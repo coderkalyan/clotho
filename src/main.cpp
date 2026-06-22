@@ -1,16 +1,16 @@
 #include <print>
 
-#include <slang/syntax/SyntaxTree.h>
+#include "Frontend.h"
 
+// Thin driver: all compiler logic lives in libclotho.
 int main() {
-    auto tree = slang::syntax::SyntaxTree::fromText(R"(
+    const auto result = clotho::parseSource(R"(
         module top;
             logic a, b, y;
             assign y = a & b;
         endmodule
     )");
 
-    std::println("parsed slang syntax tree, diagnostics: {}",
-                 tree->diagnostics().empty() ? "none" : "present");
-    return 0;
+    std::println("parsed: {}, diagnostics: {}", result.parsed, result.diagnostics ? "present" : "none");
+    return result.diagnostics ? 1 : 0;
 }

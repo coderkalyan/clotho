@@ -11,6 +11,9 @@ AlignConsecutiveBitFields: true
 AlignConsecutiveDeclarations: true
 AlignConsecutiveMacros: true
 AlignConsecutiveShortCaseStatements: { Enabled: true }
+AllowShortFunctionsOnASingleLine: Empty
+AccessModifierOffset: -4
+BreakBeforeBraces: Attach
 AlignEscapedNewlines: LeftWithLastLine
 AlignTrailingComments: true
 SortIncludes: true
