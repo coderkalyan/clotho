@@ -1,12 +1,16 @@
 #pragma once
 
-// IR construction. `Builder` owns the growable build-time storage (instruction
-// columns + extra side-table) and produces an immutable `Ir` via finish().
-// Instructions are appended in program order; the builder is spent after
-// finish().
+// Process IR construction. `Builder` owns the growable build-time storage
+// (instruction columns + extra side-table) and produces an immutable `Ir` via
+// finish(). The builder is spent after finish().
 //
-// Scaffolding: one emit method per sample instruction. The full set is filled
-// in in a later step.
+// Structured control flow: instructions accumulate into the current region.
+// openRegion()/closeRegion() bracket a nested body (e.g. a cond branch);
+// closeRegion() returns the region's slice, to be handed to cond(). The
+// outermost (root) region is sealed by finish().
+//
+// One emit method per instruction shape. Variants sharing a payload
+// (arithmetic, bitwise, ...) go through the generic unary()/binary().
 
 #include <array>
 #include <bit>
@@ -24,14 +28,34 @@ public:
     explicit Builder(InternPool& pool)
       : pool_(pool) {}
 
-    // Emit instructions, in program order. Each returns its result handle and
-    // requires a source location, opaque to the IR.
+    // -- Leaves --
     Index constant(Ref value, SourceLoc loc);
-    Index add(Index l, Index r, SourceLoc loc);
-    Index call(Index callee, std::span<const Index> args, SourceLoc loc);
-    Index ret(Index value, SourceLoc loc);
+    Index arg(uint32_t position, Ref type, SourceLoc loc);
+    Index signal(Signal sig, SourceLoc loc);
 
-    // Freeze the built state into an Ir. The builder is spent afterwards.
+    // -- Generic ops sharing a payload shape --
+    // tag must be a unary-payload op (load, bnot, lnot, red_*, ret).
+    Index unary(Inst::Tag tag, Index op, SourceLoc loc);
+    // tag must be a binary-payload op (arithmetic, bitwise, shift, compare,
+    // logical and/or, store, store_nb, bit_select).
+    Index binary(Inst::Tag tag, Index l, Index r, SourceLoc loc);
+
+    // -- Irregular shapes --
+    Index resize(Index op, Ref type, SourceLoc loc);
+    Index repl(Index value, uint32_t count, SourceLoc loc);
+    Index mux(Index cond, Index a, Index b, SourceLoc loc);
+    Index concat(std::span<const Index> parts, SourceLoc loc);
+    Index partSelect(Index base, uint32_t msb, uint32_t lsb, SourceLoc loc);
+    Index cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc);
+
+    // -- Regions --
+    // Begin a nested region; subsequent emits accumulate into it until closed.
+    void openRegion();
+    // End the current region and return its instruction slice.
+    ExtraSlice closeRegion();
+
+    // Freeze the built state into an Ir, sealing the root region. The builder is
+    // spent afterwards.
     Ir finish();
 
 private:
@@ -40,6 +64,7 @@ private:
         tags_.push_back(inst.tag);
         payloads_.push_back(inst.payload);
         locs_.push_back(loc);
+        scratch_.push_back(static_cast<Index>(index));
 
         return static_cast<Index>(index);
     }
@@ -55,7 +80,7 @@ private:
         return static_cast<ExtraIndex>(start);
     }
 
-    // Append a run of instruction indices; returns the covering slice.
+    // Append a run of instruction indices to the extra buffer; returns the slice.
     ExtraSlice addSlice(std::span<const Index> indices) {
         const auto start = static_cast<uint32_t>(extra_.size());
         for (Index i : indices) {
@@ -74,6 +99,10 @@ private:
     std::vector<SourceLoc>     locs_;
     // Flat u32 side-table under construction.
     std::vector<uint32_t> extra_;
+    // Instruction indices of all open regions, innermost segment last.
+    std::vector<Index> scratch_;
+    // Start offset into scratch_ of each open nested region.
+    std::vector<size_t> region_starts_;
 };
 
 } // namespace clotho::ir
