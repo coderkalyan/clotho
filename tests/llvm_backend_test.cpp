@@ -91,11 +91,10 @@ TEST_CASE("2-state vs 4-state widths") {
     )";
     const std::string          ir  = emit(src);
 
-    // bit signals are i4, logic signal is i8; both get a val + xz field.
     // Deduplicated, nested signal value types: bit.4 used twice (x, y), logic.8
-    // once (z); the state struct nests them.
-    CHECK(ir.find("%bit.4 = type { i4, i4 }") != std::string::npos);
-    CHECK(ir.find("%logic.8 = type { i8, i8 }") != std::string::npos);
+    // once (z); each is a { i(2W) must|may, iW z } struct nested in the state struct.
+    CHECK(ir.find("%bit.4 = type { i8, i4 }") != std::string::npos);
+    CHECK(ir.find("%logic.8 = type { i16, i8 }") != std::string::npos);
     CHECK(ir.find("%m.state = type { %bit.4, %bit.4, %logic.8 }") != std::string::npos);
     CHECK(ir.find("define void @m.") != std::string::npos);
 }

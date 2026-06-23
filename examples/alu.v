@@ -1,6 +1,6 @@
 // Registered ALU datapath: a combinational next-result block feeding a clocked
 // register with synchronous reset. Exercises the lowering proof-of-concept end
-// to end (operators, ?: select, if/else, blocking + nonblocking assigns).
+// to end (chained operators, if/else, blocking + nonblocking assigns).
 module alu(
     input             clk,
     input             rst,
@@ -12,11 +12,10 @@ module alu(
     reg  [7:0] acc;
     wire [7:0] next;
 
-    // Combinational next-result selection.
-    assign next = (op == 2'd0) ? (a + b) :
-                  (op == 2'd1) ? (a - b) :
-                  (op == 2'd2) ? (a & b) :
-                                 (a ^ b);
+    // Combinational next-result: a chained-operator datapath. Real designs lean
+    // on operator depth like this far more than the wide mux-trees that come from
+    // case statements (case lowering is a TODO).
+    assign next = (((a + b) ^ (a & b)) + ((a | b) - (a ^ b))) >> op;
 
     // Sequential register with synchronous reset.
     always @(posedge clk)

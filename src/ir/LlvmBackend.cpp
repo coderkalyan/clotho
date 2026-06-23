@@ -14,6 +14,7 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/MDBuilder.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Verifier.h>
@@ -23,15 +24,22 @@
 
 // LLVM backend rationale.
 //
-// 4-state lowering (dual plane). clotho values are 4-state (0/1/X/Z), stored as
-// two bit-planes: `val` and `xz` (xz bit set => the bit is X or Z). LLVM has no
-// 4-state integer, so each SSA value lowers to a *pair* of iW values, and every
-// operation derives both planes of its result from both planes of its operands.
-// 2-state values carry an all-zero xz plane, so one code path serves both.
+// 4-state lowering (must/may/z, three planes). Each bit is carried as a pair of
+// monotone planes plus a z marker:
+//   * `must` — the bit is definitely 1.
+//   * `may`  — the bit could be 1.
+//   * `z`    — the bit is high-impedance (collapses to X for logic).
+// Per bit: 0 = (must 0, may 0), 1 = (must 1, may 1), X = (must 0, may 1); the
+// invariant is must => may. Z is encoded as X in must/may with its z plane set.
+// This makes the common logic ops monotone and cheap: AND/OR are just per-plane
+// &/|, NOT is a swap+complement. The z plane passes through loads/stores and is
+// cleared by the logic ops (their result is never Z); we leave it to LLVM to
+// elide z where it proves dead rather than dropping it here.
+// To reconstruct canonical 4-state when needed: xz = must ^ may, val = must.
 //
 // State / ABI. Signals are persistent module state. We build one LLVM struct
-// with two iW fields per signal (val then xz) and hand every process function a
-// pointer to it; Load reads those fields, Store writes them.
+// with three iW fields per signal (must, may, z) and hand every process function
+// a pointer to it; Load reads those fields, Store writes them.
 //
 // Inferred types. The IR stores no per-instruction result type, so the backend
 // recomputes width / domain / signedness for each value by walking operands
@@ -55,10 +63,13 @@ struct ValType {
     bool     is_signed  = false;
 };
 
-// A lowered value as two bit-planes of identical integer type iW.
+// A lowered value: the must/may planes packed into one i(2W) integer (low W bits
+// = must / definitely 1, high W bits = may / could be 1), plus a separate iW `z`
+// (high-impedance marker). Packing lets the monotone ops (AND/OR/NOT, mux select)
+// act on both planes with a single instruction.
 struct Plane {
-    llvm::Value* val = nullptr;
-    llvm::Value* xz  = nullptr;
+    llvm::Value* mm = nullptr; // i(2W): [0,W) must, [W,2W) may
+    llvm::Value* z  = nullptr; // iW
 };
 
 // A resolved assignment target: a constant/runtime bit offset and width into a
@@ -74,7 +85,7 @@ struct LValue {
 struct SignalSlot {
     // Index of this signal's field in the state struct.
     unsigned field = 0;
-    // The signal's value type: a `{val, xz}` plane struct (e.g. %logic.8).
+    // The signal's value type: a `{ i(2W) must|may, iW z }` struct (e.g. %logic.8).
     llvm::StructType* ty         = nullptr;
     uint32_t          width      = 0;
     bool              four_state = false;
@@ -131,9 +142,9 @@ private:
 
     // -- Signal value types --
 
-    // The named, deduplicated `{val, xz}` struct for a signal type. 4-state types
-    // are %logic.<width>, 2-state %bit.<width>; each is emitted at most once and
-    // only because a signal uses it.
+    // The named, deduplicated `{ i(2W) must|may, iW z }` struct for a signal type.
+    // 4-state types are %logic.<width>, 2-state %bit.<width>; each is emitted at
+    // most once and only because a signal uses it.
     llvm::StructType* value_type(Ref type) {
         const Layout      lay  = mod_.pool.layout(type);
         const uint32_t    w    = lay.width == 0 ? 1 : lay.width;
@@ -144,7 +155,7 @@ private:
         if (it != value_types_.end()) {
             return it->second;
         }
-        auto* st           = llvm::StructType::create(ctx_, { int_ty(w), int_ty(w) }, name);
+        auto* st           = llvm::StructType::create(ctx_, { int_ty(2 * w), int_ty(w) }, name);
         value_types_[name] = st;
         return st;
     }
@@ -337,7 +348,7 @@ private:
                 return;
             case Inst::Tag::BitSelect: {
                 const LValue& base = lvalue_of(p.binary.l);
-                llvm::Value*  idx  = cast(value_of(p.binary.r).val, 32, false);
+                llvm::Value*  idx  = cast(must_of(value_of(p.binary.r)), 32, false);
                 set_lvalue(i, LValue{ base.sig, b_.CreateAdd(base.bit_off, idx), 1 });
                 return;
             }
@@ -444,9 +455,10 @@ private:
         const std::span<const uint8_t> bytes = mod_.pool.bytes(ref);
         const uint32_t                 pb    = plane_bytes(lay.width);
 
+        // The pool stores canonical val/xz; ingest to must/may (constants never z).
         llvm::Value* val = const_from_bytes(bytes.subspan(0, pb), w);
         llvm::Value* xz  = lay.domain == Domain::Four ? const_from_bytes(bytes.subspan(pb, pb), w) : zero(w);
-        return { val, xz };
+        return packed(b_.CreateAnd(val, b_.CreateNot(xz)), b_.CreateOr(val, xz), zero(w));
     }
 
     // Build an iW constant from little-endian canonical plane bytes.
@@ -460,49 +472,54 @@ private:
     // -- State access --
 
     Plane lower_load(const LValue& lv) {
-        const SignalSlot& s   = slot_of(lv.sig);
-        llvm::Value*      sp  = b_.CreateStructGEP(state_ty_, state_, s.field);
-        llvm::Value*      vp  = b_.CreateStructGEP(s.ty, sp, 0);
-        llvm::Value*      xp  = b_.CreateStructGEP(s.ty, sp, 1);
-        llvm::Value*      val = b_.CreateLoad(int_ty(s.width), vp);
-        llvm::Value*      xz  = b_.CreateLoad(int_ty(s.width), xp);
+        const SignalSlot& s  = slot_of(lv.sig);
+        llvm::Value*      sp = b_.CreateStructGEP(state_ty_, state_, s.field);
+        llvm::Value*      mm = b_.CreateLoad(int_ty(2 * s.width), b_.CreateStructGEP(s.ty, sp, 0));
+        llvm::Value*      z  = b_.CreateLoad(int_ty(s.width), b_.CreateStructGEP(s.ty, sp, 1));
         if (lv.width == s.width && is_zero_const(lv.bit_off)) {
-            return { val, xz };
+            return { mm, z };
         }
-        llvm::Value* off = cast(lv.bit_off, s.width, false);
-        val              = cast(b_.CreateLShr(val, off), lv.width, false);
-        xz               = cast(b_.CreateLShr(xz, off), lv.width, false);
-        return { val, xz };
+        // Bit/part select: unpack, shift each plane down by the offset, re-pack.
+        const Plane  full = { mm, z };
+        llvm::Value* off  = cast(lv.bit_off, s.width, false);
+        return packed(cast(b_.CreateLShr(must_of(full), off), lv.width, false),
+                      cast(b_.CreateLShr(may_of(full), off), lv.width, false),
+                      cast(b_.CreateLShr(z, off), lv.width, false));
     }
 
     void lower_store(const LValue& lv, Plane rhs, ValType rhs_ty) {
-        const SignalSlot& s    = slot_of(lv.sig);
-        llvm::Value*      rval = cast(rhs.val, lv.width, false);
-        llvm::Value*      rxz  = cast(rhs.xz, lv.width, false);
+        const SignalSlot& s  = slot_of(lv.sig);
+        llvm::Value*      sp = b_.CreateStructGEP(state_ty_, state_, s.field);
+        llvm::Value*      mp = b_.CreateStructGEP(s.ty, sp, 0);
+        llvm::Value*      zp = b_.CreateStructGEP(s.ty, sp, 1);
         (void)rhs_ty;
 
-        llvm::Value* sp = b_.CreateStructGEP(state_ty_, state_, s.field);
-        llvm::Value* vp = b_.CreateStructGEP(s.ty, sp, 0);
-        llvm::Value* xp = b_.CreateStructGEP(s.ty, sp, 1);
-
+        // Whole-signal store: the frontend context-sizes the RHS to the lvalue
+        // width (via an inserted Resize), so rhs already matches the signal width
+        // and the planes store directly.
         if (lv.width == s.width && is_zero_const(lv.bit_off)) {
-            b_.CreateStore(rval, vp);
-            b_.CreateStore(rxz, xp);
+            b_.CreateStore(rhs.mm, mp);
+            b_.CreateStore(rhs.z, zp);
             return;
         }
 
+        // Partial store: read-modify-write each plane at the signal width.
+        const Plane  old   = { b_.CreateLoad(int_ty(2 * s.width), mp), b_.CreateLoad(int_ty(s.width), zp) };
         llvm::Value* off   = cast(lv.bit_off, s.width, false);
         llvm::Value* mask  = b_.CreateShl(cast(ones(lv.width), s.width, false), off);
         llvm::Value* nmask = b_.CreateNot(mask);
-        write_masked(vp, int_ty(s.width), nmask, mask, b_.CreateShl(cast(rval, s.width, false), off));
-        write_masked(xp, int_ty(s.width), nmask, mask, b_.CreateShl(cast(rxz, s.width, false), off));
+        llvm::Value* must  = merge_bits(must_of(old), cast(must_of(rhs), s.width, false), off, mask, nmask);
+        llvm::Value* may   = merge_bits(may_of(old), cast(may_of(rhs), s.width, false), off, mask, nmask);
+        llvm::Value* z     = merge_bits(old.z, cast(rhs.z, s.width, false), off, mask, nmask);
+        b_.CreateStore(packed(must, may, z).mm, mp);
+        b_.CreateStore(z, zp);
     }
 
-    // field = (old & ~mask) | (ins & mask)
-    void write_masked(llvm::Value* ptr, llvm::Type* ty, llvm::Value* nmask, llvm::Value* mask, llvm::Value* ins) {
-        llvm::Value* old  = b_.CreateLoad(ty, ptr);
-        llvm::Value* kept = b_.CreateAnd(old, nmask);
-        b_.CreateStore(b_.CreateOr(kept, b_.CreateAnd(ins, mask)), ptr);
+    // (old & ~mask) | ((ins << off) & mask)
+    llvm::Value* merge_bits(llvm::Value* old, llvm::Value* ins, llvm::Value* off, llvm::Value* mask,
+                            llvm::Value* nmask) {
+        llvm::Value* shifted = b_.CreateAnd(b_.CreateShl(ins, off), mask);
+        return b_.CreateOr(b_.CreateAnd(old, nmask), shifted);
     }
 
     static bool is_zero_const(llvm::Value* v) {
@@ -510,128 +527,197 @@ private:
         return c != nullptr && c->isZero();
     }
 
-    // -- Per-bit mask helpers (operate on whole planes) --
+    // -- Plane helpers --
 
-    llvm::Value* def1(Plane a) {
-        return b_.CreateAnd(a.val, b_.CreateNot(a.xz));
+    static uint32_t bits_of(llvm::Value* v) {
+        return llvm::cast<llvm::IntegerType>(v->getType())->getBitWidth();
     }
-    llvm::Value* def0(Plane a) {
-        return b_.CreateAnd(b_.CreateNot(a.val), b_.CreateNot(a.xz));
+    // Value width W of a packed plane (mm is i(2W)).
+    static uint32_t width_of(Plane a) {
+        return bits_of(a.mm) / 2;
     }
-    // i1: does this value contain any X/Z bit?
+
+    // The must (low W) and may (high W) halves of a packed plane.
+    llvm::Value* must_of(Plane a) {
+        return b_.CreateTrunc(a.mm, int_ty(width_of(a)));
+    }
+    llvm::Value* may_of(Plane a) {
+        const uint32_t w = width_of(a);
+        return b_.CreateTrunc(b_.CreateLShr(a.mm, w), int_ty(w));
+    }
+
+    // Pack iW must + iW may (+ iW z) into a Plane (mm is i(2W)).
+    Plane packed(llvm::Value* must, llvm::Value* may, llvm::Value* z) {
+        const uint32_t w    = bits_of(must);
+        auto*          wide = int_ty(2 * w);
+        llvm::Value*   mm   = b_.CreateOr(b_.CreateZExt(must, wide), b_.CreateShl(b_.CreateZExt(may, wide), w));
+        return { mm, z };
+    }
+
+    // i1: does this value contain any X/Z bit? Unknown bits are exactly must!=may.
     llvm::Value* any_unknown(Plane a) {
-        return b_.CreateICmpNE(a.xz, llvm::ConstantInt::get(a.xz->getType(), 0));
-    }
-    // i1: is any bit a definite 1 / definite 0?
-    llvm::Value* any_one(Plane a) {
-        llvm::Value* d = def1(a);
-        return b_.CreateICmpNE(d, llvm::ConstantInt::get(d->getType(), 0));
-    }
-    llvm::Value* any_zero(Plane a) {
-        llvm::Value* d = def0(a);
-        return b_.CreateICmpNE(d, llvm::ConstantInt::get(d->getType(), 0));
+        llvm::Value* u = b_.CreateXor(must_of(a), may_of(a));
+        return b_.CreateICmpNE(u, llvm::ConstantInt::get(u->getType(), 0));
     }
 
-    // Pack an i1 (val) + i1 (xz) into a width-1 Plane.
-    Plane bit_plane(llvm::Value* val_i1, llvm::Value* xz_i1) {
-        return { b_.CreateZExt(val_i1, int_ty(1)), b_.CreateZExt(xz_i1, int_ty(1)) };
+    // Pack an i1 must + i1 may into a width-1 Plane (z cleared).
+    Plane bit_plane(llvm::Value* must_i1, llvm::Value* may_i1) {
+        return packed(must_i1, may_i1, zero(1));
+    }
+
+    // Cast all planes to width `to`. No-op when already that width — avoids a
+    // pointless unpack/repack of the packed mm.
+    Plane cast_plane(Plane a, uint32_t to, bool sign) {
+        if (width_of(a) == to) {
+            return a;
+        }
+        return packed(cast(must_of(a), to, sign), cast(may_of(a), to, sign), cast(a.z, to, sign));
     }
 
     // -- Arithmetic: any X/Z in an operand makes the whole result X. --
+    //
+    // Lowered as a branch, not a select: the X case is rare, so it is split into a
+    // cold block that just materialises the all-X constant (one move-immediate),
+    // while the hot block does a single W-bit add/sub/mul of the value and
+    // duplicates it across both planes (known bits have must == may).
 
     Plane lower_arith(Inst::Tag tag, Plane a, Plane b) {
-        const uint32_t w = llvm::cast<llvm::IntegerType>(a.val->getType())->getBitWidth();
-        llvm::Value*   r = nullptr;
+        const uint32_t w    = width_of(a);
+        auto*          wide = int_ty(2 * w);
+
+        // Any X/Z bit in either operand, tested once for the pair. The per-bit X
+        // mask of a packed value is `must ^ may`, which sits in the low W bits of
+        // `mm ^ (mm >> W)`. OR the two operands' masks and do a single nonzero
+        // test instead of checking a and b separately. (The values can't be merged
+        // before this step: X-ness is nonlinear, so OR-ing mm first is wrong.)
+        llvm::Value* xa      = b_.CreateXor(a.mm, b_.CreateLShr(a.mm, w));
+        llvm::Value* xb      = b_.CreateXor(b.mm, b_.CreateLShr(b.mm, w));
+        llvm::Value* xmask   = b_.CreateTrunc(b_.CreateOr(xa, xb), int_ty(w));
+        llvm::Value* unknown = b_.CreateICmpNE(xmask, zero(w));
+
+        auto* x_bb   = llvm::BasicBlock::Create(ctx_, "arith.x", fn_);
+        auto* val_bb = llvm::BasicBlock::Create(ctx_, "arith.val", fn_);
+        auto* end_bb = llvm::BasicBlock::Create(ctx_, "arith.end", fn_);
+
+        llvm::BranchInst* br = b_.CreateCondBr(unknown, x_bb, val_bb);
+        br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
+
+        // Cold: whole result is X = every bit (must 0, may 1) = the high-half ones.
+        b_.SetInsertPoint(x_bb);
+        llvm::Value* x_mm = llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w));
+        b_.CreateBr(end_bb);
+
+        // Hot: one W-bit op on the value, duplicated into both planes.
+        b_.SetInsertPoint(val_bb);
+        llvm::Value* am = must_of(a);
+        llvm::Value* bm = must_of(b);
+        llvm::Value* r  = nullptr;
         switch (tag) {
             case Inst::Tag::Add:
-                r = b_.CreateAdd(a.val, b.val);
+                r = b_.CreateAdd(am, bm);
                 break;
             case Inst::Tag::Sub:
-                r = b_.CreateSub(a.val, b.val);
+                r = b_.CreateSub(am, bm);
                 break;
             default:
-                r = b_.CreateMul(a.val, b.val);
+                r = b_.CreateMul(am, bm);
                 break;
         }
-        llvm::Value* unknown = b_.CreateOr(any_unknown(a), any_unknown(b));
-        llvm::Value* val     = b_.CreateSelect(unknown, ones(w), r);
-        llvm::Value* xz      = b_.CreateSelect(unknown, ones(w), zero(w));
-        return { val, xz };
+        llvm::Value* val_mm = packed(r, r, zero(w)).mm;
+        b_.CreateBr(end_bb);
+
+        b_.SetInsertPoint(end_bb);
+        llvm::PHINode* mm = b_.CreatePHI(wide, 2);
+        mm->addIncoming(x_mm, x_bb);
+        mm->addIncoming(val_mm, val_bb);
+        return { mm, zero(w) };
     }
 
-    // -- Bitwise X/Z (per-bit). --
-    //
-    // The val plane is meaningful only where xz==0; where xz==1 (X/Z) the val bit
-    // is don't-care, so these need not canonicalize it. The xz (unknown) plane is
-    // computed exactly. Naming the planes ah/al (a.xz/a.val) etc, these are the
-    // minimal forms: the val plane is plain 2-state &/|/^/~, and the unknown plane
-    // accounts for the absorbing 0 (AND) / 1 (OR).
+    // -- Bitwise: AND/OR are monotone, so one op on the packed planes does both;
+    // the result is never Z, so z is cleared. --
 
     Plane lower_bitwise(Inst::Tag tag, Plane a, Plane b) {
-        if (tag == Inst::Tag::Bxor) {
-            // Unknown iff either operand bit is unknown; value is plain xor.
-            return { b_.CreateXor(a.val, b.val), b_.CreateOr(a.xz, b.xz) };
-        }
-        // Shared AND high-plane: unknown unless a forcing 0 is present.
-        llvm::Value* t_and = b_.CreateAnd(b_.CreateOr(a.xz, a.val), b_.CreateOr(b.xz, b_.CreateAnd(a.xz, b.val)));
+        const uint32_t w = width_of(a);
         if (tag == Inst::Tag::Band) {
-            return { b_.CreateAnd(a.val, b.val), t_and };
+            return { b_.CreateAnd(a.mm, b.mm), zero(w) };
         }
-        // Bor: high plane is ah ^ bh ^ t_and.
-        llvm::Value* xz = b_.CreateXor(b_.CreateXor(a.xz, b.xz), t_and);
-        return { b_.CreateOr(a.val, b.val), xz };
+        if (tag == Inst::Tag::Bor) {
+            return { b_.CreateOr(a.mm, b.mm), zero(w) };
+        }
+        // Bxor (non-monotone): unpack. Unknown iff either bit unknown; value is xor.
+        llvm::Value* am = must_of(a);
+        llvm::Value* aM = may_of(a);
+        llvm::Value* bm = must_of(b);
+        llvm::Value* bM = may_of(b);
+        llvm::Value* u  = b_.CreateOr(b_.CreateXor(am, aM), b_.CreateXor(bm, bM));
+        llvm::Value* k  = b_.CreateXor(am, bm);
+        return packed(b_.CreateAnd(b_.CreateNot(u), k), b_.CreateOr(u, k), zero(w));
     }
 
     Plane lower_bnot(Plane a) {
-        // Known bits invert; unknown bits stay unknown (val don't-care).
-        return { b_.CreateNot(a.val), a.xz };
+        // NOT is must' = ~may, may' = ~must: complement both planes and swap them.
+        // Complement is one full ~ on the packed value; the swap is a rotate-left
+        // by W (the two halves trade places), emitted as a funnel shift. NOT and
+        // rotate commute, so order does not matter.
+        const uint32_t w       = width_of(a);
+        auto*          wide    = int_ty(2 * w);
+        llvm::Value*   notted  = b_.CreateNot(a.mm);
+        llvm::Value*   amount  = llvm::ConstantInt::get(wide, w);
+        llvm::Value*   swapped = b_.CreateIntrinsic(llvm::Intrinsic::fshl, { wide }, { notted, notted, amount });
+        return { swapped, zero(w) };
     }
 
-    // -- Reductions -> 1-bit. --
+    // -- Reductions -> 1-bit (chained AND/OR/XOR over the bits). --
 
     Plane lower_reduce(Inst::Tag tag, Plane a) {
+        const uint32_t w  = width_of(a);
+        llvm::Value*   am = must_of(a);
+        llvm::Value*   aM = may_of(a);
         if (tag == Inst::Tag::RedXor) {
             llvm::Value* unknown = any_unknown(a);
-            llvm::Value* pop     = b_.CreateUnaryIntrinsic(llvm::Intrinsic::ctpop, a.val);
+            llvm::Value* pop     = b_.CreateUnaryIntrinsic(llvm::Intrinsic::ctpop, am);
             llvm::Value* parity  = b_.CreateTrunc(pop, int_ty(1));
-            llvm::Value* val     = b_.CreateOr(b_.CreateZExt(unknown, int_ty(1)), parity);
-            return { val, b_.CreateZExt(unknown, int_ty(1)) };
+            return bit_plane(b_.CreateAnd(b_.CreateNot(unknown), parity), b_.CreateOr(unknown, parity));
         }
-        llvm::Value* unknown = any_unknown(a);
         if (tag == Inst::Tag::RedAnd) {
-            llvm::Value* not_zero = b_.CreateNot(any_zero(a)); // no definite-0 bit
-            llvm::Value* x        = b_.CreateAnd(not_zero, unknown);
-            return bit_plane(not_zero, x);
+            // must: all bits definitely 1; may: all bits could be 1.
+            return bit_plane(b_.CreateICmpEQ(am, ones(w)), b_.CreateICmpEQ(aM, ones(w)));
         }
-        // RedOr
-        llvm::Value* one = any_one(a);
-        llvm::Value* x   = b_.CreateAnd(b_.CreateNot(one), unknown);
-        return bit_plane(b_.CreateOr(one, x), x);
+        // RedOr: must: any bit definitely 1; may: any bit could be 1.
+        return bit_plane(b_.CreateICmpNE(am, zero(w)), b_.CreateICmpNE(aM, zero(w)));
     }
 
     // -- Shifts: X/Z in the count makes the whole result X; value planes shift. --
 
     Plane lower_shift(Inst::Tag tag, Plane a, Plane amt, bool sign) {
-        const uint32_t w  = llvm::cast<llvm::IntegerType>(a.val->getType())->getBitWidth();
-        llvm::Value*   sh = cast(amt.val, w, false);
-        llvm::Value*   val;
-        llvm::Value*   xz;
+        const uint32_t w  = width_of(a);
+        llvm::Value*   sh = cast(must_of(amt), w, false);
+        llvm::Value*   am = must_of(a);
+        llvm::Value*   aM = may_of(a);
+        llvm::Value*   must;
+        llvm::Value*   may;
+        llvm::Value*   z;
         switch (tag) {
             case Inst::Tag::Sll:
-                val = b_.CreateShl(a.val, sh);
-                xz  = b_.CreateShl(a.xz, sh);
+                must = b_.CreateShl(am, sh);
+                may  = b_.CreateShl(aM, sh);
+                z    = b_.CreateShl(a.z, sh);
                 break;
             case Inst::Tag::Srl:
-                val = b_.CreateLShr(a.val, sh);
-                xz  = b_.CreateLShr(a.xz, sh);
+                must = b_.CreateLShr(am, sh);
+                may  = b_.CreateLShr(aM, sh);
+                z    = b_.CreateLShr(a.z, sh);
                 break;
-            default: // Sra: arithmetic, replicate sign (and its x/z-ness)
-                val = sign ? b_.CreateAShr(a.val, sh) : b_.CreateLShr(a.val, sh);
-                xz  = sign ? b_.CreateAShr(a.xz, sh) : b_.CreateLShr(a.xz, sh);
+            default: // Sra: arithmetic, replicate the sign (and its unknown-ness)
+                must = sign ? b_.CreateAShr(am, sh) : b_.CreateLShr(am, sh);
+                may  = sign ? b_.CreateAShr(aM, sh) : b_.CreateLShr(aM, sh);
+                z    = sign ? b_.CreateAShr(a.z, sh) : b_.CreateLShr(a.z, sh);
                 break;
         }
         llvm::Value* unknown = any_unknown(amt);
-        return { b_.CreateSelect(unknown, ones(w), val), b_.CreateSelect(unknown, ones(w), xz) };
+        return packed(b_.CreateSelect(unknown, zero(w), must),
+                      b_.CreateSelect(unknown, ones(w), may),
+                      b_.CreateSelect(unknown, zero(w), z));
     }
 
     // -- Comparisons -> 1-bit; X/Z in either operand yields X. --
@@ -658,63 +744,61 @@ private:
                 pred = sign ? llvm::CmpInst::ICMP_SGE : llvm::CmpInst::ICMP_UGE;
                 break;
         }
-        llvm::Value* cmp     = b_.CreateICmp(pred, a.val, b.val);
+        llvm::Value* cmp     = b_.CreateICmp(pred, must_of(a), must_of(b));
         llvm::Value* unknown = b_.CreateOr(any_unknown(a), any_unknown(b));
-        return bit_plane(b_.CreateOr(cmp, unknown), unknown);
+        return bit_plane(b_.CreateAnd(b_.CreateNot(unknown), cmp), b_.CreateOr(unknown, cmp));
     }
 
     // -- Logical and/or/not -> 1-bit, three-valued. --
 
-    // Per-operand truth (i1): definitely-true, definitely-false, unknown.
+    // Per-operand truth (i1): definitely-true (some must bit) / definitely-false
+    // (no may bit). Unknown is neither.
     struct Truth {
         llvm::Value* t;
         llvm::Value* f;
-        llvm::Value* x;
     };
     Truth truth_of(Plane a) {
-        llvm::Value* t = any_one(a);
-        llvm::Value* f = b_.CreateAnd(b_.CreateNot(t), b_.CreateNot(any_unknown(a)));
-        llvm::Value* x = b_.CreateAnd(b_.CreateNot(t), b_.CreateNot(f));
-        return { t, f, x };
+        const uint32_t w = width_of(a);
+        llvm::Value*   t = b_.CreateICmpNE(must_of(a), zero(w));
+        llvm::Value*   f = b_.CreateICmpEQ(may_of(a), zero(w));
+        return { t, f };
     }
 
     Plane lower_logical(Inst::Tag tag, Plane a, Plane b) {
-        const Truth  ta = truth_of(a);
-        const Truth  tb = truth_of(b);
-        llvm::Value* res_t;
-        llvm::Value* res_f;
+        const Truth ta = truth_of(a);
+        const Truth tb = truth_of(b);
         if (tag == Inst::Tag::Land) {
-            res_f = b_.CreateOr(ta.f, tb.f);
-            res_t = b_.CreateAnd(ta.t, tb.t);
-        } else {
-            res_t = b_.CreateOr(ta.t, tb.t);
-            res_f = b_.CreateAnd(ta.f, tb.f);
+            // must = both true; may = not (either false).
+            return bit_plane(b_.CreateAnd(ta.t, tb.t), b_.CreateNot(b_.CreateOr(ta.f, tb.f)));
         }
-        llvm::Value* x = b_.CreateAnd(b_.CreateNot(res_t), b_.CreateNot(res_f));
-        return bit_plane(b_.CreateOr(res_t, x), x);
+        // Lor: must = either true; may = not (both false).
+        return bit_plane(b_.CreateOr(ta.t, tb.t), b_.CreateNot(b_.CreateAnd(ta.f, tb.f)));
     }
 
     Plane lower_lnot(Plane a) {
         const Truth t = truth_of(a);
-        // true -> 0, false -> 1, x -> x
-        return bit_plane(b_.CreateOr(t.f, t.x), t.x);
+        // true -> 0, false -> 1, x -> x: must = was-false, may = not was-true.
+        return bit_plane(t.f, b_.CreateNot(t.t));
     }
 
-    // -- Mux: known condition selects; unknown merges bitwise (X where differ). --
+    // -- Mux: known condition selects (one packed select); unknown merges bitwise
+    // (X where the arms disagree). --
 
     Plane lower_mux(Plane cond, Plane a, Plane b) {
-        llvm::Value* cond_known = b_.CreateICmpEQ(cond.xz, zero(1));
-        llvm::Value* cond_true  = b_.CreateICmpNE(cond.val, zero(1));
+        const uint32_t w          = width_of(a);
+        llvm::Value*   cond_known = b_.CreateICmpEQ(must_of(cond), may_of(cond));
+        llvm::Value*   cond_true  = b_.CreateICmpNE(must_of(cond), zero(1));
 
-        llvm::Value* sel_val = b_.CreateSelect(cond_true, a.val, b.val);
-        llvm::Value* sel_xz  = b_.CreateSelect(cond_true, a.xz, b.xz);
+        llvm::Value* sel_mm = b_.CreateSelect(cond_true, a.mm, b.mm);
+        llvm::Value* sel_z  = b_.CreateSelect(cond_true, a.z, b.z);
 
-        llvm::Value* diff    = b_.CreateOr(b_.CreateXor(a.val, b.val), b_.CreateXor(a.xz, b.xz));
-        llvm::Value* ndiff   = b_.CreateNot(diff);
-        llvm::Value* unk_val = b_.CreateOr(b_.CreateAnd(a.val, ndiff), diff);
-        llvm::Value* unk_xz  = b_.CreateOr(b_.CreateAnd(a.xz, ndiff), diff);
+        // Unknown condition: interval hull per bit. Low half (must) ANDs, high half
+        // (may) ORs; a low-bit mask keeps each half's result.
+        llvm::Value* lowmask = llvm::ConstantInt::get(ctx_, llvm::APInt::getLowBitsSet(2 * w, w));
+        llvm::Value* merge   = b_.CreateOr(b_.CreateAnd(b_.CreateAnd(a.mm, b.mm), lowmask),
+                                           b_.CreateAnd(b_.CreateOr(a.mm, b.mm), b_.CreateNot(lowmask)));
 
-        return { b_.CreateSelect(cond_known, sel_val, unk_val), b_.CreateSelect(cond_known, sel_xz, unk_xz) };
+        return { b_.CreateSelect(cond_known, sel_mm, merge), b_.CreateSelect(cond_known, sel_z, zero(w)) };
     }
 
     // -- Concat / Repl: first operand occupies the most-significant bits. --
@@ -724,35 +808,40 @@ private:
         std::array<Index, 3> scratch;
         const auto           parts = ir_->operands(i, scratch);
 
-        llvm::Value* val = zero(w);
-        llvm::Value* xz  = zero(w);
+        llvm::Value* must = zero(w);
+        llvm::Value* may  = zero(w);
+        llvm::Value* z    = zero(w);
         for (Index part : parts) {
             const uint32_t pw = type_of(part).width;
             const Plane    pv = value_of(part);
-            val               = b_.CreateOr(b_.CreateShl(val, pw), cast(pv.val, w, false));
-            xz                = b_.CreateOr(b_.CreateShl(xz, pw), cast(pv.xz, w, false));
+            must              = b_.CreateOr(b_.CreateShl(must, pw), cast(must_of(pv), w, false));
+            may               = b_.CreateOr(b_.CreateShl(may, pw), cast(may_of(pv), w, false));
+            z                 = b_.CreateOr(b_.CreateShl(z, pw), cast(pv.z, w, false));
         }
-        return { val, xz };
+        return packed(must, may, z);
     }
 
     Plane lower_repl(Plane v, uint32_t part_width, uint32_t count) {
-        const uint32_t w   = part_width * count;
-        llvm::Value*   val = zero(w);
-        llvm::Value*   xz  = zero(w);
-        llvm::Value*   pv  = cast(v.val, w, false);
-        llvm::Value*   px  = cast(v.xz, w, false);
+        const uint32_t w    = part_width * count;
+        llvm::Value*   pm   = cast(must_of(v), w, false);
+        llvm::Value*   pM   = cast(may_of(v), w, false);
+        llvm::Value*   pz   = cast(v.z, w, false);
+        llvm::Value*   must = zero(w);
+        llvm::Value*   may  = zero(w);
+        llvm::Value*   z    = zero(w);
         for (uint32_t c = 0; c < count; ++c) {
-            val = b_.CreateOr(b_.CreateShl(val, part_width), pv);
-            xz  = b_.CreateOr(b_.CreateShl(xz, part_width), px);
+            must = b_.CreateOr(b_.CreateShl(must, part_width), pm);
+            may  = b_.CreateOr(b_.CreateShl(may, part_width), pM);
+            z    = b_.CreateOr(b_.CreateShl(z, part_width), pz);
         }
-        return { val, xz };
+        return packed(must, may, z);
     }
 
-    // -- Resize: truncate or extend both planes (sign per target). --
+    // -- Resize: truncate or extend all planes (sign per target). --
 
     Plane lower_resize(Plane v, ValType from, ValType to) {
         (void)from;
-        return { cast(v.val, to.width, to.is_signed), cast(v.xz, to.width, to.is_signed) };
+        return cast_plane(v, to.width, to.is_signed);
     }
 
     // -- Control flow: if/else with two regions. X/Z condition takes else. --
@@ -762,9 +851,9 @@ private:
         const auto           regs = ir_->extra_data<Regions>(p.op_extra.extra);
         const Plane          cond = value_of(p.op_extra.op);
 
-        llvm::Value* known = b_.CreateICmpEQ(cond.xz, zero(1));
-        llvm::Value* nz    = b_.CreateICmpNE(cond.val, zero(1));
-        llvm::Value* take  = b_.CreateAnd(known, nz);
+        // must=1 holds only for a definite 1 (invariant must => may), so X/Z fall
+        // through to else automatically.
+        llvm::Value* take = b_.CreateICmpNE(must_of(cond), zero(1));
 
         auto* then_bb = llvm::BasicBlock::Create(ctx_, "then", fn_);
         auto* else_bb = llvm::BasicBlock::Create(ctx_, "else", fn_);
