@@ -44,6 +44,7 @@ add_library(clotho_ir STATIC
   src/ir/InternPool.cpp
   src/ir/Ir.cpp
   src/ir/Builder.cpp
+  src/ir/Printer.cpp
 )
 target_include_directories(clotho_ir PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(clotho_ir PUBLIC unordered_dense::unordered_dense)
@@ -53,6 +54,7 @@ target_link_libraries(clotho_ir PUBLIC unordered_dense::unordered_dense)
 add_library(clotho STATIC
   src/Frontend.cpp
   src/SourceMap.cpp
+  src/Lower.cpp
 )
 target_include_directories(clotho PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(clotho PUBLIC clotho_ir slang::slang)
@@ -69,6 +71,7 @@ add_executable(clotho_test
   tests/ir_test.cpp
   tests/frontend_test.cpp
   tests/sourcemap_test.cpp
+  tests/lower_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho doctest::doctest)
 add_test(NAME clotho_test COMMAND clotho_test)

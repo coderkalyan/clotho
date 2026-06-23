@@ -8,6 +8,7 @@
 #include "ir/Builder.h"
 #include "ir/InternPool.h"
 #include "ir/Ir.h"
+#include "ir/Printer.h"
 
 using namespace clotho::ir;
 
@@ -176,4 +177,64 @@ TEST_CASE("mux and concat expose their operands") {
     REQUIRE(concat_ops.size() == 2);
     CHECK(concat_ops[0] == x);
     CHECK(concat_ops[1] == z);
+}
+
+TEST_CASE("printer renders a flat combinational body") {
+    InternPool      pool;
+    Builder         b(pool);
+    const SourceLoc loc{ 1 };
+
+    const Index a  = b.signal(Signal{ 0 }, loc);
+    const Index bs = b.signal(Signal{ 1 }, loc);
+    const Index y  = b.signal(Signal{ 2 }, loc);
+    const Index va = b.unary(Inst::Tag::Load, a, loc);
+    const Index vb = b.unary(Inst::Tag::Load, bs, loc);
+    const Index r  = b.binary(Inst::Tag::Band, va, vb, loc);
+    b.binary(Inst::Tag::Store, y, r, loc);
+
+    Ir ir = b.finish();
+
+    const std::string expected = "%0 = signal(s0)\n"
+                                 "%1 = signal(s1)\n"
+                                 "%2 = signal(s2)\n"
+                                 "%3 = load(%0)\n"
+                                 "%4 = load(%1)\n"
+                                 "%5 = band(%3, %4)\n"
+                                 "%6 = store(%2, %5)\n";
+    CHECK(toString(ir) == expected);
+}
+
+TEST_CASE("printer indents cond regions and decodes constants") {
+    InternPool      pool;
+    Builder         b(pool);
+    const SourceLoc loc{ 1 };
+
+    const Index c  = b.signal(Signal{ 0 }, loc);
+    const Index vc = b.unary(Inst::Tag::Load, c, loc);
+    const Index q  = b.signal(Signal{ 1 }, loc);
+
+    b.openRegion();
+    b.binary(Inst::Tag::StoreNb, q, b.constant(konst(pool, 1), loc), loc);
+    const ExtraSlice then_region = b.closeRegion();
+
+    b.openRegion();
+    b.binary(Inst::Tag::StoreNb, q, b.constant(konst(pool, 0), loc), loc);
+    const ExtraSlice else_region = b.closeRegion();
+
+    b.cond(vc, then_region, else_region, loc);
+
+    Ir ir = b.finish();
+
+    const std::string expected = "%0 = signal(s0)\n"
+                                 "%1 = load(%0)\n"
+                                 "%2 = signal(s1)\n"
+                                 "%7 = cond(%1) {\n"
+                                 "  then:\n"
+                                 "    %3 = constant(bit 0x01)\n"
+                                 "    %4 = store_nb(%2, %3)\n"
+                                 "  else:\n"
+                                 "    %5 = constant(bit 0x00)\n"
+                                 "    %6 = store_nb(%2, %5)\n"
+                                 "}\n";
+    CHECK(toString(ir) == expected);
 }

@@ -1,16 +1,26 @@
+#include <iostream>
 #include <print>
 
-#include "Frontend.h"
+#include "Lower.h"
+#include "ir/Printer.h"
 
-// Thin driver: all compiler logic lives in libclotho.
-int main() {
-    const auto result = clotho::parseSource(R"(
-        module top;
-            logic a, b, y;
-            assign y = a & b;
-        endmodule
-    )");
+// Thin driver: take a SystemVerilog file, run it through the lowering pipeline,
+// and print the resulting process IR. All compiler logic lives in libclotho.
+int main(int argc, char** argv) {
+    if (argc != 2) {
+        std::println(stderr, "usage: {} <file.sv>", argv[0]);
+        return 2;
+    }
 
-    std::println("parsed: {}, diagnostics: {}", result.parsed, result.diagnostics ? "present" : "none");
-    return result.diagnostics ? 1 : 0;
+    const clotho::LowerResult result = clotho::lowerFile(argv[1]);
+    if (!result.diagnostics.empty()) {
+        std::print(stderr, "{}", result.diagnostics);
+    }
+    if (!result.ok) {
+        return 1;
+    }
+
+    clotho::ir::printModule(*result.module, std::cout);
+
+    return 0;
 }
