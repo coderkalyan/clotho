@@ -57,6 +57,7 @@ add_library(clotho_ir STATIC
   src/ir/Builder.cpp
   src/ir/Printer.cpp
   src/ir/LlvmBackend.cpp
+  src/Wheel.cpp
 )
 target_include_directories(clotho_ir PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${LLVM_INCLUDE_DIRS})
 target_compile_definitions(clotho_ir PUBLIC ${LLVM_DEFINITIONS})
@@ -86,6 +87,7 @@ add_executable(clotho_test
   tests/sourcemap_test.cpp
   tests/lower_test.cpp
   tests/llvm_backend_test.cpp
+  tests/wheel_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho doctest::doctest)
 add_test(NAME clotho_test COMMAND clotho_test)
