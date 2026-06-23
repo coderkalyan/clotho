@@ -110,9 +110,14 @@ public:
 
     void run() {
         build_state_struct();
+        std::vector<llvm::Function*> initials;
         for (const Process& proc : mod_.processes()) {
-            lower_process(proc);
+            llvm::Function* f = lower_process(proc);
+            if (proc.kind == ProcessKind::Initial) {
+                initials.push_back(f);
+            }
         }
+        emit_main(initials);
     }
 
 private:
@@ -189,7 +194,7 @@ private:
 
     // -- Per-process lowering --
 
-    void lower_process(const Process& proc) {
+    llvm::Function* lower_process(const Process& proc) {
         ir_            = &proc.ir;
         const size_t n = ir_->inst_count();
         values_.assign(n, Plane{});
@@ -216,6 +221,45 @@ private:
 
         lower_region(ir_->root());
         b_.CreateRetVoid();
+        return fn_;
+    }
+
+    // -- Top-level entry --
+    //
+    // Emit `i32 @main()`: stack-allocate the shared state, power it up, then call
+    // every initial block in process-table order (initial blocks are unordered, so
+    // any order is legal). Returns 0. Suspension / scheduling are out of scope —
+    // each callee runs straight through.
+    void emit_main(const std::vector<llvm::Function*>& initials) {
+        auto* i32  = llvm::Type::getInt32Ty(ctx_);
+        auto* fnty = llvm::FunctionType::get(i32, false);
+        auto* main = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, "main", llmod_);
+
+        auto* entry = llvm::BasicBlock::Create(ctx_, "entry", main);
+        b_.SetInsertPoint(entry);
+
+        llvm::Value* state = b_.CreateAlloca(state_ty_, nullptr, "state");
+        init_state(state);
+        for (llvm::Function* f : initials) {
+            b_.CreateCall(f, { state });
+        }
+        b_.CreateRet(llvm::ConstantInt::get(i32, 0));
+    }
+
+    // Power-up the state struct: 4-state signals come up X (must 0, may 1, z 0),
+    // 2-state signals come up 0.
+    void init_state(llvm::Value* state) {
+        for (const SignalSlot& s : slots_) {
+            llvm::Value* sp = b_.CreateStructGEP(state_ty_, state, s.field);
+            llvm::Value* mp = b_.CreateStructGEP(s.ty, sp, 0);
+            llvm::Value* zp = b_.CreateStructGEP(s.ty, sp, 1);
+            // X packs as the high W bits of the i(2W) must|may word (may=1, must=0).
+            llvm::Value* mm = s.four_state
+                                ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * s.width, s.width))
+                                : zero(2 * s.width);
+            b_.CreateStore(mm, mp);
+            b_.CreateStore(zero(s.width), zp);
+        }
     }
 
     // Lower a region's instructions in order into the current insert block.

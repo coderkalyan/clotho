@@ -182,6 +182,10 @@ private:
         ir::Signal      clock = ir::Signal{ 0 };
         ir::Edge        edge  = ir::Edge::Posedge;
 
+        if (sym.procedureKind == ProceduralBlockKind::Initial) {
+            kind = ir::ProcessKind::Initial;
+        }
+
         const Statement& body = sym.getBody();
         if (body.kind == StatementKind::Timed) {
             const TimedStatement&     timed = body.as<TimedStatement>();

@@ -335,6 +335,8 @@ void print_module(const Module& m, std::ostream& os) {
         if (p.kind == ProcessKind::Sequential) {
             os << "kind=seq clk=" << (p.clock_edge == Edge::Posedge ? "posedge" : "negedge") << " s"
                << static_cast<uint32_t>(p.clock);
+        } else if (p.kind == ProcessKind::Initial) {
+            os << "kind=initial";
         } else {
             os << "kind=comb";
         }

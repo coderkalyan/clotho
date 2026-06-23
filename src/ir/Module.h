@@ -42,10 +42,12 @@ struct SignalInfo {
 // Handle to a process: an index into Module::processes.
 enum class ProcessId : uint32_t {};
 
-// Whether a process settles combinationally or updates on a clock edge.
+// Whether a process settles combinationally, updates on a clock edge, or runs
+// once at time zero (an initial block).
 enum class ProcessKind : uint8_t {
     Comb,
     Sequential,
+    Initial,
 };
 
 // Active edge of a sequential process's clock.
