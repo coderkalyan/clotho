@@ -8,7 +8,7 @@ namespace {
 
 // Render an interned type compactly, e.g. `logic[7:0]`. Free function so both
 // the instruction printer and the module signal table can reuse it.
-void renderType(const InternPool& pool, Ref type, std::ostream& os) {
+void render_type(const InternPool& pool, Ref type, std::ostream& os) {
     if (type == Ref::Invalid) {
         os << "<?>";
         return;
@@ -28,18 +28,18 @@ void renderType(const InternPool& pool, Ref type, std::ostream& os) {
             os << "bit";
             break;
         case Type::Kind::PackedArray:
-            renderType(pool, t.element, os);
+            render_type(pool, t.element, os);
             os << "[" << t.left << ":" << t.right << "]";
             break;
         case Type::Kind::UnpackedArray:
-            renderType(pool, t.element, os);
+            render_type(pool, t.element, os);
             os << " [" << t.left << ":" << t.right << "]";
             break;
     }
 }
 
 // Short mnemonic for an instruction tag (snake_case, femtoc-style).
-const char* tagName(Inst::Tag tag) {
+const char* tag_name(Inst::Tag tag) {
     using T = Inst::Tag;
     switch (tag) {
         case T::Constant:
@@ -129,7 +129,7 @@ public:
 
     void run() {
         for (Index i : ir_.root()) {
-            renderInst(i, 0);
+            render_inst(i, 0);
         }
     }
 
@@ -147,16 +147,16 @@ private:
     }
 
     // Render an interned type compactly, e.g. `logic[7:0]`.
-    void renderType(Ref type) {
-        clotho::ir::renderType(ir_.pool, type, os_);
+    void render_type(Ref type) {
+        clotho::ir::render_type(ir_.pool, type, os_);
     }
 
     // Render an interned constant as `<type> 0x<val-plane>`. Only the value
     // plane is shown; a trailing `+xz` flags any unknown bits.
-    void renderConstant(Ref value) {
+    void render_constant(Ref value) {
         const Value& v   = std::get<Value>(ir_.pool.get(value));
         const auto   all = ir_.pool.bytes(value);
-        renderType(v.type);
+        render_type(v.type);
 
         const auto planes      = static_cast<size_t>(ir_.pool.layout(v.type).domain);
         const auto plane_bytes = planes ? all.size() / planes : all.size();
@@ -181,18 +181,18 @@ private:
     }
 
     // Render one instruction line (and, for cond, its nested region blocks).
-    void renderInst(Index i, int depth) {
+    void render_inst(Index i, int depth) {
         indent(depth);
         ref(i);
-        os_ << " = " << tagName(ir_.tag(i)) << "(";
+        os_ << " = " << tag_name(ir_.tag(i)) << "(";
 
         const Inst::Tag      tag = ir_.tag(i);
         const Inst::Payload& p   = ir_.payload(i);
-        switch (payloadKind(tag)) {
+        switch (payload_kind(tag)) {
             case Inst::PayloadKind::None:
                 break;
             case Inst::PayloadKind::Ref:
-                renderConstant(p.ref);
+                render_constant(p.ref);
                 break;
             case Inst::PayloadKind::Signal:
                 os_ << "s" << static_cast<uint32_t>(p.signal);
@@ -208,11 +208,11 @@ private:
             case Inst::PayloadKind::OpType:
                 ref(p.op_type.op);
                 os_ << " -> ";
-                renderType(p.op_type.type);
+                render_type(p.op_type.type);
                 break;
             case Inst::PayloadKind::Arg:
                 os_ << "#" << p.arg.position << ": ";
-                renderType(p.arg.type);
+                render_type(p.arg.type);
                 break;
             case Inst::PayloadKind::Repl:
                 ref(p.repl.value);
@@ -220,7 +220,7 @@ private:
                 break;
             case Inst::PayloadKind::Extra: {
                 // concat: variadic operands.
-                const auto parts = ir_.region(ir_.extraData<ExtraSlice>(p.extra));
+                const auto parts = ir_.region(ir_.extra_data<ExtraSlice>(p.extra));
                 for (size_t k = 0; k < parts.size(); ++k) {
                     if (k != 0) {
                         os_ << ", ";
@@ -230,7 +230,7 @@ private:
                 break;
             }
             case Inst::PayloadKind::OpExtra:
-                renderOpExtra(tag, p, depth);
+                render_op_extra(tag, p, depth);
                 return; // cond closes its own line; others fall through below.
         }
 
@@ -238,10 +238,10 @@ private:
     }
 
     // Render the op-plus-extra payloads (mux, part_select, cond).
-    void renderOpExtra(Inst::Tag tag, const Inst::Payload& p, int depth) {
+    void render_op_extra(Inst::Tag tag, const Inst::Payload& p, int depth) {
         switch (tag) {
             case Inst::Tag::Mux: {
-                const Mux m = ir_.extraData<Mux>(p.op_extra.extra);
+                const Mux m = ir_.extra_data<Mux>(p.op_extra.extra);
                 ref(p.op_extra.op);
                 os_ << " ? ";
                 ref(m.a);
@@ -251,17 +251,17 @@ private:
                 break;
             }
             case Inst::Tag::PartSelect: {
-                const PartSelect ps = ir_.extraData<PartSelect>(p.op_extra.extra);
+                const PartSelect ps = ir_.extra_data<PartSelect>(p.op_extra.extra);
                 ref(p.op_extra.op);
                 os_ << "[" << ps.msb << ":" << ps.lsb << "])\n";
                 break;
             }
             case Inst::Tag::Cond: {
-                const Regions regions = ir_.extraData<Regions>(p.op_extra.extra);
+                const Regions regions = ir_.extra_data<Regions>(p.op_extra.extra);
                 ref(p.op_extra.op);
                 os_ << ") {\n";
-                renderRegion("then", regions.then_, depth);
-                renderRegion("else", regions.else_, depth);
+                render_region("then", regions.then_, depth);
+                render_region("else", regions.else_, depth);
                 indent(depth);
                 os_ << "}\n";
                 break;
@@ -273,11 +273,11 @@ private:
     }
 
     // Render a labelled region body, indented one level under its op.
-    void renderRegion(const char* label, ExtraSlice slice, int depth) {
+    void render_region(const char* label, ExtraSlice slice, int depth) {
         indent(depth + 1);
         os_ << label << ":\n";
         for (Index child : ir_.region(slice)) {
-            renderInst(child, depth + 2);
+            render_inst(child, depth + 2);
         }
     }
 
@@ -300,15 +300,15 @@ std::string toString(const Ir& ir) {
 
 namespace {
 
-const char* dirName(SignalInfo::Dir dir) {
+const char* direction_name(SignalInfo::Direction dir) {
     switch (dir) {
-        case SignalInfo::Dir::Internal:
+        case SignalInfo::Direction::Internal:
             return "internal";
-        case SignalInfo::Dir::Input:
+        case SignalInfo::Direction::Input:
             return "input";
-        case SignalInfo::Dir::Output:
+        case SignalInfo::Direction::Output:
             return "output";
-        case SignalInfo::Dir::Inout:
+        case SignalInfo::Direction::Inout:
             return "inout";
     }
 
@@ -317,22 +317,22 @@ const char* dirName(SignalInfo::Dir dir) {
 
 } // namespace
 
-void printModule(const Module& m, std::ostream& os) {
+void print_module(const Module& m, std::ostream& os) {
     os << "module " << m.name << "\n";
 
     const auto signals = m.signals();
     for (size_t i = 0; i < signals.size(); ++i) {
         const SignalInfo& s = signals[i];
         os << "  s" << i << ": ";
-        renderType(m.pool, s.type, os);
-        os << " " << s.name << " (" << dirName(s.dir) << ")\n";
+        render_type(m.pool, s.type, os);
+        os << " " << s.name << " (" << direction_name(s.dir) << ")\n";
     }
 
     const auto processes = m.processes();
     for (size_t i = 0; i < processes.size(); ++i) {
         const Process& p = processes[i];
         os << "process[" << i << "] ";
-        if (p.kind == ProcKind::Sequential) {
+        if (p.kind == ProcessKind::Sequential) {
             os << "kind=seq clk=" << (p.clock_edge == Edge::Posedge ? "posedge" : "negedge") << " s"
                << static_cast<uint32_t>(p.clock);
         } else {
@@ -345,7 +345,7 @@ void printModule(const Module& m, std::ostream& os) {
 
 std::string toString(const Module& m) {
     std::ostringstream os;
-    printModule(m, os);
+    print_module(m, os);
 
     return os.str();
 }

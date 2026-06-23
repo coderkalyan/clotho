@@ -2,7 +2,7 @@
 
 namespace clotho::ir {
 
-Inst::PayloadKind payloadKind(Inst::Tag tag) {
+Inst::PayloadKind payload_kind(Inst::Tag tag) {
     using T = Inst::Tag;
     using K = Inst::PayloadKind;
     switch (tag) {
@@ -64,7 +64,7 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
     const auto  tag = this->tag(inst);
     const auto& p   = payload(inst);
 
-    switch (payloadKind(tag)) {
+    switch (payload_kind(tag)) {
         case Inst::PayloadKind::None:
         case Inst::PayloadKind::Ref:
         case Inst::PayloadKind::Signal:
@@ -90,8 +90,8 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
 
         case Inst::PayloadKind::Extra: {
             // concat: variadic operands live in the extra buffer.
-            const auto slice = extraData<ExtraSlice>(p.extra);
-            return indexSlice(slice);
+            const auto slice = extra_data<ExtraSlice>(p.extra);
+            return index_slice(slice);
         }
 
         case Inst::PayloadKind::OpExtra:
@@ -99,7 +99,7 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
             // expose only their primary operand (regions / bounds aren't SSA
             // operands).
             if (tag == Inst::Tag::Mux) {
-                const auto mux = extraData<Mux>(p.op_extra.extra);
+                const auto mux = extra_data<Mux>(p.op_extra.extra);
                 scratch[0]     = p.op_extra.op;
                 scratch[1]     = mux.a;
                 scratch[2]     = mux.b;

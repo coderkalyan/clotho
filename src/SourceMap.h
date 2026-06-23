@@ -11,9 +11,9 @@
 namespace clotho {
 
 // Pack a slang source location into the opaque IR handle.
-ir::SourceLoc toSourceLoc(slang::SourceLocation loc);
+ir::SourceLoc to_source_loc(slang::SourceLocation loc);
 
 // Unpack an IR handle back into a slang source location.
-slang::SourceLocation toSlangLocation(ir::SourceLoc loc);
+slang::SourceLocation to_slang_location(ir::SourceLoc loc);
 
 } // namespace clotho

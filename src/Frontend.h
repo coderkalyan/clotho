@@ -13,6 +13,6 @@ struct ParseResult {
 };
 
 // Parse a SystemVerilog source fragment, reporting whether it parsed cleanly.
-ParseResult parseSource(std::string_view text);
+ParseResult parse_source(std::string_view text);
 
 } // namespace clotho

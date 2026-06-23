@@ -2,20 +2,21 @@
 
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <vector>
+
+#include <ankerl/unordered_dense.h>
 
 #include <slang/ast/Compilation.h>
 #include <slang/ast/Expression.h>
-#include <slang/ast/Statement.h>
 #include <slang/ast/SemanticFacts.h>
+#include <slang/ast/Statement.h>
 #include <slang/ast/TimingControl.h>
 #include <slang/ast/expressions/AssignmentExpressions.h>
 #include <slang/ast/expressions/ConversionExpression.h>
 #include <slang/ast/expressions/LiteralExpressions.h>
 #include <slang/ast/expressions/MiscExpressions.h>
-#include <slang/ast/expressions/OperatorExpressions.h>
 #include <slang/ast/expressions/Operator.h>
+#include <slang/ast/expressions/OperatorExpressions.h>
 #include <slang/ast/expressions/SelectExpressions.h>
 #include <slang/ast/statements/ConditionalStatements.h>
 #include <slang/ast/statements/MiscStatements.h>
@@ -45,19 +46,19 @@ struct LowerError {
     std::string message;
 };
 
-ir::SignalInfo::Dir dirOf(slang::ast::ArgumentDirection d) {
+ir::SignalInfo::Direction direction_of(slang::ast::ArgumentDirection d) {
     switch (d) {
         case slang::ast::ArgumentDirection::In:
-            return ir::SignalInfo::Dir::Input;
+            return ir::SignalInfo::Direction::Input;
         case slang::ast::ArgumentDirection::Out:
-            return ir::SignalInfo::Dir::Output;
+            return ir::SignalInfo::Direction::Output;
         case slang::ast::ArgumentDirection::InOut:
-            return ir::SignalInfo::Dir::Inout;
+            return ir::SignalInfo::Direction::Inout;
         case slang::ast::ArgumentDirection::Ref:
-            return ir::SignalInfo::Dir::Internal;
+            return ir::SignalInfo::Direction::Internal;
     }
 
-    return ir::SignalInfo::Dir::Internal;
+    return ir::SignalInfo::Direction::Internal;
 }
 
 // Walks the elaborated AST of one top module into an ir::Module.
@@ -66,16 +67,16 @@ public:
     explicit Lowerer(ir::Module& module)
       : module_(module) {}
 
-    void lowerInstance(const InstanceSymbol& top) {
-        module_.name = std::string(top.name);
+    void lower_instance(const InstanceSymbol& top) {
+        module_.name                   = std::string(top.name);
         const InstanceBodySymbol& body = top.body;
-        collectSignals(body);
+        collect_signals(body);
 
         for (const Symbol& m : body.members()) {
             if (m.kind == SymbolKind::ContinuousAssign) {
-                lowerContinuousAssign(m.as<ContinuousAssignSymbol>());
+                lower_continuous_assign(m.as<ContinuousAssignSymbol>());
             } else if (m.kind == SymbolKind::ProceduralBlock) {
-                lowerProceduralBlock(m.as<ProceduralBlockSymbol>());
+                lower_procedural_block(m.as<ProceduralBlockSymbol>());
             }
         }
     }
@@ -86,15 +87,15 @@ private:
     }
 
     ir::SourceLoc loc(const Expression& e) const {
-        return toSourceLoc(e.sourceRange.start());
+        return to_source_loc(e.sourceRange.start());
     }
     ir::SourceLoc loc(const Statement& s) const {
-        return toSourceLoc(s.sourceRange.start());
+        return to_source_loc(s.sourceRange.start());
     }
 
     // -- Types --
 
-    ir::Ref lowerType(const slang::ast::Type& type) {
+    ir::Ref lower_type(const slang::ast::Type& type) {
         const slang::ast::Type& ct = type.getCanonicalType();
         if (ct.isVoid()) {
             return module_.pool.void_type;
@@ -103,10 +104,10 @@ private:
             fail("unsupported non-integral type");
         }
 
-        const uint32_t width    = ct.getBitWidth();
-        const bool     is_four  = ct.isFourState();
+        const uint32_t width     = ct.getBitWidth();
+        const bool     is_four   = ct.isFourState();
         const bool     is_signed = ct.isSigned();
-        const ir::Ref  element  = is_four ? module_.pool.logic_type : module_.pool.bit_type;
+        const ir::Ref  element   = is_four ? module_.pool.logic_type : module_.pool.bit_type;
 
         if (width == 1 && !is_signed) {
             return element;
@@ -124,14 +125,14 @@ private:
 
     // -- Signals --
 
-    void collectSignals(const InstanceBodySymbol& body) {
+    void collect_signals(const InstanceBodySymbol& body) {
         // First pass: record port directions by the symbol they back.
-        std::unordered_map<const Symbol*, ir::SignalInfo::Dir> port_dir;
+        ankerl::unordered_dense::map<const Symbol*, ir::SignalInfo::Direction> port_dir;
         for (const Symbol& m : body.members()) {
             if (m.kind == SymbolKind::Port) {
                 const PortSymbol& p = m.as<PortSymbol>();
                 if (p.internalSymbol) {
-                    port_dir[p.internalSymbol] = dirOf(p.direction);
+                    port_dir[p.internalSymbol] = direction_of(p.direction);
                 }
             }
         }
@@ -145,15 +146,15 @@ private:
 
             ir::SignalInfo info;
             info.name        = std::string(vs.name);
-            info.type        = lowerType(vs.getType());
+            info.type        = lower_type(vs.getType());
             const auto found = port_dir.find(&m);
-            info.dir         = found != port_dir.end() ? found->second : ir::SignalInfo::Dir::Internal;
+            info.dir         = found != port_dir.end() ? found->second : ir::SignalInfo::Direction::Internal;
 
-            sigmap_[&vs] = module_.addSignal(std::move(info));
+            sigmap_[&vs] = module_.add_signal(std::move(info));
         }
     }
 
-    ir::Signal signalOf(const ValueSymbol& sym) {
+    ir::Signal signal_of(const ValueSymbol& sym) {
         const auto it = sigmap_.find(&sym);
         if (it == sigmap_.end()) {
             fail("reference to unknown signal '" + std::string(sym.name) + "'");
@@ -164,48 +165,49 @@ private:
 
     // -- Processes --
 
-    void lowerContinuousAssign(const ContinuousAssignSymbol& sym) {
+    void lower_continuous_assign(const ContinuousAssignSymbol& sym) {
         const Expression& e = sym.getAssignment();
         if (e.kind != ExpressionKind::Assignment) {
             fail("malformed continuous assignment");
         }
 
         ir::Builder b(module_.pool);
-        lowerAssign(e.as<AssignmentExpression>(), b);
-        module_.addProcess(ir::Process{ .kind = ir::ProcKind::Comb, .ir = b.finish() });
+        lower_assign(e.as<AssignmentExpression>(), b);
+        module_.add_process(
+          ir::Process{ .kind = ir::ProcessKind::Comb, .loc = to_source_loc(sym.location), .ir = b.finish() });
     }
 
-    void lowerProceduralBlock(const ProceduralBlockSymbol& sym) {
-        ir::ProcKind kind  = ir::ProcKind::Comb;
-        ir::Signal   clock = ir::Signal{ 0 };
-        ir::Edge     edge  = ir::Edge::Posedge;
+    void lower_procedural_block(const ProceduralBlockSymbol& sym) {
+        ir::ProcessKind kind  = ir::ProcessKind::Comb;
+        ir::Signal      clock = ir::Signal{ 0 };
+        ir::Edge        edge  = ir::Edge::Posedge;
 
         const Statement& body = sym.getBody();
         if (body.kind == StatementKind::Timed) {
-            const TimedStatement&      timed = body.as<TimedStatement>();
-            const SignalEventControl*  ev    = findEdgeEvent(timed.timing);
+            const TimedStatement&     timed = body.as<TimedStatement>();
+            const SignalEventControl* ev    = find_edge_event(timed.timing);
             if (ev != nullptr && ev->edge != slang::ast::EdgeKind::None) {
-                kind  = ir::ProcKind::Sequential;
+                kind  = ir::ProcessKind::Sequential;
                 edge  = ev->edge == slang::ast::EdgeKind::NegEdge ? ir::Edge::Negedge : ir::Edge::Posedge;
-                clock = clockSignal(ev->expr);
+                clock = clock_signal(ev->expr);
             }
         }
 
         ir::Builder b(module_.pool);
-        lowerStmt(body, b);
-        module_.addProcess(
-            ir::Process{ .kind = kind, .clock = clock, .clock_edge = edge, .ir = b.finish() });
+        lower_stmt(body, b);
+        module_.add_process(ir::Process{
+          .kind = kind, .clock = clock, .clock_edge = edge, .loc = to_source_loc(sym.location), .ir = b.finish() });
     }
 
     // Find the first edge-triggered signal event in a timing control (descends
     // into event lists, e.g. @(posedge clk or negedge rst)).
-    const SignalEventControl* findEdgeEvent(const TimingControl& tc) {
+    const SignalEventControl* find_edge_event(const TimingControl& tc) {
         if (tc.kind == TimingControlKind::SignalEvent) {
             return &tc.as<SignalEventControl>();
         }
         if (tc.kind == TimingControlKind::EventList) {
             for (const TimingControl* e : tc.as<EventListControl>().events) {
-                if (const SignalEventControl* found = findEdgeEvent(*e)) {
+                if (const SignalEventControl* found = find_edge_event(*e)) {
                     return found;
                 }
             }
@@ -214,39 +216,39 @@ private:
         return nullptr;
     }
 
-    ir::Signal clockSignal(const Expression& e) {
+    ir::Signal clock_signal(const Expression& e) {
         if (e.kind == ExpressionKind::NamedValue) {
-            return signalOf(e.as<NamedValueExpression>().symbol);
+            return signal_of(e.as<NamedValueExpression>().symbol);
         }
         fail("unsupported clock expression");
     }
 
     // -- Statements --
 
-    void lowerStmt(const Statement& stmt, ir::Builder& b) {
+    void lower_stmt(const Statement& stmt, ir::Builder& b) {
         switch (stmt.kind) {
             case StatementKind::List:
                 for (const Statement* s : stmt.as<StatementList>().list) {
-                    lowerStmt(*s, b);
+                    lower_stmt(*s, b);
                 }
                 break;
             case StatementKind::Block:
-                lowerStmt(stmt.as<BlockStatement>().body, b);
+                lower_stmt(stmt.as<BlockStatement>().body, b);
                 break;
             case StatementKind::Timed:
                 // Timing already consumed for sensitivity; lower the body.
-                lowerStmt(stmt.as<TimedStatement>().stmt, b);
+                lower_stmt(stmt.as<TimedStatement>().stmt, b);
                 break;
             case StatementKind::ExpressionStatement: {
                 const Expression& e = stmt.as<ExpressionStatement>().expr;
                 if (e.kind != ExpressionKind::Assignment) {
                     fail("unsupported expression statement");
                 }
-                lowerAssign(e.as<AssignmentExpression>(), b);
+                lower_assign(e.as<AssignmentExpression>(), b);
                 break;
             }
             case StatementKind::Conditional:
-                lowerConditional(stmt.as<ConditionalStatement>(), b);
+                lower_conditional(stmt.as<ConditionalStatement>(), b);
                 break;
             case StatementKind::Empty:
             case StatementKind::VariableDeclaration:
@@ -260,31 +262,31 @@ private:
         }
     }
 
-    void lowerConditional(const ConditionalStatement& c, ir::Builder& b) {
+    void lower_conditional(const ConditionalStatement& c, ir::Builder& b) {
         if (c.conditions.size() != 1) {
             fail("unsupported multi-condition if");
         }
-        const ir::Index pred = lowerExpr(*c.conditions[0].expr, b);
+        const ir::Index pred = lower_expr(*c.conditions[0].expr, b);
 
-        b.openRegion();
-        lowerStmt(c.ifTrue, b);
-        const ir::ExtraSlice then_region = b.closeRegion();
+        b.open_region();
+        lower_stmt(c.ifTrue, b);
+        const ir::ExtraSlice then_region = b.close_region();
 
-        b.openRegion();
+        b.open_region();
         if (c.ifFalse != nullptr) {
-            lowerStmt(*c.ifFalse, b);
+            lower_stmt(*c.ifFalse, b);
         }
-        const ir::ExtraSlice else_region = b.closeRegion();
+        const ir::ExtraSlice else_region = b.close_region();
 
         b.cond(pred, then_region, else_region, loc(c));
     }
 
-    void lowerAssign(const AssignmentExpression& a, ir::Builder& b) {
+    void lower_assign(const AssignmentExpression& a, ir::Builder& b) {
         if (a.isCompound()) {
             fail("compound assignment not supported");
         }
-        const ir::Index  lhs = lowerLvalue(a.left(), b);
-        const ir::Index  rhs = lowerExpr(a.right(), b);
+        const ir::Index     lhs = lower_lvalue(a.left(), b);
+        const ir::Index     rhs = lower_expr(a.right(), b);
         const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
         b.binary(tag, lhs, rhs, loc(a));
     }
@@ -292,48 +294,48 @@ private:
     // -- Expressions --
 
     // Lower an expression as an rvalue, returning the SSA value index.
-    ir::Index lowerExpr(const Expression& expr, ir::Builder& b) {
+    ir::Index lower_expr(const Expression& expr, ir::Builder& b) {
         const ir::SourceLoc l = loc(expr);
         switch (expr.kind) {
             case ExpressionKind::IntegerLiteral: {
-                const ir::Ref  ty   = lowerType(*expr.type);
+                const ir::Ref  ty   = lower_type(*expr.type);
                 const uint64_t bits = expr.as<IntegerLiteral>().getValue().as<uint64_t>().value_or(0);
-                return b.constant(module_.pool.putInt(ty, bits), l);
+                return b.constant(module_.pool.put_int(ty, bits), l);
             }
             case ExpressionKind::NamedValue: {
-                const ir::Signal sig = signalOf(expr.as<NamedValueExpression>().symbol);
+                const ir::Signal sig = signal_of(expr.as<NamedValueExpression>().symbol);
                 return b.unary(ir::Inst::Tag::Load, b.signal(sig, l), l);
             }
             case ExpressionKind::UnaryOp:
-                return lowerUnary(expr.as<UnaryExpression>(), b);
+                return lower_unary(expr.as<UnaryExpression>(), b);
             case ExpressionKind::BinaryOp:
-                return lowerBinary(expr.as<BinaryExpression>(), b);
+                return lower_binary(expr.as<BinaryExpression>(), b);
             case ExpressionKind::ConditionalOp: {
                 const ConditionalExpression& c = expr.as<ConditionalExpression>();
                 if (c.conditions.size() != 1) {
                     fail("unsupported multi-condition ?:");
                 }
-                const ir::Index pred = lowerExpr(*c.conditions[0].expr, b);
-                const ir::Index a    = lowerExpr(c.left(), b);
-                const ir::Index bb   = lowerExpr(c.right(), b);
+                const ir::Index pred = lower_expr(*c.conditions[0].expr, b);
+                const ir::Index a    = lower_expr(c.left(), b);
+                const ir::Index bb   = lower_expr(c.right(), b);
                 return b.mux(pred, a, bb, l);
             }
             case ExpressionKind::Concatenation: {
                 std::vector<ir::Index> parts;
                 for (const Expression* op : expr.as<ConcatenationExpression>().operands()) {
-                    parts.push_back(lowerExpr(*op, b));
+                    parts.push_back(lower_expr(*op, b));
                 }
                 return b.concat(parts, l);
             }
             case ExpressionKind::Replication: {
                 const ReplicationExpression& r     = expr.as<ReplicationExpression>();
-                const uint64_t               count = constUInt(r.count());
-                return b.repl(lowerExpr(r.concat(), b), static_cast<uint32_t>(count), l);
+                const uint64_t               count = const_uint(r.count());
+                return b.repl(lower_expr(r.concat(), b), static_cast<uint32_t>(count), l);
             }
             case ExpressionKind::ElementSelect: {
-                const ElementSelectExpression& es = expr.as<ElementSelectExpression>();
-                const ir::Index base = lowerLvalue(es.value(), b);
-                const ir::Index idx  = lowerExpr(es.selector(), b);
+                const ElementSelectExpression& es   = expr.as<ElementSelectExpression>();
+                const ir::Index                base = lower_lvalue(es.value(), b);
+                const ir::Index                idx  = lower_expr(es.selector(), b);
                 return b.unary(ir::Inst::Tag::Load, b.binary(ir::Inst::Tag::BitSelect, base, idx, l), l);
             }
             case ExpressionKind::RangeSelect: {
@@ -341,23 +343,23 @@ private:
                 if (rs.getSelectionKind() != RangeSelectionKind::Simple) {
                     fail("only constant [msb:lsb] part-selects are supported");
                 }
-                const ir::Index base = lowerLvalue(rs.value(), b);
-                const auto      msb  = static_cast<uint32_t>(constUInt(rs.left()));
-                const auto      lsb  = static_cast<uint32_t>(constUInt(rs.right()));
-                return b.unary(ir::Inst::Tag::Load, b.partSelect(base, msb, lsb, l), l);
+                const ir::Index base = lower_lvalue(rs.value(), b);
+                const auto      msb  = static_cast<uint32_t>(const_uint(rs.left()));
+                const auto      lsb  = static_cast<uint32_t>(const_uint(rs.right()));
+                return b.unary(ir::Inst::Tag::Load, b.part_select(base, msb, lsb, l), l);
             }
             case ExpressionKind::Conversion: {
                 const ConversionExpression& cv = expr.as<ConversionExpression>();
-                return b.resize(lowerExpr(cv.operand(), b), lowerType(*expr.type), l);
+                return b.resize(lower_expr(cv.operand(), b), lower_type(*expr.type), l);
             }
             default:
                 fail("unsupported expression");
         }
     }
 
-    ir::Index lowerUnary(const UnaryExpression& u, ir::Builder& b) {
+    ir::Index lower_unary(const UnaryExpression& u, ir::Builder& b) {
         const ir::SourceLoc l  = loc(u);
-        const ir::Index     op = lowerExpr(u.operand(), b);
+        const ir::Index     op = lower_expr(u.operand(), b);
         using U                = slang::ast::UnaryOperator;
         using T                = ir::Inst::Tag;
         switch (u.op) {
@@ -380,7 +382,7 @@ private:
             case U::Plus:
                 return op;
             case U::Minus: {
-                const ir::Index zero = b.constant(module_.pool.putInt(lowerType(*u.type), 0), l);
+                const ir::Index zero = b.constant(module_.pool.put_int(lower_type(*u.type), 0), l);
                 return b.binary(T::Sub, zero, op, l);
             }
             default:
@@ -388,10 +390,10 @@ private:
         }
     }
 
-    ir::Index lowerBinary(const BinaryExpression& bin, ir::Builder& b) {
+    ir::Index lower_binary(const BinaryExpression& bin, ir::Builder& b) {
         const ir::SourceLoc l   = loc(bin);
-        const ir::Index     lhs = lowerExpr(bin.left(), b);
-        const ir::Index     rhs = lowerExpr(bin.right(), b);
+        const ir::Index     lhs = lower_expr(bin.left(), b);
+        const ir::Index     rhs = lower_expr(bin.right(), b);
         using B                 = slang::ast::BinaryOperator;
         using T                 = ir::Inst::Tag;
 
@@ -439,15 +441,15 @@ private:
     }
 
     // Lower an expression as an lvalue, returning the lvalue index (no Load).
-    ir::Index lowerLvalue(const Expression& expr, ir::Builder& b) {
+    ir::Index lower_lvalue(const Expression& expr, ir::Builder& b) {
         const ir::SourceLoc l = loc(expr);
         switch (expr.kind) {
             case ExpressionKind::NamedValue:
-                return b.signal(signalOf(expr.as<NamedValueExpression>().symbol), l);
+                return b.signal(signal_of(expr.as<NamedValueExpression>().symbol), l);
             case ExpressionKind::ElementSelect: {
-                const ElementSelectExpression& es = expr.as<ElementSelectExpression>();
-                const ir::Index base = lowerLvalue(es.value(), b);
-                const ir::Index idx  = lowerExpr(es.selector(), b);
+                const ElementSelectExpression& es   = expr.as<ElementSelectExpression>();
+                const ir::Index                base = lower_lvalue(es.value(), b);
+                const ir::Index                idx  = lower_expr(es.selector(), b);
                 return b.binary(ir::Inst::Tag::BitSelect, base, idx, l);
             }
             case ExpressionKind::RangeSelect: {
@@ -455,10 +457,10 @@ private:
                 if (rs.getSelectionKind() != RangeSelectionKind::Simple) {
                     fail("only constant [msb:lsb] part-selects are supported");
                 }
-                const ir::Index base = lowerLvalue(rs.value(), b);
-                const auto      msb  = static_cast<uint32_t>(constUInt(rs.left()));
-                const auto      lsb  = static_cast<uint32_t>(constUInt(rs.right()));
-                return b.partSelect(base, msb, lsb, l);
+                const ir::Index base = lower_lvalue(rs.value(), b);
+                const auto      msb  = static_cast<uint32_t>(const_uint(rs.left()));
+                const auto      lsb  = static_cast<uint32_t>(const_uint(rs.right()));
+                return b.part_select(base, msb, lsb, l);
             }
             default:
                 fail("unsupported assignment target");
@@ -466,7 +468,7 @@ private:
     }
 
     // Read a constant integer expression (literal, possibly behind conversions).
-    uint64_t constUInt(const Expression& e) {
+    uint64_t const_uint(const Expression& e) {
         const Expression* p = &e;
         while (p->kind == ExpressionKind::Conversion) {
             p = &p->as<ConversionExpression>().operand();
@@ -479,15 +481,15 @@ private:
 
     ir::Module& module_;
     // Maps an elaborated value symbol to its module Signal handle.
-    std::unordered_map<const ValueSymbol*, ir::Signal> sigmap_;
+    ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal> sigmap_;
 };
 
-LowerResult lowerCompilation(slang::ast::Compilation& comp) {
+LowerResult lower_compilation(slang::ast::Compilation& comp) {
     LowerResult result;
 
-    const slang::Diagnostics&    diags = comp.getAllDiagnostics();
-    const slang::SourceManager*  sm    = comp.getSourceManager();
-    bool                         has_error = false;
+    const slang::Diagnostics&   diags     = comp.getAllDiagnostics();
+    const slang::SourceManager* sm        = comp.getSourceManager();
+    bool                        has_error = false;
     if (sm != nullptr && !diags.empty()) {
         slang::DiagnosticEngine engine(*sm);
         auto                    client = std::make_shared<slang::TextDiagnosticClient>();
@@ -510,7 +512,7 @@ LowerResult lowerCompilation(slang::ast::Compilation& comp) {
 
     auto module = std::make_unique<ir::Module>();
     try {
-        Lowerer(*module).lowerInstance(*root.topInstances[0]);
+        Lowerer(*module).lower_instance(*root.topInstances[0]);
     } catch (const LowerError& e) {
         result.diagnostics += "error: " + e.message + "\n";
         return result;
@@ -524,26 +526,26 @@ LowerResult lowerCompilation(slang::ast::Compilation& comp) {
 
 } // namespace
 
-LowerResult lowerFile(std::string_view path) {
+LowerResult lower_file(std::string_view path) {
     auto tree = slang::syntax::SyntaxTree::fromFile(path);
     if (!tree) {
         LowerResult result;
         result.diagnostics =
-            "error: cannot read '" + std::string(path) + "': " + std::string(tree.error().second) + "\n";
+          "error: cannot read '" + std::string(path) + "': " + std::string(tree.error().second) + "\n";
         return result;
     }
 
     slang::ast::Compilation comp;
     comp.addSyntaxTree(*tree);
 
-    return lowerCompilation(comp);
+    return lower_compilation(comp);
 }
 
-LowerResult lowerText(std::string_view source) {
+LowerResult lower_text(std::string_view source) {
     slang::ast::Compilation comp;
     comp.addSyntaxTree(slang::syntax::SyntaxTree::fromText(source));
 
-    return lowerCompilation(comp);
+    return lower_compilation(comp);
 }
 
 } // namespace clotho

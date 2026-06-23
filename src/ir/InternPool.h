@@ -42,7 +42,7 @@ enum class Domain : uint8_t {
 
 // Canonical bytes of one plane for a packed value of the given width (IEEE-style
 // sizing): W<=8 -> 1B, <=16 -> 2B, <=32 -> 4B, <=64 -> 8B, else ceil(W/64) words.
-constexpr uint32_t planeBytes(uint32_t width) {
+constexpr uint32_t plane_bytes(uint32_t width) {
     if (width == 0) {
         return 0;
     }
@@ -116,7 +116,7 @@ using Item = std::variant<Type, Value>;
 inline constexpr uint32_t kInlineValueBytes = sizeof(Value{}.data.inline_bytes);
 
 // Resolve a value's canonical bytes against the pool's spill array.
-inline std::span<const uint8_t> valueBytes(const Value& v, const std::vector<uint8_t>& spill) {
+inline std::span<const uint8_t> value_bytes(const Value& v, const std::vector<uint8_t>& spill) {
     if (v.byte_count <= kInlineValueBytes) {
         return { v.data.inline_bytes, v.byte_count };
     }
@@ -147,7 +147,7 @@ namespace clotho::ir {
 
 // Canonical comparison form of an item: a type, or a value's (type, bytes).
 // Both stored indices and not-yet-interned candidates resolve to this, so
-// hashing and equality have a single implementation (hashView / eqView), and a
+// hashing and equality have a single implementation (hash_view / eq_view), and a
 // candidate can be probed without first being placed in the store.
 struct ItemView {
     bool                     is_type    = false;
@@ -157,16 +157,16 @@ struct ItemView {
 };
 
 // Resolve a stored item to its view (values dereference the spill array).
-inline ItemView viewOf(const Item& item, const std::vector<uint8_t>& spill) {
+inline ItemView view_of(const Item& item, const std::vector<uint8_t>& spill) {
     if (const Type* t = std::get_if<Type>(&item)) {
         return { .is_type = true, .type = *t };
     }
     const Value& v = std::get<Value>(item);
 
-    return { .is_type = false, .value_type = v.type, .value_bytes = valueBytes(v, spill) };
+    return { .is_type = false, .value_type = v.type, .value_bytes = value_bytes(v, spill) };
 }
 
-inline uint64_t hashView(const ItemView& v) {
+inline uint64_t hash_view(const ItemView& v) {
     if (v.is_type) {
         return ankerl::unordered_dense::hash<Type>{}(v.type);
     }
@@ -175,7 +175,7 @@ inline uint64_t hashView(const ItemView& v) {
     return ankerl::unordered_dense::detail::wyhash::hash(h ^ (static_cast<uint64_t>(v.value_type) + 1));
 }
 
-inline bool eqView(const ItemView& a, const ItemView& b) {
+inline bool eq_view(const ItemView& a, const ItemView& b) {
     if (a.is_type != b.is_type) {
         return false;
     }
@@ -193,7 +193,7 @@ struct Layout {
     Domain domain = Domain::Two;
     // Flattened packed width in bits.
     uint32_t width = 0;
-    // Canonical bytes of a whole value: plane_count * planeBytes(width).
+    // Canonical bytes of a whole value: plane_count * plane_bytes(width).
     uint32_t byte_count = 0;
 };
 
@@ -216,10 +216,10 @@ public:
 
     // Intern a value from its canonical plane bytes (length must match the
     // type's layout).
-    Ref putValue(Ref type, std::span<const uint8_t> bytes);
+    Ref put_value(Ref type, std::span<const uint8_t> bytes);
     // Intern a known integer value (width <= 64, 2- or 4-state); the xz plane,
     // if any, is all-zero.
-    Ref putInt(Ref type, uint64_t bits);
+    Ref put_int(Ref type, uint64_t bits);
 
     const Item& get(Ref ref) const;
     // Canonical bytes of an interned value.
@@ -239,10 +239,10 @@ private:
         const std::vector<uint8_t>* spill;
 
         auto operator()(uint32_t i) const -> uint64_t {
-            return hashView(viewOf((*items)[i], *spill));
+            return hash_view(view_of((*items)[i], *spill));
         }
         auto operator()(const ItemView& v) const -> uint64_t {
-            return hashView(v);
+            return hash_view(v);
         }
     };
 
@@ -252,13 +252,13 @@ private:
         const std::vector<uint8_t>* spill;
 
         auto operator()(uint32_t a, uint32_t b) const -> bool {
-            return eqView(viewOf((*items)[a], *spill), viewOf((*items)[b], *spill));
+            return eq_view(view_of((*items)[a], *spill), view_of((*items)[b], *spill));
         }
         auto operator()(uint32_t a, const ItemView& v) const -> bool {
-            return eqView(viewOf((*items)[a], *spill), v);
+            return eq_view(view_of((*items)[a], *spill), v);
         }
         auto operator()(const ItemView& v, uint32_t a) const -> bool {
-            return eqView(v, viewOf((*items)[a], *spill));
+            return eq_view(v, view_of((*items)[a], *spill));
         }
     };
 

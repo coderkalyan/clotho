@@ -22,7 +22,7 @@ std::string toString(const Ir& ir);
 
 // Render a module: its name, signal table (so the body's `s<n>` references are
 // decodable), then each process with a header and its lowered body.
-void printModule(const Module& m, std::ostream& os);
+void print_module(const Module& m, std::ostream& os);
 
 // Render a module to a string.
 std::string toString(const Module& m);

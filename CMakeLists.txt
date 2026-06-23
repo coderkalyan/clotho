@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(clotho CXX)
+project(clotho C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,6 +7,17 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(FetchContent)
+
+# System LLVM (latest installed). Used by the backend for native codegen. This
+# install ships LLVM as a single shared library, so prefer the `LLVM` imported
+# target; fall back to per-component static libs if only those are present.
+find_package(LLVM REQUIRED CONFIG)
+message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION} at ${LLVM_DIR}")
+if(TARGET LLVM)
+  set(LLVM_LIBS LLVM)
+else()
+  llvm_map_components_to_libnames(LLVM_LIBS core support)
+endif()
 
 FetchContent_Declare(
   slang
@@ -45,9 +56,11 @@ add_library(clotho_ir STATIC
   src/ir/Ir.cpp
   src/ir/Builder.cpp
   src/ir/Printer.cpp
+  src/ir/LlvmBackend.cpp
 )
-target_include_directories(clotho_ir PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(clotho_ir PUBLIC unordered_dense::unordered_dense)
+target_include_directories(clotho_ir PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${LLVM_INCLUDE_DIRS})
+target_compile_definitions(clotho_ir PUBLIC ${LLVM_DEFINITIONS})
+target_link_libraries(clotho_ir PUBLIC unordered_dense::unordered_dense ${LLVM_LIBS})
 
 # Front-end and the (future) slang -> IR translation. Pulls in slang and the
 # IR; consumers get both transitively.
@@ -72,6 +85,7 @@ add_executable(clotho_test
   tests/frontend_test.cpp
   tests/sourcemap_test.cpp
   tests/lower_test.cpp
+  tests/llvm_backend_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho doctest::doctest)
 add_test(NAME clotho_test COMMAND clotho_test)

@@ -15,7 +15,7 @@
 //     parallel tag / payload / source-location columns (held directly by Ir)
 //     so a pass that only reads tags never pulls payloads into cache.
 //   * Compact untagged payload union (<=8 bytes). The discriminant lives in
-//     the separate tag column and selects the active member via payloadKind().
+//     the separate tag column and selects the active member via payload_kind().
 //   * Flat u32 "extra" side-table for variable-length / overflow operands and
 //     region bodies. Structs whose every field is a 4-byte handle are overlaid
 //     onto the buffer with std::bit_cast.
@@ -173,7 +173,7 @@ struct Inst {
         Ret,
     };
 
-    // Which union member a tag activates. Drives payloadKind() / operands().
+    // Which union member a tag activates. Drives payload_kind() / operands().
     enum class PayloadKind : uint8_t {
         None,
         Ref,
@@ -245,7 +245,7 @@ static_assert(sizeof(Inst::Payload) <= 8, "payload must stay compact");
 static_assert(std::is_trivially_copyable_v<Inst::Payload>);
 
 // Maps an instruction tag to the active payload union member.
-Inst::PayloadKind payloadKind(Inst::Tag tag);
+Inst::PayloadKind payload_kind(Inst::Tag tag);
 
 // Immutable, finished process IR: a structure of arrays (parallel tag / payload
 // / location columns indexed by Index) plus a flat extra side-table. The body
@@ -256,7 +256,7 @@ public:
     const InternPool& pool;
 
     // Total number of instructions across all regions.
-    size_t instCount() const {
+    size_t inst_count() const {
         return tags_.size();
     }
 
@@ -275,17 +275,17 @@ public:
 
     // The top-level instruction sequence of the process body.
     std::span<const Index> root() const {
-        return indexSlice(root_);
+        return index_slice(root_);
     }
 
     // The instructions of a region (e.g. a cond's then/else branch), in order.
     std::span<const Index> region(ExtraSlice r) const {
-        return indexSlice(r);
+        return index_slice(r);
     }
 
-    // Decode a struct previously written with Builder::addExtra.
+    // Decode a struct previously written with Builder::add_extra.
     template<ExtraPayload T>
-    T extraData(ExtraIndex at) const {
+    T extra_data(ExtraIndex at) const {
         constexpr size_t        n    = sizeof(T) / sizeof(uint32_t);
         const auto              base = static_cast<uint32_t>(at);
         std::array<uint32_t, n> words{};
@@ -306,7 +306,7 @@ private:
     friend class Builder;
 
     // A slice reinterpreted as a run of instruction indices.
-    std::span<const Index> indexSlice(ExtraSlice s) const {
+    std::span<const Index> index_slice(ExtraSlice s) const {
         const auto a = static_cast<uint32_t>(s.start);
         const auto b = static_cast<uint32_t>(s.end);
 

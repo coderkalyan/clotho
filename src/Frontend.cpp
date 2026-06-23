@@ -4,7 +4,7 @@
 
 namespace clotho {
 
-ParseResult parseSource(std::string_view text) {
+ParseResult parse_source(std::string_view text) {
     const auto tree = slang::syntax::SyntaxTree::fromText(text);
     return {
         .parsed      = tree != nullptr,

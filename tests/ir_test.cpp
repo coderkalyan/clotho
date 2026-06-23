@@ -15,7 +15,7 @@ using namespace clotho::ir;
 namespace {
 // A 1-bit known constant value.
 Ref konst(InternPool& pool, uint64_t v) {
-    return pool.putInt(pool.bit_type, v);
+    return pool.put_int(pool.bit_type, v);
 }
 } // namespace
 
@@ -52,9 +52,9 @@ TEST_CASE("interned values round-trip in canonical planes") {
     CHECK(lay.width == 8);
     CHECK(lay.byte_count == 2);
 
-    const Ref a = pool.putInt(byte8, 0xA5);
-    const Ref b = pool.putInt(byte8, 0xA5);
-    const Ref c = pool.putInt(byte8, 0x5A);
+    const Ref a = pool.put_int(byte8, 0xA5);
+    const Ref b = pool.put_int(byte8, 0xA5);
+    const Ref c = pool.put_int(byte8, 0x5A);
     CHECK(a == b); // identical values dedup
     CHECK(a != c);
 
@@ -64,7 +64,7 @@ TEST_CASE("interned values round-trip in canonical planes") {
     CHECK(av[1] == 0x00); // xz plane: all bits known
 
     // bit (2-state) stores a single plane.
-    CHECK(pool.bytes(pool.putInt(pool.bit_type, 1)).size() == 1);
+    CHECK(pool.bytes(pool.put_int(pool.bit_type, 1)).size() == 1);
 
     // logic [127:0]: 32 bytes (> inline) -> spills, and still dedups.
     const Ref wide =
@@ -72,8 +72,8 @@ TEST_CASE("interned values round-trip in canonical planes") {
     CHECK(pool.layout(wide).byte_count == 32);
     std::vector<uint8_t> raw(32, 0);
     raw[0]            = 0xFF;
-    const Ref w       = pool.putValue(wide, raw);
-    const Ref w_again = pool.putValue(wide, raw);
+    const Ref w       = pool.put_value(wide, raw);
+    const Ref w_again = pool.put_value(wide, raw);
     CHECK(w == w_again); // spilled values dedup too
     REQUIRE(pool.bytes(w).size() == 32);
     CHECK(pool.bytes(w)[0] == 0xFF);
@@ -94,7 +94,7 @@ TEST_CASE("build a combinational process and query it") {
     b.binary(Inst::Tag::Store, y, r, loc);
 
     Ir ir = b.finish();
-    REQUIRE(ir.instCount() == 7);
+    REQUIRE(ir.inst_count() == 7);
     REQUIRE(ir.root().size() == 7); // everything is top-level here
 
     CHECK(ir.tag(a) == Inst::Tag::Signal);
@@ -124,13 +124,13 @@ TEST_CASE("structured cond carries then/else regions") {
     const Index vc = b.unary(Inst::Tag::Load, c, loc);
     const Index q  = b.signal(Signal{ 1 }, loc);
 
-    b.openRegion();
+    b.open_region();
     b.binary(Inst::Tag::StoreNb, q, b.constant(konst(pool, 1), loc), loc);
-    const ExtraSlice then_region = b.closeRegion();
+    const ExtraSlice then_region = b.close_region();
 
-    b.openRegion();
+    b.open_region();
     b.binary(Inst::Tag::StoreNb, q, b.constant(konst(pool, 0), loc), loc);
-    const ExtraSlice else_region = b.closeRegion();
+    const ExtraSlice else_region = b.close_region();
 
     const Index cnd = b.cond(vc, then_region, else_region, loc);
 
@@ -145,7 +145,7 @@ TEST_CASE("structured cond carries then/else regions") {
     REQUIRE(cond_ops.size() == 1); // only the condition; regions aren't operands
     CHECK(cond_ops[0] == vc);
 
-    const Regions regions = ir.extraData<Regions>(ir.payload(cnd).op_extra.extra);
+    const Regions regions = ir.extra_data<Regions>(ir.payload(cnd).op_extra.extra);
     CHECK(ir.region(regions.then_).size() == 2); // constant + store_nb
     CHECK(ir.region(regions.else_).size() == 2);
     CHECK(ir.tag(ir.region(regions.then_)[1]) == Inst::Tag::StoreNb);
@@ -213,13 +213,13 @@ TEST_CASE("printer indents cond regions and decodes constants") {
     const Index vc = b.unary(Inst::Tag::Load, c, loc);
     const Index q  = b.signal(Signal{ 1 }, loc);
 
-    b.openRegion();
+    b.open_region();
     b.binary(Inst::Tag::StoreNb, q, b.constant(konst(pool, 1), loc), loc);
-    const ExtraSlice then_region = b.closeRegion();
+    const ExtraSlice then_region = b.close_region();
 
-    b.openRegion();
+    b.open_region();
     b.binary(Inst::Tag::StoreNb, q, b.constant(konst(pool, 0), loc), loc);
-    const ExtraSlice else_region = b.closeRegion();
+    const ExtraSlice else_region = b.close_region();
 
     b.cond(vc, then_region, else_region, loc);
 

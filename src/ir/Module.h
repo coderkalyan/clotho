@@ -24,7 +24,7 @@ namespace clotho::ir {
 // IS the `Signal` handle the process IR carries.
 struct SignalInfo {
     // Port direction, or Internal for a signal that is not a port.
-    enum class Dir : uint8_t {
+    enum class Direction : uint8_t {
         Internal,
         Input,
         Output,
@@ -36,14 +36,14 @@ struct SignalInfo {
     // Interned type in the module's pool.
     Ref type = Ref::Invalid;
     // Direction relative to the module boundary.
-    Dir dir = Dir::Internal;
+    Direction dir = Direction::Internal;
 };
 
 // Handle to a process: an index into Module::processes.
 enum class ProcessId : uint32_t {};
 
 // Whether a process settles combinationally or updates on a clock edge.
-enum class ProcKind : uint8_t {
+enum class ProcessKind : uint8_t {
     Comb,
     Sequential,
 };
@@ -58,11 +58,14 @@ enum class Edge : uint8_t {
 // (kind, and for sequential processes the clock signal and its active edge).
 struct Process {
     // Combinational or sequential.
-    ProcKind kind = ProcKind::Comb;
+    ProcessKind kind = ProcessKind::Comb;
     // Clock signal; meaningful only when kind == Sequential.
     Signal clock = Signal{ 0 };
     // Active clock edge; meaningful only when kind == Sequential.
     Edge clock_edge = Edge::Posedge;
+    // Location of the AST construct that produced this process (the continuous
+    // assign, always block, ...).
+    SourceLoc loc = SourceLoc{ 0 };
     // The lowered process body.
     Ir ir;
 };
@@ -76,7 +79,7 @@ public:
     std::string name;
 
     // Append a signal; the returned Signal handle is its index in `signals`.
-    Signal addSignal(SignalInfo info) {
+    Signal add_signal(SignalInfo info) {
         const auto index = static_cast<uint32_t>(signals_.size());
         signals_.push_back(std::move(info));
 
@@ -84,7 +87,7 @@ public:
     }
 
     // Append a process; the returned ProcessId is its index in `processes`.
-    ProcessId addProcess(Process proc) {
+    ProcessId add_process(Process proc) {
         const auto index = static_cast<uint32_t>(processes_.size());
         processes_.push_back(std::move(proc));
 

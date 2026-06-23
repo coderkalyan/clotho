@@ -35,8 +35,8 @@ constexpr std::string_view kAlu = R"(
 )";
 
 // Does the IR contain at least one instruction with the given tag?
-bool hasTag(const ir::Ir& ir, ir::Inst::Tag tag) {
-    for (size_t i = 0; i < ir.instCount(); ++i) {
+bool has_tag(const ir::Ir& ir, ir::Inst::Tag tag) {
+    for (size_t i = 0; i < ir.inst_count(); ++i) {
         if (ir.tag(static_cast<ir::Index>(i)) == tag) {
             return true;
         }
@@ -45,7 +45,7 @@ bool hasTag(const ir::Ir& ir, ir::Inst::Tag tag) {
     return false;
 }
 
-const ir::Process* findKind(const ir::Module& m, ir::ProcKind kind) {
+const ir::Process* find_kind(const ir::Module& m, ir::ProcessKind kind) {
     for (const ir::Process& p : m.processes()) {
         if (p.kind == kind) {
             return &p;
@@ -58,7 +58,7 @@ const ir::Process* findKind(const ir::Module& m, ir::ProcKind kind) {
 } // namespace
 
 TEST_CASE("lowering the registered ALU produces a module") {
-    const LowerResult r = lowerText(kAlu);
+    const LowerResult r = lower_text(kAlu);
 
     REQUIRE_MESSAGE(r.ok, r.diagnostics);
     REQUIRE(r.module != nullptr);
@@ -72,36 +72,36 @@ TEST_CASE("lowering the registered ALU produces a module") {
 }
 
 TEST_CASE("the sequential process carries clocking and nonblocking stores") {
-    const LowerResult r = lowerText(kAlu);
+    const LowerResult r = lower_text(kAlu);
     REQUIRE(r.ok);
 
-    const ir::Process* seq = findKind(*r.module, ir::ProcKind::Sequential);
+    const ir::Process* seq = find_kind(*r.module, ir::ProcessKind::Sequential);
     REQUIRE(seq != nullptr);
     CHECK(seq->clock_edge == ir::Edge::Posedge);
-    CHECK(hasTag(seq->ir, ir::Inst::Tag::Cond));
-    CHECK(hasTag(seq->ir, ir::Inst::Tag::StoreNb));
+    CHECK(has_tag(seq->ir, ir::Inst::Tag::Cond));
+    CHECK(has_tag(seq->ir, ir::Inst::Tag::StoreNb));
     // The clock signal handle resolves to "clk".
     CHECK(r.module->signal(seq->clock).name == "clk");
 }
 
 TEST_CASE("a combinational process lowers the operator/mux datapath") {
-    const LowerResult r = lowerText(kAlu);
+    const LowerResult r = lower_text(kAlu);
     REQUIRE(r.ok);
 
     // The `next` assign is the comb process with the arithmetic + selects.
     bool found_datapath = false;
     for (const ir::Process& p : r.module->processes()) {
-        if (p.kind == ir::ProcKind::Comb && hasTag(p.ir, ir::Inst::Tag::Mux)) {
+        if (p.kind == ir::ProcessKind::Comb && has_tag(p.ir, ir::Inst::Tag::Mux)) {
             found_datapath = true;
-            CHECK(hasTag(p.ir, ir::Inst::Tag::Add));
-            CHECK(hasTag(p.ir, ir::Inst::Tag::Store));
+            CHECK(has_tag(p.ir, ir::Inst::Tag::Add));
+            CHECK(has_tag(p.ir, ir::Inst::Tag::Store));
         }
     }
     CHECK(found_datapath);
 }
 
 TEST_CASE("case statements are reported as unsupported") {
-    const LowerResult r = lowerText(R"(
+    const LowerResult r = lower_text(R"(
         module m(input [1:0] s, output reg x);
             always @(*)
                 case (s)

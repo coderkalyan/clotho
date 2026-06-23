@@ -5,8 +5,8 @@
 // finish(). The builder is spent after finish().
 //
 // Structured control flow: instructions accumulate into the current region.
-// openRegion()/closeRegion() bracket a nested body (e.g. a cond branch);
-// closeRegion() returns the region's slice, to be handed to cond(). The
+// open_region()/close_region() bracket a nested body (e.g. a cond branch);
+// close_region() returns the region's slice, to be handed to cond(). The
 // outermost (root) region is sealed by finish().
 //
 // One emit method per instruction shape. Variants sharing a payload
@@ -45,14 +45,14 @@ public:
     Index repl(Index value, uint32_t count, SourceLoc loc);
     Index mux(Index cond, Index a, Index b, SourceLoc loc);
     Index concat(std::span<const Index> parts, SourceLoc loc);
-    Index partSelect(Index base, uint32_t msb, uint32_t lsb, SourceLoc loc);
+    Index part_select(Index base, uint32_t msb, uint32_t lsb, SourceLoc loc);
     Index cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc);
 
     // -- Regions --
     // Begin a nested region; subsequent emits accumulate into it until closed.
-    void openRegion();
+    void open_region();
     // End the current region and return its instruction slice.
-    ExtraSlice closeRegion();
+    ExtraSlice close_region();
 
     // Freeze the built state into an Ir, sealing the root region. The builder is
     // spent afterwards.
@@ -71,7 +71,7 @@ private:
 
     // Append a struct to the extra buffer; returns its offset handle.
     template<ExtraPayload T>
-    ExtraIndex addExtra(const T& value) {
+    ExtraIndex add_extra(const T& value) {
         constexpr size_t n     = sizeof(T) / sizeof(uint32_t);
         const auto       words = std::bit_cast<std::array<uint32_t, n>>(value);
         const auto       start = static_cast<uint32_t>(extra_.size());
@@ -81,7 +81,7 @@ private:
     }
 
     // Append a run of instruction indices to the extra buffer; returns the slice.
-    ExtraSlice addSlice(std::span<const Index> indices) {
+    ExtraSlice add_slice(std::span<const Index> indices) {
         const auto start = static_cast<uint32_t>(extra_.size());
         for (Index i : indices) {
             extra_.push_back(static_cast<uint32_t>(i));

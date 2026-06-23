@@ -28,9 +28,9 @@ struct LowerResult {
 };
 
 // Lower a SystemVerilog source file at `path`.
-LowerResult lowerFile(std::string_view path);
+LowerResult lower_file(std::string_view path);
 
 // Lower a SystemVerilog source fragment held in memory.
-LowerResult lowerText(std::string_view source);
+LowerResult lower_text(std::string_view source);
 
 } // namespace clotho
