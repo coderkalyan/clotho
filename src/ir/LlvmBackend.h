@@ -11,11 +11,21 @@
 //     of that struct.
 //   * Every SSA value is lowered as a (val, xz) plane pair so X/Z propagate.
 
+#include <memory>
+
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Module.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include "Module.h"
 
 namespace clotho::ir {
+
+// Lower every process in `m` to a fresh llvm::Module owned by `ctx`. Returns
+// nullptr (and writes the reason to llvm::errs()) on backend error or if the
+// generated module fails verification. The caller owns the returned module and
+// must keep `ctx` alive at least as long as it.
+std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& ctx);
 
 // Lower every process in `m` to an LLVM function and write textual LLVM IR to
 // `os`. Returns false (and writes the reason to llvm::errs()) if the generated

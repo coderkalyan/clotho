@@ -959,22 +959,31 @@ private:
 
 } // namespace
 
-bool emit_llvm(const Module& m, llvm::raw_ostream& os) {
-    llvm::LLVMContext ctx;
-    llvm::Module      llmod(m.name.empty() ? "clotho" : m.name, ctx);
+std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& ctx) {
+    auto llmod = std::make_unique<llvm::Module>(m.name.empty() ? "clotho" : m.name, ctx);
 
     try {
-        Backend(m, ctx, llmod).run();
+        Backend(m, ctx, *llmod).run();
     } catch (const BackendError& e) {
         llvm::errs() << "llvm backend error: " << e.message << "\n";
+        return nullptr;
+    }
+
+    if (llvm::verifyModule(*llmod, &llvm::errs())) {
+        return nullptr;
+    }
+
+    return llmod;
+}
+
+bool emit_llvm(const Module& m, llvm::raw_ostream& os) {
+    llvm::LLVMContext ctx;
+    auto              llmod = build_module(m, ctx);
+    if (!llmod) {
         return false;
     }
 
-    if (llvm::verifyModule(llmod, &llvm::errs())) {
-        return false;
-    }
-
-    llmod.print(os, nullptr);
+    llmod->print(os, nullptr);
     return true;
 }
 

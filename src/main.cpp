@@ -5,16 +5,17 @@
 #include <llvm/Support/raw_ostream.h>
 
 #include "Lower.h"
+#include "ir/Jit.h"
 #include "ir/LlvmBackend.h"
 #include "ir/Printer.h"
 
 // Thin driver: take a SystemVerilog file, run it through the lowering pipeline,
-// and either print the process IR (default) or emit LLVM IR. All compiler logic
-// lives in libclotho / libclotho_ir.
+// then JIT-compile and run it (default), or emit the process IR / LLVM IR for
+// debugging. All compiler logic lives in libclotho / libclotho_ir.
 //
-// Usage: clotho [--emit=ir|llvm] [-o <out>] <file.sv>
+// Usage: clotho [--emit=run|ir|llvm] [-o <out>] <file.sv>
 int main(int argc, char** argv) {
-    std::string_view emit = "ir";
+    std::string_view emit = "run";
     std::string_view out;
     std::string_view input;
 
@@ -32,8 +33,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (input.empty() || (emit != "ir" && emit != "llvm")) {
-        std::println(stderr, "usage: {} [--emit=ir|llvm] [-o <out>] <file.sv>", argv[0]);
+    if (input.empty() || (emit != "run" && emit != "ir" && emit != "llvm")) {
+        std::println(stderr, "usage: {} [--emit=run|ir|llvm] [-o <out>] <file.sv>", argv[0]);
         return 2;
     }
 
@@ -43,6 +44,10 @@ int main(int argc, char** argv) {
     }
     if (!result.ok) {
         return 1;
+    }
+
+    if (emit == "run") {
+        return clotho::ir::run_jit(*result.module);
     }
 
     if (emit == "ir") {

@@ -16,7 +16,7 @@ message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION} at ${LLVM_DIR}")
 if(TARGET LLVM)
   set(LLVM_LIBS LLVM)
 else()
-  llvm_map_components_to_libnames(LLVM_LIBS core support)
+  llvm_map_components_to_libnames(LLVM_LIBS core support orcjit jitlink native)
 endif()
 
 FetchContent_Declare(
@@ -57,6 +57,7 @@ add_library(clotho_ir STATIC
   src/ir/Builder.cpp
   src/ir/Printer.cpp
   src/ir/LlvmBackend.cpp
+  src/ir/Jit.cpp
   src/Wheel.cpp
 )
 target_include_directories(clotho_ir PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${LLVM_INCLUDE_DIRS})
