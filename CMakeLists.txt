@@ -50,9 +50,11 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(unordered_dense)
 
 # Simulation runtime: native support routines the JIT'd design calls into.
-# Deliberately depends on nothing (no LLVM, no slang) — plain native code.
+# Deliberately depends on nothing (no LLVM, no slang) — plain native code. The
+# timing wheel is part of this surface: the runtime exposes it behind a C ABI.
 add_library(clotho_runtime STATIC
   src/runtime/Runtime.cpp
+  src/Wheel.cpp
 )
 target_include_directories(clotho_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
@@ -65,7 +67,6 @@ add_library(clotho_ir STATIC
   src/ir/Printer.cpp
   src/ir/LlvmBackend.cpp
   src/ir/Jit.cpp
-  src/Wheel.cpp
 )
 target_include_directories(clotho_ir PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${LLVM_INCLUDE_DIRS})
 target_compile_definitions(clotho_ir PUBLIC ${LLVM_DEFINITIONS})
@@ -96,6 +97,7 @@ add_executable(clotho_test
   tests/lower_test.cpp
   tests/llvm_backend_test.cpp
   tests/wheel_test.cpp
+  tests/runtime_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho doctest::doctest)
 add_test(NAME clotho_test COMMAND clotho_test)

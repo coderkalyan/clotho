@@ -54,12 +54,20 @@ int run_jit(const Module& m) {
     // Expose the native runtime to the JIT'd design as absolute symbols, mapped
     // directly to the host function addresses. The runtime is plain native code
     // statically linked into this process.
-    auto&              jd = (*jit)->getMainJITDylib();
+    auto&                jd = (*jit)->getMainJITDylib();
     llvm::orc::SymbolMap rt_syms;
-    rt_syms[(*jit)->mangleAndIntern("rt_hello")] = {
-        llvm::orc::ExecutorAddr::fromPtr(&rt_hello),
-        llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable,
+    auto                 expose = [&](llvm::StringRef name, auto* fn) {
+        rt_syms[(*jit)->mangleAndIntern(name)] = {
+            llvm::orc::ExecutorAddr::fromPtr(fn),
+            llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable,
+        };
     };
+    expose("rt_hello", &rt_hello);
+    expose("rt_wheel_init", &rt_wheel_init);
+    expose("rt_wheel_deinit", &rt_wheel_deinit);
+    expose("rt_wheel_now", &rt_wheel_now);
+    expose("rt_wheel_schedule", &rt_wheel_schedule);
+    expose("rt_wheel_tick", &rt_wheel_tick);
     if (auto err = jd.define(llvm::orc::absoluteSymbols(std::move(rt_syms)))) {
         llvm::errs() << "jit: " << llvm::toString(std::move(err)) << "\n";
         return -1;

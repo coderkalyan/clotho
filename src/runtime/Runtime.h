@@ -5,10 +5,62 @@
 // LLVM or the rest of the compiler — it is plain native code the design calls
 // into. The interface is C so the codegen can reference it by a stable symbol.
 
+#include <cstdint>
+
 extern "C" {
 
 // Minimal smoke-test entry: prints a banner. Emitted as a call at the top of a
 // design's `main()` to prove runtime linkage works end to end.
 void rt_hello();
+
+// -- Timing wheel --
+//
+// The wheel (src/Wheel.h) is the design's event scheduler, surfaced here behind
+// a C ABI. Tick values are an abstract uint64 the wheel never interprets; the
+// design owns the mapping from simulation time to ticks. The fired-timer
+// context is a single opaque pointer the design threads through tick().
+
+// Opaque inline storage for a wheel, owned by the caller. The design declares an
+// rt_wheel (typically on the stack), hands it to rt_wheel_init, and tears it down
+// with rt_wheel_deinit — no heap allocation. The byte block is sized and aligned to
+// hold the concrete clotho::Wheel (both checked in Runtime.cpp); the design never
+// inspects it.
+typedef struct rt_wheel {
+    alignas(8) unsigned char storage[2560];
+} rt_wheel;
+
+// Intrusive timer node the design embeds inside an owning awaiter and recovers
+// via offsetof. Layout mirrors clotho::Timer (asserted in Runtime.cpp); the
+// design never reads these fields, it only hands the node back to the wheel.
+typedef struct rt_timer {
+    // Intrusive slot-list link. Unspecified unless linked into a slot.
+    struct rt_timer* next;
+    // Type-erased expiry callback. Set by rt_wheel_schedule, re-typed on fire.
+    void (*on_expire)();
+} rt_timer;
+
+// Expiry callback: invoked as on_expire(timer, ctx) when `timer` fires, where
+// `ctx` is the pointer passed to the rt_wheel_tick that fired it.
+typedef void (*rt_timer_fn)(rt_timer* timer, void* ctx);
+
+// Construct a wheel in caller-owned storage, starting at tick zero. Pair with
+// rt_wheel_deinit.
+void rt_wheel_init(rt_wheel* wheel);
+
+// Tear down a wheel constructed by rt_wheel_init, releasing its overflow heap. The
+// caller still owns the rt_wheel storage and any timer nodes linked into it.
+void rt_wheel_deinit(rt_wheel* wheel);
+
+// Current tick. Starts at zero, advances only through rt_wheel_tick.
+uint64_t rt_wheel_now(const rt_wheel* wheel);
+
+// Link `timer` to fire at absolute tick `deadline` (must be > rt_wheel_now),
+// calling `on_expire(timer, ctx)` when it fires.
+void rt_wheel_schedule(rt_wheel* wheel, rt_timer* timer, uint64_t deadline, rt_timer_fn on_expire);
+
+// Jump to the next non-empty tick and fire its timers in list order, passing
+// `ctx` to each callback. A no-op on an idle wheel. A node is unlinked before
+// its callback runs, so a callback may re-schedule it.
+void rt_wheel_tick(rt_wheel* wheel, void* ctx);
 
 } // extern "C"
