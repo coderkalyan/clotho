@@ -21,6 +21,7 @@
 
 #include "ir/InternPool.h"
 #include "ir/Ir.h"
+#include "runtime/Runtime.h"
 
 // LLVM backend rationale.
 //
@@ -243,10 +244,11 @@ private:
 
     // -- Top-level entry --
     //
-    // Emit `i32 @main()`: stack-allocate the shared state, power it up, then call
-    // every initial block in process-table order (initial blocks are unordered, so
-    // any order is legal). Returns 0. Suspension / scheduling are out of scope —
-    // each callee runs straight through.
+    // Emit `i32 @main()`: stack-allocate the shared state, power it up, then run
+    // the initial blocks through the active task queue (seed it with every initial
+    // block and drain it). Returns 0. A timing wheel is constructed alongside but
+    // sits idle — timed-event scheduling lands on it in a later step. General
+    // suspension is still out of scope; each callee runs straight through.
     void emit_main(const std::vector<llvm::Function*>& initials) {
         auto* i32  = llvm::Type::getInt32Ty(ctx_);
         auto* fnty = llvm::FunctionType::get(i32, false);
@@ -259,10 +261,94 @@ private:
         llvm::AllocaInst* state  = b_.CreateAlloca(buf_ty, nullptr, "state");
         state->setAlignment(llvm::Align(8));
         init_state(state);
-        for (llvm::Function* f : initials) {
-            b_.CreateCall(f, { state });
-        }
+
+        // Timing wheel: constructed and live in main but not yet driven — timed
+        // events get scheduled onto it later. For now it sits idle while the active
+        // queue carries the initial blocks.
+        auto* wheel_ty = llvm::ArrayType::get(b_.getInt8Ty(), sizeof(rt_wheel));
+        auto* wheel    = b_.CreateAlloca(wheel_ty, nullptr, "wheel");
+        wheel->setAlignment(llvm::Align(alignof(rt_wheel)));
+        b_.CreateCall(wheel_init_fn(), { wheel });
+
+        emit_active_run(state, initials);
+
+        b_.CreateCall(wheel_deinit_fn(), { wheel });
         b_.CreateRet(llvm::ConstantInt::get(i32, 0));
+    }
+
+    // The active task queue: ready-to-run processes held in a fixed-size global
+    // array used as a LIFO stack (active events may fire in any order per the LRM,
+    // so the stack discipline is free). Capacity is the total process count — the
+    // most that can ever be ready at once. main empties the stack, pushes every
+    // initial block, then drains it, calling each process with the state pointer.
+    // The drain reloads the top each turn, so a running process can push more work.
+    void emit_active_run(llvm::Value* state, const std::vector<llvm::Function*>& initials) {
+        auto*      ptr_ty = llvm::PointerType::getUnqual(ctx_);
+        auto*      i32    = b_.getInt32Ty();
+        const auto cap    = std::max<size_t>(mod_.processes().size(), 1);
+
+        auto* arr_ty = llvm::ArrayType::get(ptr_ty, cap);
+        auto* queue  = new llvm::GlobalVariable(llmod_, arr_ty, false, llvm::GlobalValue::InternalLinkage,
+                                                llvm::ConstantAggregateZero::get(arr_ty), "clotho.active");
+        // Stack top: index of the next free slot. Starts at 0 (empty).
+        auto* top = new llvm::GlobalVariable(llmod_, i32, false, llvm::GlobalValue::InternalLinkage,
+                                             b_.getInt32(0), "clotho.active_top");
+
+        // Init: empty the stack.
+        b_.CreateStore(b_.getInt32(0), top);
+
+        // Push every initial block: queue[top++] = f.
+        for (llvm::Function* f : initials) {
+            llvm::Value* sp   = b_.CreateLoad(i32, top);
+            llvm::Value* slot = b_.CreateInBoundsGEP(arr_ty, queue, { b_.getInt32(0), sp });
+            b_.CreateStore(f, slot);
+            b_.CreateStore(b_.CreateAdd(sp, b_.getInt32(1)), top);
+        }
+
+        // Drain: while top != 0, pop queue[--top] and call it.
+        auto* proc_fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty }, false);
+        auto* fn        = b_.GetInsertBlock()->getParent();
+        auto* check     = llvm::BasicBlock::Create(ctx_, "active.check", fn);
+        auto* body      = llvm::BasicBlock::Create(ctx_, "active.body", fn);
+        auto* done      = llvm::BasicBlock::Create(ctx_, "active.done", fn);
+        b_.CreateBr(check);
+
+        b_.SetInsertPoint(check);
+        llvm::Value* sp = b_.CreateLoad(i32, top);
+        b_.CreateCondBr(b_.CreateICmpNE(sp, b_.getInt32(0)), body, done);
+
+        b_.SetInsertPoint(body);
+        llvm::Value* idx  = b_.CreateSub(sp, b_.getInt32(1));
+        b_.CreateStore(idx, top);
+        llvm::Value* slot = b_.CreateInBoundsGEP(arr_ty, queue, { b_.getInt32(0), idx });
+        llvm::Value* fnp  = b_.CreateLoad(ptr_ty, slot);
+        b_.CreateCall(proc_fnty, fnp, { state });
+        b_.CreateBr(check);
+
+        b_.SetInsertPoint(done);
+    }
+
+    // -- Timing wheel runtime (runtime/Runtime.h C ABI) --
+
+    // void rt_wheel_init(rt_wheel*) / void rt_wheel_deinit(rt_wheel*)
+    llvm::FunctionCallee wheel_init_fn() {
+        auto* ptr = llvm::PointerType::getUnqual(ctx_);
+        return llmod_.getOrInsertFunction("rt_wheel_init", llvm::FunctionType::get(b_.getVoidTy(), { ptr }, false));
+    }
+    llvm::FunctionCallee wheel_deinit_fn() {
+        auto* ptr = llvm::PointerType::getUnqual(ctx_);
+        return llmod_.getOrInsertFunction("rt_wheel_deinit", llvm::FunctionType::get(b_.getVoidTy(), { ptr }, false));
+    }
+    // void rt_wheel_schedule(rt_wheel*, rt_timer*, i64 deadline, rt_timer_fn)
+    llvm::FunctionCallee wheel_schedule_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, b_.getInt64Ty(), ptr }, false);
+        return llmod_.getOrInsertFunction("rt_wheel_schedule", fnty);
+    }
+    // void rt_wheel_tick(rt_wheel*, void* ctx)
+    llvm::FunctionCallee wheel_tick_fn() {
+        auto* ptr = llvm::PointerType::getUnqual(ctx_);
+        return llmod_.getOrInsertFunction("rt_wheel_tick", llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false));
     }
 
     // Power-up the state struct: 4-state signals come up X (must 0, may 1, z 0),
