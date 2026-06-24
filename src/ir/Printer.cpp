@@ -365,13 +365,20 @@ void print_module(const Module& m, std::ostream& os) {
     for (size_t i = 0; i < processes.size(); ++i) {
         const Process& p = processes[i];
         os << "process[" << i << "] ";
-        if (p.kind == ProcessKind::Sequential) {
-            os << "kind=seq clk=" << (p.clock_edge == Edge::Posedge ? "posedge" : "negedge") << " s"
-               << static_cast<uint32_t>(p.clock);
-        } else if (p.kind == ProcessKind::Initial) {
-            os << "kind=initial";
-        } else {
-            os << "kind=comb";
+        os << (p.activation == Activation::Initial ? "initial" : "always");
+        for (const WaitEvent& w : p.wait_events) {
+            os << " @";
+            switch (w.edge) {
+                case Edge::Positive:
+                    os << "posedge ";
+                    break;
+                case Edge::Negative:
+                    os << "negedge ";
+                    break;
+                case Edge::Any:
+                    break;
+            }
+            os << "s" << static_cast<uint32_t>(w.signal);
         }
         os << "\n";
         print(p.ir, os);

@@ -239,47 +239,42 @@ private:
 
         ir::Builder b(module_.pool);
         lower_assign(e.as<AssignmentExpression>(), b);
+        // TODO: a continuous assign re-evaluates on any change of its RHS signals;
+        // that sensitivity is not yet inferred, so the wait list is left empty.
         module_.add_process(
-          ir::Process{ .kind = ir::ProcessKind::Comb, .loc = to_source_loc(sym.location), .ir = b.finish() });
+          ir::Process{ .activation = ir::Activation::Always, .loc = to_source_loc(sym.location), .ir = b.finish() });
     }
 
     void lower_procedural_block(const ProceduralBlockSymbol& sym) {
-        ir::ProcessKind kind  = ir::ProcessKind::Comb;
-        ir::Signal      clock = ir::Signal{ 0 };
-        ir::Edge        edge  = ir::Edge::Posedge;
+        ir::Activation             activation = ir::Activation::Always;
+        std::vector<ir::WaitEvent> wait_events;
 
         if (sym.procedureKind == ProceduralBlockKind::Initial) {
-            kind = ir::ProcessKind::Initial;
+            activation = ir::Activation::Initial;
         }
 
         const Statement* body = &sym.getBody();
 
-        // A top-level event control is the process's sensitivity: consume it here
-        // and lower the statement underneath. An edge event (@(posedge/negedge
-        // clk)) makes the process sequential; a level or implicit list (@*,
-        // @(a or b)) leaves it combinational. A non-event top-level timing (e.g.
-        // `always #5 ...`) is NOT sensitivity — it falls through to lower_stmt,
-        // whose Timed case rejects it loudly.
-        // TODO: honor the full sensitivity list — only the edge clock is modeled.
-        // Level-sensitive lists are treated as always-evaluated combinational
-        // logic, and the per-signal trigger set is otherwise ignored.
+        // A top-level event control is the process's sensitivity: collect its wait
+        // events here and lower the statement underneath. A non-event top-level
+        // timing (e.g. `always #5 ...`) is NOT sensitivity — it falls through to
+        // lower_stmt, whose Timed case rejects it loudly.
+        // TODO: implicit (@*) and inferred combinational sensitivity are not yet
+        // collected, so those processes get an empty wait list.
         if (body->kind == StatementKind::Timed) {
             const TimedStatement& timed = body->as<TimedStatement>();
             if (is_event_control(timed.timing)) {
-                const SignalEventControl* ev = find_edge_event(timed.timing);
-                if (ev != nullptr && ev->edge != slang::ast::EdgeKind::None) {
-                    kind  = ir::ProcessKind::Sequential;
-                    edge  = ev->edge == slang::ast::EdgeKind::NegEdge ? ir::Edge::Negedge : ir::Edge::Posedge;
-                    clock = clock_signal(ev->expr);
-                }
+                collect_wait_events(timed.timing, wait_events);
                 body = &timed.stmt;
             }
         }
 
         ir::Builder b(module_.pool);
         lower_stmt(*body, b);
-        module_.add_process(ir::Process{
-          .kind = kind, .clock = clock, .clock_edge = edge, .loc = to_source_loc(sym.location), .ir = b.finish() });
+        module_.add_process(ir::Process{ .activation  = activation,
+                                         .wait_events = std::move(wait_events),
+                                         .loc         = to_source_loc(sym.location),
+                                         .ir          = b.finish() });
     }
 
     // True if `tc` is an @-style event control (the kinds usable as a process's
@@ -296,28 +291,45 @@ private:
         }
     }
 
-    // Find the first edge-triggered signal event in a timing control (descends
-    // into event lists, e.g. @(posedge clk or negedge rst)).
-    const SignalEventControl* find_edge_event(const TimingControl& tc) {
-        if (tc.kind == TimingControlKind::SignalEvent) {
-            return &tc.as<SignalEventControl>();
-        }
-        if (tc.kind == TimingControlKind::EventList) {
-            for (const TimingControl* e : tc.as<EventListControl>().events) {
-                if (const SignalEventControl* found = find_edge_event(*e)) {
-                    return found;
-                }
+    // Collect the signal events of a timing control into `out`, descending into
+    // event lists (@(posedge clk or a or negedge rst)). Each SignalEventControl
+    // contributes one wait event; an implicit (@*) or other control adds nothing.
+    void collect_wait_events(const TimingControl& tc, std::vector<ir::WaitEvent>& out) {
+        switch (tc.kind) {
+            case TimingControlKind::SignalEvent: {
+                const SignalEventControl& ev = tc.as<SignalEventControl>();
+                out.push_back(ir::WaitEvent{ .signal = event_signal(ev.expr), .edge = to_edge(ev.edge) });
+                break;
             }
+            case TimingControlKind::EventList:
+                for (const TimingControl* e : tc.as<EventListControl>().events) {
+                    collect_wait_events(*e, out);
+                }
+                break;
+            default:
+                // ImplicitEvent (@*) and the like: no explicit signals to collect.
+                break;
         }
-
-        return nullptr;
     }
 
-    ir::Signal clock_signal(const Expression& e) {
+    // Map a slang edge kind to the IR edge. A level-sensitive entry (no edge) and
+    // a both-edge entry both record as Any (any value change).
+    static ir::Edge to_edge(slang::ast::EdgeKind edge) {
+        switch (edge) {
+            case slang::ast::EdgeKind::PosEdge:
+                return ir::Edge::Positive;
+            case slang::ast::EdgeKind::NegEdge:
+                return ir::Edge::Negative;
+            default:
+                return ir::Edge::Any;
+        }
+    }
+
+    ir::Signal event_signal(const Expression& e) {
         if (e.kind == ExpressionKind::NamedValue) {
             return signal_of(e.as<NamedValueExpression>().symbol);
         }
-        fail("unsupported clock expression");
+        fail("unsupported event expression");
     }
 
     // -- Statements --

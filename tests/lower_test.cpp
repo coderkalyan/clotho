@@ -45,14 +45,41 @@ bool has_tag(const ir::Ir& ir, ir::Inst::Tag tag) {
     return false;
 }
 
-const ir::Process* find_kind(const ir::Module& m, ir::ProcessKind kind) {
+// True if the process is edge-triggered: some wait event is a clock edge rather
+// than a level-sensitive (any-change) entry.
+bool is_edge_triggered(const ir::Process& p) {
+    for (const ir::WaitEvent& w : p.wait_events) {
+        if (w.edge != ir::Edge::Any) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// First process matching `pred`, or null.
+template <class Pred>
+const ir::Process* find_process(const ir::Module& m, Pred pred) {
     for (const ir::Process& p : m.processes()) {
-        if (p.kind == kind) {
+        if (pred(p)) {
             return &p;
         }
     }
 
     return nullptr;
+}
+
+// First edge-triggered process (the lone always @(posedge/negedge ...) block).
+const ir::Process* find_edge_process(const ir::Module& m) {
+    return find_process(m, is_edge_triggered);
+}
+
+// First level-sensitive process: an always-activated process with no edge wait
+// events (a continuous assign or a @(*) / level-sensitive always block).
+const ir::Process* find_level_process(const ir::Module& m) {
+    return find_process(m, [](const ir::Process& p) {
+        return p.activation == ir::Activation::Always && !is_edge_triggered(p);
+    });
 }
 
 } // namespace
@@ -71,27 +98,29 @@ TEST_CASE("lowering the registered ALU produces a module") {
     CHECK(m.processes().size() == 3);
 }
 
-TEST_CASE("the sequential process carries clocking and nonblocking stores") {
+TEST_CASE("the edge-triggered process carries its wait event and nonblocking stores") {
     const LowerResult r = lower_text(kAlu);
     REQUIRE(r.ok);
 
-    const ir::Process* seq = find_kind(*r.module, ir::ProcessKind::Sequential);
+    const ir::Process* seq = find_edge_process(*r.module);
     REQUIRE(seq != nullptr);
-    CHECK(seq->clock_edge == ir::Edge::Posedge);
+    CHECK(seq->activation == ir::Activation::Always);
+    // A single wait event: posedge of clk.
+    REQUIRE(seq->wait_events.size() == 1);
+    CHECK(seq->wait_events[0].edge == ir::Edge::Positive);
+    CHECK(r.module->signal(seq->wait_events[0].signal).name == "clk");
     CHECK(has_tag(seq->ir, ir::Inst::Tag::Cond));
     CHECK(has_tag(seq->ir, ir::Inst::Tag::StoreNb));
-    // The clock signal handle resolves to "clk".
-    CHECK(r.module->signal(seq->clock).name == "clk");
 }
 
-TEST_CASE("a combinational process lowers the operator/mux datapath") {
+TEST_CASE("a level-sensitive process lowers the operator/mux datapath") {
     const LowerResult r = lower_text(kAlu);
     REQUIRE(r.ok);
 
-    // The `next` assign is the comb process with the arithmetic + selects.
+    // The `next` assign is the level-sensitive process with the arithmetic + selects.
     bool found_datapath = false;
     for (const ir::Process& p : r.module->processes()) {
-        if (p.kind == ir::ProcessKind::Comb && has_tag(p.ir, ir::Inst::Tag::Mux)) {
+        if (!is_edge_triggered(p) && has_tag(p.ir, ir::Inst::Tag::Mux)) {
             found_datapath = true;
             CHECK(has_tag(p.ir, ir::Inst::Tag::Add));
             CHECK(has_tag(p.ir, ir::Inst::Tag::Store));
@@ -119,7 +148,7 @@ TEST_CASE("case lowers to a case-equality / cond chain") {
     )");
     REQUIRE_MESSAGE(r.ok, r.diagnostics);
 
-    const ir::Process* p = find_kind(*r.module, ir::ProcessKind::Comb);
+    const ir::Process* p = find_level_process(*r.module);
     REQUIRE(p != nullptr);
     CHECK(has_tag(p->ir, ir::Inst::Tag::CaseEq));
     CHECK(has_tag(p->ir, ir::Inst::Tag::Cond));
@@ -130,17 +159,17 @@ TEST_CASE("case lowers to a case-equality / cond chain") {
 TEST_CASE("casez / casex select the wildcard comparison") {
     const LowerResult rz = lower_case_module("casez", "2'b1?: x = 2'b01; default: x = 2'b00;");
     REQUIRE_MESSAGE(rz.ok, rz.diagnostics);
-    CHECK(has_tag(find_kind(*rz.module, ir::ProcessKind::Comb)->ir, ir::Inst::Tag::CasezEq));
+    CHECK(has_tag(find_level_process(*rz.module)->ir, ir::Inst::Tag::CasezEq));
 
     const LowerResult rx = lower_case_module("casex", "2'b1x: x = 2'b01; default: x = 2'b00;");
     REQUIRE_MESSAGE(rx.ok, rx.diagnostics);
-    CHECK(has_tag(find_kind(*rx.module, ir::ProcessKind::Comb)->ir, ir::Inst::Tag::CasexEq));
+    CHECK(has_tag(find_level_process(*rx.module)->ir, ir::Inst::Tag::CasexEq));
 }
 
 TEST_CASE("a case with multiple labels per item ORs the comparisons") {
     const LowerResult r = lower_case_module("case", "2'd0, 2'd1: x = 2'b01; default: x = 2'b00;");
     REQUIRE_MESSAGE(r.ok, r.diagnostics);
-    const ir::Process* p = find_kind(*r.module, ir::ProcessKind::Comb);
+    const ir::Process* p = find_level_process(*r.module);
     REQUIRE(p != nullptr);
     CHECK(has_tag(p->ir, ir::Inst::Tag::Lor));
 }

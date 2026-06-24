@@ -42,29 +42,44 @@ struct SignalInfo {
 // Handle to a process: an index into Module::processes.
 enum class ProcessId : uint32_t {};
 
-// Whether a process settles combinationally, updates on a clock edge, or runs
-// once at time zero (an initial block).
-enum class ProcessKind : uint8_t {
-    Comb,
-    Sequential,
+// How a process is scheduled. The fine-grained trigger condition lives in the
+// process's wait list (Process::wait_events); this only separates one-shot
+// startup processes from those that re-arm and rerun whenever they are woken.
+enum class Activation : uint8_t {
+    // Runs once at time zero, then completes (an `initial` block).
     Initial,
+    // Re-armed after each run and rerun whenever one of its wait events fires
+    // (an `always` block or a continuous `assign`).
+    Always,
 };
 
-// Active edge of a sequential process's clock.
+// The kind of signal change a wait event triggers on.
 enum class Edge : uint8_t {
-    Posedge,
-    Negedge,
+    // 0 -> 1 transition: @(posedge s).
+    Positive,
+    // 1 -> 0 transition: @(negedge s).
+    Negative,
+    // Any value change: level-sensitive sensitivity (@(s), @(a or b), @*) and,
+    // for now, both-edge triggers.
+    Any,
 };
 
-// One lowered process plus the metadata the IR body itself does not carry
-// (kind, and for sequential processes the clock signal and its active edge).
+// One entry of a process's wait list: the process wakes when `signal` undergoes
+// `edge`. A list of these is a process's full sensitivity.
+struct WaitEvent {
+    Signal signal = Signal{ 0 };
+    Edge   edge   = Edge::Any;
+};
+
+// One lowered process plus the metadata the IR body itself does not carry: how
+// it is activated and the wait events that wake it.
 struct Process {
-    // Combinational or sequential.
-    ProcessKind kind = ProcessKind::Comb;
-    // Clock signal; meaningful only when kind == Sequential.
-    Signal clock = Signal{ 0 };
-    // Active clock edge; meaningful only when kind == Sequential.
-    Edge clock_edge = Edge::Posedge;
+    // Whether the process runs once at startup or re-arms on its wait events.
+    Activation activation = Activation::Always;
+    // Sensitivity list: the signal events that wake the process. Empty for an
+    // `initial` block, and (for now) for processes whose sensitivity is implicit
+    // or not yet inferred (continuous assigns, @*).
+    std::vector<WaitEvent> wait_events;
     // Location of the AST construct that produced this process (the continuous
     // assign, always block, ...).
     SourceLoc loc = SourceLoc{ 0 };

@@ -51,7 +51,7 @@
 // (the frontend already inserted Resize nodes to width-match binary operands).
 //
 // Scope (initial). Nonblocking assignment is lowered identically to blocking
-// (no two-phase next-state staging yet); clock-edge / sensitivity gating is left
+// (no two-phase next-state staging yet); event / sensitivity gating is left
 // to a future top-level sim loop; Arg / Ret (functions, tasks), unpacked arrays
 // and memories are unsupported and rejected.
 
@@ -115,17 +115,18 @@ public:
 
     void run() {
         build_state_layout();
+        build_wait_queues();
         std::vector<llvm::Function*> initials;
         for (const Process& proc : mod_.processes()) {
             llvm::Function* f = lower_process(proc);
-            if (proc.kind == ProcessKind::Initial) {
+            if (proc.activation == Activation::Initial) {
                 initials.push_back(f);
             }
         }
-        // TODO: only initial blocks are scheduled into main. Comb (continuous
-        // assign) and Sequential (always @(edge)) processes are compiled to
-        // functions but never called — there is no sim loop or clock-edge gating
-        // yet, so `assign` / `always` currently have no runtime effect.
+        // TODO: only initial blocks are scheduled into main. Always processes
+        // (continuous assigns, always blocks) are compiled to functions but never
+        // called — there is no sim loop or event gating yet, so `assign` /
+        // `always` currently have no runtime effect.
         emit_main(initials);
     }
 
@@ -434,6 +435,53 @@ private:
 
         b_.CreateCall(wheel_deinit_fn(), { wheel });
         b_.CreateRet(llvm::ConstantInt::get(i32, 0));
+    }
+
+    // Count, per signal, how many processes wait on it: a process is counted once
+    // for each distinct signal in its wait list, regardless of edge. A signal it
+    // waits on under several edges (e.g. @(posedge clk or negedge clk)) still
+    // counts the process once.
+    std::vector<uint32_t> wait_counts() const {
+        std::vector<uint32_t> counts(mod_.signals().size(), 0);
+        for (const Process& p : mod_.processes()) {
+            const auto& events = p.wait_events;
+            for (size_t i = 0; i < events.size(); ++i) {
+                bool dup = false;
+                for (size_t j = 0; j < i; ++j) {
+                    dup = dup || events[j].signal == events[i].signal;
+                }
+                if (!dup) {
+                    counts[static_cast<uint32_t>(events[i].signal)]++;
+                }
+            }
+        }
+        return counts;
+    }
+
+    // Per-signal wait queue: storage for the coroutine handles of processes that
+    // block on this signal, statically sized to its waiter count (wait_counts).
+    // Mirrors the active queue's "global array sized to a compile-time process
+    // bound" shape, one instance per signal instead of one for the module.
+    //
+    // Emitted but deliberately unused: nothing reads or writes these yet. They
+    // give the upcoming wait-event lowering a ready destination — a fired signal
+    // will push its blocked processes onto the active queue from here. A signal
+    // with no waiters gets no queue (wait_gv_ entry stays null).
+    void build_wait_queues() {
+        const auto                  sigs   = mod_.signals();
+        const std::vector<uint32_t> counts = wait_counts();
+        wait_gv_.assign(sigs.size(), nullptr);
+
+        auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
+        for (uint32_t i = 0; i < sigs.size(); ++i) {
+            if (counts[i] == 0) {
+                continue;
+            }
+            auto* arr_ty = llvm::ArrayType::get(ptr_ty, counts[i]);
+            wait_gv_[i]  = new llvm::GlobalVariable(llmod_, arr_ty, false, llvm::GlobalValue::InternalLinkage,
+                                                    llvm::ConstantAggregateZero::get(arr_ty),
+                                                    "clotho.wait." + sigs[i].name);
+        }
     }
 
     // The active task queue: ready-to-run coroutine handles held in a fixed-size
@@ -1450,6 +1498,9 @@ private:
     llvm::GlobalVariable*               queue_gv_     = nullptr;
     llvm::GlobalVariable*               top_gv_       = nullptr;
     llvm::ArrayType*                    queue_arr_ty_ = nullptr;
+    // Per-signal wait queue, indexed by Signal handle; null where a signal has no
+    // waiters. Built once in build_wait_queues; unused at runtime for now.
+    std::vector<llvm::GlobalVariable*>  wait_gv_;
     std::vector<Plane>                  values_;
     std::vector<std::optional<LValue>>  lvals_;
     std::vector<std::optional<ValType>> types_;
