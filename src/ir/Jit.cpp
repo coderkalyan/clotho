@@ -33,8 +33,12 @@ void ensure_native_target() {
 
 } // namespace
 
-int run_jit(const Module& m) {
+int run_jit(const Module& m, Timings* timings) {
     ensure_native_target();
+
+    // LLVM compile phase: build the module (IR gen + coroutine/opt passes), then
+    // below, JIT codegen triggered by looking up main.
+    const auto t_llvm = std::chrono::steady_clock::now();
 
     // Each run owns its context: the design module is built into it, then both
     // are moved into a ThreadSafeModule the JIT takes over.
@@ -90,7 +94,17 @@ int run_jit(const Module& m) {
     }
 
     auto* fn = sym->toPtr<int (*)()>();
-    return fn();
+    if (timings != nullptr) {
+        timings->llvm_ms += ms_since(t_llvm);
+    }
+
+    // Simulation phase: run the compiled design.
+    const auto t_sim = std::chrono::steady_clock::now();
+    const int  rc    = fn();
+    if (timings != nullptr) {
+        timings->sim_ms += ms_since(t_sim);
+    }
+    return rc;
 }
 
 } // namespace clotho::ir

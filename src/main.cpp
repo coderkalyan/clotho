@@ -13,16 +13,19 @@
 // then JIT-compile and run it (default), or emit the process IR / LLVM IR for
 // debugging. All compiler logic lives in libclotho / libclotho_ir.
 //
-// Usage: clotho [--emit=run|ir|llvm] [-o <out>] <file.sv>
+// Usage: clotho [--emit=run|ir|llvm] [--time] [-o <out>] <file.sv>
 int main(int argc, char** argv) {
     std::string_view emit = "run";
     std::string_view out;
     std::string_view input;
+    bool             time = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (arg.starts_with("--emit=")) {
             emit = arg.substr(7);
+        } else if (arg == "--time") {
+            time = true;
         } else if (arg == "-o" && i + 1 < argc) {
             out = argv[++i];
         } else if (!arg.starts_with("-")) {
@@ -34,11 +37,32 @@ int main(int argc, char** argv) {
     }
 
     if (input.empty() || (emit != "run" && emit != "ir" && emit != "llvm")) {
-        std::println(stderr, "usage: {} [--emit=run|ir|llvm] [-o <out>] <file.sv>", argv[0]);
+        std::println(stderr, "usage: {} [--emit=run|ir|llvm] [--time] [-o <out>] <file.sv>", argv[0]);
         return 2;
     }
 
-    const clotho::LowerResult result = clotho::lower_file(input);
+    // Phase timings reported to stderr when --time is set (stdout stays clean for
+    // the design's own output).
+    clotho::Timings  timings;
+    clotho::Timings* tp = time ? &timings : nullptr;
+    const auto       report = [&] {
+        if (!time) {
+            return;
+        }
+        std::println(stderr, "timings (ms):");
+        std::println(stderr, "  {:<16}{:>12.3f}", "frontend (slang)", timings.frontend_ms);
+        std::println(stderr, "  {:<16}{:>12.3f}", "analysis (ir)", timings.analysis_ms);
+        // llvm compile and simulation are only measured on the run path.
+        if (emit == "run") {
+            std::println(stderr, "  {:<16}{:>12.3f}", "llvm compile", timings.llvm_ms);
+            std::println(stderr, "  {:<16}{:>12.3f}", "simulation", timings.sim_ms);
+        }
+        const double total =
+          timings.frontend_ms + timings.analysis_ms + timings.llvm_ms + timings.sim_ms;
+        std::println(stderr, "  {:<16}{:>12.3f}", "total", total);
+    };
+
+    const clotho::LowerResult result = clotho::lower_file(input, tp);
     if (!result.diagnostics.empty()) {
         std::print(stderr, "{}", result.diagnostics);
     }
@@ -47,23 +71,30 @@ int main(int argc, char** argv) {
     }
 
     if (emit == "run") {
-        return clotho::ir::run_jit(*result.module);
+        const int rc = clotho::ir::run_jit(*result.module, tp);
+        report();
+        return rc;
     }
 
     if (emit == "ir") {
         clotho::ir::print_module(*result.module, std::cout);
+        report();
         return 0;
     }
 
     // emit == "llvm"
+    bool ok = false;
     if (out.empty()) {
-        return clotho::ir::emit_llvm(*result.module, llvm::outs()) ? 0 : 1;
+        ok = clotho::ir::emit_llvm(*result.module, llvm::outs());
+    } else {
+        std::error_code      ec;
+        llvm::raw_fd_ostream os(out, ec);
+        if (ec) {
+            std::println(stderr, "cannot open '{}': {}", out, ec.message());
+            return 1;
+        }
+        ok = clotho::ir::emit_llvm(*result.module, os);
     }
-    std::error_code      ec;
-    llvm::raw_fd_ostream os(out, ec);
-    if (ec) {
-        std::println(stderr, "cannot open '{}': {}", out, ec.message());
-        return 1;
-    }
-    return clotho::ir::emit_llvm(*result.module, os) ? 0 : 1;
+    report();
+    return ok ? 0 : 1;
 }

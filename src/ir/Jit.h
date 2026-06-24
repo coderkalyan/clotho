@@ -6,13 +6,15 @@
 // emission paths (emit_llvm / print_module) remain for debugging.
 
 #include "Module.h"
+#include "Timing.h"
 
 namespace clotho::ir {
 
 // Build, JIT-compile and execute `main()` for `m` on the host. Returns the i32
 // value `main()` returns (intended as the process exit code). On any setup or
 // compilation failure, writes the reason to llvm::errs() and returns a negative
-// sentinel so the driver can exit non-zero.
-int run_jit(const Module& m);
+// sentinel so the driver can exit non-zero. If `timings` is non-null, the LLVM
+// compile and simulation phase durations are recorded into it.
+int run_jit(const Module& m, Timings* timings = nullptr);
 
 } // namespace clotho::ir

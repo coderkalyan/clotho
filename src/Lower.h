@@ -14,6 +14,7 @@
 #include <string_view>
 
 #include "ir/Module.h"
+#include "ir/Timing.h"
 
 namespace clotho {
 
@@ -27,10 +28,12 @@ struct LowerResult {
     bool ok = false;
 };
 
-// Lower a SystemVerilog source file at `path`.
-LowerResult lower_file(std::string_view path);
+// Lower a SystemVerilog source file at `path`. If `timings` is non-null, the
+// front-end and analysis phase durations are accumulated into it.
+LowerResult lower_file(std::string_view path, Timings* timings = nullptr);
 
-// Lower a SystemVerilog source fragment held in memory.
-LowerResult lower_text(std::string_view source);
+// Lower a SystemVerilog source fragment held in memory. If `timings` is non-null,
+// the front-end and analysis phase durations are accumulated into it.
+LowerResult lower_text(std::string_view source, Timings* timings = nullptr);
 
 } // namespace clotho

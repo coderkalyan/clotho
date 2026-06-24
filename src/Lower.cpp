@@ -875,9 +875,12 @@ private:
     ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal> sigmap_;
 };
 
-LowerResult lower_compilation(slang::ast::Compilation& comp) {
+LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
     LowerResult result;
 
+    // Front end: getAllDiagnostics forces full elaboration; getRoot resolves the
+    // design hierarchy. Both are slang work.
+    const auto                  t_fe      = std::chrono::steady_clock::now();
     const slang::Diagnostics&   diags     = comp.getAllDiagnostics();
     const slang::SourceManager* sm        = comp.getSourceManager();
     bool                        has_error = false;
@@ -892,21 +895,32 @@ LowerResult lower_compilation(slang::ast::Compilation& comp) {
         has_error          = engine.getNumErrors() > 0;
     }
     if (has_error) {
+        if (timings != nullptr) {
+            timings->frontend_ms += ms_since(t_fe);
+        }
         return result;
     }
 
     const RootSymbol& root = comp.getRoot();
+    if (timings != nullptr) {
+        timings->frontend_ms += ms_since(t_fe);
+    }
     if (root.topInstances.empty()) {
         result.diagnostics += "error: no top-level module found\n";
         return result;
     }
 
-    auto module = std::make_unique<ir::Module>();
+    // Analysis: walk the elaborated AST into clotho IR.
+    const auto t_an   = std::chrono::steady_clock::now();
+    auto       module = std::make_unique<ir::Module>();
     try {
         Lowerer(*module).lower_instance(*root.topInstances[0]);
     } catch (const LowerError& e) {
         result.diagnostics += "error: " + e.message + "\n";
         return result;
+    }
+    if (timings != nullptr) {
+        timings->analysis_ms += ms_since(t_an);
     }
 
     result.module = std::move(module);
@@ -917,8 +931,9 @@ LowerResult lower_compilation(slang::ast::Compilation& comp) {
 
 } // namespace
 
-LowerResult lower_file(std::string_view path) {
-    auto tree = slang::syntax::SyntaxTree::fromFile(path);
+LowerResult lower_file(std::string_view path, Timings* timings) {
+    const auto t_parse = std::chrono::steady_clock::now();
+    auto       tree    = slang::syntax::SyntaxTree::fromFile(path);
     if (!tree) {
         LowerResult result;
         result.diagnostics =
@@ -928,15 +943,22 @@ LowerResult lower_file(std::string_view path) {
 
     slang::ast::Compilation comp;
     comp.addSyntaxTree(*tree);
+    if (timings != nullptr) {
+        timings->frontend_ms += ms_since(t_parse);
+    }
 
-    return lower_compilation(comp);
+    return lower_compilation(comp, timings);
 }
 
-LowerResult lower_text(std::string_view source) {
+LowerResult lower_text(std::string_view source, Timings* timings) {
+    const auto t_parse = std::chrono::steady_clock::now();
     slang::ast::Compilation comp;
     comp.addSyntaxTree(slang::syntax::SyntaxTree::fromText(source));
+    if (timings != nullptr) {
+        timings->frontend_ms += ms_since(t_parse);
+    }
 
-    return lower_compilation(comp);
+    return lower_compilation(comp, timings);
 }
 
 } // namespace clotho
