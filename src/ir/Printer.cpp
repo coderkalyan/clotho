@@ -120,6 +120,8 @@ const char* tag_name(Inst::Tag tag) {
             return "cond";
         case T::Ret:
             return "ret";
+        case T::Delay:
+            return "delay";
         case T::Display:
             return "display";
     }

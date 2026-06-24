@@ -70,11 +70,11 @@ TEST_CASE("alu emits verifiable llvm ir") {
 
     // One coroutine per process, named @<module>.<source byte offset>: two
     // combinational assigns + one sequential always block. Each is a switched-
-    // resume coroutine ramp returning the handle and taking a bare state ptr.
-    // (CoroSplit also emits .resume/.destroy/.cleanup parts, which don't match
-    // this "define ptr @alu." prefix.)
+    // resume coroutine ramp returning the handle and taking the bare state ptr plus
+    // the timing-wheel ptr. (CoroSplit also emits .resume/.destroy/.cleanup parts,
+    // which don't match this "define ptr @alu." prefix.)
     CHECK(count_substr(ir, "define ptr @alu.") == 3);
-    CHECK(ir.find("(ptr %state)") != std::string::npos);
+    CHECK(ir.find("(ptr %state, ptr %wheel)") != std::string::npos);
 
     // Datapath ops present.
     CHECK(ir.find(" add ") != std::string::npos);
@@ -106,4 +106,58 @@ TEST_CASE("2-state vs 4-state widths") {
     // z's must|may word sits first at offset 0 as an i16 (2W = 16).
     CHECK(ir.find("store i16") != std::string::npos);
     CHECK(ir.find("define ptr @m.") != std::string::npos);
+}
+
+TEST_CASE("delay suspends and reschedules on the wheel") {
+    constexpr std::string_view src = R"(
+        module d;
+            initial begin
+                $display("hi");
+                #20;
+                $display("bye");
+            end
+        endmodule
+    )";
+    const std::string          ir  = emit(src);
+
+    // #20 lowers to: read current tick, schedule a wheel timer, and suspend. The
+    // coroutine intrinsics themselves are lowered away by CoroSplit; the runtime
+    // calls are what remain.
+    CHECK(ir.find("call i64 @rt_wheel_now") != std::string::npos);
+    CHECK(ir.find("call void @rt_wheel_schedule") != std::string::npos);
+    // The timer callback that resumes the suspended coroutine.
+    CHECK(ir.find("define internal void @clotho.resume_timer") != std::string::npos);
+    // main drains the wheel: tick while timers are pending.
+    CHECK(ir.find("call i32 @rt_wheel_pending") != std::string::npos);
+    CHECK(ir.find("call void @rt_wheel_tick") != std::string::npos);
+}
+
+TEST_CASE("delay inside a conditional splits cleanly") {
+    // A #delay nested in an if/else branch suspends mid-conditional. The point is
+    // that CoroSplit handles the resulting CFG and the module still verifies —
+    // emit() REQUIREs emit_llvm (which runs the coroutine passes and verifyModule)
+    // to succeed, so a malformed split would fail this test outright.
+    constexpr std::string_view src = R"(
+        module c;
+            logic flag;
+            initial begin
+                flag = 1;
+                $display("start");
+                if (flag) begin
+                    #10;
+                    $display("then");
+                end else begin
+                    #99;
+                    $display("else");
+                end
+                $display("done");
+            end
+        endmodule
+    )";
+    const std::string          ir  = emit(src);
+
+    // The conditional's branch and both delays' schedules survive lowering.
+    CHECK(ir.find("br i1") != std::string::npos);
+    CHECK(count_substr(ir, "call void @rt_wheel_schedule") == 2);
+    CHECK(ir.find("define internal void @clotho.resume_timer") != std::string::npos);
 }

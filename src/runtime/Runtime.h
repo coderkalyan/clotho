@@ -84,6 +84,10 @@ void rt_wheel_deinit(rt_wheel* wheel);
 // Current tick. Starts at zero, advances only through rt_wheel_tick.
 uint64_t rt_wheel_now(const rt_wheel* wheel);
 
+// Non-zero iff the wheel has any timer scheduled. The design's sim loop ticks
+// the wheel until this reports empty.
+int rt_wheel_pending(const rt_wheel* wheel);
+
 // Link `timer` to fire at absolute tick `deadline` (must be > rt_wheel_now),
 // calling `on_expire(timer, ctx)` when it fires.
 void rt_wheel_schedule(rt_wheel* wheel, rt_timer* timer, uint64_t deadline, rt_timer_fn on_expire);

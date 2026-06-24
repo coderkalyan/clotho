@@ -197,6 +197,10 @@ struct Inst {
         Cond,
         // Return a value from a function / task (payload: unary).
         Ret,
+        // Time delay `#n`: suspend the process for `n` ticks (payload: unary, the
+        // tick count). Lowers to a timer scheduled on the wheel plus a coroutine
+        // suspend; the wheel resumes the process when the delay elapses.
+        Delay,
 
         // -- System tasks --
         // $display / $write: format string + variadic args (payload: display).

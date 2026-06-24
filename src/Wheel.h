@@ -64,6 +64,17 @@ public:
         return now_;
     }
 
+    // True iff no timers are scheduled anywhere (neither in a wheel slot nor the
+    // overflow heap). Drives the drain loop: tick until empty.
+    bool empty() const {
+        for (uint64_t word : occupied_) {
+            if (word != 0) {
+                return false;
+            }
+        }
+        return overflow_.empty();
+    }
+
     // Link `t` to fire at absolute tick `deadline` (must be > now()). The
     // node's callback must already be set.
     void schedule(Timer& t, uint64_t deadline);
@@ -140,6 +151,11 @@ public:
 
     uint64_t now() const {
         return impl_.now();
+    }
+
+    // True iff nothing is scheduled. See WheelImpl::empty.
+    bool empty() const {
+        return impl_.empty();
     }
 
     // Schedule `t` to fire at `deadline` (> now()), invoking on_expire(t, args...).

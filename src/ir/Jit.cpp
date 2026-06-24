@@ -68,6 +68,7 @@ int run_jit(const Module& m) {
     expose("rt_wheel_init", &rt_wheel_init);
     expose("rt_wheel_deinit", &rt_wheel_deinit);
     expose("rt_wheel_now", &rt_wheel_now);
+    expose("rt_wheel_pending", &rt_wheel_pending);
     expose("rt_wheel_schedule", &rt_wheel_schedule);
     expose("rt_wheel_tick", &rt_wheel_tick);
     if (auto err = jd.define(llvm::orc::absoluteSymbols(std::move(rt_syms)))) {

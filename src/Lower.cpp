@@ -305,18 +305,23 @@ private:
             case StatementKind::Block:
                 lower_stmt(stmt.as<BlockStatement>().body, b);
                 break;
-            case StatementKind::Timed:
-                // A timing control reached here is nested inside a process body — a
-                // delay (#10), an intra-body event wait (@(posedge clk)), or
-                // wait(expr). None can suspend yet: there is no scheduler to resume
-                // on, so running the body immediately would silently violate timing
-                // semantics. Reject it loudly. (A process's top-level @(edge)
-                // sensitivity is consumed in lower_procedural_block and never lands
-                // here.)
-                // TODO: lower delays / event waits to a suspend + reschedule on the
-                // timing wheel (src/Wheel.h) once the sim loop exists.
-                fail("delay / event control / wait inside a process body is not "
-                     "supported yet (no scheduler)");
+            case StatementKind::Timed: {
+                // A timing control nested inside a process body. A delay (#n) lowers
+                // to a Delay instruction (suspend + reschedule on the timing wheel),
+                // then its body runs after the delay elapses. Intra-body event waits
+                // (@(posedge clk)) and wait(expr) still have no lowering. (A
+                // process's top-level @(edge) sensitivity is consumed in
+                // lower_procedural_block and never lands here.)
+                const TimedStatement& timed = stmt.as<TimedStatement>();
+                if (timed.timing.kind != TimingControlKind::Delay) {
+                    fail("event control / wait inside a process body is not "
+                         "supported yet (only #delay)");
+                }
+                const Expression& amount = timed.timing.as<DelayControl>().expr;
+                b.unary(ir::Inst::Tag::Delay, lower_expr(amount, b), loc(stmt));
+                lower_stmt(timed.stmt, b);
+                break;
+            }
             case StatementKind::ExpressionStatement: {
                 const Expression& e = stmt.as<ExpressionStatement>().expr;
                 if (e.kind == ExpressionKind::Assignment) {

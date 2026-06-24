@@ -20,6 +20,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::RedXor:
         case T::Lnot:
         case T::Ret:
+        case T::Delay:
             return K::Unary;
 
         case T::BitSelect:

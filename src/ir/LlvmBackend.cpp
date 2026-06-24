@@ -232,23 +232,25 @@ private:
         const std::string  name        = mod_.name + "." + std::to_string(offset);
 
         // A process lowers to a switched-resume LLVM coroutine:
-        // `ptr @<module>.<offset>(ptr noalias state)`. The ramp runs the body
-        // straight through to a single final suspend and returns the coroutine
-        // handle; the scheduler later resumes/destroys through that handle. There
-        // are no body suspend points yet, so behaviour is unchanged from the old
-        // plain function — the CoroSplit pass lowers the intrinsics away, leaving
-        // an ordinary function (plus a heap-allocated, currently-empty frame). This
-        // is the groundwork for #delay / @event suspension.
+        // `ptr @<module>.<offset>(ptr noalias state, ptr wheel)`. The ramp runs the
+        // body until the first #delay (or to completion) and returns the coroutine
+        // handle; the scheduler resumes/destroys through that handle. A #delay (see
+        // lower_delay) schedules a wheel timer and suspends; the timer's callback
+        // resumes the coroutine when the delay elapses. A delay-free process runs
+        // straight to the final suspend, exactly like the old plain function.
         auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
-        auto* fnty   = llvm::FunctionType::get(ptr_ty, { ptr_ty }, false);
+        auto* fnty   = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
         fn_          = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name, llmod_);
         // Mark it pre-split so the CoroSplit pass picks it up.
         fn_->setPresplitCoroutine();
         state_ = fn_->getArg(0);
         state_->setName("state");
+        wheel_ = fn_->getArg(1);
+        wheel_->setName("wheel");
         // The state pointer is the sole module memory the process touches; noalias
         // lets the allocator rematerialize signal loads instead of spilling them.
         fn_->addParamAttr(0, llvm::Attribute::NoAlias);
+        awaiter_ = nullptr;
 
         auto* none     = llvm::ConstantTokenNone::get(ctx_);
         auto* null     = llvm::ConstantPointerNull::get(ptr_ty);
@@ -264,7 +266,7 @@ private:
         b_.CreateCondBr(need, alloc_bb, begin_bb);
 
         // Dynamic frame: rt_alloc(coro.size). The sim owns frame memory so a frame
-        // can outlive the ramp once real suspend points exist.
+        // outlives the ramp while the process is suspended on the wheel.
         b_.SetInsertPoint(alloc_bb);
         auto* size = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_size, { b_.getInt64Ty() }), {});
         auto* mem  = b_.CreateCall(alloc_fn(), { size });
@@ -274,52 +276,134 @@ private:
         auto* frame = b_.CreatePHI(ptr_ty, 2);
         frame->addIncoming(null, entry);
         frame->addIncoming(mem, alloc_bb);
-        auto* hdl = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_begin), { id, frame });
+        hdl_        = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_begin), { id, frame });
+        coro_begin_ = llvm::cast<llvm::Instruction>(hdl_);
 
-        // Process body. lower_region appends into the current block (and any blocks
-        // it creates), leaving the insert point on a terminator-less block.
-        lower_region(ir_->root());
+        // Shared epilogue, built up front so #delay suspends and the final suspend
+        // can all branch to it. cleanup frees the frame (coro.free -> rt_free); ret
+        // ends the coroutine and returns the handle to whoever resumed it.
+        auto* trap_bb     = llvm::BasicBlock::Create(ctx_, "coro.trap", fn_);
+        auto* free_bb     = llvm::BasicBlock::Create(ctx_, "coro.free", fn_);
+        coro_cleanup_bb_  = llvm::BasicBlock::Create(ctx_, "coro.cleanup", fn_);
+        coro_ret_bb_      = llvm::BasicBlock::Create(ctx_, "coro.ret", fn_);
 
-        auto* final_bb = llvm::BasicBlock::Create(ctx_, "coro.final", fn_);
-        auto* trap_bb  = llvm::BasicBlock::Create(ctx_, "coro.trap", fn_);
-        auto* clean_bb = llvm::BasicBlock::Create(ctx_, "coro.cleanup", fn_);
-        auto* free_bb  = llvm::BasicBlock::Create(ctx_, "coro.free", fn_);
-        auto* ret_bb   = llvm::BasicBlock::Create(ctx_, "coro.ret", fn_);
-        b_.CreateBr(final_bb);
-
-        // One final suspend. The default edge first returns the handle to the
-        // scheduler; a later coro.destroy re-enters here (case 1) to free the
-        // frame; resuming a finished coroutine (case 0) is undefined, so trap.
-        b_.SetInsertPoint(final_bb);
-        auto* res = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { none, b_.getTrue() });
-        auto* sw  = b_.CreateSwitch(res, ret_bb, 2);
-        sw->addCase(b_.getInt8(0), trap_bb);
-        sw->addCase(b_.getInt8(1), clean_bb);
-
-        b_.SetInsertPoint(trap_bb);
-        b_.CreateUnreachable();
-
-        b_.SetInsertPoint(clean_bb);
-        auto* freed = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_free), { id, hdl });
-        b_.CreateCondBr(b_.CreateICmpNE(freed, null), free_bb, ret_bb);
+        b_.SetInsertPoint(coro_cleanup_bb_);
+        auto* freed = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_free), { id, hdl_ });
+        b_.CreateCondBr(b_.CreateICmpNE(freed, null), free_bb, coro_ret_bb_);
 
         b_.SetInsertPoint(free_bb);
         b_.CreateCall(free_fn(), { freed });
-        b_.CreateBr(ret_bb);
+        b_.CreateBr(coro_ret_bb_);
 
-        b_.SetInsertPoint(ret_bb);
-        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_end), { hdl, b_.getFalse(), none });
-        b_.CreateRet(hdl);
+        b_.SetInsertPoint(coro_ret_bb_);
+        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_end), { hdl_, b_.getFalse(), none });
+        b_.CreateRet(hdl_);
+
+        // Process body. lower_region appends after coro.begin (and into any blocks a
+        // #delay suspend creates), leaving the insert point on a terminator-less
+        // block that falls through to the final suspend.
+        b_.SetInsertPoint(begin_bb);
+        lower_region(ir_->root());
+
+        // Final suspend: the default edge returns the (now-done) handle to the
+        // resumer, which destroys it; case 1 is the destroy re-entry; resuming a
+        // finished coroutine (case 0) is undefined, so trap.
+        auto* final_bb = llvm::BasicBlock::Create(ctx_, "coro.final", fn_);
+        b_.CreateBr(final_bb);
+        b_.SetInsertPoint(final_bb);
+        auto* res = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { none, b_.getTrue() });
+        auto* sw  = b_.CreateSwitch(res, coro_ret_bb_, 2);
+        sw->addCase(b_.getInt8(0), trap_bb);
+        sw->addCase(b_.getInt8(1), coro_cleanup_bb_);
+
+        b_.SetInsertPoint(trap_bb);
+        b_.CreateUnreachable();
         return fn_;
+    }
+
+    // The awaiter embedded in the coroutine frame for #delay: an rt_timer
+    // ({ next, on_expire }) followed by the coroutine handle. &awaiter aliases the
+    // rt_timer the wheel links; the resume trampoline recovers the handle from
+    // field 2. One per process, reused across delays (a process waits on at most
+    // one timer at a time).
+    llvm::StructType* awaiter_ty() {
+        auto* ptr = llvm::PointerType::getUnqual(ctx_);
+        return llvm::StructType::get(ctx_, { ptr, ptr, ptr });
+    }
+
+    // Lazily allocate the awaiter, placed just after coro.begin so CoroSplit spills
+    // it into the frame (its address escapes to the wheel and it is live across the
+    // suspend).
+    llvm::Value* awaiter() {
+        if (awaiter_ == nullptr) {
+            // Insert right after coro.begin — using the block + iterator form so it
+            // works even when coro.begin is the last instruction so far (a #delay as
+            // the process's first statement).
+            llvm::IRBuilder<> ab(coro_begin_->getParent(), std::next(coro_begin_->getIterator()));
+            awaiter_ = ab.CreateAlloca(awaiter_ty(), nullptr, "awaiter");
+        }
+        return awaiter_;
+    }
+
+    // The shared timer callback: void @clotho.resume_timer(ptr timer, ptr ctx).
+    // Recovers the handle from the awaiter, resumes the coroutine, and destroys it
+    // if that resume ran it to completion. Built once per module.
+    llvm::Function* resume_trampoline() {
+        if (resume_fn_ != nullptr) {
+            return resume_fn_;
+        }
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
+        resume_fn_ = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, "clotho.resume_timer", llmod_);
+
+        llvm::IRBuilder<> tb(ctx_);
+        auto*             entry   = llvm::BasicBlock::Create(ctx_, "entry", resume_fn_);
+        auto*             destroy = llvm::BasicBlock::Create(ctx_, "destroy", resume_fn_);
+        auto*             ret     = llvm::BasicBlock::Create(ctx_, "ret", resume_fn_);
+        tb.SetInsertPoint(entry);
+        llvm::Value* hp  = tb.CreateStructGEP(awaiter_ty(), resume_fn_->getArg(0), 2);
+        llvm::Value* hdl = tb.CreateLoad(ptr, hp);
+        tb.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
+        llvm::Value* done = tb.CreateCall(coro_intr(llvm::Intrinsic::coro_done), { hdl });
+        tb.CreateCondBr(done, destroy, ret);
+        tb.SetInsertPoint(destroy);
+        tb.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
+        tb.CreateBr(ret);
+        tb.SetInsertPoint(ret);
+        tb.CreateRetVoid();
+        return resume_fn_;
+    }
+
+    // Lower a #delay: schedule a wheel timer for `now + amount` ticks that resumes
+    // this coroutine, then suspend. Execution continues in a fresh resume block.
+    void lower_delay(Index amount) {
+        auto* aw = awaiter();
+        // Stash the handle so the timer callback can resume us.
+        b_.CreateStore(hdl_, b_.CreateStructGEP(awaiter_ty(), aw, 2));
+
+        llvm::Value* ticks    = cast(must_of(value_of(amount)), 64, false);
+        llvm::Value* now      = b_.CreateCall(wheel_now_fn(), { wheel_ });
+        llvm::Value* deadline = b_.CreateAdd(now, ticks);
+        b_.CreateCall(wheel_schedule_fn(), { wheel_, aw, deadline, resume_trampoline() });
+
+        // Suspend. The save token pairs the suspend with this resume point; the
+        // default edge returns control to the resumer (coro.ret), case 0 resumes
+        // here, case 1 is a destroy while suspended.
+        auto* save   = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_save), { hdl_ });
+        auto* susp   = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { save, b_.getFalse() });
+        auto* resume = llvm::BasicBlock::Create(ctx_, "coro.resume", fn_);
+        auto* sw     = b_.CreateSwitch(susp, coro_ret_bb_, 2);
+        sw->addCase(b_.getInt8(0), resume);
+        sw->addCase(b_.getInt8(1), coro_cleanup_bb_);
+        b_.SetInsertPoint(resume);
     }
 
     // -- Top-level entry --
     //
-    // Emit `i32 @main()`: stack-allocate the shared state, power it up, then run
-    // the initial blocks through the active task queue (seed it with every initial
-    // block and drain it). Returns 0. A timing wheel is constructed alongside but
-    // sits idle — timed-event scheduling lands on it in a later step. General
-    // suspension is still out of scope; each callee runs straight through.
+    // Emit `i32 @main()`: stack-allocate the shared state, power it up, build the
+    // timing wheel, then run the initial blocks through the active task queue and
+    // drain the wheel (advancing time, resuming delayed processes) until idle.
+    // Returns 0.
     void emit_main(const std::vector<llvm::Function*>& initials) {
         auto* i32  = llvm::Type::getInt32Ty(ctx_);
         auto* fnty = llvm::FunctionType::get(i32, false);
@@ -333,15 +417,14 @@ private:
         state->setAlignment(llvm::Align(8));
         init_state(state);
 
-        // Timing wheel: constructed and live in main but not yet driven — timed
-        // events get scheduled onto it later. For now it sits idle while the active
-        // queue carries the initial blocks.
+        // Timing wheel: the event scheduler. Processes schedule timers on it at
+        // #delay and the drain loop ticks it to advance time and resume them.
         auto* wheel_ty = llvm::ArrayType::get(b_.getInt8Ty(), sizeof(rt_wheel));
         auto* wheel    = b_.CreateAlloca(wheel_ty, nullptr, "wheel");
         wheel->setAlignment(llvm::Align(alignof(rt_wheel)));
         b_.CreateCall(wheel_init_fn(), { wheel });
 
-        emit_active_run(state, initials);
+        emit_active_run(state, wheel, initials);
 
         b_.CreateCall(wheel_deinit_fn(), { wheel });
         b_.CreateRet(llvm::ConstantInt::get(i32, 0));
@@ -351,9 +434,13 @@ private:
     // array used as a LIFO stack (active events may fire in any order per the LRM,
     // so the stack discipline is free). Capacity is the total process count — the
     // most that can ever be ready at once. main empties the stack, pushes every
-    // initial block, then drains it, calling each process with the state pointer.
+    // initial block, then drains it, calling each process with (state, wheel).
     // The drain reloads the top each turn, so a running process can push more work.
-    void emit_active_run(llvm::Value* state, const std::vector<llvm::Function*>& initials) {
+    //
+    // Once the active queue empties, the wheel drain takes over: tick the wheel
+    // (advancing simulation time to the next scheduled timer and firing its
+    // callbacks, which resume the delayed coroutines) until no timers remain.
+    void emit_active_run(llvm::Value* state, llvm::Value* wheel, const std::vector<llvm::Function*>& initials) {
         auto*      ptr_ty = llvm::PointerType::getUnqual(ctx_);
         auto*      i32    = b_.getInt32Ty();
         const auto cap    = std::max<size_t>(mod_.processes().size(), 1);
@@ -376,17 +463,19 @@ private:
             b_.CreateStore(b_.CreateAdd(sp, b_.getInt32(1)), top);
         }
 
-        // Drain: while top != 0, pop queue[--top], resume it, then destroy it.
-        // Each process is a coroutine: calling its ramp runs the body to the final
-        // suspend and yields a handle; coro.destroy frees the frame. Dispatch is
-        // indirect (through the queue), so the frame can't be elided — it lives on
-        // the heap via rt_alloc. That's the price of dynamic scheduling and matches
-        // how the wheel will resume suspended processes later; behaviour is
-        // unchanged from the old direct call.
-        auto* proc_fnty = llvm::FunctionType::get(ptr_ty, { ptr_ty }, false);
+        // Drain the active queue: while top != 0, pop queue[--top] and resume it.
+        // Each process is a coroutine; calling its ramp runs the body until the
+        // first #delay (or to completion) and yields a handle. If it ran to
+        // completion (coro.done) we destroy it here; otherwise it is suspended on
+        // the wheel and the timer callback owns it. Dispatch is indirect (through
+        // the queue), so the frame can't be elided — it lives on the heap via
+        // rt_alloc, which is also what lets it persist across a suspend.
+        auto* proc_fnty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
         auto* fn        = b_.GetInsertBlock()->getParent();
         auto* check     = llvm::BasicBlock::Create(ctx_, "active.check", fn);
         auto* body      = llvm::BasicBlock::Create(ctx_, "active.body", fn);
+        auto* destroy   = llvm::BasicBlock::Create(ctx_, "active.destroy", fn);
+        auto* cont      = llvm::BasicBlock::Create(ctx_, "active.cont", fn);
         auto* done      = llvm::BasicBlock::Create(ctx_, "active.done", fn);
         b_.CreateBr(check);
 
@@ -399,11 +488,36 @@ private:
         b_.CreateStore(idx, top);
         llvm::Value* slot = b_.CreateInBoundsGEP(arr_ty, queue, { b_.getInt32(0), idx });
         llvm::Value* fnp  = b_.CreateLoad(ptr_ty, slot);
-        llvm::Value* hdl  = b_.CreateCall(proc_fnty, fnp, { state });
+        llvm::Value* hdl  = b_.CreateCall(proc_fnty, fnp, { state, wheel });
+        llvm::Value* fin  = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_done), { hdl });
+        b_.CreateCondBr(fin, destroy, cont);
+
+        b_.SetInsertPoint(destroy);
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
+        b_.CreateBr(cont);
+
+        b_.SetInsertPoint(cont);
         b_.CreateBr(check);
 
+        // Wheel drain: tick until no timers remain. Each tick advances time to the
+        // next timer and fires it, resuming (and possibly finishing) a coroutine,
+        // which may schedule further timers.
         b_.SetInsertPoint(done);
+        auto* null       = llvm::ConstantPointerNull::get(ptr_ty);
+        auto* wheel_chk  = llvm::BasicBlock::Create(ctx_, "wheel.check", fn);
+        auto* wheel_tick = llvm::BasicBlock::Create(ctx_, "wheel.tick", fn);
+        auto* wheel_done = llvm::BasicBlock::Create(ctx_, "wheel.done", fn);
+        b_.CreateBr(wheel_chk);
+
+        b_.SetInsertPoint(wheel_chk);
+        llvm::Value* pending = b_.CreateCall(wheel_pending_fn(), { wheel });
+        b_.CreateCondBr(b_.CreateICmpNE(pending, b_.getInt32(0)), wheel_tick, wheel_done);
+
+        b_.SetInsertPoint(wheel_tick);
+        b_.CreateCall(wheel_tick_fn(), { wheel, null });
+        b_.CreateBr(wheel_chk);
+
+        b_.SetInsertPoint(wheel_done);
     }
 
     // -- Coroutine intrinsics / frame allocator --
@@ -434,6 +548,16 @@ private:
     llvm::FunctionCallee wheel_deinit_fn() {
         auto* ptr = llvm::PointerType::getUnqual(ctx_);
         return llmod_.getOrInsertFunction("rt_wheel_deinit", llvm::FunctionType::get(b_.getVoidTy(), { ptr }, false));
+    }
+    // i64 rt_wheel_now(const rt_wheel*)
+    llvm::FunctionCallee wheel_now_fn() {
+        auto* ptr = llvm::PointerType::getUnqual(ctx_);
+        return llmod_.getOrInsertFunction("rt_wheel_now", llvm::FunctionType::get(b_.getInt64Ty(), { ptr }, false));
+    }
+    // i32 rt_wheel_pending(const rt_wheel*)
+    llvm::FunctionCallee wheel_pending_fn() {
+        auto* ptr = llvm::PointerType::getUnqual(ctx_);
+        return llmod_.getOrInsertFunction("rt_wheel_pending", llvm::FunctionType::get(b_.getInt32Ty(), { ptr }, false));
     }
     // void rt_wheel_schedule(rt_wheel*, rt_timer*, i64 deadline, rt_timer_fn)
     llvm::FunctionCallee wheel_schedule_fn() {
@@ -566,6 +690,7 @@ private:
             case Inst::Tag::StoreNb:
             case Inst::Tag::Cond:
             case Inst::Tag::Ret:
+            case Inst::Tag::Delay:
             case Inst::Tag::Display:
                 return { 0, false, false };
         }
@@ -700,6 +825,10 @@ private:
 
             case Inst::Tag::Cond:
                 lower_cond(i);
+                return;
+
+            case Inst::Tag::Delay:
+                lower_delay(p.unary);
                 return;
 
             case Inst::Tag::Display:
@@ -1248,9 +1377,17 @@ private:
     std::vector<SignalSlot> slots_;
 
     // Per-process scratch, reset in lower_process.
-    const Ir*                           ir_    = nullptr;
-    llvm::Function*                     fn_    = nullptr;
-    llvm::Value*                        state_ = nullptr;
+    const Ir*           ir_         = nullptr;
+    llvm::Function*     fn_         = nullptr;
+    llvm::Value*        state_      = nullptr;
+    llvm::Value*        wheel_      = nullptr;
+    llvm::Value*        hdl_        = nullptr;
+    llvm::Instruction*  coro_begin_ = nullptr;
+    llvm::AllocaInst*   awaiter_    = nullptr;
+    llvm::BasicBlock*   coro_cleanup_bb_ = nullptr;
+    llvm::BasicBlock*   coro_ret_bb_     = nullptr;
+    // The shared timer-resume trampoline, built once per module.
+    llvm::Function*                     resume_fn_ = nullptr;
     std::vector<Plane>                  values_;
     std::vector<std::optional<LValue>>  lvals_;
     std::vector<std::optional<ValType>> types_;
