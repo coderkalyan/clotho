@@ -6,5 +6,7 @@ module foo;
     clk  = 0;
     rst  = 1;
     data = 100 + 23;
+
+    $display("Hello, world!");
   end
 endmodule

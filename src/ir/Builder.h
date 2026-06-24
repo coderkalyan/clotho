@@ -16,6 +16,7 @@
 #include <bit>
 #include <cstdint>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "InternPool.h"
@@ -48,6 +49,11 @@ public:
     Index part_select(Index base, uint32_t msb, uint32_t lsb, SourceLoc loc);
     Index cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc);
 
+    // -- System tasks --
+    // $display / $write: a literal format string, a newline flag (true for
+    // $display), and the already-lowered value args its specifiers consume.
+    Index display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc);
+
     // -- Regions --
     // Begin a nested region; subsequent emits accumulate into it until closed.
     void open_region();
@@ -76,6 +82,21 @@ private:
         const auto       words = std::bit_cast<std::array<uint32_t, n>>(value);
         const auto       start = static_cast<uint32_t>(extra_.size());
         extra_.insert(extra_.end(), words.begin(), words.end());
+
+        return static_cast<ExtraIndex>(start);
+    }
+
+    // Append raw bytes to the extra buffer, packed little-endian 4 chars per
+    // word; returns the offset of the first word. Decode with Ir::extra_bytes.
+    ExtraIndex add_bytes(std::string_view s) {
+        const auto start = static_cast<uint32_t>(extra_.size());
+        for (size_t i = 0; i < s.size(); i += 4) {
+            uint32_t word = 0;
+            for (size_t k = 0; k < 4 && i + k < s.size(); ++k) {
+                word |= static_cast<uint32_t>(static_cast<uint8_t>(s[i + k])) << (8 * k);
+            }
+            extra_.push_back(word);
+        }
 
         return static_cast<ExtraIndex>(start);
     }

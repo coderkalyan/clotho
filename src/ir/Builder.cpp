@@ -76,4 +76,15 @@ Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_reg
     return emit({ Inst::Tag::Cond, Inst::Payload{ .op_extra = { condition, extra } } }, loc);
 }
 
+Index Builder::display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc) {
+    // Order in the extra buffer: format bytes, then the arg-index slice, then the
+    // DisplayInfo record pointing at both. None of the three regions overlap.
+    const ExtraIndex fmt_at = add_bytes(fmt);
+    const ExtraSlice slice  = add_slice(args);
+    const ExtraIndex extra =
+      add_extra(DisplayInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), newline ? 1u : 0u, slice });
+
+    return emit({ Inst::Tag::Display, Inst::Payload{ .display = extra } }, loc);
+}
+
 } // namespace clotho::ir

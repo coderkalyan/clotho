@@ -50,6 +50,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::Repl;
         case T::Concat:
             return K::Extra;
+        case T::Display:
+            return K::Display;
 
         case T::Mux:
         case T::PartSelect:
@@ -92,6 +94,13 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
             // concat: variadic operands live in the extra buffer.
             const auto slice = extra_data<ExtraSlice>(p.extra);
             return index_slice(slice);
+        }
+
+        case Inst::PayloadKind::Display: {
+            // display: the value args are an index slice in the DisplayInfo record;
+            // the format string is not an SSA operand.
+            const auto info = extra_data<DisplayInfo>(p.display);
+            return index_slice(info.args);
         }
 
         case Inst::PayloadKind::OpExtra:

@@ -381,6 +381,7 @@ private:
             case Inst::Tag::StoreNb:
             case Inst::Tag::Cond:
             case Inst::Tag::Ret:
+            case Inst::Tag::Display:
                 return { 0, false, false };
         }
         return { 0, false, false };
@@ -504,6 +505,10 @@ private:
                 lower_cond(i);
                 return;
 
+            case Inst::Tag::Display:
+                lower_display(i);
+                return;
+
             case Inst::Tag::Arg:
                 throw BackendError{ "arg (function/task parameter) not supported by the process backend" };
             case Inst::Tag::Ret:
@@ -592,6 +597,64 @@ private:
     static bool is_zero_const(llvm::Value* v) {
         auto* c = llvm::dyn_cast<llvm::ConstantInt>(v);
         return c != nullptr && c->isZero();
+    }
+
+    // -- System tasks --
+
+    // The runtime argument descriptor, mirroring `rt_arg` in runtime/Runtime.h:
+    //   { i32 width, i32 flags, i64 val, i64 xz, i64 z }
+    // val/xz/z carry the low 64 bits of each plane (wider values are truncated).
+    llvm::StructType* arg_struct_ty() {
+        return llvm::StructType::get(
+          ctx_, { b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty() });
+    }
+
+    // void rt_display(const char* fmt, i32 argc, const rt_arg* argv)
+    llvm::FunctionCallee display_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, b_.getInt32Ty(), ptr }, false);
+        return llmod_.getOrInsertFunction("rt_display", fnty);
+    }
+
+    // Lower a $display / $write: stack-allocate an rt_arg[] descriptor array, pack
+    // each value operand's planes into it, and call the runtime formatter.
+    void lower_display(Index i) {
+        const auto  info = ir_->extra_data<DisplayInfo>(ir_->payload(i).display);
+        std::string fmt  = ir_->extra_bytes(info.fmt, info.fmt_len);
+        if (info.newline) {
+            fmt += '\n';
+        }
+
+        const std::span<const Index> args = ir_->region(info.args);
+        const auto                   n    = static_cast<uint32_t>(args.size());
+
+        llvm::StructType* sty = arg_struct_ty();
+        llvm::Value*      arr = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+        if (n > 0) {
+            arr = b_.CreateAlloca(sty, b_.getInt32(n), "display_args");
+            for (uint32_t k = 0; k < n; ++k) {
+                const Plane   p    = value_of(args[k]);
+                const ValType t    = type_of(args[k]);
+                llvm::Value*  must = must_of(p);
+                llvm::Value*  may  = may_of(p);
+                // xz = must ^ may marks every unknown bit (X and Z); z marks the Z
+                // subset. The runtime distinguishes them per bit.
+                llvm::Value* xz  = b_.CreateXor(must, may);
+                llvm::Value* elt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
+                store_field(sty, elt, 0, b_.getInt32(t.width));
+                store_field(sty, elt, 1, b_.getInt32(t.is_signed ? 1u : 0u));
+                store_field(sty, elt, 2, cast(must, 64, false));
+                store_field(sty, elt, 3, cast(xz, 64, false));
+                store_field(sty, elt, 4, cast(p.z, 64, false));
+            }
+        }
+
+        llvm::Value* fmt_ptr = b_.CreateGlobalString(fmt);
+        b_.CreateCall(display_fn(), { fmt_ptr, b_.getInt32(n), arr });
+    }
+
+    void store_field(llvm::StructType* sty, llvm::Value* elt, unsigned idx, llvm::Value* v) {
+        b_.CreateStore(v, b_.CreateStructGEP(sty, elt, idx));
     }
 
     // -- Plane helpers --

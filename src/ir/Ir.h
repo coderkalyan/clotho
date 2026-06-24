@@ -27,6 +27,7 @@
 #include <bit>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -84,10 +85,26 @@ struct Regions {
     ExtraSlice else_;
 };
 
+// Extra payload for `display`: a $display / $write system task. The format-string
+// bytes live packed little-endian (4 chars per u32 word) at `fmt` for `fmt_len`
+// bytes; `args` is the slice of value operands the format specifiers consume, in
+// order; `newline` is 1 for $display (append '\n') and 0 for $write.
+struct DisplayInfo {
+    // First extra word of the packed format-string bytes.
+    ExtraIndex fmt;
+    // Format-string length in bytes.
+    uint32_t fmt_len;
+    // 1 => append a trailing newline ($display); 0 => none ($write).
+    uint32_t newline;
+    // Value operands consumed by the format specifiers.
+    ExtraSlice args;
+};
+
 static_assert(ExtraPayload<ExtraSlice>);
 static_assert(ExtraPayload<Mux>);
 static_assert(ExtraPayload<PartSelect>);
 static_assert(ExtraPayload<Regions>);
+static_assert(ExtraPayload<DisplayInfo>);
 
 struct Inst {
     enum class Tag : uint8_t {
@@ -171,6 +188,10 @@ struct Inst {
         Cond,
         // Return a value from a function / task (payload: unary).
         Ret,
+
+        // -- System tasks --
+        // $display / $write: format string + variadic args (payload: display).
+        Display,
     };
 
     // Which union member a tag activates. Drives payload_kind() / operands().
@@ -185,6 +206,7 @@ struct Inst {
         Repl,
         OpExtra,
         Extra,
+        Display,
     };
 
     union Payload {
@@ -233,6 +255,8 @@ struct Inst {
         } op_extra;
         // Handle to a variable-length operand slice (concat).
         ExtraIndex extra;
+        // Handle to a DisplayInfo extra record (display).
+        ExtraIndex display;
     };
 
     // Discriminant selecting the active payload member.
@@ -294,6 +318,18 @@ public:
         }
 
         return std::bit_cast<T>(words);
+    }
+
+    // Decode `len` raw bytes previously packed at `at` by Builder (little-endian,
+    // 4 chars per word). Used for $display format strings.
+    std::string extra_bytes(ExtraIndex at, uint32_t len) const {
+        std::string s(len, '\0');
+        const auto  base = static_cast<uint32_t>(at);
+        for (uint32_t i = 0; i < len; ++i) {
+            s[i] = static_cast<char>((extra_[base + i / 4] >> (8 * (i % 4))) & 0xff);
+        }
+
+        return s;
     }
 
     // Fill `scratch` with the SSA operands of an instruction and return a view

@@ -1,7 +1,9 @@
 #include "Runtime.h"
 
 #include <cstddef>
+#include <cstdio>
 #include <new>
+#include <string>
 
 #include "Wheel.h"
 
@@ -31,6 +33,79 @@ const RuntimeWheel* unwrap(const rt_wheel* w) {
     return reinterpret_cast<const RuntimeWheel*>(w->storage);
 }
 
+// -- $display formatting --
+
+// Low-`w`-bits mask (all ones for w >= 64).
+uint64_t width_mask(uint32_t w) {
+    return w >= 64 ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << w) - 1);
+}
+
+// Render `val` as ceil(width/bits) digits, most-significant first. A digit prints
+// as 'z' if all of its unknown bits are high-impedance, 'x' if any are X, else
+// its hex/octal/binary value. `bits` is 1 (binary), 3 (octal) or 4 (hex).
+void render_digits(std::string& out, uint64_t val, uint64_t xz, uint64_t z, uint32_t width, uint32_t bits) {
+    if (width == 0) {
+        width = 1;
+    }
+    static constexpr char kHex[]  = "0123456789abcdef";
+    const uint64_t        dig_mask = (uint64_t{ 1 } << bits) - 1;
+    const uint32_t        digits   = (width + bits - 1) / bits;
+    for (uint32_t d = digits; d-- > 0;) {
+        const uint32_t shift = d * bits;
+        const uint64_t dxz   = (xz >> shift) & dig_mask;
+        if (dxz != 0) {
+            const uint64_t dz = (z >> shift) & dig_mask;
+            out += (dxz & ~dz) ? 'x' : 'z';
+        } else {
+            out += kHex[(val >> shift) & dig_mask];
+        }
+    }
+}
+
+// Render one descriptor under conversion `conv`, appending to `out`.
+void render_arg(std::string& out, const rt_arg& a, char conv) {
+    const uint32_t w    = a.width ? a.width : 1;
+    const uint64_t mask = width_mask(w);
+    const uint64_t val  = a.val & mask;
+    const uint64_t xz   = a.xz & mask;
+    const uint64_t z    = a.z & mask;
+
+    switch (conv) {
+        case 'd':
+        case 'D':
+            if (xz != 0) { // any unknown bit collapses the whole field
+                out += (xz & ~z) ? 'x' : 'z';
+            } else if ((a.flags & 1u) != 0) {
+                const uint64_t sext = (w < 64 && ((val >> (w - 1)) & 1u)) ? (val | ~mask) : val;
+                out += std::to_string(static_cast<int64_t>(sext));
+            } else {
+                out += std::to_string(val);
+            }
+            return;
+        case 'h':
+        case 'H':
+        case 'x':
+        case 'X':
+            render_digits(out, val, xz, z, w, 4);
+            return;
+        case 'o':
+        case 'O':
+            render_digits(out, val, xz, z, w, 3);
+            return;
+        case 'b':
+        case 'B':
+            render_digits(out, val, xz, z, w, 1);
+            return;
+        case 'c':
+        case 'C':
+            out += static_cast<char>(val & 0xff);
+            return;
+        default:
+            // Unsupported specifier (e.g. %s, %t, %m): consume the arg, emit nothing.
+            return;
+    }
+}
+
 clotho::Timer& unwrap(rt_timer* t) {
     return *reinterpret_cast<clotho::Timer*>(t);
 }
@@ -58,4 +133,40 @@ extern "C" void rt_wheel_schedule(rt_wheel* wheel, rt_timer* timer, uint64_t dea
 
 extern "C" void rt_wheel_tick(rt_wheel* wheel, void* ctx) {
     unwrap(wheel)->tick(ctx);
+}
+
+extern "C" void rt_display(const char* fmt, uint32_t argc, const rt_arg* argv) {
+    std::string out;
+    uint32_t    ai = 0;
+    for (const char* p = fmt; *p != '\0'; ++p) {
+        if (*p != '%') {
+            out += *p;
+            continue;
+        }
+        ++p;
+        if (*p == '\0') {
+            out += '%';
+            break;
+        }
+        if (*p == '%') {
+            out += '%';
+            continue;
+        }
+        // Skip flags and an optional width/precision; the field is auto-sized.
+        while (*p == '-' || *p == '+' || *p == ' ' || *p == '0') {
+            ++p;
+        }
+        while ((*p >= '0' && *p <= '9') || *p == '.') {
+            ++p;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        if (ai < argc) {
+            render_arg(out, argv[ai++], *p);
+        }
+    }
+    // Write raw: `out` may contain '%' or '{}' that printf/std::print would treat
+    // as format syntax.
+    std::fwrite(out.data(), 1, out.size(), stdout);
 }

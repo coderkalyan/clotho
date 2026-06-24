@@ -12,6 +12,7 @@
 #include <slang/ast/Statement.h>
 #include <slang/ast/TimingControl.h>
 #include <slang/ast/expressions/AssignmentExpressions.h>
+#include <slang/ast/expressions/CallExpression.h>
 #include <slang/ast/expressions/ConversionExpression.h>
 #include <slang/ast/expressions/LiteralExpressions.h>
 #include <slang/ast/expressions/MiscExpressions.h>
@@ -245,10 +246,13 @@ private:
                 break;
             case StatementKind::ExpressionStatement: {
                 const Expression& e = stmt.as<ExpressionStatement>().expr;
-                if (e.kind != ExpressionKind::Assignment) {
+                if (e.kind == ExpressionKind::Assignment) {
+                    lower_assign(e.as<AssignmentExpression>(), b);
+                } else if (e.kind == ExpressionKind::Call) {
+                    lower_call(e.as<CallExpression>(), b);
+                } else {
                     fail("unsupported expression statement");
                 }
-                lower_assign(e.as<AssignmentExpression>(), b);
                 break;
             }
             case StatementKind::Conditional:
@@ -283,6 +287,64 @@ private:
         const ir::ExtraSlice else_region = b.close_region();
 
         b.cond(pred, then_region, else_region, loc(c));
+    }
+
+    // -- System tasks --
+
+    void lower_call(const CallExpression& call, ir::Builder& b) {
+        if (!call.isSystemCall()) {
+            fail("only system task calls are supported as statements");
+        }
+        const std::string_view name = call.getSubroutineName();
+        if (name == "$display" || name == "$write") {
+            lower_display(call, name == "$display", b);
+            return;
+        }
+        fail("unsupported system task '" + std::string(name) + "'");
+    }
+
+    // Lower $display / $write into a single format string plus the value args its
+    // specifiers consume. A string-literal argument contributes its text verbatim
+    // (its %-specifiers pull from following value args, SV-style); a bare value
+    // argument not covered by an earlier specifier gets a default `%0d`.
+    void lower_display(const CallExpression& call, bool newline, ir::Builder& b) {
+        std::string            fmt;
+        std::vector<ir::Index> args;
+        int                    pending = 0; // unmatched specifiers seen so far
+
+        for (const Expression* arg : call.arguments()) {
+            if (arg->kind == ExpressionKind::StringLiteral) {
+                const std::string_view text = arg->as<StringLiteral>().getValue();
+                fmt += text;
+                pending += count_specifiers(text);
+            } else {
+                args.push_back(lower_expr(*arg, b));
+                if (pending > 0) {
+                    --pending; // consumed by an earlier format specifier
+                } else {
+                    fmt += "%0d"; // bare value: default decimal
+                }
+            }
+        }
+
+        b.display(fmt, newline, args, loc(call));
+    }
+
+    // Count format specifiers in `s`, treating `%%` as an escaped literal percent.
+    static int count_specifiers(std::string_view s) {
+        int n = 0;
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i] != '%') {
+                continue;
+            }
+            if (i + 1 < s.size() && s[i + 1] == '%') {
+                ++i; // skip the escaped percent
+                continue;
+            }
+            ++n;
+        }
+
+        return n;
     }
 
     void lower_assign(const AssignmentExpression& a, ir::Builder& b) {

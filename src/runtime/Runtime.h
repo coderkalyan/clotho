@@ -9,6 +9,30 @@
 
 extern "C" {
 
+// -- $display / $write --
+//
+// One value argument of a display task. The codegen packs each operand's 4-state
+// planes into the low 64 bits (wider values are truncated): `val` is the bit
+// pattern, `xz` marks unknown bits (X or Z), and `z` marks the high-impedance
+// subset (z is a subset of xz). Only the low `width` bits are significant.
+typedef struct rt_arg {
+    // Significant bit width of the value.
+    uint32_t width;
+    // Bit 0: the value is signed (drives %d sign-extension).
+    uint32_t flags;
+    // Value plane (definitely-1 bits) in the low `width` bits.
+    uint64_t val;
+    // Unknown mask: bit set => the value bit is X or Z.
+    uint64_t xz;
+    // High-impedance mask: bit set => the value bit is Z (implies the xz bit).
+    uint64_t z;
+} rt_arg;
+
+// Format `fmt` with `argc` descriptors and write the result to stdout. Supports
+// the common $display specifiers (%d %h/%x %b %o %c, and %%); each consumes the
+// next descriptor. The codegen folds any trailing newline into `fmt`.
+void rt_display(const char* fmt, uint32_t argc, const rt_arg* argv);
+
 // -- Timing wheel --
 //
 // The wheel (src/Wheel.h) is the design's event scheduler, surfaced here behind

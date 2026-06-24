@@ -114,6 +114,8 @@ const char* tag_name(Inst::Tag tag) {
             return "cond";
         case T::Ret:
             return "ret";
+        case T::Display:
+            return "display";
     }
 
     return "?";
@@ -226,6 +228,15 @@ private:
                         os_ << ", ";
                     }
                     ref(parts[k]);
+                }
+                break;
+            }
+            case Inst::PayloadKind::Display: {
+                const auto info = ir_.extra_data<DisplayInfo>(p.display);
+                os_ << '"' << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
+                for (Index a : ir_.region(info.args)) {
+                    os_ << ", ";
+                    ref(a);
                 }
                 break;
             }
