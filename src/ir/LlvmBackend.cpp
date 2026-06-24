@@ -1,11 +1,11 @@
 #include "ir/LlvmBackend.h"
 
+#include <algorithm>
 #include <array>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <vector>
-
-#include <ankerl/unordered_dense.h>
 
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Constants.h>
@@ -37,9 +37,12 @@
 // elide z where it proves dead rather than dropping it here.
 // To reconstruct canonical 4-state when needed: xz = must ^ may, val = must.
 //
-// State / ABI. Signals are persistent module state. We build one LLVM struct
-// with three iW fields per signal (must, may, z) and hand every process function
-// a pointer to it; Load reads those fields, Store writes them.
+// State / ABI. Signals are persistent module state held in one opaque byte
+// buffer (the LLVM equivalent of `u8* align(8)`). Clotho owns the layout: it
+// computes a fixed byte offset for each signal's must|may and z fields at compile
+// time (signals packed in decreasing alignment order) and hands every process
+// function a bare `ptr`. Load/Store reach a field via a constant-offset i8 GEP
+// and an aligned load/store — no LLVM struct layout is involved.
 //
 // Inferred types. The IR stores no per-instruction result type, so the backend
 // recomputes width / domain / signedness for each value by walking operands
@@ -81,15 +84,15 @@ struct LValue {
     uint32_t     width   = 0;
 };
 
-// Per-signal placement in the state struct plus its cached layout facts.
+// Per-signal placement in the state buffer plus its cached layout facts. A
+// signal occupies two fields: the packed i(2W) must|may word at `off_mm` and the
+// iW z word at `off_z` (both absolute byte offsets into the buffer).
 struct SignalSlot {
-    // Index of this signal's field in the state struct.
-    unsigned field = 0;
-    // The signal's value type: a `{ i(2W) must|may, iW z }` struct (e.g. %logic.8).
-    llvm::StructType* ty         = nullptr;
-    uint32_t          width      = 0;
-    bool              four_state = false;
-    bool              is_signed  = false;
+    uint32_t off_mm     = 0;
+    uint32_t off_z      = 0;
+    uint32_t width      = 0;
+    bool     four_state = false;
+    bool     is_signed  = false;
 };
 
 // Raised on a construct the backend cannot lower; caught at the top level.
@@ -109,7 +112,7 @@ public:
       , b_(ctx) {}
 
     void run() {
-        build_state_struct();
+        build_state_layout();
         std::vector<llvm::Function*> initials;
         for (const Process& proc : mod_.processes()) {
             llvm::Function* f = lower_process(proc);
@@ -145,47 +148,61 @@ private:
         return sign ? b_.CreateSExt(v, int_ty(to)) : b_.CreateZExt(v, int_ty(to));
     }
 
-    // -- Signal value types --
+    // -- State buffer layout --
 
-    // The named, deduplicated `{ i(2W) must|may, iW z }` struct for a signal type.
-    // 4-state types are %logic.<width>, 2-state %bit.<width>; each is emitted at
-    // most once and only because a signal uses it.
-    llvm::StructType* value_type(Ref type) {
-        const Layout      lay  = mod_.pool.layout(type);
-        const uint32_t    w    = lay.width == 0 ? 1 : lay.width;
-        const bool        four = lay.domain == Domain::Four;
-        const std::string name = (four ? "logic." : "bit.") + std::to_string(w);
-
-        const auto it = value_types_.find(name);
-        if (it != value_types_.end()) {
-            return it->second;
-        }
-        auto* st           = llvm::StructType::create(ctx_, { int_ty(2 * w), int_ty(w) }, name);
-        value_types_[name] = st;
-        return st;
+    // Byte size and natural alignment (capped at 8) of an integer field of the
+    // given bit width, both derived from the canonical plane sizing.
+    static uint32_t field_bytes(uint32_t bits) {
+        return plane_bytes(bits);
+    }
+    static uint32_t field_align(uint32_t bits) {
+        return std::min<uint32_t>(8, plane_bytes(bits));
+    }
+    static uint32_t round_up(uint32_t x, uint32_t a) {
+        return (x + a - 1) & ~(a - 1);
     }
 
-    // -- State struct --
+    // Lay out the single module's signals into one opaque byte buffer. Each signal
+    // owns a `{ i(2W) must|may, iW z }` slot; slots are packed in decreasing
+    // alignment order (stable on declaration order) so padding stays minimal.
+    // `slots_` stays indexed by signal handle — only the byte offsets reflect the
+    // packed order.
+    void build_state_layout() {
+        const auto sigs = mod_.signals();
+        slots_.resize(sigs.size());
 
-    void build_state_struct() {
-        const auto               sigs = mod_.signals();
-        std::vector<llvm::Type*> fields;
-        slots_.reserve(sigs.size());
-        for (const SignalInfo& s : sigs) {
-            const Layout lay = mod_.pool.layout(s.type);
-            const Type&  ty  = std::get<Type>(mod_.pool.get(s.type));
+        std::vector<uint32_t> order(sigs.size());
+        for (uint32_t i = 0; i < sigs.size(); ++i) {
+            const Layout lay = mod_.pool.layout(sigs[i].type);
+            const Type&  ty  = std::get<Type>(mod_.pool.get(sigs[i].type));
 
-            SignalSlot slot;
-            slot.width      = lay.width == 0 ? 1 : lay.width;
-            slot.four_state = lay.domain == Domain::Four;
-            slot.is_signed  = ty.is_signed;
-            slot.ty         = value_type(s.type);
-            slot.field      = static_cast<unsigned>(fields.size());
-            fields.push_back(slot.ty);
-            slots_.push_back(slot);
+            SignalSlot& slot = slots_[i];
+            slot.width       = lay.width == 0 ? 1 : lay.width;
+            slot.four_state  = lay.domain == Domain::Four;
+            slot.is_signed   = ty.is_signed;
+            order[i]         = i;
         }
 
-        state_ty_ = llvm::StructType::create(ctx_, fields, mod_.name + ".state");
+        // Stable sort by slot alignment (= align of the 2W must|may word) desc.
+        std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+            return field_align(2 * slots_[a].width) > field_align(2 * slots_[b].width);
+        });
+
+        uint32_t cursor = 0;
+        for (uint32_t i : order) {
+            SignalSlot&    slot       = slots_[i];
+            const uint32_t mm_bits    = 2 * slot.width;
+            const uint32_t slot_align = field_align(mm_bits);
+            const uint32_t z_rel      = round_up(field_bytes(mm_bits), field_align(slot.width));
+
+            const uint32_t slot_size = round_up(z_rel + field_bytes(slot.width), slot_align);
+            cursor                   = round_up(cursor, slot_align);
+            slot.off_mm              = cursor;
+            slot.off_z               = cursor + z_rel;
+            cursor += slot_size;
+        }
+
+        state_bytes_ = std::max<uint32_t>(1, round_up(cursor, 8));
     }
 
     const SignalSlot& slot_of(Signal s) const {
@@ -238,7 +255,9 @@ private:
         auto* entry = llvm::BasicBlock::Create(ctx_, "entry", main);
         b_.SetInsertPoint(entry);
 
-        llvm::Value* state = b_.CreateAlloca(state_ty_, nullptr, "state");
+        auto*           buf_ty = llvm::ArrayType::get(b_.getInt8Ty(), state_bytes_);
+        llvm::AllocaInst* state  = b_.CreateAlloca(buf_ty, nullptr, "state");
+        state->setAlignment(llvm::Align(8));
         init_state(state);
         for (llvm::Function* f : initials) {
             b_.CreateCall(f, { state });
@@ -250,16 +269,18 @@ private:
     // 2-state signals come up 0.
     void init_state(llvm::Value* state) {
         for (const SignalSlot& s : slots_) {
-            llvm::Value* sp = b_.CreateStructGEP(state_ty_, state, s.field);
-            llvm::Value* mp = b_.CreateStructGEP(s.ty, sp, 0);
-            llvm::Value* zp = b_.CreateStructGEP(s.ty, sp, 1);
             // X packs as the high W bits of the i(2W) must|may word (may=1, must=0).
             llvm::Value* mm = s.four_state
                                 ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * s.width, s.width))
                                 : zero(2 * s.width);
-            b_.CreateStore(mm, mp);
-            b_.CreateStore(zero(s.width), zp);
+            b_.CreateAlignedStore(mm, field_ptr(state, s.off_mm), llvm::Align(field_align(2 * s.width)));
+            b_.CreateAlignedStore(zero(s.width), field_ptr(state, s.off_z), llvm::Align(field_align(s.width)));
         }
+    }
+
+    // Pointer to a state field at a constant byte offset (a folded i8 GEP).
+    llvm::Value* field_ptr(llvm::Value* base, uint32_t off) {
+        return b_.CreateConstInBoundsGEP1_32(b_.getInt8Ty(), base, off);
     }
 
     // Lower a region's instructions in order into the current insert block.
@@ -516,10 +537,10 @@ private:
     // -- State access --
 
     Plane lower_load(const LValue& lv) {
-        const SignalSlot& s  = slot_of(lv.sig);
-        llvm::Value*      sp = b_.CreateStructGEP(state_ty_, state_, s.field);
-        llvm::Value*      mm = b_.CreateLoad(int_ty(2 * s.width), b_.CreateStructGEP(s.ty, sp, 0));
-        llvm::Value*      z  = b_.CreateLoad(int_ty(s.width), b_.CreateStructGEP(s.ty, sp, 1));
+        const SignalSlot& s = slot_of(lv.sig);
+        llvm::Value*      mm = b_.CreateAlignedLoad(
+          int_ty(2 * s.width), field_ptr(state_, s.off_mm), llvm::Align(field_align(2 * s.width)));
+        llvm::Value* z = b_.CreateAlignedLoad(int_ty(s.width), field_ptr(state_, s.off_z), llvm::Align(field_align(s.width)));
         if (lv.width == s.width && is_zero_const(lv.bit_off)) {
             return { mm, z };
         }
@@ -532,31 +553,33 @@ private:
     }
 
     void lower_store(const LValue& lv, Plane rhs, ValType rhs_ty) {
-        const SignalSlot& s  = slot_of(lv.sig);
-        llvm::Value*      sp = b_.CreateStructGEP(state_ty_, state_, s.field);
-        llvm::Value*      mp = b_.CreateStructGEP(s.ty, sp, 0);
-        llvm::Value*      zp = b_.CreateStructGEP(s.ty, sp, 1);
+        const SignalSlot& s     = slot_of(lv.sig);
+        llvm::Value*      mp     = field_ptr(state_, s.off_mm);
+        llvm::Value*      zp     = field_ptr(state_, s.off_z);
+        const llvm::Align mm_al  = llvm::Align(field_align(2 * s.width));
+        const llvm::Align z_al   = llvm::Align(field_align(s.width));
         (void)rhs_ty;
 
         // Whole-signal store: the frontend context-sizes the RHS to the lvalue
         // width (via an inserted Resize), so rhs already matches the signal width
         // and the planes store directly.
         if (lv.width == s.width && is_zero_const(lv.bit_off)) {
-            b_.CreateStore(rhs.mm, mp);
-            b_.CreateStore(rhs.z, zp);
+            b_.CreateAlignedStore(rhs.mm, mp, mm_al);
+            b_.CreateAlignedStore(rhs.z, zp, z_al);
             return;
         }
 
         // Partial store: read-modify-write each plane at the signal width.
-        const Plane  old   = { b_.CreateLoad(int_ty(2 * s.width), mp), b_.CreateLoad(int_ty(s.width), zp) };
+        const Plane  old =
+          { b_.CreateAlignedLoad(int_ty(2 * s.width), mp, mm_al), b_.CreateAlignedLoad(int_ty(s.width), zp, z_al) };
         llvm::Value* off   = cast(lv.bit_off, s.width, false);
         llvm::Value* mask  = b_.CreateShl(cast(ones(lv.width), s.width, false), off);
         llvm::Value* nmask = b_.CreateNot(mask);
         llvm::Value* must  = merge_bits(must_of(old), cast(must_of(rhs), s.width, false), off, mask, nmask);
         llvm::Value* may   = merge_bits(may_of(old), cast(may_of(rhs), s.width, false), off, mask, nmask);
         llvm::Value* z     = merge_bits(old.z, cast(rhs.z, s.width, false), off, mask, nmask);
-        b_.CreateStore(packed(must, may, z).mm, mp);
-        b_.CreateStore(z, zp);
+        b_.CreateAlignedStore(packed(must, may, z).mm, mp, mm_al);
+        b_.CreateAlignedStore(z, zp, z_al);
     }
 
     // (old & ~mask) | ((ins << off) & mask)
@@ -921,10 +944,9 @@ private:
     llvm::LLVMContext&      ctx_;
     llvm::Module&           llmod_;
     llvm::IRBuilder<>       b_;
-    llvm::StructType*       state_ty_ = nullptr;
+    // Total size of the opaque state buffer in bytes (min 1, rounded up to 8).
+    uint32_t                state_bytes_ = 1;
     std::vector<SignalSlot> slots_;
-    // Deduplicated signal value types, keyed by name (logic.<w> / bit.<w>).
-    ankerl::unordered_dense::map<std::string, llvm::StructType*> value_types_;
 
     // Per-process scratch, reset in lower_process.
     const Ir*                           ir_    = nullptr;

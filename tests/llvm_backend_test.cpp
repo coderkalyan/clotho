@@ -63,19 +63,22 @@ constexpr std::string_view kAlu = R"(
 TEST_CASE("alu emits verifiable llvm ir") {
     const std::string ir = emit(kAlu);
 
-    // A state struct with two i-fields per signal (val + xz planes).
-    CHECK(ir.find("%alu.state = type") != std::string::npos);
+    // State is an opaque byte buffer, not a typed LLVM struct: main stack-
+    // allocates an `[N x i8]` and there is no named `%alu.state` type.
+    CHECK(ir.find("alloca [") != std::string::npos);
+    CHECK(ir.find("%alu.state") == std::string::npos);
 
     // One function per process, named @<module>.<source byte offset>: two
-    // combinational assigns + one sequential always block.
+    // combinational assigns + one sequential always block. Each takes a bare ptr.
     CHECK(count_substr(ir, "define void @alu.") == 3);
+    CHECK(ir.find("ptr noalias %state") != std::string::npos);
 
     // Datapath ops present.
     CHECK(ir.find(" add ") != std::string::npos);
     CHECK(ir.find(" sub ") != std::string::npos);
 
-    // Signal access via struct GEP + load/store.
-    CHECK(ir.find("getelementptr") != std::string::npos);
+    // Signal access via constant-offset i8 GEP + load/store.
+    CHECK(ir.find("getelementptr inbounds i8, ptr") != std::string::npos);
     CHECK(ir.find("store i8") != std::string::npos);
 
     // The if/else lowers to branches.
@@ -91,10 +94,12 @@ TEST_CASE("2-state vs 4-state widths") {
     )";
     const std::string          ir  = emit(src);
 
-    // Deduplicated, nested signal value types: bit.4 used twice (x, y), logic.8
-    // once (z); each is a { i(2W) must|may, iW z } struct nested in the state struct.
-    CHECK(ir.find("%bit.4 = type { i8, i4 }") != std::string::npos);
-    CHECK(ir.find("%logic.8 = type { i16, i8 }") != std::string::npos);
-    CHECK(ir.find("%m.state = type { %bit.4, %bit.4, %logic.8 }") != std::string::npos);
+    // No typed value/state structs — state is laid out by clotho into an opaque
+    // byte buffer. The 4-state z (logic[7:0], align 2) packs ahead of the 2-state
+    // x/y (bit[3:0], align 1); the buffer is 8 bytes, align 8.
+    CHECK(ir.find("= type") == std::string::npos);
+    CHECK(ir.find("alloca [8 x i8], align 8") != std::string::npos);
+    // z's must|may word sits first at offset 0 as an i16 (2W = 16).
+    CHECK(ir.find("store i16") != std::string::npos);
     CHECK(ir.find("define void @m.") != std::string::npos);
 }
