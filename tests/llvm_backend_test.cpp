@@ -89,10 +89,15 @@ TEST_CASE("alu emits verifiable llvm ir") {
 }
 
 TEST_CASE("2-state vs 4-state widths") {
+    // Driven from an initial (not assigns) so the state buffer is live in main and
+    // survives optimization — only scheduled processes touch state, and combinational
+    // assigns are not scheduled yet.
     constexpr std::string_view src = R"(
         module m(input bit [3:0] x, output bit [3:0] y, output logic [7:0] z);
-            assign y = x & x;
-            assign z = 8'hAB;
+            initial begin
+                y = x & x;
+                z = 8'hAB;
+            end
         endmodule
     )";
     const std::string          ir  = emit(src);
@@ -125,8 +130,9 @@ TEST_CASE("delay suspends and reschedules on the wheel") {
     // calls are what remain.
     CHECK(ir.find("call i64 @rt_wheel_now") != std::string::npos);
     CHECK(ir.find("call void @rt_wheel_schedule") != std::string::npos);
-    // The timer callback that resumes the suspended coroutine.
-    CHECK(ir.find("define internal void @clotho.resume_timer") != std::string::npos);
+    // The timer callback that wakes the suspended coroutine by pushing its handle
+    // onto the active queue.
+    CHECK(ir.find("define internal void @clotho.enqueue_timer") != std::string::npos);
     // main drains the wheel: tick while timers are pending.
     CHECK(ir.find("call i32 @rt_wheel_pending") != std::string::npos);
     CHECK(ir.find("call void @rt_wheel_tick") != std::string::npos);
@@ -159,5 +165,5 @@ TEST_CASE("delay inside a conditional splits cleanly") {
     // The conditional's branch and both delays' schedules survive lowering.
     CHECK(ir.find("br i1") != std::string::npos);
     CHECK(count_substr(ir, "call void @rt_wheel_schedule") == 2);
-    CHECK(ir.find("define internal void @clotho.resume_timer") != std::string::npos);
+    CHECK(ir.find("define internal void @clotho.enqueue_timer") != std::string::npos);
 }
