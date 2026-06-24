@@ -9,10 +9,6 @@
 
 extern "C" {
 
-// Minimal smoke-test entry: prints a banner. Emitted as a call at the top of a
-// design's `main()` to prove runtime linkage works end to end.
-void rt_hello();
-
 // -- Timing wheel --
 //
 // The wheel (src/Wheel.h) is the design's event scheduler, surfaced here behind

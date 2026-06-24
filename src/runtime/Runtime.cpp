@@ -2,13 +2,8 @@
 
 #include <cstddef>
 #include <new>
-#include <print>
 
 #include "Wheel.h"
-
-extern "C" void rt_hello() {
-    std::print("hello from the clotho runtime\n");
-}
 
 namespace {
 

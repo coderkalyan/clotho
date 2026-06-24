@@ -62,7 +62,6 @@ int run_jit(const Module& m) {
             llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable,
         };
     };
-    expose("rt_hello", &rt_hello);
     expose("rt_wheel_init", &rt_wheel_init);
     expose("rt_wheel_deinit", &rt_wheel_deinit);
     expose("rt_wheel_now", &rt_wheel_now);
