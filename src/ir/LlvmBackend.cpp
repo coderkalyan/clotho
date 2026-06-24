@@ -18,6 +18,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Passes/PassBuilder.h>
 
 #include "ir/InternPool.h"
 #include "ir/Ir.h"
@@ -229,20 +230,86 @@ private:
         constexpr uint64_t offset_mask = (uint64_t{ 1 } << 36) - 1;
         const uint64_t     offset      = static_cast<uint64_t>(proc.loc) & offset_mask;
         const std::string  name        = mod_.name + "." + std::to_string(offset);
-        auto*              fnty =
-          llvm::FunctionType::get(llvm::Type::getVoidTy(ctx_), { llvm::PointerType::getUnqual(ctx_) }, false);
-        fn_    = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name, llmod_);
+
+        // A process lowers to a switched-resume LLVM coroutine:
+        // `ptr @<module>.<offset>(ptr noalias state)`. The ramp runs the body
+        // straight through to a single final suspend and returns the coroutine
+        // handle; the scheduler later resumes/destroys through that handle. There
+        // are no body suspend points yet, so behaviour is unchanged from the old
+        // plain function — the CoroSplit pass lowers the intrinsics away, leaving
+        // an ordinary function (plus a heap-allocated, currently-empty frame). This
+        // is the groundwork for #delay / @event suspension.
+        auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
+        auto* fnty   = llvm::FunctionType::get(ptr_ty, { ptr_ty }, false);
+        fn_          = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name, llmod_);
+        // Mark it pre-split so the CoroSplit pass picks it up.
+        fn_->setPresplitCoroutine();
         state_ = fn_->getArg(0);
         state_->setName("state");
-        // The state pointer is the sole memory the process touches; noalias lets
-        // the allocator rematerialize signal loads instead of spilling them.
+        // The state pointer is the sole module memory the process touches; noalias
+        // lets the allocator rematerialize signal loads instead of spilling them.
         fn_->addParamAttr(0, llvm::Attribute::NoAlias);
 
-        auto* entry = llvm::BasicBlock::Create(ctx_, "entry", fn_);
-        b_.SetInsertPoint(entry);
+        auto* none     = llvm::ConstantTokenNone::get(ctx_);
+        auto* null     = llvm::ConstantPointerNull::get(ptr_ty);
+        auto* entry    = llvm::BasicBlock::Create(ctx_, "entry", fn_);
+        auto* alloc_bb = llvm::BasicBlock::Create(ctx_, "coro.alloc", fn_);
+        auto* begin_bb = llvm::BasicBlock::Create(ctx_, "coro.begin", fn_);
 
+        // Identify the coroutine; coro.alloc lets the optimizer skip the dynamic
+        // frame allocation when the frame can live on the caller's stack.
+        b_.SetInsertPoint(entry);
+        auto* id   = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_id), { b_.getInt32(0), null, null, null });
+        auto* need = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_alloc), { id });
+        b_.CreateCondBr(need, alloc_bb, begin_bb);
+
+        // Dynamic frame: rt_alloc(coro.size). The sim owns frame memory so a frame
+        // can outlive the ramp once real suspend points exist.
+        b_.SetInsertPoint(alloc_bb);
+        auto* size = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_size, { b_.getInt64Ty() }), {});
+        auto* mem  = b_.CreateCall(alloc_fn(), { size });
+        b_.CreateBr(begin_bb);
+
+        b_.SetInsertPoint(begin_bb);
+        auto* frame = b_.CreatePHI(ptr_ty, 2);
+        frame->addIncoming(null, entry);
+        frame->addIncoming(mem, alloc_bb);
+        auto* hdl = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_begin), { id, frame });
+
+        // Process body. lower_region appends into the current block (and any blocks
+        // it creates), leaving the insert point on a terminator-less block.
         lower_region(ir_->root());
-        b_.CreateRetVoid();
+
+        auto* final_bb = llvm::BasicBlock::Create(ctx_, "coro.final", fn_);
+        auto* trap_bb  = llvm::BasicBlock::Create(ctx_, "coro.trap", fn_);
+        auto* clean_bb = llvm::BasicBlock::Create(ctx_, "coro.cleanup", fn_);
+        auto* free_bb  = llvm::BasicBlock::Create(ctx_, "coro.free", fn_);
+        auto* ret_bb   = llvm::BasicBlock::Create(ctx_, "coro.ret", fn_);
+        b_.CreateBr(final_bb);
+
+        // One final suspend. The default edge first returns the handle to the
+        // scheduler; a later coro.destroy re-enters here (case 1) to free the
+        // frame; resuming a finished coroutine (case 0) is undefined, so trap.
+        b_.SetInsertPoint(final_bb);
+        auto* res = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { none, b_.getTrue() });
+        auto* sw  = b_.CreateSwitch(res, ret_bb, 2);
+        sw->addCase(b_.getInt8(0), trap_bb);
+        sw->addCase(b_.getInt8(1), clean_bb);
+
+        b_.SetInsertPoint(trap_bb);
+        b_.CreateUnreachable();
+
+        b_.SetInsertPoint(clean_bb);
+        auto* freed = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_free), { id, hdl });
+        b_.CreateCondBr(b_.CreateICmpNE(freed, null), free_bb, ret_bb);
+
+        b_.SetInsertPoint(free_bb);
+        b_.CreateCall(free_fn(), { freed });
+        b_.CreateBr(ret_bb);
+
+        b_.SetInsertPoint(ret_bb);
+        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_end), { hdl, b_.getFalse(), none });
+        b_.CreateRet(hdl);
         return fn_;
     }
 
@@ -309,8 +376,14 @@ private:
             b_.CreateStore(b_.CreateAdd(sp, b_.getInt32(1)), top);
         }
 
-        // Drain: while top != 0, pop queue[--top] and call it.
-        auto* proc_fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty }, false);
+        // Drain: while top != 0, pop queue[--top], resume it, then destroy it.
+        // Each process is a coroutine: calling its ramp runs the body to the final
+        // suspend and yields a handle; coro.destroy frees the frame. Dispatch is
+        // indirect (through the queue), so the frame can't be elided — it lives on
+        // the heap via rt_alloc. That's the price of dynamic scheduling and matches
+        // how the wheel will resume suspended processes later; behaviour is
+        // unchanged from the old direct call.
+        auto* proc_fnty = llvm::FunctionType::get(ptr_ty, { ptr_ty }, false);
         auto* fn        = b_.GetInsertBlock()->getParent();
         auto* check     = llvm::BasicBlock::Create(ctx_, "active.check", fn);
         auto* body      = llvm::BasicBlock::Create(ctx_, "active.body", fn);
@@ -326,10 +399,29 @@ private:
         b_.CreateStore(idx, top);
         llvm::Value* slot = b_.CreateInBoundsGEP(arr_ty, queue, { b_.getInt32(0), idx });
         llvm::Value* fnp  = b_.CreateLoad(ptr_ty, slot);
-        b_.CreateCall(proc_fnty, fnp, { state });
+        llvm::Value* hdl  = b_.CreateCall(proc_fnty, fnp, { state });
+        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
         b_.CreateBr(check);
 
         b_.SetInsertPoint(done);
+    }
+
+    // -- Coroutine intrinsics / frame allocator --
+
+    // Declare (or fetch) an llvm.coro.* intrinsic. `tys` supplies the overload
+    // type for the few overloaded ones (e.g. coro.size -> i64).
+    llvm::Function* coro_intr(llvm::Intrinsic::ID id, llvm::ArrayRef<llvm::Type*> tys = {}) {
+        return llvm::Intrinsic::getOrInsertDeclaration(&llmod_, id, tys);
+    }
+    // ptr rt_alloc(i64) — coroutine frame allocation, sim-owned.
+    llvm::FunctionCallee alloc_fn() {
+        auto* ptr = llvm::PointerType::getUnqual(ctx_);
+        return llmod_.getOrInsertFunction("rt_alloc", llvm::FunctionType::get(ptr, { b_.getInt64Ty() }, false));
+    }
+    // void rt_free(ptr) — coroutine frame deallocation.
+    llvm::FunctionCallee free_fn() {
+        auto* ptr = llvm::PointerType::getUnqual(ctx_);
+        return llmod_.getOrInsertFunction("rt_free", llvm::FunctionType::get(b_.getVoidTy(), { ptr }, false));
     }
 
     // -- Timing wheel runtime (runtime/Runtime.h C ABI) --
@@ -1164,6 +1256,38 @@ private:
     std::vector<std::optional<ValType>> types_;
 };
 
+// Lower the coroutine intrinsics emitted for each process. CoroSplit (with
+// CoroEarly/CoroCleanup) is mandatory: without it the llvm.coro.* intrinsics
+// survive to codegen and the module won't compile. The mem2reg/sroa/simplifycfg
+// cleanup shrinks the frame, and inline + coro-elide stack-allocate the frame for
+// processes that never suspend, collapsing the coroutine back to straight-line
+// code. Returns false (reason on errs()) only if the pipeline string is rejected.
+bool lower_coroutines(llvm::Module& m) {
+    llvm::PassBuilder         pb;
+    llvm::LoopAnalysisManager     lam;
+    llvm::FunctionAnalysisManager fam;
+    llvm::CGSCCAnalysisManager    cgam;
+    llvm::ModuleAnalysisManager   mam;
+    pb.registerModuleAnalyses(mam);
+    pb.registerCGSCCAnalyses(cgam);
+    pb.registerFunctionAnalyses(fam);
+    pb.registerLoopAnalyses(lam);
+    pb.crossRegisterProxies(lam, fam, cgam, mam);
+
+    llvm::ModulePassManager mpm;
+    if (auto err = pb.parsePassPipeline(mpm,
+                                        "coro-early,"
+                                        "function(mem2reg,sroa,simplifycfg),"
+                                        "cgscc(inline,coro-split,coro-annotation-elide),"
+                                        "function(coro-elide,simplifycfg),"
+                                        "coro-cleanup")) {
+        llvm::errs() << "llvm backend: bad coroutine pipeline: " << llvm::toString(std::move(err)) << "\n";
+        return false;
+    }
+    mpm.run(m, mam);
+    return true;
+}
+
 } // namespace
 
 std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& ctx) {
@@ -1176,6 +1300,14 @@ std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& c
         return nullptr;
     }
 
+    // Verify the freshly-built (pre-split) module, then lower the coroutines and
+    // verify again — the second pass guards against malformed coro lowering.
+    if (llvm::verifyModule(*llmod, &llvm::errs())) {
+        return nullptr;
+    }
+    if (!lower_coroutines(*llmod)) {
+        return nullptr;
+    }
     if (llvm::verifyModule(*llmod, &llvm::errs())) {
         return nullptr;
     }

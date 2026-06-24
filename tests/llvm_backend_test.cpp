@@ -68,10 +68,13 @@ TEST_CASE("alu emits verifiable llvm ir") {
     CHECK(ir.find("alloca [") != std::string::npos);
     CHECK(ir.find("%alu.state") == std::string::npos);
 
-    // One function per process, named @<module>.<source byte offset>: two
-    // combinational assigns + one sequential always block. Each takes a bare ptr.
-    CHECK(count_substr(ir, "define void @alu.") == 3);
-    CHECK(ir.find("ptr noalias %state") != std::string::npos);
+    // One coroutine per process, named @<module>.<source byte offset>: two
+    // combinational assigns + one sequential always block. Each is a switched-
+    // resume coroutine ramp returning the handle and taking a bare state ptr.
+    // (CoroSplit also emits .resume/.destroy/.cleanup parts, which don't match
+    // this "define ptr @alu." prefix.)
+    CHECK(count_substr(ir, "define ptr @alu.") == 3);
+    CHECK(ir.find("(ptr %state)") != std::string::npos);
 
     // Datapath ops present.
     CHECK(ir.find(" add ") != std::string::npos);
@@ -94,12 +97,13 @@ TEST_CASE("2-state vs 4-state widths") {
     )";
     const std::string          ir  = emit(src);
 
-    // No typed value/state structs — state is laid out by clotho into an opaque
-    // byte buffer. The 4-state z (logic[7:0], align 2) packs ahead of the 2-state
-    // x/y (bit[3:0], align 1); the buffer is 8 bytes, align 8.
-    CHECK(ir.find("= type") == std::string::npos);
+    // No typed value/state struct — state is laid out by clotho into an opaque
+    // byte buffer (the only named types are coroutine frames, an unrelated
+    // lowering artifact). The 4-state z (logic[7:0], align 2) packs ahead of the
+    // 2-state x/y (bit[3:0], align 1); the buffer is 8 bytes, align 8.
+    CHECK(ir.find("%m.state") == std::string::npos);
     CHECK(ir.find("alloca [8 x i8], align 8") != std::string::npos);
     // z's must|may word sits first at offset 0 as an i16 (2W = 16).
     CHECK(ir.find("store i16") != std::string::npos);
-    CHECK(ir.find("define void @m.") != std::string::npos);
+    CHECK(ir.find("define ptr @m.") != std::string::npos);
 }

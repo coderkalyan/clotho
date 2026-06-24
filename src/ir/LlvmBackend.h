@@ -7,8 +7,9 @@
 // Model (see LlvmBackend.cpp for the full rationale):
 //   * One shared state struct holds two integer fields per module signal — the
 //     val plane and the xz plane of its 4-state value.
-//   * Each process becomes `void <name>(ptr state)`; Load/Store address fields
-//     of that struct.
+//   * Each process becomes a switched-resume coroutine `ptr <name>(ptr state)`;
+//     Load/Store address fields of that struct. With no body suspend points yet
+//     the optimizer elides the frame, so behaviour matches a plain function.
 //   * Every SSA value is lowered as a (val, xz) plane pair so X/Z propagate.
 
 #include <memory>

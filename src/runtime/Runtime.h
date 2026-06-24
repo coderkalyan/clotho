@@ -33,6 +33,16 @@ typedef struct rt_arg {
 // next descriptor. The codegen folds any trailing newline into `fmt`.
 void rt_display(const char* fmt, uint32_t argc, const rt_arg* argv);
 
+// -- Coroutine frame allocation --
+//
+// Each process lowers to an LLVM coroutine; its frame is allocated through these
+// hooks (wired into the coro.alloc / coro.free pattern) so the sim owns frame
+// memory rather than libc. Today they are thin malloc/free wrappers; a later swap
+// to a pool/arena is transparent to codegen. The optimizer elides the allocation
+// entirely for processes whose frame can live on the caller's stack.
+void* rt_alloc(uint64_t size);
+void  rt_free(void* p);
+
 // -- Timing wheel --
 //
 // The wheel (src/Wheel.h) is the design's event scheduler, surfaced here behind

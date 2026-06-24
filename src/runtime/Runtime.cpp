@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <new>
 #include <string>
 
@@ -171,4 +172,12 @@ extern "C" void rt_display(const char* fmt, uint32_t argc, const rt_arg* argv) {
     // Write raw: `out` may contain '%' or '{}' that printf/std::print would treat
     // as format syntax.
     std::fwrite(out.data(), 1, out.size(), stdout);
+}
+
+extern "C" void* rt_alloc(uint64_t size) {
+    return std::malloc(size);
+}
+
+extern "C" void rt_free(void* p) {
+    std::free(p);
 }
