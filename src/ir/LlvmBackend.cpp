@@ -255,6 +255,12 @@ private:
         auto* entry = llvm::BasicBlock::Create(ctx_, "entry", main);
         b_.SetInsertPoint(entry);
 
+        // Call the native runtime (resolved by the JIT). Declared here as an
+        // external `void rt_hello()`; left undefined in the module.
+        auto* rt_ty = llvm::FunctionType::get(b_.getVoidTy(), false);
+        auto  rt    = llmod_.getOrInsertFunction("rt_hello", rt_ty);
+        b_.CreateCall(rt);
+
         auto*           buf_ty = llvm::ArrayType::get(b_.getInt8Ty(), state_bytes_);
         llvm::AllocaInst* state  = b_.CreateAlloca(buf_ty, nullptr, "state");
         state->setAlignment(llvm::Align(8));

@@ -49,6 +49,13 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(unordered_dense)
 
+# Simulation runtime: native support routines the JIT'd design calls into.
+# Deliberately depends on nothing (no LLVM, no slang) — plain native code.
+add_library(clotho_runtime STATIC
+  src/runtime/Runtime.cpp
+)
+target_include_directories(clotho_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 # Backend IR + passes. Target-agnostic, no slang dependency: handles the bulk
 # of compiler logic short of the slang -> IR translation layer.
 add_library(clotho_ir STATIC
@@ -62,7 +69,7 @@ add_library(clotho_ir STATIC
 )
 target_include_directories(clotho_ir PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${LLVM_INCLUDE_DIRS})
 target_compile_definitions(clotho_ir PUBLIC ${LLVM_DEFINITIONS})
-target_link_libraries(clotho_ir PUBLIC unordered_dense::unordered_dense ${LLVM_LIBS})
+target_link_libraries(clotho_ir PUBLIC unordered_dense::unordered_dense clotho_runtime ${LLVM_LIBS})
 
 # Front-end and the (future) slang -> IR translation. Pulls in slang and the
 # IR; consumers get both transitively.

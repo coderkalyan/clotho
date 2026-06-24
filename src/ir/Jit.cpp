@@ -3,7 +3,10 @@
 #include <memory>
 #include <mutex>
 
+#include <llvm/ExecutionEngine/Orc/AbsoluteSymbols.h>
+#include <llvm/ExecutionEngine/Orc/Core.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -12,6 +15,7 @@
 #include <llvm/Support/raw_ostream.h>
 
 #include "LlvmBackend.h"
+#include "runtime/Runtime.h"
 
 namespace clotho::ir {
 
@@ -44,6 +48,20 @@ int run_jit(const Module& m) {
     auto jit = llvm::orc::LLJITBuilder().create();
     if (!jit) {
         llvm::errs() << "jit: " << llvm::toString(jit.takeError()) << "\n";
+        return -1;
+    }
+
+    // Expose the native runtime to the JIT'd design as absolute symbols, mapped
+    // directly to the host function addresses. The runtime is plain native code
+    // statically linked into this process.
+    auto&              jd = (*jit)->getMainJITDylib();
+    llvm::orc::SymbolMap rt_syms;
+    rt_syms[(*jit)->mangleAndIntern("rt_hello")] = {
+        llvm::orc::ExecutorAddr::fromPtr(&rt_hello),
+        llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable,
+    };
+    if (auto err = jd.define(llvm::orc::absoluteSymbols(std::move(rt_syms)))) {
+        llvm::errs() << "jit: " << llvm::toString(std::move(err)) << "\n";
         return -1;
     }
 
