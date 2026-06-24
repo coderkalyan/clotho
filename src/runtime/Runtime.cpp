@@ -101,7 +101,9 @@ void render_arg(std::string& out, const rt_arg& a, char conv) {
             out += static_cast<char>(val & 0xff);
             return;
         default:
-            // Unsupported specifier (e.g. %s, %t, %m): consume the arg, emit nothing.
+            // TODO: %s / %t / %m / %f are consumed but emit nothing, so the field
+            // silently vanishes. LRM expects string / time / hierarchical-path /
+            // real output respectively.
             return;
     }
 }

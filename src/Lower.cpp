@@ -200,6 +200,11 @@ private:
     // -- Processes --
 
     void lower_continuous_assign(const ContinuousAssignSymbol& sym) {
+        if (sym.getDelay() != nullptr) {
+            // `assign #N lhs = rhs;` — the net-delay is dropped today, so the
+            // update would land at the wrong time. Reject until the scheduler exists.
+            fail("continuous assignment delay (assign #N) is not supported");
+        }
         const Expression& e = sym.getAssignment();
         if (e.kind != ExpressionKind::Assignment) {
             fail("malformed continuous assignment");
@@ -220,21 +225,48 @@ private:
             kind = ir::ProcessKind::Initial;
         }
 
-        const Statement& body = sym.getBody();
-        if (body.kind == StatementKind::Timed) {
-            const TimedStatement&     timed = body.as<TimedStatement>();
-            const SignalEventControl* ev    = find_edge_event(timed.timing);
-            if (ev != nullptr && ev->edge != slang::ast::EdgeKind::None) {
-                kind  = ir::ProcessKind::Sequential;
-                edge  = ev->edge == slang::ast::EdgeKind::NegEdge ? ir::Edge::Negedge : ir::Edge::Posedge;
-                clock = clock_signal(ev->expr);
+        const Statement* body = &sym.getBody();
+
+        // A top-level event control is the process's sensitivity: consume it here
+        // and lower the statement underneath. An edge event (@(posedge/negedge
+        // clk)) makes the process sequential; a level or implicit list (@*,
+        // @(a or b)) leaves it combinational. A non-event top-level timing (e.g.
+        // `always #5 ...`) is NOT sensitivity — it falls through to lower_stmt,
+        // whose Timed case rejects it loudly.
+        // TODO: honor the full sensitivity list — only the edge clock is modeled.
+        // Level-sensitive lists are treated as always-evaluated combinational
+        // logic, and the per-signal trigger set is otherwise ignored.
+        if (body->kind == StatementKind::Timed) {
+            const TimedStatement& timed = body->as<TimedStatement>();
+            if (is_event_control(timed.timing)) {
+                const SignalEventControl* ev = find_edge_event(timed.timing);
+                if (ev != nullptr && ev->edge != slang::ast::EdgeKind::None) {
+                    kind  = ir::ProcessKind::Sequential;
+                    edge  = ev->edge == slang::ast::EdgeKind::NegEdge ? ir::Edge::Negedge : ir::Edge::Posedge;
+                    clock = clock_signal(ev->expr);
+                }
+                body = &timed.stmt;
             }
         }
 
         ir::Builder b(module_.pool);
-        lower_stmt(body, b);
+        lower_stmt(*body, b);
         module_.add_process(ir::Process{
           .kind = kind, .clock = clock, .clock_edge = edge, .loc = to_source_loc(sym.location), .ir = b.finish() });
+    }
+
+    // True if `tc` is an @-style event control (the kinds usable as a process's
+    // sensitivity), as opposed to a delay (#) or other timing. Only these are
+    // consumed as sensitivity; everything else reaches lower_stmt's Timed case.
+    static bool is_event_control(const TimingControl& tc) {
+        switch (tc.kind) {
+            case TimingControlKind::SignalEvent:
+            case TimingControlKind::EventList:
+            case TimingControlKind::ImplicitEvent:
+                return true;
+            default:
+                return false;
+        }
     }
 
     // Find the first edge-triggered signal event in a timing control (descends
@@ -274,9 +306,17 @@ private:
                 lower_stmt(stmt.as<BlockStatement>().body, b);
                 break;
             case StatementKind::Timed:
-                // Timing already consumed for sensitivity; lower the body.
-                lower_stmt(stmt.as<TimedStatement>().stmt, b);
-                break;
+                // A timing control reached here is nested inside a process body — a
+                // delay (#10), an intra-body event wait (@(posedge clk)), or
+                // wait(expr). None can suspend yet: there is no scheduler to resume
+                // on, so running the body immediately would silently violate timing
+                // semantics. Reject it loudly. (A process's top-level @(edge)
+                // sensitivity is consumed in lower_procedural_block and never lands
+                // here.)
+                // TODO: lower delays / event waits to a suspend + reschedule on the
+                // timing wheel (src/Wheel.h) once the sim loop exists.
+                fail("delay / event control / wait inside a process body is not "
+                     "supported yet (no scheduler)");
             case StatementKind::ExpressionStatement: {
                 const Expression& e = stmt.as<ExpressionStatement>().expr;
                 if (e.kind == ExpressionKind::Assignment) {
@@ -471,8 +511,18 @@ private:
         if (a.isCompound()) {
             fail("compound assignment not supported");
         }
-        const ir::Index     lhs = lower_lvalue(a.left(), b);
-        const ir::Index     rhs = lower_expr(a.right(), b);
+        if (a.timingControl != nullptr) {
+            // Intra-assignment timing: `x = #5 y;` / `x = @(posedge clk) y;`. The
+            // delay/event is dropped today, so the update would land immediately at
+            // the wrong time. Reject until the scheduler exists.
+            fail("intra-assignment timing control (#/@ on an assignment) is not supported");
+        }
+        const ir::Index lhs = lower_lvalue(a.left(), b);
+        const ir::Index rhs = lower_expr(a.right(), b);
+        // TODO(nonblocking): StoreNb is lowered identically to a blocking Store in
+        // the backend. Correct NBA semantics need two-phase update — sample every
+        // RHS in the active region, then commit in the NBA region — so that e.g.
+        // `a <= b; b <= a;` swaps rather than copying.
         const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
         b.binary(tag, lhs, rhs, loc(a));
     }

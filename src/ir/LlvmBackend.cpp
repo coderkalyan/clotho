@@ -121,6 +121,10 @@ public:
                 initials.push_back(f);
             }
         }
+        // TODO: only initial blocks are scheduled into main. Comb (continuous
+        // assign) and Sequential (always @(edge)) processes are compiled to
+        // functions but never called — there is no sim loop or clock-edge gating
+        // yet, so `assign` / `always` currently have no runtime effect.
         emit_main(initials);
     }
 
@@ -503,7 +507,10 @@ private:
                 return;
             case Inst::Tag::BitSelect: {
                 const LValue& base = lvalue_of(p.binary.l);
-                llvm::Value*  idx  = cast(must_of(value_of(p.binary.r)), 32, false);
+                // TODO: an X/Z or out-of-range index uses only its must bits,
+                // silently selecting the wrong bit. LRM: a read with an unknown /
+                // out-of-range index yields X; such a write is a no-op.
+                llvm::Value* idx = cast(must_of(value_of(p.binary.r)), 32, false);
                 set_lvalue(i, LValue{ base.sig, b_.CreateAdd(base.bit_off, idx), 1 });
                 return;
             }
@@ -519,6 +526,9 @@ private:
                 set_value(i, lower_load(lvalue_of(p.unary)));
                 return;
             case Inst::Tag::Store:
+            // TODO(nonblocking): StoreNb is lowered identically to a blocking
+            // Store — no two-phase next-state staging — so RAW-dependent NBAs in
+            // one process (e.g. `a <= b; b <= a;`) copy instead of swapping.
             case Inst::Tag::StoreNb:
                 lower_store(lvalue_of(p.binary.l), value_of(p.binary.r), type_of(p.binary.r));
                 return;
@@ -715,6 +725,8 @@ private:
 
     // Lower a $display / $write: stack-allocate an rt_arg[] descriptor array, pack
     // each value operand's planes into it, and call the runtime formatter.
+    // TODO: each operand's planes are truncated to the low 64 bits (rt_arg is
+    // i64), so values wider than 64 bits print silently wrong. Pass full width.
     void lower_display(Index i) {
         const auto  info = ir_->extra_data<DisplayInfo>(ir_->payload(i).display);
         std::string fmt  = ir_->extra_bytes(info.fmt, info.fmt_len);
@@ -1082,6 +1094,8 @@ private:
     }
 
     Plane lower_repl(Plane v, uint32_t part_width, uint32_t count) {
+        // TODO: a zero replication count ({0{x}}) should yield a 0-width value;
+        // here w becomes 0 and int_ty(0) is widened to i1, so it leaks one bit.
         const uint32_t w    = part_width * count;
         llvm::Value*   pm   = cast(must_of(v), w, false);
         llvm::Value*   pM   = cast(may_of(v), w, false);
