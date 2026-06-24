@@ -76,6 +76,13 @@ Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_reg
     return emit({ Inst::Tag::Cond, Inst::Payload{ .op_extra = { condition, extra } } }, loc);
 }
 
+Index Builder::loop(ExtraSlice cond_region, Index pred, ExtraSlice body_region, ExtraSlice step_region,
+                    SourceLoc loc) {
+    const ExtraIndex extra = add_extra(LoopInfo{ cond_region, pred, body_region, step_region });
+
+    return emit({ Inst::Tag::Loop, Inst::Payload{ .extra = extra } }, loc);
+}
+
 Index Builder::display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc) {
     // Order in the extra buffer: format bytes, then the arg-index slice, then the
     // DisplayInfo record pointing at both. None of the three regions overlap.

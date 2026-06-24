@@ -689,6 +689,7 @@ private:
             case Inst::Tag::Store:
             case Inst::Tag::StoreNb:
             case Inst::Tag::Cond:
+            case Inst::Tag::Loop:
             case Inst::Tag::Ret:
             case Inst::Tag::Delay:
             case Inst::Tag::Display:
@@ -825,6 +826,10 @@ private:
 
             case Inst::Tag::Cond:
                 lower_cond(i);
+                return;
+
+            case Inst::Tag::Loop:
+                lower_loop(i);
                 return;
 
             case Inst::Tag::Delay:
@@ -1364,6 +1369,40 @@ private:
         b_.CreateBr(cont_bb);
 
         b_.SetInsertPoint(cont_bb);
+    }
+
+    // -- Control flow: for/while/forever. The cond region recomputes the
+    // predicate each iteration; X/Z exits the loop (same definite-1 rule as
+    // lower_cond). State lives in memory, so the back-edge needs no PHIs. --
+
+    void lower_loop(Index i) {
+        const Inst::Payload& p  = ir_->payload(i);
+        const auto           lp = ir_->extra_data<LoopInfo>(p.extra);
+
+        auto* head_bb = llvm::BasicBlock::Create(ctx_, "loop.head", fn_);
+        auto* body_bb = llvm::BasicBlock::Create(ctx_, "loop.body", fn_);
+        auto* step_bb = llvm::BasicBlock::Create(ctx_, "loop.step", fn_);
+        auto* exit_bb = llvm::BasicBlock::Create(ctx_, "loop.exit", fn_);
+
+        b_.CreateBr(head_bb);
+
+        // Header: recompute the predicate, then test it. must=1 only for a
+        // definite 1, so an X/Z condition exits the loop.
+        b_.SetInsertPoint(head_bb);
+        lower_region(ir_->region(lp.cond));
+        llvm::Value* take = b_.CreateICmpNE(must_of(value_of(lp.pred)), zero(1));
+        b_.CreateCondBr(take, body_bb, exit_bb);
+
+        b_.SetInsertPoint(body_bb);
+        lower_region(ir_->region(lp.body));
+        b_.CreateBr(step_bb);
+
+        // Step, then the back-edge to re-test the condition.
+        b_.SetInsertPoint(step_bb);
+        lower_region(ir_->region(lp.step));
+        b_.CreateBr(head_bb);
+
+        b_.SetInsertPoint(exit_bb);
     }
 
     // -- State --

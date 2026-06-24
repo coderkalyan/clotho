@@ -22,6 +22,7 @@
 #include <slang/ast/expressions/OperatorExpressions.h>
 #include <slang/ast/expressions/SelectExpressions.h>
 #include <slang/ast/statements/ConditionalStatements.h>
+#include <slang/ast/statements/LoopStatements.h>
 #include <slang/ast/statements/MiscStatements.h>
 #include <slang/ast/symbols/BlockSymbols.h>
 #include <slang/ast/symbols/CompilationUnitSymbols.h>
@@ -29,6 +30,7 @@
 #include <slang/ast/symbols/MemberSymbols.h>
 #include <slang/ast/symbols/PortSymbols.h>
 #include <slang/ast/symbols/ValueSymbol.h>
+#include <slang/ast/symbols/VariableSymbols.h>
 #include <slang/ast/types/Type.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/diagnostics/TextDiagnosticClient.h>
@@ -197,6 +199,31 @@ private:
         return it->second;
     }
 
+    // Register a procedural local variable (a for-loop control variable or a
+    // block-local declaration) as backing signal storage, reusing the signal
+    // machinery for its loads/stores. Idempotent.
+    //
+    // NOTE: this gives the local static, signal-like storage rather than true
+    // per-entry automatic lifetime (12.7.1). That is correct for the
+    // non-recursive, single-instance processes the simulator models today, and
+    // matches how module variables are already handled.
+    ir::Signal declare_local(const ValueSymbol& vs) {
+        const auto it = sigmap_.find(&vs);
+        if (it != sigmap_.end()) {
+            return it->second;
+        }
+
+        ir::SignalInfo info;
+        info.name = std::string(vs.name);
+        info.type = lower_type(vs.getType());
+        info.dir  = ir::SignalInfo::Direction::Internal;
+
+        const ir::Signal sig = module_.add_signal(std::move(info));
+        sigmap_[&vs]         = sig;
+
+        return sig;
+    }
+
     // -- Processes --
 
     void lower_continuous_assign(const ContinuousAssignSymbol& sym) {
@@ -337,12 +364,21 @@ private:
                 lower_conditional(stmt.as<ConditionalStatement>(), b);
                 break;
             case StatementKind::Empty:
+                break;
             case StatementKind::VariableDeclaration:
-                // No-op for the PoC: empty statements and local declarations carry
-                // nothing to lower.
+                lower_var_decl(stmt.as<VariableDeclStatement>().symbol, b);
                 break;
             case StatementKind::Case:
                 lower_case(stmt.as<CaseStatement>(), b);
+                break;
+            case StatementKind::ForLoop:
+                lower_for(stmt.as<ForLoopStatement>(), b);
+                break;
+            case StatementKind::WhileLoop:
+                lower_while(stmt.as<WhileLoopStatement>(), b);
+                break;
+            case StatementKind::ForeverLoop:
+                lower_forever(stmt.as<ForeverLoopStatement>(), b);
                 break;
             default:
                 fail("unsupported statement");
@@ -366,6 +402,123 @@ private:
         const ir::ExtraSlice else_region = b.close_region();
 
         b.cond(pred, then_region, else_region, loc(c));
+    }
+
+    // A definite 1-bit `1`, used as the predicate for an omitted for-condition
+    // or a `forever` loop.
+    ir::Index true_const(ir::Builder& b, ir::SourceLoc l) {
+        return b.constant(module_.pool.put_int(make_int_type(1, false, false), 1), l);
+    }
+
+    // A local declaration statement: register the variable's storage and, if it
+    // has an initializer, store it.
+    void lower_var_decl(const VariableSymbol& vs, ir::Builder& b) {
+        const ir::Signal sig = declare_local(vs);
+        if (const Expression* init = vs.getInitializer()) {
+            const ir::SourceLoc l = loc(*init);
+            b.binary(ir::Inst::Tag::Store, b.signal(sig, l), lower_expr(*init, b), l);
+        }
+    }
+
+    // for-loop. The initialization runs once in the enclosing region; the
+    // condition, body, and step become the loop's three regions. An omitted
+    // condition is a constant true (12.7.1); an X/Z condition exits (handled in
+    // the backend via the definite-1 rule).
+    void lower_for(const ForLoopStatement& f, ir::Builder& b) {
+        // Init: declared loop vars and assignment initializers are mutually
+        // exclusive. Either is lowered in source order so a later init may read
+        // an earlier one (12.7.1).
+        for (const VariableSymbol* vs : f.loopVars) {
+            lower_var_decl(*vs, b);
+        }
+        for (const Expression* init : f.initializers) {
+            lower_for_step(*init, b);
+        }
+
+        b.open_region();
+        const ir::Index pred = f.stopExpr != nullptr ? lower_expr(*f.stopExpr, b) : true_const(b, loc(f));
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        lower_stmt(f.body, b);
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        for (const Expression* s : f.steps) {
+            lower_for_step(*s, b);
+        }
+        const ir::ExtraSlice step = b.close_region();
+
+        b.loop(cond, pred, body, step, loc(f));
+    }
+
+    // while-loop: a for-loop with no init and no step.
+    void lower_while(const WhileLoopStatement& w, ir::Builder& b) {
+        b.open_region();
+        const ir::Index     pred = lower_expr(w.cond, b);
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        lower_stmt(w.body, b);
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        const ir::ExtraSlice step = b.close_region(); // empty
+
+        b.loop(cond, pred, body, step, loc(w));
+    }
+
+    // forever-loop: a while-loop with a constant-true condition.
+    void lower_forever(const ForeverLoopStatement& f, ir::Builder& b) {
+        b.open_region();
+        const ir::Index     pred = true_const(b, loc(f));
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        lower_stmt(f.body, b);
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        const ir::ExtraSlice step = b.close_region(); // empty
+
+        b.loop(cond, pred, body, step, loc(f));
+    }
+
+    // A for_initialization assignment or a for_step (12.7.1, A.6.8): a simple
+    // assignment, or a pre/post increment/decrement. Compound assignments and
+    // function-call steps are not supported yet.
+    void lower_for_step(const Expression& e, ir::Builder& b) {
+        if (e.kind == ExpressionKind::Assignment) {
+            lower_assign(e.as<AssignmentExpression>(), b);
+            return;
+        }
+        if (e.kind == ExpressionKind::UnaryOp) {
+            const UnaryExpression& u = e.as<UnaryExpression>();
+            using U                  = slang::ast::UnaryOperator;
+            bool inc;
+            switch (u.op) {
+                case U::Preincrement:
+                case U::Postincrement:
+                    inc = true;
+                    break;
+                case U::Predecrement:
+                case U::Postdecrement:
+                    inc = false;
+                    break;
+                default:
+                    fail("unsupported for-step expression");
+            }
+            // A step is a statement: the loop variable's value before/after the
+            // bump is discarded, so pre and post forms lower identically.
+            const ir::SourceLoc l   = loc(e);
+            const ir::Index     lv  = lower_lvalue(u.operand(), b);
+            const ir::Index     cur = b.unary(ir::Inst::Tag::Load, lv, l);
+            const ir::Index     one = b.constant(module_.pool.put_int(lower_type(*u.operand().type), 1), l);
+            const ir::Index     nv  = b.binary(inc ? ir::Inst::Tag::Add : ir::Inst::Tag::Sub, cur, one, l);
+            b.binary(ir::Inst::Tag::Store, lv, nv, l);
+            return;
+        }
+        fail("unsupported for-step expression (only assignment and ++/-- are supported)");
     }
 
     // The width/state/signedness all case_expressions are compared at: the

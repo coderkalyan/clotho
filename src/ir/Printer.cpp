@@ -120,6 +120,8 @@ const char* tag_name(Inst::Tag tag) {
             return "cond";
         case T::Ret:
             return "ret";
+        case T::Loop:
+            return "loop";
         case T::Delay:
             return "delay";
         case T::Display:
@@ -190,7 +192,7 @@ private:
         }
     }
 
-    // Render one instruction line (and, for cond, its nested region blocks).
+    // Render one instruction line (and, for cond / loop, its nested region blocks).
     void render_inst(Index i, int depth) {
         indent(depth);
         ref(i);
@@ -198,6 +200,18 @@ private:
 
         const Inst::Tag      tag = ir_.tag(i);
         const Inst::Payload& p   = ir_.payload(i);
+        // loop shares the Extra payload with concat but renders region blocks.
+        if (tag == Inst::Tag::Loop) {
+            const LoopInfo lp = ir_.extra_data<LoopInfo>(p.extra);
+            ref(lp.pred);
+            os_ << ") {\n";
+            render_region("cond", lp.cond, depth);
+            render_region("body", lp.body, depth);
+            render_region("step", lp.step, depth);
+            indent(depth);
+            os_ << "}\n";
+            return;
+        }
         switch (payload_kind(tag)) {
             case Inst::PayloadKind::None:
                 break;

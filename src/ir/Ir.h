@@ -85,6 +85,21 @@ struct Regions {
     ExtraSlice else_;
 };
 
+// Extra payload for `loop`. `cond` holds the instructions that recompute the
+// predicate each iteration; `pred` is the 1-bit predicate index defined within
+// `cond` (a constant 1 when the source condition is omitted). `body` is the
+// loop body; `step` is the per-iteration update (empty for while / forever).
+struct LoopInfo {
+    // Instructions recomputing the predicate at the top of each iteration.
+    ExtraSlice cond;
+    // The 1-bit predicate value, defined inside `cond`.
+    Index pred;
+    // Loop body, executed while the predicate is a definite 1.
+    ExtraSlice body;
+    // Per-iteration update, executed after the body (empty for while / forever).
+    ExtraSlice step;
+};
+
 // Extra payload for `display`: a $display / $write system task. The format-string
 // bytes live packed little-endian (4 chars per u32 word) at `fmt` for `fmt_len`
 // bytes; `args` is the slice of value operands the format specifiers consume, in
@@ -104,6 +119,7 @@ static_assert(ExtraPayload<ExtraSlice>);
 static_assert(ExtraPayload<Mux>);
 static_assert(ExtraPayload<PartSelect>);
 static_assert(ExtraPayload<Regions>);
+static_assert(ExtraPayload<LoopInfo>);
 static_assert(ExtraPayload<DisplayInfo>);
 
 struct Inst {
@@ -197,6 +213,11 @@ struct Inst {
         Cond,
         // Return a value from a function / task (payload: unary).
         Ret,
+        // Loop with a per-iteration condition; `for` / `while` / `forever` all
+        // lower to this (payload: extra -> LoopInfo). The `for` init runs in the
+        // enclosing region before this inst; `while` / `forever` have empty step.
+        // Lowers to header / body / step / exit blocks with a back-edge.
+        Loop,
         // Time delay `#n`: suspend the process for `n` ticks (payload: unary, the
         // tick count). Lowers to a timer scheduled on the wheel plus a coroutine
         // suspend; the wheel resumes the process when the delay elapses.

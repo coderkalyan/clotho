@@ -48,6 +48,9 @@ public:
     Index concat(std::span<const Index> parts, SourceLoc loc);
     Index part_select(Index base, uint32_t msb, uint32_t lsb, SourceLoc loc);
     Index cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc);
+    // for / while / forever. `cond_region` recomputes `pred` each iteration;
+    // `step_region` is the per-iteration update (empty for while / forever).
+    Index loop(ExtraSlice cond_region, Index pred, ExtraSlice body_region, ExtraSlice step_region, SourceLoc loc);
 
     // -- System tasks --
     // $display / $write: a literal format string, a newline flag (true for

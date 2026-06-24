@@ -53,6 +53,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Repl:
             return K::Repl;
         case T::Concat:
+        case T::Loop:
             return K::Extra;
         case T::Display:
             return K::Display;
@@ -95,6 +96,11 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
             return { scratch.data(), 2 };
 
         case Inst::PayloadKind::Extra: {
+            // loop: its predicate and regions are not top-level SSA operands
+            // (the predicate lives inside the cond region, walked via region()).
+            if (tag == Inst::Tag::Loop) {
+                return {};
+            }
             // concat: variadic operands live in the extra buffer.
             const auto slice = extra_data<ExtraSlice>(p.extra);
             return index_slice(slice);
