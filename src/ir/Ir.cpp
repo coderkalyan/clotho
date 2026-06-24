@@ -40,6 +40,9 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Le:
         case T::Gt:
         case T::Ge:
+        case T::CaseEq:
+        case T::CasezEq:
+        case T::CasexEq:
         case T::Land:
         case T::Lor:
             return K::Binary;

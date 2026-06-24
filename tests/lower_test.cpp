@@ -100,17 +100,61 @@ TEST_CASE("a combinational process lowers the operator/mux datapath") {
     CHECK(found_datapath);
 }
 
-TEST_CASE("case statements are reported as unsupported") {
-    const LowerResult r = lower_text(R"(
-        module m(input [1:0] s, output reg x);
+// Lower a single combinational process wrapping `body` and return its IR.
+LowerResult lower_case_module(std::string_view kind, std::string_view body) {
+    std::string src = "module m(input [1:0] s, output reg [1:0] x);\n always @(*)\n  ";
+    src += kind;
+    src += " (s)\n";
+    src += body;
+    src += "\n  endcase\nendmodule\n";
+
+    return lower_text(src);
+}
+
+TEST_CASE("case lowers to a case-equality / cond chain") {
+    const LowerResult r = lower_case_module("case", R"(
+        2'd0: x = 2'b00;
+        2'd1: x = 2'b01;
+        default: x = 2'b11;
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    const ir::Process* p = find_kind(*r.module, ir::ProcessKind::Comb);
+    REQUIRE(p != nullptr);
+    CHECK(has_tag(p->ir, ir::Inst::Tag::CaseEq));
+    CHECK(has_tag(p->ir, ir::Inst::Tag::Cond));
+    // Normal case uses exact equality, never the X-propagating logical Eq.
+    CHECK_FALSE(has_tag(p->ir, ir::Inst::Tag::Eq));
+}
+
+TEST_CASE("casez / casex select the wildcard comparison") {
+    const LowerResult rz = lower_case_module("casez", "2'b1?: x = 2'b01; default: x = 2'b00;");
+    REQUIRE_MESSAGE(rz.ok, rz.diagnostics);
+    CHECK(has_tag(find_kind(*rz.module, ir::ProcessKind::Comb)->ir, ir::Inst::Tag::CasezEq));
+
+    const LowerResult rx = lower_case_module("casex", "2'b1x: x = 2'b01; default: x = 2'b00;");
+    REQUIRE_MESSAGE(rx.ok, rx.diagnostics);
+    CHECK(has_tag(find_kind(*rx.module, ir::ProcessKind::Comb)->ir, ir::Inst::Tag::CasexEq));
+}
+
+TEST_CASE("a case with multiple labels per item ORs the comparisons") {
+    const LowerResult r = lower_case_module("case", "2'd0, 2'd1: x = 2'b01; default: x = 2'b00;");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    const ir::Process* p = find_kind(*r.module, ir::ProcessKind::Comb);
+    REQUIRE(p != nullptr);
+    CHECK(has_tag(p->ir, ir::Inst::Tag::Lor));
+}
+
+TEST_CASE("case inside is reported as unsupported") {
+    const LowerResult ri = lower_text(R"(
+        module m(input [2:0] s, output reg x);
             always @(*)
-                case (s)
-                    2'd0: x = 1'b0;
-                    default: x = 1'b1;
+                case (s) inside
+                    [0:3]: x = 1'b1;
+                    default: x = 1'b0;
                 endcase
         endmodule
     )");
-
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("case") != std::string::npos);
+    CHECK_FALSE(ri.ok);
+    CHECK(ri.diagnostics.find("inside") != std::string::npos);
 }

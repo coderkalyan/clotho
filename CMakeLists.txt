@@ -95,6 +95,7 @@ add_executable(clotho_test
   tests/frontend_test.cpp
   tests/sourcemap_test.cpp
   tests/lower_test.cpp
+  tests/case_test.cpp
   tests/llvm_backend_test.cpp
   tests/wheel_test.cpp
   tests/runtime_test.cpp

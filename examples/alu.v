@@ -14,7 +14,7 @@ module alu(
 
     // Combinational next-result: a chained-operator datapath. Real designs lean
     // on operator depth like this far more than the wide mux-trees that come from
-    // case statements (case lowering is a TODO).
+    // case statements.
     assign next = (((a + b) ^ (a & b)) + ((a | b) - (a ^ b))) >> op;
 
     // Sequential register with synchronous reset.

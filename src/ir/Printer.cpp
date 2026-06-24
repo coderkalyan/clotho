@@ -96,6 +96,12 @@ const char* tag_name(Inst::Tag tag) {
             return "gt";
         case T::Ge:
             return "ge";
+        case T::CaseEq:
+            return "case_eq";
+        case T::CasezEq:
+            return "casez_eq";
+        case T::CasexEq:
+            return "casex_eq";
         case T::Land:
             return "land";
         case T::Lor:

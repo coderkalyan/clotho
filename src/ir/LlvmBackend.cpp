@@ -442,6 +442,9 @@ private:
             case Inst::Tag::Le:
             case Inst::Tag::Gt:
             case Inst::Tag::Ge:
+            case Inst::Tag::CaseEq:
+            case Inst::Tag::CasezEq:
+            case Inst::Tag::CasexEq:
             case Inst::Tag::Land:
             case Inst::Tag::Lor:
             case Inst::Tag::Lnot:
@@ -564,6 +567,12 @@ private:
                             ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r), type_of(p.binary.l).is_signed));
                 return;
 
+            case Inst::Tag::CaseEq:
+            case Inst::Tag::CasezEq:
+            case Inst::Tag::CasexEq:
+                set_value(i, lower_case_compare(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
+                return;
+
             case Inst::Tag::Land:
             case Inst::Tag::Lor:
                 set_value(i, lower_logical(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
@@ -611,10 +620,12 @@ private:
         const std::span<const uint8_t> bytes = mod_.pool.bytes(ref);
         const uint32_t                 pb    = plane_bytes(lay.width);
 
-        // The pool stores canonical val/xz; ingest to must/may (constants never z).
+        // The pool stores canonical val/xz; ingest to must/may/z so 0/1/x/z stay
+        // distinct (case-equality needs to tell a literal x from a literal z).
+        // VPI: x=(val1,xz1), z=(val0,xz1) => must=val&~xz, may=val|xz, z=xz&~val.
         llvm::Value* val = const_from_bytes(bytes.subspan(0, pb), w);
         llvm::Value* xz  = lay.domain == Domain::Four ? const_from_bytes(bytes.subspan(pb, pb), w) : zero(w);
-        return packed(b_.CreateAnd(val, b_.CreateNot(xz)), b_.CreateOr(val, xz), zero(w));
+        return packed(b_.CreateAnd(val, b_.CreateNot(xz)), b_.CreateOr(val, xz), b_.CreateAnd(xz, b_.CreateNot(val)));
     }
 
     // Build an iW constant from little-endian canonical plane bytes.
@@ -963,6 +974,39 @@ private:
         llvm::Value* cmp     = b_.CreateICmp(pred, must_of(a), must_of(b));
         llvm::Value* unknown = b_.CreateOr(any_unknown(a), any_unknown(b));
         return bit_plane(b_.CreateAnd(b_.CreateNot(unknown), cmp), b_.CreateOr(unknown, cmp));
+    }
+
+    // -- Case-equality (SV `case`/`casez`/`casex`) -> definite 1-bit. --
+    //
+    // Unlike `lower_compare`, the result is always known (must == may): the case
+    // statement compares 4-state planes bit-exactly rather than propagating X.
+    //   CaseEq  (===): every bit of must/may/z must be equal.
+    //   CasezEq:  z bits in either operand are don't-care (mask = z_a | z_b).
+    //   CasexEq:  x and z bits in either operand are don't-care
+    //             (mask = unknown_a | unknown_b, since both x and z have must!=may).
+    Plane lower_case_compare(Inst::Tag tag, Plane a, Plane b) {
+        const uint32_t w  = std::max(width_of(a), width_of(b));
+        a                 = cast_plane(a, w, false);
+        b                 = cast_plane(b, w, false);
+        llvm::Value* am   = must_of(a);
+        llvm::Value* aM   = may_of(a);
+        llvm::Value* bm   = must_of(b);
+        llvm::Value* bM   = may_of(b);
+
+        llvm::Value* eq;
+        if (tag == Inst::Tag::CaseEq) {
+            eq = b_.CreateAnd(b_.CreateAnd(b_.CreateICmpEQ(am, bm), b_.CreateICmpEQ(aM, bM)),
+                              b_.CreateICmpEQ(a.z, b.z));
+        } else {
+            llvm::Value* dc = tag == Inst::Tag::CasezEq
+                                ? b_.CreateOr(a.z, b.z)
+                                : b_.CreateOr(b_.CreateXor(am, aM), b_.CreateXor(bm, bM));
+            llvm::Value* keep = b_.CreateNot(dc);
+            eq                = b_.CreateAnd(
+              b_.CreateICmpEQ(b_.CreateAnd(am, keep), b_.CreateAnd(bm, keep)),
+              b_.CreateICmpEQ(b_.CreateAnd(aM, keep), b_.CreateAnd(bM, keep)));
+        }
+        return bit_plane(eq, eq);
     }
 
     // -- Logical and/or/not -> 1-bit, three-valued. --

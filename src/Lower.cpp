@@ -1,5 +1,7 @@
 #include "Lower.h"
 
+#include <algorithm>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -105,11 +107,12 @@ private:
             fail("unsupported non-integral type");
         }
 
-        const uint32_t width     = ct.getBitWidth();
-        const bool     is_four   = ct.isFourState();
-        const bool     is_signed = ct.isSigned();
-        const ir::Ref  element   = is_four ? module_.pool.logic_type : module_.pool.bit_type;
+        return make_int_type(ct.getBitWidth(), ct.isFourState(), ct.isSigned());
+    }
 
+    // Intern a packed integer type of the given width / state / signedness.
+    ir::Ref make_int_type(uint32_t width, bool is_four, bool is_signed) {
+        const ir::Ref element = is_four ? module_.pool.logic_type : module_.pool.bit_type;
         if (width == 1 && !is_signed) {
             return element;
         }
@@ -122,6 +125,36 @@ private:
         vec.right     = 0;
 
         return module_.pool.put(ir::Item{ vec });
+    }
+
+    // Intern an integer literal, preserving x/z bits. Slang stores a 4-state
+    // SVInt as [value words][unknown words] with X=(val0,unk1), Z=(val1,unk1) —
+    // the opposite val convention from the pool's VPI planes (X=(val1,xz1),
+    // Z=(val0,xz1)). The unknown word IS the xz plane; the val plane is
+    // value^unknown so the per-bit codes line up. 2-state literals take the fast
+    // uint64 path.
+    ir::Ref lower_int_literal(const IntegerLiteral& lit) {
+        const ir::Ref      ty = lower_type(*lit.type);
+        const slang::SVInt v  = lit.getValue();
+        if (!v.hasUnknown()) {
+            return module_.pool.put_int(ty, v.as<uint64_t>().value_or(0));
+        }
+
+        const uint32_t        width = v.getBitWidth();
+        const uint32_t        words = (width + 63) / 64;
+        const uint64_t*       raw   = v.getRawPtr();
+        std::vector<uint64_t> planes(static_cast<size_t>(words) * 2);
+        for (uint32_t i = 0; i < words; ++i) {
+            planes[i]         = raw[i] ^ raw[words + i]; // val plane (VPI)
+            planes[words + i] = raw[words + i];          // xz plane (unknown)
+        }
+
+        const uint32_t       pb = ir::plane_bytes(width);
+        std::vector<uint8_t> bytes(static_cast<size_t>(pb) * 2, 0);
+        std::memcpy(bytes.data(), planes.data(), pb);
+        std::memcpy(bytes.data() + pb, planes.data() + words, pb);
+
+        return module_.pool.put_value(ty, bytes);
     }
 
     // -- Signals --
@@ -264,7 +297,8 @@ private:
                 // nothing to lower.
                 break;
             case StatementKind::Case:
-                fail("case statements are not supported");
+                lower_case(stmt.as<CaseStatement>(), b);
+                break;
             default:
                 fail("unsupported statement");
         }
@@ -287,6 +321,92 @@ private:
         const ir::ExtraSlice else_region = b.close_region();
 
         b.cond(pred, then_region, else_region, loc(c));
+    }
+
+    // The width/state/signedness all case_expressions are compared at: the
+    // longest of the selector and every item label, four-state if any operand is,
+    // signed only if all are (IEEE 1800-2023 12.5).
+    ir::Ref common_case_type(const CaseStatement& c) {
+        uint32_t width  = c.expr.type->getBitWidth();
+        bool     four   = c.expr.type->isFourState();
+        bool     signd  = c.expr.type->isSigned();
+        for (const CaseStatement::ItemGroup& item : c.items) {
+            for (const Expression* e : item.expressions) {
+                width = std::max(width, e->type->getBitWidth());
+                four  = four || e->type->isFourState();
+                signd = signd && e->type->isSigned();
+            }
+        }
+
+        return make_int_type(width, four, signd);
+    }
+
+    void lower_case(const CaseStatement& c, ir::Builder& b) {
+        ir::Inst::Tag cmp;
+        switch (c.condition) {
+            case CaseStatementCondition::Normal:
+                cmp = ir::Inst::Tag::CaseEq;
+                break;
+            case CaseStatementCondition::WildcardJustZ:
+                cmp = ir::Inst::Tag::CasezEq;
+                break;
+            case CaseStatementCondition::WildcardXOrZ:
+                cmp = ir::Inst::Tag::CasexEq;
+                break;
+            default:
+                fail("case ... inside is not supported");
+        }
+        // NOTE: unique / unique0 / priority (c.check) only govern violation
+        // reporting, a runtime assertion; the first-match execution below is
+        // conforming for all of them.
+        // TODO: emit unique / priority violation reports.
+
+        const ir::Ref   ty  = common_case_type(c);
+        // The selector is evaluated exactly once, up front (12.5).
+        const ir::Index sel = b.resize(lower_expr(c.expr, b), ty, loc(c.expr));
+
+        lower_case_item(c, 0, sel, cmp, ty, b);
+    }
+
+    // Emit the if-else chain for items[k..] into the current region: item k's
+    // match test guards its body, with the rest of the chain (eventually the
+    // default) as the else branch. Items are tested in textual order and the
+    // first match wins; labels for items not yet reached are evaluated lazily,
+    // inside the else regions, so they run only until a match is found.
+    void lower_case_item(const CaseStatement& c, size_t k, ir::Index sel, ir::Inst::Tag cmp, ir::Ref ty,
+                         ir::Builder& b) {
+        if (k == c.items.size()) {
+            if (c.defaultCase != nullptr) {
+                lower_stmt(*c.defaultCase, b);
+            }
+            return;
+        }
+
+        const CaseStatement::ItemGroup& item = c.items[k];
+        if (item.expressions.empty()) {
+            lower_case_item(c, k + 1, sel, cmp, ty, b);
+            return;
+        }
+
+        // Match predicate: OR of (selector <cmp> label) over the group's labels.
+        ir::Index pred{};
+        bool      have = false;
+        for (const Expression* e : item.expressions) {
+            const ir::Index val = b.resize(lower_expr(*e, b), ty, loc(*e));
+            const ir::Index one = b.binary(cmp, sel, val, loc(*e));
+            pred                = have ? b.binary(ir::Inst::Tag::Lor, pred, one, loc(*e)) : one;
+            have                = true;
+        }
+
+        b.open_region();
+        lower_stmt(*item.stmt, b);
+        const ir::ExtraSlice then_region = b.close_region();
+
+        b.open_region();
+        lower_case_item(c, k + 1, sel, cmp, ty, b);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        b.cond(pred, then_region, else_region, loc(*item.stmt));
     }
 
     // -- System tasks --
@@ -363,11 +483,8 @@ private:
     ir::Index lower_expr(const Expression& expr, ir::Builder& b) {
         const ir::SourceLoc l = loc(expr);
         switch (expr.kind) {
-            case ExpressionKind::IntegerLiteral: {
-                const ir::Ref  ty   = lower_type(*expr.type);
-                const uint64_t bits = expr.as<IntegerLiteral>().getValue().as<uint64_t>().value_or(0);
-                return b.constant(module_.pool.put_int(ty, bits), l);
-            }
+            case ExpressionKind::IntegerLiteral:
+                return b.constant(lower_int_literal(expr.as<IntegerLiteral>()), l);
             case ExpressionKind::NamedValue: {
                 const ir::Signal sig = signal_of(expr.as<NamedValueExpression>().symbol);
                 return b.unary(ir::Inst::Tag::Load, b.signal(sig, l), l);

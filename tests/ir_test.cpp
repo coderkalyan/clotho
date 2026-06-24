@@ -151,6 +151,25 @@ TEST_CASE("structured cond carries then/else regions") {
     CHECK(ir.tag(ir.region(regions.then_)[1]) == Inst::Tag::StoreNb);
 }
 
+TEST_CASE("case-equality comparisons are binary ops over two operands") {
+    InternPool      pool;
+    Builder         b(pool);
+    const SourceLoc loc{ 1 };
+
+    const Index sel = b.unary(Inst::Tag::Load, b.signal(Signal{ 0 }, loc), loc);
+    const Index lab = b.constant(konst(pool, 1), loc);
+    const Index eq  = b.binary(Inst::Tag::CasezEq, sel, lab, loc);
+
+    Ir ir = b.finish();
+    CHECK(ir.tag(eq) == Inst::Tag::CasezEq);
+
+    std::array<Index, 3> scratch{};
+    const auto           ops = ir.operands(eq, scratch);
+    REQUIRE(ops.size() == 2);
+    CHECK(ops[0] == sel);
+    CHECK(ops[1] == lab);
+}
+
 TEST_CASE("mux and concat expose their operands") {
     InternPool      pool;
     Builder         b(pool);

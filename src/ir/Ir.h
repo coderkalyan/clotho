@@ -163,6 +163,15 @@ struct Inst {
         Gt,
         Ge,
 
+        // -- Case-equality, -> definite 1-bit (payload: binary) --
+        // Unlike Eq, these never yield X: they compare the 4-state planes
+        // directly and return a known 0/1, matching SV case-statement semantics.
+        // CaseEq is `===` (every bit, incl. x/z, must match exactly); CasezEq /
+        // CasexEq treat z (resp. x and z) bits in either operand as don't-care.
+        CaseEq,
+        CasezEq,
+        CasexEq,
+
         // -- Logical, -> 1-bit --
         // Logical and (payload: binary).
         Land,
