@@ -167,3 +167,41 @@ TEST_CASE("delay inside a conditional splits cleanly") {
     CHECK(count_substr(ir, "call void @rt_wheel_schedule") == 2);
     CHECK(ir.find("define internal void @clotho.enqueue_timer") != std::string::npos);
 }
+
+TEST_CASE("event waits emit wait queues, always loops, and queue servicing") {
+    // A clocked counter feeding a level-sensitive combinational block, driven by
+    // an initial that blocks on @(doubled). Exercises every wait mechanism: a
+    // persistent always-block subscription, a one-shot intra-body @(sig), and the
+    // blocking store that services the queue. emit() REQUIREs verifyModule, so a
+    // malformed always-loop / wait-suspend CFG fails this test outright.
+    constexpr std::string_view src = R"(
+        module w;
+            reg clk, rst;
+            reg [7:0] d, q, doubled;
+            integer i;
+            always @(posedge clk) if (rst) q = 8'd0; else q = q + 8'd1;
+            always @(d or q)      doubled = d + q;
+            initial begin
+                rst = 1; d = 8'd10; clk = 0;
+                #5 clk = 1; #5 clk = 0; rst = 0;
+                for (i = 0; i < 3; i = i + 1) begin
+                    #5 clk = 1;
+                    @(doubled);
+                    $display("q=%0d doubled=%0d", q, doubled);
+                    #5 clk = 0;
+                end
+            end
+        endmodule
+    )";
+    const std::string          ir  = emit(src);
+
+    // Per-signal wait queues + the per-process scheduled-flag array exist.
+    CHECK(ir.find("@clotho.wait.clk = internal global") != std::string::npos);
+    CHECK(ir.find("@clotho.wait.doubled = internal global") != std::string::npos);
+    CHECK(ir.find("@clotho.proc_sched = internal global") != std::string::npos);
+    // The always blocks lower to a persistent subscribe + forever wait loop, and
+    // the blocking stores emit the queue-servicing scan.
+    CHECK(ir.find("always.loop") != std::string::npos);
+    CHECK(ir.find("wait.head") != std::string::npos);
+    CHECK(ir.find("wait.persist") != std::string::npos);
+}

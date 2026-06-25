@@ -124,6 +124,8 @@ const char* tag_name(Inst::Tag tag) {
             return "loop";
         case T::Delay:
             return "delay";
+        case T::Wait:
+            return "wait";
         case T::Display:
             return "display";
     }
@@ -221,6 +223,13 @@ private:
             case Inst::PayloadKind::Signal:
                 os_ << "s" << static_cast<uint32_t>(p.signal);
                 break;
+            case Inst::PayloadKind::Wait: {
+                const char* edge = p.wait.edge == static_cast<uint32_t>(Edge::Positive)   ? "posedge "
+                                   : p.wait.edge == static_cast<uint32_t>(Edge::Negative) ? "negedge "
+                                                                                          : "";
+                os_ << "@" << edge << "s" << static_cast<uint32_t>(p.wait.signal);
+                break;
+            }
             case Inst::PayloadKind::Unary:
                 ref(p.unary);
                 break;

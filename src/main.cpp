@@ -13,7 +13,9 @@
 // then JIT-compile and run it (default), or emit the process IR / LLVM IR for
 // debugging. All compiler logic lives in libclotho / libclotho_ir.
 //
-// Usage: clotho [--emit=run|ir|llvm] [--time] [-o <out>] <file.sv>
+// Usage: clotho [--emit=run|ir|llvm|opt] [--time] [-o <out>] <file.sv>
+// `llvm` emits the backend's raw IR before the coroutine-lowering pipeline runs
+// (coro intrinsics intact) — for manual review; `opt` emits it after the passes.
 int main(int argc, char** argv) {
     std::string_view emit = "run";
     std::string_view out;
@@ -36,8 +38,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (input.empty() || (emit != "run" && emit != "ir" && emit != "llvm")) {
-        std::println(stderr, "usage: {} [--emit=run|ir|llvm] [--time] [-o <out>] <file.sv>", argv[0]);
+    if (input.empty() || (emit != "run" && emit != "ir" && emit != "llvm" && emit != "opt")) {
+        std::println(stderr, "usage: {} [--emit=run|ir|llvm|opt] [--time] [-o <out>] <file.sv>", argv[0]);
         return 2;
     }
 
@@ -82,10 +84,11 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // emit == "llvm"
-    bool ok = false;
+    // emit == "llvm" (raw backend output) or "opt" (after the coroutine passes).
+    const bool optimize = emit == "opt";
+    bool       ok       = false;
     if (out.empty()) {
-        ok = clotho::ir::emit_llvm(*result.module, llvm::outs());
+        ok = clotho::ir::emit_llvm(*result.module, llvm::outs(), optimize);
     } else {
         std::error_code      ec;
         llvm::raw_fd_ostream os(out, ec);
@@ -93,7 +96,7 @@ int main(int argc, char** argv) {
             std::println(stderr, "cannot open '{}': {}", out, ec.message());
             return 1;
         }
-        ok = clotho::ir::emit_llvm(*result.module, os);
+        ok = clotho::ir::emit_llvm(*result.module, os, optimize);
     }
     report();
     return ok ? 0 : 1;

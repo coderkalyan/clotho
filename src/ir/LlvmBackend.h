@@ -26,11 +26,16 @@ namespace clotho::ir {
 // nullptr (and writes the reason to llvm::errs()) on backend error or if the
 // generated module fails verification. The caller owns the returned module and
 // must keep `ctx` alive at least as long as it.
-std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& ctx);
+//
+// `optimize` runs the coroutine-lowering pipeline (CoroSplit et al., required to
+// produce runnable code). Pass false to get the raw pre-split module — the
+// llvm.coro.* intrinsics are still present — for manual review before any passes.
+std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& ctx, bool optimize = true);
 
 // Lower every process in `m` to an LLVM function and write textual LLVM IR to
 // `os`. Returns false (and writes the reason to llvm::errs()) if the generated
 // module fails verification; on success the IR has already been printed to `os`.
-bool emit_llvm(const Module& m, llvm::raw_ostream& os);
+// `optimize` is forwarded to build_module: false emits the pre-pass IR.
+bool emit_llvm(const Module& m, llvm::raw_ostream& os, bool optimize = true);
 
 } // namespace clotho::ir

@@ -1,47 +1,44 @@
-// Intra-body event waits as a stimulus driver. NOTE: does not compile yet —
-// `@(edge)`/`@(signal)` waits inside a process body have no lowering (see
-// Lower.cpp's Timed case). This is the target for the wait-event feature: a
-// blocking-assignment process that suspends on an event and resumes when it
-// fires. The design is a clocked register fed by a level-sensitive combinational
-// block; the initial block drives the clock and synchronizes to it with waits.
+// Intra-body event waits as a stimulus driver, exercising the full wait path:
+// a clocked counter, a level-sensitive combinational block with a multi-signal
+// sensitivity list, and an initial block that drives the clock and synchronizes
+// to the combinational result with @(signal) waits. All assignments are blocking
+// (no NBA yet) — this design has no intra-block RAW hazards, so blocking matches
+// what a synchronous register would produce. Terminating and deterministic;
+// output verified equal to Icarus.
 module wait_events;
   reg        clk;
   reg        rst;
   reg  [7:0] d;
   reg  [7:0] q;
   reg  [7:0] doubled;
+  integer    i;
 
-  // Sequential: capture the combinational result on each rising clock edge with
-  // a synchronous (nonblocking) assignment.
+  // Sequential: a counter, reset-cleared, incremented on each rising clock edge.
   always @(posedge clk)
     if (rst)
-      q <= 8'd0;
+      q = 8'd0;
     else
-      q <= doubled;
+      q = q + 8'd1;
 
   // Level-sensitive combinational block (no always_comb yet): recompute on any
-  // input change with a blocking assignment.
+  // change of d or q.
   always @(d or q)
     doubled = d + q;
 
-  // Stimulus: drive the clock and inputs, then block on events. The `@(...)`
-  // waits sitting between blocking assignments are exactly what the wait-event
-  // lowering must support.
+  // Stimulus: hold reset for one edge, then pulse the clock and, each time, block
+  // on the combinational result settling before sampling it.
   initial begin
-    clk = 0;
     rst = 1;
-    d   = 8'd3;
-
-    #5 clk = 1;     // rising edge: register loads (rst held)
+    d   = 8'd10;
+    clk = 0;
+    #5 clk = 1;   // reset edge: q <= 0
     #5 clk = 0;
-
-    @(q);           // wait until the register output settles
     rst = 0;
-
-    #5 clk = 1;     // next rising edge: register loads `doubled`
-    #5 clk = 0;
-
-    @(doubled);     // wait until the combinational result updates
-    $display("q=%0d doubled=%0d", q, doubled);
+    for (i = 0; i < 3; i = i + 1) begin
+      #5 clk = 1; // counting edge: q increments, so doubled changes
+      @(doubled); // wait for the combinational result to settle
+      $display("q=%0d doubled=%0d", q, doubled);
+      #5 clk = 0;
+    end
   end
 endmodule

@@ -83,6 +83,10 @@ Index Builder::loop(ExtraSlice cond_region, Index pred, ExtraSlice body_region, 
     return emit({ Inst::Tag::Loop, Inst::Payload{ .extra = extra } }, loc);
 }
 
+Index Builder::wait(Signal sig, uint32_t edge, SourceLoc loc) {
+    return emit({ Inst::Tag::Wait, Inst::Payload{ .wait = { sig, edge } } }, loc);
+}
+
 Index Builder::display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc) {
     // Order in the extra buffer: format bytes, then the arg-index slice, then the
     // DisplayInfo record pointing at both. None of the three regions overlap.

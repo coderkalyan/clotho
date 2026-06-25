@@ -332,6 +332,19 @@ private:
         fail("unsupported event expression");
     }
 
+    // Lower an intra-body event control `@(...)` to a Wait instruction. Only a
+    // single signal event is supported for now; a multi-signal list (@(a or b))
+    // or implicit (@*) wait would need the process to register on several queues
+    // at once, which the backend cannot yet do safely.
+    void lower_event_wait(const TimingControl& tc, ir::Builder& b, ir::SourceLoc l) {
+        std::vector<ir::WaitEvent> events;
+        collect_wait_events(tc, events);
+        if (events.size() != 1) {
+            fail("only single-signal intra-body event waits (@(sig)) are supported yet");
+        }
+        b.wait(events[0].signal, static_cast<uint32_t>(events[0].edge), l);
+    }
+
     // -- Statements --
 
     void lower_stmt(const Statement& stmt, ir::Builder& b) {
@@ -346,18 +359,20 @@ private:
                 break;
             case StatementKind::Timed: {
                 // A timing control nested inside a process body. A delay (#n) lowers
-                // to a Delay instruction (suspend + reschedule on the timing wheel),
-                // then its body runs after the delay elapses. Intra-body event waits
-                // (@(posedge clk)) and wait(expr) still have no lowering. (A
-                // process's top-level @(edge) sensitivity is consumed in
-                // lower_procedural_block and never lands here.)
+                // to a Delay instruction (suspend + reschedule on the timing wheel);
+                // an event wait (@(edge sig)) lowers to a Wait instruction (suspend
+                // on the signal's wait queue). Either way the body underneath runs
+                // once the process resumes. (A process's top-level @(edge)
+                // sensitivity is consumed in lower_procedural_block, not here.)
                 const TimedStatement& timed = stmt.as<TimedStatement>();
-                if (timed.timing.kind != TimingControlKind::Delay) {
-                    fail("event control / wait inside a process body is not "
-                         "supported yet (only #delay)");
+                if (timed.timing.kind == TimingControlKind::Delay) {
+                    const Expression& amount = timed.timing.as<DelayControl>().expr;
+                    b.unary(ir::Inst::Tag::Delay, lower_expr(amount, b), loc(stmt));
+                } else if (is_event_control(timed.timing)) {
+                    lower_event_wait(timed.timing, b, loc(stmt));
+                } else {
+                    fail("unsupported timing control inside a process body");
                 }
-                const Expression& amount = timed.timing.as<DelayControl>().expr;
-                b.unary(ir::Inst::Tag::Delay, lower_expr(amount, b), loc(stmt));
                 lower_stmt(timed.stmt, b);
                 break;
             }

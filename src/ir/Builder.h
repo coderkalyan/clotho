@@ -52,6 +52,11 @@ public:
     // `step_region` is the per-iteration update (empty for while / forever).
     Index loop(ExtraSlice cond_region, Index pred, ExtraSlice body_region, ExtraSlice step_region, SourceLoc loc);
 
+    // -- Timing --
+    // Event wait `@(edge sig)`: suspend until `sig` undergoes `edge` (an ir::Edge
+    // value passed as u32 to keep the builder free of the Module-level enum).
+    Index wait(Signal sig, uint32_t edge, SourceLoc loc);
+
     // -- System tasks --
     // $display / $write: a literal format string, a newline flag (true for
     // $display), and the already-lowered value args its specifiers consume.

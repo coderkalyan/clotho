@@ -222,6 +222,11 @@ struct Inst {
         // tick count). Lowers to a timer scheduled on the wheel plus a coroutine
         // suspend; the wheel resumes the process when the delay elapses.
         Delay,
+        // Event wait `@(edge signal)`: suspend until the signal undergoes the edge
+        // (payload: wait). Lowers to registering the process on the signal's wait
+        // queue plus a coroutine suspend; a matching blocking assignment to the
+        // signal wakes it. Carries a single signal event today.
+        Wait,
 
         // -- System tasks --
         // $display / $write: format string + variadic args (payload: display).
@@ -241,6 +246,7 @@ struct Inst {
         OpExtra,
         Extra,
         Display,
+        Wait,
     };
 
     union Payload {
@@ -291,6 +297,14 @@ struct Inst {
         ExtraIndex extra;
         // Handle to a DisplayInfo extra record (display).
         ExtraIndex display;
+        // Signal event to suspend on (wait): the signal and its edge (an ir::Edge
+        // stored as u32). No SSA operands.
+        struct {
+            // Signal whose change wakes the process.
+            Signal signal;
+            // Edge to wait for (ir::Edge value).
+            uint32_t edge;
+        } wait;
     };
 
     // Discriminant selecting the active payload member.

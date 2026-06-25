@@ -57,6 +57,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::Extra;
         case T::Display:
             return K::Display;
+        case T::Wait:
+            return K::Wait;
 
         case T::Mux:
         case T::PartSelect:
@@ -76,6 +78,7 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
         case Inst::PayloadKind::Ref:
         case Inst::PayloadKind::Signal:
         case Inst::PayloadKind::Arg:
+        case Inst::PayloadKind::Wait:
             return {};
 
         case Inst::PayloadKind::Unary:
