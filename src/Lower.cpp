@@ -332,17 +332,21 @@ private:
         fail("unsupported event expression");
     }
 
-    // Lower an intra-body event control `@(...)` to a Wait instruction. Only a
-    // single signal event is supported for now; a multi-signal list (@(a or b))
-    // or implicit (@*) wait would need the process to register on several queues
-    // at once, which the backend cannot yet do safely.
+    // Lower an intra-body event control `@(...)` to a Wait instruction. A
+    // multi-signal list (@(a or posedge b)) registers the process on every listed
+    // (signal, edge) queue at once; it wakes when any of them fires.
     void lower_event_wait(const TimingControl& tc, ir::Builder& b, ir::SourceLoc l) {
         std::vector<ir::WaitEvent> events;
         collect_wait_events(tc, events);
-        if (events.size() != 1) {
-            fail("only single-signal intra-body event waits (@(sig)) are supported yet");
+        if (events.empty()) {
+            fail("intra-body event wait has no signal events");
         }
-        b.wait(events[0].signal, static_cast<uint32_t>(events[0].edge), l);
+        std::vector<ir::WaitEdge> edges;
+        edges.reserve(events.size());
+        for (const ir::WaitEvent& e : events) {
+            edges.push_back(ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge) });
+        }
+        b.wait(edges, l);
     }
 
     // -- Statements --

@@ -446,14 +446,15 @@ private:
         b_.SetInsertPoint(resume);
     }
 
-    // Store a { handle, edge, flag_ptr } entry at a chosen slot of a queue array.
-    void emit_entry(llvm::ArrayType* arr_ty, llvm::Value* q, llvm::Value* slot_idx, uint32_t edge,
-                    llvm::Value* handle, llvm::Value* flag_ptr) {
+    // Store a { handle, flag_ptr } entry at a chosen slot of a queue array. The
+    // edge is no longer stored per entry — it is encoded by which sub-queue the
+    // entry lives in.
+    void emit_entry(llvm::ArrayType* arr_ty, llvm::Value* q, llvm::Value* slot_idx, llvm::Value* handle,
+                    llvm::Value* flag_ptr) {
         llvm::StructType* elem = wait_elem_ty();
         llvm::Value*      slot = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), slot_idx });
         b_.CreateStore(handle, b_.CreateStructGEP(elem, slot, 0));
-        b_.CreateStore(b_.getInt8(static_cast<uint8_t>(edge)), b_.CreateStructGEP(elem, slot, 1));
-        b_.CreateStore(flag_ptr, b_.CreateStructGEP(elem, slot, 2));
+        b_.CreateStore(flag_ptr, b_.CreateStructGEP(elem, slot, 1));
     }
 
     // Persistent (always-block) subscription: write a process's entry into the
@@ -466,8 +467,8 @@ private:
     // before any servicing, so the fixed-trip scans never read an empty slot.
     void emit_static_subscribe(Signal sig, uint32_t edge, llvm::Value* handle, llvm::Value* flag_ptr) {
         const auto     i    = static_cast<uint32_t>(sig);
-        const uint32_t slot = sta_next_[i]++;
-        emit_entry(wait_sta_ty_[i], wait_sta_gv_[i], b_.getInt32(slot), edge, handle, flag_ptr);
+        const uint32_t slot = sta_next_[i][edge]++;
+        emit_entry(wait_sta_ty_[i][edge], wait_sta_gv_[i][edge], b_.getInt32(slot), handle, flag_ptr);
     }
 
     // One-shot (intra-body @(sig)) registration: append this coroutine to the
@@ -476,10 +477,10 @@ private:
     // holds at most one dynamic slot per signal at a time.
     void emit_dynamic_register(Signal sig, uint32_t edge) {
         const auto   i      = static_cast<uint32_t>(sig);
-        auto*        len_gv = wait_dyn_len_gv_[i];
+        auto*        len_gv = wait_dyn_len_gv_[i][edge];
         auto*        i32    = b_.getInt32Ty();
         llvm::Value* len    = b_.CreateLoad(i32, len_gv);
-        emit_entry(wait_dyn_ty_[i], wait_dyn_gv_[i], len, edge, hdl_, sched_ptr_);
+        emit_entry(wait_dyn_ty_[i][edge], wait_dyn_gv_[i][edge], len, hdl_, sched_ptr_);
         b_.CreateStore(b_.CreateAdd(len, b_.getInt32(1)), len_gv);
     }
 
@@ -497,13 +498,33 @@ private:
         b_.SetInsertPoint(resume);
     }
 
-    // Lower an intra-body `@(edge sig)` event wait: register on the signal's
-    // dynamic queue and suspend. A matching blocking store wakes us
-    // (service_dynamic_queue pushes the handle onto the active queue and removes
-    // the entry); the scheduler resumes us in the fresh resume block.
-    void lower_wait(Signal sig, uint32_t edge) {
-        emit_dynamic_register(sig, edge);
-        emit_wait_suspend();
+    // Lower an intra-body `@(a or posedge b ...)` event wait: register on EVERY
+    // listed (signal, edge)'s dynamic queue, arm our scheduled flag, then suspend
+    // once. A matching blocking store to any of the signals wakes us
+    // (service_dynamic_queue pushes our handle onto the active queue and clears
+    // that bucket's length); the scheduler resumes us in the fresh resume block.
+    //
+    // Flag arming: service_dynamic_queue now reads the flag, so we must store 0 to
+    // our &proc_sched slot before suspending or we would never be woken again.
+    //
+    // Eager removal (multi-signal only): when we resume, the bucket that fired is
+    // already cleared, but the OTHER buckets still hold our stale entry. Left in
+    // place they would spuriously wake us later and, in a forever loop, grow those
+    // buckets past their capacity (overflow). So compact ourselves out of each
+    // bucket on resume. A single-signal wait is in exactly one bucket, cleared on
+    // fire, so it needs no removal.
+    void lower_wait(ExtraIndex info) {
+        const auto events = ir_->wait_edges(info);
+        for (const WaitEdge& e : events) {
+            emit_dynamic_register(e.signal, e.edge);
+        }
+        b_.CreateStore(b_.getInt32(0), sched_ptr_); // arm: ready to be woken
+        emit_wait_suspend();                        // park until any event fires
+        if (events.size() > 1) {
+            for (const WaitEdge& e : events) {
+                emit_dynamic_remove(e.signal, e.edge);
+            }
+        }
     }
 
     // -- Top-level entry --
@@ -538,37 +559,47 @@ private:
         b_.CreateRet(llvm::ConstantInt::get(i32, 0));
     }
 
-    // Per-signal capacities for the two wait queues.
+    // Per-(signal, edge) capacities for the two wait queues. Indexed
+    // [signal][static_cast<uint32_t>(edge)] (0=pos, 1=neg, 2=any).
     struct WaitCounts {
         // Static queue: one slot per sensitivity wait event (an always block's
         // @(edge sig)). Membership is fixed for the whole run, so this is exact.
-        std::vector<uint32_t> sta;
+        std::vector<std::array<uint32_t, 3>> sta;
         // Dynamic queue: one slot per distinct process that does an intra-body
-        // @(sig). A process holds at most one such slot per signal at a time.
-        std::vector<uint32_t> dyn;
+        // @(edge sig). A process holds at most one such slot per (signal, edge)
+        // at a time.
+        std::vector<std::array<uint32_t, 3>> dyn;
     };
 
     WaitCounts wait_counts() const {
-        const auto    n = mod_.signals().size();
-        WaitCounts    c{ std::vector<uint32_t>(n, 0), std::vector<uint32_t>(n, 0) };
+        const auto n = mod_.signals().size();
+        WaitCounts c{ std::vector<std::array<uint32_t, 3>>(n, { 0, 0, 0 }),
+                      std::vector<std::array<uint32_t, 3>>(n, { 0, 0, 0 }) };
         for (const Process& p : mod_.processes()) {
             for (const WaitEvent& w : p.wait_events) {
-                c.sta[static_cast<uint32_t>(w.signal)]++;
+                c.sta[static_cast<uint32_t>(w.signal)][static_cast<uint32_t>(w.edge)]++;
             }
-            std::vector<Signal> seen;
+            // Gather the distinct (signal, edge) pairs this process intra-body
+            // waits on, across every Wait's event list. A process is a single
+            // coroutine suspended at one wait at a time, so it holds at most one
+            // dynamic slot per (signal, edge) — count each distinct pair once.
+            std::vector<std::pair<Signal, uint32_t>> seen;
             for (size_t i = 0; i < p.ir.inst_count(); ++i) {
                 const auto idx = static_cast<Index>(i);
                 if (p.ir.tag(idx) != Inst::Tag::Wait) {
                     continue;
                 }
-                const Signal s   = p.ir.payload(idx).wait.signal;
-                bool         dup = false;
-                for (Signal e : seen) {
-                    dup = dup || e == s;
-                }
-                if (!dup) {
-                    seen.push_back(s);
-                    c.dyn[static_cast<uint32_t>(s)]++;
+                for (const WaitEdge& we : p.ir.wait_edges(p.ir.payload(idx).wait)) {
+                    const Signal   s   = we.signal;
+                    const uint32_t e   = we.edge;
+                    bool           dup = false;
+                    for (const auto& pr : seen) {
+                        dup = dup || (pr.first == s && pr.second == e);
+                    }
+                    if (!dup) {
+                        seen.emplace_back(s, e);
+                        c.dyn[static_cast<uint32_t>(s)][e]++;
+                    }
                 }
             }
         }
@@ -576,71 +607,91 @@ private:
     }
 
     // One wait-queue entry, shared by both the static and dynamic queues:
-    // { ptr handle, i8 edge, ptr flag_ptr }.
+    // { ptr handle, ptr flag_ptr }.
     //   handle   — the suspended coroutine to resume.
-    //   edge     — the ir::Edge it waits for (i8).
-    //   flag_ptr — &clotho.proc_sched[process]. The static queue reads it to avoid
-    //              waking a process twice when several of its sensitivity signals
-    //              change together. The dynamic queue only stores it (groundwork
-    //              for multi-signal intra-body waits); it does not read it yet.
-    // The persistent/transient distinction is now encoded by which queue the entry
-    // lives in (.sta vs .dyn), not a per-entry flag.
+    //   flag_ptr — &clotho.proc_sched[process]. Both queues read it to avoid
+    //              waking a process twice when several of the signals it waits on
+    //              change together (a multi-signal sensitivity or a multi-signal
+    //              @(a or b) intra-body wait).
+    // The persistent/transient distinction is encoded by which queue the entry
+    // lives in (.sta vs .dyn); the edge is encoded by which per-edge sub-queue it
+    // lives in (.pos/.neg/.any). Neither is a per-entry field anymore.
     llvm::StructType* wait_elem_ty() {
         auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        auto* i8  = b_.getInt8Ty();
-        return llvm::StructType::get(ctx_, { ptr, i8, ptr });
+        return llvm::StructType::get(ctx_, { ptr, ptr });
     }
 
-    // Per-signal wait queues, each created only if it has any waiter:
+    // The .pos/.neg/.any suffix for an edge bucket index (0=pos, 1=neg, 2=any).
+    static const char* edge_suffix(uint32_t edge) {
+        switch (static_cast<Edge>(edge)) {
+            case Edge::Positive: return "pos";
+            case Edge::Negative: return "neg";
+            case Edge::Any: return "any";
+        }
+        return "any";
+    }
+
+    // Per-signal wait queues, split into up to three per-edge sub-queues, each
+    // created only if it has at least one waiter:
     //
-    //   clotho.wait.<sig>.sta  — persistent always-block subscriptions. Filled at
-    //     startup (priming) and never pushed/popped; serviced by a fixed-trip scan
-    //     (capacity is a compile-time constant, so the optimizer can unroll it).
-    //     No length global.
-    //   clotho.wait.<sig>.dyn  — one-shot intra-body @(sig) waiters, with a
-    //     .dyn.len of live entries; serviced by a compacting scan that removes
-    //     each waiter as it fires (as the single merged queue did before).
+    //   clotho.wait.<sig>.sta.{pos,neg,any}  — persistent always-block
+    //     subscriptions for that edge. Filled at startup (priming) and never
+    //     pushed/popped; serviced by a fixed-trip scan (capacity is a compile-time
+    //     constant, so the optimizer can unroll it). No length global.
+    //   clotho.wait.<sig>.dyn.{pos,neg,any}  — one-shot intra-body @(edge sig)
+    //     waiters for that edge, each with its own .len of live entries; serviced
+    //     by a straight scan that wakes every entry (they all share the matched
+    //     edge) and resets the length.
     //
-    // Splitting them keeps the hot path lean: an always-only signal carries just a
-    // fixed array (no len, no compaction), an initial-only signal just the dynamic
-    // queue. Both share the { handle, edge, flag_ptr } element type.
+    // Splitting by edge hoists the per-entry edge test out of the scan: servicing
+    // guards each whole bucket with a single branch on the matching transition
+    // fact. Both kinds share the { handle, flag_ptr } element type.
     void build_wait_queues() {
         const auto       sigs = mod_.signals();
         const WaitCounts c    = wait_counts();
-        wait_sta_gv_.assign(sigs.size(), nullptr);
-        wait_sta_ty_.assign(sigs.size(), nullptr);
-        wait_sta_cap_.assign(sigs.size(), 0);
-        wait_dyn_gv_.assign(sigs.size(), nullptr);
-        wait_dyn_ty_.assign(sigs.size(), nullptr);
-        wait_dyn_len_gv_.assign(sigs.size(), nullptr);
-        sta_next_.assign(sigs.size(), 0);
+        wait_sta_gv_.assign(sigs.size(), { nullptr, nullptr, nullptr });
+        wait_sta_ty_.assign(sigs.size(), { nullptr, nullptr, nullptr });
+        wait_sta_cap_.assign(sigs.size(), { 0, 0, 0 });
+        wait_dyn_gv_.assign(sigs.size(), { nullptr, nullptr, nullptr });
+        wait_dyn_ty_.assign(sigs.size(), { nullptr, nullptr, nullptr });
+        wait_dyn_len_gv_.assign(sigs.size(), { nullptr, nullptr, nullptr });
+        sta_next_.assign(sigs.size(), { 0, 0, 0 });
 
         auto* i32  = llvm::Type::getInt32Ty(ctx_);
         auto* elem = wait_elem_ty();
         for (uint32_t i = 0; i < sigs.size(); ++i) {
-            const std::string name = "clotho.wait." + sigs[i].name;
-            if (c.sta[i] > 0) {
-                auto* arr        = llvm::ArrayType::get(elem, c.sta[i]);
-                wait_sta_ty_[i]  = arr;
-                wait_sta_cap_[i] = c.sta[i];
-                wait_sta_gv_[i]  = new llvm::GlobalVariable(llmod_, arr, false, llvm::GlobalValue::InternalLinkage,
-                                                            llvm::ConstantAggregateZero::get(arr), name + ".sta");
-            }
-            if (c.dyn[i] > 0) {
-                auto* arr       = llvm::ArrayType::get(elem, c.dyn[i]);
-                wait_dyn_ty_[i] = arr;
-                wait_dyn_gv_[i] = new llvm::GlobalVariable(llmod_, arr, false, llvm::GlobalValue::InternalLinkage,
-                                                           llvm::ConstantAggregateZero::get(arr), name + ".dyn");
-                wait_dyn_len_gv_[i] =
-                  new llvm::GlobalVariable(llmod_, i32, false, llvm::GlobalValue::InternalLinkage,
-                                           llvm::ConstantInt::get(i32, 0), name + ".dyn.len");
+            for (uint32_t e = 0; e < 3; ++e) {
+                const std::string base = "clotho.wait." + sigs[i].name + "." ;
+                if (c.sta[i][e] > 0) {
+                    auto* arr           = llvm::ArrayType::get(elem, c.sta[i][e]);
+                    wait_sta_ty_[i][e]  = arr;
+                    wait_sta_cap_[i][e] = c.sta[i][e];
+                    wait_sta_gv_[i][e]  = new llvm::GlobalVariable(
+                      llmod_, arr, false, llvm::GlobalValue::InternalLinkage,
+                      llvm::ConstantAggregateZero::get(arr), base + "sta." + edge_suffix(e));
+                }
+                if (c.dyn[i][e] > 0) {
+                    auto* arr          = llvm::ArrayType::get(elem, c.dyn[i][e]);
+                    wait_dyn_ty_[i][e] = arr;
+                    wait_dyn_gv_[i][e] = new llvm::GlobalVariable(
+                      llmod_, arr, false, llvm::GlobalValue::InternalLinkage,
+                      llvm::ConstantAggregateZero::get(arr), base + "dyn." + edge_suffix(e));
+                    wait_dyn_len_gv_[i][e] = new llvm::GlobalVariable(
+                      llmod_, i32, false, llvm::GlobalValue::InternalLinkage,
+                      llvm::ConstantInt::get(i32, 0), base + "dyn." + edge_suffix(e) + ".len");
+                }
             }
         }
     }
 
     bool signal_has_waiters(Signal sig) const {
         const auto i = static_cast<uint32_t>(sig);
-        return wait_sta_gv_[i] != nullptr || wait_dyn_gv_[i] != nullptr;
+        for (uint32_t e = 0; e < 3; ++e) {
+            if (wait_sta_gv_[i][e] != nullptr || wait_dyn_gv_[i][e] != nullptr) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // Load a signal's packed must|may state word (the i(2W) at off_mm).
@@ -650,24 +701,16 @@ private:
           int_ty(2 * s.width), field_ptr(state_, s.off_mm), llvm::Align(field_align(2 * s.width)));
     }
 
-    // i1: does the edge `e_i8` (an ir::Edge) fire for a transition with these
-    // precomputed facts? Positive = a 0->1 LSB change, Negative = 1->0, Any = any
-    // change of the packed state.
-    llvm::Value* edge_matches(llvm::Value* e_i8, llvm::Value* pos, llvm::Value* neg, llvm::Value* changed) {
-        auto* i8 = b_.getInt8Ty();
-        auto  is = [&](Edge ed) {
-            return b_.CreateICmpEQ(e_i8, llvm::ConstantInt::get(i8, static_cast<uint8_t>(ed)));
-        };
-        llvm::Value* m = b_.CreateOr(b_.CreateAnd(is(Edge::Positive), pos), b_.CreateAnd(is(Edge::Negative), neg));
-        return b_.CreateOr(m, b_.CreateAnd(is(Edge::Any), changed));
-    }
-
     // Service a signal's wait queues after a blocking assignment to it. Computes
-    // the transition's edge facts once, then scans whichever queues exist. Emits
-    // nothing for a signal with no waiters.
+    // the transition's edge facts once, then for each per-edge bucket that exists
+    // guards its whole scan with a single branch on the matching fact — no
+    // per-entry edge check. Emits nothing for a signal with no waiters.
+    //
+    // The three buckets are serviced independently (not else-if): a 0->1 LSB
+    // transition is both `changed` (any) and `pos`, so it services both buckets.
     void service_wait_queue(Signal sig, llvm::Value* old_mm, llvm::Value* new_mm) {
         const auto i = static_cast<uint32_t>(sig);
-        if (wait_sta_gv_[i] == nullptr && wait_dyn_gv_[i] == nullptr) {
+        if (!signal_has_waiters(sig)) {
             return;
         }
         // Edge-detection facts, computed once for all entries. The LSB of `must` is
@@ -678,34 +721,55 @@ private:
         llvm::Value* neg     = b_.CreateAnd(old_lsb, b_.CreateNot(new_lsb));
         llvm::Value* changed = b_.CreateICmpNE(old_mm, new_mm);
 
-        if (wait_sta_gv_[i] != nullptr) {
-            service_static_queue(sig, pos, neg, changed);
-        }
-        if (wait_dyn_gv_[i] != nullptr) {
-            service_dynamic_queue(sig, pos, neg, changed);
+        // Bucket -> matching fact. `pos`/`neg` each imply `changed`, so the Any
+        // bucket also fires on an LSB transition.
+        const std::array<std::pair<uint32_t, llvm::Value*>, 3> buckets = {
+            std::make_pair(static_cast<uint32_t>(Edge::Any), changed),
+            std::make_pair(static_cast<uint32_t>(Edge::Positive), pos),
+            std::make_pair(static_cast<uint32_t>(Edge::Negative), neg),
+        };
+        for (const auto& [e, fact] : buckets) {
+            if (wait_sta_gv_[i][e] == nullptr && wait_dyn_gv_[i][e] == nullptr) {
+                continue;
+            }
+            auto* fn   = b_.GetInsertBlock()->getParent();
+            auto* body = llvm::BasicBlock::Create(ctx_, "wait.body", fn);
+            auto* cont = llvm::BasicBlock::Create(ctx_, "wait.cont", fn);
+            b_.CreateCondBr(fact, body, cont);
+
+            b_.SetInsertPoint(body);
+            if (wait_sta_gv_[i][e] != nullptr) {
+                service_static_queue(sig, e);
+            }
+            if (wait_dyn_gv_[i][e] != nullptr) {
+                service_dynamic_queue(sig, e);
+            }
+            b_.CreateBr(cont);
+            b_.SetInsertPoint(cont);
         }
     }
 
-    // Static queue scan: a fixed-trip loop over the persistent subscriptions (the
-    // capacity is a compile-time constant, so the optimizer may unroll). Membership
-    // never changes — no compaction, no length. Each matching entry wakes its
-    // process, but only if it is not already scheduled this instant (its flag is
-    // 0), then sets the flag; that flag is what collapses a multi-signal sensitivity
-    // (the same process subscribed under several signals) into a single wake.
-    void service_static_queue(Signal sig, llvm::Value* pos, llvm::Value* neg, llvm::Value* changed) {
+    // Static sub-queue scan (one edge bucket): a fixed-trip loop over the
+    // persistent subscriptions for this (signal, edge). The bucket's edge already
+    // matched the transition (the caller guarded the whole scan), so there is no
+    // per-entry edge check. The capacity is a compile-time constant, so the
+    // optimizer may unroll. Membership never changes — no compaction, no length.
+    // Each entry wakes its process, but only if it is not already scheduled this
+    // instant (its flag is 0), then sets the flag; that flag collapses a
+    // multi-signal sensitivity (the same process subscribed under several signals)
+    // into a single wake.
+    void service_static_queue(Signal sig, uint32_t edge) {
         const auto        i      = static_cast<uint32_t>(sig);
-        auto*             q      = wait_sta_gv_[i];
-        auto*             arr_ty = wait_sta_ty_[i];
-        const uint32_t    cap    = wait_sta_cap_[i];
+        auto*             q      = wait_sta_gv_[i][edge];
+        auto*             arr_ty = wait_sta_ty_[i][edge];
+        const uint32_t    cap    = wait_sta_cap_[i][edge];
         llvm::StructType* elem   = wait_elem_ty();
         auto*             ptr_ty = llvm::PointerType::getUnqual(ctx_);
-        auto*             i8     = b_.getInt8Ty();
         auto*             i32    = b_.getInt32Ty();
 
         auto* fn    = b_.GetInsertBlock()->getParent();
         auto* head  = llvm::BasicBlock::Create(ctx_, "sta.head", fn);
         auto* body  = llvm::BasicBlock::Create(ctx_, "sta.body", fn);
-        auto* mblk  = llvm::BasicBlock::Create(ctx_, "sta.match", fn);
         auto* wake  = llvm::BasicBlock::Create(ctx_, "sta.wake", fn);
         auto* cont  = llvm::BasicBlock::Create(ctx_, "sta.cont", fn);
         auto* done  = llvm::BasicBlock::Create(ctx_, "sta.done", fn);
@@ -718,13 +782,9 @@ private:
         b_.CreateCondBr(b_.CreateICmpULT(idx, b_.getInt32(cap)), body, done);
 
         b_.SetInsertPoint(body);
-        llvm::Value* src   = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), idx });
-        llvm::Value* h     = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 0));
-        llvm::Value* e     = b_.CreateLoad(i8, b_.CreateStructGEP(elem, src, 1));
-        llvm::Value* fptr  = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 2));
-        b_.CreateCondBr(edge_matches(e, pos, neg, changed), mblk, cont);
-
-        b_.SetInsertPoint(mblk);
+        llvm::Value* src     = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), idx });
+        llvm::Value* h       = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 0));
+        llvm::Value* fptr    = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 1));
         llvm::Value* already = b_.CreateICmpNE(b_.CreateLoad(i32, fptr), b_.getInt32(0));
         b_.CreateCondBr(already, cont, wake);
 
@@ -741,19 +801,22 @@ private:
         b_.SetInsertPoint(done);
     }
 
-    // Dynamic queue scan: a compacting loop over the live one-shot waiters. Read
-    // index i scans [0, len), write index w keeps the survivors; a matching entry
-    // is woken and removed (dropped), a non-matching one is compacted down. The new
-    // length is the final w. (The flag is stored in each entry but not consulted —
-    // today's intra-body waits are single-signal, so a waiter is in just one queue.)
-    void service_dynamic_queue(Signal sig, llvm::Value* pos, llvm::Value* neg, llvm::Value* changed) {
+    // Dynamic sub-queue scan (one edge bucket): a straight loop over the live
+    // one-shot waiters for this (signal, edge). The bucket's edge already matched
+    // the transition (the caller guarded the whole scan), so every entry fires.
+    // Each entry wakes its process, but only if it is not already scheduled this
+    // instant (its flag is 0), then sets the flag — collapsing a multi-signal
+    // intra-body wait (the same process registered under several signals firing
+    // together) into a single wake. The whole bucket is consumed, so the length
+    // resets to 0; the firing process deregisters its stale entries from any OTHER
+    // buckets itself on resume (eager removal in lower_wait).
+    void service_dynamic_queue(Signal sig, uint32_t edge) {
         const auto        i      = static_cast<uint32_t>(sig);
-        auto*             q      = wait_dyn_gv_[i];
-        auto*             arr_ty = wait_dyn_ty_[i];
-        auto*             len_gv = wait_dyn_len_gv_[i];
+        auto*             q      = wait_dyn_gv_[i][edge];
+        auto*             arr_ty = wait_dyn_ty_[i][edge];
+        auto*             len_gv = wait_dyn_len_gv_[i][edge];
         llvm::StructType* elem   = wait_elem_ty();
         auto*             ptr_ty = llvm::PointerType::getUnqual(ctx_);
-        auto*             i8     = b_.getInt8Ty();
         auto*             i32    = b_.getInt32Ty();
 
         llvm::Value* n     = b_.CreateLoad(i32, len_gv);
@@ -761,7 +824,6 @@ private:
         auto*        head  = llvm::BasicBlock::Create(ctx_, "dyn.head", fn);
         auto*        body  = llvm::BasicBlock::Create(ctx_, "dyn.body", fn);
         auto*        wake  = llvm::BasicBlock::Create(ctx_, "dyn.wake", fn);
-        auto*        keep  = llvm::BasicBlock::Create(ctx_, "dyn.keep", fn);
         auto*        cont  = llvm::BasicBlock::Create(ctx_, "dyn.cont", fn);
         auto*        done  = llvm::BasicBlock::Create(ctx_, "dyn.done", fn);
         auto*        entry = b_.GetInsertBlock();
@@ -769,43 +831,86 @@ private:
 
         b_.SetInsertPoint(head);
         auto* i_phi = b_.CreatePHI(i32, 2);
-        auto* w_phi = b_.CreatePHI(i32, 2);
         i_phi->addIncoming(b_.getInt32(0), entry);
-        w_phi->addIncoming(b_.getInt32(0), entry);
         b_.CreateCondBr(b_.CreateICmpULT(i_phi, n), body, done);
 
         b_.SetInsertPoint(body);
-        llvm::Value* src  = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), i_phi });
-        llvm::Value* h    = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 0));
-        llvm::Value* e    = b_.CreateLoad(i8, b_.CreateStructGEP(elem, src, 1));
-        llvm::Value* fptr = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 2));
-        b_.CreateCondBr(edge_matches(e, pos, neg, changed), wake, keep);
+        llvm::Value* src     = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), i_phi });
+        llvm::Value* h       = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 0));
+        llvm::Value* fptr    = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 1));
+        llvm::Value* already = b_.CreateICmpNE(b_.CreateLoad(i32, fptr), b_.getInt32(0));
+        b_.CreateCondBr(already, cont, wake);
 
-        // wake: push and remove (drop the slot, w unchanged).
         b_.SetInsertPoint(wake);
         emit_active_push(b_, h);
+        b_.CreateStore(b_.getInt32(1), fptr); // mark scheduled
         b_.CreateBr(cont);
 
-        // keep: compact the survivor down to slot w (a no-op store when w == i).
+        b_.SetInsertPoint(cont);
+        llvm::Value* i_next = b_.CreateAdd(i_phi, b_.getInt32(1));
+        b_.CreateBr(head);
+        i_phi->addIncoming(i_next, cont);
+
+        b_.SetInsertPoint(done);
+        b_.CreateStore(b_.getInt32(0), len_gv);
+    }
+
+    // Compacting removal of this coroutine's entries from one (signal, edge)
+    // dynamic bucket, used on resume from a multi-signal wait: the firing bucket
+    // already cleared us, but the others still hold our now-stale entry. Slides
+    // every entry whose handle != hdl_ down to fill the gaps and trims the length:
+    //   w = 0; for i in 0..len: if Q[i].handle != hdl_ { Q[w++] = Q[i] } ; len = w
+    void emit_dynamic_remove(Signal sig, uint32_t edge) {
+        const auto        i      = static_cast<uint32_t>(sig);
+        auto*             q      = wait_dyn_gv_[i][edge];
+        auto*             arr_ty = wait_dyn_ty_[i][edge];
+        auto*             len_gv = wait_dyn_len_gv_[i][edge];
+        llvm::StructType* elem   = wait_elem_ty();
+        auto*             ptr_ty = llvm::PointerType::getUnqual(ctx_);
+        auto*             i32    = b_.getInt32Ty();
+
+        llvm::Value* n     = b_.CreateLoad(i32, len_gv);
+        auto*        fn    = b_.GetInsertBlock()->getParent();
+        auto*        head  = llvm::BasicBlock::Create(ctx_, "rm.head", fn);
+        auto*        body  = llvm::BasicBlock::Create(ctx_, "rm.body", fn);
+        auto*        keep  = llvm::BasicBlock::Create(ctx_, "rm.keep", fn);
+        auto*        cont  = llvm::BasicBlock::Create(ctx_, "rm.cont", fn);
+        auto*        done  = llvm::BasicBlock::Create(ctx_, "rm.done", fn);
+        auto*        entry = b_.GetInsertBlock();
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(head);
+        auto* idx = b_.CreatePHI(i32, 2);
+        auto* w   = b_.CreatePHI(i32, 2);
+        idx->addIncoming(b_.getInt32(0), entry);
+        w->addIncoming(b_.getInt32(0), entry);
+        b_.CreateCondBr(b_.CreateICmpULT(idx, n), body, done);
+
+        b_.SetInsertPoint(body);
+        llvm::Value* src  = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), idx });
+        llvm::Value* h    = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 0));
+        llvm::Value* f    = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 1));
+        llvm::Value* mine = b_.CreateICmpEQ(h, hdl_);
+        b_.CreateCondBr(mine, cont, keep); // ours -> drop; else -> keep
+
         b_.SetInsertPoint(keep);
-        llvm::Value* dst = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), w_phi });
+        llvm::Value* dst = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), w });
         b_.CreateStore(h, b_.CreateStructGEP(elem, dst, 0));
-        b_.CreateStore(e, b_.CreateStructGEP(elem, dst, 1));
-        b_.CreateStore(fptr, b_.CreateStructGEP(elem, dst, 2));
-        llvm::Value* w_inc = b_.CreateAdd(w_phi, b_.getInt32(1));
+        b_.CreateStore(f, b_.CreateStructGEP(elem, dst, 1));
+        llvm::Value* w_keep = b_.CreateAdd(w, b_.getInt32(1));
         b_.CreateBr(cont);
 
         b_.SetInsertPoint(cont);
         auto* w_next = b_.CreatePHI(i32, 2);
-        w_next->addIncoming(w_phi, wake);
-        w_next->addIncoming(w_inc, keep);
-        llvm::Value* i_next = b_.CreateAdd(i_phi, b_.getInt32(1));
+        w_next->addIncoming(w, body);
+        w_next->addIncoming(w_keep, keep);
+        llvm::Value* idx_next = b_.CreateAdd(idx, b_.getInt32(1));
         b_.CreateBr(head);
-        i_phi->addIncoming(i_next, cont);
-        w_phi->addIncoming(w_next, cont);
+        idx->addIncoming(idx_next, cont);
+        w->addIncoming(w_next, cont);
 
         b_.SetInsertPoint(done);
-        b_.CreateStore(w_phi, len_gv);
+        b_.CreateStore(w, len_gv);
     }
 
     // The active task queue: ready-to-run coroutine handles held in a fixed-size
@@ -1264,7 +1369,7 @@ private:
                 return;
 
             case Inst::Tag::Wait:
-                lower_wait(p.wait.signal, p.wait.edge);
+                lower_wait(p.wait);
                 return;
 
             case Inst::Tag::Display:
@@ -1864,20 +1969,23 @@ private:
     llvm::GlobalVariable*               queue_gv_     = nullptr;
     llvm::GlobalVariable*               top_gv_       = nullptr;
     llvm::ArrayType*                    queue_arr_ty_ = nullptr;
-    // Per-signal wait queues, indexed by Signal handle; null where the signal has
-    // no waiter of that kind. Static (.sta): fixed-capacity persistent
-    // subscriptions, `wait_sta_cap_` the compile-time trip count, no length.
-    // Dynamic (.dyn): one-shot waiters with `wait_dyn_len_gv_` live count. Built in
-    // build_wait_queues; serviced by service_static_queue / service_dynamic_queue.
-    std::vector<llvm::GlobalVariable*>  wait_sta_gv_;
-    std::vector<llvm::ArrayType*>       wait_sta_ty_;
-    std::vector<uint32_t>               wait_sta_cap_;
-    std::vector<llvm::GlobalVariable*>  wait_dyn_gv_;
-    std::vector<llvm::ArrayType*>       wait_dyn_ty_;
-    std::vector<llvm::GlobalVariable*>  wait_dyn_len_gv_;
-    // Next free static slot per signal, handed out during lowering (parallels the
-    // capacities computed in build_wait_queues).
-    std::vector<uint32_t>               sta_next_;
+    // Per-signal wait queues, indexed by Signal handle and then by edge bucket
+    // (`[signal][static_cast<uint32_t>(edge)]`: 0=pos, 1=neg, 2=any); null where the
+    // signal has no waiter of that (kind, edge). Splitting by edge hoists the
+    // edge check out of the scan into one branch per bucket. Static (.sta):
+    // fixed-capacity persistent subscriptions, `wait_sta_cap_` the compile-time
+    // trip count, no length. Dynamic (.dyn): one-shot waiters with `wait_dyn_len_gv_`
+    // live count. Built in build_wait_queues; serviced by service_static_queue /
+    // service_dynamic_queue.
+    std::vector<std::array<llvm::GlobalVariable*, 3>>  wait_sta_gv_;
+    std::vector<std::array<llvm::ArrayType*, 3>>       wait_sta_ty_;
+    std::vector<std::array<uint32_t, 3>>               wait_sta_cap_;
+    std::vector<std::array<llvm::GlobalVariable*, 3>>  wait_dyn_gv_;
+    std::vector<std::array<llvm::ArrayType*, 3>>       wait_dyn_ty_;
+    std::vector<std::array<llvm::GlobalVariable*, 3>>  wait_dyn_len_gv_;
+    // Next free static slot per (signal, edge), handed out during lowering
+    // (parallels the capacities computed in build_wait_queues).
+    std::vector<std::array<uint32_t, 3>>               sta_next_;
     // Per-process scheduled flags (clotho.proc_sched), built once in run().
     llvm::GlobalVariable*               sched_gv_     = nullptr;
     llvm::ArrayType*                    sched_arr_ty_ = nullptr;

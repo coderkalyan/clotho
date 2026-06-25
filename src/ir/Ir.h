@@ -115,12 +115,31 @@ struct DisplayInfo {
     ExtraSlice args;
 };
 
+// Extra payload for `wait`: one (signal, edge) event of an intra-body event
+// control. A `@(a or posedge b)` wait carries several of these in a row.
+struct WaitEdge {
+    // Signal whose change can wake the process.
+    Signal signal;
+    // Edge to wait for (ir::Edge value).
+    uint32_t edge;
+};
+
+// Extra payload for `wait`: the list of events the process suspends on. The
+// process wakes when ANY listed (signal, edge) fires. `events` is a run of
+// packed WaitEdge records (each two words wide) in the extra buffer.
+struct WaitInfo {
+    // The (signal, edge) events, as back-to-back WaitEdge records.
+    ExtraSlice events;
+};
+
 static_assert(ExtraPayload<ExtraSlice>);
 static_assert(ExtraPayload<Mux>);
 static_assert(ExtraPayload<PartSelect>);
 static_assert(ExtraPayload<Regions>);
 static_assert(ExtraPayload<LoopInfo>);
 static_assert(ExtraPayload<DisplayInfo>);
+static_assert(ExtraPayload<WaitEdge>);
+static_assert(ExtraPayload<WaitInfo>);
 
 struct Inst {
     enum class Tag : uint8_t {
@@ -222,10 +241,10 @@ struct Inst {
         // tick count). Lowers to a timer scheduled on the wheel plus a coroutine
         // suspend; the wheel resumes the process when the delay elapses.
         Delay,
-        // Event wait `@(edge signal)`: suspend until the signal undergoes the edge
-        // (payload: wait). Lowers to registering the process on the signal's wait
-        // queue plus a coroutine suspend; a matching blocking assignment to the
-        // signal wakes it. Carries a single signal event today.
+        // Event wait `@(edge signal)` / `@(a or posedge b)`: suspend until ANY
+        // listed (signal, edge) fires (payload: wait -> WaitInfo). Lowers to
+        // registering the process on each event's wait queue plus a coroutine
+        // suspend; a matching blocking assignment to one of the signals wakes it.
         Wait,
 
         // -- System tasks --
@@ -297,14 +316,10 @@ struct Inst {
         ExtraIndex extra;
         // Handle to a DisplayInfo extra record (display).
         ExtraIndex display;
-        // Signal event to suspend on (wait): the signal and its edge (an ir::Edge
-        // stored as u32). No SSA operands.
-        struct {
-            // Signal whose change wakes the process.
-            Signal signal;
-            // Edge to wait for (ir::Edge value).
-            uint32_t edge;
-        } wait;
+        // Handle to a WaitInfo extra record (wait): the list of (signal, edge)
+        // events to suspend on. The process wakes when ANY of them fires. No SSA
+        // operands.
+        ExtraIndex wait;
     };
 
     // Discriminant selecting the active payload member.
@@ -378,6 +393,22 @@ public:
         }
 
         return s;
+    }
+
+    // Decode the (signal, edge) events of a `wait` instruction's WaitInfo. The
+    // events are packed WaitEdge records (each two words wide) in the extra
+    // buffer; this returns them in order.
+    std::vector<WaitEdge> wait_edges(ExtraIndex info) const {
+        const WaitInfo        wi    = extra_data<WaitInfo>(info);
+        const auto            start = static_cast<uint32_t>(wi.events.start);
+        const auto            end   = static_cast<uint32_t>(wi.events.end);
+        constexpr uint32_t    stride = sizeof(WaitEdge) / sizeof(uint32_t);
+        std::vector<WaitEdge> out;
+        for (uint32_t w = start; w < end; w += stride) {
+            out.push_back(extra_data<WaitEdge>(static_cast<ExtraIndex>(w)));
+        }
+
+        return out;
     }
 
     // Fill `scratch` with the SSA operands of an instruction and return a view

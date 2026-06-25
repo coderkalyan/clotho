@@ -83,8 +83,19 @@ Index Builder::loop(ExtraSlice cond_region, Index pred, ExtraSlice body_region, 
     return emit({ Inst::Tag::Loop, Inst::Payload{ .extra = extra } }, loc);
 }
 
-Index Builder::wait(Signal sig, uint32_t edge, SourceLoc loc) {
-    return emit({ Inst::Tag::Wait, Inst::Payload{ .wait = { sig, edge } } }, loc);
+Index Builder::wait(std::span<const WaitEdge> events, SourceLoc loc) {
+    // Pack the WaitEdge records back-to-back, then a WaitInfo pointing at the run.
+    const auto start = static_cast<uint32_t>(extra_.size());
+    for (const WaitEdge& e : events) {
+        constexpr size_t n     = sizeof(WaitEdge) / sizeof(uint32_t);
+        const auto       words = std::bit_cast<std::array<uint32_t, n>>(e);
+        extra_.insert(extra_.end(), words.begin(), words.end());
+    }
+    const auto       end  = static_cast<uint32_t>(extra_.size());
+    const ExtraIndex info = add_extra(
+      WaitInfo{ ExtraSlice{ static_cast<ExtraIndex>(start), static_cast<ExtraIndex>(end) } });
+
+    return emit({ Inst::Tag::Wait, Inst::Payload{ .wait = info } }, loc);
 }
 
 Index Builder::display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc) {

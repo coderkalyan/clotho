@@ -224,10 +224,16 @@ private:
                 os_ << "s" << static_cast<uint32_t>(p.signal);
                 break;
             case Inst::PayloadKind::Wait: {
-                const char* edge = p.wait.edge == static_cast<uint32_t>(Edge::Positive)   ? "posedge "
-                                   : p.wait.edge == static_cast<uint32_t>(Edge::Negative) ? "negedge "
-                                                                                          : "";
-                os_ << "@" << edge << "s" << static_cast<uint32_t>(p.wait.signal);
+                const auto events = ir_.wait_edges(p.wait);
+                for (size_t k = 0; k < events.size(); ++k) {
+                    if (k != 0) {
+                        os_ << " or ";
+                    }
+                    const char* edge = events[k].edge == static_cast<uint32_t>(Edge::Positive)   ? "posedge "
+                                       : events[k].edge == static_cast<uint32_t>(Edge::Negative) ? "negedge "
+                                                                                                 : "";
+                    os_ << "@" << edge << "s" << static_cast<uint32_t>(events[k].signal);
+                }
                 break;
             }
             case Inst::PayloadKind::Unary:

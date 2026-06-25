@@ -53,9 +53,10 @@ public:
     Index loop(ExtraSlice cond_region, Index pred, ExtraSlice body_region, ExtraSlice step_region, SourceLoc loc);
 
     // -- Timing --
-    // Event wait `@(edge sig)`: suspend until `sig` undergoes `edge` (an ir::Edge
-    // value passed as u32 to keep the builder free of the Module-level enum).
-    Index wait(Signal sig, uint32_t edge, SourceLoc loc);
+    // Event wait `@(a or posedge b ...)`: suspend until ANY listed (signal, edge)
+    // fires. Each WaitEdge carries an ir::Edge value as u32, keeping the builder
+    // free of the Module-level enum. The list must be non-empty.
+    Index wait(std::span<const WaitEdge> events, SourceLoc loc);
 
     // -- System tasks --
     // $display / $write: a literal format string, a newline flag (true for
