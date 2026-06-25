@@ -195,13 +195,17 @@ TEST_CASE("event waits emit wait queues, always loops, and queue servicing") {
     )";
     const std::string          ir  = emit(src);
 
-    // Per-signal wait queues + the per-process scheduled-flag array exist.
-    CHECK(ir.find("@clotho.wait.clk = internal global") != std::string::npos);
-    CHECK(ir.find("@clotho.wait.doubled = internal global") != std::string::npos);
+    // Split wait queues: clk (always sensitivity) is static, doubled (intra-body
+    // @) is dynamic; the per-process scheduled-flag array exists. A static-only
+    // signal carries no length global.
+    CHECK(ir.find("@clotho.wait.clk.sta = internal global") != std::string::npos);
+    CHECK(ir.find("@clotho.wait.clk.sta.len") == std::string::npos);
+    CHECK(ir.find("@clotho.wait.doubled.dyn = internal global") != std::string::npos);
+    CHECK(ir.find("@clotho.wait.doubled.dyn.len = internal global") != std::string::npos);
     CHECK(ir.find("@clotho.proc_sched = internal global") != std::string::npos);
-    // The always blocks lower to a persistent subscribe + forever wait loop, and
-    // the blocking stores emit the queue-servicing scan.
+    // The always blocks lower to a forever wait loop; servicing has both a static
+    // (fixed-trip) and a dynamic (compacting) scan.
     CHECK(ir.find("always.loop") != std::string::npos);
-    CHECK(ir.find("wait.head") != std::string::npos);
-    CHECK(ir.find("wait.persist") != std::string::npos);
+    CHECK(ir.find("sta.head") != std::string::npos);
+    CHECK(ir.find("dyn.head") != std::string::npos);
 }
