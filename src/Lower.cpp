@@ -348,10 +348,25 @@ private:
 
         ir::Builder b(module_.pool);
         lower_assign(e.as<AssignmentExpression>(), b);
-        // TODO: a continuous assign re-evaluates on any change of its RHS signals;
-        // that sensitivity is not yet inferred, so the wait list is left empty.
-        module_.add_process(
-          ir::Process{ .activation = ir::Activation::Always, .loc = to_source_loc(sym.location), .ir = b.finish() });
+
+        // A continuous assign is a process sensitive to the source elements of
+        // its expression (LRM 4.9.1): every signal the RHS reads, plus any read
+        // in an LHS selector (`assign mem[i] = x` is sensitive to i). Unlike an
+        // always_comb, the written net is NOT subtracted: a net that is both
+        // driven and read is real combinational feedback (`assign y = a & y`)
+        // and must stay sensitive. An empty list (constant RHS) yields a
+        // run-once process, which is the required time-zero evaluation.
+        std::vector<ir::WaitEvent> wait_events;
+        SensitivityCollector       c(sigmap_);
+        e.visit(c);
+        for (const ir::Signal s : c.reads) {
+            wait_events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
+        }
+
+        module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
+                                         .wait_events = std::move(wait_events),
+                                         .loc         = to_source_loc(sym.location),
+                                         .ir          = b.finish() });
     }
 
     void lower_procedural_block(const ProceduralBlockSymbol& sym) {

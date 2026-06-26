@@ -279,3 +279,47 @@ TEST_CASE("an index expression on the write target is a read") {
     // i (LHS index) and d (RHS) are reads; y is only ever written.
     CHECK(sensitivity_names(*r.module, *p) == std::set<std::string>{ "d", "i" });
 }
+
+// -- Continuous-assign sensitivity (LRM 4.9.1) --
+
+TEST_CASE("a continuous assign infers sensitivity from its RHS reads") {
+    const LowerResult r = lower_text(R"(
+        module m(input a, input b, input sel, output y);
+            assign y = sel ? a : b;
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    const ir::Process* p = find_level_process(*r.module);
+    REQUIRE(p != nullptr);
+    CHECK(sensitivity_names(*r.module, *p) == std::set<std::string>{ "a", "b", "sel" });
+}
+
+TEST_CASE("a continuous assign with combinational feedback stays sensitive to the driven net") {
+    const LowerResult r = lower_text(R"(
+        module m(input a, output y);
+            assign y = a & y;
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    const ir::Process* p = find_level_process(*r.module);
+    REQUIRE(p != nullptr);
+    // The driven net y is read on the RHS, so unlike always_comb it is NOT
+    // subtracted: real feedback must re-trigger the assign.
+    CHECK(sensitivity_names(*r.module, *p) == std::set<std::string>{ "a", "y" });
+}
+
+TEST_CASE("a continuous assign with a constant RHS has an empty wait list") {
+    const LowerResult r = lower_text(R"(
+        module m(output [3:0] y);
+            assign y = 4'b0;
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    const ir::Process* p = find_level_process(*r.module);
+    REQUIRE(p != nullptr);
+    // No source elements: the process runs once at time zero and never re-triggers.
+    CHECK(p->wait_events.empty());
+}
