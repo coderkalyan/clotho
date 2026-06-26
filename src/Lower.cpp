@@ -78,7 +78,7 @@ ir::SignalInfo::Direction direction_of(slang::ast::ArgumentDirection d) {
 // The AST is walked rather than the lowered IR so reads are seen at the source
 // level, before any temporaries the IR introduces. Symbols not in `sigmap`
 // (parameters, genvars, other constants) carry no sensitivity and are skipped.
-struct SensitivityCollector : ASTVisitor<SensitivityCollector, /*Statements=*/true, /*Exprs=*/true> {
+struct SensitivityCollector : ASTVisitor<SensitivityCollector, true, true> {
     using SigMap = ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal>;
 
     const SigMap&                          sigmap;
@@ -750,7 +750,7 @@ private:
         // exclusive. Either is lowered in source order so a later init may read
         // an earlier one (12.7.1).
         for (const VariableSymbol* vs : f.loopVars) {
-            lower_var_decl(*vs, b, /*force_frame=*/true);
+            lower_var_decl(*vs, b, true);
         }
         for (const Expression* init : f.initializers) {
             lower_for_step(*init, b);

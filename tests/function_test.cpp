@@ -237,6 +237,34 @@ TEST_CASE("automatic local is fresh each call") {
     CHECK(run_capture(src) == "1 1 1\n");
 }
 
+// Each module instance has its own copy of a static local declared in its
+// subroutine (LRM 6.21 / 13.4.2): both instances count from 1 independently, so
+// the second does NOT continue the first's sequence. slang re-elaborates each
+// instance into distinct symbols, and the static is named under the instance
+// prefix, so the two copies stay separate.
+TEST_CASE("static function local is per module instance") {
+    constexpr std::string_view src = R"(
+        module sub ();
+            function int bump();
+                int c;
+                c = c + 1;
+                return c;
+            endfunction
+            initial begin
+                int x, y;
+                x = bump();
+                y = bump();
+                $display("%0d %0d", x, y);
+            end
+        endmodule
+        module top;
+            sub u0();
+            sub u1();
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 2\n1 2\n");
+}
+
 // A static local with an initializer needs once-at-time-zero initialization,
 // which is not modeled; reject it rather than re-init on every call.
 TEST_CASE("static local with an initializer is rejected") {
