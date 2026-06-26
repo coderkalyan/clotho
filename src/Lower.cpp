@@ -1102,6 +1102,22 @@ private:
             return b.resize(b.sim_time(time_mul_, l), lower_type(*call.type), l);
         }
 
+        // $random (LRM §20.15.1): a 32-bit signed PRNG draw. The plain form
+        // returns the next value of the simulator's global random stream.
+        if (name == "$random") {
+            // TODO: the seeded form `$random(seed)` (LRM §20.15.1) threads PRNG
+            // state through an inout `seed` integer — it must read the seed
+            // lvalue, advance a per-seed stream, and write the updated state
+            // back. The V2005 reference stream does not map cleanly onto
+            // mt19937's 624-word state, and the IR has no inout-arg writeback
+            // path yet, so the seeded form is rejected rather than silently
+            // ignoring the seed.
+            if (!call.arguments().empty()) {
+                fail("$random with a seed argument is not supported");
+            }
+            return b.random(l);
+        }
+
         // TODO: $realtime (LRM §20.3.3) returns a real scaled to the module time
         // unit; blocked on real (floating-point) value support in the IR.
         if (name == "$realtime") {

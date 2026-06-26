@@ -1583,6 +1583,10 @@ private:
         auto* ptr = llvm::PointerType::getUnqual(ctx_);
         return llmod_.getOrInsertFunction("rt_wheel_now", llvm::FunctionType::get(b_.getInt64Ty(), { ptr }, false));
     }
+    // i32 rt_random(void)
+    llvm::FunctionCallee random_fn() {
+        return llmod_.getOrInsertFunction("rt_random", llvm::FunctionType::get(b_.getInt32Ty(), {}, false));
+    }
     // i32 rt_wheel_pending(const rt_wheel*)
     llvm::FunctionCallee wheel_pending_fn() {
         auto* ptr = llvm::PointerType::getUnqual(ctx_);
@@ -1679,6 +1683,8 @@ private:
                 return type_of(p.unary);
             case Inst::Tag::SimTime:
                 return { 64, false, false };
+            case Inst::Tag::Random:
+                return { 32, false, true };
 
             case Inst::Tag::Add:
             case Inst::Tag::Sub:
@@ -1918,6 +1924,13 @@ private:
                                         b_.getInt64(p.scale));
                 }
                 set_value(i, packed(now, now, zero(64)));
+                return;
+            }
+
+            case Inst::Tag::Random: {
+                // The PRNG draw is always known (no x/z): must == may, z == 0.
+                llvm::Value* draw = b_.CreateCall(random_fn(), {});
+                set_value(i, packed(draw, draw, zero(32)));
                 return;
             }
 

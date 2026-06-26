@@ -397,3 +397,40 @@ TEST_CASE("single-element concat and replication produce correct bits") {
     )");
     CHECK(out == "10 10 10101010 1111\n");
 }
+
+// $random's global stream is a fixed-seed std::mt19937 (Runtime.cpp), so the
+// sequence is fully determined. This is the only test in the suite that draws
+// from it, so it observes the stream from its first value. The expected numbers
+// are mt19937{0x1979} reinterpreted as int32; negatives prove the signed return
+// type, and the distinct values prove it varies.
+TEST_CASE("$random yields the deterministic signed-32 stream") {
+    const std::string out = run_capture(R"(
+        module top;
+            integer i;
+            initial
+                for (i = 0; i < 8; i = i + 1)
+                    $display("%0d", $random);
+        endmodule
+    )");
+    CHECK(out ==
+          "2009080500\n"
+          "-537682317\n"
+          "-1813350883\n"
+          "1054232434\n"
+          "-1699253010\n"
+          "1848886818\n"
+          "1569458764\n"
+          "969765471\n");
+}
+
+TEST_CASE("$random lowers to an rt_random call") {
+    constexpr std::string_view src = R"(
+        module m;
+            integer x;
+            initial x = $random;
+        endmodule
+    )";
+    const std::string          ir  = emit(src);
+
+    CHECK(ir.find("call i32 @rt_random(") != std::string::npos);
+}

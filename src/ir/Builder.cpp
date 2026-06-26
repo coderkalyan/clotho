@@ -117,4 +117,8 @@ Index Builder::sim_time(uint64_t scale, SourceLoc loc) {
     return emit({ Inst::Tag::SimTime, Inst::Payload{ .scale = scale } }, loc);
 }
 
+Index Builder::random(SourceLoc loc) {
+    return emit({ Inst::Tag::Random, Inst::Payload{ .none = 0 } }, loc);
+}
+
 } // namespace clotho::ir

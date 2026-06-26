@@ -132,6 +132,8 @@ const char* tag_name(Inst::Tag tag) {
             return "finish";
         case T::SimTime:
             return "sim_time";
+        case T::Random:
+            return "random";
     }
 
     return "?";

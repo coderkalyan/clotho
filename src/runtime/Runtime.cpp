@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <new>
+#include <random>
 #include <string>
 
 #include "Wheel.h"
@@ -183,6 +184,17 @@ extern "C" void rt_finish(void) {
     // runs atexit handlers and flushes C stdio, so any buffered $display output is
     // committed before the process leaves.
     std::exit(0);
+}
+
+extern "C" int32_t rt_random(void) {
+    // $random's global stream. The seed is a fixed constant so runs reproduce
+    // bit-for-bit; the LRM leaves the stream's contents implementation-defined,
+    // requiring only stability for a given seed. 0x1979 is an arbitrary nonzero
+    // constant. The generator is process-global (one simulator per process).
+    static std::mt19937 gen{ 0x1979u };
+    // A full-range int32 draw: reinterpret the 32-bit unsigned output as signed
+    // so negative values occur, matching $random's signed return type.
+    return static_cast<int32_t>(gen());
 }
 
 extern "C" void* rt_alloc(uint64_t size) {

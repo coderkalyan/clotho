@@ -69,6 +69,8 @@ public:
     // $time / $stime: read the simulation clock. Yields a 64-bit unsigned value
     // rounded down by `scale` to the calling module's time unit (1 == unitless).
     Index sim_time(uint64_t scale, SourceLoc loc);
+    // $random: a 32-bit signed PRNG draw. No operands.
+    Index random(SourceLoc loc);
 
     // -- Regions --
     // Begin a nested region; subsequent emits accumulate into it until closed.

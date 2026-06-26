@@ -210,6 +210,21 @@ TEST_CASE("timeunit / timeprecision declarations lower") {
     CHECK(r.ok);
 }
 
+TEST_CASE("$random with a seed argument is reported as unsupported") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            integer seed;
+            integer x;
+            initial begin
+                seed = 1;
+                x = $random(seed);
+            end
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("$random with a seed argument") != std::string::npos);
+}
+
 TEST_CASE("$realtime is reported as unsupported") {
     const LowerResult r = lower_text(R"(
         module m;
