@@ -68,12 +68,12 @@ TEST_CASE("alu emits verifiable llvm ir") {
     CHECK(ir.find("alloca [") != std::string::npos);
     CHECK(ir.find("%alu.state") == std::string::npos);
 
-    // One coroutine per process, named @<module>.<source byte offset>: two
-    // combinational assigns + one sequential always block. Each is a switched-
-    // resume coroutine ramp returning the handle and taking the bare state ptr plus
-    // the timing-wheel ptr. (CoroSplit also emits .resume/.destroy/.cleanup parts,
-    // which don't match this "define ptr @alu." prefix.)
-    CHECK(count_substr(ir, "define ptr @alu.") == 3);
+    // One coroutine per process, named @<module>.p<index>: two combinational
+    // assigns + one sequential always block. Each is a switched-resume coroutine
+    // ramp returning the handle and taking the bare state ptr plus the timing-wheel
+    // ptr. (CoroSplit also emits .resume/.destroy/.cleanup parts, which don't match
+    // this "define ptr @alu.p" prefix.)
+    CHECK(count_substr(ir, "define ptr @alu.p") == 3);
     CHECK(ir.find("(ptr %state, ptr %wheel)") != std::string::npos);
 
     // Datapath ops present.
@@ -247,4 +247,25 @@ TEST_CASE("$finish with a diagnostic-level argument lowers (argument ignored)") 
     const std::string          ir  = emit(src);
 
     CHECK(ir.find("call void @rt_finish()") != std::string::npos);
+}
+
+TEST_CASE("repeated instantiation emits distinct process symbols") {
+    // Two instances of one module share AST source locations; the backend must
+    // name their processes uniquely (by index) or LLVM would reject duplicate
+    // symbol definitions. emit() REQUIREs a well-formed module.
+    constexpr std::string_view src = R"(
+        module counter(input clk, output reg [3:0] cnt);
+            always @(posedge clk) cnt <= cnt + 4'd1;
+        endmodule
+        module top(input clk, output [3:0] a, output [3:0] b);
+            counter u0(.clk(clk), .cnt(a));
+            counter u1(.clk(clk), .cnt(b));
+        endmodule
+    )";
+    const std::string          ir  = emit(src);
+
+    // Per instance: 1 always block + 1 input-port copy (clk) + 1 output-port copy
+    // (cnt) = 3 ramps; 2 instances + 0 top processes = 6 distinct @top.p<N>
+    // coroutine ramps.
+    CHECK(count_substr(ir, "define ptr @top.p") == 6);
 }

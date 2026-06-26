@@ -337,12 +337,11 @@ private:
         sched_ptr_ = llvm::ConstantExpr::getInBoundsGetElementPtr(
           sched_arr_ty_, sched_gv_, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(proc_index) });
 
-        // Name a process by the source byte offset of the AST node that produced
-        // it: @<module>.<offset>. The IR's SourceLoc packs {buffer:28|offset:36};
-        // the low 36 bits are that byte offset.
-        constexpr uint64_t offset_mask = (uint64_t{ 1 } << 36) - 1;
-        const uint64_t     offset      = static_cast<uint64_t>(proc.loc) & offset_mask;
-        const std::string  name        = mod_.name + "." + std::to_string(offset);
+        // Name a process by its index: @<module>.p<index>. Source-offset naming
+        // would collide once the design has multiple instances of one module —
+        // their processes share the same AST source location. The index is unique
+        // across the flattened module; proc.loc still carries the source mapping.
+        const std::string name = mod_.name + ".p" + std::to_string(proc_index);
 
         // A process lowers to a switched-resume LLVM coroutine:
         // `ptr @<module>.<offset>(ptr noalias state, ptr wheel)`. The ramp runs the

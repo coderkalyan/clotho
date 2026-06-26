@@ -181,16 +181,49 @@ public:
     explicit Lowerer(ir::Module& module)
       : module_(module) {}
 
-    void lower_instance(const InstanceSymbol& top) {
-        module_.name                   = std::string(top.name);
-        const InstanceBodySymbol& body = top.body;
+    // Flatten one elaborated instance into the module: register its signals under
+    // `prefix`, lower its processes, then recurse into child instances and wire
+    // their ports. `prefix` is empty for the top instance and "<inst>." per level
+    // below it. Each instance has its own slang body with distinct ValueSymbols,
+    // so sigmap_ (keyed by symbol) disambiguates repeated instantiations for free.
+    void lower_instance(const InstanceSymbol& inst, std::string_view prefix) {
+        if (prefix.empty()) {
+            module_.name = std::string(inst.name);
+        }
+        const std::string         self_prefix(prefix);
+        const InstanceBodySymbol& body = inst.body;
+        prefix_                        = self_prefix;
         collect_signals(body);
 
+        // prefix_ holds self_prefix on entry to each iteration: it is set above and
+        // restored after the Instance case (the only one that descends and changes
+        // it), so signal-creating process lowering always sees this level's prefix.
         for (const Symbol& m : body.members()) {
-            if (m.kind == SymbolKind::ContinuousAssign) {
-                lower_continuous_assign(m.as<ContinuousAssignSymbol>());
-            } else if (m.kind == SymbolKind::ProceduralBlock) {
-                lower_procedural_block(m.as<ProceduralBlockSymbol>());
+            switch (m.kind) {
+                case SymbolKind::ContinuousAssign:
+                    lower_continuous_assign(m.as<ContinuousAssignSymbol>());
+                    break;
+                case SymbolKind::ProceduralBlock:
+                    lower_procedural_block(m.as<ProceduralBlockSymbol>());
+                    break;
+                case SymbolKind::Instance: {
+                    const InstanceSymbol& child = m.as<InstanceSymbol>();
+                    // Recurse first (collects child signals), then wire ports: a
+                    // connection's parent-side expression resolves against signals
+                    // already registered in this (parent) body. Recursion leaves
+                    // prefix_ at the child level, so restore it before wiring.
+                    lower_instance(child, self_prefix + std::string(child.name) + ".");
+                    prefix_ = self_prefix;
+                    wire_ports(child);
+                    break;
+                }
+                case SymbolKind::InstanceArray:
+                    // TODO: instance arrays (foo u[N](...)) — needs per-element
+                    // elaboration and bit-sliced port connections.
+                    fail("instance arrays are not supported");
+                    break;
+                default:
+                    break;
             }
         }
     }
@@ -290,7 +323,7 @@ private:
             const ValueSymbol& vs = m.as<ValueSymbol>();
 
             ir::SignalInfo info;
-            info.name        = std::string(vs.name);
+            info.name        = prefix_ + std::string(vs.name);
             info.type        = lower_type(vs.getType());
             const auto found = port_dir.find(&m);
             info.dir         = found != port_dir.end() ? found->second : ir::SignalInfo::Direction::Internal;
@@ -323,7 +356,7 @@ private:
         }
 
         ir::SignalInfo info;
-        info.name = std::string(vs.name);
+        info.name = prefix_ + std::string(vs.name);
         info.type = lower_type(vs.getType());
         info.dir  = ir::SignalInfo::Direction::Internal;
 
@@ -352,6 +385,80 @@ private:
         // that sensitivity is not yet inferred, so the wait list is left empty.
         module_.add_process(
           ir::Process{ .activation = ir::Activation::Always, .loc = to_source_loc(sym.location), .ir = b.finish() });
+    }
+
+    // Wire one child instance's ports to the parent. Each connection becomes a
+    // copy process across the boundary, carrying inferred sensitivity so the value
+    // propagates on change (it must not inherit the empty-wait-list gap of plain
+    // continuous assigns). Both sides' signals are already registered: the child's
+    // by the just-completed recursion, the parent's by this body's collect_signals.
+    //
+    // slang models a connection asymmetrically: an output yields a full
+    // AssignmentExpression (sink = source, with width conversions baked in), while
+    // an input yields the bare source rvalue to drive the child net with.
+    void wire_ports(const InstanceSymbol& child) {
+        for (const PortConnection* pc : child.getPortConnections()) {
+            if (pc->port.kind != SymbolKind::Port) {
+                // TODO: interface / modport ports — need virtual-interface plumbing.
+                fail("interface/modport port connections are not supported");
+            }
+            const PortSymbol& p = pc->port.as<PortSymbol>();
+            if (p.direction == slang::ast::ArgumentDirection::InOut ||
+                p.direction == slang::ast::ArgumentDirection::Ref) {
+                // TODO: inout / ref ports — bidirectional, needs net resolution
+                // (or net-collapsing) rather than a one-way copy.
+                fail("inout/ref port connections are not supported");
+            }
+            if (p.internalSymbol == nullptr) {
+                // TODO: a port with no internal net (e.g. an unnamed expression
+                // port) — has no signal storage to copy to/from.
+                fail("port without an internal net is not supported");
+            }
+            const Expression* expr = pc->getExpression();
+            if (expr == nullptr) {
+                // TODO: unconnected port — should default to its initializer / z.
+                fail("unconnected module port is not supported");
+            }
+
+            const ir::Signal           child_sig = signal_of(p.internalSymbol->as<ValueSymbol>());
+            const ir::SourceLoc        l         = to_source_loc(p.location);
+            ir::Builder                b(module_.pool);
+            std::vector<ir::WaitEvent> sens;
+            if (expr->kind == ExpressionKind::Assignment) {
+                // Output: parent_target = child_net. slang gives an assignment whose
+                // LHS is the parent target and whose RHS is an EmptyArgument
+                // placeholder for the port value, so read the child net directly and
+                // resize it to the target width. Wakes on the child net.
+                const AssignmentExpression& a   = expr->as<AssignmentExpression>();
+                const ir::Ref               ty  = lower_type(*a.left().type);
+                const ir::Index             val = b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l);
+                b.binary(ir::Inst::Tag::Store, lower_lvalue(a.left(), b), b.resize(val, ty, l), l);
+                sens.push_back(ir::WaitEvent{ .signal = child_sig, .edge = ir::Edge::Any });
+            } else {
+                // Input: drive the child net from the source rvalue, resized to the
+                // port width; wakes on the source's reads.
+                const ir::Ref ty = lower_type(p.internalSymbol->as<ValueSymbol>().getType());
+                b.binary(ir::Inst::Tag::Store, b.signal(child_sig, l), b.resize(lower_expr(*expr, b), ty, l), l);
+                collect_expr_reads(*expr, sens);
+            }
+            module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
+                                             .wait_events = std::move(sens),
+                                             .loc         = l,
+                                             .ir          = b.finish() });
+        }
+    }
+
+    // Append the sensitivity of an rvalue expression (each signal it reads, as an
+    // any-change wait) to `out`. Mirrors collect_inferred_sensitivity for an
+    // expression with no writes.
+    void collect_expr_reads(const Expression& expr, std::vector<ir::WaitEvent>& out) {
+        SensitivityCollector c(sigmap_);
+        expr.visit(c);
+        for (const ir::Signal s : c.reads) {
+            if (!c.written.contains(static_cast<uint32_t>(s))) {
+                out.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
+            }
+        }
     }
 
     void lower_procedural_block(const ProceduralBlockSymbol& sym) {
@@ -919,7 +1026,7 @@ private:
                 return b.resize(lower_expr(cv.operand(), b), lower_type(*expr.type), l);
             }
             default:
-                fail("unsupported expression");
+                fail("unsupported expression kind=" + std::string(slang::ast::toString(expr.kind)));
         }
     }
 
@@ -1029,7 +1136,7 @@ private:
                 return b.part_select(base, msb, lsb, l);
             }
             default:
-                fail("unsupported assignment target");
+                fail("unsupported assignment target kind=" + std::string(slang::ast::toString(expr.kind)));
         }
     }
 
@@ -1048,6 +1155,10 @@ private:
     ir::Module& module_;
     // Maps an elaborated value symbol to its module Signal handle.
     ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal> sigmap_;
+    // Hierarchical name prefix of the instance currently being lowered (e.g.
+    // "u_alu.u_sub."); empty for the top. Prepended to every signal name created
+    // while this instance's body is processed so flattened signals stay unique.
+    std::string prefix_;
 };
 
 LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
@@ -1084,12 +1195,18 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
         result.diagnostics += "error: no top-level module found\n";
         return result;
     }
+    if (root.topInstances.size() > 1) {
+        // TODO: multiple roots — elaborate each into the one flat module (their
+        // signals share the state buffer but never connect).
+        result.diagnostics += "error: multiple top-level modules are not supported\n";
+        return result;
+    }
 
     // Analysis: walk the elaborated AST into clotho IR.
     const auto t_an   = std::chrono::steady_clock::now();
     auto       module = std::make_unique<ir::Module>();
     try {
-        Lowerer(*module).lower_instance(*root.topInstances[0]);
+        Lowerer(*module).lower_instance(*root.topInstances[0], "");
     } catch (const LowerError& e) {
         result.diagnostics += "error: " + e.message + "\n";
         return result;

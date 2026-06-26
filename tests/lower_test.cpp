@@ -279,3 +279,129 @@ TEST_CASE("an index expression on the write target is a read") {
     // i (LHS index) and d (RHS) are reads; y is only ever written.
     CHECK(sensitivity_names(*r.module, *p) == std::set<std::string>{ "d", "i" });
 }
+
+// ---- Module instantiation / hierarchy ----
+
+namespace {
+
+// All signal names declared across the flattened module.
+std::set<std::string> signal_names(const ir::Module& m) {
+    std::set<std::string> names;
+    for (const ir::SignalInfo& s : m.signals()) {
+        names.insert(s.name);
+    }
+    return names;
+}
+
+// Two-level hierarchy: an inverter child wired into a top via one input and one
+// output port.
+constexpr std::string_view kHier = R"(
+    module inv(input a, output y);
+        assign y = ~a;
+    endmodule
+    module top(input g, output o);
+        wire w;
+        inv u_inv(.a(g), .y(w));
+        assign o = w;
+    endmodule
+)";
+
+} // namespace
+
+TEST_CASE("instantiation flattens the child under a hierarchical prefix") {
+    const LowerResult r = lower_text(kHier);
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    const ir::Module& m = *r.module;
+    CHECK(m.name == "top");
+    // Top signals are unprefixed; the child's are under "u_inv.".
+    CHECK(signal_names(m) == std::set<std::string>{ "g", "o", "w", "u_inv.a", "u_inv.y" });
+    // top assign (o=w) + child assign (y=~a) + 2 port-copy processes (.a in, .y out).
+    CHECK(m.processes().size() == 4);
+}
+
+TEST_CASE("an input port connection copies into the child with the expression's sensitivity") {
+    const LowerResult r = lower_text(R"(
+        module add1(input [7:0] a, output [7:0] y);
+            assign y = a + 8'd1;
+        endmodule
+        module top(input [7:0] x, input [7:0] z, output [7:0] o);
+            wire [7:0] w;
+            add1 u(.a(x + z), .y(w));
+            assign o = w;
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    // The copy driving u.a re-evaluates on x and z (the connection expression's reads).
+    const ir::Process* copy = find_process(*r.module, [&](const ir::Process& p) {
+        return sensitivity_names(*r.module, p) == std::set<std::string>{ "x", "z" };
+    });
+    CHECK(copy != nullptr);
+}
+
+TEST_CASE("the same module instantiated twice gets distinct signal storage") {
+    const LowerResult r = lower_text(R"(
+        module inv(input a, output y);
+            assign y = ~a;
+        endmodule
+        module top(input g, output [1:0] o);
+            inv u0(.a(g), .y(o[0]));
+            inv u1(.a(g), .y(o[1]));
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    const std::set<std::string> names = signal_names(*r.module);
+    CHECK(names.contains("u0.a"));
+    CHECK(names.contains("u0.y"));
+    CHECK(names.contains("u1.a"));
+    CHECK(names.contains("u1.y"));
+}
+
+TEST_CASE("an inout port connection fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module pass(inout a);
+        endmodule
+        module top(inout b);
+            pass u(.a(b));
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("inout") != std::string::npos);
+}
+
+TEST_CASE("an instance array fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module inv(input a, output y);
+            assign y = ~a;
+        endmodule
+        module top(input [3:0] g, output [3:0] o);
+            inv u[3:0](.a(g), .y(o));
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("instance array") != std::string::npos);
+}
+
+TEST_CASE("nested instances chain their hierarchical prefixes") {
+    const LowerResult r = lower_text(R"(
+        module leaf(input a, output y);
+            assign y = ~a;
+        endmodule
+        module mid(input mi, output mo);
+            leaf u_leaf(.a(mi), .y(mo));
+        endmodule
+        module top(input g, output o);
+            mid u_mid(.mi(g), .mo(o));
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    const std::set<std::string> names = signal_names(*r.module);
+    // The grandchild's nets carry the full path through both instance levels.
+    CHECK(names.contains("u_mid.u_leaf.a"));
+    CHECK(names.contains("u_mid.u_leaf.y"));
+    CHECK(names.contains("u_mid.mi"));
+    CHECK(names.contains("u_mid.mo"));
+}
