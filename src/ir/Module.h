@@ -11,6 +11,7 @@
 // typically held behind a unique_ptr by the front-end.
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -87,6 +88,26 @@ struct Process {
     Ir ir;
 };
 
+// A lowered SystemVerilog function: a real callable, not inlined. Its body is an
+// Ir whose leaves are Arg (parameters), Local (frame storage), and Signal (module
+// signals it references); it ends every path in a Ret. The backend emits one LLVM
+// function per Function, called at each `call` site, so recursion and `automatic`
+// lifetime fall out of normal stack frames.
+struct Function {
+    // Function name (for the emitted symbol and diagnostics).
+    std::string name;
+    // Return type; `pool.void_type` for a void function (no return value).
+    Ref return_type = Ref::Invalid;
+    // Parameter types, in declaration order (inputs only for now). The frontend
+    // resizes each call argument to the matching type.
+    std::vector<Ref> param_types;
+    // Storage type of every frame local, indexed by the Local handle's index:
+    // the parameter copies, the return variable, and body-local declarations.
+    std::vector<Ref> local_types;
+    // The lowered body.
+    Ir ir;
+};
+
 class Module {
 public:
     // Shared intern pool backing every process's constant / type handles. Owned
@@ -111,6 +132,29 @@ public:
         return static_cast<ProcessId>(index);
     }
 
+    // Reserve a function slot and return its id before the body is built, so a
+    // recursive call can resolve the id while the body is still being lowered. The
+    // slot must be filled with set_function before the module is used.
+    FunctionId reserve_function() {
+        const auto index = static_cast<uint32_t>(functions_.size());
+        functions_.push_back(nullptr);
+
+        return static_cast<FunctionId>(index);
+    }
+
+    // Fill a previously reserved slot with the built function.
+    void set_function(FunctionId id, Function fn) {
+        functions_[static_cast<uint32_t>(id)] = std::make_unique<Function>(std::move(fn));
+    }
+
+    const Function& function(FunctionId id) const {
+        return *functions_[static_cast<uint32_t>(id)];
+    }
+
+    size_t function_count() const {
+        return functions_.size();
+    }
+
     const SignalInfo& signal(Signal s) const {
         return signals_[static_cast<uint32_t>(s)];
     }
@@ -132,6 +176,9 @@ private:
     std::vector<SignalInfo> signals_;
     // Lowered processes; index == ProcessId handle.
     std::vector<Process> processes_;
+    // Lowered functions; index == FunctionId handle. Held behind unique_ptr so a
+    // slot can be reserved (recursion) before its body exists.
+    std::vector<std::unique_ptr<Function>> functions_;
 };
 
 } // namespace clotho::ir

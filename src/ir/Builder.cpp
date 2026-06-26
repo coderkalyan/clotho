@@ -35,6 +35,10 @@ Index Builder::signal(Signal sig, SourceLoc loc) {
     return emit({ Inst::Tag::Signal, Inst::Payload{ .signal = sig } }, loc);
 }
 
+Index Builder::local(uint32_t index, Ref type, SourceLoc loc) {
+    return emit({ Inst::Tag::Local, Inst::Payload{ .local = { index, type } } }, loc);
+}
+
 Index Builder::unary(Inst::Tag tag, Index op, SourceLoc loc) {
     return emit({ tag, Inst::Payload{ .unary = op } }, loc);
 }
@@ -96,6 +100,13 @@ Index Builder::wait(std::span<const WaitEdge> events, SourceLoc loc) {
       WaitInfo{ ExtraSlice{ static_cast<ExtraIndex>(start), static_cast<ExtraIndex>(end) } });
 
     return emit({ Inst::Tag::Wait, Inst::Payload{ .wait = info } }, loc);
+}
+
+Index Builder::call(FunctionId func, std::span<const Index> args, SourceLoc loc) {
+    const ExtraSlice slice = add_slice(args);
+    const ExtraIndex extra = add_extra(CallInfo{ func, slice });
+
+    return emit({ Inst::Tag::Call, Inst::Payload{ .extra = extra } }, loc);
 }
 
 Index Builder::display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc) {

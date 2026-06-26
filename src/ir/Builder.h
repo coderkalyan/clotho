@@ -33,6 +33,9 @@ public:
     Index constant(Ref value, SourceLoc loc);
     Index arg(uint32_t position, Ref type, SourceLoc loc);
     Index signal(Signal sig, SourceLoc loc);
+    // A function-frame local slot (lvalue leaf); `index` selects the slot, `type`
+    // gives its storage width / domain.
+    Index local(uint32_t index, Ref type, SourceLoc loc);
 
     // -- Generic ops sharing a payload shape --
     // tag must be a unary-payload op (load, bnot, lnot, red_*, ret).
@@ -57,6 +60,11 @@ public:
     // fires. Each WaitEdge carries an ir::Edge value as u32, keeping the builder
     // free of the Module-level enum. The list must be non-empty.
     Index wait(std::span<const WaitEdge> events, SourceLoc loc);
+
+    // -- Calls --
+    // Call function `func` with `args` (in formal-parameter order, each already
+    // resized to its parameter type). The result is this instruction's value.
+    Index call(FunctionId func, std::span<const Index> args, SourceLoc loc);
 
     // -- System tasks --
     // $display / $write: a literal format string, a newline flag (true for

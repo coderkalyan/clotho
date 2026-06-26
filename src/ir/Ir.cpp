@@ -12,6 +12,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::Signal;
         case T::Arg:
             return K::Arg;
+        case T::Local:
+            return K::Local;
 
         case T::Load:
         case T::Bnot:
@@ -55,6 +57,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Concat:
         case T::Loop:
             return K::Extra;
+        case T::Call:
+            return K::Call;
         case T::Display:
             return K::Display;
         case T::Finish:
@@ -80,8 +84,15 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
         case Inst::PayloadKind::Ref:
         case Inst::PayloadKind::Signal:
         case Inst::PayloadKind::Arg:
+        case Inst::PayloadKind::Local:
         case Inst::PayloadKind::Wait:
             return {};
+
+        case Inst::PayloadKind::Call: {
+            // call: its arguments are the SSA operands; the callee handle is not.
+            const auto ci = extra_data<CallInfo>(p.extra);
+            return index_slice(ci.args);
+        }
 
         case Inst::PayloadKind::Unary:
             scratch[0] = p.unary;
