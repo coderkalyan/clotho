@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,7 @@
 #include <slang/ast/symbols/InstanceSymbols.h>
 #include <slang/ast/symbols/MemberSymbols.h>
 #include <slang/ast/symbols/PortSymbols.h>
+#include <slang/ast/symbols/SubroutineSymbols.h>
 #include <slang/ast/symbols/ValueSymbol.h>
 #include <slang/ast/symbols/VariableSymbols.h>
 #include <slang/ast/types/Type.h>
@@ -83,6 +85,9 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, /*Statements=*/tr
     std::vector<ir::Signal>                reads;    // in first-seen order
     ankerl::unordered_dense::set<uint32_t> seen;     // dedup for `reads`
     ankerl::unordered_dense::set<uint32_t> written;  // assignment targets / locals
+    // User functions already descended into, so a function called from several
+    // sites (or a recursive one) is walked at most once.
+    ankerl::unordered_dense::set<const SubroutineSymbol*> entered;
 
     explicit SensitivityCollector(const SigMap& m) : sigmap(m) {}
 
@@ -172,6 +177,24 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, /*Statements=*/tr
             mark_written(*v);
         }
         visitDefault(f);
+    }
+
+    // A called function's reads count toward the caller's sensitivity: a function
+    // may reference module signals directly, not only through its arguments. Visit
+    // the actual-argument expressions, then descend once into the callee body. The
+    // callee's formals / locals are not module signals (not in sigmap), so they are
+    // ignored; module signals it reads / writes are recorded as usual.
+    void handle(const CallExpression& c) {
+        for (const Expression* arg : c.arguments()) {
+            arg->visit(*this);
+        }
+        if (c.isSystemCall()) {
+            return;
+        }
+        const SubroutineSymbol* sub = std::get<0>(c.subroutine);
+        if (sub != nullptr && entered.insert(sub).second) {
+            sub->getBody().visit(*this);
+        }
     }
 };
 
@@ -667,6 +690,9 @@ private:
             case StatementKind::ForeverLoop:
                 lower_forever(stmt.as<ForeverLoopStatement>(), b);
                 break;
+            case StatementKind::Return:
+                lower_return(stmt.as<ReturnStatement>(), b);
+                break;
             default:
                 fail("unsupported statement");
         }
@@ -697,13 +723,14 @@ private:
         return b.constant(module_.pool.put_int(make_int_type(1, false, false), 1), l);
     }
 
-    // A local declaration statement: register the variable's storage and, if it
+    // A local declaration statement: register the variable's storage (a function
+    // frame Local when lowering a function body, else a module Signal) and, if it
     // has an initializer, store it.
     void lower_var_decl(const VariableSymbol& vs, ir::Builder& b) {
-        const ir::Signal sig = declare_local(vs);
+        declare_storage(vs);
         if (const Expression* init = vs.getInitializer()) {
             const ir::SourceLoc l = loc(*init);
-            b.binary(ir::Inst::Tag::Store, b.signal(sig, l), lower_expr(*init, b), l);
+            b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
         }
     }
 
@@ -898,7 +925,11 @@ private:
 
     void lower_call(const CallExpression& call, ir::Builder& b) {
         if (!call.isSystemCall()) {
-            fail("only system task calls are supported as statements");
+            // A user function invoked as a statement: void, or a non-void function
+            // whose result is discarded. Lower the call for its side effects (a
+            // function may write module signals). A task is rejected in lower_user_call.
+            lower_user_call(call, b);
+            return;
         }
         const std::string_view name = call.getSubroutineName();
         if (name == "$display" || name == "$write") {
@@ -972,6 +1003,12 @@ private:
             // the wrong time. Reject until the scheduler exists.
             fail("intra-assignment timing control (#/@ on an assignment) is not supported");
         }
+        if (a.isNonBlocking() && fn_ctx_ != nullptr) {
+            // A function consumes no time, so a nonblocking assignment in one has no
+            // deferred region to commit into. slang permits it in limited cases; we
+            // do not model it.
+            fail("nonblocking assignment in a function is not supported");
+        }
         const ir::Index lhs = lower_lvalue(a.left(), b);
         const ir::Index rhs = lower_expr(a.right(), b);
         // StoreNb gets correct two-phase NBA semantics in the backend: the RHS is
@@ -990,10 +1027,8 @@ private:
         switch (expr.kind) {
             case ExpressionKind::IntegerLiteral:
                 return b.constant(lower_int_literal(expr.as<IntegerLiteral>()), l);
-            case ExpressionKind::NamedValue: {
-                const ir::Signal sig = signal_of(expr.as<NamedValueExpression>().symbol);
-                return b.unary(ir::Inst::Tag::Load, b.signal(sig, l), l);
-            }
+            case ExpressionKind::NamedValue:
+                return b.unary(ir::Inst::Tag::Load, value_lvalue(expr.as<NamedValueExpression>().symbol, b, l), l);
             case ExpressionKind::UnaryOp:
                 return lower_unary(expr.as<UnaryExpression>(), b);
             case ExpressionKind::BinaryOp:
@@ -1039,6 +1074,19 @@ private:
             case ExpressionKind::Conversion: {
                 const ConversionExpression& cv = expr.as<ConversionExpression>();
                 return b.resize(lower_expr(cv.operand(), b), lower_type(*expr.type), l);
+            }
+            case ExpressionKind::Call: {
+                const CallExpression& call = expr.as<CallExpression>();
+                if (call.isSystemCall()) {
+                    // System functions ($signed, $bits, $time, ...) need bespoke
+                    // lowering; none is implemented yet.
+                    fail("system function '" + std::string(call.getSubroutineName()) + "' is not supported");
+                }
+                const std::optional<ir::Index> v = lower_user_call(call, b);
+                if (!v) {
+                    fail("void function call used as an expression");
+                }
+                return *v;
             }
             default:
                 fail("unsupported expression kind=" + std::string(slang::ast::toString(expr.kind)));
@@ -1133,7 +1181,7 @@ private:
         const ir::SourceLoc l = loc(expr);
         switch (expr.kind) {
             case ExpressionKind::NamedValue:
-                return b.signal(signal_of(expr.as<NamedValueExpression>().symbol), l);
+                return value_lvalue(expr.as<NamedValueExpression>().symbol, b, l);
             case ExpressionKind::ElementSelect: {
                 const ElementSelectExpression& es   = expr.as<ElementSelectExpression>();
                 const ir::Index                base = lower_lvalue(es.value(), b);
@@ -1167,6 +1215,199 @@ private:
         fail("expected a constant integer");
     }
 
+    // -- Functions --
+    //
+    // A function lowers to its own ir::Function (a real callable), not inlined.
+    // Its body references parameters via Arg (copied into a Local at entry so the
+    // body may mutate them), function-frame storage via Local, and module signals
+    // via Signal; every path ends in a Ret. The backend emits one LLVM function
+    // per ir::Function and calls it at each `call` site, so recursion and
+    // `automatic` lifetime come from ordinary stack frames.
+
+    // Build-time state for the function currently being lowered. Local indices are
+    // handed out densely as formals / the return variable / body locals are seen;
+    // `local_types` (parallel to the indices) becomes the Function's frame layout.
+    struct FnCtx {
+        // Value symbol -> frame Local index.
+        ankerl::unordered_dense::map<const ValueSymbol*, uint32_t> localmap;
+        // Storage type per Local index.
+        std::vector<ir::Ref> local_types;
+        // The return variable's Local index / type (valid iff has_ret_local).
+        uint32_t ret_local     = 0;
+        ir::Ref  ret_type      = ir::Ref::Invalid;
+        bool     has_ret_local = false;
+    };
+
+    // Get (creating if needed) the frame Local index for a function-local symbol.
+    uint32_t fn_local(const ValueSymbol& vs) {
+        const auto it = fn_ctx_->localmap.find(&vs);
+        if (it != fn_ctx_->localmap.end()) {
+            return it->second;
+        }
+        const auto idx = static_cast<uint32_t>(fn_ctx_->local_types.size());
+        fn_ctx_->local_types.push_back(lower_type(vs.getType()));
+        fn_ctx_->localmap[&vs] = idx;
+
+        return idx;
+    }
+
+    // Ensure storage exists for a procedural local declaration / loop variable: a
+    // function-frame Local inside a function, else a module Signal.
+    void declare_storage(const ValueSymbol& vs) {
+        if (fn_ctx_ != nullptr) {
+            fn_local(vs);
+        } else {
+            declare_local(vs);
+        }
+    }
+
+    // The lvalue leaf for a value-symbol reference: a function-frame Local if the
+    // symbol is one of the current function's locals, else a module Signal (which
+    // a function may also reference directly). signal_of fails loudly if unknown.
+    ir::Index value_lvalue(const ValueSymbol& vs, ir::Builder& b, ir::SourceLoc l) {
+        if (fn_ctx_ != nullptr) {
+            const auto it = fn_ctx_->localmap.find(&vs);
+            if (it != fn_ctx_->localmap.end()) {
+                return b.local(it->second, fn_ctx_->local_types[it->second], l);
+            }
+        }
+
+        return b.signal(signal_of(vs), l);
+    }
+
+    // A 1-bit zero, used as the (ignored) operand of a void function's Ret. Ret
+    // always carries an operand; the backend drops it for a void return.
+    ir::Index void_ret_operand(ir::Builder& b, ir::SourceLoc l) {
+        return b.constant(module_.pool.put_int(make_int_type(1, false, false), 0), l);
+    }
+
+    void lower_return(const ReturnStatement& r, ir::Builder& b) {
+        if (fn_ctx_ == nullptr) {
+            fail("return statement outside of a function");
+        }
+        const ir::SourceLoc l = loc(r);
+        if (r.expr != nullptr) {
+            if (!fn_ctx_->has_ret_local) {
+                fail("return with a value in a void function");
+            }
+            b.unary(ir::Inst::Tag::Ret, b.resize(lower_expr(*r.expr, b), fn_ctx_->ret_type, l), l);
+        } else if (fn_ctx_->has_ret_local) {
+            // `return;` in a non-void function yields the current function-var value.
+            const ir::Index rv = b.local(fn_ctx_->ret_local, fn_ctx_->ret_type, l);
+            b.unary(ir::Inst::Tag::Ret, b.unary(ir::Inst::Tag::Load, rv, l), l);
+        } else {
+            b.unary(ir::Inst::Tag::Ret, void_ret_operand(b, l), l);
+        }
+    }
+
+    // Resolve a subroutine to a FunctionId, lowering its body on first reference.
+    // The id is reserved before the body is built so a recursive call resolves it.
+    ir::FunctionId function_id(const SubroutineSymbol& sub) {
+        const auto cached = fnmap_.find(&sub);
+        if (cached != fnmap_.end()) {
+            return cached->second;
+        }
+        if (sub.subroutineKind != SubroutineKind::Function) {
+            // TODO: tasks — they can consume time and need the scheduler.
+            fail("task enable is not supported (functions only)");
+        }
+        if (sub.flags.has(MethodFlags::DPIImport)) {
+            // TODO: DPI imports — call out to native code via the runtime.
+            fail("DPI imported functions are not supported");
+        }
+        for (const FormalArgumentSymbol* fa : sub.getArguments()) {
+            if (fa->direction != slang::ast::ArgumentDirection::In) {
+                // TODO: output / inout / ref arguments — copy-out / aliasing.
+                fail("functions with output/inout/ref arguments are not supported");
+            }
+        }
+
+        const ir::FunctionId id = module_.reserve_function();
+        fnmap_[&sub]            = id;
+        build_function(sub, id);
+
+        return id;
+    }
+
+    // Lower one function body into the reserved slot. (Ir has no default ctor and
+    // is not assignable, so every field is built locally and the Function is
+    // constructed once, at the end.)
+    void build_function(const SubroutineSymbol& sub, ir::FunctionId id) {
+        const bool    is_void     = sub.returnValVar == nullptr;
+        const ir::Ref return_type = is_void ? module_.pool.void_type : lower_type(sub.returnValVar->getType());
+
+        FnCtx            ctx;
+        FnCtx*           saved = fn_ctx_;
+        fn_ctx_                = &ctx;
+        ir::Builder      b(module_.pool);
+        std::vector<ir::Ref> param_types;
+
+        // Parameters: copy each Arg into the formal's Local at entry, so the body
+        // reads / writes the formal as ordinary frame storage.
+        for (const FormalArgumentSymbol* fa : sub.getArguments()) {
+            const ir::Ref       pty = lower_type(fa->getType());
+            const ir::SourceLoc fl  = to_source_loc(fa->location);
+            const auto          pos = static_cast<uint32_t>(param_types.size());
+            param_types.push_back(pty);
+            const uint32_t idx = fn_local(*fa);
+            b.binary(ir::Inst::Tag::Store, b.local(idx, pty, fl), b.arg(pos, pty, fl), fl);
+        }
+
+        if (!is_void) {
+            ctx.has_ret_local = true;
+            ctx.ret_type      = return_type;
+            ctx.ret_local     = fn_local(*sub.returnValVar);
+        }
+
+        lower_stmt(sub.getBody(), b);
+
+        // Fall-through return: yields the function variable (X if never assigned).
+        const ir::SourceLoc el = to_source_loc(sub.location);
+        if (is_void) {
+            b.unary(ir::Inst::Tag::Ret, void_ret_operand(b, el), el);
+        } else {
+            const ir::Index rv = b.local(ctx.ret_local, ctx.ret_type, el);
+            b.unary(ir::Inst::Tag::Ret, b.unary(ir::Inst::Tag::Load, rv, el), el);
+        }
+
+        module_.set_function(id, ir::Function{ .name        = std::string(sub.name),
+                                               .return_type = return_type,
+                                               .param_types = std::move(param_types),
+                                               .local_types = std::move(ctx.local_types),
+                                               .ir          = b.finish() });
+        fn_ctx_ = saved;
+    }
+
+    // Lower a user function call: the actuals (resized to the parameter types)
+    // become a `call`. Returns the result value, or nullopt for a void function.
+    std::optional<ir::Index> lower_user_call(const CallExpression& call, ir::Builder& b) {
+        if (call.subroutine.index() != 0) {
+            fail("system call used where a user subroutine was expected");
+        }
+        if (call.thisClass() != nullptr) {
+            // TODO: class methods — need object handles.
+            fail("class method calls are not supported");
+        }
+        const SubroutineSymbol& sub = *std::get<0>(call.subroutine);
+        const ir::FunctionId    id  = function_id(sub); // validates + lowers (lazily)
+
+        const auto formals = sub.getArguments();
+        const auto actuals = call.arguments();
+        if (formals.size() != actuals.size()) {
+            fail("function argument count mismatch");
+        }
+        const ir::SourceLoc    l = loc(call);
+        std::vector<ir::Index> args;
+        args.reserve(actuals.size());
+        for (size_t i = 0; i < formals.size(); ++i) {
+            const ir::Ref pty = lower_type(formals[i]->getType());
+            args.push_back(b.resize(lower_expr(*actuals[i], b), pty, l));
+        }
+        const ir::Index c = b.call(id, args, l);
+
+        return sub.returnValVar == nullptr ? std::nullopt : std::optional<ir::Index>(c);
+    }
+
     ir::Module& module_;
     // Maps an elaborated value symbol to its module Signal handle.
     ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal> sigmap_;
@@ -1174,6 +1415,12 @@ private:
     // "u_alu.u_sub."); empty for the top. Prepended to every signal name created
     // while this instance's body is processed so flattened signals stay unique.
     std::string prefix_;
+    // Subroutine -> its lowered FunctionId, so each function is lowered once and
+    // shared across call sites (and a recursive call resolves its own id).
+    ankerl::unordered_dense::map<const SubroutineSymbol*, ir::FunctionId> fnmap_;
+    // The function currently being lowered, or null when lowering a process. Drives
+    // local-vs-signal name resolution and `return` handling.
+    FnCtx* fn_ctx_ = nullptr;
 };
 
 LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
