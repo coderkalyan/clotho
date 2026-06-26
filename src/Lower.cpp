@@ -723,12 +723,19 @@ private:
         return b.constant(module_.pool.put_int(make_int_type(1, false, false), 1), l);
     }
 
-    // A local declaration statement: register the variable's storage (a function
-    // frame Local when lowering a function body, else a module Signal) and, if it
-    // has an initializer, store it.
-    void lower_var_decl(const VariableSymbol& vs, ir::Builder& b) {
-        declare_storage(vs);
+    // A local declaration statement: register the variable's storage (a static
+    // local's persistent Signal, a per-call frame Local, or a module Signal in a
+    // process) and, if it has an initializer, store it. `force_frame` marks a loop
+    // control variable, which is per-call regardless of the function's lifetime.
+    void lower_var_decl(const VariableSymbol& vs, ir::Builder& b, bool force_frame = false) {
+        declare_storage(vs, force_frame);
         if (const Expression* init = vs.getInitializer()) {
+            if (is_static_local(vs, force_frame)) {
+                // A static local's initializer runs once at time zero, not on each
+                // call; modeling that needs a separate init pass. A static local
+                // without an initializer (default 0 / X at time zero) works.
+                fail("static function local with an initializer is not supported");
+            }
             const ir::SourceLoc l = loc(*init);
             b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
         }
@@ -743,7 +750,7 @@ private:
         // exclusive. Either is lowered in source order so a later init may read
         // an earlier one (12.7.1).
         for (const VariableSymbol* vs : f.loopVars) {
-            lower_var_decl(*vs, b);
+            lower_var_decl(*vs, b, /*force_frame=*/true);
         }
         for (const Expression* init : f.initializers) {
             lower_for_step(*init, b);
@@ -1228,7 +1235,7 @@ private:
     // handed out densely as formals / the return variable / body locals are seen;
     // `local_types` (parallel to the indices) becomes the Function's frame layout.
     struct FnCtx {
-        // Value symbol -> frame Local index.
+        // Value symbol -> frame Local index (automatic-lifetime locals only).
         ankerl::unordered_dense::map<const ValueSymbol*, uint32_t> localmap;
         // Storage type per Local index.
         std::vector<ir::Ref> local_types;
@@ -1236,6 +1243,9 @@ private:
         uint32_t ret_local     = 0;
         ir::Ref  ret_type      = ir::Ref::Invalid;
         bool     has_ret_local = false;
+        // Name qualifier (e.g. "f.") prepended to a static local's signal name so
+        // same-named statics in different functions stay distinct.
+        std::string name_prefix;
     };
 
     // Get (creating if needed) the frame Local index for a function-local symbol.
@@ -1251,13 +1261,41 @@ private:
         return idx;
     }
 
-    // Ensure storage exists for a procedural local declaration / loop variable: a
-    // function-frame Local inside a function, else a module Signal.
-    void declare_storage(const ValueSymbol& vs) {
-        if (fn_ctx_ != nullptr) {
-            fn_local(vs);
-        } else {
+    // A static-lifetime function local: it persists across calls (LRM 13.4.2), so
+    // it gets persistent module-signal storage, initialized once at time zero —
+    // not the per-call frame. Named with the function qualifier to avoid clashes.
+    ir::Signal declare_static_local(const ValueSymbol& vs) {
+        const auto it = sigmap_.find(&vs);
+        if (it != sigmap_.end()) {
+            return it->second;
+        }
+        ir::SignalInfo info;
+        info.name = prefix_ + fn_ctx_->name_prefix + std::string(vs.name);
+        info.type = lower_type(vs.getType());
+        info.dir  = ir::SignalInfo::Direction::Internal;
+        const ir::Signal sig = module_.add_signal(std::move(info));
+        sigmap_[&vs]         = sig;
+
+        return sig;
+    }
+
+    // True if `vs` is a static-lifetime function local (persistent storage). A
+    // loop control variable is always treated as per-call (force_frame), since its
+    // value is reset by the loop initialization on every entry regardless.
+    bool is_static_local(const VariableSymbol& vs, bool force_frame) const {
+        return fn_ctx_ != nullptr && !force_frame && vs.lifetime == slang::ast::VariableLifetime::Static;
+    }
+
+    // Ensure storage exists for a procedural local declaration / loop variable.
+    // Outside a function: a module Signal. Inside a function: a persistent Signal
+    // for a static local, else a per-call frame Local.
+    void declare_storage(const VariableSymbol& vs, bool force_frame) {
+        if (fn_ctx_ == nullptr) {
             declare_local(vs);
+        } else if (is_static_local(vs, force_frame)) {
+            declare_static_local(vs);
+        } else {
+            fn_local(vs);
         }
     }
 
@@ -1337,6 +1375,7 @@ private:
         const ir::Ref return_type = is_void ? module_.pool.void_type : lower_type(sub.returnValVar->getType());
 
         FnCtx            ctx;
+        ctx.name_prefix        = std::string(sub.name) + ".";
         FnCtx*           saved = fn_ctx_;
         fn_ctx_                = &ctx;
         ir::Builder      b(module_.pool);

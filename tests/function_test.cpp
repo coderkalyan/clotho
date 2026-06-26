@@ -205,6 +205,55 @@ TEST_CASE("always_comb sensitivity includes signals read inside a function") {
     CHECK(run_capture(src) == "11\n21\n25\n");
 }
 
+// Default lifetime in a non-automatic module is STATIC: a declared local persists
+// across calls and is initialized once (LRM 13.4.2). counter() => 1, 2, 3.
+TEST_CASE("static (default) local persists across calls") {
+    constexpr std::string_view src = R"(
+        module m;
+            function int counter();
+                int c;
+                c = c + 1;
+                return c;
+            endfunction
+            initial $display("%0d %0d %0d", counter(), counter(), counter());
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 2 3\n");
+}
+
+// An `automatic` local is fresh on every call: acounter() => 1, 1, 1. Same body
+// as the static case above — only the lifetime differs.
+TEST_CASE("automatic local is fresh each call") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic int counter();
+                int c;
+                c = c + 1;
+                return c;
+            endfunction
+            initial $display("%0d %0d %0d", counter(), counter(), counter());
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 1 1\n");
+}
+
+// A static local with an initializer needs once-at-time-zero initialization,
+// which is not modeled; reject it rather than re-init on every call.
+TEST_CASE("static local with an initializer is rejected") {
+    constexpr std::string_view src = R"(
+        module m;
+            function int f();
+                static int c = 0;
+                c = c + 1;
+                return c;
+            endfunction
+            int y;
+            initial y = f();
+        endmodule
+    )";
+    CHECK(reject(src).find("static function local with an initializer") != std::string::npos);
+}
+
 // Output / inout / ref formal arguments need copy-out / aliasing and are not
 // implemented.
 TEST_CASE("function with an output argument is rejected") {
