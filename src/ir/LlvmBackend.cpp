@@ -2455,12 +2455,23 @@ private:
         llvm::Value* must = zero(w);
         llvm::Value* may  = zero(w);
         llvm::Value* z    = zero(w);
+        // The first part is OR'd in without a preceding shift: a shift by the
+        // full result width (which happens when the concat has a single operand,
+        // pw == w) is poison in LLVM, and shifting the still-zero accumulator is
+        // a no-op anyway.
+        bool first = true;
         for (Index part : parts) {
             const uint32_t pw = type_of(part).width;
             const Plane    pv = value_of(part);
-            must              = b_.CreateOr(b_.CreateShl(must, pw), cast(must_of(pv), w, false));
-            may               = b_.CreateOr(b_.CreateShl(may, pw), cast(may_of(pv), w, false));
-            z                 = b_.CreateOr(b_.CreateShl(z, pw), cast(pv.z, w, false));
+            if (!first) {
+                must = b_.CreateShl(must, pw);
+                may  = b_.CreateShl(may, pw);
+                z    = b_.CreateShl(z, pw);
+            }
+            must  = b_.CreateOr(must, cast(must_of(pv), w, false));
+            may   = b_.CreateOr(may, cast(may_of(pv), w, false));
+            z     = b_.CreateOr(z, cast(pv.z, w, false));
+            first = false;
         }
         return packed(must, may, z);
     }
@@ -2475,10 +2486,17 @@ private:
         llvm::Value*   must = zero(w);
         llvm::Value*   may  = zero(w);
         llvm::Value*   z    = zero(w);
+        // Skip the shift on the first copy: for a single replication ({1{x}})
+        // part_width == w, and a shift by the full width is poison in LLVM.
         for (uint32_t c = 0; c < count; ++c) {
-            must = b_.CreateOr(b_.CreateShl(must, part_width), pm);
-            may  = b_.CreateOr(b_.CreateShl(may, part_width), pM);
-            z    = b_.CreateOr(b_.CreateShl(z, part_width), pz);
+            if (c != 0) {
+                must = b_.CreateShl(must, part_width);
+                may  = b_.CreateShl(may, part_width);
+                z    = b_.CreateShl(z, part_width);
+            }
+            must = b_.CreateOr(must, pm);
+            may  = b_.CreateOr(may, pM);
+            z    = b_.CreateOr(z, pz);
         }
         return packed(must, may, z);
     }

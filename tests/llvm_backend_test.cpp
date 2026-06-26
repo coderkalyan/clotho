@@ -1,11 +1,15 @@
 #include <doctest/doctest.h>
 
+#include <cstdio>
 #include <string>
 #include <string_view>
+
+#include <unistd.h>
 
 #include <llvm/Support/raw_ostream.h>
 
 #include "Lower.h"
+#include "ir/Jit.h"
 #include "ir/LlvmBackend.h"
 
 using namespace clotho;
@@ -22,6 +26,37 @@ std::string emit(std::string_view source) {
     llvm::raw_string_ostream os(text);
     REQUIRE(ir::emit_llvm(*result.module, os));
     return text;
+}
+
+// JIT-run a module and return everything its initial blocks wrote to stdout.
+std::string run_capture(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE(r.module != nullptr);
+
+    std::FILE* tmp = std::tmpfile();
+    REQUIRE(tmp != nullptr);
+
+    std::fflush(stdout);
+    const int saved = dup(fileno(stdout));
+    dup2(fileno(tmp), fileno(stdout));
+
+    ir::run_jit(*r.module);
+
+    std::fflush(stdout);
+    dup2(saved, fileno(stdout));
+    close(saved);
+
+    std::rewind(tmp);
+    std::string out;
+    char        buf[256];
+    size_t      n;
+    while ((n = std::fread(buf, 1, sizeof(buf), tmp)) > 0) {
+        out.append(buf, n);
+    }
+    std::fclose(tmp);
+
+    return out;
 }
 
 // Count non-overlapping occurrences of `needle` in `hay`.
@@ -268,4 +303,21 @@ TEST_CASE("repeated instantiation emits distinct process symbols") {
     // (cnt) = 3 ramps; 2 instances + 0 top processes = 6 distinct @top.p<N>
     // coroutine ramps.
     CHECK(count_substr(ir, "define ptr @top.p") == 6);
+}
+
+// Regression: a single-operand concat ({x}) and a single replication ({1{x}})
+// once shifted the accumulator by the full result width, which is poison in LLVM
+// (shift >= bitwidth). Replication wraps its operand in a single-element concat,
+// so {N{x}} read garbage. Assert the concrete bit pattern.
+TEST_CASE("single-element concat and replication produce correct bits") {
+    const std::string out = run_capture(R"(
+        module top;
+            reg [1:0] a;
+            initial begin
+                a = 2'b10;
+                $display("%b %b %b %b", {a}, {1{a}}, {4{a}}, {4{1'b1}});
+            end
+        endmodule
+    )");
+    CHECK(out == "10 10 10101010 1111\n");
 }
