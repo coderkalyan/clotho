@@ -1908,7 +1908,7 @@ private:
 
             case Inst::Tag::SimTime: {
                 // The clock value is always known: must == may, z == 0. The wheel
-                // counts in the design's finest precision; scale the tick count
+                // counts in the design's smallest time unit; scale the tick count
                 // down to the calling module's time unit, rounding to nearest
                 // (LRM §20.3.1). `scale` is a power of ten, so scale/2 is exact and
                 // (now + scale/2) / scale rounds half up.

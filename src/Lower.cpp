@@ -85,19 +85,32 @@ uint64_t tsv_to_fs(slang::TimeScaleValue v) {
     return static_cast<uint64_t>(v.magnitude) * fs_per_unit;
 }
 
-// Finest time precision (fs) over an instance subtree, plus whether any design
-// unit set a timescale explicitly. The wheel tick is this precision; delays and
-// the $time family scale against it. Mirrors lower_instance's recursion. Uses
-// each scope's *effective* timescale (slang resolves inheritance / the default),
-// but the caller treats the result as unitless unless `any_explicit` is set, so
-// a design with no directive keeps raw-tick time (LRM §3.14.2.3).
+// Wheel-tick size (fs) for an instance subtree: the smallest time *unit* across
+// the design, plus whether any design unit set a timescale explicitly. Mirrors
+// lower_instance's recursion over each scope's *effective* timescale (slang
+// resolves inheritance / the default); the caller treats the result as unitless
+// unless `any_explicit` is set, so a design with no directive keeps raw-tick time
+// (LRM §3.14.2.3).
+//
+// The tick is the minimum unit, NOT the minimum precision: with only integer
+// delays, every delay (constant or runtime `#expr`) is an exact multiple of its
+// module's unit, so no event can land finer than the smallest unit. Precision
+// matters only for rounding fractional (real) delays, which are unsupported.
+// Choosing the unit keeps deadline magnitudes near the timing wheel's
+// near-window (one revolution) instead of inflating them by unit/precision and
+// spilling every timer into the O(log n) overflow heap. Since all timescale
+// values are powers of ten, the minimum unit equals the GCD of all units, so it
+// also exactly represents every event time.
+// TODO: when `real` delays land, a fractional delay rounds to its module
+// precision, so the tick must drop to the minimum precision (or the GCD that
+// includes precisions) to stay exact.
 uint64_t design_tick_fs(const InstanceSymbol& inst, bool& any_explicit) {
     uint64_t min_fs = 0;
     if (inst.getDefinition().timeScale.has_value()) {
         any_explicit = true;
     }
     if (const auto ts = inst.body.getTimeScale()) {
-        min_fs = tsv_to_fs(ts->precision);
+        min_fs = tsv_to_fs(ts->base);
     }
     for (const Symbol& m : inst.body.members()) {
         if (m.kind == SymbolKind::Instance) {
@@ -237,8 +250,8 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, /*Statements=*/tr
 // Walks the elaborated AST of one top module into an ir::Module.
 class Lowerer {
 public:
-    // `tick_fs` is the femtoseconds-per-wheel-tick (design-wide finest time
-    // precision), or 0 when no design unit set a timescale (unitless ticks).
+    // `tick_fs` is the femtoseconds-per-wheel-tick (design-wide smallest time
+    // unit), or 0 when no design unit set a timescale (unitless ticks).
     Lowerer(ir::Module& module, uint64_t tick_fs)
       : module_(module)
       , tick_fs_(tick_fs) {}
@@ -1353,7 +1366,7 @@ private:
     // "u_alu.u_sub."); empty for the top. Prepended to every signal name created
     // while this instance's body is processed so flattened signals stay unique.
     std::string prefix_;
-    // Femtoseconds per wheel tick (design-wide finest precision); 0 == unitless.
+    // Femtoseconds per wheel tick (design-wide smallest time unit); 0 == unitless.
     uint64_t tick_fs_ = 0;
     // Time-unit multiplier of the instance currently being lowered: a delay is
     // scaled up by this into ticks; $time is scaled (rounded) down by it. Always
@@ -1403,8 +1416,8 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
     }
 
     // Analysis: walk the elaborated AST into clotho IR. The wheel tick is the
-    // design's finest time precision; if no design unit set a timescale, time
-    // stays unitless (one tick == one time unit) and nothing is scaled.
+    // design's smallest time unit; if no design unit set a timescale, time stays
+    // unitless (one tick == one time unit) and nothing is scaled.
     const auto t_an         = std::chrono::steady_clock::now();
     auto       module       = std::make_unique<ir::Module>();
     bool       any_explicit = false;
