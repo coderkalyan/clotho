@@ -104,6 +104,46 @@ uint64_t tsv_to_fs(slang::TimeScaleValue v) {
 // TODO: when `real` delays land, a fractional delay rounds to its module
 // precision, so the tick must drop to the minimum precision (or the GCD that
 // includes precisions) to stay exact.
+uint64_t design_tick_fs(const InstanceSymbol& inst, bool& any_explicit);
+
+// Smallest child time unit (fs) reachable from a scope, descending into nested
+// instances and through generate blocks/arrays (whose instances share the
+// enclosing instance's timescale but may instantiate further modules).
+// Uninstantiated generate branches contribute nothing.
+uint64_t scope_min_tick_fs(const Scope& scope, bool& any_explicit) {
+    uint64_t   min_fs = 0;
+    const auto consider = [&](uint64_t child) {
+        if (child != 0 && (min_fs == 0 || child < min_fs)) {
+            min_fs = child;
+        }
+    };
+    for (const Symbol& m : scope.members()) {
+        switch (m.kind) {
+            case SymbolKind::Instance:
+                consider(design_tick_fs(m.as<InstanceSymbol>(), any_explicit));
+                break;
+            case SymbolKind::GenerateBlock: {
+                const auto& gb = m.as<GenerateBlockSymbol>();
+                if (!gb.isUninstantiated) {
+                    consider(scope_min_tick_fs(gb, any_explicit));
+                }
+                break;
+            }
+            case SymbolKind::GenerateBlockArray:
+                for (const GenerateBlockSymbol* e : m.as<GenerateBlockArraySymbol>().entries) {
+                    if (!e->isUninstantiated) {
+                        consider(scope_min_tick_fs(*e, any_explicit));
+                    }
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    return min_fs;
+}
+
 uint64_t design_tick_fs(const InstanceSymbol& inst, bool& any_explicit) {
     uint64_t min_fs = 0;
     if (inst.getDefinition().timeScale.has_value()) {
@@ -112,13 +152,9 @@ uint64_t design_tick_fs(const InstanceSymbol& inst, bool& any_explicit) {
     if (const auto ts = inst.body.getTimeScale()) {
         min_fs = tsv_to_fs(ts->base);
     }
-    for (const Symbol& m : inst.body.members()) {
-        if (m.kind == SymbolKind::Instance) {
-            const uint64_t child = design_tick_fs(m.as<InstanceSymbol>(), any_explicit);
-            if (child != 0 && (min_fs == 0 || child < min_fs)) {
-                min_fs = child;
-            }
-        }
+    const uint64_t child = scope_min_tick_fs(inst.body, any_explicit);
+    if (child != 0 && (min_fs == 0 || child < min_fs)) {
+        min_fs = child;
     }
 
     return min_fs;
@@ -283,11 +319,21 @@ public:
         prefix_ = self_prefix;
         scope_  = &body;
         collect_signals(body);
+        lower_members(body, self_prefix, self_mul);
+    }
 
-        // prefix_ holds self_prefix on entry to each iteration: it is set above and
-        // restored after the Instance case (the only one that descends and changes
-        // it), so signal-creating process lowering always sees this level's prefix.
-        for (const Symbol& m : body.members()) {
+private:
+    // Lower the non-signal members of a scope (an instance body or a generate
+    // block) into processes: continuous assigns, procedural blocks, child
+    // instances, and nested generate constructs. `self_prefix` is the
+    // hierarchical name prefix of `scope`; `self_mul` is the enclosing instance's
+    // time multiplier, restored after a child instance recurses. Signals are
+    // already registered by collect_signals, which walked the same generate tree.
+    void lower_members(const Scope& scope, const std::string& self_prefix, uint64_t self_mul) {
+        // prefix_ / scope_ hold this level's values on entry to each iteration:
+        // set by the caller and restored after any case that descends and changes
+        // them, so signal-creating process lowering always sees this level.
+        for (const Symbol& m : scope.members()) {
             switch (m.kind) {
                 case SymbolKind::ContinuousAssign:
                     lower_continuous_assign(m.as<ContinuousAssignSymbol>());
@@ -303,9 +349,36 @@ public:
                     // prefix_ at the child level, so restore it before wiring.
                     lower_instance(child, self_prefix + std::string(child.name) + ".");
                     prefix_   = self_prefix;
-                    scope_    = &body;
+                    scope_    = &scope;
                     time_mul_ = self_mul;
                     wire_ports(child);
+                    break;
+                }
+                case SymbolKind::GenerateBlock: {
+                    // A conditional/bare generate block elaborated to a single
+                    // scope. An unmatched if/case branch is uninstantiated and
+                    // contributes nothing (its body is not part of the design).
+                    const auto& gb = m.as<GenerateBlockSymbol>();
+                    if (!gb.isUninstantiated) {
+                        lower_generate_block(gb, self_prefix + gb.getExternalName() + ".", self_mul);
+                        prefix_ = self_prefix;
+                        scope_  = &scope;
+                    }
+                    break;
+                }
+                case SymbolKind::GenerateBlockArray: {
+                    // A loop generate: one entry block per genvar iteration, named
+                    // <array>[<index>] so flattened signal paths stay unique.
+                    const auto& ga = m.as<GenerateBlockArraySymbol>();
+                    for (const GenerateBlockSymbol* e : ga.entries) {
+                        if (e->isUninstantiated) {
+                            continue;
+                        }
+                        lower_generate_block(*e, self_prefix + gen_entry_name(ga, *e) + ".",
+                                             self_mul);
+                    }
+                    prefix_ = self_prefix;
+                    scope_  = &scope;
                     break;
                 }
                 case SymbolKind::InstanceArray:
@@ -319,7 +392,30 @@ public:
         }
     }
 
-private:
+    // Lower one generate block's members under `block_prefix`. Genvar values are
+    // implicit localparams in the block scope, so const folding and parameter
+    // reads resolve them once scope_ points at the block.
+    void lower_generate_block(const GenerateBlockSymbol& block, const std::string& block_prefix,
+                              uint64_t self_mul) {
+        prefix_ = block_prefix;
+        scope_  = &block;
+        lower_members(block, block_prefix, self_mul);
+    }
+
+    // Hierarchical-path segment for one loop-generate entry: <array>[<index>].
+    // The entry's own name is empty; the genvar value (its arrayIndex) supplies
+    // the subscript.
+    static std::string gen_entry_name(const GenerateBlockArraySymbol& array,
+                                      const GenerateBlockSymbol&      entry) {
+        std::string name = array.getExternalName();
+        if (entry.arrayIndex != nullptr) {
+            name += '[';
+            name += entry.arrayIndex->toString(slang::LiteralBase::Decimal, /*includeBase=*/false);
+            name += ']';
+        }
+        return name;
+    }
+
     [[noreturn]] void fail(std::string msg) {
         throw LowerError{ std::move(msg) };
     }
@@ -412,7 +508,8 @@ private:
     // -- Signals --
 
     void collect_signals(const InstanceBodySymbol& body) {
-        // First pass: record port directions by the symbol they back.
+        // First pass: record port directions by the symbol they back. Ports exist
+        // only on the instance body, never inside a generate block.
         ankerl::unordered_dense::map<const Symbol*, ir::SignalInfo::Direction> port_dir;
         for (const Symbol& m : body.members()) {
             if (m.kind == SymbolKind::Port) {
@@ -423,20 +520,53 @@ private:
             }
         }
 
-        // Second pass: nets and variables become signals.
-        for (const Symbol& m : body.members()) {
-            if (m.kind != SymbolKind::Net && m.kind != SymbolKind::Variable) {
-                continue;
+        collect_scope_signals(body, prefix_, &port_dir);
+    }
+
+    // Register the nets and variables of one scope as signals under `prefix`,
+    // recursing through instantiated generate blocks/arrays (their nets carry the
+    // block's name in the path). `port_dir`, present only for an instance body,
+    // tags port-backed signals with their direction; generate-block signals are
+    // always internal. Child instances are handled by lower_instance, not here.
+    void collect_scope_signals(const Scope& scope, const std::string& prefix,
+                               const ankerl::unordered_dense::map<const Symbol*, ir::SignalInfo::Direction>* port_dir) {
+        for (const Symbol& m : scope.members()) {
+            switch (m.kind) {
+                case SymbolKind::Net:
+                case SymbolKind::Variable: {
+                    const ValueSymbol& vs = m.as<ValueSymbol>();
+
+                    ir::SignalInfo info;
+                    info.name = prefix + std::string(vs.name);
+                    info.type = lower_type(vs.getType());
+                    info.dir  = ir::SignalInfo::Direction::Internal;
+                    if (port_dir != nullptr) {
+                        const auto found = port_dir->find(&m);
+                        if (found != port_dir->end()) {
+                            info.dir = found->second;
+                        }
+                    }
+
+                    sigmap_[&vs] = module_.add_signal(std::move(info));
+                    break;
+                }
+                case SymbolKind::GenerateBlock: {
+                    const auto& gb = m.as<GenerateBlockSymbol>();
+                    if (!gb.isUninstantiated) {
+                        collect_scope_signals(gb, prefix + gb.getExternalName() + ".", nullptr);
+                    }
+                    break;
+                }
+                case SymbolKind::GenerateBlockArray:
+                    for (const GenerateBlockSymbol* e : m.as<GenerateBlockArraySymbol>().entries) {
+                        if (!e->isUninstantiated) {
+                            collect_scope_signals(*e, prefix + gen_entry_name(m.as<GenerateBlockArraySymbol>(), *e) + ".", nullptr);
+                        }
+                    }
+                    break;
+                default:
+                    break;
             }
-            const ValueSymbol& vs = m.as<ValueSymbol>();
-
-            ir::SignalInfo info;
-            info.name        = prefix_ + std::string(vs.name);
-            info.type        = lower_type(vs.getType());
-            const auto found = port_dir.find(&m);
-            info.dir         = found != port_dir.end() ? found->second : ir::SignalInfo::Direction::Internal;
-
-            sigmap_[&vs] = module_.add_signal(std::move(info));
         }
     }
 
