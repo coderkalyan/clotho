@@ -187,12 +187,104 @@ TEST_CASE("forever loop lowers to a Loop instruction") {
     CHECK(any_process_has_tag(*r.module, ir::Inst::Tag::Loop));
 }
 
-// Out-of-scope loop forms still fail loudly rather than miscompiling.
-TEST_CASE("repeat loop is reported as unsupported") {
+// repeat (N) runs the body exactly N times (12.7.2).
+TEST_CASE("repeat loop runs N times") {
+    CHECK(run_capture(R"(
+        module m;
+            integer i;
+            initial begin
+                for (i = 0; i < 3; i = i + 1) ; // touch a control var
+                repeat (3) $display("x");
+            end
+        endmodule
+    )") == "x\nx\nx\n");
+}
+
+// Lowers to the generic Loop instruction.
+TEST_CASE("repeat loop lowers to a Loop") {
     const LowerResult r = lower_text(R"(
         module m;
             initial repeat (3) $display("x");
         endmodule
     )");
-    CHECK_FALSE(r.ok);
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    CHECK(any_process_has_tag(*r.module, ir::Inst::Tag::Loop));
+}
+
+// A zero, negative, or X/Z count yields zero iterations (12.7.2).
+TEST_CASE("repeat loop with non-positive or unknown count runs zero times") {
+    CHECK(run_capture(R"(
+        module m;
+            initial begin
+                repeat (0) $display("zero");
+                $display("after-zero");
+            end
+        endmodule
+    )") == "after-zero\n");
+
+    CHECK(run_capture(R"(
+        module m;
+            integer n;
+            initial begin
+                n = -1;
+                repeat (n) $display("neg");
+                $display("after-neg");
+            end
+        endmodule
+    )") == "after-neg\n");
+
+    // An uninitialized 4-state integer is all-X, so the count is unknown.
+    CHECK(run_capture(R"(
+        module m;
+            integer n;
+            initial begin
+                repeat (n) $display("x");
+                $display("after-x");
+            end
+        endmodule
+    )") == "after-x\n");
+}
+
+// The count is sampled once on entry; mutating its source inside the body does
+// not change the iteration total (12.7.2).
+TEST_CASE("repeat loop count is evaluated once") {
+    CHECK(run_capture(R"(
+        module m;
+            integer n;
+            initial begin
+                n = 3;
+                repeat (n) begin
+                    $display("i");
+                    n = n + 10; // must not extend the loop
+                end
+            end
+        endmodule
+    )") == "i\ni\ni\n");
+}
+
+// Side effects in the body observe an independent loop counter each pass.
+TEST_CASE("repeat loop body side effects") {
+    CHECK(run_capture(R"(
+        module m;
+            integer k;
+            initial begin
+                k = 0;
+                repeat (4) begin
+                    k = k + 1;
+                    $display("%0d", k);
+                end
+            end
+        endmodule
+    )") == "1\n2\n3\n4\n");
+}
+
+// Nested repeat multiplies the iteration counts.
+TEST_CASE("repeat loop nesting") {
+    CHECK(run_capture(R"(
+        module m;
+            initial
+                repeat (2)
+                    repeat (3) $display("y");
+        endmodule
+    )") == "y\ny\ny\ny\ny\ny\n");
 }

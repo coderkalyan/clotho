@@ -787,6 +787,9 @@ private:
             case StatementKind::ForeverLoop:
                 lower_forever(stmt.as<ForeverLoopStatement>(), b);
                 break;
+            case StatementKind::RepeatLoop:
+                lower_repeat(stmt.as<RepeatLoopStatement>(), b);
+                break;
             default:
                 fail("unsupported statement");
         }
@@ -889,6 +892,56 @@ private:
         const ir::ExtraSlice step = b.close_region(); // empty
 
         b.loop(cond, pred, body, step, loc(f));
+    }
+
+    // repeat-loop (12.7.2): runs the body N times, where N is the count
+    // expression evaluated EXACTLY ONCE on entry. Lowers to the generic Loop with
+    // a hidden counter and a hidden bound: `for (counter = 0; counter < bound;
+    // counter++) body`. The count's own type (width + signedness) carries through
+    // so a negative signed count yields zero iterations (0 < negative is false),
+    // and an X/Z count yields zero iterations (the Lt predicate is non-definite-1,
+    // which the backend's definite-1 loop rule treats as exit).
+    void lower_repeat(const RepeatLoopStatement& r, ir::Builder& b) {
+        const ir::SourceLoc l   = loc(r);
+        const ir::Ref       ty  = lower_type(*r.count.type);
+
+        // Hidden bound holds the once-evaluated count; hidden counter starts at 0.
+        // Both live in the enclosing region, like a for-loop's init.
+        const ir::Signal bound   = declare_temp(ty, "repeat_bound");
+        const ir::Signal counter = declare_temp(ty, "repeat_count");
+        b.binary(ir::Inst::Tag::Store, b.signal(bound, l), b.resize(lower_expr(r.count, b), ty, l), l);
+        b.binary(ir::Inst::Tag::Store, b.signal(counter, l),
+                 b.constant(module_.pool.put_int(ty, 0), l), l);
+
+        b.open_region();
+        const ir::Index cur  = b.unary(ir::Inst::Tag::Load, b.signal(counter, l), l);
+        const ir::Index lim  = b.unary(ir::Inst::Tag::Load, b.signal(bound, l), l);
+        const ir::Index pred = b.binary(ir::Inst::Tag::Lt, cur, lim, l);
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        lower_stmt(r.body, b);
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        const ir::Index step_cur = b.unary(ir::Inst::Tag::Load, b.signal(counter, l), l);
+        const ir::Index one      = b.constant(module_.pool.put_int(ty, 1), l);
+        const ir::Index next     = b.binary(ir::Inst::Tag::Add, step_cur, one, l);
+        b.binary(ir::Inst::Tag::Store, b.signal(counter, l), next, l);
+        const ir::ExtraSlice step = b.close_region();
+
+        b.loop(cond, pred, body, step, l);
+    }
+
+    // Register a hidden compiler temporary as backing signal storage. Unlike
+    // declare_local there is no source ValueSymbol, so the name is synthesized.
+    ir::Signal declare_temp(ir::Ref type, std::string_view role) {
+        ir::SignalInfo info;
+        info.name = prefix_ + "__" + std::string(role) + std::to_string(temp_id_++);
+        info.type = type;
+        info.dir  = ir::SignalInfo::Direction::Internal;
+
+        return module_.add_signal(std::move(info));
     }
 
     // A for_initialization assignment or a for_step (12.7.1, A.6.8): a simple
@@ -1384,6 +1437,9 @@ private:
     // scaled up by this into ticks; $time is scaled (rounded) down by it. Always
     // 1 when unitless. Saved / restored around child-instance recursion.
     uint64_t time_mul_ = 1;
+    // Monotonic counter naming hidden compiler temporaries (e.g. a repeat loop's
+    // counter / bound) so their flattened signal names stay unique.
+    uint32_t temp_id_ = 0;
 };
 
 LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
