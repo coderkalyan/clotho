@@ -130,6 +130,8 @@ const char* tag_name(Inst::Tag tag) {
             return "display";
         case T::Finish:
             return "finish";
+        case T::SimTime:
+            return "sim_time";
     }
 
     return "?";

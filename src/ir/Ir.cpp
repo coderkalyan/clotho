@@ -58,6 +58,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Display:
             return K::Display;
         case T::Finish:
+        case T::SimTime:
             return K::None;
         case T::Wait:
             return K::Wait;

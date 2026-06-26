@@ -254,6 +254,14 @@ struct Inst {
         // has $stop suspend and $finish exit; with no resume mechanism a suspend
         // is observationally an exit, so both are treated identically.
         Finish,
+
+        // -- System functions --
+        // $time / $stime: read the simulation clock, -> 64-bit unsigned (payload:
+        // none). Lowers to a `rt_wheel_now` call; the value is always known (no
+        // x/z). With no timescale support every design element is unit time, so
+        // the raw tick count is the time-unit-scaled value the LRM mandates (LRM
+        // §20.3.1). $stime truncates the result to 32 bits via a frontend Resize.
+        SimTime,
     };
 
     // Which union member a tag activates. Drives payload_kind() / operands().

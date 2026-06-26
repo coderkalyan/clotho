@@ -1677,6 +1677,8 @@ private:
             }
             case Inst::Tag::Load:
                 return type_of(p.unary);
+            case Inst::Tag::SimTime:
+                return { 64, false, false };
 
             case Inst::Tag::Add:
             case Inst::Tag::Sub:
@@ -1903,6 +1905,13 @@ private:
             case Inst::Tag::Finish:
                 lower_finish();
                 return;
+
+            case Inst::Tag::SimTime: {
+                // The clock value is always known: must == may, z == 0.
+                llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
+                set_value(i, packed(now, now, zero(64)));
+                return;
+            }
 
             case Inst::Tag::Arg:
                 throw BackendError{ "arg (function/task parameter) not supported by the process backend" };

@@ -65,6 +65,10 @@ public:
     // $finish / $stop: end the simulation and exit. No operands.
     Index finish(SourceLoc loc);
 
+    // -- System functions --
+    // $time / $stime: read the simulation clock. Yields a 64-bit unsigned value.
+    Index sim_time(SourceLoc loc);
+
     // -- Regions --
     // Begin a nested region; subsequent emits accumulate into it until closed.
     void open_region();

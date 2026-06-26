@@ -195,8 +195,19 @@ public:
         }
         const std::string         self_prefix(prefix);
         const InstanceBodySymbol& body = inst.body;
-        prefix_                        = self_prefix;
-        scope_                         = &body;
+
+        // TODO: timescale support. Clotho has no per-module time unit/precision;
+        // the event wheel counts in abstract ticks (one tick == one time unit).
+        // A `timescale / timeunit / timeprecision would require scaling delays
+        // and the $time family to the module's unit (LRM §3.14, §20.3), so reject
+        // it loudly rather than silently mis-scale. slang folds both the directive
+        // and timeunit/timeprecision declarations into this single field.
+        if (inst.getDefinition().timeScale.has_value()) {
+            fail("timescale / timeunit / timeprecision is not supported");
+        }
+
+        prefix_ = self_prefix;
+        scope_  = &body;
         collect_signals(body);
 
         // prefix_ holds self_prefix on entry to each iteration: it is set above and
@@ -940,6 +951,34 @@ private:
         fail("unsupported system task '" + std::string(name) + "'");
     }
 
+    // Lower a system function call used as an rvalue (e.g. `$time`). User function
+    // calls are not yet supported.
+    ir::Index lower_sysfunc(const CallExpression& call, ir::Builder& b) {
+        if (!call.isSystemCall()) {
+            fail("user function calls are not supported");
+        }
+        const std::string_view name = call.getSubroutineName();
+        const ir::SourceLoc    l    = loc(call);
+
+        // $time: 64-bit, scaled to the calling module's time unit (LRM §20.3.1).
+        // $stime: same value truncated to the low 32 bits (LRM §20.3.2). With no
+        // timescale, the wheel tick count is already the scaled value, so $time
+        // is the raw clock and $stime resizes it to its 32-bit return type.
+        if (name == "$time") {
+            return b.sim_time(l);
+        }
+        if (name == "$stime") {
+            return b.resize(b.sim_time(l), lower_type(*call.type), l);
+        }
+
+        // TODO: $realtime (LRM §20.3.3) returns a real scaled to the module time
+        // unit; blocked on real (floating-point) value support in the IR.
+        if (name == "$realtime") {
+            fail("$realtime is not supported (no real-type support)");
+        }
+        fail("unsupported system function '" + std::string(name) + "'");
+    }
+
     // Lower $display / $write into a single format string plus the value args its
     // specifiers consume. A string-literal argument contributes its text verbatim
     // (its %-specifiers pull from following value args, SV-style); a bare value
@@ -1067,6 +1106,8 @@ private:
                 const ConversionExpression& cv = expr.as<ConversionExpression>();
                 return b.resize(lower_expr(cv.operand(), b), lower_type(*expr.type), l);
             }
+            case ExpressionKind::Call:
+                return lower_sysfunc(expr.as<CallExpression>(), b);
             default:
                 fail("unsupported expression kind=" + std::string(slang::ast::toString(expr.kind)));
         }

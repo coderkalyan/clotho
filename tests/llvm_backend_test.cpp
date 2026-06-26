@@ -284,6 +284,35 @@ TEST_CASE("$finish with a diagnostic-level argument lowers (argument ignored)") 
     CHECK(ir.find("call void @rt_finish()") != std::string::npos);
 }
 
+TEST_CASE("$time and $stime read the simulation clock") {
+    // With no timescale the wheel tick count is the time-unit-scaled value, so
+    // $time returns the raw clock and $stime mirrors it (truncated to 32 bits).
+    const std::string out = run_capture(R"(
+        module m;
+            initial begin
+                $display("%0d", $time);
+                #5;
+                $display("%0d %0d", $time, $stime);
+                #3;
+                $display("%0d", $time);
+            end
+        endmodule
+    )");
+
+    CHECK(out == "0\n5 5\n8\n");
+}
+
+TEST_CASE("$time lowers to an rt_wheel_now call") {
+    constexpr std::string_view src = R"(
+        module m;
+            initial $display("%0d", $time);
+        endmodule
+    )";
+    const std::string          ir  = emit(src);
+
+    CHECK(ir.find("call i64 @rt_wheel_now(") != std::string::npos);
+}
+
 TEST_CASE("repeated instantiation emits distinct process symbols") {
     // Two instances of one module share AST source locations; the backend must
     // name their processes uniquely (by index) or LLVM would reject duplicate

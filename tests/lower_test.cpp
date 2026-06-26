@@ -175,6 +175,53 @@ TEST_CASE("a case with multiple labels per item ORs the comparisons") {
     CHECK(has_tag(p->ir, ir::Inst::Tag::Lor));
 }
 
+TEST_CASE("$time lowers to a SimTime instruction") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            initial $display("%0d", $time);
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    bool found = false;
+    for (const ir::Process& p : r.module->processes()) {
+        found = found || has_tag(p.ir, ir::Inst::Tag::SimTime);
+    }
+    CHECK(found);
+}
+
+TEST_CASE("a `timescale directive is reported as unsupported") {
+    const LowerResult r = lower_text(R"(`timescale 1ns/1ps
+        module m;
+            initial #5 $display("x");
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("timescale") != std::string::npos);
+}
+
+TEST_CASE("a timeunit declaration is reported as unsupported") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            timeunit 1ns;
+            timeprecision 1ps;
+            initial #5 $display("x");
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("timescale") != std::string::npos);
+}
+
+TEST_CASE("$realtime is reported as unsupported") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            initial $display("%0d", $realtime);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("$realtime") != std::string::npos);
+}
+
 TEST_CASE("case inside is reported as unsupported") {
     const LowerResult ri = lower_text(R"(
         module m(input [2:0] s, output reg x);
