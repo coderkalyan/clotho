@@ -293,6 +293,16 @@ std::set<std::string> signal_names(const ir::Module& m) {
     return names;
 }
 
+// Packed bit width of the named signal, or 0 if absent.
+uint32_t signal_width(const ir::Module& m, std::string_view name) {
+    for (const ir::SignalInfo& s : m.signals()) {
+        if (s.name == name) {
+            return m.pool.layout(s.type).width;
+        }
+    }
+    return 0;
+}
+
 // Two-level hierarchy: an inverter child wired into a top via one input and one
 // output port.
 constexpr std::string_view kHier = R"(
@@ -448,4 +458,65 @@ TEST_CASE("a continuous assign with a constant RHS has an empty wait list") {
     REQUIRE(p != nullptr);
     // No source elements: the process runs once at time zero and never re-triggers.
     CHECK(p->wait_events.empty());
+}
+
+// -- Parameters (LRM 6.20) --
+
+TEST_CASE("a parameter sets a signal width and drives a replication count") {
+    const LowerResult r = lower_text(R"(
+        module m #(parameter W = 4) (output [W-1:0] o);
+            assign o = {W{1'b1}};
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    CHECK(signal_width(*r.module, "o") == 4);
+}
+
+TEST_CASE("a #() override specializes each instance's width independently") {
+    const LowerResult r = lower_text(R"(
+        module m #(parameter W = 4) (output [W-1:0] o);
+            assign o = {W{1'b0}};
+        endmodule
+        module top(output [2:0] a, output [7:0] b);
+            m #(.W(3)) u0(.o(a));
+            m #(.W(8)) u1(.o(b));
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    CHECK(signal_width(*r.module, "u0.o") == 3);
+    CHECK(signal_width(*r.module, "u1.o") == 8);
+}
+
+TEST_CASE("a parameter referenced in an rvalue folds to a constant, not a signal read") {
+    const LowerResult r = lower_text(R"(
+        module m #(parameter W = 5) (input [7:0] a, output [7:0] y);
+            assign y = a + W;
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    // W is a compile-time constant: the assign is sensitive only to `a`.
+    const ir::Process* p = find_level_process(*r.module);
+    REQUIRE(p != nullptr);
+    CHECK(sensitivity_names(*r.module, *p) == std::set<std::string>{ "a" });
+}
+
+TEST_CASE("a localparam derived from a parameter resolves its width") {
+    const LowerResult r = lower_text(R"(
+        module m #(parameter W = 4) (output [2*W-1:0] o);
+            localparam D = 2 * W;
+            assign o = {D{1'b0}};
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    CHECK(signal_width(*r.module, "o") == 8);
+}
+
+TEST_CASE("a parameter expression in a part-select bound folds") {
+    const LowerResult r = lower_text(R"(
+        module m #(parameter W = 8) (input [W-1:0] a, output [1:0] o);
+            assign o = a[W-1:W-2];
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    CHECK(signal_width(*r.module, "o") == 2);
 }

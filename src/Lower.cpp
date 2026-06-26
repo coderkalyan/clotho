@@ -8,8 +8,10 @@
 
 #include <ankerl/unordered_dense.h>
 
+#include <slang/ast/ASTContext.h>
 #include <slang/ast/ASTVisitor.h>
 #include <slang/ast/Compilation.h>
+#include <slang/ast/EvalContext.h>
 #include <slang/ast/Expression.h>
 #include <slang/ast/SemanticFacts.h>
 #include <slang/ast/Statement.h>
@@ -29,6 +31,7 @@
 #include <slang/ast/symbols/CompilationUnitSymbols.h>
 #include <slang/ast/symbols/InstanceSymbols.h>
 #include <slang/ast/symbols/MemberSymbols.h>
+#include <slang/ast/symbols/ParameterSymbols.h>
 #include <slang/ast/symbols/PortSymbols.h>
 #include <slang/ast/symbols/ValueSymbol.h>
 #include <slang/ast/symbols/VariableSymbols.h>
@@ -193,6 +196,7 @@ public:
         const std::string         self_prefix(prefix);
         const InstanceBodySymbol& body = inst.body;
         prefix_                        = self_prefix;
+        scope_                         = &body;
         collect_signals(body);
 
         // prefix_ holds self_prefix on entry to each iteration: it is set above and
@@ -214,6 +218,7 @@ public:
                     // prefix_ at the child level, so restore it before wiring.
                     lower_instance(child, self_prefix + std::string(child.name) + ".");
                     prefix_ = self_prefix;
+                    scope_  = &body;
                     wire_ports(child);
                     break;
                 }
@@ -278,8 +283,11 @@ private:
     // value^unknown so the per-bit codes line up. 2-state literals take the fast
     // uint64 path.
     ir::Ref lower_int_literal(const IntegerLiteral& lit) {
-        const ir::Ref      ty = lower_type(*lit.type);
-        const slang::SVInt v  = lit.getValue();
+        return svint_to_ref(lit.getValue(), lower_type(*lit.type));
+    }
+
+    // Convert a slang SVInt into a pooled IR constant of the given type.
+    ir::Ref svint_to_ref(const slang::SVInt& v, ir::Ref ty) {
         if (!v.hasUnknown()) {
             return module_.pool.put_int(ty, v.as<uint64_t>().value_or(0));
         }
@@ -299,6 +307,20 @@ private:
         std::memcpy(bytes.data() + pb, planes.data() + words, pb);
 
         return module_.pool.put_value(ty, bytes);
+    }
+
+    // Lower a slang compile-time constant (a resolved parameter value or a
+    // folded constant-required expression) into a pooled IR constant. Only
+    // integral constants are modeled; real/string/aggregate constants are
+    // outside the synthesizable-RTL scope.
+    //
+    // TODO: real/string/struct/array/enum constant parameters (depends on the
+    // matching runtime types — see docs/TODO.md Tier 3).
+    ir::Ref lower_constant(const slang::ConstantValue& cv, const slang::ast::Type& type) {
+        if (!cv.isInteger()) {
+            fail("only integral constant parameters are supported");
+        }
+        return svint_to_ref(cv.integer(), lower_type(type));
     }
 
     // -- Signals --
@@ -991,7 +1013,12 @@ private:
             case ExpressionKind::IntegerLiteral:
                 return b.constant(lower_int_literal(expr.as<IntegerLiteral>()), l);
             case ExpressionKind::NamedValue: {
-                const ir::Signal sig = signal_of(expr.as<NamedValueExpression>().symbol);
+                const ValueSymbol& sym = expr.as<NamedValueExpression>().symbol;
+                if (sym.kind == SymbolKind::Parameter) {
+                    const ParameterSymbol& p = sym.as<ParameterSymbol>();
+                    return b.constant(lower_constant(p.getValue(), p.getType()), l);
+                }
+                const ir::Signal sig = signal_of(sym);
                 return b.unary(ir::Inst::Tag::Load, b.signal(sig, l), l);
             }
             case ExpressionKind::UnaryOp:
@@ -1155,19 +1182,24 @@ private:
         }
     }
 
-    // Read a constant integer expression (literal, possibly behind conversions).
+    // Evaluate a constant integer expression (a literal, a parameter reference,
+    // or any constant-foldable expression over them, e.g. `W-1` or `W*2`).
+    // Folded with slang against the current instance scope so parameterized
+    // widths, replication counts and part-select bounds resolve to a value.
     uint64_t const_uint(const Expression& e) {
-        const Expression* p = &e;
-        while (p->kind == ExpressionKind::Conversion) {
-            p = &p->as<ConversionExpression>().operand();
+        slang::ast::ASTContext  astCtx(*scope_, slang::ast::LookupLocation::max);
+        slang::ast::EvalContext evalCtx(astCtx);
+        const slang::ConstantValue cv = e.eval(evalCtx);
+        if (!cv.isInteger()) {
+            fail("expected a constant integer");
         }
-        if (p->kind == ExpressionKind::IntegerLiteral) {
-            return p->as<IntegerLiteral>().getValue().as<uint64_t>().value_or(0);
-        }
-        fail("expected a constant integer");
+        return cv.integer().as<uint64_t>().value_or(0);
     }
 
     ir::Module& module_;
+    // Scope of the instance body currently being lowered; used to fold constant
+    // expressions (parameter references and arithmetic over them).
+    const slang::ast::Scope* scope_ = nullptr;
     // Maps an elaborated value symbol to its module Signal handle.
     ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal> sigmap_;
     // Hierarchical name prefix of the instance currently being lowered (e.g.
