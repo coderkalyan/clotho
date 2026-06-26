@@ -190,17 +190,16 @@ TEST_CASE("$time lowers to a SimTime instruction") {
     CHECK(found);
 }
 
-TEST_CASE("a `timescale directive is reported as unsupported") {
+TEST_CASE("a `timescale directive lowers") {
     const LowerResult r = lower_text(R"(`timescale 1ns/1ps
         module m;
             initial #5 $display("x");
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("timescale") != std::string::npos);
+    CHECK(r.ok);
 }
 
-TEST_CASE("a timeunit declaration is reported as unsupported") {
+TEST_CASE("timeunit / timeprecision declarations lower") {
     const LowerResult r = lower_text(R"(
         module m;
             timeunit 1ns;
@@ -208,8 +207,7 @@ TEST_CASE("a timeunit declaration is reported as unsupported") {
             initial #5 $display("x");
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("timescale") != std::string::npos);
+    CHECK(r.ok);
 }
 
 TEST_CASE("$realtime is reported as unsupported") {

@@ -36,8 +36,10 @@
 #include <slang/ast/symbols/ValueSymbol.h>
 #include <slang/ast/symbols/VariableSymbols.h>
 #include <slang/ast/types/Type.h>
+#include <slang/ast/Scope.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/diagnostics/TextDiagnosticClient.h>
+#include <slang/numeric/Time.h>
 #include <slang/syntax/SyntaxTree.h>
 
 #include "SourceMap.h"
@@ -54,6 +56,60 @@ using namespace slang::ast;
 struct LowerError {
     std::string message;
 };
+
+// Femtoseconds in one unit of a time-scale value. Magnitude is 1/10/100 and the
+// unit is a power-of-ten fraction of a second, so the result is a power of ten.
+uint64_t tsv_to_fs(slang::TimeScaleValue v) {
+    uint64_t fs_per_unit = 1;
+    switch (v.unit) {
+        case slang::TimeUnit::Femtoseconds:
+            fs_per_unit = 1ULL;
+            break;
+        case slang::TimeUnit::Picoseconds:
+            fs_per_unit = 1'000ULL;
+            break;
+        case slang::TimeUnit::Nanoseconds:
+            fs_per_unit = 1'000'000ULL;
+            break;
+        case slang::TimeUnit::Microseconds:
+            fs_per_unit = 1'000'000'000ULL;
+            break;
+        case slang::TimeUnit::Milliseconds:
+            fs_per_unit = 1'000'000'000'000ULL;
+            break;
+        case slang::TimeUnit::Seconds:
+            fs_per_unit = 1'000'000'000'000'000ULL;
+            break;
+    }
+
+    return static_cast<uint64_t>(v.magnitude) * fs_per_unit;
+}
+
+// Finest time precision (fs) over an instance subtree, plus whether any design
+// unit set a timescale explicitly. The wheel tick is this precision; delays and
+// the $time family scale against it. Mirrors lower_instance's recursion. Uses
+// each scope's *effective* timescale (slang resolves inheritance / the default),
+// but the caller treats the result as unitless unless `any_explicit` is set, so
+// a design with no directive keeps raw-tick time (LRM §3.14.2.3).
+uint64_t design_tick_fs(const InstanceSymbol& inst, bool& any_explicit) {
+    uint64_t min_fs = 0;
+    if (inst.getDefinition().timeScale.has_value()) {
+        any_explicit = true;
+    }
+    if (const auto ts = inst.body.getTimeScale()) {
+        min_fs = tsv_to_fs(ts->precision);
+    }
+    for (const Symbol& m : inst.body.members()) {
+        if (m.kind == SymbolKind::Instance) {
+            const uint64_t child = design_tick_fs(m.as<InstanceSymbol>(), any_explicit);
+            if (child != 0 && (min_fs == 0 || child < min_fs)) {
+                min_fs = child;
+            }
+        }
+    }
+
+    return min_fs;
+}
 
 ir::SignalInfo::Direction direction_of(slang::ast::ArgumentDirection d) {
     switch (d) {
@@ -181,8 +237,11 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, /*Statements=*/tr
 // Walks the elaborated AST of one top module into an ir::Module.
 class Lowerer {
 public:
-    explicit Lowerer(ir::Module& module)
-      : module_(module) {}
+    // `tick_fs` is the femtoseconds-per-wheel-tick (design-wide finest time
+    // precision), or 0 when no design unit set a timescale (unitless ticks).
+    Lowerer(ir::Module& module, uint64_t tick_fs)
+      : module_(module)
+      , tick_fs_(tick_fs) {}
 
     // Flatten one elaborated instance into the module: register its signals under
     // `prefix`, lower its processes, then recurse into child instances and wire
@@ -196,15 +255,17 @@ public:
         const std::string         self_prefix(prefix);
         const InstanceBodySymbol& body = inst.body;
 
-        // TODO: timescale support. Clotho has no per-module time unit/precision;
-        // the event wheel counts in abstract ticks (one tick == one time unit).
-        // A `timescale / timeunit / timeprecision would require scaling delays
-        // and the $time family to the module's unit (LRM §3.14, §20.3), so reject
-        // it loudly rather than silently mis-scale. slang folds both the directive
-        // and timeunit/timeprecision declarations into this single field.
-        if (inst.getDefinition().timeScale.has_value()) {
-            fail("timescale / timeunit / timeprecision is not supported");
+        // This instance's delay / $time multiplier: its time unit divided by the
+        // wheel tick (the design's finest precision). Both are powers of ten and
+        // the unit is never finer than the precision, so the ratio is an exact
+        // integer (LRM §3.14). Stays 1 in unitless mode. Saved here so the
+        // post-recursion restore below (with prefix_ / scope_) returns it to this
+        // level after a child runs.
+        if (tick_fs_ != 0) {
+            const auto ts = body.getTimeScale();
+            time_mul_     = ts ? tsv_to_fs(ts->base) / tick_fs_ : 1;
         }
+        const uint64_t self_mul = time_mul_;
 
         prefix_ = self_prefix;
         scope_  = &body;
@@ -228,8 +289,9 @@ public:
                     // already registered in this (parent) body. Recursion leaves
                     // prefix_ at the child level, so restore it before wiring.
                     lower_instance(child, self_prefix + std::string(child.name) + ".");
-                    prefix_ = self_prefix;
-                    scope_  = &body;
+                    prefix_   = self_prefix;
+                    scope_    = &body;
+                    time_mul_ = self_mul;
                     wire_ports(child);
                     break;
                 }
@@ -660,7 +722,7 @@ private:
                 const TimedStatement& timed = stmt.as<TimedStatement>();
                 if (timed.timing.kind == TimingControlKind::Delay) {
                     const Expression& amount = timed.timing.as<DelayControl>().expr;
-                    b.unary(ir::Inst::Tag::Delay, lower_expr(amount, b), loc(stmt));
+                    b.unary(ir::Inst::Tag::Delay, scaled_delay(amount, b), loc(stmt));
                 } else if (is_event_control(timed.timing)) {
                     lower_event_wait(timed.timing, b, loc(stmt));
                 } else {
@@ -948,7 +1010,50 @@ private:
             b.finish(loc(call));
             return;
         }
+        if (name == "$printtimescale") {
+            lower_printtimescale(call, b);
+            return;
+        }
         fail("unsupported system task '" + std::string(name) + "'");
+    }
+
+    // $printtimescale [hier]: print "Time scale of (<path>) is <unit> / <prec>"
+    // for a scope (LRM §21.3.1.2). With no argument the scope is the calling
+    // module; the timescale and path are compile-time constants, so this folds to
+    // a literal $display.
+    void lower_printtimescale(const CallExpression& call, ir::Builder& b) {
+        // TODO: a hierarchical-name argument selects another scope's timescale;
+        // resolving it needs cross-hierarchy lookup, which Clotho lacks.
+        if (!call.arguments().empty()) {
+            fail("$printtimescale with a scope argument is not supported");
+        }
+        const auto ts = scope_->getTimeScale();
+        if (!ts) {
+            // TODO: a scope with no timescale prints the simulator default; Clotho
+            // has no unitless $printtimescale text yet.
+            fail("$printtimescale requires a timescale");
+        }
+        const std::string path = prefix_.empty() ? module_.name : prefix_.substr(0, prefix_.size() - 1);
+        const std::string text = "Time scale of (" + path + ") is " + ts->toString();
+        b.display(text, /*newline=*/true, {}, loc(call));
+    }
+
+    // Lower a #delay amount, scaled from the module's time unit to wheel ticks.
+    // The unit multiplier is a compile-time constant; widen to 64 bits and
+    // multiply so a large unit (e.g. seconds against fs precision) cannot
+    // overflow the amount's declared width. No rounding is needed: an integer
+    // delay times the unit is always an exact multiple of the precision (LRM
+    // §3.14). Real (fractional) delays, which would round, are not yet supported.
+    ir::Index scaled_delay(const Expression& amount, ir::Builder& b) {
+        const ir::Index v = lower_expr(amount, b);
+        if (time_mul_ <= 1) {
+            return v;
+        }
+        const ir::SourceLoc l   = loc(amount);
+        const ir::Ref       u64 = make_int_type(64, false, false);
+        const ir::Index     mul = b.constant(module_.pool.put_int(u64, time_mul_), l);
+
+        return b.binary(ir::Inst::Tag::Mul, b.resize(v, u64, l), mul, l);
     }
 
     // Lower a system function call used as an rvalue (e.g. `$time`). User function
@@ -961,14 +1066,15 @@ private:
         const ir::SourceLoc    l    = loc(call);
 
         // $time: 64-bit, scaled to the calling module's time unit (LRM §20.3.1).
-        // $stime: same value truncated to the low 32 bits (LRM §20.3.2). With no
-        // timescale, the wheel tick count is already the scaled value, so $time
-        // is the raw clock and $stime resizes it to its 32-bit return type.
+        // $stime: same value truncated to the low 32 bits (LRM §20.3.2). The
+        // backend divides the wheel tick by time_mul_ (1 when unitless) to scale
+        // the finest-precision clock down to the module unit; $stime resizes the
+        // result to its 32-bit return type.
         if (name == "$time") {
-            return b.sim_time(l);
+            return b.sim_time(time_mul_, l);
         }
         if (name == "$stime") {
-            return b.resize(b.sim_time(l), lower_type(*call.type), l);
+            return b.resize(b.sim_time(time_mul_, l), lower_type(*call.type), l);
         }
 
         // TODO: $realtime (LRM §20.3.3) returns a real scaled to the module time
@@ -1247,6 +1353,12 @@ private:
     // "u_alu.u_sub."); empty for the top. Prepended to every signal name created
     // while this instance's body is processed so flattened signals stay unique.
     std::string prefix_;
+    // Femtoseconds per wheel tick (design-wide finest precision); 0 == unitless.
+    uint64_t tick_fs_ = 0;
+    // Time-unit multiplier of the instance currently being lowered: a delay is
+    // scaled up by this into ticks; $time is scaled (rounded) down by it. Always
+    // 1 when unitless. Saved / restored around child-instance recursion.
+    uint64_t time_mul_ = 1;
 };
 
 LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
@@ -1290,11 +1402,16 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
         return result;
     }
 
-    // Analysis: walk the elaborated AST into clotho IR.
-    const auto t_an   = std::chrono::steady_clock::now();
-    auto       module = std::make_unique<ir::Module>();
+    // Analysis: walk the elaborated AST into clotho IR. The wheel tick is the
+    // design's finest time precision; if no design unit set a timescale, time
+    // stays unitless (one tick == one time unit) and nothing is scaled.
+    const auto t_an         = std::chrono::steady_clock::now();
+    auto       module       = std::make_unique<ir::Module>();
+    bool       any_explicit = false;
+    const uint64_t prec_fs  = design_tick_fs(*root.topInstances[0], any_explicit);
+    const uint64_t tick_fs  = any_explicit ? prec_fs : 0;
     try {
-        Lowerer(*module).lower_instance(*root.topInstances[0], "");
+        Lowerer(*module, tick_fs).lower_instance(*root.topInstances[0], "");
     } catch (const LowerError& e) {
         result.diagnostics += "error: " + e.message + "\n";
         return result;

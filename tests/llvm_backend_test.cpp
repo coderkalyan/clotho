@@ -313,6 +313,53 @@ TEST_CASE("$time lowers to an rt_wheel_now call") {
     CHECK(ir.find("call i64 @rt_wheel_now(") != std::string::npos);
 }
 
+TEST_CASE("timescale scales delays into the global precision and $time back to the unit") {
+    // The wheel counts in the design's finest precision (1ps here, from top).
+    // sub's #5 is 5 ns == 5000 ticks, so it fires AFTER top's #4000 (4000 ticks),
+    // proving the delay scaled up. sub's $time scales back to its 1ns unit (5),
+    // while top's 1ps unit reads ticks directly (4000).
+    const std::string out = run_capture(R"(`timescale 1ns/1ps
+        module sub;
+            initial #5 $display("sub %0d", $time);
+        endmodule
+        `timescale 1ps/1ps
+        module top;
+            sub s();
+            initial #4000 $display("top %0d", $time);
+        endmodule
+    )");
+
+    CHECK(out == "top 4000\nsub 5\n");
+}
+
+TEST_CASE("$time rounds the scaled clock to the nearest module time unit") {
+    // Global precision is 1ns. fine's #15 lands the wheel on tick 15; top's unit
+    // is 10ns, so $time = round(15 / 10) = 2 (1.5 rounds up, LRM §20.3.1).
+    const std::string out = run_capture(R"(`timescale 1ns/1ns
+        module fine(output reg ping);
+            initial begin ping = 0; #15 ping = 1; end
+        endmodule
+        `timescale 10ns/1ns
+        module top;
+            wire ping;
+            fine f(.ping(ping));
+            always @(posedge ping) $display("%0d", $time);
+        endmodule
+    )");
+
+    CHECK(out == "2\n");
+}
+
+TEST_CASE("$printtimescale prints the scope unit and precision") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ps
+        module m;
+            initial $printtimescale;
+        endmodule
+    )");
+
+    CHECK(out == "Time scale of (m) is 1ns / 1ps\n");
+}
+
 TEST_CASE("repeated instantiation emits distinct process symbols") {
     // Two instances of one module share AST source locations; the backend must
     // name their processes uniquely (by index) or LLVM would reject duplicate
