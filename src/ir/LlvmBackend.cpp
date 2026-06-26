@@ -95,6 +95,30 @@ struct SignalSlot {
     uint32_t width      = 0;
     bool     four_state = false;
     bool     is_signed  = false;
+    // Nonblocking-assignment staging. Set only for signals that are NBA targets.
+    // A target gets a shadow `{ i(2W) nmm, iW nz }` mirroring its live slot; a
+    // target with any bit/part-select site also gets an iW dirty `mask`. nba_id is
+    // a dense index into the pending flags / meta table; nba_bucket indexes the
+    // per-(width, partial) commit worklist.
+    bool     nba         = false;
+    bool     nba_partial = false;
+    uint32_t nba_id      = 0;
+    uint32_t nba_bucket  = 0;
+    uint32_t off_nmm     = 0;
+    uint32_t off_nz      = 0;
+    uint32_t off_mask    = 0;
+};
+
+// One NBA commit bucket: every NBA-target signal of a given width and partial-ness
+// shares a worklist (of nba-ids) and a width-specialized commit loop. Splitting by
+// width lets each loop type its plane loads/stores exactly (LLVM integer widths are
+// static); splitting full vs partial keeps whole-signal commits free of mask/RMW.
+struct NbaBucket {
+    uint32_t              width;          // signal width (the commit loop bakes it in)
+    bool                  partial;        // mask-RMW commit vs whole copy
+    llvm::ArrayType*      ty   = nullptr; // [cap x i32] of nba-ids
+    llvm::GlobalVariable* gv   = nullptr;
+    llvm::GlobalVariable* top  = nullptr; // i32 live count
 };
 
 // Raised on a construct the backend cannot lower; caught at the top level.
@@ -117,6 +141,7 @@ public:
         build_state_layout();
         build_wait_queues();
         build_sched_flags();
+        build_nba_state();
 
         // Lower every process and seed every one at startup. An `initial` runs its
         // body once; an `always` with a sensitivity list immediately subscribes to
@@ -210,6 +235,8 @@ private:
             return field_align(2 * slots_[a].width) > field_align(2 * slots_[b].width);
         });
 
+        nba_classify();
+
         uint32_t cursor = 0;
         for (uint32_t i : order) {
             SignalSlot&    slot       = slots_[i];
@@ -224,7 +251,72 @@ private:
             cursor += slot_size;
         }
 
+        // Shadow staging fields for NBA targets, placed after the live region in
+        // nba-id order (= signal order). A shadow mirrors the live `{ i(2W), iW }`;
+        // a partial target adds an iW dirty mask.
+        for (uint32_t i = 0; i < sigs.size(); ++i) {
+            SignalSlot& slot = slots_[i];
+            if (!slot.nba) {
+                continue;
+            }
+            const uint32_t mm_bits = 2 * slot.width;
+            cursor        = round_up(cursor, field_align(mm_bits));
+            slot.off_nmm  = cursor;
+            cursor += field_bytes(mm_bits);
+            cursor        = round_up(cursor, field_align(slot.width));
+            slot.off_nz   = cursor;
+            cursor += field_bytes(slot.width);
+            if (slot.nba_partial) {
+                cursor       = round_up(cursor, field_align(slot.width));
+                slot.off_mask = cursor;
+                cursor += field_bytes(slot.width);
+            }
+        }
+
         state_bytes_ = std::max<uint32_t>(1, round_up(cursor, 8));
+    }
+
+    // Walk a StoreNb's lvalue chain to its root signal, reporting whether the
+    // target is the whole signal (a bare Signal lvalue) or a bit/part-select.
+    struct NbaTarget {
+        Signal sig;
+        bool   whole;
+    };
+    NbaTarget nba_target(const Ir& ir, Index lv) const {
+        bool whole = true;
+        for (;;) {
+            switch (ir.tag(lv)) {
+                case Inst::Tag::Signal: return { ir.payload(lv).signal, whole };
+                case Inst::Tag::BitSelect: lv = ir.payload(lv).binary.l; whole = false; continue;
+                case Inst::Tag::PartSelect: lv = ir.payload(lv).op_extra.op; whole = false; continue;
+                default: throw BackendError{ "unsupported nonblocking-assignment lvalue" };
+            }
+        }
+    }
+
+    // Find every NBA-target signal across all processes and mark its slot: `nba`,
+    // `nba_partial` (any bit/part-select site), and a dense `nba_id` (signal order).
+    // Bucket assignment happens later in build_nba_state once widths are final.
+    void nba_classify() {
+        const auto sigs = mod_.signals();
+        for (const Process& p : mod_.processes()) {
+            for (size_t k = 0; k < p.ir.inst_count(); ++k) {
+                const auto idx = static_cast<Index>(k);
+                if (p.ir.tag(idx) != Inst::Tag::StoreNb) {
+                    continue;
+                }
+                const NbaTarget t  = nba_target(p.ir, p.ir.payload(idx).binary.l);
+                SignalSlot&     s  = slots_[static_cast<uint32_t>(t.sig)];
+                s.nba              = true;
+                s.nba_partial      = s.nba_partial || !t.whole;
+            }
+        }
+        n_nba_ = 0;
+        for (uint32_t i = 0; i < sigs.size(); ++i) {
+            if (slots_[i].nba) {
+                slots_[i].nba_id = n_nba_++;
+            }
+        }
     }
 
     const SignalSlot& slot_of(Signal s) const {
@@ -684,6 +776,90 @@ private:
         }
     }
 
+    // Build the nonblocking-assignment update state: per-(width, partial) commit
+    // worklists, the dense pending-flag array, and a constant per-signal metadata
+    // table (live/shadow/mask offsets plus the wait-queue base/cap/len pointers the
+    // generic commit loop services from). Must run after build_state_layout (slot
+    // offsets, nba flags) and build_wait_queues (queue globals).
+    void build_nba_state() {
+        auto* i8    = llvm::Type::getInt8Ty(ctx_);
+        auto* i32   = llvm::Type::getInt32Ty(ctx_);
+        auto* ptr   = llvm::PointerType::getUnqual(ctx_);
+        auto* arr3p = llvm::ArrayType::get(ptr, 3);
+        auto* arr3i = llvm::ArrayType::get(i32, 3);
+        nba_meta_ty_ = llvm::StructType::get(ctx_, { i32, i32, i32, i32, i32, arr3p, arr3i, arr3p, arr3p });
+
+        const auto sigs = mod_.signals();
+
+        // Assign each NBA target to a (width, partial) bucket.
+        for (uint32_t i = 0; i < sigs.size(); ++i) {
+            SignalSlot& s = slots_[i];
+            if (!s.nba) {
+                continue;
+            }
+            uint32_t bi = 0;
+            for (; bi < nba_buckets_.size(); ++bi) {
+                if (nba_buckets_[bi].width == s.width && nba_buckets_[bi].partial == s.nba_partial) {
+                    break;
+                }
+            }
+            if (bi == nba_buckets_.size()) {
+                nba_buckets_.push_back(NbaBucket{ s.width, s.nba_partial, nullptr, nullptr, nullptr });
+            }
+            s.nba_bucket = bi;
+        }
+        std::vector<uint32_t> caps(nba_buckets_.size(), 0);
+        for (uint32_t i = 0; i < sigs.size(); ++i) {
+            if (slots_[i].nba) {
+                caps[slots_[i].nba_bucket]++;
+            }
+        }
+        for (uint32_t bi = 0; bi < nba_buckets_.size(); ++bi) {
+            NbaBucket&        b    = nba_buckets_[bi];
+            const std::string name = "clotho.nba.w" + std::to_string(b.width) + (b.partial ? ".part" : ".full");
+            b.ty  = llvm::ArrayType::get(i32, std::max<uint32_t>(caps[bi], 1));
+            b.gv  = new llvm::GlobalVariable(llmod_, b.ty, false, llvm::GlobalValue::InternalLinkage,
+                                             llvm::ConstantAggregateZero::get(b.ty), name);
+            b.top = new llvm::GlobalVariable(llmod_, i32, false, llvm::GlobalValue::InternalLinkage,
+                                             llvm::ConstantInt::get(i32, 0), name + ".top");
+        }
+
+        // Dense dedup flags, one per nba-id.
+        nba_pending_ty_ = llvm::ArrayType::get(i8, std::max<uint32_t>(n_nba_, 1));
+        nba_pending_gv_ = new llvm::GlobalVariable(llmod_, nba_pending_ty_, false, llvm::GlobalValue::InternalLinkage,
+                                                   llvm::ConstantAggregateZero::get(nba_pending_ty_),
+                                                   "clotho.nba_pending");
+
+        // Constant metadata, one record per nba-id (signal order, matching nba_id).
+        auto*                        nullp = llvm::ConstantPointerNull::get(ptr);
+        std::vector<llvm::Constant*> metas;
+        for (uint32_t i = 0; i < sigs.size(); ++i) {
+            const SignalSlot& s = slots_[i];
+            if (!s.nba) {
+                continue;
+            }
+            std::array<llvm::Constant*, 3> sb{}, sc{}, db{}, dl{};
+            for (uint32_t e = 0; e < 3; ++e) {
+                sb[e] = wait_sta_gv_[i][e] ? llvm::cast<llvm::Constant>(wait_sta_gv_[i][e]) : nullp;
+                sc[e] = llvm::ConstantInt::get(i32, wait_sta_cap_[i][e]);
+                db[e] = wait_dyn_gv_[i][e] ? llvm::cast<llvm::Constant>(wait_dyn_gv_[i][e]) : nullp;
+                dl[e] = wait_dyn_len_gv_[i][e] ? llvm::cast<llvm::Constant>(wait_dyn_len_gv_[i][e]) : nullp;
+            }
+            metas.push_back(llvm::ConstantStruct::get(
+              nba_meta_ty_, { llvm::ConstantInt::get(i32, s.off_mm), llvm::ConstantInt::get(i32, s.off_z),
+                              llvm::ConstantInt::get(i32, s.off_nmm), llvm::ConstantInt::get(i32, s.off_nz),
+                              llvm::ConstantInt::get(i32, s.off_mask), llvm::ConstantArray::get(arr3p, sb),
+                              llvm::ConstantArray::get(arr3i, sc), llvm::ConstantArray::get(arr3p, db),
+                              llvm::ConstantArray::get(arr3p, dl) }));
+        }
+        if (metas.empty()) {
+            metas.push_back(llvm::ConstantAggregateZero::get(nba_meta_ty_));
+        }
+        nba_meta_arr_ty_ = llvm::ArrayType::get(nba_meta_ty_, metas.size());
+        nba_meta_gv_     = new llvm::GlobalVariable(llmod_, nba_meta_arr_ty_, true, llvm::GlobalValue::InternalLinkage,
+                                                    llvm::ConstantArray::get(nba_meta_arr_ty_, metas), "clotho.nba_meta");
+    }
+
     bool signal_has_waiters(Signal sig) const {
         const auto i = static_cast<uint32_t>(sig);
         for (uint32_t e = 0; e < 3; ++e) {
@@ -944,6 +1120,213 @@ private:
         b.CreateStore(b.CreateAdd(sp, b.getInt32(1)), top_gv_);
     }
 
+    // -- NBA update region --
+    //
+    // After the active queue drains, the NBA region commits every staged update:
+    // each (width, partial) bucket worklist is streamed by a width-specialized loop
+    // that copies (or mask-RMWs) the shadow into live state and services the wait
+    // queue. Per-signal offsets and queue pointers come from the constant meta
+    // table, so the loop body is generic (no per-signal code, no indirect dispatch).
+
+    // Load a scalar i32 field (0..4) or an array element (fields 5..8) from a meta
+    // record pointer. Meta layout: 0 off_mm, 1 off_z, 2 off_nmm, 3 off_nz,
+    // 4 off_mask, 5 sta_base[3], 6 sta_cap[3], 7 dyn_base[3], 8 dyn_len[3].
+    llvm::Value* meta_i32(llvm::Value* meta, unsigned field) {
+        return b_.CreateLoad(b_.getInt32Ty(),
+                             b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(field) }));
+    }
+    llvm::Value* meta_ptr_at(llvm::Value* meta, unsigned field, uint32_t e) {
+        return b_.CreateLoad(
+          llvm::PointerType::getUnqual(ctx_),
+          b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(field), b_.getInt32(e) }));
+    }
+    llvm::Value* meta_i32_at(llvm::Value* meta, unsigned field, uint32_t e) {
+        return b_.CreateLoad(
+          b_.getInt32Ty(),
+          b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(field), b_.getInt32(e) }));
+    }
+
+    // Generic static-queue scan (runtime base + capacity), null base => no waiters.
+    // Mirrors service_static_queue but reads its trip count at runtime from meta.
+    void emit_static_scan_rt(llvm::Value* base, llvm::Value* cap) {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* elem = wait_elem_ty();
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* head = llvm::BasicBlock::Create(ctx_, "nsta.head", fn);
+        auto* body = llvm::BasicBlock::Create(ctx_, "nsta.body", fn);
+        auto* wake = llvm::BasicBlock::Create(ctx_, "nsta.wake", fn);
+        auto* cont = llvm::BasicBlock::Create(ctx_, "nsta.cont", fn);
+        auto* done = llvm::BasicBlock::Create(ctx_, "nsta.done", fn);
+        auto* entry = b_.GetInsertBlock();
+        b_.CreateCondBr(b_.CreateICmpNE(base, llvm::ConstantPointerNull::get(ptr)), head, done);
+
+        b_.SetInsertPoint(head);
+        auto* idx = b_.CreatePHI(i32, 2);
+        idx->addIncoming(b_.getInt32(0), entry);
+        b_.CreateCondBr(b_.CreateICmpULT(idx, cap), body, done);
+
+        b_.SetInsertPoint(body);
+        llvm::Value* src  = b_.CreateInBoundsGEP(elem, base, idx);
+        llvm::Value* h    = b_.CreateLoad(ptr, b_.CreateStructGEP(elem, src, 0));
+        llvm::Value* fptr = b_.CreateLoad(ptr, b_.CreateStructGEP(elem, src, 1));
+        b_.CreateCondBr(b_.CreateICmpNE(b_.CreateLoad(i32, fptr), b_.getInt32(0)), cont, wake);
+
+        b_.SetInsertPoint(wake);
+        emit_active_push(b_, h);
+        b_.CreateStore(b_.getInt32(1), fptr);
+        b_.CreateBr(cont);
+
+        b_.SetInsertPoint(cont);
+        idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), cont);
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(done);
+    }
+
+    // Generic dynamic-queue scan (runtime base + length pointer), null base => skip.
+    // Wakes every live entry (flag-deduped) and resets the length to 0.
+    void emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr) {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* elem = wait_elem_ty();
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* chk   = llvm::BasicBlock::Create(ctx_, "ndyn.chk", fn);
+        auto* head  = llvm::BasicBlock::Create(ctx_, "ndyn.head", fn);
+        auto* body  = llvm::BasicBlock::Create(ctx_, "ndyn.body", fn);
+        auto* wake  = llvm::BasicBlock::Create(ctx_, "ndyn.wake", fn);
+        auto* cont  = llvm::BasicBlock::Create(ctx_, "ndyn.cont", fn);
+        auto* reset = llvm::BasicBlock::Create(ctx_, "ndyn.reset", fn);
+        auto* done  = llvm::BasicBlock::Create(ctx_, "ndyn.done", fn);
+        b_.CreateCondBr(b_.CreateICmpNE(base, llvm::ConstantPointerNull::get(ptr)), chk, done);
+
+        b_.SetInsertPoint(chk);
+        llvm::Value* n = b_.CreateLoad(i32, lenptr);
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(head);
+        auto* idx = b_.CreatePHI(i32, 2);
+        idx->addIncoming(b_.getInt32(0), chk);
+        b_.CreateCondBr(b_.CreateICmpULT(idx, n), body, reset);
+
+        b_.SetInsertPoint(body);
+        llvm::Value* src  = b_.CreateInBoundsGEP(elem, base, idx);
+        llvm::Value* h    = b_.CreateLoad(ptr, b_.CreateStructGEP(elem, src, 0));
+        llvm::Value* fptr = b_.CreateLoad(ptr, b_.CreateStructGEP(elem, src, 1));
+        b_.CreateCondBr(b_.CreateICmpNE(b_.CreateLoad(i32, fptr), b_.getInt32(0)), cont, wake);
+
+        b_.SetInsertPoint(wake);
+        emit_active_push(b_, h);
+        b_.CreateStore(b_.getInt32(1), fptr);
+        b_.CreateBr(cont);
+
+        b_.SetInsertPoint(cont);
+        idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), cont);
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(reset);
+        b_.CreateStore(b_.getInt32(0), lenptr);
+        b_.CreateBr(done);
+
+        b_.SetInsertPoint(done);
+    }
+
+    // Service an NBA target's wait queues after its shadow committed to live. Same
+    // edge facts as service_wait_queue, but the per-edge queue pointers come from
+    // the meta record (runtime) so this drives any signal with one body.
+    void emit_nba_service(llvm::Value* meta, llvm::Value* old_mm, llvm::Value* new_mm) {
+        auto*        i1      = b_.getInt1Ty();
+        llvm::Value* old_lsb = b_.CreateTrunc(old_mm, i1);
+        llvm::Value* new_lsb = b_.CreateTrunc(new_mm, i1);
+        llvm::Value* pos     = b_.CreateAnd(b_.CreateNot(old_lsb), new_lsb);
+        llvm::Value* neg     = b_.CreateAnd(old_lsb, b_.CreateNot(new_lsb));
+        llvm::Value* changed = b_.CreateICmpNE(old_mm, new_mm);
+        const std::array<std::pair<uint32_t, llvm::Value*>, 3> buckets = {
+            std::make_pair(static_cast<uint32_t>(Edge::Any), changed),
+            std::make_pair(static_cast<uint32_t>(Edge::Positive), pos),
+            std::make_pair(static_cast<uint32_t>(Edge::Negative), neg),
+        };
+        for (const auto& [e, fact] : buckets) {
+            auto* fn   = b_.GetInsertBlock()->getParent();
+            auto* body = llvm::BasicBlock::Create(ctx_, "nsvc.body", fn);
+            auto* cont = llvm::BasicBlock::Create(ctx_, "nsvc.cont", fn);
+            b_.CreateCondBr(fact, body, cont);
+            b_.SetInsertPoint(body);
+            emit_static_scan_rt(meta_ptr_at(meta, 5, e), meta_i32_at(meta, 6, e));
+            emit_dynamic_scan_rt(meta_ptr_at(meta, 7, e), meta_ptr_at(meta, 8, e));
+            b_.CreateBr(cont);
+            b_.SetInsertPoint(cont);
+        }
+    }
+
+    // Stream one (width, partial) bucket worklist: commit each staged signal's
+    // shadow into live state (whole copy, or mask-RMW for a partial bucket), service
+    // its wait queue, clear its pending flag, then reset the worklist. Width is the
+    // bucket's compile-time width, so the plane loads/stores are exactly typed.
+    void emit_nba_commit_bucket(const NbaBucket& bk, llvm::Value* state) {
+        const uint32_t    W     = bk.width;
+        auto*             i32   = b_.getInt32Ty();
+        auto*             mmty  = int_ty(2 * W);
+        auto*             zty   = int_ty(W);
+        const llvm::Align mm_al = llvm::Align(field_align(2 * W));
+        const llvm::Align z_al  = llvm::Align(field_align(W));
+
+        auto*        fn    = b_.GetInsertBlock()->getParent();
+        auto*        head  = llvm::BasicBlock::Create(ctx_, "ncommit.head", fn);
+        auto*        body  = llvm::BasicBlock::Create(ctx_, "ncommit.body", fn);
+        auto*        cont  = llvm::BasicBlock::Create(ctx_, "ncommit.cont", fn);
+        auto*        done  = llvm::BasicBlock::Create(ctx_, "ncommit.done", fn);
+        llvm::Value* n     = b_.CreateLoad(i32, bk.top);
+        auto*        entry = b_.GetInsertBlock();
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(head);
+        auto* idx = b_.CreatePHI(i32, 2);
+        idx->addIncoming(b_.getInt32(0), entry);
+        b_.CreateCondBr(b_.CreateICmpULT(idx, n), body, done);
+
+        b_.SetInsertPoint(body);
+        llvm::Value* id        = b_.CreateLoad(i32, b_.CreateInBoundsGEP(bk.ty, bk.gv, { b_.getInt32(0), idx }));
+        llvm::Value* meta      = b_.CreateInBoundsGEP(nba_meta_arr_ty_, nba_meta_gv_, { b_.getInt32(0), id });
+        llvm::Value* live_mm_p = field_ptr_var(state, meta_i32(meta, 0));
+        llvm::Value* live_z_p  = field_ptr_var(state, meta_i32(meta, 1));
+        llvm::Value* sh_mm_p   = field_ptr_var(state, meta_i32(meta, 2));
+        llvm::Value* sh_z_p    = field_ptr_var(state, meta_i32(meta, 3));
+        llvm::Value* old_mm    = b_.CreateAlignedLoad(mmty, live_mm_p, mm_al);
+        llvm::Value* new_mm    = nullptr;
+        if (!bk.partial) {
+            new_mm             = b_.CreateAlignedLoad(mmty, sh_mm_p, mm_al);
+            llvm::Value* new_z = b_.CreateAlignedLoad(zty, sh_z_p, z_al);
+            b_.CreateAlignedStore(new_mm, live_mm_p, mm_al);
+            b_.CreateAlignedStore(new_z, live_z_p, z_al);
+        } else {
+            llvm::Value* mask_p = field_ptr_var(state, meta_i32(meta, 4));
+            llvm::Value* mask   = b_.CreateAlignedLoad(zty, mask_p, z_al);
+            llvm::Value* old_z  = b_.CreateAlignedLoad(zty, live_z_p, z_al);
+            llvm::Value* sh_mm  = b_.CreateAlignedLoad(mmty, sh_mm_p, mm_al);
+            llvm::Value* sh_z   = b_.CreateAlignedLoad(zty, sh_z_p, z_al);
+            // Replicate the W-bit mask into both halves of the packed must|may word.
+            llvm::Value* maskw  = b_.CreateZExt(mask, mmty);
+            llvm::Value* mask2  = b_.CreateOr(maskw, b_.CreateShl(maskw, llvm::ConstantInt::get(mmty, W)));
+            new_mm              = b_.CreateOr(b_.CreateAnd(old_mm, b_.CreateNot(mask2)), b_.CreateAnd(sh_mm, mask2));
+            llvm::Value* new_z  = b_.CreateOr(b_.CreateAnd(old_z, b_.CreateNot(mask)), b_.CreateAnd(sh_z, mask));
+            b_.CreateAlignedStore(new_mm, live_mm_p, mm_al);
+            b_.CreateAlignedStore(new_z, live_z_p, z_al);
+            b_.CreateAlignedStore(zero(W), mask_p, z_al); // clear dirty mask for next slot
+        }
+        emit_nba_service(meta, old_mm, new_mm);
+        b_.CreateStore(b_.getInt8(0),
+                       b_.CreateInBoundsGEP(nba_pending_ty_, nba_pending_gv_, { b_.getInt32(0), id }));
+        b_.CreateBr(cont);
+
+        b_.SetInsertPoint(cont);
+        idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), cont);
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(done);
+        b_.CreateStore(b_.getInt32(0), bk.top);
+    }
+
     // Run the simulation: seed the active queue with every process, then alternate
     // draining the active queue with ticking the wheel.
     //
@@ -1001,12 +1384,19 @@ private:
         auto* wtick   = llvm::BasicBlock::Create(ctx_, "wheel.tick", fn);
         auto* wdone   = llvm::BasicBlock::Create(ctx_, "wheel.done", fn);
         auto* null    = llvm::ConstantPointerNull::get(ptr_ty);
+        // NBA region: only when the design has nonblocking assignments. Entered when
+        // the active queue drains; if any update is staged it commits them all and
+        // re-drains the active queue at the SAME instant; otherwise it falls through
+        // to the wheel. So active and NBA iterate until both settle before time moves.
+        const bool has_nba = !nba_buckets_.empty();
+        auto*      ncheck  = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.check", fn) : wcheck;
+        auto*      ncommit = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.commit", fn) : nullptr;
         b_.CreateBr(check);
 
         // Drain the active queue: while top != 0, pop queue[--top] and resume it.
         b_.SetInsertPoint(check);
         llvm::Value* sp = b_.CreateLoad(i32, top_gv_);
-        b_.CreateCondBr(b_.CreateICmpNE(sp, b_.getInt32(0)), body, wcheck);
+        b_.CreateCondBr(b_.CreateICmpNE(sp, b_.getInt32(0)), body, ncheck);
 
         b_.SetInsertPoint(body);
         llvm::Value* idx  = b_.CreateSub(sp, b_.getInt32(1));
@@ -1023,6 +1413,23 @@ private:
 
         b_.SetInsertPoint(cont);
         b_.CreateBr(check);
+
+        if (has_nba) {
+            // Any staged update? OR each bucket's live count; if so, commit them all
+            // and loop back to drain the processes the commits just woke.
+            b_.SetInsertPoint(ncheck);
+            llvm::Value* any = b_.getFalse();
+            for (const NbaBucket& bk : nba_buckets_) {
+                any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateLoad(i32, bk.top), b_.getInt32(0)));
+            }
+            b_.CreateCondBr(any, ncommit, wcheck);
+
+            b_.SetInsertPoint(ncommit);
+            for (const NbaBucket& bk : nba_buckets_) {
+                emit_nba_commit_bucket(bk, state);
+            }
+            b_.CreateBr(check);
+        }
 
         // Queue empty: if any timer remains, advance one instant (firing its timers,
         // which enqueue their handles) and go drain the queue again.
@@ -1098,12 +1505,23 @@ private:
                                 : zero(2 * s.width);
             b_.CreateAlignedStore(mm, field_ptr(state, s.off_mm), llvm::Align(field_align(2 * s.width)));
             b_.CreateAlignedStore(zero(s.width), field_ptr(state, s.off_z), llvm::Align(field_align(s.width)));
+            // A partial target's dirty mask must start clear; the shadow itself is
+            // written before it is read, so it needs no initialisation.
+            if (s.nba_partial) {
+                b_.CreateAlignedStore(zero(s.width), field_ptr(state, s.off_mask), llvm::Align(field_align(s.width)));
+            }
         }
     }
 
     // Pointer to a state field at a constant byte offset (a folded i8 GEP).
     llvm::Value* field_ptr(llvm::Value* base, uint32_t off) {
         return b_.CreateConstInBoundsGEP1_32(b_.getInt8Ty(), base, off);
+    }
+    // Pointer to a state field at a runtime byte offset (NBA commit reads offsets
+    // from the meta table). The base is 8-aligned and offsets are field-aligned, so
+    // accesses stay naturally aligned even though the GEP is dynamic.
+    llvm::Value* field_ptr_var(llvm::Value* base, llvm::Value* off) {
+        return b_.CreateInBoundsGEP(b_.getInt8Ty(), base, off);
     }
 
     // Lower a region's instructions in order into the current insert block.
@@ -1275,12 +1693,12 @@ private:
                 }
                 return;
             }
-            // TODO(nonblocking): StoreNb is lowered identically to a blocking Store
-            // — no two-phase next-state staging, and no wait-queue servicing — so
-            // RAW-dependent NBAs in one process (e.g. `a <= b; b <= a;`) copy
-            // instead of swapping.
+            // A nonblocking assignment samples its RHS now but defers the write: it
+            // stages the value into the target's shadow and enqueues the target for
+            // the NBA update region (see emit_nba_region), which commits shadow ->
+            // live and services wait queues only after every active process has run.
             case Inst::Tag::StoreNb:
-                lower_store(lvalue_of(p.binary.l), value_of(p.binary.r), type_of(p.binary.r));
+                lower_store_nb(lvalue_of(p.binary.l), value_of(p.binary.r));
                 return;
 
             case Inst::Tag::Constant:
@@ -1454,6 +1872,71 @@ private:
         llvm::Value* z     = merge_bits(old.z, cast(rhs.z, s.width, false), off, mask, nmask);
         b_.CreateAlignedStore(packed(must, may, z).mm, mp, mm_al);
         b_.CreateAlignedStore(z, zp, z_al);
+    }
+
+    // Stage a nonblocking assignment: write the sampled RHS into the target's
+    // shadow (whole-signal direct, or merged-with-mask for a part-select target)
+    // and append the target to its commit worklist (deduped by the pending flag, so
+    // repeat NBAs to one signal in a slot accumulate in the shadow). No wait queues
+    // are serviced here — that happens in the NBA region after the active drain.
+    void lower_store_nb(const LValue& lv, Plane rhs) {
+        const SignalSlot& s    = slot_of(lv.sig);
+        const llvm::Align mm_al = llvm::Align(field_align(2 * s.width));
+        const llvm::Align z_al  = llvm::Align(field_align(s.width));
+        llvm::Value*      mp    = field_ptr(state_, s.off_nmm);
+        llvm::Value*      zp    = field_ptr(state_, s.off_nz);
+
+        if (!s.nba_partial) {
+            // Whole-signal target: the RHS is already signal-width (frontend Resize),
+            // so the shadow planes store directly — no mask, no read-modify-write.
+            b_.CreateAlignedStore(rhs.mm, mp, mm_al);
+            b_.CreateAlignedStore(rhs.z, zp, z_al);
+        } else {
+            // Partial-capable target: merge the selected bits into the shadow and OR
+            // the touched bits into the dirty mask. A whole-signal site here selects
+            // every bit, so it merges the full word and sets the whole mask.
+            llvm::Value* maskp = field_ptr(state_, s.off_mask);
+            const Plane  old   = { b_.CreateAlignedLoad(int_ty(2 * s.width), mp, mm_al),
+                                   b_.CreateAlignedLoad(int_ty(s.width), zp, z_al) };
+            llvm::Value* off   = cast(lv.bit_off, s.width, false);
+            llvm::Value* bmask = b_.CreateShl(cast(ones(lv.width), s.width, false), off);
+            llvm::Value* nmask = b_.CreateNot(bmask);
+            llvm::Value* must  = merge_bits(must_of(old), cast(must_of(rhs), s.width, false), off, bmask, nmask);
+            llvm::Value* may   = merge_bits(may_of(old), cast(may_of(rhs), s.width, false), off, bmask, nmask);
+            llvm::Value* z     = merge_bits(old.z, cast(rhs.z, s.width, false), off, bmask, nmask);
+            b_.CreateAlignedStore(packed(must, may, z).mm, mp, mm_al);
+            b_.CreateAlignedStore(z, zp, z_al);
+            llvm::Value* cur = b_.CreateAlignedLoad(int_ty(s.width), maskp, z_al);
+            b_.CreateAlignedStore(b_.CreateOr(cur, bmask), maskp, z_al);
+        }
+        emit_nba_enqueue(s);
+    }
+
+    // Append an NBA target to its bucket worklist, but only the first time it is
+    // staged this slot (pending flag 0 -> 1). The flag is cleared when the entry is
+    // committed, so the next slot re-enqueues; it also bounds the worklist to one
+    // live entry per signal, making the bucket capacity (its signal count) exact.
+    void emit_nba_enqueue(const SignalSlot& s) {
+        auto*             i8    = b_.getInt8Ty();
+        auto*             i32   = b_.getInt32Ty();
+        const NbaBucket&  bk    = nba_buckets_[s.nba_bucket];
+        llvm::Value*      flagp = b_.CreateInBoundsGEP(nba_pending_ty_, nba_pending_gv_,
+                                                       { b_.getInt32(0), b_.getInt32(s.nba_id) });
+        llvm::Value*      already = b_.CreateICmpNE(b_.CreateLoad(i8, flagp), b_.getInt8(0));
+        auto*             fn      = b_.GetInsertBlock()->getParent();
+        auto*             push    = llvm::BasicBlock::Create(ctx_, "nba.push", fn);
+        auto*             cont    = llvm::BasicBlock::Create(ctx_, "nba.pushcont", fn);
+        b_.CreateCondBr(already, cont, push);
+
+        b_.SetInsertPoint(push);
+        b_.CreateStore(b_.getInt8(1), flagp);
+        llvm::Value* top  = b_.CreateLoad(i32, bk.top);
+        llvm::Value* slot = b_.CreateInBoundsGEP(bk.ty, bk.gv, { b_.getInt32(0), top });
+        b_.CreateStore(b_.getInt32(s.nba_id), slot);
+        b_.CreateStore(b_.CreateAdd(top, b_.getInt32(1)), bk.top);
+        b_.CreateBr(cont);
+
+        b_.SetInsertPoint(cont);
     }
 
     // (old & ~mask) | ((ins << off) & mask)
@@ -1989,6 +2472,19 @@ private:
     // Per-process scheduled flags (clotho.proc_sched), built once in run().
     llvm::GlobalVariable*               sched_gv_     = nullptr;
     llvm::ArrayType*                    sched_arr_ty_ = nullptr;
+
+    // Nonblocking-assignment update state, built in build_nba_state(). A StoreNb
+    // stages its RHS into the target's shadow and appends the target to its bucket
+    // worklist (deduped by nba_pending); the NBA region streams each bucket through
+    // a width-specialized commit loop that copies/RMWs shadow -> live and services
+    // the wait queue. Empty (no NBAs) leaves all of this null/zero.
+    std::vector<NbaBucket>  nba_buckets_;
+    uint32_t                n_nba_  = 0; // distinct NBA-target signals
+    llvm::GlobalVariable*   nba_pending_gv_ = nullptr; // [n_nba x i8] dedup flags
+    llvm::ArrayType*        nba_pending_ty_ = nullptr;
+    llvm::GlobalVariable*   nba_meta_gv_    = nullptr; // [n_nba x NbaMeta] constants
+    llvm::ArrayType*        nba_meta_arr_ty_ = nullptr;
+    llvm::StructType*       nba_meta_ty_    = nullptr;
     std::vector<Plane>                  values_;
     std::vector<std::optional<LValue>>  lvals_;
     std::vector<std::optional<ValType>> types_;

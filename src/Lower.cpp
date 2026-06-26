@@ -708,10 +708,10 @@ private:
         }
         const ir::Index lhs = lower_lvalue(a.left(), b);
         const ir::Index rhs = lower_expr(a.right(), b);
-        // TODO(nonblocking): StoreNb is lowered identically to a blocking Store in
-        // the backend. Correct NBA semantics need two-phase update — sample every
-        // RHS in the active region, then commit in the NBA region — so that e.g.
-        // `a <= b; b <= a;` swaps rather than copying.
+        // StoreNb gets correct two-phase NBA semantics in the backend: the RHS is
+        // sampled here in the active region and committed in the NBA update region.
+        // Intra-assignment timing (`<= #5`) is still rejected above, so the deferred
+        // update always lands in the current instant's NBA region.
         const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
         b.binary(tag, lhs, rhs, loc(a));
     }
