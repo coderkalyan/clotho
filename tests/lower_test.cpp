@@ -230,6 +230,21 @@ TEST_CASE("always @(*) infers the same sensitivity as always_comb") {
     CHECK(sensitivity_names(*r.module, *p) == std::set<std::string>{ "a", "b" });
 }
 
+TEST_CASE("always_latch infers sensitivity the same way as always_comb") {
+    const LowerResult r = lower_text(R"(
+        module m(input g, input d, output reg q);
+            always_latch
+                if (g) q = d;
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    const ir::Process* p = find_level_process(*r.module);
+    REQUIRE(p != nullptr);
+    // Enable and data are reads; the (conditionally) written q holds otherwise.
+    CHECK(sensitivity_names(*r.module, *p) == std::set<std::string>{ "g", "d" });
+}
+
 TEST_CASE("an intermediate that is written then read is not in the sensitivity list") {
     const LowerResult r = lower_text(R"(
         module m(input a, input b, input c, output reg y);
