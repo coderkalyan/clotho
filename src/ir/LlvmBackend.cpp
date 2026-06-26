@@ -77,13 +77,26 @@ struct Plane {
     llvm::Value* z  = nullptr; // iW
 };
 
-// A resolved assignment target: a constant/runtime bit offset and width into a
-// signal's state fields. `bit_off` is an i32; whole-signal targets have offset 0
-// and width equal to the signal width.
+// A resolved assignment target: a `{ i(2W) must|may, iW z }` pair somewhere in
+// memory (the module state buffer for a signal, or the per-call frame for a
+// function local) plus a bit offset / width selecting part of it. `bit_off` is an
+// i32; a whole-storage target has offset 0 and width == store_width.
 struct LValue {
-    Signal       sig;
+    // Base pointer of the storage buffer (state or frame).
+    llvm::Value* base = nullptr;
+    // Byte offset of the must|may word and the z word within `base`.
+    uint32_t off_mm = 0;
+    uint32_t off_z  = 0;
+    // Full storage width in bits.
+    uint32_t store_width = 0;
+    // Bit offset of the selection within the storage (i32).
     llvm::Value* bit_off = nullptr;
-    uint32_t     width   = 0;
+    // Selected width in bits (== store_width for a whole-storage target).
+    uint32_t width = 0;
+    // A module signal (not a frame local): its store services wait queues. `sig`
+    // is meaningful only then.
+    bool   is_signal = false;
+    Signal sig{ 0 };
 };
 
 // Per-signal placement in the state buffer plus its cached layout facts. A
@@ -121,6 +134,16 @@ struct NbaBucket {
     llvm::GlobalVariable* top  = nullptr; // i32 live count
 };
 
+// Placement of one function-frame local: byte offsets of its `{ i(2W) must|may,
+// iW z }` pair within the per-call frame buffer, plus its width / domain. Mirrors
+// SignalSlot but with no wait-queue / NBA machinery (frame locals have neither).
+struct FrameSlot {
+    uint32_t off_mm     = 0;
+    uint32_t off_z      = 0;
+    uint32_t width      = 0;
+    bool     four_state = false;
+};
+
 // Raised on a construct the backend cannot lower; caught at the top level.
 struct BackendError {
     std::string message;
@@ -142,6 +165,17 @@ public:
         build_wait_queues();
         build_sched_flags();
         build_nba_state();
+
+        // Functions: declare every one up front (so calls resolve, including
+        // recursion and forward references), then lower their bodies.
+        const size_t nf = mod_.function_count();
+        fn_decls_.assign(nf, nullptr);
+        for (uint32_t i = 0; i < nf; ++i) {
+            fn_decls_[i] = declare_function(static_cast<FunctionId>(i));
+        }
+        for (uint32_t i = 0; i < nf; ++i) {
+            lower_function(static_cast<FunctionId>(i));
+        }
 
         // Lower every process and seed every one at startup. An `initial` runs its
         // body once; an `always` with a sensitivity list immediately subscribes to
@@ -465,6 +499,139 @@ private:
         b_.SetInsertPoint(trap_bb);
         b_.CreateUnreachable();
         return fn_;
+    }
+
+    // -- Functions --
+    //
+    // Each ir::Function becomes a plain (non-coroutine) LLVM function
+    //   { i(2Wr), iWr } @<mod>.fn.<name>(ptr state, <arg mm/z pairs...>)
+    // (void return / no result for a void function). Locals live in a per-call
+    // stack frame buffer, so recursion and `automatic` lifetime are just ordinary
+    // stack frames; module signals are still reached through `state`.
+
+    // The packed width W of a value type (the ==0 -> 1 scalar rule).
+    uint32_t width_of(Ref type) const {
+        const uint32_t w = mod_.pool.layout(type).width;
+        return w == 0 ? 1 : w;
+    }
+
+    bool is_void(Ref type) const {
+        return type == mod_.pool.void_type;
+    }
+
+    // The LLVM type a function returns: void, or the `{ i(2W), iW }` result planes.
+    llvm::Type* fn_return_ty(Ref return_type) {
+        if (is_void(return_type)) {
+            return b_.getVoidTy();
+        }
+        const uint32_t w = width_of(return_type);
+        return llvm::StructType::get(ctx_, { int_ty(2 * w), int_ty(w) });
+    }
+
+    // Create (but do not yet lower) a function's declaration, so calls — including
+    // recursive and forward ones — resolve before any body is emitted.
+    llvm::Function* declare_function(FunctionId id) {
+        const Function&          f   = mod_.function(id);
+        auto*                    ptr = llvm::PointerType::getUnqual(ctx_);
+        std::vector<llvm::Type*> params;
+        params.push_back(ptr); // state
+        for (Ref pt : f.param_types) {
+            const uint32_t w = width_of(pt);
+            params.push_back(int_ty(2 * w)); // must|may
+            params.push_back(int_ty(w));     // z
+        }
+        auto* fnty = llvm::FunctionType::get(fn_return_ty(f.return_type), params, false);
+        auto* fn   = llvm::Function::Create(fnty, llvm::Function::InternalLinkage,
+                                            mod_.name + ".fn." + f.name, llmod_);
+        fn->addParamAttr(0, llvm::Attribute::NoAlias);
+        return fn;
+    }
+
+    // Lay out a function's frame locals into one stack buffer, packed in
+    // decreasing alignment order (same scheme as build_state_layout, minus the
+    // wait-queue / NBA shadows that frame locals never need).
+    void build_frame_layout(const Function& f) {
+        const size_t n = f.local_types.size();
+        frame_slots_.assign(n, FrameSlot{});
+        std::vector<uint32_t> order(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            const Layout lay     = mod_.pool.layout(f.local_types[i]);
+            frame_slots_[i].width      = lay.width == 0 ? 1 : lay.width;
+            frame_slots_[i].four_state = lay.domain == Domain::Four;
+            order[i]                   = i;
+        }
+        std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+            return field_align(2 * frame_slots_[a].width) > field_align(2 * frame_slots_[b].width);
+        });
+
+        uint32_t cursor = 0;
+        for (uint32_t i : order) {
+            FrameSlot&     s          = frame_slots_[i];
+            const uint32_t mm_bits    = 2 * s.width;
+            const uint32_t slot_align = field_align(mm_bits);
+            const uint32_t z_rel      = round_up(field_bytes(mm_bits), field_align(s.width));
+            const uint32_t slot_size  = round_up(z_rel + field_bytes(s.width), slot_align);
+            cursor                    = round_up(cursor, slot_align);
+            s.off_mm                  = cursor;
+            s.off_z                   = cursor + z_rel;
+            cursor += slot_size;
+        }
+        frame_bytes_ = std::max<uint32_t>(1, round_up(cursor, 8));
+    }
+
+    // Power up the frame: 4-state locals come up X (must 0, may 1), 2-state 0; z
+    // is cleared. Formal-parameter locals are immediately overwritten by copy-in;
+    // an unwritten return variable thus reads X (its uninitialized value).
+    void init_frame() {
+        for (const FrameSlot& s : frame_slots_) {
+            llvm::Value* mm = s.four_state
+                                ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * s.width, s.width))
+                                : zero(2 * s.width);
+            b_.CreateAlignedStore(mm, field_ptr(frame_, s.off_mm), llvm::Align(field_align(2 * s.width)));
+            b_.CreateAlignedStore(zero(s.width), field_ptr(frame_, s.off_z), llvm::Align(field_align(s.width)));
+        }
+    }
+
+    // Lower a function body into its (already declared) LLVM function. Reuses the
+    // shared instruction lowering — Arg reads a parameter, Local addresses the
+    // frame, Ret is a real return, Call invokes another function.
+    void lower_function(FunctionId id) {
+        const Function& f = mod_.function(id);
+        ir_               = &f.ir;
+        cur_fn_           = &f;
+        build_frame_layout(f);
+
+        fn_            = fn_decls_[static_cast<uint32_t>(id)];
+        const size_t n = ir_->inst_count();
+        values_.assign(n, Plane{});
+        lvals_.assign(n, std::optional<LValue>{});
+        types_.assign(n, std::optional<ValType>{});
+
+        auto* entry = llvm::BasicBlock::Create(ctx_, "entry", fn_);
+        b_.SetInsertPoint(entry);
+        state_ = fn_->getArg(0);
+        state_->setName("state");
+        fn_->addParamAttr(0, llvm::Attribute::NoAlias);
+
+        auto* buf_ty = llvm::ArrayType::get(b_.getInt8Ty(), frame_bytes_);
+        auto* frame  = b_.CreateAlloca(buf_ty, nullptr, "frame");
+        frame->setAlignment(llvm::Align(8));
+        frame_ = frame;
+        init_frame();
+
+        lower_region(ir_->root());
+        // The frontend appends a trailing Ret, so the entry path always terminates;
+        // guard defensively in case a body lowered to nothing.
+        if (b_.GetInsertBlock()->getTerminator() == nullptr) {
+            if (is_void(f.return_type)) {
+                b_.CreateRetVoid();
+            } else {
+                b_.CreateRet(llvm::ConstantAggregateZero::get(fn_->getReturnType()));
+            }
+        }
+
+        cur_fn_ = nullptr;
+        frame_  = nullptr;
     }
 
     // The awaiter embedded in the coroutine frame for #delay: an rt_timer
@@ -1629,10 +1796,23 @@ private:
         return b_.CreateInBoundsGEP(b_.getInt8Ty(), base, off);
     }
 
-    // Lower a region's instructions in order into the current insert block.
+    // Lower a region's instructions in order into the current insert block. A `ret`
+    // (function early return) terminates the block; the rest of the region is then
+    // unreachable, so stop emitting into the dead tail.
     void lower_region(std::span<const Index> region) {
         for (Index i : region) {
             lower_inst(i);
+            if (b_.GetInsertBlock()->getTerminator() != nullptr) {
+                return;
+            }
+        }
+    }
+
+    // Branch to `bb` unless the current block is already terminated (e.g. a region
+    // that ended in a `ret`). Keeps merge edges from being appended after a `ret`.
+    void branch_to(llvm::BasicBlock* bb) {
+        if (b_.GetInsertBlock()->getTerminator() == nullptr) {
+            b_.CreateBr(bb);
         }
     }
 
@@ -1661,6 +1841,10 @@ private:
                 return from_ref(std::get<Value>(mod_.pool.get(p.ref)).type);
             case Inst::Tag::Arg:
                 return from_ref(p.arg.type);
+            case Inst::Tag::Local:
+                return from_ref(p.local.type);
+            case Inst::Tag::Call:
+                return from_ref(mod_.function(ir_->extra_data<CallInfo>(p.extra).func).return_type);
             case Inst::Tag::Resize:
                 return from_ref(p.op_type.type);
             case Inst::Tag::Signal: {
@@ -1763,22 +1947,28 @@ private:
         switch (ir_->tag(i)) {
             // Lvalue derivation: record a descriptor, emit no value.
             case Inst::Tag::Signal:
-                set_lvalue(i, LValue{ p.signal, b_.getInt32(0), slot_of(p.signal).width });
+                set_lvalue(i, signal_lvalue(p.signal));
+                return;
+            case Inst::Tag::Local:
+                set_lvalue(i, local_lvalue(p.local.index));
                 return;
             case Inst::Tag::BitSelect: {
-                const LValue& base = lvalue_of(p.binary.l);
+                LValue lv = lvalue_of(p.binary.l);
                 // TODO: an X/Z or out-of-range index uses only its must bits,
                 // silently selecting the wrong bit. LRM: a read with an unknown /
                 // out-of-range index yields X; such a write is a no-op.
                 llvm::Value* idx = cast(must_of(value_of(p.binary.r)), 32, false);
-                set_lvalue(i, LValue{ base.sig, b_.CreateAdd(base.bit_off, idx), 1 });
+                lv.bit_off       = b_.CreateAdd(lv.bit_off, idx);
+                lv.width         = 1;
+                set_lvalue(i, lv);
                 return;
             }
             case Inst::Tag::PartSelect: {
-                const LValue& base = lvalue_of(p.op_extra.op);
-                const auto    ps   = ir_->extra_data<PartSelect>(p.op_extra.extra);
-                llvm::Value*  off  = b_.CreateAdd(base.bit_off, b_.getInt32(ps.lsb));
-                set_lvalue(i, LValue{ base.sig, off, ps.msb - ps.lsb + 1 });
+                LValue     lv = lvalue_of(p.op_extra.op);
+                const auto ps = ir_->extra_data<PartSelect>(p.op_extra.extra);
+                lv.bit_off    = b_.CreateAdd(lv.bit_off, b_.getInt32(ps.lsb));
+                lv.width      = ps.msb - ps.lsb + 1;
+                set_lvalue(i, lv);
                 return;
             }
 
@@ -1791,7 +1981,9 @@ private:
                 // is woken. Snapshot the old value first so the transition can be
                 // detected from old -> new.
                 const LValue& lv      = lvalue_of(p.binary.l);
-                const bool    service = signal_has_waiters(lv.sig);
+                // Frame locals have no waiters; only a module signal store services
+                // wait queues.
+                const bool    service = lv.is_signal && signal_has_waiters(lv.sig);
                 llvm::Value*  old_mm  = service ? load_mm(lv.sig) : nullptr;
                 lower_store(lv, value_of(p.binary.r), type_of(p.binary.r));
                 if (service) {
@@ -1904,10 +2096,20 @@ private:
                 lower_finish();
                 return;
 
-            case Inst::Tag::Arg:
-                throw BackendError{ "arg (function/task parameter) not supported by the process backend" };
+            case Inst::Tag::Arg: {
+                // A function parameter: read its plane from the call frame's params.
+                // The signature is (state, arg0_mm, arg0_z, arg1_mm, ...), so arg k
+                // occupies LLVM params 1 + 2k (must|may) and 2 + 2k (z).
+                const uint32_t k = p.arg.position;
+                set_value(i, Plane{ fn_->getArg(1 + 2 * k), fn_->getArg(2 + 2 * k) });
+                return;
+            }
             case Inst::Tag::Ret:
-                throw BackendError{ "ret (function/task return) not supported by the process backend" };
+                lower_ret(p.unary);
+                return;
+            case Inst::Tag::Call:
+                lower_call_inst(i);
+                return;
         }
     }
 
@@ -1938,48 +2140,74 @@ private:
 
     // -- State access --
 
+    // Whole-storage lvalue for a module signal (state buffer).
+    LValue signal_lvalue(Signal sig) {
+        const SignalSlot& s = slot_of(sig);
+        return LValue{ .base        = state_,
+                       .off_mm      = s.off_mm,
+                       .off_z       = s.off_z,
+                       .store_width = s.width,
+                       .bit_off     = b_.getInt32(0),
+                       .width       = s.width,
+                       .is_signal   = true,
+                       .sig         = sig };
+    }
+
+    // Whole-storage lvalue for a function-frame local (per-call frame buffer).
+    LValue local_lvalue(uint32_t index) {
+        const FrameSlot& s = frame_slots_[index];
+        return LValue{ .base        = frame_,
+                       .off_mm      = s.off_mm,
+                       .off_z       = s.off_z,
+                       .store_width = s.width,
+                       .bit_off     = b_.getInt32(0),
+                       .width       = s.width,
+                       .is_signal   = false,
+                       .sig         = Signal{ 0 } };
+    }
+
     Plane lower_load(const LValue& lv) {
-        const SignalSlot& s = slot_of(lv.sig);
+        const uint32_t    w  = lv.store_width;
         llvm::Value*      mm = b_.CreateAlignedLoad(
-          int_ty(2 * s.width), field_ptr(state_, s.off_mm), llvm::Align(field_align(2 * s.width)));
-        llvm::Value* z = b_.CreateAlignedLoad(int_ty(s.width), field_ptr(state_, s.off_z), llvm::Align(field_align(s.width)));
-        if (lv.width == s.width && is_zero_const(lv.bit_off)) {
+          int_ty(2 * w), field_ptr(lv.base, lv.off_mm), llvm::Align(field_align(2 * w)));
+        llvm::Value* z = b_.CreateAlignedLoad(int_ty(w), field_ptr(lv.base, lv.off_z), llvm::Align(field_align(w)));
+        if (lv.width == w && is_zero_const(lv.bit_off)) {
             return { mm, z };
         }
         // Bit/part select: unpack, shift each plane down by the offset, re-pack.
         const Plane  full = { mm, z };
-        llvm::Value* off  = cast(lv.bit_off, s.width, false);
+        llvm::Value* off  = cast(lv.bit_off, w, false);
         return packed(cast(b_.CreateLShr(must_of(full), off), lv.width, false),
                       cast(b_.CreateLShr(may_of(full), off), lv.width, false),
                       cast(b_.CreateLShr(z, off), lv.width, false));
     }
 
     void lower_store(const LValue& lv, Plane rhs, ValType rhs_ty) {
-        const SignalSlot& s     = slot_of(lv.sig);
-        llvm::Value*      mp     = field_ptr(state_, s.off_mm);
-        llvm::Value*      zp     = field_ptr(state_, s.off_z);
-        const llvm::Align mm_al  = llvm::Align(field_align(2 * s.width));
-        const llvm::Align z_al   = llvm::Align(field_align(s.width));
+        const uint32_t    s_width = lv.store_width;
+        llvm::Value*      mp      = field_ptr(lv.base, lv.off_mm);
+        llvm::Value*      zp      = field_ptr(lv.base, lv.off_z);
+        const llvm::Align mm_al   = llvm::Align(field_align(2 * s_width));
+        const llvm::Align z_al    = llvm::Align(field_align(s_width));
         (void)rhs_ty;
 
-        // Whole-signal store: the frontend context-sizes the RHS to the lvalue
-        // width (via an inserted Resize), so rhs already matches the signal width
+        // Whole-storage store: the frontend context-sizes the RHS to the lvalue
+        // width (via an inserted Resize), so rhs already matches the storage width
         // and the planes store directly.
-        if (lv.width == s.width && is_zero_const(lv.bit_off)) {
+        if (lv.width == s_width && is_zero_const(lv.bit_off)) {
             b_.CreateAlignedStore(rhs.mm, mp, mm_al);
             b_.CreateAlignedStore(rhs.z, zp, z_al);
             return;
         }
 
-        // Partial store: read-modify-write each plane at the signal width.
+        // Partial store: read-modify-write each plane at the storage width.
         const Plane  old =
-          { b_.CreateAlignedLoad(int_ty(2 * s.width), mp, mm_al), b_.CreateAlignedLoad(int_ty(s.width), zp, z_al) };
-        llvm::Value* off   = cast(lv.bit_off, s.width, false);
-        llvm::Value* mask  = b_.CreateShl(cast(ones(lv.width), s.width, false), off);
+          { b_.CreateAlignedLoad(int_ty(2 * s_width), mp, mm_al), b_.CreateAlignedLoad(int_ty(s_width), zp, z_al) };
+        llvm::Value* off   = cast(lv.bit_off, s_width, false);
+        llvm::Value* mask  = b_.CreateShl(cast(ones(lv.width), s_width, false), off);
         llvm::Value* nmask = b_.CreateNot(mask);
-        llvm::Value* must  = merge_bits(must_of(old), cast(must_of(rhs), s.width, false), off, mask, nmask);
-        llvm::Value* may   = merge_bits(may_of(old), cast(may_of(rhs), s.width, false), off, mask, nmask);
-        llvm::Value* z     = merge_bits(old.z, cast(rhs.z, s.width, false), off, mask, nmask);
+        llvm::Value* must  = merge_bits(must_of(old), cast(must_of(rhs), s_width, false), off, mask, nmask);
+        llvm::Value* may   = merge_bits(may_of(old), cast(may_of(rhs), s_width, false), off, mask, nmask);
+        llvm::Value* z     = merge_bits(old.z, cast(rhs.z, s_width, false), off, mask, nmask);
         b_.CreateAlignedStore(packed(must, may, z).mm, mp, mm_al);
         b_.CreateAlignedStore(z, zp, z_al);
     }
@@ -2093,6 +2321,42 @@ private:
     // rt_finish is marked noreturn and the optimizer prunes the unreachable tail.
     void lower_finish() {
         b_.CreateCall(finish_fn(), {});
+    }
+
+    // Lower a function `return`: a real `ret`, so it terminates the block and any
+    // instructions after it in the region are unreachable (lower_region stops).
+    // A void function ignores the operand and returns void; otherwise the result
+    // is packed into the `{ i(2W), iW }` return struct.
+    void lower_ret(Index value) {
+        if (cur_fn_->return_type == mod_.pool.void_type) {
+            b_.CreateRetVoid();
+            return;
+        }
+        const Plane  pl  = value_of(value);
+        auto*        rty = llvm::cast<llvm::StructType>(fn_->getReturnType());
+        llvm::Value* agg = llvm::UndefValue::get(rty);
+        agg              = b_.CreateInsertValue(agg, pl.mm, { 0 });
+        agg              = b_.CreateInsertValue(agg, pl.z, { 1 });
+        b_.CreateRet(agg);
+    }
+
+    // Lower a `call`: pass the state pointer plus each argument as its (must|may,
+    // z) plane pair (the frontend has resized each to its parameter width), then
+    // unpack the returned struct into a Plane. A void callee yields no value.
+    void lower_call_inst(Index i) {
+        const auto                ci = ir_->extra_data<CallInfo>(ir_->payload(i).extra);
+        llvm::Function*           cf = fn_decls_[static_cast<uint32_t>(ci.func)];
+        std::vector<llvm::Value*> argv;
+        argv.push_back(state_);
+        for (Index a : ir_->region(ci.args)) {
+            const Plane pl = value_of(a);
+            argv.push_back(pl.mm);
+            argv.push_back(pl.z);
+        }
+        llvm::Value* r = b_.CreateCall(cf->getFunctionType(), cf, argv);
+        if (mod_.function(ci.func).return_type != mod_.pool.void_type) {
+            set_value(i, Plane{ b_.CreateExtractValue(r, { 0 }), b_.CreateExtractValue(r, { 1 }) });
+        }
     }
 
     // Lower a $display / $write: stack-allocate an rt_arg[] descriptor array, pack
@@ -2508,11 +2772,11 @@ private:
 
         b_.SetInsertPoint(then_bb);
         lower_region(ir_->region(regs.then_));
-        b_.CreateBr(cont_bb);
+        branch_to(cont_bb);
 
         b_.SetInsertPoint(else_bb);
         lower_region(ir_->region(regs.else_));
-        b_.CreateBr(cont_bb);
+        branch_to(cont_bb);
 
         b_.SetInsertPoint(cont_bb);
     }
@@ -2541,7 +2805,7 @@ private:
 
         b_.SetInsertPoint(body_bb);
         lower_region(ir_->region(lp.body));
-        b_.CreateBr(step_bb);
+        branch_to(step_bb); // a `return` in the body terminates it; don't double-branch
 
         // Step, then the back-edge to re-test the condition.
         b_.SetInsertPoint(step_bb);
@@ -2560,6 +2824,16 @@ private:
     // Total size of the opaque state buffer in bytes (min 1, rounded up to 8).
     uint32_t                state_bytes_ = 1;
     std::vector<SignalSlot> slots_;
+
+    // Function declarations, indexed by FunctionId; filled before any body is
+    // lowered so calls (including recursive / forward) resolve.
+    std::vector<llvm::Function*> fn_decls_;
+    // Set while lowering a function body (null during a process). `frame_` is the
+    // current call's stack frame buffer; `frame_slots_` / `frame_bytes_` its layout.
+    const Function*         cur_fn_      = nullptr;
+    llvm::Value*            frame_       = nullptr;
+    std::vector<FrameSlot>  frame_slots_;
+    uint32_t                frame_bytes_ = 1;
 
     // Per-process scratch, reset in lower_process.
     const Ir*           ir_         = nullptr;
