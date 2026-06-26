@@ -113,8 +113,8 @@ Index Builder::finish(SourceLoc loc) {
     return emit({ Inst::Tag::Finish, Inst::Payload{ .none = 0 } }, loc);
 }
 
-Index Builder::sim_time(SourceLoc loc) {
-    return emit({ Inst::Tag::SimTime, Inst::Payload{ .none = 0 } }, loc);
+Index Builder::sim_time(uint64_t scale, SourceLoc loc) {
+    return emit({ Inst::Tag::SimTime, Inst::Payload{ .scale = scale } }, loc);
 }
 
 } // namespace clotho::ir

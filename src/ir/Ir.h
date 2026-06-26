@@ -257,10 +257,12 @@ struct Inst {
 
         // -- System functions --
         // $time / $stime: read the simulation clock, -> 64-bit unsigned (payload:
-        // none). Lowers to a `rt_wheel_now` call; the value is always known (no
-        // x/z). With no timescale support every design element is unit time, so
-        // the raw tick count is the time-unit-scaled value the LRM mandates (LRM
-        // §20.3.1). $stime truncates the result to 32 bits via a frontend Resize.
+        // scale). Lowers to a `rt_wheel_now` call; the value is always known (no
+        // x/z). The wheel counts in the design's finest time precision; the
+        // backend rounds the tick count down by `scale` (the calling module's
+        // time-unit / global-precision ratio) to the module time unit (LRM
+        // §20.3.1). `scale` is 1 when unitless or the module unit equals the
+        // global precision. $stime truncates the result to 32 bits via a Resize.
         SimTime,
     };
 
@@ -283,6 +285,9 @@ struct Inst {
     union Payload {
         // Inactive / nullary placeholder.
         uint32_t none;
+        // Time-unit multiplier for sim_time: $time returns the wheel tick count
+        // rounded down by this to the calling module's time unit. 1 == unitless.
+        uint64_t scale;
         // Interned constant value (constant).
         Ref ref;
         // Module signal handle (signal).

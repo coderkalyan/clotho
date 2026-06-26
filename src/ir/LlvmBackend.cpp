@@ -1907,8 +1907,16 @@ private:
                 return;
 
             case Inst::Tag::SimTime: {
-                // The clock value is always known: must == may, z == 0.
+                // The clock value is always known: must == may, z == 0. The wheel
+                // counts in the design's finest precision; scale the tick count
+                // down to the calling module's time unit, rounding to nearest
+                // (LRM §20.3.1). `scale` is a power of ten, so scale/2 is exact and
+                // (now + scale/2) / scale rounds half up.
                 llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
+                if (p.scale > 1) {
+                    now = b_.CreateUDiv(b_.CreateAdd(now, b_.getInt64(p.scale / 2)),
+                                        b_.getInt64(p.scale));
+                }
                 set_value(i, packed(now, now, zero(64)));
                 return;
             }
