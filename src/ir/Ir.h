@@ -250,6 +250,10 @@ struct Inst {
         // -- System tasks --
         // $display / $write: format string + variadic args (payload: display).
         Display,
+        // $finish / $stop: end the simulation and exit (payload: none). LRM §20.2
+        // has $stop suspend and $finish exit; with no resume mechanism a suspend
+        // is observationally an exit, so both are treated identically.
+        Finish,
     };
 
     // Which union member a tag activates. Drives payload_kind() / operands().

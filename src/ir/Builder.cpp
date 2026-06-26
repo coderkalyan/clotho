@@ -109,4 +109,8 @@ Index Builder::display(std::string_view fmt, bool newline, std::span<const Index
     return emit({ Inst::Tag::Display, Inst::Payload{ .display = extra } }, loc);
 }
 
+Index Builder::finish(SourceLoc loc) {
+    return emit({ Inst::Tag::Finish, Inst::Payload{ .none = 0 } }, loc);
+}
+
 } // namespace clotho::ir

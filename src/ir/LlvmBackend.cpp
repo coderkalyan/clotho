@@ -1735,6 +1735,7 @@ private:
             case Inst::Tag::Delay:
             case Inst::Tag::Wait:
             case Inst::Tag::Display:
+            case Inst::Tag::Finish:
                 return { 0, false, false };
         }
         return { 0, false, false };
@@ -1898,6 +1899,10 @@ private:
 
             case Inst::Tag::Display:
                 lower_display(i);
+                return;
+
+            case Inst::Tag::Finish:
+                lower_finish();
                 return;
 
             case Inst::Tag::Arg:
@@ -2072,6 +2077,23 @@ private:
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, b_.getInt32Ty(), ptr }, false);
         return llmod_.getOrInsertFunction("rt_display", fnty);
+    }
+
+    // void rt_finish(void) — noreturn; exits the process.
+    llvm::FunctionCallee finish_fn() {
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), false);
+        auto  fn   = llmod_.getOrInsertFunction("rt_finish", fnty);
+        if (auto* f = llvm::dyn_cast<llvm::Function>(fn.getCallee())) {
+            f->setDoesNotReturn();
+        }
+        return fn;
+    }
+
+    // Lower a $finish / $stop: call the runtime, which exits the process. The call
+    // never returns, so the rest of the region is dead, but it stays valid IR —
+    // rt_finish is marked noreturn and the optimizer prunes the unreachable tail.
+    void lower_finish() {
+        b_.CreateCall(finish_fn(), {});
     }
 
     // Lower a $display / $write: stack-allocate an rt_arg[] descriptor array, pack

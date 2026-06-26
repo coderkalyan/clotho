@@ -67,6 +67,7 @@ int run_jit(const Module& m, Timings* timings) {
         };
     };
     expose("rt_display", &rt_display);
+    expose("rt_finish", &rt_finish);
     expose("rt_alloc", &rt_alloc);
     expose("rt_free", &rt_free);
     expose("rt_wheel_init", &rt_wheel_init);

@@ -33,6 +33,17 @@ typedef struct rt_arg {
 // next descriptor. The codegen folds any trailing newline into `fmt`.
 void rt_display(const char* fmt, uint32_t argc, const rt_arg* argv);
 
+// -- Simulation control --
+//
+// $finish / $stop: end the simulation and exit the process. LRM 1800-2023 §20.2
+// defines $stop as suspending simulation and $finish as exiting to the OS; it
+// mandates no interactive mode. Clotho has no mechanism to resume a suspended
+// run, so a suspend that can never resume is observationally identical to exit,
+// and $stop is treated identically to $finish. Does not return.
+// TODO: the optional diagnostic-level argument (0/1/2) that controls exit-message
+// verbosity is accepted at the frontend but ignored here.
+[[noreturn]] void rt_finish(void);
+
 // -- Coroutine frame allocation --
 //
 // Each process lowers to an LLVM coroutine; its frame is allocated through these

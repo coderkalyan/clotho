@@ -128,6 +128,8 @@ const char* tag_name(Inst::Tag tag) {
             return "wait";
         case T::Display:
             return "display";
+        case T::Finish:
+            return "finish";
     }
 
     return "?";

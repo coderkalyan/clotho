@@ -212,3 +212,39 @@ TEST_CASE("event waits emit wait queues, always loops, and queue servicing") {
     CHECK(ir.find("sta.head") != std::string::npos);
     CHECK(ir.find("dyn.head") != std::string::npos);
 }
+
+TEST_CASE("$finish lowers to an rt_finish call") {
+    constexpr std::string_view src = R"(
+        module m;
+            initial begin
+                $display("done");
+                $finish;
+            end
+        endmodule
+    )";
+    const std::string          ir  = emit(src);
+
+    CHECK(ir.find("call void @rt_finish()") != std::string::npos);
+}
+
+TEST_CASE("$stop lowers identically to $finish") {
+    constexpr std::string_view src = R"(
+        module m;
+            initial $stop;
+        endmodule
+    )";
+    const std::string          ir  = emit(src);
+
+    CHECK(ir.find("call void @rt_finish()") != std::string::npos);
+}
+
+TEST_CASE("$finish with a diagnostic-level argument lowers (argument ignored)") {
+    constexpr std::string_view src = R"(
+        module m;
+            initial $finish(2);
+        endmodule
+    )";
+    const std::string          ir  = emit(src);
+
+    CHECK(ir.find("call void @rt_finish()") != std::string::npos);
+}

@@ -62,6 +62,8 @@ public:
     // $display / $write: a literal format string, a newline flag (true for
     // $display), and the already-lowered value args its specifiers consume.
     Index display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc);
+    // $finish / $stop: end the simulation and exit. No operands.
+    Index finish(SourceLoc loc);
 
     // -- Regions --
     // Begin a nested region; subsequent emits accumulate into it until closed.

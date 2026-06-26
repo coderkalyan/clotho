@@ -783,6 +783,16 @@ private:
             lower_display(call, name == "$display", b);
             return;
         }
+        if (name == "$finish" || name == "$stop") {
+            // Both end the simulation and exit. LRM §20.2 defines $stop as
+            // suspending the run (vs $finish exiting to the OS) and mandates no
+            // interactive mode; Clotho cannot resume a suspended run, so a
+            // suspend-forever equals exit and the two are treated identically.
+            // TODO: the optional diagnostic-level argument (0/1/2) controlling
+            // exit-message verbosity is parsed by slang but dropped here.
+            b.finish(loc(call));
+            return;
+        }
         fail("unsupported system task '" + std::string(name) + "'");
     }
 

@@ -178,6 +178,13 @@ extern "C" void rt_display(const char* fmt, uint32_t argc, const rt_arg* argv) {
     std::fwrite(out.data(), 1, out.size(), stdout);
 }
 
+extern "C" void rt_finish(void) {
+    // $finish / $stop: end the simulation and return control to the OS. std::exit
+    // runs atexit handlers and flushes C stdio, so any buffered $display output is
+    // committed before the process leaves.
+    std::exit(0);
+}
+
 extern "C" void* rt_alloc(uint64_t size) {
     return std::malloc(size);
 }
