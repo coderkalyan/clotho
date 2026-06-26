@@ -89,9 +89,9 @@ TEST_CASE("alu emits verifiable llvm ir") {
 }
 
 TEST_CASE("2-state vs 4-state widths") {
-    // Driven from an initial (not assigns) so the state buffer is live in main and
-    // survives optimization — only scheduled processes touch state, and combinational
-    // assigns are not scheduled yet.
+    // Driven from an initial so the writes land in one initial process; an assign
+    // would lower to its own scheduled process, which is fine but adds coroutine
+    // noise this layout-focused case does not need.
     constexpr std::string_view src = R"(
         module m(input bit [3:0] x, output bit [3:0] y, output logic [7:0] z);
             initial begin
