@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <set>
 #include <string_view>
 
 #include "Lower.h"
@@ -186,4 +187,80 @@ TEST_CASE("case inside is reported as unsupported") {
     )");
     CHECK_FALSE(ri.ok);
     CHECK(ri.diagnostics.find("inside") != std::string::npos);
+}
+
+// -- Inferred (@*) combinational sensitivity --
+
+// The set of signal names a process is sensitive to, all expected level-sensitive.
+std::set<std::string> sensitivity_names(const ir::Module& m, const ir::Process& p) {
+    std::set<std::string> names;
+    for (const ir::WaitEvent& w : p.wait_events) {
+        CHECK(w.edge == ir::Edge::Any);
+        names.insert(m.signal(w.signal).name);
+    }
+    return names;
+}
+
+TEST_CASE("always_comb infers its sensitivity from the RHS reads") {
+    const LowerResult r = lower_text(R"(
+        module m(input a, input b, input sel, output reg y);
+            always_comb
+                y = sel ? a : b;
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    const ir::Process* p = find_level_process(*r.module);
+    REQUIRE(p != nullptr);
+    // Reads a, b, sel; the write target y is excluded.
+    CHECK(sensitivity_names(*r.module, *p) == std::set<std::string>{ "a", "b", "sel" });
+}
+
+TEST_CASE("always @(*) infers the same sensitivity as always_comb") {
+    const LowerResult r = lower_text(R"(
+        module m(input a, input b, output reg y);
+            always @(*)
+                y = a & b;
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    const ir::Process* p = find_level_process(*r.module);
+    REQUIRE(p != nullptr);
+    CHECK(sensitivity_names(*r.module, *p) == std::set<std::string>{ "a", "b" });
+}
+
+TEST_CASE("an intermediate that is written then read is not in the sensitivity list") {
+    const LowerResult r = lower_text(R"(
+        module m(input a, input b, input c, output reg y);
+            reg t;
+            always_comb begin
+                t = a & b;
+                y = t | c;
+            end
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    const ir::Process* p = find_level_process(*r.module);
+    REQUIRE(p != nullptr);
+    // t is read on the second line but written on the first, so it drops out.
+    CHECK(sensitivity_names(*r.module, *p) == std::set<std::string>{ "a", "b", "c" });
+}
+
+TEST_CASE("an index expression on the write target is a read") {
+    const LowerResult r = lower_text(R"(
+        module m(input [7:0] d, input [2:0] i, output reg [7:0] y);
+            always_comb begin
+                y    = 8'd0;
+                y[i] = d[0];
+            end
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    const ir::Process* p = find_level_process(*r.module);
+    REQUIRE(p != nullptr);
+    // i (LHS index) and d (RHS) are reads; y is only ever written.
+    CHECK(sensitivity_names(*r.module, *p) == std::set<std::string>{ "d", "i" });
 }

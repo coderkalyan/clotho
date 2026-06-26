@@ -8,6 +8,7 @@
 
 #include <ankerl/unordered_dense.h>
 
+#include <slang/ast/ASTVisitor.h>
 #include <slang/ast/Compilation.h>
 #include <slang/ast/Expression.h>
 #include <slang/ast/SemanticFacts.h>
@@ -65,6 +66,114 @@ ir::SignalInfo::Direction direction_of(slang::ast::ArgumentDirection d) {
 
     return ir::SignalInfo::Direction::Internal;
 }
+
+// Infers the @* sensitivity of a combinational process body (an `always_comb`,
+// `always_latch`, or `always @*`): the signals it reads to compute a result,
+// minus the ones it writes. A signal that is both read and written is an
+// internal intermediate and is left out; index/part-select expressions on a
+// write target are themselves reads and are kept (11.6, 9.2.2.2).
+//
+// The AST is walked rather than the lowered IR so reads are seen at the source
+// level, before any temporaries the IR introduces. Symbols not in `sigmap`
+// (parameters, genvars, other constants) carry no sensitivity and are skipped.
+struct SensitivityCollector : ASTVisitor<SensitivityCollector, /*Statements=*/true, /*Exprs=*/true> {
+    using SigMap = ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal>;
+
+    const SigMap&                          sigmap;
+    std::vector<ir::Signal>                reads;    // in first-seen order
+    ankerl::unordered_dense::set<uint32_t> seen;     // dedup for `reads`
+    ankerl::unordered_dense::set<uint32_t> written;  // assignment targets / locals
+
+    explicit SensitivityCollector(const SigMap& m) : sigmap(m) {}
+
+    void record_read(const ValueSymbol& sym) {
+        const auto it = sigmap.find(&sym);
+        if (it == sigmap.end()) {
+            return;
+        }
+        if (seen.insert(static_cast<uint32_t>(it->second)).second) {
+            reads.push_back(it->second);
+        }
+    }
+
+    void mark_written(const ValueSymbol& sym) {
+        const auto it = sigmap.find(&sym);
+        if (it != sigmap.end()) {
+            written.insert(static_cast<uint32_t>(it->second));
+        }
+    }
+
+    // Record the write target(s) of an lvalue: the base name is written, but any
+    // selector expression on it (an index or a non-constant part-select bound) is
+    // a read and is descended into.
+    void record_write(const Expression& lhs) {
+        switch (lhs.kind) {
+            case ExpressionKind::NamedValue:
+                mark_written(lhs.as<NamedValueExpression>().symbol);
+                break;
+            case ExpressionKind::ElementSelect: {
+                const ElementSelectExpression& es = lhs.as<ElementSelectExpression>();
+                record_write(es.value());
+                es.selector().visit(*this);
+                break;
+            }
+            case ExpressionKind::RangeSelect: {
+                const RangeSelectExpression& rs = lhs.as<RangeSelectExpression>();
+                record_write(rs.value());
+                rs.left().visit(*this);
+                rs.right().visit(*this);
+                break;
+            }
+            case ExpressionKind::Concatenation:
+                for (const Expression* op : lhs.as<ConcatenationExpression>().operands()) {
+                    record_write(*op);
+                }
+                break;
+            case ExpressionKind::Conversion:
+                record_write(lhs.as<ConversionExpression>().operand());
+                break;
+            default:
+                // An unrecognized lvalue shape: descend conservatively so any
+                // reads inside it are still picked up.
+                lhs.visit(*this);
+                break;
+        }
+    }
+
+    void handle(const NamedValueExpression& nv) { record_read(nv.symbol); }
+
+    void handle(const AssignmentExpression& a) {
+        a.right().visit(*this); // RHS: pure reads
+        record_write(a.left());
+    }
+
+    void handle(const UnaryExpression& u) {
+        switch (u.op) {
+            case UnaryOperator::Preincrement:
+            case UnaryOperator::Postincrement:
+            case UnaryOperator::Predecrement:
+            case UnaryOperator::Postdecrement:
+                // A ++/-- target is both read and written, so it drops out.
+                record_write(u.operand());
+                break;
+            default:
+                break;
+        }
+        visitDefault(u);
+    }
+
+    void handle(const VariableDeclStatement& d) {
+        mark_written(d.symbol); // a block-local temporary, not an input
+        visitDefault(d);
+    }
+
+    void handle(const ForLoopStatement& f) {
+        for (const VariableSymbol* v : f.loopVars) {
+            mark_written(*v);
+        }
+        visitDefault(f);
+    }
+};
 
 // Walks the elaborated AST of one top module into an ir::Module.
 class Lowerer {
@@ -255,15 +364,22 @@ private:
 
         const Statement* body = &sym.getBody();
 
+        // `always_comb` / `always_latch` have no written sensitivity at all; their
+        // event list is inferred from the body's reads (9.2.2.2). `always @*`
+        // carries an ImplicitEvent timing wrapping the body, inferred the same way.
+        bool infer = sym.procedureKind == ProceduralBlockKind::AlwaysComb ||
+                     sym.procedureKind == ProceduralBlockKind::AlwaysLatch;
+
         // A top-level event control is the process's sensitivity: collect its wait
         // events here and lower the statement underneath. A non-event top-level
         // timing (e.g. `always #5 ...`) is NOT sensitivity — it falls through to
         // lower_stmt, whose Timed case rejects it loudly.
-        // TODO: implicit (@*) and inferred combinational sensitivity are not yet
-        // collected, so those processes get an empty wait list.
         if (body->kind == StatementKind::Timed) {
             const TimedStatement& timed = body->as<TimedStatement>();
-            if (is_event_control(timed.timing)) {
+            if (timed.timing.kind == TimingControlKind::ImplicitEvent) {
+                infer = true;
+                body  = &timed.stmt;
+            } else if (is_event_control(timed.timing)) {
                 collect_wait_events(timed.timing, wait_events);
                 body = &timed.stmt;
             }
@@ -271,6 +387,11 @@ private:
 
         ir::Builder b(module_.pool);
         lower_stmt(*body, b);
+        // Inferred sensitivity is read from the body after lowering, so any
+        // block-local declarations it touched are already registered in sigmap_.
+        if (infer) {
+            collect_inferred_sensitivity(*body, wait_events);
+        }
         module_.add_process(ir::Process{ .activation  = activation,
                                          .wait_events = std::move(wait_events),
                                          .loc         = to_source_loc(sym.location),
@@ -309,6 +430,19 @@ private:
             default:
                 // ImplicitEvent (@*) and the like: no explicit signals to collect.
                 break;
+        }
+    }
+
+    // Build the inferred (@*) sensitivity of a combinational process body and
+    // append it to `out`: every signal read to compute a result, minus those the
+    // body writes, each entered as a level-sensitive (any-change) wait.
+    void collect_inferred_sensitivity(const Statement& body, std::vector<ir::WaitEvent>& out) {
+        SensitivityCollector c(sigmap_);
+        body.visit(c);
+        for (const ir::Signal s : c.reads) {
+            if (!c.written.contains(static_cast<uint32_t>(s))) {
+                out.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
+            }
         }
     }
 
