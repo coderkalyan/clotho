@@ -514,28 +514,70 @@ private:
         return enqueue_fn_;
     }
 
-    // Lower a #delay: schedule a wheel timer for `now + amount` ticks that resumes
-    // this coroutine, then suspend. Execution continues in a fresh resume block.
-    void lower_delay(Index amount) {
-        auto* aw = awaiter();
-        // Stash the handle so the timer callback can resume us.
-        b_.CreateStore(hdl_, b_.CreateStructGEP(awaiter_ty(), aw, 2));
-
-        llvm::Value* ticks    = cast(must_of(value_of(amount)), 64, false);
-        llvm::Value* now      = b_.CreateCall(wheel_now_fn(), { wheel_ });
-        llvm::Value* deadline = b_.CreateAdd(now, ticks);
-        b_.CreateCall(wheel_schedule_fn(), { wheel_, aw, deadline, enqueue_trampoline() });
-
-        // Suspend. The save token pairs the suspend with this resume point; the
-        // default edge returns control to the resumer (coro.ret), case 0 resumes
-        // here, case 1 is a destroy while suspended.
+    // Suspend the coroutine and continue in a fresh resume block named `label`.
+    // The save token pairs the suspend with this resume point; the default edge
+    // returns control to the resumer (coro.ret), case 0 resumes in the new block,
+    // case 1 is a destroy while suspended. Shared by every suspend site (#delay,
+    // #0, event wait).
+    void emit_suspend(const char* label) {
         auto* save   = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_save), { hdl_ });
         auto* susp   = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { save, b_.getFalse() });
-        auto* resume = llvm::BasicBlock::Create(ctx_, "coro.resume", fn_);
+        auto* resume = llvm::BasicBlock::Create(ctx_, label, fn_);
         auto* sw     = b_.CreateSwitch(susp, coro_ret_bb_, 2);
         sw->addCase(b_.getInt8(0), resume);
         sw->addCase(b_.getInt8(1), coro_cleanup_bb_);
         b_.SetInsertPoint(resume);
+    }
+
+    // Lower a #delay, then suspend; execution continues in a fresh resume block.
+    //
+    // A zero delay (#0) does not advance time: per the LRM the process parks in
+    // the inactive queue and is promoted back to active at the same instant,
+    // after everything else there settles. So route ticks==0 to the inactive
+    // queue (no wheel timer, no awaiter) and a nonzero delay to a wheel timer for
+    // `now + ticks`. When the amount is a compile-time constant we emit only the
+    // taken path; otherwise we branch at runtime (covers a delay expression that
+    // happens to evaluate to 0, which is also inactive).
+    void lower_delay(Index amount) {
+        llvm::Value* ticks = cast(must_of(value_of(amount)), 64, false);
+
+        if (auto* c = llvm::dyn_cast<llvm::ConstantInt>(ticks)) {
+            if (c->isZero()) {
+                emit_inactive_push(b_, hdl_);
+            } else {
+                emit_delay_timer(ticks);
+            }
+            emit_suspend("coro.resume");
+            return;
+        }
+
+        // Runtime amount: branch on zero. Both arms fall through to one suspend.
+        auto* zero  = llvm::BasicBlock::Create(ctx_, "delay.zero", fn_);
+        auto* timer = llvm::BasicBlock::Create(ctx_, "delay.timer", fn_);
+        auto* susp  = llvm::BasicBlock::Create(ctx_, "delay.susp", fn_);
+        b_.CreateCondBr(b_.CreateICmpEQ(ticks, b_.getInt64(0)), zero, timer);
+
+        b_.SetInsertPoint(zero);
+        emit_inactive_push(b_, hdl_);
+        b_.CreateBr(susp);
+
+        b_.SetInsertPoint(timer);
+        emit_delay_timer(ticks);
+        b_.CreateBr(susp);
+
+        b_.SetInsertPoint(susp);
+        emit_suspend("coro.resume");
+    }
+
+    // Schedule a wheel timer for `now + ticks` that resumes this coroutine: stash
+    // the handle in the awaiter so the timer callback can find it, then arm the
+    // wheel. Caller emits the suspend.
+    void emit_delay_timer(llvm::Value* ticks) {
+        auto* aw = awaiter();
+        b_.CreateStore(hdl_, b_.CreateStructGEP(awaiter_ty(), aw, 2));
+        llvm::Value* now      = b_.CreateCall(wheel_now_fn(), { wheel_ });
+        llvm::Value* deadline = b_.CreateAdd(now, ticks);
+        b_.CreateCall(wheel_schedule_fn(), { wheel_, aw, deadline, enqueue_trampoline() });
     }
 
     // Store a { handle, flag_ptr } entry at a chosen slot of a queue array. The
@@ -581,13 +623,7 @@ private:
     // returns to the resumer, case 0 resumes here, case 1 is a destroy while
     // suspended.
     void emit_wait_suspend() {
-        auto* save   = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_save), { hdl_ });
-        auto* susp   = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { save, b_.getFalse() });
-        auto* resume = llvm::BasicBlock::Create(ctx_, "coro.wait_resume", fn_);
-        auto* sw     = b_.CreateSwitch(susp, coro_ret_bb_, 2);
-        sw->addCase(b_.getInt8(0), resume);
-        sw->addCase(b_.getInt8(1), coro_cleanup_bb_);
-        b_.SetInsertPoint(resume);
+        emit_suspend("coro.wait_resume");
     }
 
     // Lower an intra-body `@(a or posedge b ...)` event wait: register on EVERY
@@ -1095,7 +1131,7 @@ private:
     // most that can ever be ready at once. Created once, lazily, so the timer
     // callback (built while lowering a process) and emit_active_run share it.
     void ensure_active_queue() {
-        if (queue_gv_ != nullptr) {
+        if (active_gv_ != nullptr) {
             return;
         }
         auto*      ptr_ty = llvm::PointerType::getUnqual(ctx_);
@@ -1103,21 +1139,46 @@ private:
         const auto cap    = std::max<size_t>(mod_.processes().size(), 1);
 
         queue_arr_ty_ = llvm::ArrayType::get(ptr_ty, cap);
-        queue_gv_     = new llvm::GlobalVariable(llmod_, queue_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
+        active_gv_    = new llvm::GlobalVariable(llmod_, queue_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
                                                  llvm::ConstantAggregateZero::get(queue_arr_ty_), "clotho.active");
         // Stack top: index of the next free slot. Starts at 0 (empty).
-        top_gv_ = new llvm::GlobalVariable(llmod_, i32, false, llvm::GlobalValue::InternalLinkage,
-                                           llvm::ConstantInt::get(i32, 0), "clotho.active_top");
+        active_top_gv_ = new llvm::GlobalVariable(llmod_, i32, false, llvm::GlobalValue::InternalLinkage,
+                                                  llvm::ConstantInt::get(i32, 0), "clotho.active_top");
+    }
+
+    // The inactive queue: same shape and capacity as the active queue, holding
+    // handles parked on a zero delay (#0). Promoted into the active queue at the
+    // same instant, after active drains and before NBA (see emit_active_run).
+    void ensure_inactive_queue() {
+        if (inactive_gv_ != nullptr) {
+            return;
+        }
+        ensure_active_queue(); // queue_arr_ty_ is shared by both queues
+        auto* i32    = llvm::Type::getInt32Ty(ctx_);
+        inactive_gv_ = new llvm::GlobalVariable(llmod_, queue_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
+                                                llvm::ConstantAggregateZero::get(queue_arr_ty_), "clotho.inactive");
+        inactive_top_gv_ = new llvm::GlobalVariable(llmod_, i32, false, llvm::GlobalValue::InternalLinkage,
+                                                    llvm::ConstantInt::get(i32, 0), "clotho.inactive_top");
     }
 
     // Push a handle onto the active queue: queue[top++] = handle.
     void emit_active_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
         ensure_active_queue();
         auto*        i32  = b.getInt32Ty();
-        llvm::Value* sp   = b.CreateLoad(i32, top_gv_);
-        llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, queue_gv_, { b.getInt32(0), sp });
+        llvm::Value* sp   = b.CreateLoad(i32, active_top_gv_);
+        llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, active_gv_, { b.getInt32(0), sp });
         b.CreateStore(handle, slot);
-        b.CreateStore(b.CreateAdd(sp, b.getInt32(1)), top_gv_);
+        b.CreateStore(b.CreateAdd(sp, b.getInt32(1)), active_top_gv_);
+    }
+
+    // Push a handle onto the inactive queue: inactive[top++] = handle.
+    void emit_inactive_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
+        ensure_inactive_queue();
+        auto*        i32  = b.getInt32Ty();
+        llvm::Value* sp   = b.CreateLoad(i32, inactive_top_gv_);
+        llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, inactive_gv_, { b.getInt32(0), sp });
+        b.CreateStore(handle, slot);
+        b.CreateStore(b.CreateAdd(sp, b.getInt32(1)), inactive_top_gv_);
     }
 
     // -- NBA update region --
@@ -1359,7 +1420,11 @@ private:
         // before any servicing scans it. Everything else (initial blocks,
         // sensitivity-less always / continuous assigns) is enqueued to run during
         // the drain.
-        b_.CreateStore(b_.getInt32(0), top_gv_);
+        b_.CreateStore(b_.getInt32(0), active_top_gv_);
+        const bool has_inactive = inactive_gv_ != nullptr; // some #0 was lowered
+        if (has_inactive) {
+            b_.CreateStore(b_.getInt32(0), inactive_top_gv_);
+        }
         const auto all = mod_.processes();
         for (uint32_t k = 0; k < procs.size(); ++k) {
             llvm::Value*   hdl = b_.CreateCall(proc_fnty, procs[k], { state, wheel });
@@ -1391,17 +1456,23 @@ private:
         const bool has_nba = !nba_buckets_.empty();
         auto*      ncheck  = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.check", fn) : wcheck;
         auto*      ncommit = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.commit", fn) : nullptr;
+        // Inactive region: only when the design has a #0. When the active queue
+        // drains, promote the whole inactive batch back into the (now empty)
+        // active queue and re-drain at the SAME instant — before NBA. So active
+        // and inactive iterate until both settle, then NBA, then the wheel.
+        auto* icheck   = has_inactive ? llvm::BasicBlock::Create(ctx_, "inactive.check", fn) : ncheck;
+        auto* ipromote = has_inactive ? llvm::BasicBlock::Create(ctx_, "inactive.promote", fn) : nullptr;
         b_.CreateBr(check);
 
-        // Drain the active queue: while top != 0, pop queue[--top] and resume it.
+        // Drain the active queue: while top != 0, pop active[--top] and resume it.
         b_.SetInsertPoint(check);
-        llvm::Value* sp = b_.CreateLoad(i32, top_gv_);
-        b_.CreateCondBr(b_.CreateICmpNE(sp, b_.getInt32(0)), body, ncheck);
+        llvm::Value* sp = b_.CreateLoad(i32, active_top_gv_);
+        b_.CreateCondBr(b_.CreateICmpNE(sp, b_.getInt32(0)), body, icheck);
 
         b_.SetInsertPoint(body);
         llvm::Value* idx  = b_.CreateSub(sp, b_.getInt32(1));
-        b_.CreateStore(idx, top_gv_);
-        llvm::Value* slot = b_.CreateInBoundsGEP(queue_arr_ty_, queue_gv_, { b_.getInt32(0), idx });
+        b_.CreateStore(idx, active_top_gv_);
+        llvm::Value* slot = b_.CreateInBoundsGEP(queue_arr_ty_, active_gv_, { b_.getInt32(0), idx });
         llvm::Value* hdl  = b_.CreateLoad(ptr_ty, slot);
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
         llvm::Value* fin = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_done), { hdl });
@@ -1413,6 +1484,41 @@ private:
 
         b_.SetInsertPoint(cont);
         b_.CreateBr(check);
+
+        if (has_inactive) {
+            // Active queue is empty here. If anything parked on a #0, move the
+            // whole batch into the active queue (it is empty, so a plain copy)
+            // and re-drain. Promoting the batch all at once is what makes every
+            // #0 process at this instant become active together, per the LRM.
+            b_.SetInsertPoint(icheck);
+            llvm::Value* n = b_.CreateLoad(i32, inactive_top_gv_);
+            b_.CreateCondBr(b_.CreateICmpNE(n, b_.getInt32(0)), ipromote, ncheck);
+
+            // for (i = 0; i < n; ++i) active[i] = inactive[i];
+            // active_top = n; inactive_top = 0; then loop back to the drain.
+            auto* phead = llvm::BasicBlock::Create(ctx_, "inactive.copy", fn);
+            auto* pbody = llvm::BasicBlock::Create(ctx_, "inactive.copy.body", fn);
+            auto* pdone = llvm::BasicBlock::Create(ctx_, "inactive.copy.done", fn);
+            b_.SetInsertPoint(ipromote);
+            b_.CreateBr(phead);
+
+            b_.SetInsertPoint(phead);
+            auto* i = b_.CreatePHI(i32, 2);
+            i->addIncoming(b_.getInt32(0), ipromote);
+            b_.CreateCondBr(b_.CreateICmpULT(i, n), pbody, pdone);
+
+            b_.SetInsertPoint(pbody);
+            llvm::Value* src = b_.CreateInBoundsGEP(queue_arr_ty_, inactive_gv_, { b_.getInt32(0), i });
+            llvm::Value* dst = b_.CreateInBoundsGEP(queue_arr_ty_, active_gv_, { b_.getInt32(0), i });
+            b_.CreateStore(b_.CreateLoad(ptr_ty, src), dst);
+            i->addIncoming(b_.CreateAdd(i, b_.getInt32(1)), pbody);
+            b_.CreateBr(phead);
+
+            b_.SetInsertPoint(pdone);
+            b_.CreateStore(n, active_top_gv_);
+            b_.CreateStore(b_.getInt32(0), inactive_top_gv_);
+            b_.CreateBr(check);
+        }
 
         if (has_nba) {
             // Any staged update? OR each bucket's live count; if so, commit them all
@@ -2447,11 +2553,15 @@ private:
     // &clotho.proc_sched[this process], set per process in lower_process.
     llvm::Constant*     sched_ptr_       = nullptr;
     // The shared timer callback (pushes a woken handle onto the active queue) and
-    // the active queue globals, all built once per module.
-    llvm::Function*                     enqueue_fn_   = nullptr;
-    llvm::GlobalVariable*               queue_gv_     = nullptr;
-    llvm::GlobalVariable*               top_gv_       = nullptr;
-    llvm::ArrayType*                    queue_arr_ty_ = nullptr;
+    // the active/inactive queue globals, all built once per module. The inactive
+    // queue holds processes parked on a zero delay (#0): drained into active at
+    // the same instant, after active settles but before NBA.
+    llvm::Function*                     enqueue_fn_        = nullptr;
+    llvm::GlobalVariable*               active_gv_         = nullptr;
+    llvm::GlobalVariable*               active_top_gv_     = nullptr;
+    llvm::GlobalVariable*               inactive_gv_       = nullptr;
+    llvm::GlobalVariable*               inactive_top_gv_   = nullptr;
+    llvm::ArrayType*                    queue_arr_ty_      = nullptr;
     // Per-signal wait queues, indexed by Signal handle and then by edge bucket
     // (`[signal][static_cast<uint32_t>(edge)]`: 0=pos, 1=neg, 2=any); null where the
     // signal has no waiter of that (kind, edge). Splitting by edge hoists the
