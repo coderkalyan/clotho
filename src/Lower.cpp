@@ -601,9 +601,7 @@ private:
                      sym.procedureKind == ProceduralBlockKind::AlwaysLatch;
 
         // A top-level event control is the process's sensitivity: collect its wait
-        // events here and lower the statement underneath. A non-event top-level
-        // timing (e.g. `always #5 ...`) is NOT sensitivity — it falls through to
-        // lower_stmt, whose Timed case rejects it loudly.
+        // events here and lower the statement underneath.
         if (body->kind == StatementKind::Timed) {
             const TimedStatement& timed = body->as<TimedStatement>();
             if (timed.timing.kind == TimingControlKind::ImplicitEvent) {
@@ -613,6 +611,20 @@ private:
                 collect_wait_events(timed.timing, wait_events);
                 body = &timed.stmt;
             }
+        }
+
+        // An `always` is semantically a forever loop around its body. Clotho models
+        // that loop only when the body re-triggers on a sensitivity list (event
+        // control above) or the block is combinational (always_comb / always_latch
+        // / @*, inferred below). Any other `always` — driven by a `#delay`, an
+        // internal timing control, or no sensitivity at all — would need a true
+        // implicit forever loop that is not yet implemented. Lowering it runs the
+        // body exactly once and silently miscompiles (e.g. `always #5 clk = ~clk;`
+        // never toggles), so reject it loudly.
+        // TODO: wrap such blocks in an implicit forever loop (docs/TODO.md M1).
+        if (activation == ir::Activation::Always && !infer && wait_events.empty()) {
+            fail("an always block with no event sensitivity list (e.g. `always #5 ...`) "
+                 "is not supported");
         }
 
         ir::Builder b(module_.pool);
