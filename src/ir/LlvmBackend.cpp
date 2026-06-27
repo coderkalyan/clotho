@@ -680,6 +680,11 @@ private:
         wheel->setAlignment(llvm::Align(alignof(rt_wheel)));
         b_.CreateCall(wheel_init_fn(), { wheel });
 
+        // Seed the %t formatter with the design tick size (fs) and the default
+        // time-unit exponent (smallest design precision) before any process runs.
+        b_.CreateCall(timeformat_init_fn(),
+                      { b_.getInt64(mod_.tick_fs), b_.getInt32(static_cast<uint32_t>(mod_.timeformat_units)) });
+
         emit_active_run(state, wheel, procs);
 
         b_.CreateCall(wheel_deinit_fn(), { wheel });
@@ -1742,6 +1747,7 @@ private:
             case Inst::Tag::Delay:
             case Inst::Tag::Wait:
             case Inst::Tag::Display:
+            case Inst::Tag::TimeFormat:
             case Inst::Tag::Finish:
                 return { 0, false, false };
         }
@@ -1906,6 +1912,10 @@ private:
 
             case Inst::Tag::Display:
                 lower_display(i);
+                return;
+
+            case Inst::Tag::TimeFormat:
+                lower_timeformat(i);
                 return;
 
             case Inst::Tag::Finish:
@@ -2106,6 +2116,35 @@ private:
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, b_.getInt32Ty(), ptr }, false);
         return llmod_.getOrInsertFunction("rt_display", fnty);
+    }
+
+    // void rt_timeformat_init(i64 tick_fs, i32 default_units)
+    llvm::FunctionCallee timeformat_init_fn() {
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { b_.getInt64Ty(), b_.getInt32Ty() }, false);
+        return llmod_.getOrInsertFunction("rt_timeformat_init", fnty);
+    }
+
+    // void rt_timeformat_set(i32 units, i32 precision, const char* suffix, i32 suffix_len, i32 min_width)
+    llvm::FunctionCallee timeformat_set_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { i32, i32, ptr, i32, i32 }, false);
+        return llmod_.getOrInsertFunction("rt_timeformat_set", fnty);
+    }
+
+    // Lower a $timeformat: evaluate the units / precision / min_width operands and
+    // hand them, plus the literal suffix, to the runtime setter. The operands were
+    // lowered earlier in this region, so their values are available.
+    void lower_timeformat(Index i) {
+        const auto   info  = ir_->extra_data<TimeFormatInfo>(ir_->payload(i).timeformat);
+        llvm::Value* units = cast(must_of(value_of(info.units)), 32, true);
+        llvm::Value* prec  = cast(must_of(value_of(info.precision)), 32, true);
+        llvm::Value* width = cast(must_of(value_of(info.min_width)), 32, true);
+
+        const std::string suffix  = ir_->extra_bytes(info.suffix, info.suffix_len);
+        llvm::Value*      sfx_ptr = b_.CreateGlobalString(suffix);
+        b_.CreateCall(timeformat_set_fn(),
+                      { units, prec, sfx_ptr, b_.getInt32(static_cast<uint32_t>(suffix.size())), width });
     }
 
     // void rt_finish(void) — noreturn; exits the process.

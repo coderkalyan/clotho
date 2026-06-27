@@ -1,6 +1,7 @@
 #include "Lower.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -158,6 +159,33 @@ uint64_t design_tick_fs(const InstanceSymbol& inst, bool& any_explicit) {
     }
 
     return min_fs;
+}
+
+// Smallest time *precision* (fs) across the design's effective timescales. This
+// is the default %t time unit (LRM Table 20-3), distinct from the wheel tick,
+// which tracks the smallest *unit*. Returns 0 if no scope has a timescale.
+uint64_t design_min_precision_fs(const InstanceSymbol& inst) {
+    uint64_t min_fs = 0;
+    if (const auto ts = inst.body.getTimeScale()) {
+        min_fs = tsv_to_fs(ts->precision);
+    }
+    for (const Symbol& m : inst.body.members()) {
+        if (m.kind == SymbolKind::Instance) {
+            const uint64_t child = design_min_precision_fs(m.as<InstanceSymbol>());
+            if (child != 0 && (min_fs == 0 || child < min_fs)) {
+                min_fs = child;
+            }
+        }
+    }
+
+    return min_fs;
+}
+
+// Time-unit exponent (10^n seconds) of a power-of-ten femtosecond magnitude. A
+// timescale value is always a power of ten, so the base-10 log is exact;
+// fs = 10^(n+15) s, so the unit exponent is log10(fs) - 15.
+int32_t fs_to_unit_exponent(uint64_t fs) {
+    return static_cast<int32_t>(std::lround(std::log10(static_cast<double>(fs)))) - 15;
 }
 
 ir::SignalInfo::Direction direction_of(slang::ast::ArgumentDirection d) {
@@ -1230,7 +1258,43 @@ private:
             lower_printtimescale(call, b);
             return;
         }
+        if (name == "$timeformat") {
+            lower_timeformat(call, b);
+            return;
+        }
         fail("unsupported system task '" + std::string(name) + "'");
+    }
+
+    // $timeformat(units, precision, suffix, min_width): set the %t format for all
+    // later %t specifiers (LRM §20.4.3). units / precision / min_width are general
+    // runtime rvalues; the suffix must be a string literal.
+    void lower_timeformat(const CallExpression& call, ir::Builder& b) {
+        const auto args = call.arguments();
+        // The no-argument form resets to the defaults; slang accepts it but
+        // Clotho's runtime default is already seeded at startup, so it is unused
+        // in practice. Require the full four-argument form for now.
+        // TODO: the zero-argument $timeformat resets to the LRM default values.
+        if (args.size() != 4) {
+            fail("$timeformat requires four arguments (units, precision, suffix, min_width)");
+        }
+
+        // The suffix must be a literal string: dynamic string values have no
+        // runtime representation yet, so only a compile-time literal is passed to
+        // the runtime as (ptr, len).
+        // TODO: a non-literal suffix (a string variable / expression) needs full
+        // dynamic string support, which Clotho lacks.
+        const Expression* suffix = args[2];
+        while (suffix->kind == ExpressionKind::Conversion) {
+            suffix = &suffix->as<ConversionExpression>().operand();
+        }
+        if (suffix->kind != ExpressionKind::StringLiteral) {
+            fail("$timeformat suffix must be a string literal");
+        }
+
+        const ir::Index units     = lower_expr(*args[0], b);
+        const ir::Index precision = lower_expr(*args[1], b);
+        const ir::Index min_width = lower_expr(*args[3], b);
+        b.timeformat(units, precision, suffix->as<StringLiteral>().getValue(), min_width, loc(call));
     }
 
     // $printtimescale [hier]: print "Time scale of (<path>) is <unit> / <prec>"
@@ -1324,41 +1388,77 @@ private:
     void lower_display(const CallExpression& call, bool newline, ir::Builder& b) {
         std::string            fmt;
         std::vector<ir::Index> args;
-        int                    pending = 0; // unmatched specifiers seen so far
+        // Conversion chars of specifiers seen but not yet matched to a value arg,
+        // in order (FIFO). Needed so a `%t` argument can be scaled to ticks.
+        std::vector<char> pending;
+        size_t            next = 0; // front of `pending`
 
         for (const Expression* arg : call.arguments()) {
             if (arg->kind == ExpressionKind::StringLiteral) {
                 const std::string_view text = arg->as<StringLiteral>().getValue();
                 fmt += text;
-                pending += count_specifiers(text);
+                collect_specifiers(text, pending);
             } else {
-                args.push_back(lower_expr(*arg, b));
-                if (pending > 0) {
-                    --pending; // consumed by an earlier format specifier
+                char conv = 'd';
+                if (next < pending.size()) {
+                    conv = pending[next++]; // consumed by an earlier specifier
                 } else {
                     fmt += "%0d"; // bare value: default decimal
                 }
+                ir::Index v = lower_expr(*arg, b);
+                if (conv == 't' || conv == 'T') {
+                    v = scale_to_ticks(*arg, v, b);
+                }
+                args.push_back(v);
             }
         }
 
         b.display(fmt, newline, args, loc(call));
     }
 
-    // Count format specifiers in `s`, treating `%%` as an escaped literal percent.
-    static int count_specifiers(std::string_view s) {
-        int n = 0;
+    // Append the conversion character of each format specifier in `s` to `out`,
+    // treating `%%` as an escaped literal percent (no specifier). Mirrors the
+    // runtime's flag/width/precision skipping so the recorded char is the one the
+    // runtime will dispatch on.
+    static void collect_specifiers(std::string_view s, std::vector<char>& out) {
         for (size_t i = 0; i < s.size(); ++i) {
             if (s[i] != '%') {
                 continue;
             }
-            if (i + 1 < s.size() && s[i + 1] == '%') {
-                ++i; // skip the escaped percent
-                continue;
+            ++i;
+            if (i >= s.size()) {
+                break;
             }
-            ++n;
+            if (s[i] == '%') {
+                continue; // escaped percent: no value arg
+            }
+            while (i < s.size() && (s[i] == '-' || s[i] == '+' || s[i] == ' ' || s[i] == '0')) {
+                ++i;
+            }
+            while (i < s.size() && ((s[i] >= '0' && s[i] <= '9') || s[i] == '.')) {
+                ++i;
+            }
+            if (i >= s.size()) {
+                break;
+            }
+            out.push_back(s[i]);
         }
+    }
 
-        return n;
+    // Scale a %t argument from its module's time unit to design ticks: the runtime
+    // converts ticks -> fs -> the $timeformat unit independent of the caller's
+    // timescale (LRM §20.4.3). A value in module units times this instance's
+    // time-unit multiplier yields ticks; the result is widened to 64 bits so the
+    // runtime reads the full tick count.
+    ir::Index scale_to_ticks(const Expression& arg, ir::Index v, ir::Builder& b) {
+        const ir::SourceLoc l   = loc(arg);
+        const ir::Ref       u64 = make_int_type(64, false, false);
+        const ir::Index     w   = b.resize(v, u64, l);
+        if (time_mul_ <= 1) {
+            return w;
+        }
+        const ir::Index mul = b.constant(module_.pool.put_int(u64, time_mul_), l);
+        return b.binary(ir::Inst::Tag::Mul, w, mul, l);
     }
 
     void lower_assign(const AssignmentExpression& a, ir::Builder& b) {
@@ -1645,6 +1745,15 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
     bool       any_explicit = false;
     const uint64_t prec_fs  = design_tick_fs(*root.topInstances[0], any_explicit);
     const uint64_t tick_fs  = any_explicit ? prec_fs : 0;
+
+    // %t needs the real tick size (fs). In unitless mode (no `timescale anywhere)
+    // a tick is one second, matching the seconds base the LRM and iverilog use
+    // when no scale is set. The default %t time unit is the smallest design
+    // precision (LRM Table 20-3), falling back to the tick when unitless.
+    constexpr uint64_t fs_per_second = 1'000'000'000'000'000ULL;
+    const uint64_t     min_prec_fs   = design_min_precision_fs(*root.topInstances[0]);
+    module->tick_fs                  = prec_fs == 0 ? fs_per_second : prec_fs;
+    module->timeformat_units         = fs_to_unit_exponent(min_prec_fs == 0 ? module->tick_fs : min_prec_fs);
     try {
         Lowerer(*module, tick_fs).lower_instance(*root.topInstances[0], "");
     } catch (const LowerError& e) {

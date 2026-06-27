@@ -94,6 +94,13 @@ public:
     InternPool pool;
     // Module name.
     std::string name;
+    // Femtoseconds per wheel tick (the design's finest time unit). Used by %t to
+    // convert a tick-valued time argument to real time. 1 when unitless.
+    uint64_t tick_fs = 1;
+    // Default %t time-unit exponent (10^n seconds): the smallest time precision
+    // across all design timescales (LRM Table 20-3). Seeds the runtime's
+    // $timeformat default at startup.
+    int32_t timeformat_units = 0;
 
     // Append a signal; the returned Signal handle is its index in `signals`.
     Signal add_signal(SignalInfo info) {

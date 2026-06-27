@@ -67,6 +67,8 @@ int run_jit(const Module& m, Timings* timings) {
         };
     };
     expose("rt_display", &rt_display);
+    expose("rt_timeformat_init", &rt_timeformat_init);
+    expose("rt_timeformat_set", &rt_timeformat_set);
     expose("rt_finish", &rt_finish);
     expose("rt_random", &rt_random);
     expose("rt_alloc", &rt_alloc);

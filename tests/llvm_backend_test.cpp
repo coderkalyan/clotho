@@ -360,6 +360,72 @@ TEST_CASE("$printtimescale prints the scope unit and precision") {
     CHECK(out == "Time scale of (m) is 1ns / 1ps\n");
 }
 
+TEST_CASE("%t formats time per $timeformat units, precision, suffix, and width") {
+    // Verified against iverilog. $time is 100 ns; changing only the units reprints
+    // the same instant in ns then ps, and width right-justifies number + suffix.
+    const std::string out = run_capture(R"(`timescale 1ns/1ns
+        module m;
+            initial begin
+                $timeformat(-9, 2, " ns", 10);
+                #100 $display("a:%t", $time);
+                $timeformat(-12, 0, " ps", 8);
+                $display("b:%t", $time);
+                $timeformat(-9, 3, " ns", 0);
+                $display("c:%t", $time);
+            end
+        endmodule
+    )");
+
+    CHECK(out == "a: 100.00 ns\nb:100000 ps\nc:100.000 ns\n");
+}
+
+TEST_CASE("%t default format uses the smallest precision and width 20") {
+    // No $timeformat call: units default to the design's smallest precision (1ps),
+    // precision 0, empty suffix, field width 20 (LRM Table 20-3). $time is 100 ns
+    // == 100000 ps, right-justified in 20 columns. Matches iverilog.
+    const std::string out = run_capture(R"(`timescale 1ns/1ps
+        module m;
+            initial #100 $display("d:%t", $time);
+        endmodule
+    )");
+
+    CHECK(out == "d:              100000\n");
+}
+
+TEST_CASE("%t scales to ticks independent of the calling module time unit") {
+    // top's unit is 1us; its $time reads 5 (us). With units -9 the same instant
+    // prints as 5000 ns, proving %t scales through real time, not the module unit
+    // (LRM §20.4.3). The design tick is 1ns (sub's unit). Matches iverilog.
+    const std::string out = run_capture(R"(`timescale 1ns/1ns
+        module sub; initial #5500 ; endmodule
+        `timescale 1us/1ns
+        module top;
+            sub s();
+            initial begin
+                $timeformat(-9, 0, " ns", 0);
+                #5 $display("t:%t", $time);
+            end
+        endmodule
+    )");
+
+    CHECK(out == "t:5000 ns\n");
+}
+
+TEST_CASE("a later $timeformat changes the format mid-simulation") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ns
+        module m;
+            initial begin
+                $timeformat(-9, 0, "ns", 0);
+                #10 $display("%t", $time);
+                $timeformat(-12, 1, "ps", 0);
+                #10 $display("%t", $time);
+            end
+        endmodule
+    )");
+
+    CHECK(out == "10ns\n20000.0ps\n");
+}
+
 TEST_CASE("repeated instantiation emits distinct process symbols") {
     // Two instances of one module share AST source locations; the backend must
     // name their processes uniquely (by index) or LLVM would reject duplicate

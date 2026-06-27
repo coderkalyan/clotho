@@ -115,6 +115,23 @@ struct DisplayInfo {
     ExtraSlice args;
 };
 
+// Extra payload for `timeformat`: a $timeformat system task. `units`,
+// `precision`, and `min_width` are value operands (general runtime rvalues); the
+// suffix string is appended after the formatted number and lives packed
+// little-endian (4 chars per u32 word) at `suffix` for `suffix_len` bytes.
+struct TimeFormatInfo {
+    // Time-unit exponent operand (10^units seconds).
+    Index units;
+    // Fractional-digit count operand.
+    Index precision;
+    // Minimum field width operand (right-justifies the number + suffix).
+    Index min_width;
+    // First extra word of the packed suffix bytes.
+    ExtraIndex suffix;
+    // Suffix length in bytes.
+    uint32_t suffix_len;
+};
+
 // Extra payload for `wait`: one (signal, edge) event of an intra-body event
 // control. A `@(a or posedge b)` wait carries several of these in a row.
 struct WaitEdge {
@@ -138,6 +155,7 @@ static_assert(ExtraPayload<PartSelect>);
 static_assert(ExtraPayload<Regions>);
 static_assert(ExtraPayload<LoopInfo>);
 static_assert(ExtraPayload<DisplayInfo>);
+static_assert(ExtraPayload<TimeFormatInfo>);
 static_assert(ExtraPayload<WaitEdge>);
 static_assert(ExtraPayload<WaitInfo>);
 
@@ -250,6 +268,10 @@ struct Inst {
         // -- System tasks --
         // $display / $write: format string + variadic args (payload: display).
         Display,
+        // $timeformat: set the %t format (units / precision / suffix / min width)
+        // for all later %t specifiers (payload: timeformat -> TimeFormatInfo).
+        // LRM §20.4.3. Lowers to an rt_timeformat_set call.
+        TimeFormat,
         // $finish / $stop: end the simulation and exit (payload: none). LRM §20.2
         // has $stop suspend and $finish exit; with no resume mechanism a suspend
         // is observationally an exit, so both are treated identically.
@@ -284,6 +306,7 @@ struct Inst {
         OpExtra,
         Extra,
         Display,
+        TimeFormat,
         Wait,
     };
 
@@ -338,6 +361,8 @@ struct Inst {
         ExtraIndex extra;
         // Handle to a DisplayInfo extra record (display).
         ExtraIndex display;
+        // Handle to a TimeFormatInfo extra record (timeformat).
+        ExtraIndex timeformat;
         // Handle to a WaitInfo extra record (wait): the list of (signal, edge)
         // events to suspend on. The process wakes when ANY of them fires. No SSA
         // operands.
