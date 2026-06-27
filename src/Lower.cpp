@@ -935,6 +935,14 @@ private:
 
     // Register a hidden compiler temporary as backing signal storage. Unlike
     // declare_local there is no source ValueSymbol, so the name is synthesized.
+    //
+    // TODO: Back compiler temporaries (and SV automatic locals) with a
+    // process-local storage class on the coroutine frame (an alloca) rather than
+    // a module-global signal. The signal model gives static lifetime, pollutes
+    // the signal table, and runs wait-queue machinery a loop-private counter does
+    // not need. Correct today because processes are single-activation and the
+    // counter is reinitialized at each loop entry, but wrong for true automatic
+    // lifetime and future reentrant/recursive activations. See declare_local NOTE.
     ir::Signal declare_temp(ir::Ref type, std::string_view role) {
         ir::SignalInfo info;
         info.name = prefix_ + "__" + std::string(role) + std::to_string(temp_id_++);
