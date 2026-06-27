@@ -80,6 +80,8 @@ const char* tag_name(Inst::Tag tag) {
             return "bor";
         case T::Bxor:
             return "bxor";
+        case T::Bxnor:
+            return "bxnor";
         case T::Bnot:
             return "bnot";
         case T::RedAnd:
@@ -112,6 +114,8 @@ const char* tag_name(Inst::Tag tag) {
             return "casez_eq";
         case T::CasexEq:
             return "casex_eq";
+        case T::WildEq:
+            return "wild_eq";
         case T::Land:
             return "land";
         case T::Lor:

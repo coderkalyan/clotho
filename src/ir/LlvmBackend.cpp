@@ -199,6 +199,16 @@ constexpr code ne4(code a, code b) {
 constexpr uint32_t NE1_LUT = build_lut(ne4);
 static_assert(NE1_LUT == XOR1_LUT, "1-bit != must equal 1-bit xor");
 
+// 1-bit bitwise xnor is ~(a ^ b) with the X rule — the same table as ==.
+constexpr code bxnor4(code a, code b) {
+    const code u = ((a ^ (a >> 1)) | (b ^ (b >> 1))) & 1u;
+    const code k = (~((a & 1u) ^ (b & 1u))) & 1u;          // ~(a ^ b)
+    return (((u | k) & 1u) << 1) | (~u & k & 1u);
+}
+
+constexpr uint32_t BXNOR1_LUT = build_lut(bxnor4);
+static_assert(BXNOR1_LUT == EQ1_LUT, "1-bit xnor must equal 1-bit ==");
+
 // A resolved assignment target: a `{ i(2W) must|may, iW z }` pair somewhere in
 // memory (the module state buffer for a signal, or the per-call frame for a
 // function local) plus a bit offset / width selecting part of it. `bit_off` is an
@@ -2186,6 +2196,7 @@ private:
             case Inst::Tag::Band:
             case Inst::Tag::Bor:
             case Inst::Tag::Bxor:
+            case Inst::Tag::Bxnor:
             case Inst::Tag::Sll:
             case Inst::Tag::Srl:
             case Inst::Tag::Sra:
@@ -2207,6 +2218,7 @@ private:
             case Inst::Tag::CaseEq:
             case Inst::Tag::CasezEq:
             case Inst::Tag::CasexEq:
+            case Inst::Tag::WildEq:
             case Inst::Tag::Land:
             case Inst::Tag::Lor:
             case Inst::Tag::Lnot:
@@ -2396,6 +2408,7 @@ private:
             case Inst::Tag::Band:
             case Inst::Tag::Bor:
             case Inst::Tag::Bxor:
+            case Inst::Tag::Bxnor:
                 set_value(i, lower_bitwise(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
                 return;
             case Inst::Tag::Bnot:
@@ -2431,6 +2444,10 @@ private:
             case Inst::Tag::CasezEq:
             case Inst::Tag::CasexEq:
                 set_value(i, lower_case_compare(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
+                return;
+
+            case Inst::Tag::WildEq:
+                set_value(i, lower_wildeq(value_of(p.binary.l), value_of(p.binary.r)));
                 return;
 
             case Inst::Tag::Land:
@@ -3182,6 +3199,14 @@ private:
         if (tag == Inst::Tag::Bor) {
             return { b_.CreateOr(a.mm, b.mm), zero(w) };
         }
+        if (tag == Inst::Tag::Bxnor) {
+            if (w == 1) {
+                return single_bit_lut(BXNOR1_LUT, a, b);
+            }
+            // Wider xnor = ~(xor): lower_bnot does must' = ~may, may' = ~must over
+            // the xor result, which is exactly the negated value with the same X mask.
+            return lower_bnot(lower_bitwise(Inst::Tag::Bxor, a, b));
+        }
         if (w == 1) {
             return single_bit_lut(XOR1_LUT, a, b);
         }
@@ -3392,6 +3417,26 @@ private:
               b_.CreateICmpEQ(b_.CreateAnd(aM, keep), b_.CreateAnd(bM, keep)));
         }
         return bit_plane(eq, eq);
+    }
+
+    // Wildcard equality `==?`. LRM 1800-2023 §11.4.6: x/z in the RIGHT operand are
+    // wildcards (that bit position is not compared); on the remaining positions it
+    // is an ordinary X-propagating `==`, so a left-operand x/z there yields X.
+    // Masking both operands to the kept (non-wildcard) bits and running `==` gives
+    // exactly that: the right is known on kept bits so it never injects X, while a
+    // left x/z on a kept bit trips the unknown path.
+    Plane lower_wildeq(Plane a, Plane b) {
+        const uint32_t w     = std::max(width_of(a), width_of(b));
+        a                    = cast_plane(a, w, false);
+        b                    = cast_plane(b, w, false);
+        auto*          wide  = int_ty(2 * w);
+        llvm::Value*   unkb  = b_.CreateXor(must_of(b), may_of(b)); // x/z bits of b
+        llvm::Value*   keep  = b_.CreateNot(unkb);
+        llvm::Value*   keepW = b_.CreateOr(b_.CreateZExt(keep, wide),
+                                           b_.CreateShl(b_.CreateZExt(keep, wide), w));
+        Plane ma = { b_.CreateAnd(a.mm, keepW), b_.CreateAnd(a.z, keep) };
+        Plane mb = { b_.CreateAnd(b.mm, keepW), b_.CreateAnd(b.z, keep) };
+        return lower_compare(Inst::Tag::Eq, ma, mb, false);
     }
 
     // -- Logical and/or/not -> 1-bit, three-valued. --

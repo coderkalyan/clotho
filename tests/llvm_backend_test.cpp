@@ -411,6 +411,50 @@ TEST_CASE("wide == keeps the icmp compare path") {
     CHECK(ir.find("icmp") != std::string::npos);
 }
 
+TEST_CASE("===, !==, ==?, and ^~ operators agree with LRM 4-state semantics") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] a, b;
+            initial begin
+                a = 4'b001x; b = 4'b0011;
+                $display("%b%b%b%b", a===b, a!==b, a==?b, a^~b);
+                a = 4'b001x; b = 4'b001x;
+                $display("%b%b%b%b", a===b, a!==b, a==?b, a^~b);
+                a = 4'b0011; b = 4'b001x;
+                $display("%b%b%b%b", a===b, a!==b, a==?b, a^~b);
+                a = 4'bzz01; b = 4'bzz01;
+                $display("%b%b%b%b", a===b, a!==b, a==?b, a^~b);
+            end
+        endmodule
+    )";
+    // Each line is %b%b%b%b = ===, !==, ==? (1 bit each) then ^~ (4 bits).
+    // === bit-exact (incl x/z); !== its negation; ==? wildcards the right operand's
+    // x/z then X-propagating == (so 001x==?0011 is x, 001x==?001x is 1); ^~ is
+    // bitwise xnor with X where either bit is x/z. Cross-checked against iverilog.
+    CHECK(run_capture(src) ==
+          "01x111x\n"   // 001x vs 0011: 0,1,x,111x
+          "101111x\n"   // 001x vs 001x: 1,0,1,111x
+          "011111x\n"   // 0011 vs 001x: 0,1,1,111x
+          "101xx11\n"); // zz01 vs zz01: 1,0,1,xx11
+}
+
+TEST_CASE("single-bit ^~ uses the bxnor truth-table immediate (== EQ1)") {
+    const std::string ir = emit(R"(
+        module m(input logic a, input logic b, output logic y); assign y = a ^~ b; endmodule
+    )");
+    CHECK(ir.find("lshr i32 -526254045") != std::string::npos); // BXNOR1_LUT == EQ1_LUT
+}
+
+TEST_CASE("wide ^~ lowers as xnor over the xor path") {
+    const std::string ir = emit(R"(
+        module m(input logic [7:0] a, input logic [7:0] b, output logic [7:0] y);
+            assign y = a ^~ b;
+        endmodule
+    )");
+    CHECK(ir.find("-526254045") == std::string::npos); // not the 1-bit LUT
+    CHECK(ir.find("fshl") != std::string::npos);        // bnot's plane swap
+}
+
 TEST_CASE("delay suspends and reschedules on the wheel") {
     constexpr std::string_view src = R"(
         module d;

@@ -232,6 +232,8 @@ struct Inst {
         Band,
         Bor,
         Bxor,
+        // Bitwise xnor ^~ / ~^ (payload: binary).
+        Bxnor,
         // Bitwise invert ~ (payload: unary).
         Bnot,
 
@@ -264,6 +266,11 @@ struct Inst {
         CaseEq,
         CasezEq,
         CasexEq,
+
+        // Wildcard equality `==?` (payload: binary). x/z bits in the RIGHT operand
+        // are wildcards; unlike the case-equality tags this is X-propagating — a
+        // left-operand x/z on a non-wildcard bit yields X.
+        WildEq,
 
         // -- Logical, -> 1-bit --
         // Logical and (payload: binary).

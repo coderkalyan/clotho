@@ -1759,11 +1759,19 @@ private:
             case B::BinaryXor:
                 return b.binary(T::Bxor, lhs, rhs, l);
             case B::BinaryXnor:
-                return b.unary(T::Bnot, b.binary(T::Bxor, lhs, rhs, l), l);
+                return b.binary(T::Bxnor, lhs, rhs, l);
             case B::Equality:
                 return b.binary(T::Eq, lhs, rhs, l);
             case B::Inequality:
                 return b.binary(T::Ne, lhs, rhs, l);
+            case B::CaseEquality:
+                return b.binary(T::CaseEq, lhs, rhs, l);
+            case B::CaseInequality:
+                // !== is the strict inequality: logical negation of the always-known
+                // === result.
+                return b.unary(T::Lnot, b.binary(T::CaseEq, lhs, rhs, l), l);
+            case B::WildcardEquality:
+                return b.binary(T::WildEq, lhs, rhs, l);
             case B::GreaterThanEqual:
                 return b.binary(T::Ge, lhs, rhs, l);
             case B::GreaterThan:

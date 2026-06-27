@@ -37,6 +37,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Band:
         case T::Bor:
         case T::Bxor:
+        case T::Bxnor:
         case T::Sll:
         case T::Srl:
         case T::Sra:
@@ -49,6 +50,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::CaseEq:
         case T::CasezEq:
         case T::CasexEq:
+        case T::WildEq:
         case T::Land:
         case T::Lor:
             return K::Binary;
