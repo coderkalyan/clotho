@@ -920,6 +920,11 @@ private:
         wheel->setAlignment(llvm::Align(alignof(rt_wheel)));
         b_.CreateCall(wheel_init_fn(), { wheel });
 
+        // Seed the %t formatter with the design tick size (fs) and the default
+        // time-unit exponent (smallest design precision) before any process runs.
+        b_.CreateCall(timeformat_init_fn(),
+                      { b_.getInt64(mod_.tick_fs), b_.getInt32(static_cast<uint32_t>(mod_.timeformat_units)) });
+
         emit_active_run(state, wheel, procs);
 
         b_.CreateCall(wheel_deinit_fn(), { wheel });
@@ -1823,6 +1828,15 @@ private:
         auto* ptr = llvm::PointerType::getUnqual(ctx_);
         return llmod_.getOrInsertFunction("rt_wheel_now", llvm::FunctionType::get(b_.getInt64Ty(), { ptr }, false));
     }
+    // i32 rt_random(void)
+    llvm::FunctionCallee random_fn() {
+        return llmod_.getOrInsertFunction("rt_random", llvm::FunctionType::get(b_.getInt32Ty(), {}, false));
+    }
+    // i64 rt_pow_u64(i64 base, i64 exp)
+    llvm::FunctionCallee pow_fn() {
+        auto* i64 = b_.getInt64Ty();
+        return llmod_.getOrInsertFunction("rt_pow_u64", llvm::FunctionType::get(i64, { i64, i64 }, false));
+    }
     // i32 rt_wheel_pending(const rt_wheel*)
     llvm::FunctionCallee wheel_pending_fn() {
         auto* ptr = llvm::PointerType::getUnqual(ctx_);
@@ -1934,10 +1948,19 @@ private:
             }
             case Inst::Tag::Load:
                 return type_of(p.unary);
+            case Inst::Tag::SimTime:
+                return { 64, false, false };
+            case Inst::Tag::Random:
+                return { 32, false, true };
 
             case Inst::Tag::Add:
             case Inst::Tag::Sub:
             case Inst::Tag::Mul:
+            case Inst::Tag::Div:
+            case Inst::Tag::Mod:
+            // Power's result shares the left operand's type; the exponent is
+            // self-determined and does not widen the result.
+            case Inst::Tag::Pow:
             case Inst::Tag::Band:
             case Inst::Tag::Bor:
             case Inst::Tag::Bxor:
@@ -1991,6 +2014,7 @@ private:
             case Inst::Tag::Delay:
             case Inst::Tag::Wait:
             case Inst::Tag::Display:
+            case Inst::Tag::TimeFormat:
             case Inst::Tag::Finish:
                 return { 0, false, false };
         }
@@ -2082,6 +2106,37 @@ private:
                 set_value(i, lower_arith(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
                 return;
 
+            case Inst::Tag::Div:
+            case Inst::Tag::Mod: {
+                const ValType lt = type_of(p.binary.l);
+                if (lt.width > 64) {
+                    // TODO: integer / and % lower to LLVM udiv/sdiv/urem/srem, which legalize to
+                    // 128-bit __udivti3 / __umodti3 (and signed siblings) for wider operands; those
+                    // compiler-rt builtins are not resolvable in the JIT, so wide divide/modulo would
+                    // silently miscompute. Provision the libcalls before lifting this guard.
+                    throw BackendError{ "divide/modulo with operands wider than 64 bits not yet supported" };
+                }
+                set_value(i, lower_divmod(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r), lt.is_signed));
+                return;
+            }
+
+            case Inst::Tag::Pow: {
+                const ValType lt = type_of(p.binary.l);
+                if (lt.is_signed || type_of(p.binary.r).is_signed) {
+                    // TODO: signed ** carries the negative-base/negative-exponent corners of LRM
+                    // Table 11-4 (op1 == -1 parity, |op1| > 1 with op2 < 0 -> 0, etc.); only the
+                    // unsigned path is lowered.
+                    throw BackendError{ "signed power operator (**) not yet supported" };
+                }
+                if (lt.width > 64 || type_of(p.binary.r).width > 64) {
+                    // TODO: rt_pow_u64 is a 64-bit entry; wider operands need a multi-word runtime
+                    // helper before ** can be lowered for them.
+                    throw BackendError{ "power operator (**) with operands wider than 64 bits not yet supported" };
+                }
+                set_value(i, lower_pow(value_of(p.binary.l), value_of(p.binary.r)));
+                return;
+            }
+
             case Inst::Tag::Band:
             case Inst::Tag::Bor:
             case Inst::Tag::Bxor:
@@ -2165,9 +2220,35 @@ private:
                 lower_display(i);
                 return;
 
+            case Inst::Tag::TimeFormat:
+                lower_timeformat(i);
+                return;
+
             case Inst::Tag::Finish:
                 lower_finish();
                 return;
+
+            case Inst::Tag::SimTime: {
+                // The clock value is always known: must == may, z == 0. The wheel
+                // counts in the design's smallest time unit; scale the tick count
+                // down to the calling module's time unit, rounding to nearest
+                // (LRM §20.3.1). `scale` is a power of ten, so scale/2 is exact and
+                // (now + scale/2) / scale rounds half up.
+                llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
+                if (p.scale > 1) {
+                    now = b_.CreateUDiv(b_.CreateAdd(now, b_.getInt64(p.scale / 2)),
+                                        b_.getInt64(p.scale));
+                }
+                set_value(i, packed(now, now, zero(64)));
+                return;
+            }
+
+            case Inst::Tag::Random: {
+                // The PRNG draw is always known (no x/z): must == may, z == 0.
+                llvm::Value* draw = b_.CreateCall(random_fn(), {});
+                set_value(i, packed(draw, draw, zero(32)));
+                return;
+            }
 
             case Inst::Tag::Arg: {
                 // A function parameter: read its plane from the call frame's params.
@@ -2377,6 +2458,35 @@ private:
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, b_.getInt32Ty(), ptr }, false);
         return llmod_.getOrInsertFunction("rt_display", fnty);
+    }
+
+    // void rt_timeformat_init(i64 tick_fs, i32 default_units)
+    llvm::FunctionCallee timeformat_init_fn() {
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { b_.getInt64Ty(), b_.getInt32Ty() }, false);
+        return llmod_.getOrInsertFunction("rt_timeformat_init", fnty);
+    }
+
+    // void rt_timeformat_set(i32 units, i32 precision, const char* suffix, i32 suffix_len, i32 min_width)
+    llvm::FunctionCallee timeformat_set_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { i32, i32, ptr, i32, i32 }, false);
+        return llmod_.getOrInsertFunction("rt_timeformat_set", fnty);
+    }
+
+    // Lower a $timeformat: evaluate the units / precision / min_width operands and
+    // hand them, plus the literal suffix, to the runtime setter. The operands were
+    // lowered earlier in this region, so their values are available.
+    void lower_timeformat(Index i) {
+        const auto   info  = ir_->extra_data<TimeFormatInfo>(ir_->payload(i).timeformat);
+        llvm::Value* units = cast(must_of(value_of(info.units)), 32, true);
+        llvm::Value* prec  = cast(must_of(value_of(info.precision)), 32, true);
+        llvm::Value* width = cast(must_of(value_of(info.min_width)), 32, true);
+
+        const std::string suffix  = ir_->extra_bytes(info.suffix, info.suffix_len);
+        llvm::Value*      sfx_ptr = b_.CreateGlobalString(suffix);
+        b_.CreateCall(timeformat_set_fn(),
+                      { units, prec, sfx_ptr, b_.getInt32(static_cast<uint32_t>(suffix.size())), width });
     }
 
     // void rt_finish(void) — noreturn; exits the process.
@@ -2596,6 +2706,113 @@ private:
         return { mm, zero(w) };
     }
 
+    // Divide and modulo. LRM 1800-2023 §11.4.3: integer division truncates toward
+    // zero, modulo takes the sign of the dividend, and a zero divisor or any X/Z
+    // bit in either operand makes the whole result X.
+    Plane lower_divmod(Inst::Tag tag, Plane a, Plane b, bool sign) {
+        const uint32_t w      = width_of(a);
+        auto*          wide   = int_ty(2 * w);
+        const bool     is_div = tag == Inst::Tag::Div;
+
+        llvm::Value* am = must_of(a);
+        llvm::Value* bm = must_of(b);
+
+        // One cold branch folds the X/Z test and the divide-by-zero test together:
+        // both map to an all-X result, so a single not-taken branch is optimal. For
+        // 2-state operands the X/Z half is statically zero and instcombine drops it,
+        // leaving just `divisor == 0`.
+        llvm::Value* xa      = b_.CreateXor(a.mm, b_.CreateLShr(a.mm, w));
+        llvm::Value* xb      = b_.CreateXor(b.mm, b_.CreateLShr(b.mm, w));
+        llvm::Value* xmask   = b_.CreateTrunc(b_.CreateOr(xa, xb), int_ty(w));
+        llvm::Value* unknown = b_.CreateICmpNE(xmask, zero(w));
+        llvm::Value* divzero = b_.CreateICmpEQ(bm, zero(w));
+        llvm::Value* cold    = b_.CreateOr(unknown, divzero);
+
+        auto* x_bb   = llvm::BasicBlock::Create(ctx_, "divmod.x", fn_);
+        auto* val_bb = llvm::BasicBlock::Create(ctx_, "divmod.val", fn_);
+        auto* end_bb = llvm::BasicBlock::Create(ctx_, "divmod.end", fn_);
+
+        llvm::BranchInst* br = b_.CreateCondBr(cold, x_bb, val_bb);
+        br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
+
+        b_.SetInsertPoint(x_bb);
+        llvm::Value* x_mm = llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w));
+        b_.CreateBr(end_bb);
+
+        // Hot: divisor guaranteed nonzero. Unsigned is a direct udiv/urem. Signed
+        // sdiv/srem are poison for INT_MIN / -1, so sanitize that divisor to 1 and
+        // substitute the wrapped result (INT_MIN for /, 0 for %), which is the
+        // two's-complement overflow value at width W.
+        b_.SetInsertPoint(val_bb);
+        llvm::Value* r = nullptr;
+        if (!sign) {
+            r = is_div ? b_.CreateUDiv(am, bm) : b_.CreateURem(am, bm);
+        }
+        else {
+            llvm::Value* neg1 = b_.CreateICmpEQ(bm, llvm::ConstantInt::getAllOnesValue(int_ty(w)));
+            llvm::Value* safe = b_.CreateSelect(neg1, llvm::ConstantInt::get(int_ty(w), 1), bm);
+            if (is_div) {
+                r = b_.CreateSelect(neg1, b_.CreateNeg(am), b_.CreateSDiv(am, safe));
+            }
+            else {
+                r = b_.CreateSelect(neg1, zero(w), b_.CreateSRem(am, safe));
+            }
+        }
+        llvm::Value* val_mm = packed(r, r, zero(w)).mm;
+        b_.CreateBr(end_bb);
+
+        b_.SetInsertPoint(end_bb);
+        llvm::PHINode* mm = b_.CreatePHI(wide, 2);
+        mm->addIncoming(x_mm, x_bb);
+        mm->addIncoming(val_mm, val_bb);
+        return { mm, zero(w) };
+    }
+
+    // Power (**), unsigned. LRM 1800-2023 §11.4.3: the exponent is self-determined
+    // (so it may be a different width from the base/result), any X/Z bit makes the
+    // result X, and the unsigned table corners (exp 0 -> 1, 0**n -> 0, 1**n -> 1)
+    // fall out of exponentiation by squaring in rt_pow_u64.
+    Plane lower_pow(Plane a, Plane b) {
+        const uint32_t w    = width_of(a);
+        const uint32_t ew   = width_of(b);
+        auto*          wide = int_ty(2 * w);
+
+        // X/Z in either operand -> all-X. The operands can differ in width, so each
+        // mask is tested at its own width and the two feed one cold branch.
+        llvm::Value* xa      = b_.CreateXor(a.mm, b_.CreateLShr(a.mm, w));
+        llvm::Value* xb      = b_.CreateXor(b.mm, b_.CreateLShr(b.mm, ew));
+        llvm::Value* ua      = b_.CreateICmpNE(b_.CreateTrunc(xa, int_ty(w)), zero(w));
+        llvm::Value* ub      = b_.CreateICmpNE(b_.CreateTrunc(xb, int_ty(ew)), zero(ew));
+        llvm::Value* unknown = b_.CreateOr(ua, ub);
+
+        auto* x_bb   = llvm::BasicBlock::Create(ctx_, "pow.x", fn_);
+        auto* val_bb = llvm::BasicBlock::Create(ctx_, "pow.val", fn_);
+        auto* end_bb = llvm::BasicBlock::Create(ctx_, "pow.end", fn_);
+
+        llvm::BranchInst* br = b_.CreateCondBr(unknown, x_bb, val_bb);
+        br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
+
+        b_.SetInsertPoint(x_bb);
+        llvm::Value* x_mm = llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w));
+        b_.CreateBr(end_bb);
+
+        // Hot: compute in 64 bits and truncate to W. Since 2^W | 2^64 the modular
+        // result is exact at width W.
+        b_.SetInsertPoint(val_bb);
+        llvm::Value* base   = cast(must_of(a), 64, false);
+        llvm::Value* exp    = cast(must_of(b), 64, false);
+        llvm::Value* res    = b_.CreateCall(pow_fn(), { base, exp });
+        llvm::Value* r      = cast(res, w, false);
+        llvm::Value* val_mm = packed(r, r, zero(w)).mm;
+        b_.CreateBr(end_bb);
+
+        b_.SetInsertPoint(end_bb);
+        llvm::PHINode* mm = b_.CreatePHI(wide, 2);
+        mm->addIncoming(x_mm, x_bb);
+        mm->addIncoming(val_mm, val_bb);
+        return { mm, zero(w) };
+    }
+
     // -- Bitwise: AND/OR are monotone, so one op on the packed planes does both;
     // the result is never Z, so z is cleared. --
 
@@ -2700,29 +2917,56 @@ private:
 
     Plane lower_shift(Inst::Tag tag, Plane a, Plane amt, bool sign) {
         const uint32_t w  = width_of(a);
-        llvm::Value*   sh = cast(must_of(amt), w, false);
+        const uint32_t aw = width_of(amt);
         llvm::Value*   am = must_of(a);
         llvm::Value*   aM = may_of(a);
-        llvm::Value*   must;
-        llvm::Value*   may;
-        llvm::Value*   z;
+
+        // Detect a shift amount >= width at the amount's untruncated width. LLVM
+        // shift ops are poison once the amount reaches the operand width (LRM
+        // §11.4.10 instead defines the result), and truncating the amount to `w`
+        // first would alias multiples of 2**w down to 0. Compare in a width that
+        // holds both the amount and `w`.
+        const uint32_t cw  = std::max(aw, w);
+        llvm::Value*   oob = b_.CreateICmpUGE(cast(must_of(amt), cw, false),
+                                              llvm::ConstantInt::get(int_ty(cw), w));
+
+        // Clamp to w-1 so every LLVM shift below is well-defined; the truncated
+        // amount is exact whenever the shift is in range (a value < w fits in w
+        // bits), and the out-of-range result is patched in afterwards.
+        llvm::Value* sh   = cast(must_of(amt), w, false);
+        llvm::Value* safe = b_.CreateSelect(oob, llvm::ConstantInt::get(int_ty(w), w == 0 ? 0 : w - 1), sh);
+
+        const bool   arith = tag == Inst::Tag::Sra && sign;
+        llvm::Value* must;
+        llvm::Value* may;
+        llvm::Value* z;
         switch (tag) {
             case Inst::Tag::Sll:
-                must = b_.CreateShl(am, sh);
-                may  = b_.CreateShl(aM, sh);
-                z    = b_.CreateShl(a.z, sh);
+                must = b_.CreateShl(am, safe);
+                may  = b_.CreateShl(aM, safe);
+                z    = b_.CreateShl(a.z, safe);
                 break;
             case Inst::Tag::Srl:
-                must = b_.CreateLShr(am, sh);
-                may  = b_.CreateLShr(aM, sh);
-                z    = b_.CreateLShr(a.z, sh);
+                must = b_.CreateLShr(am, safe);
+                may  = b_.CreateLShr(aM, safe);
+                z    = b_.CreateLShr(a.z, safe);
                 break;
-            default: // Sra: arithmetic, replicate the sign (and its unknown-ness)
-                must = sign ? b_.CreateAShr(am, sh) : b_.CreateLShr(am, sh);
-                may  = sign ? b_.CreateAShr(aM, sh) : b_.CreateLShr(aM, sh);
-                z    = sign ? b_.CreateAShr(a.z, sh) : b_.CreateLShr(a.z, sh);
+            default: // Sra: arithmetic (signed) replicates the sign and its
+                     // unknown-ness; unsigned `>>>` is logical.
+                must = arith ? b_.CreateAShr(am, safe) : b_.CreateLShr(am, safe);
+                may  = arith ? b_.CreateAShr(aM, safe) : b_.CreateLShr(aM, safe);
+                z    = arith ? b_.CreateAShr(a.z, safe) : b_.CreateLShr(a.z, safe);
                 break;
         }
+
+        // Out-of-range: logical shifts (and unsigned `>>>`) produce 0. The
+        // arithmetic `>>>` already yields all sign bits from the clamp to w-1.
+        if (!arith) {
+            must = b_.CreateSelect(oob, zero(w), must);
+            may  = b_.CreateSelect(oob, zero(w), may);
+            z    = b_.CreateSelect(oob, zero(w), z);
+        }
+
         llvm::Value* unknown = any_unknown(amt);
         return packed(b_.CreateSelect(unknown, zero(w), must),
                       b_.CreateSelect(unknown, ones(w), may),
@@ -2853,12 +3097,23 @@ private:
         llvm::Value* must = zero(w);
         llvm::Value* may  = zero(w);
         llvm::Value* z    = zero(w);
+        // The first part is OR'd in without a preceding shift: a shift by the
+        // full result width (which happens when the concat has a single operand,
+        // pw == w) is poison in LLVM, and shifting the still-zero accumulator is
+        // a no-op anyway.
+        bool first = true;
         for (Index part : parts) {
             const uint32_t pw = type_of(part).width;
             const Plane    pv = value_of(part);
-            must              = b_.CreateOr(b_.CreateShl(must, pw), cast(must_of(pv), w, false));
-            may               = b_.CreateOr(b_.CreateShl(may, pw), cast(may_of(pv), w, false));
-            z                 = b_.CreateOr(b_.CreateShl(z, pw), cast(pv.z, w, false));
+            if (!first) {
+                must = b_.CreateShl(must, pw);
+                may  = b_.CreateShl(may, pw);
+                z    = b_.CreateShl(z, pw);
+            }
+            must  = b_.CreateOr(must, cast(must_of(pv), w, false));
+            may   = b_.CreateOr(may, cast(may_of(pv), w, false));
+            z     = b_.CreateOr(z, cast(pv.z, w, false));
+            first = false;
         }
         return packed(must, may, z);
     }
@@ -2873,10 +3128,17 @@ private:
         llvm::Value*   must = zero(w);
         llvm::Value*   may  = zero(w);
         llvm::Value*   z    = zero(w);
+        // Skip the shift on the first copy: for a single replication ({1{x}})
+        // part_width == w, and a shift by the full width is poison in LLVM.
         for (uint32_t c = 0; c < count; ++c) {
-            must = b_.CreateOr(b_.CreateShl(must, part_width), pm);
-            may  = b_.CreateOr(b_.CreateShl(may, part_width), pM);
-            z    = b_.CreateOr(b_.CreateShl(z, part_width), pz);
+            if (c != 0) {
+                must = b_.CreateShl(must, part_width);
+                may  = b_.CreateShl(may, part_width);
+                z    = b_.CreateShl(z, part_width);
+            }
+            must = b_.CreateOr(must, pm);
+            may  = b_.CreateOr(may, pM);
+            z    = b_.CreateOr(z, pz);
         }
         return packed(must, may, z);
     }

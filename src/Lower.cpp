@@ -1,6 +1,7 @@
 #include "Lower.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -9,8 +10,10 @@
 
 #include <ankerl/unordered_dense.h>
 
+#include <slang/ast/ASTContext.h>
 #include <slang/ast/ASTVisitor.h>
 #include <slang/ast/Compilation.h>
+#include <slang/ast/EvalContext.h>
 #include <slang/ast/Expression.h>
 #include <slang/ast/SemanticFacts.h>
 #include <slang/ast/Statement.h>
@@ -30,13 +33,16 @@
 #include <slang/ast/symbols/CompilationUnitSymbols.h>
 #include <slang/ast/symbols/InstanceSymbols.h>
 #include <slang/ast/symbols/MemberSymbols.h>
+#include <slang/ast/symbols/ParameterSymbols.h>
 #include <slang/ast/symbols/PortSymbols.h>
 #include <slang/ast/symbols/SubroutineSymbols.h>
 #include <slang/ast/symbols/ValueSymbol.h>
 #include <slang/ast/symbols/VariableSymbols.h>
 #include <slang/ast/types/Type.h>
+#include <slang/ast/Scope.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/diagnostics/TextDiagnosticClient.h>
+#include <slang/numeric/Time.h>
 #include <slang/syntax/SyntaxTree.h>
 
 #include "SourceMap.h"
@@ -53,6 +59,136 @@ using namespace slang::ast;
 struct LowerError {
     std::string message;
 };
+
+// Femtoseconds in one unit of a time-scale value. Magnitude is 1/10/100 and the
+// unit is a power-of-ten fraction of a second, so the result is a power of ten.
+uint64_t tsv_to_fs(slang::TimeScaleValue v) {
+    uint64_t fs_per_unit = 1;
+    switch (v.unit) {
+        case slang::TimeUnit::Femtoseconds:
+            fs_per_unit = 1ULL;
+            break;
+        case slang::TimeUnit::Picoseconds:
+            fs_per_unit = 1'000ULL;
+            break;
+        case slang::TimeUnit::Nanoseconds:
+            fs_per_unit = 1'000'000ULL;
+            break;
+        case slang::TimeUnit::Microseconds:
+            fs_per_unit = 1'000'000'000ULL;
+            break;
+        case slang::TimeUnit::Milliseconds:
+            fs_per_unit = 1'000'000'000'000ULL;
+            break;
+        case slang::TimeUnit::Seconds:
+            fs_per_unit = 1'000'000'000'000'000ULL;
+            break;
+    }
+
+    return static_cast<uint64_t>(v.magnitude) * fs_per_unit;
+}
+
+// Wheel-tick size (fs) for an instance subtree: the smallest time *unit* across
+// the design, plus whether any design unit set a timescale explicitly. Mirrors
+// lower_instance's recursion over each scope's *effective* timescale (slang
+// resolves inheritance / the default); the caller treats the result as unitless
+// unless `any_explicit` is set, so a design with no directive keeps raw-tick time
+// (LRM §3.14.2.3).
+//
+// The tick is the minimum unit, NOT the minimum precision: with only integer
+// delays, every delay (constant or runtime `#expr`) is an exact multiple of its
+// module's unit, so no event can land finer than the smallest unit. Precision
+// matters only for rounding fractional (real) delays, which are unsupported.
+// Choosing the unit keeps deadline magnitudes near the timing wheel's
+// near-window (one revolution) instead of inflating them by unit/precision and
+// spilling every timer into the O(log n) overflow heap. Since all timescale
+// values are powers of ten, the minimum unit equals the GCD of all units, so it
+// also exactly represents every event time.
+// TODO: when `real` delays land, a fractional delay rounds to its module
+// precision, so the tick must drop to the minimum precision (or the GCD that
+// includes precisions) to stay exact.
+uint64_t design_tick_fs(const InstanceSymbol& inst, bool& any_explicit);
+
+// Smallest child time unit (fs) reachable from a scope, descending into nested
+// instances and through generate blocks/arrays (whose instances share the
+// enclosing instance's timescale but may instantiate further modules).
+// Uninstantiated generate branches contribute nothing.
+uint64_t scope_min_tick_fs(const Scope& scope, bool& any_explicit) {
+    uint64_t   min_fs = 0;
+    const auto consider = [&](uint64_t child) {
+        if (child != 0 && (min_fs == 0 || child < min_fs)) {
+            min_fs = child;
+        }
+    };
+    for (const Symbol& m : scope.members()) {
+        switch (m.kind) {
+            case SymbolKind::Instance:
+                consider(design_tick_fs(m.as<InstanceSymbol>(), any_explicit));
+                break;
+            case SymbolKind::GenerateBlock: {
+                const auto& gb = m.as<GenerateBlockSymbol>();
+                if (!gb.isUninstantiated) {
+                    consider(scope_min_tick_fs(gb, any_explicit));
+                }
+                break;
+            }
+            case SymbolKind::GenerateBlockArray:
+                for (const GenerateBlockSymbol* e : m.as<GenerateBlockArraySymbol>().entries) {
+                    if (!e->isUninstantiated) {
+                        consider(scope_min_tick_fs(*e, any_explicit));
+                    }
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    return min_fs;
+}
+
+uint64_t design_tick_fs(const InstanceSymbol& inst, bool& any_explicit) {
+    uint64_t min_fs = 0;
+    if (inst.getDefinition().timeScale.has_value()) {
+        any_explicit = true;
+    }
+    if (const auto ts = inst.body.getTimeScale()) {
+        min_fs = tsv_to_fs(ts->base);
+    }
+    const uint64_t child = scope_min_tick_fs(inst.body, any_explicit);
+    if (child != 0 && (min_fs == 0 || child < min_fs)) {
+        min_fs = child;
+    }
+
+    return min_fs;
+}
+
+// Smallest time *precision* (fs) across the design's effective timescales. This
+// is the default %t time unit (LRM Table 20-3), distinct from the wheel tick,
+// which tracks the smallest *unit*. Returns 0 if no scope has a timescale.
+uint64_t design_min_precision_fs(const InstanceSymbol& inst) {
+    uint64_t min_fs = 0;
+    if (const auto ts = inst.body.getTimeScale()) {
+        min_fs = tsv_to_fs(ts->precision);
+    }
+    for (const Symbol& m : inst.body.members()) {
+        if (m.kind == SymbolKind::Instance) {
+            const uint64_t child = design_min_precision_fs(m.as<InstanceSymbol>());
+            if (child != 0 && (min_fs == 0 || child < min_fs)) {
+                min_fs = child;
+            }
+        }
+    }
+
+    return min_fs;
+}
+
+// Time-unit exponent (10^n seconds) of a power-of-ten femtosecond magnitude. A
+// timescale value is always a power of ten, so the base-10 log is exact;
+// fs = 10^(n+15) s, so the unit exponent is log10(fs) - 15.
+int32_t fs_to_unit_exponent(uint64_t fs) {
+    return static_cast<int32_t>(std::lround(std::log10(static_cast<double>(fs)))) - 15;
+}
 
 ir::SignalInfo::Direction direction_of(slang::ast::ArgumentDirection d) {
     switch (d) {
@@ -201,8 +337,11 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, true, true> {
 // Walks the elaborated AST of one top module into an ir::Module.
 class Lowerer {
 public:
-    explicit Lowerer(ir::Module& module)
-      : module_(module) {}
+    // `tick_fs` is the femtoseconds-per-wheel-tick (design-wide smallest time
+    // unit), or 0 when no design unit set a timescale (unitless ticks).
+    Lowerer(ir::Module& module, uint64_t tick_fs)
+      : module_(module)
+      , tick_fs_(tick_fs) {}
 
     // Flatten one elaborated instance into the module: register its signals under
     // `prefix`, lower its processes, then recurse into child instances and wire
@@ -215,13 +354,37 @@ public:
         }
         const std::string         self_prefix(prefix);
         const InstanceBodySymbol& body = inst.body;
-        prefix_                        = self_prefix;
-        collect_signals(body);
 
-        // prefix_ holds self_prefix on entry to each iteration: it is set above and
-        // restored after the Instance case (the only one that descends and changes
-        // it), so signal-creating process lowering always sees this level's prefix.
-        for (const Symbol& m : body.members()) {
+        // This instance's delay / $time multiplier: its time unit divided by the
+        // wheel tick (the design's finest precision). Both are powers of ten and
+        // the unit is never finer than the precision, so the ratio is an exact
+        // integer (LRM §3.14). Stays 1 in unitless mode. Saved here so the
+        // post-recursion restore below (with prefix_ / scope_) returns it to this
+        // level after a child runs.
+        if (tick_fs_ != 0) {
+            const auto ts = body.getTimeScale();
+            time_mul_     = ts ? tsv_to_fs(ts->base) / tick_fs_ : 1;
+        }
+        const uint64_t self_mul = time_mul_;
+
+        prefix_ = self_prefix;
+        scope_  = &body;
+        collect_signals(body);
+        lower_members(body, self_prefix, self_mul);
+    }
+
+private:
+    // Lower the non-signal members of a scope (an instance body or a generate
+    // block) into processes: continuous assigns, procedural blocks, child
+    // instances, and nested generate constructs. `self_prefix` is the
+    // hierarchical name prefix of `scope`; `self_mul` is the enclosing instance's
+    // time multiplier, restored after a child instance recurses. Signals are
+    // already registered by collect_signals, which walked the same generate tree.
+    void lower_members(const Scope& scope, const std::string& self_prefix, uint64_t self_mul) {
+        // prefix_ / scope_ hold this level's values on entry to each iteration:
+        // set by the caller and restored after any case that descends and changes
+        // them, so signal-creating process lowering always sees this level.
+        for (const Symbol& m : scope.members()) {
             switch (m.kind) {
                 case SymbolKind::ContinuousAssign:
                     lower_continuous_assign(m.as<ContinuousAssignSymbol>());
@@ -236,8 +399,37 @@ public:
                     // already registered in this (parent) body. Recursion leaves
                     // prefix_ at the child level, so restore it before wiring.
                     lower_instance(child, self_prefix + std::string(child.name) + ".");
-                    prefix_ = self_prefix;
+                    prefix_   = self_prefix;
+                    scope_    = &scope;
+                    time_mul_ = self_mul;
                     wire_ports(child);
+                    break;
+                }
+                case SymbolKind::GenerateBlock: {
+                    // A conditional/bare generate block elaborated to a single
+                    // scope. An unmatched if/case branch is uninstantiated and
+                    // contributes nothing (its body is not part of the design).
+                    const auto& gb = m.as<GenerateBlockSymbol>();
+                    if (!gb.isUninstantiated) {
+                        lower_generate_block(gb, self_prefix + gb.getExternalName() + ".", self_mul);
+                        prefix_ = self_prefix;
+                        scope_  = &scope;
+                    }
+                    break;
+                }
+                case SymbolKind::GenerateBlockArray: {
+                    // A loop generate: one entry block per genvar iteration, named
+                    // <array>[<index>] so flattened signal paths stay unique.
+                    const auto& ga = m.as<GenerateBlockArraySymbol>();
+                    for (const GenerateBlockSymbol* e : ga.entries) {
+                        if (e->isUninstantiated) {
+                            continue;
+                        }
+                        lower_generate_block(*e, self_prefix + gen_entry_name(ga, *e) + ".",
+                                             self_mul);
+                    }
+                    prefix_ = self_prefix;
+                    scope_  = &scope;
                     break;
                 }
                 case SymbolKind::InstanceArray:
@@ -251,7 +443,30 @@ public:
         }
     }
 
-private:
+    // Lower one generate block's members under `block_prefix`. Genvar values are
+    // implicit localparams in the block scope, so const folding and parameter
+    // reads resolve them once scope_ points at the block.
+    void lower_generate_block(const GenerateBlockSymbol& block, const std::string& block_prefix,
+                              uint64_t self_mul) {
+        prefix_ = block_prefix;
+        scope_  = &block;
+        lower_members(block, block_prefix, self_mul);
+    }
+
+    // Hierarchical-path segment for one loop-generate entry: <array>[<index>].
+    // The entry's own name is empty; the genvar value (its arrayIndex) supplies
+    // the subscript.
+    static std::string gen_entry_name(const GenerateBlockArraySymbol& array,
+                                      const GenerateBlockSymbol&      entry) {
+        std::string name = array.getExternalName();
+        if (entry.arrayIndex != nullptr) {
+            name += '[';
+            name += entry.arrayIndex->toString(slang::LiteralBase::Decimal, /*includeBase=*/false);
+            name += ']';
+        }
+        return name;
+    }
+
     [[noreturn]] void fail(std::string msg) {
         throw LowerError{ std::move(msg) };
     }
@@ -301,8 +516,11 @@ private:
     // value^unknown so the per-bit codes line up. 2-state literals take the fast
     // uint64 path.
     ir::Ref lower_int_literal(const IntegerLiteral& lit) {
-        const ir::Ref      ty = lower_type(*lit.type);
-        const slang::SVInt v  = lit.getValue();
+        return svint_to_ref(lit.getValue(), lower_type(*lit.type));
+    }
+
+    // Convert a slang SVInt into a pooled IR constant of the given type.
+    ir::Ref svint_to_ref(const slang::SVInt& v, ir::Ref ty) {
         if (!v.hasUnknown()) {
             return module_.pool.put_int(ty, v.as<uint64_t>().value_or(0));
         }
@@ -324,10 +542,25 @@ private:
         return module_.pool.put_value(ty, bytes);
     }
 
+    // Lower a slang compile-time constant (a resolved parameter value or a
+    // folded constant-required expression) into a pooled IR constant. Only
+    // integral constants are modeled; real/string/aggregate constants are
+    // outside the synthesizable-RTL scope.
+    //
+    // TODO: real/string/struct/array/enum constant parameters (depends on the
+    // matching runtime types — see docs/TODO.md Tier 3).
+    ir::Ref lower_constant(const slang::ConstantValue& cv, const slang::ast::Type& type) {
+        if (!cv.isInteger()) {
+            fail("only integral constant parameters are supported");
+        }
+        return svint_to_ref(cv.integer(), lower_type(type));
+    }
+
     // -- Signals --
 
     void collect_signals(const InstanceBodySymbol& body) {
-        // First pass: record port directions by the symbol they back.
+        // First pass: record port directions by the symbol they back. Ports exist
+        // only on the instance body, never inside a generate block.
         ankerl::unordered_dense::map<const Symbol*, ir::SignalInfo::Direction> port_dir;
         for (const Symbol& m : body.members()) {
             if (m.kind == SymbolKind::Port) {
@@ -338,20 +571,53 @@ private:
             }
         }
 
-        // Second pass: nets and variables become signals.
-        for (const Symbol& m : body.members()) {
-            if (m.kind != SymbolKind::Net && m.kind != SymbolKind::Variable) {
-                continue;
+        collect_scope_signals(body, prefix_, &port_dir);
+    }
+
+    // Register the nets and variables of one scope as signals under `prefix`,
+    // recursing through instantiated generate blocks/arrays (their nets carry the
+    // block's name in the path). `port_dir`, present only for an instance body,
+    // tags port-backed signals with their direction; generate-block signals are
+    // always internal. Child instances are handled by lower_instance, not here.
+    void collect_scope_signals(const Scope& scope, const std::string& prefix,
+                               const ankerl::unordered_dense::map<const Symbol*, ir::SignalInfo::Direction>* port_dir) {
+        for (const Symbol& m : scope.members()) {
+            switch (m.kind) {
+                case SymbolKind::Net:
+                case SymbolKind::Variable: {
+                    const ValueSymbol& vs = m.as<ValueSymbol>();
+
+                    ir::SignalInfo info;
+                    info.name = prefix + std::string(vs.name);
+                    info.type = lower_type(vs.getType());
+                    info.dir  = ir::SignalInfo::Direction::Internal;
+                    if (port_dir != nullptr) {
+                        const auto found = port_dir->find(&m);
+                        if (found != port_dir->end()) {
+                            info.dir = found->second;
+                        }
+                    }
+
+                    sigmap_[&vs] = module_.add_signal(std::move(info));
+                    break;
+                }
+                case SymbolKind::GenerateBlock: {
+                    const auto& gb = m.as<GenerateBlockSymbol>();
+                    if (!gb.isUninstantiated) {
+                        collect_scope_signals(gb, prefix + gb.getExternalName() + ".", nullptr);
+                    }
+                    break;
+                }
+                case SymbolKind::GenerateBlockArray:
+                    for (const GenerateBlockSymbol* e : m.as<GenerateBlockArraySymbol>().entries) {
+                        if (!e->isUninstantiated) {
+                            collect_scope_signals(*e, prefix + gen_entry_name(m.as<GenerateBlockArraySymbol>(), *e) + ".", nullptr);
+                        }
+                    }
+                    break;
+                default:
+                    break;
             }
-            const ValueSymbol& vs = m.as<ValueSymbol>();
-
-            ir::SignalInfo info;
-            info.name        = prefix_ + std::string(vs.name);
-            info.type        = lower_type(vs.getType());
-            const auto found = port_dir.find(&m);
-            info.dir         = found != port_dir.end() ? found->second : ir::SignalInfo::Direction::Internal;
-
-            sigmap_[&vs] = module_.add_signal(std::move(info));
         }
     }
 
@@ -516,9 +782,7 @@ private:
                      sym.procedureKind == ProceduralBlockKind::AlwaysLatch;
 
         // A top-level event control is the process's sensitivity: collect its wait
-        // events here and lower the statement underneath. A non-event top-level
-        // timing (e.g. `always #5 ...`) is NOT sensitivity — it falls through to
-        // lower_stmt, whose Timed case rejects it loudly.
+        // events here and lower the statement underneath.
         if (body->kind == StatementKind::Timed) {
             const TimedStatement& timed = body->as<TimedStatement>();
             if (timed.timing.kind == TimingControlKind::ImplicitEvent) {
@@ -530,8 +794,23 @@ private:
             }
         }
 
+        // An `always` is semantically a forever loop around its body (LRM 9.2.2).
+        // Clotho models that loop implicitly when the body re-triggers on a
+        // sensitivity list (event control above) or the block is combinational
+        // (always_comb / always_latch / @*, inferred below). Any other `always` —
+        // driven by a `#delay` or an internal `@`, or with no timing at all — has
+        // no sensitivity to re-trigger it, so the forever loop must live in its
+        // own body. A body with no internal timing control is a legal but
+        // pathological zero-delay infinite loop (it hangs at time zero);
+        // we lower it faithfully rather than reject it.
+        const bool looping = activation == ir::Activation::Always && !infer && wait_events.empty();
+
         ir::Builder b(module_.pool);
-        lower_stmt(*body, b);
+        if (looping) {
+            lower_implicit_forever(*body, b);
+        } else {
+            lower_stmt(*body, b);
+        }
         // Inferred sensitivity is read from the body after lowering, so any
         // block-local declarations it touched are already registered in sigmap_.
         if (infer) {
@@ -650,7 +929,7 @@ private:
                 const TimedStatement& timed = stmt.as<TimedStatement>();
                 if (timed.timing.kind == TimingControlKind::Delay) {
                     const Expression& amount = timed.timing.as<DelayControl>().expr;
-                    b.unary(ir::Inst::Tag::Delay, lower_expr(amount, b), loc(stmt));
+                    b.unary(ir::Inst::Tag::Delay, scaled_delay(amount, b), loc(stmt));
                 } else if (is_event_control(timed.timing)) {
                     lower_event_wait(timed.timing, b, loc(stmt));
                 } else {
@@ -690,6 +969,9 @@ private:
             case StatementKind::ForeverLoop:
                 lower_forever(stmt.as<ForeverLoopStatement>(), b);
                 break;
+            case StatementKind::RepeatLoop:
+                lower_repeat(stmt.as<RepeatLoopStatement>(), b);
+                break;
             case StatementKind::Return:
                 lower_return(stmt.as<ReturnStatement>(), b);
                 break;
@@ -698,11 +980,23 @@ private:
         }
     }
 
+    // Reduce a condition expression to its 1-bit truth value for `if`/`?:`.
+    // LRM §12.4: the condition is true if any bit is 1, false if all bits are 0,
+    // and ambiguous (X) otherwise. That is exactly reduction-OR: must = any bit
+    // definitely 1, may = any bit could be 1 (Z bits read as X via `may`). This
+    // also normalizes a multi-bit predicate to the 1-bit value `b.cond`/`b.mux`
+    // require; without it the backend emits a mismatched-width icmp.
+    ir::Index lower_predicate(const Expression& cond, ir::Builder& b) {
+        const ir::SourceLoc l    = loc(cond);
+        const ir::Index     pred = lower_expr(cond, b);
+        return b.unary(ir::Inst::Tag::RedOr, pred, l);
+    }
+
     void lower_conditional(const ConditionalStatement& c, ir::Builder& b) {
         if (c.conditions.size() != 1) {
             fail("unsupported multi-condition if");
         }
-        const ir::Index pred = lower_expr(*c.conditions[0].expr, b);
+        const ir::Index pred = lower_predicate(*c.conditions[0].expr, b);
 
         b.open_region();
         lower_stmt(c.ifTrue, b);
@@ -789,6 +1083,25 @@ private:
         b.loop(cond, pred, body, step, loc(w));
     }
 
+    // The implicit forever loop wrapping a sensitivity-less `always` body (LRM
+    // 9.2.2): a constant-true `forever` around `body`, with no separate AST node.
+    // The body's own timing control (`#`/`@`) suspends each iteration; without one
+    // this is the legal zero-delay infinite loop noted in lower_procedural_block.
+    void lower_implicit_forever(const Statement& body, ir::Builder& b) {
+        b.open_region();
+        const ir::Index      pred = true_const(b, loc(body));
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        lower_stmt(body, b);
+        const ir::ExtraSlice body_region = b.close_region();
+
+        b.open_region();
+        const ir::ExtraSlice step = b.close_region(); // empty
+
+        b.loop(cond, pred, body_region, step, loc(body));
+    }
+
     // forever-loop: a while-loop with a constant-true condition.
     void lower_forever(const ForeverLoopStatement& f, ir::Builder& b) {
         b.open_region();
@@ -803,6 +1116,64 @@ private:
         const ir::ExtraSlice step = b.close_region(); // empty
 
         b.loop(cond, pred, body, step, loc(f));
+    }
+
+    // repeat-loop (12.7.2): runs the body N times, where N is the count
+    // expression evaluated EXACTLY ONCE on entry. Lowers to the generic Loop with
+    // a hidden counter and a hidden bound: `for (counter = 0; counter < bound;
+    // counter++) body`. The count's own type (width + signedness) carries through
+    // so a negative signed count yields zero iterations (0 < negative is false),
+    // and an X/Z count yields zero iterations (the Lt predicate is non-definite-1,
+    // which the backend's definite-1 loop rule treats as exit).
+    void lower_repeat(const RepeatLoopStatement& r, ir::Builder& b) {
+        const ir::SourceLoc l   = loc(r);
+        const ir::Ref       ty  = lower_type(*r.count.type);
+
+        // Hidden bound holds the once-evaluated count; hidden counter starts at 0.
+        // Both live in the enclosing region, like a for-loop's init.
+        const ir::Signal bound   = declare_temp(ty, "repeat_bound");
+        const ir::Signal counter = declare_temp(ty, "repeat_count");
+        b.binary(ir::Inst::Tag::Store, b.signal(bound, l), b.resize(lower_expr(r.count, b), ty, l), l);
+        b.binary(ir::Inst::Tag::Store, b.signal(counter, l),
+                 b.constant(module_.pool.put_int(ty, 0), l), l);
+
+        b.open_region();
+        const ir::Index cur  = b.unary(ir::Inst::Tag::Load, b.signal(counter, l), l);
+        const ir::Index lim  = b.unary(ir::Inst::Tag::Load, b.signal(bound, l), l);
+        const ir::Index pred = b.binary(ir::Inst::Tag::Lt, cur, lim, l);
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        lower_stmt(r.body, b);
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        const ir::Index step_cur = b.unary(ir::Inst::Tag::Load, b.signal(counter, l), l);
+        const ir::Index one      = b.constant(module_.pool.put_int(ty, 1), l);
+        const ir::Index next     = b.binary(ir::Inst::Tag::Add, step_cur, one, l);
+        b.binary(ir::Inst::Tag::Store, b.signal(counter, l), next, l);
+        const ir::ExtraSlice step = b.close_region();
+
+        b.loop(cond, pred, body, step, l);
+    }
+
+    // Register a hidden compiler temporary as backing signal storage. Unlike
+    // declare_local there is no source ValueSymbol, so the name is synthesized.
+    //
+    // TODO: Back compiler temporaries (and SV automatic locals) with a
+    // process-local storage class on the coroutine frame (an alloca) rather than
+    // a module-global signal. The signal model gives static lifetime, pollutes
+    // the signal table, and runs wait-queue machinery a loop-private counter does
+    // not need. Correct today because processes are single-activation and the
+    // counter is reinitialized at each loop entry, but wrong for true automatic
+    // lifetime and future reentrant/recursive activations. See declare_local NOTE.
+    ir::Signal declare_temp(ir::Ref type, std::string_view role) {
+        ir::SignalInfo info;
+        info.name = prefix_ + "__" + std::string(role) + std::to_string(temp_id_++);
+        info.type = type;
+        info.dir  = ir::SignalInfo::Direction::Internal;
+
+        return module_.add_signal(std::move(info));
     }
 
     // A for_initialization assignment or a for_step (12.7.1, A.6.8): a simple
@@ -953,7 +1324,151 @@ private:
             b.finish(loc(call));
             return;
         }
+        if (name == "$printtimescale") {
+            lower_printtimescale(call, b);
+            return;
+        }
+        if (name == "$timeformat") {
+            lower_timeformat(call, b);
+            return;
+        }
         fail("unsupported system task '" + std::string(name) + "'");
+    }
+
+    // $timeformat(units, precision, suffix, min_width): set the %t format for all
+    // later %t specifiers (LRM §20.4.3). units / precision / min_width are general
+    // runtime rvalues; the suffix must be a string literal.
+    void lower_timeformat(const CallExpression& call, ir::Builder& b) {
+        const auto args = call.arguments();
+        // The no-argument form resets to the defaults; slang accepts it but
+        // Clotho's runtime default is already seeded at startup, so it is unused
+        // in practice. Require the full four-argument form for now.
+        // TODO: the zero-argument $timeformat resets to the LRM default values.
+        if (args.size() != 4) {
+            fail("$timeformat requires four arguments (units, precision, suffix, min_width)");
+        }
+
+        // The suffix must be a literal string: dynamic string values have no
+        // runtime representation yet, so only a compile-time literal is passed to
+        // the runtime as (ptr, len).
+        // TODO: a non-literal suffix (a string variable / expression) needs full
+        // dynamic string support, which Clotho lacks.
+        const Expression* suffix = args[2];
+        while (suffix->kind == ExpressionKind::Conversion) {
+            suffix = &suffix->as<ConversionExpression>().operand();
+        }
+        if (suffix->kind != ExpressionKind::StringLiteral) {
+            fail("$timeformat suffix must be a string literal");
+        }
+
+        const ir::Index units     = lower_expr(*args[0], b);
+        const ir::Index precision = lower_expr(*args[1], b);
+        const ir::Index min_width = lower_expr(*args[3], b);
+        b.timeformat(units, precision, suffix->as<StringLiteral>().getValue(), min_width, loc(call));
+    }
+
+    // $printtimescale [hier]: print "Time scale of (<path>) is <unit> / <prec>"
+    // for a scope (LRM §21.3.1.2). With no argument the scope is the calling
+    // module; the timescale and path are compile-time constants, so this folds to
+    // a literal $display.
+    void lower_printtimescale(const CallExpression& call, ir::Builder& b) {
+        // TODO: a hierarchical-name argument selects another scope's timescale;
+        // resolving it needs cross-hierarchy lookup, which Clotho lacks.
+        if (!call.arguments().empty()) {
+            fail("$printtimescale with a scope argument is not supported");
+        }
+        const auto ts = scope_->getTimeScale();
+        if (!ts) {
+            // TODO: a scope with no timescale prints the simulator default; Clotho
+            // has no unitless $printtimescale text yet.
+            fail("$printtimescale requires a timescale");
+        }
+        const std::string path = prefix_.empty() ? module_.name : prefix_.substr(0, prefix_.size() - 1);
+        const std::string text = "Time scale of (" + path + ") is " + ts->toString();
+        b.display(text, /*newline=*/true, {}, loc(call));
+    }
+
+    // Lower a #delay amount, scaled from the module's time unit to wheel ticks.
+    // The unit multiplier is a compile-time constant; widen to 64 bits and
+    // multiply so a large unit (e.g. seconds against fs precision) cannot
+    // overflow the amount's declared width. No rounding is needed: an integer
+    // delay times the unit is always an exact multiple of the precision (LRM
+    // §3.14). Real (fractional) delays, which would round, are not yet supported.
+    ir::Index scaled_delay(const Expression& amount, ir::Builder& b) {
+        const ir::Index v = lower_expr(amount, b);
+        if (time_mul_ <= 1) {
+            return v;
+        }
+        const ir::SourceLoc l   = loc(amount);
+        const ir::Ref       u64 = make_int_type(64, false, false);
+        const ir::Index     mul = b.constant(module_.pool.put_int(u64, time_mul_), l);
+
+        return b.binary(ir::Inst::Tag::Mul, b.resize(v, u64, l), mul, l);
+    }
+
+    // Lower a system function call used as an rvalue (e.g. `$time`). User function
+    // calls are not yet supported.
+    ir::Index lower_sysfunc(const CallExpression& call, ir::Builder& b) {
+        if (!call.isSystemCall()) {
+            fail("user function calls are not supported");
+        }
+        const std::string_view name = call.getSubroutineName();
+        const ir::SourceLoc    l    = loc(call);
+
+        if (fn_ctx_ != nullptr && (name == "$time" || name == "$stime")) {
+            // A function is a plain callable with no wheel pointer in its ABI, so
+            // it cannot read the simulation clock. Reject rather than emit a
+            // SimTime that would dereference a stale wheel.
+            // TODO: thread the wheel into the function ABI to support this.
+            fail("$time / $stime inside a function is not supported");
+        }
+
+        // $time: 64-bit, scaled to the calling module's time unit (LRM §20.3.1).
+        // $stime: same value truncated to the low 32 bits (LRM §20.3.2). The
+        // backend divides the wheel tick by time_mul_ (1 when unitless) to scale
+        // the finest-precision clock down to the module unit; $stime resizes the
+        // result to its 32-bit return type.
+        if (name == "$time") {
+            return b.sim_time(time_mul_, l);
+        }
+        if (name == "$stime") {
+            return b.resize(b.sim_time(time_mul_, l), lower_type(*call.type), l);
+        }
+
+        // $random (LRM §20.15.1): a 32-bit signed PRNG draw. The plain form
+        // returns the next value of the simulator's global random stream.
+        if (name == "$random") {
+            // TODO: the seeded form `$random(seed)` (LRM §20.15.1) threads PRNG
+            // state through an inout `seed` integer — it must read the seed
+            // lvalue, advance a per-seed stream, and write the updated state
+            // back. The V2005 reference stream does not map cleanly onto
+            // mt19937's 624-word state, and the IR has no inout-arg writeback
+            // path yet, so the seeded form is rejected rather than silently
+            // ignoring the seed.
+            if (!call.arguments().empty()) {
+                fail("$random with a seed argument is not supported");
+            }
+            return b.random(l);
+        }
+
+        // $signed / $unsigned (LRM §20.10): reinterpret the self-determined
+        // argument with the opposite signedness, preserving its size and value
+        // bits. slang gives `call.type` the argument's width with the new sign;
+        // a same-width resize leaves the bits untouched but tags the result type
+        // so downstream widening sign- vs zero-extends correctly.
+        if (name == "$signed" || name == "$unsigned") {
+            if (call.arguments().size() != 1) {
+                fail("$signed / $unsigned expects exactly one argument");
+            }
+            return b.resize(lower_expr(*call.arguments()[0], b), lower_type(*call.type), l);
+        }
+
+        // TODO: $realtime (LRM §20.3.3) returns a real scaled to the module time
+        // unit; blocked on real (floating-point) value support in the IR.
+        if (name == "$realtime") {
+            fail("$realtime is not supported (no real-type support)");
+        }
+        fail("unsupported system function '" + std::string(name) + "'");
     }
 
     // Lower $display / $write into a single format string plus the value args its
@@ -963,41 +1478,77 @@ private:
     void lower_display(const CallExpression& call, bool newline, ir::Builder& b) {
         std::string            fmt;
         std::vector<ir::Index> args;
-        int                    pending = 0; // unmatched specifiers seen so far
+        // Conversion chars of specifiers seen but not yet matched to a value arg,
+        // in order (FIFO). Needed so a `%t` argument can be scaled to ticks.
+        std::vector<char> pending;
+        size_t            next = 0; // front of `pending`
 
         for (const Expression* arg : call.arguments()) {
             if (arg->kind == ExpressionKind::StringLiteral) {
                 const std::string_view text = arg->as<StringLiteral>().getValue();
                 fmt += text;
-                pending += count_specifiers(text);
+                collect_specifiers(text, pending);
             } else {
-                args.push_back(lower_expr(*arg, b));
-                if (pending > 0) {
-                    --pending; // consumed by an earlier format specifier
+                char conv = 'd';
+                if (next < pending.size()) {
+                    conv = pending[next++]; // consumed by an earlier specifier
                 } else {
                     fmt += "%0d"; // bare value: default decimal
                 }
+                ir::Index v = lower_expr(*arg, b);
+                if (conv == 't' || conv == 'T') {
+                    v = scale_to_ticks(*arg, v, b);
+                }
+                args.push_back(v);
             }
         }
 
         b.display(fmt, newline, args, loc(call));
     }
 
-    // Count format specifiers in `s`, treating `%%` as an escaped literal percent.
-    static int count_specifiers(std::string_view s) {
-        int n = 0;
+    // Append the conversion character of each format specifier in `s` to `out`,
+    // treating `%%` as an escaped literal percent (no specifier). Mirrors the
+    // runtime's flag/width/precision skipping so the recorded char is the one the
+    // runtime will dispatch on.
+    static void collect_specifiers(std::string_view s, std::vector<char>& out) {
         for (size_t i = 0; i < s.size(); ++i) {
             if (s[i] != '%') {
                 continue;
             }
-            if (i + 1 < s.size() && s[i + 1] == '%') {
-                ++i; // skip the escaped percent
-                continue;
+            ++i;
+            if (i >= s.size()) {
+                break;
             }
-            ++n;
+            if (s[i] == '%') {
+                continue; // escaped percent: no value arg
+            }
+            while (i < s.size() && (s[i] == '-' || s[i] == '+' || s[i] == ' ' || s[i] == '0')) {
+                ++i;
+            }
+            while (i < s.size() && ((s[i] >= '0' && s[i] <= '9') || s[i] == '.')) {
+                ++i;
+            }
+            if (i >= s.size()) {
+                break;
+            }
+            out.push_back(s[i]);
         }
+    }
 
-        return n;
+    // Scale a %t argument from its module's time unit to design ticks: the runtime
+    // converts ticks -> fs -> the $timeformat unit independent of the caller's
+    // timescale (LRM §20.4.3). A value in module units times this instance's
+    // time-unit multiplier yields ticks; the result is widened to 64 bits so the
+    // runtime reads the full tick count.
+    ir::Index scale_to_ticks(const Expression& arg, ir::Index v, ir::Builder& b) {
+        const ir::SourceLoc l   = loc(arg);
+        const ir::Ref       u64 = make_int_type(64, false, false);
+        const ir::Index     w   = b.resize(v, u64, l);
+        if (time_mul_ <= 1) {
+            return w;
+        }
+        const ir::Index mul = b.constant(module_.pool.put_int(u64, time_mul_), l);
+        return b.binary(ir::Inst::Tag::Mul, w, mul, l);
     }
 
     void lower_assign(const AssignmentExpression& a, ir::Builder& b) {
@@ -1034,8 +1585,14 @@ private:
         switch (expr.kind) {
             case ExpressionKind::IntegerLiteral:
                 return b.constant(lower_int_literal(expr.as<IntegerLiteral>()), l);
-            case ExpressionKind::NamedValue:
-                return b.unary(ir::Inst::Tag::Load, value_lvalue(expr.as<NamedValueExpression>().symbol, b, l), l);
+            case ExpressionKind::NamedValue: {
+                const ValueSymbol& sym = expr.as<NamedValueExpression>().symbol;
+                if (sym.kind == SymbolKind::Parameter) {
+                    const ParameterSymbol& p = sym.as<ParameterSymbol>();
+                    return b.constant(lower_constant(p.getValue(), p.getType()), l);
+                }
+                return b.unary(ir::Inst::Tag::Load, value_lvalue(sym, b, l), l);
+            }
             case ExpressionKind::UnaryOp:
                 return lower_unary(expr.as<UnaryExpression>(), b);
             case ExpressionKind::BinaryOp:
@@ -1045,7 +1602,7 @@ private:
                 if (c.conditions.size() != 1) {
                     fail("unsupported multi-condition ?:");
                 }
-                const ir::Index pred = lower_expr(*c.conditions[0].expr, b);
+                const ir::Index pred = lower_predicate(*c.conditions[0].expr, b);
                 const ir::Index a    = lower_expr(c.left(), b);
                 const ir::Index bb   = lower_expr(c.right(), b);
                 return b.mux(pred, a, bb, l);
@@ -1085,9 +1642,7 @@ private:
             case ExpressionKind::Call: {
                 const CallExpression& call = expr.as<CallExpression>();
                 if (call.isSystemCall()) {
-                    // System functions ($signed, $bits, $time, ...) need bespoke
-                    // lowering; none is implemented yet.
-                    fail("system function '" + std::string(call.getSubroutineName()) + "' is not supported");
+                    return lower_sysfunc(call, b);
                 }
                 const std::optional<ir::Index> v = lower_user_call(call, b);
                 if (!v) {
@@ -1147,6 +1702,12 @@ private:
                 return b.binary(T::Sub, lhs, rhs, l);
             case B::Multiply:
                 return b.binary(T::Mul, lhs, rhs, l);
+            case B::Divide:
+                return b.binary(T::Div, lhs, rhs, l);
+            case B::Mod:
+                return b.binary(T::Mod, lhs, rhs, l);
+            case B::Power:
+                return b.binary(T::Pow, lhs, rhs, l);
             case B::BinaryAnd:
                 return b.binary(T::Band, lhs, rhs, l);
             case B::BinaryOr:
@@ -1210,16 +1771,18 @@ private:
         }
     }
 
-    // Read a constant integer expression (literal, possibly behind conversions).
+    // Evaluate a constant integer expression (a literal, a parameter reference,
+    // or any constant-foldable expression over them, e.g. `W-1` or `W*2`).
+    // Folded with slang against the current instance scope so parameterized
+    // widths, replication counts and part-select bounds resolve to a value.
     uint64_t const_uint(const Expression& e) {
-        const Expression* p = &e;
-        while (p->kind == ExpressionKind::Conversion) {
-            p = &p->as<ConversionExpression>().operand();
+        slang::ast::ASTContext  astCtx(*scope_, slang::ast::LookupLocation::max);
+        slang::ast::EvalContext evalCtx(astCtx);
+        const slang::ConstantValue cv = e.eval(evalCtx);
+        if (!cv.isInteger()) {
+            fail("expected a constant integer");
         }
-        if (p->kind == ExpressionKind::IntegerLiteral) {
-            return p->as<IntegerLiteral>().getValue().as<uint64_t>().value_or(0);
-        }
-        fail("expected a constant integer");
+        return cv.integer().as<uint64_t>().value_or(0);
     }
 
     // -- Functions --
@@ -1448,12 +2011,24 @@ private:
     }
 
     ir::Module& module_;
+    // Scope of the instance body currently being lowered; used to fold constant
+    // expressions (parameter references and arithmetic over them).
+    const slang::ast::Scope* scope_ = nullptr;
     // Maps an elaborated value symbol to its module Signal handle.
     ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal> sigmap_;
     // Hierarchical name prefix of the instance currently being lowered (e.g.
     // "u_alu.u_sub."); empty for the top. Prepended to every signal name created
     // while this instance's body is processed so flattened signals stay unique.
     std::string prefix_;
+    // Femtoseconds per wheel tick (design-wide smallest time unit); 0 == unitless.
+    uint64_t tick_fs_ = 0;
+    // Time-unit multiplier of the instance currently being lowered: a delay is
+    // scaled up by this into ticks; $time is scaled (rounded) down by it. Always
+    // 1 when unitless. Saved / restored around child-instance recursion.
+    uint64_t time_mul_ = 1;
+    // Monotonic counter naming hidden compiler temporaries (e.g. a repeat loop's
+    // counter / bound) so their flattened signal names stay unique.
+    uint32_t temp_id_ = 0;
     // Subroutine -> its lowered FunctionId, so each function is lowered once and
     // shared across call sites (and a recursive call resolves its own id).
     ankerl::unordered_dense::map<const SubroutineSymbol*, ir::FunctionId> fnmap_;
@@ -1496,18 +2071,57 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
         result.diagnostics += "error: no top-level module found\n";
         return result;
     }
-    if (root.topInstances.size() > 1) {
-        // TODO: multiple roots — elaborate each into the one flat module (their
-        // signals share the state buffer but never connect).
-        result.diagnostics += "error: multiple top-level modules are not supported\n";
-        return result;
-    }
 
-    // Analysis: walk the elaborated AST into clotho IR.
-    const auto t_an   = std::chrono::steady_clock::now();
-    auto       module = std::make_unique<ir::Module>();
+    // Analysis: walk the elaborated AST into clotho IR. The wheel tick is the
+    // design's smallest time unit; if no design unit set a timescale, time stays
+    // unitless (one tick == one time unit) and nothing is scaled.
+    //
+    // Multiple top-level modules are each implicitly instantiated once and
+    // elaborated into the one flat design (LRM 3.11, 23.3.1): independent name
+    // hierarchies sharing one global timeline, with no port connections between
+    // them. They flatten into a single Module — signals share the state buffer
+    // but never connect. Precision/unit are the minimum across all tops (the
+    // global time precision, LRM 3.14.2), so the wheel tick is computed over the
+    // whole set, not a single root.
+    const auto t_an         = std::chrono::steady_clock::now();
+    auto       module       = std::make_unique<ir::Module>();
+    bool       any_explicit = false;
+    uint64_t   prec_fs      = 0;
+    uint64_t   min_prec_fs  = 0;
+    for (const InstanceSymbol* top : root.topInstances) {
+        const uint64_t p = design_tick_fs(*top, any_explicit);
+        if (p != 0 && (prec_fs == 0 || p < prec_fs)) {
+            prec_fs = p;
+        }
+        const uint64_t mp = design_min_precision_fs(*top);
+        if (mp != 0 && (min_prec_fs == 0 || mp < min_prec_fs)) {
+            min_prec_fs = mp;
+        }
+    }
+    const uint64_t tick_fs = any_explicit ? prec_fs : 0;
+
+    // %t needs the real tick size (fs). In unitless mode (no `timescale anywhere)
+    // a tick is one second, matching the seconds base the LRM and iverilog use
+    // when no scale is set. The default %t time unit is the smallest design
+    // precision (LRM Table 20-3), falling back to the tick when unitless.
+    constexpr uint64_t fs_per_second = 1'000'000'000'000'000ULL;
+    module->tick_fs                  = prec_fs == 0 ? fs_per_second : prec_fs;
+    module->timeformat_units         = fs_to_unit_exponent(min_prec_fs == 0 ? module->tick_fs : min_prec_fs);
+
+    // A single top keeps the bare (prefix-less) signal paths the rest of the
+    // pipeline expects. With several tops, each top's instance name (== its
+    // module name, LRM 23.3.1) prefixes its flattened paths so they stay unique.
+    // Each top gets a fresh Lowerer: their bodies share no symbols (no inter-top
+    // ports), so per-Lowerer maps need not — and must not — be shared.
+    const bool single = root.topInstances.size() == 1;
+    if (!single) {
+        module->name = std::string(root.topInstances[0]->name);
+    }
     try {
-        Lowerer(*module).lower_instance(*root.topInstances[0], "");
+        for (const InstanceSymbol* top : root.topInstances) {
+            const std::string prefix = single ? std::string() : std::string(top->name) + ".";
+            Lowerer(*module, tick_fs).lower_instance(*top, prefix);
+        }
     } catch (const LowerError& e) {
         result.diagnostics += "error: " + e.message + "\n";
         return result;

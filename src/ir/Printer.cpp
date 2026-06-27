@@ -66,6 +66,12 @@ const char* tag_name(Inst::Tag tag) {
             return "sub";
         case T::Mul:
             return "mul";
+        case T::Div:
+            return "div";
+        case T::Mod:
+            return "mod";
+        case T::Pow:
+            return "pow";
         case T::Band:
             return "band";
         case T::Bor:
@@ -134,6 +140,10 @@ const char* tag_name(Inst::Tag tag) {
             return "display";
         case T::Finish:
             return "finish";
+        case T::SimTime:
+            return "sim_time";
+        case T::Random:
+            return "random";
     }
 
     return "?";

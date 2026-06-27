@@ -29,9 +29,27 @@ typedef struct rt_arg {
 } rt_arg;
 
 // Format `fmt` with `argc` descriptors and write the result to stdout. Supports
-// the common $display specifiers (%d %h/%x %b %o %c, and %%); each consumes the
-// next descriptor. The codegen folds any trailing newline into `fmt`.
+// the common $display specifiers (%d %h/%x %b %o %c %t, and %%); each consumes
+// the next descriptor. A %t descriptor carries a tick-valued time (see
+// $timeformat below). The codegen folds any trailing newline into `fmt`.
 void rt_display(const char* fmt, uint32_t argc, const rt_arg* argv);
+
+// -- $timeformat / %t --
+//
+// The %t format specifier renders a time argument (passed in design ticks, i.e.
+// the value scaled to the design's finest time unit) according to the format set
+// by $timeformat (LRM §20.4.3). The runtime holds one global timeformat state.
+
+// Seed the %t formatter at startup: `tick_fs` is the femtoseconds per design
+// tick (so a tick argument converts to real time), and `default_units` is the
+// smallest design time precision exponent. Installs the LRM default format
+// (precision 0, empty suffix, field width 20).
+void rt_timeformat_init(uint64_t tick_fs, int32_t default_units);
+
+// $timeformat(units, precision, suffix, min_width): set the %t format. `units`
+// and `precision` are 10^n-second exponents; `suffix` (length `suffix_len`) is
+// appended after the number; `min_width` right-justifies the number + suffix.
+void rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uint32_t suffix_len, int32_t min_width);
 
 // -- Simulation control --
 //
@@ -43,6 +61,25 @@ void rt_display(const char* fmt, uint32_t argc, const rt_arg* argv);
 // TODO: the optional diagnostic-level argument (0/1/2) that controls exit-message
 // verbosity is accepted at the frontend but ignored here.
 [[noreturn]] void rt_finish(void);
+
+// -- $random --
+//
+// $random (LRM 1800-2023 §20.15.1): return the next value of the simulator's
+// global random stream as a signed 32-bit integer. Clotho draws from a
+// file-scope std::mt19937 seeded with a fixed constant, so a run is fully
+// reproducible (re-running the same design yields the same stream). The
+// generator is process-global, matching the single-simulator-per-process model.
+// TODO: the seeded form $random(seed) threads per-seed PRNG state through an
+// inout argument; it is rejected at the frontend and has no runtime entry yet.
+int32_t rt_random(void);
+
+// $power / ** operator (LRM 1800-2023 §11.4.3), unsigned 2-state path. Returns
+// base**exp computed modulo 2^64 via exponentiation by squaring. The caller
+// truncates to the result width W; since 2^W divides 2^64 for W <= 64, the
+// modular result is exact at that width. Caller handles X/Z propagation and the
+// signed/wide forms; this entry assumes both operands fit in 64 bits and are
+// X/Z-free.
+uint64_t rt_pow_u64(uint64_t base, uint64_t exp);
 
 // -- Coroutine frame allocation --
 //

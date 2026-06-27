@@ -1,11 +1,12 @@
 #pragma once
 
 // Lowering: SystemVerilog source -> clotho process IR. Parses and elaborates
-// with slang, then walks the elaborated AST of the top module into an
-// ir::Module (one Process per continuous assign / procedural block).
+// with slang, then walks the elaborated AST of each top module into an
+// ir::Module (one Process per continuous assign / procedural block). Multiple
+// top-level modules flatten into the one Module, each prefixed by its name.
 //
-// This is a proof-of-concept, not a full front-end: it covers a single top
-// module of synthesizable Verilog-2005 (ports, nets/vars, continuous assigns,
+// This is a proof-of-concept, not a full front-end: it covers the top
+// module(s) of synthesizable Verilog-2005 (ports, nets/vars, continuous assigns,
 // always blocks with if/else, the usual operators). Unsupported constructs are
 // reported in `diagnostics` rather than crashing.
 

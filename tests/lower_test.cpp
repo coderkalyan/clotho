@@ -175,6 +175,79 @@ TEST_CASE("a case with multiple labels per item ORs the comparisons") {
     CHECK(has_tag(p->ir, ir::Inst::Tag::Lor));
 }
 
+TEST_CASE("$time lowers to a SimTime instruction") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            initial $display("%0d", $time);
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    bool found = false;
+    for (const ir::Process& p : r.module->processes()) {
+        found = found || has_tag(p.ir, ir::Inst::Tag::SimTime);
+    }
+    CHECK(found);
+}
+
+TEST_CASE("a `timescale directive lowers") {
+    const LowerResult r = lower_text(R"(`timescale 1ns/1ps
+        module m;
+            initial #5 $display("x");
+        endmodule
+    )");
+    CHECK(r.ok);
+}
+
+TEST_CASE("timeunit / timeprecision declarations lower") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            timeunit 1ns;
+            timeprecision 1ps;
+            initial #5 $display("x");
+        endmodule
+    )");
+    CHECK(r.ok);
+}
+
+TEST_CASE("$random with a seed argument is reported as unsupported") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            integer seed;
+            integer x;
+            initial begin
+                seed = 1;
+                x = $random(seed);
+            end
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("$random with a seed argument") != std::string::npos);
+}
+
+TEST_CASE("$realtime is reported as unsupported") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            initial $display("%0d", $realtime);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("$realtime") != std::string::npos);
+}
+
+TEST_CASE("$timeformat with a non-literal suffix is reported as unsupported") {
+    // The suffix must be a compile-time string literal; a string parameter
+    // reference has no runtime string representation yet, so it is rejected.
+    const LowerResult r = lower_text(R"(
+        module m;
+            parameter string S = " ns";
+            initial $timeformat(-9, 2, S, 10);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("suffix must be a string literal") != std::string::npos);
+}
+
 TEST_CASE("case inside is reported as unsupported") {
     const LowerResult ri = lower_text(R"(
         module m(input [2:0] s, output reg x);
@@ -291,6 +364,16 @@ std::set<std::string> signal_names(const ir::Module& m) {
         names.insert(s.name);
     }
     return names;
+}
+
+// Packed bit width of the named signal, or 0 if absent.
+uint32_t signal_width(const ir::Module& m, std::string_view name) {
+    for (const ir::SignalInfo& s : m.signals()) {
+        if (s.name == name) {
+            return m.pool.layout(s.type).width;
+        }
+    }
+    return 0;
 }
 
 // Two-level hierarchy: an inverter child wired into a top via one input and one
@@ -448,4 +531,65 @@ TEST_CASE("a continuous assign with a constant RHS has an empty wait list") {
     REQUIRE(p != nullptr);
     // No source elements: the process runs once at time zero and never re-triggers.
     CHECK(p->wait_events.empty());
+}
+
+// -- Parameters (LRM 6.20) --
+
+TEST_CASE("a parameter sets a signal width and drives a replication count") {
+    const LowerResult r = lower_text(R"(
+        module m #(parameter W = 4) (output [W-1:0] o);
+            assign o = {W{1'b1}};
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    CHECK(signal_width(*r.module, "o") == 4);
+}
+
+TEST_CASE("a #() override specializes each instance's width independently") {
+    const LowerResult r = lower_text(R"(
+        module m #(parameter W = 4) (output [W-1:0] o);
+            assign o = {W{1'b0}};
+        endmodule
+        module top(output [2:0] a, output [7:0] b);
+            m #(.W(3)) u0(.o(a));
+            m #(.W(8)) u1(.o(b));
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    CHECK(signal_width(*r.module, "u0.o") == 3);
+    CHECK(signal_width(*r.module, "u1.o") == 8);
+}
+
+TEST_CASE("a parameter referenced in an rvalue folds to a constant, not a signal read") {
+    const LowerResult r = lower_text(R"(
+        module m #(parameter W = 5) (input [7:0] a, output [7:0] y);
+            assign y = a + W;
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    // W is a compile-time constant: the assign is sensitive only to `a`.
+    const ir::Process* p = find_level_process(*r.module);
+    REQUIRE(p != nullptr);
+    CHECK(sensitivity_names(*r.module, *p) == std::set<std::string>{ "a" });
+}
+
+TEST_CASE("a localparam derived from a parameter resolves its width") {
+    const LowerResult r = lower_text(R"(
+        module m #(parameter W = 4) (output [2*W-1:0] o);
+            localparam D = 2 * W;
+            assign o = {D{1'b0}};
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    CHECK(signal_width(*r.module, "o") == 8);
+}
+
+TEST_CASE("a parameter expression in a part-select bound folds") {
+    const LowerResult r = lower_text(R"(
+        module m #(parameter W = 8) (input [W-1:0] a, output [1:0] o);
+            assign o = a[W-1:W-2];
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    CHECK(signal_width(*r.module, "o") == 2);
 }
