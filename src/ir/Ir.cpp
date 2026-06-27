@@ -57,6 +57,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::Extra;
         case T::Display:
             return K::Display;
+        case T::TimeFormat:
+            return K::TimeFormat;
         case T::Finish:
         case T::SimTime:
             return K::None;
@@ -117,6 +119,16 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
             // the format string is not an SSA operand.
             const auto info = extra_data<DisplayInfo>(p.display);
             return index_slice(info.args);
+        }
+
+        case Inst::PayloadKind::TimeFormat: {
+            // timeformat: units / precision / min_width are SSA operands; the
+            // suffix bytes are not.
+            const auto info = extra_data<TimeFormatInfo>(p.timeformat);
+            scratch[0]      = info.units;
+            scratch[1]      = info.precision;
+            scratch[2]      = info.min_width;
+            return { scratch.data(), 3 };
         }
 
         case Inst::PayloadKind::OpExtra:

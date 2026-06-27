@@ -220,6 +220,19 @@ TEST_CASE("$realtime is reported as unsupported") {
     CHECK(r.diagnostics.find("$realtime") != std::string::npos);
 }
 
+TEST_CASE("$timeformat with a non-literal suffix is reported as unsupported") {
+    // The suffix must be a compile-time string literal; a string parameter
+    // reference has no runtime string representation yet, so it is rejected.
+    const LowerResult r = lower_text(R"(
+        module m;
+            parameter string S = " ns";
+            initial $timeformat(-9, 2, S, 10);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("suffix must be a string literal") != std::string::npos);
+}
+
 TEST_CASE("case inside is reported as unsupported") {
     const LowerResult ri = lower_text(R"(
         module m(input [2:0] s, output reg x);

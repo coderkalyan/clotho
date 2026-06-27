@@ -64,6 +64,10 @@ public:
     Index display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc);
     // $finish / $stop: end the simulation and exit. No operands.
     Index finish(SourceLoc loc);
+    // $timeformat: set the %t format. `units`, `precision`, and `min_width` are
+    // already-lowered value operands; `suffix` is a literal string appended after
+    // the formatted number.
+    Index timeformat(Index units, Index precision, std::string_view suffix, Index min_width, SourceLoc loc);
 
     // -- System functions --
     // $time / $stime: read the simulation clock. Yields a 64-bit unsigned value

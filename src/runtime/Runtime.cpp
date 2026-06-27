@@ -34,6 +34,51 @@ const RuntimeWheel* unwrap(const rt_wheel* w) {
     return reinterpret_cast<const RuntimeWheel*>(w->storage);
 }
 
+// -- $timeformat / %t state --
+
+// The single global %t format, set by $timeformat and seeded by
+// rt_timeformat_init at startup. The simulator is single-threaded, so a plain
+// global is sufficient (LRM §20.4.3).
+struct TimeFormat {
+    // Femtoseconds per design tick; converts a tick-valued %t argument to fs.
+    uint64_t tick_fs = 1;
+    // Display time-unit exponent (10^units seconds).
+    int32_t units = 0;
+    // Fractional digits printed after the decimal point.
+    int32_t precision = 0;
+    // Minimum field width of the number + suffix (space-padded on the left).
+    int32_t min_width = 20;
+    // String appended after the number (e.g. " ns").
+    std::string suffix;
+};
+
+TimeFormat g_timeformat;
+
+// Render a tick-valued time `ticks` per the current $timeformat, appending to
+// `out` (LRM §20.4.3). The tick value scales to femtoseconds, then to the
+// display unit (10^units s); since fs = 10^-15 s, a display unit of 10^units s
+// is 10^(units+15) fs. The number is printed with `precision` fractional digits,
+// the suffix is appended, and the whole field is right-justified to min_width.
+void render_time(std::string& out, uint64_t ticks) {
+    const double fs      = static_cast<double>(ticks) * static_cast<double>(g_timeformat.tick_fs);
+    double       divisor = 1.0;
+    for (int32_t k = 0; k < g_timeformat.units + 15; ++k) {
+        divisor *= 10.0;
+    }
+    const double value = fs / divisor;
+
+    const int32_t prec = g_timeformat.precision < 0 ? 0 : g_timeformat.precision;
+    char          numbuf[64];
+    std::snprintf(numbuf, sizeof(numbuf), "%.*f", prec, value);
+
+    std::string field = numbuf;
+    field += g_timeformat.suffix;
+    if (g_timeformat.min_width > 0 && field.size() < static_cast<size_t>(g_timeformat.min_width)) {
+        out.append(static_cast<size_t>(g_timeformat.min_width) - field.size(), ' ');
+    }
+    out += field;
+}
+
 // -- $display formatting --
 
 // Low-`w`-bits mask (all ones for w >= 64).
@@ -101,10 +146,16 @@ void render_arg(std::string& out, const rt_arg& a, char conv) {
         case 'C':
             out += static_cast<char>(val & 0xff);
             return;
+        case 't':
+        case 'T':
+            // The frontend scales a %t argument to design ticks, so `val` is the
+            // tick count; render_time converts it per the current $timeformat.
+            render_time(out, val);
+            return;
         default:
-            // TODO: %s / %t / %m / %f are consumed but emit nothing, so the field
-            // silently vanishes. LRM expects string / time / hierarchical-path /
-            // real output respectively.
+            // TODO: %s / %m / %f are consumed but emit nothing, so the field
+            // silently vanishes. LRM expects string / hierarchical-path / real
+            // output respectively.
             return;
     }
 }
@@ -176,6 +227,22 @@ extern "C" void rt_display(const char* fmt, uint32_t argc, const rt_arg* argv) {
     // Write raw: `out` may contain '%' or '{}' that printf/std::print would treat
     // as format syntax.
     std::fwrite(out.data(), 1, out.size(), stdout);
+}
+
+extern "C" void rt_timeformat_init(uint64_t tick_fs, int32_t default_units) {
+    g_timeformat.tick_fs   = tick_fs == 0 ? 1 : tick_fs;
+    g_timeformat.units     = default_units;
+    g_timeformat.precision = 0;
+    g_timeformat.min_width = 20;
+    g_timeformat.suffix.clear();
+}
+
+extern "C" void
+rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uint32_t suffix_len, int32_t min_width) {
+    g_timeformat.units     = units;
+    g_timeformat.precision = precision;
+    g_timeformat.min_width = min_width;
+    g_timeformat.suffix.assign(suffix, suffix_len);
 }
 
 extern "C" void rt_finish(void) {

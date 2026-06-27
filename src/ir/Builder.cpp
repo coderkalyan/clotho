@@ -113,6 +113,16 @@ Index Builder::finish(SourceLoc loc) {
     return emit({ Inst::Tag::Finish, Inst::Payload{ .none = 0 } }, loc);
 }
 
+Index Builder::timeformat(Index units, Index precision, std::string_view suffix, Index min_width, SourceLoc loc) {
+    // Order in the extra buffer: suffix bytes, then the TimeFormatInfo record
+    // pointing at them. The three operands are plain SSA indices in the record.
+    const ExtraIndex suffix_at = add_bytes(suffix);
+    const ExtraIndex extra     = add_extra(
+      TimeFormatInfo{ units, precision, min_width, suffix_at, static_cast<uint32_t>(suffix.size()) });
+
+    return emit({ Inst::Tag::TimeFormat, Inst::Payload{ .timeformat = extra } }, loc);
+}
+
 Index Builder::sim_time(uint64_t scale, SourceLoc loc) {
     return emit({ Inst::Tag::SimTime, Inst::Payload{ .scale = scale } }, loc);
 }
