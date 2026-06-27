@@ -74,6 +74,12 @@ Index Builder::part_select(Index base, uint32_t msb, uint32_t lsb, SourceLoc loc
     return emit({ Inst::Tag::PartSelect, Inst::Payload{ .op_extra = { base, extra } } }, loc);
 }
 
+Index Builder::elem_select(Index base, Index index, Ref array_type, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(ElemSelect{ index, array_type });
+
+    return emit({ Inst::Tag::ElemSelect, Inst::Payload{ .op_extra = { base, extra } } }, loc);
+}
+
 Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc) {
     const ExtraIndex extra = add_extra(Regions{ then_region, else_region });
 

@@ -81,6 +81,38 @@ int32_t rt_random(void);
 // X/Z-free.
 uint64_t rt_pow_u64(uint64_t base, uint64_t exp);
 
+// -- Deferred nonblocking writes to unpacked-array elements --
+//
+// A synchronous memory write `mem[i] <= rhs` cannot use the per-signal NBA
+// shadow (whole-signal, statically keyed). Each element write is appended to
+// this deferred queue in the active region and replayed in the NBA region. A
+// record is a bytewise masked merge into the live element slot, so the queue is
+// width-agnostic; the value / mask byte blobs are copied into runtime-owned
+// storage at push time. One global queue serves the whole design.
+
+// Append one deferred element write. `sig` identifies the array signal (for
+// post-commit wake servicing). `mm_ptr` / `z_ptr` point at the live element's
+// must|may and z words; `*_val` are the bits to write and `*_mask` selects which
+// bits (1 => take from val), each `*_bytes` long.
+void rt_nba_arr_push(uint32_t sig, void* mm_ptr, const void* mm_val, const void* mm_mask, uint32_t mm_bytes,
+                     void* z_ptr, const void* z_val, const void* z_mask, uint32_t z_bytes);
+
+// Number of queued element writes; the NBA region tests this to decide whether a
+// commit pass is needed.
+uint32_t rt_nba_arr_pending(void);
+
+// Replay every queued write into its destination (bytewise (dest & ~mask) | (val
+// & mask)), in push order so a later write to the same element wins. Records
+// stay queued (for rt_nba_arr_dirty) until rt_nba_arr_reset.
+void rt_nba_arr_commit(void);
+
+// Non-zero iff any currently-queued write targets `sig` (queried after commit to
+// decide whether to wake that array's readers).
+int rt_nba_arr_dirty(uint32_t sig);
+
+// Drop all queued writes (called after a commit + wake pass).
+void rt_nba_arr_reset(void);
+
 // -- Coroutine frame allocation --
 //
 // Each process lowers to an LLVM coroutine; its frame is allocated through these

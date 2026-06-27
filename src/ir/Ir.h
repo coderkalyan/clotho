@@ -80,6 +80,18 @@ struct PartSelect {
     uint32_t lsb;
 };
 
+// Extra payload for `elem_select`: a runtime element index into an unpacked
+// array (the base is the op). `index` is the selector value (declared-range
+// coordinate, normalized against the array's bounds in the backend);
+// `array_type` is the interned UnpackedArray type being indexed, giving the
+// element stride and the declared [left:right] bounds.
+struct ElemSelect {
+    // Element index value, in declared-range coordinates.
+    Index index;
+    // The UnpackedArray type being indexed.
+    Ref array_type;
+};
+
 // Extra payload for `call`: the callee plus its already-lowered argument values,
 // in formal-parameter order (each resized to the parameter type by the frontend).
 struct CallInfo {
@@ -165,6 +177,7 @@ static_assert(ExtraPayload<ExtraSlice>);
 static_assert(ExtraPayload<CallInfo>);
 static_assert(ExtraPayload<Mux>);
 static_assert(ExtraPayload<PartSelect>);
+static_assert(ExtraPayload<ElemSelect>);
 static_assert(ExtraPayload<Regions>);
 static_assert(ExtraPayload<LoopInfo>);
 static_assert(ExtraPayload<DisplayInfo>);
@@ -193,6 +206,11 @@ struct Inst {
         BitSelect,
         // Constant part-select base[msb:lsb] (payload: op_extra -> PartSelect).
         PartSelect,
+        // Unpacked-array element select base[index] (payload: op_extra ->
+        // ElemSelect). Distinct from BitSelect: the stride is the element's
+        // storage size, not one bit, and the index is normalized against the
+        // array's declared bounds.
+        ElemSelect,
 
         // -- State access --
         // Read the current value of an lvalue (payload: unary).

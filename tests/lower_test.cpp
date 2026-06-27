@@ -467,6 +467,40 @@ TEST_CASE("an instance array fails loudly") {
     CHECK(r.diagnostics.find("instance array") != std::string::npos);
 }
 
+TEST_CASE("whole unpacked array assignment fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            logic [7:0] a [0:3];
+            logic [7:0] b [0:3];
+            initial a = b;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("whole unpacked array assignment") != std::string::npos);
+}
+
+TEST_CASE("a nonblocking write to an array element lowers") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            logic [7:0] mem [0:3];
+            logic clk;
+            always @(posedge clk) mem[0] <= 8'd1;
+        endmodule
+    )");
+    CHECK(r.ok);
+}
+
+TEST_CASE("a dynamic array fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            int dyn [];
+            initial dyn = new [4];
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("dynamic / queue / associative") != std::string::npos);
+}
+
 TEST_CASE("nested instances chain their hierarchical prefixes") {
     const LowerResult r = lower_text(R"(
         module leaf(input a, output y);
