@@ -45,6 +45,9 @@ enum class SourceLoc : uint64_t {};
 // Opaque handle to a module signal (net / variable / port). Resolved by the
 // enclosing module; the process IR never interprets it.
 enum class Signal : uint32_t {};
+// Handle to a function in the enclosing module's function table; the callee of a
+// `call`. Resolved by the module, like Signal.
+enum class FunctionId : uint32_t {};
 
 // A struct may be overlaid on the extra buffer iff it is trivially copyable
 // and a whole number of u32 words wide. Because every field is a 4-byte
@@ -75,6 +78,15 @@ struct PartSelect {
     uint32_t msb;
     // Least-significant selected bit.
     uint32_t lsb;
+};
+
+// Extra payload for `call`: the callee plus its already-lowered argument values,
+// in formal-parameter order (each resized to the parameter type by the frontend).
+struct CallInfo {
+    // Function being called, resolved against the module's function table.
+    FunctionId func;
+    // The argument value operands, in order.
+    ExtraSlice args;
 };
 
 // Extra payload for `cond`: the then / else regions (the condition is the op).
@@ -150,6 +162,7 @@ struct WaitInfo {
 };
 
 static_assert(ExtraPayload<ExtraSlice>);
+static_assert(ExtraPayload<CallInfo>);
 static_assert(ExtraPayload<Mux>);
 static_assert(ExtraPayload<PartSelect>);
 static_assert(ExtraPayload<Regions>);
@@ -164,10 +177,16 @@ struct Inst {
         // -- Leaves --
         // Interned constant value (payload: ref).
         Constant,
-        // Function / task parameter by position (payload: arg).
+        // Function / task parameter by position (payload: arg). Read-only; a
+        // formal is copied into a Local at entry so the body can mutate it.
         Arg,
         // Reference to a module signal (payload: signal).
         Signal,
+        // Reference to a function-frame local slot by index (payload: local). An
+        // lvalue leaf like Signal, but backed by per-call stack storage (automatic
+        // lifetime) rather than the persistent state buffer. Holds formals, the
+        // return variable, and body-local declarations of a function.
+        Local,
 
         // -- Lvalue derivation --
         // Single-bit select base[index] (payload: binary).
@@ -248,8 +267,13 @@ struct Inst {
         // -- Control flow --
         // If / else; condition + then/else regions (payload: op_extra -> Regions).
         Cond,
-        // Return a value from a function / task (payload: unary).
+        // Return from a function (payload: unary, the return value; ignored for a
+        // void function). A real terminator: instructions after it in the same
+        // region are unreachable. Early `return` works without any flag.
         Ret,
+        // Call a function (payload: extra -> CallInfo). The result is this
+        // instruction's value (absent for a void function called as a statement).
+        Call,
         // Loop with a per-iteration condition; `for` / `while` / `forever` all
         // lower to this (payload: extra -> LoopInfo). The `for` init runs in the
         // enclosing region before this inst; `while` / `forever` have empty step.
@@ -302,9 +326,11 @@ struct Inst {
         Binary,
         OpType,
         Arg,
+        Local,
         Repl,
         OpExtra,
         Extra,
+        Call,
         Display,
         TimeFormat,
         Wait,
@@ -343,6 +369,13 @@ struct Inst {
             // Parameter type.
             Ref type;
         } arg;
+        // Function-frame local slot index plus its type (local).
+        struct {
+            // Index into the function's local table / frame layout.
+            uint32_t index;
+            // Storage type of the local.
+            Ref type;
+        } local;
         // Replicated value plus a constant count (repl).
         struct {
             // Value being replicated.

@@ -48,6 +48,8 @@ const char* tag_name(Inst::Tag tag) {
             return "arg";
         case T::Signal:
             return "signal";
+        case T::Local:
+            return "local";
         case T::BitSelect:
             return "bit_select";
         case T::PartSelect:
@@ -120,6 +122,8 @@ const char* tag_name(Inst::Tag tag) {
             return "cond";
         case T::Ret:
             return "ret";
+        case T::Call:
+            return "call";
         case T::Loop:
             return "loop";
         case T::Delay:
@@ -259,6 +263,19 @@ private:
                 os_ << "#" << p.arg.position << ": ";
                 render_type(p.arg.type);
                 break;
+            case Inst::PayloadKind::Local:
+                os_ << "l" << p.local.index << ": ";
+                render_type(p.local.type);
+                break;
+            case Inst::PayloadKind::Call: {
+                const auto ci = ir_.extra_data<CallInfo>(p.extra);
+                os_ << "fn" << static_cast<uint32_t>(ci.func);
+                for (Index a : ir_.region(ci.args)) {
+                    os_ << ", ";
+                    ref(a);
+                }
+                break;
+            }
             case Inst::PayloadKind::Repl:
                 ref(p.repl.value);
                 os_ << " x" << p.repl.count;
