@@ -455,6 +455,32 @@ TEST_CASE("wide ^~ lowers as xnor over the xor path") {
     CHECK(ir.find("fshl") != std::string::npos);        // bnot's plane swap
 }
 
+TEST_CASE("single-bit &&, ||, !, ~ agree with LRM Kleene semantics") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a, b;
+            initial begin
+                a = 1'b0; b = 1'b0; $display("%b%b%b%b", a&&b, a||b, !a, ~a);
+                a = 1'b1; b = 1'bx; $display("%b%b%b%b", a&&b, a||b, !a, ~a);
+                a = 1'b0; b = 1'bx; $display("%b%b%b%b", a&&b, a||b, !a, ~a);
+                a = 1'bx; b = 1'bx; $display("%b%b%b%b", a&&b, a||b, !a, ~a);
+                a = 1'b1; b = 1'b0; $display("%b%b%b%b", a&&b, a||b, !a, ~a);
+            end
+        endmodule
+    )";
+    // 1-bit && / || are the monotone bitwise & / |; ! is the same op as ~ at one
+    // bit. Verified against iverilog: false dominates && (0&&x=0), true dominates
+    // || (1||x=1).
+    CHECK(run_capture(src) == "0011\nx100\n0x11\nxxxx\n0100\n");
+}
+
+TEST_CASE("single-bit && lowers to a packed and (no truth reduction)") {
+    const std::string ir = emit(R"(
+        module m(input logic a, input logic b, output logic y); assign y = a && b; endmodule
+    )");
+    CHECK(ir.find("and i2") != std::string::npos);
+}
+
 TEST_CASE("delay suspends and reschedules on the wheel") {
     constexpr std::string_view src = R"(
         module d;

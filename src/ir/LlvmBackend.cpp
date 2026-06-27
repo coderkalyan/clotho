@@ -3455,6 +3455,14 @@ private:
     }
 
     Plane lower_logical(Inst::Tag tag, Plane a, Plane b) {
+        // At width 1 the truth of each operand is the bit itself, so &&/|| are the
+        // monotone bitwise &/| — one packed op, no truth reduction. It also degrades
+        // straight to a plain &/| once the may plane is elided, unlike a LUT.
+        if (width_of(a) == 1 && width_of(b) == 1) {
+            llvm::Value* mm =
+              tag == Inst::Tag::Land ? b_.CreateAnd(a.mm, b.mm) : b_.CreateOr(a.mm, b.mm);
+            return { mm, zero(1) };
+        }
         const Truth ta = truth_of(a);
         const Truth tb = truth_of(b);
         if (tag == Inst::Tag::Land) {
@@ -3466,6 +3474,12 @@ private:
     }
 
     Plane lower_lnot(Plane a) {
+        // At width 1, !a is the same operation as ~a (negate the single truth bit),
+        // so reuse the bnot plane swap+complement — cheaper than a truth pair, and
+        // already optimal (one not + one rotate), so no LUT is warranted.
+        if (width_of(a) == 1) {
+            return lower_bnot(a);
+        }
         const Truth t = truth_of(a);
         // true -> 0, false -> 1, x -> x: must = was-false, may = not was-true.
         return bit_plane(t.f, b_.CreateNot(t.t));
