@@ -77,6 +77,43 @@ struct Plane {
     llvm::Value* z  = nullptr; // iW
 };
 
+// Single-bit 4-state truth tables, packed into one i32 immediate so a width-1 op
+// is a shift+mask instead of an unpack/recombine. A 2-bit `code` carries one bit
+// in the Plane encoding: bit0 = must, bit1 = may. Legal codes are 00=0, 11=1,
+// 10=X; 01 violates must=>may and is unreachable at runtime.
+//
+// build_lut packs the 16 (a, b) outcomes at bit (((a<<2)|b)<<1). Illegal operand
+// codes fill 0: LLVM has no per-bit poison, and the slot is never indexed because
+// the invariant holds, so a harmless 2-state value is fine.
+using code = unsigned;
+
+constexpr bool legal(code c) {
+    return c != 0b01;
+}
+
+template <class F>
+constexpr uint32_t build_lut(F f) {
+    uint32_t t = 0;
+    for (code a = 0; a < 4; ++a) {
+        for (code b = 0; b < 4; ++b) {
+            const code o = legal(a) && legal(b) ? f(a, b) & 0b11u : 0u;
+            t |= o << (((a << 2) | b) << 1);
+        }
+    }
+    return t;
+}
+
+// XOR is non-monotone (X ^ anything = X), so the result is X iff either operand
+// is X, else the must-bit xor. Same logic as the wide path, evaluated at compile
+// time over the 2-bit domain.
+constexpr code xor4(code a, code b) {
+    const code u = ((a ^ (a >> 1)) | (b ^ (b >> 1))) & 1u; // either X -> X
+    const code k = (a ^ b) & 1u;                           // value: must ^ must
+    return (((u | k) & 1u) << 1) | (~u & k & 1u);          // (may<<1) | must
+}
+
+constexpr uint32_t XOR1_LUT = build_lut(xor4); // 0x23A200E0
+
 // A resolved assignment target: a `{ i(2W) must|may, iW z }` pair somewhere in
 // memory (the module state buffer for a signal, or the per-call frame for a
 // function local) plus a bit offset / width selecting part of it. `bit_off` is an
@@ -2519,14 +2556,54 @@ private:
         if (tag == Inst::Tag::Bor) {
             return { b_.CreateOr(a.mm, b.mm), zero(w) };
         }
-        // Bxor (non-monotone): unpack. Unknown iff either bit unknown; value is xor.
-        llvm::Value* am = must_of(a);
-        llvm::Value* aM = may_of(a);
-        llvm::Value* bm = must_of(b);
-        llvm::Value* bM = may_of(b);
-        llvm::Value* u  = b_.CreateOr(b_.CreateXor(am, aM), b_.CreateXor(bm, bM));
-        llvm::Value* k  = b_.CreateXor(am, bm);
-        return packed(b_.CreateAnd(b_.CreateNot(u), k), b_.CreateOr(u, k), zero(w));
+        // Width-1 Bxor: index the packed truth table instead of unpacking. The
+        // shift amount idx*2 = (a.mm<<3)|(b.mm<<1) selects the 2-bit result; the
+        // count must match the i32 LUT, so widen there (free in codegen).
+        if (w == 1) {
+            llvm::Value* aw = b_.CreateZExt(a.mm, int_ty(32));
+            llvm::Value* bw = b_.CreateZExt(b.mm, int_ty(32));
+            llvm::Value* sh = b_.CreateOr(b_.CreateShl(aw, 3), b_.CreateShl(bw, 1));
+            llvm::Value* t  = b_.CreateLShr(b_.getInt32(XOR1_LUT), sh);
+            return { b_.CreateTrunc(t, int_ty(2)), zero(1) };
+        }
+        // Wider Bxor (non-monotone). When neither operand has an X/Z bit, XOR is
+        // monotone like AND/OR — must == may in each operand, so the packed `a ^ b`
+        // is already the answer. Real designs hit that case ~all the time per site,
+        // so guard the cheap path and fall back to the full unpack only on X. The
+        // combined X-mask `u` is computed once for the test and reused by the slow
+        // path. The X-mask of a packed value is its low W bits of `mm ^ (mm >> W)`
+        // (must ^ may); X-ness is nonlinear, so each operand's mask is taken
+        // separately before OR-ing.
+        llvm::Value* xa    = b_.CreateXor(a.mm, b_.CreateLShr(a.mm, w));
+        llvm::Value* xb    = b_.CreateXor(b.mm, b_.CreateLShr(b.mm, w));
+        llvm::Value* u     = b_.CreateTrunc(b_.CreateOr(xa, xb), int_ty(w));
+        llvm::Value* known = b_.CreateICmpEQ(u, zero(w));
+
+        auto* fast_bb = llvm::BasicBlock::Create(ctx_, "xor.known", fn_);
+        auto* slow_bb = llvm::BasicBlock::Create(ctx_, "xor.x", fn_);
+        auto* end_bb  = llvm::BasicBlock::Create(ctx_, "xor.end", fn_);
+
+        llvm::BranchInst* br = b_.CreateCondBr(known, fast_bb, slow_bb);
+        br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1u << 20, 1));
+
+        // Hot: both operands known -> one packed xor carries both planes.
+        b_.SetInsertPoint(fast_bb);
+        llvm::Value* fast_mm = b_.CreateXor(a.mm, b.mm);
+        b_.CreateBr(end_bb);
+
+        // Cold: at least one X bit. Reuse `u`; value is the must-bit xor, X where u.
+        b_.SetInsertPoint(slow_bb);
+        llvm::Value* am      = must_of(a);
+        llvm::Value* bm      = must_of(b);
+        llvm::Value* k       = b_.CreateXor(am, bm);
+        llvm::Value* slow_mm = packed(b_.CreateAnd(b_.CreateNot(u), k), b_.CreateOr(u, k), zero(w)).mm;
+        b_.CreateBr(end_bb);
+
+        b_.SetInsertPoint(end_bb);
+        llvm::PHINode* mm = b_.CreatePHI(int_ty(2 * w), 2);
+        mm->addIncoming(fast_mm, fast_bb);
+        mm->addIncoming(slow_mm, slow_bb);
+        return { mm, zero(w) };
     }
 
     Plane lower_bnot(Plane a) {

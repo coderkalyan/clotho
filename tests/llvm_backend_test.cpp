@@ -1,16 +1,49 @@
 #include <doctest/doctest.h>
 
+#include <cstdio>
 #include <string>
 #include <string_view>
+
+#include <unistd.h>
 
 #include <llvm/Support/raw_ostream.h>
 
 #include "Lower.h"
+#include "ir/Jit.h"
 #include "ir/LlvmBackend.h"
 
 using namespace clotho;
 
 namespace {
+
+// JIT-run a module's initial blocks and return everything written to stdout.
+std::string run_capture(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE(r.module != nullptr);
+
+    std::FILE* tmp = std::tmpfile();
+    REQUIRE(tmp != nullptr);
+    std::fflush(stdout);
+    const int saved = dup(fileno(stdout));
+    dup2(fileno(tmp), fileno(stdout));
+
+    ir::run_jit(*r.module);
+
+    std::fflush(stdout);
+    dup2(saved, fileno(stdout));
+    close(saved);
+
+    std::rewind(tmp);
+    std::string out;
+    char        buf[256];
+    size_t      n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), tmp)) > 0) {
+        out.append(buf, n);
+    }
+    std::fclose(tmp);
+    return out;
+}
 
 // Lower SystemVerilog text to a Module and emit LLVM IR as a string.
 std::string emit(std::string_view source) {
@@ -111,6 +144,47 @@ TEST_CASE("2-state vs 4-state widths") {
     // z's must|may word sits first at offset 0 as an i16 (2W = 16).
     CHECK(ir.find("store i16") != std::string::npos);
     CHECK(ir.find("define ptr @m.") != std::string::npos);
+}
+
+TEST_CASE("single-bit xor uses the packed truth-table immediate") {
+    constexpr std::string_view src = R"(
+        module m(input logic a, input logic b, output logic y);
+            assign y = a ^ b;
+        endmodule
+    )";
+    const std::string          ir  = emit(src);
+
+    // Width-1 XOR shifts the 16-entry packed LUT (0x23A200E0 = 597819616) by the
+    // operand index instead of unpacking must/may planes.
+    CHECK(ir.find("lshr i32 597819616") != std::string::npos);
+}
+
+TEST_CASE("guarded wide xor: known fast path and X slow path agree with LRM") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a, b, y;
+            initial begin
+                a = 8'hAA;        b = 8'hCC;        y = a ^ b; $display("%b", y);
+                a = 8'b1010_101x; b = 8'b0000_0000; y = a ^ b; $display("%b", y);
+                a = 8'b0000_00xx; b = 8'b0000_0011; y = a ^ b; $display("%b", y);
+            end
+        endmodule
+    )";
+    // Known^known takes the fast leg (AA^CC); any X bit takes the slow leg, where
+    // X^anything = X and known bits xor normally.
+    CHECK(run_capture(src) == "01100110\n1010101x\n000000xx\n");
+}
+
+TEST_CASE("wide xor keeps the generic unpack path") {
+    constexpr std::string_view src = R"(
+        module m(input logic [7:0] a, input logic [7:0] b, output logic [7:0] y);
+            assign y = a ^ b;
+        endmodule
+    )";
+    const std::string          ir  = emit(src);
+
+    // The LUT immediate is single-bit only; an 8-bit XOR must not use it.
+    CHECK(ir.find("597819616") == std::string::npos);
 }
 
 TEST_CASE("delay suspends and reschedules on the wheel") {
