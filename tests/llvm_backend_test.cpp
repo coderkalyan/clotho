@@ -779,6 +779,118 @@ TEST_CASE("identically named signals in separate tops stay independent") {
     CHECK((out == "10\n20\n" || out == "20\n10\n"));
 }
 
+// -- Unpacked arrays (memories) --
+
+// Element-addressed storage: blocking writes then reads round-trip per element.
+TEST_CASE("unpacked array blocking write and read") {
+    const std::string out = run_capture(R"(
+        module top;
+            logic [7:0] mem [0:3];
+            integer i;
+            initial begin
+                for (i = 0; i < 4; i = i + 1) mem[i] = i * 16 + 1;
+                for (i = 0; i < 4; i = i + 1) $display("%0d", mem[i]);
+            end
+        endmodule
+    )");
+    CHECK(out == "1\n17\n33\n49\n");
+}
+
+// A nested select indexes a bit / part of an element: mem[i][bit] and a
+// read-modify-write part-select mem[i][3:0].
+TEST_CASE("unpacked array element bit- and part-select") {
+    const std::string out = run_capture(R"(
+        module top;
+            logic [7:0] mem [0:3];
+            initial begin
+                mem[2] = 8'h21;
+                $display("%b", mem[2][7]);
+                $display("%b", mem[2][0]);
+                mem[2][3:0] = 4'h0;
+                $display("%0h", mem[2]);
+            end
+        endmodule
+    )");
+    CHECK(out == "0\n1\n20\n");
+}
+
+// A descending element range [3:0] maps indices to storage by declared
+// direction; element selects must honour it.
+TEST_CASE("unpacked array descending index range") {
+    const std::string out = run_capture(R"(
+        module top;
+            logic [7:0] mem [3:0];
+            initial begin
+                mem[3] = 8'd9;
+                mem[0] = 8'd1;
+                $display("%0d %0d", mem[3], mem[0]);
+            end
+        endmodule
+    )");
+    CHECK(out == "9 1\n");
+}
+
+// Multidimensional unpacked arrays nest: mem[a][b] accumulates a byte offset
+// across both dimensions.
+TEST_CASE("multidimensional unpacked array") {
+    const std::string out = run_capture(R"(
+        module top;
+            logic [7:0] md [0:1][0:1];
+            initial begin
+                md[0][0] = 8'd10; md[0][1] = 8'd20;
+                md[1][0] = 8'd30; md[1][1] = 8'd40;
+                $display("%0d %0d %0d %0d", md[0][0], md[0][1], md[1][0], md[1][1]);
+            end
+        endmodule
+    )");
+    CHECK(out == "10 20 30 40\n");
+}
+
+// A 4-state memory reads X at power-on, before any element is written.
+TEST_CASE("unpacked array elements power on to X") {
+    const std::string out = run_capture(R"(
+        module top;
+            logic [7:0] mem [0:3];
+            initial $display("%b", mem[1]);
+        endmodule
+    )");
+    CHECK(out == "xxxxxxxx\n");
+}
+
+// A dynamically-computed index reads back the element written at that index.
+TEST_CASE("unpacked array dynamic index round-trip") {
+    const std::string out = run_capture(R"(
+        module top;
+            logic [7:0] mem [0:255];
+            integer i;
+            initial begin
+                for (i = 0; i < 256; i = i + 1) mem[i] = i[7:0];
+                $display("%0d", mem[200]);
+            end
+        endmodule
+    )");
+    CHECK(out == "200\n");
+}
+
+// Efficiency: a large memory must be element-addressed. Element access loads an
+// element-width word (i16 for logic[7:0]) via a dynamic GEP; it must NOT
+// materialize an array-width integer (here 256*8*2 = i4096) for a single access.
+TEST_CASE("large memory uses element-addressed access, not array-width integers") {
+    const std::string ir = emit(R"(
+        module top;
+            logic [7:0] mem [0:255];
+            integer i;
+            initial begin
+                for (i = 0; i < 256; i = i + 1) mem[i] = i[7:0];
+                $display("%0d", mem[200]);
+            end
+        endmodule
+    )");
+    CHECK(ir.find("i4096") == std::string::npos);
+    CHECK(ir.find("i2048") == std::string::npos);
+    CHECK(ir.find("getelementptr") != std::string::npos);
+}
+
 // A top with submodules elaborates alongside a flat top; events on both tops
 // advance on the one shared wheel.
 TEST_CASE("multiple tops share one timeline") {

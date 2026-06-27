@@ -84,11 +84,16 @@ struct Plane {
 struct LValue {
     // Base pointer of the storage buffer (state or frame).
     llvm::Value* base = nullptr;
-    // Byte offset of the must|may word and the z word within `base`.
+    // Byte offset of the must|may word and the z word within `base`. For an
+    // unpacked-array element these are element 0's offsets; `dyn_off` shifts to
+    // the selected element.
     uint32_t off_mm = 0;
     uint32_t off_z  = 0;
     // Full storage width in bits.
     uint32_t store_width = 0;
+    // Runtime byte offset added to both off_mm and off_z, selecting an unpacked
+    // array element (null when the target is a plain signal / frame local).
+    llvm::Value* dyn_off = nullptr;
     // Bit offset of the selection within the storage (i32).
     llvm::Value* bit_off = nullptr;
     // Selected width in bits (== store_width for a whole-storage target).
@@ -108,6 +113,13 @@ struct SignalSlot {
     uint32_t width      = 0;
     bool     four_state = false;
     bool     is_signed  = false;
+    // Unpacked array (memory): `width` is the leaf element width and off_mm/off_z
+    // address element 0. `elem_stride` is the per-element byte size (one leaf
+    // slot); `elem_count` is the total leaf-element count (product of all
+    // dimensions). The region spans elem_count * elem_stride bytes.
+    bool     is_array    = false;
+    uint32_t elem_stride = 0;
+    uint32_t elem_count  = 0;
     // Nonblocking-assignment staging. Set only for signals that are NBA targets.
     // A target gets a shadow `{ i(2W) nmm, iW nz }` mirroring its live slot; a
     // target with any bit/part-select site also gets an iW dirty `mask`. nba_id is
@@ -243,6 +255,31 @@ private:
         return (x + a - 1) & ~(a - 1);
     }
 
+    // Byte size of one runtime storage slot for a scalar value of `width` bits:
+    // the i(2W) must|may word plus the i(W) z word, with the same field padding
+    // build_state_layout uses for a plain signal.
+    static uint32_t slot_bytes(uint32_t width) {
+        const uint32_t mm_bits = 2 * width;
+        const uint32_t z_rel   = round_up(field_bytes(mm_bits), field_align(width));
+        return round_up(z_rel + field_bytes(width), field_align(mm_bits));
+    }
+    // Byte offset of the z word within a scalar slot of `width` bits.
+    static uint32_t slot_z_rel(uint32_t width) {
+        return round_up(field_bytes(2 * width), field_align(width));
+    }
+
+    // Total byte size of an unpacked-array (or scalar) type's element-addressed
+    // storage: count * element storage, recursing through nested array
+    // dimensions down to a scalar leaf slot.
+    uint32_t array_storage_bytes(Ref type) const {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            const uint32_t count = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
+            return count * array_storage_bytes(t.element);
+        }
+        return slot_bytes(mod_.pool.layout(type).width);
+    }
+
     // Lay out the single module's signals into one opaque byte buffer. Each signal
     // owns a `{ i(2W) must|may, iW z }` slot; slots are packed in decreasing
     // alignment order (stable on declaration order) so padding stays minimal.
@@ -278,11 +315,24 @@ private:
             const uint32_t slot_align = field_align(mm_bits);
             const uint32_t z_rel      = round_up(field_bytes(mm_bits), field_align(slot.width));
 
-            const uint32_t slot_size = round_up(z_rel + field_bytes(slot.width), slot_align);
-            cursor                   = round_up(cursor, slot_align);
-            slot.off_mm              = cursor;
-            slot.off_z               = cursor + z_rel;
-            cursor += slot_size;
+            cursor      = round_up(cursor, slot_align);
+            slot.off_mm = cursor;
+            slot.off_z  = cursor + z_rel;
+
+            const Type& ty = std::get<Type>(mod_.pool.get(sigs[i].type));
+            if (ty.kind == Type::Kind::UnpackedArray) {
+                // Element-addressed memory: a contiguous run of `elem_count` leaf
+                // slots. off_mm/off_z address element 0; an ElemSelect shifts by
+                // index * elem_stride at runtime. slot.width is the leaf element
+                // width (set from the recursive layout above).
+                const uint32_t total = array_storage_bytes(sigs[i].type);
+                slot.is_array        = true;
+                slot.elem_stride     = slot_bytes(slot.width);
+                slot.elem_count      = slot.elem_stride == 0 ? 0 : total / slot.elem_stride;
+                cursor += total;
+            } else {
+                cursor += round_up(z_rel + field_bytes(slot.width), slot_align);
+            }
         }
 
         // Shadow staging fields for NBA targets, placed after the live region in
@@ -1084,6 +1134,16 @@ private:
           int_ty(2 * s.width), field_ptr(state_, s.off_mm), llvm::Align(field_align(2 * s.width)));
     }
 
+    // Load the packed must|may word of an lvalue's selected storage: the whole
+    // signal for a plain target, or one element for an unpacked-array element
+    // (dyn_off-aware). Used to snapshot old / new state around a blocking store so
+    // wait-queue servicing detects an element-level change, not just element 0.
+    llvm::Value* load_lv_mm(const LValue& lv) {
+        const uint32_t w = lv.store_width;
+        return b_.CreateAlignedLoad(int_ty(2 * w), elem_ptr(lv.base, lv.off_mm, lv.dyn_off),
+                                    llvm::Align(field_align(2 * w)));
+    }
+
     // Service a signal's wait queues after a blocking assignment to it. Computes
     // the transition's edge facts once, then for each per-edge bucket that exists
     // guards its whole scan with a single branch on the matching fact — no
@@ -1785,6 +1845,10 @@ private:
     // 2-state signals come up 0.
     void init_state(llvm::Value* state) {
         for (const SignalSlot& s : slots_) {
+            if (s.is_array) {
+                emit_array_init(state, s);
+                continue;
+            }
             // X packs as the high W bits of the i(2W) must|may word (may=1, must=0).
             llvm::Value* mm = s.four_state
                                 ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * s.width, s.width))
@@ -1799,6 +1863,43 @@ private:
         }
     }
 
+    // Initialise an unpacked-array signal: a runtime loop over its elements
+    // storing the per-element power-on value (X for 4-state, 0 for 2-state) into
+    // each leaf slot. A loop keeps init O(elem_count) emitted instructions, so a
+    // large memory does not bloat the IR.
+    void emit_array_init(llvm::Value* state, const SignalSlot& s) {
+        const uint32_t w  = s.width;
+        auto*          i32 = b_.getInt32Ty();
+        llvm::Value*   mm = s.four_state
+                              ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w))
+                              : zero(2 * w);
+        const llvm::Align mm_al = llvm::Align(field_align(2 * w));
+        const llvm::Align z_al  = llvm::Align(field_align(w));
+
+        auto* fn    = b_.GetInsertBlock()->getParent();
+        auto* head  = llvm::BasicBlock::Create(ctx_, "ainit.head", fn);
+        auto* body  = llvm::BasicBlock::Create(ctx_, "ainit.body", fn);
+        auto* done  = llvm::BasicBlock::Create(ctx_, "ainit.done", fn);
+        auto* entry = b_.GetInsertBlock();
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(head);
+        auto* idx = b_.CreatePHI(i32, 2);
+        idx->addIncoming(b_.getInt32(0), entry);
+        b_.CreateCondBr(b_.CreateICmpULT(idx, b_.getInt32(s.elem_count)), body, done);
+
+        b_.SetInsertPoint(body);
+        llvm::Value* byte_off = b_.CreateMul(idx, b_.getInt32(s.elem_stride));
+        llvm::Value* mp       = field_ptr_var(field_ptr(state, s.off_mm), byte_off);
+        llvm::Value* zp       = field_ptr_var(field_ptr(state, s.off_z), byte_off);
+        b_.CreateAlignedStore(mm, mp, mm_al);
+        b_.CreateAlignedStore(zero(w), zp, z_al);
+        idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), body);
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(done);
+    }
+
     // Pointer to a state field at a constant byte offset (a folded i8 GEP).
     llvm::Value* field_ptr(llvm::Value* base, uint32_t off) {
         return b_.CreateConstInBoundsGEP1_32(b_.getInt8Ty(), base, off);
@@ -1808,6 +1909,13 @@ private:
     // accesses stay naturally aligned even though the GEP is dynamic.
     llvm::Value* field_ptr_var(llvm::Value* base, llvm::Value* off) {
         return b_.CreateInBoundsGEP(b_.getInt8Ty(), base, off);
+    }
+    // Pointer to an lvalue field: the constant field offset, plus the runtime
+    // element byte offset for an unpacked-array element (null for a plain target).
+    // The element stride is field-aligned, so the access stays naturally aligned.
+    llvm::Value* elem_ptr(llvm::Value* base, uint32_t off, llvm::Value* dyn_off) {
+        llvm::Value* p = field_ptr(base, off);
+        return dyn_off != nullptr ? field_ptr_var(p, dyn_off) : p;
     }
 
     // Lower a region's instructions in order into the current insert block. A `ret`
@@ -1872,6 +1980,12 @@ private:
             case Inst::Tag::PartSelect: {
                 const auto ps = ir_->extra_data<PartSelect>(p.op_extra.extra);
                 return { ps.msb - ps.lsb + 1, type_of(p.op_extra.op).four_state, false };
+            }
+            case Inst::Tag::ElemSelect: {
+                // The result is one element of the indexed array.
+                const auto  es = ir_->extra_data<ElemSelect>(p.op_extra.extra);
+                const Type& at = std::get<Type>(mod_.pool.get(es.array_type));
+                return from_ref(at.element);
             }
             case Inst::Tag::Load:
                 return type_of(p.unary);
@@ -1995,6 +2109,29 @@ private:
                 set_lvalue(i, lv);
                 return;
             }
+            case Inst::Tag::ElemSelect: {
+                // Advance the lvalue's runtime byte offset to the selected element:
+                // dyn_off += normalized_index * element_stride. The base lvalue's
+                // off_mm/off_z and store_width already describe a leaf element (set
+                // by the array's signal slot), so this only shifts to the element
+                // and resets any inherited bit offset.
+                LValue      lv = lvalue_of(p.op_extra.op);
+                const auto  es = ir_->extra_data<ElemSelect>(p.op_extra.extra);
+                const Type& at = std::get<Type>(mod_.pool.get(es.array_type));
+                const uint32_t stride = array_storage_bytes(at.element);
+                // TODO: an X/Z or out-of-range index uses only its must bits, so it
+                // selects a wrong / out-of-bounds element. LRM: an out-of-range read
+                // yields X and such a write is a no-op.
+                llvm::Value* idx = cast(must_of(value_of(es.index)), 32, false);
+                // Normalize the declared-range coordinate to a 0-based position.
+                llvm::Value* norm = at.left <= at.right ? b_.CreateSub(idx, b_.getInt32(at.left))
+                                                        : b_.CreateSub(b_.getInt32(at.left), idx);
+                llvm::Value* byte_off = b_.CreateMul(norm, b_.getInt32(stride));
+                lv.dyn_off            = lv.dyn_off != nullptr ? b_.CreateAdd(lv.dyn_off, byte_off) : byte_off;
+                lv.bit_off            = b_.getInt32(0);
+                set_lvalue(i, lv);
+                return;
+            }
 
             case Inst::Tag::Load:
                 set_value(i, lower_load(lvalue_of(p.unary)));
@@ -2008,10 +2145,13 @@ private:
                 // Frame locals have no waiters; only a module signal store services
                 // wait queues.
                 const bool    service = lv.is_signal && signal_has_waiters(lv.sig);
-                llvm::Value*  old_mm  = service ? load_mm(lv.sig) : nullptr;
+                // Snapshot the selected storage (whole signal, or one array element)
+                // so an element write wakes Any-edge waiters on a change to that
+                // element rather than always reading element 0.
+                llvm::Value*  old_mm  = service ? load_lv_mm(lv) : nullptr;
                 lower_store(lv, value_of(p.binary.r), type_of(p.binary.r));
                 if (service) {
-                    service_wait_queue(lv.sig, old_mm, load_mm(lv.sig));
+                    service_wait_queue(lv.sig, old_mm, load_lv_mm(lv));
                 }
                 return;
             }
@@ -2250,8 +2390,9 @@ private:
     Plane lower_load(const LValue& lv) {
         const uint32_t    w  = lv.store_width;
         llvm::Value*      mm = b_.CreateAlignedLoad(
-          int_ty(2 * w), field_ptr(lv.base, lv.off_mm), llvm::Align(field_align(2 * w)));
-        llvm::Value* z = b_.CreateAlignedLoad(int_ty(w), field_ptr(lv.base, lv.off_z), llvm::Align(field_align(w)));
+          int_ty(2 * w), elem_ptr(lv.base, lv.off_mm, lv.dyn_off), llvm::Align(field_align(2 * w)));
+        llvm::Value* z =
+          b_.CreateAlignedLoad(int_ty(w), elem_ptr(lv.base, lv.off_z, lv.dyn_off), llvm::Align(field_align(w)));
         if (lv.width == w && is_zero_const(lv.bit_off)) {
             return { mm, z };
         }
@@ -2265,8 +2406,8 @@ private:
 
     void lower_store(const LValue& lv, Plane rhs, ValType rhs_ty) {
         const uint32_t    s_width = lv.store_width;
-        llvm::Value*      mp      = field_ptr(lv.base, lv.off_mm);
-        llvm::Value*      zp      = field_ptr(lv.base, lv.off_z);
+        llvm::Value*      mp      = elem_ptr(lv.base, lv.off_mm, lv.dyn_off);
+        llvm::Value*      zp      = elem_ptr(lv.base, lv.off_z, lv.dyn_off);
         const llvm::Align mm_al   = llvm::Align(field_align(2 * s_width));
         const llvm::Align z_al    = llvm::Align(field_align(s_width));
         (void)rhs_ty;

@@ -93,9 +93,17 @@ Layout InternPool::layout(Ref type) const {
             const auto     bytes = static_cast<uint32_t>(static_cast<uint8_t>(el.domain)) * plane_bytes(width);
             return { el.domain, width, bytes };
         }
-        case Type::Kind::UnpackedArray:
-            // Aggregate values (row-major element blobs) are not interned yet.
-            return { Domain::Two, 0, 0 };
+        case Type::Kind::UnpackedArray: {
+            // Report the leaf element's domain / width (recursion drills through
+            // nested arrays), so callers sizing a per-element access see the
+            // element, not a flattened whole. `byte_count` is the flattened
+            // canonical-value size (count * element bytes); runtime element
+            // storage uses the backend's own per-element slot sizing, which
+            // differs from this packed-value layout.
+            const Layout   el    = layout(t.element);
+            const uint32_t count = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
+            return { el.domain, el.width, count * el.byte_count };
+        }
     }
 
     return { Domain::Two, 0, 0 };
