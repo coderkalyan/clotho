@@ -114,6 +114,19 @@ constexpr code xor4(code a, code b) {
 
 constexpr uint32_t XOR1_LUT = build_lut(xor4); // 0x23A200E0
 
+// 1-bit add/sub truncate the carry/borrow, so the result is the sum bit a^b;
+// like all arithmetic, any X operand makes it X. That is exactly the XOR table,
+// but derive it independently from the addition so a future encoding change is
+// caught rather than silently aliasing.
+constexpr code add4(code a, code b) {
+    const code u = ((a ^ (a >> 1)) | (b ^ (b >> 1))) & 1u; // either X -> X
+    const code k = ((a & 1u) + (b & 1u)) & 1u;             // sum bit: must + must
+    return (((u | k) & 1u) << 1) | (~u & k & 1u);          // (may<<1) | must
+}
+
+constexpr uint32_t ADD1_LUT = build_lut(add4);
+static_assert(ADD1_LUT == XOR1_LUT, "1-bit add must equal 1-bit xor");
+
 // A resolved assignment target: a `{ i(2W) must|may, iW z }` pair somewhere in
 // memory (the module state buffer for a signal, or the per-call frame for a
 // function local) plus a bit offset / width selecting part of it. `bit_off` is an
@@ -2495,7 +2508,14 @@ private:
 
     Plane lower_arith(Inst::Tag tag, Plane a, Plane b) {
         const uint32_t w    = width_of(a);
-        auto*          wide = int_ty(2 * w);
+
+        // Width-1 add truncates the carry, so the result is the 1-bit sum a^b with
+        // the usual arithmetic X rule. Index the truth table instead of branching.
+        if (w == 1 && tag == Inst::Tag::Add) {
+            return single_bit_lut(ADD1_LUT, a, b);
+        }
+
+        auto* wide = int_ty(2 * w);
 
         // Any X/Z bit in either operand, tested once for the pair. The per-bit X
         // mask of a packed value is `must ^ may`, which sits in the low W bits of
@@ -2548,6 +2568,19 @@ private:
     // -- Bitwise: AND/OR are monotone, so one op on the packed planes does both;
     // the result is never Z, so z is cleared. --
 
+    // Evaluate a single-bit binary op by indexing its packed truth table: the two
+    // 2-bit operand codes form idx = (a<<2)|b and the result code sits at bit
+    // idx*2. One variable shift of the i32 immediate selects it — no unpack, no
+    // branch. The shift count must match the LUT width, so widen the operands to
+    // i32 (free in codegen); the result truncs back to the 2-bit plane.
+    Plane single_bit_lut(uint32_t lut, Plane a, Plane b) {
+        llvm::Value* aw = b_.CreateZExt(a.mm, int_ty(32));
+        llvm::Value* bw = b_.CreateZExt(b.mm, int_ty(32));
+        llvm::Value* sh = b_.CreateOr(b_.CreateShl(aw, 3), b_.CreateShl(bw, 1));
+        llvm::Value* t  = b_.CreateLShr(b_.getInt32(lut), sh);
+        return { b_.CreateTrunc(t, int_ty(2)), zero(1) };
+    }
+
     Plane lower_bitwise(Inst::Tag tag, Plane a, Plane b) {
         const uint32_t w = width_of(a);
         if (tag == Inst::Tag::Band) {
@@ -2556,15 +2589,8 @@ private:
         if (tag == Inst::Tag::Bor) {
             return { b_.CreateOr(a.mm, b.mm), zero(w) };
         }
-        // Width-1 Bxor: index the packed truth table instead of unpacking. The
-        // shift amount idx*2 = (a.mm<<3)|(b.mm<<1) selects the 2-bit result; the
-        // count must match the i32 LUT, so widen there (free in codegen).
         if (w == 1) {
-            llvm::Value* aw = b_.CreateZExt(a.mm, int_ty(32));
-            llvm::Value* bw = b_.CreateZExt(b.mm, int_ty(32));
-            llvm::Value* sh = b_.CreateOr(b_.CreateShl(aw, 3), b_.CreateShl(bw, 1));
-            llvm::Value* t  = b_.CreateLShr(b_.getInt32(XOR1_LUT), sh);
-            return { b_.CreateTrunc(t, int_ty(2)), zero(1) };
+            return single_bit_lut(XOR1_LUT, a, b);
         }
         // Wider Bxor (non-monotone). When neither operand has an X/Z bit, XOR is
         // monotone like AND/OR — must == may in each operand, so the packed `a ^ b`

@@ -187,6 +187,48 @@ TEST_CASE("wide xor keeps the generic unpack path") {
     CHECK(ir.find("597819616") == std::string::npos);
 }
 
+TEST_CASE("single-bit add reuses the xor truth-table immediate, no branch") {
+    constexpr std::string_view src = R"(
+        module m(input logic a, input logic b, output logic y);
+            assign y = a + b;
+        endmodule
+    )";
+    const std::string          ir  = emit(src);
+
+    // 1-bit add truncates the carry to a^b, so it indexes the LUT (== XOR1_LUT)
+    // instead of the branching arithmetic path.
+    CHECK(ir.find("lshr i32 597819616") != std::string::npos);
+    CHECK(ir.find("arith.x") == std::string::npos);
+}
+
+TEST_CASE("single-bit add agrees with LRM, including X") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a, b, y;
+            initial begin
+                a = 1'b1; b = 1'b1; y = a + b; $display("%b", y);
+                a = 1'b1; b = 1'b0; y = a + b; $display("%b", y);
+                a = 1'bx; b = 1'b1; y = a + b; $display("%b", y);
+            end
+        endmodule
+    )";
+    // 1+1 truncates to 0; 1+0 = 1; x + anything = x.
+    CHECK(run_capture(src) == "0\n1\nx\n");
+}
+
+TEST_CASE("wide add keeps the branching arithmetic path") {
+    constexpr std::string_view src = R"(
+        module m(input logic [7:0] a, input logic [7:0] b, output logic [7:0] y);
+            assign y = a + b;
+        endmodule
+    )";
+    const std::string          ir  = emit(src);
+
+    // Not the single-bit LUT path; the branching arithmetic lowering is used.
+    CHECK(ir.find("597819616") == std::string::npos);
+    CHECK(ir.find("arith") != std::string::npos);
+}
+
 TEST_CASE("delay suspends and reschedules on the wheel") {
     constexpr std::string_view src = R"(
         module d;
