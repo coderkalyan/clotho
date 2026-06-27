@@ -1592,6 +1592,11 @@ private:
     llvm::FunctionCallee random_fn() {
         return llmod_.getOrInsertFunction("rt_random", llvm::FunctionType::get(b_.getInt32Ty(), {}, false));
     }
+    // i64 rt_pow_u64(i64 base, i64 exp)
+    llvm::FunctionCallee pow_fn() {
+        auto* i64 = b_.getInt64Ty();
+        return llmod_.getOrInsertFunction("rt_pow_u64", llvm::FunctionType::get(i64, { i64, i64 }, false));
+    }
     // i32 rt_wheel_pending(const rt_wheel*)
     llvm::FunctionCallee wheel_pending_fn() {
         auto* ptr = llvm::PointerType::getUnqual(ctx_);
@@ -1694,6 +1699,11 @@ private:
             case Inst::Tag::Add:
             case Inst::Tag::Sub:
             case Inst::Tag::Mul:
+            case Inst::Tag::Div:
+            case Inst::Tag::Mod:
+            // Power's result shares the left operand's type; the exponent is
+            // self-determined and does not widen the result.
+            case Inst::Tag::Pow:
             case Inst::Tag::Band:
             case Inst::Tag::Bor:
             case Inst::Tag::Bxor:
@@ -1830,6 +1840,37 @@ private:
             case Inst::Tag::Mul:
                 set_value(i, lower_arith(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
                 return;
+
+            case Inst::Tag::Div:
+            case Inst::Tag::Mod: {
+                const ValType lt = type_of(p.binary.l);
+                if (lt.width > 64) {
+                    // TODO: integer / and % lower to LLVM udiv/sdiv/urem/srem, which legalize to
+                    // 128-bit __udivti3 / __umodti3 (and signed siblings) for wider operands; those
+                    // compiler-rt builtins are not resolvable in the JIT, so wide divide/modulo would
+                    // silently miscompute. Provision the libcalls before lifting this guard.
+                    throw BackendError{ "divide/modulo with operands wider than 64 bits not yet supported" };
+                }
+                set_value(i, lower_divmod(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r), lt.is_signed));
+                return;
+            }
+
+            case Inst::Tag::Pow: {
+                const ValType lt = type_of(p.binary.l);
+                if (lt.is_signed || type_of(p.binary.r).is_signed) {
+                    // TODO: signed ** carries the negative-base/negative-exponent corners of LRM
+                    // Table 11-4 (op1 == -1 parity, |op1| > 1 with op2 < 0 -> 0, etc.); only the
+                    // unsigned path is lowered.
+                    throw BackendError{ "signed power operator (**) not yet supported" };
+                }
+                if (lt.width > 64 || type_of(p.binary.r).width > 64) {
+                    // TODO: rt_pow_u64 is a 64-bit entry; wider operands need a multi-word runtime
+                    // helper before ** can be lowered for them.
+                    throw BackendError{ "power operator (**) with operands wider than 64 bits not yet supported" };
+                }
+                set_value(i, lower_pow(value_of(p.binary.l), value_of(p.binary.r)));
+                return;
+            }
 
             case Inst::Tag::Band:
             case Inst::Tag::Bor:
@@ -2303,6 +2344,113 @@ private:
                 r = b_.CreateMul(am, bm);
                 break;
         }
+        llvm::Value* val_mm = packed(r, r, zero(w)).mm;
+        b_.CreateBr(end_bb);
+
+        b_.SetInsertPoint(end_bb);
+        llvm::PHINode* mm = b_.CreatePHI(wide, 2);
+        mm->addIncoming(x_mm, x_bb);
+        mm->addIncoming(val_mm, val_bb);
+        return { mm, zero(w) };
+    }
+
+    // Divide and modulo. LRM 1800-2023 §11.4.3: integer division truncates toward
+    // zero, modulo takes the sign of the dividend, and a zero divisor or any X/Z
+    // bit in either operand makes the whole result X.
+    Plane lower_divmod(Inst::Tag tag, Plane a, Plane b, bool sign) {
+        const uint32_t w      = width_of(a);
+        auto*          wide   = int_ty(2 * w);
+        const bool     is_div = tag == Inst::Tag::Div;
+
+        llvm::Value* am = must_of(a);
+        llvm::Value* bm = must_of(b);
+
+        // One cold branch folds the X/Z test and the divide-by-zero test together:
+        // both map to an all-X result, so a single not-taken branch is optimal. For
+        // 2-state operands the X/Z half is statically zero and instcombine drops it,
+        // leaving just `divisor == 0`.
+        llvm::Value* xa      = b_.CreateXor(a.mm, b_.CreateLShr(a.mm, w));
+        llvm::Value* xb      = b_.CreateXor(b.mm, b_.CreateLShr(b.mm, w));
+        llvm::Value* xmask   = b_.CreateTrunc(b_.CreateOr(xa, xb), int_ty(w));
+        llvm::Value* unknown = b_.CreateICmpNE(xmask, zero(w));
+        llvm::Value* divzero = b_.CreateICmpEQ(bm, zero(w));
+        llvm::Value* cold    = b_.CreateOr(unknown, divzero);
+
+        auto* x_bb   = llvm::BasicBlock::Create(ctx_, "divmod.x", fn_);
+        auto* val_bb = llvm::BasicBlock::Create(ctx_, "divmod.val", fn_);
+        auto* end_bb = llvm::BasicBlock::Create(ctx_, "divmod.end", fn_);
+
+        llvm::BranchInst* br = b_.CreateCondBr(cold, x_bb, val_bb);
+        br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
+
+        b_.SetInsertPoint(x_bb);
+        llvm::Value* x_mm = llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w));
+        b_.CreateBr(end_bb);
+
+        // Hot: divisor guaranteed nonzero. Unsigned is a direct udiv/urem. Signed
+        // sdiv/srem are poison for INT_MIN / -1, so sanitize that divisor to 1 and
+        // substitute the wrapped result (INT_MIN for /, 0 for %), which is the
+        // two's-complement overflow value at width W.
+        b_.SetInsertPoint(val_bb);
+        llvm::Value* r = nullptr;
+        if (!sign) {
+            r = is_div ? b_.CreateUDiv(am, bm) : b_.CreateURem(am, bm);
+        }
+        else {
+            llvm::Value* neg1 = b_.CreateICmpEQ(bm, llvm::ConstantInt::getAllOnesValue(int_ty(w)));
+            llvm::Value* safe = b_.CreateSelect(neg1, llvm::ConstantInt::get(int_ty(w), 1), bm);
+            if (is_div) {
+                r = b_.CreateSelect(neg1, b_.CreateNeg(am), b_.CreateSDiv(am, safe));
+            }
+            else {
+                r = b_.CreateSelect(neg1, zero(w), b_.CreateSRem(am, safe));
+            }
+        }
+        llvm::Value* val_mm = packed(r, r, zero(w)).mm;
+        b_.CreateBr(end_bb);
+
+        b_.SetInsertPoint(end_bb);
+        llvm::PHINode* mm = b_.CreatePHI(wide, 2);
+        mm->addIncoming(x_mm, x_bb);
+        mm->addIncoming(val_mm, val_bb);
+        return { mm, zero(w) };
+    }
+
+    // Power (**), unsigned. LRM 1800-2023 §11.4.3: the exponent is self-determined
+    // (so it may be a different width from the base/result), any X/Z bit makes the
+    // result X, and the unsigned table corners (exp 0 -> 1, 0**n -> 0, 1**n -> 1)
+    // fall out of exponentiation by squaring in rt_pow_u64.
+    Plane lower_pow(Plane a, Plane b) {
+        const uint32_t w    = width_of(a);
+        const uint32_t ew   = width_of(b);
+        auto*          wide = int_ty(2 * w);
+
+        // X/Z in either operand -> all-X. The operands can differ in width, so each
+        // mask is tested at its own width and the two feed one cold branch.
+        llvm::Value* xa      = b_.CreateXor(a.mm, b_.CreateLShr(a.mm, w));
+        llvm::Value* xb      = b_.CreateXor(b.mm, b_.CreateLShr(b.mm, ew));
+        llvm::Value* ua      = b_.CreateICmpNE(b_.CreateTrunc(xa, int_ty(w)), zero(w));
+        llvm::Value* ub      = b_.CreateICmpNE(b_.CreateTrunc(xb, int_ty(ew)), zero(ew));
+        llvm::Value* unknown = b_.CreateOr(ua, ub);
+
+        auto* x_bb   = llvm::BasicBlock::Create(ctx_, "pow.x", fn_);
+        auto* val_bb = llvm::BasicBlock::Create(ctx_, "pow.val", fn_);
+        auto* end_bb = llvm::BasicBlock::Create(ctx_, "pow.end", fn_);
+
+        llvm::BranchInst* br = b_.CreateCondBr(unknown, x_bb, val_bb);
+        br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
+
+        b_.SetInsertPoint(x_bb);
+        llvm::Value* x_mm = llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w));
+        b_.CreateBr(end_bb);
+
+        // Hot: compute in 64 bits and truncate to W. Since 2^W | 2^64 the modular
+        // result is exact at width W.
+        b_.SetInsertPoint(val_bb);
+        llvm::Value* base   = cast(must_of(a), 64, false);
+        llvm::Value* exp    = cast(must_of(b), 64, false);
+        llvm::Value* res    = b_.CreateCall(pow_fn(), { base, exp });
+        llvm::Value* r      = cast(res, w, false);
         llvm::Value* val_mm = packed(r, r, zero(w)).mm;
         b_.CreateBr(end_bb);
 

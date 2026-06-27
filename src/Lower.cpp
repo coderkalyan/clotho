@@ -1598,6 +1598,12 @@ private:
                 return b.binary(T::Sub, lhs, rhs, l);
             case B::Multiply:
                 return b.binary(T::Mul, lhs, rhs, l);
+            case B::Divide:
+                return b.binary(T::Div, lhs, rhs, l);
+            case B::Mod:
+                return b.binary(T::Mod, lhs, rhs, l);
+            case B::Power:
+                return b.binary(T::Pow, lhs, rhs, l);
             case B::BinaryAnd:
                 return b.binary(T::Band, lhs, rhs, l);
             case B::BinaryOr:
