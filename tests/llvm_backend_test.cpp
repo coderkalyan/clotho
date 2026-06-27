@@ -746,3 +746,49 @@ TEST_CASE("unsupported divide/modulo/power forms are rejected, not miscompiled")
     CHECK(rejects(R"(module m; initial begin int a, b, c; a = 2; b = 3; c = a ** b; end endmodule)"));
     CHECK(rejects(R"(module m; initial begin logic [99:0] a, b, c; a = 2; b = 3; c = a ** b; end endmodule)"));
 }
+
+// Multiple top-level modules are each implicitly instantiated once and
+// flattened into the one design, sharing the global timeline (LRM 3.11, 23.3.1).
+TEST_CASE("multiple top-level modules each elaborate into the design") {
+    const std::string out = run_capture(R"(
+        module a;
+            initial $display("a");
+        endmodule
+        module b;
+            initial $display("b");
+        endmodule
+    )");
+    // Both tops run; time-zero ordering across tops is nondeterministic (LRM
+    // 4.7), so accept either interleaving.
+    CHECK((out == "a\nb\n" || out == "b\na\n"));
+}
+
+// Same-named signals in separate tops must not collide: each top's instance
+// name prefixes its flattened paths, and signals resolve by handle regardless.
+TEST_CASE("identically named signals in separate tops stay independent") {
+    const std::string out = run_capture(R"(
+        module a;
+            reg [7:0] x;
+            initial begin x = 8'd10; $display("%0d", x); end
+        endmodule
+        module b;
+            reg [7:0] x;
+            initial begin x = 8'd20; $display("%0d", x); end
+        endmodule
+    )");
+    CHECK((out == "10\n20\n" || out == "20\n10\n"));
+}
+
+// A top with submodules elaborates alongside a flat top; events on both tops
+// advance on the one shared wheel.
+TEST_CASE("multiple tops share one timeline") {
+    const std::string out = run_capture(R"(
+        module a;
+            initial begin #5 $display("a@%0d", $time); end
+        endmodule
+        module b;
+            initial begin #10 $display("b@%0d", $time); end
+        endmodule
+    )");
+    CHECK(out == "a@5\nb@10\n");
+}

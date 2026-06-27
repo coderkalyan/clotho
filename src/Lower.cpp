@@ -2071,32 +2071,57 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
         result.diagnostics += "error: no top-level module found\n";
         return result;
     }
-    if (root.topInstances.size() > 1) {
-        // TODO: multiple roots — elaborate each into the one flat module (their
-        // signals share the state buffer but never connect).
-        result.diagnostics += "error: multiple top-level modules are not supported\n";
-        return result;
-    }
 
     // Analysis: walk the elaborated AST into clotho IR. The wheel tick is the
     // design's smallest time unit; if no design unit set a timescale, time stays
     // unitless (one tick == one time unit) and nothing is scaled.
+    //
+    // Multiple top-level modules are each implicitly instantiated once and
+    // elaborated into the one flat design (LRM 3.11, 23.3.1): independent name
+    // hierarchies sharing one global timeline, with no port connections between
+    // them. They flatten into a single Module — signals share the state buffer
+    // but never connect. Precision/unit are the minimum across all tops (the
+    // global time precision, LRM 3.14.2), so the wheel tick is computed over the
+    // whole set, not a single root.
     const auto t_an         = std::chrono::steady_clock::now();
     auto       module       = std::make_unique<ir::Module>();
     bool       any_explicit = false;
-    const uint64_t prec_fs  = design_tick_fs(*root.topInstances[0], any_explicit);
-    const uint64_t tick_fs  = any_explicit ? prec_fs : 0;
+    uint64_t   prec_fs      = 0;
+    uint64_t   min_prec_fs  = 0;
+    for (const InstanceSymbol* top : root.topInstances) {
+        const uint64_t p = design_tick_fs(*top, any_explicit);
+        if (p != 0 && (prec_fs == 0 || p < prec_fs)) {
+            prec_fs = p;
+        }
+        const uint64_t mp = design_min_precision_fs(*top);
+        if (mp != 0 && (min_prec_fs == 0 || mp < min_prec_fs)) {
+            min_prec_fs = mp;
+        }
+    }
+    const uint64_t tick_fs = any_explicit ? prec_fs : 0;
 
     // %t needs the real tick size (fs). In unitless mode (no `timescale anywhere)
     // a tick is one second, matching the seconds base the LRM and iverilog use
     // when no scale is set. The default %t time unit is the smallest design
     // precision (LRM Table 20-3), falling back to the tick when unitless.
     constexpr uint64_t fs_per_second = 1'000'000'000'000'000ULL;
-    const uint64_t     min_prec_fs   = design_min_precision_fs(*root.topInstances[0]);
     module->tick_fs                  = prec_fs == 0 ? fs_per_second : prec_fs;
     module->timeformat_units         = fs_to_unit_exponent(min_prec_fs == 0 ? module->tick_fs : min_prec_fs);
+
+    // A single top keeps the bare (prefix-less) signal paths the rest of the
+    // pipeline expects. With several tops, each top's instance name (== its
+    // module name, LRM 23.3.1) prefixes its flattened paths so they stay unique.
+    // Each top gets a fresh Lowerer: their bodies share no symbols (no inter-top
+    // ports), so per-Lowerer maps need not — and must not — be shared.
+    const bool single = root.topInstances.size() == 1;
+    if (!single) {
+        module->name = std::string(root.topInstances[0]->name);
+    }
     try {
-        Lowerer(*module, tick_fs).lower_instance(*root.topInstances[0], "");
+        for (const InstanceSymbol* top : root.topInstances) {
+            const std::string prefix = single ? std::string() : std::string(top->name) + ".";
+            Lowerer(*module, tick_fs).lower_instance(*top, prefix);
+        }
     } catch (const LowerError& e) {
         result.diagnostics += "error: " + e.message + "\n";
         return result;
