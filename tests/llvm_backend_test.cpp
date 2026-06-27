@@ -229,6 +229,70 @@ TEST_CASE("wide add keeps the branching arithmetic path") {
     CHECK(ir.find("arith") != std::string::npos);
 }
 
+TEST_CASE("single-bit sub reuses the xor truth-table immediate, no branch") {
+    const std::string ir = emit(R"(
+        module m(input logic a, input logic b, output logic y);
+            assign y = a - b;
+        endmodule
+    )");
+    // 1-bit sub truncates the borrow to a^b, so it shares the XOR LUT.
+    CHECK(ir.find("lshr i32 597819616") != std::string::npos);
+    CHECK(ir.find("arith.x") == std::string::npos);
+}
+
+TEST_CASE("single-bit sub agrees with LRM, including X") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a, b, y;
+            initial begin
+                a = 1'b1; b = 1'b1; y = a - b; $display("%b", y);
+                a = 1'b0; b = 1'b1; y = a - b; $display("%b", y);
+                a = 1'bx; b = 1'b1; y = a - b; $display("%b", y);
+            end
+        endmodule
+    )";
+    // 1-1 = 0; 0-1 borrows, truncates to 1; x - anything = x.
+    CHECK(run_capture(src) == "0\n1\nx\n");
+}
+
+TEST_CASE("single-bit mul uses its own truth-table immediate, no branch") {
+    const std::string ir = emit(R"(
+        module m(input logic a, input logic b, output logic y);
+            assign y = a * b;
+        endmodule
+    )");
+    // Mul's table differs from xor (0*x = x), so a distinct immediate.
+    CHECK(ir.find("lshr i32 -526254048") != std::string::npos);
+    CHECK(ir.find("597819616") == std::string::npos);
+    CHECK(ir.find("arith.x") == std::string::npos);
+}
+
+TEST_CASE("single-bit mul agrees with LRM: value is and, but X propagates") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a, b, y;
+            initial begin
+                a = 1'b1; b = 1'b1; y = a * b; $display("%b", y);
+                a = 1'b1; b = 1'b0; y = a * b; $display("%b", y);
+                a = 1'b0; b = 1'bx; y = a * b; $display("%b", y);
+                a = 1'bx; b = 1'b1; y = a * b; $display("%b", y);
+            end
+        endmodule
+    )";
+    // 1*1 = 1; 1*0 = 0; but 0*x = x (arithmetic X rule), unlike bitwise 0&x = 0.
+    CHECK(run_capture(src) == "1\n0\nx\nx\n");
+}
+
+TEST_CASE("wide mul keeps the branching arithmetic path") {
+    const std::string ir = emit(R"(
+        module m(input logic [7:0] a, input logic [7:0] b, output logic [7:0] y);
+            assign y = a * b;
+        endmodule
+    )");
+    CHECK(ir.find("-526254048") == std::string::npos);
+    CHECK(ir.find("arith") != std::string::npos);
+}
+
 TEST_CASE("delay suspends and reschedules on the wheel") {
     constexpr std::string_view src = R"(
         module d;

@@ -127,6 +127,29 @@ constexpr code add4(code a, code b) {
 constexpr uint32_t ADD1_LUT = build_lut(add4);
 static_assert(ADD1_LUT == XOR1_LUT, "1-bit add must equal 1-bit xor");
 
+// 1-bit subtract truncates the borrow, so the result is a^b — again the XOR
+// table. Derived from subtraction and asserted equal.
+constexpr code sub4(code a, code b) {
+    const code u = ((a ^ (a >> 1)) | (b ^ (b >> 1))) & 1u; // either X -> X
+    const code k = ((a & 1u) - (b & 1u)) & 1u;             // difference bit
+    return (((u | k) & 1u) << 1) | (~u & k & 1u);
+}
+
+constexpr uint32_t SUB1_LUT = build_lut(sub4);
+static_assert(SUB1_LUT == XOR1_LUT, "1-bit sub must equal 1-bit xor");
+
+// 1-bit multiply: the value is a&b, but multiply is arithmetic, so any X operand
+// makes the result X (0*x = x, unlike the monotone bitwise AND where 0&x = 0).
+// Distinct table.
+constexpr code mul4(code a, code b) {
+    const code u = ((a ^ (a >> 1)) | (b ^ (b >> 1))) & 1u; // arith rule: any X -> X
+    const code k = (a & 1u) & (b & 1u);                    // product bit: must * must
+    return (((u | k) & 1u) << 1) | (~u & k & 1u);
+}
+
+constexpr uint32_t MUL1_LUT = build_lut(mul4); // 0xE0A20020
+static_assert(MUL1_LUT != XOR1_LUT, "1-bit mul must differ from xor (0*x = x, not 0)");
+
 // A resolved assignment target: a `{ i(2W) must|may, iW z }` pair somewhere in
 // memory (the module state buffer for a signal, or the per-call frame for a
 // function local) plus a bit offset / width selecting part of it. `bit_off` is an
@@ -2509,10 +2532,18 @@ private:
     Plane lower_arith(Inst::Tag tag, Plane a, Plane b) {
         const uint32_t w    = width_of(a);
 
-        // Width-1 add truncates the carry, so the result is the 1-bit sum a^b with
-        // the usual arithmetic X rule. Index the truth table instead of branching.
-        if (w == 1 && tag == Inst::Tag::Add) {
-            return single_bit_lut(ADD1_LUT, a, b);
+        // Width-1 add/sub/mul: index the per-op truth table instead of branching.
+        // Add/sub truncate the carry/borrow to a^b; mul is a&b. All three keep the
+        // arithmetic X rule (any X operand -> X), which the LUTs bake in.
+        if (w == 1) {
+            switch (tag) {
+                case Inst::Tag::Add:
+                    return single_bit_lut(ADD1_LUT, a, b);
+                case Inst::Tag::Sub:
+                    return single_bit_lut(SUB1_LUT, a, b);
+                default: // Mul (lower_arith only handles add/sub/mul)
+                    return single_bit_lut(MUL1_LUT, a, b);
+            }
         }
 
         auto* wide = int_ty(2 * w);
