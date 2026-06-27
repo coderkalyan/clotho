@@ -3367,22 +3367,25 @@ private:
     //   CasexEq:  x and z bits in either operand are don't-care
     //             (mask = unknown_a | unknown_b, since both x and z have must!=may).
     Plane lower_case_compare(Inst::Tag tag, Plane a, Plane b) {
-        const uint32_t w  = std::max(width_of(a), width_of(b));
-        a                 = cast_plane(a, w, false);
-        b                 = cast_plane(b, w, false);
-        llvm::Value* am   = must_of(a);
-        llvm::Value* aM   = may_of(a);
-        llvm::Value* bm   = must_of(b);
-        llvm::Value* bM   = may_of(b);
+        const uint32_t w = std::max(width_of(a), width_of(b));
+        a                = cast_plane(a, w, false);
+        b                = cast_plane(b, w, false);
 
         llvm::Value* eq;
         if (tag == Inst::Tag::CaseEq) {
-            eq = b_.CreateAnd(b_.CreateAnd(b_.CreateICmpEQ(am, bm), b_.CreateICmpEQ(aM, bM)),
-                              b_.CreateICmpEQ(a.z, b.z));
+            // === : bit-exact equality. The packed mm word carries both the must
+            // and may planes, so a single icmp on the word covers them at once;
+            // the z plane is compared alongside. One icmp per plane, no unpack.
+            eq = b_.CreateAnd(b_.CreateICmpEQ(a.mm, b.mm), b_.CreateICmpEQ(a.z, b.z));
         } else {
-            llvm::Value* dc = tag == Inst::Tag::CasezEq
-                                ? b_.CreateOr(a.z, b.z)
-                                : b_.CreateOr(b_.CreateXor(am, aM), b_.CreateXor(bm, bM));
+            // casez/casex mask out don't-care bits, so they need the planes split.
+            llvm::Value* am   = must_of(a);
+            llvm::Value* aM   = may_of(a);
+            llvm::Value* bm   = must_of(b);
+            llvm::Value* bM   = may_of(b);
+            llvm::Value* dc   = tag == Inst::Tag::CasezEq
+                                  ? b_.CreateOr(a.z, b.z)
+                                  : b_.CreateOr(b_.CreateXor(am, aM), b_.CreateXor(bm, bM));
             llvm::Value* keep = b_.CreateNot(dc);
             eq                = b_.CreateAnd(
               b_.CreateICmpEQ(b_.CreateAnd(am, keep), b_.CreateAnd(bm, keep)),
