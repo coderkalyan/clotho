@@ -794,22 +794,23 @@ private:
             }
         }
 
-        // An `always` is semantically a forever loop around its body. Clotho models
-        // that loop only when the body re-triggers on a sensitivity list (event
-        // control above) or the block is combinational (always_comb / always_latch
-        // / @*, inferred below). Any other `always` — driven by a `#delay`, an
-        // internal timing control, or no sensitivity at all — would need a true
-        // implicit forever loop that is not yet implemented. Lowering it runs the
-        // body exactly once and silently miscompiles (e.g. `always #5 clk = ~clk;`
-        // never toggles), so reject it loudly.
-        // TODO: wrap such blocks in an implicit forever loop (docs/TODO.md M1).
-        if (activation == ir::Activation::Always && !infer && wait_events.empty()) {
-            fail("an always block with no event sensitivity list (e.g. `always #5 ...`) "
-                 "is not supported");
-        }
+        // An `always` is semantically a forever loop around its body (LRM 9.2.2).
+        // Clotho models that loop implicitly when the body re-triggers on a
+        // sensitivity list (event control above) or the block is combinational
+        // (always_comb / always_latch / @*, inferred below). Any other `always` —
+        // driven by a `#delay` or an internal `@`, or with no timing at all — has
+        // no sensitivity to re-trigger it, so the forever loop must live in its
+        // own body. A body with no internal timing control is a legal but
+        // pathological zero-delay infinite loop (it hangs at time zero);
+        // we lower it faithfully rather than reject it.
+        const bool looping = activation == ir::Activation::Always && !infer && wait_events.empty();
 
         ir::Builder b(module_.pool);
-        lower_stmt(*body, b);
+        if (looping) {
+            lower_implicit_forever(*body, b);
+        } else {
+            lower_stmt(*body, b);
+        }
         // Inferred sensitivity is read from the body after lowering, so any
         // block-local declarations it touched are already registered in sigmap_.
         if (infer) {
@@ -1080,6 +1081,25 @@ private:
         const ir::ExtraSlice step = b.close_region(); // empty
 
         b.loop(cond, pred, body, step, loc(w));
+    }
+
+    // The implicit forever loop wrapping a sensitivity-less `always` body (LRM
+    // 9.2.2): a constant-true `forever` around `body`, with no separate AST node.
+    // The body's own timing control (`#`/`@`) suspends each iteration; without one
+    // this is the legal zero-delay infinite loop noted in lower_procedural_block.
+    void lower_implicit_forever(const Statement& body, ir::Builder& b) {
+        b.open_region();
+        const ir::Index      pred = true_const(b, loc(body));
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        lower_stmt(body, b);
+        const ir::ExtraSlice body_region = b.close_region();
+
+        b.open_region();
+        const ir::ExtraSlice step = b.close_region(); // empty
+
+        b.loop(cond, pred, body_region, step, loc(body));
     }
 
     // forever-loop: a while-loop with a constant-true condition.

@@ -4,6 +4,7 @@
 #include <string>
 #include <string_view>
 
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "Lower.h"
@@ -12,6 +13,18 @@
 using namespace clotho;
 
 namespace {
+
+// Read the whole of a temp file into a string (helper for the capture routines).
+std::string slurp(std::FILE* f) {
+    std::rewind(f);
+    std::string out;
+    char        buf[256];
+    size_t      n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
+        out.append(buf, n);
+    }
+    return out;
+}
 
 // JIT-run a module's initial blocks and return everything it wrote to stdout.
 // Loop bodies report their progress with $display, so the captured text is the
@@ -34,13 +47,41 @@ std::string run_capture(std::string_view source) {
     dup2(saved, fileno(stdout));
     close(saved);
 
-    std::rewind(tmp);
-    std::string out;
-    char        buf[256];
-    size_t      n;
-    while ((n = std::fread(buf, 1, sizeof(buf), tmp)) > 0) {
-        out.append(buf, n);
+    std::string out = slurp(tmp);
+    std::fclose(tmp);
+
+    return out;
+}
+
+// JIT-run a design that ends via $finish and return its stdout. $finish calls
+// std::exit, which would tear down the whole test runner, so the simulation runs
+// in a forked child writing to a temp file; the parent waits and reads it. Use
+// this (not run_capture) for any free-running process — e.g. a clock-generating
+// `always` — that only stops at $finish.
+std::string run_capture_finish(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE(r.module != nullptr);
+
+    std::FILE* tmp = std::tmpfile();
+    REQUIRE(tmp != nullptr);
+    std::fflush(stdout);
+
+    const pid_t pid = fork();
+    REQUIRE(pid >= 0);
+    if (pid == 0) {
+        // Child: run with stdout pointed at the temp file. $finish's std::exit(0)
+        // ends the child here; _exit covers a design that drains without $finish.
+        dup2(fileno(tmp), fileno(stdout));
+        ir::run_jit(*r.module);
+        std::fflush(stdout);
+        _exit(0);
     }
+
+    int wstatus = 0;
+    REQUIRE(waitpid(pid, &wstatus, 0) == pid);
+
+    std::string out = slurp(tmp);
     std::fclose(tmp);
 
     return out;
@@ -287,4 +328,55 @@ TEST_CASE("repeat loop nesting") {
                     repeat (3) $display("y");
         endmodule
     )") == "y\ny\ny\ny\ny\ny\n");
+}
+
+// A sensitivity-less `always` is an implicit forever loop around its body (LRM
+// 9.2.2): `always #5 clk = ~clk;` is a free-running clock. Each toggle drives a
+// posedge-sensitive process that counts edges and stops the run.
+TEST_CASE("always with a delay is a free-running clock") {
+    CHECK(run_capture_finish(R"(
+        module m;
+            reg clk;
+            integer count;
+            initial begin clk = 0; count = 0; end
+            always #5 clk = ~clk;
+            always @(posedge clk) begin
+                count = count + 1;
+                $display("posedge %0d", count);
+                if (count == 3) $finish;
+            end
+        endmodule
+    )") == "posedge 1\nposedge 2\nposedge 3\n");
+}
+
+// The implicit forever loop re-enters the body, so a multi-statement block with
+// several internal delays cycles indefinitely until $finish.
+TEST_CASE("always block with multiple internal delays cycles") {
+    CHECK(run_capture_finish(R"(
+        module m;
+            reg a;
+            integer n;
+            initial begin a = 0; n = 0; end
+            always begin
+                #1 a = 1;
+                #1 a = 0;
+                n = n + 1;
+                $display("cycle %0d", n);
+                if (n == 3) $finish;
+            end
+        endmodule
+    )") == "cycle 1\ncycle 2\ncycle 3\n");
+}
+
+// A sensitivity-less `always` lowers to an implicit forever Loop, not a
+// run-once body.
+TEST_CASE("sensitivity-less always lowers to a Loop") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            reg clk;
+            always #5 clk = ~clk;
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    CHECK(any_process_has_tag(*r.module, ir::Inst::Tag::Loop));
 }
