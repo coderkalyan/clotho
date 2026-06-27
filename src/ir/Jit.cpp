@@ -74,6 +74,11 @@ int run_jit(const Module& m, Timings* timings) {
     expose("rt_pow_u64", &rt_pow_u64);
     expose("rt_alloc", &rt_alloc);
     expose("rt_free", &rt_free);
+    expose("rt_nba_arr_push", &rt_nba_arr_push);
+    expose("rt_nba_arr_pending", &rt_nba_arr_pending);
+    expose("rt_nba_arr_commit", &rt_nba_arr_commit);
+    expose("rt_nba_arr_dirty", &rt_nba_arr_dirty);
+    expose("rt_nba_arr_reset", &rt_nba_arr_reset);
     expose("rt_wheel_init", &rt_wheel_init);
     expose("rt_wheel_deinit", &rt_wheel_deinit);
     expose("rt_wheel_now", &rt_wheel_now);
