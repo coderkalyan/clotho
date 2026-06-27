@@ -522,23 +522,6 @@ private:
         return e.type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() != nullptr;
     }
 
-    // True if an lvalue expression ultimately indexes into an unpacked array
-    // (`mem[i]`, `mem[i][3]`, `mem[i][7:0]`). Used to gate constructs not yet
-    // supported on array elements.
-    static bool selects_unpacked(const slang::ast::Expression& e) {
-        using namespace slang::ast;
-        switch (e.kind) {
-            case ExpressionKind::ElementSelect: {
-                const auto& es = e.as<ElementSelectExpression>();
-                return is_unpacked_array(es.value()) || selects_unpacked(es.value());
-            }
-            case ExpressionKind::RangeSelect:
-                return selects_unpacked(e.as<RangeSelectExpression>().value());
-            default:
-                return false;
-        }
-    }
-
     // Intern a packed integer type of the given width / state / signedness.
     ir::Ref make_int_type(uint32_t width, bool is_four, bool is_signed) {
         const ir::Ref element = is_four ? module_.pool.logic_type : module_.pool.bit_type;
@@ -1619,11 +1602,6 @@ private:
             // element-wise copy / aggregate lowering; only element assignment is
             // supported today.
             fail("whole unpacked array assignment is not supported");
-        }
-        if (a.isNonBlocking() && selects_unpacked(a.left())) {
-            // TODO(Phase 2): nonblocking write to an array element (synchronous
-            // memory) via the deferred write queue.
-            fail("nonblocking assignment to an unpacked array element is not yet supported");
         }
         const ir::Index lhs = lower_lvalue(a.left(), b);
         const ir::Index rhs = lower_expr(a.right(), b);

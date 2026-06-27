@@ -479,7 +479,7 @@ TEST_CASE("whole unpacked array assignment fails loudly") {
     CHECK(r.diagnostics.find("whole unpacked array assignment") != std::string::npos);
 }
 
-TEST_CASE("nonblocking assignment to an array element fails loudly (Phase 2)") {
+TEST_CASE("a nonblocking write to an array element lowers") {
     const LowerResult r = lower_text(R"(
         module top;
             logic [7:0] mem [0:3];
@@ -487,8 +487,7 @@ TEST_CASE("nonblocking assignment to an array element fails loudly (Phase 2)") {
             always @(posedge clk) mem[0] <= 8'd1;
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("nonblocking assignment to an unpacked array element") != std::string::npos);
+    CHECK(r.ok);
 }
 
 TEST_CASE("a dynamic array fails loudly") {
