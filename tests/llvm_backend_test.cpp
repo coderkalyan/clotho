@@ -373,6 +373,44 @@ TEST_CASE("wide div keeps the branching divmod path") {
     CHECK(ir.find("divmod") != std::string::npos);
 }
 
+TEST_CASE("single-bit == and != use truth-table immediates") {
+    const std::string eq = emit(R"(
+        module m(input logic a, input logic b, output logic y); assign y = (a == b); endmodule
+    )");
+    CHECK(eq.find("lshr i32 -526254045") != std::string::npos); // EQ1_LUT
+
+    const std::string ne = emit(R"(
+        module m(input logic a, input logic b, output logic y); assign y = (a != b); endmodule
+    )");
+    CHECK(ne.find("lshr i32 597819616") != std::string::npos);  // NE1_LUT == XOR1_LUT
+}
+
+TEST_CASE("single-bit == / != agree with LRM, including X") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a, b, e, n;
+            initial begin
+                a = 1'b1; b = 1'b1; e = (a == b); n = (a != b); $display("%b%b", e, n);
+                a = 1'b1; b = 1'b0; e = (a == b); n = (a != b); $display("%b%b", e, n);
+                a = 1'b0; b = 1'b0; e = (a == b); n = (a != b); $display("%b%b", e, n);
+                a = 1'bx; b = 1'b1; e = (a == b); n = (a != b); $display("%b%b", e, n);
+            end
+        endmodule
+    )";
+    // equal->==1,!=0; unequal->==0,!=1; X operand -> both x.
+    CHECK(run_capture(src) == "10\n01\n10\nxx\n");
+}
+
+TEST_CASE("wide == keeps the icmp compare path") {
+    const std::string ir = emit(R"(
+        module m(input logic [7:0] a, input logic [7:0] b, output logic y);
+            assign y = (a == b);
+        endmodule
+    )");
+    CHECK(ir.find("-526254045") == std::string::npos);
+    CHECK(ir.find("icmp") != std::string::npos);
+}
+
 TEST_CASE("delay suspends and reschedules on the wheel") {
     constexpr std::string_view src = R"(
         module d;

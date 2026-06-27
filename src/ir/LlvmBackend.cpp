@@ -179,6 +179,26 @@ constexpr code pow4(code a, code b) {
 
 constexpr uint32_t POW1_LUT = build_lut(pow4); // 0xE3A20023
 
+// 1-bit == is XNOR of the value bits (equal -> 1), with the X rule (any X -> X).
+// This is the X-propagating `==`/`!=`, not the case operators `===`/`!==`.
+constexpr code eq4(code a, code b) {
+    const code u = ((a ^ (a >> 1)) | (b ^ (b >> 1))) & 1u;  // either X -> X
+    const code k = (~((a & 1u) ^ (b & 1u))) & 1u;           // a == b
+    return (((u | k) & 1u) << 1) | (~u & k & 1u);
+}
+
+constexpr uint32_t EQ1_LUT = build_lut(eq4); // 0xE0A20023
+
+// 1-bit != is the value xor, with the X rule — the same table as XOR.
+constexpr code ne4(code a, code b) {
+    const code u = ((a ^ (a >> 1)) | (b ^ (b >> 1))) & 1u;
+    const code k = ((a & 1u) ^ (b & 1u)) & 1u;              // a != b
+    return (((u | k) & 1u) << 1) | (~u & k & 1u);
+}
+
+constexpr uint32_t NE1_LUT = build_lut(ne4);
+static_assert(NE1_LUT == XOR1_LUT, "1-bit != must equal 1-bit xor");
+
 // A resolved assignment target: a `{ i(2W) must|may, iW z }` pair somewhere in
 // memory (the module state buffer for a signal, or the per-call frame for a
 // function local) plus a bit offset / width selecting part of it. `bit_off` is an
@@ -3301,6 +3321,17 @@ private:
     // -- Comparisons -> 1-bit; X/Z in either operand yields X. --
 
     Plane lower_compare(Inst::Tag tag, Plane a, Plane b, bool sign) {
+        // Width-1 == / != index a truth table instead of masking an icmp with the
+        // per-operand X tests. Operands share a width here, so both are 1-bit.
+        if (width_of(a) == 1) {
+            if (tag == Inst::Tag::Eq) {
+                return single_bit_lut(EQ1_LUT, a, b);
+            }
+            if (tag == Inst::Tag::Ne) {
+                return single_bit_lut(NE1_LUT, a, b);
+            }
+        }
+
         llvm::CmpInst::Predicate pred;
         switch (tag) {
             case Inst::Tag::Eq:
