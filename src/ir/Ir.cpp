@@ -29,6 +29,9 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Add:
         case T::Sub:
         case T::Mul:
+        case T::Div:
+        case T::Mod:
+        case T::Pow:
         case T::Band:
         case T::Bor:
         case T::Bxor:
