@@ -1431,6 +1431,18 @@ private:
             return b.random(l);
         }
 
+        // $signed / $unsigned (LRM §20.10): reinterpret the self-determined
+        // argument with the opposite signedness, preserving its size and value
+        // bits. slang gives `call.type` the argument's width with the new sign;
+        // a same-width resize leaves the bits untouched but tags the result type
+        // so downstream widening sign- vs zero-extends correctly.
+        if (name == "$signed" || name == "$unsigned") {
+            if (call.arguments().size() != 1) {
+                fail("$signed / $unsigned expects exactly one argument");
+            }
+            return b.resize(lower_expr(*call.arguments()[0], b), lower_type(*call.type), l);
+        }
+
         // TODO: $realtime (LRM §20.3.3) returns a real scaled to the module time
         // unit; blocked on real (floating-point) value support in the IR.
         if (name == "$realtime") {

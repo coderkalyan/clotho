@@ -224,6 +224,62 @@ TEST_CASE("if vs ?: propagate an ambiguous predicate differently") {
     CHECK(out == "if=0101\ntern=1xx0\nifz=0000\n");
 }
 
+TEST_CASE("signed arithmetic obeys LRM signedness across the operator set") {
+    // Sign extension on widening, signed compare, signed divide/modulo (trunc
+    // toward zero, INT_MIN/-1 overflow wrap), signed multiply/add widening, and
+    // the mixed-sign rule (LRM §11.8.1: any unsigned operand => unsigned op).
+    // $signed/$unsigned reinterpret without changing the bits but drive later
+    // sign-extension. All values cross-checked against iverilog.
+    const std::string out = run_capture(R"(
+        module m;
+            initial begin
+                logic signed [3:0] a4; logic signed [7:0] b8, b8u;
+                logic signed [3:0] d1, d2;
+                logic signed [7:0] e1; logic [7:0] e2;
+                logic [3:0] u4; logic signed [3:0] sm4;
+                logic signed [31:0] mn, q, r;
+                logic signed [3:0] h1, h2; logic signed [7:0] hr, ir2;
+                a4 = -4'sd3; b8 = a4;       $display("%0d", b8);            // -3
+                b8u = $unsigned(4'b1111);   $display("%0d", b8u);           // 15
+                $display("%0d", $signed(4'b1111));                          // -1
+                d1 = -1; d2 = 1;            $display("%0d", d1 < d2);       // 1
+                e1 = -1; e2 = 1;            $display("%0d", e1 < e2);       // 0
+                u4 = 4'b1111;               $display("%0d", $signed(u4) < 0); // 1
+                $display("%0d %0d %0d %0d", -7/2, 7/-2, -7%2, 7%-2);        // -3 -3 -1 1
+                mn = -2147483648; q = mn/-1; r = mn%-1;
+                $display("%0d %0d", q, r);                                  // -2147483648 0
+                h1 = -2; h2 = 3; hr = h1*h2; $display("%0d", hr);           // -6
+                ir2 = h1 + h1;             $display("%0d", ir2);            // -4
+            end
+        endmodule
+    )");
+    CHECK(out == "-3\n15\n-1\n1\n0\n1\n-3 -3 -1 1\n-2147483648 0\n-6\n-4\n");
+}
+
+TEST_CASE("shifts define the out-of-range amount instead of emitting poison") {
+    // LRM §11.4.10: a shift amount >= the operand width yields 0 for <<, >>, and
+    // unsigned >>>, while signed >>> fills with the sign bit. LLVM shift ops are
+    // poison at amount >= width, so the backend must guard the range; it also
+    // must test the untruncated amount so multiples of 2**width (e.g. >>256 on an
+    // 8-bit value) do not alias to a no-op. Cross-checked against iverilog.
+    const std::string out = run_capture(R"(
+        module m;
+            initial begin
+                logic [7:0] u; logic signed [7:0] s; logic [15:0] amt;
+                u = 8'hFF; s = -8'sd1;
+                $display("%0d %0d %0d", u << 8, u >> 8, u >> 300);          // 0 0 0
+                $display("%0d %0d", u << 256, u >> 256);                    // 0 0
+                $display("%0d %0d", s >>> 8, s >>> 256);                    // -1 -1
+                $display("%0d", $signed(8'b11111000) >>> 1);               // -4
+                $display("%0d", u >>> 1);                                   // 127
+                amt = 16'd256; $display("%0d", u >> amt);                   // 0
+                amt = 16'd3;   $display("%0d", u >> amt);                   // 31
+            end
+        endmodule
+    )");
+    CHECK(out == "0 0 0\n0 0\n-1 -1\n-4\n127\n0\n31\n");
+}
+
 TEST_CASE("delay inside a conditional splits cleanly") {
     // A #delay nested in an if/else branch suspends mid-conditional. The point is
     // that CoroSplit handles the resulting CFG and the module still verifies —

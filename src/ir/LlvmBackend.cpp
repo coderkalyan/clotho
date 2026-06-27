@@ -2783,29 +2783,56 @@ private:
 
     Plane lower_shift(Inst::Tag tag, Plane a, Plane amt, bool sign) {
         const uint32_t w  = width_of(a);
-        llvm::Value*   sh = cast(must_of(amt), w, false);
+        const uint32_t aw = width_of(amt);
         llvm::Value*   am = must_of(a);
         llvm::Value*   aM = may_of(a);
-        llvm::Value*   must;
-        llvm::Value*   may;
-        llvm::Value*   z;
+
+        // Detect a shift amount >= width at the amount's untruncated width. LLVM
+        // shift ops are poison once the amount reaches the operand width (LRM
+        // §11.4.10 instead defines the result), and truncating the amount to `w`
+        // first would alias multiples of 2**w down to 0. Compare in a width that
+        // holds both the amount and `w`.
+        const uint32_t cw  = std::max(aw, w);
+        llvm::Value*   oob = b_.CreateICmpUGE(cast(must_of(amt), cw, false),
+                                              llvm::ConstantInt::get(int_ty(cw), w));
+
+        // Clamp to w-1 so every LLVM shift below is well-defined; the truncated
+        // amount is exact whenever the shift is in range (a value < w fits in w
+        // bits), and the out-of-range result is patched in afterwards.
+        llvm::Value* sh   = cast(must_of(amt), w, false);
+        llvm::Value* safe = b_.CreateSelect(oob, llvm::ConstantInt::get(int_ty(w), w == 0 ? 0 : w - 1), sh);
+
+        const bool   arith = tag == Inst::Tag::Sra && sign;
+        llvm::Value* must;
+        llvm::Value* may;
+        llvm::Value* z;
         switch (tag) {
             case Inst::Tag::Sll:
-                must = b_.CreateShl(am, sh);
-                may  = b_.CreateShl(aM, sh);
-                z    = b_.CreateShl(a.z, sh);
+                must = b_.CreateShl(am, safe);
+                may  = b_.CreateShl(aM, safe);
+                z    = b_.CreateShl(a.z, safe);
                 break;
             case Inst::Tag::Srl:
-                must = b_.CreateLShr(am, sh);
-                may  = b_.CreateLShr(aM, sh);
-                z    = b_.CreateLShr(a.z, sh);
+                must = b_.CreateLShr(am, safe);
+                may  = b_.CreateLShr(aM, safe);
+                z    = b_.CreateLShr(a.z, safe);
                 break;
-            default: // Sra: arithmetic, replicate the sign (and its unknown-ness)
-                must = sign ? b_.CreateAShr(am, sh) : b_.CreateLShr(am, sh);
-                may  = sign ? b_.CreateAShr(aM, sh) : b_.CreateLShr(aM, sh);
-                z    = sign ? b_.CreateAShr(a.z, sh) : b_.CreateLShr(a.z, sh);
+            default: // Sra: arithmetic (signed) replicates the sign and its
+                     // unknown-ness; unsigned `>>>` is logical.
+                must = arith ? b_.CreateAShr(am, safe) : b_.CreateLShr(am, safe);
+                may  = arith ? b_.CreateAShr(aM, safe) : b_.CreateLShr(aM, safe);
+                z    = arith ? b_.CreateAShr(a.z, safe) : b_.CreateLShr(a.z, safe);
                 break;
         }
+
+        // Out-of-range: logical shifts (and unsigned `>>>`) produce 0. The
+        // arithmetic `>>>` already yields all sign bits from the clamp to w-1.
+        if (!arith) {
+            must = b_.CreateSelect(oob, zero(w), must);
+            may  = b_.CreateSelect(oob, zero(w), may);
+            z    = b_.CreateSelect(oob, zero(w), z);
+        }
+
         llvm::Value* unknown = any_unknown(amt);
         return packed(b_.CreateSelect(unknown, zero(w), must),
                       b_.CreateSelect(unknown, ones(w), may),
