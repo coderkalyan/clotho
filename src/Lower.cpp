@@ -1603,14 +1603,45 @@ private:
             // supported today.
             fail("whole unpacked array assignment is not supported");
         }
-        const ir::Index lhs = lower_lvalue(a.left(), b);
-        const ir::Index rhs = lower_expr(a.right(), b);
         // StoreNb gets correct two-phase NBA semantics in the backend: the RHS is
         // sampled here in the active region and committed in the NBA update region.
         // Intra-assignment timing (`<= #5`) is still rejected above, so the deferred
         // update always lands in the current instant's NBA region.
         const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
-        b.binary(tag, lhs, rhs, loc(a));
+        const ir::Index     rhs = lower_expr(a.right(), b);
+        if (a.left().kind == ExpressionKind::Concatenation) {
+            store_concat(a.left().as<ConcatenationExpression>(), rhs, tag, b, loc(a));
+            return;
+        }
+        b.binary(tag, lower_lvalue(a.left(), b), rhs, loc(a));
+    }
+
+    // Distribute a value across a concatenation lvalue, `{a, b, c} = rhs` (LRM
+    // §11.4.12). The leftmost operand takes the most-significant slice; operand
+    // widths partition the RHS bits. Lowered to one store per operand: the slice
+    // is `rhs >> offset` truncated to the operand width via resize (the upper bits
+    // are discarded by the narrowing store). The RHS is sampled once by the caller,
+    // so a nonblocking concat assignment keeps single-evaluation semantics.
+    void store_concat(const ConcatenationExpression& cc, ir::Index rhs, ir::Inst::Tag tag,
+                      ir::Builder& b, ir::SourceLoc l) {
+        const std::span<const Expression* const> ops = cc.operands();
+        uint32_t                                  offset = 0;
+        for (size_t k = ops.size(); k-- > 0;) {
+            const Expression& op    = *ops[k];
+            ir::Index         chunk = rhs;
+            if (offset != 0) {
+                const ir::Index sh =
+                    b.constant(module_.pool.put_int(make_int_type(32, false, false), offset), l);
+                chunk = b.binary(ir::Inst::Tag::Srl, rhs, sh, l);
+            }
+            const ir::Index val = b.resize(chunk, lower_type(*op.type), l);
+            if (op.kind == ExpressionKind::Concatenation) {
+                store_concat(op.as<ConcatenationExpression>(), val, tag, b, l);
+            } else {
+                b.binary(tag, lower_lvalue(op, b), val, l);
+            }
+            offset += op.type->getBitWidth();
+        }
     }
 
     // -- Expressions --
