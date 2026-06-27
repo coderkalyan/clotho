@@ -73,6 +73,14 @@ void rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uin
 // inout argument; it is rejected at the frontend and has no runtime entry yet.
 int32_t rt_random(void);
 
+// $power / ** operator (LRM 1800-2023 §11.4.3), unsigned 2-state path. Returns
+// base**exp computed modulo 2^64 via exponentiation by squaring. The caller
+// truncates to the result width W; since 2^W divides 2^64 for W <= 64, the
+// modular result is exact at that width. Caller handles X/Z propagation and the
+// signed/wide forms; this entry assumes both operands fit in 64 bits and are
+// X/Z-free.
+uint64_t rt_pow_u64(uint64_t base, uint64_t exp);
+
 // -- Coroutine frame allocation --
 //
 // Each process lowers to an LLVM coroutine; its frame is allocated through these

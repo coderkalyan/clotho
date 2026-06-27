@@ -71,6 +71,7 @@ int run_jit(const Module& m, Timings* timings) {
     expose("rt_timeformat_set", &rt_timeformat_set);
     expose("rt_finish", &rt_finish);
     expose("rt_random", &rt_random);
+    expose("rt_pow_u64", &rt_pow_u64);
     expose("rt_alloc", &rt_alloc);
     expose("rt_free", &rt_free);
     expose("rt_wheel_init", &rt_wheel_init);
