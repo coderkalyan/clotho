@@ -979,11 +979,23 @@ private:
         }
     }
 
+    // Reduce a condition expression to its 1-bit truth value for `if`/`?:`.
+    // LRM §12.4: the condition is true if any bit is 1, false if all bits are 0,
+    // and ambiguous (X) otherwise. That is exactly reduction-OR: must = any bit
+    // definitely 1, may = any bit could be 1 (Z bits read as X via `may`). This
+    // also normalizes a multi-bit predicate to the 1-bit value `b.cond`/`b.mux`
+    // require; without it the backend emits a mismatched-width icmp.
+    ir::Index lower_predicate(const Expression& cond, ir::Builder& b) {
+        const ir::SourceLoc l    = loc(cond);
+        const ir::Index     pred = lower_expr(cond, b);
+        return b.unary(ir::Inst::Tag::RedOr, pred, l);
+    }
+
     void lower_conditional(const ConditionalStatement& c, ir::Builder& b) {
         if (c.conditions.size() != 1) {
             fail("unsupported multi-condition if");
         }
-        const ir::Index pred = lower_expr(*c.conditions[0].expr, b);
+        const ir::Index pred = lower_predicate(*c.conditions[0].expr, b);
 
         b.open_region();
         lower_stmt(c.ifTrue, b);
@@ -1558,7 +1570,7 @@ private:
                 if (c.conditions.size() != 1) {
                     fail("unsupported multi-condition ?:");
                 }
-                const ir::Index pred = lower_expr(*c.conditions[0].expr, b);
+                const ir::Index pred = lower_predicate(*c.conditions[0].expr, b);
                 const ir::Index a    = lower_expr(c.left(), b);
                 const ir::Index bb   = lower_expr(c.right(), b);
                 return b.mux(pred, a, bb, l);

@@ -173,6 +173,57 @@ TEST_CASE("delay suspends and reschedules on the wheel") {
     CHECK(ir.find("call void @rt_wheel_tick") != std::string::npos);
 }
 
+TEST_CASE("multi-bit if / ?: predicates reduce to LRM truth values") {
+    // A predicate wider than one bit must be reduced to its 1-bit truth value
+    // (LRM §12.4: true if any bit is 1). `sel = 8'd2` has bit 0 clear but bit 1
+    // set, so a naive low-bit truncation would wrongly read false. Both `if` and
+    // `?:` must agree it is true. Before the reduction landed this also produced a
+    // mismatched-width icmp that failed verifyModule.
+    const std::string out = run_capture(R"(
+        module m;
+            initial begin
+                logic [7:0] sel;
+                integer r;
+                sel = 8'd2;
+                if (sel) r = 1; else r = 0;
+                $display("if=%0d", r);
+                r = sel ? 7 : 9;
+                $display("tern=%0d", r);
+                sel = 8'd0;
+                if (sel) r = 1; else r = 0;
+                $display("ifz=%0d", r);
+                r = sel ? 7 : 9;
+                $display("ternz=%0d", r);
+            end
+        endmodule
+    )");
+    CHECK(out == "if=1\ntern=7\nifz=0\nternz=9\n");
+}
+
+TEST_CASE("if vs ?: propagate an ambiguous predicate differently") {
+    // An X/Z condition is ambiguous. `if` takes the else branch (LRM §12.4);
+    // `?:` returns the bitwise merge of both operands (LRM §11.4.11): bits that
+    // agree pass through, bits that differ become X. Z bits read as X. Verified
+    // against iverilog.
+    const std::string out = run_capture(R"(
+        module m;
+            initial begin
+                logic [3:0] s;
+                logic [3:0] r;
+                s = 4'bxxxx;
+                if (s) r = 4'b1010; else r = 4'b0101;
+                $display("if=%b", r);
+                r = s ? 4'b1100 : 4'b1010;
+                $display("tern=%b", r);
+                s = 4'bzz00;
+                if (s) r = 4'b1111; else r = 4'b0000;
+                $display("ifz=%b", r);
+            end
+        endmodule
+    )");
+    CHECK(out == "if=0101\ntern=1xx0\nifz=0000\n");
+}
+
 TEST_CASE("delay inside a conditional splits cleanly") {
     // A #delay nested in an if/else branch suspends mid-conditional. The point is
     // that CoroSplit handles the resulting CFG and the module still verifies —
