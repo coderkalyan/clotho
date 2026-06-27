@@ -165,7 +165,72 @@ clotho::Timer& unwrap(rt_timer* t) {
     return *reinterpret_cast<clotho::Timer*>(t);
 }
 
+// One deferred unpacked-array element write: a bytewise masked merge of `mm` /
+// `z` value bytes into the live element's must|may and z words. Self-describing
+// (absolute destination pointers captured at push time) so the commit pass is
+// width-agnostic.
+struct NbaArrWrite {
+    uint32_t             sig;
+    void*                mm_ptr;
+    void*                z_ptr;
+    std::vector<uint8_t> mm_val;
+    std::vector<uint8_t> mm_mask;
+    std::vector<uint8_t> z_val;
+    std::vector<uint8_t> z_mask;
+};
+
+// The single deferred-write queue. Cleared (kept allocated) each NBA pass.
+std::vector<NbaArrWrite> nba_arr_queue;
+
+// Bytewise dest = (dest & ~mask) | (val & mask).
+void masked_merge(void* dest, const std::vector<uint8_t>& val, const std::vector<uint8_t>& mask) {
+    auto* d = static_cast<uint8_t*>(dest);
+    for (size_t k = 0; k < val.size(); ++k) {
+        d[k] = static_cast<uint8_t>((d[k] & ~mask[k]) | (val[k] & mask[k]));
+    }
+}
+
 } // namespace
+
+extern "C" void rt_nba_arr_push(uint32_t sig, void* mm_ptr, const void* mm_val, const void* mm_mask,
+                                uint32_t mm_bytes, void* z_ptr, const void* z_val, const void* z_mask,
+                                uint32_t z_bytes) {
+    const auto* mv = static_cast<const uint8_t*>(mm_val);
+    const auto* mk = static_cast<const uint8_t*>(mm_mask);
+    const auto* zv = static_cast<const uint8_t*>(z_val);
+    const auto* zk = static_cast<const uint8_t*>(z_mask);
+    nba_arr_queue.push_back(NbaArrWrite{ .sig     = sig,
+                                         .mm_ptr  = mm_ptr,
+                                         .z_ptr   = z_ptr,
+                                         .mm_val  = { mv, mv + mm_bytes },
+                                         .mm_mask = { mk, mk + mm_bytes },
+                                         .z_val   = { zv, zv + z_bytes },
+                                         .z_mask  = { zk, zk + z_bytes } });
+}
+
+extern "C" uint32_t rt_nba_arr_pending(void) {
+    return static_cast<uint32_t>(nba_arr_queue.size());
+}
+
+extern "C" void rt_nba_arr_commit(void) {
+    for (const NbaArrWrite& w : nba_arr_queue) {
+        masked_merge(w.mm_ptr, w.mm_val, w.mm_mask);
+        masked_merge(w.z_ptr, w.z_val, w.z_mask);
+    }
+}
+
+extern "C" int rt_nba_arr_dirty(uint32_t sig) {
+    for (const NbaArrWrite& w : nba_arr_queue) {
+        if (w.sig == sig) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+extern "C" void rt_nba_arr_reset(void) {
+    nba_arr_queue.clear();
+}
 
 extern "C" void rt_wheel_init(rt_wheel* wheel) {
     new (wheel->storage) RuntimeWheel;

@@ -54,6 +54,8 @@ const char* tag_name(Inst::Tag tag) {
             return "bit_select";
         case T::PartSelect:
             return "part_select";
+        case T::ElemSelect:
+            return "elem_select";
         case T::Load:
             return "load";
         case T::Store:
@@ -331,6 +333,14 @@ private:
                 const PartSelect ps = ir_.extra_data<PartSelect>(p.op_extra.extra);
                 ref(p.op_extra.op);
                 os_ << "[" << ps.msb << ":" << ps.lsb << "])\n";
+                break;
+            }
+            case Inst::Tag::ElemSelect: {
+                const ElemSelect es = ir_.extra_data<ElemSelect>(p.op_extra.extra);
+                ref(p.op_extra.op);
+                os_ << "[";
+                ref(es.index);
+                os_ << "])\n";
                 break;
             }
             case Inst::Tag::Cond: {

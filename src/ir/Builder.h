@@ -50,6 +50,9 @@ public:
     Index mux(Index cond, Index a, Index b, SourceLoc loc);
     Index concat(std::span<const Index> parts, SourceLoc loc);
     Index part_select(Index base, uint32_t msb, uint32_t lsb, SourceLoc loc);
+    // Unpacked-array element select base[index]. `array_type` is the interned
+    // UnpackedArray type being indexed (gives element stride + declared bounds).
+    Index elem_select(Index base, Index index, Ref array_type, SourceLoc loc);
     Index cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc);
     // for / while / forever. `cond_region` recomputes `pred` each iteration;
     // `step_region` is the per-iteration update (empty for while / forever).

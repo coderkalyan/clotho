@@ -38,6 +38,7 @@
 #include <slang/ast/symbols/SubroutineSymbols.h>
 #include <slang/ast/symbols/ValueSymbol.h>
 #include <slang/ast/symbols/VariableSymbols.h>
+#include <slang/ast/types/AllTypes.h>
 #include <slang/ast/types/Type.h>
 #include <slang/ast/Scope.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
@@ -485,11 +486,40 @@ private:
         if (ct.isVoid()) {
             return module_.pool.void_type;
         }
+        if (const auto* arr = ct.as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
+            // Fixed-size unpacked array (memory). Recurse on the element (a nested
+            // unpacked array gives a multidimensional memory; otherwise an integral
+            // element). Bounds come straight from the declared range.
+            const slang::ConstantRange r = arr->range;
+            if (r.left < 0 || r.right < 0) {
+                // TODO: negative element-index bounds (e.g. arr[-1:1]). The ir Type
+                // stores bounds as uint32; supporting them needs signed normalization
+                // in the backend element-select. Rare in RTL memories.
+                fail("unpacked array with negative index bounds is not supported");
+            }
+            ir::Type t;
+            t.kind    = ir::Type::Kind::UnpackedArray;
+            t.element = lower_type(arr->elementType);
+            t.left    = static_cast<uint32_t>(r.left);
+            t.right   = static_cast<uint32_t>(r.right);
+
+            return module_.pool.put(ir::Item{ t });
+        }
+        if (ct.isUnpackedArray()) {
+            // TODO: dynamic arrays, queues, associative arrays (variable-size,
+            // need heap-backed runtime storage).
+            fail("dynamic / queue / associative arrays are not supported");
+        }
         if (!ct.isIntegral()) {
             fail("unsupported non-integral type");
         }
 
         return make_int_type(ct.getBitWidth(), ct.isFourState(), ct.isSigned());
+    }
+
+    // True if an expression's type is a fixed-size unpacked array (a memory).
+    static bool is_unpacked_array(const slang::ast::Expression& e) {
+        return e.type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() != nullptr;
     }
 
     // Intern a packed integer type of the given width / state / signedness.
@@ -1567,6 +1597,12 @@ private:
             // do not model it.
             fail("nonblocking assignment in a function is not supported");
         }
+        if (is_unpacked_array(a.left())) {
+            // TODO: whole-array assignment (mem1 = mem2, mem = '{...}). Needs an
+            // element-wise copy / aggregate lowering; only element assignment is
+            // supported today.
+            fail("whole unpacked array assignment is not supported");
+        }
         const ir::Index lhs = lower_lvalue(a.left(), b);
         const ir::Index rhs = lower_expr(a.right(), b);
         // StoreNb gets correct two-phase NBA semantics in the backend: the RHS is
@@ -1590,6 +1626,11 @@ private:
                 if (sym.kind == SymbolKind::Parameter) {
                     const ParameterSymbol& p = sym.as<ParameterSymbol>();
                     return b.constant(lower_constant(p.getValue(), p.getType()), l);
+                }
+                if (is_unpacked_array(expr)) {
+                    // TODO: reading a whole unpacked array as a value (array copy,
+                    // passing a memory by value). Only element reads are supported.
+                    fail("whole unpacked array read is not supported");
                 }
                 return b.unary(ir::Inst::Tag::Load, value_lvalue(sym, b, l), l);
             }
@@ -1623,7 +1664,10 @@ private:
                 const ElementSelectExpression& es   = expr.as<ElementSelectExpression>();
                 const ir::Index                base = lower_lvalue(es.value(), b);
                 const ir::Index                idx  = lower_expr(es.selector(), b);
-                return b.unary(ir::Inst::Tag::Load, b.binary(ir::Inst::Tag::BitSelect, base, idx, l), l);
+                const ir::Index                sel  = is_unpacked_array(es.value())
+                                   ? b.elem_select(base, idx, lower_type(*es.value().type), l)
+                                   : b.binary(ir::Inst::Tag::BitSelect, base, idx, l);
+                return b.unary(ir::Inst::Tag::Load, sel, l);
             }
             case ExpressionKind::RangeSelect: {
                 const RangeSelectExpression& rs = expr.as<RangeSelectExpression>();
@@ -1754,6 +1798,9 @@ private:
                 const ElementSelectExpression& es   = expr.as<ElementSelectExpression>();
                 const ir::Index                base = lower_lvalue(es.value(), b);
                 const ir::Index                idx  = lower_expr(es.selector(), b);
+                if (is_unpacked_array(es.value())) {
+                    return b.elem_select(base, idx, lower_type(*es.value().type), l);
+                }
                 return b.binary(ir::Inst::Tag::BitSelect, base, idx, l);
             }
             case ExpressionKind::RangeSelect: {
@@ -1853,6 +1900,11 @@ private:
     // Outside a function: a module Signal. Inside a function: a persistent Signal
     // for a static local, else a per-call frame Local.
     void declare_storage(const VariableSymbol& vs, bool force_frame) {
+        if (fn_ctx_ != nullptr && vs.getType().getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
+            // TODO: unpacked arrays as function-frame locals. The frame layout has no
+            // per-element array storage yet; only module-level memories are supported.
+            fail("unpacked array as a function local is not supported");
+        }
         if (fn_ctx_ == nullptr) {
             declare_local(vs);
         } else if (is_static_local(vs, force_frame)) {

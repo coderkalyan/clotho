@@ -75,6 +75,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
 
         case T::Mux:
         case T::PartSelect:
+        case T::ElemSelect:
         case T::Cond:
             return K::OpExtra;
     }
@@ -156,6 +157,15 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 scratch[1]     = mux.a;
                 scratch[2]     = mux.b;
                 return { scratch.data(), 3 };
+            }
+            // elem_select exposes its base and the index value (the index is read
+            // to compute the element address); the array-type handle is not an
+            // operand. The bounds of a part_select / regions of a cond are not.
+            if (tag == Inst::Tag::ElemSelect) {
+                const auto es = extra_data<ElemSelect>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = es.index;
+                return { scratch.data(), 2 };
             }
             scratch[0] = p.op_extra.op;
             return { scratch.data(), 1 };
