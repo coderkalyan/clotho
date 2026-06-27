@@ -150,6 +150,35 @@ constexpr code mul4(code a, code b) {
 constexpr uint32_t MUL1_LUT = build_lut(mul4); // 0xE0A20020
 static_assert(MUL1_LUT != XOR1_LUT, "1-bit mul must differ from xor (0*x = x, not 0)");
 
+// 1-bit divide: a/1 = a, but a zero divisor is X (like any divide-by-zero) and
+// any X operand is X. `~b & 1` is the divisor-known-zero term.
+constexpr code div4(code a, code b) {
+    const code uz = (((a ^ (a >> 1)) | (b ^ (b >> 1))) & 1u) | (~b & 1u); // X or b==0
+    const code k  = a & 1u;                                               // a / 1 = a
+    return (((uz | k) & 1u) << 1) | (~uz & k & 1u);
+}
+
+constexpr uint32_t DIV1_LUT = build_lut(div4); // 0xE2A20022
+
+// 1-bit modulo: a % 1 = 0 always; a zero divisor is X; any X operand is X.
+constexpr code mod4(code a, code b) {
+    const code uz = (((a ^ (a >> 1)) | (b ^ (b >> 1))) & 1u) | (~b & 1u); // X or b==0
+    const code k  = 0u;                                                   // a % 1 = 0
+    return (((uz | k) & 1u) << 1) | (~uz & k & 1u);
+}
+
+constexpr uint32_t MOD1_LUT = build_lut(mod4); // 0x22A20022
+static_assert(DIV1_LUT != MOD1_LUT, "1-bit div (=a) and mod (=0) must differ");
+
+// 1-bit power (unsigned): exp 0 -> 1, else base^1 = base; any X operand is X.
+constexpr code pow4(code a, code b) {
+    const code u = ((a ^ (a >> 1)) | (b ^ (b >> 1))) & 1u;
+    const code k = (b & 1u) ? (a & 1u) : 1u;                              // b ? a : 1
+    return (((u | k) & 1u) << 1) | (~u & k & 1u);
+}
+
+constexpr uint32_t POW1_LUT = build_lut(pow4); // 0xE3A20023
+
 // A resolved assignment target: a `{ i(2W) must|may, iW z }` pair somewhere in
 // memory (the module state buffer for a signal, or the per-call frame for a
 // function local) plus a bit offset / width selecting part of it. `bit_off` is an
@@ -2711,8 +2740,15 @@ private:
     // bit in either operand makes the whole result X.
     Plane lower_divmod(Inst::Tag tag, Plane a, Plane b, bool sign) {
         const uint32_t w      = width_of(a);
-        auto*          wide   = int_ty(2 * w);
         const bool     is_div = tag == Inst::Tag::Div;
+
+        // Width-1: index the truth table instead of branching. DIV1/MOD1 bake in
+        // the X rule and the divide-by-zero -> X case.
+        if (w == 1) {
+            return single_bit_lut(is_div ? DIV1_LUT : MOD1_LUT, a, b);
+        }
+
+        auto* wide = int_ty(2 * w);
 
         llvm::Value* am = must_of(a);
         llvm::Value* bm = must_of(b);
@@ -2773,9 +2809,16 @@ private:
     // result X, and the unsigned table corners (exp 0 -> 1, 0**n -> 0, 1**n -> 1)
     // fall out of exponentiation by squaring in rt_pow_u64.
     Plane lower_pow(Plane a, Plane b) {
-        const uint32_t w    = width_of(a);
-        const uint32_t ew   = width_of(b);
-        auto*          wide = int_ty(2 * w);
+        const uint32_t w  = width_of(a);
+        const uint32_t ew = width_of(b);
+
+        // Width-1 base and exponent: index the truth table (exp 0 -> 1, 1**n -> 1,
+        // 0**(n>0) -> 0, any X -> X). A wider exponent stays on the runtime path.
+        if (w == 1 && ew == 1) {
+            return single_bit_lut(POW1_LUT, a, b);
+        }
+
+        auto* wide = int_ty(2 * w);
 
         // X/Z in either operand -> all-X. The operands can differ in width, so each
         // mask is tested at its own width and the two feed one cold branch.

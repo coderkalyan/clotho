@@ -295,6 +295,84 @@ TEST_CASE("wide mul keeps the branching arithmetic path") {
     CHECK(ir.find("arith") != std::string::npos);
 }
 
+TEST_CASE("single-bit div/mod/pow use their own truth-table immediates, no branch") {
+    const std::string div = emit(R"(
+        module m(input logic a, input logic b, output logic y); assign y = a / b; endmodule
+    )");
+    CHECK(div.find("lshr i32 -492699614") != std::string::npos); // DIV1_LUT
+    CHECK(div.find("divmod.x") == std::string::npos);
+
+    const std::string mod = emit(R"(
+        module m(input logic a, input logic b, output logic y); assign y = a % b; endmodule
+    )");
+    CHECK(mod.find("lshr i32 581042210") != std::string::npos);  // MOD1_LUT
+    CHECK(mod.find("divmod.x") == std::string::npos);
+
+    const std::string pow = emit(R"(
+        module m(input logic a, input logic b, output logic y); assign y = a ** b; endmodule
+    )");
+    CHECK(pow.find("lshr i32 -475922397") != std::string::npos); // POW1_LUT
+    CHECK(pow.find("pow.x") == std::string::npos);
+}
+
+TEST_CASE("single-bit div agrees with LRM, including divide-by-zero and X") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a, b, y;
+            initial begin
+                a = 1'b1; b = 1'b1; y = a / b; $display("%b", y);
+                a = 1'b0; b = 1'b1; y = a / b; $display("%b", y);
+                a = 1'b1; b = 1'b0; y = a / b; $display("%b", y);
+                a = 1'bx; b = 1'b1; y = a / b; $display("%b", y);
+            end
+        endmodule
+    )";
+    // 1/1 = 1; 0/1 = 0; divide-by-zero = x; x / anything = x.
+    CHECK(run_capture(src) == "1\n0\nx\nx\n");
+}
+
+TEST_CASE("single-bit mod agrees with LRM, including divide-by-zero and X") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a, b, y;
+            initial begin
+                a = 1'b1; b = 1'b1; y = a % b; $display("%b", y);
+                a = 1'b0; b = 1'b1; y = a % b; $display("%b", y);
+                a = 1'b1; b = 1'b0; y = a % b; $display("%b", y);
+                a = 1'bx; b = 1'b1; y = a % b; $display("%b", y);
+            end
+        endmodule
+    )";
+    // a % 1 = 0; divide-by-zero = x; x % anything = x.
+    CHECK(run_capture(src) == "0\n0\nx\nx\n");
+}
+
+TEST_CASE("single-bit pow agrees with LRM, including X") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a, b, y;
+            initial begin
+                a = 1'b0; b = 1'b0; y = a ** b; $display("%b", y);
+                a = 1'b0; b = 1'b1; y = a ** b; $display("%b", y);
+                a = 1'b1; b = 1'b0; y = a ** b; $display("%b", y);
+                a = 1'bx; b = 1'b1; y = a ** b; $display("%b", y);
+            end
+        endmodule
+    )";
+    // 0**0 = 1; 0**1 = 0; 1**0 = 1; x ** anything = x.
+    CHECK(run_capture(src) == "1\n0\n1\nx\n");
+}
+
+TEST_CASE("wide div keeps the branching divmod path") {
+    const std::string ir = emit(R"(
+        module m(input logic [7:0] a, input logic [7:0] b, output logic [7:0] y);
+            assign y = a / b;
+        endmodule
+    )");
+    CHECK(ir.find("-492699614") == std::string::npos);
+    CHECK(ir.find("divmod") != std::string::npos);
+}
+
 TEST_CASE("delay suspends and reschedules on the wheel") {
     constexpr std::string_view src = R"(
         module d;
