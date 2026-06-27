@@ -500,3 +500,142 @@ TEST_CASE("$random lowers to an rt_random call") {
 
     CHECK(ir.find("call i32 @rt_random(") != std::string::npos);
 }
+
+TEST_CASE("unsigned divide and modulo truncate toward zero") {
+    const std::string out = run_capture(R"(
+        module m;
+            initial begin
+                logic [7:0] a, b;
+                a = 8'd200; b = 8'd3;
+                $display("%0d %0d", a / b, a % b);
+            end
+        endmodule
+    )");
+    CHECK(out == "66 2\n");
+}
+
+TEST_CASE("divide or modulo by zero yields x") {
+    const std::string out = run_capture(R"(
+        module m;
+            initial begin
+                logic [7:0] a, b;
+                a = 8'd17; b = 8'd0;
+                $display("%0d %0d", a / b, a % b);
+            end
+        endmodule
+    )");
+    CHECK(out == "x x\n");
+}
+
+TEST_CASE("an unknown operand makes divide and modulo x") {
+    const std::string out = run_capture(R"(
+        module m;
+            initial begin
+                logic [3:0] a, b;
+                a = 4'b001x; b = 4'd2;
+                $display("%0d %0d", a / b, a % b);
+            end
+        endmodule
+    )");
+    CHECK(out == "x x\n");
+}
+
+TEST_CASE("signed divide truncates toward zero and modulo takes the dividend sign") {
+    const std::string out = run_capture(R"(
+        module m;
+            initial begin
+                int a, b;
+                a = -7; b = 2;
+                $display("%0d %0d", a / b, a % b);
+            end
+        endmodule
+    )");
+    CHECK(out == "-3 -1\n");
+}
+
+TEST_CASE("signed INT_MIN divided by -1 wraps instead of trapping") {
+    const std::string out = run_capture(R"(
+        module m;
+            initial begin
+                logic signed [7:0] a, b;
+                a = -128; b = -1;
+                $display("%0d %0d", a / b, a % b);
+            end
+        endmodule
+    )");
+    // -128 / -1 overflows the 8-bit signed range and wraps back to -128; the
+    // remainder is 0.
+    CHECK(out == "-128 0\n");
+}
+
+TEST_CASE("unsigned power") {
+    const std::string out = run_capture(R"(
+        module m;
+            initial begin
+                logic [15:0] a, b;
+                a = 16'd3; b = 16'd4;
+                $display("%0d", a ** b);
+            end
+        endmodule
+    )");
+    CHECK(out == "81\n");
+}
+
+TEST_CASE("power wraps to the result width and handles the exponent corners") {
+    const std::string out = run_capture(R"(
+        module m;
+            initial begin
+                logic [7:0] a, e, z;
+                a = 8'd2; e = 8'd10; z = 8'd0;
+                $display("%0d %0d %0d", a ** e, a ** z, z ** e);
+            end
+        endmodule
+    )");
+    // 2**10 = 1024 = 0 mod 256; 2**0 = 1; 0**10 = 0.
+    CHECK(out == "0 1 0\n");
+}
+
+TEST_CASE("an unknown operand makes power x") {
+    const std::string out = run_capture(R"(
+        module m;
+            initial begin
+                logic [7:0] a, b;
+                a = 8'b0000_001x; b = 8'd3;
+                $display("%0d", a ** b);
+            end
+        endmodule
+    )");
+    CHECK(out == "x\n");
+}
+
+TEST_CASE("power lowers to an rt_pow_u64 call") {
+    const std::string ir = emit(R"(
+        module m;
+            initial begin
+                logic [7:0] a, b, c;
+                a = 8'd17; b = 8'd5;
+                c = a ** b;
+            end
+        endmodule
+    )");
+    CHECK(ir.find("call i64 @rt_pow_u64(") != std::string::npos);
+}
+
+TEST_CASE("unsupported divide/modulo/power forms are rejected, not miscompiled") {
+    // The backend refuses (returns no module) rather than silently emitting wrong
+    // code for the unimplemented corners: wide divide/modulo (needs 128-bit
+    // division libcalls), signed power, and wide power.
+    auto rejects = [](std::string_view src) {
+        const LowerResult r = lower_text(src);
+        REQUIRE_MESSAGE(r.ok, r.diagnostics);
+        REQUIRE(r.module != nullptr);
+        std::string              text;
+        llvm::raw_string_ostream os(text);
+        return !ir::emit_llvm(*r.module, os);
+    };
+
+    CHECK(rejects(R"(module m; initial begin logic [99:0] a, b, c; a = 1; b = 1; c = a / b; end endmodule)"));
+    CHECK(rejects(R"(module m; initial begin logic [99:0] a, b, c; a = 1; b = 1; c = a % b; end endmodule)"));
+    CHECK(rejects(R"(module m; initial begin int a, b, c; a = 2; b = 3; c = a ** b; end endmodule)"));
+    CHECK(rejects(R"(module m; initial begin logic [99:0] a, b, c; a = 2; b = 3; c = a ** b; end endmodule)"));
+}

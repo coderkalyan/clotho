@@ -206,6 +206,9 @@ struct Inst {
         Add,
         Sub,
         Mul,
+        Div,
+        Mod,
+        Pow,
 
         // -- Bitwise (payload: binary, except Bnot) --
         Band,

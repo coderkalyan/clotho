@@ -264,6 +264,22 @@ extern "C" int32_t rt_random(void) {
     return static_cast<int32_t>(gen());
 }
 
+extern "C" uint64_t rt_pow_u64(uint64_t base, uint64_t exp) {
+    // Exponentiation by squaring. All products wrap modulo 2^64, which is the
+    // correct result for any narrower width W since 2^W | 2^64. The unsigned
+    // LRM power-table corners fall out naturally: exp == 0 -> 1 (zero
+    // iterations), 0**(>0) -> 0, and 1**exp -> 1.
+    uint64_t result = 1;
+    while (exp != 0) {
+        if ((exp & 1u) != 0) {
+            result *= base;
+        }
+        base *= base;
+        exp >>= 1;
+    }
+    return result;
+}
+
 extern "C" void* rt_alloc(uint64_t size) {
     return std::malloc(size);
 }
