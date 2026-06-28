@@ -551,17 +551,24 @@ private:
 
     // Convert a slang SVInt into a pooled IR constant of the given type.
     ir::Ref svint_to_ref(const slang::SVInt& v, ir::Ref ty) {
-        if (!v.hasUnknown()) {
+        const uint32_t width = v.getBitWidth();
+        // Fast path: a known value that fits a machine word.
+        if (!v.hasUnknown() && width <= 64) {
             return module_.pool.put_int(ty, v.as<uint64_t>().value_or(0));
         }
 
-        const uint32_t        width = v.getBitWidth();
+        // General path: pack the raw words into val / xz planes. A wide (>64-bit)
+        // value heap-allocates even when fully known (e.g. a packed string literal
+        // like a 96-bit "hello world!"), so the fast path above must not swallow it
+        // via a 64-bit truncation. getRawPtr lays out value words, followed by the
+        // unknown words only when hasUnknown.
         const uint32_t        words = (width + 63) / 64;
         const uint64_t*       raw   = v.getRawPtr();
-        std::vector<uint64_t> planes(static_cast<size_t>(words) * 2);
+        const bool            unk   = v.hasUnknown();
+        std::vector<uint64_t> planes(static_cast<size_t>(words) * 2, 0);
         for (uint32_t i = 0; i < words; ++i) {
-            planes[i]         = raw[i] ^ raw[words + i]; // val plane (VPI)
-            planes[words + i] = raw[words + i];          // xz plane (unknown)
+            planes[i]         = unk ? (raw[i] ^ raw[words + i]) : raw[i]; // val plane (VPI)
+            planes[words + i] = unk ? raw[words + i] : 0;                 // xz plane (unknown)
         }
 
         const uint32_t       pb = ir::plane_bytes(width);
@@ -1660,6 +1667,19 @@ private:
         switch (expr.kind) {
             case ExpressionKind::IntegerLiteral:
                 return b.constant(lower_int_literal(expr.as<IntegerLiteral>()), l);
+            case ExpressionKind::StringLiteral: {
+                // A string literal is a packed array of 8-bit ASCII bytes (LRM 5.9);
+                // as an integral rvalue it is that packed value. slang folds it to an
+                // SVInt of the literal's 8*N-bit type; the surrounding conversion
+                // resizes it to the assignment context.
+                slang::ast::ASTContext  actx(*scope_, slang::ast::LookupLocation::max);
+                slang::ast::EvalContext ectx(actx);
+                const slang::ConstantValue cv = expr.eval(ectx);
+                if (!cv.isInteger()) {
+                    fail("non-integral string literal");
+                }
+                return b.constant(svint_to_ref(cv.integer(), lower_type(*expr.type)), l);
+            }
             case ExpressionKind::NamedValue: {
                 const ValueSymbol& sym = expr.as<NamedValueExpression>().symbol;
                 if (sym.kind == SymbolKind::Parameter) {

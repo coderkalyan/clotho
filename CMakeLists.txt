@@ -98,6 +98,7 @@ add_executable(clotho_test
   tests/case_test.cpp
   tests/function_test.cpp
   tests/task_test.cpp
+  tests/string_test.cpp
   tests/loop_test.cpp
   tests/generate_test.cpp
   tests/llvm_backend_test.cpp
