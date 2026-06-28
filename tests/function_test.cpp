@@ -294,14 +294,3 @@ TEST_CASE("function with an output argument is rejected") {
     )";
     CHECK(reject(src).find("output/inout/ref") != std::string::npos);
 }
-
-// A task enable consumes time / needs the scheduler; only functions are lowered.
-TEST_CASE("task enable is rejected") {
-    constexpr std::string_view src = R"(
-        module m;
-            task t(input int a); endtask
-            initial t(3);
-        endmodule
-    )";
-    CHECK(reject(src).find("task enable is not supported") != std::string::npos);
-}
