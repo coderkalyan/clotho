@@ -1378,3 +1378,69 @@ TEST_CASE("multiple tops share one timeline") {
     )");
     CHECK(out == "a@5\nb@10\n");
 }
+
+// Concatenation as an assignment target (LRM 11.4.12): the RHS bits partition
+// across the operands, leftmost taking the most-significant slice.
+TEST_CASE("concatenation lvalue distributes the RHS bits") {
+    // Plain split: hi gets the high nibble, lo the low nibble.
+    CHECK(run_capture(R"(
+        module m;
+            logic [3:0] hi, lo;
+            initial begin {hi, lo} = 8'hAB; $display("%h%h", hi, lo); end
+        endmodule
+    )") == "ab\n");
+
+    // Non-contiguous slices of one reg: a nibble swap, the canonical picorv32
+    // immediate-swizzle shape.
+    CHECK(run_capture(R"(
+        module m;
+            logic [7:0] r;
+            initial begin {r[3:0], r[7:4]} = 8'hAB; $display("%h", r); end
+        endmodule
+    )") == "ba\n");
+
+    // Uneven widths plus X distribution: each operand keeps the X bits of its slice.
+    CHECK(run_capture(R"(
+        module m;
+            logic x; logic [1:0] y; logic z;
+            initial begin {x, y, z} = 4'b10x1; $display("%b%b%b", x, y, z); end
+        endmodule
+    )") == "10x1\n");
+}
+
+// Nonblocking concat assignment samples the RHS once and commits each slice in
+// the NBA region; the values are visible after the time step.
+TEST_CASE("concatenation lvalue works for nonblocking assignment") {
+    CHECK(run_capture(R"(
+        module m;
+            logic [3:0] hi, lo;
+            initial begin {hi, lo} <= 8'hC3; #1 $display("%h%h", hi, lo); end
+        endmodule
+    )") == "c3\n");
+}
+
+// A concatenation operand may itself be a concatenation; the slice recurses.
+TEST_CASE("nested concatenation lvalue recurses") {
+    CHECK(run_capture(R"(
+        module m;
+            logic [1:0] a, b; logic [3:0] c;
+            initial begin { {a, b}, c } = 8'hD7; $display("%h%h%h", a, b, c); end
+        endmodule
+    )") == "317\n");
+}
+
+// The picorv32 RISC-V J-immediate swizzle (picorv32.v:880): one assignment
+// scatters a sign-extended source across non-contiguous fields of one register.
+// Reference output cross-checked against iverilog.
+TEST_CASE("concatenation lvalue lowers the picorv32 J-immediate swizzle") {
+    CHECK(run_capture(R"(
+        module m;
+            reg [31:0] decoded_imm_j;
+            initial begin
+                { decoded_imm_j[31:20], decoded_imm_j[10:1], decoded_imm_j[11],
+                  decoded_imm_j[19:12], decoded_imm_j[0] } = $signed({20'hABCDE, 1'b0});
+                $display("%h", decoded_imm_j);
+            end
+        endmodule
+    )") == "fffde2bc\n");
+}
