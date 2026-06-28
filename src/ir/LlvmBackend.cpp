@@ -3231,8 +3231,10 @@ private:
 
     // Lower a $display / $write: stack-allocate an rt_arg[] descriptor array, pack
     // each value operand's planes into it, and call the runtime formatter.
-    // TODO: each operand's planes are truncated to the low 64 bits (rt_arg is
-    // i64), so values wider than 64 bits print silently wrong. Pass full width.
+    // TODO: rt_arg carries only the low 64 bits of each plane, so an operand wider
+    // than 64 bits cannot be passed in full. Until the descriptor grows a
+    // full-width path, such an operand is loud-failed below rather than printed
+    // with its high bits silently dropped (docs/TODO.md, M1 $display).
     void lower_display(Index i) {
         const auto  info = ir_->extra_data<DisplayInfo>(ir_->payload(i).display);
         std::string fmt  = ir_->extra_bytes(info.fmt, info.fmt_len);
@@ -3250,6 +3252,10 @@ private:
             for (uint32_t k = 0; k < n; ++k) {
                 const Plane   p    = value_of(args[k]);
                 const ValType t    = type_of(args[k]);
+                if (t.width > 64) {
+                    throw BackendError{ "$display / $write of an operand wider than 64 bits is not "
+                                        "supported (it would print with its high bits truncated)" };
+                }
                 llvm::Value*  must = must_of(p);
                 llvm::Value*  may  = may_of(p);
                 // xz = must ^ may marks every unknown bit (X and Z); z marks the Z
