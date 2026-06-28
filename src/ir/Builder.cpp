@@ -115,6 +115,13 @@ Index Builder::call(FunctionId func, std::span<const Index> args, SourceLoc loc)
     return emit({ Inst::Tag::Call, Inst::Payload{ .extra = extra } }, loc);
 }
 
+Index Builder::task_call(FunctionId func, std::span<const Index> args, SourceLoc loc) {
+    const ExtraSlice slice = add_slice(args);
+    const ExtraIndex extra = add_extra(TaskCallInfo{ func, slice });
+
+    return emit({ Inst::Tag::TaskCall, Inst::Payload{ .extra = extra } }, loc);
+}
+
 Index Builder::display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc) {
     // Order in the extra buffer: format bytes, then the arg-index slice, then the
     // DisplayInfo record pointing at both. None of the three regions overlap.

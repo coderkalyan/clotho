@@ -310,15 +310,20 @@ public:
         build_sched_flags();
         build_nba_state();
 
-        // Functions: declare every one up front (so calls resolve, including
-        // recursion and forward references), then lower their bodies.
+        // Functions and tasks: declare every one up front (so calls resolve,
+        // including recursion and forward references), then lower their bodies. A
+        // task is a coroutine (lower_task); a function is a plain call.
         const size_t nf = mod_.function_count();
         fn_decls_.assign(nf, nullptr);
         for (uint32_t i = 0; i < nf; ++i) {
             fn_decls_[i] = declare_function(static_cast<FunctionId>(i));
         }
         for (uint32_t i = 0; i < nf; ++i) {
-            lower_function(static_cast<FunctionId>(i));
+            if (mod_.function(static_cast<FunctionId>(i)).is_task) {
+                lower_task(static_cast<FunctionId>(i));
+            } else {
+                lower_function(static_cast<FunctionId>(i));
+            }
         }
 
         // Lower every process and seed every one at startup. An `initial` runs its
@@ -592,6 +597,8 @@ private:
         fn_->addParamAttr(0, llvm::Attribute::NoAlias);
         awaiter_     = nullptr;
         nba_scratch_ = nullptr;
+        record_      = nullptr;
+        cur_is_task_ = false;
 
         auto* none     = llvm::ConstantTokenNone::get(ctx_);
         auto* null     = llvm::ConstantPointerNull::get(ptr_ty);
@@ -726,7 +733,10 @@ private:
     // Create (but do not yet lower) a function's declaration, so calls — including
     // recursive and forward ones — resolve before any body is emitted.
     llvm::Function* declare_function(FunctionId id) {
-        const Function&          f   = mod_.function(id);
+        const Function& f = mod_.function(id);
+        if (f.is_task) {
+            return declare_task(id);
+        }
         auto*                    ptr = llvm::PointerType::getUnqual(ctx_);
         std::vector<llvm::Type*> params;
         params.push_back(ptr); // state
@@ -740,6 +750,48 @@ private:
                                             mod_.name + ".fn." + f.name, llmod_);
         fn->addParamAttr(0, llvm::Attribute::NoAlias);
         return fn;
+    }
+
+    // A task is a switched-resume coroutine. Its signature is:
+    //   ptr @<mod>.task.<name>(ptr noalias state, ptr wheel,
+    //                          <per formal>, ptr record)
+    // where each input formal contributes (i(2W) mm, iW z) value planes and each
+    // output / inout formal contributes (ptr mm_ptr, ptr z_ptr) into a caller temp.
+    // `record` is a { ptr parent } slot: the body stores the completing coroutine's
+    // continuation there (see lower_task / lower_task_call_inst). It returns the
+    // coroutine handle, like a process.
+    llvm::Function* declare_task(FunctionId id) {
+        const Function&          f   = mod_.function(id);
+        auto*                    ptr = llvm::PointerType::getUnqual(ctx_);
+        std::vector<llvm::Type*> params;
+        params.push_back(ptr); // state
+        params.push_back(ptr); // wheel
+        for (size_t k = 0; k < f.param_types.size(); ++k) {
+            if (f.arg_dirs[k] == ArgDir::In) {
+                const uint32_t w = width_of(f.param_types[k]);
+                params.push_back(int_ty(2 * w)); // must|may
+                params.push_back(int_ty(w));     // z
+            } else {
+                params.push_back(ptr); // &caller_temp.mm
+                params.push_back(ptr); // &caller_temp.z
+            }
+        }
+        params.push_back(ptr); // record { ptr parent }
+        auto* fnty = llvm::FunctionType::get(ptr, params, false);
+        auto* fn   = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage,
+                                            mod_.name + ".task." + f.name, llmod_);
+        fn->setPresplitCoroutine();
+        fn->addParamAttr(0, llvm::Attribute::NoAlias);
+        return fn;
+    }
+
+    // LLVM param index of formal k's first parameter (state, wheel, then 2 per
+    // formal). The record slot follows all formals.
+    static uint32_t task_param_base(uint32_t k) {
+        return 2 + 2 * k;
+    }
+    uint32_t task_record_param(const Function& f) const {
+        return 2 + 2 * static_cast<uint32_t>(f.param_types.size());
     }
 
     // Lay out a function's frame locals into one stack buffer, packed in
@@ -794,6 +846,7 @@ private:
         const Function& f = mod_.function(id);
         ir_               = &f.ir;
         cur_fn_           = &f;
+        cur_is_task_      = false;
         build_frame_layout(f);
 
         fn_            = fn_decls_[static_cast<uint32_t>(id)];
@@ -827,6 +880,170 @@ private:
 
         cur_fn_ = nullptr;
         frame_  = nullptr;
+    }
+
+    // -- Tasks --
+    //
+    // A task is a switched-resume coroutine (like a process) that also carries a
+    // per-call frame (like a function). The ramp builds the frame and parks at the
+    // initial suspend; the caller (a process or another task) drives it via
+    // lower_task_call_inst. The body may suspend on #delay / @event, in which case
+    // the caller suspends too; on completion the task copies output / inout formals
+    // back through their pointers and resumes the caller (the record's parent).
+    void lower_task(FunctionId id) {
+        const Function& f = mod_.function(id);
+        ir_               = &f.ir;
+        cur_fn_           = &f;
+        cur_is_task_      = true;
+        build_frame_layout(f);
+
+        fn_            = fn_decls_[static_cast<uint32_t>(id)];
+        const size_t n = ir_->inst_count();
+        values_.assign(n, Plane{});
+        lvals_.assign(n, std::optional<LValue>{});
+        types_.assign(n, std::optional<ValType>{});
+
+        auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
+        state_       = fn_->getArg(0);
+        state_->setName("state");
+        wheel_ = fn_->getArg(1);
+        wheel_->setName("wheel");
+        awaiter_ = nullptr;
+        record_  = nullptr;
+
+        auto* none     = llvm::ConstantTokenNone::get(ctx_);
+        auto* null     = llvm::ConstantPointerNull::get(ptr_ty);
+        auto* entry    = llvm::BasicBlock::Create(ctx_, "entry", fn_);
+        auto* alloc_bb = llvm::BasicBlock::Create(ctx_, "coro.alloc", fn_);
+        auto* begin_bb = llvm::BasicBlock::Create(ctx_, "coro.begin", fn_);
+
+        b_.SetInsertPoint(entry);
+        auto* cid  = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_id), { b_.getInt32(0), null, null, null });
+        auto* need = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_alloc), { cid });
+        b_.CreateCondBr(need, alloc_bb, begin_bb);
+
+        b_.SetInsertPoint(alloc_bb);
+        auto* size = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_size, { b_.getInt64Ty() }), {});
+        auto* mem  = b_.CreateCall(alloc_fn(), { size });
+        b_.CreateBr(begin_bb);
+
+        b_.SetInsertPoint(begin_bb);
+        auto* frame_phi = b_.CreatePHI(ptr_ty, 2);
+        frame_phi->addIncoming(null, entry);
+        frame_phi->addIncoming(mem, alloc_bb);
+        hdl_        = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_begin), { cid, frame_phi });
+        coro_begin_ = llvm::cast<llvm::Instruction>(hdl_);
+
+        // Frame buffer and the task's own scheduled flag, placed just after
+        // coro.begin so CoroSplit spills them into the coroutine frame (both live
+        // across suspends; the frame's address escapes to callees). The flag backs
+        // intra-body @event waits, exactly like a process's proc_sched slot.
+        auto* fbuf_ty = llvm::ArrayType::get(b_.getInt8Ty(), frame_bytes_);
+        frame_        = b_.CreateAlloca(fbuf_ty, nullptr, "frame");
+        llvm::cast<llvm::AllocaInst>(frame_)->setAlignment(llvm::Align(8));
+        sched_ptr_ = b_.CreateAlloca(b_.getInt32Ty(), nullptr, "task_sched");
+
+        auto* trap_bb    = llvm::BasicBlock::Create(ctx_, "coro.trap", fn_);
+        auto* free_bb    = llvm::BasicBlock::Create(ctx_, "coro.free", fn_);
+        coro_cleanup_bb_ = llvm::BasicBlock::Create(ctx_, "coro.cleanup", fn_);
+        coro_ret_bb_     = llvm::BasicBlock::Create(ctx_, "coro.ret", fn_);
+
+        b_.SetInsertPoint(coro_cleanup_bb_);
+        auto* freed = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_free), { cid, hdl_ });
+        b_.CreateCondBr(b_.CreateICmpNE(freed, null), free_bb, coro_ret_bb_);
+
+        b_.SetInsertPoint(free_bb);
+        b_.CreateCall(free_fn(), { freed });
+        b_.CreateBr(coro_ret_bb_);
+
+        b_.SetInsertPoint(coro_ret_bb_);
+        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_end), { hdl_, b_.getFalse(), none });
+        b_.CreateRet(hdl_);
+
+        // Initial suspend: park after building the frame, return the handle without
+        // running the body. The caller runs the body on the first resume (case 0).
+        b_.SetInsertPoint(begin_bb);
+        auto* start_bb = llvm::BasicBlock::Create(ctx_, "coro.start", fn_);
+        auto* init     = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { none, b_.getFalse() });
+        auto* sw_init  = b_.CreateSwitch(init, coro_ret_bb_, 2);
+        sw_init->addCase(b_.getInt8(0), start_bb);
+        sw_init->addCase(b_.getInt8(1), coro_cleanup_bb_);
+
+        // The completion epilogue and the final suspend are shared by the
+        // fall-through end and every explicit `return` (lower_ret branches here).
+        auto* epilogue_bb = llvm::BasicBlock::Create(ctx_, "task.epilogue", fn_);
+        auto* final_bb    = llvm::BasicBlock::Create(ctx_, "coro.final", fn_);
+        task_epilogue_bb_ = epilogue_bb;
+
+        // Body: initialize the frame, copy parameters in (per direction), then run.
+        b_.SetInsertPoint(start_bb);
+        init_frame();
+        emit_task_copyin(f);
+        lower_region(ir_->root());
+        branch_to(epilogue_bb);
+
+        // Epilogue: copy output / inout formals back through their pointers, then
+        // resume the caller (the record's parent, if any) and fall into the final
+        // suspend. In the synchronous path the caller never wrote a parent (it reads
+        // the task `done` and resumes inline), so the load is null and nothing is
+        // enqueued; in the blocked path the caller stored its handle before
+        // suspending, so we push it onto the active queue here.
+        b_.SetInsertPoint(epilogue_bb);
+        emit_task_copyout(f);
+        llvm::Value* parent = b_.CreateLoad(ptr_ty, fn_->getArg(task_record_param(f)));
+        auto*        has_bb = llvm::BasicBlock::Create(ctx_, "task.wake", fn_);
+        b_.CreateCondBr(b_.CreateICmpNE(parent, null), has_bb, final_bb);
+        b_.SetInsertPoint(has_bb);
+        emit_active_push(b_, parent);
+        b_.CreateBr(final_bb);
+
+        b_.SetInsertPoint(final_bb);
+        auto* res = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { none, b_.getTrue() });
+        auto* sw  = b_.CreateSwitch(res, coro_ret_bb_, 2);
+        sw->addCase(b_.getInt8(0), trap_bb);
+        sw->addCase(b_.getInt8(1), coro_cleanup_bb_);
+
+        b_.SetInsertPoint(trap_bb);
+        b_.CreateUnreachable();
+
+        cur_fn_           = nullptr;
+        cur_is_task_      = false;
+        frame_            = nullptr;
+        task_epilogue_bb_ = nullptr;
+    }
+
+    // Prologue: copy each formal's parameter into its frame Local (Local k == formal
+    // k). Inputs read their value planes; inouts load through their caller pointer;
+    // outputs keep the frame's default (X / 0) until the body assigns them.
+    void emit_task_copyin(const Function& f) {
+        for (uint32_t k = 0; k < f.param_types.size(); ++k) {
+            const uint32_t w    = width_of(f.param_types[k]);
+            const uint32_t base = task_param_base(k);
+            if (f.arg_dirs[k] == ArgDir::In) {
+                lower_store(local_lvalue(k), Plane{ fn_->getArg(base), fn_->getArg(base + 1) }, from_ref(f.param_types[k]));
+            } else if (f.arg_dirs[k] == ArgDir::Inout) {
+                llvm::Value* mm =
+                  b_.CreateAlignedLoad(int_ty(2 * w), fn_->getArg(base), llvm::Align(field_align(2 * w)));
+                llvm::Value* z =
+                  b_.CreateAlignedLoad(int_ty(w), fn_->getArg(base + 1), llvm::Align(field_align(w)));
+                lower_store(local_lvalue(k), Plane{ mm, z }, from_ref(f.param_types[k]));
+            }
+        }
+    }
+
+    // Epilogue: copy each output / inout formal's frame Local back through its
+    // caller pointer (LRM 13.5 copy-out at completion).
+    void emit_task_copyout(const Function& f) {
+        for (uint32_t k = 0; k < f.param_types.size(); ++k) {
+            if (f.arg_dirs[k] == ArgDir::In) {
+                continue;
+            }
+            const uint32_t w    = width_of(f.param_types[k]);
+            const uint32_t base = task_param_base(k);
+            const Plane    v    = lower_load(local_lvalue(k));
+            b_.CreateAlignedStore(v.mm, fn_->getArg(base), llvm::Align(field_align(2 * w)));
+            b_.CreateAlignedStore(v.z, fn_->getArg(base + 1), llvm::Align(field_align(w)));
+        }
     }
 
     // The awaiter embedded in the coroutine frame for #delay: an rt_timer
@@ -1093,6 +1310,39 @@ private:
                     if (!dup) {
                         seen.emplace_back(s, e);
                         c.dyn[static_cast<uint32_t>(s)][e]++;
+                    }
+                }
+            }
+        }
+
+        // Tasks also do intra-body @event waits, but a task is a coroutine created
+        // per call and not counted above. Without fork, each process is a single
+        // call-stack, so at most one task frame per process chain is suspended on a
+        // given (signal, edge) at once — bound the extra dynamic slots by the
+        // process count for every (signal, edge) any task waits on. (#delay uses the
+        // wheel, not these queues, so it needs no capacity here.)
+        const auto chains = static_cast<uint32_t>(mod_.processes().size());
+        if (chains > 0) {
+            std::vector<std::array<bool, 3>> task_waits(n, { false, false, false });
+            for (size_t fi = 0; fi < mod_.function_count(); ++fi) {
+                const Function& f = mod_.function(static_cast<FunctionId>(fi));
+                if (!f.is_task) {
+                    continue;
+                }
+                for (size_t i = 0; i < f.ir.inst_count(); ++i) {
+                    const auto idx = static_cast<Index>(i);
+                    if (f.ir.tag(idx) != Inst::Tag::Wait) {
+                        continue;
+                    }
+                    for (const WaitEdge& we : f.ir.wait_edges(f.ir.payload(idx).wait)) {
+                        task_waits[static_cast<uint32_t>(we.signal)][we.edge] = true;
+                    }
+                }
+            }
+            for (uint32_t s = 0; s < n; ++s) {
+                for (uint32_t e = 0; e < 3; ++e) {
+                    if (task_waits[s][e]) {
+                        c.dyn[s][e] += chains;
                     }
                 }
             }
@@ -1512,6 +1762,10 @@ private:
         }
         auto*      ptr_ty = llvm::PointerType::getUnqual(ctx_);
         auto*      i32    = llvm::Type::getInt32Ty(ctx_);
+        // One slot per process suffices even with tasks: the queue is a LIFO drained
+        // to empty each region, and (without fork) each process is a single
+        // call-stack with at most one ready coroutine at a time — a task handle, or
+        // the parent it re-enqueues on completion, reuses that chain's one slot.
         const auto cap    = std::max<size_t>(mod_.processes().size(), 1);
 
         queue_arr_ty_ = llvm::ArrayType::get(ptr_ty, cap);
@@ -2250,6 +2504,7 @@ private:
             case Inst::Tag::Display:
             case Inst::Tag::TimeFormat:
             case Inst::Tag::Finish:
+            case Inst::Tag::TaskCall:
                 return { 0, false, false };
         }
         return { 0, false, false };
@@ -2536,6 +2791,9 @@ private:
                 return;
             case Inst::Tag::Call:
                 lower_call_inst(i);
+                return;
+            case Inst::Tag::TaskCall:
+                lower_task_call_inst(i);
                 return;
         }
     }
@@ -2859,6 +3117,12 @@ private:
     // A void function ignores the operand and returns void; otherwise the result
     // is packed into the `{ i(2W), iW }` return struct.
     void lower_ret(Index value) {
+        if (cur_is_task_) {
+            // A task is a coroutine: `return` runs the copy-out + caller-resume
+            // epilogue and falls into the final suspend, never a real `ret`.
+            b_.CreateBr(task_epilogue_bb_);
+            return;
+        }
         if (cur_fn_->return_type == mod_.pool.void_type) {
             b_.CreateRetVoid();
             return;
@@ -2888,6 +3152,81 @@ private:
         if (mod_.function(ci.func).return_type != mod_.pool.void_type) {
             set_value(i, Plane{ b_.CreateExtractValue(r, { 0 }), b_.CreateExtractValue(r, { 1 }) });
         }
+    }
+
+    // The caller's record slot { ptr parent }: a single ptr alloca placed after the
+    // caller's coro.begin (so it is frame-resident across the task-call suspend) and
+    // reused by every task call in this coroutine — a coroutine is in at most one
+    // task call at a time. The task writes nothing to it on a synchronous return; on
+    // a blocking call the caller stores its handle here before suspending and the
+    // task reads it to resume the caller on completion.
+    llvm::Value* record_slot() {
+        if (record_ == nullptr) {
+            llvm::IRBuilder<> ab(coro_begin_->getParent(), std::next(coro_begin_->getIterator()));
+            record_ = ab.CreateAlloca(llvm::PointerType::getUnqual(ctx_), nullptr, "task_record");
+        }
+        return record_;
+    }
+
+    // Lower a task enable (LRM 13.3). Create the task coroutine, copy inputs in /
+    // pass output-inout temp pointers, drive it once, and either finish inline (the
+    // task consumed no time) or park the caller until the task completes and resumes
+    // it. Only valid inside a coroutine — the frontend never emits a TaskCall in a
+    // plain function.
+    void lower_task_call_inst(Index i) {
+        const auto      ti = ir_->extra_data<TaskCallInfo>(ir_->payload(i).extra);
+        const Function& tf = mod_.function(ti.func);
+        llvm::Function* cf = fn_decls_[static_cast<uint32_t>(ti.func)];
+        auto*           ptr_ty = llvm::PointerType::getUnqual(ctx_);
+        auto*           null   = llvm::ConstantPointerNull::get(ptr_ty);
+
+        // Reset the record so a synchronous task reads a null parent (no enqueue).
+        llvm::Value* record = record_slot();
+        b_.CreateStore(null, record);
+
+        // Ramp arguments: state, wheel, per-formal planes / pointers, record.
+        const std::span<const Index> args = ir_->region(ti.args);
+        std::vector<llvm::Value*>    argv;
+        argv.push_back(state_);
+        argv.push_back(wheel_);
+        for (uint32_t k = 0; k < args.size(); ++k) {
+            if (tf.arg_dirs[k] == ArgDir::In) {
+                const Plane pl = value_of(args[k]);
+                argv.push_back(pl.mm);
+                argv.push_back(pl.z);
+            } else {
+                // An output / inout temp: pass pointers to its mm and z planes.
+                const LValue& lv = lvalue_of(args[k]);
+                argv.push_back(field_ptr(lv.base, lv.off_mm));
+                argv.push_back(field_ptr(lv.base, lv.off_z));
+            }
+        }
+        argv.push_back(record);
+
+        llvm::Value* task_hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
+        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { task_hdl });
+        llvm::Value* done = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_done), { task_hdl });
+
+        auto* sync_bb  = llvm::BasicBlock::Create(ctx_, "task.sync", fn_);
+        auto* async_bb = llvm::BasicBlock::Create(ctx_, "task.async", fn_);
+        auto* cont_bb  = llvm::BasicBlock::Create(ctx_, "task.cont", fn_);
+        b_.CreateCondBr(done, sync_bb, async_bb);
+
+        // Synchronous: the task ran to completion with no time. It already copied
+        // outputs back; destroy it and continue inline.
+        b_.SetInsertPoint(sync_bb);
+        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { task_hdl });
+        b_.CreateBr(cont_bb);
+
+        // Blocked: record our handle so the task resumes us when it completes, then
+        // suspend. The task drives itself through the wheel / wait queues and the
+        // scheduler destroys it on completion (coro.done in the drain loop).
+        b_.SetInsertPoint(async_bb);
+        b_.CreateStore(hdl_, record);
+        emit_suspend("task.resume");
+        b_.CreateBr(cont_bb);
+
+        b_.SetInsertPoint(cont_bb);
     }
 
     // Lower a $display / $write: stack-allocate an rt_arg[] descriptor array, pack
@@ -3685,12 +4024,19 @@ private:
     // Function declarations, indexed by FunctionId; filled before any body is
     // lowered so calls (including recursive / forward) resolve.
     std::vector<llvm::Function*> fn_decls_;
-    // Set while lowering a function body (null during a process). `frame_` is the
-    // current call's stack frame buffer; `frame_slots_` / `frame_bytes_` its layout.
+    // Set while lowering a function or task body (null during a process). `frame_`
+    // is the current call's frame buffer; `frame_slots_` / `frame_bytes_` its
+    // layout. `cur_is_task_` selects the coroutine return path (epilogue) for Ret.
     const Function*         cur_fn_      = nullptr;
+    bool                    cur_is_task_ = false;
     llvm::Value*            frame_       = nullptr;
     std::vector<FrameSlot>  frame_slots_;
     uint32_t                frame_bytes_ = 1;
+    // While lowering a task: the shared copy-out + caller-resume epilogue block a
+    // Ret branches to. The caller-side record slot { ptr parent } for task calls
+    // this coroutine makes (a process or a task can be a task caller).
+    llvm::BasicBlock*       task_epilogue_bb_ = nullptr;
+    llvm::AllocaInst*       record_           = nullptr;
 
     // Per-process scratch, reset in lower_process.
     const Ir*           ir_         = nullptr;
@@ -3706,8 +4052,9 @@ private:
     llvm::AllocaInst*   nba_scratch_ = nullptr;
     llvm::BasicBlock*   coro_cleanup_bb_ = nullptr;
     llvm::BasicBlock*   coro_ret_bb_     = nullptr;
-    // &clotho.proc_sched[this process], set per process in lower_process.
-    llvm::Constant*     sched_ptr_       = nullptr;
+    // The current coroutine's scheduled flag: &clotho.proc_sched[this process] for
+    // a process (a Constant GEP), or a frame-resident i32 alloca for a task.
+    llvm::Value*        sched_ptr_       = nullptr;
     // The shared timer callback (pushes a woken handle onto the active queue) and
     // the active/inactive queue globals, all built once per module. The inactive
     // queue holds processes parked on a zero delay (#0): drained into active at

@@ -136,6 +136,8 @@ const char* tag_name(Inst::Tag tag) {
             return "ret";
         case T::Call:
             return "call";
+        case T::TaskCall:
+            return "task_call";
         case T::Loop:
             return "loop";
         case T::Delay:
@@ -283,6 +285,15 @@ private:
                 const auto ci = ir_.extra_data<CallInfo>(p.extra);
                 os_ << "fn" << static_cast<uint32_t>(ci.func);
                 for (Index a : ir_.region(ci.args)) {
+                    os_ << ", ";
+                    ref(a);
+                }
+                break;
+            }
+            case Inst::PayloadKind::TaskCall: {
+                const auto ti = ir_.extra_data<TaskCallInfo>(p.extra);
+                os_ << "task" << static_cast<uint32_t>(ti.func);
+                for (Index a : ir_.region(ti.args)) {
                     os_ << ", ";
                     ref(a);
                 }

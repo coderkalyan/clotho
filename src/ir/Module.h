@@ -88,22 +88,42 @@ struct Process {
     Ir ir;
 };
 
-// A lowered SystemVerilog function: a real callable, not inlined. Its body is an
-// Ir whose leaves are Arg (parameters), Local (frame storage), and Signal (module
-// signals it references); it ends every path in a Ret. The backend emits one LLVM
-// function per Function, called at each `call` site, so recursion and `automatic`
-// lifetime fall out of normal stack frames.
+// Direction of a task formal argument (LRM 13.5). A function's arguments are all
+// In; only tasks carry Out / Inout, which copy the formal back to the caller at
+// task completion. (ref is rejected by the frontend for now.)
+enum class ArgDir : uint8_t {
+    // Copy in at call (input).
+    In,
+    // Copy out at completion (output).
+    Out,
+    // Copy in at call and out at completion (inout).
+    Inout,
+};
+
+// A lowered SystemVerilog function or task. Its body is an Ir whose leaves are
+// Arg (parameters), Local (frame storage), and Signal (module signals it
+// references); it ends every path in a Ret. A function becomes one plain LLVM
+// function called at each `call` site (recursion / `automatic` lifetime fall out
+// of normal stack frames). A task (is_task) becomes a switched-resume coroutine,
+// like a process, so it can consume time (#delay / @event); it is driven at each
+// `task_call` site and blocks the caller until it completes (LRM 13.3).
 struct Function {
-    // Function name (for the emitted symbol and diagnostics).
+    // Function / task name (for the emitted symbol and diagnostics).
     std::string name;
-    // Return type; `pool.void_type` for a void function (no return value).
+    // Return type; `pool.void_type` for a void function (no return value). A task
+    // is always void.
     Ref return_type = Ref::Invalid;
-    // Parameter types, in declaration order (inputs only for now). The frontend
-    // resizes each call argument to the matching type.
+    // Parameter types, in declaration order. The frontend resizes each input call
+    // argument to the matching type; output / inout arguments pass by pointer.
     std::vector<Ref> param_types;
+    // Direction of each parameter, parallel to param_types. Empty for a function
+    // (all inputs); populated for a task.
+    std::vector<ArgDir> arg_dirs;
     // Storage type of every frame local, indexed by the Local handle's index:
     // the parameter copies, the return variable, and body-local declarations.
     std::vector<Ref> local_types;
+    // True for a task: lowered as a coroutine that may suspend on timing controls.
+    bool is_task = false;
     // The lowered body.
     Ir ir;
 };

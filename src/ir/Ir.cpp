@@ -64,6 +64,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::Extra;
         case T::Call:
             return K::Call;
+        case T::TaskCall:
+            return K::TaskCall;
         case T::Display:
             return K::Display;
         case T::TimeFormat:
@@ -102,6 +104,13 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
             // call: its arguments are the SSA operands; the callee handle is not.
             const auto ci = extra_data<CallInfo>(p.extra);
             return index_slice(ci.args);
+        }
+
+        case Inst::PayloadKind::TaskCall: {
+            // task_call: its per-formal operands (values and lvalue temps) are the
+            // SSA operands; directions / the callee handle are not.
+            const auto ti = extra_data<TaskCallInfo>(p.extra);
+            return index_slice(ti.args);
         }
 
         case Inst::PayloadKind::Unary:

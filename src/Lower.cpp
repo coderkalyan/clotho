@@ -1005,6 +1005,11 @@ private:
             case StatementKind::Return:
                 lower_return(stmt.as<ReturnStatement>(), b);
                 break;
+            case StatementKind::Disable:
+            case StatementKind::DisableFork:
+                // TODO: disable — unwinding a suspended task coroutine and clearing
+                // its wheel / wait-queue registrations is not modeled yet.
+                fail("disable is not supported");
             default:
                 fail("unsupported statement");
         }
@@ -1333,9 +1338,9 @@ private:
 
     void lower_call(const CallExpression& call, ir::Builder& b) {
         if (!call.isSystemCall()) {
-            // A user function invoked as a statement: void, or a non-void function
-            // whose result is discarded. Lower the call for its side effects (a
-            // function may write module signals). A task is rejected in lower_user_call.
+            // A user subroutine invoked as a statement: a function (void, or a
+            // non-void whose result is discarded) or a task enable. Lower for side
+            // effects; lower_user_call routes a task to lower_task_call.
             lower_user_call(call, b);
             return;
         }
@@ -1445,10 +1450,11 @@ private:
         const std::string_view name = call.getSubroutineName();
         const ir::SourceLoc    l    = loc(call);
 
-        if (fn_ctx_ != nullptr && (name == "$time" || name == "$stime")) {
+        if (fn_ctx_ != nullptr && !fn_ctx_->is_task && (name == "$time" || name == "$stime")) {
             // A function is a plain callable with no wheel pointer in its ABI, so
             // it cannot read the simulation clock. Reject rather than emit a
-            // SimTime that would dereference a stale wheel.
+            // SimTime that would dereference a stale wheel. A task is a coroutine
+            // and does carry the wheel, so $time is allowed there.
             // TODO: thread the wheel into the function ABI to support this.
             fail("$time / $stime inside a function is not supported");
         }
@@ -1593,9 +1599,11 @@ private:
         }
         if (a.isNonBlocking() && fn_ctx_ != nullptr) {
             // A function consumes no time, so a nonblocking assignment in one has no
-            // deferred region to commit into. slang permits it in limited cases; we
-            // do not model it.
-            fail("nonblocking assignment in a function is not supported");
+            // deferred region to commit into. A task could host one (it is a
+            // coroutine), but wiring its NBA staging through the task frame is not
+            // done yet.
+            // TODO: nonblocking assignment inside a task.
+            fail("nonblocking assignment in a function/task is not supported");
         }
         if (is_unpacked_array(a.left())) {
             // TODO: whole-array assignment (mem1 = mem2, mem = '{...}). Needs an
@@ -1864,6 +1872,9 @@ private:
         // Name qualifier (e.g. "f.") prepended to a static local's signal name so
         // same-named statics in different functions stay distinct.
         std::string name_prefix;
+        // True while lowering a task body (a coroutine): unlike a function, timing
+        // controls and $time are allowed.
+        bool is_task = false;
     };
 
     // Get (creating if needed) the frame Local index for a function-local symbol.
@@ -1961,33 +1972,96 @@ private:
         }
     }
 
-    // Resolve a subroutine to a FunctionId, lowering its body on first reference.
-    // The id is reserved before the body is built so a recursive call resolves it.
+    // Resolve a subroutine (function or task) to a FunctionId, lowering its body
+    // on first reference. The id is reserved before the body is built so a
+    // recursive call resolves it.
     ir::FunctionId function_id(const SubroutineSymbol& sub) {
         const auto cached = fnmap_.find(&sub);
         if (cached != fnmap_.end()) {
             return cached->second;
         }
-        if (sub.subroutineKind != SubroutineKind::Function) {
-            // TODO: tasks — they can consume time and need the scheduler.
-            fail("task enable is not supported (functions only)");
-        }
         if (sub.flags.has(MethodFlags::DPIImport)) {
             // TODO: DPI imports — call out to native code via the runtime.
-            fail("DPI imported functions are not supported");
+            fail("DPI imported subroutines are not supported");
         }
+        const bool is_task = sub.subroutineKind == SubroutineKind::Task;
         for (const FormalArgumentSymbol* fa : sub.getArguments()) {
-            if (fa->direction != slang::ast::ArgumentDirection::In) {
-                // TODO: output / inout / ref arguments — copy-out / aliasing.
+            const auto dir = fa->direction;
+            if (dir == slang::ast::ArgumentDirection::Ref) {
+                // TODO: ref arguments — live aliasing of the actual through the body.
+                fail("subroutines with ref arguments are not supported");
+            }
+            if (!is_task && dir != slang::ast::ArgumentDirection::In) {
+                // A function copies no arguments back; only tasks carry out/inout.
+                // TODO: output / inout arguments on functions.
                 fail("functions with output/inout/ref arguments are not supported");
             }
         }
 
         const ir::FunctionId id = module_.reserve_function();
         fnmap_[&sub]            = id;
-        build_function(sub, id);
+        if (is_task) {
+            build_task(sub, id);
+        } else {
+            build_function(sub, id);
+        }
 
         return id;
+    }
+
+    // Map a slang argument direction to the IR direction (ref is rejected upstream).
+    static ir::ArgDir to_arg_dir(slang::ast::ArgumentDirection dir) {
+        switch (dir) {
+            case slang::ast::ArgumentDirection::In:
+                return ir::ArgDir::In;
+            case slang::ast::ArgumentDirection::Out:
+                return ir::ArgDir::Out;
+            case slang::ast::ArgumentDirection::InOut:
+                return ir::ArgDir::Inout;
+            default:
+                return ir::ArgDir::In;
+        }
+    }
+
+    // Lower one task body into the reserved slot. Like build_function, but the task
+    // is void and becomes a coroutine: the backend emits the parameter copy-in /
+    // copy-out (output / inout pass by pointer) and the completion handshake, so
+    // here we only allocate a frame Local per formal (index k == formal position)
+    // and lower the body. Every path ends in a void Ret, which the backend turns
+    // into the copy-out + caller-resume epilogue.
+    void build_task(const SubroutineSymbol& sub, ir::FunctionId id) {
+        FnCtx ctx;
+        ctx.name_prefix = std::string(sub.name) + ".";
+        ctx.is_task     = true;
+        FnCtx* saved    = fn_ctx_;
+        fn_ctx_         = &ctx;
+        ir::Builder          b(module_.pool);
+        std::vector<ir::Ref> param_types;
+        std::vector<ir::ArgDir> arg_dirs;
+
+        // Allocate the formals' frame Locals first so formal k maps to Local k (the
+        // backend's prologue / epilogue rely on this). No Arg copy is emitted: the
+        // backend copies parameters in (and output / inout back out) per direction.
+        for (const FormalArgumentSymbol* fa : sub.getArguments()) {
+            param_types.push_back(lower_type(fa->getType()));
+            arg_dirs.push_back(to_arg_dir(fa->direction));
+            fn_local(*fa);
+        }
+
+        lower_stmt(sub.getBody(), b);
+
+        // Fall-through return: the void Ret drives the backend's copy-out epilogue.
+        const ir::SourceLoc el = to_source_loc(sub.location);
+        b.unary(ir::Inst::Tag::Ret, void_ret_operand(b, el), el);
+
+        module_.set_function(id, ir::Function{ .name        = std::string(sub.name),
+                                               .return_type = module_.pool.void_type,
+                                               .param_types = std::move(param_types),
+                                               .arg_dirs    = std::move(arg_dirs),
+                                               .local_types = std::move(ctx.local_types),
+                                               .is_task     = true,
+                                               .ir          = b.finish() });
+        fn_ctx_ = saved;
     }
 
     // Lower one function body into the reserved slot. (Ir has no default ctor and
@@ -2051,7 +2125,12 @@ private:
             fail("class method calls are not supported");
         }
         const SubroutineSymbol& sub = *std::get<0>(call.subroutine);
-        const ir::FunctionId    id  = function_id(sub); // validates + lowers (lazily)
+        if (sub.subroutineKind == SubroutineKind::Task) {
+            // A task is a statement, never a value; it blocks the caller until done.
+            lower_task_call(call, sub, b);
+            return std::nullopt;
+        }
+        const ir::FunctionId id = function_id(sub); // validates + lowers (lazily)
 
         const auto formals = sub.getArguments();
         const auto actuals = call.arguments();
@@ -2068,6 +2147,79 @@ private:
         const ir::Index c = b.call(id, args, l);
 
         return sub.returnValVar == nullptr ? std::nullopt : std::optional<ir::Index>(c);
+    }
+
+    // Lower a task enable (LRM 13.3). The backend drives the task coroutine and
+    // blocks the caller until it completes. Argument passing (13.5): each input is
+    // a value resized to the parameter type; each output / inout uses a caller temp
+    // that the backend passes to the task by pointer. We copy an inout's actual into
+    // its temp before the call and copy every output / inout temp back to its actual
+    // after — both as ordinary assignments, so width conversion and complex actual
+    // lvalues (bit / part selects) reuse the normal store path.
+    void lower_task_call(const CallExpression& call, const SubroutineSymbol& sub, ir::Builder& b) {
+        const ir::FunctionId id      = function_id(sub); // validates + lowers (lazily)
+        const auto           formals = sub.getArguments();
+        const auto           actuals = call.arguments();
+        if (formals.size() != actuals.size()) {
+            fail("task argument count mismatch");
+        }
+        const ir::SourceLoc l = loc(call);
+
+        // One temp + copy-back record per output / inout argument.
+        struct OutArg {
+            ir::Index         temp;      // the caller temp lvalue (parameter width)
+            const Expression* actual;    // the call-site lvalue to copy back into
+            ir::Ref           actual_ty; // the actual's type (target of copy-out)
+        };
+        std::vector<OutArg>    outs;
+        std::vector<ir::Index> args;
+        args.reserve(formals.size());
+        for (size_t i = 0; i < formals.size(); ++i) {
+            const ir::Ref pty = lower_type(formals[i]->getType());
+            if (formals[i]->direction == slang::ast::ArgumentDirection::In) {
+                args.push_back(b.resize(lower_expr(*actuals[i], b), pty, l));
+                continue;
+            }
+            // slang models an output / inout actual as an AssignmentExpression whose
+            // left side is the caller lvalue; unwrap it to the bound expression.
+            const Expression* actual = actuals[i];
+            if (actual->kind == ExpressionKind::Assignment) {
+                actual = &actual->as<AssignmentExpression>().left();
+            }
+            const ir::Index temp = make_task_temp(pty, b, l);
+            if (formals[i]->direction == slang::ast::ArgumentDirection::InOut) {
+                // Copy-in: temp = (parameter type) actual.
+                b.binary(ir::Inst::Tag::Store, temp, b.resize(lower_expr(*actual, b), pty, l), l);
+            }
+            args.push_back(temp);
+            outs.push_back(OutArg{ temp, actual, lower_type(*actual->type) });
+        }
+
+        b.task_call(id, args, l);
+
+        // Copy-out at completion: actual = (actual type) temp.
+        for (const OutArg& oc : outs) {
+            const ir::Index dst = lower_lvalue(*oc.actual, b);
+            const ir::Index tv  = b.unary(ir::Inst::Tag::Load, oc.temp, l);
+            b.binary(ir::Inst::Tag::Store, dst, b.resize(tv, oc.actual_ty, l), l);
+        }
+    }
+
+    // A fresh, anonymous storage cell for an output / inout task argument, returned
+    // as an lvalue leaf. Inside a task caller it is a per-call frame Local; in a
+    // process it is a module Signal (a process has no frame). The same lvalue Index
+    // is reused for copy-in, the task_call operand, and copy-out.
+    ir::Index make_task_temp(ir::Ref type, ir::Builder& b, ir::SourceLoc l) {
+        if (fn_ctx_ != nullptr) {
+            const auto idx = static_cast<uint32_t>(fn_ctx_->local_types.size());
+            fn_ctx_->local_types.push_back(type);
+            return b.local(idx, type, l);
+        }
+        ir::SignalInfo info;
+        info.name = prefix_ + "__taskarg" + std::to_string(task_temp_seq_++);
+        info.type = type;
+        info.dir  = ir::SignalInfo::Direction::Internal;
+        return b.signal(module_.add_signal(std::move(info)), l);
     }
 
     ir::Module& module_;
@@ -2095,6 +2247,9 @@ private:
     // The function currently being lowered, or null when lowering a process. Drives
     // local-vs-signal name resolution and `return` handling.
     FnCtx* fn_ctx_ = nullptr;
+    // Monotonic counter naming anonymous output / inout task-argument temps created
+    // in a process body (where temps are module signals, not frame locals).
+    uint32_t task_temp_seq_ = 0;
 };
 
 LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {

@@ -69,6 +69,11 @@ public:
     // resized to its parameter type). The result is this instruction's value.
     Index call(FunctionId func, std::span<const Index> args, SourceLoc loc);
 
+    // Enable task `func`. `args` has one operand per formal in order: an rvalue for
+    // an input formal, an lvalue leaf (a caller temp) for an output / inout formal.
+    // A statement, never a value; the caller blocks until the task completes.
+    Index task_call(FunctionId func, std::span<const Index> args, SourceLoc loc);
+
     // -- System tasks --
     // $display / $write: a literal format string, a newline flag (true for
     // $display), and the already-lowered value args its specifiers consume.

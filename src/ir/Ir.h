@@ -101,6 +101,19 @@ struct CallInfo {
     ExtraSlice args;
 };
 
+// Extra payload for `task_call`: the callee task plus one operand per formal, in
+// declaration order. An input formal's operand is a value (resized to the
+// parameter type); an output / inout formal's operand is an lvalue leaf
+// (Signal / Local) naming a caller temp the backend passes by pointer and the
+// frontend copies to/from the actual around the call. Directions come from the
+// callee's Function::arg_dirs.
+struct TaskCallInfo {
+    // Task being called, resolved against the module's function table.
+    FunctionId func;
+    // One operand per formal, in order (value for input, lvalue for output/inout).
+    ExtraSlice args;
+};
+
 // Extra payload for `cond`: the then / else regions (the condition is the op).
 struct Regions {
     // Instructions executed when the condition is true.
@@ -175,6 +188,7 @@ struct WaitInfo {
 
 static_assert(ExtraPayload<ExtraSlice>);
 static_assert(ExtraPayload<CallInfo>);
+static_assert(ExtraPayload<TaskCallInfo>);
 static_assert(ExtraPayload<Mux>);
 static_assert(ExtraPayload<PartSelect>);
 static_assert(ExtraPayload<ElemSelect>);
@@ -302,6 +316,11 @@ struct Inst {
         // Call a function (payload: extra -> CallInfo). The result is this
         // instruction's value (absent for a void function called as a statement).
         Call,
+        // Enable a task (payload: extra -> TaskCallInfo). A statement, never a
+        // value: it creates the task coroutine, drives it, and blocks the calling
+        // coroutine until the task completes (LRM 13.3). Only legal inside a
+        // coroutine (a process or another task), never a plain function.
+        TaskCall,
         // Loop with a per-iteration condition; `for` / `while` / `forever` all
         // lower to this (payload: extra -> LoopInfo). The `for` init runs in the
         // enclosing region before this inst; `while` / `forever` have empty step.
@@ -359,6 +378,7 @@ struct Inst {
         OpExtra,
         Extra,
         Call,
+        TaskCall,
         Display,
         TimeFormat,
         Wait,
