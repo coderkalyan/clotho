@@ -76,6 +76,25 @@ TEST_CASE("task consumes time and blocks the caller") {
     CHECK(run_capture(src) == "done t=20 clk=0\n");
 }
 
+// A task that consumes no time completes synchronously on the caller's stack
+// (the fast path: resume, see `done`, continue inline) and still copies outputs.
+TEST_CASE("zero-time task completes synchronously") {
+    constexpr std::string_view src = R"(
+        module m;
+            task automatic addone(input int a, output int b);
+                b = a + 1;
+            endtask
+            int r;
+            initial begin
+                addone(41, r);
+                addone(r, r);
+                $display("r=%0d", r);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "r=43\n");
+}
+
 // An output argument is copied back to the caller at completion, even when the
 // task blocked in between (LRM 13.5).
 TEST_CASE("task output argument copies back at completion") {
