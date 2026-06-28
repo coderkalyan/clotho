@@ -1772,6 +1772,10 @@ private:
                 return b.unary(T::Lnot, b.binary(T::CaseEq, lhs, rhs, l), l);
             case B::WildcardEquality:
                 return b.binary(T::WildEq, lhs, rhs, l);
+            case B::WildcardInequality:
+                // !=? is the logical negation of ==? (X-propagating, so Lnot keeps
+                // x as x).
+                return b.unary(T::Lnot, b.binary(T::WildEq, lhs, rhs, l), l);
             case B::GreaterThanEqual:
                 return b.binary(T::Ge, lhs, rhs, l);
             case B::GreaterThan:
