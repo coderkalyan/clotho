@@ -481,6 +481,39 @@ TEST_CASE("single-bit && lowers to a packed and (no truth reduction)") {
     CHECK(ir.find("and i2") != std::string::npos);
 }
 
+TEST_CASE("multi-bit relational and logical guard X (branchy), agree with LRM") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] a, b;
+            initial begin
+                a=4'd5;    b=4'd3; $display("%b%b%b%b%b%b", a<b, a<=b, a>b, a>=b, a&&b, a||b);
+                a=4'd3;    b=4'd3; $display("%b%b%b%b%b%b", a<b, a<=b, a>b, a>=b, a&&b, a||b);
+                a=4'b001x; b=4'd3; $display("%b%b%b%b%b%b", a<b, a<=b, a>b, a>=b, a&&b, a||b);
+                a=4'd0;    b=4'b001x; $display("%b%b%b%b%b%b", a<b, a<=b, a>b, a>=b, a&&b, a||b);
+                a=4'b001x; b=4'd0; $display("%b%b%b%b%b%b", a<b, a<=b, a>b, a>=b, a&&b, a||b);
+            end
+        endmodule
+    )";
+    // Relationals: any x/z -> X. Logical: cold (Kleene) path still resolves a
+    // dominating operand (001x is nonzero -> true; 0 -> false). vs iverilog.
+    CHECK(run_capture(src) ==
+          "001111\n"   // 5,3
+          "010111\n"   // 3,3
+          "xxxx11\n"   // 001x(true),3   -> rel x, &&=1, ||=1
+          "xxxx01\n"   // 0(false),001x  -> &&=0, ||=1
+          "xxxx01\n"); // 001x(true),0   -> &&=0, ||=1
+}
+
+TEST_CASE("ordered relational guards X with a branch") {
+    const std::string ir = emit(R"(
+        module m(input logic [7:0] a, input logic [7:0] b, output logic y);
+            assign y = a < b;
+        endmodule
+    )");
+    CHECK(ir.find("bit.val") != std::string::npos); // branchy fast/cold split
+    CHECK(ir.find("icmp ult i8") != std::string::npos);
+}
+
 TEST_CASE("delay suspends and reschedules on the wheel") {
     constexpr std::string_view src = R"(
         module d;

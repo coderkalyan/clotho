@@ -3345,26 +3345,55 @@ private:
 
     // -- Comparisons -> 1-bit; X/Z in either operand yields X. --
 
+    // Build a 1-bit 4-state result split on `unknown`: the cold block takes the
+    // X-case word from `cold_mm()`, the hot block computes a known i1 from
+    // `fast_bit()` and splats it across both planes. `unknown` is the only read of
+    // the may plane, so once it is statically false (2-state) the guard folds away
+    // and just the hot op survives. Mirrors the arithmetic guard.
+    template <class ColdF, class FastF>
+    Plane branchy_bit(llvm::Value* unknown, ColdF cold_mm, FastF fast_bit) {
+        auto* x_bb   = llvm::BasicBlock::Create(ctx_, "bit.x", fn_);
+        auto* val_bb = llvm::BasicBlock::Create(ctx_, "bit.val", fn_);
+        auto* end_bb = llvm::BasicBlock::Create(ctx_, "bit.end", fn_);
+
+        llvm::BranchInst* br = b_.CreateCondBr(unknown, x_bb, val_bb);
+        br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
+
+        b_.SetInsertPoint(x_bb);
+        llvm::Value* x_mm = cold_mm();
+        b_.CreateBr(end_bb);
+
+        b_.SetInsertPoint(val_bb);
+        llvm::Value* c      = fast_bit();
+        llvm::Value* val_mm = bit_plane(c, c).mm;
+        b_.CreateBr(end_bb);
+
+        b_.SetInsertPoint(end_bb);
+        llvm::PHINode* mm = b_.CreatePHI(int_ty(2), 2);
+        mm->addIncoming(x_mm, x_bb);
+        mm->addIncoming(val_mm, val_bb);
+        return { mm, zero(1) };
+    }
+
     Plane lower_compare(Inst::Tag tag, Plane a, Plane b, bool sign) {
-        // Width-1 == / != index a truth table instead of masking an icmp with the
-        // per-operand X tests. Operands share a width here, so both are 1-bit.
-        if (width_of(a) == 1) {
-            if (tag == Inst::Tag::Eq) {
-                return single_bit_lut(EQ1_LUT, a, b);
+        // Equality keeps the branchless X-mask (and a width-1 LUT): == / != are
+        // cheap and fold the X mask straight into the result.
+        if (tag == Inst::Tag::Eq || tag == Inst::Tag::Ne) {
+            if (width_of(a) == 1) {
+                return single_bit_lut(tag == Inst::Tag::Eq ? EQ1_LUT : NE1_LUT, a, b);
             }
-            if (tag == Inst::Tag::Ne) {
-                return single_bit_lut(NE1_LUT, a, b);
-            }
+            const auto pred =
+              tag == Inst::Tag::Eq ? llvm::CmpInst::ICMP_EQ : llvm::CmpInst::ICMP_NE;
+            llvm::Value* cmp     = b_.CreateICmp(pred, must_of(a), must_of(b));
+            llvm::Value* unknown = b_.CreateOr(any_unknown(a), any_unknown(b));
+            return bit_plane(b_.CreateAnd(b_.CreateNot(unknown), cmp), b_.CreateOr(unknown, cmp));
         }
 
+        // Ordered relationals: any x/z yields X, exactly like arithmetic, so guard
+        // on it. The hot block is one native compare on the data (must) bits; the
+        // cold block is the all-X word (must 0, may 1).
         llvm::CmpInst::Predicate pred;
         switch (tag) {
-            case Inst::Tag::Eq:
-                pred = llvm::CmpInst::ICMP_EQ;
-                break;
-            case Inst::Tag::Ne:
-                pred = llvm::CmpInst::ICMP_NE;
-                break;
             case Inst::Tag::Lt:
                 pred = sign ? llvm::CmpInst::ICMP_SLT : llvm::CmpInst::ICMP_ULT;
                 break;
@@ -3378,9 +3407,10 @@ private:
                 pred = sign ? llvm::CmpInst::ICMP_SGE : llvm::CmpInst::ICMP_UGE;
                 break;
         }
-        llvm::Value* cmp     = b_.CreateICmp(pred, must_of(a), must_of(b));
         llvm::Value* unknown = b_.CreateOr(any_unknown(a), any_unknown(b));
-        return bit_plane(b_.CreateAnd(b_.CreateNot(unknown), cmp), b_.CreateOr(unknown, cmp));
+        return branchy_bit(
+          unknown, [&] { return llvm::ConstantInt::get(int_ty(2), 0b10); },
+          [&] { return b_.CreateICmp(pred, must_of(a), must_of(b)); });
     }
 
     // -- Case-equality (SV `case`/`casez`/`casex`) -> definite 1-bit. --
@@ -3463,14 +3493,27 @@ private:
               tag == Inst::Tag::Land ? b_.CreateAnd(a.mm, b.mm) : b_.CreateOr(a.mm, b.mm);
             return { mm, zero(1) };
         }
-        const Truth ta = truth_of(a);
-        const Truth tb = truth_of(b);
-        if (tag == Inst::Tag::Land) {
-            // must = both true; may = not (either false).
-            return bit_plane(b_.CreateAnd(ta.t, tb.t), b_.CreateNot(b_.CreateOr(ta.f, tb.f)));
-        }
-        // Lor: must = either true; may = not (both false).
-        return bit_plane(b_.CreateOr(ta.t, tb.t), b_.CreateNot(b_.CreateAnd(ta.f, tb.f)));
+
+        // Multi-bit: with no x/z each operand's truth is just "nonzero", so &&/||
+        // are a plain boolean on the data bits. An x/z is rarer and can still be
+        // dominated (0 && x = 0), so the cold block keeps the full 3-valued logic.
+        const uint32_t wa      = width_of(a);
+        const uint32_t wb      = width_of(b);
+        llvm::Value*   unknown = b_.CreateOr(any_unknown(a), any_unknown(b));
+        return branchy_bit(
+          unknown,
+          [&] {
+              const Truth ta = truth_of(a);
+              const Truth tb = truth_of(b);
+              return tag == Inst::Tag::Land
+                       ? bit_plane(b_.CreateAnd(ta.t, tb.t), b_.CreateNot(b_.CreateOr(ta.f, tb.f))).mm
+                       : bit_plane(b_.CreateOr(ta.t, tb.t), b_.CreateNot(b_.CreateAnd(ta.f, tb.f))).mm;
+          },
+          [&] {
+              llvm::Value* at = b_.CreateICmpNE(must_of(a), zero(wa));
+              llvm::Value* bt = b_.CreateICmpNE(must_of(b), zero(wb));
+              return tag == Inst::Tag::Land ? b_.CreateAnd(at, bt) : b_.CreateOr(at, bt);
+          });
     }
 
     Plane lower_lnot(Plane a) {
