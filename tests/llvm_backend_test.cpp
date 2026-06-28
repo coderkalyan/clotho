@@ -438,6 +438,21 @@ TEST_CASE("===, !==, ==?, and ^~ operators agree with LRM 4-state semantics") {
           "101xx11\n"); // zz01 vs zz01: 1,0,1,xx11
 }
 
+TEST_CASE("!=? is the negation of ==?, X-propagating") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] a, b;
+            initial begin
+                a = 4'b0011; b = 4'b001x; $display("%b%b", a==?b, a!=?b);
+                a = 4'b001x; b = 4'b0011; $display("%b%b", a==?b, a!=?b);
+                a = 4'b0101; b = 4'b001x; $display("%b%b", a==?b, a!=?b);
+            end
+        endmodule
+    )";
+    // !=? negates ==?; an x result stays x. vs iverilog.
+    CHECK(run_capture(src) == "10\nxx\n01\n");
+}
+
 TEST_CASE("single-bit ^~ uses the bxnor truth-table immediate (== EQ1)") {
     const std::string ir = emit(R"(
         module m(input logic a, input logic b, output logic y); assign y = a ^~ b; endmodule
