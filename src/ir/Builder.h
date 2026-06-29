@@ -50,6 +50,9 @@ public:
     Index mux(Index cond, Index a, Index b, SourceLoc loc);
     Index concat(std::span<const Index> parts, SourceLoc loc);
     Index part_select(Index base, uint32_t msb, uint32_t lsb, SourceLoc loc);
+    // Runtime-offset, constant-width part-select base[offset +: width]. `offset` is
+    // the already-lowered value of the low selected bit.
+    Index dyn_part_select(Index base, Index offset, uint32_t width, SourceLoc loc);
     // Unpacked-array element select base[index]. `array_type` is the interned
     // UnpackedArray type being indexed (gives element stride + declared bounds).
     Index elem_select(Index base, Index index, Ref array_type, SourceLoc loc);

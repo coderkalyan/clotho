@@ -304,15 +304,81 @@ TEST_CASE("disable inside a task is rejected") {
     CHECK(reject(src).find("disable is not supported") != std::string::npos);
 }
 
-TEST_CASE("nonblocking assignment inside a task is rejected") {
+// A nonblocking assignment to a module signal from inside a task stages into the
+// signal's shadow and commits in the caller instant's NBA region: the old value is
+// still visible immediately after the call, the new value one delta later (LRM
+// 13.3 / 10.4.2). Cross-checked against Icarus Verilog.
+TEST_CASE("nonblocking assignment to a module signal in a task defers") {
+    constexpr std::string_view src = R"(
+        module m;
+            reg [7:0] q;
+            reg [7:0] seen;
+            task set_q(input [7:0] v);
+                begin
+                    q <= v;
+                    seen = q;
+                end
+            endtask
+            initial begin
+                q = 8'd10;
+                #1 set_q(8'd99);
+                $display("a q=%0d seen=%0d", q, seen);
+                #1 $display("b q=%0d", q);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a q=10 seen=10\nb q=99\n");
+}
+
+TEST_CASE("nonblocking assignment in a function is rejected") {
     constexpr std::string_view src = R"(
         module m;
             logic x;
-            task t;
+            function void f;
                 x <= 1;
-            endtask
-            initial t;
+            endfunction
+            initial f();
         endmodule
     )";
-    CHECK(reject(src).find("nonblocking assignment") != std::string::npos);
+    CHECK(reject(src).find("nonblocking assignment in a function") != std::string::npos);
+}
+
+TEST_CASE("nonblocking assignment to a task output argument is rejected") {
+    constexpr std::string_view src = R"(
+        module m;
+            reg [7:0] r;
+            task t(output [7:0] o);
+                o <= 8'd7;
+            endtask
+            initial t(r);
+        endmodule
+    )";
+    CHECK(reject(src).find("task-local variable") != std::string::npos);
+}
+
+// A nonblocking write to an unpacked-array element from a task defers through the
+// global runtime queue, just as it does from a process: a runtime-indexed element
+// plus byte-lane part-select (the picorv32 AXI write pattern) commits one delta
+// later. Cross-checked against Icarus Verilog.
+TEST_CASE("nonblocking write to an array element in a task defers") {
+    constexpr std::string_view src = R"(
+        module m;
+            reg [31:0] mem [0:1];
+            task wr(input i, input [31:0] v, input [3:0] strb);
+                begin
+                    if (strb[0]) mem[i][ 7: 0] <= v[ 7: 0];
+                    if (strb[1]) mem[i][15: 8] <= v[15: 8];
+                    if (strb[2]) mem[i][23:16] <= v[23:16];
+                    if (strb[3]) mem[i][31:24] <= v[31:24];
+                end
+            endtask
+            initial begin
+                mem[0] = 32'h0;
+                #1 wr(0, 32'hDEADBEEF, 4'b1010);
+                $display("a %08x", mem[0]);
+                #1 $display("b %08x", mem[0]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a 00000000\nb de00be00\n");
 }

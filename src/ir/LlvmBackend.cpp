@@ -510,41 +510,58 @@ private:
                 case Inst::Tag::Signal: return { ir.payload(lv).signal, whole };
                 case Inst::Tag::BitSelect: lv = ir.payload(lv).binary.l; whole = false; continue;
                 case Inst::Tag::PartSelect: lv = ir.payload(lv).op_extra.op; whole = false; continue;
+                case Inst::Tag::DynPartSelect: lv = ir.payload(lv).op_extra.op; whole = false; continue;
                 case Inst::Tag::ElemSelect: lv = ir.payload(lv).op_extra.op; whole = false; continue;
                 default: throw BackendError{ "unsupported nonblocking-assignment lvalue" };
             }
         }
     }
 
-    // Find every NBA-target signal across all processes and mark its slot: `nba`,
-    // `nba_partial` (any bit/part-select site), and a dense `nba_id` (signal order).
-    // Bucket assignment happens later in build_nba_state once widths are final.
-    void nba_classify() {
+    // Mark NBA-target signals reached by one IR body (a process or a task): set
+    // `nba`, `nba_partial` (any bit/part-select site), and collect unpacked-array
+    // targets for the runtime deferred queue.
+    void nba_classify_ir(const Ir& ir) {
         const auto sigs = mod_.signals();
+        for (size_t k = 0; k < ir.inst_count(); ++k) {
+            const auto idx = static_cast<Index>(k);
+            if (ir.tag(idx) != Inst::Tag::StoreNb) {
+                continue;
+            }
+            const NbaTarget t = nba_target(ir, ir.payload(idx).binary.l);
+            // An unpacked-array element NBA uses the runtime deferred queue, not
+            // the per-signal shadow; record the array signal for wake servicing.
+            // (slot.is_array is not set until the placement loop below, so test
+            // the type directly here.)
+            if (std::get<Type>(mod_.pool.get(sigs[static_cast<uint32_t>(t.sig)].type)).kind ==
+                Type::Kind::UnpackedArray) {
+                if (std::find(array_nba_sigs_.begin(), array_nba_sigs_.end(), t.sig) == array_nba_sigs_.end()) {
+                    array_nba_sigs_.push_back(t.sig);
+                }
+                continue;
+            }
+            SignalSlot& s = slots_[static_cast<uint32_t>(t.sig)];
+            s.nba         = true;
+            s.nba_partial = s.nba_partial || !t.whole;
+        }
+    }
+
+    // Find every NBA-target signal across all processes and tasks and mark its slot:
+    // `nba`, `nba_partial`, and a dense `nba_id` (signal order). A task NBA stages
+    // into the same per-signal shadow and commits in its caller's NBA region, so its
+    // targets must be classified here too. Bucket assignment happens later in
+    // build_nba_state once widths are final.
+    void nba_classify() {
         for (const Process& p : mod_.processes()) {
-            for (size_t k = 0; k < p.ir.inst_count(); ++k) {
-                const auto idx = static_cast<Index>(k);
-                if (p.ir.tag(idx) != Inst::Tag::StoreNb) {
-                    continue;
-                }
-                const NbaTarget t = nba_target(p.ir, p.ir.payload(idx).binary.l);
-                // An unpacked-array element NBA uses the runtime deferred queue, not
-                // the per-signal shadow; record the array signal for wake servicing.
-                // (slot.is_array is not set until the placement loop below, so test
-                // the type directly here.)
-                if (std::get<Type>(mod_.pool.get(sigs[static_cast<uint32_t>(t.sig)].type)).kind ==
-                    Type::Kind::UnpackedArray) {
-                    if (std::find(array_nba_sigs_.begin(), array_nba_sigs_.end(), t.sig) == array_nba_sigs_.end()) {
-                        array_nba_sigs_.push_back(t.sig);
-                    }
-                    continue;
-                }
-                SignalSlot& s = slots_[static_cast<uint32_t>(t.sig)];
-                s.nba         = true;
-                s.nba_partial = s.nba_partial || !t.whole;
+            nba_classify_ir(p.ir);
+        }
+        for (uint32_t i = 0; i < mod_.function_count(); ++i) {
+            const Function& f = mod_.function(static_cast<FunctionId>(i));
+            if (f.is_task) {
+                nba_classify_ir(f.ir);
             }
         }
-        n_nba_ = 0;
+        n_nba_          = 0;
+        const auto sigs = mod_.signals();
         for (uint32_t i = 0; i < sigs.size(); ++i) {
             if (slots_[i].nba) {
                 slots_[i].nba_id = n_nba_++;
@@ -2421,6 +2438,10 @@ private:
                 const auto ps = ir_->extra_data<PartSelect>(p.op_extra.extra);
                 return { ps.msb - ps.lsb + 1, type_of(p.op_extra.op).four_state, false };
             }
+            case Inst::Tag::DynPartSelect: {
+                const auto dps = ir_->extra_data<DynPartSelect>(p.op_extra.extra);
+                return { dps.width, type_of(p.op_extra.op).four_state, false };
+            }
             case Inst::Tag::ElemSelect: {
                 // The result is one element of the indexed array.
                 const auto  es = ir_->extra_data<ElemSelect>(p.op_extra.extra);
@@ -2549,6 +2570,20 @@ private:
                 const auto ps = ir_->extra_data<PartSelect>(p.op_extra.extra);
                 lv.bit_off    = b_.CreateAdd(lv.bit_off, b_.getInt32(ps.lsb));
                 lv.width      = ps.msb - ps.lsb + 1;
+                set_lvalue(i, lv);
+                return;
+            }
+            case Inst::Tag::DynPartSelect: {
+                // Runtime low-bit offset, constant width: add the offset to the
+                // lvalue's bit_off exactly as a dynamic BitSelect does, then the
+                // shared load/store path shifts/masks by the runtime bit_off.
+                // TODO: an X/Z or out-of-range offset uses only its must bits and is
+                // not bounds-checked (LRM 11.5.1: OOB read -> X, write -> no-op).
+                LValue       lv  = lvalue_of(p.op_extra.op);
+                const auto   dps = ir_->extra_data<DynPartSelect>(p.op_extra.extra);
+                llvm::Value* off = cast(must_of(value_of(dps.offset)), 32, false);
+                lv.bit_off       = b_.CreateAdd(lv.bit_off, off);
+                lv.width         = dps.width;
                 set_lvalue(i, lv);
                 return;
             }

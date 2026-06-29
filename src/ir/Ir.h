@@ -80,6 +80,18 @@ struct PartSelect {
     uint32_t lsb;
 };
 
+// Extra payload for `dyn_part_select`: a runtime-offset, constant-width slice of
+// the base (a SystemVerilog indexed part-select `base[off +: width]` /
+// `base[off -: width]`). `offset` is the value of the low selected bit (the
+// frontend already folds the `-:` form to its low bit); `width` is the constant
+// number of selected bits.
+struct DynPartSelect {
+    // Value of the least-significant selected bit position.
+    Index offset;
+    // Number of selected bits (constant).
+    uint32_t width;
+};
+
 // Extra payload for `elem_select`: a runtime element index into an unpacked
 // array (the base is the op). `index` is the selector value (declared-range
 // coordinate, normalized against the array's bounds in the backend);
@@ -220,6 +232,10 @@ struct Inst {
         BitSelect,
         // Constant part-select base[msb:lsb] (payload: op_extra -> PartSelect).
         PartSelect,
+        // Runtime-offset, constant-width part-select base[off +: w] / base[off -: w]
+        // (payload: op_extra -> DynPartSelect). The offset is a runtime value; the
+        // backend rides the same shift/mask load/store path as a dynamic BitSelect.
+        DynPartSelect,
         // Unpacked-array element select base[index] (payload: op_extra ->
         // ElemSelect). Distinct from BitSelect: the stride is the element's
         // storage size, not one bit, and the index is normalized against the

@@ -1604,6 +1604,43 @@ private:
         return b.binary(ir::Inst::Tag::Mul, w, mul, l);
     }
 
+    // Reject the one nonblocking-assignment target a task cannot stage: a frame
+    // local or formal argument (both live in localmap). These have no module-signal
+    // storage, and nba_target in the backend only walks to a Signal root, so there
+    // is no shadow to defer the write into. A module signal, static local, or
+    // unpacked-array element is fine: nba_classify walks task bodies, so a signal
+    // gets shadow storage and an array element defers through the global runtime
+    // queue exactly as it does from a process.
+    void check_task_nba_target(const Expression& lhs) {
+        switch (lhs.kind) {
+            case ExpressionKind::Concatenation:
+                for (const Expression* op : lhs.as<ConcatenationExpression>().operands()) {
+                    check_task_nba_target(*op);
+                }
+                return;
+            case ExpressionKind::Conversion:
+                check_task_nba_target(lhs.as<ConversionExpression>().operand());
+                return;
+            case ExpressionKind::ElementSelect:
+                check_task_nba_target(lhs.as<ElementSelectExpression>().value());
+                return;
+            case ExpressionKind::RangeSelect:
+                check_task_nba_target(lhs.as<RangeSelectExpression>().value());
+                return;
+            case ExpressionKind::NamedValue: {
+                const ValueSymbol& vs = lhs.as<NamedValueExpression>().symbol;
+                if (fn_ctx_->localmap.contains(&vs)) {
+                    // TODO: nonblocking assignment to a task local / formal argument.
+                    fail("nonblocking assignment to a task-local variable is not supported");
+                }
+                return;
+            }
+            default:
+                // TODO: an unrecognized nonblocking lvalue shape inside a task.
+                fail("unsupported nonblocking-assignment target in a task");
+        }
+    }
+
     void lower_assign(const AssignmentExpression& a, ir::Builder& b) {
         if (a.isCompound()) {
             fail("compound assignment not supported");
@@ -1615,12 +1652,17 @@ private:
             fail("intra-assignment timing control (#/@ on an assignment) is not supported");
         }
         if (a.isNonBlocking() && fn_ctx_ != nullptr) {
-            // A function consumes no time, so a nonblocking assignment in one has no
-            // deferred region to commit into. A task could host one (it is a
-            // coroutine), but wiring its NBA staging through the task frame is not
-            // done yet.
-            // TODO: nonblocking assignment inside a task.
-            fail("nonblocking assignment in a function/task is not supported");
+            if (!fn_ctx_->is_task) {
+                // A function consumes no simulation time, so a nonblocking
+                // assignment in one has no deferred update region to commit into.
+                // TODO: nonblocking assignment inside a function.
+                fail("nonblocking assignment in a function is not supported");
+            }
+            // A task runs in its caller's time step; an NBA stages into the target
+            // signal's shadow and commits in that instant's NBA region (the
+            // backend's nba_classify scans task bodies). Only module-signal targets
+            // have that shadow, so reject the rest.
+            check_task_nba_target(a.left());
         }
         if (is_unpacked_array(a.left())) {
             // TODO: whole-array assignment (mem1 = mem2, mem = '{...}). Needs an
@@ -1739,14 +1781,9 @@ private:
                 return b.unary(ir::Inst::Tag::Load, sel, l);
             }
             case ExpressionKind::RangeSelect: {
-                const RangeSelectExpression& rs = expr.as<RangeSelectExpression>();
-                if (rs.getSelectionKind() != RangeSelectionKind::Simple) {
-                    fail("only constant [msb:lsb] part-selects are supported");
-                }
-                const ir::Index base = lower_lvalue(rs.value(), b);
-                const auto      msb  = static_cast<uint32_t>(const_uint(rs.left()));
-                const auto      lsb  = static_cast<uint32_t>(const_uint(rs.right()));
-                return b.unary(ir::Inst::Tag::Load, b.part_select(base, msb, lsb, l), l);
+                const RangeSelectExpression& rs   = expr.as<RangeSelectExpression>();
+                const ir::Index              base = lower_lvalue(rs.value(), b);
+                return b.unary(ir::Inst::Tag::Load, lower_range_select(rs, base, b, l), l);
             }
             case ExpressionKind::Conversion: {
                 const ConversionExpression& cv = expr.as<ConversionExpression>();
@@ -1869,6 +1906,34 @@ private:
         }
     }
 
+    // Build the lvalue for a part-select over an already-lowered base lvalue: a
+    // constant `[msb:lsb]` slice, or a runtime-base indexed slice `[off +: w]` /
+    // `[off -: w]` (width constant, base a runtime value). Shared by the rvalue and
+    // lvalue paths so a read and a write of the same shape lower identically.
+    ir::Index lower_range_select(const RangeSelectExpression& rs, ir::Index base, ir::Builder& b, ir::SourceLoc l) {
+        if (rs.getSelectionKind() == RangeSelectionKind::Simple) {
+            const auto msb = static_cast<uint32_t>(const_uint(rs.left()));
+            const auto lsb = static_cast<uint32_t>(const_uint(rs.right()));
+            return b.part_select(base, msb, lsb, l);
+        }
+        // Indexed part-select: the width is a constant (LRM 11.5.1) and the base is a
+        // runtime value. `+:` selects [off : off+w-1] (low bit = off); `-:` selects
+        // [off-w+1 : off] (low bit = off-(w-1)), folded here so the IR carries a
+        // single low-bit offset.
+        //
+        // TODO: an out-of-range or X/Z base is not bounds-checked. LRM 11.5.1: an
+        // out-of-range read yields X and such a write is a no-op. This inherits the
+        // dynamic BitSelect gap and shifts by the raw value.
+        const auto    width = static_cast<uint32_t>(const_uint(rs.right()));
+        const ir::Ref u32   = make_int_type(32, false, false);
+        ir::Index     off   = b.resize(lower_expr(rs.left(), b), u32, l);
+        if (rs.getSelectionKind() == RangeSelectionKind::IndexedDown) {
+            const ir::Index w1 = b.constant(module_.pool.put_int(u32, width - 1), l);
+            off                = b.binary(ir::Inst::Tag::Sub, off, w1, l);
+        }
+        return b.dyn_part_select(base, off, width, l);
+    }
+
     // Lower an expression as an lvalue, returning the lvalue index (no Load).
     ir::Index lower_lvalue(const Expression& expr, ir::Builder& b) {
         const ir::SourceLoc l = loc(expr);
@@ -1885,14 +1950,9 @@ private:
                 return b.binary(ir::Inst::Tag::BitSelect, base, idx, l);
             }
             case ExpressionKind::RangeSelect: {
-                const RangeSelectExpression& rs = expr.as<RangeSelectExpression>();
-                if (rs.getSelectionKind() != RangeSelectionKind::Simple) {
-                    fail("only constant [msb:lsb] part-selects are supported");
-                }
-                const ir::Index base = lower_lvalue(rs.value(), b);
-                const auto      msb  = static_cast<uint32_t>(const_uint(rs.left()));
-                const auto      lsb  = static_cast<uint32_t>(const_uint(rs.right()));
-                return b.part_select(base, msb, lsb, l);
+                const RangeSelectExpression& rs   = expr.as<RangeSelectExpression>();
+                const ir::Index              base = lower_lvalue(rs.value(), b);
+                return lower_range_select(rs, base, b, l);
             }
             default:
                 fail("unsupported assignment target kind=" + std::string(slang::ast::toString(expr.kind)));

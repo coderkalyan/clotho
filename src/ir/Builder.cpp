@@ -74,6 +74,12 @@ Index Builder::part_select(Index base, uint32_t msb, uint32_t lsb, SourceLoc loc
     return emit({ Inst::Tag::PartSelect, Inst::Payload{ .op_extra = { base, extra } } }, loc);
 }
 
+Index Builder::dyn_part_select(Index base, Index offset, uint32_t width, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(DynPartSelect{ offset, width });
+
+    return emit({ Inst::Tag::DynPartSelect, Inst::Payload{ .op_extra = { base, extra } } }, loc);
+}
+
 Index Builder::elem_select(Index base, Index index, Ref array_type, SourceLoc loc) {
     const ExtraIndex extra = add_extra(ElemSelect{ index, array_type });
 
