@@ -757,8 +757,18 @@ private:
             }
             const Expression* expr = pc->getExpression();
             if (expr == nullptr) {
-                // TODO: unconnected port — should default to its initializer / z.
-                fail("unconnected module port is not supported");
+                // Unconnected port (LRM 23.3.2.7). An unconnected output discards
+                // the child's driven value: nothing in the parent reads it, so emit
+                // no copy process. An unconnected input leaves the child's internal
+                // net at its startup value (X for 4-state, 0 for 2-state, per
+                // init_state) — the same way every undriven net is already modeled.
+                // A port carrying an explicit default value arrives here with a
+                // non-null expression, so a null expression means there is genuinely
+                // nothing to drive.
+                //
+                // NOTE: a 4-state undriven net is modeled as X, not Z; clotho treats
+                // all undriven nets as X uniformly, so no new inconsistency arises.
+                continue;
             }
 
             const ir::Signal           child_sig = signal_of(p.internalSymbol->as<ValueSymbol>());
