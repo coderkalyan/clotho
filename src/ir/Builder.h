@@ -83,6 +83,13 @@ public:
     Index display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc);
     // $finish / $stop: end the simulation and exit. No operands.
     Index finish(SourceLoc loc);
+    // $fflush (no-arg form): flush all open output buffers. No operands.
+    Index fflush(SourceLoc loc);
+    // $readmemh / $readmemb: load a file into the memory signal `target`. `filename`
+    // is the path value; `start` / `finish` are optional address bounds (pass any
+    // Index when the matching has_* is false). `hex` selects hex vs binary.
+    Index read_mem(Signal target, Index filename, Index start, Index finish, bool hex, bool has_start,
+                   bool has_finish, SourceLoc loc);
     // $timeformat: set the %t format. `units`, `precision`, and `min_width` are
     // already-lowered value operands; `suffix` is a literal string appended after
     // the formatted number.

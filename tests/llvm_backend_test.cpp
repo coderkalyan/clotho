@@ -1505,3 +1505,123 @@ TEST_CASE("concatenation lvalue lowers the picorv32 J-immediate swizzle") {
         endmodule
     )") == "fffde2bc\n");
 }
+
+// Indexed part-selects with a runtime base (`[i +: w]` / `[i -: w]`) lower to a
+// variable shift + mask over the existing dynamic-offset lvalue path. Read and
+// write, both directions; cross-checked against iverilog.
+TEST_CASE("dynamic indexed part-select read and write") {
+    const std::string out = run_capture(R"(
+        module m;
+            reg [31:0] x;
+            reg [7:0]  r;
+            integer i;
+            initial begin
+                x = 32'hAABBCCDD;
+                for (i = 0; i < 4; i = i + 1) begin
+                    r = x[i*8 +: 8];
+                    $display("up%0d=%02x", i, r);
+                end
+                $display("dn=%02x", x[31 -: 8]);
+                for (i = 0; i < 4; i = i + 1)
+                    x[i*8 +: 8] = i;
+                $display("wr=%08x", x);
+                x = 32'h0;
+                x[15 -: 8] = 8'hEF;
+                $display("wrdn=%08x", x);
+            end
+        endmodule
+    )");
+    CHECK(out == "up0=dd\nup1=cc\nup2=bb\nup3=aa\ndn=aa\nwr=03020100\nwrdn=0000ef00\n");
+}
+
+// The picorv32 fast-multiplier carry chain: a runtime-base indexed part-select on
+// both sides of an assignment inside a bounded procedural loop (picorv32.v:2264).
+// A constant CARRY_CHAIN keeps the loop unrollable so the selects fold, but the
+// frontend lowers them dynamically regardless.
+TEST_CASE("dynamic part-select carry-chain accumulate") {
+    const std::string out = run_capture(R"(
+        module m;
+            localparam CARRY_CHAIN = 4;
+            reg [15:0] a, b_, sum;
+            integer j;
+            initial begin
+                a = 16'h1234; b_ = 16'h5678; sum = 0;
+                for (j = 0; j < 16; j = j + CARRY_CHAIN)
+                    sum[j +: CARRY_CHAIN] = a[j +: CARRY_CHAIN] + b_[j +: CARRY_CHAIN];
+                $display("%04x", sum);
+            end
+        endmodule
+    )");
+    CHECK(out == "68ac\n");
+}
+
+// Write `text` to `path` for a $readmem test, replacing any existing file.
+void write_file(const char* path, std::string_view text) {
+    std::FILE* f = std::fopen(path, "w");
+    REQUIRE(f != nullptr);
+    std::fwrite(text.data(), 1, text.size(), f);
+    std::fclose(f);
+}
+
+// $readmemh fills the memory from the file, honoring @address jumps and skipping
+// // and /* */ comments; untouched words keep their X startup value (LRM §21.4).
+// Cross-checked against Icarus Verilog.
+TEST_CASE("$readmemh loads a memory with @address and comments") {
+    const char* path = "clotho_readmemh_test.hex";
+    write_file(path, "// header comment\nDEADBEEF 01234567\n@4 /* jump */ AABBCCDD\n");
+    const std::string src = std::string(R"(
+        module m;
+            reg [31:0] mem [0:5];
+            integer k;
+            initial begin
+                $readmemh(")") + path + R"(", mem);
+                for (k = 0; k < 6; k = k + 1) $display("%08x", mem[k]);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "deadbeef\n01234567\nxxxxxxxx\nxxxxxxxx\naabbccdd\nxxxxxxxx\n");
+    std::remove(path);
+}
+
+// $readmemb parses binary digits and x/z; a runtime-string filename (a reg holding
+// packed ASCII, the picorv32 pattern) resolves to the path at run time.
+TEST_CASE("$readmemb parses x/z and a runtime-string filename") {
+    const char* path = "clotho_readmemb_test.bin";
+    write_file(path, "1010xx01\nzzzz0000\n");
+    const std::string src = std::string(R"(
+        module m;
+            reg [7:0] mem [0:2];
+            reg [255:0] fname;
+            initial begin
+                fname = ")") + path + R"(";
+                $readmemb(fname, mem);
+                $display("%b %b %b", mem[0], mem[1], mem[2]);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1010xx01 zzzz0000 xxxxxxxx\n");
+    std::remove(path);
+}
+
+// Default load fills from the lowest address upward regardless of the declared
+// range direction; a descending range [3:0] therefore maps the first datum to
+// address 0 (storage slot 3). This is the LRM §21.4 rule, which Icarus follows and
+// which differs from a naive storage-order fill.
+TEST_CASE("$readmemh default fill honors a descending declared range") {
+    const char* path = "clotho_readmem_desc_test.hex";
+    write_file(path, "F0 0F C3\n");
+    const std::string src = std::string(R"(
+        module m;
+            reg [7:0] mem [3:0];
+            initial begin
+                $readmemh(")") + path + R"(", mem);
+                $display("%h %h %h %h", mem[3], mem[2], mem[1], mem[0]);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "xx c3 0f f0\n");
+    std::remove(path);
+}

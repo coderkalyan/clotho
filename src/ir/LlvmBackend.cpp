@@ -2520,6 +2520,8 @@ private:
             case Inst::Tag::Display:
             case Inst::Tag::TimeFormat:
             case Inst::Tag::Finish:
+            case Inst::Tag::Fflush:
+            case Inst::Tag::ReadMem:
             case Inst::Tag::TaskCall:
                 return { 0, false, false };
         }
@@ -2774,6 +2776,14 @@ private:
 
             case Inst::Tag::Finish:
                 lower_finish();
+                return;
+
+            case Inst::Tag::Fflush:
+                lower_fflush();
+                return;
+
+            case Inst::Tag::ReadMem:
+                lower_readmem(i);
                 return;
 
             case Inst::Tag::SimTime: {
@@ -3130,6 +3140,72 @@ private:
     // rt_finish is marked noreturn and the optimizer prunes the unreachable tail.
     void lower_finish() {
         b_.CreateCall(finish_fn(), {});
+    }
+
+    // void rt_fflush(void) — flush all open output buffers.
+    llvm::FunctionCallee fflush_fn() {
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), false);
+        return llmod_.getOrInsertFunction("rt_fflush", fnty);
+    }
+
+    // Lower a $fflush (no-arg form): flush the runtime's output buffers.
+    void lower_fflush() {
+        b_.CreateCall(fflush_fn(), {});
+    }
+
+    // void rt_readmem(const char* path, i32 path_len, i8* mm_base, i8* z_base,
+    //                 i32 stride, i32 count, i32 width, i64 decl_left, i64 decl_right,
+    //                 i64 start, i64 finish, i32 flags)
+    llvm::FunctionCallee readmem_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* i64  = b_.getInt64Ty();
+        auto* fnty = llvm::FunctionType::get(
+          b_.getVoidTy(), { ptr, i32, ptr, ptr, i32, i32, i32, i64, i64, i64, i64, i32 }, false);
+        return llmod_.getOrInsertFunction("rt_readmem", fnty);
+    }
+
+    // Lower a $readmemh / $readmemb: spill the filename to a stack buffer and hand
+    // the runtime the destination memory's plane bases (element 0) and geometry. The
+    // runtime opens the file and writes element planes straight into `state`. The mm
+    // and z words of element i sit at off_mm/off_z + i*elem_stride, so the two region
+    // bases plus the stride let the runtime address every element.
+    void lower_readmem(Index i) {
+        const auto        info  = ir_->extra_data<ReadMemInfo>(ir_->payload(i).op_extra.extra);
+        const Index       fname = ir_->payload(i).op_extra.op;
+        const SignalSlot& s     = slot_of(info.target);
+        if (!s.is_array) {
+            throw BackendError{ "$readmem target is not a memory" };
+        }
+        if (s.width > 64) {
+            // TODO: element width > 64 needs multi-word value assembly in rt_readmem
+            // (the value/mask accumulators are u64 / unsigned __int128 today).
+            throw BackendError{ "$readmem into a memory with elements wider than 64 bits is not supported" };
+        }
+
+        // Spill the filename's must-bits to a byte buffer: the value is a packed-
+        // ASCII vector (string literal or reg), so its low bytes are the path.
+        const ValType  fty    = type_of(fname);
+        const uint32_t fbytes = std::max<uint32_t>((fty.width + 7) / 8, 1);
+        llvm::Value*   path   = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(fbytes), "readmem.path");
+        b_.CreateAlignedStore(must_of(value_of(fname)), path, llvm::Align(1));
+
+        llvm::Value* mm_base = field_ptr(state_, s.off_mm);
+        llvm::Value* z_base  = field_ptr(state_, s.off_z);
+
+        const Type& at = std::get<Type>(mod_.pool.get(mod_.signal(info.target).type));
+
+        const auto   i64_of = [&](Index idx) { return cast(must_of(value_of(idx)), 64, true); };
+        llvm::Value* start  = info.has_start ? i64_of(info.start) : b_.getInt64(0);
+        llvm::Value* finish = info.has_finish ? i64_of(info.finish) : b_.getInt64(0);
+
+        const uint32_t flags = (info.hex ? 1u : 0u) | (info.has_start ? 2u : 0u) |
+                               (info.has_finish ? 4u : 0u) | (s.four_state ? 8u : 0u);
+
+        b_.CreateCall(readmem_fn(),
+                      { path, b_.getInt32(fbytes), mm_base, z_base, b_.getInt32(s.elem_stride),
+                        b_.getInt32(s.elem_count), b_.getInt32(s.width), b_.getInt64(at.left),
+                        b_.getInt64(at.right), start, finish, b_.getInt32(flags) });
     }
 
     // Lower a function `return`: a real `ret`, so it terminates the block and any

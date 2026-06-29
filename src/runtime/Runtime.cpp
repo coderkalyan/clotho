@@ -3,9 +3,11 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <new>
 #include <random>
 #include <string>
+#include <vector>
 
 #include "Wheel.h"
 
@@ -316,6 +318,202 @@ extern "C" void rt_finish(void) {
     // runs atexit handlers and flushes C stdio, so any buffered $display output is
     // committed before the process leaves.
     std::exit(0);
+}
+
+extern "C" void rt_fflush(void) {
+    // Flush every open output stream. $write output goes to stdout via fwrite;
+    // passing nullptr flushes all C stdio buffers (LRM $fflush with no descriptor).
+    std::fflush(nullptr);
+}
+
+namespace {
+
+// Hex / binary digit value, or -1 if `c` is not a digit of that base.
+int hex_digit(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+int bin_digit(char c) {
+    return (c == '0' || c == '1') ? c - '0' : -1;
+}
+
+} // namespace
+
+// $readmemh / $readmemb (LRM §21.4). Loads a hex/binary text file into an unpacked
+// array. The destination planes live in the JIT state buffer: element i's must|may
+// word is at mm_base + i*stride, its z word at z_base + i*stride (the backend passes
+// the two region bases, already offset to element 0). Each parsed token is assembled
+// into u64 must / may / z accumulators (element width <= 64, enforced by the backend)
+// and written with two memcpys of the field byte sizes — no per-element allocation.
+extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8_t* z_base,
+                           uint32_t stride, uint32_t count, uint32_t width, int64_t decl_left,
+                           int64_t decl_right, int64_t start, int64_t finish, uint32_t flags) {
+    const bool hex        = (flags & 1u) != 0;
+    const bool has_start  = (flags & 2u) != 0;
+    const bool has_finish = (flags & 4u) != 0;
+    const bool four_state = (flags & 8u) != 0;
+
+    // Reconstruct the path. The filename value is a right-justified packed-ASCII
+    // vector, so its bytes are little-endian (byte 0 = last character); the high
+    // bytes are zero padding. Walk from the top non-zero byte down.
+    std::string path;
+    uint32_t    hi = path_len;
+    while (hi > 0 && path_buf[hi - 1] == 0) {
+        --hi;
+    }
+    for (uint32_t k = hi; k-- > 0;) {
+        path.push_back(static_cast<char>(path_buf[k]));
+    }
+
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        std::fprintf(stderr, "$readmem: cannot open file '%s'\n", path.c_str());
+        return;
+    }
+    std::fseek(f, 0, SEEK_END);
+    const long sz = std::ftell(f);
+    std::rewind(f);
+    std::vector<char> buf(sz > 0 ? static_cast<size_t>(sz) : 0);
+    if (!buf.empty()) {
+        buf.resize(std::fread(buf.data(), 1, buf.size(), f));
+    }
+    std::fclose(f);
+
+    // Map a declared-range address to a 0-based storage index (mirrors the element
+    // select normalization): ascending range counts up from `decl_left`, descending
+    // counts down from it.
+    const auto norm = [&](int64_t a) -> int64_t {
+        return decl_left <= decl_right ? a - decl_left : decl_left - a;
+    };
+
+    // Iteration runs in declared-address space, not storage-index space (LRM
+    // §21.4). The default start is the *lowest* address and loading proceeds upward
+    // toward the highest, regardless of the range direction; a start-only form also
+    // goes upward; a start>finish pair decrements. The direction persists across any
+    // @addr directive in the file. norm() maps each address to its storage slot.
+    const int64_t lo_addr = decl_left < decl_right ? decl_left : decl_right;
+    const int64_t hi_addr = decl_left < decl_right ? decl_right : decl_left;
+    int64_t       addr    = has_start ? start : lo_addr;
+    const int64_t dir     = (has_finish && finish < start) ? -1 : 1;
+    // Loading stops at the finish address (if given) else the highest address; data
+    // beyond that bound is ignored with a warning (LRM §21.4).
+    const int64_t end = has_finish ? finish : hi_addr;
+
+    const uint32_t mm_bytes = (2 * width + 7) / 8;
+    const uint32_t z_bytes  = (width + 7) / 8;
+    const int      bits     = hex ? 4 : 1;
+    const uint64_t wmask    = width >= 64 ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << width) - 1);
+    const uint64_t nibble   = hex ? 0xFu : 0x1u;
+
+    const auto write_elem = [&](int64_t idx, uint64_t must, uint64_t may, uint64_t z) {
+        if (idx < 0 || idx >= static_cast<int64_t>(count)) {
+            std::fprintf(stderr, "$readmem: address out of range for '%s'\n", path.c_str());
+            return;
+        }
+        if (!four_state) {
+            // A 2-state memory has no z plane and reads x/z as 0.
+            may = must;
+            z   = 0;
+        }
+        must &= wmask;
+        may &= wmask;
+        z &= wmask;
+        const unsigned __int128 mmv = static_cast<unsigned __int128>(must) |
+                                      (static_cast<unsigned __int128>(may) << width);
+        std::memcpy(mm_base + static_cast<size_t>(idx) * stride, &mmv, mm_bytes);
+        std::memcpy(z_base + static_cast<size_t>(idx) * stride, &z, z_bytes);
+    };
+
+    const size_t n = buf.size();
+    size_t       i = 0;
+    while (i < n) {
+        const char c = buf[i];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v') {
+            ++i;
+            continue;
+        }
+        if (c == '/' && i + 1 < n && buf[i + 1] == '/') {
+            i += 2;
+            while (i < n && buf[i] != '\n') {
+                ++i;
+            }
+            continue;
+        }
+        if (c == '/' && i + 1 < n && buf[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < n && !(buf[i] == '*' && buf[i + 1] == '/')) {
+                ++i;
+            }
+            i += 2;
+            continue;
+        }
+        if (c == '@') {
+            // Address directive @hexaddr (always hex, regardless of readmemh/b).
+            ++i;
+            uint64_t a = 0;
+            for (int d; i < n && (d = hex_digit(buf[i])) >= 0; ++i) {
+                a = a * 16 + static_cast<uint64_t>(d);
+            }
+            addr = static_cast<int64_t>(a);
+            continue;
+        }
+        // A data token: accumulate digits MSB-first; x/z (and ?) mark unknown bits.
+        uint64_t must = 0;
+        uint64_t may  = 0;
+        uint64_t z    = 0;
+        bool     any  = false;
+        while (i < n) {
+            const char d = buf[i];
+            uint64_t   dv;
+            uint64_t   mv;
+            uint64_t   zv;
+            if (d == '_') {
+                ++i;
+                continue;
+            }
+            if (d == 'x' || d == 'X') {
+                dv = 0;
+                mv = nibble;
+                zv = 0;
+            } else if (d == 'z' || d == 'Z' || d == '?') {
+                dv = 0;
+                mv = nibble;
+                zv = nibble;
+            } else {
+                const int hv = hex ? hex_digit(d) : bin_digit(d);
+                if (hv < 0) {
+                    break;
+                }
+                dv = static_cast<uint64_t>(hv);
+                mv = dv;
+                zv = 0;
+            }
+            must = (must << bits) | dv;
+            may  = (may << bits) | mv;
+            z    = (z << bits) | zv;
+            any  = true;
+            ++i;
+        }
+        if (!any) {
+            ++i; // an unrecognized character; skip it and continue
+            continue;
+        }
+        if ((dir > 0 && addr > end) || (dir < 0 && addr < end)) {
+            // Past the finish / highest address: the remaining file data is dropped.
+            std::fprintf(stderr, "$readmem: more data than the memory range for '%s'\n", path.c_str());
+            break;
+        }
+        write_elem(norm(addr), must, may, z);
+        addr += dir;
+    }
 }
 
 extern "C" int32_t rt_random(void) {

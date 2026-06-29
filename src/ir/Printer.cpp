@@ -148,6 +148,12 @@ const char* tag_name(Inst::Tag tag) {
             return "display";
         case T::Finish:
             return "finish";
+        case T::Fflush:
+            return "fflush";
+        case T::DynPartSelect:
+            return "dyn_part_select";
+        case T::ReadMem:
+            return "read_mem";
         case T::SimTime:
             return "sim_time";
         case T::Random:

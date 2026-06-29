@@ -1376,6 +1376,17 @@ private:
             b.finish(loc(call));
             return;
         }
+        if (name == "$fflush") {
+            // The no-argument form flushes every open output buffer (LRM §21.3.6).
+            // The single-argument form, $fflush(fd), flushes one descriptor; file
+            // descriptors depend on $fopen, which is not implemented, so reject it.
+            // TODO: $fflush(fd) once multichannel file I/O exists.
+            if (!call.arguments().empty()) {
+                fail("$fflush with a file-descriptor argument is not supported");
+            }
+            b.fflush(loc(call));
+            return;
+        }
         if (name == "$printtimescale") {
             lower_printtimescale(call, b);
             return;
@@ -1384,7 +1395,41 @@ private:
             lower_timeformat(call, b);
             return;
         }
+        if (name == "$readmemh" || name == "$readmemb") {
+            lower_readmem(call, name == "$readmemh", b);
+            return;
+        }
         fail("unsupported system task '" + std::string(name) + "'");
+    }
+
+    // $readmemh / $readmemb (LRM §21.4): load a file into an unpacked-array memory.
+    // Forms: (file, mem), (file, mem, start), (file, mem, start, finish). The memory
+    // must be a whole unpacked array (a plain name or hierarchical reference); the
+    // filename and optional address bounds are general runtime values.
+    void lower_readmem(const CallExpression& call, bool hex, ir::Builder& b) {
+        const auto args = call.arguments();
+        if (args.size() < 2 || args.size() > 4) {
+            fail("$readmem requires 2 to 4 arguments");
+        }
+        const Expression& mem = *args[1];
+        const auto*       vsb = mem.as_if<slang::ast::ValueExpressionBase>();
+        if (vsb == nullptr || mem.type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() == nullptr) {
+            // TODO: a sliced memory target (mem[a:b]) or a multidimensional slice.
+            fail("$readmem target must be a whole unpacked-array memory");
+        }
+        const ir::Signal target   = signal_of(vsb->symbol);
+        const ir::Index  filename = lower_expr(*args[0], b);
+        ir::Index        start    = filename; // placeholder; unused unless has_start
+        ir::Index        finish   = filename;
+        const bool       has_start  = args.size() >= 3;
+        const bool       has_finish = args.size() >= 4;
+        if (has_start) {
+            start = lower_expr(*args[2], b);
+        }
+        if (has_finish) {
+            finish = lower_expr(*args[3], b);
+        }
+        b.read_mem(target, filename, start, finish, hex, has_start, has_finish, loc(call));
     }
 
     // $timeformat(units, precision, suffix, min_width): set the %t format for all

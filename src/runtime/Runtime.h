@@ -62,6 +62,20 @@ void rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uin
 // verbosity is accepted at the frontend but ignored here.
 [[noreturn]] void rt_finish(void);
 
+// $fflush (no-arg form, LRM 1800-2023 §21.3.6): flush all open output buffers so
+// queued $write output is emitted immediately.
+void rt_fflush(void);
+
+// $readmemh / $readmemb (LRM 1800-2023 §21.4): load a hex/binary text file into an
+// unpacked-array memory. `path_buf`/`path_len` carry the filename as a packed-ASCII
+// vector; `mm_base`/`z_base` point at element 0's must|may and z words in the state
+// buffer, strided by `stride`; `count`/`width` describe the memory; `decl_left`/
+// `decl_right` are its declared address bounds (for `@addr` and start/finish
+// mapping). `flags` bit0=hex, bit1=has_start, bit2=has_finish, bit3=four_state.
+void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8_t* z_base, uint32_t stride,
+                uint32_t count, uint32_t width, int64_t decl_left, int64_t decl_right, int64_t start,
+                int64_t finish, uint32_t flags);
+
 // -- $random --
 //
 // $random (LRM 1800-2023 §20.15.1): return the next value of the simulator's

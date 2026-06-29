@@ -143,6 +143,17 @@ Index Builder::finish(SourceLoc loc) {
     return emit({ Inst::Tag::Finish, Inst::Payload{ .none = 0 } }, loc);
 }
 
+Index Builder::fflush(SourceLoc loc) {
+    return emit({ Inst::Tag::Fflush, Inst::Payload{ .none = 0 } }, loc);
+}
+
+Index Builder::read_mem(Signal target, Index filename, Index start, Index finish, bool hex, bool has_start,
+                        bool has_finish, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(ReadMemInfo{ target, start, finish, hex, has_start, has_finish });
+
+    return emit({ Inst::Tag::ReadMem, Inst::Payload{ .op_extra = { filename, extra } } }, loc);
+}
+
 Index Builder::timeformat(Index units, Index precision, std::string_view suffix, Index min_width, SourceLoc loc) {
     // Order in the extra buffer: suffix bytes, then the TimeFormatInfo record
     // pointing at them. The three operands are plain SSA indices in the record.

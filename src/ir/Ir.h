@@ -104,6 +104,24 @@ struct ElemSelect {
     Ref array_type;
 };
 
+// Extra payload for `read_mem`: a $readmemh / $readmemb load of a file into an
+// unpacked-array memory. The filename value is the instruction's `op` (a packed-
+// ASCII vector; the backend spills its must-bits to a byte buffer). `target` is the
+// destination memory signal. `start` / `finish` are optional address-bound operands
+// (valid per `has_start` / `has_finish`). `hex` selects hex vs binary digits.
+struct ReadMemInfo {
+    // Destination memory signal.
+    Signal target;
+    // Optional first / last address operands (declared-range coordinates).
+    Index start;
+    Index finish;
+    // True for $readmemh, false for $readmemb.
+    bool hex;
+    // Whether the start / finish operands are present.
+    bool has_start;
+    bool has_finish;
+};
+
 // Extra payload for `call`: the callee plus its already-lowered argument values,
 // in formal-parameter order (each resized to the parameter type by the frontend).
 struct CallInfo {
@@ -203,7 +221,9 @@ static_assert(ExtraPayload<CallInfo>);
 static_assert(ExtraPayload<TaskCallInfo>);
 static_assert(ExtraPayload<Mux>);
 static_assert(ExtraPayload<PartSelect>);
+static_assert(ExtraPayload<DynPartSelect>);
 static_assert(ExtraPayload<ElemSelect>);
+static_assert(ExtraPayload<ReadMemInfo>);
 static_assert(ExtraPayload<Regions>);
 static_assert(ExtraPayload<LoopInfo>);
 static_assert(ExtraPayload<DisplayInfo>);
@@ -363,6 +383,13 @@ struct Inst {
         // has $stop suspend and $finish exit; with no resume mechanism a suspend
         // is observationally an exit, so both are treated identically.
         Finish,
+        // $fflush (no-arg form): flush all open output buffers (payload: none).
+        // LRM §21.3.6. Lowers to an rt_fflush call.
+        Fflush,
+        // $readmemh / $readmemb: load a hex/binary file into an unpacked-array
+        // memory (payload: op_extra -> ReadMemInfo; op is the filename value). LRM
+        // §21.4. Lowers to an rt_readmem call.
+        ReadMem,
 
         // -- System functions --
         // $time / $stime: read the simulation clock, -> 64-bit unsigned (payload:
