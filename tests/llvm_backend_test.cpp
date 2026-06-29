@@ -1096,23 +1096,72 @@ TEST_CASE("an unknown operand makes power x") {
     CHECK(out == "x\n");
 }
 
-TEST_CASE("power lowers to an rt_pow_u64 call") {
-    const std::string ir = emit(R"(
-        module m;
-            initial begin
-                logic [7:0] a, b, c;
-                a = 8'd17; b = 8'd5;
-                c = a ** b;
-            end
-        endmodule
-    )");
-    CHECK(ir.find("call i64 @rt_pow_u64(") != std::string::npos);
+// Wide (>64-bit) multiply, divide, modulo and power compute correctly. The
+// result of each is compared against a hand-computed wide literal so the check
+// only ever $displays a 1-bit value (the >64-bit display path is loud-fail).
+TEST_CASE("wide multiply, divide, modulo, power produce correct values") {
+    // 10^12 * 10^12 = 10^24, which exceeds 64 bits and fits in 100.
+    CHECK(run_capture(R"(module m; initial begin
+        logic [99:0] a, b, c;
+        a = 100'd1000000000000; b = 100'd1000000000000;
+        c = a * b;
+        $display("%0d", c == 100'd1000000000000000000000000);
+    end endmodule)") == "1\n");
+
+    CHECK(run_capture(R"(module m; initial begin
+        logic [99:0] a, b, c;
+        a = 100'd1000000000000000000000000; b = 100'd1000000000000;
+        c = a / b;
+        $display("%0d", c == 100'd1000000000000);
+    end endmodule)") == "1\n");
+
+    CHECK(run_capture(R"(module m; initial begin
+        logic [99:0] a, b, c;
+        a = 100'd1000000000000000000000007; b = 100'd10;
+        c = a % b;
+        $display("%0d", c == 100'd7);
+    end endmodule)") == "1\n");
+
+    // 2 ** 70 = 1180591620717411303424, also > 64 bits.
+    CHECK(run_capture(R"(module m; initial begin
+        logic [99:0] a, c; logic [7:0] e;
+        a = 100'd2; e = 8'd70;
+        c = a ** e;
+        $display("%0d", c == 100'd1180591620717411303424);
+    end endmodule)") == "1\n");
 }
 
-TEST_CASE("unsupported divide/modulo/power forms are rejected, not miscompiled") {
-    // The backend refuses (returns no module) rather than silently emitting wrong
-    // code for the unimplemented corners: wide divide/modulo (needs 128-bit
-    // division libcalls), signed power, and wide power.
+// The compiler-rt/libgcc libcalls (__multi3 / __udivti3 / __umodti3) must
+// resolve and execute in the JIT. $random operands are opaque to the optimizer,
+// so these multiplies/divides/mods run at runtime rather than constant-folding —
+// if the builtins were unresolved the JIT lookup would fail and produce no
+// output. Each design asserts a value-independent identity, so the result is 1
+// regardless of the drawn operands.
+TEST_CASE("wide arithmetic libcalls resolve and run in the JIT") {
+    // a*b fits in 100 bits (operands <= 48 bits), so (a*b)/b == a and (a*b)%b == 0.
+    CHECK(run_capture(R"(module m; initial begin
+        logic [31:0] r0, r1, r2, r3;
+        logic [99:0] a, b, c;
+        r0 = $random; r1 = $random; r2 = $random; r3 = $random;
+        a = {r0[15:0], r1};
+        b = {r2[15:0], r3} | 100'd1;
+        c = a * b;
+        $display("%0d", (c / b == a) && (c % b == 100'd0));
+    end endmodule)") == "1\n");
+
+    // Wide power at runtime: base 0..15, exponent runtime, so base**(e+1) fits in
+    // 100 bits and equals (base**e) * base.
+    CHECK(run_capture(R"(module m; initial begin
+        logic [7:0] rb, re; logic [99:0] base;
+        rb = $random; re = $random;
+        base = rb & 8'hF;
+        re = re & 8'h7;
+        $display("%0d", (base ** (re + 8'd1)) == ((base ** re) * base));
+    end endmodule)") == "1\n");
+}
+
+// Signed power remains unimplemented and must be rejected, not miscompiled.
+TEST_CASE("signed power is rejected, not miscompiled") {
     auto rejects = [](std::string_view src) {
         const LowerResult r = lower_text(src);
         REQUIRE_MESSAGE(r.ok, r.diagnostics);
@@ -1122,10 +1171,7 @@ TEST_CASE("unsupported divide/modulo/power forms are rejected, not miscompiled")
         return !ir::emit_llvm(*r.module, os);
     };
 
-    CHECK(rejects(R"(module m; initial begin logic [99:0] a, b, c; a = 1; b = 1; c = a / b; end endmodule)"));
-    CHECK(rejects(R"(module m; initial begin logic [99:0] a, b, c; a = 1; b = 1; c = a % b; end endmodule)"));
     CHECK(rejects(R"(module m; initial begin int a, b, c; a = 2; b = 3; c = a ** b; end endmodule)"));
-    CHECK(rejects(R"(module m; initial begin logic [99:0] a, b, c; a = 2; b = 3; c = a ** b; end endmodule)"));
 }
 
 // Multiple top-level modules are each implicitly instantiated once and

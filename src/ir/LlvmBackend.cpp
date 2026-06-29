@@ -2264,11 +2264,6 @@ private:
     llvm::FunctionCallee random_fn() {
         return llmod_.getOrInsertFunction("rt_random", llvm::FunctionType::get(b_.getInt32Ty(), {}, false));
     }
-    // i64 rt_pow_u64(i64 base, i64 exp)
-    llvm::FunctionCallee pow_fn() {
-        auto* i64 = b_.getInt64Ty();
-        return llmod_.getOrInsertFunction("rt_pow_u64", llvm::FunctionType::get(i64, { i64, i64 }, false));
-    }
     // i32 rt_wheel_pending(const rt_wheel*)
     llvm::FunctionCallee wheel_pending_fn() {
         auto* ptr = llvm::PointerType::getUnqual(ctx_);
@@ -2632,13 +2627,8 @@ private:
             case Inst::Tag::Div:
             case Inst::Tag::Mod: {
                 const ValType lt = type_of(p.binary.l);
-                if (lt.width > 64) {
-                    // TODO: integer / and % lower to LLVM udiv/sdiv/urem/srem, which legalize to
-                    // 128-bit __udivti3 / __umodti3 (and signed siblings) for wider operands; those
-                    // compiler-rt builtins are not resolvable in the JIT, so wide divide/modulo would
-                    // silently miscompute. Provision the libcalls before lifting this guard.
-                    throw BackendError{ "divide/modulo with operands wider than 64 bits not yet supported" };
-                }
+                // Wide operands legalize to the 128-bit __udivti3 / __umodti3 (and signed
+                // siblings) libcalls, resolved from compiler-rt/libgcc in the JIT (see run_jit).
                 set_value(i, lower_divmod(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r), lt.is_signed));
                 return;
             }
@@ -2650,11 +2640,6 @@ private:
                     // Table 11-4 (op1 == -1 parity, |op1| > 1 with op2 < 0 -> 0, etc.); only the
                     // unsigned path is lowered.
                     throw BackendError{ "signed power operator (**) not yet supported" };
-                }
-                if (lt.width > 64 || type_of(p.binary.r).width > 64) {
-                    // TODO: rt_pow_u64 is a 64-bit entry; wider operands need a multi-word runtime
-                    // helper before ** can be lowered for them.
-                    throw BackendError{ "power operator (**) with operands wider than 64 bits not yet supported" };
                 }
                 set_value(i, lower_pow(value_of(p.binary.l), value_of(p.binary.r)));
                 return;
@@ -3471,7 +3456,7 @@ private:
     // Power (**), unsigned. LRM 1800-2023 §11.4.3: the exponent is self-determined
     // (so it may be a different width from the base/result), any X/Z bit makes the
     // result X, and the unsigned table corners (exp 0 -> 1, 0**n -> 0, 1**n -> 1)
-    // fall out of exponentiation by squaring in rt_pow_u64.
+    // fall out of exponentiation by squaring.
     Plane lower_pow(Plane a, Plane b) {
         const uint32_t w  = width_of(a);
         const uint32_t ew = width_of(b);
@@ -3503,20 +3488,51 @@ private:
         llvm::Value* x_mm = llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w));
         b_.CreateBr(end_bb);
 
-        // Hot: compute in 64 bits and truncate to W. Since 2^W | 2^64 the modular
-        // result is exact at width W.
+        // Hot: exponentiation by squaring at the result width W. Every product wraps
+        // modulo 2^W, the correct result for width W; the wide (>64-bit) multiply
+        // legalizes to the __multi3 libcall resolved in the JIT. The exponent keeps
+        // its self-determined width so wide exponents are not truncated. The loop
+        // always runs once (exp 0 -> one no-op iteration leaving result 1), which
+        // yields the unsigned table corners directly.
         b_.SetInsertPoint(val_bb);
-        llvm::Value* base   = cast(must_of(a), 64, false);
-        llvm::Value* exp    = cast(must_of(b), 64, false);
-        llvm::Value* res    = b_.CreateCall(pow_fn(), { base, exp });
-        llvm::Value* r      = cast(res, w, false);
-        llvm::Value* val_mm = packed(r, r, zero(w)).mm;
-        b_.CreateBr(end_bb);
+        auto*        wty   = int_ty(w);
+        auto*        ety   = int_ty(ew);
+        // Seed values are materialized in val_bb so they dominate the loop's entry edge.
+        llvm::Value* base0 = must_of(a);
+        llvm::Value* exp0  = must_of(b);
+        auto*        loop  = llvm::BasicBlock::Create(ctx_, "pow.loop", fn_);
+        b_.CreateBr(loop);
+
+        b_.SetInsertPoint(loop);
+        llvm::PHINode* result = b_.CreatePHI(wty, 2);
+        llvm::PHINode* base   = b_.CreatePHI(wty, 2);
+        llvm::PHINode* exp    = b_.CreatePHI(ety, 2);
+        result->addIncoming(llvm::ConstantInt::get(wty, 1), val_bb);
+        base->addIncoming(base0, val_bb);
+        exp->addIncoming(exp0, val_bb);
+
+        // Multiply result by base when the low exponent bit is set; always square
+        // the base and shift the exponent down.
+        llvm::Value* odd      = b_.CreateTrunc(exp, b_.getInt1Ty());
+        llvm::Value* product  = b_.CreateMul(result, base);
+        llvm::Value* next_res = b_.CreateSelect(odd, product, result);
+        llvm::Value* next_bas = b_.CreateMul(base, base);
+        llvm::Value* next_exp = b_.CreateLShr(exp, llvm::ConstantInt::get(ety, 1));
+        llvm::Value* more     = b_.CreateICmpNE(next_exp, zero(ew));
+
+        // Result mantissa for the loop->end edge: emitted before the terminator so it
+        // dominates the predecessor's branch (PHI-incoming requirement).
+        llvm::Value* val_mm = packed(next_res, next_res, zero(w)).mm;
+
+        b_.CreateCondBr(more, loop, end_bb);
+        result->addIncoming(next_res, loop);
+        base->addIncoming(next_bas, loop);
+        exp->addIncoming(next_exp, loop);
 
         b_.SetInsertPoint(end_bb);
         llvm::PHINode* mm = b_.CreatePHI(wide, 2);
         mm->addIncoming(x_mm, x_bb);
-        mm->addIncoming(val_mm, val_bb);
+        mm->addIncoming(val_mm, loop);
         return { mm, zero(w) };
     }
 

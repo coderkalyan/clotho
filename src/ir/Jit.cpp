@@ -5,11 +5,14 @@
 
 #include <llvm/ExecutionEngine/Orc/AbsoluteSymbols.h>
 #include <llvm/ExecutionEngine/Orc/Core.h>
+#include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
+#include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
+#include <llvm/Support/CodeGen.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
@@ -49,7 +52,17 @@ int run_jit(const Module& m, Timings* timings) {
     }
     llvm::orc::ThreadSafeModule tsm(std::move(mod), std::move(ctx));
 
-    auto jit = llvm::orc::LLJITBuilder().create();
+    // Pin the JIT's machine-code generation to -O0. The IR is already optimized
+    // by the backend's own pass pipeline before it reaches ORC, so the codegen
+    // optimizer adds compile time for little gain on the JIT path.
+    auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
+    if (!jtmb) {
+        llvm::errs() << "jit: " << llvm::toString(jtmb.takeError()) << "\n";
+        return -1;
+    }
+    jtmb->setCodeGenOptLevel(llvm::CodeGenOptLevel::None);
+
+    auto jit = llvm::orc::LLJITBuilder().setJITTargetMachineBuilder(std::move(*jtmb)).create();
     if (!jit) {
         llvm::errs() << "jit: " << llvm::toString(jit.takeError()) << "\n";
         return -1;
@@ -89,6 +102,18 @@ int run_jit(const Module& m, Timings* timings) {
         llvm::errs() << "jit: " << llvm::toString(std::move(err)) << "\n";
         return -1;
     }
+
+    // Resolve the compiler-rt/libgcc builtins the backend emits for wide
+    // (>64-bit) arithmetic: __multi3 for multiply, __udivti3 / __umodti3 and
+    // their signed siblings for divide/modulo. They are linked into this process
+    // (libgcc_s), so expose the process symbol table to the JIT for the libcalls.
+    auto builtins = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+      (*jit)->getDataLayout().getGlobalPrefix());
+    if (!builtins) {
+        llvm::errs() << "jit: " << llvm::toString(builtins.takeError()) << "\n";
+        return -1;
+    }
+    jd.addGenerator(std::move(*builtins));
 
     if (auto err = (*jit)->addIRModule(std::move(tsm))) {
         llvm::errs() << "jit: " << llvm::toString(std::move(err)) << "\n";
