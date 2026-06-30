@@ -612,10 +612,11 @@ private:
         // The state pointer is the sole module memory the process touches; noalias
         // lets the allocator rematerialize signal loads instead of spilling them.
         fn_->addParamAttr(0, llvm::Attribute::NoAlias);
-        awaiter_     = nullptr;
-        nba_scratch_ = nullptr;
-        record_      = nullptr;
-        cur_is_task_ = false;
+        awaiter_          = nullptr;
+        nba_scratch_      = nullptr;
+        record_           = nullptr;
+        cur_is_task_      = false;
+        lowering_preinit_ = proc.activation == Activation::PreInit;
 
         auto* none     = llvm::ConstantTokenNone::get(ctx_);
         auto* null     = llvm::ConstantPointerNull::get(ptr_ty);
@@ -2073,9 +2074,28 @@ private:
             b_.CreateStore(b_.getInt32(0), inactive_top_gv_);
         }
         const auto all = mod_.processes();
+
+        // Pre-init pass first (LRM 6.8): apply variable declaration initializers
+        // before any Initial / Always process is created or subscribed. A PreInit
+        // body has no timing, so resuming it once runs it to completion; its stores
+        // generate no events (see lower_process), so the always blocks created
+        // below subscribe to already-settled values. Run before the seed loop so no
+        // wait queue is scanned before priming.
         for (uint32_t k = 0; k < procs.size(); ++k) {
-            llvm::Value*   hdl = b_.CreateCall(proc_fnty, procs[k], { state, wheel });
-            const Process& p   = all[k];
+            if (all[k].activation != Activation::PreInit) {
+                continue;
+            }
+            llvm::Value* hdl = b_.CreateCall(proc_fnty, procs[k], { state, wheel });
+            b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
+            b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
+        }
+
+        for (uint32_t k = 0; k < procs.size(); ++k) {
+            const Process& p = all[k];
+            if (p.activation == Activation::PreInit) {
+                continue; // already run above
+            }
+            llvm::Value* hdl = b_.CreateCall(proc_fnty, procs[k], { state, wheel });
             if (p.activation == Activation::Always && !p.wait_events.empty()) {
                 llvm::Constant* flag = llvm::ConstantExpr::getInBoundsGetElementPtr(
                   sched_arr_ty_, sched_gv_, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(k) });
@@ -2623,8 +2643,9 @@ private:
                 // detected from old -> new.
                 const LValue& lv      = lvalue_of(p.binary.l);
                 // Frame locals have no waiters; only a module signal store services
-                // wait queues.
-                const bool    service = lv.is_signal && signal_has_waiters(lv.sig);
+                // wait queues. A PreInit store (variable declaration initializer)
+                // generates no events, so it never services regardless of waiters.
+                const bool    service = !lowering_preinit_ && lv.is_signal && signal_has_waiters(lv.sig);
                 // Snapshot the selected storage (whole signal, or one array element)
                 // so an element write wakes Any-edge waiters on a change to that
                 // element rather than always reading element 0.
@@ -4162,6 +4183,9 @@ private:
     // layout. `cur_is_task_` selects the coroutine return path (epilogue) for Ret.
     const Function*         cur_fn_      = nullptr;
     bool                    cur_is_task_ = false;
+    // Set while lowering a PreInit process: its stores apply variable declaration
+    // initializers and must generate no events, so wait-queue servicing is skipped.
+    bool                    lowering_preinit_ = false;
     llvm::Value*            frame_       = nullptr;
     std::vector<FrameSlot>  frame_slots_;
     uint32_t                frame_bytes_ = 1;

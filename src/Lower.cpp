@@ -372,6 +372,13 @@ public:
         scope_  = &body;
         collect_signals(body);
         lower_members(body, self_prefix, self_mul);
+
+        // The top instance wraps the whole hierarchy: once it and all its children
+        // are lowered, every variable initializer has been collected, so emit the
+        // single pre-init process.
+        if (prefix.empty()) {
+            finalize_preinit();
+        }
     }
 
 private:
@@ -392,6 +399,17 @@ private:
                     break;
                 case SymbolKind::ProceduralBlock:
                     lower_procedural_block(m.as<ProceduralBlockSymbol>());
+                    break;
+                case SymbolKind::Variable:
+                    // Storage was registered by collect_signals; here only a
+                    // declaration initializer (LRM 6.8) needs lowering, into the
+                    // pre-init process.
+                    lower_var_initializer(m.as<VariableSymbol>());
+                    break;
+                case SymbolKind::Net:
+                    // Storage was registered by collect_signals; a net declaration
+                    // assignment (`wire w = expr`) is a continuous assignment.
+                    lower_net_initializer(m.as<NetSymbol>());
                     break;
                 case SymbolKind::Instance: {
                     const InstanceSymbol& child = m.as<InstanceSymbol>();
@@ -728,6 +746,36 @@ private:
                                          .ir          = b.finish() });
     }
 
+    // A net declaration assignment (`wire w = expr;`) is a continuous assignment
+    // (LRM 6.7.1 / 10.3.3), NOT a one-shot initialization like a variable's: slang
+    // models it as the net's initializer expression rather than a separate
+    // ContinuousAssignSymbol, so it is lowered here into the same kind of process a
+    // bare `assign` produces. The initializer is already converted to the net type
+    // by slang, so the store needs no extra resize.
+    void lower_net_initializer(const NetSymbol& ns) {
+        const Expression* init = ns.getInitializer();
+        if (init == nullptr) {
+            return;
+        }
+        ir::Builder         b(module_.pool);
+        const ir::SourceLoc l = loc(*init);
+        b.binary(ir::Inst::Tag::Store, value_lvalue(ns, b, l), lower_expr(*init, b), l);
+
+        // Sensitive to every signal the initializer reads (LRM 4.9.1); an empty
+        // list (constant RHS) yields the required run-once time-zero evaluation.
+        std::vector<ir::WaitEvent> wait_events;
+        SensitivityCollector       c(sigmap_);
+        init->visit(c);
+        for (const ir::Signal s : c.reads) {
+            wait_events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
+        }
+
+        module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
+                                         .wait_events = std::move(wait_events),
+                                         .loc         = to_source_loc(ns.location),
+                                         .ir          = b.finish() });
+    }
+
     // Wire one child instance's ports to the parent. Each connection becomes a
     // copy process across the boundary, carrying inferred sensitivity so the value
     // propagates on change (it must not inherit the empty-wait-list gap of plain
@@ -818,6 +866,11 @@ private:
 
         if (sym.procedureKind == ProceduralBlockKind::Initial) {
             activation = ir::Activation::Initial;
+        } else if (sym.procedureKind == ProceduralBlockKind::Final) {
+            // TODO: `final` blocks run once at simulation end ($finish), LRM 9.2.3.
+            // Lowering needs an end-of-sim hook; without it the block would be
+            // mis-scheduled as an always (a sensitivity-less infinite loop).
+            fail("final block is not supported");
         }
 
         const Statement* body = &sym.getBody();
@@ -1085,6 +1138,37 @@ private:
             const ir::SourceLoc l = loc(*init);
             b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
         }
+    }
+
+    // Apply a module-level (static) variable's declaration initializer (LRM 6.8)
+    // as a store in the run-once pre-init process. The store services no wait queue
+    // (the backend suppresses servicing for a PreInit process), so initialization
+    // generates no events and every Initial / Always process starts from the
+    // settled value, before any of them run. A variable with no initializer keeps
+    // its power-on default (X / 0), set by the backend's init_state.
+    void lower_var_initializer(const VariableSymbol& vs) {
+        const Expression* init = vs.getInitializer();
+        if (init == nullptr) {
+            return;
+        }
+        if (!preinit_) {
+            preinit_.emplace(module_.pool);
+        }
+        ir::Builder&        b = *preinit_;
+        const ir::SourceLoc l = loc(*init);
+        b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
+    }
+
+    // Emit the accumulated declaration initializers as one run-once PreInit
+    // process. Called once after the top instance and all its children are lowered;
+    // a no-op when the design has no variable initializers.
+    void finalize_preinit() {
+        if (!preinit_) {
+            return;
+        }
+        module_.add_process(
+          ir::Process{ .activation = ir::Activation::PreInit, .ir = preinit_->finish() });
+        preinit_.reset();
     }
 
     // for-loop. The initialization runs once in the enclosing region; the
@@ -2420,6 +2504,10 @@ private:
     // Monotonic counter naming anonymous output / inout task-argument temps created
     // in a process body (where temps are module signals, not frame locals).
     uint32_t task_temp_seq_ = 0;
+    // Accumulates static variable declaration initializers (LRM 6.8) across the
+    // whole instance hierarchy into one run-once pre-init process, finalized at the
+    // end of the top instance. Lazily engaged: absent when no initializer exists.
+    std::optional<ir::Builder> preinit_;
 };
 
 LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {

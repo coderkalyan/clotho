@@ -1555,6 +1555,52 @@ TEST_CASE("dynamic part-select carry-chain accumulate") {
     CHECK(out == "68ac\n");
 }
 
+// A module variable's declaration initializer (LRM 6.8) sets the value at time
+// zero, before any procedure runs; it is not dropped (regression) nor modeled as
+// a continuous assignment. Reading it from an initial block sees the value.
+TEST_CASE("module variable declaration initializers apply at time zero") {
+    const std::string out = run_capture(R"(
+        module m;
+            reg [7:0] v = 8'hA5;
+            int n = 42;
+            initial $display("%h %0d", v, n);
+        endmodule
+    )");
+    CHECK(out == "a5 42\n");
+}
+
+// The core decl-initializer-vs-edge bug: a clock with a declaration initializer
+// (`reg clk = 0`) must start at 0 so the toggling `always` produces real posedges.
+// Before the fix clk stayed X, ~X stayed X, and the posedge block never fired. The
+// clock is driven from an initial (bounded) so the design drains without $finish.
+TEST_CASE("declaration-initialized clock produces posedges") {
+    const std::string out = run_capture(R"(
+        module m;
+            reg clk = 0;
+            always @(posedge clk) $display("posedge %0d", $time);
+            initial repeat (6) #5 clk = ~clk;
+        endmodule
+    )");
+    CHECK(out == "posedge 5\nposedge 15\nposedge 25\n");
+}
+
+// A net declaration assignment (`wire w = a & b`) is a continuous assignment
+// (LRM 6.7.1), re-evaluated when its source changes — not a one-shot init and not
+// silently dropped (regression: it previously left the net at X).
+TEST_CASE("net declaration assignment is continuous") {
+    const std::string out = run_capture(R"(
+        module m;
+            logic a, b;
+            wire w = a & b;
+            initial begin
+                a = 1; b = 0; #1 $display("%b", w);
+                b = 1;        #1 $display("%b", w);
+            end
+        endmodule
+    )");
+    CHECK(out == "0\n1\n");
+}
+
 // Write `text` to `path` for a $readmem test, replacing any existing file.
 void write_file(const char* path, std::string_view text) {
     std::FILE* f = std::fopen(path, "w");

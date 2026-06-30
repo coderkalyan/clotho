@@ -262,6 +262,19 @@ TEST_CASE("case inside is reported as unsupported") {
     CHECK(ri.diagnostics.find("inside") != std::string::npos);
 }
 
+// A `final` block runs once at simulation end (LRM 9.2.3); without an end-of-sim
+// hook it must be rejected, not mis-scheduled as a sensitivity-less always (which
+// would spin forever at time zero).
+TEST_CASE("final block is reported as unsupported") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            final $display("done");
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("final block") != std::string::npos);
+}
+
 // -- Inferred (@*) combinational sensitivity --
 
 // The set of signal names a process is sensitive to, all expected level-sensitive.

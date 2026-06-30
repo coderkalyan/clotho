@@ -440,7 +440,17 @@ void print_module(const Module& m, std::ostream& os) {
     for (size_t i = 0; i < processes.size(); ++i) {
         const Process& p = processes[i];
         os << "process[" << i << "] ";
-        os << (p.activation == Activation::Initial ? "initial" : "always");
+        switch (p.activation) {
+            case Activation::PreInit:
+                os << "preinit";
+                break;
+            case Activation::Initial:
+                os << "initial";
+                break;
+            case Activation::Always:
+                os << "always";
+                break;
+        }
         for (const WaitEvent& w : p.wait_events) {
             os << " @";
             switch (w.edge) {

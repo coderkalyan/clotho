@@ -47,6 +47,10 @@ enum class ProcessId : uint32_t {};
 // process's wait list (Process::wait_events); this only separates one-shot
 // startup processes from those that re-arm and rerun whenever they are woken.
 enum class Activation : uint8_t {
+    // Runs once, before any Initial/Always process starts, to apply static
+    // variable declaration initializers (LRM 6.8). Its stores set state without
+    // generating events, so no process observes an edge from initialization.
+    PreInit,
     // Runs once at time zero, then completes (an `initial` block).
     Initial,
     // Re-armed after each run and rerun whenever one of its wait events fires
