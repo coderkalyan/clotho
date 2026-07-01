@@ -1584,6 +1584,24 @@ TEST_CASE("declaration-initialized clock produces posedges") {
     CHECK(out == "posedge 5\nposedge 15\nposedge 25\n");
 }
 
+// Declaration initializers must apply even when the design has more than one top
+// module (regression). finalize_preinit ran only for a top with an empty prefix,
+// but a multi-top design prefixes every top with "<name>.", so the pre-init
+// process was never emitted and every initializer was dropped. This is the
+// picorv32 AXI-testbench stall: unreferenced tops (picorv32_wb, ...) made the
+// design multi-top, so axi4_memory's `async_axi_transaction = ~0` came up X.
+TEST_CASE("declaration initializers apply with multiple top modules") {
+    const std::string out = run_capture(R"(
+        module other;
+        endmodule
+        module m;
+            reg [4:0] x = ~0;
+            initial $display("%b", x);
+        endmodule
+    )");
+    CHECK(out == "11111\n");
+}
+
 // A net declaration assignment (`wire w = a & b`) is a continuous assignment
 // (LRM 6.7.1), re-evaluated when its source changes — not a one-shot init and not
 // silently dropped (regression: it previously left the net at X).

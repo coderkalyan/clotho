@@ -372,13 +372,16 @@ public:
         scope_  = &body;
         collect_signals(body);
         lower_members(body, self_prefix, self_mul);
+    }
 
-        // The top instance wraps the whole hierarchy: once it and all its children
-        // are lowered, every variable initializer has been collected, so emit the
-        // single pre-init process.
-        if (prefix.empty()) {
-            finalize_preinit();
-        }
+    // Lower one top instance and its whole hierarchy, then emit the accumulated
+    // declaration initializers as this Lowerer's pre-init process. finalize_preinit
+    // runs here, per top, rather than inside lower_instance: a multi-top design
+    // gives every top a "<name>." prefix, so gating on an empty prefix would drop
+    // all initializers (each top gets its own Lowerer, so this covers each one).
+    void lower_top(const InstanceSymbol& top, std::string_view prefix) {
+        lower_instance(top, prefix);
+        finalize_preinit();
     }
 
 private:
@@ -2593,7 +2596,7 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
     try {
         for (const InstanceSymbol* top : root.topInstances) {
             const std::string prefix = single ? std::string() : std::string(top->name) + ".";
-            Lowerer(*module, tick_fs).lower_instance(*top, prefix);
+            Lowerer(*module, tick_fs).lower_top(*top, prefix);
         }
     } catch (const LowerError& e) {
         result.diagnostics += "error: " + e.message + "\n";
