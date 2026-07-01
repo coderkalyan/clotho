@@ -85,6 +85,13 @@ struct Process {
     // `initial` block, and (for now) for processes whose sensitivity is implicit
     // or not yet inferred (continuous assigns, @*).
     std::vector<WaitEvent> wait_events;
+    // True for a continuously-active process (continuous assign, module-port copy,
+    // always_comb / always_latch): it must evaluate once at time zero so it settles
+    // from the declaration-initialized values, then re-evaluate on its wait events
+    // (LRM 9.2.2.2, 10.3). An edge- or explicit-list-sensitive `always` leaves this
+    // false: it runs only when a wait event fires. Only meaningful with a non-empty
+    // wait list (a sensitivity-less process already runs once via the seed loop).
+    bool self_start = false;
     // Location of the AST construct that produced this process (the continuous
     // assign, always block, ...).
     SourceLoc loc = SourceLoc{ 0 };

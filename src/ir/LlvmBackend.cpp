@@ -2102,6 +2102,14 @@ private:
                 for (const WaitEvent& w : p.wait_events) {
                     emit_static_subscribe(w.signal, static_cast<uint32_t>(w.edge), hdl, flag);
                 }
+                // A continuously-active process (continuous assign / port copy /
+                // always_comb) also runs once now, so it settles from the pre-init
+                // values rather than waiting for an input edge that a declaration
+                // initializer never generates. It runs body-first then parks on its
+                // (already-subscribed) wait, so later input changes still wake it.
+                if (p.self_start) {
+                    emit_active_push(b_, hdl);
+                }
             } else {
                 emit_active_push(b_, hdl);
             }

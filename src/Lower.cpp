@@ -745,6 +745,7 @@ private:
 
         module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
                                          .wait_events = std::move(wait_events),
+                                         .self_start  = true,
                                          .loc         = to_source_loc(sym.location),
                                          .ir          = b.finish() });
     }
@@ -775,6 +776,7 @@ private:
 
         module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
                                          .wait_events = std::move(wait_events),
+                                         .self_start  = true,
                                          .loc         = to_source_loc(ns.location),
                                          .ir          = b.finish() });
     }
@@ -843,8 +845,12 @@ private:
                 b.binary(ir::Inst::Tag::Store, b.signal(child_sig, l), b.resize(lower_expr(*expr, b), ty, l), l);
                 collect_expr_reads(*expr, sens);
             }
+            // A port connection is a continuous copy: evaluate at time zero so the
+            // child sees the parent's declaration-initialized value even when the
+            // parent signal never changes afterward (LRM 23.3.3).
             module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
                                              .wait_events = std::move(sens),
+                                             .self_start  = true,
                                              .loc         = l,
                                              .ir          = b.finish() });
         }
@@ -919,8 +925,15 @@ private:
         if (infer) {
             collect_inferred_sensitivity(*body, wait_events);
         }
+        // always_comb / always_latch evaluate once at time zero (LRM 9.2.2.2), so
+        // they settle from declaration-initialized values. An `always @*` or an
+        // explicit `@(...)` list is a plain sensitivity list that runs only when a
+        // listed signal changes, matching Verilog, so it is left non-self-starting.
+        const bool self_start = sym.procedureKind == ProceduralBlockKind::AlwaysComb ||
+                                sym.procedureKind == ProceduralBlockKind::AlwaysLatch;
         module_.add_process(ir::Process{ .activation  = activation,
                                          .wait_events = std::move(wait_events),
+                                         .self_start  = self_start,
                                          .loc         = to_source_loc(sym.location),
                                          .ir          = b.finish() });
     }

@@ -1602,6 +1602,36 @@ TEST_CASE("declaration initializers apply with multiple top modules") {
     CHECK(out == "11111\n");
 }
 
+// A declaration initializer must propagate to continuously-active consumers at
+// time zero (regression). A continuous assign / port copy / always_comb subscribes
+// to its sources but is event-driven; when a source is written only by the
+// non-servicing pre-init pass it generates no edge, so the consumer must instead
+// self-start (run once at time zero, LRM 10.3 / 9.2.2.2). Before the fix `y` and
+// the child's reset input stayed X, which is what left the native picorv32 core in
+// reset with mem_valid = X. Covers a continuous assign, a module-port copy, and the
+// posedge reset that reads the copied value.
+TEST_CASE("declaration initializers propagate to continuous consumers at time zero") {
+    const std::string out = run_capture(R"(
+        module dut(input clk, input rstn, output reg valid);
+            always @(posedge clk) valid <= rstn ? 1'b1 : 1'b0;
+        endmodule
+        module m;
+            reg  en = 0;
+            wire y = en;                 // continuous assign of a decl-init reg
+            reg  rstn = 0;               // reaches dut through a port copy
+            reg  clk = 0;
+            wire dvalid;
+            dut u(.clk(clk), .rstn(rstn), .valid(dvalid));
+            always #5 clk = ~clk;
+            initial begin
+                #12 $display("y=%b dvalid=%b", y, dvalid);
+                $finish;
+            end
+        endmodule
+    )");
+    CHECK(out == "y=0 dvalid=0\n");
+}
+
 // A net declaration assignment (`wire w = a & b`) is a continuous assignment
 // (LRM 6.7.1), re-evaluated when its source changes — not a one-shot init and not
 // silently dropped (regression: it previously left the net at X).
