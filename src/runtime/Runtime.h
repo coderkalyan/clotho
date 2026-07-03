@@ -121,6 +121,18 @@ int32_t rt_rewind(int32_t fd);
 // a multiple of 8.
 int32_t rt_fgets(uint8_t* mm, uint8_t* z, uint32_t width, int32_t fd);
 
+// $sformat / $swrite (LRM §21.3.3): format `fmt` with `argc` descriptors (as
+// rt_fwrite) and store the result into the destination string variable, whose
+// must|may plane is at `mm` (2*`width` bits) and z plane at `z` (`width` bits).
+// Stored right-justified; an oversized result keeps its low bytes. `width` must be
+// a multiple of 8.
+void rt_sformat(uint8_t* mm, uint8_t* z, uint32_t width, const char* fmt, uint32_t argc, const rt_arg* argv);
+
+// $ferror(fd, str) (LRM §21.3.6): write the descriptor's most recent error message
+// into the string variable at `mm` / `z` (`width` bits) and return its error code
+// (0 when the stream is clear).
+int32_t rt_ferror(int32_t fd, uint8_t* mm, uint8_t* z, uint32_t width);
+
 // $fflush(desc): flush the output buffers of descriptor `desc` (an MCD or FD).
 // The no-argument $fflush passes 0, which flushes every open stream (LRM
 // §21.3.6).

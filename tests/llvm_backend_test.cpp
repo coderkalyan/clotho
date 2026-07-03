@@ -1879,6 +1879,66 @@ TEST_CASE("$fgetc / $ungetc / $feof") {
     std::remove(path);
 }
 
+// $sformat renders an explicit format into a string variable, stored
+// right-justified. %h layout cross-checked against Icarus (0x..6465633d37).
+TEST_CASE("$sformat into a string variable") {
+    CHECK(run_capture(R"(
+        module m;
+            reg [8*8-1:0] s;
+            initial begin
+                $sformat(s, "hex=%0h dec=%0d", 255, 7);
+                $display("%h", s);
+            end
+        endmodule
+    )") == "6666206465633d37\n"); // "ff dec=7" (low 8 bytes of "hex=ff dec=7")
+}
+
+// An oversized $sformat result keeps its low (rightmost) bytes, matching a
+// string-to-narrower-reg assignment. Cross-checked against Icarus.
+TEST_CASE("$sformat truncates to the low bytes on overflow") {
+    CHECK(run_capture(R"(
+        module m;
+            reg [8*4-1:0] s;
+            initial begin
+                $sformat(s, "abcdef");
+                $display("%h", s);
+            end
+        endmodule
+    )") == "63646566\n"); // "cdef"
+}
+
+// $swrite concatenates $write-style; bare values use clotho's %0d default width.
+TEST_CASE("$swrite concatenates into a string variable") {
+    CHECK(run_capture(R"(
+        module m;
+            reg [8*8-1:0] s;
+            initial begin
+                $swrite(s, "v", 5);
+                $display("%h", s);
+            end
+        endmodule
+    )") == "0000000000007635\n"); // "v5"
+}
+
+// $ferror reports a clear stream as code 0 (the message write-back path).
+TEST_CASE("$ferror on a clear stream returns 0") {
+    const char* path = "clotho_ferror_test.txt";
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, code;
+            reg [8*80-1:0] msg;
+            initial begin
+                fd = $fopen(")") + path + R"(", "w");
+                code = $ferror(fd, msg);
+                $display("%0d", code);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "0\n");
+    std::remove(path);
+}
+
 // $ftell reports the offset, $fseek repositions (operation 0 = SEEK_SET), and
 // $rewind returns to the start (LRM §21.3.5).
 TEST_CASE("$ftell / $fseek / $rewind") {

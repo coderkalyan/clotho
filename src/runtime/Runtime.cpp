@@ -1,6 +1,7 @@
 #include "Runtime.h"
 
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -248,6 +249,24 @@ std::string unpack_ascii(const char* buf, uint32_t len) {
 std::FILE* fd_stream(int32_t desc) {
     const uint32_t idx = static_cast<uint32_t>(desc & ~kFdBit);
     return idx < fd_streams.size() ? fd_streams[idx] : nullptr;
+}
+
+// Store `count` bytes right-justified into a packed vector's planes: byte 0 (LSB)
+// holds the last byte, higher bytes precede it, the top bytes are cleared. When
+// the bytes overflow the vector the low (rightmost) `capacity` are kept. must ==
+// may (bytes are fully known) and the z plane is cleared. width % 8 == 0 (the
+// backend guards it), so the must / may plane halves stay byte-aligned. Shared by
+// $fgets, $sformat / $swrite, and $ferror.
+void store_string_planes(uint8_t* mm, uint8_t* z, uint32_t width, const uint8_t* bytes, uint32_t count) {
+    const uint32_t capacity = width / 8;
+    std::memset(mm, 0, static_cast<size_t>(capacity) * 2);
+    std::memset(z, 0, capacity);
+    const uint32_t keep = count < capacity ? count : capacity;
+    for (uint32_t k = 0; k < keep; ++k) {
+        const uint8_t byte = bytes[count - 1 - k]; // last byte read lands in mm[0]
+        mm[k]              = byte;                  // must half (low `width` bits)
+        mm[capacity + k]   = byte;                  // may half (high `width` bits)
+    }
 }
 
 clotho::Timer& unwrap(rt_timer* t) {
@@ -507,18 +526,41 @@ extern "C" int32_t rt_fgets(uint8_t* mm, uint8_t* z, uint32_t width, int32_t fd)
     if (count == 0) {
         return 0;
     }
-    // Store right-justified into the must|may plane: byte 0 holds the last
-    // character read, higher bytes precede it, the top bytes stay zero. must == may
-    // (characters are fully known) and the z plane is cleared. width % 8 == 0 (the
-    // backend guards it), so the must / may halves are byte-aligned.
-    std::memset(mm, 0, static_cast<size_t>(capacity) * 2);
-    std::memset(z, 0, capacity);
-    for (uint32_t k = 0; k < count; ++k) {
-        const uint8_t byte = line[count - 1 - k];
-        mm[k]              = byte; // must half (low `width` bits)
-        mm[capacity + k]   = byte; // may half (high `width` bits)
-    }
+    store_string_planes(mm, z, width, line.data(), count);
     return static_cast<int32_t>(count);
+}
+
+extern "C" void
+rt_sformat(uint8_t* mm, uint8_t* z, uint32_t width, const char* fmt, uint32_t argc, const rt_arg* argv) {
+    // $sformat / $swrite: render like $display, then store the result into the
+    // destination string variable (LRM §21.3.3). An oversized result keeps its low
+    // (rightmost) bytes, matching a string-to-narrower-reg assignment.
+    std::string out;
+    render(out, fmt, argc, argv);
+    store_string_planes(mm, z, width, reinterpret_cast<const uint8_t*>(out.data()),
+                        static_cast<uint32_t>(out.size()));
+}
+
+extern "C" int32_t rt_ferror(int32_t fd, uint8_t* mm, uint8_t* z, uint32_t width) {
+    // $ferror (LRM §21.3.6): return the stream's error code and write the matching
+    // message into `str`. C stdio has no per-stream error code, only an indicator,
+    // so errno is the closest portable source. A cleared stream reports 0.
+    // TODO: the LRM's exact error-code values are implementation-defined; this
+    // surfaces errno / strerror rather than a fixed table.
+    io_ensure_init();
+    std::FILE*  f    = fd_stream(fd);
+    int         code = 0;
+    const char* msg  = "";
+    if (f == nullptr) {
+        code = -1;
+        msg  = "invalid file descriptor";
+    } else if (std::ferror(f) != 0) {
+        code = errno;
+        msg  = std::strerror(errno);
+    }
+    store_string_planes(mm, z, width, reinterpret_cast<const uint8_t*>(msg),
+                        static_cast<uint32_t>(std::strlen(msg)));
+    return code;
 }
 
 extern "C" void rt_timeformat_init(uint64_t tick_fs, int32_t default_units) {

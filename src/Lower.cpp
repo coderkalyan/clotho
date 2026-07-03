@@ -1470,6 +1470,10 @@ private:
             lower_fdisplay(call, name == "$fdisplay", b);
             return;
         }
+        if (name == "$swrite" || name == "$sformat") {
+            lower_sformat(call, name == "$sformat", b);
+            return;
+        }
         if (name == "$fclose") {
             if (call.arguments().size() != 1) {
                 fail("$fclose requires a single file-descriptor argument");
@@ -1478,9 +1482,10 @@ private:
             return;
         }
         if (name == "$fgets" || name == "$fgetc" || name == "$ungetc" || name == "$feof" ||
-            name == "$ftell" || name == "$fseek" || name == "$rewind") {
-            // File read / positioning functions used in statement position: lower
-            // for the side effect (file position, write-back) and drop the result.
+            name == "$ftell" || name == "$fseek" || name == "$rewind" || name == "$ferror") {
+            // File read / positioning / error functions used in statement position:
+            // lower for the side effect (file position, write-back) and drop the
+            // result.
             lower_sysfunc(call, b);
             return;
         }
@@ -1767,6 +1772,18 @@ private:
             return b.fgets(dst, fd, l);
         }
 
+        // $ferror(fd, str) (LRM §21.3.6): write the descriptor's error message into
+        // the string lvalue `str`, returning the error code.
+        if (name == "$ferror") {
+            const auto args = call.arguments();
+            if (args.size() != 2) {
+                fail("$ferror expects two arguments (fd, str)");
+            }
+            const ir::Index fd  = lower_expr(*args[0], b);
+            const ir::Index dst = lower_lvalue(*args[1], b);
+            return b.ferror(dst, fd, l);
+        }
+
         // TODO: $realtime (LRM §20.3.3) returns a real scaled to the module time
         // unit; blocked on real (floating-point) value support in the IR.
         if (name == "$realtime") {
@@ -1788,8 +1805,14 @@ private:
         size_t            next = 0; // front of `pending`
 
         for (const Expression* arg : format_args) {
-            if (arg->kind == ExpressionKind::StringLiteral) {
-                const std::string_view text = arg->as<StringLiteral>().getValue();
+            // A string-literal argument (SV-style) contributes format text, even
+            // when width-converted; unwrap conversions to see the literal.
+            const Expression* lit = arg;
+            while (lit->kind == ExpressionKind::Conversion) {
+                lit = &lit->as<ConversionExpression>().operand();
+            }
+            if (lit->kind == ExpressionKind::StringLiteral) {
+                const std::string_view text = lit->as<StringLiteral>().getValue();
                 fmt += text;
                 collect_specifiers(text, pending);
             } else {
@@ -1828,6 +1851,36 @@ private:
         std::vector<ir::Index> args;
         build_format(args_in.subspan(1), fmt, args, b);
         b.fdisplay(fd, fmt, newline, args, loc(call));
+    }
+
+    // Lower $sformat / $swrite (LRM §21.3.3): render the trailing arguments like
+    // $write and store the result into the destination string lvalue (the first
+    // argument). $sformat's format (its second argument) must be a string literal;
+    // $swrite takes $write-style interleaved literals and values.
+    void lower_sformat(const CallExpression& call, bool is_sformat, ir::Builder& b) {
+        const auto args = call.arguments();
+        if (args.empty()) {
+            fail("$sformat / $swrite requires a destination string argument");
+        }
+        if (is_sformat) {
+            if (args.size() < 2) {
+                fail("$sformat requires a format-string argument");
+            }
+            const Expression* fmt = args[1];
+            while (fmt->kind == ExpressionKind::Conversion) {
+                fmt = &fmt->as<ConversionExpression>().operand();
+            }
+            if (fmt->kind != ExpressionKind::StringLiteral) {
+                // TODO: a runtime (non-literal) $sformat format string needs
+                // dynamic string support, which Clotho lacks.
+                fail("$sformat format must be a string literal");
+            }
+        }
+        const ir::Index        dst = lower_lvalue(*args[0], b);
+        std::string            fmt;
+        std::vector<ir::Index> values;
+        build_format(args.subspan(1), fmt, values, b);
+        b.sformat(dst, fmt, values, loc(call));
     }
 
     // Append the conversion character of each format specifier in `s` to `out`,

@@ -158,6 +158,10 @@ const char* tag_name(Inst::Tag tag) {
             return "file_op";
         case T::Fgets:
             return "fgets";
+        case T::Sformat:
+            return "sformat";
+        case T::Ferror:
+            return "ferror";
         case T::DynPartSelect:
             return "dyn_part_select";
         case T::ReadMem:
@@ -340,6 +344,16 @@ private:
             case Inst::PayloadKind::FileOp: {
                 const auto info = ir_.extra_data<FileOpInfo>(p.extra);
                 os_ << "op" << info.op;
+                for (Index a : ir_.region(info.args)) {
+                    os_ << ", ";
+                    ref(a);
+                }
+                break;
+            }
+            case Inst::PayloadKind::Sformat: {
+                const auto info = ir_.extra_data<SformatInfo>(p.extra);
+                ref(info.dst);
+                os_ << ", \"" << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
                 for (Index a : ir_.region(info.args)) {
                     os_ << ", ";
                     ref(a);

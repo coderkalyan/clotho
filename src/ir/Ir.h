@@ -237,6 +237,29 @@ struct FgetsInfo {
     Index fd;
 };
 
+// Extra payload for `sformat`: $sformat / $swrite (LRM §21.3.3) format the value
+// args per the packed format-string bytes at `fmt` (`fmt_len` bytes) and store the
+// result into the destination string lvalue `dst`. `args` is the value-operand
+// slice the specifiers consume.
+struct SformatInfo {
+    // Destination string lvalue.
+    Index dst;
+    // First extra word of the packed format-string bytes.
+    ExtraIndex fmt;
+    // Format-string length in bytes.
+    uint32_t fmt_len;
+    // Value operands consumed by the format specifiers.
+    ExtraSlice args;
+};
+
+// Extra payload for `ferror`: $ferror(fd, str) (LRM §21.3.6) writes the
+// descriptor's error message into the string lvalue (the instruction's `op`) and
+// returns the error code. `fd` is a value operand.
+struct FerrorInfo {
+    // File-descriptor value operand.
+    Index fd;
+};
+
 // Extra payload for `timeformat`: a $timeformat system task. `units`,
 // `precision`, and `min_width` are value operands (general runtime rvalues); the
 // suffix string is appended after the formatted number and lives packed
@@ -285,6 +308,8 @@ static_assert(ExtraPayload<DisplayInfo>);
 static_assert(ExtraPayload<FopenInfo>);
 static_assert(ExtraPayload<FileOpInfo>);
 static_assert(ExtraPayload<FgetsInfo>);
+static_assert(ExtraPayload<SformatInfo>);
+static_assert(ExtraPayload<FerrorInfo>);
 static_assert(ExtraPayload<TimeFormatInfo>);
 static_assert(ExtraPayload<WaitEdge>);
 static_assert(ExtraPayload<WaitInfo>);
@@ -450,6 +475,13 @@ struct Inst {
         // character count (payload: op_extra -> FgetsInfo; op is the destination
         // lvalue, extra holds the descriptor value). LRM §21.3.4. Lowers to rt_fgets.
         Fgets,
+        // $sformat / $swrite: format value args and store the result into a string
+        // lvalue (payload: extra -> SformatInfo). LRM §21.3.3. Lowers to rt_sformat.
+        Sformat,
+        // $ferror: write a descriptor's error message into a string lvalue, ->
+        // error code (payload: op_extra -> FerrorInfo; op is the destination
+        // lvalue). LRM §21.3.6. Lowers to an rt_ferror call.
+        Ferror,
         // $timeformat: set the %t format (units / precision / suffix / min width)
         // for all later %t specifiers (payload: timeformat -> TimeFormatInfo).
         // LRM §20.4.3. Lowers to an rt_timeformat_set call.
@@ -502,6 +534,7 @@ struct Inst {
         TimeFormat,
         Wait,
         FileOp,
+        Sformat,
     };
 
     union Payload {

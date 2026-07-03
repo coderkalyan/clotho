@@ -174,6 +174,22 @@ Index Builder::fgets(Index dst, Index fd, SourceLoc loc) {
     return emit({ Inst::Tag::Fgets, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
 }
 
+Index Builder::sformat(Index dst, std::string_view fmt, std::span<const Index> args, SourceLoc loc) {
+    // Order in the extra buffer: format bytes, then the arg-index slice, then the
+    // SformatInfo record pointing at both.
+    const ExtraIndex fmt_at = add_bytes(fmt);
+    const ExtraSlice slice  = add_slice(args);
+    const ExtraIndex extra = add_extra(SformatInfo{ dst, fmt_at, static_cast<uint32_t>(fmt.size()), slice });
+
+    return emit({ Inst::Tag::Sformat, Inst::Payload{ .extra = extra } }, loc);
+}
+
+Index Builder::ferror(Index dst, Index fd, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(FerrorInfo{ fd });
+
+    return emit({ Inst::Tag::Ferror, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+}
+
 Index Builder::finish(SourceLoc loc) {
     return emit({ Inst::Tag::Finish, Inst::Payload{ .none = 0 } }, loc);
 }

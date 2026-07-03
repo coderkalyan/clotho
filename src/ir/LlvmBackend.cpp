@@ -2487,7 +2487,8 @@ private:
                 return { 32, false, true };
             case Inst::Tag::FileValueOp:
             case Inst::Tag::Fgets:
-                // The file read / positioning functions all return a 32-bit int.
+            case Inst::Tag::Ferror:
+                // The file read / positioning / error functions all return i32.
                 return { 32, false, true };
 
             case Inst::Tag::Add:
@@ -2557,6 +2558,7 @@ private:
             case Inst::Tag::Finish:
             case Inst::Tag::Fflush:
             case Inst::Tag::Fclose:
+            case Inst::Tag::Sformat:
             case Inst::Tag::ReadMem:
             case Inst::Tag::TaskCall:
                 return { 0, false, false };
@@ -2833,6 +2835,14 @@ private:
 
             case Inst::Tag::Fgets:
                 lower_fgets(i);
+                return;
+
+            case Inst::Tag::Sformat:
+                lower_sformat(i);
+                return;
+
+            case Inst::Tag::Ferror:
+                lower_ferror(i);
                 return;
 
             case Inst::Tag::ReadMem:
@@ -3309,25 +3319,76 @@ private:
     // right-justified into the must|may plane, clears the z plane, and returns the
     // character count.
     void lower_fgets(Index i) {
-        const Index   dst  = ir_->payload(i).op_extra.op;
-        const auto    info = ir_->extra_data<FgetsInfo>(ir_->payload(i).op_extra.extra);
-        const LValue& lv   = lvalue_of(dst);
+        const Index dst  = ir_->payload(i).op_extra.op;
+        const auto  info = ir_->extra_data<FgetsInfo>(ir_->payload(i).op_extra.extra);
+        const auto [mm, z, width] = string_dest(dst, "$fgets");
+        llvm::Value* fd           = cast(must_of(value_of(info.fd)), 32, true);
+        llvm::Value* r            = b_.CreateCall(fgets_fn(), { mm, z, b_.getInt32(width), fd });
+        set_value(i, packed(r, r, zero(32)));
+    }
+
+    // Resolve a whole packed-vector lvalue to (must|may plane ptr, z plane ptr, bit
+    // width) for a string write-back ($fgets / $sformat / $ferror). Part-select and
+    // non-byte-multiple targets loud-fail: the runtime fills a whole byte-aligned
+    // vector. `who` names the caller.
+    std::tuple<llvm::Value*, llvm::Value*, uint32_t> string_dest(Index dst, const char* who) {
+        const LValue& lv = lvalue_of(dst);
         if (lv.width != lv.store_width) {
-            // TODO: a part-select target ($fgets(s[15:0], fd)) writes only a slice;
-            // the runtime fills a whole packed vector today.
-            throw BackendError{ "$fgets into a part-select target is not supported" };
+            // TODO: a part-select target (s[15:0]) writes only a slice.
+            throw BackendError{ std::string(who) + " into a part-select target is not supported" };
         }
         if (lv.store_width % 8 != 0) {
             // TODO: a non-byte-multiple width leaves the must|may plane halves
-            // byte-unaligned; $fgets targets are byte vectors in practice.
-            throw BackendError{ "$fgets into a target whose width is not a multiple of 8 is not supported" };
+            // byte-unaligned; targets are byte vectors in practice.
+            throw BackendError{ std::string(who) +
+                                " into a target whose width is not a multiple of 8 is not supported" };
         }
         llvm::Value* mm = lv.dyn_off != nullptr ? elem_ptr(lv.base, lv.off_mm, lv.dyn_off)
                                                 : field_ptr(lv.base, lv.off_mm);
         llvm::Value* z  = lv.dyn_off != nullptr ? elem_ptr(lv.base, lv.off_z, lv.dyn_off)
                                                 : field_ptr(lv.base, lv.off_z);
-        llvm::Value* fd = cast(must_of(value_of(info.fd)), 32, true);
-        llvm::Value* r  = b_.CreateCall(fgets_fn(), { mm, z, b_.getInt32(lv.store_width), fd });
+        return { mm, z, lv.store_width };
+    }
+
+    // void rt_sformat(i8* mm, i8* z, i32 width, const char* fmt, i32 argc, const rt_arg* argv)
+    llvm::FunctionCallee sformat_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, i32, ptr, i32, ptr }, false);
+        return llmod_.getOrInsertFunction("rt_sformat", fnty);
+    }
+
+    // Lower a $sformat / $swrite: build the format-arg descriptor array and hand it,
+    // the format string, and the destination vector's planes to the runtime.
+    void lower_sformat(Index i) {
+        const auto        info = ir_->extra_data<SformatInfo>(ir_->payload(i).extra);
+        const std::string fmt  = ir_->extra_bytes(info.fmt, info.fmt_len);
+
+        const std::span<const Index> args = ir_->region(info.args);
+        llvm::Value*                 arr  = build_rt_args(args, "$sformat / $swrite");
+        const auto [mm, z, width]         = string_dest(info.dst, "$sformat / $swrite");
+        llvm::Value* fmt_ptr              = b_.CreateGlobalString(fmt);
+        b_.CreateCall(
+          sformat_fn(),
+          { mm, z, b_.getInt32(width), fmt_ptr, b_.getInt32(static_cast<uint32_t>(args.size())), arr });
+    }
+
+    // i32 rt_ferror(i32 fd, i8* mm, i8* z, i32 width)
+    llvm::FunctionCallee ferror_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(i32, { i32, ptr, ptr, i32 }, false);
+        return llmod_.getOrInsertFunction("rt_ferror", fnty);
+    }
+
+    // Lower a $ferror: pass the descriptor plus the destination string's planes; the
+    // runtime writes the message and returns the error code.
+    void lower_ferror(Index i) {
+        const Index dst  = ir_->payload(i).op_extra.op;
+        const auto  info = ir_->extra_data<FerrorInfo>(ir_->payload(i).op_extra.extra);
+        const auto [mm, z, width] = string_dest(dst, "$ferror");
+        llvm::Value* fd           = cast(must_of(value_of(info.fd)), 32, true);
+        llvm::Value* r            = b_.CreateCall(ferror_fn(), { fd, mm, z, b_.getInt32(width) });
         set_value(i, packed(r, r, zero(32)));
     }
 
@@ -3511,12 +3572,46 @@ private:
         b_.SetInsertPoint(cont_bb);
     }
 
-    // Lower a $display / $write: stack-allocate an rt_arg[] descriptor array, pack
-    // each value operand's planes into it, and call the runtime formatter.
+    // Build the runtime rt_arg[] descriptor array shared by every $display-family
+    // format call: stack-allocate one slot per value operand and pack its planes
+    // (width, sign, and the must / xz / z low-64 bits). Returns the array pointer
+    // (a null pointer when there are no operands). `who` names the caller in the
+    // >64-bit loud-fail.
     // TODO: rt_arg carries only the low 64 bits of each plane, so an operand wider
-    // than 64 bits cannot be passed in full. Until the descriptor grows a
-    // full-width path, such an operand is loud-failed below rather than printed
-    // with its high bits silently dropped (docs/TODO.md, M1 $display).
+    // than 64 bits cannot be passed in full; such an operand is loud-failed rather
+    // than formatted with its high bits silently dropped (docs/TODO.md, M1 $display).
+    llvm::Value* build_rt_args(std::span<const Index> args, const char* who) {
+        const auto n = static_cast<uint32_t>(args.size());
+        if (n == 0) {
+            return llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+        }
+        llvm::StructType* sty = arg_struct_ty();
+        llvm::Value*      arr = b_.CreateAlloca(sty, b_.getInt32(n), "fmt_args");
+        for (uint32_t k = 0; k < n; ++k) {
+            const Plane   p = value_of(args[k]);
+            const ValType t = type_of(args[k]);
+            if (t.width > 64) {
+                throw BackendError{ std::string(who) +
+                                    " of an operand wider than 64 bits is not supported (it "
+                                    "would format with its high bits truncated)" };
+            }
+            llvm::Value* must = must_of(p);
+            llvm::Value* may  = may_of(p);
+            // xz = must ^ may marks every unknown bit (X and Z); z marks the Z
+            // subset. The runtime distinguishes them per bit.
+            llvm::Value* xz  = b_.CreateXor(must, may);
+            llvm::Value* elt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
+            store_field(sty, elt, 0, b_.getInt32(t.width));
+            store_field(sty, elt, 1, b_.getInt32(t.is_signed ? 1u : 0u));
+            store_field(sty, elt, 2, cast(must, 64, false));
+            store_field(sty, elt, 3, cast(xz, 64, false));
+            store_field(sty, elt, 4, cast(p.z, 64, false));
+        }
+        return arr;
+    }
+
+    // Lower a $display / $write / $fdisplay / $fwrite: build the descriptor array
+    // and call the runtime formatter with the destination descriptor.
     void lower_display(Index i) {
         const auto  info = ir_->extra_data<DisplayInfo>(ir_->payload(i).display);
         std::string fmt  = ir_->extra_bytes(info.fmt, info.fmt_len);
@@ -3525,38 +3620,13 @@ private:
         }
 
         const std::span<const Index> args = ir_->region(info.args);
-        const auto                   n    = static_cast<uint32_t>(args.size());
-
-        llvm::StructType* sty = arg_struct_ty();
-        llvm::Value*      arr = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
-        if (n > 0) {
-            arr = b_.CreateAlloca(sty, b_.getInt32(n), "display_args");
-            for (uint32_t k = 0; k < n; ++k) {
-                const Plane   p    = value_of(args[k]);
-                const ValType t    = type_of(args[k]);
-                if (t.width > 64) {
-                    throw BackendError{ "$display / $write of an operand wider than 64 bits is not "
-                                        "supported (it would print with its high bits truncated)" };
-                }
-                llvm::Value*  must = must_of(p);
-                llvm::Value*  may  = may_of(p);
-                // xz = must ^ may marks every unknown bit (X and Z); z marks the Z
-                // subset. The runtime distinguishes them per bit.
-                llvm::Value* xz  = b_.CreateXor(must, may);
-                llvm::Value* elt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
-                store_field(sty, elt, 0, b_.getInt32(t.width));
-                store_field(sty, elt, 1, b_.getInt32(t.is_signed ? 1u : 0u));
-                store_field(sty, elt, 2, cast(must, 64, false));
-                store_field(sty, elt, 3, cast(xz, 64, false));
-                store_field(sty, elt, 4, cast(p.z, 64, false));
-            }
-        }
+        llvm::Value*                 arr  = build_rt_args(args, "$display / $write");
 
         // $display / $write target the standard-output MCD (bit 0); $fdisplay /
         // $fwrite carry an explicit descriptor operand.
         llvm::Value* desc = info.has_fd ? cast(must_of(value_of(info.fd)), 32, true) : b_.getInt32(1);
         llvm::Value* fmt_ptr = b_.CreateGlobalString(fmt);
-        b_.CreateCall(fwrite_fn(), { desc, fmt_ptr, b_.getInt32(n), arr });
+        b_.CreateCall(fwrite_fn(), { desc, fmt_ptr, b_.getInt32(static_cast<uint32_t>(args.size())), arr });
     }
 
     void store_field(llvm::StructType* sty, llvm::Value* elt, unsigned idx, llvm::Value* v) {

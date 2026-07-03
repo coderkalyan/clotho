@@ -90,6 +90,8 @@ int run_jit(const Module& m, Timings* timings) {
     expose("rt_fseek", &rt_fseek);
     expose("rt_rewind", &rt_rewind);
     expose("rt_fgets", &rt_fgets);
+    expose("rt_sformat", &rt_sformat);
+    expose("rt_ferror", &rt_ferror);
     expose("rt_timeformat_init", &rt_timeformat_init);
     expose("rt_timeformat_set", &rt_timeformat_set);
     expose("rt_finish", &rt_finish);

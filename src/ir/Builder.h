@@ -98,6 +98,12 @@ public:
     // $fgets: read a line from descriptor `fd` into the packed-vector lvalue `dst`.
     // Yields the character count.
     Index fgets(Index dst, Index fd, SourceLoc loc);
+    // $sformat / $swrite: format `args` per `fmt` and store the result into the
+    // string lvalue `dst`. No value.
+    Index sformat(Index dst, std::string_view fmt, std::span<const Index> args, SourceLoc loc);
+    // $ferror: write descriptor `fd`'s error message into the string lvalue `dst`.
+    // Yields the error code.
+    Index ferror(Index dst, Index fd, SourceLoc loc);
     // $finish / $stop: end the simulation and exit. No operands.
     Index finish(SourceLoc loc);
     // $fflush: flush the descriptor `handle`'s output buffers. The no-argument
