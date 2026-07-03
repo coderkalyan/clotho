@@ -79,12 +79,23 @@ public:
 
     // -- System tasks --
     // $display / $write: a literal format string, a newline flag (true for
-    // $display), and the already-lowered value args its specifiers consume.
+    // $display), and the already-lowered value args its specifiers consume. The
+    // backend writes to standard output.
     Index display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc);
+    // $fdisplay / $fwrite: like display, but `fd` selects the destination
+    // descriptor (an MCD or FD value).
+    Index fdisplay(Index fd, std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc);
+    // $fopen: open `name`, yielding a 32-bit descriptor. With `has_mode`, `mode`
+    // is the C stdio mode string and the result is an FD; without it a fresh MCD
+    // is opened for writing (`mode` is ignored, pass any Index).
+    Index fopen(Index name, Index mode, bool has_mode, SourceLoc loc);
+    // $fclose: close the descriptor `handle`. No value.
+    Index fclose(Index handle, SourceLoc loc);
     // $finish / $stop: end the simulation and exit. No operands.
     Index finish(SourceLoc loc);
-    // $fflush (no-arg form): flush all open output buffers. No operands.
-    Index fflush(SourceLoc loc);
+    // $fflush: flush the descriptor `handle`'s output buffers. The no-argument
+    // form passes a constant 0 (the runtime flushes every open stream).
+    Index fflush(Index handle, SourceLoc loc);
     // $readmemh / $readmemb: load a file into the memory signal `target`. `filename`
     // is the path value; `start` / `finish` are optional address bounds (pass any
     // Index when the matching has_* is false). `hex` selects hex vs binary.
@@ -113,6 +124,12 @@ public:
     Ir finish();
 
 private:
+    // Shared body of display / fdisplay: emit a Display inst carrying the format
+    // string, the value args, and an optional destination descriptor (`fd` valid
+    // iff `has_fd`; otherwise the backend targets standard output).
+    Index display_impl(Index fd, bool has_fd, std::string_view fmt, bool newline, std::span<const Index> args,
+                       SourceLoc loc);
+
     Index emit(const Inst& inst, SourceLoc loc) {
         const auto index = static_cast<uint32_t>(tags_.size());
         tags_.push_back(inst.tag);

@@ -167,19 +167,37 @@ struct LoopInfo {
     ExtraSlice step;
 };
 
-// Extra payload for `display`: a $display / $write system task. The format-string
-// bytes live packed little-endian (4 chars per u32 word) at `fmt` for `fmt_len`
-// bytes; `args` is the slice of value operands the format specifiers consume, in
-// order; `newline` is 1 for $display (append '\n') and 0 for $write.
+// Extra payload for `display`: a $display / $write / $fdisplay / $fwrite system
+// task. The format-string bytes live packed little-endian (4 chars per u32 word)
+// at `fmt` for `fmt_len` bytes; `args` is the slice of value operands the format
+// specifiers consume, in order; `newline` is 1 for the $*display forms (append
+// '\n') and 0 for the $*write forms. `fd` is the destination descriptor operand
+// for the $f* forms; when `has_fd` is 0 ($display / $write) the backend writes to
+// the standard-output MCD and `fd` is unused.
 struct DisplayInfo {
     // First extra word of the packed format-string bytes.
     ExtraIndex fmt;
     // Format-string length in bytes.
     uint32_t fmt_len;
-    // 1 => append a trailing newline ($display); 0 => none ($write).
+    // 1 => append a trailing newline ($display / $fdisplay); 0 => none.
     uint32_t newline;
+    // Destination descriptor operand ($fdisplay / $fwrite); valid iff has_fd.
+    Index fd;
+    // 1 => fd is a real descriptor operand; 0 => write to standard output.
+    uint32_t has_fd;
     // Value operands consumed by the format specifiers.
     ExtraSlice args;
+};
+
+// Extra payload for `fopen`: the $fopen(name, mode) form. `mode` is the C stdio
+// mode-string operand (a packed-ASCII vector, spilled by the backend) and is
+// valid iff `has_mode`; the name value is the instruction's `op`. With a mode a
+// single FD is opened, without one a fresh MCD is opened for writing.
+struct FopenInfo {
+    // C stdio mode-string operand; valid iff has_mode.
+    Index mode;
+    // 1 => two-argument $fopen (FD); 0 => one-argument $fopen (MCD).
+    uint32_t has_mode;
 };
 
 // Extra payload for `timeformat`: a $timeformat system task. `units`,
@@ -227,6 +245,7 @@ static_assert(ExtraPayload<ReadMemInfo>);
 static_assert(ExtraPayload<Regions>);
 static_assert(ExtraPayload<LoopInfo>);
 static_assert(ExtraPayload<DisplayInfo>);
+static_assert(ExtraPayload<FopenInfo>);
 static_assert(ExtraPayload<TimeFormatInfo>);
 static_assert(ExtraPayload<WaitEdge>);
 static_assert(ExtraPayload<WaitInfo>);
@@ -373,8 +392,16 @@ struct Inst {
         Wait,
 
         // -- System tasks --
-        // $display / $write: format string + variadic args (payload: display).
+        // $display / $write / $fdisplay / $fwrite: format string + variadic args,
+        // with an optional destination descriptor (payload: display -> DisplayInfo).
         Display,
+        // $fopen: open a file, -> 32-bit descriptor value (payload: op_extra ->
+        // FopenInfo; op is the filename value). LRM §21.3. One-argument form yields
+        // an MCD, two-argument form yields an FD. Lowers to rt_fopen_mcd/_fd.
+        Fopen,
+        // $fclose: close a file descriptor (payload: unary, the descriptor value).
+        // LRM §21.3.2. Lowers to an rt_fclose call.
+        Fclose,
         // $timeformat: set the %t format (units / precision / suffix / min width)
         // for all later %t specifiers (payload: timeformat -> TimeFormatInfo).
         // LRM §20.4.3. Lowers to an rt_timeformat_set call.
@@ -383,8 +410,9 @@ struct Inst {
         // has $stop suspend and $finish exit; with no resume mechanism a suspend
         // is observationally an exit, so both are treated identically.
         Finish,
-        // $fflush (no-arg form): flush all open output buffers (payload: none).
-        // LRM §21.3.6. Lowers to an rt_fflush call.
+        // $fflush: flush a descriptor's output buffers (payload: unary, the
+        // descriptor value; the no-argument form passes a constant 0, which the
+        // runtime treats as "flush all"). LRM §21.3.6. Lowers to an rt_fflush call.
         Fflush,
         // $readmemh / $readmemb: load a hex/binary file into an unpacked-array
         // memory (payload: op_extra -> ReadMemInfo; op is the filename value). LRM

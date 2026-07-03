@@ -79,7 +79,10 @@ int run_jit(const Module& m, Timings* timings) {
             llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable,
         };
     };
-    expose("rt_display", &rt_display);
+    expose("rt_fwrite", &rt_fwrite);
+    expose("rt_fopen_mcd", &rt_fopen_mcd);
+    expose("rt_fopen_fd", &rt_fopen_fd);
+    expose("rt_fclose", &rt_fclose);
     expose("rt_timeformat_init", &rt_timeformat_init);
     expose("rt_timeformat_set", &rt_timeformat_set);
     expose("rt_finish", &rt_finish);

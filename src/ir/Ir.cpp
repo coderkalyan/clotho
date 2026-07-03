@@ -23,6 +23,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Lnot:
         case T::Ret:
         case T::Delay:
+        case T::Fclose:
+        case T::Fflush:
             return K::Unary;
 
         case T::BitSelect:
@@ -81,6 +83,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::PartSelect:
         case T::ElemSelect:
         case T::Cond:
+        case T::Fopen:
             return K::OpExtra;
     }
 

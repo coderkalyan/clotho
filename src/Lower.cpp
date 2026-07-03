@@ -1466,6 +1466,17 @@ private:
             lower_display(call, name == "$display", b);
             return;
         }
+        if (name == "$fdisplay" || name == "$fwrite") {
+            lower_fdisplay(call, name == "$fdisplay", b);
+            return;
+        }
+        if (name == "$fclose") {
+            if (call.arguments().size() != 1) {
+                fail("$fclose requires a single file-descriptor argument");
+            }
+            b.fclose(lower_expr(*call.arguments()[0], b), loc(call));
+            return;
+        }
         if (name == "$finish" || name == "$stop") {
             // Both end the simulation and exit. LRM §20.2 defines $stop as
             // suspending the run (vs $finish exiting to the OS) and mandates no
@@ -1477,14 +1488,17 @@ private:
             return;
         }
         if (name == "$fflush") {
-            // The no-argument form flushes every open output buffer (LRM §21.3.6).
-            // The single-argument form, $fflush(fd), flushes one descriptor; file
-            // descriptors depend on $fopen, which is not implemented, so reject it.
-            // TODO: $fflush(fd) once multichannel file I/O exists.
-            if (!call.arguments().empty()) {
-                fail("$fflush with a file-descriptor argument is not supported");
+            // No-argument form flushes every open output buffer; the runtime reads
+            // a 0 descriptor as "flush all" (LRM §21.3.6). The single-argument form
+            // flushes one MCD / FD.
+            ir::Index handle;
+            if (call.arguments().empty()) {
+                const ir::Ref u32 = make_int_type(32, false, false);
+                handle            = b.constant(module_.pool.put_int(u32, 0), loc(call));
+            } else {
+                handle = lower_expr(*call.arguments()[0], b);
             }
-            b.fflush(loc(call));
+            b.fflush(handle, loc(call));
             return;
         }
         if (name == "$printtimescale") {
@@ -1603,6 +1617,25 @@ private:
         return b.binary(ir::Inst::Tag::Mul, b.resize(v, u64, l), mul, l);
     }
 
+    // Lower a string-valued system-task argument (a $fopen filename / mode) to a
+    // packed-ASCII vector value. slang types these arguments as the dynamic
+    // `string` type, wrapping a string literal in a conversion Clotho has no
+    // representation for; strip those conversions to recover the packed byte
+    // vector the runtime expects (byte 0 = last character). A genuine dynamic
+    // string value has no packed form and is rejected.
+    ir::Index lower_string_arg(const Expression& expr, ir::Builder& b) {
+        const Expression* e = &expr;
+        while (e->kind == ExpressionKind::Conversion && e->type->getCanonicalType().isString()) {
+            e = &e->as<ConversionExpression>().operand();
+        }
+        if (e->type->getCanonicalType().isString()) {
+            // TODO: a dynamic-string variable / expression as a filename or mode
+            // needs runtime string support, which Clotho lacks.
+            fail("$fopen with a dynamic-string argument is not supported");
+        }
+        return lower_expr(*e, b);
+    }
+
     // Lower a system function call used as an rvalue (e.g. `$time`). User function
     // calls are not yet supported.
     ir::Index lower_sysfunc(const CallExpression& call, ir::Builder& b) {
@@ -1661,6 +1694,21 @@ private:
             return b.resize(lower_expr(*call.arguments()[0], b), lower_type(*call.type), l);
         }
 
+        // $fopen (LRM §21.3): one argument opens a multichannel descriptor (MCD)
+        // for writing; two arguments open a single file descriptor (FD) with the
+        // given C stdio mode string. The name / mode lower to packed-ASCII vectors
+        // the backend spills to byte buffers, like $readmem's filename.
+        if (name == "$fopen") {
+            const auto args = call.arguments();
+            if (args.empty() || args.size() > 2) {
+                fail("$fopen expects one or two arguments");
+            }
+            const ir::Index fname    = lower_string_arg(*args[0], b);
+            const bool      has_mode = args.size() == 2;
+            const ir::Index mode     = has_mode ? lower_string_arg(*args[1], b) : fname;
+            return b.fopen(fname, mode, has_mode, l);
+        }
+
         // TODO: $realtime (LRM §20.3.3) returns a real scaled to the module time
         // unit; blocked on real (floating-point) value support in the IR.
         if (name == "$realtime") {
@@ -1669,19 +1717,19 @@ private:
         fail("unsupported system function '" + std::string(name) + "'");
     }
 
-    // Lower $display / $write into a single format string plus the value args its
-    // specifiers consume. A string-literal argument contributes its text verbatim
-    // (its %-specifiers pull from following value args, SV-style); a bare value
-    // argument not covered by an earlier specifier gets a default `%0d`.
-    void lower_display(const CallExpression& call, bool newline, ir::Builder& b) {
-        std::string            fmt;
-        std::vector<ir::Index> args;
+    // Build the combined format string and value-arg list of a $display-family
+    // task from `format_args` (the arguments after any leading descriptor). A
+    // string-literal argument contributes its text verbatim (its %-specifiers pull
+    // from following value args, SV-style); a bare value argument not covered by an
+    // earlier specifier gets a default `%0d`.
+    void build_format(std::span<const Expression* const> format_args, std::string& fmt,
+                      std::vector<ir::Index>& args, ir::Builder& b) {
         // Conversion chars of specifiers seen but not yet matched to a value arg,
         // in order (FIFO). Needed so a `%t` argument can be scaled to ticks.
         std::vector<char> pending;
         size_t            next = 0; // front of `pending`
 
-        for (const Expression* arg : call.arguments()) {
+        for (const Expression* arg : format_args) {
             if (arg->kind == ExpressionKind::StringLiteral) {
                 const std::string_view text = arg->as<StringLiteral>().getValue();
                 fmt += text;
@@ -1700,8 +1748,28 @@ private:
                 args.push_back(v);
             }
         }
+    }
 
+    // Lower $display / $write: format the arguments and write to standard output.
+    void lower_display(const CallExpression& call, bool newline, ir::Builder& b) {
+        std::string            fmt;
+        std::vector<ir::Index> args;
+        build_format(call.arguments(), fmt, args, b);
         b.display(fmt, newline, args, loc(call));
+    }
+
+    // Lower $fdisplay / $fwrite (LRM §21.3.3): the first argument is the
+    // destination descriptor (an MCD or FD); the rest form the message.
+    void lower_fdisplay(const CallExpression& call, bool newline, ir::Builder& b) {
+        const auto args_in = call.arguments();
+        if (args_in.empty()) {
+            fail("$fdisplay / $fwrite requires a file-descriptor argument");
+        }
+        const ir::Index       fd = lower_expr(*args_in[0], b);
+        std::string            fmt;
+        std::vector<ir::Index> args;
+        build_format(args_in.subspan(1), fmt, args, b);
+        b.fdisplay(fd, fmt, newline, args, loc(call));
     }
 
     // Append the conversion character of each format specifier in `s` to `out`,

@@ -1,5 +1,6 @@
 #include "Runtime.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -163,6 +164,92 @@ void render_arg(std::string& out, const rt_arg& a, char conv) {
     }
 }
 
+// Format `fmt` with the argument descriptors, appending to `out`. Shared by every
+// $write-family task ($display / $write / $fdisplay / $fwrite differ only in the
+// destination and the folded-in newline, both handled by the caller). Text is
+// emitted verbatim; a `%` begins a specifier whose flags / width / precision are
+// skipped (the field is auto-sized) and whose conversion char selects render_arg.
+void render(std::string& out, const char* fmt, uint32_t argc, const rt_arg* argv) {
+    uint32_t ai = 0;
+    for (const char* p = fmt; *p != '\0'; ++p) {
+        if (*p != '%') {
+            out += *p;
+            continue;
+        }
+        ++p;
+        if (*p == '\0') {
+            out += '%';
+            break;
+        }
+        if (*p == '%') {
+            out += '%';
+            continue;
+        }
+        // Skip flags and an optional width/precision; the field is auto-sized.
+        while (*p == '-' || *p == '+' || *p == ' ' || *p == '0') {
+            ++p;
+        }
+        while ((*p >= '0' && *p <= '9') || *p == '.') {
+            ++p;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        if (ai < argc) {
+            render_arg(out, argv[ai++], *p);
+        }
+    }
+}
+
+// -- File I/O descriptor tables (LRM §21.3) --
+//
+// Two integer descriptor kinds share this state, distinguished by bit 31 (see
+// Runtime.h). The tables are process-global and unsynchronized: one simulator
+// per process, single-threaded. Adding thread safety later means a lock around
+// these two containers plus stdio's own per-stream locking on the writes.
+
+// Bit 31: set marks an FD, clear marks an MCD.
+constexpr int32_t kFdBit = static_cast<int32_t>(0x80000000u);
+
+// MCD channels indexed by bit position; [0] is the preopened standard output. A
+// one-argument $fopen claims the lowest free channel in [1, 30].
+std::array<std::FILE*, 31> mcd_channels{};
+
+// FD streams indexed by (descriptor & ~kFdBit); [0]/[1]/[2] are stdin/stdout/
+// stderr. A closed slot holds nullptr and is reused before the vector grows.
+std::vector<std::FILE*> fd_streams;
+
+// Preopen the standard streams on first file-I/O use, so a design that never
+// touches file I/O pays nothing. mcd_channels[0] doubles as the init flag.
+void io_ensure_init() {
+    if (mcd_channels[0] != nullptr) {
+        return;
+    }
+    mcd_channels[0] = stdout;
+    fd_streams      = { stdin, stdout, stderr };
+}
+
+// Reconstruct a string from a right-justified packed-ASCII vector: byte 0 is the
+// last character and the high bytes are zero padding (the layout $readmem and
+// $fopen both receive from the backend).
+std::string unpack_ascii(const char* buf, uint32_t len) {
+    std::string s;
+    uint32_t    hi = len;
+    while (hi > 0 && buf[hi - 1] == 0) {
+        --hi;
+    }
+    for (uint32_t k = hi; k-- > 0;) {
+        s.push_back(static_cast<char>(buf[k]));
+    }
+    return s;
+}
+
+// Resolve a single-stream FD to its FILE*, or nullptr if out of range / closed.
+std::FILE* fd_stream(int32_t desc) {
+    const uint32_t idx = static_cast<uint32_t>(desc & ~kFdBit);
+    return idx < fd_streams.size() ? fd_streams[idx] : nullptr;
+}
+
 clotho::Timer& unwrap(rt_timer* t) {
     return *reinterpret_cast<clotho::Timer*>(t);
 }
@@ -261,40 +348,81 @@ extern "C" void rt_wheel_tick(rt_wheel* wheel, void* ctx) {
     unwrap(wheel)->tick(ctx);
 }
 
-extern "C" void rt_display(const char* fmt, uint32_t argc, const rt_arg* argv) {
-    std::string out;
-    uint32_t    ai = 0;
-    for (const char* p = fmt; *p != '\0'; ++p) {
-        if (*p != '%') {
-            out += *p;
-            continue;
-        }
-        ++p;
-        if (*p == '\0') {
-            out += '%';
-            break;
-        }
-        if (*p == '%') {
-            out += '%';
-            continue;
-        }
-        // Skip flags and an optional width/precision; the field is auto-sized.
-        while (*p == '-' || *p == '+' || *p == ' ' || *p == '0') {
-            ++p;
-        }
-        while ((*p >= '0' && *p <= '9') || *p == '.') {
-            ++p;
-        }
-        if (*p == '\0') {
-            break;
-        }
-        if (ai < argc) {
-            render_arg(out, argv[ai++], *p);
-        }
-    }
+extern "C" void rt_fwrite(int32_t desc, const char* fmt, uint32_t argc, const rt_arg* argv) {
+    io_ensure_init();
     // Write raw: `out` may contain '%' or '{}' that printf/std::print would treat
     // as format syntax.
-    std::fwrite(out.data(), 1, out.size(), stdout);
+    std::string out;
+    render(out, fmt, argc, argv);
+    if ((desc & kFdBit) != 0) {
+        if (std::FILE* f = fd_stream(desc)) {
+            std::fwrite(out.data(), 1, out.size(), f);
+        }
+        return;
+    }
+    // MCD: emit to every set channel (LRM §21.3.4 multichannel descriptor).
+    for (int b = 0; b < 31; ++b) {
+        if ((desc & (int32_t{ 1 } << b)) != 0 && mcd_channels[b] != nullptr) {
+            std::fwrite(out.data(), 1, out.size(), mcd_channels[b]);
+        }
+    }
+}
+
+extern "C" int32_t rt_fopen_mcd(const char* name_buf, uint32_t name_len) {
+    io_ensure_init();
+    const std::string path = unpack_ascii(name_buf, name_len);
+    // Claim the lowest free channel; bit 0 is the reserved standard output.
+    for (int b = 1; b < 31; ++b) {
+        if (mcd_channels[b] == nullptr) {
+            std::FILE* f = std::fopen(path.c_str(), "w");
+            if (f == nullptr) {
+                return 0;
+            }
+            mcd_channels[b] = f;
+            return int32_t{ 1 } << b;
+        }
+    }
+    return 0; // all 30 channels in use
+}
+
+extern "C" int32_t
+rt_fopen_fd(const char* name_buf, uint32_t name_len, const char* mode_buf, uint32_t mode_len) {
+    io_ensure_init();
+    const std::string path = unpack_ascii(name_buf, name_len);
+    const std::string mode = unpack_ascii(mode_buf, mode_len);
+    std::FILE*        f    = std::fopen(path.c_str(), mode.c_str());
+    if (f == nullptr) {
+        return 0;
+    }
+    // Reuse a slot emptied by $fclose before growing the table; indices 0..2 are
+    // the reserved standard streams.
+    for (uint32_t idx = 3; idx < fd_streams.size(); ++idx) {
+        if (fd_streams[idx] == nullptr) {
+            fd_streams[idx] = f;
+            return kFdBit | static_cast<int32_t>(idx);
+        }
+    }
+    fd_streams.push_back(f);
+    return kFdBit | static_cast<int32_t>(fd_streams.size() - 1);
+}
+
+extern "C" void rt_fclose(int32_t desc) {
+    io_ensure_init();
+    if ((desc & kFdBit) != 0) {
+        const uint32_t idx = static_cast<uint32_t>(desc & ~kFdBit);
+        if (idx >= 3 && idx < fd_streams.size() && fd_streams[idx] != nullptr) {
+            std::fclose(fd_streams[idx]);
+            fd_streams[idx] = nullptr;
+        }
+        return;
+    }
+    // MCD: close every set channel except the preopened standard output (bit 0).
+    for (int b = 1; b < 31; ++b) {
+        if ((desc & (int32_t{ 1 } << b)) != 0 && mcd_channels[b] != nullptr) {
+            std::fclose(mcd_channels[b]);
+            mcd_channels[b] = nullptr;
+        }
+    }
 }
 
 extern "C" void rt_timeformat_init(uint64_t tick_fs, int32_t default_units) {
@@ -320,10 +448,24 @@ extern "C" void rt_finish(void) {
     std::exit(0);
 }
 
-extern "C" void rt_fflush(void) {
-    // Flush every open output stream. $write output goes to stdout via fwrite;
-    // passing nullptr flushes all C stdio buffers (LRM $fflush with no descriptor).
-    std::fflush(nullptr);
+extern "C" void rt_fflush(int32_t desc) {
+    if (desc == 0) {
+        // No-argument $fflush: passing nullptr flushes all C stdio buffers.
+        std::fflush(nullptr);
+        return;
+    }
+    io_ensure_init();
+    if ((desc & kFdBit) != 0) {
+        if (std::FILE* f = fd_stream(desc)) {
+            std::fflush(f);
+        }
+        return;
+    }
+    for (int b = 0; b < 31; ++b) {
+        if ((desc & (int32_t{ 1 } << b)) != 0 && mcd_channels[b] != nullptr) {
+            std::fflush(mcd_channels[b]);
+        }
+    }
 }
 
 namespace {
@@ -361,17 +503,9 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
     const bool has_finish = (flags & 4u) != 0;
     const bool four_state = (flags & 8u) != 0;
 
-    // Reconstruct the path. The filename value is a right-justified packed-ASCII
-    // vector, so its bytes are little-endian (byte 0 = last character); the high
-    // bytes are zero padding. Walk from the top non-zero byte down.
-    std::string path;
-    uint32_t    hi = path_len;
-    while (hi > 0 && path_buf[hi - 1] == 0) {
-        --hi;
-    }
-    for (uint32_t k = hi; k-- > 0;) {
-        path.push_back(static_cast<char>(path_buf[k]));
-    }
+    // The filename value is a right-justified packed-ASCII vector (byte 0 = last
+    // character, high bytes zero padding), the same layout $fopen receives.
+    const std::string path = unpack_ascii(path_buf, path_len);
 
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (f == nullptr) {

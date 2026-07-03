@@ -1719,3 +1719,115 @@ TEST_CASE("$readmemh default fill honors a descending declared range") {
     CHECK(run_capture(src) == "xx c3 0f f0\n");
     std::remove(path);
 }
+
+// Slurp a file written by a file-I/O test.
+std::string read_file(const char* path) {
+    std::FILE* f = std::fopen(path, "rb");
+    REQUIRE(f != nullptr);
+    std::string out;
+    char        buf[256];
+    size_t      n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
+        out.append(buf, n);
+    }
+    std::fclose(f);
+    return out;
+}
+
+// Two-argument $fopen returns an FD; $fdisplay / $fwrite route to it and the
+// trailing newline distinguishes them (LRM §21.3).
+TEST_CASE("$fopen FD form: $fdisplay and $fwrite") {
+    const char* path = "clotho_fd_test.txt";
+    std::remove(path);
+    const std::string src = std::string(R"(
+        module m;
+            integer fd;
+            initial begin
+                fd = $fopen(")") + path + R"(", "w");
+                $fdisplay(fd, "line %0d", 1);
+                $fwrite(fd, "no-newline ");
+                $fwrite(fd, "tail\n");
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    run_capture(src);
+    CHECK(read_file(path) == "line 1\nno-newline tail\n");
+    std::remove(path);
+}
+
+// One-argument $fopen returns a multichannel descriptor opened for writing.
+TEST_CASE("$fopen MCD form writes to its channel") {
+    const char* path = "clotho_mcd_test.txt";
+    std::remove(path);
+    const std::string src = std::string(R"(
+        module m;
+            integer mcd;
+            initial begin
+                mcd = $fopen(")") + path + R"(");
+                $fdisplay(mcd, "hello %0d", 42);
+                $fclose(mcd);
+            end
+        endmodule
+    )";
+    run_capture(src);
+    CHECK(read_file(path) == "hello 42\n");
+    std::remove(path);
+}
+
+// OR-ing two MCDs fans a single write out to every set channel (LRM §21.3.4).
+TEST_CASE("$fdisplay to a combined MCD writes both files") {
+    const char* p1 = "clotho_mcd_a.txt";
+    const char* p2 = "clotho_mcd_b.txt";
+    std::remove(p1);
+    std::remove(p2);
+    const std::string src = "module m;\n"
+                            "  integer a, b;\n"
+                            "  initial begin\n"
+                            "    a = $fopen(\"" +
+                            std::string(p1) +
+                            "\");\n"
+                            "    b = $fopen(\"" +
+                            std::string(p2) +
+                            "\");\n"
+                            "    $fdisplay(a | b, \"both %0d\", 7);\n"
+                            "    $fclose(a);\n"
+                            "    $fclose(b);\n"
+                            "  end\n"
+                            "endmodule\n";
+    run_capture(src);
+    CHECK(read_file(p1) == "both 7\n");
+    CHECK(read_file(p2) == "both 7\n");
+    std::remove(p1);
+    std::remove(p2);
+}
+
+// $fflush forces buffered output to disk without closing: the file is readable
+// mid-run, before any $fclose (LRM §21.3.6).
+TEST_CASE("$fflush(fd) flushes before close") {
+    const char* path = "clotho_fflush_test.txt";
+    std::remove(path);
+    const std::string src = std::string(R"(
+        module m;
+            integer fd;
+            initial begin
+                fd = $fopen(")") + path + R"(", "w");
+                $fwrite(fd, "flushed");
+                $fflush(fd);
+            end
+        endmodule
+    )";
+    run_capture(src);
+    CHECK(read_file(path) == "flushed");
+    std::remove(path);
+}
+
+// $display / $write still reach stdout after the merge onto rt_fwrite (the
+// standard-output MCD, bit 0).
+TEST_CASE("$display still targets stdout after the fwrite merge") {
+    CHECK(run_capture(R"(
+        module m;
+            initial $display("to stdout %0d", 9);
+        endmodule
+    )") == "to stdout 9\n");
+}

@@ -129,22 +129,44 @@ Index Builder::task_call(FunctionId func, std::span<const Index> args, SourceLoc
 }
 
 Index Builder::display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc) {
+    // $display / $write: no descriptor operand; the backend targets standard output.
+    return display_impl(static_cast<Index>(0), false, fmt, newline, args, loc);
+}
+
+Index Builder::fdisplay(Index fd, std::string_view fmt, bool newline, std::span<const Index> args,
+                        SourceLoc loc) {
+    // $fdisplay / $fwrite: `fd` selects the destination descriptor.
+    return display_impl(fd, true, fmt, newline, args, loc);
+}
+
+Index Builder::display_impl(Index fd, bool has_fd, std::string_view fmt, bool newline,
+                            std::span<const Index> args, SourceLoc loc) {
     // Order in the extra buffer: format bytes, then the arg-index slice, then the
     // DisplayInfo record pointing at both. None of the three regions overlap.
     const ExtraIndex fmt_at = add_bytes(fmt);
     const ExtraSlice slice  = add_slice(args);
-    const ExtraIndex extra =
-      add_extra(DisplayInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), newline ? 1u : 0u, slice });
+    const ExtraIndex extra  = add_extra(DisplayInfo{
+      fmt_at, static_cast<uint32_t>(fmt.size()), newline ? 1u : 0u, fd, has_fd ? 1u : 0u, slice });
 
     return emit({ Inst::Tag::Display, Inst::Payload{ .display = extra } }, loc);
+}
+
+Index Builder::fopen(Index name, Index mode, bool has_mode, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(FopenInfo{ mode, has_mode ? 1u : 0u });
+
+    return emit({ Inst::Tag::Fopen, Inst::Payload{ .op_extra = { name, extra } } }, loc);
+}
+
+Index Builder::fclose(Index handle, SourceLoc loc) {
+    return emit({ Inst::Tag::Fclose, Inst::Payload{ .unary = handle } }, loc);
 }
 
 Index Builder::finish(SourceLoc loc) {
     return emit({ Inst::Tag::Finish, Inst::Payload{ .none = 0 } }, loc);
 }
 
-Index Builder::fflush(SourceLoc loc) {
-    return emit({ Inst::Tag::Fflush, Inst::Payload{ .none = 0 } }, loc);
+Index Builder::fflush(Index handle, SourceLoc loc) {
+    return emit({ Inst::Tag::Fflush, Inst::Payload{ .unary = handle } }, loc);
 }
 
 Index Builder::read_mem(Signal target, Index filename, Index start, Index finish, bool hex, bool has_start,

@@ -28,11 +28,13 @@ typedef struct rt_arg {
     uint64_t z;
 } rt_arg;
 
-// Format `fmt` with `argc` descriptors and write the result to stdout. Supports
-// the common $display specifiers (%d %h/%x %b %o %c %t, and %%); each consumes
-// the next descriptor. A %t descriptor carries a tick-valued time (see
-// $timeformat below). The codegen folds any trailing newline into `fmt`.
-void rt_display(const char* fmt, uint32_t argc, const rt_arg* argv);
+// Format `fmt` with `argc` descriptors and write the result to descriptor
+// `desc` — an MCD or FD (see the file-I/O block below); $display / $write pass
+// the standard-output MCD (bit 0). Supports the common $display specifiers
+// (%d %h/%x %b %o %c %t, and %%); each consumes the next descriptor. A %t
+// descriptor carries a tick-valued time (see $timeformat below). The codegen
+// folds any trailing newline into `fmt`.
+void rt_fwrite(int32_t desc, const char* fmt, uint32_t argc, const rt_arg* argv);
 
 // -- $timeformat / %t --
 //
@@ -62,9 +64,37 @@ void rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uin
 // verbosity is accepted at the frontend but ignored here.
 [[noreturn]] void rt_finish(void);
 
-// $fflush (no-arg form, LRM 1800-2023 §21.3.6): flush all open output buffers so
-// queued $write output is emitted immediately.
-void rt_fflush(void);
+// -- File I/O (LRM 1800-2023 §21.3) --
+//
+// A file descriptor is a 32-bit integer the design stores in its own variables.
+// Two kinds are distinguished by bit 31:
+//   * MCD (multi-channel descriptor), bit 31 clear: bits 0..30 form a channel
+//     mask, one bit per open file, and a write goes to every set channel at
+//     once. Bit 0 is the preopened standard output. Returned by the one-argument
+//     $fopen(name), which opens for writing.
+//   * FD (single file descriptor), bit 31 set: 0x8000_0000 | index of one
+//     stream. Indices 0/1/2 are the preopened stdin/stdout/stderr. Returned by
+//     the two-argument $fopen(name, mode); the read routines require this kind.
+// $fopen returns 0 on failure (or when no MCD channel is free).
+
+// $fopen(name): open `name` for writing and return a fresh MCD, or 0 on failure.
+// `name_buf`/`name_len` carry the path as a packed-ASCII vector (as $readmem).
+int32_t rt_fopen_mcd(const char* name_buf, uint32_t name_len);
+
+// $fopen(name, mode): open `name` with C stdio mode string `mode` and return a
+// fresh FD, or 0 on failure. Both strings are packed-ASCII vectors; `mode` is
+// passed straight to fopen, so SV mode strings ("r", "w", "a", "r+b", ...) map
+// directly.
+int32_t rt_fopen_fd(const char* name_buf, uint32_t name_len, const char* mode_buf, uint32_t mode_len);
+
+// $fclose(desc): close every stream the descriptor names (all set MCD channels,
+// or the one FD). The preopened standard streams are never closed.
+void rt_fclose(int32_t desc);
+
+// $fflush(desc): flush the output buffers of descriptor `desc` (an MCD or FD).
+// The no-argument $fflush passes 0, which flushes every open stream (LRM
+// §21.3.6).
+void rt_fflush(int32_t desc);
 
 // $readmemh / $readmemb (LRM 1800-2023 §21.4): load a hex/binary text file into an
 // unpacked-array memory. `path_buf`/`path_len` carry the filename as a packed-ASCII

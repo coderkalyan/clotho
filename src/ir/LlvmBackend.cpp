@@ -2482,6 +2482,9 @@ private:
                 return { 64, false, false };
             case Inst::Tag::Random:
                 return { 32, false, true };
+            case Inst::Tag::Fopen:
+                // $fopen returns a 32-bit descriptor integer.
+                return { 32, false, true };
 
             case Inst::Tag::Add:
             case Inst::Tag::Sub:
@@ -2549,6 +2552,7 @@ private:
             case Inst::Tag::TimeFormat:
             case Inst::Tag::Finish:
             case Inst::Tag::Fflush:
+            case Inst::Tag::Fclose:
             case Inst::Tag::ReadMem:
             case Inst::Tag::TaskCall:
                 return { 0, false, false };
@@ -2808,7 +2812,15 @@ private:
                 return;
 
             case Inst::Tag::Fflush:
-                lower_fflush();
+                lower_fflush(i);
+                return;
+
+            case Inst::Tag::Fopen:
+                lower_fopen(i);
+                return;
+
+            case Inst::Tag::Fclose:
+                lower_fclose(i);
                 return;
 
             case Inst::Tag::ReadMem:
@@ -3118,11 +3130,33 @@ private:
           ctx_, { b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty() });
     }
 
-    // void rt_display(const char* fmt, i32 argc, const rt_arg* argv)
-    llvm::FunctionCallee display_fn() {
+    // void rt_fwrite(i32 desc, const char* fmt, i32 argc, const rt_arg* argv)
+    llvm::FunctionCallee fwrite_fn() {
+        auto* ptr = llvm::PointerType::getUnqual(ctx_);
+        auto* fnty =
+          llvm::FunctionType::get(b_.getVoidTy(), { b_.getInt32Ty(), ptr, b_.getInt32Ty(), ptr }, false);
+        return llmod_.getOrInsertFunction("rt_fwrite", fnty);
+    }
+
+    // i32 rt_fopen_mcd(const char* name, i32 name_len)
+    llvm::FunctionCallee fopen_mcd_fn() {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, b_.getInt32Ty(), ptr }, false);
-        return llmod_.getOrInsertFunction("rt_display", fnty);
+        auto* fnty = llvm::FunctionType::get(b_.getInt32Ty(), { ptr, b_.getInt32Ty() }, false);
+        return llmod_.getOrInsertFunction("rt_fopen_mcd", fnty);
+    }
+
+    // i32 rt_fopen_fd(const char* name, i32 name_len, const char* mode, i32 mode_len)
+    llvm::FunctionCallee fopen_fd_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(i32, { ptr, i32, ptr, i32 }, false);
+        return llmod_.getOrInsertFunction("rt_fopen_fd", fnty);
+    }
+
+    // void rt_fclose(i32 desc)
+    llvm::FunctionCallee fclose_fn() {
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { b_.getInt32Ty() }, false);
+        return llmod_.getOrInsertFunction("rt_fclose", fnty);
     }
 
     // void rt_timeformat_init(i64 tick_fs, i32 default_units)
@@ -3171,15 +3205,53 @@ private:
         b_.CreateCall(finish_fn(), {});
     }
 
-    // void rt_fflush(void) — flush all open output buffers.
+    // void rt_fflush(i32 desc) — flush a descriptor's output buffers (0 => all).
     llvm::FunctionCallee fflush_fn() {
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), false);
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { b_.getInt32Ty() }, false);
         return llmod_.getOrInsertFunction("rt_fflush", fnty);
     }
 
-    // Lower a $fflush (no-arg form): flush the runtime's output buffers.
-    void lower_fflush() {
-        b_.CreateCall(fflush_fn(), {});
+    // Lower a $fflush: flush the descriptor operand's buffers (a constant 0 for the
+    // no-argument form, which the runtime reads as "flush everything").
+    void lower_fflush(Index i) {
+        llvm::Value* desc = cast(must_of(value_of(ir_->payload(i).unary)), 32, true);
+        b_.CreateCall(fflush_fn(), { desc });
+    }
+
+    // Lower a $fopen: spill the filename (and mode, for the FD form) to stack byte
+    // buffers and call the matching runtime opener; the result is the descriptor.
+    void lower_fopen(Index i) {
+        const Index fname = ir_->payload(i).op_extra.op;
+        const auto  info  = ir_->extra_data<FopenInfo>(ir_->payload(i).op_extra.extra);
+        const auto [name_ptr, name_len] = spill_ascii(fname, "fopen.name");
+
+        llvm::Value* desc = nullptr;
+        if (info.has_mode) {
+            const auto [mode_ptr, mode_len] = spill_ascii(info.mode, "fopen.mode");
+            desc = b_.CreateCall(
+              fopen_fd_fn(), { name_ptr, b_.getInt32(name_len), mode_ptr, b_.getInt32(mode_len) });
+        } else {
+            desc = b_.CreateCall(fopen_mcd_fn(), { name_ptr, b_.getInt32(name_len) });
+        }
+        // The descriptor is a plain known integer (no x/z): must == may, z == 0.
+        set_value(i, packed(desc, desc, zero(32)));
+    }
+
+    // Lower a $fclose: close the descriptor operand.
+    void lower_fclose(Index i) {
+        llvm::Value* desc = cast(must_of(value_of(ir_->payload(i).unary)), 32, true);
+        b_.CreateCall(fclose_fn(), { desc });
+    }
+
+    // Spill a packed-ASCII string value's must-bits to a stack byte buffer and
+    // return (pointer, byte length). The value is a packed vector (a string literal
+    // or a reg holding characters); the runtime reconstructs the string from these
+    // bytes. Shared by $readmem (filename) and $fopen (name / mode).
+    std::pair<llvm::Value*, uint32_t> spill_ascii(Index v, const char* name) {
+        const uint32_t bytes = std::max<uint32_t>((type_of(v).width + 7) / 8, 1);
+        llvm::Value*   buf   = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(bytes), name);
+        b_.CreateAlignedStore(must_of(value_of(v)), buf, llvm::Align(1));
+        return { buf, bytes };
     }
 
     // void rt_readmem(const char* path, i32 path_len, i8* mm_base, i8* z_base,
@@ -3214,10 +3286,7 @@ private:
 
         // Spill the filename's must-bits to a byte buffer: the value is a packed-
         // ASCII vector (string literal or reg), so its low bytes are the path.
-        const ValType  fty    = type_of(fname);
-        const uint32_t fbytes = std::max<uint32_t>((fty.width + 7) / 8, 1);
-        llvm::Value*   path   = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(fbytes), "readmem.path");
-        b_.CreateAlignedStore(must_of(value_of(fname)), path, llvm::Align(1));
+        const auto [path, fbytes] = spill_ascii(fname, "readmem.path");
 
         llvm::Value* mm_base = field_ptr(state_, s.off_mm);
         llvm::Value* z_base  = field_ptr(state_, s.off_z);
@@ -3395,8 +3464,11 @@ private:
             }
         }
 
+        // $display / $write target the standard-output MCD (bit 0); $fdisplay /
+        // $fwrite carry an explicit descriptor operand.
+        llvm::Value* desc = info.has_fd ? cast(must_of(value_of(info.fd)), 32, true) : b_.getInt32(1);
         llvm::Value* fmt_ptr = b_.CreateGlobalString(fmt);
-        b_.CreateCall(display_fn(), { fmt_ptr, b_.getInt32(n), arr });
+        b_.CreateCall(fwrite_fn(), { desc, fmt_ptr, b_.getInt32(n), arr });
     }
 
     void store_field(llvm::StructType* sty, llvm::Value* elt, unsigned idx, llvm::Value* v) {

@@ -150,6 +150,10 @@ const char* tag_name(Inst::Tag tag) {
             return "finish";
         case T::Fflush:
             return "fflush";
+        case T::Fopen:
+            return "fopen";
+        case T::Fclose:
+            return "fclose";
         case T::DynPartSelect:
             return "dyn_part_select";
         case T::ReadMem:
