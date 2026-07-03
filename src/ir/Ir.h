@@ -68,6 +68,40 @@ enum class FileOp : uint32_t {
     Rewind,
 };
 
+// Which real math system function a `real_math` invokes (LRM §20.8.2, Table
+// 20-4). Each takes real operands and returns a real; the LRM requires each to
+// match the equivalent C standard math library function. Pow / Atan2 / Hypot
+// take two operands, all others one. Kept in lockstep with the backend
+// dispatch in LlvmBackend.
+enum class RealMathOp : uint32_t {
+    // $ln(x) -> C log(x).
+    Ln,
+    Log10,
+    Exp,
+    Sqrt,
+    // $pow(x, y) -> C pow; also the lowering of the real ** operator (LRM
+    // 11.4.3 leaves 0**negative and negative**non-integral unspecified — C pow
+    // behavior is used).
+    Pow,
+    Floor,
+    Ceil,
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    // $atan2(y, x).
+    Atan2,
+    Hypot,
+    Sinh,
+    Cosh,
+    Tanh,
+    Asinh,
+    Acosh,
+    Atanh,
+};
+
 // A struct may be overlaid on the extra buffer iff it is trivially copyable
 // and a whole number of u32 words wide. Because every field is a 4-byte
 // handle/enum, such structs carry no padding and round-trip via bit_cast.
@@ -231,6 +265,16 @@ struct FileOpInfo {
     ExtraSlice args;
 };
 
+// Extra payload for `real_math`: a real math system function (LRM §20.8.2).
+// `op` is the ir::RealMathOp selecting the routine; `args` are its real value
+// operands in call order (one for most, two for Pow / Atan2 / Hypot).
+struct RealMathInfo {
+    // ir::RealMathOp value.
+    uint32_t op;
+    // Real value operands in call order.
+    ExtraSlice args;
+};
+
 // Extra payload for `fgets`: $fgets(str, fd) (LRM §21.3.4) reads a line from the
 // descriptor `fd` into the packed-vector lvalue `str` (the instruction's `op`),
 // returning the character count. `fd` is a value operand.
@@ -378,6 +422,7 @@ static_assert(ExtraPayload<LoopInfo>);
 static_assert(ExtraPayload<DisplayInfo>);
 static_assert(ExtraPayload<FopenInfo>);
 static_assert(ExtraPayload<FileOpInfo>);
+static_assert(ExtraPayload<RealMathInfo>);
 static_assert(ExtraPayload<FgetsInfo>);
 static_assert(ExtraPayload<SformatInfo>);
 static_assert(ExtraPayload<SformatfInfo>);
@@ -481,6 +526,48 @@ struct Inst {
         // are wildcards; unlike the case-equality tags this is X-propagating — a
         // left-operand x/z on a non-wildcard bit yields X.
         WildEq,
+
+        // -- Floating point (real / shortreal; LRM 6.12) --
+        // Operands and result share one float type: the frontend inserts all
+        // int/real and real/shortreal conversions (LRM 11.8.2), so mixed
+        // operands never reach these tags. Reals carry no x/z.
+        // Arithmetic (payload: binary).
+        FAdd,
+        FSub,
+        FMul,
+        FDiv,
+        // Power ** on reals (payload: binary). C pow semantics for the corners
+        // LRM 11.4.3 leaves unspecified.
+        FPow,
+        // Negation -x (payload: unary). A real fneg, not Sub-from-zero: 0.0 - 0.0
+        // is +0.0 but -(0.0) must be -0.0.
+        FNeg,
+        // Comparisons, -> definite 1-bit, never X (payload: binary). FNe is
+        // an unordered compare so NaN != NaN yields 1, matching C.
+        FEq,
+        FNe,
+        FLt,
+        FLe,
+        FGt,
+        FGe,
+        // Conversions (payload: op_type = operand + target type).
+        // Integral -> float. Source signedness comes from the operand type;
+        // x/z bits read as 0 (LRM 6.12.1).
+        ItoF,
+        // Float -> integral, rounding half away from zero (LRM 6.12.1) — the
+        // assignment / cast conversion.
+        FtoI,
+        // Float -> integral, truncating toward zero — $rtoi (LRM 20.5).
+        FtoITrunc,
+        // Bit-pattern reinterpret between a float type and the same-width
+        // integral type: $realtobits / $bitstoreal / $shortrealtobits /
+        // $bitstoshortreal (LRM 20.5). Direction from operand vs target type.
+        FBitcast,
+        // real <-> shortreal value conversion (fpext / fptrunc, LRM 6.12.1).
+        FResize,
+        // Real math system function $sqrt / $sin / ... (payload: extra ->
+        // RealMathInfo). LRM §20.8.2: each matches the C math library function.
+        RealMath,
 
         // -- Logical, -> 1-bit --
         // Logical and (payload: binary).
@@ -657,6 +744,7 @@ struct Inst {
         Sformat,
         Sformatf,
         Scanf,
+        RealMath,
     };
 
     union Payload {

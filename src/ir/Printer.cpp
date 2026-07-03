@@ -27,6 +27,12 @@ void render_type(const InternPool& pool, Ref type, std::ostream& os) {
         case Type::Kind::Bit:
             os << "bit";
             break;
+        case Type::Kind::Real:
+            os << "real";
+            break;
+        case Type::Kind::ShortReal:
+            os << "shortreal";
+            break;
         case Type::Kind::PackedArray:
             render_type(pool, t.element, os);
             os << "[" << t.left << ":" << t.right << "]";
@@ -203,6 +209,42 @@ const char* tag_name(Inst::Tag tag) {
             return "timeformat";
         case T::Random:
             return "random";
+        case T::FAdd:
+            return "fadd";
+        case T::FSub:
+            return "fsub";
+        case T::FMul:
+            return "fmul";
+        case T::FDiv:
+            return "fdiv";
+        case T::FPow:
+            return "fpow";
+        case T::FNeg:
+            return "fneg";
+        case T::FEq:
+            return "feq";
+        case T::FNe:
+            return "fne";
+        case T::FLt:
+            return "flt";
+        case T::FLe:
+            return "fle";
+        case T::FGt:
+            return "fgt";
+        case T::FGe:
+            return "fge";
+        case T::ItoF:
+            return "itof";
+        case T::FtoI:
+            return "ftoi";
+        case T::FtoITrunc:
+            return "ftoi_trunc";
+        case T::FBitcast:
+            return "fbitcast";
+        case T::FResize:
+            return "fresize";
+        case T::RealMath:
+            return "real_math";
     }
 
     return "?";

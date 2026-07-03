@@ -46,6 +46,13 @@ public:
 
     // -- Irregular shapes --
     Index resize(Index op, Ref type, SourceLoc loc);
+
+    // Emit a float conversion (ItoF / FtoI / FtoITrunc / FBitcast / FResize)
+    // of `op` to `type`.
+    Index float_cvt(Inst::Tag tag, Index op, Ref type, SourceLoc loc);
+
+    // Emit a real math system function call (LRM §20.8.2).
+    Index real_math(RealMathOp op, std::span<const Index> args, SourceLoc loc);
     Index repl(Index value, uint32_t count, SourceLoc loc);
     Index mux(Index cond, Index a, Index b, SourceLoc loc);
     Index concat(std::span<const Index> parts, SourceLoc loc);

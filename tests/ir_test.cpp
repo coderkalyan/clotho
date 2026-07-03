@@ -416,3 +416,37 @@ TEST_CASE("shortreal values round to nearest float on interning") {
     std::memcpy(&pat, bytes.data(), 4);
     CHECK(pat == std::bit_cast<uint32_t>(0.1f));
 }
+
+TEST_CASE("float tags round-trip through builder, payload_kind, and operands") {
+    InternPool pool;
+    Builder    b(pool);
+    const auto l = static_cast<SourceLoc>(0);
+
+    const Index x = b.constant(pool.put_real(pool.real_type, 1.5), l);
+    const Index y = b.constant(pool.put_real(pool.real_type, 2.5), l);
+
+    const Index sum = b.binary(Inst::Tag::FAdd, x, y, l);
+    const Index neg = b.unary(Inst::Tag::FNeg, sum, l);
+    const Index cvt = b.float_cvt(Inst::Tag::FtoI, neg, pool.bit_type, l);
+    const std::array<Index, 2> margs{ x, y };
+    const Index                pw = b.real_math(RealMathOp::Pow, margs, l);
+    b.unary(Inst::Tag::Ret, cvt, l);
+    b.unary(Inst::Tag::Ret, pw, l);
+
+    const Ir ir = b.finish();
+    CHECK(payload_kind(ir.tag(sum)) == Inst::PayloadKind::Binary);
+    CHECK(payload_kind(ir.tag(neg)) == Inst::PayloadKind::Unary);
+    CHECK(payload_kind(ir.tag(cvt)) == Inst::PayloadKind::OpType);
+    CHECK(payload_kind(ir.tag(pw)) == Inst::PayloadKind::RealMath);
+
+    CHECK(ir.payload(cvt).op_type.type == pool.bit_type);
+
+    const auto info = ir.extra_data<RealMathInfo>(ir.payload(pw).extra);
+    CHECK(info.op == static_cast<uint32_t>(RealMathOp::Pow));
+
+    std::array<Index, 3> scratch;
+    const auto           ops = ir.operands(pw, scratch);
+    REQUIRE(ops.size() == 2);
+    CHECK(ops[0] == x);
+    CHECK(ops[1] == y);
+}
