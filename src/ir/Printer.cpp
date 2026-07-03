@@ -154,6 +154,10 @@ const char* tag_name(Inst::Tag tag) {
             return "fopen";
         case T::Fclose:
             return "fclose";
+        case T::FileValueOp:
+            return "file_op";
+        case T::Fgets:
+            return "fgets";
         case T::DynPartSelect:
             return "dyn_part_select";
         case T::ReadMem:
@@ -327,6 +331,15 @@ private:
             case Inst::PayloadKind::Display: {
                 const auto info = ir_.extra_data<DisplayInfo>(p.display);
                 os_ << '"' << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
+                for (Index a : ir_.region(info.args)) {
+                    os_ << ", ";
+                    ref(a);
+                }
+                break;
+            }
+            case Inst::PayloadKind::FileOp: {
+                const auto info = ir_.extra_data<FileOpInfo>(p.extra);
+                os_ << "op" << info.op;
                 for (Index a : ir_.region(info.args)) {
                     os_ << ", ";
                     ref(a);

@@ -70,6 +70,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::TaskCall;
         case T::Display:
             return K::Display;
+        case T::FileValueOp:
+            return K::FileOp;
         case T::TimeFormat:
             return K::TimeFormat;
         case T::Finish:
@@ -84,6 +86,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::ElemSelect:
         case T::Cond:
         case T::Fopen:
+        case T::Fgets:
             return K::OpExtra;
     }
 
@@ -148,6 +151,13 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
             // display: the value args are an index slice in the DisplayInfo record;
             // the format string is not an SSA operand.
             const auto info = extra_data<DisplayInfo>(p.display);
+            return index_slice(info.args);
+        }
+
+        case Inst::PayloadKind::FileOp: {
+            // file_value_op: the value args live in the FileOpInfo record; the
+            // opcode is not an SSA operand.
+            const auto info = extra_data<FileOpInfo>(p.extra);
             return index_slice(info.args);
         }
 

@@ -91,6 +91,36 @@ int32_t rt_fopen_fd(const char* name_buf, uint32_t name_len, const char* mode_bu
 // or the one FD). The preopened standard streams are never closed.
 void rt_fclose(int32_t desc);
 
+// The file read / positioning functions require an FD (a stream), not an MCD.
+// Each maps directly onto its C stdio analog.
+
+// $fgetc(fd): read one byte, or -1 (EOF) on end of file / error.
+int32_t rt_fgetc(int32_t fd);
+
+// $ungetc(c, fd): push `c` back so the next read returns it; -> c, or -1.
+int32_t rt_ungetc(int32_t c, int32_t fd);
+
+// $feof(fd): nonzero once the stream has hit end of file.
+int32_t rt_feof(int32_t fd);
+
+// $ftell(fd): current byte offset from the start, or -1 on error.
+int32_t rt_ftell(int32_t fd);
+
+// $fseek(fd, offset, operation): reposition the stream. `operation` 0/1/2 selects
+// SEEK_SET / SEEK_CUR / SEEK_END. -> 0 on success, -1 on failure.
+int32_t rt_fseek(int32_t fd, int32_t offset, int32_t operation);
+
+// $rewind(fd): seek to the start; -> 0.
+int32_t rt_rewind(int32_t fd);
+
+// $fgets(str, fd): read a line into the packed vector `str`, whose must|may plane
+// is at `mm` (2*`width` bits) and z plane at `z` (`width` bits). Reads up to
+// `width`/8 characters, stopping after a newline or at EOF. The characters are
+// stored right-justified (byte 0 = last character), the high bytes and the z
+// plane are cleared. -> the character count, or 0 on EOF / error. `width` must be
+// a multiple of 8.
+int32_t rt_fgets(uint8_t* mm, uint8_t* z, uint32_t width, int32_t fd);
+
 // $fflush(desc): flush the output buffers of descriptor `desc` (an MCD or FD).
 // The no-argument $fflush passes 0, which flushes every open stream (LRM
 // §21.3.6).

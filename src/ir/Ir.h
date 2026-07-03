@@ -49,6 +49,25 @@ enum class Signal : uint32_t {};
 // `call`. Resolved by the module, like Signal.
 enum class FunctionId : uint32_t {};
 
+// Which file-I/O system function a `file_value_op` invokes (LRM §21.3). Each
+// returns a 32-bit integer and takes its operands (a file descriptor, plus a
+// character or offset) as plain value args. Kept in lockstep with the runtime
+// dispatch in LlvmBackend.
+enum class FileOp : uint32_t {
+    // $fgetc(fd) -> next byte, or -1 at EOF.
+    Fgetc,
+    // $ungetc(c, fd) -> c, or -1 on failure.
+    Ungetc,
+    // $feof(fd) -> nonzero once EOF has been seen.
+    Feof,
+    // $ftell(fd) -> current byte offset, or -1.
+    Ftell,
+    // $fseek(fd, offset, operation) -> 0 on success, -1 on failure.
+    Fseek,
+    // $rewind(fd) -> 0 (seek to start).
+    Rewind,
+};
+
 // A struct may be overlaid on the extra buffer iff it is trivially copyable
 // and a whole number of u32 words wide. Because every field is a 4-byte
 // handle/enum, such structs carry no padding and round-trip via bit_cast.
@@ -200,6 +219,24 @@ struct FopenInfo {
     uint32_t has_mode;
 };
 
+// Extra payload for `file_value_op`: a file-I/O system function returning a
+// 32-bit integer. `op` is the ir::FileOp selecting the routine; `args` are its
+// value operands in call order (a descriptor, plus a character / offset).
+struct FileOpInfo {
+    // ir::FileOp value.
+    uint32_t op;
+    // Value operands in call order.
+    ExtraSlice args;
+};
+
+// Extra payload for `fgets`: $fgets(str, fd) (LRM §21.3.4) reads a line from the
+// descriptor `fd` into the packed-vector lvalue `str` (the instruction's `op`),
+// returning the character count. `fd` is a value operand.
+struct FgetsInfo {
+    // File-descriptor value operand.
+    Index fd;
+};
+
 // Extra payload for `timeformat`: a $timeformat system task. `units`,
 // `precision`, and `min_width` are value operands (general runtime rvalues); the
 // suffix string is appended after the formatted number and lives packed
@@ -246,6 +283,8 @@ static_assert(ExtraPayload<Regions>);
 static_assert(ExtraPayload<LoopInfo>);
 static_assert(ExtraPayload<DisplayInfo>);
 static_assert(ExtraPayload<FopenInfo>);
+static_assert(ExtraPayload<FileOpInfo>);
+static_assert(ExtraPayload<FgetsInfo>);
 static_assert(ExtraPayload<TimeFormatInfo>);
 static_assert(ExtraPayload<WaitEdge>);
 static_assert(ExtraPayload<WaitInfo>);
@@ -402,6 +441,15 @@ struct Inst {
         // $fclose: close a file descriptor (payload: unary, the descriptor value).
         // LRM §21.3.2. Lowers to an rt_fclose call.
         Fclose,
+        // $fgetc / $ungetc / $feof / $ftell / $fseek / $rewind: file read /
+        // positioning system functions, each -> a 32-bit integer (payload: extra ->
+        // FileOpInfo, whose `op` picks the routine and `args` are its value
+        // operands). LRM §21.3. Lowers to the matching rt_* call.
+        FileValueOp,
+        // $fgets: read a line from a descriptor into a packed-vector lvalue, ->
+        // character count (payload: op_extra -> FgetsInfo; op is the destination
+        // lvalue, extra holds the descriptor value). LRM §21.3.4. Lowers to rt_fgets.
+        Fgets,
         // $timeformat: set the %t format (units / precision / suffix / min width)
         // for all later %t specifiers (payload: timeformat -> TimeFormatInfo).
         // LRM §20.4.3. Lowers to an rt_timeformat_set call.
@@ -453,6 +501,7 @@ struct Inst {
         Display,
         TimeFormat,
         Wait,
+        FileOp,
     };
 
     union Payload {

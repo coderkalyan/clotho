@@ -161,6 +161,19 @@ Index Builder::fclose(Index handle, SourceLoc loc) {
     return emit({ Inst::Tag::Fclose, Inst::Payload{ .unary = handle } }, loc);
 }
 
+Index Builder::file_value_op(FileOp op, std::span<const Index> args, SourceLoc loc) {
+    const ExtraSlice slice = add_slice(args);
+    const ExtraIndex extra = add_extra(FileOpInfo{ static_cast<uint32_t>(op), slice });
+
+    return emit({ Inst::Tag::FileValueOp, Inst::Payload{ .extra = extra } }, loc);
+}
+
+Index Builder::fgets(Index dst, Index fd, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(FgetsInfo{ fd });
+
+    return emit({ Inst::Tag::Fgets, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+}
+
 Index Builder::finish(SourceLoc loc) {
     return emit({ Inst::Tag::Finish, Inst::Payload{ .none = 0 } }, loc);
 }

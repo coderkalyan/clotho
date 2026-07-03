@@ -425,6 +425,102 @@ extern "C" void rt_fclose(int32_t desc) {
     }
 }
 
+extern "C" int32_t rt_fgetc(int32_t fd) {
+    io_ensure_init();
+    std::FILE* f = fd_stream(fd);
+    return f != nullptr ? std::fgetc(f) : -1;
+}
+
+extern "C" int32_t rt_ungetc(int32_t c, int32_t fd) {
+    io_ensure_init();
+    std::FILE* f = fd_stream(fd);
+    return f != nullptr ? std::ungetc(c, f) : -1;
+}
+
+extern "C" int32_t rt_feof(int32_t fd) {
+    io_ensure_init();
+    std::FILE* f = fd_stream(fd);
+    return (f == nullptr || std::feof(f) != 0) ? 1 : 0;
+}
+
+extern "C" int32_t rt_ftell(int32_t fd) {
+    io_ensure_init();
+    std::FILE* f = fd_stream(fd);
+    return f != nullptr ? static_cast<int32_t>(std::ftell(f)) : -1;
+}
+
+extern "C" int32_t rt_fseek(int32_t fd, int32_t offset, int32_t operation) {
+    io_ensure_init();
+    std::FILE* f = fd_stream(fd);
+    if (f == nullptr) {
+        return -1;
+    }
+    int whence;
+    switch (operation) {
+        case 0:
+            whence = SEEK_SET;
+            break;
+        case 1:
+            whence = SEEK_CUR;
+            break;
+        case 2:
+            whence = SEEK_END;
+            break;
+        default:
+            return -1;
+    }
+    return std::fseek(f, offset, whence) == 0 ? 0 : -1;
+}
+
+extern "C" int32_t rt_rewind(int32_t fd) {
+    io_ensure_init();
+    std::FILE* f = fd_stream(fd);
+    if (f == nullptr) {
+        return -1;
+    }
+    std::rewind(f);
+    return 0;
+}
+
+extern "C" int32_t rt_fgets(uint8_t* mm, uint8_t* z, uint32_t width, int32_t fd) {
+    io_ensure_init();
+    std::FILE*     f        = fd_stream(fd);
+    const uint32_t capacity = width / 8;
+    if (f == nullptr || capacity == 0) {
+        return 0;
+    }
+    // Read up to `capacity` characters, stopping once a newline is stored (LRM
+    // §21.3.4).
+    std::vector<uint8_t> line;
+    line.reserve(capacity);
+    while (line.size() < capacity) {
+        const int c = std::fgetc(f);
+        if (c == EOF) {
+            break;
+        }
+        line.push_back(static_cast<uint8_t>(c));
+        if (c == '\n') {
+            break;
+        }
+    }
+    const uint32_t count = static_cast<uint32_t>(line.size());
+    if (count == 0) {
+        return 0;
+    }
+    // Store right-justified into the must|may plane: byte 0 holds the last
+    // character read, higher bytes precede it, the top bytes stay zero. must == may
+    // (characters are fully known) and the z plane is cleared. width % 8 == 0 (the
+    // backend guards it), so the must / may halves are byte-aligned.
+    std::memset(mm, 0, static_cast<size_t>(capacity) * 2);
+    std::memset(z, 0, capacity);
+    for (uint32_t k = 0; k < count; ++k) {
+        const uint8_t byte = line[count - 1 - k];
+        mm[k]              = byte; // must half (low `width` bits)
+        mm[capacity + k]   = byte; // may half (high `width` bits)
+    }
+    return static_cast<int32_t>(count);
+}
+
 extern "C" void rt_timeformat_init(uint64_t tick_fs, int32_t default_units) {
     timeformat.tick_fs   = tick_fs == 0 ? 1 : tick_fs;
     timeformat.units     = default_units;

@@ -1477,6 +1477,13 @@ private:
             b.fclose(lower_expr(*call.arguments()[0], b), loc(call));
             return;
         }
+        if (name == "$fgets" || name == "$fgetc" || name == "$ungetc" || name == "$feof" ||
+            name == "$ftell" || name == "$fseek" || name == "$rewind") {
+            // File read / positioning functions used in statement position: lower
+            // for the side effect (file position, write-back) and drop the result.
+            lower_sysfunc(call, b);
+            return;
+        }
         if (name == "$finish" || name == "$stop") {
             // Both end the simulation and exit. LRM §20.2 defines $stop as
             // suspending the run (vs $finish exiting to the OS) and mandates no
@@ -1707,6 +1714,57 @@ private:
             const bool      has_mode = args.size() == 2;
             const ir::Index mode     = has_mode ? lower_string_arg(*args[1], b) : fname;
             return b.fopen(fname, mode, has_mode, l);
+        }
+
+        // $fgetc / $ungetc / $feof / $ftell / $fseek / $rewind (LRM §21.3): file
+        // read / positioning functions, each returning a 32-bit integer. Operands
+        // (a descriptor, plus a character or offset) are plain integer rvalues in
+        // call order.
+        if (name == "$fgetc" || name == "$feof" || name == "$ftell" || name == "$rewind" ||
+            name == "$ungetc" || name == "$fseek") {
+            ir::FileOp op;
+            size_t     want;
+            if (name == "$fgetc") {
+                op   = ir::FileOp::Fgetc;
+                want = 1;
+            } else if (name == "$feof") {
+                op   = ir::FileOp::Feof;
+                want = 1;
+            } else if (name == "$ftell") {
+                op   = ir::FileOp::Ftell;
+                want = 1;
+            } else if (name == "$rewind") {
+                op   = ir::FileOp::Rewind;
+                want = 1;
+            } else if (name == "$ungetc") {
+                op   = ir::FileOp::Ungetc;
+                want = 2;
+            } else {
+                op   = ir::FileOp::Fseek;
+                want = 3;
+            }
+            const auto args = call.arguments();
+            if (args.size() != want) {
+                fail(std::string(name) + " expects " + std::to_string(want) + " argument(s)");
+            }
+            std::vector<ir::Index> vals;
+            vals.reserve(args.size());
+            for (const Expression* a : args) {
+                vals.push_back(lower_expr(*a, b));
+            }
+            return b.file_value_op(op, vals, l);
+        }
+
+        // $fgets(str, fd) (LRM §21.3.4): read a line into the packed-vector lvalue
+        // `str`, returning the character count. `str` is an output argument.
+        if (name == "$fgets") {
+            const auto args = call.arguments();
+            if (args.size() != 2) {
+                fail("$fgets expects two arguments (str, fd)");
+            }
+            const ir::Index dst = lower_lvalue(*args[0], b);
+            const ir::Index fd  = lower_expr(*args[1], b);
+            return b.fgets(dst, fd, l);
         }
 
         // TODO: $realtime (LRM §20.3.3) returns a real scaled to the module time

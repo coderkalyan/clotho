@@ -1831,3 +1831,76 @@ TEST_CASE("$display still targets stdout after the fwrite merge") {
         endmodule
     )") == "to stdout 9\n");
 }
+
+// $fgets reads a line (through the newline) into a packed vector, stored
+// right-justified, and returns the character count. The %h layout is
+// cross-checked against Icarus Verilog (n=6, 0x...68656c6c6f0a for "hello\n").
+TEST_CASE("$fgets reads a line right-justified") {
+    const char* path = "clotho_fgets_test.txt";
+    write_file(path, "hello\nworld\n");
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, n;
+            reg [8*8-1:0] line;
+            initial begin
+                fd = $fopen(")") + path + R"(", "r");
+                n = $fgets(line, fd);
+                $display("%0d %h", n, line);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "6 000068656c6c6f0a\n");
+    std::remove(path);
+}
+
+// $fgetc returns bytes then -1 at EOF; $ungetc pushes a byte back for the next
+// read; $feof reports the end condition (LRM §21.3.4).
+TEST_CASE("$fgetc / $ungetc / $feof") {
+    const char* path = "clotho_fgetc_test.txt";
+    write_file(path, "AB");
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, c1, c2, c3, c4, eof;
+            initial begin
+                fd = $fopen(")") + path + R"(", "r");
+                c1 = $fgetc(fd);        // 'A'
+                c2 = $ungetc(c1, fd);   // -> 'A'
+                c2 = $fgetc(fd);        // 'A' again
+                c3 = $fgetc(fd);        // 'B'
+                c4 = $fgetc(fd);        // EOF
+                eof = $feof(fd);
+                $display("%0d %0d %0d %0d %0d", c1, c2, c3, c4, eof);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "65 65 66 -1 1\n");
+    std::remove(path);
+}
+
+// $ftell reports the offset, $fseek repositions (operation 0 = SEEK_SET), and
+// $rewind returns to the start (LRM §21.3.5).
+TEST_CASE("$ftell / $fseek / $rewind") {
+    const char* path = "clotho_fseek_test.txt";
+    write_file(path, "0123456789");
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, p1, s, p2, c, r, c2;
+            initial begin
+                fd = $fopen(")") + path + R"(", "r");
+                c  = $fgetc(fd); c = $fgetc(fd); c = $fgetc(fd);
+                p1 = $ftell(fd);        // 3
+                s  = $fseek(fd, 7, 0);  // 0
+                p2 = $ftell(fd);        // 7
+                c  = $fgetc(fd);        // '7'
+                r  = $rewind(fd);       // 0
+                c2 = $fgetc(fd);        // '0'
+                $display("%0d %0d %0d %c %0d %c", p1, s, p2, c, r, c2);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "3 0 7 7 0 0\n");
+    std::remove(path);
+}

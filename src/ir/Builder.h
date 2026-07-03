@@ -91,6 +91,13 @@ public:
     Index fopen(Index name, Index mode, bool has_mode, SourceLoc loc);
     // $fclose: close the descriptor `handle`. No value.
     Index fclose(Index handle, SourceLoc loc);
+    // $fgetc / $ungetc / $feof / $ftell / $fseek / $rewind: a file read /
+    // positioning function selected by `op`, with `args` its already-lowered value
+    // operands (in call order). Yields a 32-bit integer.
+    Index file_value_op(FileOp op, std::span<const Index> args, SourceLoc loc);
+    // $fgets: read a line from descriptor `fd` into the packed-vector lvalue `dst`.
+    // Yields the character count.
+    Index fgets(Index dst, Index fd, SourceLoc loc);
     // $finish / $stop: end the simulation and exit. No operands.
     Index finish(SourceLoc loc);
     // $fflush: flush the descriptor `handle`'s output buffers. The no-argument

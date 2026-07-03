@@ -2485,6 +2485,10 @@ private:
             case Inst::Tag::Fopen:
                 // $fopen returns a 32-bit descriptor integer.
                 return { 32, false, true };
+            case Inst::Tag::FileValueOp:
+            case Inst::Tag::Fgets:
+                // The file read / positioning functions all return a 32-bit int.
+                return { 32, false, true };
 
             case Inst::Tag::Add:
             case Inst::Tag::Sub:
@@ -2821,6 +2825,14 @@ private:
 
             case Inst::Tag::Fclose:
                 lower_fclose(i);
+                return;
+
+            case Inst::Tag::FileValueOp:
+                lower_file_op(i);
+                return;
+
+            case Inst::Tag::Fgets:
+                lower_fgets(i);
                 return;
 
             case Inst::Tag::ReadMem:
@@ -3241,6 +3253,82 @@ private:
     void lower_fclose(Index i) {
         llvm::Value* desc = cast(must_of(value_of(ir_->payload(i).unary)), 32, true);
         b_.CreateCall(fclose_fn(), { desc });
+    }
+
+    // Lower a $fgetc / $ungetc / $feof / $ftell / $fseek / $rewind: every one takes
+    // i32 operands and returns i32, so the call is built generically and only the
+    // runtime symbol varies with the opcode. The result is a known integer.
+    void lower_file_op(Index i) {
+        const auto                   info = ir_->extra_data<FileOpInfo>(ir_->payload(i).extra);
+        const std::span<const Index> args = ir_->region(info.args);
+
+        std::vector<llvm::Value*> argv;
+        argv.reserve(args.size());
+        for (Index a : args) {
+            argv.push_back(cast(must_of(value_of(a)), 32, true));
+        }
+
+        const char* fn = nullptr;
+        switch (static_cast<FileOp>(info.op)) {
+            case FileOp::Fgetc:
+                fn = "rt_fgetc";
+                break;
+            case FileOp::Ungetc:
+                fn = "rt_ungetc";
+                break;
+            case FileOp::Feof:
+                fn = "rt_feof";
+                break;
+            case FileOp::Ftell:
+                fn = "rt_ftell";
+                break;
+            case FileOp::Fseek:
+                fn = "rt_fseek";
+                break;
+            case FileOp::Rewind:
+                fn = "rt_rewind";
+                break;
+        }
+
+        std::vector<llvm::Type*> params(args.size(), b_.getInt32Ty());
+        auto*        fnty = llvm::FunctionType::get(b_.getInt32Ty(), params, false);
+        llvm::Value* r    = b_.CreateCall(llmod_.getOrInsertFunction(fn, fnty), argv);
+        set_value(i, packed(r, r, zero(32)));
+    }
+
+    // i32 rt_fgets(i8* mm, i8* z, i32 width, i32 fd)
+    llvm::FunctionCallee fgets_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(i32, { ptr, ptr, i32, i32 }, false);
+        return llmod_.getOrInsertFunction("rt_fgets", fnty);
+    }
+
+    // Lower a $fgets: hand the runtime the destination vector's plane pointers plus
+    // its bit width and the descriptor. The runtime reads a line, stores it
+    // right-justified into the must|may plane, clears the z plane, and returns the
+    // character count.
+    void lower_fgets(Index i) {
+        const Index   dst  = ir_->payload(i).op_extra.op;
+        const auto    info = ir_->extra_data<FgetsInfo>(ir_->payload(i).op_extra.extra);
+        const LValue& lv   = lvalue_of(dst);
+        if (lv.width != lv.store_width) {
+            // TODO: a part-select target ($fgets(s[15:0], fd)) writes only a slice;
+            // the runtime fills a whole packed vector today.
+            throw BackendError{ "$fgets into a part-select target is not supported" };
+        }
+        if (lv.store_width % 8 != 0) {
+            // TODO: a non-byte-multiple width leaves the must|may plane halves
+            // byte-unaligned; $fgets targets are byte vectors in practice.
+            throw BackendError{ "$fgets into a target whose width is not a multiple of 8 is not supported" };
+        }
+        llvm::Value* mm = lv.dyn_off != nullptr ? elem_ptr(lv.base, lv.off_mm, lv.dyn_off)
+                                                : field_ptr(lv.base, lv.off_mm);
+        llvm::Value* z  = lv.dyn_off != nullptr ? elem_ptr(lv.base, lv.off_z, lv.dyn_off)
+                                                : field_ptr(lv.base, lv.off_z);
+        llvm::Value* fd = cast(must_of(value_of(info.fd)), 32, true);
+        llvm::Value* r  = b_.CreateCall(fgets_fn(), { mm, z, b_.getInt32(lv.store_width), fd });
+        set_value(i, packed(r, r, zero(32)));
     }
 
     // Spill a packed-ASCII string value's must-bits to a stack byte buffer and
