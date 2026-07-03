@@ -553,6 +553,9 @@ private:
             // need heap-backed runtime storage).
             fail("dynamic / queue / associative arrays are not supported");
         }
+        if (ct.isString()) {
+            return module_.pool.string_type;
+        }
         if (!ct.isIntegral()) {
             fail("unsupported non-integral type");
         }
@@ -563,6 +566,37 @@ private:
     // True if an expression's type is a fixed-size unpacked array (a memory).
     static bool is_unpacked_array(const slang::ast::Expression& e) {
         return e.type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() != nullptr;
+    }
+
+    // True if an expression is of the dynamic `string` type (LRM 6.16).
+    static bool is_string_expr(const slang::ast::Expression& e) {
+        return e.type->getCanonicalType().isString();
+    }
+
+    // True if an interned IR type is the string type, or an unpacked array whose
+    // leaf element is.
+    bool is_string_ref(ir::Ref ty) const {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(ty));
+        if (t.kind == ir::Type::Kind::UnpackedArray) {
+            return is_string_ref(t.element);
+        }
+        return t.kind == ir::Type::Kind::String;
+    }
+
+    // Intern a string literal's characters as a string constant. Every \0 byte
+    // is dropped: a string object never contains one, and literal-to-string
+    // assignment strips them (LRM 6.16).
+    ir::Ref string_value_ref(std::string_view text) {
+        std::string stripped;
+        stripped.reserve(text.size());
+        for (const char c : text) {
+            if (c != '\0') {
+                stripped += c;
+            }
+        }
+        return module_.pool.put_value(
+          module_.pool.string_type,
+          { reinterpret_cast<const uint8_t*>(stripped.data()), stripped.size() });
     }
 
     // Intern a packed integer type of the given width / state / signedness.
@@ -691,6 +725,11 @@ private:
                         if (found != port_dir->end()) {
                             info.dir = found->second;
                         }
+                    }
+                    if (info.dir != ir::SignalInfo::Direction::Internal && is_string_ref(info.type)) {
+                        // TODO: string module ports (needs string-aware port
+                        // copies and change propagation).
+                        fail("string module ports are not supported");
                     }
 
                     sigmap_[&vs] = register_signal(std::move(info));
@@ -1025,6 +1064,12 @@ private:
         body.visit(c);
         for (const ir::Signal s : c.reads) {
             if (!c.written.contains(static_cast<uint32_t>(s))) {
+                if (is_string_ref(module_.signal(s).type)) {
+                    // TODO: string signals in inferred (@*) sensitivity — string
+                    // stores skip wait-queue servicing, so the process would
+                    // never re-trigger.
+                    fail("string in inferred combinational sensitivity is not supported");
+                }
                 out.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
             }
         }
@@ -1044,6 +1089,11 @@ private:
     }
 
     ir::Signal event_signal(const Expression& e) {
+        if (is_string_expr(e)) {
+            // TODO: waiting on a string change (needs string-aware wait-queue
+            // servicing; string stores skip edge detection).
+            fail("string in an event control is not supported");
+        }
         if (e.kind == ExpressionKind::NamedValue) {
             return signal_of(e.as<NamedValueExpression>().symbol);
         }
@@ -1428,6 +1478,11 @@ private:
     }
 
     void lower_case(const CaseStatement& c, ir::Builder& b) {
+        if (is_string_expr(c.expr)) {
+            // TODO: case over strings (labels compare with rt_string_cmp; the
+            // common-type/resize machinery below is packed-only).
+            fail("case statement over strings is not supported");
+        }
         ir::Inst::Tag cmp;
         switch (c.condition) {
             case CaseStatementCondition::Normal:
@@ -1506,6 +1561,13 @@ private:
             return;
         }
         const std::string_view name = call.getSubroutineName();
+        // A string method used as a statement (s.putc(i, c); the others are
+        // legal-but-pointless): lower for its effect, discard the value.
+        if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
+            is_string_expr(*call.arguments()[0])) {
+            lower_string_method(name, call, b);
+            return;
+        }
         if (name == "$display" || name == "$write") {
             lower_display(call, name == "$display", b);
             return;
@@ -1656,6 +1718,13 @@ private:
         const std::string_view name = call.getSubroutineName();
         const ir::SourceLoc    l    = loc(call);
 
+        // String built-in methods (s.len(), s.substr(i,j), ...) arrive as system
+        // calls whose receiver is arguments()[0]; their names carry no '$'.
+        if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
+            is_string_expr(*call.arguments()[0])) {
+            return lower_string_method(name, call, b);
+        }
+
         if (fn_ctx_ != nullptr && !fn_ctx_->is_task && (name == "$time" || name == "$stime")) {
             // A function is a plain callable with no wheel pointer in its ABI, so
             // it cannot read the simulation clock. Reject rather than emit a
@@ -1711,6 +1780,50 @@ private:
             fail("$realtime is not supported (no real-type support)");
         }
         fail("unsupported system function '" + std::string(name) + "'");
+    }
+
+    // Lower a built-in string method call (LRM 6.16.x). slang models these as
+    // system subroutines with the receiver as arguments()[0]. Read-only methods
+    // take the receiver as an rvalue; putc mutates it in place through its
+    // lvalue.
+    ir::Index lower_string_method(std::string_view name, const CallExpression& call, ir::Builder& b) {
+        const ir::SourceLoc l    = loc(call);
+        const auto          args = call.arguments();
+        const auto          recv = [&] { return lower_expr(*args[0], b); };
+        using T                  = ir::Inst::Tag;
+
+        if (name == "len") {
+            return b.unary(T::StrLen, recv(), l);
+        }
+        if (name == "getc" && args.size() == 2) {
+            return b.binary(T::StrGetc, recv(), lower_expr(*args[1], b), l);
+        }
+        if (name == "toupper") {
+            return b.unary(T::StrUpper, recv(), l);
+        }
+        if (name == "tolower") {
+            return b.unary(T::StrLower, recv(), l);
+        }
+        if (name == "compare" && args.size() == 2) {
+            return b.binary(T::StrCmp, recv(), lower_expr(*args[1], b), l);
+        }
+        if (name == "icompare" && args.size() == 2) {
+            return b.binary(T::StrICmp, recv(), lower_expr(*args[1], b), l);
+        }
+        if (name == "substr" && args.size() == 3) {
+            const ir::Index s = recv();
+            const ir::Index i = lower_expr(*args[1], b);
+            const ir::Index j = lower_expr(*args[2], b);
+            return b.str_substr(s, i, j, l);
+        }
+        if (name == "putc" && args.size() == 3) {
+            const ir::Index str = lower_lvalue(*args[0], b);
+            const ir::Index idx = lower_expr(*args[1], b);
+            return b.str_putc(str, idx, lower_expr(*args[2], b), l);
+        }
+        // TODO: atoi / atohex / atooct / atobin / atoreal and the itoa family
+        // (LRM 6.16.9-6.16.10) — need the numeric conversion runtime entries.
+        fail("string method '" + std::string(name) + "' is not supported");
     }
 
     // Lower $display / $write into a single format string plus the value args its
@@ -1859,6 +1972,27 @@ private:
             // supported today.
             fail("whole unpacked array assignment is not supported");
         }
+        // s[i] = c writes one character in place; out-of-range or a zero byte is
+        // a no-op (LRM 6.16.2). The LHS element is byte-typed, so detect it via
+        // the selected base.
+        if (a.left().kind == ExpressionKind::ElementSelect &&
+            is_string_expr(a.left().as<ElementSelectExpression>().value())) {
+            if (a.isNonBlocking()) {
+                // TODO: nonblocking assignment to strings (needs a string-aware
+                // NBA staging path).
+                fail("nonblocking assignment to a string is not supported");
+            }
+            const ElementSelectExpression& es  = a.left().as<ElementSelectExpression>();
+            const ir::Index                str = lower_lvalue(es.value(), b);
+            const ir::Index                idx = lower_expr(es.selector(), b);
+            b.str_putc(str, idx, lower_expr(a.right(), b), loc(a));
+            return;
+        }
+        if (is_string_expr(a.left()) && a.isNonBlocking()) {
+            // TODO: nonblocking assignment to strings (needs a string-aware NBA
+            // staging path; the per-signal shadow is plane-shaped).
+            fail("nonblocking assignment to a string is not supported");
+        }
         // StoreNb gets correct two-phase NBA semantics in the backend: the RHS is
         // sampled here in the active region and committed in the NBA update region.
         // Intra-assignment timing (`<= #5`) is still rejected above, so the deferred
@@ -1883,8 +2017,11 @@ private:
         const std::span<const Expression* const> ops = cc.operands();
         uint32_t                                  offset = 0;
         for (size_t k = ops.size(); k-- > 0;) {
-            const Expression& op    = *ops[k];
-            ir::Index         chunk = rhs;
+            const Expression& op = *ops[k];
+            if (is_string_expr(op)) {
+                fail("string operand in an lvalue concatenation is not supported");
+            }
+            ir::Index chunk = rhs;
             if (offset != 0) {
                 const ir::Index sh =
                     b.constant(module_.pool.put_int(make_int_type(32, false, false), offset), l);
@@ -1909,10 +2046,15 @@ private:
             case ExpressionKind::IntegerLiteral:
                 return b.constant(lower_int_literal(expr.as<IntegerLiteral>()), l);
             case ExpressionKind::StringLiteral: {
-                // A string literal is a packed array of 8-bit ASCII bytes (LRM 5.9);
-                // as an integral rvalue it is that packed value. slang folds it to an
-                // SVInt of the literal's 8*N-bit type; the surrounding conversion
-                // resizes it to the assignment context.
+                // In a string-typed context the literal is a string constant with
+                // its \0 bytes dropped (LRM 6.16).
+                if (is_string_expr(expr)) {
+                    return b.constant(string_value_ref(expr.as<StringLiteral>().getValue()), l);
+                }
+                // Otherwise a string literal is a packed array of 8-bit ASCII bytes
+                // (LRM 5.9); as an integral rvalue it is that packed value. slang
+                // folds it to an SVInt of the literal's 8*N-bit type; the
+                // surrounding conversion resizes it to the assignment context.
                 slang::ast::ASTContext  actx(*scope_, slang::ast::LookupLocation::max);
                 slang::ast::EvalContext ectx(actx);
                 const slang::ConstantValue cv = expr.eval(ectx);
@@ -1940,6 +2082,11 @@ private:
                 return lower_binary(expr.as<BinaryExpression>(), b);
             case ExpressionKind::ConditionalOp: {
                 const ConditionalExpression& c = expr.as<ConditionalExpression>();
+                if (is_string_expr(expr)) {
+                    // TODO: ?: over strings (needs a string-aware mux; lower to a
+                    // Cond with a string temp).
+                    fail("conditional operator (?:) over strings is not supported");
+                }
                 if (c.conditions.size() != 1) {
                     fail("unsupported multi-condition ?:");
                 }
@@ -1961,10 +2108,16 @@ private:
                 return b.repl(lower_expr(r.concat(), b), static_cast<uint32_t>(count), l);
             }
             case ExpressionKind::ElementSelect: {
-                const ElementSelectExpression& es   = expr.as<ElementSelectExpression>();
-                const ir::Index                base = lower_lvalue(es.value(), b);
-                const ir::Index                idx  = lower_expr(es.selector(), b);
-                const ir::Index                sel  = is_unpacked_array(es.value())
+                const ElementSelectExpression& es = expr.as<ElementSelectExpression>();
+                if (is_string_expr(es.value())) {
+                    // s[i] reads the byte at i, 0 when out of range — identical to
+                    // getc (LRM 6.16.3).
+                    const ir::Index str = b.unary(ir::Inst::Tag::Load, lower_lvalue(es.value(), b), l);
+                    return b.binary(ir::Inst::Tag::StrGetc, str, lower_expr(es.selector(), b), l);
+                }
+                const ir::Index base = lower_lvalue(es.value(), b);
+                const ir::Index idx  = lower_expr(es.selector(), b);
+                const ir::Index sel  = is_unpacked_array(es.value())
                                    ? b.elem_select(base, idx, lower_type(*es.value().type), l)
                                    : b.binary(ir::Inst::Tag::BitSelect, base, idx, l);
                 return b.unary(ir::Inst::Tag::Load, sel, l);
@@ -1975,7 +2128,33 @@ private:
                 return b.unary(ir::Inst::Tag::Load, lower_range_select(rs, base, b, l), l);
             }
             case ExpressionKind::Conversion: {
-                const ConversionExpression& cv = expr.as<ConversionExpression>();
+                const ConversionExpression& cv       = expr.as<ConversionExpression>();
+                const bool                  to_str   = is_string_expr(expr);
+                const bool                  from_str = is_string_expr(cv.operand());
+                if (to_str && from_str) {
+                    return lower_expr(cv.operand(), b); // identity
+                }
+                if (to_str) {
+                    // A literal folds at compile time (its \0 bytes dropped);
+                    // anything else is the runtime integral -> string cast
+                    // (bytes MSB-first, zero bytes removed, LRM 6.16).
+                    if (cv.operand().kind == ExpressionKind::StringLiteral) {
+                        return b.constant(
+                          string_value_ref(cv.operand().as<StringLiteral>().getValue()), l);
+                    }
+                    if (!cv.operand().type->isIntegral()) {
+                        fail("unsupported conversion to string");
+                    }
+                    return b.unary(ir::Inst::Tag::StrFromPacked, lower_expr(cv.operand(), b), l);
+                }
+                if (from_str) {
+                    // string -> packed integral: characters pack MSB-first,
+                    // right-justified to the target width (LRM 6.16).
+                    if (!expr.type->isIntegral()) {
+                        fail("unsupported conversion from string");
+                    }
+                    return b.str_to_packed(lower_expr(cv.operand(), b), lower_type(*expr.type), l);
+                }
                 return b.resize(lower_expr(cv.operand(), b), lower_type(*expr.type), l);
             }
             case ExpressionKind::Call: {
@@ -2033,6 +2212,30 @@ private:
         const ir::Index     rhs = lower_expr(bin.right(), b);
         using B                 = slang::ast::BinaryOperator;
         using T                 = ir::Inst::Tag;
+
+        if (is_string_expr(bin.left()) || is_string_expr(bin.right())) {
+            // slang's implicit conversions make both operands string here. Only
+            // comparisons apply to strings; ===/!== degenerate to ==/!= since a
+            // string carries no X/Z (LRM 6.16.9).
+            switch (bin.op) {
+                case B::Equality:
+                case B::CaseEquality:
+                    return b.binary(T::Eq, lhs, rhs, l);
+                case B::Inequality:
+                case B::CaseInequality:
+                    return b.binary(T::Ne, lhs, rhs, l);
+                case B::LessThan:
+                    return b.binary(T::Lt, lhs, rhs, l);
+                case B::LessThanEqual:
+                    return b.binary(T::Le, lhs, rhs, l);
+                case B::GreaterThan:
+                    return b.binary(T::Gt, lhs, rhs, l);
+                case B::GreaterThanEqual:
+                    return b.binary(T::Ge, lhs, rhs, l);
+                default:
+                    fail("unsupported binary operator on strings");
+            }
+        }
 
         switch (bin.op) {
             case B::Add:
@@ -2310,6 +2513,12 @@ private:
                 // TODO: output / inout arguments on functions.
                 fail("functions with output/inout/ref arguments are not supported");
             }
+            if (is_task && dir != slang::ast::ArgumentDirection::In &&
+                fa->getType().getCanonicalType().isString()) {
+                // TODO: output / inout string task formals (the copy-out path
+                // passes plane pointers, not string handles).
+                fail("output/inout string task arguments are not supported");
+            }
         }
 
         const ir::FunctionId id = module_.reserve_function();
@@ -2456,7 +2665,10 @@ private:
         args.reserve(actuals.size());
         for (size_t i = 0; i < formals.size(); ++i) {
             const ir::Ref pty = lower_type(formals[i]->getType());
-            args.push_back(b.resize(lower_expr(*actuals[i], b), pty, l));
+            // A string actual passes as-is (no width to resize to); the callee's
+            // copy-in gives value semantics.
+            args.push_back(is_string_ref(pty) ? lower_expr(*actuals[i], b)
+                                              : b.resize(lower_expr(*actuals[i], b), pty, l));
         }
         const ir::Index c = b.call(id, args, l);
 
@@ -2491,7 +2703,8 @@ private:
         for (size_t i = 0; i < formals.size(); ++i) {
             const ir::Ref pty = lower_type(formals[i]->getType());
             if (formals[i]->direction == slang::ast::ArgumentDirection::In) {
-                args.push_back(b.resize(lower_expr(*actuals[i], b), pty, l));
+                args.push_back(is_string_ref(pty) ? lower_expr(*actuals[i], b)
+                                                  : b.resize(lower_expr(*actuals[i], b), pty, l));
                 continue;
             }
             // slang models an output / inout actual as an AssignmentExpression whose
