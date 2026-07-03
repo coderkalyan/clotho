@@ -16,9 +16,11 @@ extern "C" {
 // pattern, `xz` marks unknown bits (X or Z), and `z` marks the high-impedance
 // subset (z is a subset of xz). Only the low `width` bits are significant.
 typedef struct rt_arg {
-    // Significant bit width of the value.
+    // Significant bit width of the value (0 for a string handle).
     uint32_t width;
     // Bit 0: the value is signed (drives %d sign-extension).
+    // Bit 1: `val` carries an rt_string* (a %s string-object argument); the
+    //        width/xz/z fields are meaningless.
     uint32_t flags;
     // Value plane (definitely-1 bits) in the low `width` bits.
     uint64_t val;

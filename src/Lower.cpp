@@ -1844,11 +1844,17 @@ private:
                 fmt += text;
                 collect_specifiers(text, pending);
             } else {
-                char conv = 'd';
+                const bool str  = is_string_expr(*arg);
+                char       conv = str ? 's' : 'd';
                 if (next < pending.size()) {
                     conv = pending[next++]; // consumed by an earlier specifier
                 } else {
-                    fmt += "%0d"; // bare value: default decimal
+                    fmt += str ? "%s" : "%0d"; // bare value default
+                }
+                if (str && conv != 's' && conv != 'S') {
+                    // TODO: %d/%h/... of a string object (would need the packed
+                    // reinterpretation of its characters).
+                    fail("a string argument to $display/$write requires %s");
                 }
                 ir::Index v = lower_expr(*arg, b);
                 if (conv == 't' || conv == 'T') {

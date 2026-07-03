@@ -112,6 +112,11 @@ void render_digits(std::string& out, uint64_t val, uint64_t xz, uint64_t z, uint
     }
 }
 
+// Forward declarations: the rt_string representation lives below with the
+// other string internals; %s rendering needs these two.
+uint64_t    str_len(const rt_string* s);
+const char* str_data(const rt_string* s);
+
 // Render one descriptor under conversion `conv`, appending to `out`.
 void render_arg(std::string& out, const rt_arg& a, char conv) {
     const uint32_t w    = a.width ? a.width : 1;
@@ -156,10 +161,24 @@ void render_arg(std::string& out, const rt_arg& a, char conv) {
             // tick count; render_time converts it per the current $timeformat.
             render_time(out, val);
             return;
+        case 's':
+        case 'S':
+            if ((a.flags & 2u) != 0) {
+                // A string object: `val` carries the rt_string handle pointer.
+                const auto* s = reinterpret_cast<const rt_string*>(static_cast<uintptr_t>(a.val));
+                out.append(str_data(s), str_len(s));
+                return;
+            }
+            // A packed value: ceil(width/8) ASCII chars, most-significant first;
+            // a 0x00 byte prints as a space (matches iverilog).
+            for (uint32_t k = (w + 7) / 8; k-- > 0;) {
+                const auto c = static_cast<char>((val >> (8 * k)) & 0xff);
+                out += c == '\0' ? ' ' : c;
+            }
+            return;
         default:
-            // TODO: %s / %m / %f are consumed but emit nothing, so the field
-            // silently vanishes. LRM expects string / hierarchical-path / real
-            // output respectively.
+            // TODO: %m / %f are consumed but emit nothing, so the field silently
+            // vanishes. LRM expects hierarchical-path / real output respectively.
             return;
     }
 }
