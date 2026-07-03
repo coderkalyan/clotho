@@ -82,6 +82,9 @@ struct ValType {
     uint32_t width      = 0;
     bool     four_state = false;
     bool     is_signed  = false;
+    // A string value: carried as an rt_string handle pointer (str_vals_), never
+    // as a Plane. width / four_state are meaningless when set.
+    bool is_string = false;
 };
 
 // A lowered value: the must/may planes packed into one i(2W) integer (low W bits
@@ -255,6 +258,9 @@ struct LValue {
     // is meaningful only then.
     bool   is_signal = false;
     Signal sig{ 0 };
+    // A string target: `base` (indexed by elem_idx for an array) is the
+    // rt_string handle; widths / bit_off / has_z are meaningless.
+    bool is_string = false;
 };
 
 // Per-signal placement in the state struct plus its cached layout facts. A
@@ -295,6 +301,10 @@ struct SignalSlot {
     uint32_t sh_mm_field   = 0;
     uint32_t sh_z_field    = 0;
     uint32_t sh_mask_field = 0;
+    // A string (or array-of-string) signal: the slot is an opaque rt_string
+    // handle (`clotho.string`), has_z is false, and `nba` is never set (the
+    // frontend rejects nonblocking assignment to strings).
+    bool is_string = false;
 };
 
 // One NBA commit bucket: every NBA-target signal of a given width and partial-ness
@@ -318,6 +328,9 @@ struct FrameSlot {
     llvm::StructType* slot_ty    = nullptr;
     uint32_t          width      = 0;
     bool              four_state = false;
+    // A string local: the slot is an rt_string handle; init/deinit bracket the
+    // call.
+    bool is_string = false;
 };
 
 // Raised on a construct the backend cannot lower; caught at the top level.
@@ -436,6 +449,26 @@ private:
         return ty;
     }
 
+    // The opaque rt_string handle slot type (`%clotho.string = { [32 x i8] }`),
+    // memoized. A struct wrapper keeps GEP paths and array-of-slot addressing
+    // uniform with the plane slots.
+    llvm::StructType* str_slot_ty() {
+        if (str_slot_ty_ == nullptr) {
+            str_slot_ty_ = llvm::StructType::create(
+              ctx_, { llvm::ArrayType::get(b_.getInt8Ty(), sizeof(rt_string)) }, "clotho.string");
+        }
+        return str_slot_ty_;
+    }
+
+    // Whether a type is a string, or an unpacked array whose leaf element is.
+    bool is_string_type(Ref type) const {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            return is_string_type(t.element);
+        }
+        return t.kind == Type::Kind::String;
+    }
+
     // Total leaf-element count of an unpacked-array type (product of all
     // dimensions); 1 for a scalar leaf.
     uint32_t array_leaf_count(Ref type) const {
@@ -536,6 +569,20 @@ private:
             slot.width       = lay.width == 0 ? 1 : lay.width;
             slot.four_state  = lay.domain == Domain::Four;
             slot.is_signed   = ty.is_signed;
+            // A string slot is an opaque rt_string handle: no planes, no z word.
+            if (is_string_type(sigs[i].type)) {
+                slot.is_string = true;
+                slot.has_z     = false;
+                slot.slot_ty   = str_slot_ty();
+                if (ty.kind == Type::Kind::UnpackedArray) {
+                    slot.is_array   = true;
+                    slot.elem_count = array_leaf_count(sigs[i].type);
+                    slot.storage_ty = llvm::ArrayType::get(slot.slot_ty, slot.elem_count);
+                } else {
+                    slot.storage_ty = slot.slot_ty;
+                }
+                continue;
+            }
             slot.init_z      = undriven[i] && sigs[i].is_net && slot.four_state;
             slot.has_z       = may_z[i] || task_out[i] || slot.init_z;
             slot.slot_ty     = slot_type(slot.width, slot.four_state, slot.has_z);
@@ -760,6 +807,8 @@ private:
         values_.assign(n, Plane{});
         lvals_.assign(n, std::optional<LValue>{});
         types_.assign(n, std::optional<ValType>{});
+        str_vals_.assign(n, nullptr);
+        frame_slots_.clear(); // a process has no frame; deinit sees only temps
 
         // This process's scheduled-flag slot: &clotho.proc_sched[proc_index]. A
         // constant GEP so it is valid in any block of the function.
@@ -823,6 +872,9 @@ private:
         frame->addIncoming(mem, alloc_bb);
         hdl_        = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_begin), { id, frame });
         coro_begin_ = llvm::cast<llvm::Instruction>(hdl_);
+        // String rvalue temporaries live in the coroutine frame (CoroSplit spills
+        // any that survive a suspend) and are constructed once, in the ramp.
+        build_str_temps();
 
         // Shared epilogue, built up front so #delay suspends and the final suspend
         // can all branch to it. cleanup frees the frame (coro.free -> rt_free); ret
@@ -890,6 +942,10 @@ private:
         auto* final_bb = llvm::BasicBlock::Create(ctx_, "coro.final", fn_);
         b_.CreateBr(final_bb);
         b_.SetInsertPoint(final_bb);
+        // A completing process releases its string temporaries. (An always loop
+        // never reaches here — its temps persist, bounded and capacity-reused; a
+        // $finish longjmps out and the heap is reclaimed at process exit.)
+        deinit_body_strings();
         auto* res = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { none, b_.getTrue() });
         auto* sw  = b_.CreateSwitch(res, coro_ret_bb_, 2);
         sw->addCase(b_.getInt8(0), trap_bb);
@@ -938,11 +994,22 @@ private:
         std::vector<llvm::Type*> params;
         params.push_back(ptr); // state
         for (Ref pt : f.param_types) {
+            if (is_string_type(pt)) {
+                params.push_back(ptr); // rt_string handle (callee copy-in gives value semantics)
+                continue;
+            }
             const uint32_t w = width_of(pt);
             params.push_back(int_ty(2 * w)); // must|may
             params.push_back(int_ty(w));     // z
         }
-        auto* fnty = llvm::FunctionType::get(fn_return_ty(f.return_type), params, false);
+        // A string result returns through a trailing out-param handle the caller
+        // owns (its call-site temp) — a 32-byte handle has no plane struct form.
+        llvm::Type* rty = fn_return_ty(f.return_type);
+        if (is_string_type(f.return_type)) {
+            rty = b_.getVoidTy();
+            params.push_back(ptr);
+        }
+        auto* fnty = llvm::FunctionType::get(rty, params, false);
         auto* fn   = llvm::Function::Create(fnty, llvm::Function::InternalLinkage,
                                             mod_.name + ".fn." + f.name, llmod_);
         fn->addParamAttr(0, llvm::Attribute::NoAlias);
@@ -965,6 +1032,10 @@ private:
         params.push_back(ptr); // wheel
         for (size_t k = 0; k < f.param_types.size(); ++k) {
             if (f.arg_dirs[k] == ArgDir::In) {
+                if (is_string_type(f.param_types[k])) {
+                    params.push_back(ptr); // rt_string handle
+                    continue;
+                }
                 const uint32_t w = width_of(f.param_types[k]);
                 params.push_back(int_ty(2 * w)); // must|may
                 params.push_back(int_ty(w));     // z
@@ -984,11 +1055,31 @@ private:
 
     // LLVM param index of formal k's first parameter (state, wheel, then 2 per
     // formal). The record slot follows all formals.
-    static uint32_t task_param_base(uint32_t k) {
-        return 2 + 2 * k;
+    // LLVM arg index of each formal's first parameter for `f`'s signature shape:
+    // functions start after `state`, tasks after `state, wheel`; a string input
+    // formal is one ptr, everything else two params. Replaces a fixed
+    // 1 + 2k / 2 + 2k stride, which string formals break.
+    std::vector<uint32_t> param_indices(const Function& f) const {
+        std::vector<uint32_t> idx(f.param_types.size());
+        uint32_t              cur = f.is_task ? 2 : 1;
+        for (size_t k = 0; k < f.param_types.size(); ++k) {
+            idx[k] = cur;
+            const bool in_string =
+              is_string_type(f.param_types[k]) && (!f.is_task || f.arg_dirs[k] == ArgDir::In);
+            cur += in_string ? 1 : 2;
+        }
+        return idx;
     }
+
+    // LLVM param index of the task's record slot: right after the last formal.
     uint32_t task_record_param(const Function& f) const {
-        return 2 + 2 * static_cast<uint32_t>(f.param_types.size());
+        const auto idx = param_indices(f);
+        if (idx.empty()) {
+            return 2;
+        }
+        const bool last_string =
+          is_string_type(f.param_types.back()) && f.arg_dirs.back() == ArgDir::In;
+        return idx.back() + (last_string ? 1 : 2);
     }
 
     // Build a function's frame struct: one slot field per local, in Local-handle
@@ -1001,6 +1092,12 @@ private:
             const Layout lay           = mod_.pool.layout(f.local_types[i]);
             frame_slots_[i].width      = lay.width == 0 ? 1 : lay.width;
             frame_slots_[i].four_state = lay.domain == Domain::Four;
+            if (is_string_type(f.local_types[i])) {
+                frame_slots_[i].is_string = true;
+                frame_slots_[i].slot_ty   = str_slot_ty();
+                fields[i]                 = frame_slots_[i].slot_ty;
+                continue;
+            }
             // Frame slots always keep z: the task ABI and copy-in/out use the z
             // field, and LLVM folds the zero-z traffic on its own.
             frame_slots_[i].slot_ty = slot_type(frame_slots_[i].width, frame_slots_[i].four_state, true);
@@ -1016,11 +1113,29 @@ private:
         for (uint32_t i = 0; i < frame_slots_.size(); ++i) {
             const FrameSlot& s    = frame_slots_[i];
             llvm::Value*     slot = b_.CreateStructGEP(frame_ty_, frame_, i);
+            if (s.is_string) {
+                b_.CreateCall(str_init_fn(), { slot });
+                continue;
+            }
             llvm::Value*     mm   = s.four_state
                                       ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * s.width, s.width))
                                       : zero(2 * s.width);
             b_.CreateStore(mm, b_.CreateStructGEP(s.slot_ty, slot, 0));
             b_.CreateStore(zero(s.width), b_.CreateStructGEP(s.slot_ty, slot, 1));
+        }
+    }
+
+    // Release every string owned by the current body: frame-local string slots
+    // plus the string rvalue temporaries. Emitted before each function `ret`, in
+    // a task's completion epilogue, and before a process's final suspend.
+    void deinit_body_strings() {
+        for (uint32_t i = 0; i < frame_slots_.size(); ++i) {
+            if (frame_slots_[i].is_string) {
+                b_.CreateCall(str_deinit_fn(), { b_.CreateStructGEP(frame_ty_, frame_, i) });
+            }
+        }
+        for (llvm::Value* temp : str_temp_list_) {
+            b_.CreateCall(str_deinit_fn(), { temp });
         }
     }
 
@@ -1032,6 +1147,7 @@ private:
         ir_               = &f.ir;
         cur_fn_           = &f;
         cur_is_task_      = false;
+        param_llvm_index_ = param_indices(f);
         build_frame_layout(f);
 
         fn_            = fn_decls_[static_cast<uint32_t>(id)];
@@ -1039,6 +1155,7 @@ private:
         values_.assign(n, Plane{});
         lvals_.assign(n, std::optional<LValue>{});
         types_.assign(n, std::optional<ValType>{});
+        str_vals_.assign(n, nullptr);
 
         auto* entry = llvm::BasicBlock::Create(ctx_, "entry", fn_);
         b_.SetInsertPoint(entry);
@@ -1048,11 +1165,13 @@ private:
 
         frame_ = b_.CreateAlloca(frame_ty_, nullptr, "frame");
         init_frame();
+        build_str_temps();
 
         lower_region(ir_->root());
         // The frontend appends a trailing Ret, so the entry path always terminates;
         // guard defensively in case a body lowered to nothing.
         if (b_.GetInsertBlock()->getTerminator() == nullptr) {
+            deinit_body_strings();
             if (is_void(f.return_type)) {
                 b_.CreateRetVoid();
             } else {
@@ -1077,6 +1196,7 @@ private:
         ir_               = &f.ir;
         cur_fn_           = &f;
         cur_is_task_      = true;
+        param_llvm_index_ = param_indices(f);
         build_frame_layout(f);
 
         fn_            = fn_decls_[static_cast<uint32_t>(id)];
@@ -1084,6 +1204,7 @@ private:
         values_.assign(n, Plane{});
         lvals_.assign(n, std::optional<LValue>{});
         types_.assign(n, std::optional<ValType>{});
+        str_vals_.assign(n, nullptr);
 
         auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
         state_       = fn_->getArg(0);
@@ -1158,6 +1279,7 @@ private:
         // Body: initialize the frame, copy parameters in (per direction), then run.
         b_.SetInsertPoint(start_bb);
         init_frame();
+        build_str_temps();
         emit_task_copyin(f);
         lower_region(ir_->root());
         branch_to(epilogue_bb);
@@ -1170,6 +1292,7 @@ private:
         // suspending, so we push it onto the active queue here.
         b_.SetInsertPoint(epilogue_bb);
         emit_task_copyout(f);
+        deinit_body_strings(); // string locals + temps die with the call
         llvm::Value* parent = b_.CreateLoad(ptr_ty, fn_->getArg(task_record_param(f)));
         auto*        has_bb = llvm::BasicBlock::Create(ctx_, "task.wake", fn_);
         b_.CreateCondBr(b_.CreateICmpNE(parent, null), has_bb, final_bb);
@@ -1198,8 +1321,15 @@ private:
     void emit_task_copyin(const Function& f) {
         for (uint32_t k = 0; k < f.param_types.size(); ++k) {
             const uint32_t w    = width_of(f.param_types[k]);
-            const uint32_t base = task_param_base(k);
+            const uint32_t base = param_llvm_index_[k];
             if (f.arg_dirs[k] == ArgDir::In) {
+                if (is_string_type(f.param_types[k])) {
+                    // Deep copy the caller's handle into the frame local (value
+                    // semantics; the frame slot was init'd by init_frame).
+                    b_.CreateCall(str_assign_fn(),
+                                  { b_.CreateStructGEP(frame_ty_, frame_, k), fn_->getArg(base) });
+                    continue;
+                }
                 lower_store(local_lvalue(k), Plane{ fn_->getArg(base), fn_->getArg(base + 1) }, from_ref(f.param_types[k]));
             } else if (f.arg_dirs[k] == ArgDir::Inout) {
                 llvm::Value* mm = b_.CreateLoad(int_ty(2 * w), fn_->getArg(base));
@@ -1216,7 +1346,7 @@ private:
             if (f.arg_dirs[k] == ArgDir::In) {
                 continue;
             }
-            const uint32_t base = task_param_base(k);
+            const uint32_t base = param_llvm_index_[k];
             const Plane    v    = lower_load(local_lvalue(k));
             b_.CreateStore(v.mm, fn_->getArg(base));
             b_.CreateStore(v.z, fn_->getArg(base + 1));
@@ -1440,6 +1570,15 @@ private:
                       { b_.getInt64(mod_.tick_fs), b_.getInt32(static_cast<uint32_t>(mod_.timeformat_units)) });
 
         emit_active_run(state, wheel, procs);
+
+        // Release heap owned by string signals. A $finish longjmps out of the
+        // design before reaching this, so it covers designs that drain
+        // naturally; a $finish run's string heap is reclaimed at process exit.
+        for (const SignalSlot& s : slots_) {
+            if (s.is_string) {
+                emit_string_slot_op(state, s, str_deinit_fn());
+            }
+        }
 
         b_.CreateCall(wheel_deinit_fn(), { wheel });
         b_.CreateRet(llvm::ConstantInt::get(i32, 0));
@@ -2466,6 +2605,65 @@ private:
         return llmod_.getOrInsertFunction("rt_nba_arr_reset", llvm::FunctionType::get(b_.getVoidTy(), {}, false));
     }
 
+    // -- String runtime (rt_string_*, runtime/Runtime.h) --
+
+    llvm::FunctionCallee str_rt_fn(const char* name, llvm::Type* ret, llvm::ArrayRef<llvm::Type*> params) {
+        return llmod_.getOrInsertFunction(name, llvm::FunctionType::get(ret, params, false));
+    }
+    llvm::Type* raw_ptr_ty() {
+        return llvm::PointerType::getUnqual(ctx_);
+    }
+    llvm::FunctionCallee str_init_fn() {
+        return str_rt_fn("rt_string_init", b_.getVoidTy(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_deinit_fn() {
+        return str_rt_fn("rt_string_deinit", b_.getVoidTy(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_assign_fn() {
+        return str_rt_fn("rt_string_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_assign_bytes_fn() {
+        return str_rt_fn("rt_string_assign_bytes", b_.getVoidTy(),
+                         { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+    }
+    llvm::FunctionCallee str_len_fn() {
+        return str_rt_fn("rt_string_len", b_.getInt64Ty(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_concat_fn() {
+        return str_rt_fn("rt_string_concat", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_repl_fn() {
+        return str_rt_fn("rt_string_repl", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+    }
+    llvm::FunctionCallee str_cmp_fn() {
+        return str_rt_fn("rt_string_cmp", b_.getInt32Ty(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_icmp_fn() {
+        return str_rt_fn("rt_string_icmp", b_.getInt32Ty(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_substr_fn() {
+        return str_rt_fn("rt_string_substr", b_.getVoidTy(),
+                         { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_upper_fn() {
+        return str_rt_fn("rt_string_toupper", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_lower_fn() {
+        return str_rt_fn("rt_string_tolower", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_putc_fn() {
+        return str_rt_fn("rt_string_putc", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_getc_fn() {
+        return str_rt_fn("rt_string_getc", b_.getInt32Ty(), { raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_from_packed_fn() {
+        return str_rt_fn("rt_string_from_packed", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_to_packed_fn() {
+        return str_rt_fn("rt_string_to_packed", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+    }
+
     llvm::FunctionCallee wheel_init_fn() {
         auto* ptr = llvm::PointerType::getUnqual(ctx_);
         return llmod_.getOrInsertFunction("rt_wheel_init", llvm::FunctionType::get(b_.getVoidTy(), { ptr }, false));
@@ -2504,6 +2702,10 @@ private:
     // must 0, may 1, z all-ones), other 4-state signals X (z 0), 2-state 0.
     void init_state(llvm::Value* state) {
         for (const SignalSlot& s : slots_) {
+            if (s.is_string) {
+                emit_string_slot_op(state, s, str_init_fn());
+                continue;
+            }
             if (s.is_array) {
                 emit_array_init(state, s);
                 continue;
@@ -2528,6 +2730,37 @@ private:
                                                       b_.getInt32(s.sh_mask_field) }));
             }
         }
+    }
+
+    // Apply `callee` (rt_string_init / rt_string_deinit) to a string signal's
+    // handle, or to every element handle of an array-of-string signal (a runtime
+    // loop, like emit_array_init).
+    void emit_string_slot_op(llvm::Value* state, const SignalSlot& s, llvm::FunctionCallee callee) {
+        llvm::Value* base = storage_ptr(state, s);
+        if (!s.is_array) {
+            b_.CreateCall(callee, { base });
+            return;
+        }
+        auto* arr_ty = llvm::cast<llvm::ArrayType>(s.storage_ty);
+        auto* i32    = b_.getInt32Ty();
+        auto* fn     = b_.GetInsertBlock()->getParent();
+        auto* head   = llvm::BasicBlock::Create(ctx_, "strop.head", fn);
+        auto* body   = llvm::BasicBlock::Create(ctx_, "strop.body", fn);
+        auto* done   = llvm::BasicBlock::Create(ctx_, "strop.done", fn);
+        auto* entry  = b_.GetInsertBlock();
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(head);
+        auto* idx = b_.CreatePHI(i32, 2);
+        idx->addIncoming(b_.getInt32(0), entry);
+        b_.CreateCondBr(b_.CreateICmpULT(idx, b_.getInt32(s.elem_count)), body, done);
+
+        b_.SetInsertPoint(body);
+        b_.CreateCall(callee, { b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), idx }) });
+        idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), body);
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(done);
     }
 
     // Initialise an unpacked-array signal: a runtime loop over its elements
@@ -2609,8 +2842,11 @@ private:
     }
 
     ValType from_ref(Ref type) const {
+        const Type& ty = std::get<Type>(mod_.pool.get(type));
+        if (ty.kind == Type::Kind::String) {
+            return { 0, false, false, true };
+        }
         const Layout lay = mod_.pool.layout(type);
-        const Type&  ty  = std::get<Type>(mod_.pool.get(type));
         return { lay.width == 0 ? 1 : lay.width, lay.domain == Domain::Four, ty.is_signed };
     }
 
@@ -2629,7 +2865,7 @@ private:
                 return from_ref(p.op_type.type);
             case Inst::Tag::Signal: {
                 const SignalSlot& s = slot_of(p.signal);
-                return { s.width, s.four_state, s.is_signed };
+                return { s.width, s.four_state, s.is_signed, s.is_string && !s.is_array };
             }
             case Inst::Tag::BitSelect: {
                 const ValType base = type_of(p.binary.l);
@@ -2701,6 +2937,9 @@ private:
                 bool                 four  = false;
                 for (Index part : ir_->operands(i, scratch)) {
                     const ValType t = type_of(part);
+                    if (t.is_string) { // string concat (all parts are strings)
+                        return { 0, false, false, true };
+                    }
                     width += t.width;
                     four = four || t.four_state;
                 }
@@ -2708,8 +2947,27 @@ private:
             }
             case Inst::Tag::Repl: {
                 const ValType v = type_of(p.repl.value);
+                if (v.is_string) {
+                    return { 0, false, false, true };
+                }
                 return { v.width * p.repl.count, v.four_state, false };
             }
+
+            case Inst::Tag::StrLen:
+            case Inst::Tag::StrCmp:
+            case Inst::Tag::StrICmp:
+                return { 32, false, true };
+            case Inst::Tag::StrGetc:
+                return { 8, false, false };
+            case Inst::Tag::StrUpper:
+            case Inst::Tag::StrLower:
+            case Inst::Tag::StrSubstr:
+            case Inst::Tag::StrFromPacked:
+                return { 0, false, false, true };
+            case Inst::Tag::StrToPacked:
+                return from_ref(p.op_type.type);
+            case Inst::Tag::StrPutc:
+                return { 0, false, false };
 
             case Inst::Tag::Store:
             case Inst::Tag::StoreNb:
@@ -2745,6 +3003,64 @@ private:
         lvals_[static_cast<uint32_t>(i)] = lv;
     }
 
+    // rt_string handle pointer of a string-valued instruction (parallel to
+    // values_; null for non-string values).
+    llvm::Value* str_of(Index i) const {
+        return str_vals_[static_cast<uint32_t>(i)];
+    }
+    void set_str(Index i, llvm::Value* handle) {
+        str_vals_[static_cast<uint32_t>(i)] = handle;
+    }
+
+    // The rt_string handle pointer of a string lvalue (one array element when
+    // elem_idx selects it).
+    llvm::Value* lv_string_ptr(const LValue& lv) {
+        if (lv.array_ty != nullptr) {
+            llvm::Value* idx = lv.elem_idx != nullptr ? lv.elem_idx : b_.getInt32(0);
+            return b_.CreateInBoundsGEP(lv.array_ty, lv.base, { b_.getInt32(0), idx });
+        }
+        return lv.base;
+    }
+
+    // Whether an instruction produces a fresh string value that needs its own
+    // 32-byte handle (as opposed to yielding a pointer at existing storage).
+    bool produces_string_temp(Index i) {
+        switch (ir_->tag(i)) {
+            case Inst::Tag::StrUpper:
+            case Inst::Tag::StrLower:
+            case Inst::Tag::StrSubstr:
+            case Inst::Tag::StrFromPacked:
+                return true;
+            case Inst::Tag::Constant:
+            case Inst::Tag::Concat:
+            case Inst::Tag::Repl:
+            case Inst::Tag::Call:
+                return type_of(i).is_string;
+            default:
+                return false;
+        }
+    }
+
+    // Alloca + init one handle per string-producing instruction, in the body
+    // prologue (entry block of a function; right after coro.begin of a process /
+    // task). Producers overwrite their temp in place, so a loop reuses its
+    // capacity instead of allocating each iteration. Paired with
+    // deinit_body_strings at the body's exits.
+    void build_str_temps() {
+        str_temp_list_.clear();
+        for (size_t k = 0; k < ir_->inst_count(); ++k) {
+            const auto i = static_cast<Index>(k);
+            if (!produces_string_temp(i)) {
+                continue;
+            }
+            auto* temp = b_.CreateAlloca(str_slot_ty(), nullptr, "str.tmp");
+            temp->setAlignment(llvm::Align(alignof(rt_string)));
+            b_.CreateCall(str_init_fn(), { temp });
+            set_str(i, temp);
+            str_temp_list_.push_back(temp);
+        }
+    }
+
     // -- Instruction dispatch --
 
     void lower_inst(Index i) {
@@ -2759,6 +3075,10 @@ private:
                 return;
             case Inst::Tag::BitSelect: {
                 LValue lv = lvalue_of(p.binary.l);
+                if (lv.is_string) {
+                    // String indexing lowers to StrGetc / StrPutc in the frontend.
+                    throw BackendError{ "internal: string value in bit_select" };
+                }
                 // TODO: an X/Z or out-of-range index uses only its must bits,
                 // silently selecting the wrong bit. LRM: a read with an unknown /
                 // out-of-range index yields X; such a write is a no-op.
@@ -2816,15 +3136,30 @@ private:
                 return;
             }
 
-            case Inst::Tag::Load:
-                set_value(i, lower_load(lvalue_of(p.unary)));
+            case Inst::Tag::Load: {
+                const LValue& lv = lvalue_of(p.unary);
+                if (lv.is_string) {
+                    // A string load is the storage handle pointer, not a copy:
+                    // every mutation point (Store, string ops) deep-copies, and
+                    // producers write into distinct temps.
+                    set_str(i, lv_string_ptr(lv));
+                    return;
+                }
+                set_value(i, lower_load(lv));
                 return;
+            }
             case Inst::Tag::Store: {
                 // A blocking assignment stores, then services the target signal's
                 // wait queue: any process waiting for an edge this store produced
                 // is woken. Snapshot the old value first so the transition can be
                 // detected from old -> new.
                 const LValue& lv      = lvalue_of(p.binary.l);
+                if (lv.is_string) {
+                    // Deep copy. Strings are guarded out of sensitivity lists in
+                    // the frontend, so there is no wait queue to service.
+                    b_.CreateCall(str_assign_fn(), { lv_string_ptr(lv), str_of(p.binary.r) });
+                    return;
+                }
                 // Frame locals have no waiters; only a module signal store services
                 // wait queues. A PreInit store (variable declaration initializer)
                 // generates no events, so it never services regardless of waiters.
@@ -2855,9 +3190,15 @@ private:
                 return;
             }
 
-            case Inst::Tag::Constant:
+            case Inst::Tag::Constant: {
+                const Value& v = std::get<Value>(mod_.pool.get(p.ref));
+                if (std::get<Type>(mod_.pool.get(v.type)).kind == Type::Kind::String) {
+                    lower_string_constant(i, p.ref);
+                    return;
+                }
                 set_value(i, lower_constant(p.ref));
                 return;
+            }
 
             case Inst::Tag::Add:
             case Inst::Tag::Sub:
@@ -2916,6 +3257,10 @@ private:
             case Inst::Tag::Le:
             case Inst::Tag::Gt:
             case Inst::Tag::Ge:
+                if (type_of(p.binary.l).is_string) {
+                    set_value(i, lower_string_relation(ir_->tag(i), p.binary.l, p.binary.r));
+                    return;
+                }
                 set_value(i,
                           lower_compare(
                             ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r), type_of(p.binary.l).is_signed));
@@ -2941,18 +3286,97 @@ private:
 
             case Inst::Tag::Mux: {
                 const auto mux = ir_->extra_data<Mux>(p.op_extra.extra);
+                if (type_of(mux.a).is_string) {
+                    throw BackendError{ "internal: string value in mux" };
+                }
                 set_value(i, lower_mux(value_of(p.op_extra.op), value_of(mux.a), value_of(mux.b)));
                 return;
             }
             case Inst::Tag::Concat:
+                if (type_of(i).is_string) {
+                    lower_string_concat(i);
+                    return;
+                }
                 set_value(i, lower_concat(i));
                 return;
             case Inst::Tag::Repl:
+                if (type_of(i).is_string) {
+                    b_.CreateCall(str_repl_fn(),
+                                  { str_of(i), str_of(p.repl.value), b_.getInt64(p.repl.count) });
+                    return;
+                }
                 set_value(i, lower_repl(value_of(p.repl.value), type_of(p.repl.value).width, p.repl.count));
                 return;
             case Inst::Tag::Resize:
+                if (type_of(p.op_type.op).is_string) {
+                    throw BackendError{ "internal: string value in resize" };
+                }
                 set_value(i, lower_resize(value_of(p.op_type.op), type_of(p.op_type.op), from_ref(p.op_type.type)));
                 return;
+
+            case Inst::Tag::StrLen: {
+                llvm::Value* n = b_.CreateCall(str_len_fn(), { str_of(p.unary) });
+                llvm::Value* v = b_.CreateTrunc(n, int_ty(32));
+                set_value(i, packed(v, v, zero(32)));
+                return;
+            }
+            case Inst::Tag::StrGetc: {
+                llvm::Value* idx =
+                  cast(must_of(value_of(p.binary.r)), 32, type_of(p.binary.r).is_signed);
+                llvm::Value* c = b_.CreateCall(str_getc_fn(), { str_of(p.binary.l), idx });
+                llvm::Value* v = b_.CreateTrunc(c, int_ty(8));
+                set_value(i, packed(v, v, zero(8)));
+                return;
+            }
+            case Inst::Tag::StrPutc: {
+                const auto    sp = ir_->extra_data<StrPutcInfo>(p.op_extra.extra);
+                const LValue& lv = lvalue_of(p.op_extra.op);
+                llvm::Value*  idx =
+                  cast(must_of(value_of(sp.index)), 32, type_of(sp.index).is_signed);
+                llvm::Value* ch = cast(must_of(value_of(sp.ch)), 32, false);
+                b_.CreateCall(str_putc_fn(), { lv_string_ptr(lv), idx, ch });
+                return;
+            }
+            case Inst::Tag::StrCmp:
+            case Inst::Tag::StrICmp: {
+                auto         fn = ir_->tag(i) == Inst::Tag::StrCmp ? str_cmp_fn() : str_icmp_fn();
+                llvm::Value* c  = b_.CreateCall(fn, { str_of(p.binary.l), str_of(p.binary.r) });
+                set_value(i, packed(c, c, zero(32)));
+                return;
+            }
+            case Inst::Tag::StrUpper:
+            case Inst::Tag::StrLower: {
+                auto fn = ir_->tag(i) == Inst::Tag::StrUpper ? str_upper_fn() : str_lower_fn();
+                b_.CreateCall(fn, { str_of(i), str_of(p.unary) });
+                return;
+            }
+            case Inst::Tag::StrSubstr: {
+                const auto   ss = ir_->extra_data<StrSubstrInfo>(p.op_extra.extra);
+                llvm::Value* si = cast(must_of(value_of(ss.i)), 32, type_of(ss.i).is_signed);
+                llvm::Value* sj = cast(must_of(value_of(ss.j)), 32, type_of(ss.j).is_signed);
+                b_.CreateCall(str_substr_fn(), { str_of(i), str_of(p.op_extra.op), si, sj });
+                return;
+            }
+            case Inst::Tag::StrFromPacked: {
+                // Spill the operand's val plane to a stack buffer (X bits read as
+                // 0 — the runtime consumes must-bits only, a documented
+                // simplification of the LRM cast).
+                const ValType  t   = type_of(p.unary);
+                const uint32_t pb  = plane_bytes(t.width);
+                llvm::Value*   buf = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(pb), "str.pack");
+                b_.CreateAlignedStore(must_of(value_of(p.unary)), buf, llvm::Align(1));
+                b_.CreateCall(str_from_packed_fn(), { str_of(i), buf, b_.getInt32(t.width) });
+                return;
+            }
+            case Inst::Tag::StrToPacked: {
+                const ValType  to  = from_ref(p.op_type.type);
+                const uint32_t pb  = plane_bytes(to.width);
+                llvm::Value*   buf = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(pb), "str.unpack");
+                b_.CreateCall(str_to_packed_fn(), { str_of(p.op_type.op), buf, b_.getInt32(to.width) });
+                llvm::Value* v = b_.CreateAlignedLoad(int_ty(to.width), buf, llvm::Align(1));
+                set_value(i, packed(v, v, zero(to.width)));
+                return;
+            }
 
             case Inst::Tag::Cond:
                 lower_cond(i);
@@ -3013,11 +3437,15 @@ private:
             }
 
             case Inst::Tag::Arg: {
-                // A function parameter: read its plane from the call frame's params.
-                // The signature is (state, arg0_mm, arg0_z, arg1_mm, ...), so arg k
-                // occupies LLVM params 1 + 2k (must|may) and 2 + 2k (z).
-                const uint32_t k = p.arg.position;
-                set_value(i, Plane{ fn_->getArg(1 + 2 * k), fn_->getArg(2 + 2 * k) });
+                // A function / task parameter, located via the per-signature index
+                // table (a string formal is one ptr, others two params).
+                const uint32_t k    = p.arg.position;
+                const uint32_t base = param_llvm_index_[k];
+                if (is_string_type(cur_fn_->param_types[k])) {
+                    set_str(i, fn_->getArg(base));
+                    return;
+                }
+                set_value(i, Plane{ fn_->getArg(base), fn_->getArg(base + 1) });
                 return;
             }
             case Inst::Tag::Ret:
@@ -3049,6 +3477,49 @@ private:
         return packed(b_.CreateAnd(val, b_.CreateNot(xz)), b_.CreateOr(val, xz), b_.CreateAnd(xz, b_.CreateNot(val)));
     }
 
+    // A string literal: copy its interned characters into this instruction's
+    // pre-built temp from a private constant global. Length is passed explicitly
+    // — never rely on the NUL byte CreateGlobalString appends.
+    void lower_string_constant(Index i, Ref ref) {
+        const std::span<const uint8_t> bytes = mod_.pool.bytes(ref);
+        llvm::Value*                   glob  = b_.CreateGlobalString(
+          llvm::StringRef(reinterpret_cast<const char*>(bytes.data()), bytes.size()), "str.lit");
+        b_.CreateCall(str_assign_bytes_fn(), { str_of(i), glob, b_.getInt64(bytes.size()) });
+    }
+
+    // String concatenation: gather the part handles into a stack array and hand
+    // them to the runtime, which builds into this instruction's temp (alias-safe
+    // even when the temp aliases a part).
+    void lower_string_concat(Index i) {
+        std::array<Index, 3> scratch;
+        const auto           parts  = ir_->operands(i, scratch);
+        const auto           n      = static_cast<uint32_t>(parts.size());
+        auto*                arr_ty = llvm::ArrayType::get(llvm::PointerType::getUnqual(ctx_), n);
+        llvm::Value*         arr    = b_.CreateAlloca(arr_ty, nullptr, "str.parts");
+        for (uint32_t k = 0; k < n; ++k) {
+            b_.CreateStore(str_of(parts[k]),
+                           b_.CreateInBoundsGEP(arr_ty, arr, { b_.getInt32(0), b_.getInt32(k) }));
+        }
+        b_.CreateCall(str_concat_fn(), { str_of(i), arr, b_.getInt32(n) });
+    }
+
+    // A string comparison operator: rt_string_cmp then a native compare against
+    // zero. Strings carry no X/Z, so the 1-bit result is always definite.
+    Plane lower_string_relation(Inst::Tag tag, Index l, Index r) {
+        llvm::Value*             c = b_.CreateCall(str_cmp_fn(), { str_of(l), str_of(r) });
+        llvm::CmpInst::Predicate pred;
+        switch (tag) {
+            case Inst::Tag::Eq: pred = llvm::CmpInst::ICMP_EQ; break;
+            case Inst::Tag::Ne: pred = llvm::CmpInst::ICMP_NE; break;
+            case Inst::Tag::Lt: pred = llvm::CmpInst::ICMP_SLT; break;
+            case Inst::Tag::Le: pred = llvm::CmpInst::ICMP_SLE; break;
+            case Inst::Tag::Gt: pred = llvm::CmpInst::ICMP_SGT; break;
+            default:            pred = llvm::CmpInst::ICMP_SGE; break;
+        }
+        llvm::Value* bit = b_.CreateICmp(pred, c, b_.getInt32(0));
+        return bit_plane(bit, bit);
+    }
+
     // Build an iW constant from little-endian canonical plane bytes.
     llvm::ConstantInt* const_from_bytes(std::span<const uint8_t> bytes, uint32_t width) {
         const unsigned        words = (width + 63) / 64;
@@ -3070,7 +3541,8 @@ private:
                        .bit_off     = b_.getInt32(0),
                        .width       = s.width,
                        .is_signal   = true,
-                       .sig         = sig };
+                       .sig         = sig,
+                       .is_string   = s.is_string };
     }
 
     // Whole-storage lvalue for a function-frame local (per-call frame struct).
@@ -3082,7 +3554,8 @@ private:
                        .bit_off     = b_.getInt32(0),
                        .width       = s.width,
                        .is_signal   = false,
-                       .sig         = Signal{ 0 } };
+                       .sig         = Signal{ 0 },
+                       .is_string   = s.is_string };
     }
 
     Plane lower_load(const LValue& lv) {
@@ -3451,7 +3924,17 @@ private:
             b_.CreateBr(task_epilogue_bb_);
             return;
         }
+        if (is_string_type(cur_fn_->return_type)) {
+            // Copy the result out through the trailing out-param handle BEFORE
+            // releasing the body's strings (the value may be one of them).
+            b_.CreateCall(str_assign_fn(),
+                          { fn_->getArg(fn_->arg_size() - 1), str_of(value) });
+            deinit_body_strings();
+            b_.CreateRetVoid();
+            return;
+        }
         if (cur_fn_->return_type == mod_.pool.void_type) {
+            deinit_body_strings();
             b_.CreateRetVoid();
             return;
         }
@@ -3460,6 +3943,7 @@ private:
         llvm::Value* agg = llvm::UndefValue::get(rty);
         agg              = b_.CreateInsertValue(agg, pl.mm, { 0 });
         agg              = b_.CreateInsertValue(agg, pl.z, { 1 });
+        deinit_body_strings();
         b_.CreateRet(agg);
     }
 
@@ -3468,16 +3952,30 @@ private:
     // unpack the returned struct into a Plane. A void callee yields no value.
     void lower_call_inst(Index i) {
         const auto                ci = ir_->extra_data<CallInfo>(ir_->payload(i).extra);
+        const Function&           f  = mod_.function(ci.func);
         llvm::Function*           cf = fn_decls_[static_cast<uint32_t>(ci.func)];
         std::vector<llvm::Value*> argv;
         argv.push_back(state_);
+        size_t k = 0;
         for (Index a : ir_->region(ci.args)) {
-            const Plane pl = value_of(a);
-            argv.push_back(pl.mm);
-            argv.push_back(pl.z);
+            if (is_string_type(f.param_types[k])) {
+                argv.push_back(str_of(a));
+            } else {
+                const Plane pl = value_of(a);
+                argv.push_back(pl.mm);
+                argv.push_back(pl.z);
+            }
+            ++k;
+        }
+        if (is_string_type(f.return_type)) {
+            // The callee assigns the result into this call's temp handle (the
+            // trailing out-param); str_of(i) was pre-set by build_str_temps.
+            argv.push_back(str_of(i));
+            b_.CreateCall(cf->getFunctionType(), cf, argv);
+            return;
         }
         llvm::Value* r = b_.CreateCall(cf->getFunctionType(), cf, argv);
-        if (mod_.function(ci.func).return_type != mod_.pool.void_type) {
+        if (f.return_type != mod_.pool.void_type) {
             set_value(i, Plane{ b_.CreateExtractValue(r, { 0 }), b_.CreateExtractValue(r, { 1 }) });
         }
     }
@@ -3519,6 +4017,10 @@ private:
         argv.push_back(wheel_);
         for (uint32_t k = 0; k < args.size(); ++k) {
             if (tf.arg_dirs[k] == ArgDir::In) {
+                if (is_string_type(tf.param_types[k])) {
+                    argv.push_back(str_of(args[k]));
+                    continue;
+                }
                 const Plane pl = value_of(args[k]);
                 argv.push_back(pl.mm);
                 argv.push_back(pl.z);
@@ -3580,6 +4082,16 @@ private:
             for (uint32_t k = 0; k < n; ++k) {
                 const Plane   p    = value_of(args[k]);
                 const ValType t    = type_of(args[k]);
+                if (t.is_string) {
+                    // A string argument: flag bit 1, val = the handle pointer.
+                    llvm::Value* selt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
+                    store_field(sty, selt, 0, b_.getInt32(0));
+                    store_field(sty, selt, 1, b_.getInt32(2));
+                    store_field(sty, selt, 2, b_.CreatePtrToInt(str_of(args[k]), b_.getInt64Ty()));
+                    store_field(sty, selt, 3, b_.getInt64(0));
+                    store_field(sty, selt, 4, b_.getInt64(0));
+                    continue;
+                }
                 if (t.width > 64) {
                     throw BackendError{ "$display / $write of an operand wider than 64 bits is not "
                                         "supported (it would print with its high bits truncated)" };
@@ -4404,6 +4916,9 @@ private:
     // `cur_is_task_` selects the coroutine return path (epilogue) for Ret.
     const Function*         cur_fn_      = nullptr;
     bool                    cur_is_task_ = false;
+    // LLVM arg index of each of the current function/task's formals (see
+    // param_indices) — string formals make the stride non-uniform.
+    std::vector<uint32_t> param_llvm_index_;
     // Set while lowering a PreInit process: its stores apply variable declaration
     // initializers and must generate no events, so wait-queue servicing is skipped.
     bool                    lowering_preinit_ = false;
@@ -4487,6 +5002,13 @@ private:
     std::vector<Plane>                  values_;
     std::vector<std::optional<LValue>>  lvals_;
     std::vector<std::optional<ValType>> types_;
+    // rt_string handle pointers of string-valued instructions, parallel to
+    // values_ (a string never flows as a Plane).
+    std::vector<llvm::Value*> str_vals_;
+    // The current body's string rvalue temporaries, deinit'd at its exits.
+    std::vector<llvm::Value*> str_temp_list_;
+    // Memoized `%clotho.string` handle slot type.
+    llvm::StructType* str_slot_ty_ = nullptr;
 };
 
 // Lower the coroutine intrinsics emitted for each process. CoroSplit (with

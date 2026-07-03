@@ -1,6 +1,8 @@
 #include <doctest/doctest.h>
 
 #include <cstdio>
+#include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -9,8 +11,10 @@
 #include <llvm/Support/raw_ostream.h>
 
 #include "Lower.h"
+#include "ir/Builder.h"
 #include "ir/Jit.h"
 #include "ir/LlvmBackend.h"
+#include "ir/Module.h"
 
 using namespace clotho;
 
@@ -1954,4 +1958,59 @@ TEST_CASE("non-wire net kinds fail loudly") {
     )");
     CHECK(!r.ok);
     CHECK(r.diagnostics.find("unsupported net type") != std::string::npos);
+}
+
+// The frontend cannot produce string IR yet, so build a module by hand: a
+// string signal assigned a literal, then len / toupper / getc observed through
+// $display. Exercises the string slot layout, startup init / teardown deinit,
+// temps, and the rt_string_* call lowering end to end.
+TEST_CASE("backend lowers string signals, constants, and string ops (hand-built IR)") {
+    using namespace clotho::ir;
+
+    auto mod  = std::make_unique<Module>();
+    mod->name = "m";
+    const Signal s =
+      mod->add_signal({ .name = "s", .type = mod->pool.string_type, .dir = SignalInfo::Direction::Internal });
+
+    Builder         b(mod->pool);
+    const SourceLoc loc{ 1 };
+    const auto      chars = std::string_view{ "Hello" };
+    const Ref       lit   = mod->pool.put_value(
+      mod->pool.string_type, { reinterpret_cast<const uint8_t*>(chars.data()), chars.size() });
+    const Ref int_ty =
+      mod->pool.put(Type{ .kind = Type::Kind::PackedArray, .is_signed = true, .element = mod->pool.bit_type,
+                          .left = 31, .right = 0 });
+
+    const Index sig = b.signal(s, loc);
+    const Index k   = b.constant(lit, loc);
+    b.binary(Inst::Tag::Store, sig, k, loc);
+    const Index v   = b.unary(Inst::Tag::Load, sig, loc);
+    const Index len = b.unary(Inst::Tag::StrLen, v, loc);
+    b.display("%0d", true, std::span<const Index>{ &len, 1 }, loc);
+    const Index up  = b.unary(Inst::Tag::StrUpper, v, loc);
+    const Index idx = b.constant(mod->pool.put_int(int_ty, 4), loc);
+    const Index ch  = b.binary(Inst::Tag::StrGetc, up, idx, loc);
+    b.display("%c", true, std::span<const Index>{ &ch, 1 }, loc);
+
+    mod->add_process(Process{ .activation = Activation::Initial, .ir = b.finish() });
+
+    std::FILE* tmp = std::tmpfile();
+    REQUIRE(tmp != nullptr);
+    std::fflush(stdout);
+    const int saved = dup(fileno(stdout));
+    dup2(fileno(tmp), fileno(stdout));
+    run_jit(*mod);
+    std::fflush(stdout);
+    dup2(saved, fileno(stdout));
+    close(saved);
+
+    std::rewind(tmp);
+    std::string out;
+    char        buf[64];
+    size_t      n;
+    while ((n = std::fread(buf, 1, sizeof(buf), tmp)) > 0) {
+        out.append(buf, n);
+    }
+    std::fclose(tmp);
+    CHECK(out == "5\nO\n");
 }

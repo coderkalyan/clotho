@@ -212,6 +212,7 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                     scratch[n++] = rm.finish;
                 }
                 return { scratch.data(), n };
+            }
             // str_putc / str_substr expose the string op plus their two extra
             // value operands (index+char / start+end).
             if (tag == Inst::Tag::StrPutc) {

@@ -307,6 +307,18 @@ struct Analysis {
                 case Inst::Tag::Fflush:
                 case Inst::Tag::SimTime:
                 case Inst::Tag::Random:
+                // String values carry no bit planes and the integral string ops
+                // (len / getc / cmp / to_packed) always produce known bits.
+                case Inst::Tag::StrLen:
+                case Inst::Tag::StrGetc:
+                case Inst::Tag::StrPutc:
+                case Inst::Tag::StrCmp:
+                case Inst::Tag::StrICmp:
+                case Inst::Tag::StrUpper:
+                case Inst::Tag::StrLower:
+                case Inst::Tag::StrSubstr:
+                case Inst::Tag::StrFromPacked:
+                case Inst::Tag::StrToPacked:
                     break;
             }
         }

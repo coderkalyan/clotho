@@ -140,6 +140,7 @@ TEST_CASE("rt_nba_arr push/commit with a null z_ptr merges only the mm word") {
 
     CHECK(mm == 0x0f);
     CHECK(z_guard == 0x77);
+}
 
 namespace {
 
