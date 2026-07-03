@@ -23,6 +23,10 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Lnot:
         case T::Ret:
         case T::Delay:
+        case T::StrLen:
+        case T::StrUpper:
+        case T::StrLower:
+        case T::StrFromPacked:
             return K::Unary;
 
         case T::BitSelect:
@@ -53,9 +57,13 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::WildEq:
         case T::Land:
         case T::Lor:
+        case T::StrGetc:
+        case T::StrCmp:
+        case T::StrICmp:
             return K::Binary;
 
         case T::Resize:
+        case T::StrToPacked:
             return K::OpType;
         case T::Repl:
             return K::Repl;
@@ -84,6 +92,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::ElemSelect:
         case T::Cond:
         case T::ReadMem:
+        case T::StrPutc:
+        case T::StrSubstr:
             return K::OpExtra;
     }
 
@@ -202,6 +212,21 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                     scratch[n++] = rm.finish;
                 }
                 return { scratch.data(), n };
+            // str_putc / str_substr expose the string op plus their two extra
+            // value operands (index+char / start+end).
+            if (tag == Inst::Tag::StrPutc) {
+                const auto sp = extra_data<StrPutcInfo>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = sp.index;
+                scratch[2]    = sp.ch;
+                return { scratch.data(), 3 };
+            }
+            if (tag == Inst::Tag::StrSubstr) {
+                const auto ss = extra_data<StrSubstrInfo>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = ss.i;
+                scratch[2]    = ss.j;
+                return { scratch.data(), 3 };
             }
             scratch[0] = p.op_extra.op;
             return { scratch.data(), 1 };

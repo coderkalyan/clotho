@@ -99,6 +99,22 @@ Index Builder::loop(ExtraSlice cond_region, Index pred, ExtraSlice body_region, 
     return emit({ Inst::Tag::Loop, Inst::Payload{ .extra = extra } }, loc);
 }
 
+Index Builder::str_putc(Index str, Index index, Index ch, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(StrPutcInfo{ index, ch });
+
+    return emit({ Inst::Tag::StrPutc, Inst::Payload{ .op_extra = { str, extra } } }, loc);
+}
+
+Index Builder::str_substr(Index str, Index i, Index j, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(StrSubstrInfo{ i, j });
+
+    return emit({ Inst::Tag::StrSubstr, Inst::Payload{ .op_extra = { str, extra } } }, loc);
+}
+
+Index Builder::str_to_packed(Index str, Ref type, SourceLoc loc) {
+    return emit({ Inst::Tag::StrToPacked, Inst::Payload{ .op_type = { str, type } } }, loc);
+}
+
 Index Builder::wait(std::span<const WaitEdge> events, SourceLoc loc) {
     // Pack the WaitEdge records back-to-back, then a WaitInfo pointing at the run.
     const auto start = static_cast<uint32_t>(extra_.size());

@@ -15,9 +15,10 @@ namespace clotho::ir {
 
 InternPool::InternPool()
   : set_(0, Hash{ &items_, &value_bytes_ }, Eq{ &items_, &value_bytes_ }) {
-    void_type  = put(Type{ .kind = Type::Kind::Void });
-    logic_type = put(Type{ .kind = Type::Kind::Logic });
-    bit_type   = put(Type{ .kind = Type::Kind::Bit });
+    void_type   = put(Type{ .kind = Type::Kind::Void });
+    logic_type  = put(Type{ .kind = Type::Kind::Logic });
+    bit_type    = put(Type{ .kind = Type::Kind::Bit });
+    string_type = put(Type{ .kind = Type::Kind::String });
 }
 
 Ref InternPool::put(const Item& item) {
@@ -93,6 +94,11 @@ Layout InternPool::layout(Ref type) const {
             const auto     bytes = static_cast<uint32_t>(static_cast<uint8_t>(el.domain)) * plane_bytes(width);
             return { el.domain, width, bytes };
         }
+        case Type::Kind::String:
+            // Not plane-sized: a string is an opaque runtime handle, and an
+            // interned string constant's bytes are its characters (any length).
+            // Width 0 is the sentinel; consumers branch on the kind first.
+            return { Domain::Two, 0, 0 };
         case Type::Kind::UnpackedArray: {
             // Report the leaf element's domain / width (recursion drills through
             // nested arrays), so callers sizing a per-element access see the

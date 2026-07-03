@@ -77,6 +77,10 @@ struct Type {
         PackedArray,
         // Unpacked array (memory): collection of `element` over [left:right].
         UnpackedArray,
+        // Dynamic string (LRM §6.16). Not plane-sized: layout() reports width 0
+        // and runtime storage is an opaque rt_string handle, so every consumer
+        // must branch on the kind before using layout facts.
+        String,
     };
 
     // Discriminant for this type.
@@ -204,6 +208,8 @@ public:
     // 1-bit unsigned logic / bit.
     Ref logic_type;
     Ref bit_type;
+    // Dynamic string.
+    Ref string_type;
 
     InternPool();
 

@@ -2,6 +2,9 @@
 
 #include <array>
 #include <cstdint>
+#include <span>
+#include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -255,5 +258,69 @@ TEST_CASE("printer indents cond regions and decodes constants") {
                                  "    %5 = constant(bit 0x00)\n"
                                  "    %6 = store_nb(%2, %5)\n"
                                  "}\n";
+    CHECK(toString(ir) == expected);
+}
+
+TEST_CASE("string type interns once and string constants dedup on content") {
+    InternPool pool;
+
+    CHECK(pool.string_type != Ref::Invalid);
+    CHECK(pool.put(Type{ .kind = Type::Kind::String }) == pool.string_type);
+
+    // Not plane-sized: width 0 flags "branch on the kind before using layout".
+    const Layout lay = pool.layout(pool.string_type);
+    CHECK(lay.width == 0);
+    CHECK(lay.byte_count == 0);
+
+    const auto chars = [](std::string_view s) {
+        return std::span<const uint8_t>{ reinterpret_cast<const uint8_t*>(s.data()), s.size() };
+    };
+    const Ref a = pool.put_value(pool.string_type, chars("hello"));
+    const Ref b = pool.put_value(pool.string_type, chars("hello"));
+    const Ref c = pool.put_value(pool.string_type, chars("world"));
+    CHECK(a == b);
+    CHECK(a != c);
+    const auto got = pool.bytes(a);
+    CHECK(std::string(reinterpret_cast<const char*>(got.data()), got.size()) == "hello");
+}
+
+TEST_CASE("string instructions carry their operands and print") {
+    InternPool      pool;
+    Builder         b(pool);
+    const SourceLoc loc{ 1 };
+
+    const auto      chars = std::string_view{ "hi" };
+    const Ref       lit   = pool.put_value(
+      pool.string_type, { reinterpret_cast<const uint8_t*>(chars.data()), chars.size() });
+
+    const Index s   = b.signal(Signal{ 0 }, loc);
+    const Index v   = b.unary(Inst::Tag::Load, s, loc);
+    const Index k   = b.constant(lit, loc);
+    const Index len = b.unary(Inst::Tag::StrLen, v, loc);
+    const Index ch  = b.binary(Inst::Tag::StrGetc, v, len, loc);
+    b.str_putc(s, len, ch, loc);
+    b.str_substr(v, len, len, loc);
+    b.str_to_packed(v, pool.bit_type, loc);
+    b.binary(Inst::Tag::StrCmp, v, k, loc);
+
+    Ir ir = b.finish();
+
+    // Operand exposure: str_putc / str_substr surface op + their extra operands.
+    std::array<Index, 3> scratch{};
+    const auto           putc_ops = ir.operands(Index{ 5 }, scratch);
+    REQUIRE(putc_ops.size() == 3);
+    CHECK(putc_ops[0] == s);
+    CHECK(putc_ops[1] == len);
+    CHECK(putc_ops[2] == ch);
+
+    const std::string expected = "%0 = signal(s0)\n"
+                                 "%1 = load(%0)\n"
+                                 "%2 = constant(string \"hi\")\n"
+                                 "%3 = str_len(%1)\n"
+                                 "%4 = str_getc(%1, %3)\n"
+                                 "%5 = str_putc(%0[%3] = %4)\n"
+                                 "%6 = str_substr(%1, %3, %3)\n"
+                                 "%7 = str_to_packed(%1 -> bit)\n"
+                                 "%8 = str_cmp(%1, %2)\n";
     CHECK(toString(ir) == expected);
 }

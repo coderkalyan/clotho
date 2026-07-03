@@ -199,6 +199,24 @@ struct TimeFormatInfo {
     uint32_t suffix_len;
 };
 
+// Extra payload for `str_putc`: s[i] = c / s.putc(i, c). The string lvalue is
+// the op; these are the index and character value operands.
+struct StrPutcInfo {
+    // Character position operand.
+    Index index;
+    // Character value operand (low 8 bits used).
+    Index ch;
+};
+
+// Extra payload for `str_substr`: s.substr(i, j). The source string is the op;
+// these are the inclusive start / end position operands.
+struct StrSubstrInfo {
+    // First selected position operand.
+    Index i;
+    // Last selected position operand (inclusive).
+    Index j;
+};
+
 // Extra payload for `wait`: one (signal, edge) event of an intra-body event
 // control. A `@(a or posedge b)` wait carries several of these in a row.
 struct WaitEdge {
@@ -230,6 +248,8 @@ static_assert(ExtraPayload<DisplayInfo>);
 static_assert(ExtraPayload<TimeFormatInfo>);
 static_assert(ExtraPayload<WaitEdge>);
 static_assert(ExtraPayload<WaitInfo>);
+static_assert(ExtraPayload<StrPutcInfo>);
+static_assert(ExtraPayload<StrSubstrInfo>);
 
 struct Inst {
     enum class Tag : uint8_t {
@@ -371,6 +391,34 @@ struct Inst {
         // registering the process on each event's wait queue plus a coroutine
         // suspend; a matching blocking assignment to one of the signals wakes it.
         Wait,
+
+        // -- String ops (operands are string values unless noted) --
+        // s.len() -> 32-bit signed (payload: unary).
+        StrLen,
+        // s[i] / s.getc(i) -> 8-bit 2-state; 0 when i is out of range (payload:
+        // binary — l is the string, r the index).
+        StrGetc,
+        // s[i] = c / s.putc(i, c): mutate a string lvalue in place; a no-op when
+        // i is out of range or c's low byte is 0 (payload: op_extra ->
+        // StrPutcInfo; the op is the string lvalue, like Store's lhs).
+        StrPutc,
+        // a.compare(b) / a.icompare(b) -> 32-bit signed, strcmp order (payload:
+        // binary).
+        StrCmp,
+        StrICmp,
+        // s.toupper() / s.tolower() -> new string value (payload: unary).
+        StrUpper,
+        StrLower,
+        // s.substr(i, j) -> new string value; "" when the range is invalid
+        // (payload: op_extra -> StrSubstrInfo; the op is the source string).
+        StrSubstr,
+        // string'(packed) -> string: bytes MSB-first with 0x00 bytes dropped
+        // (payload: unary — the packed value).
+        StrFromPacked,
+        // Packed cast of a string: characters pack MSB-first, right-justified to
+        // the target type's width (payload: op_type — op is the string, type the
+        // target packed type).
+        StrToPacked,
 
         // -- System tasks --
         // $display / $write: format string + variadic args (payload: display).
