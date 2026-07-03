@@ -21,6 +21,9 @@ typedef struct rt_arg {
     // Bit 0: the value is signed (drives %d sign-extension).
     // Bit 1: `val` carries an rt_string* (a %s string-object argument); the
     //        width/xz/z fields are meaningless.
+    // Bit 2: the value is real — `val` is an IEEE-754 double bit pattern
+    //        (shortreal is widened to double by the codegen) and xz / z are 0;
+    //        it renders via the %e / %f / %g family (LRM 21.2, Table 21-2).
     uint32_t flags;
     // Value plane (definitely-1 bits) in the low `width` bits.
     uint64_t val;

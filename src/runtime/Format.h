@@ -21,6 +21,11 @@ struct FormatSpec {
     bool     has_width;
     bool     width_overflow;
     bool     has_prec;
+    // The width began with a '0'. Integer conversions ignore this (the 0 folds
+    // into the width); the real conversions honor it
+    // as the C zero-pad flag (LRM §21.2.1.2 Table 21-2 grants %e/%f/%g the full
+    // C formatting specification).
+    bool     zero_pad;
     char     conv;
     uint32_t width;
     uint32_t prec;
@@ -44,6 +49,9 @@ inline FormatSpec parse_format_spec(std::string_view s) {
     if (s[i] == '-') {
         spec.left_justify = true;
         ++i;
+    }
+    if (i < s.size() && s[i] == '0') {
+        spec.zero_pad = true;
     }
     while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
         spec.has_width   = true;

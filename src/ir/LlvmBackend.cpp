@@ -4814,10 +4814,21 @@ private:
                 store_field(sty, selt, 4, b_.getInt64(0));
                 continue;
             }
-            // TODO: real display formatting lands with the runtime %f/%e/%g
-            // support; until then a real operand loud-fails.
             if (t.is_real) {
-                throw BackendError{ std::string(who) + " of a real operand is not yet supported" };
+                // A real rides `val` as a double bit pattern (flags bit 2); a
+                // shortreal widens to double first so the runtime handles one
+                // representation. Reals are signed and have no x/z.
+                llvm::Value* fv = fp_of(p);
+                if (t.width == 32) {
+                    fv = b_.CreateFPExt(fv, b_.getDoubleTy());
+                }
+                llvm::Value* relt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
+                store_field(sty, relt, 0, b_.getInt32(64));
+                store_field(sty, relt, 1, b_.getInt32(0b101u));
+                store_field(sty, relt, 2, b_.CreateBitCast(fv, int_ty(64)));
+                store_field(sty, relt, 3, b_.getInt64(0));
+                store_field(sty, relt, 4, b_.getInt64(0));
+                continue;
             }
             if (t.width > 64) {
                 throw BackendError{ std::string(who) +

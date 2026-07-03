@@ -4,9 +4,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <unistd.h>
 
 #include "runtime/Runtime.h"
 
@@ -335,4 +339,71 @@ TEST_CASE("rt_string_to_packed right-justifies with left truncation and zero fil
     rt_string_to_packed(&empty.s, out8, 16);
     CHECK(out8[0] == 0x00);
     CHECK(out8[1] == 0x00);
+}
+
+// -- rt_fwrite real formatting --
+
+namespace {
+
+// Capture what rt_fwrite writes to the standard-output MCD.
+std::string capture_fwrite(const char* fmt, std::initializer_list<rt_arg> args) {
+    std::FILE* tmp = std::tmpfile();
+    REQUIRE(tmp != nullptr);
+
+    std::fflush(stdout);
+    const int saved = dup(fileno(stdout));
+    dup2(fileno(tmp), fileno(stdout));
+
+    const std::vector<rt_arg> argv(args);
+    rt_fwrite(1, fmt, static_cast<uint32_t>(argv.size()), argv.data());
+
+    std::fflush(stdout);
+    dup2(saved, fileno(stdout));
+    close(saved);
+
+    std::rewind(tmp);
+    std::string out;
+    char        buf[256];
+    size_t      n;
+    while ((n = std::fread(buf, 1, sizeof(buf), tmp)) > 0) {
+        out.append(buf, n);
+    }
+    std::fclose(tmp);
+
+    return out;
+}
+
+// A real-flagged descriptor (val = double bit pattern, flags bit 2 + signed).
+rt_arg real_arg(double v) {
+    uint64_t pat = 0;
+    std::memcpy(&pat, &v, sizeof pat);
+    return rt_arg{ 64, 0b101u, pat, 0, 0 };
+}
+
+} // namespace
+
+TEST_CASE("rt_fwrite renders reals with %e / %f / %g and C passthrough") {
+    CHECK(capture_fwrite("%f", { real_arg(3.6) }) == "3.600000");
+    CHECK(capture_fwrite("%e", { real_arg(1234.5) }) == "1.234500e+03");
+    CHECK(capture_fwrite("%g", { real_arg(3.6) }) == "3.6");
+    CHECK(capture_fwrite("%g", { real_arg(0.00001234) }) == "1.234e-05");
+
+    // Full C flag / width / precision passthrough (LRM 21.2 Table 21-2).
+    CHECK(capture_fwrite("%10.3g|", { real_arg(3.14159) }) == "      3.14|");
+    CHECK(capture_fwrite("%-8.2f|", { real_arg(2.5) }) == "2.50    |");
+    CHECK(capture_fwrite("%08.2f", { real_arg(-1.5) }) == "-0001.50");
+
+    // Case variants and non-finite values follow C.
+    CHECK(capture_fwrite("%E", { real_arg(1234.5) }) == "1.234500E+03");
+    const double inf = std::numeric_limits<double>::infinity();
+    CHECK(capture_fwrite("%f", { real_arg(inf) }) == "inf");
+    CHECK(capture_fwrite("%g", { real_arg(-inf) }) == "-inf");
+    CHECK(capture_fwrite("%f", { real_arg(std::numeric_limits<double>::quiet_NaN()) }) == "nan");
+}
+
+TEST_CASE("rt_fwrite integer specifiers are unchanged around real fields") {
+    // Mixed integer + real fields consume descriptors in order; integer
+    // fields keep the width-honoring justification (LRM §21.2.1.2).
+    CHECK(capture_fwrite("a=%0d r=%g", { rt_arg{ 32, 1, 42, 0, 0 }, real_arg(0.5) }) == "a=42 r=0.5");
+    CHECK(capture_fwrite("%5d", { rt_arg{ 8, 0, 7, 0, 0 } }) == "    7");
 }

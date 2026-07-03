@@ -254,6 +254,42 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
                 }
             }
             break;
+        case 'e':
+        case 'E':
+        case 'f':
+        case 'F':
+        case 'g':
+        case 'G': {
+            // Real conversion: rebuild the C specifier and let snprintf format
+            // the whole field — LRM 21.2 Table 21-2 grants the real specifiers
+            // full C formatting (width / precision / justification), so the
+            // generic justify pass below sees an already-padded field. `val`
+            // carries an IEEE-754 double bit pattern (rt_arg flags bit 2).
+            std::string cs = "%";
+            if (spec.left_justify) {
+                cs += '-';
+            }
+            if (spec.zero_pad) {
+                cs += '0';
+            }
+            if (spec.has_width) {
+                cs += std::to_string(spec.width);
+            }
+            if (spec.has_prec) {
+                cs += '.';
+                cs += std::to_string(spec.prec);
+            }
+            cs += spec.conv;
+            double v = 0.0;
+            std::memcpy(&v, &a.val, sizeof v);
+            const int n = std::snprintf(nullptr, 0, cs.c_str(), v);
+            if (n > 0) {
+                field.resize(static_cast<size_t>(n) + 1);
+                std::snprintf(field.data(), static_cast<size_t>(n) + 1, cs.c_str(), v);
+                field.resize(static_cast<size_t>(n));
+            }
+            break;
+        }
         default:
             format_fatal("unsupported conversion reached the formatter");
     }

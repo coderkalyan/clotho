@@ -2940,3 +2940,20 @@ TEST_CASE("real math ops lower to intrinsics and libm calls") {
     m.add_process(ir::Process{ ir::Activation::Initial, {}, false, kLoc, b.finish() });
     CHECK(run_module(m) == "3\n2\n3\n1024\n1\n0\n3\n5\n0\n0\n0\n0\n");
 }
+
+TEST_CASE("real display marshals through rt_fwrite with %g / %f") {
+    ir::Module  m;
+    ir::Builder b(m.pool);
+    const auto real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
+
+    const std::array<ir::Index, 2> args{ real(3.6), real(0.25) };
+    b.display("%g %f", true, args, kLoc);
+
+    // A shortreal marshals by widening to double.
+    const ir::Index sr = b.float_cvt(ir::Inst::Tag::FResize, real(1.5), m.pool.shortreal_type, kLoc);
+    const std::array<ir::Index, 1> args2{ sr };
+    b.display("%g", true, args2, kLoc);
+
+    m.add_process(ir::Process{ ir::Activation::Initial, {}, false, kLoc, b.finish() });
+    CHECK(run_module(m) == "3.6 0.250000\n1.5\n");
+}
