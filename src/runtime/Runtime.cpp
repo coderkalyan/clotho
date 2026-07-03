@@ -164,6 +164,119 @@ void render_arg(std::string& out, const rt_arg& a, char conv) {
     }
 }
 
+// -- SystemVerilog string representation --
+//
+// fbstring-style small-string optimization over the 32 opaque bytes of an
+// rt_string (Runtime.h). Two forms, discriminated by the MSB of byte 31:
+//
+//   inline: bytes[0..30] hold the characters; byte 31 holds 31 - len, so a full
+//           31-char string stores 0 there and no separate flag byte is spent.
+//   heap:   a StrHeap {ptr, len, cap} occupies bytes[0..23]; byte 31 is 0x80.
+//
+// Strings are raw byte sequences with an explicit length; no NUL terminator is
+// stored or relied upon. A heap buffer never shrinks back to inline — the
+// capacity is kept for reuse so reassignment in a loop stops allocating.
+
+constexpr uint64_t      str_inline_cap = 31;
+constexpr unsigned char str_heap_flag  = 0x80;
+
+// The heap form's header, memcpy'd in and out of the handle bytes.
+struct StrHeap {
+    char*    ptr;
+    uint64_t len;
+    uint64_t cap;
+};
+static_assert(sizeof(StrHeap) == 24);
+static_assert(sizeof(StrHeap) < sizeof(rt_string));
+static_assert(alignof(StrHeap) <= alignof(rt_string));
+
+bool str_is_heap(const rt_string* s) {
+    return (s->storage[31] & str_heap_flag) != 0;
+}
+
+StrHeap str_heap(const rt_string* s) {
+    StrHeap h;
+    std::memcpy(&h, s->storage, sizeof(h));
+    return h;
+}
+
+void str_set_heap(rt_string* s, const StrHeap& h) {
+    std::memcpy(s->storage, &h, sizeof(h));
+    s->storage[31] = str_heap_flag;
+}
+
+uint64_t str_len(const rt_string* s) {
+    return str_is_heap(s) ? str_heap(s).len : str_inline_cap - s->storage[31];
+}
+
+const char* str_data(const rt_string* s) {
+    return str_is_heap(s) ? str_heap(s).ptr : reinterpret_cast<const char*>(s->storage);
+}
+
+char* str_data(rt_string* s) {
+    return str_is_heap(s) ? str_heap(s).ptr : reinterpret_cast<char*>(s->storage);
+}
+
+// Core write path: s = the n bytes at p. p may alias s's own buffer (memmove on
+// the in-place paths; on the grow path the new buffer is filled before the old
+// one is freed).
+void str_assign(rt_string* s, const char* p, uint64_t n) {
+    if (!str_is_heap(s)) {
+        if (n <= str_inline_cap) {
+            if (n != 0) {
+                std::memmove(s->storage, p, n);
+            }
+            s->storage[31] = static_cast<unsigned char>(str_inline_cap - n);
+            return;
+        }
+        char* buf = static_cast<char*>(std::malloc(n));
+        std::memcpy(buf, p, n);
+        str_set_heap(s, StrHeap{ buf, n, n });
+        return;
+    }
+    StrHeap h = str_heap(s);
+    if (n <= h.cap) {
+        if (n != 0) {
+            std::memmove(h.ptr, p, n);
+        }
+        h.len = n;
+        str_set_heap(s, h);
+        return;
+    }
+    // Geometric growth so repeated append-style reassignment amortizes.
+    const uint64_t cap = h.cap * 2 > n ? h.cap * 2 : n;
+    char*          buf = static_cast<char*>(std::malloc(cap));
+    std::memcpy(buf, p, n);
+    std::free(h.ptr);
+    str_set_heap(s, StrHeap{ buf, n, cap });
+}
+
+char str_ascii_lower(char c) {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+char str_ascii_upper(char c) {
+    return (c >= 'a' && c <= 'z') ? static_cast<char>(c - 'a' + 'A') : c;
+}
+
+// Scratch buffer for building concat/repl results before the alias-safe final
+// assign: stack storage for small results, heap beyond.
+struct StrScratch {
+    char  stack[256];
+    char* buf;
+
+    explicit StrScratch(uint64_t n) {
+        buf = n <= sizeof(stack) ? stack : static_cast<char*>(std::malloc(n));
+    }
+    ~StrScratch() {
+        if (buf != stack) {
+            std::free(buf);
+        }
+    }
+    StrScratch(const StrScratch&)            = delete;
+    StrScratch& operator=(const StrScratch&) = delete;
+};
+
 clotho::Timer& unwrap(rt_timer* t) {
     return *reinterpret_cast<clotho::Timer*>(t);
 }
@@ -553,6 +666,173 @@ extern "C" int32_t rt_random(void) {
     // A full-range int32 draw: reinterpret the 32-bit unsigned output as signed
     // so negative values occur, matching $random's signed return type.
     return static_cast<int32_t>(gen());
+}
+
+extern "C" void rt_string_init(rt_string* s) {
+    s->storage[31] = str_inline_cap; // Inline form, length 0.
+}
+
+extern "C" void rt_string_deinit(rt_string* s) {
+    if (str_is_heap(s)) {
+        std::free(str_heap(s).ptr);
+    }
+    s->storage[31] = str_inline_cap;
+}
+
+extern "C" void rt_string_assign(rt_string* dst, const rt_string* src) {
+    if (dst == src) {
+        return;
+    }
+    str_assign(dst, str_data(src), str_len(src));
+}
+
+extern "C" void rt_string_assign_bytes(rt_string* dst, const char* p, uint64_t n) {
+    str_assign(dst, p, n);
+}
+
+extern "C" uint64_t rt_string_len(const rt_string* s) {
+    return str_len(s);
+}
+
+extern "C" void rt_string_concat(rt_string* dst, const rt_string* const* parts, uint32_t n) {
+    // Built into a scratch buffer first: dst may appear among the parts
+    // (a = {a, b}).
+    // TODO: in-place append fast path when dst is not among the parts.
+    uint64_t total = 0;
+    for (uint32_t k = 0; k < n; ++k) {
+        total += str_len(parts[k]);
+    }
+    StrScratch scratch(total);
+    uint64_t   off = 0;
+    for (uint32_t k = 0; k < n; ++k) {
+        const uint64_t len = str_len(parts[k]);
+        std::memcpy(scratch.buf + off, str_data(parts[k]), len);
+        off += len;
+    }
+    str_assign(dst, scratch.buf, total);
+}
+
+extern "C" void rt_string_repl(rt_string* dst, const rt_string* src, uint64_t count) {
+    const uint64_t len   = str_len(src);
+    const uint64_t total = len * count;
+    StrScratch     scratch(total);
+    for (uint64_t k = 0; k < count; ++k) {
+        std::memcpy(scratch.buf + k * len, str_data(src), len);
+    }
+    str_assign(dst, scratch.buf, total);
+}
+
+extern "C" int32_t rt_string_cmp(const rt_string* a, const rt_string* b) {
+    const uint64_t la = str_len(a);
+    const uint64_t lb = str_len(b);
+    const uint64_t n  = la < lb ? la : lb;
+    const int      c  = n != 0 ? std::memcmp(str_data(a), str_data(b), n) : 0;
+    if (c != 0) {
+        return c < 0 ? -1 : 1;
+    }
+    return la < lb ? -1 : (la > lb ? 1 : 0);
+}
+
+extern "C" int32_t rt_string_icmp(const rt_string* a, const rt_string* b) {
+    const uint64_t la = str_len(a);
+    const uint64_t lb = str_len(b);
+    const uint64_t n  = la < lb ? la : lb;
+    const char*    pa = str_data(a);
+    const char*    pb = str_data(b);
+    for (uint64_t k = 0; k < n; ++k) {
+        const char ca = str_ascii_lower(pa[k]);
+        const char cb = str_ascii_lower(pb[k]);
+        if (ca != cb) {
+            return static_cast<unsigned char>(ca) < static_cast<unsigned char>(cb) ? -1 : 1;
+        }
+    }
+    return la < lb ? -1 : (la > lb ? 1 : 0);
+}
+
+extern "C" void rt_string_substr(rt_string* dst, const rt_string* src, int32_t i, int32_t j) {
+    const uint64_t len = str_len(src);
+    if (i < 0 || j < i || static_cast<uint64_t>(j) >= len) {
+        str_assign(dst, nullptr, 0);
+        return;
+    }
+    str_assign(dst, str_data(src) + i, static_cast<uint64_t>(j) - static_cast<uint64_t>(i) + 1);
+}
+
+extern "C" void rt_string_toupper(rt_string* dst, const rt_string* src) {
+    rt_string_assign(dst, src); // No-op when dst == src, then transform in place.
+    char*          p = str_data(dst);
+    const uint64_t n = str_len(dst);
+    for (uint64_t k = 0; k < n; ++k) {
+        p[k] = str_ascii_upper(p[k]);
+    }
+}
+
+extern "C" void rt_string_tolower(rt_string* dst, const rt_string* src) {
+    rt_string_assign(dst, src);
+    char*          p = str_data(dst);
+    const uint64_t n = str_len(dst);
+    for (uint64_t k = 0; k < n; ++k) {
+        p[k] = str_ascii_lower(p[k]);
+    }
+}
+
+extern "C" void rt_string_putc(rt_string* s, int32_t i, uint32_t c) {
+    if (i < 0 || static_cast<uint64_t>(i) >= str_len(s) || (c & 0xffu) == 0) {
+        return;
+    }
+    str_data(s)[i] = static_cast<char>(c & 0xffu);
+}
+
+extern "C" uint32_t rt_string_getc(const rt_string* s, int32_t i) {
+    if (i < 0 || static_cast<uint64_t>(i) >= str_len(s)) {
+        return 0;
+    }
+    return static_cast<unsigned char>(str_data(s)[i]);
+}
+
+extern "C" void rt_string_from_packed(rt_string* dst, const uint8_t* val, uint32_t width_bits) {
+    const uint32_t nbytes = (width_bits + 7) / 8;
+    StrScratch     scratch(nbytes);
+    uint64_t       out_len = 0;
+    for (uint32_t k = nbytes; k-- > 0;) {
+        uint8_t c = val[k];
+        if (k == nbytes - 1 && width_bits % 8 != 0) {
+            c &= static_cast<uint8_t>((1u << (width_bits % 8)) - 1);
+        }
+        if (c != 0) {
+            scratch.buf[out_len++] = static_cast<char>(c);
+        }
+    }
+    str_assign(dst, scratch.buf, out_len);
+}
+
+extern "C" void rt_string_to_packed(const rt_string* s, uint8_t* out, uint32_t width_bits) {
+    // Buffer sizing mirrors ir::plane_bytes (InternPool.h) — the backend allocas
+    // exactly one val plane and loads an iW from it.
+    uint32_t buf_bytes = 0;
+    if (width_bits <= 8) {
+        buf_bytes = 1;
+    } else if (width_bits <= 16) {
+        buf_bytes = 2;
+    } else if (width_bits <= 32) {
+        buf_bytes = 4;
+    } else if (width_bits <= 64) {
+        buf_bytes = 8;
+    } else {
+        buf_bytes = ((width_bits + 63) / 64) * 8;
+    }
+    std::memset(out, 0, buf_bytes);
+
+    const uint32_t nbytes = (width_bits + 7) / 8;
+    const uint64_t len    = str_len(s);
+    const char*    p      = str_data(s);
+    const uint32_t take   = len < nbytes ? static_cast<uint32_t>(len) : nbytes;
+    for (uint32_t k = 0; k < take; ++k) {
+        out[k] = static_cast<uint8_t>(p[len - 1 - k]);
+    }
+    if (width_bits % 8 != 0) {
+        out[nbytes - 1] &= static_cast<uint8_t>((1u << (width_bits % 8)) - 1);
+    }
 }
 
 extern "C" void* rt_alloc(uint64_t size) {

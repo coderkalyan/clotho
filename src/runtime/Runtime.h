@@ -129,6 +129,80 @@ int rt_nba_arr_dirty(uint32_t sig);
 // Drop all queued writes (called after a commit + wake pass).
 void rt_nba_arr_reset(void);
 
+// -- SystemVerilog string objects --
+//
+// The dynamic `string` type (LRM §6.16). A string value lives in a fixed
+// 32-byte caller-owned handle embedded in design state (same ownership model as
+// rt_wheel): small strings are stored inline in the handle, larger ones spill
+// to a heap buffer the handle owns. Copies are eager deep copies; handles never
+// share storage. A handle must be constructed with rt_string_init before any
+// other call and released with rt_string_deinit. Every operation that writes a
+// destination handle requires it already constructed and reuses its existing
+// capacity, so steady-state reassignment in a loop does not allocate.
+typedef struct rt_string {
+    alignas(8) unsigned char storage[32];
+} rt_string;
+
+// Construct the empty string "" in caller-owned storage. Never allocates.
+void rt_string_init(rt_string* s);
+
+// Release any heap buffer owned by `s`. The caller still owns the handle
+// storage; `s` is left as a valid empty string, so deinit is idempotent.
+void rt_string_deinit(rt_string* s);
+
+// dst = src (deep copy). dst == src is a no-op.
+void rt_string_assign(rt_string* dst, const rt_string* src);
+
+// dst = the `n` bytes at `p`. `p` is a raw byte sequence, not NUL-terminated;
+// it may alias dst's own buffer.
+void rt_string_assign_bytes(rt_string* dst, const char* p, uint64_t n);
+
+// Length in bytes ($.len()). The empty string has length 0.
+uint64_t rt_string_len(const rt_string* s);
+
+// dst = parts[0] .. parts[n-1] concatenated. dst may appear among the parts
+// (a = {a, b}).
+void rt_string_concat(rt_string* dst, const rt_string* const* parts, uint32_t n);
+
+// dst = src repeated `count` times ({count{src}}); count == 0 yields "".
+void rt_string_repl(rt_string* dst, const rt_string* src, uint64_t count);
+
+// Lexicographic comparison in strcmp order over (bytes, then length): returns
+// < 0, 0, or > 0. The LRM (§6.16.9) specifies only the sign.
+int32_t rt_string_cmp(const rt_string* a, const rt_string* b);
+
+// rt_string_cmp over ASCII-lowercased operands ($.icompare()).
+int32_t rt_string_icmp(const rt_string* a, const rt_string* b);
+
+// dst = src.substr(i, j): the bytes at positions i..j inclusive, or "" when the
+// range is invalid (i < 0, j < i, or j >= len; LRM §6.16.8).
+void rt_string_substr(rt_string* dst, const rt_string* src, int32_t i, int32_t j);
+
+// dst = src with ASCII letters upper/lowercased. dst may alias src.
+void rt_string_toupper(rt_string* dst, const rt_string* src);
+void rt_string_tolower(rt_string* dst, const rt_string* src);
+
+// s[i] = c ($.putc()): a no-op when i is out of range or (c & 0xff) == 0 — a
+// string never contains a 0 byte (LRM §6.16.2).
+void rt_string_putc(rt_string* s, int32_t i, uint32_t c);
+
+// s[i] ($.getc()): the byte at i, or 0 when i is out of range (LRM §6.16.3).
+uint32_t rt_string_getc(const rt_string* s, int32_t i);
+
+// string'(value): `val` is the little-endian val plane of a packed value,
+// plane_bytes(width_bits) long. Bytes are taken most-significant first and
+// every 0x00 byte is dropped (LRM §6.16: the integral value converts as a
+// string literal, and literal conversion removes \0 characters). X/Z bits are
+// read as 0 — the caller passes the val plane only.
+void rt_string_from_packed(rt_string* dst, const uint8_t* val, uint32_t width_bits);
+
+// Packed-integral cast of a string: writes the little-endian val plane of the
+// result into `out`, which is plane_bytes(width_bits) long. Characters pack
+// most-significant first, right-justified: truncated on the left when the
+// string is longer than the width, zero-filled on the left when shorter
+// (LRM §6.16).
+void rt_string_to_packed(const rt_string* s, uint8_t* out, uint32_t width_bits);
+
 // -- Coroutine frame allocation --
 //
 // Each process lowers to an LLVM coroutine; its frame is allocated through these
