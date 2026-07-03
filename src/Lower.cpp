@@ -2485,7 +2485,10 @@ private:
             if (!fn_ctx_->has_ret_local) {
                 fail("return with a value in a void function");
             }
-            b.unary(ir::Inst::Tag::Ret, b.resize(lower_expr(*r.expr, b), fn_ctx_->ret_type, l), l);
+            // A string result needs no width resize (slang already converted).
+            const ir::Index v = lower_expr(*r.expr, b);
+            b.unary(ir::Inst::Tag::Ret,
+                    is_string_ref(fn_ctx_->ret_type) ? v : b.resize(v, fn_ctx_->ret_type, l), l);
         } else if (fn_ctx_->has_ret_local) {
             // `return;` in a non-void function yields the current function-var value.
             const ir::Index rv = b.local(fn_ctx_->ret_local, fn_ctx_->ret_type, l);
