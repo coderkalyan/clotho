@@ -464,6 +464,15 @@ private:
                 }
                 break;
             }
+            case Inst::PayloadKind::RealMath: {
+                const auto info = ir_.extra_data<RealMathInfo>(p.extra);
+                os_ << "op" << info.op;
+                for (Index a : ir_.region(info.args)) {
+                    os_ << ", ";
+                    ref(a);
+                }
+                break;
+            }
             case Inst::PayloadKind::TimeFormat: {
                 const auto info = ir_.extra_data<TimeFormatInfo>(p.timeformat);
                 ref(info.units);
