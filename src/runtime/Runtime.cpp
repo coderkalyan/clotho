@@ -269,6 +269,9 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
             if (spec.left_justify) {
                 cs += '-';
             }
+            if (spec.alt) {
+                cs += '#';
+            }
             if (spec.zero_pad) {
                 cs += '0';
             }

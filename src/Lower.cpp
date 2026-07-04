@@ -587,7 +587,15 @@ private:
         if (ct.isString()) {
             return module_.pool.string_type;
         }
+        if (ct.isFloating()) {
+            // realtime is synonymous with real (LRM 6.12); both canonicalize to
+            // the pool's real type.
+            const auto& ft = ct.as<slang::ast::FloatingType>();
+            return ft.floatKind == slang::ast::FloatingType::ShortReal ? module_.pool.shortreal_type
+                                                                       : module_.pool.real_type;
+        }
         if (!ct.isIntegral()) {
+            // TODO: string / chandle / event / class types.
             fail("unsupported non-integral type");
         }
 
@@ -647,6 +655,27 @@ private:
         return module_.pool.put(ir::Item{ vec });
     }
 
+    // Resize / convert an already-lowered rvalue of slang type `from` to the
+    // interned target `to`. Integral-to-integral resizes; any real endpoint
+    // picks the matching float conversion (assignment semantics: real ->
+    // integral rounds half away from zero, LRM 6.12.1). Used where the
+    // frontend coerces manually (port copies, call arguments, returns) rather
+    // than through a slang-inserted Conversion.
+    ir::Index coerce(ir::Index v, const slang::ast::Type& from, ir::Ref to, ir::Builder& b, ir::SourceLoc l) {
+        const bool from_f = from.isFloating();
+        const bool to_f   = module_.pool.is_float(to);
+        if (to_f && from_f) {
+            return b.float_cvt(ir::Inst::Tag::FResize, v, to, l);
+        }
+        if (to_f) {
+            return b.float_cvt(ir::Inst::Tag::ItoF, v, to, l);
+        }
+        if (from_f) {
+            return b.float_cvt(ir::Inst::Tag::FtoI, v, to, l);
+        }
+        return b.resize(v, to, l);
+    }
+
     // Intern an integer literal, preserving x/z bits. Slang stores a 4-state
     // SVInt as [value words][unknown words] with X=(val0,unk1), Z=(val1,unk1) —
     // the opposite val convention from the pool's VPI planes (X=(val1,xz1),
@@ -688,15 +717,21 @@ private:
     }
 
     // Lower a slang compile-time constant (a resolved parameter value or a
-    // folded constant-required expression) into a pooled IR constant. Only
-    // integral constants are modeled; real/string/aggregate constants are
-    // outside the synthesizable-RTL scope.
+    // folded constant-required expression) into a pooled IR constant.
     //
-    // TODO: real/string/struct/array/enum constant parameters (depends on the
+    // TODO: string/struct/array/enum constant parameters (depends on the
     // matching runtime types — see docs/TODO.md Tier 3).
     ir::Ref lower_constant(const slang::ConstantValue& cv, const slang::ast::Type& type) {
+        // Real / shortreal parameters (LRM 6.20), including untyped
+        // `parameter r = 5.7`, whose type slang resolves to real.
+        if (cv.isReal()) {
+            return module_.pool.put_real(lower_type(type), static_cast<double>(cv.real()));
+        }
+        if (cv.isShortReal()) {
+            return module_.pool.put_real(lower_type(type), static_cast<double>(cv.shortReal()));
+        }
         if (!cv.isInteger()) {
-            fail("only integral constant parameters are supported");
+            fail("only integral and real constant parameters are supported");
         }
         return svint_to_ref(cv.integer(), lower_type(type));
     }
@@ -1089,7 +1124,8 @@ private:
                 record_net_driver(a.left());
                 const ir::Ref   ty  = lower_type(*a.left().type);
                 const ir::Index val = b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l);
-                b.binary(ir::Inst::Tag::Store, lower_lvalue(a.left(), b), b.resize(val, ty, l), l);
+                b.binary(ir::Inst::Tag::Store, lower_lvalue(a.left(), b),
+                         coerce(val, *a.right().type, ty, b, l), l);
                 sens.push_back(ir::WaitEvent{ .signal = child_sig, .edge = ir::Edge::Any });
             } else {
                 // Input: drive the child net from the source rvalue, resized to the
@@ -1097,7 +1133,8 @@ private:
                 // driver of the whole child-side net.
                 record_net_driver_range(p.internalSymbol->as<ValueSymbol>(), 0, UINT32_MAX);
                 const ir::Ref ty = lower_type(p.internalSymbol->as<ValueSymbol>().getType());
-                b.binary(ir::Inst::Tag::Store, b.signal(child_sig, l), b.resize(lower_expr(*expr, b), ty, l), l);
+                b.binary(ir::Inst::Tag::Store, b.signal(child_sig, l),
+                         coerce(lower_expr(*expr, b), *expr->type, ty, b, l), l);
                 collect_inferred_sensitivity(*expr, sens, /*exclude_written=*/false);
             }
             // A port connection is a continuous copy: evaluate at time zero so the
@@ -1390,6 +1427,11 @@ private:
             return b.unary(ir::Inst::Tag::RedOr, len, l);
         }
         const ir::Index pred = lower_expr(cond, b);
+        if (cond.type->isFloating()) {
+            // A real condition is true iff nonzero — a definite 1-bit result
+            // (reals carry no x/z).
+            return b.binary(ir::Inst::Tag::FNe, pred, real_zero(cond, b, l), l);
+        }
         return b.unary(ir::Inst::Tag::RedOr, pred, l);
     }
 
@@ -1559,6 +1601,10 @@ private:
     // which the backend's definite-1 loop rule treats as exit).
     void lower_repeat(const RepeatLoopStatement& r, ir::Builder& b) {
         const ir::SourceLoc l   = loc(r);
+        if (r.count.type->isFloating()) {
+            // LRM 12.7.2: a real repeat count would round; not yet lowered.
+            fail("repeat with a real count is not supported");
+        }
         const ir::Ref       ty  = lower_type(*r.count.type);
 
         // Hidden bound holds the once-evaluated count; hidden counter starts at 0.
@@ -1637,6 +1683,18 @@ private:
             const ir::SourceLoc l   = loc(e);
             const ir::Index     lv  = lower_lvalue(u.operand(), b);
             const ir::Index     cur = b.unary(ir::Inst::Tag::Load, lv, l);
+            if (u.operand().type->isFloating()) {
+                // ++ / -- on a real add / subtract 1.0 (LRM 11.4.2).
+                const ir::Index     lv   = lower_lvalue(u.operand(), b);
+                const ir::Index     cur  = b.unary(ir::Inst::Tag::Load, lv, l);
+                const ir::Index     onef =
+                  b.constant(module_.pool.put_real(lower_type(*u.operand().type), 1.0), l);
+                const bool          inc = u.op == UnaryOperator::Preincrement || u.op == UnaryOperator::Postincrement;
+                const ir::Index     nv =
+                  b.binary(inc ? ir::Inst::Tag::FAdd : ir::Inst::Tag::FSub, cur, onef, l);
+                b.binary(ir::Inst::Tag::Store, lv, nv, l);
+                return;
+            }
             const ir::Index     one = b.constant(module_.pool.put_int(lower_type(*u.operand().type), 1), l);
             const ir::Index     nv  = b.binary(inc ? ir::Inst::Tag::Add : ir::Inst::Tag::Sub, cur, one, l);
             b.binary(ir::Inst::Tag::Store, lv, nv, l);
@@ -1649,6 +1707,19 @@ private:
     // longest of the selector and every item label, four-state if any operand is,
     // signed only if all are (IEEE 1800-2023 12.5).
     ir::Ref common_case_type(const CaseStatement& c) {
+        // TODO: case with a real selector or label. LRM 12.5 defines matching
+        // with === semantics, which Table 11-1 leaves undefined for reals
+        // (iverilog compares with ==). Loud-fail until the semantics call.
+        if (c.expr.type->isFloating()) {
+            fail("case on a real selector is not supported");
+        }
+        for (const CaseStatement::ItemGroup& item : c.items) {
+            for (const Expression* e : item.expressions) {
+                if (e->type->isFloating()) {
+                    fail("case with a real item label is not supported");
+                }
+            }
+        }
         uint32_t width  = c.expr.type->getBitWidth();
         bool     four   = c.expr.type->isFourState();
         bool     signd  = c.expr.type->isSigned();
@@ -1924,6 +1995,12 @@ private:
     // delay times the unit is always an exact multiple of the precision (LRM
     // §3.14). Real (fractional) delays, which would round, are not yet supported.
     ir::Index scaled_delay(const Expression& amount, ir::Builder& b) {
+        // TODO: fractional (real) delays round to the time precision, which
+        // forces the wheel tick down to the smallest precision (LRM 22.7; see
+        // the design_tick_fs note).
+        if (amount.type->isFloating()) {
+            fail("real (fractional) delay values are not supported");
+        }
         const ir::Index v = lower_expr(amount, b);
         if (time_mul_ <= 1) {
             return v;
@@ -2346,8 +2423,9 @@ private:
             case 'e':
             case 'f':
             case 'g':
-                // TODO: real format specifiers need real-type support.
-                fail("real format specifiers (%e / %f / %g) are not supported");
+                // Real conversions take the full C formatting specification
+                // (LRM §21.2.1.2 Table 21-2), including a precision.
+                return conv;
             case 'v':
                 // TODO: %v needs net strength modeling (LRM §21.2.1.4).
                 fail("%v (net signal strength) is not supported");
@@ -2430,9 +2508,15 @@ private:
                 append_format_literal(fmt, lit->as<StringLiteral>().getValue(), pending);
             } else {
                 const bool str  = is_string_expr(*arg);
-                char       conv = str ? 's' : default_conv;
+                const bool fl   = arg->type->isFloating();
+                char       conv = str ? 's' : (fl ? 'g' : default_conv);
                 if (next < pending.size()) {
                     conv = pending[next++]; // consumed by an earlier specifier
+                } else if (fl) {
+                    // Bare real: the "default decimal format" (LRM §21.2.1.1)
+                    // is unpinned for reals; %#g (6 significant digits,
+                    // trailing zeros kept) matches iverilog byte for byte.
+                    fmt += "%#g";
                 } else {
                     // Bare value default: the task's radix, auto-sized
                     // (LRM §21.2.1.1); a string object formats as a string.
@@ -2444,7 +2528,31 @@ private:
                     // reinterpretation of its characters).
                     fail("a string argument to $display/$write requires %s");
                 }
+                const ir::SourceLoc al = loc(*arg);
+                const bool real_conv =
+                  conv == 'e' || conv == 'E' || conv == 'f' || conv == 'F' || conv == 'g' || conv == 'G';
                 ir::Index v = lower_expr(*arg, b);
+                if (fl && !real_conv) {
+                    switch (conv) {
+                        case 'd':
+                            // A real under %d prints its rounded integer value
+                            // (LRM 6.12.1 conversion; matches iverilog).
+                            v = b.float_cvt(ir::Inst::Tag::FtoI, v, make_int_type(64, false, true), al);
+                            break;
+                        case 't':
+                            // TODO: %t with a real (realtime) argument — needs the
+                            // real tick-scaling path (lands with $realtime).
+                            fail("%t with a real argument is not supported");
+                        default:
+                            // %h / %o / %b / %c take integral operands only
+                            // (LRM 21.2.1.1).
+                            fail(std::string("%") + conv + " with a real argument is not supported");
+                    }
+                } else if (!fl && real_conv) {
+                    // An integral argument under %e/%f/%g converts to real
+                    // (LRM 6.12.1) so the runtime formats one representation.
+                    v = b.float_cvt(ir::Inst::Tag::ItoF, v, module_.pool.real_type, al);
+                }
                 if (conv == 't') {
                     v = scale_to_ticks(*arg, v, b);
                 }
@@ -2704,6 +2812,17 @@ private:
         switch (expr.kind) {
             case ExpressionKind::IntegerLiteral:
                 return b.constant(lower_int_literal(expr.as<IntegerLiteral>()), l);
+            case ExpressionKind::RealLiteral:
+                // An IEEE-754 double (LRM 5.7.2); a shortreal literal arrives as
+                // a cast around this, handled by the Conversion case.
+                return b.constant(module_.pool.put_real(lower_type(*expr.type), expr.as<RealLiteral>().getValue()),
+                                  l);
+            case ExpressionKind::TimeLiteral:
+                // A realtime value slang has already scaled to the scope's time
+                // unit (LRM 5.8); precision rounding applies only in delay
+                // contexts, which reject reals for now.
+                return b.constant(module_.pool.put_real(lower_type(*expr.type), expr.as<TimeLiteral>().getValue()),
+                                  l);
             case ExpressionKind::StringLiteral: {
                 // In a string-typed context the literal is a string constant with
                 // its \0 bytes dropped (LRM 6.16).
@@ -2819,7 +2938,7 @@ private:
                     }
                     return b.str_to_packed(lower_expr(cv.operand(), b), lower_type(*expr.type), l);
                 }
-                return b.resize(lower_expr(cv.operand(), b), lower_type(*expr.type), l);
+                return coerce(lower_expr(cv.operand(), b), *cv.operand().type, lower_type(*expr.type), b, l);
             }
             case ExpressionKind::Call: {
                 const CallExpression& call = expr.as<CallExpression>();
@@ -2842,6 +2961,22 @@ private:
         const ir::Index     op = lower_expr(u.operand(), b);
         using U                = slang::ast::UnaryOperator;
         using T                = ir::Inst::Tag;
+        if (u.operand().type->isFloating()) {
+            switch (u.op) {
+                case U::Plus:
+                    return op;
+                case U::Minus:
+                    return b.unary(T::FNeg, op, l);
+                case U::LogicalNot:
+                    // !r is r == 0.0: a definite 1-bit result (LRM 11.4.7 with
+                    // real operands has no ambiguity — reals carry no x/z).
+                    return b.binary(T::FEq, op, real_zero(u.operand(), b, l), l);
+                default:
+                    // Bitwise / reduction operators are illegal on reals (LRM
+                    // Table 11-1); slang rejects them upstream.
+                    fail("unsupported unary operator on a real operand");
+            }
+        }
         switch (u.op) {
             case U::BitwiseNot:
                 return b.unary(T::Bnot, op, l);
@@ -2870,6 +3005,61 @@ private:
             }
             default:
                 fail("unsupported unary operator");
+        }
+    }
+
+    // A 0.0 constant of the operand's float type, for predicates.
+    ir::Index real_zero(const Expression& operand, ir::Builder& b, ir::SourceLoc l) {
+        return b.constant(module_.pool.put_real(lower_type(*operand.type), 0.0), l);
+    }
+
+    // Binary operator with real operands. slang has inserted all LRM 11.3.1 /
+    // 11.8.2 conversions, so both operands share one float type here (except a
+    // logical operand, which converts to its own truth value first).
+    ir::Index lower_real_binary(const BinaryExpression& bin, ir::Index lhs, ir::Index rhs, ir::Builder& b) {
+        const ir::SourceLoc l = loc(bin);
+        using B               = slang::ast::BinaryOperator;
+        using T               = ir::Inst::Tag;
+        switch (bin.op) {
+            case B::Add:
+                return b.binary(T::FAdd, lhs, rhs, l);
+            case B::Subtract:
+                return b.binary(T::FSub, lhs, rhs, l);
+            case B::Multiply:
+                return b.binary(T::FMul, lhs, rhs, l);
+            case B::Divide:
+                return b.binary(T::FDiv, lhs, rhs, l);
+            case B::Power:
+                return b.binary(T::FPow, lhs, rhs, l);
+            case B::Equality:
+                return b.binary(T::FEq, lhs, rhs, l);
+            case B::Inequality:
+                return b.binary(T::FNe, lhs, rhs, l);
+            case B::GreaterThan:
+                return b.binary(T::FGt, lhs, rhs, l);
+            case B::GreaterThanEqual:
+                return b.binary(T::FGe, lhs, rhs, l);
+            case B::LessThan:
+                return b.binary(T::FLt, lhs, rhs, l);
+            case B::LessThanEqual:
+                return b.binary(T::FLe, lhs, rhs, l);
+            case B::LogicalAnd:
+            case B::LogicalOr: {
+                // Each real operand reduces to its own truth value (!= 0.0,
+                // definite); an integral operand keeps its planes and the
+                // backend's Land/Lor X rules apply to it alone.
+                const ir::Index lp = bin.left().type->isFloating()
+                                       ? b.binary(T::FNe, lhs, real_zero(bin.left(), b, l), l)
+                                       : lhs;
+                const ir::Index rp = bin.right().type->isFloating()
+                                       ? b.binary(T::FNe, rhs, real_zero(bin.right(), b, l), l)
+                                       : rhs;
+                return b.binary(bin.op == B::LogicalAnd ? T::Land : T::Lor, lp, rp, l);
+            }
+            default:
+                // %, bitwise, shifts, ===, ==? are illegal on reals (LRM Table
+                // 11-1); slang rejects them upstream.
+                fail("unsupported binary operator on real operands");
         }
     }
 
@@ -2902,6 +3092,9 @@ private:
                 default:
                     fail("unsupported binary operator on strings");
             }
+        }
+        if (bin.left().type->isFloating() || bin.right().type->isFloating()) {
+            return lower_real_binary(bin, lhs, rhs, b);
         }
 
         switch (bin.op) {
@@ -3228,7 +3421,10 @@ private:
             // A string result needs no width resize (slang already converted).
             const ir::Index v = lower_expr(*r.expr, b);
             b.unary(ir::Inst::Tag::Ret,
-                    is_string_ref(fn_ctx_->ret_type) ? v : b.resize(v, fn_ctx_->ret_type, l), l);
+                    is_string_ref(fn_ctx_->ret_type)
+                      ? v
+                      : coerce(v, *r.expr->type, fn_ctx_->ret_type, b, l),
+                    l);
         } else if (fn_ctx_->has_ret_local) {
             // `return;` in a non-void function yields the current function-var value.
             const ir::Index rv = b.local(fn_ctx_->ret_local, fn_ctx_->ret_type, l);
@@ -3422,8 +3618,9 @@ private:
             const ir::Ref pty = lower_type(formals[i]->getType());
             // A string actual passes as-is (no width to resize to); the callee's
             // copy-in gives value semantics.
-            args.push_back(is_string_ref(pty) ? lower_expr(*actuals[i], b)
-                                              : b.resize(lower_expr(*actuals[i], b), pty, l));
+            args.push_back(is_string_ref(pty)
+                             ? lower_expr(*actuals[i], b)
+                             : coerce(lower_expr(*actuals[i], b), *actuals[i]->type, pty, b, l));
         }
         const ir::Index c = b.call(id, args, l);
 
@@ -3451,6 +3648,7 @@ private:
             ir::Index         temp;      // the caller temp lvalue (parameter width)
             const Expression* actual;    // the call-site lvalue to copy back into
             ir::Ref           actual_ty; // the actual's type (target of copy-out)
+            const slang::ast::Type* formal_ty; // the formal's type (source of copy-out)
         };
         std::vector<OutArg>    outs;
         std::vector<ir::Index> args;
@@ -3458,8 +3656,9 @@ private:
         for (size_t i = 0; i < formals.size(); ++i) {
             const ir::Ref pty = lower_type(formals[i]->getType());
             if (formals[i]->direction == slang::ast::ArgumentDirection::In) {
-                args.push_back(is_string_ref(pty) ? lower_expr(*actuals[i], b)
-                                                  : b.resize(lower_expr(*actuals[i], b), pty, l));
+                args.push_back(is_string_ref(pty)
+                                 ? lower_expr(*actuals[i], b)
+                                 : coerce(lower_expr(*actuals[i], b), *actuals[i]->type, pty, b, l));
                 continue;
             }
             // slang models an output / inout actual as an AssignmentExpression whose
@@ -3471,10 +3670,10 @@ private:
             const ir::Index temp = make_task_temp(pty, b, l);
             if (formals[i]->direction == slang::ast::ArgumentDirection::InOut) {
                 // Copy-in: temp = (parameter type) actual.
-                b.binary(ir::Inst::Tag::Store, temp, b.resize(lower_expr(*actual, b), pty, l), l);
+                b.binary(ir::Inst::Tag::Store, temp, coerce(lower_expr(*actual, b), *actual->type, pty, b, l), l);
             }
             args.push_back(temp);
-            outs.push_back(OutArg{ temp, actual, lower_type(*actual->type) });
+            outs.push_back(OutArg{ temp, actual, lower_type(*actual->type), &formals[i]->getType() });
         }
 
         b.task_call(id, args, l);
@@ -3483,7 +3682,7 @@ private:
         for (const OutArg& oc : outs) {
             const ir::Index dst = lower_lvalue(*oc.actual, b);
             const ir::Index tv  = b.unary(ir::Inst::Tag::Load, oc.temp, l);
-            b.binary(ir::Inst::Tag::Store, dst, b.resize(tv, oc.actual_ty, l), l);
+            b.binary(ir::Inst::Tag::Store, dst, coerce(tv, *oc.formal_ty, oc.actual_ty, b, l), l);
         }
     }
 

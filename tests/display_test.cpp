@@ -263,12 +263,12 @@ TEST_CASE("unsupported or invalid format specifiers are rejected") {
             endmodule
         )", "%l (library binding) is not supported");
     }
-    SUBCASE("real formats without real support") {
-        check_rejected(R"(
+    SUBCASE("integral under a real specifier converts (LRM 6.12.1)") {
+        CHECK(run_capture(R"(
             module m;
                 initial $display("%f", 1);
             endmodule
-        )", "real format specifiers (%e / %f / %g) are not supported");
+        )") == "1.000000\n");
     }
     SUBCASE("precision on an integer conversion") {
         // slang diagnoses this at elaboration, before Clotho's own guard.
