@@ -3459,3 +3459,27 @@ TEST_CASE("suspension points and self-sensitivity writes block fusion") {
     CHECK(count_substr(ir, ".f2(") == 0);
     CHECK(count_substr(ir, ".f3(") == 0);
 }
+
+TEST_CASE("time-zero stores do not overflow the active queue via self-start re-wakes") {
+    // Regression: the seed loop pushed self-start processes (port copies /
+    // continuous assigns) without setting their scheduled flag, so an initial
+    // block draining first at time zero re-woke the still-queued copies and the
+    // duplicate entries overflowed the fixed-capacity active queue (a segfault
+    // at millions-of-entries scale designs; corruption here).
+    // Cross-checked against iverilog.
+    const std::string out = run_capture(R"(
+        module sub(input a, input b, output y);
+            assign y = a & b;
+        endmodule
+        module top;
+            reg a, b;
+            wire y;
+            sub u(a, b, y);
+            initial begin
+                a = 1; b = 1;
+                #1 $display("y=%b", y);
+            end
+        endmodule
+    )");
+    CHECK(out == "y=1\n");
+}
