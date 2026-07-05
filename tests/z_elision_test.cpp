@@ -1,0 +1,233 @@
+#include <doctest/doctest.h>
+
+#include <string_view>
+
+#include "Lower.h"
+#include "ir/ZElision.h"
+
+using namespace clotho;
+
+namespace {
+
+// Lowered module plus its may-z result, addressable by signal name.
+struct Analyzed {
+    LowerResult       lowered;
+    std::vector<bool> may_z;
+
+    // May-z of the signal whose (possibly hierarchical) name is `name` or ends
+    // with ".name". Fails the test if no such signal exists.
+    bool z(std::string_view name) const {
+        const auto signals = lowered.module->signals();
+        for (size_t i = 0; i < signals.size(); ++i) {
+            const std::string& n = signals[i].name;
+            if (n == name || (n.size() > name.size() && n.compare(n.size() - name.size(), name.size(), name) == 0 &&
+                              n[n.size() - name.size() - 1] == '.')) {
+                return may_z[i];
+            }
+        }
+        FAIL("no signal named ", name);
+        return true;
+    }
+};
+
+Analyzed analyze(std::string_view source) {
+    Analyzed a{ .lowered = lower_text(source), .may_z = {} };
+    REQUIRE_MESSAGE(a.lowered.ok, a.lowered.diagnostics);
+    REQUIRE(a.lowered.module != nullptr);
+    a.may_z = ir::compute_may_z(*a.lowered.module);
+
+    return a;
+}
+
+} // namespace
+
+TEST_CASE("a design without z sources proves every signal never-z") {
+    const Analyzed a = analyze(R"(
+        module top(input clk, input [7:0] d, output reg [7:0] q);
+            wire [7:0] n = d ^ 8'hff;
+            always @(posedge clk) q <= n + 1;
+        endmodule
+    )");
+    for (const bool z : a.may_z) {
+        CHECK(!z);
+    }
+}
+
+TEST_CASE("a z literal marks its target and transitive copies") {
+    const Analyzed a = analyze(R"(
+        module top;
+            logic [3:0] w = 4'bz01x;
+            logic [3:0] y;
+            logic [3:0] clean = 4'b1010;
+            assign y = w;
+        endmodule
+    )");
+    CHECK(a.z("w"));
+    CHECK(a.z("y"));
+    CHECK(!a.z("clean"));
+}
+
+TEST_CASE("z rides through transparent ops") {
+    const Analyzed a = analyze(R"(
+        module top(input sel);
+            logic [3:0] w = 4'bz01x;
+            logic [3:0] m, c, r, sh, ps;
+            logic [7:0] sx;
+            logic       b;
+            assign m  = sel ? w : 4'b0;
+            assign c  = { w[1:0], 2'b00 };
+            assign r  = { 2{ w[1:0] } };
+            assign sh = w << 1;
+            assign ps = { 2'b0, w[3:2] };
+            assign sx = $signed(w);
+            assign b  = w[0];
+        endmodule
+    )");
+    CHECK(a.z("m"));
+    CHECK(a.z("c"));
+    CHECK(a.z("r"));
+    CHECK(a.z("sh"));
+    CHECK(a.z("ps"));
+    CHECK(a.z("sx"));
+    CHECK(a.z("b"));
+}
+
+TEST_CASE("z is absorbed by arithmetic, comparisons, reductions, and case-equality") {
+    const Analyzed a = analyze(R"(
+        module top;
+            logic [3:0] w = 4'bz01x;
+            logic [3:0] sum, andv;
+            logic       eq, ceq, red, lnot;
+            assign sum  = w + 1;
+            assign andv = w & 4'hf;
+            assign eq   = w == 4'h3;
+            assign ceq  = w === 4'bz01x;
+            assign red  = &w;
+            assign lnot = !w;
+        endmodule
+    )");
+    CHECK(a.z("w"));
+    CHECK(!a.z("sum"));
+    CHECK(!a.z("andv"));
+    CHECK(!a.z("eq"));
+    CHECK(!a.z("ceq"));
+    CHECK(!a.z("red"));
+    CHECK(!a.z("lnot"));
+}
+
+TEST_CASE("an unknown mux condition or shift count does not launder z away") {
+    // The z operand still rides through even when the selector itself is clean;
+    // conversely a z-free datapath stays clean under a 4-state selector.
+    const Analyzed a = analyze(R"(
+        module top(input s);
+            logic [3:0] w = 4'bzzzz;
+            logic [3:0] viaz, clean;
+            assign viaz  = s ? w : w >> 1;
+            assign clean = s ? 4'h1 : 4'h2;
+        endmodule
+    )");
+    CHECK(a.z("viaz"));
+    CHECK(!a.z("clean"));
+}
+
+TEST_CASE("$readmem seeds a 4-state memory but not a 2-state one") {
+    const Analyzed a = analyze(R"(
+        module top;
+            logic [7:0] mem4 [0:3];
+            bit   [7:0] mem2 [0:3];
+            logic [7:0] out4;
+            bit   [7:0] out2;
+            initial begin
+                $readmemh("f.hex", mem4);
+                $readmemh("f.hex", mem2);
+                out4 = mem4[0];
+                out2 = mem2[0];
+            end
+        endmodule
+    )");
+    CHECK(a.z("mem4"));
+    CHECK(!a.z("mem2"));
+    CHECK(a.z("out4"));
+    CHECK(!a.z("out2"));
+}
+
+TEST_CASE("z crosses instance boundaries through port copies") {
+    const Analyzed a = analyze(R"(
+        module child(input [3:0] i, output [3:0] o);
+            assign o = i;
+        endmodule
+        module top;
+            logic [3:0] src = 4'bz0z0;
+            logic [3:0] dst;
+            child c(.i(src), .o(dst));
+        endmodule
+    )");
+    CHECK(a.z("src"));
+    CHECK(a.z("dst"));
+    CHECK(a.z("i"));
+    CHECK(a.z("o"));
+}
+
+TEST_CASE("function results carry may-z only when the body can produce z") {
+    const Analyzed a = analyze(R"(
+        module top;
+            function automatic logic [3:0] zfn(input logic [3:0] x);
+                return 4'bz000;
+            endfunction
+            function automatic logic [3:0] addfn(input logic [3:0] x);
+                return x + 1;
+            endfunction
+            function automatic logic [3:0] passfn(input logic [3:0] x);
+                return x;
+            endfunction
+            logic [3:0] a1, a2, a3, a4;
+            initial begin
+                a1 = zfn(4'h0);
+                a2 = addfn(4'bzzzz);
+                a3 = passfn(4'bz000);
+                a4 = passfn(4'h5);
+            end
+        endmodule
+    )");
+    CHECK(a.z("a1"));
+    CHECK(!a.z("a2"));
+    // passfn joins over call sites: one z actual poisons the shared summary.
+    CHECK(a.z("a3"));
+    CHECK(a.z("a4"));
+}
+
+TEST_CASE("task output formals propagate z to the caller") {
+    const Analyzed a = analyze(R"(
+        module top;
+            task automatic zt(output logic [3:0] o);
+                o = 4'bz111;
+            endtask
+            task automatic ct(output logic [3:0] o);
+                o = 4'b0111;
+            endtask
+            logic [3:0] zdst, cdst;
+            initial begin
+                zt(zdst);
+                ct(cdst);
+            end
+        endmodule
+    )");
+    CHECK(a.z("zdst"));
+    CHECK(!a.z("cdst"));
+}
+
+TEST_CASE("z flows around loop back-edges to fixpoint") {
+    // dst picks up z only via the feedback signal written later in the process.
+    const Analyzed a = analyze(R"(
+        module top(input clk);
+            logic [3:0] fb = 4'h0;
+            logic [3:0] dst;
+            always @(posedge clk) begin
+                dst <= fb;
+                fb  <= 4'bz000;
+            end
+        endmodule
+    )");
+    CHECK(a.z("fb"));
+    CHECK(a.z("dst"));
+}

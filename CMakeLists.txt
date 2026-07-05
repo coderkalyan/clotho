@@ -65,6 +65,7 @@ add_library(clotho_ir STATIC
   src/ir/Ir.cpp
   src/ir/Builder.cpp
   src/ir/Printer.cpp
+  src/ir/ZElision.cpp
   src/ir/LlvmBackend.cpp
   src/ir/Jit.cpp
 )
@@ -101,6 +102,7 @@ add_executable(clotho_test
   tests/string_test.cpp
   tests/loop_test.cpp
   tests/generate_test.cpp
+  tests/z_elision_test.cpp
   tests/llvm_backend_test.cpp
   tests/wheel_test.cpp
   tests/runtime_test.cpp
