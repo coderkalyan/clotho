@@ -98,10 +98,10 @@ constexpr std::string_view kAlu = R"(
 TEST_CASE("alu emits verifiable llvm ir") {
     const std::string ir = emit(kAlu);
 
-    // State is an opaque byte buffer, not a typed LLVM struct: main stack-
-    // allocates an `[N x i8]` and there is no named `%alu.state` type.
-    CHECK(ir.find("alloca [") != std::string::npos);
-    CHECK(ir.find("%alu.state") == std::string::npos);
+    // State is typed: the module definition gets a named state struct, the root
+    // %clotho.state composes it, and main stack-allocates the root type.
+    CHECK(ir.find("%alu.state = type") != std::string::npos);
+    CHECK(ir.find("alloca %clotho.state") != std::string::npos);
 
     // One coroutine per process, named @<module>.p<index>: two combinational
     // assigns + one sequential always block. Each is a switched-resume coroutine
@@ -115,8 +115,8 @@ TEST_CASE("alu emits verifiable llvm ir") {
     CHECK(ir.find(" add ") != std::string::npos);
     CHECK(ir.find(" sub ") != std::string::npos);
 
-    // Signal access via constant-offset i8 GEP + load/store.
-    CHECK(ir.find("getelementptr inbounds i8, ptr") != std::string::npos);
+    // Signal access via constant-index typed GEPs into the state structs.
+    CHECK(ir.find("getelementptr inbounds %clotho.state, ptr") != std::string::npos);
     CHECK(ir.find("store i8") != std::string::npos);
 
     // The if/else lowers to branches.
@@ -137,15 +137,43 @@ TEST_CASE("2-state vs 4-state widths") {
     )";
     const std::string          ir  = emit(src);
 
-    // No typed value/state struct — state is laid out by clotho into an opaque
-    // byte buffer (the only named types are coroutine frames, an unrelated
-    // lowering artifact). The 4-state z (logic[7:0], align 2) packs ahead of the
-    // 2-state x/y (bit[3:0], align 1); the buffer is 8 bytes, align 8.
-    CHECK(ir.find("%m.state") == std::string::npos);
-    CHECK(ir.find("alloca [8 x i8], align 8") != std::string::npos);
-    // z's must|may word sits first at offset 0 as an i16 (2W = 16).
+    // Every signal keeps its LLVM slot type — a `{ i(2W) must|may, iW z }`
+    // struct named per (domain, width) — and the module's state struct lists
+    // them in declaration order: x, y (bit[3:0]) then z (logic[7:0]).
+    CHECK(ir.find("%m.state = type { %bit.4, %bit.4, %logic.8 }") != std::string::npos);
+    CHECK(ir.find("%bit.4 = type { i8, i4 }") != std::string::npos);
+    CHECK(ir.find("%logic.8 = type { i16, i8 }") != std::string::npos);
+    CHECK(ir.find("alloca %clotho.state") != std::string::npos);
+    // z's must|may word is an i16 (2W = 16).
     CHECK(ir.find("store i16") != std::string::npos);
     CHECK(ir.find("define ptr @m.") != std::string::npos);
+}
+
+TEST_CASE("instance state structs compose nested and replicate per instantiation") {
+    constexpr std::string_view src = R"(
+        module leaf(input logic a, output logic [7:0] q);
+            logic [7:0] cnt;
+            always @(posedge a) cnt <= cnt + 8'd1;
+            assign q = cnt;
+        endmodule
+        module top;
+            logic clk;
+            logic [7:0] q0, q1;
+            leaf u0(.a(clk), .q(q0));
+            leaf u1(.a(clk), .q(q1));
+        endmodule
+    )";
+    const std::string          ir  = emit(src);
+
+    // One state struct per module definition; the parent embeds one field per
+    // child instance (two %leaf.state replicas), and the root composes the top
+    // instance plus the NBA shadow region.
+    CHECK(ir.find("%leaf.state = type { %logic.1, %logic.8, %logic.8 }") != std::string::npos);
+    CHECK(ir.find("%top.state = type { %logic.1, %logic.8, %logic.8, %leaf.state, %leaf.state }") !=
+          std::string::npos);
+    CHECK(ir.find("%clotho.state = type { %top.state, %clotho.nba.shadow }") != std::string::npos);
+    // Exactly one definition of the leaf struct type (deduplicated, no .0 clone).
+    CHECK(ir.find("%leaf.state.0") == std::string::npos);
 }
 
 TEST_CASE("single-bit xor uses the packed truth-table immediate") {

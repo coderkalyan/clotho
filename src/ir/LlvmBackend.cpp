@@ -3,10 +3,14 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <mutex>
 #include <optional>
+#include <span>
 #include <string>
+#include <tuple>
 #include <vector>
 
+#include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DerivedTypes.h>
@@ -19,6 +23,7 @@
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/Support/TargetSelect.h>
 
 #include "ir/InternPool.h"
 #include "ir/Ir.h"
@@ -39,12 +44,15 @@
 // elide z where it proves dead rather than dropping it here.
 // To reconstruct canonical 4-state when needed: xz = must ^ may, val = must.
 //
-// State / ABI. Signals are persistent module state held in one opaque byte
-// buffer (the LLVM equivalent of `u8* align(8)`). Clotho owns the layout: it
-// computes a fixed byte offset for each signal's must|may and z fields at compile
-// time (signals packed in decreasing alignment order) and hands every process
-// function a bare `ptr`. Load/Store reach a field via a constant-offset i8 GEP
-// and an aligned load/store — no LLVM struct layout is involved.
+// State / ABI. Signals are persistent module state laid out with LLVM's type
+// system. Every signal owns a `{ i(2W) must|may, iW z }` slot struct (an
+// unpacked-array signal an `[N x slot]` of leaf slots); every module definition
+// gets one identified struct type listing its scope's slots followed by one
+// field per child instance (the child definition's struct, replicated per
+// instantiation); the root `%clotho.state` composes the top-level instances
+// plus the NBA shadow region. Each process takes a `ptr` to the root and
+// reaches a field through constant-index GEPs, so LLVM computes and owns all
+// offsets/padding (the module carries the host target's DataLayout).
 //
 // Inferred types. The IR stores no per-instruction result type, so the backend
 // recomputes width / domain / signedness for each value by walking operands
@@ -209,23 +217,25 @@ constexpr code bxnor4(code a, code b) {
 constexpr uint32_t BXNOR1_LUT = build_lut(bxnor4);
 static_assert(BXNOR1_LUT == EQ1_LUT, "1-bit xnor must equal 1-bit ==");
 
-// A resolved assignment target: a `{ i(2W) must|may, iW z }` pair somewhere in
-// memory (the module state buffer for a signal, or the per-call frame for a
-// function local) plus a bit offset / width selecting part of it. `bit_off` is an
-// i32; a whole-storage target has offset 0 and width == store_width.
+// A resolved assignment target: a `{ i(2W) must|may, iW z }` slot somewhere in
+// typed storage (the module state struct for a signal, or the per-call frame
+// struct for a function local) plus a bit offset / width selecting part of it.
+// `bit_off` is an i32; a whole-storage target has offset 0 and width ==
+// store_width.
 struct LValue {
-    // Base pointer of the storage buffer (state or frame).
+    // Pointer to the slot struct — or, for an unpacked-array signal, to the
+    // whole `[N x slot]` storage (`elem_idx` then selects the leaf).
     llvm::Value* base = nullptr;
-    // Byte offset of the must|may word and the z word within `base`. For an
-    // unpacked-array element these are element 0's offsets; `dyn_off` shifts to
-    // the selected element.
-    uint32_t off_mm = 0;
-    uint32_t off_z  = 0;
-    // Full storage width in bits.
+    // The leaf slot type `{ i(2W), iW }` of the addressed storage.
+    llvm::StructType* slot_ty = nullptr;
+    // The `[N x slot]` storage type when `base` addresses a whole memory; null
+    // for plain scalar storage.
+    llvm::ArrayType* array_ty = nullptr;
+    // Flat leaf-element index (i32) into `array_ty`, accumulated across nested
+    // ElemSelects; null when the target is a plain signal / frame local.
+    llvm::Value* elem_idx = nullptr;
+    // Full storage width in bits (the leaf element width for a memory).
     uint32_t store_width = 0;
-    // Runtime byte offset added to both off_mm and off_z, selecting an unpacked
-    // array element (null when the target is a plain signal / frame local).
-    llvm::Value* dyn_off = nullptr;
     // Bit offset of the selection within the storage (i32).
     llvm::Value* bit_off = nullptr;
     // Selected width in bits (== store_width for a whole-storage target).
@@ -236,34 +246,37 @@ struct LValue {
     Signal sig{ 0 };
 };
 
-// Per-signal placement in the state buffer plus its cached layout facts. A
-// signal occupies two fields: the packed i(2W) must|may word at `off_mm` and the
-// iW z word at `off_z` (both absolute byte offsets into the buffer).
+// Per-signal placement in the state struct plus its cached layout facts. A
+// signal owns one `{ i(2W) must|may, iW z }` slot struct (an unpacked array an
+// `[elem_count x slot]` of leaf slots), reached from the root state pointer by
+// the constant GEP field indices in `path`.
 struct SignalSlot {
-    uint32_t off_mm     = 0;
-    uint32_t off_z      = 0;
+    // The leaf slot type `{ i(2W), iW }` (of the element, for a memory).
+    llvm::StructType* slot_ty = nullptr;
+    // The signal's whole storage: slot_ty, or `[elem_count x slot_ty]`.
+    llvm::Type* storage_ty = nullptr;
+    // GEP field indices from the root state struct to this signal's storage.
+    std::vector<uint32_t> path;
     uint32_t width      = 0;
     bool     four_state = false;
     bool     is_signed  = false;
-    // Unpacked array (memory): `width` is the leaf element width and off_mm/off_z
-    // address element 0. `elem_stride` is the per-element byte size (one leaf
-    // slot); `elem_count` is the total leaf-element count (product of all
-    // dimensions). The region spans elem_count * elem_stride bytes.
-    bool     is_array    = false;
-    uint32_t elem_stride = 0;
-    uint32_t elem_count  = 0;
+    // Unpacked array (memory): `width` is the leaf element width; `elem_count`
+    // the total leaf-element count (product of all dimensions).
+    bool     is_array   = false;
+    uint32_t elem_count = 0;
     // Nonblocking-assignment staging. Set only for signals that are NBA targets.
-    // A target gets a shadow `{ i(2W) nmm, iW nz }` mirroring its live slot; a
-    // target with any bit/part-select site also gets an iW dirty `mask`. nba_id is
-    // a dense index into the pending flags / meta table; nba_bucket indexes the
-    // per-(width, partial) commit worklist.
-    bool     nba         = false;
-    bool     nba_partial = false;
-    uint32_t nba_id      = 0;
-    uint32_t nba_bucket  = 0;
-    uint32_t off_nmm     = 0;
-    uint32_t off_nz      = 0;
-    uint32_t off_mask    = 0;
+    // A target gets shadow `i(2W)` / `iW` fields mirroring its live slot in the
+    // root's shadow struct; a target with any bit/part-select site also gets an
+    // iW dirty mask field. nba_id is a dense index into the pending flags / meta
+    // table; nba_bucket indexes the per-(width, partial) commit worklist; the
+    // sh_* members are field indices into the shadow struct.
+    bool     nba           = false;
+    bool     nba_partial   = false;
+    uint32_t nba_id        = 0;
+    uint32_t nba_bucket    = 0;
+    uint32_t sh_mm_field   = 0;
+    uint32_t sh_z_field    = 0;
+    uint32_t sh_mask_field = 0;
 };
 
 // One NBA commit bucket: every NBA-target signal of a given width and partial-ness
@@ -278,14 +291,14 @@ struct NbaBucket {
     llvm::GlobalVariable* top  = nullptr; // i32 live count
 };
 
-// Placement of one function-frame local: byte offsets of its `{ i(2W) must|may,
-// iW z }` pair within the per-call frame buffer, plus its width / domain. Mirrors
-// SignalSlot but with no wait-queue / NBA machinery (frame locals have neither).
+// One function-frame local: its `{ i(2W), iW }` slot type and width / domain.
+// The frame is an LLVM struct with one field per local, in Local-handle order,
+// so the local's index IS its GEP field index. No wait-queue / NBA machinery
+// (frame locals have neither).
 struct FrameSlot {
-    uint32_t off_mm     = 0;
-    uint32_t off_z      = 0;
-    uint32_t width      = 0;
-    bool     four_state = false;
+    llvm::StructType* slot_ty    = nullptr;
+    uint32_t          width      = 0;
+    bool              four_state = false;
 };
 
 // Raised on a construct the backend cannot lower; caught at the top level.
@@ -305,7 +318,7 @@ public:
       , b_(ctx) {}
 
     void run() {
-        build_state_layout();
+        build_state_types();
         build_wait_queues();
         build_sched_flags();
         build_nba_state();
@@ -378,55 +391,103 @@ private:
         return sign ? b_.CreateSExt(v, int_ty(to)) : b_.CreateZExt(v, int_ty(to));
     }
 
-    // -- State buffer layout --
+    // -- State types --
 
-    // Byte size and natural alignment (capped at 8) of an integer field of the
-    // given bit width, both derived from the canonical plane sizing.
-    static uint32_t field_bytes(uint32_t bits) {
-        return plane_bytes(bits);
-    }
-    static uint32_t field_align(uint32_t bits) {
-        return std::min<uint32_t>(8, plane_bytes(bits));
-    }
-    static uint32_t round_up(uint32_t x, uint32_t a) {
-        return (x + a - 1) & ~(a - 1);
-    }
-
-    // Byte size of one runtime storage slot for a scalar value of `width` bits:
-    // the i(2W) must|may word plus the i(W) z word, with the same field padding
-    // build_state_layout uses for a plain signal.
-    static uint32_t slot_bytes(uint32_t width) {
-        const uint32_t mm_bits = 2 * width;
-        const uint32_t z_rel   = round_up(field_bytes(mm_bits), field_align(width));
-        return round_up(z_rel + field_bytes(width), field_align(mm_bits));
-    }
-    // Byte offset of the z word within a scalar slot of `width` bits.
-    static uint32_t slot_z_rel(uint32_t width) {
-        return round_up(field_bytes(2 * width), field_align(width));
+    // The `{ i(2W) must|may, iW z }` slot struct for a value of the given width
+    // and domain. Identified and memoized per (width, domain) so every signal of
+    // one type shares one named LLVM type (%logic.8, %bit.4, ...). Both domains
+    // share the layout — a 2-state signal still stores a (constant-zero) z word —
+    // but distinct names keep the emitted IR self-describing.
+    llvm::StructType* slot_type(uint32_t width, bool four_state) {
+        for (const auto& [w, four, ty] : slot_types_) {
+            if (w == width && four == four_state) {
+                return ty;
+            }
+        }
+        const std::string name = (four_state ? "logic." : "bit.") + std::to_string(width);
+        auto* ty = llvm::StructType::create(ctx_, { int_ty(2 * width), int_ty(width) }, name);
+        slot_types_.emplace_back(width, four_state, ty);
+        return ty;
     }
 
-    // Total byte size of an unpacked-array (or scalar) type's element-addressed
-    // storage: count * element storage, recursing through nested array
-    // dimensions down to a scalar leaf slot.
-    uint32_t array_storage_bytes(Ref type) const {
+    // Total leaf-element count of an unpacked-array type (product of all
+    // dimensions); 1 for a scalar leaf.
+    uint32_t array_leaf_count(Ref type) const {
         const Type& t = std::get<Type>(mod_.pool.get(type));
         if (t.kind == Type::Kind::UnpackedArray) {
             const uint32_t count = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
-            return count * array_storage_bytes(t.element);
+            return count * array_leaf_count(t.element);
         }
-        return slot_bytes(mod_.pool.layout(type).width);
+        return 1;
     }
 
-    // Lay out the single module's signals into one opaque byte buffer. Each signal
-    // owns a `{ i(2W) must|may, iW z }` slot; slots are packed in decreasing
-    // alignment order (stable on declaration order) so padding stays minimal.
-    // `slots_` stays indexed by signal handle — only the byte offsets reflect the
-    // packed order.
-    void build_state_layout() {
+    // Byte offset of a GEP field-index path from the root state struct, per the
+    // module's DataLayout. Used where the runtime needs raw offsets (the NBA
+    // commit loop's meta table).
+    uint32_t path_offset(std::span<const uint32_t> path) const {
+        const llvm::DataLayout& dl  = llmod_.getDataLayout();
+        llvm::Type*             ty  = state_ty_;
+        uint64_t                off = 0;
+        for (const uint32_t f : path) {
+            if (auto* st = llvm::dyn_cast<llvm::StructType>(ty)) {
+                off += dl.getStructLayout(st)->getElementOffset(f);
+                ty = st->getElementType(f);
+            } else {
+                auto* at = llvm::cast<llvm::ArrayType>(ty);
+                off += f * dl.getTypeAllocSize(at->getElementType());
+                ty = at->getElementType();
+            }
+        }
+        return static_cast<uint32_t>(off);
+    }
+
+    // Build one instance scope's state struct: its signals' slots (field k ==
+    // scope signal k), then one field per child instance. Assigns every covered
+    // signal's GEP path; `path` holds the field indices from the root to this
+    // scope. Struct types are deduplicated per module definition — instances of
+    // one definition (same parameterization) produce identical field lists and
+    // share one identified type, so the type is replicated per instantiation.
+    llvm::StructType* scope_type(const InstanceScope& scope, std::vector<uint32_t>& path,
+                                 std::vector<bool>& claimed) {
+        std::vector<llvm::Type*> fields;
+        for (uint32_t k = 0; k < scope.signals.size(); ++k) {
+            const auto si = static_cast<uint32_t>(scope.signals[k]);
+            if (si >= slots_.size() || claimed[si]) {
+                throw BackendError{ "malformed instance hierarchy: signal claimed twice" };
+            }
+            claimed[si] = true;
+            slots_[si].path = path;
+            slots_[si].path.push_back(k);
+            fields.push_back(slots_[si].storage_ty);
+        }
+        const auto nsig = static_cast<uint32_t>(scope.signals.size());
+        for (uint32_t c = 0; c < scope.children.size(); ++c) {
+            path.push_back(nsig + c);
+            fields.push_back(scope_type(scope.children[c], path, claimed));
+            path.pop_back();
+        }
+
+        for (const auto& [def, flds, ty] : def_types_) {
+            if (def == scope.def_name && flds == fields) {
+                return ty;
+            }
+        }
+        auto* ty = llvm::StructType::create(ctx_, fields, scope.def_name + ".state");
+        def_types_.emplace_back(scope.def_name, fields, ty);
+        return ty;
+    }
+
+    // Build the design's state types: per-signal slot / storage types, one
+    // struct per module definition composed nested along the instance tree, and
+    // the root `%clotho.state` = { <top instances...>, <unscoped signals...>,
+    // <NBA shadow struct> }. Unscoped signals only occur for a module built
+    // without hierarchy info (they form one flat root scope). The NBA shadow
+    // region lives at the root, not inside the definition structs, because
+    // staging is a backend artifact of which signals the design nonblocking-
+    // assigns, not part of a module's declared state.
+    void build_state_types() {
         const auto sigs = mod_.signals();
         slots_.resize(sigs.size());
-
-        std::vector<uint32_t> order(sigs.size());
         for (uint32_t i = 0; i < sigs.size(); ++i) {
             const Layout lay = mod_.pool.layout(sigs[i].type);
             const Type&  ty  = std::get<Type>(mod_.pool.get(sigs[i].type));
@@ -435,66 +496,55 @@ private:
             slot.width       = lay.width == 0 ? 1 : lay.width;
             slot.four_state  = lay.domain == Domain::Four;
             slot.is_signed   = ty.is_signed;
-            order[i]         = i;
+            slot.slot_ty     = slot_type(slot.width, slot.four_state);
+            if (ty.kind == Type::Kind::UnpackedArray) {
+                slot.is_array   = true;
+                slot.elem_count = array_leaf_count(sigs[i].type);
+                slot.storage_ty = llvm::ArrayType::get(slot.slot_ty, slot.elem_count);
+            } else {
+                slot.storage_ty = slot.slot_ty;
+            }
         }
-
-        // Stable sort by slot alignment (= align of the 2W must|may word) desc.
-        std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-            return field_align(2 * slots_[a].width) > field_align(2 * slots_[b].width);
-        });
 
         nba_classify();
 
-        uint32_t cursor = 0;
-        for (uint32_t i : order) {
-            SignalSlot&    slot       = slots_[i];
-            const uint32_t mm_bits    = 2 * slot.width;
-            const uint32_t slot_align = field_align(mm_bits);
-            const uint32_t z_rel      = round_up(field_bytes(mm_bits), field_align(slot.width));
-
-            cursor      = round_up(cursor, slot_align);
-            slot.off_mm = cursor;
-            slot.off_z  = cursor + z_rel;
-
-            const Type& ty = std::get<Type>(mod_.pool.get(sigs[i].type));
-            if (ty.kind == Type::Kind::UnpackedArray) {
-                // Element-addressed memory: a contiguous run of `elem_count` leaf
-                // slots. off_mm/off_z address element 0; an ElemSelect shifts by
-                // index * elem_stride at runtime. slot.width is the leaf element
-                // width (set from the recursive layout above).
-                const uint32_t total = array_storage_bytes(sigs[i].type);
-                slot.is_array        = true;
-                slot.elem_stride     = slot_bytes(slot.width);
-                slot.elem_count      = slot.elem_stride == 0 ? 0 : total / slot.elem_stride;
-                cursor += total;
-            } else {
-                cursor += round_up(z_rel + field_bytes(slot.width), slot_align);
-            }
+        std::vector<llvm::Type*> root_fields;
+        std::vector<bool>        claimed(sigs.size(), false);
+        for (const InstanceScope& top : mod_.tops()) {
+            std::vector<uint32_t> path{ static_cast<uint32_t>(root_fields.size()) };
+            root_fields.push_back(scope_type(top, path, claimed));
         }
-
-        // Shadow staging fields for NBA targets, placed after the live region in
-        // nba-id order (= signal order). A shadow mirrors the live `{ i(2W), iW }`;
-        // a partial target adds an iW dirty mask.
         for (uint32_t i = 0; i < sigs.size(); ++i) {
-            SignalSlot& slot = slots_[i];
-            if (!slot.nba) {
-                continue;
-            }
-            const uint32_t mm_bits = 2 * slot.width;
-            cursor        = round_up(cursor, field_align(mm_bits));
-            slot.off_nmm  = cursor;
-            cursor += field_bytes(mm_bits);
-            cursor        = round_up(cursor, field_align(slot.width));
-            slot.off_nz   = cursor;
-            cursor += field_bytes(slot.width);
-            if (slot.nba_partial) {
-                cursor       = round_up(cursor, field_align(slot.width));
-                slot.off_mask = cursor;
-                cursor += field_bytes(slot.width);
+            if (!claimed[i]) {
+                slots_[i].path = { static_cast<uint32_t>(root_fields.size()) };
+                root_fields.push_back(slots_[i].storage_ty);
             }
         }
 
-        state_bytes_ = std::max<uint32_t>(1, round_up(cursor, 8));
+        // Shadow staging fields for NBA targets, in nba-id order. A shadow
+        // mirrors the live i(2W) / iW planes; a partial target adds a dirty mask.
+        if (n_nba_ > 0) {
+            std::vector<llvm::Type*> sf;
+            for (uint32_t i = 0; i < sigs.size(); ++i) {
+                SignalSlot& slot = slots_[i];
+                if (!slot.nba) {
+                    continue;
+                }
+                slot.sh_mm_field = static_cast<uint32_t>(sf.size());
+                sf.push_back(int_ty(2 * slot.width));
+                slot.sh_z_field = static_cast<uint32_t>(sf.size());
+                sf.push_back(int_ty(slot.width));
+                if (slot.nba_partial) {
+                    slot.sh_mask_field = static_cast<uint32_t>(sf.size());
+                    sf.push_back(int_ty(slot.width));
+                }
+            }
+            shadow_ty_    = llvm::StructType::create(ctx_, sf, "clotho.nba.shadow");
+            shadow_field_ = static_cast<uint32_t>(root_fields.size());
+            root_fields.push_back(shadow_ty_);
+        }
+
+        state_ty_ = llvm::StructType::create(ctx_, root_fields, "clotho.state");
     }
 
     // Walk a StoreNb's lvalue chain to its root signal, reporting whether the
@@ -571,6 +621,41 @@ private:
 
     const SignalSlot& slot_of(Signal s) const {
         return slots_[static_cast<uint32_t>(s)];
+    }
+
+    // Pointer to a signal's whole storage (its slot struct, or its [N x slot]
+    // memory) within the state struct `base` points at: one constant-index GEP
+    // along the slot's field path.
+    llvm::Value* storage_ptr(llvm::Value* base, const SignalSlot& s) {
+        std::vector<llvm::Value*> idx;
+        idx.reserve(s.path.size() + 1);
+        idx.push_back(b_.getInt32(0));
+        for (const uint32_t f : s.path) {
+            idx.push_back(b_.getInt32(f));
+        }
+        return b_.CreateInBoundsGEP(state_ty_, base, idx);
+    }
+
+    // Pointer to one field of the root NBA shadow struct.
+    llvm::Value* shadow_ptr(uint32_t field) {
+        return b_.CreateInBoundsGEP(
+          state_ty_, state_, { b_.getInt32(0), b_.getInt32(shadow_field_), b_.getInt32(field) });
+    }
+
+    // Pointer to an lvalue's mm (field 0) or z (field 1) word, resolving the
+    // selected leaf element for a memory target.
+    llvm::Value* lv_field_ptr(const LValue& lv, uint32_t field) {
+        if (lv.array_ty != nullptr) {
+            llvm::Value* idx = lv.elem_idx != nullptr ? lv.elem_idx : b_.getInt32(0);
+            return b_.CreateInBoundsGEP(lv.array_ty, lv.base, { b_.getInt32(0), idx, b_.getInt32(field) });
+        }
+        return b_.CreateStructGEP(lv.slot_ty, lv.base, field);
+    }
+    llvm::Value* lv_mm_ptr(const LValue& lv) {
+        return lv_field_ptr(lv, 0);
+    }
+    llvm::Value* lv_z_ptr(const LValue& lv) {
+        return lv_field_ptr(lv, 1);
     }
 
     // -- Per-process lowering --
@@ -812,48 +897,34 @@ private:
         return 2 + 2 * static_cast<uint32_t>(f.param_types.size());
     }
 
-    // Lay out a function's frame locals into one stack buffer, packed in
-    // decreasing alignment order (same scheme as build_state_layout, minus the
-    // wait-queue / NBA shadows that frame locals never need).
+    // Build a function's frame struct: one slot field per local, in Local-handle
+    // order (a Local's index is its GEP field index).
     void build_frame_layout(const Function& f) {
         const size_t n = f.local_types.size();
         frame_slots_.assign(n, FrameSlot{});
-        std::vector<uint32_t> order(n);
+        std::vector<llvm::Type*> fields(n);
         for (uint32_t i = 0; i < n; ++i) {
-            const Layout lay     = mod_.pool.layout(f.local_types[i]);
+            const Layout lay           = mod_.pool.layout(f.local_types[i]);
             frame_slots_[i].width      = lay.width == 0 ? 1 : lay.width;
             frame_slots_[i].four_state = lay.domain == Domain::Four;
-            order[i]                   = i;
+            frame_slots_[i].slot_ty    = slot_type(frame_slots_[i].width, frame_slots_[i].four_state);
+            fields[i]                  = frame_slots_[i].slot_ty;
         }
-        std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-            return field_align(2 * frame_slots_[a].width) > field_align(2 * frame_slots_[b].width);
-        });
-
-        uint32_t cursor = 0;
-        for (uint32_t i : order) {
-            FrameSlot&     s          = frame_slots_[i];
-            const uint32_t mm_bits    = 2 * s.width;
-            const uint32_t slot_align = field_align(mm_bits);
-            const uint32_t z_rel      = round_up(field_bytes(mm_bits), field_align(s.width));
-            const uint32_t slot_size  = round_up(z_rel + field_bytes(s.width), slot_align);
-            cursor                    = round_up(cursor, slot_align);
-            s.off_mm                  = cursor;
-            s.off_z                   = cursor + z_rel;
-            cursor += slot_size;
-        }
-        frame_bytes_ = std::max<uint32_t>(1, round_up(cursor, 8));
+        frame_ty_ = llvm::StructType::create(ctx_, fields, mod_.name + ".fn." + f.name + ".frame");
     }
 
     // Power up the frame: 4-state locals come up X (must 0, may 1), 2-state 0; z
     // is cleared. Formal-parameter locals are immediately overwritten by copy-in;
     // an unwritten return variable thus reads X (its uninitialized value).
     void init_frame() {
-        for (const FrameSlot& s : frame_slots_) {
-            llvm::Value* mm = s.four_state
-                                ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * s.width, s.width))
-                                : zero(2 * s.width);
-            b_.CreateAlignedStore(mm, field_ptr(frame_, s.off_mm), llvm::Align(field_align(2 * s.width)));
-            b_.CreateAlignedStore(zero(s.width), field_ptr(frame_, s.off_z), llvm::Align(field_align(s.width)));
+        for (uint32_t i = 0; i < frame_slots_.size(); ++i) {
+            const FrameSlot& s    = frame_slots_[i];
+            llvm::Value*     slot = b_.CreateStructGEP(frame_ty_, frame_, i);
+            llvm::Value*     mm   = s.four_state
+                                      ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * s.width, s.width))
+                                      : zero(2 * s.width);
+            b_.CreateStore(mm, b_.CreateStructGEP(s.slot_ty, slot, 0));
+            b_.CreateStore(zero(s.width), b_.CreateStructGEP(s.slot_ty, slot, 1));
         }
     }
 
@@ -879,10 +950,7 @@ private:
         state_->setName("state");
         fn_->addParamAttr(0, llvm::Attribute::NoAlias);
 
-        auto* buf_ty = llvm::ArrayType::get(b_.getInt8Ty(), frame_bytes_);
-        auto* frame  = b_.CreateAlloca(buf_ty, nullptr, "frame");
-        frame->setAlignment(llvm::Align(8));
-        frame_ = frame;
+        frame_ = b_.CreateAlloca(frame_ty_, nullptr, "frame");
         init_frame();
 
         lower_region(ir_->root());
@@ -956,9 +1024,7 @@ private:
         // coro.begin so CoroSplit spills them into the coroutine frame (both live
         // across suspends; the frame's address escapes to callees). The flag backs
         // intra-body @event waits, exactly like a process's proc_sched slot.
-        auto* fbuf_ty = llvm::ArrayType::get(b_.getInt8Ty(), frame_bytes_);
-        frame_        = b_.CreateAlloca(fbuf_ty, nullptr, "frame");
-        llvm::cast<llvm::AllocaInst>(frame_)->setAlignment(llvm::Align(8));
+        frame_     = b_.CreateAlloca(frame_ty_, nullptr, "frame");
         sched_ptr_ = b_.CreateAlloca(b_.getInt32Ty(), nullptr, "task_sched");
 
         auto* trap_bb    = llvm::BasicBlock::Create(ctx_, "coro.trap", fn_);
@@ -1040,10 +1106,8 @@ private:
             if (f.arg_dirs[k] == ArgDir::In) {
                 lower_store(local_lvalue(k), Plane{ fn_->getArg(base), fn_->getArg(base + 1) }, from_ref(f.param_types[k]));
             } else if (f.arg_dirs[k] == ArgDir::Inout) {
-                llvm::Value* mm =
-                  b_.CreateAlignedLoad(int_ty(2 * w), fn_->getArg(base), llvm::Align(field_align(2 * w)));
-                llvm::Value* z =
-                  b_.CreateAlignedLoad(int_ty(w), fn_->getArg(base + 1), llvm::Align(field_align(w)));
+                llvm::Value* mm = b_.CreateLoad(int_ty(2 * w), fn_->getArg(base));
+                llvm::Value* z  = b_.CreateLoad(int_ty(w), fn_->getArg(base + 1));
                 lower_store(local_lvalue(k), Plane{ mm, z }, from_ref(f.param_types[k]));
             }
         }
@@ -1056,11 +1120,10 @@ private:
             if (f.arg_dirs[k] == ArgDir::In) {
                 continue;
             }
-            const uint32_t w    = width_of(f.param_types[k]);
             const uint32_t base = task_param_base(k);
             const Plane    v    = lower_load(local_lvalue(k));
-            b_.CreateAlignedStore(v.mm, fn_->getArg(base), llvm::Align(field_align(2 * w)));
-            b_.CreateAlignedStore(v.z, fn_->getArg(base + 1), llvm::Align(field_align(w)));
+            b_.CreateStore(v.mm, fn_->getArg(base));
+            b_.CreateStore(v.z, fn_->getArg(base + 1));
         }
     }
 
@@ -1265,9 +1328,7 @@ private:
         auto* entry = llvm::BasicBlock::Create(ctx_, "entry", main);
         b_.SetInsertPoint(entry);
 
-        auto*           buf_ty = llvm::ArrayType::get(b_.getInt8Ty(), state_bytes_);
-        llvm::AllocaInst* state  = b_.CreateAlloca(buf_ty, nullptr, "state");
-        state->setAlignment(llvm::Align(8));
+        llvm::AllocaInst* state = b_.CreateAlloca(state_ty_, nullptr, "state");
         init_state(state);
 
         // Timing wheel: the event scheduler. Processes schedule timers on it at
@@ -1500,7 +1561,11 @@ private:
                                                    llvm::ConstantAggregateZero::get(nba_pending_ty_),
                                                    "clotho.nba_pending");
 
-        // Constant metadata, one record per nba-id (signal order, matching nba_id).
+        // Constant metadata, one record per nba-id (signal order, matching
+        // nba_id). The commit loop walks state with runtime byte offsets read
+        // from here, so the DataLayout offsets of the typed fields are baked in
+        // as i32 constants.
+        const llvm::DataLayout&      dlay = llmod_.getDataLayout();
         auto*                        nullp = llvm::ConstantPointerNull::get(ptr);
         std::vector<llvm::Constant*> metas;
         for (uint32_t i = 0; i < sigs.size(); ++i) {
@@ -1508,6 +1573,17 @@ private:
             if (!s.nba) {
                 continue;
             }
+            const uint32_t live_off = path_offset(s.path);
+            const uint64_t z_rel    = dlay.getStructLayout(s.slot_ty)->getElementOffset(1);
+            const std::array<uint32_t, 2> sh_mm_path{ shadow_field_, s.sh_mm_field };
+            const std::array<uint32_t, 2> sh_z_path{ shadow_field_, s.sh_z_field };
+            const std::array<uint32_t, 2> sh_mask_path{ shadow_field_, s.sh_mask_field };
+            const uint32_t off_mm   = live_off;
+            const uint32_t off_z    = live_off + static_cast<uint32_t>(z_rel);
+            const uint32_t off_nmm  = path_offset(sh_mm_path);
+            const uint32_t off_nz   = path_offset(sh_z_path);
+            const uint32_t off_mask = s.nba_partial ? path_offset(sh_mask_path) : 0;
+
             std::array<llvm::Constant*, 3> sb{}, sc{}, db{}, dl{};
             for (uint32_t e = 0; e < 3; ++e) {
                 sb[e] = wait_sta_gv_[i][e] ? llvm::cast<llvm::Constant>(wait_sta_gv_[i][e]) : nullp;
@@ -1516,9 +1592,9 @@ private:
                 dl[e] = wait_dyn_len_gv_[i][e] ? llvm::cast<llvm::Constant>(wait_dyn_len_gv_[i][e]) : nullp;
             }
             metas.push_back(llvm::ConstantStruct::get(
-              nba_meta_ty_, { llvm::ConstantInt::get(i32, s.off_mm), llvm::ConstantInt::get(i32, s.off_z),
-                              llvm::ConstantInt::get(i32, s.off_nmm), llvm::ConstantInt::get(i32, s.off_nz),
-                              llvm::ConstantInt::get(i32, s.off_mask), llvm::ConstantArray::get(arr3p, sb),
+              nba_meta_ty_, { llvm::ConstantInt::get(i32, off_mm), llvm::ConstantInt::get(i32, off_z),
+                              llvm::ConstantInt::get(i32, off_nmm), llvm::ConstantInt::get(i32, off_nz),
+                              llvm::ConstantInt::get(i32, off_mask), llvm::ConstantArray::get(arr3p, sb),
                               llvm::ConstantArray::get(arr3i, sc), llvm::ConstantArray::get(arr3p, db),
                               llvm::ConstantArray::get(arr3p, dl) }));
         }
@@ -1540,21 +1616,12 @@ private:
         return false;
     }
 
-    // Load a signal's packed must|may state word (the i(2W) at off_mm).
-    llvm::Value* load_mm(Signal sig) {
-        const SignalSlot& s = slot_of(sig);
-        return b_.CreateAlignedLoad(
-          int_ty(2 * s.width), field_ptr(state_, s.off_mm), llvm::Align(field_align(2 * s.width)));
-    }
-
     // Load the packed must|may word of an lvalue's selected storage: the whole
-    // signal for a plain target, or one element for an unpacked-array element
-    // (dyn_off-aware). Used to snapshot old / new state around a blocking store so
-    // wait-queue servicing detects an element-level change, not just element 0.
+    // signal for a plain target, or one element for an unpacked-array element.
+    // Used to snapshot old / new state around a blocking store so wait-queue
+    // servicing detects an element-level change, not just element 0.
     llvm::Value* load_lv_mm(const LValue& lv) {
-        const uint32_t w = lv.store_width;
-        return b_.CreateAlignedLoad(int_ty(2 * w), elem_ptr(lv.base, lv.off_mm, lv.dyn_off),
-                                    llvm::Align(field_align(2 * w)));
+        return b_.CreateLoad(int_ty(2 * lv.store_width), lv_mm_ptr(lv));
     }
 
     // Service a signal's wait queues after a blocking assignment to it. Computes
@@ -1977,8 +2044,10 @@ private:
         auto*             i32   = b_.getInt32Ty();
         auto*             mmty  = int_ty(2 * W);
         auto*             zty   = int_ty(W);
-        const llvm::Align mm_al = llvm::Align(field_align(2 * W));
-        const llvm::Align z_al  = llvm::Align(field_align(W));
+        // The runtime-offset i8 GEPs below erase the field types, so the loads/
+        // stores carry the fields' ABI alignment explicitly.
+        const llvm::Align mm_al = llmod_.getDataLayout().getABITypeAlign(mmty);
+        const llvm::Align z_al  = llmod_.getDataLayout().getABITypeAlign(zty);
 
         auto*        fn    = b_.GetInsertBlock()->getParent();
         auto*        head  = llvm::BasicBlock::Create(ctx_, "ncommit.head", fn);
@@ -2338,12 +2407,16 @@ private:
             llvm::Value* mm = s.four_state
                                 ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * s.width, s.width))
                                 : zero(2 * s.width);
-            b_.CreateAlignedStore(mm, field_ptr(state, s.off_mm), llvm::Align(field_align(2 * s.width)));
-            b_.CreateAlignedStore(zero(s.width), field_ptr(state, s.off_z), llvm::Align(field_align(s.width)));
+            llvm::Value* slot = storage_ptr(state, s);
+            b_.CreateStore(mm, b_.CreateStructGEP(s.slot_ty, slot, 0));
+            b_.CreateStore(zero(s.width), b_.CreateStructGEP(s.slot_ty, slot, 1));
             // A partial target's dirty mask must start clear; the shadow itself is
             // written before it is read, so it needs no initialisation.
             if (s.nba_partial) {
-                b_.CreateAlignedStore(zero(s.width), field_ptr(state, s.off_mask), llvm::Align(field_align(s.width)));
+                b_.CreateStore(zero(s.width),
+                               b_.CreateInBoundsGEP(state_ty_, state,
+                                                    { b_.getInt32(0), b_.getInt32(shadow_field_),
+                                                      b_.getInt32(s.sh_mask_field) }));
             }
         }
     }
@@ -2353,13 +2426,13 @@ private:
     // each leaf slot. A loop keeps init O(elem_count) emitted instructions, so a
     // large memory does not bloat the IR.
     void emit_array_init(llvm::Value* state, const SignalSlot& s) {
-        const uint32_t w  = s.width;
+        const uint32_t w   = s.width;
         auto*          i32 = b_.getInt32Ty();
-        llvm::Value*   mm = s.four_state
-                              ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w))
-                              : zero(2 * w);
-        const llvm::Align mm_al = llvm::Align(field_align(2 * w));
-        const llvm::Align z_al  = llvm::Align(field_align(w));
+        llvm::Value*   mm  = s.four_state
+                               ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w))
+                               : zero(2 * w);
+        auto*        arr_ty = llvm::cast<llvm::ArrayType>(s.storage_ty);
+        llvm::Value* base   = storage_ptr(state, s);
 
         auto* fn    = b_.GetInsertBlock()->getParent();
         auto* head  = llvm::BasicBlock::Create(ctx_, "ainit.head", fn);
@@ -2374,33 +2447,20 @@ private:
         b_.CreateCondBr(b_.CreateICmpULT(idx, b_.getInt32(s.elem_count)), body, done);
 
         b_.SetInsertPoint(body);
-        llvm::Value* byte_off = b_.CreateMul(idx, b_.getInt32(s.elem_stride));
-        llvm::Value* mp       = field_ptr_var(field_ptr(state, s.off_mm), byte_off);
-        llvm::Value* zp       = field_ptr_var(field_ptr(state, s.off_z), byte_off);
-        b_.CreateAlignedStore(mm, mp, mm_al);
-        b_.CreateAlignedStore(zero(w), zp, z_al);
+        b_.CreateStore(mm, b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), idx, b_.getInt32(0) }));
+        b_.CreateStore(zero(w), b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), idx, b_.getInt32(1) }));
         idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), body);
         b_.CreateBr(head);
 
         b_.SetInsertPoint(done);
     }
 
-    // Pointer to a state field at a constant byte offset (a folded i8 GEP).
-    llvm::Value* field_ptr(llvm::Value* base, uint32_t off) {
-        return b_.CreateConstInBoundsGEP1_32(b_.getInt8Ty(), base, off);
-    }
-    // Pointer to a state field at a runtime byte offset (NBA commit reads offsets
-    // from the meta table). The base is 8-aligned and offsets are field-aligned, so
-    // accesses stay naturally aligned even though the GEP is dynamic.
+    // Pointer to a state field at a runtime byte offset (the NBA commit loop
+    // reads its offsets from the meta table, erasing the field types). Offsets
+    // are DataLayout field offsets, so accesses stay naturally aligned even
+    // though the GEP is dynamic.
     llvm::Value* field_ptr_var(llvm::Value* base, llvm::Value* off) {
         return b_.CreateInBoundsGEP(b_.getInt8Ty(), base, off);
-    }
-    // Pointer to an lvalue field: the constant field offset, plus the runtime
-    // element byte offset for an unpacked-array element (null for a plain target).
-    // The element stride is field-aligned, so the access stays naturally aligned.
-    llvm::Value* elem_ptr(llvm::Value* base, uint32_t off, llvm::Value* dyn_off) {
-        llvm::Value* p = field_ptr(base, off);
-        return dyn_off != nullptr ? field_ptr_var(p, dyn_off) : p;
     }
 
     // Lower a region's instructions in order into the current insert block. A `ret`
@@ -2618,15 +2678,17 @@ private:
                 return;
             }
             case Inst::Tag::ElemSelect: {
-                // Advance the lvalue's runtime byte offset to the selected element:
-                // dyn_off += normalized_index * element_stride. The base lvalue's
-                // off_mm/off_z and store_width already describe a leaf element (set
-                // by the array's signal slot), so this only shifts to the element
-                // and resets any inherited bit offset.
-                LValue      lv = lvalue_of(p.op_extra.op);
-                const auto  es = ir_->extra_data<ElemSelect>(p.op_extra.extra);
-                const Type& at = std::get<Type>(mod_.pool.get(es.array_type));
-                const uint32_t stride = array_storage_bytes(at.element);
+                // Advance the lvalue's flat leaf index to the selected element:
+                // elem_idx += normalized_index * leaf-elements-per-selected-element
+                // (1 for a leaf select; the inner dimensions' product for an outer
+                // dimension of a multidimensional memory). The base lvalue's
+                // slot_ty and store_width already describe a leaf element (set by
+                // the array's signal slot), so this only shifts to the element and
+                // resets any inherited bit offset.
+                LValue         lv     = lvalue_of(p.op_extra.op);
+                const auto     es     = ir_->extra_data<ElemSelect>(p.op_extra.extra);
+                const Type&    at     = std::get<Type>(mod_.pool.get(es.array_type));
+                const uint32_t stride = array_leaf_count(at.element);
                 // TODO: an X/Z or out-of-range index uses only its must bits, so it
                 // selects a wrong / out-of-bounds element. LRM: an out-of-range read
                 // yields X and such a write is a no-op.
@@ -2634,9 +2696,9 @@ private:
                 // Normalize the declared-range coordinate to a 0-based position.
                 llvm::Value* norm = at.left <= at.right ? b_.CreateSub(idx, b_.getInt32(at.left))
                                                         : b_.CreateSub(b_.getInt32(at.left), idx);
-                llvm::Value* byte_off = b_.CreateMul(norm, b_.getInt32(stride));
-                lv.dyn_off            = lv.dyn_off != nullptr ? b_.CreateAdd(lv.dyn_off, byte_off) : byte_off;
-                lv.bit_off            = b_.getInt32(0);
+                llvm::Value* off  = stride == 1 ? norm : b_.CreateMul(norm, b_.getInt32(stride));
+                lv.elem_idx       = lv.elem_idx != nullptr ? b_.CreateAdd(lv.elem_idx, off) : off;
+                lv.bit_off        = b_.getInt32(0);
                 set_lvalue(i, lv);
                 return;
             }
@@ -2884,12 +2946,12 @@ private:
 
     // -- State access --
 
-    // Whole-storage lvalue for a module signal (state buffer).
+    // Whole-storage lvalue for a module signal (state struct).
     LValue signal_lvalue(Signal sig) {
         const SignalSlot& s = slot_of(sig);
-        return LValue{ .base        = state_,
-                       .off_mm      = s.off_mm,
-                       .off_z       = s.off_z,
+        return LValue{ .base        = storage_ptr(state_, s),
+                       .slot_ty     = s.slot_ty,
+                       .array_ty    = s.is_array ? llvm::cast<llvm::ArrayType>(s.storage_ty) : nullptr,
                        .store_width = s.width,
                        .bit_off     = b_.getInt32(0),
                        .width       = s.width,
@@ -2897,12 +2959,11 @@ private:
                        .sig         = sig };
     }
 
-    // Whole-storage lvalue for a function-frame local (per-call frame buffer).
+    // Whole-storage lvalue for a function-frame local (per-call frame struct).
     LValue local_lvalue(uint32_t index) {
         const FrameSlot& s = frame_slots_[index];
-        return LValue{ .base        = frame_,
-                       .off_mm      = s.off_mm,
-                       .off_z       = s.off_z,
+        return LValue{ .base        = b_.CreateStructGEP(frame_ty_, frame_, index),
+                       .slot_ty     = s.slot_ty,
                        .store_width = s.width,
                        .bit_off     = b_.getInt32(0),
                        .width       = s.width,
@@ -2911,11 +2972,9 @@ private:
     }
 
     Plane lower_load(const LValue& lv) {
-        const uint32_t    w  = lv.store_width;
-        llvm::Value*      mm = b_.CreateAlignedLoad(
-          int_ty(2 * w), elem_ptr(lv.base, lv.off_mm, lv.dyn_off), llvm::Align(field_align(2 * w)));
-        llvm::Value* z =
-          b_.CreateAlignedLoad(int_ty(w), elem_ptr(lv.base, lv.off_z, lv.dyn_off), llvm::Align(field_align(w)));
+        const uint32_t w  = lv.store_width;
+        llvm::Value*   mm = b_.CreateLoad(int_ty(2 * w), lv_mm_ptr(lv));
+        llvm::Value*   z  = b_.CreateLoad(int_ty(w), lv_z_ptr(lv));
         if (lv.width == w && is_zero_const(lv.bit_off)) {
             return { mm, z };
         }
@@ -2928,33 +2987,30 @@ private:
     }
 
     void lower_store(const LValue& lv, Plane rhs, ValType rhs_ty) {
-        const uint32_t    s_width = lv.store_width;
-        llvm::Value*      mp      = elem_ptr(lv.base, lv.off_mm, lv.dyn_off);
-        llvm::Value*      zp      = elem_ptr(lv.base, lv.off_z, lv.dyn_off);
-        const llvm::Align mm_al   = llvm::Align(field_align(2 * s_width));
-        const llvm::Align z_al    = llvm::Align(field_align(s_width));
+        const uint32_t s_width = lv.store_width;
+        llvm::Value*   mp      = lv_mm_ptr(lv);
+        llvm::Value*   zp      = lv_z_ptr(lv);
         (void)rhs_ty;
 
         // Whole-storage store: the frontend context-sizes the RHS to the lvalue
         // width (via an inserted Resize), so rhs already matches the storage width
         // and the planes store directly.
         if (lv.width == s_width && is_zero_const(lv.bit_off)) {
-            b_.CreateAlignedStore(rhs.mm, mp, mm_al);
-            b_.CreateAlignedStore(rhs.z, zp, z_al);
+            b_.CreateStore(rhs.mm, mp);
+            b_.CreateStore(rhs.z, zp);
             return;
         }
 
         // Partial store: read-modify-write each plane at the storage width.
-        const Plane  old =
-          { b_.CreateAlignedLoad(int_ty(2 * s_width), mp, mm_al), b_.CreateAlignedLoad(int_ty(s_width), zp, z_al) };
+        const Plane  old   = { b_.CreateLoad(int_ty(2 * s_width), mp), b_.CreateLoad(int_ty(s_width), zp) };
         llvm::Value* off   = cast(lv.bit_off, s_width, false);
         llvm::Value* mask  = b_.CreateShl(cast(ones(lv.width), s_width, false), off);
         llvm::Value* nmask = b_.CreateNot(mask);
         llvm::Value* must  = merge_bits(must_of(old), cast(must_of(rhs), s_width, false), off, mask, nmask);
         llvm::Value* may   = merge_bits(may_of(old), cast(may_of(rhs), s_width, false), off, mask, nmask);
         llvm::Value* z     = merge_bits(old.z, cast(rhs.z, s_width, false), off, mask, nmask);
-        b_.CreateAlignedStore(packed(must, may, z).mm, mp, mm_al);
-        b_.CreateAlignedStore(z, zp, z_al);
+        b_.CreateStore(packed(must, may, z).mm, mp);
+        b_.CreateStore(z, zp);
     }
 
     // Stage a nonblocking assignment: write the sampled RHS into the target's
@@ -2963,34 +3019,31 @@ private:
     // repeat NBAs to one signal in a slot accumulate in the shadow). No wait queues
     // are serviced here — that happens in the NBA region after the active drain.
     void lower_store_nb(const LValue& lv, Plane rhs) {
-        const SignalSlot& s    = slot_of(lv.sig);
-        const llvm::Align mm_al = llvm::Align(field_align(2 * s.width));
-        const llvm::Align z_al  = llvm::Align(field_align(s.width));
-        llvm::Value*      mp    = field_ptr(state_, s.off_nmm);
-        llvm::Value*      zp    = field_ptr(state_, s.off_nz);
+        const SignalSlot& s  = slot_of(lv.sig);
+        llvm::Value*      mp = shadow_ptr(s.sh_mm_field);
+        llvm::Value*      zp = shadow_ptr(s.sh_z_field);
 
         if (!s.nba_partial) {
             // Whole-signal target: the RHS is already signal-width (frontend Resize),
             // so the shadow planes store directly — no mask, no read-modify-write.
-            b_.CreateAlignedStore(rhs.mm, mp, mm_al);
-            b_.CreateAlignedStore(rhs.z, zp, z_al);
+            b_.CreateStore(rhs.mm, mp);
+            b_.CreateStore(rhs.z, zp);
         } else {
             // Partial-capable target: merge the selected bits into the shadow and OR
             // the touched bits into the dirty mask. A whole-signal site here selects
             // every bit, so it merges the full word and sets the whole mask.
-            llvm::Value* maskp = field_ptr(state_, s.off_mask);
-            const Plane  old   = { b_.CreateAlignedLoad(int_ty(2 * s.width), mp, mm_al),
-                                   b_.CreateAlignedLoad(int_ty(s.width), zp, z_al) };
+            llvm::Value* maskp = shadow_ptr(s.sh_mask_field);
+            const Plane  old   = { b_.CreateLoad(int_ty(2 * s.width), mp), b_.CreateLoad(int_ty(s.width), zp) };
             llvm::Value* off   = cast(lv.bit_off, s.width, false);
             llvm::Value* bmask = b_.CreateShl(cast(ones(lv.width), s.width, false), off);
             llvm::Value* nmask = b_.CreateNot(bmask);
             llvm::Value* must  = merge_bits(must_of(old), cast(must_of(rhs), s.width, false), off, bmask, nmask);
             llvm::Value* may   = merge_bits(may_of(old), cast(may_of(rhs), s.width, false), off, bmask, nmask);
             llvm::Value* z     = merge_bits(old.z, cast(rhs.z, s.width, false), off, bmask, nmask);
-            b_.CreateAlignedStore(packed(must, may, z).mm, mp, mm_al);
-            b_.CreateAlignedStore(z, zp, z_al);
-            llvm::Value* cur = b_.CreateAlignedLoad(int_ty(s.width), maskp, z_al);
-            b_.CreateAlignedStore(b_.CreateOr(cur, bmask), maskp, z_al);
+            b_.CreateStore(packed(must, may, z).mm, mp);
+            b_.CreateStore(z, zp);
+            llvm::Value* cur = b_.CreateLoad(int_ty(s.width), maskp);
+            b_.CreateStore(b_.CreateOr(cur, bmask), maskp);
         }
         emit_nba_enqueue(s);
     }
@@ -3044,8 +3097,8 @@ private:
         b_.CreateAlignedStore(zval, zvp, a1);
         b_.CreateAlignedStore(mask_w, zkp, a1);
 
-        llvm::Value*   mm_ptr   = elem_ptr(lv.base, lv.off_mm, lv.dyn_off);
-        llvm::Value*   z_ptr    = elem_ptr(lv.base, lv.off_z, lv.dyn_off);
+        llvm::Value*   mm_ptr   = lv_mm_ptr(lv);
+        llvm::Value*   z_ptr    = lv_z_ptr(lv);
         const uint32_t mm_bytes = (2 * W + 7) / 8;
         const uint32_t z_bytes  = (W + 7) / 8;
         b_.CreateCall(nba_arr_push_fn(),
@@ -3197,8 +3250,8 @@ private:
     // Lower a $readmemh / $readmemb: spill the filename to a stack buffer and hand
     // the runtime the destination memory's plane bases (element 0) and geometry. The
     // runtime opens the file and writes element planes straight into `state`. The mm
-    // and z words of element i sit at off_mm/off_z + i*elem_stride, so the two region
-    // bases plus the stride let the runtime address every element.
+    // and z words of element i sit at the plane bases + i*stride (one slot struct
+    // per element), so the two region bases plus the stride address every element.
     void lower_readmem(Index i) {
         const auto        info  = ir_->extra_data<ReadMemInfo>(ir_->payload(i).op_extra.extra);
         const Index       fname = ir_->payload(i).op_extra.op;
@@ -3219,8 +3272,15 @@ private:
         llvm::Value*   path   = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(fbytes), "readmem.path");
         b_.CreateAlignedStore(must_of(value_of(fname)), path, llvm::Align(1));
 
-        llvm::Value* mm_base = field_ptr(state_, s.off_mm);
-        llvm::Value* z_base  = field_ptr(state_, s.off_z);
+        // The runtime addresses element i's planes at base + i*stride, so hand it
+        // element 0's typed field pointers and the slot struct's alloc size.
+        auto*        arr_ty  = llvm::cast<llvm::ArrayType>(s.storage_ty);
+        llvm::Value* storage = storage_ptr(state_, s);
+        llvm::Value* mm_base =
+          b_.CreateInBoundsGEP(arr_ty, storage, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(0) });
+        llvm::Value* z_base =
+          b_.CreateInBoundsGEP(arr_ty, storage, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(1) });
+        const auto stride = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(s.slot_ty));
 
         const Type& at = std::get<Type>(mod_.pool.get(mod_.signal(info.target).type));
 
@@ -3232,7 +3292,7 @@ private:
                                (info.has_finish ? 4u : 0u) | (s.four_state ? 8u : 0u);
 
         b_.CreateCall(readmem_fn(),
-                      { path, b_.getInt32(fbytes), mm_base, z_base, b_.getInt32(s.elem_stride),
+                      { path, b_.getInt32(fbytes), mm_base, z_base, b_.getInt32(stride),
                         b_.getInt32(s.elem_count), b_.getInt32(s.width), b_.getInt64(at.left),
                         b_.getInt64(at.right), start, finish, b_.getInt32(flags) });
     }
@@ -3322,8 +3382,8 @@ private:
             } else {
                 // An output / inout temp: pass pointers to its mm and z planes.
                 const LValue& lv = lvalue_of(args[k]);
-                argv.push_back(field_ptr(lv.base, lv.off_mm));
-                argv.push_back(field_ptr(lv.base, lv.off_z));
+                argv.push_back(lv_mm_ptr(lv));
+                argv.push_back(lv_z_ptr(lv));
             }
         }
         argv.push_back(record);
@@ -4179,16 +4239,26 @@ private:
     llvm::LLVMContext&      ctx_;
     llvm::Module&           llmod_;
     llvm::IRBuilder<>       b_;
-    // Total size of the opaque state buffer in bytes (min 1, rounded up to 8).
-    uint32_t                state_bytes_ = 1;
+    // The root `%clotho.state` struct: top-instance state structs, unscoped
+    // signals, then the NBA shadow struct (when the design has NBAs).
+    llvm::StructType*       state_ty_ = nullptr;
+    // The NBA shadow struct and its field index in the root (valid iff non-null).
+    llvm::StructType*       shadow_ty_    = nullptr;
+    uint32_t                shadow_field_ = 0;
+    // Slot-type memo, one `{ i(2W), iW }` per (width, domain).
+    std::vector<std::tuple<uint32_t, bool, llvm::StructType*>> slot_types_;
+    // Per-definition state-struct memo: (definition name, field types, type).
+    // Instances of one definition share the type; a same-named definition with
+    // different fields (different parameterization) gets its own entry.
+    std::vector<std::tuple<std::string, std::vector<llvm::Type*>, llvm::StructType*>> def_types_;
     std::vector<SignalSlot> slots_;
 
     // Function declarations, indexed by FunctionId; filled before any body is
     // lowered so calls (including recursive / forward) resolve.
     std::vector<llvm::Function*> fn_decls_;
     // Set while lowering a function or task body (null during a process). `frame_`
-    // is the current call's frame buffer; `frame_slots_` / `frame_bytes_` its
-    // layout. `cur_is_task_` selects the coroutine return path (epilogue) for Ret.
+    // is the current call's frame; `frame_slots_` / `frame_ty_` its layout.
+    // `cur_is_task_` selects the coroutine return path (epilogue) for Ret.
     const Function*         cur_fn_      = nullptr;
     bool                    cur_is_task_ = false;
     // Set while lowering a PreInit process: its stores apply variable declaration
@@ -4196,7 +4266,8 @@ private:
     bool                    lowering_preinit_ = false;
     llvm::Value*            frame_       = nullptr;
     std::vector<FrameSlot>  frame_slots_;
-    uint32_t                frame_bytes_ = 1;
+    // The current function's frame struct (one field per Local, in order).
+    llvm::StructType*       frame_ty_    = nullptr;
     // While lowering a task: the shared copy-out + caller-resume epilogue block a
     // Ret branches to. The caller-side record slot { ptr parent } for task calls
     // this coroutine makes (a process or a task can be a task caller).
@@ -4309,6 +4380,29 @@ bool lower_coroutines(llvm::Module& m) {
 
 std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& ctx, bool optimize) {
     auto llmod = std::make_unique<llvm::Module>(m.name.empty() ? "clotho" : m.name, ctx);
+
+    // Pin the module to the host target's triple and DataLayout before any IR is
+    // built: the state/frame struct layouts, the NBA meta table's baked byte
+    // offsets, and load/store alignments are all DataLayout-derived, so they
+    // must be computed against the layout codegen will actually use.
+    {
+        static std::once_flag once;
+        std::call_once(once, [] { llvm::InitializeNativeTarget(); });
+        auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
+        if (!jtmb) {
+            llvm::errs() << "llvm backend: cannot detect host target: "
+                         << llvm::toString(jtmb.takeError()) << "\n";
+            return nullptr;
+        }
+        auto dl = jtmb->getDefaultDataLayoutForTarget();
+        if (!dl) {
+            llvm::errs() << "llvm backend: no host data layout: " << llvm::toString(dl.takeError())
+                         << "\n";
+            return nullptr;
+        }
+        llmod->setTargetTriple(jtmb->getTargetTriple());
+        llmod->setDataLayout(*dl);
+    }
 
     try {
         Backend(m, ctx, *llmod).run();
