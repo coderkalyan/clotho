@@ -356,6 +356,24 @@ public:
         const std::string         self_prefix(prefix);
         const InstanceBodySymbol& body = inst.body;
 
+        // Open this instance's hierarchy scope: signals registered while it is
+        // on top of the stack (ports, nets/vars, generate-block signals, and
+        // compiler temps) are recorded as declared here. A parent's children
+        // vector only grows after this child pops, so the stacked pointers stay
+        // stable across the recursion.
+        ir::InstanceScope node;
+        node.name     = std::string(inst.name);
+        node.def_name = std::string(inst.getDefinition().name);
+        ir::InstanceScope* self = nullptr;
+        if (scope_stack_.empty()) {
+            top_scope_ = std::move(node);
+            self       = &top_scope_;
+        } else {
+            scope_stack_.back()->children.push_back(std::move(node));
+            self = &scope_stack_.back()->children.back();
+        }
+        scope_stack_.push_back(self);
+
         // This instance's delay / $time multiplier: its time unit divided by the
         // wheel tick (the design's finest precision). Both are powers of ten and
         // the unit is never finer than the precision, so the ratio is an exact
@@ -372,6 +390,8 @@ public:
         scope_  = &body;
         collect_signals(body);
         lower_members(body, self_prefix, self_mul);
+
+        scope_stack_.pop_back();
     }
 
     // Lower one top instance and its whole hierarchy, then emit the accumulated
@@ -382,6 +402,7 @@ public:
     void lower_top(const InstanceSymbol& top, std::string_view prefix) {
         lower_instance(top, prefix);
         finalize_preinit();
+        module_.add_top(std::move(top_scope_));
     }
 
 private:
@@ -656,7 +677,7 @@ private:
                         }
                     }
 
-                    sigmap_[&vs] = module_.add_signal(std::move(info));
+                    sigmap_[&vs] = register_signal(std::move(info));
                     break;
                 }
                 case SymbolKind::GenerateBlock: {
@@ -677,6 +698,16 @@ private:
                     break;
             }
         }
+    }
+
+    // Append a signal to the module and record it in the currently open
+    // hierarchy scope. Every signal-creating path funnels through here so the
+    // scope tree covers the signal table exactly.
+    ir::Signal register_signal(ir::SignalInfo info) {
+        const ir::Signal sig = module_.add_signal(std::move(info));
+        scope_stack_.back()->signals.push_back(sig);
+
+        return sig;
     }
 
     ir::Signal signal_of(const ValueSymbol& sym) {
@@ -707,7 +738,7 @@ private:
         info.type = lower_type(vs.getType());
         info.dir  = ir::SignalInfo::Direction::Internal;
 
-        const ir::Signal sig = module_.add_signal(std::move(info));
+        const ir::Signal sig = register_signal(std::move(info));
         sigmap_[&vs]         = sig;
 
         return sig;
@@ -1325,7 +1356,7 @@ private:
         info.type = type;
         info.dir  = ir::SignalInfo::Direction::Internal;
 
-        return module_.add_signal(std::move(info));
+        return register_signal(std::move(info));
     }
 
     // A for_initialization assignment or a for_step (12.7.1, A.6.8): a simple
@@ -2172,7 +2203,7 @@ private:
         info.name = prefix_ + fn_ctx_->name_prefix + std::string(vs.name);
         info.type = lower_type(vs.getType());
         info.dir  = ir::SignalInfo::Direction::Internal;
-        const ir::Signal sig = module_.add_signal(std::move(info));
+        const ir::Signal sig = register_signal(std::move(info));
         sigmap_[&vs]         = sig;
 
         return sig;
@@ -2489,10 +2520,15 @@ private:
         info.name = prefix_ + "__taskarg" + std::to_string(task_temp_seq_++);
         info.type = type;
         info.dir  = ir::SignalInfo::Direction::Internal;
-        return b.signal(module_.add_signal(std::move(info)), l);
+        return b.signal(register_signal(std::move(info)), l);
     }
 
     ir::Module& module_;
+    // Scope tree of the top instance this Lowerer walks, handed to the module in
+    // lower_top. scope_stack_ tracks the path from the top to the instance
+    // currently being lowered; register_signal records into its back().
+    ir::InstanceScope               top_scope_;
+    std::vector<ir::InstanceScope*> scope_stack_;
     // Scope of the instance body currently being lowered; used to fold constant
     // expressions (parameter references and arithmetic over them).
     const slang::ast::Scope* scope_ = nullptr;

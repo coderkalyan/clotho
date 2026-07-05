@@ -40,6 +40,25 @@ struct SignalInfo {
     Direction dir = Direction::Internal;
 };
 
+// One elaborated instance in the design hierarchy. The frontend flattens every
+// instance's signals into the module-wide table (Signal handles stay flat and
+// globally unique); this tree records which scope each signal was declared in,
+// so the backend can rebuild a per-module-definition state struct type and
+// compose the types nested per instance. Signals of generate blocks and
+// compiler temporaries belong to the enclosing instance's scope.
+struct InstanceScope {
+    // Instance name (the top module's name for a top scope).
+    std::string name;
+    // Module definition name. Instances of one definition with the same
+    // parameterization declare identical signal type sequences, so the backend
+    // keys state-type deduplication on this (verified against field types).
+    std::string def_name;
+    // Signals declared directly in this scope, in declaration order.
+    std::vector<Signal> signals;
+    // Child instances, in declaration order.
+    std::vector<InstanceScope> children;
+};
+
 // Handle to a process: an index into Module::processes.
 enum class ProcessId : uint32_t {};
 
@@ -209,6 +228,18 @@ public:
         return processes_;
     }
 
+    // Append one top instance's completed scope tree (one per top-level module).
+    void add_top(InstanceScope scope) {
+        tops_.push_back(std::move(scope));
+    }
+
+    // The design hierarchy, one tree per top-level module. Empty for a module
+    // built without hierarchy info; the backend then treats every signal as
+    // belonging to one flat root scope.
+    std::span<const InstanceScope> tops() const {
+        return tops_;
+    }
+
 private:
     // Signal table; index == Signal handle.
     std::vector<SignalInfo> signals_;
@@ -217,6 +248,8 @@ private:
     // Lowered functions; index == FunctionId handle. Held behind unique_ptr so a
     // slot can be reserved (recursion) before its body exists.
     std::vector<std::unique_ptr<Function>> functions_;
+    // Instance hierarchy, one scope tree per top-level module.
+    std::vector<InstanceScope> tops_;
 };
 
 } // namespace clotho::ir
