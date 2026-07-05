@@ -37,7 +37,7 @@ void ensure_native_target() {
 
 } // namespace
 
-int run_jit(const Module& m, Timings* timings) {
+int run_jit(const Module& m, Timings* timings, bool z_elision) {
     ensure_native_target();
 
     // LLVM compile phase: build the module (IR gen + coroutine/opt passes), then
@@ -47,7 +47,7 @@ int run_jit(const Module& m, Timings* timings) {
     // Each run owns its context: the design module is built into it, then both
     // are moved into a ThreadSafeModule the JIT takes over.
     auto ctx = std::make_unique<llvm::LLVMContext>();
-    auto mod = build_module(m, *ctx);
+    auto mod = build_module(m, *ctx, /*optimize=*/true, z_elision);
     if (!mod) {
         return -1; // build_module already reported the reason.
     }

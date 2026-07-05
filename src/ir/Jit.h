@@ -14,7 +14,8 @@ namespace clotho::ir {
 // value `main()` returns (intended as the process exit code). On any setup or
 // compilation failure, writes the reason to llvm::errs() and returns a negative
 // sentinel so the driver can exit non-zero. If `timings` is non-null, the LLVM
-// compile and simulation phase durations are recorded into it.
-int run_jit(const Module& m, Timings* timings = nullptr);
+// compile and simulation phase durations are recorded into it. `z_elision` is
+// forwarded to build_module.
+int run_jit(const Module& m, Timings* timings = nullptr, bool z_elision = true);
 
 } // namespace clotho::ir

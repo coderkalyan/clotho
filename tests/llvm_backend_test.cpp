@@ -1748,3 +1748,165 @@ TEST_CASE("$readmemh default fill honors a descending declared range") {
     CHECK(run_capture(src) == "xx c3 0f f0\n");
     std::remove(path);
 }
+
+// -- Z elision --
+//
+// Signals the may-z analysis proves z-free store no z word (%logic.nz.W slots);
+// signals that can carry z keep the full slot and must round-trip z bit-exact.
+
+TEST_CASE("a z-carrying signal keeps its z word and round-trips z through copies") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] v = 4'bz01x;
+            logic [3:0] y;
+            logic [3:0] clean = 4'b1010;
+            assign y = v;
+            initial begin
+                #1 $display("%b %b %b", v, y, clean);
+                $display("%b %b", v === 4'bz01x, y === 4'bz01x);
+                casez (y)
+                    4'bz01?: $display("casez hit");
+                    default: $display("casez miss");
+                endcase
+            end
+        endmodule
+    )";
+    const std::string ir = emit(src);
+    // v and y carry z (full slot); clean is proven never-z (elided slot).
+    CHECK(ir.find("%logic.4 = type { i8, i4 }") != std::string::npos);
+    CHECK(ir.find("%logic.nz.4 = type { i8 }") != std::string::npos);
+    CHECK(run_capture(src) == "z01x z01x 1010\n1 1\ncasez hit\n");
+}
+
+TEST_CASE("NBA of a z value round-trips the shadow commit; never-z NBAs use the .noz bucket") {
+    constexpr std::string_view src = R"(
+        module m;
+            reg clk = 0;
+            logic [3:0] zq;
+            logic [3:0] nq;
+            logic [3:0] zsrc = 4'bzz01;
+            always @(posedge clk) begin
+                zq <= zsrc;
+                nq <= nq === 4'bxxxx ? 4'd5 : nq + 1;
+            end
+            initial begin
+                #1 clk = 1;
+                #1 $display("%b %b", zq, nq);
+                $finish;
+            end
+        endmodule
+    )";
+    const std::string ir = emit(src);
+    // Same width, different z-ness: two distinct commit buckets.
+    CHECK(ir.find("clotho.nba.w4.full = ") != std::string::npos);
+    CHECK(ir.find("clotho.nba.w4.full.noz = ") != std::string::npos);
+    CHECK(run_capture(src) == "zz01 0101\n");
+}
+
+TEST_CASE("partial NBA merges z bits into a z-carrying target") {
+    constexpr std::string_view src = R"(
+        module m;
+            reg clk = 0;
+            logic [3:0] q = 4'b0000;
+            always @(posedge clk) q[2:1] <= 2'bz0;
+            initial begin
+                #1 clk = 1;
+                #1 $display("%b", q);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "0z00\n");
+}
+
+TEST_CASE("array NBA works against a never-z memory and keeps z in a 4-state one") {
+    constexpr std::string_view src = R"(
+        module m;
+            reg clk = 0;
+            bit   [7:0] mem2 [0:1];
+            logic [7:0] mem4 [0:1];
+            always @(posedge clk) begin
+                mem2[0] <= 8'hA5;
+                mem4[1] <= 8'bzz01zz10;
+            end
+            initial begin
+                #1 clk = 1;
+                #1 $display("%h %h %b", mem2[0], mem2[1], mem4[1]);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a5 00 zz01zz10\n");
+}
+
+TEST_CASE("$readmem with z digits into a 2-state memory reads 0 and spares neighbors") {
+    const char* path = "clotho_readmem_2state_z.hex";
+    write_file(path, "zz 5a z1\n");
+    const std::string src = std::string(R"(
+        module m;
+            bit [7:0] mem [0:2];
+            initial begin
+                $readmemh(")") + path + R"(", mem);
+                $display("%h %h %h", mem[0], mem[1], mem[2]);
+                $finish;
+            end
+        endmodule
+    )";
+    // z reads as 0 in a 2-state memory (elided z plane, null z_base); the
+    // neighboring elements' must|may words must be untouched by the skipped
+    // z writes.
+    CHECK(run_capture(src) == "00 5a 01\n");
+    std::remove(path);
+}
+
+TEST_CASE("a task output formal carries z back to the caller") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] zdst;
+            logic [3:0] cdst;
+            task automatic zt(output logic [3:0] o);
+                o = 4'bz111;
+            endtask
+            task automatic ct(input logic [3:0] a, output logic [3:0] o);
+                o = a + 1;
+            endtask
+            initial begin
+                zt(zdst);
+                ct(4'd6, cdst);
+                $display("%b %d", zdst, cdst);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "z111 7\n");
+}
+
+TEST_CASE("a function returning z feeds a z-capable target") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic logic [3:0] zfn(input logic [3:0] x);
+                return { 2'bz0, x[1:0] };
+            endfunction
+            logic [3:0] r;
+            initial begin
+                r = zfn(4'b0011);
+                $display("%b", r);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "z011\n");
+}
+
+TEST_CASE("--no-z-elision keeps every slot's z word") {
+    constexpr std::string_view src = R"(
+        module m(input bit [3:0] x, output bit [3:0] y);
+            initial y = x + 1;
+        endmodule
+    )";
+    const LowerResult r = lower_text(src);
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    std::string              text;
+    llvm::raw_string_ostream os(text);
+    REQUIRE(ir::emit_llvm(*r.module, os, /*optimize=*/false, /*z_elision=*/false));
+    CHECK(text.find("%bit.4 = type { i8, i4 }") != std::string::npos);
+    CHECK(text.find(".nz.") == std::string::npos);
+}
