@@ -2488,7 +2488,8 @@ private:
             case Inst::Tag::FileValueOp:
             case Inst::Tag::Fgets:
             case Inst::Tag::Ferror:
-                // The file read / positioning / error functions all return i32.
+            case Inst::Tag::Scanf:
+                // The file read / positioning / error / scan functions return i32.
                 return { 32, false, true };
 
             case Inst::Tag::Add:
@@ -2843,6 +2844,10 @@ private:
 
             case Inst::Tag::Ferror:
                 lower_ferror(i);
+                return;
+
+            case Inst::Tag::Scanf:
+                lower_scanf(i);
                 return;
 
             case Inst::Tag::ReadMem:
@@ -3389,6 +3394,78 @@ private:
         const auto [mm, z, width] = string_dest(dst, "$ferror");
         llvm::Value* fd           = cast(must_of(value_of(info.fd)), 32, true);
         llvm::Value* r            = b_.CreateCall(ferror_fn(), { fd, mm, z, b_.getInt32(width) });
+        set_value(i, packed(r, r, zero(32)));
+    }
+
+    // { ptr mm, ptr z, i32 width } — mirrors rt_scan_arg in runtime/Runtime.h.
+    llvm::StructType* scan_arg_struct_ty() {
+        auto* ptr = llvm::PointerType::getUnqual(ctx_);
+        return llvm::StructType::get(ctx_, { ptr, ptr, b_.getInt32Ty() });
+    }
+
+    // i32 rt_fscanf(i32 fd, const char* fmt, i32 argc, const rt_scan_arg* args)
+    llvm::FunctionCallee fscanf_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(i32, { i32, ptr, i32, ptr }, false);
+        return llmod_.getOrInsertFunction("rt_fscanf", fnty);
+    }
+
+    // i32 rt_sscanf(const char* buf, i32 len, const char* fmt, i32 argc, const rt_scan_arg* args)
+    llvm::FunctionCallee sscanf_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(i32, { ptr, i32, ptr, i32, ptr }, false);
+        return llmod_.getOrInsertFunction("rt_sscanf", fnty);
+    }
+
+    // Lower a $fscanf / $sscanf: build the rt_scan_arg[] descriptor array from the
+    // output lvalues, then call the runtime scanner with the source (an FD, or a
+    // spilled string for $sscanf). Each output target must be whole-storage and
+    // <=64 bits (the runtime writes one 64-bit word per conversion).
+    void lower_scanf(Index i) {
+        const auto        info = ir_->extra_data<ScanfInfo>(ir_->payload(i).extra);
+        const std::string fmt  = ir_->extra_bytes(info.fmt, info.fmt_len);
+
+        const std::span<const Index> outs = ir_->region(info.args);
+        const auto                   n    = static_cast<uint32_t>(outs.size());
+
+        llvm::StructType* sty = scan_arg_struct_ty();
+        llvm::Value*      arr = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+        if (n > 0) {
+            arr = b_.CreateAlloca(sty, b_.getInt32(n), "scan_args");
+            for (uint32_t k = 0; k < n; ++k) {
+                const LValue& lv = lvalue_of(outs[k]);
+                if (lv.width != lv.store_width) {
+                    // TODO: a part-select scan target (x[7:0]).
+                    throw BackendError{ "$fscanf / $sscanf into a part-select target is not supported" };
+                }
+                if (lv.store_width > 64) {
+                    // TODO: a target wider than 64 bits (e.g. a long %s token) needs
+                    // multi-word plane assembly in the runtime scanner.
+                    throw BackendError{ "$fscanf / $sscanf into a target wider than 64 bits is not "
+                                        "supported" };
+                }
+                llvm::Value* mm = lv.dyn_off != nullptr ? elem_ptr(lv.base, lv.off_mm, lv.dyn_off)
+                                                        : field_ptr(lv.base, lv.off_mm);
+                llvm::Value* z  = lv.dyn_off != nullptr ? elem_ptr(lv.base, lv.off_z, lv.dyn_off)
+                                                        : field_ptr(lv.base, lv.off_z);
+                llvm::Value* elt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
+                b_.CreateStore(mm, b_.CreateStructGEP(sty, elt, 0));
+                b_.CreateStore(z, b_.CreateStructGEP(sty, elt, 1));
+                b_.CreateStore(b_.getInt32(lv.store_width), b_.CreateStructGEP(sty, elt, 2));
+            }
+        }
+
+        llvm::Value* fmt_ptr = b_.CreateGlobalString(fmt);
+        llvm::Value* r       = nullptr;
+        if (info.is_string) {
+            const auto [buf, len] = spill_ascii(info.source, "sscanf.buf");
+            r = b_.CreateCall(sscanf_fn(), { buf, b_.getInt32(len), fmt_ptr, b_.getInt32(n), arr });
+        } else {
+            llvm::Value* fd = cast(must_of(value_of(info.source)), 32, true);
+            r               = b_.CreateCall(fscanf_fn(), { fd, fmt_ptr, b_.getInt32(n), arr });
+        }
         set_value(i, packed(r, r, zero(32)));
     }
 

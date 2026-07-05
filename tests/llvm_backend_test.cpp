@@ -1939,6 +1939,81 @@ TEST_CASE("$ferror on a clear stream returns 0") {
     std::remove(path);
 }
 
+// $fscanf parses fields into integer lvalues and returns the conversion count.
+// Values cross-checked against Icarus Verilog.
+TEST_CASE("$fscanf parses integer fields") {
+    const char* path = "clotho_fscanf_test.txt";
+    write_file(path, "42 -7 ff\n");
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, n, a, b, c;
+            initial begin
+                fd = $fopen(")") + path + R"(", "r");
+                n = $fscanf(fd, "%d %d %h", a, b, c);
+                $display("%0d %0d %0d %0d", n, a, b, c);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "3 42 -7 255\n");
+    std::remove(path);
+}
+
+// %s reads a whitespace-delimited token (right-justified), and $fscanf resumes at
+// the next field. Cross-checked against Icarus.
+TEST_CASE("$fscanf with %s and a trailing field") {
+    const char* path = "clotho_fscanf_s_test.txt";
+    write_file(path, "hello 255\n");
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, n, v;
+            reg [8*8-1:0] word;
+            initial begin
+                fd = $fopen(")") + path + R"(", "r");
+                n = $fscanf(fd, "%s %d", word, v);
+                $display("%0d %h %0d", n, word, v);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2 00000068656c6c6f 255\n"); // "hello"
+    std::remove(path);
+}
+
+// $sscanf parses a literal string; the `*` flag suppresses a field (no arg).
+// Cross-checked against Icarus.
+TEST_CASE("$sscanf with a suppressed field") {
+    CHECK(run_capture(R"(
+        module m;
+            integer n, a, b;
+            initial begin
+                n = $sscanf("10 20 30", "%d %*d %d", a, b);
+                $display("%0d %0d %0d", n, a, b);
+            end
+        endmodule
+    )") == "2 10 30\n");
+}
+
+// $fscanf returns -1 (EOF) when the input is exhausted before the first
+// conversion (LRM §21.3.4).
+TEST_CASE("$fscanf returns -1 at end of file") {
+    const char* path = "clotho_fscanf_eof_test.txt";
+    write_file(path, "");
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, n, a;
+            initial begin
+                fd = $fopen(")") + path + R"(", "r");
+                n = $fscanf(fd, "%d", a);
+                $display("%0d", n);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "-1\n");
+    std::remove(path);
+}
+
 // $ftell reports the offset, $fseek repositions (operation 0 = SEEK_SET), and
 // $rewind returns to the start (LRM §21.3.5).
 TEST_CASE("$ftell / $fseek / $rewind") {

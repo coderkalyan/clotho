@@ -260,6 +260,24 @@ struct FerrorInfo {
     Index fd;
 };
 
+// Extra payload for `scanf`: $fscanf / $sscanf (LRM §21.3.4) parse `source` per the
+// packed format-string bytes at `fmt` (`fmt_len` bytes) into the output lvalues
+// `args`, returning the conversion count. When `is_string` is 1 ($sscanf) `source`
+// is a packed-ASCII string value the backend spills; otherwise ($fscanf) it is a
+// file-descriptor value.
+struct ScanfInfo {
+    // First extra word of the packed format-string bytes.
+    ExtraIndex fmt;
+    // Format-string length in bytes.
+    uint32_t fmt_len;
+    // Source operand: an FD value ($fscanf) or a packed string value ($sscanf).
+    Index source;
+    // 1 => $sscanf (source is a packed string); 0 => $fscanf (source is an FD).
+    uint32_t is_string;
+    // Output lvalue operands, one per conversion, in order.
+    ExtraSlice args;
+};
+
 // Extra payload for `timeformat`: a $timeformat system task. `units`,
 // `precision`, and `min_width` are value operands (general runtime rvalues); the
 // suffix string is appended after the formatted number and lives packed
@@ -310,6 +328,7 @@ static_assert(ExtraPayload<FileOpInfo>);
 static_assert(ExtraPayload<FgetsInfo>);
 static_assert(ExtraPayload<SformatInfo>);
 static_assert(ExtraPayload<FerrorInfo>);
+static_assert(ExtraPayload<ScanfInfo>);
 static_assert(ExtraPayload<TimeFormatInfo>);
 static_assert(ExtraPayload<WaitEdge>);
 static_assert(ExtraPayload<WaitInfo>);
@@ -482,6 +501,10 @@ struct Inst {
         // error code (payload: op_extra -> FerrorInfo; op is the destination
         // lvalue). LRM §21.3.6. Lowers to an rt_ferror call.
         Ferror,
+        // $fscanf / $sscanf: parse a source into output lvalues per a format, ->
+        // conversion count (payload: extra -> ScanfInfo). LRM §21.3.4. Lowers to an
+        // rt_fscanf / rt_sscanf call.
+        Scanf,
         // $timeformat: set the %t format (units / precision / suffix / min width)
         // for all later %t specifiers (payload: timeformat -> TimeFormatInfo).
         // LRM §20.4.3. Lowers to an rt_timeformat_set call.
@@ -535,6 +558,7 @@ struct Inst {
         Wait,
         FileOp,
         Sformat,
+        Scanf,
     };
 
     union Payload {

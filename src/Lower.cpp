@@ -1482,10 +1482,11 @@ private:
             return;
         }
         if (name == "$fgets" || name == "$fgetc" || name == "$ungetc" || name == "$feof" ||
-            name == "$ftell" || name == "$fseek" || name == "$rewind" || name == "$ferror") {
-            // File read / positioning / error functions used in statement position:
-            // lower for the side effect (file position, write-back) and drop the
-            // result.
+            name == "$ftell" || name == "$fseek" || name == "$rewind" || name == "$ferror" ||
+            name == "$fscanf" || name == "$sscanf") {
+            // File read / positioning / error / scan functions used in statement
+            // position: lower for the side effect (file position, write-back) and
+            // drop the result.
             lower_sysfunc(call, b);
             return;
         }
@@ -1648,6 +1649,87 @@ private:
         return lower_expr(*e, b);
     }
 
+    // Count the non-suppressed conversions in a $fscanf / $sscanf format literal,
+    // rejecting unsupported conversion characters. Mirrors the runtime scanner: a
+    // leading '*' suppresses (consumes no arg), an optional field width follows,
+    // then the conversion char. Blocks %f/%e/%g (no reals) and %v/%m/%t/%u/%z.
+    size_t count_scan_conversions(std::string_view fmt) {
+        size_t n = 0;
+        for (size_t i = 0; i < fmt.size(); ++i) {
+            if (fmt[i] != '%') {
+                continue;
+            }
+            ++i;
+            if (i >= fmt.size()) {
+                break;
+            }
+            if (fmt[i] == '%') {
+                continue;
+            }
+            bool suppress = false;
+            if (fmt[i] == '*') {
+                suppress = true;
+                ++i;
+            }
+            while (i < fmt.size() && fmt[i] >= '0' && fmt[i] <= '9') {
+                ++i;
+            }
+            if (i >= fmt.size()) {
+                break;
+            }
+            switch (fmt[i]) {
+                case 'd':
+                case 'o':
+                case 'b':
+                case 'h':
+                case 'x':
+                case 'c':
+                case 's':
+                    break;
+                default:
+                    // TODO: %f/%e/%g need real support; %v/%m/%t/%u/%z unimplemented.
+                    fail(std::string("$fscanf / $sscanf conversion %") + fmt[i] + " is not supported");
+            }
+            if (!suppress) {
+                ++n;
+            }
+        }
+        return n;
+    }
+
+    // Lower $fscanf / $sscanf (LRM §21.3.4): the source is the first argument (an
+    // FD for $fscanf, a string for $sscanf), the format is the second (a string
+    // literal), and the rest are output lvalues, one per conversion.
+    ir::Index lower_scanf(const CallExpression& call, bool is_sscanf, ir::Builder& b, ir::SourceLoc l) {
+        const auto args = call.arguments();
+        if (args.size() < 2) {
+            fail("$fscanf / $sscanf requires a source and a format string");
+        }
+        const Expression* fmt_e = args[1];
+        while (fmt_e->kind == ExpressionKind::Conversion) {
+            fmt_e = &fmt_e->as<ConversionExpression>().operand();
+        }
+        if (fmt_e->kind != ExpressionKind::StringLiteral) {
+            // TODO: a runtime (non-literal) format string needs dynamic string support.
+            fail("$fscanf / $sscanf format must be a string literal");
+        }
+        const std::string_view fmt      = fmt_e->as<StringLiteral>().getValue();
+        const size_t           want     = count_scan_conversions(fmt);
+        const auto             out_args = args.subspan(2);
+        if (out_args.size() != want) {
+            fail("$fscanf / $sscanf has " + std::to_string(want) + " conversion(s) but " +
+                 std::to_string(out_args.size()) + " output argument(s)");
+        }
+        // The source lowers as a value (FD) or a packed string ($sscanf).
+        const ir::Index source = is_sscanf ? lower_string_arg(*args[0], b) : lower_expr(*args[0], b);
+        std::vector<ir::Index> outs;
+        outs.reserve(out_args.size());
+        for (const Expression* a : out_args) {
+            outs.push_back(lower_lvalue(*a, b));
+        }
+        return b.scanf(source, is_sscanf, fmt, outs, l);
+    }
+
     // Lower a system function call used as an rvalue (e.g. `$time`). User function
     // calls are not yet supported.
     ir::Index lower_sysfunc(const CallExpression& call, ir::Builder& b) {
@@ -1782,6 +1864,11 @@ private:
             const ir::Index fd  = lower_expr(*args[0], b);
             const ir::Index dst = lower_lvalue(*args[1], b);
             return b.ferror(dst, fd, l);
+        }
+
+        // $fscanf(fd, fmt, args) / $sscanf(str, fmt, args) (LRM §21.3.4).
+        if (name == "$fscanf" || name == "$sscanf") {
+            return lower_scanf(call, name == "$sscanf", b, l);
         }
 
         // TODO: $realtime (LRM §20.3.3) returns a real scaled to the module time

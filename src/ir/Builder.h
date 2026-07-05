@@ -104,6 +104,10 @@ public:
     // $ferror: write descriptor `fd`'s error message into the string lvalue `dst`.
     // Yields the error code.
     Index ferror(Index dst, Index fd, SourceLoc loc);
+    // $fscanf / $sscanf: parse `source` (an FD value, or a packed string value when
+    // `is_string`) per `fmt` into the output lvalues `args`. Yields the conversion
+    // count.
+    Index scanf(Index source, bool is_string, std::string_view fmt, std::span<const Index> args, SourceLoc loc);
     // $finish / $stop: end the simulation and exit. No operands.
     Index finish(SourceLoc loc);
     // $fflush: flush the descriptor `handle`'s output buffers. The no-argument

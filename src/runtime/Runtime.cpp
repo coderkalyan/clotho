@@ -269,6 +269,20 @@ void store_string_planes(uint8_t* mm, uint8_t* z, uint32_t width, const uint8_t*
     }
 }
 
+// Write a ≤64-bit value's planes into a packed vector: the must|may word (must in
+// the low `width` bits, may above) at `mm`, plus the z word at `z`. Values are
+// masked to `width`. Shared by $readmem and the $fscanf / $sscanf engine.
+void write_word_planes(uint8_t* mm, uint8_t* z, uint32_t width, uint64_t must, uint64_t may, uint64_t zz) {
+    const uint64_t wmask = width >= 64 ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << width) - 1);
+    must &= wmask;
+    may &= wmask;
+    zz &= wmask;
+    const unsigned __int128 mmv = static_cast<unsigned __int128>(must) |
+                                  (static_cast<unsigned __int128>(may) << width);
+    std::memcpy(mm, &mmv, (2 * width + 7) / 8);
+    std::memcpy(z, &zz, (width + 7) / 8);
+}
+
 clotho::Timer& unwrap(rt_timer* t) {
     return *reinterpret_cast<clotho::Timer*>(t);
 }
@@ -563,6 +577,245 @@ extern "C" int32_t rt_ferror(int32_t fd, uint8_t* mm, uint8_t* z, uint32_t width
     return code;
 }
 
+namespace {
+
+// Defined below, next to $readmem which shares them.
+int hex_digit(char c);
+int bin_digit(char c);
+
+// A character source for the scan engine: a file ($fscanf) or an in-memory buffer
+// ($sscanf), with one character of pushback.
+struct ScanSource {
+    std::FILE*     f   = nullptr;
+    const uint8_t* buf = nullptr;
+    size_t         len = 0;
+    size_t         pos = 0;
+
+    int get() {
+        if (f != nullptr) {
+            return std::fgetc(f);
+        }
+        return pos < len ? buf[pos++] : EOF;
+    }
+    void unget(int c) {
+        if (c == EOF) {
+            return;
+        }
+        if (f != nullptr) {
+            std::ungetc(c, f);
+        } else if (pos > 0) {
+            --pos;
+        }
+    }
+};
+
+bool scan_ws(int c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+// Skip a run of input whitespace, pushing back the first non-space character.
+void skip_ws(ScanSource& src) {
+    int c;
+    while ((c = src.get()) != EOF && scan_ws(c)) {
+    }
+    src.unget(c);
+}
+
+// The $fscanf / $sscanf engine (LRM §21.3.4). Walks `fmt`, matching literal text
+// and whitespace against `src` and converting each %-directive into the next
+// output descriptor. Supports d/o/b/h/x (with x/z digits on the power-of-two
+// bases), c, and s, plus `*` suppression and an optional maximum field width.
+// Returns the number of stored conversions, or -1 if the input is exhausted before
+// the first conversion (matching $fscanf's EOF result). Unsupported conversions are
+// rejected by the frontend, so `fmt` only carries the above.
+int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_arg* args) {
+    uint32_t ai        = 0;
+    int32_t  count     = 0;
+    bool     any_input = false;
+
+    for (const char* p = fmt; *p != '\0'; ++p) {
+        if (scan_ws(static_cast<unsigned char>(*p))) {
+            skip_ws(src);
+            continue;
+        }
+        if (*p != '%') {
+            const int c = src.get();
+            if (c != static_cast<unsigned char>(*p)) {
+                src.unget(c);
+                break; // literal mismatch (or EOF) ends the scan
+            }
+            any_input = true;
+            continue;
+        }
+
+        ++p;
+        if (*p == '%') {
+            const int c = src.get();
+            if (c != '%') {
+                src.unget(c);
+                break;
+            }
+            continue;
+        }
+
+        bool suppress = false;
+        if (*p == '*') {
+            suppress = true;
+            ++p;
+        }
+        uint32_t maxw = 0;
+        while (*p >= '0' && *p <= '9') {
+            maxw = maxw * 10 + static_cast<uint32_t>(*p - '0');
+            ++p;
+        }
+        const char conv = *p;
+        if (conv == '\0') {
+            break;
+        }
+
+        uint64_t must = 0;
+        uint64_t may  = 0;
+        uint64_t z    = 0;
+        bool     ok   = false;
+
+        if (conv == 'c') {
+            const int c = src.get();
+            if (c != EOF) {
+                any_input = true;
+                must = may = static_cast<uint8_t>(c);
+                ok         = true;
+            }
+        } else if (conv == 's') {
+            skip_ws(src);
+            std::vector<uint8_t> tok;
+            int                  c;
+            while ((c = src.get()) != EOF && !scan_ws(c)) {
+                if (maxw != 0 && tok.size() >= maxw) {
+                    src.unget(c);
+                    break;
+                }
+                tok.push_back(static_cast<uint8_t>(c));
+            }
+            if (scan_ws(c)) {
+                src.unget(c);
+            }
+            if (!tok.empty()) {
+                any_input = true;
+                // Right-justify the token bytes into `must` (byte 0 = last char),
+                // capped at 8 bytes; wider %s targets are guarded by the backend.
+                const size_t keep = tok.size() < 8 ? tok.size() : 8;
+                for (size_t k = 0; k < keep; ++k) {
+                    must |= static_cast<uint64_t>(tok[tok.size() - 1 - k]) << (8 * k);
+                }
+                may = must;
+                ok  = true;
+            }
+        } else {
+            // Numeric: d (signed decimal), o / b / h / x (power-of-two bases, with
+            // x/z digits marking unknown bits like $readmem).
+            // NOTE: a token shorter than the target zero-extends its high bits (the
+            // natural value read). Whether it x-extends when the token carries
+            // unknowns is not pinned down by the LRM (§21.3.4), so the simpler
+            // zero-extension is used.
+            const int base = conv == 'd' ? 10 : conv == 'o' ? 8 : conv == 'b' ? 2 : 16;
+            const int bits = base == 16 ? 4 : base == 8 ? 3 : base == 2 ? 1 : 0;
+            skip_ws(src);
+            bool     neg  = false;
+            uint32_t used = 0;
+            int      c    = src.get();
+            if (base == 10 && (c == '+' || c == '-')) {
+                neg = c == '-';
+                c   = src.get();
+            }
+            const uint64_t dmask = bits != 0 ? static_cast<uint64_t>((1u << bits) - 1) : 0;
+            while (c != EOF) {
+                if (maxw != 0 && used >= maxw) {
+                    break;
+                }
+                uint64_t dv = 0;
+                uint64_t mv = 0;
+                uint64_t zz = 0;
+                if (base != 10 && (c == 'x' || c == 'X')) {
+                    mv = dmask;
+                } else if (base != 10 && (c == 'z' || c == 'Z' || c == '?')) {
+                    mv = zz = dmask;
+                } else {
+                    int hv;
+                    if (base == 10) {
+                        hv = (c >= '0' && c <= '9') ? c - '0' : -1;
+                    } else if (base == 8) {
+                        hv = (c >= '0' && c <= '7') ? c - '0' : -1;
+                    } else if (base == 2) {
+                        hv = bin_digit(static_cast<char>(c));
+                    } else {
+                        hv = hex_digit(static_cast<char>(c));
+                    }
+                    if (hv < 0) {
+                        break;
+                    }
+                    dv = static_cast<uint64_t>(hv);
+                    mv = dv; // known digit: may == must
+                }
+                if (base == 10) {
+                    must = must * 10 + dv;
+                } else {
+                    must = (must << bits) | dv;
+                    may  = (may << bits) | mv;
+                    z    = (z << bits) | zz;
+                }
+                ok        = true;
+                any_input = true;
+                ++used;
+                c = src.get();
+            }
+            src.unget(c);
+            if (ok && base == 10) {
+                if (neg) {
+                    must = static_cast<uint64_t>(-static_cast<int64_t>(must));
+                }
+                may = must; // decimal values carry no x/z
+            }
+        }
+
+        if (!ok) {
+            break; // conversion failed; stop like C scanf
+        }
+        if (!suppress) {
+            if (ai >= argc) {
+                break; // more conversions than output args
+            }
+            const rt_scan_arg& a = args[ai++];
+            write_word_planes(a.mm, a.z, a.width, must, may, z);
+            ++count;
+        }
+    }
+
+    return (count == 0 && !any_input) ? -1 : count;
+}
+
+} // namespace
+
+extern "C" int32_t rt_fscanf(int32_t fd, const char* fmt, uint32_t argc, const rt_scan_arg* args) {
+    io_ensure_init();
+    std::FILE* f = fd_stream(fd);
+    if (f == nullptr) {
+        return -1;
+    }
+    ScanSource src;
+    src.f = f;
+    return scan_run(src, fmt, argc, args);
+}
+
+extern "C" int32_t
+rt_sscanf(const char* buf, uint32_t len, const char* fmt, uint32_t argc, const rt_scan_arg* args) {
+    // The source is a packed-ASCII vector; reconstruct the string, then scan it.
+    const std::string s = unpack_ascii(buf, len);
+    ScanSource        src;
+    src.buf = reinterpret_cast<const uint8_t*>(s.data());
+    src.len = s.size();
+    return scan_run(src, fmt, argc, args);
+}
+
 extern "C" void rt_timeformat_init(uint64_t tick_fs, int32_t default_units) {
     timeformat.tick_fs   = tick_fs == 0 ? 1 : tick_fs;
     timeformat.units     = default_units;
@@ -679,11 +932,8 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
     // beyond that bound is ignored with a warning (LRM §21.4).
     const int64_t end = has_finish ? finish : hi_addr;
 
-    const uint32_t mm_bytes = (2 * width + 7) / 8;
-    const uint32_t z_bytes  = (width + 7) / 8;
-    const int      bits     = hex ? 4 : 1;
-    const uint64_t wmask    = width >= 64 ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << width) - 1);
-    const uint64_t nibble   = hex ? 0xFu : 0x1u;
+    const int      bits   = hex ? 4 : 1;
+    const uint64_t nibble = hex ? 0xFu : 0x1u;
 
     const auto write_elem = [&](int64_t idx, uint64_t must, uint64_t may, uint64_t z) {
         if (idx < 0 || idx >= static_cast<int64_t>(count)) {
@@ -695,13 +945,8 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
             may = must;
             z   = 0;
         }
-        must &= wmask;
-        may &= wmask;
-        z &= wmask;
-        const unsigned __int128 mmv = static_cast<unsigned __int128>(must) |
-                                      (static_cast<unsigned __int128>(may) << width);
-        std::memcpy(mm_base + static_cast<size_t>(idx) * stride, &mmv, mm_bytes);
-        std::memcpy(z_base + static_cast<size_t>(idx) * stride, &z, z_bytes);
+        write_word_planes(mm_base + static_cast<size_t>(idx) * stride,
+                          z_base + static_cast<size_t>(idx) * stride, width, must, may, z);
     };
 
     const size_t n = buf.size();

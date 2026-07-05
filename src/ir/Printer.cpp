@@ -162,6 +162,8 @@ const char* tag_name(Inst::Tag tag) {
             return "sformat";
         case T::Ferror:
             return "ferror";
+        case T::Scanf:
+            return "scanf";
         case T::DynPartSelect:
             return "dyn_part_select";
         case T::ReadMem:
@@ -353,6 +355,16 @@ private:
             case Inst::PayloadKind::Sformat: {
                 const auto info = ir_.extra_data<SformatInfo>(p.extra);
                 ref(info.dst);
+                os_ << ", \"" << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
+                for (Index a : ir_.region(info.args)) {
+                    os_ << ", ";
+                    ref(a);
+                }
+                break;
+            }
+            case Inst::PayloadKind::Scanf: {
+                const auto info = ir_.extra_data<ScanfInfo>(p.extra);
+                ref(info.source);
                 os_ << ", \"" << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
                 for (Index a : ir_.region(info.args)) {
                     os_ << ", ";

@@ -133,6 +133,25 @@ void rt_sformat(uint8_t* mm, uint8_t* z, uint32_t width, const char* fmt, uint32
 // (0 when the stream is clear).
 int32_t rt_ferror(int32_t fd, uint8_t* mm, uint8_t* z, uint32_t width);
 
+// One output destination of a $fscanf / $sscanf conversion: the must|may plane
+// pointer (2*`width` bits), the z plane pointer (`width` bits), and the width. The
+// conversion char in the format decides how the parsed value is stored here.
+typedef struct rt_scan_arg {
+    uint8_t* mm;
+    uint8_t* z;
+    uint32_t width;
+} rt_scan_arg;
+
+// $fscanf(fd, fmt, args) (LRM §21.3.4): parse the descriptor's input per `fmt`,
+// writing each conversion into the matching `args` descriptor. Supports d/o/b/h/x
+// (with x/z digits), c, s, `*` suppression and a field width. -> the number of
+// stored conversions, or -1 if the input is exhausted before the first.
+int32_t rt_fscanf(int32_t fd, const char* fmt, uint32_t argc, const rt_scan_arg* args);
+
+// $sscanf(str, fmt, args): as rt_fscanf, but the source is the packed-ASCII vector
+// at `buf` (`len` bytes).
+int32_t rt_sscanf(const char* buf, uint32_t len, const char* fmt, uint32_t argc, const rt_scan_arg* args);
+
 // $fflush(desc): flush the output buffers of descriptor `desc` (an MCD or FD).
 // The no-argument $fflush passes 0, which flushes every open stream (LRM
 // §21.3.6).

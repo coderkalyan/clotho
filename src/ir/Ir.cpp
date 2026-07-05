@@ -74,6 +74,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::FileOp;
         case T::Sformat:
             return K::Sformat;
+        case T::Scanf:
+            return K::Scanf;
         case T::TimeFormat:
             return K::TimeFormat;
         case T::Finish:
@@ -168,6 +170,13 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
             // sformat: the value args live in the SformatInfo record; the format
             // bytes and the destination lvalue are not value operands.
             const auto info = extra_data<SformatInfo>(p.extra);
+            return index_slice(info.args);
+        }
+
+        case Inst::PayloadKind::Scanf: {
+            // scanf: the output lvalue operands live in the ScanfInfo record; the
+            // format bytes and the source operand are read directly.
+            const auto info = extra_data<ScanfInfo>(p.extra);
             return index_slice(info.args);
         }
 
