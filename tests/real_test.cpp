@@ -288,3 +288,34 @@ TEST_CASE("LRM 20.5 conversion system functions") {
     )");
     CHECK(out == "123\n-15\n-16\n123\n4607182418800017408\n1\n3fc00000\n1.5\n3.14159\n");
 }
+
+TEST_CASE("LRM 20.8.2 real math functions match C libm") {
+    const std::string out = run_capture(R"(
+        module t;
+            real r;
+            initial begin
+                $display("%g", $sqrt(9.0));
+                $display("%g", $ln($exp(2.0)));
+                $display("%g", $log10(1000.0));
+                $display("%g", $pow(2.0, 10.0));
+                $display("%g", $floor(2.9));
+                $display("%g", $ceil(2.1));
+                $display("%g", $cos(0.0));
+                $display("%g", $atan2(0.0, 1.0));
+                $display("%g", $hypot(3.0, 4.0));
+                $display("%g", $cosh(0.0));
+                // Pure-libm entries (no LLVM intrinsic): symbol-resolution risk.
+                $display("%g", $tan(0.0));
+                $display("%g", $asin(1.0) == $acos(-1.0) / 2.0);
+                $display("%g", $tanh(0.0));
+                $display("%g", $asinh(0.0));
+                $display("%g", $acosh(1.0));
+                $display("%g", $atanh(0.0));
+                $display("%g", $sqrt(2) * $sqrt(2) > 1.99); // integral arg converts
+                r = 16;
+                $display("%g", $sqrt(r)); // non-constant argument
+            end
+        endmodule
+    )");
+    CHECK(out == "3\n2\n3\n1024\n2\n3\n1\n0\n5\n1\n0\n1\n0\n0\n0\n0\n1\n4\n");
+}

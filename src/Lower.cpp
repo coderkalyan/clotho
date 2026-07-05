@@ -2325,6 +2325,41 @@ private:
             return b.float_cvt(ir::Inst::Tag::FBitcast, v, lower_type(*call.type), l);
         }
 
+        // Real math functions (LRM §20.8.2, Table 20-4): each matches the
+        // equivalent C math library function. slang converts every argument to
+        // real. Constant contexts fold in slang and never reach here.
+        {
+            static constexpr std::pair<std::string_view, ir::RealMathOp> kMath[] = {
+                { "$ln", ir::RealMathOp::Ln },       { "$log10", ir::RealMathOp::Log10 },
+                { "$exp", ir::RealMathOp::Exp },     { "$sqrt", ir::RealMathOp::Sqrt },
+                { "$pow", ir::RealMathOp::Pow },     { "$floor", ir::RealMathOp::Floor },
+                { "$ceil", ir::RealMathOp::Ceil },   { "$sin", ir::RealMathOp::Sin },
+                { "$cos", ir::RealMathOp::Cos },     { "$tan", ir::RealMathOp::Tan },
+                { "$asin", ir::RealMathOp::Asin },   { "$acos", ir::RealMathOp::Acos },
+                { "$atan", ir::RealMathOp::Atan },   { "$atan2", ir::RealMathOp::Atan2 },
+                { "$hypot", ir::RealMathOp::Hypot }, { "$sinh", ir::RealMathOp::Sinh },
+                { "$cosh", ir::RealMathOp::Cosh },   { "$tanh", ir::RealMathOp::Tanh },
+                { "$asinh", ir::RealMathOp::Asinh }, { "$acosh", ir::RealMathOp::Acosh },
+                { "$atanh", ir::RealMathOp::Atanh },
+            };
+            for (const auto& [fname, op] : kMath) {
+                if (name != fname) {
+                    continue;
+                }
+                const bool two = op == ir::RealMathOp::Pow || op == ir::RealMathOp::Atan2 ||
+                                 op == ir::RealMathOp::Hypot;
+                const auto args = call.arguments();
+                if (args.size() != (two ? 2u : 1u)) {
+                    fail(std::string(name) + " expects " + (two ? "two arguments" : "one argument"));
+                }
+                std::vector<ir::Index> vals;
+                for (const Expression* a : args) {
+                    vals.push_back(lower_expr(*a, b));
+                }
+                return b.real_math(op, vals, l);
+            }
+        }
+
         // TODO: $realtime (LRM §20.3.3) returns a real scaled to the module time
         // unit; blocked on real (floating-point) value support in the IR.
         if (name == "$realtime") {
