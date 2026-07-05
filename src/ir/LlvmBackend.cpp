@@ -11,9 +11,13 @@
 #include <span>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
+#include <ankerl/unordered_dense.h>
+
 #include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
+
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DerivedTypes.h>
@@ -3081,20 +3085,30 @@ private:
         return !gate_fan_lo_.empty() && gate_fan_lo_[i] != gate_fan_hi_[i];
     }
 
-    // Build the per-signal fanout CSR: for each signal, the dense slice of
-    // clotho.gate_fanout holding the ids of gates that read it (deduped, so a
-    // gate reading two bits of one vector appears once). Runs before
-    // build_nba_state so the NBA meta table can embed each target's slice.
+    // Build the fanout CSRs over one flat clotho.gate_fanout array:
+    //
+    //   * Per-signal slices (gate_fan_lo_/hi_): every gate reading any bit of
+    //     the signal, deduped. Used by blocking stores and NBA commits, whose
+    //     write may touch any subset of the word.
+    //   * Per-(signal, bit) slices (gate_bitfan_): gates reading exactly that
+    //     bit. A gate's output is a compile-time (signal, bit), so its table
+    //     row embeds this exact slice — a single-bit gate write never wakes
+    //     readers of the vector's other bits. Without this, a gate chain
+    //     threaded through one vector degrades to O(bits) pushes per change.
+    //
+    // Runs before build_nba_state so the NBA meta can embed per-signal slices.
     void build_gate_fanout() {
         const auto gates = mod_.gates();
         const auto nsig  = mod_.signals().size();
         gate_fan_lo_.assign(nsig, 0);
         gate_fan_hi_.assign(nsig, 0);
+        gate_bitfan_.clear();
         if (gates.empty()) {
             return;
         }
 
-        std::vector<std::vector<uint32_t>> fan(nsig);
+        std::vector<std::vector<uint32_t>>                            fan(nsig);
+        ankerl::unordered_dense::map<uint64_t, std::vector<uint32_t>> bitfan;
         for (uint32_t g = 0; g < gates.size(); ++g) {
             const GateInfo& gi = gates[g];
             for (uint32_t k = 0; k < gi.in_count; ++k) {
@@ -3106,19 +3120,33 @@ private:
                 if (f.empty() || f.back() != g) { // inputs of one gate are adjacent
                     f.push_back(g);
                 }
+                std::vector<uint32_t>& bf = bitfan[bitfan_key(in.sig, in.bit)];
+                if (bf.empty() || bf.back() != g) {
+                    bf.push_back(g);
+                }
             }
         }
 
-        auto*                 i32 = llvm::Type::getInt32Ty(ctx_);
         std::vector<uint32_t> flat;
         for (uint32_t s = 0; s < nsig; ++s) {
             gate_fan_lo_[s] = static_cast<uint32_t>(flat.size());
             flat.insert(flat.end(), fan[s].begin(), fan[s].end());
             gate_fan_hi_[s] = static_cast<uint32_t>(flat.size());
         }
+        for (auto& [key, ids] : bitfan) {
+            const auto lo = static_cast<uint32_t>(flat.size());
+            flat.insert(flat.end(), ids.begin(), ids.end());
+            gate_bitfan_[key] = { lo, static_cast<uint32_t>(flat.size()) };
+        }
+
+        auto* i32       = llvm::Type::getInt32Ty(ctx_);
         gate_fanout_ty_ = llvm::ArrayType::get(i32, std::max<size_t>(flat.size(), 1));
         gate_fanout_gv_ = new llvm::GlobalVariable(llmod_, gate_fanout_ty_, true, llvm::GlobalValue::InternalLinkage,
                                                    const_i32_array(gate_fanout_ty_, flat), "clotho.gate_fanout");
+    }
+
+    static uint64_t bitfan_key(Signal sig, uint32_t bit) {
+        return (static_cast<uint64_t>(sig) << 32) | bit;
     }
 
     // An [N x i32] constant array initializer from host values.
@@ -3213,8 +3241,11 @@ private:
             out_may[g]                = mm_byte * 8 + out.width + gi.output.bit;
             out_z[g]                  = z_byte * 8 + gi.output.bit;
             const auto osig       = static_cast<uint32_t>(gi.output.sig);
-            gfan_lo[g]            = gate_fan_lo_[osig];
-            gfan_hi[g]            = gate_fan_hi_[osig];
+            // A gate writes exactly one bit, so its fanout is the per-(signal,
+            // bit) slice: only gates reading THAT bit re-evaluate.
+            const auto bf = gate_bitfan_.find(bitfan_key(gi.output.sig, gi.output.bit));
+            gfan_lo[g]    = bf != gate_bitfan_.end() ? bf->second.first : 0;
+            gfan_hi[g]    = bf != gate_bitfan_.end() ? bf->second.second : 0;
 
             // Waiter side-table row, only for gates whose output signal has
             // process waiters. pos/neg buckets are nulled for a non-LSB output
@@ -8638,6 +8669,9 @@ private:
     // state, and the two generated functions.
     std::vector<uint32_t> gate_fan_lo_;
     std::vector<uint32_t> gate_fan_hi_;
+    // (signal << 32 | bit) -> [lo, hi) slice of clotho.gate_fanout holding the
+    // gates that read exactly that bit; a gate's output row embeds its slice.
+    ankerl::unordered_dense::map<uint64_t, std::pair<uint32_t, uint32_t>> gate_bitfan_;
     llvm::ArrayType*      gate_fanout_ty_ = nullptr;
     llvm::GlobalVariable* gate_fanout_gv_ = nullptr;
     llvm::GlobalVariable* gate_op_gv_       = nullptr;
