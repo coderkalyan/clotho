@@ -71,6 +71,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::TimeFormat:
             return K::TimeFormat;
         case T::Finish:
+        case T::Fflush:
         case T::SimTime:
         case T::Random:
             return K::None;
@@ -79,8 +80,10 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
 
         case T::Mux:
         case T::PartSelect:
+        case T::DynPartSelect:
         case T::ElemSelect:
         case T::Cond:
+        case T::ReadMem:
             return K::OpExtra;
     }
 
@@ -177,6 +180,28 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 scratch[0]    = p.op_extra.op;
                 scratch[1]    = es.index;
                 return { scratch.data(), 2 };
+            }
+            // dyn_part_select exposes its base and the runtime offset value; the
+            // constant width is not an operand.
+            if (tag == Inst::Tag::DynPartSelect) {
+                const auto dps = extra_data<DynPartSelect>(p.op_extra.extra);
+                scratch[0]     = p.op_extra.op;
+                scratch[1]     = dps.offset;
+                return { scratch.data(), 2 };
+            }
+            // read_mem exposes its filename value plus the optional start / finish
+            // address operands; the target memory is a Signal handle, not an operand.
+            if (tag == Inst::Tag::ReadMem) {
+                const auto rm = extra_data<ReadMemInfo>(p.op_extra.extra);
+                size_t     n  = 0;
+                scratch[n++]  = p.op_extra.op;
+                if (rm.has_start) {
+                    scratch[n++] = rm.start;
+                }
+                if (rm.has_finish) {
+                    scratch[n++] = rm.finish;
+                }
+                return { scratch.data(), n };
             }
             scratch[0] = p.op_extra.op;
             return { scratch.data(), 1 };
