@@ -382,6 +382,11 @@ public:
       , config_(config) {}
 
     void run() {
+        if (!mod_.gates().empty()) {
+            // TODO: table-driven gate evaluation; rejecting here keeps a lowered
+            // gate table from being silently dropped at runtime.
+            throw BackendError{ "gate primitives are not yet lowered by the backend" };
+        }
         build_state_types();
         compute_subscription_order();
         compute_fusion_groups(); // before build_wait_queues: bucket capacities count group subscriptions

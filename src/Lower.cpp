@@ -553,10 +553,13 @@ private:
                     scope_  = &scope;
                     break;
                 }
+                case SymbolKind::PrimitiveInstance:
+                    lower_gate(m.as<PrimitiveInstanceSymbol>());
+                    break;
                 case SymbolKind::InstanceArray:
-                    // TODO: instance arrays (foo u[N](...)) — needs per-element
-                    // elaboration and bit-sliced port connections.
-                    fail("instance arrays are not supported");
+                    // Gate arrays lower per-element; module instance arrays fail
+                    // inside (TODO there).
+                    lower_primitive_array(m.as<InstanceArraySymbol>());
                     break;
                 // Known-inert members: elaboration artifacts and declarations
                 // that bear no simulation behavior of their own. Ports are wired
@@ -1156,6 +1159,303 @@ private:
         const ir::SourceLoc l = loc(*init);
         b.binary(ir::Inst::Tag::Store, value_lvalue(ns, b, l), lower_expr(*init, b), l);
         add_continuous_process(continuous_events(*init), to_source_loc(ns.location), b);
+    }
+
+    // -- Gate primitives (LRM 28.4, 28.5) --
+    //
+    // A gate instance is NOT lowered to a process: it becomes one row of the
+    // module's gate table, which the backend turns into constant metadata plus a
+    // shared table-driven eval loop (no per-gate coroutine or code). Terminals
+    // are therefore restricted to static 1-bit locations; any other input
+    // expression is an implicit continuous assignment to an implicit net (LRM
+    // 4.9.6), lowered here as a synthesized temp signal plus an ordinary
+    // continuous-assign process the gate reads from.
+
+    // Map a built-in gate primitive name to its GateOp; nullopt for primitives
+    // outside the supported set.
+    static std::optional<ir::GateOp> gate_op_of(std::string_view name) {
+        if (name == "and") {
+            return ir::GateOp::And;
+        }
+        if (name == "nand") {
+            return ir::GateOp::Nand;
+        }
+        if (name == "or") {
+            return ir::GateOp::Or;
+        }
+        if (name == "nor") {
+            return ir::GateOp::Nor;
+        }
+        if (name == "xor") {
+            return ir::GateOp::Xor;
+        }
+        if (name == "xnor") {
+            return ir::GateOp::Xnor;
+        }
+        if (name == "buf") {
+            return ir::GateOp::Buf;
+        }
+        if (name == "not") {
+            return ir::GateOp::Not;
+        }
+
+        return std::nullopt;
+    }
+
+    // Strip conversion wrappers whose operand is still a packed integral value.
+    // Gate terminals are bound against 1-bit logic, so a `bit` net or a typedef'd
+    // scalar arrives wrapped in a no-op (for our purposes) conversion.
+    static const Expression& unwrap_conversions(const Expression& e) {
+        const Expression* cur = &e;
+        while (cur->kind == ExpressionKind::Conversion) {
+            const Expression& op = cur->as<ConversionExpression>().operand();
+            if (!op.type->isIntegral()) {
+                break;
+            }
+            cur = &op;
+        }
+
+        return *cur;
+    }
+
+    // Resolve a select base to its packed module signal, if it is a (possibly
+    // conversion-wrapped) plain signal reference. Only a width-preserving wrapper
+    // keeps bit positions aligned with the underlying signal's storage; gate
+    // instance arrays slice through such a converted view of the port expression.
+    std::optional<ir::Signal> gate_select_base(const Expression& value) {
+        const Expression& val = unwrap_conversions(value);
+        if (val.kind != ExpressionKind::NamedValue ||
+            val.type->getCanonicalType().getBitWidth() != value.type->getCanonicalType().getBitWidth()) {
+            return std::nullopt;
+        }
+        const ValueSymbol& sym = val.as<NamedValueExpression>().symbol;
+        if (sym.kind == SymbolKind::Parameter || !sigmap_.contains(&sym)) {
+            return std::nullopt;
+        }
+
+        return signal_of(sym);
+    }
+
+    // Normalize a declared index into `value`'s packed range to an LSB-relative
+    // bit position (translateIndex maps both descending and ascending ranges to
+    // distance from the LSB end), so non-zero-based and ascending ranges resolve
+    // correctly.
+    std::optional<uint32_t> gate_select_bit(const Expression& value, const Expression& index) {
+        const std::optional<int64_t> idx = try_const_int(index);
+        if (!idx) {
+            return std::nullopt;
+        }
+        const slang::ConstantRange r = value.type->getCanonicalType().getFixedRange();
+        if (!r.containsPoint(static_cast<int32_t>(*idx))) {
+            return std::nullopt;
+        }
+
+        return static_cast<uint32_t>(r.translateIndex(static_cast<int32_t>(*idx)));
+    }
+
+    // Resolve a terminal expression to a static (signal, bit) location if it is a
+    // plain scalar reference, a constant bit-select, or a constant 1-bit
+    // part-select of a packed signal (gate instance arrays produce the latter).
+    std::optional<ir::GateTerm> gate_static_term(const Expression& e) {
+        const Expression& base = unwrap_conversions(e);
+        if (base.kind == ExpressionKind::NamedValue) {
+            const ValueSymbol& sym = base.as<NamedValueExpression>().symbol;
+            if (sym.kind == SymbolKind::Parameter || !sigmap_.contains(&sym)) {
+                return std::nullopt;
+            }
+            if (base.type->getCanonicalType().getBitWidth() != 1) {
+                return std::nullopt;
+            }
+
+            return ir::GateTerm{ .sig = signal_of(sym), .bit = 0 };
+        }
+        if (base.kind == ExpressionKind::ElementSelect) {
+            const ElementSelectExpression& es = base.as<ElementSelectExpression>();
+            if (is_unpacked_array(es.value())) {
+                return std::nullopt;
+            }
+            const auto sig = gate_select_base(es.value());
+            const auto bit = sig ? gate_select_bit(es.value(), es.selector()) : std::nullopt;
+            if (!bit) {
+                return std::nullopt;
+            }
+
+            return ir::GateTerm{ .sig = *sig, .bit = *bit };
+        }
+        if (base.kind == ExpressionKind::RangeSelect) {
+            const RangeSelectExpression& rs = base.as<RangeSelectExpression>();
+            if (rs.getSelectionKind() != RangeSelectionKind::Simple ||
+                base.type->getCanonicalType().getBitWidth() != 1 || is_unpacked_array(rs.value())) {
+                return std::nullopt;
+            }
+            const auto sig = gate_select_base(rs.value());
+            const auto bit = sig ? gate_select_bit(rs.value(), rs.right()) : std::nullopt;
+            if (!bit) {
+                return std::nullopt;
+            }
+
+            return ir::GateTerm{ .sig = *sig, .bit = *bit };
+        }
+
+        return std::nullopt;
+    }
+
+    // Evaluate a constant integer expression, returning nullopt instead of
+    // failing (unlike const_uint) so callers can fall back to a runtime path.
+    std::optional<int64_t> try_const_int(const Expression& e) {
+        slang::ast::ASTContext     astCtx(*scope_, slang::ast::LookupLocation::max);
+        slang::ast::EvalContext    evalCtx(astCtx);
+        const slang::ConstantValue cv = e.eval(evalCtx);
+        if (!cv.isInteger()) {
+            return std::nullopt;
+        }
+
+        return cv.integer().as<int64_t>();
+    }
+
+    // Lower one gate input terminal to a GateInput: a compile-time constant plane
+    // code, a static 1-bit location, or (the general case, LRM 4.9.6) a synthesized
+    // temp net continuously assigned from the expression.
+    ir::GateInput lower_gate_input(const Expression& e, std::string_view inst_name, uint32_t input_index) {
+        // Constant fold first: literals, parameters, and constant expressions
+        // (tie cells) melt into the gate at compile time. The terminal is bound
+        // as 1-bit logic, so bit 0 of the folded value is the input; x and z both
+        // fold to the X plane code (Z reads as X, LRM Table 28-3).
+        {
+            slang::ast::ASTContext     astCtx(*scope_, slang::ast::LookupLocation::max);
+            slang::ast::EvalContext    evalCtx(astCtx);
+            const slang::ConstantValue cv = e.eval(evalCtx);
+            if (cv.isInteger()) {
+                const slang::logic_t bit  = cv.integer()[0];
+                const uint8_t        code = bit.isUnknown() ? 0b10 : (bit.value != 0 ? 0b11 : 0b00);
+
+                return ir::GateInput{ .const_code = code, .is_const = true };
+            }
+        }
+
+        if (const auto term = gate_static_term(e)) {
+            return ir::GateInput{ .sig = term->sig, .bit = term->bit };
+        }
+
+        // Implicit continuous assign to an implicit net: temp = expr, sensitive
+        // to the expression's reads, evaluated at time zero like any continuous
+        // assign (mirrors lower_continuous_assign).
+        ir::SignalInfo info;
+        info.name = prefix_ + "$gate" + std::to_string(temp_id_++) + "." + std::string(inst_name) + ".in" +
+                    std::to_string(input_index);
+        info.type            = module_.pool.logic_type;
+        const ir::Signal tmp = module_.add_signal(std::move(info));
+
+        ir::Builder         b(module_.pool);
+        const ir::SourceLoc l = loc(e);
+        b.binary(ir::Inst::Tag::Store, b.signal(tmp, l), b.resize(lower_expr(e, b), module_.pool.logic_type, l), l);
+
+        std::vector<ir::WaitEvent> wait_events;
+        SensitivityCollector       c(sigmap_);
+        e.visit(c);
+        for (const ir::Signal s : c.reads) {
+            wait_events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
+        }
+        module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
+                                         .wait_events = std::move(wait_events),
+                                         .self_start  = true,
+                                         .loc         = l,
+                                         .ir          = b.finish() });
+
+        return ir::GateInput{ .sig = tmp, .bit = 0 };
+    }
+
+    // Lower one gate output terminal. slang wraps each output connection in an
+    // AssignmentExpression whose left() is the driven lvalue; only a static 1-bit
+    // location on a 4-state signal is accepted (a gate can drive X, which a
+    // 2-state slot cannot hold).
+    ir::GateTerm lower_gate_output(const Expression& conn) {
+        if (conn.kind != ExpressionKind::Assignment) {
+            fail("malformed gate output terminal");
+        }
+        const Expression& lhs = conn.as<AssignmentExpression>().left();
+        if (!lhs.type->isFourState()) {
+            // TODO: gate outputs on 2-state nets need an X-coercion policy.
+            fail("gate output on a 2-state net is not supported");
+        }
+        const auto term = gate_static_term(lhs);
+        if (!term) {
+            // TODO: concatenation / part-select / unpacked-element gate output
+            // lvalues (rare in netlists).
+            fail("unsupported gate output terminal");
+        }
+
+        return *term;
+    }
+
+    void lower_gate(const PrimitiveInstanceSymbol& gi) {
+        const PrimitiveSymbol& prim = gi.primitiveType;
+        const auto             op   = gate_op_of(prim.name);
+        const bool             supported_kind =
+            prim.primitiveKind == PrimitiveSymbol::NInput || prim.primitiveKind == PrimitiveSymbol::NOutput;
+        if (!op || !supported_kind) {
+            // TODO: tri-state gates (bufif*/notif*), MOS / bidirectional
+            // switches, pullup/pulldown (need Z generation and driver strength
+            // resolution) and user-defined primitives.
+            fail("gate primitive '" + std::string(prim.name) + "' is not supported");
+        }
+        if (gi.getDelay() != nullptr) {
+            // TODO: gate delays (rise/fall pairs, inertial semantics, LRM 28.16).
+            fail("gate delay is not supported");
+        }
+        const auto [s0, s1] = gi.getDriveStrength();
+        if ((s0 && *s0 != DriveStrength::Strong) || (s1 && *s1 != DriveStrength::Strong)) {
+            // TODO: drive strengths (needs multi-driver resolution). The default
+            // (strong0, strong1), written out explicitly, is accepted as-is.
+            fail("gate drive strength is not supported");
+        }
+
+        const auto conns = gi.getPortConnections();
+        if (conns.size() < 2) {
+            // slang has already diagnosed a malformed terminal list.
+            fail("malformed gate terminal list");
+        }
+
+        // NInput: terminal 0 is the output, the rest are inputs. NOutput (buf /
+        // not): the last terminal is the input, the rest are outputs — lowered as
+        // one independent single-output gate per output terminal.
+        const bool n_output    = prim.primitiveKind == PrimitiveSymbol::NOutput;
+        const auto input_span  = n_output ? conns.subspan(conns.size() - 1) : conns.subspan(1);
+        const auto output_span = n_output ? conns.subspan(0, conns.size() - 1) : conns.subspan(0, 1);
+
+        std::vector<ir::GateInput> inputs;
+        inputs.reserve(input_span.size());
+        for (size_t i = 0; i < input_span.size(); ++i) {
+            inputs.push_back(lower_gate_input(*input_span[i], gi.name, static_cast<uint32_t>(i)));
+        }
+
+        for (const Expression* out : output_span) {
+            module_.add_gate(ir::GateInfo{ .op     = *op,
+                                           .output = lower_gate_output(*out),
+                                           .loc    = to_source_loc(gi.location) },
+                             inputs);
+        }
+    }
+
+    // Lower an array of gate instances: slang has already elaborated one
+    // PrimitiveInstanceSymbol per element with per-instance bit-sliced terminal
+    // connections (LRM 28.3.6), so each leaf lowers like a scalar gate. Module
+    // instance arrays still fail (first non-primitive leaf aborts lowering).
+    void lower_primitive_array(const InstanceArraySymbol& arr) {
+        for (const Symbol* el : arr.elements) {
+            switch (el->kind) {
+                case SymbolKind::PrimitiveInstance:
+                    lower_gate(el->as<PrimitiveInstanceSymbol>());
+                    break;
+                case SymbolKind::InstanceArray:
+                    lower_primitive_array(el->as<InstanceArraySymbol>());
+                    break;
+                default:
+                    // TODO: module instance arrays (foo u[N](...)) — need
+                    // per-element elaboration and bit-sliced port connections.
+                    fail("instance arrays are not supported");
+            }
+        }
     }
 
     // Wire one child instance's ports to the parent. Each connection becomes a
