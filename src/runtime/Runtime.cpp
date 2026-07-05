@@ -1625,7 +1625,10 @@ extern "C" void rt_string_to_packed(const rt_string* s, uint8_t* out, uint32_t w
 }
 
 extern "C" void* rt_alloc(uint64_t size) {
-    return std::malloc(size);
+    // Coroutine frames may be over-aligned (16-byte plane spills); glibc
+    // malloc guarantees only 16, so align generously. aligned_alloc requires
+    // the size to be a multiple of the alignment.
+    return std::aligned_alloc(64, (size + 63) / 64 * 64);
 }
 
 extern "C" void rt_free(void* p) {

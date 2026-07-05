@@ -905,8 +905,12 @@ private:
         // Dynamic frame: rt_alloc(coro.size). The sim owns frame memory so a frame
         // outlives the ramp while the process is suspended on the wheel.
         b_.SetInsertPoint(alloc_bb);
-        auto* size = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_size, { b_.getInt64Ty() }), {});
-        auto* mem  = b_.CreateCall(alloc_fn(), { size });
+        // Over-allocate by coro.align: with an over-aligned frame (e.g. an i128
+        // plane spill) CoroSplit lays out fields past coro.size unless the
+        // allocation covers the realignment slack (LLVM coroutine contract).
+        auto* size  = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_size, { b_.getInt64Ty() }), {});
+        auto* align = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_align, { b_.getInt64Ty() }), {});
+        auto* mem   = b_.CreateCall(alloc_fn(), { b_.CreateAdd(size, align) });
         b_.CreateBr(begin_bb);
 
         b_.SetInsertPoint(begin_bb);
@@ -1313,8 +1317,12 @@ private:
         b_.CreateCondBr(need, alloc_bb, begin_bb);
 
         b_.SetInsertPoint(alloc_bb);
-        auto* size = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_size, { b_.getInt64Ty() }), {});
-        auto* mem  = b_.CreateCall(alloc_fn(), { size });
+        // Over-allocate by coro.align: with an over-aligned frame (e.g. an i128
+        // plane spill) CoroSplit lays out fields past coro.size unless the
+        // allocation covers the realignment slack (LLVM coroutine contract).
+        auto* size  = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_size, { b_.getInt64Ty() }), {});
+        auto* align = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_align, { b_.getInt64Ty() }), {});
+        auto* mem   = b_.CreateCall(alloc_fn(), { b_.CreateAdd(size, align) });
         b_.CreateBr(begin_bb);
 
         b_.SetInsertPoint(begin_bb);
