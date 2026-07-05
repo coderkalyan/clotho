@@ -263,3 +263,28 @@ TEST_CASE("%h of a real is rejected loudly") {
     expect_reject(R"(module m; initial $display("%h", 1.5); endmodule)",
                   "%h with a real argument is not supported");
 }
+
+TEST_CASE("LRM 20.5 conversion system functions") {
+    const std::string out = run_capture(R"(
+        module t;
+            real r;
+            integer i;
+            reg [63:0] b64;
+            shortreal s;
+            reg [31:0] b32;
+            initial begin
+                i = $rtoi(123.45);   $display("%0d", i); // truncates
+                i = $rtoi(-15.7);    $display("%0d", i); // -15: toward zero
+                i = int'(-15.7);     $display("%0d", i); // -16: cast rounds (6.12.1)
+                r = $itor(123);      $display("%g", r);
+                b64 = $realtobits(1.0); $display("%0d", b64);
+                r = $bitstoreal(b64);   $display("%g", r);
+                s = 1.5;
+                b32 = $shortrealtobits(s); $display("%h", b32);
+                s = $bitstoshortreal(32'h3fc00000); $display("%g", s);
+                r = $bitstoreal($realtobits(3.14159)); $display("%g", r);
+            end
+        endmodule
+    )");
+    CHECK(out == "123\n-15\n-16\n123\n4607182418800017408\n1\n3fc00000\n1.5\n3.14159\n");
+}

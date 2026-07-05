@@ -2302,6 +2302,29 @@ private:
             return b.fread_word(dst, fd, l);
         }
 
+        // Real conversion functions (LRM §20.5). Constant contexts never reach
+        // here — slang folds them.
+        if (name == "$rtoi" || name == "$itor" || name == "$realtobits" || name == "$bitstoreal" ||
+            name == "$shortrealtobits" || name == "$bitstoshortreal") {
+            if (call.arguments().size() != 1) {
+                fail(std::string(name) + " expects exactly one argument");
+            }
+            // slang has converted the argument to the function's formal type
+            // (real / shortreal / 64- or 32-bit vector), so only the result
+            // conversion is lowered here.
+            const ir::Index v = lower_expr(*call.arguments()[0], b);
+            if (name == "$rtoi") {
+                // Truncates toward zero — unlike assignment conversion, which
+                // rounds (LRM 20.5 vs 6.12.1).
+                return b.float_cvt(ir::Inst::Tag::FtoITrunc, v, lower_type(*call.type), l);
+            }
+            if (name == "$itor") {
+                return b.float_cvt(ir::Inst::Tag::ItoF, v, lower_type(*call.type), l);
+            }
+            // The four bit-pattern reinterpretations.
+            return b.float_cvt(ir::Inst::Tag::FBitcast, v, lower_type(*call.type), l);
+        }
+
         // TODO: $realtime (LRM §20.3.3) returns a real scaled to the module time
         // unit; blocked on real (floating-point) value support in the IR.
         if (name == "$realtime") {
