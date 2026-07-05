@@ -319,3 +319,38 @@ TEST_CASE("LRM 20.8.2 real math functions match C libm") {
     )");
     CHECK(out == "3\n2\n3\n1024\n2\n3\n1\n0\n5\n1\n0\n1\n0\n0\n0\n0\n1\n4\n");
 }
+
+TEST_CASE("$realtime keeps the sub-unit fraction and %t accepts reals") {
+    // The fast child pins the wheel tick at 1ns; the top's unit is 10ns, so a
+    // 16ns event reads as 1.6 units from $realtime while $time rounds to 2
+    // (LRM 20.3.1 / 20.3.3).
+    const std::string out = run_capture(R"(
+        `timescale 1ns/1ns
+        module fast(output reg fire);
+            initial begin fire = 0; #16 fire = 1; end
+        endmodule
+        `timescale 10ns/1ns
+        module t;
+            wire fire;
+            fast f(fire);
+            initial begin
+                @(posedge fire);
+                $display("%g", $realtime);
+                $display("%0d", $time);
+                $timeformat(-9, 2, " ns", 10);
+                $display("%t", $realtime);
+                $display("%t", 1.5); // a raw real scales in the real domain
+            end
+        endmodule
+    )");
+    CHECK(out == "1.6\n2\n  16.00 ns\n  15.00 ns\n");
+}
+
+TEST_CASE("$realtime inside a function is rejected loudly") {
+    expect_reject(R"(
+        module m;
+            function real f(); return $realtime; endfunction
+            initial $display("%g", f());
+        endmodule
+    )", "$realtime inside a function is not supported");
+}

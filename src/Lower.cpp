@@ -2128,13 +2128,14 @@ private:
             return lower_string_method(name, call, b);
         }
 
-        if (fn_ctx_ != nullptr && !fn_ctx_->is_task && (name == "$time" || name == "$stime")) {
+        if (fn_ctx_ != nullptr && !fn_ctx_->is_task &&
+            (name == "$time" || name == "$stime" || name == "$realtime")) {
             // A function is a plain callable with no wheel pointer in its ABI, so
             // it cannot read the simulation clock. Reject rather than emit a
             // SimTime that would dereference a stale wheel. A task is a coroutine
             // and does carry the wheel, so $time is allowed there.
             // TODO: thread the wheel into the function ABI to support this.
-            fail("$time / $stime inside a function is not supported");
+            fail("$time / $stime / $realtime inside a function is not supported");
         }
 
         // $time: 64-bit, scaled to the calling module's time unit (LRM §20.3.1).
@@ -2360,10 +2361,17 @@ private:
             }
         }
 
-        // TODO: $realtime (LRM §20.3.3) returns a real scaled to the module time
-        // unit; blocked on real (floating-point) value support in the IR.
+        // $realtime (LRM §20.3.3): the raw wheel tick count as a real, divided
+        // by the unit multiplier so the fractional part below the module time
+        // unit survives ($time's round-to-unit does not apply).
         if (name == "$realtime") {
-            fail("$realtime is not supported (no real-type support)");
+            const ir::Index ticks = b.float_cvt(ir::Inst::Tag::ItoF, b.sim_time(1, l), module_.pool.real_type, l);
+            if (time_mul_ <= 1) {
+                return ticks;
+            }
+            const ir::Index mul =
+              b.constant(module_.pool.put_real(module_.pool.real_type, static_cast<double>(time_mul_)), l);
+            return b.binary(ir::Inst::Tag::FDiv, ticks, mul, l);
         }
         fail("unsupported system function '" + std::string(name) + "'");
     }
@@ -2598,9 +2606,7 @@ private:
                             v = b.float_cvt(ir::Inst::Tag::FtoI, v, make_int_type(64, false, true), al);
                             break;
                         case 't':
-                            // TODO: %t with a real (realtime) argument — needs the
-                            // real tick-scaling path (lands with $realtime).
-                            fail("%t with a real argument is not supported");
+                            break; // scale_to_ticks below has the real path
                         default:
                             // %h / %o / %b / %c take integral operands only
                             // (LRM 21.2.1.1).
@@ -2723,7 +2729,20 @@ private:
     ir::Index scale_to_ticks(const Expression& arg, ir::Index v, ir::Builder& b) {
         const ir::SourceLoc l   = loc(arg);
         const ir::Ref       u64 = make_int_type(64, false, false);
-        const ir::Index     w   = b.resize(v, u64, l);
+        if (arg.type->isFloating()) {
+            // A real (realtime) argument scales in the real domain, then rounds
+            // to the nearest tick (FtoI rounds half away from zero); only
+            // sub-tick fraction is lost, which the tick-based %t renderer
+            // cannot represent anyway.
+            ir::Index scaled = v;
+            if (time_mul_ > 1) {
+                const ir::Index mul =
+                  b.constant(module_.pool.put_real(module_.pool.real_type, static_cast<double>(time_mul_)), l);
+                scaled = b.binary(ir::Inst::Tag::FMul, v, mul, l);
+            }
+            return b.float_cvt(ir::Inst::Tag::FtoI, scaled, u64, l);
+        }
+        const ir::Index w = b.resize(v, u64, l);
         if (time_mul_ <= 1) {
             return w;
         }
