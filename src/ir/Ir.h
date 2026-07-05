@@ -278,6 +278,27 @@ struct ScanfInfo {
     ExtraSlice args;
 };
 
+// Extra payload for `fread_word`: $fread(reg, fd) (LRM §21.3.4) reads raw bytes into
+// the packed-vector lvalue `reg` (the instruction's `op`). `fd` is a value operand.
+struct FreadWordInfo {
+    // File-descriptor value operand.
+    Index fd;
+};
+
+// Extra payload for `fread_mem`: $fread(mem, fd[, start[, count]]) reads raw bytes
+// into the unpacked-array memory `mem`. The fd value is the instruction's `op`;
+// `start` / `count` are optional address / element-count operands (valid per has_*).
+struct FreadMemInfo {
+    // Destination memory signal.
+    Signal mem;
+    // Optional first-address and max-element-count operands.
+    Index start;
+    Index count;
+    // Whether the start / count operands are present.
+    uint32_t has_start;
+    uint32_t has_count;
+};
+
 // Extra payload for `timeformat`: a $timeformat system task. `units`,
 // `precision`, and `min_width` are value operands (general runtime rvalues); the
 // suffix string is appended after the formatted number and lives packed
@@ -329,6 +350,8 @@ static_assert(ExtraPayload<FgetsInfo>);
 static_assert(ExtraPayload<SformatInfo>);
 static_assert(ExtraPayload<FerrorInfo>);
 static_assert(ExtraPayload<ScanfInfo>);
+static_assert(ExtraPayload<FreadWordInfo>);
+static_assert(ExtraPayload<FreadMemInfo>);
 static_assert(ExtraPayload<TimeFormatInfo>);
 static_assert(ExtraPayload<WaitEdge>);
 static_assert(ExtraPayload<WaitInfo>);
@@ -505,6 +528,13 @@ struct Inst {
         // conversion count (payload: extra -> ScanfInfo). LRM §21.3.4. Lowers to an
         // rt_fscanf / rt_sscanf call.
         Scanf,
+        // $fread into a single packed-vector lvalue (payload: op_extra ->
+        // FreadWordInfo; op is the destination lvalue), -> bytes read. LRM §21.3.4.
+        // Lowers to an rt_fread call.
+        FreadWord,
+        // $fread into an unpacked-array memory (payload: op_extra -> FreadMemInfo;
+        // op is the fd value), -> bytes read. LRM §21.3.4. Lowers to an rt_fread call.
+        FreadMem,
         // $timeformat: set the %t format (units / precision / suffix / min width)
         // for all later %t specifiers (payload: timeformat -> TimeFormatInfo).
         // LRM §20.4.3. Lowers to an rt_timeformat_set call.

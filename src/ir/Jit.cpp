@@ -94,6 +94,7 @@ int run_jit(const Module& m, Timings* timings) {
     expose("rt_ferror", &rt_ferror);
     expose("rt_fscanf", &rt_fscanf);
     expose("rt_sscanf", &rt_sscanf);
+    expose("rt_fread", &rt_fread);
     expose("rt_timeformat_init", &rt_timeformat_init);
     expose("rt_timeformat_set", &rt_timeformat_set);
     expose("rt_finish", &rt_finish);

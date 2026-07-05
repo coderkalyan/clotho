@@ -108,6 +108,13 @@ public:
     // `is_string`) per `fmt` into the output lvalues `args`. Yields the conversion
     // count.
     Index scanf(Index source, bool is_string, std::string_view fmt, std::span<const Index> args, SourceLoc loc);
+    // $fread(reg, fd): read raw bytes from `fd` into the packed-vector lvalue `dst`.
+    // Yields the byte count.
+    Index fread_word(Index dst, Index fd, SourceLoc loc);
+    // $fread(mem, fd[, start[, count]]): read raw bytes from `fd` into the memory
+    // signal `mem`. Yields the byte count.
+    Index fread_mem(Index fd, Signal mem, Index start, Index count, bool has_start, bool has_count,
+                    SourceLoc loc);
     // $finish / $stop: end the simulation and exit. No operands.
     Index finish(SourceLoc loc);
     // $fflush: flush the descriptor `handle`'s output buffers. The no-argument

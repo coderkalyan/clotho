@@ -1483,7 +1483,7 @@ private:
         }
         if (name == "$fgets" || name == "$fgetc" || name == "$ungetc" || name == "$feof" ||
             name == "$ftell" || name == "$fseek" || name == "$rewind" || name == "$ferror" ||
-            name == "$fscanf" || name == "$sscanf") {
+            name == "$fscanf" || name == "$sscanf" || name == "$fread") {
             // File read / positioning / error / scan functions used in statement
             // position: lower for the side effect (file position, write-back) and
             // drop the result.
@@ -1869,6 +1869,43 @@ private:
         // $fscanf(fd, fmt, args) / $sscanf(str, fmt, args) (LRM §21.3.4).
         if (name == "$fscanf" || name == "$sscanf") {
             return lower_scanf(call, name == "$sscanf", b, l);
+        }
+
+        // $fread(target, fd[, start[, count]]) (LRM §21.3.4): binary read into a
+        // single vector or a whole unpacked-array memory. The memory form (like
+        // $readmem) takes optional start-address and element-count bounds.
+        if (name == "$fread") {
+            const auto args = call.arguments();
+            if (args.size() < 2 || args.size() > 4) {
+                fail("$fread requires 2 to 4 arguments");
+            }
+            const Expression& target = *args[0];
+            if (is_unpacked_array(target)) {
+                const auto* vsb = target.as_if<slang::ast::ValueExpressionBase>();
+                if (vsb == nullptr) {
+                    // TODO: a sliced memory target (mem[a:b]).
+                    fail("$fread memory target must be a whole unpacked-array memory");
+                }
+                const ir::Signal mem       = signal_of(vsb->symbol);
+                const ir::Index  fd        = lower_expr(*args[1], b);
+                const bool       has_start = args.size() >= 3;
+                const bool       has_count = args.size() >= 4;
+                ir::Index        start     = fd; // placeholder unless present
+                ir::Index        cnt       = fd;
+                if (has_start) {
+                    start = lower_expr(*args[2], b);
+                }
+                if (has_count) {
+                    cnt = lower_expr(*args[3], b);
+                }
+                return b.fread_mem(fd, mem, start, cnt, has_start, has_count, l);
+            }
+            if (args.size() != 2) {
+                fail("$fread into a scalar variable takes exactly two arguments");
+            }
+            const ir::Index dst = lower_lvalue(target, b);
+            const ir::Index fd  = lower_expr(*args[1], b);
+            return b.fread_word(dst, fd, l);
         }
 
         // TODO: $realtime (LRM §20.3.3) returns a real scaled to the module time

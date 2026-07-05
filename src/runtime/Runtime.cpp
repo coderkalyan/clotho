@@ -880,12 +880,48 @@ int bin_digit(char c) {
 
 } // namespace
 
+namespace {
+
+// Destination geometry for a bulk memory load, shared by $readmem and $fread:
+// element i's planes live at mm_base / z_base + i*stride, each `width` bits (<=64,
+// enforced by the backend). A 2-state memory (four_state=false) has no z plane and
+// stores x/z as 0. A scalar target is just count == 1.
+struct MemDest {
+    uint8_t* mm_base;
+    uint8_t* z_base;
+    uint32_t stride;
+    uint32_t count;
+    uint32_t width;
+    bool     four_state;
+};
+
+// Write one element's value planes at storage index `idx` (bounds-checked).
+void mem_write(const MemDest& d, int64_t idx, uint64_t must, uint64_t may, uint64_t z) {
+    if (idx < 0 || idx >= static_cast<int64_t>(d.count)) {
+        return;
+    }
+    if (!d.four_state) {
+        may = must;
+        z   = 0;
+    }
+    write_word_planes(d.mm_base + static_cast<size_t>(idx) * d.stride,
+                      d.z_base + static_cast<size_t>(idx) * d.stride, d.width, must, may, z);
+}
+
+// Map a declared-range address to a 0-based storage index: an ascending range
+// counts up from decl_left, a descending range counts down from it.
+int64_t norm_addr(int64_t decl_left, int64_t decl_right, int64_t addr) {
+    return decl_left <= decl_right ? addr - decl_left : decl_left - addr;
+}
+
+} // namespace
+
 // $readmemh / $readmemb (LRM §21.4). Loads a hex/binary text file into an unpacked
 // array. The destination planes live in the JIT state buffer: element i's must|may
 // word is at mm_base + i*stride, its z word at z_base + i*stride (the backend passes
 // the two region bases, already offset to element 0). Each parsed token is assembled
 // into u64 must / may / z accumulators (element width <= 64, enforced by the backend)
-// and written with two memcpys of the field byte sizes — no per-element allocation.
+// and written through mem_write — no per-element allocation.
 extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8_t* z_base,
                            uint32_t stride, uint32_t count, uint32_t width, int64_t decl_left,
                            int64_t decl_right, int64_t start, int64_t finish, uint32_t flags) {
@@ -912,13 +948,6 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
     }
     std::fclose(f);
 
-    // Map a declared-range address to a 0-based storage index (mirrors the element
-    // select normalization): ascending range counts up from `decl_left`, descending
-    // counts down from it.
-    const auto norm = [&](int64_t a) -> int64_t {
-        return decl_left <= decl_right ? a - decl_left : decl_left - a;
-    };
-
     // Iteration runs in declared-address space, not storage-index space (LRM
     // §21.4). The default start is the *lowest* address and loading proceeds upward
     // toward the highest, regardless of the range direction; a start-only form also
@@ -935,18 +964,13 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
     const int      bits   = hex ? 4 : 1;
     const uint64_t nibble = hex ? 0xFu : 0x1u;
 
-    const auto write_elem = [&](int64_t idx, uint64_t must, uint64_t may, uint64_t z) {
+    const MemDest dest{ mm_base, z_base, stride, count, width, four_state };
+    const auto    write_elem = [&](int64_t idx, uint64_t must, uint64_t may, uint64_t z) {
         if (idx < 0 || idx >= static_cast<int64_t>(count)) {
             std::fprintf(stderr, "$readmem: address out of range for '%s'\n", path.c_str());
             return;
         }
-        if (!four_state) {
-            // A 2-state memory has no z plane and reads x/z as 0.
-            may = must;
-            z   = 0;
-        }
-        write_word_planes(mm_base + static_cast<size_t>(idx) * stride,
-                          z_base + static_cast<size_t>(idx) * stride, width, must, may, z);
+        mem_write(dest, idx, must, may, z);
     };
 
     const size_t n = buf.size();
@@ -1028,9 +1052,61 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
             std::fprintf(stderr, "$readmem: more data than the memory range for '%s'\n", path.c_str());
             break;
         }
-        write_elem(norm(addr), must, may, z);
+        write_elem(norm_addr(decl_left, decl_right, addr), must, may, z);
         addr += dir;
     }
+}
+
+extern "C" int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint32_t stride, uint32_t count,
+                            uint32_t width, uint32_t four_state, int64_t decl_left, int64_t decl_right,
+                            int64_t start, int64_t max_count, uint32_t flags) {
+    // $fread (LRM §21.3.4): read raw bytes from `fd` into a memory (or a scalar,
+    // count == 1), MSB-first per element. Fills from the `start` declared address
+    // (default the lowest) upward, at most `max_count` elements. Shares the memory
+    // destination substrate with $readmem; only the byte source differs. Returns the
+    // number of bytes read.
+    io_ensure_init();
+    std::FILE* f = fd_stream(fd);
+    if (f == nullptr) {
+        return 0;
+    }
+    const bool     has_start  = (flags & 1u) != 0;
+    const bool     has_count  = (flags & 2u) != 0;
+    const MemDest  dest{ mm_base, z_base, stride, count, width, four_state != 0 };
+    const uint32_t elem_bytes = (width + 7) / 8;
+
+    const int64_t lo        = decl_left < decl_right ? decl_left : decl_right;
+    const int64_t hi        = decl_left < decl_right ? decl_right : decl_left;
+    int64_t       addr      = has_start ? start : lo;
+    int64_t       remaining = has_count ? max_count : static_cast<int64_t>(count);
+
+    int32_t bytes_read = 0;
+    while (addr <= hi && remaining > 0) {
+        uint64_t val = 0;
+        uint32_t nb  = 0;
+        while (nb < elem_bytes) {
+            const int c = std::fgetc(f);
+            if (c == EOF) {
+                break;
+            }
+            val = (val << 8) | static_cast<uint8_t>(c);
+            ++nb;
+            ++bytes_read;
+        }
+        if (nb == 0) {
+            break; // EOF before this element
+        }
+        // MSB-first: a short final element left-shifts so the bytes read occupy the
+        // high end and the missing low bytes stay 0.
+        val <<= 8u * (elem_bytes - nb);
+        mem_write(dest, norm_addr(decl_left, decl_right, addr), val, val, 0);
+        ++addr;
+        --remaining;
+        if (nb < elem_bytes) {
+            break; // hit EOF mid-element
+        }
+    }
+    return bytes_read;
 }
 
 extern "C" int32_t rt_random(void) {

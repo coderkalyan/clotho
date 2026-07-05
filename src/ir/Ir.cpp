@@ -92,6 +92,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Fopen:
         case T::Fgets:
         case T::Ferror:
+        case T::FreadWord:
+        case T::FreadMem:
             return K::OpExtra;
     }
 

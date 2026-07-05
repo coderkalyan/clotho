@@ -2489,6 +2489,8 @@ private:
             case Inst::Tag::Fgets:
             case Inst::Tag::Ferror:
             case Inst::Tag::Scanf:
+            case Inst::Tag::FreadWord:
+            case Inst::Tag::FreadMem:
                 // The file read / positioning / error / scan functions return i32.
                 return { 32, false, true };
 
@@ -2848,6 +2850,14 @@ private:
 
             case Inst::Tag::Scanf:
                 lower_scanf(i);
+                return;
+
+            case Inst::Tag::FreadWord:
+                lower_fread_word(i);
+                return;
+
+            case Inst::Tag::FreadMem:
+                lower_fread_mem(i);
                 return;
 
             case Inst::Tag::ReadMem:
@@ -3490,6 +3500,75 @@ private:
         auto* fnty = llvm::FunctionType::get(
           b_.getVoidTy(), { ptr, i32, ptr, ptr, i32, i32, i32, i64, i64, i64, i64, i32 }, false);
         return llmod_.getOrInsertFunction("rt_readmem", fnty);
+    }
+
+    // i32 rt_fread(i32 fd, i8* mm, i8* z, i32 stride, i32 count, i32 width, i32 four,
+    //              i64 decl_left, i64 decl_right, i64 start, i64 max_count, i32 flags)
+    llvm::FunctionCallee fread_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* i64  = b_.getInt64Ty();
+        auto* fnty = llvm::FunctionType::get(
+          i32, { i32, ptr, ptr, i32, i32, i32, i32, i64, i64, i64, i64, i32 }, false);
+        return llmod_.getOrInsertFunction("rt_fread", fnty);
+    }
+
+    // Lower a $fread into a single vector: one element, no addressing. The runtime
+    // reads ceil(width/8) bytes MSB-first into the destination planes.
+    void lower_fread_word(Index i) {
+        const Index dst  = ir_->payload(i).op_extra.op;
+        const auto  info = ir_->extra_data<FreadWordInfo>(ir_->payload(i).op_extra.extra);
+
+        const LValue& lv = lvalue_of(dst);
+        if (lv.width != lv.store_width) {
+            throw BackendError{ "$fread into a part-select target is not supported" };
+        }
+        if (lv.store_width > 64) {
+            throw BackendError{ "$fread into a target wider than 64 bits is not supported" };
+        }
+        llvm::Value* mm = lv.dyn_off != nullptr ? elem_ptr(lv.base, lv.off_mm, lv.dyn_off)
+                                                : field_ptr(lv.base, lv.off_mm);
+        llvm::Value* z  = lv.dyn_off != nullptr ? elem_ptr(lv.base, lv.off_z, lv.dyn_off)
+                                                : field_ptr(lv.base, lv.off_z);
+        llvm::Value* fd = cast(must_of(value_of(info.fd)), 32, true);
+
+        const uint32_t four = type_of(dst).four_state ? 1u : 0u;
+        llvm::Value*   r    = b_.CreateCall(fread_fn(),
+                                            { fd, mm, z, b_.getInt32(0), b_.getInt32(1), b_.getInt32(lv.store_width),
+                                              b_.getInt32(four), b_.getInt64(0), b_.getInt64(0), b_.getInt64(0),
+                                              b_.getInt64(0), b_.getInt32(0) });
+        set_value(i, packed(r, r, zero(32)));
+    }
+
+    // Lower a $fread into a memory: reuse the $readmem geometry (plane bases,
+    // stride, count, declared bounds) with optional start-address / element-count
+    // operands, and read binary bytes MSB-first per element.
+    void lower_fread_mem(Index i) {
+        const Index fdi  = ir_->payload(i).op_extra.op;
+        const auto  info = ir_->extra_data<FreadMemInfo>(ir_->payload(i).op_extra.extra);
+
+        const SignalSlot& s = slot_of(info.mem);
+        if (!s.is_array) {
+            throw BackendError{ "$fread memory target is not a memory" };
+        }
+        if (s.width > 64) {
+            throw BackendError{ "$fread into a memory with elements wider than 64 bits is not supported" };
+        }
+        llvm::Value* mm_base = field_ptr(state_, s.off_mm);
+        llvm::Value* z_base  = field_ptr(state_, s.off_z);
+        const Type&  at      = std::get<Type>(mod_.pool.get(mod_.signal(info.mem).type));
+
+        llvm::Value*   fd     = cast(must_of(value_of(fdi)), 32, true);
+        const auto     i64_of = [&](Index idx) { return cast(must_of(value_of(idx)), 64, true); };
+        llvm::Value*   start  = info.has_start ? i64_of(info.start) : b_.getInt64(0);
+        llvm::Value*   cnt    = info.has_count ? i64_of(info.count) : b_.getInt64(0);
+        const uint32_t flags  = (info.has_start ? 1u : 0u) | (info.has_count ? 2u : 0u);
+
+        llvm::Value* r = b_.CreateCall(
+          fread_fn(), { fd, mm_base, z_base, b_.getInt32(s.elem_stride), b_.getInt32(s.elem_count),
+                        b_.getInt32(s.width), b_.getInt32(s.four_state ? 1u : 0u), b_.getInt64(at.left),
+                        b_.getInt64(at.right), start, cnt, b_.getInt32(flags) });
+        set_value(i, packed(r, r, zero(32)));
     }
 
     // Lower a $readmemh / $readmemb: spill the filename to a stack buffer and hand

@@ -2014,6 +2014,52 @@ TEST_CASE("$fscanf returns -1 at end of file") {
     std::remove(path);
 }
 
+// $fread packs raw bytes MSB-first into a scalar and then a memory, sharing the
+// $readmem geometry. Cross-checked against Icarus Verilog.
+TEST_CASE("$fread into a scalar and a memory") {
+    const char* path = "clotho_fread_test.bin";
+    write_file(path, std::string("\xDE\xAD\xBE\xEF\x11\x22\x33\x44", 8));
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, n1, n2;
+            reg [31:0] r;
+            reg [7:0] mem [0:3];
+            initial begin
+                fd = $fopen(")") + path + R"(", "rb");
+                n1 = $fread(r, fd);
+                n2 = $fread(mem, fd);
+                $display("%0d %h %0d %h %h %h %h", n1, r, n2, mem[0], mem[1], mem[2], mem[3]);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "4 deadbeef 4 11 22 33 44\n");
+    std::remove(path);
+}
+
+// $fread(mem, fd, start, count) fills a bounded address window. Cross-checked
+// against Icarus.
+TEST_CASE("$fread with start and count into a memory") {
+    const char* path = "clotho_fread_sc_test.bin";
+    write_file(path, std::string("\xAA\xBB\xCC", 3));
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, n;
+            reg [7:0] mem [0:5];
+            integer k;
+            initial begin
+                for (k = 0; k < 6; k = k + 1) mem[k] = 0;
+                fd = $fopen(")") + path + R"(", "rb");
+                n = $fread(mem, fd, 2, 3);
+                $display("%0d %h %h %h %h %h %h", n, mem[0], mem[1], mem[2], mem[3], mem[4], mem[5]);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "3 00 00 aa bb cc 00\n");
+    std::remove(path);
+}
+
 // $ftell reports the offset, $fseek repositions (operation 0 = SEEK_SET), and
 // $rewind returns to the start (LRM §21.3.5).
 TEST_CASE("$ftell / $fseek / $rewind") {

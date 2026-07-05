@@ -152,6 +152,16 @@ int32_t rt_fscanf(int32_t fd, const char* fmt, uint32_t argc, const rt_scan_arg*
 // at `buf` (`len` bytes).
 int32_t rt_sscanf(const char* buf, uint32_t len, const char* fmt, uint32_t argc, const rt_scan_arg* args);
 
+// $fread(target, fd[, start[, count]]) (LRM §21.3.4): read raw bytes from `fd` into
+// a memory (or a scalar, `count` == 1), MSB-first per element. The destination
+// geometry matches $readmem: element i's planes are at `mm_base` / `z_base` +
+// i*`stride`, `width` bits each, over `count` elements with declared bounds
+// `decl_left` / `decl_right`. `start` / `max_count` (valid per `flags` bit0 / bit1)
+// bound the address range. Returns the number of bytes read. `width` must be <= 64.
+int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint32_t stride, uint32_t count,
+                 uint32_t width, uint32_t four_state, int64_t decl_left, int64_t decl_right, int64_t start,
+                 int64_t max_count, uint32_t flags);
+
 // $fflush(desc): flush the output buffers of descriptor `desc` (an MCD or FD).
 // The no-argument $fflush passes 0, which flushes every open stream (LRM
 // §21.3.6).

@@ -190,6 +190,20 @@ Index Builder::ferror(Index dst, Index fd, SourceLoc loc) {
     return emit({ Inst::Tag::Ferror, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
 }
 
+Index Builder::fread_word(Index dst, Index fd, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(FreadWordInfo{ fd });
+
+    return emit({ Inst::Tag::FreadWord, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+}
+
+Index Builder::fread_mem(Index fd, Signal mem, Index start, Index count, bool has_start, bool has_count,
+                         SourceLoc loc) {
+    const ExtraIndex extra =
+      add_extra(FreadMemInfo{ mem, start, count, has_start ? 1u : 0u, has_count ? 1u : 0u });
+
+    return emit({ Inst::Tag::FreadMem, Inst::Payload{ .op_extra = { fd, extra } } }, loc);
+}
+
 Index Builder::scanf(Index source, bool is_string, std::string_view fmt, std::span<const Index> args,
                      SourceLoc loc) {
     // Order in the extra buffer: format bytes, then the output-lvalue slice, then
