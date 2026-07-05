@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <vector>
 
 #include "runtime/Runtime.h"
@@ -92,4 +94,48 @@ TEST_CASE("rt_wheel_tick on an idle runtime wheel is a no-op") {
     CHECK(c.order.empty());
 
     rt_wheel_deinit(&w);
+}
+
+TEST_CASE("rt_readmem with a null z_base loads values without touching z memory") {
+    // Two adjacent 8-bit elements, mm word (2 bytes) each, no z word: stride 2.
+    // A z write through a null-z layout would clobber the next element's mm word.
+    char path[] = "/tmp/clotho_rt_readmem_noz.hex";
+    std::FILE* f = std::fopen(path, "w");
+    REQUIRE(f != nullptr);
+    std::fputs("a5 3c\n", f);
+    std::fclose(f);
+
+    // The filename crosses the ABI as a right-justified packed-ASCII vector
+    // (byte 0 = last character).
+    std::vector<char> packed;
+    for (size_t k = std::strlen(path); k-- > 0;) {
+        packed.push_back(path[k]);
+    }
+
+    uint8_t mm[4] = { 0xee, 0xee, 0xee, 0xee };
+    rt_readmem(packed.data(), static_cast<uint32_t>(packed.size()), mm, nullptr, 2, 2, 8, 0, 1, 0, 0,
+               /*flags: hex, 2-state*/ 1);
+
+    // must = may = value for a 2-state load: mm word is val | (val << 8).
+    CHECK(mm[0] == 0xa5);
+    CHECK(mm[1] == 0xa5);
+    CHECK(mm[2] == 0x3c);
+    CHECK(mm[3] == 0x3c);
+    std::remove(path);
+}
+
+TEST_CASE("rt_nba_arr push/commit with a null z_ptr merges only the mm word") {
+    uint8_t mm = 0x00;
+    uint8_t z_guard = 0x77; // would be corrupted by a stray z write
+
+    const uint8_t val  = 0x0f;
+    const uint8_t mask = 0xff;
+    rt_nba_arr_push(0, &mm, &val, &mask, 1, nullptr, nullptr, nullptr, 0);
+    REQUIRE(rt_nba_arr_pending() == 1);
+    rt_nba_arr_commit();
+    CHECK(rt_nba_arr_dirty(0) == 1);
+    rt_nba_arr_reset();
+
+    CHECK(mm == 0x0f);
+    CHECK(z_guard == 0x77);
 }

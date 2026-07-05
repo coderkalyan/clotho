@@ -77,9 +77,10 @@ void rt_fflush(void);
 // $readmemh / $readmemb (LRM 1800-2023 §21.4): load a hex/binary text file into an
 // unpacked-array memory. `path_buf`/`path_len` carry the filename as a packed-ASCII
 // vector; `mm_base`/`z_base` point at element 0's must|may and z words in the state
-// buffer, strided by `stride`; `count`/`width` describe the memory; `decl_left`/
-// `decl_right` are its declared address bounds (for `@addr` and start/finish
-// mapping). `flags` bit0=hex, bit1=has_start, bit2=has_finish, bit3=four_state.
+// buffer, strided by `stride` (`z_base` is null when the memory's slot stores no z
+// word); `count`/`width` describe the memory; `decl_left`/`decl_right` are its
+// declared address bounds (for `@addr` and start/finish mapping). `flags` bit0=hex,
+// bit1=has_start, bit2=has_finish, bit3=four_state.
 void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8_t* z_base, uint32_t stride,
                 uint32_t count, uint32_t width, int64_t decl_left, int64_t decl_right, int64_t start,
                 int64_t finish, uint32_t flags);
@@ -107,7 +108,8 @@ int32_t rt_random(void);
 // Append one deferred element write. `sig` identifies the array signal (for
 // post-commit wake servicing). `mm_ptr` / `z_ptr` point at the live element's
 // must|may and z words; `*_val` are the bits to write and `*_mask` selects which
-// bits (1 => take from val), each `*_bytes` long.
+// bits (1 => take from val), each `*_bytes` long. A target whose slot stores no
+// z word passes `z_ptr` null with `z_bytes` 0.
 void rt_nba_arr_push(uint32_t sig, void* mm_ptr, const void* mm_val, const void* mm_mask, uint32_t mm_bytes,
                      void* z_ptr, const void* z_val, const void* z_mask, uint32_t z_bytes);
 

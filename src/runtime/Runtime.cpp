@@ -198,6 +198,8 @@ void masked_merge(void* dest, const std::vector<uint8_t>& val, const std::vector
 extern "C" void rt_nba_arr_push(uint32_t sig, void* mm_ptr, const void* mm_val, const void* mm_mask,
                                 uint32_t mm_bytes, void* z_ptr, const void* z_val, const void* z_mask,
                                 uint32_t z_bytes) {
+    // A target whose slot stores no z word passes z_ptr null with z_bytes 0;
+    // the write then merges only the must|may word at commit.
     const auto* mv = static_cast<const uint8_t*>(mm_val);
     const auto* mk = static_cast<const uint8_t*>(mm_mask);
     const auto* zv = static_cast<const uint8_t*>(z_val);
@@ -207,8 +209,10 @@ extern "C" void rt_nba_arr_push(uint32_t sig, void* mm_ptr, const void* mm_val, 
                                          .z_ptr   = z_ptr,
                                          .mm_val  = { mv, mv + mm_bytes },
                                          .mm_mask = { mk, mk + mm_bytes },
-                                         .z_val   = { zv, zv + z_bytes },
-                                         .z_mask  = { zk, zk + z_bytes } });
+                                         .z_val   = z_bytes != 0 ? std::vector<uint8_t>{ zv, zv + z_bytes }
+                                                                 : std::vector<uint8_t>{},
+                                         .z_mask  = z_bytes != 0 ? std::vector<uint8_t>{ zk, zk + z_bytes }
+                                                                 : std::vector<uint8_t>{} });
 }
 
 extern "C" uint32_t rt_nba_arr_pending(void) {
@@ -218,7 +222,9 @@ extern "C" uint32_t rt_nba_arr_pending(void) {
 extern "C" void rt_nba_arr_commit(void) {
     for (const NbaArrWrite& w : nba_arr_queue) {
         masked_merge(w.mm_ptr, w.mm_val, w.mm_mask);
-        masked_merge(w.z_ptr, w.z_val, w.z_mask);
+        if (w.z_ptr != nullptr) {
+            masked_merge(w.z_ptr, w.z_val, w.z_mask);
+        }
     }
 }
 
@@ -447,7 +453,11 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
         const unsigned __int128 mmv = static_cast<unsigned __int128>(must) |
                                       (static_cast<unsigned __int128>(may) << width);
         std::memcpy(mm_base + static_cast<size_t>(idx) * stride, &mmv, mm_bytes);
-        std::memcpy(z_base + static_cast<size_t>(idx) * stride, &z, z_bytes);
+        // A memory whose slot stores no z word passes a null z_base; writing
+        // through it would clobber the neighboring element's must|may word.
+        if (z_base != nullptr) {
+            std::memcpy(z_base + static_cast<size_t>(idx) * stride, &z, z_bytes);
+        }
     };
 
     const size_t n = buf.size();
