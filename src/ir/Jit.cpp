@@ -1,5 +1,6 @@
 #include "Jit.h"
 
+#include <csetjmp>
 #include <memory>
 #include <mutex>
 
@@ -134,9 +135,19 @@ int run_jit(const Module& m, Timings* timings) {
         timings->llvm_ms += ms_since(t_llvm);
     }
 
-    // Simulation phase: run the compiled design.
-    const auto t_sim = std::chrono::steady_clock::now();
-    const int  rc    = fn();
+    // Simulation phase: run the compiled design. A $finish longjmps back here
+    // (rt_finish is noreturn to the design) so the embedding process survives;
+    // the sim's live coroutine frames are abandoned, which is fine — it is over.
+    const auto   t_sim = std::chrono::steady_clock::now();
+    std::jmp_buf finish_env;
+    // Volatile: an auto variable modified between setjmp and longjmp is
+    // otherwise indeterminate after the jump.
+    volatile int rc = 0;
+    if (setjmp(finish_env) == 0) {
+        rt_finish_host(&finish_env);
+        rc = fn();
+    }
+    rt_finish_host(nullptr);
     if (timings != nullptr) {
         timings->sim_ms += ms_since(t_sim);
     }

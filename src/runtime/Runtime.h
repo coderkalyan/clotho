@@ -53,14 +53,22 @@ void rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uin
 
 // -- Simulation control --
 //
-// $finish / $stop: end the simulation and exit the process. LRM 1800-2023 §20.2
-// defines $stop as suspending simulation and $finish as exiting to the OS; it
-// mandates no interactive mode. Clotho has no mechanism to resume a suspended
-// run, so a suspend that can never resume is observationally identical to exit,
-// and $stop is treated identically to $finish. Does not return.
+// $finish / $stop: end the simulation. LRM 1800-2023 §20.2 defines $stop as
+// suspending simulation and $finish as exiting to the OS; it mandates no
+// interactive mode. Clotho has no mechanism to resume a suspended run, so a
+// suspend that can never resume is observationally identical to exit, and $stop
+// is treated identically to $finish. Never returns to the caller: control
+// transfers to the host installed by rt_finish_host (run_jit), or the process
+// exits when no host is installed.
 // TODO: the optional diagnostic-level argument (0/1/2) that controls exit-message
 // verbosity is accepted at the frontend but ignored here.
 [[noreturn]] void rt_finish(void);
+
+// Install (or clear, with null) the setjmp target rt_finish longjmps to, so a
+// $finish ends only the simulation, not the embedding process (the test binary
+// runs many simulations). The jump abandons live coroutine frames — acceptable,
+// the simulation is over. `env` points at a std::jmp_buf.
+void rt_finish_host(void* env);
 
 // $fflush (no-arg form, LRM 1800-2023 §21.3.6): flush all open output buffers so
 // queued $write output is emitted immediately.

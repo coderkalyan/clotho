@@ -1,5 +1,6 @@
 #include "Runtime.h"
 
+#include <csetjmp>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -313,10 +314,27 @@ rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uint32_t
     timeformat.suffix.assign(suffix, suffix_len);
 }
 
+namespace {
+
+// Where rt_finish returns control: the run_jit frame that started the
+// simulation, or null when the design runs standalone.
+std::jmp_buf* finish_env = nullptr;
+
+} // namespace
+
+extern "C" void rt_finish_host(void* env) {
+    finish_env = static_cast<std::jmp_buf*>(env);
+}
+
 extern "C" void rt_finish(void) {
-    // $finish / $stop: end the simulation and return control to the OS. std::exit
-    // runs atexit handlers and flushes C stdio, so any buffered $display output is
-    // committed before the process leaves.
+    // $finish / $stop: end the simulation. Jump back to the host that started
+    // the run when one is installed — the codegen relies on rt_finish being
+    // noreturn, so returning normally is not an option. Otherwise exit;
+    // std::exit runs atexit handlers and flushes C stdio, so any buffered
+    // $display output is committed before the process leaves.
+    if (finish_env != nullptr) {
+        std::longjmp(*finish_env, 1);
+    }
     std::exit(0);
 }
 
