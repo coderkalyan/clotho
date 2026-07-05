@@ -137,12 +137,13 @@ TEST_CASE("2-state vs 4-state widths") {
     )";
     const std::string          ir  = emit(src);
 
-    // Every signal keeps its LLVM slot type — a `{ i(2W) must|may, iW z }`
-    // struct named per (domain, width) — and the module's state struct lists
-    // them in declaration order: x, y (bit[3:0]) then z (logic[7:0]).
-    CHECK(ir.find("%m.state = type { %bit.4, %bit.4, %logic.8 }") != std::string::npos);
-    CHECK(ir.find("%bit.4 = type { i8, i4 }") != std::string::npos);
-    CHECK(ir.find("%logic.8 = type { i16, i8 }") != std::string::npos);
+    // Every signal keeps its LLVM slot type, named per (domain, width) — and
+    // the module's state struct lists them in declaration order: x, y
+    // (bit[3:0]) then z (logic[7:0]). No signal here can carry z, so every
+    // slot is the elided `.nz` form: just the i(2W) must|may word, no z word.
+    CHECK(ir.find("%m.state = type { %bit.nz.4, %bit.nz.4, %logic.nz.8 }") != std::string::npos);
+    CHECK(ir.find("%bit.nz.4 = type { i8 }") != std::string::npos);
+    CHECK(ir.find("%logic.nz.8 = type { i16 }") != std::string::npos);
     CHECK(ir.find("alloca %clotho.state") != std::string::npos);
     // z's must|may word is an i16 (2W = 16).
     CHECK(ir.find("store i16") != std::string::npos);
@@ -167,9 +168,9 @@ TEST_CASE("instance state structs compose nested and replicate per instantiation
 
     // One state struct per module definition; the parent embeds one field per
     // child instance (two %leaf.state replicas), and the root composes the top
-    // instance plus the NBA shadow region.
-    CHECK(ir.find("%leaf.state = type { %logic.1, %logic.8, %logic.8 }") != std::string::npos);
-    CHECK(ir.find("%top.state = type { %logic.1, %logic.8, %logic.8, %leaf.state, %leaf.state }") !=
+    // instance plus the NBA shadow region. No z sources → every slot elided.
+    CHECK(ir.find("%leaf.state = type { %logic.nz.1, %logic.nz.8, %logic.nz.8 }") != std::string::npos);
+    CHECK(ir.find("%top.state = type { %logic.nz.1, %logic.nz.8, %logic.nz.8, %leaf.state, %leaf.state }") !=
           std::string::npos);
     CHECK(ir.find("%clotho.state = type { %top.state, %clotho.nba.shadow }") != std::string::npos);
     // Exactly one definition of the leaf struct type (deduplicated, no .0 clone).

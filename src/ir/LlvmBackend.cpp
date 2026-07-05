@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstring>
 #include <mutex>
 #include <optional>
@@ -27,6 +28,7 @@
 
 #include "ir/InternPool.h"
 #include "ir/Ir.h"
+#include "ir/ZElision.h"
 #include "runtime/Runtime.h"
 
 // LLVM backend rationale.
@@ -40,12 +42,18 @@
 // invariant is must => may. Z is encoded as X in must/may with its z plane set.
 // This makes the common logic ops monotone and cheap: AND/OR are just per-plane
 // &/|, NOT is a swap+complement. The z plane passes through loads/stores and is
-// cleared by the logic ops (their result is never Z); we leave it to LLVM to
-// elide z where it proves dead rather than dropping it here.
+// cleared by the logic ops (their result is never Z).
 // To reconstruct canonical 4-state when needed: xz = must ^ may, val = must.
 //
+// Z elision. compute_may_z (ZElision.cpp) proves most signals can never carry a
+// z bit; a proven never-z signal stores no z word in its slot (see slot_type)
+// and its loads materialize a constant-zero z plane instead. SSA values,
+// function ABIs, and frame locals keep their z plane regardless — the zero
+// constants fold in LLVM — so only persistent storage changes shape.
+//
 // State / ABI. Signals are persistent module state laid out with LLVM's type
-// system. Every signal owns a `{ i(2W) must|may, iW z }` slot struct (an
+// system. Every signal owns a `{ i(2W) must|may, iW z }` slot struct — without
+// the z word when the signal is proven never-z (an
 // unpacked-array signal an `[N x slot]` of leaf slots); every module definition
 // gets one identified struct type listing its scope's slots followed by one
 // field per child instance (the child definition's struct, replicated per
@@ -228,6 +236,9 @@ struct LValue {
     llvm::Value* base = nullptr;
     // The leaf slot type `{ i(2W), iW }` of the addressed storage.
     llvm::StructType* slot_ty = nullptr;
+    // Whether the slot stores a z word (field 1). False for a never-z signal;
+    // loads then materialize a zero z plane and stores drop theirs.
+    bool has_z = true;
     // The `[N x slot]` storage type when `base` addresses a whole memory; null
     // for plain scalar storage.
     llvm::ArrayType* array_ty = nullptr;
@@ -260,6 +271,10 @@ struct SignalSlot {
     uint32_t width      = 0;
     bool     four_state = false;
     bool     is_signed  = false;
+    // Whether the slot stores a z word: the signal may carry z (compute_may_z)
+    // or is a task out/inout target (the task ABI stores z through a pointer to
+    // it). A never-z slot is just `{ i(2W) }`.
+    bool has_z = true;
     // Unpacked array (memory): `width` is the leaf element width; `elem_count`
     // the total leaf-element count (product of all dimensions).
     bool     is_array   = false;
@@ -286,6 +301,7 @@ struct SignalSlot {
 struct NbaBucket {
     uint32_t              width;          // signal width (the commit loop bakes it in)
     bool                  partial;        // mask-RMW commit vs whole copy
+    bool                  has_z;          // targets with a z word commit it; never-z loops skip it
     llvm::ArrayType*      ty   = nullptr; // [cap x i32] of nba-ids
     llvm::GlobalVariable* gv   = nullptr;
     llvm::GlobalVariable* top  = nullptr; // i32 live count
@@ -311,11 +327,12 @@ struct BackendError {
 // are reset each time).
 class Backend {
 public:
-    Backend(const Module& mod, llvm::LLVMContext& ctx, llvm::Module& llmod)
+    Backend(const Module& mod, llvm::LLVMContext& ctx, llvm::Module& llmod, bool z_elision)
       : mod_(mod)
       , ctx_(ctx)
       , llmod_(llmod)
-      , b_(ctx) {}
+      , b_(ctx)
+      , z_elision_(z_elision) {}
 
     void run() {
         build_state_types();
@@ -394,19 +411,25 @@ private:
     // -- State types --
 
     // The `{ i(2W) must|may, iW z }` slot struct for a value of the given width
-    // and domain. Identified and memoized per (width, domain) so every signal of
-    // one type shares one named LLVM type (%logic.8, %bit.4, ...). Both domains
-    // share the layout — a 2-state signal still stores a (constant-zero) z word —
-    // but distinct names keep the emitted IR self-describing.
-    llvm::StructType* slot_type(uint32_t width, bool four_state) {
-        for (const auto& [w, four, ty] : slot_types_) {
-            if (w == width && four == four_state) {
+    // and domain — just `{ i(2W) }` when the slot needs no z word (a proven
+    // never-z signal; frame locals always keep z). Identified and memoized per
+    // (width, domain, has_z) so every signal of one shape shares one named LLVM
+    // type (%logic.8, %bit.nz.4, ...); the single-field form keeps the struct
+    // wrapper so GEP paths and array-of-slot addressing stay uniform.
+    llvm::StructType* slot_type(uint32_t width, bool four_state, bool has_z) {
+        for (const auto& [w, four, z, ty] : slot_types_) {
+            if (w == width && four == four_state && z == has_z) {
                 return ty;
             }
         }
-        const std::string name = (four_state ? "logic." : "bit.") + std::to_string(width);
-        auto* ty = llvm::StructType::create(ctx_, { int_ty(2 * width), int_ty(width) }, name);
-        slot_types_.emplace_back(width, four_state, ty);
+        const std::string name =
+          std::string(four_state ? "logic." : "bit.") + (has_z ? "" : "nz.") + std::to_string(width);
+        std::vector<llvm::Type*> fields{ int_ty(2 * width) };
+        if (has_z) {
+            fields.push_back(int_ty(width));
+        }
+        auto* ty = llvm::StructType::create(ctx_, fields, name);
+        slot_types_.emplace_back(width, four_state, has_z, ty);
         return ty;
     }
 
@@ -488,6 +511,16 @@ private:
     void build_state_types() {
         const auto sigs = mod_.signals();
         slots_.resize(sigs.size());
+
+        // A slot keeps its z word when the may-z analysis cannot prove it z-free
+        // or the task ABI needs z storage behind it. Elision is analysis-driven,
+        // not domain-driven: a 2-state signal assigned a z-carrying expression
+        // round-trips the z bit today (Resize does not clear z across domains),
+        // and that behavior is preserved — ordinary 2-state signals are never-z
+        // through the analysis anyway.
+        const std::vector<bool> may_z = z_elision_ ? compute_may_z(mod_) : std::vector<bool>(sigs.size(), true);
+        const std::vector<bool> task_out = task_out_targets();
+
         for (uint32_t i = 0; i < sigs.size(); ++i) {
             const Layout lay = mod_.pool.layout(sigs[i].type);
             const Type&  ty  = std::get<Type>(mod_.pool.get(sigs[i].type));
@@ -496,7 +529,8 @@ private:
             slot.width       = lay.width == 0 ? 1 : lay.width;
             slot.four_state  = lay.domain == Domain::Four;
             slot.is_signed   = ty.is_signed;
-            slot.slot_ty     = slot_type(slot.width, slot.four_state);
+            slot.has_z       = may_z[i] || task_out[i];
+            slot.slot_ty     = slot_type(slot.width, slot.four_state, slot.has_z);
             if (ty.kind == Type::Kind::UnpackedArray) {
                 slot.is_array   = true;
                 slot.elem_count = array_leaf_count(sigs[i].type);
@@ -532,8 +566,11 @@ private:
                 }
                 slot.sh_mm_field = static_cast<uint32_t>(sf.size());
                 sf.push_back(int_ty(2 * slot.width));
-                slot.sh_z_field = static_cast<uint32_t>(sf.size());
-                sf.push_back(int_ty(slot.width));
+                // A never-z target stages no z shadow; sh_z_field stays unused.
+                if (slot.has_z) {
+                    slot.sh_z_field = static_cast<uint32_t>(sf.size());
+                    sf.push_back(int_ty(slot.width));
+                }
                 if (slot.nba_partial) {
                     slot.sh_mask_field = static_cast<uint32_t>(sf.size());
                     sf.push_back(int_ty(slot.width));
@@ -619,6 +656,52 @@ private:
         }
     }
 
+    // Signals used as a task out/inout actual anywhere in the design. The task
+    // ABI passes `&signal.z` and stores through it at copy-out (emit_task_copyout),
+    // so such a signal must keep its z word even when proven never-z. A storage/
+    // ABI constraint, not a may-z fact, hence separate from compute_may_z.
+    // (An alternative — a caller-stack z scratch word for elided targets — is
+    // sound but adds a second mechanism for a rare construct.)
+    std::vector<bool> task_out_targets() const {
+        std::vector<bool> out(mod_.signals().size(), false);
+        const auto        scan = [&](const Ir& ir) {
+            for (size_t k = 0; k < ir.inst_count(); ++k) {
+                const auto idx = static_cast<Index>(k);
+                if (ir.tag(idx) != Inst::Tag::TaskCall) {
+                    continue;
+                }
+                const auto      ti     = ir.extra_data<TaskCallInfo>(ir.payload(idx).extra);
+                const Function& callee = mod_.function(ti.func);
+                const auto      args   = ir.region(ti.args);
+                for (size_t a = 0; a < args.size(); ++a) {
+                    if (callee.arg_dirs[a] == ArgDir::In) {
+                        continue;
+                    }
+                    Index lv = args[a];
+                    for (bool walking = true; walking;) {
+                        switch (ir.tag(lv)) {
+                            case Inst::Tag::BitSelect: lv = ir.payload(lv).binary.l; break;
+                            case Inst::Tag::PartSelect:
+                            case Inst::Tag::DynPartSelect:
+                            case Inst::Tag::ElemSelect: lv = ir.payload(lv).op_extra.op; break;
+                            default: walking = false; break;
+                        }
+                    }
+                    if (ir.tag(lv) == Inst::Tag::Signal) {
+                        out[static_cast<uint32_t>(ir.payload(lv).signal)] = true;
+                    }
+                }
+            }
+        };
+        for (const Process& p : mod_.processes()) {
+            scan(p.ir);
+        }
+        for (uint32_t i = 0; i < mod_.function_count(); ++i) {
+            scan(mod_.function(static_cast<FunctionId>(i)).ir);
+        }
+        return out;
+    }
+
     const SignalSlot& slot_of(Signal s) const {
         return slots_[static_cast<uint32_t>(s)];
     }
@@ -655,6 +738,9 @@ private:
         return lv_field_ptr(lv, 0);
     }
     llvm::Value* lv_z_ptr(const LValue& lv) {
+        // A never-z slot has no field 1; any consumer must branch on has_z
+        // before asking for the pointer.
+        assert(lv.has_z);
         return lv_field_ptr(lv, 1);
     }
 
@@ -907,7 +993,9 @@ private:
             const Layout lay           = mod_.pool.layout(f.local_types[i]);
             frame_slots_[i].width      = lay.width == 0 ? 1 : lay.width;
             frame_slots_[i].four_state = lay.domain == Domain::Four;
-            frame_slots_[i].slot_ty    = slot_type(frame_slots_[i].width, frame_slots_[i].four_state);
+            // Frame slots always keep z: the task ABI and copy-in/out use the z
+            // field, and LLVM folds the zero-z traffic on its own.
+            frame_slots_[i].slot_ty = slot_type(frame_slots_[i].width, frame_slots_[i].four_state, true);
             fields[i]                  = frame_slots_[i].slot_ty;
         }
         frame_ty_ = llvm::StructType::create(ctx_, fields, mod_.name + ".fn." + f.name + ".frame");
@@ -1530,12 +1618,13 @@ private:
             }
             uint32_t bi = 0;
             for (; bi < nba_buckets_.size(); ++bi) {
-                if (nba_buckets_[bi].width == s.width && nba_buckets_[bi].partial == s.nba_partial) {
+                if (nba_buckets_[bi].width == s.width && nba_buckets_[bi].partial == s.nba_partial &&
+                    nba_buckets_[bi].has_z == s.has_z) {
                     break;
                 }
             }
             if (bi == nba_buckets_.size()) {
-                nba_buckets_.push_back(NbaBucket{ s.width, s.nba_partial, nullptr, nullptr, nullptr });
+                nba_buckets_.push_back(NbaBucket{ s.width, s.nba_partial, s.has_z, nullptr, nullptr, nullptr });
             }
             s.nba_bucket = bi;
         }
@@ -1547,7 +1636,8 @@ private:
         }
         for (uint32_t bi = 0; bi < nba_buckets_.size(); ++bi) {
             NbaBucket&        b    = nba_buckets_[bi];
-            const std::string name = "clotho.nba.w" + std::to_string(b.width) + (b.partial ? ".part" : ".full");
+            const std::string name = "clotho.nba.w" + std::to_string(b.width) + (b.partial ? ".part" : ".full") +
+                                     (b.has_z ? "" : ".noz");
             b.ty  = llvm::ArrayType::get(i32, std::max<uint32_t>(caps[bi], 1));
             b.gv  = new llvm::GlobalVariable(llmod_, b.ty, false, llvm::GlobalValue::InternalLinkage,
                                              llvm::ConstantAggregateZero::get(b.ty), name);
@@ -1574,14 +1664,16 @@ private:
                 continue;
             }
             const uint32_t live_off = path_offset(s.path);
-            const uint64_t z_rel    = dlay.getStructLayout(s.slot_ty)->getElementOffset(1);
             const std::array<uint32_t, 2> sh_mm_path{ shadow_field_, s.sh_mm_field };
             const std::array<uint32_t, 2> sh_z_path{ shadow_field_, s.sh_z_field };
             const std::array<uint32_t, 2> sh_mask_path{ shadow_field_, s.sh_mask_field };
-            const uint32_t off_mm   = live_off;
-            const uint32_t off_z    = live_off + static_cast<uint32_t>(z_rel);
+            const uint32_t off_mm = live_off;
+            // A never-z slot has no z field (nor a z shadow); its commit bucket
+            // never reads these, so bake benign zeros.
+            const uint32_t off_z =
+              s.has_z ? live_off + static_cast<uint32_t>(dlay.getStructLayout(s.slot_ty)->getElementOffset(1)) : 0;
             const uint32_t off_nmm  = path_offset(sh_mm_path);
-            const uint32_t off_nz   = path_offset(sh_z_path);
+            const uint32_t off_nz   = s.has_z ? path_offset(sh_z_path) : 0;
             const uint32_t off_mask = s.nba_partial ? path_offset(sh_mask_path) : 0;
 
             std::array<llvm::Constant*, 3> sb{}, sc{}, db{}, dl{};
@@ -2067,29 +2159,34 @@ private:
         llvm::Value* id        = b_.CreateLoad(i32, b_.CreateInBoundsGEP(bk.ty, bk.gv, { b_.getInt32(0), idx }));
         llvm::Value* meta      = b_.CreateInBoundsGEP(nba_meta_arr_ty_, nba_meta_gv_, { b_.getInt32(0), id });
         llvm::Value* live_mm_p = field_ptr_var(state, meta_i32(meta, 0));
-        llvm::Value* live_z_p  = field_ptr_var(state, meta_i32(meta, 1));
-        llvm::Value* sh_mm_p   = field_ptr_var(state, meta_i32(meta, 2));
-        llvm::Value* sh_z_p    = field_ptr_var(state, meta_i32(meta, 3));
-        llvm::Value* old_mm    = b_.CreateAlignedLoad(mmty, live_mm_p, mm_al);
-        llvm::Value* new_mm    = nullptr;
+        // A never-z bucket's targets store no z word / z shadow; skip z entirely.
+        llvm::Value* live_z_p = bk.has_z ? field_ptr_var(state, meta_i32(meta, 1)) : nullptr;
+        llvm::Value* sh_mm_p  = field_ptr_var(state, meta_i32(meta, 2));
+        llvm::Value* sh_z_p   = bk.has_z ? field_ptr_var(state, meta_i32(meta, 3)) : nullptr;
+        llvm::Value* old_mm   = b_.CreateAlignedLoad(mmty, live_mm_p, mm_al);
+        llvm::Value* new_mm   = nullptr;
         if (!bk.partial) {
-            new_mm             = b_.CreateAlignedLoad(mmty, sh_mm_p, mm_al);
-            llvm::Value* new_z = b_.CreateAlignedLoad(zty, sh_z_p, z_al);
+            new_mm = b_.CreateAlignedLoad(mmty, sh_mm_p, mm_al);
             b_.CreateAlignedStore(new_mm, live_mm_p, mm_al);
-            b_.CreateAlignedStore(new_z, live_z_p, z_al);
+            if (bk.has_z) {
+                llvm::Value* new_z = b_.CreateAlignedLoad(zty, sh_z_p, z_al);
+                b_.CreateAlignedStore(new_z, live_z_p, z_al);
+            }
         } else {
             llvm::Value* mask_p = field_ptr_var(state, meta_i32(meta, 4));
             llvm::Value* mask   = b_.CreateAlignedLoad(zty, mask_p, z_al);
-            llvm::Value* old_z  = b_.CreateAlignedLoad(zty, live_z_p, z_al);
             llvm::Value* sh_mm  = b_.CreateAlignedLoad(mmty, sh_mm_p, mm_al);
-            llvm::Value* sh_z   = b_.CreateAlignedLoad(zty, sh_z_p, z_al);
             // Replicate the W-bit mask into both halves of the packed must|may word.
-            llvm::Value* maskw  = b_.CreateZExt(mask, mmty);
-            llvm::Value* mask2  = b_.CreateOr(maskw, b_.CreateShl(maskw, llvm::ConstantInt::get(mmty, W)));
-            new_mm              = b_.CreateOr(b_.CreateAnd(old_mm, b_.CreateNot(mask2)), b_.CreateAnd(sh_mm, mask2));
-            llvm::Value* new_z  = b_.CreateOr(b_.CreateAnd(old_z, b_.CreateNot(mask)), b_.CreateAnd(sh_z, mask));
+            llvm::Value* maskw = b_.CreateZExt(mask, mmty);
+            llvm::Value* mask2 = b_.CreateOr(maskw, b_.CreateShl(maskw, llvm::ConstantInt::get(mmty, W)));
+            new_mm             = b_.CreateOr(b_.CreateAnd(old_mm, b_.CreateNot(mask2)), b_.CreateAnd(sh_mm, mask2));
             b_.CreateAlignedStore(new_mm, live_mm_p, mm_al);
-            b_.CreateAlignedStore(new_z, live_z_p, z_al);
+            if (bk.has_z) {
+                llvm::Value* old_z = b_.CreateAlignedLoad(zty, live_z_p, z_al);
+                llvm::Value* sh_z  = b_.CreateAlignedLoad(zty, sh_z_p, z_al);
+                llvm::Value* new_z = b_.CreateOr(b_.CreateAnd(old_z, b_.CreateNot(mask)), b_.CreateAnd(sh_z, mask));
+                b_.CreateAlignedStore(new_z, live_z_p, z_al);
+            }
             b_.CreateAlignedStore(zero(W), mask_p, z_al); // clear dirty mask for next slot
         }
         emit_nba_service(meta, old_mm, new_mm);
@@ -2409,7 +2506,9 @@ private:
                                 : zero(2 * s.width);
             llvm::Value* slot = storage_ptr(state, s);
             b_.CreateStore(mm, b_.CreateStructGEP(s.slot_ty, slot, 0));
-            b_.CreateStore(zero(s.width), b_.CreateStructGEP(s.slot_ty, slot, 1));
+            if (s.has_z) {
+                b_.CreateStore(zero(s.width), b_.CreateStructGEP(s.slot_ty, slot, 1));
+            }
             // A partial target's dirty mask must start clear; the shadow itself is
             // written before it is read, so it needs no initialisation.
             if (s.nba_partial) {
@@ -2448,7 +2547,9 @@ private:
 
         b_.SetInsertPoint(body);
         b_.CreateStore(mm, b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), idx, b_.getInt32(0) }));
-        b_.CreateStore(zero(w), b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), idx, b_.getInt32(1) }));
+        if (s.has_z) {
+            b_.CreateStore(zero(w), b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), idx, b_.getInt32(1) }));
+        }
         idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), body);
         b_.CreateBr(head);
 
@@ -2951,6 +3052,7 @@ private:
         const SignalSlot& s = slot_of(sig);
         return LValue{ .base        = storage_ptr(state_, s),
                        .slot_ty     = s.slot_ty,
+                       .has_z       = s.has_z,
                        .array_ty    = s.is_array ? llvm::cast<llvm::ArrayType>(s.storage_ty) : nullptr,
                        .store_width = s.width,
                        .bit_off     = b_.getInt32(0),
@@ -2974,7 +3076,8 @@ private:
     Plane lower_load(const LValue& lv) {
         const uint32_t w  = lv.store_width;
         llvm::Value*   mm = b_.CreateLoad(int_ty(2 * w), lv_mm_ptr(lv));
-        llvm::Value*   z  = b_.CreateLoad(int_ty(w), lv_z_ptr(lv));
+        // A never-z slot stores no z word; its z plane is a constant zero.
+        llvm::Value* z = lv.has_z ? static_cast<llvm::Value*>(b_.CreateLoad(int_ty(w), lv_z_ptr(lv))) : zero(w);
         if (lv.width == w && is_zero_const(lv.bit_off)) {
             return { mm, z };
         }
@@ -2989,20 +3092,25 @@ private:
     void lower_store(const LValue& lv, Plane rhs, ValType rhs_ty) {
         const uint32_t s_width = lv.store_width;
         llvm::Value*   mp      = lv_mm_ptr(lv);
-        llvm::Value*   zp      = lv_z_ptr(lv);
         (void)rhs_ty;
 
         // Whole-storage store: the frontend context-sizes the RHS to the lvalue
         // width (via an inserted Resize), so rhs already matches the storage width
-        // and the planes store directly.
+        // and the planes store directly. A never-z slot drops the RHS z plane —
+        // the may-z analysis proved it zero here.
         if (lv.width == s_width && is_zero_const(lv.bit_off)) {
             b_.CreateStore(rhs.mm, mp);
-            b_.CreateStore(rhs.z, zp);
+            if (lv.has_z) {
+                b_.CreateStore(rhs.z, lv_z_ptr(lv));
+            }
             return;
         }
 
         // Partial store: read-modify-write each plane at the storage width.
-        const Plane  old   = { b_.CreateLoad(int_ty(2 * s_width), mp), b_.CreateLoad(int_ty(s_width), zp) };
+        llvm::Value* zp  = lv.has_z ? lv_z_ptr(lv) : nullptr;
+        const Plane  old = { b_.CreateLoad(int_ty(2 * s_width), mp),
+                             lv.has_z ? static_cast<llvm::Value*>(b_.CreateLoad(int_ty(s_width), zp))
+                                      : zero(s_width) };
         llvm::Value* off   = cast(lv.bit_off, s_width, false);
         llvm::Value* mask  = b_.CreateShl(cast(ones(lv.width), s_width, false), off);
         llvm::Value* nmask = b_.CreateNot(mask);
@@ -3010,7 +3118,9 @@ private:
         llvm::Value* may   = merge_bits(may_of(old), cast(may_of(rhs), s_width, false), off, mask, nmask);
         llvm::Value* z     = merge_bits(old.z, cast(rhs.z, s_width, false), off, mask, nmask);
         b_.CreateStore(packed(must, may, z).mm, mp);
-        b_.CreateStore(z, zp);
+        if (lv.has_z) {
+            b_.CreateStore(z, zp);
+        }
     }
 
     // Stage a nonblocking assignment: write the sampled RHS into the target's
@@ -3021,19 +3131,24 @@ private:
     void lower_store_nb(const LValue& lv, Plane rhs) {
         const SignalSlot& s  = slot_of(lv.sig);
         llvm::Value*      mp = shadow_ptr(s.sh_mm_field);
-        llvm::Value*      zp = shadow_ptr(s.sh_z_field);
+        // A never-z target stages no z shadow (and its commit loop skips z).
+        llvm::Value* zp = s.has_z ? shadow_ptr(s.sh_z_field) : nullptr;
 
         if (!s.nba_partial) {
             // Whole-signal target: the RHS is already signal-width (frontend Resize),
             // so the shadow planes store directly — no mask, no read-modify-write.
             b_.CreateStore(rhs.mm, mp);
-            b_.CreateStore(rhs.z, zp);
+            if (s.has_z) {
+                b_.CreateStore(rhs.z, zp);
+            }
         } else {
             // Partial-capable target: merge the selected bits into the shadow and OR
             // the touched bits into the dirty mask. A whole-signal site here selects
             // every bit, so it merges the full word and sets the whole mask.
             llvm::Value* maskp = shadow_ptr(s.sh_mask_field);
-            const Plane  old   = { b_.CreateLoad(int_ty(2 * s.width), mp), b_.CreateLoad(int_ty(s.width), zp) };
+            const Plane  old   = { b_.CreateLoad(int_ty(2 * s.width), mp),
+                                   s.has_z ? static_cast<llvm::Value*>(b_.CreateLoad(int_ty(s.width), zp))
+                                           : zero(s.width) };
             llvm::Value* off   = cast(lv.bit_off, s.width, false);
             llvm::Value* bmask = b_.CreateShl(cast(ones(lv.width), s.width, false), off);
             llvm::Value* nmask = b_.CreateNot(bmask);
@@ -3041,7 +3156,9 @@ private:
             llvm::Value* may   = merge_bits(may_of(old), cast(may_of(rhs), s.width, false), off, bmask, nmask);
             llvm::Value* z     = merge_bits(old.z, cast(rhs.z, s.width, false), off, bmask, nmask);
             b_.CreateStore(packed(must, may, z).mm, mp);
-            b_.CreateStore(z, zp);
+            if (s.has_z) {
+                b_.CreateStore(z, zp);
+            }
             llvm::Value* cur = b_.CreateLoad(int_ty(s.width), maskp);
             b_.CreateStore(b_.CreateOr(cur, bmask), maskp);
         }
@@ -3088,19 +3205,28 @@ private:
         llvm::Value*      st  = nba_scratch();
         llvm::StructType* ty  = nba_scratch_ty();
         const llvm::Align a1{ 1 };
-        llvm::Value*      mvp = b_.CreateStructGEP(ty, st, 0);
-        llvm::Value*      mkp = b_.CreateStructGEP(ty, st, 1);
-        llvm::Value*      zvp = b_.CreateStructGEP(ty, st, 2);
-        llvm::Value*      zkp = b_.CreateStructGEP(ty, st, 3);
+        auto*             nullp = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+        llvm::Value*      mvp   = b_.CreateStructGEP(ty, st, 0);
+        llvm::Value*      mkp   = b_.CreateStructGEP(ty, st, 1);
         b_.CreateAlignedStore(mm_val, mvp, a1);
         b_.CreateAlignedStore(mm_msk, mkp, a1);
-        b_.CreateAlignedStore(zval, zvp, a1);
-        b_.CreateAlignedStore(mask_w, zkp, a1);
+        // A never-z element slot stores no z word: hand the runtime a null z_ptr
+        // with zero z bytes so the commit merges only the must|may word.
+        llvm::Value* zvp = nullp;
+        llvm::Value* zkp = nullp;
+        llvm::Value* z_ptr = nullp;
+        uint32_t     z_bytes = 0;
+        if (lv.has_z) {
+            zvp = b_.CreateStructGEP(ty, st, 2);
+            zkp = b_.CreateStructGEP(ty, st, 3);
+            b_.CreateAlignedStore(zval, zvp, a1);
+            b_.CreateAlignedStore(mask_w, zkp, a1);
+            z_ptr   = lv_z_ptr(lv);
+            z_bytes = (W + 7) / 8;
+        }
 
         llvm::Value*   mm_ptr   = lv_mm_ptr(lv);
-        llvm::Value*   z_ptr    = lv_z_ptr(lv);
         const uint32_t mm_bytes = (2 * W + 7) / 8;
-        const uint32_t z_bytes  = (W + 7) / 8;
         b_.CreateCall(nba_arr_push_fn(),
                       { b_.getInt32(static_cast<uint32_t>(lv.sig)), mm_ptr, mvp, mkp, b_.getInt32(mm_bytes), z_ptr,
                         zvp, zkp, b_.getInt32(z_bytes) });
@@ -3278,8 +3404,13 @@ private:
         llvm::Value* storage = storage_ptr(state_, s);
         llvm::Value* mm_base =
           b_.CreateInBoundsGEP(arr_ty, storage, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(0) });
+        // A never-z memory (always the case for a 2-state element type) stores no
+        // z words; a null z_base tells the runtime to skip the z writes. A
+        // 4-state readmem target is a z seed in compute_may_z, so it always keeps
+        // its z field.
         llvm::Value* z_base =
-          b_.CreateInBoundsGEP(arr_ty, storage, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(1) });
+          s.has_z ? b_.CreateInBoundsGEP(arr_ty, storage, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(1) })
+                  : llvm::cast<llvm::Value>(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
         const auto stride = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(s.slot_ty));
 
         const Type& at = std::get<Type>(mod_.pool.get(mod_.signal(info.target).type));
@@ -4245,8 +4376,8 @@ private:
     // The NBA shadow struct and its field index in the root (valid iff non-null).
     llvm::StructType*       shadow_ty_    = nullptr;
     uint32_t                shadow_field_ = 0;
-    // Slot-type memo, one `{ i(2W), iW }` per (width, domain).
-    std::vector<std::tuple<uint32_t, bool, llvm::StructType*>> slot_types_;
+    // Slot-type memo, one `{ i(2W)[, iW] }` per (width, domain, has_z).
+    std::vector<std::tuple<uint32_t, bool, bool, llvm::StructType*>> slot_types_;
     // Per-definition state-struct memo: (definition name, field types, type).
     // Instances of one definition share the type; a same-named definition with
     // different fields (different parameterization) gets its own entry.
@@ -4264,6 +4395,9 @@ private:
     // Set while lowering a PreInit process: its stores apply variable declaration
     // initializers and must generate no events, so wait-queue servicing is skipped.
     bool                    lowering_preinit_ = false;
+    // Whether never-z signals drop their z word (build_state_types); false keeps
+    // every slot's z storage (the --no-z-elision escape hatch).
+    bool                    z_elision_ = true;
     llvm::Value*            frame_       = nullptr;
     std::vector<FrameSlot>  frame_slots_;
     // The current function's frame struct (one field per Local, in order).
@@ -4378,7 +4512,7 @@ bool lower_coroutines(llvm::Module& m) {
 
 } // namespace
 
-std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& ctx, bool optimize) {
+std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& ctx, bool optimize, bool z_elision) {
     auto llmod = std::make_unique<llvm::Module>(m.name.empty() ? "clotho" : m.name, ctx);
 
     // Pin the module to the host target's triple and DataLayout before any IR is
@@ -4405,7 +4539,7 @@ std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& c
     }
 
     try {
-        Backend(m, ctx, *llmod).run();
+        Backend(m, ctx, *llmod, z_elision).run();
     } catch (const BackendError& e) {
         llvm::errs() << "llvm backend error: " << e.message << "\n";
         return nullptr;
@@ -4431,9 +4565,9 @@ std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& c
     return llmod;
 }
 
-bool emit_llvm(const Module& m, llvm::raw_ostream& os, bool optimize) {
+bool emit_llvm(const Module& m, llvm::raw_ostream& os, bool optimize, bool z_elision) {
     llvm::LLVMContext ctx;
-    auto              llmod = build_module(m, ctx, optimize);
+    auto              llmod = build_module(m, ctx, optimize, z_elision);
     if (!llmod) {
         return false;
     }
