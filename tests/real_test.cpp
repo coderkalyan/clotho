@@ -354,3 +354,71 @@ TEST_CASE("$realtime inside a function is rejected loudly") {
         endmodule
     )", "$realtime inside a function is not supported");
 }
+
+TEST_CASE("real function arguments, returns, and recursion") {
+    const std::string out = run_capture(R"(
+        module t;
+            real g;
+
+            function real avg(input real a, input real b);
+                return (a + b) / 2.0;
+            endfunction
+
+            function real fact(input real n);
+                if (n <= 1.0) return 1.0;
+                return n * fact(n - 1.0);
+            endfunction
+
+            function shortreal halve(input shortreal x);
+                return x / 2.0;
+            endfunction
+
+            function int roundit(input real r);
+                return r; // implicit real -> int rounds (LRM 6.12.1)
+            endfunction
+
+            initial begin
+                $display("%g", avg(1.5, 2.5));
+                $display("%g", fact(5.0));
+                $display("%g", halve(7.0));
+                $display("%0d", roundit(2.5));
+                $display("%g", avg(3, 4)); // int actuals convert at the call
+                g = avg(g, 8.0);           // module real through a function
+                $display("%g", g);
+            end
+        endmodule
+    )");
+    CHECK(out == "2\n120\n3.5\n3\n3.5\n4\n");
+}
+
+TEST_CASE("real task formals: input, output, and inout copy in and out") {
+    const std::string out = run_capture(R"(
+        module t;
+            real o, a;
+            task automatic scale(input real in, output real out, inout real acc);
+                out = in * 3.0;
+                acc = acc + in;
+            endtask
+            initial begin
+                a = 10.0;
+                scale(1.25, o, a);
+                $display("%g %g", o, a);
+            end
+        endmodule
+    )");
+    CHECK(out == "3.75 11.25\n");
+}
+
+TEST_CASE("a real task formal survives a timing suspend") {
+    // The formal's frame slot (its 64-bit pattern) must live across the
+    // coroutine suspend and resume.
+    const std::string out = run_capture(R"(
+        module t;
+            task automatic later(input real v);
+                #2 $display("%g", v * 2.0);
+            endtask
+            initial later(1.75);
+        endmodule
+    )");
+    CHECK(out == "3.5\n");
+}
