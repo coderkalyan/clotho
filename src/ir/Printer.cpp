@@ -179,6 +179,8 @@ const char* tag_name(Inst::Tag tag) {
             return "read_mem";
         case T::SimTime:
             return "sim_time";
+        case T::TimeFormat:
+            return "timeformat";
         case T::Random:
             return "random";
     }
@@ -360,6 +362,16 @@ private:
                     os_ << ", ";
                     ref(a);
                 }
+                break;
+            }
+            case Inst::PayloadKind::TimeFormat: {
+                const auto info = ir_.extra_data<TimeFormatInfo>(p.timeformat);
+                ref(info.units);
+                os_ << ", ";
+                ref(info.precision);
+                os_ << ", ";
+                ref(info.min_width);
+                os_ << ", \"" << ir_.extra_bytes(info.suffix, info.suffix_len) << '"';
                 break;
             }
             case Inst::PayloadKind::OpExtra:
