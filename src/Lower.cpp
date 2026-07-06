@@ -207,11 +207,29 @@ ir::SignalInfo::Direction direction_of(slang::ast::ArgumentDirection d) {
     return ir::SignalInfo::Direction::Internal;
 }
 
-// Infers the @* sensitivity of a combinational process body (an `always_comb`,
-// `always_latch`, or `always @*`): the signals it reads to compute a result,
-// minus the ones it writes. A signal that is both read and written is an
-// internal intermediate and is left out; index/part-select expressions on a
-// write target are themselves reads and are kept (11.6, 9.2.2.2).
+// Which inferred-sensitivity rule set a SensitivityCollector walk applies. The
+// LRM defines two that differ in how subroutine calls contribute (9.2.2.2.2):
+//
+// - Comb (`always_comb` / `always_latch`, 9.2.2.2.1, and continuous assigns):
+//   the bodies of called functions contribute their reads and writes; the
+//   bodies of called tasks contribute nothing (only the task's argument
+//   expressions do).
+// - ImplicitEvent (`always @*`, 9.4.2.2): no called subroutine body
+//   contributes anything; only the argument expressions are sensitive.
+enum class SensitivityMode : uint8_t {
+    Comb,
+    ImplicitEvent,
+};
+
+// Collects the reads and writes that build a process's inferred sensitivity
+// (an `always_comb`, `always_latch`, `always @*`, or continuous assign): the
+// signals the body reads to compute a result, and the ones it writes. Whether
+// written signals are subtracted from the read set is decided at the use site:
+// always_comb excludes them (9.2.2.2.1 (b)), while `always @*` keeps a signal
+// that is read anywhere outside an lvalue base even if also written (9.4.2.2:
+// only identifiers appearing *solely* as an assignment's left-hand side are
+// excluded). Index/part-select expressions on a write target are themselves
+// reads and are always kept (11.6, 9.2.2.2).
 //
 // The AST is walked rather than the lowered IR so reads are seen at the source
 // level, before any temporaries the IR introduces. Symbols not in `sigmap`
@@ -220,6 +238,7 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     using SigMap = ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal>;
 
     const SigMap&                          sigmap;
+    SensitivityMode                        mode;
     std::vector<ir::Signal>                reads;    // in first-seen order
     ankerl::unordered_dense::set<uint32_t> seen;     // dedup for `reads`
     ankerl::unordered_dense::set<uint32_t> written;  // assignment targets / locals
@@ -227,7 +246,7 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     // sites (or a recursive one) is walked at most once.
     ankerl::unordered_dense::set<const SubroutineSymbol*> entered;
 
-    explicit SensitivityCollector(const SigMap& m) : sigmap(m) {}
+    SensitivityCollector(const SigMap& m, SensitivityMode mode) : sigmap(m), mode(mode) {}
 
     void record_read(const ValueSymbol& sym) {
         const auto it = sigmap.find(&sym);
@@ -287,8 +306,19 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
 
     void handle(const AssignmentExpression& a) {
         a.right().visit(*this); // RHS: pure reads
+        if (a.isCompound()) {
+            // `a += b` reads its target too. In Comb mode the write below
+            // subtracts it back out; in ImplicitEvent mode it stays sensitive.
+            a.left().visit(*this);
+        }
         record_write(a.left());
     }
+
+    // Identifiers that appear only in a timing-control (wait / event / delay)
+    // expression carry no sensitivity (9.2.2.2.1 (c), 9.4.2.2): skip the timing
+    // control and walk only the controlled statement. Reachable only from
+    // `always @*` (Comb procedures reject timing controls at elaboration).
+    void handle(const TimedStatement& t) { t.stmt.visit(*this); }
 
     void handle(const UnaryExpression& u) {
         switch (u.op) {
@@ -317,20 +347,24 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
         visitDefault(f);
     }
 
-    // A called function's reads count toward the caller's sensitivity: a function
-    // may reference module signals directly, not only through its arguments. Visit
-    // the actual-argument expressions, then descend once into the callee body. The
-    // callee's formals / locals are not module signals (not in sigmap), so they are
-    // ignored; module signals it reads / writes are recorded as usual.
+    // A called subroutine's argument expressions are always sensitive. Its body
+    // contributes only for a *function* under Comb rules (9.2.2.2.1): a function
+    // may reference module signals directly, not only through its arguments, so
+    // descend once into the callee body — the callee's formals / locals are not
+    // module signals (not in sigmap), so they are ignored, while module signals
+    // it reads / writes are recorded as usual. Task bodies never contribute
+    // (9.2.2.2.1: "the contents of the tasks do not add anything"), and under
+    // ImplicitEvent (@*) rules no callee body does (9.2.2.2.2).
     void handle(const CallExpression& c) {
         for (const Expression* arg : c.arguments()) {
             arg->visit(*this);
         }
-        if (c.isSystemCall()) {
+        if (c.isSystemCall() || mode != SensitivityMode::Comb) {
             return;
         }
         const SubroutineSymbol* sub = std::get<0>(c.subroutine);
-        if (sub != nullptr && entered.insert(sub).second) {
+        if (sub != nullptr && sub->subroutineKind == SubroutineKind::Function &&
+            entered.insert(sub).second) {
             sub->getBody().visit(*this);
         }
     }
@@ -846,8 +880,12 @@ private:
         // driven and read is real combinational feedback (`assign y = a & y`)
         // and must stay sensitive. An empty list (constant RHS) yields a
         // run-once process, which is the required time-zero evaluation.
+        //
+        // NOTE: Comb mode inlines called-function reads. The LRM leaves this
+        // unspecified for continuous assigns; inlining is
+        // the safe superset (extra wakeups of an idempotent assign).
         std::vector<ir::WaitEvent> wait_events;
-        SensitivityCollector       c(sigmap_);
+        SensitivityCollector       c(sigmap_, SensitivityMode::Comb);
         e.visit(c);
         for (const ir::Signal s : c.reads) {
             wait_events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
@@ -878,7 +916,7 @@ private:
         // Sensitive to every signal the initializer reads (LRM 4.9.1); an empty
         // list (constant RHS) yields the required run-once time-zero evaluation.
         std::vector<ir::WaitEvent> wait_events;
-        SensitivityCollector       c(sigmap_);
+        SensitivityCollector       c(sigmap_, SensitivityMode::Comb);
         init->visit(c);
         for (const ir::Signal s : c.reads) {
             wait_events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
@@ -967,7 +1005,7 @@ private:
     // any-change wait) to `out`. Mirrors collect_inferred_sensitivity for an
     // expression with no writes.
     void collect_expr_reads(const Expression& expr, std::vector<ir::WaitEvent>& out) {
-        SensitivityCollector c(sigmap_);
+        SensitivityCollector c(sigmap_, SensitivityMode::Comb);
         expr.visit(c);
         for (const ir::Signal s : c.reads) {
             if (!c.written.contains(static_cast<uint32_t>(s))) {
@@ -993,9 +1031,11 @@ private:
 
         // `always_comb` / `always_latch` have no written sensitivity at all; their
         // event list is inferred from the body's reads (9.2.2.2). `always @*`
-        // carries an ImplicitEvent timing wrapping the body, inferred the same way.
-        bool infer = sym.procedureKind == ProceduralBlockKind::AlwaysComb ||
-                     sym.procedureKind == ProceduralBlockKind::AlwaysLatch;
+        // carries an ImplicitEvent timing wrapping the body, inferred under the
+        // subtly different 9.4.2.2 rules (see SensitivityMode).
+        const bool comb = sym.procedureKind == ProceduralBlockKind::AlwaysComb ||
+                          sym.procedureKind == ProceduralBlockKind::AlwaysLatch;
+        bool       infer = comb;
 
         // A top-level event control is the process's sensitivity: collect its wait
         // events here and lower the statement underneath.
@@ -1030,7 +1070,8 @@ private:
         // Inferred sensitivity is read from the body after lowering, so any
         // block-local declarations it touched are already registered in sigmap_.
         if (infer) {
-            collect_inferred_sensitivity(*body, wait_events);
+            collect_inferred_sensitivity(
+              *body, comb ? SensitivityMode::Comb : SensitivityMode::ImplicitEvent, wait_events);
         }
         // always_comb / always_latch evaluate once at time zero (LRM 9.2.2.2), so
         // they settle from declaration-initialized values. An `always @*` or an
@@ -1086,22 +1127,28 @@ private:
         }
     }
 
-    // Build the inferred (@*) sensitivity of a combinational process body and
-    // append it to `out`: every signal read to compute a result, minus those the
-    // body writes, each entered as a level-sensitive (any-change) wait.
-    void collect_inferred_sensitivity(const Statement& body, std::vector<ir::WaitEvent>& out) {
-        SensitivityCollector c(sigmap_);
+    // Build the inferred sensitivity of a combinational process body and append
+    // it to `out`, each signal as a level-sensitive (any-change) wait. Under
+    // Comb rules (always_comb / always_latch) signals the body writes are
+    // subtracted (9.2.2.2.1 (b)); under ImplicitEvent (@*) rules a signal read
+    // anywhere stays sensitive even if also written — LRM 9.4.2.2's example
+    // makes `tmp1 = a & b; y = tmp1;` sensitive to tmp1, which another process
+    // may legally write (@* permits multiple drivers).
+    void collect_inferred_sensitivity(const Statement& body, SensitivityMode mode,
+                                      std::vector<ir::WaitEvent>& out) {
+        SensitivityCollector c(sigmap_, mode);
         body.visit(c);
         for (const ir::Signal s : c.reads) {
-            if (!c.written.contains(static_cast<uint32_t>(s))) {
-                if (is_string_ref(module_.signal(s).type)) {
-                    // TODO: string signals in inferred (@*) sensitivity — string
-                    // stores skip wait-queue servicing, so the process would
-                    // never re-trigger.
-                    fail("string in inferred combinational sensitivity is not supported");
-                }
-                out.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
+            if (mode == SensitivityMode::Comb && c.written.contains(static_cast<uint32_t>(s))) {
+                continue;
             }
+            if (is_string_ref(module_.signal(s).type)) {
+                // TODO: string signals in inferred (@*) sensitivity — string
+                // stores skip wait-queue servicing, so the process would
+                // never re-trigger.
+                fail("string in inferred combinational sensitivity is not supported");
+            }
+            out.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
         }
     }
 

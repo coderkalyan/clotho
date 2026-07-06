@@ -640,3 +640,100 @@ TEST_CASE("a parameter expression in a part-select bound folds") {
     REQUIRE_MESSAGE(r.ok, r.diagnostics);
     CHECK(signal_width(*r.module, "o") == 2);
 }
+
+TEST_CASE("a task body neither adds to nor subtracts from always_comb sensitivity") {
+    // LRM 9.2.2.2.1: a called task's argument expressions are sensitive, but
+    // the task's contents contribute nothing -- in particular a task-body
+    // write must not subtract a signal the block itself reads.
+    const LowerResult r = lower_text(R"(
+        module m(input a, input b, input g, output reg y);
+            reg side;
+            task automatic t;
+                side = g;
+            endtask
+            always_comb begin
+                y = a | b;
+                if (b) t();
+            end
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    const ir::Process* p = find_level_process(*r.module);
+    REQUIRE(p != nullptr);
+    // g (read only inside the task) is out; a and b stay in. Before the fix
+    // the walk descended into t, so g leaked in.
+    CHECK(sensitivity_names(*r.module, *p) == std::set<std::string>{ "a", "b" });
+}
+
+TEST_CASE("a task-body write does not subtract a block-level read") {
+    const LowerResult r = lower_text(R"(
+        module m(input b, output reg y);
+            reg a;
+            task automatic t;
+                a = 1'b1;
+            endtask
+            always_comb begin
+                y = a | b;
+                if (b) t();
+            end
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    const ir::Process* p = find_level_process(*r.module);
+    REQUIRE(p != nullptr);
+    // a is read at block level; the write inside t is a task write and does
+    // not exclude it (only block / called-function writes do).
+    CHECK(sensitivity_names(*r.module, *p) == std::set<std::string>{ "a", "b" });
+}
+
+TEST_CASE("always @* keeps an intermediate that is both read and written") {
+    // LRM 9.4.2.2 (Example 2): @* excludes only identifiers appearing solely
+    // as an assignment's LHS; tmp is read, so it stays sensitive -- unlike
+    // always_comb, which subtracts written signals (9.2.2.2.1 (b)).
+    const LowerResult r = lower_text(R"(
+        module m(input a, input b, input c, output reg y);
+            reg t;
+            always @* begin
+                t = a & b;
+                y = t | c;
+            end
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    const ir::Process* p = find_level_process(*r.module);
+    REQUIRE(p != nullptr);
+    CHECK(sensitivity_names(*r.module, *p) == std::set<std::string>{ "a", "b", "c", "t" });
+}
+
+TEST_CASE("always @* is sensitive to function arguments, not function contents") {
+    // LRM 9.2.2.2.2: @* sees only a called function's arguments; always_comb
+    // additionally sees the signals the function body reads.
+    const LowerResult star = lower_text(R"(
+        module m(input a, input g, output reg y);
+            function automatic logic f(logic x);
+                return x ^ g;
+            endfunction
+            always @* y = f(a);
+        endmodule
+    )");
+    REQUIRE_MESSAGE(star.ok, star.diagnostics);
+    const ir::Process* sp = find_level_process(*star.module);
+    REQUIRE(sp != nullptr);
+    CHECK(sensitivity_names(*star.module, *sp) == std::set<std::string>{ "a" });
+
+    const LowerResult comb = lower_text(R"(
+        module m(input a, input g, output reg y);
+            function automatic logic f(logic x);
+                return x ^ g;
+            endfunction
+            always_comb y = f(a);
+        endmodule
+    )");
+    REQUIRE_MESSAGE(comb.ok, comb.diagnostics);
+    const ir::Process* cp = find_level_process(*comb.module);
+    REQUIRE(cp != nullptr);
+    CHECK(sensitivity_names(*comb.module, *cp) == std::set<std::string>{ "a", "g" });
+}

@@ -2014,3 +2014,49 @@ TEST_CASE("backend lowers string signals, constants, and string ops (hand-built 
     std::fclose(tmp);
     CHECK(out == "5\nO\n");
 }
+
+TEST_CASE("a signal written by a called task stays in always_comb sensitivity") {
+    // Regression: the sensitivity walk used to descend into task bodies, so
+    // the task's write of `a` subtracted the block-level read and a change to
+    // `a` never re-triggered the comb process (LRM 9.2.2.2.1: task contents
+    // contribute nothing).
+    const std::string_view src = R"(
+        module m;
+            reg a, b, y;
+            task automatic t;
+                a = 1'b1;
+            endtask
+            always_comb begin
+                y = a | b;
+                if (b) t();
+            end
+            initial begin
+                a = 1'b0; b = 1'b0;
+                #1 a = 1'b1;
+                #1 $display("%b", y);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1\n");
+}
+
+TEST_CASE("always @* re-triggers on a read+written intermediate") {
+    // Regression: @* subtracted written signals like always_comb, so another
+    // process's write to `t` never woke the block (LRM 9.4.2.2 Example 2
+    // keeps a read intermediate sensitive).
+    const std::string_view src = R"(
+        module m;
+            reg a, b, c, t, y;
+            always @* begin
+                y = t | c;
+                if (c) t = a & b;
+            end
+            initial begin
+                a = 1'b0; b = 1'b0; c = 1'b0; t = 1'b0;
+                #1 t = 1'b1;
+                #1 $display("%b", y);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1\n");
+}
