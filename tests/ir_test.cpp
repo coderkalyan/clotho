@@ -79,6 +79,35 @@ TEST_CASE("interned values round-trip in canonical planes") {
     CHECK(pool.bytes(w)[0] == 0xFF);
 }
 
+TEST_CASE("put_int on a >64-bit type zero-extends both planes") {
+    InternPool pool;
+
+    // logic [127:0]: val + xz planes of 16 bytes each. put_int used to copy
+    // from an 8-byte source word with the plane width, reading out of bounds
+    // and leaving garbage in the extension bytes.
+    const Ref wide =
+      pool.put(Type{ .kind = Type::Kind::PackedArray, .element = pool.logic_type, .left = 127, .right = 0 });
+    const Ref v = pool.put_int(wide, 0x0123456789ABCDEFull);
+
+    const auto bytes = pool.bytes(v);
+    REQUIRE(bytes.size() == 32);
+    uint64_t low = 0;
+    for (int i = 7; i >= 0; --i) {
+        low = (low << 8) | bytes[static_cast<size_t>(i)];
+    }
+    CHECK(low == 0x0123456789ABCDEFull);
+    for (size_t i = 8; i < 32; ++i) {
+        CHECK(bytes[i] == 0x00); // val extension and the whole xz plane
+    }
+
+    // Same value again dedups; a 2-state wide type has a single 16-byte plane.
+    CHECK(pool.put_int(wide, 0x0123456789ABCDEFull) == v);
+    const Ref wide2 =
+      pool.put(Type{ .kind = Type::Kind::PackedArray, .element = pool.bit_type, .left = 127, .right = 0 });
+    CHECK(pool.bytes(pool.put_int(wide2, 42)).size() == 16);
+    CHECK(pool.bytes(pool.put_int(wide2, 42))[0] == 42);
+}
+
 // Combinational body:  y = a & b;
 TEST_CASE("build a combinational process and query it") {
     InternPool      pool;
