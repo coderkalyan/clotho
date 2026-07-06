@@ -1122,7 +1122,16 @@ private:
                 if (ev.iffCondition != nullptr) {
                     fail("iff qualifier on an event control is not supported");
                 }
-                out.push_back(ir::WaitEvent{ .signal = event_signal(ev.expr), .edge = to_edge(ev.edge) });
+                const ir::Signal sig = event_signal(ev.expr);
+                if (ev.edge == slang::ast::EdgeKind::BothEdges) {
+                    // `edge` means posedge-or-negedge (LRM 9.4.2), not any change:
+                    // an x<->z transition is neither and must not wake. Subscribe
+                    // both edge buckets; the scheduled flag dedups a double wake.
+                    out.push_back(ir::WaitEvent{ .signal = sig, .edge = ir::Edge::Positive });
+                    out.push_back(ir::WaitEvent{ .signal = sig, .edge = ir::Edge::Negative });
+                } else {
+                    out.push_back(ir::WaitEvent{ .signal = sig, .edge = to_edge(ev.edge) });
+                }
                 break;
             }
             case TimingControlKind::EventList:
@@ -1161,8 +1170,8 @@ private:
         }
     }
 
-    // Map a slang edge kind to the IR edge. A level-sensitive entry (no edge) and
-    // a both-edge entry both record as Any (any value change).
+    // Map a slang edge kind to the IR edge. Only None (a level wait) reaches the
+    // default; BothEdges is expanded to two wait events by collect_wait_events.
     static ir::Edge to_edge(slang::ast::EdgeKind edge) {
         switch (edge) {
             case slang::ast::EdgeKind::PosEdge:

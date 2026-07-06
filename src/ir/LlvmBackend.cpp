@@ -1855,6 +1855,15 @@ private:
         return false;
     }
 
+    // Whether any waiter subscribed a level (any-change) wait on the signal. Only
+    // these consume the z word in edge classification, so a store may skip the z
+    // snapshot when none exist.
+    bool signal_has_level_waiters(Signal sig) const {
+        const auto i = static_cast<uint32_t>(sig);
+        const auto e = static_cast<uint32_t>(Edge::Any);
+        return wait_sta_gv_[i][e] != nullptr || wait_dyn_gv_[i][e] != nullptr;
+    }
+
     // Load the packed must|may word of an lvalue's selected storage: the whole
     // signal for a plain target, or one element for an unpacked-array element.
     // Used to snapshot old / new state around a blocking store so wait-queue
@@ -1862,36 +1871,99 @@ private:
     llvm::Value* load_lv_mm(const LValue& lv) {
         return b_.CreateLoad(int_ty(2 * lv.store_width), lv_mm_ptr(lv));
     }
+    llvm::Value* load_lv_z(const LValue& lv) {
+        return b_.CreateLoad(int_ty(lv.store_width), lv_z_ptr(lv));
+    }
+
+    // One old -> new transition's wake facts: which edge buckets fire. A fact is
+    // null when its bucket was not requested (no waiters of that kind).
+    struct EdgeFacts {
+        llvm::Value* pos     = nullptr; // Table 9-2 posedge (a move toward 1)
+        llvm::Value* neg     = nullptr; // Table 9-2 negedge (a move toward 0)
+        llvm::Value* changed = nullptr; // any value change (level waits)
+    };
+
+    // Classify a store's old -> new transition of a packed must|may word into wake
+    // facts per LRM 9.4.2 / Table 9-2. The edge state of bit 0 forms the lattice
+    // 0 < x/z < 1 — x and z encode identically in the planes (must 0 / may 1), and
+    // the LRM defines no edge between them — so posedge is any move up the lattice
+    // (0->1, 0->x, x->1) and negedge any move down. A 2-state slot cannot hold x,
+    // so its classifier stays the plain 0<->1 compare. Edges read only the LSB of
+    // each plane (LRM 9.4.2: an edge is detected only on the LSB).
+    //
+    // `changed` compares whole words: both planes and, when the slot carries a z
+    // word (old_z / new_z non-null), the z word too — x->z is a value change for a
+    // level wait even though the planes agree. Facts whose need flag is false stay
+    // null and emit no code.
+    EdgeFacts emit_edge_facts(llvm::Value* old_mm, llvm::Value* new_mm, uint32_t width,
+                              bool four_state, llvm::Value* old_z, llvm::Value* new_z,
+                              bool need_pos, bool need_neg, bool need_any) {
+        auto*     i1 = b_.getInt1Ty();
+        EdgeFacts f;
+        if (need_pos || need_neg) {
+            llvm::Value* old_m = b_.CreateTrunc(old_mm, i1); // must LSB
+            llvm::Value* new_m = b_.CreateTrunc(new_mm, i1);
+            if (four_state) {
+                auto*        sh      = llvm::ConstantInt::get(old_mm->getType(), width);
+                llvm::Value* old_may = b_.CreateTrunc(b_.CreateLShr(old_mm, sh), i1);
+                llvm::Value* new_may = b_.CreateTrunc(b_.CreateLShr(new_mm, sh), i1);
+                if (need_pos) {
+                    f.pos = b_.CreateAnd(b_.CreateAnd(b_.CreateNot(old_m), new_may),
+                                         b_.CreateOr(b_.CreateNot(old_may), new_m));
+                }
+                if (need_neg) {
+                    f.neg = b_.CreateAnd(b_.CreateAnd(old_may, b_.CreateNot(new_m)),
+                                         b_.CreateOr(b_.CreateNot(new_may), old_m));
+                }
+            } else {
+                if (need_pos) {
+                    f.pos = b_.CreateAnd(b_.CreateNot(old_m), new_m);
+                }
+                if (need_neg) {
+                    f.neg = b_.CreateAnd(old_m, b_.CreateNot(new_m));
+                }
+            }
+        }
+        if (need_any) {
+            f.changed = b_.CreateICmpNE(old_mm, new_mm);
+            if (old_z != nullptr) {
+                f.changed = b_.CreateOr(f.changed, b_.CreateICmpNE(old_z, new_z));
+            }
+        }
+        return f;
+    }
 
     // Service a signal's wait queues after a blocking assignment to it. Computes
     // the transition's edge facts once, then for each per-edge bucket that exists
     // guards its whole scan with a single branch on the matching fact — no
-    // per-entry edge check. Emits nothing for a signal with no waiters.
+    // per-entry edge check. Emits nothing for a signal with no waiters. old_z /
+    // new_z are the z-word snapshots, or null when the slot has no z word or no
+    // level waiter consumes it.
     //
     // The three buckets are serviced independently (not else-if): a 0->1 LSB
     // transition is both `changed` (any) and `pos`, so it services both buckets.
-    void service_wait_queue(Signal sig, llvm::Value* old_mm, llvm::Value* new_mm) {
+    void service_wait_queue(Signal sig, llvm::Value* old_mm, llvm::Value* new_mm,
+                            llvm::Value* old_z, llvm::Value* new_z) {
         const auto i = static_cast<uint32_t>(sig);
         if (!signal_has_waiters(sig)) {
             return;
         }
-        // Edge-detection facts, computed once for all entries. The LSB of `must` is
-        // bit 0 of the packed word; Any compares the whole word.
-        llvm::Value* old_lsb = b_.CreateTrunc(old_mm, b_.getInt1Ty());
-        llvm::Value* new_lsb = b_.CreateTrunc(new_mm, b_.getInt1Ty());
-        llvm::Value* pos     = b_.CreateAnd(b_.CreateNot(old_lsb), new_lsb);
-        llvm::Value* neg     = b_.CreateAnd(old_lsb, b_.CreateNot(new_lsb));
-        llvm::Value* changed = b_.CreateICmpNE(old_mm, new_mm);
+        const auto has_bucket = [&](Edge e) {
+            const auto k = static_cast<uint32_t>(e);
+            return wait_sta_gv_[i][k] != nullptr || wait_dyn_gv_[i][k] != nullptr;
+        };
+        const SignalSlot& slot = slot_of(sig);
+        const EdgeFacts   f =
+          emit_edge_facts(old_mm, new_mm, slot.width, slot.four_state, old_z, new_z,
+                          has_bucket(Edge::Positive), has_bucket(Edge::Negative), has_bucket(Edge::Any));
 
-        // Bucket -> matching fact. `pos`/`neg` each imply `changed`, so the Any
-        // bucket also fires on an LSB transition.
         const std::array<std::pair<uint32_t, llvm::Value*>, 3> buckets = {
-            std::make_pair(static_cast<uint32_t>(Edge::Any), changed),
-            std::make_pair(static_cast<uint32_t>(Edge::Positive), pos),
-            std::make_pair(static_cast<uint32_t>(Edge::Negative), neg),
+            std::make_pair(static_cast<uint32_t>(Edge::Any), f.changed),
+            std::make_pair(static_cast<uint32_t>(Edge::Positive), f.pos),
+            std::make_pair(static_cast<uint32_t>(Edge::Negative), f.neg),
         };
         for (const auto& [e, fact] : buckets) {
-            if (wait_sta_gv_[i][e] == nullptr && wait_dyn_gv_[i][e] == nullptr) {
+            if (fact == nullptr) {
                 continue;
             }
             auto* fn   = b_.GetInsertBlock()->getParent();
@@ -2248,18 +2320,21 @@ private:
 
     // Service an NBA target's wait queues after its shadow committed to live. Same
     // edge facts as service_wait_queue, but the per-edge queue pointers come from
-    // the meta record (runtime) so this drives any signal with one body.
-    void emit_nba_service(llvm::Value* meta, llvm::Value* old_mm, llvm::Value* new_mm) {
-        auto*        i1      = b_.getInt1Ty();
-        llvm::Value* old_lsb = b_.CreateTrunc(old_mm, i1);
-        llvm::Value* new_lsb = b_.CreateTrunc(new_mm, i1);
-        llvm::Value* pos     = b_.CreateAnd(b_.CreateNot(old_lsb), new_lsb);
-        llvm::Value* neg     = b_.CreateAnd(old_lsb, b_.CreateNot(new_lsb));
-        llvm::Value* changed = b_.CreateICmpNE(old_mm, new_mm);
+    // the meta record (runtime) so this drives any signal with one body. Which
+    // per-edge queues are populated is not known at compile time here (the commit
+    // loop is shared per bucket), so all three facts are computed; a 2-state
+    // target keeps must == may in every stored word, so the 4-state classifier is
+    // exact for it too and `four_state` is passed unconditionally. `width` is the
+    // bucket's static width; old_z / new_z are null for a never-z bucket.
+    void emit_nba_service(llvm::Value* meta, llvm::Value* old_mm, llvm::Value* new_mm,
+                          uint32_t width, llvm::Value* old_z, llvm::Value* new_z) {
+        const EdgeFacts f = emit_edge_facts(old_mm, new_mm, width, /*four_state=*/true, old_z,
+                                            new_z, /*need_pos=*/true, /*need_neg=*/true,
+                                            /*need_any=*/true);
         const std::array<std::pair<uint32_t, llvm::Value*>, 3> buckets = {
-            std::make_pair(static_cast<uint32_t>(Edge::Any), changed),
-            std::make_pair(static_cast<uint32_t>(Edge::Positive), pos),
-            std::make_pair(static_cast<uint32_t>(Edge::Negative), neg),
+            std::make_pair(static_cast<uint32_t>(Edge::Any), f.changed),
+            std::make_pair(static_cast<uint32_t>(Edge::Positive), f.pos),
+            std::make_pair(static_cast<uint32_t>(Edge::Negative), f.neg),
         };
         for (const auto& [e, fact] : buckets) {
             auto* fn   = b_.GetInsertBlock()->getParent();
@@ -2312,11 +2387,16 @@ private:
         llvm::Value* sh_z_p   = bk.has_z ? field_ptr_var(state, meta_i32(meta, 3)) : nullptr;
         llvm::Value* old_mm   = b_.CreateAlignedLoad(mmty, live_mm_p, mm_al);
         llvm::Value* new_mm   = nullptr;
+        // z snapshots feed the level-wait change compare (x<->z is a value
+        // change); null for a never-z bucket.
+        llvm::Value* old_z = nullptr;
+        llvm::Value* new_z = nullptr;
         if (!bk.partial) {
             new_mm = b_.CreateAlignedLoad(mmty, sh_mm_p, mm_al);
             b_.CreateAlignedStore(new_mm, live_mm_p, mm_al);
             if (bk.has_z) {
-                llvm::Value* new_z = b_.CreateAlignedLoad(zty, sh_z_p, z_al);
+                old_z = b_.CreateAlignedLoad(zty, live_z_p, z_al);
+                new_z = b_.CreateAlignedLoad(zty, sh_z_p, z_al);
                 b_.CreateAlignedStore(new_z, live_z_p, z_al);
             }
         } else {
@@ -2329,14 +2409,14 @@ private:
             new_mm             = b_.CreateOr(b_.CreateAnd(old_mm, b_.CreateNot(mask2)), b_.CreateAnd(sh_mm, mask2));
             b_.CreateAlignedStore(new_mm, live_mm_p, mm_al);
             if (bk.has_z) {
-                llvm::Value* old_z = b_.CreateAlignedLoad(zty, live_z_p, z_al);
-                llvm::Value* sh_z  = b_.CreateAlignedLoad(zty, sh_z_p, z_al);
-                llvm::Value* new_z = b_.CreateOr(b_.CreateAnd(old_z, b_.CreateNot(mask)), b_.CreateAnd(sh_z, mask));
+                old_z             = b_.CreateAlignedLoad(zty, live_z_p, z_al);
+                llvm::Value* sh_z = b_.CreateAlignedLoad(zty, sh_z_p, z_al);
+                new_z = b_.CreateOr(b_.CreateAnd(old_z, b_.CreateNot(mask)), b_.CreateAnd(sh_z, mask));
                 b_.CreateAlignedStore(new_z, live_z_p, z_al);
             }
             b_.CreateAlignedStore(zero(W), mask_p, z_al); // clear dirty mask for next slot
         }
-        emit_nba_service(meta, old_mm, new_mm);
+        emit_nba_service(meta, old_mm, new_mm, bk.width, old_z, new_z);
         b_.CreateStore(b_.getInt8(0),
                        b_.CreateInBoundsGEP(nba_pending_ty_, nba_pending_gv_, { b_.getInt32(0), id }));
         b_.CreateBr(cont);
@@ -3166,11 +3246,16 @@ private:
                 const bool    service = !lowering_preinit_ && lv.is_signal && signal_has_waiters(lv.sig);
                 // Snapshot the selected storage (whole signal, or one array element)
                 // so an element write wakes Any-edge waiters on a change to that
-                // element rather than always reading element 0.
+                // element rather than always reading element 0. The z word joins
+                // the snapshot only when a level waiter exists to consume it (a
+                // z-only x<->z transition is a value change, LRM 9.4.2).
+                const bool    watch_z = service && lv.has_z && signal_has_level_waiters(lv.sig);
                 llvm::Value*  old_mm  = service ? load_lv_mm(lv) : nullptr;
+                llvm::Value*  old_z   = watch_z ? load_lv_z(lv) : nullptr;
                 lower_store(lv, value_of(p.binary.r), type_of(p.binary.r));
                 if (service) {
-                    service_wait_queue(lv.sig, old_mm, load_lv_mm(lv));
+                    service_wait_queue(lv.sig, old_mm, load_lv_mm(lv), old_z,
+                                       watch_z ? load_lv_z(lv) : nullptr);
                 }
                 return;
             }

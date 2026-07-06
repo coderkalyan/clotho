@@ -2060,3 +2060,89 @@ TEST_CASE("always @* re-triggers on a read+written intermediate") {
     )";
     CHECK(run_capture(src) == "1\n");
 }
+
+TEST_CASE("posedge/negedge classify x/z transitions per LRM Table 9-2") {
+    // Regression: edge detection read only the must-plane LSB, so a 0->x
+    // posedge (and its mirrors) never fired. Sequence below has two posedges
+    // (0->x, x->1); x->0 and 1->z are negedges and z->x is no edge.
+    const std::string_view src = R"(
+        module m;
+            reg clk;
+            integer n;
+            initial n = 0;
+            always @(posedge clk) n = n + 1;
+            initial begin
+                #1 clk = 1'b0;
+                #1 clk = 1'bx;
+                #1 clk = 1'b1;
+                #1 clk = 1'bz;
+                #1 clk = 1'bx;
+                #1 $display("%0d", n);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2\n");
+}
+
+TEST_CASE("a level wait wakes on a z-only value change") {
+    // Regression: the any-change compare covered only the must/may planes, so
+    // x<->z transitions (visible only in the z word) never woke @(s).
+    const std::string_view src = R"(
+        module m;
+            reg s;
+            integer n;
+            initial n = 0;
+            always @(s) n = n + 1;
+            initial begin
+                #1 s = 1'bz;
+                #1 s = 1'bx;
+                #1 s = 1'b0;
+                #1 $display("%0d", n);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "3\n");
+}
+
+TEST_CASE("the edge keyword fires on posedge or negedge, not x<->z") {
+    // `edge` = posedge|negedge (LRM 9.4.2): the x->z step is no edge; z->1 is
+    // a posedge and 1->x a negedge.
+    const std::string_view src = R"(
+        module m;
+            reg s;
+            integer n;
+            initial n = 0;
+            always @(edge s) n = n + 1;
+            initial begin
+                #1 s = 1'bz;
+                #1 s = 1'b1;
+                #1 s = 1'bx;
+                #1 $display("%0d", n);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2\n");
+}
+
+TEST_CASE("NBA commits classify x/z edges and z-only changes the same way") {
+    // The nonblocking commit path has its own edge-fact emission; the clock
+    // sequence has two posedges (0->x, x->1), and the level wait on s must
+    // wake for the x->z NBA commit.
+    const std::string_view src = R"(
+        module m;
+            reg clk, s;
+            integer n, k;
+            initial begin n = 0; k = 0; end
+            always @(posedge clk) n = n + 1;
+            always @(s) k = k + 1;
+            initial begin
+                #1 clk <= 1'b0;
+                #1 clk <= 1'bx;
+                #1 clk <= 1'b1;
+                #1 s <= 1'bz;
+                #1 $display("%0d %0d", n, k);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2 1\n");
+}
