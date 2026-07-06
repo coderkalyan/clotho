@@ -42,6 +42,8 @@
 #include <slang/ast/types/NetType.h>
 #include <slang/ast/types/Type.h>
 #include <slang/ast/Scope.h>
+#include <slang/analysis/AnalysisManager.h>
+#include <slang/diagnostics/AnalysisDiags.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/diagnostics/TextDiagnosticClient.h>
 #include <slang/numeric/Time.h>
@@ -2978,12 +2980,35 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
     const slang::Diagnostics&   diags     = comp.getAllDiagnostics();
     const slang::SourceManager* sm        = comp.getSourceManager();
     bool                        has_error = false;
-    if (sm != nullptr && !diags.empty()) {
+    if (sm != nullptr) {
         slang::DiagnosticEngine engine(*sm);
         auto                    client = std::make_shared<slang::TextDiagnosticClient>();
         engine.addClient(client);
+        // LRM 9.2.2.2 / 9.2.2.3 recommend tools warn when a comb / latch
+        // procedure's behavior does not match its declared kind. slang keeps
+        // both diagnostics in its off-by-default "extra" group, so enable them.
+        engine.setSeverity(slang::diag::InferredLatch, slang::DiagnosticSeverity::Warning);
+        engine.setSeverity(slang::diag::InferredComb, slang::DiagnosticSeverity::Warning);
+        // slang rejects a timing-control-free `always` as a hard error, but the
+        // LRM (9.2.2.1) only describes it as a simulation deadlock: clotho
+        // deliberately lowers it faithfully (see lower_procedural_block), so
+        // downgrade to a warning.
+        engine.setSeverity(slang::diag::AlwaysWithoutTimingControl,
+                           slang::DiagnosticSeverity::Warning);
         for (const slang::Diagnostic& d : diags) {
             engine.issue(d);
+        }
+        // Post-elaboration analysis (dataflow): inferred-latch/comb checks,
+        // blocking-task-in-comb errors, and multi-driver checks (9.2.2.2). Only
+        // run on an error-free design — analysis assumes a valid AST. Default
+        // AnalysisOptions deliberately leave the lint-style CheckUnused /
+        // CheckShadow passes off and match strict LRM driver rules.
+        if (engine.getNumErrors() == 0) {
+            comp.freeze();
+            slang::analysis::AnalysisManager analysis;
+            analysis.analyze(comp);
+            engine.issue(analysis.getDiagnostics());
+            comp.unfreeze();
         }
         result.diagnostics = client->getString();
         has_error          = engine.getNumErrors() > 0;

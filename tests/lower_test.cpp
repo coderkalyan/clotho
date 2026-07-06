@@ -737,3 +737,56 @@ TEST_CASE("always @* is sensitive to function arguments, not function contents")
     REQUIRE(cp != nullptr);
     CHECK(sensitivity_names(*comb.module, *cp) == std::set<std::string>{ "a", "g" });
 }
+
+TEST_CASE("an always_comb that infers a latch warns but still lowers") {
+    // LRM 9.2.2.2: tools should warn when an always_comb does not model
+    // combinational logic; slang's dataflow analysis reports it.
+    const LowerResult r = lower_text(R"(
+        module m(input en, input d, output reg q);
+            always_comb
+                if (en) q = d;
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    CHECK(r.diagnostics.find("latch inferred") != std::string::npos);
+}
+
+TEST_CASE("a blocking task called from always_comb is rejected") {
+    // LRM 9.2.2.2: statements in an always_comb shall not block. The direct
+    // form is caught at elaboration; the called-task form needs analysis.
+    const LowerResult r = lower_text(R"(
+        module m(output reg y);
+            task automatic t;
+                #1 y = 1'b1;
+            endtask
+            always_comb t();
+        endmodule
+    )");
+    CHECK(!r.ok);
+    CHECK(r.diagnostics.find("blocking timing control") != std::string::npos);
+}
+
+TEST_CASE("a variable driven by always_comb and another process warns") {
+    const LowerResult r = lower_text(R"(
+        module m(output reg y);
+            always_comb y = 1'b0;
+            initial y = 1'b1;
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    CHECK(r.diagnostics.find("cannot be written to by any other process") != std::string::npos);
+}
+
+TEST_CASE("a timing-control-free always warns but still lowers") {
+    // slang's analysis makes this a hard error; clotho lowers the zero-delay
+    // infinite loop faithfully (LRM 9.2.2.1 calls it a deadlock, not illegal),
+    // so the severity is downgraded to a warning.
+    const LowerResult r = lower_text(R"(
+        module m;
+            reg a;
+            always a = ~a;
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    CHECK(r.diagnostics.find("does not advance time") != std::string::npos);
+}
