@@ -1362,16 +1362,21 @@ private:
         }
     }
 
-    // Reduce a condition expression to its 1-bit truth value for `if`/`?:`.
-    // LRM §12.4: the condition is true if any bit is 1, false if all bits are 0,
-    // and ambiguous (X) otherwise. That is exactly reduction-OR: must = any bit
-    // definitely 1, may = any bit could be 1 (Z bits read as X via `may`). This
-    // also normalizes a multi-bit predicate to the 1-bit value `b.cond`/`b.mux`
-    // require; without it the backend emits a mismatched-width icmp.
     ir::Index lower_predicate(const Expression& cond, ir::Builder& b) {
-        const ir::SourceLoc l    = loc(cond);
-        const ir::Index     pred = lower_expr(cond, b);
+        const ir::SourceLoc l = loc(cond);
+        if (is_string_expr(cond)) {
+            const ir::Index len = b.unary(ir::Inst::Tag::StrLen, lower_expr(cond, b), l);
+            return b.unary(ir::Inst::Tag::RedOr, len, l);
+        }
+        const ir::Index pred = lower_expr(cond, b);
         return b.unary(ir::Inst::Tag::RedOr, pred, l);
+    }
+
+    // A loop condition keeps its native width (the backend's definite-1 rule
+    // normalizes multi-bit and X/Z), except a string, which must lower to its
+    // 1-bit truth value.
+    ir::Index lower_loop_cond(const Expression& cond, ir::Builder& b) {
+        return is_string_expr(cond) ? lower_predicate(cond, b) : lower_expr(cond, b);
     }
 
     void lower_conditional(const ConditionalStatement& c, ir::Builder& b) {
@@ -1470,7 +1475,8 @@ private:
         }
 
         b.open_region();
-        const ir::Index pred = f.stopExpr != nullptr ? lower_expr(*f.stopExpr, b) : true_const(b, loc(f));
+        const ir::Index pred =
+          f.stopExpr != nullptr ? lower_loop_cond(*f.stopExpr, b) : true_const(b, loc(f));
         const ir::ExtraSlice cond = b.close_region();
 
         b.open_region();
@@ -1489,7 +1495,7 @@ private:
     // while-loop: a for-loop with no init and no step.
     void lower_while(const WhileLoopStatement& w, ir::Builder& b) {
         b.open_region();
-        const ir::Index     pred = lower_expr(w.cond, b);
+        const ir::Index     pred = lower_loop_cond(w.cond, b);
         const ir::ExtraSlice cond = b.close_region();
 
         b.open_region();
@@ -2354,6 +2360,9 @@ private:
             case U::BitwiseNot:
                 return b.unary(T::Bnot, op, l);
             case U::LogicalNot:
+                if (is_string_expr(u.operand())) {
+                    fail("logical negation of a string is not legal (LRM Table 11-1)");
+                }
                 return b.unary(T::Lnot, op, l);
             case U::BitwiseAnd:
                 return b.unary(T::RedAnd, op, l);
