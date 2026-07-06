@@ -19,6 +19,7 @@
 #include <llvm/Support/raw_ostream.h>
 
 #include "Module.h"
+#include "SimConfig.h"
 
 namespace clotho::ir {
 
@@ -27,18 +28,13 @@ namespace clotho::ir {
 // generated module fails verification. The caller owns the returned module and
 // must keep `ctx` alive at least as long as it.
 //
-// `optimize` runs the coroutine-lowering pipeline (CoroSplit et al., required to
-// produce runnable code). Pass false to get the raw pre-split module — the
-// llvm.coro.* intrinsics are still present — for manual review before any passes.
-// `z_elision` drops the z word from the state slot of signals the may-z analysis
-// proves never carry z; false keeps every slot's z storage (debug escape hatch).
-std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& ctx, bool optimize = true,
-                                           bool z_elision = true);
+std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& ctx,
+                                           const SimulationConfig& config = {});
 
 // Lower every process in `m` to an LLVM function and write textual LLVM IR to
 // `os`. Returns false (and writes the reason to llvm::errs()) if the generated
 // module fails verification; on success the IR has already been printed to `os`.
-// `optimize` / `z_elision` are forwarded to build_module.
-bool emit_llvm(const Module& m, llvm::raw_ostream& os, bool optimize = true, bool z_elision = true);
+// `config` is forwarded to build_module.
+bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config = {});
 
 } // namespace clotho::ir

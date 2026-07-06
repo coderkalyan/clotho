@@ -330,12 +330,12 @@ struct BackendError {
 // are reset each time).
 class Backend {
 public:
-    Backend(const Module& mod, llvm::LLVMContext& ctx, llvm::Module& llmod, bool z_elision)
+    Backend(const Module& mod, llvm::LLVMContext& ctx, llvm::Module& llmod, const SimulationConfig& config)
       : mod_(mod)
       , ctx_(ctx)
       , llmod_(llmod)
       , b_(ctx)
-      , z_elision_(z_elision) {}
+      , config_(config) {}
 
     void run() {
         build_state_types();
@@ -521,10 +521,11 @@ private:
         // round-trips the z bit today (Resize does not clear z across domains),
         // and that behavior is preserved — ordinary 2-state signals are never-z
         // through the analysis anyway.
-        const std::vector<bool> may_z = z_elision_ ? compute_may_z(mod_) : std::vector<bool>(sigs.size(), true);
+        const std::vector<bool> may_z =
+          config_.z_elision ? compute_may_z(mod_) : std::vector<bool>(sigs.size(), true);
         const std::vector<bool> task_out = task_out_targets();
-        // Semantics, not optimization: computed regardless of z_elision_. An
-        // undriven 4-state net powers up z (LRM 6.6); everything else x / 0.
+        // Semantics, not optimization: computed regardless of config_.z_elision.
+        // An undriven 4-state net powers up z (LRM 6.6); everything else x / 0.
         const std::vector<bool> undriven = compute_undriven(mod_);
 
         for (uint32_t i = 0; i < sigs.size(); ++i) {
@@ -4406,9 +4407,8 @@ private:
     // Set while lowering a PreInit process: its stores apply variable declaration
     // initializers and must generate no events, so wait-queue servicing is skipped.
     bool                    lowering_preinit_ = false;
-    // Whether never-z signals drop their z word (build_state_types); false keeps
-    // every slot's z storage (the --no-z-elision escape hatch).
-    bool                    z_elision_ = true;
+    // Compile/simulation knobs (z elision, ...); see SimConfig.h.
+    SimulationConfig        config_;
     llvm::Value*            frame_       = nullptr;
     std::vector<FrameSlot>  frame_slots_;
     // The current function's frame struct (one field per Local, in order).
@@ -4523,7 +4523,8 @@ bool lower_coroutines(llvm::Module& m) {
 
 } // namespace
 
-std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& ctx, bool optimize, bool z_elision) {
+std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& ctx,
+                                           const SimulationConfig& config) {
     auto llmod = std::make_unique<llvm::Module>(m.name.empty() ? "clotho" : m.name, ctx);
 
     // Pin the module to the host target's triple and DataLayout before any IR is
@@ -4550,7 +4551,7 @@ std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& c
     }
 
     try {
-        Backend(m, ctx, *llmod, z_elision).run();
+        Backend(m, ctx, *llmod, config).run();
     } catch (const BackendError& e) {
         llvm::errs() << "llvm backend error: " << e.message << "\n";
         return nullptr;
@@ -4561,7 +4562,7 @@ std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& c
     if (llvm::verifyModule(*llmod, &llvm::errs())) {
         return nullptr;
     }
-    if (!optimize) {
+    if (!config.optimize) {
         return llmod;
     }
     // Lower the coroutines and verify again — the second pass guards against
@@ -4576,9 +4577,9 @@ std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& c
     return llmod;
 }
 
-bool emit_llvm(const Module& m, llvm::raw_ostream& os, bool optimize, bool z_elision) {
+bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config) {
     llvm::LLVMContext ctx;
-    auto              llmod = build_module(m, ctx, optimize, z_elision);
+    auto              llmod = build_module(m, ctx, config);
     if (!llmod) {
         return false;
     }

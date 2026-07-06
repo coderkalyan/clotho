@@ -18,11 +18,11 @@
 // (coro intrinsics intact) — for manual review; `opt` emits it after the passes.
 // `--no-z-elision` keeps every signal slot's z word (bisection / debug).
 int main(int argc, char** argv) {
-    std::string_view emit = "run";
-    std::string_view out;
-    std::string_view input;
-    bool             time      = false;
-    bool             z_elision = true;
+    std::string_view            emit = "run";
+    std::string_view            out;
+    std::string_view            input;
+    bool                        time = false;
+    clotho::ir::SimulationConfig config;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
@@ -31,7 +31,7 @@ int main(int argc, char** argv) {
         } else if (arg == "--time") {
             time = true;
         } else if (arg == "--no-z-elision") {
-            z_elision = false;
+            config.z_elision = false;
         } else if (arg == "-o" && i + 1 < argc) {
             out = argv[++i];
         } else if (!arg.starts_with("-")) {
@@ -78,7 +78,7 @@ int main(int argc, char** argv) {
     }
 
     if (emit == "run") {
-        const int rc = clotho::ir::run_jit(*result.module, tp, z_elision);
+        const int rc = clotho::ir::run_jit(*result.module, tp, config);
         report();
         return rc;
     }
@@ -90,10 +90,10 @@ int main(int argc, char** argv) {
     }
 
     // emit == "llvm" (raw backend output) or "opt" (after the coroutine passes).
-    const bool optimize = emit == "opt";
-    bool       ok       = false;
+    config.optimize = emit == "opt";
+    bool ok         = false;
     if (out.empty()) {
-        ok = clotho::ir::emit_llvm(*result.module, llvm::outs(), optimize, z_elision);
+        ok = clotho::ir::emit_llvm(*result.module, llvm::outs(), config);
     } else {
         std::error_code      ec;
         llvm::raw_fd_ostream os(out, ec);
@@ -101,7 +101,7 @@ int main(int argc, char** argv) {
             std::println(stderr, "cannot open '{}': {}", out, ec.message());
             return 1;
         }
-        ok = clotho::ir::emit_llvm(*result.module, os, optimize, z_elision);
+        ok = clotho::ir::emit_llvm(*result.module, os, config);
     }
     report();
     return ok ? 0 : 1;

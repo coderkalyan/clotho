@@ -37,7 +37,7 @@ void ensure_native_target() {
 
 } // namespace
 
-int run_jit(const Module& m, Timings* timings, bool z_elision) {
+int run_jit(const Module& m, Timings* timings, const SimulationConfig& config) {
     ensure_native_target();
 
     // LLVM compile phase: build the module (IR gen + coroutine/opt passes), then
@@ -47,7 +47,12 @@ int run_jit(const Module& m, Timings* timings, bool z_elision) {
     // Each run owns its context: the design module is built into it, then both
     // are moved into a ThreadSafeModule the JIT takes over.
     auto ctx = std::make_unique<llvm::LLVMContext>();
-    auto mod = build_module(m, *ctx, /*optimize=*/true, z_elision);
+    // The JIT needs runnable code: coroutine lowering is mandatory regardless
+    // of what the caller's config says (optimize=false is an emit_llvm
+    // inspection mode).
+    SimulationConfig jit_config = config;
+    jit_config.optimize         = true;
+    auto mod                    = build_module(m, *ctx, jit_config);
     if (!mod) {
         return -1; // build_module already reported the reason.
     }
