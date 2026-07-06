@@ -1910,3 +1910,48 @@ TEST_CASE("--no-z-elision keeps every slot's z word") {
     CHECK(text.find("%bit.4 = type { i8, i4 }") != std::string::npos);
     CHECK(text.find(".nz.") == std::string::npos);
 }
+
+TEST_CASE("an undriven 4-state net powers up z, an undriven variable x (LRM 6.6)") {
+    constexpr std::string_view src = R"(
+        module m;
+            wire  [3:0] w;
+            logic [3:0] v;
+            wire  eqz = w === 4'bzzzz;
+            initial #1 $display("%b %b %b", w, v, eqz);
+        endmodule
+    )";
+    // Verified against iverilog: undriven net z, undriven variable x.
+    CHECK(run_capture(src) == "zzzz xxxx 1\n");
+}
+
+TEST_CASE("undriven top-level input ports read z") {
+    constexpr std::string_view src = R"(
+        module m(input [3:0] a, input [3:0] b);
+            wire r = a === b;
+            initial #1 $display("%b %b", a, r);
+        endmodule
+    )";
+    CHECK(run_capture(src) == "zzzz 1\n");
+}
+
+TEST_CASE("an unconnected child input port reads z inside the child") {
+    constexpr std::string_view src = R"(
+        module child(input [3:0] i);
+            initial #1 $display("%b", i);
+        endmodule
+        module top;
+            child c();
+        endmodule
+    )";
+    CHECK(run_capture(src) == "zzzz\n");
+}
+
+TEST_CASE("non-wire net kinds fail loudly") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            wand w;
+        endmodule
+    )");
+    CHECK(!r.ok);
+    CHECK(r.diagnostics.find("unsupported net type") != std::string::npos);
+}

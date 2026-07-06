@@ -38,6 +38,10 @@ struct SignalInfo {
     Ref type = Ref::Invalid;
     // Direction relative to the module boundary.
     Direction dir = Direction::Internal;
+    // A net (wire/tri/uwire), as opposed to a variable. An undriven 4-state net
+    // defaults to z (LRM 6.6); an undriven variable defaults to x. Also the
+    // seed condition for the may-z analysis (ZElision.h).
+    bool is_net = false;
 };
 
 // One elaborated instance in the design hierarchy. The frontend flattens every

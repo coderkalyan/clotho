@@ -39,6 +39,7 @@
 #include <slang/ast/symbols/ValueSymbol.h>
 #include <slang/ast/symbols/VariableSymbols.h>
 #include <slang/ast/types/AllTypes.h>
+#include <slang/ast/types/NetType.h>
 #include <slang/ast/types/Type.h>
 #include <slang/ast/Scope.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
@@ -667,6 +668,21 @@ private:
                     const ValueSymbol& vs = m.as<ValueSymbol>();
 
                     ir::SignalInfo info;
+                    if (m.kind == SymbolKind::Net) {
+                        // Only single-driver, z-defaulting net kinds are modeled.
+                        // TODO: wand/wor/tri0/tri1/trireg/supply0/supply1 carry
+                        // resolution, pull, or charge semantics (and different
+                        // undriven defaults) clotho does not implement.
+                        switch (m.as<NetSymbol>().netType.netKind) {
+                            case NetType::Wire:
+                            case NetType::Tri:
+                            case NetType::UWire:
+                                break;
+                            default:
+                                fail("unsupported net type (only wire/tri/uwire are modeled)");
+                        }
+                        info.is_net = true;
+                    }
                     info.name = prefix + std::string(vs.name);
                     info.type = lower_type(vs.getType());
                     info.dir  = ir::SignalInfo::Direction::Internal;
@@ -844,14 +860,11 @@ private:
                 // Unconnected port (LRM 23.3.2.7). An unconnected output discards
                 // the child's driven value: nothing in the parent reads it, so emit
                 // no copy process. An unconnected input leaves the child's internal
-                // net at its startup value (X for 4-state, 0 for 2-state, per
-                // init_state) — the same way every undriven net is already modeled.
-                // A port carrying an explicit default value arrives here with a
-                // non-null expression, so a null expression means there is genuinely
-                // nothing to drive.
-                //
-                // NOTE: a 4-state undriven net is modeled as X, not Z; clotho treats
-                // all undriven nets as X uniformly, so no new inconsistency arises.
+                // net with no driver, so it holds the undriven default from
+                // init_state (z for a 4-state net per LRM 6.6, x for a variable,
+                // 0 for 2-state). A port carrying an explicit default value
+                // arrives here with a non-null expression, so a null expression
+                // means there is genuinely nothing to drive.
                 continue;
             }
 

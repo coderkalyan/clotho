@@ -275,6 +275,9 @@ struct SignalSlot {
     // or is a task out/inout target (the task ABI stores z through a pointer to
     // it). A never-z slot is just `{ i(2W) }`.
     bool has_z = true;
+    // Powers up as z rather than x: an undriven 4-state net (LRM 6.6). Implies
+    // has_z (undriven nets are a may-z seed).
+    bool init_z = false;
     // Unpacked array (memory): `width` is the leaf element width; `elem_count`
     // the total leaf-element count (product of all dimensions).
     bool     is_array   = false;
@@ -520,6 +523,9 @@ private:
         // through the analysis anyway.
         const std::vector<bool> may_z = z_elision_ ? compute_may_z(mod_) : std::vector<bool>(sigs.size(), true);
         const std::vector<bool> task_out = task_out_targets();
+        // Semantics, not optimization: computed regardless of z_elision_. An
+        // undriven 4-state net powers up z (LRM 6.6); everything else x / 0.
+        const std::vector<bool> undriven = compute_undriven(mod_);
 
         for (uint32_t i = 0; i < sigs.size(); ++i) {
             const Layout lay = mod_.pool.layout(sigs[i].type);
@@ -529,7 +535,8 @@ private:
             slot.width       = lay.width == 0 ? 1 : lay.width;
             slot.four_state  = lay.domain == Domain::Four;
             slot.is_signed   = ty.is_signed;
-            slot.has_z       = may_z[i] || task_out[i];
+            slot.init_z      = undriven[i] && sigs[i].is_net && slot.four_state;
+            slot.has_z       = may_z[i] || task_out[i] || slot.init_z;
             slot.slot_ty     = slot_type(slot.width, slot.four_state, slot.has_z);
             if (ty.kind == Type::Kind::UnpackedArray) {
                 slot.is_array   = true;
@@ -2492,22 +2499,24 @@ private:
         return llmod_.getOrInsertFunction("rt_wheel_tick", llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false));
     }
 
-    // Power-up the state struct: 4-state signals come up X (must 0, may 1, z 0),
-    // 2-state signals come up 0.
+    // Power-up the state struct: undriven 4-state nets come up Z (LRM 6.6 —
+    // must 0, may 1, z all-ones), other 4-state signals X (z 0), 2-state 0.
     void init_state(llvm::Value* state) {
         for (const SignalSlot& s : slots_) {
             if (s.is_array) {
                 emit_array_init(state, s);
                 continue;
             }
-            // X packs as the high W bits of the i(2W) must|may word (may=1, must=0).
+            // X (and the must|may half of Z) packs as the high W bits of the
+            // i(2W) must|may word (may=1, must=0).
             llvm::Value* mm = s.four_state
                                 ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * s.width, s.width))
                                 : zero(2 * s.width);
             llvm::Value* slot = storage_ptr(state, s);
             b_.CreateStore(mm, b_.CreateStructGEP(s.slot_ty, slot, 0));
             if (s.has_z) {
-                b_.CreateStore(zero(s.width), b_.CreateStructGEP(s.slot_ty, slot, 1));
+                b_.CreateStore(s.init_z ? ones(s.width) : zero(s.width),
+                               b_.CreateStructGEP(s.slot_ty, slot, 1));
             }
             // A partial target's dirty mask must start clear; the shadow itself is
             // written before it is read, so it needs no initialisation.
@@ -2548,7 +2557,9 @@ private:
         b_.SetInsertPoint(body);
         b_.CreateStore(mm, b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), idx, b_.getInt32(0) }));
         if (s.has_z) {
-            b_.CreateStore(zero(w), b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), idx, b_.getInt32(1) }));
+            // An undriven net array's elements default to z like any net.
+            b_.CreateStore(s.init_z ? ones(w) : zero(w),
+                           b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), idx, b_.getInt32(1) }));
         }
         idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), body);
         b_.CreateBr(head);

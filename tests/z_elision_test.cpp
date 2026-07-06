@@ -41,16 +41,44 @@ Analyzed analyze(std::string_view source) {
 
 } // namespace
 
-TEST_CASE("a design without z sources proves every signal never-z") {
+TEST_CASE("a fully-driven design without z literals proves every signal never-z") {
+    // Testbench-shaped: no ports, every net driven. Top-level input ports would
+    // be undriven nets and thus z (see the undriven-net seed test below).
     const Analyzed a = analyze(R"(
-        module top(input clk, input [7:0] d, output reg [7:0] q);
+        module top;
+            reg clk = 0;
+            reg [7:0] d = 8'h3c;
+            reg [7:0] q;
             wire [7:0] n = d ^ 8'hff;
+            always #5 clk = ~clk;
             always @(posedge clk) q <= n + 1;
         endmodule
     )");
     for (const bool z : a.may_z) {
         CHECK(!z);
     }
+}
+
+TEST_CASE("an undriven 4-state net defaults to z and seeds the analysis (LRM 6.6)") {
+    const Analyzed a = analyze(R"(
+        module top(input [3:0] in);
+            wire [3:0] w;
+            wire [3:0] driven = 4'b1010;
+            logic [3:0] v;
+            bit  [3:0] w2;
+            logic [3:0] copy;
+            assign copy = w;
+        endmodule
+    )");
+    // Undriven nets (including undriven top-level input ports) hold z.
+    CHECK(a.z("w"));
+    CHECK(a.z("in"));
+    CHECK(a.z("copy"));
+    // A driven net, an undriven variable (defaults x), and a 2-state signal
+    // cannot hold z.
+    CHECK(!a.z("driven"));
+    CHECK(!a.z("v"));
+    CHECK(!a.z("w2"));
 }
 
 TEST_CASE("a z literal marks its target and transitive copies") {

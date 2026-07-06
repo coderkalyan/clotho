@@ -6,12 +6,15 @@
 // plane — see the plane rationale in LlvmBackend.cpp).
 //
 // Seeds:
-//   1. Interned constants with z bits (a 4-state literal like 4'bz01x, or a
+//   1. Undriven 4-state nets: a net with no driver holds its default value z
+//      (LRM 6.6). Undriven variables default to x, not z.
+//   2. Interned constants with z bits (a 4-state literal like 4'bz01x, or a
 //      parameter folded from one).
-//   2. $readmem targets with a 4-state element type (the file may contain z
+//   3. $readmem targets with a 4-state element type (the file may contain z
 //      digits; a 2-state memory reads x/z as 0 — see rt_readmem).
-// Not seeds: undriven nets / unconnected ports power up X with z = 0; tri nets,
-// gate primitives, force/release, and inout ports are unimplemented loud-fails.
+// Not seeds: gate primitives, force/release, inout ports, and net kinds with
+// resolution/pull semantics (wand, tri0, trireg, ...) are unimplemented
+// loud-fails; when implemented, their z-producing forms MUST seed here.
 //
 // The lattice is one monotone false->true bit per storage node: module signals,
 // plus each function's formals, frame locals, and return value. Each sweep
@@ -312,6 +315,59 @@ struct Analysis {
 
 } // namespace
 
+std::vector<bool> compute_undriven(const Module& m) {
+    std::vector<bool> driven(m.signals().size(), false);
+    const auto        mark_root = [&](const Ir& ir, Index lv) {
+        const Index root = lvalue_root(ir, lv);
+        if (ir.tag(root) == Inst::Tag::Signal) {
+            driven[static_cast<uint32_t>(ir.payload(root).signal)] = true;
+        }
+    };
+    const auto scan = [&](const Ir& ir, const Function* fn) {
+        for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+            const Index          i = static_cast<Index>(k);
+            const Inst::Payload& p = ir.payload(i);
+            switch (ir.tag(i)) {
+                case Inst::Tag::Store:
+                case Inst::Tag::StoreNb:
+                    mark_root(ir, p.binary.l);
+                    break;
+                case Inst::Tag::ReadMem:
+                    driven[static_cast<uint32_t>(ir.extra_data<ReadMemInfo>(p.op_extra.extra).target)] = true;
+                    break;
+                case Inst::Tag::TaskCall: {
+                    // Copy-out writes each out/inout actual at task completion.
+                    const TaskCallInfo ti     = ir.extra_data<TaskCallInfo>(p.extra);
+                    const Function&    callee = m.function(ti.func);
+                    const auto         args   = ir.region(ti.args);
+                    for (size_t a = 0; a < args.size(); ++a) {
+                        if (callee.arg_dirs[a] != ArgDir::In) {
+                            mark_root(ir, args[a]);
+                        }
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+        (void)fn;
+    };
+    for (const Process& p : m.processes()) {
+        scan(p.ir, nullptr);
+    }
+    for (uint32_t f = 0; f < m.function_count(); ++f) {
+        const Function& fn = m.function(static_cast<FunctionId>(f));
+        scan(fn.ir, &fn);
+    }
+
+    std::vector<bool> undriven(driven.size());
+    for (size_t i = 0; i < driven.size(); ++i) {
+        undriven[i] = !driven[i];
+    }
+    return undriven;
+}
+
 std::vector<bool> compute_may_z(const Module& m) {
     Analysis a{ .m = m };
     a.sig_z.assign(m.signals().size(), 0);
@@ -320,6 +376,16 @@ std::vector<bool> compute_may_z(const Module& m) {
         const Function& fn = m.function(static_cast<FunctionId>(f));
         a.fns[f].param_z.assign(fn.param_types.size(), 0);
         a.fns[f].local_z.assign(fn.local_types.size(), 0);
+    }
+
+    // Seed 1: an undriven 4-state net holds its default value z (LRM 6.6).
+    // The backend initializes exactly these to z (init_state).
+    const std::vector<bool> undriven = compute_undriven(m);
+    const auto              sigs     = m.signals();
+    for (size_t i = 0; i < sigs.size(); ++i) {
+        if (undriven[i] && sigs[i].is_net && m.pool.layout(sigs[i].type).domain == Domain::Four) {
+            a.sig_z[i] = 1;
+        }
     }
 
     do {
