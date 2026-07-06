@@ -2568,136 +2568,131 @@ private:
     llvm::Function* coro_intr(llvm::Intrinsic::ID id, llvm::ArrayRef<llvm::Type*> tys = {}) {
         return llvm::Intrinsic::getOrInsertDeclaration(&llmod_, id, tys);
     }
-    // ptr rt_alloc(i64) — coroutine frame allocation, sim-owned.
-    llvm::FunctionCallee alloc_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_alloc", llvm::FunctionType::get(ptr, { b_.getInt64Ty() }, false));
-    }
-    // void rt_free(ptr) — coroutine frame deallocation.
-    llvm::FunctionCallee free_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_free", llvm::FunctionType::get(b_.getVoidTy(), { ptr }, false));
-    }
 
-    // -- Timing wheel runtime (runtime/Runtime.h C ABI) --
+    // -- Runtime ABI (runtime/Runtime.h C ABI) --
+    //
+    // rt_fn declares (or fetches) one runtime entry point; each *_fn helper
+    // below pins one C signature. Every pointer parameter is an opaque ptr, so
+    // the LLVM-side signature is the C one with pointers erased; a helper
+    // carries a comment only where the C signature is not obvious from it.
 
-    // void rt_wheel_init(rt_wheel*) / void rt_wheel_deinit(rt_wheel*)
-    // -- Deferred array-NBA queue (rt_nba_arr_*) --
-    llvm::FunctionCallee nba_arr_push_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        auto* i32 = b_.getInt32Ty();
-        auto* fnty =
-          llvm::FunctionType::get(b_.getVoidTy(), { i32, ptr, ptr, ptr, i32, ptr, ptr, ptr, i32 }, false);
-        return llmod_.getOrInsertFunction("rt_nba_arr_push", fnty);
-    }
-    llvm::FunctionCallee nba_arr_pending_fn() {
-        return llmod_.getOrInsertFunction("rt_nba_arr_pending", llvm::FunctionType::get(b_.getInt32Ty(), {}, false));
-    }
-    llvm::FunctionCallee nba_arr_commit_fn() {
-        return llmod_.getOrInsertFunction("rt_nba_arr_commit", llvm::FunctionType::get(b_.getVoidTy(), {}, false));
-    }
-    llvm::FunctionCallee nba_arr_dirty_fn() {
-        return llmod_.getOrInsertFunction("rt_nba_arr_dirty",
-                                          llvm::FunctionType::get(b_.getInt32Ty(), { b_.getInt32Ty() }, false));
-    }
-    llvm::FunctionCallee nba_arr_reset_fn() {
-        return llmod_.getOrInsertFunction("rt_nba_arr_reset", llvm::FunctionType::get(b_.getVoidTy(), {}, false));
-    }
-
-    // -- String runtime (rt_string_*, runtime/Runtime.h) --
-
-    llvm::FunctionCallee str_rt_fn(const char* name, llvm::Type* ret, llvm::ArrayRef<llvm::Type*> params) {
+    llvm::FunctionCallee rt_fn(const char* name, llvm::Type* ret, llvm::ArrayRef<llvm::Type*> params) {
         return llmod_.getOrInsertFunction(name, llvm::FunctionType::get(ret, params, false));
     }
     llvm::Type* raw_ptr_ty() {
         return llvm::PointerType::getUnqual(ctx_);
     }
-    llvm::FunctionCallee str_init_fn() {
-        return str_rt_fn("rt_string_init", b_.getVoidTy(), { raw_ptr_ty() });
+
+    // Coroutine frame allocation, sim-owned: ptr rt_alloc(i64) / void rt_free(ptr).
+    llvm::FunctionCallee alloc_fn() {
+        return rt_fn("rt_alloc", raw_ptr_ty(), { b_.getInt64Ty() });
     }
-    llvm::FunctionCallee str_deinit_fn() {
-        return str_rt_fn("rt_string_deinit", b_.getVoidTy(), { raw_ptr_ty() });
-    }
-    llvm::FunctionCallee str_assign_fn() {
-        return str_rt_fn("rt_string_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
-    }
-    llvm::FunctionCallee str_assign_bytes_fn() {
-        return str_rt_fn("rt_string_assign_bytes", b_.getVoidTy(),
-                         { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
-    }
-    llvm::FunctionCallee str_len_fn() {
-        return str_rt_fn("rt_string_len", b_.getInt64Ty(), { raw_ptr_ty() });
-    }
-    llvm::FunctionCallee str_data_fn() {
-        return str_rt_fn("rt_string_data", raw_ptr_ty(), { raw_ptr_ty() });
-    }
-    llvm::FunctionCallee str_concat_fn() {
-        return str_rt_fn("rt_string_concat", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
-    }
-    llvm::FunctionCallee str_repl_fn() {
-        return str_rt_fn("rt_string_repl", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
-    }
-    llvm::FunctionCallee str_cmp_fn() {
-        return str_rt_fn("rt_string_cmp", b_.getInt32Ty(), { raw_ptr_ty(), raw_ptr_ty() });
-    }
-    llvm::FunctionCallee str_icmp_fn() {
-        return str_rt_fn("rt_string_icmp", b_.getInt32Ty(), { raw_ptr_ty(), raw_ptr_ty() });
-    }
-    llvm::FunctionCallee str_substr_fn() {
-        return str_rt_fn("rt_string_substr", b_.getVoidTy(),
-                         { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() });
-    }
-    llvm::FunctionCallee str_upper_fn() {
-        return str_rt_fn("rt_string_toupper", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
-    }
-    llvm::FunctionCallee str_lower_fn() {
-        return str_rt_fn("rt_string_tolower", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
-    }
-    llvm::FunctionCallee str_putc_fn() {
-        return str_rt_fn("rt_string_putc", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() });
-    }
-    llvm::FunctionCallee str_getc_fn() {
-        return str_rt_fn("rt_string_getc", b_.getInt32Ty(), { raw_ptr_ty(), b_.getInt32Ty() });
-    }
-    llvm::FunctionCallee str_from_packed_fn() {
-        return str_rt_fn("rt_string_from_packed", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
-    }
-    llvm::FunctionCallee str_to_packed_fn() {
-        return str_rt_fn("rt_string_to_packed", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+    llvm::FunctionCallee free_fn() {
+        return rt_fn("rt_free", b_.getVoidTy(), { raw_ptr_ty() });
     }
 
+    // Deferred array-NBA queue (rt_nba_arr_*).
+    // void rt_nba_arr_push(i32 sig, ptr mm_dst, ptr mm_val, ptr mm_mask,
+    //                      i32 mm_bytes, ptr z_dst, ptr z_val, ptr z_mask, i32 z_bytes)
+    llvm::FunctionCallee nba_arr_push_fn() {
+        auto* ptr = raw_ptr_ty();
+        auto* i32 = b_.getInt32Ty();
+        return rt_fn("rt_nba_arr_push", b_.getVoidTy(), { i32, ptr, ptr, ptr, i32, ptr, ptr, ptr, i32 });
+    }
+    llvm::FunctionCallee nba_arr_pending_fn() {
+        return rt_fn("rt_nba_arr_pending", b_.getInt32Ty(), {});
+    }
+    llvm::FunctionCallee nba_arr_commit_fn() {
+        return rt_fn("rt_nba_arr_commit", b_.getVoidTy(), {});
+    }
+    llvm::FunctionCallee nba_arr_dirty_fn() {
+        return rt_fn("rt_nba_arr_dirty", b_.getInt32Ty(), { b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee nba_arr_reset_fn() {
+        return rt_fn("rt_nba_arr_reset", b_.getVoidTy(), {});
+    }
+
+    // String runtime (rt_string_*); every ptr is an rt_string handle except
+    // where noted.
+    llvm::FunctionCallee str_init_fn() {
+        return rt_fn("rt_string_init", b_.getVoidTy(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_deinit_fn() {
+        return rt_fn("rt_string_deinit", b_.getVoidTy(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_assign_fn() {
+        return rt_fn("rt_string_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    // void rt_string_assign_bytes(rt_string*, const char* bytes, i64 len)
+    llvm::FunctionCallee str_assign_bytes_fn() {
+        return rt_fn("rt_string_assign_bytes", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+    }
+    llvm::FunctionCallee str_len_fn() {
+        return rt_fn("rt_string_len", b_.getInt64Ty(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_data_fn() {
+        return rt_fn("rt_string_data", raw_ptr_ty(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_concat_fn() {
+        return rt_fn("rt_string_concat", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_repl_fn() {
+        return rt_fn("rt_string_repl", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+    }
+    llvm::FunctionCallee str_cmp_fn() {
+        return rt_fn("rt_string_cmp", b_.getInt32Ty(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_icmp_fn() {
+        return rt_fn("rt_string_icmp", b_.getInt32Ty(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_substr_fn() {
+        return rt_fn("rt_string_substr", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_upper_fn() {
+        return rt_fn("rt_string_toupper", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_lower_fn() {
+        return rt_fn("rt_string_tolower", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_putc_fn() {
+        return rt_fn("rt_string_putc", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_getc_fn() {
+        return rt_fn("rt_string_getc", b_.getInt32Ty(), { raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_from_packed_fn() {
+        return rt_fn("rt_string_from_packed", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_to_packed_fn() {
+        return rt_fn("rt_string_to_packed", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+    }
+
+    // Timing wheel (rt_wheel_*); the ptr parameter is the rt_wheel.
     llvm::FunctionCallee wheel_init_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_wheel_init", llvm::FunctionType::get(b_.getVoidTy(), { ptr }, false));
+        return rt_fn("rt_wheel_init", b_.getVoidTy(), { raw_ptr_ty() });
     }
     llvm::FunctionCallee wheel_deinit_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_wheel_deinit", llvm::FunctionType::get(b_.getVoidTy(), { ptr }, false));
+        return rt_fn("rt_wheel_deinit", b_.getVoidTy(), { raw_ptr_ty() });
     }
-    // i64 rt_wheel_now(const rt_wheel*)
     llvm::FunctionCallee wheel_now_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_wheel_now", llvm::FunctionType::get(b_.getInt64Ty(), { ptr }, false));
+        return rt_fn("rt_wheel_now", b_.getInt64Ty(), { raw_ptr_ty() });
     }
-    // i32 rt_random(void)
     llvm::FunctionCallee random_fn() {
-        return llmod_.getOrInsertFunction("rt_random", llvm::FunctionType::get(b_.getInt32Ty(), {}, false));
+        return rt_fn("rt_random", b_.getInt32Ty(), {});
     }
-    // i32 rt_wheel_pending(const rt_wheel*)
     llvm::FunctionCallee wheel_pending_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_wheel_pending", llvm::FunctionType::get(b_.getInt32Ty(), { ptr }, false));
+        return rt_fn("rt_wheel_pending", b_.getInt32Ty(), { raw_ptr_ty() });
     }
     // void rt_wheel_schedule(rt_wheel*, rt_timer*, i64 deadline, rt_timer_fn)
     llvm::FunctionCallee wheel_schedule_fn() {
-        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, b_.getInt64Ty(), ptr }, false);
-        return llmod_.getOrInsertFunction("rt_wheel_schedule", fnty);
+        return rt_fn("rt_wheel_schedule", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
     }
     // void rt_wheel_tick(rt_wheel*, void* ctx)
     llvm::FunctionCallee wheel_tick_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_wheel_tick", llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false));
+        return rt_fn("rt_wheel_tick", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
 
     // Power-up the state struct: undriven 4-state nets come up Z (LRM 6.6 —
@@ -3790,23 +3785,18 @@ private:
 
     // void rt_display(const char* fmt, i32 argc, const rt_arg* argv)
     llvm::FunctionCallee display_fn() {
-        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, b_.getInt32Ty(), ptr }, false);
-        return llmod_.getOrInsertFunction("rt_display", fnty);
+        return rt_fn("rt_display", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
     }
 
     // void rt_timeformat_init(i64 tick_fs, i32 default_units)
     llvm::FunctionCallee timeformat_init_fn() {
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { b_.getInt64Ty(), b_.getInt32Ty() }, false);
-        return llmod_.getOrInsertFunction("rt_timeformat_init", fnty);
+        return rt_fn("rt_timeformat_init", b_.getVoidTy(), { b_.getInt64Ty(), b_.getInt32Ty() });
     }
 
     // void rt_timeformat_set(i32 units, i32 precision, const char* suffix, i32 suffix_len, i32 min_width)
     llvm::FunctionCallee timeformat_set_fn() {
-        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-        auto* i32  = b_.getInt32Ty();
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { i32, i32, ptr, i32, i32 }, false);
-        return llmod_.getOrInsertFunction("rt_timeformat_set", fnty);
+        auto* i32 = b_.getInt32Ty();
+        return rt_fn("rt_timeformat_set", b_.getVoidTy(), { i32, i32, raw_ptr_ty(), i32, i32 });
     }
 
     // Lower a $timeformat: evaluate the units / precision / min_width operands and
@@ -3824,10 +3814,11 @@ private:
                       { units, prec, sfx_ptr, b_.getInt32(static_cast<uint32_t>(suffix.size())), width });
     }
 
-    // void rt_finish(void) — noreturn; exits the process.
+    // void rt_finish(void) — noreturn; exits the process. Kept separate from
+    // the plain rt_fn helpers: the noreturn attribute must land on the
+    // declaration so the optimizer prunes the dead tail after a $finish.
     llvm::FunctionCallee finish_fn() {
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), false);
-        auto  fn   = llmod_.getOrInsertFunction("rt_finish", fnty);
+        auto fn = rt_fn("rt_finish", b_.getVoidTy(), {});
         if (auto* f = llvm::dyn_cast<llvm::Function>(fn.getCallee())) {
             f->setDoesNotReturn();
         }
@@ -3843,8 +3834,7 @@ private:
 
     // void rt_fflush(void) — flush all open output buffers.
     llvm::FunctionCallee fflush_fn() {
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), false);
-        return llmod_.getOrInsertFunction("rt_fflush", fnty);
+        return rt_fn("rt_fflush", b_.getVoidTy(), {});
     }
 
     // Lower a $fflush (no-arg form): flush the runtime's output buffers.
@@ -3856,12 +3846,10 @@ private:
     //                 i32 stride, i32 count, i32 width, i64 decl_left, i64 decl_right,
     //                 i64 start, i64 finish, i32 flags)
     llvm::FunctionCallee readmem_fn() {
-        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-        auto* i32  = b_.getInt32Ty();
-        auto* i64  = b_.getInt64Ty();
-        auto* fnty = llvm::FunctionType::get(
-          b_.getVoidTy(), { ptr, i32, ptr, ptr, i32, i32, i32, i64, i64, i64, i64, i32 }, false);
-        return llmod_.getOrInsertFunction("rt_readmem", fnty);
+        auto* ptr = raw_ptr_ty();
+        auto* i32 = b_.getInt32Ty();
+        auto* i64 = b_.getInt64Ty();
+        return rt_fn("rt_readmem", b_.getVoidTy(), { ptr, i32, ptr, ptr, i32, i32, i32, i64, i64, i64, i64, i32 });
     }
 
     // Lower a $readmemh / $readmemb: hand the runtime the filename bytes (spilled
