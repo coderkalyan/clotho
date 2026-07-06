@@ -802,3 +802,27 @@ TEST_CASE("a net declaration delay fails loudly") {
     )");
     CHECK_MESSAGE(rp.ok, rp.diagnostics);
 }
+
+// -- `matches` pattern conditions (LRM 12.6.2) --
+
+TEST_CASE("a matches pattern in an if condition fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module m(input [3:0] v, output reg q);
+            always @(*)
+                if (v matches 4'd3) q = 1'b1;
+                else q = 1'b0;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("pattern matching in conditions") != std::string::npos);
+}
+
+TEST_CASE("a matches pattern in a conditional expression fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module m(input [3:0] v, output y);
+            assign y = v matches 4'd3 ? 1'b1 : 1'b0;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("pattern matching in conditions") != std::string::npos);
+}

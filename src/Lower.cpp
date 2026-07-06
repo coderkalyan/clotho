@@ -1378,6 +1378,12 @@ private:
         if (c.conditions.size() != 1) {
             fail("unsupported multi-condition if");
         }
+        if (c.conditions[0].pattern != nullptr) {
+            // TODO: `if (expr matches pattern)` (LRM 12.6.2) — the pattern must
+            // be matched and its variables bound; lowering the bare condition
+            // would silently ignore the pattern.
+            fail("pattern matching in conditions is not supported");
+        }
         const ir::Index pred = lower_predicate(*c.conditions[0].expr, b);
 
         b.open_region();
@@ -2250,6 +2256,11 @@ private:
                 }
                 if (c.conditions.size() != 1) {
                     fail("unsupported multi-condition ?:");
+                }
+                if (c.conditions[0].pattern != nullptr) {
+                    // TODO: `expr matches pattern ? a : b` (LRM 12.6.2) — same
+                    // gap as lower_conditional's pattern guard.
+                    fail("pattern matching in conditions is not supported");
                 }
                 const ir::Index pred = lower_predicate(*c.conditions[0].expr, b);
                 const ir::Index a    = lower_expr(c.left(), b);
