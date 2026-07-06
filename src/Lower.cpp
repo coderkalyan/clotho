@@ -481,8 +481,32 @@ private:
                     // elaboration and bit-sliced port connections.
                     fail("instance arrays are not supported");
                     break;
-                default:
+                // Known-inert members: elaboration artifacts and declarations
+                // that bear no simulation behavior of their own. Ports are wired
+                // by wire_ports; parameters/types/genvars are resolved by slang;
+                // subroutines lower on demand at call sites; statement blocks
+                // lower with their enclosing procedure; elab system tasks were
+                // already issued as elaboration diagnostics.
+                case SymbolKind::Port:
+                case SymbolKind::Parameter:
+                case SymbolKind::TypeParameter:
+                case SymbolKind::TypeAlias:
+                case SymbolKind::TransparentMember:
+                case SymbolKind::Genvar:
+                case SymbolKind::Subroutine:
+                case SymbolKind::StatementBlock:
+                case SymbolKind::WildcardImport:
+                case SymbolKind::ExplicitImport:
+                case SymbolKind::EmptyMember:
+                case SymbolKind::ElabSystemTask:
+                case SymbolKind::Specparam:
+                case SymbolKind::DefParam:
                     break;
+                default:
+                    // Anything else (gate primitives, specify blocks, checkers,
+                    // nettype aliases, ...) may carry behavior; refusing loudly
+                    // beats silently dropping it.
+                    fail("unsupported module member kind=" + std::string(toString(m.kind)));
             }
         }
     }
@@ -1003,6 +1027,12 @@ private:
         switch (tc.kind) {
             case TimingControlKind::SignalEvent: {
                 const SignalEventControl& ev = tc.as<SignalEventControl>();
+                // TODO: `@(edge sig iff cond)` (LRM 9.4.2.3) — the wake must be
+                // gated on the condition at event time; dropping it fires the
+                // process regardless of the guard.
+                if (ev.iffCondition != nullptr) {
+                    fail("iff qualifier on an event control is not supported");
+                }
                 out.push_back(ir::WaitEvent{ .signal = event_signal(ev.expr), .edge = to_edge(ev.edge) });
                 break;
             }
@@ -1076,9 +1106,18 @@ private:
                     lower_stmt(*s, b);
                 }
                 break;
-            case StatementKind::Block:
-                lower_stmt(stmt.as<BlockStatement>().body, b);
+            case StatementKind::Block: {
+                const BlockStatement& blk = stmt.as<BlockStatement>();
+                // TODO: fork..join / join_any / join_none (LRM 9.3.2) — needs
+                // child process spawning and join synchronization in the
+                // scheduler. Lowering the body sequentially would silently
+                // serialize concurrent branches.
+                if (blk.blockKind != StatementBlockKind::Sequential) {
+                    fail("fork..join blocks are not supported");
+                }
+                lower_stmt(blk.body, b);
                 break;
+            }
             case StatementKind::Timed: {
                 // A timing control nested inside a process body. A delay (#n) lowers
                 // to a Delay instruction (suspend + reschedule on the timing wheel);
