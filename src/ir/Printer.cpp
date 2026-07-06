@@ -35,6 +35,9 @@ void render_type(const InternPool& pool, Ref type, std::ostream& os) {
             render_type(pool, t.element, os);
             os << " [" << t.left << ":" << t.right << "]";
             break;
+        case Type::Kind::String:
+            os << "string";
+            break;
     }
 }
 
@@ -144,6 +147,26 @@ const char* tag_name(Inst::Tag tag) {
             return "delay";
         case T::Wait:
             return "wait";
+        case T::StrLen:
+            return "str_len";
+        case T::StrGetc:
+            return "str_getc";
+        case T::StrPutc:
+            return "str_putc";
+        case T::StrCmp:
+            return "str_cmp";
+        case T::StrICmp:
+            return "str_icmp";
+        case T::StrUpper:
+            return "str_upper";
+        case T::StrLower:
+            return "str_lower";
+        case T::StrSubstr:
+            return "str_substr";
+        case T::StrFromPacked:
+            return "str_from_packed";
+        case T::StrToPacked:
+            return "str_to_packed";
         case T::Display:
             return "display";
         case T::Finish:
@@ -174,6 +197,8 @@ const char* tag_name(Inst::Tag tag) {
             return "read_mem";
         case T::SimTime:
             return "sim_time";
+        case T::TimeFormat:
+            return "timeformat";
         case T::Random:
             return "random";
     }
@@ -219,6 +244,16 @@ private:
         const Value& v   = std::get<Value>(ir_.pool.get(value));
         const auto   all = ir_.pool.bytes(value);
         render_type(v.type);
+
+        // A string constant's bytes are its characters, not plane data.
+        if (std::get<Type>(ir_.pool.get(v.type)).kind == Type::Kind::String) {
+            os_ << " \"";
+            for (const uint8_t c : all) {
+                os_ << static_cast<char>(c);
+            }
+            os_ << '"';
+            return;
+        }
 
         const auto planes      = static_cast<size_t>(ir_.pool.layout(v.type).domain);
         const auto plane_bytes = planes ? all.size() / planes : all.size();
@@ -376,6 +411,16 @@ private:
                 }
                 break;
             }
+            case Inst::PayloadKind::TimeFormat: {
+                const auto info = ir_.extra_data<TimeFormatInfo>(p.timeformat);
+                ref(info.units);
+                os_ << ", ";
+                ref(info.precision);
+                os_ << ", ";
+                ref(info.min_width);
+                os_ << ", \"" << ir_.extra_bytes(info.suffix, info.suffix_len) << '"';
+                break;
+            }
             case Inst::PayloadKind::OpExtra:
                 render_op_extra(tag, p, depth);
                 return; // cond closes its own line; others fall through below.
@@ -409,6 +454,26 @@ private:
                 os_ << "[";
                 ref(es.index);
                 os_ << "])\n";
+                break;
+            }
+            case Inst::Tag::StrPutc: {
+                const StrPutcInfo sp = ir_.extra_data<StrPutcInfo>(p.op_extra.extra);
+                ref(p.op_extra.op);
+                os_ << "[";
+                ref(sp.index);
+                os_ << "] = ";
+                ref(sp.ch);
+                os_ << ")\n";
+                break;
+            }
+            case Inst::Tag::StrSubstr: {
+                const StrSubstrInfo ss = ir_.extra_data<StrSubstrInfo>(p.op_extra.extra);
+                ref(p.op_extra.op);
+                os_ << ", ";
+                ref(ss.i);
+                os_ << ", ";
+                ref(ss.j);
+                os_ << ")\n";
                 break;
             }
             case Inst::Tag::Cond: {

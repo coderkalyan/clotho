@@ -2,11 +2,16 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstring>
+#include <mutex>
 #include <optional>
+#include <span>
 #include <string>
+#include <tuple>
 #include <vector>
 
+#include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DerivedTypes.h>
@@ -19,9 +24,11 @@
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/Support/TargetSelect.h>
 
 #include "ir/InternPool.h"
 #include "ir/Ir.h"
+#include "ir/ZElision.h"
 #include "runtime/Runtime.h"
 
 // LLVM backend rationale.
@@ -35,16 +42,25 @@
 // invariant is must => may. Z is encoded as X in must/may with its z plane set.
 // This makes the common logic ops monotone and cheap: AND/OR are just per-plane
 // &/|, NOT is a swap+complement. The z plane passes through loads/stores and is
-// cleared by the logic ops (their result is never Z); we leave it to LLVM to
-// elide z where it proves dead rather than dropping it here.
+// cleared by the logic ops (their result is never Z).
 // To reconstruct canonical 4-state when needed: xz = must ^ may, val = must.
 //
-// State / ABI. Signals are persistent module state held in one opaque byte
-// buffer (the LLVM equivalent of `u8* align(8)`). Clotho owns the layout: it
-// computes a fixed byte offset for each signal's must|may and z fields at compile
-// time (signals packed in decreasing alignment order) and hands every process
-// function a bare `ptr`. Load/Store reach a field via a constant-offset i8 GEP
-// and an aligned load/store — no LLVM struct layout is involved.
+// Z elision. compute_may_z (ZElision.cpp) proves most signals can never carry a
+// z bit; a proven never-z signal stores no z word in its slot (see slot_type)
+// and its loads materialize a constant-zero z plane instead. SSA values,
+// function ABIs, and frame locals keep their z plane regardless — the zero
+// constants fold in LLVM — so only persistent storage changes shape.
+//
+// State / ABI. Signals are persistent module state laid out with LLVM's type
+// system. Every signal owns a `{ i(2W) must|may, iW z }` slot struct — without
+// the z word when the signal is proven never-z (an
+// unpacked-array signal an `[N x slot]` of leaf slots); every module definition
+// gets one identified struct type listing its scope's slots followed by one
+// field per child instance (the child definition's struct, replicated per
+// instantiation); the root `%clotho.state` composes the top-level instances
+// plus the NBA shadow region. Each process takes a `ptr` to the root and
+// reaches a field through constant-index GEPs, so LLVM computes and owns all
+// offsets/padding (the module carries the host target's DataLayout).
 //
 // Inferred types. The IR stores no per-instruction result type, so the backend
 // recomputes width / domain / signedness for each value by walking operands
@@ -66,6 +82,9 @@ struct ValType {
     uint32_t width      = 0;
     bool     four_state = false;
     bool     is_signed  = false;
+    // A string value: carried as an rt_string handle pointer (str_vals_), never
+    // as a Plane. width / four_state are meaningless when set.
+    bool is_string = false;
 };
 
 // A lowered value: the must/may planes packed into one i(2W) integer (low W bits
@@ -209,23 +228,28 @@ constexpr code bxnor4(code a, code b) {
 constexpr uint32_t BXNOR1_LUT = build_lut(bxnor4);
 static_assert(BXNOR1_LUT == EQ1_LUT, "1-bit xnor must equal 1-bit ==");
 
-// A resolved assignment target: a `{ i(2W) must|may, iW z }` pair somewhere in
-// memory (the module state buffer for a signal, or the per-call frame for a
-// function local) plus a bit offset / width selecting part of it. `bit_off` is an
-// i32; a whole-storage target has offset 0 and width == store_width.
+// A resolved assignment target: a `{ i(2W) must|may, iW z }` slot somewhere in
+// typed storage (the module state struct for a signal, or the per-call frame
+// struct for a function local) plus a bit offset / width selecting part of it.
+// `bit_off` is an i32; a whole-storage target has offset 0 and width ==
+// store_width.
 struct LValue {
-    // Base pointer of the storage buffer (state or frame).
+    // Pointer to the slot struct — or, for an unpacked-array signal, to the
+    // whole `[N x slot]` storage (`elem_idx` then selects the leaf).
     llvm::Value* base = nullptr;
-    // Byte offset of the must|may word and the z word within `base`. For an
-    // unpacked-array element these are element 0's offsets; `dyn_off` shifts to
-    // the selected element.
-    uint32_t off_mm = 0;
-    uint32_t off_z  = 0;
-    // Full storage width in bits.
+    // The leaf slot type `{ i(2W), iW }` of the addressed storage.
+    llvm::StructType* slot_ty = nullptr;
+    // Whether the slot stores a z word (field 1). False for a never-z signal;
+    // loads then materialize a zero z plane and stores drop theirs.
+    bool has_z = true;
+    // The `[N x slot]` storage type when `base` addresses a whole memory; null
+    // for plain scalar storage.
+    llvm::ArrayType* array_ty = nullptr;
+    // Flat leaf-element index (i32) into `array_ty`, accumulated across nested
+    // ElemSelects; null when the target is a plain signal / frame local.
+    llvm::Value* elem_idx = nullptr;
+    // Full storage width in bits (the leaf element width for a memory).
     uint32_t store_width = 0;
-    // Runtime byte offset added to both off_mm and off_z, selecting an unpacked
-    // array element (null when the target is a plain signal / frame local).
-    llvm::Value* dyn_off = nullptr;
     // Bit offset of the selection within the storage (i32).
     llvm::Value* bit_off = nullptr;
     // Selected width in bits (== store_width for a whole-storage target).
@@ -234,36 +258,53 @@ struct LValue {
     // is meaningful only then.
     bool   is_signal = false;
     Signal sig{ 0 };
+    // A string target: `base` (indexed by elem_idx for an array) is the
+    // rt_string handle; widths / bit_off / has_z are meaningless.
+    bool is_string = false;
 };
 
-// Per-signal placement in the state buffer plus its cached layout facts. A
-// signal occupies two fields: the packed i(2W) must|may word at `off_mm` and the
-// iW z word at `off_z` (both absolute byte offsets into the buffer).
+// Per-signal placement in the state struct plus its cached layout facts. A
+// signal owns one `{ i(2W) must|may, iW z }` slot struct (an unpacked array an
+// `[elem_count x slot]` of leaf slots), reached from the root state pointer by
+// the constant GEP field indices in `path`.
 struct SignalSlot {
-    uint32_t off_mm     = 0;
-    uint32_t off_z      = 0;
+    // The leaf slot type `{ i(2W), iW }` (of the element, for a memory).
+    llvm::StructType* slot_ty = nullptr;
+    // The signal's whole storage: slot_ty, or `[elem_count x slot_ty]`.
+    llvm::Type* storage_ty = nullptr;
+    // GEP field indices from the root state struct to this signal's storage.
+    std::vector<uint32_t> path;
     uint32_t width      = 0;
     bool     four_state = false;
     bool     is_signed  = false;
-    // Unpacked array (memory): `width` is the leaf element width and off_mm/off_z
-    // address element 0. `elem_stride` is the per-element byte size (one leaf
-    // slot); `elem_count` is the total leaf-element count (product of all
-    // dimensions). The region spans elem_count * elem_stride bytes.
-    bool     is_array    = false;
-    uint32_t elem_stride = 0;
-    uint32_t elem_count  = 0;
+    // Whether the slot stores a z word: the signal may carry z (compute_may_z)
+    // or is a task out/inout target (the task ABI stores z through a pointer to
+    // it). A never-z slot is just `{ i(2W) }`.
+    bool has_z = true;
+    // Powers up as z rather than x: an undriven 4-state net (LRM 6.6). Implies
+    // has_z (undriven nets are a may-z seed).
+    bool init_z = false;
+    // Unpacked array (memory): `width` is the leaf element width; `elem_count`
+    // the total leaf-element count (product of all dimensions).
+    bool     is_array   = false;
+    uint32_t elem_count = 0;
     // Nonblocking-assignment staging. Set only for signals that are NBA targets.
-    // A target gets a shadow `{ i(2W) nmm, iW nz }` mirroring its live slot; a
-    // target with any bit/part-select site also gets an iW dirty `mask`. nba_id is
-    // a dense index into the pending flags / meta table; nba_bucket indexes the
-    // per-(width, partial) commit worklist.
-    bool     nba         = false;
-    bool     nba_partial = false;
-    uint32_t nba_id      = 0;
-    uint32_t nba_bucket  = 0;
-    uint32_t off_nmm     = 0;
-    uint32_t off_nz      = 0;
-    uint32_t off_mask    = 0;
+    // A target gets shadow `i(2W)` / `iW` fields mirroring its live slot in the
+    // root's shadow struct; a target with any bit/part-select site also gets an
+    // iW dirty mask field. nba_id is a dense index into the pending flags / meta
+    // table; nba_bucket indexes the per-(width, partial) commit worklist; the
+    // sh_* members are field indices into the shadow struct.
+    bool     nba           = false;
+    bool     nba_partial   = false;
+    uint32_t nba_id        = 0;
+    uint32_t nba_bucket    = 0;
+    uint32_t sh_mm_field   = 0;
+    uint32_t sh_z_field    = 0;
+    uint32_t sh_mask_field = 0;
+    // A string (or array-of-string) signal: the slot is an opaque rt_string
+    // handle (`clotho.string`), has_z is false, and `nba` is never set (the
+    // frontend rejects nonblocking assignment to strings).
+    bool is_string = false;
 };
 
 // One NBA commit bucket: every NBA-target signal of a given width and partial-ness
@@ -273,19 +314,23 @@ struct SignalSlot {
 struct NbaBucket {
     uint32_t              width;          // signal width (the commit loop bakes it in)
     bool                  partial;        // mask-RMW commit vs whole copy
+    bool                  has_z;          // targets with a z word commit it; never-z loops skip it
     llvm::ArrayType*      ty   = nullptr; // [cap x i32] of nba-ids
     llvm::GlobalVariable* gv   = nullptr;
     llvm::GlobalVariable* top  = nullptr; // i32 live count
 };
 
-// Placement of one function-frame local: byte offsets of its `{ i(2W) must|may,
-// iW z }` pair within the per-call frame buffer, plus its width / domain. Mirrors
-// SignalSlot but with no wait-queue / NBA machinery (frame locals have neither).
+// One function-frame local: its `{ i(2W), iW }` slot type and width / domain.
+// The frame is an LLVM struct with one field per local, in Local-handle order,
+// so the local's index IS its GEP field index. No wait-queue / NBA machinery
+// (frame locals have neither).
 struct FrameSlot {
-    uint32_t off_mm     = 0;
-    uint32_t off_z      = 0;
-    uint32_t width      = 0;
-    bool     four_state = false;
+    llvm::StructType* slot_ty    = nullptr;
+    uint32_t          width      = 0;
+    bool              four_state = false;
+    // A string local: the slot is an rt_string handle; init/deinit bracket the
+    // call.
+    bool is_string = false;
 };
 
 // Raised on a construct the backend cannot lower; caught at the top level.
@@ -298,14 +343,15 @@ struct BackendError {
 // are reset each time).
 class Backend {
 public:
-    Backend(const Module& mod, llvm::LLVMContext& ctx, llvm::Module& llmod)
+    Backend(const Module& mod, llvm::LLVMContext& ctx, llvm::Module& llmod, const SimulationConfig& config)
       : mod_(mod)
       , ctx_(ctx)
       , llmod_(llmod)
-      , b_(ctx) {}
+      , b_(ctx)
+      , config_(config) {}
 
     void run() {
-        build_state_layout();
+        build_state_types();
         build_wait_queues();
         build_sched_flags();
         build_nba_state();
@@ -365,6 +411,11 @@ private:
     llvm::ConstantInt* ones(uint32_t width) const {
         return llvm::ConstantInt::get(ctx_, llvm::APInt::getAllOnes(width == 0 ? 1 : width));
     }
+    // The all-X packed i(2W) must|may word: every bit X (must 0, may 1), i.e.
+    // the high W bits set. Also the must|may half of all-Z.
+    llvm::ConstantInt* x_mm(uint32_t width) const {
+        return llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * width, width));
+    }
 
     // Cast an integer value to width `to` (zero/sign extend or truncate).
     llvm::Value* cast(llvm::Value* v, uint32_t to, bool sign) {
@@ -378,55 +429,143 @@ private:
         return sign ? b_.CreateSExt(v, int_ty(to)) : b_.CreateZExt(v, int_ty(to));
     }
 
-    // -- State buffer layout --
+    // -- State types --
 
-    // Byte size and natural alignment (capped at 8) of an integer field of the
-    // given bit width, both derived from the canonical plane sizing.
-    static uint32_t field_bytes(uint32_t bits) {
-        return plane_bytes(bits);
-    }
-    static uint32_t field_align(uint32_t bits) {
-        return std::min<uint32_t>(8, plane_bytes(bits));
-    }
-    static uint32_t round_up(uint32_t x, uint32_t a) {
-        return (x + a - 1) & ~(a - 1);
-    }
-
-    // Byte size of one runtime storage slot for a scalar value of `width` bits:
-    // the i(2W) must|may word plus the i(W) z word, with the same field padding
-    // build_state_layout uses for a plain signal.
-    static uint32_t slot_bytes(uint32_t width) {
-        const uint32_t mm_bits = 2 * width;
-        const uint32_t z_rel   = round_up(field_bytes(mm_bits), field_align(width));
-        return round_up(z_rel + field_bytes(width), field_align(mm_bits));
-    }
-    // Byte offset of the z word within a scalar slot of `width` bits.
-    static uint32_t slot_z_rel(uint32_t width) {
-        return round_up(field_bytes(2 * width), field_align(width));
+    // The `{ i(2W) must|may, iW z }` slot struct for a value of the given width
+    // and domain — just `{ i(2W) }` when the slot needs no z word (a proven
+    // never-z signal; frame locals always keep z). Identified and memoized per
+    // (width, domain, has_z) so every signal of one shape shares one named LLVM
+    // type (%logic.8, %bit.nz.4, ...); the single-field form keeps the struct
+    // wrapper so GEP paths and array-of-slot addressing stay uniform.
+    llvm::StructType* slot_type(uint32_t width, bool four_state, bool has_z) {
+        for (const auto& [w, four, z, ty] : slot_types_) {
+            if (w == width && four == four_state && z == has_z) {
+                return ty;
+            }
+        }
+        const std::string name =
+          std::string(four_state ? "logic." : "bit.") + (has_z ? "" : "nz.") + std::to_string(width);
+        std::vector<llvm::Type*> fields{ int_ty(2 * width) };
+        if (has_z) {
+            fields.push_back(int_ty(width));
+        }
+        auto* ty = llvm::StructType::create(ctx_, fields, name);
+        slot_types_.emplace_back(width, four_state, has_z, ty);
+        return ty;
     }
 
-    // Total byte size of an unpacked-array (or scalar) type's element-addressed
-    // storage: count * element storage, recursing through nested array
-    // dimensions down to a scalar leaf slot.
-    uint32_t array_storage_bytes(Ref type) const {
+    // The opaque rt_string handle slot type (`%clotho.string = { [32 x i8] }`),
+    // memoized. A struct wrapper keeps GEP paths and array-of-slot addressing
+    // uniform with the plane slots.
+    llvm::StructType* str_slot_ty() {
+        if (str_slot_ty_ == nullptr) {
+            str_slot_ty_ = llvm::StructType::create(
+              ctx_, { llvm::ArrayType::get(b_.getInt8Ty(), sizeof(rt_string)) }, "clotho.string");
+        }
+        return str_slot_ty_;
+    }
+
+    // Whether a type is a string, or an unpacked array whose leaf element is.
+    bool is_string_type(Ref type) const {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            return is_string_type(t.element);
+        }
+        return t.kind == Type::Kind::String;
+    }
+
+    // Total leaf-element count of an unpacked-array type (product of all
+    // dimensions); 1 for a scalar leaf.
+    uint32_t array_leaf_count(Ref type) const {
         const Type& t = std::get<Type>(mod_.pool.get(type));
         if (t.kind == Type::Kind::UnpackedArray) {
             const uint32_t count = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
-            return count * array_storage_bytes(t.element);
+            return count * array_leaf_count(t.element);
         }
-        return slot_bytes(mod_.pool.layout(type).width);
+        return 1;
     }
 
-    // Lay out the single module's signals into one opaque byte buffer. Each signal
-    // owns a `{ i(2W) must|may, iW z }` slot; slots are packed in decreasing
-    // alignment order (stable on declaration order) so padding stays minimal.
-    // `slots_` stays indexed by signal handle — only the byte offsets reflect the
-    // packed order.
-    void build_state_layout() {
+    // Byte offset of a GEP field-index path from the root state struct, per the
+    // module's DataLayout. Used where the runtime needs raw offsets (the NBA
+    // commit loop's meta table).
+    uint32_t path_offset(std::span<const uint32_t> path) const {
+        const llvm::DataLayout& dl  = llmod_.getDataLayout();
+        llvm::Type*             ty  = state_ty_;
+        uint64_t                off = 0;
+        for (const uint32_t f : path) {
+            if (auto* st = llvm::dyn_cast<llvm::StructType>(ty)) {
+                off += dl.getStructLayout(st)->getElementOffset(f);
+                ty = st->getElementType(f);
+            } else {
+                auto* at = llvm::cast<llvm::ArrayType>(ty);
+                off += f * dl.getTypeAllocSize(at->getElementType());
+                ty = at->getElementType();
+            }
+        }
+        return static_cast<uint32_t>(off);
+    }
+
+    // Build one instance scope's state struct: its signals' slots (field k ==
+    // scope signal k), then one field per child instance. Assigns every covered
+    // signal's GEP path; `path` holds the field indices from the root to this
+    // scope. Struct types are deduplicated per module definition — instances of
+    // one definition (same parameterization) produce identical field lists and
+    // share one identified type, so the type is replicated per instantiation.
+    llvm::StructType* scope_type(const InstanceScope& scope, std::vector<uint32_t>& path,
+                                 std::vector<bool>& claimed) {
+        std::vector<llvm::Type*> fields;
+        for (uint32_t k = 0; k < scope.signals.size(); ++k) {
+            const auto si = static_cast<uint32_t>(scope.signals[k]);
+            if (si >= slots_.size() || claimed[si]) {
+                throw BackendError{ "malformed instance hierarchy: signal claimed twice" };
+            }
+            claimed[si] = true;
+            slots_[si].path = path;
+            slots_[si].path.push_back(k);
+            fields.push_back(slots_[si].storage_ty);
+        }
+        const auto nsig = static_cast<uint32_t>(scope.signals.size());
+        for (uint32_t c = 0; c < scope.children.size(); ++c) {
+            path.push_back(nsig + c);
+            fields.push_back(scope_type(scope.children[c], path, claimed));
+            path.pop_back();
+        }
+
+        for (const auto& [def, flds, ty] : def_types_) {
+            if (def == scope.def_name && flds == fields) {
+                return ty;
+            }
+        }
+        auto* ty = llvm::StructType::create(ctx_, fields, scope.def_name + ".state");
+        def_types_.emplace_back(scope.def_name, fields, ty);
+        return ty;
+    }
+
+    // Build the design's state types: per-signal slot / storage types, one
+    // struct per module definition composed nested along the instance tree, and
+    // the root `%clotho.state` = { <top instances...>, <unscoped signals...>,
+    // <NBA shadow struct> }. Unscoped signals only occur for a module built
+    // without hierarchy info (they form one flat root scope). The NBA shadow
+    // region lives at the root, not inside the definition structs, because
+    // staging is a backend artifact of which signals the design nonblocking-
+    // assigns, not part of a module's declared state.
+    void build_state_types() {
         const auto sigs = mod_.signals();
         slots_.resize(sigs.size());
 
-        std::vector<uint32_t> order(sigs.size());
+        // A slot keeps its z word when the may-z analysis cannot prove it z-free
+        // or the task ABI needs z storage behind it. Elision is analysis-driven,
+        // not domain-driven: a 2-state signal assigned a z-carrying expression
+        // round-trips the z bit today (Resize does not clear z across domains),
+        // and that behavior is preserved — ordinary 2-state signals are never-z
+        // through the analysis anyway.
+        const std::vector<bool> may_z =
+          config_.z_elision ? compute_may_z(mod_) : std::vector<bool>(sigs.size(), true);
+        const std::vector<bool> task_out = task_out_targets();
+        // Semantics, not optimization: computed regardless of config_.z_elision.
+        // An undriven 4-state net powers up z (LRM 6.6); everything else x / 0.
+        const std::vector<bool> undriven = compute_undriven(mod_);
+
         for (uint32_t i = 0; i < sigs.size(); ++i) {
             const Layout lay = mod_.pool.layout(sigs[i].type);
             const Type&  ty  = std::get<Type>(mod_.pool.get(sigs[i].type));
@@ -435,66 +574,74 @@ private:
             slot.width       = lay.width == 0 ? 1 : lay.width;
             slot.four_state  = lay.domain == Domain::Four;
             slot.is_signed   = ty.is_signed;
-            order[i]         = i;
+            // A string slot is an opaque rt_string handle: no planes, no z word.
+            if (is_string_type(sigs[i].type)) {
+                slot.is_string = true;
+                slot.has_z     = false;
+                slot.slot_ty   = str_slot_ty();
+                if (ty.kind == Type::Kind::UnpackedArray) {
+                    slot.is_array   = true;
+                    slot.elem_count = array_leaf_count(sigs[i].type);
+                    slot.storage_ty = llvm::ArrayType::get(slot.slot_ty, slot.elem_count);
+                } else {
+                    slot.storage_ty = slot.slot_ty;
+                }
+                continue;
+            }
+            slot.init_z      = undriven[i] && sigs[i].is_net && slot.four_state;
+            slot.has_z       = may_z[i] || task_out[i] || slot.init_z;
+            slot.slot_ty     = slot_type(slot.width, slot.four_state, slot.has_z);
+            if (ty.kind == Type::Kind::UnpackedArray) {
+                slot.is_array   = true;
+                slot.elem_count = array_leaf_count(sigs[i].type);
+                slot.storage_ty = llvm::ArrayType::get(slot.slot_ty, slot.elem_count);
+            } else {
+                slot.storage_ty = slot.slot_ty;
+            }
         }
-
-        // Stable sort by slot alignment (= align of the 2W must|may word) desc.
-        std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-            return field_align(2 * slots_[a].width) > field_align(2 * slots_[b].width);
-        });
 
         nba_classify();
 
-        uint32_t cursor = 0;
-        for (uint32_t i : order) {
-            SignalSlot&    slot       = slots_[i];
-            const uint32_t mm_bits    = 2 * slot.width;
-            const uint32_t slot_align = field_align(mm_bits);
-            const uint32_t z_rel      = round_up(field_bytes(mm_bits), field_align(slot.width));
-
-            cursor      = round_up(cursor, slot_align);
-            slot.off_mm = cursor;
-            slot.off_z  = cursor + z_rel;
-
-            const Type& ty = std::get<Type>(mod_.pool.get(sigs[i].type));
-            if (ty.kind == Type::Kind::UnpackedArray) {
-                // Element-addressed memory: a contiguous run of `elem_count` leaf
-                // slots. off_mm/off_z address element 0; an ElemSelect shifts by
-                // index * elem_stride at runtime. slot.width is the leaf element
-                // width (set from the recursive layout above).
-                const uint32_t total = array_storage_bytes(sigs[i].type);
-                slot.is_array        = true;
-                slot.elem_stride     = slot_bytes(slot.width);
-                slot.elem_count      = slot.elem_stride == 0 ? 0 : total / slot.elem_stride;
-                cursor += total;
-            } else {
-                cursor += round_up(z_rel + field_bytes(slot.width), slot_align);
-            }
+        std::vector<llvm::Type*> root_fields;
+        std::vector<bool>        claimed(sigs.size(), false);
+        for (const InstanceScope& top : mod_.tops()) {
+            std::vector<uint32_t> path{ static_cast<uint32_t>(root_fields.size()) };
+            root_fields.push_back(scope_type(top, path, claimed));
         }
-
-        // Shadow staging fields for NBA targets, placed after the live region in
-        // nba-id order (= signal order). A shadow mirrors the live `{ i(2W), iW }`;
-        // a partial target adds an iW dirty mask.
         for (uint32_t i = 0; i < sigs.size(); ++i) {
-            SignalSlot& slot = slots_[i];
-            if (!slot.nba) {
-                continue;
-            }
-            const uint32_t mm_bits = 2 * slot.width;
-            cursor        = round_up(cursor, field_align(mm_bits));
-            slot.off_nmm  = cursor;
-            cursor += field_bytes(mm_bits);
-            cursor        = round_up(cursor, field_align(slot.width));
-            slot.off_nz   = cursor;
-            cursor += field_bytes(slot.width);
-            if (slot.nba_partial) {
-                cursor       = round_up(cursor, field_align(slot.width));
-                slot.off_mask = cursor;
-                cursor += field_bytes(slot.width);
+            if (!claimed[i]) {
+                slots_[i].path = { static_cast<uint32_t>(root_fields.size()) };
+                root_fields.push_back(slots_[i].storage_ty);
             }
         }
 
-        state_bytes_ = std::max<uint32_t>(1, round_up(cursor, 8));
+        // Shadow staging fields for NBA targets, in nba-id order. A shadow
+        // mirrors the live i(2W) / iW planes; a partial target adds a dirty mask.
+        if (n_nba_ > 0) {
+            std::vector<llvm::Type*> sf;
+            for (uint32_t i = 0; i < sigs.size(); ++i) {
+                SignalSlot& slot = slots_[i];
+                if (!slot.nba) {
+                    continue;
+                }
+                slot.sh_mm_field = static_cast<uint32_t>(sf.size());
+                sf.push_back(int_ty(2 * slot.width));
+                // A never-z target stages no z shadow; sh_z_field stays unused.
+                if (slot.has_z) {
+                    slot.sh_z_field = static_cast<uint32_t>(sf.size());
+                    sf.push_back(int_ty(slot.width));
+                }
+                if (slot.nba_partial) {
+                    slot.sh_mask_field = static_cast<uint32_t>(sf.size());
+                    sf.push_back(int_ty(slot.width));
+                }
+            }
+            shadow_ty_    = llvm::StructType::create(ctx_, sf, "clotho.nba.shadow");
+            shadow_field_ = static_cast<uint32_t>(root_fields.size());
+            root_fields.push_back(shadow_ty_);
+        }
+
+        state_ty_ = llvm::StructType::create(ctx_, root_fields, "clotho.state");
     }
 
     // Walk a StoreNb's lvalue chain to its root signal, reporting whether the
@@ -504,17 +651,11 @@ private:
         bool   whole;
     };
     NbaTarget nba_target(const Ir& ir, Index lv) const {
-        bool whole = true;
-        for (;;) {
-            switch (ir.tag(lv)) {
-                case Inst::Tag::Signal: return { ir.payload(lv).signal, whole };
-                case Inst::Tag::BitSelect: lv = ir.payload(lv).binary.l; whole = false; continue;
-                case Inst::Tag::PartSelect: lv = ir.payload(lv).op_extra.op; whole = false; continue;
-                case Inst::Tag::DynPartSelect: lv = ir.payload(lv).op_extra.op; whole = false; continue;
-                case Inst::Tag::ElemSelect: lv = ir.payload(lv).op_extra.op; whole = false; continue;
-                default: throw BackendError{ "unsupported nonblocking-assignment lvalue" };
-            }
+        const LvalueRoot r = lvalue_root(ir, lv);
+        if (ir.tag(r.root) != Inst::Tag::Signal) {
+            throw BackendError{ "unsupported nonblocking-assignment lvalue" };
         }
+        return { ir.payload(r.root).signal, r.whole };
     }
 
     // Mark NBA-target signals reached by one IR body (a process or a task): set
@@ -569,8 +710,83 @@ private:
         }
     }
 
+    // Signals used as a task out/inout actual anywhere in the design. The task
+    // ABI passes `&signal.z` and stores through it at copy-out (emit_task_copyout),
+    // so such a signal must keep its z word even when proven never-z. A storage/
+    // ABI constraint, not a may-z fact, hence separate from compute_may_z.
+    // (An alternative — a caller-stack z scratch word for elided targets — is
+    // sound but adds a second mechanism for a rare construct.)
+    std::vector<bool> task_out_targets() const {
+        std::vector<bool> out(mod_.signals().size(), false);
+        const auto        scan = [&](const Ir& ir) {
+            for (size_t k = 0; k < ir.inst_count(); ++k) {
+                const auto idx = static_cast<Index>(k);
+                if (ir.tag(idx) != Inst::Tag::TaskCall) {
+                    continue;
+                }
+                const auto      ti     = ir.extra_data<TaskCallInfo>(ir.payload(idx).extra);
+                const Function& callee = mod_.function(ti.func);
+                const auto      args   = ir.region(ti.args);
+                for (size_t a = 0; a < args.size(); ++a) {
+                    if (callee.arg_dirs[a] == ArgDir::In) {
+                        continue;
+                    }
+                    const Index root = lvalue_root(ir, args[a]).root;
+                    if (ir.tag(root) == Inst::Tag::Signal) {
+                        out[static_cast<uint32_t>(ir.payload(root).signal)] = true;
+                    }
+                }
+            }
+        };
+        for (const Process& p : mod_.processes()) {
+            scan(p.ir);
+        }
+        for (uint32_t i = 0; i < mod_.function_count(); ++i) {
+            scan(mod_.function(static_cast<FunctionId>(i)).ir);
+        }
+        return out;
+    }
+
     const SignalSlot& slot_of(Signal s) const {
         return slots_[static_cast<uint32_t>(s)];
+    }
+
+    // Pointer to a signal's whole storage (its slot struct, or its [N x slot]
+    // memory) within the state struct `base` points at: one constant-index GEP
+    // along the slot's field path.
+    llvm::Value* storage_ptr(llvm::Value* base, const SignalSlot& s) {
+        std::vector<llvm::Value*> idx;
+        idx.reserve(s.path.size() + 1);
+        idx.push_back(b_.getInt32(0));
+        for (const uint32_t f : s.path) {
+            idx.push_back(b_.getInt32(f));
+        }
+        return b_.CreateInBoundsGEP(state_ty_, base, idx);
+    }
+
+    // Pointer to one field of the root NBA shadow struct.
+    llvm::Value* shadow_ptr(uint32_t field) {
+        return b_.CreateInBoundsGEP(
+          state_ty_, state_, { b_.getInt32(0), b_.getInt32(shadow_field_), b_.getInt32(field) });
+    }
+
+    // Pointer to an lvalue's mm (field 0) or z (field 1) word, resolving the
+    // selected leaf element for a memory target.
+    llvm::Value* lv_field_ptr(const LValue& lv, uint32_t field) {
+        if (lv.array_ty != nullptr) {
+            llvm::Value* idx = lv.elem_idx != nullptr ? lv.elem_idx : b_.getInt32(0);
+            return b_.CreateInBoundsGEP(lv.array_ty, lv.base, { b_.getInt32(0), idx, b_.getInt32(field) });
+        }
+        return b_.CreateStructGEP(lv.slot_ty, lv.base, field);
+    }
+    llvm::Value* lv_mm_ptr(const LValue& lv) {
+        return lv_field_ptr(lv, 0);
+    }
+    llvm::Value* lv_z_ptr(const LValue& lv) {
+        // A never-z slot has no field 1; any consumer must branch on has_z
+        // before asking for the pointer.
+        assert(lv.has_z);
+        return lv_field_ptr(lv, 1);
     }
 
     // -- Per-process lowering --
@@ -581,6 +797,8 @@ private:
         values_.assign(n, Plane{});
         lvals_.assign(n, std::optional<LValue>{});
         types_.assign(n, std::optional<ValType>{});
+        str_vals_.assign(n, nullptr);
+        frame_slots_.clear(); // a process has no frame; deinit sees only temps
 
         // This process's scheduled-flag slot: &clotho.proc_sched[proc_index]. A
         // constant GEP so it is valid in any block of the function.
@@ -644,6 +862,9 @@ private:
         frame->addIncoming(mem, alloc_bb);
         hdl_        = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_begin), { id, frame });
         coro_begin_ = llvm::cast<llvm::Instruction>(hdl_);
+        // String rvalue temporaries live in the coroutine frame (CoroSplit spills
+        // any that survive a suspend) and are constructed once, in the ramp.
+        build_str_temps();
 
         // Shared epilogue, built up front so #delay suspends and the final suspend
         // can all branch to it. cleanup frees the frame (coro.free -> rt_free); ret
@@ -711,6 +932,10 @@ private:
         auto* final_bb = llvm::BasicBlock::Create(ctx_, "coro.final", fn_);
         b_.CreateBr(final_bb);
         b_.SetInsertPoint(final_bb);
+        // A completing process releases its string temporaries. (An always loop
+        // never reaches here — its temps persist, bounded and capacity-reused; a
+        // $finish longjmps out and the heap is reclaimed at process exit.)
+        deinit_body_strings();
         auto* res = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { none, b_.getTrue() });
         auto* sw  = b_.CreateSwitch(res, coro_ret_bb_, 2);
         sw->addCase(b_.getInt8(0), trap_bb);
@@ -759,11 +984,22 @@ private:
         std::vector<llvm::Type*> params;
         params.push_back(ptr); // state
         for (Ref pt : f.param_types) {
+            if (is_string_type(pt)) {
+                params.push_back(ptr); // rt_string handle (callee copy-in gives value semantics)
+                continue;
+            }
             const uint32_t w = width_of(pt);
             params.push_back(int_ty(2 * w)); // must|may
             params.push_back(int_ty(w));     // z
         }
-        auto* fnty = llvm::FunctionType::get(fn_return_ty(f.return_type), params, false);
+        // A string result returns through a trailing out-param handle the caller
+        // owns (its call-site temp) — a 32-byte handle has no plane struct form.
+        llvm::Type* rty = fn_return_ty(f.return_type);
+        if (is_string_type(f.return_type)) {
+            rty = b_.getVoidTy();
+            params.push_back(ptr);
+        }
+        auto* fnty = llvm::FunctionType::get(rty, params, false);
         auto* fn   = llvm::Function::Create(fnty, llvm::Function::InternalLinkage,
                                             mod_.name + ".fn." + f.name, llmod_);
         fn->addParamAttr(0, llvm::Attribute::NoAlias);
@@ -786,6 +1022,10 @@ private:
         params.push_back(ptr); // wheel
         for (size_t k = 0; k < f.param_types.size(); ++k) {
             if (f.arg_dirs[k] == ArgDir::In) {
+                if (is_string_type(f.param_types[k])) {
+                    params.push_back(ptr); // rt_string handle
+                    continue;
+                }
                 const uint32_t w = width_of(f.param_types[k]);
                 params.push_back(int_ty(2 * w)); // must|may
                 params.push_back(int_ty(w));     // z
@@ -805,55 +1045,85 @@ private:
 
     // LLVM param index of formal k's first parameter (state, wheel, then 2 per
     // formal). The record slot follows all formals.
-    static uint32_t task_param_base(uint32_t k) {
-        return 2 + 2 * k;
-    }
-    uint32_t task_record_param(const Function& f) const {
-        return 2 + 2 * static_cast<uint32_t>(f.param_types.size());
+    // LLVM arg index of each formal's first parameter for `f`'s signature shape:
+    // functions start after `state`, tasks after `state, wheel`; a string input
+    // formal is one ptr, everything else two params. Replaces a fixed
+    // 1 + 2k / 2 + 2k stride, which string formals break.
+    std::vector<uint32_t> param_indices(const Function& f) const {
+        std::vector<uint32_t> idx(f.param_types.size());
+        uint32_t              cur = f.is_task ? 2 : 1;
+        for (size_t k = 0; k < f.param_types.size(); ++k) {
+            idx[k] = cur;
+            const bool in_string =
+              is_string_type(f.param_types[k]) && (!f.is_task || f.arg_dirs[k] == ArgDir::In);
+            cur += in_string ? 1 : 2;
+        }
+        return idx;
     }
 
-    // Lay out a function's frame locals into one stack buffer, packed in
-    // decreasing alignment order (same scheme as build_state_layout, minus the
-    // wait-queue / NBA shadows that frame locals never need).
+    // LLVM param index of the task's record slot: right after the last formal.
+    uint32_t task_record_param(const Function& f) const {
+        const auto idx = param_indices(f);
+        if (idx.empty()) {
+            return 2;
+        }
+        const bool last_string =
+          is_string_type(f.param_types.back()) && f.arg_dirs.back() == ArgDir::In;
+        return idx.back() + (last_string ? 1 : 2);
+    }
+
+    // Build a function's frame struct: one slot field per local, in Local-handle
+    // order (a Local's index is its GEP field index).
     void build_frame_layout(const Function& f) {
         const size_t n = f.local_types.size();
         frame_slots_.assign(n, FrameSlot{});
-        std::vector<uint32_t> order(n);
+        std::vector<llvm::Type*> fields(n);
         for (uint32_t i = 0; i < n; ++i) {
-            const Layout lay     = mod_.pool.layout(f.local_types[i]);
+            const Layout lay           = mod_.pool.layout(f.local_types[i]);
             frame_slots_[i].width      = lay.width == 0 ? 1 : lay.width;
             frame_slots_[i].four_state = lay.domain == Domain::Four;
-            order[i]                   = i;
+            if (is_string_type(f.local_types[i])) {
+                frame_slots_[i].is_string = true;
+                frame_slots_[i].slot_ty   = str_slot_ty();
+                fields[i]                 = frame_slots_[i].slot_ty;
+                continue;
+            }
+            // Frame slots always keep z: the task ABI and copy-in/out use the z
+            // field, and LLVM folds the zero-z traffic on its own.
+            frame_slots_[i].slot_ty = slot_type(frame_slots_[i].width, frame_slots_[i].four_state, true);
+            fields[i]                  = frame_slots_[i].slot_ty;
         }
-        std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-            return field_align(2 * frame_slots_[a].width) > field_align(2 * frame_slots_[b].width);
-        });
-
-        uint32_t cursor = 0;
-        for (uint32_t i : order) {
-            FrameSlot&     s          = frame_slots_[i];
-            const uint32_t mm_bits    = 2 * s.width;
-            const uint32_t slot_align = field_align(mm_bits);
-            const uint32_t z_rel      = round_up(field_bytes(mm_bits), field_align(s.width));
-            const uint32_t slot_size  = round_up(z_rel + field_bytes(s.width), slot_align);
-            cursor                    = round_up(cursor, slot_align);
-            s.off_mm                  = cursor;
-            s.off_z                   = cursor + z_rel;
-            cursor += slot_size;
-        }
-        frame_bytes_ = std::max<uint32_t>(1, round_up(cursor, 8));
+        frame_ty_ = llvm::StructType::create(ctx_, fields, mod_.name + ".fn." + f.name + ".frame");
     }
 
     // Power up the frame: 4-state locals come up X (must 0, may 1), 2-state 0; z
     // is cleared. Formal-parameter locals are immediately overwritten by copy-in;
     // an unwritten return variable thus reads X (its uninitialized value).
     void init_frame() {
-        for (const FrameSlot& s : frame_slots_) {
-            llvm::Value* mm = s.four_state
-                                ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * s.width, s.width))
-                                : zero(2 * s.width);
-            b_.CreateAlignedStore(mm, field_ptr(frame_, s.off_mm), llvm::Align(field_align(2 * s.width)));
-            b_.CreateAlignedStore(zero(s.width), field_ptr(frame_, s.off_z), llvm::Align(field_align(s.width)));
+        for (uint32_t i = 0; i < frame_slots_.size(); ++i) {
+            const FrameSlot& s    = frame_slots_[i];
+            llvm::Value*     slot = b_.CreateStructGEP(frame_ty_, frame_, i);
+            if (s.is_string) {
+                b_.CreateCall(str_init_fn(), { slot });
+                continue;
+            }
+            llvm::Value*     mm   = s.four_state ? x_mm(s.width) : zero(2 * s.width);
+            b_.CreateStore(mm, b_.CreateStructGEP(s.slot_ty, slot, 0));
+            b_.CreateStore(zero(s.width), b_.CreateStructGEP(s.slot_ty, slot, 1));
+        }
+    }
+
+    // Release every string owned by the current body: frame-local string slots
+    // plus the string rvalue temporaries. Emitted before each function `ret`, in
+    // a task's completion epilogue, and before a process's final suspend.
+    void deinit_body_strings() {
+        for (uint32_t i = 0; i < frame_slots_.size(); ++i) {
+            if (frame_slots_[i].is_string) {
+                b_.CreateCall(str_deinit_fn(), { b_.CreateStructGEP(frame_ty_, frame_, i) });
+            }
+        }
+        for (llvm::Value* temp : str_temp_list_) {
+            b_.CreateCall(str_deinit_fn(), { temp });
         }
     }
 
@@ -865,6 +1135,7 @@ private:
         ir_               = &f.ir;
         cur_fn_           = &f;
         cur_is_task_      = false;
+        param_llvm_index_ = param_indices(f);
         build_frame_layout(f);
 
         fn_            = fn_decls_[static_cast<uint32_t>(id)];
@@ -872,23 +1143,22 @@ private:
         values_.assign(n, Plane{});
         lvals_.assign(n, std::optional<LValue>{});
         types_.assign(n, std::optional<ValType>{});
+        str_vals_.assign(n, nullptr);
 
         auto* entry = llvm::BasicBlock::Create(ctx_, "entry", fn_);
         b_.SetInsertPoint(entry);
         state_ = fn_->getArg(0);
         state_->setName("state");
-        fn_->addParamAttr(0, llvm::Attribute::NoAlias);
 
-        auto* buf_ty = llvm::ArrayType::get(b_.getInt8Ty(), frame_bytes_);
-        auto* frame  = b_.CreateAlloca(buf_ty, nullptr, "frame");
-        frame->setAlignment(llvm::Align(8));
-        frame_ = frame;
+        frame_ = b_.CreateAlloca(frame_ty_, nullptr, "frame");
         init_frame();
+        build_str_temps();
 
         lower_region(ir_->root());
         // The frontend appends a trailing Ret, so the entry path always terminates;
         // guard defensively in case a body lowered to nothing.
         if (b_.GetInsertBlock()->getTerminator() == nullptr) {
+            deinit_body_strings();
             if (is_void(f.return_type)) {
                 b_.CreateRetVoid();
             } else {
@@ -913,6 +1183,7 @@ private:
         ir_               = &f.ir;
         cur_fn_           = &f;
         cur_is_task_      = true;
+        param_llvm_index_ = param_indices(f);
         build_frame_layout(f);
 
         fn_            = fn_decls_[static_cast<uint32_t>(id)];
@@ -920,6 +1191,7 @@ private:
         values_.assign(n, Plane{});
         lvals_.assign(n, std::optional<LValue>{});
         types_.assign(n, std::optional<ValType>{});
+        str_vals_.assign(n, nullptr);
 
         auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
         state_       = fn_->getArg(0);
@@ -956,9 +1228,7 @@ private:
         // coro.begin so CoroSplit spills them into the coroutine frame (both live
         // across suspends; the frame's address escapes to callees). The flag backs
         // intra-body @event waits, exactly like a process's proc_sched slot.
-        auto* fbuf_ty = llvm::ArrayType::get(b_.getInt8Ty(), frame_bytes_);
-        frame_        = b_.CreateAlloca(fbuf_ty, nullptr, "frame");
-        llvm::cast<llvm::AllocaInst>(frame_)->setAlignment(llvm::Align(8));
+        frame_     = b_.CreateAlloca(frame_ty_, nullptr, "frame");
         sched_ptr_ = b_.CreateAlloca(b_.getInt32Ty(), nullptr, "task_sched");
 
         auto* trap_bb    = llvm::BasicBlock::Create(ctx_, "coro.trap", fn_);
@@ -996,6 +1266,7 @@ private:
         // Body: initialize the frame, copy parameters in (per direction), then run.
         b_.SetInsertPoint(start_bb);
         init_frame();
+        build_str_temps();
         emit_task_copyin(f);
         lower_region(ir_->root());
         branch_to(epilogue_bb);
@@ -1008,6 +1279,7 @@ private:
         // suspending, so we push it onto the active queue here.
         b_.SetInsertPoint(epilogue_bb);
         emit_task_copyout(f);
+        deinit_body_strings(); // string locals + temps die with the call
         llvm::Value* parent = b_.CreateLoad(ptr_ty, fn_->getArg(task_record_param(f)));
         auto*        has_bb = llvm::BasicBlock::Create(ctx_, "task.wake", fn_);
         b_.CreateCondBr(b_.CreateICmpNE(parent, null), has_bb, final_bb);
@@ -1036,15 +1308,20 @@ private:
     void emit_task_copyin(const Function& f) {
         for (uint32_t k = 0; k < f.param_types.size(); ++k) {
             const uint32_t w    = width_of(f.param_types[k]);
-            const uint32_t base = task_param_base(k);
+            const uint32_t base = param_llvm_index_[k];
             if (f.arg_dirs[k] == ArgDir::In) {
-                lower_store(local_lvalue(k), Plane{ fn_->getArg(base), fn_->getArg(base + 1) }, from_ref(f.param_types[k]));
+                if (is_string_type(f.param_types[k])) {
+                    // Deep copy the caller's handle into the frame local (value
+                    // semantics; the frame slot was init'd by init_frame).
+                    b_.CreateCall(str_assign_fn(),
+                                  { b_.CreateStructGEP(frame_ty_, frame_, k), fn_->getArg(base) });
+                    continue;
+                }
+                lower_store(local_lvalue(k), Plane{ fn_->getArg(base), fn_->getArg(base + 1) });
             } else if (f.arg_dirs[k] == ArgDir::Inout) {
-                llvm::Value* mm =
-                  b_.CreateAlignedLoad(int_ty(2 * w), fn_->getArg(base), llvm::Align(field_align(2 * w)));
-                llvm::Value* z =
-                  b_.CreateAlignedLoad(int_ty(w), fn_->getArg(base + 1), llvm::Align(field_align(w)));
-                lower_store(local_lvalue(k), Plane{ mm, z }, from_ref(f.param_types[k]));
+                llvm::Value* mm = b_.CreateLoad(int_ty(2 * w), fn_->getArg(base));
+                llvm::Value* z  = b_.CreateLoad(int_ty(w), fn_->getArg(base + 1));
+                lower_store(local_lvalue(k), Plane{ mm, z });
             }
         }
     }
@@ -1056,11 +1333,10 @@ private:
             if (f.arg_dirs[k] == ArgDir::In) {
                 continue;
             }
-            const uint32_t w    = width_of(f.param_types[k]);
-            const uint32_t base = task_param_base(k);
+            const uint32_t base = param_llvm_index_[k];
             const Plane    v    = lower_load(local_lvalue(k));
-            b_.CreateAlignedStore(v.mm, fn_->getArg(base), llvm::Align(field_align(2 * w)));
-            b_.CreateAlignedStore(v.z, fn_->getArg(base + 1), llvm::Align(field_align(w)));
+            b_.CreateStore(v.mm, fn_->getArg(base));
+            b_.CreateStore(v.z, fn_->getArg(base + 1));
         }
     }
 
@@ -1265,9 +1541,7 @@ private:
         auto* entry = llvm::BasicBlock::Create(ctx_, "entry", main);
         b_.SetInsertPoint(entry);
 
-        auto*           buf_ty = llvm::ArrayType::get(b_.getInt8Ty(), state_bytes_);
-        llvm::AllocaInst* state  = b_.CreateAlloca(buf_ty, nullptr, "state");
-        state->setAlignment(llvm::Align(8));
+        llvm::AllocaInst* state = b_.CreateAlloca(state_ty_, nullptr, "state");
         init_state(state);
 
         // Timing wheel: the event scheduler. Processes schedule timers on it at
@@ -1283,6 +1557,15 @@ private:
                       { b_.getInt64(mod_.tick_fs), b_.getInt32(static_cast<uint32_t>(mod_.timeformat_units)) });
 
         emit_active_run(state, wheel, procs);
+
+        // Release heap owned by string signals. A $finish longjmps out of the
+        // design before reaching this, so it covers designs that drain
+        // naturally; a $finish run's string heap is reclaimed at process exit.
+        for (const SignalSlot& s : slots_) {
+            if (s.is_string) {
+                emit_string_slot_op(state, s, str_deinit_fn());
+            }
+        }
 
         b_.CreateCall(wheel_deinit_fn(), { wheel });
         b_.CreateRet(llvm::ConstantInt::get(i32, 0));
@@ -1319,15 +1602,10 @@ private:
                     continue;
                 }
                 for (const WaitEdge& we : p.ir.wait_edges(p.ir.payload(idx).wait)) {
-                    const Signal   s   = we.signal;
-                    const uint32_t e   = we.edge;
-                    bool           dup = false;
-                    for (const auto& pr : seen) {
-                        dup = dup || (pr.first == s && pr.second == e);
-                    }
-                    if (!dup) {
-                        seen.emplace_back(s, e);
-                        c.dyn[static_cast<uint32_t>(s)][e]++;
+                    const std::pair<Signal, uint32_t> key{ we.signal, we.edge };
+                    if (!std::ranges::contains(seen, key)) {
+                        seen.push_back(key);
+                        c.dyn[static_cast<uint32_t>(we.signal)][we.edge]++;
                     }
                 }
             }
@@ -1469,12 +1747,13 @@ private:
             }
             uint32_t bi = 0;
             for (; bi < nba_buckets_.size(); ++bi) {
-                if (nba_buckets_[bi].width == s.width && nba_buckets_[bi].partial == s.nba_partial) {
+                if (nba_buckets_[bi].width == s.width && nba_buckets_[bi].partial == s.nba_partial &&
+                    nba_buckets_[bi].has_z == s.has_z) {
                     break;
                 }
             }
             if (bi == nba_buckets_.size()) {
-                nba_buckets_.push_back(NbaBucket{ s.width, s.nba_partial, nullptr, nullptr, nullptr });
+                nba_buckets_.push_back(NbaBucket{ s.width, s.nba_partial, s.has_z, nullptr, nullptr, nullptr });
             }
             s.nba_bucket = bi;
         }
@@ -1486,7 +1765,8 @@ private:
         }
         for (uint32_t bi = 0; bi < nba_buckets_.size(); ++bi) {
             NbaBucket&        b    = nba_buckets_[bi];
-            const std::string name = "clotho.nba.w" + std::to_string(b.width) + (b.partial ? ".part" : ".full");
+            const std::string name = "clotho.nba.w" + std::to_string(b.width) + (b.partial ? ".part" : ".full") +
+                                     (b.has_z ? "" : ".noz");
             b.ty  = llvm::ArrayType::get(i32, std::max<uint32_t>(caps[bi], 1));
             b.gv  = new llvm::GlobalVariable(llmod_, b.ty, false, llvm::GlobalValue::InternalLinkage,
                                              llvm::ConstantAggregateZero::get(b.ty), name);
@@ -1500,7 +1780,11 @@ private:
                                                    llvm::ConstantAggregateZero::get(nba_pending_ty_),
                                                    "clotho.nba_pending");
 
-        // Constant metadata, one record per nba-id (signal order, matching nba_id).
+        // Constant metadata, one record per nba-id (signal order, matching
+        // nba_id). The commit loop walks state with runtime byte offsets read
+        // from here, so the DataLayout offsets of the typed fields are baked in
+        // as i32 constants.
+        const llvm::DataLayout&      dlay = llmod_.getDataLayout();
         auto*                        nullp = llvm::ConstantPointerNull::get(ptr);
         std::vector<llvm::Constant*> metas;
         for (uint32_t i = 0; i < sigs.size(); ++i) {
@@ -1508,6 +1792,19 @@ private:
             if (!s.nba) {
                 continue;
             }
+            const uint32_t live_off = path_offset(s.path);
+            const std::array<uint32_t, 2> sh_mm_path{ shadow_field_, s.sh_mm_field };
+            const std::array<uint32_t, 2> sh_z_path{ shadow_field_, s.sh_z_field };
+            const std::array<uint32_t, 2> sh_mask_path{ shadow_field_, s.sh_mask_field };
+            const uint32_t off_mm = live_off;
+            // A never-z slot has no z field (nor a z shadow); its commit bucket
+            // never reads these, so bake benign zeros.
+            const uint32_t off_z =
+              s.has_z ? live_off + static_cast<uint32_t>(dlay.getStructLayout(s.slot_ty)->getElementOffset(1)) : 0;
+            const uint32_t off_nmm  = path_offset(sh_mm_path);
+            const uint32_t off_nz   = s.has_z ? path_offset(sh_z_path) : 0;
+            const uint32_t off_mask = s.nba_partial ? path_offset(sh_mask_path) : 0;
+
             std::array<llvm::Constant*, 3> sb{}, sc{}, db{}, dl{};
             for (uint32_t e = 0; e < 3; ++e) {
                 sb[e] = wait_sta_gv_[i][e] ? llvm::cast<llvm::Constant>(wait_sta_gv_[i][e]) : nullp;
@@ -1516,9 +1813,9 @@ private:
                 dl[e] = wait_dyn_len_gv_[i][e] ? llvm::cast<llvm::Constant>(wait_dyn_len_gv_[i][e]) : nullp;
             }
             metas.push_back(llvm::ConstantStruct::get(
-              nba_meta_ty_, { llvm::ConstantInt::get(i32, s.off_mm), llvm::ConstantInt::get(i32, s.off_z),
-                              llvm::ConstantInt::get(i32, s.off_nmm), llvm::ConstantInt::get(i32, s.off_nz),
-                              llvm::ConstantInt::get(i32, s.off_mask), llvm::ConstantArray::get(arr3p, sb),
+              nba_meta_ty_, { llvm::ConstantInt::get(i32, off_mm), llvm::ConstantInt::get(i32, off_z),
+                              llvm::ConstantInt::get(i32, off_nmm), llvm::ConstantInt::get(i32, off_nz),
+                              llvm::ConstantInt::get(i32, off_mask), llvm::ConstantArray::get(arr3p, sb),
                               llvm::ConstantArray::get(arr3i, sc), llvm::ConstantArray::get(arr3p, db),
                               llvm::ConstantArray::get(arr3p, dl) }));
         }
@@ -1540,21 +1837,12 @@ private:
         return false;
     }
 
-    // Load a signal's packed must|may state word (the i(2W) at off_mm).
-    llvm::Value* load_mm(Signal sig) {
-        const SignalSlot& s = slot_of(sig);
-        return b_.CreateAlignedLoad(
-          int_ty(2 * s.width), field_ptr(state_, s.off_mm), llvm::Align(field_align(2 * s.width)));
-    }
-
     // Load the packed must|may word of an lvalue's selected storage: the whole
-    // signal for a plain target, or one element for an unpacked-array element
-    // (dyn_off-aware). Used to snapshot old / new state around a blocking store so
-    // wait-queue servicing detects an element-level change, not just element 0.
+    // signal for a plain target, or one element for an unpacked-array element.
+    // Used to snapshot old / new state around a blocking store so wait-queue
+    // servicing detects an element-level change, not just element 0.
     llvm::Value* load_lv_mm(const LValue& lv) {
-        const uint32_t w = lv.store_width;
-        return b_.CreateAlignedLoad(int_ty(2 * w), elem_ptr(lv.base, lv.off_mm, lv.dyn_off),
-                                    llvm::Align(field_align(2 * w)));
+        return b_.CreateLoad(int_ty(2 * lv.store_width), lv_mm_ptr(lv));
     }
 
     // Service a signal's wait queues after a blocking assignment to it. Computes
@@ -1608,107 +1896,23 @@ private:
     // Static sub-queue scan (one edge bucket): a fixed-trip loop over the
     // persistent subscriptions for this (signal, edge). The bucket's edge already
     // matched the transition (the caller guarded the whole scan), so there is no
-    // per-entry edge check. The capacity is a compile-time constant, so the
-    // optimizer may unroll. Membership never changes — no compaction, no length.
-    // Each entry wakes its process, but only if it is not already scheduled this
-    // instant (its flag is 0), then sets the flag; that flag collapses a
-    // multi-signal sensitivity (the same process subscribed under several signals)
-    // into a single wake.
+    // per-entry edge check. Emitted via the generic runtime scan with a constant
+    // non-null base and constant cap: simplifycfg (lower_coroutines) folds the
+    // dead null guard and the constant trip count still lets the optimizer
+    // unroll. Membership never changes — no compaction, no length.
     void service_static_queue(Signal sig, uint32_t edge) {
-        const auto        i      = static_cast<uint32_t>(sig);
-        auto*             q      = wait_sta_gv_[i][edge];
-        auto*             arr_ty = wait_sta_ty_[i][edge];
-        const uint32_t    cap    = wait_sta_cap_[i][edge];
-        llvm::StructType* elem   = wait_elem_ty();
-        auto*             ptr_ty = llvm::PointerType::getUnqual(ctx_);
-        auto*             i32    = b_.getInt32Ty();
-
-        auto* fn    = b_.GetInsertBlock()->getParent();
-        auto* head  = llvm::BasicBlock::Create(ctx_, "sta.head", fn);
-        auto* body  = llvm::BasicBlock::Create(ctx_, "sta.body", fn);
-        auto* wake  = llvm::BasicBlock::Create(ctx_, "sta.wake", fn);
-        auto* cont  = llvm::BasicBlock::Create(ctx_, "sta.cont", fn);
-        auto* done  = llvm::BasicBlock::Create(ctx_, "sta.done", fn);
-        auto* entry = b_.GetInsertBlock();
-        b_.CreateBr(head);
-
-        b_.SetInsertPoint(head);
-        auto* idx = b_.CreatePHI(i32, 2);
-        idx->addIncoming(b_.getInt32(0), entry);
-        b_.CreateCondBr(b_.CreateICmpULT(idx, b_.getInt32(cap)), body, done);
-
-        b_.SetInsertPoint(body);
-        llvm::Value* src     = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), idx });
-        llvm::Value* h       = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 0));
-        llvm::Value* fptr    = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 1));
-        llvm::Value* already = b_.CreateICmpNE(b_.CreateLoad(i32, fptr), b_.getInt32(0));
-        b_.CreateCondBr(already, cont, wake);
-
-        b_.SetInsertPoint(wake);
-        emit_active_push(b_, h);
-        b_.CreateStore(b_.getInt32(1), fptr); // mark scheduled
-        b_.CreateBr(cont);
-
-        b_.SetInsertPoint(cont);
-        llvm::Value* next = b_.CreateAdd(idx, b_.getInt32(1));
-        b_.CreateBr(head);
-        idx->addIncoming(next, cont);
-
-        b_.SetInsertPoint(done);
+        const auto i = static_cast<uint32_t>(sig);
+        emit_static_scan_rt(wait_sta_gv_[i][edge], b_.getInt32(wait_sta_cap_[i][edge]));
     }
 
     // Dynamic sub-queue scan (one edge bucket): a straight loop over the live
-    // one-shot waiters for this (signal, edge). The bucket's edge already matched
-    // the transition (the caller guarded the whole scan), so every entry fires.
-    // Each entry wakes its process, but only if it is not already scheduled this
-    // instant (its flag is 0), then sets the flag — collapsing a multi-signal
-    // intra-body wait (the same process registered under several signals firing
-    // together) into a single wake. The whole bucket is consumed, so the length
-    // resets to 0; the firing process deregisters its stale entries from any OTHER
-    // buckets itself on resume (eager removal in lower_wait).
+    // one-shot waiters for this (signal, edge), via the generic runtime scan
+    // with a constant non-null base. The whole bucket is consumed (length
+    // resets to 0); the firing process deregisters its stale entries from any
+    // OTHER buckets itself on resume (eager removal in lower_wait).
     void service_dynamic_queue(Signal sig, uint32_t edge) {
-        const auto        i      = static_cast<uint32_t>(sig);
-        auto*             q      = wait_dyn_gv_[i][edge];
-        auto*             arr_ty = wait_dyn_ty_[i][edge];
-        auto*             len_gv = wait_dyn_len_gv_[i][edge];
-        llvm::StructType* elem   = wait_elem_ty();
-        auto*             ptr_ty = llvm::PointerType::getUnqual(ctx_);
-        auto*             i32    = b_.getInt32Ty();
-
-        llvm::Value* n     = b_.CreateLoad(i32, len_gv);
-        auto*        fn    = b_.GetInsertBlock()->getParent();
-        auto*        head  = llvm::BasicBlock::Create(ctx_, "dyn.head", fn);
-        auto*        body  = llvm::BasicBlock::Create(ctx_, "dyn.body", fn);
-        auto*        wake  = llvm::BasicBlock::Create(ctx_, "dyn.wake", fn);
-        auto*        cont  = llvm::BasicBlock::Create(ctx_, "dyn.cont", fn);
-        auto*        done  = llvm::BasicBlock::Create(ctx_, "dyn.done", fn);
-        auto*        entry = b_.GetInsertBlock();
-        b_.CreateBr(head);
-
-        b_.SetInsertPoint(head);
-        auto* i_phi = b_.CreatePHI(i32, 2);
-        i_phi->addIncoming(b_.getInt32(0), entry);
-        b_.CreateCondBr(b_.CreateICmpULT(i_phi, n), body, done);
-
-        b_.SetInsertPoint(body);
-        llvm::Value* src     = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), i_phi });
-        llvm::Value* h       = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 0));
-        llvm::Value* fptr    = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 1));
-        llvm::Value* already = b_.CreateICmpNE(b_.CreateLoad(i32, fptr), b_.getInt32(0));
-        b_.CreateCondBr(already, cont, wake);
-
-        b_.SetInsertPoint(wake);
-        emit_active_push(b_, h);
-        b_.CreateStore(b_.getInt32(1), fptr); // mark scheduled
-        b_.CreateBr(cont);
-
-        b_.SetInsertPoint(cont);
-        llvm::Value* i_next = b_.CreateAdd(i_phi, b_.getInt32(1));
-        b_.CreateBr(head);
-        i_phi->addIncoming(i_next, cont);
-
-        b_.SetInsertPoint(done);
-        b_.CreateStore(b_.getInt32(0), len_gv);
+        const auto i = static_cast<uint32_t>(sig);
+        emit_dynamic_scan_rt(wait_dyn_gv_[i][edge], wait_dyn_len_gv_[i][edge]);
     }
 
     // Compacting removal of this coroutine's entries from one (signal, edge)
@@ -1844,19 +2048,17 @@ private:
         return b_.CreateLoad(b_.getInt32Ty(),
                              b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(field) }));
     }
-    llvm::Value* meta_ptr_at(llvm::Value* meta, unsigned field, uint32_t e) {
+    llvm::Value* meta_at(llvm::Value* meta, unsigned field, uint32_t e, llvm::Type* ty) {
         return b_.CreateLoad(
-          llvm::PointerType::getUnqual(ctx_),
-          b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(field), b_.getInt32(e) }));
-    }
-    llvm::Value* meta_i32_at(llvm::Value* meta, unsigned field, uint32_t e) {
-        return b_.CreateLoad(
-          b_.getInt32Ty(),
-          b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(field), b_.getInt32(e) }));
+          ty, b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(field), b_.getInt32(e) }));
     }
 
-    // Generic static-queue scan (runtime base + capacity), null base => no waiters.
-    // Mirrors service_static_queue but reads its trip count at runtime from meta.
+    // Generic static-queue scan (base + capacity values), null base => no
+    // waiters. Serves both callers: service_static_queue passes a constant
+    // global and cap; the NBA commit loop passes values read from meta. Each
+    // entry wakes its process only if its scheduled flag is 0, then sets the
+    // flag — collapsing a multi-signal sensitivity (the same process
+    // subscribed under several signals) into a single wake.
     void emit_static_scan_rt(llvm::Value* base, llvm::Value* cap) {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
@@ -1893,8 +2095,9 @@ private:
         b_.SetInsertPoint(done);
     }
 
-    // Generic dynamic-queue scan (runtime base + length pointer), null base => skip.
-    // Wakes every live entry (flag-deduped) and resets the length to 0.
+    // Generic dynamic-queue scan (base + length pointer values), null base =>
+    // skip. Serves both callers, like emit_static_scan_rt. Wakes every live
+    // entry (flag-deduped) and resets the length to 0.
     void emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr) {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
@@ -1961,8 +2164,10 @@ private:
             auto* cont = llvm::BasicBlock::Create(ctx_, "nsvc.cont", fn);
             b_.CreateCondBr(fact, body, cont);
             b_.SetInsertPoint(body);
-            emit_static_scan_rt(meta_ptr_at(meta, 5, e), meta_i32_at(meta, 6, e));
-            emit_dynamic_scan_rt(meta_ptr_at(meta, 7, e), meta_ptr_at(meta, 8, e));
+            auto* ptr = raw_ptr_ty();
+            auto* i32 = b_.getInt32Ty();
+            emit_static_scan_rt(meta_at(meta, 5, e, ptr), meta_at(meta, 6, e, i32));
+            emit_dynamic_scan_rt(meta_at(meta, 7, e, ptr), meta_at(meta, 8, e, ptr));
             b_.CreateBr(cont);
             b_.SetInsertPoint(cont);
         }
@@ -1977,8 +2182,10 @@ private:
         auto*             i32   = b_.getInt32Ty();
         auto*             mmty  = int_ty(2 * W);
         auto*             zty   = int_ty(W);
-        const llvm::Align mm_al = llvm::Align(field_align(2 * W));
-        const llvm::Align z_al  = llvm::Align(field_align(W));
+        // The runtime-offset i8 GEPs below erase the field types, so the loads/
+        // stores carry the fields' ABI alignment explicitly.
+        const llvm::Align mm_al = llmod_.getDataLayout().getABITypeAlign(mmty);
+        const llvm::Align z_al  = llmod_.getDataLayout().getABITypeAlign(zty);
 
         auto*        fn    = b_.GetInsertBlock()->getParent();
         auto*        head  = llvm::BasicBlock::Create(ctx_, "ncommit.head", fn);
@@ -1998,29 +2205,34 @@ private:
         llvm::Value* id        = b_.CreateLoad(i32, b_.CreateInBoundsGEP(bk.ty, bk.gv, { b_.getInt32(0), idx }));
         llvm::Value* meta      = b_.CreateInBoundsGEP(nba_meta_arr_ty_, nba_meta_gv_, { b_.getInt32(0), id });
         llvm::Value* live_mm_p = field_ptr_var(state, meta_i32(meta, 0));
-        llvm::Value* live_z_p  = field_ptr_var(state, meta_i32(meta, 1));
-        llvm::Value* sh_mm_p   = field_ptr_var(state, meta_i32(meta, 2));
-        llvm::Value* sh_z_p    = field_ptr_var(state, meta_i32(meta, 3));
-        llvm::Value* old_mm    = b_.CreateAlignedLoad(mmty, live_mm_p, mm_al);
-        llvm::Value* new_mm    = nullptr;
+        // A never-z bucket's targets store no z word / z shadow; skip z entirely.
+        llvm::Value* live_z_p = bk.has_z ? field_ptr_var(state, meta_i32(meta, 1)) : nullptr;
+        llvm::Value* sh_mm_p  = field_ptr_var(state, meta_i32(meta, 2));
+        llvm::Value* sh_z_p   = bk.has_z ? field_ptr_var(state, meta_i32(meta, 3)) : nullptr;
+        llvm::Value* old_mm   = b_.CreateAlignedLoad(mmty, live_mm_p, mm_al);
+        llvm::Value* new_mm   = nullptr;
         if (!bk.partial) {
-            new_mm             = b_.CreateAlignedLoad(mmty, sh_mm_p, mm_al);
-            llvm::Value* new_z = b_.CreateAlignedLoad(zty, sh_z_p, z_al);
+            new_mm = b_.CreateAlignedLoad(mmty, sh_mm_p, mm_al);
             b_.CreateAlignedStore(new_mm, live_mm_p, mm_al);
-            b_.CreateAlignedStore(new_z, live_z_p, z_al);
+            if (bk.has_z) {
+                llvm::Value* new_z = b_.CreateAlignedLoad(zty, sh_z_p, z_al);
+                b_.CreateAlignedStore(new_z, live_z_p, z_al);
+            }
         } else {
             llvm::Value* mask_p = field_ptr_var(state, meta_i32(meta, 4));
             llvm::Value* mask   = b_.CreateAlignedLoad(zty, mask_p, z_al);
-            llvm::Value* old_z  = b_.CreateAlignedLoad(zty, live_z_p, z_al);
             llvm::Value* sh_mm  = b_.CreateAlignedLoad(mmty, sh_mm_p, mm_al);
-            llvm::Value* sh_z   = b_.CreateAlignedLoad(zty, sh_z_p, z_al);
             // Replicate the W-bit mask into both halves of the packed must|may word.
-            llvm::Value* maskw  = b_.CreateZExt(mask, mmty);
-            llvm::Value* mask2  = b_.CreateOr(maskw, b_.CreateShl(maskw, llvm::ConstantInt::get(mmty, W)));
-            new_mm              = b_.CreateOr(b_.CreateAnd(old_mm, b_.CreateNot(mask2)), b_.CreateAnd(sh_mm, mask2));
-            llvm::Value* new_z  = b_.CreateOr(b_.CreateAnd(old_z, b_.CreateNot(mask)), b_.CreateAnd(sh_z, mask));
+            llvm::Value* maskw = b_.CreateZExt(mask, mmty);
+            llvm::Value* mask2 = b_.CreateOr(maskw, b_.CreateShl(maskw, llvm::ConstantInt::get(mmty, W)));
+            new_mm             = b_.CreateOr(b_.CreateAnd(old_mm, b_.CreateNot(mask2)), b_.CreateAnd(sh_mm, mask2));
             b_.CreateAlignedStore(new_mm, live_mm_p, mm_al);
-            b_.CreateAlignedStore(new_z, live_z_p, z_al);
+            if (bk.has_z) {
+                llvm::Value* old_z = b_.CreateAlignedLoad(zty, live_z_p, z_al);
+                llvm::Value* sh_z  = b_.CreateAlignedLoad(zty, sh_z_p, z_al);
+                llvm::Value* new_z = b_.CreateOr(b_.CreateAnd(old_z, b_.CreateNot(mask)), b_.CreateAnd(sh_z, mask));
+                b_.CreateAlignedStore(new_z, live_z_p, z_al);
+            }
             b_.CreateAlignedStore(zero(W), mask_p, z_al); // clear dirty mask for next slot
         }
         emit_nba_service(meta, old_mm, new_mm);
@@ -2256,96 +2468,192 @@ private:
     llvm::Function* coro_intr(llvm::Intrinsic::ID id, llvm::ArrayRef<llvm::Type*> tys = {}) {
         return llvm::Intrinsic::getOrInsertDeclaration(&llmod_, id, tys);
     }
-    // ptr rt_alloc(i64) — coroutine frame allocation, sim-owned.
+
+    // -- Runtime ABI (runtime/Runtime.h C ABI) --
+    //
+    // rt_fn declares (or fetches) one runtime entry point; each *_fn helper
+    // below pins one C signature. Every pointer parameter is an opaque ptr, so
+    // the LLVM-side signature is the C one with pointers erased; a helper
+    // carries a comment only where the C signature is not obvious from it.
+
+    llvm::FunctionCallee rt_fn(const char* name, llvm::Type* ret, llvm::ArrayRef<llvm::Type*> params) {
+        return llmod_.getOrInsertFunction(name, llvm::FunctionType::get(ret, params, false));
+    }
+    llvm::Type* raw_ptr_ty() {
+        return llvm::PointerType::getUnqual(ctx_);
+    }
+
+    // Coroutine frame allocation, sim-owned: ptr rt_alloc(i64) / void rt_free(ptr).
     llvm::FunctionCallee alloc_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_alloc", llvm::FunctionType::get(ptr, { b_.getInt64Ty() }, false));
+        return rt_fn("rt_alloc", raw_ptr_ty(), { b_.getInt64Ty() });
     }
-    // void rt_free(ptr) — coroutine frame deallocation.
     llvm::FunctionCallee free_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_free", llvm::FunctionType::get(b_.getVoidTy(), { ptr }, false));
+        return rt_fn("rt_free", b_.getVoidTy(), { raw_ptr_ty() });
     }
 
-    // -- Timing wheel runtime (runtime/Runtime.h C ABI) --
-
-    // void rt_wheel_init(rt_wheel*) / void rt_wheel_deinit(rt_wheel*)
-    // -- Deferred array-NBA queue (rt_nba_arr_*) --
+    // Deferred array-NBA queue (rt_nba_arr_*).
+    // void rt_nba_arr_push(i32 sig, ptr mm_dst, ptr mm_val, ptr mm_mask,
+    //                      i32 mm_bytes, ptr z_dst, ptr z_val, ptr z_mask, i32 z_bytes)
     llvm::FunctionCallee nba_arr_push_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
+        auto* ptr = raw_ptr_ty();
         auto* i32 = b_.getInt32Ty();
-        auto* fnty =
-          llvm::FunctionType::get(b_.getVoidTy(), { i32, ptr, ptr, ptr, i32, ptr, ptr, ptr, i32 }, false);
-        return llmod_.getOrInsertFunction("rt_nba_arr_push", fnty);
+        return rt_fn("rt_nba_arr_push", b_.getVoidTy(), { i32, ptr, ptr, ptr, i32, ptr, ptr, ptr, i32 });
     }
     llvm::FunctionCallee nba_arr_pending_fn() {
-        return llmod_.getOrInsertFunction("rt_nba_arr_pending", llvm::FunctionType::get(b_.getInt32Ty(), {}, false));
+        return rt_fn("rt_nba_arr_pending", b_.getInt32Ty(), {});
     }
     llvm::FunctionCallee nba_arr_commit_fn() {
-        return llmod_.getOrInsertFunction("rt_nba_arr_commit", llvm::FunctionType::get(b_.getVoidTy(), {}, false));
+        return rt_fn("rt_nba_arr_commit", b_.getVoidTy(), {});
     }
     llvm::FunctionCallee nba_arr_dirty_fn() {
-        return llmod_.getOrInsertFunction("rt_nba_arr_dirty",
-                                          llvm::FunctionType::get(b_.getInt32Ty(), { b_.getInt32Ty() }, false));
+        return rt_fn("rt_nba_arr_dirty", b_.getInt32Ty(), { b_.getInt32Ty() });
     }
     llvm::FunctionCallee nba_arr_reset_fn() {
-        return llmod_.getOrInsertFunction("rt_nba_arr_reset", llvm::FunctionType::get(b_.getVoidTy(), {}, false));
+        return rt_fn("rt_nba_arr_reset", b_.getVoidTy(), {});
     }
 
+    // String runtime (rt_string_*); every ptr is an rt_string handle except
+    // where noted.
+    llvm::FunctionCallee str_init_fn() {
+        return rt_fn("rt_string_init", b_.getVoidTy(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_deinit_fn() {
+        return rt_fn("rt_string_deinit", b_.getVoidTy(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_assign_fn() {
+        return rt_fn("rt_string_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    // void rt_string_assign_bytes(rt_string*, const char* bytes, i64 len)
+    llvm::FunctionCallee str_assign_bytes_fn() {
+        return rt_fn("rt_string_assign_bytes", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+    }
+    llvm::FunctionCallee str_len_fn() {
+        return rt_fn("rt_string_len", b_.getInt64Ty(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_data_fn() {
+        return rt_fn("rt_string_data", raw_ptr_ty(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_concat_fn() {
+        return rt_fn("rt_string_concat", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_repl_fn() {
+        return rt_fn("rt_string_repl", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+    }
+    llvm::FunctionCallee str_cmp_fn() {
+        return rt_fn("rt_string_cmp", b_.getInt32Ty(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_icmp_fn() {
+        return rt_fn("rt_string_icmp", b_.getInt32Ty(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_substr_fn() {
+        return rt_fn("rt_string_substr", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_upper_fn() {
+        return rt_fn("rt_string_toupper", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_lower_fn() {
+        return rt_fn("rt_string_tolower", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_putc_fn() {
+        return rt_fn("rt_string_putc", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_getc_fn() {
+        return rt_fn("rt_string_getc", b_.getInt32Ty(), { raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_from_packed_fn() {
+        return rt_fn("rt_string_from_packed", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_to_packed_fn() {
+        return rt_fn("rt_string_to_packed", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+    }
+
+    // Timing wheel (rt_wheel_*); the ptr parameter is the rt_wheel.
     llvm::FunctionCallee wheel_init_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_wheel_init", llvm::FunctionType::get(b_.getVoidTy(), { ptr }, false));
+        return rt_fn("rt_wheel_init", b_.getVoidTy(), { raw_ptr_ty() });
     }
     llvm::FunctionCallee wheel_deinit_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_wheel_deinit", llvm::FunctionType::get(b_.getVoidTy(), { ptr }, false));
+        return rt_fn("rt_wheel_deinit", b_.getVoidTy(), { raw_ptr_ty() });
     }
-    // i64 rt_wheel_now(const rt_wheel*)
     llvm::FunctionCallee wheel_now_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_wheel_now", llvm::FunctionType::get(b_.getInt64Ty(), { ptr }, false));
+        return rt_fn("rt_wheel_now", b_.getInt64Ty(), { raw_ptr_ty() });
     }
-    // i32 rt_random(void)
     llvm::FunctionCallee random_fn() {
-        return llmod_.getOrInsertFunction("rt_random", llvm::FunctionType::get(b_.getInt32Ty(), {}, false));
+        return rt_fn("rt_random", b_.getInt32Ty(), {});
     }
-    // i32 rt_wheel_pending(const rt_wheel*)
     llvm::FunctionCallee wheel_pending_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_wheel_pending", llvm::FunctionType::get(b_.getInt32Ty(), { ptr }, false));
+        return rt_fn("rt_wheel_pending", b_.getInt32Ty(), { raw_ptr_ty() });
     }
     // void rt_wheel_schedule(rt_wheel*, rt_timer*, i64 deadline, rt_timer_fn)
     llvm::FunctionCallee wheel_schedule_fn() {
-        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, b_.getInt64Ty(), ptr }, false);
-        return llmod_.getOrInsertFunction("rt_wheel_schedule", fnty);
+        return rt_fn("rt_wheel_schedule", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
     }
     // void rt_wheel_tick(rt_wheel*, void* ctx)
     llvm::FunctionCallee wheel_tick_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_wheel_tick", llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false));
+        return rt_fn("rt_wheel_tick", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
 
-    // Power-up the state struct: 4-state signals come up X (must 0, may 1, z 0),
-    // 2-state signals come up 0.
+    // Power-up the state struct: undriven 4-state nets come up Z (LRM 6.6 —
+    // must 0, may 1, z all-ones), other 4-state signals X (z 0), 2-state 0.
     void init_state(llvm::Value* state) {
         for (const SignalSlot& s : slots_) {
+            if (s.is_string) {
+                emit_string_slot_op(state, s, str_init_fn());
+                continue;
+            }
             if (s.is_array) {
                 emit_array_init(state, s);
                 continue;
             }
-            // X packs as the high W bits of the i(2W) must|may word (may=1, must=0).
-            llvm::Value* mm = s.four_state
-                                ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * s.width, s.width))
-                                : zero(2 * s.width);
-            b_.CreateAlignedStore(mm, field_ptr(state, s.off_mm), llvm::Align(field_align(2 * s.width)));
-            b_.CreateAlignedStore(zero(s.width), field_ptr(state, s.off_z), llvm::Align(field_align(s.width)));
+            llvm::Value* mm   = s.four_state ? x_mm(s.width) : zero(2 * s.width);
+            llvm::Value* slot = storage_ptr(state, s);
+            b_.CreateStore(mm, b_.CreateStructGEP(s.slot_ty, slot, 0));
+            if (s.has_z) {
+                b_.CreateStore(s.init_z ? ones(s.width) : zero(s.width),
+                               b_.CreateStructGEP(s.slot_ty, slot, 1));
+            }
             // A partial target's dirty mask must start clear; the shadow itself is
             // written before it is read, so it needs no initialisation.
             if (s.nba_partial) {
-                b_.CreateAlignedStore(zero(s.width), field_ptr(state, s.off_mask), llvm::Align(field_align(s.width)));
+                b_.CreateStore(zero(s.width),
+                               b_.CreateInBoundsGEP(state_ty_, state,
+                                                    { b_.getInt32(0), b_.getInt32(shadow_field_),
+                                                      b_.getInt32(s.sh_mask_field) }));
             }
         }
+    }
+
+    // Apply `callee` (rt_string_init / rt_string_deinit) to a string signal's
+    // handle, or to every element handle of an array-of-string signal (a runtime
+    // loop, like emit_array_init).
+    void emit_string_slot_op(llvm::Value* state, const SignalSlot& s, llvm::FunctionCallee callee) {
+        llvm::Value* base = storage_ptr(state, s);
+        if (!s.is_array) {
+            b_.CreateCall(callee, { base });
+            return;
+        }
+        auto* arr_ty = llvm::cast<llvm::ArrayType>(s.storage_ty);
+        auto* i32    = b_.getInt32Ty();
+        auto* fn     = b_.GetInsertBlock()->getParent();
+        auto* head   = llvm::BasicBlock::Create(ctx_, "strop.head", fn);
+        auto* body   = llvm::BasicBlock::Create(ctx_, "strop.body", fn);
+        auto* done   = llvm::BasicBlock::Create(ctx_, "strop.done", fn);
+        auto* entry  = b_.GetInsertBlock();
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(head);
+        auto* idx = b_.CreatePHI(i32, 2);
+        idx->addIncoming(b_.getInt32(0), entry);
+        b_.CreateCondBr(b_.CreateICmpULT(idx, b_.getInt32(s.elem_count)), body, done);
+
+        b_.SetInsertPoint(body);
+        b_.CreateCall(callee, { b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), idx }) });
+        idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), body);
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(done);
     }
 
     // Initialise an unpacked-array signal: a runtime loop over its elements
@@ -2353,13 +2661,11 @@ private:
     // each leaf slot. A loop keeps init O(elem_count) emitted instructions, so a
     // large memory does not bloat the IR.
     void emit_array_init(llvm::Value* state, const SignalSlot& s) {
-        const uint32_t w  = s.width;
+        const uint32_t w   = s.width;
         auto*          i32 = b_.getInt32Ty();
-        llvm::Value*   mm = s.four_state
-                              ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w))
-                              : zero(2 * w);
-        const llvm::Align mm_al = llvm::Align(field_align(2 * w));
-        const llvm::Align z_al  = llvm::Align(field_align(w));
+        llvm::Value*   mm  = s.four_state ? x_mm(w) : zero(2 * w);
+        auto*        arr_ty = llvm::cast<llvm::ArrayType>(s.storage_ty);
+        llvm::Value* base   = storage_ptr(state, s);
 
         auto* fn    = b_.GetInsertBlock()->getParent();
         auto* head  = llvm::BasicBlock::Create(ctx_, "ainit.head", fn);
@@ -2374,33 +2680,24 @@ private:
         b_.CreateCondBr(b_.CreateICmpULT(idx, b_.getInt32(s.elem_count)), body, done);
 
         b_.SetInsertPoint(body);
-        llvm::Value* byte_off = b_.CreateMul(idx, b_.getInt32(s.elem_stride));
-        llvm::Value* mp       = field_ptr_var(field_ptr(state, s.off_mm), byte_off);
-        llvm::Value* zp       = field_ptr_var(field_ptr(state, s.off_z), byte_off);
-        b_.CreateAlignedStore(mm, mp, mm_al);
-        b_.CreateAlignedStore(zero(w), zp, z_al);
+        b_.CreateStore(mm, b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), idx, b_.getInt32(0) }));
+        if (s.has_z) {
+            // An undriven net array's elements default to z like any net.
+            b_.CreateStore(s.init_z ? ones(w) : zero(w),
+                           b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), idx, b_.getInt32(1) }));
+        }
         idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), body);
         b_.CreateBr(head);
 
         b_.SetInsertPoint(done);
     }
 
-    // Pointer to a state field at a constant byte offset (a folded i8 GEP).
-    llvm::Value* field_ptr(llvm::Value* base, uint32_t off) {
-        return b_.CreateConstInBoundsGEP1_32(b_.getInt8Ty(), base, off);
-    }
-    // Pointer to a state field at a runtime byte offset (NBA commit reads offsets
-    // from the meta table). The base is 8-aligned and offsets are field-aligned, so
-    // accesses stay naturally aligned even though the GEP is dynamic.
+    // Pointer to a state field at a runtime byte offset (the NBA commit loop
+    // reads its offsets from the meta table, erasing the field types). Offsets
+    // are DataLayout field offsets, so accesses stay naturally aligned even
+    // though the GEP is dynamic.
     llvm::Value* field_ptr_var(llvm::Value* base, llvm::Value* off) {
         return b_.CreateInBoundsGEP(b_.getInt8Ty(), base, off);
-    }
-    // Pointer to an lvalue field: the constant field offset, plus the runtime
-    // element byte offset for an unpacked-array element (null for a plain target).
-    // The element stride is field-aligned, so the access stays naturally aligned.
-    llvm::Value* elem_ptr(llvm::Value* base, uint32_t off, llvm::Value* dyn_off) {
-        llvm::Value* p = field_ptr(base, off);
-        return dyn_off != nullptr ? field_ptr_var(p, dyn_off) : p;
     }
 
     // Lower a region's instructions in order into the current insert block. A `ret`
@@ -2436,8 +2733,11 @@ private:
     }
 
     ValType from_ref(Ref type) const {
+        const Type& ty = std::get<Type>(mod_.pool.get(type));
+        if (ty.kind == Type::Kind::String) {
+            return { 0, false, false, true };
+        }
         const Layout lay = mod_.pool.layout(type);
-        const Type&  ty  = std::get<Type>(mod_.pool.get(type));
         return { lay.width == 0 ? 1 : lay.width, lay.domain == Domain::Four, ty.is_signed };
     }
 
@@ -2456,7 +2756,7 @@ private:
                 return from_ref(p.op_type.type);
             case Inst::Tag::Signal: {
                 const SignalSlot& s = slot_of(p.signal);
-                return { s.width, s.four_state, s.is_signed };
+                return { s.width, s.four_state, s.is_signed, s.is_string && !s.is_array };
             }
             case Inst::Tag::BitSelect: {
                 const ValType base = type_of(p.binary.l);
@@ -2539,6 +2839,9 @@ private:
                 bool                 four  = false;
                 for (Index part : ir_->operands(i, scratch)) {
                     const ValType t = type_of(part);
+                    if (t.is_string) { // string concat (all parts are strings)
+                        return { 0, false, false, true };
+                    }
                     width += t.width;
                     four = four || t.four_state;
                 }
@@ -2546,8 +2849,29 @@ private:
             }
             case Inst::Tag::Repl: {
                 const ValType v = type_of(p.repl.value);
+                if (v.is_string) {
+                    return { 0, false, false, true };
+                }
                 return { v.width * p.repl.count, v.four_state, false };
             }
+
+            case Inst::Tag::StrLen:
+            case Inst::Tag::StrCmp:
+            case Inst::Tag::StrICmp:
+                return { 32, false, true };
+            case Inst::Tag::StrGetc:
+                // getc / s[i] return `byte`, which is signed (LRM 6.16.3 and
+                // Table 6-8), so 0xff displays as -1 under %d.
+                return { 8, false, true };
+            case Inst::Tag::StrUpper:
+            case Inst::Tag::StrLower:
+            case Inst::Tag::StrSubstr:
+            case Inst::Tag::StrFromPacked:
+                return { 0, false, false, true };
+            case Inst::Tag::StrToPacked:
+                return from_ref(p.op_type.type);
+            case Inst::Tag::StrPutc:
+                return { 0, false, false };
 
             case Inst::Tag::Store:
             case Inst::Tag::StoreNb:
@@ -2585,6 +2909,64 @@ private:
         lvals_[static_cast<uint32_t>(i)] = lv;
     }
 
+    // rt_string handle pointer of a string-valued instruction (parallel to
+    // values_; null for non-string values).
+    llvm::Value* str_of(Index i) const {
+        return str_vals_[static_cast<uint32_t>(i)];
+    }
+    void set_str(Index i, llvm::Value* handle) {
+        str_vals_[static_cast<uint32_t>(i)] = handle;
+    }
+
+    // The rt_string handle pointer of a string lvalue (one array element when
+    // elem_idx selects it).
+    llvm::Value* lv_string_ptr(const LValue& lv) {
+        if (lv.array_ty != nullptr) {
+            llvm::Value* idx = lv.elem_idx != nullptr ? lv.elem_idx : b_.getInt32(0);
+            return b_.CreateInBoundsGEP(lv.array_ty, lv.base, { b_.getInt32(0), idx });
+        }
+        return lv.base;
+    }
+
+    // Whether an instruction produces a fresh string value that needs its own
+    // 32-byte handle (as opposed to yielding a pointer at existing storage).
+    bool produces_string_temp(Index i) {
+        switch (ir_->tag(i)) {
+            case Inst::Tag::StrUpper:
+            case Inst::Tag::StrLower:
+            case Inst::Tag::StrSubstr:
+            case Inst::Tag::StrFromPacked:
+                return true;
+            case Inst::Tag::Constant:
+            case Inst::Tag::Concat:
+            case Inst::Tag::Repl:
+            case Inst::Tag::Call:
+                return type_of(i).is_string;
+            default:
+                return false;
+        }
+    }
+
+    // Alloca + init one handle per string-producing instruction, in the body
+    // prologue (entry block of a function; right after coro.begin of a process /
+    // task). Producers overwrite their temp in place, so a loop reuses its
+    // capacity instead of allocating each iteration. Paired with
+    // deinit_body_strings at the body's exits.
+    void build_str_temps() {
+        str_temp_list_.clear();
+        for (size_t k = 0; k < ir_->inst_count(); ++k) {
+            const auto i = static_cast<Index>(k);
+            if (!produces_string_temp(i)) {
+                continue;
+            }
+            auto* temp = b_.CreateAlloca(str_slot_ty(), nullptr, "str.tmp");
+            temp->setAlignment(llvm::Align(alignof(rt_string)));
+            b_.CreateCall(str_init_fn(), { temp });
+            set_str(i, temp);
+            str_temp_list_.push_back(temp);
+        }
+    }
+
     // -- Instruction dispatch --
 
     void lower_inst(Index i) {
@@ -2599,6 +2981,10 @@ private:
                 return;
             case Inst::Tag::BitSelect: {
                 LValue lv = lvalue_of(p.binary.l);
+                if (lv.is_string) {
+                    // String indexing lowers to StrGetc / StrPutc in the frontend.
+                    throw BackendError{ "internal: string value in bit_select" };
+                }
                 // TODO: an X/Z or out-of-range index uses only its must bits,
                 // silently selecting the wrong bit. LRM: a read with an unknown /
                 // out-of-range index yields X; such a write is a no-op.
@@ -2631,15 +3017,17 @@ private:
                 return;
             }
             case Inst::Tag::ElemSelect: {
-                // Advance the lvalue's runtime byte offset to the selected element:
-                // dyn_off += normalized_index * element_stride. The base lvalue's
-                // off_mm/off_z and store_width already describe a leaf element (set
-                // by the array's signal slot), so this only shifts to the element
-                // and resets any inherited bit offset.
-                LValue      lv = lvalue_of(p.op_extra.op);
-                const auto  es = ir_->extra_data<ElemSelect>(p.op_extra.extra);
-                const Type& at = std::get<Type>(mod_.pool.get(es.array_type));
-                const uint32_t stride = array_storage_bytes(at.element);
+                // Advance the lvalue's flat leaf index to the selected element:
+                // elem_idx += normalized_index * leaf-elements-per-selected-element
+                // (1 for a leaf select; the inner dimensions' product for an outer
+                // dimension of a multidimensional memory). The base lvalue's
+                // slot_ty and store_width already describe a leaf element (set by
+                // the array's signal slot), so this only shifts to the element and
+                // resets any inherited bit offset.
+                LValue         lv     = lvalue_of(p.op_extra.op);
+                const auto     es     = ir_->extra_data<ElemSelect>(p.op_extra.extra);
+                const Type&    at     = std::get<Type>(mod_.pool.get(es.array_type));
+                const uint32_t stride = array_leaf_count(at.element);
                 // TODO: an X/Z or out-of-range index uses only its must bits, so it
                 // selects a wrong / out-of-bounds element. LRM: an out-of-range read
                 // yields X and such a write is a no-op.
@@ -2647,22 +3035,37 @@ private:
                 // Normalize the declared-range coordinate to a 0-based position.
                 llvm::Value* norm = at.left <= at.right ? b_.CreateSub(idx, b_.getInt32(at.left))
                                                         : b_.CreateSub(b_.getInt32(at.left), idx);
-                llvm::Value* byte_off = b_.CreateMul(norm, b_.getInt32(stride));
-                lv.dyn_off            = lv.dyn_off != nullptr ? b_.CreateAdd(lv.dyn_off, byte_off) : byte_off;
-                lv.bit_off            = b_.getInt32(0);
+                llvm::Value* off  = stride == 1 ? norm : b_.CreateMul(norm, b_.getInt32(stride));
+                lv.elem_idx       = lv.elem_idx != nullptr ? b_.CreateAdd(lv.elem_idx, off) : off;
+                lv.bit_off        = b_.getInt32(0);
                 set_lvalue(i, lv);
                 return;
             }
 
-            case Inst::Tag::Load:
-                set_value(i, lower_load(lvalue_of(p.unary)));
+            case Inst::Tag::Load: {
+                const LValue& lv = lvalue_of(p.unary);
+                if (lv.is_string) {
+                    // A string load is the storage handle pointer, not a copy:
+                    // every mutation point (Store, string ops) deep-copies, and
+                    // producers write into distinct temps.
+                    set_str(i, lv_string_ptr(lv));
+                    return;
+                }
+                set_value(i, lower_load(lv));
                 return;
+            }
             case Inst::Tag::Store: {
                 // A blocking assignment stores, then services the target signal's
                 // wait queue: any process waiting for an edge this store produced
                 // is woken. Snapshot the old value first so the transition can be
                 // detected from old -> new.
                 const LValue& lv      = lvalue_of(p.binary.l);
+                if (lv.is_string) {
+                    // Deep copy. Strings are guarded out of sensitivity lists in
+                    // the frontend, so there is no wait queue to service.
+                    b_.CreateCall(str_assign_fn(), { lv_string_ptr(lv), str_of(p.binary.r) });
+                    return;
+                }
                 // Frame locals have no waiters; only a module signal store services
                 // wait queues. A PreInit store (variable declaration initializer)
                 // generates no events, so it never services regardless of waiters.
@@ -2671,7 +3074,7 @@ private:
                 // so an element write wakes Any-edge waiters on a change to that
                 // element rather than always reading element 0.
                 llvm::Value*  old_mm  = service ? load_lv_mm(lv) : nullptr;
-                lower_store(lv, value_of(p.binary.r), type_of(p.binary.r));
+                lower_store(lv, value_of(p.binary.r));
                 if (service) {
                     service_wait_queue(lv.sig, old_mm, load_lv_mm(lv));
                 }
@@ -2693,9 +3096,15 @@ private:
                 return;
             }
 
-            case Inst::Tag::Constant:
+            case Inst::Tag::Constant: {
+                const Value& v = std::get<Value>(mod_.pool.get(p.ref));
+                if (std::get<Type>(mod_.pool.get(v.type)).kind == Type::Kind::String) {
+                    lower_string_constant(i, p.ref);
+                    return;
+                }
                 set_value(i, lower_constant(p.ref));
                 return;
+            }
 
             case Inst::Tag::Add:
             case Inst::Tag::Sub:
@@ -2754,6 +3163,10 @@ private:
             case Inst::Tag::Le:
             case Inst::Tag::Gt:
             case Inst::Tag::Ge:
+                if (type_of(p.binary.l).is_string) {
+                    set_value(i, lower_string_relation(ir_->tag(i), p.binary.l, p.binary.r));
+                    return;
+                }
                 set_value(i,
                           lower_compare(
                             ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r), type_of(p.binary.l).is_signed));
@@ -2779,18 +3192,100 @@ private:
 
             case Inst::Tag::Mux: {
                 const auto mux = ir_->extra_data<Mux>(p.op_extra.extra);
+                if (type_of(mux.a).is_string) {
+                    throw BackendError{ "internal: string value in mux" };
+                }
                 set_value(i, lower_mux(value_of(p.op_extra.op), value_of(mux.a), value_of(mux.b)));
                 return;
             }
             case Inst::Tag::Concat:
+                if (type_of(i).is_string) {
+                    lower_string_concat(i);
+                    return;
+                }
                 set_value(i, lower_concat(i));
                 return;
             case Inst::Tag::Repl:
+                if (type_of(i).is_string) {
+                    b_.CreateCall(str_repl_fn(),
+                                  { str_of(i), str_of(p.repl.value), b_.getInt64(p.repl.count) });
+                    return;
+                }
                 set_value(i, lower_repl(value_of(p.repl.value), type_of(p.repl.value).width, p.repl.count));
                 return;
-            case Inst::Tag::Resize:
-                set_value(i, lower_resize(value_of(p.op_type.op), type_of(p.op_type.op), from_ref(p.op_type.type)));
+            case Inst::Tag::Resize: {
+                // Truncate or extend all planes (sign per target type).
+                if (type_of(p.op_type.op).is_string) {
+                    throw BackendError{ "internal: string value in resize" };
+                }
+                const ValType to = from_ref(p.op_type.type);
+                set_value(i, cast_plane(value_of(p.op_type.op), to.width, to.is_signed));
                 return;
+            }
+
+            case Inst::Tag::StrLen: {
+                llvm::Value* n = b_.CreateCall(str_len_fn(), { str_of(p.unary) });
+                llvm::Value* v = b_.CreateTrunc(n, int_ty(32));
+                set_value(i, packed(v, v, zero(32)));
+                return;
+            }
+            case Inst::Tag::StrGetc: {
+                llvm::Value* idx =
+                  cast(must_of(value_of(p.binary.r)), 32, type_of(p.binary.r).is_signed);
+                llvm::Value* c = b_.CreateCall(str_getc_fn(), { str_of(p.binary.l), idx });
+                llvm::Value* v = b_.CreateTrunc(c, int_ty(8));
+                set_value(i, packed(v, v, zero(8)));
+                return;
+            }
+            case Inst::Tag::StrPutc: {
+                const auto    sp = ir_->extra_data<StrPutcInfo>(p.op_extra.extra);
+                const LValue& lv = lvalue_of(p.op_extra.op);
+                llvm::Value*  idx =
+                  cast(must_of(value_of(sp.index)), 32, type_of(sp.index).is_signed);
+                llvm::Value* ch = cast(must_of(value_of(sp.ch)), 32, false);
+                b_.CreateCall(str_putc_fn(), { lv_string_ptr(lv), idx, ch });
+                return;
+            }
+            case Inst::Tag::StrCmp:
+            case Inst::Tag::StrICmp: {
+                auto         fn = ir_->tag(i) == Inst::Tag::StrCmp ? str_cmp_fn() : str_icmp_fn();
+                llvm::Value* c  = b_.CreateCall(fn, { str_of(p.binary.l), str_of(p.binary.r) });
+                set_value(i, packed(c, c, zero(32)));
+                return;
+            }
+            case Inst::Tag::StrUpper:
+            case Inst::Tag::StrLower: {
+                auto fn = ir_->tag(i) == Inst::Tag::StrUpper ? str_upper_fn() : str_lower_fn();
+                b_.CreateCall(fn, { str_of(i), str_of(p.unary) });
+                return;
+            }
+            case Inst::Tag::StrSubstr: {
+                const auto   ss = ir_->extra_data<StrSubstrInfo>(p.op_extra.extra);
+                llvm::Value* si = cast(must_of(value_of(ss.i)), 32, type_of(ss.i).is_signed);
+                llvm::Value* sj = cast(must_of(value_of(ss.j)), 32, type_of(ss.j).is_signed);
+                b_.CreateCall(str_substr_fn(), { str_of(i), str_of(p.op_extra.op), si, sj });
+                return;
+            }
+            case Inst::Tag::StrFromPacked: {
+                // Spill the operand's val plane to a stack buffer (X bits read as
+                // 0 — the runtime consumes must-bits only, a documented
+                // simplification of the LRM cast).
+                const ValType  t   = type_of(p.unary);
+                const uint32_t pb  = plane_bytes(t.width);
+                llvm::Value*   buf = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(pb), "str.pack");
+                b_.CreateAlignedStore(must_of(value_of(p.unary)), buf, llvm::Align(1));
+                b_.CreateCall(str_from_packed_fn(), { str_of(i), buf, b_.getInt32(t.width) });
+                return;
+            }
+            case Inst::Tag::StrToPacked: {
+                const ValType  to  = from_ref(p.op_type.type);
+                const uint32_t pb  = plane_bytes(to.width);
+                llvm::Value*   buf = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(pb), "str.unpack");
+                b_.CreateCall(str_to_packed_fn(), { str_of(p.op_type.op), buf, b_.getInt32(to.width) });
+                llvm::Value* v = b_.CreateAlignedLoad(int_ty(to.width), buf, llvm::Align(1));
+                set_value(i, packed(v, v, zero(to.width)));
+                return;
+            }
 
             case Inst::Tag::Cond:
                 lower_cond(i);
@@ -2817,7 +3312,9 @@ private:
                 return;
 
             case Inst::Tag::Finish:
-                lower_finish();
+                // $finish / $stop: rt_finish exits the process and never
+                // returns (noreturn), so the optimizer prunes the region tail.
+                b_.CreateCall(finish_fn(), {});
                 return;
 
             case Inst::Tag::Fflush:
@@ -2887,11 +3384,15 @@ private:
             }
 
             case Inst::Tag::Arg: {
-                // A function parameter: read its plane from the call frame's params.
-                // The signature is (state, arg0_mm, arg0_z, arg1_mm, ...), so arg k
-                // occupies LLVM params 1 + 2k (must|may) and 2 + 2k (z).
-                const uint32_t k = p.arg.position;
-                set_value(i, Plane{ fn_->getArg(1 + 2 * k), fn_->getArg(2 + 2 * k) });
+                // A function / task parameter, located via the per-signature index
+                // table (a string formal is one ptr, others two params).
+                const uint32_t k    = p.arg.position;
+                const uint32_t base = param_llvm_index_[k];
+                if (is_string_type(cur_fn_->param_types[k])) {
+                    set_str(i, fn_->getArg(base));
+                    return;
+                }
+                set_value(i, Plane{ fn_->getArg(base), fn_->getArg(base + 1) });
                 return;
             }
             case Inst::Tag::Ret:
@@ -2923,6 +3424,49 @@ private:
         return packed(b_.CreateAnd(val, b_.CreateNot(xz)), b_.CreateOr(val, xz), b_.CreateAnd(xz, b_.CreateNot(val)));
     }
 
+    // A string literal: copy its interned characters into this instruction's
+    // pre-built temp from a private constant global. Length is passed explicitly
+    // — never rely on the NUL byte CreateGlobalString appends.
+    void lower_string_constant(Index i, Ref ref) {
+        const std::span<const uint8_t> bytes = mod_.pool.bytes(ref);
+        llvm::Value*                   glob  = b_.CreateGlobalString(
+          llvm::StringRef(reinterpret_cast<const char*>(bytes.data()), bytes.size()), "str.lit");
+        b_.CreateCall(str_assign_bytes_fn(), { str_of(i), glob, b_.getInt64(bytes.size()) });
+    }
+
+    // String concatenation: gather the part handles into a stack array and hand
+    // them to the runtime, which builds into this instruction's temp (alias-safe
+    // even when the temp aliases a part).
+    void lower_string_concat(Index i) {
+        std::array<Index, 3> scratch;
+        const auto           parts  = ir_->operands(i, scratch);
+        const auto           n      = static_cast<uint32_t>(parts.size());
+        auto*                arr_ty = llvm::ArrayType::get(llvm::PointerType::getUnqual(ctx_), n);
+        llvm::Value*         arr    = b_.CreateAlloca(arr_ty, nullptr, "str.parts");
+        for (uint32_t k = 0; k < n; ++k) {
+            b_.CreateStore(str_of(parts[k]),
+                           b_.CreateInBoundsGEP(arr_ty, arr, { b_.getInt32(0), b_.getInt32(k) }));
+        }
+        b_.CreateCall(str_concat_fn(), { str_of(i), arr, b_.getInt32(n) });
+    }
+
+    // A string comparison operator: rt_string_cmp then a native compare against
+    // zero. Strings carry no X/Z, so the 1-bit result is always definite.
+    Plane lower_string_relation(Inst::Tag tag, Index l, Index r) {
+        llvm::Value*             c = b_.CreateCall(str_cmp_fn(), { str_of(l), str_of(r) });
+        llvm::CmpInst::Predicate pred;
+        switch (tag) {
+            case Inst::Tag::Eq: pred = llvm::CmpInst::ICMP_EQ; break;
+            case Inst::Tag::Ne: pred = llvm::CmpInst::ICMP_NE; break;
+            case Inst::Tag::Lt: pred = llvm::CmpInst::ICMP_SLT; break;
+            case Inst::Tag::Le: pred = llvm::CmpInst::ICMP_SLE; break;
+            case Inst::Tag::Gt: pred = llvm::CmpInst::ICMP_SGT; break;
+            default:            pred = llvm::CmpInst::ICMP_SGE; break;
+        }
+        llvm::Value* bit = b_.CreateICmp(pred, c, b_.getInt32(0));
+        return bit_plane(bit, bit);
+    }
+
     // Build an iW constant from little-endian canonical plane bytes.
     llvm::ConstantInt* const_from_bytes(std::span<const uint8_t> bytes, uint32_t width) {
         const unsigned        words = (width + 63) / 64;
@@ -2933,38 +3477,39 @@ private:
 
     // -- State access --
 
-    // Whole-storage lvalue for a module signal (state buffer).
+    // Whole-storage lvalue for a module signal (state struct).
     LValue signal_lvalue(Signal sig) {
         const SignalSlot& s = slot_of(sig);
-        return LValue{ .base        = state_,
-                       .off_mm      = s.off_mm,
-                       .off_z       = s.off_z,
+        return LValue{ .base        = storage_ptr(state_, s),
+                       .slot_ty     = s.slot_ty,
+                       .has_z       = s.has_z,
+                       .array_ty    = s.is_array ? llvm::cast<llvm::ArrayType>(s.storage_ty) : nullptr,
                        .store_width = s.width,
                        .bit_off     = b_.getInt32(0),
                        .width       = s.width,
                        .is_signal   = true,
-                       .sig         = sig };
+                       .sig         = sig,
+                       .is_string   = s.is_string };
     }
 
-    // Whole-storage lvalue for a function-frame local (per-call frame buffer).
+    // Whole-storage lvalue for a function-frame local (per-call frame struct).
     LValue local_lvalue(uint32_t index) {
         const FrameSlot& s = frame_slots_[index];
-        return LValue{ .base        = frame_,
-                       .off_mm      = s.off_mm,
-                       .off_z       = s.off_z,
+        return LValue{ .base        = b_.CreateStructGEP(frame_ty_, frame_, index),
+                       .slot_ty     = s.slot_ty,
                        .store_width = s.width,
                        .bit_off     = b_.getInt32(0),
                        .width       = s.width,
                        .is_signal   = false,
-                       .sig         = Signal{ 0 } };
+                       .sig         = Signal{ 0 },
+                       .is_string   = s.is_string };
     }
 
     Plane lower_load(const LValue& lv) {
-        const uint32_t    w  = lv.store_width;
-        llvm::Value*      mm = b_.CreateAlignedLoad(
-          int_ty(2 * w), elem_ptr(lv.base, lv.off_mm, lv.dyn_off), llvm::Align(field_align(2 * w)));
-        llvm::Value* z =
-          b_.CreateAlignedLoad(int_ty(w), elem_ptr(lv.base, lv.off_z, lv.dyn_off), llvm::Align(field_align(w)));
+        const uint32_t w  = lv.store_width;
+        llvm::Value*   mm = b_.CreateLoad(int_ty(2 * w), lv_mm_ptr(lv));
+        // A never-z slot stores no z word; its z plane is a constant zero.
+        llvm::Value* z = lv.has_z ? static_cast<llvm::Value*>(b_.CreateLoad(int_ty(w), lv_z_ptr(lv))) : zero(w);
         if (lv.width == w && is_zero_const(lv.bit_off)) {
             return { mm, z };
         }
@@ -2976,34 +3521,37 @@ private:
                       cast(b_.CreateLShr(z, off), lv.width, false));
     }
 
-    void lower_store(const LValue& lv, Plane rhs, ValType rhs_ty) {
-        const uint32_t    s_width = lv.store_width;
-        llvm::Value*      mp      = elem_ptr(lv.base, lv.off_mm, lv.dyn_off);
-        llvm::Value*      zp      = elem_ptr(lv.base, lv.off_z, lv.dyn_off);
-        const llvm::Align mm_al   = llvm::Align(field_align(2 * s_width));
-        const llvm::Align z_al    = llvm::Align(field_align(s_width));
-        (void)rhs_ty;
+    void lower_store(const LValue& lv, Plane rhs) {
+        const uint32_t s_width = lv.store_width;
+        llvm::Value*   mp      = lv_mm_ptr(lv);
 
         // Whole-storage store: the frontend context-sizes the RHS to the lvalue
         // width (via an inserted Resize), so rhs already matches the storage width
-        // and the planes store directly.
+        // and the planes store directly. A never-z slot drops the RHS z plane —
+        // the may-z analysis proved it zero here.
         if (lv.width == s_width && is_zero_const(lv.bit_off)) {
-            b_.CreateAlignedStore(rhs.mm, mp, mm_al);
-            b_.CreateAlignedStore(rhs.z, zp, z_al);
+            b_.CreateStore(rhs.mm, mp);
+            if (lv.has_z) {
+                b_.CreateStore(rhs.z, lv_z_ptr(lv));
+            }
             return;
         }
 
         // Partial store: read-modify-write each plane at the storage width.
-        const Plane  old =
-          { b_.CreateAlignedLoad(int_ty(2 * s_width), mp, mm_al), b_.CreateAlignedLoad(int_ty(s_width), zp, z_al) };
+        llvm::Value* zp  = lv.has_z ? lv_z_ptr(lv) : nullptr;
+        const Plane  old = { b_.CreateLoad(int_ty(2 * s_width), mp),
+                             lv.has_z ? static_cast<llvm::Value*>(b_.CreateLoad(int_ty(s_width), zp))
+                                      : zero(s_width) };
         llvm::Value* off   = cast(lv.bit_off, s_width, false);
         llvm::Value* mask  = b_.CreateShl(cast(ones(lv.width), s_width, false), off);
         llvm::Value* nmask = b_.CreateNot(mask);
         llvm::Value* must  = merge_bits(must_of(old), cast(must_of(rhs), s_width, false), off, mask, nmask);
         llvm::Value* may   = merge_bits(may_of(old), cast(may_of(rhs), s_width, false), off, mask, nmask);
         llvm::Value* z     = merge_bits(old.z, cast(rhs.z, s_width, false), off, mask, nmask);
-        b_.CreateAlignedStore(packed(must, may, z).mm, mp, mm_al);
-        b_.CreateAlignedStore(z, zp, z_al);
+        b_.CreateStore(packed(must, may, z).mm, mp);
+        if (lv.has_z) {
+            b_.CreateStore(z, zp);
+        }
     }
 
     // Stage a nonblocking assignment: write the sampled RHS into the target's
@@ -3012,34 +3560,38 @@ private:
     // repeat NBAs to one signal in a slot accumulate in the shadow). No wait queues
     // are serviced here — that happens in the NBA region after the active drain.
     void lower_store_nb(const LValue& lv, Plane rhs) {
-        const SignalSlot& s    = slot_of(lv.sig);
-        const llvm::Align mm_al = llvm::Align(field_align(2 * s.width));
-        const llvm::Align z_al  = llvm::Align(field_align(s.width));
-        llvm::Value*      mp    = field_ptr(state_, s.off_nmm);
-        llvm::Value*      zp    = field_ptr(state_, s.off_nz);
+        const SignalSlot& s  = slot_of(lv.sig);
+        llvm::Value*      mp = shadow_ptr(s.sh_mm_field);
+        // A never-z target stages no z shadow (and its commit loop skips z).
+        llvm::Value* zp = s.has_z ? shadow_ptr(s.sh_z_field) : nullptr;
 
         if (!s.nba_partial) {
             // Whole-signal target: the RHS is already signal-width (frontend Resize),
             // so the shadow planes store directly — no mask, no read-modify-write.
-            b_.CreateAlignedStore(rhs.mm, mp, mm_al);
-            b_.CreateAlignedStore(rhs.z, zp, z_al);
+            b_.CreateStore(rhs.mm, mp);
+            if (s.has_z) {
+                b_.CreateStore(rhs.z, zp);
+            }
         } else {
             // Partial-capable target: merge the selected bits into the shadow and OR
             // the touched bits into the dirty mask. A whole-signal site here selects
             // every bit, so it merges the full word and sets the whole mask.
-            llvm::Value* maskp = field_ptr(state_, s.off_mask);
-            const Plane  old   = { b_.CreateAlignedLoad(int_ty(2 * s.width), mp, mm_al),
-                                   b_.CreateAlignedLoad(int_ty(s.width), zp, z_al) };
+            llvm::Value* maskp = shadow_ptr(s.sh_mask_field);
+            const Plane  old   = { b_.CreateLoad(int_ty(2 * s.width), mp),
+                                   s.has_z ? static_cast<llvm::Value*>(b_.CreateLoad(int_ty(s.width), zp))
+                                           : zero(s.width) };
             llvm::Value* off   = cast(lv.bit_off, s.width, false);
             llvm::Value* bmask = b_.CreateShl(cast(ones(lv.width), s.width, false), off);
             llvm::Value* nmask = b_.CreateNot(bmask);
             llvm::Value* must  = merge_bits(must_of(old), cast(must_of(rhs), s.width, false), off, bmask, nmask);
             llvm::Value* may   = merge_bits(may_of(old), cast(may_of(rhs), s.width, false), off, bmask, nmask);
             llvm::Value* z     = merge_bits(old.z, cast(rhs.z, s.width, false), off, bmask, nmask);
-            b_.CreateAlignedStore(packed(must, may, z).mm, mp, mm_al);
-            b_.CreateAlignedStore(z, zp, z_al);
-            llvm::Value* cur = b_.CreateAlignedLoad(int_ty(s.width), maskp, z_al);
-            b_.CreateAlignedStore(b_.CreateOr(cur, bmask), maskp, z_al);
+            b_.CreateStore(packed(must, may, z).mm, mp);
+            if (s.has_z) {
+                b_.CreateStore(z, zp);
+            }
+            llvm::Value* cur = b_.CreateLoad(int_ty(s.width), maskp);
+            b_.CreateStore(b_.CreateOr(cur, bmask), maskp);
         }
         emit_nba_enqueue(s);
     }
@@ -3084,19 +3636,28 @@ private:
         llvm::Value*      st  = nba_scratch();
         llvm::StructType* ty  = nba_scratch_ty();
         const llvm::Align a1{ 1 };
-        llvm::Value*      mvp = b_.CreateStructGEP(ty, st, 0);
-        llvm::Value*      mkp = b_.CreateStructGEP(ty, st, 1);
-        llvm::Value*      zvp = b_.CreateStructGEP(ty, st, 2);
-        llvm::Value*      zkp = b_.CreateStructGEP(ty, st, 3);
+        auto*             nullp = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+        llvm::Value*      mvp   = b_.CreateStructGEP(ty, st, 0);
+        llvm::Value*      mkp   = b_.CreateStructGEP(ty, st, 1);
         b_.CreateAlignedStore(mm_val, mvp, a1);
         b_.CreateAlignedStore(mm_msk, mkp, a1);
-        b_.CreateAlignedStore(zval, zvp, a1);
-        b_.CreateAlignedStore(mask_w, zkp, a1);
+        // A never-z element slot stores no z word: hand the runtime a null z_ptr
+        // with zero z bytes so the commit merges only the must|may word.
+        llvm::Value* zvp = nullp;
+        llvm::Value* zkp = nullp;
+        llvm::Value* z_ptr = nullp;
+        uint32_t     z_bytes = 0;
+        if (lv.has_z) {
+            zvp = b_.CreateStructGEP(ty, st, 2);
+            zkp = b_.CreateStructGEP(ty, st, 3);
+            b_.CreateAlignedStore(zval, zvp, a1);
+            b_.CreateAlignedStore(mask_w, zkp, a1);
+            z_ptr   = lv_z_ptr(lv);
+            z_bytes = (W + 7) / 8;
+        }
 
-        llvm::Value*   mm_ptr   = elem_ptr(lv.base, lv.off_mm, lv.dyn_off);
-        llvm::Value*   z_ptr    = elem_ptr(lv.base, lv.off_z, lv.dyn_off);
+        llvm::Value*   mm_ptr   = lv_mm_ptr(lv);
         const uint32_t mm_bytes = (2 * W + 7) / 8;
-        const uint32_t z_bytes  = (W + 7) / 8;
         b_.CreateCall(nba_arr_push_fn(),
                       { b_.getInt32(static_cast<uint32_t>(lv.sig)), mm_ptr, mvp, mkp, b_.getInt32(mm_bytes), z_ptr,
                         zvp, zkp, b_.getInt32(z_bytes) });
@@ -3169,45 +3730,35 @@ private:
 
     // void rt_fwrite(i32 desc, const char* fmt, i32 argc, const rt_arg* argv)
     llvm::FunctionCallee fwrite_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        auto* fnty =
-          llvm::FunctionType::get(b_.getVoidTy(), { b_.getInt32Ty(), ptr, b_.getInt32Ty(), ptr }, false);
-        return llmod_.getOrInsertFunction("rt_fwrite", fnty);
+        auto* i32 = b_.getInt32Ty();
+        return rt_fn("rt_fwrite", b_.getVoidTy(), { i32, raw_ptr_ty(), i32, raw_ptr_ty() });
     }
 
     // i32 rt_fopen_mcd(const char* name, i32 name_len)
     llvm::FunctionCallee fopen_mcd_fn() {
-        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-        auto* fnty = llvm::FunctionType::get(b_.getInt32Ty(), { ptr, b_.getInt32Ty() }, false);
-        return llmod_.getOrInsertFunction("rt_fopen_mcd", fnty);
+        return rt_fn("rt_fopen_mcd", b_.getInt32Ty(), { raw_ptr_ty(), b_.getInt32Ty() });
     }
 
     // i32 rt_fopen_fd(const char* name, i32 name_len, const char* mode, i32 mode_len)
     llvm::FunctionCallee fopen_fd_fn() {
-        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-        auto* i32  = b_.getInt32Ty();
-        auto* fnty = llvm::FunctionType::get(i32, { ptr, i32, ptr, i32 }, false);
-        return llmod_.getOrInsertFunction("rt_fopen_fd", fnty);
+        auto* i32 = b_.getInt32Ty();
+        return rt_fn("rt_fopen_fd", i32, { raw_ptr_ty(), i32, raw_ptr_ty(), i32 });
     }
 
     // void rt_fclose(i32 desc)
     llvm::FunctionCallee fclose_fn() {
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { b_.getInt32Ty() }, false);
-        return llmod_.getOrInsertFunction("rt_fclose", fnty);
+        return rt_fn("rt_fclose", b_.getVoidTy(), { b_.getInt32Ty() });
     }
 
     // void rt_timeformat_init(i64 tick_fs, i32 default_units)
     llvm::FunctionCallee timeformat_init_fn() {
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { b_.getInt64Ty(), b_.getInt32Ty() }, false);
-        return llmod_.getOrInsertFunction("rt_timeformat_init", fnty);
+        return rt_fn("rt_timeformat_init", b_.getVoidTy(), { b_.getInt64Ty(), b_.getInt32Ty() });
     }
 
     // void rt_timeformat_set(i32 units, i32 precision, const char* suffix, i32 suffix_len, i32 min_width)
     llvm::FunctionCallee timeformat_set_fn() {
-        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-        auto* i32  = b_.getInt32Ty();
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { i32, i32, ptr, i32, i32 }, false);
-        return llmod_.getOrInsertFunction("rt_timeformat_set", fnty);
+        auto* i32 = b_.getInt32Ty();
+        return rt_fn("rt_timeformat_set", b_.getVoidTy(), { i32, i32, raw_ptr_ty(), i32, i32 });
     }
 
     // Lower a $timeformat: evaluate the units / precision / min_width operands and
@@ -3225,10 +3776,11 @@ private:
                       { units, prec, sfx_ptr, b_.getInt32(static_cast<uint32_t>(suffix.size())), width });
     }
 
-    // void rt_finish(void) — noreturn; exits the process.
+    // void rt_finish(void) — noreturn; exits the process. Kept separate from
+    // the plain rt_fn helpers: the noreturn attribute must land on the
+    // declaration so the optimizer prunes the dead tail after a $finish.
     llvm::FunctionCallee finish_fn() {
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), false);
-        auto  fn   = llmod_.getOrInsertFunction("rt_finish", fnty);
+        auto fn = rt_fn("rt_finish", b_.getVoidTy(), {});
         if (auto* f = llvm::dyn_cast<llvm::Function>(fn.getCallee())) {
             f->setDoesNotReturn();
         }
@@ -3244,8 +3796,7 @@ private:
 
     // void rt_fflush(i32 desc) — flush a descriptor's output buffers (0 => all).
     llvm::FunctionCallee fflush_fn() {
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { b_.getInt32Ty() }, false);
-        return llmod_.getOrInsertFunction("rt_fflush", fnty);
+        return rt_fn("rt_fflush", b_.getVoidTy(), { b_.getInt32Ty() });
     }
 
     // Lower a $fflush: flush the descriptor operand's buffers (a constant 0 for the
@@ -3348,6 +3899,10 @@ private:
     // vector. `who` names the caller.
     std::tuple<llvm::Value*, llvm::Value*, uint32_t> string_dest(Index dst, const char* who) {
         const LValue& lv = lvalue_of(dst);
+        if (lv.is_string) {
+            // TODO: file write-back into a dynamic string object (rt_string).
+            throw BackendError{ std::string(who) + " into a string object is not supported" };
+        }
         if (lv.width != lv.store_width) {
             // TODO: a part-select target (s[15:0]) writes only a slice.
             throw BackendError{ std::string(who) + " into a part-select target is not supported" };
@@ -3358,10 +3913,11 @@ private:
             throw BackendError{ std::string(who) +
                                 " into a target whose width is not a multiple of 8 is not supported" };
         }
-        llvm::Value* mm = lv.dyn_off != nullptr ? elem_ptr(lv.base, lv.off_mm, lv.dyn_off)
-                                                : field_ptr(lv.base, lv.off_mm);
-        llvm::Value* z  = lv.dyn_off != nullptr ? elem_ptr(lv.base, lv.off_z, lv.dyn_off)
-                                                : field_ptr(lv.base, lv.off_z);
+        // A never-z target (z elision) has no z word; pass null and the runtime
+        // skips the z write.
+        llvm::Value* mm = lv_mm_ptr(lv);
+        llvm::Value* z =
+          lv.has_z ? lv_z_ptr(lv) : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
         return { mm, z, lv.store_width };
     }
 
@@ -3446,6 +4002,10 @@ private:
             arr = b_.CreateAlloca(sty, b_.getInt32(n), "scan_args");
             for (uint32_t k = 0; k < n; ++k) {
                 const LValue& lv = lvalue_of(outs[k]);
+                if (lv.is_string) {
+                    // TODO: $*scanf write-back into a dynamic string object.
+                    throw BackendError{ "$fscanf / $sscanf into a string object is not supported" };
+                }
                 if (lv.width != lv.store_width) {
                     // TODO: a part-select scan target (x[7:0]).
                     throw BackendError{ "$fscanf / $sscanf into a part-select target is not supported" };
@@ -3456,10 +4016,10 @@ private:
                     throw BackendError{ "$fscanf / $sscanf into a target wider than 64 bits is not "
                                         "supported" };
                 }
-                llvm::Value* mm = lv.dyn_off != nullptr ? elem_ptr(lv.base, lv.off_mm, lv.dyn_off)
-                                                        : field_ptr(lv.base, lv.off_mm);
-                llvm::Value* z  = lv.dyn_off != nullptr ? elem_ptr(lv.base, lv.off_z, lv.dyn_off)
-                                                        : field_ptr(lv.base, lv.off_z);
+                // A never-z target (z elision) passes a null z pointer.
+                llvm::Value* mm  = lv_mm_ptr(lv);
+                llvm::Value* z   = lv.has_z ? lv_z_ptr(lv)
+                                            : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
                 llvm::Value* elt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
                 b_.CreateStore(mm, b_.CreateStructGEP(sty, elt, 0));
                 b_.CreateStore(z, b_.CreateStructGEP(sty, elt, 1));
@@ -3494,23 +4054,19 @@ private:
     //                 i32 stride, i32 count, i32 width, i64 decl_left, i64 decl_right,
     //                 i64 start, i64 finish, i32 flags)
     llvm::FunctionCallee readmem_fn() {
-        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-        auto* i32  = b_.getInt32Ty();
-        auto* i64  = b_.getInt64Ty();
-        auto* fnty = llvm::FunctionType::get(
-          b_.getVoidTy(), { ptr, i32, ptr, ptr, i32, i32, i32, i64, i64, i64, i64, i32 }, false);
-        return llmod_.getOrInsertFunction("rt_readmem", fnty);
+        auto* ptr = raw_ptr_ty();
+        auto* i32 = b_.getInt32Ty();
+        auto* i64 = b_.getInt64Ty();
+        return rt_fn("rt_readmem", b_.getVoidTy(), { ptr, i32, ptr, ptr, i32, i32, i32, i64, i64, i64, i64, i32 });
     }
 
     // i32 rt_fread(i32 fd, i8* mm, i8* z, i32 stride, i32 count, i32 width, i32 four,
     //              i64 decl_left, i64 decl_right, i64 start, i64 max_count, i32 flags)
     llvm::FunctionCallee fread_fn() {
-        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-        auto* i32  = b_.getInt32Ty();
-        auto* i64  = b_.getInt64Ty();
-        auto* fnty = llvm::FunctionType::get(
-          i32, { i32, ptr, ptr, i32, i32, i32, i32, i64, i64, i64, i64, i32 }, false);
-        return llmod_.getOrInsertFunction("rt_fread", fnty);
+        auto* ptr = raw_ptr_ty();
+        auto* i32 = b_.getInt32Ty();
+        auto* i64 = b_.getInt64Ty();
+        return rt_fn("rt_fread", i32, { i32, ptr, ptr, i32, i32, i32, i32, i64, i64, i64, i64, i32 });
     }
 
     // Lower a $fread into a single vector: one element, no addressing. The runtime
@@ -3520,16 +4076,19 @@ private:
         const auto  info = ir_->extra_data<FreadWordInfo>(ir_->payload(i).op_extra.extra);
 
         const LValue& lv = lvalue_of(dst);
+        if (lv.is_string) {
+            throw BackendError{ "$fread into a string object is not supported" };
+        }
         if (lv.width != lv.store_width) {
             throw BackendError{ "$fread into a part-select target is not supported" };
         }
         if (lv.store_width > 64) {
             throw BackendError{ "$fread into a target wider than 64 bits is not supported" };
         }
-        llvm::Value* mm = lv.dyn_off != nullptr ? elem_ptr(lv.base, lv.off_mm, lv.dyn_off)
-                                                : field_ptr(lv.base, lv.off_mm);
-        llvm::Value* z  = lv.dyn_off != nullptr ? elem_ptr(lv.base, lv.off_z, lv.dyn_off)
-                                                : field_ptr(lv.base, lv.off_z);
+        // A never-z target (z elision) passes a null z pointer.
+        llvm::Value* mm = lv_mm_ptr(lv);
+        llvm::Value* z =
+          lv.has_z ? lv_z_ptr(lv) : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
         llvm::Value* fd = cast(must_of(value_of(info.fd)), 32, true);
 
         const uint32_t four = type_of(dst).four_state ? 1u : 0u;
@@ -3554,9 +4113,17 @@ private:
         if (s.width > 64) {
             throw BackendError{ "$fread into a memory with elements wider than 64 bits is not supported" };
         }
-        llvm::Value* mm_base = field_ptr(state_, s.off_mm);
-        llvm::Value* z_base  = field_ptr(state_, s.off_z);
-        const Type&  at      = std::get<Type>(mod_.pool.get(mod_.signal(info.mem).type));
+        // Element i's planes at base + i*stride (one slot struct per element); a
+        // never-z memory stores no z word, so pass a null z_base.
+        auto*        arr_ty  = llvm::cast<llvm::ArrayType>(s.storage_ty);
+        llvm::Value* storage = storage_ptr(state_, s);
+        llvm::Value* mm_base =
+          b_.CreateInBoundsGEP(arr_ty, storage, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(0) });
+        llvm::Value* z_base =
+          s.has_z ? b_.CreateInBoundsGEP(arr_ty, storage, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(1) })
+                  : llvm::cast<llvm::Value>(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
+        const auto  stride = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(s.slot_ty));
+        const Type& at     = std::get<Type>(mod_.pool.get(mod_.signal(info.mem).type));
 
         llvm::Value*   fd     = cast(must_of(value_of(fdi)), 32, true);
         const auto     i64_of = [&](Index idx) { return cast(must_of(value_of(idx)), 64, true); };
@@ -3565,17 +4132,18 @@ private:
         const uint32_t flags  = (info.has_start ? 1u : 0u) | (info.has_count ? 2u : 0u);
 
         llvm::Value* r = b_.CreateCall(
-          fread_fn(), { fd, mm_base, z_base, b_.getInt32(s.elem_stride), b_.getInt32(s.elem_count),
+          fread_fn(), { fd, mm_base, z_base, b_.getInt32(stride), b_.getInt32(s.elem_count),
                         b_.getInt32(s.width), b_.getInt32(s.four_state ? 1u : 0u), b_.getInt64(at.left),
                         b_.getInt64(at.right), start, cnt, b_.getInt32(flags) });
         set_value(i, packed(r, r, zero(32)));
     }
 
-    // Lower a $readmemh / $readmemb: spill the filename to a stack buffer and hand
-    // the runtime the destination memory's plane bases (element 0) and geometry. The
+    // Lower a $readmemh / $readmemb: hand the runtime the filename bytes (spilled
+    // to a stack buffer, or read from the rt_string handle for a string-typed
+    // filename) plus the destination memory's plane bases (element 0) and geometry. The
     // runtime opens the file and writes element planes straight into `state`. The mm
-    // and z words of element i sit at off_mm/off_z + i*elem_stride, so the two region
-    // bases plus the stride let the runtime address every element.
+    // and z words of element i sit at the plane bases + i*stride (one slot struct
+    // per element), so the two region bases plus the stride address every element.
     void lower_readmem(Index i) {
         const auto        info  = ir_->extra_data<ReadMemInfo>(ir_->payload(i).op_extra.extra);
         const Index       fname = ir_->payload(i).op_extra.op;
@@ -3589,12 +4157,41 @@ private:
             throw BackendError{ "$readmem into a memory with elements wider than 64 bits is not supported" };
         }
 
-        // Spill the filename's must-bits to a byte buffer: the value is a packed-
-        // ASCII vector (string literal or reg), so its low bytes are the path.
-        const auto [path, fbytes] = spill_ascii(fname, "readmem.path");
+        // A string-object filename (LRM §21.4 allows a string-typed expression) is
+        // read straight from its rt_string handle: bytes in natural order, so the
+        // runtime is told to skip the packed-vector byte reversal (flags bit 4).
+        // Otherwise spill the filename's must-bits to a byte buffer: the value is
+        // a packed-ASCII vector (string literal or reg), so its low bytes are the
+        // path.
+        const ValType fty          = type_of(fname);
+        llvm::Value*  path         = nullptr;
+        llvm::Value*  path_len     = nullptr;
+        const bool    fname_is_str = fty.is_string;
+        if (fname_is_str) {
+            llvm::Value* handle = str_of(fname);
+            path                = b_.CreateCall(str_data_fn(), { handle });
+            path_len            = b_.CreateTrunc(b_.CreateCall(str_len_fn(), { handle }), b_.getInt32Ty());
+        } else {
+            const uint32_t fbytes = std::max<uint32_t>((fty.width + 7) / 8, 1);
+            path                  = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(fbytes), "readmem.path");
+            path_len              = b_.getInt32(fbytes);
+            b_.CreateAlignedStore(must_of(value_of(fname)), path, llvm::Align(1));
+        }
 
-        llvm::Value* mm_base = field_ptr(state_, s.off_mm);
-        llvm::Value* z_base  = field_ptr(state_, s.off_z);
+        // The runtime addresses element i's planes at base + i*stride, so hand it
+        // element 0's typed field pointers and the slot struct's alloc size.
+        auto*        arr_ty  = llvm::cast<llvm::ArrayType>(s.storage_ty);
+        llvm::Value* storage = storage_ptr(state_, s);
+        llvm::Value* mm_base =
+          b_.CreateInBoundsGEP(arr_ty, storage, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(0) });
+        // A never-z memory (always the case for a 2-state element type) stores no
+        // z words; a null z_base tells the runtime to skip the z writes. A
+        // 4-state readmem target is a z seed in compute_may_z, so it always keeps
+        // its z field.
+        llvm::Value* z_base =
+          s.has_z ? b_.CreateInBoundsGEP(arr_ty, storage, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(1) })
+                  : llvm::cast<llvm::Value>(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
+        const auto stride = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(s.slot_ty));
 
         const Type& at = std::get<Type>(mod_.pool.get(mod_.signal(info.target).type));
 
@@ -3603,10 +4200,11 @@ private:
         llvm::Value* finish = info.has_finish ? i64_of(info.finish) : b_.getInt64(0);
 
         const uint32_t flags = (info.hex ? 1u : 0u) | (info.has_start ? 2u : 0u) |
-                               (info.has_finish ? 4u : 0u) | (s.four_state ? 8u : 0u);
+                               (info.has_finish ? 4u : 0u) | (s.four_state ? 8u : 0u) |
+                               (fname_is_str ? 16u : 0u);
 
         b_.CreateCall(readmem_fn(),
-                      { path, b_.getInt32(fbytes), mm_base, z_base, b_.getInt32(s.elem_stride),
+                      { path, path_len, mm_base, z_base, b_.getInt32(stride),
                         b_.getInt32(s.elem_count), b_.getInt32(s.width), b_.getInt64(at.left),
                         b_.getInt64(at.right), start, finish, b_.getInt32(flags) });
     }
@@ -3622,7 +4220,17 @@ private:
             b_.CreateBr(task_epilogue_bb_);
             return;
         }
+        if (is_string_type(cur_fn_->return_type)) {
+            // Copy the result out through the trailing out-param handle BEFORE
+            // releasing the body's strings (the value may be one of them).
+            b_.CreateCall(str_assign_fn(),
+                          { fn_->getArg(fn_->arg_size() - 1), str_of(value) });
+            deinit_body_strings();
+            b_.CreateRetVoid();
+            return;
+        }
         if (cur_fn_->return_type == mod_.pool.void_type) {
+            deinit_body_strings();
             b_.CreateRetVoid();
             return;
         }
@@ -3631,6 +4239,7 @@ private:
         llvm::Value* agg = llvm::UndefValue::get(rty);
         agg              = b_.CreateInsertValue(agg, pl.mm, { 0 });
         agg              = b_.CreateInsertValue(agg, pl.z, { 1 });
+        deinit_body_strings();
         b_.CreateRet(agg);
     }
 
@@ -3639,16 +4248,30 @@ private:
     // unpack the returned struct into a Plane. A void callee yields no value.
     void lower_call_inst(Index i) {
         const auto                ci = ir_->extra_data<CallInfo>(ir_->payload(i).extra);
+        const Function&           f  = mod_.function(ci.func);
         llvm::Function*           cf = fn_decls_[static_cast<uint32_t>(ci.func)];
         std::vector<llvm::Value*> argv;
         argv.push_back(state_);
+        size_t k = 0;
         for (Index a : ir_->region(ci.args)) {
-            const Plane pl = value_of(a);
-            argv.push_back(pl.mm);
-            argv.push_back(pl.z);
+            if (is_string_type(f.param_types[k])) {
+                argv.push_back(str_of(a));
+            } else {
+                const Plane pl = value_of(a);
+                argv.push_back(pl.mm);
+                argv.push_back(pl.z);
+            }
+            ++k;
+        }
+        if (is_string_type(f.return_type)) {
+            // The callee assigns the result into this call's temp handle (the
+            // trailing out-param); str_of(i) was pre-set by build_str_temps.
+            argv.push_back(str_of(i));
+            b_.CreateCall(cf->getFunctionType(), cf, argv);
+            return;
         }
         llvm::Value* r = b_.CreateCall(cf->getFunctionType(), cf, argv);
-        if (mod_.function(ci.func).return_type != mod_.pool.void_type) {
+        if (f.return_type != mod_.pool.void_type) {
             set_value(i, Plane{ b_.CreateExtractValue(r, { 0 }), b_.CreateExtractValue(r, { 1 }) });
         }
     }
@@ -3690,14 +4313,18 @@ private:
         argv.push_back(wheel_);
         for (uint32_t k = 0; k < args.size(); ++k) {
             if (tf.arg_dirs[k] == ArgDir::In) {
+                if (is_string_type(tf.param_types[k])) {
+                    argv.push_back(str_of(args[k]));
+                    continue;
+                }
                 const Plane pl = value_of(args[k]);
                 argv.push_back(pl.mm);
                 argv.push_back(pl.z);
             } else {
                 // An output / inout temp: pass pointers to its mm and z planes.
                 const LValue& lv = lvalue_of(args[k]);
-                argv.push_back(field_ptr(lv.base, lv.off_mm));
-                argv.push_back(field_ptr(lv.base, lv.off_z));
+                argv.push_back(lv_mm_ptr(lv));
+                argv.push_back(lv_z_ptr(lv));
             }
         }
         argv.push_back(record);
@@ -3746,6 +4373,17 @@ private:
         for (uint32_t k = 0; k < n; ++k) {
             const Plane   p = value_of(args[k]);
             const ValType t = type_of(args[k]);
+            if (t.is_string) {
+                // A string-object argument (%s): flag bit 1, val = the rt_string
+                // handle pointer; the width / plane fields are unused.
+                llvm::Value* selt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
+                store_field(sty, selt, 0, b_.getInt32(0));
+                store_field(sty, selt, 1, b_.getInt32(2));
+                store_field(sty, selt, 2, b_.CreatePtrToInt(str_of(args[k]), b_.getInt64Ty()));
+                store_field(sty, selt, 3, b_.getInt64(0));
+                store_field(sty, selt, 4, b_.getInt64(0));
+                continue;
+            }
             if (t.width > 64) {
                 throw BackendError{ std::string(who) +
                                     " of an operand wider than 64 bits is not supported (it "
@@ -3836,6 +4474,17 @@ private:
         return packed(cast(must_of(a), to, sign), cast(may_of(a), to, sign), cast(a.z, to, sign));
     }
 
+    // Combined per-bit X/Z mask (iW) of two same-width operands, tested once
+    // for the pair. The X mask of a packed value is `must ^ may`, which sits
+    // in the low W bits of `mm ^ (mm >> W)`. X-ness is nonlinear, so each
+    // operand's mask is taken separately before OR-ing (merging the mm words
+    // first would be wrong).
+    llvm::Value* xz_mask(Plane a, Plane b, uint32_t w) {
+        llvm::Value* xa = b_.CreateXor(a.mm, b_.CreateLShr(a.mm, w));
+        llvm::Value* xb = b_.CreateXor(b.mm, b_.CreateLShr(b.mm, w));
+        return b_.CreateTrunc(b_.CreateOr(xa, xb), int_ty(w));
+    }
+
     // -- Arithmetic: any X/Z in an operand makes the whole result X. --
     //
     // Lowered as a branch, not a select: the X case is rare, so it is split into a
@@ -3862,15 +4511,7 @@ private:
 
         auto* wide = int_ty(2 * w);
 
-        // Any X/Z bit in either operand, tested once for the pair. The per-bit X
-        // mask of a packed value is `must ^ may`, which sits in the low W bits of
-        // `mm ^ (mm >> W)`. OR the two operands' masks and do a single nonzero
-        // test instead of checking a and b separately. (The values can't be merged
-        // before this step: X-ness is nonlinear, so OR-ing mm first is wrong.)
-        llvm::Value* xa      = b_.CreateXor(a.mm, b_.CreateLShr(a.mm, w));
-        llvm::Value* xb      = b_.CreateXor(b.mm, b_.CreateLShr(b.mm, w));
-        llvm::Value* xmask   = b_.CreateTrunc(b_.CreateOr(xa, xb), int_ty(w));
-        llvm::Value* unknown = b_.CreateICmpNE(xmask, zero(w));
+        llvm::Value* unknown = b_.CreateICmpNE(xz_mask(a, b, w), zero(w));
 
         auto* x_bb   = llvm::BasicBlock::Create(ctx_, "arith.x", fn_);
         auto* val_bb = llvm::BasicBlock::Create(ctx_, "arith.val", fn_);
@@ -3879,9 +4520,9 @@ private:
         llvm::BranchInst* br = b_.CreateCondBr(unknown, x_bb, val_bb);
         br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
 
-        // Cold: whole result is X = every bit (must 0, may 1) = the high-half ones.
+        // Cold: whole result is X.
         b_.SetInsertPoint(x_bb);
-        llvm::Value* x_mm = llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w));
+        llvm::Value* x_word = x_mm(w);
         b_.CreateBr(end_bb);
 
         // Hot: one W-bit op on the value, duplicated into both planes.
@@ -3905,7 +4546,7 @@ private:
 
         b_.SetInsertPoint(end_bb);
         llvm::PHINode* mm = b_.CreatePHI(wide, 2);
-        mm->addIncoming(x_mm, x_bb);
+        mm->addIncoming(x_word, x_bb);
         mm->addIncoming(val_mm, val_bb);
         return { mm, zero(w) };
     }
@@ -3932,10 +4573,7 @@ private:
         // both map to an all-X result, so a single not-taken branch is optimal. For
         // 2-state operands the X/Z half is statically zero and instcombine drops it,
         // leaving just `divisor == 0`.
-        llvm::Value* xa      = b_.CreateXor(a.mm, b_.CreateLShr(a.mm, w));
-        llvm::Value* xb      = b_.CreateXor(b.mm, b_.CreateLShr(b.mm, w));
-        llvm::Value* xmask   = b_.CreateTrunc(b_.CreateOr(xa, xb), int_ty(w));
-        llvm::Value* unknown = b_.CreateICmpNE(xmask, zero(w));
+        llvm::Value* unknown = b_.CreateICmpNE(xz_mask(a, b, w), zero(w));
         llvm::Value* divzero = b_.CreateICmpEQ(bm, zero(w));
         llvm::Value* cold    = b_.CreateOr(unknown, divzero);
 
@@ -3947,7 +4585,7 @@ private:
         br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
 
         b_.SetInsertPoint(x_bb);
-        llvm::Value* x_mm = llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w));
+        llvm::Value* x_word = x_mm(w);
         b_.CreateBr(end_bb);
 
         // Hot: divisor guaranteed nonzero. Unsigned is a direct udiv/urem. Signed
@@ -3974,7 +4612,7 @@ private:
 
         b_.SetInsertPoint(end_bb);
         llvm::PHINode* mm = b_.CreatePHI(wide, 2);
-        mm->addIncoming(x_mm, x_bb);
+        mm->addIncoming(x_word, x_bb);
         mm->addIncoming(val_mm, val_bb);
         return { mm, zero(w) };
     }
@@ -4011,7 +4649,7 @@ private:
         br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
 
         b_.SetInsertPoint(x_bb);
-        llvm::Value* x_mm = llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w));
+        llvm::Value* x_word = x_mm(w);
         b_.CreateBr(end_bb);
 
         // Hot: exponentiation by squaring at the result width W. Every product wraps
@@ -4057,7 +4695,7 @@ private:
 
         b_.SetInsertPoint(end_bb);
         llvm::PHINode* mm = b_.CreatePHI(wide, 2);
-        mm->addIncoming(x_mm, x_bb);
+        mm->addIncoming(x_word, x_bb);
         mm->addIncoming(val_mm, loop);
         return { mm, zero(w) };
     }
@@ -4102,12 +4740,8 @@ private:
         // is already the answer. Real designs hit that case ~all the time per site,
         // so guard the cheap path and fall back to the full unpack only on X. The
         // combined X-mask `u` is computed once for the test and reused by the slow
-        // path. The X-mask of a packed value is its low W bits of `mm ^ (mm >> W)`
-        // (must ^ may); X-ness is nonlinear, so each operand's mask is taken
-        // separately before OR-ing.
-        llvm::Value* xa    = b_.CreateXor(a.mm, b_.CreateLShr(a.mm, w));
-        llvm::Value* xb    = b_.CreateXor(b.mm, b_.CreateLShr(b.mm, w));
-        llvm::Value* u     = b_.CreateTrunc(b_.CreateOr(xa, xb), int_ty(w));
+        // path.
+        llvm::Value* u     = xz_mask(a, b, w);
         llvm::Value* known = b_.CreateICmpEQ(u, zero(w));
 
         auto* fast_bb = llvm::BasicBlock::Create(ctx_, "xor.known", fn_);
@@ -4491,13 +5125,6 @@ private:
         return packed(must, may, z);
     }
 
-    // -- Resize: truncate or extend all planes (sign per target). --
-
-    Plane lower_resize(Plane v, ValType from, ValType to) {
-        (void)from;
-        return cast_plane(v, to.width, to.is_signed);
-    }
-
     // -- Control flow: if/else with two regions. X/Z condition takes else. --
 
     void lower_cond(Index i) {
@@ -4565,24 +5192,40 @@ private:
     llvm::LLVMContext&      ctx_;
     llvm::Module&           llmod_;
     llvm::IRBuilder<>       b_;
-    // Total size of the opaque state buffer in bytes (min 1, rounded up to 8).
-    uint32_t                state_bytes_ = 1;
+    // The root `%clotho.state` struct: top-instance state structs, unscoped
+    // signals, then the NBA shadow struct (when the design has NBAs).
+    llvm::StructType*       state_ty_ = nullptr;
+    // The NBA shadow struct and its field index in the root (valid iff non-null).
+    llvm::StructType*       shadow_ty_    = nullptr;
+    uint32_t                shadow_field_ = 0;
+    // Slot-type memo, one `{ i(2W)[, iW] }` per (width, domain, has_z).
+    std::vector<std::tuple<uint32_t, bool, bool, llvm::StructType*>> slot_types_;
+    // Per-definition state-struct memo: (definition name, field types, type).
+    // Instances of one definition share the type; a same-named definition with
+    // different fields (different parameterization) gets its own entry.
+    std::vector<std::tuple<std::string, std::vector<llvm::Type*>, llvm::StructType*>> def_types_;
     std::vector<SignalSlot> slots_;
 
     // Function declarations, indexed by FunctionId; filled before any body is
     // lowered so calls (including recursive / forward) resolve.
     std::vector<llvm::Function*> fn_decls_;
     // Set while lowering a function or task body (null during a process). `frame_`
-    // is the current call's frame buffer; `frame_slots_` / `frame_bytes_` its
-    // layout. `cur_is_task_` selects the coroutine return path (epilogue) for Ret.
+    // is the current call's frame; `frame_slots_` / `frame_ty_` its layout.
+    // `cur_is_task_` selects the coroutine return path (epilogue) for Ret.
     const Function*         cur_fn_      = nullptr;
     bool                    cur_is_task_ = false;
+    // LLVM arg index of each of the current function/task's formals (see
+    // param_indices) — string formals make the stride non-uniform.
+    std::vector<uint32_t> param_llvm_index_;
     // Set while lowering a PreInit process: its stores apply variable declaration
     // initializers and must generate no events, so wait-queue servicing is skipped.
     bool                    lowering_preinit_ = false;
+    // Compile/simulation knobs (z elision, ...); see SimConfig.h.
+    SimulationConfig        config_;
     llvm::Value*            frame_       = nullptr;
     std::vector<FrameSlot>  frame_slots_;
-    uint32_t                frame_bytes_ = 1;
+    // The current function's frame struct (one field per Local, in order).
+    llvm::StructType*       frame_ty_    = nullptr;
     // While lowering a task: the shared copy-out + caller-resume epilogue block a
     // Ret branches to. The caller-side record slot { ptr parent } for task calls
     // this coroutine makes (a process or a task can be a task caller).
@@ -4657,6 +5300,13 @@ private:
     std::vector<Plane>                  values_;
     std::vector<std::optional<LValue>>  lvals_;
     std::vector<std::optional<ValType>> types_;
+    // rt_string handle pointers of string-valued instructions, parallel to
+    // values_ (a string never flows as a Plane).
+    std::vector<llvm::Value*> str_vals_;
+    // The current body's string rvalue temporaries, deinit'd at its exits.
+    std::vector<llvm::Value*> str_temp_list_;
+    // Memoized `%clotho.string` handle slot type.
+    llvm::StructType* str_slot_ty_ = nullptr;
 };
 
 // Lower the coroutine intrinsics emitted for each process. CoroSplit (with
@@ -4693,11 +5343,35 @@ bool lower_coroutines(llvm::Module& m) {
 
 } // namespace
 
-std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& ctx, bool optimize) {
+std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& ctx,
+                                           const SimulationConfig& config) {
     auto llmod = std::make_unique<llvm::Module>(m.name.empty() ? "clotho" : m.name, ctx);
 
+    // Pin the module to the host target's triple and DataLayout before any IR is
+    // built: the state/frame struct layouts, the NBA meta table's baked byte
+    // offsets, and load/store alignments are all DataLayout-derived, so they
+    // must be computed against the layout codegen will actually use.
+    {
+        static std::once_flag once;
+        std::call_once(once, [] { llvm::InitializeNativeTarget(); });
+        auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
+        if (!jtmb) {
+            llvm::errs() << "llvm backend: cannot detect host target: "
+                         << llvm::toString(jtmb.takeError()) << "\n";
+            return nullptr;
+        }
+        auto dl = jtmb->getDefaultDataLayoutForTarget();
+        if (!dl) {
+            llvm::errs() << "llvm backend: no host data layout: " << llvm::toString(dl.takeError())
+                         << "\n";
+            return nullptr;
+        }
+        llmod->setTargetTriple(jtmb->getTargetTriple());
+        llmod->setDataLayout(*dl);
+    }
+
     try {
-        Backend(m, ctx, *llmod).run();
+        Backend(m, ctx, *llmod, config).run();
     } catch (const BackendError& e) {
         llvm::errs() << "llvm backend error: " << e.message << "\n";
         return nullptr;
@@ -4708,7 +5382,7 @@ std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& c
     if (llvm::verifyModule(*llmod, &llvm::errs())) {
         return nullptr;
     }
-    if (!optimize) {
+    if (!config.optimize) {
         return llmod;
     }
     // Lower the coroutines and verify again — the second pass guards against
@@ -4723,9 +5397,9 @@ std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& c
     return llmod;
 }
 
-bool emit_llvm(const Module& m, llvm::raw_ostream& os, bool optimize) {
+bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config) {
     llvm::LLVMContext ctx;
-    auto              llmod = build_module(m, ctx, optimize);
+    auto              llmod = build_module(m, ctx, config);
     if (!llmod) {
         return false;
     }

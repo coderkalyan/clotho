@@ -13,14 +13,16 @@
 // then JIT-compile and run it (default), or emit the process IR / LLVM IR for
 // debugging. All compiler logic lives in libclotho / libclotho_ir.
 //
-// Usage: clotho [--emit=run|ir|llvm|opt] [--time] [-o <out>] <file.sv>
+// Usage: clotho [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [-o <out>] <file.sv>
 // `llvm` emits the backend's raw IR before the coroutine-lowering pipeline runs
 // (coro intrinsics intact) — for manual review; `opt` emits it after the passes.
+// `--no-z-elision` keeps every signal slot's z word (bisection / debug).
 int main(int argc, char** argv) {
-    std::string_view emit = "run";
-    std::string_view out;
-    std::string_view input;
-    bool             time = false;
+    std::string_view            emit = "run";
+    std::string_view            out;
+    std::string_view            input;
+    bool                        time = false;
+    clotho::ir::SimulationConfig config;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
@@ -28,6 +30,8 @@ int main(int argc, char** argv) {
             emit = arg.substr(7);
         } else if (arg == "--time") {
             time = true;
+        } else if (arg == "--no-z-elision") {
+            config.z_elision = false;
         } else if (arg == "-o" && i + 1 < argc) {
             out = argv[++i];
         } else if (!arg.starts_with("-")) {
@@ -39,7 +43,8 @@ int main(int argc, char** argv) {
     }
 
     if (input.empty() || (emit != "run" && emit != "ir" && emit != "llvm" && emit != "opt")) {
-        std::println(stderr, "usage: {} [--emit=run|ir|llvm|opt] [--time] [-o <out>] <file.sv>", argv[0]);
+        std::println(stderr, "usage: {} [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [-o <out>] <file.sv>",
+                     argv[0]);
         return 2;
     }
 
@@ -73,7 +78,7 @@ int main(int argc, char** argv) {
     }
 
     if (emit == "run") {
-        const int rc = clotho::ir::run_jit(*result.module, tp);
+        const int rc = clotho::ir::run_jit(*result.module, tp, config);
         report();
         return rc;
     }
@@ -85,10 +90,10 @@ int main(int argc, char** argv) {
     }
 
     // emit == "llvm" (raw backend output) or "opt" (after the coroutine passes).
-    const bool optimize = emit == "opt";
-    bool       ok       = false;
+    config.optimize = emit == "opt";
+    bool ok         = false;
     if (out.empty()) {
-        ok = clotho::ir::emit_llvm(*result.module, llvm::outs(), optimize);
+        ok = clotho::ir::emit_llvm(*result.module, llvm::outs(), config);
     } else {
         std::error_code      ec;
         llvm::raw_fd_ostream os(out, ec);
@@ -96,7 +101,7 @@ int main(int argc, char** argv) {
             std::println(stderr, "cannot open '{}': {}", out, ec.message());
             return 1;
         }
-        ok = clotho::ir::emit_llvm(*result.module, os, optimize);
+        ok = clotho::ir::emit_llvm(*result.module, os, config);
     }
     report();
     return ok ? 0 : 1;

@@ -15,9 +15,10 @@ namespace clotho::ir {
 
 InternPool::InternPool()
   : set_(0, Hash{ &items_, &value_bytes_ }, Eq{ &items_, &value_bytes_ }) {
-    void_type  = put(Type{ .kind = Type::Kind::Void });
-    logic_type = put(Type{ .kind = Type::Kind::Logic });
-    bit_type   = put(Type{ .kind = Type::Kind::Bit });
+    void_type   = put(Type{ .kind = Type::Kind::Void });
+    logic_type  = put(Type{ .kind = Type::Kind::Logic });
+    bit_type    = put(Type{ .kind = Type::Kind::Bit });
+    string_type = put(Type{ .kind = Type::Kind::String });
 }
 
 Ref InternPool::put(const Item& item) {
@@ -62,11 +63,20 @@ Ref InternPool::put_int(Ref type, uint64_t bits) {
     const uint64_t mask = lay.width >= 64 ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << lay.width) - 1);
     const uint64_t val  = bits & mask;
 
-    // Val plane holds the known bits; any xz plane stays zero (all bits known).
-    std::array<uint8_t, 16> buf{};
-    std::memcpy(buf.data(), &val, pb);
+    // Val plane holds the known bits, zero-extended to the plane width; any xz
+    // plane stays zero (all bits known). A >64-bit type needs a plane wider
+    // than the source word, so only the low sizeof(val) bytes are copied and a
+    // wide value takes the heap buffer.
+    const size_t copy = std::min<size_t>(pb, sizeof(val));
+    if (lay.byte_count <= 16) {
+        std::array<uint8_t, 16> buf{};
+        std::memcpy(buf.data(), &val, copy);
+        return put_value(type, { buf.data(), lay.byte_count });
+    }
+    std::vector<uint8_t> buf(lay.byte_count, 0);
+    std::memcpy(buf.data(), &val, copy);
 
-    return put_value(type, { buf.data(), lay.byte_count });
+    return put_value(type, buf);
 }
 
 const Item& InternPool::get(Ref ref) const {
@@ -93,6 +103,11 @@ Layout InternPool::layout(Ref type) const {
             const auto     bytes = static_cast<uint32_t>(static_cast<uint8_t>(el.domain)) * plane_bytes(width);
             return { el.domain, width, bytes };
         }
+        case Type::Kind::String:
+            // Not plane-sized: a string is an opaque runtime handle, and an
+            // interned string constant's bytes are its characters (any length).
+            // Width 0 is the sentinel; consumers branch on the kind first.
+            return { Domain::Two, 0, 0 };
         case Type::Kind::UnpackedArray: {
             // Report the leaf element's domain / width (recursion drills through
             // nested arrays), so callers sizing a per-element access see the

@@ -144,8 +144,10 @@ private:
 template<class... Args>
 class Wheel {
 public:
-    using Timer    = clotho::Timer;
-    using Callback = void (*)(Timer&, Args...);
+    using Timer = clotho::Timer;
+    // Pointer (not reference) parameter so the runtime's C-ABI mirror callback
+    // type is token-identical and the cross-ABI cast stays warning-free.
+    using Callback = void (*)(Timer*, Args...);
 
     static constexpr uint64_t slots = WheelImpl::slots;
 
@@ -171,7 +173,7 @@ public:
         while (t != nullptr) {
             Timer* next = t->next;
             t->next     = nullptr;
-            reinterpret_cast<Callback>(t->on_expire)(*t, args...);
+            reinterpret_cast<Callback>(t->on_expire)(t, args...);
             t = next;
         }
     }

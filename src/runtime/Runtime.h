@@ -16,9 +16,11 @@ extern "C" {
 // pattern, `xz` marks unknown bits (X or Z), and `z` marks the high-impedance
 // subset (z is a subset of xz). Only the low `width` bits are significant.
 typedef struct rt_arg {
-    // Significant bit width of the value.
+    // Significant bit width of the value (0 for a string handle).
     uint32_t width;
     // Bit 0: the value is signed (drives %d sign-extension).
+    // Bit 1: `val` carries an rt_string* (a %s string-object argument); the
+    //        width/xz/z fields are meaningless.
     uint32_t flags;
     // Value plane (definitely-1 bits) in the low `width` bits.
     uint64_t val;
@@ -55,14 +57,22 @@ void rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uin
 
 // -- Simulation control --
 //
-// $finish / $stop: end the simulation and exit the process. LRM 1800-2023 §20.2
-// defines $stop as suspending simulation and $finish as exiting to the OS; it
-// mandates no interactive mode. Clotho has no mechanism to resume a suspended
-// run, so a suspend that can never resume is observationally identical to exit,
-// and $stop is treated identically to $finish. Does not return.
+// $finish / $stop: end the simulation. LRM 1800-2023 §20.2 defines $stop as
+// suspending simulation and $finish as exiting to the OS; it mandates no
+// interactive mode. Clotho has no mechanism to resume a suspended run, so a
+// suspend that can never resume is observationally identical to exit, and $stop
+// is treated identically to $finish. Never returns to the caller: control
+// transfers to the host installed by rt_finish_host (run_jit), or the process
+// exits when no host is installed.
 // TODO: the optional diagnostic-level argument (0/1/2) that controls exit-message
 // verbosity is accepted at the frontend but ignored here.
 [[noreturn]] void rt_finish(void);
+
+// Install (or clear, with null) the setjmp target rt_finish longjmps to, so a
+// $finish ends only the simulation, not the embedding process (the test binary
+// runs many simulations). The jump abandons live coroutine frames — acceptable,
+// the simulation is over. `env` points at a std::jmp_buf.
+void rt_finish_host(void* env);
 
 // -- File I/O (LRM 1800-2023 §21.3) --
 //
@@ -169,10 +179,12 @@ void rt_fflush(int32_t desc);
 
 // $readmemh / $readmemb (LRM 1800-2023 §21.4): load a hex/binary text file into an
 // unpacked-array memory. `path_buf`/`path_len` carry the filename as a packed-ASCII
-// vector; `mm_base`/`z_base` point at element 0's must|may and z words in the state
-// buffer, strided by `stride`; `count`/`width` describe the memory; `decl_left`/
-// `decl_right` are its declared address bounds (for `@addr` and start/finish
-// mapping). `flags` bit0=hex, bit1=has_start, bit2=has_finish, bit3=four_state.
+// vector, or as bytes in natural order when flags bit4 is set (a string-object
+// filename); `mm_base`/`z_base` point at element 0's must|may and z words in the
+// state buffer, strided by `stride` (`z_base` is null when the memory's slot stores
+// no z word); `count`/`width` describe the memory; `decl_left`/`decl_right` are its
+// declared address bounds (for `@addr` and start/finish mapping). `flags` bit0=hex,
+// bit1=has_start, bit2=has_finish, bit3=four_state, bit4=path_forward.
 void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8_t* z_base, uint32_t stride,
                 uint32_t count, uint32_t width, int64_t decl_left, int64_t decl_right, int64_t start,
                 int64_t finish, uint32_t flags);
@@ -200,7 +212,8 @@ int32_t rt_random(void);
 // Append one deferred element write. `sig` identifies the array signal (for
 // post-commit wake servicing). `mm_ptr` / `z_ptr` point at the live element's
 // must|may and z words; `*_val` are the bits to write and `*_mask` selects which
-// bits (1 => take from val), each `*_bytes` long.
+// bits (1 => take from val), each `*_bytes` long. A target whose slot stores no
+// z word passes `z_ptr` null with `z_bytes` 0.
 void rt_nba_arr_push(uint32_t sig, void* mm_ptr, const void* mm_val, const void* mm_mask, uint32_t mm_bytes,
                      void* z_ptr, const void* z_val, const void* z_mask, uint32_t z_bytes);
 
@@ -219,6 +232,84 @@ int rt_nba_arr_dirty(uint32_t sig);
 
 // Drop all queued writes (called after a commit + wake pass).
 void rt_nba_arr_reset(void);
+
+// -- SystemVerilog string objects --
+//
+// The dynamic `string` type (LRM §6.16). A string value lives in a fixed
+// 32-byte caller-owned handle embedded in design state (same ownership model as
+// rt_wheel): small strings are stored inline in the handle, larger ones spill
+// to a heap buffer the handle owns. Copies are eager deep copies; handles never
+// share storage. A handle must be constructed with rt_string_init before any
+// other call and released with rt_string_deinit. Every operation that writes a
+// destination handle requires it already constructed and reuses its existing
+// capacity, so steady-state reassignment in a loop does not allocate.
+typedef struct rt_string {
+    alignas(8) unsigned char storage[32];
+} rt_string;
+
+// Construct the empty string "" in caller-owned storage. Never allocates.
+void rt_string_init(rt_string* s);
+
+// Release any heap buffer owned by `s`. The caller still owns the handle
+// storage; `s` is left as a valid empty string, so deinit is idempotent.
+void rt_string_deinit(rt_string* s);
+
+// dst = src (deep copy). dst == src is a no-op.
+void rt_string_assign(rt_string* dst, const rt_string* src);
+
+// dst = the `n` bytes at `p`. `p` is a raw byte sequence, not NUL-terminated;
+// it may alias dst's own buffer.
+void rt_string_assign_bytes(rt_string* dst, const char* p, uint64_t n);
+
+// Length in bytes ($.len()). The empty string has length 0.
+uint64_t rt_string_len(const rt_string* s);
+
+// Pointer to the string's bytes (not NUL-terminated; length via rt_string_len).
+// Valid until the next mutation of `s`.
+const char* rt_string_data(const rt_string* s);
+
+// dst = parts[0] .. parts[n-1] concatenated. dst may appear among the parts
+// (a = {a, b}).
+void rt_string_concat(rt_string* dst, const rt_string* const* parts, uint32_t n);
+
+// dst = src repeated `count` times ({count{src}}); count == 0 yields "".
+void rt_string_repl(rt_string* dst, const rt_string* src, uint64_t count);
+
+// Lexicographic comparison in strcmp order over (bytes, then length): returns
+// < 0, 0, or > 0. The LRM (§6.16.9) specifies only the sign.
+int32_t rt_string_cmp(const rt_string* a, const rt_string* b);
+
+// rt_string_cmp over ASCII-lowercased operands ($.icompare()).
+int32_t rt_string_icmp(const rt_string* a, const rt_string* b);
+
+// dst = src.substr(i, j): the bytes at positions i..j inclusive, or "" when the
+// range is invalid (i < 0, j < i, or j >= len; LRM §6.16.8).
+void rt_string_substr(rt_string* dst, const rt_string* src, int32_t i, int32_t j);
+
+// dst = src with ASCII letters upper/lowercased. dst may alias src.
+void rt_string_toupper(rt_string* dst, const rt_string* src);
+void rt_string_tolower(rt_string* dst, const rt_string* src);
+
+// s[i] = c ($.putc()): a no-op when i is out of range or (c & 0xff) == 0 — a
+// string never contains a 0 byte (LRM §6.16.2).
+void rt_string_putc(rt_string* s, int32_t i, uint32_t c);
+
+// s[i] ($.getc()): the byte at i, or 0 when i is out of range (LRM §6.16.3).
+uint32_t rt_string_getc(const rt_string* s, int32_t i);
+
+// string'(value): `val` is the little-endian val plane of a packed value,
+// plane_bytes(width_bits) long. Bytes are taken most-significant first and
+// every 0x00 byte is dropped (LRM §6.16: the integral value converts as a
+// string literal, and literal conversion removes \0 characters). X/Z bits are
+// read as 0 — the caller passes the val plane only.
+void rt_string_from_packed(rt_string* dst, const uint8_t* val, uint32_t width_bits);
+
+// Packed-integral cast of a string: writes the little-endian val plane of the
+// result into `out`, which is plane_bytes(width_bits) long. Characters pack
+// most-significant first, right-justified: truncated on the left when the
+// string is longer than the width, zero-filled on the left when shorter
+// (LRM §6.16).
+void rt_string_to_packed(const rt_string* s, uint8_t* out, uint32_t width_bits);
 
 // -- Coroutine frame allocation --
 //

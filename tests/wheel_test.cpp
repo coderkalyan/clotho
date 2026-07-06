@@ -31,12 +31,12 @@ struct Awaiter {
 };
 
 // Recover the owning Awaiter from its embedded Timer node.
-Awaiter& owner(Timer& t) {
-    return *reinterpret_cast<Awaiter*>(reinterpret_cast<char*>(&t) - offsetof(Awaiter, timer));
+Awaiter& owner(Timer* t) {
+    return *reinterpret_cast<Awaiter*>(reinterpret_cast<char*>(t) - offsetof(Awaiter, timer));
 }
 
 // Mark the owner fired and log the order it fired in.
-void record(Timer& t, Context& c) {
+void record(Timer* t, Context& c) {
     Awaiter& a = owner(t);
     a.fired    = true;
     a.fired_at = c.wheel->now();
@@ -44,10 +44,10 @@ void record(Timer& t, Context& c) {
 }
 
 // Re-arm self three ticks out, up to three times.
-void rearm(Timer& t, Context& c) {
+void rearm(Timer* t, Context& c) {
     c.order.push_back(static_cast<int>(c.wheel->now()));
     if (++c.rearm_count < 3) {
-        c.wheel->schedule(t, c.wheel->now() + 3, &rearm);
+        c.wheel->schedule(*t, c.wheel->now() + 3, &rearm);
     }
 }
 

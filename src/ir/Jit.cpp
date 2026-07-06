@@ -1,5 +1,6 @@
 #include "Jit.h"
 
+#include <csetjmp>
 #include <memory>
 #include <mutex>
 
@@ -36,7 +37,7 @@ void ensure_native_target() {
 
 } // namespace
 
-int run_jit(const Module& m, Timings* timings) {
+int run_jit(const Module& m, Timings* timings, const SimulationConfig& config) {
     ensure_native_target();
 
     // LLVM compile phase: build the module (IR gen + coroutine/opt passes), then
@@ -46,7 +47,12 @@ int run_jit(const Module& m, Timings* timings) {
     // Each run owns its context: the design module is built into it, then both
     // are moved into a ThreadSafeModule the JIT takes over.
     auto ctx = std::make_unique<llvm::LLVMContext>();
-    auto mod = build_module(m, *ctx);
+    // The JIT needs runnable code: coroutine lowering is mandatory regardless
+    // of what the caller's config says (optimize=false is an emit_llvm
+    // inspection mode).
+    SimulationConfig jit_config = config;
+    jit_config.optimize         = true;
+    auto mod                    = build_module(m, *ctx, jit_config);
     if (!mod) {
         return -1; // build_module already reported the reason.
     }
@@ -108,6 +114,23 @@ int run_jit(const Module& m, Timings* timings) {
     expose("rt_nba_arr_commit", &rt_nba_arr_commit);
     expose("rt_nba_arr_dirty", &rt_nba_arr_dirty);
     expose("rt_nba_arr_reset", &rt_nba_arr_reset);
+    expose("rt_string_init", &rt_string_init);
+    expose("rt_string_deinit", &rt_string_deinit);
+    expose("rt_string_assign", &rt_string_assign);
+    expose("rt_string_assign_bytes", &rt_string_assign_bytes);
+    expose("rt_string_len", &rt_string_len);
+    expose("rt_string_data", &rt_string_data);
+    expose("rt_string_concat", &rt_string_concat);
+    expose("rt_string_repl", &rt_string_repl);
+    expose("rt_string_cmp", &rt_string_cmp);
+    expose("rt_string_icmp", &rt_string_icmp);
+    expose("rt_string_substr", &rt_string_substr);
+    expose("rt_string_toupper", &rt_string_toupper);
+    expose("rt_string_tolower", &rt_string_tolower);
+    expose("rt_string_putc", &rt_string_putc);
+    expose("rt_string_getc", &rt_string_getc);
+    expose("rt_string_from_packed", &rt_string_from_packed);
+    expose("rt_string_to_packed", &rt_string_to_packed);
     expose("rt_wheel_init", &rt_wheel_init);
     expose("rt_wheel_deinit", &rt_wheel_deinit);
     expose("rt_wheel_now", &rt_wheel_now);
@@ -149,9 +172,19 @@ int run_jit(const Module& m, Timings* timings) {
         timings->llvm_ms += ms_since(t_llvm);
     }
 
-    // Simulation phase: run the compiled design.
-    const auto t_sim = std::chrono::steady_clock::now();
-    const int  rc    = fn();
+    // Simulation phase: run the compiled design. A $finish longjmps back here
+    // (rt_finish is noreturn to the design) so the embedding process survives;
+    // the sim's live coroutine frames are abandoned, which is fine — it is over.
+    const auto   t_sim = std::chrono::steady_clock::now();
+    std::jmp_buf finish_env;
+    // Volatile: an auto variable modified between setjmp and longjmp is
+    // otherwise indeterminate after the jump.
+    volatile int rc = 0;
+    if (setjmp(finish_env) == 0) {
+        rt_finish_host(&finish_env);
+        rc = fn();
+    }
+    rt_finish_host(nullptr);
     if (timings != nullptr) {
         timings->sim_ms += ms_since(t_sim);
     }

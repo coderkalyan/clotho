@@ -1,6 +1,8 @@
 #include <doctest/doctest.h>
 
 #include <cstdio>
+#include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -9,8 +11,10 @@
 #include <llvm/Support/raw_ostream.h>
 
 #include "Lower.h"
+#include "ir/Builder.h"
 #include "ir/Jit.h"
 #include "ir/LlvmBackend.h"
+#include "ir/Module.h"
 
 using namespace clotho;
 
@@ -98,10 +102,10 @@ constexpr std::string_view kAlu = R"(
 TEST_CASE("alu emits verifiable llvm ir") {
     const std::string ir = emit(kAlu);
 
-    // State is an opaque byte buffer, not a typed LLVM struct: main stack-
-    // allocates an `[N x i8]` and there is no named `%alu.state` type.
-    CHECK(ir.find("alloca [") != std::string::npos);
-    CHECK(ir.find("%alu.state") == std::string::npos);
+    // State is typed: the module definition gets a named state struct, the root
+    // %clotho.state composes it, and main stack-allocates the root type.
+    CHECK(ir.find("%alu.state = type") != std::string::npos);
+    CHECK(ir.find("alloca %clotho.state") != std::string::npos);
 
     // One coroutine per process, named @<module>.p<index>: two combinational
     // assigns + one sequential always block. Each is a switched-resume coroutine
@@ -115,8 +119,8 @@ TEST_CASE("alu emits verifiable llvm ir") {
     CHECK(ir.find(" add ") != std::string::npos);
     CHECK(ir.find(" sub ") != std::string::npos);
 
-    // Signal access via constant-offset i8 GEP + load/store.
-    CHECK(ir.find("getelementptr inbounds i8, ptr") != std::string::npos);
+    // Signal access via constant-index typed GEPs into the state structs.
+    CHECK(ir.find("getelementptr inbounds %clotho.state, ptr") != std::string::npos);
     CHECK(ir.find("store i8") != std::string::npos);
 
     // The if/else lowers to branches.
@@ -137,15 +141,44 @@ TEST_CASE("2-state vs 4-state widths") {
     )";
     const std::string          ir  = emit(src);
 
-    // No typed value/state struct — state is laid out by clotho into an opaque
-    // byte buffer (the only named types are coroutine frames, an unrelated
-    // lowering artifact). The 4-state z (logic[7:0], align 2) packs ahead of the
-    // 2-state x/y (bit[3:0], align 1); the buffer is 8 bytes, align 8.
-    CHECK(ir.find("%m.state") == std::string::npos);
-    CHECK(ir.find("alloca [8 x i8], align 8") != std::string::npos);
-    // z's must|may word sits first at offset 0 as an i16 (2W = 16).
+    // Every signal keeps its LLVM slot type, named per (domain, width) — and
+    // the module's state struct lists them in declaration order: x, y
+    // (bit[3:0]) then z (logic[7:0]). No signal here can carry z, so every
+    // slot is the elided `.nz` form: just the i(2W) must|may word, no z word.
+    CHECK(ir.find("%m.state = type { %bit.nz.4, %bit.nz.4, %logic.nz.8 }") != std::string::npos);
+    CHECK(ir.find("%bit.nz.4 = type { i8 }") != std::string::npos);
+    CHECK(ir.find("%logic.nz.8 = type { i16 }") != std::string::npos);
+    CHECK(ir.find("alloca %clotho.state") != std::string::npos);
+    // z's must|may word is an i16 (2W = 16).
     CHECK(ir.find("store i16") != std::string::npos);
     CHECK(ir.find("define ptr @m.") != std::string::npos);
+}
+
+TEST_CASE("instance state structs compose nested and replicate per instantiation") {
+    constexpr std::string_view src = R"(
+        module leaf(input logic a, output logic [7:0] q);
+            logic [7:0] cnt;
+            always @(posedge a) cnt <= cnt + 8'd1;
+            assign q = cnt;
+        endmodule
+        module top;
+            logic clk;
+            logic [7:0] q0, q1;
+            leaf u0(.a(clk), .q(q0));
+            leaf u1(.a(clk), .q(q1));
+        endmodule
+    )";
+    const std::string          ir  = emit(src);
+
+    // One state struct per module definition; the parent embeds one field per
+    // child instance (two %leaf.state replicas), and the root composes the top
+    // instance plus the NBA shadow region. No z sources → every slot elided.
+    CHECK(ir.find("%leaf.state = type { %logic.nz.1, %logic.nz.8, %logic.nz.8 }") != std::string::npos);
+    CHECK(ir.find("%top.state = type { %logic.nz.1, %logic.nz.8, %logic.nz.8, %leaf.state, %leaf.state }") !=
+          std::string::npos);
+    CHECK(ir.find("%clotho.state = type { %top.state, %clotho.nba.shadow }") != std::string::npos);
+    // Exactly one definition of the leaf struct type (deduplicated, no .0 clone).
+    CHECK(ir.find("%leaf.state.0") == std::string::npos);
 }
 
 TEST_CASE("single-bit xor uses the packed truth-table immediate") {
@@ -1699,6 +1732,51 @@ TEST_CASE("$readmemb parses x/z and a runtime-string filename") {
     std::remove(path);
 }
 
+// A string-variable filename (LRM §21.4: the filename may be a string data type)
+// resolves through the rt_string handle at run time; the bytes are in natural
+// order, unlike the reversed packed-ASCII form. Cross-checked against Icarus
+// Verilog. Regression: this previously crashed the compiler (null value plane).
+TEST_CASE("$readmemh accepts a string-variable filename") {
+    const char* path = "clotho_readmemh_strvar_test.hex";
+    write_file(path, "de ad be ef\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] mem [0:3];
+            string fname;
+            initial begin
+                fname = ")") + path + R"(";
+                $readmemh(fname, mem);
+                $display("%h %h %h %h", mem[0], mem[1], mem[2], mem[3]);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "de ad be ef\n");
+    std::remove(path);
+}
+
+// A string-expression filename (a concatenation) is also legal per LRM §21.4:
+// "The filename is an expression that is a string literal, string data type, or
+// an integral data type". Cross-checked against Icarus Verilog.
+TEST_CASE("$readmemh accepts a string-expression filename") {
+    const char* path = "clotho_readmemh_strexpr_test.hex";
+    write_file(path, "12 34\n");
+    const std::string src = R"(
+        module m;
+            logic [7:0] mem [0:1];
+            string base;
+            initial begin
+                base = "clotho_readmemh_strexpr_test";
+                $readmemh({base, ".hex"}, mem);
+                $display("%h %h", mem[0], mem[1]);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "12 34\n");
+    std::remove(path);
+}
+
 // Default load fills from the lowest address upward regardless of the declared
 // range direction; a descending range [3:0] therefore maps the first datum to
 // address 0 (storage slot 3). This is the LRM §21.4 rule, which Icarus follows and
@@ -2084,4 +2162,266 @@ TEST_CASE("$ftell / $fseek / $rewind") {
     )";
     CHECK(run_capture(src) == "3 0 7 7 0 0\n");
     std::remove(path);
+}
+
+// -- Z elision --
+//
+// Signals the may-z analysis proves z-free store no z word (%logic.nz.W slots);
+// signals that can carry z keep the full slot and must round-trip z bit-exact.
+
+TEST_CASE("a z-carrying signal keeps its z word and round-trips z through copies") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] v = 4'bz01x;
+            logic [3:0] y;
+            logic [3:0] clean = 4'b1010;
+            assign y = v;
+            initial begin
+                #1 $display("%b %b %b", v, y, clean);
+                $display("%b %b", v === 4'bz01x, y === 4'bz01x);
+                casez (y)
+                    4'bz01?: $display("casez hit");
+                    default: $display("casez miss");
+                endcase
+            end
+        endmodule
+    )";
+    const std::string ir = emit(src);
+    // v and y carry z (full slot); clean is proven never-z (elided slot).
+    CHECK(ir.find("%logic.4 = type { i8, i4 }") != std::string::npos);
+    CHECK(ir.find("%logic.nz.4 = type { i8 }") != std::string::npos);
+    CHECK(run_capture(src) == "z01x z01x 1010\n1 1\ncasez hit\n");
+}
+
+TEST_CASE("NBA of a z value round-trips the shadow commit; never-z NBAs use the .noz bucket") {
+    constexpr std::string_view src = R"(
+        module m;
+            reg clk = 0;
+            logic [3:0] zq;
+            logic [3:0] nq;
+            logic [3:0] zsrc = 4'bzz01;
+            always @(posedge clk) begin
+                zq <= zsrc;
+                nq <= nq === 4'bxxxx ? 4'd5 : nq + 1;
+            end
+            initial begin
+                #1 clk = 1;
+                #1 $display("%b %b", zq, nq);
+                $finish;
+            end
+        endmodule
+    )";
+    const std::string ir = emit(src);
+    // Same width, different z-ness: two distinct commit buckets.
+    CHECK(ir.find("clotho.nba.w4.full = ") != std::string::npos);
+    CHECK(ir.find("clotho.nba.w4.full.noz = ") != std::string::npos);
+    CHECK(run_capture(src) == "zz01 0101\n");
+}
+
+TEST_CASE("partial NBA merges z bits into a z-carrying target") {
+    constexpr std::string_view src = R"(
+        module m;
+            reg clk = 0;
+            logic [3:0] q = 4'b0000;
+            always @(posedge clk) q[2:1] <= 2'bz0;
+            initial begin
+                #1 clk = 1;
+                #1 $display("%b", q);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "0z00\n");
+}
+
+TEST_CASE("array NBA works against a never-z memory and keeps z in a 4-state one") {
+    constexpr std::string_view src = R"(
+        module m;
+            reg clk = 0;
+            bit   [7:0] mem2 [0:1];
+            logic [7:0] mem4 [0:1];
+            always @(posedge clk) begin
+                mem2[0] <= 8'hA5;
+                mem4[1] <= 8'bzz01zz10;
+            end
+            initial begin
+                #1 clk = 1;
+                #1 $display("%h %h %b", mem2[0], mem2[1], mem4[1]);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a5 00 zz01zz10\n");
+}
+
+TEST_CASE("$readmem with z digits into a 2-state memory reads 0 and spares neighbors") {
+    const char* path = "clotho_readmem_2state_z.hex";
+    write_file(path, "zz 5a z1\n");
+    const std::string src = std::string(R"(
+        module m;
+            bit [7:0] mem [0:2];
+            initial begin
+                $readmemh(")") + path + R"(", mem);
+                $display("%h %h %h", mem[0], mem[1], mem[2]);
+                $finish;
+            end
+        endmodule
+    )";
+    // z reads as 0 in a 2-state memory (elided z plane, null z_base); the
+    // neighboring elements' must|may words must be untouched by the skipped
+    // z writes.
+    CHECK(run_capture(src) == "00 5a 01\n");
+    std::remove(path);
+}
+
+TEST_CASE("a task output formal carries z back to the caller") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] zdst;
+            logic [3:0] cdst;
+            task automatic zt(output logic [3:0] o);
+                o = 4'bz111;
+            endtask
+            task automatic ct(input logic [3:0] a, output logic [3:0] o);
+                o = a + 1;
+            endtask
+            initial begin
+                zt(zdst);
+                ct(4'd6, cdst);
+                $display("%b %d", zdst, cdst);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "z111 7\n");
+}
+
+TEST_CASE("a function returning z feeds a z-capable target") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic logic [3:0] zfn(input logic [3:0] x);
+                return { 2'bz0, x[1:0] };
+            endfunction
+            logic [3:0] r;
+            initial begin
+                r = zfn(4'b0011);
+                $display("%b", r);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "z011\n");
+}
+
+TEST_CASE("--no-z-elision keeps every slot's z word") {
+    constexpr std::string_view src = R"(
+        module m(input bit [3:0] x, output bit [3:0] y);
+            initial y = x + 1;
+        endmodule
+    )";
+    const LowerResult r = lower_text(src);
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    std::string              text;
+    llvm::raw_string_ostream os(text);
+    REQUIRE(ir::emit_llvm(*r.module, os, { .optimize = false, .z_elision = false }));
+    CHECK(text.find("%bit.4 = type { i8, i4 }") != std::string::npos);
+    CHECK(text.find(".nz.") == std::string::npos);
+}
+
+TEST_CASE("an undriven 4-state net powers up z, an undriven variable x (LRM 6.6)") {
+    constexpr std::string_view src = R"(
+        module m;
+            wire  [3:0] w;
+            logic [3:0] v;
+            wire  eqz = w === 4'bzzzz;
+            initial #1 $display("%b %b %b", w, v, eqz);
+        endmodule
+    )";
+    // Verified against iverilog: undriven net z, undriven variable x.
+    CHECK(run_capture(src) == "zzzz xxxx 1\n");
+}
+
+TEST_CASE("undriven top-level input ports read z") {
+    constexpr std::string_view src = R"(
+        module m(input [3:0] a, input [3:0] b);
+            wire r = a === b;
+            initial #1 $display("%b %b", a, r);
+        endmodule
+    )";
+    CHECK(run_capture(src) == "zzzz 1\n");
+}
+
+TEST_CASE("an unconnected child input port reads z inside the child") {
+    constexpr std::string_view src = R"(
+        module child(input [3:0] i);
+            initial #1 $display("%b", i);
+        endmodule
+        module top;
+            child c();
+        endmodule
+    )";
+    CHECK(run_capture(src) == "zzzz\n");
+}
+
+TEST_CASE("non-wire net kinds fail loudly") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            wand w;
+        endmodule
+    )");
+    CHECK(!r.ok);
+    CHECK(r.diagnostics.find("unsupported net type") != std::string::npos);
+}
+
+// The frontend cannot produce string IR yet, so build a module by hand: a
+// string signal assigned a literal, then len / toupper / getc observed through
+// $display. Exercises the string slot layout, startup init / teardown deinit,
+// temps, and the rt_string_* call lowering end to end.
+TEST_CASE("backend lowers string signals, constants, and string ops (hand-built IR)") {
+    using namespace clotho::ir;
+
+    auto mod  = std::make_unique<Module>();
+    mod->name = "m";
+    const Signal s =
+      mod->add_signal({ .name = "s", .type = mod->pool.string_type, .dir = SignalInfo::Direction::Internal });
+
+    Builder         b(mod->pool);
+    const SourceLoc loc{ 1 };
+    const auto      chars = std::string_view{ "Hello" };
+    const Ref       lit   = mod->pool.put_value(
+      mod->pool.string_type, { reinterpret_cast<const uint8_t*>(chars.data()), chars.size() });
+    const Ref int_ty =
+      mod->pool.put(Type{ .kind = Type::Kind::PackedArray, .is_signed = true, .element = mod->pool.bit_type,
+                          .left = 31, .right = 0 });
+
+    const Index sig = b.signal(s, loc);
+    const Index k   = b.constant(lit, loc);
+    b.binary(Inst::Tag::Store, sig, k, loc);
+    const Index v   = b.unary(Inst::Tag::Load, sig, loc);
+    const Index len = b.unary(Inst::Tag::StrLen, v, loc);
+    b.display("%0d", true, std::span<const Index>{ &len, 1 }, loc);
+    const Index up  = b.unary(Inst::Tag::StrUpper, v, loc);
+    const Index idx = b.constant(mod->pool.put_int(int_ty, 4), loc);
+    const Index ch  = b.binary(Inst::Tag::StrGetc, up, idx, loc);
+    b.display("%c", true, std::span<const Index>{ &ch, 1 }, loc);
+
+    mod->add_process(Process{ .activation = Activation::Initial, .ir = b.finish() });
+
+    std::FILE* tmp = std::tmpfile();
+    REQUIRE(tmp != nullptr);
+    std::fflush(stdout);
+    const int saved = dup(fileno(stdout));
+    dup2(fileno(tmp), fileno(stdout));
+    run_jit(*mod);
+    std::fflush(stdout);
+    dup2(saved, fileno(stdout));
+    close(saved);
+
+    std::rewind(tmp);
+    std::string out;
+    char        buf[64];
+    size_t      n;
+    while ((n = std::fread(buf, 1, sizeof(buf), tmp)) > 0) {
+        out.append(buf, n);
+    }
+    std::fclose(tmp);
+    CHECK(out == "5\nO\n");
 }

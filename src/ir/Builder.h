@@ -61,6 +61,14 @@ public:
     // `step_region` is the per-iteration update (empty for while / forever).
     Index loop(ExtraSlice cond_region, Index pred, ExtraSlice body_region, ExtraSlice step_region, SourceLoc loc);
 
+    // -- String ops (unary/binary-shaped ones go through unary()/binary()) --
+    // s[i] = c / s.putc(i, c): mutate the string lvalue `str` in place.
+    Index str_putc(Index str, Index index, Index ch, SourceLoc loc);
+    // s.substr(i, j): a new string value from the source string `str`.
+    Index str_substr(Index str, Index i, Index j, SourceLoc loc);
+    // Packed cast of a string to target packed type `type`.
+    Index str_to_packed(Index str, Ref type, SourceLoc loc);
+
     // -- Timing --
     // Event wait `@(a or posedge b ...)`: suspend until ANY listed (signal, edge)
     // fires. Each WaitEdge carries an ir::Edge value as u32, keeping the builder

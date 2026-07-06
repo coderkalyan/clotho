@@ -38,10 +38,30 @@ struct SignalInfo {
     Ref type = Ref::Invalid;
     // Direction relative to the module boundary.
     Direction dir = Direction::Internal;
+    // A net (wire/tri/uwire), as opposed to a variable. An undriven 4-state net
+    // defaults to z (LRM 6.6); an undriven variable defaults to x. Also the
+    // seed condition for the may-z analysis (ZElision.h).
+    bool is_net = false;
 };
 
-// Handle to a process: an index into Module::processes.
-enum class ProcessId : uint32_t {};
+// One elaborated instance in the design hierarchy. The frontend flattens every
+// instance's signals into the module-wide table (Signal handles stay flat and
+// globally unique); this tree records which scope each signal was declared in,
+// so the backend can rebuild a per-module-definition state struct type and
+// compose the types nested per instance. Signals of generate blocks and
+// compiler temporaries belong to the enclosing instance's scope.
+struct InstanceScope {
+    // Instance name (the top module's name for a top scope).
+    std::string name;
+    // Module definition name. Instances of one definition with the same
+    // parameterization declare identical signal type sequences, so the backend
+    // keys state-type deduplication on this (verified against field types).
+    std::string def_name;
+    // Signals declared directly in this scope, in declaration order.
+    std::vector<Signal> signals;
+    // Child instances, in declaration order.
+    std::vector<InstanceScope> children;
+};
 
 // How a process is scheduled. The fine-grained trigger condition lives in the
 // process's wait list (Process::wait_events); this only separates one-shot
@@ -162,12 +182,9 @@ public:
         return static_cast<Signal>(index);
     }
 
-    // Append a process; the returned ProcessId is its index in `processes`.
-    ProcessId add_process(Process proc) {
-        const auto index = static_cast<uint32_t>(processes_.size());
+    // Append a process; its index in `processes` is its identity.
+    void add_process(Process proc) {
         processes_.push_back(std::move(proc));
-
-        return static_cast<ProcessId>(index);
     }
 
     // Reserve a function slot and return its id before the body is built, so a
@@ -197,10 +214,6 @@ public:
         return signals_[static_cast<uint32_t>(s)];
     }
 
-    const Process& process(ProcessId id) const {
-        return processes_[static_cast<uint32_t>(id)];
-    }
-
     std::span<const SignalInfo> signals() const {
         return signals_;
     }
@@ -209,14 +222,28 @@ public:
         return processes_;
     }
 
+    // Append one top instance's completed scope tree (one per top-level module).
+    void add_top(InstanceScope scope) {
+        tops_.push_back(std::move(scope));
+    }
+
+    // The design hierarchy, one tree per top-level module. Empty for a module
+    // built without hierarchy info; the backend then treats every signal as
+    // belonging to one flat root scope.
+    std::span<const InstanceScope> tops() const {
+        return tops_;
+    }
+
 private:
     // Signal table; index == Signal handle.
     std::vector<SignalInfo> signals_;
-    // Lowered processes; index == ProcessId handle.
+    // Lowered processes, in creation order.
     std::vector<Process> processes_;
     // Lowered functions; index == FunctionId handle. Held behind unique_ptr so a
     // slot can be reserved (recursion) before its body exists.
     std::vector<std::unique_ptr<Function>> functions_;
+    // Instance hierarchy, one scope tree per top-level module.
+    std::vector<InstanceScope> tops_;
 };
 
 } // namespace clotho::ir

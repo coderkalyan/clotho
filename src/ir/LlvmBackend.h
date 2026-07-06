@@ -5,12 +5,12 @@
 // the IR into something compilable; the library is no longer "just IR".
 //
 // Model (see LlvmBackend.cpp for the full rationale):
-//   * One shared state struct holds two integer fields per module signal — the
-//     val plane and the xz plane of its 4-state value.
+//   * One shared state struct holds a slot per module signal: a packed must|may
+//     word plus a z word — the z word elided when the may-z analysis
+//     (ZElision.h) proves the signal never carries z.
 //   * Each process becomes a switched-resume coroutine `ptr <name>(ptr state)`;
-//     Load/Store address fields of that struct. With no body suspend points yet
-//     the optimizer elides the frame, so behaviour matches a plain function.
-//   * Every SSA value is lowered as a (val, xz) plane pair so X/Z propagate.
+//     Load/Store address fields of that struct.
+//   * Every SSA value is lowered as a (must|may, z) plane pair so X/Z propagate.
 
 #include <memory>
 
@@ -19,6 +19,7 @@
 #include <llvm/Support/raw_ostream.h>
 
 #include "Module.h"
+#include "SimConfig.h"
 
 namespace clotho::ir {
 
@@ -27,15 +28,13 @@ namespace clotho::ir {
 // generated module fails verification. The caller owns the returned module and
 // must keep `ctx` alive at least as long as it.
 //
-// `optimize` runs the coroutine-lowering pipeline (CoroSplit et al., required to
-// produce runnable code). Pass false to get the raw pre-split module — the
-// llvm.coro.* intrinsics are still present — for manual review before any passes.
-std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& ctx, bool optimize = true);
+std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& ctx,
+                                           const SimulationConfig& config = {});
 
 // Lower every process in `m` to an LLVM function and write textual LLVM IR to
 // `os`. Returns false (and writes the reason to llvm::errs()) if the generated
 // module fails verification; on success the IR has already been printed to `os`.
-// `optimize` is forwarded to build_module: false emits the pre-pass IR.
-bool emit_llvm(const Module& m, llvm::raw_ostream& os, bool optimize = true);
+// `config` is forwarded to build_module.
+bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config = {});
 
 } // namespace clotho::ir

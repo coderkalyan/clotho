@@ -640,3 +640,189 @@ TEST_CASE("a parameter expression in a part-select bound folds") {
     REQUIRE_MESSAGE(r.ok, r.diagnostics);
     CHECK(signal_width(*r.module, "o") == 2);
 }
+
+// -- Multiple continuous drivers on one net (LRM 6.6.1) --
+//
+// Clotho has no net resolution: overlapping continuous/structural drivers
+// must fail loudly instead of silently last-writer-winning (Table 6-2 says
+// conflicting wire drivers resolve to x).
+
+TEST_CASE("two continuous assigns driving one net fail loudly") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            wire w;
+            assign w = 1'b0;
+            assign w = 1'b1;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("multiple drivers on net 'w'") != std::string::npos);
+}
+
+TEST_CASE("a net declaration assignment plus a continuous assign fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module m(input a);
+            wire w = 1'b0;
+            assign w = a;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("multiple drivers on net 'w'") != std::string::npos);
+}
+
+TEST_CASE("an output port connection plus a continuous assign fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module sub(output y);
+            assign y = 1'b0;
+        endmodule
+        module m;
+            wire w;
+            sub u(.y(w));
+            assign w = 1'b1;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("multiple drivers on net 'w'") != std::string::npos);
+}
+
+TEST_CASE("overlapping constant part-select drivers fail loudly") {
+    const LowerResult r = lower_text(R"(
+        module m(input [3:0] a, input [4:0] b);
+            wire [7:0] w;
+            assign w[3:0] = a;
+            assign w[6:2] = b;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("multiple drivers on net 'w'") != std::string::npos);
+}
+
+TEST_CASE("a concatenation lvalue operand overlapping another driver fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module m(input [1:0] a, input b);
+            wire x, y;
+            assign {x, y} = a;
+            assign y = b;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("multiple drivers on net 'y'") != std::string::npos);
+}
+
+TEST_CASE("non-overlapping constant bit drivers of one net are accepted") {
+    const LowerResult r = lower_text(R"(
+        module m(input a, input b, output [1:0] y);
+            wire [1:0] w;
+            assign w[0] = a;
+            assign w[1] = b;
+            assign y = w;
+        endmodule
+    )");
+    CHECK_MESSAGE(r.ok, r.diagnostics);
+}
+
+TEST_CASE("non-overlapping constant part-select drivers are accepted") {
+    const LowerResult r = lower_text(R"(
+        module m(input [3:0] a, input [3:0] b, output [7:0] y);
+            wire [7:0] w;
+            assign w[3:0] = a;
+            assign w[7:4] = b;
+            assign y = w;
+        endmodule
+    )");
+    CHECK_MESSAGE(r.ok, r.diagnostics);
+}
+
+TEST_CASE("a net with one continuous driver read procedurally is accepted") {
+    // Procedural blocks are not continuous drivers: one assign plus reads
+    // (including in an always body) must not trip the multi-driver guard.
+    const LowerResult r = lower_text(R"(
+        module m(input a, output reg q);
+            wire w;
+            assign w = a;
+            always @(w) q = w;
+        endmodule
+    )");
+    CHECK_MESSAGE(r.ok, r.diagnostics);
+}
+
+TEST_CASE("a non-default drive strength fails loudly") {
+    const LowerResult ra = lower_text(R"(
+        module m(input a);
+            wire w;
+            assign (weak0, weak1) w = a;
+        endmodule
+    )");
+    CHECK_FALSE(ra.ok);
+    CHECK(ra.diagnostics.find("drive strength") != std::string::npos);
+
+    const LowerResult rn = lower_text(R"(
+        module m(input a);
+            wire (pull0, pull1) w = a;
+        endmodule
+    )");
+    CHECK_FALSE(rn.ok);
+    CHECK(rn.diagnostics.find("drive strength") != std::string::npos);
+
+    // An explicit (strong0, strong1) equals the default (LRM 10.3.4): accepted.
+    const LowerResult rs = lower_text(R"(
+        module m(input a);
+            wire w;
+            assign (strong0, strong1) w = a;
+        endmodule
+    )");
+    CHECK_MESSAGE(rs.ok, rs.diagnostics);
+}
+
+// -- Net delay (LRM 28.16) --
+
+TEST_CASE("a net declaration delay fails loudly") {
+    const LowerResult ri = lower_text(R"(
+        module m(input a);
+            wire #5 w = a;
+        endmodule
+    )");
+    CHECK_FALSE(ri.ok);
+    CHECK(ri.diagnostics.find("net delay") != std::string::npos);
+
+    const LowerResult rd = lower_text(R"(
+        module m(input a);
+            wire #5 w;
+            assign w = a;
+        endmodule
+    )");
+    CHECK_FALSE(rd.ok);
+    CHECK(rd.diagnostics.find("net delay") != std::string::npos);
+
+    // No delay: a plain net declaration assignment still lowers.
+    const LowerResult rp = lower_text(R"(
+        module m(input a);
+            wire w = a;
+        endmodule
+    )");
+    CHECK_MESSAGE(rp.ok, rp.diagnostics);
+}
+
+// -- `matches` pattern conditions (LRM 12.6.2) --
+
+TEST_CASE("a matches pattern in an if condition fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module m(input [3:0] v, output reg q);
+            always @(*)
+                if (v matches 4'd3) q = 1'b1;
+                else q = 1'b0;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("pattern matching in conditions") != std::string::npos);
+}
+
+TEST_CASE("a matches pattern in a conditional expression fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module m(input [3:0] v, output y);
+            assign y = v matches 4'd3 ? 1'b1 : 1'b0;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("pattern matching in conditions") != std::string::npos);
+}

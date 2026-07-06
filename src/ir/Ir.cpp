@@ -25,6 +25,10 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Delay:
         case T::Fclose:
         case T::Fflush:
+        case T::StrLen:
+        case T::StrUpper:
+        case T::StrLower:
+        case T::StrFromPacked:
             return K::Unary;
 
         case T::BitSelect:
@@ -55,9 +59,13 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::WildEq:
         case T::Land:
         case T::Lor:
+        case T::StrGetc:
+        case T::StrCmp:
+        case T::StrICmp:
             return K::Binary;
 
         case T::Resize:
+        case T::StrToPacked:
             return K::OpType;
         case T::Repl:
             return K::Repl;
@@ -87,6 +95,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
 
         case T::Mux:
         case T::PartSelect:
+        case T::DynPartSelect:
         case T::ElemSelect:
         case T::Cond:
         case T::Fopen:
@@ -94,6 +103,9 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Ferror:
         case T::FreadWord:
         case T::FreadMem:
+        case T::ReadMem:
+        case T::StrPutc:
+        case T::StrSubstr:
             return K::OpExtra;
     }
 
@@ -212,11 +224,69 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 scratch[1]    = es.index;
                 return { scratch.data(), 2 };
             }
+            // dyn_part_select exposes its base and the runtime offset value; the
+            // constant width is not an operand.
+            if (tag == Inst::Tag::DynPartSelect) {
+                const auto dps = extra_data<DynPartSelect>(p.op_extra.extra);
+                scratch[0]     = p.op_extra.op;
+                scratch[1]     = dps.offset;
+                return { scratch.data(), 2 };
+            }
+            // read_mem exposes its filename value plus the optional start / finish
+            // address operands; the target memory is a Signal handle, not an operand.
+            if (tag == Inst::Tag::ReadMem) {
+                const auto rm = extra_data<ReadMemInfo>(p.op_extra.extra);
+                size_t     n  = 0;
+                scratch[n++]  = p.op_extra.op;
+                if (rm.has_start) {
+                    scratch[n++] = rm.start;
+                }
+                if (rm.has_finish) {
+                    scratch[n++] = rm.finish;
+                }
+                return { scratch.data(), n };
+            }
+            // str_putc / str_substr expose the string op plus their two extra
+            // value operands (index+char / start+end).
+            if (tag == Inst::Tag::StrPutc) {
+                const auto sp = extra_data<StrPutcInfo>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = sp.index;
+                scratch[2]    = sp.ch;
+                return { scratch.data(), 3 };
+            }
+            if (tag == Inst::Tag::StrSubstr) {
+                const auto ss = extra_data<StrSubstrInfo>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = ss.i;
+                scratch[2]    = ss.j;
+                return { scratch.data(), 3 };
+            }
             scratch[0] = p.op_extra.op;
             return { scratch.data(), 1 };
     }
 
     return {};
+}
+
+LvalueRoot lvalue_root(const Ir& ir, Index lv) {
+    bool whole = true;
+    for (;;) {
+        switch (ir.tag(lv)) {
+            case Inst::Tag::BitSelect:
+                lv    = ir.payload(lv).binary.l;
+                whole = false;
+                break;
+            case Inst::Tag::PartSelect:
+            case Inst::Tag::DynPartSelect:
+            case Inst::Tag::ElemSelect:
+                lv    = ir.payload(lv).op_extra.op;
+                whole = false;
+                break;
+            default:
+                return { lv, whole };
+        }
+    }
 }
 
 } // namespace clotho::ir
