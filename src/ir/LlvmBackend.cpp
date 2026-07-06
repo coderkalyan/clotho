@@ -1898,107 +1898,23 @@ private:
     // Static sub-queue scan (one edge bucket): a fixed-trip loop over the
     // persistent subscriptions for this (signal, edge). The bucket's edge already
     // matched the transition (the caller guarded the whole scan), so there is no
-    // per-entry edge check. The capacity is a compile-time constant, so the
-    // optimizer may unroll. Membership never changes — no compaction, no length.
-    // Each entry wakes its process, but only if it is not already scheduled this
-    // instant (its flag is 0), then sets the flag; that flag collapses a
-    // multi-signal sensitivity (the same process subscribed under several signals)
-    // into a single wake.
+    // per-entry edge check. Emitted via the generic runtime scan with a constant
+    // non-null base and constant cap: simplifycfg (lower_coroutines) folds the
+    // dead null guard and the constant trip count still lets the optimizer
+    // unroll. Membership never changes — no compaction, no length.
     void service_static_queue(Signal sig, uint32_t edge) {
-        const auto        i      = static_cast<uint32_t>(sig);
-        auto*             q      = wait_sta_gv_[i][edge];
-        auto*             arr_ty = wait_sta_ty_[i][edge];
-        const uint32_t    cap    = wait_sta_cap_[i][edge];
-        llvm::StructType* elem   = wait_elem_ty();
-        auto*             ptr_ty = llvm::PointerType::getUnqual(ctx_);
-        auto*             i32    = b_.getInt32Ty();
-
-        auto* fn    = b_.GetInsertBlock()->getParent();
-        auto* head  = llvm::BasicBlock::Create(ctx_, "sta.head", fn);
-        auto* body  = llvm::BasicBlock::Create(ctx_, "sta.body", fn);
-        auto* wake  = llvm::BasicBlock::Create(ctx_, "sta.wake", fn);
-        auto* cont  = llvm::BasicBlock::Create(ctx_, "sta.cont", fn);
-        auto* done  = llvm::BasicBlock::Create(ctx_, "sta.done", fn);
-        auto* entry = b_.GetInsertBlock();
-        b_.CreateBr(head);
-
-        b_.SetInsertPoint(head);
-        auto* idx = b_.CreatePHI(i32, 2);
-        idx->addIncoming(b_.getInt32(0), entry);
-        b_.CreateCondBr(b_.CreateICmpULT(idx, b_.getInt32(cap)), body, done);
-
-        b_.SetInsertPoint(body);
-        llvm::Value* src     = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), idx });
-        llvm::Value* h       = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 0));
-        llvm::Value* fptr    = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 1));
-        llvm::Value* already = b_.CreateICmpNE(b_.CreateLoad(i32, fptr), b_.getInt32(0));
-        b_.CreateCondBr(already, cont, wake);
-
-        b_.SetInsertPoint(wake);
-        emit_active_push(b_, h);
-        b_.CreateStore(b_.getInt32(1), fptr); // mark scheduled
-        b_.CreateBr(cont);
-
-        b_.SetInsertPoint(cont);
-        llvm::Value* next = b_.CreateAdd(idx, b_.getInt32(1));
-        b_.CreateBr(head);
-        idx->addIncoming(next, cont);
-
-        b_.SetInsertPoint(done);
+        const auto i = static_cast<uint32_t>(sig);
+        emit_static_scan_rt(wait_sta_gv_[i][edge], b_.getInt32(wait_sta_cap_[i][edge]));
     }
 
     // Dynamic sub-queue scan (one edge bucket): a straight loop over the live
-    // one-shot waiters for this (signal, edge). The bucket's edge already matched
-    // the transition (the caller guarded the whole scan), so every entry fires.
-    // Each entry wakes its process, but only if it is not already scheduled this
-    // instant (its flag is 0), then sets the flag — collapsing a multi-signal
-    // intra-body wait (the same process registered under several signals firing
-    // together) into a single wake. The whole bucket is consumed, so the length
-    // resets to 0; the firing process deregisters its stale entries from any OTHER
-    // buckets itself on resume (eager removal in lower_wait).
+    // one-shot waiters for this (signal, edge), via the generic runtime scan
+    // with a constant non-null base. The whole bucket is consumed (length
+    // resets to 0); the firing process deregisters its stale entries from any
+    // OTHER buckets itself on resume (eager removal in lower_wait).
     void service_dynamic_queue(Signal sig, uint32_t edge) {
-        const auto        i      = static_cast<uint32_t>(sig);
-        auto*             q      = wait_dyn_gv_[i][edge];
-        auto*             arr_ty = wait_dyn_ty_[i][edge];
-        auto*             len_gv = wait_dyn_len_gv_[i][edge];
-        llvm::StructType* elem   = wait_elem_ty();
-        auto*             ptr_ty = llvm::PointerType::getUnqual(ctx_);
-        auto*             i32    = b_.getInt32Ty();
-
-        llvm::Value* n     = b_.CreateLoad(i32, len_gv);
-        auto*        fn    = b_.GetInsertBlock()->getParent();
-        auto*        head  = llvm::BasicBlock::Create(ctx_, "dyn.head", fn);
-        auto*        body  = llvm::BasicBlock::Create(ctx_, "dyn.body", fn);
-        auto*        wake  = llvm::BasicBlock::Create(ctx_, "dyn.wake", fn);
-        auto*        cont  = llvm::BasicBlock::Create(ctx_, "dyn.cont", fn);
-        auto*        done  = llvm::BasicBlock::Create(ctx_, "dyn.done", fn);
-        auto*        entry = b_.GetInsertBlock();
-        b_.CreateBr(head);
-
-        b_.SetInsertPoint(head);
-        auto* i_phi = b_.CreatePHI(i32, 2);
-        i_phi->addIncoming(b_.getInt32(0), entry);
-        b_.CreateCondBr(b_.CreateICmpULT(i_phi, n), body, done);
-
-        b_.SetInsertPoint(body);
-        llvm::Value* src     = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), i_phi });
-        llvm::Value* h       = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 0));
-        llvm::Value* fptr    = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 1));
-        llvm::Value* already = b_.CreateICmpNE(b_.CreateLoad(i32, fptr), b_.getInt32(0));
-        b_.CreateCondBr(already, cont, wake);
-
-        b_.SetInsertPoint(wake);
-        emit_active_push(b_, h);
-        b_.CreateStore(b_.getInt32(1), fptr); // mark scheduled
-        b_.CreateBr(cont);
-
-        b_.SetInsertPoint(cont);
-        llvm::Value* i_next = b_.CreateAdd(i_phi, b_.getInt32(1));
-        b_.CreateBr(head);
-        i_phi->addIncoming(i_next, cont);
-
-        b_.SetInsertPoint(done);
-        b_.CreateStore(b_.getInt32(0), len_gv);
+        const auto i = static_cast<uint32_t>(sig);
+        emit_dynamic_scan_rt(wait_dyn_gv_[i][edge], wait_dyn_len_gv_[i][edge]);
     }
 
     // Compacting removal of this coroutine's entries from one (signal, edge)
@@ -2145,8 +2061,12 @@ private:
           b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(field), b_.getInt32(e) }));
     }
 
-    // Generic static-queue scan (runtime base + capacity), null base => no waiters.
-    // Mirrors service_static_queue but reads its trip count at runtime from meta.
+    // Generic static-queue scan (base + capacity values), null base => no
+    // waiters. Serves both callers: service_static_queue passes a constant
+    // global and cap; the NBA commit loop passes values read from meta. Each
+    // entry wakes its process only if its scheduled flag is 0, then sets the
+    // flag — collapsing a multi-signal sensitivity (the same process
+    // subscribed under several signals) into a single wake.
     void emit_static_scan_rt(llvm::Value* base, llvm::Value* cap) {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
@@ -2183,8 +2103,9 @@ private:
         b_.SetInsertPoint(done);
     }
 
-    // Generic dynamic-queue scan (runtime base + length pointer), null base => skip.
-    // Wakes every live entry (flag-deduped) and resets the length to 0.
+    // Generic dynamic-queue scan (base + length pointer values), null base =>
+    // skip. Serves both callers, like emit_static_scan_rt. Wakes every live
+    // entry (flag-deduped) and resets the length to 0.
     void emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr) {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
