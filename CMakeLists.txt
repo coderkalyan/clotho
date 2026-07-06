@@ -99,10 +99,9 @@ target_compile_definitions(clotho_ir PUBLIC ${LLVM_DEFINITIONS})
 target_link_libraries(clotho_ir PUBLIC unordered_dense::unordered_dense clotho_runtime ${LLVM_LIBS})
 target_link_libraries(clotho_ir PRIVATE clotho_warnings)
 
-# Front-end and the (future) slang -> IR translation. Pulls in slang and the
-# IR; consumers get both transitively.
+# Front-end: the slang -> IR translation. Pulls in slang and the IR;
+# consumers get both transitively.
 add_library(clotho STATIC
-  src/Frontend.cpp
   src/SourceMap.cpp
   src/Lower.cpp
 )
@@ -120,7 +119,6 @@ enable_testing()
 add_executable(clotho_test
   tests/test_main.cpp
   tests/ir_test.cpp
-  tests/frontend_test.cpp
   tests/sourcemap_test.cpp
   tests/lower_test.cpp
   tests/case_test.cpp
