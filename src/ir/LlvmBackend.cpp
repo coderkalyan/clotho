@@ -341,6 +341,9 @@ struct FrameSlot {
     llvm::StructType* slot_ty    = nullptr;
     uint32_t          width      = 0;
     bool              four_state = false;
+    // A genuine single-iW 2-state local (`{ iW }`). The ABI wire is still the
+    // packed word, so copy-in projects into the iW slot and copy-out lifts back.
+    bool narrow = false;
     // A string local: the slot is an rt_string handle; init/deinit bracket the
     // call.
     bool is_string = false;
@@ -1099,9 +1102,38 @@ private:
 
     // Build a function's frame struct: one slot field per local, in Local-handle
     // order (a Local's index is its GEP field index).
+    // Locals passed as a task-call output / inout argument: the callee writes them
+    // back through the packed-word pointer ABI, so they cannot use the narrow iW
+    // slot (they stay packed, like an out-target signal). Functions never write
+    // back (their outputs are by-value and dropped), so only task calls matter.
+    std::vector<bool> frame_out_targets(const Function& f) const {
+        std::vector<bool> out(f.local_types.size(), false);
+        const Ir&         ir = f.ir;
+        for (size_t k = 0; k < ir.inst_count(); ++k) {
+            const auto idx = static_cast<Index>(k);
+            if (ir.tag(idx) != Inst::Tag::TaskCall) {
+                continue;
+            }
+            const auto      ti     = ir.extra_data<TaskCallInfo>(ir.payload(idx).extra);
+            const Function& callee = mod_.function(ti.func);
+            const auto      args   = ir.region(ti.args);
+            for (size_t a = 0; a < args.size(); ++a) {
+                if (callee.arg_dirs[a] == ArgDir::In) {
+                    continue;
+                }
+                const Index root = lvalue_root(ir, args[a]).root;
+                if (ir.tag(root) == Inst::Tag::Local) {
+                    out[ir.payload(root).local.index] = true;
+                }
+            }
+        }
+        return out;
+    }
+
     void build_frame_layout(const Function& f) {
         const size_t n = f.local_types.size();
         frame_slots_.assign(n, FrameSlot{});
+        const std::vector<bool>  out_target = frame_out_targets(f);
         std::vector<llvm::Type*> fields(n);
         for (uint32_t i = 0; i < n; ++i) {
             const Layout lay           = mod_.pool.layout(f.local_types[i]);
@@ -1113,9 +1145,17 @@ private:
                 fields[i]                 = frame_slots_[i].slot_ty;
                 continue;
             }
-            // Frame slots always keep z: the task ABI and copy-in/out use the z
-            // field, and LLVM folds the zero-z traffic on its own.
-            frame_slots_[i].slot_ty = slot_type(frame_slots_[i].width, frame_slots_[i].four_state, true);
+            // A 2-state local uses the genuine iW slot; the packed-word ABI wire is
+            // bridged by copy-in/out. A 4-state local keeps its z field (the ABI and
+            // copy-in/out use it; LLVM folds the zero-z traffic on its own). A local
+            // passed as a task out/inout target stays packed — the callee writes it
+            // back through the packed-word pointer ABI.
+            frame_slots_[i].narrow  = !frame_slots_[i].four_state && !out_target[i];
+            // A non-narrow slot keeps its z field: a 4-state local needs it, and a
+            // packed 2-state out-target local is written back through the (mm, z)
+            // pointer ABI. A narrow local has no z.
+            frame_slots_[i].slot_ty = slot_type(frame_slots_[i].width, frame_slots_[i].four_state,
+                                                !frame_slots_[i].narrow, frame_slots_[i].narrow);
             fields[i]                  = frame_slots_[i].slot_ty;
         }
         frame_ty_ = llvm::StructType::create(ctx_, fields, mod_.name + ".fn." + f.name + ".frame");
@@ -1130,6 +1170,12 @@ private:
             llvm::Value*     slot = b_.CreateStructGEP(frame_ty_, frame_, i);
             if (s.is_string) {
                 b_.CreateCall(str_init_fn(), { slot });
+                continue;
+            }
+            // A narrow 2-state local is a single iW field (comes up 0); a 4-state
+            // local is the packed word (X) plus a cleared z field.
+            if (s.narrow) {
+                b_.CreateStore(zero(s.width), b_.CreateStructGEP(s.slot_ty, slot, 0));
                 continue;
             }
             llvm::Value*     mm   = s.four_state ? x_mm(s.width) : zero(2 * s.width);
@@ -1359,7 +1405,8 @@ private:
                 continue;
             }
             const uint32_t base = param_llvm_index_[k];
-            const Plane    v    = lower_load(local_lvalue(k));
+            // The caller's out-target is still the packed word; lift a narrow local.
+            const Plane    v    = to_four(lower_load(local_lvalue(k)));
             b_.CreateStore(v.mm, fn_->getArg(base));
             b_.CreateStore(v.z, fn_->getArg(base + 1));
         }
@@ -3505,6 +3552,8 @@ private:
         const FrameSlot& s = frame_slots_[index];
         return LValue{ .base        = b_.CreateStructGEP(frame_ty_, frame_, index),
                        .slot_ty     = s.slot_ty,
+                       .has_z       = !s.narrow,
+                       .narrow      = s.narrow,
                        .store_width = s.width,
                        .bit_off     = b_.getInt32(0),
                        .width       = s.width,
