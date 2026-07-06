@@ -646,17 +646,11 @@ private:
         bool   whole;
     };
     NbaTarget nba_target(const Ir& ir, Index lv) const {
-        bool whole = true;
-        for (;;) {
-            switch (ir.tag(lv)) {
-                case Inst::Tag::Signal: return { ir.payload(lv).signal, whole };
-                case Inst::Tag::BitSelect: lv = ir.payload(lv).binary.l; whole = false; continue;
-                case Inst::Tag::PartSelect: lv = ir.payload(lv).op_extra.op; whole = false; continue;
-                case Inst::Tag::DynPartSelect: lv = ir.payload(lv).op_extra.op; whole = false; continue;
-                case Inst::Tag::ElemSelect: lv = ir.payload(lv).op_extra.op; whole = false; continue;
-                default: throw BackendError{ "unsupported nonblocking-assignment lvalue" };
-            }
+        const LvalueRoot r = lvalue_root(ir, lv);
+        if (ir.tag(r.root) != Inst::Tag::Signal) {
+            throw BackendError{ "unsupported nonblocking-assignment lvalue" };
         }
+        return { ir.payload(r.root).signal, r.whole };
     }
 
     // Mark NBA-target signals reached by one IR body (a process or a task): set
@@ -732,18 +726,9 @@ private:
                     if (callee.arg_dirs[a] == ArgDir::In) {
                         continue;
                     }
-                    Index lv = args[a];
-                    for (bool walking = true; walking;) {
-                        switch (ir.tag(lv)) {
-                            case Inst::Tag::BitSelect: lv = ir.payload(lv).binary.l; break;
-                            case Inst::Tag::PartSelect:
-                            case Inst::Tag::DynPartSelect:
-                            case Inst::Tag::ElemSelect: lv = ir.payload(lv).op_extra.op; break;
-                            default: walking = false; break;
-                        }
-                    }
-                    if (ir.tag(lv) == Inst::Tag::Signal) {
-                        out[static_cast<uint32_t>(ir.payload(lv).signal)] = true;
+                    const Index root = lvalue_root(ir, args[a]).root;
+                    if (ir.tag(root) == Inst::Tag::Signal) {
+                        out[static_cast<uint32_t>(ir.payload(root).signal)] = true;
                     }
                 }
             }

@@ -35,24 +35,6 @@ namespace clotho::ir {
 
 namespace {
 
-// Walk an lvalue select chain (bit / part / element selects) to its root leaf.
-Index lvalue_root(const Ir& ir, Index lv) {
-    for (;;) {
-        switch (ir.tag(lv)) {
-            case Inst::Tag::BitSelect:
-                lv = ir.payload(lv).binary.l;
-                break;
-            case Inst::Tag::PartSelect:
-            case Inst::Tag::DynPartSelect:
-            case Inst::Tag::ElemSelect:
-                lv = ir.payload(lv).op_extra.op;
-                break;
-            default:
-                return lv;
-        }
-    }
-}
-
 struct Analysis {
     // Per-function facts, indexed by FunctionId.
     struct FnState {
@@ -109,7 +91,7 @@ struct Analysis {
 
     // May-z of the storage behind an lvalue. Unknown leaves are conservatively z.
     bool storage_z(const Ir& ir, const FnState* fn, Index lv) const {
-        const Index root = lvalue_root(ir, lv);
+        const Index root = lvalue_root(ir, lv).root;
         switch (ir.tag(root)) {
             case Inst::Tag::Signal:
                 return sig_z[static_cast<uint32_t>(ir.payload(root).signal)] != 0;
@@ -126,7 +108,7 @@ struct Analysis {
         if (!rhs_z) {
             return;
         }
-        const Index root = lvalue_root(ir, lhs);
+        const Index root = lvalue_root(ir, lhs).root;
         switch (ir.tag(root)) {
             case Inst::Tag::Signal:
                 mark(sig_z[static_cast<uint32_t>(ir.payload(root).signal)]);
@@ -330,7 +312,7 @@ struct Analysis {
 std::vector<bool> compute_undriven(const Module& m) {
     std::vector<bool> driven(m.signals().size(), false);
     const auto        mark_root = [&](const Ir& ir, Index lv) {
-        const Index root = lvalue_root(ir, lv);
+        const Index root = lvalue_root(ir, lv).root;
         if (ir.tag(root) == Inst::Tag::Signal) {
             driven[static_cast<uint32_t>(ir.payload(root).signal)] = true;
         }

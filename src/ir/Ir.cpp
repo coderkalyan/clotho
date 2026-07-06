@@ -236,4 +236,24 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
     return {};
 }
 
+LvalueRoot lvalue_root(const Ir& ir, Index lv) {
+    bool whole = true;
+    for (;;) {
+        switch (ir.tag(lv)) {
+            case Inst::Tag::BitSelect:
+                lv    = ir.payload(lv).binary.l;
+                whole = false;
+                break;
+            case Inst::Tag::PartSelect:
+            case Inst::Tag::DynPartSelect:
+            case Inst::Tag::ElemSelect:
+                lv    = ir.payload(lv).op_extra.op;
+                whole = false;
+                break;
+            default:
+                return { lv, whole };
+        }
+    }
+}
+
 } // namespace clotho::ir
