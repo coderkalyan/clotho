@@ -1029,6 +1029,13 @@ private:
             fail("final block is not supported");
         }
 
+        // TODO: no non-sequential-behavior warning for `always_ff`. LRM 9.2.2.4
+        // says tools should warn when the body does not represent sequential
+        // logic, but slang's analysis library has no such diagnostic (unlike
+        // inferred-latch / inferred-comb for the other two kinds), so nothing
+        // surfaces it today. slang does enforce the hard 9.2.2.4 rules (exactly
+        // one event control, no blocking timing controls).
+
         const Statement* body = &sym.getBody();
 
         // `always_comb` / `always_latch` have no written sensitivity at all; their
