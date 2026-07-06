@@ -390,7 +390,7 @@ extern "C" int rt_wheel_pending(const rt_wheel* wheel) {
 }
 
 extern "C" void rt_wheel_schedule(rt_wheel* wheel, rt_timer* timer, uint64_t deadline, rt_timer_fn on_expire) {
-    // rt_timer* and clotho::Timer& share a representation, so reinterpreting the
+    // rt_timer* and clotho::Timer* share a representation, so reinterpreting the
     // callback's first parameter is sound — the same pointer-cast the wheel
     // already relies on for its type-erased dispatch.
     unwrap(wheel)->schedule(unwrap(timer), deadline, reinterpret_cast<RuntimeWheel::Callback>(on_expire));
