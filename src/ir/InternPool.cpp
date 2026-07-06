@@ -63,11 +63,20 @@ Ref InternPool::put_int(Ref type, uint64_t bits) {
     const uint64_t mask = lay.width >= 64 ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << lay.width) - 1);
     const uint64_t val  = bits & mask;
 
-    // Val plane holds the known bits; any xz plane stays zero (all bits known).
-    std::array<uint8_t, 16> buf{};
-    std::memcpy(buf.data(), &val, pb);
+    // Val plane holds the known bits, zero-extended to the plane width; any xz
+    // plane stays zero (all bits known). A >64-bit type needs a plane wider
+    // than the source word, so only the low sizeof(val) bytes are copied and a
+    // wide value takes the heap buffer.
+    const size_t copy = std::min<size_t>(pb, sizeof(val));
+    if (lay.byte_count <= 16) {
+        std::array<uint8_t, 16> buf{};
+        std::memcpy(buf.data(), &val, copy);
+        return put_value(type, { buf.data(), lay.byte_count });
+    }
+    std::vector<uint8_t> buf(lay.byte_count, 0);
+    std::memcpy(buf.data(), &val, copy);
 
-    return put_value(type, { buf.data(), lay.byte_count });
+    return put_value(type, buf);
 }
 
 const Item& InternPool::get(Ref ref) const {

@@ -102,6 +102,7 @@ add_executable(clotho_test
   tests/string_test.cpp
   tests/loop_test.cpp
   tests/generate_test.cpp
+  tests/packed_range_test.cpp
   tests/z_elision_test.cpp
   tests/llvm_backend_test.cpp
   tests/wheel_test.cpp

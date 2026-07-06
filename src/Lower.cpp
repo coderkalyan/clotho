@@ -481,8 +481,32 @@ private:
                     // elaboration and bit-sliced port connections.
                     fail("instance arrays are not supported");
                     break;
-                default:
+                // Known-inert members: elaboration artifacts and declarations
+                // that bear no simulation behavior of their own. Ports are wired
+                // by wire_ports; parameters/types/genvars are resolved by slang;
+                // subroutines lower on demand at call sites; statement blocks
+                // lower with their enclosing procedure; elab system tasks were
+                // already issued as elaboration diagnostics.
+                case SymbolKind::Port:
+                case SymbolKind::Parameter:
+                case SymbolKind::TypeParameter:
+                case SymbolKind::TypeAlias:
+                case SymbolKind::TransparentMember:
+                case SymbolKind::Genvar:
+                case SymbolKind::Subroutine:
+                case SymbolKind::StatementBlock:
+                case SymbolKind::WildcardImport:
+                case SymbolKind::ExplicitImport:
+                case SymbolKind::EmptyMember:
+                case SymbolKind::ElabSystemTask:
+                case SymbolKind::Specparam:
+                case SymbolKind::DefParam:
                     break;
+                default:
+                    // Anything else (gate primitives, specify blocks, checkers,
+                    // nettype aliases, ...) may carry behavior; refusing loudly
+                    // beats silently dropping it.
+                    fail("unsupported module member kind=" + std::string(toString(m.kind)));
             }
         }
     }
@@ -1042,6 +1066,12 @@ private:
         switch (tc.kind) {
             case TimingControlKind::SignalEvent: {
                 const SignalEventControl& ev = tc.as<SignalEventControl>();
+                // TODO: `@(edge sig iff cond)` (LRM 9.4.2.3) — the wake must be
+                // gated on the condition at event time; dropping it fires the
+                // process regardless of the guard.
+                if (ev.iffCondition != nullptr) {
+                    fail("iff qualifier on an event control is not supported");
+                }
                 out.push_back(ir::WaitEvent{ .signal = event_signal(ev.expr), .edge = to_edge(ev.edge) });
                 break;
             }
@@ -1126,9 +1156,18 @@ private:
                     lower_stmt(*s, b);
                 }
                 break;
-            case StatementKind::Block:
-                lower_stmt(stmt.as<BlockStatement>().body, b);
+            case StatementKind::Block: {
+                const BlockStatement& blk = stmt.as<BlockStatement>();
+                // TODO: fork..join / join_any / join_none (LRM 9.3.2) — needs
+                // child process spawning and join synchronization in the
+                // scheduler. Lowering the body sequentially would silently
+                // serialize concurrent branches.
+                if (blk.blockKind != StatementBlockKind::Sequential) {
+                    fail("fork..join blocks are not supported");
+                }
+                lower_stmt(blk.body, b);
                 break;
+            }
             case StatementKind::Timed: {
                 // A timing control nested inside a process body. A delay (#n) lowers
                 // to a Delay instruction (suspend + reschedule on the timing wheel);
@@ -2122,10 +2161,10 @@ private:
                     return b.binary(ir::Inst::Tag::StrGetc, str, lower_expr(es.selector(), b), l);
                 }
                 const ir::Index base = lower_lvalue(es.value(), b);
-                const ir::Index idx  = lower_expr(es.selector(), b);
-                const ir::Index sel  = is_unpacked_array(es.value())
-                                   ? b.elem_select(base, idx, lower_type(*es.value().type), l)
-                                   : b.binary(ir::Inst::Tag::BitSelect, base, idx, l);
+                const ir::Index sel =
+                    is_unpacked_array(es.value())
+                        ? b.elem_select(base, lower_expr(es.selector(), b), lower_type(*es.value().type), l)
+                        : b.binary(ir::Inst::Tag::BitSelect, base, packed_bit_index(es, b, l), l);
                 return b.unary(ir::Inst::Tag::Load, sel, l);
             }
             case ExpressionKind::RangeSelect: {
@@ -2309,26 +2348,39 @@ private:
     // `[off -: w]` (width constant, base a runtime value). Shared by the rvalue and
     // lvalue paths so a read and a write of the same shape lower identically.
     ir::Index lower_range_select(const RangeSelectExpression& rs, ir::Index base, ir::Builder& b, ir::SourceLoc l) {
+        // TODO: range select on a multi-dim packed array selects whole
+        // elements, so both bounds and the width scale by the element width.
+        const auto* pa = rs.value().type->getCanonicalType().as_if<slang::ast::PackedArrayType>();
+        if (pa != nullptr && pa->elementType.getBitWidth() != 1) {
+            fail("range select on a multi-dimensional packed array is not supported");
+        }
+        const slang::ConstantRange range = packed_range_of(rs.value());
         if (rs.getSelectionKind() == RangeSelectionKind::Simple) {
-            const auto msb = static_cast<uint32_t>(const_uint(rs.left()));
-            const auto lsb = static_cast<uint32_t>(const_uint(rs.right()));
+            const std::optional<int32_t> left  = try_const_int(rs.left());
+            const std::optional<int32_t> right = try_const_int(rs.right());
+            if (!left || !right) {
+                fail("expected constant part-select bounds");
+            }
+            // translateIndex puts the left bound at the higher LSB offset for
+            // either endianness (slang has already checked the select's
+            // direction matches the declared range).
+            const auto msb = static_cast<uint32_t>(range.translateIndex(*left));
+            const auto lsb = static_cast<uint32_t>(range.translateIndex(*right));
             return b.part_select(base, msb, lsb, l);
         }
-        // Indexed part-select: the width is a constant (LRM 11.5.1) and the base is a
-        // runtime value. `+:` selects [off : off+w-1] (low bit = off); `-:` selects
-        // [off-w+1 : off] (low bit = off-(w-1)), folded here so the IR carries a
-        // single low-bit offset.
+        // Indexed part-select: the width is a constant (LRM 11.5.1) and the base
+        // is a runtime value in declared-range coordinates. The IR carries the
+        // low-bit LSB offset: that is the translated base offset, minus width-1
+        // when the selection extends away from the LSB end (`-:` on a
+        // little-endian range, `+:` on a big-endian one).
         //
         // TODO: an out-of-range or X/Z base is not bounds-checked. LRM 11.5.1: an
         // out-of-range read yields X and such a write is a no-op. This inherits the
         // dynamic BitSelect gap and shifts by the raw value.
         const auto    width = static_cast<uint32_t>(const_uint(rs.right()));
-        const ir::Ref u32   = make_int_type(32, false, false);
-        ir::Index     off   = b.resize(lower_expr(rs.left(), b), u32, l);
-        if (rs.getSelectionKind() == RangeSelectionKind::IndexedDown) {
-            const ir::Index w1 = b.constant(module_.pool.put_int(u32, width - 1), l);
-            off                = b.binary(ir::Inst::Tag::Sub, off, w1, l);
-        }
+        const bool    down  = rs.getSelectionKind() == RangeSelectionKind::IndexedDown;
+        const int32_t bias  = down == range.isLittleEndian() ? static_cast<int32_t>(width) - 1 : 0;
+        const ir::Index off = lower_packed_offset(rs.left(), range, bias, b, l);
         return b.dyn_part_select(base, off, width, l);
     }
 
@@ -2341,11 +2393,10 @@ private:
             case ExpressionKind::ElementSelect: {
                 const ElementSelectExpression& es   = expr.as<ElementSelectExpression>();
                 const ir::Index                base = lower_lvalue(es.value(), b);
-                const ir::Index                idx  = lower_expr(es.selector(), b);
                 if (is_unpacked_array(es.value())) {
-                    return b.elem_select(base, idx, lower_type(*es.value().type), l);
+                    return b.elem_select(base, lower_expr(es.selector(), b), lower_type(*es.value().type), l);
                 }
-                return b.binary(ir::Inst::Tag::BitSelect, base, idx, l);
+                return b.binary(ir::Inst::Tag::BitSelect, base, packed_bit_index(es, b, l), l);
             }
             case ExpressionKind::RangeSelect: {
                 const RangeSelectExpression& rs   = expr.as<RangeSelectExpression>();
@@ -2369,6 +2420,73 @@ private:
             fail("expected a constant integer");
         }
         return cv.integer().as<uint64_t>().value_or(0);
+    }
+
+    // Constant-fold an integer expression against the current scope; nullopt
+    // when it is non-constant (a runtime index) or holds X/Z bits.
+    std::optional<int32_t> try_const_int(const Expression& e) {
+        slang::ast::ASTContext  astCtx(*scope_, slang::ast::LookupLocation::max);
+        slang::ast::EvalContext evalCtx(astCtx);
+        const slang::ConstantValue cv = e.eval(evalCtx);
+        if (!cv.isInteger()) {
+            return std::nullopt;
+        }
+        return cv.integer().as<int32_t>();
+    }
+
+    // -- Packed-select index normalization --
+    //
+    // The IR models every packed type as [width-1:0] (make_int_type), so a
+    // select index written against the declared range ([0:7], [15:8],
+    // [-1:-8], ...) must be translated to a zero-based LSB offset before
+    // BitSelect / PartSelect / DynPartSelect (LRM 11.5): a little-endian
+    // range [l:r] maps index i to i - r, a big-endian range to r - i.
+
+    // Declared range of the packed value a select indexes into. Taken from
+    // slang's type so nested selects use whatever coordinates slang assigned
+    // to the inner select's result.
+    static slang::ConstantRange packed_range_of(const Expression& value) {
+        return value.type->getCanonicalType().getFixedRange();
+    }
+
+    // Lower a packed-select index to its 32-bit zero-based LSB offset, minus
+    // `bias` (0 for a bit select; width-1 when an indexed part-select's low
+    // bit sits below the translated base). A constant index folds to an
+    // immediate. A runtime index is widened by its own signedness (so a
+    // signed index into a negative-bound range resolves correctly) and keeps
+    // the source's 4-state-ness so an X/Z index still poisons the offset
+    // arithmetic instead of being silently coerced to a known value.
+    ir::Index lower_packed_offset(const Expression& idx, slang::ConstantRange range, int32_t bias,
+                                  ir::Builder& b, ir::SourceLoc l) {
+        if (const std::optional<int32_t> c = try_const_int(idx)) {
+            const auto off = static_cast<uint32_t>(range.translateIndex(*c) - bias);
+            return b.constant(module_.pool.put_int(make_int_type(32, false, false), off), l);
+        }
+        const ir::Ref   off_ty = make_int_type(32, idx.type->isFourState(), idx.type->isSigned());
+        const ir::Index v      = b.resize(lower_expr(idx, b), off_ty, l);
+        if (range.isLittleEndian()) {
+            const int32_t sub = range.right + bias; // off = idx - right - bias
+            if (sub == 0) {
+                return v;
+            }
+            const ir::Index c = b.constant(module_.pool.put_int(off_ty, static_cast<uint32_t>(sub)), l);
+            return b.binary(ir::Inst::Tag::Sub, v, c, l);
+        }
+        // Big-endian: off = (right - bias) - idx.
+        const ir::Index c =
+            b.constant(module_.pool.put_int(off_ty, static_cast<uint32_t>(range.right - bias)), l);
+        return b.binary(ir::Inst::Tag::Sub, c, v, l);
+    }
+
+    // Normalized bit offset for an element select on a packed value.
+    ir::Index packed_bit_index(const ElementSelectExpression& es, ir::Builder& b, ir::SourceLoc l) {
+        // TODO: element select on a multi-dim packed array selects a whole
+        // multi-bit element; BitSelect models a 1-bit result, so the offset
+        // would also need scaling by the element width.
+        if (es.type->getBitWidth() != 1) {
+            fail("element select on a multi-dimensional packed array is not supported");
+        }
+        return lower_packed_offset(es.selector(), packed_range_of(es.value()), 0, b, l);
     }
 
     // -- Functions --
