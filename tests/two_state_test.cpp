@@ -176,9 +176,40 @@ TEST_CASE("integer is 4-state, int is 2-state") {
             initial begin a = 0; b = 0; end
         endmodule
     )");
-    // int -> a bit slot; integer -> a logic slot.
-    CHECK(ir.find("%bit.nz.32") != std::string::npos);
-    CHECK(ir.find("%logic.nz.32") != std::string::npos);
+    // int -> a narrow single-iW bit slot; integer -> a 4-state logic slot.
+    CHECK(ir.find("%bit.32 = type { i32 }") != std::string::npos);
+    CHECK(ir.find("%logic.nz.32 = type { i64 }") != std::string::npos);
+}
+
+// A decoupled 2-state signal gets the genuine single-iW slot and native iW
+// load/store, with no packed-word scaffolding.
+TEST_CASE("2-state signal storage shrinks to a single iW slot") {
+    const std::string ir = emit(R"(
+        module m;
+            bit [7:0] a, b;
+            initial begin a = 8'd1; b = a + 8'd1; end
+        endmodule
+    )");
+    CHECK(ir.find("%bit.8 = type { i8 }") != std::string::npos);
+    CHECK(ir.find("load i8") != std::string::npos);
+    CHECK(ir.find("store i8") != std::string::npos);
+    // No packed i16 word for these signals.
+    CHECK(ir.find("%bit.nz.8") == std::string::npos);
+}
+
+// A 2-state signal that is an NBA target stays on the packed word (its shadow
+// and commit still expect it) — narrowing is deferred for it.
+TEST_CASE("2-state NBA-target signal keeps the packed slot") {
+    const std::string ir = emit(R"(
+        module m;
+            bit clk;
+            bit [7:0] q;
+            always @(posedge clk) q <= q + 8'd1;
+        endmodule
+    )");
+    // q is an NBA target -> packed nz slot, not the narrow form.
+    CHECK(ir.find("%bit.nz.8 = type { i16 }") != std::string::npos);
+    CHECK(ir.find("%bit.8 = type { i8 }") == std::string::npos);
 }
 
 // posedge / negedge detection works on a 2-state (bit) clock.

@@ -247,6 +247,9 @@ struct LValue {
     // Whether the slot stores a z word (field 1). False for a never-z signal;
     // loads then materialize a zero z plane and stores drop theirs.
     bool has_z = true;
+    // A genuine single-iW 2-state slot: the mm word is `iW`, not `i(2W)`, and
+    // there is no z word. Loads yield a two_val Plane; stores write the iW value.
+    bool narrow = false;
     // The `[N x slot]` storage type when `base` addresses a whole memory; null
     // for plain scalar storage.
     llvm::ArrayType* array_ty = nullptr;
@@ -286,6 +289,11 @@ struct SignalSlot {
     // or is a task out/inout target (the task ABI stores z through a pointer to
     // it). A never-z slot is just `{ i(2W) }`.
     bool has_z = true;
+    // A genuine single-iW 2-state slot (`{ iW }`): the packed must|may word is
+    // dropped. Set only for a 2-state signal proven decoupled from every path that
+    // still reads the packed form (ABI, NBA, arrays). Loads yield a two_val Plane;
+    // stores write the must plane as iW.
+    bool narrow = false;
     // Powers up as z rather than x: an undriven 4-state net (LRM 6.6). Implies
     // has_z (undriven nets are a may-z seed).
     bool init_z = false;
@@ -442,20 +450,24 @@ private:
     // (width, domain, has_z) so every signal of one shape shares one named LLVM
     // type (%logic.8, %bit.nz.4, ...); the single-field form keeps the struct
     // wrapper so GEP paths and array-of-slot addressing stay uniform.
-    llvm::StructType* slot_type(uint32_t width, bool four_state, bool has_z) {
-        for (const auto& [w, four, z, ty] : slot_types_) {
-            if (w == width && four == four_state && z == has_z) {
+    // `narrow` requests the genuine single-iW 2-state slot (`{ iW }`, named
+    // `%bit.W`) instead of the packed must|may word — used for a 2-state signal
+    // proven decoupled from every path that still reads the packed form (ABI, NBA,
+    // arrays). Only valid for a 2-state (four_state == false), never-z slot.
+    llvm::StructType* slot_type(uint32_t width, bool four_state, bool has_z, bool narrow = false) {
+        for (const auto& [w, four, z, nr, ty] : slot_types_) {
+            if (w == width && four == four_state && z == has_z && nr == narrow) {
                 return ty;
             }
         }
-        const std::string name =
-          std::string(four_state ? "logic." : "bit.") + (has_z ? "" : "nz.") + std::to_string(width);
-        std::vector<llvm::Type*> fields{ int_ty(2 * width) };
+        const std::string name = std::string(four_state ? "logic." : "bit.")
+                               + (narrow ? "" : (has_z ? "" : "nz.")) + std::to_string(width);
+        std::vector<llvm::Type*> fields{ int_ty(narrow ? width : 2 * width) };
         if (has_z) {
             fields.push_back(int_ty(width));
         }
         auto* ty = llvm::StructType::create(ctx_, fields, name);
-        slot_types_.emplace_back(width, four_state, has_z, ty);
+        slot_types_.emplace_back(width, four_state, has_z, narrow, ty);
         return ty;
     }
 
@@ -557,6 +569,9 @@ private:
     void build_state_types() {
         const auto sigs = mod_.signals();
         slots_.resize(sigs.size());
+        // Classify NBA targets up front so the slot loop can keep an NBA-target
+        // 2-state signal on the packed word (its shadow / commit still expect it).
+        nba_classify();
 
         // A slot keeps its z word when the may-z analysis cannot prove it z-free
         // or the task ABI needs z storage behind it. Elision is analysis-driven,
@@ -595,7 +610,14 @@ private:
             }
             slot.init_z      = undriven[i] && sigs[i].is_net && slot.four_state;
             slot.has_z       = may_z[i] || task_out[i] || slot.init_z;
-            slot.slot_ty     = slot_type(slot.width, slot.four_state, slot.has_z);
+            // A 2-state signal drops the packed must|may word for a genuine iW slot
+            // when it is decoupled from every path that still reads the packed form:
+            // it is never-z (so not a task out/inout target, which forces has_z),
+            // not an NBA target (its shadow / commit are still packed), and not an
+            // unpacked array (memory element layout is still packed).
+            const bool is_arr = ty.kind == Type::Kind::UnpackedArray;
+            slot.narrow      = !slot.four_state && !slot.has_z && !slot.nba && !is_arr;
+            slot.slot_ty     = slot_type(slot.width, slot.four_state, slot.has_z, slot.narrow);
             if (ty.kind == Type::Kind::UnpackedArray) {
                 slot.is_array   = true;
                 slot.elem_count = array_leaf_count(sigs[i].type);
@@ -604,8 +626,6 @@ private:
                 slot.storage_ty = slot.slot_ty;
             }
         }
-
-        nba_classify();
 
         std::vector<llvm::Type*> root_fields;
         std::vector<bool>        claimed(sigs.size(), false);
@@ -1846,8 +1866,14 @@ private:
     // signal for a plain target, or one element for an unpacked-array element.
     // Used to snapshot old / new state around a blocking store so wait-queue
     // servicing detects an element-level change, not just element 0.
+    // Bit width of a slot's stored value word: iW for a narrow 2-state slot, the
+    // packed i(2W) otherwise.
+    uint32_t slot_mm_bits(const LValue& lv) const {
+        return lv.narrow ? lv.store_width : 2 * lv.store_width;
+    }
+
     llvm::Value* load_lv_mm(const LValue& lv) {
-        return b_.CreateLoad(int_ty(2 * lv.store_width), lv_mm_ptr(lv));
+        return b_.CreateLoad(int_ty(slot_mm_bits(lv)), lv_mm_ptr(lv));
     }
 
     // Service a signal's wait queues after a blocking assignment to it. Computes
@@ -2612,7 +2638,8 @@ private:
                 emit_array_init(state, s);
                 continue;
             }
-            llvm::Value* mm   = s.four_state ? x_mm(s.width) : zero(2 * s.width);
+            llvm::Value* mm =
+              s.narrow ? zero(s.width) : (s.four_state ? x_mm(s.width) : zero(2 * s.width));
             llvm::Value* slot = storage_ptr(state, s);
             b_.CreateStore(mm, b_.CreateStructGEP(s.slot_ty, slot, 0));
             if (s.has_z) {
@@ -3463,6 +3490,7 @@ private:
         return LValue{ .base        = storage_ptr(state_, s),
                        .slot_ty     = s.slot_ty,
                        .has_z       = s.has_z,
+                       .narrow      = s.narrow,
                        .array_ty    = s.is_array ? llvm::cast<llvm::ArrayType>(s.storage_ty) : nullptr,
                        .store_width = s.width,
                        .bit_off     = b_.getInt32(0),
@@ -3487,6 +3515,17 @@ private:
 
     Plane lower_load(const LValue& lv) {
         const uint32_t w  = lv.store_width;
+
+        // Narrow 2-state slot: the stored word IS the iW value.
+        if (lv.narrow) {
+            llvm::Value* v = b_.CreateLoad(int_ty(w), lv_mm_ptr(lv));
+            if (lv.width == w && is_zero_const(lv.bit_off)) {
+                return two_val(v);
+            }
+            llvm::Value* off = cast(lv.bit_off, w, false);
+            return two_val(cast(b_.CreateLShr(v, off), lv.width, false));
+        }
+
         llvm::Value*   mm = b_.CreateLoad(int_ty(2 * w), lv_mm_ptr(lv));
         // A never-z slot stores no z word; its z plane is a constant zero.
         llvm::Value* z = lv.has_z ? static_cast<llvm::Value*>(b_.CreateLoad(int_ty(w), lv_z_ptr(lv))) : zero(w);
@@ -3502,11 +3541,29 @@ private:
     }
 
     void lower_store(const LValue& lv, Plane rhs) {
-        // The live slot still holds the packed i(2W) word; a 2-state RHS lifts to
-        // it (single-iW storage lands in a later stage).
-        rhs = to_four(rhs);
         const uint32_t s_width = lv.store_width;
         llvm::Value*   mp      = lv_mm_ptr(lv);
+
+        // Narrow 2-state slot: store the single iW value (the must plane of a
+        // 4-state RHS drops any x/z to 0 per LRM 6.3.1; a 2-state RHS is the value
+        // itself). No z word.
+        if (lv.narrow) {
+            llvm::Value* v = must_of(rhs);
+            if (lv.width == s_width && is_zero_const(lv.bit_off)) {
+                b_.CreateStore(v, mp);
+                return;
+            }
+            llvm::Value* old   = b_.CreateLoad(int_ty(s_width), mp);
+            llvm::Value* off   = cast(lv.bit_off, s_width, false);
+            llvm::Value* mask  = b_.CreateShl(cast(ones(lv.width), s_width, false), off);
+            llvm::Value* merged =
+              merge_bits(old, cast(v, s_width, false), off, mask, b_.CreateNot(mask));
+            b_.CreateStore(merged, mp);
+            return;
+        }
+
+        // The packed slot still holds i(2W); a 2-state RHS lifts to it.
+        rhs = to_four(rhs);
 
         // Whole-storage store: the frontend context-sizes the RHS to the lvalue
         // width (via an inserted Resize), so rhs already matches the storage width
@@ -5015,7 +5072,7 @@ private:
     llvm::StructType*       shadow_ty_    = nullptr;
     uint32_t                shadow_field_ = 0;
     // Slot-type memo, one `{ i(2W)[, iW] }` per (width, domain, has_z).
-    std::vector<std::tuple<uint32_t, bool, bool, llvm::StructType*>> slot_types_;
+    std::vector<std::tuple<uint32_t, bool, bool, bool, llvm::StructType*>> slot_types_;
     // Per-definition state-struct memo: (definition name, field types, type).
     // Instances of one definition share the type; a same-named definition with
     // different fields (different parameterization) gets its own entry.

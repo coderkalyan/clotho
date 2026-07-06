@@ -143,10 +143,11 @@ TEST_CASE("2-state vs 4-state widths") {
 
     // Every signal keeps its LLVM slot type, named per (domain, width) — and
     // the module's state struct lists them in declaration order: x, y
-    // (bit[3:0]) then z (logic[7:0]). No signal here can carry z, so every
-    // slot is the elided `.nz` form: just the i(2W) must|may word, no z word.
-    CHECK(ir.find("%m.state = type { %bit.nz.4, %bit.nz.4, %logic.nz.8 }") != std::string::npos);
-    CHECK(ir.find("%bit.nz.4 = type { i8 }") != std::string::npos);
+    // (bit[3:0]) then z (logic[7:0]). The 2-state signals are decoupled from the
+    // packed-word paths (no ABI / NBA / array), so they get the genuine single-iW
+    // slot `%bit.4 = { i4 }`; the 4-state z keeps the i(2W) must|may word.
+    CHECK(ir.find("%m.state = type { %bit.4, %bit.4, %logic.nz.8 }") != std::string::npos);
+    CHECK(ir.find("%bit.4 = type { i4 }") != std::string::npos);
     CHECK(ir.find("%logic.nz.8 = type { i16 }") != std::string::npos);
     CHECK(ir.find("alloca %clotho.state") != std::string::npos);
     // z's must|may word is an i16 (2W = 16).
