@@ -130,6 +130,7 @@ add_executable(clotho_test
   tests/packed_range_test.cpp
   tests/z_elision_test.cpp
   tests/llvm_backend_test.cpp
+  tests/two_state_test.cpp
   tests/wheel_test.cpp
   tests/runtime_test.cpp
 )

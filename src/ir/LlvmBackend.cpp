@@ -92,8 +92,13 @@ struct ValType {
 // (high-impedance marker). Packing lets the monotone ops (AND/OR/NOT, mux select)
 // act on both planes with a single instruction.
 struct Plane {
-    llvm::Value* mm = nullptr; // i(2W): [0,W) must, [W,2W) may
-    llvm::Value* z  = nullptr; // iW
+    llvm::Value* mm = nullptr; // 4-state: i(2W) [0,W) must, [W,2W) may. 2-state: iW value.
+    llvm::Value* z  = nullptr; // 4-state z plane (iW), or null when never-z. Null for 2-state.
+    // A genuine 2-state value: `mm` is a single iW with no unknown/z plane. The
+    // accessors (must_of/may_of/width_of/any_unknown) read this flag, so a
+    // 2-state value never carries the redundant may/z half. Domain is inferred
+    // per value, not per instruction; see the operator dispatch in lower_inst.
+    bool two = false;
 };
 
 // Single-bit 4-state truth tables, packed into one i32 immediate so a width-1 op
@@ -2886,6 +2891,21 @@ private:
         return values_[static_cast<uint32_t>(i)];
     }
     void set_value(Index i, Plane p) {
+        // Keep a value's encoding in lockstep with its IR type's domain. slang
+        // unifies operand *types* (inserting conversions), not our Plane flags, so
+        // the "operands share a domain" invariant the operator dispatch relies on
+        // holds only if every value's `two` flag matches type_of(i). Producers that
+        // always emit the packed form (Arg, Call, SimTime, string ops, ...) are
+        // projected to a single iW here when their type is 2-state; the projection
+        // is lossless because such a value has must == may and no z.
+        const ValType t = type_of(i);
+        if (!t.is_string) {
+            if (t.four_state && p.two) {
+                p = to_four(p);
+            } else if (!t.four_state && !p.two) {
+                p = two_val(must_of(p));
+            }
+        }
         values_[static_cast<uint32_t>(i)] = p;
     }
 
@@ -3038,6 +3058,8 @@ private:
                     set_str(i, lv_string_ptr(lv));
                     return;
                 }
+                // The slot still stores the packed i(2W) word (single-iW storage is
+                // a later stage); set_value projects a 2-state result to its iW.
                 set_value(i, lower_load(lv));
                 return;
             }
@@ -3206,7 +3228,10 @@ private:
                     throw BackendError{ "internal: string value in resize" };
                 }
                 const ValType to = from_ref(p.op_type.type);
-                set_value(i, cast_plane(value_of(p.op_type.op), to.width, to.is_signed));
+                // Resize is also the domain-conversion site: slang lowers an
+                // implicit 2-state <-> 4-state conversion (LRM 6.3.1) as a
+                // ConversionExpression -> Resize to the target type.
+                set_value(i, convert(value_of(p.op_type.op), to.width, to.four_state, to.is_signed));
                 return;
             }
 
@@ -3371,7 +3396,11 @@ private:
         // distinct (case-equality needs to tell a literal x from a literal z).
         // VPI: x=(val1,xz1), z=(val0,xz1) => must=val&~xz, may=val|xz, z=xz&~val.
         llvm::Value* val = const_from_bytes(bytes.subspan(0, pb), w);
-        llvm::Value* xz  = lay.domain == Domain::Four ? const_from_bytes(bytes.subspan(pb, pb), w) : zero(w);
+        // A 2-state constant has no x/z: its value is the single iW word.
+        if (lay.domain != Domain::Four) {
+            return two_val(val);
+        }
+        llvm::Value* xz = const_from_bytes(bytes.subspan(pb, pb), w);
         return packed(b_.CreateAnd(val, b_.CreateNot(xz)), b_.CreateOr(val, xz), b_.CreateAnd(xz, b_.CreateNot(val)));
     }
 
@@ -3473,6 +3502,9 @@ private:
     }
 
     void lower_store(const LValue& lv, Plane rhs) {
+        // The live slot still holds the packed i(2W) word; a 2-state RHS lifts to
+        // it (single-iW storage lands in a later stage).
+        rhs = to_four(rhs);
         const uint32_t s_width = lv.store_width;
         llvm::Value*   mp      = lv_mm_ptr(lv);
 
@@ -3511,6 +3543,7 @@ private:
     // repeat NBAs to one signal in a slot accumulate in the shadow). No wait queues
     // are serviced here — that happens in the NBA region after the active drain.
     void lower_store_nb(const LValue& lv, Plane rhs) {
+        rhs                  = to_four(rhs);
         const SignalSlot& s  = slot_of(lv.sig);
         llvm::Value*      mp = shadow_ptr(s.sh_mm_field);
         // A never-z target stages no z shadow (and its commit loop skips z).
@@ -3571,6 +3604,7 @@ private:
     // scratch, and hands the live element's destination pointers to the queue; the
     // NBA region replays the masked merge after the active drain.
     void emit_array_nba(const LValue& lv, Plane rhs) {
+        rhs              = to_four(rhs);
         const uint32_t W = lv.store_width;
         if (W > 64) {
             // TODO: element width > 64 needs a larger staging buffer (mm word > i128).
@@ -3832,7 +3866,8 @@ private:
             b_.CreateRetVoid();
             return;
         }
-        const Plane  pl  = value_of(value);
+        // The return ABI is the packed (must|may, z) pair; lift a 2-state result.
+        const Plane  pl  = to_four(value_of(value));
         auto*        rty = llvm::cast<llvm::StructType>(fn_->getReturnType());
         llvm::Value* agg = llvm::UndefValue::get(rty);
         agg              = b_.CreateInsertValue(agg, pl.mm, { 0 });
@@ -3855,7 +3890,7 @@ private:
             if (is_string_type(f.param_types[k])) {
                 argv.push_back(str_of(a));
             } else {
-                const Plane pl = value_of(a);
+                const Plane pl = to_four(value_of(a));
                 argv.push_back(pl.mm);
                 argv.push_back(pl.z);
             }
@@ -3915,7 +3950,7 @@ private:
                     argv.push_back(str_of(args[k]));
                     continue;
                 }
-                const Plane pl = value_of(args[k]);
+                const Plane pl = to_four(value_of(args[k]));
                 argv.push_back(pl.mm);
                 argv.push_back(pl.z);
             } else {
@@ -4000,7 +4035,7 @@ private:
                 store_field(sty, elt, 1, b_.getInt32(t.is_signed ? 1u : 0u));
                 store_field(sty, elt, 2, cast(must, 64, false));
                 store_field(sty, elt, 3, cast(xz, 64, false));
-                store_field(sty, elt, 4, cast(p.z, 64, false));
+                store_field(sty, elt, 4, cast(z_of(p), 64, false));
             }
         }
 
@@ -4017,18 +4052,44 @@ private:
     static uint32_t bits_of(llvm::Value* v) {
         return llvm::cast<llvm::IntegerType>(v->getType())->getBitWidth();
     }
-    // Value width W of a packed plane (mm is i(2W)).
+    // Value width W of a plane. A 2-state value's mm IS the iW value; a 4-state
+    // value packs must|may into i(2W).
     static uint32_t width_of(Plane a) {
-        return bits_of(a.mm) / 2;
+        return a.two ? bits_of(a.mm) : bits_of(a.mm) / 2;
     }
 
-    // The must (low W) and may (high W) halves of a packed plane.
+    // The must (low W) and may (high W) halves of a plane. For a 2-state value
+    // both are the value itself (must == may, no unknown bits).
     llvm::Value* must_of(Plane a) {
-        return b_.CreateTrunc(a.mm, int_ty(width_of(a)));
+        return a.two ? a.mm : b_.CreateTrunc(a.mm, int_ty(width_of(a)));
     }
     llvm::Value* may_of(Plane a) {
+        if (a.two) {
+            return a.mm;
+        }
         const uint32_t w = width_of(a);
         return b_.CreateTrunc(b_.CreateLShr(a.mm, w), int_ty(w));
+    }
+
+    // The z plane, materialized as a zero constant for a 2-state (never-z) value.
+    llvm::Value* z_of(Plane a) {
+        return a.two ? zero(width_of(a)) : a.z;
+    }
+
+    // Wrap a single iW value as a 2-state Plane.
+    Plane two_val(llvm::Value* v) {
+        return { v, nullptr, true };
+    }
+
+    // Lift a 2-state value into the 4-state must|may encoding (must == may == v,
+    // z = 0); a no-op on an already-4-state value. Used at storage / ABI sinks
+    // that still consume the packed i(2W) word.
+    Plane to_four(Plane a) {
+        if (!a.two) {
+            return a;
+        }
+        const uint32_t w = bits_of(a.mm);
+        return packed(a.mm, a.mm, zero(w));
     }
 
     // Pack iW must + iW may (+ iW z) into a Plane (mm is i(2W)).
@@ -4040,7 +4101,11 @@ private:
     }
 
     // i1: does this value contain any X/Z bit? Unknown bits are exactly must!=may.
+    // A 2-state value never has any.
     llvm::Value* any_unknown(Plane a) {
+        if (a.two) {
+            return b_.getFalse();
+        }
         llvm::Value* u = b_.CreateXor(must_of(a), may_of(a));
         return b_.CreateICmpNE(u, llvm::ConstantInt::get(u->getType(), 0));
     }
@@ -4051,12 +4116,30 @@ private:
     }
 
     // Cast all planes to width `to`. No-op when already that width — avoids a
-    // pointless unpack/repack of the packed mm.
+    // pointless unpack/repack of the packed mm. Preserves the value's domain: a
+    // 2-state value stays a single iW.
     Plane cast_plane(Plane a, uint32_t to, bool sign) {
         if (width_of(a) == to) {
             return a;
         }
+        if (a.two) {
+            return two_val(cast(a.mm, to, sign));
+        }
         return packed(cast(must_of(a), to, sign), cast(may_of(a), to, sign), cast(a.z, to, sign));
+    }
+
+    // Convert a value to a target domain + width. Domain projection follows LRM
+    // 1800-2023 6.3.1: assigning a 4-state value to a 2-state target drops x/z to
+    // 0 (that is exactly the must plane, since must is 0 for both x and z);
+    // widening a 2-state value to 4-state duplicates it into both planes with z=0.
+    // Width resize (sign-aware) happens after the domain projection.
+    Plane convert(Plane a, uint32_t to_width, bool four_state, bool sign) {
+        if (four_state && a.two) {
+            a = to_four(a);
+        } else if (!four_state && !a.two) {
+            a = two_val(must_of(a));
+        }
+        return cast_plane(a, to_width, sign);
     }
 
     // Combined per-bit X/Z mask (iW) of two same-width operands, tested once
@@ -4079,6 +4162,15 @@ private:
 
     Plane lower_arith(Inst::Tag tag, Plane a, Plane b) {
         const uint32_t w    = width_of(a);
+
+        // 2-state: a single native op on the value; no X rule, no plane duplication.
+        if (a.two) {
+            switch (tag) {
+                case Inst::Tag::Add: return two_val(b_.CreateAdd(a.mm, b.mm));
+                case Inst::Tag::Sub: return two_val(b_.CreateSub(a.mm, b.mm));
+                default:             return two_val(b_.CreateMul(a.mm, b.mm)); // Mul
+            }
+        }
 
         // Width-1 add/sub/mul: index the per-op truth table instead of branching.
         // Add/sub truncate the carry/borrow to a^b; mul is a&b. All three keep the
@@ -4142,6 +4234,27 @@ private:
     Plane lower_divmod(Inst::Tag tag, Plane a, Plane b, bool sign) {
         const uint32_t w      = width_of(a);
         const bool     is_div = tag == Inst::Tag::Div;
+
+        // 2-state: divide/modulo by zero is x, which collapses to 0 in a 2-state
+        // result (verified against iverilog: `int`/`bit` div/mod by 0 -> 0). Guard
+        // the divisor to avoid poison, then select 0 on a zero divisor. Signed
+        // INT_MIN / -1 is also poison, patched to the wrapped value like the
+        // 4-state path.
+        if (a.two) {
+            llvm::Value* dz = b_.CreateICmpEQ(b.mm, zero(w));
+            llvm::Value* r;
+            if (!sign) {
+                llvm::Value* safe = b_.CreateSelect(dz, ones(w), b.mm);
+                r = is_div ? b_.CreateUDiv(a.mm, safe) : b_.CreateURem(a.mm, safe);
+            } else {
+                llvm::Value* neg1 = b_.CreateICmpEQ(b.mm, llvm::ConstantInt::getAllOnesValue(int_ty(w)));
+                llvm::Value* bad  = b_.CreateOr(dz, neg1);
+                llvm::Value* safe = b_.CreateSelect(bad, llvm::ConstantInt::get(int_ty(w), 1), b.mm);
+                r = is_div ? b_.CreateSelect(neg1, b_.CreateNeg(a.mm), b_.CreateSDiv(a.mm, safe))
+                           : b_.CreateSelect(neg1, zero(w), b_.CreateSRem(a.mm, safe));
+            }
+            return two_val(b_.CreateSelect(dz, zero(w), r));
+        }
 
         // Width-1: index the truth table instead of branching. DIV1/MOD1 bake in
         // the X rule and the divide-by-zero -> X case.
@@ -4209,6 +4322,14 @@ private:
     Plane lower_pow(Plane a, Plane b) {
         const uint32_t w  = width_of(a);
         const uint32_t ew = width_of(b);
+
+        // 2-state (unsigned): reuse the 4-state exponentiation-by-squaring loop on
+        // the lifted operands (no X bits, so the loop's cold X block folds away),
+        // then project the definite result back to a single iW. Avoids duplicating
+        // the delicate loop.
+        if (a.two) {
+            return two_val(must_of(lower_pow(to_four(a), to_four(b))));
+        }
 
         // Width-1 base and exponent: index the truth table (exp 0 -> 1, 1**n -> 1,
         // 0**(n>0) -> 0, any X -> X). A wider exponent stays on the runtime path.
@@ -4303,6 +4424,16 @@ private:
 
     Plane lower_bitwise(Inst::Tag tag, Plane a, Plane b) {
         const uint32_t w = width_of(a);
+
+        // 2-state: one native bitwise op; xnor is ~(xor).
+        if (a.two) {
+            switch (tag) {
+                case Inst::Tag::Band:  return two_val(b_.CreateAnd(a.mm, b.mm));
+                case Inst::Tag::Bor:   return two_val(b_.CreateOr(a.mm, b.mm));
+                case Inst::Tag::Bxor:  return two_val(b_.CreateXor(a.mm, b.mm));
+                default:               return two_val(b_.CreateNot(b_.CreateXor(a.mm, b.mm))); // Bxnor
+            }
+        }
         if (tag == Inst::Tag::Band) {
             return { b_.CreateAnd(a.mm, b.mm), zero(w) };
         }
@@ -4357,6 +4488,10 @@ private:
     }
 
     Plane lower_bnot(Plane a) {
+        // 2-state: a plain complement.
+        if (a.two) {
+            return two_val(b_.CreateNot(a.mm));
+        }
         // NOT is must' = ~may, may' = ~must: complement both planes and swap them.
         // Complement is one full ~ on the packed value; the swap is a rotate-left
         // by W (the two halves trade places), emitted as a funnel shift. NOT and
@@ -4372,6 +4507,9 @@ private:
     // -- Reductions -> 1-bit (chained AND/OR/XOR over the bits). --
 
     Plane lower_reduce(Inst::Tag tag, Plane a) {
+        // Definite 4-state 1-bit result (compute_type); a 2-state operand lifts and
+        // the any_unknown terms fold away, leaving the native reduction.
+        a = to_four(a);
         const uint32_t w  = width_of(a);
         llvm::Value*   am = must_of(a);
         llvm::Value*   aM = may_of(a);
@@ -4394,6 +4532,31 @@ private:
     Plane lower_shift(Inst::Tag tag, Plane a, Plane amt, bool sign) {
         const uint32_t w  = width_of(a);
         const uint32_t aw = width_of(amt);
+
+        // 2-state value: one native shift with the same out-of-range handling. An
+        // x/z in the (self-determined) amount makes the result x, which collapses
+        // to 0 in a 2-state result.
+        if (a.two) {
+            const bool     arith = tag == Inst::Tag::Sra && sign;
+            const uint32_t cw    = std::max(aw, w);
+            llvm::Value*   av    = must_of(amt);
+            llvm::Value*   oob   = b_.CreateICmpUGE(cast(av, cw, false), llvm::ConstantInt::get(int_ty(cw), w));
+            llvm::Value*   safe =
+              b_.CreateSelect(oob, llvm::ConstantInt::get(int_ty(w), w == 0 ? 0 : w - 1), cast(av, w, false));
+            llvm::Value* r;
+            switch (tag) {
+                case Inst::Tag::Sll: r = b_.CreateShl(a.mm, safe); break;
+                case Inst::Tag::Srl: r = b_.CreateLShr(a.mm, safe); break;
+                default:             r = arith ? b_.CreateAShr(a.mm, safe) : b_.CreateLShr(a.mm, safe); break;
+            }
+            // Logical shifts (and unsigned >>>) zero on out-of-range; arithmetic
+            // >>> already yields sign fill from the clamp to w-1.
+            if (!arith) {
+                r = b_.CreateSelect(oob, zero(w), r);
+            }
+            return two_val(b_.CreateSelect(any_unknown(amt), zero(w), r));
+        }
+
         llvm::Value*   am = must_of(a);
         llvm::Value*   aM = may_of(a);
 
@@ -4482,6 +4645,12 @@ private:
     }
 
     Plane lower_compare(Inst::Tag tag, Plane a, Plane b, bool sign) {
+        // The result is always a definite 4-state bit (compute_type), so lift a
+        // 2-state operand into the packed encoding; with no x/z the any_unknown
+        // guards below fold to a single native icmp.
+        a = to_four(a);
+        b = to_four(b);
+
         // Equality keeps the branchless X-mask (and a width-1 LUT): == / != are
         // cheap and fold the X mask straight into the result.
         if (tag == Inst::Tag::Eq || tag == Inst::Tag::Ne) {
@@ -4529,8 +4698,11 @@ private:
     //             (mask = unknown_a | unknown_b, since both x and z have must!=may).
     Plane lower_case_compare(Inst::Tag tag, Plane a, Plane b) {
         const uint32_t w = std::max(width_of(a), width_of(b));
-        a                = cast_plane(a, w, false);
-        b                = cast_plane(b, w, false);
+        // The result is a definite 4-state bit; lift operands to the packed form the
+        // masking below needs (z / may planes materialized). 2-state operands carry
+        // no x/z, so the case forms collapse to a plain == after folding.
+        a = cast_plane(to_four(a), w, false);
+        b = cast_plane(to_four(b), w, false);
 
         llvm::Value* eq;
         if (tag == Inst::Tag::CaseEq) {
@@ -4563,8 +4735,10 @@ private:
     // left x/z on a kept bit trips the unknown path.
     Plane lower_wildeq(Plane a, Plane b) {
         const uint32_t w     = std::max(width_of(a), width_of(b));
-        a                    = cast_plane(a, w, false);
-        b                    = cast_plane(b, w, false);
+        // Definite 4-state bit result; lift operands. 2-state operands have no
+        // wildcard (x/z) bits, so ==? folds to a plain ==.
+        a                    = cast_plane(to_four(a), w, false);
+        b                    = cast_plane(to_four(b), w, false);
         auto*          wide  = int_ty(2 * w);
         llvm::Value*   unkb  = b_.CreateXor(must_of(b), may_of(b)); // x/z bits of b
         llvm::Value*   keep  = b_.CreateNot(unkb);
@@ -4591,6 +4765,12 @@ private:
     }
 
     Plane lower_logical(Inst::Tag tag, Plane a, Plane b) {
+        // Definite 4-state 1-bit result; lift operands (self-determined, so either
+        // may be 2-state) into the packed encoding. With no x/z the truth of each
+        // operand is just "nonzero" and the body folds to a native boolean op.
+        a = to_four(a);
+        b = to_four(b);
+
         // At width 1 the truth of each operand is the bit itself, so &&/|| are the
         // monotone bitwise &/| — one packed op, no truth reduction. It also degrades
         // straight to a plain &/| once the may plane is elided, unlike a LUT.
@@ -4623,6 +4803,8 @@ private:
     }
 
     Plane lower_lnot(Plane a) {
+        // Definite 4-state 1-bit result; lift a 2-state operand (!a folds to a==0).
+        a = to_four(a);
         // At width 1, !a is the same operation as ~a (negate the single truth bit),
         // so reuse the bnot plane swap+complement — cheaper than a truth pair, and
         // already optimal (one not + one rotate), so no LUT is warranted.
@@ -4638,6 +4820,24 @@ private:
     // (X where the arms disagree). --
 
     Plane lower_mux(Plane cond, Plane a, Plane b) {
+        // 2-state arms: a native select. slang unifies the two arms to a common
+        // type, so both are 2-state here. A 4-state condition may be x (LRM
+        // 1800-2023 11.4.11: bitwise merge, x where the arms disagree); in a
+        // 2-state result that x collapses to 0, which is exactly `a & b`.
+        if (a.two && b.two) {
+            llvm::Value* ct  = b_.CreateICmpNE(must_of(cond), zero(1));
+            llvm::Value* sel = b_.CreateSelect(ct, a.mm, b.mm);
+            if (cond.two) {
+                return two_val(sel);
+            }
+            llvm::Value* known = b_.CreateICmpEQ(must_of(cond), may_of(cond));
+            return two_val(b_.CreateSelect(known, sel, b_.CreateAnd(a.mm, b.mm)));
+        }
+        // Defensive: a lone 2-state arm is lifted so the packed body's direct plane
+        // access is uniform.
+        a = to_four(a);
+        b = to_four(b);
+
         const uint32_t w          = width_of(a);
         llvm::Value*   cond_known = b_.CreateICmpEQ(must_of(cond), may_of(cond));
         llvm::Value*   cond_true  = b_.CreateICmpNE(must_of(cond), zero(1));
@@ -4661,13 +4861,30 @@ private:
         std::array<Index, 3> scratch;
         const auto           parts = ir_->operands(i, scratch);
 
+        // 2-state result: every part is 2-state (a concat is 4-state if any part
+        // is). Assemble the single iW word directly.
+        if (!type_of(i).four_state) {
+            llvm::Value* acc   = zero(w);
+            bool         first = true;
+            for (Index part : parts) {
+                const uint32_t pw = type_of(part).width;
+                if (!first) {
+                    acc = b_.CreateShl(acc, pw);
+                }
+                acc   = b_.CreateOr(acc, cast(must_of(value_of(part)), w, false));
+                first = false;
+            }
+            return two_val(acc);
+        }
+
         llvm::Value* must = zero(w);
         llvm::Value* may  = zero(w);
         llvm::Value* z    = zero(w);
         // The first part is OR'd in without a preceding shift: a shift by the
         // full result width (which happens when the concat has a single operand,
         // pw == w) is poison in LLVM, and shifting the still-zero accumulator is
-        // a no-op anyway.
+        // a no-op anyway. A 2-state part contributes must == may and a zero z
+        // plane (z_of), so it packs into the 4-state result unchanged.
         bool first = true;
         for (Index part : parts) {
             const uint32_t pw = type_of(part).width;
@@ -4679,7 +4896,7 @@ private:
             }
             must  = b_.CreateOr(must, cast(must_of(pv), w, false));
             may   = b_.CreateOr(may, cast(may_of(pv), w, false));
-            z     = b_.CreateOr(z, cast(pv.z, w, false));
+            z     = b_.CreateOr(z, cast(z_of(pv), w, false));
             first = false;
         }
         return packed(must, may, z);
@@ -4689,9 +4906,23 @@ private:
         // TODO: a zero replication count ({0{x}}) should yield a 0-width value;
         // here w becomes 0 and int_ty(0) is widened to i1, so it leaks one bit.
         const uint32_t w    = part_width * count;
+
+        // 2-state: replicate the single word.
+        if (v.two) {
+            llvm::Value* p   = cast(v.mm, w, false);
+            llvm::Value* acc = zero(w);
+            for (uint32_t c = 0; c < count; ++c) {
+                if (c != 0) {
+                    acc = b_.CreateShl(acc, part_width);
+                }
+                acc = b_.CreateOr(acc, p);
+            }
+            return two_val(acc);
+        }
+
         llvm::Value*   pm   = cast(must_of(v), w, false);
         llvm::Value*   pM   = cast(may_of(v), w, false);
-        llvm::Value*   pz   = cast(v.z, w, false);
+        llvm::Value*   pz   = cast(z_of(v), w, false);
         llvm::Value*   must = zero(w);
         llvm::Value*   may  = zero(w);
         llvm::Value*   z    = zero(w);
