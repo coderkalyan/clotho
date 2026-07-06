@@ -2961,7 +2961,9 @@ private:
             case Inst::Tag::StrICmp:
                 return { 32, false, true };
             case Inst::Tag::StrGetc:
-                return { 8, false, false };
+                // getc / s[i] return `byte`, which is signed (LRM 6.16.3 and
+                // Table 6-8), so 0xff displays as -1 under %d.
+                return { 8, false, true };
             case Inst::Tag::StrUpper:
             case Inst::Tag::StrLower:
             case Inst::Tag::StrSubstr:

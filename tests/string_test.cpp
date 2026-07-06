@@ -217,6 +217,30 @@ TEST_CASE("string indexing reads bytes and writes in place with LRM out-of-range
     CHECK(run_capture(src) == "97 99 0\n[aZc]\n[aZc]\n[aZk] 107\n");
 }
 
+// s[i] and getc() return `byte`, a signed 8-bit type (LRM 6.16.3 and Table 6-8),
+// so a 0xff character is -1 under %d, and widening into a 32-bit context sign-
+// extends. NOTE: iverilog contradicts the LRM here (prints 255); the LRM is the
+// oracle for this case, not iverilog.
+TEST_CASE("string index and getc are signed bytes") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s;
+            byte b;
+            bit [31:0] u;
+            initial begin
+                s = "a";
+                s.putc(0, 8'hff);
+                $display("%0d %0d", s[0], s.getc(0));
+                b = s[0];
+                $display("%0d", b);
+                u = s[0];
+                $display("%h", u);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "-1 -1\n-1\nffffffff\n");
+}
+
 TEST_CASE("toupper, tolower, and substr follow LRM 6.16 semantics") {
     constexpr std::string_view src = R"(
         module m;
