@@ -622,6 +622,8 @@ private:
             // deferred queue writes the packed word), and not a $readmem target
             // (rt_readmem writes the packed word). A scalar NBA target CAN narrow —
             // its shadow and commit loop are width-driven off the same flag.
+            // TODO: narrow unpacked-array NBA / $readmem memories too, once the
+            // deferred-queue push and rt_readmem write an iW (not packed) element.
             const bool arr_nba =
               std::find(array_nba_sigs_.begin(), array_nba_sigs_.end(), static_cast<Signal>(i)) !=
               array_nba_sigs_.end();
@@ -1041,6 +1043,10 @@ private:
         auto*                    ptr = llvm::PointerType::getUnqual(ctx_);
         std::vector<llvm::Type*> params;
         params.push_back(ptr); // state
+        // TODO: pass a 2-state formal as a single iW param (and a 2-state result as
+        // a bare iW) instead of the packed (mm, z) pair. The wire is packed today —
+        // a 2-state arg lifts to must==may with a constant-0 z, which LLVM folds —
+        // so this is a call-ABI size micro-opt, not a correctness gap.
         for (Ref pt : f.param_types) {
             if (is_string_type(pt)) {
                 params.push_back(ptr); // rt_string handle (callee copy-in gives value semantics)
