@@ -197,9 +197,9 @@ TEST_CASE("2-state signal storage shrinks to a single iW slot") {
     CHECK(ir.find("%bit.nz.8") == std::string::npos);
 }
 
-// A 2-state signal that is an NBA target stays on the packed word (its shadow
-// and commit still expect it) — narrowing is deferred for it.
-TEST_CASE("2-state NBA-target signal keeps the packed slot") {
+// A 2-state NBA-target signal narrows: both its live slot and NBA shadow are a
+// single iW, and clocked nonblocking updates still commit correctly.
+TEST_CASE("2-state NBA-target signal narrows to iW") {
     const std::string ir = emit(R"(
         module m;
             bit clk;
@@ -207,9 +207,24 @@ TEST_CASE("2-state NBA-target signal keeps the packed slot") {
             always @(posedge clk) q <= q + 8'd1;
         endmodule
     )");
-    // q is an NBA target -> packed nz slot, not the narrow form.
-    CHECK(ir.find("%bit.nz.8 = type { i16 }") != std::string::npos);
-    CHECK(ir.find("%bit.8 = type { i8 }") == std::string::npos);
+    CHECK(ir.find("%bit.8 = type { i8 }") != std::string::npos);
+    CHECK(ir.find("%bit.nz.8") == std::string::npos);
+
+    // Clocked accumulate through the NBA commit path.
+    const std::string out = run_capture(R"(
+        module m;
+            bit clk;
+            bit [7:0] q;
+            int i;
+            always @(posedge clk) q <= q + 8'd1;
+            initial begin
+                for (i = 0; i < 5; i = i + 1) begin clk = 0; #1; clk = 1; #1; end
+                $display("%0d", q);
+                $finish;
+            end
+        endmodule
+    )");
+    CHECK(out == "5\n");
 }
 
 // A plain 2-state memory shrinks to [N x { iW }] elements and reads/writes

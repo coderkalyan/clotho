@@ -328,6 +328,7 @@ struct NbaBucket {
     uint32_t              width;          // signal width (the commit loop bakes it in)
     bool                  partial;        // mask-RMW commit vs whole copy
     bool                  has_z;          // targets with a z word commit it; never-z loops skip it
+    bool                  narrow;         // 2-state target: the mm word is iW, not i(2W)
     llvm::ArrayType*      ty   = nullptr; // [cap x i32] of nba-ids
     llvm::GlobalVariable* gv   = nullptr;
     llvm::GlobalVariable* top  = nullptr; // i32 live count
@@ -617,14 +618,14 @@ private:
             // A 2-state signal drops the packed must|may word for a genuine iW slot
             // (or `[N x { iW }]` memory) when it is decoupled from every path that
             // still reads the packed form: it is never-z (so not a task out/inout
-            // target, which forces has_z), not a scalar NBA target (its shadow /
-            // commit are packed), not an unpacked-array NBA target (the deferred
-            // queue writes the packed word), and not a $readmem target (rt_readmem
-            // writes the packed word).
+            // target, which forces has_z), not an unpacked-array NBA target (the
+            // deferred queue writes the packed word), and not a $readmem target
+            // (rt_readmem writes the packed word). A scalar NBA target CAN narrow —
+            // its shadow and commit loop are width-driven off the same flag.
             const bool arr_nba =
               std::find(array_nba_sigs_.begin(), array_nba_sigs_.end(), static_cast<Signal>(i)) !=
               array_nba_sigs_.end();
-            slot.narrow = !slot.four_state && !slot.has_z && !slot.nba && !arr_nba && !readmem_target[i];
+            slot.narrow = !slot.four_state && !slot.has_z && !arr_nba && !readmem_target[i];
             slot.slot_ty     = slot_type(slot.width, slot.four_state, slot.has_z, slot.narrow);
             if (ty.kind == Type::Kind::UnpackedArray) {
                 slot.is_array   = true;
@@ -658,7 +659,8 @@ private:
                     continue;
                 }
                 slot.sh_mm_field = static_cast<uint32_t>(sf.size());
-                sf.push_back(int_ty(2 * slot.width));
+                // A narrow 2-state target shadows a single iW word (no z shadow).
+                sf.push_back(int_ty(slot.narrow ? slot.width : 2 * slot.width));
                 // A never-z target stages no z shadow; sh_z_field stays unused.
                 if (slot.has_z) {
                     slot.sh_z_field = static_cast<uint32_t>(sf.size());
@@ -1848,12 +1850,12 @@ private:
             uint32_t bi = 0;
             for (; bi < nba_buckets_.size(); ++bi) {
                 if (nba_buckets_[bi].width == s.width && nba_buckets_[bi].partial == s.nba_partial &&
-                    nba_buckets_[bi].has_z == s.has_z) {
+                    nba_buckets_[bi].has_z == s.has_z && nba_buckets_[bi].narrow == s.narrow) {
                     break;
                 }
             }
             if (bi == nba_buckets_.size()) {
-                nba_buckets_.push_back(NbaBucket{ s.width, s.nba_partial, s.has_z, nullptr, nullptr, nullptr });
+                nba_buckets_.push_back(NbaBucket{ s.width, s.nba_partial, s.has_z, s.narrow, nullptr, nullptr, nullptr });
             }
             s.nba_bucket = bi;
         }
@@ -2286,7 +2288,9 @@ private:
     void emit_nba_commit_bucket(const NbaBucket& bk, llvm::Value* state) {
         const uint32_t    W     = bk.width;
         auto*             i32   = b_.getInt32Ty();
-        auto*             mmty  = int_ty(2 * W);
+        // A narrow 2-state bucket commits a single iW word (no z, no plane
+        // duplication); the mask (already iW) applies directly.
+        auto*             mmty  = int_ty(bk.narrow ? W : 2 * W);
         auto*             zty   = int_ty(W);
         // The runtime-offset i8 GEPs below erase the field types, so the loads/
         // stores carry the fields' ABI alignment explicitly.
@@ -2328,9 +2332,11 @@ private:
             llvm::Value* mask_p = field_ptr_var(state, meta_i32(meta, 4));
             llvm::Value* mask   = b_.CreateAlignedLoad(zty, mask_p, z_al);
             llvm::Value* sh_mm  = b_.CreateAlignedLoad(mmty, sh_mm_p, mm_al);
-            // Replicate the W-bit mask into both halves of the packed must|may word.
+            // A narrow bucket's word is iW, so the iW mask applies directly; a packed
+            // bucket replicates the W-bit mask into both halves of the must|may word.
             llvm::Value* maskw = b_.CreateZExt(mask, mmty);
-            llvm::Value* mask2 = b_.CreateOr(maskw, b_.CreateShl(maskw, llvm::ConstantInt::get(mmty, W)));
+            llvm::Value* mask2 =
+              bk.narrow ? maskw : b_.CreateOr(maskw, b_.CreateShl(maskw, llvm::ConstantInt::get(mmty, W)));
             new_mm             = b_.CreateOr(b_.CreateAnd(old_mm, b_.CreateNot(mask2)), b_.CreateAnd(sh_mm, mask2));
             b_.CreateAlignedStore(new_mm, live_mm_p, mm_al);
             if (bk.has_z) {
@@ -3677,9 +3683,28 @@ private:
     // repeat NBAs to one signal in a slot accumulate in the shadow). No wait queues
     // are serviced here — that happens in the NBA region after the active drain.
     void lower_store_nb(const LValue& lv, Plane rhs) {
-        rhs                  = to_four(rhs);
         const SignalSlot& s  = slot_of(lv.sig);
         llvm::Value*      mp = shadow_ptr(s.sh_mm_field);
+
+        // Narrow 2-state target: stage the single iW value into the iW shadow. No z.
+        if (s.narrow) {
+            llvm::Value* v = must_of(rhs);
+            if (!s.nba_partial) {
+                b_.CreateStore(v, mp);
+            } else {
+                llvm::Value* maskp = shadow_ptr(s.sh_mask_field);
+                llvm::Value* old   = b_.CreateLoad(int_ty(s.width), mp);
+                llvm::Value* off   = cast(lv.bit_off, s.width, false);
+                llvm::Value* bmask = b_.CreateShl(cast(ones(lv.width), s.width, false), off);
+                b_.CreateStore(merge_bits(old, cast(v, s.width, false), off, bmask, b_.CreateNot(bmask)), mp);
+                llvm::Value* cur = b_.CreateLoad(int_ty(s.width), maskp);
+                b_.CreateStore(b_.CreateOr(cur, bmask), maskp);
+            }
+            emit_nba_enqueue(s);
+            return;
+        }
+
+        rhs                  = to_four(rhs);
         // A never-z target stages no z shadow (and its commit loop skips z).
         llvm::Value* zp = s.has_z ? shadow_ptr(s.sh_z_field) : nullptr;
 
