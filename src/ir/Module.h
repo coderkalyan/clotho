@@ -63,9 +63,6 @@ struct InstanceScope {
     std::vector<InstanceScope> children;
 };
 
-// Handle to a process: an index into Module::processes.
-enum class ProcessId : uint32_t {};
-
 // How a process is scheduled. The fine-grained trigger condition lives in the
 // process's wait list (Process::wait_events); this only separates one-shot
 // startup processes from those that re-arm and rerun whenever they are woken.
@@ -185,12 +182,9 @@ public:
         return static_cast<Signal>(index);
     }
 
-    // Append a process; the returned ProcessId is its index in `processes`.
-    ProcessId add_process(Process proc) {
-        const auto index = static_cast<uint32_t>(processes_.size());
+    // Append a process; its index in `processes` is its identity.
+    void add_process(Process proc) {
         processes_.push_back(std::move(proc));
-
-        return static_cast<ProcessId>(index);
     }
 
     // Reserve a function slot and return its id before the body is built, so a
@@ -220,10 +214,6 @@ public:
         return signals_[static_cast<uint32_t>(s)];
     }
 
-    const Process& process(ProcessId id) const {
-        return processes_[static_cast<uint32_t>(id)];
-    }
-
     std::span<const SignalInfo> signals() const {
         return signals_;
     }
@@ -247,7 +237,7 @@ public:
 private:
     // Signal table; index == Signal handle.
     std::vector<SignalInfo> signals_;
-    // Lowered processes; index == ProcessId handle.
+    // Lowered processes, in creation order.
     std::vector<Process> processes_;
     // Lowered functions; index == FunctionId handle. Held behind unique_ptr so a
     // slot can be reserved (recursion) before its body exists.

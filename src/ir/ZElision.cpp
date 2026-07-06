@@ -335,7 +335,7 @@ std::vector<bool> compute_undriven(const Module& m) {
             driven[static_cast<uint32_t>(ir.payload(root).signal)] = true;
         }
     };
-    const auto scan = [&](const Ir& ir, const Function* fn) {
+    const auto scan = [&](const Ir& ir) {
         for (uint32_t k = 0; k < ir.inst_count(); ++k) {
             const Index          i = static_cast<Index>(k);
             const Inst::Payload& p = ir.payload(i);
@@ -363,21 +363,16 @@ std::vector<bool> compute_undriven(const Module& m) {
                     break;
             }
         }
-        (void)fn;
     };
     for (const Process& p : m.processes()) {
-        scan(p.ir, nullptr);
+        scan(p.ir);
     }
     for (uint32_t f = 0; f < m.function_count(); ++f) {
-        const Function& fn = m.function(static_cast<FunctionId>(f));
-        scan(fn.ir, &fn);
+        scan(m.function(static_cast<FunctionId>(f)).ir);
     }
 
-    std::vector<bool> undriven(driven.size());
-    for (size_t i = 0; i < driven.size(); ++i) {
-        undriven[i] = !driven[i];
-    }
-    return undriven;
+    driven.flip();
+    return driven;
 }
 
 std::vector<bool> compute_may_z(const Module& m) {

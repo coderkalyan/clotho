@@ -1161,7 +1161,6 @@ private:
         b_.SetInsertPoint(entry);
         state_ = fn_->getArg(0);
         state_->setName("state");
-        fn_->addParamAttr(0, llvm::Attribute::NoAlias);
 
         frame_ = b_.CreateAlloca(frame_ty_, nullptr, "frame");
         init_frame();
@@ -1330,11 +1329,11 @@ private:
                                   { b_.CreateStructGEP(frame_ty_, frame_, k), fn_->getArg(base) });
                     continue;
                 }
-                lower_store(local_lvalue(k), Plane{ fn_->getArg(base), fn_->getArg(base + 1) }, from_ref(f.param_types[k]));
+                lower_store(local_lvalue(k), Plane{ fn_->getArg(base), fn_->getArg(base + 1) });
             } else if (f.arg_dirs[k] == ArgDir::Inout) {
                 llvm::Value* mm = b_.CreateLoad(int_ty(2 * w), fn_->getArg(base));
                 llvm::Value* z  = b_.CreateLoad(int_ty(w), fn_->getArg(base + 1));
-                lower_store(local_lvalue(k), Plane{ mm, z }, from_ref(f.param_types[k]));
+                lower_store(local_lvalue(k), Plane{ mm, z });
             }
         }
     }
@@ -3173,7 +3172,7 @@ private:
                 // so an element write wakes Any-edge waiters on a change to that
                 // element rather than always reading element 0.
                 llvm::Value*  old_mm  = service ? load_lv_mm(lv) : nullptr;
-                lower_store(lv, value_of(p.binary.r), type_of(p.binary.r));
+                lower_store(lv, value_of(p.binary.r));
                 if (service) {
                     service_wait_queue(lv.sig, old_mm, load_lv_mm(lv));
                 }
@@ -3312,12 +3311,15 @@ private:
                 }
                 set_value(i, lower_repl(value_of(p.repl.value), type_of(p.repl.value).width, p.repl.count));
                 return;
-            case Inst::Tag::Resize:
+            case Inst::Tag::Resize: {
+                // Truncate or extend all planes (sign per target type).
                 if (type_of(p.op_type.op).is_string) {
                     throw BackendError{ "internal: string value in resize" };
                 }
-                set_value(i, lower_resize(value_of(p.op_type.op), type_of(p.op_type.op), from_ref(p.op_type.type)));
+                const ValType to = from_ref(p.op_type.type);
+                set_value(i, cast_plane(value_of(p.op_type.op), to.width, to.is_signed));
                 return;
+            }
 
             case Inst::Tag::StrLen: {
                 llvm::Value* n = b_.CreateCall(str_len_fn(), { str_of(p.unary) });
@@ -3579,10 +3581,9 @@ private:
                       cast(b_.CreateLShr(z, off), lv.width, false));
     }
 
-    void lower_store(const LValue& lv, Plane rhs, ValType rhs_ty) {
+    void lower_store(const LValue& lv, Plane rhs) {
         const uint32_t s_width = lv.store_width;
         llvm::Value*   mp      = lv_mm_ptr(lv);
-        (void)rhs_ty;
 
         // Whole-storage store: the frontend context-sizes the RHS to the lvalue
         // width (via an inserted Resize), so rhs already matches the storage width
@@ -4839,13 +4840,6 @@ private:
             z    = b_.CreateOr(z, pz);
         }
         return packed(must, may, z);
-    }
-
-    // -- Resize: truncate or extend all planes (sign per target). --
-
-    Plane lower_resize(Plane v, ValType from, ValType to) {
-        (void)from;
-        return cast_plane(v, to.width, to.is_signed);
     }
 
     // -- Control flow: if/else with two regions. X/Z condition takes else. --
