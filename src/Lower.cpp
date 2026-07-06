@@ -216,7 +216,7 @@ ir::SignalInfo::Direction direction_of(slang::ast::ArgumentDirection d) {
 // The AST is walked rather than the lowered IR so reads are seen at the source
 // level, before any temporaries the IR introduces. Symbols not in `sigmap`
 // (parameters, genvars, other constants) carry no sensitivity and are skipped.
-struct SensitivityCollector : ASTVisitor<SensitivityCollector, true, true> {
+struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGood> {
     using SigMap = ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal>;
 
     const SigMap&                          sigmap;
@@ -1656,7 +1656,14 @@ private:
         if (args.size() < 2 || args.size() > 4) {
             fail("$readmem requires 2 to 4 arguments");
         }
-        const Expression& mem = *args[1];
+        // slang (post-8.0) binds the memory as a system-task output argument: an
+        // AssignmentExpression whose left side is the target lvalue, the same
+        // shape a user task's output actual has. Unwrap to the target.
+        const Expression* mem_arg = args[1];
+        if (mem_arg->kind == ExpressionKind::Assignment) {
+            mem_arg = &mem_arg->as<AssignmentExpression>().left();
+        }
+        const Expression& mem = *mem_arg;
         const auto*       vsb = mem.as_if<slang::ast::ValueExpressionBase>();
         if (vsb == nullptr || mem.type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() == nullptr) {
             // TODO: a sliced memory target (mem[a:b]) or a multidimensional slice.
@@ -2379,7 +2386,7 @@ private:
         // dynamic BitSelect gap and shifts by the raw value.
         const auto    width = static_cast<uint32_t>(const_uint(rs.right()));
         const bool    down  = rs.getSelectionKind() == RangeSelectionKind::IndexedDown;
-        const int32_t bias  = down == range.isLittleEndian() ? static_cast<int32_t>(width) - 1 : 0;
+        const int32_t bias  = down == range.isDescending() ? static_cast<int32_t>(width) - 1 : 0;
         const ir::Index off = lower_packed_offset(rs.left(), range, bias, b, l);
         return b.dyn_part_select(base, off, width, l);
     }
@@ -2464,7 +2471,7 @@ private:
         }
         const ir::Ref   off_ty = make_int_type(32, idx.type->isFourState(), idx.type->isSigned());
         const ir::Index v      = b.resize(lower_expr(idx, b), off_ty, l);
-        if (range.isLittleEndian()) {
+        if (range.isDescending()) {
             const int32_t sub = range.right + bias; // off = idx - right - bias
             if (sub == 0) {
                 return v;
