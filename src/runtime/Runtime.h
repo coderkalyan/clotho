@@ -78,11 +78,12 @@ void rt_fflush(void);
 
 // $readmemh / $readmemb (LRM 1800-2023 §21.4): load a hex/binary text file into an
 // unpacked-array memory. `path_buf`/`path_len` carry the filename as a packed-ASCII
-// vector; `mm_base`/`z_base` point at element 0's must|may and z words in the state
-// buffer, strided by `stride` (`z_base` is null when the memory's slot stores no z
-// word); `count`/`width` describe the memory; `decl_left`/`decl_right` are its
+// vector, or as bytes in natural order when flags bit4 is set (a string-object
+// filename); `mm_base`/`z_base` point at element 0's must|may and z words in the
+// state buffer, strided by `stride` (`z_base` is null when the memory's slot stores
+// no z word); `count`/`width` describe the memory; `decl_left`/`decl_right` are its
 // declared address bounds (for `@addr` and start/finish mapping). `flags` bit0=hex,
-// bit1=has_start, bit2=has_finish, bit3=four_state.
+// bit1=has_start, bit2=has_finish, bit3=four_state, bit4=path_forward.
 void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8_t* z_base, uint32_t stride,
                 uint32_t count, uint32_t width, int64_t decl_left, int64_t decl_right, int64_t start,
                 int64_t finish, uint32_t flags);
@@ -161,6 +162,10 @@ void rt_string_assign_bytes(rt_string* dst, const char* p, uint64_t n);
 
 // Length in bytes ($.len()). The empty string has length 0.
 uint64_t rt_string_len(const rt_string* s);
+
+// Pointer to the string's bytes (not NUL-terminated; length via rt_string_len).
+// Valid until the next mutation of `s`.
+const char* rt_string_data(const rt_string* s);
 
 // dst = parts[0] .. parts[n-1] concatenated. dst may appear among the parts
 // (a = {a, b}).

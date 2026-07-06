@@ -1732,6 +1732,51 @@ TEST_CASE("$readmemb parses x/z and a runtime-string filename") {
     std::remove(path);
 }
 
+// A string-variable filename (LRM §21.4: the filename may be a string data type)
+// resolves through the rt_string handle at run time; the bytes are in natural
+// order, unlike the reversed packed-ASCII form. Cross-checked against Icarus
+// Verilog. Regression: this previously crashed the compiler (null value plane).
+TEST_CASE("$readmemh accepts a string-variable filename") {
+    const char* path = "clotho_readmemh_strvar_test.hex";
+    write_file(path, "de ad be ef\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] mem [0:3];
+            string fname;
+            initial begin
+                fname = ")") + path + R"(";
+                $readmemh(fname, mem);
+                $display("%h %h %h %h", mem[0], mem[1], mem[2], mem[3]);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "de ad be ef\n");
+    std::remove(path);
+}
+
+// A string-expression filename (a concatenation) is also legal per LRM §21.4:
+// "The filename is an expression that is a string literal, string data type, or
+// an integral data type". Cross-checked against Icarus Verilog.
+TEST_CASE("$readmemh accepts a string-expression filename") {
+    const char* path = "clotho_readmemh_strexpr_test.hex";
+    write_file(path, "12 34\n");
+    const std::string src = R"(
+        module m;
+            logic [7:0] mem [0:1];
+            string base;
+            initial begin
+                base = "clotho_readmemh_strexpr_test";
+                $readmemh({base, ".hex"}, mem);
+                $display("%h %h", mem[0], mem[1]);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "12 34\n");
+    std::remove(path);
+}
+
 // Default load fills from the lowest address upward regardless of the declared
 // range direction; a descending range [3:0] therefore maps the first datum to
 // address 0 (storage slot 3). This is the LRM §21.4 rule, which Icarus follows and

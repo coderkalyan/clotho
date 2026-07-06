@@ -2629,6 +2629,9 @@ private:
     llvm::FunctionCallee str_len_fn() {
         return str_rt_fn("rt_string_len", b_.getInt64Ty(), { raw_ptr_ty() });
     }
+    llvm::FunctionCallee str_data_fn() {
+        return str_rt_fn("rt_string_data", raw_ptr_ty(), { raw_ptr_ty() });
+    }
     llvm::FunctionCallee str_concat_fn() {
         return str_rt_fn("rt_string_concat", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
     }
@@ -2958,7 +2961,9 @@ private:
             case Inst::Tag::StrICmp:
                 return { 32, false, true };
             case Inst::Tag::StrGetc:
-                return { 8, false, false };
+                // getc / s[i] return `byte`, which is signed (LRM 6.16.3 and
+                // Table 6-8), so 0xff displays as -1 under %d.
+                return { 8, false, true };
             case Inst::Tag::StrUpper:
             case Inst::Tag::StrLower:
             case Inst::Tag::StrSubstr:
@@ -3858,8 +3863,9 @@ private:
         return llmod_.getOrInsertFunction("rt_readmem", fnty);
     }
 
-    // Lower a $readmemh / $readmemb: spill the filename to a stack buffer and hand
-    // the runtime the destination memory's plane bases (element 0) and geometry. The
+    // Lower a $readmemh / $readmemb: hand the runtime the filename bytes (spilled
+    // to a stack buffer, or read from the rt_string handle for a string-typed
+    // filename) plus the destination memory's plane bases (element 0) and geometry. The
     // runtime opens the file and writes element planes straight into `state`. The mm
     // and z words of element i sit at the plane bases + i*stride (one slot struct
     // per element), so the two region bases plus the stride address every element.
@@ -3876,12 +3882,26 @@ private:
             throw BackendError{ "$readmem into a memory with elements wider than 64 bits is not supported" };
         }
 
-        // Spill the filename's must-bits to a byte buffer: the value is a packed-
-        // ASCII vector (string literal or reg), so its low bytes are the path.
-        const ValType  fty    = type_of(fname);
-        const uint32_t fbytes = std::max<uint32_t>((fty.width + 7) / 8, 1);
-        llvm::Value*   path   = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(fbytes), "readmem.path");
-        b_.CreateAlignedStore(must_of(value_of(fname)), path, llvm::Align(1));
+        // A string-object filename (LRM §21.4 allows a string-typed expression) is
+        // read straight from its rt_string handle: bytes in natural order, so the
+        // runtime is told to skip the packed-vector byte reversal (flags bit 4).
+        // Otherwise spill the filename's must-bits to a byte buffer: the value is
+        // a packed-ASCII vector (string literal or reg), so its low bytes are the
+        // path.
+        const ValType fty         = type_of(fname);
+        llvm::Value*  path        = nullptr;
+        llvm::Value*  path_len    = nullptr;
+        const bool    fname_is_str = fty.is_string;
+        if (fname_is_str) {
+            llvm::Value* handle = str_of(fname);
+            path                = b_.CreateCall(str_data_fn(), { handle });
+            path_len            = b_.CreateTrunc(b_.CreateCall(str_len_fn(), { handle }), b_.getInt32Ty());
+        } else {
+            const uint32_t fbytes = std::max<uint32_t>((fty.width + 7) / 8, 1);
+            path                  = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(fbytes), "readmem.path");
+            path_len              = b_.getInt32(fbytes);
+            b_.CreateAlignedStore(must_of(value_of(fname)), path, llvm::Align(1));
+        }
 
         // The runtime addresses element i's planes at base + i*stride, so hand it
         // element 0's typed field pointers and the slot struct's alloc size.
@@ -3905,10 +3925,11 @@ private:
         llvm::Value* finish = info.has_finish ? i64_of(info.finish) : b_.getInt64(0);
 
         const uint32_t flags = (info.hex ? 1u : 0u) | (info.has_start ? 2u : 0u) |
-                               (info.has_finish ? 4u : 0u) | (s.four_state ? 8u : 0u);
+                               (info.has_finish ? 4u : 0u) | (s.four_state ? 8u : 0u) |
+                               (fname_is_str ? 16u : 0u);
 
         b_.CreateCall(readmem_fn(),
-                      { path, b_.getInt32(fbytes), mm_base, z_base, b_.getInt32(stride),
+                      { path, path_len, mm_base, z_base, b_.getInt32(stride),
                         b_.getInt32(s.elem_count), b_.getInt32(s.width), b_.getInt64(at.left),
                         b_.getInt64(at.right), start, finish, b_.getInt32(flags) });
     }

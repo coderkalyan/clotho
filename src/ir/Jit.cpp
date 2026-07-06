@@ -104,6 +104,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config) {
     expose("rt_string_assign", &rt_string_assign);
     expose("rt_string_assign_bytes", &rt_string_assign_bytes);
     expose("rt_string_len", &rt_string_len);
+    expose("rt_string_data", &rt_string_data);
     expose("rt_string_concat", &rt_string_concat);
     expose("rt_string_repl", &rt_string_repl);
     expose("rt_string_cmp", &rt_string_cmp);
