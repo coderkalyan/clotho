@@ -105,10 +105,12 @@ struct ElemSelect {
 };
 
 // Extra payload for `read_mem`: a $readmemh / $readmemb load of a file into an
-// unpacked-array memory. The filename value is the instruction's `op` (a packed-
-// ASCII vector; the backend spills its must-bits to a byte buffer). `target` is the
-// destination memory signal. `start` / `finish` are optional address-bound operands
-// (valid per `has_start` / `has_finish`). `hex` selects hex vs binary digits.
+// unpacked-array memory. The filename value is the instruction's `op`: either a
+// packed-ASCII vector (the backend spills its must-bits to a byte buffer) or a
+// string value (the backend reads the rt_string handle's bytes at the call site).
+// `target` is the destination memory signal. `start` / `finish` are optional
+// address-bound operands (valid per `has_start` / `has_finish`). `hex` selects hex
+// vs binary digits.
 struct ReadMemInfo {
     // Destination memory signal.
     Signal target;

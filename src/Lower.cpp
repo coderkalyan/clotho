@@ -1650,7 +1650,9 @@ private:
     // $readmemh / $readmemb (LRM §21.4): load a file into an unpacked-array memory.
     // Forms: (file, mem), (file, mem, start), (file, mem, start, finish). The memory
     // must be a whole unpacked array (a plain name or hierarchical reference); the
-    // filename and optional address bounds are general runtime values.
+    // filename is a string literal, string-typed expression, or integral value
+    // holding packed ASCII (LRM §21.4), and the optional address bounds are general
+    // runtime values.
     void lower_readmem(const CallExpression& call, bool hex, ir::Builder& b) {
         const auto args = call.arguments();
         if (args.size() < 2 || args.size() > 4) {

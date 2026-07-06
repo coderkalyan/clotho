@@ -512,21 +512,28 @@ int bin_digit(char c) {
 extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8_t* z_base,
                            uint32_t stride, uint32_t count, uint32_t width, int64_t decl_left,
                            int64_t decl_right, int64_t start, int64_t finish, uint32_t flags) {
-    const bool hex        = (flags & 1u) != 0;
-    const bool has_start  = (flags & 2u) != 0;
-    const bool has_finish = (flags & 4u) != 0;
-    const bool four_state = (flags & 8u) != 0;
+    const bool hex          = (flags & 1u) != 0;
+    const bool has_start    = (flags & 2u) != 0;
+    const bool has_finish   = (flags & 4u) != 0;
+    const bool four_state   = (flags & 8u) != 0;
+    const bool path_forward = (flags & 16u) != 0;
 
-    // Reconstruct the path. The filename value is a right-justified packed-ASCII
-    // vector, so its bytes are little-endian (byte 0 = last character); the high
-    // bytes are zero padding. Walk from the top non-zero byte down.
+    // Reconstruct the path. A string-object filename (path_forward) arrives as its
+    // bytes in natural order. Otherwise the filename value is a right-justified
+    // packed-ASCII vector, so its bytes are little-endian (byte 0 = last
+    // character); the high bytes are zero padding. Walk from the top non-zero
+    // byte down.
     std::string path;
-    uint32_t    hi = path_len;
-    while (hi > 0 && path_buf[hi - 1] == 0) {
-        --hi;
-    }
-    for (uint32_t k = hi; k-- > 0;) {
-        path.push_back(static_cast<char>(path_buf[k]));
+    if (path_forward) {
+        path.assign(path_buf, path_len);
+    } else {
+        uint32_t hi = path_len;
+        while (hi > 0 && path_buf[hi - 1] == 0) {
+            --hi;
+        }
+        for (uint32_t k = hi; k-- > 0;) {
+            path.push_back(static_cast<char>(path_buf[k]));
+        }
     }
 
     std::FILE* f = std::fopen(path.c_str(), "rb");
@@ -711,6 +718,10 @@ extern "C" void rt_string_assign_bytes(rt_string* dst, const char* p, uint64_t n
 
 extern "C" uint64_t rt_string_len(const rt_string* s) {
     return str_len(s);
+}
+
+extern "C" const char* rt_string_data(const rt_string* s) {
+    return str_data(s);
 }
 
 extern "C" void rt_string_concat(rt_string* dst, const rt_string* const* parts, uint32_t n) {
