@@ -212,6 +212,28 @@ TEST_CASE("2-state NBA-target signal keeps the packed slot") {
     CHECK(ir.find("%bit.8 = type { i8 }") == std::string::npos);
 }
 
+// A plain 2-state memory shrinks to [N x { iW }] elements and reads/writes
+// correctly.
+TEST_CASE("2-state memory element storage shrinks to iW") {
+    const std::string ir = emit(R"(
+        module m;
+            bit [7:0] a [0:3];
+            initial begin a[0] = 8'd5; a[1] = a[0] + 8'd1; end
+        endmodule
+    )");
+    CHECK(ir.find("[4 x %bit.8]") != std::string::npos);
+    CHECK(ir.find("%bit.8 = type { i8 }") != std::string::npos);
+
+    const std::string out = run_capture(prog(
+      "bit [7:0] a [0:3]; int s;",
+      R"(
+        a[0]=8'd5; a[1]=8'd10; a[2]=8'd20; a[3]=8'd40;
+        s = a[0]+a[1]+a[2]+a[3];
+        $display("%0d %0d", s, a[2]);
+      )"));
+    CHECK(out == "75 20\n");
+}
+
 // posedge / negedge detection works on a 2-state (bit) clock.
 TEST_CASE("edge sensitivity on a bit clock") {
     const std::string out = run_capture(R"(

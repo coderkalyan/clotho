@@ -575,6 +575,7 @@ private:
         // Classify NBA targets up front so the slot loop can keep an NBA-target
         // 2-state signal on the packed word (its shadow / commit still expect it).
         nba_classify();
+        const std::vector<bool> readmem_target = readmem_targets();
 
         // A slot keeps its z word when the may-z analysis cannot prove it z-free
         // or the task ABI needs z storage behind it. Elision is analysis-driven,
@@ -614,12 +615,16 @@ private:
             slot.init_z      = undriven[i] && sigs[i].is_net && slot.four_state;
             slot.has_z       = may_z[i] || task_out[i] || slot.init_z;
             // A 2-state signal drops the packed must|may word for a genuine iW slot
-            // when it is decoupled from every path that still reads the packed form:
-            // it is never-z (so not a task out/inout target, which forces has_z),
-            // not an NBA target (its shadow / commit are still packed), and not an
-            // unpacked array (memory element layout is still packed).
-            const bool is_arr = ty.kind == Type::Kind::UnpackedArray;
-            slot.narrow      = !slot.four_state && !slot.has_z && !slot.nba && !is_arr;
+            // (or `[N x { iW }]` memory) when it is decoupled from every path that
+            // still reads the packed form: it is never-z (so not a task out/inout
+            // target, which forces has_z), not a scalar NBA target (its shadow /
+            // commit are packed), not an unpacked-array NBA target (the deferred
+            // queue writes the packed word), and not a $readmem target (rt_readmem
+            // writes the packed word).
+            const bool arr_nba =
+              std::find(array_nba_sigs_.begin(), array_nba_sigs_.end(), static_cast<Signal>(i)) !=
+              array_nba_sigs_.end();
+            slot.narrow = !slot.four_state && !slot.has_z && !slot.nba && !arr_nba && !readmem_target[i];
             slot.slot_ty     = slot_type(slot.width, slot.four_state, slot.has_z, slot.narrow);
             if (ty.kind == Type::Kind::UnpackedArray) {
                 slot.is_array   = true;
@@ -744,6 +749,29 @@ private:
     // ABI constraint, not a may-z fact, hence separate from compute_may_z.
     // (An alternative — a caller-stack z scratch word for elided targets — is
     // sound but adds a second mechanism for a rare construct.)
+    // Signals that are a $readmem destination: rt_readmem writes the packed
+    // must|may word, so such a memory keeps the packed element layout.
+    std::vector<bool> readmem_targets() const {
+        std::vector<bool> out(mod_.signals().size(), false);
+        const auto        scan = [&](const Ir& ir) {
+            for (size_t k = 0; k < ir.inst_count(); ++k) {
+                const auto idx = static_cast<Index>(k);
+                if (ir.tag(idx) != Inst::Tag::ReadMem) {
+                    continue;
+                }
+                const auto info = ir.extra_data<ReadMemInfo>(ir.payload(idx).op_extra.extra);
+                out[static_cast<uint32_t>(info.target)] = true;
+            }
+        };
+        for (const Process& p : mod_.processes()) {
+            scan(p.ir);
+        }
+        for (uint32_t i = 0; i < mod_.function_count(); ++i) {
+            scan(mod_.function(static_cast<FunctionId>(i)).ir);
+        }
+        return out;
+    }
+
     std::vector<bool> task_out_targets() const {
         std::vector<bool> out(mod_.signals().size(), false);
         const auto        scan = [&](const Ir& ir) {
@@ -2742,7 +2770,7 @@ private:
     void emit_array_init(llvm::Value* state, const SignalSlot& s) {
         const uint32_t w   = s.width;
         auto*          i32 = b_.getInt32Ty();
-        llvm::Value*   mm  = s.four_state ? x_mm(w) : zero(2 * w);
+        llvm::Value*   mm  = s.narrow ? zero(w) : (s.four_state ? x_mm(w) : zero(2 * w));
         auto*        arr_ty = llvm::cast<llvm::ArrayType>(s.storage_ty);
         llvm::Value* base   = storage_ptr(state, s);
 
