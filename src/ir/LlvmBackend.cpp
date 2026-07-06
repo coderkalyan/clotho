@@ -411,6 +411,11 @@ private:
     llvm::ConstantInt* ones(uint32_t width) const {
         return llvm::ConstantInt::get(ctx_, llvm::APInt::getAllOnes(width == 0 ? 1 : width));
     }
+    // The all-X packed i(2W) must|may word: every bit X (must 0, may 1), i.e.
+    // the high W bits set. Also the must|may half of all-Z.
+    llvm::ConstantInt* x_mm(uint32_t width) const {
+        return llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * width, width));
+    }
 
     // Cast an integer value to width `to` (zero/sign extend or truncate).
     llvm::Value* cast(llvm::Value* v, uint32_t to, bool sign) {
@@ -1102,9 +1107,7 @@ private:
                 b_.CreateCall(str_init_fn(), { slot });
                 continue;
             }
-            llvm::Value*     mm   = s.four_state
-                                      ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * s.width, s.width))
-                                      : zero(2 * s.width);
+            llvm::Value*     mm   = s.four_state ? x_mm(s.width) : zero(2 * s.width);
             b_.CreateStore(mm, b_.CreateStructGEP(s.slot_ty, slot, 0));
             b_.CreateStore(zero(s.width), b_.CreateStructGEP(s.slot_ty, slot, 1));
         }
@@ -1599,15 +1602,10 @@ private:
                     continue;
                 }
                 for (const WaitEdge& we : p.ir.wait_edges(p.ir.payload(idx).wait)) {
-                    const Signal   s   = we.signal;
-                    const uint32_t e   = we.edge;
-                    bool           dup = false;
-                    for (const auto& pr : seen) {
-                        dup = dup || (pr.first == s && pr.second == e);
-                    }
-                    if (!dup) {
-                        seen.emplace_back(s, e);
-                        c.dyn[static_cast<uint32_t>(s)][e]++;
+                    const std::pair<Signal, uint32_t> key{ we.signal, we.edge };
+                    if (!std::ranges::contains(seen, key)) {
+                        seen.push_back(key);
+                        c.dyn[static_cast<uint32_t>(we.signal)][we.edge]++;
                     }
                 }
             }
@@ -2050,15 +2048,9 @@ private:
         return b_.CreateLoad(b_.getInt32Ty(),
                              b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(field) }));
     }
-    llvm::Value* meta_ptr_at(llvm::Value* meta, unsigned field, uint32_t e) {
+    llvm::Value* meta_at(llvm::Value* meta, unsigned field, uint32_t e, llvm::Type* ty) {
         return b_.CreateLoad(
-          llvm::PointerType::getUnqual(ctx_),
-          b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(field), b_.getInt32(e) }));
-    }
-    llvm::Value* meta_i32_at(llvm::Value* meta, unsigned field, uint32_t e) {
-        return b_.CreateLoad(
-          b_.getInt32Ty(),
-          b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(field), b_.getInt32(e) }));
+          ty, b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(field), b_.getInt32(e) }));
     }
 
     // Generic static-queue scan (base + capacity values), null base => no
@@ -2172,8 +2164,10 @@ private:
             auto* cont = llvm::BasicBlock::Create(ctx_, "nsvc.cont", fn);
             b_.CreateCondBr(fact, body, cont);
             b_.SetInsertPoint(body);
-            emit_static_scan_rt(meta_ptr_at(meta, 5, e), meta_i32_at(meta, 6, e));
-            emit_dynamic_scan_rt(meta_ptr_at(meta, 7, e), meta_ptr_at(meta, 8, e));
+            auto* ptr = raw_ptr_ty();
+            auto* i32 = b_.getInt32Ty();
+            emit_static_scan_rt(meta_at(meta, 5, e, ptr), meta_at(meta, 6, e, i32));
+            emit_dynamic_scan_rt(meta_at(meta, 7, e, ptr), meta_at(meta, 8, e, ptr));
             b_.CreateBr(cont);
             b_.SetInsertPoint(cont);
         }
@@ -2613,11 +2607,7 @@ private:
                 emit_array_init(state, s);
                 continue;
             }
-            // X (and the must|may half of Z) packs as the high W bits of the
-            // i(2W) must|may word (may=1, must=0).
-            llvm::Value* mm = s.four_state
-                                ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * s.width, s.width))
-                                : zero(2 * s.width);
+            llvm::Value* mm   = s.four_state ? x_mm(s.width) : zero(2 * s.width);
             llvm::Value* slot = storage_ptr(state, s);
             b_.CreateStore(mm, b_.CreateStructGEP(s.slot_ty, slot, 0));
             if (s.has_z) {
@@ -2673,9 +2663,7 @@ private:
     void emit_array_init(llvm::Value* state, const SignalSlot& s) {
         const uint32_t w   = s.width;
         auto*          i32 = b_.getInt32Ty();
-        llvm::Value*   mm  = s.four_state
-                               ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w))
-                               : zero(2 * w);
+        llvm::Value*   mm  = s.four_state ? x_mm(w) : zero(2 * w);
         auto*        arr_ty = llvm::cast<llvm::ArrayType>(s.storage_ty);
         llvm::Value* base   = storage_ptr(state, s);
 
@@ -3311,11 +3299,13 @@ private:
                 return;
 
             case Inst::Tag::Finish:
-                lower_finish();
+                // $finish / $stop: rt_finish exits the process and never
+                // returns (noreturn), so the optimizer prunes the region tail.
+                b_.CreateCall(finish_fn(), {});
                 return;
 
             case Inst::Tag::Fflush:
-                lower_fflush();
+                b_.CreateCall(fflush_fn(), {});
                 return;
 
             case Inst::Tag::ReadMem:
@@ -3731,21 +3721,9 @@ private:
         return fn;
     }
 
-    // Lower a $finish / $stop: call the runtime, which exits the process. The call
-    // never returns, so the rest of the region is dead, but it stays valid IR —
-    // rt_finish is marked noreturn and the optimizer prunes the unreachable tail.
-    void lower_finish() {
-        b_.CreateCall(finish_fn(), {});
-    }
-
-    // void rt_fflush(void) — flush all open output buffers.
+    // void rt_fflush(void) — flush all open output buffers ($fflush, no-arg form).
     llvm::FunctionCallee fflush_fn() {
         return rt_fn("rt_fflush", b_.getVoidTy(), {});
-    }
-
-    // Lower a $fflush (no-arg form): flush the runtime's output buffers.
-    void lower_fflush() {
-        b_.CreateCall(fflush_fn(), {});
     }
 
     // void rt_readmem(const char* path, i32 path_len, i8* mm_base, i8* z_base,
@@ -4081,6 +4059,17 @@ private:
         return packed(cast(must_of(a), to, sign), cast(may_of(a), to, sign), cast(a.z, to, sign));
     }
 
+    // Combined per-bit X/Z mask (iW) of two same-width operands, tested once
+    // for the pair. The X mask of a packed value is `must ^ may`, which sits
+    // in the low W bits of `mm ^ (mm >> W)`. X-ness is nonlinear, so each
+    // operand's mask is taken separately before OR-ing (merging the mm words
+    // first would be wrong).
+    llvm::Value* xz_mask(Plane a, Plane b, uint32_t w) {
+        llvm::Value* xa = b_.CreateXor(a.mm, b_.CreateLShr(a.mm, w));
+        llvm::Value* xb = b_.CreateXor(b.mm, b_.CreateLShr(b.mm, w));
+        return b_.CreateTrunc(b_.CreateOr(xa, xb), int_ty(w));
+    }
+
     // -- Arithmetic: any X/Z in an operand makes the whole result X. --
     //
     // Lowered as a branch, not a select: the X case is rare, so it is split into a
@@ -4107,15 +4096,7 @@ private:
 
         auto* wide = int_ty(2 * w);
 
-        // Any X/Z bit in either operand, tested once for the pair. The per-bit X
-        // mask of a packed value is `must ^ may`, which sits in the low W bits of
-        // `mm ^ (mm >> W)`. OR the two operands' masks and do a single nonzero
-        // test instead of checking a and b separately. (The values can't be merged
-        // before this step: X-ness is nonlinear, so OR-ing mm first is wrong.)
-        llvm::Value* xa      = b_.CreateXor(a.mm, b_.CreateLShr(a.mm, w));
-        llvm::Value* xb      = b_.CreateXor(b.mm, b_.CreateLShr(b.mm, w));
-        llvm::Value* xmask   = b_.CreateTrunc(b_.CreateOr(xa, xb), int_ty(w));
-        llvm::Value* unknown = b_.CreateICmpNE(xmask, zero(w));
+        llvm::Value* unknown = b_.CreateICmpNE(xz_mask(a, b, w), zero(w));
 
         auto* x_bb   = llvm::BasicBlock::Create(ctx_, "arith.x", fn_);
         auto* val_bb = llvm::BasicBlock::Create(ctx_, "arith.val", fn_);
@@ -4124,9 +4105,9 @@ private:
         llvm::BranchInst* br = b_.CreateCondBr(unknown, x_bb, val_bb);
         br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
 
-        // Cold: whole result is X = every bit (must 0, may 1) = the high-half ones.
+        // Cold: whole result is X.
         b_.SetInsertPoint(x_bb);
-        llvm::Value* x_mm = llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w));
+        llvm::Value* x_word = x_mm(w);
         b_.CreateBr(end_bb);
 
         // Hot: one W-bit op on the value, duplicated into both planes.
@@ -4150,7 +4131,7 @@ private:
 
         b_.SetInsertPoint(end_bb);
         llvm::PHINode* mm = b_.CreatePHI(wide, 2);
-        mm->addIncoming(x_mm, x_bb);
+        mm->addIncoming(x_word, x_bb);
         mm->addIncoming(val_mm, val_bb);
         return { mm, zero(w) };
     }
@@ -4177,10 +4158,7 @@ private:
         // both map to an all-X result, so a single not-taken branch is optimal. For
         // 2-state operands the X/Z half is statically zero and instcombine drops it,
         // leaving just `divisor == 0`.
-        llvm::Value* xa      = b_.CreateXor(a.mm, b_.CreateLShr(a.mm, w));
-        llvm::Value* xb      = b_.CreateXor(b.mm, b_.CreateLShr(b.mm, w));
-        llvm::Value* xmask   = b_.CreateTrunc(b_.CreateOr(xa, xb), int_ty(w));
-        llvm::Value* unknown = b_.CreateICmpNE(xmask, zero(w));
+        llvm::Value* unknown = b_.CreateICmpNE(xz_mask(a, b, w), zero(w));
         llvm::Value* divzero = b_.CreateICmpEQ(bm, zero(w));
         llvm::Value* cold    = b_.CreateOr(unknown, divzero);
 
@@ -4192,7 +4170,7 @@ private:
         br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
 
         b_.SetInsertPoint(x_bb);
-        llvm::Value* x_mm = llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w));
+        llvm::Value* x_word = x_mm(w);
         b_.CreateBr(end_bb);
 
         // Hot: divisor guaranteed nonzero. Unsigned is a direct udiv/urem. Signed
@@ -4219,7 +4197,7 @@ private:
 
         b_.SetInsertPoint(end_bb);
         llvm::PHINode* mm = b_.CreatePHI(wide, 2);
-        mm->addIncoming(x_mm, x_bb);
+        mm->addIncoming(x_word, x_bb);
         mm->addIncoming(val_mm, val_bb);
         return { mm, zero(w) };
     }
@@ -4256,7 +4234,7 @@ private:
         br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
 
         b_.SetInsertPoint(x_bb);
-        llvm::Value* x_mm = llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w));
+        llvm::Value* x_word = x_mm(w);
         b_.CreateBr(end_bb);
 
         // Hot: exponentiation by squaring at the result width W. Every product wraps
@@ -4302,7 +4280,7 @@ private:
 
         b_.SetInsertPoint(end_bb);
         llvm::PHINode* mm = b_.CreatePHI(wide, 2);
-        mm->addIncoming(x_mm, x_bb);
+        mm->addIncoming(x_word, x_bb);
         mm->addIncoming(val_mm, loop);
         return { mm, zero(w) };
     }
@@ -4347,12 +4325,8 @@ private:
         // is already the answer. Real designs hit that case ~all the time per site,
         // so guard the cheap path and fall back to the full unpack only on X. The
         // combined X-mask `u` is computed once for the test and reused by the slow
-        // path. The X-mask of a packed value is its low W bits of `mm ^ (mm >> W)`
-        // (must ^ may); X-ness is nonlinear, so each operand's mask is taken
-        // separately before OR-ing.
-        llvm::Value* xa    = b_.CreateXor(a.mm, b_.CreateLShr(a.mm, w));
-        llvm::Value* xb    = b_.CreateXor(b.mm, b_.CreateLShr(b.mm, w));
-        llvm::Value* u     = b_.CreateTrunc(b_.CreateOr(xa, xb), int_ty(w));
+        // path.
+        llvm::Value* u     = xz_mask(a, b, w);
         llvm::Value* known = b_.CreateICmpEQ(u, zero(w));
 
         auto* fast_bb = llvm::BasicBlock::Create(ctx_, "xor.known", fn_);
