@@ -411,6 +411,11 @@ private:
     llvm::ConstantInt* ones(uint32_t width) const {
         return llvm::ConstantInt::get(ctx_, llvm::APInt::getAllOnes(width == 0 ? 1 : width));
     }
+    // The all-X packed i(2W) must|may word: every bit X (must 0, may 1), i.e.
+    // the high W bits set. Also the must|may half of all-Z.
+    llvm::ConstantInt* x_mm(uint32_t width) const {
+        return llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * width, width));
+    }
 
     // Cast an integer value to width `to` (zero/sign extend or truncate).
     llvm::Value* cast(llvm::Value* v, uint32_t to, bool sign) {
@@ -646,17 +651,11 @@ private:
         bool   whole;
     };
     NbaTarget nba_target(const Ir& ir, Index lv) const {
-        bool whole = true;
-        for (;;) {
-            switch (ir.tag(lv)) {
-                case Inst::Tag::Signal: return { ir.payload(lv).signal, whole };
-                case Inst::Tag::BitSelect: lv = ir.payload(lv).binary.l; whole = false; continue;
-                case Inst::Tag::PartSelect: lv = ir.payload(lv).op_extra.op; whole = false; continue;
-                case Inst::Tag::DynPartSelect: lv = ir.payload(lv).op_extra.op; whole = false; continue;
-                case Inst::Tag::ElemSelect: lv = ir.payload(lv).op_extra.op; whole = false; continue;
-                default: throw BackendError{ "unsupported nonblocking-assignment lvalue" };
-            }
+        const LvalueRoot r = lvalue_root(ir, lv);
+        if (ir.tag(r.root) != Inst::Tag::Signal) {
+            throw BackendError{ "unsupported nonblocking-assignment lvalue" };
         }
+        return { ir.payload(r.root).signal, r.whole };
     }
 
     // Mark NBA-target signals reached by one IR body (a process or a task): set
@@ -732,18 +731,9 @@ private:
                     if (callee.arg_dirs[a] == ArgDir::In) {
                         continue;
                     }
-                    Index lv = args[a];
-                    for (bool walking = true; walking;) {
-                        switch (ir.tag(lv)) {
-                            case Inst::Tag::BitSelect: lv = ir.payload(lv).binary.l; break;
-                            case Inst::Tag::PartSelect:
-                            case Inst::Tag::DynPartSelect:
-                            case Inst::Tag::ElemSelect: lv = ir.payload(lv).op_extra.op; break;
-                            default: walking = false; break;
-                        }
-                    }
-                    if (ir.tag(lv) == Inst::Tag::Signal) {
-                        out[static_cast<uint32_t>(ir.payload(lv).signal)] = true;
+                    const Index root = lvalue_root(ir, args[a]).root;
+                    if (ir.tag(root) == Inst::Tag::Signal) {
+                        out[static_cast<uint32_t>(ir.payload(root).signal)] = true;
                     }
                 }
             }
@@ -1117,9 +1107,7 @@ private:
                 b_.CreateCall(str_init_fn(), { slot });
                 continue;
             }
-            llvm::Value*     mm   = s.four_state
-                                      ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * s.width, s.width))
-                                      : zero(2 * s.width);
+            llvm::Value*     mm   = s.four_state ? x_mm(s.width) : zero(2 * s.width);
             b_.CreateStore(mm, b_.CreateStructGEP(s.slot_ty, slot, 0));
             b_.CreateStore(zero(s.width), b_.CreateStructGEP(s.slot_ty, slot, 1));
         }
@@ -1161,7 +1149,6 @@ private:
         b_.SetInsertPoint(entry);
         state_ = fn_->getArg(0);
         state_->setName("state");
-        fn_->addParamAttr(0, llvm::Attribute::NoAlias);
 
         frame_ = b_.CreateAlloca(frame_ty_, nullptr, "frame");
         init_frame();
@@ -1330,11 +1317,11 @@ private:
                                   { b_.CreateStructGEP(frame_ty_, frame_, k), fn_->getArg(base) });
                     continue;
                 }
-                lower_store(local_lvalue(k), Plane{ fn_->getArg(base), fn_->getArg(base + 1) }, from_ref(f.param_types[k]));
+                lower_store(local_lvalue(k), Plane{ fn_->getArg(base), fn_->getArg(base + 1) });
             } else if (f.arg_dirs[k] == ArgDir::Inout) {
                 llvm::Value* mm = b_.CreateLoad(int_ty(2 * w), fn_->getArg(base));
                 llvm::Value* z  = b_.CreateLoad(int_ty(w), fn_->getArg(base + 1));
-                lower_store(local_lvalue(k), Plane{ mm, z }, from_ref(f.param_types[k]));
+                lower_store(local_lvalue(k), Plane{ mm, z });
             }
         }
     }
@@ -1615,15 +1602,10 @@ private:
                     continue;
                 }
                 for (const WaitEdge& we : p.ir.wait_edges(p.ir.payload(idx).wait)) {
-                    const Signal   s   = we.signal;
-                    const uint32_t e   = we.edge;
-                    bool           dup = false;
-                    for (const auto& pr : seen) {
-                        dup = dup || (pr.first == s && pr.second == e);
-                    }
-                    if (!dup) {
-                        seen.emplace_back(s, e);
-                        c.dyn[static_cast<uint32_t>(s)][e]++;
+                    const std::pair<Signal, uint32_t> key{ we.signal, we.edge };
+                    if (!std::ranges::contains(seen, key)) {
+                        seen.push_back(key);
+                        c.dyn[static_cast<uint32_t>(we.signal)][we.edge]++;
                     }
                 }
             }
@@ -1914,107 +1896,23 @@ private:
     // Static sub-queue scan (one edge bucket): a fixed-trip loop over the
     // persistent subscriptions for this (signal, edge). The bucket's edge already
     // matched the transition (the caller guarded the whole scan), so there is no
-    // per-entry edge check. The capacity is a compile-time constant, so the
-    // optimizer may unroll. Membership never changes — no compaction, no length.
-    // Each entry wakes its process, but only if it is not already scheduled this
-    // instant (its flag is 0), then sets the flag; that flag collapses a
-    // multi-signal sensitivity (the same process subscribed under several signals)
-    // into a single wake.
+    // per-entry edge check. Emitted via the generic runtime scan with a constant
+    // non-null base and constant cap: simplifycfg (lower_coroutines) folds the
+    // dead null guard and the constant trip count still lets the optimizer
+    // unroll. Membership never changes — no compaction, no length.
     void service_static_queue(Signal sig, uint32_t edge) {
-        const auto        i      = static_cast<uint32_t>(sig);
-        auto*             q      = wait_sta_gv_[i][edge];
-        auto*             arr_ty = wait_sta_ty_[i][edge];
-        const uint32_t    cap    = wait_sta_cap_[i][edge];
-        llvm::StructType* elem   = wait_elem_ty();
-        auto*             ptr_ty = llvm::PointerType::getUnqual(ctx_);
-        auto*             i32    = b_.getInt32Ty();
-
-        auto* fn    = b_.GetInsertBlock()->getParent();
-        auto* head  = llvm::BasicBlock::Create(ctx_, "sta.head", fn);
-        auto* body  = llvm::BasicBlock::Create(ctx_, "sta.body", fn);
-        auto* wake  = llvm::BasicBlock::Create(ctx_, "sta.wake", fn);
-        auto* cont  = llvm::BasicBlock::Create(ctx_, "sta.cont", fn);
-        auto* done  = llvm::BasicBlock::Create(ctx_, "sta.done", fn);
-        auto* entry = b_.GetInsertBlock();
-        b_.CreateBr(head);
-
-        b_.SetInsertPoint(head);
-        auto* idx = b_.CreatePHI(i32, 2);
-        idx->addIncoming(b_.getInt32(0), entry);
-        b_.CreateCondBr(b_.CreateICmpULT(idx, b_.getInt32(cap)), body, done);
-
-        b_.SetInsertPoint(body);
-        llvm::Value* src     = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), idx });
-        llvm::Value* h       = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 0));
-        llvm::Value* fptr    = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 1));
-        llvm::Value* already = b_.CreateICmpNE(b_.CreateLoad(i32, fptr), b_.getInt32(0));
-        b_.CreateCondBr(already, cont, wake);
-
-        b_.SetInsertPoint(wake);
-        emit_active_push(b_, h);
-        b_.CreateStore(b_.getInt32(1), fptr); // mark scheduled
-        b_.CreateBr(cont);
-
-        b_.SetInsertPoint(cont);
-        llvm::Value* next = b_.CreateAdd(idx, b_.getInt32(1));
-        b_.CreateBr(head);
-        idx->addIncoming(next, cont);
-
-        b_.SetInsertPoint(done);
+        const auto i = static_cast<uint32_t>(sig);
+        emit_static_scan_rt(wait_sta_gv_[i][edge], b_.getInt32(wait_sta_cap_[i][edge]));
     }
 
     // Dynamic sub-queue scan (one edge bucket): a straight loop over the live
-    // one-shot waiters for this (signal, edge). The bucket's edge already matched
-    // the transition (the caller guarded the whole scan), so every entry fires.
-    // Each entry wakes its process, but only if it is not already scheduled this
-    // instant (its flag is 0), then sets the flag — collapsing a multi-signal
-    // intra-body wait (the same process registered under several signals firing
-    // together) into a single wake. The whole bucket is consumed, so the length
-    // resets to 0; the firing process deregisters its stale entries from any OTHER
-    // buckets itself on resume (eager removal in lower_wait).
+    // one-shot waiters for this (signal, edge), via the generic runtime scan
+    // with a constant non-null base. The whole bucket is consumed (length
+    // resets to 0); the firing process deregisters its stale entries from any
+    // OTHER buckets itself on resume (eager removal in lower_wait).
     void service_dynamic_queue(Signal sig, uint32_t edge) {
-        const auto        i      = static_cast<uint32_t>(sig);
-        auto*             q      = wait_dyn_gv_[i][edge];
-        auto*             arr_ty = wait_dyn_ty_[i][edge];
-        auto*             len_gv = wait_dyn_len_gv_[i][edge];
-        llvm::StructType* elem   = wait_elem_ty();
-        auto*             ptr_ty = llvm::PointerType::getUnqual(ctx_);
-        auto*             i32    = b_.getInt32Ty();
-
-        llvm::Value* n     = b_.CreateLoad(i32, len_gv);
-        auto*        fn    = b_.GetInsertBlock()->getParent();
-        auto*        head  = llvm::BasicBlock::Create(ctx_, "dyn.head", fn);
-        auto*        body  = llvm::BasicBlock::Create(ctx_, "dyn.body", fn);
-        auto*        wake  = llvm::BasicBlock::Create(ctx_, "dyn.wake", fn);
-        auto*        cont  = llvm::BasicBlock::Create(ctx_, "dyn.cont", fn);
-        auto*        done  = llvm::BasicBlock::Create(ctx_, "dyn.done", fn);
-        auto*        entry = b_.GetInsertBlock();
-        b_.CreateBr(head);
-
-        b_.SetInsertPoint(head);
-        auto* i_phi = b_.CreatePHI(i32, 2);
-        i_phi->addIncoming(b_.getInt32(0), entry);
-        b_.CreateCondBr(b_.CreateICmpULT(i_phi, n), body, done);
-
-        b_.SetInsertPoint(body);
-        llvm::Value* src     = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), i_phi });
-        llvm::Value* h       = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 0));
-        llvm::Value* fptr    = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 1));
-        llvm::Value* already = b_.CreateICmpNE(b_.CreateLoad(i32, fptr), b_.getInt32(0));
-        b_.CreateCondBr(already, cont, wake);
-
-        b_.SetInsertPoint(wake);
-        emit_active_push(b_, h);
-        b_.CreateStore(b_.getInt32(1), fptr); // mark scheduled
-        b_.CreateBr(cont);
-
-        b_.SetInsertPoint(cont);
-        llvm::Value* i_next = b_.CreateAdd(i_phi, b_.getInt32(1));
-        b_.CreateBr(head);
-        i_phi->addIncoming(i_next, cont);
-
-        b_.SetInsertPoint(done);
-        b_.CreateStore(b_.getInt32(0), len_gv);
+        const auto i = static_cast<uint32_t>(sig);
+        emit_dynamic_scan_rt(wait_dyn_gv_[i][edge], wait_dyn_len_gv_[i][edge]);
     }
 
     // Compacting removal of this coroutine's entries from one (signal, edge)
@@ -2150,19 +2048,17 @@ private:
         return b_.CreateLoad(b_.getInt32Ty(),
                              b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(field) }));
     }
-    llvm::Value* meta_ptr_at(llvm::Value* meta, unsigned field, uint32_t e) {
+    llvm::Value* meta_at(llvm::Value* meta, unsigned field, uint32_t e, llvm::Type* ty) {
         return b_.CreateLoad(
-          llvm::PointerType::getUnqual(ctx_),
-          b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(field), b_.getInt32(e) }));
-    }
-    llvm::Value* meta_i32_at(llvm::Value* meta, unsigned field, uint32_t e) {
-        return b_.CreateLoad(
-          b_.getInt32Ty(),
-          b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(field), b_.getInt32(e) }));
+          ty, b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(field), b_.getInt32(e) }));
     }
 
-    // Generic static-queue scan (runtime base + capacity), null base => no waiters.
-    // Mirrors service_static_queue but reads its trip count at runtime from meta.
+    // Generic static-queue scan (base + capacity values), null base => no
+    // waiters. Serves both callers: service_static_queue passes a constant
+    // global and cap; the NBA commit loop passes values read from meta. Each
+    // entry wakes its process only if its scheduled flag is 0, then sets the
+    // flag — collapsing a multi-signal sensitivity (the same process
+    // subscribed under several signals) into a single wake.
     void emit_static_scan_rt(llvm::Value* base, llvm::Value* cap) {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
@@ -2199,8 +2095,9 @@ private:
         b_.SetInsertPoint(done);
     }
 
-    // Generic dynamic-queue scan (runtime base + length pointer), null base => skip.
-    // Wakes every live entry (flag-deduped) and resets the length to 0.
+    // Generic dynamic-queue scan (base + length pointer values), null base =>
+    // skip. Serves both callers, like emit_static_scan_rt. Wakes every live
+    // entry (flag-deduped) and resets the length to 0.
     void emit_dynamic_scan_rt(llvm::Value* base, llvm::Value* lenptr) {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
@@ -2267,8 +2164,10 @@ private:
             auto* cont = llvm::BasicBlock::Create(ctx_, "nsvc.cont", fn);
             b_.CreateCondBr(fact, body, cont);
             b_.SetInsertPoint(body);
-            emit_static_scan_rt(meta_ptr_at(meta, 5, e), meta_i32_at(meta, 6, e));
-            emit_dynamic_scan_rt(meta_ptr_at(meta, 7, e), meta_ptr_at(meta, 8, e));
+            auto* ptr = raw_ptr_ty();
+            auto* i32 = b_.getInt32Ty();
+            emit_static_scan_rt(meta_at(meta, 5, e, ptr), meta_at(meta, 6, e, i32));
+            emit_dynamic_scan_rt(meta_at(meta, 7, e, ptr), meta_at(meta, 8, e, ptr));
             b_.CreateBr(cont);
             b_.SetInsertPoint(cont);
         }
@@ -2569,136 +2468,131 @@ private:
     llvm::Function* coro_intr(llvm::Intrinsic::ID id, llvm::ArrayRef<llvm::Type*> tys = {}) {
         return llvm::Intrinsic::getOrInsertDeclaration(&llmod_, id, tys);
     }
-    // ptr rt_alloc(i64) — coroutine frame allocation, sim-owned.
-    llvm::FunctionCallee alloc_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_alloc", llvm::FunctionType::get(ptr, { b_.getInt64Ty() }, false));
-    }
-    // void rt_free(ptr) — coroutine frame deallocation.
-    llvm::FunctionCallee free_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_free", llvm::FunctionType::get(b_.getVoidTy(), { ptr }, false));
-    }
 
-    // -- Timing wheel runtime (runtime/Runtime.h C ABI) --
+    // -- Runtime ABI (runtime/Runtime.h C ABI) --
+    //
+    // rt_fn declares (or fetches) one runtime entry point; each *_fn helper
+    // below pins one C signature. Every pointer parameter is an opaque ptr, so
+    // the LLVM-side signature is the C one with pointers erased; a helper
+    // carries a comment only where the C signature is not obvious from it.
 
-    // void rt_wheel_init(rt_wheel*) / void rt_wheel_deinit(rt_wheel*)
-    // -- Deferred array-NBA queue (rt_nba_arr_*) --
-    llvm::FunctionCallee nba_arr_push_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        auto* i32 = b_.getInt32Ty();
-        auto* fnty =
-          llvm::FunctionType::get(b_.getVoidTy(), { i32, ptr, ptr, ptr, i32, ptr, ptr, ptr, i32 }, false);
-        return llmod_.getOrInsertFunction("rt_nba_arr_push", fnty);
-    }
-    llvm::FunctionCallee nba_arr_pending_fn() {
-        return llmod_.getOrInsertFunction("rt_nba_arr_pending", llvm::FunctionType::get(b_.getInt32Ty(), {}, false));
-    }
-    llvm::FunctionCallee nba_arr_commit_fn() {
-        return llmod_.getOrInsertFunction("rt_nba_arr_commit", llvm::FunctionType::get(b_.getVoidTy(), {}, false));
-    }
-    llvm::FunctionCallee nba_arr_dirty_fn() {
-        return llmod_.getOrInsertFunction("rt_nba_arr_dirty",
-                                          llvm::FunctionType::get(b_.getInt32Ty(), { b_.getInt32Ty() }, false));
-    }
-    llvm::FunctionCallee nba_arr_reset_fn() {
-        return llmod_.getOrInsertFunction("rt_nba_arr_reset", llvm::FunctionType::get(b_.getVoidTy(), {}, false));
-    }
-
-    // -- String runtime (rt_string_*, runtime/Runtime.h) --
-
-    llvm::FunctionCallee str_rt_fn(const char* name, llvm::Type* ret, llvm::ArrayRef<llvm::Type*> params) {
+    llvm::FunctionCallee rt_fn(const char* name, llvm::Type* ret, llvm::ArrayRef<llvm::Type*> params) {
         return llmod_.getOrInsertFunction(name, llvm::FunctionType::get(ret, params, false));
     }
     llvm::Type* raw_ptr_ty() {
         return llvm::PointerType::getUnqual(ctx_);
     }
-    llvm::FunctionCallee str_init_fn() {
-        return str_rt_fn("rt_string_init", b_.getVoidTy(), { raw_ptr_ty() });
+
+    // Coroutine frame allocation, sim-owned: ptr rt_alloc(i64) / void rt_free(ptr).
+    llvm::FunctionCallee alloc_fn() {
+        return rt_fn("rt_alloc", raw_ptr_ty(), { b_.getInt64Ty() });
     }
-    llvm::FunctionCallee str_deinit_fn() {
-        return str_rt_fn("rt_string_deinit", b_.getVoidTy(), { raw_ptr_ty() });
-    }
-    llvm::FunctionCallee str_assign_fn() {
-        return str_rt_fn("rt_string_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
-    }
-    llvm::FunctionCallee str_assign_bytes_fn() {
-        return str_rt_fn("rt_string_assign_bytes", b_.getVoidTy(),
-                         { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
-    }
-    llvm::FunctionCallee str_len_fn() {
-        return str_rt_fn("rt_string_len", b_.getInt64Ty(), { raw_ptr_ty() });
-    }
-    llvm::FunctionCallee str_data_fn() {
-        return str_rt_fn("rt_string_data", raw_ptr_ty(), { raw_ptr_ty() });
-    }
-    llvm::FunctionCallee str_concat_fn() {
-        return str_rt_fn("rt_string_concat", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
-    }
-    llvm::FunctionCallee str_repl_fn() {
-        return str_rt_fn("rt_string_repl", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
-    }
-    llvm::FunctionCallee str_cmp_fn() {
-        return str_rt_fn("rt_string_cmp", b_.getInt32Ty(), { raw_ptr_ty(), raw_ptr_ty() });
-    }
-    llvm::FunctionCallee str_icmp_fn() {
-        return str_rt_fn("rt_string_icmp", b_.getInt32Ty(), { raw_ptr_ty(), raw_ptr_ty() });
-    }
-    llvm::FunctionCallee str_substr_fn() {
-        return str_rt_fn("rt_string_substr", b_.getVoidTy(),
-                         { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() });
-    }
-    llvm::FunctionCallee str_upper_fn() {
-        return str_rt_fn("rt_string_toupper", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
-    }
-    llvm::FunctionCallee str_lower_fn() {
-        return str_rt_fn("rt_string_tolower", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
-    }
-    llvm::FunctionCallee str_putc_fn() {
-        return str_rt_fn("rt_string_putc", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() });
-    }
-    llvm::FunctionCallee str_getc_fn() {
-        return str_rt_fn("rt_string_getc", b_.getInt32Ty(), { raw_ptr_ty(), b_.getInt32Ty() });
-    }
-    llvm::FunctionCallee str_from_packed_fn() {
-        return str_rt_fn("rt_string_from_packed", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
-    }
-    llvm::FunctionCallee str_to_packed_fn() {
-        return str_rt_fn("rt_string_to_packed", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+    llvm::FunctionCallee free_fn() {
+        return rt_fn("rt_free", b_.getVoidTy(), { raw_ptr_ty() });
     }
 
+    // Deferred array-NBA queue (rt_nba_arr_*).
+    // void rt_nba_arr_push(i32 sig, ptr mm_dst, ptr mm_val, ptr mm_mask,
+    //                      i32 mm_bytes, ptr z_dst, ptr z_val, ptr z_mask, i32 z_bytes)
+    llvm::FunctionCallee nba_arr_push_fn() {
+        auto* ptr = raw_ptr_ty();
+        auto* i32 = b_.getInt32Ty();
+        return rt_fn("rt_nba_arr_push", b_.getVoidTy(), { i32, ptr, ptr, ptr, i32, ptr, ptr, ptr, i32 });
+    }
+    llvm::FunctionCallee nba_arr_pending_fn() {
+        return rt_fn("rt_nba_arr_pending", b_.getInt32Ty(), {});
+    }
+    llvm::FunctionCallee nba_arr_commit_fn() {
+        return rt_fn("rt_nba_arr_commit", b_.getVoidTy(), {});
+    }
+    llvm::FunctionCallee nba_arr_dirty_fn() {
+        return rt_fn("rt_nba_arr_dirty", b_.getInt32Ty(), { b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee nba_arr_reset_fn() {
+        return rt_fn("rt_nba_arr_reset", b_.getVoidTy(), {});
+    }
+
+    // String runtime (rt_string_*); every ptr is an rt_string handle except
+    // where noted.
+    llvm::FunctionCallee str_init_fn() {
+        return rt_fn("rt_string_init", b_.getVoidTy(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_deinit_fn() {
+        return rt_fn("rt_string_deinit", b_.getVoidTy(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_assign_fn() {
+        return rt_fn("rt_string_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    // void rt_string_assign_bytes(rt_string*, const char* bytes, i64 len)
+    llvm::FunctionCallee str_assign_bytes_fn() {
+        return rt_fn("rt_string_assign_bytes", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+    }
+    llvm::FunctionCallee str_len_fn() {
+        return rt_fn("rt_string_len", b_.getInt64Ty(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_data_fn() {
+        return rt_fn("rt_string_data", raw_ptr_ty(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_concat_fn() {
+        return rt_fn("rt_string_concat", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_repl_fn() {
+        return rt_fn("rt_string_repl", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+    }
+    llvm::FunctionCallee str_cmp_fn() {
+        return rt_fn("rt_string_cmp", b_.getInt32Ty(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_icmp_fn() {
+        return rt_fn("rt_string_icmp", b_.getInt32Ty(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_substr_fn() {
+        return rt_fn("rt_string_substr", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_upper_fn() {
+        return rt_fn("rt_string_toupper", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_lower_fn() {
+        return rt_fn("rt_string_tolower", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_putc_fn() {
+        return rt_fn("rt_string_putc", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_getc_fn() {
+        return rt_fn("rt_string_getc", b_.getInt32Ty(), { raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_from_packed_fn() {
+        return rt_fn("rt_string_from_packed", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_to_packed_fn() {
+        return rt_fn("rt_string_to_packed", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+    }
+
+    // Timing wheel (rt_wheel_*); the ptr parameter is the rt_wheel.
     llvm::FunctionCallee wheel_init_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_wheel_init", llvm::FunctionType::get(b_.getVoidTy(), { ptr }, false));
+        return rt_fn("rt_wheel_init", b_.getVoidTy(), { raw_ptr_ty() });
     }
     llvm::FunctionCallee wheel_deinit_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_wheel_deinit", llvm::FunctionType::get(b_.getVoidTy(), { ptr }, false));
+        return rt_fn("rt_wheel_deinit", b_.getVoidTy(), { raw_ptr_ty() });
     }
-    // i64 rt_wheel_now(const rt_wheel*)
     llvm::FunctionCallee wheel_now_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_wheel_now", llvm::FunctionType::get(b_.getInt64Ty(), { ptr }, false));
+        return rt_fn("rt_wheel_now", b_.getInt64Ty(), { raw_ptr_ty() });
     }
-    // i32 rt_random(void)
     llvm::FunctionCallee random_fn() {
-        return llmod_.getOrInsertFunction("rt_random", llvm::FunctionType::get(b_.getInt32Ty(), {}, false));
+        return rt_fn("rt_random", b_.getInt32Ty(), {});
     }
-    // i32 rt_wheel_pending(const rt_wheel*)
     llvm::FunctionCallee wheel_pending_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_wheel_pending", llvm::FunctionType::get(b_.getInt32Ty(), { ptr }, false));
+        return rt_fn("rt_wheel_pending", b_.getInt32Ty(), { raw_ptr_ty() });
     }
     // void rt_wheel_schedule(rt_wheel*, rt_timer*, i64 deadline, rt_timer_fn)
     llvm::FunctionCallee wheel_schedule_fn() {
-        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, b_.getInt64Ty(), ptr }, false);
-        return llmod_.getOrInsertFunction("rt_wheel_schedule", fnty);
+        return rt_fn("rt_wheel_schedule", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
     }
     // void rt_wheel_tick(rt_wheel*, void* ctx)
     llvm::FunctionCallee wheel_tick_fn() {
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llmod_.getOrInsertFunction("rt_wheel_tick", llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false));
+        return rt_fn("rt_wheel_tick", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
 
     // Power-up the state struct: undriven 4-state nets come up Z (LRM 6.6 —
@@ -2713,11 +2607,7 @@ private:
                 emit_array_init(state, s);
                 continue;
             }
-            // X (and the must|may half of Z) packs as the high W bits of the
-            // i(2W) must|may word (may=1, must=0).
-            llvm::Value* mm = s.four_state
-                                ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * s.width, s.width))
-                                : zero(2 * s.width);
+            llvm::Value* mm   = s.four_state ? x_mm(s.width) : zero(2 * s.width);
             llvm::Value* slot = storage_ptr(state, s);
             b_.CreateStore(mm, b_.CreateStructGEP(s.slot_ty, slot, 0));
             if (s.has_z) {
@@ -2773,9 +2663,7 @@ private:
     void emit_array_init(llvm::Value* state, const SignalSlot& s) {
         const uint32_t w   = s.width;
         auto*          i32 = b_.getInt32Ty();
-        llvm::Value*   mm  = s.four_state
-                               ? llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w))
-                               : zero(2 * w);
+        llvm::Value*   mm  = s.four_state ? x_mm(w) : zero(2 * w);
         auto*        arr_ty = llvm::cast<llvm::ArrayType>(s.storage_ty);
         llvm::Value* base   = storage_ptr(state, s);
 
@@ -3173,7 +3061,7 @@ private:
                 // so an element write wakes Any-edge waiters on a change to that
                 // element rather than always reading element 0.
                 llvm::Value*  old_mm  = service ? load_lv_mm(lv) : nullptr;
-                lower_store(lv, value_of(p.binary.r), type_of(p.binary.r));
+                lower_store(lv, value_of(p.binary.r));
                 if (service) {
                     service_wait_queue(lv.sig, old_mm, load_lv_mm(lv));
                 }
@@ -3312,12 +3200,15 @@ private:
                 }
                 set_value(i, lower_repl(value_of(p.repl.value), type_of(p.repl.value).width, p.repl.count));
                 return;
-            case Inst::Tag::Resize:
+            case Inst::Tag::Resize: {
+                // Truncate or extend all planes (sign per target type).
                 if (type_of(p.op_type.op).is_string) {
                     throw BackendError{ "internal: string value in resize" };
                 }
-                set_value(i, lower_resize(value_of(p.op_type.op), type_of(p.op_type.op), from_ref(p.op_type.type)));
+                const ValType to = from_ref(p.op_type.type);
+                set_value(i, cast_plane(value_of(p.op_type.op), to.width, to.is_signed));
                 return;
+            }
 
             case Inst::Tag::StrLen: {
                 llvm::Value* n = b_.CreateCall(str_len_fn(), { str_of(p.unary) });
@@ -3408,11 +3299,13 @@ private:
                 return;
 
             case Inst::Tag::Finish:
-                lower_finish();
+                // $finish / $stop: rt_finish exits the process and never
+                // returns (noreturn), so the optimizer prunes the region tail.
+                b_.CreateCall(finish_fn(), {});
                 return;
 
             case Inst::Tag::Fflush:
-                lower_fflush();
+                b_.CreateCall(fflush_fn(), {});
                 return;
 
             case Inst::Tag::ReadMem:
@@ -3579,10 +3472,9 @@ private:
                       cast(b_.CreateLShr(z, off), lv.width, false));
     }
 
-    void lower_store(const LValue& lv, Plane rhs, ValType rhs_ty) {
+    void lower_store(const LValue& lv, Plane rhs) {
         const uint32_t s_width = lv.store_width;
         llvm::Value*   mp      = lv_mm_ptr(lv);
-        (void)rhs_ty;
 
         // Whole-storage store: the frontend context-sizes the RHS to the lvalue
         // width (via an inserted Resize), so rhs already matches the storage width
@@ -3789,23 +3681,18 @@ private:
 
     // void rt_display(const char* fmt, i32 argc, const rt_arg* argv)
     llvm::FunctionCallee display_fn() {
-        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, b_.getInt32Ty(), ptr }, false);
-        return llmod_.getOrInsertFunction("rt_display", fnty);
+        return rt_fn("rt_display", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
     }
 
     // void rt_timeformat_init(i64 tick_fs, i32 default_units)
     llvm::FunctionCallee timeformat_init_fn() {
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { b_.getInt64Ty(), b_.getInt32Ty() }, false);
-        return llmod_.getOrInsertFunction("rt_timeformat_init", fnty);
+        return rt_fn("rt_timeformat_init", b_.getVoidTy(), { b_.getInt64Ty(), b_.getInt32Ty() });
     }
 
     // void rt_timeformat_set(i32 units, i32 precision, const char* suffix, i32 suffix_len, i32 min_width)
     llvm::FunctionCallee timeformat_set_fn() {
-        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-        auto* i32  = b_.getInt32Ty();
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { i32, i32, ptr, i32, i32 }, false);
-        return llmod_.getOrInsertFunction("rt_timeformat_set", fnty);
+        auto* i32 = b_.getInt32Ty();
+        return rt_fn("rt_timeformat_set", b_.getVoidTy(), { i32, i32, raw_ptr_ty(), i32, i32 });
     }
 
     // Lower a $timeformat: evaluate the units / precision / min_width operands and
@@ -3823,44 +3710,30 @@ private:
                       { units, prec, sfx_ptr, b_.getInt32(static_cast<uint32_t>(suffix.size())), width });
     }
 
-    // void rt_finish(void) — noreturn; exits the process.
+    // void rt_finish(void) — noreturn; exits the process. Kept separate from
+    // the plain rt_fn helpers: the noreturn attribute must land on the
+    // declaration so the optimizer prunes the dead tail after a $finish.
     llvm::FunctionCallee finish_fn() {
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), false);
-        auto  fn   = llmod_.getOrInsertFunction("rt_finish", fnty);
+        auto fn = rt_fn("rt_finish", b_.getVoidTy(), {});
         if (auto* f = llvm::dyn_cast<llvm::Function>(fn.getCallee())) {
             f->setDoesNotReturn();
         }
         return fn;
     }
 
-    // Lower a $finish / $stop: call the runtime, which exits the process. The call
-    // never returns, so the rest of the region is dead, but it stays valid IR —
-    // rt_finish is marked noreturn and the optimizer prunes the unreachable tail.
-    void lower_finish() {
-        b_.CreateCall(finish_fn(), {});
-    }
-
-    // void rt_fflush(void) — flush all open output buffers.
+    // void rt_fflush(void) — flush all open output buffers ($fflush, no-arg form).
     llvm::FunctionCallee fflush_fn() {
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), false);
-        return llmod_.getOrInsertFunction("rt_fflush", fnty);
-    }
-
-    // Lower a $fflush (no-arg form): flush the runtime's output buffers.
-    void lower_fflush() {
-        b_.CreateCall(fflush_fn(), {});
+        return rt_fn("rt_fflush", b_.getVoidTy(), {});
     }
 
     // void rt_readmem(const char* path, i32 path_len, i8* mm_base, i8* z_base,
     //                 i32 stride, i32 count, i32 width, i64 decl_left, i64 decl_right,
     //                 i64 start, i64 finish, i32 flags)
     llvm::FunctionCallee readmem_fn() {
-        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-        auto* i32  = b_.getInt32Ty();
-        auto* i64  = b_.getInt64Ty();
-        auto* fnty = llvm::FunctionType::get(
-          b_.getVoidTy(), { ptr, i32, ptr, ptr, i32, i32, i32, i64, i64, i64, i64, i32 }, false);
-        return llmod_.getOrInsertFunction("rt_readmem", fnty);
+        auto* ptr = raw_ptr_ty();
+        auto* i32 = b_.getInt32Ty();
+        auto* i64 = b_.getInt64Ty();
+        return rt_fn("rt_readmem", b_.getVoidTy(), { ptr, i32, ptr, ptr, i32, i32, i32, i64, i64, i64, i64, i32 });
     }
 
     // Lower a $readmemh / $readmemb: hand the runtime the filename bytes (spilled
@@ -4186,6 +4059,17 @@ private:
         return packed(cast(must_of(a), to, sign), cast(may_of(a), to, sign), cast(a.z, to, sign));
     }
 
+    // Combined per-bit X/Z mask (iW) of two same-width operands, tested once
+    // for the pair. The X mask of a packed value is `must ^ may`, which sits
+    // in the low W bits of `mm ^ (mm >> W)`. X-ness is nonlinear, so each
+    // operand's mask is taken separately before OR-ing (merging the mm words
+    // first would be wrong).
+    llvm::Value* xz_mask(Plane a, Plane b, uint32_t w) {
+        llvm::Value* xa = b_.CreateXor(a.mm, b_.CreateLShr(a.mm, w));
+        llvm::Value* xb = b_.CreateXor(b.mm, b_.CreateLShr(b.mm, w));
+        return b_.CreateTrunc(b_.CreateOr(xa, xb), int_ty(w));
+    }
+
     // -- Arithmetic: any X/Z in an operand makes the whole result X. --
     //
     // Lowered as a branch, not a select: the X case is rare, so it is split into a
@@ -4212,15 +4096,7 @@ private:
 
         auto* wide = int_ty(2 * w);
 
-        // Any X/Z bit in either operand, tested once for the pair. The per-bit X
-        // mask of a packed value is `must ^ may`, which sits in the low W bits of
-        // `mm ^ (mm >> W)`. OR the two operands' masks and do a single nonzero
-        // test instead of checking a and b separately. (The values can't be merged
-        // before this step: X-ness is nonlinear, so OR-ing mm first is wrong.)
-        llvm::Value* xa      = b_.CreateXor(a.mm, b_.CreateLShr(a.mm, w));
-        llvm::Value* xb      = b_.CreateXor(b.mm, b_.CreateLShr(b.mm, w));
-        llvm::Value* xmask   = b_.CreateTrunc(b_.CreateOr(xa, xb), int_ty(w));
-        llvm::Value* unknown = b_.CreateICmpNE(xmask, zero(w));
+        llvm::Value* unknown = b_.CreateICmpNE(xz_mask(a, b, w), zero(w));
 
         auto* x_bb   = llvm::BasicBlock::Create(ctx_, "arith.x", fn_);
         auto* val_bb = llvm::BasicBlock::Create(ctx_, "arith.val", fn_);
@@ -4229,9 +4105,9 @@ private:
         llvm::BranchInst* br = b_.CreateCondBr(unknown, x_bb, val_bb);
         br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
 
-        // Cold: whole result is X = every bit (must 0, may 1) = the high-half ones.
+        // Cold: whole result is X.
         b_.SetInsertPoint(x_bb);
-        llvm::Value* x_mm = llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w));
+        llvm::Value* x_word = x_mm(w);
         b_.CreateBr(end_bb);
 
         // Hot: one W-bit op on the value, duplicated into both planes.
@@ -4255,7 +4131,7 @@ private:
 
         b_.SetInsertPoint(end_bb);
         llvm::PHINode* mm = b_.CreatePHI(wide, 2);
-        mm->addIncoming(x_mm, x_bb);
+        mm->addIncoming(x_word, x_bb);
         mm->addIncoming(val_mm, val_bb);
         return { mm, zero(w) };
     }
@@ -4282,10 +4158,7 @@ private:
         // both map to an all-X result, so a single not-taken branch is optimal. For
         // 2-state operands the X/Z half is statically zero and instcombine drops it,
         // leaving just `divisor == 0`.
-        llvm::Value* xa      = b_.CreateXor(a.mm, b_.CreateLShr(a.mm, w));
-        llvm::Value* xb      = b_.CreateXor(b.mm, b_.CreateLShr(b.mm, w));
-        llvm::Value* xmask   = b_.CreateTrunc(b_.CreateOr(xa, xb), int_ty(w));
-        llvm::Value* unknown = b_.CreateICmpNE(xmask, zero(w));
+        llvm::Value* unknown = b_.CreateICmpNE(xz_mask(a, b, w), zero(w));
         llvm::Value* divzero = b_.CreateICmpEQ(bm, zero(w));
         llvm::Value* cold    = b_.CreateOr(unknown, divzero);
 
@@ -4297,7 +4170,7 @@ private:
         br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
 
         b_.SetInsertPoint(x_bb);
-        llvm::Value* x_mm = llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w));
+        llvm::Value* x_word = x_mm(w);
         b_.CreateBr(end_bb);
 
         // Hot: divisor guaranteed nonzero. Unsigned is a direct udiv/urem. Signed
@@ -4324,7 +4197,7 @@ private:
 
         b_.SetInsertPoint(end_bb);
         llvm::PHINode* mm = b_.CreatePHI(wide, 2);
-        mm->addIncoming(x_mm, x_bb);
+        mm->addIncoming(x_word, x_bb);
         mm->addIncoming(val_mm, val_bb);
         return { mm, zero(w) };
     }
@@ -4361,7 +4234,7 @@ private:
         br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
 
         b_.SetInsertPoint(x_bb);
-        llvm::Value* x_mm = llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * w, w));
+        llvm::Value* x_word = x_mm(w);
         b_.CreateBr(end_bb);
 
         // Hot: exponentiation by squaring at the result width W. Every product wraps
@@ -4407,7 +4280,7 @@ private:
 
         b_.SetInsertPoint(end_bb);
         llvm::PHINode* mm = b_.CreatePHI(wide, 2);
-        mm->addIncoming(x_mm, x_bb);
+        mm->addIncoming(x_word, x_bb);
         mm->addIncoming(val_mm, loop);
         return { mm, zero(w) };
     }
@@ -4452,12 +4325,8 @@ private:
         // is already the answer. Real designs hit that case ~all the time per site,
         // so guard the cheap path and fall back to the full unpack only on X. The
         // combined X-mask `u` is computed once for the test and reused by the slow
-        // path. The X-mask of a packed value is its low W bits of `mm ^ (mm >> W)`
-        // (must ^ may); X-ness is nonlinear, so each operand's mask is taken
-        // separately before OR-ing.
-        llvm::Value* xa    = b_.CreateXor(a.mm, b_.CreateLShr(a.mm, w));
-        llvm::Value* xb    = b_.CreateXor(b.mm, b_.CreateLShr(b.mm, w));
-        llvm::Value* u     = b_.CreateTrunc(b_.CreateOr(xa, xb), int_ty(w));
+        // path.
+        llvm::Value* u     = xz_mask(a, b, w);
         llvm::Value* known = b_.CreateICmpEQ(u, zero(w));
 
         auto* fast_bb = llvm::BasicBlock::Create(ctx_, "xor.known", fn_);
@@ -4839,13 +4708,6 @@ private:
             z    = b_.CreateOr(z, pz);
         }
         return packed(must, may, z);
-    }
-
-    // -- Resize: truncate or extend all planes (sign per target). --
-
-    Plane lower_resize(Plane v, ValType from, ValType to) {
-        (void)from;
-        return cast_plane(v, to.width, to.is_signed);
     }
 
     // -- Control flow: if/else with two regions. X/Z condition takes else. --

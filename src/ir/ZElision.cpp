@@ -35,24 +35,6 @@ namespace clotho::ir {
 
 namespace {
 
-// Walk an lvalue select chain (bit / part / element selects) to its root leaf.
-Index lvalue_root(const Ir& ir, Index lv) {
-    for (;;) {
-        switch (ir.tag(lv)) {
-            case Inst::Tag::BitSelect:
-                lv = ir.payload(lv).binary.l;
-                break;
-            case Inst::Tag::PartSelect:
-            case Inst::Tag::DynPartSelect:
-            case Inst::Tag::ElemSelect:
-                lv = ir.payload(lv).op_extra.op;
-                break;
-            default:
-                return lv;
-        }
-    }
-}
-
 struct Analysis {
     // Per-function facts, indexed by FunctionId.
     struct FnState {
@@ -109,7 +91,7 @@ struct Analysis {
 
     // May-z of the storage behind an lvalue. Unknown leaves are conservatively z.
     bool storage_z(const Ir& ir, const FnState* fn, Index lv) const {
-        const Index root = lvalue_root(ir, lv);
+        const Index root = lvalue_root(ir, lv).root;
         switch (ir.tag(root)) {
             case Inst::Tag::Signal:
                 return sig_z[static_cast<uint32_t>(ir.payload(root).signal)] != 0;
@@ -126,7 +108,7 @@ struct Analysis {
         if (!rhs_z) {
             return;
         }
-        const Index root = lvalue_root(ir, lhs);
+        const Index root = lvalue_root(ir, lhs).root;
         switch (ir.tag(root)) {
             case Inst::Tag::Signal:
                 mark(sig_z[static_cast<uint32_t>(ir.payload(root).signal)]);
@@ -330,12 +312,12 @@ struct Analysis {
 std::vector<bool> compute_undriven(const Module& m) {
     std::vector<bool> driven(m.signals().size(), false);
     const auto        mark_root = [&](const Ir& ir, Index lv) {
-        const Index root = lvalue_root(ir, lv);
+        const Index root = lvalue_root(ir, lv).root;
         if (ir.tag(root) == Inst::Tag::Signal) {
             driven[static_cast<uint32_t>(ir.payload(root).signal)] = true;
         }
     };
-    const auto scan = [&](const Ir& ir, const Function* fn) {
+    const auto scan = [&](const Ir& ir) {
         for (uint32_t k = 0; k < ir.inst_count(); ++k) {
             const Index          i = static_cast<Index>(k);
             const Inst::Payload& p = ir.payload(i);
@@ -363,21 +345,16 @@ std::vector<bool> compute_undriven(const Module& m) {
                     break;
             }
         }
-        (void)fn;
     };
     for (const Process& p : m.processes()) {
-        scan(p.ir, nullptr);
+        scan(p.ir);
     }
     for (uint32_t f = 0; f < m.function_count(); ++f) {
-        const Function& fn = m.function(static_cast<FunctionId>(f));
-        scan(fn.ir, &fn);
+        scan(m.function(static_cast<FunctionId>(f)).ir);
     }
 
-    std::vector<bool> undriven(driven.size());
-    for (size_t i = 0; i < driven.size(); ++i) {
-        undriven[i] = !driven[i];
-    }
-    return undriven;
+    driven.flip();
+    return driven;
 }
 
 std::vector<bool> compute_may_z(const Module& m) {

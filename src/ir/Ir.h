@@ -675,4 +675,20 @@ private:
     ExtraSlice root_;
 };
 
+// Result of walking an lvalue's select chain to its root storage leaf.
+struct LvalueRoot {
+    // The root leaf (a Signal / Local / Arg — whatever the chain bottoms out
+    // on; callers switch on its tag).
+    Index root;
+    // False when any select was traversed: the lvalue names a bit / part /
+    // element of the root, not the whole storage.
+    bool whole;
+};
+
+// Walk an lvalue select chain (bit / part / element selects) to its root leaf.
+// The single walker every lvalue-classifying pass shares (NBA targeting, task
+// copy-out targets, may-z storage resolution), so they cannot drift apart when
+// a select form is added.
+LvalueRoot lvalue_root(const Ir& ir, Index lv);
+
 } // namespace clotho::ir

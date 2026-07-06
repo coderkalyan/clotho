@@ -841,22 +841,36 @@ private:
 
         // A continuous assign is a process sensitive to the source elements of
         // its expression (LRM 4.9.1): every signal the RHS reads, plus any read
-        // in an LHS selector (`assign mem[i] = x` is sensitive to i). Unlike an
-        // always_comb, the written net is NOT subtracted: a net that is both
-        // driven and read is real combinational feedback (`assign y = a & y`)
-        // and must stay sensitive. An empty list (constant RHS) yields a
-        // run-once process, which is the required time-zero evaluation.
-        std::vector<ir::WaitEvent> wait_events;
+        // in an LHS selector (`assign mem[i] = x` is sensitive to i).
+        add_continuous_process(continuous_events(e), to_source_loc(sym.location), b);
+    }
+
+    // The wait events of a continuous assignment: every signal its expression
+    // reads, as an any-change wait (LRM 4.9.1). Unlike inferred (@*)
+    // sensitivity, a written signal is NOT subtracted: a net that is both
+    // driven and read is real combinational feedback (`assign y = a & y`) and
+    // must stay sensitive. An empty list (constant RHS) yields a run-once
+    // process, which is the required time-zero evaluation.
+    std::vector<ir::WaitEvent> continuous_events(const Expression& e) {
+        std::vector<ir::WaitEvent> events;
         SensitivityCollector       c(sigmap_);
         e.visit(c);
         for (const ir::Signal s : c.reads) {
-            wait_events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
+            events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
         }
+        return events;
+    }
 
+    // Create the always-active, self-starting process every continuous
+    // construct (continuous assign, net declaration assignment, port-connection
+    // copy) lowers to: it evaluates once at time zero so it settles from
+    // declaration-initialized values, then re-evaluates whenever a wait event
+    // fires (LRM 4.9.1, 23.3.3).
+    void add_continuous_process(std::vector<ir::WaitEvent> wait_events, ir::SourceLoc l, ir::Builder& b) {
         module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
                                          .wait_events = std::move(wait_events),
                                          .self_start  = true,
-                                         .loc         = to_source_loc(sym.location),
+                                         .loc         = l,
                                          .ir          = b.finish() });
     }
 
@@ -874,21 +888,7 @@ private:
         ir::Builder         b(module_.pool);
         const ir::SourceLoc l = loc(*init);
         b.binary(ir::Inst::Tag::Store, value_lvalue(ns, b, l), lower_expr(*init, b), l);
-
-        // Sensitive to every signal the initializer reads (LRM 4.9.1); an empty
-        // list (constant RHS) yields the required run-once time-zero evaluation.
-        std::vector<ir::WaitEvent> wait_events;
-        SensitivityCollector       c(sigmap_);
-        init->visit(c);
-        for (const ir::Signal s : c.reads) {
-            wait_events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
-        }
-
-        module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
-                                         .wait_events = std::move(wait_events),
-                                         .self_start  = true,
-                                         .loc         = to_source_loc(ns.location),
-                                         .ir          = b.finish() });
+        add_continuous_process(continuous_events(*init), to_source_loc(ns.location), b);
     }
 
     // Wire one child instance's ports to the parent. Each connection becomes a
@@ -950,29 +950,12 @@ private:
                 // port width; wakes on the source's reads.
                 const ir::Ref ty = lower_type(p.internalSymbol->as<ValueSymbol>().getType());
                 b.binary(ir::Inst::Tag::Store, b.signal(child_sig, l), b.resize(lower_expr(*expr, b), ty, l), l);
-                collect_expr_reads(*expr, sens);
+                collect_inferred_sensitivity(*expr, sens);
             }
             // A port connection is a continuous copy: evaluate at time zero so the
             // child sees the parent's declaration-initialized value even when the
             // parent signal never changes afterward (LRM 23.3.3).
-            module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
-                                             .wait_events = std::move(sens),
-                                             .self_start  = true,
-                                             .loc         = l,
-                                             .ir          = b.finish() });
-        }
-    }
-
-    // Append the sensitivity of an rvalue expression (each signal it reads, as an
-    // any-change wait) to `out`. Mirrors collect_inferred_sensitivity for an
-    // expression with no writes.
-    void collect_expr_reads(const Expression& expr, std::vector<ir::WaitEvent>& out) {
-        SensitivityCollector c(sigmap_);
-        expr.visit(c);
-        for (const ir::Signal s : c.reads) {
-            if (!c.written.contains(static_cast<uint32_t>(s))) {
-                out.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
-            }
+            add_continuous_process(std::move(sens), l, b);
         }
     }
 
@@ -1023,7 +1006,7 @@ private:
 
         ir::Builder b(module_.pool);
         if (looping) {
-            lower_implicit_forever(*body, b);
+            lower_forever(*body, b);
         } else {
             lower_stmt(*body, b);
         }
@@ -1086,19 +1069,21 @@ private:
         }
     }
 
-    // Build the inferred (@*) sensitivity of a combinational process body and
-    // append it to `out`: every signal read to compute a result, minus those the
-    // body writes, each entered as a level-sensitive (any-change) wait.
-    void collect_inferred_sensitivity(const Statement& body, std::vector<ir::WaitEvent>& out) {
+    // Build the inferred sensitivity of an AST node — a combinational process
+    // body (@* / always_comb) or a port-connection source expression — and
+    // append it to `out`: every signal read to compute a result, minus those
+    // the node writes, each entered as a level-sensitive (any-change) wait.
+    template <typename Node>
+    void collect_inferred_sensitivity(const Node& node, std::vector<ir::WaitEvent>& out) {
         SensitivityCollector c(sigmap_);
-        body.visit(c);
+        node.visit(c);
         for (const ir::Signal s : c.reads) {
             if (!c.written.contains(static_cast<uint32_t>(s))) {
                 if (is_string_ref(module_.signal(s).type)) {
-                    // TODO: string signals in inferred (@*) sensitivity — string
+                    // TODO: string signals in inferred sensitivity — string
                     // stores skip wait-queue servicing, so the process would
                     // never re-trigger.
-                    fail("string in inferred combinational sensitivity is not supported");
+                    fail("string in inferred sensitivity is not supported");
                 }
                 out.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
             }
@@ -1216,7 +1201,7 @@ private:
                 lower_while(stmt.as<WhileLoopStatement>(), b);
                 break;
             case StatementKind::ForeverLoop:
-                lower_forever(stmt.as<ForeverLoopStatement>(), b);
+                lower_forever(stmt.as<ForeverLoopStatement>().body, b);
                 break;
             case StatementKind::RepeatLoop:
                 lower_repeat(stmt.as<RepeatLoopStatement>(), b);
@@ -1368,11 +1353,13 @@ private:
         b.loop(cond, pred, body, step, loc(w));
     }
 
-    // The implicit forever loop wrapping a sensitivity-less `always` body (LRM
-    // 9.2.2): a constant-true `forever` around `body`, with no separate AST node.
-    // The body's own timing control (`#`/`@`) suspends each iteration; without one
-    // this is the legal zero-delay infinite loop noted in lower_procedural_block.
-    void lower_implicit_forever(const Statement& body, ir::Builder& b) {
+    // A forever loop around `body`: a constant-true Loop. Lowers both an
+    // explicit `forever` statement's body and the implicit forever wrapping a
+    // sensitivity-less `always` body (LRM 9.2.2), which has no separate AST
+    // node. The body's own timing control (`#`/`@`) suspends each iteration;
+    // without one this is the legal zero-delay infinite loop noted in
+    // lower_procedural_block.
+    void lower_forever(const Statement& body, ir::Builder& b) {
         b.open_region();
         const ir::Index      pred = true_const(b, loc(body));
         const ir::ExtraSlice cond = b.close_region();
@@ -1385,22 +1372,6 @@ private:
         const ir::ExtraSlice step = b.close_region(); // empty
 
         b.loop(cond, pred, body_region, step, loc(body));
-    }
-
-    // forever-loop: a while-loop with a constant-true condition.
-    void lower_forever(const ForeverLoopStatement& f, ir::Builder& b) {
-        b.open_region();
-        const ir::Index     pred = true_const(b, loc(f));
-        const ir::ExtraSlice cond = b.close_region();
-
-        b.open_region();
-        lower_stmt(f.body, b);
-        const ir::ExtraSlice body = b.close_region();
-
-        b.open_region();
-        const ir::ExtraSlice step = b.close_region(); // empty
-
-        b.loop(cond, pred, body, step, loc(f));
     }
 
     // repeat-loop (12.7.2): runs the body N times, where N is the count
