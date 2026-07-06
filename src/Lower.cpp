@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <utility>
 #include <memory>
 #include <optional>
 #include <string>
@@ -727,11 +729,12 @@ private:
 
                     ir::SignalInfo info;
                     if (m.kind == SymbolKind::Net) {
+                        const NetSymbol& net = m.as<NetSymbol>();
                         // Only single-driver, z-defaulting net kinds are modeled.
                         // TODO: wand/wor/tri0/tri1/trireg/supply0/supply1 carry
                         // resolution, pull, or charge semantics (and different
                         // undriven defaults) clotho does not implement.
-                        switch (m.as<NetSymbol>().netType.netKind) {
+                        switch (net.netType.netKind) {
                             case NetType::Wire:
                             case NetType::Tri:
                             case NetType::UWire:
@@ -739,6 +742,7 @@ private:
                             default:
                                 fail("unsupported net type (only wire/tri/uwire are modeled)");
                         }
+                        check_drive_strength(net.getDriveStrength(), "a net declaration");
                         info.is_net = true;
                     }
                     info.name = prefix + std::string(vs.name);
@@ -823,6 +827,132 @@ private:
         return sig;
     }
 
+    // -- Net driver tracking --
+    //
+    // Clotho has no net resolution: every continuous driver is an independent
+    // process and the last write wins, instead of resolving conflicting values
+    // to x per LRM 6.6.1 Table 6-2. Until resolution exists, a net whose bits
+    // gain a second continuous/structural driver (continuous assign, output
+    // port connection, input port copy, net declaration assignment) must fail
+    // loudly. Procedural writes are not continuous drivers and are not tracked;
+    // non-overlapping constant selects (assign w[0]=..., assign w[1]=...) are
+    // legal single-driver-per-bit and stay accepted.
+    // TODO: multiple-driver net resolution (LRM 6.6.1); then delete this guard.
+
+    // Record that bits [lo, hi] of a net gained a continuous driver; fail on
+    // overlap with a previously recorded driver. Non-net symbols are ignored
+    // (slang already rejects multiple continuous drivers on variables).
+    void record_net_driver_range(const ValueSymbol& sym, uint32_t lo, uint32_t hi) {
+        if (sym.kind != SymbolKind::Net) {
+            return;
+        }
+        auto& ranges = net_driven_[static_cast<uint32_t>(signal_of(sym))];
+        for (const auto& [plo, phi] : ranges) {
+            if (lo <= phi && plo <= hi) {
+                fail("multiple drivers on net '" + std::string(sym.name) +
+                     "' are not supported (no resolution)");
+            }
+        }
+        ranges.emplace_back(lo, hi);
+    }
+
+    // The root value symbol of an lvalue select chain, or null for shapes with
+    // no single named root.
+    static const ValueSymbol* lvalue_root(const Expression& e) {
+        switch (e.kind) {
+            case ExpressionKind::NamedValue:
+                return &e.as<NamedValueExpression>().symbol;
+            case ExpressionKind::ElementSelect:
+                return lvalue_root(e.as<ElementSelectExpression>().value());
+            case ExpressionKind::RangeSelect:
+                return lvalue_root(e.as<RangeSelectExpression>().value());
+            case ExpressionKind::Conversion:
+                return lvalue_root(e.as<ConversionExpression>().operand());
+            default:
+                return nullptr;
+        }
+    }
+
+    // Record the net-driver coverage of one continuous-assignment lvalue. A
+    // constant bit/part-select directly on the net drives an exact bit range;
+    // any dynamic or nested select conservatively drives the whole net
+    // ([0, UINT32_MAX], which overlaps every other driver).
+    void record_net_driver(const Expression& lhs) {
+        switch (lhs.kind) {
+            case ExpressionKind::NamedValue:
+                record_net_driver_range(lhs.as<NamedValueExpression>().symbol, 0, UINT32_MAX);
+                break;
+            case ExpressionKind::Concatenation:
+                for (const Expression* op : lhs.as<ConcatenationExpression>().operands()) {
+                    record_net_driver(*op);
+                }
+                break;
+            case ExpressionKind::Conversion:
+                record_net_driver(lhs.as<ConversionExpression>().operand());
+                break;
+            case ExpressionKind::ElementSelect: {
+                const ElementSelectExpression& es   = lhs.as<ElementSelectExpression>();
+                const ValueSymbol*             root = lvalue_root(es.value());
+                if (root == nullptr) {
+                    break;
+                }
+                if (es.value().kind == ExpressionKind::NamedValue &&
+                    es.value().type->isIntegral() && es.type->getBitWidth() == 1) {
+                    if (const std::optional<int32_t> c = try_const_int(es.selector())) {
+                        const auto bit =
+                          static_cast<uint32_t>(packed_range_of(es.value()).translateIndex(*c));
+                        record_net_driver_range(*root, bit, bit);
+                        break;
+                    }
+                }
+                record_net_driver_range(*root, 0, UINT32_MAX);
+                break;
+            }
+            case ExpressionKind::RangeSelect: {
+                const RangeSelectExpression& rs   = lhs.as<RangeSelectExpression>();
+                const ValueSymbol*           root = lvalue_root(rs.value());
+                if (root == nullptr) {
+                    break;
+                }
+                if (rs.value().kind == ExpressionKind::NamedValue &&
+                    rs.value().type->isIntegral() &&
+                    rs.getSelectionKind() == RangeSelectionKind::Simple) {
+                    const std::optional<int32_t> left  = try_const_int(rs.left());
+                    const std::optional<int32_t> right = try_const_int(rs.right());
+                    if (left && right) {
+                        const slang::ConstantRange range = packed_range_of(rs.value());
+                        const auto a = static_cast<uint32_t>(range.translateIndex(*left));
+                        const auto b = static_cast<uint32_t>(range.translateIndex(*right));
+                        record_net_driver_range(*root, std::min(a, b), std::max(a, b));
+                        break;
+                    }
+                }
+                // A dynamic (or indexed +:/-:) select: conservatively the whole net.
+                record_net_driver_range(*root, 0, UINT32_MAX);
+                break;
+            }
+            default:
+                // Other lvalue shapes are rejected by lower_lvalue.
+                break;
+        }
+    }
+
+    // Reject an explicit non-default drive strength on a continuous assignment
+    // or net declaration. Strengths only affect multi-driver resolution, which
+    // Clotho lacks; an explicit (strong0, strong1) equals the default (LRM
+    // 10.3.4) and stays accepted.
+    // TODO: strength-based resolution (LRM 6.6.1, 28.11-28.12).
+    void check_drive_strength(
+      const std::pair<std::optional<DriveStrength>, std::optional<DriveStrength>>& strength,
+      std::string_view what) {
+        const auto non_default = [](const std::optional<DriveStrength>& s) {
+            return s.has_value() && *s != DriveStrength::Strong;
+        };
+        if (non_default(strength.first) || non_default(strength.second)) {
+            fail("drive strength on " + std::string(what) + " is not supported");
+        }
+    }
+
     // -- Processes --
 
     void lower_continuous_assign(const ContinuousAssignSymbol& sym) {
@@ -831,10 +961,12 @@ private:
             // update would land at the wrong time. Reject until the scheduler exists.
             fail("continuous assignment delay (assign #N) is not supported");
         }
+        check_drive_strength(sym.getDriveStrength(), "a continuous assignment");
         const Expression& e = sym.getAssignment();
         if (e.kind != ExpressionKind::Assignment) {
             fail("malformed continuous assignment");
         }
+        record_net_driver(e.as<AssignmentExpression>().left());
 
         ir::Builder b(module_.pool);
         lower_assign(e.as<AssignmentExpression>(), b);
@@ -885,6 +1017,7 @@ private:
         if (init == nullptr) {
             return;
         }
+        record_net_driver_range(ns, 0, UINT32_MAX);
         ir::Builder         b(module_.pool);
         const ir::SourceLoc l = loc(*init);
         b.binary(ir::Inst::Tag::Store, value_lvalue(ns, b, l), lower_expr(*init, b), l);
@@ -940,14 +1073,18 @@ private:
                 // LHS is the parent target and whose RHS is an EmptyArgument
                 // placeholder for the port value, so read the child net directly and
                 // resize it to the target width. Wakes on the child net.
-                const AssignmentExpression& a   = expr->as<AssignmentExpression>();
-                const ir::Ref               ty  = lower_type(*a.left().type);
-                const ir::Index             val = b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l);
+                const AssignmentExpression& a = expr->as<AssignmentExpression>();
+                // The connection is a continuous driver of the parent-side net.
+                record_net_driver(a.left());
+                const ir::Ref   ty  = lower_type(*a.left().type);
+                const ir::Index val = b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l);
                 b.binary(ir::Inst::Tag::Store, lower_lvalue(a.left(), b), b.resize(val, ty, l), l);
                 sens.push_back(ir::WaitEvent{ .signal = child_sig, .edge = ir::Edge::Any });
             } else {
                 // Input: drive the child net from the source rvalue, resized to the
-                // port width; wakes on the source's reads.
+                // port width; wakes on the source's reads. The copy is a continuous
+                // driver of the whole child-side net.
+                record_net_driver_range(p.internalSymbol->as<ValueSymbol>(), 0, UINT32_MAX);
                 const ir::Ref ty = lower_type(p.internalSymbol->as<ValueSymbol>().getType());
                 b.binary(ir::Inst::Tag::Store, b.signal(child_sig, l), b.resize(lower_expr(*expr, b), ty, l), l);
                 collect_inferred_sensitivity(*expr, sens);
@@ -2860,6 +2997,9 @@ private:
     const slang::ast::Scope* scope_ = nullptr;
     // Maps an elaborated value symbol to its module Signal handle.
     ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal> sigmap_;
+    // Continuous-driver coverage per net signal: the closed bit ranges [lo, hi]
+    // already driven, checked for overlap by record_net_driver_range.
+    ankerl::unordered_dense::map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> net_driven_;
     // Hierarchical name prefix of the instance currently being lowered (e.g.
     // "u_alu.u_sub."); empty for the top. Prepended to every signal name created
     // while this instance's body is processed so flattened signals stay unique.
