@@ -773,3 +773,32 @@ TEST_CASE("a non-default drive strength fails loudly") {
     )");
     CHECK_MESSAGE(rs.ok, rs.diagnostics);
 }
+
+// -- Net delay (LRM 28.16) --
+
+TEST_CASE("a net declaration delay fails loudly") {
+    const LowerResult ri = lower_text(R"(
+        module m(input a);
+            wire #5 w = a;
+        endmodule
+    )");
+    CHECK_FALSE(ri.ok);
+    CHECK(ri.diagnostics.find("net delay") != std::string::npos);
+
+    const LowerResult rd = lower_text(R"(
+        module m(input a);
+            wire #5 w;
+            assign w = a;
+        endmodule
+    )");
+    CHECK_FALSE(rd.ok);
+    CHECK(rd.diagnostics.find("net delay") != std::string::npos);
+
+    // No delay: a plain net declaration assignment still lowers.
+    const LowerResult rp = lower_text(R"(
+        module m(input a);
+            wire w = a;
+        endmodule
+    )");
+    CHECK_MESSAGE(rp.ok, rp.diagnostics);
+}

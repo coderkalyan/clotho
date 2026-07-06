@@ -742,6 +742,12 @@ private:
                             default:
                                 fail("unsupported net type (only wire/tri/uwire are modeled)");
                         }
+                        if (net.getDelay() != nullptr) {
+                            // TODO: net delay (`wire #5 w;`, LRM 28.16) — an
+                            // inertial delay on every driver of the net; dropped
+                            // today, so propagation would be instant.
+                            fail("net delay is not supported");
+                        }
                         check_drive_strength(net.getDriveStrength(), "a net declaration");
                         info.is_net = true;
                     }
