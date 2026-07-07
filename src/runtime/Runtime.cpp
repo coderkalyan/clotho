@@ -517,6 +517,8 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
     const bool has_finish   = (flags & 4u) != 0;
     const bool four_state   = (flags & 8u) != 0;
     const bool path_forward = (flags & 16u) != 0;
+    // A narrow 2-state memory stores a single iW element (no packed must|may word).
+    const bool narrow       = (flags & 32u) != 0;
 
     // Reconstruct the path. A string-object filename (path_forward) arrives as its
     // bytes in natural order. Otherwise the filename value is a right-justified
@@ -570,7 +572,7 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
     // beyond that bound is ignored with a warning (LRM §21.4).
     const int64_t end = has_finish ? finish : hi_addr;
 
-    const uint32_t mm_bytes = (2 * width + 7) / 8;
+    const uint32_t mm_bytes = narrow ? (width + 7) / 8 : (2 * width + 7) / 8;
     const uint32_t z_bytes  = (width + 7) / 8;
     const int      bits     = hex ? 4 : 1;
     const uint64_t wmask    = width >= 64 ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << width) - 1);
@@ -589,8 +591,11 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
         must &= wmask;
         may &= wmask;
         z &= wmask;
-        const unsigned __int128 mmv = static_cast<unsigned __int128>(must) |
-                                      (static_cast<unsigned __int128>(may) << width);
+        // A narrow 2-state element is the bare iW value; a packed element carries
+        // must in the low half and may in the high half.
+        const unsigned __int128 mmv = narrow ? static_cast<unsigned __int128>(must)
+                                             : (static_cast<unsigned __int128>(must) |
+                                                (static_cast<unsigned __int128>(may) << width));
         std::memcpy(mm_base + static_cast<size_t>(idx) * stride, &mmv, mm_bytes);
         // A memory whose slot stores no z word passes a null z_base; writing
         // through it would clobber the neighboring element's must|may word.

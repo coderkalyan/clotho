@@ -576,7 +576,6 @@ private:
         // Classify NBA targets up front so the slot loop can keep an NBA-target
         // 2-state signal on the packed word (its shadow / commit still expect it).
         nba_classify();
-        const std::vector<bool> readmem_target = readmem_targets();
 
         // A slot keeps its z word when the may-z analysis cannot prove it z-free
         // or the task ABI needs z storage behind it. Elision is analysis-driven,
@@ -616,18 +615,12 @@ private:
             slot.init_z      = undriven[i] && sigs[i].is_net && slot.four_state;
             slot.has_z       = may_z[i] || task_out[i] || slot.init_z;
             // A 2-state signal drops the packed must|may word for a genuine iW slot
-            // (or `[N x { iW }]` memory) when it is decoupled from every path that
-            // still reads the packed form: it is never-z (so not a task out/inout
-            // target, which forces has_z), not an unpacked-array NBA target (the
-            // deferred queue writes the packed word), and not a $readmem target
-            // (rt_readmem writes the packed word). A scalar NBA target CAN narrow —
-            // its shadow and commit loop are width-driven off the same flag.
-            // TODO: narrow unpacked-array NBA / $readmem memories too, once the
-            // deferred-queue push and rt_readmem write an iW (not packed) element.
-            const bool arr_nba =
-              std::find(array_nba_sigs_.begin(), array_nba_sigs_.end(), static_cast<Signal>(i)) !=
-              array_nba_sigs_.end();
-            slot.narrow = !slot.four_state && !slot.has_z && !arr_nba && !readmem_target[i];
+            // (or `[N x { iW }]` memory). The only requirement is never-z: a 2-state
+            // value carries no z, and has_z is forced only by a task out/inout target
+            // (the packed pointer ABI) or a may-z analysis result — both of which
+            // keep the packed word. Every other 2-state path (scalar/array NBA
+            // shadow + commit, $readmem via rt_readmem) is width-driven off `narrow`.
+            slot.narrow = !slot.four_state && !slot.has_z;
             slot.slot_ty     = slot_type(slot.width, slot.four_state, slot.has_z, slot.narrow);
             if (ty.kind == Type::Kind::UnpackedArray) {
                 slot.is_array   = true;
@@ -753,29 +746,6 @@ private:
     // ABI constraint, not a may-z fact, hence separate from compute_may_z.
     // (An alternative — a caller-stack z scratch word for elided targets — is
     // sound but adds a second mechanism for a rare construct.)
-    // Signals that are a $readmem destination: rt_readmem writes the packed
-    // must|may word, so such a memory keeps the packed element layout.
-    std::vector<bool> readmem_targets() const {
-        std::vector<bool> out(mod_.signals().size(), false);
-        const auto        scan = [&](const Ir& ir) {
-            for (size_t k = 0; k < ir.inst_count(); ++k) {
-                const auto idx = static_cast<Index>(k);
-                if (ir.tag(idx) != Inst::Tag::ReadMem) {
-                    continue;
-                }
-                const auto info = ir.extra_data<ReadMemInfo>(ir.payload(idx).op_extra.extra);
-                out[static_cast<uint32_t>(info.target)] = true;
-            }
-        };
-        for (const Process& p : mod_.processes()) {
-            scan(p.ir);
-        }
-        for (uint32_t i = 0; i < mod_.function_count(); ++i) {
-            scan(mod_.function(static_cast<FunctionId>(i)).ir);
-        }
-        return out;
-    }
-
     std::vector<bool> task_out_targets() const {
         std::vector<bool> out(mod_.signals().size(), false);
         const auto        scan = [&](const Ir& ir) {
@@ -3769,7 +3739,6 @@ private:
     // scratch, and hands the live element's destination pointers to the queue; the
     // NBA region replays the masked merge after the active drain.
     void emit_array_nba(const LValue& lv, Plane rhs) {
-        rhs              = to_four(rhs);
         const uint32_t W = lv.store_width;
         if (W > 64) {
             // TODO: element width > 64 needs a larger staging buffer (mm word > i128).
@@ -3777,11 +3746,25 @@ private:
         }
         llvm::Value* off    = cast(lv.bit_off, W, false);
         llvm::Value* mask_w = b_.CreateShl(cast(ones(lv.width), W, false), off);
-        llvm::Value* must   = b_.CreateShl(cast(must_of(rhs), W, false), off);
-        llvm::Value* may    = b_.CreateShl(cast(may_of(rhs), W, false), off);
-        llvm::Value* zval   = b_.CreateShl(cast(rhs.z, W, false), off);
-        llvm::Value* mm_val = packed(must, may, zval).mm;          // i2W: must | (may << W)
-        llvm::Value* mm_msk = packed(mask_w, mask_w, zero(W)).mm;  // i2W: mask in both halves
+        // A narrow 2-state element stages the bare iW value and mask (no z); the
+        // runtime commit's masked byte merge is width-agnostic, so only the byte
+        // count differs. A packed element stages the i(2W) must|may word.
+        llvm::Value* mm_val;
+        llvm::Value* mm_msk;
+        uint32_t     mm_bytes;
+        if (lv.narrow) {
+            mm_val   = b_.CreateShl(cast(must_of(rhs), W, false), off);
+            mm_msk   = mask_w;
+            mm_bytes = (W + 7) / 8;
+        } else {
+            rhs                 = to_four(rhs);
+            llvm::Value* must   = b_.CreateShl(cast(must_of(rhs), W, false), off);
+            llvm::Value* may    = b_.CreateShl(cast(may_of(rhs), W, false), off);
+            llvm::Value* zval   = b_.CreateShl(cast(rhs.z, W, false), off);
+            mm_val   = packed(must, may, zval).mm;          // i2W: must | (may << W)
+            mm_msk   = packed(mask_w, mask_w, zero(W)).mm;  // i2W: mask in both halves
+            mm_bytes = (2 * W + 7) / 8;
+        }
 
         llvm::Value*      st  = nba_scratch();
         llvm::StructType* ty  = nba_scratch_ty();
@@ -3798,6 +3781,8 @@ private:
         llvm::Value* z_ptr = nullp;
         uint32_t     z_bytes = 0;
         if (lv.has_z) {
+            // has_z implies a packed (non-narrow) element, so rhs is 4-state here.
+            llvm::Value* zval = b_.CreateShl(cast(rhs.z, W, false), off);
             zvp = b_.CreateStructGEP(ty, st, 2);
             zkp = b_.CreateStructGEP(ty, st, 3);
             b_.CreateAlignedStore(zval, zvp, a1);
@@ -3806,8 +3791,7 @@ private:
             z_bytes = (W + 7) / 8;
         }
 
-        llvm::Value*   mm_ptr   = lv_mm_ptr(lv);
-        const uint32_t mm_bytes = (2 * W + 7) / 8;
+        llvm::Value* mm_ptr = lv_mm_ptr(lv);
         b_.CreateCall(nba_arr_push_fn(),
                       { b_.getInt32(static_cast<uint32_t>(lv.sig)), mm_ptr, mvp, mkp, b_.getInt32(mm_bytes), z_ptr,
                         zvp, zkp, b_.getInt32(z_bytes) });
@@ -3998,7 +3982,7 @@ private:
 
         const uint32_t flags = (info.hex ? 1u : 0u) | (info.has_start ? 2u : 0u) |
                                (info.has_finish ? 4u : 0u) | (s.four_state ? 8u : 0u) |
-                               (fname_is_str ? 16u : 0u);
+                               (fname_is_str ? 16u : 0u) | (s.narrow ? 32u : 0u);
 
         b_.CreateCall(readmem_fn(),
                       { path, path_len, mm_base, z_base, b_.getInt32(stride),

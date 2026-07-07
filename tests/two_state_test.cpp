@@ -249,6 +249,35 @@ TEST_CASE("2-state memory element storage shrinks to iW") {
     CHECK(out == "75 20\n");
 }
 
+// A 2-state array that is an unpacked-array NBA target also narrows, and its
+// clocked element updates commit correctly through the deferred queue.
+TEST_CASE("2-state array NBA target narrows") {
+    const std::string ir = emit(R"(
+        module m;
+            bit clk;
+            bit [7:0] mem [0:3];
+            always @(posedge clk) mem[0] <= mem[0] + 8'd1;
+        endmodule
+    )");
+    CHECK(ir.find("[4 x %bit.8]") != std::string::npos);
+
+    const std::string out = run_capture(R"(
+        module m;
+            bit clk;
+            bit [7:0] mem [0:1];
+            int i;
+            always @(posedge clk) begin mem[0] <= mem[0] + 8'd1; mem[1] <= mem[1] + 8'd5; end
+            initial begin
+                mem[0] = 0; mem[1] = 0;
+                for (i = 0; i < 3; i = i + 1) begin clk = 0; #1; clk = 1; #1; end
+                $display("%0d %0d", mem[0], mem[1]);
+                $finish;
+            end
+        endmodule
+    )");
+    CHECK(out == "3 15\n");
+}
+
 // posedge / negedge detection works on a 2-state (bit) clock.
 TEST_CASE("edge sensitivity on a bit clock") {
     const std::string out = run_capture(R"(
