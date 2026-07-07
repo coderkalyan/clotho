@@ -2926,10 +2926,13 @@ private:
         }
     }
 
-    void lower_assign(const AssignmentExpression& a, ir::Builder& b) {
+    // Lower an assignment. Returns the raw stored value (the RHS as written,
+    // before LHS-type truncation) so an assignment used as an rvalue (LRM 11.3.1,
+    // `y = (x = 5)`) can recover its value; the caller truncates to the LHS type.
+    // Statement callers discard the return.
+    ir::Index lower_assign(const AssignmentExpression& a, ir::Builder& b) {
         if (a.isCompound()) {
-            lower_compound_assign(a, b);
-            return;
+            return lower_compound_assign(a, b);
         }
         if (a.timingControl != nullptr) {
             // Intra-assignment timing: `x = #5 y;` / `x = @(posedge clk) y;`. The
@@ -2969,8 +2972,9 @@ private:
             const ElementSelectExpression& es  = a.left().as<ElementSelectExpression>();
             const ir::Index                str = lower_lvalue(es.value(), b);
             const ir::Index                idx = lower_expr(es.selector(), b);
-            b.str_putc(str, idx, lower_expr(a.right(), b), loc(a));
-            return;
+            const ir::Index                chr = lower_expr(a.right(), b);
+            b.str_putc(str, idx, chr, loc(a));
+            return chr;
         }
         if (is_string_expr(a.left()) && a.isNonBlocking()) {
             // TODO: nonblocking assignment to strings (needs a string-aware NBA
@@ -2985,9 +2989,10 @@ private:
         const ir::Index     rhs = lower_expr(a.right(), b);
         if (a.left().kind == ExpressionKind::Concatenation) {
             store_concat(a.left().as<ConcatenationExpression>(), rhs, tag, b, loc(a));
-            return;
+            return rhs;
         }
         b.binary(tag, lower_lvalue(a.left(), b), rhs, loc(a));
+        return rhs;
     }
 
     // Compound assignment `lhs op= rhs` (LRM 11.4.1, always blocking). slang has
@@ -2996,7 +3001,7 @@ private:
     // LHS lvalue yields `op(load(lhs), rhs)`. The LHS lvalue is evaluated exactly
     // once and reused for the embedded LValueReference (single-evaluation, so
     // `mem[i++] += 1` bumps i once).
-    void lower_compound_assign(const AssignmentExpression& a, ir::Builder& b) {
+    ir::Index lower_compound_assign(const AssignmentExpression& a, ir::Builder& b) {
         const ir::SourceLoc l = loc(a);
         if (a.left().kind == ExpressionKind::Concatenation) {
             // TODO: compound assignment to a concatenation lvalue ({a,b} += x).
@@ -3017,6 +3022,7 @@ private:
         const ir::Index rhs                  = lower_expr(a.right(), b);
         compound_lv_                         = saved;
         b.binary(ir::Inst::Tag::Store, lv, rhs, l);
+        return rhs;
     }
 
     // Distribute a value across a concatenation lvalue, `{a, b, c} = rhs` (LRM
@@ -3214,12 +3220,15 @@ private:
                 }
                 return *v;
             }
-            case ExpressionKind::Assignment:
-                // TODO: assignment used as an rvalue (`y = (x += 1)`, `y = (x = 5)`).
-                // Its value is the LHS after the store, truncated to the LHS type
-                // (LRM 11.3.1) — not the raw RHS, so it needs lower_assign to
-                // return the stored value and this site to route into it.
-                fail("assignment used as an expression is not supported");
+            case ExpressionKind::Assignment: {
+                // Assignment used as an rvalue (`y = (x += 1)`, `y = (x = 5)`). Its
+                // value is the LHS after the store, truncated to the LHS type (LRM
+                // 11.3.1) — not the raw RHS. A string target yields the assigned
+                // handle unchanged.
+                const AssignmentExpression& a = expr.as<AssignmentExpression>();
+                const ir::Index             v = lower_assign(a, b);
+                return is_string_expr(a.left()) ? v : b.resize(v, lower_type(*a.left().type), l);
+            }
             default:
                 fail("unsupported expression kind=" + std::string(slang::ast::toString(expr.kind)));
         }

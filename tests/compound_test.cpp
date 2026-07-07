@@ -167,16 +167,40 @@ TEST_CASE("compound assignment to a string element is rejected") {
                   r.diagnostics);
 }
 
-// An assignment used as an rvalue is not supported yet (LRM 11.3.1); it must
-// fail loudly rather than silently drop the store or mis-value the result.
-TEST_CASE("assignment used as an expression is rejected") {
-    const LowerResult r = lower_text(R"(
+// An assignment used as an rvalue yields the LHS after the store, truncated to
+// the LHS type (LRM 11.3.1). Cross-checked vs Verilator; iverilog rejects the
+// construct outright, so it cannot serve as the oracle here.
+TEST_CASE("assignment used as an rvalue yields the stored value") {
+    // Simple `y = (x = v)` and compound `z = (x += v)` propagate the value.
+    CHECK(run_capture(R"(
         module m;
-            int x, y;
-            initial begin x = 0; y = (x += 1); end
+            int x, y, z;
+            initial begin
+                y = (x = 5);   $display("%0d %0d", x, y);
+                x = 10;
+                z = (x += 3);  $display("%0d %0d", x, z);
+                x = (y = (z = 7)); $display("%0d %0d %0d", x, y, z);
+            end
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK_MESSAGE(r.diagnostics.find("assignment used as an expression") != std::string::npos,
-                  r.diagnostics);
+    )") == "5 5\n13 13\n7 7 7\n");
+}
+
+// The rvalue is truncated to the LHS type, not the raw (wider) RHS.
+TEST_CASE("assignment rvalue truncates to the LHS width") {
+    CHECK(run_capture(R"(
+        module m;
+            logic [3:0] a, b;
+            initial begin b = (a = 8'hAB); $display("%h %h", a, b); end
+        endmodule
+    )") == "b b\n");
+}
+
+// A whole-string assignment as an rvalue yields the assigned handle.
+TEST_CASE("string assignment used as an rvalue yields the string") {
+    CHECK(run_capture(R"(
+        module m;
+            string s, t;
+            initial begin s = (t = "world"); $display("%s %s", s, t); end
+        endmodule
+    )") == "world world\n");
 }
