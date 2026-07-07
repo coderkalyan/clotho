@@ -787,6 +787,77 @@ TEST_CASE("event waits emit wait queues, always loops, and queue servicing") {
     CHECK(raw.find("dyn.head") != std::string::npos);
 }
 
+TEST_CASE("bare initial @(event) blocks; it does not run at time zero") {
+    // A top-level event control on an `initial` is a one-shot wait, not process
+    // sensitivity (LRM 9.4): with no driver ever producing the edge the body
+    // must never run. Regression: the wait used to be hoisted into the
+    // process's sensitivity list and discarded, firing the body at time zero.
+    constexpr std::string_view src = R"(
+        module m;
+            reg s = 1;
+            initial @(negedge s) $display("fired");
+            initial begin #10; $display("end at %0t", $time); $finish; end
+        endmodule
+    )";
+    // vs iverilog: "fired" never appears.
+    CHECK(run_capture(src) == "end at 10\n");
+}
+
+TEST_CASE("bare initial @(event) fires once when the edge arrives") {
+    constexpr std::string_view src = R"(
+        module m;
+            reg s = 1;
+            initial @(negedge s) $display("fired at %0t", $time);
+            initial begin #3 s = 0; #10 $finish; end
+        endmodule
+    )";
+    // vs iverilog.
+    CHECK(run_capture(src) == "fired at 3\n");
+}
+
+TEST_CASE("bare initial @(posedge clk) waits for the first edge only") {
+    constexpr std::string_view src = R"(
+        module m;
+            reg clk = 0;
+            always #5 clk = ~clk;
+            initial @(posedge clk) $display("posedge at %0t", $time);
+            initial #23 $finish;
+        endmodule
+    )";
+    // One shot: fires at the first posedge (t=5), not again at t=15. vs iverilog.
+    CHECK(run_capture(src) == "posedge at 5\n");
+}
+
+TEST_CASE("bare initial #delay defers the statement (not hoisted)") {
+    // The sibling of the @(event) case: a top-level delay on an `initial`
+    // already lowered intra-body; pin that down.
+    constexpr std::string_view src = R"(
+        module m;
+            initial #5 $display("at %0t", $time);
+            initial #10 $finish;
+        endmodule
+    )";
+    // vs iverilog.
+    CHECK(run_capture(src) == "at 5\n");
+}
+
+TEST_CASE("always @(posedge clk) sensitivity hoisting is unchanged") {
+    constexpr std::string_view src = R"(
+        module m;
+            reg clk = 0;
+            reg [3:0] n = 0;
+            always #5 clk = ~clk;
+            always @(posedge clk) begin
+                n = n + 1;
+                $display("tick %0d at %0t", n, $time);
+            end
+            initial #23 $finish;
+        endmodule
+    )";
+    // vs iverilog.
+    CHECK(run_capture(src) == "tick 1 at 5\ntick 2 at 15\n");
+}
+
 TEST_CASE("$finish lowers to an rt_finish call") {
     constexpr std::string_view src = R"(
         module m;
