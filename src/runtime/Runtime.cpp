@@ -5,13 +5,18 @@
 #include <bit>
 #include <cerrno>
 #include <charconv>
+#include <condition_variable>
 #include <csetjmp>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <new>
+#include <queue>
+#include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <sys/resource.h>
@@ -2552,11 +2557,11 @@ void vcd_rec_change(uint32_t idx, uint64_t must, uint64_t may, uint64_t z) {
     g_vcd.recbuf.push_back(VcdRec{ must, may, z, idx, 0 });
 }
 
-// Format every buffered record to the output file, then empty the buffer (keeping
-// its capacity). Reads only the record planes and the read-only var table, so it
-// carries no diff / shadow state.
-void vcd_drain() {
-    for (const VcdRec& r : g_vcd.recbuf) {
+// Format one record buffer to the output file. Reads only the record planes and
+// the read-only var table (no diff / shadow state), so it runs on the writer
+// thread while the sim thread fills the next buffer.
+void vcd_write_records(const std::vector<VcdRec>& buf) {
+    for (const VcdRec& r : buf) {
         if (r.is_time != 0) {
             vcd_put('#');
             vcd_put_dec(r.a);
@@ -2565,7 +2570,73 @@ void vcd_drain() {
             vcd_emit(g_vcd.vars[r.idx], r.a, r.b, r.c);
         }
     }
-    g_vcd.recbuf.clear();
+}
+
+// -- Writer thread --
+//
+// The sim thread fills g_vcd.recbuf and, at instant boundaries, hands a full
+// buffer to the writer thread through a bounded pool: the sim thread never blocks
+// on formatting or the disk unless the writer falls a whole pool behind
+// (backpressure). Buffers are recycled, so steady state does not allocate. The
+// var table and file are the only shared state: the table is read-only after
+// rt_vcd_start, and after the thread spawns the file is written by the writer
+// alone (the header is written earlier, on the sim thread, before the spawn).
+
+constexpr size_t kVcdBuffers  = 8;      // record buffers in the pool
+constexpr size_t kVcdHandoff  = 512;    // hand off once a buffer holds this many records
+
+std::thread                      vcd_thread;
+std::mutex                       vcd_mu;
+std::condition_variable          vcd_cv_ready;   // writer waits for filled buffers
+std::condition_variable          vcd_cv_free;    // sim waits for a recycled buffer
+std::condition_variable          vcd_cv_idle;    // $dumpflush waits for the writer to catch up
+std::queue<std::vector<VcdRec>>  vcd_ready;      // filled buffers awaiting write
+std::vector<std::vector<VcdRec>> vcd_pool;       // recycled empty buffers
+size_t                           vcd_inflight = 0;  // buffers handed off but not yet written
+bool                             vcd_stop     = false;
+
+void vcd_writer_loop() {
+    for (;;) {
+        std::vector<VcdRec> buf;
+        {
+            std::unique_lock<std::mutex> lk(vcd_mu);
+            vcd_cv_ready.wait(lk, [] { return !vcd_ready.empty() || vcd_stop; });
+            if (vcd_ready.empty()) {
+                return;   // stop requested and nothing left to write
+            }
+            buf = std::move(vcd_ready.front());
+            vcd_ready.pop();
+        }
+        vcd_write_records(buf);   // format + write outside the lock
+        {
+            std::unique_lock<std::mutex> lk(vcd_mu);
+            buf.clear();
+            vcd_pool.push_back(std::move(buf));
+            --vcd_inflight;
+            vcd_cv_free.notify_one();
+            if (vcd_ready.empty() && vcd_inflight == 0) {
+                vcd_cv_idle.notify_all();
+            }
+        }
+    }
+}
+
+// Hand the current record buffer to the writer and take a recycled one. Blocks
+// only if every pooled buffer is in flight (backpressure). A no-op on an empty
+// buffer.
+void vcd_handoff() {
+    if (g_vcd.recbuf.empty()) {
+        return;
+    }
+    std::unique_lock<std::mutex> lk(vcd_mu);
+    vcd_cv_free.wait(lk, [] { return !vcd_pool.empty(); });
+    std::vector<VcdRec> next = std::move(vcd_pool.back());
+    vcd_pool.pop_back();
+    next.clear();
+    vcd_ready.push(std::move(g_vcd.recbuf));
+    ++vcd_inflight;
+    g_vcd.recbuf = std::move(next);
+    vcd_cv_ready.notify_one();
 }
 
 } // namespace
@@ -2643,9 +2714,21 @@ extern "C" void rt_vcd_start(void) {
     }
     if (!g_vcd.started) {
         vcd_puts("$enddefinitions $end\n");
-        // One instant emits at most a time marker plus every variable; reserve once
-        // so the producer never allocates during the run.
-        g_vcd.recbuf.reserve(g_vcd.vars.size() + 1);
+        // Size every record buffer to hold a full handoff batch plus one more
+        // whole instant, so the producer never allocates and never splits an
+        // instant across buffers. Spawn the writer only after the header is fully
+        // written on this (sim) thread, so file access never overlaps.
+        const size_t cap = kVcdHandoff + g_vcd.vars.size() + 1;
+        g_vcd.recbuf.reserve(cap);
+        vcd_pool.clear();
+        for (size_t k = 0; k < kVcdBuffers; ++k) {
+            std::vector<VcdRec> b;
+            b.reserve(cap);
+            vcd_pool.push_back(std::move(b));
+        }
+        vcd_stop     = false;
+        vcd_inflight = 0;
+        vcd_thread   = std::thread(vcd_writer_loop);
         g_vcd.started = true;
     }
     g_vcd.active    = true;
@@ -2670,7 +2753,7 @@ extern "C" void rt_vcd_flush(uint64_t tick) {
         }
         g_vcd.pending_off = false;
         g_vcd.active      = false;
-        vcd_drain();
+        vcd_handoff();
         return;
     }
     if (!g_vcd.active) {
@@ -2698,7 +2781,12 @@ extern "C" void rt_vcd_flush(uint64_t tick) {
         g_vcd.recbuf.resize(mark);
     }
     g_vcd.force_all = false;
-    vcd_drain();
+    // Hand the batch to the writer once it is large enough; small instants
+    // accumulate to amortize the handoff. The remainder flushes at $dumpflush /
+    // close.
+    if (g_vcd.recbuf.size() >= kVcdHandoff) {
+        vcd_handoff();
+    }
 }
 
 extern "C" void rt_vcd_off(void) {
@@ -2721,13 +2809,40 @@ extern "C" void rt_vcd_all(void) {
 }
 
 extern "C" void rt_vcd_dumpflush(void) {
-    if (g_vcd.file != nullptr) {
-        std::fflush(g_vcd.file);
+    if (g_vcd.file == nullptr) {
+        return;
     }
+    // Hand off any buffered records and wait until the writer has drained
+    // everything, then push the file's own buffer to the OS. Waiting until the
+    // writer is idle means no write is in flight, so the fflush cannot race it.
+    vcd_handoff();
+    std::unique_lock<std::mutex> lk(vcd_mu);
+    vcd_cv_idle.wait(lk, [] { return vcd_ready.empty() && vcd_inflight == 0; });
+    std::fflush(g_vcd.file);
+}
+
+// Stop the writer thread and reset all threading state. Safe to call when no
+// thread was ever spawned (a $dumpvars that never ran).
+static void vcd_shutdown_writer() {
+    if (vcd_thread.joinable()) {
+        {
+            std::unique_lock<std::mutex> lk(vcd_mu);
+            vcd_stop = true;
+            vcd_cv_ready.notify_all();
+        }
+        vcd_thread.join();
+    }
+    while (!vcd_ready.empty()) {
+        vcd_ready.pop();
+    }
+    vcd_pool.clear();
+    vcd_inflight = 0;
+    vcd_stop     = false;
 }
 
 extern "C" void rt_vcd_close(void) {
     if (g_vcd.file == nullptr) {
+        vcd_shutdown_writer();
         g_vcd = VcdEngine{};
         return;
     }
@@ -2735,8 +2850,10 @@ extern "C" void rt_vcd_close(void) {
         const uint64_t now = g_vcd.wheel != nullptr ? unwrap(g_vcd.wheel)->now() : 0;
         rt_vcd_flush(now);
     }
+    vcd_handoff();            // push the final partial buffer
+    vcd_shutdown_writer();    // drain + join the writer before touching the file
     std::fflush(g_vcd.file);
     std::fclose(g_vcd.file);
     std::free(g_vcd.iobuf);
-    g_vcd = VcdEngine{};   // reset for the next simulation in this process
+    g_vcd = VcdEngine{};      // reset for the next simulation in this process
 }

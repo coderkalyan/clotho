@@ -200,6 +200,43 @@ TEST_CASE("vcd: $dumpoff writes an all-x checkpoint, $dumpon resumes") {
     CHECK(body == expected);
 }
 
+TEST_CASE("vcd: high-activity trace stays ordered through the writer thread") {
+    // Enough instants to exceed the writer's handoff threshold many times over, so
+    // the background writer processes multiple buffers. A race would corrupt the
+    // record order; assert the time markers come out strictly increasing and the
+    // final value is correct.
+    const std::string src = R"(
+        module top;
+          reg [15:0] a = 0;
+          always #1 a = a + 1;
+          initial begin
+            $dumpfile("OUT.vcd");
+            $dumpvars;
+            #2000 $finish;
+          end
+        endmodule
+    )";
+    const std::string body = body_of(run_vcd(src));
+
+    long prev  = -1;
+    long times = 0;
+    for (size_t i = 0; i < body.size();) {
+        if (body[i] == '#') {
+            const long t = std::strtol(body.c_str() + i + 1, nullptr, 10);
+            CHECK(t > prev);   // strictly increasing: no reordering across the thread
+            prev = t;
+            ++times;
+        }
+        i = body.find('\n', i);
+        if (i == std::string::npos) {
+            break;
+        }
+        ++i;
+    }
+    CHECK(times == 2000);                       // one instant per tick, 0..1999
+    CHECK(contains(body, "b11111001111 !"));    // a == 1999 at the last instant
+}
+
 TEST_CASE("vcd: $dumpvars(0, top) matches the bare whole-design form") {
     const std::string bare = R"(
         module top;
