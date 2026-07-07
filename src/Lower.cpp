@@ -1342,6 +1342,9 @@ private:
                     lower_assign(e.as<AssignmentExpression>(), b);
                 } else if (e.kind == ExpressionKind::Call) {
                     lower_call(e.as<CallExpression>(), b);
+                } else if (e.kind == ExpressionKind::UnaryOp) {
+                    // A bare `i++;` / `--i;` statement: bump and discard the value.
+                    lower_unary(e.as<UnaryExpression>(), b);
                 } else {
                     fail("unsupported expression statement");
                 }
@@ -1645,29 +1648,9 @@ private:
             return;
         }
         if (e.kind == ExpressionKind::UnaryOp) {
-            const UnaryExpression& u = e.as<UnaryExpression>();
-            using U                  = slang::ast::UnaryOperator;
-            bool inc;
-            switch (u.op) {
-                case U::Preincrement:
-                case U::Postincrement:
-                    inc = true;
-                    break;
-                case U::Predecrement:
-                case U::Postdecrement:
-                    inc = false;
-                    break;
-                default:
-                    fail("unsupported for-step expression");
-            }
-            // A step is a statement: the loop variable's value before/after the
-            // bump is discarded, so pre and post forms lower identically.
-            const ir::SourceLoc l   = loc(e);
-            const ir::Index     lv  = lower_lvalue(u.operand(), b);
-            const ir::Index     cur = b.unary(ir::Inst::Tag::Load, lv, l);
-            const ir::Index     one = b.constant(module_.pool.put_int(lower_type(*u.operand().type), 1), l);
-            const ir::Index     nv  = b.binary(inc ? ir::Inst::Tag::Add : ir::Inst::Tag::Sub, cur, one, l);
-            b.binary(ir::Inst::Tag::Store, lv, nv, l);
+            // A step discards the result; ++/-- lower via lower_unary (which
+            // rejects any other unary operator, none of which are legal steps).
+            lower_unary(e.as<UnaryExpression>(), b);
             return;
         }
         fail("unsupported for-step expression (only assignment and ++/-- are supported)");
@@ -2632,7 +2615,8 @@ private:
 
     void lower_assign(const AssignmentExpression& a, ir::Builder& b) {
         if (a.isCompound()) {
-            fail("compound assignment not supported");
+            lower_compound_assign(a, b);
+            return;
         }
         if (a.timingControl != nullptr) {
             // Intra-assignment timing: `x = #5 y;` / `x = @(posedge clk) y;`. The
@@ -2691,6 +2675,35 @@ private:
             return;
         }
         b.binary(tag, lower_lvalue(a.left(), b), rhs, loc(a));
+    }
+
+    // Compound assignment `lhs op= rhs` (LRM 11.4.1, always blocking). slang has
+    // rewritten a.right() into `BinaryExpression(LValueReference, rhs, op)` with
+    // width/sign/conversion already resolved, so lowering it after binding the
+    // LHS lvalue yields `op(load(lhs), rhs)`. The LHS lvalue is evaluated exactly
+    // once and reused for the embedded LValueReference (single-evaluation, so
+    // `mem[i++] += 1` bumps i once).
+    void lower_compound_assign(const AssignmentExpression& a, ir::Builder& b) {
+        const ir::SourceLoc l = loc(a);
+        if (a.left().kind == ExpressionKind::Concatenation) {
+            // TODO: compound assignment to a concatenation lvalue ({a,b} += x).
+            // Needs the LValueReference to read the concat and store_concat to
+            // scatter the result.
+            fail("compound assignment to a concatenation is not supported");
+        }
+        if (is_string_expr(a.left()) ||
+            (a.left().kind == ExpressionKind::ElementSelect &&
+             is_string_expr(a.left().as<ElementSelectExpression>().value()))) {
+            // TODO: compound assignment to a string / string element (the lvalue
+            // path below is packed-only; a string char write uses str_putc).
+            fail("compound assignment to a string is not supported");
+        }
+        const ir::Index                lv    = lower_lvalue(a.left(), b);
+        const std::optional<ir::Index> saved = compound_lv_;
+        compound_lv_                         = lv;
+        const ir::Index rhs                  = lower_expr(a.right(), b);
+        compound_lv_                         = saved;
+        b.binary(ir::Inst::Tag::Store, lv, rhs, l);
     }
 
     // Distribute a value across a concatenation lvalue, `{a, b, c} = rhs` (LRM
@@ -2763,6 +2776,15 @@ private:
                 }
                 return b.unary(ir::Inst::Tag::Load, value_lvalue(sym, b, l), l);
             }
+            case ExpressionKind::LValueReference:
+                // slang rewrites a compound assignment's RHS into
+                // `BinaryExpression(LValueReference, rhs, op)`; the reference
+                // stands for the LHS already lowered once by lower_compound_assign
+                // (LRM 11.4.1 single-evaluation).
+                if (!compound_lv_.has_value()) {
+                    fail("LValueReference outside a compound assignment");
+                }
+                return b.unary(ir::Inst::Tag::Load, *compound_lv_, l);
             case ExpressionKind::UnaryOp:
                 return lower_unary(expr.as<UnaryExpression>(), b);
             case ExpressionKind::BinaryOp:
@@ -2860,16 +2882,37 @@ private:
                 }
                 return *v;
             }
+            case ExpressionKind::Assignment:
+                // TODO: assignment used as an rvalue (`y = (x += 1)`, `y = (x = 5)`).
+                // Its value is the LHS after the store, truncated to the LHS type
+                // (LRM 11.3.1) — not the raw RHS, so it needs lower_assign to
+                // return the stored value and this site to route into it.
+                fail("assignment used as an expression is not supported");
             default:
                 fail("unsupported expression kind=" + std::string(slang::ast::toString(expr.kind)));
         }
     }
 
     ir::Index lower_unary(const UnaryExpression& u, ir::Builder& b) {
-        const ir::SourceLoc l  = loc(u);
-        const ir::Index     op = lower_expr(u.operand(), b);
-        using U                = slang::ast::UnaryOperator;
-        using T                = ir::Inst::Tag;
+        const ir::SourceLoc l = loc(u);
+        using U               = slang::ast::UnaryOperator;
+        using T               = ir::Inst::Tag;
+        // Increment/decrement (LRM 11.4.2): `i = i +/- 1`, LHS evaluated once.
+        // Handled before lowering the operand as an rvalue so the lvalue's
+        // selectors are not evaluated twice. Pre returns the new value, post the
+        // old; slang has already resolved the operand's width/type.
+        if (u.op == U::Preincrement || u.op == U::Postincrement ||
+            u.op == U::Predecrement || u.op == U::Postdecrement) {
+            const bool inc = u.op == U::Preincrement || u.op == U::Postincrement;
+            const bool pre = u.op == U::Preincrement || u.op == U::Predecrement;
+            const ir::Index lv  = lower_lvalue(u.operand(), b);
+            const ir::Index cur = b.unary(T::Load, lv, l);
+            const ir::Index one = b.constant(module_.pool.put_int(lower_type(*u.operand().type), 1), l);
+            const ir::Index nv  = b.binary(inc ? T::Add : T::Sub, cur, one, l);
+            b.binary(T::Store, lv, nv, l);
+            return pre ? nv : cur;
+        }
+        const ir::Index op = lower_expr(u.operand(), b);
         switch (u.op) {
             case U::BitwiseNot:
                 return b.unary(T::Bnot, op, l);
@@ -3573,6 +3616,10 @@ private:
     // The function currently being lowered, or null when lowering a process. Drives
     // local-vs-signal name resolution and `return` handling.
     FnCtx* fn_ctx_ = nullptr;
+    // The LHS lvalue of the compound assignment currently being lowered, read by
+    // the LValueReferenceExpression slang embeds in its rewritten RHS. Null
+    // outside a compound assignment.
+    std::optional<ir::Index> compound_lv_;
     // Monotonic counter naming anonymous output / inout task-argument temps created
     // in a process body (where temps are module signals, not frame locals).
     uint32_t task_temp_seq_ = 0;
