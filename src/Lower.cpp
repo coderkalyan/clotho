@@ -1370,6 +1370,15 @@ private:
             case StatementKind::RepeatLoop:
                 lower_repeat(stmt.as<RepeatLoopStatement>(), b);
                 break;
+            case StatementKind::DoWhileLoop:
+                lower_do_while(stmt.as<DoWhileLoopStatement>(), b);
+                break;
+            case StatementKind::Break:
+                b.break_(loc(stmt));
+                break;
+            case StatementKind::Continue:
+                b.continue_(loc(stmt));
+                break;
             case StatementKind::Return:
                 lower_return(stmt.as<ReturnStatement>(), b);
                 break;
@@ -1510,7 +1519,7 @@ private:
         }
         const ir::ExtraSlice step = b.close_region();
 
-        b.loop(cond, pred, body, step, loc(f));
+        b.loop(cond, pred, body, step, /*bottom_test*/ false, loc(f));
     }
 
     // while-loop: a for-loop with no init and no step.
@@ -1526,7 +1535,26 @@ private:
         b.open_region();
         const ir::ExtraSlice step = b.close_region(); // empty
 
-        b.loop(cond, pred, body, step, loc(w));
+        b.loop(cond, pred, body, step, /*bottom_test*/ false, loc(w));
+    }
+
+    // do-while (12.7.1): like while, but the body runs once before the first
+    // predicate test. The bottom_test flag makes the backend branch entry ->
+    // body; `continue` still lands on the step block, which re-evaluates the
+    // condition (empty step -> header).
+    void lower_do_while(const DoWhileLoopStatement& d, ir::Builder& b) {
+        b.open_region();
+        const ir::Index      pred = lower_loop_cond(d.cond, b);
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        lower_stmt(d.body, b);
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        const ir::ExtraSlice step = b.close_region(); // empty
+
+        b.loop(cond, pred, body, step, /*bottom_test*/ true, loc(d));
     }
 
     // A forever loop around `body`: a constant-true Loop. Lowers both an
@@ -1547,7 +1575,7 @@ private:
         b.open_region();
         const ir::ExtraSlice step = b.close_region(); // empty
 
-        b.loop(cond, pred, body_region, step, loc(body));
+        b.loop(cond, pred, body_region, step, /*bottom_test*/ false, loc(body));
     }
 
     // repeat-loop (12.7.2): runs the body N times, where N is the count
@@ -1586,7 +1614,7 @@ private:
         b.binary(ir::Inst::Tag::Store, b.signal(counter, l), next, l);
         const ir::ExtraSlice step = b.close_region();
 
-        b.loop(cond, pred, body, step, l);
+        b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
     }
 
     // Register a hidden compiler temporary as backing signal storage. Unlike

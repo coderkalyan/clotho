@@ -314,6 +314,8 @@ struct Analysis {
                 // Valueless / always-known: no z effect.
                 case Inst::Tag::Cond:
                 case Inst::Tag::Loop:
+                case Inst::Tag::Break:
+                case Inst::Tag::Continue:
                 case Inst::Tag::Delay:
                 case Inst::Tag::Wait:
                 case Inst::Tag::Display:

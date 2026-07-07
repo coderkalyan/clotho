@@ -171,6 +171,10 @@ const char* tag_name(Inst::Tag tag) {
             return "display";
         case T::Finish:
             return "finish";
+        case T::Break:
+            return "break";
+        case T::Continue:
+            return "continue";
         case T::Fflush:
             return "fflush";
         case T::Fopen:

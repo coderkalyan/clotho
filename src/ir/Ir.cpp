@@ -89,6 +89,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::TimeFormat:
             return K::TimeFormat;
         case T::Finish:
+        case T::Break:
+        case T::Continue:
         case T::SimTime:
         case T::Random:
             return K::None;
