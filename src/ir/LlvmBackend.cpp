@@ -1929,6 +1929,25 @@ private:
         return b_.CreateLoad(int_ty(slot_mm_bits(lv)), lv_mm_ptr(lv));
     }
 
+    // A blocking write to a module signal must service the signal's wait queues
+    // with the old -> new transition. This pair brackets every such write path
+    // (Store, plus the runtime pointer write-backs: $fgets / $sformat / $ferror /
+    // $*scanf / scalar $fread): snapshot the selected storage before the write,
+    // then detect the transition and service after. The snapshot is null — and
+    // servicing a no-op — for a target that never wakes anyone: a frame local, a
+    // signal without waiters, or a PreInit store (variable declaration
+    // initializers generate no events).
+    llvm::Value* service_snapshot(const LValue& lv) {
+        const bool service = !lowering_preinit_ && lv.is_signal && signal_has_waiters(lv.sig);
+        return service ? load_lv_mm(lv) : nullptr;
+    }
+
+    void service_after_write(const LValue& lv, llvm::Value* old_mm) {
+        if (old_mm != nullptr) {
+            service_wait_queue(lv.sig, old_mm, load_lv_mm(lv));
+        }
+    }
+
     // Service a signal's wait queues after a blocking assignment to it. Computes
     // the transition's edge facts once, then for each per-edge bucket that exists
     // guards its whole scan with a single branch on the matching fact — no
@@ -3174,18 +3193,12 @@ private:
                     b_.CreateCall(str_assign_fn(), { lv_string_ptr(lv), str_of(p.binary.r) });
                     return;
                 }
-                // Frame locals have no waiters; only a module signal store services
-                // wait queues. A PreInit store (variable declaration initializer)
-                // generates no events, so it never services regardless of waiters.
-                const bool    service = !lowering_preinit_ && lv.is_signal && signal_has_waiters(lv.sig);
-                // Snapshot the selected storage (whole signal, or one array element)
-                // so an element write wakes Any-edge waiters on a change to that
-                // element rather than always reading element 0.
-                llvm::Value*  old_mm  = service ? load_lv_mm(lv) : nullptr;
+                // The snapshot covers the selected storage (whole signal, or one
+                // array element) so an element write wakes Any-edge waiters on a
+                // change to that element rather than always reading element 0.
+                llvm::Value* old_mm = service_snapshot(lv);
                 lower_store(lv, value_of(p.binary.r));
-                if (service) {
-                    service_wait_queue(lv.sig, old_mm, load_lv_mm(lv));
-                }
+                service_after_write(lv, old_mm);
                 return;
             }
             // A nonblocking assignment samples its RHS now but defers the write: it
@@ -4078,7 +4091,9 @@ private:
         const auto  info = ir_->extra_data<FgetsInfo>(ir_->payload(i).op_extra.extra);
         const auto [mm, z, width, flags] = string_dest(dst, "$fgets");
         llvm::Value* fd                  = cast(must_of(value_of(info.fd)), 32, true);
+        llvm::Value* old_mm              = service_snapshot(lvalue_of(dst));
         llvm::Value* r = b_.CreateCall(fgets_fn(), { mm, z, b_.getInt32(width), fd, b_.getInt32(flags) });
+        service_after_write(lvalue_of(dst), old_mm);
         set_value(i, packed(r, r, zero(32)));
     }
 
@@ -4143,7 +4158,9 @@ private:
             return;
         }
         const auto [mm, z, width, flags] = string_dest(info.dst, "$sformat / $swrite");
+        llvm::Value* old_mm              = service_snapshot(lvalue_of(info.dst));
         b_.CreateCall(sformat_fn(), { mm, z, b_.getInt32(width), fmt_ptr, argc, arr, b_.getInt32(flags) });
+        service_after_write(lvalue_of(info.dst), old_mm);
     }
 
     // Lower a $sformatf: format into the instruction's string temp.
@@ -4173,7 +4190,9 @@ private:
         const auto  info = ir_->extra_data<FerrorInfo>(ir_->payload(i).op_extra.extra);
         const auto [mm, z, width, flags] = string_dest(dst, "$ferror");
         llvm::Value* fd                  = cast(must_of(value_of(info.fd)), 32, true);
+        llvm::Value* old_mm              = service_snapshot(lvalue_of(dst));
         llvm::Value* r = b_.CreateCall(ferror_fn(), { fd, mm, z, b_.getInt32(width), b_.getInt32(flags) });
+        service_after_write(lvalue_of(dst), old_mm);
         set_value(i, packed(r, r, zero(32)));
     }
 
@@ -4210,8 +4229,11 @@ private:
         const std::span<const Index> outs = ir_->region(info.args);
         const auto                   n    = static_cast<uint32_t>(outs.size());
 
-        llvm::StructType* sty = scan_arg_struct_ty();
-        llvm::Value*      arr = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+        llvm::StructType*         sty = scan_arg_struct_ty();
+        llvm::Value*              arr = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+        // Old-value snapshots for wait-queue servicing, parallel to `outs`
+        // (null where a target needs no servicing).
+        std::vector<llvm::Value*> olds(n, nullptr);
         if (n > 0) {
             arr = b_.CreateAlloca(sty, b_.getInt32(n), "scan_args");
             for (uint32_t k = 0; k < n; ++k) {
@@ -4241,6 +4263,7 @@ private:
                 b_.CreateStore(z, b_.CreateStructGEP(sty, elt, 1));
                 b_.CreateStore(b_.getInt32(lv.store_width), b_.CreateStructGEP(sty, elt, 2));
                 b_.CreateStore(b_.getInt32(lv.narrow ? 1u : 0u), b_.CreateStructGEP(sty, elt, 3));
+                olds[k] = service_snapshot(lv);
             }
         }
 
@@ -4252,6 +4275,11 @@ private:
         } else {
             llvm::Value* fd = cast(must_of(value_of(info.source)), 32, true);
             r               = b_.CreateCall(fscanf_fn(), { fd, fmt_ptr, b_.getInt32(n), arr });
+        }
+        // Every conversion has landed; wake anything a written target changed
+        // (an unconverted target reloads its old value and stays quiet).
+        for (uint32_t k = 0; k < n; ++k) {
+            service_after_write(lvalue_of(outs[k]), olds[k]);
         }
         set_value(i, packed(r, r, zero(32)));
     }
@@ -4309,12 +4337,14 @@ private:
           lv.has_z ? lv_z_ptr(lv) : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
         llvm::Value* fd = cast(must_of(value_of(info.fd)), 32, true);
 
-        const uint32_t four  = type_of(dst).four_state ? 1u : 0u;
-        const uint32_t flags = lv.narrow ? 4u : 0u;
-        llvm::Value*   r     = b_.CreateCall(fread_fn(),
-                                             { fd, mm, z, b_.getInt32(0), b_.getInt32(1), b_.getInt32(lv.store_width),
-                                               b_.getInt32(four), b_.getInt64(0), b_.getInt64(0), b_.getInt64(0),
-                                               b_.getInt64(0), b_.getInt32(flags) });
+        const uint32_t four   = type_of(dst).four_state ? 1u : 0u;
+        const uint32_t flags  = lv.narrow ? 4u : 0u;
+        llvm::Value*   old_mm = service_snapshot(lv);
+        llvm::Value*   r      = b_.CreateCall(fread_fn(),
+                                              { fd, mm, z, b_.getInt32(0), b_.getInt32(1), b_.getInt32(lv.store_width),
+                                                b_.getInt32(four), b_.getInt64(0), b_.getInt64(0), b_.getInt64(0),
+                                                b_.getInt64(0), b_.getInt32(flags) });
+        service_after_write(lv, old_mm);
         set_value(i, packed(r, r, zero(32)));
     }
 
@@ -4354,6 +4384,19 @@ private:
           fread_fn(), { fd, mm_base, z_base, b_.getInt32(stride), b_.getInt32(s.elem_count),
                         b_.getInt32(s.width), b_.getInt32(s.four_state ? 1u : 0u), b_.getInt64(at.left),
                         b_.getInt64(at.right), start, cnt, b_.getInt32(flags) });
+        // A whole-array write has no per-element edge facts; wake the memory's
+        // Any-edge readers when any byte landed, mirroring the deferred
+        // array-NBA commit (rt_nba_arr_dirty -> service_any_waiters).
+        if (!lowering_preinit_ && signal_has_waiters(info.mem)) {
+            auto* fn   = b_.GetInsertBlock()->getParent();
+            auto* svc  = llvm::BasicBlock::Create(ctx_, "fread.svc", fn);
+            auto* cont = llvm::BasicBlock::Create(ctx_, "fread.cont", fn);
+            b_.CreateCondBr(b_.CreateICmpNE(r, b_.getInt32(0)), svc, cont);
+            b_.SetInsertPoint(svc);
+            service_any_waiters(info.mem);
+            b_.CreateBr(cont);
+            b_.SetInsertPoint(cont);
+        }
         set_value(i, packed(r, r, zero(32)));
     }
 
@@ -4426,6 +4469,10 @@ private:
                       { path, path_len, mm_base, z_base, b_.getInt32(stride),
                         b_.getInt32(s.elem_count), b_.getInt32(s.width), b_.getInt64(at.left),
                         b_.getInt64(at.right), start, finish, b_.getInt32(flags) });
+        // TODO: $readmem services no wait queues — a process already waiting on
+        // the memory sleeps through the load (pre-existing gap). rt_readmem would
+        // need a did-write result (it returns void) to gate an Any-edge wake the
+        // way lower_fread_mem does.
     }
 
     // Lower a function `return`: a real `ret`, so it terminates the block and any
