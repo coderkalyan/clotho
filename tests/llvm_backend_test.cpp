@@ -1834,6 +1834,28 @@ TEST_CASE("$fopen FD form: $fdisplay and $fwrite") {
     std::remove(path);
 }
 
+// %u writes the 2-value projection, %z vpi aval/bval word pairs, both as
+// 32-bit words LSB-first (LRM §21.2.1.1). Byte-exact against Icarus Verilog:
+// 8'b1x0z101z has aval 0xca (x reads 1, z reads 0) and bval 0x51 (the xz mask).
+TEST_CASE("$fwrite %u and %z emit unformatted words") {
+    const char* path = "clotho_ufmt_test.bin";
+    std::remove(path);
+    const std::string src = std::string(R"(
+        module m;
+            integer fd;
+            initial begin
+                fd = $fopen(")") + path + R"(", "wb");
+                $fwrite(fd, "%u", 32'h01020304);
+                $fwrite(fd, "%z", 8'b1x0z_101z);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    run_capture(src);
+    CHECK(read_file(path) == std::string("\x04\x03\x02\x01\xca\x00\x00\x00\x51\x00\x00\x00", 12));
+    std::remove(path);
+}
+
 // One-argument $fopen returns a multichannel descriptor opened for writing.
 TEST_CASE("$fopen MCD form writes to its channel") {
     const char* path = "clotho_mcd_test.txt";
