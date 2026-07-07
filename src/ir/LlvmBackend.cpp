@@ -7117,9 +7117,6 @@ private:
         if (s.is_string) {
             throw BackendError{ "VCD dump of string signal '" + info.name + "' is not supported" };
         }
-        if (s.width > 64) {
-            throw BackendError{ "VCD dump of signal '" + info.name + "' wider than 64 bits is not supported" };
-        }
         std::string leaf = info.name;
         if (const auto pos = leaf.rfind('.'); pos != std::string::npos) {
             leaf = leaf.substr(pos + 1);

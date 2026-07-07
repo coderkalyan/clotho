@@ -2344,47 +2344,54 @@ extern "C" void rt_free(void* p) {
 
 namespace {
 
+// 64-bit words needed to hold `width` bits.
+inline uint32_t vcd_nwords(uint32_t width) {
+    return (width + 63) / 64;
+}
+
 // One dumped scalar/vector variable: its live plane pointers into design state,
 // its VCD identifier, and the last value emitted (shadow) for change suppression.
+// Planes are multi-word to support arbitrary width; a value is `nwords` 64-bit
+// words per plane (little-endian, low word first).
 struct VcdVar {
     const uint8_t* mm = nullptr;   // packed must|may plane (i(2W)), or the iW word when narrow
     const uint8_t* z  = nullptr;   // z plane (iW), or null for a never-z / narrow variable
     uint32_t       width      = 0;
+    uint32_t       nwords     = 0;   // words per plane
     bool           four_state = false;
     bool           narrow     = false;   // 2-state `{ iW }` slot: mm is a bare iW value word
-    // Shadow: the last dumped planes. `seen` is false until the first emit.
-    uint64_t last_must = 0, last_may = 0, last_z = 0;
-    bool     seen = false;
+    bool           seen       = false;   // shadow valid (a value has been dumped)
+    // Shadow of the last dumped planes: 3*nwords words laid out must | may | z.
+    std::vector<uint64_t> shadow;
     // VCD identifier code (printable ASCII), assigned at registration.
     std::string idcode;
 };
 
-// One entry of the backend-neutral record stream the producer hands to the sink
-// (docs/VCD.md §4). A time marker carries the tick in `a`; a value change carries
-// the variable index and its (must, may, z) planes. Keeping records self-contained
-// (planes, not a shadow reference) is what lets the sink be stateless and, later,
+// The producer -> sink record stream is a byte buffer of self-describing records
+// (docs/VCD.md §4), so a value of any width travels inline and the sink stays
+// stateless. A record is a tag byte followed by:
+//   tag 1 (time):   u64 tick
+//   tag 0 (change): u32 idx, u32 nwords, then nwords u64 each of must, may, z
+// Keeping the planes in the record (not a shadow reference) is what lets the sink
 // run on another thread or format an alternate backend (FST, viewer).
-struct VcdRec {
-    uint64_t a = 0, b = 0, c = 0;   // time: a = tick. change: a = must, b = may, c = z.
-    uint32_t idx     = 0;           // change: variable index (unused for a time marker)
-    uint32_t is_time = 0;           // 1 = time marker, 0 = value change
-};
 
 // The single global VCD engine (the simulator is single-threaded, one dump per
 // run). Reset by rt_vcd_close so the next simulation in the same process starts
 // clean.
 struct VcdEngine {
-    std::FILE*           file  = nullptr;
-    char*                iobuf = nullptr;   // fixed setvbuf buffer
-    rt_wheel*            wheel = nullptr;    // cached for the close-time flush
-    std::string          path;
-    std::vector<VcdVar>  vars;
-    std::vector<VcdRec>  recbuf;   // producer -> sink record stream for one instant
-    uint32_t next_id = 0;       // next VCD identifier index (assigned per rt_vcd_var)
-    bool started     = false;   // header finished ($enddefinitions written)
-    bool active      = false;   // dumping (cleared by $dumpoff)
-    bool force_all   = false;   // next flush emits every var ($dumpall / $dumpon / initial)
-    bool pending_off = false;   // next flush emits an all-x checkpoint, then deactivates
+    std::FILE*            file  = nullptr;
+    char*                 iobuf = nullptr;   // fixed setvbuf buffer
+    rt_wheel*             wheel = nullptr;    // cached for the close-time flush
+    std::string           path;
+    std::vector<VcdVar>   vars;
+    std::vector<uint8_t>  recbuf;    // producer -> sink record byte stream for pending instants
+    std::vector<uint64_t> scratch;   // scan buffer: 3*max_nwords words (must | may | z)
+    uint32_t max_nwords = 1;    // widest variable, in words (sizes scratch / buffers)
+    uint32_t next_id    = 0;    // next VCD identifier index (assigned per registration)
+    bool started        = false;   // header finished ($enddefinitions written)
+    bool active         = false;   // dumping (cleared by $dumpoff)
+    bool force_all      = false;   // next flush emits every var ($dumpall / $dumpon / initial)
+    bool pending_off    = false;   // next flush emits an all-x checkpoint, then deactivates
 
     static constexpr size_t iobuf_size = 1u << 20;   // 1 MiB
 };
@@ -2453,47 +2460,78 @@ void vcd_write_timescale(uint64_t tick_fs) {
     vcd_puts("fs\n$end\n");
 }
 
-// Read a variable's live planes as (must, may, z) 64-bit words. The must|may plane
-// is the little-endian i(2W) slot field: bits [0,W) are must, [W,2W) are may.
-void vcd_read_planes(const VcdVar& v, uint64_t& must, uint64_t& may, uint64_t& z) {
-    const uint32_t w    = v.width;
-    const uint64_t mask = w >= 64 ? ~0ull : ((1ull << w) - 1);
-    if (v.narrow) {
-        // A 2-state `{ iW }` slot: the single word is the value, fully known.
-        uint64_t val = 0;
-        std::memcpy(&val, v.mm, (w + 7) / 8);
-        must = val & mask;
-        may  = must;
-        z    = 0;
-        return;
-    }
-    unsigned __int128 mm = 0;
-    std::memcpy(&mm, v.mm, (2 * w + 7) / 8);
-    must = static_cast<uint64_t>(mm) & mask;
-    may  = static_cast<uint64_t>(mm >> w) & mask;
-    if (v.z != nullptr) {
-        uint64_t zz = 0;
-        std::memcpy(&zz, v.z, (w + 7) / 8);
-        z = zz & mask;
-    } else {
-        z = 0;
+// Mask keeping the significant bits of a plane's top word (all bits when the width
+// is a multiple of 64).
+inline uint64_t vcd_topmask(uint32_t width) {
+    const uint32_t r = width % 64;
+    return r == 0 ? ~0ull : ((1ull << r) - 1);
+}
+
+// dst[0..dstw) = (src[0..srcw) as a bignum) >> shift. Words are little-endian.
+void vcd_shr(const uint64_t* src, uint32_t srcw, uint32_t shift, uint64_t* dst, uint32_t dstw) {
+    const uint32_t ws = shift / 64;
+    const uint32_t bs = shift % 64;
+    for (uint32_t k = 0; k < dstw; ++k) {
+        const uint64_t lo  = ws + k < srcw ? src[ws + k] : 0;
+        uint64_t       val = lo >> bs;
+        if (bs != 0) {
+            const uint64_t hi = ws + k + 1 < srcw ? src[ws + k + 1] : 0;
+            val |= hi << (64 - bs);
+        }
+        dst[k] = val;
     }
 }
 
-// Emit one variable's value-change line for the given planes. Scalars print the
-// value char then the id; vectors print `b<bits> <id>` with the LRM §21.7.2.1
-// asymmetric leading-bit compression (leftmost printed digit sets the reader's
-// left-extension: 0->0, x->x, z->z, but 1->0, so a 1-MSB cannot be compressed).
-void vcd_emit(const VcdVar& v, uint64_t must, uint64_t may, uint64_t z) {
+// Read a variable's live planes into `out`, laid out must | may | z, each
+// `v.nwords` little-endian 64-bit words. The must|may plane is the packed i(2W)
+// slot field (bits [0,W) must, [W,2W) may); a narrow slot is a bare iW value.
+void vcd_read_planes(const VcdVar& v, uint64_t* out) {
+    const uint32_t w    = v.width;
+    const uint32_t nw   = v.nwords;
+    uint64_t*      must = out;
+    uint64_t*      may  = out + nw;
+    uint64_t*      z    = out + 2 * nw;
+    const uint64_t tm   = vcd_topmask(w);
+    std::memset(out, 0, static_cast<size_t>(3) * nw * 8);
+    if (v.narrow) {
+        // A 2-state `{ iW }` slot: the single value word is fully known (may==must).
+        std::memcpy(must, v.mm, (w + 7) / 8);
+        must[nw - 1] &= tm;
+        std::memcpy(may, must, static_cast<size_t>(nw) * 8);
+        return;   // z stays 0
+    }
+    // Copy the 2W-bit must|may field into a zeroed scratch, then split it: must is
+    // the low W bits, may is the field shifted right by W.
+    const uint32_t rw  = vcd_nwords(2 * w);
+    uint64_t*      raw = g_vcd.scratch.data() + 3 * g_vcd.max_nwords;   // scratch tail, reserved
+    std::memset(raw, 0, static_cast<size_t>(rw) * 8);
+    std::memcpy(raw, v.mm, (2 * w + 7) / 8);
+    std::memcpy(must, raw, static_cast<size_t>(nw) * 8);
+    must[nw - 1] &= tm;
+    vcd_shr(raw, rw, w, may, nw);
+    may[nw - 1] &= tm;
+    if (v.z != nullptr) {
+        std::memcpy(z, v.z, (w + 7) / 8);
+        z[nw - 1] &= tm;
+    }
+}
+
+// Emit one variable's value-change line for the given planes (each `v.nwords`
+// little-endian words). Scalars print the value char then the id; vectors print
+// `b<bits> <id>` with the LRM §21.7.2.1 asymmetric leading-bit compression
+// (leftmost printed digit sets the reader's left-extension: 0->0, x->x, z->z, but
+// 1->0, so a 1-MSB cannot be compressed).
+void vcd_emit(const VcdVar& v, const uint64_t* must, const uint64_t* may, const uint64_t* z) {
     const auto bitc = [&](uint32_t i) -> char {
-        const uint64_t m = 1ull << i;
-        if ((z & m) != 0) {
+        const uint64_t m = 1ull << (i & 63);
+        const uint32_t w = i >> 6;
+        if ((z[w] & m) != 0) {
             return 'z';
         }
-        if ((may & m) == 0) {
+        if ((may[w] & m) == 0) {
             return '0';
         }
-        return (must & m) != 0 ? '1' : 'x';
+        return (must[w] & m) != 0 ? '1' : 'x';
     };
     if (v.width == 1) {
         vcd_put(bitc(0));
@@ -2549,25 +2587,54 @@ void vcd_emit(const VcdVar& v, uint64_t must, uint64_t may, uint64_t z) {
 // two here is what lets a later step move vcd_drain onto a writer thread, or swap
 // in an FST / viewer sink, without touching the producer.
 
+void vcd_buf_put(std::vector<uint8_t>& b, const void* p, size_t n) {
+    const auto* s = static_cast<const uint8_t*>(p);
+    b.insert(b.end(), s, s + n);
+}
+
 void vcd_rec_time(uint64_t tick) {
-    g_vcd.recbuf.push_back(VcdRec{ tick, 0, 0, 0, 1 });
+    g_vcd.recbuf.push_back(1);
+    vcd_buf_put(g_vcd.recbuf, &tick, sizeof(tick));
 }
 
-void vcd_rec_change(uint32_t idx, uint64_t must, uint64_t may, uint64_t z) {
-    g_vcd.recbuf.push_back(VcdRec{ must, may, z, idx, 0 });
+// Append a value-change record: idx, nwords, then the must | may | z planes
+// (3*nwords words, contiguous at `planes`).
+void vcd_rec_change(uint32_t idx, const uint64_t* planes, uint32_t nwords) {
+    g_vcd.recbuf.push_back(0);
+    vcd_buf_put(g_vcd.recbuf, &idx, sizeof(idx));
+    vcd_buf_put(g_vcd.recbuf, &nwords, sizeof(nwords));
+    vcd_buf_put(g_vcd.recbuf, planes, static_cast<size_t>(3) * nwords * 8);
 }
 
-// Format one record buffer to the output file. Reads only the record planes and
-// the read-only var table (no diff / shadow state), so it runs on the writer
+// Writer-thread scratch for the aligned plane copy (only the writer touches it).
+std::vector<uint64_t> vcd_writer_scratch;
+
+// Format one record byte buffer to the output file. Reads only the record bytes
+// and the read-only var table (no diff / shadow state), so it runs on the writer
 // thread while the sim thread fills the next buffer.
-void vcd_write_records(const std::vector<VcdRec>& buf) {
-    for (const VcdRec& r : buf) {
-        if (r.is_time != 0) {
+void vcd_write_records(const std::vector<uint8_t>& buf) {
+    size_t p = 0;
+    while (p < buf.size()) {
+        const uint8_t tag = buf[p++];
+        if (tag == 1) {
+            uint64_t tick = 0;
+            std::memcpy(&tick, &buf[p], sizeof(tick));
+            p += sizeof(tick);
             vcd_put('#');
-            vcd_put_dec(r.a);
+            vcd_put_dec(tick);
             vcd_put('\n');
         } else {
-            vcd_emit(g_vcd.vars[r.idx], r.a, r.b, r.c);
+            uint32_t idx = 0, nw = 0;
+            std::memcpy(&idx, &buf[p], sizeof(idx));
+            p += sizeof(idx);
+            std::memcpy(&nw, &buf[p], sizeof(nw));
+            p += sizeof(nw);
+            // Copy the (unaligned) planes into an aligned scratch before formatting.
+            vcd_writer_scratch.resize(static_cast<size_t>(3) * nw);
+            std::memcpy(vcd_writer_scratch.data(), &buf[p], static_cast<size_t>(3) * nw * 8);
+            p += static_cast<size_t>(3) * nw * 8;
+            const uint64_t* planes = vcd_writer_scratch.data();
+            vcd_emit(g_vcd.vars[idx], planes, planes + nw, planes + 2 * nw);
         }
     }
 }
@@ -2582,22 +2649,22 @@ void vcd_write_records(const std::vector<VcdRec>& buf) {
 // rt_vcd_start, and after the thread spawns the file is written by the writer
 // alone (the header is written earlier, on the sim thread, before the spawn).
 
-constexpr size_t kVcdBuffers  = 8;      // record buffers in the pool
-constexpr size_t kVcdHandoff  = 512;    // hand off once a buffer holds this many records
+constexpr size_t kVcdBuffers      = 8;             // record buffers in the pool
+constexpr size_t kVcdHandoffBytes = 64u * 1024u;   // hand off once a buffer holds this many bytes
 
-std::thread                      vcd_thread;
-std::mutex                       vcd_mu;
-std::condition_variable          vcd_cv_ready;   // writer waits for filled buffers
-std::condition_variable          vcd_cv_free;    // sim waits for a recycled buffer
-std::condition_variable          vcd_cv_idle;    // $dumpflush waits for the writer to catch up
-std::queue<std::vector<VcdRec>>  vcd_ready;      // filled buffers awaiting write
-std::vector<std::vector<VcdRec>> vcd_pool;       // recycled empty buffers
-size_t                           vcd_inflight = 0;  // buffers handed off but not yet written
-bool                             vcd_stop     = false;
+std::thread                        vcd_thread;
+std::mutex                         vcd_mu;
+std::condition_variable            vcd_cv_ready;   // writer waits for filled buffers
+std::condition_variable            vcd_cv_free;    // sim waits for a recycled buffer
+std::condition_variable            vcd_cv_idle;    // $dumpflush waits for the writer to catch up
+std::queue<std::vector<uint8_t>>   vcd_ready;      // filled buffers awaiting write
+std::vector<std::vector<uint8_t>>  vcd_pool;       // recycled empty buffers
+size_t                             vcd_inflight = 0;  // buffers handed off but not yet written
+bool                               vcd_stop     = false;
 
 void vcd_writer_loop() {
     for (;;) {
-        std::vector<VcdRec> buf;
+        std::vector<uint8_t> buf;
         {
             std::unique_lock<std::mutex> lk(vcd_mu);
             vcd_cv_ready.wait(lk, [] { return !vcd_ready.empty() || vcd_stop; });
@@ -2630,7 +2697,7 @@ void vcd_handoff() {
     }
     std::unique_lock<std::mutex> lk(vcd_mu);
     vcd_cv_free.wait(lk, [] { return !vcd_pool.empty(); });
-    std::vector<VcdRec> next = std::move(vcd_pool.back());
+    std::vector<uint8_t> next = std::move(vcd_pool.back());
     vcd_pool.pop_back();
     next.clear();
     vcd_ready.push(std::move(g_vcd.recbuf));
@@ -2691,9 +2758,14 @@ static void vcd_register(std::string_view ref, uint32_t width, uint32_t flags, c
     v.mm         = mm;
     v.z          = z;
     v.width      = width;
+    v.nwords     = vcd_nwords(width);
     v.four_state = (flags & RT_VCD_FLAG_FOUR_STATE) != 0;
     v.narrow     = (flags & RT_VCD_FLAG_NARROW) != 0;
     v.idcode     = vcd_idcode(g_vcd.next_id++);
+    v.shadow.assign(static_cast<size_t>(3) * v.nwords, 0);
+    if (v.nwords > g_vcd.max_nwords) {
+        g_vcd.max_nwords = v.nwords;
+    }
     const char* vtype = (flags & RT_VCD_FLAG_NET) != 0 ? "wire" : "reg";
     vcd_puts("$var ");
     vcd_puts(vtype);
@@ -2739,21 +2811,30 @@ extern "C" void rt_vcd_start(void) {
     }
     if (!g_vcd.started) {
         vcd_puts("$enddefinitions $end\n");
-        // Size every record buffer to hold a full handoff batch plus one more
-        // whole instant, so the producer never allocates and never splits an
-        // instant across buffers. Spawn the writer only after the header is fully
-        // written on this (sim) thread, so file access never overlaps.
-        const size_t cap = kVcdHandoff + g_vcd.vars.size() + 1;
+        // The scan scratch holds one variable's 3*nwords planes plus, in its tail,
+        // the raw 2W-bit must|may read buffer (up to 2*max_nwords+1 words).
+        g_vcd.scratch.assign(static_cast<size_t>(5) * g_vcd.max_nwords + 2, 0);
+        vcd_writer_scratch.reserve(static_cast<size_t>(3) * g_vcd.max_nwords);
+        // Size every record buffer to hold a full handoff batch plus one more whole
+        // instant, so the producer never allocates and never splits an instant
+        // across buffers. A worst-case instant is a full-dump change for every
+        // variable plus one time marker. Spawn the writer only after the header is
+        // fully written on this (sim) thread, so file access never overlaps.
+        size_t instant_bytes = 1 + sizeof(uint64_t);   // one time marker
+        for (const VcdVar& v : g_vcd.vars) {
+            instant_bytes += 1 + 2 * sizeof(uint32_t) + static_cast<size_t>(3) * v.nwords * 8;
+        }
+        const size_t cap = kVcdHandoffBytes + instant_bytes;
         g_vcd.recbuf.reserve(cap);
         vcd_pool.clear();
         for (size_t k = 0; k < kVcdBuffers; ++k) {
-            std::vector<VcdRec> b;
+            std::vector<uint8_t> b;
             b.reserve(cap);
             vcd_pool.push_back(std::move(b));
         }
-        vcd_stop     = false;
-        vcd_inflight = 0;
-        vcd_thread   = std::thread(vcd_writer_loop);
+        vcd_stop      = false;
+        vcd_inflight  = 0;
+        vcd_thread    = std::thread(vcd_writer_loop);
         g_vcd.started = true;
     }
     g_vcd.active    = true;
@@ -2764,17 +2845,21 @@ extern "C" void rt_vcd_flush(uint64_t tick) {
     if (g_vcd.file == nullptr) {
         return;
     }
+    uint64_t* const scan = g_vcd.scratch.data();
     if (g_vcd.pending_off) {
         // $dumpoff checkpoint: mark every variable all-x at this instant.
         vcd_rec_time(tick);
         for (uint32_t i = 0; i < g_vcd.vars.size(); ++i) {
-            VcdVar&        v    = g_vcd.vars[i];
-            const uint64_t mask = v.width >= 64 ? ~0ull : ((1ull << v.width) - 1);
-            vcd_rec_change(i, 0, mask, 0);
-            v.last_must = 0;
-            v.last_may  = mask;
-            v.last_z    = 0;
-            v.seen      = true;
+            VcdVar&        v  = g_vcd.vars[i];
+            const uint32_t nw = v.nwords;
+            std::memset(scan, 0, static_cast<size_t>(3) * nw * 8);   // must = 0, z = 0
+            for (uint32_t k = 0; k < nw; ++k) {
+                scan[nw + k] = ~0ull;   // may = all ones (x)
+            }
+            scan[2 * nw - 1] &= vcd_topmask(v.width);
+            vcd_rec_change(i, scan, nw);
+            std::memcpy(v.shadow.data(), scan, static_cast<size_t>(3) * nw * 8);
+            v.seen = true;
         }
         g_vcd.pending_off = false;
         g_vcd.active      = false;
@@ -2790,16 +2875,14 @@ extern "C" void rt_vcd_flush(uint64_t tick) {
     vcd_rec_time(tick);
     bool any = false;
     for (uint32_t i = 0; i < g_vcd.vars.size(); ++i) {
-        VcdVar&  v = g_vcd.vars[i];
-        uint64_t m = 0, y = 0, zz = 0;
-        vcd_read_planes(v, m, y, zz);
-        if (g_vcd.force_all || !v.seen || m != v.last_must || y != v.last_may || zz != v.last_z) {
-            vcd_rec_change(i, m, y, zz);
-            v.last_must = m;
-            v.last_may  = y;
-            v.last_z    = zz;
-            v.seen      = true;
-            any         = true;
+        VcdVar&        v     = g_vcd.vars[i];
+        const size_t   bytes = static_cast<size_t>(3) * v.nwords * 8;
+        vcd_read_planes(v, scan);
+        if (g_vcd.force_all || !v.seen || std::memcmp(scan, v.shadow.data(), bytes) != 0) {
+            vcd_rec_change(i, scan, v.nwords);
+            std::memcpy(v.shadow.data(), scan, bytes);
+            v.seen = true;
+            any    = true;
         }
     }
     if (!any) {
@@ -2809,7 +2892,7 @@ extern "C" void rt_vcd_flush(uint64_t tick) {
     // Hand the batch to the writer once it is large enough; small instants
     // accumulate to amortize the handoff. The remainder flushes at $dumpflush /
     // close.
-    if (g_vcd.recbuf.size() >= kVcdHandoff) {
+    if (g_vcd.recbuf.size() >= kVcdHandoffBytes) {
         vcd_handoff();
     }
 }

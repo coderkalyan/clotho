@@ -243,6 +243,44 @@ TEST_CASE("vcd: descending array range names elements by declared address") {
     CHECK(contains(vcd, "m[1] $end"));
 }
 
+TEST_CASE("vcd: signals wider than 64 bits dump as full multi-word vectors") {
+    const std::string src = R"(
+        module top;
+          reg [95:0] w = 0;
+          initial begin
+            $dumpfile("OUT.vcd");
+            $dumpvars;
+            #5 w = 96'hDEAD_BEEF_1234_5678_9ABC_DEF0;
+            #5 $finish;
+          end
+        endmodule
+    )";
+    const std::string vcd  = run_vcd(src);
+    const std::string body = body_of(vcd);
+    CHECK(contains(vcd, "$var reg 96 "));   // declared at full width in the header
+    // 0xDEADBEEF123456789ABCDEF0 as 96 binary bits, MSB first, no leading-zero loss
+    // (the MSB is 1, so the full width prints).
+    CHECK(contains(body, "b110111101010110110111110111011110001001000110100010101100111100"
+                         "010011010101111001101111011110000 "));
+}
+
+TEST_CASE("vcd: wide four-state value renders x then the settled bits") {
+    const std::string src = R"(
+        module top;
+          reg [70:0] w;
+          initial begin
+            $dumpfile("OUT.vcd");
+            $dumpvars;
+            #5 w = 71'h5A;
+            #5 $finish;
+          end
+        endmodule
+    )";
+    const std::string body = body_of(run_vcd(src));
+    CHECK(contains(body, "#0\nbx "));         // uninitialized 71-bit reg is all-x
+    CHECK(contains(body, "#5\nb1011010 "));   // 0x5A, leading zeros dropped
+}
+
 TEST_CASE("vcd: high-activity trace stays ordered through the writer thread") {
     // Enough instants to exceed the writer's handoff threshold many times over, so
     // the background writer processes multiple buffers. A race would corrupt the
