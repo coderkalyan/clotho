@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include <sys/resource.h>
+
 #include "Format.h"
 #include "Wheel.h"
 
@@ -1143,18 +1145,67 @@ namespace {
 // simulation, or null when the design runs standalone.
 std::jmp_buf* finish_env = nullptr;
 
+// Append the simulation time `now` (in design ticks) as "<value> <unit>",
+// reduced to the largest SI unit that divides it evenly (fs / ps / ns / us / ms
+// / s). A unitless design (tick_fs == 0) prints the raw tick count. Used only by
+// the $finish banner, so a plain best-effort rendering — not the %t format.
+void append_finish_time(std::string& out, uint64_t now) {
+    const uint64_t tick_fs = timeformat.tick_fs;
+    if (tick_fs == 0) {
+        out += std::to_string(now);
+        return;
+    }
+    // Total femtoseconds; 128-bit to avoid overflow on a coarse precision.
+    const unsigned __int128 fs = static_cast<unsigned __int128>(now) * tick_fs;
+    static const struct {
+        uint64_t    div;
+        const char* unit;
+    } table[] = { { 1000000000000000ull, "s" }, { 1000000000000ull, "ms" },
+                  { 1000000000ull, "us" },       { 1000000ull, "ns" },
+                  { 1000ull, "ps" },             { 1ull, "fs" } };
+    // At now == 0 every unit divides; pick the design precision's unit so the
+    // output reads "0 <precision-unit>" rather than "0 s".
+    const unsigned __int128 pick = fs == 0 ? tick_fs : fs;
+    for (const auto& e : table) {
+        if (pick % e.div == 0) {
+            out += std::to_string(static_cast<uint64_t>(fs / e.div));
+            out += ' ';
+            out += e.unit;
+            return;
+        }
+    }
+}
+
 } // namespace
 
 extern "C" void rt_finish_host(void* env) {
     finish_env = static_cast<std::jmp_buf*>(env);
 }
 
-extern "C" void rt_finish(void) {
-    // $finish / $stop: end the simulation. Jump back to the host that started
-    // the run when one is installed — the codegen relies on rt_finish being
-    // noreturn, so returning normally is not an option. Otherwise exit;
-    // std::exit runs atexit handlers and flushes C stdio, so any buffered
-    // $display output is committed before the process leaves.
+extern "C" void rt_finish(const char* banner, uint64_t now, int32_t arg) {
+    if (arg >= 1) {
+        std::fflush(stdout);
+        std::string line = banner;
+        line += " called at ";
+        append_finish_time(line, now);
+        if (arg >= 2) {
+            rusage ru;
+            getrusage(RUSAGE_SELF, &ru);
+            const double cpu = static_cast<double>(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) +
+                               static_cast<double>(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
+            char stats[128];
+            std::snprintf(stats, sizeof(stats), "\n  Memory: %ld KB  CPU time: %.3f seconds",
+                          ru.ru_maxrss, cpu);
+            line += stats;
+        }
+        line += '\n';
+        std::fputs(line.c_str(), stderr);
+        std::fflush(stderr);
+    }
+    // Jump back to the host that started the run when one is installed — the
+    // codegen relies on rt_finish being noreturn, so returning normally is not an
+    // option. Otherwise exit; std::exit runs atexit handlers and flushes C stdio,
+    // so any buffered $display output is committed before the process leaves.
     if (finish_env != nullptr) {
         std::longjmp(*finish_env, 1);
     }

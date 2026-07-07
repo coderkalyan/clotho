@@ -144,8 +144,10 @@ public:
     // signal `mem`. Yields the byte count.
     Index fread_mem(Index fd, Signal mem, Index start, Index count, bool has_start, bool has_count,
                     SourceLoc loc);
-    // $finish / $stop: end the simulation and exit. No operands.
-    Index finish(SourceLoc loc);
+    // $finish / $stop: end the simulation and exit. `banner` is the compile-time
+    // prefix "<file>:<line>: <task>"; `arg` is the diagnostic level (0/1/2, LRM
+    // Table 20-1). No SSA operands.
+    Index finish(std::string_view banner, uint32_t arg, SourceLoc loc);
     // $fflush: flush the descriptor `handle`'s output buffers. The no-argument
     // form passes a constant 0 (the runtime flushes every open stream).
     Index fflush(Index handle, SourceLoc loc);

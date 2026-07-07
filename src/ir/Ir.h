@@ -263,6 +263,20 @@ struct DisplayInfo {
     ExtraSlice args;
 };
 
+// Extra payload for `finish`: a $finish / $stop. `arg` is the diagnostic level
+// (0/1/2; LRM Table 20-1: 0 prints nothing, 1 time+location, 2 adds resource
+// stats). `banner`/`banner_len` are the packed bytes of the compile-time banner
+// prefix "<file>:<line>: <task>" that the runtime completes with the simulation
+// time when `arg` >= 1; the task name is baked in so $finish and $stop differ.
+struct FinishInfo {
+    // First extra word of the packed banner-prefix bytes.
+    ExtraIndex banner;
+    // Banner-prefix length in bytes.
+    uint32_t banner_len;
+    // Diagnostic level (0/1/2), defaulting to 1 when the source omits it.
+    uint32_t arg;
+};
+
 // Extra payload for `fopen`: the $fopen(name, mode) form. `mode` is the C stdio
 // mode-string operand (a packed-ASCII vector, spilled by the backend) and is
 // valid iff `has_mode`; the name value is the instruction's `op`. With a mode a
@@ -725,9 +739,11 @@ struct Inst {
         // for all later %t specifiers (payload: timeformat -> TimeFormatInfo).
         // LRM §20.4.3. Lowers to an rt_timeformat_set call.
         TimeFormat,
-        // $finish / $stop: end the simulation and exit (payload: none). LRM §20.2
-        // has $stop suspend and $finish exit; with no resume mechanism a suspend
-        // is observationally an exit, so both are treated identically.
+        // $finish / $stop: end the simulation and exit (payload: extra ->
+        // FinishInfo, carrying the diagnostic level and the compile-time banner
+        // prefix). LRM §20.2 has $stop suspend and $finish exit; with no resume
+        // mechanism a suspend is observationally an exit, so both are treated
+        // identically apart from the banner's task name.
         Finish,
         // $fflush: flush a descriptor's output buffers (payload: unary, the
         // descriptor value; the no-argument form passes a constant 0, which the

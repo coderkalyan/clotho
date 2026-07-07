@@ -267,8 +267,11 @@ Index Builder::scanf(Index source, bool is_string, std::string_view fmt, std::sp
     return emit({ Inst::Tag::Scanf, Inst::Payload{ .extra = extra } }, loc);
 }
 
-Index Builder::finish(SourceLoc loc) {
-    return emit({ Inst::Tag::Finish, Inst::Payload{ .none = 0 } }, loc);
+Index Builder::finish(std::string_view banner, uint32_t arg, SourceLoc loc) {
+    const ExtraIndex banner_at = add_bytes(banner);
+    const ExtraIndex extra =
+      add_extra(FinishInfo{ banner_at, static_cast<uint32_t>(banner.size()), arg });
+    return emit({ Inst::Tag::Finish, Inst::Payload{ .extra = extra } }, loc);
 }
 
 Index Builder::fflush(Index handle, SourceLoc loc) {

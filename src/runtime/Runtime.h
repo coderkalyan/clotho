@@ -69,9 +69,14 @@ void rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uin
 // is treated identically to $finish. Never returns to the caller: control
 // transfers to the host installed by rt_finish_host (run_jit), or the process
 // exits when no host is installed.
-// TODO: the optional diagnostic-level argument (0/1/2) that controls exit-message
-// verbosity is accepted at the frontend but ignored here.
-[[noreturn]] void rt_finish(void);
+//
+// Before exiting it prints the exit banner per LRM Table 20-1, selected by
+// `arg` (0/1/2): 0 prints nothing, 1 prints "<banner> called at <time>", 2 adds
+// a resource-usage line. `banner` is the compile-time "<file>:<line>: <task>"
+// prefix; `now` is the current simulation time in design ticks. The banner goes
+// to stderr (a simulator diagnostic, not design output; the LRM fixes its
+// content but not the stream).
+[[noreturn]] void rt_finish(const char* banner, uint64_t now, int32_t arg);
 
 // Install (or clear, with null) the setjmp target rt_finish longjmps to, so a
 // $finish ends only the simulation, not the embedding process (the test binary

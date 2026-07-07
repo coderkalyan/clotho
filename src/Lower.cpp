@@ -623,6 +623,16 @@ private:
         return to_source_loc(s.sourceRange.start());
     }
 
+    // The compile-time banner prefix "<file>:<line>: <task>" for a $finish /
+    // $stop (LRM §20.2). The location is resolved here (the backend is
+    // slang-free); the runtime appends " called at <time>".
+    std::string finish_banner(const Expression& call, std::string_view task) const {
+        const slang::SourceManager* sm = scope_->getCompilation().getSourceManager();
+        const slang::SourceLocation sl = call.sourceRange.start();
+        return std::string(sm->getFileName(sl)) + ":" +
+               std::to_string(sm->getLineNumber(sl)) + ": " + std::string(task);
+    }
+
     // -- Types --
 
     ir::Ref lower_type(const slang::ast::Type& type) {
@@ -2004,10 +2014,23 @@ private:
             // Both end the simulation and exit. LRM §20.2 defines $stop as
             // suspending the run (vs $finish exiting to the OS) and mandates no
             // interactive mode; Clotho cannot resume a suspended run, so a
-            // suspend-forever equals exit and the two are treated identically.
-            // TODO: the optional diagnostic-level argument (0/1/2) controlling
-            // exit-message verbosity is parsed by slang but dropped here.
-            b.finish(loc(call));
+            // suspend-forever equals exit and the two are treated identically
+            // apart from the banner's task name.
+            //
+            // The optional 0/1/2 argument selects the exit-message verbosity
+            // (LRM Table 20-1); slang guarantees it is a constant, defaulting to
+            // 1 when omitted. The runtime prints the banner (time + location) for
+            // level >= 1.
+            uint32_t level = 1;
+            if (!call.arguments().empty()) {
+                slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+                slang::ast::EvalContext    ectx(actx);
+                const slang::ConstantValue cv = call.arguments()[0]->eval(ectx);
+                if (cv.isInteger()) {
+                    level = cv.integer().as<uint32_t>().value_or(1);
+                }
+            }
+            b.finish(finish_banner(call, name), level, loc(call));
             return;
         }
         if (name == "$fflush") {

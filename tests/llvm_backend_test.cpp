@@ -80,6 +80,39 @@ std::string run_capture(std::string_view source) {
     return out;
 }
 
+// Run a design and capture what it writes to stderr — used to observe the
+// $finish / $stop exit banner (LRM Table 20-1), which is a simulator diagnostic
+// routed to stderr, not the design's stdout.
+std::string run_capture_stderr(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE(r.module != nullptr);
+
+    std::FILE* tmp = std::tmpfile();
+    REQUIRE(tmp != nullptr);
+
+    std::fflush(stderr);
+    const int saved = dup(fileno(stderr));
+    dup2(fileno(tmp), fileno(stderr));
+
+    ir::run_jit(*r.module);
+
+    std::fflush(stderr);
+    dup2(saved, fileno(stderr));
+    close(saved);
+
+    std::rewind(tmp);
+    std::string out;
+    char        buf[256];
+    size_t      n;
+    while ((n = std::fread(buf, 1, sizeof(buf), tmp)) > 0) {
+        out.append(buf, n);
+    }
+    std::fclose(tmp);
+
+    return out;
+}
+
 // Count non-overlapping occurrences of `needle` in `hay`.
 size_t count_substr(const std::string& hay, std::string_view needle) {
     size_t n = 0;
@@ -955,7 +988,7 @@ TEST_CASE("always @(posedge clk) sensitivity hoisting is unchanged") {
     CHECK(run_capture(src) == "tick 1 at 5\ntick 2 at 15\n");
 }
 
-TEST_CASE("$finish lowers to an rt_finish call") {
+TEST_CASE("$finish lowers to an rt_finish call with the default level 1") {
     constexpr std::string_view src = R"(
         module m;
             initial begin
@@ -966,7 +999,9 @@ TEST_CASE("$finish lowers to an rt_finish call") {
     )";
     const std::string          ir  = emit(src);
 
-    CHECK(ir.find("call void @rt_finish()") != std::string::npos);
+    // rt_finish(banner_ptr, now, level); omitted argument defaults to level 1.
+    CHECK(ir.find("@rt_finish(") != std::string::npos);
+    CHECK(ir.find(", i32 1)") != std::string::npos);
 }
 
 TEST_CASE("$stop lowers identically to $finish") {
@@ -977,10 +1012,10 @@ TEST_CASE("$stop lowers identically to $finish") {
     )";
     const std::string          ir  = emit(src);
 
-    CHECK(ir.find("call void @rt_finish()") != std::string::npos);
+    CHECK(ir.find("@rt_finish(") != std::string::npos);
 }
 
-TEST_CASE("$finish with a diagnostic-level argument lowers (argument ignored)") {
+TEST_CASE("$finish with a diagnostic-level argument passes the level through") {
     constexpr std::string_view src = R"(
         module m;
             initial $finish(2);
@@ -988,7 +1023,53 @@ TEST_CASE("$finish with a diagnostic-level argument lowers (argument ignored)") 
     )";
     const std::string          ir  = emit(src);
 
-    CHECK(ir.find("call void @rt_finish()") != std::string::npos);
+    // The 0/1/2 level reaches rt_finish as the third argument (here 2).
+    CHECK(ir.find("@rt_finish(") != std::string::npos);
+    CHECK(ir.find(", i32 2)") != std::string::npos);
+}
+
+TEST_CASE("$finish (default level) prints a time+location banner to stderr") {
+    constexpr std::string_view src = R"(
+        module m;
+            initial $finish;
+        endmodule
+    )";
+    const std::string err = run_capture_stderr(src);
+    CHECK(err == "source:3: $finish called at 0 s\n");
+}
+
+// $stop shares the banner path but names itself in the text.
+TEST_CASE("$stop prints its own banner") {
+    constexpr std::string_view src = R"(
+        module m;
+            initial $stop;
+        endmodule
+    )";
+    const std::string err = run_capture_stderr(src);
+    CHECK(err == "source:3: $stop called at 0 s\n");
+}
+
+// Level 0 prints nothing (LRM Table 20-1).
+TEST_CASE("$finish(0) prints no banner") {
+    constexpr std::string_view src = R"(
+        module m;
+            initial $finish(0);
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).empty());
+}
+
+// The banner reports the simulation time at the point of the call, rendered in
+// the design's time precision.
+TEST_CASE("$finish banner reports the current simulation time") {
+    constexpr std::string_view src = R"(
+        `timescale 1ns/1ps
+        module m;
+            initial #12 $finish;
+        endmodule
+    )";
+    const std::string err = run_capture_stderr(src);
+    CHECK(err == "source:4: $finish called at 12 ns\n");
 }
 
 TEST_CASE("$time and $stime read the simulation clock") {

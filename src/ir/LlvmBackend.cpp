@@ -3768,9 +3768,9 @@ private:
                 return;
 
             case Inst::Tag::Finish:
-                // $finish / $stop: rt_finish exits the process and never
-                // returns (noreturn), so the optimizer prunes the region tail.
-                b_.CreateCall(finish_fn(), {});
+                // $finish / $stop: rt_finish prints the banner then exits, never
+                // returning (noreturn), so the optimizer prunes the region tail.
+                lower_finish(i);
                 return;
 
             case Inst::Tag::Fflush:
@@ -4327,22 +4327,39 @@ private:
                       { units, prec, sfx_ptr, b_.getInt32(static_cast<uint32_t>(suffix.size())), width });
     }
 
-    // void rt_finish(void) — noreturn; exits the process. Kept separate from
-    // the plain rt_fn helpers: the noreturn attribute must land on the
-    // declaration so the optimizer prunes the dead tail after a $finish.
+    // void rt_finish(ptr banner, i64 now, i32 arg) — noreturn; prints the exit
+    // banner (LRM Table 20-1) then exits the process. Kept separate from the
+    // plain rt_fn helpers: the noreturn attribute must land on the declaration so
+    // the optimizer prunes the dead tail after a $finish.
     llvm::FunctionCallee finish_fn() {
-        auto fn = rt_fn("rt_finish", b_.getVoidTy(), {});
+        auto fn = rt_fn("rt_finish", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty() });
         if (auto* f = llvm::dyn_cast<llvm::Function>(fn.getCallee())) {
             f->setDoesNotReturn();
         }
         return fn;
     }
 
-    // Lower a $finish / $stop: call the runtime, which exits the process. The call
-    // never returns, so the rest of the region is dead, but it stays valid IR —
-    // rt_finish is marked noreturn and the optimizer prunes the unreachable tail.
-    void lower_finish() {
-        b_.CreateCall(finish_fn(), {});
+    // Lower a $finish / $stop: pass the runtime the compile-time banner prefix,
+    // the current simulation time, and the diagnostic level, then it prints the
+    // banner and exits. The call never returns, so the rest of the region is dead
+    // but stays valid IR — rt_finish is noreturn and the optimizer prunes the
+    // unreachable tail. The wheel (hence the sim time) is reachable only from a
+    // process or task; a $finish in a pure function has no wheel arg, so its
+    // banner reports time 0 (a rare corner — the location is still exact).
+    void lower_finish(Index i) {
+        const auto        info   = ir_->extra_data<FinishInfo>(ir_->payload(i).extra);
+        const std::string banner = ir_->extra_bytes(info.banner, info.banner_len);
+        llvm::Value*      now = has_wheel()
+                                  ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
+                                  : static_cast<llvm::Value*>(b_.getInt64(0));
+        b_.CreateCall(finish_fn(),
+                      { b_.CreateGlobalString(banner), now, b_.getInt32(info.arg) });
+    }
+
+    // Whether wheel_ points at a live timing wheel: true in a process or task
+    // body, false in a pure function (no wheel parameter).
+    bool has_wheel() const {
+        return cur_fn_ == nullptr || cur_is_task_;
     }
 
     // void rt_sim_run(ptr state, ptr wheel, ptr drain, ptr finals) — wraps the

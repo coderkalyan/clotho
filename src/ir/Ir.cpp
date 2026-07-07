@@ -108,12 +108,13 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::RealMath;
         case T::TimeFormat:
             return K::TimeFormat;
-        case T::Finish:
         case T::Break:
         case T::Continue:
         case T::SimTime:
         case T::Random:
             return K::None;
+        case T::Finish:
+            return K::Extra;
         case T::Wait:
             return K::Wait;
 
@@ -183,7 +184,9 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
         case Inst::PayloadKind::Extra: {
             // loop: its predicate and regions are not top-level SSA operands
             // (the predicate lives inside the cond region, walked via region()).
-            if (tag == Inst::Tag::Loop) {
+            // finish: its FinishInfo carries only the diag level and banner bytes,
+            // no SSA operands.
+            if (tag == Inst::Tag::Loop || tag == Inst::Tag::Finish) {
                 return {};
             }
             // concat: variadic operands live in the extra buffer.
