@@ -134,6 +134,7 @@ add_executable(clotho_test
   tests/two_state_test.cpp
   tests/wheel_test.cpp
   tests/runtime_test.cpp
+  tests/compound_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho doctest::doctest clotho_warnings)
 
