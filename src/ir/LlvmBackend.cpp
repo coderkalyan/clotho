@@ -4928,6 +4928,12 @@ private:
             case Inst::Tag::Sformat:
             case Inst::Tag::ReadMem:
             case Inst::Tag::TaskCall:
+            case Inst::Tag::DumpFile:
+            case Inst::Tag::DumpVars:
+            case Inst::Tag::DumpOff:
+            case Inst::Tag::DumpOn:
+            case Inst::Tag::DumpAll:
+            case Inst::Tag::DumpFlush:
                 return { 0, false, false };
         }
         return { 0, false, false };
@@ -5690,6 +5696,16 @@ private:
             case Inst::Tag::ReadMem:
                 lower_readmem(i);
                 return;
+
+            case Inst::Tag::DumpFile:
+            case Inst::Tag::DumpVars:
+            case Inst::Tag::DumpOff:
+            case Inst::Tag::DumpOn:
+            case Inst::Tag::DumpAll:
+            case Inst::Tag::DumpFlush:
+                // TODO(vcd): backend lowering lands in the next commit (descriptor
+                // table + rt_vcd_* calls; see docs/VCD.md).
+                throw BackendError{ "VCD dump lowering not yet implemented" };
 
             case Inst::Tag::SimTime: {
                 // The clock value is always known: must == may, z == 0. The wheel

@@ -235,6 +235,18 @@ const char* tag_name(Inst::Tag tag) {
             return "dyn_part_select";
         case T::ReadMem:
             return "read_mem";
+        case T::DumpFile:
+            return "dump_file";
+        case T::DumpVars:
+            return "dump_vars";
+        case T::DumpOff:
+            return "dump_off";
+        case T::DumpOn:
+            return "dump_on";
+        case T::DumpAll:
+            return "dump_all";
+        case T::DumpFlush:
+            return "dump_flush";
         case T::SimTime:
             return "sim_time";
         case T::TimeFormat:

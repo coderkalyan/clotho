@@ -426,6 +426,14 @@ struct Analysis {
                 // target's z plane is always zero.
                 case Inst::Tag::TestPlusArgs:
                 case Inst::Tag::ValuePlusArgs:
+                // VCD dump tasks read signal planes but write no design value, so
+                // they seed no z (DumpFile's filename value is always-known bytes).
+                case Inst::Tag::DumpFile:
+                case Inst::Tag::DumpVars:
+                case Inst::Tag::DumpOff:
+                case Inst::Tag::DumpOn:
+                case Inst::Tag::DumpAll:
+                case Inst::Tag::DumpFlush:
                     break;
             }
         }

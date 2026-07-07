@@ -197,6 +197,16 @@ public:
     // the formatted number.
     Index timeformat(Index units, Index precision, std::string_view suffix, Index min_width, SourceLoc loc);
 
+    // -- Value-change dump (VCD; see docs/VCD.md) --
+    // $dumpfile: set the output path to the `filename` value.
+    Index dump_file(Index filename, SourceLoc loc);
+    // $dumpvars (whole-design form): begin dumping every dumpable signal. The
+    // backend supplies the signal set; this node carries no operands.
+    Index dump_vars(SourceLoc loc);
+    // $dumpoff / $dumpon / $dumpall / $dumpflush. `tag` selects the control; it
+    // must be one of the Dump* control tags.
+    Index dump_control(Inst::Tag tag, SourceLoc loc);
+
     // -- System functions --
     // $time / $stime: read the simulation clock. Yields a 64-bit unsigned value
     // rounded down by `scale` to the calling module's time unit (1 == unitless).
