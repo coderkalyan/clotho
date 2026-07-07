@@ -3177,6 +3177,49 @@ private:
             lower_readmem(call, name == "$readmemh", b);
             return;
         }
+        if (name == "$dumpfile") {
+            // $dumpfile(name) (LRM §21.7.1.1): set the output path.
+            if (call.arguments().size() != 1) {
+                fail("$dumpfile requires one filename argument");
+            }
+            b.dump_file(lower_expr(*call.arguments()[0], b), loc(call));
+            return;
+        }
+        if (name == "$dumpvars") {
+            // Phase 0 supports only the whole-design form: $dumpvars or
+            // $dumpvars(0). A level > 0 limits hierarchy depth and any further
+            // argument selects a scope / variable subset; both are deferred
+            // (docs/VCD.md, "sparse dumping"), so they loud-fail here rather than
+            // dumping the wrong set.
+            const auto args = call.arguments();
+            if (!args.empty()) {
+                if (args.size() > 1) {
+                    fail("$dumpvars with a scope/variable subset is not supported (whole-design dump only)");
+                }
+                const std::optional<int32_t> level = try_const_int(*args[0]);
+                if (!level.has_value() || *level != 0) {
+                    fail("$dumpvars with a nonzero level is not supported (whole-design dump only)");
+                }
+            }
+            b.dump_vars(loc(call));
+            return;
+        }
+        if (name == "$dumpoff") {
+            b.dump_control(ir::Inst::Tag::DumpOff, loc(call));
+            return;
+        }
+        if (name == "$dumpon") {
+            b.dump_control(ir::Inst::Tag::DumpOn, loc(call));
+            return;
+        }
+        if (name == "$dumpall") {
+            b.dump_control(ir::Inst::Tag::DumpAll, loc(call));
+            return;
+        }
+        if (name == "$dumpflush") {
+            b.dump_control(ir::Inst::Tag::DumpFlush, loc(call));
+            return;
+        }
         fail("unsupported system task '" + std::string(name) + "'");
     }
 

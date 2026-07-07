@@ -145,6 +145,18 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_random", &rt_random);
     expose("rt_test_plusargs", &rt_test_plusargs);
     expose("rt_value_plusargs", &rt_value_plusargs);
+    expose("rt_vcd_open", &rt_vcd_open);
+    expose("rt_vcd_begin", &rt_vcd_begin);
+    expose("rt_vcd_scope", &rt_vcd_scope);
+    expose("rt_vcd_upscope", &rt_vcd_upscope);
+    expose("rt_vcd_var", &rt_vcd_var);
+    expose("rt_vcd_start", &rt_vcd_start);
+    expose("rt_vcd_flush", &rt_vcd_flush);
+    expose("rt_vcd_off", &rt_vcd_off);
+    expose("rt_vcd_on", &rt_vcd_on);
+    expose("rt_vcd_all", &rt_vcd_all);
+    expose("rt_vcd_dumpflush", &rt_vcd_dumpflush);
+    expose("rt_vcd_close", &rt_vcd_close);
     expose("rt_alloc", &rt_alloc);
     expose("rt_free", &rt_free);
     expose("rt_nba_arr_slot", &rt_nba_arr_slot);

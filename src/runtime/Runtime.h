@@ -234,40 +234,42 @@ void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8
 
 // -- Value-change dump (VCD, LRM 1800-2023 §21.7; design in docs/VCD.md) --
 //
-// One dumped signal (or scope delimiter) in the compile-time descriptor table the
-// backend emits as a constant array. Plane locations are byte offsets into the
-// design state buffer, so the table is position-independent: the runtime forms a
-// live pointer as `state + off`. Names index a separate concatenated string table.
-typedef struct rt_vcd_var {
-    // 0 = scope enter (name is the instance name), 1 = variable, 2 = scope exit.
-    uint32_t kind;
-    // Byte offset / length of the name in the string table.
-    uint32_t name_off;
-    uint32_t name_len;
-    // Variable bit width (1..64 in phase 0; wider is rejected at the backend).
-    uint32_t width;
-    // Bit 0: four-state (has an x/z domain). Bit 1: a net (`wire`) vs a var (`reg`).
-    uint32_t flags;
-    // Byte offset of the packed must|may plane (field 0 of the state slot).
-    uint32_t mm_off;
-    // Byte offset of the z plane, or RT_VCD_NO_Z when the slot stores no z word.
-    uint32_t z_off;
-} rt_vcd_var;
+// Registration is call-based: at the $dumpvars site the backend walks the design
+// scope tree, calling rt_vcd_begin, then rt_vcd_scope / rt_vcd_var / rt_vcd_upscope
+// in tree order, then rt_vcd_start. Each rt_vcd_var passes live pointers to the
+// signal's planes in the design state buffer (stable for the run), so the runtime
+// needs no offset math or state base. See docs/VCD.md.
 
-// z_off sentinel: the signal is never-z (z-elided) and reads a constant-zero z.
-#define RT_VCD_NO_Z 0xffffffffu
+// rt_vcd_var flags: bit 0 four-state (has x/z), bit 1 net (`wire` vs `reg` var),
+// bit 2 narrow (a 2-state `{ iW }` slot: read the single iW word as the value,
+// with must == may and no z plane).
+#define RT_VCD_FLAG_FOUR_STATE 1u
+#define RT_VCD_FLAG_NET        2u
+#define RT_VCD_FLAG_NARROW     4u
 
-// $dumpfile: record the output path (a right-justified packed-ASCII vector the
-// backend spills, like $readmem). The file is opened lazily at rt_vcd_start.
-void rt_vcd_open(const char* path_buf, uint32_t path_len);
+// $dumpfile: record the output path. When `forward` is 0 the path is a right-
+// justified packed-ASCII vector (byte 0 = last character), as the backend spills a
+// packed value; when 1 it is the natural-order bytes of a string object. The file
+// is opened at rt_vcd_begin.
+void rt_vcd_open(const char* path_buf, uint32_t path_len, uint32_t forward);
 
-// $dumpvars (whole-design form): begin dumping. `state` is the design state base;
-// `wheel` the design wheel (cached for the final flush at close); `vars`/`nvars`
-// the descriptor table; `strtab` the name string table; `tick_fs`/`units` the
-// timescale. Allocates all engine storage once (no further allocation during the
-// run), opens the file, writes the VCD header, and arms the initial full dump.
-void rt_vcd_start(uint8_t* state, void* wheel, const rt_vcd_var* vars, uint32_t nvars, const char* strtab,
-                  uint64_t tick_fs, int32_t units);
+// Begin the header: open the file and write $date / $version / $timescale. `wheel`
+// is cached for the close-time flush; `tick_fs` / `units` set the timescale.
+void rt_vcd_begin(void* wheel, uint64_t tick_fs, int32_t units);
+
+// $scope module <name> / $upscope: open / close a hierarchy level in the header.
+void rt_vcd_scope(const char* name, uint32_t name_len);
+void rt_vcd_upscope(void);
+
+// Register one dumped variable: `name` its leaf reference, `width` its bit width
+// (1..64 in phase 0), `flags` per RT_VCD_FLAG_*, `mm` its packed must|may plane
+// pointer, `z` its z plane pointer (null for a never-z / narrow slot). Writes the
+// $var line and adds the variable to the scan table.
+void rt_vcd_var(const char* name, uint32_t name_len, uint32_t width, uint32_t flags, const uint8_t* mm,
+                const uint8_t* z);
+
+// Finish the header ($enddefinitions) and arm the initial full dump.
+void rt_vcd_start(void);
 
 // Postponed-region sample at a settled instant, called from the sim loop before
 // the wheel advances (`tick` is rt_wheel_now). Emits changed variables under one

@@ -1464,6 +1464,11 @@ extern "C" void rt_finish(const char* banner, uint64_t now, int32_t arg) {
         std::fputs(line.c_str(), stderr);
         std::fflush(stderr);
     }
+    // Flush and close the VCD while the design's stack (state + wheel the engine
+    // points at) is still live — the longjmp below unwinds it, so the sim loop's
+    // own close at wheel-drain is never reached on this path. A no-op when no dump
+    // is open.
+    rt_vcd_close();
     // Jump back to the host that started the run when one is installed — the
     // codegen relies on rt_finish being noreturn, so returning normally is not an
     // option. Otherwise exit; std::exit runs atexit handlers and flushes C stdio,
@@ -2337,14 +2342,15 @@ namespace {
 // One dumped scalar/vector variable: its live plane pointers into design state,
 // its VCD identifier, and the last value emitted (shadow) for change suppression.
 struct VcdVar {
-    const uint8_t* mm = nullptr;   // packed must|may plane (i(2W)), state + mm_off
-    const uint8_t* z  = nullptr;   // z plane (iW), or null for a never-z variable
+    const uint8_t* mm = nullptr;   // packed must|may plane (i(2W)), or the iW word when narrow
+    const uint8_t* z  = nullptr;   // z plane (iW), or null for a never-z / narrow variable
     uint32_t       width      = 0;
     bool           four_state = false;
+    bool           narrow     = false;   // 2-state `{ iW }` slot: mm is a bare iW value word
     // Shadow: the last dumped planes. `seen` is false until the first emit.
     uint64_t last_must = 0, last_may = 0, last_z = 0;
     bool     seen = false;
-    // VCD identifier code (printable ASCII), assigned at header time.
+    // VCD identifier code (printable ASCII), assigned at registration.
     std::string idcode;
 };
 
@@ -2357,7 +2363,8 @@ struct VcdEngine {
     rt_wheel*            wheel = nullptr;    // cached for the close-time flush
     std::string          path;
     std::vector<VcdVar>  vars;
-    bool started     = false;   // header written / table built
+    uint32_t next_id = 0;       // next VCD identifier index (assigned per rt_vcd_var)
+    bool started     = false;   // header finished ($enddefinitions written)
     bool active      = false;   // dumping (cleared by $dumpoff)
     bool force_all   = false;   // next flush emits every var ($dumpall / $dumpon / initial)
     bool pending_off = false;   // next flush emits an all-x checkpoint, then deactivates
@@ -2434,6 +2441,15 @@ void vcd_write_timescale(uint64_t tick_fs) {
 void vcd_read_planes(const VcdVar& v, uint64_t& must, uint64_t& may, uint64_t& z) {
     const uint32_t w    = v.width;
     const uint64_t mask = w >= 64 ? ~0ull : ((1ull << w) - 1);
+    if (v.narrow) {
+        // A 2-state `{ iW }` slot: the single word is the value, fully known.
+        uint64_t val = 0;
+        std::memcpy(&val, v.mm, (w + 7) / 8);
+        must = val & mask;
+        may  = must;
+        z    = 0;
+        return;
+    }
     unsigned __int128 mm = 0;
     std::memcpy(&mm, v.mm, (2 * w + 7) / 8);
     must = static_cast<uint64_t>(mm) & mask;
@@ -2511,18 +2527,14 @@ void vcd_emit(const VcdVar& v, uint64_t must, uint64_t may, uint64_t z) {
 
 } // namespace
 
-extern "C" void rt_vcd_open(const char* path_buf, uint32_t path_len) {
-    g_vcd.path = unpack_ascii(path_buf, path_len);
+extern "C" void rt_vcd_open(const char* path_buf, uint32_t path_len, uint32_t forward) {
+    g_vcd.path = forward != 0 ? std::string(path_buf, path_len) : unpack_ascii(path_buf, path_len);
 }
 
-extern "C" void rt_vcd_start(uint8_t* state, void* wheel, const rt_vcd_var* vars, uint32_t nvars,
-                             const char* strtab, uint64_t tick_fs, int32_t units) {
+extern "C" void rt_vcd_begin(void* wheel, uint64_t tick_fs, int32_t units) {
     (void)units;
-    // A repeat $dumpvars just re-arms a full dump; the table is already built.
-    if (g_vcd.started) {
-        g_vcd.active    = true;
-        g_vcd.force_all = true;
-        return;
+    if (g_vcd.file != nullptr) {
+        return;   // a repeat $dumpvars: header already written (rt_vcd_start re-arms)
     }
     if (g_vcd.path.empty()) {
         g_vcd.path = "dump.vcd";   // LRM default when $dumpfile is omitted
@@ -2539,41 +2551,57 @@ extern "C" void rt_vcd_start(uint8_t* state, void* wheel, const rt_vcd_var* vars
     vcd_puts("$date\n\tClotho simulation\n$end\n");
     vcd_puts("$version\n\tClotho VCD dump\n$end\n");
     vcd_write_timescale(tick_fs);
+}
 
-    g_vcd.vars.reserve(nvars);
-    uint32_t vi = 0;
-    for (uint32_t k = 0; k < nvars; ++k) {
-        const rt_vcd_var& d    = vars[k];
-        const std::string name = std::string(strtab + d.name_off, d.name_len);
-        if (d.kind == 0) {
-            vcd_puts("$scope module ");
-            vcd_puts(name);
-            vcd_puts(" $end\n");
-        } else if (d.kind == 2) {
-            vcd_puts("$upscope $end\n");
-        } else {
-            VcdVar v;
-            v.mm         = state + d.mm_off;
-            v.z          = d.z_off == RT_VCD_NO_Z ? nullptr : state + d.z_off;
-            v.width      = d.width;
-            v.four_state = (d.flags & 1u) != 0;
-            v.idcode     = vcd_idcode(vi++);
-            const char* vtype = (d.flags & 2u) != 0 ? "wire" : "reg";
-            vcd_puts("$var ");
-            vcd_puts(vtype);
-            vcd_put(' ');
-            vcd_put_dec(d.width);
-            vcd_put(' ');
-            vcd_puts(v.idcode);
-            vcd_put(' ');
-            vcd_puts(name);
-            vcd_puts(" $end\n");
-            g_vcd.vars.push_back(std::move(v));
-        }
+extern "C" void rt_vcd_scope(const char* name, uint32_t name_len) {
+    if (g_vcd.file == nullptr || g_vcd.started) {
+        return;
     }
-    vcd_puts("$enddefinitions $end\n");
+    vcd_puts("$scope module ");
+    vcd_puts(std::string_view(name, name_len));
+    vcd_puts(" $end\n");
+}
 
-    g_vcd.started   = true;
+extern "C" void rt_vcd_upscope(void) {
+    if (g_vcd.file == nullptr || g_vcd.started) {
+        return;
+    }
+    vcd_puts("$upscope $end\n");
+}
+
+extern "C" void rt_vcd_var(const char* name, uint32_t name_len, uint32_t width, uint32_t flags,
+                           const uint8_t* mm, const uint8_t* z) {
+    if (g_vcd.file == nullptr || g_vcd.started) {
+        return;
+    }
+    VcdVar v;
+    v.mm         = mm;
+    v.z          = z;
+    v.width      = width;
+    v.four_state = (flags & RT_VCD_FLAG_FOUR_STATE) != 0;
+    v.narrow     = (flags & RT_VCD_FLAG_NARROW) != 0;
+    v.idcode     = vcd_idcode(g_vcd.next_id++);
+    const char* vtype = (flags & RT_VCD_FLAG_NET) != 0 ? "wire" : "reg";
+    vcd_puts("$var ");
+    vcd_puts(vtype);
+    vcd_put(' ');
+    vcd_put_dec(width);
+    vcd_put(' ');
+    vcd_puts(v.idcode);
+    vcd_put(' ');
+    vcd_puts(std::string_view(name, name_len));
+    vcd_puts(" $end\n");
+    g_vcd.vars.push_back(std::move(v));
+}
+
+extern "C" void rt_vcd_start(void) {
+    if (g_vcd.file == nullptr) {
+        return;
+    }
+    if (!g_vcd.started) {
+        vcd_puts("$enddefinitions $end\n");
+        g_vcd.started = true;
+    }
     g_vcd.active    = true;
     g_vcd.force_all = true;   // the first flush emits every variable's initial value
 }
