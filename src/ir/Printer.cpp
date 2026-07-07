@@ -650,6 +650,9 @@ void print_module(const Module& m, std::ostream& os) {
             case Activation::Always:
                 os << "always";
                 break;
+            case Activation::Final:
+                os << "final";
+                break;
         }
         for (const WaitEvent& w : p.wait_events) {
             os << " @";

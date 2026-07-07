@@ -79,6 +79,14 @@ void rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uin
 // the simulation is over. `env` points at a std::jmp_buf.
 void rt_finish_host(void* env);
 
+// Drive one simulation: run `drain` (the event loop) under a $finish catch, then
+// run `finals` (the `final` blocks, LRM 9.2.3). A $finish during the drain
+// longjmps to this frame's own catch, so the finals still execute with the
+// design state (owned by main, which called this) live. `state` and `wheel` are
+// forwarded verbatim to both callbacks. Returns after the finals complete (or a
+// final block's own $finish transfers to the outer host / exits).
+void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*), void (*finals)(void*, void*));
+
 // -- File I/O (LRM 1800-2023 §21.3) --
 //
 // A file descriptor is a 32-bit integer the design stores in its own variables.
