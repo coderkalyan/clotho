@@ -259,3 +259,43 @@ TEST_CASE("z flows around loop back-edges to fixpoint") {
     CHECK(a.z("fb"));
     CHECK(a.z("dst"));
 }
+
+TEST_CASE("$sscanf / $fscanf seed 4-state output targets but not 2-state ones") {
+    // %h / %b / %o accept z and ? digits (LRM Table 21-7); a 2-state target
+    // drops x/z to 0 (LRM 6.3.1) and stays clean. The z must also flow onward
+    // through an ordinary assignment.
+    const Analyzed a = analyze(R"(
+        module top;
+            logic [31:0] r4;
+            bit   [31:0] r2;
+            logic [31:0] fwd;
+            int n;
+            initial begin
+                n = $sscanf("zz", "%h", r4);
+                n = $sscanf("zz", "%h", r2);
+                fwd = r4;
+            end
+        endmodule
+    )");
+    CHECK(a.z("r4"));
+    CHECK(!a.z("r2"));
+    CHECK(a.z("fwd"));
+}
+
+TEST_CASE("a scanf z reaching a signal through a function local is seeded") {
+    // The scan target is a 4-state frame local; the z must propagate through
+    // the return value into the module signal.
+    const Analyzed a = analyze(R"(
+        module top;
+            function automatic logic [31:0] scan1();
+                logic [31:0] t;
+                int n;
+                n = $sscanf("z", "%h", t);
+                return t;
+            endfunction
+            logic [31:0] s;
+            initial s = scan1();
+        endmodule
+    )");
+    CHECK(a.z("s"));
+}
