@@ -3186,22 +3186,7 @@ private:
             return;
         }
         if (name == "$dumpvars") {
-            // Phase 0 supports only the whole-design form: $dumpvars or
-            // $dumpvars(0). A level > 0 limits hierarchy depth and any further
-            // argument selects a scope / variable subset; both are deferred
-            // (docs/VCD.md, "sparse dumping"), so they loud-fail here rather than
-            // dumping the wrong set.
-            const auto args = call.arguments();
-            if (!args.empty()) {
-                if (args.size() > 1) {
-                    fail("$dumpvars with a scope/variable subset is not supported (whole-design dump only)");
-                }
-                const std::optional<int32_t> level = try_const_int(*args[0]);
-                if (!level.has_value() || *level != 0) {
-                    fail("$dumpvars with a nonzero level is not supported (whole-design dump only)");
-                }
-            }
-            b.dump_vars(loc(call));
+            lower_dumpvars(call, b);
             return;
         }
         if (name == "$dumpoff") {
@@ -3221,6 +3206,58 @@ private:
             return;
         }
         fail("unsupported system task '" + std::string(name) + "'");
+    }
+
+    // $dumpvars (LRM §21.7.1.3). Phase 0 supports only the whole-design form:
+    // $dumpvars, $dumpvars(0), or $dumpvars(0, <top>...) whose listed scopes are
+    // exactly the design's top-module instances (so the request equals the whole
+    // design). A level > 0 limits hierarchy depth and any other scope / variable
+    // argument selects a subset; both are deferred (docs/VCD.md, sparse dumping) and
+    // loud-fail rather than dumping the wrong set.
+    void lower_dumpvars(const CallExpression& call, ir::Builder& b) {
+        const auto args = call.arguments();
+        if (!args.empty()) {
+            const std::optional<int32_t> level = try_const_int(*args[0]);
+            if (!level.has_value() || *level != 0) {
+                fail("$dumpvars with a nonzero level is not supported (whole-design dump only)");
+            }
+            if (args.size() > 1) {
+                const auto tops = scope_->getCompilation().getRoot().topInstances;
+                std::vector<const slang::ast::Symbol*> listed;
+                for (size_t k = 1; k < args.size(); ++k) {
+                    const auto* as = args[k]->as_if<slang::ast::ArbitrarySymbolExpression>();
+                    if (as == nullptr || as->symbol->kind != slang::ast::SymbolKind::Instance) {
+                        fail("$dumpvars of a scope/variable subset is not supported (whole-design dump only)");
+                    }
+                    bool is_top = false;
+                    for (const slang::ast::InstanceSymbol* t : tops) {
+                        if (t == as->symbol.get()) {
+                            is_top = true;
+                            break;
+                        }
+                    }
+                    if (!is_top) {
+                        fail("$dumpvars of a non-top scope is not supported (whole-design dump only)");
+                    }
+                    listed.push_back(as->symbol.get());
+                }
+                // The list must cover every top, else the whole-design dump would be
+                // a superset of what was requested.
+                for (const slang::ast::InstanceSymbol* top : tops) {
+                    bool covered = false;
+                    for (const slang::ast::Symbol* l : listed) {
+                        if (l == top) {
+                            covered = true;
+                            break;
+                        }
+                    }
+                    if (!covered) {
+                        fail("$dumpvars must list every top module to dump the whole design");
+                    }
+                }
+            }
+        }
+        b.dump_vars(loc(call));
     }
 
     // $readmemh / $readmemb (LRM §21.4): load a file into an unpacked-array memory.
