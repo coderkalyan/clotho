@@ -200,6 +200,63 @@ TEST_CASE("while loop counts down a signal") {
     CHECK(run_capture(src) == "3\n2\n1\n");
 }
 
+// A multi-bit loop condition (12.7) has the same truth value as an `if` (12.4):
+// true iff any bit is 1. The condition is used bare (not compared), so it must
+// be reduced to a 1-bit predicate before the loop test. Regression: a bare
+// multi-bit condition previously reached the backend at native width and
+// crashed on a width-mismatched compare.
+TEST_CASE("while loop with a bare multi-bit condition") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] x;
+            initial begin
+                x = 8'd3;
+                while (x) begin
+                    $display("%0d", x);
+                    x = x - 1;
+                end
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "3\n2\n1\n");
+}
+
+// An all-x multi-bit condition has no definite 1 bit, so it is false and the
+// loop runs zero times.
+TEST_CASE("while loop with an all-x multi-bit condition runs zero times") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] x;
+            initial begin
+                x = 8'bxxxxxxxx;
+                while (x)
+                    $display("ran");
+                $display("done");
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "done\n");
+}
+
+// A real loop condition is true iff nonzero (reals carry no x/z). Regression:
+// a bare real condition previously routed a real plane through the integer
+// must-plane extraction and failed in the backend.
+TEST_CASE("while loop with a real condition") {
+    constexpr std::string_view src = R"(
+        module m;
+            real r;
+            initial begin
+                r = 3.0;
+                while (r) begin
+                    $display("%0g", r);
+                    r = r - 1.0;
+                end
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "3\n2\n1\n");
+}
+
 // A #delay inside a loop body suspends the coroutine; resume must land back in
 // the body and the back-edge must still close the loop across the suspension.
 TEST_CASE("delay inside a loop body suspends and resumes across iterations") {

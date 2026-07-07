@@ -1568,11 +1568,13 @@ private:
         return b.unary(ir::Inst::Tag::RedOr, pred, l);
     }
 
-    // A loop condition keeps its native width (the backend's definite-1 rule
-    // normalizes multi-bit and X/Z), except a string, which must lower to its
-    // 1-bit truth value.
+    // A loop condition (12.7) has the same truth value as an `if` condition
+    // (12.4): true iff any bit is definitely 1. Reduce to a 1-bit predicate with
+    // lower_predicate so a multi-bit or real condition is normalized here, not
+    // left to the backend (which would emit a width-mismatched compare on the
+    // native-width must plane, or route a real plane through must_of).
     ir::Index lower_loop_cond(const Expression& cond, ir::Builder& b) {
-        return is_string_expr(cond) ? lower_predicate(cond, b) : lower_expr(cond, b);
+        return lower_predicate(cond, b);
     }
 
     void lower_conditional(const ConditionalStatement& c, ir::Builder& b) {
