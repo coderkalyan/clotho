@@ -2986,6 +2986,8 @@ private:
             case Inst::Tag::StoreNb:
             case Inst::Tag::Cond:
             case Inst::Tag::Loop:
+            case Inst::Tag::Break:
+            case Inst::Tag::Continue:
             case Inst::Tag::Ret:
             case Inst::Tag::Delay:
             case Inst::Tag::Wait:
@@ -3417,6 +3419,17 @@ private:
 
             case Inst::Tag::Loop:
                 lower_loop(i);
+                return;
+
+            case Inst::Tag::Break:
+                // Terminator: branch to the innermost loop's exit block. slang
+                // guarantees a break appears only inside a loop.
+                b_.CreateBr(loop_targets_.back().second);
+                return;
+            case Inst::Tag::Continue:
+                // Terminator: branch to the innermost loop's step block (which
+                // re-tests the predicate via the back-edge).
+                b_.CreateBr(loop_targets_.back().first);
                 return;
 
             case Inst::Tag::Delay:
@@ -5652,7 +5665,9 @@ private:
         auto* step_bb = llvm::BasicBlock::Create(ctx_, "loop.step", fn_);
         auto* exit_bb = llvm::BasicBlock::Create(ctx_, "loop.exit", fn_);
 
-        b_.CreateBr(head_bb);
+        // do-while runs the body before the first test; every other loop tests
+        // first. `continue` -> step, `break` -> exit, innermost loop only.
+        b_.CreateBr(lp.bottom_test ? body_bb : head_bb);
 
         // Header: recompute the predicate, then test it. must=1 only for a
         // definite 1, so an X/Z condition exits the loop.
@@ -5662,8 +5677,10 @@ private:
         b_.CreateCondBr(take, body_bb, exit_bb);
 
         b_.SetInsertPoint(body_bb);
+        loop_targets_.push_back({ step_bb, exit_bb });
         lower_region(ir_->region(lp.body));
-        branch_to(step_bb); // a `return` in the body terminates it; don't double-branch
+        loop_targets_.pop_back();
+        branch_to(step_bb); // a `return`/`break`/`continue` in the body terminates it; don't double-branch
 
         // Step, then the back-edge to re-test the condition.
         b_.SetInsertPoint(step_bb);
@@ -5717,6 +5734,9 @@ private:
     // Ret branches to. The caller-side record slot { ptr parent } for task calls
     // this coroutine makes (a process or a task can be a task caller).
     llvm::BasicBlock*       task_epilogue_bb_ = nullptr;
+    // Innermost-first stack of the enclosing loops' (step, exit) blocks; a
+    // `continue` branches to `.first`, a `break` to `.second`.
+    std::vector<std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> loop_targets_;
     llvm::AllocaInst*       record_           = nullptr;
 
     // Per-process scratch, reset in lower_process.

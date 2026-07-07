@@ -186,6 +186,9 @@ struct LoopInfo {
     ExtraSlice body;
     // Per-iteration update, executed after the body (empty for while / forever).
     ExtraSlice step;
+    // do-while: run the body once before the first predicate test. The backend
+    // branches entry -> body instead of entry -> header (LRM 12.7.1).
+    bool bottom_test;
 };
 
 // Extra payload for `display`: a $display / $write / $fdisplay / $fwrite system
@@ -522,6 +525,12 @@ struct Inst {
         // enclosing region before this inst; `while` / `forever` have empty step.
         // Lowers to header / body / step / exit blocks with a back-edge.
         Loop,
+        // Loop control: `break` exits the innermost enclosing Loop (branches to
+        // its exit block); `continue` skips to the innermost Loop's step block
+        // (payload: none). Both are terminators — instructions after them in the
+        // same region are unreachable. slang rejects either outside a loop.
+        Break,
+        Continue,
         // Time delay `#n`: suspend the process for `n` ticks (payload: unary, the
         // tick count). Lowers to a timer scheduled on the wheel plus a coroutine
         // suspend; the wheel resumes the process when the delay elapses.

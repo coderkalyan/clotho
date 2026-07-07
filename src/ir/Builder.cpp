@@ -93,10 +93,19 @@ Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_reg
 }
 
 Index Builder::loop(ExtraSlice cond_region, Index pred, ExtraSlice body_region, ExtraSlice step_region,
-                    SourceLoc loc) {
-    const ExtraIndex extra = add_extra(LoopInfo{ cond_region, pred, body_region, step_region });
+                    bool bottom_test, SourceLoc loc) {
+    const ExtraIndex extra =
+      add_extra(LoopInfo{ cond_region, pred, body_region, step_region, bottom_test });
 
     return emit({ Inst::Tag::Loop, Inst::Payload{ .extra = extra } }, loc);
+}
+
+Index Builder::break_(SourceLoc loc) {
+    return emit({ Inst::Tag::Break, Inst::Payload{ .none = 0 } }, loc);
+}
+
+Index Builder::continue_(SourceLoc loc) {
+    return emit({ Inst::Tag::Continue, Inst::Payload{ .none = 0 } }, loc);
 }
 
 Index Builder::str_putc(Index str, Index index, Index ch, SourceLoc loc) {

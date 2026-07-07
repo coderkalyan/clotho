@@ -380,3 +380,164 @@ TEST_CASE("sensitivity-less always lowers to a Loop") {
     REQUIRE_MESSAGE(r.ok, r.diagnostics);
     CHECK(any_process_has_tag(*r.module, ir::Inst::Tag::Loop));
 }
+
+// -- do-while / break / continue (12.7). Oracle: iverilog. --
+
+// do-while runs the body before the first predicate test, so it executes at
+// least once even when the condition is false on entry (12.7.1).
+TEST_CASE("do-while runs the body once when the condition is false on entry") {
+    CHECK(run_capture(R"(
+        module m;
+            integer i, n;
+            initial begin
+                i = 5; n = 0;
+                do begin n = n + 1; i = i + 1; end while (i < 5);
+                $display("%0d", n);
+            end
+        endmodule
+    )") == "1\n");
+}
+
+TEST_CASE("do-while iterates while the condition holds") {
+    CHECK(run_capture(R"(
+        module m;
+            integer i;
+            initial begin
+                i = 0;
+                do begin $display("%0d", i); i = i + 1; end while (i < 3);
+            end
+        endmodule
+    )") == "0\n1\n2\n");
+}
+
+TEST_CASE("do-while lowers to a Loop instruction") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            integer i;
+            initial begin i = 0; do i = i + 1; while (i < 3); end
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    CHECK(any_process_has_tag(*r.module, ir::Inst::Tag::Loop));
+}
+
+// break leaves the innermost loop immediately.
+TEST_CASE("break exits the enclosing loop") {
+    CHECK(run_capture(R"(
+        module m;
+            integer i, sum;
+            initial begin
+                sum = 0;
+                for (i = 0; i < 10; i = i + 1) begin
+                    if (i == 4) break;
+                    sum = sum + i;
+                end
+                $display("%0d %0d", sum, i);
+            end
+        endmodule
+    )") == "6 4\n");
+}
+
+TEST_CASE("break in a while(1) terminates the loop") {
+    CHECK(run_capture(R"(
+        module m;
+            integer i, sum;
+            initial begin
+                i = 0; sum = 0;
+                while (1) begin
+                    if (i >= 5) break;
+                    sum = sum + i; i = i + 1;
+                end
+                $display("%0d", sum);
+            end
+        endmodule
+    )") == "10\n");
+}
+
+// continue skips the rest of the body; the for-loop step still runs (12.7).
+TEST_CASE("continue skips the rest of the body but runs the for step") {
+    CHECK(run_capture(R"(
+        module m;
+            integer i, sum;
+            initial begin
+                sum = 0;
+                for (i = 0; i < 6; i = i + 1) begin
+                    if (i % 2 == 0) continue;
+                    sum = sum + i;
+                end
+                $display("%0d", sum);
+            end
+        endmodule
+    )") == "9\n");
+}
+
+// continue in a do-while re-evaluates the condition rather than skipping it.
+TEST_CASE("continue in a do-while re-tests the condition") {
+    CHECK(run_capture(R"(
+        module m;
+            integer i, sum;
+            initial begin
+                i = 0; sum = 0;
+                do begin
+                    i = i + 1;
+                    if (i == 2) continue;
+                    sum = sum + i;
+                end while (i < 4);
+                $display("%0d %0d", sum, i);
+            end
+        endmodule
+    )") == "8 4\n");
+}
+
+// An inner break only exits the inner loop; the outer loop keeps iterating.
+TEST_CASE("break inside a nested loop exits only the inner loop") {
+    CHECK(run_capture(R"(
+        module m;
+            integer i, j, sum;
+            initial begin
+                sum = 0;
+                for (i = 0; i < 3; i = i + 1) begin
+                    for (j = 0; j < 3; j = j + 1) begin
+                        if (j == 1) break;
+                        sum = sum + 1;
+                    end
+                end
+                $display("%0d", sum);
+            end
+        endmodule
+    )") == "3\n");
+}
+
+// break / continue nested inside an if inside the loop body still resolve to
+// the enclosing loop's exit / step blocks.
+TEST_CASE("break and continue under a nested if") {
+    CHECK(run_capture(R"(
+        module m;
+            integer i, sum;
+            initial begin
+                sum = 0;
+                for (i = 0; i < 8; i = i + 1) begin
+                    if (i == 3) begin
+                        continue;
+                    end
+                    if (i == 6) begin
+                        break;
+                    end
+                    sum = sum + i;
+                end
+                $display("%0d", sum);
+            end
+        endmodule
+    )") == "12\n");
+}
+
+// slang rejects break/continue outside any loop at elaboration, so Clotho needs
+// no guard of its own — the design never lowers.
+TEST_CASE("break outside a loop is rejected") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            initial begin break; end
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+}
