@@ -460,6 +460,72 @@ TEST_CASE("wide == keeps the icmp compare path") {
     CHECK(ir.find("icmp") != std::string::npos);
 }
 
+TEST_CASE("wide == / != are X only when ambiguous (LRM 11.4.5)") {
+    // 11.4.5: x/z bits yield X only if the relation is ambiguous. A position
+    // where both operands are known and unequal decides the result (== 0, != 1)
+    // regardless of the unknown bits; only "known bits all equal + some x/z"
+    // is X. All lines byte-match iverilog.
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a, b;
+            initial begin
+                a = 8'b10000000; b = 8'b0000000x; $display("%b%b", a == b, a != b);
+                a = 8'b0000100x; b = 8'b00000001; $display("%b%b", a == b, a != b);
+                a = 8'b1000000x; b = 8'b10000001; $display("%b%b", a == b, a != b);
+                a = 8'b000000x1; b = 8'b00000001; $display("%b%b", a == b, a != b);
+                a = 8'b0000zz11; b = 8'b00001011; $display("%b%b", a == b, a != b);
+                a = 8'h5a;       b = 8'h5a;       $display("%b%b", a == b, a != b);
+                a = 8'h5a;       b = 8'h5b;       $display("%b%b", a == b, a != b);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "01\n"  // bit 7 known-unequal: definite, despite b's x
+          "01\n"  // bit 3 known-unequal: definite, despite a's x
+          "xx\n"  // known bits equal, bit 0 unknown: ambiguous
+          "xx\n"  // known bits equal, bit 1 unknown: ambiguous
+          "xx\n"  // z counts as unknown; known bits equal: ambiguous
+          "10\n"  // known equal
+          "01\n"); // known unequal
+}
+
+TEST_CASE("=== / !== stay bit-exact where == is definite or ambiguous") {
+    // 11.4.5's ambiguity rule does not apply to case equality: x/z compare
+    // bit-for-bit and the result is always known. Operands mirror the == test
+    // above so a regression that reroutes === through the sharpened == fails.
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a, b;
+            initial begin
+                a = 8'b10000000; b = 8'b0000000x; $display("%b%b", a === b, a !== b);
+                a = 8'b1000000x; b = 8'b10000001; $display("%b%b", a === b, a !== b);
+                a = 8'b1000000x; b = 8'b1000000x; $display("%b%b", a === b, a !== b);
+            end
+        endmodule
+    )";
+    // vs iverilog.
+    CHECK(run_capture(src) == "01\n01\n10\n");
+}
+
+TEST_CASE("==? kept positions follow the sharpened == (LRM 11.4.6)") {
+    // Non-wildcard positions compare "as for the logical equality" operator, so
+    // a definite mismatch on a kept bit beats a left-operand x elsewhere.
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a, b;
+            initial begin
+                a = 8'b10000000; b = 8'b0000000x; $display("%b%b", a ==? b, a !=? b);
+                a = 8'b1000000x; b = 8'b00000001; $display("%b%b", a ==? b, a !=? b);
+                a = 8'b1000000x; b = 8'b10000001; $display("%b%b", a ==? b, a !=? b);
+            end
+        endmodule
+    )";
+    // Line 1: bit 0 wildcarded, bit 7 known-unequal -> definite 0/1.
+    // Line 2: no wildcards; bit 7 known-unequal decides despite a's x -> 0/1.
+    // Line 3: no wildcards; known bits equal, a bit 0 x -> ambiguous. vs iverilog.
+    CHECK(run_capture(src) == "01\n01\nxx\n");
+}
+
 TEST_CASE("===, !==, ==?, and ^~ operators agree with LRM 4-state semantics") {
     constexpr std::string_view src = R"(
         module m;
