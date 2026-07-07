@@ -2354,6 +2354,17 @@ struct VcdVar {
     std::string idcode;
 };
 
+// One entry of the backend-neutral record stream the producer hands to the sink
+// (docs/VCD.md §4). A time marker carries the tick in `a`; a value change carries
+// the variable index and its (must, may, z) planes. Keeping records self-contained
+// (planes, not a shadow reference) is what lets the sink be stateless and, later,
+// run on another thread or format an alternate backend (FST, viewer).
+struct VcdRec {
+    uint64_t a = 0, b = 0, c = 0;   // time: a = tick. change: a = must, b = may, c = z.
+    uint32_t idx     = 0;           // change: variable index (unused for a time marker)
+    uint32_t is_time = 0;           // 1 = time marker, 0 = value change
+};
+
 // The single global VCD engine (the simulator is single-threaded, one dump per
 // run). Reset by rt_vcd_close so the next simulation in the same process starts
 // clean.
@@ -2363,6 +2374,7 @@ struct VcdEngine {
     rt_wheel*            wheel = nullptr;    // cached for the close-time flush
     std::string          path;
     std::vector<VcdVar>  vars;
+    std::vector<VcdRec>  recbuf;   // producer -> sink record stream for one instant
     uint32_t next_id = 0;       // next VCD identifier index (assigned per rt_vcd_var)
     bool started     = false;   // header finished ($enddefinitions written)
     bool active      = false;   // dumping (cleared by $dumpoff)
@@ -2525,6 +2537,37 @@ void vcd_emit(const VcdVar& v, uint64_t must, uint64_t may, uint64_t z) {
     vcd_put('\n');
 }
 
+// -- Producer / sink seam --
+//
+// The producer (rt_vcd_flush, on the sim thread) diffs against the shadow and
+// appends records; the sink (vcd_drain) turns records into VCD text. Splitting the
+// two here is what lets a later step move vcd_drain onto a writer thread, or swap
+// in an FST / viewer sink, without touching the producer.
+
+void vcd_rec_time(uint64_t tick) {
+    g_vcd.recbuf.push_back(VcdRec{ tick, 0, 0, 0, 1 });
+}
+
+void vcd_rec_change(uint32_t idx, uint64_t must, uint64_t may, uint64_t z) {
+    g_vcd.recbuf.push_back(VcdRec{ must, may, z, idx, 0 });
+}
+
+// Format every buffered record to the output file, then empty the buffer (keeping
+// its capacity). Reads only the record planes and the read-only var table, so it
+// carries no diff / shadow state.
+void vcd_drain() {
+    for (const VcdRec& r : g_vcd.recbuf) {
+        if (r.is_time != 0) {
+            vcd_put('#');
+            vcd_put_dec(r.a);
+            vcd_put('\n');
+        } else {
+            vcd_emit(g_vcd.vars[r.idx], r.a, r.b, r.c);
+        }
+    }
+    g_vcd.recbuf.clear();
+}
+
 } // namespace
 
 extern "C" void rt_vcd_open(const char* path_buf, uint32_t path_len, uint32_t forward) {
@@ -2600,6 +2643,9 @@ extern "C" void rt_vcd_start(void) {
     }
     if (!g_vcd.started) {
         vcd_puts("$enddefinitions $end\n");
+        // One instant emits at most a time marker plus every variable; reserve once
+        // so the producer never allocates during the run.
+        g_vcd.recbuf.reserve(g_vcd.vars.size() + 1);
         g_vcd.started = true;
     }
     g_vcd.active    = true;
@@ -2611,12 +2657,12 @@ extern "C" void rt_vcd_flush(uint64_t tick) {
         return;
     }
     if (g_vcd.pending_off) {
-        vcd_put('#');
-        vcd_put_dec(tick);
-        vcd_put('\n');
-        for (VcdVar& v : g_vcd.vars) {
+        // $dumpoff checkpoint: mark every variable all-x at this instant.
+        vcd_rec_time(tick);
+        for (uint32_t i = 0; i < g_vcd.vars.size(); ++i) {
+            VcdVar&        v    = g_vcd.vars[i];
             const uint64_t mask = v.width >= 64 ? ~0ull : ((1ull << v.width) - 1);
-            vcd_emit(v, 0, mask, 0);   // all-x checkpoint
+            vcd_rec_change(i, 0, mask, 0);
             v.last_must = 0;
             v.last_may  = mask;
             v.last_z    = 0;
@@ -2624,40 +2670,35 @@ extern "C" void rt_vcd_flush(uint64_t tick) {
         }
         g_vcd.pending_off = false;
         g_vcd.active      = false;
+        vcd_drain();
         return;
     }
     if (!g_vcd.active) {
         return;
     }
-    bool any = g_vcd.force_all;
-    if (!any) {
-        for (VcdVar& v : g_vcd.vars) {
-            uint64_t m = 0, y = 0, zz = 0;
-            vcd_read_planes(v, m, y, zz);
-            if (!v.seen || m != v.last_must || y != v.last_may || zz != v.last_z) {
-                any = true;
-                break;
-            }
-        }
-    }
-    if (!any) {
-        return;
-    }
-    vcd_put('#');
-    vcd_put_dec(tick);
-    vcd_put('\n');
-    for (VcdVar& v : g_vcd.vars) {
+    // Produce a time marker followed by the changed variables; drop the marker if
+    // nothing changed (no-change instants emit nothing).
+    const size_t mark = g_vcd.recbuf.size();
+    vcd_rec_time(tick);
+    bool any = false;
+    for (uint32_t i = 0; i < g_vcd.vars.size(); ++i) {
+        VcdVar&  v = g_vcd.vars[i];
         uint64_t m = 0, y = 0, zz = 0;
         vcd_read_planes(v, m, y, zz);
         if (g_vcd.force_all || !v.seen || m != v.last_must || y != v.last_may || zz != v.last_z) {
-            vcd_emit(v, m, y, zz);
+            vcd_rec_change(i, m, y, zz);
             v.last_must = m;
             v.last_may  = y;
             v.last_z    = zz;
             v.seen      = true;
+            any         = true;
         }
     }
+    if (!any) {
+        g_vcd.recbuf.resize(mark);
+    }
     g_vcd.force_all = false;
+    vcd_drain();
 }
 
 extern "C" void rt_vcd_off(void) {
