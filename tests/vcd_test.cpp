@@ -200,6 +200,49 @@ TEST_CASE("vcd: $dumpoff writes an all-x checkpoint, $dumpon resumes") {
     CHECK(body == expected);
 }
 
+TEST_CASE("vcd: unpacked-array memory dumps one $var per element") {
+    const std::string src = R"(
+        module top;
+          reg [7:0] mem [0:3];
+          integer i;
+          initial begin
+            for (i = 0; i < 4; i = i + 1) mem[i] = 0;
+            $dumpfile("OUT.vcd");
+            $dumpvars;
+            #5 mem[2] = 8'hAB;
+            #5 $finish;
+          end
+        endmodule
+    )";
+    const std::string vcd  = run_vcd(src);
+    const std::string body = body_of(vcd);
+    // Each element is its own $var named mem[<addr>] over the declared [0:3] range.
+    CHECK(contains(vcd, "mem[0] $end"));
+    CHECK(contains(vcd, "mem[1] $end"));
+    CHECK(contains(vcd, "mem[2] $end"));
+    CHECK(contains(vcd, "mem[3] $end"));
+    // Only mem[2] changes at #5, to 0xAB; the other elements are not re-emitted.
+    CHECK(contains(body, "#5\nb10101011 "));
+}
+
+TEST_CASE("vcd: descending array range names elements by declared address") {
+    const std::string src = R"(
+        module top;
+          reg [3:0] m [3:1];
+          initial begin
+            m[3] = 0; m[2] = 0; m[1] = 0;
+            $dumpfile("OUT.vcd");
+            $dumpvars;
+            #1 $finish;
+          end
+        endmodule
+    )";
+    const std::string vcd = run_vcd(src);
+    CHECK(contains(vcd, "m[3] $end"));
+    CHECK(contains(vcd, "m[2] $end"));
+    CHECK(contains(vcd, "m[1] $end"));
+}
+
 TEST_CASE("vcd: high-activity trace stays ordered through the writer thread") {
     // Enough instants to exceed the writer's handoff threshold many times over, so
     // the background writer processes multiple buffers. A race would corrupt the

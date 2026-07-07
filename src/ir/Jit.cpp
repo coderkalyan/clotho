@@ -150,6 +150,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_vcd_scope", &rt_vcd_scope);
     expose("rt_vcd_upscope", &rt_vcd_upscope);
     expose("rt_vcd_var", &rt_vcd_var);
+    expose("rt_vcd_array", &rt_vcd_array);
     expose("rt_vcd_start", &rt_vcd_start);
     expose("rt_vcd_flush", &rt_vcd_flush);
     expose("rt_vcd_off", &rt_vcd_off);

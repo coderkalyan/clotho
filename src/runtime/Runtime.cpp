@@ -2683,11 +2683,10 @@ extern "C" void rt_vcd_upscope(void) {
     vcd_puts("$upscope $end\n");
 }
 
-extern "C" void rt_vcd_var(const char* name, uint32_t name_len, uint32_t width, uint32_t flags,
-                           const uint8_t* mm, const uint8_t* z) {
-    if (g_vcd.file == nullptr || g_vcd.started) {
-        return;
-    }
+// Write one $var line and add the variable to the scan table. Shared by the
+// scalar (rt_vcd_var) and per-element array (rt_vcd_array) registration.
+static void vcd_register(std::string_view ref, uint32_t width, uint32_t flags, const uint8_t* mm,
+                         const uint8_t* z) {
     VcdVar v;
     v.mm         = mm;
     v.z          = z;
@@ -2703,9 +2702,35 @@ extern "C" void rt_vcd_var(const char* name, uint32_t name_len, uint32_t width, 
     vcd_put(' ');
     vcd_puts(v.idcode);
     vcd_put(' ');
-    vcd_puts(std::string_view(name, name_len));
+    vcd_puts(ref);
     vcd_puts(" $end\n");
     g_vcd.vars.push_back(std::move(v));
+}
+
+extern "C" void rt_vcd_var(const char* name, uint32_t name_len, uint32_t width, uint32_t flags,
+                           const uint8_t* mm, const uint8_t* z) {
+    if (g_vcd.file == nullptr || g_vcd.started) {
+        return;
+    }
+    vcd_register(std::string_view(name, name_len), width, flags, mm, z);
+}
+
+extern "C" void rt_vcd_array(const char* name, uint32_t name_len, uint32_t count, uint32_t width, uint32_t flags,
+                             const uint8_t* mm_base, const uint8_t* z_base, uint32_t stride, int64_t left,
+                             int64_t right) {
+    if (g_vcd.file == nullptr || g_vcd.started) {
+        return;
+    }
+    const std::string_view leaf(name, name_len);
+    for (uint32_t k = 0; k < count; ++k) {
+        // Storage index k maps to declared address left+k (ascending range) or
+        // left-k (descending), matching the element-select normalization.
+        const int64_t     addr = left <= right ? left + static_cast<int64_t>(k) : left - static_cast<int64_t>(k);
+        const std::string ref  = std::string(leaf) + "[" + std::to_string(addr) + "]";
+        const uint8_t*    mm   = mm_base + static_cast<size_t>(k) * stride;
+        const uint8_t*    z    = z_base != nullptr ? z_base + static_cast<size_t>(k) * stride : nullptr;
+        vcd_register(ref, width, flags, mm, z);
+    }
 }
 
 extern "C" void rt_vcd_start(void) {

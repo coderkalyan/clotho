@@ -6999,6 +6999,14 @@ private:
         auto* i32 = b_.getInt32Ty();
         return rt_fn("rt_vcd_var", b_.getVoidTy(), { ptr, i32, i32, i32, ptr, ptr });
     }
+    // void rt_vcd_array(i8* name, i32 len, i32 count, i32 width, i32 flags, i8* mm_base,
+    //                   i8* z_base, i32 stride, i64 left, i64 right)
+    llvm::FunctionCallee vcd_array_fn() {
+        auto* ptr = raw_ptr_ty();
+        auto* i32 = b_.getInt32Ty();
+        auto* i64 = b_.getInt64Ty();
+        return rt_fn("rt_vcd_array", b_.getVoidTy(), { ptr, i32, i32, i32, i32, ptr, ptr, i32, i64, i64 });
+    }
     llvm::FunctionCallee vcd_start_fn() {
         return rt_fn("rt_vcd_start", b_.getVoidTy(), {});
     }
@@ -7095,10 +7103,11 @@ private:
     }
 
     // Register one dumped signal: leaf name, width/flags, and live plane pointers.
-    // A whole-design dump must represent every declared signal, so an
-    // unrepresentable one (array, string, wider than 64 bits) loud-fails rather
-    // than being silently omitted; an unnamed compiler temporary is not
-    // a declared variable and is skipped.
+    // An unpacked array expands to one $var per element (rt_vcd_array). A
+    // whole-design dump must represent every declared signal, so an unrepresentable
+    // one (string, element wider than 64 bits, multidimensional array) loud-fails
+    // rather than being silently omitted; an unnamed compiler temporary
+    // is not a declared variable and is skipped.
     void emit_vcd_var(Signal sig) {
         const SignalInfo& info = mod_.signal(sig);
         if (info.name.empty()) {
@@ -7108,9 +7117,6 @@ private:
         if (s.is_string) {
             throw BackendError{ "VCD dump of string signal '" + info.name + "' is not supported" };
         }
-        if (s.is_array) {
-            throw BackendError{ "VCD dump of unpacked array '" + info.name + "' is not supported" };
-        }
         if (s.width > 64) {
             throw BackendError{ "VCD dump of signal '" + info.name + "' wider than 64 bits is not supported" };
         }
@@ -7118,15 +7124,36 @@ private:
         if (const auto pos = leaf.rfind('.'); pos != std::string::npos) {
             leaf = leaf.substr(pos + 1);
         }
-        llvm::Value* np      = b_.CreateGlobalString(leaf, "vcd.var");
-        llvm::Value* storage = storage_ptr(state_, s);
-        llvm::Value* mm      = b_.CreateStructGEP(s.slot_ty, storage, 0);
-        llvm::Value* zp      = s.has_z ? b_.CreateStructGEP(s.slot_ty, storage, 1)
-                                       : llvm::cast<llvm::Value>(
-                                           llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
+        auto*          nullp = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
         const uint32_t flags = (s.four_state ? 1u : 0u) | (info.is_net ? 2u : 0u) | (s.narrow ? 4u : 0u);
-        b_.CreateCall(vcd_var_fn(), { np, b_.getInt32(static_cast<uint32_t>(leaf.size())),
-                                      b_.getInt32(s.width), b_.getInt32(flags), mm, zp });
+        llvm::Value*   np    = b_.CreateGlobalString(leaf, "vcd.var");
+        llvm::Value*   nlen  = b_.getInt32(static_cast<uint32_t>(leaf.size()));
+
+        if (!s.is_array) {
+            llvm::Value* storage = storage_ptr(state_, s);
+            llvm::Value* mm      = b_.CreateStructGEP(s.slot_ty, storage, 0);
+            llvm::Value* zp = s.has_z ? b_.CreateStructGEP(s.slot_ty, storage, 1) : llvm::cast<llvm::Value>(nullp);
+            b_.CreateCall(vcd_var_fn(), { np, nlen, b_.getInt32(s.width), b_.getInt32(flags), mm, zp });
+            return;
+        }
+
+        // Unpacked array (memory): one $var per element. Multidimensional arrays
+        // (a nested UnpackedArray element type) need per-dimension index naming and
+        // are deferred.
+        const Type& at = std::get<Type>(mod_.pool.get(info.type));
+        if (std::get<Type>(mod_.pool.get(at.element)).kind == Type::Kind::UnpackedArray) {
+            throw BackendError{ "VCD dump of multidimensional array '" + info.name + "' is not supported" };
+        }
+        auto*        arr_ty  = llvm::cast<llvm::ArrayType>(s.storage_ty);
+        llvm::Value* base    = storage_ptr(state_, s);
+        llvm::Value* mm_base = b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(0) });
+        llvm::Value* z_base =
+          s.has_z ? b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(1) })
+                  : llvm::cast<llvm::Value>(nullp);
+        const auto stride = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(s.slot_ty));
+        b_.CreateCall(vcd_array_fn(), { np, nlen, b_.getInt32(s.elem_count), b_.getInt32(s.width),
+                                        b_.getInt32(flags), mm_base, z_base, b_.getInt32(stride),
+                                        b_.getInt64(at.left), b_.getInt64(at.right) });
     }
 
     // $dumpoff / $dumpon / $dumpall / $dumpflush: forward to the matching runtime

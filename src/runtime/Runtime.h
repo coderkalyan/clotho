@@ -268,6 +268,14 @@ void rt_vcd_upscope(void);
 void rt_vcd_var(const char* name, uint32_t name_len, uint32_t width, uint32_t flags, const uint8_t* mm,
                 const uint8_t* z);
 
+// Register a whole unpacked-array (memory) as one $var per element, named
+// `<name>[<addr>]` over the declared address range [left:right]. Element k's
+// planes sit at `mm_base + k*stride` (and `z_base + k*stride`, or z_base null for a
+// never-z / narrow memory). `width`/`flags` describe one element. Registering the
+// array in a single call keeps the emitted design independent of the array size.
+void rt_vcd_array(const char* name, uint32_t name_len, uint32_t count, uint32_t width, uint32_t flags,
+                  const uint8_t* mm_base, const uint8_t* z_base, uint32_t stride, int64_t left, int64_t right);
+
 // Finish the header ($enddefinitions) and arm the initial full dump.
 void rt_vcd_start(void);
 
