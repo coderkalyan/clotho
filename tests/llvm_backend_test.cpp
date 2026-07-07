@@ -117,12 +117,16 @@ constexpr std::string_view kAlu = R"(
 } // namespace
 
 TEST_CASE("alu emits verifiable llvm ir") {
-    const std::string ir = emit(kAlu);
+    const std::string ir  = emit(kAlu);
+    const std::string raw = emit_raw(kAlu);
 
     // State is typed: the module definition gets a named state struct, the root
-    // %clotho.state composes it, and main stack-allocates the root type.
-    CHECK(ir.find("%alu.state = type") != std::string::npos);
-    CHECK(ir.find("alloca %clotho.state") != std::string::npos);
+    // %clotho.state composes it, and main heap-allocates the root type via
+    // rt_alloc (the design state can be far too large for the stack). Asserted
+    // on raw IR: the optimizer rewrites the typed GEPs to i8 offsets, dropping
+    // the named struct definitions and the state type from the opaque `ptr`.
+    CHECK(raw.find("%alu.state = type") != std::string::npos);
+    CHECK(raw.find("%state = call ptr @rt_alloc(") != std::string::npos);
 
     // One coroutine per process, named @<module>.p<index>: two combinational
     // assigns + one sequential always block. Each is a switched-resume coroutine
@@ -138,7 +142,7 @@ TEST_CASE("alu emits verifiable llvm ir") {
 
     // Signal access via constant-index typed GEPs into the state structs
     // (asserted on raw IR; instcombine canonicalizes GEP shapes).
-    CHECK(emit_raw(kAlu).find("getelementptr inbounds %clotho.state, ptr") != std::string::npos);
+    CHECK(raw.find("getelementptr inbounds %clotho.state, ptr") != std::string::npos);
     CHECK(ir.find("store i8") != std::string::npos);
 
     // The if/else lowers to branches.
@@ -158,16 +162,18 @@ TEST_CASE("2-state vs 4-state widths") {
         endmodule
     )";
     const std::string          ir  = emit(src);
+    const std::string          raw = emit_raw(src);
 
     // Every signal keeps its LLVM slot type, named per (domain, width) — and
     // the module's state struct lists them in declaration order: x, y
     // (bit[3:0]) then z (logic[7:0]). The 2-state signals are decoupled from the
     // packed-word paths (no ABI / NBA / array), so they get the genuine single-iW
     // slot `%bit.4 = { i4 }`; the 4-state z keeps the i(2W) must|may word.
-    CHECK(ir.find("%m.state = type { %bit.4, %bit.4, %logic.nz.8 }") != std::string::npos);
-    CHECK(ir.find("%bit.4 = type { i4 }") != std::string::npos);
-    CHECK(ir.find("%logic.nz.8 = type { i16 }") != std::string::npos);
-    CHECK(ir.find("alloca %clotho.state") != std::string::npos);
+    // Named-type layout survives only in the raw IR (the optimizer drops it).
+    CHECK(raw.find("%m.state = type { %bit.4, %bit.4, %logic.nz.8 }") != std::string::npos);
+    CHECK(raw.find("%bit.4 = type { i4 }") != std::string::npos);
+    CHECK(raw.find("%logic.nz.8 = type { i16 }") != std::string::npos);
+    CHECK(raw.find("%state = call ptr @rt_alloc(") != std::string::npos);
     // z's must|may word is an i16 (2W = 16).
     CHECK(ir.find("store i16") != std::string::npos);
     CHECK(ir.find("define ptr @m.") != std::string::npos);
@@ -187,17 +193,18 @@ TEST_CASE("instance state structs compose nested and replicate per instantiation
             leaf u1(.a(clk), .q(q1));
         endmodule
     )";
-    const std::string          ir  = emit(src);
+    const std::string          raw = emit_raw(src);
 
     // One state struct per module definition; the parent embeds one field per
     // child instance (two %leaf.state replicas), and the root composes the top
     // instance plus the NBA shadow region. No z sources → every slot elided.
-    CHECK(ir.find("%leaf.state = type { %logic.nz.1, %logic.nz.8, %logic.nz.8 }") != std::string::npos);
-    CHECK(ir.find("%top.state = type { %logic.nz.1, %logic.nz.8, %logic.nz.8, %leaf.state, %leaf.state }") !=
+    // Named-type layout survives only in the raw IR (the optimizer drops it).
+    CHECK(raw.find("%leaf.state = type { %logic.nz.1, %logic.nz.8, %logic.nz.8 }") != std::string::npos);
+    CHECK(raw.find("%top.state = type { %logic.nz.1, %logic.nz.8, %logic.nz.8, %leaf.state, %leaf.state }") !=
           std::string::npos);
-    CHECK(ir.find("%clotho.state = type { %top.state, %clotho.nba.shadow }") != std::string::npos);
+    CHECK(raw.find("%clotho.state = type { %top.state, %clotho.nba.shadow }") != std::string::npos);
     // Exactly one definition of the leaf struct type (deduplicated, no .0 clone).
-    CHECK(ir.find("%leaf.state.0") == std::string::npos);
+    CHECK(raw.find("%leaf.state.0") == std::string::npos);
 }
 
 // Regression: two or more self-starting continuous assigns share the nproc-sized
@@ -2532,10 +2539,11 @@ TEST_CASE("a z-carrying signal keeps its z word and round-trips z through copies
             end
         endmodule
     )";
-    const std::string ir = emit(src);
+    const std::string raw = emit_raw(src);
     // v and y carry z (full slot); clean is proven never-z (elided slot).
-    CHECK(ir.find("%logic.4 = type { i8, i4 }") != std::string::npos);
-    CHECK(ir.find("%logic.nz.4 = type { i8 }") != std::string::npos);
+    // Named-type layout survives only in the raw IR (the optimizer drops it).
+    CHECK(raw.find("%logic.4 = type { i8, i4 }") != std::string::npos);
+    CHECK(raw.find("%logic.nz.4 = type { i8 }") != std::string::npos);
     CHECK(run_capture(src) == "z01x z01x 1010\n1 1\ncasez hit\n");
 }
 

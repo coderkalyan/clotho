@@ -1657,7 +1657,7 @@ private:
 
     // -- Top-level entry --
     //
-    // Emit `i32 @main()`: stack-allocate the shared state, power it up, build the
+    // Emit `i32 @main()`: heap-allocate the shared state, power it up, build the
     // timing wheel, then run every process through the active task queue and drain
     // the wheel (advancing time, resuming delayed/woken processes) until idle,
     // then run the `final` blocks. Returns 0.
@@ -1668,8 +1668,8 @@ private:
         // sim_drain(state, wheel): seed every non-final process and run the event
         // loop to quiescence. Split out of main so rt_sim_run can wrap it in the
         // $finish catch — a $finish longjmps back into rt_sim_run, which sits below
-        // main's live state/wheel allocas, so the final blocks still observe the
-        // settled design state.
+        // main's frame, so the heap state pointer and the wheel alloca stay live
+        // and the final blocks still observe the settled design state.
         auto* drain = llvm::Function::Create(subfnty, llvm::Function::InternalLinkage, "sim_drain", llmod_);
         b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", drain));
         emit_active_run(drain->getArg(0), drain->getArg(1), procs);
@@ -1688,7 +1688,13 @@ private:
         auto* entry = llvm::BasicBlock::Create(ctx_, "entry", main);
         b_.SetInsertPoint(entry);
 
-        llvm::AllocaInst* state = b_.CreateAlloca(state_ty_, nullptr, "state");
+        // The design state struct holds every signal, including large memories,
+        // so it can be far too big for the stack. Allocate it on the heap via
+        // rt_alloc (freed before main returns) instead of a stack alloca that
+        // would overflow on large designs. rt_alloc returns 64-byte-aligned
+        // memory, covering any packed-vector alignment in the struct.
+        const uint64_t state_size = llmod_.getDataLayout().getTypeAllocSize(state_ty_);
+        llvm::Value*   state      = b_.CreateCall(alloc_fn(), { b_.getInt64(state_size) }, "state");
         init_state(state);
 
         // Timing wheel: the event scheduler. Processes schedule timers on it at
@@ -1717,6 +1723,7 @@ private:
         }
 
         b_.CreateCall(wheel_deinit_fn(), { wheel });
+        b_.CreateCall(free_fn(), { state });
         b_.CreateRet(llvm::ConstantInt::get(i32, 0));
     }
 
