@@ -76,6 +76,11 @@ enum class Activation : uint8_t {
     // Re-armed after each run and rerun whenever one of its wait events fires
     // (an `always` block or a continuous `assign`).
     Always,
+    // Runs once at the end of simulation (a `final` block, LRM 9.2.3), on both
+    // the natural-drain and `$finish` exit paths, after every other process has
+    // settled. Zero-time: the body contains no timing controls, so it runs to
+    // completion in a single resume.
+    Final,
 };
 
 // The kind of signal change a wait event triggers on.

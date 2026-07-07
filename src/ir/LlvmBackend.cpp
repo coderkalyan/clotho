@@ -1636,13 +1636,51 @@ private:
         }
     }
 
+    // Run every `final` block once, in source order, at the end of simulation
+    // (LRM 9.2.3). A final block is zero-time, so — like the pre-init pass — one
+    // resume runs its body to completion; destroy reclaims the frame. Emitted as
+    // a separate `sim_finals(state, wheel)` so rt_sim_run can invoke it on both
+    // the natural-drain and $finish exit paths.
+    void emit_finals_run(llvm::Value* state, llvm::Value* wheel, const std::vector<llvm::Function*>& procs) {
+        auto* ptr_ty    = llvm::PointerType::getUnqual(ctx_);
+        auto* proc_fnty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
+        const auto all  = mod_.processes();
+        for (uint32_t k = 0; k < procs.size(); ++k) {
+            if (all[k].activation != Activation::Final) {
+                continue;
+            }
+            llvm::Value* hdl = b_.CreateCall(proc_fnty, procs[k], { state, wheel });
+            b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
+            b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
+        }
+    }
+
     // -- Top-level entry --
     //
     // Emit `i32 @main()`: stack-allocate the shared state, power it up, build the
     // timing wheel, then run every process through the active task queue and drain
-    // the wheel (advancing time, resuming delayed/woken processes) until idle.
-    // Returns 0.
+    // the wheel (advancing time, resuming delayed/woken processes) until idle,
+    // then run the `final` blocks. Returns 0.
     void emit_main(const std::vector<llvm::Function*>& procs) {
+        auto* ptr_ty  = llvm::PointerType::getUnqual(ctx_);
+        auto* subfnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
+
+        // sim_drain(state, wheel): seed every non-final process and run the event
+        // loop to quiescence. Split out of main so rt_sim_run can wrap it in the
+        // $finish catch — a $finish longjmps back into rt_sim_run, which sits below
+        // main's live state/wheel allocas, so the final blocks still observe the
+        // settled design state.
+        auto* drain = llvm::Function::Create(subfnty, llvm::Function::InternalLinkage, "sim_drain", llmod_);
+        b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", drain));
+        emit_active_run(drain->getArg(0), drain->getArg(1), procs);
+        b_.CreateRetVoid();
+
+        // sim_finals(state, wheel): run every `final` block once.
+        auto* finals = llvm::Function::Create(subfnty, llvm::Function::InternalLinkage, "sim_finals", llmod_);
+        b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", finals));
+        emit_finals_run(finals->getArg(0), finals->getArg(1), procs);
+        b_.CreateRetVoid();
+
         auto* i32  = llvm::Type::getInt32Ty(ctx_);
         auto* fnty = llvm::FunctionType::get(i32, false);
         auto* main = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, "main", llmod_);
@@ -1665,11 +1703,13 @@ private:
         b_.CreateCall(timeformat_init_fn(),
                       { b_.getInt64(mod_.tick_fs), b_.getInt32(static_cast<uint32_t>(mod_.timeformat_units)) });
 
-        emit_active_run(state, wheel, procs);
+        // Run the drain under the $finish catch, then the final blocks. Both exit
+        // paths (natural drain, $finish) return here with `state` still live.
+        b_.CreateCall(sim_run_fn(), { state, wheel, drain, finals });
 
-        // Release heap owned by string signals. A $finish longjmps out of the
-        // design before reaching this, so it covers designs that drain
-        // naturally; a $finish run's string heap is reclaimed at process exit.
+        // Release heap owned by string signals. Runs on both exit paths now (the
+        // $finish catch returns here); a $finish inside a final block still
+        // longjmps past this, its heap reclaimed at process exit.
         for (const SignalSlot& s : slots_) {
             if (s.is_string) {
                 emit_string_slot_op(state, s, str_deinit_fn());
@@ -2546,6 +2586,9 @@ private:
             const Process& p = all[k];
             if (p.activation == Activation::PreInit) {
                 continue; // already run above
+            }
+            if (p.activation == Activation::Final) {
+                continue; // deferred to emit_finals_run at end of simulation
             }
             llvm::Value* hdl = b_.CreateCall(proc_fnty, procs[k], { state, wheel });
             if (p.activation == Activation::Always && !p.wait_events.empty()) {
@@ -4293,6 +4336,14 @@ private:
     // rt_finish is marked noreturn and the optimizer prunes the unreachable tail.
     void lower_finish() {
         b_.CreateCall(finish_fn(), {});
+    }
+
+    // void rt_sim_run(ptr state, ptr wheel, ptr drain, ptr finals) — wraps the
+    // drain in the $finish catch (a setjmp target) so a $finish returns here with
+    // state live, then runs the final blocks (LRM 9.2.3). See runtime/Runtime.cpp.
+    llvm::FunctionCallee sim_run_fn() {
+        auto* ptr = raw_ptr_ty();
+        return rt_fn("rt_sim_run", b_.getVoidTy(), { ptr, ptr, ptr, ptr });
     }
 
     // void rt_fflush(i32 desc) — flush a descriptor's output buffers (0 => all).

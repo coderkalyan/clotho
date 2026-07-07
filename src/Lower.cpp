@@ -1240,10 +1240,11 @@ private:
         if (sym.procedureKind == ProceduralBlockKind::Initial) {
             activation = ir::Activation::Initial;
         } else if (sym.procedureKind == ProceduralBlockKind::Final) {
-            // TODO: `final` blocks run once at simulation end ($finish), LRM 9.2.3.
-            // Lowering needs an end-of-sim hook; without it the block would be
-            // mis-scheduled as an always (a sensitivity-less infinite loop).
-            fail("final block is not supported");
+            // A `final` block runs once at simulation end (LRM 9.2.3). The backend
+            // runs it, sensitivity-less, on both exit paths after every other
+            // process settles. Lowered like an `initial` body; the zero-time
+            // requirement (no timing controls) is checked after lowering below.
+            activation = ir::Activation::Final;
         }
 
         // TODO: no non-sequential-behavior warning for `always_ff`. LRM 9.2.2.4
@@ -1309,11 +1310,24 @@ private:
         // listed signal changes, matching Verilog, so it is left non-self-starting.
         const bool self_start = sym.procedureKind == ProceduralBlockKind::AlwaysComb ||
                                 sym.procedureKind == ProceduralBlockKind::AlwaysLatch;
+        ir::Ir body_ir = b.finish();
+        // A `final` block is zero-time (LRM 9.2.3): it must not suspend. slang
+        // rejects a time-consuming statement in a `final` at elaboration, so this
+        // guard is defense in depth (never silently accept an
+        // unimplemented case) — reached only if that check ever regresses.
+        if (activation == ir::Activation::Final) {
+            for (size_t i = 0; i < body_ir.inst_count(); ++i) {
+                const ir::Inst::Tag t = body_ir.tag(static_cast<ir::Index>(i));
+                if (t == ir::Inst::Tag::Delay || t == ir::Inst::Tag::Wait) {
+                    fail("timing control in a final block is not legal (LRM 9.2.3)");
+                }
+            }
+        }
         module_.add_process(ir::Process{ .activation  = activation,
                                          .wait_events = std::move(wait_events),
                                          .self_start  = self_start,
                                          .loc         = to_source_loc(sym.location),
-                                         .ir          = b.finish() });
+                                         .ir          = std::move(body_ir) });
     }
 
     // True if `tc` is an @-style event control (the kinds usable as a process's

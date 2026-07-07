@@ -1161,6 +1161,25 @@ extern "C" void rt_finish(void) {
     std::exit(0);
 }
 
+extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*),
+                           void (*finals)(void*, void*)) {
+    // Run the simulation, then the `final` blocks (LRM 9.2.3), so the finals see
+    // the settled design state on BOTH exit paths. The natural drain returns from
+    // `drain`; a $finish inside it longjmps out of the abandoned coroutine frames
+    // back to the local catch below — main's state/wheel allocas stay live because
+    // main sits beneath this frame. Either way, control reaches the finals.
+    std::jmp_buf  local;
+    std::jmp_buf* prev = finish_env; // outer host catch (run_jit), restored below
+    if (setjmp(local) == 0) {
+        finish_env = &local;
+        drain(state, wheel);
+    }
+    // Restore the outer catch before the finals so a $finish in a final block
+    // exits cleanly (to the host / process exit) rather than re-entering here.
+    finish_env = prev;
+    finals(state, wheel);
+}
+
 extern "C" void rt_fflush(int32_t desc) {
     if (desc == 0) {
         // No-argument $fflush: passing nullptr flushes all C stdio buffers.

@@ -266,17 +266,21 @@ TEST_CASE("case inside is reported as unsupported") {
     CHECK(ri.diagnostics.find("inside") != std::string::npos);
 }
 
-// A `final` block runs once at simulation end (LRM 9.2.3); without an end-of-sim
-// hook it must be rejected, not mis-scheduled as a sensitivity-less always (which
-// would spin forever at time zero).
-TEST_CASE("final block is reported as unsupported") {
+// A `final` block lowers to a run-once end-of-sim process (LRM 9.2.3), scheduled
+// separately from initial/always (the backend runs it on the exit paths).
+TEST_CASE("final block lowers to a Final-activation process") {
     const LowerResult r = lower_text(R"(
         module m;
             final $display("done");
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("final block") != std::string::npos);
+    REQUIRE(r.ok);
+    REQUIRE(r.module != nullptr);
+    bool has_final = false;
+    for (const ir::Process& p : r.module->processes()) {
+        has_final |= p.activation == ir::Activation::Final;
+    }
+    CHECK(has_final);
 }
 
 // -- Inferred (@*) combinational sensitivity --
