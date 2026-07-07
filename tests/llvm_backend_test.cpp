@@ -32,6 +32,20 @@ std::string emit(std::string_view source) {
     return text;
 }
 
+// Emit without the optimization pipeline: for assertions on the backend's own
+// emission structure (block labels, typed GEPs), which the pipeline is free to
+// rewrite.
+std::string emit_raw(std::string_view source) {
+    const LowerResult result = lower_text(source);
+    REQUIRE(result.ok);
+    REQUIRE(result.module != nullptr);
+
+    std::string              text;
+    llvm::raw_string_ostream os(text);
+    REQUIRE(ir::emit_llvm(*result.module, os, { .optimize = false }));
+    return text;
+}
+
 // JIT-run a module and return everything its initial blocks wrote to stdout.
 std::string run_capture(std::string_view source) {
     const LowerResult r = lower_text(source);
@@ -119,8 +133,9 @@ TEST_CASE("alu emits verifiable llvm ir") {
     CHECK(ir.find(" add ") != std::string::npos);
     CHECK(ir.find(" sub ") != std::string::npos);
 
-    // Signal access via constant-index typed GEPs into the state structs.
-    CHECK(ir.find("getelementptr inbounds %clotho.state, ptr") != std::string::npos);
+    // Signal access via constant-index typed GEPs into the state structs
+    // (asserted on raw IR; instcombine canonicalizes GEP shapes).
+    CHECK(emit_raw(kAlu).find("getelementptr inbounds %clotho.state, ptr") != std::string::npos);
     CHECK(ir.find("store i8") != std::string::npos);
 
     // The if/else lowers to branches.
@@ -257,7 +272,7 @@ TEST_CASE("wide add keeps the branching arithmetic path") {
             assign y = a + b;
         endmodule
     )";
-    const std::string          ir  = emit(src);
+    const std::string          ir  = emit_raw(src);
 
     // Not the single-bit LUT path; the branching arithmetic lowering is used.
     CHECK(ir.find("597819616") == std::string::npos);
@@ -319,7 +334,7 @@ TEST_CASE("single-bit mul agrees with LRM: value is and, but X propagates") {
 }
 
 TEST_CASE("wide mul keeps the branching arithmetic path") {
-    const std::string ir = emit(R"(
+    const std::string ir = emit_raw(R"(
         module m(input logic [7:0] a, input logic [7:0] b, output logic [7:0] y);
             assign y = a * b;
         endmodule
@@ -553,7 +568,7 @@ TEST_CASE("multi-bit relational and logical guard X (branchy), agree with LRM") 
 }
 
 TEST_CASE("ordered relational guards X with a branch") {
-    const std::string ir = emit(R"(
+    const std::string ir = emit_raw(R"(
         module m(input logic [7:0] a, input logic [7:0] b, output logic y);
             assign y = a < b;
         endmodule
@@ -763,10 +778,12 @@ TEST_CASE("event waits emit wait queues, always loops, and queue servicing") {
     CHECK(ir.find("@clotho.wait.doubled.dyn.any.len = internal global") != std::string::npos);
     CHECK(ir.find("@clotho.proc_sched = internal global") != std::string::npos);
     // The always blocks lower to a forever wait loop; servicing has both a static
-    // and a dynamic scan.
-    CHECK(ir.find("always.loop") != std::string::npos);
-    CHECK(ir.find("sta.head") != std::string::npos);
-    CHECK(ir.find("dyn.head") != std::string::npos);
+    // and a dynamic scan. Labels are asserted on raw IR (simplifycfg merges and
+    // renames blocks).
+    const std::string raw = emit_raw(src);
+    CHECK(raw.find("always.loop") != std::string::npos);
+    CHECK(raw.find("sta.head") != std::string::npos);
+    CHECK(raw.find("dyn.head") != std::string::npos);
 }
 
 TEST_CASE("$finish lowers to an rt_finish call") {

@@ -5309,12 +5309,19 @@ private:
     llvm::StructType* str_slot_ty_ = nullptr;
 };
 
-// Lower the coroutine intrinsics emitted for each process. CoroSplit (with
-// CoroEarly/CoroCleanup) is mandatory: without it the llvm.coro.* intrinsics
-// survive to codegen and the module won't compile. The mem2reg/sroa/simplifycfg
-// cleanup shrinks the frame, and inline + coro-elide stack-allocate the frame for
-// processes that never suspend, collapsing the coroutine back to straight-line
-// code. Returns false (reason on errs()) only if the pipeline string is rejected.
+// Lower the coroutine intrinsics emitted for each process and clean up the
+// generated code (tier-0 pipeline: fast compile, no loop/GVN passes). CoroSplit
+// (with CoroEarly/CoroCleanup) is mandatory: without it the llvm.coro.*
+// intrinsics survive to codegen and the module won't compile. The pre-split
+// sroa/early-cse/simplifycfg/instcombine run inside the CGSCC nest (after
+// inlining, before split) so promoted values never reach the coroutine frame;
+// the post-split function passes clean the resume functions, which do not exist
+// earlier. instcombine is what folds the z-elision zero-plane traffic and the
+// plane-extraction trunc/lshr chains; instsimplify is not enough (measured:
+// no sim-time win). no-verify-fixpoint: LLVM 22
+// errors if instcombine's single iteration does not converge on our
+// non-canonical IR. Returns false (reason on errs()) only if the pipeline
+// string is rejected.
 bool lower_coroutines(llvm::Module& m) {
     llvm::PassBuilder         pb;
     llvm::LoopAnalysisManager     lam;
@@ -5330,9 +5337,8 @@ bool lower_coroutines(llvm::Module& m) {
     llvm::ModulePassManager mpm;
     if (auto err = pb.parsePassPipeline(mpm,
                                         "coro-early,"
-                                        "function(mem2reg,sroa,simplifycfg),"
-                                        "cgscc(inline,coro-split,coro-annotation-elide),"
-                                        "function(coro-elide,simplifycfg),"
+                                        "cgscc(inline,function(sroa,early-cse,simplifycfg,instcombine<no-verify-fixpoint>),coro-split),"
+                                        "function(simplifycfg,instcombine<no-verify-fixpoint>,dce),"
                                         "coro-cleanup")) {
         llvm::errs() << "llvm backend: bad coroutine pipeline: " << llvm::toString(std::move(err)) << "\n";
         return false;
