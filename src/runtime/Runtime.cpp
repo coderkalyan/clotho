@@ -2357,13 +2357,19 @@ struct VcdVar {
     const uint8_t* z  = nullptr;   // z plane (iW), or null for a never-z / narrow variable
     uint32_t       width       = 0;
     uint32_t       nwords      = 0;   // words per plane
+    uint32_t       mm_bytes    = 0;   // significant bytes of the mm slot field (for the raw diff)
+    uint32_t       z_bytes     = 0;   // significant bytes of the z field (0 for never-z / narrow)
     bool           four_state  = false;
     bool           narrow      = false;   // 2-state `{ iW }` slot: mm is a bare iW value word
     bool           seen        = false;   // shadow valid (a value has been dumped)
-    // Shadow of the last dumped planes: 3*nwords words laid out must | may | z.
-    std::vector<uint64_t> shadow;
-    // VCD identifier code (printable ASCII), assigned at registration.
+    // Shadow of the last dumped *raw* slot: mm_bytes of the mm field, then z_bytes
+    // of the z field. The diff is a memcmp of these against the live slot; the
+    // planes are assembled (vcd_read_planes) only when they differ.
+    std::vector<uint8_t> shadow;
+    // VCD identifier code, and the precomputed line suffix: idcode+"\n" for a
+    // scalar, " "+idcode+"\n" for a vector (appended after the value in one copy).
     std::string idcode;
+    std::string suffix;
 };
 
 // The producer -> sink record stream is a byte buffer of self-describing records
@@ -2587,51 +2593,57 @@ void vcd_emit(const VcdVar& v, const uint64_t* must, const uint64_t* may, const 
         }
         return (must[w] & m) != 0 ? '1' : 'x';
     };
+    // One capacity check for the whole line: 'b' + up to width digits + suffix. Then
+    // write through a local pointer, no per-character bounds check.
+    const size_t need = static_cast<size_t>(v.width) + v.suffix.size() + 2;
+    if (g_vcd.out_len + need > VcdEngine::iobuf_size) {
+        vcd_flush_out();
+    }
+    char* wp = g_vcd.iobuf + g_vcd.out_len;
     if (v.width == 1) {
-        vcd_put(bitc(0));
-        vcd_puts(v.idcode);
-        vcd_put('\n');
-        return;
-    }
-    vcd_put('b');
-    const char msb = bitc(v.width - 1);
-    if (msb == '0') {
-        int hi = -1;
-        for (int i = static_cast<int>(v.width) - 1; i >= 0; --i) {
-            if (bitc(static_cast<uint32_t>(i)) != '0') {
-                hi = i;
-                break;
-            }
-        }
-        if (hi < 0) {
-            vcd_put('0');
-        } else {
-            for (int i = hi; i >= 0; --i) {
-                vcd_put(bitc(static_cast<uint32_t>(i)));
-            }
-        }
-    } else if (msb == '1') {
-        for (int i = static_cast<int>(v.width) - 1; i >= 0; --i) {
-            vcd_put(bitc(static_cast<uint32_t>(i)));
-        }
+        *wp++ = bitc(0);
     } else {
-        // x / z MSB: one marker char forces the reader's left-extension, then the
-        // bits below the leading run (every bit above `hi` equals the marker).
-        vcd_put(msb);
-        int hi = -1;
-        for (int i = static_cast<int>(v.width) - 2; i >= 0; --i) {
-            if (bitc(static_cast<uint32_t>(i)) != msb) {
-                hi = i;
-                break;
+        *wp++          = 'b';
+        const char msb = bitc(v.width - 1);
+        if (msb == '0') {
+            int hi = -1;
+            for (int i = static_cast<int>(v.width) - 1; i >= 0; --i) {
+                if (bitc(static_cast<uint32_t>(i)) != '0') {
+                    hi = i;
+                    break;
+                }
+            }
+            if (hi < 0) {
+                *wp++ = '0';
+            } else {
+                for (int i = hi; i >= 0; --i) {
+                    *wp++ = bitc(static_cast<uint32_t>(i));
+                }
+            }
+        } else if (msb == '1') {
+            for (int i = static_cast<int>(v.width) - 1; i >= 0; --i) {
+                *wp++ = bitc(static_cast<uint32_t>(i));
+            }
+        } else {
+            // x / z MSB: one marker char forces the reader's left-extension, then the
+            // bits below the leading run (every bit above `hi` equals the marker).
+            *wp++  = msb;
+            int hi = -1;
+            for (int i = static_cast<int>(v.width) - 2; i >= 0; --i) {
+                if (bitc(static_cast<uint32_t>(i)) != msb) {
+                    hi = i;
+                    break;
+                }
+            }
+            for (int i = hi; i >= 0; --i) {
+                *wp++ = bitc(static_cast<uint32_t>(i));
             }
         }
-        for (int i = hi; i >= 0; --i) {
-            vcd_put(bitc(static_cast<uint32_t>(i)));
-        }
     }
-    vcd_put(' ');
-    vcd_puts(v.idcode);
-    vcd_put('\n');
+    // Precomputed suffix: scalar idcode+"\n", vector " "+idcode+"\n".
+    std::memcpy(wp, v.suffix.data(), v.suffix.size());
+    wp += v.suffix.size();
+    g_vcd.out_len = static_cast<size_t>(wp - g_vcd.iobuf);
 }
 
 // -- Producer / sink seam --
@@ -2671,15 +2683,21 @@ void vcd_rec_change(uint32_t idx, const uint64_t* planes, uint32_t nwords) {
 // Diff variable `i` against its shadow; if changed (or `force`), append a change
 // record and update the shadow. Returns true when a record was appended.
 bool vcd_scan_var(uint32_t i, bool force) {
-    VcdVar&      v     = g_vcd.vars[i];
-    uint64_t*    scan  = g_vcd.scratch.data();
-    const size_t bytes = static_cast<size_t>(3) * v.nwords * 8;
-    vcd_read_planes(v, scan);
-    if (!force && v.seen && std::memcmp(scan, v.shadow.data(), bytes) == 0) {
+    VcdVar&  v  = g_vcd.vars[i];
+    uint8_t* sh = v.shadow.data();
+    // Cheap diff on the raw slot bytes (no plane assembly). Assemble the planes
+    // only when the value actually changed.
+    if (!force && v.seen && std::memcmp(v.mm, sh, v.mm_bytes) == 0
+        && (v.z_bytes == 0 || std::memcmp(v.z, sh + v.mm_bytes, v.z_bytes) == 0)) {
         return false;
     }
+    uint64_t* scan = g_vcd.scratch.data();
+    vcd_read_planes(v, scan);
     vcd_rec_change(i, scan, v.nwords);
-    std::memcpy(v.shadow.data(), scan, bytes);
+    std::memcpy(sh, v.mm, v.mm_bytes);
+    if (v.z_bytes != 0) {
+        std::memcpy(sh + v.mm_bytes, v.z, v.z_bytes);
+    }
     v.seen = true;
     return true;
 }
@@ -2847,7 +2865,10 @@ static void vcd_register(std::string_view ref, uint32_t width, uint32_t flags, c
     v.four_state = (flags & RT_VCD_FLAG_FOUR_STATE) != 0;
     v.narrow     = (flags & RT_VCD_FLAG_NARROW) != 0;
     v.idcode     = vcd_idcode(g_vcd.next_id++);
-    v.shadow.assign(static_cast<size_t>(3) * v.nwords, 0);
+    v.mm_bytes   = v.narrow ? (width + 7) / 8 : (2 * width + 7) / 8;
+    v.z_bytes    = z != nullptr ? (width + 7) / 8 : 0;
+    v.shadow.assign(static_cast<size_t>(v.mm_bytes) + v.z_bytes, 0);
+    v.suffix     = width == 1 ? v.idcode + "\n" : " " + v.idcode + "\n";
     if (v.nwords > g_vcd.max_nwords) {
         g_vcd.max_nwords = v.nwords;
     }
@@ -2970,7 +2991,8 @@ extern "C" void rt_vcd_flush(uint64_t tick) {
             }
             scan[2 * nw - 1] &= vcd_topmask(v.width);
             vcd_rec_change(i, scan, nw);
-            std::memcpy(v.shadow.data(), scan, static_cast<size_t>(3) * nw * 8);
+            // The shadow (raw slot) is left stale: $dumpon re-arms a full dump
+            // (force_all), which re-emits every variable and rewrites the shadow.
             v.seen         = true;
             g_vcd.epoch[i] = 0;
         }
