@@ -144,6 +144,56 @@ TEST_CASE("narrow unsigned and signed runtime indices agree with iverilog") {
     CHECK(run_capture(src) == "nu 0\nnu2 1\nns 0\nns2 0\nnips 6\n");
 }
 
+// LRM 11.5.1: a dynamic bit/part select out of the vector bounds reads x and
+// writes nothing; a partially out-of-range select applies the rule bit-by-bit;
+// an x/z index is wholly out of range. All lines cross-checked against iverilog.
+TEST_CASE("out-of-bounds dynamic selects read x and write nothing (LRM 11.5.1)") {
+    constexpr std::string_view src = R"(
+        module t;
+            logic [7:0] v;
+            logic [3:0] p;
+            logic       b;
+            logic [3:0] xi;
+            integer     i;
+            initial begin
+                // Reads: fully / partially out of range yield x.
+                v = 8'hA5;
+                i = 9;  b = v[i];      $display("%b", b);        // x
+                i = -1; b = v[i];      $display("%b", b);        // x
+                i = 6;  p = v[i +: 4]; $display("%b", p);        // xx10 (v[7:6]=10)
+                i = 20; p = v[i +: 4]; $display("%b", p);        // xxxx
+                i = -2; p = v[i +: 4]; $display("%b", p);        // 01xx (v[1:0]=01)
+                // Writes: out-of-range bits are not modified.
+                v = 8'hFF; i = 9;  v[i]      = 1'b0; $display("%h", v);  // ff
+                v = 8'h00; i = 6;  v[i +: 4] = 4'hF; $display("%h", v);  // c0
+                v = 8'h33; i = 20; v[i +: 4] = 4'hF; $display("%h", v);  // 33
+                // An x/z index is wholly out of range: read x, write no-op.
+                xi = 4'bxx01;
+                v = 8'hA5; p = v[xi +: 4];         $display("%b", p);    // xxxx
+                v = 8'h5A; v[xi +: 4] = 4'hF;      $display("%h", v);    // 5a
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "x\nx\nxx10\nxxxx\n01xx\nff\nc0\n33\nxxxx\n5a\n");
+}
+
+// The out-of-bounds rule also applies to nonblocking writes: the deferred merge
+// must mask off the out-of-range bits. Cross-checked against iverilog.
+TEST_CASE("out-of-bounds nonblocking writes affect only in-range bits") {
+    constexpr std::string_view src = R"(
+        module t;
+            logic [7:0] v;
+            integer     i;
+            initial begin
+                v = 8'hFF; i = 9;  v[i]      <= 1'b0;  #1 $display("%h", v);  // ff
+                v = 8'h00; i = 6;  v[i +: 4] <= 4'hF;  #1 $display("%h", v);  // c0
+                v = 8'h33; i = 20; v[i +: 4] <= 4'hF;  #1 $display("%h", v);  // 33
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "ff\nc0\n33\n");
+}
+
 // Wide (>64-bit) constants built during lowering (repeat counters, ++ step,
 // unary-minus zero) used to read out of bounds in InternPool::put_int and
 // produce garbage planes. Cross-checked against iverilog.

@@ -3636,11 +3636,9 @@ private:
         // is a runtime value in declared-range coordinates. The IR carries the
         // low-bit LSB offset: that is the translated base offset, minus width-1
         // when the selection extends away from the LSB end (`-:` on a
-        // little-endian range, `+:` on a big-endian one).
-        //
-        // TODO: an out-of-range or X/Z base is not bounds-checked. LRM 11.5.1: an
-        // out-of-range read yields X and such a write is a no-op. This inherits the
-        // dynamic BitSelect gap and shifts by the raw value.
+        // little-endian range, `+:` on a big-endian one). An out-of-range or X/Z
+        // base is bounds-checked in the backend per LRM 11.5.1 (out-of-range read
+        // -> X, write -> no-op; partial selects handled bit-by-bit).
         const auto    width = static_cast<uint32_t>(const_uint(rs.right()));
         const bool    down  = rs.getSelectionKind() == RangeSelectionKind::IndexedDown;
         const int32_t bias  = down == range.isDescending() ? static_cast<int32_t>(width) - 1 : 0;

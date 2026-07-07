@@ -269,6 +269,11 @@ struct LValue {
     llvm::Value* bit_off = nullptr;
     // Selected width in bits (== store_width for a whole-storage target).
     uint32_t width = 0;
+    // Storage-width in-range mask for a bounds-checked dynamic bit/part select
+    // (LRM 11.5.1): 1 for each selected bit that is in range. Null when no bounds
+    // check applies (whole storage, or a constant in-range select). A read forces
+    // x/0 outside it and a write is restricted to it.
+    llvm::Value* range_mask = nullptr;
     // A module signal (not a frame local): its store services wait queues. `sig`
     // is meaningful only then.
     bool   is_signal = false;
@@ -3341,12 +3346,15 @@ private:
                     // String indexing lowers to StrGetc / StrPutc in the frontend.
                     throw BackendError{ "internal: string value in bit_select" };
                 }
-                // TODO: an X/Z or out-of-range index uses only its must bits,
-                // silently selecting the wrong bit. LRM: a read with an unknown /
-                // out-of-range index yields X; such a write is a no-op.
-                llvm::Value* idx = cast(must_of(value_of(p.binary.r)), 32, false);
-                lv.bit_off       = b_.CreateAdd(lv.bit_off, idx);
-                lv.width         = 1;
+                // A bit-select is bounds-checked against its container (LRM
+                // 11.5.1): an out-of-range or x/z index reads x / writes nothing.
+                const Plane        idxp   = value_of(p.binary.r);
+                llvm::Value* const cbase  = lv.bit_off != nullptr ? lv.bit_off : b_.getInt32(0);
+                const uint32_t     cwidth = lv.width;
+                llvm::Value*       idx    = cast(must_of(idxp), 32, false);
+                lv.bit_off = lv.bit_off != nullptr ? b_.CreateAdd(lv.bit_off, idx) : idx;
+                lv.width   = 1;
+                set_select_bounds(lv, cbase, cwidth, 1, any_unknown(idxp));
                 set_lvalue(i, lv);
                 return;
             }
@@ -3362,13 +3370,18 @@ private:
                 // Runtime low-bit offset, constant width: add the offset to the
                 // lvalue's bit_off exactly as a dynamic BitSelect does, then the
                 // shared load/store path shifts/masks by the runtime bit_off.
-                // TODO: an X/Z or out-of-range offset uses only its must bits and is
-                // not bounds-checked (LRM 11.5.1: OOB read -> X, write -> no-op).
-                LValue       lv  = lvalue_of(p.op_extra.op);
-                const auto   dps = ir_->extra_data<DynPartSelect>(p.op_extra.extra);
-                llvm::Value* off = cast(must_of(value_of(dps.offset)), 32, false);
-                lv.bit_off       = b_.CreateAdd(lv.bit_off, off);
-                lv.width         = dps.width;
+                // Bounds-checked against its container (LRM 11.5.1): bits of the
+                // selection that fall outside read x / are not written; a wholly
+                // out-of-range or x/z offset makes the whole select out of range.
+                LValue             lv     = lvalue_of(p.op_extra.op);
+                const auto         dps    = ir_->extra_data<DynPartSelect>(p.op_extra.extra);
+                const Plane        offp   = value_of(dps.offset);
+                llvm::Value* const cbase  = lv.bit_off != nullptr ? lv.bit_off : b_.getInt32(0);
+                const uint32_t     cwidth = lv.width;
+                llvm::Value*       off    = cast(must_of(offp), 32, false);
+                lv.bit_off = lv.bit_off != nullptr ? b_.CreateAdd(lv.bit_off, off) : off;
+                lv.width   = dps.width;
+                set_select_bounds(lv, cbase, cwidth, dps.width, any_unknown(offp));
                 set_lvalue(i, lv);
                 return;
             }
@@ -3992,6 +4005,13 @@ private:
             if (lv.width == w && is_zero_const(lv.bit_off)) {
                 return two_val(v);
             }
+            // A bounds-checked select aligns poison-free and reads 0 outside range
+            // (LRM 11.5.1: an out-of-range read of a 2-state value is 0).
+            if (lv.range_mask != nullptr) {
+                llvm::Value* shifted = align_shl(v, b_.CreateNeg(lv.bit_off), w);
+                llvm::Value* valid   = align_shl(lv.range_mask, b_.CreateNeg(lv.bit_off), w);
+                return two_val(cast(b_.CreateAnd(shifted, valid), lv.width, false));
+            }
             llvm::Value* off = cast(lv.bit_off, w, false);
             return two_val(cast(b_.CreateLShr(v, off), lv.width, false));
         }
@@ -4002,9 +4022,22 @@ private:
         if (lv.width == w && is_zero_const(lv.bit_off)) {
             return { mm, z };
         }
+        const Plane full = { mm, z };
+        // A bounds-checked select aligns poison-free and forces x on the bits that
+        // fall outside the vector (LRM 11.5.1: must=0, may=1, z=0).
+        if (lv.range_mask != nullptr) {
+            llvm::Value* down  = b_.CreateNeg(lv.bit_off);
+            llvm::Value* must  = align_shl(must_of(full), down, w);
+            llvm::Value* may   = align_shl(may_of(full), down, w);
+            llvm::Value* zp    = align_shl(z, down, w);
+            llvm::Value* valid = align_shl(lv.range_mask, down, w);
+            llvm::Value* oob   = b_.CreateNot(valid);
+            return packed(cast(b_.CreateAnd(must, valid), lv.width, false),
+                          cast(b_.CreateOr(may, oob), lv.width, false),
+                          cast(b_.CreateAnd(zp, valid), lv.width, false));
+        }
         // Bit/part select: unpack, shift each plane down by the offset, re-pack.
-        const Plane  full = { mm, z };
-        llvm::Value* off  = cast(lv.bit_off, w, false);
+        llvm::Value* off = cast(lv.bit_off, w, false);
         return packed(cast(b_.CreateLShr(must_of(full), off), lv.width, false),
                       cast(b_.CreateLShr(may_of(full), off), lv.width, false),
                       cast(b_.CreateLShr(z, off), lv.width, false));
@@ -4029,12 +4062,9 @@ private:
                 b_.CreateStore(v, mp);
                 return;
             }
-            llvm::Value* old   = b_.CreateLoad(int_ty(s_width), mp);
-            llvm::Value* off   = cast(lv.bit_off, s_width, false);
-            llvm::Value* mask  = b_.CreateShl(cast(ones(lv.width), s_width, false), off);
-            llvm::Value* merged =
-              merge_bits(old, cast(v, s_width, false), off, mask, b_.CreateNot(mask));
-            b_.CreateStore(merged, mp);
+            llvm::Value* old  = b_.CreateLoad(int_ty(s_width), mp);
+            llvm::Value* mask = store_mask(lv, s_width);
+            b_.CreateStore(merge_sel(old, v, lv, s_width, mask), mp);
             return;
         }
 
@@ -4058,12 +4088,10 @@ private:
         const Plane  old = { b_.CreateLoad(int_ty(2 * s_width), mp),
                              lv.has_z ? static_cast<llvm::Value*>(b_.CreateLoad(int_ty(s_width), zp))
                                       : zero(s_width) };
-        llvm::Value* off   = cast(lv.bit_off, s_width, false);
-        llvm::Value* mask  = b_.CreateShl(cast(ones(lv.width), s_width, false), off);
-        llvm::Value* nmask = b_.CreateNot(mask);
-        llvm::Value* must  = merge_bits(must_of(old), cast(must_of(rhs), s_width, false), off, mask, nmask);
-        llvm::Value* may   = merge_bits(may_of(old), cast(may_of(rhs), s_width, false), off, mask, nmask);
-        llvm::Value* z     = merge_bits(old.z, cast(rhs.z, s_width, false), off, mask, nmask);
+        llvm::Value* mask = store_mask(lv, s_width);
+        llvm::Value* must = merge_sel(must_of(old), must_of(rhs), lv, s_width, mask);
+        llvm::Value* may  = merge_sel(may_of(old), may_of(rhs), lv, s_width, mask);
+        llvm::Value* z    = merge_sel(old.z, rhs.z, lv, s_width, mask);
         b_.CreateStore(packed(must, may, z).mm, mp);
         if (lv.has_z) {
             b_.CreateStore(z, zp);
@@ -4087,9 +4115,8 @@ private:
             } else {
                 llvm::Value* maskp = shadow_ptr(s.sh_mask_field);
                 llvm::Value* old   = b_.CreateLoad(int_ty(s.width), mp);
-                llvm::Value* off   = cast(lv.bit_off, s.width, false);
-                llvm::Value* bmask = b_.CreateShl(cast(ones(lv.width), s.width, false), off);
-                b_.CreateStore(merge_bits(old, cast(v, s.width, false), off, bmask, b_.CreateNot(bmask)), mp);
+                llvm::Value* bmask = store_mask(lv, s.width);
+                b_.CreateStore(merge_sel(old, v, lv, s.width, bmask), mp);
                 llvm::Value* cur = b_.CreateLoad(int_ty(s.width), maskp);
                 b_.CreateStore(b_.CreateOr(cur, bmask), maskp);
             }
@@ -4116,12 +4143,10 @@ private:
             const Plane  old   = { b_.CreateLoad(int_ty(2 * s.width), mp),
                                    s.has_z ? static_cast<llvm::Value*>(b_.CreateLoad(int_ty(s.width), zp))
                                            : zero(s.width) };
-            llvm::Value* off   = cast(lv.bit_off, s.width, false);
-            llvm::Value* bmask = b_.CreateShl(cast(ones(lv.width), s.width, false), off);
-            llvm::Value* nmask = b_.CreateNot(bmask);
-            llvm::Value* must  = merge_bits(must_of(old), cast(must_of(rhs), s.width, false), off, bmask, nmask);
-            llvm::Value* may   = merge_bits(may_of(old), cast(may_of(rhs), s.width, false), off, bmask, nmask);
-            llvm::Value* z     = merge_bits(old.z, cast(rhs.z, s.width, false), off, bmask, nmask);
+            llvm::Value* bmask = store_mask(lv, s.width);
+            llvm::Value* must  = merge_sel(must_of(old), must_of(rhs), lv, s.width, bmask);
+            llvm::Value* may   = merge_sel(may_of(old), may_of(rhs), lv, s.width, bmask);
+            llvm::Value* z     = merge_sel(old.z, rhs.z, lv, s.width, bmask);
             b_.CreateStore(packed(must, may, z).mm, mp);
             if (s.has_z) {
                 b_.CreateStore(z, zp);
@@ -4161,8 +4186,10 @@ private:
             // TODO: element width > 64 needs a larger staging buffer (mm word > i128).
             throw BackendError{ "nonblocking write to an unpacked array element wider than 64 bits is not supported" };
         }
-        llvm::Value* off    = cast(lv.bit_off, W, false);
-        llvm::Value* mask_w = b_.CreateShl(cast(ones(lv.width), W, false), off);
+        // A bounds-checked select restricts the mask to the in-range bits and
+        // aligns the value poison-free (LRM 11.5.1); a whole/constant target uses
+        // the naive shifted mask.
+        llvm::Value* mask_w = store_mask(lv, W);
         // A narrow 2-state element stages the bare iW value and mask (no z); the
         // runtime commit's masked byte merge is width-agnostic, so only the byte
         // count differs. A packed element stages the i(2W) must|may word.
@@ -4170,14 +4197,14 @@ private:
         llvm::Value* mm_msk;
         uint32_t     mm_bytes;
         if (lv.narrow) {
-            mm_val   = b_.CreateShl(cast(must_of(rhs), W, false), off);
+            mm_val   = place_val(lv, must_of(rhs), W);
             mm_msk   = mask_w;
             mm_bytes = (W + 7) / 8;
         } else {
             rhs                 = to_four(rhs);
-            llvm::Value* must   = b_.CreateShl(cast(must_of(rhs), W, false), off);
-            llvm::Value* may    = b_.CreateShl(cast(may_of(rhs), W, false), off);
-            llvm::Value* zval   = b_.CreateShl(cast(rhs.z, W, false), off);
+            llvm::Value* must   = place_val(lv, must_of(rhs), W);
+            llvm::Value* may    = place_val(lv, may_of(rhs), W);
+            llvm::Value* zval   = place_val(lv, rhs.z, W);
             mm_val   = packed(must, may, zval).mm;          // i2W: must | (may << W)
             mm_msk   = packed(mask_w, mask_w, zero(W)).mm;  // i2W: mask in both halves
             mm_bytes = (2 * W + 7) / 8;
@@ -4199,7 +4226,7 @@ private:
         uint32_t     z_bytes = 0;
         if (lv.has_z) {
             // has_z implies a packed (non-narrow) element, so rhs is 4-state here.
-            llvm::Value* zval = b_.CreateShl(cast(rhs.z, W, false), off);
+            llvm::Value* zval = place_val(lv, rhs.z, W);
             zvp = b_.CreateStructGEP(ty, st, 2);
             zkp = b_.CreateStructGEP(ty, st, 3);
             b_.CreateAlignedStore(zval, zvp, a1);
@@ -4262,6 +4289,94 @@ private:
                             llvm::Value* nmask) {
         llvm::Value* shifted = b_.CreateAnd(b_.CreateShl(ins, off), mask);
         return b_.CreateOr(b_.CreateAnd(old, nmask), shifted);
+    }
+
+    // -- Dynamic bit/part-select bounds (LRM 11.5.1) --
+    //
+    // A dynamic bit-select or indexed part-select can address bits outside the
+    // vector: an out-of-range read yields x (0 for a 2-state slot) and an
+    // out-of-range write is a no-op; a partially out-of-range select keeps the
+    // in-range bits and applies the rule bit-by-bit to the rest. An x/z index
+    // makes the whole select out of range. The raw run-time offset can be any
+    // i32 (negative, or past the width), so all masking / shifting below is
+    // poison-free: shift amounts are always clamped below the shifted type's
+    // width. The LValue's `range_mask` (storage-width) marks the in-range bits.
+
+    // Low `n` bits set: (1 << n) - 1 for n in [0, W]; poison-free (n >= W -> all
+    // ones). `n` is an i32.
+    llvm::Value* low_ones(uint32_t W, llvm::Value* n) {
+        llvm::Value* ge   = b_.CreateICmpUGE(n, b_.getInt32(W));
+        llvm::Value* safe = cast(b_.CreateSelect(ge, b_.getInt32(0), n), W, false);
+        llvm::Value* one  = llvm::ConstantInt::get(int_ty(W), 1);
+        llvm::Value* m    = b_.CreateSub(b_.CreateShl(one, safe), one);
+        return b_.CreateSelect(ge, ones(W), m);
+    }
+
+    // W-bit mask with bits [lo, hi) set (lo <= hi, both i32 in [0, W]).
+    llvm::Value* range_bits(uint32_t W, llvm::Value* lo, llvm::Value* hi) {
+        return b_.CreateAnd(low_ones(W, hi), b_.CreateNot(low_ones(W, lo)));
+    }
+
+    // `v` shifted by the signed i32 `s`: left when s >= 0, right by |s| when
+    // s < 0. Poison-free and saturating — |s| >= W yields 0 (every bit leaves the
+    // W-bit word), the correct behavior when aligning an out-of-range selection.
+    llvm::Value* align_shl(llvm::Value* v, llvm::Value* s, uint32_t W) {
+        llvm::Value* neg  = b_.CreateICmpSLT(s, b_.getInt32(0));
+        llvm::Value* amt  = b_.CreateSelect(neg, b_.CreateNeg(s), s);
+        llvm::Value* ovf  = b_.CreateICmpUGE(amt, b_.getInt32(W));
+        llvm::Value* samt = cast(b_.CreateSelect(ovf, b_.getInt32(0), amt), W, false);
+        llvm::Value* pick = b_.CreateSelect(neg, b_.CreateLShr(v, samt), b_.CreateShl(v, samt));
+        return b_.CreateSelect(ovf, zero(W), pick);
+    }
+
+    // Signed min / max on i64 (for clamping a select's range to its container).
+    llvm::Value* smin(llvm::Value* a, llvm::Value* b) { return b_.CreateSelect(b_.CreateICmpSLT(a, b), a, b); }
+    llvm::Value* smax(llvm::Value* a, llvm::Value* b) { return b_.CreateSelect(b_.CreateICmpSGT(a, b), a, b); }
+
+    // Set `lv.range_mask` for a dynamic bit/part select, per LRM 11.5.1. The
+    // select covers storage bits [lv.bit_off, lv.bit_off + selw); the in-range
+    // bits are that range clamped to the container [cbase, cbase + cwidth) (the
+    // whole slot for a direct select, the inner select's span for a nested one).
+    // An x/z index (`idx_unknown`) makes every bit out of range.
+    void set_select_bounds(LValue& lv, llvm::Value* cbase, uint32_t cwidth, uint32_t selw,
+                           llvm::Value* idx_unknown) {
+        const uint32_t sw    = lv.store_width;
+        auto*          i64t  = int_ty(64);
+        llvm::Value*   base  = b_.CreateSExt(cbase, i64t);
+        llvm::Value*   end   = b_.CreateAdd(base, llvm::ConstantInt::get(i64t, cwidth));
+        llvm::Value*   off   = b_.CreateSExt(lv.bit_off, i64t);
+        llvm::Value*   lo    = smax(smin(off, end), base);
+        llvm::Value*   hi    = smax(smin(b_.CreateAdd(off, llvm::ConstantInt::get(i64t, selw)), end), base);
+        llvm::Value*   mask  = range_bits(sw, b_.CreateTrunc(lo, int_ty(32)), b_.CreateTrunc(hi, int_ty(32)));
+        lv.range_mask        = b_.CreateSelect(idx_unknown, zero(sw), mask);
+    }
+
+    // Storage-width write mask for a partial store: the range-restricted mask for
+    // a bounds-checked dynamic select, or the naive shifted mask otherwise.
+    llvm::Value* store_mask(const LValue& lv, uint32_t sw) {
+        if (lv.range_mask != nullptr) {
+            return lv.range_mask;
+        }
+        return b_.CreateShl(cast(ones(lv.width), sw, false), cast(lv.bit_off, sw, false));
+    }
+
+    // Align a select's iW value to its storage bit position (poison-free for a
+    // bounds-checked select, a plain left shift otherwise).
+    llvm::Value* place_val(const LValue& lv, llvm::Value* v_iw, uint32_t sw) {
+        llvm::Value* vW = cast(v_iw, sw, false);
+        if (lv.range_mask != nullptr) {
+            return align_shl(vW, lv.bit_off, sw);
+        }
+        return b_.CreateShl(vW, cast(lv.bit_off, sw, false));
+    }
+
+    // Merge one plane of a partial store: (old & ~mask) | (aligned ins & mask),
+    // with the alignment poison-free and the mask range-restricted for a
+    // bounds-checked dynamic select. `mask` is the shared store_mask(lv, sw).
+    llvm::Value* merge_sel(llvm::Value* old, llvm::Value* ins_iw, const LValue& lv, uint32_t sw,
+                           llvm::Value* mask) {
+        llvm::Value* placed = b_.CreateAnd(place_val(lv, ins_iw, sw), mask);
+        return b_.CreateOr(b_.CreateAnd(old, b_.CreateNot(mask)), placed);
     }
 
     static bool is_zero_const(llvm::Value* v) {
