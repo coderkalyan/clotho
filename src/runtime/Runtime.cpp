@@ -2514,6 +2514,31 @@ void vcd_shr(const uint64_t* src, uint32_t srcw, uint32_t shift, uint64_t* dst, 
 // `v.nwords` little-endian 64-bit words. The must|may plane is the packed i(2W)
 // slot field (bits [0,W) must, [W,2W) may); a narrow slot is a bare iW value.
 void vcd_read_planes(const VcdVar& v, uint64_t* out) {
+    if (v.nwords == 1) {
+        // Fast path for the common width <= 64: three word stores, no memset / no
+        // bignum shift. The 2W-bit slot is <= 128 bits, read once via __int128.
+        const uint64_t tm = vcd_topmask(v.width);
+        if (v.narrow) {
+            uint64_t val = 0;
+            std::memcpy(&val, v.mm, (v.width + 7) / 8);
+            val    = val & tm;
+            out[0] = val;   // must
+            out[1] = val;   // may == must
+            out[2] = 0;     // z
+            return;
+        }
+        unsigned __int128 mm = 0;
+        std::memcpy(&mm, v.mm, (2 * v.width + 7) / 8);
+        out[0] = static_cast<uint64_t>(mm) & tm;             // must (low W)
+        out[1] = static_cast<uint64_t>(mm >> v.width) & tm;  // may  (bits [W,2W))
+        uint64_t zz = 0;
+        if (v.z != nullptr) {
+            std::memcpy(&zz, v.z, (v.width + 7) / 8);
+            zz &= tm;
+        }
+        out[2] = zz;
+        return;
+    }
     const uint32_t w    = v.width;
     const uint32_t nw   = v.nwords;
     uint64_t*      must = out;
