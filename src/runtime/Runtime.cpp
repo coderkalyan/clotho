@@ -238,15 +238,15 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
                 field.append(str_data(s), str_len(s));
                 break;
             }
-            // A packed value: ceil(width/8) ASCII chars, most-significant first;
-            // a 0x00 byte prints as a space (matches iverilog). The minimal form
-            // (%0s) drops leading 0x00 bytes instead.
+            // A packed value: ASCII chars most-significant first. Leading 0x00
+            // bytes are never printed (LRM §21.2.1.7 — iverilog deviates and
+            // prints a space per leading NUL; the LRM text and the §21.2.1.1
+            // example are explicit, so LRM wins). An embedded/trailing 0x00
+            // prints as a space (LRM silent; matches iverilog).
             {
                 uint32_t k = (w + 7) / 8;
-                if (spec.has_width && spec.width == 0) {
-                    while (k > 0 && ((val >> (8 * (k - 1))) & 0xff) == 0) {
-                        --k;
-                    }
+                while (k > 0 && ((val >> (8 * (k - 1))) & 0xff) == 0) {
+                    --k;
                 }
                 while (k-- > 0) {
                     const auto c = static_cast<char>((val >> (8 * k)) & 0xff);

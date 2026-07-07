@@ -168,6 +168,20 @@ TEST_CASE("bare-argument defaults, radix variants, and empty arguments") {
     )") == "  7\n101x0\n567\n0ef\n0ef\ne1: e2\n");
 }
 
+// Leading NUL bytes of a packed %s operand are never printed (LRM §21.2.1.7
+// and the §21.2.1.1 example; iverilog deviates).
+TEST_CASE("%s drops leading NUL bytes of a packed operand") {
+    CHECK(run_capture(R"(
+        module m;
+            initial begin
+                $display("%s is ascii value for 101", 101);
+                $display(":%s:", 32'h616263);
+                $display(":%5s:", 32'h61);
+            end
+        endmodule
+    )") == "e is ascii value for 101\n:abc:\n:    a:\n");
+}
+
 // %m splices the static hierarchical name of the invoking scope: named block,
 // task, and instance path under a multi-top design (LRM §21.2.1.5).
 TEST_CASE("%m reports the invoking scope") {
