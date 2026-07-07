@@ -1,6 +1,9 @@
 #include <doctest/doctest.h>
 
+#include <array>
+#include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <span>
 #include <string>
@@ -2862,4 +2865,248 @@ TEST_CASE("NBA commits classify x/z edges and z-only changes the same way") {
         endmodule
     )";
     CHECK(run_capture(src) == "2 1\n");
+}
+
+
+// -- Real (floating-point) backend tests --
+//
+// The frontend does not lower real expressions yet, so these build the process
+// IR by hand and observe results through integer $display of converted values.
+
+namespace {
+
+// JIT-run a hand-built module and capture its stdout.
+std::string run_module(ir::Module& m) {
+    std::FILE* tmp = std::tmpfile();
+    REQUIRE(tmp != nullptr);
+
+    std::fflush(stdout);
+    const int saved = dup(fileno(stdout));
+    dup2(fileno(tmp), fileno(stdout));
+
+    ir::run_jit(m);
+
+    std::fflush(stdout);
+    dup2(saved, fileno(stdout));
+    close(saved);
+
+    std::rewind(tmp);
+    std::string out;
+    char        buf[256];
+    size_t      n;
+    while ((n = std::fread(buf, 1, sizeof(buf), tmp)) > 0) {
+        out.append(buf, n);
+    }
+    std::fclose(tmp);
+
+    return out;
+}
+
+// A 32-bit signed two-state type (int).
+ir::Ref int_type(ir::InternPool& pool) {
+    return pool.put(
+      ir::Type{ .kind = ir::Type::Kind::PackedArray, .is_signed = true, .element = pool.bit_type, .left = 31, .right = 0 });
+}
+
+constexpr auto kLoc = static_cast<ir::SourceLoc>(0);
+
+// Append an initial process that %0d-displays `v` (an int-typed value in `b`).
+void display_int(ir::Builder& b, ir::Index v) {
+    const std::array<ir::Index, 1> args{ v };
+    b.display("%0d", true, args, kLoc);
+}
+
+} // namespace
+
+TEST_CASE("real arithmetic, rounding, and truncation") {
+    ir::Module  m;
+    ir::Builder b(m.pool);
+    const ir::Ref i32  = int_type(m.pool);
+    const auto    real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
+    const auto    ftoi = [&](ir::Index v) { return b.float_cvt(ir::Inst::Tag::FtoI, v, i32, kLoc); };
+
+    // (2.0 * 1.25 + 0.5) == 3.0.
+    const ir::Index prod = b.binary(ir::Inst::Tag::FMul, real(2.0), real(1.25), kLoc);
+    const ir::Index sum  = b.binary(ir::Inst::Tag::FAdd, prod, real(0.5), kLoc);
+    display_int(b, ftoi(sum));
+
+    // LRM 6.12.1: assignment conversion rounds half away from zero.
+    display_int(b, ftoi(real(2.5)));
+    display_int(b, ftoi(real(-1.5)));
+    // LRM 20.5: $rtoi truncates toward zero.
+    display_int(b, b.float_cvt(ir::Inst::Tag::FtoITrunc, real(-15.7), i32, kLoc));
+    display_int(b, b.float_cvt(ir::Inst::Tag::FtoITrunc, real(123.45), i32, kLoc));
+
+    // 2.0 ** -1 == 0.5 -> FPow with real operands; 0.5 rounds to 1.
+    const ir::Index p = b.binary(ir::Inst::Tag::FPow, real(2.0), real(-1.0), kLoc);
+    display_int(b, ftoi(p));
+
+    // FNeg keeps sign: -(2.5) rounds to -3.
+    display_int(b, ftoi(b.unary(ir::Inst::Tag::FNeg, real(2.5), kLoc)));
+
+    m.add_process(ir::Process{ ir::Activation::Initial, {}, false, kLoc, b.finish() });
+    CHECK(run_module(m) == "3\n3\n-2\n-15\n123\n1\n-3\n");
+}
+
+TEST_CASE("real compares are definite and NaN-correct") {
+    ir::Module  m;
+    ir::Builder b(m.pool);
+    // Widen the 1-bit compare result through an unsigned type (a signed resize
+    // would sign-extend 1'b1 to -1).
+    const ir::Ref u32 = m.pool.put(
+      ir::Type{ .kind = ir::Type::Kind::PackedArray, .element = m.pool.bit_type, .left = 31, .right = 0 });
+    const auto real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
+    const auto show = [&](ir::Index bit) { display_int(b, b.resize(bit, u32, kLoc)); };
+
+    const double    qnan = std::numeric_limits<double>::quiet_NaN();
+    const ir::Index nan  = b.constant(m.pool.put_real(m.pool.real_type, qnan), kLoc);
+
+    show(b.binary(ir::Inst::Tag::FEq, nan, nan, kLoc));         // 0: NaN == NaN is false
+    show(b.binary(ir::Inst::Tag::FNe, nan, nan, kLoc));         // 1: NaN != NaN is true
+    show(b.binary(ir::Inst::Tag::FLt, real(1.5), real(2.5), kLoc)); // 1
+    show(b.binary(ir::Inst::Tag::FGe, real(1.5), real(2.5), kLoc)); // 0
+    show(b.binary(ir::Inst::Tag::FEq, real(0.0), real(-0.0), kLoc)); // 1: +0.0 == -0.0
+
+    m.add_process(ir::Process{ ir::Activation::Initial, {}, false, kLoc, b.finish() });
+    CHECK(run_module(m) == "0\n1\n1\n0\n1\n");
+}
+
+TEST_CASE("real mux: definite select and the ambiguous-condition rule") {
+    ir::Module  m;
+    ir::Builder b(m.pool);
+    const ir::Ref i32  = int_type(m.pool);
+    const auto    real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
+    const auto    ftoi = [&](ir::Index v) { return b.float_cvt(ir::Inst::Tag::FtoI, v, i32, kLoc); };
+
+    // A definite-1 and a definite-0 1-bit condition.
+    const ir::Index c1 = b.constant(m.pool.put_int(m.pool.logic_type, 1), kLoc);
+    const ir::Index c0 = b.constant(m.pool.put_int(m.pool.logic_type, 0), kLoc);
+    // A 1-bit X condition: logic canonical planes are val, xz.
+    const std::array<uint8_t, 2> xbytes{ 0x01, 0x01 };
+    const ir::Index cx = b.constant(m.pool.put_value(m.pool.logic_type, xbytes), kLoc);
+
+    display_int(b, ftoi(b.select(c1, real(3.0), real(5.0), kLoc))); // 3
+    display_int(b, ftoi(b.select(c0, real(3.0), real(5.0), kLoc))); // 5
+    // LRM 11.4.11: ambiguous condition -> equal alternatives give that value,
+    // unequal alternatives give the real default 0.0.
+    display_int(b, ftoi(b.select(cx, real(3.0), real(3.0), kLoc))); // 3
+    display_int(b, ftoi(b.select(cx, real(3.0), real(5.0), kLoc))); // 0
+
+    m.add_process(ir::Process{ ir::Activation::Initial, {}, false, kLoc, b.finish() });
+    CHECK(run_module(m) == "3\n5\n3\n0\n");
+}
+
+TEST_CASE("real signal storage round-trips, defaults to 0.0, and wakes waiters") {
+    ir::Module      m;
+    const ir::Signal r = m.add_signal(ir::SignalInfo{ "r", m.pool.real_type, ir::SignalInfo::Direction::Internal });
+    const ir::Ref    i32 = int_type(m.pool);
+
+    // Watcher: @(r) $display("%0d", FtoI(r)).
+    {
+        ir::Builder     b(m.pool);
+        const ir::Index sig  = b.signal(r, kLoc);
+        const ir::Index load = b.unary(ir::Inst::Tag::Load, sig, kLoc);
+        display_int(b, b.float_cvt(ir::Inst::Tag::FtoI, load, i32, kLoc));
+        m.add_process(
+          ir::Process{ ir::Activation::Always, { { r, ir::Edge::Any } }, false, kLoc, b.finish() });
+    }
+
+    // Driver: default is 0.0 (2-state zero pattern), then blocking-store 2.25,
+    // then NBA-store 4.5 (commits after the active drain and wakes the watcher).
+    {
+        ir::Builder     b(m.pool);
+        const auto      real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
+        const ir::Index sig  = b.signal(r, kLoc);
+        const ir::Index ld0  = b.unary(ir::Inst::Tag::Load, sig, kLoc);
+        display_int(b, b.float_cvt(ir::Inst::Tag::FtoI, ld0, i32, kLoc)); // 0 (default 0.0)
+        b.binary(ir::Inst::Tag::Store, sig, real(2.25), kLoc);            // wakes watcher: 2
+        b.binary(ir::Inst::Tag::StoreNb, sig, real(4.5), kLoc);           // commits later: 5 (4.5 rounds)
+        m.add_process(ir::Process{ ir::Activation::Initial, {}, false, kLoc, b.finish() });
+    }
+
+    CHECK(run_module(m) == "0\n2\n5\n");
+}
+
+TEST_CASE("real bitcasts and integral conversions") {
+    ir::Module  m;
+    ir::Builder b(m.pool);
+    const ir::Ref i32 = int_type(m.pool);
+    const ir::Ref u64 = m.pool.put(
+      ir::Type{ .kind = ir::Type::Kind::PackedArray, .element = m.pool.bit_type, .left = 63, .right = 0 });
+    const auto real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
+
+    // $realtobits(1.0) is the IEEE-754 pattern of 1.0.
+    const ir::Index bits = b.float_cvt(ir::Inst::Tag::FBitcast, real(1.0), u64, kLoc);
+    display_int(b, bits); // 4607182418800017408
+
+    // $bitstoreal round-trip: pattern -> real -> FtoI.
+    const ir::Index back = b.float_cvt(ir::Inst::Tag::FBitcast, bits, m.pool.real_type, kLoc);
+    display_int(b, b.float_cvt(ir::Inst::Tag::FtoI, back, i32, kLoc)); // 1
+
+    // ItoF reads x/z bits as 0 (LRM 6.12.1): 8'b1x1x -> 8'b1010 -> 10.0.
+    const ir::Ref                logic8 = m.pool.put(
+      ir::Type{ .kind = ir::Type::Kind::PackedArray, .element = m.pool.logic_type, .left = 7, .right = 0 });
+    const std::array<uint8_t, 2> vbytes{ 0b1111, 0b0101 }; // val, xz planes
+    const ir::Index              vx = b.constant(m.pool.put_value(logic8, vbytes), kLoc);
+    const ir::Index              fv = b.float_cvt(ir::Inst::Tag::ItoF, vx, m.pool.real_type, kLoc);
+    display_int(b, b.float_cvt(ir::Inst::Tag::FtoI, fv, i32, kLoc)); // 10
+
+    // real <-> shortreal: FResize keeps the value for exactly-representable
+    // numbers; 3.5 survives the f32 round-trip.
+    const ir::Index sr  = b.float_cvt(ir::Inst::Tag::FResize, real(3.5), m.pool.shortreal_type, kLoc);
+    const ir::Index rr  = b.float_cvt(ir::Inst::Tag::FResize, sr, m.pool.real_type, kLoc);
+    display_int(b, b.float_cvt(ir::Inst::Tag::FtoI, rr, i32, kLoc)); // 4 (3.5 rounds away from zero)
+
+    m.add_process(ir::Process{ ir::Activation::Initial, {}, false, kLoc, b.finish() });
+    CHECK(run_module(m) == "4607182418800017408\n1\n10\n4\n");
+}
+
+TEST_CASE("real math ops lower to intrinsics and libm calls") {
+    ir::Module  m;
+    ir::Builder b(m.pool);
+    const ir::Ref i32  = int_type(m.pool);
+    const auto    real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
+    const auto    show = [&](ir::Index v) { display_int(b, b.float_cvt(ir::Inst::Tag::FtoI, v, i32, kLoc)); };
+    const auto    m1   = [&](ir::RealMathOp op, ir::Index x) {
+        const std::array<ir::Index, 1> a{ x };
+        return b.real_math(op, a, kLoc);
+    };
+    const auto m2 = [&](ir::RealMathOp op, ir::Index x, ir::Index y) {
+        const std::array<ir::Index, 2> a{ x, y };
+        return b.real_math(op, a, kLoc);
+    };
+
+    show(m1(ir::RealMathOp::Sqrt, real(9.0)));                  // 3
+    show(m1(ir::RealMathOp::Floor, real(2.9)));                 // 2
+    show(m1(ir::RealMathOp::Ceil, real(2.1)));                  // 3
+    show(m2(ir::RealMathOp::Pow, real(2.0), real(10.0)));       // 1024
+    show(m1(ir::RealMathOp::Exp, real(0.0)));                   // 1
+    show(m1(ir::RealMathOp::Ln, real(1.0)));                    // 0
+    show(m1(ir::RealMathOp::Log10, real(1000.0)));              // 3
+    show(m2(ir::RealMathOp::Hypot, real(3.0), real(4.0)));      // 5
+    show(m2(ir::RealMathOp::Atan2, real(0.0), real(1.0)));      // 0
+    // Pure-libm entries (no LLVM intrinsic): JIT symbol resolution risk.
+    show(m1(ir::RealMathOp::Tanh, real(0.0)));                  // 0
+    show(m1(ir::RealMathOp::Asinh, real(0.0)));                 // 0
+    show(m1(ir::RealMathOp::Acosh, real(1.0)));                 // 0
+
+    m.add_process(ir::Process{ ir::Activation::Initial, {}, false, kLoc, b.finish() });
+    CHECK(run_module(m) == "3\n2\n3\n1024\n1\n0\n3\n5\n0\n0\n0\n0\n");
+}
+
+TEST_CASE("real display marshals through rt_fwrite with %g / %f") {
+    ir::Module  m;
+    ir::Builder b(m.pool);
+    const auto real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
+
+    const std::array<ir::Index, 2> args{ real(3.6), real(0.25) };
+    b.display("%g %f", true, args, kLoc);
+
+    // A shortreal marshals by widening to double.
+    const ir::Index sr = b.float_cvt(ir::Inst::Tag::FResize, real(1.5), m.pool.shortreal_type, kLoc);
+    const std::array<ir::Index, 1> args2{ sr };
+    b.display("%g", true, args2, kLoc);
+
+    m.add_process(ir::Process{ ir::Activation::Initial, {}, false, kLoc, b.finish() });
+    CHECK(run_module(m) == "3.6 0.250000\n1.5\n");
 }

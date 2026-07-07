@@ -382,3 +382,18 @@ TEST_CASE("nonblocking write to an array element in a task defers") {
     )";
     CHECK(run_capture(src) == "a 00000000\nb de00be00\n");
 }
+
+TEST_CASE("a task with a 64-bit input formal does not overflow its frame") {
+    // Regression: an i128 must|may plane spilled into the coroutine frame made
+    // CoroSplit lay out fields past llvm.coro.size; the allocation must cover
+    // the over-alignment slack (coro.size + coro.align) or the heap corrupts.
+    const std::string out = run_capture(R"(
+        module t;
+            task automatic show(input reg [63:0] in);
+                $display("%0d", in);
+            endtask
+            initial show(64'd42);
+        endmodule
+    )");
+    CHECK(out == "42\n");
+}

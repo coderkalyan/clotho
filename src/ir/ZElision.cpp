@@ -256,6 +256,29 @@ struct Analysis {
                 case Inst::Tag::Lnot:
                     break;
 
+                // Real ops absorb z too: a real value carries no z plane and
+                // every float-tag lowering emits z = 0 (ItoF reads the must
+                // half; FtoI / FBitcast produce definite bits).
+                case Inst::Tag::FAdd:
+                case Inst::Tag::FSub:
+                case Inst::Tag::FMul:
+                case Inst::Tag::FDiv:
+                case Inst::Tag::FPow:
+                case Inst::Tag::FNeg:
+                case Inst::Tag::FEq:
+                case Inst::Tag::FNe:
+                case Inst::Tag::FLt:
+                case Inst::Tag::FLe:
+                case Inst::Tag::FGt:
+                case Inst::Tag::FGe:
+                case Inst::Tag::ItoF:
+                case Inst::Tag::FtoI:
+                case Inst::Tag::FtoITrunc:
+                case Inst::Tag::FBitcast:
+                case Inst::Tag::FResize:
+                case Inst::Tag::RealMath:
+                    break;
+
                 case Inst::Tag::Ret:
                     if (fn != nullptr && z_of(p.unary) != 0) {
                         mark(fn->result_z);

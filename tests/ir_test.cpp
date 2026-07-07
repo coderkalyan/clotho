@@ -1,7 +1,10 @@
 #include <doctest/doctest.h>
 
 #include <array>
+#include <bit>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -352,4 +355,98 @@ TEST_CASE("string instructions carry their operands and print") {
                                  "%7 = str_to_packed(%1 -> bit)\n"
                                  "%8 = str_cmp(%1, %2)\n";
     CHECK(toString(ir) == expected);
+}
+
+TEST_CASE("real / shortreal types intern with float layouts") {
+    InternPool pool;
+
+    CHECK(pool.real_type != pool.shortreal_type);
+    CHECK(pool.is_float(pool.real_type));
+    CHECK(pool.is_float(pool.shortreal_type));
+    CHECK(!pool.is_float(pool.bit_type));
+
+    // LRM 6.12: real is an IEEE-754 double, shortreal a float; both 2-state.
+    const Layout r = pool.layout(pool.real_type);
+    CHECK(r.domain == Domain::Two);
+    CHECK(r.width == 64);
+    CHECK(r.byte_count == 8);
+
+    const Layout s = pool.layout(pool.shortreal_type);
+    CHECK(s.domain == Domain::Two);
+    CHECK(s.width == 32);
+    CHECK(s.byte_count == 4);
+}
+
+TEST_CASE("real values intern by IEEE-754 bit pattern") {
+    InternPool pool;
+
+    const Ref a = pool.put_real(pool.real_type, 3.25);
+    const Ref b = pool.put_real(pool.real_type, 3.25);
+    const Ref c = pool.put_real(pool.real_type, -3.25);
+    CHECK(a == b); // bit-identical -> deduplicated
+    CHECK(a != c);
+
+    const std::span<const uint8_t> bytes = pool.bytes(a);
+    REQUIRE(bytes.size() == 8);
+    uint64_t pat = 0;
+    std::memcpy(&pat, bytes.data(), 8);
+    CHECK(pat == std::bit_cast<uint64_t>(3.25));
+
+    // -0.0 and +0.0 compare equal as doubles but are distinct bit patterns,
+    // and interning is pattern-based.
+    CHECK(pool.put_real(pool.real_type, 0.0) != pool.put_real(pool.real_type, -0.0));
+
+    // NaN interning is stable: the same payload dedups to the same Ref.
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    CHECK(pool.put_real(pool.real_type, nan) == pool.put_real(pool.real_type, nan));
+
+    // Same numeric value under different types stays distinct.
+    CHECK(pool.put_real(pool.real_type, 1.5) != pool.put_real(pool.shortreal_type, 1.5));
+}
+
+TEST_CASE("shortreal values round to nearest float on interning") {
+    InternPool pool;
+
+    // 0.1 is not exactly representable; the pattern must be float(0.1), not a
+    // truncated double (LRM 20.5 NOTE 1: round to nearest valid representation).
+    const Ref v = pool.put_real(pool.shortreal_type, 0.1);
+    const std::span<const uint8_t> bytes = pool.bytes(v);
+    REQUIRE(bytes.size() == 4);
+    uint32_t pat = 0;
+    std::memcpy(&pat, bytes.data(), 4);
+    CHECK(pat == std::bit_cast<uint32_t>(0.1f));
+}
+
+TEST_CASE("float tags round-trip through builder, payload_kind, and operands") {
+    InternPool pool;
+    Builder    b(pool);
+    const auto l = static_cast<SourceLoc>(0);
+
+    const Index x = b.constant(pool.put_real(pool.real_type, 1.5), l);
+    const Index y = b.constant(pool.put_real(pool.real_type, 2.5), l);
+
+    const Index sum = b.binary(Inst::Tag::FAdd, x, y, l);
+    const Index neg = b.unary(Inst::Tag::FNeg, sum, l);
+    const Index cvt = b.float_cvt(Inst::Tag::FtoI, neg, pool.bit_type, l);
+    const std::array<Index, 2> margs{ x, y };
+    const Index                pw = b.real_math(RealMathOp::Pow, margs, l);
+    b.unary(Inst::Tag::Ret, cvt, l);
+    b.unary(Inst::Tag::Ret, pw, l);
+
+    const Ir ir = b.finish();
+    CHECK(payload_kind(ir.tag(sum)) == Inst::PayloadKind::Binary);
+    CHECK(payload_kind(ir.tag(neg)) == Inst::PayloadKind::Unary);
+    CHECK(payload_kind(ir.tag(cvt)) == Inst::PayloadKind::OpType);
+    CHECK(payload_kind(ir.tag(pw)) == Inst::PayloadKind::RealMath);
+
+    CHECK(ir.payload(cvt).op_type.type == pool.bit_type);
+
+    const auto info = ir.extra_data<RealMathInfo>(ir.payload(pw).extra);
+    CHECK(info.op == static_cast<uint32_t>(RealMathOp::Pow));
+
+    std::array<Index, 3> scratch;
+    const auto           ops = ir.operands(pw, scratch);
+    REQUIRE(ops.size() == 2);
+    CHECK(ops[0] == x);
+    CHECK(ops[1] == y);
 }

@@ -51,6 +51,17 @@ Index Builder::resize(Index op, Ref type, SourceLoc loc) {
     return emit({ Inst::Tag::Resize, Inst::Payload{ .op_type = { op, type } } }, loc);
 }
 
+Index Builder::float_cvt(Inst::Tag tag, Index op, Ref type, SourceLoc loc) {
+    return emit({ tag, Inst::Payload{ .op_type = { op, type } } }, loc);
+}
+
+Index Builder::real_math(RealMathOp op, std::span<const Index> args, SourceLoc loc) {
+    const ExtraSlice slice = add_slice(args);
+    const ExtraIndex extra = add_extra(RealMathInfo{ static_cast<uint32_t>(op), slice });
+
+    return emit({ Inst::Tag::RealMath, Inst::Payload{ .extra = extra } }, loc);
+}
+
 Index Builder::repl(Index value, uint32_t count, SourceLoc loc) {
     return emit({ Inst::Tag::Repl, Inst::Payload{ .repl = { value, count } } }, loc);
 }

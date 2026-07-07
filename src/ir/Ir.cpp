@@ -21,6 +21,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::RedOr:
         case T::RedXor:
         case T::Lnot:
+        case T::FNeg:
         case T::Ret:
         case T::Delay:
         case T::Fclose:
@@ -62,10 +63,26 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::StrGetc:
         case T::StrCmp:
         case T::StrICmp:
+        case T::FAdd:
+        case T::FSub:
+        case T::FMul:
+        case T::FDiv:
+        case T::FPow:
+        case T::FEq:
+        case T::FNe:
+        case T::FLt:
+        case T::FLe:
+        case T::FGt:
+        case T::FGe:
             return K::Binary;
 
         case T::Resize:
         case T::StrToPacked:
+        case T::ItoF:
+        case T::FtoI:
+        case T::FtoITrunc:
+        case T::FBitcast:
+        case T::FResize:
             return K::OpType;
         case T::Repl:
             return K::Repl;
@@ -86,6 +103,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::Sformatf;
         case T::Scanf:
             return K::Scanf;
+        case T::RealMath:
+            return K::RealMath;
         case T::TimeFormat:
             return K::TimeFormat;
         case T::Finish:
@@ -203,6 +222,13 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
             // scanf: the output lvalue operands live in the ScanfInfo record; the
             // format bytes and the source operand are read directly.
             const auto info = extra_data<ScanfInfo>(p.extra);
+            return index_slice(info.args);
+        }
+
+        case Inst::PayloadKind::RealMath: {
+            // real_math: the value args live in the RealMathInfo record; the
+            // opcode is not an SSA operand.
+            const auto info = extra_data<RealMathInfo>(p.extra);
             return index_slice(info.args);
         }
 

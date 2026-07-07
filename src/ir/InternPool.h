@@ -73,6 +73,11 @@ struct Type {
         Logic,
         // 2-state scalar bit (0, 1).
         Bit,
+        // IEEE-754 double: SV `real` / `realtime` (LRM 6.12). 2-state — no x/z;
+        // the value is the 64-bit bit pattern in a single val plane.
+        Real,
+        // IEEE-754 float: SV `shortreal` (LRM 6.12). 32-bit pattern, one plane.
+        ShortReal,
         // Packed array / vector: contiguous bits of `element`, e.g. logic [7:0].
         PackedArray,
         // Unpacked array (memory): collection of `element` over [left:right].
@@ -210,6 +215,9 @@ public:
     Ref bit_type;
     // Dynamic string.
     Ref string_type;
+    // IEEE-754 double / float (SV real, realtime / shortreal).
+    Ref real_type;
+    Ref shortreal_type;
 
     InternPool();
 
@@ -224,8 +232,14 @@ public:
     // type's layout).
     Ref put_value(Ref type, std::span<const uint8_t> bytes);
     // Intern a known integer value (width <= 64, 2- or 4-state); the xz plane,
-    // if any, is all-zero.
+    // if any, is all-zero. Asserts the type is not Real / ShortReal.
     Ref put_int(Ref type, uint64_t bits);
+    // Intern a floating-point value as its IEEE-754 bit pattern (double for
+    // Real, rounded to float for ShortReal).
+    Ref put_real(Ref type, double value);
+
+    // Whether the type is Real / ShortReal.
+    bool is_float(Ref type) const;
 
     const Item& get(Ref ref) const;
     // Canonical bytes of an interned value.

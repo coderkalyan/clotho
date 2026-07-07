@@ -225,14 +225,14 @@ TEST_CASE("$random with a seed argument is reported as unsupported") {
     CHECK(r.diagnostics.find("$random with a seed argument") != std::string::npos);
 }
 
-TEST_CASE("$realtime is reported as unsupported") {
+TEST_CASE("a real (fractional) delay is reported as unsupported") {
     const LowerResult r = lower_text(R"(
         module m;
-            initial $display("%0d", $realtime);
+            initial #1.5 $display("x");
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("$realtime") != std::string::npos);
+    CHECK(r.diagnostics.find("delay") != std::string::npos);
 }
 
 TEST_CASE("$timeformat with a non-literal suffix is reported as unsupported") {

@@ -1,5 +1,7 @@
 #include "InternPool.h"
 
+#include <bit>
+#include <cassert>
 #include <cstring>
 
 // Value encoding (canonical, shared by interned constants and runtime state):
@@ -15,10 +17,12 @@ namespace clotho::ir {
 
 InternPool::InternPool()
   : set_(0, Hash{ &items_, &value_bytes_ }, Eq{ &items_, &value_bytes_ }) {
-    void_type   = put(Type{ .kind = Type::Kind::Void });
-    logic_type  = put(Type{ .kind = Type::Kind::Logic });
-    bit_type    = put(Type{ .kind = Type::Kind::Bit });
-    string_type = put(Type{ .kind = Type::Kind::String });
+    void_type      = put(Type{ .kind = Type::Kind::Void });
+    logic_type     = put(Type{ .kind = Type::Kind::Logic });
+    bit_type       = put(Type{ .kind = Type::Kind::Bit });
+    string_type    = put(Type{ .kind = Type::Kind::String });
+    real_type      = put(Type{ .kind = Type::Kind::Real });
+    shortreal_type = put(Type{ .kind = Type::Kind::ShortReal });
 }
 
 Ref InternPool::put(const Item& item) {
@@ -57,6 +61,9 @@ Ref InternPool::put_value(Ref type, std::span<const uint8_t> bytes) {
 }
 
 Ref InternPool::put_int(Ref type, uint64_t bits) {
+    // A Real / ShortReal bit pattern must come through put_real; an integer
+    // interned against a float type would alias the wrong canonical bytes.
+    assert(!is_float(type) && "put_int on a floating type");
     const Layout lay = layout(type);
     const auto   pb  = plane_bytes(lay.width);
 
@@ -79,6 +86,30 @@ Ref InternPool::put_int(Ref type, uint64_t bits) {
     return put_value(type, buf);
 }
 
+Ref InternPool::put_real(Ref type, double value) {
+    assert(is_float(type) && "put_real on a non-floating type");
+    const Layout lay = layout(type);
+
+    // Canonical bytes are the IEEE-754 bit pattern: 64-bit for Real, rounded
+    // to the nearest float (C cast semantics, LRM 20.5 NOTE 1) for ShortReal.
+    std::array<uint8_t, 8> buf{};
+    if (lay.width == 64) {
+        const uint64_t pat = std::bit_cast<uint64_t>(value);
+        std::memcpy(buf.data(), &pat, 8);
+    } else {
+        const uint32_t pat = std::bit_cast<uint32_t>(static_cast<float>(value));
+        std::memcpy(buf.data(), &pat, 4);
+    }
+
+    return put_value(type, { buf.data(), lay.byte_count });
+}
+
+bool InternPool::is_float(Ref type) const {
+    const Type& t = std::get<Type>(get(type));
+
+    return t.kind == Type::Kind::Real || t.kind == Type::Kind::ShortReal;
+}
+
 const Item& InternPool::get(Ref ref) const {
     return items_[static_cast<uint32_t>(ref)];
 }
@@ -96,6 +127,10 @@ Layout InternPool::layout(Ref type) const {
             return { Domain::Four, 1, plane_bytes(1) * 2 };
         case Type::Kind::Bit:
             return { Domain::Two, 1, plane_bytes(1) };
+        case Type::Kind::Real:
+            return { Domain::Two, 64, plane_bytes(64) };
+        case Type::Kind::ShortReal:
+            return { Domain::Two, 32, plane_bytes(32) };
         case Type::Kind::PackedArray: {
             const Layout   el    = layout(t.element);
             const uint32_t count = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;

@@ -85,6 +85,9 @@ struct ValType {
     // A string value: carried as an rt_string handle pointer (str_vals_), never
     // as a Plane. width / four_state are meaningless when set.
     bool is_string = false;
+    // Real / shortreal: the value is an IEEE-754 double (width 64) or float
+    // (width 32) riding Plane.fp; never four_state.
+    bool is_real = false;
 };
 
 // A lowered value: the must/may planes packed into one i(2W) integer (low W bits
@@ -99,6 +102,10 @@ struct Plane {
     // 2-state value never carries the redundant may/z half. Domain is inferred
     // per value, not per instruction; see the operator dispatch in lower_inst.
     bool two = false;
+    // Real / shortreal value (double / float). Exactly one of fp and mm is set:
+    // a real SSA value carries fp only; its storage form is the raw bit pattern
+    // in a 2-state slot (see the real helpers).
+    llvm::Value* fp = nullptr;
 };
 
 // Single-bit 4-state truth tables, packed into one i32 immediate so a width-1 op
@@ -297,6 +304,9 @@ struct SignalSlot {
     // Powers up as z rather than x: an undriven 4-state net (LRM 6.6). Implies
     // has_z (undriven nets are a may-z seed).
     bool init_z = false;
+    // Leaf element is real / shortreal: the slot stores the IEEE-754 bit
+    // pattern in a 2-state word (has_z is false, four_state is false).
+    bool is_real = false;
     // Unpacked array (memory): `width` is the leaf element width; `elem_count`
     // the total leaf-element count (product of all dimensions).
     bool     is_array   = false;
@@ -495,6 +505,15 @@ private:
         return t.kind == Type::Kind::String;
     }
 
+    // The scalar leaf type of a (possibly nested) unpacked-array type.
+    Ref leaf_type(Ref type) const {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            return leaf_type(t.element);
+        }
+        return type;
+    }
+
     // Total leaf-element count of an unpacked-array type (product of all
     // dimensions); 1 for a scalar leaf.
     uint32_t array_leaf_count(Ref type) const {
@@ -612,6 +631,10 @@ private:
                 }
                 continue;
             }
+            // A real / shortreal slot stores the IEEE-754 bit pattern in a
+            // 2-state word: never z, so it takes the narrow single-iW form
+            // below (pool layout gives Domain::Two for floats).
+            slot.is_real     = mod_.pool.is_float(leaf_type(sigs[i].type));
             slot.init_z      = undriven[i] && sigs[i].is_net && slot.four_state;
             slot.has_z       = may_z[i] || task_out[i] || slot.init_z;
             // A 2-state signal drops the packed must|may word for a genuine iW slot
@@ -882,8 +905,12 @@ private:
         // Dynamic frame: rt_alloc(coro.size). The sim owns frame memory so a frame
         // outlives the ramp while the process is suspended on the wheel.
         b_.SetInsertPoint(alloc_bb);
-        auto* size = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_size, { b_.getInt64Ty() }), {});
-        auto* mem  = b_.CreateCall(alloc_fn(), { size });
+        // Over-allocate by coro.align: with an over-aligned frame (e.g. an i128
+        // plane spill) CoroSplit lays out fields past coro.size unless the
+        // allocation covers the realignment slack (LLVM coroutine contract).
+        auto* size  = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_size, { b_.getInt64Ty() }), {});
+        auto* align = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_align, { b_.getInt64Ty() }), {});
+        auto* mem   = b_.CreateCall(alloc_fn(), { b_.CreateAdd(size, align) });
         b_.CreateBr(begin_bb);
 
         b_.SetInsertPoint(begin_bb);
@@ -1290,8 +1317,12 @@ private:
         b_.CreateCondBr(need, alloc_bb, begin_bb);
 
         b_.SetInsertPoint(alloc_bb);
-        auto* size = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_size, { b_.getInt64Ty() }), {});
-        auto* mem  = b_.CreateCall(alloc_fn(), { size });
+        // Over-allocate by coro.align: with an over-aligned frame (e.g. an i128
+        // plane spill) CoroSplit lays out fields past coro.size unless the
+        // allocation covers the realignment slack (LLVM coroutine contract).
+        auto* size  = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_size, { b_.getInt64Ty() }), {});
+        auto* align = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_align, { b_.getInt64Ty() }), {});
+        auto* mem   = b_.CreateCall(alloc_fn(), { b_.CreateAdd(size, align) });
         b_.CreateBr(begin_bb);
 
         b_.SetInsertPoint(begin_bb);
@@ -2956,7 +2987,10 @@ private:
             return { 0, false, false, true };
         }
         const Layout lay = mod_.pool.layout(type);
-        return { lay.width == 0 ? 1 : lay.width, lay.domain == Domain::Four, ty.is_signed };
+        const bool fl = mod_.pool.is_float(type);
+        // Reals are signed quantities (LRM 11.8.1).
+        return { lay.width == 0 ? 1 : lay.width, lay.domain == Domain::Four, ty.is_signed || fl,
+                 false, fl };
     }
 
     ValType compute_type(Index i) {
@@ -2974,7 +3008,8 @@ private:
                 return from_ref(p.op_type.type);
             case Inst::Tag::Signal: {
                 const SignalSlot& s = slot_of(p.signal);
-                return { s.width, s.four_state, s.is_signed, s.is_string && !s.is_array };
+                return { s.width, s.four_state, s.is_signed, s.is_string && !s.is_array,
+                         s.is_real && !s.is_array };
             }
             case Inst::Tag::BitSelect: {
                 const ValType base = type_of(p.binary.l);
@@ -3034,6 +3069,32 @@ private:
                 return type_of(ir_->extra_data<Select>(p.op_extra.extra).a);
             case Inst::Tag::SelectLazy:
                 return type_of(ir_->extra_data<SelectLazy>(p.op_extra.extra).then_val);
+
+            case Inst::Tag::FAdd:
+            case Inst::Tag::FSub:
+            case Inst::Tag::FMul:
+            case Inst::Tag::FDiv:
+            case Inst::Tag::FPow:
+                return type_of(p.binary.l);
+            case Inst::Tag::FNeg:
+                return type_of(p.unary);
+            // Real compares are definite (reals carry no x/z): 1-bit two-state.
+            case Inst::Tag::FEq:
+            case Inst::Tag::FNe:
+            case Inst::Tag::FLt:
+            case Inst::Tag::FLe:
+            case Inst::Tag::FGt:
+            case Inst::Tag::FGe:
+                return { 1, false, false };
+            case Inst::Tag::ItoF:
+            case Inst::Tag::FtoI:
+            case Inst::Tag::FtoITrunc:
+            case Inst::Tag::FBitcast:
+            case Inst::Tag::FResize:
+                return from_ref(p.op_type.type);
+            // Every LRM 20.8.2 routine returns a real.
+            case Inst::Tag::RealMath:
+                return { 64, false, true, false, true };
 
             case Inst::Tag::RedAnd:
             case Inst::Tag::RedOr:
@@ -3130,7 +3191,9 @@ private:
         // projected to a single iW here when their type is 2-state; the projection
         // is lossless because such a value has must == may and no z.
         const ValType t = type_of(i);
-        if (!t.is_string) {
+        // A real value stays fp-only; pack/unpack happens at the storage / ABI
+        // boundaries (see the real helpers).
+        if (!t.is_string && !t.is_real) {
             if (t.four_state && p.two) {
                 p = to_four(p);
             } else if (!t.four_state && !p.two) {
@@ -3290,9 +3353,12 @@ private:
                     set_str(i, lv_string_ptr(lv));
                     return;
                 }
-                // The slot still stores the packed i(2W) word (single-iW storage is
-                // a later stage); set_value projects a 2-state result to its iW.
-                set_value(i, lower_load(lv));
+                const ValType t = type_of(i);
+                Plane         v = lower_load(lv);
+                if (t.is_real) {
+                    v = real_plane(planes_to_real(v, t.width));
+                }
+                set_value(i, v);
                 return;
             }
             case Inst::Tag::Store: {
@@ -3320,13 +3386,17 @@ private:
             // the NBA update region (see emit_nba_region), which commits shadow ->
             // live and services wait queues only after every active process has run.
             case Inst::Tag::StoreNb: {
-                const LValue& lv = lvalue_of(p.binary.l);
+                const LValue& lv  = lvalue_of(p.binary.l);
+                Plane         rhs = value_of(p.binary.r);
+                if (type_of(p.binary.r).is_real) {
+                    rhs = real_to_planes(fp_of(rhs));
+                }
                 // An unpacked-array element NBA defers through the runtime queue; a
                 // plain signal / scalar select uses the per-signal shadow.
                 if (lv.is_signal && slot_of(lv.sig).is_array) {
-                    emit_array_nba(lv, value_of(p.binary.r));
+                    emit_array_nba(lv, rhs);
                 } else {
-                    lower_store_nb(lv, value_of(p.binary.r));
+                    lower_store_nb(lv, rhs);
                 }
                 return;
             }
@@ -3417,6 +3487,71 @@ private:
                 set_value(i, lower_wildeq(value_of(p.binary.l), value_of(p.binary.r)));
                 return;
 
+            case Inst::Tag::FAdd:
+            case Inst::Tag::FSub:
+            case Inst::Tag::FMul:
+            case Inst::Tag::FDiv:
+            case Inst::Tag::FPow:
+                set_value(i, lower_real_arith(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
+                return;
+            case Inst::Tag::FNeg:
+                set_value(i, real_plane(b_.CreateFNeg(fp_of(value_of(p.unary)))));
+                return;
+            case Inst::Tag::FEq:
+            case Inst::Tag::FNe:
+            case Inst::Tag::FLt:
+            case Inst::Tag::FLe:
+            case Inst::Tag::FGt:
+            case Inst::Tag::FGe:
+                set_value(i, lower_real_compare(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
+                return;
+
+            case Inst::Tag::ItoF: {
+                // The must half reads x/z bits as 0 (LRM 6.12.1); signedness
+                // comes from the source operand type.
+                const ValType st = type_of(p.op_type.op);
+                const ValType dt = from_ref(p.op_type.type);
+                llvm::Value*  iv = must_of(value_of(p.op_type.op));
+                llvm::Value*  fv =
+                  st.is_signed ? b_.CreateSIToFP(iv, fp_ty(dt.width)) : b_.CreateUIToFP(iv, fp_ty(dt.width));
+                set_value(i, real_plane(fv));
+                return;
+            }
+            case Inst::Tag::FtoI:
+            case Inst::Tag::FtoITrunc:
+                set_value(i, lower_ftoi(ir_->tag(i), value_of(p.op_type.op), from_ref(p.op_type.type)));
+                return;
+            case Inst::Tag::FBitcast: {
+                const ValType st = type_of(p.op_type.op);
+                const ValType dt = from_ref(p.op_type.type);
+                if (dt.is_real) {
+                    // $bitstoreal / $bitstoshortreal: integral pattern -> float.
+                    llvm::Value* pat = cast(must_of(value_of(p.op_type.op)), dt.width, false);
+                    set_value(i, real_plane(b_.CreateBitCast(pat, fp_ty(dt.width))));
+                } else {
+                    // $realtobits / $shortrealtobits: float -> integral pattern.
+                    llvm::Value* pat = b_.CreateBitCast(fp_of(value_of(p.op_type.op)), int_ty(st.width));
+                    pat              = cast(pat, dt.width, false);
+                    set_value(i, packed(pat, pat, zero(dt.width)));
+                }
+                return;
+            }
+            case Inst::Tag::FResize: {
+                const ValType st = type_of(p.op_type.op);
+                const ValType dt = from_ref(p.op_type.type);
+                llvm::Value*  v  = fp_of(value_of(p.op_type.op));
+                if (st.width < dt.width) {
+                    v = b_.CreateFPExt(v, fp_ty(dt.width));
+                } else if (st.width > dt.width) {
+                    v = b_.CreateFPTrunc(v, fp_ty(dt.width));
+                }
+                set_value(i, real_plane(v));
+                return;
+            }
+            case Inst::Tag::RealMath:
+                set_value(i, lower_real_math(i));
+                return;
+
             case Inst::Tag::Land:
             case Inst::Tag::Lor:
                 set_value(i, lower_logical(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
@@ -3430,7 +3565,11 @@ private:
                 if (type_of(select.a).is_string) {
                     throw BackendError{ "internal: string value in select" };
                 }
-                set_value(i, lower_select(value_of(p.op_extra.op), value_of(select.a), value_of(select.b)));
+                if (type_of(select.a).is_real) {
+                    set_value(i, lower_real_mux(value_of(p.op_extra.op), value_of(select.a), value_of(select.b)));
+                } else {
+                    set_value(i, lower_select(value_of(p.op_extra.op), value_of(select.a), value_of(select.b)));
+                }
                 return;
             }
             case Inst::Tag::Concat:
@@ -3454,6 +3593,12 @@ private:
                     throw BackendError{ "internal: string value in resize" };
                 }
                 const ValType to = from_ref(p.op_type.type);
+                // Depth guard: an integer resize would silently zext / trunc a
+                // float bit pattern. The frontend must emit ItoF / FtoI /
+                // FResize instead.
+                if (type_of(p.op_type.op).is_real || to.is_real) {
+                    throw BackendError{ "internal: resize on a real value" };
+                }
                 // Resize is also the domain-conversion site: slang lowers an
                 // implicit 2-state <-> 4-state conversion (LRM 6.3.1) as a
                 // ConversionExpression -> Resize to the target type.
@@ -3649,7 +3794,12 @@ private:
                     set_str(i, fn_->getArg(base));
                     return;
                 }
-                set_value(i, Plane{ fn_->getArg(base), fn_->getArg(base + 1) });
+                const ValType t = from_ref(p.arg.type);
+                Plane         v{ fn_->getArg(base), fn_->getArg(base + 1) };
+                if (t.is_real) {
+                    v = real_plane(planes_to_real(v, t.width));
+                }
+                set_value(i, v);
                 return;
             }
             case Inst::Tag::Ret:
@@ -3672,6 +3822,12 @@ private:
         const uint32_t                 w     = lay.width == 0 ? 1 : lay.width;
         const std::span<const uint8_t> bytes = mod_.pool.bytes(ref);
         const uint32_t                 pb    = plane_bytes(lay.width);
+
+        // A real constant is its IEEE-754 bit pattern in the val plane.
+        if (mod_.pool.is_float(v.type)) {
+            llvm::Value* pat = const_from_bytes(bytes.subspan(0, pb), w);
+            return real_plane(b_.CreateBitCast(pat, fp_ty(w)));
+        }
 
         // The pool stores canonical val/xz; ingest to must/may/z so 0/1/x/z stay
         // distinct (case-equality needs to tell a literal x from a literal z).
@@ -3797,6 +3953,12 @@ private:
     }
 
     void lower_store(const LValue& lv, Plane rhs) {
+        // A real RHS stores as its bit pattern; reals have no bit-selects, so
+        // a real store always takes a whole-storage path (narrow real slot:
+        // the single iW word below).
+        if (rhs.fp != nullptr) {
+            rhs = real_to_planes(fp_of(rhs));
+        }
         const uint32_t s_width = lv.store_width;
         llvm::Value*   mp      = lv_mm_ptr(lv);
 
@@ -4629,9 +4791,11 @@ private:
             b_.CreateRetVoid();
             return;
         }
-        // The return ABI is the packed (must|may, z) pair; lift a 2-state result.
-        const Plane  pl  = to_four(value_of(value));
-        auto*        rty = llvm::cast<llvm::StructType>(fn_->getReturnType());
+        // The return ABI is the packed (must|may, z) pair; lift a 2-state result
+        // (a real result returns as its bit-pattern planes).
+        Plane pl = value_of(value);
+        pl       = pl.fp != nullptr ? real_to_planes(fp_of(pl)) : to_four(pl);
+        auto* rty = llvm::cast<llvm::StructType>(fn_->getReturnType());
         llvm::Value* agg = llvm::UndefValue::get(rty);
         agg              = b_.CreateInsertValue(agg, pl.mm, { 0 });
         agg              = b_.CreateInsertValue(agg, pl.z, { 1 });
@@ -4653,7 +4817,8 @@ private:
             if (is_string_type(f.param_types[k])) {
                 argv.push_back(str_of(a));
             } else {
-                const Plane pl = to_four(value_of(a));
+                Plane pl = value_of(a);
+                pl       = pl.fp != nullptr ? real_to_planes(fp_of(pl)) : to_four(pl);
                 argv.push_back(pl.mm);
                 argv.push_back(pl.z);
             }
@@ -4668,7 +4833,12 @@ private:
         }
         llvm::Value* r = b_.CreateCall(cf->getFunctionType(), cf, argv);
         if (f.return_type != mod_.pool.void_type) {
-            set_value(i, Plane{ b_.CreateExtractValue(r, { 0 }), b_.CreateExtractValue(r, { 1 }) });
+            Plane         pl{ b_.CreateExtractValue(r, { 0 }), b_.CreateExtractValue(r, { 1 }) };
+            const ValType t = from_ref(f.return_type);
+            if (t.is_real) {
+                pl = real_plane(planes_to_real(pl, t.width));
+            }
+            set_value(i, pl);
         }
     }
 
@@ -4713,7 +4883,8 @@ private:
                     argv.push_back(str_of(args[k]));
                     continue;
                 }
-                const Plane pl = to_four(value_of(args[k]));
+                Plane pl = value_of(args[k]);
+                pl       = pl.fp != nullptr ? real_to_planes(fp_of(pl)) : to_four(pl);
                 argv.push_back(pl.mm);
                 argv.push_back(pl.z);
             } else {
@@ -4780,6 +4951,22 @@ private:
                 store_field(sty, selt, 4, b_.getInt64(0));
                 continue;
             }
+            if (t.is_real) {
+                // A real rides `val` as a double bit pattern (flags bit 2); a
+                // shortreal widens to double first so the runtime handles one
+                // representation. Reals are signed and have no x/z.
+                llvm::Value* fv = fp_of(p);
+                if (t.width == 32) {
+                    fv = b_.CreateFPExt(fv, b_.getDoubleTy());
+                }
+                llvm::Value* relt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
+                store_field(sty, relt, 0, b_.getInt32(64));
+                store_field(sty, relt, 1, b_.getInt32(0b101u));
+                store_field(sty, relt, 2, b_.CreateBitCast(fv, int_ty(64)));
+                store_field(sty, relt, 3, b_.getInt64(0));
+                store_field(sty, relt, 4, b_.getInt64(0));
+                continue;
+            }
             if (t.width > 64) {
                 throw BackendError{ std::string(who) +
                                     " of an operand wider than 64 bits is not supported (it "
@@ -4837,6 +5024,12 @@ private:
     // The must (low W) and may (high W) halves of a plane. For a 2-state value
     // both are the value itself (must == may, no unknown bits).
     llvm::Value* must_of(Plane a) {
+        if (a.mm == nullptr) {
+            // Depth guard: a real value reached an integer-plane lowering; the
+            // frontend must convert reals explicitly (float tags), never route
+            // them through integer ops.
+            throw BackendError{ "internal: integer plane of a real value" };
+        }
         return a.two ? a.mm : b_.CreateTrunc(a.mm, int_ty(width_of(a)));
     }
     llvm::Value* may_of(Plane a) {
@@ -4927,6 +5120,189 @@ private:
         llvm::Value* xa = b_.CreateXor(a.mm, b_.CreateLShr(a.mm, w));
         llvm::Value* xb = b_.CreateXor(b.mm, b_.CreateLShr(b.mm, w));
         return b_.CreateTrunc(b_.CreateOr(xa, xb), int_ty(w));
+    }
+
+    // -- Real (floating point) helpers --
+    //
+    // A real SSA value rides Plane.fp. Its storage / ABI form is the IEEE-754
+    // bit pattern duplicated across must and may (a legal known value; the
+    // must => may invariant holds) with z = 0, so state layout, change
+    // detection, NBA staging, and the function ABI stay integer. Pack / unpack
+    // happens only at these boundaries; instcombine folds the chains between
+    // back-to-back float ops.
+
+    llvm::Type* fp_ty(uint32_t width) {
+        return width == 64 ? static_cast<llvm::Type*>(b_.getDoubleTy()) : b_.getFloatTy();
+    }
+
+    Plane real_plane(llvm::Value* fp) {
+        return Plane{ .fp = fp };
+    }
+
+    llvm::Value* fp_of(Plane a) {
+        if (a.fp == nullptr) {
+            throw BackendError{ "internal: real op on a non-real value" };
+        }
+        return a.fp;
+    }
+
+    // Bit pattern -> storage planes (must = may = pattern, z = 0).
+    Plane real_to_planes(llvm::Value* fp) {
+        const uint32_t w   = fp->getType()->isDoubleTy() ? 64 : 32;
+        llvm::Value*   pat = b_.CreateBitCast(fp, int_ty(w));
+        return packed(pat, pat, zero(w));
+    }
+
+    // Storage planes -> float value (the must half is the bit pattern).
+    llvm::Value* planes_to_real(Plane a, uint32_t width) {
+        return b_.CreateBitCast(must_of(a), fp_ty(width));
+    }
+
+    Plane lower_real_arith(Inst::Tag tag, Plane a, Plane b) {
+        llvm::Value* x = fp_of(a);
+        llvm::Value* y = fp_of(b);
+        switch (tag) {
+            case Inst::Tag::FAdd:
+                return real_plane(b_.CreateFAdd(x, y));
+            case Inst::Tag::FSub:
+                return real_plane(b_.CreateFSub(x, y));
+            case Inst::Tag::FMul:
+                return real_plane(b_.CreateFMul(x, y));
+            case Inst::Tag::FDiv:
+                return real_plane(b_.CreateFDiv(x, y));
+            default:
+                // FPow: C pow semantics cover the corners LRM 11.4.3 leaves
+                // unspecified.
+                return real_plane(b_.CreateBinaryIntrinsic(llvm::Intrinsic::pow, x, y));
+        }
+    }
+
+    // Real comparison -> definite 1-bit (reals carry no x/z). Ordered
+    // predicates except FNe, which is unordered so NaN != NaN yields 1,
+    // matching C.
+    Plane lower_real_compare(Inst::Tag tag, Plane a, Plane b) {
+        llvm::Value* x = fp_of(a);
+        llvm::Value* y = fp_of(b);
+        llvm::Value* c = nullptr;
+        switch (tag) {
+            case Inst::Tag::FEq:
+                c = b_.CreateFCmpOEQ(x, y);
+                break;
+            case Inst::Tag::FNe:
+                c = b_.CreateFCmpUNE(x, y);
+                break;
+            case Inst::Tag::FLt:
+                c = b_.CreateFCmpOLT(x, y);
+                break;
+            case Inst::Tag::FLe:
+                c = b_.CreateFCmpOLE(x, y);
+                break;
+            case Inst::Tag::FGt:
+                c = b_.CreateFCmpOGT(x, y);
+                break;
+            default:
+                c = b_.CreateFCmpOGE(x, y);
+                break;
+        }
+        return bit_plane(c, c);
+    }
+
+    // Float -> integral. FtoI rounds half away from zero (LRM 6.12.1, the
+    // assignment / cast conversion); FtoITrunc truncates toward zero ($rtoi,
+    // LRM 20.5). Both go through a saturating signed 64-bit intermediate:
+    // fptosi.sat avoids poison on out-of-range / NaN inputs (behavior the LRM
+    // leaves undefined), and the final width cast wraps like an integer
+    // assignment.
+    Plane lower_ftoi(Inst::Tag tag, Plane v, ValType to) {
+        llvm::Value* f = fp_of(v);
+        if (tag == Inst::Tag::FtoI) {
+            f = b_.CreateUnaryIntrinsic(llvm::Intrinsic::round, f);
+        }
+        llvm::Value* wide = b_.CreateIntrinsic(llvm::Intrinsic::fptosi_sat, { int_ty(64), f->getType() }, { f });
+        llvm::Value* r    = cast(wide, to.width, true);
+        return packed(r, r, zero(to.width));
+    }
+
+    // Mux with real alternatives. Definite condition selects normally; an
+    // ambiguous (x/z) condition compares the alternatives with == and yields
+    // the common value, else the real default 0.0 (LRM 11.4.11). NaN arms
+    // compare unequal, so they fall to 0.0.
+    Plane lower_real_mux(Plane cond, Plane a, Plane b) {
+        llvm::Value* known = b_.CreateICmpEQ(must_of(cond), may_of(cond));
+        llvm::Value* ctrue = b_.CreateICmpNE(must_of(cond), zero(1));
+        llvm::Value* x     = fp_of(a);
+        llvm::Value* y     = fp_of(b);
+        llvm::Value* sel   = b_.CreateSelect(ctrue, x, y);
+        llvm::Value* eq    = b_.CreateFCmpOEQ(x, y);
+        llvm::Value* amb   = b_.CreateSelect(eq, x, llvm::ConstantFP::get(x->getType(), 0.0));
+        return real_plane(b_.CreateSelect(known, sel, amb));
+    }
+
+    // A double-typed libm routine, resolved from the host process by the JIT
+    // (DynamicLibrarySearchGenerator in run_jit).
+    llvm::Value* libm_call(const char* name, llvm::Value* x, llvm::Value* y = nullptr) {
+        auto* dbl = b_.getDoubleTy();
+        if (y != nullptr) {
+            return b_.CreateCall(llmod_.getOrInsertFunction(name, dbl, dbl, dbl), { x, y });
+        }
+        return b_.CreateCall(llmod_.getOrInsertFunction(name, dbl, dbl), { x });
+    }
+
+    Plane lower_real_math(Index i) {
+        const auto info = ir_->extra_data<RealMathInfo>(ir_->payload(i).extra);
+        const auto args = ir_->region(info.args);
+        llvm::Value* x = fp_of(value_of(args[0]));
+        llvm::Value* y = args.size() > 1 ? fp_of(value_of(args[1])) : nullptr;
+        using O = RealMathOp;
+        namespace In = llvm::Intrinsic;
+        switch (static_cast<O>(info.op)) {
+            // LRM Table 20-4 names the C math function each maps to. The
+            // classic routines lower to LLVM intrinsics (constant-foldable);
+            // the inverse / hyperbolic ones call libm directly.
+            case O::Ln:
+                return real_plane(b_.CreateUnaryIntrinsic(In::log, x));
+            case O::Log10:
+                return real_plane(b_.CreateUnaryIntrinsic(In::log10, x));
+            case O::Exp:
+                return real_plane(b_.CreateUnaryIntrinsic(In::exp, x));
+            case O::Sqrt:
+                return real_plane(b_.CreateUnaryIntrinsic(In::sqrt, x));
+            case O::Pow:
+                return real_plane(b_.CreateBinaryIntrinsic(In::pow, x, y));
+            case O::Floor:
+                return real_plane(b_.CreateUnaryIntrinsic(In::floor, x));
+            case O::Ceil:
+                return real_plane(b_.CreateUnaryIntrinsic(In::ceil, x));
+            case O::Sin:
+                return real_plane(b_.CreateUnaryIntrinsic(In::sin, x));
+            case O::Cos:
+                return real_plane(b_.CreateUnaryIntrinsic(In::cos, x));
+            case O::Tan:
+                return real_plane(libm_call("tan", x));
+            case O::Asin:
+                return real_plane(libm_call("asin", x));
+            case O::Acos:
+                return real_plane(libm_call("acos", x));
+            case O::Atan:
+                return real_plane(libm_call("atan", x));
+            case O::Atan2:
+                return real_plane(libm_call("atan2", x, y));
+            case O::Hypot:
+                return real_plane(libm_call("hypot", x, y));
+            case O::Sinh:
+                return real_plane(libm_call("sinh", x));
+            case O::Cosh:
+                return real_plane(libm_call("cosh", x));
+            case O::Tanh:
+                return real_plane(libm_call("tanh", x));
+            case O::Asinh:
+                return real_plane(libm_call("asinh", x));
+            case O::Acosh:
+                return real_plane(libm_call("acosh", x));
+            case O::Atanh:
+                return real_plane(libm_call("atanh", x));
+        }
+        throw BackendError{ "unknown real math op" };
     }
 
     // -- Arithmetic: any X/Z in an operand makes the whole result X. --
