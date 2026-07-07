@@ -109,6 +109,8 @@ public:
     // $sformat / $swrite: format `args` per `fmt` and store the result into the
     // string lvalue `dst`. No value.
     Index sformat(Index dst, std::string_view fmt, std::span<const Index> args, SourceLoc loc);
+    // $sformatf: format `args` per `fmt`. Yields a new string value.
+    Index sformatf(std::string_view fmt, std::span<const Index> args, SourceLoc loc);
     // $ferror: write descriptor `fd`'s error message into the string lvalue `dst`.
     // Yields the error code.
     Index ferror(Index dst, Index fd, SourceLoc loc);

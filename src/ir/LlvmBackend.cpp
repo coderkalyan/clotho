@@ -2867,6 +2867,7 @@ private:
             case Inst::Tag::StrLower:
             case Inst::Tag::StrSubstr:
             case Inst::Tag::StrFromPacked:
+            case Inst::Tag::Sformatf:
                 return { 0, false, false, true };
             case Inst::Tag::StrToPacked:
                 return from_ref(p.op_type.type);
@@ -2936,6 +2937,7 @@ private:
             case Inst::Tag::StrLower:
             case Inst::Tag::StrSubstr:
             case Inst::Tag::StrFromPacked:
+            case Inst::Tag::Sformatf:
                 return true;
             case Inst::Tag::Constant:
             case Inst::Tag::Concat:
@@ -3339,6 +3341,10 @@ private:
 
             case Inst::Tag::Sformat:
                 lower_sformat(i);
+                return;
+
+            case Inst::Tag::Sformatf:
+                lower_sformatf(i);
                 return;
 
             case Inst::Tag::Ferror:
@@ -3929,19 +3935,43 @@ private:
         return llmod_.getOrInsertFunction("rt_sformat", fnty);
     }
 
-    // Lower a $sformat / $swrite: build the format-arg descriptor array and hand it,
-    // the format string, and the destination vector's planes to the runtime.
+    // void rt_sformat_str(rt_string* dst, const char* fmt, i32 argc, const rt_arg* argv)
+    llvm::FunctionCallee sformat_str_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, b_.getInt32Ty(), ptr }, false);
+        return llmod_.getOrInsertFunction("rt_sformat_str", fnty);
+    }
+
+    // Lower a $sformat / $swrite: build the format-arg descriptor array and hand
+    // it, the format string, and the destination — a string object's handle, or
+    // a packed vector's planes — to the runtime.
     void lower_sformat(Index i) {
         const auto        info = ir_->extra_data<SformatInfo>(ir_->payload(i).extra);
         const std::string fmt  = ir_->extra_bytes(info.fmt, info.fmt_len);
 
         const std::span<const Index> args = ir_->region(info.args);
         llvm::Value*                 arr  = build_rt_args(args, "$sformat / $swrite");
-        const auto [mm, z, width]         = string_dest(info.dst, "$sformat / $swrite");
-        llvm::Value* fmt_ptr              = b_.CreateGlobalString(fmt);
-        b_.CreateCall(
-          sformat_fn(),
-          { mm, z, b_.getInt32(width), fmt_ptr, b_.getInt32(static_cast<uint32_t>(args.size())), arr });
+        llvm::Value*                 fmt_ptr = b_.CreateGlobalString(fmt);
+        llvm::Value*                 argc    = b_.getInt32(static_cast<uint32_t>(args.size()));
+        const LValue&                lv      = lvalue_of(info.dst);
+        if (lv.is_string) {
+            b_.CreateCall(sformat_str_fn(), { lv_string_ptr(lv), fmt_ptr, argc, arr });
+            return;
+        }
+        const auto [mm, z, width] = string_dest(info.dst, "$sformat / $swrite");
+        b_.CreateCall(sformat_fn(), { mm, z, b_.getInt32(width), fmt_ptr, argc, arr });
+    }
+
+    // Lower a $sformatf: format into the instruction's string temp.
+    void lower_sformatf(Index i) {
+        const auto        info = ir_->extra_data<SformatfInfo>(ir_->payload(i).extra);
+        const std::string fmt  = ir_->extra_bytes(info.fmt, info.fmt_len);
+
+        const std::span<const Index> args = ir_->region(info.args);
+        llvm::Value*                 arr  = build_rt_args(args, "$sformatf");
+        b_.CreateCall(sformat_str_fn(),
+                      { str_of(i), b_.CreateGlobalString(fmt),
+                        b_.getInt32(static_cast<uint32_t>(args.size())), arr });
     }
 
     // i32 rt_ferror(i32 fd, i8* mm, i8* z, i32 width)

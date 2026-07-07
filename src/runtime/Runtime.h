@@ -32,10 +32,12 @@ typedef struct rt_arg {
 
 // Format `fmt` with `argc` descriptors and write the result to descriptor
 // `desc` — an MCD or FD (see the file-I/O block below); $display / $write pass
-// the standard-output MCD (bit 0). Supports the common $display specifiers
-// (%d %h/%x %b %o %c %t, and %%); each consumes the next descriptor. A %t
-// descriptor carries a tick-valued time (see $timeformat below). The codegen
-// folds any trailing newline into `fmt`.
+// the standard-output MCD (bit 0). Specifiers follow LRM §21.2.1 (%d %h/%x %b
+// %o %c %s %t %u %z and %%, with widths, %0 minimal form, and `-` left-justify);
+// each except %% consumes the next descriptor. A %t descriptor carries a
+// tick-valued time (see $timeformat below). The frontend validates specifiers
+// at lower time; an invalid one reaching the runtime aborts. The codegen folds
+// any trailing newline into `fmt`.
 void rt_fwrite(int32_t desc, const char* fmt, uint32_t argc, const rt_arg* argv);
 
 // -- $timeformat / %t --
@@ -137,6 +139,11 @@ int32_t rt_fgets(uint8_t* mm, uint8_t* z, uint32_t width, int32_t fd);
 // Stored right-justified; an oversized result keeps its low bytes. `width` must be
 // a multiple of 8.
 void rt_sformat(uint8_t* mm, uint8_t* z, uint32_t width, const char* fmt, uint32_t argc, const rt_arg* argv);
+
+// $sformatf / $sformat into a string-object destination: format as rt_fwrite
+// and assign the result to the rt_string at `dst` (declared below).
+struct rt_string;
+void rt_sformat_str(struct rt_string* dst, const char* fmt, uint32_t argc, const rt_arg* argv);
 
 // $ferror(fd, str) (LRM §21.3.6): write the descriptor's most recent error message
 // into the string variable at `mm` / `z` (`width` bits) and return its error code

@@ -51,6 +51,7 @@
 
 #include "SourceMap.h"
 #include "ir/Builder.h"
+#include "runtime/Format.h"
 
 namespace clotho {
 
@@ -403,6 +404,7 @@ public:
     // gives every top a "<name>." prefix, so gating on an empty prefix would drop
     // all initializers (each top gets its own Lowerer, so this covers each one).
     void lower_top(const InstanceSymbol& top, std::string_view prefix) {
+        top_elided_ = prefix.empty();
         lower_instance(top, prefix);
         finalize_preinit();
         module_.add_top(std::move(top_scope_));
@@ -1293,7 +1295,14 @@ private:
                 if (blk.blockKind != StatementBlockKind::Sequential) {
                     fail("fork..join blocks are not supported");
                 }
+                const bool named = blk.blockSymbol != nullptr && !blk.blockSymbol->name.empty();
+                if (named) {
+                    named_blocks_.push_back(blk.blockSymbol->name);
+                }
                 lower_stmt(blk.body, b);
+                if (named) {
+                    named_blocks_.pop_back();
+                }
                 break;
             }
             case StatementKind::Timed: {
@@ -1733,16 +1742,28 @@ private:
             lower_string_method(name, call, b);
             return;
         }
-        if (name == "$display" || name == "$write") {
-            lower_display(call, name == "$display", b);
+        if (const char rx = display_radix(name, "$display")) {
+            lower_display(call, /*newline=*/true, b, rx);
             return;
         }
-        if (name == "$fdisplay" || name == "$fwrite") {
-            lower_fdisplay(call, name == "$fdisplay", b);
+        if (const char rx = display_radix(name, "$write")) {
+            lower_display(call, /*newline=*/false, b, rx);
             return;
         }
-        if (name == "$swrite" || name == "$sformat") {
-            lower_sformat(call, name == "$sformat", b);
+        if (const char rx = display_radix(name, "$fdisplay")) {
+            lower_fdisplay(call, /*newline=*/true, b, rx);
+            return;
+        }
+        if (const char rx = display_radix(name, "$fwrite")) {
+            lower_fdisplay(call, /*newline=*/false, b, rx);
+            return;
+        }
+        if (const char rx = display_radix(name, "$swrite")) {
+            lower_sformat(call, /*is_sformat=*/false, b, rx);
+            return;
+        }
+        if (name == "$sformat") {
+            lower_sformat(call, /*is_sformat=*/true, b);
             return;
         }
         if (name == "$fclose") {
@@ -1880,8 +1901,7 @@ private:
             // has no unitless $printtimescale text yet.
             fail("$printtimescale requires a timescale");
         }
-        const std::string path = prefix_.empty() ? module_.name : prefix_.substr(0, prefix_.size() - 1);
-        const std::string text = "Time scale of (" + path + ") is " + ts->toString();
+        const std::string text = "Time scale of (" + instance_path() + ") is " + ts->toString();
         b.display(text, /*newline=*/true, {}, loc(call));
     }
 
@@ -2151,6 +2171,11 @@ private:
             return lower_scanf(call, name == "$sscanf", b, l);
         }
 
+        // $sformatf(fmt, args) (LRM §21.3.3): format into a new string value.
+        if (name == "$sformatf") {
+            return lower_sformatf(call, b);
+        }
+
         // $fread(target, fd[, start[, count]]) (LRM §21.3.4): binary read into a
         // single vector or a whole unpacked-array memory. The memory form (like
         // $readmem) takes optional start-address and element-count bounds.
@@ -2245,57 +2270,209 @@ private:
     // string-literal argument contributes its text verbatim (its %-specifiers pull
     // from following value args, SV-style); a bare value argument not covered by an
     // earlier specifier gets a default `%0d` (or `%s` for a string object).
+    // Hierarchical path of the instance / generate scope currently being lowered
+    // ("top.u1.blk"): the flattened prefix, with the elided single-top name
+    // restored.
+    std::string instance_path() const {
+        std::string path = top_elided_ ? module_.name : std::string();
+        if (!prefix_.empty()) {
+            if (!path.empty()) {
+                path += '.';
+            }
+            path.append(prefix_, 0, prefix_.size() - 1);
+        }
+        return path;
+    }
+
+    // Hierarchical name of the scope invoking the statement currently being
+    // lowered (LRM §21.2.1.5 %m): the instance path plus the enclosing
+    // subroutine and named begin blocks. Static per lowering site, because
+    // instances are flattened per-instance and subroutine bodies are lowered
+    // per defining instance.
+    std::string hier_name() const {
+        std::string path = instance_path();
+        if (fn_ctx_ != nullptr && !fn_ctx_->name_prefix.empty()) {
+            path += '.';
+            path.append(fn_ctx_->name_prefix, 0, fn_ctx_->name_prefix.size() - 1);
+        }
+        for (const std::string_view nb : named_blocks_) {
+            path += '.';
+            path += nb;
+        }
+        return path;
+    }
+
+    // Validate one non-%% specifier parsed from a display format literal and
+    // return its lowercase conversion char. Everything the engine does not
+    // implement fails loudly here, so the runtime renderer only ever sees legal
+    // specifiers (LRM §21.2.1.1: an undefined specifier is an error).
+    char check_specifier(const clotho::FormatSpec& spec) {
+        if (!spec.ok) {
+            fail("incomplete format specifier in display format");
+        }
+        if (spec.width_overflow) {
+            fail("format field width is out of range");
+        }
+        const char conv = static_cast<char>(spec.conv | 0x20);
+        switch (conv) {
+            case 'd':
+            case 'h':
+            case 'x':
+            case 'o':
+            case 'b':
+            case 'c':
+            case 's':
+            case 't':
+            case 'm':
+                break;
+            case 'u':
+            case 'z':
+                if (spec.has_width || spec.left_justify) {
+                    fail("%u / %z output is unformatted; width and justification do not apply");
+                }
+                break;
+            case 'e':
+            case 'f':
+            case 'g':
+                // TODO: real format specifiers need real-type support.
+                fail("real format specifiers (%e / %f / %g) are not supported");
+            case 'v':
+                // TODO: %v needs net strength modeling (LRM §21.2.1.4).
+                fail("%v (net signal strength) is not supported");
+            case 'l':
+                // TODO: %l needs library/config info (LRM §21.2.1.1, Clause 33).
+                fail("%l (library binding) is not supported");
+            case 'p':
+                // TODO: %p needs aggregate rendering (LRM §21.2.1.6).
+                fail("%p (assignment pattern) is not supported");
+            default:
+                fail(std::string("undefined format specifier '%") + spec.conv +
+                     "' (LRM 21.2.1.1)");
+        }
+        if (spec.has_prec) {
+            fail("a format precision is only defined for real specifiers (%e / %f / %g)");
+        }
+        return conv;
+    }
+
+    // Copy one string-literal argument into `fmt`, validating every specifier,
+    // splicing %m as literal text, and appending each argument-consuming
+    // conversion char to `pending`.
+    void append_format_literal(std::string& fmt, std::string_view text, std::vector<char>& pending) {
+        for (size_t i = 0; i < text.size();) {
+            if (text[i] != '%') {
+                fmt += text[i++];
+                continue;
+            }
+            const clotho::FormatSpec spec = clotho::parse_format_spec(text.substr(i + 1));
+            if (spec.ok && spec.conv == '%') {
+                fmt += "%%";
+                i += 2;
+                continue;
+            }
+            const char conv = check_specifier(spec);
+            if (conv == 'm') {
+                // %m consumes no argument; the invoking scope is static at lower
+                // time, so splice its name (width-padded) into the text.
+                std::string name = hier_name();
+                if (spec.has_width && name.size() < spec.width) {
+                    if (spec.left_justify) {
+                        name.append(spec.width - name.size(), ' ');
+                    } else {
+                        name.insert(0, spec.width - name.size(), ' ');
+                    }
+                }
+                fmt += name;
+            } else {
+                fmt.append(text, i, 1 + spec.len);
+                pending.push_back(conv);
+            }
+            i += 1 + spec.len;
+        }
+    }
+
     void build_format(std::span<const Expression* const> format_args, std::string& fmt,
-                      std::vector<ir::Index>& args, ir::Builder& b) {
-        // Conversion chars of specifiers seen but not yet matched to a value arg,
-        // in order (FIFO). Needed so a `%t` argument can be scaled to ticks.
+                      std::vector<ir::Index>& args, ir::Builder& b, char default_conv = 'd') {
+        // Conversion chars (lowercase) of specifiers seen but not yet matched to
+        // a value arg, in order (FIFO). Needed so a `%t` argument can be scaled
+        // to ticks and a string object checked against %s.
         std::vector<char> pending;
         size_t            next = 0; // front of `pending`
 
         for (const Expression* arg : format_args) {
+            if (arg->kind == ExpressionKind::EmptyArgument) {
+                // An empty argument (adjacent commas) displays one space
+                // (LRM §21.2.1).
+                fmt += ' ';
+                continue;
+            }
             // A string-literal argument (SV-style) contributes format text, even
-            // when width-converted; unwrap conversions to see the literal.
+            // when width-converted; unwrap conversions to see the literal. A
+            // literal that an earlier specifier is still waiting on is a value
+            // argument instead ($display("%s", "hi") prints hi).
             const Expression* lit = arg;
             while (lit->kind == ExpressionKind::Conversion) {
                 lit = &lit->as<ConversionExpression>().operand();
             }
-            if (lit->kind == ExpressionKind::StringLiteral) {
-                const std::string_view text = lit->as<StringLiteral>().getValue();
-                fmt += text;
-                collect_specifiers(text, pending);
+            if (lit->kind == ExpressionKind::StringLiteral && next >= pending.size()) {
+                append_format_literal(fmt, lit->as<StringLiteral>().getValue(), pending);
             } else {
                 const bool str  = is_string_expr(*arg);
-                char       conv = str ? 's' : 'd';
+                char       conv = str ? 's' : default_conv;
                 if (next < pending.size()) {
                     conv = pending[next++]; // consumed by an earlier specifier
                 } else {
-                    fmt += str ? "%s" : "%0d"; // bare value default
+                    // Bare value default: the task's radix, auto-sized
+                    // (LRM §21.2.1.1); a string object formats as a string.
+                    fmt += '%';
+                    fmt += str ? 's' : default_conv;
                 }
-                if (str && conv != 's' && conv != 'S') {
+                if (str && conv != 's') {
                     // TODO: %d/%h/... of a string object (would need the packed
                     // reinterpretation of its characters).
                     fail("a string argument to $display/$write requires %s");
                 }
                 ir::Index v = lower_expr(*arg, b);
-                if (conv == 't' || conv == 'T') {
+                if (conv == 't') {
                     v = scale_to_ticks(*arg, v, b);
                 }
                 args.push_back(v);
             }
         }
+        if (next < pending.size()) {
+            fail("display format has more format specifiers than arguments (LRM 21.2.1.1)");
+        }
+    }
+
+    // Match a display-family task name against `base` plus an optional radix
+    // suffix ($displayb / $writeh / ...); returns the bare-argument default
+    // conversion ('d' for the plain name, the suffix's radix otherwise) or 0
+    // when the name does not match (LRM §21.2.1.1).
+    static char display_radix(std::string_view name, std::string_view base) {
+        if (!name.starts_with(base)) {
+            return 0;
+        }
+        const std::string_view rest = name.substr(base.size());
+        if (rest.empty()) {
+            return 'd';
+        }
+        if (rest == "b" || rest == "o" || rest == "h") {
+            return rest[0];
+        }
+        return 0;
     }
 
     // Lower $display / $write: format the arguments and write to standard output.
-    void lower_display(const CallExpression& call, bool newline, ir::Builder& b) {
+    void lower_display(const CallExpression& call, bool newline, ir::Builder& b, char default_conv) {
         std::string            fmt;
         std::vector<ir::Index> args;
-        build_format(call.arguments(), fmt, args, b);
+        build_format(call.arguments(), fmt, args, b, default_conv);
         b.display(fmt, newline, args, loc(call));
     }
 
     // Lower $fdisplay / $fwrite (LRM §21.3.3): the first argument is the
     // destination descriptor (an MCD or FD); the rest form the message.
-    void lower_fdisplay(const CallExpression& call, bool newline, ir::Builder& b) {
+    void lower_fdisplay(const CallExpression& call, bool newline, ir::Builder& b, char default_conv) {
         const auto args_in = call.arguments();
         if (args_in.empty()) {
             fail("$fdisplay / $fwrite requires a file-descriptor argument");
@@ -2303,7 +2480,7 @@ private:
         const ir::Index       fd = lower_expr(*args_in[0], b);
         std::string            fmt;
         std::vector<ir::Index> args;
-        build_format(args_in.subspan(1), fmt, args, b);
+        build_format(args_in.subspan(1), fmt, args, b, default_conv);
         b.fdisplay(fd, fmt, newline, args, loc(call));
     }
 
@@ -2311,7 +2488,8 @@ private:
     // $write and store the result into the destination string lvalue (the first
     // argument). $sformat's format (its second argument) must be a string literal;
     // $swrite takes $write-style interleaved literals and values.
-    void lower_sformat(const CallExpression& call, bool is_sformat, ir::Builder& b) {
+    void lower_sformat(const CallExpression& call, bool is_sformat, ir::Builder& b,
+                       char default_conv = 'd') {
         const auto args = call.arguments();
         if (args.empty()) {
             fail("$sformat / $swrite requires a destination string argument");
@@ -2333,37 +2511,30 @@ private:
         const ir::Index        dst = lower_lvalue(*args[0], b);
         std::string            fmt;
         std::vector<ir::Index> values;
-        build_format(args.subspan(1), fmt, values, b);
+        build_format(args.subspan(1), fmt, values, b, default_conv);
         b.sformat(dst, fmt, values, loc(call));
     }
 
-    // Append the conversion character of each format specifier in `s` to `out`,
-    // treating `%%` as an escaped literal percent (no specifier). Mirrors the
-    // runtime's flag/width/precision skipping so the recorded char is the one the
-    // runtime will dispatch on.
-    static void collect_specifiers(std::string_view s, std::vector<char>& out) {
-        for (size_t i = 0; i < s.size(); ++i) {
-            if (s[i] != '%') {
-                continue;
-            }
-            ++i;
-            if (i >= s.size()) {
-                break;
-            }
-            if (s[i] == '%') {
-                continue; // escaped percent: no value arg
-            }
-            while (i < s.size() && (s[i] == '-' || s[i] == '+' || s[i] == ' ' || s[i] == '0')) {
-                ++i;
-            }
-            while (i < s.size() && ((s[i] >= '0' && s[i] <= '9') || s[i] == '.')) {
-                ++i;
-            }
-            if (i >= s.size()) {
-                break;
-            }
-            out.push_back(s[i]);
+    // Lower $sformatf (LRM §21.3.3): render like $sformat but yield a new string
+    // value. The format (first argument) must be a string literal, like $sformat.
+    ir::Index lower_sformatf(const CallExpression& call, ir::Builder& b) {
+        const auto args = call.arguments();
+        if (args.empty()) {
+            fail("$sformatf requires a format-string argument");
         }
+        const Expression* fa = args[0];
+        while (fa->kind == ExpressionKind::Conversion) {
+            fa = &fa->as<ConversionExpression>().operand();
+        }
+        if (fa->kind != ExpressionKind::StringLiteral) {
+            // TODO: a runtime (non-literal) $sformatf format string needs
+            // dynamic format parsing, which Clotho lacks.
+            fail("$sformatf format must be a string literal");
+        }
+        std::string            fmt;
+        std::vector<ir::Index> values;
+        build_format(args, fmt, values, b);
+        return b.sformatf(fmt, values, loc(call));
     }
 
     // Scale a %t argument from its module's time unit to design ticks: the runtime
@@ -3124,6 +3295,8 @@ private:
         ctx.is_task     = true;
         FnCtx* saved    = fn_ctx_;
         fn_ctx_         = &ctx;
+        std::vector<std::string_view> saved_blocks;
+        saved_blocks.swap(named_blocks_);
         ir::Builder          b(module_.pool);
         std::vector<ir::Ref> param_types;
         std::vector<ir::ArgDir> arg_dirs;
@@ -3150,6 +3323,7 @@ private:
                                                .local_types = std::move(ctx.local_types),
                                                .is_task     = true,
                                                .ir          = b.finish() });
+        named_blocks_.swap(saved_blocks);
         fn_ctx_ = saved;
     }
 
@@ -3164,6 +3338,8 @@ private:
         ctx.name_prefix        = std::string(sub.name) + ".";
         FnCtx*           saved = fn_ctx_;
         fn_ctx_                = &ctx;
+        std::vector<std::string_view> saved_blocks;
+        saved_blocks.swap(named_blocks_);
         ir::Builder      b(module_.pool);
         std::vector<ir::Ref> param_types;
 
@@ -3200,6 +3376,7 @@ private:
                                                .param_types = std::move(param_types),
                                                .local_types = std::move(ctx.local_types),
                                                .ir          = b.finish() });
+        named_blocks_.swap(saved_blocks);
         fn_ctx_ = saved;
     }
 
@@ -3333,6 +3510,14 @@ private:
     // "u_alu.u_sub."); empty for the top. Prepended to every signal name created
     // while this instance's body is processed so flattened signals stay unique.
     std::string prefix_;
+    // True when flattened paths omit the single top instance's name (the
+    // single-top case); %m and $printtimescale re-prepend module_.name.
+    bool top_elided_ = false;
+    // Names of the named begin blocks enclosing the statement currently being
+    // lowered, outermost first; they extend the %m hierarchical name (LRM
+    // §21.2.1.5). Saved/cleared around subroutine body lowering: a body is
+    // built at its first call site, whose block nesting is not the body's.
+    std::vector<std::string_view> named_blocks_;
     // Femtoseconds per wheel tick (design-wide smallest time unit); 0 == unitless.
     uint64_t tick_fs_ = 0;
     // Time-unit multiplier of the instance currently being lowered: a delay is

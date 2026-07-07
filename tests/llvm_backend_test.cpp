@@ -1851,6 +1851,28 @@ TEST_CASE("$fopen FD form: $fdisplay and $fwrite") {
     std::remove(path);
 }
 
+// %u writes the 2-value projection, %z vpi aval/bval word pairs, both as
+// 32-bit words LSB-first (LRM §21.2.1.1). Byte-exact against Icarus Verilog:
+// 8'b1x0z101z has aval 0xca (x reads 1, z reads 0) and bval 0x51 (the xz mask).
+TEST_CASE("$fwrite %u and %z emit unformatted words") {
+    const char* path = "clotho_ufmt_test.bin";
+    std::remove(path);
+    const std::string src = std::string(R"(
+        module m;
+            integer fd;
+            initial begin
+                fd = $fopen(")") + path + R"(", "wb");
+                $fwrite(fd, "%u", 32'h01020304);
+                $fwrite(fd, "%z", 8'b1x0z_101z);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    run_capture(src);
+    CHECK(read_file(path) == std::string("\x04\x03\x02\x01\xca\x00\x00\x00\x51\x00\x00\x00", 12));
+    std::remove(path);
+}
+
 // One-argument $fopen returns a multichannel descriptor opened for writing.
 TEST_CASE("$fopen MCD form writes to its channel") {
     const char* path = "clotho_mcd_test.txt";
@@ -2002,7 +2024,8 @@ TEST_CASE("$sformat truncates to the low bytes on overflow") {
     )") == "63646566\n"); // "cdef"
 }
 
-// $swrite concatenates $write-style; bare values use clotho's %0d default width.
+// $swrite concatenates $write-style; a bare value uses the auto-sized decimal
+// default (LRM §21.2.1.1), so "v" + 10-wide "         5" keeps its low 8 bytes.
 TEST_CASE("$swrite concatenates into a string variable") {
     CHECK(run_capture(R"(
         module m;
@@ -2012,7 +2035,7 @@ TEST_CASE("$swrite concatenates into a string variable") {
                 $display("%h", s);
             end
         endmodule
-    )") == "0000000000007635\n"); // "v5"
+    )") == "2020202020202035\n"); // "       5"
 }
 
 // $ferror reports a clear stream as code 0 (the message write-back path).
@@ -2309,7 +2332,7 @@ TEST_CASE("a task output formal carries z back to the caller") {
             end
         endmodule
     )";
-    CHECK(run_capture(src) == "z111 7\n");
+    CHECK(run_capture(src) == "z111  7\n"); // %d of a 4-bit value auto-sizes to 2
 }
 
 TEST_CASE("a function returning z feeds a z-capable target") {

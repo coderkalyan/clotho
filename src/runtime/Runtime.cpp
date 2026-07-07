@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "Format.h"
 #include "Wheel.h"
 
 namespace {
@@ -60,11 +61,12 @@ struct TimeFormat {
 
 TimeFormat timeformat;
 
-// Render a tick-valued time `ticks` per the current $timeformat, appending to
-// `out` (LRM §20.4.3). The tick value scales to femtoseconds, then to the
-// display unit (10^units s); since fs = 10^-15 s, a display unit of 10^units s
-// is 10^(units+15) fs. The number is printed with `precision` fractional digits,
-// the suffix is appended, and the whole field is right-justified to min_width.
+// Render a tick-valued time `ticks` per the current $timeformat, appending the
+// unpadded number + suffix to `out` (LRM §20.4.3). The tick value scales to
+// femtoseconds, then to the display unit (10^units s); since fs = 10^-15 s, a
+// display unit of 10^units s is 10^(units+15) fs. The number is printed with
+// `precision` fractional digits. Field justification (to $timeformat's
+// min_width or an explicit %t width) is the caller's job.
 void render_time(std::string& out, uint64_t ticks) {
     const double fs      = static_cast<double>(ticks) * static_cast<double>(timeformat.tick_fs);
     double       divisor = 1.0;
@@ -77,12 +79,16 @@ void render_time(std::string& out, uint64_t ticks) {
     char          numbuf[64];
     std::snprintf(numbuf, sizeof(numbuf), "%.*f", prec, value);
 
-    std::string field = numbuf;
-    field += timeformat.suffix;
-    if (timeformat.min_width > 0 && field.size() < static_cast<size_t>(timeformat.min_width)) {
-        out.append(static_cast<size_t>(timeformat.min_width) - field.size(), ' ');
-    }
-    out += field;
+    out += numbuf;
+    out += timeformat.suffix;
+}
+
+// A runtime formatting invariant broke: the frontend validates every specifier
+// before it reaches the runtime, so these paths are unreachable from lowered
+// code. Abort loudly rather than emit silently-wrong output.
+[[noreturn]] void format_fatal(const char* what) {
+    std::fprintf(stderr, "clotho runtime: %s\n", what);
+    std::abort();
 }
 
 // -- $display formatting --
@@ -92,24 +98,33 @@ uint64_t width_mask(uint32_t w) {
     return w >= 64 ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << w) - 1);
 }
 
-// Render `val` as ceil(width/bits) digits, most-significant first. A digit prints
-// as 'z' if all of its unknown bits are high-impedance, 'x' if any are X, else
-// its hex/octal/binary value. `bits` is 1 (binary), 3 (octal) or 4 (hex).
+// Render `val` as ceil(width/bits) digits, most-significant first. `bits` is 1
+// (binary), 3 (octal) or 4 (hex). Unknown digits follow LRM §21.2.1.3 casing:
+// lowercase x/z when every in-range bit of the group is x / z, uppercase X/Z
+// when only some are (Z only when the group has no x bits). The top group
+// clips to the operand width so its "every bit" test ignores out-of-range bits.
 void render_digits(std::string& out, uint64_t val, uint64_t xz, uint64_t z, uint32_t width, uint32_t bits) {
     if (width == 0) {
         width = 1;
     }
-    static constexpr char kHex[]  = "0123456789abcdef";
+    static constexpr char kHex[]   = "0123456789abcdef";
     const uint64_t        dig_mask = (uint64_t{ 1 } << bits) - 1;
+    const uint64_t        all_mask = width_mask(width);
     const uint32_t        digits   = (width + bits - 1) / bits;
     for (uint32_t d = digits; d-- > 0;) {
         const uint32_t shift = d * bits;
-        const uint64_t dxz   = (xz >> shift) & dig_mask;
-        if (dxz != 0) {
-            const uint64_t dz = (z >> shift) & dig_mask;
-            out += (dxz & ~dz) ? 'x' : 'z';
+        const uint64_t gm    = dig_mask & (all_mask >> shift);
+        const uint64_t dxz   = (xz >> shift) & gm;
+        if (dxz == 0) {
+            out += kHex[(val >> shift) & gm];
+            continue;
+        }
+        const uint64_t dz = (z >> shift) & gm;
+        const uint64_t dx = dxz & ~dz;
+        if (dx != 0) {
+            out += dx == gm ? 'x' : 'X';
         } else {
-            out += kHex[(val >> shift) & dig_mask];
+            out += dz == gm ? 'z' : 'Z';
         }
     }
 }
@@ -119,105 +134,195 @@ void render_digits(std::string& out, uint64_t val, uint64_t xz, uint64_t z, uint
 uint64_t    str_len(const rt_string* s);
 const char* str_data(const rt_string* s);
 
-// Render one descriptor under conversion `conv`, appending to `out`.
-void render_arg(std::string& out, const rt_arg& a, char conv) {
+// Decimal digit count of `v` (1 for 0).
+uint32_t dec_digits(uint64_t v) {
+    uint32_t n = 1;
+    while (v >= 10) {
+        v /= 10;
+        ++n;
+    }
+    return n;
+}
+
+// Render one descriptor under the parsed specifier, appending to `out`.
+// Justification follows LRM §21.2.1.2: no explicit width sizes the field to the
+// largest possible value (decimal space-padded, other radices zero-padded, %t
+// to $timeformat's min width); width 0 is the minimal form; an explicit width
+// pads on the left (spaces for d/s/c/t, zeros for h/o/b) and never truncates.
+// `-` left-justifies with trailing spaces (an extension the LRM does not define).
+void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spec) {
     const uint32_t w    = a.width ? a.width : 1;
     const uint64_t mask = width_mask(w);
     const uint64_t val  = a.val & mask;
     const uint64_t xz   = a.xz & mask;
     const uint64_t z    = a.z & mask;
 
-    switch (conv) {
+    std::string field;
+    // Field width to justify to; an explicit specifier width overrides the
+    // per-conversion default filled in below. Width 0 means minimal.
+    uint32_t target   = spec.has_width ? spec.width : 0;
+    bool     zero_pad = false;
+
+    switch (spec.conv) {
         case 'd':
         case 'D':
-            if (xz != 0) { // any unknown bit collapses the whole field
-                out += (xz & ~z) ? 'x' : 'z';
+            if (!spec.has_width) {
+                // Automatic size: the largest possible value of a `w`-bit
+                // operand; a signed operand's widest text is its most negative
+                // value, sign included (LRM §21.2.1.2).
+                target = (a.flags & 1u) != 0 ? 1 + dec_digits(uint64_t{ 1 } << (w - 1))
+                                             : dec_digits(mask);
+            }
+            if (xz != 0) {
+                // LRM §21.2.1.3: whole-field collapse, lowercase only when
+                // every bit is x (resp. z), uppercase X when x bits mix with
+                // anything, uppercase Z when z bits mix with known bits.
+                const uint64_t x = xz & ~z;
+                if (x != 0) {
+                    field += x == mask ? 'x' : 'X';
+                } else {
+                    field += z == mask ? 'z' : 'Z';
+                }
             } else if ((a.flags & 1u) != 0) {
                 const uint64_t sext = (w < 64 && ((val >> (w - 1)) & 1u)) ? (val | ~mask) : val;
-                out += std::to_string(static_cast<int64_t>(sext));
+                field = std::to_string(static_cast<int64_t>(sext));
             } else {
-                out += std::to_string(val);
+                field = std::to_string(val);
             }
-            return;
+            break;
         case 'h':
         case 'H':
         case 'x':
         case 'X':
-            render_digits(out, val, xz, z, w, 4);
-            return;
         case 'o':
         case 'O':
-            render_digits(out, val, xz, z, w, 3);
-            return;
         case 'b':
-        case 'B':
-            render_digits(out, val, xz, z, w, 1);
-            return;
+        case 'B': {
+            const char     lc   = static_cast<char>(spec.conv | 0x20);
+            const uint32_t bits = lc == 'h' || lc == 'x' ? 4 : lc == 'o' ? 3 : 1;
+            render_digits(field, val, xz, z, w, bits);
+            if (spec.has_width) {
+                // An explicit width replaces the automatic sizing: reduce to the
+                // minimal digits, then zero-pad back out to the field width
+                // (LRM §21.2.1.2 examples: %3h of 32'h5 is "005"; %0h is "a").
+                // NOTE: iverilog deviates here (prints the full natural width);
+                // the LRM table is explicit, so LRM wins.
+                size_t k = 0;
+                while (k + 1 < field.size() && field[k] == '0') {
+                    ++k;
+                }
+                field.erase(0, k);
+            }
+            zero_pad = true;
+            break;
+        }
         case 'c':
         case 'C':
-            out += static_cast<char>(val & 0xff);
-            return;
+            field += static_cast<char>(val & 0xff);
+            break;
         case 't':
         case 'T':
             // The frontend scales a %t argument to design ticks, so `val` is the
-            // tick count; render_time converts it per the current $timeformat.
-            render_time(out, val);
-            return;
+            // tick count; render_time converts it per the current $timeformat,
+            // whose min width is the default field width for %t.
+            render_time(field, val);
+            if (!spec.has_width && timeformat.min_width > 0) {
+                target = static_cast<uint32_t>(timeformat.min_width);
+            }
+            break;
         case 's':
         case 'S':
             if ((a.flags & 2u) != 0) {
                 // A string object: `val` carries the rt_string handle pointer.
                 const auto* s = reinterpret_cast<const rt_string*>(static_cast<uintptr_t>(a.val));
-                out.append(str_data(s), str_len(s));
-                return;
+                field.append(str_data(s), str_len(s));
+                break;
             }
-            // A packed value: ceil(width/8) ASCII chars, most-significant first;
-            // a 0x00 byte prints as a space (matches iverilog).
-            for (uint32_t k = (w + 7) / 8; k-- > 0;) {
-                const auto c = static_cast<char>((val >> (8 * k)) & 0xff);
-                out += c == '\0' ? ' ' : c;
+            // A packed value: ASCII chars most-significant first. Leading 0x00
+            // bytes are never printed (LRM §21.2.1.7 — iverilog deviates and
+            // prints a space per leading NUL; the LRM text and the §21.2.1.1
+            // example are explicit, so LRM wins). An embedded/trailing 0x00
+            // prints as a space (LRM silent; matches iverilog).
+            {
+                uint32_t k = (w + 7) / 8;
+                while (k > 0 && ((val >> (8 * (k - 1))) & 0xff) == 0) {
+                    --k;
+                }
+                while (k-- > 0) {
+                    const auto c = static_cast<char>((val >> (8 * k)) & 0xff);
+                    field += c == '\0' ? ' ' : c;
+                }
             }
-            return;
+            break;
         default:
-            // TODO: %m / %f are consumed but emit nothing, so the field silently
-            // vanishes. LRM expects hierarchical-path / real output respectively.
-            return;
+            format_fatal("unsupported conversion reached the formatter");
+    }
+
+    if (field.size() >= target) {
+        out += field;
+        return;
+    }
+    const size_t fill = target - field.size();
+    if (spec.left_justify) {
+        out += field;
+        out.append(fill, ' ');
+    } else {
+        out.append(fill, zero_pad ? '0' : ' ');
+        out += field;
+    }
+}
+
+// Unformatted output (LRM §21.2.1.1 %u / %z): the operand's 32-bit words, LSB
+// word first, native endian. %u transfers the 2-value projection (x/z bits read
+// as zero); %z transfers vpi aval/bval pairs per word (x: a=1 b=1, z: a=0 b=1).
+void render_unformatted(std::string& out, const rt_arg& a, bool four_state) {
+    const uint32_t w    = a.width ? a.width : 1;
+    const uint64_t mask = width_mask(w);
+    const uint64_t xz   = a.xz & mask;
+    const uint64_t aval = ((a.val & ~a.xz) | (xz & ~a.z)) & mask;
+    const uint32_t words = (w + 31) / 32;
+    for (uint32_t k = 0; k < words; ++k) {
+        const auto append_word = [&out](uint64_t plane, uint32_t word) {
+            const auto u = static_cast<uint32_t>(plane >> (32 * word));
+            out.append(reinterpret_cast<const char*>(&u), sizeof(u));
+        };
+        append_word(four_state ? aval : (a.val & ~a.xz & mask), k);
+        if (four_state) {
+            append_word(xz, k);
+        }
     }
 }
 
 // Format `fmt` with the argument descriptors, appending to `out`. Shared by every
 // $write-family task ($display / $write / $fdisplay / $fwrite differ only in the
-// destination and the folded-in newline, both handled by the caller). Text is
-// emitted verbatim; a `%` begins a specifier whose flags / width / precision are
-// skipped (the field is auto-sized) and whose conversion char selects render_arg.
+// destination and the folded-in newline, both handled by the caller; $sformat /
+// $swrite in the stored destination). The frontend validates every specifier at
+// lower time, so a malformed or unsupported one here is an invariant break.
 void render(std::string& out, const char* fmt, uint32_t argc, const rt_arg* argv) {
-    uint32_t ai = 0;
-    for (const char* p = fmt; *p != '\0'; ++p) {
-        if (*p != '%') {
-            out += *p;
+    const std::string_view f(fmt);
+    uint32_t               ai = 0;
+    for (size_t pos = 0; pos < f.size();) {
+        if (f[pos] != '%') {
+            out += f[pos++];
             continue;
         }
-        ++p;
-        if (*p == '\0') {
-            out += '%';
-            break;
+        const clotho::FormatSpec spec = clotho::parse_format_spec(f.substr(pos + 1));
+        if (!spec.ok) {
+            format_fatal("malformed format specifier reached the formatter");
         }
-        if (*p == '%') {
+        pos += 1 + spec.len;
+        if (spec.conv == '%') {
             out += '%';
             continue;
         }
-        // Skip flags and an optional width/precision; the field is auto-sized.
-        while (*p == '-' || *p == '+' || *p == ' ' || *p == '0') {
-            ++p;
+        if (ai >= argc) {
+            format_fatal("format specifier without a matching argument");
         }
-        while ((*p >= '0' && *p <= '9') || *p == '.') {
-            ++p;
-        }
-        if (*p == '\0') {
-            break;
-        }
-        if (ai < argc) {
-            render_arg(out, argv[ai++], *p);
+        const rt_arg& a = argv[ai++];
+        if (spec.conv == 'u' || spec.conv == 'U' || spec.conv == 'z' || spec.conv == 'Z') {
+            render_unformatted(out, a, spec.conv == 'z' || spec.conv == 'Z');
+        } else {
+            render_arg(out, a, spec);
         }
     }
 }
@@ -696,6 +801,12 @@ rt_sformat(uint8_t* mm, uint8_t* z, uint32_t width, const char* fmt, uint32_t ar
     render(out, fmt, argc, argv);
     store_string_planes(mm, z, width, reinterpret_cast<const uint8_t*>(out.data()),
                         static_cast<uint32_t>(out.size()));
+}
+
+extern "C" void rt_sformat_str(rt_string* dst, const char* fmt, uint32_t argc, const rt_arg* argv) {
+    std::string out;
+    render(out, fmt, argc, argv);
+    rt_string_assign_bytes(dst, out.data(), out.size());
 }
 
 extern "C" int32_t rt_ferror(int32_t fd, uint8_t* mm, uint8_t* z, uint32_t width) {
