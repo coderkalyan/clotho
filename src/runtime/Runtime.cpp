@@ -1,6 +1,5 @@
 #include "Runtime.h"
 
-#include <algorithm>
 #include <array>
 #include <bit>
 #include <cerrno>
@@ -2356,11 +2355,12 @@ inline uint32_t vcd_nwords(uint32_t width) {
 struct VcdVar {
     const uint8_t* mm = nullptr;   // packed must|may plane (i(2W)), or the iW word when narrow
     const uint8_t* z  = nullptr;   // z plane (iW), or null for a never-z / narrow variable
-    uint32_t       width      = 0;
-    uint32_t       nwords     = 0;   // words per plane
-    bool           four_state = false;
-    bool           narrow     = false;   // 2-state `{ iW }` slot: mm is a bare iW value word
-    bool           seen       = false;   // shadow valid (a value has been dumped)
+    uint32_t       width       = 0;
+    uint32_t       nwords      = 0;   // words per plane
+    bool           four_state  = false;
+    bool           narrow      = false;   // 2-state `{ iW }` slot: mm is a bare iW value word
+    bool           always_scan = false;   // array element: scanned every instant (not touched)
+    bool           seen        = false;   // shadow valid (a value has been dumped)
     // Shadow of the last dumped planes: 3*nwords words laid out must | may | z.
     std::vector<uint64_t> shadow;
     // VCD identifier code (printable ASCII), assigned at registration.
@@ -2379,19 +2379,18 @@ struct VcdVar {
 // run). Reset by rt_vcd_close so the next simulation in the same process starts
 // clean.
 struct VcdEngine {
-    std::FILE*            file  = nullptr;
-    char*                 iobuf = nullptr;   // fixed setvbuf buffer
-    rt_wheel*             wheel = nullptr;    // cached for the close-time flush
+    std::FILE*            file    = nullptr;
+    char*                 iobuf   = nullptr;   // owned output buffer (rendered VCD bytes)
+    size_t                out_len = 0;         // bytes pending in iobuf
+    rt_wheel*             wheel   = nullptr;    // cached for the close-time flush
     std::string           path;
     std::vector<VcdVar>   vars;
     std::vector<uint8_t>  recbuf;    // producer -> sink record byte stream for pending instants
     std::vector<uint64_t> scratch;   // scan buffer: 3*max_nwords words (must | may | z)
-    // Activity-driven dirty set. `epoch[i]` guards against re-adding var i within an
-    // instant; `dirty` holds the marked indices to visit at flush; `array_vars` are
-    // the array-element vars, always scanned (their writes are not instrumented).
-    std::vector<uint8_t>  epoch;
-    std::vector<uint32_t> dirty;
-    std::vector<uint32_t> array_vars;
+    // Activity-driven dirty set: `epoch[i]` is set by rt_vcd_touch when var i is
+    // written this instant. The flush scans epoch (and each var's always_scan flag)
+    // in index order, so no per-instant sort or dirty list is needed.
+    std::vector<uint8_t> epoch;
     uint32_t max_nwords = 1;    // widest variable, in words (sizes scratch / buffers)
     uint32_t next_id    = 0;    // next VCD identifier index (assigned per registration)
     bool started        = false;   // header finished ($enddefinitions written)
@@ -2404,12 +2403,35 @@ struct VcdEngine {
 
 VcdEngine g_vcd;
 
-void vcd_put(char c) {
-    std::fputc(c, g_vcd.file);
+// All VCD text is rendered into g_vcd.iobuf and written in bulk. This avoids the
+// per-character locked stdio (std::fputc takes the FILE lock on every call), which
+// dominated the formatter's cost. The buffer is written by whichever thread is
+// appending (the sim thread for the header before the writer spawns, the writer
+// thread for the body afterwards) -- never concurrently.
+void vcd_flush_out() {
+    if (g_vcd.out_len != 0) {
+        std::fwrite(g_vcd.iobuf, 1, g_vcd.out_len, g_vcd.file);
+        g_vcd.out_len = 0;
+    }
 }
 
-void vcd_puts(std::string_view s) {
-    std::fwrite(s.data(), 1, s.size(), g_vcd.file);
+inline void vcd_put(char c) {
+    if (g_vcd.out_len >= VcdEngine::iobuf_size) {
+        vcd_flush_out();
+    }
+    g_vcd.iobuf[g_vcd.out_len++] = c;
+}
+
+inline void vcd_puts(std::string_view s) {
+    if (g_vcd.out_len + s.size() > VcdEngine::iobuf_size) {
+        vcd_flush_out();
+        if (s.size() > VcdEngine::iobuf_size) {   // a single string larger than the buffer
+            std::fwrite(s.data(), 1, s.size(), g_vcd.file);
+            return;
+        }
+    }
+    std::memcpy(g_vcd.iobuf + g_vcd.out_len, s.data(), s.size());
+    g_vcd.out_len += s.size();
 }
 
 void vcd_put_dec(uint64_t v) {
@@ -2593,23 +2615,31 @@ void vcd_emit(const VcdVar& v, const uint64_t* must, const uint64_t* may, const 
 // two here is what lets a later step move vcd_drain onto a writer thread, or swap
 // in an FST / viewer sink, without touching the producer.
 
-void vcd_buf_put(std::vector<uint8_t>& b, const void* p, size_t n) {
-    const auto* s = static_cast<const uint8_t*>(p);
-    b.insert(b.end(), s, s + n);
+// Grow recbuf by `n` and return a pointer to the fresh region. recbuf is reserved
+// to a whole handoff batch at start, so resize never reallocates -- far cheaper
+// than std::vector::insert's range machinery, which dominated the producer's cost
+// in profiling.
+inline uint8_t* vcd_rec_grow(size_t n) {
+    const size_t o = g_vcd.recbuf.size();
+    g_vcd.recbuf.resize(o + n);
+    return g_vcd.recbuf.data() + o;
 }
 
 void vcd_rec_time(uint64_t tick) {
-    g_vcd.recbuf.push_back(1);
-    vcd_buf_put(g_vcd.recbuf, &tick, sizeof(tick));
+    uint8_t* d = vcd_rec_grow(1 + sizeof(tick));
+    d[0]       = 1;
+    std::memcpy(d + 1, &tick, sizeof(tick));
 }
 
 // Append a value-change record: idx, nwords, then the must | may | z planes
 // (3*nwords words, contiguous at `planes`).
 void vcd_rec_change(uint32_t idx, const uint64_t* planes, uint32_t nwords) {
-    g_vcd.recbuf.push_back(0);
-    vcd_buf_put(g_vcd.recbuf, &idx, sizeof(idx));
-    vcd_buf_put(g_vcd.recbuf, &nwords, sizeof(nwords));
-    vcd_buf_put(g_vcd.recbuf, planes, static_cast<size_t>(3) * nwords * 8);
+    const size_t pbytes = static_cast<size_t>(3) * nwords * 8;
+    uint8_t*     d      = vcd_rec_grow(9 + pbytes);
+    d[0]                = 0;
+    std::memcpy(d + 1, &idx, 4);
+    std::memcpy(d + 5, &nwords, 4);
+    std::memcpy(d + 9, planes, pbytes);
 }
 
 // Diff variable `i` against its shadow; if changed (or `force`), append a change
@@ -2651,8 +2681,8 @@ void vcd_write_records(const std::vector<uint8_t>& buf) {
             p += sizeof(idx);
             std::memcpy(&nw, &buf[p], sizeof(nw));
             p += sizeof(nw);
-            // Copy the (unaligned) planes into an aligned scratch before formatting.
-            vcd_writer_scratch.resize(static_cast<size_t>(3) * nw);
+            // Copy the (unaligned) planes into the aligned scratch (reserved to
+            // 3*max_nwords at start, so no resize) before formatting.
             std::memcpy(vcd_writer_scratch.data(), &buf[p], static_cast<size_t>(3) * nw * 8);
             p += static_cast<size_t>(3) * nw * 8;
             const uint64_t* planes = vcd_writer_scratch.data();
@@ -2747,8 +2777,11 @@ extern "C" void rt_vcd_begin(void* wheel, uint64_t tick_fs, int32_t units) {
         std::fprintf(stderr, "$dumpvars: cannot open '%s'\n", g_vcd.path.c_str());
         return;
     }
-    g_vcd.iobuf = static_cast<char*>(std::malloc(VcdEngine::iobuf_size));
-    std::setvbuf(g_vcd.file, g_vcd.iobuf, _IOFBF, VcdEngine::iobuf_size);
+    g_vcd.iobuf   = static_cast<char*>(std::malloc(VcdEngine::iobuf_size));
+    g_vcd.out_len = 0;
+    // We buffer output ourselves in iobuf; make the FILE unbuffered so a bulk
+    // fwrite of the rendered bytes goes straight to write() with no second copy.
+    std::setvbuf(g_vcd.file, nullptr, _IONBF, 0);
     g_vcd.wheel = static_cast<rt_wheel*>(wheel);
 
     vcd_puts("$date\n\tClotho simulation\n$end\n");
@@ -2779,10 +2812,8 @@ extern "C" void rt_vcd_upscope(void) {
 // dirty set.
 static void vcd_register(std::string_view ref, uint32_t width, uint32_t flags, const uint8_t* mm, const uint8_t* z,
                          bool always_scan) {
-    if (always_scan) {
-        g_vcd.array_vars.push_back(static_cast<uint32_t>(g_vcd.vars.size()));
-    }
     VcdVar v;
+    v.always_scan = always_scan;
     v.mm         = mm;
     v.z          = z;
     v.width      = width;
@@ -2817,12 +2848,9 @@ extern "C" void rt_vcd_var(const char* name, uint32_t name_len, uint32_t width, 
 
 extern "C" void rt_vcd_touch(uint32_t idx) {
     // idx >= epoch.size() covers a not-dumped NBA target passed as (uint32_t)-1.
-    if (!g_vcd.active || idx >= g_vcd.epoch.size()) {
-        return;
-    }
-    if (g_vcd.epoch[idx] == 0) {
+    // Setting the flag is idempotent, so no dedup / list bookkeeping is needed.
+    if (g_vcd.active && idx < g_vcd.epoch.size()) {
         g_vcd.epoch[idx] = 1;
-        g_vcd.dirty.push_back(idx);
     }
 }
 
@@ -2853,11 +2881,9 @@ extern "C" void rt_vcd_start(void) {
         // The scan scratch holds one variable's 3*nwords planes plus, in its tail,
         // the raw 2W-bit must|may read buffer (up to 2*max_nwords+1 words).
         g_vcd.scratch.assign(static_cast<size_t>(5) * g_vcd.max_nwords + 2, 0);
-        // Dirty set: one epoch flag per var, and a dirty ring bounded by the var
-        // count (each var appears at most once per instant).
+        // Dirty set: one epoch flag per var, set by rt_vcd_touch and scanned +
+        // cleared in index order at flush.
         g_vcd.epoch.assign(g_vcd.vars.size(), 0);
-        g_vcd.dirty.clear();
-        g_vcd.dirty.reserve(g_vcd.vars.size());
         vcd_writer_scratch.reserve(static_cast<size_t>(3) * g_vcd.max_nwords);
         // Size every record buffer to hold a full handoff batch plus one more whole
         // instant, so the producer never allocates and never splits an instant
@@ -2889,19 +2915,12 @@ extern "C" void rt_vcd_flush(uint64_t tick) {
     if (g_vcd.file == nullptr) {
         return;
     }
-    uint64_t* const scan = g_vcd.scratch.data();
-    // Clear the dirty set: whatever we do here re-establishes the shadow, so
-    // pending touches are subsumed.
-    const auto clear_dirty = [] {
-        for (const uint32_t idx : g_vcd.dirty) {
-            g_vcd.epoch[idx] = 0;
-        }
-        g_vcd.dirty.clear();
-    };
+    uint64_t* const scan  = g_vcd.scratch.data();
+    const uint32_t  nvars = static_cast<uint32_t>(g_vcd.vars.size());
     if (g_vcd.pending_off) {
         // $dumpoff checkpoint: mark every variable all-x at this instant.
         vcd_rec_time(tick);
-        for (uint32_t i = 0; i < g_vcd.vars.size(); ++i) {
+        for (uint32_t i = 0; i < nvars; ++i) {
             VcdVar&        v  = g_vcd.vars[i];
             const uint32_t nw = v.nwords;
             std::memset(scan, 0, static_cast<size_t>(3) * nw * 8);   // must = 0, z = 0
@@ -2911,9 +2930,9 @@ extern "C" void rt_vcd_flush(uint64_t tick) {
             scan[2 * nw - 1] &= vcd_topmask(v.width);
             vcd_rec_change(i, scan, nw);
             std::memcpy(v.shadow.data(), scan, static_cast<size_t>(3) * nw * 8);
-            v.seen = true;
+            v.seen         = true;
+            g_vcd.epoch[i] = 0;
         }
-        clear_dirty();
         g_vcd.pending_off = false;
         g_vcd.active      = false;
         vcd_handoff();
@@ -2923,35 +2942,27 @@ extern "C" void rt_vcd_flush(uint64_t tick) {
         return;
     }
     // Produce a time marker followed by the changed variables; drop the marker if
-    // nothing changed (no-change instants emit nothing).
+    // nothing changed (no-change instants emit nothing). Scan in index order,
+    // reading + diffing only variables the dirty set marked (or always-scanned
+    // array elements). No per-instant sort: index order is byte-identical to a full
+    // scan for free, and the epoch check skips the expensive read/diff for the rest.
     const size_t mark = g_vcd.recbuf.size();
     vcd_rec_time(tick);
     bool any = false;
     if (g_vcd.force_all) {
-        // Initial / $dumpall / $dumpon: emit every variable.
-        for (uint32_t i = 0; i < g_vcd.vars.size(); ++i) {
+        for (uint32_t i = 0; i < nvars; ++i) {
+            g_vcd.epoch[i] = 0;
             any |= vcd_scan_var(i, true);
         }
     } else {
-        // Incremental: the marked scalars (dirty set) plus the always-scanned array
-        // elements. Emit in variable-index order (merge the sorted dirty set with
-        // the already-sorted array vars) so the output matches the full-scan byte
-        // for byte -- intra-instant order is free per LRM, but determinism keeps the
-        // dump reproducible. A no-change candidate simply emits nothing.
-        std::sort(g_vcd.dirty.begin(), g_vcd.dirty.end());
-        size_t di = 0, ai = 0;
-        while (di < g_vcd.dirty.size() || ai < g_vcd.array_vars.size()) {
-            uint32_t idx = 0;
-            if (ai >= g_vcd.array_vars.size() ||
-                (di < g_vcd.dirty.size() && g_vcd.dirty[di] < g_vcd.array_vars[ai])) {
-                idx = g_vcd.dirty[di++];
-            } else {
-                idx = g_vcd.array_vars[ai++];
+        for (uint32_t i = 0; i < nvars; ++i) {
+            const bool touched = g_vcd.epoch[i] != 0;
+            g_vcd.epoch[i]     = 0;
+            if (touched || g_vcd.vars[i].always_scan) {
+                any |= vcd_scan_var(i, false);
             }
-            any |= vcd_scan_var(idx, false);
         }
     }
-    clear_dirty();
     if (!any) {
         g_vcd.recbuf.resize(mark);
     }
@@ -2993,6 +3004,7 @@ extern "C" void rt_vcd_dumpflush(void) {
     vcd_handoff();
     std::unique_lock<std::mutex> lk(vcd_mu);
     vcd_cv_idle.wait(lk, [] { return vcd_ready.empty() && vcd_inflight == 0; });
+    vcd_flush_out();   // writer is idle -> no concurrent append into iobuf
     std::fflush(g_vcd.file);
 }
 
@@ -3027,6 +3039,7 @@ extern "C" void rt_vcd_close(void) {
     }
     vcd_handoff();            // push the final partial buffer
     vcd_shutdown_writer();    // drain + join the writer before touching the file
+    vcd_flush_out();          // writer joined -> flush the last rendered bytes
     std::fflush(g_vcd.file);
     std::fclose(g_vcd.file);
     std::free(g_vcd.iobuf);
