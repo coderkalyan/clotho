@@ -205,6 +205,27 @@ TEST_CASE("always_comb sensitivity includes signals read inside a function") {
     CHECK(run_capture(src) == "11\n21\n25\n");
 }
 
+// A continuous assign is sensitive only to the operands of its RHS (LRM 10.3.2);
+// the function-body contribution is an always_comb-only rule (9.2.2.2.2). So the
+// same `f(a)` reading module signal g does NOT re-evaluate y when g alone
+// changes — only a change to the argument a does. Contrast the always_comb case
+// above (11/21/25). Verified vs iverilog.
+TEST_CASE("continuous assign is not sensitive to signals read inside a function") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a, g, y;
+            function [7:0] f(input [7:0] x); f = x + g; endfunction
+            assign y = f(a);
+            initial begin
+                a = 8'd1; g = 8'd10; #1; $display("%0d", y);
+                g = 8'd20; #1; $display("%0d", y);
+                a = 8'd5; #1; $display("%0d", y);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "11\n11\n25\n");
+}
+
 // Default lifetime in a non-automatic module is STATIC: a declared local persists
 // across calls and is initialized once (LRM 13.4.2). counter() => 1, 2, 3.
 TEST_CASE("static (default) local persists across calls") {

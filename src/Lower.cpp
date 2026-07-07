@@ -216,12 +216,17 @@ ir::SignalInfo::Direction direction_of(slang::ast::ArgumentDirection d) {
 // Which inferred-sensitivity rule set a SensitivityCollector walk applies. The
 // LRM defines two that differ in how subroutine calls contribute (9.2.2.2.2):
 //
-// - Comb (`always_comb` / `always_latch`, 9.2.2.2.1, and continuous assigns):
-//   the bodies of called functions contribute their reads and writes; the
-//   bodies of called tasks contribute nothing (only the task's argument
-//   expressions do).
-// - ImplicitEvent (`always @*`, 9.4.2.2): no called subroutine body
-//   contributes anything; only the argument expressions are sensitive.
+// - Comb (`always_comb` / `always_latch`, 9.2.2.2.1): the bodies of called
+//   functions contribute their reads and writes; the bodies of called tasks
+//   contribute nothing (only the task's argument expressions do).
+// - ImplicitEvent (`always @*`, 9.4.2.2, and continuous assigns / port copies):
+//   no called subroutine body contributes anything; only the argument
+//   expressions are sensitive. 9.2.2.2.2 makes the function-body contribution an
+//   always_comb-only rule ("always_comb is sensitive to changes to variables
+//   read within a function called within the procedure, whereas always @* is
+//   sensitive to changes only to the arguments of such a function"); a
+//   continuous assign responds to "an operand in the right-hand expression"
+//   (10.3.2), and a function-internal read is not an operand of that expression.
 enum class SensitivityMode : uint8_t {
     Comb,
     ImplicitEvent,
@@ -1095,12 +1100,16 @@ private:
     // must stay sensitive. An empty list (constant RHS) yields a run-once
     // process, which is the required time-zero evaluation.
     //
-    // NOTE: Comb mode inlines called-function reads. The LRM leaves this
-    // unspecified for continuous assigns; inlining is
-    // the safe superset (extra wakeups of an idempotent assign).
+    // A continuous assign is sensitive only to the operands of its RHS
+    // expression (10.3.2), so a called function's argument expressions are
+    // sensitive but signals the function reads internally are not — the
+    // function-body contribution is an always_comb-only rule (9.2.2.2.2).
+    // ImplicitEvent mode enforces that. Verified vs iverilog: with
+    // `assign y = f(x)` where f reads module signal g, changing g alone does
+    // not re-evaluate y.
     std::vector<ir::WaitEvent> continuous_events(const Expression& e) {
         std::vector<ir::WaitEvent> events;
-        SensitivityCollector       c(sigmap_, SensitivityMode::Comb);
+        SensitivityCollector       c(sigmap_, SensitivityMode::ImplicitEvent);
         e.visit(c);
         for (const ir::Signal s : c.reads) {
             events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
@@ -1217,7 +1226,11 @@ private:
     // any-change wait) to `out`. Mirrors collect_inferred_sensitivity for an
     // expression with no writes.
     void collect_expr_reads(const Expression& expr, std::vector<ir::WaitEvent>& out) {
-        SensitivityCollector c(sigmap_, SensitivityMode::Comb);
+        // A port connection is a continuous copy (LRM 23.3.3), so it follows the
+        // continuous-assign sensitivity rule: function-internal reads do not
+        // contribute (ImplicitEvent), only the expression's own operands and any
+        // call arguments.
+        SensitivityCollector c(sigmap_, SensitivityMode::ImplicitEvent);
         expr.visit(c);
         for (const ir::Signal s : c.reads) {
             if (c.written.contains(static_cast<uint32_t>(s))) {
