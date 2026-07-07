@@ -166,3 +166,17 @@ TEST_CASE("compound assignment to a string element is rejected") {
     CHECK_MESSAGE(r.diagnostics.find("compound assignment to a string") != std::string::npos,
                   r.diagnostics);
 }
+
+// An assignment used as an rvalue is not supported yet (LRM 11.3.1); it must
+// fail loudly rather than silently drop the store or mis-value the result.
+TEST_CASE("assignment used as an expression is rejected") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            int x, y;
+            initial begin x = 0; y = (x += 1); end
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK_MESSAGE(r.diagnostics.find("assignment used as an expression") != std::string::npos,
+                  r.diagnostics);
+}

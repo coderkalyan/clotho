@@ -2850,6 +2850,12 @@ private:
                 }
                 return *v;
             }
+            case ExpressionKind::Assignment:
+                // TODO: assignment used as an rvalue (`y = (x += 1)`, `y = (x = 5)`).
+                // Its value is the LHS after the store, truncated to the LHS type
+                // (LRM 11.3.1) — not the raw RHS, so it needs lower_assign to
+                // return the stored value and this site to route into it.
+                fail("assignment used as an expression is not supported");
             default:
                 fail("unsupported expression kind=" + std::string(slang::ast::toString(expr.kind)));
         }
