@@ -210,11 +210,14 @@ ir::SignalInfo::Direction direction_of(slang::ast::ArgumentDirection d) {
     return ir::SignalInfo::Direction::Internal;
 }
 
-// Infers the @* sensitivity of a combinational process body (an `always_comb`,
-// `always_latch`, or `always @*`): the signals it reads to compute a result,
-// minus the ones it writes. A signal that is both read and written is an
-// internal intermediate and is left out; index/part-select expressions on a
-// write target are themselves reads and are kept (11.6, 9.2.2.2).
+// Infers the implicit sensitivity of a combinational process body. `reads`
+// holds every signal read; `written` holds every assignment target. The two
+// exclusion rules differ by construct: `always_comb`/`always_latch` subtract
+// signals also written (LRM 9.2.2.2.1 exception b), while `always @*` keeps
+// them — 9.4.2.2 excludes only identifiers appearing solely as lvalues, so a
+// read+written signal stays in the list and an external writer re-triggers
+// the block. Index/part-select expressions on a write target are themselves
+// reads in both schemes (11.6, 9.2.2.2, 9.4.2.2).
 //
 // The AST is walked rather than the lowered IR so reads are seen at the source
 // level, before any temporaries the IR introduces. Symbols not in `sigmap`
@@ -1095,7 +1098,7 @@ private:
                 record_net_driver_range(p.internalSymbol->as<ValueSymbol>(), 0, UINT32_MAX);
                 const ir::Ref ty = lower_type(p.internalSymbol->as<ValueSymbol>().getType());
                 b.binary(ir::Inst::Tag::Store, b.signal(child_sig, l), b.resize(lower_expr(*expr, b), ty, l), l);
-                collect_inferred_sensitivity(*expr, sens);
+                collect_inferred_sensitivity(*expr, sens, /*exclude_written=*/false);
             }
             // A port connection is a continuous copy: evaluate at time zero so the
             // child sees the parent's declaration-initialized value even when the
@@ -1119,11 +1122,13 @@ private:
 
         const Statement* body = &sym.getBody();
 
-        // `always_comb` / `always_latch` have no written sensitivity at all; their
-        // event list is inferred from the body's reads (9.2.2.2). `always @*`
-        // carries an ImplicitEvent timing wrapping the body, inferred the same way.
-        bool infer = sym.procedureKind == ProceduralBlockKind::AlwaysComb ||
-                     sym.procedureKind == ProceduralBlockKind::AlwaysLatch;
+        // `always_comb` / `always_latch` infer sensitivity from the body's reads
+        // minus its writes (9.2.2.2.1, legal because of the single-writer rule).
+        // `always @*` carries an ImplicitEvent timing wrapping the body and keeps
+        // read+written signals (9.4.2.2): other processes may write them.
+        const bool comb = sym.procedureKind == ProceduralBlockKind::AlwaysComb ||
+                          sym.procedureKind == ProceduralBlockKind::AlwaysLatch;
+        bool infer = comb;
 
         // A top-level event control is the process's sensitivity: collect its wait
         // events here and lower the statement underneath.
@@ -1158,7 +1163,7 @@ private:
         // Inferred sensitivity is read from the body after lowering, so any
         // block-local declarations it touched are already registered in sigmap_.
         if (infer) {
-            collect_inferred_sensitivity(*body, wait_events);
+            collect_inferred_sensitivity(*body, wait_events, /*exclude_written=*/comb);
         }
         // always_comb / always_latch evaluate once at time zero (LRM 9.2.2.2), so
         // they settle from declaration-initialized values. An `always @*` or an
@@ -1216,22 +1221,25 @@ private:
 
     // Build the inferred sensitivity of an AST node — a combinational process
     // body (@* / always_comb) or a port-connection source expression — and
-    // append it to `out`: every signal read to compute a result, minus those
-    // the node writes, each entered as a level-sensitive (any-change) wait.
+    // append every signal read as a level-sensitive (any-change) wait.
+    // `exclude_written` selects the always_comb rule (9.2.2.2.1 b: drop signals
+    // the node also writes); `always @*` passes false per 9.4.2.2.
     template <typename Node>
-    void collect_inferred_sensitivity(const Node& node, std::vector<ir::WaitEvent>& out) {
+    void collect_inferred_sensitivity(const Node& node, std::vector<ir::WaitEvent>& out,
+                                      bool exclude_written) {
         SensitivityCollector c(sigmap_);
         node.visit(c);
         for (const ir::Signal s : c.reads) {
-            if (!c.written.contains(static_cast<uint32_t>(s))) {
-                if (is_string_ref(module_.signal(s).type)) {
-                    // TODO: string signals in inferred sensitivity — string
-                    // stores skip wait-queue servicing, so the process would
-                    // never re-trigger.
-                    fail("string in inferred sensitivity is not supported");
-                }
-                out.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
+            if (exclude_written && c.written.contains(static_cast<uint32_t>(s))) {
+                continue;
             }
+            if (is_string_ref(module_.signal(s).type)) {
+                // TODO: string signals in inferred sensitivity — string
+                // stores skip wait-queue servicing, so the process would
+                // never re-trigger.
+                fail("string in inferred sensitivity is not supported");
+            }
+            out.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
         }
     }
 

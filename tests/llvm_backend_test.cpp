@@ -1682,6 +1682,33 @@ TEST_CASE("declaration initializers propagate to continuous consumers at time ze
     CHECK(out == "y=0 dvalid=0\n");
 }
 
+// `always @*` sensitivity includes signals both read and written by the block
+// (LRM 9.4.2.2 excludes only identifiers appearing solely as lvalues), unlike
+// always_comb's written-exclusion (9.2.2.2.1 b, legal there only because of the
+// single-writer rule). Regression: `a` was subtracted from the @* list, so the
+// external `a = 100` write at t=1 never re-triggered the block and `y` stayed 0.
+// Expected output matches iverilog.
+TEST_CASE("always @* re-triggers on external writes to read+written signals") {
+    const std::string out = run_capture(R"(
+        module m;
+            integer a, b, d, y;
+            always @* begin
+                if (b > 0) a = b;
+                y = a + d;
+            end
+            initial begin
+                b = 0; d = 7; a = 0;
+                #1 a = 100;
+                #1 $display("y=%0d", y);
+                #1 b = 5;
+                #1 $display("y=%0d", y);
+                $finish;
+            end
+        endmodule
+    )");
+    CHECK(out == "y=107\ny=12\n");
+}
+
 // A net declaration assignment (`wire w = a & b`) is a continuous assignment
 // (LRM 6.7.1), re-evaluated when its source changes — not a one-shot init and not
 // silently dropped (regression: it previously left the net at X).
