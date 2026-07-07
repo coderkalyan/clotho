@@ -301,6 +301,21 @@ struct Analysis {
                 case Inst::Tag::StrSubstr:
                 case Inst::Tag::StrFromPacked:
                 case Inst::Tag::StrToPacked:
+                // File I/O: descriptors and read counts are always-known integers,
+                // and the write-back forms ($fgets / $sformat / $ferror / $*scanf /
+                // $fread) store known bytes with a zero z plane, so none seed z into
+                // their target. A never-z target's z word is elided and the runtime
+                // is handed a null z pointer.
+                case Inst::Tag::Fopen:
+                case Inst::Tag::Fclose:
+                case Inst::Tag::FileValueOp:
+                case Inst::Tag::Fgets:
+                case Inst::Tag::Sformat:
+                case Inst::Tag::Sformatf:
+                case Inst::Tag::Ferror:
+                case Inst::Tag::Scanf:
+                case Inst::Tag::FreadWord:
+                case Inst::Tag::FreadMem:
                     break;
             }
         }

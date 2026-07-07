@@ -23,6 +23,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Lnot:
         case T::Ret:
         case T::Delay:
+        case T::Fclose:
+        case T::Fflush:
         case T::StrLen:
         case T::StrUpper:
         case T::StrLower:
@@ -76,10 +78,17 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::TaskCall;
         case T::Display:
             return K::Display;
+        case T::FileValueOp:
+            return K::FileOp;
+        case T::Sformat:
+            return K::Sformat;
+        case T::Sformatf:
+            return K::Sformatf;
+        case T::Scanf:
+            return K::Scanf;
         case T::TimeFormat:
             return K::TimeFormat;
         case T::Finish:
-        case T::Fflush:
         case T::SimTime:
         case T::Random:
             return K::None;
@@ -91,6 +100,11 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::DynPartSelect:
         case T::ElemSelect:
         case T::Cond:
+        case T::Fopen:
+        case T::Fgets:
+        case T::Ferror:
+        case T::FreadWord:
+        case T::FreadMem:
         case T::ReadMem:
         case T::StrPutc:
         case T::StrSubstr:
@@ -158,6 +172,34 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
             // display: the value args are an index slice in the DisplayInfo record;
             // the format string is not an SSA operand.
             const auto info = extra_data<DisplayInfo>(p.display);
+            return index_slice(info.args);
+        }
+
+        case Inst::PayloadKind::FileOp: {
+            // file_value_op: the value args live in the FileOpInfo record; the
+            // opcode is not an SSA operand.
+            const auto info = extra_data<FileOpInfo>(p.extra);
+            return index_slice(info.args);
+        }
+
+        case Inst::PayloadKind::Sformat: {
+            // sformat: the value args live in the SformatInfo record; the format
+            // bytes and the destination lvalue are not value operands.
+            const auto info = extra_data<SformatInfo>(p.extra);
+            return index_slice(info.args);
+        }
+
+        case Inst::PayloadKind::Sformatf: {
+            // sformatf: the value args live in the SformatfInfo record; the
+            // format bytes are not value operands.
+            const auto info = extra_data<SformatfInfo>(p.extra);
+            return index_slice(info.args);
+        }
+
+        case Inst::PayloadKind::Scanf: {
+            // scanf: the output lvalue operands live in the ScanfInfo record; the
+            // format bytes and the source operand are read directly.
+            const auto info = extra_data<ScanfInfo>(p.extra);
             return index_slice(info.args);
         }
 

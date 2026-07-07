@@ -16,13 +16,16 @@ using namespace clotho;
 
 namespace {
 
+// Emit unoptimized LLVM IR: these tests assert the backend's own emission
+// structure (native iW ops, slot types), which the optimization pipeline is
+// free to rewrite or constant-fold.
 std::string emit(std::string_view source) {
     const LowerResult result = lower_text(source);
     REQUIRE_MESSAGE(result.ok, result.diagnostics);
     REQUIRE(result.module != nullptr);
     std::string              text;
     llvm::raw_string_ostream os(text);
-    REQUIRE(ir::emit_llvm(*result.module, os));
+    REQUIRE(ir::emit_llvm(*result.module, os, { .optimize = false }));
     return text;
 }
 

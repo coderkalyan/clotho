@@ -2871,6 +2871,17 @@ private:
                 return { 64, false, false };
             case Inst::Tag::Random:
                 return { 32, false, true };
+            case Inst::Tag::Fopen:
+                // $fopen returns a 32-bit descriptor integer.
+                return { 32, false, true };
+            case Inst::Tag::FileValueOp:
+            case Inst::Tag::Fgets:
+            case Inst::Tag::Ferror:
+            case Inst::Tag::Scanf:
+            case Inst::Tag::FreadWord:
+            case Inst::Tag::FreadMem:
+                // The file read / positioning / error / scan functions return i32.
+                return { 32, false, true };
 
             case Inst::Tag::Add:
             case Inst::Tag::Sub:
@@ -2945,6 +2956,7 @@ private:
             case Inst::Tag::StrLower:
             case Inst::Tag::StrSubstr:
             case Inst::Tag::StrFromPacked:
+            case Inst::Tag::Sformatf:
                 return { 0, false, false, true };
             case Inst::Tag::StrToPacked:
                 return from_ref(p.op_type.type);
@@ -2962,6 +2974,8 @@ private:
             case Inst::Tag::TimeFormat:
             case Inst::Tag::Finish:
             case Inst::Tag::Fflush:
+            case Inst::Tag::Fclose:
+            case Inst::Tag::Sformat:
             case Inst::Tag::ReadMem:
             case Inst::Tag::TaskCall:
                 return { 0, false, false };
@@ -3027,6 +3041,7 @@ private:
             case Inst::Tag::StrLower:
             case Inst::Tag::StrSubstr:
             case Inst::Tag::StrFromPacked:
+            case Inst::Tag::Sformatf:
                 return true;
             case Inst::Tag::Constant:
             case Inst::Tag::Concat:
@@ -3414,7 +3429,47 @@ private:
                 return;
 
             case Inst::Tag::Fflush:
-                b_.CreateCall(fflush_fn(), {});
+                lower_fflush(i);
+                return;
+
+            case Inst::Tag::Fopen:
+                lower_fopen(i);
+                return;
+
+            case Inst::Tag::Fclose:
+                lower_fclose(i);
+                return;
+
+            case Inst::Tag::FileValueOp:
+                lower_file_op(i);
+                return;
+
+            case Inst::Tag::Fgets:
+                lower_fgets(i);
+                return;
+
+            case Inst::Tag::Sformat:
+                lower_sformat(i);
+                return;
+
+            case Inst::Tag::Sformatf:
+                lower_sformatf(i);
+                return;
+
+            case Inst::Tag::Ferror:
+                lower_ferror(i);
+                return;
+
+            case Inst::Tag::Scanf:
+                lower_scanf(i);
+                return;
+
+            case Inst::Tag::FreadWord:
+                lower_fread_word(i);
+                return;
+
+            case Inst::Tag::FreadMem:
+                lower_fread_mem(i);
                 return;
 
             case Inst::Tag::ReadMem:
@@ -3862,9 +3917,26 @@ private:
           ctx_, { b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty() });
     }
 
-    // void rt_display(const char* fmt, i32 argc, const rt_arg* argv)
-    llvm::FunctionCallee display_fn() {
-        return rt_fn("rt_display", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
+    // void rt_fwrite(i32 desc, const char* fmt, i32 argc, const rt_arg* argv)
+    llvm::FunctionCallee fwrite_fn() {
+        auto* i32 = b_.getInt32Ty();
+        return rt_fn("rt_fwrite", b_.getVoidTy(), { i32, raw_ptr_ty(), i32, raw_ptr_ty() });
+    }
+
+    // i32 rt_fopen_mcd(const char* name, i32 name_len)
+    llvm::FunctionCallee fopen_mcd_fn() {
+        return rt_fn("rt_fopen_mcd", b_.getInt32Ty(), { raw_ptr_ty(), b_.getInt32Ty() });
+    }
+
+    // i32 rt_fopen_fd(const char* name, i32 name_len, const char* mode, i32 mode_len)
+    llvm::FunctionCallee fopen_fd_fn() {
+        auto* i32 = b_.getInt32Ty();
+        return rt_fn("rt_fopen_fd", i32, { raw_ptr_ty(), i32, raw_ptr_ty(), i32 });
+    }
+
+    // void rt_fclose(i32 desc)
+    llvm::FunctionCallee fclose_fn() {
+        return rt_fn("rt_fclose", b_.getVoidTy(), { b_.getInt32Ty() });
     }
 
     // void rt_timeformat_init(i64 tick_fs, i32 default_units)
@@ -3904,9 +3976,291 @@ private:
         return fn;
     }
 
-    // void rt_fflush(void) — flush all open output buffers ($fflush, no-arg form).
+    // Lower a $finish / $stop: call the runtime, which exits the process. The call
+    // never returns, so the rest of the region is dead, but it stays valid IR —
+    // rt_finish is marked noreturn and the optimizer prunes the unreachable tail.
+    void lower_finish() {
+        b_.CreateCall(finish_fn(), {});
+    }
+
+    // void rt_fflush(i32 desc) — flush a descriptor's output buffers (0 => all).
     llvm::FunctionCallee fflush_fn() {
-        return rt_fn("rt_fflush", b_.getVoidTy(), {});
+        return rt_fn("rt_fflush", b_.getVoidTy(), { b_.getInt32Ty() });
+    }
+
+    // Lower a $fflush: flush the descriptor operand's buffers (a constant 0 for the
+    // no-argument form, which the runtime reads as "flush everything").
+    void lower_fflush(Index i) {
+        llvm::Value* desc = cast(must_of(value_of(ir_->payload(i).unary)), 32, true);
+        b_.CreateCall(fflush_fn(), { desc });
+    }
+
+    // Lower a $fopen: spill the filename (and mode, for the FD form) to stack byte
+    // buffers and call the matching runtime opener; the result is the descriptor.
+    void lower_fopen(Index i) {
+        const Index fname = ir_->payload(i).op_extra.op;
+        const auto  info  = ir_->extra_data<FopenInfo>(ir_->payload(i).op_extra.extra);
+        const auto [name_ptr, name_len] = spill_ascii(fname, "fopen.name");
+
+        llvm::Value* desc = nullptr;
+        if (info.has_mode) {
+            const auto [mode_ptr, mode_len] = spill_ascii(info.mode, "fopen.mode");
+            desc = b_.CreateCall(
+              fopen_fd_fn(), { name_ptr, b_.getInt32(name_len), mode_ptr, b_.getInt32(mode_len) });
+        } else {
+            desc = b_.CreateCall(fopen_mcd_fn(), { name_ptr, b_.getInt32(name_len) });
+        }
+        // The descriptor is a plain known integer (no x/z): must == may, z == 0.
+        set_value(i, packed(desc, desc, zero(32)));
+    }
+
+    // Lower a $fclose: close the descriptor operand.
+    void lower_fclose(Index i) {
+        llvm::Value* desc = cast(must_of(value_of(ir_->payload(i).unary)), 32, true);
+        b_.CreateCall(fclose_fn(), { desc });
+    }
+
+    // Lower a $fgetc / $ungetc / $feof / $ftell / $fseek / $rewind: every one takes
+    // i32 operands and returns i32, so the call is built generically and only the
+    // runtime symbol varies with the opcode. The result is a known integer.
+    void lower_file_op(Index i) {
+        const auto                   info = ir_->extra_data<FileOpInfo>(ir_->payload(i).extra);
+        const std::span<const Index> args = ir_->region(info.args);
+
+        std::vector<llvm::Value*> argv;
+        argv.reserve(args.size());
+        for (Index a : args) {
+            argv.push_back(cast(must_of(value_of(a)), 32, true));
+        }
+
+        const char* fn = nullptr;
+        switch (static_cast<FileOp>(info.op)) {
+            case FileOp::Fgetc:
+                fn = "rt_fgetc";
+                break;
+            case FileOp::Ungetc:
+                fn = "rt_ungetc";
+                break;
+            case FileOp::Feof:
+                fn = "rt_feof";
+                break;
+            case FileOp::Ftell:
+                fn = "rt_ftell";
+                break;
+            case FileOp::Fseek:
+                fn = "rt_fseek";
+                break;
+            case FileOp::Rewind:
+                fn = "rt_rewind";
+                break;
+        }
+
+        std::vector<llvm::Type*> params(args.size(), b_.getInt32Ty());
+        auto*        fnty = llvm::FunctionType::get(b_.getInt32Ty(), params, false);
+        llvm::Value* r    = b_.CreateCall(llmod_.getOrInsertFunction(fn, fnty), argv);
+        set_value(i, packed(r, r, zero(32)));
+    }
+
+    // i32 rt_fgets(i8* mm, i8* z, i32 width, i32 fd)
+    llvm::FunctionCallee fgets_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(i32, { ptr, ptr, i32, i32 }, false);
+        return llmod_.getOrInsertFunction("rt_fgets", fnty);
+    }
+
+    // Lower a $fgets: hand the runtime the destination vector's plane pointers plus
+    // its bit width and the descriptor. The runtime reads a line, stores it
+    // right-justified into the must|may plane, clears the z plane, and returns the
+    // character count.
+    void lower_fgets(Index i) {
+        const Index dst  = ir_->payload(i).op_extra.op;
+        const auto  info = ir_->extra_data<FgetsInfo>(ir_->payload(i).op_extra.extra);
+        const auto [mm, z, width] = string_dest(dst, "$fgets");
+        llvm::Value* fd           = cast(must_of(value_of(info.fd)), 32, true);
+        llvm::Value* r            = b_.CreateCall(fgets_fn(), { mm, z, b_.getInt32(width), fd });
+        set_value(i, packed(r, r, zero(32)));
+    }
+
+    // Resolve a whole packed-vector lvalue to (must|may plane ptr, z plane ptr, bit
+    // width) for a string write-back ($fgets / $sformat / $ferror). Part-select and
+    // non-byte-multiple targets loud-fail: the runtime fills a whole byte-aligned
+    // vector. `who` names the caller.
+    std::tuple<llvm::Value*, llvm::Value*, uint32_t> string_dest(Index dst, const char* who) {
+        const LValue& lv = lvalue_of(dst);
+        if (lv.is_string) {
+            // TODO: file write-back into a dynamic string object (rt_string).
+            throw BackendError{ std::string(who) + " into a string object is not supported" };
+        }
+        if (lv.width != lv.store_width) {
+            // TODO: a part-select target (s[15:0]) writes only a slice.
+            throw BackendError{ std::string(who) + " into a part-select target is not supported" };
+        }
+        if (lv.store_width % 8 != 0) {
+            // TODO: a non-byte-multiple width leaves the must|may plane halves
+            // byte-unaligned; targets are byte vectors in practice.
+            throw BackendError{ std::string(who) +
+                                " into a target whose width is not a multiple of 8 is not supported" };
+        }
+        // A never-z target (z elision) has no z word; pass null and the runtime
+        // skips the z write.
+        llvm::Value* mm = lv_mm_ptr(lv);
+        llvm::Value* z =
+          lv.has_z ? lv_z_ptr(lv) : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+        return { mm, z, lv.store_width };
+    }
+
+    // void rt_sformat(i8* mm, i8* z, i32 width, const char* fmt, i32 argc, const rt_arg* argv)
+    llvm::FunctionCallee sformat_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, i32, ptr, i32, ptr }, false);
+        return llmod_.getOrInsertFunction("rt_sformat", fnty);
+    }
+
+    // void rt_sformat_str(rt_string* dst, const char* fmt, i32 argc, const rt_arg* argv)
+    llvm::FunctionCallee sformat_str_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, b_.getInt32Ty(), ptr }, false);
+        return llmod_.getOrInsertFunction("rt_sformat_str", fnty);
+    }
+
+    // Lower a $sformat / $swrite: build the format-arg descriptor array and hand
+    // it, the format string, and the destination — a string object's handle, or
+    // a packed vector's planes — to the runtime.
+    void lower_sformat(Index i) {
+        const auto        info = ir_->extra_data<SformatInfo>(ir_->payload(i).extra);
+        const std::string fmt  = ir_->extra_bytes(info.fmt, info.fmt_len);
+
+        const std::span<const Index> args = ir_->region(info.args);
+        llvm::Value*                 arr  = build_rt_args(args, "$sformat / $swrite");
+        llvm::Value*                 fmt_ptr = b_.CreateGlobalString(fmt);
+        llvm::Value*                 argc    = b_.getInt32(static_cast<uint32_t>(args.size()));
+        const LValue&                lv      = lvalue_of(info.dst);
+        if (lv.is_string) {
+            b_.CreateCall(sformat_str_fn(), { lv_string_ptr(lv), fmt_ptr, argc, arr });
+            return;
+        }
+        const auto [mm, z, width] = string_dest(info.dst, "$sformat / $swrite");
+        b_.CreateCall(sformat_fn(), { mm, z, b_.getInt32(width), fmt_ptr, argc, arr });
+    }
+
+    // Lower a $sformatf: format into the instruction's string temp.
+    void lower_sformatf(Index i) {
+        const auto        info = ir_->extra_data<SformatfInfo>(ir_->payload(i).extra);
+        const std::string fmt  = ir_->extra_bytes(info.fmt, info.fmt_len);
+
+        const std::span<const Index> args = ir_->region(info.args);
+        llvm::Value*                 arr  = build_rt_args(args, "$sformatf");
+        b_.CreateCall(sformat_str_fn(),
+                      { str_of(i), b_.CreateGlobalString(fmt),
+                        b_.getInt32(static_cast<uint32_t>(args.size())), arr });
+    }
+
+    // i32 rt_ferror(i32 fd, i8* mm, i8* z, i32 width)
+    llvm::FunctionCallee ferror_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(i32, { i32, ptr, ptr, i32 }, false);
+        return llmod_.getOrInsertFunction("rt_ferror", fnty);
+    }
+
+    // Lower a $ferror: pass the descriptor plus the destination string's planes; the
+    // runtime writes the message and returns the error code.
+    void lower_ferror(Index i) {
+        const Index dst  = ir_->payload(i).op_extra.op;
+        const auto  info = ir_->extra_data<FerrorInfo>(ir_->payload(i).op_extra.extra);
+        const auto [mm, z, width] = string_dest(dst, "$ferror");
+        llvm::Value* fd           = cast(must_of(value_of(info.fd)), 32, true);
+        llvm::Value* r            = b_.CreateCall(ferror_fn(), { fd, mm, z, b_.getInt32(width) });
+        set_value(i, packed(r, r, zero(32)));
+    }
+
+    // { ptr mm, ptr z, i32 width } — mirrors rt_scan_arg in runtime/Runtime.h.
+    llvm::StructType* scan_arg_struct_ty() {
+        auto* ptr = llvm::PointerType::getUnqual(ctx_);
+        return llvm::StructType::get(ctx_, { ptr, ptr, b_.getInt32Ty() });
+    }
+
+    // i32 rt_fscanf(i32 fd, const char* fmt, i32 argc, const rt_scan_arg* args)
+    llvm::FunctionCallee fscanf_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(i32, { i32, ptr, i32, ptr }, false);
+        return llmod_.getOrInsertFunction("rt_fscanf", fnty);
+    }
+
+    // i32 rt_sscanf(const char* buf, i32 len, const char* fmt, i32 argc, const rt_scan_arg* args)
+    llvm::FunctionCallee sscanf_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(i32, { ptr, i32, ptr, i32, ptr }, false);
+        return llmod_.getOrInsertFunction("rt_sscanf", fnty);
+    }
+
+    // Lower a $fscanf / $sscanf: build the rt_scan_arg[] descriptor array from the
+    // output lvalues, then call the runtime scanner with the source (an FD, or a
+    // spilled string for $sscanf). Each output target must be whole-storage and
+    // <=64 bits (the runtime writes one 64-bit word per conversion).
+    void lower_scanf(Index i) {
+        const auto        info = ir_->extra_data<ScanfInfo>(ir_->payload(i).extra);
+        const std::string fmt  = ir_->extra_bytes(info.fmt, info.fmt_len);
+
+        const std::span<const Index> outs = ir_->region(info.args);
+        const auto                   n    = static_cast<uint32_t>(outs.size());
+
+        llvm::StructType* sty = scan_arg_struct_ty();
+        llvm::Value*      arr = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+        if (n > 0) {
+            arr = b_.CreateAlloca(sty, b_.getInt32(n), "scan_args");
+            for (uint32_t k = 0; k < n; ++k) {
+                const LValue& lv = lvalue_of(outs[k]);
+                if (lv.is_string) {
+                    // TODO: $*scanf write-back into a dynamic string object.
+                    throw BackendError{ "$fscanf / $sscanf into a string object is not supported" };
+                }
+                if (lv.width != lv.store_width) {
+                    // TODO: a part-select scan target (x[7:0]).
+                    throw BackendError{ "$fscanf / $sscanf into a part-select target is not supported" };
+                }
+                if (lv.store_width > 64) {
+                    // TODO: a target wider than 64 bits (e.g. a long %s token) needs
+                    // multi-word plane assembly in the runtime scanner.
+                    throw BackendError{ "$fscanf / $sscanf into a target wider than 64 bits is not "
+                                        "supported" };
+                }
+                // A never-z target (z elision) passes a null z pointer.
+                llvm::Value* mm  = lv_mm_ptr(lv);
+                llvm::Value* z   = lv.has_z ? lv_z_ptr(lv)
+                                            : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+                llvm::Value* elt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
+                b_.CreateStore(mm, b_.CreateStructGEP(sty, elt, 0));
+                b_.CreateStore(z, b_.CreateStructGEP(sty, elt, 1));
+                b_.CreateStore(b_.getInt32(lv.store_width), b_.CreateStructGEP(sty, elt, 2));
+            }
+        }
+
+        llvm::Value* fmt_ptr = b_.CreateGlobalString(fmt);
+        llvm::Value* r       = nullptr;
+        if (info.is_string) {
+            const auto [buf, len] = spill_ascii(info.source, "sscanf.buf");
+            r = b_.CreateCall(sscanf_fn(), { buf, b_.getInt32(len), fmt_ptr, b_.getInt32(n), arr });
+        } else {
+            llvm::Value* fd = cast(must_of(value_of(info.source)), 32, true);
+            r               = b_.CreateCall(fscanf_fn(), { fd, fmt_ptr, b_.getInt32(n), arr });
+        }
+        set_value(i, packed(r, r, zero(32)));
+    }
+
+    // Spill a packed-ASCII string value's must-bits to a stack byte buffer and
+    // return (pointer, byte length). The value is a packed vector (a string literal
+    // or a reg holding characters); the runtime reconstructs the string from these
+    // bytes. Shared by $readmem (filename) and $fopen (name / mode).
+    std::pair<llvm::Value*, uint32_t> spill_ascii(Index v, const char* name) {
+        const uint32_t bytes = std::max<uint32_t>((type_of(v).width + 7) / 8, 1);
+        llvm::Value*   buf   = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(bytes), name);
+        b_.CreateAlignedStore(must_of(value_of(v)), buf, llvm::Align(1));
+        return { buf, bytes };
     }
 
     // void rt_readmem(const char* path, i32 path_len, i8* mm_base, i8* z_base,
@@ -3917,6 +4271,84 @@ private:
         auto* i32 = b_.getInt32Ty();
         auto* i64 = b_.getInt64Ty();
         return rt_fn("rt_readmem", b_.getVoidTy(), { ptr, i32, ptr, ptr, i32, i32, i32, i64, i64, i64, i64, i32 });
+    }
+
+    // i32 rt_fread(i32 fd, i8* mm, i8* z, i32 stride, i32 count, i32 width, i32 four,
+    //              i64 decl_left, i64 decl_right, i64 start, i64 max_count, i32 flags)
+    llvm::FunctionCallee fread_fn() {
+        auto* ptr = raw_ptr_ty();
+        auto* i32 = b_.getInt32Ty();
+        auto* i64 = b_.getInt64Ty();
+        return rt_fn("rt_fread", i32, { i32, ptr, ptr, i32, i32, i32, i32, i64, i64, i64, i64, i32 });
+    }
+
+    // Lower a $fread into a single vector: one element, no addressing. The runtime
+    // reads ceil(width/8) bytes MSB-first into the destination planes.
+    void lower_fread_word(Index i) {
+        const Index dst  = ir_->payload(i).op_extra.op;
+        const auto  info = ir_->extra_data<FreadWordInfo>(ir_->payload(i).op_extra.extra);
+
+        const LValue& lv = lvalue_of(dst);
+        if (lv.is_string) {
+            throw BackendError{ "$fread into a string object is not supported" };
+        }
+        if (lv.width != lv.store_width) {
+            throw BackendError{ "$fread into a part-select target is not supported" };
+        }
+        if (lv.store_width > 64) {
+            throw BackendError{ "$fread into a target wider than 64 bits is not supported" };
+        }
+        // A never-z target (z elision) passes a null z pointer.
+        llvm::Value* mm = lv_mm_ptr(lv);
+        llvm::Value* z =
+          lv.has_z ? lv_z_ptr(lv) : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+        llvm::Value* fd = cast(must_of(value_of(info.fd)), 32, true);
+
+        const uint32_t four = type_of(dst).four_state ? 1u : 0u;
+        llvm::Value*   r    = b_.CreateCall(fread_fn(),
+                                            { fd, mm, z, b_.getInt32(0), b_.getInt32(1), b_.getInt32(lv.store_width),
+                                              b_.getInt32(four), b_.getInt64(0), b_.getInt64(0), b_.getInt64(0),
+                                              b_.getInt64(0), b_.getInt32(0) });
+        set_value(i, packed(r, r, zero(32)));
+    }
+
+    // Lower a $fread into a memory: reuse the $readmem geometry (plane bases,
+    // stride, count, declared bounds) with optional start-address / element-count
+    // operands, and read binary bytes MSB-first per element.
+    void lower_fread_mem(Index i) {
+        const Index fdi  = ir_->payload(i).op_extra.op;
+        const auto  info = ir_->extra_data<FreadMemInfo>(ir_->payload(i).op_extra.extra);
+
+        const SignalSlot& s = slot_of(info.mem);
+        if (!s.is_array) {
+            throw BackendError{ "$fread memory target is not a memory" };
+        }
+        if (s.width > 64) {
+            throw BackendError{ "$fread into a memory with elements wider than 64 bits is not supported" };
+        }
+        // Element i's planes at base + i*stride (one slot struct per element); a
+        // never-z memory stores no z word, so pass a null z_base.
+        auto*        arr_ty  = llvm::cast<llvm::ArrayType>(s.storage_ty);
+        llvm::Value* storage = storage_ptr(state_, s);
+        llvm::Value* mm_base =
+          b_.CreateInBoundsGEP(arr_ty, storage, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(0) });
+        llvm::Value* z_base =
+          s.has_z ? b_.CreateInBoundsGEP(arr_ty, storage, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(1) })
+                  : llvm::cast<llvm::Value>(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
+        const auto  stride = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(s.slot_ty));
+        const Type& at     = std::get<Type>(mod_.pool.get(mod_.signal(info.mem).type));
+
+        llvm::Value*   fd     = cast(must_of(value_of(fdi)), 32, true);
+        const auto     i64_of = [&](Index idx) { return cast(must_of(value_of(idx)), 64, true); };
+        llvm::Value*   start  = info.has_start ? i64_of(info.start) : b_.getInt64(0);
+        llvm::Value*   cnt    = info.has_count ? i64_of(info.count) : b_.getInt64(0);
+        const uint32_t flags  = (info.has_start ? 1u : 0u) | (info.has_count ? 2u : 0u) | (s.narrow ? 4u : 0u);
+
+        llvm::Value* r = b_.CreateCall(
+          fread_fn(), { fd, mm_base, z_base, b_.getInt32(stride), b_.getInt32(s.elem_count),
+                        b_.getInt32(s.width), b_.getInt32(s.four_state ? 1u : 0u), b_.getInt64(at.left),
+                        b_.getInt64(at.right), start, cnt, b_.getInt32(flags) });
+        set_value(i, packed(r, r, zero(32)));
     }
 
     // Lower a $readmemh / $readmemb: hand the runtime the filename bytes (spilled
@@ -3944,9 +4376,9 @@ private:
         // Otherwise spill the filename's must-bits to a byte buffer: the value is
         // a packed-ASCII vector (string literal or reg), so its low bytes are the
         // path.
-        const ValType fty         = type_of(fname);
-        llvm::Value*  path        = nullptr;
-        llvm::Value*  path_len    = nullptr;
+        const ValType fty          = type_of(fname);
+        llvm::Value*  path         = nullptr;
+        llvm::Value*  path_len     = nullptr;
         const bool    fname_is_str = fty.is_string;
         if (fname_is_str) {
             llvm::Value* handle = str_of(fname);
@@ -4137,12 +4569,57 @@ private:
         b_.SetInsertPoint(cont_bb);
     }
 
-    // Lower a $display / $write: stack-allocate an rt_arg[] descriptor array, pack
-    // each value operand's planes into it, and call the runtime formatter.
+    // Build the runtime rt_arg[] descriptor array shared by every $display-family
+    // format call: stack-allocate one slot per value operand and pack its planes
+    // (width, sign, and the must / xz / z low-64 bits). Returns the array pointer
+    // (a null pointer when there are no operands). `who` names the caller in the
+    // >64-bit loud-fail.
     // TODO: rt_arg carries only the low 64 bits of each plane, so an operand wider
-    // than 64 bits cannot be passed in full. Until the descriptor grows a
-    // full-width path, such an operand is loud-failed below rather than printed
-    // with its high bits silently dropped (docs/TODO.md, M1 $display).
+    // than 64 bits cannot be passed in full; such an operand is loud-failed rather
+    // than formatted with its high bits silently dropped (docs/TODO.md, M1 $display).
+    llvm::Value* build_rt_args(std::span<const Index> args, const char* who) {
+        const auto n = static_cast<uint32_t>(args.size());
+        if (n == 0) {
+            return llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+        }
+        llvm::StructType* sty = arg_struct_ty();
+        llvm::Value*      arr = b_.CreateAlloca(sty, b_.getInt32(n), "fmt_args");
+        for (uint32_t k = 0; k < n; ++k) {
+            const Plane   p = value_of(args[k]);
+            const ValType t = type_of(args[k]);
+            if (t.is_string) {
+                // A string-object argument (%s): flag bit 1, val = the rt_string
+                // handle pointer; the width / plane fields are unused.
+                llvm::Value* selt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
+                store_field(sty, selt, 0, b_.getInt32(0));
+                store_field(sty, selt, 1, b_.getInt32(2));
+                store_field(sty, selt, 2, b_.CreatePtrToInt(str_of(args[k]), b_.getInt64Ty()));
+                store_field(sty, selt, 3, b_.getInt64(0));
+                store_field(sty, selt, 4, b_.getInt64(0));
+                continue;
+            }
+            if (t.width > 64) {
+                throw BackendError{ std::string(who) +
+                                    " of an operand wider than 64 bits is not supported (it "
+                                    "would format with its high bits truncated)" };
+            }
+            llvm::Value* must = must_of(p);
+            llvm::Value* may  = may_of(p);
+            // xz = must ^ may marks every unknown bit (X and Z); z marks the Z
+            // subset. The runtime distinguishes them per bit.
+            llvm::Value* xz  = b_.CreateXor(must, may);
+            llvm::Value* elt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
+            store_field(sty, elt, 0, b_.getInt32(t.width));
+            store_field(sty, elt, 1, b_.getInt32(t.is_signed ? 1u : 0u));
+            store_field(sty, elt, 2, cast(must, 64, false));
+            store_field(sty, elt, 3, cast(xz, 64, false));
+            store_field(sty, elt, 4, cast(z_of(p), 64, false));
+        }
+        return arr;
+    }
+
+    // Lower a $display / $write / $fdisplay / $fwrite: build the descriptor array
+    // and call the runtime formatter with the destination descriptor.
     void lower_display(Index i) {
         const auto  info = ir_->extra_data<DisplayInfo>(ir_->payload(i).display);
         std::string fmt  = ir_->extra_bytes(info.fmt, info.fmt_len);
@@ -4151,45 +4628,13 @@ private:
         }
 
         const std::span<const Index> args = ir_->region(info.args);
-        const auto                   n    = static_cast<uint32_t>(args.size());
+        llvm::Value*                 arr  = build_rt_args(args, "$display / $write");
 
-        llvm::StructType* sty = arg_struct_ty();
-        llvm::Value*      arr = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
-        if (n > 0) {
-            arr = b_.CreateAlloca(sty, b_.getInt32(n), "display_args");
-            for (uint32_t k = 0; k < n; ++k) {
-                const Plane   p    = value_of(args[k]);
-                const ValType t    = type_of(args[k]);
-                if (t.is_string) {
-                    // A string argument: flag bit 1, val = the handle pointer.
-                    llvm::Value* selt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
-                    store_field(sty, selt, 0, b_.getInt32(0));
-                    store_field(sty, selt, 1, b_.getInt32(2));
-                    store_field(sty, selt, 2, b_.CreatePtrToInt(str_of(args[k]), b_.getInt64Ty()));
-                    store_field(sty, selt, 3, b_.getInt64(0));
-                    store_field(sty, selt, 4, b_.getInt64(0));
-                    continue;
-                }
-                if (t.width > 64) {
-                    throw BackendError{ "$display / $write of an operand wider than 64 bits is not "
-                                        "supported (it would print with its high bits truncated)" };
-                }
-                llvm::Value*  must = must_of(p);
-                llvm::Value*  may  = may_of(p);
-                // xz = must ^ may marks every unknown bit (X and Z); z marks the Z
-                // subset. The runtime distinguishes them per bit.
-                llvm::Value* xz  = b_.CreateXor(must, may);
-                llvm::Value* elt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
-                store_field(sty, elt, 0, b_.getInt32(t.width));
-                store_field(sty, elt, 1, b_.getInt32(t.is_signed ? 1u : 0u));
-                store_field(sty, elt, 2, cast(must, 64, false));
-                store_field(sty, elt, 3, cast(xz, 64, false));
-                store_field(sty, elt, 4, cast(z_of(p), 64, false));
-            }
-        }
-
+        // $display / $write target the standard-output MCD (bit 0); $fdisplay /
+        // $fwrite carry an explicit descriptor operand.
+        llvm::Value* desc = info.has_fd ? cast(must_of(value_of(info.fd)), 32, true) : b_.getInt32(1);
         llvm::Value* fmt_ptr = b_.CreateGlobalString(fmt);
-        b_.CreateCall(display_fn(), { fmt_ptr, b_.getInt32(n), arr });
+        b_.CreateCall(fwrite_fn(), { desc, fmt_ptr, b_.getInt32(static_cast<uint32_t>(args.size())), arr });
     }
 
     void store_field(llvm::StructType* sty, llvm::Value* elt, unsigned idx, llvm::Value* v) {
@@ -5274,12 +5719,19 @@ private:
     llvm::StructType* str_slot_ty_ = nullptr;
 };
 
-// Lower the coroutine intrinsics emitted for each process. CoroSplit (with
-// CoroEarly/CoroCleanup) is mandatory: without it the llvm.coro.* intrinsics
-// survive to codegen and the module won't compile. The mem2reg/sroa/simplifycfg
-// cleanup shrinks the frame, and inline + coro-elide stack-allocate the frame for
-// processes that never suspend, collapsing the coroutine back to straight-line
-// code. Returns false (reason on errs()) only if the pipeline string is rejected.
+// Lower the coroutine intrinsics emitted for each process and clean up the
+// generated code (tier-0 pipeline: fast compile, no loop/GVN passes). CoroSplit
+// (with CoroEarly/CoroCleanup) is mandatory: without it the llvm.coro.*
+// intrinsics survive to codegen and the module won't compile. The pre-split
+// sroa/early-cse/simplifycfg/instcombine run inside the CGSCC nest (after
+// inlining, before split) so promoted values never reach the coroutine frame;
+// the post-split function passes clean the resume functions, which do not exist
+// earlier. instcombine is what folds the z-elision zero-plane traffic and the
+// plane-extraction trunc/lshr chains; instsimplify is not enough (measured:
+// no sim-time win). no-verify-fixpoint: LLVM 22
+// errors if instcombine's single iteration does not converge on our
+// non-canonical IR. Returns false (reason on errs()) only if the pipeline
+// string is rejected.
 bool lower_coroutines(llvm::Module& m) {
     llvm::PassBuilder         pb;
     llvm::LoopAnalysisManager     lam;
@@ -5295,9 +5747,8 @@ bool lower_coroutines(llvm::Module& m) {
     llvm::ModulePassManager mpm;
     if (auto err = pb.parsePassPipeline(mpm,
                                         "coro-early,"
-                                        "function(mem2reg,sroa,simplifycfg),"
-                                        "cgscc(inline,coro-split,coro-annotation-elide),"
-                                        "function(coro-elide,simplifycfg),"
+                                        "cgscc(inline,function(sroa,early-cse,simplifycfg,instcombine<no-verify-fixpoint>),coro-split),"
+                                        "function(simplifycfg,instcombine<no-verify-fixpoint>,dce),"
                                         "coro-cleanup")) {
         llvm::errs() << "llvm backend: bad coroutine pipeline: " << llvm::toString(std::move(err)) << "\n";
         return false;

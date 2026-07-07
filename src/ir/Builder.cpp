@@ -145,22 +145,107 @@ Index Builder::task_call(FunctionId func, std::span<const Index> args, SourceLoc
 }
 
 Index Builder::display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc) {
+    // $display / $write: no descriptor operand; the backend targets standard output.
+    return display_impl(static_cast<Index>(0), false, fmt, newline, args, loc);
+}
+
+Index Builder::fdisplay(Index fd, std::string_view fmt, bool newline, std::span<const Index> args,
+                        SourceLoc loc) {
+    // $fdisplay / $fwrite: `fd` selects the destination descriptor.
+    return display_impl(fd, true, fmt, newline, args, loc);
+}
+
+Index Builder::display_impl(Index fd, bool has_fd, std::string_view fmt, bool newline,
+                            std::span<const Index> args, SourceLoc loc) {
     // Order in the extra buffer: format bytes, then the arg-index slice, then the
     // DisplayInfo record pointing at both. None of the three regions overlap.
     const ExtraIndex fmt_at = add_bytes(fmt);
     const ExtraSlice slice  = add_slice(args);
-    const ExtraIndex extra =
-      add_extra(DisplayInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), newline ? 1u : 0u, slice });
+    const ExtraIndex extra  = add_extra(DisplayInfo{
+      fmt_at, static_cast<uint32_t>(fmt.size()), newline ? 1u : 0u, fd, has_fd ? 1u : 0u, slice });
 
     return emit({ Inst::Tag::Display, Inst::Payload{ .display = extra } }, loc);
+}
+
+Index Builder::fopen(Index name, Index mode, bool has_mode, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(FopenInfo{ mode, has_mode ? 1u : 0u });
+
+    return emit({ Inst::Tag::Fopen, Inst::Payload{ .op_extra = { name, extra } } }, loc);
+}
+
+Index Builder::fclose(Index handle, SourceLoc loc) {
+    return emit({ Inst::Tag::Fclose, Inst::Payload{ .unary = handle } }, loc);
+}
+
+Index Builder::file_value_op(FileOp op, std::span<const Index> args, SourceLoc loc) {
+    const ExtraSlice slice = add_slice(args);
+    const ExtraIndex extra = add_extra(FileOpInfo{ static_cast<uint32_t>(op), slice });
+
+    return emit({ Inst::Tag::FileValueOp, Inst::Payload{ .extra = extra } }, loc);
+}
+
+Index Builder::fgets(Index dst, Index fd, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(FgetsInfo{ fd });
+
+    return emit({ Inst::Tag::Fgets, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+}
+
+Index Builder::sformat(Index dst, std::string_view fmt, std::span<const Index> args, SourceLoc loc) {
+    // Order in the extra buffer: format bytes, then the arg-index slice, then the
+    // SformatInfo record pointing at both.
+    const ExtraIndex fmt_at = add_bytes(fmt);
+    const ExtraSlice slice  = add_slice(args);
+    const ExtraIndex extra = add_extra(SformatInfo{ dst, fmt_at, static_cast<uint32_t>(fmt.size()), slice });
+
+    return emit({ Inst::Tag::Sformat, Inst::Payload{ .extra = extra } }, loc);
+}
+
+Index Builder::sformatf(std::string_view fmt, std::span<const Index> args, SourceLoc loc) {
+    const ExtraIndex fmt_at = add_bytes(fmt);
+    const ExtraSlice slice  = add_slice(args);
+    const ExtraIndex extra  = add_extra(SformatfInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), slice });
+
+    return emit({ Inst::Tag::Sformatf, Inst::Payload{ .extra = extra } }, loc);
+}
+
+Index Builder::ferror(Index dst, Index fd, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(FerrorInfo{ fd });
+
+    return emit({ Inst::Tag::Ferror, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+}
+
+Index Builder::fread_word(Index dst, Index fd, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(FreadWordInfo{ fd });
+
+    return emit({ Inst::Tag::FreadWord, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+}
+
+Index Builder::fread_mem(Index fd, Signal mem, Index start, Index count, bool has_start, bool has_count,
+                         SourceLoc loc) {
+    const ExtraIndex extra =
+      add_extra(FreadMemInfo{ mem, start, count, has_start ? 1u : 0u, has_count ? 1u : 0u });
+
+    return emit({ Inst::Tag::FreadMem, Inst::Payload{ .op_extra = { fd, extra } } }, loc);
+}
+
+Index Builder::scanf(Index source, bool is_string, std::string_view fmt, std::span<const Index> args,
+                     SourceLoc loc) {
+    // Order in the extra buffer: format bytes, then the output-lvalue slice, then
+    // the ScanfInfo record pointing at both.
+    const ExtraIndex fmt_at = add_bytes(fmt);
+    const ExtraSlice slice  = add_slice(args);
+    const ExtraIndex extra  = add_extra(
+      ScanfInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), source, is_string ? 1u : 0u, slice });
+
+    return emit({ Inst::Tag::Scanf, Inst::Payload{ .extra = extra } }, loc);
 }
 
 Index Builder::finish(SourceLoc loc) {
     return emit({ Inst::Tag::Finish, Inst::Payload{ .none = 0 } }, loc);
 }
 
-Index Builder::fflush(SourceLoc loc) {
-    return emit({ Inst::Tag::Fflush, Inst::Payload{ .none = 0 } }, loc);
+Index Builder::fflush(Index handle, SourceLoc loc) {
+    return emit({ Inst::Tag::Fflush, Inst::Payload{ .unary = handle } }, loc);
 }
 
 Index Builder::read_mem(Signal target, Index filename, Index start, Index finish, bool hex, bool has_start,
