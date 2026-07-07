@@ -202,7 +202,7 @@ TEST_CASE("case-equality comparisons are binary ops over two operands") {
     CHECK(ops[1] == lab);
 }
 
-TEST_CASE("mux and concat expose their operands") {
+TEST_CASE("select and concat expose their operands") {
     InternPool      pool;
     Builder         b(pool);
     const SourceLoc loc{ 1 };
@@ -210,7 +210,7 @@ TEST_CASE("mux and concat expose their operands") {
     const Index c = b.constant(konst(pool, 1), loc);
     const Index x = b.constant(konst(pool, 2), loc);
     const Index z = b.constant(konst(pool, 3), loc);
-    const Index m = b.mux(c, x, z, loc);
+    const Index m = b.select(c, x, z, loc);
 
     const std::array<Index, 2> parts{ x, z };
     const Index                cc = b.concat(parts, loc);

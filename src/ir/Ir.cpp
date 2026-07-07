@@ -97,7 +97,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Wait:
             return K::Wait;
 
-        case T::Mux:
+        case T::Select:
+        case T::SelectLazy:
         case T::PartSelect:
         case T::DynPartSelect:
         case T::ElemSelect:
@@ -216,14 +217,14 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
         }
 
         case Inst::PayloadKind::OpExtra:
-            // mux exposes cond + the two selected values; cond / part_select
+            // select exposes cond + the two selected values; cond / part_select
             // expose only their primary operand (regions / bounds aren't SSA
             // operands).
-            if (tag == Inst::Tag::Mux) {
-                const auto mux = extra_data<Mux>(p.op_extra.extra);
+            if (tag == Inst::Tag::Select) {
+                const auto select = extra_data<Select>(p.op_extra.extra);
                 scratch[0]     = p.op_extra.op;
-                scratch[1]     = mux.a;
-                scratch[2]     = mux.b;
+                scratch[1]     = select.a;
+                scratch[2]     = select.b;
                 return { scratch.data(), 3 };
             }
             // elem_select exposes its base and the index value (the index is read

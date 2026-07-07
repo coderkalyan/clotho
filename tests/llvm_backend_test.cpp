@@ -197,6 +197,27 @@ TEST_CASE("instance state structs compose nested and replicate per instantiation
     CHECK(ir.find("%leaf.state.0") == std::string::npos);
 }
 
+// Regression: two or more self-starting continuous assigns share the nproc-sized
+// active queue. An initial block drains first (LIFO) and its input writes service
+// the assigns' still-unrun static subscriptions; without marking them scheduled at
+// seed time each is re-pushed, overflowing the queue and corrupting a handle.
+TEST_CASE("multiple continuous assigns woken by a store do not overflow the queue") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a, b, c, d, y1, y2;
+            assign y1 = a & b;
+            assign y2 = c | d;
+            initial begin
+                a = 1; b = 1; c = 0; d = 0;
+                #1 $display("%b %b", y1, y2);
+                a = 0; d = 1;
+                #1 $display("%b %b", y1, y2);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 0\n0 1\n");
+}
+
 TEST_CASE("single-bit xor uses the packed truth-table immediate") {
     constexpr std::string_view src = R"(
         module m(input logic a, input logic b, output logic y);
@@ -2709,4 +2730,136 @@ TEST_CASE("backend lowers string signals, constants, and string ops (hand-built 
     }
     std::fclose(tmp);
     CHECK(out == "5\nO\n");
+}
+
+TEST_CASE("a signal written by a called task stays in always_comb sensitivity") {
+    // Regression: the sensitivity walk used to descend into task bodies, so
+    // the task's write of `a` subtracted the block-level read and a change to
+    // `a` never re-triggered the comb process (LRM 9.2.2.2.1: task contents
+    // contribute nothing).
+    const std::string_view src = R"(
+        module m;
+            reg a, b, y;
+            task automatic t;
+                a = 1'b1;
+            endtask
+            always_comb begin
+                y = a | b;
+                if (b) t();
+            end
+            initial begin
+                a = 1'b0; b = 1'b0;
+                #1 a = 1'b1;
+                #1 $display("%b", y);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1\n");
+}
+
+TEST_CASE("always @* re-triggers on a read+written intermediate") {
+    // Regression: @* subtracted written signals like always_comb, so another
+    // process's write to `t` never woke the block (LRM 9.4.2.2 Example 2
+    // keeps a read intermediate sensitive).
+    const std::string_view src = R"(
+        module m;
+            reg a, b, c, t, y;
+            always @* begin
+                y = t | c;
+                if (c) t = a & b;
+            end
+            initial begin
+                a = 1'b0; b = 1'b0; c = 1'b0; t = 1'b0;
+                #1 t = 1'b1;
+                #1 $display("%b", y);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1\n");
+}
+
+TEST_CASE("posedge/negedge classify x/z transitions per LRM Table 9-2") {
+    // Regression: edge detection read only the must-plane LSB, so a 0->x
+    // posedge (and its mirrors) never fired. Sequence below has two posedges
+    // (0->x, x->1); x->0 and 1->z are negedges and z->x is no edge.
+    const std::string_view src = R"(
+        module m;
+            reg clk;
+            integer n;
+            initial n = 0;
+            always @(posedge clk) n = n + 1;
+            initial begin
+                #1 clk = 1'b0;
+                #1 clk = 1'bx;
+                #1 clk = 1'b1;
+                #1 clk = 1'bz;
+                #1 clk = 1'bx;
+                #1 $display("%0d", n);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2\n");
+}
+
+TEST_CASE("a level wait wakes on a z-only value change") {
+    // Regression: the any-change compare covered only the must/may planes, so
+    // x<->z transitions (visible only in the z word) never woke @(s).
+    const std::string_view src = R"(
+        module m;
+            reg s;
+            integer n;
+            initial n = 0;
+            always @(s) n = n + 1;
+            initial begin
+                #1 s = 1'bz;
+                #1 s = 1'bx;
+                #1 s = 1'b0;
+                #1 $display("%0d", n);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "3\n");
+}
+
+TEST_CASE("the edge keyword fires on posedge or negedge, not x<->z") {
+    // `edge` = posedge|negedge (LRM 9.4.2): the x->z step is no edge; z->1 is
+    // a posedge and 1->x a negedge.
+    const std::string_view src = R"(
+        module m;
+            reg s;
+            integer n;
+            initial n = 0;
+            always @(edge s) n = n + 1;
+            initial begin
+                #1 s = 1'bz;
+                #1 s = 1'b1;
+                #1 s = 1'bx;
+                #1 $display("%0d", n);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2\n");
+}
+
+TEST_CASE("NBA commits classify x/z edges and z-only changes the same way") {
+    // The nonblocking commit path has its own edge-fact emission; the clock
+    // sequence has two posedges (0->x, x->1), and the level wait on s must
+    // wake for the x->z NBA commit.
+    const std::string_view src = R"(
+        module m;
+            reg clk, s;
+            integer n, k;
+            initial begin n = 0; k = 0; end
+            always @(posedge clk) n = n + 1;
+            always @(s) k = k + 1;
+            initial begin
+                #1 clk <= 1'b0;
+                #1 clk <= 1'bx;
+                #1 clk <= 1'b1;
+                #1 s <= 1'bz;
+                #1 $display("%0d %0d", n, k);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2 1\n");
 }

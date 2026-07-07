@@ -89,7 +89,7 @@ struct ValType {
 
 // A lowered value: the must/may planes packed into one i(2W) integer (low W bits
 // = must / definitely 1, high W bits = may / could be 1), plus a separate iW `z`
-// (high-impedance marker). Packing lets the monotone ops (AND/OR/NOT, mux select)
+// (high-impedance marker). Packing lets the monotone ops (AND/OR/NOT, select select)
 // act on both planes with a single instruction.
 struct Plane {
     llvm::Value* mm = nullptr; // 4-state: i(2W) [0,W) must, [W,2W) may. 2-state: iW value.
@@ -1915,6 +1915,15 @@ private:
         return false;
     }
 
+    // Whether any waiter subscribed a level (any-change) wait on the signal. Only
+    // these consume the z word in edge classification, so a store may skip the z
+    // snapshot when none exist.
+    bool signal_has_level_waiters(Signal sig) const {
+        const auto i = static_cast<uint32_t>(sig);
+        const auto e = static_cast<uint32_t>(Edge::Any);
+        return wait_sta_gv_[i][e] != nullptr || wait_dyn_gv_[i][e] != nullptr;
+    }
+
     // Load the packed must|may word of an lvalue's selected storage: the whole
     // signal for a plain target, or one element for an unpacked-array element.
     // Used to snapshot old / new state around a blocking store so wait-queue
@@ -1929,54 +1938,137 @@ private:
         return b_.CreateLoad(int_ty(slot_mm_bits(lv)), lv_mm_ptr(lv));
     }
 
+    llvm::Value* load_lv_z(const LValue& lv) {
+        return b_.CreateLoad(int_ty(lv.store_width), lv_z_ptr(lv));
+    }
+
+    // Pre-write snapshot of an lvalue's selected storage, taken so wait-queue
+    // servicing can classify the old -> new transition. `mm` is null when the
+    // write never wakes anyone; `z` is non-null only when a level waiter exists
+    // to consume the z word (a z-only x<->z transition is a value change,
+    // LRM 9.4.2, but edges never read z).
+    struct ServiceSnapshot {
+        llvm::Value* mm = nullptr;
+        llvm::Value* z  = nullptr;
+    };
+
     // A blocking write to a module signal must service the signal's wait queues
     // with the old -> new transition. This pair brackets every such write path
     // (Store, plus the runtime pointer write-backs: $fgets / $sformat / $ferror /
     // $*scanf / scalar $fread): snapshot the selected storage before the write,
-    // then detect the transition and service after. The snapshot is null — and
+    // then detect the transition and service after. The snapshot is empty — and
     // servicing a no-op — for a target that never wakes anyone: a frame local, a
     // signal without waiters, or a PreInit store (variable declaration
     // initializers generate no events).
-    llvm::Value* service_snapshot(const LValue& lv) {
+    ServiceSnapshot service_snapshot(const LValue& lv) {
         const bool service = !lowering_preinit_ && lv.is_signal && signal_has_waiters(lv.sig);
-        return service ? load_lv_mm(lv) : nullptr;
+        if (!service) {
+            return {};
+        }
+        ServiceSnapshot old;
+        old.mm = load_lv_mm(lv);
+        if (lv.has_z && signal_has_level_waiters(lv.sig)) {
+            old.z = load_lv_z(lv);
+        }
+        return old;
     }
 
-    void service_after_write(const LValue& lv, llvm::Value* old_mm) {
-        if (old_mm != nullptr) {
-            service_wait_queue(lv.sig, old_mm, load_lv_mm(lv));
+    void service_after_write(const LValue& lv, ServiceSnapshot old) {
+        if (old.mm != nullptr) {
+            service_wait_queue(lv.sig, old.mm, load_lv_mm(lv), old.z,
+                               old.z != nullptr ? load_lv_z(lv) : nullptr);
         }
+    }
+
+    // One old -> new transition's wake facts: which edge buckets fire. A fact is
+    // null when its bucket was not requested (no waiters of that kind).
+    struct EdgeFacts {
+        llvm::Value* pos     = nullptr; // Table 9-2 posedge (a move toward 1)
+        llvm::Value* neg     = nullptr; // Table 9-2 negedge (a move toward 0)
+        llvm::Value* changed = nullptr; // any value change (level waits)
+    };
+
+    // Classify a store's old -> new transition of a packed must|may word into wake
+    // facts per LRM 9.4.2 / Table 9-2. The edge state of bit 0 forms the lattice
+    // 0 < x/z < 1 — x and z encode identically in the planes (must 0 / may 1), and
+    // the LRM defines no edge between them — so posedge is any move up the lattice
+    // (0->1, 0->x, x->1) and negedge any move down. A 2-state slot cannot hold x,
+    // so its classifier stays the plain 0<->1 compare. Edges read only the LSB of
+    // each plane (LRM 9.4.2: an edge is detected only on the LSB).
+    //
+    // `changed` compares whole words: both planes and, when the slot carries a z
+    // word (old_z / new_z non-null), the z word too — x->z is a value change for a
+    // level wait even though the planes agree. Facts whose need flag is false stay
+    // null and emit no code.
+    EdgeFacts emit_edge_facts(llvm::Value* old_mm, llvm::Value* new_mm, uint32_t width,
+                              bool four_state, llvm::Value* old_z, llvm::Value* new_z,
+                              bool need_pos, bool need_neg, bool need_any) {
+        auto*     i1 = b_.getInt1Ty();
+        EdgeFacts f;
+        if (need_pos || need_neg) {
+            llvm::Value* old_m = b_.CreateTrunc(old_mm, i1); // must LSB
+            llvm::Value* new_m = b_.CreateTrunc(new_mm, i1);
+            if (four_state) {
+                auto*        sh      = llvm::ConstantInt::get(old_mm->getType(), width);
+                llvm::Value* old_may = b_.CreateTrunc(b_.CreateLShr(old_mm, sh), i1);
+                llvm::Value* new_may = b_.CreateTrunc(b_.CreateLShr(new_mm, sh), i1);
+                if (need_pos) {
+                    f.pos = b_.CreateAnd(b_.CreateAnd(b_.CreateNot(old_m), new_may),
+                                         b_.CreateOr(b_.CreateNot(old_may), new_m));
+                }
+                if (need_neg) {
+                    f.neg = b_.CreateAnd(b_.CreateAnd(old_may, b_.CreateNot(new_m)),
+                                         b_.CreateOr(b_.CreateNot(new_may), old_m));
+                }
+            } else {
+                if (need_pos) {
+                    f.pos = b_.CreateAnd(b_.CreateNot(old_m), new_m);
+                }
+                if (need_neg) {
+                    f.neg = b_.CreateAnd(old_m, b_.CreateNot(new_m));
+                }
+            }
+        }
+        if (need_any) {
+            f.changed = b_.CreateICmpNE(old_mm, new_mm);
+            if (old_z != nullptr) {
+                f.changed = b_.CreateOr(f.changed, b_.CreateICmpNE(old_z, new_z));
+            }
+        }
+        return f;
     }
 
     // Service a signal's wait queues after a blocking assignment to it. Computes
     // the transition's edge facts once, then for each per-edge bucket that exists
     // guards its whole scan with a single branch on the matching fact — no
-    // per-entry edge check. Emits nothing for a signal with no waiters.
+    // per-entry edge check. Emits nothing for a signal with no waiters. old_z /
+    // new_z are the z-word snapshots, or null when the slot has no z word or no
+    // level waiter consumes it.
     //
     // The three buckets are serviced independently (not else-if): a 0->1 LSB
     // transition is both `changed` (any) and `pos`, so it services both buckets.
-    void service_wait_queue(Signal sig, llvm::Value* old_mm, llvm::Value* new_mm) {
+    void service_wait_queue(Signal sig, llvm::Value* old_mm, llvm::Value* new_mm,
+                            llvm::Value* old_z, llvm::Value* new_z) {
         const auto i = static_cast<uint32_t>(sig);
         if (!signal_has_waiters(sig)) {
             return;
         }
-        // Edge-detection facts, computed once for all entries. The LSB of `must` is
-        // bit 0 of the packed word; Any compares the whole word.
-        llvm::Value* old_lsb = b_.CreateTrunc(old_mm, b_.getInt1Ty());
-        llvm::Value* new_lsb = b_.CreateTrunc(new_mm, b_.getInt1Ty());
-        llvm::Value* pos     = b_.CreateAnd(b_.CreateNot(old_lsb), new_lsb);
-        llvm::Value* neg     = b_.CreateAnd(old_lsb, b_.CreateNot(new_lsb));
-        llvm::Value* changed = b_.CreateICmpNE(old_mm, new_mm);
+        const auto has_bucket = [&](Edge e) {
+            const auto k = static_cast<uint32_t>(e);
+            return wait_sta_gv_[i][k] != nullptr || wait_dyn_gv_[i][k] != nullptr;
+        };
+        const SignalSlot& slot = slot_of(sig);
+        const EdgeFacts   f =
+          emit_edge_facts(old_mm, new_mm, slot.width, slot.four_state, old_z, new_z,
+                          has_bucket(Edge::Positive), has_bucket(Edge::Negative), has_bucket(Edge::Any));
 
-        // Bucket -> matching fact. `pos`/`neg` each imply `changed`, so the Any
-        // bucket also fires on an LSB transition.
         const std::array<std::pair<uint32_t, llvm::Value*>, 3> buckets = {
-            std::make_pair(static_cast<uint32_t>(Edge::Any), changed),
-            std::make_pair(static_cast<uint32_t>(Edge::Positive), pos),
-            std::make_pair(static_cast<uint32_t>(Edge::Negative), neg),
+            std::make_pair(static_cast<uint32_t>(Edge::Any), f.changed),
+            std::make_pair(static_cast<uint32_t>(Edge::Positive), f.pos),
+            std::make_pair(static_cast<uint32_t>(Edge::Negative), f.neg),
         };
         for (const auto& [e, fact] : buckets) {
-            if (wait_sta_gv_[i][e] == nullptr && wait_dyn_gv_[i][e] == nullptr) {
+            if (fact == nullptr) {
                 continue;
             }
             auto* fn   = b_.GetInsertBlock()->getParent();
@@ -2248,18 +2340,23 @@ private:
 
     // Service an NBA target's wait queues after its shadow committed to live. Same
     // edge facts as service_wait_queue, but the per-edge queue pointers come from
-    // the meta record (runtime) so this drives any signal with one body.
-    void emit_nba_service(llvm::Value* meta, llvm::Value* old_mm, llvm::Value* new_mm) {
-        auto*        i1      = b_.getInt1Ty();
-        llvm::Value* old_lsb = b_.CreateTrunc(old_mm, i1);
-        llvm::Value* new_lsb = b_.CreateTrunc(new_mm, i1);
-        llvm::Value* pos     = b_.CreateAnd(b_.CreateNot(old_lsb), new_lsb);
-        llvm::Value* neg     = b_.CreateAnd(old_lsb, b_.CreateNot(new_lsb));
-        llvm::Value* changed = b_.CreateICmpNE(old_mm, new_mm);
+    // the meta record (runtime) so this drives any signal with one body. Which
+    // per-edge queues are populated is not known at compile time here (the commit
+    // loop is shared per bucket), so all three facts are computed. `width` is the
+    // bucket's static width; old_z / new_z are null for a never-z bucket. A
+    // narrow bucket's word is a single iW with no may plane, so it must take the
+    // plain 0<->1 classifier — deriving `may` via LShr on the iW word would read
+    // 0 and suppress every posedge. A packed 2-state target keeps must == may in
+    // every stored word, so the 4-state classifier stays exact for it.
+    void emit_nba_service(llvm::Value* meta, llvm::Value* old_mm, llvm::Value* new_mm,
+                          uint32_t width, bool narrow, llvm::Value* old_z, llvm::Value* new_z) {
+        const EdgeFacts f = emit_edge_facts(old_mm, new_mm, width, /*four_state=*/!narrow, old_z,
+                                            new_z, /*need_pos=*/true, /*need_neg=*/true,
+                                            /*need_any=*/true);
         const std::array<std::pair<uint32_t, llvm::Value*>, 3> buckets = {
-            std::make_pair(static_cast<uint32_t>(Edge::Any), changed),
-            std::make_pair(static_cast<uint32_t>(Edge::Positive), pos),
-            std::make_pair(static_cast<uint32_t>(Edge::Negative), neg),
+            std::make_pair(static_cast<uint32_t>(Edge::Any), f.changed),
+            std::make_pair(static_cast<uint32_t>(Edge::Positive), f.pos),
+            std::make_pair(static_cast<uint32_t>(Edge::Negative), f.neg),
         };
         for (const auto& [e, fact] : buckets) {
             auto* fn   = b_.GetInsertBlock()->getParent();
@@ -2316,11 +2413,16 @@ private:
         llvm::Value* sh_z_p   = bk.has_z ? field_ptr_var(state, meta_i32(meta, 3)) : nullptr;
         llvm::Value* old_mm   = b_.CreateAlignedLoad(mmty, live_mm_p, mm_al);
         llvm::Value* new_mm   = nullptr;
+        // z snapshots feed the level-wait change compare (x<->z is a value
+        // change); null for a never-z bucket.
+        llvm::Value* old_z = nullptr;
+        llvm::Value* new_z = nullptr;
         if (!bk.partial) {
             new_mm = b_.CreateAlignedLoad(mmty, sh_mm_p, mm_al);
             b_.CreateAlignedStore(new_mm, live_mm_p, mm_al);
             if (bk.has_z) {
-                llvm::Value* new_z = b_.CreateAlignedLoad(zty, sh_z_p, z_al);
+                old_z = b_.CreateAlignedLoad(zty, live_z_p, z_al);
+                new_z = b_.CreateAlignedLoad(zty, sh_z_p, z_al);
                 b_.CreateAlignedStore(new_z, live_z_p, z_al);
             }
         } else {
@@ -2335,14 +2437,14 @@ private:
             new_mm             = b_.CreateOr(b_.CreateAnd(old_mm, b_.CreateNot(mask2)), b_.CreateAnd(sh_mm, mask2));
             b_.CreateAlignedStore(new_mm, live_mm_p, mm_al);
             if (bk.has_z) {
-                llvm::Value* old_z = b_.CreateAlignedLoad(zty, live_z_p, z_al);
-                llvm::Value* sh_z  = b_.CreateAlignedLoad(zty, sh_z_p, z_al);
-                llvm::Value* new_z = b_.CreateOr(b_.CreateAnd(old_z, b_.CreateNot(mask)), b_.CreateAnd(sh_z, mask));
+                old_z             = b_.CreateAlignedLoad(zty, live_z_p, z_al);
+                llvm::Value* sh_z = b_.CreateAlignedLoad(zty, sh_z_p, z_al);
+                new_z = b_.CreateOr(b_.CreateAnd(old_z, b_.CreateNot(mask)), b_.CreateAnd(sh_z, mask));
                 b_.CreateAlignedStore(new_z, live_z_p, z_al);
             }
             b_.CreateAlignedStore(zero(W), mask_p, z_al); // clear dirty mask for next slot
         }
-        emit_nba_service(meta, old_mm, new_mm);
+        emit_nba_service(meta, old_mm, new_mm, bk.width, bk.narrow, old_z, new_z);
         b_.CreateStore(b_.getInt8(0),
                        b_.CreateInBoundsGEP(nba_pending_ty_, nba_pending_gv_, { b_.getInt32(0), id }));
         b_.CreateBr(cont);
@@ -2426,7 +2528,15 @@ private:
                 // values rather than waiting for an input edge that a declaration
                 // initializer never generates. It runs body-first then parks on its
                 // (already-subscribed) wait, so later input changes still wake it.
+                //
+                // Mark it scheduled as it is enqueued: a seed-time store from an
+                // earlier-draining process (initial blocks drain before these, being
+                // pushed last onto the LIFO) services this static subscription and
+                // would re-push the already-queued handle without the flag, so N such
+                // processes overflow the nproc-sized active queue. The flag is cleared
+                // when the body reaches its wait-suspend (lower_process always-loop).
                 if (p.self_start) {
+                    b_.CreateStore(b_.getInt32(1), flag);
                     emit_active_push(b_, hdl);
                 }
             } else {
@@ -2920,8 +3030,10 @@ private:
                 return type_of(p.binary.l);
             case Inst::Tag::Bnot:
                 return type_of(p.unary);
-            case Inst::Tag::Mux:
-                return type_of(ir_->extra_data<Mux>(p.op_extra.extra).a);
+            case Inst::Tag::Select:
+                return type_of(ir_->extra_data<Select>(p.op_extra.extra).a);
+            case Inst::Tag::SelectLazy:
+                return type_of(ir_->extra_data<SelectLazy>(p.op_extra.extra).then_val);
 
             case Inst::Tag::RedAnd:
             case Inst::Tag::RedOr:
@@ -3198,9 +3310,9 @@ private:
                 // The snapshot covers the selected storage (whole signal, or one
                 // array element) so an element write wakes Any-edge waiters on a
                 // change to that element rather than always reading element 0.
-                llvm::Value* old_mm = service_snapshot(lv);
+                const ServiceSnapshot old = service_snapshot(lv);
                 lower_store(lv, value_of(p.binary.r));
-                service_after_write(lv, old_mm);
+                service_after_write(lv, old);
                 return;
             }
             // A nonblocking assignment samples its RHS now but defers the write: it
@@ -3313,12 +3425,12 @@ private:
                 set_value(i, lower_lnot(value_of(p.unary)));
                 return;
 
-            case Inst::Tag::Mux: {
-                const auto mux = ir_->extra_data<Mux>(p.op_extra.extra);
-                if (type_of(mux.a).is_string) {
-                    throw BackendError{ "internal: string value in mux" };
+            case Inst::Tag::Select: {
+                const auto select = ir_->extra_data<Select>(p.op_extra.extra);
+                if (type_of(select.a).is_string) {
+                    throw BackendError{ "internal: string value in select" };
                 }
-                set_value(i, lower_mux(value_of(p.op_extra.op), value_of(mux.a), value_of(mux.b)));
+                set_value(i, lower_select(value_of(p.op_extra.op), value_of(select.a), value_of(select.b)));
                 return;
             }
             case Inst::Tag::Concat:
@@ -3415,6 +3527,10 @@ private:
 
             case Inst::Tag::Cond:
                 lower_cond(i);
+                return;
+
+            case Inst::Tag::SelectLazy:
+                lower_select_lazy(i);
                 return;
 
             case Inst::Tag::Loop:
@@ -4104,9 +4220,9 @@ private:
         const auto  info = ir_->extra_data<FgetsInfo>(ir_->payload(i).op_extra.extra);
         const auto [mm, z, width, flags] = string_dest(dst, "$fgets");
         llvm::Value* fd                  = cast(must_of(value_of(info.fd)), 32, true);
-        llvm::Value* old_mm              = service_snapshot(lvalue_of(dst));
+        const ServiceSnapshot old          = service_snapshot(lvalue_of(dst));
         llvm::Value* r = b_.CreateCall(fgets_fn(), { mm, z, b_.getInt32(width), fd, b_.getInt32(flags) });
-        service_after_write(lvalue_of(dst), old_mm);
+        service_after_write(lvalue_of(dst), old);
         set_value(i, packed(r, r, zero(32)));
     }
 
@@ -4171,9 +4287,9 @@ private:
             return;
         }
         const auto [mm, z, width, flags] = string_dest(info.dst, "$sformat / $swrite");
-        llvm::Value* old_mm              = service_snapshot(lvalue_of(info.dst));
+        const ServiceSnapshot old          = service_snapshot(lvalue_of(info.dst));
         b_.CreateCall(sformat_fn(), { mm, z, b_.getInt32(width), fmt_ptr, argc, arr, b_.getInt32(flags) });
-        service_after_write(lvalue_of(info.dst), old_mm);
+        service_after_write(lvalue_of(info.dst), old);
     }
 
     // Lower a $sformatf: format into the instruction's string temp.
@@ -4203,9 +4319,9 @@ private:
         const auto  info = ir_->extra_data<FerrorInfo>(ir_->payload(i).op_extra.extra);
         const auto [mm, z, width, flags] = string_dest(dst, "$ferror");
         llvm::Value* fd                  = cast(must_of(value_of(info.fd)), 32, true);
-        llvm::Value* old_mm              = service_snapshot(lvalue_of(dst));
+        const ServiceSnapshot old          = service_snapshot(lvalue_of(dst));
         llvm::Value* r = b_.CreateCall(ferror_fn(), { fd, mm, z, b_.getInt32(width), b_.getInt32(flags) });
-        service_after_write(lvalue_of(dst), old_mm);
+        service_after_write(lvalue_of(dst), old);
         set_value(i, packed(r, r, zero(32)));
     }
 
@@ -4246,7 +4362,7 @@ private:
         llvm::Value*              arr = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
         // Old-value snapshots for wait-queue servicing, parallel to `outs`
         // (null where a target needs no servicing).
-        std::vector<llvm::Value*> olds(n, nullptr);
+        std::vector<ServiceSnapshot> olds(n);
         if (n > 0) {
             arr = b_.CreateAlloca(sty, b_.getInt32(n), "scan_args");
             for (uint32_t k = 0; k < n; ++k) {
@@ -4352,12 +4468,12 @@ private:
 
         const uint32_t four   = type_of(dst).four_state ? 1u : 0u;
         const uint32_t flags  = lv.narrow ? 4u : 0u;
-        llvm::Value*   old_mm = service_snapshot(lv);
+        const ServiceSnapshot old = service_snapshot(lv);
         llvm::Value*   r      = b_.CreateCall(fread_fn(),
                                               { fd, mm, z, b_.getInt32(0), b_.getInt32(1), b_.getInt32(lv.store_width),
                                                 b_.getInt32(four), b_.getInt64(0), b_.getInt64(0), b_.getInt64(0),
                                                 b_.getInt64(0), b_.getInt32(flags) });
-        service_after_write(lv, old_mm);
+        service_after_write(lv, old);
         set_value(i, packed(r, r, zero(32)));
     }
 
@@ -5500,10 +5616,10 @@ private:
         return bit_plane(t.f, b_.CreateNot(t.t));
     }
 
-    // -- Mux: known condition selects (one packed select); unknown merges bitwise
+    // -- Select: known condition selects (one packed select); unknown merges bitwise
     // (X where the arms disagree). --
 
-    Plane lower_mux(Plane cond, Plane a, Plane b) {
+    Plane lower_select(Plane cond, Plane a, Plane b) {
         // 2-state arms: a native select. slang unifies the two arms to a common
         // type, so both are 2-state here. A 4-state condition may be x (LRM
         // 1800-2023 11.4.11: bitwise merge, x where the arms disagree); in a
@@ -5650,6 +5766,56 @@ private:
         branch_to(cont_bb);
 
         b_.SetInsertPoint(cont_bb);
+    }
+
+    // Value-producing short-circuit conditional (&&/||). Branches on the
+    // predicate's must bit (a definite 2-state value), lowers only the taken
+    // branch's region, and merges the two branch values with a PHI. The
+    // side-effecting right operand lives inside the then-region, so it is never
+    // evaluated when the predicate is 0. LLVM folds the whole thing back to a
+    // straight-line select when both branches are side-effect free.
+    void lower_select_lazy(Index i) {
+        const Inst::Payload& p    = ir_->payload(i);
+        const auto           sel  = ir_->extra_data<SelectLazy>(p.op_extra.extra);
+        const Plane          pred = value_of(p.op_extra.op);
+
+        llvm::Value* take = b_.CreateICmpNE(must_of(pred), zero(1));
+
+        auto* then_bb = llvm::BasicBlock::Create(ctx_, "sel.then", fn_);
+        auto* else_bb = llvm::BasicBlock::Create(ctx_, "sel.else", fn_);
+        auto* cont_bb = llvm::BasicBlock::Create(ctx_, "sel.end", fn_);
+        b_.CreateCondBr(take, then_bb, else_bb);
+
+        // The two arms may disagree in Plane domain (a 2-state constant against a
+        // 4-state Land/Lor result), so each is normalized to the instruction's own
+        // domain inside its block — the PHIs need identical value types.
+        const bool four = type_of(i).four_state;
+        const auto norm = [&](Index v) { return four ? to_four(value_of(v)) : Plane{ must_of(value_of(v)), nullptr, true }; };
+
+        b_.SetInsertPoint(then_bb);
+        lower_region(ir_->region(sel.then_));
+        const Plane       tv       = norm(sel.then_val);
+        llvm::BasicBlock* then_end = b_.GetInsertBlock();
+        branch_to(cont_bb);
+
+        b_.SetInsertPoint(else_bb);
+        lower_region(ir_->region(sel.else_));
+        const Plane       ev       = norm(sel.else_val);
+        llvm::BasicBlock* else_end = b_.GetInsertBlock();
+        branch_to(cont_bb);
+
+        b_.SetInsertPoint(cont_bb);
+        llvm::PHINode* mm = b_.CreatePHI(tv.mm->getType(), 2);
+        mm->addIncoming(tv.mm, then_end);
+        mm->addIncoming(ev.mm, else_end);
+        if (!four) {
+            set_value(i, two_val(mm));
+            return;
+        }
+        llvm::PHINode* z = b_.CreatePHI(tv.z->getType(), 2);
+        z->addIncoming(tv.z, then_end);
+        z->addIncoming(ev.z, else_end);
+        set_value(i, { mm, z });
     }
 
     // -- Control flow: for/while/forever. The cond region recomputes the

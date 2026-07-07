@@ -399,3 +399,28 @@ TEST_CASE("$fgets into a narrow 2-state slot does not overrun (canary)") {
     CHECK(out == "3 0068690a deadbeef\n");
     std::remove(path);
 }
+
+// Regression: a 2-state NBA target commits through a NARROW bucket whose slot
+// word is a single iW. The Table 9-2 edge classifier derives the may plane via
+// LShr(word, width), which reads 0 on an iW word — posedge waiters on a bit
+// clock driven by `<=` then never fire. emit_nba_service must select the plain
+// 0<->1 classifier for a narrow bucket.
+TEST_CASE("a 2-state NBA clock fires posedge and negedge waiters") {
+    const std::string out = run_capture(R"(
+        module m;
+            bit clk;
+            int pos = 0, neg = 0;
+            always @(posedge clk) pos = pos + 1;
+            always @(negedge clk) neg = neg + 1;
+            initial begin
+                repeat (3) begin
+                    #1 clk <= 1'b1;
+                    #1 clk <= 1'b0;
+                end
+                #1 $display("pos=%0d neg=%0d", pos, neg);
+                $finish;
+            end
+        endmodule
+    )");
+    CHECK(out == "pos=3 neg=3\n");
+}

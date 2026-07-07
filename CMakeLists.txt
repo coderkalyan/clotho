@@ -49,7 +49,10 @@ endif()
 FetchContent_Declare(
   slang
   GIT_REPOSITORY https://github.com/MikePopoloski/slang.git
-  GIT_TAG        6befee62191395be8beb69253de5d6f9a8b955a9 # v8.0
+  # Post-8.0: the v8.0 release tag predates the slang analysis library
+  # (AnalysisManager, dataflow diagnostics like inferred-latch), which the
+  # frontend runs after elaboration.
+  GIT_TAG        6933832c97c39976890e5f12b69245f061d60a9a # v10.0-360-g6933832c9
 )
 FetchContent_MakeAvailable(slang)
 

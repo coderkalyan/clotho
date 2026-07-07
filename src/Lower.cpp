@@ -44,6 +44,8 @@
 #include <slang/ast/types/NetType.h>
 #include <slang/ast/types/Type.h>
 #include <slang/ast/Scope.h>
+#include <slang/analysis/AnalysisManager.h>
+#include <slang/diagnostics/AnalysisDiags.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/diagnostics/TextDiagnosticClient.h>
 #include <slang/numeric/Time.h>
@@ -210,22 +212,38 @@ ir::SignalInfo::Direction direction_of(slang::ast::ArgumentDirection d) {
     return ir::SignalInfo::Direction::Internal;
 }
 
-// Infers the implicit sensitivity of a combinational process body. `reads`
-// holds every signal read; `written` holds every assignment target. The two
-// exclusion rules differ by construct: `always_comb`/`always_latch` subtract
-// signals also written (LRM 9.2.2.2.1 exception b), while `always @*` keeps
-// them — 9.4.2.2 excludes only identifiers appearing solely as lvalues, so a
-// read+written signal stays in the list and an external writer re-triggers
-// the block. Index/part-select expressions on a write target are themselves
-// reads in both schemes (11.6, 9.2.2.2, 9.4.2.2).
+// Which inferred-sensitivity rule set a SensitivityCollector walk applies. The
+// LRM defines two that differ in how subroutine calls contribute (9.2.2.2.2):
+//
+// - Comb (`always_comb` / `always_latch`, 9.2.2.2.1, and continuous assigns):
+//   the bodies of called functions contribute their reads and writes; the
+//   bodies of called tasks contribute nothing (only the task's argument
+//   expressions do).
+// - ImplicitEvent (`always @*`, 9.4.2.2): no called subroutine body
+//   contributes anything; only the argument expressions are sensitive.
+enum class SensitivityMode : uint8_t {
+    Comb,
+    ImplicitEvent,
+};
+
+// Collects the reads and writes that build a process's inferred sensitivity
+// (an `always_comb`, `always_latch`, `always @*`, or continuous assign): the
+// signals the body reads to compute a result, and the ones it writes. Whether
+// written signals are subtracted from the read set is decided at the use site:
+// always_comb excludes them (9.2.2.2.1 (b)), while `always @*` keeps a signal
+// that is read anywhere outside an lvalue base even if also written (9.4.2.2:
+// only identifiers appearing *solely* as an assignment's left-hand side are
+// excluded). Index/part-select expressions on a write target are themselves
+// reads and are always kept (11.6, 9.2.2.2).
 //
 // The AST is walked rather than the lowered IR so reads are seen at the source
 // level, before any temporaries the IR introduces. Symbols not in `sigmap`
 // (parameters, genvars, other constants) carry no sensitivity and are skipped.
-struct SensitivityCollector : ASTVisitor<SensitivityCollector, true, true> {
+struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGood> {
     using SigMap = ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal>;
 
     const SigMap&                          sigmap;
+    SensitivityMode                        mode;
     std::vector<ir::Signal>                reads;    // in first-seen order
     ankerl::unordered_dense::set<uint32_t> seen;     // dedup for `reads`
     ankerl::unordered_dense::set<uint32_t> written;  // assignment targets / locals
@@ -233,7 +251,7 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, true, true> {
     // sites (or a recursive one) is walked at most once.
     ankerl::unordered_dense::set<const SubroutineSymbol*> entered;
 
-    explicit SensitivityCollector(const SigMap& m) : sigmap(m) {}
+    SensitivityCollector(const SigMap& m, SensitivityMode mode) : sigmap(m), mode(mode) {}
 
     void record_read(const ValueSymbol& sym) {
         const auto it = sigmap.find(&sym);
@@ -293,8 +311,19 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, true, true> {
 
     void handle(const AssignmentExpression& a) {
         a.right().visit(*this); // RHS: pure reads
+        if (a.isCompound()) {
+            // `a += b` reads its target too. In Comb mode the write below
+            // subtracts it back out; in ImplicitEvent mode it stays sensitive.
+            a.left().visit(*this);
+        }
         record_write(a.left());
     }
+
+    // Identifiers that appear only in a timing-control (wait / event / delay)
+    // expression carry no sensitivity (9.2.2.2.1 (c), 9.4.2.2): skip the timing
+    // control and walk only the controlled statement. Reachable only from
+    // `always @*` (Comb procedures reject timing controls at elaboration).
+    void handle(const TimedStatement& t) { t.stmt.visit(*this); }
 
     void handle(const UnaryExpression& u) {
         switch (u.op) {
@@ -323,24 +352,59 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, true, true> {
         visitDefault(f);
     }
 
-    // A called function's reads count toward the caller's sensitivity: a function
-    // may reference module signals directly, not only through its arguments. Visit
-    // the actual-argument expressions, then descend once into the callee body. The
-    // callee's formals / locals are not module signals (not in sigmap), so they are
-    // ignored; module signals it reads / writes are recorded as usual.
+    // A called subroutine's argument expressions are always sensitive. Its body
+    // contributes only for a *function* under Comb rules (9.2.2.2.1): a function
+    // may reference module signals directly, not only through its arguments, so
+    // descend once into the callee body — the callee's formals / locals are not
+    // module signals (not in sigmap), so they are ignored, while module signals
+    // it reads / writes are recorded as usual. Task bodies never contribute
+    // (9.2.2.2.1: "the contents of the tasks do not add anything"), and under
+    // ImplicitEvent (@*) rules no callee body does (9.2.2.2.2).
     void handle(const CallExpression& c) {
         for (const Expression* arg : c.arguments()) {
             arg->visit(*this);
         }
-        if (c.isSystemCall()) {
+        if (c.isSystemCall() || mode != SensitivityMode::Comb) {
             return;
         }
         const SubroutineSymbol* sub = std::get<0>(c.subroutine);
-        if (sub != nullptr && entered.insert(sub).second) {
+        if (sub != nullptr && sub->subroutineKind == SubroutineKind::Function &&
+            entered.insert(sub).second) {
             sub->getBody().visit(*this);
         }
     }
 };
+
+// Whether evaluating an expression is observable beyond its value: any call
+// (a user function body may display or write module state; system calls like
+// $display always are), an embedded assignment, or an increment / decrement.
+// Decides whether a ?: arm may be evaluated eagerly — LRM 11.4.11 forbids
+// evaluating the unchosen arm of a definite condition, but for a pure arm the
+// extra evaluation is unobservable and keeps the branchless packed select.
+struct EffectDetector : ASTVisitor<EffectDetector, VisitFlags::AllGood> {
+    bool found = false;
+
+    void handle(const CallExpression&) { found = true; }
+    void handle(const AssignmentExpression&) { found = true; }
+    void handle(const UnaryExpression& u) {
+        switch (u.op) {
+            case UnaryOperator::Preincrement:
+            case UnaryOperator::Postincrement:
+            case UnaryOperator::Predecrement:
+            case UnaryOperator::Postdecrement:
+                found = true;
+                return;
+            default:
+                visitDefault(u);
+        }
+    }
+};
+
+bool has_observable_effect(const slang::ast::Expression& e) {
+    EffectDetector d;
+    e.visit(d);
+    return d.found;
+}
 
 // Walks the elaborated AST of one top module into an ir::Module.
 class Lowerer {
@@ -994,9 +1058,13 @@ private:
     // driven and read is real combinational feedback (`assign y = a & y`) and
     // must stay sensitive. An empty list (constant RHS) yields a run-once
     // process, which is the required time-zero evaluation.
+    //
+    // NOTE: Comb mode inlines called-function reads. The LRM leaves this
+    // unspecified for continuous assigns; inlining is
+    // the safe superset (extra wakeups of an idempotent assign).
     std::vector<ir::WaitEvent> continuous_events(const Expression& e) {
         std::vector<ir::WaitEvent> events;
-        SensitivityCollector       c(sigmap_);
+        SensitivityCollector       c(sigmap_, SensitivityMode::Comb);
         e.visit(c);
         for (const ir::Signal s : c.reads) {
             events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
@@ -1098,12 +1166,32 @@ private:
                 record_net_driver_range(p.internalSymbol->as<ValueSymbol>(), 0, UINT32_MAX);
                 const ir::Ref ty = lower_type(p.internalSymbol->as<ValueSymbol>().getType());
                 b.binary(ir::Inst::Tag::Store, b.signal(child_sig, l), b.resize(lower_expr(*expr, b), ty, l), l);
-                collect_inferred_sensitivity(*expr, sens, /*exclude_written=*/false);
+                collect_expr_reads(*expr, sens);
             }
             // A port connection is a continuous copy: evaluate at time zero so the
             // child sees the parent's declaration-initialized value even when the
             // parent signal never changes afterward (LRM 23.3.3).
             add_continuous_process(std::move(sens), l, b);
+        }
+    }
+
+    // Append the sensitivity of an rvalue expression (each signal it reads, as an
+    // any-change wait) to `out`. Mirrors collect_inferred_sensitivity for an
+    // expression with no writes.
+    void collect_expr_reads(const Expression& expr, std::vector<ir::WaitEvent>& out) {
+        SensitivityCollector c(sigmap_, SensitivityMode::Comb);
+        expr.visit(c);
+        for (const ir::Signal s : c.reads) {
+            if (c.written.contains(static_cast<uint32_t>(s))) {
+                continue;
+            }
+            if (is_string_ref(module_.signal(s).type)) {
+                // TODO: string signals in inferred sensitivity — string stores
+                // skip wait-queue servicing, so the process would never
+                // re-trigger.
+                fail("string in inferred sensitivity is not supported");
+            }
+            out.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
         }
     }
 
@@ -1120,15 +1208,22 @@ private:
             fail("final block is not supported");
         }
 
+        // TODO: no non-sequential-behavior warning for `always_ff`. LRM 9.2.2.4
+        // says tools should warn when the body does not represent sequential
+        // logic, but slang's analysis library has no such diagnostic (unlike
+        // inferred-latch / inferred-comb for the other two kinds), so nothing
+        // surfaces it today. slang does enforce the hard 9.2.2.4 rules (exactly
+        // one event control, no blocking timing controls).
+
         const Statement* body = &sym.getBody();
 
         // `always_comb` / `always_latch` infer sensitivity from the body's reads
         // minus its writes (9.2.2.2.1, legal because of the single-writer rule).
-        // `always @*` carries an ImplicitEvent timing wrapping the body and keeps
-        // read+written signals (9.4.2.2): other processes may write them.
+        // `always @*` carries an ImplicitEvent timing wrapping the body, inferred
+        // under the subtly different 9.4.2.2 rules (see SensitivityMode).
         const bool comb = sym.procedureKind == ProceduralBlockKind::AlwaysComb ||
                           sym.procedureKind == ProceduralBlockKind::AlwaysLatch;
-        bool infer = comb;
+        bool       infer = comb;
 
         // A top-level event control on an `always` is the process's sensitivity
         // list: collect its wait events here and lower the statement underneath.
@@ -1167,7 +1262,8 @@ private:
         // Inferred sensitivity is read from the body after lowering, so any
         // block-local declarations it touched are already registered in sigmap_.
         if (infer) {
-            collect_inferred_sensitivity(*body, wait_events, /*exclude_written=*/comb);
+            collect_inferred_sensitivity(
+              *body, comb ? SensitivityMode::Comb : SensitivityMode::ImplicitEvent, wait_events);
         }
         // always_comb / always_latch evaluate once at time zero (LRM 9.2.2.2), so
         // they settle from declaration-initialized values. An `always @*` or an
@@ -1209,7 +1305,16 @@ private:
                 if (ev.iffCondition != nullptr) {
                     fail("iff qualifier on an event control is not supported");
                 }
-                out.push_back(ir::WaitEvent{ .signal = event_signal(ev.expr), .edge = to_edge(ev.edge) });
+                const ir::Signal sig = event_signal(ev.expr);
+                if (ev.edge == slang::ast::EdgeKind::BothEdges) {
+                    // `edge` means posedge-or-negedge (LRM 9.4.2), not any change:
+                    // an x<->z transition is neither and must not wake. Subscribe
+                    // both edge buckets; the scheduled flag dedups a double wake.
+                    out.push_back(ir::WaitEvent{ .signal = sig, .edge = ir::Edge::Positive });
+                    out.push_back(ir::WaitEvent{ .signal = sig, .edge = ir::Edge::Negative });
+                } else {
+                    out.push_back(ir::WaitEvent{ .signal = sig, .edge = to_edge(ev.edge) });
+                }
                 break;
             }
             case TimingControlKind::EventList:
@@ -1223,32 +1328,33 @@ private:
         }
     }
 
-    // Build the inferred sensitivity of an AST node — a combinational process
-    // body (@* / always_comb) or a port-connection source expression — and
-    // append every signal read as a level-sensitive (any-change) wait.
-    // `exclude_written` selects the always_comb rule (9.2.2.2.1 b: drop signals
-    // the node also writes); `always @*` passes false per 9.4.2.2.
-    template <typename Node>
-    void collect_inferred_sensitivity(const Node& node, std::vector<ir::WaitEvent>& out,
-                                      bool exclude_written) {
-        SensitivityCollector c(sigmap_);
-        node.visit(c);
+    // Build the inferred sensitivity of a combinational process body and append
+    // it to `out`, each signal as a level-sensitive (any-change) wait. Under
+    // Comb rules (always_comb / always_latch) signals the body writes are
+    // subtracted (9.2.2.2.1 (b)); under ImplicitEvent (@*) rules a signal read
+    // anywhere stays sensitive even if also written — LRM 9.4.2.2's example
+    // makes `tmp1 = a & b; y = tmp1;` sensitive to tmp1, which another process
+    // may legally write (@* permits multiple drivers).
+    void collect_inferred_sensitivity(const Statement& body, SensitivityMode mode,
+                                      std::vector<ir::WaitEvent>& out) {
+        SensitivityCollector c(sigmap_, mode);
+        body.visit(c);
         for (const ir::Signal s : c.reads) {
-            if (exclude_written && c.written.contains(static_cast<uint32_t>(s))) {
+            if (mode == SensitivityMode::Comb && c.written.contains(static_cast<uint32_t>(s))) {
                 continue;
             }
             if (is_string_ref(module_.signal(s).type)) {
-                // TODO: string signals in inferred sensitivity — string
+                // TODO: string signals in inferred (@*) sensitivity — string
                 // stores skip wait-queue servicing, so the process would
                 // never re-trigger.
-                fail("string in inferred sensitivity is not supported");
+                fail("string in inferred combinational sensitivity is not supported");
             }
             out.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
         }
     }
 
-    // Map a slang edge kind to the IR edge. A level-sensitive entry (no edge) and
-    // a both-edge entry both record as Any (any value change).
+    // Map a slang edge kind to the IR edge. Only None (a level wait) reaches the
+    // default; BothEdges is expanded to two wait events by collect_wait_events.
     static ir::Edge to_edge(slang::ast::EdgeKind edge) {
         switch (edge) {
             case slang::ast::EdgeKind::PosEdge:
@@ -1855,7 +1961,14 @@ private:
         if (args.size() < 2 || args.size() > 4) {
             fail("$readmem requires 2 to 4 arguments");
         }
-        const Expression& mem = *args[1];
+        // slang (post-8.0) binds the memory as a system-task output argument: an
+        // AssignmentExpression whose left side is the target lvalue, the same
+        // shape a user task's output actual has. Unwrap to the target.
+        const Expression* mem_arg = args[1];
+        if (mem_arg->kind == ExpressionKind::Assignment) {
+            mem_arg = &mem_arg->as<AssignmentExpression>().left();
+        }
+        const Expression& mem = *mem_arg;
         const auto*       vsb = mem.as_if<slang::ast::ValueExpressionBase>();
         if (vsb == nullptr || mem.type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() == nullptr) {
             // TODO: a sliced memory target (mem[a:b]) or a multidimensional slice.
@@ -2207,7 +2320,13 @@ private:
             if (args.size() < 2 || args.size() > 4) {
                 fail("$fread requires 2 to 4 arguments");
             }
-            const Expression& target = *args[0];
+            // slang (post-8.0) binds the target as a system-task output argument;
+            // unwrap the AssignmentExpression to the lvalue (see lower_lvalue).
+            const Expression* target_arg = args[0];
+            if (target_arg->kind == ExpressionKind::Assignment) {
+                target_arg = &target_arg->as<AssignmentExpression>().left();
+            }
+            const Expression& target = *target_arg;
             if (is_unpacked_array(target)) {
                 const auto* vsb = target.as_if<slang::ast::ValueExpressionBase>();
                 if (vsb == nullptr) {
@@ -2792,7 +2911,7 @@ private:
             case ExpressionKind::ConditionalOp: {
                 const ConditionalExpression& c = expr.as<ConditionalExpression>();
                 if (is_string_expr(expr)) {
-                    // TODO: ?: over strings (needs a string-aware mux; lower to a
+                    // TODO: ?: over strings (needs a string-aware select; lower to a
                     // Cond with a string temp).
                     fail("conditional operator (?:) over strings is not supported");
                 }
@@ -2804,10 +2923,18 @@ private:
                     // gap as lower_conditional's pattern guard.
                     fail("pattern matching in conditions is not supported");
                 }
+                // An arm whose evaluation is observable must not run unless
+                // chosen (LRM 11.4.11: a definite condition evaluates only its
+                // arm; an ambiguous one evaluates both and blends). Pure arms
+                // keep the branchless packed select — evaluating the unchosen
+                // arm is then unobservable.
+                if (has_observable_effect(c.left()) || has_observable_effect(c.right())) {
+                    return lower_lazy_conditional(c, b);
+                }
                 const ir::Index pred = lower_predicate(*c.conditions[0].expr, b);
                 const ir::Index a    = lower_expr(c.left(), b);
                 const ir::Index bb   = lower_expr(c.right(), b);
-                return b.mux(pred, a, bb, l);
+                return b.select(pred, a, bb, l);
             }
             case ExpressionKind::Concatenation: {
                 std::vector<ir::Index> parts;
@@ -2944,12 +3071,103 @@ private:
         }
     }
 
+    // Short-circuit `&&` / `||` (LRM 11.3.5, 11.4.7). The left operand is always
+    // evaluated; the right operand is evaluated only in the Select's then-branch,
+    // taken when the left has not already fixed the result. A definite left
+    // operand short-circuits (`&&` on a false left -> 0, `||` on a true left ->
+    // 1); an x/z left is ambiguous, so the right operand is still evaluated and
+    // the full 3-valued Land/Lor computes the merged result.
+    ir::Index lower_short_circuit(const BinaryExpression& bin, ir::Builder& b) {
+        using T                = ir::Inst::Tag;
+        const ir::SourceLoc l  = loc(bin);
+        const bool          is_and = bin.op == slang::ast::BinaryOperator::LogicalAnd;
+        const ir::Ref       bit  = make_int_type(1, true, false);
+
+        const ir::Index lhs = lower_expr(bin.left(), b);
+
+        // Predicate is a definite 2-state bit: 1 iff the right operand must still
+        // be evaluated. `&&` skips when the left is logically false (all bits a
+        // definite 0); `||` skips when the left is logically true (its reduction
+        // or is a definite 1). Case-equality (===) yields a definite bit even for
+        // an x/z left, so the backend can branch on it directly.
+        ir::Index pred;
+        if (is_and) {
+            const ir::Index zero = b.constant(module_.pool.put_int(lower_type(*bin.left().type), 0), l);
+            pred                 = b.unary(T::Lnot, b.binary(T::CaseEq, lhs, zero, l), l);
+        } else {
+            const ir::Index ror = b.unary(T::RedOr, lhs, l);
+            const ir::Index one = b.constant(module_.pool.put_int(bit, 1), l);
+            pred                = b.unary(T::Lnot, b.binary(T::CaseEq, ror, one, l), l);
+        }
+
+        b.open_region();
+        const ir::Index     rhs         = lower_expr(bin.right(), b);
+        const ir::Index     combined    = b.binary(is_and ? T::Land : T::Lor, lhs, rhs, l);
+        const ir::ExtraSlice then_region = b.close_region();
+
+        b.open_region();
+        const ir::Index     dom         = b.constant(module_.pool.put_int(bit, is_and ? 0 : 1), l);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        return b.select_lazy(pred, then_region, combined, else_region, dom, l);
+    }
+
+    // Lazy `?:` for an observable arm (LRM 11.4.11): a definite-true condition
+    // evaluates only the first expression, definite-false only the second, and
+    // an ambiguous (x/z) condition evaluates BOTH and blends them bit by bit
+    // (Table 11-20 — exactly what an eager Select with an unknown condition
+    // computes). Built as two nested SelectLazy: the outer branches on
+    // definite-true, its else branches on definite-false, and the innermost
+    // else region re-lowers both arms eagerly. Case-equality on the 1-bit
+    // predicate yields the definite branch bits.
+    ir::Index lower_lazy_conditional(const ConditionalExpression& c, ir::Builder& b) {
+        using T               = ir::Inst::Tag;
+        const ir::SourceLoc l = loc(c);
+        const ir::Ref       bit = make_int_type(1, true, false);
+
+        const ir::Index pred    = lower_predicate(*c.conditions[0].expr, b);
+        const ir::Index one     = b.constant(module_.pool.put_int(bit, 1), l);
+        const ir::Index zero    = b.constant(module_.pool.put_int(bit, 0), l);
+        const ir::Index is_true = b.binary(T::CaseEq, pred, one, l);
+
+        b.open_region();
+        const ir::Index      tv       = lower_expr(c.left(), b);
+        const ir::ExtraSlice t_region = b.close_region();
+
+        b.open_region();
+        const ir::Index is_false = b.binary(T::CaseEq, pred, zero, l);
+
+        b.open_region();
+        const ir::Index      fv       = lower_expr(c.right(), b);
+        const ir::ExtraSlice f_region = b.close_region();
+
+        b.open_region();
+        const ir::Index      xa       = lower_expr(c.left(), b);
+        const ir::Index      xb       = lower_expr(c.right(), b);
+        const ir::Index      blend    = b.select(pred, xa, xb, l);
+        const ir::ExtraSlice x_region = b.close_region();
+
+        const ir::Index      inner       = b.select_lazy(is_false, f_region, fv, x_region, blend, l);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        return b.select_lazy(is_true, t_region, tv, else_region, inner, l);
+    }
+
     ir::Index lower_binary(const BinaryExpression& bin, ir::Builder& b) {
+        using B = slang::ast::BinaryOperator;
+        using T = ir::Inst::Tag;
+
+        // Short-circuit logical operators: the right operand must not be
+        // evaluated when the left already decides the result, so its side
+        // effects (a function call) do not occur (LRM 11.3.5, 11.4.7). Handled
+        // before the eager operand lowering below, which always evaluates both.
+        if (bin.op == B::LogicalAnd || bin.op == B::LogicalOr) {
+            return lower_short_circuit(bin, b);
+        }
+
         const ir::SourceLoc l   = loc(bin);
         const ir::Index     lhs = lower_expr(bin.left(), b);
         const ir::Index     rhs = lower_expr(bin.right(), b);
-        using B                 = slang::ast::BinaryOperator;
-        using T                 = ir::Inst::Tag;
 
         if (is_string_expr(bin.left()) || is_string_expr(bin.right())) {
             // slang's implicit conversions make both operands string here. Only
@@ -3020,10 +3238,6 @@ private:
                 return b.binary(T::Le, lhs, rhs, l);
             case B::LessThan:
                 return b.binary(T::Lt, lhs, rhs, l);
-            case B::LogicalAnd:
-                return b.binary(T::Land, lhs, rhs, l);
-            case B::LogicalOr:
-                return b.binary(T::Lor, lhs, rhs, l);
             case B::LogicalShiftLeft:
             case B::ArithmeticShiftLeft:
                 return b.binary(T::Sll, lhs, rhs, l);
@@ -3072,7 +3286,7 @@ private:
         // dynamic BitSelect gap and shifts by the raw value.
         const auto    width = static_cast<uint32_t>(const_uint(rs.right()));
         const bool    down  = rs.getSelectionKind() == RangeSelectionKind::IndexedDown;
-        const int32_t bias  = down == range.isLittleEndian() ? static_cast<int32_t>(width) - 1 : 0;
+        const int32_t bias  = down == range.isDescending() ? static_cast<int32_t>(width) - 1 : 0;
         const ir::Index off = lower_packed_offset(rs.left(), range, bias, b, l);
         return b.dyn_part_select(base, off, width, l);
     }
@@ -3081,6 +3295,12 @@ private:
     ir::Index lower_lvalue(const Expression& expr, ir::Builder& b) {
         const ir::SourceLoc l = loc(expr);
         switch (expr.kind) {
+            case ExpressionKind::Assignment:
+                // slang (post-8.0) binds a system-task output argument ($fgets,
+                // $sformat, $*scanf, ... destinations) as an AssignmentExpression
+                // whose left side is the target lvalue, the same shape a user
+                // task's output actual has. Unwrap to the target.
+                return lower_lvalue(expr.as<AssignmentExpression>().left(), b);
             case ExpressionKind::NamedValue:
                 return value_lvalue(expr.as<NamedValueExpression>().symbol, b, l);
             case ExpressionKind::ElementSelect: {
@@ -3157,7 +3377,7 @@ private:
         }
         const ir::Ref   off_ty = make_int_type(32, idx.type->isFourState(), idx.type->isSigned());
         const ir::Index v      = b.resize(lower_expr(idx, b), off_ty, l);
-        if (range.isLittleEndian()) {
+        if (range.isDescending()) {
             const int32_t sub = range.right + bias; // off = idx - right - bias
             if (sub == 0) {
                 return v;
@@ -3638,12 +3858,35 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
     const slang::Diagnostics&   diags     = comp.getAllDiagnostics();
     const slang::SourceManager* sm        = comp.getSourceManager();
     bool                        has_error = false;
-    if (sm != nullptr && !diags.empty()) {
+    if (sm != nullptr) {
         slang::DiagnosticEngine engine(*sm);
         auto                    client = std::make_shared<slang::TextDiagnosticClient>();
         engine.addClient(client);
+        // LRM 9.2.2.2 / 9.2.2.3 recommend tools warn when a comb / latch
+        // procedure's behavior does not match its declared kind. slang keeps
+        // both diagnostics in its off-by-default "extra" group, so enable them.
+        engine.setSeverity(slang::diag::InferredLatch, slang::DiagnosticSeverity::Warning);
+        engine.setSeverity(slang::diag::InferredComb, slang::DiagnosticSeverity::Warning);
+        // slang rejects a timing-control-free `always` as a hard error, but the
+        // LRM (9.2.2.1) only describes it as a simulation deadlock: clotho
+        // deliberately lowers it faithfully (see lower_procedural_block), so
+        // downgrade to a warning.
+        engine.setSeverity(slang::diag::AlwaysWithoutTimingControl,
+                           slang::DiagnosticSeverity::Warning);
         for (const slang::Diagnostic& d : diags) {
             engine.issue(d);
+        }
+        // Post-elaboration analysis (dataflow): inferred-latch/comb checks,
+        // blocking-task-in-comb errors, and multi-driver checks (9.2.2.2). Only
+        // run on an error-free design — analysis assumes a valid AST. Default
+        // AnalysisOptions deliberately leave the lint-style CheckUnused /
+        // CheckShadow passes off and match strict LRM driver rules.
+        if (engine.getNumErrors() == 0) {
+            comp.freeze();
+            slang::analysis::AnalysisManager analysis;
+            analysis.analyze(comp);
+            engine.issue(analysis.getDiagnostics());
+            comp.unfreeze();
         }
         result.diagnostics = client->getString();
         has_error          = engine.getNumErrors() > 0;

@@ -143,7 +143,7 @@ TEST_CASE("z is absorbed by arithmetic, comparisons, reductions, and case-equali
     CHECK(!a.z("lnot"));
 }
 
-TEST_CASE("an unknown mux condition or shift count does not launder z away") {
+TEST_CASE("an unknown select condition or shift count does not launder z away") {
     // The z operand still rides through even when the selector itself is clean;
     // conversely a z-free datapath stays clean under a 4-state selector.
     const Analyzed a = analyze(R"(
