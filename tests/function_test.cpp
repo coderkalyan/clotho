@@ -344,3 +344,29 @@ TEST_CASE("&& and || evaluate the right operand on an x/z left") {
     // Every branch evaluates f (a is x). x&&0=0, x&&1=x, x||1=1, x||0=x.
     CHECK(run_capture(src) == "f\nr=0\nf\nr=x\nf\nr=1\nf\nr=x\n");
 }
+
+// LRM 11.4.11: a definite ?: condition evaluates only the chosen arm; an
+// ambiguous (x/z) condition evaluates BOTH arms and blends them bit by bit
+// per Table 11-20. The side-effecting function makes evaluation observable.
+// Verified against iverilog 13.
+TEST_CASE("?: evaluates one arm on a definite condition, both on x") {
+    constexpr std::string_view src = R"##(
+        module m;
+            function automatic logic [1:0] f(input logic [1:0] v);
+                $display("f(%b)", v);
+                return v;
+            endfunction
+            logic c;
+            logic [1:0] r;
+            initial begin
+                c = 1; r = c ? f(2'b01) : f(2'b10); $display("r=%b", r);
+                c = 0; r = c ? f(2'b01) : f(2'b10); $display("r=%b", r);
+                c = 1'bx;
+                r = c ? f(2'b01) : f(2'b10); $display("r=%b", r);
+                r = c ? f(2'b11) : f(2'b11); $display("r=%b", r);
+            end
+        endmodule
+    )##";
+    CHECK(run_capture(src) == "f(01)\nr=01\nf(10)\nr=10\n"
+                              "f(01)\nf(10)\nr=xx\nf(11)\nf(11)\nr=11\n");
+}

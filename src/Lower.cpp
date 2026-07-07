@@ -375,6 +375,37 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     }
 };
 
+// Whether evaluating an expression is observable beyond its value: any call
+// (a user function body may display or write module state; system calls like
+// $display always are), an embedded assignment, or an increment / decrement.
+// Decides whether a ?: arm may be evaluated eagerly — LRM 11.4.11 forbids
+// evaluating the unchosen arm of a definite condition, but for a pure arm the
+// extra evaluation is unobservable and keeps the branchless packed select.
+struct EffectDetector : ASTVisitor<EffectDetector, VisitFlags::AllGood> {
+    bool found = false;
+
+    void handle(const CallExpression&) { found = true; }
+    void handle(const AssignmentExpression&) { found = true; }
+    void handle(const UnaryExpression& u) {
+        switch (u.op) {
+            case UnaryOperator::Preincrement:
+            case UnaryOperator::Postincrement:
+            case UnaryOperator::Predecrement:
+            case UnaryOperator::Postdecrement:
+                found = true;
+                return;
+            default:
+                visitDefault(u);
+        }
+    }
+};
+
+bool has_observable_effect(const slang::ast::Expression& e) {
+    EffectDetector d;
+    e.visit(d);
+    return d.found;
+}
+
 // Walks the elaborated AST of one top module into an ir::Module.
 class Lowerer {
 public:
@@ -2842,6 +2873,14 @@ private:
                     // gap as lower_conditional's pattern guard.
                     fail("pattern matching in conditions is not supported");
                 }
+                // An arm whose evaluation is observable must not run unless
+                // chosen (LRM 11.4.11: a definite condition evaluates only its
+                // arm; an ambiguous one evaluates both and blends). Pure arms
+                // keep the branchless packed select — evaluating the unchosen
+                // arm is then unobservable.
+                if (has_observable_effect(c.left()) || has_observable_effect(c.right())) {
+                    return lower_lazy_conditional(c, b);
+                }
                 const ir::Index pred = lower_predicate(*c.conditions[0].expr, b);
                 const ir::Index a    = lower_expr(c.left(), b);
                 const ir::Index bb   = lower_expr(c.right(), b);
@@ -3000,6 +3039,47 @@ private:
         const ir::ExtraSlice else_region = b.close_region();
 
         return b.select_lazy(pred, then_region, combined, else_region, dom, l);
+    }
+
+    // Lazy `?:` for an observable arm (LRM 11.4.11): a definite-true condition
+    // evaluates only the first expression, definite-false only the second, and
+    // an ambiguous (x/z) condition evaluates BOTH and blends them bit by bit
+    // (Table 11-20 — exactly what an eager Select with an unknown condition
+    // computes). Built as two nested SelectLazy: the outer branches on
+    // definite-true, its else branches on definite-false, and the innermost
+    // else region re-lowers both arms eagerly. Case-equality on the 1-bit
+    // predicate yields the definite branch bits.
+    ir::Index lower_lazy_conditional(const ConditionalExpression& c, ir::Builder& b) {
+        using T               = ir::Inst::Tag;
+        const ir::SourceLoc l = loc(c);
+        const ir::Ref       bit = make_int_type(1, true, false);
+
+        const ir::Index pred    = lower_predicate(*c.conditions[0].expr, b);
+        const ir::Index one     = b.constant(module_.pool.put_int(bit, 1), l);
+        const ir::Index zero    = b.constant(module_.pool.put_int(bit, 0), l);
+        const ir::Index is_true = b.binary(T::CaseEq, pred, one, l);
+
+        b.open_region();
+        const ir::Index      tv       = lower_expr(c.left(), b);
+        const ir::ExtraSlice t_region = b.close_region();
+
+        b.open_region();
+        const ir::Index is_false = b.binary(T::CaseEq, pred, zero, l);
+
+        b.open_region();
+        const ir::Index      fv       = lower_expr(c.right(), b);
+        const ir::ExtraSlice f_region = b.close_region();
+
+        b.open_region();
+        const ir::Index      xa       = lower_expr(c.left(), b);
+        const ir::Index      xb       = lower_expr(c.right(), b);
+        const ir::Index      blend    = b.select(pred, xa, xb, l);
+        const ir::ExtraSlice x_region = b.close_region();
+
+        const ir::Index      inner       = b.select_lazy(is_false, f_region, fv, x_region, blend, l);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        return b.select_lazy(is_true, t_region, tv, else_region, inner, l);
     }
 
     ir::Index lower_binary(const BinaryExpression& bin, ir::Builder& b) {
