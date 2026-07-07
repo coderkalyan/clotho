@@ -32,6 +32,20 @@ std::string emit(std::string_view source) {
     return text;
 }
 
+// Emit without the optimization pipeline: for assertions on the backend's own
+// emission structure (block labels, typed GEPs), which the pipeline is free to
+// rewrite.
+std::string emit_raw(std::string_view source) {
+    const LowerResult result = lower_text(source);
+    REQUIRE(result.ok);
+    REQUIRE(result.module != nullptr);
+
+    std::string              text;
+    llvm::raw_string_ostream os(text);
+    REQUIRE(ir::emit_llvm(*result.module, os, { .optimize = false }));
+    return text;
+}
+
 // JIT-run a module and return everything its initial blocks wrote to stdout.
 std::string run_capture(std::string_view source) {
     const LowerResult r = lower_text(source);
@@ -119,8 +133,9 @@ TEST_CASE("alu emits verifiable llvm ir") {
     CHECK(ir.find(" add ") != std::string::npos);
     CHECK(ir.find(" sub ") != std::string::npos);
 
-    // Signal access via constant-index typed GEPs into the state structs.
-    CHECK(ir.find("getelementptr inbounds %clotho.state, ptr") != std::string::npos);
+    // Signal access via constant-index typed GEPs into the state structs
+    // (asserted on raw IR; instcombine canonicalizes GEP shapes).
+    CHECK(emit_raw(kAlu).find("getelementptr inbounds %clotho.state, ptr") != std::string::npos);
     CHECK(ir.find("store i8") != std::string::npos);
 
     // The if/else lowers to branches.
@@ -143,10 +158,11 @@ TEST_CASE("2-state vs 4-state widths") {
 
     // Every signal keeps its LLVM slot type, named per (domain, width) — and
     // the module's state struct lists them in declaration order: x, y
-    // (bit[3:0]) then z (logic[7:0]). No signal here can carry z, so every
-    // slot is the elided `.nz` form: just the i(2W) must|may word, no z word.
-    CHECK(ir.find("%m.state = type { %bit.nz.4, %bit.nz.4, %logic.nz.8 }") != std::string::npos);
-    CHECK(ir.find("%bit.nz.4 = type { i8 }") != std::string::npos);
+    // (bit[3:0]) then z (logic[7:0]). The 2-state signals are decoupled from the
+    // packed-word paths (no ABI / NBA / array), so they get the genuine single-iW
+    // slot `%bit.4 = { i4 }`; the 4-state z keeps the i(2W) must|may word.
+    CHECK(ir.find("%m.state = type { %bit.4, %bit.4, %logic.nz.8 }") != std::string::npos);
+    CHECK(ir.find("%bit.4 = type { i4 }") != std::string::npos);
     CHECK(ir.find("%logic.nz.8 = type { i16 }") != std::string::npos);
     CHECK(ir.find("alloca %clotho.state") != std::string::npos);
     // z's must|may word is an i16 (2W = 16).
@@ -278,7 +294,7 @@ TEST_CASE("wide add keeps the branching arithmetic path") {
             assign y = a + b;
         endmodule
     )";
-    const std::string          ir  = emit(src);
+    const std::string          ir  = emit_raw(src);
 
     // Not the single-bit LUT path; the branching arithmetic lowering is used.
     CHECK(ir.find("597819616") == std::string::npos);
@@ -340,7 +356,7 @@ TEST_CASE("single-bit mul agrees with LRM: value is and, but X propagates") {
 }
 
 TEST_CASE("wide mul keeps the branching arithmetic path") {
-    const std::string ir = emit(R"(
+    const std::string ir = emit_raw(R"(
         module m(input logic [7:0] a, input logic [7:0] b, output logic [7:0] y);
             assign y = a * b;
         endmodule
@@ -465,6 +481,72 @@ TEST_CASE("wide == keeps the icmp compare path") {
     CHECK(ir.find("icmp") != std::string::npos);
 }
 
+TEST_CASE("wide == / != are X only when ambiguous (LRM 11.4.5)") {
+    // 11.4.5: x/z bits yield X only if the relation is ambiguous. A position
+    // where both operands are known and unequal decides the result (== 0, != 1)
+    // regardless of the unknown bits; only "known bits all equal + some x/z"
+    // is X. All lines byte-match iverilog.
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a, b;
+            initial begin
+                a = 8'b10000000; b = 8'b0000000x; $display("%b%b", a == b, a != b);
+                a = 8'b0000100x; b = 8'b00000001; $display("%b%b", a == b, a != b);
+                a = 8'b1000000x; b = 8'b10000001; $display("%b%b", a == b, a != b);
+                a = 8'b000000x1; b = 8'b00000001; $display("%b%b", a == b, a != b);
+                a = 8'b0000zz11; b = 8'b00001011; $display("%b%b", a == b, a != b);
+                a = 8'h5a;       b = 8'h5a;       $display("%b%b", a == b, a != b);
+                a = 8'h5a;       b = 8'h5b;       $display("%b%b", a == b, a != b);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "01\n"  // bit 7 known-unequal: definite, despite b's x
+          "01\n"  // bit 3 known-unequal: definite, despite a's x
+          "xx\n"  // known bits equal, bit 0 unknown: ambiguous
+          "xx\n"  // known bits equal, bit 1 unknown: ambiguous
+          "xx\n"  // z counts as unknown; known bits equal: ambiguous
+          "10\n"  // known equal
+          "01\n"); // known unequal
+}
+
+TEST_CASE("=== / !== stay bit-exact where == is definite or ambiguous") {
+    // 11.4.5's ambiguity rule does not apply to case equality: x/z compare
+    // bit-for-bit and the result is always known. Operands mirror the == test
+    // above so a regression that reroutes === through the sharpened == fails.
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a, b;
+            initial begin
+                a = 8'b10000000; b = 8'b0000000x; $display("%b%b", a === b, a !== b);
+                a = 8'b1000000x; b = 8'b10000001; $display("%b%b", a === b, a !== b);
+                a = 8'b1000000x; b = 8'b1000000x; $display("%b%b", a === b, a !== b);
+            end
+        endmodule
+    )";
+    // vs iverilog.
+    CHECK(run_capture(src) == "01\n01\n10\n");
+}
+
+TEST_CASE("==? kept positions follow the sharpened == (LRM 11.4.6)") {
+    // Non-wildcard positions compare "as for the logical equality" operator, so
+    // a definite mismatch on a kept bit beats a left-operand x elsewhere.
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a, b;
+            initial begin
+                a = 8'b10000000; b = 8'b0000000x; $display("%b%b", a ==? b, a !=? b);
+                a = 8'b1000000x; b = 8'b00000001; $display("%b%b", a ==? b, a !=? b);
+                a = 8'b1000000x; b = 8'b10000001; $display("%b%b", a ==? b, a !=? b);
+            end
+        endmodule
+    )";
+    // Line 1: bit 0 wildcarded, bit 7 known-unequal -> definite 0/1.
+    // Line 2: no wildcards; bit 7 known-unequal decides despite a's x -> 0/1.
+    // Line 3: no wildcards; known bits equal, a bit 0 x -> ambiguous. vs iverilog.
+    CHECK(run_capture(src) == "01\n01\nxx\n");
+}
+
 TEST_CASE("===, !==, ==?, and ^~ operators agree with LRM 4-state semantics") {
     constexpr std::string_view src = R"(
         module m;
@@ -574,7 +656,7 @@ TEST_CASE("multi-bit relational and logical guard X (branchy), agree with LRM") 
 }
 
 TEST_CASE("ordered relational guards X with a branch") {
-    const std::string ir = emit(R"(
+    const std::string ir = emit_raw(R"(
         module m(input logic [7:0] a, input logic [7:0] b, output logic y);
             assign y = a < b;
         endmodule
@@ -784,10 +866,83 @@ TEST_CASE("event waits emit wait queues, always loops, and queue servicing") {
     CHECK(ir.find("@clotho.wait.doubled.dyn.any.len = internal global") != std::string::npos);
     CHECK(ir.find("@clotho.proc_sched = internal global") != std::string::npos);
     // The always blocks lower to a forever wait loop; servicing has both a static
-    // and a dynamic scan.
-    CHECK(ir.find("always.loop") != std::string::npos);
-    CHECK(ir.find("sta.head") != std::string::npos);
-    CHECK(ir.find("dyn.head") != std::string::npos);
+    // and a dynamic scan. Labels are asserted on raw IR (simplifycfg merges and
+    // renames blocks).
+    const std::string raw = emit_raw(src);
+    CHECK(raw.find("always.loop") != std::string::npos);
+    CHECK(raw.find("sta.head") != std::string::npos);
+    CHECK(raw.find("dyn.head") != std::string::npos);
+}
+
+TEST_CASE("bare initial @(event) blocks; it does not run at time zero") {
+    // A top-level event control on an `initial` is a one-shot wait, not process
+    // sensitivity (LRM 9.4): with no driver ever producing the edge the body
+    // must never run. Regression: the wait used to be hoisted into the
+    // process's sensitivity list and discarded, firing the body at time zero.
+    constexpr std::string_view src = R"(
+        module m;
+            reg s = 1;
+            initial @(negedge s) $display("fired");
+            initial begin #10; $display("end at %0t", $time); $finish; end
+        endmodule
+    )";
+    // vs iverilog: "fired" never appears.
+    CHECK(run_capture(src) == "end at 10\n");
+}
+
+TEST_CASE("bare initial @(event) fires once when the edge arrives") {
+    constexpr std::string_view src = R"(
+        module m;
+            reg s = 1;
+            initial @(negedge s) $display("fired at %0t", $time);
+            initial begin #3 s = 0; #10 $finish; end
+        endmodule
+    )";
+    // vs iverilog.
+    CHECK(run_capture(src) == "fired at 3\n");
+}
+
+TEST_CASE("bare initial @(posedge clk) waits for the first edge only") {
+    constexpr std::string_view src = R"(
+        module m;
+            reg clk = 0;
+            always #5 clk = ~clk;
+            initial @(posedge clk) $display("posedge at %0t", $time);
+            initial #23 $finish;
+        endmodule
+    )";
+    // One shot: fires at the first posedge (t=5), not again at t=15. vs iverilog.
+    CHECK(run_capture(src) == "posedge at 5\n");
+}
+
+TEST_CASE("bare initial #delay defers the statement (not hoisted)") {
+    // The sibling of the @(event) case: a top-level delay on an `initial`
+    // already lowered intra-body; pin that down.
+    constexpr std::string_view src = R"(
+        module m;
+            initial #5 $display("at %0t", $time);
+            initial #10 $finish;
+        endmodule
+    )";
+    // vs iverilog.
+    CHECK(run_capture(src) == "at 5\n");
+}
+
+TEST_CASE("always @(posedge clk) sensitivity hoisting is unchanged") {
+    constexpr std::string_view src = R"(
+        module m;
+            reg clk = 0;
+            reg [3:0] n = 0;
+            always #5 clk = ~clk;
+            always @(posedge clk) begin
+                n = n + 1;
+                $display("tick %0d at %0t", n, $time);
+            end
+            initial #23 $finish;
+        endmodule
+    )";
+    // vs iverilog.
+    CHECK(run_capture(src) == "tick 1 at 5\ntick 2 at 15\n");
 }
 
 TEST_CASE("$finish lowers to an rt_finish call") {
@@ -1686,6 +1841,33 @@ TEST_CASE("declaration initializers propagate to continuous consumers at time ze
     CHECK(out == "y=0 dvalid=0\n");
 }
 
+// `always @*` sensitivity includes signals both read and written by the block
+// (LRM 9.4.2.2 excludes only identifiers appearing solely as lvalues), unlike
+// always_comb's written-exclusion (9.2.2.2.1 b, legal there only because of the
+// single-writer rule). Regression: `a` was subtracted from the @* list, so the
+// external `a = 100` write at t=1 never re-triggered the block and `y` stayed 0.
+// Expected output matches iverilog.
+TEST_CASE("always @* re-triggers on external writes to read+written signals") {
+    const std::string out = run_capture(R"(
+        module m;
+            integer a, b, d, y;
+            always @* begin
+                if (b > 0) a = b;
+                y = a + d;
+            end
+            initial begin
+                b = 0; d = 7; a = 0;
+                #1 a = 100;
+                #1 $display("y=%0d", y);
+                #1 b = 5;
+                #1 $display("y=%0d", y);
+                $finish;
+            end
+        endmodule
+    )");
+    CHECK(out == "y=107\ny=12\n");
+}
+
 // A net declaration assignment (`wire w = a & b`) is a continuous assignment
 // (LRM 6.7.1), re-evaluated when its source changes — not a one-shot init and not
 // silently dropped (regression: it previously left the net at X).
@@ -1753,6 +1935,51 @@ TEST_CASE("$readmemb parses x/z and a runtime-string filename") {
     std::remove(path);
 }
 
+// A string-variable filename (LRM §21.4: the filename may be a string data type)
+// resolves through the rt_string handle at run time; the bytes are in natural
+// order, unlike the reversed packed-ASCII form. Cross-checked against Icarus
+// Verilog. Regression: this previously crashed the compiler (null value plane).
+TEST_CASE("$readmemh accepts a string-variable filename") {
+    const char* path = "clotho_readmemh_strvar_test.hex";
+    write_file(path, "de ad be ef\n");
+    const std::string src = std::string(R"(
+        module m;
+            logic [7:0] mem [0:3];
+            string fname;
+            initial begin
+                fname = ")") + path + R"(";
+                $readmemh(fname, mem);
+                $display("%h %h %h %h", mem[0], mem[1], mem[2], mem[3]);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "de ad be ef\n");
+    std::remove(path);
+}
+
+// A string-expression filename (a concatenation) is also legal per LRM §21.4:
+// "The filename is an expression that is a string literal, string data type, or
+// an integral data type". Cross-checked against Icarus Verilog.
+TEST_CASE("$readmemh accepts a string-expression filename") {
+    const char* path = "clotho_readmemh_strexpr_test.hex";
+    write_file(path, "12 34\n");
+    const std::string src = R"(
+        module m;
+            logic [7:0] mem [0:1];
+            string base;
+            initial begin
+                base = "clotho_readmemh_strexpr_test";
+                $readmemh({base, ".hex"}, mem);
+                $display("%h %h", mem[0], mem[1]);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "12 34\n");
+    std::remove(path);
+}
+
 // Default load fills from the lowest address upward regardless of the declared
 // range direction; a descending range [3:0] therefore maps the first datum to
 // address 0 (storage slot 3). This is the LRM §21.4 rule, which Icarus follows and
@@ -1771,6 +1998,451 @@ TEST_CASE("$readmemh default fill honors a descending declared range") {
         endmodule
     )";
     CHECK(run_capture(src) == "xx c3 0f f0\n");
+    std::remove(path);
+}
+
+// Slurp a file written by a file-I/O test.
+std::string read_file(const char* path) {
+    std::FILE* f = std::fopen(path, "rb");
+    REQUIRE(f != nullptr);
+    std::string out;
+    char        buf[256];
+    size_t      n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
+        out.append(buf, n);
+    }
+    std::fclose(f);
+    return out;
+}
+
+// Two-argument $fopen returns an FD; $fdisplay / $fwrite route to it and the
+// trailing newline distinguishes them (LRM §21.3).
+TEST_CASE("$fopen FD form: $fdisplay and $fwrite") {
+    const char* path = "clotho_fd_test.txt";
+    std::remove(path);
+    const std::string src = std::string(R"(
+        module m;
+            integer fd;
+            initial begin
+                fd = $fopen(")") + path + R"(", "w");
+                $fdisplay(fd, "line %0d", 1);
+                $fwrite(fd, "no-newline ");
+                $fwrite(fd, "tail\n");
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    run_capture(src);
+    CHECK(read_file(path) == "line 1\nno-newline tail\n");
+    std::remove(path);
+}
+
+// %u writes the 2-value projection, %z vpi aval/bval word pairs, both as
+// 32-bit words LSB-first (LRM §21.2.1.1). Byte-exact against Icarus Verilog:
+// 8'b1x0z101z has aval 0xca (x reads 1, z reads 0) and bval 0x51 (the xz mask).
+TEST_CASE("$fwrite %u and %z emit unformatted words") {
+    const char* path = "clotho_ufmt_test.bin";
+    std::remove(path);
+    const std::string src = std::string(R"(
+        module m;
+            integer fd;
+            initial begin
+                fd = $fopen(")") + path + R"(", "wb");
+                $fwrite(fd, "%u", 32'h01020304);
+                $fwrite(fd, "%z", 8'b1x0z_101z);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    run_capture(src);
+    CHECK(read_file(path) == std::string("\x04\x03\x02\x01\xca\x00\x00\x00\x51\x00\x00\x00", 12));
+    std::remove(path);
+}
+
+// One-argument $fopen returns a multichannel descriptor opened for writing.
+TEST_CASE("$fopen MCD form writes to its channel") {
+    const char* path = "clotho_mcd_test.txt";
+    std::remove(path);
+    const std::string src = std::string(R"(
+        module m;
+            integer mcd;
+            initial begin
+                mcd = $fopen(")") + path + R"(");
+                $fdisplay(mcd, "hello %0d", 42);
+                $fclose(mcd);
+            end
+        endmodule
+    )";
+    run_capture(src);
+    CHECK(read_file(path) == "hello 42\n");
+    std::remove(path);
+}
+
+// OR-ing two MCDs fans a single write out to every set channel (LRM §21.3.4).
+TEST_CASE("$fdisplay to a combined MCD writes both files") {
+    const char* p1 = "clotho_mcd_a.txt";
+    const char* p2 = "clotho_mcd_b.txt";
+    std::remove(p1);
+    std::remove(p2);
+    const std::string src = "module m;\n"
+                            "  integer a, b;\n"
+                            "  initial begin\n"
+                            "    a = $fopen(\"" +
+                            std::string(p1) +
+                            "\");\n"
+                            "    b = $fopen(\"" +
+                            std::string(p2) +
+                            "\");\n"
+                            "    $fdisplay(a | b, \"both %0d\", 7);\n"
+                            "    $fclose(a);\n"
+                            "    $fclose(b);\n"
+                            "  end\n"
+                            "endmodule\n";
+    run_capture(src);
+    CHECK(read_file(p1) == "both 7\n");
+    CHECK(read_file(p2) == "both 7\n");
+    std::remove(p1);
+    std::remove(p2);
+}
+
+// $fflush forces buffered output to disk without closing: the file is readable
+// mid-run, before any $fclose (LRM §21.3.6).
+TEST_CASE("$fflush(fd) flushes before close") {
+    const char* path = "clotho_fflush_test.txt";
+    std::remove(path);
+    const std::string src = std::string(R"(
+        module m;
+            integer fd;
+            initial begin
+                fd = $fopen(")") + path + R"(", "w");
+                $fwrite(fd, "flushed");
+                $fflush(fd);
+            end
+        endmodule
+    )";
+    run_capture(src);
+    CHECK(read_file(path) == "flushed");
+    std::remove(path);
+}
+
+// $display / $write still reach stdout after the merge onto rt_fwrite (the
+// standard-output MCD, bit 0).
+TEST_CASE("$display still targets stdout after the fwrite merge") {
+    CHECK(run_capture(R"(
+        module m;
+            initial $display("to stdout %0d", 9);
+        endmodule
+    )") == "to stdout 9\n");
+}
+
+// $fgets reads a line (through the newline) into a packed vector, stored
+// right-justified, and returns the character count. The %h layout is
+// cross-checked against Icarus Verilog (n=6, 0x...68656c6c6f0a for "hello\n").
+TEST_CASE("$fgets reads a line right-justified") {
+    const char* path = "clotho_fgets_test.txt";
+    write_file(path, "hello\nworld\n");
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, n;
+            reg [8*8-1:0] line;
+            initial begin
+                fd = $fopen(")") + path + R"(", "r");
+                n = $fgets(line, fd);
+                $display("%0d %h", n, line);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "6 000068656c6c6f0a\n");
+    std::remove(path);
+}
+
+// $fgetc returns bytes then -1 at EOF; $ungetc pushes a byte back for the next
+// read; $feof reports the end condition (LRM §21.3.4).
+TEST_CASE("$fgetc / $ungetc / $feof") {
+    const char* path = "clotho_fgetc_test.txt";
+    write_file(path, "AB");
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, c1, c2, c3, c4, eof;
+            initial begin
+                fd = $fopen(")") + path + R"(", "r");
+                c1 = $fgetc(fd);        // 'A'
+                c2 = $ungetc(c1, fd);   // -> 'A'
+                c2 = $fgetc(fd);        // 'A' again
+                c3 = $fgetc(fd);        // 'B'
+                c4 = $fgetc(fd);        // EOF
+                eof = $feof(fd);
+                $display("%0d %0d %0d %0d %0d", c1, c2, c3, c4, eof);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "65 65 66 -1 1\n");
+    std::remove(path);
+}
+
+// $sformat renders an explicit format into a string variable, stored
+// right-justified. %h layout cross-checked against Icarus (0x..6465633d37).
+TEST_CASE("$sformat into a string variable") {
+    CHECK(run_capture(R"(
+        module m;
+            reg [8*8-1:0] s;
+            initial begin
+                $sformat(s, "hex=%0h dec=%0d", 255, 7);
+                $display("%h", s);
+            end
+        endmodule
+    )") == "6666206465633d37\n"); // "ff dec=7" (low 8 bytes of "hex=ff dec=7")
+}
+
+// An oversized $sformat result keeps its low (rightmost) bytes, matching a
+// string-to-narrower-reg assignment. Cross-checked against Icarus.
+TEST_CASE("$sformat truncates to the low bytes on overflow") {
+    CHECK(run_capture(R"(
+        module m;
+            reg [8*4-1:0] s;
+            initial begin
+                $sformat(s, "abcdef");
+                $display("%h", s);
+            end
+        endmodule
+    )") == "63646566\n"); // "cdef"
+}
+
+// $swrite concatenates $write-style; a bare value uses the auto-sized decimal
+// default (LRM §21.2.1.1), so "v" + 10-wide "         5" keeps its low 8 bytes.
+TEST_CASE("$swrite concatenates into a string variable") {
+    CHECK(run_capture(R"(
+        module m;
+            reg [8*8-1:0] s;
+            initial begin
+                $swrite(s, "v", 5);
+                $display("%h", s);
+            end
+        endmodule
+    )") == "2020202020202035\n"); // "       5"
+}
+
+// $ferror reports a clear stream as code 0 (the message write-back path).
+TEST_CASE("$ferror on a clear stream returns 0") {
+    const char* path = "clotho_ferror_test.txt";
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, code;
+            reg [8*80-1:0] msg;
+            initial begin
+                fd = $fopen(")") + path + R"(", "w");
+                code = $ferror(fd, msg);
+                $display("%0d", code);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "0\n");
+    std::remove(path);
+}
+
+// $fscanf parses fields into integer lvalues and returns the conversion count.
+// Values cross-checked against Icarus Verilog.
+TEST_CASE("$fscanf parses integer fields") {
+    const char* path = "clotho_fscanf_test.txt";
+    write_file(path, "42 -7 ff\n");
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, n, a, b, c;
+            initial begin
+                fd = $fopen(")") + path + R"(", "r");
+                n = $fscanf(fd, "%d %d %h", a, b, c);
+                $display("%0d %0d %0d %0d", n, a, b, c);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "3 42 -7 255\n");
+    std::remove(path);
+}
+
+// %s reads a whitespace-delimited token (right-justified), and $fscanf resumes at
+// the next field. Cross-checked against Icarus.
+TEST_CASE("$fscanf with %s and a trailing field") {
+    const char* path = "clotho_fscanf_s_test.txt";
+    write_file(path, "hello 255\n");
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, n, v;
+            reg [8*8-1:0] word;
+            initial begin
+                fd = $fopen(")") + path + R"(", "r");
+                n = $fscanf(fd, "%s %d", word, v);
+                $display("%0d %h %0d", n, word, v);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2 00000068656c6c6f 255\n"); // "hello"
+    std::remove(path);
+}
+
+// $sscanf parses a literal string; the `*` flag suppresses a field (no arg).
+// Cross-checked against Icarus.
+TEST_CASE("$sscanf with a suppressed field") {
+    CHECK(run_capture(R"(
+        module m;
+            integer n, a, b;
+            initial begin
+                n = $sscanf("10 20 30", "%d %*d %d", a, b);
+                $display("%0d %0d %0d", n, a, b);
+            end
+        endmodule
+    )") == "2 10 30\n");
+}
+
+// $fscanf returns -1 (EOF) when the input is exhausted before the first
+// conversion (LRM §21.3.4).
+TEST_CASE("$fscanf returns -1 at end of file") {
+    const char* path = "clotho_fscanf_eof_test.txt";
+    write_file(path, "");
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, n, a;
+            initial begin
+                fd = $fopen(")") + path + R"(", "r");
+                n = $fscanf(fd, "%d", a);
+                $display("%0d", n);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "-1\n");
+    std::remove(path);
+}
+
+// The file-io write-backs are blocking writes: each must service the target
+// signal's wait queues like an ordinary assignment. Verified against iverilog.
+TEST_CASE("$sscanf / $sformat / $fgets / scalar $fread wake waiting processes") {
+    const char* path = "clotho_fio_wake_test.txt";
+    // 4 bytes so the scalar $fread fills its target exactly (a short read's
+    // low-byte fill is LRM-unpinned).
+    write_file(path, "hi!\n");
+    const std::string src = R"sv(
+        module m;
+            int r, n, fd;
+            logic [31:0] s;
+            always @(r) $display("r woke %h", r);
+            always @(s) $display("s woke %h", s);
+            initial begin
+                #1 n = $sscanf("5", "%d", r);
+                #1 $sformat(s, "AB");
+                #1 fd = $fopen(")sv" + std::string(path) + R"sv(", "r");
+                n = $fgets(s, fd);
+                $fclose(fd);
+                #1 fd = $fopen(")sv" + std::string(path) + R"sv(", "rb");
+                n = $fread(r, fd);
+                $fclose(fd);
+                #1 $finish;
+            end
+        endmodule
+    )sv";
+    CHECK(run_capture(src) == "r woke 00000005\ns woke 00004142\ns woke 6869210a\nr woke 6869210a\n");
+    std::remove(path);
+}
+
+// $fread into a memory wakes the array's Any-edge waiters (here the implicit
+// sensitivity of a continuous assign reading an element). The time-0 line is
+// the assign's initial x -> 00 transition on the 4-state wire. Verified
+// against iverilog (which schedules the time-0 evaluation before the @(y)
+// registration and so skips the first line — both orders are legal).
+TEST_CASE("$fread into a memory wakes array readers") {
+    const char* path = "clotho_fread_wake_test.bin";
+    write_file(path, std::string("\xAA\xBB\xCC\xDD", 4));
+    const std::string src = std::string(R"(
+        module m;
+            bit [7:0] mem [0:3];
+            wire [7:0] y = mem[1];
+            int fd, n;
+            always @(y) $display("y woke %h", y);
+            initial begin
+                #1 fd = $fopen(")") + path + R"(", "rb");
+                n = $fread(mem, fd);
+                $fclose(fd);
+                #1 $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "y woke 00\ny woke bb\n");
+    std::remove(path);
+}
+
+// $fread packs raw bytes MSB-first into a scalar and then a memory, sharing the
+// $readmem geometry. Cross-checked against Icarus Verilog.
+TEST_CASE("$fread into a scalar and a memory") {
+    const char* path = "clotho_fread_test.bin";
+    write_file(path, std::string("\xDE\xAD\xBE\xEF\x11\x22\x33\x44", 8));
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, n1, n2;
+            reg [31:0] r;
+            reg [7:0] mem [0:3];
+            initial begin
+                fd = $fopen(")") + path + R"(", "rb");
+                n1 = $fread(r, fd);
+                n2 = $fread(mem, fd);
+                $display("%0d %h %0d %h %h %h %h", n1, r, n2, mem[0], mem[1], mem[2], mem[3]);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "4 deadbeef 4 11 22 33 44\n");
+    std::remove(path);
+}
+
+// $fread(mem, fd, start, count) fills a bounded address window. Cross-checked
+// against Icarus.
+TEST_CASE("$fread with start and count into a memory") {
+    const char* path = "clotho_fread_sc_test.bin";
+    write_file(path, std::string("\xAA\xBB\xCC", 3));
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, n;
+            reg [7:0] mem [0:5];
+            integer k;
+            initial begin
+                for (k = 0; k < 6; k = k + 1) mem[k] = 0;
+                fd = $fopen(")") + path + R"(", "rb");
+                n = $fread(mem, fd, 2, 3);
+                $display("%0d %h %h %h %h %h %h", n, mem[0], mem[1], mem[2], mem[3], mem[4], mem[5]);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "3 00 00 aa bb cc 00\n");
+    std::remove(path);
+}
+
+// $ftell reports the offset, $fseek repositions (operation 0 = SEEK_SET), and
+// $rewind returns to the start (LRM §21.3.5).
+TEST_CASE("$ftell / $fseek / $rewind") {
+    const char* path = "clotho_fseek_test.txt";
+    write_file(path, "0123456789");
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, p1, s, p2, c, r, c2;
+            initial begin
+                fd = $fopen(")") + path + R"(", "r");
+                c  = $fgetc(fd); c = $fgetc(fd); c = $fgetc(fd);
+                p1 = $ftell(fd);        // 3
+                s  = $fseek(fd, 7, 0);  // 0
+                p2 = $ftell(fd);        // 7
+                c  = $fgetc(fd);        // '7'
+                r  = $rewind(fd);       // 0
+                c2 = $fgetc(fd);        // '0'
+                $display("%0d %0d %0d %c %0d %c", p1, s, p2, c, r, c2);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "3 0 7 7 0 0\n");
     std::remove(path);
 }
 
@@ -1884,6 +2556,30 @@ TEST_CASE("$readmem with z digits into a 2-state memory reads 0 and spares neigh
     std::remove(path);
 }
 
+// %h accepts z / ? digits (LRM Table 21-7); the scan target must keep its z
+// plane under z elision (the Scanf seed in compute_may_z), and a 2-state
+// target drops the z digits to 0 (LRM 6.3.1).
+TEST_CASE("$sscanf z digits survive z elision; a 2-state target reads 0") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [31:0] r4;
+            int r2, n;
+            initial begin
+                n = $sscanf("zzzzzzzz", "%h", r4);
+                $display("%h", r4);
+                n = $sscanf("z1x0zz1?", "%h", r4);
+                $display("%h", r4);
+                n = $sscanf("zzzzzzzz", "%h", r2);
+                $display("%h", r2);
+                $finish;
+            end
+        endmodule
+    )";
+    // Verified against iverilog except the ? digit, which iverilog reads as x;
+    // ? is an alternative for z in the LRM (5.7.1), so z is kept.
+    CHECK(run_capture(src) == "zzzzzzzz\nz1x0zz1z\n00000000\n");
+}
+
 TEST_CASE("a task output formal carries z back to the caller") {
     constexpr std::string_view src = R"(
         module m;
@@ -1902,7 +2598,7 @@ TEST_CASE("a task output formal carries z back to the caller") {
             end
         endmodule
     )";
-    CHECK(run_capture(src) == "z111 7\n");
+    CHECK(run_capture(src) == "z111  7\n"); // %d of a 4-bit value auto-sizes to 2
 }
 
 TEST_CASE("a function returning z feeds a z-capable target") {

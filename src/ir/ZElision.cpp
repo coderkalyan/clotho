@@ -12,6 +12,9 @@
 //      parameter folded from one).
 //   3. $readmem targets with a 4-state element type (the file may contain z
 //      digits; a 2-state memory reads x/z as 0 — see rt_readmem).
+//   4. $fscanf / $sscanf 4-state output targets (%h / %b / %o accept z and ?
+//      digits per LRM Table 21-7; a 2-state target drops x/z to 0 — see
+//      scan_run / write_word_planes).
 // Not seeds: gate primitives, force/release, inout ports, and net kinds with
 // resolution/pull semantics (wand, tri0, trireg, ...) are unimplemented
 // loud-fails; when implemented, their z-producing forms MUST seed here.
@@ -35,27 +38,11 @@ namespace clotho::ir {
 
 namespace {
 
-// Walk an lvalue select chain (bit / part / element selects) to its root leaf.
-Index lvalue_root(const Ir& ir, Index lv) {
-    for (;;) {
-        switch (ir.tag(lv)) {
-            case Inst::Tag::BitSelect:
-                lv = ir.payload(lv).binary.l;
-                break;
-            case Inst::Tag::PartSelect:
-            case Inst::Tag::DynPartSelect:
-            case Inst::Tag::ElemSelect:
-                lv = ir.payload(lv).op_extra.op;
-                break;
-            default:
-                return lv;
-        }
-    }
-}
-
 struct Analysis {
     // Per-function facts, indexed by FunctionId.
     struct FnState {
+        // The function these facts belong to (for local storage types).
+        const Function* func = nullptr;
         // May-z of each formal, joined over every call site.
         std::vector<uint8_t> param_z;
         // May-z of each frame local.
@@ -107,9 +94,24 @@ struct Analysis {
         return false;
     }
 
+    // Whether the storage behind an lvalue is 4-state (can hold a z bit at
+    // all). Unknown leaves are conservatively 4-state.
+    bool storage_four_state(const Ir& ir, const FnState* fn, Index lv) const {
+        const Index root = lvalue_root(ir, lv).root;
+        switch (ir.tag(root)) {
+            case Inst::Tag::Signal:
+                return m.pool.layout(m.signal(ir.payload(root).signal).type).domain == Domain::Four;
+            case Inst::Tag::Local:
+                return fn == nullptr ||
+                       m.pool.layout(fn->func->local_types[ir.payload(root).local.index]).domain == Domain::Four;
+            default:
+                return true;
+        }
+    }
+
     // May-z of the storage behind an lvalue. Unknown leaves are conservatively z.
     bool storage_z(const Ir& ir, const FnState* fn, Index lv) const {
-        const Index root = lvalue_root(ir, lv);
+        const Index root = lvalue_root(ir, lv).root;
         switch (ir.tag(root)) {
             case Inst::Tag::Signal:
                 return sig_z[static_cast<uint32_t>(ir.payload(root).signal)] != 0;
@@ -126,7 +128,7 @@ struct Analysis {
         if (!rhs_z) {
             return;
         }
-        const Index root = lvalue_root(ir, lhs);
+        const Index root = lvalue_root(ir, lhs).root;
         switch (ir.tag(root)) {
             case Inst::Tag::Signal:
                 mark(sig_z[static_cast<uint32_t>(ir.payload(root).signal)]);
@@ -302,6 +304,19 @@ struct Analysis {
                     }
                     break;
                 }
+                case Inst::Tag::Scanf: {
+                    // Seed: %h / %b / %o accept z and ? digits (LRM Table 21-7),
+                    // which land in a 4-state target's z plane. A 2-state target
+                    // has no z plane; the runtime drops parsed x/z to 0 there
+                    // (LRM 6.3.1) and it stays clean.
+                    const ScanfInfo info = ir.extra_data<ScanfInfo>(p.extra);
+                    for (const Index out : ir.region(info.args)) {
+                        if (storage_four_state(ir, fn, out)) {
+                            store_into(ir, fn, out, true);
+                        }
+                    }
+                    break;
+                }
 
                 // Valueless / always-known: no z effect.
                 case Inst::Tag::Cond:
@@ -326,6 +341,21 @@ struct Analysis {
                 case Inst::Tag::StrSubstr:
                 case Inst::Tag::StrFromPacked:
                 case Inst::Tag::StrToPacked:
+                // File I/O: descriptors and read counts are always-known integers,
+                // and these write-back forms ($fgets / $sformat / $ferror / $fread)
+                // store known bytes with a zero z plane, so none seed z into their
+                // target ($*scanf, which can parse z digits, seeds above). A
+                // never-z target's z word is elided and the runtime is handed a
+                // null z pointer.
+                case Inst::Tag::Fopen:
+                case Inst::Tag::Fclose:
+                case Inst::Tag::FileValueOp:
+                case Inst::Tag::Fgets:
+                case Inst::Tag::Sformat:
+                case Inst::Tag::Sformatf:
+                case Inst::Tag::Ferror:
+                case Inst::Tag::FreadWord:
+                case Inst::Tag::FreadMem:
                     break;
             }
         }
@@ -337,12 +367,12 @@ struct Analysis {
 std::vector<bool> compute_undriven(const Module& m) {
     std::vector<bool> driven(m.signals().size(), false);
     const auto        mark_root = [&](const Ir& ir, Index lv) {
-        const Index root = lvalue_root(ir, lv);
+        const Index root = lvalue_root(ir, lv).root;
         if (ir.tag(root) == Inst::Tag::Signal) {
             driven[static_cast<uint32_t>(ir.payload(root).signal)] = true;
         }
     };
-    const auto scan = [&](const Ir& ir, const Function* fn) {
+    const auto scan = [&](const Ir& ir) {
         for (uint32_t k = 0; k < ir.inst_count(); ++k) {
             const Index          i = static_cast<Index>(k);
             const Inst::Payload& p = ir.payload(i);
@@ -370,21 +400,16 @@ std::vector<bool> compute_undriven(const Module& m) {
                     break;
             }
         }
-        (void)fn;
     };
     for (const Process& p : m.processes()) {
-        scan(p.ir, nullptr);
+        scan(p.ir);
     }
     for (uint32_t f = 0; f < m.function_count(); ++f) {
-        const Function& fn = m.function(static_cast<FunctionId>(f));
-        scan(fn.ir, &fn);
+        scan(m.function(static_cast<FunctionId>(f)).ir);
     }
 
-    std::vector<bool> undriven(driven.size());
-    for (size_t i = 0; i < driven.size(); ++i) {
-        undriven[i] = !driven[i];
-    }
-    return undriven;
+    driven.flip();
+    return driven;
 }
 
 std::vector<bool> compute_may_z(const Module& m) {
@@ -393,6 +418,7 @@ std::vector<bool> compute_may_z(const Module& m) {
     a.fns.resize(m.function_count());
     for (size_t f = 0; f < m.function_count(); ++f) {
         const Function& fn = m.function(static_cast<FunctionId>(f));
+        a.fns[f].func      = &fn;
         a.fns[f].param_z.assign(fn.param_types.size(), 0);
         a.fns[f].local_z.assign(fn.local_types.size(), 0);
     }

@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <utility>
 #include <memory>
 #include <optional>
 #include <string>
@@ -51,6 +53,7 @@
 
 #include "SourceMap.h"
 #include "ir/Builder.h"
+#include "runtime/Format.h"
 
 namespace clotho {
 
@@ -437,6 +440,7 @@ public:
     // gives every top a "<name>." prefix, so gating on an empty prefix would drop
     // all initializers (each top gets its own Lowerer, so this covers each one).
     void lower_top(const InstanceSymbol& top, std::string_view prefix) {
+        top_elided_ = prefix.empty();
         lower_instance(top, prefix);
         finalize_preinit();
         module_.add_top(std::move(top_scope_));
@@ -763,11 +767,12 @@ private:
 
                     ir::SignalInfo info;
                     if (m.kind == SymbolKind::Net) {
+                        const NetSymbol& net = m.as<NetSymbol>();
                         // Only single-driver, z-defaulting net kinds are modeled.
                         // TODO: wand/wor/tri0/tri1/trireg/supply0/supply1 carry
                         // resolution, pull, or charge semantics (and different
                         // undriven defaults) clotho does not implement.
-                        switch (m.as<NetSymbol>().netType.netKind) {
+                        switch (net.netType.netKind) {
                             case NetType::Wire:
                             case NetType::Tri:
                             case NetType::UWire:
@@ -775,6 +780,13 @@ private:
                             default:
                                 fail("unsupported net type (only wire/tri/uwire are modeled)");
                         }
+                        if (net.getDelay() != nullptr) {
+                            // TODO: net delay (`wire #5 w;`, LRM 28.16) — an
+                            // inertial delay on every driver of the net; dropped
+                            // today, so propagation would be instant.
+                            fail("net delay is not supported");
+                        }
+                        check_drive_strength(net.getDriveStrength(), "a net declaration");
                         info.is_net = true;
                     }
                     info.name = prefix + std::string(vs.name);
@@ -859,6 +871,132 @@ private:
         return sig;
     }
 
+    // -- Net driver tracking --
+    //
+    // Clotho has no net resolution: every continuous driver is an independent
+    // process and the last write wins, instead of resolving conflicting values
+    // to x per LRM 6.6.1 Table 6-2. Until resolution exists, a net whose bits
+    // gain a second continuous/structural driver (continuous assign, output
+    // port connection, input port copy, net declaration assignment) must fail
+    // loudly. Procedural writes are not continuous drivers and are not tracked;
+    // non-overlapping constant selects (assign w[0]=..., assign w[1]=...) are
+    // legal single-driver-per-bit and stay accepted.
+    // TODO: multiple-driver net resolution (LRM 6.6.1); then delete this guard.
+
+    // Record that bits [lo, hi] of a net gained a continuous driver; fail on
+    // overlap with a previously recorded driver. Non-net symbols are ignored
+    // (slang already rejects multiple continuous drivers on variables).
+    void record_net_driver_range(const ValueSymbol& sym, uint32_t lo, uint32_t hi) {
+        if (sym.kind != SymbolKind::Net) {
+            return;
+        }
+        auto& ranges = net_driven_[static_cast<uint32_t>(signal_of(sym))];
+        for (const auto& [plo, phi] : ranges) {
+            if (lo <= phi && plo <= hi) {
+                fail("multiple drivers on net '" + std::string(sym.name) +
+                     "' are not supported (no resolution)");
+            }
+        }
+        ranges.emplace_back(lo, hi);
+    }
+
+    // The root value symbol of an lvalue select chain, or null for shapes with
+    // no single named root.
+    static const ValueSymbol* lvalue_root(const Expression& e) {
+        switch (e.kind) {
+            case ExpressionKind::NamedValue:
+                return &e.as<NamedValueExpression>().symbol;
+            case ExpressionKind::ElementSelect:
+                return lvalue_root(e.as<ElementSelectExpression>().value());
+            case ExpressionKind::RangeSelect:
+                return lvalue_root(e.as<RangeSelectExpression>().value());
+            case ExpressionKind::Conversion:
+                return lvalue_root(e.as<ConversionExpression>().operand());
+            default:
+                return nullptr;
+        }
+    }
+
+    // Record the net-driver coverage of one continuous-assignment lvalue. A
+    // constant bit/part-select directly on the net drives an exact bit range;
+    // any dynamic or nested select conservatively drives the whole net
+    // ([0, UINT32_MAX], which overlaps every other driver).
+    void record_net_driver(const Expression& lhs) {
+        switch (lhs.kind) {
+            case ExpressionKind::NamedValue:
+                record_net_driver_range(lhs.as<NamedValueExpression>().symbol, 0, UINT32_MAX);
+                break;
+            case ExpressionKind::Concatenation:
+                for (const Expression* op : lhs.as<ConcatenationExpression>().operands()) {
+                    record_net_driver(*op);
+                }
+                break;
+            case ExpressionKind::Conversion:
+                record_net_driver(lhs.as<ConversionExpression>().operand());
+                break;
+            case ExpressionKind::ElementSelect: {
+                const ElementSelectExpression& es   = lhs.as<ElementSelectExpression>();
+                const ValueSymbol*             root = lvalue_root(es.value());
+                if (root == nullptr) {
+                    break;
+                }
+                if (es.value().kind == ExpressionKind::NamedValue &&
+                    es.value().type->isIntegral() && es.type->getBitWidth() == 1) {
+                    if (const std::optional<int32_t> c = try_const_int(es.selector())) {
+                        const auto bit =
+                          static_cast<uint32_t>(packed_range_of(es.value()).translateIndex(*c));
+                        record_net_driver_range(*root, bit, bit);
+                        break;
+                    }
+                }
+                record_net_driver_range(*root, 0, UINT32_MAX);
+                break;
+            }
+            case ExpressionKind::RangeSelect: {
+                const RangeSelectExpression& rs   = lhs.as<RangeSelectExpression>();
+                const ValueSymbol*           root = lvalue_root(rs.value());
+                if (root == nullptr) {
+                    break;
+                }
+                if (rs.value().kind == ExpressionKind::NamedValue &&
+                    rs.value().type->isIntegral() &&
+                    rs.getSelectionKind() == RangeSelectionKind::Simple) {
+                    const std::optional<int32_t> left  = try_const_int(rs.left());
+                    const std::optional<int32_t> right = try_const_int(rs.right());
+                    if (left && right) {
+                        const slang::ConstantRange range = packed_range_of(rs.value());
+                        const auto a = static_cast<uint32_t>(range.translateIndex(*left));
+                        const auto b = static_cast<uint32_t>(range.translateIndex(*right));
+                        record_net_driver_range(*root, std::min(a, b), std::max(a, b));
+                        break;
+                    }
+                }
+                // A dynamic (or indexed +:/-:) select: conservatively the whole net.
+                record_net_driver_range(*root, 0, UINT32_MAX);
+                break;
+            }
+            default:
+                // Other lvalue shapes are rejected by lower_lvalue.
+                break;
+        }
+    }
+
+    // Reject an explicit non-default drive strength on a continuous assignment
+    // or net declaration. Strengths only affect multi-driver resolution, which
+    // Clotho lacks; an explicit (strong0, strong1) equals the default (LRM
+    // 10.3.4) and stays accepted.
+    // TODO: strength-based resolution (LRM 6.6.1, 28.11-28.12).
+    void check_drive_strength(
+      const std::pair<std::optional<DriveStrength>, std::optional<DriveStrength>>& strength,
+      std::string_view what) {
+        const auto non_default = [](const std::optional<DriveStrength>& s) {
+            return s.has_value() && *s != DriveStrength::Strong;
+        };
+        if (non_default(strength.first) || non_default(strength.second)) {
+            fail("drive strength on " + std::string(what) + " is not supported");
+        }
+    }
+
     // -- Processes --
 
     void lower_continuous_assign(const ContinuousAssignSymbol& sym) {
@@ -867,36 +1005,52 @@ private:
             // update would land at the wrong time. Reject until the scheduler exists.
             fail("continuous assignment delay (assign #N) is not supported");
         }
+        check_drive_strength(sym.getDriveStrength(), "a continuous assignment");
         const Expression& e = sym.getAssignment();
         if (e.kind != ExpressionKind::Assignment) {
             fail("malformed continuous assignment");
         }
+        record_net_driver(e.as<AssignmentExpression>().left());
 
         ir::Builder b(module_.pool);
         lower_assign(e.as<AssignmentExpression>(), b);
 
         // A continuous assign is a process sensitive to the source elements of
         // its expression (LRM 4.9.1): every signal the RHS reads, plus any read
-        // in an LHS selector (`assign mem[i] = x` is sensitive to i). Unlike an
-        // always_comb, the written net is NOT subtracted: a net that is both
-        // driven and read is real combinational feedback (`assign y = a & y`)
-        // and must stay sensitive. An empty list (constant RHS) yields a
-        // run-once process, which is the required time-zero evaluation.
-        //
-        // NOTE: Comb mode inlines called-function reads. The LRM leaves this
-        // unspecified for continuous assigns; inlining is
-        // the safe superset (extra wakeups of an idempotent assign).
-        std::vector<ir::WaitEvent> wait_events;
+        // in an LHS selector (`assign mem[i] = x` is sensitive to i).
+        add_continuous_process(continuous_events(e), to_source_loc(sym.location), b);
+    }
+
+    // The wait events of a continuous assignment: every signal its expression
+    // reads, as an any-change wait (LRM 4.9.1). Unlike inferred (@*)
+    // sensitivity, a written signal is NOT subtracted: a net that is both
+    // driven and read is real combinational feedback (`assign y = a & y`) and
+    // must stay sensitive. An empty list (constant RHS) yields a run-once
+    // process, which is the required time-zero evaluation.
+    //
+    // NOTE: Comb mode inlines called-function reads. The LRM leaves this
+    // unspecified for continuous assigns; inlining is
+    // the safe superset (extra wakeups of an idempotent assign).
+    std::vector<ir::WaitEvent> continuous_events(const Expression& e) {
+        std::vector<ir::WaitEvent> events;
         SensitivityCollector       c(sigmap_, SensitivityMode::Comb);
         e.visit(c);
         for (const ir::Signal s : c.reads) {
-            wait_events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
+            events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
         }
+        return events;
+    }
 
+    // Create the always-active, self-starting process every continuous
+    // construct (continuous assign, net declaration assignment, port-connection
+    // copy) lowers to: it evaluates once at time zero so it settles from
+    // declaration-initialized values, then re-evaluates whenever a wait event
+    // fires (LRM 4.9.1, 23.3.3).
+    void add_continuous_process(std::vector<ir::WaitEvent> wait_events, ir::SourceLoc l, ir::Builder& b) {
         module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
                                          .wait_events = std::move(wait_events),
                                          .self_start  = true,
-                                         .loc         = to_source_loc(sym.location),
+                                         .loc         = l,
                                          .ir          = b.finish() });
     }
 
@@ -911,24 +1065,11 @@ private:
         if (init == nullptr) {
             return;
         }
+        record_net_driver_range(ns, 0, UINT32_MAX);
         ir::Builder         b(module_.pool);
         const ir::SourceLoc l = loc(*init);
         b.binary(ir::Inst::Tag::Store, value_lvalue(ns, b, l), lower_expr(*init, b), l);
-
-        // Sensitive to every signal the initializer reads (LRM 4.9.1); an empty
-        // list (constant RHS) yields the required run-once time-zero evaluation.
-        std::vector<ir::WaitEvent> wait_events;
-        SensitivityCollector       c(sigmap_, SensitivityMode::Comb);
-        init->visit(c);
-        for (const ir::Signal s : c.reads) {
-            wait_events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
-        }
-
-        module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
-                                         .wait_events = std::move(wait_events),
-                                         .self_start  = true,
-                                         .loc         = to_source_loc(ns.location),
-                                         .ir          = b.finish() });
+        add_continuous_process(continuous_events(*init), to_source_loc(ns.location), b);
     }
 
     // Wire one child instance's ports to the parent. Each connection becomes a
@@ -980,14 +1121,18 @@ private:
                 // LHS is the parent target and whose RHS is an EmptyArgument
                 // placeholder for the port value, so read the child net directly and
                 // resize it to the target width. Wakes on the child net.
-                const AssignmentExpression& a   = expr->as<AssignmentExpression>();
-                const ir::Ref               ty  = lower_type(*a.left().type);
-                const ir::Index             val = b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l);
+                const AssignmentExpression& a = expr->as<AssignmentExpression>();
+                // The connection is a continuous driver of the parent-side net.
+                record_net_driver(a.left());
+                const ir::Ref   ty  = lower_type(*a.left().type);
+                const ir::Index val = b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l);
                 b.binary(ir::Inst::Tag::Store, lower_lvalue(a.left(), b), b.resize(val, ty, l), l);
                 sens.push_back(ir::WaitEvent{ .signal = child_sig, .edge = ir::Edge::Any });
             } else {
                 // Input: drive the child net from the source rvalue, resized to the
-                // port width; wakes on the source's reads.
+                // port width; wakes on the source's reads. The copy is a continuous
+                // driver of the whole child-side net.
+                record_net_driver_range(p.internalSymbol->as<ValueSymbol>(), 0, UINT32_MAX);
                 const ir::Ref ty = lower_type(p.internalSymbol->as<ValueSymbol>().getType());
                 b.binary(ir::Inst::Tag::Store, b.signal(child_sig, l), b.resize(lower_expr(*expr, b), ty, l), l);
                 collect_expr_reads(*expr, sens);
@@ -995,11 +1140,7 @@ private:
             // A port connection is a continuous copy: evaluate at time zero so the
             // child sees the parent's declaration-initialized value even when the
             // parent signal never changes afterward (LRM 23.3.3).
-            module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
-                                             .wait_events = std::move(sens),
-                                             .self_start  = true,
-                                             .loc         = l,
-                                             .ir          = b.finish() });
+            add_continuous_process(std::move(sens), l, b);
         }
     }
 
@@ -1010,9 +1151,16 @@ private:
         SensitivityCollector c(sigmap_, SensitivityMode::Comb);
         expr.visit(c);
         for (const ir::Signal s : c.reads) {
-            if (!c.written.contains(static_cast<uint32_t>(s))) {
-                out.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
+            if (c.written.contains(static_cast<uint32_t>(s))) {
+                continue;
             }
+            if (is_string_ref(module_.signal(s).type)) {
+                // TODO: string signals in inferred sensitivity — string stores
+                // skip wait-queue servicing, so the process would never
+                // re-trigger.
+                fail("string in inferred sensitivity is not supported");
+            }
+            out.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
         }
     }
 
@@ -1038,17 +1186,21 @@ private:
 
         const Statement* body = &sym.getBody();
 
-        // `always_comb` / `always_latch` have no written sensitivity at all; their
-        // event list is inferred from the body's reads (9.2.2.2). `always @*`
-        // carries an ImplicitEvent timing wrapping the body, inferred under the
-        // subtly different 9.4.2.2 rules (see SensitivityMode).
+        // `always_comb` / `always_latch` infer sensitivity from the body's reads
+        // minus its writes (9.2.2.2.1, legal because of the single-writer rule).
+        // `always @*` carries an ImplicitEvent timing wrapping the body, inferred
+        // under the subtly different 9.4.2.2 rules (see SensitivityMode).
         const bool comb = sym.procedureKind == ProceduralBlockKind::AlwaysComb ||
                           sym.procedureKind == ProceduralBlockKind::AlwaysLatch;
         bool       infer = comb;
 
-        // A top-level event control is the process's sensitivity: collect its wait
-        // events here and lower the statement underneath.
-        if (body->kind == StatementKind::Timed) {
+        // A top-level event control on an `always` is the process's sensitivity
+        // list: collect its wait events here and lower the statement underneath.
+        // On an `initial` the same syntax is a one-shot blocking wait (LRM 9.4):
+        // hoisting it as sensitivity would run the statement unblocked at time
+        // zero, so it is left in the body and lowers to a Wait through
+        // lower_stmt's Timed case, exactly like a begin/end-wrapped body.
+        if (activation == ir::Activation::Always && body->kind == StatementKind::Timed) {
             const TimedStatement& timed = body->as<TimedStatement>();
             if (timed.timing.kind == TimingControlKind::ImplicitEvent) {
                 infer = true;
@@ -1072,7 +1224,7 @@ private:
 
         ir::Builder b(module_.pool);
         if (looping) {
-            lower_implicit_forever(*body, b);
+            lower_forever(*body, b);
         } else {
             lower_stmt(*body, b);
         }
@@ -1230,7 +1382,14 @@ private:
                 if (blk.blockKind != StatementBlockKind::Sequential) {
                     fail("fork..join blocks are not supported");
                 }
+                const bool named = blk.blockSymbol != nullptr && !blk.blockSymbol->name.empty();
+                if (named) {
+                    named_blocks_.push_back(blk.blockSymbol->name);
+                }
                 lower_stmt(blk.body, b);
+                if (named) {
+                    named_blocks_.pop_back();
+                }
                 break;
             }
             case StatementKind::Timed: {
@@ -1281,7 +1440,7 @@ private:
                 lower_while(stmt.as<WhileLoopStatement>(), b);
                 break;
             case StatementKind::ForeverLoop:
-                lower_forever(stmt.as<ForeverLoopStatement>(), b);
+                lower_forever(stmt.as<ForeverLoopStatement>().body, b);
                 break;
             case StatementKind::RepeatLoop:
                 lower_repeat(stmt.as<RepeatLoopStatement>(), b);
@@ -1299,21 +1458,32 @@ private:
         }
     }
 
-    // Reduce a condition expression to its 1-bit truth value for `if`/`?:`.
-    // LRM §12.4: the condition is true if any bit is 1, false if all bits are 0,
-    // and ambiguous (X) otherwise. That is exactly reduction-OR: must = any bit
-    // definitely 1, may = any bit could be 1 (Z bits read as X via `may`). This
-    // also normalizes a multi-bit predicate to the 1-bit value `b.cond`/`b.select`
-    // require; without it the backend emits a mismatched-width icmp.
     ir::Index lower_predicate(const Expression& cond, ir::Builder& b) {
-        const ir::SourceLoc l    = loc(cond);
-        const ir::Index     pred = lower_expr(cond, b);
+        const ir::SourceLoc l = loc(cond);
+        if (is_string_expr(cond)) {
+            const ir::Index len = b.unary(ir::Inst::Tag::StrLen, lower_expr(cond, b), l);
+            return b.unary(ir::Inst::Tag::RedOr, len, l);
+        }
+        const ir::Index pred = lower_expr(cond, b);
         return b.unary(ir::Inst::Tag::RedOr, pred, l);
+    }
+
+    // A loop condition keeps its native width (the backend's definite-1 rule
+    // normalizes multi-bit and X/Z), except a string, which must lower to its
+    // 1-bit truth value.
+    ir::Index lower_loop_cond(const Expression& cond, ir::Builder& b) {
+        return is_string_expr(cond) ? lower_predicate(cond, b) : lower_expr(cond, b);
     }
 
     void lower_conditional(const ConditionalStatement& c, ir::Builder& b) {
         if (c.conditions.size() != 1) {
             fail("unsupported multi-condition if");
+        }
+        if (c.conditions[0].pattern != nullptr) {
+            // TODO: `if (expr matches pattern)` (LRM 12.6.2) — the pattern must
+            // be matched and its variables bound; lowering the bare condition
+            // would silently ignore the pattern.
+            fail("pattern matching in conditions is not supported");
         }
         const ir::Index pred = lower_predicate(*c.conditions[0].expr, b);
 
@@ -1401,7 +1571,8 @@ private:
         }
 
         b.open_region();
-        const ir::Index pred = f.stopExpr != nullptr ? lower_expr(*f.stopExpr, b) : true_const(b, loc(f));
+        const ir::Index pred =
+          f.stopExpr != nullptr ? lower_loop_cond(*f.stopExpr, b) : true_const(b, loc(f));
         const ir::ExtraSlice cond = b.close_region();
 
         b.open_region();
@@ -1420,7 +1591,7 @@ private:
     // while-loop: a for-loop with no init and no step.
     void lower_while(const WhileLoopStatement& w, ir::Builder& b) {
         b.open_region();
-        const ir::Index     pred = lower_expr(w.cond, b);
+        const ir::Index     pred = lower_loop_cond(w.cond, b);
         const ir::ExtraSlice cond = b.close_region();
 
         b.open_region();
@@ -1433,11 +1604,13 @@ private:
         b.loop(cond, pred, body, step, loc(w));
     }
 
-    // The implicit forever loop wrapping a sensitivity-less `always` body (LRM
-    // 9.2.2): a constant-true `forever` around `body`, with no separate AST node.
-    // The body's own timing control (`#`/`@`) suspends each iteration; without one
-    // this is the legal zero-delay infinite loop noted in lower_procedural_block.
-    void lower_implicit_forever(const Statement& body, ir::Builder& b) {
+    // A forever loop around `body`: a constant-true Loop. Lowers both an
+    // explicit `forever` statement's body and the implicit forever wrapping a
+    // sensitivity-less `always` body (LRM 9.2.2), which has no separate AST
+    // node. The body's own timing control (`#`/`@`) suspends each iteration;
+    // without one this is the legal zero-delay infinite loop noted in
+    // lower_procedural_block.
+    void lower_forever(const Statement& body, ir::Builder& b) {
         b.open_region();
         const ir::Index      pred = true_const(b, loc(body));
         const ir::ExtraSlice cond = b.close_region();
@@ -1450,22 +1623,6 @@ private:
         const ir::ExtraSlice step = b.close_region(); // empty
 
         b.loop(cond, pred, body_region, step, loc(body));
-    }
-
-    // forever-loop: a while-loop with a constant-true condition.
-    void lower_forever(const ForeverLoopStatement& f, ir::Builder& b) {
-        b.open_region();
-        const ir::Index     pred = true_const(b, loc(f));
-        const ir::ExtraSlice cond = b.close_region();
-
-        b.open_region();
-        lower_stmt(f.body, b);
-        const ir::ExtraSlice body = b.close_region();
-
-        b.open_region();
-        const ir::ExtraSlice step = b.close_region(); // empty
-
-        b.loop(cond, pred, body, step, loc(f));
     }
 
     // repeat-loop (12.7.2): runs the body N times, where N is the count
@@ -1672,8 +1829,44 @@ private:
             lower_string_method(name, call, b);
             return;
         }
-        if (name == "$display" || name == "$write") {
-            lower_display(call, name == "$display", b);
+        if (const char rx = display_radix(name, "$display")) {
+            lower_display(call, /*newline=*/true, b, rx);
+            return;
+        }
+        if (const char rx = display_radix(name, "$write")) {
+            lower_display(call, /*newline=*/false, b, rx);
+            return;
+        }
+        if (const char rx = display_radix(name, "$fdisplay")) {
+            lower_fdisplay(call, /*newline=*/true, b, rx);
+            return;
+        }
+        if (const char rx = display_radix(name, "$fwrite")) {
+            lower_fdisplay(call, /*newline=*/false, b, rx);
+            return;
+        }
+        if (const char rx = display_radix(name, "$swrite")) {
+            lower_sformat(call, /*is_sformat=*/false, b, rx);
+            return;
+        }
+        if (name == "$sformat") {
+            lower_sformat(call, /*is_sformat=*/true, b);
+            return;
+        }
+        if (name == "$fclose") {
+            if (call.arguments().size() != 1) {
+                fail("$fclose requires a single file-descriptor argument");
+            }
+            b.fclose(lower_expr(*call.arguments()[0], b), loc(call));
+            return;
+        }
+        if (name == "$fgets" || name == "$fgetc" || name == "$ungetc" || name == "$feof" ||
+            name == "$ftell" || name == "$fseek" || name == "$rewind" || name == "$ferror" ||
+            name == "$fscanf" || name == "$sscanf" || name == "$fread") {
+            // File read / positioning / error / scan functions used in statement
+            // position: lower for the side effect (file position, write-back) and
+            // drop the result.
+            lower_sysfunc(call, b);
             return;
         }
         if (name == "$finish" || name == "$stop") {
@@ -1687,14 +1880,17 @@ private:
             return;
         }
         if (name == "$fflush") {
-            // The no-argument form flushes every open output buffer (LRM §21.3.6).
-            // The single-argument form, $fflush(fd), flushes one descriptor; file
-            // descriptors depend on $fopen, which is not implemented, so reject it.
-            // TODO: $fflush(fd) once multichannel file I/O exists.
-            if (!call.arguments().empty()) {
-                fail("$fflush with a file-descriptor argument is not supported");
+            // No-argument form flushes every open output buffer; the runtime reads
+            // a 0 descriptor as "flush all" (LRM §21.3.6). The single-argument form
+            // flushes one MCD / FD.
+            ir::Index handle;
+            if (call.arguments().empty()) {
+                const ir::Ref u32 = make_int_type(32, false, false);
+                handle            = b.constant(module_.pool.put_int(u32, 0), loc(call));
+            } else {
+                handle = lower_expr(*call.arguments()[0], b);
             }
-            b.fflush(loc(call));
+            b.fflush(handle, loc(call));
             return;
         }
         if (name == "$printtimescale") {
@@ -1715,7 +1911,9 @@ private:
     // $readmemh / $readmemb (LRM §21.4): load a file into an unpacked-array memory.
     // Forms: (file, mem), (file, mem, start), (file, mem, start, finish). The memory
     // must be a whole unpacked array (a plain name or hierarchical reference); the
-    // filename and optional address bounds are general runtime values.
+    // filename is a string literal, string-typed expression, or integral value
+    // holding packed ASCII (LRM §21.4), and the optional address bounds are general
+    // runtime values.
     void lower_readmem(const CallExpression& call, bool hex, ir::Builder& b) {
         const auto args = call.arguments();
         if (args.size() < 2 || args.size() > 4) {
@@ -1797,8 +1995,7 @@ private:
             // has no unitless $printtimescale text yet.
             fail("$printtimescale requires a timescale");
         }
-        const std::string path = prefix_.empty() ? module_.name : prefix_.substr(0, prefix_.size() - 1);
-        const std::string text = "Time scale of (" + path + ") is " + ts->toString();
+        const std::string text = "Time scale of (" + instance_path() + ") is " + ts->toString();
         b.display(text, /*newline=*/true, {}, loc(call));
     }
 
@@ -1818,6 +2015,106 @@ private:
         const ir::Index     mul = b.constant(module_.pool.put_int(u64, time_mul_), l);
 
         return b.binary(ir::Inst::Tag::Mul, b.resize(v, u64, l), mul, l);
+    }
+
+    // Lower a string-valued system-task argument (a $fopen filename / mode) to a
+    // packed-ASCII vector value. slang types these arguments as the dynamic
+    // `string` type, wrapping a string literal in a conversion Clotho has no
+    // representation for; strip those conversions to recover the packed byte
+    // vector the runtime expects (byte 0 = last character). A genuine dynamic
+    // string value has no packed form and is rejected.
+    ir::Index lower_string_arg(const Expression& expr, ir::Builder& b) {
+        const Expression* e = &expr;
+        while (e->kind == ExpressionKind::Conversion && e->type->getCanonicalType().isString()) {
+            e = &e->as<ConversionExpression>().operand();
+        }
+        if (e->type->getCanonicalType().isString()) {
+            // TODO: a dynamic-string variable / expression as a filename or mode
+            // needs runtime string support, which Clotho lacks.
+            fail("$fopen with a dynamic-string argument is not supported");
+        }
+        return lower_expr(*e, b);
+    }
+
+    // Count the non-suppressed conversions in a $fscanf / $sscanf format literal,
+    // rejecting unsupported conversion characters. Mirrors the runtime scanner: a
+    // leading '*' suppresses (consumes no arg), an optional field width follows,
+    // then the conversion char. Blocks %f/%e/%g (no reals) and %v/%m/%t/%u/%z.
+    size_t count_scan_conversions(std::string_view fmt) {
+        size_t n = 0;
+        for (size_t i = 0; i < fmt.size(); ++i) {
+            if (fmt[i] != '%') {
+                continue;
+            }
+            ++i;
+            if (i >= fmt.size()) {
+                break;
+            }
+            if (fmt[i] == '%') {
+                continue;
+            }
+            bool suppress = false;
+            if (fmt[i] == '*') {
+                suppress = true;
+                ++i;
+            }
+            while (i < fmt.size() && fmt[i] >= '0' && fmt[i] <= '9') {
+                ++i;
+            }
+            if (i >= fmt.size()) {
+                break;
+            }
+            switch (fmt[i]) {
+                case 'd':
+                case 'o':
+                case 'b':
+                case 'h':
+                case 'x':
+                case 'c':
+                case 's':
+                    break;
+                default:
+                    // TODO: %f/%e/%g need real support; %v/%m/%t/%u/%z unimplemented.
+                    fail(std::string("$fscanf / $sscanf conversion %") + fmt[i] + " is not supported");
+            }
+            if (!suppress) {
+                ++n;
+            }
+        }
+        return n;
+    }
+
+    // Lower $fscanf / $sscanf (LRM §21.3.4): the source is the first argument (an
+    // FD for $fscanf, a string for $sscanf), the format is the second (a string
+    // literal), and the rest are output lvalues, one per conversion.
+    ir::Index lower_scanf(const CallExpression& call, bool is_sscanf, ir::Builder& b, ir::SourceLoc l) {
+        const auto args = call.arguments();
+        if (args.size() < 2) {
+            fail("$fscanf / $sscanf requires a source and a format string");
+        }
+        const Expression* fmt_e = args[1];
+        while (fmt_e->kind == ExpressionKind::Conversion) {
+            fmt_e = &fmt_e->as<ConversionExpression>().operand();
+        }
+        if (fmt_e->kind != ExpressionKind::StringLiteral) {
+            // TODO: a runtime (non-literal) format string needs dynamic string support.
+            fail("$fscanf / $sscanf format must be a string literal");
+        }
+        const std::string_view fmt      = fmt_e->as<StringLiteral>().getValue();
+        const size_t           want     = count_scan_conversions(fmt);
+        const auto             out_args = args.subspan(2);
+        if (out_args.size() != want) {
+            fail("$fscanf / $sscanf has " + std::to_string(want) + " conversion(s) but " +
+                 std::to_string(out_args.size()) + " output argument(s)");
+        }
+        // The source lowers as a value (FD) or a packed string ($sscanf).
+        const ir::Index source = is_sscanf ? lower_string_arg(*args[0], b) : lower_expr(*args[0], b);
+        std::vector<ir::Index> outs;
+        outs.reserve(out_args.size());
+        for (const Expression* a : out_args) {
+            outs.push_back(lower_lvalue(*a, b));
+        }
+        return b.scanf(source, is_sscanf, fmt, outs, l);
     }
 
     // Lower a system function call used as an rvalue (e.g. `$time`). User function
@@ -1885,6 +2182,137 @@ private:
             return b.resize(lower_expr(*call.arguments()[0], b), lower_type(*call.type), l);
         }
 
+        // $fopen (LRM §21.3): one argument opens a multichannel descriptor (MCD)
+        // for writing; two arguments open a single file descriptor (FD) with the
+        // given C stdio mode string. The name / mode lower to packed-ASCII vectors
+        // the backend spills to byte buffers, like $readmem's filename.
+        if (name == "$fopen") {
+            const auto args = call.arguments();
+            if (args.empty() || args.size() > 2) {
+                fail("$fopen expects one or two arguments");
+            }
+            const ir::Index fname    = lower_string_arg(*args[0], b);
+            const bool      has_mode = args.size() == 2;
+            const ir::Index mode     = has_mode ? lower_string_arg(*args[1], b) : fname;
+            return b.fopen(fname, mode, has_mode, l);
+        }
+
+        // $fgetc / $ungetc / $feof / $ftell / $fseek / $rewind (LRM §21.3): file
+        // read / positioning functions, each returning a 32-bit integer. Operands
+        // (a descriptor, plus a character or offset) are plain integer rvalues in
+        // call order.
+        if (name == "$fgetc" || name == "$feof" || name == "$ftell" || name == "$rewind" ||
+            name == "$ungetc" || name == "$fseek") {
+            ir::FileOp op;
+            size_t     want;
+            if (name == "$fgetc") {
+                op   = ir::FileOp::Fgetc;
+                want = 1;
+            } else if (name == "$feof") {
+                op   = ir::FileOp::Feof;
+                want = 1;
+            } else if (name == "$ftell") {
+                op   = ir::FileOp::Ftell;
+                want = 1;
+            } else if (name == "$rewind") {
+                op   = ir::FileOp::Rewind;
+                want = 1;
+            } else if (name == "$ungetc") {
+                op   = ir::FileOp::Ungetc;
+                want = 2;
+            } else {
+                op   = ir::FileOp::Fseek;
+                want = 3;
+            }
+            const auto args = call.arguments();
+            if (args.size() != want) {
+                fail(std::string(name) + " expects " + std::to_string(want) + " argument(s)");
+            }
+            std::vector<ir::Index> vals;
+            vals.reserve(args.size());
+            for (const Expression* a : args) {
+                vals.push_back(lower_expr(*a, b));
+            }
+            return b.file_value_op(op, vals, l);
+        }
+
+        // $fgets(str, fd) (LRM §21.3.4): read a line into the packed-vector lvalue
+        // `str`, returning the character count. `str` is an output argument.
+        if (name == "$fgets") {
+            const auto args = call.arguments();
+            if (args.size() != 2) {
+                fail("$fgets expects two arguments (str, fd)");
+            }
+            const ir::Index dst = lower_lvalue(*args[0], b);
+            const ir::Index fd  = lower_expr(*args[1], b);
+            return b.fgets(dst, fd, l);
+        }
+
+        // $ferror(fd, str) (LRM §21.3.6): write the descriptor's error message into
+        // the string lvalue `str`, returning the error code.
+        if (name == "$ferror") {
+            const auto args = call.arguments();
+            if (args.size() != 2) {
+                fail("$ferror expects two arguments (fd, str)");
+            }
+            const ir::Index fd  = lower_expr(*args[0], b);
+            const ir::Index dst = lower_lvalue(*args[1], b);
+            return b.ferror(dst, fd, l);
+        }
+
+        // $fscanf(fd, fmt, args) / $sscanf(str, fmt, args) (LRM §21.3.4).
+        if (name == "$fscanf" || name == "$sscanf") {
+            return lower_scanf(call, name == "$sscanf", b, l);
+        }
+
+        // $sformatf(fmt, args) (LRM §21.3.3): format into a new string value.
+        if (name == "$sformatf") {
+            return lower_sformatf(call, b);
+        }
+
+        // $fread(target, fd[, start[, count]]) (LRM §21.3.4): binary read into a
+        // single vector or a whole unpacked-array memory. The memory form (like
+        // $readmem) takes optional start-address and element-count bounds.
+        if (name == "$fread") {
+            const auto args = call.arguments();
+            if (args.size() < 2 || args.size() > 4) {
+                fail("$fread requires 2 to 4 arguments");
+            }
+            // slang (post-8.0) binds the target as a system-task output argument;
+            // unwrap the AssignmentExpression to the lvalue (see lower_lvalue).
+            const Expression* target_arg = args[0];
+            if (target_arg->kind == ExpressionKind::Assignment) {
+                target_arg = &target_arg->as<AssignmentExpression>().left();
+            }
+            const Expression& target = *target_arg;
+            if (is_unpacked_array(target)) {
+                const auto* vsb = target.as_if<slang::ast::ValueExpressionBase>();
+                if (vsb == nullptr) {
+                    // TODO: a sliced memory target (mem[a:b]).
+                    fail("$fread memory target must be a whole unpacked-array memory");
+                }
+                const ir::Signal mem       = signal_of(vsb->symbol);
+                const ir::Index  fd        = lower_expr(*args[1], b);
+                const bool       has_start = args.size() >= 3;
+                const bool       has_count = args.size() >= 4;
+                ir::Index        start     = fd; // placeholder unless present
+                ir::Index        cnt       = fd;
+                if (has_start) {
+                    start = lower_expr(*args[2], b);
+                }
+                if (has_count) {
+                    cnt = lower_expr(*args[3], b);
+                }
+                return b.fread_mem(fd, mem, start, cnt, has_start, has_count, l);
+            }
+            if (args.size() != 2) {
+                fail("$fread into a scalar variable takes exactly two arguments");
+            }
+            const ir::Index dst = lower_lvalue(target, b);
+            const ir::Index fd  = lower_expr(*args[1], b);
+            return b.fread_word(dst, fd, l);
+        }
+
         // TODO: $realtime (LRM §20.3.3) returns a real scaled to the module time
         // unit; blocked on real (floating-point) value support in the IR.
         if (name == "$realtime") {
@@ -1937,74 +2365,276 @@ private:
         fail("string method '" + std::string(name) + "' is not supported");
     }
 
-    // Lower $display / $write into a single format string plus the value args its
-    // specifiers consume. A string-literal argument contributes its text verbatim
-    // (its %-specifiers pull from following value args, SV-style); a bare value
-    // argument not covered by an earlier specifier gets a default `%0d`.
-    void lower_display(const CallExpression& call, bool newline, ir::Builder& b) {
-        std::string            fmt;
-        std::vector<ir::Index> args;
-        // Conversion chars of specifiers seen but not yet matched to a value arg,
-        // in order (FIFO). Needed so a `%t` argument can be scaled to ticks.
+    // Build the combined format string and value-arg list of a $display-family
+    // task from `format_args` (the arguments after any leading descriptor). A
+    // string-literal argument contributes its text verbatim (its %-specifiers pull
+    // from following value args, SV-style); a bare value argument not covered by an
+    // earlier specifier gets a default `%0d` (or `%s` for a string object).
+    // Hierarchical path of the instance / generate scope currently being lowered
+    // ("top.u1.blk"): the flattened prefix, with the elided single-top name
+    // restored.
+    std::string instance_path() const {
+        std::string path = top_elided_ ? module_.name : std::string();
+        if (!prefix_.empty()) {
+            if (!path.empty()) {
+                path += '.';
+            }
+            path.append(prefix_, 0, prefix_.size() - 1);
+        }
+        return path;
+    }
+
+    // Hierarchical name of the scope invoking the statement currently being
+    // lowered (LRM §21.2.1.5 %m): the instance path plus the enclosing
+    // subroutine and named begin blocks. Static per lowering site, because
+    // instances are flattened per-instance and subroutine bodies are lowered
+    // per defining instance.
+    std::string hier_name() const {
+        std::string path = instance_path();
+        if (fn_ctx_ != nullptr && !fn_ctx_->name_prefix.empty()) {
+            path += '.';
+            path.append(fn_ctx_->name_prefix, 0, fn_ctx_->name_prefix.size() - 1);
+        }
+        for (const std::string_view nb : named_blocks_) {
+            path += '.';
+            path += nb;
+        }
+        return path;
+    }
+
+    // Validate one non-%% specifier parsed from a display format literal and
+    // return its lowercase conversion char. Everything the engine does not
+    // implement fails loudly here, so the runtime renderer only ever sees legal
+    // specifiers (LRM §21.2.1.1: an undefined specifier is an error).
+    char check_specifier(const clotho::FormatSpec& spec) {
+        if (!spec.ok) {
+            fail("incomplete format specifier in display format");
+        }
+        if (spec.width_overflow) {
+            fail("format field width is out of range");
+        }
+        const char conv = static_cast<char>(spec.conv | 0x20);
+        switch (conv) {
+            case 'd':
+            case 'h':
+            case 'x':
+            case 'o':
+            case 'b':
+            case 'c':
+            case 's':
+            case 't':
+            case 'm':
+                break;
+            case 'u':
+            case 'z':
+                if (spec.has_width || spec.left_justify) {
+                    fail("%u / %z output is unformatted; width and justification do not apply");
+                }
+                break;
+            case 'e':
+            case 'f':
+            case 'g':
+                // TODO: real format specifiers need real-type support.
+                fail("real format specifiers (%e / %f / %g) are not supported");
+            case 'v':
+                // TODO: %v needs net strength modeling (LRM §21.2.1.4).
+                fail("%v (net signal strength) is not supported");
+            case 'l':
+                // TODO: %l needs library/config info (LRM §21.2.1.1, Clause 33).
+                fail("%l (library binding) is not supported");
+            case 'p':
+                // TODO: %p needs aggregate rendering (LRM §21.2.1.6).
+                fail("%p (assignment pattern) is not supported");
+            default:
+                fail(std::string("undefined format specifier '%") + spec.conv +
+                     "' (LRM 21.2.1.1)");
+        }
+        if (spec.has_prec) {
+            fail("a format precision is only defined for real specifiers (%e / %f / %g)");
+        }
+        return conv;
+    }
+
+    // Copy one string-literal argument into `fmt`, validating every specifier,
+    // splicing %m as literal text, and appending each argument-consuming
+    // conversion char to `pending`.
+    void append_format_literal(std::string& fmt, std::string_view text, std::vector<char>& pending) {
+        for (size_t i = 0; i < text.size();) {
+            if (text[i] != '%') {
+                fmt += text[i++];
+                continue;
+            }
+            const clotho::FormatSpec spec = clotho::parse_format_spec(text.substr(i + 1));
+            if (spec.ok && spec.conv == '%') {
+                fmt += "%%";
+                i += 2;
+                continue;
+            }
+            const char conv = check_specifier(spec);
+            if (conv == 'm') {
+                // %m consumes no argument; the invoking scope is static at lower
+                // time, so splice its name (width-padded) into the text.
+                std::string name = hier_name();
+                if (spec.has_width && name.size() < spec.width) {
+                    if (spec.left_justify) {
+                        name.append(spec.width - name.size(), ' ');
+                    } else {
+                        name.insert(0, spec.width - name.size(), ' ');
+                    }
+                }
+                fmt += name;
+            } else {
+                fmt.append(text, i, 1 + spec.len);
+                pending.push_back(conv);
+            }
+            i += 1 + spec.len;
+        }
+    }
+
+    void build_format(std::span<const Expression* const> format_args, std::string& fmt,
+                      std::vector<ir::Index>& args, ir::Builder& b, char default_conv = 'd') {
+        // Conversion chars (lowercase) of specifiers seen but not yet matched to
+        // a value arg, in order (FIFO). Needed so a `%t` argument can be scaled
+        // to ticks and a string object checked against %s.
         std::vector<char> pending;
         size_t            next = 0; // front of `pending`
 
-        for (const Expression* arg : call.arguments()) {
-            if (arg->kind == ExpressionKind::StringLiteral) {
-                const std::string_view text = arg->as<StringLiteral>().getValue();
-                fmt += text;
-                collect_specifiers(text, pending);
+        for (const Expression* arg : format_args) {
+            if (arg->kind == ExpressionKind::EmptyArgument) {
+                // An empty argument (adjacent commas) displays one space
+                // (LRM §21.2.1).
+                fmt += ' ';
+                continue;
+            }
+            // A string-literal argument (SV-style) contributes format text, even
+            // when width-converted; unwrap conversions to see the literal. A
+            // literal that an earlier specifier is still waiting on is a value
+            // argument instead ($display("%s", "hi") prints hi).
+            const Expression* lit = arg;
+            while (lit->kind == ExpressionKind::Conversion) {
+                lit = &lit->as<ConversionExpression>().operand();
+            }
+            if (lit->kind == ExpressionKind::StringLiteral && next >= pending.size()) {
+                append_format_literal(fmt, lit->as<StringLiteral>().getValue(), pending);
             } else {
                 const bool str  = is_string_expr(*arg);
-                char       conv = str ? 's' : 'd';
+                char       conv = str ? 's' : default_conv;
                 if (next < pending.size()) {
                     conv = pending[next++]; // consumed by an earlier specifier
                 } else {
-                    fmt += str ? "%s" : "%0d"; // bare value default
+                    // Bare value default: the task's radix, auto-sized
+                    // (LRM §21.2.1.1); a string object formats as a string.
+                    fmt += '%';
+                    fmt += str ? 's' : default_conv;
                 }
-                if (str && conv != 's' && conv != 'S') {
+                if (str && conv != 's') {
                     // TODO: %d/%h/... of a string object (would need the packed
                     // reinterpretation of its characters).
                     fail("a string argument to $display/$write requires %s");
                 }
                 ir::Index v = lower_expr(*arg, b);
-                if (conv == 't' || conv == 'T') {
+                if (conv == 't') {
                     v = scale_to_ticks(*arg, v, b);
                 }
                 args.push_back(v);
             }
         }
+        if (next < pending.size()) {
+            fail("display format has more format specifiers than arguments (LRM 21.2.1.1)");
+        }
+    }
 
+    // Match a display-family task name against `base` plus an optional radix
+    // suffix ($displayb / $writeh / ...); returns the bare-argument default
+    // conversion ('d' for the plain name, the suffix's radix otherwise) or 0
+    // when the name does not match (LRM §21.2.1.1).
+    static char display_radix(std::string_view name, std::string_view base) {
+        if (!name.starts_with(base)) {
+            return 0;
+        }
+        const std::string_view rest = name.substr(base.size());
+        if (rest.empty()) {
+            return 'd';
+        }
+        if (rest == "b" || rest == "o" || rest == "h") {
+            return rest[0];
+        }
+        return 0;
+    }
+
+    // Lower $display / $write: format the arguments and write to standard output.
+    void lower_display(const CallExpression& call, bool newline, ir::Builder& b, char default_conv) {
+        std::string            fmt;
+        std::vector<ir::Index> args;
+        build_format(call.arguments(), fmt, args, b, default_conv);
         b.display(fmt, newline, args, loc(call));
     }
 
-    // Append the conversion character of each format specifier in `s` to `out`,
-    // treating `%%` as an escaped literal percent (no specifier). Mirrors the
-    // runtime's flag/width/precision skipping so the recorded char is the one the
-    // runtime will dispatch on.
-    static void collect_specifiers(std::string_view s, std::vector<char>& out) {
-        for (size_t i = 0; i < s.size(); ++i) {
-            if (s[i] != '%') {
-                continue;
-            }
-            ++i;
-            if (i >= s.size()) {
-                break;
-            }
-            if (s[i] == '%') {
-                continue; // escaped percent: no value arg
-            }
-            while (i < s.size() && (s[i] == '-' || s[i] == '+' || s[i] == ' ' || s[i] == '0')) {
-                ++i;
-            }
-            while (i < s.size() && ((s[i] >= '0' && s[i] <= '9') || s[i] == '.')) {
-                ++i;
-            }
-            if (i >= s.size()) {
-                break;
-            }
-            out.push_back(s[i]);
+    // Lower $fdisplay / $fwrite (LRM §21.3.3): the first argument is the
+    // destination descriptor (an MCD or FD); the rest form the message.
+    void lower_fdisplay(const CallExpression& call, bool newline, ir::Builder& b, char default_conv) {
+        const auto args_in = call.arguments();
+        if (args_in.empty()) {
+            fail("$fdisplay / $fwrite requires a file-descriptor argument");
         }
+        const ir::Index       fd = lower_expr(*args_in[0], b);
+        std::string            fmt;
+        std::vector<ir::Index> args;
+        build_format(args_in.subspan(1), fmt, args, b, default_conv);
+        b.fdisplay(fd, fmt, newline, args, loc(call));
+    }
+
+    // Lower $sformat / $swrite (LRM §21.3.3): render the trailing arguments like
+    // $write and store the result into the destination string lvalue (the first
+    // argument). $sformat's format (its second argument) must be a string literal;
+    // $swrite takes $write-style interleaved literals and values.
+    void lower_sformat(const CallExpression& call, bool is_sformat, ir::Builder& b,
+                       char default_conv = 'd') {
+        const auto args = call.arguments();
+        if (args.empty()) {
+            fail("$sformat / $swrite requires a destination string argument");
+        }
+        if (is_sformat) {
+            if (args.size() < 2) {
+                fail("$sformat requires a format-string argument");
+            }
+            const Expression* fmt = args[1];
+            while (fmt->kind == ExpressionKind::Conversion) {
+                fmt = &fmt->as<ConversionExpression>().operand();
+            }
+            if (fmt->kind != ExpressionKind::StringLiteral) {
+                // TODO: a runtime (non-literal) $sformat format string needs
+                // dynamic string support, which Clotho lacks.
+                fail("$sformat format must be a string literal");
+            }
+        }
+        const ir::Index        dst = lower_lvalue(*args[0], b);
+        std::string            fmt;
+        std::vector<ir::Index> values;
+        build_format(args.subspan(1), fmt, values, b, default_conv);
+        b.sformat(dst, fmt, values, loc(call));
+    }
+
+    // Lower $sformatf (LRM §21.3.3): render like $sformat but yield a new string
+    // value. The format (first argument) must be a string literal, like $sformat.
+    ir::Index lower_sformatf(const CallExpression& call, ir::Builder& b) {
+        const auto args = call.arguments();
+        if (args.empty()) {
+            fail("$sformatf requires a format-string argument");
+        }
+        const Expression* fa = args[0];
+        while (fa->kind == ExpressionKind::Conversion) {
+            fa = &fa->as<ConversionExpression>().operand();
+        }
+        if (fa->kind != ExpressionKind::StringLiteral) {
+            // TODO: a runtime (non-literal) $sformatf format string needs
+            // dynamic format parsing, which Clotho lacks.
+            fail("$sformatf format must be a string literal");
+        }
+        std::string            fmt;
+        std::vector<ir::Index> values;
+        build_format(args, fmt, values, b);
+        return b.sformatf(fmt, values, loc(call));
     }
 
     // Scale a %t argument from its module's time unit to design ticks: the runtime
@@ -2207,6 +2837,11 @@ private:
                 if (c.conditions.size() != 1) {
                     fail("unsupported multi-condition ?:");
                 }
+                if (c.conditions[0].pattern != nullptr) {
+                    // TODO: `expr matches pattern ? a : b` (LRM 12.6.2) — same
+                    // gap as lower_conditional's pattern guard.
+                    fail("pattern matching in conditions is not supported");
+                }
                 const ir::Index pred = lower_predicate(*c.conditions[0].expr, b);
                 const ir::Index a    = lower_expr(c.left(), b);
                 const ir::Index bb   = lower_expr(c.right(), b);
@@ -2299,6 +2934,9 @@ private:
             case U::BitwiseNot:
                 return b.unary(T::Bnot, op, l);
             case U::LogicalNot:
+                if (is_string_expr(u.operand())) {
+                    fail("logical negation of a string is not legal (LRM Table 11-1)");
+                }
                 return b.unary(T::Lnot, op, l);
             case U::BitwiseAnd:
                 return b.unary(T::RedAnd, op, l);
@@ -2506,6 +3144,12 @@ private:
     ir::Index lower_lvalue(const Expression& expr, ir::Builder& b) {
         const ir::SourceLoc l = loc(expr);
         switch (expr.kind) {
+            case ExpressionKind::Assignment:
+                // slang (post-8.0) binds a system-task output argument ($fgets,
+                // $sformat, $*scanf, ... destinations) as an AssignmentExpression
+                // whose left side is the target lvalue, the same shape a user
+                // task's output actual has. Unwrap to the target.
+                return lower_lvalue(expr.as<AssignmentExpression>().left(), b);
             case ExpressionKind::NamedValue:
                 return value_lvalue(expr.as<NamedValueExpression>().symbol, b, l);
             case ExpressionKind::ElementSelect: {
@@ -2803,6 +3447,8 @@ private:
         ctx.is_task     = true;
         FnCtx* saved    = fn_ctx_;
         fn_ctx_         = &ctx;
+        std::vector<std::string_view> saved_blocks;
+        saved_blocks.swap(named_blocks_);
         ir::Builder          b(module_.pool);
         std::vector<ir::Ref> param_types;
         std::vector<ir::ArgDir> arg_dirs;
@@ -2829,6 +3475,7 @@ private:
                                                .local_types = std::move(ctx.local_types),
                                                .is_task     = true,
                                                .ir          = b.finish() });
+        named_blocks_.swap(saved_blocks);
         fn_ctx_ = saved;
     }
 
@@ -2843,6 +3490,8 @@ private:
         ctx.name_prefix        = std::string(sub.name) + ".";
         FnCtx*           saved = fn_ctx_;
         fn_ctx_                = &ctx;
+        std::vector<std::string_view> saved_blocks;
+        saved_blocks.swap(named_blocks_);
         ir::Builder      b(module_.pool);
         std::vector<ir::Ref> param_types;
 
@@ -2879,6 +3528,7 @@ private:
                                                .param_types = std::move(param_types),
                                                .local_types = std::move(ctx.local_types),
                                                .ir          = b.finish() });
+        named_blocks_.swap(saved_blocks);
         fn_ctx_ = saved;
     }
 
@@ -3005,10 +3655,21 @@ private:
     const slang::ast::Scope* scope_ = nullptr;
     // Maps an elaborated value symbol to its module Signal handle.
     ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal> sigmap_;
+    // Continuous-driver coverage per net signal: the closed bit ranges [lo, hi]
+    // already driven, checked for overlap by record_net_driver_range.
+    ankerl::unordered_dense::map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> net_driven_;
     // Hierarchical name prefix of the instance currently being lowered (e.g.
     // "u_alu.u_sub."); empty for the top. Prepended to every signal name created
     // while this instance's body is processed so flattened signals stay unique.
     std::string prefix_;
+    // True when flattened paths omit the single top instance's name (the
+    // single-top case); %m and $printtimescale re-prepend module_.name.
+    bool top_elided_ = false;
+    // Names of the named begin blocks enclosing the statement currently being
+    // lowered, outermost first; they extend the %m hierarchical name (LRM
+    // §21.2.1.5). Saved/cleared around subroutine body lowering: a body is
+    // built at its first call site, whose block nesting is not the body's.
+    std::vector<std::string_view> named_blocks_;
     // Femtoseconds per wheel tick (design-wide smallest time unit); 0 == unitless.
     uint64_t tick_fs_ = 0;
     // Time-unit multiplier of the instance currently being lowered: a delay is

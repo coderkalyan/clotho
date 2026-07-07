@@ -49,6 +49,25 @@ enum class Signal : uint32_t {};
 // `call`. Resolved by the module, like Signal.
 enum class FunctionId : uint32_t {};
 
+// Which file-I/O system function a `file_value_op` invokes (LRM §21.3). Each
+// returns a 32-bit integer and takes its operands (a file descriptor, plus a
+// character or offset) as plain value args. Kept in lockstep with the runtime
+// dispatch in LlvmBackend.
+enum class FileOp : uint32_t {
+    // $fgetc(fd) -> next byte, or -1 at EOF.
+    Fgetc,
+    // $ungetc(c, fd) -> c, or -1 on failure.
+    Ungetc,
+    // $feof(fd) -> nonzero once EOF has been seen.
+    Feof,
+    // $ftell(fd) -> current byte offset, or -1.
+    Ftell,
+    // $fseek(fd, offset, operation) -> 0 on success, -1 on failure.
+    Fseek,
+    // $rewind(fd) -> 0 (seek to start).
+    Rewind,
+};
+
 // A struct may be overlaid on the extra buffer iff it is trivially copyable
 // and a whole number of u32 words wide. Because every field is a 4-byte
 // handle/enum, such structs carry no padding and round-trip via bit_cast.
@@ -105,10 +124,12 @@ struct ElemSelect {
 };
 
 // Extra payload for `read_mem`: a $readmemh / $readmemb load of a file into an
-// unpacked-array memory. The filename value is the instruction's `op` (a packed-
-// ASCII vector; the backend spills its must-bits to a byte buffer). `target` is the
-// destination memory signal. `start` / `finish` are optional address-bound operands
-// (valid per `has_start` / `has_finish`). `hex` selects hex vs binary digits.
+// unpacked-array memory. The filename value is the instruction's `op`: either a
+// packed-ASCII vector (the backend spills its must-bits to a byte buffer) or a
+// string value (the backend reads the rt_string handle's bytes at the call site).
+// `target` is the destination memory signal. `start` / `finish` are optional
+// address-bound operands (valid per `has_start` / `has_finish`). `hex` selects hex
+// vs binary digits.
 struct ReadMemInfo {
     // Destination memory signal.
     Signal target;
@@ -183,19 +204,129 @@ struct LoopInfo {
     ExtraSlice step;
 };
 
-// Extra payload for `display`: a $display / $write system task. The format-string
-// bytes live packed little-endian (4 chars per u32 word) at `fmt` for `fmt_len`
-// bytes; `args` is the slice of value operands the format specifiers consume, in
-// order; `newline` is 1 for $display (append '\n') and 0 for $write.
+// Extra payload for `display`: a $display / $write / $fdisplay / $fwrite system
+// task. The format-string bytes live packed little-endian (4 chars per u32 word)
+// at `fmt` for `fmt_len` bytes; `args` is the slice of value operands the format
+// specifiers consume, in order; `newline` is 1 for the $*display forms (append
+// '\n') and 0 for the $*write forms. `fd` is the destination descriptor operand
+// for the $f* forms; when `has_fd` is 0 ($display / $write) the backend writes to
+// the standard-output MCD and `fd` is unused.
 struct DisplayInfo {
     // First extra word of the packed format-string bytes.
     ExtraIndex fmt;
     // Format-string length in bytes.
     uint32_t fmt_len;
-    // 1 => append a trailing newline ($display); 0 => none ($write).
+    // 1 => append a trailing newline ($display / $fdisplay); 0 => none.
     uint32_t newline;
+    // Destination descriptor operand ($fdisplay / $fwrite); valid iff has_fd.
+    Index fd;
+    // 1 => fd is a real descriptor operand; 0 => write to standard output.
+    uint32_t has_fd;
     // Value operands consumed by the format specifiers.
     ExtraSlice args;
+};
+
+// Extra payload for `fopen`: the $fopen(name, mode) form. `mode` is the C stdio
+// mode-string operand (a packed-ASCII vector, spilled by the backend) and is
+// valid iff `has_mode`; the name value is the instruction's `op`. With a mode a
+// single FD is opened, without one a fresh MCD is opened for writing.
+struct FopenInfo {
+    // C stdio mode-string operand; valid iff has_mode.
+    Index mode;
+    // 1 => two-argument $fopen (FD); 0 => one-argument $fopen (MCD).
+    uint32_t has_mode;
+};
+
+// Extra payload for `file_value_op`: a file-I/O system function returning a
+// 32-bit integer. `op` is the ir::FileOp selecting the routine; `args` are its
+// value operands in call order (a descriptor, plus a character / offset).
+struct FileOpInfo {
+    // ir::FileOp value.
+    uint32_t op;
+    // Value operands in call order.
+    ExtraSlice args;
+};
+
+// Extra payload for `fgets`: $fgets(str, fd) (LRM §21.3.4) reads a line from the
+// descriptor `fd` into the packed-vector lvalue `str` (the instruction's `op`),
+// returning the character count. `fd` is a value operand.
+struct FgetsInfo {
+    // File-descriptor value operand.
+    Index fd;
+};
+
+// Extra payload for `sformat`: $sformat / $swrite (LRM §21.3.3) format the value
+// args per the packed format-string bytes at `fmt` (`fmt_len` bytes) and store the
+// result into the destination string lvalue `dst`. `args` is the value-operand
+// slice the specifiers consume.
+struct SformatInfo {
+    // Destination string lvalue.
+    Index dst;
+    // First extra word of the packed format-string bytes.
+    ExtraIndex fmt;
+    // Format-string length in bytes.
+    uint32_t fmt_len;
+    // Value operands consumed by the format specifiers.
+    ExtraSlice args;
+};
+
+// Extra payload for `sformatf`: $sformatf (LRM §21.3.3) formats the value args
+// per the packed format-string bytes at `fmt` (`fmt_len` bytes) and yields a
+// new string value (the instruction's string temp).
+struct SformatfInfo {
+    // First extra word of the packed format-string bytes.
+    ExtraIndex fmt;
+    // Format-string length in bytes.
+    uint32_t fmt_len;
+    // Value operands consumed by the format specifiers.
+    ExtraSlice args;
+};
+
+// Extra payload for `ferror`: $ferror(fd, str) (LRM §21.3.6) writes the
+// descriptor's error message into the string lvalue (the instruction's `op`) and
+// returns the error code. `fd` is a value operand.
+struct FerrorInfo {
+    // File-descriptor value operand.
+    Index fd;
+};
+
+// Extra payload for `scanf`: $fscanf / $sscanf (LRM §21.3.4) parse `source` per the
+// packed format-string bytes at `fmt` (`fmt_len` bytes) into the output lvalues
+// `args`, returning the conversion count. When `is_string` is 1 ($sscanf) `source`
+// is a packed-ASCII string value the backend spills; otherwise ($fscanf) it is a
+// file-descriptor value.
+struct ScanfInfo {
+    // First extra word of the packed format-string bytes.
+    ExtraIndex fmt;
+    // Format-string length in bytes.
+    uint32_t fmt_len;
+    // Source operand: an FD value ($fscanf) or a packed string value ($sscanf).
+    Index source;
+    // 1 => $sscanf (source is a packed string); 0 => $fscanf (source is an FD).
+    uint32_t is_string;
+    // Output lvalue operands, one per conversion, in order.
+    ExtraSlice args;
+};
+
+// Extra payload for `fread_word`: $fread(reg, fd) (LRM §21.3.4) reads raw bytes into
+// the packed-vector lvalue `reg` (the instruction's `op`). `fd` is a value operand.
+struct FreadWordInfo {
+    // File-descriptor value operand.
+    Index fd;
+};
+
+// Extra payload for `fread_mem`: $fread(mem, fd[, start[, count]]) reads raw bytes
+// into the unpacked-array memory `mem`. The fd value is the instruction's `op`;
+// `start` / `count` are optional address / element-count operands (valid per has_*).
+struct FreadMemInfo {
+    // Destination memory signal.
+    Signal mem;
+    // Optional first-address and max-element-count operands.
+    Index start;
+    Index count;
+    // Whether the start / count operands are present.
+    uint32_t has_start;
+    uint32_t has_count;
 };
 
 // Extra payload for `timeformat`: a $timeformat system task. `units`,
@@ -261,6 +392,15 @@ static_assert(ExtraPayload<ReadMemInfo>);
 static_assert(ExtraPayload<Regions>);
 static_assert(ExtraPayload<LoopInfo>);
 static_assert(ExtraPayload<DisplayInfo>);
+static_assert(ExtraPayload<FopenInfo>);
+static_assert(ExtraPayload<FileOpInfo>);
+static_assert(ExtraPayload<FgetsInfo>);
+static_assert(ExtraPayload<SformatInfo>);
+static_assert(ExtraPayload<SformatfInfo>);
+static_assert(ExtraPayload<FerrorInfo>);
+static_assert(ExtraPayload<ScanfInfo>);
+static_assert(ExtraPayload<FreadWordInfo>);
+static_assert(ExtraPayload<FreadMemInfo>);
 static_assert(ExtraPayload<TimeFormatInfo>);
 static_assert(ExtraPayload<WaitEdge>);
 static_assert(ExtraPayload<WaitInfo>);
@@ -444,8 +584,47 @@ struct Inst {
         StrToPacked,
 
         // -- System tasks --
-        // $display / $write: format string + variadic args (payload: display).
+        // $display / $write / $fdisplay / $fwrite: format string + variadic args,
+        // with an optional destination descriptor (payload: display -> DisplayInfo).
         Display,
+        // $fopen: open a file, -> 32-bit descriptor value (payload: op_extra ->
+        // FopenInfo; op is the filename value). LRM §21.3. One-argument form yields
+        // an MCD, two-argument form yields an FD. Lowers to rt_fopen_mcd/_fd.
+        Fopen,
+        // $fclose: close a file descriptor (payload: unary, the descriptor value).
+        // LRM §21.3.2. Lowers to an rt_fclose call.
+        Fclose,
+        // $fgetc / $ungetc / $feof / $ftell / $fseek / $rewind: file read /
+        // positioning system functions, each -> a 32-bit integer (payload: extra ->
+        // FileOpInfo, whose `op` picks the routine and `args` are its value
+        // operands). LRM §21.3. Lowers to the matching rt_* call.
+        FileValueOp,
+        // $fgets: read a line from a descriptor into a packed-vector lvalue, ->
+        // character count (payload: op_extra -> FgetsInfo; op is the destination
+        // lvalue, extra holds the descriptor value). LRM §21.3.4. Lowers to rt_fgets.
+        Fgets,
+        // $sformat / $swrite: format value args and store the result into a string
+        // lvalue (payload: extra -> SformatInfo). LRM §21.3.3. Lowers to rt_sformat.
+        Sformat,
+        // $sformatf: format value args, -> new string value (payload: extra ->
+        // SformatfInfo). LRM §21.3.3. Lowers to rt_sformat_str into the
+        // instruction's string temp.
+        Sformatf,
+        // $ferror: write a descriptor's error message into a string lvalue, ->
+        // error code (payload: op_extra -> FerrorInfo; op is the destination
+        // lvalue). LRM §21.3.6. Lowers to an rt_ferror call.
+        Ferror,
+        // $fscanf / $sscanf: parse a source into output lvalues per a format, ->
+        // conversion count (payload: extra -> ScanfInfo). LRM §21.3.4. Lowers to an
+        // rt_fscanf / rt_sscanf call.
+        Scanf,
+        // $fread into a single packed-vector lvalue (payload: op_extra ->
+        // FreadWordInfo; op is the destination lvalue), -> bytes read. LRM §21.3.4.
+        // Lowers to an rt_fread call.
+        FreadWord,
+        // $fread into an unpacked-array memory (payload: op_extra -> FreadMemInfo;
+        // op is the fd value), -> bytes read. LRM §21.3.4. Lowers to an rt_fread call.
+        FreadMem,
         // $timeformat: set the %t format (units / precision / suffix / min width)
         // for all later %t specifiers (payload: timeformat -> TimeFormatInfo).
         // LRM §20.4.3. Lowers to an rt_timeformat_set call.
@@ -454,8 +633,9 @@ struct Inst {
         // has $stop suspend and $finish exit; with no resume mechanism a suspend
         // is observationally an exit, so both are treated identically.
         Finish,
-        // $fflush (no-arg form): flush all open output buffers (payload: none).
-        // LRM §21.3.6. Lowers to an rt_fflush call.
+        // $fflush: flush a descriptor's output buffers (payload: unary, the
+        // descriptor value; the no-argument form passes a constant 0, which the
+        // runtime treats as "flush all"). LRM §21.3.6. Lowers to an rt_fflush call.
         Fflush,
         // $readmemh / $readmemb: load a hex/binary file into an unpacked-array
         // memory (payload: op_extra -> ReadMemInfo; op is the filename value). LRM
@@ -496,6 +676,10 @@ struct Inst {
         Display,
         TimeFormat,
         Wait,
+        FileOp,
+        Sformat,
+        Sformatf,
+        Scanf,
     };
 
     union Payload {
@@ -695,5 +879,21 @@ private:
     // Top-level region: the process body.
     ExtraSlice root_;
 };
+
+// Result of walking an lvalue's select chain to its root storage leaf.
+struct LvalueRoot {
+    // The root leaf (a Signal / Local / Arg — whatever the chain bottoms out
+    // on; callers switch on its tag).
+    Index root;
+    // False when any select was traversed: the lvalue names a bit / part /
+    // element of the root, not the whole storage.
+    bool whole;
+};
+
+// Walk an lvalue select chain (bit / part / element selects) to its root leaf.
+// The single walker every lvalue-classifying pass shares (NBA targeting, task
+// copy-out targets, may-z storage resolution), so they cannot drift apart when
+// a select form is added.
+LvalueRoot lvalue_root(const Ir& ir, Index lv);
 
 } // namespace clotho::ir

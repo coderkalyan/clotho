@@ -1,0 +1,298 @@
+#include <doctest/doctest.h>
+
+#include <cstdio>
+#include <string>
+#include <string_view>
+
+#include <unistd.h>
+
+#include "Lower.h"
+#include "ir/Jit.h"
+
+using namespace clotho;
+
+// $display formatting per LRM §21.2.1: automatic sizing, field widths, x/z
+// casing, %m, empty arguments, radix task variants. Expectations are
+// cross-checked against Icarus Verilog except where noted (iverilog deviates
+// from the LRM's own examples on explicit widths for h/o/b).
+
+namespace {
+
+// JIT-run a module and capture stdout (mirrors string_test.cpp).
+std::string run_capture(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE(r.module != nullptr);
+
+    std::FILE* tmp = std::tmpfile();
+    REQUIRE(tmp != nullptr);
+
+    std::fflush(stdout);
+    const int saved = dup(fileno(stdout));
+    dup2(fileno(tmp), fileno(stdout));
+
+    ir::run_jit(*r.module);
+
+    std::fflush(stdout);
+    dup2(saved, fileno(stdout));
+    close(saved);
+
+    std::rewind(tmp);
+    std::string out;
+    char        buf[256];
+    size_t      n;
+    while ((n = std::fread(buf, 1, sizeof(buf), tmp)) > 0) {
+        out.append(buf, n);
+    }
+    std::fclose(tmp);
+    return out;
+}
+
+// Assert that `source` is rejected with a diagnostic containing `needle`.
+void check_rejected(std::string_view source, std::string_view needle) {
+    const LowerResult r = lower_text(source);
+    CHECK_FALSE(r.ok);
+    CHECK_MESSAGE(r.diagnostics.find(needle) != std::string::npos, r.diagnostics);
+}
+
+} // namespace
+
+// The printval example of LRM §21.2.1.2, verbatim.
+TEST_CASE("automatic sizing and the %0 minimal form (LRM printval example)") {
+    CHECK(run_capture(R"(
+        module printval;
+            logic [11:0] r1;
+            initial begin
+                r1 = 10;
+                $display( "Printing with maximum size - :%d: :%h:", r1,r1 );
+                $display( "Printing with minimum size - :%0d: :%0h:", r1,r1 );
+            end
+        endmodule
+    )") == "Printing with maximum size - :  10: :00a:\n"
+           "Printing with minimum size - :10: :a:\n");
+}
+
+// The field-width example table of LRM §21.2.1.2. NOTE: iverilog prints %3h of
+// 32'h5 as 00000005 (natural width); the LRM table says 005 — LRM wins.
+TEST_CASE("explicit field widths pad and expand per LRM 21.2.1.2") {
+    CHECK(run_capture(R"(
+        module m;
+            initial begin
+                $display(":%3d:", 32'd5);
+                $display(":%3d:", 32'd100);
+                $display(":%3d:", 32'd1234);
+                $display(":%3h:", 32'h5);
+                $display(":%3h:", 32'h100);
+                $display(":%3h:", 32'h1234);
+                $display(":%3s:", "a");
+                $display(":%3s:", "abc");
+                $display(":%3s:", "abcdef");
+            end
+        endmodule
+    )") == ":  5:\n:100:\n:1234:\n:005:\n:100:\n:1234:\n:  a:\n:abc:\n:abcdef:\n");
+}
+
+// LRM §21.2.1.3 examples, verbatim: whole-field decimal collapse and per-digit
+// hex/octal casing (lowercase when every bit of the group is x/z, uppercase
+// when only some are).
+TEST_CASE("x/z display follows LRM 21.2.1.3") {
+    CHECK(run_capture(R"(
+        module m;
+            initial begin
+                $display("%d", 1'bx);
+                $display("%h", 14'bx01010);
+                $display("%h %o", 12'b001xxx101x01, 12'b001xxx101x01);
+            end
+        endmodule
+    )") == "x\nxxXa\nXXX 1x5X\n");
+}
+
+TEST_CASE("decimal x/z casing and justification") {
+    CHECK(run_capture(R"(
+        module m;
+            initial begin
+                $display(":%d:", 8'bxxxxxxxx);
+                $display(":%d:", 8'bzzzzzzzz);
+                $display(":%d:", 8'b1xxxxxxx);
+                $display(":%d:", 8'b1zzzzzzz);
+                $display(":%d:", 8'bxzzzzzzz);
+                $display(":%0d:", 8'hxx);
+            end
+        endmodule
+    )") == ":  x:\n:  z:\n:  X:\n:  Z:\n:  X:\n:x:\n");
+}
+
+// Signed decimal auto-sizes to the most negative value's text (sign included).
+TEST_CASE("signed decimal automatic sizing") {
+    CHECK(run_capture(R"(
+        module m;
+            logic signed [7:0] s;
+            initial begin
+                s = -1;
+                $display(":%d:", s);
+                s = 100;
+                $display(":%d:", s);
+                $display(":%d:", 8'd7);
+            end
+        endmodule
+    )") == ":  -1:\n: 100:\n:  7:\n");
+}
+
+// `-` left-justifies with trailing spaces (an extension the LRM does not define).
+TEST_CASE("left justification") {
+    CHECK(run_capture(R"(
+        module m;
+            initial begin
+                $display(":%-5d:", 8'd7);
+                $display(":%-5s:", "ab");
+                $display(":%5s:", "ab");
+            end
+        endmodule
+    )") == ":7    :\n:ab   :\n:   ab:\n");
+}
+
+// A bare argument uses the task's auto-sized default radix (LRM §21.2.1.1);
+// an empty argument (adjacent commas) prints one space (LRM §21.2.1).
+TEST_CASE("bare-argument defaults, radix variants, and empty arguments") {
+    CHECK(run_capture(R"(
+        module m;
+            initial begin
+                $display(8'd7);
+                $displayb(5'b101x0);
+                $displayo(9'o567);
+                $displayh(12'hEF);
+                $writeh(12'hEF); $write("\n");
+                $display("e1:", , "e2");
+            end
+        endmodule
+    )") == "  7\n101x0\n567\n0ef\n0ef\ne1: e2\n");
+}
+
+// Leading NUL bytes of a packed %s operand are never printed (LRM §21.2.1.7
+// and the §21.2.1.1 example; iverilog deviates).
+TEST_CASE("%s drops leading NUL bytes of a packed operand") {
+    CHECK(run_capture(R"(
+        module m;
+            initial begin
+                $display("%s is ascii value for 101", 101);
+                $display(":%s:", 32'h616263);
+                $display(":%5s:", 32'h61);
+            end
+        endmodule
+    )") == "e is ascii value for 101\n:abc:\n:    a:\n");
+}
+
+// %m splices the static hierarchical name of the invoking scope: named block,
+// task, and instance path under a multi-top design (LRM §21.2.1.5).
+TEST_CASE("%m reports the invoking scope") {
+    CHECK(run_capture(R"(
+        module m;
+            task t; $display("task %m"); endtask
+            initial begin : blk
+                $display("blk %m");
+                t;
+            end
+        endmodule
+        module m2;
+            sub u1();
+        endmodule
+        module sub;
+            initial #1 $display("sub %m");
+        endmodule
+    )") == "blk m.blk\ntask m.t\nsub m2.u1\n");
+}
+
+// An explicit %t width overrides $timeformat's minimum width; %0t is minimal.
+TEST_CASE("%t honors explicit widths over $timeformat") {
+    CHECK(run_capture(R"(
+        `timescale 1ns/1ps
+        module m;
+            initial begin
+                $display(":%0t:", $time);
+                #5 $display(":%t:", $time);
+                $display(":%15t:", $time);
+            end
+        endmodule
+    )") == ":0:\n:                5000:\n:           5000:\n");
+}
+
+// A string literal that an earlier specifier is waiting on is its value
+// argument; otherwise a literal is format text.
+TEST_CASE("string literals fill pending specifiers") {
+    CHECK(run_capture(R"(
+        module m;
+            initial begin
+                $display("%s", "hi");
+                $display("a", "b");
+                $display("%d then %s more", 5, "txt", " end");
+            end
+        endmodule
+    )") == "hi\nab\n          5 then txt more end\n");
+}
+
+// -- Rejections: everything unimplemented fails loudly at lower time --
+
+TEST_CASE("unsupported or invalid format specifiers are rejected") {
+    SUBCASE("undefined letter") {
+        // slang diagnoses this at elaboration, before Clotho's own guard.
+        check_rejected(R"(
+            module m;
+                initial $display("%q", 1);
+            endmodule
+        )", "unknown format specifier '%q'");
+    }
+    SUBCASE("%v strength") {
+        check_rejected(R"(
+            module m;
+                wire w;
+                initial $display("%v", w);
+            endmodule
+        )", "%v (net signal strength) is not supported");
+    }
+    SUBCASE("%p assignment pattern") {
+        check_rejected(R"(
+            module m;
+                initial $display("%p", 1);
+            endmodule
+        )", "%p (assignment pattern) is not supported");
+    }
+    SUBCASE("%l library binding") {
+        check_rejected(R"(
+            module m;
+                initial $display("%l");
+            endmodule
+        )", "%l (library binding) is not supported");
+    }
+    SUBCASE("real formats without real support") {
+        check_rejected(R"(
+            module m;
+                initial $display("%f", 1);
+            endmodule
+        )", "real format specifiers (%e / %f / %g) are not supported");
+    }
+    SUBCASE("precision on an integer conversion") {
+        // slang diagnoses this at elaboration, before Clotho's own guard.
+        check_rejected(R"(
+            module m;
+                initial $display("%5.2d", 1);
+            endmodule
+        )", "floating point format specifier options used on non-floating point field");
+    }
+    SUBCASE("specifier without an argument") {
+        // slang diagnoses this at elaboration; Clotho's own count check backs
+        // it up for the $swrite-style interleaved forms slang cannot see.
+        check_rejected(R"(
+            module m;
+                initial $display("%d %d", 1);
+            endmodule
+        )", "no argument provided for '%d'");
+    }
+    SUBCASE("width on %u") {
+        // slang diagnoses this at elaboration, before Clotho's own guard.
+        check_rejected(R"(
+            module m;
+                initial $display("%8u", 32'h1);
+            endmodule
+        )", "field width not allowed on '%u'");
+    }
+}

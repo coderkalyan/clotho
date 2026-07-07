@@ -52,7 +52,7 @@ FetchContent_Declare(
   # Post-8.0: the v8.0 release tag predates the slang analysis library
   # (AnalysisManager, dataflow diagnostics like inferred-latch), which the
   # frontend runs after elaboration.
-  GIT_TAG        6933832c97c39976890e5f12b69245f061d60a9a
+  GIT_TAG        6933832c97c39976890e5f12b69245f061d60a9a # v10.0-360-g6933832c9
 )
 FetchContent_MakeAvailable(slang)
 
@@ -102,10 +102,9 @@ target_compile_definitions(clotho_ir PUBLIC ${LLVM_DEFINITIONS})
 target_link_libraries(clotho_ir PUBLIC unordered_dense::unordered_dense clotho_runtime ${LLVM_LIBS})
 target_link_libraries(clotho_ir PRIVATE clotho_warnings)
 
-# Front-end and the (future) slang -> IR translation. Pulls in slang and the
-# IR; consumers get both transitively.
+# Front-end: the slang -> IR translation. Pulls in slang and the IR;
+# consumers get both transitively.
 add_library(clotho STATIC
-  src/Frontend.cpp
   src/SourceMap.cpp
   src/Lower.cpp
 )
@@ -123,18 +122,19 @@ enable_testing()
 add_executable(clotho_test
   tests/test_main.cpp
   tests/ir_test.cpp
-  tests/frontend_test.cpp
   tests/sourcemap_test.cpp
   tests/lower_test.cpp
   tests/case_test.cpp
   tests/function_test.cpp
   tests/task_test.cpp
   tests/string_test.cpp
+  tests/display_test.cpp
   tests/loop_test.cpp
   tests/generate_test.cpp
   tests/packed_range_test.cpp
   tests/z_elision_test.cpp
   tests/llvm_backend_test.cpp
+  tests/two_state_test.cpp
   tests/wheel_test.cpp
   tests/runtime_test.cpp
 )

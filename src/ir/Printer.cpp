@@ -175,6 +175,26 @@ const char* tag_name(Inst::Tag tag) {
             return "finish";
         case T::Fflush:
             return "fflush";
+        case T::Fopen:
+            return "fopen";
+        case T::Fclose:
+            return "fclose";
+        case T::FileValueOp:
+            return "file_op";
+        case T::Fgets:
+            return "fgets";
+        case T::Sformat:
+            return "sformat";
+        case T::Sformatf:
+            return "sformatf";
+        case T::Ferror:
+            return "ferror";
+        case T::Scanf:
+            return "scanf";
+        case T::FreadWord:
+            return "fread_word";
+        case T::FreadMem:
+            return "fread_mem";
         case T::DynPartSelect:
             return "dyn_part_select";
         case T::ReadMem:
@@ -360,6 +380,44 @@ private:
             case Inst::PayloadKind::Display: {
                 const auto info = ir_.extra_data<DisplayInfo>(p.display);
                 os_ << '"' << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
+                for (Index a : ir_.region(info.args)) {
+                    os_ << ", ";
+                    ref(a);
+                }
+                break;
+            }
+            case Inst::PayloadKind::FileOp: {
+                const auto info = ir_.extra_data<FileOpInfo>(p.extra);
+                os_ << "op" << info.op;
+                for (Index a : ir_.region(info.args)) {
+                    os_ << ", ";
+                    ref(a);
+                }
+                break;
+            }
+            case Inst::PayloadKind::Sformat: {
+                const auto info = ir_.extra_data<SformatInfo>(p.extra);
+                ref(info.dst);
+                os_ << ", \"" << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
+                for (Index a : ir_.region(info.args)) {
+                    os_ << ", ";
+                    ref(a);
+                }
+                break;
+            }
+            case Inst::PayloadKind::Sformatf: {
+                const auto info = ir_.extra_data<SformatfInfo>(p.extra);
+                os_ << '"' << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
+                for (Index a : ir_.region(info.args)) {
+                    os_ << ", ";
+                    ref(a);
+                }
+                break;
+            }
+            case Inst::PayloadKind::Scanf: {
+                const auto info = ir_.extra_data<ScanfInfo>(p.extra);
+                ref(info.source);
+                os_ << ", \"" << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
                 for (Index a : ir_.region(info.args)) {
                     os_ << ", ";
                     ref(a);

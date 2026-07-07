@@ -217,6 +217,30 @@ TEST_CASE("string indexing reads bytes and writes in place with LRM out-of-range
     CHECK(run_capture(src) == "97 99 0\n[aZc]\n[aZc]\n[aZk] 107\n");
 }
 
+// s[i] and getc() return `byte`, a signed 8-bit type (LRM 6.16.3 and Table 6-8),
+// so a 0xff character is -1 under %d, and widening into a 32-bit context sign-
+// extends. NOTE: iverilog contradicts the LRM here (prints 255); the LRM is the
+// oracle for this case, not iverilog.
+TEST_CASE("string index and getc are signed bytes") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s;
+            byte b;
+            bit [31:0] u;
+            initial begin
+                s = "a";
+                s.putc(0, 8'hff);
+                $display("%0d %0d", s[0], s.getc(0));
+                b = s[0];
+                $display("%0d", b);
+                u = s[0];
+                $display("%h", u);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "-1 -1\n-1\nffffffff\n");
+}
+
 TEST_CASE("toupper, tolower, and substr follow LRM 6.16 semantics") {
     constexpr std::string_view src = R"(
         module m;
@@ -347,6 +371,93 @@ TEST_CASE("string comparisons drive control flow") {
     CHECK(run_capture(src) == "yes\n[gogogo]\n");
 }
 
+TEST_CASE("if on a string tests emptiness") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s;
+            initial begin
+                if (s) $display("t1"); else $display("f1");
+                s = "x";
+                if (s) $display("t2"); else $display("f2");
+                s = "";
+                if (s) $display("t3"); else $display("f3");
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "f1\nt2\nf3\n");
+}
+
+TEST_CASE("while on a string runs until it empties") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s;
+            integer n;
+            initial begin
+                s = "abcd";
+                n = 0;
+                while (s) begin
+                    s = s.substr(1, s.len() - 1);
+                    n = n + 1;
+                end
+                $display("%0d %0d", n, s.len());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "4 0\n");
+}
+
+TEST_CASE("for-loop string condition tests emptiness") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s;
+            integer n;
+            initial begin
+                n = 0;
+                for (s = "ab"; s; s = s.substr(1, s.len() - 1)) n = n + 1;
+                $display("%0d", n);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2\n");
+}
+
+TEST_CASE("ternary with a string condition selects by emptiness") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s;
+            integer v;
+            initial begin
+                v = s ? 1 : 2;
+                $display("%0d", v);
+                s = "go";
+                v = s ? 1 : 2;
+                $display("%0d", v);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2\n1\n");
+}
+
+// A constant string condition (a string'() cast of a literal folds to a pooled
+// string constant at lowering) takes the same truthiness. A bare string literal
+// in a condition is NOT a string: slang types it as a packed byte vector (LRM
+// 5.9), and "" is 8'b0, so both routes agree that empty is false.
+TEST_CASE("constant string conditions fold with the same truthiness") {
+    constexpr std::string_view src = R"(
+        module m;
+            initial begin
+                if (string'("")) $display("e-t"); else $display("e-f");
+                if (string'("abc")) $display("n-t"); else $display("n-f");
+                $display("%0d", string'("") ? 1 : 0);
+                $display("%0d", string'("x") ? 1 : 0);
+                if ("") $display("lit-t"); else $display("lit-f");
+                if ("x") $display("litx-t"); else $display("litx-f");
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "e-f\nn-t\n0\n1\nlit-f\nlitx-t\n");
+}
+
 // -- Unsupported string constructs fail loudly (never silently accepted) --
 
 namespace {
@@ -359,6 +470,18 @@ void check_rejected(std::string_view source, std::string_view needle) {
 }
 
 } // namespace
+
+// slang binds `!string` without diagnostic (Type::isBooleanConvertible
+// whitelists StringType) but LRM Table 11-1 makes it illegal; Clotho rejects it.
+TEST_CASE("logical negation of a string is rejected") {
+    check_rejected(R"(
+        module m;
+            string s;
+            reg r;
+            initial r = !s;
+        endmodule
+    )", "logical negation of a string is not legal (LRM Table 11-1)");
+}
 
 TEST_CASE("unsupported string constructs are rejected loudly") {
     SUBCASE("nonblocking assignment to a string") {
@@ -441,12 +564,24 @@ TEST_CASE("unsupported string constructs are rejected loudly") {
             endmodule
         )", "requires %s");
     }
-    SUBCASE("$sformatf") {
+    SUBCASE("$sformatf with a non-literal format") {
         check_rejected(R"(
             module m;
-                string s;
-                initial s = $sformatf("%0d", 1);
+                string s, f;
+                initial s = $sformatf(f, 1);
             endmodule
-        )", "$sformatf");
+        )", "$sformatf format must be a string literal");
     }
+}
+
+TEST_CASE("$sformatf formats into a string value") {
+    CHECK(run_capture(R"(
+        module m;
+            string s;
+            initial begin
+                s = $sformatf("v=%0d h=%h s=%s", 42, 8'hab, "hi");
+                $display("[%s] len=%0d", s, s.len());
+            end
+        endmodule
+    )") == "[v=42 h=ab s=hi] len=14\n");
 }

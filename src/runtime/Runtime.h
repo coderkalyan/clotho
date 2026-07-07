@@ -30,11 +30,15 @@ typedef struct rt_arg {
     uint64_t z;
 } rt_arg;
 
-// Format `fmt` with `argc` descriptors and write the result to stdout. Supports
-// the common $display specifiers (%d %h/%x %b %o %c %t, and %%); each consumes
-// the next descriptor. A %t descriptor carries a tick-valued time (see
-// $timeformat below). The codegen folds any trailing newline into `fmt`.
-void rt_display(const char* fmt, uint32_t argc, const rt_arg* argv);
+// Format `fmt` with `argc` descriptors and write the result to descriptor
+// `desc` — an MCD or FD (see the file-I/O block below); $display / $write pass
+// the standard-output MCD (bit 0). Specifiers follow LRM §21.2.1 (%d %h/%x %b
+// %o %c %s %t %u %z and %%, with widths, %0 minimal form, and `-` left-justify);
+// each except %% consumes the next descriptor. A %t descriptor carries a
+// tick-valued time (see $timeformat below). The frontend validates specifiers
+// at lower time; an invalid one reaching the runtime aborts. The codegen folds
+// any trailing newline into `fmt`.
+void rt_fwrite(int32_t desc, const char* fmt, uint32_t argc, const rt_arg* argv);
 
 // -- $timeformat / %t --
 //
@@ -72,17 +76,130 @@ void rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uin
 // the simulation is over. `env` points at a std::jmp_buf.
 void rt_finish_host(void* env);
 
-// $fflush (no-arg form, LRM 1800-2023 §21.3.6): flush all open output buffers so
-// queued $write output is emitted immediately.
-void rt_fflush(void);
+// -- File I/O (LRM 1800-2023 §21.3) --
+//
+// A file descriptor is a 32-bit integer the design stores in its own variables.
+// Two kinds are distinguished by bit 31:
+//   * MCD (multi-channel descriptor), bit 31 clear: bits 0..30 form a channel
+//     mask, one bit per open file, and a write goes to every set channel at
+//     once. Bit 0 is the preopened standard output. Returned by the one-argument
+//     $fopen(name), which opens for writing.
+//   * FD (single file descriptor), bit 31 set: 0x8000_0000 | index of one
+//     stream. Indices 0/1/2 are the preopened stdin/stdout/stderr. Returned by
+//     the two-argument $fopen(name, mode); the read routines require this kind.
+// $fopen returns 0 on failure (or when no MCD channel is free).
+
+// $fopen(name): open `name` for writing and return a fresh MCD, or 0 on failure.
+// `name_buf`/`name_len` carry the path as a packed-ASCII vector (as $readmem).
+int32_t rt_fopen_mcd(const char* name_buf, uint32_t name_len);
+
+// $fopen(name, mode): open `name` with C stdio mode string `mode` and return a
+// fresh FD, or 0 on failure. Both strings are packed-ASCII vectors; `mode` is
+// passed straight to fopen, so SV mode strings ("r", "w", "a", "r+b", ...) map
+// directly.
+int32_t rt_fopen_fd(const char* name_buf, uint32_t name_len, const char* mode_buf, uint32_t mode_len);
+
+// $fclose(desc): close every stream the descriptor names (all set MCD channels,
+// or the one FD). The preopened standard streams are never closed.
+void rt_fclose(int32_t desc);
+
+// The file read / positioning functions require an FD (a stream), not an MCD.
+// Each maps directly onto its C stdio analog.
+
+// $fgetc(fd): read one byte, or -1 (EOF) on end of file / error.
+int32_t rt_fgetc(int32_t fd);
+
+// $ungetc(c, fd): push `c` back so the next read returns it; -> c, or -1.
+int32_t rt_ungetc(int32_t c, int32_t fd);
+
+// $feof(fd): nonzero once the stream has hit end of file.
+int32_t rt_feof(int32_t fd);
+
+// $ftell(fd): current byte offset from the start, or -1 on error.
+int32_t rt_ftell(int32_t fd);
+
+// $fseek(fd, offset, operation): reposition the stream. `operation` 0/1/2 selects
+// SEEK_SET / SEEK_CUR / SEEK_END. -> 0 on success, -1 on failure.
+int32_t rt_fseek(int32_t fd, int32_t offset, int32_t operation);
+
+// $rewind(fd): seek to the start; -> 0.
+int32_t rt_rewind(int32_t fd);
+
+// $fgets(str, fd): read a line into the packed vector `str`, whose must|may plane
+// is at `mm` (2*`width` bits) and z plane at `z` (`width` bits). Reads up to
+// `width`/8 characters, stopping after a newline or at EOF. The characters are
+// stored right-justified (byte 0 = last character), the high bytes and the z
+// plane are cleared. -> the character count, or 0 on EOF / error. `width` must be
+// a multiple of 8. `flags` bit0: `mm` is a narrow 2-state slot holding the bare
+// iW value — only `width` bits are written and `z` is null.
+int32_t rt_fgets(uint8_t* mm, uint8_t* z, uint32_t width, int32_t fd, uint32_t flags);
+
+// $sformat / $swrite (LRM §21.3.3): format `fmt` with `argc` descriptors (as
+// rt_fwrite) and store the result into the destination string variable, whose
+// must|may plane is at `mm` (2*`width` bits) and z plane at `z` (`width` bits).
+// Stored right-justified; an oversized result keeps its low bytes. `width` must be
+// a multiple of 8. `flags` as rt_fgets.
+void rt_sformat(uint8_t* mm, uint8_t* z, uint32_t width, const char* fmt, uint32_t argc, const rt_arg* argv,
+                uint32_t flags);
+
+// $sformatf / $sformat into a string-object destination: format as rt_fwrite
+// and assign the result to the rt_string at `dst` (declared below).
+struct rt_string;
+void rt_sformat_str(struct rt_string* dst, const char* fmt, uint32_t argc, const rt_arg* argv);
+
+// $ferror(fd, str) (LRM §21.3.6): write the descriptor's most recent error message
+// into the string variable at `mm` / `z` (`width` bits) and return its error code
+// (0 when the stream is clear). `flags` as rt_fgets.
+int32_t rt_ferror(int32_t fd, uint8_t* mm, uint8_t* z, uint32_t width, uint32_t flags);
+
+// One output destination of a $fscanf / $sscanf conversion: the must|may plane
+// pointer (2*`width` bits), the z plane pointer (`width` bits), and the width. The
+// conversion char in the format decides how the parsed value is stored here.
+// `flags` bit0: `mm` is a narrow 2-state slot holding the bare iW value — only
+// `width` bits are written (x/z parsed digits drop to 0 per LRM 6.3.1) and `z`
+// is null.
+typedef struct rt_scan_arg {
+    uint8_t* mm;
+    uint8_t* z;
+    uint32_t width;
+    uint32_t flags;
+} rt_scan_arg;
+
+// $fscanf(fd, fmt, args) (LRM §21.3.4): parse the descriptor's input per `fmt`,
+// writing each conversion into the matching `args` descriptor. Supports d/o/b/h/x
+// (with x/z digits), c, s, `*` suppression and a field width. -> the number of
+// stored conversions, or -1 if the input is exhausted before the first.
+int32_t rt_fscanf(int32_t fd, const char* fmt, uint32_t argc, const rt_scan_arg* args);
+
+// $sscanf(str, fmt, args): as rt_fscanf, but the source is the packed-ASCII vector
+// at `buf` (`len` bytes).
+int32_t rt_sscanf(const char* buf, uint32_t len, const char* fmt, uint32_t argc, const rt_scan_arg* args);
+
+// $fread(target, fd[, start[, count]]) (LRM §21.3.4): read raw bytes from `fd` into
+// a memory (or a scalar, `count` == 1), MSB-first per element. The destination
+// geometry matches $readmem: element i's planes are at `mm_base` / `z_base` +
+// i*`stride`, `width` bits each, over `count` elements with declared bounds
+// `decl_left` / `decl_right`. `start` / `max_count` (valid per `flags` bit0 / bit1)
+// bound the address range; `flags` bit2 marks a narrow 2-state destination (bare
+// iW elements, null `z_base`). Returns the number of bytes read. `width` must be
+// <= 64.
+int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint32_t stride, uint32_t count,
+                 uint32_t width, uint32_t four_state, int64_t decl_left, int64_t decl_right, int64_t start,
+                 int64_t max_count, uint32_t flags);
+
+// $fflush(desc): flush the output buffers of descriptor `desc` (an MCD or FD).
+// The no-argument $fflush passes 0, which flushes every open stream (LRM
+// §21.3.6).
+void rt_fflush(int32_t desc);
 
 // $readmemh / $readmemb (LRM 1800-2023 §21.4): load a hex/binary text file into an
 // unpacked-array memory. `path_buf`/`path_len` carry the filename as a packed-ASCII
-// vector; `mm_base`/`z_base` point at element 0's must|may and z words in the state
-// buffer, strided by `stride` (`z_base` is null when the memory's slot stores no z
-// word); `count`/`width` describe the memory; `decl_left`/`decl_right` are its
+// vector, or as bytes in natural order when flags bit4 is set (a string-object
+// filename); `mm_base`/`z_base` point at element 0's must|may and z words in the
+// state buffer, strided by `stride` (`z_base` is null when the memory's slot stores
+// no z word); `count`/`width` describe the memory; `decl_left`/`decl_right` are its
 // declared address bounds (for `@addr` and start/finish mapping). `flags` bit0=hex,
-// bit1=has_start, bit2=has_finish, bit3=four_state.
+// bit1=has_start, bit2=has_finish, bit3=four_state, bit4=path_forward.
 void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8_t* z_base, uint32_t stride,
                 uint32_t count, uint32_t width, int64_t decl_left, int64_t decl_right, int64_t start,
                 int64_t finish, uint32_t flags);
@@ -161,6 +278,10 @@ void rt_string_assign_bytes(rt_string* dst, const char* p, uint64_t n);
 
 // Length in bytes ($.len()). The empty string has length 0.
 uint64_t rt_string_len(const rt_string* s);
+
+// Pointer to the string's bytes (not NUL-terminated; length via rt_string_len).
+// Valid until the next mutation of `s`.
+const char* rt_string_data(const rt_string* s);
 
 // dst = parts[0] .. parts[n-1] concatenated. dst may appear among the parts
 // (a = {a, b}).

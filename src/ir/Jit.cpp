@@ -85,7 +85,23 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config) {
             llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable,
         };
     };
-    expose("rt_display", &rt_display);
+    expose("rt_fwrite", &rt_fwrite);
+    expose("rt_fopen_mcd", &rt_fopen_mcd);
+    expose("rt_fopen_fd", &rt_fopen_fd);
+    expose("rt_fclose", &rt_fclose);
+    expose("rt_fgetc", &rt_fgetc);
+    expose("rt_ungetc", &rt_ungetc);
+    expose("rt_feof", &rt_feof);
+    expose("rt_ftell", &rt_ftell);
+    expose("rt_fseek", &rt_fseek);
+    expose("rt_rewind", &rt_rewind);
+    expose("rt_fgets", &rt_fgets);
+    expose("rt_sformat", &rt_sformat);
+    expose("rt_sformat_str", &rt_sformat_str);
+    expose("rt_ferror", &rt_ferror);
+    expose("rt_fscanf", &rt_fscanf);
+    expose("rt_sscanf", &rt_sscanf);
+    expose("rt_fread", &rt_fread);
     expose("rt_timeformat_init", &rt_timeformat_init);
     expose("rt_timeformat_set", &rt_timeformat_set);
     expose("rt_finish", &rt_finish);
@@ -104,6 +120,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config) {
     expose("rt_string_assign", &rt_string_assign);
     expose("rt_string_assign_bytes", &rt_string_assign_bytes);
     expose("rt_string_len", &rt_string_len);
+    expose("rt_string_data", &rt_string_data);
     expose("rt_string_concat", &rt_string_concat);
     expose("rt_string_repl", &rt_string_repl);
     expose("rt_string_cmp", &rt_string_cmp);
