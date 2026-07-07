@@ -1742,16 +1742,28 @@ private:
             lower_string_method(name, call, b);
             return;
         }
-        if (name == "$display" || name == "$write") {
-            lower_display(call, name == "$display", b);
+        if (const char rx = display_radix(name, "$display")) {
+            lower_display(call, /*newline=*/true, b, rx);
             return;
         }
-        if (name == "$fdisplay" || name == "$fwrite") {
-            lower_fdisplay(call, name == "$fdisplay", b);
+        if (const char rx = display_radix(name, "$write")) {
+            lower_display(call, /*newline=*/false, b, rx);
             return;
         }
-        if (name == "$swrite" || name == "$sformat") {
-            lower_sformat(call, name == "$sformat", b);
+        if (const char rx = display_radix(name, "$fdisplay")) {
+            lower_fdisplay(call, /*newline=*/true, b, rx);
+            return;
+        }
+        if (const char rx = display_radix(name, "$fwrite")) {
+            lower_fdisplay(call, /*newline=*/false, b, rx);
+            return;
+        }
+        if (const char rx = display_radix(name, "$swrite")) {
+            lower_sformat(call, /*is_sformat=*/false, b, rx);
+            return;
+        }
+        if (name == "$sformat") {
+            lower_sformat(call, /*is_sformat=*/true, b);
             return;
         }
         if (name == "$fclose") {
@@ -2159,6 +2171,11 @@ private:
             return lower_scanf(call, name == "$sscanf", b, l);
         }
 
+        // $sformatf(fmt, args) (LRM §21.3.3): format into a new string value.
+        if (name == "$sformatf") {
+            return lower_sformatf(call, b);
+        }
+
         // $fread(target, fd[, start[, count]]) (LRM §21.3.4): binary read into a
         // single vector or a whole unpacked-array memory. The memory form (like
         // $readmem) takes optional start-address and element-count bounds.
@@ -2390,12 +2407,14 @@ private:
                 continue;
             }
             // A string-literal argument (SV-style) contributes format text, even
-            // when width-converted; unwrap conversions to see the literal.
+            // when width-converted; unwrap conversions to see the literal. A
+            // literal that an earlier specifier is still waiting on is a value
+            // argument instead ($display("%s", "hi") prints hi).
             const Expression* lit = arg;
             while (lit->kind == ExpressionKind::Conversion) {
                 lit = &lit->as<ConversionExpression>().operand();
             }
-            if (lit->kind == ExpressionKind::StringLiteral) {
+            if (lit->kind == ExpressionKind::StringLiteral && next >= pending.size()) {
                 append_format_literal(fmt, lit->as<StringLiteral>().getValue(), pending);
             } else {
                 const bool str  = is_string_expr(*arg);
@@ -2425,17 +2444,35 @@ private:
         }
     }
 
+    // Match a display-family task name against `base` plus an optional radix
+    // suffix ($displayb / $writeh / ...); returns the bare-argument default
+    // conversion ('d' for the plain name, the suffix's radix otherwise) or 0
+    // when the name does not match (LRM §21.2.1.1).
+    static char display_radix(std::string_view name, std::string_view base) {
+        if (!name.starts_with(base)) {
+            return 0;
+        }
+        const std::string_view rest = name.substr(base.size());
+        if (rest.empty()) {
+            return 'd';
+        }
+        if (rest == "b" || rest == "o" || rest == "h") {
+            return rest[0];
+        }
+        return 0;
+    }
+
     // Lower $display / $write: format the arguments and write to standard output.
-    void lower_display(const CallExpression& call, bool newline, ir::Builder& b) {
+    void lower_display(const CallExpression& call, bool newline, ir::Builder& b, char default_conv) {
         std::string            fmt;
         std::vector<ir::Index> args;
-        build_format(call.arguments(), fmt, args, b);
+        build_format(call.arguments(), fmt, args, b, default_conv);
         b.display(fmt, newline, args, loc(call));
     }
 
     // Lower $fdisplay / $fwrite (LRM §21.3.3): the first argument is the
     // destination descriptor (an MCD or FD); the rest form the message.
-    void lower_fdisplay(const CallExpression& call, bool newline, ir::Builder& b) {
+    void lower_fdisplay(const CallExpression& call, bool newline, ir::Builder& b, char default_conv) {
         const auto args_in = call.arguments();
         if (args_in.empty()) {
             fail("$fdisplay / $fwrite requires a file-descriptor argument");
@@ -2443,7 +2480,7 @@ private:
         const ir::Index       fd = lower_expr(*args_in[0], b);
         std::string            fmt;
         std::vector<ir::Index> args;
-        build_format(args_in.subspan(1), fmt, args, b);
+        build_format(args_in.subspan(1), fmt, args, b, default_conv);
         b.fdisplay(fd, fmt, newline, args, loc(call));
     }
 
@@ -2451,7 +2488,8 @@ private:
     // $write and store the result into the destination string lvalue (the first
     // argument). $sformat's format (its second argument) must be a string literal;
     // $swrite takes $write-style interleaved literals and values.
-    void lower_sformat(const CallExpression& call, bool is_sformat, ir::Builder& b) {
+    void lower_sformat(const CallExpression& call, bool is_sformat, ir::Builder& b,
+                       char default_conv = 'd') {
         const auto args = call.arguments();
         if (args.empty()) {
             fail("$sformat / $swrite requires a destination string argument");
@@ -2473,8 +2511,30 @@ private:
         const ir::Index        dst = lower_lvalue(*args[0], b);
         std::string            fmt;
         std::vector<ir::Index> values;
-        build_format(args.subspan(1), fmt, values, b);
+        build_format(args.subspan(1), fmt, values, b, default_conv);
         b.sformat(dst, fmt, values, loc(call));
+    }
+
+    // Lower $sformatf (LRM §21.3.3): render like $sformat but yield a new string
+    // value. The format (first argument) must be a string literal, like $sformat.
+    ir::Index lower_sformatf(const CallExpression& call, ir::Builder& b) {
+        const auto args = call.arguments();
+        if (args.empty()) {
+            fail("$sformatf requires a format-string argument");
+        }
+        const Expression* fa = args[0];
+        while (fa->kind == ExpressionKind::Conversion) {
+            fa = &fa->as<ConversionExpression>().operand();
+        }
+        if (fa->kind != ExpressionKind::StringLiteral) {
+            // TODO: a runtime (non-literal) $sformatf format string needs
+            // dynamic format parsing, which Clotho lacks.
+            fail("$sformatf format must be a string literal");
+        }
+        std::string            fmt;
+        std::vector<ir::Index> values;
+        build_format(args, fmt, values, b);
+        return b.sformatf(fmt, values, loc(call));
     }
 
     // Scale a %t argument from its module's time unit to design ticks: the runtime

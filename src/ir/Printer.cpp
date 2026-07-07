@@ -183,6 +183,8 @@ const char* tag_name(Inst::Tag tag) {
             return "fgets";
         case T::Sformat:
             return "sformat";
+        case T::Sformatf:
+            return "sformatf";
         case T::Ferror:
             return "ferror";
         case T::Scanf:
@@ -395,6 +397,15 @@ private:
                 const auto info = ir_.extra_data<SformatInfo>(p.extra);
                 ref(info.dst);
                 os_ << ", \"" << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
+                for (Index a : ir_.region(info.args)) {
+                    os_ << ", ";
+                    ref(a);
+                }
+                break;
+            }
+            case Inst::PayloadKind::Sformatf: {
+                const auto info = ir_.extra_data<SformatfInfo>(p.extra);
+                os_ << '"' << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
                 for (Index a : ir_.region(info.args)) {
                     os_ << ", ";
                     ref(a);

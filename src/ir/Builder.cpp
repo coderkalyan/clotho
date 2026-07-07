@@ -200,6 +200,14 @@ Index Builder::sformat(Index dst, std::string_view fmt, std::span<const Index> a
     return emit({ Inst::Tag::Sformat, Inst::Payload{ .extra = extra } }, loc);
 }
 
+Index Builder::sformatf(std::string_view fmt, std::span<const Index> args, SourceLoc loc) {
+    const ExtraIndex fmt_at = add_bytes(fmt);
+    const ExtraSlice slice  = add_slice(args);
+    const ExtraIndex extra  = add_extra(SformatfInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), slice });
+
+    return emit({ Inst::Tag::Sformatf, Inst::Payload{ .extra = extra } }, loc);
+}
+
 Index Builder::ferror(Index dst, Index fd, SourceLoc loc) {
     const ExtraIndex extra = add_extra(FerrorInfo{ fd });
 

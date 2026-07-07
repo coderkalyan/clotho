@@ -254,6 +254,18 @@ struct SformatInfo {
     ExtraSlice args;
 };
 
+// Extra payload for `sformatf`: $sformatf (LRM §21.3.3) formats the value args
+// per the packed format-string bytes at `fmt` (`fmt_len` bytes) and yields a
+// new string value (the instruction's string temp).
+struct SformatfInfo {
+    // First extra word of the packed format-string bytes.
+    ExtraIndex fmt;
+    // Format-string length in bytes.
+    uint32_t fmt_len;
+    // Value operands consumed by the format specifiers.
+    ExtraSlice args;
+};
+
 // Extra payload for `ferror`: $ferror(fd, str) (LRM §21.3.6) writes the
 // descriptor's error message into the string lvalue (the instruction's `op`) and
 // returns the error code. `fd` is a value operand.
@@ -368,6 +380,7 @@ static_assert(ExtraPayload<FopenInfo>);
 static_assert(ExtraPayload<FileOpInfo>);
 static_assert(ExtraPayload<FgetsInfo>);
 static_assert(ExtraPayload<SformatInfo>);
+static_assert(ExtraPayload<SformatfInfo>);
 static_assert(ExtraPayload<FerrorInfo>);
 static_assert(ExtraPayload<ScanfInfo>);
 static_assert(ExtraPayload<FreadWordInfo>);
@@ -570,6 +583,10 @@ struct Inst {
         // $sformat / $swrite: format value args and store the result into a string
         // lvalue (payload: extra -> SformatInfo). LRM §21.3.3. Lowers to rt_sformat.
         Sformat,
+        // $sformatf: format value args, -> new string value (payload: extra ->
+        // SformatfInfo). LRM §21.3.3. Lowers to rt_sformat_str into the
+        // instruction's string temp.
+        Sformatf,
         // $ferror: write a descriptor's error message into a string lvalue, ->
         // error code (payload: op_extra -> FerrorInfo; op is the destination
         // lvalue). LRM §21.3.6. Lowers to an rt_ferror call.
@@ -638,6 +655,7 @@ struct Inst {
         Wait,
         FileOp,
         Sformat,
+        Sformatf,
         Scanf,
     };
 

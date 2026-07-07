@@ -564,12 +564,24 @@ TEST_CASE("unsupported string constructs are rejected loudly") {
             endmodule
         )", "requires %s");
     }
-    SUBCASE("$sformatf") {
+    SUBCASE("$sformatf with a non-literal format") {
         check_rejected(R"(
             module m;
-                string s;
-                initial s = $sformatf("%0d", 1);
+                string s, f;
+                initial s = $sformatf(f, 1);
             endmodule
-        )", "$sformatf");
+        )", "$sformatf format must be a string literal");
     }
+}
+
+TEST_CASE("$sformatf formats into a string value") {
+    CHECK(run_capture(R"(
+        module m;
+            string s;
+            initial begin
+                s = $sformatf("v=%0d h=%h s=%s", 42, 8'hab, "hi");
+                $display("[%s] len=%0d", s, s.len());
+            end
+        endmodule
+    )") == "[v=42 h=ab s=hi] len=14\n");
 }

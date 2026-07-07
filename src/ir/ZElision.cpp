@@ -311,6 +311,7 @@ struct Analysis {
                 case Inst::Tag::FileValueOp:
                 case Inst::Tag::Fgets:
                 case Inst::Tag::Sformat:
+                case Inst::Tag::Sformatf:
                 case Inst::Tag::Ferror:
                 case Inst::Tag::Scanf:
                 case Inst::Tag::FreadWord:
