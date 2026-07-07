@@ -2500,7 +2500,15 @@ private:
                 // values rather than waiting for an input edge that a declaration
                 // initializer never generates. It runs body-first then parks on its
                 // (already-subscribed) wait, so later input changes still wake it.
+                //
+                // Mark it scheduled as it is enqueued: a seed-time store from an
+                // earlier-draining process (initial blocks drain before these, being
+                // pushed last onto the LIFO) services this static subscription and
+                // would re-push the already-queued handle without the flag, so N such
+                // processes overflow the nproc-sized active queue. The flag is cleared
+                // when the body reaches its wait-suspend (lower_process always-loop).
                 if (p.self_start) {
+                    b_.CreateStore(b_.getInt32(1), flag);
                     emit_active_push(b_, hdl);
                 }
             } else {

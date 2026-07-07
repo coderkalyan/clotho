@@ -181,6 +181,27 @@ TEST_CASE("instance state structs compose nested and replicate per instantiation
     CHECK(ir.find("%leaf.state.0") == std::string::npos);
 }
 
+// Regression: two or more self-starting continuous assigns share the nproc-sized
+// active queue. An initial block drains first (LIFO) and its input writes service
+// the assigns' still-unrun static subscriptions; without marking them scheduled at
+// seed time each is re-pushed, overflowing the queue and corrupting a handle.
+TEST_CASE("multiple continuous assigns woken by a store do not overflow the queue") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a, b, c, d, y1, y2;
+            assign y1 = a & b;
+            assign y2 = c | d;
+            initial begin
+                a = 1; b = 1; c = 0; d = 0;
+                #1 $display("%b %b", y1, y2);
+                a = 0; d = 1;
+                #1 $display("%b %b", y1, y2);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 0\n0 1\n");
+}
+
 TEST_CASE("single-bit xor uses the packed truth-table immediate") {
     constexpr std::string_view src = R"(
         module m(input logic a, input logic b, output logic y);
