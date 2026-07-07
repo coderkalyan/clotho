@@ -294,3 +294,53 @@ TEST_CASE("function with an output argument is rejected") {
     )";
     CHECK(reject(src).find("output/inout/ref") != std::string::npos);
 }
+
+// Short-circuit `&&` / `||` must not evaluate the right operand when the left
+// already decides the result, so a side-effecting call is skipped (LRM 11.3.5,
+// 11.4.7). The function announces every call, making evaluation observable.
+TEST_CASE("&& and || short-circuit a side-effecting right operand") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic bit f(input bit x);
+                $display("f");
+                return x;
+            endfunction
+            bit a, b, r;
+            initial begin
+                a = 0; b = 1;
+                r = a && f(b); $display("r=%b", r);
+                a = 1;
+                r = a && f(b); $display("r=%b", r);
+                r = a || f(b); $display("r=%b", r);
+                a = 0;
+                r = a || f(b); $display("r=%b", r);
+            end
+        endmodule
+    )";
+    // a=0: && skips f. a=1: && calls f. a=1: || skips f. a=0: || calls f.
+    CHECK(run_capture(src) == "r=0\nf\nr=1\nr=1\nf\nr=1\n");
+}
+
+// An x/z left operand is ambiguous, not decisive, so the right operand is still
+// evaluated and the full 3-valued result is produced (LRM 11.4.7 requires the
+// second operand only when the first is definitively false / true).
+TEST_CASE("&& and || evaluate the right operand on an x/z left") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic logic f(input logic x);
+                $display("f");
+                return x;
+            endfunction
+            logic a, r;
+            initial begin
+                a = 1'bx;
+                r = a && f(1'b0); $display("r=%b", r);
+                r = a && f(1'b1); $display("r=%b", r);
+                r = a || f(1'b1); $display("r=%b", r);
+                r = a || f(1'b0); $display("r=%b", r);
+            end
+        endmodule
+    )";
+    // Every branch evaluates f (a is x). x&&0=0, x&&1=x, x||1=1, x||0=x.
+    CHECK(run_capture(src) == "f\nr=0\nf\nr=x\nf\nr=1\nf\nr=x\n");
+}

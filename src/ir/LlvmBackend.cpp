@@ -89,7 +89,7 @@ struct ValType {
 
 // A lowered value: the must/may planes packed into one i(2W) integer (low W bits
 // = must / definitely 1, high W bits = may / could be 1), plus a separate iW `z`
-// (high-impedance marker). Packing lets the monotone ops (AND/OR/NOT, mux select)
+// (high-impedance marker). Packing lets the monotone ops (AND/OR/NOT, select select)
 // act on both planes with a single instruction.
 struct Plane {
     llvm::Value* mm = nullptr; // i(2W): [0,W) must, [W,2W) may
@@ -2998,8 +2998,10 @@ private:
                 return type_of(p.binary.l);
             case Inst::Tag::Bnot:
                 return type_of(p.unary);
-            case Inst::Tag::Mux:
-                return type_of(ir_->extra_data<Mux>(p.op_extra.extra).a);
+            case Inst::Tag::Select:
+                return type_of(ir_->extra_data<Select>(p.op_extra.extra).a);
+            case Inst::Tag::SelectLazy:
+                return type_of(ir_->extra_data<SelectLazy>(p.op_extra.extra).then_val);
 
             case Inst::Tag::RedAnd:
             case Inst::Tag::RedOr:
@@ -3377,12 +3379,12 @@ private:
                 set_value(i, lower_lnot(value_of(p.unary)));
                 return;
 
-            case Inst::Tag::Mux: {
-                const auto mux = ir_->extra_data<Mux>(p.op_extra.extra);
-                if (type_of(mux.a).is_string) {
-                    throw BackendError{ "internal: string value in mux" };
+            case Inst::Tag::Select: {
+                const auto select = ir_->extra_data<Select>(p.op_extra.extra);
+                if (type_of(select.a).is_string) {
+                    throw BackendError{ "internal: string value in select" };
                 }
-                set_value(i, lower_mux(value_of(p.op_extra.op), value_of(mux.a), value_of(mux.b)));
+                set_value(i, lower_select(value_of(p.op_extra.op), value_of(select.a), value_of(select.b)));
                 return;
             }
             case Inst::Tag::Concat:
@@ -3473,6 +3475,10 @@ private:
 
             case Inst::Tag::Cond:
                 lower_cond(i);
+                return;
+
+            case Inst::Tag::SelectLazy:
+                lower_select_lazy(i);
                 return;
 
             case Inst::Tag::Loop:
@@ -4837,10 +4843,10 @@ private:
         return bit_plane(t.f, b_.CreateNot(t.t));
     }
 
-    // -- Mux: known condition selects (one packed select); unknown merges bitwise
+    // -- Select: known condition selects (one packed select); unknown merges bitwise
     // (X where the arms disagree). --
 
-    Plane lower_mux(Plane cond, Plane a, Plane b) {
+    Plane lower_select(Plane cond, Plane a, Plane b) {
         const uint32_t w          = width_of(a);
         llvm::Value*   cond_known = b_.CreateICmpEQ(must_of(cond), may_of(cond));
         llvm::Value*   cond_true  = b_.CreateICmpNE(must_of(cond), zero(1));
@@ -4945,6 +4951,46 @@ private:
         branch_to(cont_bb);
 
         b_.SetInsertPoint(cont_bb);
+    }
+
+    // Value-producing short-circuit conditional (&&/||). Branches on the
+    // predicate's must bit (a definite 2-state value), lowers only the taken
+    // branch's region, and merges the two branch values with a PHI. The
+    // side-effecting right operand lives inside the then-region, so it is never
+    // evaluated when the predicate is 0. LLVM folds the whole thing back to a
+    // straight-line select when both branches are side-effect free.
+    void lower_select_lazy(Index i) {
+        const Inst::Payload& p    = ir_->payload(i);
+        const auto           sel  = ir_->extra_data<SelectLazy>(p.op_extra.extra);
+        const Plane          pred = value_of(p.op_extra.op);
+
+        llvm::Value* take = b_.CreateICmpNE(must_of(pred), zero(1));
+
+        auto* then_bb = llvm::BasicBlock::Create(ctx_, "sel.then", fn_);
+        auto* else_bb = llvm::BasicBlock::Create(ctx_, "sel.else", fn_);
+        auto* cont_bb = llvm::BasicBlock::Create(ctx_, "sel.end", fn_);
+        b_.CreateCondBr(take, then_bb, else_bb);
+
+        b_.SetInsertPoint(then_bb);
+        lower_region(ir_->region(sel.then_));
+        const Plane       tv       = value_of(sel.then_val);
+        llvm::BasicBlock* then_end = b_.GetInsertBlock();
+        branch_to(cont_bb);
+
+        b_.SetInsertPoint(else_bb);
+        lower_region(ir_->region(sel.else_));
+        const Plane       ev       = value_of(sel.else_val);
+        llvm::BasicBlock* else_end = b_.GetInsertBlock();
+        branch_to(cont_bb);
+
+        b_.SetInsertPoint(cont_bb);
+        llvm::PHINode* mm = b_.CreatePHI(tv.mm->getType(), 2);
+        mm->addIncoming(tv.mm, then_end);
+        mm->addIncoming(ev.mm, else_end);
+        llvm::PHINode* z = b_.CreatePHI(tv.z->getType(), 2);
+        z->addIncoming(tv.z, then_end);
+        z->addIncoming(ev.z, else_end);
+        set_value(i, { mm, z });
     }
 
     // -- Control flow: for/while/forever. The cond region recomputes the

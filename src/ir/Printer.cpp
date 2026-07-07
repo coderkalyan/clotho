@@ -125,8 +125,10 @@ const char* tag_name(Inst::Tag tag) {
             return "lor";
         case T::Lnot:
             return "lnot";
-        case T::Mux:
-            return "mux";
+        case T::Select:
+            return "select";
+        case T::SelectLazy:
+            return "select_lazy";
         case T::Concat:
             return "concat";
         case T::Repl:
@@ -382,11 +384,11 @@ private:
         os_ << ")\n";
     }
 
-    // Render the op-plus-extra payloads (mux, part_select, cond).
+    // Render the op-plus-extra payloads (select, part_select, cond).
     void render_op_extra(Inst::Tag tag, const Inst::Payload& p, int depth) {
         switch (tag) {
-            case Inst::Tag::Mux: {
-                const Mux m = ir_.extra_data<Mux>(p.op_extra.extra);
+            case Inst::Tag::Select: {
+                const Select m = ir_.extra_data<Select>(p.op_extra.extra);
                 ref(p.op_extra.op);
                 os_ << " ? ";
                 ref(m.a);
@@ -435,6 +437,24 @@ private:
                 os_ << ") {\n";
                 render_region("then", regions.then_, depth);
                 render_region("else", regions.else_, depth);
+                indent(depth);
+                os_ << "}\n";
+                break;
+            }
+            case Inst::Tag::SelectLazy: {
+                const SelectLazy sel = ir_.extra_data<SelectLazy>(p.op_extra.extra);
+                ref(p.op_extra.op);
+                os_ << ") {\n";
+                render_region("then", sel.then_, depth);
+                indent(depth + 1);
+                os_ << "-> ";
+                ref(sel.then_val);
+                os_ << "\n";
+                render_region("else", sel.else_, depth);
+                indent(depth + 1);
+                os_ << "-> ";
+                ref(sel.else_val);
+                os_ << "\n";
                 indent(depth);
                 os_ << "}\n";
                 break;

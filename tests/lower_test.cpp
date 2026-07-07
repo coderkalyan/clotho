@@ -114,14 +114,14 @@ TEST_CASE("the edge-triggered process carries its wait event and nonblocking sto
     CHECK(has_tag(seq->ir, ir::Inst::Tag::StoreNb));
 }
 
-TEST_CASE("a level-sensitive process lowers the operator/mux datapath") {
+TEST_CASE("a level-sensitive process lowers the operator/select datapath") {
     const LowerResult r = lower_text(kAlu);
     REQUIRE(r.ok);
 
     // The `next` assign is the level-sensitive process with the arithmetic + selects.
     bool found_datapath = false;
     for (const ir::Process& p : r.module->processes()) {
-        if (!is_edge_triggered(p) && has_tag(p.ir, ir::Inst::Tag::Mux)) {
+        if (!is_edge_triggered(p) && has_tag(p.ir, ir::Inst::Tag::Select)) {
             found_datapath = true;
             CHECK(has_tag(p.ir, ir::Inst::Tag::Add));
             CHECK(has_tag(p.ir, ir::Inst::Tag::Store));

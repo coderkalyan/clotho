@@ -55,10 +55,10 @@ Index Builder::repl(Index value, uint32_t count, SourceLoc loc) {
     return emit({ Inst::Tag::Repl, Inst::Payload{ .repl = { value, count } } }, loc);
 }
 
-Index Builder::mux(Index cond, Index a, Index b, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(Mux{ a, b });
+Index Builder::select(Index cond, Index a, Index b, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(Select{ a, b });
 
-    return emit({ Inst::Tag::Mux, Inst::Payload{ .op_extra = { cond, extra } } }, loc);
+    return emit({ Inst::Tag::Select, Inst::Payload{ .op_extra = { cond, extra } } }, loc);
 }
 
 Index Builder::concat(std::span<const Index> parts, SourceLoc loc) {
@@ -90,6 +90,13 @@ Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_reg
     const ExtraIndex extra = add_extra(Regions{ then_region, else_region });
 
     return emit({ Inst::Tag::Cond, Inst::Payload{ .op_extra = { condition, extra } } }, loc);
+}
+
+Index Builder::select_lazy(Index pred, ExtraSlice then_region, Index then_val, ExtraSlice else_region, Index else_val,
+                      SourceLoc loc) {
+    const ExtraIndex extra = add_extra(SelectLazy{ then_region, then_val, else_region, else_val });
+
+    return emit({ Inst::Tag::SelectLazy, Inst::Payload{ .op_extra = { pred, extra } } }, loc);
 }
 
 Index Builder::loop(ExtraSlice cond_region, Index pred, ExtraSlice body_region, ExtraSlice step_region,

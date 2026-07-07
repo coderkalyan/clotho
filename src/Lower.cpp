@@ -1303,7 +1303,7 @@ private:
     // LRM §12.4: the condition is true if any bit is 1, false if all bits are 0,
     // and ambiguous (X) otherwise. That is exactly reduction-OR: must = any bit
     // definitely 1, may = any bit could be 1 (Z bits read as X via `may`). This
-    // also normalizes a multi-bit predicate to the 1-bit value `b.cond`/`b.mux`
+    // also normalizes a multi-bit predicate to the 1-bit value `b.cond`/`b.select`
     // require; without it the backend emits a mismatched-width icmp.
     ir::Index lower_predicate(const Expression& cond, ir::Builder& b) {
         const ir::SourceLoc l    = loc(cond);
@@ -2200,7 +2200,7 @@ private:
             case ExpressionKind::ConditionalOp: {
                 const ConditionalExpression& c = expr.as<ConditionalExpression>();
                 if (is_string_expr(expr)) {
-                    // TODO: ?: over strings (needs a string-aware mux; lower to a
+                    // TODO: ?: over strings (needs a string-aware select; lower to a
                     // Cond with a string temp).
                     fail("conditional operator (?:) over strings is not supported");
                 }
@@ -2210,7 +2210,7 @@ private:
                 const ir::Index pred = lower_predicate(*c.conditions[0].expr, b);
                 const ir::Index a    = lower_expr(c.left(), b);
                 const ir::Index bb   = lower_expr(c.right(), b);
-                return b.mux(pred, a, bb, l);
+                return b.select(pred, a, bb, l);
             }
             case ExpressionKind::Concatenation: {
                 std::vector<ir::Index> parts;
@@ -2323,12 +2323,62 @@ private:
         }
     }
 
+    // Short-circuit `&&` / `||` (LRM 11.3.5, 11.4.7). The left operand is always
+    // evaluated; the right operand is evaluated only in the Select's then-branch,
+    // taken when the left has not already fixed the result. A definite left
+    // operand short-circuits (`&&` on a false left -> 0, `||` on a true left ->
+    // 1); an x/z left is ambiguous, so the right operand is still evaluated and
+    // the full 3-valued Land/Lor computes the merged result.
+    ir::Index lower_short_circuit(const BinaryExpression& bin, ir::Builder& b) {
+        using T                = ir::Inst::Tag;
+        const ir::SourceLoc l  = loc(bin);
+        const bool          is_and = bin.op == slang::ast::BinaryOperator::LogicalAnd;
+        const ir::Ref       bit  = make_int_type(1, true, false);
+
+        const ir::Index lhs = lower_expr(bin.left(), b);
+
+        // Predicate is a definite 2-state bit: 1 iff the right operand must still
+        // be evaluated. `&&` skips when the left is logically false (all bits a
+        // definite 0); `||` skips when the left is logically true (its reduction
+        // or is a definite 1). Case-equality (===) yields a definite bit even for
+        // an x/z left, so the backend can branch on it directly.
+        ir::Index pred;
+        if (is_and) {
+            const ir::Index zero = b.constant(module_.pool.put_int(lower_type(*bin.left().type), 0), l);
+            pred                 = b.unary(T::Lnot, b.binary(T::CaseEq, lhs, zero, l), l);
+        } else {
+            const ir::Index ror = b.unary(T::RedOr, lhs, l);
+            const ir::Index one = b.constant(module_.pool.put_int(bit, 1), l);
+            pred                = b.unary(T::Lnot, b.binary(T::CaseEq, ror, one, l), l);
+        }
+
+        b.open_region();
+        const ir::Index     rhs         = lower_expr(bin.right(), b);
+        const ir::Index     combined    = b.binary(is_and ? T::Land : T::Lor, lhs, rhs, l);
+        const ir::ExtraSlice then_region = b.close_region();
+
+        b.open_region();
+        const ir::Index     dom         = b.constant(module_.pool.put_int(bit, is_and ? 0 : 1), l);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        return b.select_lazy(pred, then_region, combined, else_region, dom, l);
+    }
+
     ir::Index lower_binary(const BinaryExpression& bin, ir::Builder& b) {
+        using B = slang::ast::BinaryOperator;
+        using T = ir::Inst::Tag;
+
+        // Short-circuit logical operators: the right operand must not be
+        // evaluated when the left already decides the result, so its side
+        // effects (a function call) do not occur (LRM 11.3.5, 11.4.7). Handled
+        // before the eager operand lowering below, which always evaluates both.
+        if (bin.op == B::LogicalAnd || bin.op == B::LogicalOr) {
+            return lower_short_circuit(bin, b);
+        }
+
         const ir::SourceLoc l   = loc(bin);
         const ir::Index     lhs = lower_expr(bin.left(), b);
         const ir::Index     rhs = lower_expr(bin.right(), b);
-        using B                 = slang::ast::BinaryOperator;
-        using T                 = ir::Inst::Tag;
 
         if (is_string_expr(bin.left()) || is_string_expr(bin.right())) {
             // slang's implicit conversions make both operands string here. Only
@@ -2399,10 +2449,6 @@ private:
                 return b.binary(T::Le, lhs, rhs, l);
             case B::LessThan:
                 return b.binary(T::Lt, lhs, rhs, l);
-            case B::LogicalAnd:
-                return b.binary(T::Land, lhs, rhs, l);
-            case B::LogicalOr:
-                return b.binary(T::Lor, lhs, rhs, l);
             case B::LogicalShiftLeft:
             case B::ArithmeticShiftLeft:
                 return b.binary(T::Sll, lhs, rhs, l);

@@ -47,7 +47,7 @@ public:
     // -- Irregular shapes --
     Index resize(Index op, Ref type, SourceLoc loc);
     Index repl(Index value, uint32_t count, SourceLoc loc);
-    Index mux(Index cond, Index a, Index b, SourceLoc loc);
+    Index select(Index cond, Index a, Index b, SourceLoc loc);
     Index concat(std::span<const Index> parts, SourceLoc loc);
     Index part_select(Index base, uint32_t msb, uint32_t lsb, SourceLoc loc);
     // Runtime-offset, constant-width part-select base[offset +: width]. `offset` is
@@ -57,6 +57,12 @@ public:
     // UnpackedArray type being indexed (gives element stride + declared bounds).
     Index elem_select(Index base, Index index, Ref array_type, SourceLoc loc);
     Index cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc);
+    // Value-producing short-circuit conditional (&&/||). `pred` is a definite
+    // 2-state bit; the then-branch (pred 1) yields `then_val`, the else-branch
+    // yields `else_val`. The two values must share a width; the backend merges
+    // them with a PHI. See ir::SelectLazy.
+    Index select_lazy(Index pred, ExtraSlice then_region, Index then_val, ExtraSlice else_region, Index else_val,
+                 SourceLoc loc);
     // for / while / forever. `cond_region` recomputes `pred` each iteration;
     // `step_region` is the per-iteration update (empty for while / forever).
     Index loop(ExtraSlice cond_region, Index pred, ExtraSlice body_region, ExtraSlice step_region, SourceLoc loc);

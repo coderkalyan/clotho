@@ -189,16 +189,23 @@ struct Analysis {
                     break;
 
                 // Z-transparent value ops: the z plane rides through their
-                // lowerings (an unknown shift count / mux condition forces X
+                // lowerings (an unknown shift count / select condition forces X
                 // with z = 0, so joining only the data operands is exact).
                 case Inst::Tag::Sll:
                 case Inst::Tag::Srl:
                 case Inst::Tag::Sra:
                     val_z[raw] = z_of(p.binary.l);
                     break;
-                case Inst::Tag::Mux: {
-                    const Mux mux = ir.extra_data<Mux>(p.op_extra.extra);
-                    val_z[raw]    = z_of(mux.a) | z_of(mux.b);
+                case Inst::Tag::Select: {
+                    const Select select = ir.extra_data<Select>(p.op_extra.extra);
+                    val_z[raw]    = z_of(select.a) | z_of(select.b);
+                    break;
+                }
+                case Inst::Tag::SelectLazy: {
+                    // Either branch's value may reach the result; the predicate
+                    // only gates control flow and carries no z into it.
+                    const SelectLazy s = ir.extra_data<SelectLazy>(p.op_extra.extra);
+                    val_z[raw]     = z_of(s.then_val) | z_of(s.else_val);
                     break;
                 }
                 case Inst::Tag::Concat:

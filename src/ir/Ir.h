@@ -64,8 +64,8 @@ struct ExtraSlice {
     ExtraIndex end;
 };
 
-// Extra payload for `mux`: the two selected values (the condition is the op).
-struct Mux {
+// Extra payload for `select`: the two selected values (the condition is the op).
+struct Select {
     // Value chosen when the condition is true.
     Index a;
     // Value chosen when the condition is false.
@@ -150,6 +150,22 @@ struct Regions {
     ExtraSlice then_;
     // Instructions executed when the condition is false.
     ExtraSlice else_;
+};
+
+// Extra payload for `select_lazy`: a value-producing conditional (the predicate
+// is the op). Unlike `cond` (statement-only) each branch designates a result
+// value; the backend merges them with a PHI. Used for short-circuit &&/||,
+// where the then-branch evaluates the right operand and the else-branch yields
+// the dominating constant.
+struct SelectLazy {
+    // Instructions evaluated when the predicate is a definite 1.
+    ExtraSlice then_;
+    // Value produced by the then-branch.
+    Index then_val;
+    // Instructions evaluated when the predicate is 0.
+    ExtraSlice else_;
+    // Value produced by the else-branch.
+    Index else_val;
 };
 
 // Extra payload for `loop`. `cond` holds the instructions that recompute the
@@ -237,7 +253,7 @@ struct WaitInfo {
 static_assert(ExtraPayload<ExtraSlice>);
 static_assert(ExtraPayload<CallInfo>);
 static_assert(ExtraPayload<TaskCallInfo>);
-static_assert(ExtraPayload<Mux>);
+static_assert(ExtraPayload<Select>);
 static_assert(ExtraPayload<PartSelect>);
 static_assert(ExtraPayload<DynPartSelect>);
 static_assert(ExtraPayload<ElemSelect>);
@@ -351,8 +367,15 @@ struct Inst {
         Lnot,
 
         // -- Selection / structural --
-        // Ternary cond ? a : b (payload: op_extra -> Mux).
-        Mux,
+        // Ternary cond ? a : b (payload: op_extra -> Select).
+        Select,
+        // Value-producing short-circuit conditional (payload: op_extra ->
+        // Select). The op is a definite 2-state predicate; the then-branch
+        // (predicate 1) and else-branch each yield a value, merged by the
+        // backend. Used for &&/|| so the right operand is not evaluated when the
+        // left already decides the result (LRM 11.3.5, 11.4.7). Lowers to
+        // then/else/cont basic blocks with a PHI, like a lazy Select.
+        SelectLazy,
         // Concatenation {a, b, ...} (payload: extra -> index slice).
         Concat,
         // Replication {count{value}} (payload: repl).
@@ -522,7 +545,7 @@ struct Inst {
             // Replication count.
             uint32_t count;
         } repl;
-        // Primary operand plus a handle to an extra struct (mux, part_select, cond).
+        // Primary operand plus a handle to an extra struct (select, part_select, cond).
         struct {
             // Condition / base operand.
             Index op;
