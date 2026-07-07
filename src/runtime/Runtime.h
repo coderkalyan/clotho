@@ -130,15 +130,17 @@ int32_t rt_rewind(int32_t fd);
 // `width`/8 characters, stopping after a newline or at EOF. The characters are
 // stored right-justified (byte 0 = last character), the high bytes and the z
 // plane are cleared. -> the character count, or 0 on EOF / error. `width` must be
-// a multiple of 8.
-int32_t rt_fgets(uint8_t* mm, uint8_t* z, uint32_t width, int32_t fd);
+// a multiple of 8. `flags` bit0: `mm` is a narrow 2-state slot holding the bare
+// iW value — only `width` bits are written and `z` is null.
+int32_t rt_fgets(uint8_t* mm, uint8_t* z, uint32_t width, int32_t fd, uint32_t flags);
 
 // $sformat / $swrite (LRM §21.3.3): format `fmt` with `argc` descriptors (as
 // rt_fwrite) and store the result into the destination string variable, whose
 // must|may plane is at `mm` (2*`width` bits) and z plane at `z` (`width` bits).
 // Stored right-justified; an oversized result keeps its low bytes. `width` must be
-// a multiple of 8.
-void rt_sformat(uint8_t* mm, uint8_t* z, uint32_t width, const char* fmt, uint32_t argc, const rt_arg* argv);
+// a multiple of 8. `flags` as rt_fgets.
+void rt_sformat(uint8_t* mm, uint8_t* z, uint32_t width, const char* fmt, uint32_t argc, const rt_arg* argv,
+                uint32_t flags);
 
 // $sformatf / $sformat into a string-object destination: format as rt_fwrite
 // and assign the result to the rt_string at `dst` (declared below).
@@ -147,16 +149,20 @@ void rt_sformat_str(struct rt_string* dst, const char* fmt, uint32_t argc, const
 
 // $ferror(fd, str) (LRM §21.3.6): write the descriptor's most recent error message
 // into the string variable at `mm` / `z` (`width` bits) and return its error code
-// (0 when the stream is clear).
-int32_t rt_ferror(int32_t fd, uint8_t* mm, uint8_t* z, uint32_t width);
+// (0 when the stream is clear). `flags` as rt_fgets.
+int32_t rt_ferror(int32_t fd, uint8_t* mm, uint8_t* z, uint32_t width, uint32_t flags);
 
 // One output destination of a $fscanf / $sscanf conversion: the must|may plane
 // pointer (2*`width` bits), the z plane pointer (`width` bits), and the width. The
 // conversion char in the format decides how the parsed value is stored here.
+// `flags` bit0: `mm` is a narrow 2-state slot holding the bare iW value — only
+// `width` bits are written (x/z parsed digits drop to 0 per LRM 6.3.1) and `z`
+// is null.
 typedef struct rt_scan_arg {
     uint8_t* mm;
     uint8_t* z;
     uint32_t width;
+    uint32_t flags;
 } rt_scan_arg;
 
 // $fscanf(fd, fmt, args) (LRM §21.3.4): parse the descriptor's input per `fmt`,
@@ -174,7 +180,9 @@ int32_t rt_sscanf(const char* buf, uint32_t len, const char* fmt, uint32_t argc,
 // geometry matches $readmem: element i's planes are at `mm_base` / `z_base` +
 // i*`stride`, `width` bits each, over `count` elements with declared bounds
 // `decl_left` / `decl_right`. `start` / `max_count` (valid per `flags` bit0 / bit1)
-// bound the address range. Returns the number of bytes read. `width` must be <= 64.
+// bound the address range; `flags` bit2 marks a narrow 2-state destination (bare
+// iW elements, null `z_base`). Returns the number of bytes read. `width` must be
+// <= 64.
 int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint32_t stride, uint32_t count,
                  uint32_t width, uint32_t four_state, int64_t decl_left, int64_t decl_right, int64_t start,
                  int64_t max_count, uint32_t flags);

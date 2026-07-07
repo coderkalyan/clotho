@@ -4061,11 +4061,11 @@ private:
         set_value(i, packed(r, r, zero(32)));
     }
 
-    // i32 rt_fgets(i8* mm, i8* z, i32 width, i32 fd)
+    // i32 rt_fgets(i8* mm, i8* z, i32 width, i32 fd, i32 flags)
     llvm::FunctionCallee fgets_fn() {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
-        auto* fnty = llvm::FunctionType::get(i32, { ptr, ptr, i32, i32 }, false);
+        auto* fnty = llvm::FunctionType::get(i32, { ptr, ptr, i32, i32, i32 }, false);
         return llmod_.getOrInsertFunction("rt_fgets", fnty);
     }
 
@@ -4076,17 +4076,18 @@ private:
     void lower_fgets(Index i) {
         const Index dst  = ir_->payload(i).op_extra.op;
         const auto  info = ir_->extra_data<FgetsInfo>(ir_->payload(i).op_extra.extra);
-        const auto [mm, z, width] = string_dest(dst, "$fgets");
-        llvm::Value* fd           = cast(must_of(value_of(info.fd)), 32, true);
-        llvm::Value* r            = b_.CreateCall(fgets_fn(), { mm, z, b_.getInt32(width), fd });
+        const auto [mm, z, width, flags] = string_dest(dst, "$fgets");
+        llvm::Value* fd                  = cast(must_of(value_of(info.fd)), 32, true);
+        llvm::Value* r = b_.CreateCall(fgets_fn(), { mm, z, b_.getInt32(width), fd, b_.getInt32(flags) });
         set_value(i, packed(r, r, zero(32)));
     }
 
     // Resolve a whole packed-vector lvalue to (must|may plane ptr, z plane ptr, bit
-    // width) for a string write-back ($fgets / $sformat / $ferror). Part-select and
-    // non-byte-multiple targets loud-fail: the runtime fills a whole byte-aligned
-    // vector. `who` names the caller.
-    std::tuple<llvm::Value*, llvm::Value*, uint32_t> string_dest(Index dst, const char* who) {
+    // width, runtime flags) for a string write-back ($fgets / $sformat / $ferror).
+    // Flags bit0 marks a narrow 2-state slot, so the runtime writes only the iW
+    // value word. Part-select and non-byte-multiple targets loud-fail: the runtime
+    // fills a whole byte-aligned vector. `who` names the caller.
+    std::tuple<llvm::Value*, llvm::Value*, uint32_t, uint32_t> string_dest(Index dst, const char* who) {
         const LValue& lv = lvalue_of(dst);
         if (lv.is_string) {
             // TODO: file write-back into a dynamic string object (rt_string).
@@ -4107,14 +4108,14 @@ private:
         llvm::Value* mm = lv_mm_ptr(lv);
         llvm::Value* z =
           lv.has_z ? lv_z_ptr(lv) : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
-        return { mm, z, lv.store_width };
+        return { mm, z, lv.store_width, lv.narrow ? 1u : 0u };
     }
 
-    // void rt_sformat(i8* mm, i8* z, i32 width, const char* fmt, i32 argc, const rt_arg* argv)
+    // void rt_sformat(i8* mm, i8* z, i32 width, const char* fmt, i32 argc, const rt_arg* argv, i32 flags)
     llvm::FunctionCallee sformat_fn() {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, i32, ptr, i32, ptr }, false);
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, i32, ptr, i32, ptr, i32 }, false);
         return llmod_.getOrInsertFunction("rt_sformat", fnty);
     }
 
@@ -4141,8 +4142,8 @@ private:
             b_.CreateCall(sformat_str_fn(), { lv_string_ptr(lv), fmt_ptr, argc, arr });
             return;
         }
-        const auto [mm, z, width] = string_dest(info.dst, "$sformat / $swrite");
-        b_.CreateCall(sformat_fn(), { mm, z, b_.getInt32(width), fmt_ptr, argc, arr });
+        const auto [mm, z, width, flags] = string_dest(info.dst, "$sformat / $swrite");
+        b_.CreateCall(sformat_fn(), { mm, z, b_.getInt32(width), fmt_ptr, argc, arr, b_.getInt32(flags) });
     }
 
     // Lower a $sformatf: format into the instruction's string temp.
@@ -4157,11 +4158,11 @@ private:
                         b_.getInt32(static_cast<uint32_t>(args.size())), arr });
     }
 
-    // i32 rt_ferror(i32 fd, i8* mm, i8* z, i32 width)
+    // i32 rt_ferror(i32 fd, i8* mm, i8* z, i32 width, i32 flags)
     llvm::FunctionCallee ferror_fn() {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
-        auto* fnty = llvm::FunctionType::get(i32, { i32, ptr, ptr, i32 }, false);
+        auto* fnty = llvm::FunctionType::get(i32, { i32, ptr, ptr, i32, i32 }, false);
         return llmod_.getOrInsertFunction("rt_ferror", fnty);
     }
 
@@ -4170,16 +4171,16 @@ private:
     void lower_ferror(Index i) {
         const Index dst  = ir_->payload(i).op_extra.op;
         const auto  info = ir_->extra_data<FerrorInfo>(ir_->payload(i).op_extra.extra);
-        const auto [mm, z, width] = string_dest(dst, "$ferror");
-        llvm::Value* fd           = cast(must_of(value_of(info.fd)), 32, true);
-        llvm::Value* r            = b_.CreateCall(ferror_fn(), { fd, mm, z, b_.getInt32(width) });
+        const auto [mm, z, width, flags] = string_dest(dst, "$ferror");
+        llvm::Value* fd                  = cast(must_of(value_of(info.fd)), 32, true);
+        llvm::Value* r = b_.CreateCall(ferror_fn(), { fd, mm, z, b_.getInt32(width), b_.getInt32(flags) });
         set_value(i, packed(r, r, zero(32)));
     }
 
-    // { ptr mm, ptr z, i32 width } — mirrors rt_scan_arg in runtime/Runtime.h.
+    // { ptr mm, ptr z, i32 width, i32 flags } — mirrors rt_scan_arg in runtime/Runtime.h.
     llvm::StructType* scan_arg_struct_ty() {
         auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llvm::StructType::get(ctx_, { ptr, ptr, b_.getInt32Ty() });
+        return llvm::StructType::get(ctx_, { ptr, ptr, b_.getInt32Ty(), b_.getInt32Ty() });
     }
 
     // i32 rt_fscanf(i32 fd, const char* fmt, i32 argc, const rt_scan_arg* args)
@@ -4229,7 +4230,9 @@ private:
                     throw BackendError{ "$fscanf / $sscanf into a target wider than 64 bits is not "
                                         "supported" };
                 }
-                // A never-z target (z elision) passes a null z pointer.
+                // A never-z target (z elision) passes a null z pointer. Flags bit0
+                // marks a narrow 2-state slot: the runtime writes only the iW value
+                // word (parsed x/z digits drop to 0 per LRM 6.3.1).
                 llvm::Value* mm  = lv_mm_ptr(lv);
                 llvm::Value* z   = lv.has_z ? lv_z_ptr(lv)
                                             : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
@@ -4237,6 +4240,7 @@ private:
                 b_.CreateStore(mm, b_.CreateStructGEP(sty, elt, 0));
                 b_.CreateStore(z, b_.CreateStructGEP(sty, elt, 1));
                 b_.CreateStore(b_.getInt32(lv.store_width), b_.CreateStructGEP(sty, elt, 2));
+                b_.CreateStore(b_.getInt32(lv.narrow ? 1u : 0u), b_.CreateStructGEP(sty, elt, 3));
             }
         }
 
@@ -4298,17 +4302,19 @@ private:
         if (lv.store_width > 64) {
             throw BackendError{ "$fread into a target wider than 64 bits is not supported" };
         }
-        // A never-z target (z elision) passes a null z pointer.
+        // A never-z target (z elision) passes a null z pointer; a narrow 2-state
+        // slot sets flags bit2 so the runtime writes only the iW value word.
         llvm::Value* mm = lv_mm_ptr(lv);
         llvm::Value* z =
           lv.has_z ? lv_z_ptr(lv) : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
         llvm::Value* fd = cast(must_of(value_of(info.fd)), 32, true);
 
-        const uint32_t four = type_of(dst).four_state ? 1u : 0u;
-        llvm::Value*   r    = b_.CreateCall(fread_fn(),
-                                            { fd, mm, z, b_.getInt32(0), b_.getInt32(1), b_.getInt32(lv.store_width),
-                                              b_.getInt32(four), b_.getInt64(0), b_.getInt64(0), b_.getInt64(0),
-                                              b_.getInt64(0), b_.getInt32(0) });
+        const uint32_t four  = type_of(dst).four_state ? 1u : 0u;
+        const uint32_t flags = lv.narrow ? 4u : 0u;
+        llvm::Value*   r     = b_.CreateCall(fread_fn(),
+                                             { fd, mm, z, b_.getInt32(0), b_.getInt32(1), b_.getInt32(lv.store_width),
+                                               b_.getInt32(four), b_.getInt64(0), b_.getInt64(0), b_.getInt64(0),
+                                               b_.getInt64(0), b_.getInt32(flags) });
         set_value(i, packed(r, r, zero(32)));
     }
 
