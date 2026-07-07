@@ -232,6 +232,62 @@ void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8
                 uint32_t count, uint32_t width, int64_t decl_left, int64_t decl_right, int64_t start,
                 int64_t finish, uint32_t flags);
 
+// -- Value-change dump (VCD, LRM 1800-2023 §21.7; design in docs/VCD.md) --
+//
+// One dumped signal (or scope delimiter) in the compile-time descriptor table the
+// backend emits as a constant array. Plane locations are byte offsets into the
+// design state buffer, so the table is position-independent: the runtime forms a
+// live pointer as `state + off`. Names index a separate concatenated string table.
+typedef struct rt_vcd_var {
+    // 0 = scope enter (name is the instance name), 1 = variable, 2 = scope exit.
+    uint32_t kind;
+    // Byte offset / length of the name in the string table.
+    uint32_t name_off;
+    uint32_t name_len;
+    // Variable bit width (1..64 in phase 0; wider is rejected at the backend).
+    uint32_t width;
+    // Bit 0: four-state (has an x/z domain). Bit 1: a net (`wire`) vs a var (`reg`).
+    uint32_t flags;
+    // Byte offset of the packed must|may plane (field 0 of the state slot).
+    uint32_t mm_off;
+    // Byte offset of the z plane, or RT_VCD_NO_Z when the slot stores no z word.
+    uint32_t z_off;
+} rt_vcd_var;
+
+// z_off sentinel: the signal is never-z (z-elided) and reads a constant-zero z.
+#define RT_VCD_NO_Z 0xffffffffu
+
+// $dumpfile: record the output path (a right-justified packed-ASCII vector the
+// backend spills, like $readmem). The file is opened lazily at rt_vcd_start.
+void rt_vcd_open(const char* path_buf, uint32_t path_len);
+
+// $dumpvars (whole-design form): begin dumping. `state` is the design state base;
+// `wheel` the design wheel (cached for the final flush at close); `vars`/`nvars`
+// the descriptor table; `strtab` the name string table; `tick_fs`/`units` the
+// timescale. Allocates all engine storage once (no further allocation during the
+// run), opens the file, writes the VCD header, and arms the initial full dump.
+void rt_vcd_start(uint8_t* state, void* wheel, const rt_vcd_var* vars, uint32_t nvars, const char* strtab,
+                  uint64_t tick_fs, int32_t units);
+
+// Postponed-region sample at a settled instant, called from the sim loop before
+// the wheel advances (`tick` is rt_wheel_now). Emits changed variables under one
+// `#tick` marker; a no-change instant emits nothing. A no-op when dumping is not
+// active. Also services a pending $dumpoff / $dumpall / $dumpon at this instant.
+void rt_vcd_flush(uint64_t tick);
+
+// $dumpoff / $dumpon / $dumpall / $dumpflush (LRM §21.7.4-7). off/on/all only set
+// a deferred flag serviced by the next rt_vcd_flush, so rt_vcd_flush stays the
+// sole writer and the change lands at the correct instant; dumpflush drains the
+// output buffer to disk immediately.
+void rt_vcd_off(void);
+void rt_vcd_on(void);
+void rt_vcd_all(void);
+void rt_vcd_dumpflush(void);
+
+// Final flush of the in-progress instant + output buffer, then close the file.
+// Called on normal simulation end and on the $finish longjmp path.
+void rt_vcd_close(void);
+
 int32_t rt_random(void);
 
 // -- Plusargs (LRM §21.6) --
