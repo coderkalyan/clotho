@@ -1130,9 +1130,13 @@ private:
                           sym.procedureKind == ProceduralBlockKind::AlwaysLatch;
         bool infer = comb;
 
-        // A top-level event control is the process's sensitivity: collect its wait
-        // events here and lower the statement underneath.
-        if (body->kind == StatementKind::Timed) {
+        // A top-level event control on an `always` is the process's sensitivity
+        // list: collect its wait events here and lower the statement underneath.
+        // On an `initial` the same syntax is a one-shot blocking wait (LRM 9.4):
+        // hoisting it as sensitivity would run the statement unblocked at time
+        // zero, so it is left in the body and lowers to a Wait through
+        // lower_stmt's Timed case, exactly like a begin/end-wrapped body.
+        if (activation == ir::Activation::Always && body->kind == StatementKind::Timed) {
             const TimedStatement& timed = body->as<TimedStatement>();
             if (timed.timing.kind == TimingControlKind::ImplicitEvent) {
                 infer = true;

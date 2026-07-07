@@ -5206,7 +5206,9 @@ private:
                       b_.CreateSelect(unknown, zero(w), z));
     }
 
-    // -- Comparisons -> 1-bit; X/Z in either operand yields X. --
+    // -- Comparisons -> 1-bit. X rules differ per operator class (see
+    // lower_compare): ==/!= are X only when genuinely ambiguous (LRM 11.4.5),
+    // ordered relationals are X whenever either operand has any x/z (11.4.4). --
 
     // Build a 1-bit 4-state result split on `unknown`: the cold block takes the
     // X-case word from `cold_mm()`, the hot block computes a known i1 from
@@ -5245,22 +5247,43 @@ private:
         a = to_four(a);
         b = to_four(b);
 
-        // Equality keeps the branchless X-mask (and a width-1 LUT): == / != are
-        // cheap and fold the X mask straight into the result.
+        // Equality keeps a branchless mask form (and a width-1 LUT). LRM 11.4.5:
+        // the result is X only if unknown bits make the relation AMBIGUOUS. A bit
+        // position where both operands are known and differ decides it outright
+        // (== is 0, != is 1) no matter what the x/z bits are; only "no definite
+        // difference but some x/z bit" yields X. Unknown bits are exactly
+        // must != may (z included), so with 2-state operands `unk` is the zero
+        // constant and everything below folds to a single native icmp.
         if (tag == Inst::Tag::Eq || tag == Inst::Tag::Ne) {
             if (width_of(a) == 1) {
+                // One bit position: any x/z operand bit is ambiguous, which is
+                // exactly the LUT's "either X -> X" rule.
                 return single_bit_lut(tag == Inst::Tag::Eq ? EQ1_LUT : NE1_LUT, a, b);
             }
-            const auto pred =
-              tag == Inst::Tag::Eq ? llvm::CmpInst::ICMP_EQ : llvm::CmpInst::ICMP_NE;
-            llvm::Value* cmp     = b_.CreateICmp(pred, must_of(a), must_of(b));
-            llvm::Value* unknown = b_.CreateOr(any_unknown(a), any_unknown(b));
-            return bit_plane(b_.CreateAnd(b_.CreateNot(unknown), cmp), b_.CreateOr(unknown, cmp));
+            const uint32_t w    = width_of(a);
+            llvm::Value*   am   = must_of(a);
+            llvm::Value*   bm   = must_of(b);
+            llvm::Value*   unk  = b_.CreateOr(b_.CreateXor(am, may_of(a)), b_.CreateXor(bm, may_of(b)));
+            llvm::Value*   diff = b_.CreateICmpNE(b_.CreateAnd(b_.CreateXor(am, bm), b_.CreateNot(unk)), zero(w));
+            llvm::Value*   ambiguous = b_.CreateAnd(b_.CreateNot(diff), b_.CreateICmpNE(unk, zero(w)));
+            // diff -> definite 0/1; else ambiguous -> X; else all bits known
+            // equal -> definite 1/0.
+            if (tag == Inst::Tag::Eq) {
+                llvm::Value* eq = b_.CreateNot(diff);
+                return bit_plane(b_.CreateAnd(eq, b_.CreateNot(ambiguous)), eq);
+            }
+            return bit_plane(diff, b_.CreateOr(diff, ambiguous));
         }
 
         // Ordered relationals: any x/z yields X, exactly like arithmetic, so guard
         // on it. The hot block is one native compare on the data (must) bits; the
         // cold block is the all-X word (must 0, may 1).
+        //
+        // NOTE: Unlike ==/!=, this pessimism is normative, not a shortcut. LRM
+        // 11.4.4: "If either operand of a relational operator contains an
+        // unknown (x) or high-impedance (z) value, then the result shall be
+        // 1'bx" — even when known high bits alone would decide the relation
+        // (iverilog agrees). Do not "sharpen" this path.
         llvm::CmpInst::Predicate pred;
         switch (tag) {
             case Inst::Tag::Lt:
@@ -5322,11 +5345,12 @@ private:
     }
 
     // Wildcard equality `==?`. LRM 1800-2023 §11.4.6: x/z in the RIGHT operand are
-    // wildcards (that bit position is not compared); on the remaining positions it
-    // is an ordinary X-propagating `==`, so a left-operand x/z there yields X.
-    // Masking both operands to the kept (non-wildcard) bits and running `==` gives
-    // exactly that: the right is known on kept bits so it never injects X, while a
-    // left x/z on a kept bit trips the unknown path.
+    // wildcards (that bit position is not compared); the remaining positions are
+    // compared "as for the logical equality" operator, i.e. with 11.4.5's
+    // ambiguity rule. Masking both operands to the kept (non-wildcard) bits and
+    // running `==` gives exactly that: the right is known on kept bits so only a
+    // left x/z can make a kept position unknown, and a definite mismatch on any
+    // kept position still decides the result.
     Plane lower_wildeq(Plane a, Plane b) {
         const uint32_t w     = std::max(width_of(a), width_of(b));
         // Definite 4-state bit result; lift operands. 2-state operands have no
