@@ -11,6 +11,7 @@
 // reported in `diagnostics` rather than crashing.
 
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -29,9 +30,14 @@ struct LowerResult {
     bool ok = false;
 };
 
-// Lower a SystemVerilog source file at `path`. If `timings` is non-null, the
+// Lower one SystemVerilog source file at `path`. If `timings` is non-null, the
 // front-end and analysis phase durations are accumulated into it.
 LowerResult lower_file(std::string_view path, Timings* timings = nullptr);
+
+// Lower several source files compiled together into one design (LRM 3.12: all
+// files share one compilation unit / global name space). Paths are parsed in
+// order and added to a single Compilation before elaboration.
+LowerResult lower_files(std::span<const std::string_view> paths, Timings* timings = nullptr);
 
 // Lower a SystemVerilog source fragment held in memory. If `timings` is non-null,
 // the front-end and analysis phase durations are accumulated into it.

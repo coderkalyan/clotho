@@ -50,6 +50,7 @@
 #include <slang/diagnostics/TextDiagnosticClient.h>
 #include <slang/numeric/Time.h>
 #include <slang/syntax/SyntaxTree.h>
+#include <slang/text/SourceManager.h>
 
 #include "SourceMap.h"
 #include "ir/Builder.h"
@@ -4274,23 +4275,33 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
 
 } // namespace
 
-LowerResult lower_file(std::string_view path, Timings* timings) {
+LowerResult lower_files(std::span<const std::string_view> paths, Timings* timings) {
     const auto t_parse = std::chrono::steady_clock::now();
-    auto       tree    = slang::syntax::SyntaxTree::fromFile(path);
-    if (!tree) {
-        LowerResult result;
-        result.diagnostics =
-          "error: cannot read '" + std::string(path) + "': " + std::string(tree.error().second) + "\n";
-        return result;
-    }
 
+    // One SourceManager shared across every tree so the Compilation's
+    // diagnostics resolve file/line locations for all files. It
+    // outlives every tree and the compilation use below.
+    slang::SourceManager    sm;
     slang::ast::Compilation comp;
-    comp.addSyntaxTree(*tree);
+    for (const std::string_view path : paths) {
+        auto tree = slang::syntax::SyntaxTree::fromFile(path, sm);
+        if (!tree) {
+            LowerResult result;
+            result.diagnostics = "error: cannot read '" + std::string(path) +
+                                 "': " + std::string(tree.error().second) + "\n";
+            return result;
+        }
+        comp.addSyntaxTree(*tree);
+    }
     if (timings != nullptr) {
         timings->frontend_ms += ms_since(t_parse);
     }
 
     return lower_compilation(comp, timings);
+}
+
+LowerResult lower_file(std::string_view path, Timings* timings) {
+    return lower_files({&path, 1}, timings);
 }
 
 LowerResult lower_text(std::string_view source, Timings* timings) {

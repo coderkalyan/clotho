@@ -1,5 +1,9 @@
 #include <doctest/doctest.h>
 
+#include <array>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <set>
 #include <string_view>
 
@@ -414,6 +418,50 @@ TEST_CASE("instantiation flattens the child under a hierarchical prefix") {
     CHECK(signal_names(m) == std::set<std::string>{ "g", "o", "w", "u_inv.a", "u_inv.y" });
     // top assign (o=w) + child assign (y=~a) + 2 port-copy processes (.a in, .y out).
     CHECK(m.processes().size() == 4);
+}
+
+// Writes `text` to a fresh temp file and returns its path; the file is removed
+// by RAII on scope exit.
+struct TempSource {
+    std::filesystem::path path;
+    explicit TempSource(std::string_view name, std::string_view text)
+      : path(std::filesystem::temp_directory_path() / name) {
+        std::ofstream(path) << text;
+    }
+    ~TempSource() {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+};
+
+TEST_CASE("lower_files compiles a design split across two files into one design") {
+    // The child module lives in one file, the top that instantiates it in
+    // another: cross-file name resolution requires both trees in one Compilation.
+    TempSource child("clotho_mf_inv.sv", R"(
+        module inv(input a, output y);
+            assign y = ~a;
+        endmodule
+    )");
+    TempSource top("clotho_mf_top.sv", R"(
+        module top(input g, output o);
+            wire w;
+            inv u_inv(.a(g), .y(w));
+            assign o = w;
+        endmodule
+    )");
+
+    const std::array<std::string_view, 2> paths{ top.path.native(), child.path.native() };
+    const LowerResult                     r = lower_files(paths);
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    CHECK(r.module->name == "top");
+    CHECK(signal_names(*r.module) == std::set<std::string>{ "g", "o", "w", "u_inv.a", "u_inv.y" });
+}
+
+TEST_CASE("lower_files reports a missing file loudly") {
+    const std::array<std::string_view, 1> paths{ "/no/such/clotho/file.sv" };
+    const LowerResult                     r = lower_files(paths);
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("cannot read") != std::string::npos);
 }
 
 TEST_CASE("an input port connection copies into the child with the expression's sensitivity") {

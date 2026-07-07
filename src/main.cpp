@@ -1,6 +1,7 @@
 #include <iostream>
 #include <print>
 #include <string_view>
+#include <vector>
 
 #include <llvm/Support/raw_ostream.h>
 
@@ -13,16 +14,18 @@
 // then JIT-compile and run it (default), or emit the process IR / LLVM IR for
 // debugging. All compiler logic lives in libclotho / libclotho_ir.
 //
-// Usage: clotho [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [-o <out>] <file.sv>
+// Usage: clotho [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [-o <out>] <file.sv>...
+// Multiple source files are compiled together into one design (shared name
+// space, LRM 3.12), parsed in the order given.
 // `llvm` emits the backend's raw IR before the coroutine-lowering pipeline runs
 // (coro intrinsics intact) — for manual review; `opt` emits it after the passes.
 // `--no-z-elision` keeps every signal slot's z word (bisection / debug).
 int main(int argc, char** argv) {
-    std::string_view            emit = "run";
-    std::string_view            out;
-    std::string_view            input;
-    bool                        time = false;
-    clotho::ir::SimulationConfig config;
+    std::string_view              emit = "run";
+    std::string_view              out;
+    std::vector<std::string_view> inputs;
+    bool                          time = false;
+    clotho::ir::SimulationConfig  config;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
@@ -35,15 +38,16 @@ int main(int argc, char** argv) {
         } else if (arg == "-o" && i + 1 < argc) {
             out = argv[++i];
         } else if (!arg.starts_with("-")) {
-            input = arg;
+            inputs.push_back(arg);
         } else {
             std::println(stderr, "unknown option: {}", arg);
             return 2;
         }
     }
 
-    if (input.empty() || (emit != "run" && emit != "ir" && emit != "llvm" && emit != "opt")) {
-        std::println(stderr, "usage: {} [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [-o <out>] <file.sv>",
+    if (inputs.empty() || (emit != "run" && emit != "ir" && emit != "llvm" && emit != "opt")) {
+        std::println(stderr,
+                     "usage: {} [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [-o <out>] <file.sv>...",
                      argv[0]);
         return 2;
     }
@@ -69,7 +73,7 @@ int main(int argc, char** argv) {
         std::println(stderr, "  {:<16}{:>12.3f}", "total", total);
     };
 
-    const clotho::LowerResult result = clotho::lower_file(input, tp);
+    const clotho::LowerResult result = clotho::lower_files(inputs, tp);
     if (!result.diagnostics.empty()) {
         std::print(stderr, "{}", result.diagnostics);
     }
