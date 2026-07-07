@@ -2359,7 +2359,6 @@ struct VcdVar {
     uint32_t       nwords      = 0;   // words per plane
     bool           four_state  = false;
     bool           narrow      = false;   // 2-state `{ iW }` slot: mm is a bare iW value word
-    bool           always_scan = false;   // array element: scanned every instant (not touched)
     bool           seen        = false;   // shadow valid (a value has been dumped)
     // Shadow of the last dumped planes: 3*nwords words laid out must | may | z.
     std::vector<uint64_t> shadow;
@@ -2388,9 +2387,11 @@ struct VcdEngine {
     std::vector<uint8_t>  recbuf;    // producer -> sink record byte stream for pending instants
     std::vector<uint64_t> scratch;   // scan buffer: 3*max_nwords words (must | may | z)
     // Activity-driven dirty set: `epoch[i]` is set by rt_vcd_touch when var i is
-    // written this instant. The flush scans epoch (and each var's always_scan flag)
-    // in index order, so no per-instant sort or dirty list is needed.
+    // written this instant. `always` marks array elements (scanned every instant,
+    // not touched). Both are dense byte arrays parallel to `vars`, so the flush's
+    // per-instant index scan touches only these two, not the fat VcdVar struct.
     std::vector<uint8_t> epoch;
+    std::vector<uint8_t> always;
     uint32_t max_nwords = 1;    // widest variable, in words (sizes scratch / buffers)
     uint32_t next_id    = 0;    // next VCD identifier index (assigned per registration)
     bool started        = false;   // header finished ($enddefinitions written)
@@ -2837,8 +2838,8 @@ extern "C" void rt_vcd_upscope(void) {
 // dirty set.
 static void vcd_register(std::string_view ref, uint32_t width, uint32_t flags, const uint8_t* mm, const uint8_t* z,
                          bool always_scan) {
+    g_vcd.always.push_back(static_cast<uint8_t>(always_scan ? 1 : 0));
     VcdVar v;
-    v.always_scan = always_scan;
     v.mm         = mm;
     v.z          = z;
     v.width      = width;
@@ -2980,10 +2981,14 @@ extern "C" void rt_vcd_flush(uint64_t tick) {
             any |= vcd_scan_var(i, true);
         }
     } else {
+        // Hot loop over two dense byte arrays only (no fat-struct access): scan a
+        // var iff it was touched this instant or is an always-scan array element.
+        const uint8_t* ep = g_vcd.epoch.data();
+        const uint8_t* al = g_vcd.always.data();
         for (uint32_t i = 0; i < nvars; ++i) {
-            const bool touched = g_vcd.epoch[i] != 0;
-            g_vcd.epoch[i]     = 0;
-            if (touched || g_vcd.vars[i].always_scan) {
+            const uint8_t s = ep[i];
+            g_vcd.epoch[i]  = 0;
+            if ((s | al[i]) != 0) {
                 any |= vcd_scan_var(i, false);
             }
         }
