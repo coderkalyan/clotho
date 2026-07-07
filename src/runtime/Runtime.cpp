@@ -1,6 +1,7 @@
 #include "Runtime.h"
 
 #include <array>
+#include <bit>
 #include <cerrno>
 #include <csetjmp>
 #include <cstddef>
@@ -8,7 +9,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
-#include <random>
 #include <string>
 #include <vector>
 
@@ -1461,15 +1461,45 @@ extern "C" int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint3
     return bytes_read;
 }
 
+// The `$random` generator, implementing the algorithm IEEE Std 1800-2023 Annex N
+// defines. `$random` is rtl_dist_uniform(seed, INT32_MIN, INT32_MAX): a 32-bit
+// LCG (seed = 69069*seed + 1) whose high bits build an IEEE single in [1, 2),
+// scaled to a full-range signed 32-bit result. Only the low 32 bits of the LCG
+// state feed the float trick and they evolve independently of any higher bits,
+// so a plain uint32_t state reproduces the Annex's stream exactly.
+//
+// The float/double steps follow the Annex's arithmetic step for step: each one
+// rounds, and algebraically folding them diverges from the defined stream, so
+// they must not be reassociated (no fast-math).
+namespace {
+
+uint32_t g_random_seed = 0;
+
+// One draw of the Annex N `uniform(seed, INT32_MIN, INT32_MAX)`: a real in
+// [-2^31, 2^31).
+double rng_uniform(uint32_t& seed) {
+    constexpr double d = 0.00000011920928955078125; // 2^-23
+    constexpr double a = -2147483648.0;
+    constexpr double b = 2147483647.0;
+    if (seed == 0) {
+        seed = 259341593u;
+    }
+    seed = 69069u * seed + 1u;
+    const uint32_t stemp = (seed >> 9) | 0x3f800000u;
+    double         c     = static_cast<double>(std::bit_cast<float>(stemp));
+    c                    = c + c * d;
+    return (b - a) * (c - 1.0) + a;
+}
+
+} // namespace
+
 extern "C" int32_t rt_random(void) {
-    // $random's global stream. The seed is a fixed constant so runs reproduce
-    // bit-for-bit; the LRM leaves the stream's contents implementation-defined,
-    // requiring only stability for a given seed. 0x1979 is an arbitrary nonzero
-    // constant. The generator is process-global (one simulator per process).
-    static std::mt19937 gen{ 0x1979u };
-    // A full-range int32 draw: reinterpret the 32-bit unsigned output as signed
-    // so negative values occur, matching $random's signed return type.
-    return static_cast<int32_t>(gen());
+    // rtl_dist_uniform's INT32_MIN/INT32_MAX branch: renormalize the uniform
+    // draw across the full 32-bit span, then floor toward negative infinity.
+    double r = (rng_uniform(g_random_seed) + 2147483648.0) / 4294967295.0;
+    r        = r * 4294967296.0 - 2147483648.0;
+    const long i = r >= 0 ? static_cast<long>(r) : static_cast<long>(r - 1);
+    return static_cast<int32_t>(i);
 }
 
 extern "C" void rt_string_init(rt_string* s) {

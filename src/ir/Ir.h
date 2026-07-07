@@ -747,7 +747,7 @@ struct Inst {
         // unitless or the module owns the smallest unit. $stime truncates the
         // result to 32 bits via a Resize.
         SimTime,
-        // $random: V2005 signed-32 PRNG, -> 32-bit signed two-state (payload:
+        // $random: IEEE Annex N reference PRNG, -> 32-bit signed two-state (payload:
         // none). Lowers to an `rt_random` call; the value is always known (no
         // x/z). The seeded form `$random(seed)` is rejected by the frontend, so
         // this tag never carries a seed operand.

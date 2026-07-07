@@ -2298,10 +2298,10 @@ private:
             // TODO: the seeded form `$random(seed)` (LRM §20.15.1) threads PRNG
             // state through an inout `seed` integer — it must read the seed
             // lvalue, advance a per-seed stream, and write the updated state
-            // back. The V2005 reference stream does not map cleanly onto
-            // mt19937's 624-word state, and the IR has no inout-arg writeback
-            // path yet, so the seeded form is rejected rather than silently
-            // ignoring the seed.
+            // back. The reference PRNG (rt_random) already carries its whole
+            // state in one 32-bit word, so the stream maps cleanly; the blocker
+            // is only the IR's missing inout-arg writeback path, so the seeded
+            // form is rejected rather than silently ignoring the seed.
             if (!call.arguments().empty()) {
                 fail("$random with a seed argument is not supported");
             }

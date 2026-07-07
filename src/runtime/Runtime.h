@@ -215,15 +215,6 @@ void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8
                 uint32_t count, uint32_t width, int64_t decl_left, int64_t decl_right, int64_t start,
                 int64_t finish, uint32_t flags);
 
-// -- $random --
-//
-// $random (LRM 1800-2023 §20.15.1): return the next value of the simulator's
-// global random stream as a signed 32-bit integer. Clotho draws from a
-// file-scope std::mt19937 seeded with a fixed constant, so a run is fully
-// reproducible (re-running the same design yields the same stream). The
-// generator is process-global, matching the single-simulator-per-process model.
-// TODO: the seeded form $random(seed) threads per-seed PRNG state through an
-// inout argument; it is rejected at the frontend and has no runtime entry yet.
 int32_t rt_random(void);
 
 // -- Deferred nonblocking writes to unpacked-array elements --
