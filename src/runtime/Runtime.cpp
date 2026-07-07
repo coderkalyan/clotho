@@ -2880,6 +2880,19 @@ extern "C" void rt_vcd_touch(uint32_t idx) {
     }
 }
 
+extern "C" void rt_vcd_touch_range(uint32_t base, uint32_t count) {
+    if (!g_vcd.active) {
+        return;
+    }
+    uint32_t end = base + count;
+    if (end > g_vcd.epoch.size()) {
+        end = static_cast<uint32_t>(g_vcd.epoch.size());
+    }
+    for (uint32_t i = base; i < end; ++i) {
+        g_vcd.epoch[i] = 1;
+    }
+}
+
 extern "C" void rt_vcd_array(const char* name, uint32_t name_len, uint32_t count, uint32_t width, uint32_t flags,
                              const uint8_t* mm_base, const uint8_t* z_base, uint32_t stride, int64_t left,
                              int64_t right) {
@@ -2894,7 +2907,9 @@ extern "C" void rt_vcd_array(const char* name, uint32_t name_len, uint32_t count
         const std::string ref  = std::string(leaf) + "[" + std::to_string(addr) + "]";
         const uint8_t*    mm   = mm_base + static_cast<size_t>(k) * stride;
         const uint8_t*    z    = z_base != nullptr ? z_base + static_cast<size_t>(k) * stride : nullptr;
-        vcd_register(ref, width, flags, mm, z, true);
+        // Array elements are touched on write (not always-scanned), so register
+        // them like scalars; the backend instruments blocking and NBA array writes.
+        vcd_register(ref, width, flags, mm, z, false);
     }
 }
 

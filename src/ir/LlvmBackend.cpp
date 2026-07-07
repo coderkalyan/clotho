@@ -4304,6 +4304,26 @@ private:
                 for (const Signal sig : array_nba_sigs_) {
                     emit_array_commit(sig, state);
                 }
+                // VCD: touch each dumped array that took an NBA write this instant,
+                // so the flush scans its elements only on write instants (not every
+                // instant). The runtime queue has no per-element index, so touch the
+                // whole element range; the flush diff still emits only what changed.
+                if (uses_vcd) {
+                    for (const Signal sig : array_nba_sigs_) {
+                        if (vcd_index_[static_cast<uint32_t>(sig)] < 0) {
+                            continue;
+                        }
+                        auto* fn     = b_.GetInsertBlock()->getParent();
+                        auto* svc    = llvm::BasicBlock::Create(ctx_, "vcd.arr.svc", fn);
+                        auto* nextbb = llvm::BasicBlock::Create(ctx_, "vcd.arr.next", fn);
+                        auto* dirty  = b_.CreateCall(nba_arr_dirty_fn(), { b_.getInt32(static_cast<uint32_t>(sig)) });
+                        b_.CreateCondBr(b_.CreateICmpNE(dirty, b_.getInt32(0)), svc, nextbb);
+                        b_.SetInsertPoint(svc);
+                        vcd_touch_array(sig);
+                        b_.CreateBr(nextbb);
+                        b_.SetInsertPoint(nextbb);
+                    }
+                }
                 b_.CreateCall(nba_arr_reset_fn(), {});
             }
             b_.CreateBr(check);
@@ -6933,6 +6953,9 @@ private:
             b_.CreateBr(cont);
             b_.SetInsertPoint(cont);
         }
+        if (!lowering_preinit_) {
+            vcd_touch_array(info.mem);   // bulk write: mark the array for the dump
+        }
         set_value(i, packed(r, r, zero(32)));
     }
 
@@ -7000,6 +7023,9 @@ private:
                       { path, path_len, mm_base, z_base, b_.getInt32(stride),
                         b_.getInt32(s.elem_count), b_.getInt32(s.width), b_.getInt64(at.left),
                         b_.getInt64(at.right), start, finish, b_.getInt32(flags) });
+        if (!lowering_preinit_) {
+            vcd_touch_array(info.target);   // bulk write: mark the array for the dump
+        }
         // TODO: $readmem services no wait queues — a process already waiting on
         // the memory sleeps through the load (pre-existing gap). rt_readmem would
         // need a did-write result (it returns void) to gate an Any-edge wake the
@@ -7118,22 +7144,58 @@ private:
             return;   // never registers (emit_vcd_var loud-fails on a string)
         }
         if (s.is_array) {
-            next += s.elem_count;   // array elements consume indices but are always-scanned
+            // Record the first element's dump-var index; element k is base + k. An
+            // element write touches base + normalized index (blocking) or the whole
+            // range (NBA), instead of being scanned every instant.
+            vcd_index_[static_cast<uint32_t>(sig)] = static_cast<int32_t>(next);
+            next += s.elem_count;
             return;
         }
         vcd_index_[static_cast<uint32_t>(sig)] = static_cast<int32_t>(next++);
     }
 
-    // Emit rt_vcd_touch for a blocking write to a dumped scalar signal, marking it
-    // in the dirty set. A no-op for a non-dumped signal, an array element (always
-    // scanned), or a PreInit store (before $dumpvars, subsumed by the initial dump).
+    llvm::FunctionCallee vcd_touch_range_fn() {
+        return rt_fn("rt_vcd_touch_range", b_.getVoidTy(), { b_.getInt32Ty(), b_.getInt32Ty() });
+    }
+
+    // Emit rt_vcd_touch for a blocking write to a dumped signal, marking it in the
+    // dirty set. A scalar touches its index; an array element touches base + its
+    // normalized element index (a whole-array store touches the range). A no-op for
+    // a non-dumped signal or a PreInit store (before $dumpvars, subsumed by the
+    // initial dump).
     void vcd_touch_lvalue(const LValue& lv) {
         if (!design_uses_vcd_ || lowering_preinit_ || !lv.is_signal) {
             return;
         }
-        const int32_t idx = vcd_index_[static_cast<uint32_t>(lv.sig)];
-        if (idx >= 0) {
-            b_.CreateCall(vcd_touch_fn(), { b_.getInt32(static_cast<uint32_t>(idx)) });
+        const int32_t base = vcd_index_[static_cast<uint32_t>(lv.sig)];
+        if (base < 0) {
+            return;
+        }
+        const SignalSlot& s = slot_of(lv.sig);
+        if (s.is_array) {
+            if (lv.elem_idx != nullptr) {
+                llvm::Value* idx = b_.CreateAdd(b_.getInt32(static_cast<uint32_t>(base)), lv.elem_idx);
+                b_.CreateCall(vcd_touch_fn(), { idx });
+            } else {
+                b_.CreateCall(vcd_touch_range_fn(),
+                              { b_.getInt32(static_cast<uint32_t>(base)), b_.getInt32(s.elem_count) });
+            }
+            return;
+        }
+        b_.CreateCall(vcd_touch_fn(), { b_.getInt32(static_cast<uint32_t>(base)) });
+    }
+
+    // Emit an rt_vcd_touch_range for a dumped array signal (whole element range).
+    // Used at the array-NBA commit, where the runtime queue does not carry the
+    // per-element index, and after $readmem / $fread bulk writes.
+    void vcd_touch_array(Signal sig) {
+        if (!design_uses_vcd_) {
+            return;
+        }
+        const int32_t base = vcd_index_[static_cast<uint32_t>(sig)];
+        if (base >= 0) {
+            b_.CreateCall(vcd_touch_range_fn(),
+                          { b_.getInt32(static_cast<uint32_t>(base)), b_.getInt32(slot_of(sig).elem_count) });
         }
     }
 

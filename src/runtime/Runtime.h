@@ -281,10 +281,15 @@ void rt_vcd_start(void);
 
 // Mark variable `idx` changed this instant (activity-driven dirty set). Called
 // from the design at each write to a dumped scalar signal (blocking store and NBA
-// commit); epoch-deduplicated so repeated writes to one signal cost O(1). The next
-// rt_vcd_flush visits only the marked variables plus the always-scanned array
-// elements. A no-op when dumping is not active.
+// commit); the next rt_vcd_flush visits only the marked variables. A no-op when
+// dumping is not active.
 void rt_vcd_touch(uint32_t idx);
+
+// Mark the `count` variables [base, base+count) changed -- used for a whole
+// unpacked-array (memory) write, where `base` is the array's first element var.
+// A blocking element write touches the single element; an NBA array commit
+// touches the whole array (the runtime queue does not carry per-element indices).
+void rt_vcd_touch_range(uint32_t base, uint32_t count);
 
 // Postponed-region sample at a settled instant, called from the sim loop before
 // the wheel advances (`tick` is rt_wheel_now). Emits changed variables under one

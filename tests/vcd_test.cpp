@@ -225,6 +225,40 @@ TEST_CASE("vcd: unpacked-array memory dumps one $var per element") {
     CHECK(contains(body, "#5\nb10101011 "));
 }
 
+TEST_CASE("vcd: nonblocking array-element writes are dumped per element") {
+    // mem[idx] <= ... each cycle: the touched element must re-emit on its write
+    // cycle only (array writes are instrumented, not always-scanned).
+    const std::string src = R"(
+        module top;
+          reg clk = 0;
+          reg [7:0] mem [0:3];
+          reg [1:0] idx = 0;
+          integer i;
+          initial for (i = 0; i < 4; i = i + 1) mem[i] = 0;
+          always #5 clk = ~clk;
+          always @(posedge clk) begin
+            mem[idx] <= mem[idx] + 8'h11;
+            idx <= idx + 1;
+          end
+          initial begin
+            $dumpfile("OUT.vcd");
+            $dumpvars;
+            #45 $finish;
+          end
+        endmodule
+    )";
+    const std::string body = body_of(run_vcd(src));
+    // mem[0] is written at the first posedge (#5) -> 0x11; mem[1] at #15, etc.
+    CHECK(contains(body, "#5\n"));
+    CHECK(contains(body, "b10001 "));   // 0x11 on the written element
+    // Count 0x11 (b10001) emissions: one per element as each is written once.
+    size_t n = 0;
+    for (size_t p = body.find("b10001 "); p != std::string::npos; p = body.find("b10001 ", p + 1)) {
+        ++n;
+    }
+    CHECK(n == 4);   // mem[0..3] each written once over the run
+}
+
 TEST_CASE("vcd: descending array range names elements by declared address") {
     const std::string src = R"(
         module top;
