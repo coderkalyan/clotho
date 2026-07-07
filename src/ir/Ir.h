@@ -752,6 +752,12 @@ struct Inst {
         // x/z). The seeded form `$random(seed)` is rejected by the frontend, so
         // this tag never carries a seed operand.
         Random,
+        // $clog2: ceil(log2(operand)) with the operand treated as unsigned and
+        // $clog2(0) == 0, -> a 32-bit signed `integer` (payload: unary). LRM
+        // §20.8.1. The operand's own width bounds the count; any x/z bit in it
+        // makes the whole result X (iverilog oracle — the LRM is silent). Lowers
+        // to a count-leading-zeros: `operand == 0 ? 0 : W - clz(operand - 1)`.
+        Clog2,
     };
 
     // Which union member a tag activates. Drives payload_kind() / operands().

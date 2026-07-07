@@ -2290,6 +2290,26 @@ private:
             return b.resize(lower_expr(*call.arguments()[0], b), lower_type(*call.type), l);
         }
 
+        // $clog2 (LRM §20.8.1): ceil(log2(arg)) with the argument treated as
+        // unsigned and $clog2(0) == 0; the result is a 32-bit integer. slang's
+        // constant evaluator implements clog2, so a constant argument (the
+        // common `$clog2(PARAM)` / literal usage) folds to a pooled literal here.
+        if (name == "$clog2") {
+            if (call.arguments().size() != 1) {
+                fail("$clog2 expects exactly one argument");
+            }
+            slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+            slang::ast::EvalContext    ectx(actx);
+            const slang::ConstantValue cv = call.eval(ectx);
+            if (cv.isInteger()) {
+                return b.constant(svint_to_ref(cv.integer(), lower_type(*call.type)), l);
+            }
+            // A non-constant argument lowers to a runtime count-leading-zeros
+            // (Clog2). The argument is self-determined and treated as unsigned
+            // (LRM §20.8.1); its own width bounds the result.
+            return b.unary(ir::Inst::Tag::Clog2, lower_expr(*call.arguments()[0], b), l);
+        }
+
         // $fopen (LRM §21.3): one argument opens a multichannel descriptor (MCD)
         // for writing; two arguments open a single file descriptor (FD) with the
         // given C stdio mode string. The name / mode lower to packed-ASCII vectors
