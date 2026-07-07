@@ -312,3 +312,90 @@ TEST_CASE("2-state truthiness in if / while") {
       )"));
     CHECK(out == "2\n3\n");
 }
+
+// Runtime pointer-ABI write-backs into narrow 2-state slots must write only the
+// iW value word. Before the narrow flag was threaded through, each of these
+// wrote the packed i(2W) word (or 2*capacity bytes), overrunning the slot into
+// the adjacent state field — the canaries catch that.
+TEST_CASE("$sformat into a narrow 2-state slot does not overrun (canary)") {
+    const std::string out = run_capture(R"(
+        module m;
+            bit [31:0] dst, canary;
+            initial begin
+                canary = 32'hDEADBEEF;
+                $sformat(dst, "ABCD");
+                $display("%h %h", dst, canary);
+                $finish;
+            end
+        endmodule
+    )");
+    CHECK(out == "41424344 deadbeef\n");
+}
+
+TEST_CASE("$sscanf into a narrow 2-state slot does not overrun (canary)") {
+    const std::string out = run_capture(R"(
+        module m;
+            int x, y, n;
+            initial begin
+                y = 32'h12345678;
+                n = $sscanf("41", "%d", x);
+                $display("%0d %0d %h", n, x, y);
+                $finish;
+            end
+        endmodule
+    )");
+    CHECK(out == "1 41 12345678\n");
+}
+
+TEST_CASE("scalar $fread into a narrow 2-state slot does not overrun (canary)") {
+    const char* path = "clotho_fread_narrow_test.bin";
+    {
+        std::FILE* f = std::fopen(path, "wb");
+        REQUIRE(f != nullptr);
+        const unsigned char bytes[4] = { 0xAA, 0xBB, 0xCC, 0xDD };
+        std::fwrite(bytes, 1, 4, f);
+        std::fclose(f);
+    }
+    const std::string out = run_capture(R"(
+        module m;
+            bit [31:0] w, canary;
+            int fd, n;
+            initial begin
+                canary = 32'hDEADBEEF;
+                fd = $fopen("clotho_fread_narrow_test.bin", "r");
+                n = $fread(w, fd);
+                $fclose(fd);
+                $display("%0d %h %h", n, w, canary);
+                $finish;
+            end
+        endmodule
+    )");
+    CHECK(out == "4 aabbccdd deadbeef\n");
+    std::remove(path);
+}
+
+TEST_CASE("$fgets into a narrow 2-state slot does not overrun (canary)") {
+    const char* path = "clotho_fgets_narrow_test.txt";
+    {
+        std::FILE* f = std::fopen(path, "w");
+        REQUIRE(f != nullptr);
+        std::fputs("hi\n", f);
+        std::fclose(f);
+    }
+    const std::string out = run_capture(R"(
+        module m;
+            bit [31:0] s, canary;
+            int fd, n;
+            initial begin
+                canary = 32'hDEADBEEF;
+                fd = $fopen("clotho_fgets_narrow_test.txt", "r");
+                n = $fgets(s, fd);
+                $fclose(fd);
+                $display("%0d %h %h", n, s, canary);
+                $finish;
+            end
+        endmodule
+    )");
+    CHECK(out == "3 0068690a deadbeef\n");
+    std::remove(path);
+}

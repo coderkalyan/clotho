@@ -2297,6 +2297,62 @@ TEST_CASE("$fscanf returns -1 at end of file") {
     std::remove(path);
 }
 
+// The file-io write-backs are blocking writes: each must service the target
+// signal's wait queues like an ordinary assignment. Verified against iverilog.
+TEST_CASE("$sscanf / $sformat / $fgets / scalar $fread wake waiting processes") {
+    const char* path = "clotho_fio_wake_test.txt";
+    // 4 bytes so the scalar $fread fills its target exactly (a short read's
+    // low-byte fill is LRM-unpinned).
+    write_file(path, "hi!\n");
+    const std::string src = R"sv(
+        module m;
+            int r, n, fd;
+            logic [31:0] s;
+            always @(r) $display("r woke %h", r);
+            always @(s) $display("s woke %h", s);
+            initial begin
+                #1 n = $sscanf("5", "%d", r);
+                #1 $sformat(s, "AB");
+                #1 fd = $fopen(")sv" + std::string(path) + R"sv(", "r");
+                n = $fgets(s, fd);
+                $fclose(fd);
+                #1 fd = $fopen(")sv" + std::string(path) + R"sv(", "rb");
+                n = $fread(r, fd);
+                $fclose(fd);
+                #1 $finish;
+            end
+        endmodule
+    )sv";
+    CHECK(run_capture(src) == "r woke 00000005\ns woke 00004142\ns woke 6869210a\nr woke 6869210a\n");
+    std::remove(path);
+}
+
+// $fread into a memory wakes the array's Any-edge waiters (here the implicit
+// sensitivity of a continuous assign reading an element). The time-0 line is
+// the assign's initial x -> 00 transition on the 4-state wire. Verified
+// against iverilog (which schedules the time-0 evaluation before the @(y)
+// registration and so skips the first line — both orders are legal).
+TEST_CASE("$fread into a memory wakes array readers") {
+    const char* path = "clotho_fread_wake_test.bin";
+    write_file(path, std::string("\xAA\xBB\xCC\xDD", 4));
+    const std::string src = std::string(R"(
+        module m;
+            bit [7:0] mem [0:3];
+            wire [7:0] y = mem[1];
+            int fd, n;
+            always @(y) $display("y woke %h", y);
+            initial begin
+                #1 fd = $fopen(")") + path + R"(", "rb");
+                n = $fread(mem, fd);
+                $fclose(fd);
+                #1 $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "y woke 00\ny woke bb\n");
+    std::remove(path);
+}
+
 // $fread packs raw bytes MSB-first into a scalar and then a memory, sharing the
 // $readmem geometry. Cross-checked against Icarus Verilog.
 TEST_CASE("$fread into a scalar and a memory") {
@@ -2477,6 +2533,30 @@ TEST_CASE("$readmem with z digits into a 2-state memory reads 0 and spares neigh
     // z writes.
     CHECK(run_capture(src) == "00 5a 01\n");
     std::remove(path);
+}
+
+// %h accepts z / ? digits (LRM Table 21-7); the scan target must keep its z
+// plane under z elision (the Scanf seed in compute_may_z), and a 2-state
+// target drops the z digits to 0 (LRM 6.3.1).
+TEST_CASE("$sscanf z digits survive z elision; a 2-state target reads 0") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [31:0] r4;
+            int r2, n;
+            initial begin
+                n = $sscanf("zzzzzzzz", "%h", r4);
+                $display("%h", r4);
+                n = $sscanf("z1x0zz1?", "%h", r4);
+                $display("%h", r4);
+                n = $sscanf("zzzzzzzz", "%h", r2);
+                $display("%h", r2);
+                $finish;
+            end
+        endmodule
+    )";
+    // Verified against iverilog except the ? digit, which iverilog reads as x;
+    // ? is an alternative for z in the LRM (5.7.1), so z is kept.
+    CHECK(run_capture(src) == "zzzzzzzz\nz1x0zz1z\n00000000\n");
 }
 
 TEST_CASE("a task output formal carries z back to the caller") {

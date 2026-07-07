@@ -380,28 +380,40 @@ std::FILE* fd_stream(int32_t desc) {
 // holds the last byte, higher bytes precede it, the top bytes are cleared. When
 // the bytes overflow the vector the low (rightmost) `capacity` are kept. must ==
 // may (bytes are fully known) and the z plane is cleared. width % 8 == 0 (the
-// backend guards it), so the must / may plane halves stay byte-aligned. Shared by
+// backend guards it), so the must / may plane halves stay byte-aligned. A narrow
+// 2-state slot holds only the iW value word, so exactly `capacity` bytes are
+// written (a wider write would overrun into the adjacent state field). Shared by
 // $fgets, $sformat / $swrite, and $ferror.
-void store_string_planes(uint8_t* mm, uint8_t* z, uint32_t width, const uint8_t* bytes, uint32_t count) {
+void store_string_planes(uint8_t* mm, uint8_t* z, uint32_t width, const uint8_t* bytes, uint32_t count,
+                         bool narrow) {
     const uint32_t capacity = width / 8;
-    std::memset(mm, 0, static_cast<size_t>(capacity) * 2);
+    std::memset(mm, 0, narrow ? capacity : static_cast<size_t>(capacity) * 2);
     if (z != nullptr) { // null when the target's slot has no z word (z elision)
         std::memset(z, 0, capacity);
     }
     const uint32_t keep = count < capacity ? count : capacity;
     for (uint32_t k = 0; k < keep; ++k) {
         const uint8_t byte = bytes[count - 1 - k]; // last byte read lands in mm[0]
-        mm[k]              = byte;                  // must half (low `width` bits)
-        mm[capacity + k]   = byte;                  // may half (high `width` bits)
+        mm[k]              = byte;                 // must half (low `width` bits)
+        if (!narrow) {
+            mm[capacity + k] = byte; // may half (high `width` bits)
+        }
     }
 }
 
 // Write a ≤64-bit value's planes into a packed vector: the must|may word (must in
 // the low `width` bits, may above) at `mm`, plus the z word at `z`. Values are
-// masked to `width`. Shared by $readmem and the $fscanf / $sscanf engine.
-void write_word_planes(uint8_t* mm, uint8_t* z, uint32_t width, uint64_t must, uint64_t may, uint64_t zz) {
+// masked to `width`. A narrow 2-state slot stores only the iW must word (x/z bits
+// are 0 there by construction, LRM 6.3.1). Shared by $readmem, $fread, and the
+// $fscanf / $sscanf engine.
+void write_word_planes(uint8_t* mm, uint8_t* z, uint32_t width, uint64_t must, uint64_t may, uint64_t zz,
+                       bool narrow) {
     const uint64_t wmask = width >= 64 ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << width) - 1);
     must &= wmask;
+    if (narrow) {
+        std::memcpy(mm, &must, (width + 7) / 8);
+        return;
+    }
     may &= wmask;
     zz &= wmask;
     const unsigned __int128 mmv = static_cast<unsigned __int128>(must) |
@@ -763,7 +775,7 @@ extern "C" int32_t rt_rewind(int32_t fd) {
     return 0;
 }
 
-extern "C" int32_t rt_fgets(uint8_t* mm, uint8_t* z, uint32_t width, int32_t fd) {
+extern "C" int32_t rt_fgets(uint8_t* mm, uint8_t* z, uint32_t width, int32_t fd, uint32_t flags) {
     io_ensure_init();
     std::FILE*     f        = fd_stream(fd);
     const uint32_t capacity = width / 8;
@@ -788,19 +800,19 @@ extern "C" int32_t rt_fgets(uint8_t* mm, uint8_t* z, uint32_t width, int32_t fd)
     if (count == 0) {
         return 0;
     }
-    store_string_planes(mm, z, width, line.data(), count);
+    store_string_planes(mm, z, width, line.data(), count, (flags & 1u) != 0);
     return static_cast<int32_t>(count);
 }
 
-extern "C" void
-rt_sformat(uint8_t* mm, uint8_t* z, uint32_t width, const char* fmt, uint32_t argc, const rt_arg* argv) {
+extern "C" void rt_sformat(uint8_t* mm, uint8_t* z, uint32_t width, const char* fmt, uint32_t argc,
+                           const rt_arg* argv, uint32_t flags) {
     // $sformat / $swrite: render like $display, then store the result into the
     // destination string variable (LRM §21.3.3). An oversized result keeps its low
     // (rightmost) bytes, matching a string-to-narrower-reg assignment.
     std::string out;
     render(out, fmt, argc, argv);
     store_string_planes(mm, z, width, reinterpret_cast<const uint8_t*>(out.data()),
-                        static_cast<uint32_t>(out.size()));
+                        static_cast<uint32_t>(out.size()), (flags & 1u) != 0);
 }
 
 extern "C" void rt_sformat_str(rt_string* dst, const char* fmt, uint32_t argc, const rt_arg* argv) {
@@ -809,7 +821,7 @@ extern "C" void rt_sformat_str(rt_string* dst, const char* fmt, uint32_t argc, c
     rt_string_assign_bytes(dst, out.data(), out.size());
 }
 
-extern "C" int32_t rt_ferror(int32_t fd, uint8_t* mm, uint8_t* z, uint32_t width) {
+extern "C" int32_t rt_ferror(int32_t fd, uint8_t* mm, uint8_t* z, uint32_t width, uint32_t flags) {
     // $ferror (LRM §21.3.6): return the stream's error code and write the matching
     // message into `str`. C stdio has no per-stream error code, only an indicator,
     // so errno is the closest portable source. A cleared stream reports 0.
@@ -827,7 +839,7 @@ extern "C" int32_t rt_ferror(int32_t fd, uint8_t* mm, uint8_t* z, uint32_t width
         msg  = std::strerror(errno);
     }
     store_string_planes(mm, z, width, reinterpret_cast<const uint8_t*>(msg),
-                        static_cast<uint32_t>(std::strlen(msg)));
+                        static_cast<uint32_t>(std::strlen(msg)), (flags & 1u) != 0);
     return code;
 }
 
@@ -1039,7 +1051,7 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
                 break; // more conversions than output args
             }
             const rt_scan_arg& a = args[ai++];
-            write_word_planes(a.mm, a.z, a.width, must, may, z);
+            write_word_planes(a.mm, a.z, a.width, must, may, z, (a.flags & 1u) != 0);
             ++count;
         }
     }
@@ -1181,15 +1193,8 @@ void mem_write(const MemDest& d, int64_t idx, uint64_t must, uint64_t may, uint6
         z   = 0;
     }
     const size_t off = static_cast<size_t>(idx) * d.stride;
-    // A narrow element is a single iW value; write just the low `width` bits.
-    if (d.narrow) {
-        const uint64_t wmask = d.width >= 64 ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << d.width) - 1);
-        const uint64_t v     = must & wmask;
-        std::memcpy(d.mm_base + off, &v, (d.width + 7) / 8);
-        return;
-    }
-    uint8_t* zp = d.z_base != nullptr ? d.z_base + off : nullptr;
-    write_word_planes(d.mm_base + off, zp, d.width, must, may, z);
+    uint8_t*     zp  = d.z_base != nullptr ? d.z_base + off : nullptr;
+    write_word_planes(d.mm_base + off, zp, d.width, must, may, z, d.narrow);
 }
 
 // Map a declared-range address to a 0-based storage index: an ascending range
