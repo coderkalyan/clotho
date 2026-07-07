@@ -1040,6 +1040,67 @@ TEST_CASE("$random lowers to an rt_random call") {
     CHECK(ir.find("call i32 @rt_random(") != std::string::npos);
 }
 
+// $clog2 (LRM §20.8.1): ceil(log2(arg)), arg unsigned, $clog2(0) == 0. A
+// constant argument folds to a literal; here it drives a localparam width and
+// direct literal/parameter arguments. Boundary values (exact powers of two vs
+// one past) cross-checked against iverilog.
+TEST_CASE("$clog2 folds to the ceiling of log2") {
+    const std::string out = run_capture(R"(
+        module m;
+            parameter DEPTH = 129;
+            localparam AW = $clog2(DEPTH);
+            initial
+                $display("%0d %0d %0d %0d %0d %0d %0d",
+                         $clog2(0), $clog2(1), $clog2(2), $clog2(3),
+                         $clog2(256), $clog2(257), AW);
+        endmodule
+    )");
+    CHECK(out == "0 0 1 2 8 9 8\n");
+}
+
+// A non-constant $clog2 argument lowers to a runtime count-leading-zeros. The
+// operand's own width bounds the count (a 100-bit vector reaches 100), and the
+// argument is treated as unsigned. Boundary and wide values cross-checked
+// against iverilog.
+TEST_CASE("$clog2 of a non-constant argument counts leading zeros at runtime") {
+    const std::string out = run_capture(R"(
+        module m;
+            logic [7:0]  x;
+            logic [15:0] w;
+            logic [99:0] big;
+            initial begin
+                x = 0;    $display("%0d", $clog2(x));
+                x = 1;    $display("%0d", $clog2(x));
+                x = 5;    $display("%0d", $clog2(x));
+                x = 8;    $display("%0d", $clog2(x));
+                x = 255;  $display("%0d", $clog2(x));
+                w = 256;  $display("%0d", $clog2(w));
+                w = 257;  $display("%0d", $clog2(w));
+                big = 100'h8000000000000000000000000; $display("%0d", $clog2(big));
+                big = 100'h8000000000000000000000001; $display("%0d", $clog2(big));
+            end
+        endmodule
+    )");
+    CHECK(out == "0\n0\n3\n3\n8\n8\n9\n99\n100\n");
+}
+
+// An x/z bit anywhere in the operand makes the whole 32-bit result X (iverilog
+// oracle; the LRM does not define x/z operands for $clog2).
+TEST_CASE("$clog2 propagates X when the operand has unknown bits") {
+    const std::string out = run_capture(R"(
+        module m;
+            logic [3:0] n;
+            logic [7:0] u;
+            initial begin
+                n = 4'b001x;      $display("%b", $clog2(n));
+                u = 8'bxxxxxxxx;  $display("%b", $clog2(u));
+            end
+        endmodule
+    )");
+    CHECK(out == "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+                 "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n");
+}
+
 TEST_CASE("unsigned divide and modulo truncate toward zero") {
     const std::string out = run_capture(R"(
         module m;

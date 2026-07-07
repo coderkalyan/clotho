@@ -289,6 +289,9 @@ struct Analysis {
                 case Inst::Tag::Fflush:
                 case Inst::Tag::SimTime:
                 case Inst::Tag::Random:
+                // $clog2 yields a count (or X when the operand has unknown bits);
+                // its result z plane is always zero.
+                case Inst::Tag::Clog2:
                 // String values carry no bit planes and the integral string ops
                 // (len / getc / cmp / to_packed) always produce known bits.
                 case Inst::Tag::StrLen:

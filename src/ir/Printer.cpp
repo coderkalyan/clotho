@@ -203,6 +203,8 @@ const char* tag_name(Inst::Tag tag) {
             return "timeformat";
         case T::Random:
             return "random";
+        case T::Clog2:
+            return "clog2";
     }
 
     return "?";

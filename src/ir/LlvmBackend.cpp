@@ -2871,6 +2871,10 @@ private:
                 return { 64, false, false };
             case Inst::Tag::Random:
                 return { 32, false, true };
+            case Inst::Tag::Clog2:
+                // $clog2 returns a 32-bit signed `integer` (4-state: the result
+                // is X when the operand carries x/z).
+                return { 32, true, true };
             case Inst::Tag::Fopen:
                 // $fopen returns a 32-bit descriptor integer.
                 return { 32, false, true };
@@ -3255,6 +3259,10 @@ private:
             case Inst::Tag::RedOr:
             case Inst::Tag::RedXor:
                 set_value(i, lower_reduce(ir_->tag(i), value_of(p.unary)));
+                return;
+
+            case Inst::Tag::Clog2:
+                set_value(i, lower_clog2(value_of(p.unary)));
                 return;
 
             case Inst::Tag::Sll:
@@ -5119,6 +5127,34 @@ private:
         }
         // RedOr: must: any bit definitely 1; may: any bit could be 1.
         return bit_plane(b_.CreateICmpNE(am, zero(w)), b_.CreateICmpNE(aM, zero(w)));
+    }
+
+    // $clog2 (LRM §20.8.1): ceil(log2(operand)), operand unsigned, $clog2(0) == 0,
+    // -> a 32-bit `integer`. For a known operand of width W, the ceiling equals the
+    // bit index one past the top set bit of `operand - 1`, i.e. `W - clz(operand-1)`;
+    // `operand == 0` is special-cased to 0 (it would otherwise wrap to all-ones and
+    // yield W). Any x/z bit in the operand makes the whole result X, matching
+    // iverilog (the LRM does not define x/z operands here).
+    Plane lower_clog2(Plane a) {
+        const uint32_t w   = width_of(a);
+        llvm::Value*   val = must_of(a); // operand treated as unsigned
+
+        // W - clz(val - 1), computed in a width that holds the count (<= W) and the
+        // 32-bit result; ctlz's zero-is-poison flag is false so val == 1 (val-1 == 0)
+        // yields clz == W and thus a count of 0.
+        const uint32_t cw    = std::max(w, 32u);
+        llvm::Value*   vm1   = b_.CreateSub(val, llvm::ConstantInt::get(int_ty(w), 1));
+        llvm::Value*   clz   = b_.CreateIntrinsic(llvm::Intrinsic::ctlz, { int_ty(w) }, { vm1, b_.getFalse() });
+        llvm::Value*   count = b_.CreateSub(llvm::ConstantInt::get(int_ty(cw), w), cast(clz, cw, false));
+        llvm::Value*   is_zero = b_.CreateICmpEQ(val, zero(w));
+        llvm::Value*   known   = b_.CreateSelect(is_zero, zero(cw), count);
+        llvm::Value*   res32   = cast(known, 32, false);
+
+        // X-propagate: any unknown operand bit -> all-X result (must = 0, may = 1s).
+        llvm::Value* unknown = any_unknown(a);
+        llvm::Value* must    = b_.CreateSelect(unknown, zero(32), res32);
+        llvm::Value* may     = b_.CreateSelect(unknown, ones(32), res32);
+        return packed(must, may, zero(32));
     }
 
     // -- Shifts: X/Z in the count makes the whole result X; value planes shift. --

@@ -29,6 +29,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::StrUpper:
         case T::StrLower:
         case T::StrFromPacked:
+        case T::Clog2:
             return K::Unary;
 
         case T::BitSelect:
