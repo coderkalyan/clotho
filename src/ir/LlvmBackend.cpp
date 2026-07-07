@@ -4458,9 +4458,16 @@ private:
     // the current simulation time, and the diagnostic level, then it prints the
     // banner and exits. The call never returns, so the rest of the region is dead
     // but stays valid IR — rt_finish is noreturn and the optimizer prunes the
-    // unreachable tail. The wheel (hence the sim time) is reachable only from a
-    // process or task; a $finish in a pure function has no wheel arg, so its
-    // banner reports time 0 (a rare corner — the location is still exact).
+    // unreachable tail.
+    //
+    // TODO: a $finish / $stop inside a pure function reports simulation time 0.
+    // Functions take (state) but no wheel argument (only processes and tasks do,
+    // see the function ABI in declare_function / lower_task), so the current
+    // time is unreachable here and the banner falls back to 0 — which reads wrong
+    // if a design actually triggers it (e.g. `if (err) $finish;` in a function).
+    // The location is still exact. $time has the same root cause but is guarded
+    // loudly in the frontend (lower_sysfunc); the clean fix for both is to thread
+    // the wheel into the function ABI, after which this fallback can go.
     void lower_finish(Index i) {
         const auto        info   = ir_->extra_data<FinishInfo>(ir_->payload(i).extra);
         const std::string banner = ir_->extra_bytes(info.banner, info.banner_len);
