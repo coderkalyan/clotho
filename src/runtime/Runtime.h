@@ -279,6 +279,13 @@ void rt_vcd_array(const char* name, uint32_t name_len, uint32_t count, uint32_t 
 // Finish the header ($enddefinitions) and arm the initial full dump.
 void rt_vcd_start(void);
 
+// Mark variable `idx` changed this instant (activity-driven dirty set). Called
+// from the design at each write to a dumped scalar signal (blocking store and NBA
+// commit); epoch-deduplicated so repeated writes to one signal cost O(1). The next
+// rt_vcd_flush visits only the marked variables plus the always-scanned array
+// elements. A no-op when dumping is not active.
+void rt_vcd_touch(uint32_t idx);
+
 // Postponed-region sample at a settled instant, called from the sim loop before
 // the wheel advances (`tick` is rt_wheel_now). Emits changed variables under one
 // `#tick` marker; a no-change instant emits nothing. A no-op when dumping is not

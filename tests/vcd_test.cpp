@@ -318,6 +318,53 @@ TEST_CASE("vcd: high-activity trace stays ordered through the writer thread") {
     CHECK(contains(body, "b11111001111 !"));    // a == 1999 at the last instant
 }
 
+TEST_CASE("vcd: dirty set re-emits only signals that actually change") {
+    // `moving` toggles every posedge (an NBA target); `still` is written the same
+    // value every posedge, and `idle` is never written. All three appear at #0
+    // (the initial dump); afterwards only `moving` should re-appear -- the NBA
+    // commit touches `still` too, but the flush diff suppresses the no-change.
+    const std::string src = R"(
+        module top;
+          reg clk = 0;
+          reg [3:0] moving = 0;
+          reg [3:0] still  = 7;
+          reg [3:0] idle   = 3;
+          always #5 clk = ~clk;
+          always @(posedge clk) begin
+            moving <= moving + 1;
+            still  <= 7;
+          end
+          initial begin
+            $dumpfile("OUT.vcd");
+            $dumpvars;
+            #28 $finish;
+          end
+        endmodule
+    )";
+    const std::string body = body_of(run_vcd(src));
+
+    // The initial dump at #0 carries all three; count later re-emissions.
+    const auto count = [&](std::string_view id) {
+        size_t n = 0;
+        for (size_t p = body.find(id); p != std::string::npos; p = body.find(id, p + 1)) {
+            ++n;
+        }
+        return n;
+    };
+    // Identify each var's id from the header is overkill; instead check that only
+    // one 4-bit value line pattern recurs. `moving` reaches 1,2 over #28; `still`
+    // and `idle` never change after #0. Concretely: exactly one #0 block, and after
+    // it only `moving`'s edges produce vector lines.
+    CHECK(count("#0") == 1);
+    // moving = 1 at first posedge (#5), 2 at #15, 3 at #25 -> b1, b10, b11 appear.
+    CHECK(contains(body, "b1 "));
+    CHECK(contains(body, "b10 "));
+    CHECK(contains(body, "b11 "));
+    // `still` holds 7 (b111) and `idle` holds 3 (b11) only at #0; b111 must not
+    // recur (still never changes value).
+    CHECK(count("b111 ") == 1);
+}
+
 TEST_CASE("vcd: $dumpvars(0, top) matches the bare whole-design form") {
     const std::string bare = R"(
         module top;

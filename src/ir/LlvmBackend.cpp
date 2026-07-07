@@ -397,6 +397,7 @@ public:
             report_comb_fuse_stat();
         }
         compute_domain_spec();   // after fusion (thunk_group_): reads spec_group_ in lower_group
+        build_vcd_index();       // before build_nba_state: fills vcd_index_ / design_uses_vcd_
         build_wait_queues();
         build_sched_flags();
         build_nba_state();
@@ -3277,11 +3278,19 @@ private:
         // (storage_ptr / shadow_ptr), so no byte offsets are baked here.
         auto*                        nullp = llvm::ConstantPointerNull::get(ptr);
         std::vector<llvm::Constant*> metas;
+        // Parallel to `metas` (nba_id order): the dump-var index of each NBA-target
+        // signal, or -1 when it is not a dumped scalar. Read in the commit loop to
+        // mark the signal in the VCD dirty set.
+        std::vector<llvm::Constant*> nba_vcd;
         for (uint32_t i = 0; i < sigs.size(); ++i) {
             const SignalSlot& s = slots_[i];
             if (!s.nba) {
                 continue;
             }
+            // Parallel to metas: this NBA target's dump-var index, or -1 when it is
+            // not a dumped scalar. The commit loop reads it to mark the signal dirty.
+            nba_vcd.push_back(llvm::ConstantInt::get(
+              i32, static_cast<uint64_t>(static_cast<int64_t>(design_uses_vcd_ ? vcd_index_[i] : -1))));
             std::array<llvm::Constant*, 3> sb{}, sc{}, db{}, dl{};
             for (uint32_t e = 0; e < 3; ++e) {
                 sb[e] = wait_sta_gv_[i][e] ? llvm::cast<llvm::Constant>(wait_sta_gv_[i][e]) : nullp;
@@ -3299,6 +3308,14 @@ private:
         nba_meta_arr_ty_ = llvm::ArrayType::get(nba_meta_ty_, metas.size());
         nba_meta_gv_     = new llvm::GlobalVariable(llmod_, nba_meta_arr_ty_, true, llvm::GlobalValue::InternalLinkage,
                                                     llvm::ConstantArray::get(nba_meta_arr_ty_, metas), "clotho.nba_meta");
+
+        // Parallel dump-var index array (nba_id order), consumed by the commit loop
+        // to mark committed signals dirty in the VCD dirty set.
+        if (design_uses_vcd_ && !nba_vcd.empty()) {
+            auto* ty    = llvm::ArrayType::get(i32, nba_vcd.size());
+            nba_vcd_gv_ = new llvm::GlobalVariable(llmod_, ty, true, llvm::GlobalValue::InternalLinkage,
+                                                   llvm::ConstantArray::get(ty, nba_vcd), "clotho.nba_vcd");
+        }
 
         // Declare the block-commit enqueue stub up front so StoreNb lowering can call
         // it (its body + the worklist/pending globals are emitted post-lowering by
@@ -3453,6 +3470,15 @@ private:
                                                          { b_.getInt32(0), b_.getInt32(s.nba_id) });
                 emit_nba_service(meta, old_mm, new_mm, W, s.narrow, old_z, new_z);
             }
+            // Mark a dumped scalar target dirty in the VCD set (rt_vcd_touch ignores
+            // the -1 index of a non-dumped signal). Commit is unconditional, so a
+            // no-change commit over-touches; the flush diff suppresses it.
+            if (design_uses_vcd_ && nba_vcd_gv_ != nullptr) {
+                llvm::Value* vidx = b_.CreateLoad(
+                  b_.getInt32Ty(), b_.CreateInBoundsGEP(nba_vcd_gv_->getValueType(), nba_vcd_gv_,
+                                                        { b_.getInt32(0), b_.getInt32(s.nba_id) }));
+                b_.CreateCall(vcd_touch_fn(), { vidx });
+            }
         }
     }
 
@@ -3596,6 +3622,9 @@ private:
             service_wait_queue(lv.sig, old.mm, load_lv_mm(lv), old.z,
                                old.z != nullptr ? load_lv_z(lv) : nullptr);
         }
+        // Mark the signal changed for the VCD dirty set. Independent of wait-queue
+        // servicing: a dumped signal with no waiters still needs a touch.
+        vcd_touch_lvalue(lv);
     }
 
     // One old -> new transition's wake facts: which edge buckets fire. A fact is
@@ -7010,6 +7039,9 @@ private:
     llvm::FunctionCallee vcd_start_fn() {
         return rt_fn("rt_vcd_start", b_.getVoidTy(), {});
     }
+    llvm::FunctionCallee vcd_touch_fn() {
+        return rt_fn("rt_vcd_touch", b_.getVoidTy(), { b_.getInt32Ty() });
+    }
     llvm::FunctionCallee vcd_flush_fn() {
         return rt_fn("rt_vcd_flush", b_.getVoidTy(), { b_.getInt64Ty() });
     }
@@ -7040,6 +7072,69 @@ private:
             }
         }
         return false;
+    }
+
+    // Assign each dumped scalar signal its runtime dump-var index, in the exact
+    // order rt_vcd_var / rt_vcd_array register variables (the emit_vcd_var walk):
+    // an unpacked array consumes elem_count indices (its always-scanned elements),
+    // a scalar consumes one. Precomputed before any process body so a store's touch
+    // uses a compile-time-constant index. Kept in lockstep with emit_vcd_var /
+    // emit_vcd_scope_tree; a byte-diff of the dump verifies the two match.
+    void build_vcd_index() {
+        design_uses_vcd_ = design_uses_vcd();
+        if (!design_uses_vcd_) {
+            return;
+        }
+        vcd_index_.assign(mod_.signals().size(), -1);
+        uint32_t   next = 0;
+        const auto tops = mod_.tops();
+        if (tops.empty()) {
+            for (uint32_t si = 0; si < mod_.signals().size(); ++si) {
+                vcd_index_signal(static_cast<Signal>(si), next);
+            }
+        } else {
+            for (const InstanceScope& top : tops) {
+                vcd_index_scope(top, next);
+            }
+        }
+    }
+
+    void vcd_index_scope(const InstanceScope& sc, uint32_t& next) {
+        for (const Signal sig : sc.signals) {
+            vcd_index_signal(sig, next);
+        }
+        for (const InstanceScope& child : sc.children) {
+            vcd_index_scope(child, next);
+        }
+    }
+
+    void vcd_index_signal(Signal sig, uint32_t& next) {
+        const SignalInfo& info = mod_.signal(sig);
+        if (info.name.empty()) {
+            return;
+        }
+        const SignalSlot& s = slot_of(sig);
+        if (s.is_string) {
+            return;   // never registers (emit_vcd_var loud-fails on a string)
+        }
+        if (s.is_array) {
+            next += s.elem_count;   // array elements consume indices but are always-scanned
+            return;
+        }
+        vcd_index_[static_cast<uint32_t>(sig)] = static_cast<int32_t>(next++);
+    }
+
+    // Emit rt_vcd_touch for a blocking write to a dumped scalar signal, marking it
+    // in the dirty set. A no-op for a non-dumped signal, an array element (always
+    // scanned), or a PreInit store (before $dumpvars, subsumed by the initial dump).
+    void vcd_touch_lvalue(const LValue& lv) {
+        if (!design_uses_vcd_ || lowering_preinit_ || !lv.is_signal) {
+            return;
+        }
+        const int32_t idx = vcd_index_[static_cast<uint32_t>(lv.sig)];
+        if (idx >= 0) {
+            b_.CreateCall(vcd_touch_fn(), { b_.getInt32(static_cast<uint32_t>(idx)) });
+        }
     }
 
     // $dumpfile: record the output path. A string-object filename is read straight
@@ -8919,6 +9014,15 @@ private:
     // different fields (different parameterization) gets its own entry.
     std::vector<std::tuple<std::string, std::vector<llvm::Type*>, llvm::StructType*>> def_types_;
     std::vector<SignalSlot> slots_;
+
+    // VCD dirty set (meaningful iff design_uses_vcd_). vcd_index_[sig] is the
+    // runtime dump-var index of a dumped scalar signal, or -1 when the signal is
+    // not a touched scalar (an unnamed temporary, a string, or an unpacked array —
+    // array elements are always-scanned, not instrumented). nba_vcd_gv_ is a
+    // parallel [n_nba x i32] of those indices, read in the NBA commit loop.
+    bool                  design_uses_vcd_ = false;
+    std::vector<int32_t>  vcd_index_;
+    llvm::GlobalVariable* nba_vcd_gv_ = nullptr;
 
     // Function declarations, indexed by FunctionId; filled before any body is
     // lowered so calls (including recursive / forward) resolve.
