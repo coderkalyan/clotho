@@ -476,6 +476,67 @@ TEST_CASE("single-bit pow agrees with LRM, including X") {
     CHECK(run_capture(src) == "1\n0\n1\nx\n");
 }
 
+// Signed ** covers LRM Table 11-4: signed base at a non-negative exponent (the
+// squaring loop is sign-agnostic) and the negative-exponent corners (op1==0 -> X,
+// op1==1 -> 1, op1==-1 -> parity of op2, |op1|>1 -> 0). Values match iverilog 13.
+TEST_CASE("signed pow agrees with LRM Table 11-4") {
+    constexpr std::string_view src = R"(
+        module m;
+            integer a, e, r;
+            task show(input integer base, input integer exp);
+                begin a = base; e = exp; r = a ** e; $display("%0d", r); end
+            endtask
+            initial begin
+                show(-3, 3);   // -27  signed base, positive exponent
+                show(-2, 2);   // 4
+                show(-3, 0);   // 1    exp 0 -> 1
+                show(2, -2);   // 0    |op1|>1, negative exp
+                show(1, -5);   // 1
+                show(-1, -7);  // -1   op1==-1, odd exp
+                show(-1, -8);  // 1    op1==-1, even exp
+                show(-1, 7);   // -1
+                show(0, -1);   // x    op1==0, negative exp
+                show(5, -1);   // 0
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "-27\n4\n1\n0\n1\n-1\n1\n-1\nx\n0\n");
+}
+
+// A constant exponent lets the optimizer fold the squaring loop; a bare literal
+// exponent is 2-state, so with a 4-state base the operands are mixed-domain. The
+// backend must lift the exponent to 4-state or the X-mask shifts an iW word by its
+// full width (poison), which the optimizer turns into an unreachable process body.
+// Regression: `x ** 3` and an unsigned constant exponent both once produced no
+// output. 2-state `int` operands exercise the recursion + wide-multiply path.
+TEST_CASE("pow with a constant / mixed-domain exponent is not miscompiled") {
+    constexpr std::string_view src = R"(
+        module m;
+            integer a4, r4;
+            reg [31:0] u;
+            int ai, ei, ri;
+            initial begin
+                a4 = -3;     r4 = a4 ** 3;      $display("%0d", r4);  // -27, literal exp (2-state)
+                r4 = (-3) ** 3;                 $display("%0d", r4);  // -27, both constant
+                u = 32'd3;   u = u ** 32'd3;    $display("%0d", u);   // 27,  unsigned const exp
+                ai = -4; ei = 3; ri = ai ** ei; $display("%0d", ri);  // -64, 2-state signed
+                ai = 2;  ei = -3; ri = ai ** ei; $display("%0d", ri); // 0,   2-state neg exp
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "-27\n-27\n27\n-64\n0\n");
+}
+
+// The x-producing corner of Table 11-4 (0 ** negative) is coerced to 0 when the
+// result type is 2-state (LRM 6.3.1) but kept as x in a 4-state result. iverilog
+// keeps x even for a 2-state `int` here, an inconsistency with its own plain
+// x-assignment coercion; Clotho follows the LRM.
+TEST_CASE("0 ** negative coerces X to 0 in a 2-state result") {
+    CHECK(run_capture(R"(module m; int r; integer q;
+        initial begin r = 0 ** -1; $display("%0d", r); q = 0 ** -1; $display("%0d", q); end
+        endmodule)") == "0\nx\n");
+}
+
 TEST_CASE("wide div keeps the branching divmod path") {
     const std::string ir = emit(R"(
         module m(input logic [7:0] a, input logic [7:0] b, output logic [7:0] y);
@@ -1519,18 +1580,16 @@ TEST_CASE("wide arithmetic libcalls resolve and run in the JIT") {
     end endmodule)") == "1\n");
 }
 
-// Signed power remains unimplemented and must be rejected, not miscompiled.
-TEST_CASE("signed power is rejected, not miscompiled") {
-    auto rejects = [](std::string_view src) {
-        const LowerResult r = lower_text(src);
-        REQUIRE_MESSAGE(r.ok, r.diagnostics);
-        REQUIRE(r.module != nullptr);
-        std::string              text;
-        llvm::raw_string_ostream os(text);
-        return !ir::emit_llvm(*r.module, os);
-    };
-
-    CHECK(rejects(R"(module m; initial begin int a, b, c; a = 2; b = 3; c = a ** b; end endmodule)"));
+// Signed power now lowers (LRM Table 11-4); it must emit, not reject. Behavior is
+// covered by the Table 11-4 test above.
+TEST_CASE("signed power lowers to valid IR") {
+    const LowerResult r =
+      lower_text(R"(module m; initial begin int a, b, c; a = 2; b = 3; c = a ** b; end endmodule)");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE(r.module != nullptr);
+    std::string              text;
+    llvm::raw_string_ostream os(text);
+    CHECK(ir::emit_llvm(*r.module, os));
 }
 
 // Multiple top-level modules are each implicitly instantiated once and
