@@ -10,3 +10,5 @@ cases/*/*.vcd
 cases/*/splits.txt
 cases/*/hyperfine.json
 __pycache__/
+# Machine-local oracle tool bindirs (install-specific paths).
+tools.local.json

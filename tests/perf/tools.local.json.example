@@ -1,0 +1,3 @@
+{
+  "_comment": "Copy to tools.local.json (gitignored). Maps an oracle tool to the bindir prepended to PATH for its commands, for tools not on the system PATH. Omit a tool that is already on PATH (e.g. iverilog, verilator)."
+}

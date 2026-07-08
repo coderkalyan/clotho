@@ -16,6 +16,7 @@ See README.md for the regression policy.
 import argparse
 import datetime
 import json
+import os
 import platform
 import re
 import shlex
@@ -32,6 +33,7 @@ BUILD_DIR = REPO / "build-perf"
 RESULTS_PATH = HERE / "results.json"
 BASELINE_PATH = HERE / "baseline.json"
 ORACLES_PATH = HERE / "oracles.json"
+TOOLS_LOCAL_PATH = HERE / "tools.local.json"
 DEFAULT_RUNS = 5
 SANITY_TIMEOUT_S = 900
 
@@ -110,13 +112,13 @@ def ensure_build(no_build):
     subprocess.run(["ninja", "-C", str(BUILD_DIR), "clotho"], check=True)
     return clotho
 
-def hyperfine(cmd, cwd, runs, warmup):
+def hyperfine(cmd, cwd, runs, warmup, env=None):
     """Run one shell command under hyperfine; return per-run wall times in ms."""
     export = cwd / "hyperfine.json"
     subprocess.run(
         ["hyperfine", "--style", "basic", "--warmup", str(warmup),
          "--runs", str(runs), "--export-json", str(export), cmd],
-        cwd=cwd, check=True)
+        cwd=cwd, check=True, env=env)
     with open(export) as f:
         times_s = json.load(f)["results"][0]["times"]
     return [t * 1000.0 for t in times_s]
@@ -124,10 +126,10 @@ def hyperfine(cmd, cwd, runs, warmup):
 def metric(samples):
     return {"samples": [round(s, 3) for s in samples], "min": round(min(samples), 3)}
 
-def sanity_run(cmd, cwd, regex, label):
+def sanity_run(cmd, cwd, regex, label, env=None):
     """One untimed correctness run; refuse to benchmark a broken sim."""
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                       timeout=SANITY_TIMEOUT_S, shell=isinstance(cmd, str))
+                       timeout=SANITY_TIMEOUT_S, shell=isinstance(cmd, str), env=env)
     if r.returncode != 0:
         fail(f"[{label}] sanity run failed (rc={r.returncode}):\n{r.stdout}\n{r.stderr}")
     if regex and not re.search(regex, r.stdout):
@@ -275,13 +277,33 @@ def oracle_cmds(tool, files, top):
                 f"obj_dir/V{top}")
     fail(f"unknown oracle tool '{tool}'")
 
-def tool_version(tool):
-    r = subprocess.run(ORACLE_VERSION_CMD[tool], capture_output=True, text=True)
+def tool_version(tool, env):
+    r = subprocess.run(ORACLE_VERSION_CMD[tool], capture_output=True, text=True, env=env)
     lines = (r.stdout or r.stderr).strip().splitlines()
     return lines[0].strip() if lines else "unknown"
 
+def load_tools_local():
+    if not TOOLS_LOCAL_PATH.is_file():
+        return {}
+    with open(TOOLS_LOCAL_PATH) as f:
+        return json.load(f)
+
+def tool_env(tool, tools_local):
+    """Environment for a tool's commands, with its local bindir prepended to PATH."""
+    bindir = tools_local.get(tool)
+    if not bindir:
+        return None
+    env = os.environ.copy()
+    env["PATH"] = f"{bindir}{os.pathsep}{env.get('PATH', '')}"
+    return env
+
+def on_path(bins, env):
+    path = env["PATH"] if env else None
+    return all(shutil.which(b, path=path) is not None for b in bins)
+
 def cmd_oracles(args):
     cases = load_cases(args.cases)
+    tools_local = load_tools_local()
     doc = {"schema": 1, "cases": {}}
     if ORACLES_PATH.is_file():  # merge per case/tool across manual runs
         with open(ORACLES_PATH) as f:
@@ -300,20 +322,22 @@ def cmd_oracles(args):
                 print(f"[{name}/{tool}] disabled: {tool_cfg.get('note', 'no note')}")
                 entry[tool] = {"skipped": tool_cfg.get("note", "disabled in case.toml")}
                 continue
-            if any(shutil.which(b) is None for b in ORACLE_BINS[tool]):
-                print(f"[{name}/{tool}] SKIPPED: tool not on PATH (existing numbers kept)")
+            env = tool_env(tool, tools_local)
+            if not on_path(ORACLE_BINS[tool], env):
+                hint = "" if tool in tools_local else f" (set its bindir in {TOOLS_LOCAL_PATH.name})"
+                print(f"[{name}/{tool}] SKIPPED: not on PATH{hint} (existing numbers kept)")
                 continue
             files = tool_cfg.get("files", case["clotho"]["files"])
             compile_cmd, sim_cmd = oracle_cmds(tool, files, top)
             print(f"[{name}/{tool}] sanity compile + sim")
-            sanity_run(compile_cmd, cwd, None, f"{name}/{tool}/compile")
-            sanity_run(sim_cmd, cwd, regex, f"{name}/{tool}/sim")
+            sanity_run(compile_cmd, cwd, None, f"{name}/{tool}/compile", env=env)
+            sanity_run(sim_cmd, cwd, regex, f"{name}/{tool}/sim", env=env)
             print(f"[{name}/{tool}] timing compile ({args.runs} runs)")
-            compile_times = hyperfine(compile_cmd, cwd, args.runs, warmup=0)
+            compile_times = hyperfine(compile_cmd, cwd, args.runs, warmup=0, env=env)
             print(f"[{name}/{tool}] timing sim ({args.runs} runs)")
-            sim_times = hyperfine(sim_cmd, cwd, args.runs, warmup=0)
+            sim_times = hyperfine(sim_cmd, cwd, args.runs, warmup=0, env=env)
             entry[tool] = {
-                "meta": {**run_meta(args.runs), "version": tool_version(tool)},
+                "meta": {**run_meta(args.runs), "version": tool_version(tool, env)},
                 "compile_ms": metric(compile_times),
                 "sim_ms": metric(sim_times),
             }
