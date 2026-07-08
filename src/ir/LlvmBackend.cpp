@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cassert>
 #include <cstring>
 #include <mutex>
@@ -2252,28 +2253,39 @@ private:
     }
 
     // The active task queue: ready-to-run coroutine handles held in a fixed-size
-    // global used as a LIFO stack (active events may fire in any order per the LRM,
-    // so the stack discipline is free). Capacity is the total process count — the
-    // most that can ever be ready at once. Created once, lazily, so the timer
-    // callback (built while lowering a process) and emit_active_run share it.
+    // global used as a FIFO ring (active events may fire in any order per the LRM,
+    // so the discipline is free). FIFO over LIFO is deliberate: wakes enqueue
+    // behind the current batch, so combinational cascades settle breadth-first —
+    // each process runs at most once per wave and the worst case is bounded by
+    // net depth, where LIFO's depth-first re-entry is exponential on dense
+    // fan-in. It also runs same-instant processes in declaration order.
+    // Created once, lazily, so the timer callback (built while
+    // lowering a process) and emit_active_run share it.
     void ensure_active_queue() {
         if (active_gv_ != nullptr) {
             return;
         }
         auto*      ptr_ty = llvm::PointerType::getUnqual(ctx_);
         auto*      i32    = llvm::Type::getInt32Ty(ctx_);
-        // One slot per process suffices even with tasks: the queue is a LIFO drained
-        // to empty each region, and (without fork) each process is a single
-        // call-stack with at most one ready coroutine at a time — a task handle, or
-        // the parent it re-enqueues on completion, reuses that chain's one slot.
-        const auto cap    = std::max<size_t>(mod_.processes().size(), 1);
+        // One LIVE slot per process suffices even with tasks: the scheduled flag
+        // dedupes wakes, and (without fork) each process is a single call-stack
+        // with at most one ready coroutine at a time — a task handle, or the
+        // parent it re-enqueues on completion, reuses that chain's one slot.
+        // Rounded up to a power of two so the monotone head/tail indices wrap
+        // with a mask (total pushes per drain are unbounded — a process may be
+        // re-woken after it runs — only the live count is bounded).
+        const auto cap = std::bit_ceil(std::max<size_t>(mod_.processes().size(), 1));
+        active_mask_   = static_cast<uint32_t>(cap - 1);
 
         queue_arr_ty_ = llvm::ArrayType::get(ptr_ty, cap);
         active_gv_    = new llvm::GlobalVariable(llmod_, queue_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
                                                  llvm::ConstantAggregateZero::get(queue_arr_ty_), "clotho.active");
-        // Stack top: index of the next free slot. Starts at 0 (empty).
-        active_top_gv_ = new llvm::GlobalVariable(llmod_, i32, false, llvm::GlobalValue::InternalLinkage,
-                                                  llvm::ConstantInt::get(i32, 0), "clotho.active_top");
+        // Ring indices: pop at head, push at tail, empty iff equal. Monotone
+        // u32s (masked on access), so u32 wraparound is harmless.
+        active_head_gv_ = new llvm::GlobalVariable(llmod_, i32, false, llvm::GlobalValue::InternalLinkage,
+                                                   llvm::ConstantInt::get(i32, 0), "clotho.active_head");
+        active_tail_gv_ = new llvm::GlobalVariable(llmod_, i32, false, llvm::GlobalValue::InternalLinkage,
+                                                   llvm::ConstantInt::get(i32, 0), "clotho.active_tail");
     }
 
     // The inactive queue: same shape and capacity as the active queue, holding
@@ -2291,14 +2303,15 @@ private:
                                                     llvm::ConstantInt::get(i32, 0), "clotho.inactive_top");
     }
 
-    // Push a handle onto the active queue: queue[top++] = handle.
+    // Push a handle onto the active ring: queue[tail++ & mask] = handle.
     void emit_active_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
         ensure_active_queue();
         auto*        i32  = b.getInt32Ty();
-        llvm::Value* sp   = b.CreateLoad(i32, active_top_gv_);
-        llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, active_gv_, { b.getInt32(0), sp });
+        llvm::Value* tl   = b.CreateLoad(i32, active_tail_gv_);
+        llvm::Value* idx  = b.CreateAnd(tl, b.getInt32(active_mask_));
+        llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, active_gv_, { b.getInt32(0), idx });
         b.CreateStore(handle, slot);
-        b.CreateStore(b.CreateAdd(sp, b.getInt32(1)), active_top_gv_);
+        b.CreateStore(b.CreateAdd(tl, b.getInt32(1)), active_tail_gv_);
     }
 
     // Push a handle onto the inactive queue: inactive[top++] = handle.
@@ -2572,7 +2585,8 @@ private:
         // before any servicing scans it. Everything else (initial blocks,
         // sensitivity-less always / continuous assigns) is enqueued to run during
         // the drain.
-        b_.CreateStore(b_.getInt32(0), active_top_gv_);
+        b_.CreateStore(b_.getInt32(0), active_head_gv_);
+        b_.CreateStore(b_.getInt32(0), active_tail_gv_);
         const bool has_inactive = inactive_gv_ != nullptr; // some #0 was lowered
         if (has_inactive) {
             b_.CreateStore(b_.getInt32(0), inactive_top_gv_);
@@ -2654,14 +2668,16 @@ private:
         auto* ipromote = has_inactive ? llvm::BasicBlock::Create(ctx_, "inactive.promote", fn) : nullptr;
         b_.CreateBr(check);
 
-        // Drain the active queue: while top != 0, pop active[--top] and resume it.
+        // Drain the active ring: while head != tail, pop active[head++ & mask]
+        // and resume it.
         b_.SetInsertPoint(check);
-        llvm::Value* sp = b_.CreateLoad(i32, active_top_gv_);
-        b_.CreateCondBr(b_.CreateICmpNE(sp, b_.getInt32(0)), body, icheck);
+        llvm::Value* hd = b_.CreateLoad(i32, active_head_gv_);
+        llvm::Value* tl = b_.CreateLoad(i32, active_tail_gv_);
+        b_.CreateCondBr(b_.CreateICmpNE(hd, tl), body, icheck);
 
         b_.SetInsertPoint(body);
-        llvm::Value* idx  = b_.CreateSub(sp, b_.getInt32(1));
-        b_.CreateStore(idx, active_top_gv_);
+        b_.CreateStore(b_.CreateAdd(hd, b_.getInt32(1)), active_head_gv_);
+        llvm::Value* idx  = b_.CreateAnd(hd, b_.getInt32(active_mask_));
         llvm::Value* slot = b_.CreateInBoundsGEP(queue_arr_ty_, active_gv_, { b_.getInt32(0), idx });
         llvm::Value* hdl  = b_.CreateLoad(ptr_ty, slot);
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
@@ -2685,7 +2701,8 @@ private:
             b_.CreateCondBr(b_.CreateICmpNE(n, b_.getInt32(0)), ipromote, ncheck);
 
             // for (i = 0; i < n; ++i) active[i] = inactive[i];
-            // active_top = n; inactive_top = 0; then loop back to the drain.
+            // head = 0, tail = n (ring empty here, n <= cap); inactive_top = 0;
+            // then loop back to the drain.
             auto* phead = llvm::BasicBlock::Create(ctx_, "inactive.copy", fn);
             auto* pbody = llvm::BasicBlock::Create(ctx_, "inactive.copy.body", fn);
             auto* pdone = llvm::BasicBlock::Create(ctx_, "inactive.copy.done", fn);
@@ -2705,7 +2722,8 @@ private:
             b_.CreateBr(phead);
 
             b_.SetInsertPoint(pdone);
-            b_.CreateStore(n, active_top_gv_);
+            b_.CreateStore(b_.getInt32(0), active_head_gv_);
+            b_.CreateStore(n, active_tail_gv_);
             b_.CreateStore(b_.getInt32(0), inactive_top_gv_);
             b_.CreateBr(check);
         }
@@ -6537,10 +6555,12 @@ private:
     // the same instant, after active settles but before NBA.
     llvm::Function*                     enqueue_fn_        = nullptr;
     llvm::GlobalVariable*               active_gv_         = nullptr;
-    llvm::GlobalVariable*               active_top_gv_     = nullptr;
+    llvm::GlobalVariable*               active_head_gv_    = nullptr;
+    llvm::GlobalVariable*               active_tail_gv_    = nullptr;
     llvm::GlobalVariable*               inactive_gv_       = nullptr;
     llvm::GlobalVariable*               inactive_top_gv_   = nullptr;
     llvm::ArrayType*                    queue_arr_ty_      = nullptr;
+    uint32_t                            active_mask_       = 0;
     // Per-signal wait queues, indexed by Signal handle and then by edge bucket
     // (`[signal][static_cast<uint32_t>(edge)]`: 0=pos, 1=neg, 2=any); null where the
     // signal has no waiter of that (kind, edge). Splitting by edge hoists the
