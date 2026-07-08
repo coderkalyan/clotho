@@ -121,6 +121,29 @@ def gen_thunk(n: int, cycles: int, shape: str) -> str:
     return "\n".join(out) + "\n"
 
 
+def gen_wheel(cycles: int) -> str:
+    """Timestep-bound clock microbench: one #delay clock generator and one
+    trivial clocked process, so ~2 wheel ticks per cycle dominate over the
+    single per-cycle activation. Isolates the timing-wheel / JIT<->runtime ABI
+    boundary cost (rt_wheel_advance), which activation-bound benches hide."""
+    return (
+        "module top;\n"
+        "  reg clk = 0;\n"
+        "  reg [31:0] acc = 0;\n"
+        "  reg [31:0] cyc = 0;\n"
+        "  always #5 clk = ~clk;\n"
+        "  always @(posedge clk) begin\n"
+        "    acc <= acc + 32'd2654435761;\n"
+        "    cyc <= cyc + 32'd1;\n"
+        f"    if (cyc == 32'd{cycles}) begin\n"
+        '      $display("done %h", acc);\n'
+        "      $finish;\n"
+        "    end\n"
+        "  end\n"
+        "endmodule\n"
+    )
+
+
 def gen_tri(k: int, cycles: int, fused: bool, order: str) -> str:
     out = []
     out.append("module top;")
@@ -219,7 +242,7 @@ def gen_chain(k: int, cycles: int, fused: bool, order: str) -> str:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("bench", choices=["regs", "tri", "chain", "thunk"])
+    ap.add_argument("bench", choices=["regs", "tri", "chain", "thunk", "wheel"])
     ap.add_argument("--n", type=int, required=True)
     ap.add_argument("--cycles", type=int, required=True)
     ap.add_argument("--fused", action="store_true")
@@ -233,5 +256,7 @@ if __name__ == "__main__":
         sys.stdout.write(gen_tri(a.n, a.cycles, a.fused, a.order))
     elif a.bench == "chain":
         sys.stdout.write(gen_chain(a.n, a.cycles, a.fused, a.order))
-    else:
+    elif a.bench == "thunk":
         sys.stdout.write(gen_thunk(a.n, a.cycles, a.shape))
+    else:
+        sys.stdout.write(gen_wheel(a.cycles))
