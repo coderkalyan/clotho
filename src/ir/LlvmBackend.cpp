@@ -3894,14 +3894,11 @@ private:
             }
 
             case Inst::Tag::Pow: {
+                // Result signedness follows the base (op1); the exponent (op2) is
+                // self-determined. Both flags feed Table 11-4's signed corners.
                 const ValType lt = type_of(p.binary.l);
-                if (lt.is_signed || type_of(p.binary.r).is_signed) {
-                    // TODO: signed ** carries the negative-base/negative-exponent corners of LRM
-                    // Table 11-4 (op1 == -1 parity, |op1| > 1 with op2 < 0 -> 0, etc.); only the
-                    // unsigned path is lowered.
-                    throw BackendError{ "signed power operator (**) not yet supported" };
-                }
-                set_value(i, lower_pow(value_of(p.binary.l), value_of(p.binary.r)));
+                const ValType rt = type_of(p.binary.r);
+                set_value(i, lower_pow(value_of(p.binary.l), value_of(p.binary.r), lt.is_signed, rt.is_signed));
                 return;
             }
 
@@ -6072,29 +6069,46 @@ private:
         return { mm, zero(w) };
     }
 
-    // Power (**), unsigned. LRM 1800-2023 §11.4.3: the exponent is self-determined
-    // (so it may be a different width from the base/result), any X/Z bit makes the
-    // result X, and the unsigned table corners (exp 0 -> 1, 0**n -> 0, 1**n -> 1)
-    // fall out of exponentiation by squaring.
-    Plane lower_pow(Plane a, Plane b) {
+    // Power (**). LRM 1800-2023 §11.4.3: the exponent is self-determined (so it may
+    // be a different width from the base/result), any X/Z bit makes the result X, and
+    // the positive-exponent table corners (exp 0 -> 1, 0**n -> 0, 1**n -> 1) fall out
+    // of exponentiation by squaring. Two's-complement multiply is sign-agnostic, so
+    // the same loop is bit-correct for a signed base at a non-negative exponent.
+    //
+    // A negative exponent is reachable only when the exponent type is signed; it
+    // triggers Table 11-4's negative-op2 corners, computed branchlessly (op1==0 -> X,
+    // op1==1 -> 1, signed op1==-1 -> parity of op2, else -> 0). base_signed gates the
+    // op1==-1 case: an unsigned all-ones is a large positive, so it takes the `else`.
+    Plane lower_pow(Plane a, Plane b, bool base_signed, bool exp_signed) {
         const uint32_t w  = width_of(a);
         const uint32_t ew = width_of(b);
 
-        // 2-state (unsigned): reuse the 4-state exponentiation-by-squaring loop on
-        // the lifted operands (no X bits, so the loop's cold X block folds away),
-        // then project the definite result back to a single iW. Avoids duplicating
-        // the delicate loop.
+        // 2-state: reuse the 4-state exponentiation-by-squaring loop on the lifted
+        // operands (no X bits, so the loop's cold X block folds away), then project
+        // the definite result back to a single iW. Avoids duplicating the delicate
+        // loop; a 0**neg -> X result projects to 0 via must_of (LRM 6.3.1).
         if (a.two) {
-            return two_val(must_of(lower_pow(to_four(a), to_four(b))));
+            return two_val(must_of(lower_pow(to_four(a), to_four(b), base_signed, exp_signed)));
         }
 
-        // Width-1 base and exponent: index the truth table (exp 0 -> 1, 1**n -> 1,
-        // 0**(n>0) -> 0, any X -> X). A wider exponent stays on the runtime path.
-        if (w == 1 && ew == 1) {
+        // Past the a.two return the base is 4-state, but the exponent may still be
+        // 2-state (mixed domains: a 4-state base with a 2-state exponent, e.g. the
+        // common `x ** 3` where a bare literal is 2-state). The 4-state paths below
+        // read the exponent's packed i(2*ew) word, so lift it — otherwise the
+        // X-mask's `b.mm >> ew` shifts an iW value by its full width (poison).
+        b = to_four(b);
+
+        // Width-1 base and exponent, both unsigned: index the truth table (exp 0 -> 1,
+        // 1**n -> 1, 0**(n>0) -> 0, any X -> X). The LUT is unsigned-only; a signed
+        // operand falls through to the general path (which handles the -1 corner). A
+        // wider exponent stays on the runtime path.
+        if (w == 1 && ew == 1 && !base_signed && !exp_signed) {
             return single_bit_lut(POW1_LUT, a, b);
         }
 
         auto* wide = int_ty(2 * w);
+        auto* wty  = int_ty(w);
+        auto* ety  = int_ty(ew);
 
         // X/Z in either operand -> all-X. The operands can differ in width, so each
         // mask is tested at its own width and the two feed one cold branch.
@@ -6104,30 +6118,59 @@ private:
         llvm::Value* ub      = b_.CreateICmpNE(b_.CreateTrunc(xb, int_ty(ew)), zero(ew));
         llvm::Value* unknown = b_.CreateOr(ua, ub);
 
-        auto* x_bb   = llvm::BasicBlock::Create(ctx_, "pow.x", fn_);
-        auto* val_bb = llvm::BasicBlock::Create(ctx_, "pow.val", fn_);
-        auto* end_bb = llvm::BasicBlock::Create(ctx_, "pow.end", fn_);
+        auto* x_bb    = llvm::BasicBlock::Create(ctx_, "pow.x", fn_);
+        auto* known_bb = llvm::BasicBlock::Create(ctx_, "pow.known", fn_);
+        auto* val_bb  = llvm::BasicBlock::Create(ctx_, "pow.val", fn_);
+        auto* end_bb  = llvm::BasicBlock::Create(ctx_, "pow.end", fn_);
 
-        llvm::BranchInst* br = b_.CreateCondBr(unknown, x_bb, val_bb);
+        llvm::BranchInst* br = b_.CreateCondBr(unknown, x_bb, known_bb);
         br->setMetadata(llvm::LLVMContext::MD_prof, llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
 
         b_.SetInsertPoint(x_bb);
         llvm::Value* x_word = x_mm(w);
         b_.CreateBr(end_bb);
 
+        // Operands known. Seeds are materialized here so they dominate both the loop
+        // (non-negative exponent) and the negative-exponent corner block below.
+        b_.SetInsertPoint(known_bb);
+        llvm::Value* base0 = must_of(a);
+        llvm::Value* exp0  = must_of(b);
+
+        // Negative-exponent corners (Table 11-4), reachable only for a signed
+        // exponent. Branchless: is0 -> X, is1 or (-1 with even op2) -> 1, -1 with
+        // odd op2 -> all-ones (-1), otherwise 0.
+        llvm::BasicBlock* neg_bb = nullptr;
+        llvm::Value*      neg_mm = nullptr;
+        if (exp_signed) {
+            neg_bb = llvm::BasicBlock::Create(ctx_, "pow.neg", fn_);
+            b_.CreateCondBr(b_.CreateICmpSLT(exp0, zero(ew)), neg_bb, val_bb);
+
+            b_.SetInsertPoint(neg_bb);
+            llvm::Value* all_ones = llvm::ConstantInt::getAllOnesValue(wty);
+            llvm::Value* is0      = b_.CreateICmpEQ(base0, zero(w));
+            llvm::Value* is1      = b_.CreateICmpEQ(base0, llvm::ConstantInt::get(wty, 1));
+            llvm::Value* ism1     = base_signed ? b_.CreateICmpEQ(base0, all_ones) : b_.getFalse();
+            llvm::Value* odd      = b_.CreateTrunc(exp0, b_.getInt1Ty());
+            llvm::Value* one_like = b_.CreateOr(is1, b_.CreateAnd(ism1, b_.CreateNot(odd)));
+            llvm::Value* negone   = b_.CreateAnd(ism1, odd);
+            llvm::Value* val      = b_.CreateSelect(
+              negone, all_ones, b_.CreateSelect(one_like, llvm::ConstantInt::get(wty, 1), zero(w)));
+            neg_mm = b_.CreateSelect(is0, x_mm(w), packed(val, val, zero(w)).mm);
+            b_.CreateBr(end_bb);
+
+            b_.SetInsertPoint(val_bb);
+        } else {
+            b_.CreateBr(val_bb);
+            b_.SetInsertPoint(val_bb);
+        }
+
         // Hot: exponentiation by squaring at the result width W. Every product wraps
         // modulo 2^W, the correct result for width W; the wide (>64-bit) multiply
         // legalizes to the __multi3 libcall resolved in the JIT. The exponent keeps
         // its self-determined width so wide exponents are not truncated. The loop
         // always runs once (exp 0 -> one no-op iteration leaving result 1), which
-        // yields the unsigned table corners directly.
-        b_.SetInsertPoint(val_bb);
-        auto*        wty   = int_ty(w);
-        auto*        ety   = int_ty(ew);
-        // Seed values are materialized in val_bb so they dominate the loop's entry edge.
-        llvm::Value* base0 = must_of(a);
-        llvm::Value* exp0  = must_of(b);
-        auto*        loop  = llvm::BasicBlock::Create(ctx_, "pow.loop", fn_);
+        // yields the non-negative table corners directly.
+        auto* loop = llvm::BasicBlock::Create(ctx_, "pow.loop", fn_);
         b_.CreateBr(loop);
 
         b_.SetInsertPoint(loop);
@@ -6157,9 +6200,12 @@ private:
         exp->addIncoming(next_exp, loop);
 
         b_.SetInsertPoint(end_bb);
-        llvm::PHINode* mm = b_.CreatePHI(wide, 2);
+        llvm::PHINode* mm = b_.CreatePHI(wide, neg_bb ? 3 : 2);
         mm->addIncoming(x_word, x_bb);
         mm->addIncoming(val_mm, loop);
+        if (neg_bb) {
+            mm->addIncoming(neg_mm, neg_bb);
+        }
         return { mm, zero(w) };
     }
 
