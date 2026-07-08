@@ -85,6 +85,15 @@ add_library(clotho_runtime STATIC
 )
 target_include_directories(clotho_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(clotho_runtime PRIVATE clotho_warnings)
+# Always optimize the runtime, even in a Debug build. It is stable native code
+# the JIT'd design calls into on every event; at -O0 its trivial leaf functions
+# (unwrap, WheelImpl accessors) stop inlining and the timing wheel reads as pure
+# call overhead — distorting `perf` profiles and slowing every simulation. Debug
+# is for iterating on the compiler, not the runtime, so pin this target to -O2
+# there (asserts stay live — NDEBUG is not forced, so the runtime keeps its
+# safety checks). Release / RelWithDebInfo already optimize; the genex leaves
+# them untouched.
+target_compile_options(clotho_runtime PRIVATE $<$<CONFIG:Debug>:-O2>)
 
 # Backend IR + passes. Target-agnostic, no slang dependency: handles the bulk
 # of compiler logic short of the slang -> IR translation layer.
