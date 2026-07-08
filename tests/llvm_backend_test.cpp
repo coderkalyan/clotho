@@ -64,7 +64,9 @@ std::string emit_raw(std::string_view source, ir::SimulationConfig config = { .o
 }
 
 // JIT-run a module and return everything its initial blocks wrote to stdout.
-std::string run_capture(std::string_view source) {
+// The config lets a test A/B the same design across lowerings (e.g. thunk vs
+// --no-thunk) and assert byte-identical output.
+std::string run_capture(std::string_view source, ir::SimulationConfig config = {}) {
     const LowerResult r = lower_text(source);
     REQUIRE_MESSAGE(r.ok, r.diagnostics);
     REQUIRE(r.module != nullptr);
@@ -76,7 +78,7 @@ std::string run_capture(std::string_view source) {
     const int saved = dup(fileno(stdout));
     dup2(fileno(tmp), fileno(stdout));
 
-    ir::run_jit(*r.module);
+    ir::run_jit(*r.module, nullptr, config);
 
     std::fflush(stdout);
     dup2(saved, fileno(stdout));
@@ -3374,6 +3376,35 @@ TEST_CASE("identical-sensitivity clocked processes fuse and stay correct") {
     // a coroutine under --no-thunk.
     CHECK(count_substr(emit(src), ".f3.thunk(") == 1);
     CHECK(count_substr(emit(src, { .thunk = false }), ".f3(") == 1);
+}
+
+TEST_CASE("thunk lowering: eligibility matrix and coroutine equivalence") {
+    // A suspension-free always-with-sensitivity (no #delay / intra-body @wait /
+    // task call, and no blocking write to its own sensitivity) elides its
+    // coroutine and lowers to a plain per-activation thunk. Constructs that can
+    // suspend, or self-wake, must stay coroutines.
+    constexpr std::string_view src = R"(
+        module top;
+            reg clk = 0;
+            reg [7:0] a = 0, b = 0, x = 0, y = 0, w = 0;
+            always @(posedge clk) a <= a + 8'd1;          // clocked NBA -> thunk
+            always @(b)           x = b + 8'd1;           // level comb   -> thunk
+            always @(posedge clk) begin #1 y <= y + 8'd1; end // #delay   -> coroutine
+            always @(w) if (w < 8'd3) w = w + 8'd1;       // self-write   -> coroutine
+            initial begin #5 clk = 1; b = 8'd7; #5 clk = 0; #5 $finish; end
+        endmodule
+    )";
+    // Exactly the two simple always blocks become thunks; the two non-elidable
+    // always blocks and the initial stay coroutines.
+    CHECK(count_substr(emit(src), ".thunk(") == 2);
+    // Under --no-thunk nothing elides, and there are strictly more coroutine
+    // frames (the two simple procs are coroutines again).
+    CHECK(count_substr(emit(src, { .thunk = false }), ".thunk(") == 0);
+    CHECK(count_substr(emit_raw(src), "call ptr @llvm.coro.begin")
+          < count_substr(emit_raw(src, { .thunk = false }), "call ptr @llvm.coro.begin"));
+    // Elision is behavior-preserving: the same design produces byte-identical
+    // output with thunks on and off.
+    CHECK(run_capture(src) == run_capture(src, { .thunk = false }));
 }
 
 TEST_CASE("suspension points and self-sensitivity writes block fusion") {
