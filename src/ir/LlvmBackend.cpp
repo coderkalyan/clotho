@@ -2128,6 +2128,47 @@ private:
                          [&](uint32_t a, uint32_t b) { return level[dense(a)] < level[dense(b)]; });
     }
 
+    // True when a process is a suspension-free always-with-sensitivity: an
+    // Always with a static sensitivity list whose body has no suspension point
+    // (#delay, intra-body @/wait, task call) and no blocking write to a signal
+    // in its own sensitivity set. Such a process re-runs its whole body on each
+    // trigger with no state carried across activations, so it can lower to a
+    // plain per-activation thunk instead of a coroutine (see the thunk path in
+    // lower_group) and can be fused with peers sharing its sensitivity. Shared
+    // by compute_fusion_groups and the thunk decision.
+    bool is_simple_always(const Process& p) const {
+        if (p.activation != Activation::Always || p.wait_events.empty()) {
+            return false;
+        }
+        for (size_t k = 0; k < p.ir.inst_count(); ++k) {
+            const auto idx = static_cast<Index>(k);
+            switch (p.ir.tag(idx)) {
+                case Inst::Tag::Delay:
+                case Inst::Tag::Wait:
+                case Inst::Tag::TaskCall:
+                    return false;
+                case Inst::Tag::Store: {
+                    const LvalueRoot r = lvalue_root(p.ir, p.ir.payload(idx).binary.l);
+                    if (p.ir.tag(r.root) != Inst::Tag::Signal) {
+                        break;
+                    }
+                    // Membership in the raw wait list is identical to membership
+                    // in the deduped canonical set.
+                    const auto sig = static_cast<uint32_t>(p.ir.payload(r.root).signal);
+                    for (const WaitEvent& w : p.wait_events) {
+                        if (static_cast<uint32_t>(w.signal) == sig) {
+                            return false;
+                        }
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+        return true;
+    }
+
     // V1 static process fusion: partition processes into groups that lower to a
     // single coroutine each. A group's members share an identical canonical
     // sensitivity set and self_start flag, so the fused wake set equals every
@@ -2168,38 +2209,6 @@ private:
             return key;
         };
 
-        const auto fusable = [&](const Process& p) {
-            if (p.activation != Activation::Always || p.wait_events.empty()) {
-                return false;
-            }
-            const auto key = canonical(p.wait_events);
-            for (size_t k = 0; k < p.ir.inst_count(); ++k) {
-                const auto idx = static_cast<Index>(k);
-                switch (p.ir.tag(idx)) {
-                    case Inst::Tag::Delay:
-                    case Inst::Tag::Wait:
-                    case Inst::Tag::TaskCall:
-                        return false;
-                    case Inst::Tag::Store: {
-                        const LvalueRoot r = lvalue_root(p.ir, p.ir.payload(idx).binary.l);
-                        if (p.ir.tag(r.root) != Inst::Tag::Signal) {
-                            break;
-                        }
-                        const auto sig = static_cast<uint32_t>(p.ir.payload(r.root).signal);
-                        for (const auto& [s, e] : key) {
-                            if (s == sig) {
-                                return false;
-                            }
-                        }
-                        break;
-                    }
-                    default:
-                        break;
-                }
-            }
-            return true;
-        };
-
         // Bucket fusable processes by (canonical events, self_start), preserving
         // first-seen order; everything else is its own singleton group. Group
         // size is capped so one fused coroutine cannot grow arbitrarily large
@@ -2208,7 +2217,7 @@ private:
         std::map<std::pair<std::vector<std::pair<uint32_t, uint32_t>>, bool>, uint32_t> by_key;
         for (uint32_t k = 0; k < nprocs; ++k) {
             const Process& p = all[k];
-            if (config_.fuse && fusable(p)) {
+            if (config_.fuse && is_simple_always(p)) {
                 const auto key = std::make_pair(canonical(p.wait_events), p.self_start);
                 const auto it  = by_key.find(key);
                 if (it != by_key.end() && groups_[it->second].size() < group_cap) {

@@ -24,6 +24,13 @@ struct SimulationConfig {
     // bisection / debugging; semantics are identical either way (the fused
     // member order is one of the LRM-allowed same-instant orders).
     bool fuse = true;
+    // Lower a suspension-free always-process (no #delay / intra-body wait / task
+    // call, and no blocking write to its own sensitivity) to a plain thunk
+    // called once per activation instead of an LLVM coroutine — eliding the
+    // frame, the suspend state machine, and CoroSplit (see is_simple_always /
+    // the thunk path in LlvmBackend.cpp). Disable for bisection / debugging;
+    // semantics are byte-identical (same sched-flag timeline, same FIFO order).
+    bool thunk = true;
     // Register LLVM's perf JITEventListener on the object-linking layer so the
     // JIT'd design's functions show up in `perf` with real symbols. Emits a
     // jitdump (`$JITDUMPDIR/jit-<pid>.dump`) consumed by `perf inject --jit`.
