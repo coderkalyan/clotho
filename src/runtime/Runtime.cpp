@@ -682,6 +682,10 @@ extern "C" void rt_wheel_tick(rt_wheel* wheel, void* ctx) {
     unwrap(wheel)->tick(ctx);
 }
 
+extern "C" int rt_wheel_advance(rt_wheel* wheel, void* ctx) {
+    return unwrap(wheel)->advance(ctx) ? 1 : 0;
+}
+
 extern "C" void rt_fwrite(int32_t desc, const char* fmt, uint32_t argc, const rt_arg* argv) {
     io_ensure_init();
     // Write raw: `out` may contain '%' or '{}' that printf/std::print would treat

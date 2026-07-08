@@ -810,9 +810,9 @@ TEST_CASE("delay suspends and reschedules on the wheel") {
     // The timer callback that wakes the suspended coroutine by pushing its handle
     // onto the active queue.
     CHECK(ir.find("define internal void @clotho.enqueue_timer") != std::string::npos);
-    // main drains the wheel: tick while timers are pending.
-    CHECK(ir.find("call i32 @rt_wheel_pending") != std::string::npos);
-    CHECK(ir.find("call void @rt_wheel_tick") != std::string::npos);
+    // main drains the wheel: advance while timers are pending (the pending-check
+    // is folded into the tick, one ABI crossing per timestep).
+    CHECK(ir.find("call i32 @rt_wheel_advance") != std::string::npos);
 }
 
 TEST_CASE("multi-bit if / ?: predicates reduce to LRM truth values") {

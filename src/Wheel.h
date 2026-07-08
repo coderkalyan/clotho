@@ -166,16 +166,29 @@ public:
         impl_.schedule(t, deadline);
     }
 
-    // Advance to the next non-empty tick and fire its timers. A node is unlinked
-    // before its callback runs, so the callback may re-schedule it.
-    void tick(Args... args) {
+    // Advance to the next non-empty tick and fire its timers; return false if the
+    // wheel was empty (nothing scheduled anywhere). A node is unlinked before its
+    // callback runs, so the callback may re-schedule it. Folds the emptiness
+    // check into the advance: advance() already returns null iff the wheel is
+    // empty, so the drain loop needs neither a separate empty() occupancy scan
+    // nor a second ABI-boundary crossing per timestep.
+    bool advance(Args... args) {
         Timer* t = impl_.advance();
-        while (t != nullptr) {
+        if (t == nullptr) {
+            return false;
+        }
+        do {
             Timer* next = t->next;
             t->next     = nullptr;
             reinterpret_cast<Callback>(t->on_expire)(t, args...);
             t = next;
-        }
+        } while (t != nullptr);
+        return true;
+    }
+
+    // Advance and fire, ignoring whether anything was pending.
+    void tick(Args... args) {
+        advance(args...);
     }
 
 private:

@@ -397,4 +397,10 @@ void rt_wheel_schedule(rt_wheel* wheel, rt_timer* timer, uint64_t deadline, rt_t
 // its callback runs, so a callback may re-schedule it.
 void rt_wheel_tick(rt_wheel* wheel, void* ctx);
 
+// rt_wheel_pending + rt_wheel_tick folded into one call: advance and fire if any
+// timer is scheduled and return non-zero, else return zero. Lets the sim loop
+// cross the ABI boundary once per timestep instead of twice and skips the
+// separate occupancy scan (advance already reports emptiness).
+int rt_wheel_advance(rt_wheel* wheel, void* ctx);
+
 } // extern "C"

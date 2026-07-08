@@ -170,6 +170,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config) {
     expose("rt_wheel_pending", &rt_wheel_pending);
     expose("rt_wheel_schedule", &rt_wheel_schedule);
     expose("rt_wheel_tick", &rt_wheel_tick);
+    expose("rt_wheel_advance", &rt_wheel_advance);
     if (auto err = jd.define(llvm::orc::absoluteSymbols(std::move(rt_syms)))) {
         llvm::errs() << "jit: " << llvm::toString(std::move(err)) << "\n";
         return -1;

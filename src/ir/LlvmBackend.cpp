@@ -3242,15 +3242,16 @@ private:
             b_.CreateBr(check);
         }
 
-        // Queue empty: if any timer remains, advance one instant (firing its timers,
-        // which enqueue their handles) and go drain the queue again.
+        // Queue empty: advance one instant (firing any timers, which enqueue their
+        // handles) and re-drain. rt_wheel_advance folds the pending-check into the
+        // tick — one ABI crossing per timestep, no separate occupancy scan — and
+        // returns non-zero iff it fired something (an idle wheel ends the sim).
         b_.SetInsertPoint(wcheck);
-        llvm::Value* pending = b_.CreateCall(wheel_pending_fn(), { wheel });
-        b_.CreateCondBr(b_.CreateICmpNE(pending, b_.getInt32(0)), wtick, wdone);
+        llvm::Value* ticked = b_.CreateCall(wheel_advance_fn(), { wheel, null });
+        b_.CreateCondBr(b_.CreateICmpNE(ticked, b_.getInt32(0)), check, wdone);
 
-        b_.SetInsertPoint(wtick);
-        b_.CreateCall(wheel_tick_fn(), { wheel, null });
-        b_.CreateBr(check);
+        b_.SetInsertPoint(wtick); // unreachable now; kept so block wiring stays valid
+        b_.CreateBr(wdone);
 
         b_.SetInsertPoint(wdone);
     }
@@ -3387,6 +3388,10 @@ private:
     // void rt_wheel_tick(rt_wheel*, void* ctx)
     llvm::FunctionCallee wheel_tick_fn() {
         return rt_fn("rt_wheel_tick", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    // int rt_wheel_advance(rt_wheel*, void* ctx)
+    llvm::FunctionCallee wheel_advance_fn() {
+        return rt_fn("rt_wheel_advance", b_.getInt32Ty(), { raw_ptr_ty(), raw_ptr_ty() });
     }
 
     // Power-up the state struct: undriven 4-state nets come up Z (LRM 6.6 —
