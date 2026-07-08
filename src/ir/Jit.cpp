@@ -4,11 +4,14 @@
 #include <memory>
 #include <mutex>
 
+#include <llvm/ExecutionEngine/JITEventListener.h>
 #include <llvm/ExecutionEngine/Orc/AbsoluteSymbols.h>
 #include <llvm/ExecutionEngine/Orc/Core.h>
 #include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
 #include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h>
+#include <llvm/ExecutionEngine/SectionMemoryManager.h>
 #include <llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 #include <llvm/IR/LLVMContext.h>
@@ -68,7 +71,34 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config) {
     }
     jtmb->setCodeGenOptLevel(llvm::CodeGenOptLevel::None);
 
-    auto jit = llvm::orc::LLJITBuilder().setJITTargetMachineBuilder(std::move(*jtmb)).create();
+    llvm::orc::LLJITBuilder builder;
+    builder.setJITTargetMachineBuilder(std::move(*jtmb));
+
+    // Register the perf jitdump listener on the object-linking layer. The
+    // default LLJIT layer is RTDyldObjectLinkingLayer; supply our own so we can
+    // attach the listener. createPerfJITEventListener returns null unless LLVM
+    // was built -DLLVM_USE_PERF=ON; skip registration (no symbols in perf) then.
+    if (config.perf_jitdump) {
+        builder.setObjectLinkingLayerCreator(
+          [](llvm::orc::ExecutionSession& es)
+            -> llvm::Expected<std::unique_ptr<llvm::orc::ObjectLayer>> {
+              auto layer = std::make_unique<llvm::orc::RTDyldObjectLinkingLayer>(
+                es, [](const llvm::MemoryBuffer&) {
+                    return std::make_unique<llvm::SectionMemoryManager>();
+                });
+              if (auto* perf = llvm::JITEventListener::createPerfJITEventListener()) {
+                  // Leaked deliberately: the listener must outlive the layer, and
+                  // both live until process exit. LLVM offers no owning handle.
+                  layer->registerJITEventListener(*perf);
+              } else {
+                  llvm::errs() << "jit: perf jitdump requested but this LLVM lacks "
+                                  "perf support (LLVM_USE_PERF); no symbols emitted\n";
+              }
+              return layer;
+          });
+    }
+
+    auto jit = builder.create();
     if (!jit) {
         llvm::errs() << "jit: " << llvm::toString(jit.takeError()) << "\n";
         return -1;

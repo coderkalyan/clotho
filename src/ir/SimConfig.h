@@ -14,6 +14,12 @@ struct SimulationConfig {
     // (ZElision.h) proves never carry z. Disable for bisection / debugging;
     // semantics are identical either way.
     bool z_elision = true;
+    // Register LLVM's perf JITEventListener on the object-linking layer so the
+    // JIT'd design's functions show up in `perf` with real symbols. Emits a
+    // jitdump (`$JITDUMPDIR/jit-<pid>.dump`) consumed by `perf inject --jit`.
+    // Off by default: the listener adds per-object bookkeeping and writes the
+    // dump file. Run-only knob (build_module ignores it).
+    bool perf_jitdump = false;
 };
 
 } // namespace clotho::ir
