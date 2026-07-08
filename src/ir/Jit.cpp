@@ -61,15 +61,16 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config) {
     }
     llvm::orc::ThreadSafeModule tsm(std::move(mod), std::move(ctx));
 
-    // Pin the JIT's machine-code generation to -O0. The IR is already optimized
-    // by the backend's own pass pipeline before it reaches ORC, so the codegen
-    // optimizer adds compile time for little gain on the JIT path.
+    // Machine-code generation matches the IR tier: -O0/FastISel for tier 0
+    // (the backend pipeline already did the cheap cleanup; codegen quality is
+    // deliberately traded for compile speed) and Aggressive under -O.
     auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
     if (!jtmb) {
         llvm::errs() << "jit: " << llvm::toString(jtmb.takeError()) << "\n";
         return -1;
     }
-    jtmb->setCodeGenOptLevel(llvm::CodeGenOptLevel::None);
+    jtmb->setCodeGenOptLevel(config.o3 ? llvm::CodeGenOptLevel::Aggressive
+                                       : llvm::CodeGenOptLevel::None);
 
     llvm::orc::LLJITBuilder builder;
     builder.setJITTargetMachineBuilder(std::move(*jtmb));

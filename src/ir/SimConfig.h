@@ -14,6 +14,11 @@ struct SimulationConfig {
     // (ZElision.h) proves never carry z. Disable for bisection / debugging;
     // semantics are identical either way.
     bool z_elision = true;
+    // Opt-in aggressive tier: replace the tier-0 coroutine pipeline with
+    // LLVM's default<O3> module pipeline (which includes the coro passes) and
+    // raise machine codegen from None/FastISel to Aggressive. Costs compile
+    // time; wins simulation time on long traces.
+    bool o3 = false;
     // Fuse always-processes with identical canonical sensitivity into one
     // coroutine (see compute_fusion_groups in LlvmBackend.cpp). Disable for
     // bisection / debugging; semantics are identical either way (the fused

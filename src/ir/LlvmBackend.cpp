@@ -7016,7 +7016,7 @@ private:
 // errors if instcombine's single iteration does not converge on our
 // non-canonical IR. Returns false (reason on errs()) only if the pipeline
 // string is rejected.
-bool lower_coroutines(llvm::Module& m) {
+bool lower_coroutines(llvm::Module& m, bool o3) {
     llvm::PassBuilder         pb;
     llvm::LoopAnalysisManager     lam;
     llvm::FunctionAnalysisManager fam;
@@ -7029,7 +7029,13 @@ bool lower_coroutines(llvm::Module& m) {
     pb.crossRegisterProxies(lam, fam, cgam, mam);
 
     llvm::ModulePassManager mpm;
-    if (auto err = pb.parsePassPipeline(mpm,
+    if (o3) {
+        // Aggressive tier: LLVM's full default<O3> pipeline, which contains
+        // the mandatory coro passes (CoroEarly / CoroSplit in the CGSCC nest /
+        // CoroCleanup) plus the loop/GVN/vectorizer stack tier 0 omits.
+        mpm = pb.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
+    }
+    else if (auto err = pb.parsePassPipeline(mpm,
                                         "coro-early,"
                                         "cgscc(inline,function(sroa,early-cse,simplifycfg,instcombine<no-verify-fixpoint>),coro-split),"
                                         "function(simplifycfg,instcombine<no-verify-fixpoint>,dce),"
@@ -7087,7 +7093,7 @@ std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& c
     }
     // Lower the coroutines and verify again — the second pass guards against
     // malformed coro lowering.
-    if (!lower_coroutines(*llmod)) {
+    if (!lower_coroutines(*llmod, config.o3)) {
         return nullptr;
     }
     if (llvm::verifyModule(*llmod, &llvm::errs())) {
