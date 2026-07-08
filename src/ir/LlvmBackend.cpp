@@ -5,6 +5,7 @@
 #include <bit>
 #include <cassert>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -385,10 +386,11 @@ public:
 
     void run() {
         build_state_types();
+        compute_subscription_order();
+        compute_fusion_groups(); // before build_wait_queues: bucket capacities count group subscriptions
         build_wait_queues();
         build_sched_flags();
         build_nba_state();
-        compute_subscription_order();
 
         // Functions and tasks: declare every one up front (so calls resolve,
         // including recursion and forward references), then lower their bodies. A
@@ -413,12 +415,11 @@ public:
         // TODO: an `always` / continuous assign with no sensitivity list (e.g. a
         // continuous `assign`, whose RHS sensitivity is not yet inferred) still
         // runs its body just once — it does not re-trigger on input changes.
-        std::vector<llvm::Function*> procs;
-        const auto                   all = mod_.processes();
-        for (uint32_t i = 0; i < all.size(); ++i) {
-            procs.push_back(lower_process(all[i], i));
+        std::vector<llvm::Function*> group_fns;
+        for (const std::vector<uint32_t>& g : groups_) {
+            group_fns.push_back(lower_group(g));
         }
-        emit_main(procs);
+        emit_main(group_fns);
     }
 
     // Per-process "scheduled" flags, one i32 per process: clotho.proc_sched[k] is
@@ -851,16 +852,20 @@ private:
 
     // -- Per-process lowering --
 
-    llvm::Function* lower_process(const Process& proc, uint32_t proc_index) {
-        ir_            = &proc.ir;
-        const size_t n = ir_->inst_count();
-        values_.assign(n, Plane{});
-        lvals_.assign(n, std::optional<LValue>{});
-        types_.assign(n, std::optional<ValType>{});
-        str_vals_.assign(n, nullptr);
+    // Lower one fusion group (usually a singleton) to one coroutine. Members of
+    // a fused group share one frame, one sched flag (the first member's slot),
+    // and one wait suspend; their bodies run back-to-back per wake, in
+    // scheduled-rank order (see compute_fusion_groups for the legality
+    // argument). The per-member value tables are swapped in around each
+    // member's body.
+    llvm::Function* lower_group(const std::vector<uint32_t>& members) {
+        const auto     all        = mod_.processes();
+        const uint32_t proc_index = members.front();
+        const Process& proc       = all[proc_index];
+        ir_                       = &proc.ir;
         frame_slots_.clear(); // a process has no frame; deinit sees only temps
 
-        // This process's scheduled-flag slot: &clotho.proc_sched[proc_index]. A
+        // This group's scheduled-flag slot: &clotho.proc_sched[proc_index]. A
         // constant GEP so it is valid in any block of the function.
         sched_ptr_ = llvm::ConstantExpr::getInBoundsGetElementPtr(
           sched_arr_ty_, sched_gv_, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(proc_index) });
@@ -869,7 +874,20 @@ private:
         // would collide once the design has multiple instances of one module —
         // their processes share the same AST source location. The index is unique
         // across the flattened module; proc.loc still carries the source mapping.
-        const std::string name = mod_.name + ".p" + std::to_string(proc_index);
+        // A fused group is named by its first member plus its size.
+        std::string name = mod_.name + ".p" + std::to_string(proc_index);
+        if (members.size() > 1) {
+            name += ".f" + std::to_string(members.size());
+        }
+
+        // Per-member table setup, run before lowering anything of that member.
+        const auto select_member = [&](uint32_t m) {
+            ir_            = &all[m].ir;
+            const size_t n = ir_->inst_count();
+            values_.assign(n, Plane{});
+            lvals_.assign(n, std::optional<LValue>{});
+            types_.assign(n, std::optional<ValType>{});
+        };
 
         // A process lowers to a switched-resume LLVM coroutine:
         // `ptr @<module>.<offset>(ptr noalias state, ptr wheel)`. The ramp runs the
@@ -927,8 +945,19 @@ private:
         hdl_        = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_begin), { id, frame });
         coro_begin_ = llvm::cast<llvm::Instruction>(hdl_);
         // String rvalue temporaries live in the coroutine frame (CoroSplit spills
-        // any that survive a suspend) and are constructed once, in the ramp.
-        build_str_temps();
+        // any that survive a suspend) and are constructed once, in the ramp —
+        // per member, with each member's inst-indexed pointers snapshotted for
+        // its body lowering below. (str_temp_list_ ends up holding only the
+        // last member's temps; it feeds deinit_body_strings, which an
+        // always-loop group never reaches.)
+        std::vector<std::vector<llvm::Value*>> member_strs;
+        for (const uint32_t m : members) {
+            select_member(m); // sizes the type cache build_str_temps consults
+            str_vals_.assign(ir_->inst_count(), nullptr);
+            build_str_temps();
+            member_strs.push_back(str_vals_);
+        }
+        ir_ = &proc.ir;
 
         // Shared epilogue, built up front so #delay suspends and the final suspend
         // can all branch to it. cleanup frees the frame (coro.free -> rt_free); ret
@@ -972,14 +1001,19 @@ private:
             // An always block with a sensitivity list. It is subscribed to its
             // signals' static queues from the seed loop (emit_active_run) and left
             // parked at the initial suspend; the first wake resumes here. So the
-            // loop is body-first: run the body for the trigger that woke us, re-arm
-            // the scheduled flag, suspend until the next trigger, repeat. The body
-            // therefore runs only on a trigger, never at time zero, with the flag
-            // held set across the body (it is cleared just before the suspend).
+            // loop is body-first: run the bodies for the trigger that woke us,
+            // re-arm the scheduled flag, suspend until the next trigger, repeat.
+            // The bodies therefore run only on a trigger, never at time zero, with
+            // the flag held set across them (it is cleared just before the
+            // suspend), so the group's own stores can never re-wake it mid-body.
             auto* loop_bb = llvm::BasicBlock::Create(ctx_, "always.loop", fn_);
             b_.CreateBr(loop_bb);
             b_.SetInsertPoint(loop_bb);
-            lower_region(ir_->root());                  // body (per trigger)
+            for (size_t i = 0; i < members.size(); ++i) {
+                select_member(members[i]);
+                str_vals_ = member_strs[i];
+                lower_region(ir_->root());              // member body (per trigger)
+            }
             b_.CreateStore(b_.getInt32(0), sched_ptr_); // re-arm: ready to be woken
             emit_wait_suspend();                        // park until next trigger
             b_.CreateBr(loop_bb);
@@ -987,6 +1021,9 @@ private:
             // unreachable; build it in a dead block so the IR stays well-formed.
             b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "always.exit", fn_));
         } else {
+            // Never fused: a non-always (or sensitivity-less) group is a singleton.
+            select_member(proc_index);
+            str_vals_ = member_strs.front();
             lower_region(ir_->root());
         }
 
@@ -1652,11 +1689,11 @@ private:
         auto* ptr_ty    = llvm::PointerType::getUnqual(ctx_);
         auto* proc_fnty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
         const auto all  = mod_.processes();
-        for (uint32_t k = 0; k < procs.size(); ++k) {
-            if (all[k].activation != Activation::Final) {
+        for (uint32_t g = 0; g < procs.size(); ++g) {
+            if (all[groups_[g].front()].activation != Activation::Final) {
                 continue;
             }
-            llvm::Value* hdl = b_.CreateCall(proc_fnty, procs[k], { state, wheel });
+            llvm::Value* hdl = b_.CreateCall(proc_fnty, procs[g], { state, wheel });
             b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
             b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
         }
@@ -1750,10 +1787,16 @@ private:
         const auto n = mod_.signals().size();
         WaitCounts c{ std::vector<std::array<uint32_t, 3>>(n, { 0, 0, 0 }),
                       std::vector<std::array<uint32_t, 3>>(n, { 0, 0, 0 }) };
-        for (const Process& p : mod_.processes()) {
-            for (const WaitEvent& w : p.wait_events) {
+        // Static capacities count what the seed loop will actually subscribe:
+        // one entry per group (signal, edge) — a fused group subscribes its
+        // canonical set once, not once per member. The scan reads every slot
+        // up to the capacity, so over-allocation would read a null flag ptr.
+        for (const std::vector<WaitEvent>& evs : group_events_) {
+            for (const WaitEvent& w : evs) {
                 c.sta[static_cast<uint32_t>(w.signal)][static_cast<uint32_t>(w.edge)]++;
             }
+        }
+        for (const Process& p : mod_.processes()) {
             // Gather the distinct (signal, edge) pairs this process intra-body
             // waits on, across every Wait's event list. A process is a single
             // coroutine suspended at one wait at a time, so it holds at most one
@@ -2083,6 +2126,118 @@ private:
         }
         std::stable_sort(sub_order_.begin(), sub_order_.end(),
                          [&](uint32_t a, uint32_t b) { return level[dense(a)] < level[dense(b)]; });
+    }
+
+    // V1 static process fusion: partition processes into groups that lower to a
+    // single coroutine each. A group's members share an identical canonical
+    // sensitivity set and self_start flag, so the fused wake set equals every
+    // member's own wake set — each body still runs exactly when its own trigger
+    // fires, and activation counts are unchanged by construction (no
+    // over-evaluation possible). Running members back-to-back fixes one of the
+    // LRM-allowed same-instant orders (members are ordered by their
+    // sub_order_ rank, matching the unfused schedule).
+    //
+    // A process is fusable only when:
+    //  - it is an Always with a static sensitivity list;
+    //  - its body has no suspension point (no #delay, no intra-body @/wait, no
+    //    task call — a suspended fused body would stall its siblings);
+    //  - it does not blocking-write a signal in its own sensitivity set (the
+    //    write would re-wake an already-ran sibling in the unfused schedule,
+    //    but lands mid-body under the group's held sched flag when fused).
+    void compute_fusion_groups() {
+        const auto all    = mod_.processes();
+        const auto nprocs = static_cast<uint32_t>(all.size());
+        groups_.clear();
+        group_of_.assign(nprocs, 0);
+        group_events_.clear();
+
+        // Position of each process in sub_order_ (its scheduled rank).
+        std::vector<uint32_t> pos(nprocs, 0);
+        for (uint32_t i = 0; i < nprocs; ++i) {
+            pos[sub_order_[i]] = i;
+        }
+
+        const auto canonical = [](const std::vector<WaitEvent>& evs) {
+            std::vector<std::pair<uint32_t, uint32_t>> key;
+            key.reserve(evs.size());
+            for (const WaitEvent& w : evs) {
+                key.emplace_back(static_cast<uint32_t>(w.signal), static_cast<uint32_t>(w.edge));
+            }
+            std::sort(key.begin(), key.end());
+            key.erase(std::unique(key.begin(), key.end()), key.end());
+            return key;
+        };
+
+        const auto fusable = [&](const Process& p) {
+            if (p.activation != Activation::Always || p.wait_events.empty()) {
+                return false;
+            }
+            const auto key = canonical(p.wait_events);
+            for (size_t k = 0; k < p.ir.inst_count(); ++k) {
+                const auto idx = static_cast<Index>(k);
+                switch (p.ir.tag(idx)) {
+                    case Inst::Tag::Delay:
+                    case Inst::Tag::Wait:
+                    case Inst::Tag::TaskCall:
+                        return false;
+                    case Inst::Tag::Store: {
+                        const LvalueRoot r = lvalue_root(p.ir, p.ir.payload(idx).binary.l);
+                        if (p.ir.tag(r.root) != Inst::Tag::Signal) {
+                            break;
+                        }
+                        const auto sig = static_cast<uint32_t>(p.ir.payload(r.root).signal);
+                        for (const auto& [s, e] : key) {
+                            if (s == sig) {
+                                return false;
+                            }
+                        }
+                        break;
+                    }
+                    default:
+                        break;
+                }
+            }
+            return true;
+        };
+
+        // Bucket fusable processes by (canonical events, self_start), preserving
+        // first-seen order; everything else is its own singleton group. Group
+        // size is capped so one fused coroutine cannot grow arbitrarily large
+        // (function size / frame size / compile time).
+        constexpr size_t group_cap = 256;
+        std::map<std::pair<std::vector<std::pair<uint32_t, uint32_t>>, bool>, uint32_t> by_key;
+        for (uint32_t k = 0; k < nprocs; ++k) {
+            const Process& p = all[k];
+            if (config_.fuse && fusable(p)) {
+                const auto key = std::make_pair(canonical(p.wait_events), p.self_start);
+                const auto it  = by_key.find(key);
+                if (it != by_key.end() && groups_[it->second].size() < group_cap) {
+                    groups_[it->second].push_back(k);
+                    group_of_[k] = it->second;
+                    continue;
+                }
+                by_key[key] = static_cast<uint32_t>(groups_.size());
+            }
+            group_of_[k] = static_cast<uint32_t>(groups_.size());
+            groups_.push_back({ k });
+        }
+
+        // Members run in scheduled-rank order (the order the unfused FIFO would
+        // have popped them); the group subscribes at its earliest member's rank.
+        group_events_.resize(groups_.size());
+        for (uint32_t g = 0; g < groups_.size(); ++g) {
+            std::sort(groups_[g].begin(), groups_[g].end(),
+                      [&](uint32_t a, uint32_t b) { return pos[a] < pos[b]; });
+            if (groups_[g].size() == 1) {
+                group_events_[g] = all[groups_[g].front()].wait_events;
+                continue;
+            }
+            // Fused: subscribe the canonical deduped set once (wait_counts sizes
+            // the buckets to match).
+            for (const auto& [s, e] : canonical(all[groups_[g].front()].wait_events)) {
+                group_events_[g].push_back(WaitEvent{ static_cast<Signal>(s), static_cast<Edge>(e) });
+            }
+        }
     }
 
     // Build the nonblocking-assignment update state: per-(width, partial) commit
@@ -2798,17 +2953,20 @@ private:
         // generate no events (see lower_process), so the always blocks created
         // below subscribe to already-settled values. Run before the seed loop so no
         // wait queue is scanned before priming.
-        for (uint32_t k = 0; k < procs.size(); ++k) {
-            if (all[k].activation != Activation::PreInit) {
+        for (uint32_t g = 0; g < procs.size(); ++g) {
+            if (all[groups_[g].front()].activation != Activation::PreInit) {
                 continue;
             }
-            llvm::Value* hdl = b_.CreateCall(proc_fnty, procs[k], { state, wheel });
+            llvm::Value* hdl = b_.CreateCall(proc_fnty, procs[g], { state, wheel });
             b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
             b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
         }
 
+        // One handle per fusion group; a group's activation facts come from its
+        // first member (identical across fused members by the group key).
         std::vector<llvm::Value*> hdls(procs.size(), nullptr);
-        for (uint32_t k = 0; k < procs.size(); ++k) {
+        for (uint32_t g = 0; g < procs.size(); ++g) {
+            const uint32_t k = groups_[g].front();
             const Process& p = all[k];
             if (p.activation == Activation::PreInit) {
                 continue; // already run above
@@ -2816,8 +2974,8 @@ private:
             if (p.activation == Activation::Final) {
                 continue; // deferred to emit_finals_run at end of simulation
             }
-            llvm::Value* hdl = b_.CreateCall(proc_fnty, procs[k], { state, wheel });
-            hdls[k]          = hdl;
+            llvm::Value* hdl = b_.CreateCall(proc_fnty, procs[g], { state, wheel });
+            hdls[g]          = hdl;
             if (p.activation == Activation::Always && !p.wait_events.empty()) {
                 // Subscribed in the topo-ordered pass below.
                 //
@@ -2851,15 +3009,20 @@ private:
         // wave. A separate pass so only wake order changes — creation and
         // enqueue order above stay declaration order. All subscriptions still
         // land before the drain, so no scan reads an empty slot.
+        // A fused group subscribes once, at its earliest member's rank, with the
+        // group's canonical event set and the group's flag/handle.
+        std::vector<bool> subscribed(procs.size(), false);
         for (const uint32_t k : sub_order_) {
-            const Process& p = all[k];
-            if (p.activation != Activation::Always || p.wait_events.empty()) {
+            const uint32_t g = group_of_[k];
+            const uint32_t f = groups_[g].front();
+            if (subscribed[g] || all[f].activation != Activation::Always || all[f].wait_events.empty()) {
                 continue;
             }
+            subscribed[g]        = true;
             llvm::Constant* flag = llvm::ConstantExpr::getInBoundsGetElementPtr(
-              sched_arr_ty_, sched_gv_, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(k) });
-            for (const WaitEvent& w : p.wait_events) {
-                emit_static_subscribe(w.signal, static_cast<uint32_t>(w.edge), hdls[k], flag);
+              sched_arr_ty_, sched_gv_, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(f) });
+            for (const WaitEvent& w : group_events_[g]) {
+                emit_static_subscribe(w.signal, static_cast<uint32_t>(w.edge), hdls[g], flag);
             }
         }
 
@@ -6782,6 +6945,14 @@ private:
     uint32_t                            active_mask_       = 0;
     // Process indices in static-subscription order (compute_subscription_order).
     std::vector<uint32_t>               sub_order_;
+    // Fusion groups (compute_fusion_groups): each group lowers to one
+    // coroutine. groups_[g] lists member process indices in scheduled-rank
+    // order; group_of_ maps a process to its group; group_events_[g] is the
+    // (signal, edge) set the group subscribes (canonical deduped for fused
+    // groups, the member's raw list for singletons).
+    std::vector<std::vector<uint32_t>>  groups_;
+    std::vector<uint32_t>               group_of_;
+    std::vector<std::vector<WaitEvent>> group_events_;
     // Per-signal wait queues, indexed by Signal handle and then by edge bucket
     // (`[signal][static_cast<uint32_t>(edge)]`: 0=pos, 1=neg, 2=any); null where the
     // signal has no waiter of that (kind, edge). Splitting by edge hoists the

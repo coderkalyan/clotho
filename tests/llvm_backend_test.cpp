@@ -1230,9 +1230,12 @@ TEST_CASE("repeated instantiation emits distinct process symbols") {
     const std::string          ir  = emit(src);
 
     // Per instance: 1 always block + 1 input-port copy (clk) + 1 output-port copy
-    // (cnt) = 3 ramps; 2 instances + 0 top processes = 6 distinct @top.p<N>
-    // coroutine ramps.
-    CHECK(count_substr(ir, "define ptr @top.p") == 6);
+    // (cnt) = 3 ramps. The two clk input-port copies share the identical
+    // sensitivity (@top clk) and fuse into one coroutine (`.f2`); the clocked
+    // always blocks watch per-instance clk locals and stay separate. 6
+    // processes emit as 5 distinct @top.p<N> ramps.
+    CHECK(count_substr(ir, "define ptr @top.p") == 5);
+    CHECK(count_substr(ir, ".f2(") == 1);
 }
 
 // Regression: a single-operand concat ({x}) and a single replication ({1{x}})
@@ -3253,4 +3256,54 @@ TEST_CASE("real display marshals through rt_fwrite with %g / %f") {
 
     m.add_process(ir::Process{ ir::Activation::Initial, {}, false, kLoc, b.finish() });
     CHECK(run_module(m) == "3.6 0.250000\n1.5\n");
+}
+
+// -- V1 static process fusion --
+
+TEST_CASE("identical-sensitivity clocked processes fuse and stay correct") {
+    // Three same-clock NBA processes with cross-reads: every read must observe
+    // the pre-edge value regardless of the fused member order (NBA semantics),
+    // so the settled values after two edges are order-independent and any
+    // divergence from the unfused schedule is a fusion bug.
+    constexpr std::string_view src = R"(
+        module top;
+            reg clk = 0;
+            reg [7:0] a = 1, b = 10, c = 100;
+            always @(posedge clk) a <= a + c;
+            always @(posedge clk) b <= a + b;
+            always @(posedge clk) c <= b + c;
+            initial begin
+                #5 clk = 1;
+                #5 clk = 0;
+                #5 clk = 1;
+                #1 $display("%0d %0d %0d", a, b, c);
+                $finish;
+            end
+        endmodule
+    )";
+    // Edge 1: a=101, b=11, c=110. Edge 2: a=211, b=112, c=121.
+    CHECK(run_capture(src) == "211 112 121\n");
+    // All three lower into one fused coroutine.
+    CHECK(count_substr(emit(src), ".f3(") == 1);
+}
+
+TEST_CASE("suspension points and self-sensitivity writes block fusion") {
+    // p1/p2 share @(posedge clk) but p2 contains a #delay: a suspended fused
+    // body would stall its sibling, so it must stay a separate coroutine.
+    // p3/p4 share @(a or b) but p4 blocking-writes b, a signal in its own
+    // sensitivity set: fused, the self-wake the unfused schedule performs
+    // would be lost under the held sched flag.
+    constexpr std::string_view src = R"(
+        module top;
+            reg clk = 0;
+            reg [7:0] a = 0, b = 0, x = 0, y = 0;
+            always @(posedge clk) x <= x + 8'd1;
+            always @(posedge clk) begin #1 y <= y + 8'd1; end
+            always @(a or b) x = a;
+            always @(a or b) b = a;
+        endmodule
+    )";
+    const std::string ir = emit(src);
+    CHECK(count_substr(ir, ".f2(") == 0);
+    CHECK(count_substr(ir, ".f3(") == 0);
 }

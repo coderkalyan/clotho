@@ -14,7 +14,7 @@
 // then JIT-compile and run it (default), or emit the process IR / LLVM IR for
 // debugging. All compiler logic lives in libclotho / libclotho_ir.
 //
-// Usage: clotho [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--perf-jitdump] [-o <out>] <file.sv>...
+// Usage: clotho [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--perf-jitdump] [-o <out>] <file.sv>...
 // Multiple source files are compiled together into one design (shared name
 // space, LRM 3.12), parsed in the order given.
 // `llvm` emits the backend's raw IR before the coroutine-lowering pipeline runs
@@ -35,6 +35,8 @@ int main(int argc, char** argv) {
             time = true;
         } else if (arg == "--no-z-elision") {
             config.z_elision = false;
+        } else if (arg == "--no-fuse") {
+            config.fuse = false;
         } else if (arg == "--perf-jitdump") {
             config.perf_jitdump = true;
         } else if (arg == "-o" && i + 1 < argc) {
@@ -49,7 +51,7 @@ int main(int argc, char** argv) {
 
     if (inputs.empty() || (emit != "run" && emit != "ir" && emit != "llvm" && emit != "opt")) {
         std::println(stderr,
-                     "usage: {} [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--perf-jitdump] [-o <out>] <file.sv>...",
+                     "usage: {} [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--perf-jitdump] [-o <out>] <file.sv>...",
                      argv[0]);
         return 2;
     }
