@@ -388,6 +388,7 @@ public:
         build_wait_queues();
         build_sched_flags();
         build_nba_state();
+        compute_subscription_order();
 
         // Functions and tasks: declare every one up front (so calls resolve,
         // including recursion and forward references), then lower their bodies. A
@@ -1886,6 +1887,204 @@ private:
         }
     }
 
+    // Static-subscription order: a topological sort of processes over the
+    // blocking-write wake graph (edge P -> Q iff P blocking-writes a signal in
+    // Q's sensitivity list). Wait-queue bucket entries fill in subscription
+    // order and the FIFO drain pops in bucket order, so subscribing in this
+    // order runs producers before consumers within a settle wave: an acyclic
+    // blocking cascade settles in one wave regardless of source order.
+    //
+    // NBA writes are deliberately not edges — a commit lands between drains and
+    // starts a fresh wave, so they cannot cause same-wave re-evaluation, and
+    // excluding them removes the clocked feedback that would otherwise make
+    // every sequential design one big SCC.
+    //
+    // Cycles (combinational loops): Tarjan SCC + condensation order, so only
+    // the processes inside a loop keep declaration order among themselves;
+    // everything downstream of the loop is still placed after it. Convergence
+    // is unaffected either way — re-wake-on-change still iterates SCCs.
+    void compute_subscription_order() {
+        const auto     all    = mod_.processes();
+        const auto     nprocs = static_cast<uint32_t>(all.size());
+        const uint32_t nsigs  = static_cast<uint32_t>(mod_.signals().size());
+        sub_order_.resize(nprocs);
+        for (uint32_t k = 0; k < nprocs; ++k) {
+            sub_order_[k] = k;
+        }
+        if (nprocs < 2) {
+            return;
+        }
+
+        // Blocking-written signals of one IR body: Store roots plus out/inout
+        // TaskCall actuals (copy-out writes the actual in the caller). Roots
+        // that are not signals (function locals / formals) are skipped.
+        const auto body_writes = [&](const Ir& ir, std::vector<Signal>& out, std::vector<FunctionId>& calls) {
+            for (size_t k = 0; k < ir.inst_count(); ++k) {
+                const auto idx = static_cast<Index>(k);
+                if (ir.tag(idx) == Inst::Tag::Store) {
+                    const LvalueRoot r = lvalue_root(ir, ir.payload(idx).binary.l);
+                    if (ir.tag(r.root) == Inst::Tag::Signal) {
+                        out.push_back(ir.payload(r.root).signal);
+                    }
+                }
+                else if (ir.tag(idx) == Inst::Tag::TaskCall) {
+                    const auto      ti     = ir.extra_data<TaskCallInfo>(ir.payload(idx).extra);
+                    const Function& callee = mod_.function(ti.func);
+                    const auto      args   = ir.region(ti.args);
+                    for (size_t a = 0; a < args.size(); ++a) {
+                        if (callee.arg_dirs[a] == ArgDir::In) {
+                            continue;
+                        }
+                        const LvalueRoot r = lvalue_root(ir, args[a]);
+                        if (ir.tag(r.root) == Inst::Tag::Signal) {
+                            out.push_back(ir.payload(r.root).signal);
+                        }
+                    }
+                    calls.push_back(ti.func);
+                }
+            }
+        };
+
+        // Per-function write sets, closed transitively over calls (memoized
+        // DFS; an in-progress callee — recursion — contributes what it has so
+        // far, an over- or under-approximation that only perturbs ordering).
+        const auto                       nf = static_cast<uint32_t>(mod_.function_count());
+        std::vector<std::vector<Signal>> fn_writes(nf);
+        std::vector<uint8_t>             fn_state(nf, 0); // 0 new, 1 visiting, 2 done
+        const auto close_fn = [&](this const auto& self, uint32_t f) -> void {
+            if (fn_state[f] != 0) {
+                return;
+            }
+            fn_state[f] = 1;
+            std::vector<FunctionId> calls;
+            body_writes(mod_.function(static_cast<FunctionId>(f)).ir, fn_writes[f], calls);
+            for (const FunctionId c : calls) {
+                self(static_cast<uint32_t>(c));
+                const auto& cw = fn_writes[static_cast<uint32_t>(c)];
+                fn_writes[f].insert(fn_writes[f].end(), cw.begin(), cw.end());
+            }
+            fn_state[f] = 2;
+        };
+
+        // Readers: processes statically subscribed to each signal (any edge).
+        std::vector<std::vector<uint32_t>> readers(nsigs);
+        for (uint32_t k = 0; k < nprocs; ++k) {
+            if (all[k].activation != Activation::Always) {
+                continue;
+            }
+            for (const WaitEvent& w : all[k].wait_events) {
+                readers[static_cast<uint32_t>(w.signal)].push_back(k);
+            }
+        }
+
+        // Adjacency, deduplicated with a per-source stamp.
+        std::vector<std::vector<uint32_t>> adj(nprocs);
+        std::vector<uint32_t>              stamp(nprocs, UINT32_MAX);
+        for (uint32_t k = 0; k < nprocs; ++k) {
+            std::vector<Signal>     writes;
+            std::vector<FunctionId> calls;
+            body_writes(all[k].ir, writes, calls);
+            for (const FunctionId c : calls) {
+                close_fn(static_cast<uint32_t>(c));
+                const auto& cw = fn_writes[static_cast<uint32_t>(c)];
+                writes.insert(writes.end(), cw.begin(), cw.end());
+            }
+            for (const Signal s : writes) {
+                for (const uint32_t q : readers[static_cast<uint32_t>(s)]) {
+                    if (q == k || stamp[q] == k) {
+                        continue;
+                    }
+                    stamp[q] = k;
+                    adj[k].push_back(q);
+                }
+            }
+        }
+
+        // Iterative Tarjan. SCCs complete in reverse condensation-topo order
+        // (an SCC finishes only after everything it reaches), so assigning
+        // descending ranks as they complete numbers SCCs in topo order.
+        std::vector<uint32_t> scc_rank(nprocs, 0);
+        uint32_t              next_rank = nprocs; // descending as SCCs complete
+        {
+            constexpr uint32_t    none = UINT32_MAX;
+            std::vector<uint32_t> index(nprocs, none);
+            std::vector<uint32_t> low(nprocs, 0);
+            std::vector<uint8_t>  on_stack(nprocs, 0);
+            std::vector<uint32_t> stack;
+            uint32_t              next_index = 0;
+            struct Frame {
+                uint32_t v;
+                uint32_t child;
+            };
+            std::vector<Frame> dfs;
+            for (uint32_t root = 0; root < nprocs; ++root) {
+                if (index[root] != none) {
+                    continue;
+                }
+                dfs.push_back({ root, 0 });
+                index[root] = low[root] = next_index++;
+                stack.push_back(root);
+                on_stack[root] = 1;
+                while (!dfs.empty()) {
+                    Frame& f = dfs.back();
+                    if (f.child < adj[f.v].size()) {
+                        const uint32_t w = adj[f.v][f.child++];
+                        if (index[w] == none) {
+                            index[w] = low[w] = next_index++;
+                            stack.push_back(w);
+                            on_stack[w] = 1;
+                            dfs.push_back({ w, 0 });
+                        }
+                        else if (on_stack[w]) {
+                            low[f.v] = std::min(low[f.v], index[w]);
+                        }
+                        continue;
+                    }
+                    const uint32_t v = f.v;
+                    dfs.pop_back();
+                    if (!dfs.empty()) {
+                        low[dfs.back().v] = std::min(low[dfs.back().v], low[v]);
+                    }
+                    if (low[v] == index[v]) {
+                        --next_rank;
+                        uint32_t w;
+                        do {
+                            w = stack.back();
+                            stack.pop_back();
+                            on_stack[w] = 0;
+                            scc_rank[w] = next_rank;
+                        } while (w != v);
+                    }
+                }
+            }
+        }
+
+        // Order by longest-path level in the condensation, not by raw SCC
+        // number: distinct SCC numbers would also order UNRELATED processes by
+        // arbitrary DFS completion, gratuitously shuffling them against
+        // declaration order (measured as a few percent of extra comb
+        // re-evaluation on picorv32). Levels give every process the earliest
+        // slot its producers allow; everything else keeps declaration order
+        // via the stable sort.
+        const uint32_t        nscc = nprocs - next_rank;
+        const auto            dense = [&](uint32_t p) { return scc_rank[p] - next_rank; };
+        std::vector<uint32_t> level(nscc, 0);
+        std::vector<uint32_t> by_rank = sub_order_;
+        std::stable_sort(by_rank.begin(), by_rank.end(),
+                         [&](uint32_t a, uint32_t b) { return scc_rank[a] < scc_rank[b]; });
+        // Cross-SCC edges always point to a higher rank (the successor SCC
+        // completed first), so one ascending pass relaxes in topo order.
+        for (const uint32_t u : by_rank) {
+            for (const uint32_t v : adj[u]) {
+                if (dense(v) != dense(u)) {
+                    level[dense(v)] = std::max(level[dense(v)], level[dense(u)] + 1);
+                }
+            }
+        }
+        std::stable_sort(sub_order_.begin(), sub_order_.end(),
+                         [&](uint32_t a, uint32_t b) { return level[dense(a)] < level[dense(b)]; });
+    }
+
     // Build the nonblocking-assignment update state: per-(width, partial) commit
     // worklists, the dense pending-flag array, and a constant per-signal metadata
     // table (live/shadow/mask offsets plus the wait-queue base/cap/len pointers the
@@ -2608,6 +2807,7 @@ private:
             b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
         }
 
+        std::vector<llvm::Value*> hdls(procs.size(), nullptr);
         for (uint32_t k = 0; k < procs.size(); ++k) {
             const Process& p = all[k];
             if (p.activation == Activation::PreInit) {
@@ -2617,30 +2817,49 @@ private:
                 continue; // deferred to emit_finals_run at end of simulation
             }
             llvm::Value* hdl = b_.CreateCall(proc_fnty, procs[k], { state, wheel });
+            hdls[k]          = hdl;
             if (p.activation == Activation::Always && !p.wait_events.empty()) {
-                llvm::Constant* flag = llvm::ConstantExpr::getInBoundsGetElementPtr(
-                  sched_arr_ty_, sched_gv_, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(k) });
-                for (const WaitEvent& w : p.wait_events) {
-                    emit_static_subscribe(w.signal, static_cast<uint32_t>(w.edge), hdl, flag);
-                }
+                // Subscribed in the topo-ordered pass below.
+                //
                 // A continuously-active process (continuous assign / port copy /
                 // always_comb) also runs once now, so it settles from the pre-init
                 // values rather than waiting for an input edge that a declaration
                 // initializer never generates. It runs body-first then parks on its
-                // (already-subscribed) wait, so later input changes still wake it.
+                // (subscribed-below) wait, so later input changes still wake it.
                 //
-                // Mark it scheduled as it is enqueued: a seed-time store from an
-                // earlier-draining process (initial blocks drain before these, being
-                // pushed last onto the LIFO) services this static subscription and
-                // would re-push the already-queued handle without the flag, so N such
-                // processes overflow the nproc-sized active queue. The flag is cleared
+                // Mark it scheduled as it is enqueued: a seed-time store from a
+                // process draining earlier in the same first drain (an initial
+                // block) services this static subscription and would re-push the
+                // already-queued handle without the flag, so N such processes
+                // overflow the nproc-sized active queue. The flag is cleared
                 // when the body reaches its wait-suspend (lower_process always-loop).
                 if (p.self_start) {
+                    llvm::Constant* flag = llvm::ConstantExpr::getInBoundsGetElementPtr(
+                      sched_arr_ty_, sched_gv_, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(k) });
                     b_.CreateStore(b_.getInt32(1), flag);
                     emit_active_push(b_, hdl);
                 }
             } else {
                 emit_active_push(b_, hdl);
+            }
+        }
+
+        // Static subscriptions, in topological order of the blocking-write wake
+        // graph (compute_subscription_order): bucket entry order is subscription
+        // order, the FIFO drain pops in bucket order, so a settle wave runs
+        // producers before consumers and each acyclic cascade settles in one
+        // wave. A separate pass so only wake order changes — creation and
+        // enqueue order above stay declaration order. All subscriptions still
+        // land before the drain, so no scan reads an empty slot.
+        for (const uint32_t k : sub_order_) {
+            const Process& p = all[k];
+            if (p.activation != Activation::Always || p.wait_events.empty()) {
+                continue;
+            }
+            llvm::Constant* flag = llvm::ConstantExpr::getInBoundsGetElementPtr(
+              sched_arr_ty_, sched_gv_, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(k) });
+            for (const WaitEvent& w : p.wait_events) {
+                emit_static_subscribe(w.signal, static_cast<uint32_t>(w.edge), hdls[k], flag);
             }
         }
 
@@ -6561,6 +6780,8 @@ private:
     llvm::GlobalVariable*               inactive_top_gv_   = nullptr;
     llvm::ArrayType*                    queue_arr_ty_      = nullptr;
     uint32_t                            active_mask_       = 0;
+    // Process indices in static-subscription order (compute_subscription_order).
+    std::vector<uint32_t>               sub_order_;
     // Per-signal wait queues, indexed by Signal handle and then by edge bucket
     // (`[signal][static_cast<uint32_t>(edge)]`: 0=pos, 1=neg, 2=any); null where the
     // signal has no waiter of that (kind, edge). Splitting by edge hoists the
