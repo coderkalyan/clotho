@@ -889,6 +889,46 @@ private:
             types_.assign(n, std::optional<ValType>{});
         };
 
+        // Coroutine elision: a suspension-free always-with-sensitivity group (see
+        // is_simple_always) carries no state across activations, so instead of a
+        // coroutine it lowers to a plain thunk — void @<name>.thunk(state, wheel)
+        // — run once per activation. The seed subscribes a tagged pointer to it
+        // and the drain calls it directly (no frame, no suspend switch, no
+        // CoroSplit). The sched-flag timeline matches the coroutine always-loop:
+        // the flag is held set across the body and cleared at the end, so
+        // same-instant re-triggers behave identically.
+        if (thunk_group_[group_of_[proc_index]]) {
+            auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
+            auto* fnty   = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
+            fn_ = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name + ".thunk", llmod_);
+            state_ = fn_->getArg(0);
+            state_->setName("state");
+            wheel_ = fn_->getArg(1);
+            wheel_->setName("wheel");
+            fn_->addParamAttr(0, llvm::Attribute::NoAlias);
+            awaiter_          = nullptr;
+            nba_scratch_      = nullptr;
+            record_           = nullptr;
+            cur_is_task_      = false;
+            lowering_preinit_ = false;
+            hdl_              = nullptr;
+            b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
+            // Run each member body per activation, freeing its string temporaries
+            // afterward — a thunk has no frame to persist them in (a per-call cost
+            // paid only by string-using bodies). frame_slots_ is empty for a
+            // process, so deinit_body_strings frees exactly this member's temps.
+            for (const uint32_t m : members) {
+                select_member(m);
+                str_vals_.assign(ir_->inst_count(), nullptr);
+                build_str_temps();
+                lower_region(ir_->root());
+                deinit_body_strings();
+            }
+            b_.CreateStore(b_.getInt32(0), sched_ptr_); // re-arm: ready to be woken
+            b_.CreateRetVoid();
+            return fn_;
+        }
+
         // A process lowers to a switched-resume LLVM coroutine:
         // `ptr @<module>.<offset>(ptr noalias state, ptr wheel)`. The ramp runs the
         // body until the first #delay (or to completion) and returns the coroutine
@@ -2247,6 +2287,17 @@ private:
                 group_events_[g].push_back(WaitEvent{ static_cast<Signal>(s), static_cast<Edge>(e) });
             }
         }
+
+        // A group is thunk-eligible when its (front) member is a suspension-free
+        // always-with-sensitivity: fused members all passed is_simple_always, so
+        // the front's verdict holds for the group. Computed here so lower_group
+        // and the seed/drain read one table. Empty is fine when --no-thunk.
+        thunk_group_.assign(groups_.size(), false);
+        if (config_.thunk) {
+            for (uint32_t g = 0; g < groups_.size(); ++g) {
+                thunk_group_[g] = is_simple_always(all[groups_[g].front()]);
+            }
+        }
     }
 
     // Build the nonblocking-assignment update state: per-(width, partial) commit
@@ -2983,7 +3034,16 @@ private:
             if (p.activation == Activation::Final) {
                 continue; // deferred to emit_finals_run at end of simulation
             }
-            llvm::Value* hdl = b_.CreateCall(proc_fnty, procs[g], { state, wheel });
+            // A thunk group is not ramped (no frame): its "handle" is the thunk
+            // function pointer with the low bit set, so the drain calls it
+            // directly instead of resuming a coroutine. Function addresses are
+            // aligned, so bit 0 is a free tag; coro handles (rt_alloc) leave it
+            // clear. The tagged pointer flows through subscription / self_start
+            // push unchanged.
+            llvm::Value* hdl = thunk_group_[g]
+              ? b_.CreateIntToPtr(
+                  b_.CreateOr(b_.CreatePtrToInt(procs[g], b_.getInt64Ty()), b_.getInt64(1)), ptr_ty)
+              : b_.CreateCall(proc_fnty, procs[g], { state, wheel });
             hdls[g]          = hdl;
             if (p.activation == Activation::Always && !p.wait_events.empty()) {
                 // Subscribed in the topo-ordered pass below.
@@ -3044,6 +3104,12 @@ private:
         auto* wtick   = llvm::BasicBlock::Create(ctx_, "wheel.tick", fn);
         auto* wdone   = llvm::BasicBlock::Create(ctx_, "wheel.done", fn);
         auto* null    = llvm::ConstantPointerNull::get(ptr_ty);
+        // Any thunk group present means the active queue can carry tagged thunk
+        // pointers, so the drain must discriminate; a coro-only design keeps the
+        // straight resume path (no per-pop tag test).
+        const bool has_thunk = std::any_of(thunk_group_.begin(), thunk_group_.end(),
+                                            [](bool t) { return t; });
+        auto* thunk_fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
         // NBA region: only when the design has nonblocking assignments. Entered when
         // the active queue drains; if any update is staged it commits them all and
         // re-drains the active queue at the SAME instant; otherwise it falls through
@@ -3071,6 +3137,22 @@ private:
         llvm::Value* idx  = b_.CreateAnd(hd, b_.getInt32(active_mask_));
         llvm::Value* slot = b_.CreateInBoundsGEP(queue_arr_ty_, active_gv_, { b_.getInt32(0), idx });
         llvm::Value* hdl  = b_.CreateLoad(ptr_ty, slot);
+        if (has_thunk) {
+            // Low bit set => a tagged thunk pointer: call it directly (no frame,
+            // nothing to destroy). Clear => a coroutine handle: resume/done/
+            // destroy as before.
+            auto* thunk_bb = llvm::BasicBlock::Create(ctx_, "active.thunk", fn);
+            auto* coro_bb  = llvm::BasicBlock::Create(ctx_, "active.coro", fn);
+            auto* addr     = b_.CreatePtrToInt(hdl, b_.getInt64Ty());
+            b_.CreateCondBr(b_.CreateTrunc(addr, b_.getInt1Ty()), thunk_bb, coro_bb);
+
+            b_.SetInsertPoint(thunk_bb);
+            auto* fnp = b_.CreateIntToPtr(b_.CreateAnd(addr, ~static_cast<uint64_t>(1)), ptr_ty);
+            b_.CreateCall(thunk_fnty, fnp, { state, wheel });
+            b_.CreateBr(cont);
+
+            b_.SetInsertPoint(coro_bb);
+        }
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
         llvm::Value* fin = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_done), { hdl });
         b_.CreateCondBr(fin, destroy, cont);
@@ -4575,7 +4657,15 @@ private:
     // awaiter().
     llvm::Value* nba_scratch() {
         if (nba_scratch_ == nullptr) {
-            llvm::IRBuilder<> ab(coro_begin_->getParent(), std::next(coro_begin_->getIterator()));
+            // A coroutine must home the scratch in its frame (after coro.begin);
+            // a thunk has no frame, so anchor it at the entry-block front. Guard
+            // on coro_begin_ belonging to the current function: it is stale (a
+            // prior group's) or null in a thunk.
+            const bool in_frame = coro_begin_ != nullptr && coro_begin_->getFunction() == fn_;
+            auto* bb = in_frame ? coro_begin_->getParent() : &fn_->getEntryBlock();
+            auto  it = in_frame ? std::next(coro_begin_->getIterator())
+                                : fn_->getEntryBlock().getFirstInsertionPt();
+            llvm::IRBuilder<> ab(bb, it);
             nba_scratch_ = ab.CreateAlloca(nba_scratch_ty(), nullptr, "nba.scratch");
         }
         return nba_scratch_;
@@ -7008,6 +7098,10 @@ private:
     std::vector<std::vector<uint32_t>>  groups_;
     std::vector<uint32_t>               group_of_;
     std::vector<std::vector<WaitEvent>> group_events_;
+    // Per-group: lower as a plain per-activation thunk (config_.thunk && the
+    // group is suspension-free), not a coroutine. Drives lower_group's emission
+    // and the seed/drain dispatch, kept as one table so all three agree.
+    std::vector<bool>                   thunk_group_;
     // Per-signal wait queues, indexed by Signal handle and then by edge bucket
     // (`[signal][static_cast<uint32_t>(edge)]`: 0=pos, 1=neg, 2=any); null where the
     // signal has no waiter of that (kind, edge). Splitting by edge hoists the

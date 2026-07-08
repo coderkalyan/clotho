@@ -35,17 +35,31 @@ std::string emit(std::string_view source) {
     return text;
 }
 
-// Emit without the optimization pipeline: for assertions on the backend's own
-// emission structure (block labels, typed GEPs), which the pipeline is free to
-// rewrite.
-std::string emit_raw(std::string_view source) {
+// Emit with an explicit config (e.g. {.thunk = false} to force the coroutine
+// form for structural assertions on both lowerings).
+std::string emit(std::string_view source, ir::SimulationConfig config) {
     const LowerResult result = lower_text(source);
     REQUIRE(result.ok);
     REQUIRE(result.module != nullptr);
 
     std::string              text;
     llvm::raw_string_ostream os(text);
-    REQUIRE(ir::emit_llvm(*result.module, os, { .optimize = false }));
+    REQUIRE(ir::emit_llvm(*result.module, os, config));
+    return text;
+}
+
+// Emit without the optimization pipeline: for assertions on the backend's own
+// emission structure (block labels, typed GEPs), which the pipeline is free to
+// rewrite.
+std::string emit_raw(std::string_view source, ir::SimulationConfig config = { .optimize = false }) {
+    const LowerResult result = lower_text(source);
+    REQUIRE(result.ok);
+    REQUIRE(result.module != nullptr);
+
+    std::string              text;
+    llvm::raw_string_ostream os(text);
+    config.optimize = false;
+    REQUIRE(ir::emit_llvm(*result.module, os, config));
     return text;
 }
 
@@ -161,13 +175,18 @@ TEST_CASE("alu emits verifiable llvm ir") {
     CHECK(raw.find("%alu.state = type") != std::string::npos);
     CHECK(raw.find("%state = call ptr @rt_alloc(") != std::string::npos);
 
-    // One coroutine per process, named @<module>.p<index>: two combinational
-    // assigns + one sequential always block. Each is a switched-resume coroutine
-    // ramp returning the handle and taking the bare state ptr plus the timing-wheel
-    // ptr. (CoroSplit also emits .resume/.destroy/.cleanup parts, which don't match
-    // this "define ptr @alu.p" prefix.)
-    CHECK(count_substr(ir, "define ptr @alu.p") == 3);
-    CHECK(ir.find("(ptr %state, ptr %wheel)") != std::string::npos);
+    // One process per @<module>.p<index>: two combinational assigns + one
+    // sequential always block. All three are suspension-free, so by default they
+    // lower to plain per-activation thunks — void, taking the state ptr plus the
+    // timing-wheel ptr, no coroutine. Under --no-thunk each is instead a
+    // switched-resume coroutine ramp returning the handle (CoroSplit then emits
+    // .resume/.destroy/.cleanup parts, which don't match "define ptr @alu.p").
+    CHECK(count_substr(ir, "define void @alu.p") == 3);
+    CHECK(count_substr(ir, ".thunk(") == 3);
+    CHECK(ir.find("(ptr noalias %state, ptr %wheel)") != std::string::npos);
+    const std::string co = emit(kAlu, { .thunk = false });
+    CHECK(count_substr(co, "define ptr @alu.p") == 3);
+    CHECK(co.find("(ptr %state, ptr %wheel)") != std::string::npos);
 
     // Datapath ops present.
     CHECK(ir.find(" add ") != std::string::npos);
@@ -969,13 +988,17 @@ TEST_CASE("event waits emit wait queues, always loops, and queue servicing") {
     CHECK(ir.find("@clotho.wait.doubled.dyn.any = internal global") != std::string::npos);
     CHECK(ir.find("@clotho.wait.doubled.dyn.any.len = internal global") != std::string::npos);
     CHECK(ir.find("@clotho.proc_sched = internal global") != std::string::npos);
-    // The always blocks lower to a forever wait loop; servicing has both a static
-    // and a dynamic scan. Labels are asserted on raw IR (simplifycfg merges and
-    // renames blocks).
+    // Both always blocks are suspension-free, so by default they lower to plain
+    // per-activation thunks (no forever wait loop); servicing still has a static
+    // and a dynamic scan from the blocking stores. The always-loop coroutine
+    // form appears under --no-thunk. Labels asserted on raw IR (simplifycfg
+    // merges and renames blocks).
     const std::string raw = emit_raw(src);
-    CHECK(raw.find("always.loop") != std::string::npos);
     CHECK(raw.find("sta.head") != std::string::npos);
     CHECK(raw.find("dyn.head") != std::string::npos);
+    CHECK(count_substr(raw, ".thunk(") == 2);
+    CHECK(raw.find("always.loop") == std::string::npos);
+    CHECK(emit_raw(src, { .thunk = false }).find("always.loop") != std::string::npos);
 }
 
 TEST_CASE("bare initial @(event) blocks; it does not run at time zero") {
@@ -1291,12 +1314,17 @@ TEST_CASE("repeated instantiation emits distinct process symbols") {
     const std::string          ir  = emit(src);
 
     // Per instance: 1 always block + 1 input-port copy (clk) + 1 output-port copy
-    // (cnt) = 3 ramps. The two clk input-port copies share the identical
-    // sensitivity (@top clk) and fuse into one coroutine (`.f2`); the clocked
-    // always blocks watch per-instance clk locals and stay separate. 6
-    // processes emit as 5 distinct @top.p<N> ramps.
-    CHECK(count_substr(ir, "define ptr @top.p") == 5);
-    CHECK(count_substr(ir, ".f2(") == 1);
+    // (cnt). The two clk input-port copies share the identical sensitivity
+    // (@top clk) and fuse into one unit (`.f2`); the clocked always blocks watch
+    // per-instance clk locals and stay separate. 6 processes emit as 5 distinct
+    // @top.p<N> units. All are suspension-free, so by default they are thunks
+    // (the fused pair is `.f2.thunk`); under --no-thunk they are coroutine ramps.
+    CHECK(count_substr(ir, "define void @top.p") == 5);
+    CHECK(count_substr(ir, ".thunk(") == 5);
+    CHECK(count_substr(ir, ".f2.thunk(") == 1);
+    const std::string co = emit(src, { .thunk = false });
+    CHECK(count_substr(co, "define ptr @top.p") == 5);
+    CHECK(count_substr(co, ".f2(") == 1);
 }
 
 // Regression: a single-operand concat ({x}) and a single replication ({1{x}})
@@ -3342,8 +3370,10 @@ TEST_CASE("identical-sensitivity clocked processes fuse and stay correct") {
     )";
     // Edge 1: a=101, b=11, c=110. Edge 2: a=211, b=112, c=121.
     CHECK(run_capture(src) == "211 112 121\n");
-    // All three lower into one fused coroutine.
-    CHECK(count_substr(emit(src), ".f3(") == 1);
+    // All three lower into one fused unit: a thunk by default (suspension-free),
+    // a coroutine under --no-thunk.
+    CHECK(count_substr(emit(src), ".f3.thunk(") == 1);
+    CHECK(count_substr(emit(src, { .thunk = false }), ".f3(") == 1);
 }
 
 TEST_CASE("suspension points and self-sensitivity writes block fusion") {
