@@ -1,0 +1,15 @@
+name = "str_append"
+top = "top"
+
+[clotho]
+files = ["design.sv"]
+
+[check]
+stdout_regex = "done 480000 ghabcdefgh"
+
+[oracles.iverilog]
+enabled = true
+
+[oracles.verilator]
+enabled = true
+

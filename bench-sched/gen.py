@@ -36,7 +36,6 @@ import argparse
 import random
 import sys
 
-
 def gen_regs(n: int, cycles: int, fused: bool, seed: int | None) -> str:
     out = []
     out.append("module top;")
@@ -70,7 +69,6 @@ def gen_regs(n: int, cycles: int, fused: bool, seed: int | None) -> str:
             out.append(f"  always @(posedge clk) {stmts[i]}")
     out.append("endmodule")
     return "\n".join(out) + "\n"
-
 
 def gen_thunk(n: int, cycles: int, shape: str) -> str:
     out = []
@@ -120,7 +118,6 @@ def gen_thunk(n: int, cycles: int, shape: str) -> str:
     out.append("endmodule")
     return "\n".join(out) + "\n"
 
-
 def gen_wheel(cycles: int) -> str:
     """Timestep-bound clock microbench: one #delay clock generator and one
     trivial clocked process, so ~2 wheel ticks per cycle dominate over the
@@ -142,7 +139,6 @@ def gen_wheel(cycles: int) -> str:
         "  end\n"
         "endmodule\n"
     )
-
 
 def gen_tri(k: int, cycles: int, fused: bool, order: str) -> str:
     out = []
@@ -193,7 +189,6 @@ def gen_tri(k: int, cycles: int, fused: bool, order: str) -> str:
     out.append("endmodule")
     return "\n".join(out) + "\n"
 
-
 def gen_chain(k: int, cycles: int, fused: bool, order: str) -> str:
     """Sparse counterpart of tri: proc i reads only s and a_{i-1}. Waste from
     bad order is bounded (~2x), the realistic envelope for RTL-like nets."""
@@ -239,10 +234,116 @@ def gen_chain(k: int, cycles: int, fused: bool, order: str) -> str:
     out.append("endmodule")
     return "\n".join(out) + "\n"
 
+def gen_combchain(depth: int, cycles: int) -> str:
+    """Deep combinational module chain: DEPTH pass-through cell modules, each
+    one continuous assign, wired input->output through ports. Every clock edge
+    ripples one wave of DEPTH single-assign activations down the chain, so the
+    bench is dominated by per-wave wake/subscription/port-copy cost -- the
+    target of comb-process fusion.
+    2026-07); per-activation cost measured ~4x the thunk_comb figure."""
+    out = []
+    out.append("module stage(input wire [31:0] in, output wire [31:0] out);")
+    out.append("  assign out = in + 32'h1;")
+    out.append("endmodule")
+    out.append("")
+    out.append("module top;")
+    out.append("  reg clk = 0;")
+    out.append("  reg [31:0] src = 0;")
+    out.append("  integer c = 0;")
+    out.append("  wire [31:0] w0;")
+    out.append("  assign w0 = src;")
+    for i in range(depth):
+        out.append(f"  wire [31:0] w{i + 1};")
+        out.append(f"  stage s{i}(.in(w{i}), .out(w{i + 1}));")
+    out.append("  always #5 clk = ~clk;")
+    # The finisher reads the far end one full cycle after the last src update
+    # (NBA src, wave settles within the same timestep), so the read is settled
+    # and deterministic.
+    out.append("  always @(posedge clk) begin")
+    out.append("    src <= src + 3;")
+    out.append("    c <= c + 1;")
+    out.append(f"    if (c == {cycles}) begin")
+    out.append(f'      $display("done %h", w{depth});')
+    out.append("      $finish;")
+    out.append("    end")
+    out.append("  end")
+    out.append("endmodule")
+    return "\n".join(out) + "\n"
+
+def _primes(count: int, start: int = 3):
+    """First COUNT odd primes from START."""
+    primes = []
+    cand = start
+    while len(primes) < count:
+        if all(cand % p for p in range(3, int(cand**0.5) + 1, 2)) and cand % 2:
+            primes.append(cand)
+        cand += 2
+    return primes
+
+def gen_timers(n: int, horizon: int) -> str:
+    """N free-running `always #p` toggles with distinct prime periods: keeps N
+    timers pending concurrently, spread across timing-wheel levels. The
+    single-timer `wheel` bench never holds more than a couple of pending
+    entries, so multi-timer occupancy (schedule/advance with populated levels)
+    is only visible here. The watchdog samples at the first time >= HORIZON
+    that no period divides, so no toggle coincides with the read (same-instant
+    ordering would otherwise be legal nondeterminism)."""
+    periods = _primes(n)
+    end = horizon
+    while any(end % p == 0 for p in periods):
+        end += 1
+    out = []
+    out.append("module top;")
+    for i, p in enumerate(periods):
+        out.append(f"  reg x{i} = 0;")
+        out.append(f"  always begin #{p} x{i} = ~x{i}; end")
+    out.append("  reg [31:0] acc;")
+    out.append("  initial begin")
+    out.append(f"    #{end};")
+    out.append("    acc = 0;")
+    for g in range(0, n, 32):
+        bits = ", ".join(f"x{i}" for i in range(g, min(g + 32, n)))
+        out.append(f"    acc = acc + {{{bits}}};")
+    out.append('    $display("done %h", acc);')
+    out.append("    $finish;")
+    out.append("  end")
+    out.append("endmodule")
+    return "\n".join(out) + "\n"
+
+def gen_bigcase(n: int, cycles: int) -> str:
+    """One clocked process holding an N-entry case statement over a hashed
+    selector. Tracks two costs on the same design: LLVM compile time of a
+    large single function (measured superlinear at tier 0: 1024 entries
+    0.7 s, 4096 entries 11.6 s, 2026-07) and case-dispatch sim cost (lowers
+    to a compare chain today, so per-cycle cost grows with N; a jump table
+    would flatten it)."""
+    sel_bits = max(1, (n - 1).bit_length())
+    out = []
+    out.append("module top;")
+    out.append("  reg clk = 0;")
+    out.append("  integer c = 0;")
+    out.append("  reg [31:0] sel = 0;")
+    out.append("  reg [31:0] out_r = 0;")
+    out.append("  always #5 clk = ~clk;")
+    out.append("  always @(posedge clk) begin")
+    out.append(f"    case (sel[{sel_bits - 1}:0])")
+    for i in range(n):
+        out.append(f"      {sel_bits}'d{i}: out_r = out_r + 32'h{(i * 2654435761) & 0xffffffff:08x};")
+    out.append("    endcase")
+    out.append("    sel <= sel + 32'h9e3779b1;")
+    out.append("    c <= c + 1;")
+    out.append(f"    if (c == {cycles}) begin")
+    out.append('      $display("done %h", out_r);')
+    out.append("      $finish;")
+    out.append("    end")
+    out.append("  end")
+    out.append("endmodule")
+    return "\n".join(out) + "\n"
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("bench", choices=["regs", "tri", "chain", "thunk", "wheel"])
+    ap.add_argument("bench", choices=["regs", "tri", "chain", "thunk", "wheel",
+                                      "combchain", "timers", "bigcase"])
     ap.add_argument("--n", type=int, required=True)
     ap.add_argument("--cycles", type=int, required=True)
     ap.add_argument("--fused", action="store_true")
@@ -258,5 +359,11 @@ if __name__ == "__main__":
         sys.stdout.write(gen_chain(a.n, a.cycles, a.fused, a.order))
     elif a.bench == "thunk":
         sys.stdout.write(gen_thunk(a.n, a.cycles, a.shape))
+    elif a.bench == "combchain":
+        sys.stdout.write(gen_combchain(a.n, a.cycles))
+    elif a.bench == "timers":
+        sys.stdout.write(gen_timers(a.n, a.cycles))
+    elif a.bench == "bigcase":
+        sys.stdout.write(gen_bigcase(a.n, a.cycles))
     else:
         sys.stdout.write(gen_wheel(a.cycles))

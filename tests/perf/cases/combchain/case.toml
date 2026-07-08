@@ -1,0 +1,19 @@
+name = "combchain"
+top = "top"
+
+[fetch]
+script = "fetch.sh"
+probe = "design.sv"
+
+[clotho]
+files = ["design.sv"]
+
+[check]
+stdout_regex = "done 0000ec60"
+
+[oracles.iverilog]
+enabled = true
+
+[oracles.verilator]
+enabled = true
+

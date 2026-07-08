@@ -1,0 +1,16 @@
+name = "wide_mul"
+description = "200k-iteration 2048-bit multiply/shift/add chain in a zero-time loop. Wide ops land in wide-integer libcalls, neutralizing the JIT dispatch advantage: clotho's smallest compute-bound lead (~4.5x over iverilog, 2026-07; 64-bit loops run >100x). Tracks wide-op codegen; width-specialized multiply or 2-state lowering moves this."
+top = "top"
+
+[clotho]
+files = ["design.sv"]
+
+[check]
+stdout_regex = "done 7c73d10c95f6ec7f"
+
+[oracles.iverilog]
+enabled = true
+
+[oracles.verilator]
+enabled = true
+

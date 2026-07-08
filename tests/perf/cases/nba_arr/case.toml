@@ -1,0 +1,15 @@
+name = "nba_arr"
+top = "top"
+
+[clotho]
+files = ["design.sv"]
+
+[check]
+stdout_regex = "done c0ffa2d7"
+
+[oracles.iverilog]
+enabled = true
+
+[oracles.verilator]
+enabled = true
+
