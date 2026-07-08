@@ -1,0 +1,12 @@
+# Fetched benchmark sources (pinned clones, see cases/*/fetch.sh).
+cases/*/src/
+# Per-run results; only baseline.json and oracles.json are checked in.
+results.json
+# Oracle tool build artifacts (runs execute in the case directory).
+cases/*/iv.out
+cases/*/obj_dir/
+cases/*/*.log
+cases/*/*.vcd
+cases/*/splits.txt
+cases/*/hyperfine.json
+__pycache__/

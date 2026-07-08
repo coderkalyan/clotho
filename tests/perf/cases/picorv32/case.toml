@@ -1,0 +1,24 @@
+name = "picorv32"
+description = "Stock picorv32 core + AXI testbench run to the 1M-cycle watchdog TIMEOUT (fixed, deterministic cycle count)."
+top = "testbench"
+
+[fetch]
+script = "fetch.sh"
+# Fetch runs when this file is missing.
+probe = "src/picorv32.v"
+
+[clotho]
+# testbench.v is vendored with $test$plusargs/$value$plusargs sites disabled
+# (clotho TODO); picorv32.v is stock from the pinned clone.
+files = ["src/picorv32.v", "testbench.v"]
+
+[check]
+# Watchdog fires after 1M cycles; anything else (TRAP/ERROR) is a broken sim.
+stdout_regex = "TIMEOUT"
+
+[oracles.iverilog]
+enabled = true
+
+[oracles.verilator]
+enabled = false
+note = "Not comparable: verilator harness drives the clock from C++ with no AXI delay randomization and ends at firmware completion, a different cycle count."
