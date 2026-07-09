@@ -153,3 +153,367 @@ TEST_CASE("first matching item wins, search stops") {
     )";
     CHECK(run_capture(src) == "first\n");
 }
+
+// -- Priority-order case dedup (LRM 12.5 first-match) --
+
+// A later constant label duplicating an earlier one is dead: the first item's
+// body is the only one that can run for that value.
+TEST_CASE("duplicate constant label: first body wins, duplicate is dead") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [1:0] s;
+            initial begin
+                s = 2'd1;
+                case (s)
+                    2'd1: $display("first");
+                    2'd1: $display("dup");
+                    default: $display("def");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "first\n");
+}
+
+// The duplicate collapses across differing widths once resized to the common
+// compare width (8'd5 === 4'd5), so the wider later label is still dead.
+TEST_CASE("duplicate constant label across widths") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] s;
+            initial begin
+                s = 8'd5;
+                case (s)
+                    4'd5: $display("first");
+                    8'd5: $display("dup");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "first\n");
+}
+
+// Deduping a label out of a group must not remove a still-live sibling label.
+TEST_CASE("dedup within a group keeps live sibling") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [2:0] s;
+            initial begin
+                s = 3'd4;
+                case (s)
+                    3'd1:       $display("one");
+                    3'd1, 3'd4: $display("group");
+                    default:    $display("def");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "group\n");
+}
+
+// Non-constant labels are not deduped (only constants are, for now), so a
+// side-effecting label between two identical `k` labels must still run and the
+// later `k` re-evaluate: k starts 1 (no match at s=2), bump() raises k to 2 and
+// matches. Guards that constant-only dedup never disturbs non-constant labels.
+TEST_CASE("non-constant labels keep evaluation and side effects (not deduped)") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] s, k;
+            function automatic logic [3:0] bump;
+                k = k + 4'd1;
+                return k;
+            endfunction
+            initial begin
+                k = 4'd1;
+                s = 4'd2;
+                case (s)
+                    k:      $display("k1");
+                    bump(): $display("bumped");
+                    k:      $display("k2");
+                    default:$display("def");
+                endcase
+            end
+        endmodule
+    )";
+    // k starts 1 (no match), bump() -> k=2 matches s=2.
+    CHECK(run_capture(src) == "bumped\n");
+}
+
+// A duplicate call label must keep its second evaluation (side effect), so the
+// duplicate is never dropped. Each call increments a counter; the body that
+// runs reports the counter, proving both calls executed.
+TEST_CASE("duplicate call label keeps its side effect") {
+    constexpr std::string_view src = R"(
+        module m;
+            integer n = 0;
+            logic [3:0] s;
+            function automatic logic [3:0] tick;
+                n = n + 1;
+                return 4'd7;
+            endfunction
+            initial begin
+                s = 4'd3;
+                case (s)
+                    tick(): $display("a");
+                    tick(): $display("b");
+                    default: $display("n=%0d", n);
+                endcase
+            end
+        endmodule
+    )";
+    // s=3 matches neither tick()==7; both calls run -> n=2 at default.
+    CHECK(run_capture(src) == "n=2\n");
+}
+
+// casez: two identical wildcard labels -- the later is dead (identical label
+// yields an identical match predicate).
+TEST_CASE("duplicate casez wildcard label is dead") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] s;
+            initial begin
+                s = 4'b1010;
+                casez (s)
+                    4'b1?1?: $display("first");
+                    4'b1?1?: $display("dup");
+                    default: $display("def");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "first\n");
+}
+
+// unique case with duplicate labels: dedup is skipped so the items survive
+// (overlap is a reportable violation; first-match execution stays conforming).
+TEST_CASE("unique case with duplicate label still executes first match") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [1:0] s;
+            initial begin
+                s = 2'd2;
+                unique case (s)
+                    2'd2: $display("first");
+                    2'd2: $display("dup");
+                    default: $display("def");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "first\n");
+}
+
+// -- Switch-lowered constant case: packed-key routing --
+// These run through the multiway switch path (all labels clean constants). The
+// key is {may^must, must}: a clean selector keys on its value; any x/z bit sets
+// the high half so the key lands outside every case value and hits default.
+
+TEST_CASE("switch case: clean selector hits its arm") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] s;
+            initial begin
+                s = 4'd10;
+                case (s)
+                    4'd8:  $display("eight");
+                    4'd10: $display("ten");
+                    4'd12: $display("twelve");
+                    default: $display("def");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "ten\n");
+}
+
+TEST_CASE("switch case: clean unlisted value hits default") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] s;
+            initial begin
+                s = 4'd7;
+                case (s)
+                    4'd8:  $display("eight");
+                    4'd10: $display("ten");
+                    default: $display("def");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "def\n");
+}
+
+// A selector with an x bit cannot === any clean label; the packed key routes it
+// to default. Without the may^must field it would alias a clean label.
+TEST_CASE("switch case: x-bit selector routes to default") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] s;
+            initial begin
+                s = 4'b101x;
+                case (s)
+                    4'd8:  $display("eight");
+                    4'd10: $display("ten");
+                    default: $display("def");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "def\n");
+}
+
+TEST_CASE("switch case: z-bit selector routes to default") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] s;
+            initial begin
+                s = 4'b101z;
+                case (s)
+                    4'd8:  $display("eight");
+                    4'd10: $display("ten");
+                    default: $display("def");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "def\n");
+}
+
+// Grouped keys share one arm; matching the second key still runs that body.
+TEST_CASE("switch case: grouped key second value hits shared arm") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] s;
+            initial begin
+                s = 4'd3;
+                case (s)
+                    4'd1, 4'd3, 4'd5: $display("odd");
+                    4'd2, 4'd4:       $display("even");
+                    default:          $display("def");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "odd\n");
+}
+
+// -- One-hot reverse-case `case (1'b1)` over base[i] selects (ctz/clz + jump) --
+// Cross-checked against iverilog.
+
+TEST_CASE("one-hot ascending: lowest set bit wins") {
+    // bits 1 and 3 set; LSB-first source order -> bit 1 (arm a1) wins.
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] s;
+            initial begin
+                s = 4'b1010;
+                case (1'b1)
+                    s[0]: $display("a0");
+                    s[1]: $display("a1");
+                    s[2]: $display("a2");
+                    s[3]: $display("a3");
+                    default: $display("def");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a1\n");
+}
+
+TEST_CASE("one-hot descending: highest set bit wins") {
+    // bits 1 and 3 set; MSB-first source order -> bit 3 (arm m3) wins.
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] s;
+            initial begin
+                s = 4'b1010;
+                case (1'b1)
+                    s[3]: $display("m3");
+                    s[2]: $display("m2");
+                    s[1]: $display("m1");
+                    s[0]: $display("m0");
+                    default: $display("def");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "m3\n");
+}
+
+TEST_CASE("one-hot: x/z bit is not a definite 1 (skipped)") {
+    // bit 0 = x (no match), bit 2 = 1 -> arm a2.
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] s;
+            initial begin
+                s = 4'b010x;
+                case (1'b1)
+                    s[0]: $display("a0");
+                    s[1]: $display("a1");
+                    s[2]: $display("a2");
+                    default: $display("def");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a2\n");
+}
+
+TEST_CASE("one-hot: no definite-1 bit hits default") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] s;
+            initial begin
+                s = 4'bxxxx;
+                case (1'b1)
+                    s[0]: $display("a0");
+                    s[1]: $display("a1");
+                    s[2]: $display("a2");
+                    default: $display("def");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "def\n");
+}
+
+TEST_CASE("one-hot with a gap in indices masks unselected bits") {
+    // Only bits 0 and 3 are arms; bit 1 is set but has no arm -> must not
+    // shadow. Here bit 3 set, bit 1 set -> arm for bit 3 (ascending: lowest
+    // *selected* set bit is 3 since bit-0 arm's bit is 0).
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] s;
+            initial begin
+                s = 4'b1010;
+                case (1'b1)
+                    s[0]: $display("a0");
+                    s[3]: $display("a3");
+                    default: $display("def");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a3\n");
+}
+
+// Non-monotonic arm order can't use ctz/clz (source-order priority differs from
+// bit order under multiple set bits); it falls back to the chain and still
+// yields the source-order first match.
+TEST_CASE("one-hot non-monotonic order falls back to chain (source priority)") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] s;
+            initial begin
+                s = 4'b0011;
+                case (1'b1)
+                    s[2]: $display("n2");
+                    s[0]: $display("n0");
+                    s[1]: $display("n1");
+                    default: $display("nd");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "n0\n");
+}

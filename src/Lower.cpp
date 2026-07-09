@@ -1879,6 +1879,280 @@ private:
         return make_int_type(width, four, signd);
     }
 
+    // Priority-order case dedup (LRM 12.5). The first matching case_item wins,
+    // so a later label that always evaluates identically to an earlier one is
+    // dead -- its body can never run. A constant label's value is fixed, so a
+    // later exact duplicate (=== at the common compare width) is always dead,
+    // immune to any intervening side effect. Handles casez/casex too: an
+    // identical label yields an identical match predicate regardless of its
+    // wildcard bits.
+    //
+    // TODO: dedup non-constant duplicate labels (a repeated `k` / `a+b`). Only
+    // safe when the label and every label between the two occurrences are
+    // side-effect-free -- else an intervening f() or ++ could mutate the
+    // variables it reads, or a conforming sim must still run the dropped label's
+    // own effect (has_observable_effect + a pure-label memo cleared at any impure
+    // label gates it). Dropped for now: rare, and the constant path is what the
+    // downstream jump-table lowering needs.
+    //
+    // Skipped for unique/priority checks: their overlap is a reportable
+    // violation, so duplicates must survive (report emission is a TODO above).
+    // Returns keep[k][j] = whether item k's label j survives.
+    std::vector<std::vector<char>> case_dedup(const CaseStatement& c) {
+        std::vector<std::vector<char>> keep(c.items.size());
+        for (size_t k = 0; k < c.items.size(); k++) {
+            keep[k].assign(c.items[k].expressions.size(), 1);
+        }
+        if (c.check != slang::ast::UniquePriorityCheck::None) {
+            return keep;
+        }
+
+        // Common compare width: longest of the selector and all labels (12.5).
+        uint32_t width = c.expr.type->getBitWidth();
+        for (const CaseStatement::ItemGroup& item : c.items) {
+            for (const Expression* e : item.expressions) {
+                width = std::max(width, e->type->getBitWidth());
+            }
+        }
+
+        std::vector<slang::SVInt> seen_const;
+        slang::ast::ASTContext    astCtx(*scope_, slang::ast::LookupLocation::max);
+
+        for (size_t k = 0; k < c.items.size(); k++) {
+            const std::span<const Expression* const> exprs = c.items[k].expressions;
+            for (size_t j = 0; j < exprs.size(); j++) {
+                const Expression&          e  = *exprs[j];
+                slang::ast::EvalContext    ev(astCtx);
+                const slang::ConstantValue cv = e.eval(ev);
+                if (!cv.isInteger()) {
+                    continue;
+                }
+                slang::SVInt v = cv.integer();
+                if (v.getBitWidth() < width) {
+                    v = v.extend(width, e.type->isSigned());
+                }
+                bool dup = false;
+                for (const slang::SVInt& s : seen_const) {
+                    if (exactlyEqual(s, v)) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) {
+                    keep[k][j] = 0;
+                }
+                else {
+                    seen_const.push_back(std::move(v));
+                }
+            }
+        }
+        return keep;
+    }
+
+    // One arm of a switch-lowered case: the constant clean key values selecting
+    // it (already normalized to the common compare width) and the body to run.
+    struct SwitchArmPlan {
+        std::vector<uint64_t>        keys;
+        const slang::ast::Statement* body;
+    };
+
+    // Decide whether a Normal case can lower to a switch, and if so build its
+    // arms. Eligible when every label is a constant with no x/z bits ("clean")
+    // and the packed key fits 64 bits. The backend keys a clean value on its
+    // bare bits ({may^must, must}); an x/z-bearing label would need the z field
+    // and per-bit packing, so it falls back to the if-else chain (rare).
+    //
+    // Dedup happens here in one pass (LRM 12.5 first-match: a later label
+    // duplicating an earlier key is dead, so it is dropped), giving the switch
+    // unique keys without a second label evaluation. The caller only reaches
+    // this for a check==None Normal case; casez/casex and unique/priority keep
+    // the chain. Returns nullopt (-> chain) on the first non-constant or x/z
+    // label, or when the key is too wide.
+    std::optional<std::vector<SwitchArmPlan>> build_switch_arms(const CaseStatement& c) {
+        uint32_t width = c.expr.type->getBitWidth();
+        bool     four  = c.expr.type->isFourState();
+        for (const CaseStatement::ItemGroup& item : c.items) {
+            for (const Expression* e : item.expressions) {
+                width = std::max(width, e->type->getBitWidth());
+                four  = four || e->type->isFourState();
+            }
+        }
+        const uint32_t key_width = four ? 2 * width : width;
+        if (key_width == 0 || key_width > 64) {
+            return std::nullopt;
+        }
+
+        slang::ast::ASTContext                  astCtx(*scope_, slang::ast::LookupLocation::max);
+        std::vector<SwitchArmPlan>              arms;
+        ankerl::unordered_dense::set<uint64_t>  seen;
+        for (const CaseStatement::ItemGroup& item : c.items) {
+            std::vector<uint64_t> keys;
+            for (const Expression* e : item.expressions) {
+                slang::ast::EvalContext    ev(astCtx);
+                const slang::ConstantValue cv = e->eval(ev);
+                if (!cv.isInteger() || cv.integer().hasUnknown()) {
+                    return std::nullopt;  // non-constant or x/z label -> chain.
+                }
+                slang::SVInt v = cv.integer();
+                if (v.getBitWidth() < width) {
+                    v = v.extend(width, e->type->isSigned());
+                }
+                const std::optional<uint64_t> u = v.as<uint64_t>();
+                if (!u) {
+                    return std::nullopt;
+                }
+                if (seen.insert(*u).second) {  // first occurrence wins; drop dups.
+                    keys.push_back(*u);
+                }
+            }
+            if (!keys.empty()) {
+                arms.push_back({ std::move(keys), item.stmt });
+            }
+        }
+        if (arms.empty()) {
+            return std::nullopt;
+        }
+        return arms;
+    }
+
+    // A one-hot reverse-case plan: the base packed value and, per arm, the IR
+    // bit position it selects and the body to run. `descending` picks Clz
+    // (highest-bit priority) over Ctz (lowest-bit).
+    struct OneHotPlan {
+        const Expression*                                  base;
+        std::vector<std::pair<uint64_t, const Statement*>> arms;  // (IR bit, body)
+        bool                                               descending;
+        uint32_t                                           base_width;
+    };
+
+    // Detect the one-hot reverse-case idiom `case (1'b1)` where every arm is a
+    // single-bit select `base[i]` of a common packed base with a constant index.
+    // First arm in source order whose bit is a definite 1 wins (LRM 12.5). When
+    // the arms' IR bit positions run monotonically -- ascending (lower Ctz) or
+    // descending (Clz) -- source-order priority equals lowest/highest-set-bit
+    // priority for ANY set-bit pattern, so it lowers to
+    // `switch (ctz/clz(base)) { i_k -> arm_k }`: a jump table keyed on the
+    // winning bit index (LLVM owns the table and permutes the arbitrary case
+    // values). x/z bits are not definite 1, so they never match, matching `===`.
+    //
+    // TODO(unique): `unique`/`unique0 case (1'b1)` asserts one-hot (<= 1 bit
+    // set), which makes ANY arm order safe (order is unobservable with one bit)
+    // -- accept non-monotonic orders there once the unique/unique0 overlap
+    // violation report lands (a TODO shared with the plain switch path).
+    // TODO(repack): a non-monotonic plain case is not handled -- source-order
+    // priority then differs from bit order under multiple simultaneous set bits.
+    // A cheap gather re-packing the selected bits into source order (bit k =
+    // base[i_k]) before Ctz would restore it; deferred (O(N) ops/eval, rare).
+    std::optional<OneHotPlan> build_onehot_plan(const CaseStatement& c) {
+        if (c.condition != CaseStatementCondition::Normal ||
+            c.check != slang::ast::UniquePriorityCheck::None) {
+            return std::nullopt;
+        }
+        // Selector must be exactly the 1-bit constant 1.
+        {
+            slang::ast::ASTContext     ctx(*scope_, slang::ast::LookupLocation::max);
+            slang::ast::EvalContext    ev(ctx);
+            const slang::ConstantValue cv = c.expr.eval(ev);
+            if (!cv.isInteger() || cv.integer().getBitWidth() != 1 || cv.integer().hasUnknown() ||
+                cv.integer().as<uint64_t>().value_or(0) != 1) {
+                return std::nullopt;
+            }
+        }
+
+        const slang::ast::ValueSymbol*                     base_sym   = nullptr;
+        const Expression*                                  base_expr  = nullptr;
+        uint32_t                                           base_width = 0;
+        std::vector<std::pair<uint64_t, const Statement*>> arms;
+        for (const CaseStatement::ItemGroup& item : c.items) {
+            if (item.expressions.size() != 1) {
+                return std::nullopt;  // grouped labels: fallback (see TODO(repack)).
+            }
+            const Expression& e = *item.expressions[0];
+            if (e.kind != ExpressionKind::ElementSelect) {
+                return std::nullopt;
+            }
+            const ElementSelectExpression& es = e.as<ElementSelectExpression>();
+            if (es.value().kind != ExpressionKind::NamedValue) {
+                return std::nullopt;
+            }
+            const slang::ast::ValueSymbol& sym = es.value().as<NamedValueExpression>().symbol;
+            if (base_sym == nullptr) {
+                base_sym   = &sym;
+                base_expr  = &es.value();
+                base_width = es.value().type->getBitWidth();
+                if (base_width == 0 || !es.value().type->isIntegral()) {
+                    return std::nullopt;
+                }
+            }
+            else if (&sym != base_sym) {
+                return std::nullopt;  // arms must share one base signal.
+            }
+            if (!e.type->isIntegral() || e.type->getBitWidth() != 1) {
+                return std::nullopt;
+            }
+            const std::optional<int32_t> decl = try_const_int(es.selector());
+            if (!decl) {
+                return std::nullopt;
+            }
+            const slang::ConstantRange range = packed_range_of(es.value());
+            if (!range.containsPoint(*decl)) {
+                return std::nullopt;
+            }
+            arms.push_back({ static_cast<uint64_t>(range.translateIndex(*decl)), item.stmt });
+        }
+        if (arms.size() < 2) {
+            return std::nullopt;
+        }
+
+        // Monotonic in IR bit position: ascending -> Ctz, descending -> Clz.
+        bool ascending = true, descending = true;
+        for (size_t k = 1; k < arms.size(); k++) {
+            ascending  = ascending && arms[k].first > arms[k - 1].first;
+            descending = descending && arms[k].first < arms[k - 1].first;
+        }
+        if (!ascending && !descending) {
+            return std::nullopt;  // see TODO(unique) / TODO(repack).
+        }
+        return OneHotPlan{ base_expr, std::move(arms), !ascending, base_width };
+    }
+
+    void emit_onehot(const CaseStatement& c, const OneHotPlan& plan, ir::Builder& b) {
+        const ir::Index base_val = lower_expr(*plan.base, b);
+        ir::Index       selector = base_val;
+        // Mask to the selected bits so a set base bit with no arm can't shadow a
+        // higher-priority selected bit. Skipped when every base bit is an arm.
+        if (plan.arms.size() != plan.base_width) {
+            slang::SVInt       mask(plan.base_width, 0, false);
+            const slang::SVInt one(plan.base_width, 1, false);
+            for (const std::pair<uint64_t, const Statement*>& arm : plan.arms) {
+                mask |= one.shl(static_cast<uint32_t>(arm.first));
+            }
+            const ir::Index mcst =
+              b.constant(svint_to_ref(mask, lower_type(*plan.base->type)), loc(*plan.base));
+            selector = b.binary(ir::Inst::Tag::Band, base_val, mcst, loc(*plan.base));
+        }
+        const ir::Index key =
+          b.unary(plan.descending ? ir::Inst::Tag::Clz : ir::Inst::Tag::Ctz, selector, loc(c.expr));
+
+        std::vector<std::vector<uint64_t>>       keystore;
+        std::vector<ir::Builder::SwitchArmBuild> arms;
+        keystore.reserve(plan.arms.size());
+        arms.reserve(plan.arms.size());
+        for (const std::pair<uint64_t, const Statement*>& arm : plan.arms) {
+            b.open_region();
+            lower_stmt(*arm.second, b);
+            const ir::ExtraSlice reg = b.close_region();
+            keystore.push_back({ arm.first });
+            arms.push_back({ std::span<const uint64_t>(keystore.back()), reg });
+        }
+        b.open_region();
+        if (c.defaultCase != nullptr) {
+            lower_stmt(*c.defaultCase, b);
+        }
+        const ir::ExtraSlice default_region = b.close_region();
+        b.switch_(key, arms, default_region, loc(c.expr));
+    }
+
     void lower_case(const CaseStatement& c, ir::Builder& b) {
         if (is_string_expr(c.expr)) {
             // TODO: case over strings (labels compare with rt_string_cmp; the
@@ -1904,11 +2178,43 @@ private:
         // conforming for all of them.
         // TODO: emit unique / priority violation reports.
 
+        // The one-hot reverse-case idiom `case (1'b1)` over base[i] selects
+        // lowers to ctz/clz + jump table. See build_onehot_plan.
+        if (std::optional<OneHotPlan> oh = build_onehot_plan(c)) {
+            emit_onehot(c, *oh, b);
+            return;
+        }
+
         const ir::Ref   ty  = common_case_type(c);
         // The selector is evaluated exactly once, up front (12.5).
         const ir::Index sel = b.resize(lower_expr(c.expr, b), ty, loc(c.expr));
 
-        lower_case_item(c, 0, sel, cmp, ty, b);
+        // A constant, wildcard-free case lowers to a multiway switch (jump table)
+        // instead of an O(N) if-else compare chain. build_switch_arms dedups the
+        // keys itself, so this path never runs case_dedup. See build_switch_arms.
+        if (c.condition == CaseStatementCondition::Normal &&
+            c.check == slang::ast::UniquePriorityCheck::None) {
+            if (std::optional<std::vector<SwitchArmPlan>> plan = build_switch_arms(c)) {
+                std::vector<ir::Builder::SwitchArmBuild> arms;
+                arms.reserve(plan->size());
+                for (const SwitchArmPlan& ap : *plan) {
+                    b.open_region();
+                    lower_stmt(*ap.body, b);
+                    const ir::ExtraSlice body = b.close_region();
+                    arms.push_back({ std::span<const uint64_t>(ap.keys), body });
+                }
+                b.open_region();
+                if (c.defaultCase != nullptr) {
+                    lower_stmt(*c.defaultCase, b);
+                }
+                const ir::ExtraSlice default_region = b.close_region();
+                b.switch_(sel, arms, default_region, loc(c.expr));
+                return;
+            }
+        }
+
+        const std::vector<std::vector<char>> keep = case_dedup(c);
+        lower_case_item(c, 0, sel, cmp, ty, keep, b);
     }
 
     // Emit the if-else chain for items[k..] into the current region: item k's
@@ -1917,7 +2223,7 @@ private:
     // first match wins; labels for items not yet reached are evaluated lazily,
     // inside the else regions, so they run only until a match is found.
     void lower_case_item(const CaseStatement& c, size_t k, ir::Index sel, ir::Inst::Tag cmp, ir::Ref ty,
-                         ir::Builder& b) {
+                         const std::vector<std::vector<char>>& keep, ir::Builder& b) {
         if (k == c.items.size()) {
             if (c.defaultCase != nullptr) {
                 lower_stmt(*c.defaultCase, b);
@@ -1926,19 +2232,26 @@ private:
         }
 
         const CaseStatement::ItemGroup& item = c.items[k];
-        if (item.expressions.empty()) {
-            lower_case_item(c, k + 1, sel, cmp, ty, b);
-            return;
-        }
 
-        // Match predicate: OR of (selector <cmp> label) over the group's labels.
+        // Match predicate: OR of (selector <cmp> label) over the group's labels,
+        // skipping labels dropped by case_dedup.
         ir::Index pred{};
         bool      have = false;
-        for (const Expression* e : item.expressions) {
-            const ir::Index val = b.resize(lower_expr(*e, b), ty, loc(*e));
-            const ir::Index one = b.binary(cmp, sel, val, loc(*e));
-            pred                = have ? b.binary(ir::Inst::Tag::Lor, pred, one, loc(*e)) : one;
-            have                = true;
+        for (size_t j = 0; j < item.expressions.size(); j++) {
+            if (!keep[k][j]) {
+                continue;
+            }
+            const Expression* e   = item.expressions[j];
+            const ir::Index   val = b.resize(lower_expr(*e, b), ty, loc(*e));
+            const ir::Index   one = b.binary(cmp, sel, val, loc(*e));
+            pred                  = have ? b.binary(ir::Inst::Tag::Lor, pred, one, loc(*e)) : one;
+            have                  = true;
+        }
+        if (!have) {
+            // No surviving label (empty group, or every label deduped away): the
+            // body is unreachable, so continue the chain in the current region.
+            lower_case_item(c, k + 1, sel, cmp, ty, keep, b);
+            return;
         }
 
         b.open_region();
@@ -1946,7 +2259,7 @@ private:
         const ir::ExtraSlice then_region = b.close_region();
 
         b.open_region();
-        lower_case_item(c, k + 1, sel, cmp, ty, b);
+        lower_case_item(c, k + 1, sel, cmp, ty, keep, b);
         const ir::ExtraSlice else_region = b.close_region();
 
         b.cond(pred, then_region, else_region, loc(*item.stmt));

@@ -145,7 +145,7 @@ LowerResult lower_case_module(std::string_view kind, std::string_view body) {
     return lower_text(src);
 }
 
-TEST_CASE("case lowers to a case-equality / cond chain") {
+TEST_CASE("constant case lowers to a switch") {
     const LowerResult r = lower_case_module("case", R"(
         2'd0: x = 2'b00;
         2'd1: x = 2'b01;
@@ -155,8 +155,26 @@ TEST_CASE("case lowers to a case-equality / cond chain") {
 
     const ir::Process* p = find_level_process(*r.module);
     REQUIRE(p != nullptr);
+    // Constant, deduped, wildcard-free labels lower to a multiway switch, not
+    // the O(N) case-equality if-else chain.
+    CHECK(has_tag(p->ir, ir::Inst::Tag::Switch));
+    CHECK_FALSE(has_tag(p->ir, ir::Inst::Tag::CaseEq));
+    CHECK_FALSE(has_tag(p->ir, ir::Inst::Tag::Cond));
+}
+
+TEST_CASE("non-constant case label uses the case-equality cond chain") {
+    // A label reading `x` is not a constant, so the switch key cannot be built
+    // and lowering falls back to the if-else chain; a grouped item ORs its
+    // comparisons.
+    const LowerResult r = lower_case_module("case", "x, 2'd1: x = 2'b01; default: x = 2'b00;");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    const ir::Process* p = find_level_process(*r.module);
+    REQUIRE(p != nullptr);
     CHECK(has_tag(p->ir, ir::Inst::Tag::CaseEq));
     CHECK(has_tag(p->ir, ir::Inst::Tag::Cond));
+    CHECK(has_tag(p->ir, ir::Inst::Tag::Lor));
+    CHECK_FALSE(has_tag(p->ir, ir::Inst::Tag::Switch));
     // Normal case uses exact equality, never the X-propagating logical Eq.
     CHECK_FALSE(has_tag(p->ir, ir::Inst::Tag::Eq));
 }
@@ -171,12 +189,14 @@ TEST_CASE("casez / casex select the wildcard comparison") {
     CHECK(has_tag(find_level_process(*rx.module)->ir, ir::Inst::Tag::CasexEq));
 }
 
-TEST_CASE("a case with multiple labels per item ORs the comparisons") {
+TEST_CASE("grouped constant labels share one switch arm") {
     const LowerResult r = lower_case_module("case", "2'd0, 2'd1: x = 2'b01; default: x = 2'b00;");
     REQUIRE_MESSAGE(r.ok, r.diagnostics);
     const ir::Process* p = find_level_process(*r.module);
     REQUIRE(p != nullptr);
-    CHECK(has_tag(p->ir, ir::Inst::Tag::Lor));
+    // Both keys map to one arm body; no OR-of-comparisons chain.
+    CHECK(has_tag(p->ir, ir::Inst::Tag::Switch));
+    CHECK_FALSE(has_tag(p->ir, ir::Inst::Tag::Lor));
 }
 
 TEST_CASE("$time lowers to a SimTime instruction") {
