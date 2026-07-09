@@ -224,35 +224,30 @@ int32_t rt_random(void);
 
 // -- Deferred nonblocking writes to unpacked-array elements --
 //
-// A synchronous memory write `mem[i] <= rhs` cannot use the per-signal NBA
-// shadow (whole-signal, statically keyed). Each element write is appended to
-// this deferred queue in the active region and replayed in the NBA region. A
-// record is a bytewise masked merge into the live element slot, so the queue is
-// width-agnostic; the value / mask byte blobs are copied into runtime-owned
-// storage at push time. One global queue serves the whole design.
+// A synchronous memory write `mem[i] <= rhs` cannot use the per-signal NBA shadow
+// (whole-signal, statically keyed), so each element write is deferred to the NBA
+// region. The runtime only owns per-array growable record buffers; the record
+// layout (destination pointer(s) + value [+ mask]) is defined and filled by the
+// backend, monomorphized on the element's width / z-ness. Each array-NBA signal
+// has a dense `idx`. The buffers are reused (count reset, capacity kept) across
+// timesteps, so steady-state pushes allocate nothing at any element width.
 
-// Append one deferred element write. `sig` identifies the array signal (for
-// post-commit wake servicing). `mm_ptr` / `z_ptr` point at the live element's
-// must|may and z words; `*_val` are the bits to write and `*_mask` selects which
-// bits (1 => take from val), each `*_bytes` long. A target whose slot stores no
-// z word passes `z_ptr` null with `z_bytes` 0.
-void rt_nba_arr_push(uint32_t sig, void* mm_ptr, const void* mm_val, const void* mm_mask, uint32_t mm_bytes,
-                     void* z_ptr, const void* z_val, const void* z_mask, uint32_t z_bytes);
+// Reserve one `stride`-byte record slot in array `idx`'s buffer and return its
+// address for the backend to fill. The buffer grows geometrically; the returned
+// pointer is valid until the next slot call on the same idx.
+void* rt_nba_arr_slot(uint32_t idx, uint32_t stride);
 
-// Number of queued element writes; the NBA region tests this to decide whether a
-// commit pass is needed.
-uint32_t rt_nba_arr_pending(void);
+// Base pointer and record count of array `idx`'s buffer, read once in the NBA
+// region to drive the backend-emitted commit loop.
+void* rt_nba_arr_base(uint32_t idx);
+uint32_t rt_nba_arr_count(uint32_t idx);
 
-// Replay every queued write into its destination (bytewise (dest & ~mask) | (val
-// & mask)), in push order so a later write to the same element wins. Records
-// stay queued (for rt_nba_arr_dirty) until rt_nba_arr_reset.
-void rt_nba_arr_commit(void);
+// Total records staged across all arrays this pass; the NBA region tests this to
+// decide whether an array commit is needed.
+uint32_t rt_nba_arr_any(void);
 
-// Non-zero iff any currently-queued write targets `sig` (queried after commit to
-// decide whether to wake that array's readers).
-int rt_nba_arr_dirty(uint32_t sig);
-
-// Drop all queued writes (called after a commit + wake pass).
+// Reset every array's record count to zero (buffers keep their capacity). Called
+// after the commit + wake pass.
 void rt_nba_arr_reset(void);
 
 // -- SystemVerilog string objects --
@@ -313,6 +308,12 @@ void rt_string_substr(rt_string* dst, const rt_string* src, int32_t i, int32_t j
 void rt_string_toupper(rt_string* dst, const rt_string* src);
 void rt_string_tolower(rt_string* dst, const rt_string* src);
 
+// dst = the source name of the enum member whose value equals `val`, or "" if
+// none matches (LRM §6.19.2 e.name()). `values` / `names` / `lens` are the
+// member table (parallel arrays of `count` rows) emitted per enum type.
+void rt_enum_name(rt_string* dst, uint64_t val, uint32_t count, const uint64_t* values,
+                  const char* const* names, const uint32_t* lens);
+
 // s[i] = c ($.putc()): a no-op when i is out of range or (c & 0xff) == 0 — a
 // string never contains a 0 byte (LRM §6.16.2).
 void rt_string_putc(rt_string* s, int32_t i, uint32_t c);
@@ -333,6 +334,35 @@ void rt_string_from_packed(rt_string* dst, const uint8_t* val, uint32_t width_bi
 // string is longer than the width, zero-filled on the left when shorter
 // (LRM §6.16).
 void rt_string_to_packed(const rt_string* s, uint8_t* out, uint32_t width_bits);
+
+// s.atoi() / s.atohex() / s.atooct() / s.atobin() (LRM §6.16.9): scan leading
+// digits and '_' separators from the start of s in the given base, stopping
+// at the first other character or end of string; 0 if no digit matched. No
+// leading whitespace or sign handling — the LRM excludes them explicitly.
+// Overflow truncates silently (wraps in unsigned 32-bit arithmetic).
+int32_t rt_string_atoi(const rt_string* s);
+int32_t rt_string_atohex(const rt_string* s);
+int32_t rt_string_atooct(const rt_string* s);
+int32_t rt_string_atobin(const rt_string* s);
+
+// s.atoreal() (LRM §6.16.10): parses a real-literal-like prefix, stopping at
+// the first non-conforming character; 0.0 if no digits matched. Unlike the
+// atoi family, leading whitespace and an optional '+' are skipped first
+// (verified against iverilog).
+double rt_string_atoreal(const rt_string* s);
+
+// dst = sign + magnitude of `i` in the given base, lowercase digits (LRM
+// §6.16.11-6.16.14; inverse of atoi/atohex/atooct/atobin). `i`'s x/z bits are
+// read as 0 by the caller before this call, the same must-plane convention as
+// StrFromPacked.
+void rt_string_itoa(rt_string* dst, int32_t i);
+void rt_string_hextoa(rt_string* dst, int32_t i);
+void rt_string_octtoa(rt_string* dst, int32_t i);
+void rt_string_bintoa(rt_string* dst, int32_t i);
+
+// dst = ASCII representation of r at full round-trip precision (LRM
+// §6.16.15; inverse of atoreal).
+void rt_string_realtoa(rt_string* dst, double r);
 
 // -- Coroutine frame allocation --
 //

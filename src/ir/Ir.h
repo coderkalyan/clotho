@@ -450,6 +450,43 @@ struct StrSubstrInfo {
     Index j;
 };
 
+// One row of an enum's name table: a member value (low 64 bits) and its source
+// name, packed little-endian at `name_at` for `name_len` bytes.
+struct EnumNameEntry {
+    // Member value, low word.
+    uint32_t val_lo;
+    // Member value, high word.
+    uint32_t val_hi;
+    // First extra word of the packed name bytes.
+    ExtraIndex name_at;
+    // Name length in bytes.
+    uint32_t name_len;
+};
+
+// Extra payload for `enum_name`: the enum's member table, a run of back-to-back
+// EnumNameEntry records the runtime scans for a value match.
+struct EnumNameInfo {
+    // The member rows, as back-to-back EnumNameEntry records.
+    ExtraSlice entries;
+};
+
+// Which 4-state bit values a CountBits op tallies (LRM 20.9 $countbits control
+// bits). Bits are OR-combined into CountBitsInfo::mask; $countones is CountOne
+// alone, $isunknown is CountX | CountZ.
+enum CountBitsClass : uint32_t {
+    CountZero = 1u << 0,
+    CountOne  = 1u << 1,
+    CountX    = 1u << 2,
+    CountZ    = 1u << 3,
+};
+
+// Extra payload for `count_bits`: the operand is the op; this selects which
+// per-bit 4-state values are counted (a CountBitsClass OR-mask).
+struct CountBitsInfo {
+    // OR of CountBitsClass bits.
+    uint32_t mask;
+};
+
 // Extra payload for `wait`: one (signal, edge) event of an intra-body event
 // control. A `@(a or posedge b)` wait carries several of these in a row.
 struct WaitEdge {
@@ -495,6 +532,9 @@ static_assert(ExtraPayload<WaitEdge>);
 static_assert(ExtraPayload<WaitInfo>);
 static_assert(ExtraPayload<StrPutcInfo>);
 static_assert(ExtraPayload<StrSubstrInfo>);
+static_assert(ExtraPayload<EnumNameEntry>);
+static_assert(ExtraPayload<EnumNameInfo>);
+static_assert(ExtraPayload<CountBitsInfo>);
 
 struct Inst {
     enum class Tag : uint8_t {
@@ -727,6 +767,10 @@ struct Inst {
         // s.substr(i, j) -> new string value; "" when the range is invalid
         // (payload: op_extra -> StrSubstrInfo; the op is the source string).
         StrSubstr,
+        // e.name() -> new string value: the source name of the enum member whose
+        // value equals the operand, or "" if none matches (LRM 6.19.2). Payload:
+        // op_extra -> EnumNameInfo (the member table); op is the enum value.
+        EnumName,
         // string'(packed) -> string: bytes MSB-first with 0x00 bytes dropped
         // (payload: unary — the packed value).
         StrFromPacked,
@@ -734,6 +778,36 @@ struct Inst {
         // the target type's width (payload: op_type — op is the string, type the
         // target packed type).
         StrToPacked,
+        // s.atoi() / s.atohex() / s.atooct() / s.atobin() -> 32-bit signed
+        // `integer` (LRM 6.16.9: the declared type is 4-state, though the
+        // conversion itself never yields x — it scans leading digits, and '_'
+        // separators, of the given base and stops at the first other character
+        // or end of string; 0 if none matched. No leading whitespace or sign
+        // handling, and overflow truncates silently (payload: unary — the
+        // source string).
+        StrAtoi,
+        StrAtohex,
+        StrAtooct,
+        StrAtobin,
+        // s.atoreal() -> real (LRM 6.16.10): parses a real-literal-like prefix,
+        // stopping at the first non-conforming character; 0.0 if none matched.
+        // Unlike the atoi family, leading whitespace and an optional '+' are
+        // consumed first (payload: unary).
+        StrAtoreal,
+        // s.itoa(i) / s.hextoa(i) / s.octtoa(i) / s.bintoa(i): format `i` (a
+        // 4-state `integer`; x/z bits read as 0, the same must-plane
+        // simplification as StrFromPacked) into the string lvalue as sign +
+        // magnitude in the given base, lowercase digits (LRM 6.16.11-6.16.14;
+        // payload: binary — l is the string lvalue, like Store's lhs, r is the
+        // integer value).
+        StrItoa,
+        StrHextoa,
+        StrOctoa,
+        StrBintoa,
+        // s.realtoa(r): format `r` into the string lvalue at full round-trip
+        // precision (LRM 6.16.15; payload: binary — l the string lvalue, r the
+        // real value).
+        StrRealtoa,
 
         // -- System tasks --
         // $display / $write / $fdisplay / $fwrite: format string + variadic args,
@@ -816,6 +890,14 @@ struct Inst {
         // makes the whole result X (iverilog oracle — the LRM is silent). Lowers
         // to a count-leading-zeros: `operand == 0 ? 0 : W - clz(operand - 1)`.
         Clog2,
+        // $countbits / $countones / $onehot / $onehot0 / $isunknown building
+        // block (payload: op_extra -> CountBitsInfo; the op is the counted
+        // value). Tallies the operand's bits whose 4-state value is in the
+        // info mask (LRM 20.9), -> a definite 2-state 32-bit `int`. $countones
+        // masks CountOne; $isunknown is `CountBits(CountX|CountZ) != 0`; the
+        // one-hot forms compare `CountBits(CountOne)` against 1. A constant
+        // operand folds in slang and never reaches this tag.
+        CountBits,
     };
 
     // Which union member a tag activates. Drives payload_kind() / operands().

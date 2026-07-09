@@ -130,20 +130,30 @@ TEST_CASE("rt_readmem with a null z_base loads values without touching z memory"
     std::remove(path);
 }
 
-TEST_CASE("rt_nba_arr push/commit with a null z_ptr merges only the mm word") {
-    uint8_t mm = 0x00;
-    uint8_t z_guard = 0x77; // would be corrupted by a stray z write
-
-    const uint8_t val  = 0x0f;
-    const uint8_t mask = 0xff;
-    rt_nba_arr_push(0, &mm, &val, &mask, 1, nullptr, nullptr, nullptr, 0);
-    REQUIRE(rt_nba_arr_pending() == 1);
-    rt_nba_arr_commit();
-    CHECK(rt_nba_arr_dirty(0) == 1);
+TEST_CASE("rt_nba_arr slot buffer: distinct slots, counts, reset keeps capacity") {
     rt_nba_arr_reset();
+    const uint32_t stride = 16;
+    // Two arrays; reserve slots and confirm they are distinct, stride-spaced, and
+    // that the writes round-trip through base + i*stride.
+    void* a0 = rt_nba_arr_slot(0, stride);
+    void* a1 = rt_nba_arr_slot(0, stride);
+    void* b0 = rt_nba_arr_slot(1, stride);
+    static_cast<uint64_t*>(a0)[0] = 0xAAAA;
+    static_cast<uint64_t*>(a1)[0] = 0xBBBB;
+    static_cast<uint64_t*>(b0)[0] = 0xCCCC;
+    CHECK(rt_nba_arr_count(0) == 2);
+    CHECK(rt_nba_arr_count(1) == 1);
+    CHECK(rt_nba_arr_any() == 3);
+    auto* base0 = static_cast<uint8_t*>(rt_nba_arr_base(0));
+    CHECK(*reinterpret_cast<uint64_t*>(base0 + 0 * stride) == 0xAAAA);
+    CHECK(*reinterpret_cast<uint64_t*>(base0 + 1 * stride) == 0xBBBB);
 
-    CHECK(mm == 0x0f);
-    CHECK(z_guard == 0x77);
+    rt_nba_arr_reset();
+    CHECK(rt_nba_arr_count(0) == 0);
+    CHECK(rt_nba_arr_any() == 0);
+    // Capacity retained: a fresh slot reuses the same buffer address.
+    CHECK(rt_nba_arr_slot(0, stride) == base0);
+    rt_nba_arr_reset(); // leave no staged records for the next test
 }
 
 namespace {
@@ -339,6 +349,84 @@ TEST_CASE("rt_string_to_packed right-justifies with left truncation and zero fil
     rt_string_to_packed(&empty.s, out8, 16);
     CHECK(out8[0] == 0x00);
     CHECK(out8[1] == 0x00);
+}
+
+TEST_CASE("rt_string_atoi family scans leading digits, no sign or whitespace") {
+    Str s{ "123" };
+    CHECK(rt_string_atoi(&s.s) == 123);
+
+    Str neg{ "-123" };
+    CHECK(rt_string_atoi(&neg.s) == 0); // no sign handling (LRM 6.16.9)
+
+    Str ws{ "  123" };
+    CHECK(rt_string_atoi(&ws.s) == 0); // no leading-whitespace skip
+
+    Str us{ "1_2_3" };
+    CHECK(rt_string_atoi(&us.s) == 123); // '_' separators skipped
+
+    Str partial{ "12abc" };
+    CHECK(rt_string_atoi(&partial.s) == 12); // stops at the first non-digit
+
+    Str none{ "abc" };
+    CHECK(rt_string_atoi(&none.s) == 0);
+
+    Str empty;
+    CHECK(rt_string_atoi(&empty.s) == 0);
+
+    Str overflow{ "4294967296123" }; // wraps mod 2^32
+    CHECK(rt_string_atoi(&overflow.s) == 123);
+
+    Str hex{ "ff" };
+    CHECK(rt_string_atohex(&hex.s) == 255);
+    Str oct{ "17" };
+    CHECK(rt_string_atooct(&oct.s) == 15);
+    Str bin{ "101" };
+    CHECK(rt_string_atobin(&bin.s) == 5);
+}
+
+TEST_CASE("rt_string_atoreal accepts leading whitespace and '+', unlike atoi") {
+    Str s{ "3.14" };
+    CHECK(rt_string_atoreal(&s.s) == doctest::Approx(3.14));
+
+    Str ws{ "  -3.14" };
+    CHECK(rt_string_atoreal(&ws.s) == doctest::Approx(-3.14));
+
+    Str plus{ "+3.14" };
+    CHECK(rt_string_atoreal(&plus.s) == doctest::Approx(3.14));
+
+    Str exp{ "3.14e2" };
+    CHECK(rt_string_atoreal(&exp.s) == doctest::Approx(314.0));
+
+    Str none{ "abc" };
+    CHECK(rt_string_atoreal(&none.s) == 0.0);
+}
+
+TEST_CASE("rt_string itoa family formats sign + magnitude, not two's-complement") {
+    Str d;
+    rt_string_itoa(&d.s, 123);
+    CHECK(str_bytes(d.s) == "123");
+    rt_string_itoa(&d.s, -123);
+    CHECK(str_bytes(d.s) == "-123");
+
+    rt_string_hextoa(&d.s, 255);
+    CHECK(str_bytes(d.s) == "ff");
+    rt_string_hextoa(&d.s, -256); // sign + magnitude, matching iverilog
+    CHECK(str_bytes(d.s) == "-100");
+
+    rt_string_octtoa(&d.s, 8);
+    CHECK(str_bytes(d.s) == "10");
+    rt_string_bintoa(&d.s, 5);
+    CHECK(str_bytes(d.s) == "101");
+}
+
+TEST_CASE("rt_string_realtoa formats at full round-trip precision") {
+    Str d;
+    rt_string_realtoa(&d.s, 3.14);
+    CHECK(str_bytes(d.s) == "3.14");
+    rt_string_realtoa(&d.s, 100.0);
+    CHECK(str_bytes(d.s) == "100"); // no trailing ".0"
+    rt_string_realtoa(&d.s, 123456789.123);
+    CHECK(str_bytes(d.s) == "123456789.123"); // full precision, unlike iverilog's %g
 }
 
 // -- rt_fwrite real formatting --

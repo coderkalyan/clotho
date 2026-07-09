@@ -171,6 +171,41 @@ Index Builder::str_to_packed(Index str, Ref type, SourceLoc loc) {
     return emit({ Inst::Tag::StrToPacked, Inst::Payload{ .op_type = { str, type } } }, loc);
 }
 
+Index Builder::enum_name(Index val, std::span<const std::pair<uint64_t, std::string_view>> members,
+                         SourceLoc loc) {
+    // Pack each member's name bytes first, remembering where they landed, then
+    // pack the entry records contiguously so they form one ExtraSlice. Names and
+    // records share the extra buffer but never overlap.
+    struct Packed {
+        uint64_t   value;
+        ExtraIndex name_at;
+        uint32_t   name_len;
+    };
+    std::vector<Packed> packed;
+    packed.reserve(members.size());
+    for (const std::pair<uint64_t, std::string_view>& m : members) {
+        const ExtraIndex at = add_bytes(m.second);
+        packed.push_back({ m.first, at, static_cast<uint32_t>(m.second.size()) });
+    }
+
+    const auto start = static_cast<ExtraIndex>(extra_.size());
+    for (const Packed& p : packed) {
+        add_extra(EnumNameEntry{ static_cast<uint32_t>(p.value), static_cast<uint32_t>(p.value >> 32),
+                                 p.name_at, p.name_len });
+    }
+    const auto end = static_cast<ExtraIndex>(extra_.size());
+
+    const ExtraIndex extra = add_extra(EnumNameInfo{ ExtraSlice{ start, end } });
+
+    return emit({ Inst::Tag::EnumName, Inst::Payload{ .op_extra = { val, extra } } }, loc);
+}
+
+Index Builder::count_bits(Index op, uint32_t mask, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(CountBitsInfo{ mask });
+
+    return emit({ Inst::Tag::CountBits, Inst::Payload{ .op_extra = { op, extra } } }, loc);
+}
+
 Index Builder::wait(std::span<const WaitEdge> events, SourceLoc loc) {
     // Pack the WaitEdge records back-to-back, then a WaitInfo pointing at the run.
     const auto start = static_cast<uint32_t>(extra_.size());

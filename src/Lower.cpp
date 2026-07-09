@@ -553,10 +553,13 @@ private:
                     scope_  = &scope;
                     break;
                 }
+                case SymbolKind::PrimitiveInstance:
+                    lower_gate(m.as<PrimitiveInstanceSymbol>());
+                    break;
                 case SymbolKind::InstanceArray:
-                    // TODO: instance arrays (foo u[N](...)) — needs per-element
-                    // elaboration and bit-sliced port connections.
-                    fail("instance arrays are not supported");
+                    // Gate arrays lower per-element; module instance arrays fail
+                    // inside (TODO there).
+                    lower_primitive_array(m.as<InstanceArraySymbol>());
                     break;
                 // Known-inert members: elaboration artifacts and declarations
                 // that bear no simulation behavior of their own. Ports are wired
@@ -1158,6 +1161,290 @@ private:
         add_continuous_process(continuous_events(*init), to_source_loc(ns.location), b);
     }
 
+    // -- Gate primitives (LRM 28.4, 28.5) --
+    //
+    // A gate instance is NOT lowered to a process: it becomes one row of the
+    // module's gate table, which the backend turns into constant metadata plus a
+    // shared table-driven eval loop (no per-gate coroutine or code). Terminals
+    // are therefore restricted to static 1-bit locations; any other input
+    // expression is an implicit continuous assignment to an implicit net (LRM
+    // 4.9.6), lowered here as a synthesized temp signal plus an ordinary
+    // continuous-assign process the gate reads from.
+
+    // Map a built-in gate primitive name to its GateOp; nullopt for primitives
+    // outside the supported set.
+    static std::optional<ir::GateOp> gate_op_of(std::string_view name) {
+        if (name == "and") {
+            return ir::GateOp::And;
+        }
+        if (name == "nand") {
+            return ir::GateOp::Nand;
+        }
+        if (name == "or") {
+            return ir::GateOp::Or;
+        }
+        if (name == "nor") {
+            return ir::GateOp::Nor;
+        }
+        if (name == "xor") {
+            return ir::GateOp::Xor;
+        }
+        if (name == "xnor") {
+            return ir::GateOp::Xnor;
+        }
+        if (name == "buf") {
+            return ir::GateOp::Buf;
+        }
+        if (name == "not") {
+            return ir::GateOp::Not;
+        }
+
+        return std::nullopt;
+    }
+
+    // Strip conversion wrappers whose operand is still a packed integral value.
+    // Gate terminals are bound against 1-bit logic, so a `bit` net or a typedef'd
+    // scalar arrives wrapped in a no-op (for our purposes) conversion.
+    static const Expression& unwrap_conversions(const Expression& e) {
+        const Expression* cur = &e;
+        while (cur->kind == ExpressionKind::Conversion) {
+            const Expression& op = cur->as<ConversionExpression>().operand();
+            if (!op.type->isIntegral()) {
+                break;
+            }
+            cur = &op;
+        }
+
+        return *cur;
+    }
+
+    // Resolve a select base to its packed module signal, if it is a (possibly
+    // conversion-wrapped) plain signal reference. Only a width-preserving wrapper
+    // keeps bit positions aligned with the underlying signal's storage; gate
+    // instance arrays slice through such a converted view of the port expression.
+    std::optional<ir::Signal> gate_select_base(const Expression& value) {
+        const Expression& val = unwrap_conversions(value);
+        if (val.kind != ExpressionKind::NamedValue ||
+            val.type->getCanonicalType().getBitWidth() != value.type->getCanonicalType().getBitWidth()) {
+            return std::nullopt;
+        }
+        const ValueSymbol& sym = val.as<NamedValueExpression>().symbol;
+        if (sym.kind == SymbolKind::Parameter || !sigmap_.contains(&sym)) {
+            return std::nullopt;
+        }
+
+        return signal_of(sym);
+    }
+
+    // Normalize a declared index into `value`'s packed range to an LSB-relative
+    // bit position (translateIndex maps both descending and ascending ranges to
+    // distance from the LSB end), so non-zero-based and ascending ranges resolve
+    // correctly.
+    std::optional<uint32_t> gate_select_bit(const Expression& value, const Expression& index) {
+        const std::optional<int32_t> idx = try_const_int(index);
+        if (!idx) {
+            return std::nullopt;
+        }
+        const slang::ConstantRange r = value.type->getCanonicalType().getFixedRange();
+        if (!r.containsPoint(*idx)) {
+            return std::nullopt;
+        }
+
+        return static_cast<uint32_t>(r.translateIndex(*idx));
+    }
+
+    // Resolve a terminal expression to a static (signal, bit) location if it is a
+    // plain scalar reference, a constant bit-select, or a constant 1-bit
+    // part-select of a packed signal (gate instance arrays produce the latter).
+    std::optional<ir::GateTerm> gate_static_term(const Expression& e) {
+        const Expression& base = unwrap_conversions(e);
+        if (base.kind == ExpressionKind::NamedValue) {
+            const ValueSymbol& sym = base.as<NamedValueExpression>().symbol;
+            if (sym.kind == SymbolKind::Parameter || !sigmap_.contains(&sym)) {
+                return std::nullopt;
+            }
+            if (base.type->getCanonicalType().getBitWidth() != 1) {
+                return std::nullopt;
+            }
+
+            return ir::GateTerm{ .sig = signal_of(sym), .bit = 0 };
+        }
+        if (base.kind == ExpressionKind::ElementSelect) {
+            const ElementSelectExpression& es = base.as<ElementSelectExpression>();
+            if (is_unpacked_array(es.value())) {
+                return std::nullopt;
+            }
+            const auto sig = gate_select_base(es.value());
+            const auto bit = sig ? gate_select_bit(es.value(), es.selector()) : std::nullopt;
+            if (!bit) {
+                return std::nullopt;
+            }
+
+            return ir::GateTerm{ .sig = *sig, .bit = *bit };
+        }
+        if (base.kind == ExpressionKind::RangeSelect) {
+            const RangeSelectExpression& rs = base.as<RangeSelectExpression>();
+            if (rs.getSelectionKind() != RangeSelectionKind::Simple ||
+                base.type->getCanonicalType().getBitWidth() != 1 || is_unpacked_array(rs.value())) {
+                return std::nullopt;
+            }
+            const auto sig = gate_select_base(rs.value());
+            const auto bit = sig ? gate_select_bit(rs.value(), rs.right()) : std::nullopt;
+            if (!bit) {
+                return std::nullopt;
+            }
+
+            return ir::GateTerm{ .sig = *sig, .bit = *bit };
+        }
+
+        return std::nullopt;
+    }
+
+    // Lower one gate input terminal to a GateInput: a compile-time constant plane
+    // code, a static 1-bit location, or (the general case, LRM 4.9.6) a synthesized
+    // temp net continuously assigned from the expression.
+    ir::GateInput lower_gate_input(const Expression& e, std::string_view inst_name, uint32_t input_index) {
+        // Constant fold first: literals, parameters, and constant expressions
+        // (tie cells) melt into the gate at compile time. The terminal is bound
+        // as 1-bit logic, so bit 0 of the folded value is the input; x and z both
+        // fold to the X plane code (Z reads as X, LRM Table 28-3).
+        {
+            slang::ast::ASTContext     astCtx(*scope_, slang::ast::LookupLocation::max);
+            slang::ast::EvalContext    evalCtx(astCtx);
+            const slang::ConstantValue cv = e.eval(evalCtx);
+            if (cv.isInteger()) {
+                const slang::logic_t bit  = cv.integer()[0];
+                const uint8_t        code = bit.isUnknown() ? 0b10 : (bit.value != 0 ? 0b11 : 0b00);
+
+                return ir::GateInput{ .const_code = code, .is_const = true };
+            }
+        }
+
+        if (const auto term = gate_static_term(e)) {
+            return ir::GateInput{ .sig = term->sig, .bit = term->bit };
+        }
+
+        // Implicit continuous assign to an implicit net: temp = expr, sensitive
+        // to the expression's reads, evaluated at time zero like any continuous
+        // assign (mirrors lower_continuous_assign).
+        ir::SignalInfo info;
+        info.name = prefix_ + "$gate" + std::to_string(temp_id_++) + "." + std::string(inst_name) + ".in" +
+                    std::to_string(input_index);
+        info.type            = module_.pool.logic_type;
+        const ir::Signal tmp = module_.add_signal(std::move(info));
+
+        ir::Builder         b(module_.pool);
+        const ir::SourceLoc l = loc(e);
+        b.binary(ir::Inst::Tag::Store, b.signal(tmp, l), b.resize(lower_expr(e, b), module_.pool.logic_type, l), l);
+
+        std::vector<ir::WaitEvent> wait_events;
+        SensitivityCollector       c(sigmap_, SensitivityMode::ImplicitEvent);
+        e.visit(c);
+        for (const ir::Signal s : c.reads) {
+            wait_events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
+        }
+        module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
+                                         .wait_events = std::move(wait_events),
+                                         .self_start  = true,
+                                         .loc         = l,
+                                         .ir          = b.finish() });
+
+        return ir::GateInput{ .sig = tmp, .bit = 0 };
+    }
+
+    // Lower one gate output terminal. slang wraps each output connection in an
+    // AssignmentExpression whose left() is the driven lvalue; only a static 1-bit
+    // location on a 4-state signal is accepted (a gate can drive X, which a
+    // 2-state slot cannot hold).
+    ir::GateTerm lower_gate_output(const Expression& conn) {
+        if (conn.kind != ExpressionKind::Assignment) {
+            fail("malformed gate output terminal");
+        }
+        const Expression& lhs = conn.as<AssignmentExpression>().left();
+        if (!lhs.type->isFourState()) {
+            // TODO: gate outputs on 2-state nets need an X-coercion policy.
+            fail("gate output on a 2-state net is not supported");
+        }
+        const auto term = gate_static_term(lhs);
+        if (!term) {
+            // TODO: concatenation / part-select / unpacked-element gate output
+            // lvalues (rare in netlists).
+            fail("unsupported gate output terminal");
+        }
+
+        return *term;
+    }
+
+    void lower_gate(const PrimitiveInstanceSymbol& gi) {
+        const PrimitiveSymbol& prim = gi.primitiveType;
+        const auto             op   = gate_op_of(prim.name);
+        const bool             supported_kind =
+            prim.primitiveKind == PrimitiveSymbol::NInput || prim.primitiveKind == PrimitiveSymbol::NOutput;
+        if (!op || !supported_kind) {
+            // TODO: tri-state gates (bufif*/notif*), MOS / bidirectional
+            // switches, pullup/pulldown (need Z generation and driver strength
+            // resolution) and user-defined primitives.
+            fail("gate primitive '" + std::string(prim.name) + "' is not supported");
+        }
+        if (gi.getDelay() != nullptr) {
+            // TODO: gate delays (rise/fall pairs, inertial semantics, LRM 28.16).
+            fail("gate delay is not supported");
+        }
+        const auto [s0, s1] = gi.getDriveStrength();
+        if ((s0 && *s0 != DriveStrength::Strong) || (s1 && *s1 != DriveStrength::Strong)) {
+            // TODO: drive strengths (needs multi-driver resolution). The default
+            // (strong0, strong1), written out explicitly, is accepted as-is.
+            fail("gate drive strength is not supported");
+        }
+
+        const auto conns = gi.getPortConnections();
+        if (conns.size() < 2) {
+            // slang has already diagnosed a malformed terminal list.
+            fail("malformed gate terminal list");
+        }
+
+        // NInput: terminal 0 is the output, the rest are inputs. NOutput (buf /
+        // not): the last terminal is the input, the rest are outputs — lowered as
+        // one independent single-output gate per output terminal.
+        const bool n_output    = prim.primitiveKind == PrimitiveSymbol::NOutput;
+        const auto input_span  = n_output ? conns.subspan(conns.size() - 1) : conns.subspan(1);
+        const auto output_span = n_output ? conns.subspan(0, conns.size() - 1) : conns.subspan(0, 1);
+
+        std::vector<ir::GateInput> inputs;
+        inputs.reserve(input_span.size());
+        for (size_t i = 0; i < input_span.size(); ++i) {
+            inputs.push_back(lower_gate_input(*input_span[i], gi.name, static_cast<uint32_t>(i)));
+        }
+
+        for (const Expression* out : output_span) {
+            module_.add_gate(ir::GateInfo{ .op     = *op,
+                                           .output = lower_gate_output(*out),
+                                           .loc    = to_source_loc(gi.location) },
+                             inputs);
+        }
+    }
+
+    // Lower an array of gate instances: slang has already elaborated one
+    // PrimitiveInstanceSymbol per element with per-instance bit-sliced terminal
+    // connections (LRM 28.3.6), so each leaf lowers like a scalar gate. Module
+    // instance arrays still fail (first non-primitive leaf aborts lowering).
+    void lower_primitive_array(const InstanceArraySymbol& arr) {
+        for (const Symbol* el : arr.elements) {
+            switch (el->kind) {
+                case SymbolKind::PrimitiveInstance:
+                    lower_gate(el->as<PrimitiveInstanceSymbol>());
+                    break;
+                case SymbolKind::InstanceArray:
+                    lower_primitive_array(el->as<InstanceArraySymbol>());
+                    break;
+                default:
+                    // TODO: module instance arrays (foo u[N](...)) — need
+                    // per-element elaboration and bit-sliced port connections.
+                    fail("instance arrays are not supported");
+            }
+        }
+    }
+
     // Wire one child instance's ports to the parent. Each connection becomes a
     // copy process across the boundary, carrying inferred sensitivity so the value
     // propagates on change (it must not inherit the empty-wait-list gap of plain
@@ -1557,6 +1844,9 @@ private:
             case StatementKind::DoWhileLoop:
                 lower_do_while(stmt.as<DoWhileLoopStatement>(), b);
                 break;
+            case StatementKind::ForeachLoop:
+                lower_foreach(stmt.as<ForeachLoopStatement>(), b);
+                break;
             case StatementKind::Break:
                 b.break_(loc(stmt));
                 break;
@@ -1807,6 +2097,112 @@ private:
         const ir::Index one      = b.constant(module_.pool.put_int(ty, 1), l);
         const ir::Index next     = b.binary(ir::Inst::Tag::Add, step_cur, one, l);
         b.binary(ir::Inst::Tag::Store, b.signal(counter, l), next, l);
+        const ir::ExtraSlice step = b.close_region();
+
+        b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
+    }
+
+    // foreach-loop (12.7.3): nested loops over an array's declared dimensions.
+    // `loopDims` has one entry per bracketed slot the user wrote, in array-
+    // dimension order (leftmost = outermost, matching "outer loops correspond
+    // to lower cardinality indices"); a skipped slot (empty loop var) means
+    // "no iteration over that dimension" per the LRM -- not a loop that runs
+    // once, no loop at all, so it just advances to the next slot in the same
+    // region. Dimension bounds come straight from slang (`LoopDim::range`),
+    // valid for both packed and unpacked fixed-range dimensions alike, so no
+    // separate walk of Clotho's own (unpacked-only) array Type is needed --
+    // whatever indexing the body performs on the result is ordinary,
+    // pre-existing ElemSelect/BitSelect lowering, untouched by this loop nest.
+    void lower_foreach(const ForeachLoopStatement& f, ir::Builder& b) {
+        lower_foreach_dim(f, 0, b);
+    }
+
+    void lower_foreach_dim(const ForeachLoopStatement& f, size_t dim, ir::Builder& b) {
+        if (dim == f.loopDims.size()) {
+            lower_stmt(f.body, b);
+            return;
+        }
+        const ForeachLoopStatement::LoopDim& d = f.loopDims[dim];
+        if (d.loopVar == nullptr) {
+            lower_foreach_dim(f, dim + 1, b);
+            return;
+        }
+
+        const ir::SourceLoc l = loc(f);
+        declare_storage(*d.loopVar, /*force_frame*/ true);
+        const ir::Ref   ty      = lower_type(d.loopVar->getType());
+        const ir::Index iter_lv = value_lvalue(*d.loopVar, b, l);
+
+        if (!d.range.has_value()) {
+            if (!is_string_expr(f.arrayRef)) {
+                // TODO: dynamic array / queue / associative array foreach
+                // dimension -- needs a runtime-sized bound, not modeled
+                // (dynamic/queue/associative arrays fail at Lower.cpp:665).
+                fail("foreach over a dynamically-sized array dimension is not supported");
+            }
+            lower_foreach_string_dim(f, dim, ty, iter_lv, b, l);
+            return;
+        }
+
+        // Fixed-range dimension (packed or unpacked): iterate the declared
+        // range directly, ascending or descending as declared (LRM's own
+        // example iterates a `[5:1]` dimension 5 down to 1). The range is an
+        // elaboration-time constant, so unlike a runtime count there is
+        // nothing to snapshot.
+        const slang::ConstantRange r         = *d.range;
+        const bool                 ascending = r.left <= r.right;
+        b.binary(ir::Inst::Tag::Store, iter_lv,
+                 b.constant(module_.pool.put_int(ty, static_cast<uint64_t>(static_cast<uint32_t>(r.left))), l),
+                 l);
+
+        b.open_region();
+        const ir::Index cur = b.unary(ir::Inst::Tag::Load, iter_lv, l);
+        const ir::Index lim = b.constant(
+          module_.pool.put_int(ty, static_cast<uint64_t>(static_cast<uint32_t>(r.right))), l);
+        const ir::Index      pred = b.binary(ascending ? ir::Inst::Tag::Le : ir::Inst::Tag::Ge, cur, lim, l);
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        lower_foreach_dim(f, dim + 1, b);
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        const ir::Index step_cur = b.unary(ir::Inst::Tag::Load, iter_lv, l);
+        const ir::Index one      = b.constant(module_.pool.put_int(ty, 1), l);
+        const ir::Index next =
+          b.binary(ascending ? ir::Inst::Tag::Add : ir::Inst::Tag::Sub, step_cur, one, l);
+        b.binary(ir::Inst::Tag::Store, iter_lv, next, l);
+        const ir::ExtraSlice step = b.close_region();
+
+        b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
+    }
+
+    // A `string` foreach dimension (LRM 12.7.3: "a string ... is treated as a
+    // dynamic array of bytes indexed from 0 to N-1"). The bound is the
+    // runtime length, snapshotted once on entry like a repeat-loop's count --
+    // resizing the string mid-loop is undefined behavior per the LRM (same
+    // clause), so one read is enough. 0-based, matching StrGetc addressing.
+    void lower_foreach_string_dim(const ForeachLoopStatement& f, size_t dim, ir::Ref ty,
+                                   ir::Index iter_lv, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Signal bound = declare_temp(ty, "foreach_bound");
+        const ir::Index  len   = b.unary(ir::Inst::Tag::StrLen, lower_expr(f.arrayRef, b), l);
+        b.binary(ir::Inst::Tag::Store, b.signal(bound, l), b.resize(len, ty, l), l);
+        b.binary(ir::Inst::Tag::Store, iter_lv, b.constant(module_.pool.put_int(ty, 0), l), l);
+
+        b.open_region();
+        const ir::Index      cur  = b.unary(ir::Inst::Tag::Load, iter_lv, l);
+        const ir::Index      lim  = b.unary(ir::Inst::Tag::Load, b.signal(bound, l), l);
+        const ir::Index      pred = b.binary(ir::Inst::Tag::Lt, cur, lim, l);
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        lower_foreach_dim(f, dim + 1, b);
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        const ir::Index step_cur = b.unary(ir::Inst::Tag::Load, iter_lv, l);
+        const ir::Index one      = b.constant(module_.pool.put_int(ty, 1), l);
+        b.binary(ir::Inst::Tag::Store, iter_lv, b.binary(ir::Inst::Tag::Add, step_cur, one, l), l);
         const ir::ExtraSlice step = b.close_region();
 
         b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
@@ -2590,6 +2986,256 @@ private:
         return b.scanf(source, is_sscanf, fmt, outs, l);
     }
 
+    // An enum member in declaration order: its constant value and source name.
+    struct EnumMember {
+        slang::SVInt     value;
+        std::string_view name;
+    };
+
+    // Collect an enum type's members in declaration order (LRM 6.19: the order
+    // the methods first/last/next/prev/name walk). Every member value is a clean
+    // compile-time constant of the base type.
+    std::vector<EnumMember> enum_members(const slang::ast::EnumType& et) {
+        std::vector<EnumMember> members;
+        for (const slang::ast::EnumValueSymbol& ev : et.values()) {
+            members.push_back({ ev.getValue().integer(), ev.name });
+        }
+        return members;
+    }
+
+    // Lower an enum method (LRM 6.19.2-6.19.5). The receiver is arguments()[0].
+    ir::Index lower_enum_method(std::string_view name, const slang::ast::EnumType& et,
+                                const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
+        const std::vector<EnumMember> members = enum_members(et);
+        const ir::Ref                 base_ty = lower_type(et);
+
+        // num(): the member count (LRM 6.19.4), an int, independent of the value.
+        if (name == "num") {
+            return b.constant(module_.pool.put_int(lower_type(*call.type), members.size()), l);
+        }
+        // first()/last(): the first/last member value (LRM 6.19.5), constant.
+        if (name == "first") {
+            return b.constant(svint_to_ref(members.front().value, base_ty), l);
+        }
+        if (name == "last") {
+            return b.constant(svint_to_ref(members.back().value, base_ty), l);
+        }
+
+        // name() (LRM 6.19.2): the source name of the matching member, or "" if
+        // the value is not a member. Delegated to a runtime scan of a per-type
+        // member table (a string result rules out a frontend select).
+        if (name == "name") {
+            if (et.bitWidth > 64) {
+                // TODO: the table key packs the value into u64; a wider base needs
+                // multi-word keys.
+                fail("enum name() with a base type wider than 64 bits is not supported");
+            }
+            std::vector<std::pair<uint64_t, std::string_view>> table;
+            table.reserve(members.size());
+            for (const EnumMember& m : members) {
+                uint64_t key = m.value.as<uint64_t>().value_or(0);
+                if (et.bitWidth < 64) {
+                    key &= (static_cast<uint64_t>(1) << et.bitWidth) - 1;
+                }
+                table.push_back({ key, m.name });
+            }
+            return b.enum_name(lower_expr(*call.arguments()[0], b), table, l);
+        }
+
+        // next(N)/prev(N) (LRM 6.19.5): the Nth member after/before the current
+        // one in declaration order, wrapping. N is an optional constant (default
+        // 1); a non-member receiver yields X (matches iverilog; LRM leaves it
+        // undefined). Lowered as a branchless packed select chain over the member
+        // set — an integer select, so any base width works.
+        if (name == "next" || name == "prev") {
+            int64_t step = 1;
+            if (call.arguments().size() >= 2) {
+                slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+                slang::ast::EvalContext    ectx(actx);
+                const slang::ConstantValue cv = call.arguments()[1]->eval(ectx);
+                if (!cv.isInteger()) {
+                    // TODO: a runtime (non-constant) step needs value->index lookup
+                    // plus modular index arithmetic; rare, so reject for now.
+                    fail("enum next/prev with a non-constant step is not supported");
+                }
+                step = cv.integer().as<int64_t>().value_or(0);
+            }
+
+            const int64_t num   = static_cast<int64_t>(members.size());
+            const int64_t delta = (name == "next") ? step : -step;
+            const auto    wrap  = [num](int64_t k) { return ((k % num) + num) % num; };
+
+            const ir::Index recv = lower_expr(*call.arguments()[0], b);
+            // Default (no member matched): X of the base type (2-state base cannot
+            // hold X, so it degrades to 0 via svint_to_ref's must plane).
+            ir::Index res = b.constant(
+              svint_to_ref(et.isFourState ? slang::SVInt::createFillX(et.bitWidth, et.isSigned)
+                                          : slang::SVInt(et.bitWidth, 0, et.isSigned),
+                           base_ty),
+              l);
+            for (size_t i = members.size(); i-- > 0;) {
+                const ir::Index memberc =
+                  b.constant(svint_to_ref(members[i].value, base_ty), l);
+                const ir::Index targetc = b.constant(
+                  svint_to_ref(members[static_cast<size_t>(wrap(static_cast<int64_t>(i) + delta))].value,
+                               base_ty),
+                  l);
+                const ir::Index eq = b.binary(ir::Inst::Tag::CaseEq, recv, memberc, l);
+                res                = b.select(eq, targetc, res, l);
+            }
+            return res;
+        }
+
+        fail("enum method '" + std::string(name) + "' is not supported");
+    }
+
+    std::string format_typename(const slang::ast::Type& type) {
+        const slang::ast::Type& t = type.getCanonicalType();
+
+        // Non-default signing suffix (LRM 20.6.1 rule b).
+        const auto signing = [](const slang::ast::Type& ty, bool default_signed) -> std::string {
+            if (ty.isSigned() == default_signed) {
+                return "";
+            }
+            return ty.isSigned() ? " signed" : " unsigned";
+        };
+        const auto range_str = [](slang::ConstantRange r) {
+            return "[" + std::to_string(r.left) + ":" + std::to_string(r.right) + "]";
+        };
+
+        if (const auto* st = t.as_if<slang::ast::ScalarType>()) {
+            // Predefined 1-bit types; default unsigned.
+            const char* base = st->scalarKind == slang::ast::ScalarType::Bit    ? "bit"
+                               : st->scalarKind == slang::ast::ScalarType::Reg ? "reg"
+                                                                                : "logic";
+            return base + signing(*st, false);
+        }
+        if (const auto* it = t.as_if<slang::ast::PredefinedIntegerType>()) {
+            using K = slang::ast::PredefinedIntegerType::Kind;
+            const char* base = it->integerKind == K::Int        ? "int"
+                               : it->integerKind == K::Byte     ? "byte"
+                               : it->integerKind == K::ShortInt ? "shortint"
+                               : it->integerKind == K::LongInt  ? "longint"
+                               : it->integerKind == K::Integer  ? "integer"
+                                                                : "time";
+            return base + signing(*it, slang::ast::PredefinedIntegerType::isDefaultSigned(it->integerKind));
+        }
+        if (const auto* pa = t.as_if<slang::ast::PackedArrayType>()) {
+            // Collect the packed dimensions outermost-first down to the base
+            // scalar; the whole vector's signing sits between base and dims.
+            std::string             dims;
+            const slang::ast::Type* cur = pa;
+            while (const auto* p = cur->as_if<slang::ast::PackedArrayType>()) {
+                dims += range_str(p->range);
+                cur = &p->elementType.getCanonicalType();
+            }
+            const auto* base = cur->as_if<slang::ast::ScalarType>();
+            if (base == nullptr) {
+                // A packed array of enum / struct — unsupported base.
+                fail("$typename of this packed type is not supported");
+            }
+            const char* name = base->scalarKind == slang::ast::ScalarType::Bit    ? "bit"
+                               : base->scalarKind == slang::ast::ScalarType::Reg ? "reg"
+                                                                                  : "logic";
+            return name + signing(*pa, false) + dims;
+        }
+        if (const auto* ua = t.as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
+            // Unpacked dimension: a "$" placeholder for the anonymous array name
+            // (rule d), then the range (LRM: "logic[7:0]$[0:9]").
+            return format_typename(ua->elementType) + "$" + range_str(ua->range);
+        }
+        if (t.isFloating()) {
+            const auto& ft = t.as<slang::ast::FloatingType>();
+            return ft.floatKind == slang::ast::FloatingType::ShortReal ? "shortreal"
+                   : ft.floatKind == slang::ast::FloatingType::RealTime ? "realtime"
+                                                                        : "real";
+        }
+        if (t.isString()) {
+            return "string";
+        }
+        // enum / struct / union / class / interface / dynamic array / queue /
+        // associative array / chandle / event — Clotho does not lower these, so
+        // it cannot vouch for their $typename string.
+        fail("$typename of this type is not supported");
+    }
+
+    // Classify a $countbits control-bit argument (LRM 20.9): a constant 1-bit
+    // value naming which 4-state value that control tallies. A non-constant
+    // control is rejected (it would need a runtime class-mask select).
+    uint32_t count_control_class(const Expression& ctrl) {
+        slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+        slang::ast::EvalContext    ectx(actx);
+        const slang::ConstantValue cv = ctrl.eval(ectx);
+        if (!cv.isInteger()) {
+            fail("$countbits control bit must be a constant 0/1/x/z");
+        }
+        const slang::logic_t bit = cv.integer()[0];
+        if (bit.value == slang::logic_t::X_VALUE) {
+            return ir::CountX;
+        }
+        if (bit.value == slang::logic_t::Z_VALUE) {
+            return ir::CountZ;
+        }
+        return bit.value != 0 ? ir::CountOne : ir::CountZero;
+    }
+
+    // Runtime lowering for the utility bit-query functions (LRM 20.9; $bits on a
+    // dynamic string per 20.6.2) when the operand is not constant. A constant
+    // operand folds in slang and never reaches here.
+    ir::Index lower_bit_query(std::string_view name, const CallExpression& call, ir::Builder& b,
+                              const ir::SourceLoc l) {
+        const auto    args = call.arguments();
+        const ir::Ref i32  = make_int_type(32, false, true);
+
+        // $bits: the only non-constant operand Clotho stores is a dynamic
+        // string, whose bit count is 8 per current character (LRM 6.16, 20.6.2).
+        // A fixed-size operand would have const-folded above; any other dynamic
+        // type (queue / dynamic array / class handle) is unsupported storage.
+        if (name == "$bits") {
+            if (args.size() != 1 || !is_string_expr(*args[0])) {
+                fail("$bits of a non-constant, non-string operand is not supported");
+            }
+            const ir::Index len   = b.unary(ir::Inst::Tag::StrLen, lower_expr(*args[0], b), l);
+            const ir::Index eight = b.constant(module_.pool.put_int(i32, 8), l);
+            return b.resize(b.binary(ir::Inst::Tag::Mul, len, eight, l), lower_type(*call.type), l);
+        }
+
+        // The 20.9 counting family. The first argument is the counted value;
+        // $countbits additionally carries constant control-bit arguments naming
+        // which 4-state values to tally.
+        const ir::Index val = lower_expr(*args[0], b);
+
+        uint32_t mask = ir::CountOne; // $countones / $onehot* count definite-1 bits
+        if (name == "$isunknown") {
+            mask = ir::CountX | ir::CountZ;
+        }
+        else if (name == "$countbits") {
+            mask = 0;
+            for (size_t k = 1; k < args.size(); ++k) {
+                mask |= count_control_class(*args[k]);
+            }
+        }
+
+        const ir::Index count = b.count_bits(val, mask, l);
+
+        if (name == "$countones" || name == "$countbits") {
+            return b.resize(count, lower_type(*call.type), l);
+        }
+        // $onehot -> count == 1; $onehot0 -> count <= 1; $isunknown -> count != 0.
+        ir::Inst::Tag   op  = ir::Inst::Tag::Ne;
+        uint64_t        rhs = 0;
+        if (name == "$onehot") {
+            op  = ir::Inst::Tag::Eq;
+            rhs = 1;
+        }
+        else if (name == "$onehot0") {
+            op  = ir::Inst::Tag::Le;
+            rhs = 1;
+        }
+        return b.resize(b.binary(op, count, b.constant(module_.pool.put_int(i32, rhs), l), l),
+                        lower_type(*call.type), l);
+    }
+
     // Lower a system function call used as an rvalue (e.g. `$time`). User function
     // calls are not yet supported.
     ir::Index lower_sysfunc(const CallExpression& call, ir::Builder& b) {
@@ -2604,6 +3250,15 @@ private:
         if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
             is_string_expr(*call.arguments()[0])) {
             return lower_string_method(name, call, b);
+        }
+
+        // Enum methods (LRM 6.19.2-6.19.5) arrive the same way, with an enum-typed
+        // receiver as arguments()[0].
+        if (!name.empty() && name[0] != '$' && !call.arguments().empty()) {
+            const slang::ast::Type& rct = call.arguments()[0]->type->getCanonicalType();
+            if (const auto* et = rct.as_if<slang::ast::EnumType>()) {
+                return lower_enum_method(name, *et, call, b, l);
+            }
         }
 
         if (fn_ctx_ != nullptr && !fn_ctx_->is_task &&
@@ -2674,6 +3329,38 @@ private:
             // (Clog2). The argument is self-determined and treated as unsigned
             // (LRM §20.8.1); its own width bounds the result.
             return b.unary(ir::Inst::Tag::Clog2, lower_expr(*call.arguments()[0], b), l);
+        }
+
+        // Utility query / bit-counting system functions (LRM 20.6, 20.9). Each
+        // is a compile-time constant for a fixed-size operand: slang's constant
+        // evaluator folds $bits / $countones / $countbits / $onehot / $onehot0 /
+        // $isunknown to a literal (e.g. $bits queries the operand's type, never
+        // its value), so the common constant-arg usage costs nothing at
+        // runtime. Only a non-constant (runtime signal / dynamic string)
+        // argument reaches the IR lowering.
+        if (name == "$bits" || name == "$countones" || name == "$countbits" || name == "$onehot" ||
+            name == "$onehot0" || name == "$isunknown") {
+            slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+            slang::ast::EvalContext    ectx(actx);
+            const slang::ConstantValue cv = call.eval(ectx);
+            if (cv.isInteger()) {
+                return b.constant(svint_to_ref(cv.integer(), lower_type(*call.type)), l);
+            }
+            return lower_bit_query(name, call, b, l);
+        }
+
+        // TODO: $typename (LRM 20.6.1). slang folds it to a string, but its type
+        // $typename (LRM 20.6.1): the operand's resolved type name as a string
+        // constant. Clotho formats the type itself (format_typename) rather than
+        // trusting slang's Type::toString, so it emits only names for the type
+        // kinds it actually lowers and controls the exact LRM format. The
+        // argument's self-determined type is named; the type is resolved during
+        // elaboration but never evaluated.
+        if (name == "$typename") {
+            if (call.arguments().size() != 1) {
+                fail("$typename expects exactly one argument");
+            }
+            return b.constant(string_value_ref(format_typename(*call.arguments()[0]->type)), l);
         }
 
         // $fopen (LRM §21.3): one argument opens a multichannel descriptor (MCD)
@@ -2919,8 +3606,41 @@ private:
             const ir::Index idx = lower_expr(*args[1], b);
             return b.str_putc(str, idx, lower_expr(*args[2], b), l);
         }
-        // TODO: atoi / atohex / atooct / atobin / atoreal and the itoa family
-        // (LRM 6.16.9-6.16.10) — need the numeric conversion runtime entries.
+        if (name == "atoi") {
+            return b.unary(T::StrAtoi, recv(), l);
+        }
+        if (name == "atohex") {
+            return b.unary(T::StrAtohex, recv(), l);
+        }
+        if (name == "atooct") {
+            return b.unary(T::StrAtooct, recv(), l);
+        }
+        if (name == "atobin") {
+            return b.unary(T::StrAtobin, recv(), l);
+        }
+        if (name == "atoreal") {
+            return b.unary(T::StrAtoreal, recv(), l);
+        }
+        if (name == "itoa" && args.size() == 2) {
+            const ir::Index str = lower_lvalue(*args[0], b);
+            return b.binary(T::StrItoa, str, lower_expr(*args[1], b), l);
+        }
+        if (name == "hextoa" && args.size() == 2) {
+            const ir::Index str = lower_lvalue(*args[0], b);
+            return b.binary(T::StrHextoa, str, lower_expr(*args[1], b), l);
+        }
+        if (name == "octtoa" && args.size() == 2) {
+            const ir::Index str = lower_lvalue(*args[0], b);
+            return b.binary(T::StrOctoa, str, lower_expr(*args[1], b), l);
+        }
+        if (name == "bintoa" && args.size() == 2) {
+            const ir::Index str = lower_lvalue(*args[0], b);
+            return b.binary(T::StrBintoa, str, lower_expr(*args[1], b), l);
+        }
+        if (name == "realtoa" && args.size() == 2) {
+            const ir::Index str = lower_lvalue(*args[0], b);
+            return b.binary(T::StrRealtoa, str, lower_expr(*args[1], b), l);
+        }
         fail("string method '" + std::string(name) + "' is not supported");
     }
 
@@ -3423,6 +4143,78 @@ private:
 
     // -- Expressions --
 
+    // Lower a fixed-width RHS streaming concatenation (LRM §11.4.14).
+    // `>>` (sliceSize==0): plain left-to-right concat, no reorder.
+    // `<<` (sliceSize>0): concatenate, then reverse the order of sliceSize-bit
+    // blocks (rightmost block becomes the MSB of the result).
+    ir::Index lower_streaming_concat(const StreamingConcatenationExpression& sc,
+                                     ir::Ref target_ty, ir::Builder& b, ir::SourceLoc l) {
+        if (!sc.isFixedSize()) {
+            fail("streaming concatenation with dynamically-sized operands is not supported");
+        }
+        for (const auto& stream : sc.streams()) {
+            if (stream.withExpr) {
+                fail("streaming concatenation `with` clause is not supported");
+            }
+        }
+
+        // Build the generic stream: concatenate operands left-to-right.
+        // A nested streaming concat has void type (slang creates it with getVoidType()),
+        // so detect it and supply the concrete target type derived from bitstream width.
+        const bool is_four_outer = module_.pool.layout(target_ty).domain == ir::Domain::Four;
+        std::vector<ir::Index> parts;
+        for (const auto& stream : sc.streams()) {
+            const Expression& operand = *stream.operand;
+            if (operand.kind == ExpressionKind::Streaming) {
+                const auto& inner = operand.as<StreamingConcatenationExpression>();
+                const ir::Ref inner_ty = make_int_type(
+                    static_cast<uint32_t>(inner.getBitstreamWidth()), is_four_outer, false);
+                parts.push_back(lower_streaming_concat(inner, inner_ty, b, l));
+            } else {
+                parts.push_back(lower_expr(operand, b));
+            }
+        }
+        ir::Index raw = parts.size() == 1 ? parts[0] : b.concat(parts, l);
+
+        const uint64_t W = sc.getBitstreamWidth();
+        const uint64_t S = sc.getSliceSize();
+
+        // sliceSize > 0: '<<' — reverse order of S-bit blocks sliced from the
+        // right. Block i covers bits [min((i+1)*S,W)-1 : i*S]; reversed output
+        // places block 0 (rightmost) in the MSB position (first concat arg).
+        // Extract each block via logical-right-shift + resize (PartSelect is
+        // lvalue-only in the backend and cannot be used on intermediate values).
+        if (S > 0) {
+            const uint64_t N = (W + S - 1) / S;
+            std::vector<ir::Index> blocks;
+            blocks.reserve(N);
+            const bool is_four = module_.pool.layout(target_ty).domain == ir::Domain::Four;
+            for (uint64_t i = 0; i < N; ++i) {
+                const uint32_t lo    = static_cast<uint32_t>(i * S);
+                const uint32_t bw    = static_cast<uint32_t>(std::min((i + 1) * S, W) - lo);
+                const ir::Ref  sh_ty = make_int_type(static_cast<uint32_t>(W), false, false);
+                const ir::Index sh   = b.constant(module_.pool.put_int(sh_ty, lo), l);
+                const ir::Index srl  = b.binary(ir::Inst::Tag::Srl, raw, sh, l);
+                blocks.push_back(b.resize(srl, make_int_type(bw, is_four, false), l));
+            }
+            raw = b.concat(blocks, l);
+        }
+
+        // Widen if the target is wider than the stream (LRM §11.4.14: zero-fill
+        // on the right, i.e. stream occupies the MSBs of the result).
+        const uint32_t target_w = module_.pool.layout(target_ty).width;
+        if (target_w > static_cast<uint32_t>(W)) {
+            const uint32_t pad       = target_w - static_cast<uint32_t>(W);
+            const bool     is_four   = module_.pool.layout(target_ty).domain == ir::Domain::Four;
+            const ir::Ref  pad_ty    = make_int_type(pad, is_four, false);
+            const ir::Index zero_pad = b.constant(module_.pool.put_int(pad_ty, 0), l);
+            std::vector<ir::Index> widened = {raw, zero_pad};
+            raw = b.concat(widened, l);
+        }
+
+        return b.resize(raw, target_ty, l);
+    }
+
     // Lower an expression as an rvalue, returning the SSA value index.
     ir::Index lower_expr(const Expression& expr, ir::Builder& b) {
         const ir::SourceLoc l = loc(expr);
@@ -3463,6 +4255,14 @@ private:
                 if (sym.kind == SymbolKind::Parameter) {
                     const ParameterSymbol& p = sym.as<ParameterSymbol>();
                     return b.constant(lower_constant(p.getValue(), p.getType()), l);
+                }
+                if (sym.kind == SymbolKind::EnumValue) {
+                    // An enum member (LRM 6.19) is a named compile-time constant of
+                    // the enum's base type; slang computes its value (auto-increment
+                    // or explicit). The enum type itself lowers as its base integer
+                    // (lower_type), so the member is just that base-typed constant.
+                    const EnumValueSymbol& ev = sym.as<EnumValueSymbol>();
+                    return b.constant(lower_constant(ev.getValue(), ev.getType()), l);
                 }
                 if (is_unpacked_array(expr)) {
                     // TODO: reading a whole unpacked array as a value (array copy,
@@ -3571,6 +4371,11 @@ private:
                         fail("unsupported conversion from string");
                     }
                     return b.str_to_packed(lower_expr(cv.operand(), b), lower_type(*expr.type), l);
+                }
+                if (cv.conversionKind == ConversionKind::StreamingConcat) {
+                    return lower_streaming_concat(
+                        cv.operand().as<StreamingConcatenationExpression>(),
+                        lower_type(*expr.type), b, l);
                 }
                 return coerce(lower_expr(cv.operand(), b), *cv.operand().type, lower_type(*expr.type), b, l);
             }

@@ -3,6 +3,7 @@
 #include <array>
 #include <bit>
 #include <cerrno>
+#include <charconv>
 #include <csetjmp>
 #include <cstddef>
 #include <cstdio>
@@ -619,77 +620,55 @@ clotho::Timer& unwrap(rt_timer* t) {
     return *reinterpret_cast<clotho::Timer*>(t);
 }
 
-// One deferred unpacked-array element write: a bytewise masked merge of `mm` /
-// `z` value bytes into the live element's must|may and z words. Self-describing
-// (absolute destination pointers captured at push time) so the commit pass is
-// width-agnostic.
-struct NbaArrWrite {
-    uint32_t             sig;
-    void*                mm_ptr;
-    void*                z_ptr;
-    std::vector<uint8_t> mm_val;
-    std::vector<uint8_t> mm_mask;
-    std::vector<uint8_t> z_val;
-    std::vector<uint8_t> z_mask;
+// One array-NBA signal's deferred-write buffer: a growable byte buffer of
+// fixed-stride records (defined and filled by the backend) plus a live count.
+// Reused across timesteps (count reset, capacity kept).
+struct ArrQueue {
+    std::vector<uint8_t> buf;
+    uint32_t             count = 0;
 };
 
-// The single deferred-write queue. Cleared (kept allocated) each NBA pass.
-std::vector<NbaArrWrite> nba_arr_queue;
-
-// Bytewise dest = (dest & ~mask) | (val & mask).
-void masked_merge(void* dest, const std::vector<uint8_t>& val, const std::vector<uint8_t>& mask) {
-    auto* d = static_cast<uint8_t*>(dest);
-    for (size_t k = 0; k < val.size(); ++k) {
-        d[k] = static_cast<uint8_t>((d[k] & ~mask[k]) | (val[k] & mask[k]));
-    }
-}
+std::vector<ArrQueue> arr_queues; // indexed by dense array-nba id
+uint32_t              arr_total = 0; // records staged this pass, across all arrays
 
 } // namespace
 
-extern "C" void rt_nba_arr_push(uint32_t sig, void* mm_ptr, const void* mm_val, const void* mm_mask,
-                                uint32_t mm_bytes, void* z_ptr, const void* z_val, const void* z_mask,
-                                uint32_t z_bytes) {
-    // A target whose slot stores no z word passes z_ptr null with z_bytes 0;
-    // the write then merges only the must|may word at commit.
-    const auto* mv = static_cast<const uint8_t*>(mm_val);
-    const auto* mk = static_cast<const uint8_t*>(mm_mask);
-    const auto* zv = static_cast<const uint8_t*>(z_val);
-    const auto* zk = static_cast<const uint8_t*>(z_mask);
-    nba_arr_queue.push_back(NbaArrWrite{ .sig     = sig,
-                                         .mm_ptr  = mm_ptr,
-                                         .z_ptr   = z_ptr,
-                                         .mm_val  = { mv, mv + mm_bytes },
-                                         .mm_mask = { mk, mk + mm_bytes },
-                                         .z_val   = z_bytes != 0 ? std::vector<uint8_t>{ zv, zv + z_bytes }
-                                                                 : std::vector<uint8_t>{},
-                                         .z_mask  = z_bytes != 0 ? std::vector<uint8_t>{ zk, zk + z_bytes }
-                                                                 : std::vector<uint8_t>{} });
-}
-
-extern "C" uint32_t rt_nba_arr_pending(void) {
-    return static_cast<uint32_t>(nba_arr_queue.size());
-}
-
-extern "C" void rt_nba_arr_commit(void) {
-    for (const NbaArrWrite& w : nba_arr_queue) {
-        masked_merge(w.mm_ptr, w.mm_val, w.mm_mask);
-        if (w.z_ptr != nullptr) {
-            masked_merge(w.z_ptr, w.z_val, w.z_mask);
-        }
+extern "C" void* rt_nba_arr_slot(uint32_t idx, uint32_t stride) {
+    if (idx >= arr_queues.size()) {
+        arr_queues.resize(idx + 1);
     }
+    ArrQueue&    q    = arr_queues[idx];
+    const size_t need = static_cast<size_t>(q.count + 1) * stride;
+    if (q.buf.size() < need) {
+        // Geometric growth; resize copies existing records, so slot pointers the
+        // backend already wrote stay valid (they were filled before this grow).
+        q.buf.resize(std::max<size_t>(need, q.buf.size() * 2));
+    }
+    void* p = q.buf.data() + static_cast<size_t>(q.count) * stride;
+    q.count++;
+    arr_total++;
+    return p;
 }
 
-extern "C" int rt_nba_arr_dirty(uint32_t sig) {
-    for (const NbaArrWrite& w : nba_arr_queue) {
-        if (w.sig == sig) {
-            return 1;
-        }
-    }
-    return 0;
+extern "C" void* rt_nba_arr_base(uint32_t idx) {
+    // An array with no writes this pass may have no buffer yet; its commit loop
+    // runs zero iterations, so a null base is never dereferenced.
+    return idx < arr_queues.size() ? arr_queues[idx].buf.data() : nullptr;
+}
+
+extern "C" uint32_t rt_nba_arr_count(uint32_t idx) {
+    return idx < arr_queues.size() ? arr_queues[idx].count : 0;
+}
+
+extern "C" uint32_t rt_nba_arr_any(void) {
+    return arr_total;
 }
 
 extern "C" void rt_nba_arr_reset(void) {
-    nba_arr_queue.clear();
+    for (ArrQueue& q : arr_queues) {
+        q.count = 0;
+    }
+    arr_total = 0;
 }
 
 extern "C" void rt_wheel_init(rt_wheel* wheel) {
@@ -1713,6 +1692,17 @@ extern "C" void rt_string_substr(rt_string* dst, const rt_string* src, int32_t i
     str_assign(dst, str_data(src) + i, static_cast<uint64_t>(j) - static_cast<uint64_t>(i) + 1);
 }
 
+extern "C" void rt_enum_name(rt_string* dst, uint64_t val, uint32_t count, const uint64_t* values,
+                             const char* const* names, const uint32_t* lens) {
+    for (uint32_t k = 0; k < count; ++k) {
+        if (values[k] == val) {
+            str_assign(dst, names[k], lens[k]);
+            return;
+        }
+    }
+    str_assign(dst, nullptr, 0); // No member matched: empty string (LRM 6.19.2).
+}
+
 extern "C" void rt_string_toupper(rt_string* dst, const rt_string* src) {
     rt_string_assign(dst, src); // No-op when dst == src, then transform in place.
     char*          p = str_data(dst);
@@ -1743,6 +1733,107 @@ extern "C" uint32_t rt_string_getc(const rt_string* s, int32_t i) {
         return 0;
     }
     return static_cast<unsigned char>(str_data(s)[i]);
+}
+
+namespace {
+
+// Shared digit-scan for the atoi family (LRM §6.16.9): consume leading digits
+// (and '_' separators) of `base`, stopping at the first other character or
+// end of string. No leading whitespace or sign handling — the clause
+// explicitly excludes them ("does not parse the full syntax for integer
+// literals"). Verified against iverilog. Underscore
+// interleaving rules out std::from_chars here; overflow wraps silently via
+// plain unsigned 32-bit accumulation, matching the clause's own truncation
+// note.
+int32_t str_atoi_base(const rt_string* s, uint32_t base) {
+    const char*    p     = str_data(s);
+    const uint64_t n     = str_len(s);
+    uint32_t       acc   = 0;
+    bool           found = false;
+    for (uint64_t k = 0; k < n; ++k) {
+        const char c = p[k];
+        if (c == '_') {
+            continue;
+        }
+        uint32_t v;
+        if (c >= '0' && c <= '9') {
+            v = static_cast<uint32_t>(c - '0');
+        } else if (c >= 'a' && c <= 'z') {
+            v = static_cast<uint32_t>(c - 'a') + 10;
+        } else if (c >= 'A' && c <= 'Z') {
+            v = static_cast<uint32_t>(c - 'A') + 10;
+        } else {
+            break;
+        }
+        if (v >= base) {
+            break;
+        }
+        acc   = acc * base + v;
+        found = true;
+    }
+    return found ? static_cast<int32_t>(acc) : 0;
+}
+
+// dst = sign + magnitude of `i` in `base`, lowercase digits (LRM §6.16.11-
+// 6.16.14). std::to_chars natively formats a negative signed integer as '-'
+// followed by the magnitude in any base, matching iverilog's convention for
+// hextoa/octtoa/bintoa — not a two's-complement bit-pattern
+// dump.
+void str_toa_base(rt_string* dst, int32_t i, int base) {
+    char       buf[36]; // sign + up to 32 binary digits
+    const auto res = std::to_chars(buf, buf + sizeof(buf), i, base);
+    str_assign(dst, buf, static_cast<uint64_t>(res.ptr - buf));
+}
+
+} // namespace
+
+extern "C" int32_t rt_string_atoi(const rt_string* s) {
+    return str_atoi_base(s, 10);
+}
+extern "C" int32_t rt_string_atohex(const rt_string* s) {
+    return str_atoi_base(s, 16);
+}
+extern "C" int32_t rt_string_atooct(const rt_string* s) {
+    return str_atoi_base(s, 8);
+}
+extern "C" int32_t rt_string_atobin(const rt_string* s) {
+    return str_atoi_base(s, 2);
+}
+
+extern "C" double rt_string_atoreal(const rt_string* s) {
+    const char* p   = str_data(s);
+    const char* end = p + str_len(s);
+    // Unlike the atoi family, atoreal accepts leading whitespace and a '+'
+    // sign (verified against iverilog); std::from_chars accepts neither, so
+    // both are skipped by hand before the real-literal parse.
+    while (p < end && scan_ws(static_cast<unsigned char>(*p))) {
+        ++p;
+    }
+    if (p < end && *p == '+') {
+        ++p;
+    }
+    double v = 0.0; // Unmodified by from_chars on failure: "0.0 if no digits".
+    std::from_chars(p, end, v);
+    return v;
+}
+
+extern "C" void rt_string_itoa(rt_string* dst, int32_t i) {
+    str_toa_base(dst, i, 10);
+}
+extern "C" void rt_string_hextoa(rt_string* dst, int32_t i) {
+    str_toa_base(dst, i, 16);
+}
+extern "C" void rt_string_octtoa(rt_string* dst, int32_t i) {
+    str_toa_base(dst, i, 8);
+}
+extern "C" void rt_string_bintoa(rt_string* dst, int32_t i) {
+    str_toa_base(dst, i, 2);
+}
+
+extern "C" void rt_string_realtoa(rt_string* dst, double r) {
+    char       buf[32];
+    const auto res = std::to_chars(buf, buf + sizeof(buf), r);
+    str_assign(dst, buf, static_cast<uint64_t>(res.ptr - buf));
 }
 
 extern "C" void rt_string_from_packed(rt_string* dst, const uint8_t* val, uint32_t width_bits) {

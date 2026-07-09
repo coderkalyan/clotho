@@ -142,6 +142,7 @@ add_executable(clotho_test
   tests/generate_test.cpp
   tests/packed_range_test.cpp
   tests/z_elision_test.cpp
+  tests/gate_test.cpp
   tests/llvm_backend_test.cpp
   tests/two_state_test.cpp
   tests/domain_spec_test.cpp
@@ -150,6 +151,10 @@ add_executable(clotho_test
   tests/runtime_test.cpp
   tests/compound_test.cpp
   tests/final_test.cpp
+  tests/comb_fusion_test.cpp
+  tests/enum_test.cpp
+  tests/sysfunc_test.cpp
+  tests/streaming_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho doctest::doctest clotho_warnings)
 

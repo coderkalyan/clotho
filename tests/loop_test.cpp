@@ -598,3 +598,158 @@ TEST_CASE("break outside a loop is rejected") {
     )");
     CHECK_FALSE(r.ok);
 }
+
+// -- foreach (12.7.3). Oracle: iverilog. --
+
+// Single-dimension foreach over a fixed-size unpacked array, ascending
+// declared range: the loop variable is implicitly `int` and reads back
+// exactly the elements written through it.
+TEST_CASE("foreach writes and reads back a 1-D unpacked array, ascending range") {
+    CHECK(run_capture(R"(
+        module m;
+            integer mem [0:3];
+            initial begin
+                foreach (mem[i]) mem[i] = i * 10;
+                $display("%0d %0d %0d %0d", mem[0], mem[1], mem[2], mem[3]);
+            end
+        endmodule
+    )") == "0 10 20 30\n");
+}
+
+// A descending declared range ([3:0]) iterates in declared left-to-right
+// order, i.e. counting down (matches the LRM's own `B[5:1]` example, which
+// iterates 5 down to 1).
+TEST_CASE("foreach over a descending declared range counts down") {
+    CHECK(run_capture(R"(
+        module m;
+            integer arr [3:0];
+            initial foreach (arr[i]) $display("%0d", i);
+        endmodule
+    )") == "3\n2\n1\n0\n");
+}
+
+// Multiple loop variables nest, innermost varying fastest (outer loops
+// correspond to the lower-cardinality / leftmost dimensions).
+TEST_CASE("foreach over a 2-D array nests with the inner dimension fastest") {
+    CHECK(run_capture(R"(
+        module m;
+            integer a [0:1][0:2];
+            initial foreach (a[i, j]) $display("%0d %0d", i, j);
+        endmodule
+    )") == "0 0\n0 1\n0 2\n1 0\n1 1\n1 2\n");
+}
+
+// foreach lowers to nested Loop instructions, one per iterated dimension.
+TEST_CASE("foreach lowers to a Loop instruction") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            integer a [0:1][0:2];
+            initial foreach (a[i, j]) $display("%0d %0d", i, j);
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    CHECK(any_process_has_tag(*r.module, ir::Inst::Tag::Loop));
+}
+
+// A skipped (omitted) loop variable means no iteration over that dimension at
+// all -- not a hidden loop over its full extent. Regression: an earlier
+// misreading of 12.7.3 treated a skipped dimension as "iterate but don't
+// bind," which would multiply the count by the skipped dimension's size (24
+// instead of 8 here: dim2's size-3 must NOT be a factor).
+TEST_CASE("foreach with a skipped dimension does not iterate over it") {
+    CHECK(run_capture(R"(
+        module m;
+            integer a [0:1][0:2][0:3];
+            integer count;
+            initial begin
+                count = 0;
+                foreach (a[i, , k]) count = count + 1;
+                $display("%0d", count);
+            end
+        endmodule
+    )") == "8\n");
+}
+
+// continue in a nested foreach applies to the innermost dimension only.
+TEST_CASE("continue in a nested foreach skips only the innermost iteration") {
+    CHECK(run_capture(R"(
+        module m;
+            integer a [0:1][0:2];
+            integer count;
+            initial begin
+                count = 0;
+                foreach (a[i, j]) begin
+                    if (j == 1) continue;
+                    count = count + 1;
+                end
+                $display("%0d", count);
+            end
+        endmodule
+    )") == "4\n");
+}
+
+// break in a nested foreach exits only the innermost loop; the outer
+// dimension keeps iterating.
+TEST_CASE("break in a nested foreach exits only the innermost loop") {
+    CHECK(run_capture(R"(
+        module m;
+            integer a [0:1][0:2];
+            integer count;
+            initial begin
+                count = 0;
+                foreach (a[i, j]) begin
+                    if (j == 1) break;
+                    count = count + 1;
+                end
+                $display("%0d", count);
+            end
+        endmodule
+    )") == "2\n");
+}
+
+// A string is treated as a dynamic array of bytes indexed 0..N-1 (12.7.3); the
+// bound is the runtime length, not a compile-time range.
+TEST_CASE("foreach over a string iterates its bytes") {
+    CHECK(run_capture(R"(
+        module m;
+            string s;
+            initial begin
+                s = "abc";
+                foreach (s[i]) $display("%0d %0d", i, s[i]);
+            end
+        endmodule
+    )") == "0 97\n1 98\n2 99\n");
+}
+
+// Dynamic arrays, queues, and associative arrays are not modeled at all
+// (Lower.cpp: "dynamic / queue / associative arrays are not supported"), so a
+// foreach over one must fail loudly rather than silently mis-iterate.
+TEST_CASE("foreach over a dynamic array is rejected") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            integer dyn [];
+            initial foreach (dyn[i]) $display("%0d", i);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+}
+
+TEST_CASE("foreach over a queue is rejected") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            integer q [$];
+            initial foreach (q[i]) $display("%0d", i);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+}
+
+TEST_CASE("foreach over an associative array is rejected") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            integer assoc [int];
+            initial foreach (assoc[i]) $display("%0d", i);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+}

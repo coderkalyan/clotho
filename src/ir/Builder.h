@@ -97,8 +97,17 @@ public:
     Index str_putc(Index str, Index index, Index ch, SourceLoc loc);
     // s.substr(i, j): a new string value from the source string `str`.
     Index str_substr(Index str, Index i, Index j, SourceLoc loc);
+    // e.name(): a new string value naming the enum member whose value equals
+    // `val`. `members` is the (value, source-name) table in declaration order.
+    Index enum_name(Index val, std::span<const std::pair<uint64_t, std::string_view>> members,
+                    SourceLoc loc);
     // Packed cast of a string to target packed type `type`.
     Index str_to_packed(Index str, Ref type, SourceLoc loc);
+
+    // $countbits / $countones / $onehot* / $isunknown building block: tally the
+    // bits of `op` whose 4-state value is selected by `mask` (a CountBitsClass
+    // OR-mask). Yields a definite 2-state 32-bit int.
+    Index count_bits(Index op, uint32_t mask, SourceLoc loc);
 
     // -- Timing --
     // Event wait `@(a or posedge b ...)`: suspend until ANY listed (signal, edge)

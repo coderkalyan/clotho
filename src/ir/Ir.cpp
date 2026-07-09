@@ -30,6 +30,11 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::StrUpper:
         case T::StrLower:
         case T::StrFromPacked:
+        case T::StrAtoi:
+        case T::StrAtohex:
+        case T::StrAtooct:
+        case T::StrAtobin:
+        case T::StrAtoreal:
         case T::Clog2:
         case T::Ctz:
         case T::Clz:
@@ -66,6 +71,11 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::StrGetc:
         case T::StrCmp:
         case T::StrICmp:
+        case T::StrItoa:
+        case T::StrHextoa:
+        case T::StrOctoa:
+        case T::StrBintoa:
+        case T::StrRealtoa:
         case T::FAdd:
         case T::FSub:
         case T::FMul:
@@ -135,6 +145,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::ReadMem:
         case T::StrPutc:
         case T::StrSubstr:
+        case T::EnumName:
+        case T::CountBits:
             return K::OpExtra;
     }
 

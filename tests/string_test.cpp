@@ -331,6 +331,89 @@ TEST_CASE("toupper, tolower, and substr follow LRM 6.16 semantics") {
     CHECK(run_capture(src) == "[MIXED 42!] [mixed 42!]\n[MiXeD 42!]\n[iXe]\n0\n0\n");
 }
 
+// atoi/atohex/atooct/atobin (LRM 6.16.9): leading digits (and '_') of the
+// given base, stopping at the first other character; 0 if none matched. No
+// leading whitespace or sign handling, and overflow truncates silently.
+// Expectations cross-checked vs iverilog.
+TEST_CASE("atoi family scans leading digits per LRM 6.16.9") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s;
+            integer r;
+            initial begin
+                s = "123"; r = s.atoi(); $display("%0d", r);
+                s = "-123"; r = s.atoi(); $display("%0d", r);   // no sign handling -> 0
+                s = "1_2_3"; r = s.atoi(); $display("%0d", r);  // '_' skipped
+                s = "12abc"; r = s.atoi(); $display("%0d", r);  // stops at 'a'
+                s = ""; r = s.atoi(); $display("%0d", r);
+                s = "4294967296123"; r = s.atoi(); $display("%0d", r); // truncates
+                s = "FF"; r = s.atohex(); $display("%0d", r);
+                s = "17"; r = s.atooct(); $display("%0d", r);
+                s = "101"; r = s.atobin(); $display("%0d", r);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "123\n0\n123\n12\n0\n123\n255\n15\n5\n");
+}
+
+// atoreal (LRM 6.16.10): unlike the atoi family, leading whitespace and an
+// optional '+' are accepted (iverilog-verified); 0.0 if no digits matched.
+TEST_CASE("atoreal parses a real-literal prefix per LRM 6.16.10") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s;
+            real r;
+            initial begin
+                s = "3.14"; r = s.atoreal(); $display("%f", r);
+                s = "  -3.14"; r = s.atoreal(); $display("%f", r);
+                s = "+3.14"; r = s.atoreal(); $display("%f", r);
+                s = "abc"; r = s.atoreal(); $display("%f", r);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "3.140000\n-3.140000\n3.140000\n0.000000\n");
+}
+
+// itoa/hextoa/octtoa/bintoa (LRM 6.16.11-6.16.14): sign + magnitude in the
+// given base, lowercase digits — not a two's-complement bit-pattern dump.
+// x/z bits of the operand read as 0 (StrFromPacked's
+// must-plane convention). Expectations cross-checked vs iverilog.
+TEST_CASE("itoa family formats sign + magnitude per LRM 6.16.11-6.16.14") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s;
+            integer r;
+            initial begin
+                r = 123; s.itoa(r); $display("%s", s);
+                r = -123; s.itoa(r); $display("%s", s);
+                r = 255; s.hextoa(r); $display("%s", s);
+                r = -256; s.hextoa(r); $display("%s", s);
+                r = 8; s.octtoa(r); $display("%s", s);
+                r = 5; s.bintoa(r); $display("%s", s);
+                r = 32'h1x; s.itoa(r); $display("%s", s); // x reads as 0 -> 0x10
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "123\n-123\nff\n-100\n10\n101\n16\n");
+}
+
+// realtoa (LRM 6.16.15): full round-trip precision, not iverilog's 6-sig-fig
+// %g truncation (a deliberate LRM-compliant deviation).
+TEST_CASE("realtoa formats at full round-trip precision") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s;
+            real r;
+            initial begin
+                r = 3.14; s.realtoa(r); $display("%s", s);
+                r = 100.0; s.realtoa(r); $display("%s", s);
+                r = 123456789.123; s.realtoa(r); $display("%s", s);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "3.14\n100\n123456789.123\n");
+}
+
 TEST_CASE("string casts pack and unpack characters per LRM 6.16") {
     constexpr std::string_view src = R"(
         module m;
@@ -564,15 +647,6 @@ TEST_CASE("unsupported string constructs are rejected loudly") {
                 initial s <= "x";
             endmodule
         )", "nonblocking assignment to a string");
-    }
-    SUBCASE("atoi method family") {
-        check_rejected(R"(
-            module m;
-                string s;
-                integer v;
-                initial begin s = "42"; v = s.atoi(); end
-            endmodule
-        )", "string method 'atoi'");
     }
     SUBCASE("string module port") {
         check_rejected(R"(

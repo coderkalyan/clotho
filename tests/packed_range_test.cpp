@@ -258,14 +258,6 @@ TEST_CASE("iff qualifier on an event control is rejected, not dropped") {
 }
 
 TEST_CASE("behavior-bearing members are rejected, not dropped") {
-    constexpr std::string_view gate = R"(
-        module t;
-            wire y; reg a, b;
-            and g(y, a, b);
-        endmodule
-    )";
-    CHECK(reject(gate).find("PrimitiveInstance") != std::string::npos);
-
     constexpr std::string_view specify = R"(
         module m(input a, output b);
             assign b = a;

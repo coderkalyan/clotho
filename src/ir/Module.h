@@ -124,6 +124,51 @@ struct Process {
     Ir ir;
 };
 
+// A structural gate primitive's operation (LRM 28.4, 28.5). Every gate is a
+// fold of one commutative 2-bit-code operation over its inputs, optionally
+// inverted, so the backend needs only the kind — arity lives in GateInfo.
+enum class GateOp : uint8_t {
+    And,
+    Nand,
+    Or,
+    Nor,
+    Xor,
+    Xnor,
+    Buf,
+    Not,
+};
+
+// One static 1-bit location a gate drives: a bit of a module signal. Bit 0 for
+// a scalar; the LSB-relative bit index for a constant select of a packed net.
+struct GateTerm {
+    Signal   sig = Signal{ 0 };
+    uint32_t bit = 0;
+};
+
+// One gate input: either a static 1-bit signal location, or a compile-time
+// constant folded into the gate. `const_code` is the 2-bit 4-state plane code
+// (bit0 = must, bit1 = may): 0b00 = 0, 0b11 = 1, 0b10 = X (Z reads as X per
+// LRM Table 28-3).
+struct GateInput {
+    Signal   sig        = Signal{ 0 };
+    uint32_t bit        = 0;
+    uint8_t  const_code = 0;
+    bool     is_const   = false;
+};
+
+// One structural gate instance. Gates are not processes: the backend lowers the
+// whole table to constant metadata plus a shared table-driven eval loop, so a
+// gate costs no coroutine frame or per-gate code. Inputs live CSR-style in
+// Module::gate_inputs at [in_start, in_start + in_count). A multi-output
+// buf/not is lowered as one GateInfo per output.
+struct GateInfo {
+    GateOp    op = GateOp::Buf;
+    GateTerm  output;
+    uint32_t  in_start = 0;
+    uint32_t  in_count = 0;
+    SourceLoc loc = SourceLoc{ 0 };
+};
+
 // Direction of a task formal argument (LRM 13.5). A function's arguments are all
 // In; only tasks carry Out / Inout, which copy the formal back to the caller at
 // task completion. (ref is rejected by the frontend for now.)
@@ -192,6 +237,14 @@ public:
         processes_.push_back(std::move(proc));
     }
 
+    // Append a gate with its inputs; fills the gate's CSR slice in gate_inputs.
+    void add_gate(GateInfo gate, std::span<const GateInput> inputs) {
+        gate.in_start = static_cast<uint32_t>(gate_inputs_.size());
+        gate.in_count = static_cast<uint32_t>(inputs.size());
+        gate_inputs_.insert(gate_inputs_.end(), inputs.begin(), inputs.end());
+        gates_.push_back(gate);
+    }
+
     // Reserve a function slot and return its id before the body is built, so a
     // recursive call can resolve the id while the body is still being lowered. The
     // slot must be filled with set_function before the module is used.
@@ -239,11 +292,22 @@ public:
         return tops_;
     }
 
+    std::span<const GateInfo> gates() const {
+        return gates_;
+    }
+
+    std::span<const GateInput> gate_inputs() const {
+        return gate_inputs_;
+    }
+
 private:
     // Signal table; index == Signal handle.
     std::vector<SignalInfo> signals_;
     // Lowered processes, in creation order.
     std::vector<Process> processes_;
+    // Structural gate table plus the shared CSR input pool it indexes into.
+    std::vector<GateInfo>  gates_;
+    std::vector<GateInput> gate_inputs_;
     // Lowered functions; index == FunctionId handle. Held behind unique_ptr so a
     // slot can be reserved (recursion) before its body exists.
     std::vector<std::unique_ptr<Function>> functions_;

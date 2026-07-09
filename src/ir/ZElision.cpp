@@ -363,6 +363,8 @@ struct Analysis {
                 // Ctz / Clz count the must plane -> a definite bit index, z = 0.
                 case Inst::Tag::Ctz:
                 case Inst::Tag::Clz:
+                // $countbits family: a definite 2-state count, z = 0.
+                case Inst::Tag::CountBits:
                 // String values carry no bit planes and the integral string ops
                 // (len / getc / cmp / to_packed) always produce known bits.
                 case Inst::Tag::StrLen:
@@ -373,8 +375,22 @@ struct Analysis {
                 case Inst::Tag::StrUpper:
                 case Inst::Tag::StrLower:
                 case Inst::Tag::StrSubstr:
+                case Inst::Tag::EnumName:
                 case Inst::Tag::StrFromPacked:
                 case Inst::Tag::StrToPacked:
+                // atoi/atohex/atooct/atobin/atoreal parse a string's bytes into a
+                // definite value (no z plane possible from ASCII digits);
+                // itoa/hextoa/octtoa/bintoa/realtoa produce no value at all.
+                case Inst::Tag::StrAtoi:
+                case Inst::Tag::StrAtohex:
+                case Inst::Tag::StrAtooct:
+                case Inst::Tag::StrAtobin:
+                case Inst::Tag::StrAtoreal:
+                case Inst::Tag::StrItoa:
+                case Inst::Tag::StrHextoa:
+                case Inst::Tag::StrOctoa:
+                case Inst::Tag::StrBintoa:
+                case Inst::Tag::StrRealtoa:
                 // File I/O: descriptors and read counts are always-known integers,
                 // and these write-back forms ($fgets / $sformat / $ferror / $fread)
                 // store known bytes with a zero z plane, so none seed z into their
