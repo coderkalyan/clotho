@@ -294,7 +294,6 @@ TEST_CASE("printer indents cond regions and decodes constants") {
     CHECK(toString(ir) == expected);
 }
 
-<<<<<<< HEAD
 TEST_CASE("string type interns once and string constants dedup on content") {
     InternPool pool;
 

@@ -1241,16 +1241,16 @@ private:
     // distance from the LSB end), so non-zero-based and ascending ranges resolve
     // correctly.
     std::optional<uint32_t> gate_select_bit(const Expression& value, const Expression& index) {
-        const std::optional<int64_t> idx = try_const_int(index);
+        const std::optional<int32_t> idx = try_const_int(index);
         if (!idx) {
             return std::nullopt;
         }
         const slang::ConstantRange r = value.type->getCanonicalType().getFixedRange();
-        if (!r.containsPoint(static_cast<int32_t>(*idx))) {
+        if (!r.containsPoint(*idx)) {
             return std::nullopt;
         }
 
-        return static_cast<uint32_t>(r.translateIndex(static_cast<int32_t>(*idx)));
+        return static_cast<uint32_t>(r.translateIndex(*idx));
     }
 
     // Resolve a terminal expression to a static (signal, bit) location if it is a
@@ -1300,19 +1300,6 @@ private:
         return std::nullopt;
     }
 
-    // Evaluate a constant integer expression, returning nullopt instead of
-    // failing (unlike const_uint) so callers can fall back to a runtime path.
-    std::optional<int64_t> try_const_int(const Expression& e) {
-        slang::ast::ASTContext     astCtx(*scope_, slang::ast::LookupLocation::max);
-        slang::ast::EvalContext    evalCtx(astCtx);
-        const slang::ConstantValue cv = e.eval(evalCtx);
-        if (!cv.isInteger()) {
-            return std::nullopt;
-        }
-
-        return cv.integer().as<int64_t>();
-    }
-
     // Lower one gate input terminal to a GateInput: a compile-time constant plane
     // code, a static 1-bit location, or (the general case, LRM 4.9.6) a synthesized
     // temp net continuously assigned from the expression.
@@ -1351,7 +1338,7 @@ private:
         b.binary(ir::Inst::Tag::Store, b.signal(tmp, l), b.resize(lower_expr(e, b), module_.pool.logic_type, l), l);
 
         std::vector<ir::WaitEvent> wait_events;
-        SensitivityCollector       c(sigmap_);
+        SensitivityCollector       c(sigmap_, SensitivityMode::ImplicitEvent);
         e.visit(c);
         for (const ir::Signal s : c.reads) {
             wait_events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });

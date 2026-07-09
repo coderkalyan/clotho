@@ -2978,6 +2978,20 @@ private:
                 llvm::Value* meta = b_.CreateInBoundsGEP(nba_meta_arr_ty_, nba_meta_gv_,
                                                          { b_.getInt32(0), b_.getInt32(s.nba_id) });
                 emit_nba_service(meta, old_mm, new_mm, W, s.narrow, old_z, new_z);
+            } else if (!mod_.gates().empty() && signal_has_gate_fanout(bs.sig)) {
+                // Gate fanout without process waiters: no meta needed, push directly.
+                const auto   idx  = static_cast<uint32_t>(bs.sig);
+                const EdgeFacts f = emit_edge_facts(old_mm, new_mm, W, !s.narrow, old_z, new_z,
+                                                    false, false, true);
+                auto* fn   = b_.GetInsertBlock()->getParent();
+                auto* push = llvm::BasicBlock::Create(ctx_, "nsvc.gfan", fn);
+                auto* cont = llvm::BasicBlock::Create(ctx_, "nsvc.gfan.cont", fn);
+                b_.CreateCondBr(f.changed, push, cont);
+                b_.SetInsertPoint(push);
+                b_.CreateCall(gate_push_range_fn_,
+                              { b_.getInt32(gate_fan_lo_[idx]), b_.getInt32(gate_fan_hi_[idx]) });
+                b_.CreateBr(cont);
+                b_.SetInsertPoint(cont);
             }
         }
     }
@@ -3205,6 +3219,7 @@ private:
         };
 
         std::vector<uint8_t>  ops(n), inits(n);
+        std::vector<uint8_t>  has_z_vec(n);
         std::vector<uint32_t> in_start;
         std::vector<uint32_t> in_must, in_may;
         std::vector<uint32_t> out_must(n), out_may(n), out_z(n), gfan_lo(n), gfan_hi(n);
@@ -3240,6 +3255,7 @@ private:
             out_must[g]               = mm_byte * 8 + gi.output.bit;
             out_may[g]                = mm_byte * 8 + out.width + gi.output.bit;
             out_z[g]                  = z_byte * 8 + gi.output.bit;
+            has_z_vec[g]              = out.has_z ? 1 : 0;
             const auto osig       = static_cast<uint32_t>(gi.output.sig);
             // A gate writes exactly one bit, so its fanout is the per-(signal,
             // bit) slice: only gates reading THAT bit re-evaluate.
@@ -3293,9 +3309,10 @@ private:
         gate_in_start_gv_ = mk_i32("clotho.gate_in_start", in_start);
         gate_in_must_gv_  = mk_i32("clotho.gate_in_must", in_must);
         gate_in_may_gv_   = mk_i32("clotho.gate_in_may", in_may);
-        gate_out_must_gv_ = mk_i32("clotho.gate_out_must", out_must);
-        gate_out_may_gv_  = mk_i32("clotho.gate_out_may", out_may);
-        gate_out_z_gv_    = mk_i32("clotho.gate_out_z", out_z);
+        gate_out_must_gv_  = mk_i32("clotho.gate_out_must", out_must);
+        gate_out_may_gv_   = mk_i32("clotho.gate_out_may", out_may);
+        gate_out_z_gv_     = mk_i32("clotho.gate_out_z", out_z);
+        gate_out_has_z_gv_ = mk_i8("clotho.gate_out_has_z", has_z_vec);
         gate_gfan_lo_gv_  = mk_i32("clotho.gate_out_fan_lo", gfan_lo);
         gate_gfan_hi_gv_  = mk_i32("clotho.gate_out_fan_hi", gfan_hi);
         gate_wmi_gv_      = mk_i32("clotho.gate_waitmeta_idx", wmi);
@@ -3483,8 +3500,19 @@ private:
 
         llvm::Value* oma  = gate_tab_i32(gate_out_must_gv_, id);
         llvm::Value* omya = gate_tab_i32(gate_out_may_gv_, id);
-        llvm::Value* old  = b_.CreateOr(gate_bit_read(state, oma),
-                                        b_.CreateShl(gate_bit_read(state, omya), b_.getInt32(1)));
+        // NOTE: Include the z bit as bit 2 in old. Gates never output z (bit 2
+        // of out is always 0), so if the signal currently has z=1 the codes
+        // differ and the write path fires, clearing z. Masked by has_z so
+        // z-elided outputs (no z field) never contribute a spurious bit.
+        auto*        hzp  = b_.CreateInBoundsGEP(
+            llvm::cast<llvm::ArrayType>(gate_out_has_z_gv_->getValueType()),
+            gate_out_has_z_gv_, { b_.getInt32(0), id });
+        llvm::Value* hz   = b_.CreateZExt(b_.CreateLoad(b_.getInt8Ty(), hzp), b_.getInt32Ty());
+        llvm::Value* old  = b_.CreateOr(
+            b_.CreateOr(gate_bit_read(state, oma),
+                        b_.CreateShl(gate_bit_read(state, omya), b_.getInt32(1))),
+            b_.CreateShl(b_.CreateAnd(gate_bit_read(state, gate_tab_i32(gate_out_z_gv_, id)), hz),
+                         b_.getInt32(2)));
 
         auto* wr = llvm::BasicBlock::Create(ctx_, "gate.write", gate_eval_fn_);
         b_.CreateCondBr(b_.CreateICmpEQ(old, out), check, wr);
@@ -3688,7 +3716,8 @@ private:
         const SignalSlot& slot = slot_of(sig);
         const EdgeFacts   f =
           emit_edge_facts(old_mm, new_mm, slot.width, slot.four_state, old_z, new_z,
-                          has_bucket(Edge::Positive), has_bucket(Edge::Negative), has_bucket(Edge::Any));
+                          has_bucket(Edge::Positive), has_bucket(Edge::Negative),
+                          has_bucket(Edge::Any) || signal_has_gate_fanout(sig));
 
         // Gate fanout: any change pushes the reading gates onto the worklist
         // (deduped inside), drained in the active region.
@@ -8679,9 +8708,10 @@ private:
     llvm::GlobalVariable* gate_in_start_gv_ = nullptr;
     llvm::GlobalVariable* gate_in_must_gv_  = nullptr;
     llvm::GlobalVariable* gate_in_may_gv_   = nullptr;
-    llvm::GlobalVariable* gate_out_must_gv_ = nullptr;
-    llvm::GlobalVariable* gate_out_may_gv_  = nullptr;
-    llvm::GlobalVariable* gate_out_z_gv_    = nullptr;
+    llvm::GlobalVariable* gate_out_must_gv_  = nullptr;
+    llvm::GlobalVariable* gate_out_may_gv_   = nullptr;
+    llvm::GlobalVariable* gate_out_z_gv_     = nullptr;
+    llvm::GlobalVariable* gate_out_has_z_gv_ = nullptr;
     llvm::GlobalVariable* gate_gfan_lo_gv_  = nullptr;
     llvm::GlobalVariable* gate_gfan_hi_gv_  = nullptr;
     llvm::GlobalVariable* gate_wmi_gv_      = nullptr;
