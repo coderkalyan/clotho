@@ -31,14 +31,6 @@ struct SimulationConfig {
     // the thunk path in LlvmBackend.cpp). Disable for bisection / debugging;
     // semantics are byte-identical (same sched-flag timeline, same FIFO order).
     bool thunk = true;
-    // Commit whole-signal scalar NBAs per straight-line block instead of per
-    // signal: each block's writes register one deferred commit in the NBA region,
-    // so enqueue cost is O(branchiness) not O(signals written). Semantics are
-    // byte-identical (same shadow last-write-wins, same NBA-region timing).
-    // Partial (bit/part-select) and array-element NBAs are unaffected. Disable
-    // for bisection / debugging. Measured: wideff N=256 sim 116 -> 59 ms,
-    // picorv32 1710 -> 1527 ms.
-    bool block_nba = true;
     // Register LLVM's perf JITEventListener on the object-linking layer so the
     // JIT'd design's functions show up in `perf` with real symbols. Emits a
     // jitdump (`$JITDUMPDIR/jit-<pid>.dump`) consumed by `perf inject --jit`.
