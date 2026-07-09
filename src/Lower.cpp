@@ -3464,6 +3464,14 @@ private:
                     const ParameterSymbol& p = sym.as<ParameterSymbol>();
                     return b.constant(lower_constant(p.getValue(), p.getType()), l);
                 }
+                if (sym.kind == SymbolKind::EnumValue) {
+                    // An enum member (LRM 6.19) is a named compile-time constant of
+                    // the enum's base type; slang computes its value (auto-increment
+                    // or explicit). The enum type itself lowers as its base integer
+                    // (lower_type), so the member is just that base-typed constant.
+                    const EnumValueSymbol& ev = sym.as<EnumValueSymbol>();
+                    return b.constant(lower_constant(ev.getValue(), ev.getType()), l);
+                }
                 if (is_unpacked_array(expr)) {
                     // TODO: reading a whole unpacked array as a value (array copy,
                     // passing a memory by value). Only element reads are supported.
