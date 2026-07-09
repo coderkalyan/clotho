@@ -1997,6 +1997,8 @@ private:
         for (uint32_t k = 0; k < nprocs; ++k) {
             sub_order_[k] = k;
         }
+        wake_adj_.assign(nprocs, {});
+        scc_nontrivial_.assign(nprocs, 0);
         if (nprocs < 2) {
             return;
         }
@@ -2063,9 +2065,10 @@ private:
             }
         }
 
-        // Adjacency, deduplicated with a per-source stamp.
-        std::vector<std::vector<uint32_t>> adj(nprocs);
-        std::vector<uint32_t>              stamp(nprocs, UINT32_MAX);
+        // Adjacency, deduplicated with a per-source stamp. Kept as a member:
+        // the comb-fusion pass reuses these edges for component grouping.
+        std::vector<std::vector<uint32_t>>& adj = wake_adj_;
+        std::vector<uint32_t>               stamp(nprocs, UINT32_MAX);
         for (uint32_t k = 0; k < nprocs; ++k) {
             std::vector<Signal>     writes;
             std::vector<FunctionId> calls;
@@ -2142,6 +2145,19 @@ private:
                         } while (w != v);
                     }
                 }
+            }
+        }
+
+        // Nontrivial SCC membership (multi-process combinational loop): those
+        // processes have no producer-before-consumer order, so comb fusion
+        // must leave them on the re-wake iteration path.
+        {
+            std::vector<uint32_t> scc_size(nprocs, 0);
+            for (uint32_t k = 0; k < nprocs; ++k) {
+                scc_size[scc_rank[k]]++;
+            }
+            for (uint32_t k = 0; k < nprocs; ++k) {
+                scc_nontrivial_[k] = scc_size[scc_rank[k]] > 1 ? 1 : 0;
             }
         }
 
@@ -2476,6 +2492,100 @@ private:
             groups_.push_back({ k });
         }
 
+        // Comb fusion: merge dependent comb-eligible singletons into
+        // rank-contiguous chunks running producer-before-consumer in one
+        // activation, subscribed to the union sensitivity (see
+        // docs/design/comb-fusion.md for the LRM as-if argument). Two facts
+        // carry the legality: the sched flag is held across the fused body,
+        // so an intra-group store cannot re-enqueue the group (the downstream
+        // member already runs later in the same activation with final
+        // values); and change detection makes a spuriously-run member (pure,
+        // reads unchanged) write no changes and wake nobody. Grouping is by
+        // connected component of the wake graph so independent cones are
+        // never yoked together (a union sensitivity across unrelated cones
+        // would run every body per trigger); nontrivial SCCs (comb loops)
+        // keep re-wake fixpoint iteration.
+        if (config_.fuse && config_.comb_fuse && nprocs >= 2) {
+            std::vector<uint8_t> cand(nprocs, 0);
+            for (const auto& g : groups_) {
+                if (g.size() != 1) {
+                    continue;
+                }
+                const uint32_t k = g.front();
+                if (scc_nontrivial_[k] == 0 && comb_fuse_verdict(all[k]) == CombFuse::Eligible) {
+                    cand[k] = 1;
+                }
+            }
+            // Union-find over wake edges between candidates. self_start must
+            // match: the group makes one seed decision (comb populations are
+            // uniformly self_start in practice; a mismatch just splits).
+            std::vector<uint32_t> uf(nprocs);
+            for (uint32_t k = 0; k < nprocs; ++k) {
+                uf[k] = k;
+            }
+            const auto find = [&](uint32_t x) {
+                while (uf[x] != x) {
+                    uf[x] = uf[uf[x]];
+                    x     = uf[x];
+                }
+                return x;
+            };
+            for (uint32_t k = 0; k < nprocs; ++k) {
+                if (cand[k] == 0) {
+                    continue;
+                }
+                for (const uint32_t q : wake_adj_[k]) {
+                    if (cand[q] != 0 && all[q].self_start == all[k].self_start) {
+                        uf[find(k)] = find(q);
+                    }
+                }
+            }
+            // Component members in scheduled-rank order (sub_order_ iteration
+            // yields them pre-sorted), then chunked at the group cap; a
+            // leftover chunk of one stays a singleton.
+            std::vector<std::vector<uint32_t>> comp(nprocs);
+            for (const uint32_t k : sub_order_) {
+                if (cand[k] != 0) {
+                    comp[find(k)].push_back(k);
+                }
+            }
+            bool merged = false;
+            for (const auto& c : comp) {
+                for (size_t off = 0; off + 1 < c.size(); off += group_cap) {
+                    const size_t end = std::min(c.size(), off + group_cap);
+                    if (end - off < 2) {
+                        break;
+                    }
+                    const uint32_t g0 = group_of_[c[off]];
+                    for (size_t j = off + 1; j < end; ++j) {
+                        const uint32_t m = c[j];
+                        groups_[group_of_[m]].clear();
+                        groups_[g0].push_back(m);
+                        group_of_[m] = g0;
+                        merged       = true;
+                    }
+                }
+            }
+            // Compact the emptied singleton slots.
+            if (merged) {
+                std::vector<uint32_t> remap(groups_.size(), 0);
+                uint32_t              w = 0;
+                for (uint32_t g = 0; g < groups_.size(); ++g) {
+                    if (!groups_[g].empty()) {
+                        remap[g] = w;
+                        if (w != g) {
+                            groups_[w] = std::move(groups_[g]);
+                        }
+                        ++w;
+                    }
+                }
+                groups_.resize(w);
+                for (uint32_t k = 0; k < nprocs; ++k) {
+                    group_of_[k] = remap[group_of_[k]];
+                }
+            }
+        }
+
         // Members run in scheduled-rank order (the order the unfused FIFO would
         // have popped them); the group subscribes at its earliest member's rank.
         group_events_.resize(groups_.size());
@@ -2486,9 +2596,15 @@ private:
                 group_events_[g] = all[groups_[g].front()].wait_events;
                 continue;
             }
-            // Fused: subscribe the canonical deduped set once (wait_counts sizes
-            // the buckets to match).
-            for (const auto& [s, e] : canonical(all[groups_[g].front()].wait_events)) {
+            // Fused: subscribe the canonical deduped union of member events
+            // once (wait_counts sizes the buckets to match). For V1 groups
+            // the union equals the front member's set; comb groups need the
+            // true union.
+            std::vector<WaitEvent> evs;
+            for (const uint32_t m : groups_[g]) {
+                evs.insert(evs.end(), all[m].wait_events.begin(), all[m].wait_events.end());
+            }
+            for (const auto& [s, e] : canonical(evs)) {
                 group_events_[g].push_back(WaitEvent{ static_cast<Signal>(s), static_cast<Edge>(e) });
             }
         }
@@ -7441,6 +7557,12 @@ private:
     uint32_t                            active_mask_       = 0;
     // Process indices in static-subscription order (compute_subscription_order).
     std::vector<uint32_t>               sub_order_;
+    // Blocking-write wake graph (writer -> statically-subscribed reader) and
+    // per-process membership in a nontrivial SCC (a multi-process
+    // combinational loop), both retained by compute_subscription_order for
+    // the comb-fusion pass in compute_fusion_groups.
+    std::vector<std::vector<uint32_t>>  wake_adj_;
+    std::vector<uint8_t>                scc_nontrivial_;
     // Fusion groups (compute_fusion_groups): each group lowers to one
     // coroutine. groups_[g] lists member process indices in scheduled-rank
     // order; group_of_ maps a process to its group; group_events_[g] is the

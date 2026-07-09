@@ -24,6 +24,12 @@ struct SimulationConfig {
     // bisection / debugging; semantics are identical either way (the fused
     // member order is one of the LRM-allowed same-instant orders).
     bool fuse = true;
+    // Fuse dependent combinational processes (pure, level-sensitive, read set
+    // covered by sensitivity — see comb_fuse_verdict) into rank-contiguous
+    // groups running producer-before-consumer per activation, subscribed to
+    // the union sensitivity (see docs/design/comb-fusion.md for the LRM as-if
+    // argument). Disable for bisection / debugging. Requires `fuse`.
+    bool comb_fuse = true;
     // Lower a suspension-free always-process (no #delay / intra-body wait / task
     // call, and no blocking write to its own sensitivity) to a plain thunk
     // called once per activation instead of an LLVM coroutine — eliding the
