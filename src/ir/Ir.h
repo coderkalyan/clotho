@@ -778,6 +778,36 @@ struct Inst {
         // the target type's width (payload: op_type — op is the string, type the
         // target packed type).
         StrToPacked,
+        // s.atoi() / s.atohex() / s.atooct() / s.atobin() -> 32-bit signed
+        // `integer` (LRM 6.16.9: the declared type is 4-state, though the
+        // conversion itself never yields x — it scans leading digits, and '_'
+        // separators, of the given base and stops at the first other character
+        // or end of string; 0 if none matched. No leading whitespace or sign
+        // handling, and overflow truncates silently (payload: unary — the
+        // source string).
+        StrAtoi,
+        StrAtohex,
+        StrAtooct,
+        StrAtobin,
+        // s.atoreal() -> real (LRM 6.16.10): parses a real-literal-like prefix,
+        // stopping at the first non-conforming character; 0.0 if none matched.
+        // Unlike the atoi family, leading whitespace and an optional '+' are
+        // consumed first (payload: unary).
+        StrAtoreal,
+        // s.itoa(i) / s.hextoa(i) / s.octtoa(i) / s.bintoa(i): format `i` (a
+        // 4-state `integer`; x/z bits read as 0, the same must-plane
+        // simplification as StrFromPacked) into the string lvalue as sign +
+        // magnitude in the given base, lowercase digits (LRM 6.16.11-6.16.14;
+        // payload: binary — l is the string lvalue, like Store's lhs, r is the
+        // integer value).
+        StrItoa,
+        StrHextoa,
+        StrOctoa,
+        StrBintoa,
+        // s.realtoa(r): format `r` into the string lvalue at full round-trip
+        // precision (LRM 6.16.15; payload: binary — l the string lvalue, r the
+        // real value).
+        StrRealtoa,
 
         // -- System tasks --
         // $display / $write / $fdisplay / $fwrite: format string + variadic args,

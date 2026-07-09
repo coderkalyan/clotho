@@ -179,6 +179,26 @@ const char* tag_name(Inst::Tag tag) {
             return "str_from_packed";
         case T::StrToPacked:
             return "str_to_packed";
+        case T::StrAtoi:
+            return "str_atoi";
+        case T::StrAtohex:
+            return "str_atohex";
+        case T::StrAtooct:
+            return "str_atooct";
+        case T::StrAtobin:
+            return "str_atobin";
+        case T::StrAtoreal:
+            return "str_atoreal";
+        case T::StrItoa:
+            return "str_itoa";
+        case T::StrHextoa:
+            return "str_hextoa";
+        case T::StrOctoa:
+            return "str_octtoa";
+        case T::StrBintoa:
+            return "str_bintoa";
+        case T::StrRealtoa:
+            return "str_realtoa";
         case T::Display:
             return "display";
         case T::Finish:

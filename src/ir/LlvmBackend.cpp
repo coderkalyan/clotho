@@ -4544,6 +4544,36 @@ private:
     llvm::FunctionCallee str_to_packed_fn() {
         return rt_fn("rt_string_to_packed", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
     }
+    llvm::FunctionCallee str_atoi_fn() {
+        return rt_fn("rt_string_atoi", b_.getInt32Ty(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_atohex_fn() {
+        return rt_fn("rt_string_atohex", b_.getInt32Ty(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_atooct_fn() {
+        return rt_fn("rt_string_atooct", b_.getInt32Ty(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_atobin_fn() {
+        return rt_fn("rt_string_atobin", b_.getInt32Ty(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_atoreal_fn() {
+        return rt_fn("rt_string_atoreal", b_.getDoubleTy(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee str_itoa_fn() {
+        return rt_fn("rt_string_itoa", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_hextoa_fn() {
+        return rt_fn("rt_string_hextoa", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_octtoa_fn() {
+        return rt_fn("rt_string_octtoa", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_bintoa_fn() {
+        return rt_fn("rt_string_bintoa", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee str_realtoa_fn() {
+        return rt_fn("rt_string_realtoa", b_.getVoidTy(), { raw_ptr_ty(), b_.getDoubleTy() });
+    }
 
     // Timing wheel (rt_wheel_*); the ptr parameter is the rt_wheel.
     llvm::FunctionCallee wheel_init_fn() {
@@ -4957,6 +4987,22 @@ private:
             case Inst::Tag::StrToPacked:
                 return from_ref(p.op_type.type);
             case Inst::Tag::StrPutc:
+                return { 0, false, false };
+            case Inst::Tag::StrAtoi:
+            case Inst::Tag::StrAtohex:
+            case Inst::Tag::StrAtooct:
+            case Inst::Tag::StrAtobin:
+                // LRM 6.16.9: declared return type `integer` (4-state), though
+                // the conversion itself is always definite — no x/z is
+                // reachable from a string's bytes.
+                return { 32, true, true };
+            case Inst::Tag::StrAtoreal:
+                return { 64, false, true, false, true };
+            case Inst::Tag::StrItoa:
+            case Inst::Tag::StrHextoa:
+            case Inst::Tag::StrOctoa:
+            case Inst::Tag::StrBintoa:
+            case Inst::Tag::StrRealtoa:
                 return { 0, false, false };
 
             case Inst::Tag::Store:
@@ -5503,6 +5549,47 @@ private:
                   cast(must_of(value_of(sp.index)), 32, type_of(sp.index).is_signed);
                 llvm::Value* ch = cast(must_of(value_of(sp.ch)), 32, false);
                 b_.CreateCall(str_putc_fn(), { lv_string_ptr(lv), idx, ch });
+                return;
+            }
+            case Inst::Tag::StrAtoi:
+            case Inst::Tag::StrAtohex:
+            case Inst::Tag::StrAtooct:
+            case Inst::Tag::StrAtobin: {
+                using T          = Inst::Tag;
+                const T tag      = ir_->tag(i);
+                auto    fn       = tag == T::StrAtoi    ? str_atoi_fn()
+                                  : tag == T::StrAtohex ? str_atohex_fn()
+                                  : tag == T::StrAtooct ? str_atooct_fn()
+                                                        : str_atobin_fn();
+                llvm::Value* v = b_.CreateCall(fn, { str_of(p.unary) });
+                set_value(i, packed(v, v, zero(32)));
+                return;
+            }
+            case Inst::Tag::StrAtoreal: {
+                llvm::Value* v = b_.CreateCall(str_atoreal_fn(), { str_of(p.unary) });
+                set_value(i, real_plane(v));
+                return;
+            }
+            case Inst::Tag::StrItoa:
+            case Inst::Tag::StrHextoa:
+            case Inst::Tag::StrOctoa:
+            case Inst::Tag::StrBintoa: {
+                using T          = Inst::Tag;
+                const T tag      = ir_->tag(i);
+                auto    fn       = tag == T::StrItoa      ? str_itoa_fn()
+                                  : tag == T::StrHextoa   ? str_hextoa_fn()
+                                  : tag == T::StrOctoa    ? str_octtoa_fn()
+                                                          : str_bintoa_fn();
+                const LValue& lv = lvalue_of(p.binary.l);
+                llvm::Value*  v =
+                  cast(must_of(value_of(p.binary.r)), 32, type_of(p.binary.r).is_signed);
+                b_.CreateCall(fn, { lv_string_ptr(lv), v });
+                return;
+            }
+            case Inst::Tag::StrRealtoa: {
+                const LValue& lv = lvalue_of(p.binary.l);
+                llvm::Value*  v  = fp_of(value_of(p.binary.r));
+                b_.CreateCall(str_realtoa_fn(), { lv_string_ptr(lv), v });
                 return;
             }
             case Inst::Tag::StrCmp:

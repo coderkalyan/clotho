@@ -6,6 +6,7 @@ cases/*/design.sv
 !cases/str_append/design.sv
 !cases/nba_arr/design.sv
 !cases/wide_mul/design.sv
+!cases/str_numeric/design.sv
 # Per-run results; only baseline.json and oracles.json are checked in.
 results.json
 # Oracle tool build artifacts (runs execute in the case directory).

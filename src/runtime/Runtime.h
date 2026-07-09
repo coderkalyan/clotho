@@ -335,6 +335,35 @@ void rt_string_from_packed(rt_string* dst, const uint8_t* val, uint32_t width_bi
 // (LRM §6.16).
 void rt_string_to_packed(const rt_string* s, uint8_t* out, uint32_t width_bits);
 
+// s.atoi() / s.atohex() / s.atooct() / s.atobin() (LRM §6.16.9): scan leading
+// digits and '_' separators from the start of s in the given base, stopping
+// at the first other character or end of string; 0 if no digit matched. No
+// leading whitespace or sign handling — the LRM excludes them explicitly.
+// Overflow truncates silently (wraps in unsigned 32-bit arithmetic).
+int32_t rt_string_atoi(const rt_string* s);
+int32_t rt_string_atohex(const rt_string* s);
+int32_t rt_string_atooct(const rt_string* s);
+int32_t rt_string_atobin(const rt_string* s);
+
+// s.atoreal() (LRM §6.16.10): parses a real-literal-like prefix, stopping at
+// the first non-conforming character; 0.0 if no digits matched. Unlike the
+// atoi family, leading whitespace and an optional '+' are skipped first
+// (verified against iverilog).
+double rt_string_atoreal(const rt_string* s);
+
+// dst = sign + magnitude of `i` in the given base, lowercase digits (LRM
+// §6.16.11-6.16.14; inverse of atoi/atohex/atooct/atobin). `i`'s x/z bits are
+// read as 0 by the caller before this call, the same must-plane convention as
+// StrFromPacked.
+void rt_string_itoa(rt_string* dst, int32_t i);
+void rt_string_hextoa(rt_string* dst, int32_t i);
+void rt_string_octtoa(rt_string* dst, int32_t i);
+void rt_string_bintoa(rt_string* dst, int32_t i);
+
+// dst = ASCII representation of r at full round-trip precision (LRM
+// §6.16.15; inverse of atoreal).
+void rt_string_realtoa(rt_string* dst, double r);
+
 // -- Coroutine frame allocation --
 //
 // Each process lowers to an LLVM coroutine; its frame is allocated through these
