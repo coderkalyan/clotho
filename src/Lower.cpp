@@ -2625,6 +2625,50 @@ private:
             return b.constant(svint_to_ref(members.back().value, base_ty), l);
         }
 
+        // next(N)/prev(N) (LRM 6.19.5): the Nth member after/before the current
+        // one in declaration order, wrapping. N is an optional constant (default
+        // 1); a non-member receiver yields X (matches iverilog; LRM leaves it
+        // undefined). Lowered as a branchless packed select chain over the member
+        // set — an integer select, so any base width works.
+        if (name == "next" || name == "prev") {
+            int64_t step = 1;
+            if (call.arguments().size() >= 2) {
+                slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+                slang::ast::EvalContext    ectx(actx);
+                const slang::ConstantValue cv = call.arguments()[1]->eval(ectx);
+                if (!cv.isInteger()) {
+                    // TODO: a runtime (non-constant) step needs value->index lookup
+                    // plus modular index arithmetic; rare, so reject for now.
+                    fail("enum next/prev with a non-constant step is not supported");
+                }
+                step = cv.integer().as<int64_t>().value_or(0);
+            }
+
+            const int64_t num   = static_cast<int64_t>(members.size());
+            const int64_t delta = (name == "next") ? step : -step;
+            const auto    wrap  = [num](int64_t k) { return ((k % num) + num) % num; };
+
+            const ir::Index recv = lower_expr(*call.arguments()[0], b);
+            // Default (no member matched): X of the base type (2-state base cannot
+            // hold X, so it degrades to 0 via svint_to_ref's must plane).
+            ir::Index res = b.constant(
+              svint_to_ref(et.isFourState ? slang::SVInt::createFillX(et.bitWidth, et.isSigned)
+                                          : slang::SVInt(et.bitWidth, 0, et.isSigned),
+                           base_ty),
+              l);
+            for (size_t i = members.size(); i-- > 0;) {
+                const ir::Index memberc =
+                  b.constant(svint_to_ref(members[i].value, base_ty), l);
+                const ir::Index targetc = b.constant(
+                  svint_to_ref(members[static_cast<size_t>(wrap(static_cast<int64_t>(i) + delta))].value,
+                               base_ty),
+                  l);
+                const ir::Index eq = b.binary(ir::Inst::Tag::CaseEq, recv, memberc, l);
+                res                = b.select(eq, targetc, res, l);
+            }
+            return res;
+        }
+
         fail("enum method '" + std::string(name) + "' is not supported");
     }
 

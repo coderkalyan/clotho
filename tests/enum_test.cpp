@@ -112,22 +112,32 @@ TEST_CASE("enum first / last / num") {
     CHECK(out == "num=3 first=1 last=6\n");
 }
 
+// next(N)/prev(N) (LRM 6.19.5) walk declaration order with wrap; N is an
+// optional constant step (default 1); a non-member receiver yields X. All
+// values verified vs iverilog.
+TEST_CASE("enum next / prev with wrap, step, and non-member") {
+    const std::string out = run_capture(R"(
+        module m;
+          typedef enum logic [2:0] {A=1, B=3, C=6} e_t;
+          e_t x;
+          initial begin
+            x = A; $display("%0d %0d", x.next(), x.prev());
+            x = C; $display("%0d %0d", x.next(), x.prev());
+            x = B; $display("%0d %0d", x.next(2), x.prev(2));
+            x = A; $display("%0d %0d", x.next(0), x.next(4));
+            x = e_t'(3'd2); $display("%0d", x.next());
+          end
+        endmodule
+    )");
+    CHECK(out == "3 6\n1 3\n1 6\n1 3\nx\n");
+}
+
 // -- Unsupported enum constructs fail loudly (never silently accepted) --
 
 // Enum methods (.name/.next/.prev/.first/.last/.num, LRM 6.19.2-6.19.5) are not
 // implemented; each must reject rather than silently mis-lower. slang models
 // them as system subroutines, so they hit the unsupported-system-function guard.
 TEST_CASE("enum methods are rejected") {
-    // .name() returns a string (needs %s); the others return the enum / an int.
-    for (const char* method : { "next", "prev" }) {
-        const std::string src = std::string(R"(
-            module m;
-              typedef enum {A, B} e_t;
-              e_t x;
-              initial begin x = A; $display("%0d", x.)") +
-                                method + "()); end\n endmodule\n";
-        check_rejected(src, "enum method '" + std::string(method) + "' is not supported");
-    }
     check_rejected(R"(
         module m;
           typedef enum {A, B} e_t;
@@ -136,4 +146,13 @@ TEST_CASE("enum methods are rejected") {
         endmodule
     )",
                    "enum method 'name' is not supported");
+    // A runtime (non-constant) step to next/prev is not supported.
+    check_rejected(R"(
+        module m;
+          typedef enum {A, B} e_t;
+          e_t x; int k;
+          initial begin x = A; k = 1; $display("%0d", x.next(k)); end
+        endmodule
+    )",
+                   "non-constant step");
 }
