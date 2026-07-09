@@ -2590,6 +2590,44 @@ private:
         return b.scanf(source, is_sscanf, fmt, outs, l);
     }
 
+    // An enum member in declaration order: its constant value and source name.
+    struct EnumMember {
+        slang::SVInt     value;
+        std::string_view name;
+    };
+
+    // Collect an enum type's members in declaration order (LRM 6.19: the order
+    // the methods first/last/next/prev/name walk). Every member value is a clean
+    // compile-time constant of the base type.
+    std::vector<EnumMember> enum_members(const slang::ast::EnumType& et) {
+        std::vector<EnumMember> members;
+        for (const slang::ast::EnumValueSymbol& ev : et.values()) {
+            members.push_back({ ev.getValue().integer(), ev.name });
+        }
+        return members;
+    }
+
+    // Lower an enum method (LRM 6.19.2-6.19.5). The receiver is arguments()[0].
+    ir::Index lower_enum_method(std::string_view name, const slang::ast::EnumType& et,
+                                const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
+        const std::vector<EnumMember> members = enum_members(et);
+        const ir::Ref                 base_ty = lower_type(et);
+
+        // num(): the member count (LRM 6.19.4), an int, independent of the value.
+        if (name == "num") {
+            return b.constant(module_.pool.put_int(lower_type(*call.type), members.size()), l);
+        }
+        // first()/last(): the first/last member value (LRM 6.19.5), constant.
+        if (name == "first") {
+            return b.constant(svint_to_ref(members.front().value, base_ty), l);
+        }
+        if (name == "last") {
+            return b.constant(svint_to_ref(members.back().value, base_ty), l);
+        }
+
+        fail("enum method '" + std::string(name) + "' is not supported");
+    }
+
     // Lower a system function call used as an rvalue (e.g. `$time`). User function
     // calls are not yet supported.
     ir::Index lower_sysfunc(const CallExpression& call, ir::Builder& b) {
@@ -2604,6 +2642,15 @@ private:
         if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
             is_string_expr(*call.arguments()[0])) {
             return lower_string_method(name, call, b);
+        }
+
+        // Enum methods (LRM 6.19.2-6.19.5) arrive the same way, with an enum-typed
+        // receiver as arguments()[0].
+        if (!name.empty() && name[0] != '$' && !call.arguments().empty()) {
+            const slang::ast::Type& rct = call.arguments()[0]->type->getCanonicalType();
+            if (const auto* et = rct.as_if<slang::ast::EnumType>()) {
+                return lower_enum_method(name, *et, call, b, l);
+            }
         }
 
         if (fn_ctx_ != nullptr && !fn_ctx_->is_task &&

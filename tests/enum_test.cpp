@@ -98,6 +98,20 @@ TEST_CASE("enum with signed base type and enum-typed parameter") {
     CHECK(out == "x=-2 P=3\nneg\n");
 }
 
+// first()/last()/num() (LRM 6.19.4-6.19.5) depend only on the type: the first
+// and last member values in declaration order, and the member count. Values
+// verified vs iverilog.
+TEST_CASE("enum first / last / num") {
+    const std::string out = run_capture(R"(
+        module m;
+          typedef enum logic [2:0] {RED=1, GREEN=3, BLUE=6} c_t;
+          c_t x;
+          initial $display("num=%0d first=%0d last=%0d", x.num(), x.first(), x.last());
+        endmodule
+    )");
+    CHECK(out == "num=3 first=1 last=6\n");
+}
+
 // -- Unsupported enum constructs fail loudly (never silently accepted) --
 
 // Enum methods (.name/.next/.prev/.first/.last/.num, LRM 6.19.2-6.19.5) are not
@@ -105,14 +119,14 @@ TEST_CASE("enum with signed base type and enum-typed parameter") {
 // them as system subroutines, so they hit the unsupported-system-function guard.
 TEST_CASE("enum methods are rejected") {
     // .name() returns a string (needs %s); the others return the enum / an int.
-    for (const char* method : { "next", "prev", "first", "last", "num" }) {
+    for (const char* method : { "next", "prev" }) {
         const std::string src = std::string(R"(
             module m;
               typedef enum {A, B} e_t;
               e_t x;
               initial begin x = A; $display("%0d", x.)") +
                                 method + "()); end\n endmodule\n";
-        check_rejected(src, "unsupported system function '" + std::string(method) + "'");
+        check_rejected(src, "enum method '" + std::string(method) + "' is not supported");
     }
     check_rejected(R"(
         module m;
@@ -121,5 +135,5 @@ TEST_CASE("enum methods are rejected") {
           initial begin x = A; $display("%s", x.name()); end
         endmodule
     )",
-                   "unsupported system function 'name'");
+                   "enum method 'name' is not supported");
 }
