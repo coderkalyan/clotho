@@ -2428,6 +2428,22 @@ private:
                      (unsigned long long)counts[static_cast<size_t>(CombFuse::NbaWrite)],
                      (unsigned long long)counts[static_cast<size_t>(CombFuse::UnsupportedWrite)],
                      (unsigned long long)counts[static_cast<size_t>(CombFuse::ReadOutsideSens)]);
+        if (!comb_group_sizes_.empty()) {
+            uint64_t members = 0, mx = 0;
+            for (const uint32_t s : comb_group_sizes_) {
+                members += s;
+                mx = std::max<uint64_t>(mx, s);
+            }
+            std::fprintf(stderr, "comb-fuse: %zu comb groups, %llu members (max %llu): ",
+                         comb_group_sizes_.size(), (unsigned long long)members,
+                         (unsigned long long)mx);
+            std::vector<uint32_t> sorted(comb_group_sizes_.begin(), comb_group_sizes_.end());
+            std::sort(sorted.rbegin(), sorted.rend());
+            for (size_t i = 0; i < sorted.size() && i < 24; ++i) {
+                std::fprintf(stderr, "%u ", sorted[i]);
+            }
+            std::fprintf(stderr, "%s\n", sorted.size() > 24 ? "..." : "");
+        }
     }
 
     // V1 static process fusion: partition processes into groups that lower to a
@@ -2550,6 +2566,7 @@ private:
                 }
             }
             bool merged = false;
+            comb_group_sizes_.clear();
             for (const auto& c : comp) {
                 for (size_t off = 0; off + 1 < c.size(); off += group_cap) {
                     const size_t end = std::min(c.size(), off + group_cap);
@@ -2564,6 +2581,7 @@ private:
                         group_of_[m] = g0;
                         merged       = true;
                     }
+                    comb_group_sizes_.push_back(static_cast<uint32_t>(end - off));
                 }
             }
             // Compact the emptied singleton slots.
@@ -7563,6 +7581,9 @@ private:
     // the comb-fusion pass in compute_fusion_groups.
     std::vector<std::vector<uint32_t>>  wake_adj_;
     std::vector<uint8_t>                scc_nontrivial_;
+    // Sizes of the groups the comb-fusion pass formed (measurement only, for
+    // the CLOTHO_COMB_FUSE_STAT probe).
+    std::vector<uint32_t>               comb_group_sizes_;
     // Fusion groups (compute_fusion_groups): each group lowers to one
     // coroutine. groups_[g] lists member process indices in scheduled-rank
     // order; group_of_ maps a process to its group; group_events_[g] is the
