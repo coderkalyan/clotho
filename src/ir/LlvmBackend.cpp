@@ -946,9 +946,19 @@ private:
               domain_ctr_ty_, domain_ctr_gv_, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(g) });
             llvm::Value* ctr = b_.CreateLoad(b_.getInt32Ty(), cp);
             b_.CreateCondBr(b_.CreateICmpEQ(ctr, b_.getInt32(0)), fast_bb, gen_bb);
+            const auto bump = [&](llvm::GlobalVariable* gv) {
+                if (!dom_debug_) {
+                    return;
+                }
+                auto* p = llvm::ConstantExpr::getInBoundsGetElementPtr(
+                  dom_cnt_ty_, gv, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(g) });
+                b_.CreateStore(b_.CreateAdd(b_.CreateLoad(b_.getInt64Ty(), p), b_.getInt64(1)), p);
+            };
             b_.SetInsertPoint(gen_bb);
+            bump(dom_ngen_gv_);
             lower_bodies();
             b_.SetInsertPoint(fast_bb);
+            bump(dom_nfast_gv_);
             assume_clean_ = true;
             lower_bodies();
             assume_clean_ = false;
@@ -2360,10 +2370,68 @@ private:
     //  - strings (separate value machinery, no need to prove it x-safe);
     //  - constants carrying x/z bits (their must-plane projection would lose
     //    the x/z, e.g. casez wildcard patterns).
-    bool spec_eligible_body(const Ir& ir) const {
+    // Debug companion of spec_eligible_body: the numeric Inst::Tag of the
+    // first rejecting instruction, or -1. Kept trivially in sync by calling
+    // the same predicate per single-instruction window.
+    int spec_first_reject(const Ir& ir) {
         for (size_t k = 0; k < ir.inst_count(); ++k) {
-            const auto           idx = static_cast<Index>(k);
-            const Inst::Payload& p   = ir.payload(idx);
+            if (!spec_inst_ok(ir, static_cast<Index>(k))) {
+                return static_cast<int>(ir.tag(static_cast<Index>(k)));
+            }
+        }
+        return -1;
+    }
+
+    bool spec_eligible_body(const Ir& ir) {
+        for (size_t k = 0; k < ir.inst_count(); ++k) {
+            if (!spec_inst_ok(ir, static_cast<Index>(k))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // The tightest provable bound (in bits) on a select index value: the
+    // lowering zero-extends the index's must bits, so its width bounds it by
+    // 2^w - 1 — but the frontend resizes every index to 32 bits first, so
+    // peel widening Resizes of unsigned sources back to the true source
+    // width (a zext preserves the bound; a sext of a signed source can turn
+    // a negative into a huge zext'd index, so peeling stops there).
+    uint32_t spec_index_bound_width(const Ir& ir, Index idx) {
+        uint32_t w = type_of(idx).width;
+        while (ir.tag(idx) == Inst::Tag::Resize) {
+            const Index   src = ir.payload(idx).op_type.op;
+            const ValType st  = type_of(src);
+            if (st.is_signed && type_of(idx).width > st.width) {
+                break;
+            }
+            w   = std::min(w, st.width);
+            idx = src;
+        }
+        // A constant index (e.g. a localparam, typed 32-bit) is bounded by its
+        // actual value's bit length. Its x/z-freedom was already established:
+        // the eligibility scan visits operands before users (flat store is in
+        // creation order) and rejects any x/z-carrying constant outright.
+        if (ir.tag(idx) == Inst::Tag::Constant) {
+            const Ref                      ref   = ir.payload(idx).ref;
+            const Value&                   v     = std::get<Value>(mod_.pool.get(ref));
+            const std::span<const uint8_t> bytes = mod_.pool.bytes(ref);
+            const uint32_t                 pb    = plane_bytes(mod_.pool.layout(v.type).width);
+            uint32_t                       bits  = 0;
+            for (uint32_t bi = 0; bi < pb && bi < bytes.size(); ++bi) {
+                if (bytes[bi] != 0) {
+                    bits = 8 * bi + (32 - static_cast<uint32_t>(std::countl_zero(uint32_t{ bytes[bi] })));
+                }
+            }
+            w = std::min(w, bits);
+        }
+        return w;
+    }
+
+    // One instruction of the eligibility scan (see spec_eligible_body).
+    bool spec_inst_ok(const Ir& ir, Index idx) {
+        {
+            const Inst::Payload& p = ir.payload(idx);
             switch (ir.tag(idx)) {
                 case Inst::Tag::Constant: {
                     const Value& v = std::get<Value>(mod_.pool.get(p.ref));
@@ -2388,6 +2456,30 @@ private:
                         return false;
                     }
                     break;
+                }
+                // A dynamic bit/part select is admitted when it provably cannot
+                // go out of range: the lowering zero-extends the index's must
+                // bits (lower_inst BitSelect/DynPartSelect), so a w-bit index is
+                // bounded by 2^w - 1 regardless of signedness, and a fast-body
+                // index is clean by construction — in range, the 2-state select
+                // equals the 4-state one exactly. Anything wider falls back to
+                // generic (an out-of-range read is x in 4-state, 0 in 2-state).
+                case Inst::Tag::BitSelect: {
+                    const ValType  base = type_of(p.binary.l);
+                    const uint32_t iw   = spec_index_bound_width(ir, p.binary.r);
+                    if (iw < 32 && (1u << iw) <= base.width) {
+                        break;
+                    }
+                    return false;
+                }
+                case Inst::Tag::DynPartSelect: {
+                    const auto     dps  = ir.extra_data<DynPartSelect>(p.op_extra.extra);
+                    const ValType  base = type_of(p.op_extra.op);
+                    const uint32_t ow   = spec_index_bound_width(ir, dps.offset);
+                    if (ow < 32 && (1u << ow) - 1 + dps.width <= base.width) {
+                        break;
+                    }
+                    return false;
                 }
                 // NOTE: PartSelect is the constant [msb:lsb] form; slang rejects
                 // an out-of-range constant select of a packed type, so it cannot
@@ -2496,6 +2588,7 @@ private:
         if (!config_.domain_spec) {
             return;
         }
+        dom_debug_ = getenv("CLOTHO_DOM_DEBUG") != nullptr;
 
         std::vector<uint32_t> ctr_init(ngroups, 0);
         for (uint32_t g = 0; g < ngroups; ++g) {
@@ -2506,7 +2599,16 @@ private:
             std::vector<uint32_t> reads;
             for (const uint32_t m : groups_[g]) {
                 const Ir& ir = all[m].ir;
+                // The eligibility scan queries operand types (bounded-select
+                // proofs), so bind the member like select_member does; lowering
+                // re-binds later. assume_clean_ is off here — real domains.
+                ir_ = &ir;
+                types_.assign(ir.inst_count(), std::optional<ValType>{});
                 if (!spec_eligible_body(ir)) {
+                    if (dom_debug_) {
+                        fprintf(stderr, "DOM reject g=%u proc=%u insts=%zu first_bad=%d\n", g, m,
+                                ir.inst_count(), spec_first_reject(ir));
+                    }
                     ok = false;
                     break;
                 }
@@ -2572,8 +2674,19 @@ private:
                 }
             }
             const uint32_t min_ops = config_.domain_spec_min_ops;
-            if (min_ops != 0 && (n_compute < min_ops || n_compute < 8 * n_stores)) {
+            if (!dom_debug_ && min_ops != 0 && (n_compute < min_ops || n_compute < 8 * n_stores)) {
                 continue;
+            }
+            if (dom_debug_) {
+                fprintf(stderr, "DOM group g=%u procs=[", g);
+                for (const uint32_t m : groups_[g]) {
+                    fprintf(stderr, "%u ", m);
+                }
+                fprintf(stderr, "] compute=%u stores=%u reads=[", n_compute, n_stores);
+                for (const uint32_t si : reads) {
+                    fprintf(stderr, "%u:%s ", si, mod_.signals()[si].name.c_str());
+                }
+                fprintf(stderr, "]\n");
             }
             spec_group_[g] = true;
             ctr_init[g]    = static_cast<uint32_t>(reads.size());
@@ -2609,6 +2722,26 @@ private:
                                                   llvm::GlobalValue::InternalLinkage,
                                                   llvm::ConstantArray::get(domain_ctr_ty_, ctrs),
                                                   "clotho.domain_ctr");
+        if (dom_debug_) {
+            auto* i64 = llvm::Type::getInt64Ty(ctx_);
+            dom_cnt_ty_  = llvm::ArrayType::get(i64, std::max<uint32_t>(ngroups, 1));
+            dom_nfast_gv_ = new llvm::GlobalVariable(llmod_, dom_cnt_ty_, false,
+                                                     llvm::GlobalValue::ExternalLinkage,
+                                                     llvm::ConstantAggregateZero::get(dom_cnt_ty_),
+                                                     "clotho.dom_nfast");
+            dom_ngen_gv_ = new llvm::GlobalVariable(llmod_, dom_cnt_ty_, false,
+                                                    llvm::GlobalValue::ExternalLinkage,
+                                                    llvm::ConstantAggregateZero::get(dom_cnt_ty_),
+                                                    "clotho.dom_ngen");
+            auto* i32t = llvm::Type::getInt32Ty(ctx_);
+            new llvm::GlobalVariable(llmod_, i32t, true, llvm::GlobalValue::ExternalLinkage,
+                                     llvm::ConstantInt::get(i32t, ngroups), "clotho.dom_ngroups");
+            new llvm::GlobalVariable(llmod_, i32t, true, llvm::GlobalValue::ExternalLinkage,
+                                     llvm::ConstantInt::get(i32t, nsig), "clotho.dom_nsig");
+            domain_tag_gv_->setLinkage(llvm::GlobalValue::ExternalLinkage);
+            domain_flips_gv_->setLinkage(llvm::GlobalValue::ExternalLinkage);
+            domain_ctr_gv_->setLinkage(llvm::GlobalValue::ExternalLinkage);
+        }
         for (uint32_t si = 0; si < nsig; ++si) {
             if (sig_dep_groups_[si].empty()) {
                 continue;
@@ -7828,6 +7961,15 @@ private:
     // transition adjusts. assume_clean_ flips type_of/from_ref to report
     // 4-state as 2-state while the fast body lowers.
     bool                                assume_clean_ = false;
+    // CLOTHO_DOM_DEBUG: bypass the profitability gate, export the tracking
+    // globals, count fast/generic dispatches per group (clotho.dom_nfast /
+    // dom_ngen), and dump the tracked read sets to stderr — run_jit prints the
+    // runtime side after the sim (Jit.cpp). Diagnosis only; zero cost when
+    // the env var is unset (checked at compile time).
+    bool                                dom_debug_ = false;
+    llvm::GlobalVariable*               dom_nfast_gv_ = nullptr;
+    llvm::GlobalVariable*               dom_ngen_gv_  = nullptr;
+    llvm::ArrayType*                    dom_cnt_ty_   = nullptr;
     std::vector<bool>                   spec_group_;
     std::vector<bool>                   tracked_;
     std::vector<std::vector<uint32_t>>  sig_dep_groups_;

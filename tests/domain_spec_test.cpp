@@ -221,6 +221,42 @@ TEST_CASE("flap pin: a signal oscillating between domains stays correct") {
            "xx\n0d\nxx\n");
 }
 
+TEST_CASE("provably in-range dynamic bit-select stays eligible and exact") {
+    // A 3-bit index zero-extends to at most 7 < 8 = base width, so the select
+    // can never read the out-of-range x that separates the domains; the fast
+    // body may keep it (iverilog: xx / 03 / 08).
+    run_ab(R"(
+        module top;
+          reg [7:0] a;
+          reg [2:0] i;
+          reg clk = 0;
+          reg [7:0] y = 0;
+          always @(posedge clk) y = {7'b0, a[i]} + {5'b0, i};
+          initial begin
+            #1 clk = 1; #1 clk = 0;
+            $display("%h", y);
+            a = 8'hA5; i = 3'd2;
+            #1 clk = 1; #1 clk = 0;
+            $display("%h", y);
+            i = 3'd7;
+            #1 clk = 1; #1 clk = 0;
+            $display("%h", y);
+            $finish(0);
+          end
+        endmodule
+    )",
+           "xx\n03\n08\n");
+    // The bounded form specializes; the 8-bit-index form (256 > 8) cannot.
+    const std::string ok = emit_raw(R"(
+        module top;
+          reg [7:0] a; reg [2:0] i; reg clk = 0; reg [7:0] y = 0;
+          always @(posedge clk) y = {7'd0, a[i]};
+          initial begin #1 clk = 1; $finish(0); end
+        endmodule
+    )");
+    CHECK(ok.find("dom.fast") != std::string::npos);
+}
+
 TEST_CASE("dispatch structure: fast body forms only for eligible groups") {
     // Eligible: plain arithmetic on 4-state scalars.
     const std::string ok = emit_raw(R"(
@@ -253,10 +289,12 @@ TEST_CASE("dispatch structure: fast body forms only for eligible groups") {
     )");
     CHECK(csz.find("dom.fast") == std::string::npos);
 
-    // A dynamic bit-select can read x out of range — ineligible.
+    // A dynamic bit-select whose index range exceeds the base can read x out
+    // of range — ineligible (the in-range 3-bit form is admitted; see the
+    // bounded-select test).
     const std::string bsel = emit_raw(R"(
         module top;
-          reg [7:0] a; reg [2:0] i; reg clk = 0; reg [7:0] y = 0;
+          reg [7:0] a; reg [7:0] i; reg clk = 0; reg [7:0] y = 0;
           always @(posedge clk) y = {7'd0, a[i]};
           initial begin #1 clk = 1; $finish(0); end
         endmodule

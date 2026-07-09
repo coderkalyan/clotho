@@ -222,6 +222,37 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config) {
     if (timings != nullptr) {
         timings->sim_ms += ms_since(t_sim);
     }
+    // CLOTHO_DOM_DEBUG: dump the domain-specialization runtime state the
+    // backend exported (see compute_domain_spec) — per-group fast/generic
+    // dispatch counts and final counters, plus per-signal tag/flip bytes.
+    // Pairs with the backend's compile-time stderr dump of the read sets.
+    if (getenv("CLOTHO_DOM_DEBUG") != nullptr) {
+        const auto addr = [&](const char* name) -> void* {
+            auto s = (*jit)->lookup(name);
+            return s ? s->toPtr<void*>() : nullptr;
+        };
+        const auto* ng    = static_cast<const uint32_t*>(addr("clotho.dom_ngroups"));
+        const auto* ns    = static_cast<const uint32_t*>(addr("clotho.dom_nsig"));
+        const auto* nfast = static_cast<const uint64_t*>(addr("clotho.dom_nfast"));
+        const auto* ngen  = static_cast<const uint64_t*>(addr("clotho.dom_ngen"));
+        const auto* ctr   = static_cast<const int32_t*>(addr("clotho.domain_ctr"));
+        const auto* tag   = static_cast<const uint8_t*>(addr("clotho.domain_tag"));
+        const auto* flip  = static_cast<const uint8_t*>(addr("clotho.domain_flips"));
+        if (ng && ns && nfast && ngen && ctr && tag && flip) {
+            for (uint32_t g = 0; g < *ng; ++g) {
+                if (nfast[g] + ngen[g] > 0 || ctr[g] != 0) {
+                    fprintf(stderr, "DOM run g=%u fast=%llu gen=%llu ctr_end=%d\n", g,
+                            static_cast<unsigned long long>(nfast[g]),
+                            static_cast<unsigned long long>(ngen[g]), ctr[g]);
+                }
+            }
+            for (uint32_t i = 0; i < *ns; ++i) {
+                if (tag[i] != 0 || flip[i] != 0) {
+                    fprintf(stderr, "DOM sig s=%u tag=%u flips=%u\n", i, tag[i], flip[i]);
+                }
+            }
+        }
+    }
     return rc;
 }
 
