@@ -2590,6 +2590,83 @@ private:
         return b.scanf(source, is_sscanf, fmt, outs, l);
     }
 
+    // Classify a $countbits control-bit argument (LRM 20.9): a constant 1-bit
+    // value naming which 4-state value that control tallies. A non-constant
+    // control is rejected (it would need a runtime class-mask select).
+    uint32_t count_control_class(const Expression& ctrl) {
+        slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+        slang::ast::EvalContext    ectx(actx);
+        const slang::ConstantValue cv = ctrl.eval(ectx);
+        if (!cv.isInteger()) {
+            fail("$countbits control bit must be a constant 0/1/x/z");
+        }
+        const slang::logic_t bit = cv.integer()[0];
+        if (bit.value == slang::logic_t::X_VALUE) {
+            return ir::CountX;
+        }
+        if (bit.value == slang::logic_t::Z_VALUE) {
+            return ir::CountZ;
+        }
+        return bit.value != 0 ? ir::CountOne : ir::CountZero;
+    }
+
+    // Runtime lowering for the utility bit-query functions (LRM 20.9; $bits on a
+    // dynamic string per 20.6.2) when the operand is not constant. A constant
+    // operand folds in slang and never reaches here.
+    ir::Index lower_bit_query(std::string_view name, const CallExpression& call, ir::Builder& b,
+                              const ir::SourceLoc l) {
+        const auto    args = call.arguments();
+        const ir::Ref i32  = make_int_type(32, false, true);
+
+        // $bits: the only non-constant operand Clotho stores is a dynamic
+        // string, whose bit count is 8 per current character (LRM 6.16, 20.6.2).
+        // A fixed-size operand would have const-folded above; any other dynamic
+        // type (queue / dynamic array / class handle) is unsupported storage.
+        if (name == "$bits") {
+            if (args.size() != 1 || !is_string_expr(*args[0])) {
+                fail("$bits of a non-constant, non-string operand is not supported");
+            }
+            const ir::Index len   = b.unary(ir::Inst::Tag::StrLen, lower_expr(*args[0], b), l);
+            const ir::Index eight = b.constant(module_.pool.put_int(i32, 8), l);
+            return b.resize(b.binary(ir::Inst::Tag::Mul, len, eight, l), lower_type(*call.type), l);
+        }
+
+        // The 20.9 counting family. The first argument is the counted value;
+        // $countbits additionally carries constant control-bit arguments naming
+        // which 4-state values to tally.
+        const ir::Index val = lower_expr(*args[0], b);
+
+        uint32_t mask = ir::CountOne; // $countones / $onehot* count definite-1 bits
+        if (name == "$isunknown") {
+            mask = ir::CountX | ir::CountZ;
+        }
+        else if (name == "$countbits") {
+            mask = 0;
+            for (size_t k = 1; k < args.size(); ++k) {
+                mask |= count_control_class(*args[k]);
+            }
+        }
+
+        const ir::Index count = b.count_bits(val, mask, l);
+
+        if (name == "$countones" || name == "$countbits") {
+            return b.resize(count, lower_type(*call.type), l);
+        }
+        // $onehot -> count == 1; $onehot0 -> count <= 1; $isunknown -> count != 0.
+        ir::Inst::Tag   op  = ir::Inst::Tag::Ne;
+        uint64_t        rhs = 0;
+        if (name == "$onehot") {
+            op  = ir::Inst::Tag::Eq;
+            rhs = 1;
+        }
+        else if (name == "$onehot0") {
+            op  = ir::Inst::Tag::Le;
+            rhs = 1;
+        }
+        return b.resize(b.binary(op, count, b.constant(module_.pool.put_int(i32, rhs), l), l),
+                        lower_type(*call.type), l);
+    }
+
     // Lower a system function call used as an rvalue (e.g. `$time`). User function
     // calls are not yet supported.
     ir::Index lower_sysfunc(const CallExpression& call, ir::Builder& b) {
@@ -2674,6 +2751,38 @@ private:
             // (Clog2). The argument is self-determined and treated as unsigned
             // (LRM §20.8.1); its own width bounds the result.
             return b.unary(ir::Inst::Tag::Clog2, lower_expr(*call.arguments()[0], b), l);
+        }
+
+        // Utility query / bit-counting system functions (LRM 20.6, 20.9). Each
+        // is a compile-time constant for a fixed-size operand: slang's constant
+        // evaluator folds $bits / $countones / $countbits / $onehot / $onehot0 /
+        // $isunknown to a literal (e.g. $bits queries the operand's type, never
+        // its value), so the common constant-arg usage costs nothing at
+        // runtime. Only a non-constant (runtime signal / dynamic string)
+        // argument reaches the IR lowering.
+        if (name == "$bits" || name == "$countones" || name == "$countbits" || name == "$onehot" ||
+            name == "$onehot0" || name == "$isunknown") {
+            slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+            slang::ast::EvalContext    ectx(actx);
+            const slang::ConstantValue cv = call.eval(ectx);
+            if (cv.isInteger()) {
+                return b.constant(svint_to_ref(cv.integer(), lower_type(*call.type)), l);
+            }
+            return lower_bit_query(name, call, b, l);
+        }
+
+        // TODO: $typename (LRM 20.6.1). slang folds it to a string, but its type
+        // printer omits the space the LRM mandates between a keyword and its
+        // packed range — slang yields "logic[7:0]" where LRM 20.6.1(h) and its
+        // own example require "logic [7:0]" (while unpacked dimensions such as
+        // "$[0:9]" take no space). Emitting slang's string directly would be a
+        // silently non-compliant type name, which matters because $typename is
+        // defined for exact string comparison. Reproducing the LRM format across
+        // simple / struct / enum / unpacked / package-qualified forms needs a
+        // dedicated formatter; rejected loudly until then.
+        if (name == "$typename") {
+            fail("$typename is not supported (slang's type-name format deviates "
+                 "from LRM 20.6.1 whitespace rules)");
         }
 
         // $fopen (LRM §21.3): one argument opens a multichannel descriptor (MCD)

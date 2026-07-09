@@ -363,6 +363,8 @@ struct Analysis {
                 // Ctz / Clz count the must plane -> a definite bit index, z = 0.
                 case Inst::Tag::Ctz:
                 case Inst::Tag::Clz:
+                // $countbits family: a definite 2-state count, z = 0.
+                case Inst::Tag::CountBits:
                 // String values carry no bit planes and the integral string ops
                 // (len / getc / cmp / to_packed) always produce known bits.
                 case Inst::Tag::StrLen:

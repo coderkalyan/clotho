@@ -2304,6 +2304,7 @@ private:
                 case Inst::Tag::RedXor:
                 case Inst::Tag::Ctz:
                 case Inst::Tag::Clz:
+                case Inst::Tag::CountBits:
                 case Inst::Tag::Sll:
                 case Inst::Tag::Srl:
                 case Inst::Tag::Sra:
@@ -3975,6 +3976,11 @@ private:
             case Inst::Tag::Clz:
                 // A definite 2-state 32-bit bit index (counts of the must plane).
                 return { 32, false, false };
+            case Inst::Tag::CountBits:
+                // $countbits family: a definite 2-state 32-bit signed `int`
+                // (LRM 20.9 return type). Never X — it counts, it does not
+                // propagate.
+                return { 32, false, true };
             case Inst::Tag::Fopen:
                 // $fopen returns a 32-bit descriptor integer.
                 return { 32, false, true };
@@ -4457,6 +4463,12 @@ private:
             case Inst::Tag::Ctz:
             case Inst::Tag::Clz:
                 set_value(i, lower_bit_index(ir_->tag(i), value_of(p.unary)));
+                return;
+
+            case Inst::Tag::CountBits:
+                set_value(i,
+                          lower_count_bits(value_of(p.op_extra.op),
+                                           ir_->extra_data<CountBitsInfo>(p.op_extra.extra).mask));
                 return;
 
             case Inst::Tag::Sll:
@@ -6904,6 +6916,36 @@ private:
             idx = b_.CreateSelect(b_.CreateICmpEQ(val, zero(w)), llvm::ConstantInt::get(int_ty(w), w), hb);
         }
         return two_val(cast(idx, 32, false));
+    }
+
+    // $countbits / $countones / $onehot* / $isunknown (LRM 20.9): count the
+    // operand bits whose 4-state value is selected by `mask` (a CountBitsClass
+    // OR-mask). Per-bit codes from the planes: definite 1 = must; definite 0 =
+    // ~may; unknown = may & ~must; z = unknown & z-plane; x = unknown & ~z. The
+    // selected classes (disjoint per bit) OR together, then popcount. The result
+    // is definite (2-state) — counting never propagates X.
+    Plane lower_count_bits(Plane a, uint32_t mask) {
+        a = to_four(a);
+        const uint32_t w       = width_of(a);
+        llvm::Value*   m       = must_of(a);
+        llvm::Value*   M       = may_of(a);
+        llvm::Value*   z       = z_of(a);
+        llvm::Value*   unknown = b_.CreateAnd(M, b_.CreateNot(m));
+        llvm::Value*   sel     = zero(w);
+        if (mask & CountZero) {
+            sel = b_.CreateOr(sel, b_.CreateNot(M));
+        }
+        if (mask & CountOne) {
+            sel = b_.CreateOr(sel, m);
+        }
+        if (mask & CountX) {
+            sel = b_.CreateOr(sel, b_.CreateAnd(unknown, b_.CreateNot(z)));
+        }
+        if (mask & CountZ) {
+            sel = b_.CreateOr(sel, b_.CreateAnd(unknown, z));
+        }
+        llvm::Value* pop = b_.CreateUnaryIntrinsic(llvm::Intrinsic::ctpop, sel);
+        return two_val(cast(pop, 32, false));
     }
 
     Plane lower_clog2(Plane a) {

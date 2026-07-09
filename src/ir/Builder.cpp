@@ -171,6 +171,12 @@ Index Builder::str_to_packed(Index str, Ref type, SourceLoc loc) {
     return emit({ Inst::Tag::StrToPacked, Inst::Payload{ .op_type = { str, type } } }, loc);
 }
 
+Index Builder::count_bits(Index op, uint32_t mask, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(CountBitsInfo{ mask });
+
+    return emit({ Inst::Tag::CountBits, Inst::Payload{ .op_extra = { op, extra } } }, loc);
+}
+
 Index Builder::wait(std::span<const WaitEdge> events, SourceLoc loc) {
     // Pack the WaitEdge records back-to-back, then a WaitInfo pointing at the run.
     const auto start = static_cast<uint32_t>(extra_.size());

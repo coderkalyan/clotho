@@ -219,6 +219,8 @@ const char* tag_name(Inst::Tag tag) {
             return "random";
         case T::Clog2:
             return "clog2";
+        case T::CountBits:
+            return "count_bits";
         case T::Ctz:
             return "ctz";
         case T::Clz:
