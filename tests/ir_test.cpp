@@ -48,6 +48,61 @@ TEST_CASE("intern pool deduplicates types in one Ref space") {
     CHECK(std::get<Type>(pool.get(vec(false))).left == 7);
 }
 
+TEST_CASE("a packed struct's field table participates in interning") {
+    InternPool pool;
+
+    // struct packed { logic [3:0] a; bit [7:0] b; } — a at the MSB (LRM 7.2.1).
+    const uint32_t fields_a = pool.intern_struct_fields({
+      { "a", pool.put(Type{ .kind = Type::Kind::PackedArray, .element = pool.logic_type, .left = 3, .right = 0 }), 8 },
+      { "b", pool.put(Type{ .kind = Type::Kind::PackedArray, .element = pool.bit_type, .left = 7, .right = 0 }), 0 },
+    });
+    Type s;
+    s.kind      = Type::Kind::Struct;
+    s.is_packed = true;
+    s.element   = pool.logic_type; // any field is 4-state -> whole struct is
+    s.left      = 11;
+    s.right     = 0;
+    s.fields_id = fields_a;
+
+    const Ref r1 = pool.put(Item{ s });
+    const Ref r2 = pool.put(Item{ s }); // identical Type value -> same fields_id
+    CHECK(r1 == r2);
+
+    const Layout lay = pool.layout(r1);
+    CHECK(lay.domain == Domain::Four);
+    CHECK(lay.width == 12);
+
+    const auto fields = pool.struct_fields(fields_a);
+    REQUIRE(fields.size() == 2);
+    CHECK(fields[0].name == "a");
+    CHECK(fields[0].bit_offset == 8);
+    CHECK(fields[1].name == "b");
+    CHECK(fields[1].bit_offset == 0);
+
+    // A second, independently-interned field table with the *same shape* is a
+    // distinct id — the pool must not accidentally alias the two structs (each
+    // Lower.cpp call site is responsible for its own dedup via a symbol-keyed
+    // cache; the pool only dedups by identical fields_id).
+    const uint32_t fields_b = pool.intern_struct_fields({
+      { "a", pool.put(Type{ .kind = Type::Kind::PackedArray, .element = pool.logic_type, .left = 3, .right = 0 }), 8 },
+      { "b", pool.put(Type{ .kind = Type::Kind::PackedArray, .element = pool.bit_type, .left = 7, .right = 0 }), 0 },
+    });
+    CHECK(fields_b != fields_a);
+    Type s2  = s;
+    s2.fields_id = fields_b;
+    const Ref r3 = pool.put(Item{ s2 });
+    CHECK(r3 != r1);
+
+    // Unpacked struct: no plane-packed value (mirrors String's sentinel).
+    Type u;
+    u.kind      = Type::Kind::Struct;
+    u.is_packed = false;
+    u.fields_id = fields_a;
+    const Layout ulay = pool.layout(pool.put(Item{ u }));
+    CHECK(ulay.width == 0);
+    CHECK(ulay.byte_count == 0);
+}
+
 TEST_CASE("interned values round-trip in canonical planes") {
     InternPool pool;
 

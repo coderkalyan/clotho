@@ -44,6 +44,19 @@ void render_type(const InternPool& pool, Ref type, std::ostream& os) {
         case Type::Kind::String:
             os << "string";
             break;
+        case Type::Kind::Struct: {
+            const auto fields = pool.struct_fields(t.fields_id);
+            os << (t.is_packed ? "struct packed{" : "struct{");
+            for (size_t i = 0; i < fields.size(); ++i) {
+                if (i != 0) {
+                    os << ", ";
+                }
+                os << fields[i].name << ":";
+                render_type(pool, fields[i].type, os);
+            }
+            os << "}";
+            break;
+        }
     }
 }
 

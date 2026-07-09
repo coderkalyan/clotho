@@ -753,6 +753,48 @@ private:
             return ft.floatKind == slang::ast::FloatingType::ShortReal ? module_.pool.shortreal_type
                                                                        : module_.pool.real_type;
         }
+        if (ct.isStruct()) {
+            // Checked ahead of the isIntegral() fallback below: PackedStructType
+            // derives IntegralType in slang (LRM 7.2.1 - a packed struct is a
+            // single bit-vector value), so without this branch a packed struct
+            // would silently fall through to make_int_type and lose its field
+            // identity (member access / assignment patterns need it; whole-
+            // object declare/assign works either way since the storage is the
+            // same bit-vector shape).
+            if (const auto cached = struct_type_cache_.find(&ct); cached != struct_type_cache_.end()) {
+                return cached->second;
+            }
+
+            const bool is_packed = !ct.isUnpackedStruct();
+            if (!is_packed) {
+                // TODO: unpacked struct/union — aggregate llvm::StructType
+                // backing, member GEP access, state_initializer recursion.
+                // Field-table plumbing (this function) is shared with the
+                // packed path already; only backend storage is missing.
+                fail("unpacked struct is not supported yet");
+            }
+
+            const Scope& body = ct.as<slang::ast::PackedStructType>();
+            std::vector<ir::Field> fields;
+            for (const auto& f : body.membersOfType<slang::ast::FieldSymbol>()) {
+                fields.push_back({ std::string(f.name), lower_type(f.getType()),
+                                    static_cast<uint32_t>(f.bitOffset) });
+            }
+
+            ir::Type t;
+            t.kind      = ir::Type::Kind::Struct;
+            t.is_signed = ct.isSigned();
+            t.is_packed = true;
+            t.element   = ct.isFourState() ? module_.pool.logic_type : module_.pool.bit_type;
+            t.left      = ct.getBitWidth() - 1;
+            t.right     = 0;
+            t.fields_id = module_.pool.intern_struct_fields(std::move(fields));
+
+            const ir::Ref ref = module_.pool.put(ir::Item{ t });
+            struct_type_cache_.emplace(&ct, ref);
+
+            return ref;
+        }
         if (!ct.isIntegral()) {
             // TODO: string / chandle / event / class types.
             fail("unsupported non-integral type");
@@ -5719,6 +5761,12 @@ private:
     // Subroutine -> its lowered FunctionId, so each function is lowered once and
     // shared across call sites (and a recursive call resolves its own id).
     ankerl::unordered_dense::map<const SubroutineSymbol*, ir::FunctionId> fnmap_;
+    // Canonical slang struct/union type -> its lowered ir::Ref, so a type used by
+    // many variables (e.g. a bus of the same struct) interns its field table
+    // once. The pool's own structural dedup can't do this: two independently
+    // built field lists get different `fields_id`s and would never compare
+    // equal, defeating InternPool::put's content-based dedup.
+    ankerl::unordered_dense::map<const slang::ast::Type*, ir::Ref> struct_type_cache_;
     // The function currently being lowered, or null when lowering a process. Drives
     // local-vs-signal name resolution and `return` handling.
     FnCtx* fn_ctx_ = nullptr;

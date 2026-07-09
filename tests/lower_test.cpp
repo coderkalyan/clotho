@@ -573,6 +573,57 @@ TEST_CASE("a dynamic array fails loudly") {
     CHECK(r.diagnostics.find("dynamic / queue / associative") != std::string::npos);
 }
 
+TEST_CASE("a packed struct declares and carries its field table") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            typedef struct packed {
+                logic [3:0] a;
+                bit [7:0] b;
+            } s_t;
+            s_t x;
+            s_t y;
+            initial y = x;
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE(r.module != nullptr);
+
+    const ir::Module& m = *r.module;
+    REQUIRE(m.signals().size() == 2);
+    const ir::Ref ty = m.signals()[0].type;
+
+    const ir::Layout lay = m.pool.layout(ty);
+    // a (4-bit logic) makes the whole struct four-state; total width 4 + 8.
+    CHECK(lay.domain == ir::Domain::Four);
+    CHECK(lay.width == 12);
+
+    const ir::Type& t = std::get<ir::Type>(m.pool.get(ty));
+    REQUIRE(t.kind == ir::Type::Kind::Struct);
+    CHECK(t.is_packed);
+    const auto fields = m.pool.struct_fields(t.fields_id);
+    REQUIRE(fields.size() == 2);
+    CHECK(fields[0].name == "a");
+    CHECK(fields[1].name == "b");
+    // LRM 7.2.1: the first declared member is the most significant, so `a`
+    // (the second field, width 8) sits above `b` at the LSB.
+    CHECK(fields[0].bit_offset == 8);
+    CHECK(fields[1].bit_offset == 0);
+}
+
+TEST_CASE("an unpacked struct fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            typedef struct {
+                logic [3:0] a;
+                bit [7:0] b;
+            } s_t;
+            s_t x;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("unpacked struct is not supported") != std::string::npos);
+}
+
 TEST_CASE("nested instances chain their hierarchical prefixes") {
     const LowerResult r = lower_text(R"(
         module leaf(input a, output y);
