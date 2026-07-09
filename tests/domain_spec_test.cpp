@@ -55,7 +55,9 @@ std::string run_capture(std::string_view source, ir::SimulationConfig config = {
 // Run with specialization on and off; the outputs must match each other and
 // the expected (iverilog-verified) text. Returns the specialized output.
 std::string run_ab(std::string_view source, std::string_view expected) {
-    const std::string spec   = run_capture(source);
+    // min_ops = 0: exercise the machinery on deliberately tiny bodies that
+    // the default profitability gate would (correctly) skip.
+    const std::string spec   = run_capture(source, { .domain_spec_min_ops = 0 });
     const std::string nospec = run_capture(source, { .domain_spec = false });
     CHECK_EQ(spec, nospec);
     CHECK_EQ(spec, expected);
@@ -70,7 +72,7 @@ std::string emit_raw(std::string_view source) {
     REQUIRE(result.module != nullptr);
     std::string              text;
     llvm::raw_string_ostream os(text);
-    REQUIRE(ir::emit_llvm(*result.module, os, { .optimize = false }));
+    REQUIRE(ir::emit_llvm(*result.module, os, { .optimize = false, .domain_spec_min_ops = 0 }));
     return text;
 }
 

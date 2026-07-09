@@ -2533,6 +2533,48 @@ private:
             if (!ok || reads.empty()) {
                 continue;
             }
+            // Profitability gate. Specialization is not free even when the
+            // fast body never runs: every write to a tracked signal anywhere
+            // in the design pays the x/z retest, and the NBA commit loop pays
+            // a changed-word check per tracked commit. The fast body must be
+            // decisively op-dense to fund that (measured on picorv32: 188
+            // small groups, compute <= 50, regressed sim ~11% for no win;
+            // the xdomain shape, compute ~5k over 259 stores, keeps ~93% of
+            // the 2-state ceiling). V1 static proxy — a runtime-feedback
+            // group-retirement scheme is the planned replacement
+            // (docs/design/domain-spec.md).
+            uint32_t n_compute = 0;
+            uint32_t n_stores  = 0;
+            for (const uint32_t m : groups_[g]) {
+                const Ir& ir = all[m].ir;
+                for (size_t k = 0; k < ir.inst_count(); ++k) {
+                    switch (ir.tag(static_cast<Index>(k))) {
+                        case Inst::Tag::Store:
+                        case Inst::Tag::StoreNb:
+                            n_stores++;
+                            break;
+                        case Inst::Tag::Add: case Inst::Tag::Sub: case Inst::Tag::Mul:
+                        case Inst::Tag::Band: case Inst::Tag::Bor: case Inst::Tag::Bxor:
+                        case Inst::Tag::Bxnor: case Inst::Tag::Bnot:
+                        case Inst::Tag::RedAnd: case Inst::Tag::RedOr: case Inst::Tag::RedXor:
+                        case Inst::Tag::Sll: case Inst::Tag::Srl: case Inst::Tag::Sra:
+                        case Inst::Tag::Eq: case Inst::Tag::Ne: case Inst::Tag::Lt:
+                        case Inst::Tag::Le: case Inst::Tag::Gt: case Inst::Tag::Ge:
+                        case Inst::Tag::CaseEq: case Inst::Tag::CasezEq: case Inst::Tag::CasexEq:
+                        case Inst::Tag::WildEq: case Inst::Tag::Select: case Inst::Tag::SelectLazy:
+                        case Inst::Tag::Concat: case Inst::Tag::Repl:
+                        case Inst::Tag::Land: case Inst::Tag::Lor: case Inst::Tag::Lnot:
+                            n_compute++;
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            }
+            const uint32_t min_ops = config_.domain_spec_min_ops;
+            if (min_ops != 0 && (n_compute < min_ops || n_compute < 8 * n_stores)) {
+                continue;
+            }
             spec_group_[g] = true;
             ctr_init[g]    = static_cast<uint32_t>(reads.size());
             for (const uint32_t si : reads) {

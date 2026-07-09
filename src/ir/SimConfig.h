@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 // Configuration knobs shared by the compile (LlvmBackend.h) and run (Jit.h)
 // entry points. Grows as new optimizations and simulation modes land.
 
@@ -40,6 +42,14 @@ struct SimulationConfig {
     // the fast body runs only when the whole read set is clean at runtime,
     // where 2-state and 4-state lowering agree exactly.
     bool domain_spec = true;
+    // Profitability floor for domain specialization: a thunk group is
+    // specialized only when its bodies hold at least this many eligible
+    // 4-state compute ops (and 8x its store count) — the write-side tag
+    // maintenance is paid design-wide, so the fast body must be decisively
+    // op-dense to fund it (measured thresholds, docs/design/domain-spec.md).
+    // 0 disables the gate (used by tests to exercise the machinery on small
+    // bodies).
+    uint32_t domain_spec_min_ops = 64;
     // Register LLVM's perf JITEventListener on the object-linking layer so the
     // JIT'd design's functions show up in `perf` with real symbols. Emits a
     // jitdump (`$JITDUMPDIR/jit-<pid>.dump`) consumed by `perf inject --jit`.
