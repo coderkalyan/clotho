@@ -2590,6 +2590,7 @@ private:
         }
         dom_debug_ = getenv("CLOTHO_DOM_DEBUG") != nullptr;
 
+        bool                  any_spec = false;
         std::vector<uint32_t> ctr_init(ngroups, 0);
         for (uint32_t g = 0; g < ngroups; ++g) {
             if (!thunk_group_[g]) {
@@ -2689,11 +2690,24 @@ private:
                 fprintf(stderr, "]\n");
             }
             spec_group_[g] = true;
+            any_spec       = true;
             ctr_init[g]    = static_cast<uint32_t>(reads.size());
             for (const uint32_t si : reads) {
                 tracked_[si] = true;
                 sig_dep_groups_[si].push_back(g);
             }
+        }
+
+        // Zero-residue: with no group specialized, emit none of the tracking
+        // state. The globals stay null, so the NBA commit loop's note early-
+        // returns (domain_ctr_gv_ == nullptr) and inline stores / dispatch
+        // (gated on tracked_ / spec_group_) emit nothing -- the design compiles
+        // byte-identically to --no-domain-spec. Without this, every 4-state NBA
+        // commit still pays the note's changed-word + ndeps gate in a design
+        // where the profitability gate rejected every candidate (e.g. picorv32,
+        // where it is the whole default-build residual).
+        if (!any_spec) {
+            return;
         }
 
         auto* i8  = llvm::Type::getInt8Ty(ctx_);
@@ -2778,6 +2792,15 @@ private:
     // covers x and z (z encodes as x in the planes); the z word is OR'd in as
     // defense on paths that write z storage directly. Hot path is the xz test
     // plus one i8 load + compare; the transition machinery is a side block.
+    //
+    // NOTE: retest-first, not pinned-first. Loading the tag and branching on
+    // the pin sentinel (3) *before* the xz retest — to skip the retest for a
+    // pinned signal — was measured a net ~1.7% regression on ungated picorv32
+    // (paired median +34 ms, 7/8 reps, 2026-07). The retest is cheap and
+    // pinned signals are rare (pico pins ~1 tracked signal), so the extra
+    // per-write branch on the common non-pinned path outweighs the rare skip;
+    // even on a flap-saturated microbench the skipped xz is dwarfed by the NBA
+    // commit's wait-service cost. A pinned tag still exits in two compares.
     void domain_note_write(Signal sig, uint32_t width, llvm::Value* new_mm, llvm::Value* new_z) {
         const auto si = static_cast<uint32_t>(sig);
         if (si >= tracked_.size() || !tracked_[si]) {
