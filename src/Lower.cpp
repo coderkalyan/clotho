@@ -51,6 +51,7 @@
 #include <slang/numeric/Time.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/text/SourceManager.h>
+#include <slang/util/SmallVector.h>
 
 #include "SourceMap.h"
 #include "ir/Builder.h"
@@ -553,11 +554,17 @@ private:
                     scope_  = &scope;
                     break;
                 }
-                case SymbolKind::InstanceArray:
-                    // TODO: instance arrays (foo u[N](...)) — needs per-element
-                    // elaboration and bit-sliced port connections.
-                    fail("instance arrays are not supported");
+                case SymbolKind::InstanceArray: {
+                    // An array of instances (`foo u [N:M] (...)`, LRM 23.3.6).
+                    // Slang has already elaborated one InstanceSymbol per
+                    // element, bit-sliced port connections included, so this
+                    // only needs to flatten each element under its own name.
+                    lower_instance_array(m.as<InstanceArraySymbol>(), self_prefix, scope, self_mul);
+                    prefix_   = self_prefix;
+                    scope_    = &scope;
+                    time_mul_ = self_mul;
                     break;
+                }
                 // Known-inert members: elaboration artifacts and declarations
                 // that bear no simulation behavior of their own. Ports are wired
                 // by wire_ports; parameters/types/genvars are resolved by slang;
@@ -596,6 +603,57 @@ private:
         prefix_ = block_prefix;
         scope_  = &block;
         lower_members(block, block_prefix, self_mul);
+    }
+
+    // Recurse through one (possibly multidimensional) array of instances,
+    // lowering and wiring each element under <array>[<index>]. Slang builds a
+    // nested InstanceArraySymbol per extra unpacked dimension (`foo u[3][4]
+    // (...)`), each ultimately bottoming out at a leaf InstanceSymbol that
+    // already carries its own bit-sliced port connections — this only walks
+    // to those leaves and flattens them, mirroring generate-loop arrays
+    // (gen_entry_name) rather than synthesizing anything slang didn't already
+    // elaborate.
+    void lower_instance_array(const InstanceArraySymbol& arr, const std::string& self_prefix,
+                              const Scope& parent_scope, uint64_t self_mul) {
+        for (const Symbol* elem : arr.elements) {
+            if (elem->kind == SymbolKind::InstanceArray) {
+                lower_instance_array(elem->as<InstanceArraySymbol>(), self_prefix, parent_scope,
+                                     self_mul);
+                continue;
+            }
+            if (elem->kind != SymbolKind::Instance) {
+                // A gate-primitive or checker instance array: neither
+                // primitive gates nor checkers are lowered today (see the
+                // single-instance member switch above), so fail the same way
+                // a lone instance of one would.
+                fail("unsupported instance array element kind=" + std::string(toString(elem->kind)));
+            }
+            const InstanceSymbol& child = elem->as<InstanceSymbol>();
+            lower_instance(child, self_prefix + instance_array_element_name(child) + ".");
+            prefix_   = self_prefix;
+            scope_    = &parent_scope;
+            time_mul_ = self_mul;
+            wire_ports(child);
+        }
+    }
+
+    // Hierarchical-path segment for one instance-array element: <array>[<i0>]
+    // [<i1>].... Mirrors slang's own hierarchical-path formatting (slang's
+    // Symbol::getHierarchicalPath): arrayPath holds one canonical (always
+    // zero-based) index per dimension, and adding each dimension's lower
+    // bound recovers the source-code index regardless of whether that
+    // dimension's range counts up or down.
+    static std::string instance_array_element_name(const InstanceSymbol& elem) {
+        std::string name(elem.getArrayName());
+        slang::SmallVector<slang::ConstantRange, 4> dims;
+        elem.getArrayDimensions(dims);
+        SLANG_ASSERT(dims.size() == elem.arrayPath.size());
+        for (size_t i = 0; i < dims.size(); i++) {
+            name += '[';
+            name += std::to_string(int32_t(elem.arrayPath[i]) + dims[i].lower());
+            name += ']';
+        }
+        return name;
     }
 
     // Hierarchical-path segment for one loop-generate entry: <array>[<index>].

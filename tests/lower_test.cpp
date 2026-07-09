@@ -539,19 +539,6 @@ TEST_CASE("an inout port connection fails loudly") {
     CHECK(r.diagnostics.find("inout") != std::string::npos);
 }
 
-TEST_CASE("an instance array fails loudly") {
-    const LowerResult r = lower_text(R"(
-        module inv(input a, output y);
-            assign y = ~a;
-        endmodule
-        module top(input [3:0] g, output [3:0] o);
-            inv u[3:0](.a(g), .y(o));
-        endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("instance array") != std::string::npos);
-}
-
 TEST_CASE("whole unpacked array assignment fails loudly") {
     const LowerResult r = lower_text(R"(
         module top;
