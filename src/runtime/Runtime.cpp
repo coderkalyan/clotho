@@ -552,6 +552,43 @@ void str_assign(rt_string* s, const char* p, uint64_t n) {
     str_set_heap(s, StrHeap{ buf, n, cap });
 }
 
+// Grow s's buffer to hold at least n bytes, preserving contents and length.
+// The handle stays valid across the grow, so aliased readers of s (same handle
+// pointer) keep seeing the current bytes.
+void str_reserve(rt_string* s, uint64_t n) {
+    if (!str_is_heap(s)) {
+        if (n <= str_inline_cap) {
+            return;
+        }
+        const uint64_t len = str_inline_cap - s->storage[31];
+        char*          buf = static_cast<char*>(std::malloc(n));
+        std::memcpy(buf, s->storage, len);
+        str_set_heap(s, StrHeap{ buf, len, n });
+        return;
+    }
+    StrHeap h = str_heap(s);
+    if (n <= h.cap) {
+        return;
+    }
+    // Geometric growth so repeated append-style reassignment amortizes.
+    const uint64_t cap = h.cap * 2 > n ? h.cap * 2 : n;
+    char*          buf = static_cast<char*>(std::malloc(cap));
+    std::memcpy(buf, h.ptr, h.len);
+    std::free(h.ptr);
+    str_set_heap(s, StrHeap{ buf, h.len, cap });
+}
+
+// Set the length of s; capacity for n bytes must already be reserved.
+void str_set_len(rt_string* s, uint64_t n) {
+    if (str_is_heap(s)) {
+        StrHeap h = str_heap(s);
+        h.len     = n;
+        str_set_heap(s, h);
+        return;
+    }
+    s->storage[31] = static_cast<unsigned char>(str_inline_cap - n);
+}
+
 char str_ascii_lower(char c) {
     return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
 }
@@ -1588,13 +1625,38 @@ extern "C" const char* rt_string_data(const rt_string* s) {
 }
 
 extern "C" void rt_string_concat(rt_string* dst, const rt_string* const* parts, uint32_t n) {
-    // Built into a scratch buffer first: dst may appear among the parts
-    // (a = {a, b}).
-    // TODO: in-place append fast path when dst is not among the parts.
-    uint64_t total = 0;
+    // Aliasing exists only as identical handle pointers: distinct handles never
+    // share a buffer (every assignment deep-copies). Scan for dst among the
+    // parts; anything but a prefix occurrence falls back to a scratch build.
+    uint64_t total  = 0;
+    uint32_t dst_at = n;
     for (uint32_t k = 0; k < n; ++k) {
         total += str_len(parts[k]);
+        if (dst_at == n && parts[k] == dst) {
+            dst_at = k;
+        }
     }
+    if (dst_at == n || dst_at == 0) {
+        // In-place: dst's current bytes are either unused (dst is not a part)
+        // or already the result's prefix (dst is part 0, the s = {s, ...}
+        // append). Writes land at offsets >= that prefix, so later parts equal
+        // to dst still read their original bytes ({s, s} self-append); dst's
+        // stored length is only updated after the copies, so their str_len is
+        // the pre-call value too.
+        const uint64_t skip = dst_at == 0 ? str_len(dst) : 0;
+        str_reserve(dst, total);
+        char*    out = str_data(dst);
+        uint64_t off = skip;
+        for (uint32_t k = dst_at == 0 ? 1 : 0; k < n; ++k) {
+            const uint64_t len = str_len(parts[k]);
+            std::memcpy(out + off, str_data(parts[k]), len);
+            off += len;
+        }
+        str_set_len(dst, total);
+        return;
+    }
+    // dst appears at a later position (s = {c, s}): its bytes sit mid-result,
+    // so prefix writes would clobber them. Build in scratch.
     StrScratch scratch(total);
     uint64_t   off = 0;
     for (uint32_t k = 0; k < n; ++k) {

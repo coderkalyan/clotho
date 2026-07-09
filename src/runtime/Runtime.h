@@ -291,7 +291,8 @@ uint64_t rt_string_len(const rt_string* s);
 const char* rt_string_data(const rt_string* s);
 
 // dst = parts[0] .. parts[n-1] concatenated. dst may appear among the parts
-// (a = {a, b}).
+// (a = {a, b}); when its first occurrence is parts[0] the call appends in
+// place with amortized growth, so repeated a = {a, chunk} is linear overall.
 void rt_string_concat(rt_string* dst, const rt_string* const* parts, uint32_t n);
 
 // dst = src repeated `count` times ({count{src}}); count == 0 yields "".
