@@ -135,6 +135,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::ReadMem:
         case T::StrPutc:
         case T::StrSubstr:
+        case T::EnumName:
             return K::OpExtra;
     }
 

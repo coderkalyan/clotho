@@ -3729,6 +3729,11 @@ private:
     llvm::FunctionCallee str_upper_fn() {
         return rt_fn("rt_string_toupper", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
+    llvm::FunctionCallee enum_name_fn() {
+        return rt_fn("rt_enum_name", b_.getVoidTy(),
+                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty(),
+                       raw_ptr_ty() });
+    }
     llvm::FunctionCallee str_lower_fn() {
         return rt_fn("rt_string_tolower", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
@@ -4089,6 +4094,7 @@ private:
             case Inst::Tag::StrSubstr:
             case Inst::Tag::StrFromPacked:
             case Inst::Tag::Sformatf:
+            case Inst::Tag::EnumName:
                 return { 0, false, false, true };
             case Inst::Tag::StrToPacked:
                 return from_ref(p.op_type.type);
@@ -4179,6 +4185,7 @@ private:
             case Inst::Tag::StrSubstr:
             case Inst::Tag::StrFromPacked:
             case Inst::Tag::Sformatf:
+            case Inst::Tag::EnumName:
                 return true;
             case Inst::Tag::Constant:
             case Inst::Tag::Concat:
@@ -4652,6 +4659,42 @@ private:
                 llvm::Value* si = cast(must_of(value_of(ss.i)), 32, type_of(ss.i).is_signed);
                 llvm::Value* sj = cast(must_of(value_of(ss.j)), 32, type_of(ss.j).is_signed);
                 b_.CreateCall(str_substr_fn(), { str_of(i), str_of(p.op_extra.op), si, sj });
+                return;
+            }
+            case Inst::Tag::EnumName: {
+                // Materialize the member table as three parallel read-only globals
+                // (values / name pointers / lengths) and let the runtime scan it.
+                const auto     info   = ir_->extra_data<EnumNameInfo>(p.op_extra.extra);
+                const auto     start  = static_cast<uint32_t>(info.entries.start);
+                const auto     end    = static_cast<uint32_t>(info.entries.end);
+                constexpr uint32_t stride = sizeof(EnumNameEntry) / sizeof(uint32_t);
+                llvm::Type* const i64  = b_.getInt64Ty();
+                llvm::Type* const i32  = b_.getInt32Ty();
+                std::vector<llvm::Constant*> vals, names, lens;
+                for (uint32_t w = start; w < end; w += stride) {
+                    const auto     e = ir_->extra_data<EnumNameEntry>(static_cast<ExtraIndex>(w));
+                    const uint64_t v =
+                      static_cast<uint64_t>(e.val_lo) | (static_cast<uint64_t>(e.val_hi) << 32);
+                    vals.push_back(llvm::ConstantInt::get(i64, v));
+                    names.push_back(b_.CreateGlobalString(ir_->extra_bytes(e.name_at, e.name_len)));
+                    lens.push_back(llvm::ConstantInt::get(i32, e.name_len));
+                }
+                const auto count   = static_cast<uint32_t>(vals.size());
+                auto*      val_arr = llvm::ArrayType::get(i64, count);
+                auto*      ptr_arr = llvm::ArrayType::get(raw_ptr_ty(), count);
+                auto*      len_arr = llvm::ArrayType::get(i32, count);
+                auto make_gv = [&](llvm::ArrayType* ty, llvm::ArrayRef<llvm::Constant*> els,
+                                   const char* nm) {
+                    return new llvm::GlobalVariable(llmod_, ty, true,
+                                                    llvm::GlobalValue::InternalLinkage,
+                                                    llvm::ConstantArray::get(ty, els), nm);
+                };
+                llvm::Value* vg = make_gv(val_arr, vals, "clotho.enum.vals");
+                llvm::Value* ng = make_gv(ptr_arr, names, "clotho.enum.names");
+                llvm::Value* lg = make_gv(len_arr, lens, "clotho.enum.lens");
+                llvm::Value* val64 = cast(must_of(value_of(p.op_extra.op)), 64, false);
+                b_.CreateCall(enum_name_fn(),
+                              { str_of(i), val64, b_.getInt32(count), vg, ng, lg });
                 return;
             }
             case Inst::Tag::StrFromPacked: {

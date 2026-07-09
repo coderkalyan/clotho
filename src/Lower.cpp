@@ -2625,6 +2625,27 @@ private:
             return b.constant(svint_to_ref(members.back().value, base_ty), l);
         }
 
+        // name() (LRM 6.19.2): the source name of the matching member, or "" if
+        // the value is not a member. Delegated to a runtime scan of a per-type
+        // member table (a string result rules out a frontend select).
+        if (name == "name") {
+            if (et.bitWidth > 64) {
+                // TODO: the table key packs the value into u64; a wider base needs
+                // multi-word keys.
+                fail("enum name() with a base type wider than 64 bits is not supported");
+            }
+            std::vector<std::pair<uint64_t, std::string_view>> table;
+            table.reserve(members.size());
+            for (const EnumMember& m : members) {
+                uint64_t key = m.value.as<uint64_t>().value_or(0);
+                if (et.bitWidth < 64) {
+                    key &= (static_cast<uint64_t>(1) << et.bitWidth) - 1;
+                }
+                table.push_back({ key, m.name });
+            }
+            return b.enum_name(lower_expr(*call.arguments()[0], b), table, l);
+        }
+
         // next(N)/prev(N) (LRM 6.19.5): the Nth member after/before the current
         // one in declaration order, wrapping. N is an optional constant (default
         // 1); a non-member receiver yields X (matches iverilog; LRM leaves it

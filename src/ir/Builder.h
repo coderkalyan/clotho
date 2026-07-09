@@ -97,6 +97,10 @@ public:
     Index str_putc(Index str, Index index, Index ch, SourceLoc loc);
     // s.substr(i, j): a new string value from the source string `str`.
     Index str_substr(Index str, Index i, Index j, SourceLoc loc);
+    // e.name(): a new string value naming the enum member whose value equals
+    // `val`. `members` is the (value, source-name) table in declaration order.
+    Index enum_name(Index val, std::span<const std::pair<uint64_t, std::string_view>> members,
+                    SourceLoc loc);
     // Packed cast of a string to target packed type `type`.
     Index str_to_packed(Index str, Ref type, SourceLoc loc);
 

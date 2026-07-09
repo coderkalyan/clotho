@@ -173,6 +173,8 @@ const char* tag_name(Inst::Tag tag) {
             return "str_lower";
         case T::StrSubstr:
             return "str_substr";
+        case T::EnumName:
+            return "enum_name";
         case T::StrFromPacked:
             return "str_from_packed";
         case T::StrToPacked:

@@ -450,6 +450,26 @@ struct StrSubstrInfo {
     Index j;
 };
 
+// One row of an enum's name table: a member value (low 64 bits) and its source
+// name, packed little-endian at `name_at` for `name_len` bytes.
+struct EnumNameEntry {
+    // Member value, low word.
+    uint32_t val_lo;
+    // Member value, high word.
+    uint32_t val_hi;
+    // First extra word of the packed name bytes.
+    ExtraIndex name_at;
+    // Name length in bytes.
+    uint32_t name_len;
+};
+
+// Extra payload for `enum_name`: the enum's member table, a run of back-to-back
+// EnumNameEntry records the runtime scans for a value match.
+struct EnumNameInfo {
+    // The member rows, as back-to-back EnumNameEntry records.
+    ExtraSlice entries;
+};
+
 // Extra payload for `wait`: one (signal, edge) event of an intra-body event
 // control. A `@(a or posedge b)` wait carries several of these in a row.
 struct WaitEdge {
@@ -495,6 +515,8 @@ static_assert(ExtraPayload<WaitEdge>);
 static_assert(ExtraPayload<WaitInfo>);
 static_assert(ExtraPayload<StrPutcInfo>);
 static_assert(ExtraPayload<StrSubstrInfo>);
+static_assert(ExtraPayload<EnumNameEntry>);
+static_assert(ExtraPayload<EnumNameInfo>);
 
 struct Inst {
     enum class Tag : uint8_t {
@@ -727,6 +749,10 @@ struct Inst {
         // s.substr(i, j) -> new string value; "" when the range is invalid
         // (payload: op_extra -> StrSubstrInfo; the op is the source string).
         StrSubstr,
+        // e.name() -> new string value: the source name of the enum member whose
+        // value equals the operand, or "" if none matches (LRM 6.19.2). Payload:
+        // op_extra -> EnumNameInfo (the member table); op is the enum value.
+        EnumName,
         // string'(packed) -> string: bytes MSB-first with 0x00 bytes dropped
         // (payload: unary — the packed value).
         StrFromPacked,

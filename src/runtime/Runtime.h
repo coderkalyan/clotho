@@ -313,6 +313,12 @@ void rt_string_substr(rt_string* dst, const rt_string* src, int32_t i, int32_t j
 void rt_string_toupper(rt_string* dst, const rt_string* src);
 void rt_string_tolower(rt_string* dst, const rt_string* src);
 
+// dst = the source name of the enum member whose value equals `val`, or "" if
+// none matches (LRM §6.19.2 e.name()). `values` / `names` / `lens` are the
+// member table (parallel arrays of `count` rows) emitted per enum type.
+void rt_enum_name(rt_string* dst, uint64_t val, uint32_t count, const uint64_t* values,
+                  const char* const* names, const uint32_t* lens);
+
 // s[i] = c ($.putc()): a no-op when i is out of range or (c & 0xff) == 0 — a
 // string never contains a 0 byte (LRM §6.16.2).
 void rt_string_putc(rt_string* s, int32_t i, uint32_t c);

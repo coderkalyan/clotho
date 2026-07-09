@@ -132,20 +132,39 @@ TEST_CASE("enum next / prev with wrap, step, and non-member") {
     CHECK(out == "3 6\n1 3\n1 6\n1 3\nx\n");
 }
 
+// name() (LRM 6.19.2) returns the source name of the matching member, or "" for
+// a non-member value. Verified vs iverilog.
+TEST_CASE("enum name") {
+    const std::string out = run_capture(R"(
+        module m;
+          typedef enum logic [2:0] {RED=1, GREEN=3, BLUE=6} c_t;
+          c_t x, y;
+          initial begin
+            x = RED;   $display("[%s]", x.name());
+            x = BLUE;  $display("[%s]", x.name());
+            x = c_t'(3'd2); $display("[%s]", x.name());
+            x = RED; y = x.next(); $display("[%s]", y.name());
+          end
+        endmodule
+    )");
+    CHECK(out == "[RED]\n[BLUE]\n[]\n[GREEN]\n");
+}
+
 // -- Unsupported enum constructs fail loudly (never silently accepted) --
 
 // Enum methods (.name/.next/.prev/.first/.last/.num, LRM 6.19.2-6.19.5) are not
 // implemented; each must reject rather than silently mis-lower. slang models
 // them as system subroutines, so they hit the unsupported-system-function guard.
 TEST_CASE("enum methods are rejected") {
+    // name() on a base type wider than 64 bits (the table key packs into u64).
     check_rejected(R"(
         module m;
-          typedef enum {A, B} e_t;
-          e_t x;
-          initial begin x = A; $display("%s", x.name()); end
+          typedef enum bit [71:0] {A, B} e_t;
+          e_t x; string s;
+          initial begin x = A; s = x.name(); end
         endmodule
     )",
-                   "enum method 'name' is not supported");
+                   "wider than 64 bits");
     // A runtime (non-constant) step to next/prev is not supported.
     check_rejected(R"(
         module m;

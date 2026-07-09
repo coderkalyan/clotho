@@ -373,6 +373,7 @@ struct Analysis {
                 case Inst::Tag::StrUpper:
                 case Inst::Tag::StrLower:
                 case Inst::Tag::StrSubstr:
+                case Inst::Tag::EnumName:
                 case Inst::Tag::StrFromPacked:
                 case Inst::Tag::StrToPacked:
                 // File I/O: descriptors and read counts are always-known integers,

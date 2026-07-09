@@ -158,6 +158,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config) {
     expose("rt_string_cmp", &rt_string_cmp);
     expose("rt_string_icmp", &rt_string_icmp);
     expose("rt_string_substr", &rt_string_substr);
+    expose("rt_enum_name", &rt_enum_name);
     expose("rt_string_toupper", &rt_string_toupper);
     expose("rt_string_tolower", &rt_string_tolower);
     expose("rt_string_putc", &rt_string_putc);
