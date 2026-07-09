@@ -170,12 +170,12 @@ TEST_CASE("alu emits verifiable llvm ir") {
     const std::string raw = emit_raw(kAlu);
 
     // State is typed: the module definition gets a named state struct, the root
-    // %clotho.state composes it, and main heap-allocates the root type via
-    // rt_alloc (the design state can be far too large for the stack). Asserted
-    // on raw IR: the optimizer rewrites the typed GEPs to i8 offsets, dropping
-    // the named struct definitions and the state type from the opaque `ptr`.
+    // %clotho.state composes it, and it lives as one internal global whose
+    // initializer is the whole power-on state (X = 0xFF00 for a 4-state byte),
+    // so main emits no rt_alloc and no per-signal init stores.
     CHECK(raw.find("%alu.state = type") != std::string::npos);
-    CHECK(raw.find("%state = call ptr @rt_alloc(") != std::string::npos);
+    CHECK(raw.find("@clotho.state = internal global") != std::string::npos);
+    CHECK(raw.find("i16 -256") != std::string::npos);
 
     // One process per @<module>.p<index>: two combinational assigns + one
     // sequential always block. All three are suspension-free, so by default they
@@ -197,7 +197,7 @@ TEST_CASE("alu emits verifiable llvm ir") {
     // Signal access via constant-index typed GEPs into the state structs
     // (asserted on raw IR; instcombine canonicalizes GEP shapes).
     CHECK(raw.find("getelementptr inbounds %clotho.state, ptr") != std::string::npos);
-    CHECK(ir.find("store i8") != std::string::npos);
+    CHECK(ir.find("store i16") != std::string::npos);
 
     // The if/else lowers to branches.
     CHECK(ir.find("br i1") != std::string::npos);
@@ -227,7 +227,7 @@ TEST_CASE("2-state vs 4-state widths") {
     CHECK(raw.find("%m.state = type { %bit.4, %bit.4, %logic.nz.8 }") != std::string::npos);
     CHECK(raw.find("%bit.4 = type { i4 }") != std::string::npos);
     CHECK(raw.find("%logic.nz.8 = type { i16 }") != std::string::npos);
-    CHECK(raw.find("%state = call ptr @rt_alloc(") != std::string::npos);
+    CHECK(raw.find("@clotho.state = internal global") != std::string::npos);
     // z's must|may word is an i16 (2W = 16).
     CHECK(ir.find("store i16") != std::string::npos);
     CHECK(ir.find("define ptr @m.") != std::string::npos);

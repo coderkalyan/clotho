@@ -1850,13 +1850,17 @@ private:
         auto* entry = llvm::BasicBlock::Create(ctx_, "entry", main);
         b_.SetInsertPoint(entry);
 
-        // The design state struct holds every signal, including large memories,
-        // so it can be far too big for the stack. Allocate it on the heap via
-        // rt_alloc (freed before main returns) instead of a stack alloca that
-        // would overflow on large designs. rt_alloc returns 64-byte-aligned
-        // memory, covering any packed-vector alignment in the struct.
-        const uint64_t state_size = llmod_.getDataLayout().getTypeAllocSize(state_ty_);
-        llvm::Value*   state      = b_.CreateCall(alloc_fn(), { b_.getInt64(state_size) }, "state");
+        // The design state struct holds every signal, including large memories.
+        // It is a single internal global whose initializer is the whole power-on
+        // state (`state_initializer`) — the optimizer can then constant-fold the
+        // fixed base into every signal GEP, and no per-signal init store is
+        // emitted (only arrays keep a runtime fill loop; see `init_state`).
+        // 64-byte aligned to cover any packed-vector alignment in the struct.
+        auto* state_gv = new llvm::GlobalVariable(llmod_, state_ty_, false,
+                                                  llvm::GlobalValue::InternalLinkage,
+                                                  state_initializer(), "clotho.state");
+        state_gv->setAlignment(llvm::Align(64));
+        llvm::Value* state = state_gv;
         init_state(state);
         if (shadow_base_gv_ != nullptr) {
             b_.CreateStore(b_.CreateInBoundsGEP(state_ty_, state, { b_.getInt32(0), b_.getInt32(shadow_field_) }),
@@ -1889,7 +1893,6 @@ private:
         }
 
         b_.CreateCall(wheel_deinit_fn(), { wheel });
-        b_.CreateCall(free_fn(), { state });
         b_.CreateRet(llvm::ConstantInt::get(i32, 0));
     }
 
@@ -3954,33 +3957,86 @@ private:
 
     // Power-up the state struct: undriven 4-state nets come up Z (LRM 6.6 —
     // must 0, may 1, z all-ones), other 4-state signals X (z 0), 2-state 0.
+    // Runtime power-on init: only unpacked arrays (memories). Every scalar
+    // signal's power-on value — X for a 4-state plane, an empty inline string
+    // handle, a clear nba dirty mask — is a compile-time constant folded into
+    // the state global's initializer (`state_initializer`), so no per-signal
+    // GEP+store is emitted here. Arrays stay a runtime loop: materialising a
+    // large memory's X-fill as a global constant would bloat the JIT object's
+    // `.data` (a non-zero pattern cannot go in `.bss`), so it is filled in
+    // O(1) emitted instructions instead.
     void init_state(llvm::Value* state) {
         for (const SignalSlot& s : slots_) {
+            if (!s.is_array) {
+                continue;
+            }
             if (s.is_string) {
                 emit_string_slot_op(state, s, str_init_fn());
-                continue;
-            }
-            if (s.is_array) {
+            } else {
                 emit_array_init(state, s);
-                continue;
-            }
-            llvm::Value* mm =
-              s.narrow ? zero(s.width) : (s.four_state ? x_mm(s.width) : zero(2 * s.width));
-            llvm::Value* slot = storage_ptr(state, s);
-            b_.CreateStore(mm, b_.CreateStructGEP(s.slot_ty, slot, 0));
-            if (s.has_z) {
-                b_.CreateStore(s.init_z ? ones(s.width) : zero(s.width),
-                               b_.CreateStructGEP(s.slot_ty, slot, 1));
-            }
-            // A dynamic-select target's dirty mask must start clear; the shadow itself
-            // is written before it is read, so it needs no initialisation.
-            if (s.nba_dyn) {
-                b_.CreateStore(zero(s.width),
-                               b_.CreateInBoundsGEP(state_ty_, state,
-                                                    { b_.getInt32(0), b_.getInt32(shadow_field_),
-                                                      b_.getInt32(s.sh_mask_field) }));
             }
         }
+    }
+
+    // Constant initializer for the `clotho.state` global: the whole power-on
+    // state as an LLVM constant. Recurses the nested scope struct; each signal
+    // leaf (matched by its GEP path) gets its power-on constant, array leaves
+    // and the shadow region get zeroinitializer (arrays are filled by
+    // `init_state`, shadows are written before read).
+    llvm::Constant* state_initializer() {
+        std::map<std::vector<uint32_t>, const SignalSlot*> by_path;
+        for (const SignalSlot& s : slots_) {
+            by_path.emplace(s.path, &s);
+        }
+        std::vector<uint32_t> path;
+        return const_for_path(state_ty_, path, by_path);
+    }
+
+    llvm::Constant* const_for_path(llvm::Type* ty, std::vector<uint32_t>& path,
+                                   const std::map<std::vector<uint32_t>, const SignalSlot*>& by_path) {
+        if (const auto it = by_path.find(path); it != by_path.end()) {
+            return slot_const(*it->second);
+        }
+        if (auto* st = llvm::dyn_cast<llvm::StructType>(ty)) {
+            std::vector<llvm::Constant*> elems;
+            elems.reserve(st->getNumElements());
+            for (uint32_t i = 0; i < st->getNumElements(); ++i) {
+                path.push_back(i);
+                elems.push_back(const_for_path(st->getElementType(i), path, by_path));
+                path.pop_back();
+            }
+            return llvm::ConstantStruct::get(st, elems);
+        }
+        // Non-slot leaf: a shadow-region scalar (mm/z shadow or dirty mask).
+        // Shadows are written before read and the mask powers on clear.
+        return llvm::Constant::getNullValue(ty);
+    }
+
+    // Power-on constant for one signal's storage. Arrays and string arrays are
+    // zeroinitialized (filled at runtime by `init_state`); a scalar string is
+    // the empty inline handle (`rt_string_init`: byte 31 == str_inline_cap);
+    // a scalar plane is X (4-state) or 0 (2-state) with the z word set for an
+    // undriven-net may-z seed.
+    llvm::Constant* slot_const(const SignalSlot& s) {
+        if (s.is_array) {
+            return llvm::ConstantAggregateZero::get(s.storage_ty);
+        }
+        if (s.is_string) {
+            // Empty inline handle: byte (cap) holds cap == str_inline_cap, i.e.
+            // sizeof(rt_string) - 1 (mirrors rt_string_init).
+            constexpr uint8_t cap = sizeof(rt_string) - 1;
+            std::vector<uint8_t> bytes(sizeof(rt_string), 0);
+            bytes[cap] = cap;
+            return llvm::ConstantStruct::get(
+              s.slot_ty, { llvm::ConstantDataArray::get(ctx_, bytes) });
+        }
+        llvm::Constant* mm =
+          s.narrow ? zero(s.width) : (s.four_state ? x_mm(s.width) : zero(2 * s.width));
+        std::vector<llvm::Constant*> fields{ mm };
+        if (s.has_z) {
+            fields.push_back(s.init_z ? ones(s.width) : zero(s.width));
+        }
+        return llvm::ConstantStruct::get(s.slot_ty, fields);
     }
 
     // Apply `callee` (rt_string_init / rt_string_deinit) to a string signal's
