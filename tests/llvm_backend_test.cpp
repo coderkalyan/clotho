@@ -2715,7 +2715,34 @@ TEST_CASE("a z-carrying signal keeps its z word and round-trips z through copies
     CHECK(run_capture(src) == "z01x z01x 1010\n1 1\ncasez hit\n");
 }
 
-TEST_CASE("NBA of a z value round-trips the shadow commit; never-z NBAs use the .noz bucket") {
+TEST_CASE("NBA of a z value round-trips a static-select block commit (z and never-z targets)") {
+    constexpr std::string_view src = R"(
+        module m;
+            reg clk = 0;
+            logic [3:0] zq;
+            logic [3:0] nq;
+            logic [3:0] zsrc = 4'bzz01;
+            always @(posedge clk) begin
+                zq[3:0] <= zsrc;
+                nq[3:0] <= nq === 4'bxxxx ? 4'd5 : nq + 1;
+            end
+            initial begin
+                #1 clk = 1;
+                #1 $display("%b %b", zq, nq);
+                $finish;
+            end
+        endmodule
+    )";
+    // Static bit-range NBA targets commit through the block path with a compile-time
+    // mask; no per-signal bucket globals form. zq carries z (full slot), nq is
+    // proven never-z, and both round-trip their shadow commit.
+    const std::string ir = emit(src);
+    CHECK(ir.find("clotho.nba.commit_blk") != std::string::npos);
+    CHECK(ir.find("clotho.nba.w4") == std::string::npos);
+    CHECK(run_capture(src) == "zz01 0101\n");
+}
+
+TEST_CASE("whole-scalar NBAs lower to the block-commit path by default") {
     constexpr std::string_view src = R"(
         module m;
             reg clk = 0;
@@ -2734,9 +2761,14 @@ TEST_CASE("NBA of a z value round-trips the shadow commit; never-z NBAs use the 
         endmodule
     )";
     const std::string ir = emit(src);
-    // Same width, different z-ness: two distinct commit buckets.
-    CHECK(ir.find("clotho.nba.w4.full = ") != std::string::npos);
-    CHECK(ir.find("clotho.nba.w4.full.noz = ") != std::string::npos);
+    // One straight-line block: a single enqueue registration and one commit
+    // function; no per-signal w4 bucket worklists form.
+    CHECK(ir.find("clotho.nba_block_enqueue") != std::string::npos);
+    CHECK(ir.find("clotho.nba.commit_blk0") != std::string::npos);
+    CHECK(ir.find("clotho.nba.w4.full") == std::string::npos);
+    // Shadow accesses go through the opaque base, not state-relative constant
+    // offsets (memory-dependence mis-speculation defense; see shadow_ptr).
+    CHECK(ir.find("clotho.nba.shadow_base") != std::string::npos);
     CHECK(run_capture(src) == "zz01 0101\n");
 }
 
