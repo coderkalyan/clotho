@@ -341,8 +341,11 @@ struct Analysis {
                     break;
                 }
 
-                // Valueless / always-known: no z effect.
+                // Valueless / always-known: no z effect. Switch arm and default
+                // bodies are swept flatly by this same loop (their stores land
+                // through the Store cases), so only the node itself is nil here.
                 case Inst::Tag::Cond:
+                case Inst::Tag::Switch:
                 case Inst::Tag::Loop:
                 case Inst::Tag::Break:
                 case Inst::Tag::Continue:
@@ -357,6 +360,9 @@ struct Analysis {
                 // $clog2 yields a count (or X when the operand has unknown bits);
                 // its result z plane is always zero.
                 case Inst::Tag::Clog2:
+                // Ctz / Clz count the must plane -> a definite bit index, z = 0.
+                case Inst::Tag::Ctz:
+                case Inst::Tag::Clz:
                 // String values carry no bit planes and the integral string ops
                 // (len / getc / cmp / to_packed) always produce known bits.
                 case Inst::Tag::StrLen:

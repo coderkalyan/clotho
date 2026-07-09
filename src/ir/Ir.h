@@ -241,6 +241,31 @@ struct LoopInfo {
     bool bottom_test;
 };
 
+// Extra payload for one arm of a `switch`: the constant case-value keys that
+// select this arm, and the arm's statement body. `keys` is a run of u64 case
+// values (2 words each; decode with Ir::region); several keys share one body
+// for a grouped case item (`2, 3: stmt`). `body` is the region executed on a
+// match.
+struct SwitchArm {
+    // Constant case-value keys selecting this arm (u64 each).
+    ExtraSlice keys;
+    // Statement region run on a match.
+    ExtraSlice body;
+};
+
+// Extra payload for `switch` (payload: op_extra -> SwitchInfo; the op is the
+// selector value). A constant, deduped, wildcard-free `case` lowered to a
+// multiway branch: the backend packs the selector's planes into an integer key
+// ({may^must, must}, must on the low bits) so a clean value keys on its bare
+// bits (dense -> jump table) and any x/z selector lands outside the clean key
+// range and falls to `default_`. `arms` is a run of SwitchArm records.
+struct SwitchInfo {
+    // Run of SwitchArm records (each sizeof(SwitchArm)/4 words).
+    ExtraSlice arms;
+    // Default region, run when no key matches (empty when the case had none).
+    ExtraSlice default_;
+};
+
 // Extra payload for `display`: a $display / $write / $fdisplay / $fwrite system
 // task. The format-string bytes live packed little-endian (4 chars per u32 word)
 // at `fmt` for `fmt_len` bytes; `args` is the slice of value operands the format
@@ -452,6 +477,8 @@ static_assert(ExtraPayload<ElemSelect>);
 static_assert(ExtraPayload<ReadMemInfo>);
 static_assert(ExtraPayload<Regions>);
 static_assert(ExtraPayload<LoopInfo>);
+static_assert(ExtraPayload<SwitchArm>);
+static_assert(ExtraPayload<SwitchInfo>);
 static_assert(ExtraPayload<DisplayInfo>);
 static_assert(ExtraPayload<FopenInfo>);
 static_assert(ExtraPayload<FileOpInfo>);
@@ -529,6 +556,16 @@ struct Inst {
         RedAnd,
         RedOr,
         RedXor,
+
+        // Index of the lowest (Ctz) / highest (Clz) definite-1 bit of the
+        // operand's must plane, or the operand width when it has no definite-1
+        // bit (payload: unary). x/z bits are not definite 1, so they never
+        // count. Result is a definite (2-state) 32-bit count. Used to lower the
+        // one-hot `case (1'b1)` reverse-case idiom to a jump table: the winning
+        // arm is the lowest (ascending source order) or highest (descending) set
+        // bit index. See Lower.cpp build_onehot_plan.
+        Ctz,
+        Clz,
 
         // -- Shifts (payload: binary) --
         // Shift left logical.
@@ -632,6 +669,11 @@ struct Inst {
         // -- Control flow --
         // If / else; condition + then/else regions (payload: op_extra -> Regions).
         Cond,
+        // Multiway branch for a constant, deduped, wildcard-free `case` (payload:
+        // op_extra -> SwitchInfo; the op is the selector value). Lowers to an
+        // llvm switch over a packed key; unmatched keys (incl. any x/z selector)
+        // run the default region. See SwitchInfo.
+        Switch,
         // Return from a function (payload: unary, the return value; ignored for a
         // void function). A real terminator: instructions after it in the same
         // region are unreachable. Early `return` works without any flag.

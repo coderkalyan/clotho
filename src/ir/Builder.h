@@ -64,6 +64,18 @@ public:
     // UnpackedArray type being indexed (gives element stride + declared bounds).
     Index elem_select(Index base, Index index, Ref array_type, SourceLoc loc);
     Index cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc);
+    // One arm of a `switch`: the constant case-value keys that select it and the
+    // arm's already-closed body region. Several keys share one body for a grouped
+    // case item. See Builder::switch_.
+    struct SwitchArmBuild {
+        std::span<const uint64_t> keys;
+        ExtraSlice                body;
+    };
+    // Multiway branch for a constant, deduped, wildcard-free `case`. `selector`
+    // is the value the backend packs into the match key; `arms` map key sets to
+    // bodies; `default_region` runs on no match (pass an empty region when the
+    // case had no default). See ir::SwitchInfo.
+    Index switch_(Index selector, std::span<const SwitchArmBuild> arms, ExtraSlice default_region, SourceLoc loc);
     // Value-producing short-circuit conditional (&&/||). `pred` is a definite
     // 2-state bit; the then-branch (pred 1) yields `then_val`, the else-branch
     // yields `else_val`. The two values must share a width; the backend merges

@@ -143,6 +143,8 @@ const char* tag_name(Inst::Tag tag) {
             return "resize";
         case T::Cond:
             return "cond";
+        case T::Switch:
+            return "switch";
         case T::Ret:
             return "ret";
         case T::Call:
@@ -217,6 +219,10 @@ const char* tag_name(Inst::Tag tag) {
             return "random";
         case T::Clog2:
             return "clog2";
+        case T::Ctz:
+            return "ctz";
+        case T::Clz:
+            return "clz";
         case T::FAdd:
             return "fadd";
         case T::FSub:
@@ -552,6 +558,30 @@ private:
                 os_ << ") {\n";
                 render_region("then", regions.then_, depth);
                 render_region("else", regions.else_, depth);
+                indent(depth);
+                os_ << "}\n";
+                break;
+            }
+            case Inst::Tag::Switch: {
+                const SwitchInfo info = ir_.extra_data<SwitchInfo>(p.op_extra.extra);
+                ref(p.op_extra.op);
+                os_ << ") {\n";
+                const std::span<const Index> arm_words = ir_.region(info.arms);
+                constexpr uint32_t           arm_len   = sizeof(SwitchArm) / sizeof(uint32_t);
+                for (uint32_t a = 0; a * arm_len < arm_words.size(); ++a) {
+                    const auto arm = ir_.extra_data<SwitchArm>(
+                      static_cast<ExtraIndex>(static_cast<uint32_t>(info.arms.start) + a * arm_len));
+                    indent(depth + 1);
+                    const std::span<const Index> kw = ir_.region(arm.keys);
+                    for (size_t k = 0; k + 1 < kw.size(); k += 2) {
+                        const uint64_t val =
+                          static_cast<uint64_t>(kw[k]) | (static_cast<uint64_t>(kw[k + 1]) << 32);
+                        os_ << (k == 0 ? "" : ", ") << val;
+                    }
+                    os_ << ":\n";
+                    render_region("do", arm.body, depth + 1);
+                }
+                render_region("default", info.default_, depth);
                 indent(depth);
                 os_ << "}\n";
                 break;

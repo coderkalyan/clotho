@@ -31,6 +31,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::StrLower:
         case T::StrFromPacked:
         case T::Clog2:
+        case T::Ctz:
+        case T::Clz:
             return K::Unary;
 
         case T::BitSelect:
@@ -124,6 +126,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::DynPartSelect:
         case T::ElemSelect:
         case T::Cond:
+        case T::Switch:
         case T::Fopen:
         case T::Fgets:
         case T::Ferror:

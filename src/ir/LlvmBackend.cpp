@@ -3590,6 +3590,10 @@ private:
                 // $clog2 returns a 32-bit signed `integer` (4-state: the result
                 // is X when the operand carries x/z).
                 return { 32, true, true };
+            case Inst::Tag::Ctz:
+            case Inst::Tag::Clz:
+                // A definite 2-state 32-bit bit index (counts of the must plane).
+                return { 32, false, false };
             case Inst::Tag::Fopen:
                 // $fopen returns a 32-bit descriptor integer.
                 return { 32, false, true };
@@ -3713,6 +3717,7 @@ private:
             case Inst::Tag::Store:
             case Inst::Tag::StoreNb:
             case Inst::Tag::Cond:
+            case Inst::Tag::Switch:
             case Inst::Tag::Loop:
             case Inst::Tag::Break:
             case Inst::Tag::Continue:
@@ -4068,6 +4073,11 @@ private:
                 set_value(i, lower_clog2(value_of(p.unary)));
                 return;
 
+            case Inst::Tag::Ctz:
+            case Inst::Tag::Clz:
+                set_value(i, lower_bit_index(ir_->tag(i), value_of(p.unary)));
+                return;
+
             case Inst::Tag::Sll:
             case Inst::Tag::Srl:
             case Inst::Tag::Sra:
@@ -4286,6 +4296,10 @@ private:
 
             case Inst::Tag::Cond:
                 lower_cond(i);
+                return;
+
+            case Inst::Tag::Switch:
+                lower_switch(i);
                 return;
 
             case Inst::Tag::SelectLazy:
@@ -6490,6 +6504,27 @@ private:
     // `operand == 0` is special-cased to 0 (it would otherwise wrap to all-ones and
     // yield W). Any x/z bit in the operand makes the whole result X, matching
     // iverilog (the LRM does not define x/z operands here).
+    // Ctz / Clz: index of the lowest / highest definite-1 bit of the operand's
+    // must plane, or the operand width when it has none. x/z bits (must = 0)
+    // never count as set, matching `bit === 1'b1`. The result is always definite
+    // (the must plane is known), so no X-propagation.
+    Plane lower_bit_index(Inst::Tag tag, Plane a) {
+        const uint32_t w   = width_of(a);
+        llvm::Value*   val = must_of(a);  // definite-1 bits
+        llvm::Value*   idx = nullptr;
+        if (tag == Inst::Tag::Ctz) {
+            // cttz(val, zero_poison=false) returns w when val == 0 (no set bit).
+            idx = b_.CreateIntrinsic(llvm::Intrinsic::cttz, { int_ty(w) }, { val, b_.getFalse() });
+        }
+        else {
+            // Highest set bit index = (w-1) - clz(val); w when val == 0.
+            llvm::Value* clz = b_.CreateIntrinsic(llvm::Intrinsic::ctlz, { int_ty(w) }, { val, b_.getFalse() });
+            llvm::Value* hb  = b_.CreateSub(llvm::ConstantInt::get(int_ty(w), w - 1), clz);
+            idx = b_.CreateSelect(b_.CreateICmpEQ(val, zero(w)), llvm::ConstantInt::get(int_ty(w), w), hb);
+        }
+        return two_val(cast(idx, 32, false));
+    }
+
     Plane lower_clog2(Plane a) {
         const uint32_t w   = width_of(a);
         llvm::Value*   val = must_of(a); // operand treated as unsigned
@@ -6972,6 +7007,62 @@ private:
 
         b_.SetInsertPoint(else_bb);
         lower_region(ir_->region(regs.else_));
+        branch_to(cont_bb);
+
+        b_.SetInsertPoint(cont_bb);
+    }
+
+    // Multiway `case` -> llvm switch. Packs the selector planes into an integer
+    // match key: for a 2-state selector the key is the bare value; for 4-state
+    // it is {may^must, must} with `must` on the low W bits. A clean value keys
+    // on its low W bits alone (its unknown half is zero), so the clean cases sit
+    // densely in [0, 2^W) and LLVM can build a jump table; any x/z selector sets
+    // a bit in the high half, landing outside every case value and falling to
+    // the default. This exactly reproduces `===`: the frontend supplies each
+    // clean label's value as its case key and guarantees the keys are unique.
+    void lower_switch(Index i) {
+        const Inst::Payload& p    = ir_->payload(i);
+        const auto           info = ir_->extra_data<SwitchInfo>(p.op_extra.extra);
+        const Plane          sel  = value_of(p.op_extra.op);
+
+        const uint32_t w    = width_of(sel);
+        llvm::Value*   must = must_of(sel);
+        llvm::Value*   key  = must;
+        uint32_t       keyw = w;
+        if (!sel.two) {
+            keyw            = 2 * w;
+            llvm::Type* kty = int_ty(keyw);
+            llvm::Value* u  = b_.CreateXor(must, may_of(sel));
+            key = b_.CreateOr(b_.CreateZExt(must, kty), b_.CreateShl(b_.CreateZExt(u, kty), w));
+        }
+        llvm::Type* kty = int_ty(keyw);
+
+        const std::span<const Index> arm_words = ir_->region(info.arms);
+        constexpr uint32_t           arm_len   = sizeof(SwitchArm) / sizeof(uint32_t);
+        const uint32_t               n_arms    = static_cast<uint32_t>(arm_words.size()) / arm_len;
+
+        auto* default_bb = llvm::BasicBlock::Create(ctx_, "case.default", fn_);
+        auto* cont_bb    = llvm::BasicBlock::Create(ctx_, "case.end", fn_);
+
+        llvm::SwitchInst* sw = b_.CreateSwitch(key, default_bb, n_arms);
+        for (uint32_t a = 0; a < n_arms; ++a) {
+            const auto arm = ir_->extra_data<SwitchArm>(
+              static_cast<ExtraIndex>(static_cast<uint32_t>(info.arms.start) + a * arm_len));
+            auto*      arm_bb = llvm::BasicBlock::Create(ctx_, "case.arm", fn_);
+
+            const std::span<const Index> kw = ir_->region(arm.keys);
+            for (size_t k = 0; k + 1 < kw.size(); k += 2) {
+                const uint64_t val = static_cast<uint64_t>(kw[k]) | (static_cast<uint64_t>(kw[k + 1]) << 32);
+                sw->addCase(llvm::ConstantInt::get(llvm::cast<llvm::IntegerType>(kty), val), arm_bb);
+            }
+
+            b_.SetInsertPoint(arm_bb);
+            lower_region(ir_->region(arm.body));
+            branch_to(cont_bb);
+        }
+
+        b_.SetInsertPoint(default_bb);
+        lower_region(ir_->region(info.default_));
         branch_to(cont_bb);
 
         b_.SetInsertPoint(cont_bb);

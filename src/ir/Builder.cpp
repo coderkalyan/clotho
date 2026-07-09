@@ -103,6 +103,35 @@ Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_reg
     return emit({ Inst::Tag::Cond, Inst::Payload{ .op_extra = { condition, extra } } }, loc);
 }
 
+Index Builder::switch_(Index selector, std::span<const SwitchArmBuild> arms, ExtraSlice default_region,
+                       SourceLoc loc) {
+    // Lay the arm records after their keys so every ExtraSlice is an absolute
+    // offset: each arm's keys (u64 -> two words) first, then the SwitchArm
+    // records contiguously, then the SwitchInfo referencing the record run.
+    std::vector<SwitchArm> records;
+    records.reserve(arms.size());
+    for (const SwitchArmBuild& arm : arms) {
+        const auto keys_start = static_cast<ExtraIndex>(extra_.size());
+        for (uint64_t k : arm.keys) {
+            extra_.push_back(static_cast<uint32_t>(k));
+            extra_.push_back(static_cast<uint32_t>(k >> 32));
+        }
+        const auto keys_end = static_cast<ExtraIndex>(extra_.size());
+        records.push_back(SwitchArm{ ExtraSlice{ keys_start, keys_end }, arm.body });
+    }
+
+    const auto arms_start = static_cast<ExtraIndex>(extra_.size());
+    for (const SwitchArm& rec : records) {
+        add_extra(rec);
+    }
+    const auto arms_end = static_cast<ExtraIndex>(extra_.size());
+
+    const ExtraIndex extra =
+      add_extra(SwitchInfo{ ExtraSlice{ arms_start, arms_end }, default_region });
+
+    return emit({ Inst::Tag::Switch, Inst::Payload{ .op_extra = { selector, extra } } }, loc);
+}
+
 Index Builder::select_lazy(Index pred, ExtraSlice then_region, Index then_val, ExtraSlice else_region, Index else_val,
                       SourceLoc loc) {
     const ExtraIndex extra = add_extra(SelectLazy{ then_region, then_val, else_region, else_val });
