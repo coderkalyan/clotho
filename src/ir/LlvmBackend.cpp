@@ -2532,6 +2532,45 @@ private:
                     cand[k] = 1;
                 }
             }
+            // Interior guard: only members whose ENTIRE sensitivity is
+            // candidate-written may merge. A member with a private external
+            // trigger (e.g. star fan-out: `assign c_i = s ^ x_i` with hot
+            // x_i) would drag the whole group awake on every private change —
+            // measured 10.9x slower than unfused on a 256-consumer star.
+            // Interior members wake only via changes propagating through the
+            // component, which is exactly the wave the fused topo order
+            // replaces. Non-interior candidates stay singletons but still
+            // provide edges/writes (their stores wake the groups they feed).
+            std::vector<uint8_t> cand_writes(static_cast<uint32_t>(mod_.signals().size()), 0);
+            for (uint32_t k = 0; k < nprocs; ++k) {
+                if (cand[k] == 0) {
+                    continue;
+                }
+                const Ir& ir = all[k].ir;
+                for (size_t j = 0; j < ir.inst_count(); ++j) {
+                    const auto idx = static_cast<Index>(j);
+                    if (ir.tag(idx) != Inst::Tag::Store) {
+                        continue;
+                    }
+                    const LvalueRoot r = lvalue_root(ir, ir.payload(idx).binary.l);
+                    if (ir.tag(r.root) == Inst::Tag::Signal) {
+                        cand_writes[static_cast<uint32_t>(ir.payload(r.root).signal)] = 1;
+                    }
+                }
+            }
+            std::vector<uint8_t> interior(nprocs, 0);
+            for (uint32_t k = 0; k < nprocs; ++k) {
+                if (cand[k] == 0) {
+                    continue;
+                }
+                interior[k] = 1;
+                for (const WaitEvent& w : all[k].wait_events) {
+                    if (cand_writes[static_cast<uint32_t>(w.signal)] == 0) {
+                        interior[k] = 0;
+                        break;
+                    }
+                }
+            }
             // Union-find over wake edges between candidates. self_start must
             // match: the group makes one seed decision (comb populations are
             // uniformly self_start in practice; a mismatch just splits).
@@ -2558,10 +2597,13 @@ private:
             }
             // Component members in scheduled-rank order (sub_order_ iteration
             // yields them pre-sorted), then chunked at the group cap; a
-            // leftover chunk of one stays a singleton.
+            // leftover chunk of one stays a singleton. Only interior members
+            // merge; components are still discovered over all candidates so
+            // two interior members joined through a non-interior producer
+            // land in one group.
             std::vector<std::vector<uint32_t>> comp(nprocs);
             for (const uint32_t k : sub_order_) {
-                if (cand[k] != 0) {
+                if (interior[k] != 0) {
                     comp[find(k)].push_back(k);
                 }
             }

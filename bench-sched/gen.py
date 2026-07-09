@@ -270,6 +270,40 @@ def gen_combchain(depth: int, cycles: int) -> str:
     out.append("endmodule")
     return "\n".join(out) + "\n"
 
+def gen_star(n: int, cycles: int) -> str:
+    """Adversarial comb-fusion fan-out: one candidate-produced signal s feeds
+    N consumers `assign c_i = s ^ x_i` that each also carry a private hot
+    input x_i (toggled round-robin by the clocked driver, s static). Naive
+    union-sensitivity fusion of the component runs all N bodies per private
+    toggle where the unfused schedule runs one (measured 10.9x slower at
+    N=256 before the interior guard). The guard demotes every consumer (x_i
+    is not candidate-written), so this must match unfused timing."""
+    out = []
+    out.append("module top;")
+    out.append("  reg [31:0] a = 0;")
+    out.append("  wire [31:0] s;")
+    out.append("  assign s = a + 32'd1;")
+    for i in range(n):
+        out.append(f"  reg x{i} = 0;")
+        out.append(f"  wire [31:0] c{i};")
+        out.append(f"  assign c{i} = s ^ {{31'b0, x{i}}};")
+    out.append("  integer cnt = 0;")
+    out.append("  reg clk = 0;")
+    out.append("  always #1 clk = ~clk;")
+    out.append("  always @(posedge clk) begin")
+    out.append(f"    case (cnt % {n})")
+    for i in range(n):
+        out.append(f"      {i}: x{i} <= ~x{i};")
+    out.append("    endcase")
+    out.append("    cnt <= cnt + 1;")
+    out.append(f"    if (cnt == {cycles}) begin")
+    out.append(f'      $display("done %h", c0 ^ c{n - 1});')
+    out.append("      $finish;")
+    out.append("    end")
+    out.append("  end")
+    out.append("endmodule")
+    return "\n".join(out) + "\n"
+
 def _primes(count: int, start: int = 3):
     """First COUNT odd primes from START."""
     primes = []
@@ -381,7 +415,8 @@ def gen_onehot(n: int, cycles: int, order: str) -> str:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("bench", choices=["regs", "tri", "chain", "thunk", "wheel",
-                                      "combchain", "timers", "bigcase", "onehot"])
+                                      "combchain", "timers", "bigcase", "onehot",
+                                      "star"])
     ap.add_argument("--n", type=int, required=True)
     ap.add_argument("--cycles", type=int, required=True)
     ap.add_argument("--fused", action="store_true")
@@ -405,5 +440,7 @@ if __name__ == "__main__":
         sys.stdout.write(gen_bigcase(a.n, a.cycles))
     elif a.bench == "onehot":
         sys.stdout.write(gen_onehot(a.n, a.cycles, a.order))
+    elif a.bench == "star":
+        sys.stdout.write(gen_star(a.n, a.cycles))
     else:
         sys.stdout.write(gen_wheel(a.cycles))
