@@ -70,6 +70,133 @@ def gen_regs(n: int, cycles: int, fused: bool, seed: int | None) -> str:
     out.append("endmodule")
     return "\n".join(out) + "\n"
 
+def gen_wideff(n: int, cycles: int) -> str:
+    # One clocked process whose single straight-line block holds N whole-signal
+    # scalar NBAs to independent flops. Isolates NBA *enqueue* overhead: per-signal
+    # lowering enqueues each of the N signals every cycle (O(N)); block-commit
+    # lowering enqueues the one block (O(1)). Self-increment RHS keeps the work
+    # per assignment trivial so enqueue/commit machinery dominates. All state,
+    # the cycle counter, and the finisher share the one block (one process, one
+    # block) so nothing else perturbs the enqueue count.
+    out = []
+    out.append("module top;")
+    out.append("  reg clk = 0;")
+    out.append("  reg [31:0] cyc = 0;")
+    for i in range(n):
+        out.append(f"  reg [31:0] q{i} = 32'd{i * 2654435761 % 4294967296};")
+    out.append("  always #5 clk = ~clk;")
+    out.append("  always @(posedge clk) begin")
+    out.append("    cyc <= cyc + 1;")
+    for i in range(n):
+        out.append(f"    q{i} <= q{i} + 32'd{(i * 40503 + 12345) % 65536 | 1};")
+    xor = " ^ ".join(f"q{i}" for i in range(n))
+    out.append(f"    if (cyc == 32'd{cycles}) begin")
+    out.append(f'      $display("done %h", {xor});')
+    out.append("      $finish;")
+    out.append("    end")
+    out.append("  end")
+    out.append("endmodule")
+    return "\n".join(out) + "\n"
+
+def gen_nbablocks(blocks: int, sig_per_block: int, cycles: int) -> str:
+    # `blocks` independent clocked processes, each staging `sig_per_block` whole-
+    # signal scalar NBAs to independent flops. Total committed signals =
+    # blocks * sig_per_block; holding that product fixed while varying the split
+    # isolates NBA-region *dispatch* cost (per-block commit-fn dispatch) from
+    # per-signal *commit* work. blocks=1 is one wide block (= wideff);
+    # sig_per_block=1 is dispatch-dominated (one commit fn per flop per cycle),
+    # the case that separates threaded dispatch from a central worklist loop.
+    n = blocks * sig_per_block
+    out = ["module top;", "  reg clk = 0;", "  reg [31:0] cyc = 0;"]
+    for i in range(n):
+        out.append(f"  reg [31:0] q{i} = 32'd{i * 2654435761 % 4294967296};")
+    out.append("  always #5 clk = ~clk;")
+    for b in range(blocks):
+        out.append("  always @(posedge clk) begin")
+        for s in range(sig_per_block):
+            i = b * sig_per_block + s
+            out.append(f"    q{i} <= q{i} + 32'd{(i * 40503 + 12345) % 65536 | 1};")
+        out.append("  end")
+    xor = " ^ ".join(f"q{i}" for i in range(n))
+    out.append("  always @(posedge clk) begin")
+    out.append("    cyc <= cyc + 1;")
+    out.append(f"    if (cyc == 32'd{cycles}) begin")
+    out.append(f'      $display("done %h", {xor});')
+    out.append("      $finish;")
+    out.append("    end")
+    out.append("  end")
+    out.append("endmodule")
+    return "\n".join(out) + "\n"
+
+def gen_nbamem(n: int, width: int, cycles: int, select: str) -> str:
+    # N nonblocking writes to distinct elements of one unpacked-array (memory) per
+    # cycle, via a dynamic-index loop -- the array-element NBA deferred-queue path.
+    # `width` is the element width (sweep incl. >64 to exercise wide records).
+    # select="whole": mem[j] <= ...  (mask-elided); select="part": mem[j][lo] <= ...
+    # (masked). Checksum XOR-reduces all elements at the end.
+    w = width
+    inc = "1"
+    # 32-bit XOR fold of each element (>64-bit $display is unsupported).
+    words = " ^ ".join(f"mem[j][{k*32+31}:{k*32}]" for k in range((w + 31) // 32))
+    out = ["module top;", "  reg clk = 0;", "  reg [31:0] cyc = 0;",
+           f"  reg [{w-1}:0] mem [0:{n-1}];",
+           "  reg [31:0] acc;", "  integer j;"]
+    out.append("  initial begin")
+    out.append(f"    for (j = 0; j < {n}; j = j + 1) mem[j] = j * 32'd2654435761;")
+    out.append("  end")
+    out.append("  always #5 clk = ~clk;")
+    out.append("  always @(posedge clk) begin")
+    if select == "part":
+        half = w // 2
+        out.append(f"    for (j = 0; j < {n}; j = j + 1) mem[j][{half-1}:0] <= mem[j][{half-1}:0] + {inc};")
+    else:
+        out.append(f"    for (j = 0; j < {n}; j = j + 1) mem[j] <= mem[j] + {inc};")
+    out.append("  end")
+    out.append("  always @(posedge clk) begin")
+    out.append("    cyc <= cyc + 1;")
+    out.append(f"    if (cyc == 32'd{cycles}) begin")
+    out.append("      acc = 0;")
+    out.append(f"      for (j = 0; j < {n}; j = j + 1) acc = acc ^ {words};")
+    out.append('      $display("done %h", acc);')
+    out.append("      $finish;")
+    out.append("    end")
+    out.append("  end")
+    out.append("endmodule")
+    return "\n".join(out) + "\n"
+
+def gen_partblocks(blocks: int, sig_per_block: int, cycles: int, select: str) -> str:
+    # Like nbablocks, but every NBA is a *partial* (bit/part-select) target, to
+    # exercise the masked commit path. select="static": a constant [15:0] half-word
+    # RMW (compile-time mask); select="dynamic": an indexed part-select [off +: 8]
+    # at a runtime offset (runtime mask). Same blocks x sig_per_block dispatch axis
+    # as nbablocks so the two are comparable.
+    n = blocks * sig_per_block
+    out = ["module top;", "  reg clk = 0;", "  reg [31:0] cyc = 0;"]
+    for i in range(n):
+        out.append(f"  reg [31:0] q{i} = 32'd{i * 2654435761 % 4294967296};")
+    out.append("  always #5 clk = ~clk;")
+    for b in range(blocks):
+        out.append("  always @(posedge clk) begin")
+        for s in range(sig_per_block):
+            i = b * sig_per_block + s
+            c = (i * 40503 + 12345) % 65536 | 1
+            if select == "dynamic":
+                # off in {0,8,16,24} (always in bounds for [off +: 8]).
+                out.append(f"    q{i}[(cyc[1:0] << 3) +: 8] <= q{i}[7:0] + 8'd{c & 0xff | 1};")
+            else:
+                out.append(f"    q{i}[15:0] <= q{i}[15:0] + 16'd{c};")
+        out.append("  end")
+    xor = " ^ ".join(f"q{i}" for i in range(n))
+    out.append("  always @(posedge clk) begin")
+    out.append("    cyc <= cyc + 1;")
+    out.append(f"    if (cyc == 32'd{cycles}) begin")
+    out.append(f'      $display("done %h", {xor});')
+    out.append("      $finish;")
+    out.append("    end")
+    out.append("  end")
+    out.append("endmodule")
+    return "\n".join(out) + "\n"
+
 def gen_thunk(n: int, cycles: int, shape: str) -> str:
     out = []
     out.append("module top;")
@@ -416,13 +543,20 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("bench", choices=["regs", "tri", "chain", "thunk", "wheel",
                                       "combchain", "timers", "bigcase", "onehot",
+                                      "wideff", "nbablocks", "partblocks", "nbamem",
                                       "star"])
-    ap.add_argument("--n", type=int, required=True)
+    ap.add_argument("--n", type=int, required=True,
+                    help="nbablocks: number of blocks (processes)")
     ap.add_argument("--cycles", type=int, required=True)
     ap.add_argument("--fused", action="store_true")
     ap.add_argument("--seed", type=int, default=None, help="regs: shuffle decl order")
     ap.add_argument("--order", default="topo", help="tri: topo|revtopo|s<seed>")
     ap.add_argument("--shape", default="comb", help="thunk: comb|ff")
+    ap.add_argument("--sig-per-block", type=int, default=1,
+                    help="nbablocks/partblocks: NBAs per block")
+    ap.add_argument("--select", default="static",
+                    help="partblocks: static|dynamic; nbamem: whole|part")
+    ap.add_argument("--width", type=int, default=32, help="nbamem: element width")
     a = ap.parse_args()
     if a.bench == "regs":
         sys.stdout.write(gen_regs(a.n, a.cycles, a.fused, a.seed))
@@ -440,6 +574,14 @@ if __name__ == "__main__":
         sys.stdout.write(gen_bigcase(a.n, a.cycles))
     elif a.bench == "onehot":
         sys.stdout.write(gen_onehot(a.n, a.cycles, a.order))
+    elif a.bench == "wideff":
+        sys.stdout.write(gen_wideff(a.n, a.cycles))
+    elif a.bench == "nbablocks":
+        sys.stdout.write(gen_nbablocks(a.n, a.sig_per_block, a.cycles))
+    elif a.bench == "partblocks":
+        sys.stdout.write(gen_partblocks(a.n, a.sig_per_block, a.cycles, a.select))
+    elif a.bench == "nbamem":
+        sys.stdout.write(gen_nbamem(a.n, a.width, a.cycles, a.select))
     elif a.bench == "star":
         sys.stdout.write(gen_star(a.n, a.cycles))
     else:

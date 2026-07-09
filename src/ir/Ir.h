@@ -470,6 +470,23 @@ struct EnumNameInfo {
     ExtraSlice entries;
 };
 
+// Which 4-state bit values a CountBits op tallies (LRM 20.9 $countbits control
+// bits). Bits are OR-combined into CountBitsInfo::mask; $countones is CountOne
+// alone, $isunknown is CountX | CountZ.
+enum CountBitsClass : uint32_t {
+    CountZero = 1u << 0,
+    CountOne  = 1u << 1,
+    CountX    = 1u << 2,
+    CountZ    = 1u << 3,
+};
+
+// Extra payload for `count_bits`: the operand is the op; this selects which
+// per-bit 4-state values are counted (a CountBitsClass OR-mask).
+struct CountBitsInfo {
+    // OR of CountBitsClass bits.
+    uint32_t mask;
+};
+
 // Extra payload for `wait`: one (signal, edge) event of an intra-body event
 // control. A `@(a or posedge b)` wait carries several of these in a row.
 struct WaitEdge {
@@ -517,6 +534,7 @@ static_assert(ExtraPayload<StrPutcInfo>);
 static_assert(ExtraPayload<StrSubstrInfo>);
 static_assert(ExtraPayload<EnumNameEntry>);
 static_assert(ExtraPayload<EnumNameInfo>);
+static_assert(ExtraPayload<CountBitsInfo>);
 
 struct Inst {
     enum class Tag : uint8_t {
@@ -842,6 +860,14 @@ struct Inst {
         // makes the whole result X (iverilog oracle — the LRM is silent). Lowers
         // to a count-leading-zeros: `operand == 0 ? 0 : W - clz(operand - 1)`.
         Clog2,
+        // $countbits / $countones / $onehot / $onehot0 / $isunknown building
+        // block (payload: op_extra -> CountBitsInfo; the op is the counted
+        // value). Tallies the operand's bits whose 4-state value is in the
+        // info mask (LRM 20.9), -> a definite 2-state 32-bit `int`. $countones
+        // masks CountOne; $isunknown is `CountBits(CountX|CountZ) != 0`; the
+        // one-hot forms compare `CountBits(CountOne)` against 1. A constant
+        // operand folds in slang and never reaches this tag.
+        CountBits,
     };
 
     // Which union member a tag activates. Drives payload_kind() / operands().

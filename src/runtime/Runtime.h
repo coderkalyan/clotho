@@ -224,35 +224,30 @@ int32_t rt_random(void);
 
 // -- Deferred nonblocking writes to unpacked-array elements --
 //
-// A synchronous memory write `mem[i] <= rhs` cannot use the per-signal NBA
-// shadow (whole-signal, statically keyed). Each element write is appended to
-// this deferred queue in the active region and replayed in the NBA region. A
-// record is a bytewise masked merge into the live element slot, so the queue is
-// width-agnostic; the value / mask byte blobs are copied into runtime-owned
-// storage at push time. One global queue serves the whole design.
+// A synchronous memory write `mem[i] <= rhs` cannot use the per-signal NBA shadow
+// (whole-signal, statically keyed), so each element write is deferred to the NBA
+// region. The runtime only owns per-array growable record buffers; the record
+// layout (destination pointer(s) + value [+ mask]) is defined and filled by the
+// backend, monomorphized on the element's width / z-ness. Each array-NBA signal
+// has a dense `idx`. The buffers are reused (count reset, capacity kept) across
+// timesteps, so steady-state pushes allocate nothing at any element width.
 
-// Append one deferred element write. `sig` identifies the array signal (for
-// post-commit wake servicing). `mm_ptr` / `z_ptr` point at the live element's
-// must|may and z words; `*_val` are the bits to write and `*_mask` selects which
-// bits (1 => take from val), each `*_bytes` long. A target whose slot stores no
-// z word passes `z_ptr` null with `z_bytes` 0.
-void rt_nba_arr_push(uint32_t sig, void* mm_ptr, const void* mm_val, const void* mm_mask, uint32_t mm_bytes,
-                     void* z_ptr, const void* z_val, const void* z_mask, uint32_t z_bytes);
+// Reserve one `stride`-byte record slot in array `idx`'s buffer and return its
+// address for the backend to fill. The buffer grows geometrically; the returned
+// pointer is valid until the next slot call on the same idx.
+void* rt_nba_arr_slot(uint32_t idx, uint32_t stride);
 
-// Number of queued element writes; the NBA region tests this to decide whether a
-// commit pass is needed.
-uint32_t rt_nba_arr_pending(void);
+// Base pointer and record count of array `idx`'s buffer, read once in the NBA
+// region to drive the backend-emitted commit loop.
+void* rt_nba_arr_base(uint32_t idx);
+uint32_t rt_nba_arr_count(uint32_t idx);
 
-// Replay every queued write into its destination (bytewise (dest & ~mask) | (val
-// & mask)), in push order so a later write to the same element wins. Records
-// stay queued (for rt_nba_arr_dirty) until rt_nba_arr_reset.
-void rt_nba_arr_commit(void);
+// Total records staged across all arrays this pass; the NBA region tests this to
+// decide whether an array commit is needed.
+uint32_t rt_nba_arr_any(void);
 
-// Non-zero iff any currently-queued write targets `sig` (queried after commit to
-// decide whether to wake that array's readers).
-int rt_nba_arr_dirty(uint32_t sig);
-
-// Drop all queued writes (called after a commit + wake pass).
+// Reset every array's record count to zero (buffers keep their capacity). Called
+// after the commit + wake pass.
 void rt_nba_arr_reset(void);
 
 // -- SystemVerilog string objects --

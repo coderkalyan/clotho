@@ -136,6 +136,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::StrPutc:
         case T::StrSubstr:
         case T::EnumName:
+        case T::CountBits:
             return K::OpExtra;
     }
 

@@ -104,6 +104,11 @@ public:
     // Packed cast of a string to target packed type `type`.
     Index str_to_packed(Index str, Ref type, SourceLoc loc);
 
+    // $countbits / $countones / $onehot* / $isunknown building block: tally the
+    // bits of `op` whose 4-state value is selected by `mask` (a CountBitsClass
+    // OR-mask). Yields a definite 2-state 32-bit int.
+    Index count_bits(Index op, uint32_t mask, SourceLoc loc);
+
     // -- Timing --
     // Event wait `@(a or posedge b ...)`: suspend until ANY listed (signal, edge)
     // fires. Each WaitEdge carries an ir::Edge value as u32, keeping the builder

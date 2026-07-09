@@ -200,6 +200,12 @@ Index Builder::enum_name(Index val, std::span<const std::pair<uint64_t, std::str
     return emit({ Inst::Tag::EnumName, Inst::Payload{ .op_extra = { val, extra } } }, loc);
 }
 
+Index Builder::count_bits(Index op, uint32_t mask, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(CountBitsInfo{ mask });
+
+    return emit({ Inst::Tag::CountBits, Inst::Payload{ .op_extra = { op, extra } } }, loc);
+}
+
 Index Builder::wait(std::span<const WaitEdge> events, SourceLoc loc) {
     // Pack the WaitEdge records back-to-back, then a WaitInfo pointing at the run.
     const auto start = static_cast<uint32_t>(extra_.size());

@@ -2693,6 +2693,153 @@ private:
         fail("enum method '" + std::string(name) + "' is not supported");
     }
 
+    std::string format_typename(const slang::ast::Type& type) {
+        const slang::ast::Type& t = type.getCanonicalType();
+
+        // Non-default signing suffix (LRM 20.6.1 rule b).
+        const auto signing = [](const slang::ast::Type& ty, bool default_signed) -> std::string {
+            if (ty.isSigned() == default_signed) {
+                return "";
+            }
+            return ty.isSigned() ? " signed" : " unsigned";
+        };
+        const auto range_str = [](slang::ConstantRange r) {
+            return "[" + std::to_string(r.left) + ":" + std::to_string(r.right) + "]";
+        };
+
+        if (const auto* st = t.as_if<slang::ast::ScalarType>()) {
+            // Predefined 1-bit types; default unsigned.
+            const char* base = st->scalarKind == slang::ast::ScalarType::Bit    ? "bit"
+                               : st->scalarKind == slang::ast::ScalarType::Reg ? "reg"
+                                                                                : "logic";
+            return base + signing(*st, false);
+        }
+        if (const auto* it = t.as_if<slang::ast::PredefinedIntegerType>()) {
+            using K = slang::ast::PredefinedIntegerType::Kind;
+            const char* base = it->integerKind == K::Int        ? "int"
+                               : it->integerKind == K::Byte     ? "byte"
+                               : it->integerKind == K::ShortInt ? "shortint"
+                               : it->integerKind == K::LongInt  ? "longint"
+                               : it->integerKind == K::Integer  ? "integer"
+                                                                : "time";
+            return base + signing(*it, slang::ast::PredefinedIntegerType::isDefaultSigned(it->integerKind));
+        }
+        if (const auto* pa = t.as_if<slang::ast::PackedArrayType>()) {
+            // Collect the packed dimensions outermost-first down to the base
+            // scalar; the whole vector's signing sits between base and dims.
+            std::string             dims;
+            const slang::ast::Type* cur = pa;
+            while (const auto* p = cur->as_if<slang::ast::PackedArrayType>()) {
+                dims += range_str(p->range);
+                cur = &p->elementType.getCanonicalType();
+            }
+            const auto* base = cur->as_if<slang::ast::ScalarType>();
+            if (base == nullptr) {
+                // A packed array of enum / struct — unsupported base.
+                fail("$typename of this packed type is not supported");
+            }
+            const char* name = base->scalarKind == slang::ast::ScalarType::Bit    ? "bit"
+                               : base->scalarKind == slang::ast::ScalarType::Reg ? "reg"
+                                                                                  : "logic";
+            return name + signing(*pa, false) + dims;
+        }
+        if (const auto* ua = t.as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
+            // Unpacked dimension: a "$" placeholder for the anonymous array name
+            // (rule d), then the range (LRM: "logic[7:0]$[0:9]").
+            return format_typename(ua->elementType) + "$" + range_str(ua->range);
+        }
+        if (t.isFloating()) {
+            const auto& ft = t.as<slang::ast::FloatingType>();
+            return ft.floatKind == slang::ast::FloatingType::ShortReal ? "shortreal"
+                   : ft.floatKind == slang::ast::FloatingType::RealTime ? "realtime"
+                                                                        : "real";
+        }
+        if (t.isString()) {
+            return "string";
+        }
+        // enum / struct / union / class / interface / dynamic array / queue /
+        // associative array / chandle / event — Clotho does not lower these, so
+        // it cannot vouch for their $typename string.
+        fail("$typename of this type is not supported");
+    }
+
+    // Classify a $countbits control-bit argument (LRM 20.9): a constant 1-bit
+    // value naming which 4-state value that control tallies. A non-constant
+    // control is rejected (it would need a runtime class-mask select).
+    uint32_t count_control_class(const Expression& ctrl) {
+        slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+        slang::ast::EvalContext    ectx(actx);
+        const slang::ConstantValue cv = ctrl.eval(ectx);
+        if (!cv.isInteger()) {
+            fail("$countbits control bit must be a constant 0/1/x/z");
+        }
+        const slang::logic_t bit = cv.integer()[0];
+        if (bit.value == slang::logic_t::X_VALUE) {
+            return ir::CountX;
+        }
+        if (bit.value == slang::logic_t::Z_VALUE) {
+            return ir::CountZ;
+        }
+        return bit.value != 0 ? ir::CountOne : ir::CountZero;
+    }
+
+    // Runtime lowering for the utility bit-query functions (LRM 20.9; $bits on a
+    // dynamic string per 20.6.2) when the operand is not constant. A constant
+    // operand folds in slang and never reaches here.
+    ir::Index lower_bit_query(std::string_view name, const CallExpression& call, ir::Builder& b,
+                              const ir::SourceLoc l) {
+        const auto    args = call.arguments();
+        const ir::Ref i32  = make_int_type(32, false, true);
+
+        // $bits: the only non-constant operand Clotho stores is a dynamic
+        // string, whose bit count is 8 per current character (LRM 6.16, 20.6.2).
+        // A fixed-size operand would have const-folded above; any other dynamic
+        // type (queue / dynamic array / class handle) is unsupported storage.
+        if (name == "$bits") {
+            if (args.size() != 1 || !is_string_expr(*args[0])) {
+                fail("$bits of a non-constant, non-string operand is not supported");
+            }
+            const ir::Index len   = b.unary(ir::Inst::Tag::StrLen, lower_expr(*args[0], b), l);
+            const ir::Index eight = b.constant(module_.pool.put_int(i32, 8), l);
+            return b.resize(b.binary(ir::Inst::Tag::Mul, len, eight, l), lower_type(*call.type), l);
+        }
+
+        // The 20.9 counting family. The first argument is the counted value;
+        // $countbits additionally carries constant control-bit arguments naming
+        // which 4-state values to tally.
+        const ir::Index val = lower_expr(*args[0], b);
+
+        uint32_t mask = ir::CountOne; // $countones / $onehot* count definite-1 bits
+        if (name == "$isunknown") {
+            mask = ir::CountX | ir::CountZ;
+        }
+        else if (name == "$countbits") {
+            mask = 0;
+            for (size_t k = 1; k < args.size(); ++k) {
+                mask |= count_control_class(*args[k]);
+            }
+        }
+
+        const ir::Index count = b.count_bits(val, mask, l);
+
+        if (name == "$countones" || name == "$countbits") {
+            return b.resize(count, lower_type(*call.type), l);
+        }
+        // $onehot -> count == 1; $onehot0 -> count <= 1; $isunknown -> count != 0.
+        ir::Inst::Tag   op  = ir::Inst::Tag::Ne;
+        uint64_t        rhs = 0;
+        if (name == "$onehot") {
+            op  = ir::Inst::Tag::Eq;
+            rhs = 1;
+        }
+        else if (name == "$onehot0") {
+            op  = ir::Inst::Tag::Le;
+            rhs = 1;
+        }
+        return b.resize(b.binary(op, count, b.constant(module_.pool.put_int(i32, rhs), l), l),
+                        lower_type(*call.type), l);
+    }
+
     // Lower a system function call used as an rvalue (e.g. `$time`). User function
     // calls are not yet supported.
     ir::Index lower_sysfunc(const CallExpression& call, ir::Builder& b) {
@@ -2786,6 +2933,38 @@ private:
             // (Clog2). The argument is self-determined and treated as unsigned
             // (LRM §20.8.1); its own width bounds the result.
             return b.unary(ir::Inst::Tag::Clog2, lower_expr(*call.arguments()[0], b), l);
+        }
+
+        // Utility query / bit-counting system functions (LRM 20.6, 20.9). Each
+        // is a compile-time constant for a fixed-size operand: slang's constant
+        // evaluator folds $bits / $countones / $countbits / $onehot / $onehot0 /
+        // $isunknown to a literal (e.g. $bits queries the operand's type, never
+        // its value), so the common constant-arg usage costs nothing at
+        // runtime. Only a non-constant (runtime signal / dynamic string)
+        // argument reaches the IR lowering.
+        if (name == "$bits" || name == "$countones" || name == "$countbits" || name == "$onehot" ||
+            name == "$onehot0" || name == "$isunknown") {
+            slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+            slang::ast::EvalContext    ectx(actx);
+            const slang::ConstantValue cv = call.eval(ectx);
+            if (cv.isInteger()) {
+                return b.constant(svint_to_ref(cv.integer(), lower_type(*call.type)), l);
+            }
+            return lower_bit_query(name, call, b, l);
+        }
+
+        // TODO: $typename (LRM 20.6.1). slang folds it to a string, but its type
+        // $typename (LRM 20.6.1): the operand's resolved type name as a string
+        // constant. Clotho formats the type itself (format_typename) rather than
+        // trusting slang's Type::toString, so it emits only names for the type
+        // kinds it actually lowers and controls the exact LRM format. The
+        // argument's self-determined type is named; the type is resolved during
+        // elaboration but never evaluated.
+        if (name == "$typename") {
+            if (call.arguments().size() != 1) {
+                fail("$typename expects exactly one argument");
+            }
+            return b.constant(string_value_ref(format_typename(*call.arguments()[0]->type)), l);
         }
 
         // $fopen (LRM §21.3): one argument opens a multichannel descriptor (MCD)
