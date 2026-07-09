@@ -2590,6 +2590,76 @@ private:
         return b.scanf(source, is_sscanf, fmt, outs, l);
     }
 
+    std::string format_typename(const slang::ast::Type& type) {
+        const slang::ast::Type& t = type.getCanonicalType();
+
+        // Non-default signing suffix (LRM 20.6.1 rule b).
+        const auto signing = [](const slang::ast::Type& ty, bool default_signed) -> std::string {
+            if (ty.isSigned() == default_signed) {
+                return "";
+            }
+            return ty.isSigned() ? " signed" : " unsigned";
+        };
+        const auto range_str = [](slang::ConstantRange r) {
+            return "[" + std::to_string(r.left) + ":" + std::to_string(r.right) + "]";
+        };
+
+        if (const auto* st = t.as_if<slang::ast::ScalarType>()) {
+            // Predefined 1-bit types; default unsigned.
+            const char* base = st->scalarKind == slang::ast::ScalarType::Bit    ? "bit"
+                               : st->scalarKind == slang::ast::ScalarType::Reg ? "reg"
+                                                                                : "logic";
+            return base + signing(*st, false);
+        }
+        if (const auto* it = t.as_if<slang::ast::PredefinedIntegerType>()) {
+            using K = slang::ast::PredefinedIntegerType::Kind;
+            const char* base = it->integerKind == K::Int        ? "int"
+                               : it->integerKind == K::Byte     ? "byte"
+                               : it->integerKind == K::ShortInt ? "shortint"
+                               : it->integerKind == K::LongInt  ? "longint"
+                               : it->integerKind == K::Integer  ? "integer"
+                                                                : "time";
+            return base + signing(*it, slang::ast::PredefinedIntegerType::isDefaultSigned(it->integerKind));
+        }
+        if (const auto* pa = t.as_if<slang::ast::PackedArrayType>()) {
+            // Collect the packed dimensions outermost-first down to the base
+            // scalar; the whole vector's signing sits between base and dims.
+            std::string             dims;
+            const slang::ast::Type* cur = pa;
+            while (const auto* p = cur->as_if<slang::ast::PackedArrayType>()) {
+                dims += range_str(p->range);
+                cur = &p->elementType.getCanonicalType();
+            }
+            const auto* base = cur->as_if<slang::ast::ScalarType>();
+            if (base == nullptr) {
+                // A packed array of enum / struct — unsupported base.
+                fail("$typename of this packed type is not supported");
+            }
+            const char* name = base->scalarKind == slang::ast::ScalarType::Bit    ? "bit"
+                               : base->scalarKind == slang::ast::ScalarType::Reg ? "reg"
+                                                                                  : "logic";
+            return name + signing(*pa, false) + dims;
+        }
+        if (const auto* ua = t.as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
+            // Unpacked dimension: a "$" placeholder for the anonymous array name
+            // (rule d), then the range (LRM: "logic[7:0]$[0:9]").
+            return format_typename(ua->elementType) + "$" + range_str(ua->range);
+        }
+        if (t.isFloating()) {
+            const auto& ft = t.as<slang::ast::FloatingType>();
+            return ft.floatKind == slang::ast::FloatingType::ShortReal ? "shortreal"
+                   : ft.floatKind == slang::ast::FloatingType::RealTime ? "realtime"
+                                                                        : "real";
+        }
+        if (t.isString()) {
+            return "string";
+        }
+        // enum / struct / union / class / interface / dynamic array / queue /
+        // associative array / chandle / event — Clotho does not lower these, so
+        // it cannot vouch for their $typename string.
+        fail("$typename of this type is not supported");
+    }
+
     // Classify a $countbits control-bit argument (LRM 20.9): a constant 1-bit
     // value naming which 4-state value that control tallies. A non-constant
     // control is rejected (it would need a runtime class-mask select).
@@ -2772,17 +2842,17 @@ private:
         }
 
         // TODO: $typename (LRM 20.6.1). slang folds it to a string, but its type
-        // printer omits the space the LRM mandates between a keyword and its
-        // packed range — slang yields "logic[7:0]" where LRM 20.6.1(h) and its
-        // own example require "logic [7:0]" (while unpacked dimensions such as
-        // "$[0:9]" take no space). Emitting slang's string directly would be a
-        // silently non-compliant type name, which matters because $typename is
-        // defined for exact string comparison. Reproducing the LRM format across
-        // simple / struct / enum / unpacked / package-qualified forms needs a
-        // dedicated formatter; rejected loudly until then.
+        // $typename (LRM 20.6.1): the operand's resolved type name as a string
+        // constant. Clotho formats the type itself (format_typename) rather than
+        // trusting slang's Type::toString, so it emits only names for the type
+        // kinds it actually lowers and controls the exact LRM format. The
+        // argument's self-determined type is named; the type is resolved during
+        // elaboration but never evaluated.
         if (name == "$typename") {
-            fail("$typename is not supported (slang's type-name format deviates "
-                 "from LRM 20.6.1 whitespace rules)");
+            if (call.arguments().size() != 1) {
+                fail("$typename expects exactly one argument");
+            }
+            return b.constant(string_value_ref(format_typename(*call.arguments()[0]->type)), l);
         }
 
         // $fopen (LRM §21.3): one argument opens a multichannel descriptor (MCD)

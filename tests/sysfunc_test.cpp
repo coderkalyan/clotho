@@ -169,11 +169,40 @@ TEST_CASE("bit-query results feed expressions") {
     CHECK(out == "all set\n16\n");
 }
 
-// -- $typename (guarded) ----------------------------------------------------
+// -- $typename --------------------------------------------------------------
 
-// slang's type-name printer omits the LRM 20.6.1 whitespace, so $typename is
-// rejected loudly rather than emitting a non-compliant string.
-TEST_CASE("$typename is rejected loudly") {
-    const std::string err = lower_error("module m; logic [7:0] v; initial $display(\"%s\", $typename(v)); endmodule");
-    CHECK(err.find("$typename") != std::string::npos);
+TEST_CASE("$typename formats the supported type kinds") {
+    const std::string out = run_capture(prog(
+      "typedef bit node; bit b; logic l; reg r; int i; integer ig; byte by;"
+      " shortint sh; longint lo; time tm; bit [7:0] bv; logic [15:0] lv;"
+      " logic signed [7:0] sv; bit [0:3] rev; node [2:0] nn; int unsigned iu;"
+      " logic [7:0] arr [0:9]; string s; real rr; shortreal sr;",
+      "$write(\"%s|%s|%s|%s|%s|%s|%s|\", $typename(b), $typename(l), $typename(r),"
+      " $typename(i), $typename(ig), $typename(by), $typename(sh));"
+      "$write(\"%s|%s|%s|%s|%s|%s|\", $typename(lo), $typename(tm), $typename(bv),"
+      " $typename(lv), $typename(sv), $typename(rev));"
+      "$display(\"%s|%s|%s|%s|%s|%s\", $typename(nn), $typename(iu), $typename(arr),"
+      " $typename(s), $typename(rr), $typename(sr));"));
+    CHECK(out ==
+          "bit|logic|reg|int|integer|byte|shortint|"
+          "longint|time|bit[7:0]|logic[15:0]|logic signed[7:0]|bit[0:3]|"
+          "bit[2:0]|int unsigned|logic[7:0]$[0:9]|string|real|shortreal\n");
+}
+
+// A data-type argument names the same type as an expression of that type.
+TEST_CASE("$typename of a data-type argument") {
+    const std::string out = run_capture(
+      prog("", "$display(\"%s %s\", $typename(logic [7:0]), $typename(int));"));
+    CHECK(out == "logic[7:0] int\n");
+}
+
+// enum / struct / union / class are legal types whose $typename string
+// Clotho does not produce yet, so $typename rejects them loudly rather than
+// fabricating a string.
+TEST_CASE("$typename of an unsupported type kind fails loudly") {
+    CHECK(lower_error("module m; typedef enum {A,B} e; e x; initial $display($typename(x)); endmodule")
+            .find("$typename") != std::string::npos);
+    CHECK(lower_error("module m; typedef struct packed {logic a;} s; s x;"
+                      " initial $display($typename(x)); endmodule")
+            .find("$typename") != std::string::npos);
 }
