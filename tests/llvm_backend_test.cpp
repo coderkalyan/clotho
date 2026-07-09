@@ -2733,11 +2733,15 @@ TEST_CASE("NBA of a z value round-trips the shadow commit; never-z NBAs use the 
             end
         endmodule
     )";
-    const std::string ir = emit(src);
+    // Whole-scalar targets default to the block-commit path; pin the per-signal
+    // bucket path (still live for partial/array targets and --no-block-nba) to
+    // keep asserting its z/noz bucket split.
+    const std::string ir = emit(src, { .block_nba = false });
     // Same width, different z-ness: two distinct commit buckets.
     CHECK(ir.find("clotho.nba.w4.full = ") != std::string::npos);
     CHECK(ir.find("clotho.nba.w4.full.noz = ") != std::string::npos);
     CHECK(run_capture(src) == "zz01 0101\n");
+    CHECK(run_capture(src, { .block_nba = false }) == "zz01 0101\n");
 }
 
 TEST_CASE("partial NBA merges z bits into a z-carrying target") {

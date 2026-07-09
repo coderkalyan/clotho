@@ -4,6 +4,7 @@
 #include <array>
 #include <bit>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -326,6 +327,10 @@ struct SignalSlot {
     // sh_* members are field indices into the shadow struct.
     bool     nba           = false;
     bool     nba_partial   = false;
+    // Whole-signal scalar target committed per straight-line block (config_.block_nba):
+    // its shadow is registered by the block-commit path, not a per-signal bucket
+    // worklist. False for partial targets, array elements, or when block_nba is off.
+    bool     nba_block     = false;
     uint32_t nba_id        = 0;
     uint32_t nba_bucket    = 0;
     uint32_t sh_mm_field   = 0;
@@ -419,6 +424,10 @@ public:
         for (const std::vector<uint32_t>& g : groups_) {
             group_fns.push_back(lower_group(g));
         }
+        // Blocks are discovered during the lowering above; size the block-commit
+        // globals and emit the commit / enqueue functions now, before emit_main
+        // wires the NBA-region drain that references them.
+        finalize_block_nba();
         emit_main(group_fns);
     }
 
@@ -2315,10 +2324,16 @@ private:
 
         const auto sigs = mod_.signals();
 
-        // Assign each NBA target to a (width, partial) bucket.
+        // Assign each NBA target to a (width, partial) bucket. A whole-signal scalar
+        // target under block_nba commits through the block-commit path instead, so it
+        // keeps its shadow/meta (below) but takes no bucket worklist slot.
         for (uint32_t i = 0; i < sigs.size(); ++i) {
             SignalSlot& s = slots_[i];
             if (!s.nba) {
+                continue;
+            }
+            s.nba_block = config_.block_nba && !s.nba_partial && !s.is_array;
+            if (s.nba_block) {
                 continue;
             }
             uint32_t bi = 0;
@@ -2335,7 +2350,7 @@ private:
         }
         std::vector<uint32_t> caps(nba_buckets_.size(), 0);
         for (uint32_t i = 0; i < sigs.size(); ++i) {
-            if (slots_[i].nba) {
+            if (slots_[i].nba && !slots_[i].nba_block) {
                 caps[slots_[i].nba_bucket]++;
             }
         }
@@ -2401,6 +2416,328 @@ private:
         nba_meta_arr_ty_ = llvm::ArrayType::get(nba_meta_ty_, metas.size());
         nba_meta_gv_     = new llvm::GlobalVariable(llmod_, nba_meta_arr_ty_, true, llvm::GlobalValue::InternalLinkage,
                                                     llvm::ConstantArray::get(nba_meta_arr_ty_, metas), "clotho.nba_meta");
+
+        // Declare the block-commit enqueue stub up front so StoreNb lowering can call
+        // it (its body + the worklist/pending globals are emitted post-lowering by
+        // finalize_block_nba, once the block count is known). Declared only when some
+        // signal actually takes the block path.
+        const bool any_block = std::any_of(slots_.begin(), slots_.end(), [](const SignalSlot& s) { return s.nba_block; });
+        if (any_block) {
+            auto* fnty = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx_), { i32 }, false);
+            nba_block_enqueue_fn_ =
+              llvm::Function::Create(fnty, llvm::Function::InternalLinkage, "clotho.nba_block_enqueue", llmod_);
+        }
+    }
+
+    // Register the current straight-line block (the live insert basic block) as the
+    // owner of a whole-signal scalar NBA to `sig`. The first whole-scalar StoreNb in
+    // a block emits one enqueue call (deduped at runtime by block_pending); every
+    // target in the block is gathered into the block's commit function. Keyed on the
+    // LLVM insert block, so back-to-back fused members that share one block coalesce
+    // into a single enqueue + commit.
+    void block_register(Signal sig) {
+        // Open a new block on the first NBA of a segment (the enqueue call is emitted
+        // once, here, at that first store's insert point; it runs unconditionally
+        // because same-epoch stores are straight-line co-executed).
+        if (cur_block_epoch_ != static_cast<int64_t>(cur_seg_epoch_)) {
+            cur_block_id_    = static_cast<uint32_t>(block_commits_.size());
+            block_commits_.push_back({});
+            cur_block_epoch_ = static_cast<int64_t>(cur_seg_epoch_);
+            b_.CreateCall(nba_block_enqueue_fn_, { b_.getInt32(cur_block_id_) });
+        }
+        std::vector<Signal>& sigs = block_commits_[cur_block_id_].sigs;
+        if (std::find(sigs.begin(), sigs.end(), sig) == sigs.end()) {
+            sigs.push_back(sig);
+        }
+    }
+
+    // NBA-region block dispatch mode: threaded intrusive chain (default) vs the
+    // array worklist + central loop (CLOTHO_BLOCK_WORKLIST). Experiment toggle.
+    bool block_threaded() const {
+        static const bool v = std::getenv("CLOTHO_BLOCK_WORKLIST") == nullptr;
+        return v;
+    }
+    // Sentinel stored in block_next[id] when block id is not enqueued (doubles as
+    // the dedup marker); distinct from null, which marks the chain end.
+    llvm::Constant* block_not_queued() {
+        return llvm::ConstantExpr::getIntToPtr(llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx_), 1),
+                                               llvm::PointerType::getUnqual(ctx_));
+    }
+    // Threaded-dispatch tail for block `id`'s commit function, emitted at its single
+    // exit block after the copy/service work: reset this block's link to NOT_QUEUED,
+    // then musttail-call the next pending block (or ret at the chain end). In
+    // worklist mode this is just `ret void`.
+    void emit_block_commit_tail(uint32_t id) {
+        if (!block_threaded()) {
+            b_.CreateRetVoid();
+            return;
+        }
+        auto*        ptr   = llvm::PointerType::getUnqual(ctx_);
+        auto*        nullp = llvm::ConstantPointerNull::get(ptr);
+        llvm::Value* nextp = b_.CreateInBoundsGEP(block_next_ty_, block_next_gv_, { b_.getInt32(0), b_.getInt32(id) });
+        llvm::Value* next  = b_.CreateLoad(ptr, nextp);
+        b_.CreateStore(block_not_queued(), nextp); // reset self for next instant
+        auto* fn     = b_.GetInsertBlock()->getParent();
+        auto* tailbb = llvm::BasicBlock::Create(ctx_, "thr.tail", fn);
+        auto* retbb  = llvm::BasicBlock::Create(ctx_, "thr.ret", fn);
+        b_.CreateCondBr(b_.CreateICmpEQ(next, nullp), retbb, tailbb);
+
+        b_.SetInsertPoint(tailbb);
+        auto* cty  = llvm::FunctionType::get(b_.getVoidTy(), { ptr }, false);
+        auto* call = b_.CreateCall(cty, next, { state_ });
+        call->setTailCallKind(llvm::CallInst::TCK_MustTail);
+        b_.CreateRetVoid();
+
+        b_.SetInsertPoint(retbb);
+        b_.CreateRetVoid();
+    }
+
+    // Emit block `id`'s commit function `void(state)`: for every whole-signal scalar
+    // target the block writes, copy its shadow planes into live state and, where the
+    // target has waiters, service its wait queues. Signals are partitioned by
+    // (width, narrow, has_z, has-waiters) and each group commits through a compact
+    // counted loop over a constant nba-id array — like the bucket commit loop, but
+    // one array per block registered by a single O(1) enqueue instead of an O(N)
+    // per-signal worklist push. (An earlier unrolled variant — one straight-line copy
+    // body per signal — was replaced by this loop.) The no-waiter groups skip the
+    // edge compute + scan entirely (a no-op in the bucket path too — semantics
+    // unchanged), which the common flop population hits.
+    void emit_block_commit_fn(uint32_t id) {
+        auto* voidty = llvm::Type::getVoidTy(ctx_);
+        auto* ptr    = llvm::PointerType::getUnqual(ctx_);
+        auto* fnty   = llvm::FunctionType::get(voidty, { ptr }, false);
+        auto* fn     = llvm::Function::Create(fnty, llvm::Function::InternalLinkage,
+                                              "clotho.nba.commit_blk" + std::to_string(id), llmod_);
+        block_commits_[id].fn = fn;
+
+        // Partition the block's targets into commit groups, preserving first-seen
+        // order for determinism. Key: (width, narrow, has_z, has-waiters).
+        struct GroupKey {
+            uint32_t width;
+            bool     narrow;
+            bool     has_z;
+            bool     waits;
+            bool     operator==(const GroupKey&) const = default;
+        };
+        std::vector<GroupKey>              keys;
+        std::vector<std::vector<uint32_t>> groups; // parallel to keys: nba-ids
+        for (const Signal sig : block_commits_[id].sigs) {
+            const SignalSlot& s = slot_of(sig);
+            const GroupKey    k{ s.width, s.narrow, s.has_z, signal_has_waiters(sig) };
+            auto              it = std::find(keys.begin(), keys.end(), k);
+            if (it == keys.end()) {
+                keys.push_back(k);
+                groups.push_back({ s.nba_id });
+            } else {
+                groups[static_cast<size_t>(it - keys.begin())].push_back(s.nba_id);
+            }
+        }
+
+        // Save/restore the builder + current-state pointer: field_ptr_var reads
+        // through `state`, emit_nba_service builds control flow at the insert point.
+        llvm::IRBuilderBase::InsertPoint saved       = b_.saveIP();
+        llvm::Value*                     saved_state = state_;
+        state_      = fn->getArg(0);
+        auto* entry = llvm::BasicBlock::Create(ctx_, "entry", fn);
+        b_.SetInsertPoint(entry);
+        // Default: one straight-line copy body per signal (no loop).
+        // CLOTHO_BLOCK_LOOPY selects the alternate counted-loop-over-constant-id-array
+        // form, kept for comparison.
+        static const bool loopy = std::getenv("CLOTHO_BLOCK_LOOPY") != nullptr;
+        if (loopy) {
+            for (size_t g = 0; g < keys.size(); ++g) {
+                emit_block_commit_group(id, static_cast<uint32_t>(g), groups[g], keys[g].width, keys[g].narrow,
+                                        keys[g].has_z, keys[g].waits);
+            }
+        } else {
+            emit_block_commit_unrolled(id);
+        }
+        emit_block_commit_tail(id);
+        b_.restoreIP(saved);
+        state_ = saved_state;
+    }
+
+    // Alternate commit body (CLOTHO_BLOCK_UNROLL): one straight-line copy per signal,
+    // no loop, using compile-time slot/shadow offsets. Emits into the current insert
+    // point (state_ already set to the commit fn's arg).
+    void emit_block_commit_unrolled(uint32_t id) {
+        for (const Signal sig : block_commits_[id].sigs) {
+            const SignalSlot& s       = slot_of(sig);
+            auto*             mmty     = int_ty(s.narrow ? s.width : 2 * s.width);
+            auto*             zty      = int_ty(s.width);
+            llvm::Value*      live     = storage_ptr(state_, s);
+            llvm::Value*      live_mm  = b_.CreateStructGEP(s.slot_ty, live, 0);
+            llvm::Value*      sh_mm    = shadow_ptr(s.sh_mm_field);
+            llvm::Value*      old_mm   = b_.CreateLoad(mmty, live_mm);
+            llvm::Value*      new_mm   = b_.CreateLoad(mmty, sh_mm);
+            b_.CreateStore(new_mm, live_mm);
+            llvm::Value* old_z = nullptr;
+            llvm::Value* new_z = nullptr;
+            if (s.has_z) {
+                llvm::Value* live_z = b_.CreateStructGEP(s.slot_ty, live, 1);
+                llvm::Value* sh_z   = shadow_ptr(s.sh_z_field);
+                old_z               = b_.CreateLoad(zty, live_z);
+                new_z               = b_.CreateLoad(zty, sh_z);
+                b_.CreateStore(new_z, live_z);
+            }
+            if (signal_has_waiters(sig)) {
+                llvm::Value* meta = b_.CreateInBoundsGEP(nba_meta_arr_ty_, nba_meta_gv_,
+                                                         { b_.getInt32(0), b_.getInt32(s.nba_id) });
+                emit_nba_service(meta, old_mm, new_mm, s.width, s.narrow, old_z, new_z);
+            }
+        }
+    }
+
+    // Commit one (width, narrow, has_z, waits) group of block `bid`: loop over a
+    // constant [K x i32] nba-id array, copying each target's shadow planes into live
+    // state (via the constant meta offsets) and, when the group has waiters,
+    // servicing its wait queues. Mirrors emit_nba_commit_bucket's non-partial body.
+    void emit_block_commit_group(uint32_t bid, uint32_t gid, const std::vector<uint32_t>& ids, uint32_t W,
+                                 bool narrow, bool has_z, bool waits) {
+        auto*             i32   = b_.getInt32Ty();
+        auto*             mmty  = int_ty(narrow ? W : 2 * W);
+        auto*             zty   = int_ty(W);
+        const llvm::Align mm_al = llmod_.getDataLayout().getABITypeAlign(mmty);
+        const llvm::Align z_al  = llmod_.getDataLayout().getABITypeAlign(zty);
+
+        std::vector<llvm::Constant*> cids;
+        cids.reserve(ids.size());
+        for (const uint32_t id : ids) {
+            cids.push_back(llvm::ConstantInt::get(i32, id));
+        }
+        auto* arrty = llvm::ArrayType::get(i32, ids.size());
+        auto* gv    = new llvm::GlobalVariable(llmod_, arrty, true, llvm::GlobalValue::InternalLinkage,
+                                               llvm::ConstantArray::get(arrty, cids),
+                                               "clotho.nba_blk" + std::to_string(bid) + "_g" + std::to_string(gid));
+
+        auto* fn    = b_.GetInsertBlock()->getParent();
+        auto* head  = llvm::BasicBlock::Create(ctx_, "bc.head", fn);
+        auto* body  = llvm::BasicBlock::Create(ctx_, "bc.body", fn);
+        auto* cont  = llvm::BasicBlock::Create(ctx_, "bc.cont", fn);
+        auto* done  = llvm::BasicBlock::Create(ctx_, "bc.done", fn);
+        auto* n     = b_.getInt32(static_cast<uint32_t>(ids.size()));
+        auto* entry = b_.GetInsertBlock();
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(head);
+        auto* idx = b_.CreatePHI(i32, 2);
+        idx->addIncoming(b_.getInt32(0), entry);
+        b_.CreateCondBr(b_.CreateICmpULT(idx, n), body, done);
+
+        b_.SetInsertPoint(body);
+        llvm::Value* id        = b_.CreateLoad(i32, b_.CreateInBoundsGEP(arrty, gv, { b_.getInt32(0), idx }));
+        llvm::Value* meta      = b_.CreateInBoundsGEP(nba_meta_arr_ty_, nba_meta_gv_, { b_.getInt32(0), id });
+        llvm::Value* live_mm_p = field_ptr_var(state_, meta_i32(meta, 0));
+        llvm::Value* sh_mm_p   = field_ptr_var(state_, meta_i32(meta, 2));
+        llvm::Value* old_mm    = b_.CreateAlignedLoad(mmty, live_mm_p, mm_al);
+        llvm::Value* new_mm    = b_.CreateAlignedLoad(mmty, sh_mm_p, mm_al);
+        b_.CreateAlignedStore(new_mm, live_mm_p, mm_al);
+        llvm::Value* old_z = nullptr;
+        llvm::Value* new_z = nullptr;
+        if (has_z) {
+            llvm::Value* live_z_p = field_ptr_var(state_, meta_i32(meta, 1));
+            llvm::Value* sh_z_p   = field_ptr_var(state_, meta_i32(meta, 3));
+            old_z                 = b_.CreateAlignedLoad(zty, live_z_p, z_al);
+            new_z                 = b_.CreateAlignedLoad(zty, sh_z_p, z_al);
+            b_.CreateAlignedStore(new_z, live_z_p, z_al);
+        }
+        if (waits) {
+            emit_nba_service(meta, old_mm, new_mm, W, narrow, old_z, new_z);
+        }
+        b_.CreateBr(cont);
+
+        b_.SetInsertPoint(cont);
+        idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), cont);
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(done);
+    }
+
+    // Finalize the block-commit path after all bodies are lowered: size the worklist
+    // / pending / commit-fn-table globals to the discovered block count, emit each
+    // block's commit function, and emit the enqueue stub body. No-op when the path
+    // was never used.
+    void finalize_block_nba() {
+        if (nba_block_enqueue_fn_ == nullptr) {
+            return;
+        }
+        auto* i8  = llvm::Type::getInt8Ty(ctx_);
+        auto* i32 = llvm::Type::getInt32Ty(ctx_);
+        auto* ptr = llvm::PointerType::getUnqual(ctx_);
+        // A declared-but-unused stub (no block ever registered) still needs a body to
+        // verify; it is never called.
+        const uint32_t n = std::max<uint32_t>(static_cast<uint32_t>(block_commits_.size()), 1);
+
+        block_pending_ty_  = llvm::ArrayType::get(i8, n);
+        block_pending_gv_  = new llvm::GlobalVariable(llmod_, block_pending_ty_, false,
+                                                      llvm::GlobalValue::InternalLinkage,
+                                                      llvm::ConstantAggregateZero::get(block_pending_ty_),
+                                                      "clotho.nba_block_pending");
+        block_worklist_ty_ = llvm::ArrayType::get(i32, n);
+        block_worklist_gv_ = new llvm::GlobalVariable(llmod_, block_worklist_ty_, false,
+                                                      llvm::GlobalValue::InternalLinkage,
+                                                      llvm::ConstantAggregateZero::get(block_worklist_ty_),
+                                                      "clotho.nba_block_worklist");
+        block_top_gv_      = new llvm::GlobalVariable(llmod_, i32, false, llvm::GlobalValue::InternalLinkage,
+                                                      llvm::ConstantInt::get(i32, 0), "clotho.nba_block_top");
+
+        // Threaded-dispatch globals. Must exist before the commit-fn loop below,
+        // whose emitted tails reference block_next. Links init to NOT_QUEUED, head
+        // to null (empty chain).
+        block_next_ty_ = llvm::ArrayType::get(ptr, n);
+        block_next_gv_ = new llvm::GlobalVariable(
+          llmod_, block_next_ty_, false, llvm::GlobalValue::InternalLinkage,
+          llvm::ConstantArray::get(block_next_ty_, std::vector<llvm::Constant*>(n, block_not_queued())),
+          "clotho.nba_block_next");
+        block_head_gv_ = new llvm::GlobalVariable(llmod_, ptr, false, llvm::GlobalValue::InternalLinkage,
+                                                  llvm::ConstantPointerNull::get(ptr), "clotho.nba_block_head");
+
+        std::vector<llvm::Constant*> fns;
+        for (uint32_t id = 0; id < block_commits_.size(); ++id) {
+            emit_block_commit_fn(id);
+            fns.push_back(block_commits_[id].fn);
+        }
+        if (fns.empty()) {
+            fns.push_back(llvm::ConstantPointerNull::get(ptr));
+        }
+        block_commit_fns_ty_ = llvm::ArrayType::get(ptr, fns.size());
+        block_commit_fns_gv_ = new llvm::GlobalVariable(llmod_, block_commit_fns_ty_, true,
+                                                        llvm::GlobalValue::InternalLinkage,
+                                                        llvm::ConstantArray::get(block_commit_fns_ty_, fns),
+                                                        "clotho.nba_block_commit_fns");
+
+        // Enqueue stub body. Threaded (default): if block id is not queued
+        // (block_next[id] == NOT_QUEUED), push it on the intrusive chain
+        // (block_next[id] = block_head; block_head = commit_fns[id]). Worklist mode:
+        // dedup on block_pending[id], append id to the worklist.
+        auto* entry = llvm::BasicBlock::Create(ctx_, "entry", nba_block_enqueue_fn_);
+        auto* push  = llvm::BasicBlock::Create(ctx_, "push", nba_block_enqueue_fn_);
+        auto* done  = llvm::BasicBlock::Create(ctx_, "done", nba_block_enqueue_fn_);
+        llvm::IRBuilder<> tb(entry);
+        llvm::Value*      id = nba_block_enqueue_fn_->getArg(0);
+        if (block_threaded()) {
+            llvm::Value* nextp = tb.CreateInBoundsGEP(block_next_ty_, block_next_gv_, { tb.getInt32(0), id });
+            llvm::Value* cur   = tb.CreateLoad(ptr, nextp);
+            tb.CreateCondBr(tb.CreateICmpEQ(cur, block_not_queued()), push, done);
+            tb.SetInsertPoint(push);
+            tb.CreateStore(tb.CreateLoad(ptr, block_head_gv_), nextp);
+            llvm::Value* fn = tb.CreateLoad(
+              ptr, tb.CreateInBoundsGEP(block_commit_fns_ty_, block_commit_fns_gv_, { tb.getInt32(0), id }));
+            tb.CreateStore(fn, block_head_gv_);
+            tb.CreateBr(done);
+        } else {
+            llvm::Value* flagp = tb.CreateInBoundsGEP(block_pending_ty_, block_pending_gv_, { tb.getInt32(0), id });
+            tb.CreateCondBr(tb.CreateICmpNE(tb.CreateLoad(i8, flagp), tb.getInt8(0)), done, push);
+            tb.SetInsertPoint(push);
+            tb.CreateStore(tb.getInt8(1), flagp);
+            llvm::Value* t    = tb.CreateLoad(i32, block_top_gv_);
+            llvm::Value* slot = tb.CreateInBoundsGEP(block_worklist_ty_, block_worklist_gv_, { tb.getInt32(0), t });
+            tb.CreateStore(id, slot);
+            tb.CreateStore(tb.CreateAdd(t, tb.getInt32(1)), block_top_gv_);
+            tb.CreateBr(done);
+        }
+        tb.SetInsertPoint(done);
+        tb.CreateRetVoid();
     }
 
     bool signal_has_waiters(Signal sig) const {
@@ -3114,7 +3451,7 @@ private:
         // the active queue drains; if any update is staged it commits them all and
         // re-drains the active queue at the SAME instant; otherwise it falls through
         // to the wheel. So active and NBA iterate until both settle before time moves.
-        const bool has_nba = !nba_buckets_.empty() || !array_nba_sigs_.empty();
+        const bool has_nba = !nba_buckets_.empty() || !array_nba_sigs_.empty() || !block_commits_.empty();
         auto*      ncheck  = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.check", fn) : wcheck;
         auto*      ncommit = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.commit", fn) : nullptr;
         // Inactive region: only when the design has a #0. When the active queue
@@ -3213,11 +3550,63 @@ private:
             if (!array_nba_sigs_.empty()) {
                 any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateCall(nba_arr_pending_fn(), {}), b_.getInt32(0)));
             }
+            if (!block_commits_.empty()) {
+                llvm::Value* staged =
+                  block_threaded()
+                    ? b_.CreateICmpNE(b_.CreateLoad(ptr_ty, block_head_gv_), llvm::ConstantPointerNull::get(ptr_ty))
+                    : b_.CreateICmpNE(b_.CreateLoad(i32, block_top_gv_), b_.getInt32(0));
+                any = b_.CreateOr(any, staged);
+            }
             b_.CreateCondBr(any, ncommit, wcheck);
 
             b_.SetInsertPoint(ncommit);
             for (const NbaBucket& bk : nba_buckets_) {
                 emit_nba_commit_bucket(bk, state);
+            }
+            // Block-commit whole-signal scalar NBAs. Threaded (default): call the head
+            // block's commit function; it musttail-chains through every pending block
+            // and returns here. Worklist mode: loop the worklist, indirect-calling each
+            // enqueued block's commit function and clearing its pending flag.
+            if (!block_commits_.empty() && block_threaded()) {
+                auto*        cfn    = b_.GetInsertBlock()->getParent();
+                auto*        run    = llvm::BasicBlock::Create(ctx_, "nblk.run", cfn);
+                auto*        after  = llvm::BasicBlock::Create(ctx_, "nblk.after", cfn);
+                llvm::Value* h      = b_.CreateLoad(ptr_ty, block_head_gv_);
+                b_.CreateCondBr(b_.CreateICmpNE(h, llvm::ConstantPointerNull::get(ptr_ty)), run, after);
+                b_.SetInsertPoint(run);
+                b_.CreateStore(llvm::ConstantPointerNull::get(ptr_ty), block_head_gv_); // empty chain for next instant
+                auto* cty = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty }, false);
+                b_.CreateCall(cty, h, { state });
+                b_.CreateBr(after);
+                b_.SetInsertPoint(after);
+            } else if (!block_commits_.empty()) {
+                auto*        cfn   = b_.GetInsertBlock()->getParent();
+                auto*        bhead = llvm::BasicBlock::Create(ctx_, "nblk.head", cfn);
+                auto*        bbody = llvm::BasicBlock::Create(ctx_, "nblk.body", cfn);
+                auto*        bdone = llvm::BasicBlock::Create(ctx_, "nblk.done", cfn);
+                llvm::Value* bn    = b_.CreateLoad(i32, block_top_gv_);
+                auto*        bentry = b_.GetInsertBlock();
+                b_.CreateBr(bhead);
+
+                b_.SetInsertPoint(bhead);
+                auto* bidx = b_.CreatePHI(i32, 2);
+                bidx->addIncoming(b_.getInt32(0), bentry);
+                b_.CreateCondBr(b_.CreateICmpULT(bidx, bn), bbody, bdone);
+
+                b_.SetInsertPoint(bbody);
+                llvm::Value* bid = b_.CreateLoad(
+                  i32, b_.CreateInBoundsGEP(block_worklist_ty_, block_worklist_gv_, { b_.getInt32(0), bidx }));
+                b_.CreateStore(b_.getInt8(0),
+                               b_.CreateInBoundsGEP(block_pending_ty_, block_pending_gv_, { b_.getInt32(0), bid }));
+                llvm::Value* fnp = b_.CreateLoad(
+                  ptr_ty, b_.CreateInBoundsGEP(block_commit_fns_ty_, block_commit_fns_gv_, { b_.getInt32(0), bid }));
+                auto* cty = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty }, false);
+                b_.CreateCall(cty, fnp, { state });
+                bidx->addIncoming(b_.CreateAdd(bidx, b_.getInt32(1)), b_.GetInsertBlock());
+                b_.CreateBr(bhead);
+
+                b_.SetInsertPoint(bdone);
+                b_.CreateStore(b_.getInt32(0), block_top_gv_);
             }
             // Deferred array-element writes: replay them, then wake the Any-edge
             // readers of any array a write touched, then clear the queue.
@@ -3504,12 +3893,17 @@ private:
     // (function early return) terminates the block; the rest of the region is then
     // unreachable, so stop emitting into the dead tail.
     void lower_region(std::span<const Index> region) {
+        // Bump the NBA segment epoch on entry and exit so a nested region's NBAs
+        // never share a block-commit with the enclosing straight-line run (a block
+        // must not span a conditional body). See block_register / cur_seg_epoch_.
+        ++cur_seg_epoch_;
         for (Index i : region) {
             lower_inst(i);
             if (b_.GetInsertBlock()->getTerminator() != nullptr) {
-                return;
+                break;
             }
         }
+        ++cur_seg_epoch_;
     }
 
     // Branch to `bb` unless the current block is already terminated (e.g. a region
@@ -4322,10 +4716,14 @@ private:
                 return;
 
             case Inst::Tag::Delay:
+                // A suspend ends the current NBA segment: post-suspend NBAs stage at a
+                // later instant and must commit in a different NBA region.
+                ++cur_seg_epoch_;
                 lower_delay(p.unary);
                 return;
 
             case Inst::Tag::Wait:
+                ++cur_seg_epoch_;
                 lower_wait(p.wait);
                 return;
 
@@ -4437,7 +4835,12 @@ private:
                 lower_call_inst(i);
                 return;
             case Inst::Tag::TaskCall:
+                // A task call may suspend the caller (task with #delay / @event) and
+                // stages its own NBAs into the shared shadow; end the segment so the
+                // caller's pre/post-call NBAs never share a block with it.
+                ++cur_seg_epoch_;
                 lower_task_call_inst(i);
+                ++cur_seg_epoch_;
                 return;
         }
     }
@@ -4677,7 +5080,11 @@ private:
                 llvm::Value* cur = b_.CreateLoad(int_ty(s.width), maskp);
                 b_.CreateStore(b_.CreateOr(cur, bmask), maskp);
             }
-            emit_nba_enqueue(s);
+            if (s.nba_block) {
+                block_register(lv.sig);
+            } else {
+                emit_nba_enqueue(s);
+            }
             return;
         }
 
@@ -4711,7 +5118,11 @@ private:
             llvm::Value* cur = b_.CreateLoad(int_ty(s.width), maskp);
             b_.CreateStore(b_.CreateOr(cur, bmask), maskp);
         }
-        emit_nba_enqueue(s);
+        if (s.nba_block) {
+            block_register(lv.sig);
+        } else {
+            emit_nba_enqueue(s);
+        }
     }
 
     // The reused array-NBA staging struct type: [16]mm_val [16]mm_mask [8]z_val
@@ -7286,6 +7697,46 @@ private:
     // rather than the per-signal shadow; after a commit, each is woken if any
     // queued write touched it.
     std::vector<Signal>     array_nba_sigs_;
+
+    // Block-commit NBA state (config_.block_nba). A whole-signal scalar NBA stages
+    // its shadow as before, then registers its enclosing straight-line block (one
+    // LLVM basic block) once per instant via nba_block_enqueue_fn_ (deduped by
+    // block_pending). The NBA region drains block_worklist, indirect-calling each
+    // block's monomorphized commit function (block_commits_[id].fn), which copies
+    // that block's shadows -> live and services their waiters. Keyed on the live
+    // insert block so back-to-back fused members coalesce into one block.
+    struct BlockCommit {
+        std::vector<Signal> sigs;         // whole-scalar targets, in first-store order
+        llvm::Function*     fn = nullptr; // monomorphized commit, void(state)
+    };
+    std::vector<BlockCommit>                    block_commits_;
+    // Source-IR straight-line segment counter, bumped at every structured-region
+    // boundary (lower_region entry/exit) and in-region suspend (Delay / Wait /
+    // TaskCall). NBAs sharing an epoch are unconditionally co-executed with no
+    // suspend between, so they commit together safely; a block never spans a
+    // conditional body or a suspend. Keyed on the epoch, NOT the LLVM basic block,
+    // because 4-state RHS arithmetic splits the LLVM block mid-statement.
+    uint32_t                cur_seg_epoch_   = 0;
+    int64_t                 cur_block_epoch_ = -1;  // epoch cur_block_id_ was opened at (-1: none)
+    uint32_t                cur_block_id_    = 0;
+    llvm::Function*         nba_block_enqueue_fn_ = nullptr;    // void(i32 id), body emitted post-lowering
+    llvm::GlobalVariable*   block_pending_gv_     = nullptr;    // [n_block x i8] dedup flags
+    llvm::ArrayType*        block_pending_ty_     = nullptr;
+    llvm::GlobalVariable*   block_worklist_gv_    = nullptr;    // [n_block x i32] enqueued ids
+    llvm::ArrayType*        block_worklist_ty_    = nullptr;
+    llvm::GlobalVariable*   block_top_gv_         = nullptr;    // i32 live worklist count
+    llvm::GlobalVariable*   block_commit_fns_gv_  = nullptr;    // [n_block x ptr] commit fn table
+    llvm::ArrayType*        block_commit_fns_ty_  = nullptr;
+    // Threaded-dispatch state (default; CLOTHO_BLOCK_WORKLIST selects the array
+    // worklist above instead). An intrusive chain of pending blocks: block_next[id]
+    // holds the next pending block's commit-fn pointer, `null` = chain end, sentinel
+    // 1 (kBlockNotQueued) = not enqueued (also the dedup marker). block_head points
+    // at the first pending block's commit fn. Each commit fn musttail-calls its
+    // successor; the NBA region just calls the head.
+    llvm::GlobalVariable*   block_next_gv_        = nullptr;    // [n_block x ptr] intrusive links
+    llvm::ArrayType*        block_next_ty_        = nullptr;
+    llvm::GlobalVariable*   block_head_gv_        = nullptr;    // ptr: first pending block's commit fn
+
     std::vector<Plane>                  values_;
     std::vector<std::optional<LValue>>  lvals_;
     std::vector<std::optional<ValType>> types_;
