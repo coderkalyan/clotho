@@ -130,20 +130,30 @@ TEST_CASE("rt_readmem with a null z_base loads values without touching z memory"
     std::remove(path);
 }
 
-TEST_CASE("rt_nba_arr push/commit with a null z_ptr merges only the mm word") {
-    uint8_t mm = 0x00;
-    uint8_t z_guard = 0x77; // would be corrupted by a stray z write
-
-    const uint8_t val  = 0x0f;
-    const uint8_t mask = 0xff;
-    rt_nba_arr_push(0, &mm, &val, &mask, 1, nullptr, nullptr, nullptr, 0);
-    REQUIRE(rt_nba_arr_pending() == 1);
-    rt_nba_arr_commit();
-    CHECK(rt_nba_arr_dirty(0) == 1);
+TEST_CASE("rt_nba_arr slot buffer: distinct slots, counts, reset keeps capacity") {
     rt_nba_arr_reset();
+    const uint32_t stride = 16;
+    // Two arrays; reserve slots and confirm they are distinct, stride-spaced, and
+    // that the writes round-trip through base + i*stride.
+    void* a0 = rt_nba_arr_slot(0, stride);
+    void* a1 = rt_nba_arr_slot(0, stride);
+    void* b0 = rt_nba_arr_slot(1, stride);
+    static_cast<uint64_t*>(a0)[0] = 0xAAAA;
+    static_cast<uint64_t*>(a1)[0] = 0xBBBB;
+    static_cast<uint64_t*>(b0)[0] = 0xCCCC;
+    CHECK(rt_nba_arr_count(0) == 2);
+    CHECK(rt_nba_arr_count(1) == 1);
+    CHECK(rt_nba_arr_any() == 3);
+    auto* base0 = static_cast<uint8_t*>(rt_nba_arr_base(0));
+    CHECK(*reinterpret_cast<uint64_t*>(base0 + 0 * stride) == 0xAAAA);
+    CHECK(*reinterpret_cast<uint64_t*>(base0 + 1 * stride) == 0xBBBB);
 
-    CHECK(mm == 0x0f);
-    CHECK(z_guard == 0x77);
+    rt_nba_arr_reset();
+    CHECK(rt_nba_arr_count(0) == 0);
+    CHECK(rt_nba_arr_any() == 0);
+    // Capacity retained: a fresh slot reuses the same buffer address.
+    CHECK(rt_nba_arr_slot(0, stride) == base0);
+    rt_nba_arr_reset(); // leave no staged records for the next test
 }
 
 namespace {

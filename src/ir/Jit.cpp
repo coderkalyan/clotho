@@ -142,10 +142,10 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config) {
     expose("rt_random", &rt_random);
     expose("rt_alloc", &rt_alloc);
     expose("rt_free", &rt_free);
-    expose("rt_nba_arr_push", &rt_nba_arr_push);
-    expose("rt_nba_arr_pending", &rt_nba_arr_pending);
-    expose("rt_nba_arr_commit", &rt_nba_arr_commit);
-    expose("rt_nba_arr_dirty", &rt_nba_arr_dirty);
+    expose("rt_nba_arr_slot", &rt_nba_arr_slot);
+    expose("rt_nba_arr_base", &rt_nba_arr_base);
+    expose("rt_nba_arr_count", &rt_nba_arr_count);
+    expose("rt_nba_arr_any", &rt_nba_arr_any);
     expose("rt_nba_arr_reset", &rt_nba_arr_reset);
     expose("rt_string_init", &rt_string_init);
     expose("rt_string_deinit", &rt_string_deinit);

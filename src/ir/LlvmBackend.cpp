@@ -334,6 +334,10 @@ struct SignalSlot {
     // partial alike). False only for array-element targets, which use the runtime
     // deferred queue.
     bool     nba_block     = false;
+    // Array-element NBA target with any within-element bit/part-select site: its
+    // deferred records carry a per-write mask (whole-element sites store all-ones).
+    // A memory written only whole-element (mem[i] <= x) needs no mask.
+    bool     arr_masked    = false;
     uint32_t nba_id        = 0;
     uint32_t sh_mm_field   = 0;
     uint32_t sh_z_field    = 0;
@@ -740,6 +744,27 @@ private:
         }
     }
 
+    // Whether an lvalue chain contains a bit/part-select (a within-element select
+    // for a memory: BitSelect / PartSelect / DynPartSelect), as opposed to only an
+    // ElemSelect array index. Determines whether an array target needs a write mask.
+    static bool lvalue_has_subselect(const Ir& ir, Index lv) {
+        for (;;) {
+            switch (ir.tag(lv)) {
+                case Inst::Tag::BitSelect:
+                    lv = ir.payload(lv).binary.l;
+                    return true;
+                case Inst::Tag::PartSelect:
+                case Inst::Tag::DynPartSelect:
+                    return true;
+                case Inst::Tag::ElemSelect:
+                    lv = ir.payload(lv).op_extra.op;
+                    break;
+                default:
+                    return false;
+            }
+        }
+    }
+
     // Mark NBA-target signals reached by one IR body (a process or a task): set
     // `nba`, `nba_partial` (any bit/part-select site), `nba_dyn` (any runtime-indexed
     // select), and collect unpacked-array targets for the runtime deferred queue.
@@ -760,6 +785,11 @@ private:
                 Type::Kind::UnpackedArray) {
                 if (std::find(array_nba_sigs_.begin(), array_nba_sigs_.end(), t.sig) == array_nba_sigs_.end()) {
                     array_nba_sigs_.push_back(t.sig);
+                }
+                // A within-element bit/part-select (below the element index) means
+                // this array's deferred records must carry a write mask.
+                if (lvalue_has_subselect(ir, lv_idx)) {
+                    slots_[static_cast<uint32_t>(t.sig)].arr_masked = true;
                 }
                 continue;
             }
@@ -954,7 +984,6 @@ private:
             wheel_->setName("wheel");
             fn_->addParamAttr(0, llvm::Attribute::NoAlias);
             awaiter_          = nullptr;
-            nba_scratch_      = nullptr;
             record_           = nullptr;
             cur_is_task_      = false;
             lowering_preinit_ = false;
@@ -996,7 +1025,6 @@ private:
         // lets the allocator rematerialize signal loads instead of spilling them.
         fn_->addParamAttr(0, llvm::Attribute::NoAlias);
         awaiter_          = nullptr;
-        nba_scratch_      = nullptr;
         record_           = nullptr;
         cur_is_task_      = false;
         lowering_preinit_ = proc.activation == Activation::PreInit;
@@ -3125,6 +3153,12 @@ private:
         if (has_inactive) {
             b_.CreateStore(b_.getInt32(0), inactive_top_gv_);
         }
+        // The array-NBA record buffers are process-global; clear any state a prior
+        // simulation in this process left staged (e.g. a $finish between staging and
+        // the NBA commit) so this run starts empty.
+        if (!array_nba_sigs_.empty()) {
+            b_.CreateCall(nba_arr_reset_fn(), {});
+        }
         const auto all = mod_.processes();
 
         // Pre-init pass first (LRM 6.8): apply variable declaration initializers
@@ -3328,7 +3362,7 @@ private:
             b_.SetInsertPoint(ncheck);
             llvm::Value* any = b_.getFalse();
             if (!array_nba_sigs_.empty()) {
-                any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateCall(nba_arr_pending_fn(), {}), b_.getInt32(0)));
+                any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateCall(nba_arr_any_fn(), {}), b_.getInt32(0)));
             }
             if (!block_commits_.empty()) {
                 any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateLoad(ptr_ty, block_head_gv_),
@@ -3352,23 +3386,11 @@ private:
                 b_.CreateBr(after);
                 b_.SetInsertPoint(after);
             }
-            // Deferred array-element writes: replay them, then wake the Any-edge
-            // readers of any array a write touched, then clear the queue.
+            // Deferred array-element writes: replay each array's records (monomorphized
+            // commit), waking its Any-edge readers if it took any write, then reset.
             if (!array_nba_sigs_.empty()) {
-                b_.CreateCall(nba_arr_commit_fn(), {});
                 for (const Signal sig : array_nba_sigs_) {
-                    if (!signal_has_waiters(sig)) {
-                        continue;
-                    }
-                    auto* fn      = b_.GetInsertBlock()->getParent();
-                    auto* svc     = llvm::BasicBlock::Create(ctx_, "nba.arr.svc", fn);
-                    auto* nextbb  = llvm::BasicBlock::Create(ctx_, "nba.arr.next", fn);
-                    auto* dirty   = b_.CreateCall(nba_arr_dirty_fn(), { b_.getInt32(static_cast<uint32_t>(sig)) });
-                    b_.CreateCondBr(b_.CreateICmpNE(dirty, b_.getInt32(0)), svc, nextbb);
-                    b_.SetInsertPoint(svc);
-                    service_any_waiters(sig);
-                    b_.CreateBr(nextbb);
-                    b_.SetInsertPoint(nextbb);
+                    emit_array_commit(sig, state);
                 }
                 b_.CreateCall(nba_arr_reset_fn(), {});
             }
@@ -3419,26 +3441,47 @@ private:
         return rt_fn("rt_free", b_.getVoidTy(), { raw_ptr_ty() });
     }
 
-    // Deferred array-NBA queue (rt_nba_arr_*).
-    // void rt_nba_arr_push(i32 sig, ptr mm_dst, ptr mm_val, ptr mm_mask,
-    //                      i32 mm_bytes, ptr z_dst, ptr z_val, ptr z_mask, i32 z_bytes)
-    llvm::FunctionCallee nba_arr_push_fn() {
-        auto* ptr = raw_ptr_ty();
-        auto* i32 = b_.getInt32Ty();
-        return rt_fn("rt_nba_arr_push", b_.getVoidTy(), { i32, ptr, ptr, ptr, i32, ptr, ptr, ptr, i32 });
+    // Deferred array-NBA record buffers (rt_nba_arr_*). The runtime owns the
+    // growable per-array buffers; the backend defines and fills the fixed-stride
+    // records and emits the monomorphized commit.
+    llvm::FunctionCallee nba_arr_slot_fn() {
+        return rt_fn("rt_nba_arr_slot", raw_ptr_ty(), { b_.getInt32Ty(), b_.getInt32Ty() });
     }
-    llvm::FunctionCallee nba_arr_pending_fn() {
-        return rt_fn("rt_nba_arr_pending", b_.getInt32Ty(), {});
+    llvm::FunctionCallee nba_arr_base_fn() {
+        return rt_fn("rt_nba_arr_base", raw_ptr_ty(), { b_.getInt32Ty() });
     }
-    llvm::FunctionCallee nba_arr_commit_fn() {
-        return rt_fn("rt_nba_arr_commit", b_.getVoidTy(), {});
+    llvm::FunctionCallee nba_arr_count_fn() {
+        return rt_fn("rt_nba_arr_count", b_.getInt32Ty(), { b_.getInt32Ty() });
     }
-    llvm::FunctionCallee nba_arr_dirty_fn() {
-        return rt_fn("rt_nba_arr_dirty", b_.getInt32Ty(), { b_.getInt32Ty() });
+    llvm::FunctionCallee nba_arr_any_fn() {
+        return rt_fn("rt_nba_arr_any", b_.getInt32Ty(), {});
     }
     llvm::FunctionCallee nba_arr_reset_fn() {
         return rt_fn("rt_nba_arr_reset", b_.getVoidTy(), {});
     }
+
+    // Per array-NBA signal: dense id (buffer index) and the record StructType
+    // { ptr mm_ptr, iMM mm_val, [ptr z_ptr, iW z_val], [iW mask] }.
+    uint32_t arr_idx(Signal sig) const {
+        const auto it = std::find(array_nba_sigs_.begin(), array_nba_sigs_.end(), sig);
+        return static_cast<uint32_t>(it - array_nba_sigs_.begin());
+    }
+    llvm::StructType* arr_rec_ty(const SignalSlot& s) {
+        auto*                    ptr  = raw_ptr_ty();
+        std::vector<llvm::Type*> f    = { ptr, int_ty(s.narrow ? s.width : 2 * s.width) };
+        if (s.has_z) {
+            f.push_back(ptr);
+            f.push_back(int_ty(s.width));
+        }
+        if (s.arr_masked) {
+            f.push_back(int_ty(s.width));
+        }
+        return llvm::StructType::get(ctx_, f);
+    }
+    // Field indices within the record (mm_ptr=0, mm_val=1 are fixed).
+    uint32_t arr_rec_z_ptr(const SignalSlot&) const { return 2; }
+    uint32_t arr_rec_z_val(const SignalSlot&) const { return 3; }
+    uint32_t arr_rec_mask(const SignalSlot& s) const { return s.has_z ? 4 : 2; }
 
     // String runtime (rt_string_*); every ptr is an rt_string handle except
     // where noted.
@@ -4890,96 +4933,124 @@ private:
         }
     }
 
-    // The reused array-NBA staging struct type: [16]mm_val [16]mm_mask [8]z_val
-    // [8]z_mask, sized for an element width up to 64 bits (mm word i128 = 16B).
-    llvm::StructType* nba_scratch_ty() {
-        auto* i8 = b_.getInt8Ty();
-        return llvm::StructType::get(ctx_, { llvm::ArrayType::get(i8, 16), llvm::ArrayType::get(i8, 16),
-                                             llvm::ArrayType::get(i8, 8), llvm::ArrayType::get(i8, 8) });
-    }
-    // Lazily allocate the staging struct at coro.begin so it is reused across every
-    // element-NBA site (a loop of element NBAs must not grow the stack). Mirrors
-    // awaiter().
-    llvm::Value* nba_scratch() {
-        if (nba_scratch_ == nullptr) {
-            // A coroutine must home the scratch in its frame (after coro.begin);
-            // a thunk has no frame, so anchor it at the entry-block front. Guard
-            // on coro_begin_ belonging to the current function: it is stale (a
-            // prior group's) or null in a thunk.
-            const bool in_frame = coro_begin_ != nullptr && coro_begin_->getFunction() == fn_;
-            auto* bb = in_frame ? coro_begin_->getParent() : &fn_->getEntryBlock();
-            auto  it = in_frame ? std::next(coro_begin_->getIterator())
-                                : fn_->getEntryBlock().getFirstInsertionPt();
-            llvm::IRBuilder<> ab(bb, it);
-            nba_scratch_ = ab.CreateAlloca(nba_scratch_ty(), nullptr, "nba.scratch");
-        }
-        return nba_scratch_;
-    }
 
-    // Stage a nonblocking write to an unpacked-array element into the runtime
-    // deferred queue (rt_nba_arr_push). Builds the value and a write-mask at the
-    // element width (selected bits placed at bit_off), stores them to reused
-    // scratch, and hands the live element's destination pointers to the queue; the
-    // NBA region replays the masked merge after the active drain.
+    // Stage a nonblocking write to an unpacked-array element: reserve a fixed-stride
+    // record slot in this array's deferred buffer (rt_nba_arr_slot) and fill it with
+    // the destination pointer(s), the positioned value, and (for a masked target) the
+    // write mask. The NBA region replays it. Element width is unrestricted — the
+    // value is a native iMM word of any size.
     void emit_array_nba(const LValue& lv, Plane rhs) {
-        const uint32_t W = lv.store_width;
-        if (W > 64) {
-            // TODO: element width > 64 needs a larger staging buffer (mm word > i128).
-            throw BackendError{ "nonblocking write to an unpacked array element wider than 64 bits is not supported" };
-        }
-        // A bounds-checked select restricts the mask to the in-range bits and
-        // aligns the value poison-free (LRM 11.5.1); a whole/constant target uses
-        // the naive shifted mask.
-        llvm::Value* mask_w = store_mask(lv, W);
-        // A narrow 2-state element stages the bare iW value and mask (no z); the
-        // runtime commit's masked byte merge is width-agnostic, so only the byte
-        // count differs. A packed element stages the i(2W) must|may word.
+        const uint32_t    W = lv.store_width;
+        const SignalSlot& s = slot_of(lv.sig);
+        const llvm::Align a1{ 1 }; // records live in an unaligned byte buffer
+
+        // A bounds-checked select restricts the mask to the in-range bits and aligns
+        // the value poison-free (LRM 11.5.1); a whole/constant target's mask folds to
+        // all-ones and is elided (unmasked signals carry no mask field).
+        llvm::Value* mask_w = s.arr_masked ? store_mask(lv, W) : nullptr;
         llvm::Value* mm_val;
-        llvm::Value* mm_msk;
-        uint32_t     mm_bytes;
-        if (lv.narrow) {
-            mm_val   = place_val(lv, must_of(rhs), W);
-            mm_msk   = mask_w;
-            mm_bytes = (W + 7) / 8;
+        if (s.narrow) {
+            mm_val = place_val(lv, must_of(rhs), W); // iW
         } else {
-            rhs                 = to_four(rhs);
-            llvm::Value* must   = place_val(lv, must_of(rhs), W);
-            llvm::Value* may    = place_val(lv, may_of(rhs), W);
-            llvm::Value* zval   = place_val(lv, rhs.z, W);
-            mm_val   = packed(must, may, zval).mm;          // i2W: must | (may << W)
-            mm_msk   = packed(mask_w, mask_w, zero(W)).mm;  // i2W: mask in both halves
-            mm_bytes = (2 * W + 7) / 8;
-        }
-
-        llvm::Value*      st  = nba_scratch();
-        llvm::StructType* ty  = nba_scratch_ty();
-        const llvm::Align a1{ 1 };
-        auto*             nullp = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
-        llvm::Value*      mvp   = b_.CreateStructGEP(ty, st, 0);
-        llvm::Value*      mkp   = b_.CreateStructGEP(ty, st, 1);
-        b_.CreateAlignedStore(mm_val, mvp, a1);
-        b_.CreateAlignedStore(mm_msk, mkp, a1);
-        // A never-z element slot stores no z word: hand the runtime a null z_ptr
-        // with zero z bytes so the commit merges only the must|may word.
-        llvm::Value* zvp = nullp;
-        llvm::Value* zkp = nullp;
-        llvm::Value* z_ptr = nullp;
-        uint32_t     z_bytes = 0;
-        if (lv.has_z) {
-            // has_z implies a packed (non-narrow) element, so rhs is 4-state here.
+            rhs               = to_four(rhs);
+            llvm::Value* must = place_val(lv, must_of(rhs), W);
+            llvm::Value* may  = place_val(lv, may_of(rhs), W);
             llvm::Value* zval = place_val(lv, rhs.z, W);
-            zvp = b_.CreateStructGEP(ty, st, 2);
-            zkp = b_.CreateStructGEP(ty, st, 3);
-            b_.CreateAlignedStore(zval, zvp, a1);
-            b_.CreateAlignedStore(mask_w, zkp, a1);
-            z_ptr   = lv_z_ptr(lv);
-            z_bytes = (W + 7) / 8;
+            mm_val            = packed(must, may, zval).mm; // i2W: must | (may << W)
         }
 
-        llvm::Value* mm_ptr = lv_mm_ptr(lv);
-        b_.CreateCall(nba_arr_push_fn(),
-                      { b_.getInt32(static_cast<uint32_t>(lv.sig)), mm_ptr, mvp, mkp, b_.getInt32(mm_bytes), z_ptr,
-                        zvp, zkp, b_.getInt32(z_bytes) });
+        llvm::StructType* rt     = arr_rec_ty(s);
+        const uint32_t    stride = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(rt));
+        llvm::Value*      rec    = b_.CreateCall(nba_arr_slot_fn(), { b_.getInt32(arr_idx(lv.sig)), b_.getInt32(stride) });
+        b_.CreateAlignedStore(lv_mm_ptr(lv), b_.CreateStructGEP(rt, rec, 0), a1);
+        b_.CreateAlignedStore(mm_val, b_.CreateStructGEP(rt, rec, 1), a1);
+        if (s.has_z) {
+            // has_z implies a packed (non-narrow) element, so rhs is 4-state here.
+            b_.CreateAlignedStore(lv_z_ptr(lv), b_.CreateStructGEP(rt, rec, arr_rec_z_ptr(s)), a1);
+            b_.CreateAlignedStore(place_val(lv, rhs.z, W), b_.CreateStructGEP(rt, rec, arr_rec_z_val(s)), a1);
+        }
+        if (s.arr_masked) {
+            b_.CreateAlignedStore(mask_w, b_.CreateStructGEP(rt, rec, arr_rec_mask(s)), a1);
+        }
+    }
+
+    // Replay array `sig`'s deferred records in push order (later write to an element
+    // wins): a monomorphized loop of typed masked/plain stores into the live element
+    // slots, then wake its Any-edge readers if it took any write.
+    void emit_array_commit(Signal sig, llvm::Value* state) {
+        (void)state;
+        const SignalSlot& s      = slot_of(sig);
+        const uint32_t    W      = s.width;
+        auto*             i32    = b_.getInt32Ty();
+        auto*             ptr    = raw_ptr_ty();
+        auto*             i8     = b_.getInt8Ty();
+        auto*             mmty   = int_ty(s.narrow ? W : 2 * W);
+        auto*             zty    = int_ty(W);
+        auto*             rt     = arr_rec_ty(s);
+        const uint32_t    stride = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(rt));
+        const llvm::Align a1{ 1 };
+        // The live element pointer arrives opaque from the record, but the design
+        // state is rt_alloc'd (64-byte aligned) and array elements sit at naturally
+        // aligned offsets, so each element word meets its ABI alignment.
+        const llvm::Align mm_al  = llmod_.getDataLayout().getABITypeAlign(mmty);
+        const llvm::Align z_al   = llmod_.getDataLayout().getABITypeAlign(zty);
+
+        llvm::Value* n    = b_.CreateCall(nba_arr_count_fn(), { b_.getInt32(arr_idx(sig)) });
+        llvm::Value* base = b_.CreateCall(nba_arr_base_fn(), { b_.getInt32(arr_idx(sig)) });
+        auto*        fn    = b_.GetInsertBlock()->getParent();
+        auto*        head  = llvm::BasicBlock::Create(ctx_, "arr.head", fn);
+        auto*        body  = llvm::BasicBlock::Create(ctx_, "arr.body", fn);
+        auto*        done  = llvm::BasicBlock::Create(ctx_, "arr.done", fn);
+        auto*        entry = b_.GetInsertBlock();
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(head);
+        auto* idx = b_.CreatePHI(i32, 2);
+        idx->addIncoming(b_.getInt32(0), entry);
+        b_.CreateCondBr(b_.CreateICmpULT(idx, n), body, done);
+
+        b_.SetInsertPoint(body);
+        llvm::Value* recp   = b_.CreateInBoundsGEP(i8, base, b_.CreateMul(idx, b_.getInt32(stride)));
+        llvm::Value* mm_ptr = b_.CreateLoad(ptr, b_.CreateStructGEP(rt, recp, 0));
+        llvm::Value* mm_val = b_.CreateAlignedLoad(mmty, b_.CreateStructGEP(rt, recp, 1), a1);
+        llvm::Value* mask   = nullptr;
+        if (s.arr_masked) {
+            mask = b_.CreateAlignedLoad(zty, b_.CreateStructGEP(rt, recp, arr_rec_mask(s)), a1);
+            llvm::Value* mask2 = s.narrow ? mask
+                                          : b_.CreateOr(b_.CreateZExt(mask, mmty),
+                                                        b_.CreateShl(b_.CreateZExt(mask, mmty),
+                                                                     llvm::ConstantInt::get(mmty, W)));
+            llvm::Value* old   = b_.CreateAlignedLoad(mmty, mm_ptr, mm_al);
+            b_.CreateAlignedStore(
+              b_.CreateOr(b_.CreateAnd(old, b_.CreateNot(mask2)), b_.CreateAnd(mm_val, mask2)), mm_ptr, mm_al);
+        } else {
+            b_.CreateAlignedStore(mm_val, mm_ptr, mm_al);
+        }
+        if (s.has_z) {
+            llvm::Value* z_ptr = b_.CreateLoad(ptr, b_.CreateStructGEP(rt, recp, arr_rec_z_ptr(s)));
+            llvm::Value* z_val = b_.CreateAlignedLoad(zty, b_.CreateStructGEP(rt, recp, arr_rec_z_val(s)), a1);
+            if (s.arr_masked) {
+                llvm::Value* old = b_.CreateAlignedLoad(zty, z_ptr, z_al);
+                b_.CreateAlignedStore(
+                  b_.CreateOr(b_.CreateAnd(old, b_.CreateNot(mask)), b_.CreateAnd(z_val, mask)), z_ptr, z_al);
+            } else {
+                b_.CreateAlignedStore(z_val, z_ptr, z_al);
+            }
+        }
+        idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), b_.GetInsertBlock());
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(done);
+        // Wake the array's level readers if it took any write this pass.
+        if (signal_has_waiters(sig)) {
+            auto* svc  = llvm::BasicBlock::Create(ctx_, "arr.svc", fn);
+            auto* cont = llvm::BasicBlock::Create(ctx_, "arr.svc.cont", fn);
+            b_.CreateCondBr(b_.CreateICmpNE(n, b_.getInt32(0)), svc, cont);
+            b_.SetInsertPoint(svc);
+            service_any_waiters(sig);
+            b_.CreateBr(cont);
+            b_.SetInsertPoint(cont);
+        }
     }
 
     // Wake the Any-edge waiters of an array signal unconditionally (an element
@@ -7368,7 +7439,6 @@ private:
     // Reused scratch for staging array-NBA value/mask bytes before a push call
     // (one per process, hoisted to coro.begin so a loop of element NBAs does not
     // grow the stack). Layout: [16]mm_val [16]mm_mask [8]z_val [8]z_mask.
-    llvm::AllocaInst*   nba_scratch_ = nullptr;
     llvm::BasicBlock*   coro_cleanup_bb_ = nullptr;
     llvm::BasicBlock*   coro_ret_bb_     = nullptr;
     // The current coroutine's scheduled flag: &clotho.proc_sched[this process] for
