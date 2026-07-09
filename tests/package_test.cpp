@@ -299,3 +299,71 @@ TEST_CASE("package variable is one shared signal across multiple top-level modul
     )");
     CHECK(out == "m2 sees shared_var=42\n");
 }
+
+// A package that itself imports another package (LRM 26.3) can use the
+// imported names in its own declarations (parameter expressions, function
+// bodies); this is ordinary transparent import resolution one level removed,
+// needing nothing package-specific in Clotho.
+TEST_CASE("package importing another package: names usable in its own declarations") {
+    const std::string out = run_capture(R"(
+        package p;
+            parameter int W = 8;
+        endpackage
+        package q;
+            import p::*;
+            parameter int W2 = W * 2;
+            function automatic int scaled(int x);
+                return x * W;
+            endfunction
+        endpackage
+        module m;
+            import q::*;
+            initial $display("W2=%0d scaled=%0d", W2, scaled(3));
+        endmodule
+    )");
+    CHECK(out == "W2=16 scaled=24\n");
+}
+
+// A package-internal import is not transitively visible through a further
+// import of that package (LRM 26.3/26.4): `q`'s own use of `p::W` does not
+// make `W` itself reachable via `import q::*;` without an explicit `export`.
+// Verified vs iverilog (same "unable to bind" / undeclared-identifier
+// failure).
+TEST_CASE("package-internal import does not leak without export") {
+    check_rejected(R"(
+        package p;
+            parameter int W = 8;
+        endpackage
+        package q;
+            import p::*;
+            parameter int W2 = W * 2;
+        endpackage
+        module m;
+            import q::*;
+            initial $display("%0d", W);
+        endmodule
+    )",
+                   "undeclared identifier");
+}
+
+// `export pkg::*;` (LRM 26.4) makes a re-exported name reachable through a
+// further `import`, when the exporting package's own body also references
+// that name somewhere. slang resolves it that way,
+// and the fully general case has no independent confirmation.
+TEST_CASE("export re-export via a further import") {
+    const std::string out = run_capture(R"(
+        package p;
+            parameter int W = 8;
+        endpackage
+        package q;
+            import p::*;
+            export p::*;
+            parameter int W2 = W * 2;
+        endpackage
+        module m;
+            import q::*;
+            initial $display("W=%0d W2=%0d", W, W2);
+        endmodule
+    )");
+    CHECK(out == "W=8 W2=16\n");
+}
