@@ -134,12 +134,16 @@ TEST_CASE("rt_nba_arr slot buffer: distinct slots, counts, reset keeps capacity"
     rt_nba_arr_reset();
     const uint32_t stride = 16;
     // Two arrays; reserve slots and confirm they are distinct, stride-spaced, and
-    // that the writes round-trip through base + i*stride.
+    // that the writes round-trip through base + i*stride. Each slot is written
+    // immediately after it is reserved: rt_nba_arr_slot may resize (and thus
+    // reallocate) the buffer, invalidating pointers from earlier calls, so the
+    // backend contract is write-then-advance — a later grow resize-copies the
+    // already-written records forward (Runtime.cpp).
     void* a0 = rt_nba_arr_slot(0, stride);
-    void* a1 = rt_nba_arr_slot(0, stride);
-    void* b0 = rt_nba_arr_slot(1, stride);
     static_cast<uint64_t*>(a0)[0] = 0xAAAA;
+    void* a1 = rt_nba_arr_slot(0, stride);
     static_cast<uint64_t*>(a1)[0] = 0xBBBB;
+    void* b0 = rt_nba_arr_slot(1, stride);
     static_cast<uint64_t*>(b0)[0] = 0xCCCC;
     CHECK(rt_nba_arr_count(0) == 2);
     CHECK(rt_nba_arr_count(1) == 1);
