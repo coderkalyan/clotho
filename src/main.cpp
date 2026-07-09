@@ -1,5 +1,3 @@
-#include <cstdint>
-#include <cstdlib>
 #include <iostream>
 #include <print>
 #include <string_view>
@@ -16,7 +14,7 @@
 // then JIT-compile and run it (default), or emit the process IR / LLVM IR for
 // debugging. All compiler logic lives in libclotho / libclotho_ir.
 //
-// Usage: clotho [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-thunk] [--no-domain-spec] [--dom-min-ops N] [-O] [--perf-jitdump] [-o <out>] <file.sv>...
+// Usage: clotho [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-thunk] [--domain-spec] [-O] [--perf-jitdump] [-o <out>] <file.sv>...
 // Multiple source files are compiled together into one design (shared name
 // space, LRM 3.12), parsed in the order given.
 // `llvm` emits the backend's raw IR before the coroutine-lowering pipeline runs
@@ -41,10 +39,8 @@ int main(int argc, char** argv) {
             config.fuse = false;
         } else if (arg == "--no-thunk") {
             config.thunk = false;
-        } else if (arg == "--no-domain-spec") {
-            config.domain_spec = false;
-        } else if (arg == "--dom-min-ops" && i + 1 < argc) {
-            config.domain_spec_min_ops = static_cast<uint32_t>(std::atoi(argv[++i]));
+        } else if (arg == "--domain-spec") {
+            config.domain_spec = true;
         } else if (arg == "-O") {
             config.o3 = true;
         } else if (arg == "--perf-jitdump") {
@@ -61,7 +57,7 @@ int main(int argc, char** argv) {
 
     if (inputs.empty() || (emit != "run" && emit != "ir" && emit != "llvm" && emit != "opt")) {
         std::println(stderr,
-                     "usage: {} [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-thunk] [--no-domain-spec] [--dom-min-ops N] [-O] [--perf-jitdump] [-o <out>] <file.sv>...",
+                     "usage: {} [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-thunk] [--domain-spec] [-O] [--perf-jitdump] [-o <out>] <file.sv>...",
                      argv[0]);
         return 2;
     }

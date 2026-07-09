@@ -1,7 +1,5 @@
 #pragma once
 
-#include <cstdint>
-
 // Configuration knobs shared by the compile (LlvmBackend.h) and run (Jit.h)
 // entry points. Grows as new optimizations and simulation modes land.
 
@@ -33,23 +31,20 @@ struct SimulationConfig {
     // the thunk path in LlvmBackend.cpp). Disable for bisection / debugging;
     // semantics are byte-identical (same sched-flag timeline, same FIFO order).
     bool thunk = true;
-    // Dynamic domain specialization: compile an eligible thunk group's body a
-    // second time under the assumption that every 4-state signal it reads is
-    // currently clean (no x/z bit), routed through the native 2-state operator
-    // paths, and dispatch per activation on a per-group dirty counter
-    // maintained at write sites (see compute_domain_spec in LlvmBackend.cpp).
-    // Disable for bisection / debugging; semantics are identical either way —
-    // the fast body runs only when the whole read set is clean at runtime,
-    // where 2-state and 4-state lowering agree exactly.
-    bool domain_spec = true;
-    // Profitability floor for domain specialization: a thunk group is
-    // specialized only when its bodies hold at least this many eligible
-    // 4-state compute ops (and 8x its store count) — the write-side tag
-    // maintenance is paid design-wide, so the fast body must be decisively
-    // op-dense to fund it (measured thresholds, docs/design/domain-spec.md).
-    // 0 disables the gate (used by tests to exercise the machinery on small
-    // bodies).
-    uint32_t domain_spec_min_ops = 64;
+    // Dynamic domain specialization (OPT-IN, off by default): compile every
+    // eligible thunk group's body a second time under the assumption that its
+    // 4-state reads are currently clean (no x/z bit), routed through the native
+    // 2-state operator paths, and pick fast-vs-generic per activation with a
+    // reader-side guard over the read set (see compute_domain_spec in
+    // LlvmBackend.cpp). Semantics are identical either way — the fast body runs
+    // only when the whole read set is clean at runtime, where 2-state and
+    // 4-state lowering agree exactly. Off by default: the fast body pays
+    // 4-state<->2-state boundary conversions that only op-dense bodies
+    // amortize, so it is not a universal win; it targets op-dense workloads
+    // over transiently-x (reset-then-run) signals a static analysis cannot
+    // prove clean. When off, none of the specialization machinery is emitted
+    // (the design compiles exactly as without the feature).
+    bool domain_spec = false;
     // Register LLVM's perf JITEventListener on the object-linking layer so the
     // JIT'd design's functions show up in `perf` with real symbols. Emits a
     // jitdump (`$JITDUMPDIR/jit-<pid>.dump`) consumed by `perf inject --jit`.

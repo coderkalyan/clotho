@@ -18,8 +18,8 @@
 // exercise the domain transitions the guard must track (a read set going x ->
 // clean -> x through blocking stores, partial stores, NBA commits, and a
 // producer group's own stores) against iverilog-verified outputs, and always
-// A/B the specialized run against --no-domain-spec — the two lowerings must
-// agree byte-for-byte.
+// A/B the specialized run (--domain-spec) against the default (off) — the two
+// lowerings must agree byte-for-byte.
 
 using namespace clotho;
 
@@ -56,10 +56,10 @@ std::string run_capture(std::string_view source, ir::SimulationConfig config = {
 // Run with specialization on and off; the outputs must match each other and
 // the expected (iverilog-verified) text. Returns the specialized output.
 std::string run_ab(std::string_view source, std::string_view expected) {
-    // min_ops = 0: exercise the machinery on deliberately tiny bodies that
-    // the default profitability gate would (correctly) skip.
-    const std::string spec   = run_capture(source, { .domain_spec_min_ops = 0 });
-    const std::string nospec = run_capture(source, { .domain_spec = false });
+    // domain_spec is opt-in and ungated, so every eligible group specializes;
+    // the off run is the default config.
+    const std::string spec   = run_capture(source, { .domain_spec = true });
+    const std::string nospec = run_capture(source);
     CHECK_EQ(spec, nospec);
     CHECK_EQ(spec, expected);
     return spec;
@@ -73,7 +73,7 @@ std::string emit_raw(std::string_view source) {
     REQUIRE(result.module != nullptr);
     std::string              text;
     llvm::raw_string_ostream os(text);
-    REQUIRE(ir::emit_llvm(*result.module, os, { .optimize = false, .domain_spec_min_ops = 0 }));
+    REQUIRE(ir::emit_llvm(*result.module, os, { .optimize = false, .domain_spec = true }));
     return text;
 }
 

@@ -2349,24 +2349,29 @@ private:
         }
     }
 
-    // -- Dynamic domain specialization --
+    // -- Dynamic domain specialization (opt-in: config_.domain_spec) --
     //
     // A 4-state signal rarely changes domain at runtime: typically x until
-    // reset, then clean (no x/z bit) for the rest of the run. A thunk group
-    // whose body meets spec_eligible_body is compiled twice — the generic
-    // 4-state body, plus a fast body lowered as if every 4-state value were
-    // 2-state (assume_clean_ makes type_of report 4-state as 2-state, routing
-    // every operator through the native 2-state paths; stores lift back to the
-    // packed planes via to_four, so storage and outside readers see identical
-    // bits). Dispatch is reader-side (lower_group): at each activation the
-    // group's tracked read-set signals are loaded and tested for cleanliness,
-    // short-circuiting to the generic body on the first dirty one. The fast
-    // body runs only when the whole read set is clean, where 2-state and
-    // 4-state lowering agree exactly, so results are identical by construction
-    // — only speed changes. Reader-side validation carries no write-side cost:
-    // nothing is maintained at store / NBA-commit sites (an earlier tag +
-    // per-group-counter scheme did, and that per-write retest was the entire
-    // ungated maintenance residual — see docs/design/domain-spec.md).
+    // reset, then clean (no x/z bit) for the rest of the run. When enabled,
+    // every thunk group whose body meets spec_eligible_body is compiled twice —
+    // the generic 4-state body, plus a fast body lowered as if every 4-state
+    // value were 2-state (assume_clean_ makes type_of report 4-state as
+    // 2-state, routing every operator through the native 2-state paths; stores
+    // lift back to the packed planes via to_four, so storage and outside
+    // readers see identical bits). Dispatch is reader-side (lower_group): at
+    // each activation the group's tracked read-set signals are loaded and
+    // tested for cleanliness, short-circuiting to the generic body on the first
+    // dirty one. The fast body runs only when the whole read set is clean,
+    // where 2-state and 4-state lowering agree exactly, so results are
+    // identical by construction — only speed changes. Reader-side validation
+    // carries no write-side cost: nothing is maintained at store / NBA-commit
+    // sites.
+    //
+    // No profitability gate. The feature is off by default and applies to
+    // every eligible group when opted in — the fast body's 4-state<->2-state
+    // boundary conversions are amortized only by op-dense bodies, so it is not
+    // a universal win, but choosing that trade-off is the caller's job, not a
+    // magic-number heuristic in the backend. See docs/design/domain-spec.md.
 
     // Whether one member body may be lowered under assume_clean_. Allow-list:
     // any tag not listed keeps the group generic, so newly added IR tags are
@@ -2645,54 +2650,19 @@ private:
             if (!ok || reads.empty()) {
                 continue;
             }
-            // Profitability gate. Specialization is not free even when the
-            // fast body never runs: every write to a tracked signal anywhere
-            // in the design pays the x/z retest, and the NBA commit loop pays
-            // a changed-word check per tracked commit. The fast body must be
-            // decisively op-dense to fund that (measured on picorv32: 188
-            // small groups, compute <= 50, regressed sim ~11% for no win;
-            // the xdomain shape, compute ~5k over 259 stores, keeps ~93% of
-            // the 2-state ceiling). V1 static proxy — a runtime-feedback
-            // group-retirement scheme is the planned replacement
-            // (docs/design/domain-spec.md).
-            uint32_t n_compute = 0;
-            uint32_t n_stores  = 0;
-            for (const uint32_t m : groups_[g]) {
-                const Ir& ir = all[m].ir;
-                for (size_t k = 0; k < ir.inst_count(); ++k) {
-                    switch (ir.tag(static_cast<Index>(k))) {
-                        case Inst::Tag::Store:
-                        case Inst::Tag::StoreNb:
-                            n_stores++;
-                            break;
-                        case Inst::Tag::Add: case Inst::Tag::Sub: case Inst::Tag::Mul:
-                        case Inst::Tag::Band: case Inst::Tag::Bor: case Inst::Tag::Bxor:
-                        case Inst::Tag::Bxnor: case Inst::Tag::Bnot:
-                        case Inst::Tag::RedAnd: case Inst::Tag::RedOr: case Inst::Tag::RedXor:
-                        case Inst::Tag::Sll: case Inst::Tag::Srl: case Inst::Tag::Sra:
-                        case Inst::Tag::Eq: case Inst::Tag::Ne: case Inst::Tag::Lt:
-                        case Inst::Tag::Le: case Inst::Tag::Gt: case Inst::Tag::Ge:
-                        case Inst::Tag::CaseEq: case Inst::Tag::CasezEq: case Inst::Tag::CasexEq:
-                        case Inst::Tag::WildEq: case Inst::Tag::Select: case Inst::Tag::SelectLazy:
-                        case Inst::Tag::Concat: case Inst::Tag::Repl:
-                        case Inst::Tag::Land: case Inst::Tag::Lor: case Inst::Tag::Lnot:
-                            n_compute++;
-                            break;
-                        default:
-                            break;
-                    }
-                }
-            }
-            const uint32_t min_ops = config_.domain_spec_min_ops;
-            if (!dom_debug_ && min_ops != 0 && (n_compute < min_ops || n_compute < 8 * n_stores)) {
-                continue;
-            }
+            // No profitability gate: domain specialization is a fully opt-in
+            // feature (config_.domain_spec, off by default), so when it is on
+            // every eligible group is specialized. The fast body pays
+            // 4-state<->2-state boundary conversions that only op-dense bodies
+            // amortize, so it is not a universal win — but that trade-off is
+            // the caller's to make by opting in, not a static heuristic baked
+            // into the backend. See docs/design/domain-spec.md.
             if (dom_debug_) {
                 fprintf(stderr, "DOM group g=%u procs=[", g);
                 for (const uint32_t m : groups_[g]) {
                     fprintf(stderr, "%u ", m);
                 }
-                fprintf(stderr, "] compute=%u stores=%u reads=[", n_compute, n_stores);
+                fprintf(stderr, "] reads=[");
                 for (const uint32_t si : reads) {
                     fprintf(stderr, "%u:%s ", si, mod_.signals()[si].name.c_str());
                 }
@@ -7696,11 +7666,11 @@ private:
     bool                                assume_clean_ = false;
     std::vector<bool>                   spec_group_;
     std::vector<std::vector<uint32_t>>  group_reads_;
-    // CLOTHO_DOM_DEBUG: bypass the profitability gate, count fast/generic
-    // dispatches per group (clotho.dom_nfast / dom_ngen), and dump the read
-    // sets / rejections to stderr — run_jit prints the runtime dispatch counts
-    // after the sim (Jit.cpp). Diagnosis only; zero cost when the env var is
-    // unset (checked at compile time).
+    // CLOTHO_DOM_DEBUG: count fast/generic dispatches per group
+    // (clotho.dom_nfast / dom_ngen) and dump the read sets / rejections to
+    // stderr — run_jit prints the runtime dispatch counts after the sim
+    // (Jit.cpp). Diagnosis only; zero cost when the env var is unset (checked
+    // at compile time). Requires --domain-spec to be on.
     bool                                dom_debug_ = false;
     llvm::GlobalVariable*               dom_nfast_gv_ = nullptr;
     llvm::GlobalVariable*               dom_ngen_gv_  = nullptr;
