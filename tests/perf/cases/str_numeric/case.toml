@@ -1,0 +1,16 @@
+name = "str_numeric"
+description = "200k-iteration loop calling atoi/atohex/atoreal + itoa/hextoa/realtoa once each per iteration (LRM 6.16.9/6.16.11 numeric-conversion methods, landed 2026-07). Operand range keeps output independent of Clotho's documented choices (no sign-magnitude or precision divergence)."
+top = "top"
+
+[clotho]
+files = ["design.sv"]
+
+[check]
+stdout_regex = 'done -1772450284 700000\.000000'
+
+[oracles.iverilog]
+enabled = true
+
+[oracles.verilator]
+enabled = true
+
