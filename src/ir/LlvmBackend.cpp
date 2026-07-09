@@ -3804,16 +3804,61 @@ private:
         }
     }
 
+    // A string Store whose RHS concat builds directly into the store target,
+    // making the store itself a no-op. Matches the exact frontend shape of
+    // `s = {...}` — consecutive [Concat, lvalue leaf, Store] — so nothing reads
+    // the target between the concat write and the store, and the concat has no
+    // earlier consumer. rt_string_concat is alias-safe for a target appearing as
+    // a prefix part (s = {s, chunk} appends in place, the O(n^2)->O(n) fix for
+    // repeated append); a whole-string leaf target keeps the handle derivable in
+    // the prologue, before the leaf instruction itself lowers.
+    bool forwarded_string_store(Index j) {
+        if (ir_->tag(j) != Inst::Tag::Store) {
+            return false;
+        }
+        const Inst::Payload& p  = ir_->payload(j);
+        const auto           ji = static_cast<uint32_t>(j);
+        if (static_cast<uint32_t>(p.binary.r) + 2 != ji || static_cast<uint32_t>(p.binary.l) + 1 != ji) {
+            return false;
+        }
+        if (ir_->tag(p.binary.r) != Inst::Tag::Concat || !type_of(p.binary.r).is_string) {
+            return false;
+        }
+        switch (ir_->tag(p.binary.l)) {
+            case Inst::Tag::Signal: {
+                const SignalSlot& s = slot_of(ir_->payload(p.binary.l).signal);
+                return s.is_string && !s.is_array;
+            }
+            case Inst::Tag::Local: {
+                const uint32_t idx = ir_->payload(p.binary.l).local.index;
+                return idx < frame_slots_.size() && frame_slots_[idx].is_string;
+            }
+            default:
+                return false;
+        }
+    }
+
     // Alloca + init one handle per string-producing instruction, in the body
     // prologue (entry block of a function; right after coro.begin of a process /
     // task). Producers overwrite their temp in place, so a loop reuses its
     // capacity instead of allocating each iteration. Paired with
-    // deinit_body_strings at the body's exits.
+    // deinit_body_strings at the body's exits. A concat consumed by an adjacent
+    // forwarded store gets the store target's handle instead of a temp (never
+    // init'd — the target already holds a live string).
     void build_str_temps() {
         str_temp_list_.clear();
         for (size_t k = 0; k < ir_->inst_count(); ++k) {
             const auto i = static_cast<Index>(k);
             if (!produces_string_temp(i)) {
+                continue;
+            }
+            if (ir_->tag(i) == Inst::Tag::Concat && k + 2 < ir_->inst_count() &&
+                forwarded_string_store(static_cast<Index>(k + 2))) {
+                const Inst::Payload& lp = ir_->payload(static_cast<Index>(k + 1));
+                const LValue lv = ir_->tag(static_cast<Index>(k + 1)) == Inst::Tag::Signal
+                                    ? signal_lvalue(lp.signal)
+                                    : local_lvalue(lp.local.index);
+                set_str(i, lv_string_ptr(lv));
                 continue;
             }
             auto* temp = b_.CreateAlloca(str_slot_ty(), nullptr, "str.tmp");
@@ -3931,6 +3976,11 @@ private:
                 // detected from old -> new.
                 const LValue& lv      = lvalue_of(p.binary.l);
                 if (lv.is_string) {
+                    // A forwarded concat already built its result in the target
+                    // (build_str_temps handed it the target's handle).
+                    if (forwarded_string_store(i)) {
+                        return;
+                    }
                     // Deep copy. Strings are guarded out of sensitivity lists in
                     // the frontend, so there is no wait queue to service.
                     b_.CreateCall(str_assign_fn(), { lv_string_ptr(lv), str_of(p.binary.r) });

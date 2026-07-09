@@ -178,6 +178,79 @@ TEST_CASE("string concatenation and replication, including self-append") {
     CHECK(run_capture(src) == "[ababc]\n[xyxyxy]\n0\n[H]\n");
 }
 
+// The concat-into-store forwarding path (build_str_temps) plus the alias-aware
+// in-place append in rt_string_concat. Each case cross-checked vs iverilog 13.
+TEST_CASE("self-append concat grows in place, including multiple self-occurrences") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s;
+            initial begin
+                s = "0123456789";
+                s = {s, s};
+                s = {s, s};
+                $display("%0d %s", s.len(), s.substr(30, 39));
+                s = {s, "X", s};
+                $display("%0d %s", s.len(), s.substr(39, 41));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "40 0123456789\n81 9X0\n");
+}
+
+TEST_CASE("prepend concat (destination as a later part) keeps the scratch path") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s;
+            int i;
+            initial begin
+                s = "T";
+                for (i = 0; i < 20; i++) s = {"ab", s};
+                $display("%0d %s %s", s.len(), s.substr(0, 3), s.substr(38, 40));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "41 abab abT\n");
+}
+
+TEST_CASE("append loop crosses the inline-to-heap boundary mid-append") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s, chunk;
+            int i;
+            initial begin
+                s = "";
+                chunk = "abcd";
+                for (i = 0; i < 64; i++) s = {s, chunk.substr(i % 4, i % 4)};
+                $display("%0d %s %s", s.len(), s.substr(28, 35), s.substr(60, 63));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "64 abcdabcd abcd\n");
+}
+
+TEST_CASE("string append forwards for locals and stays on the temp path for array elements") {
+    constexpr std::string_view src = R"(
+        module m;
+            string arr[2];
+            function string join3(string a);
+                string r;
+                r = "";
+                r = {r, a};
+                r = {r, "-"};
+                r = {r, a};
+                return r;
+            endfunction
+            initial begin
+                arr[0] = "x";
+                arr[0] = {arr[0], "yz"};
+                arr[1] = {arr[0], arr[0]};
+                $display("%s %s %s", arr[0], arr[1], join3("ab"));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "xyz xyzxyz ab-ab\n");
+}
+
 TEST_CASE("string comparison operators and compare/icompare order in strcmp fashion") {
     constexpr std::string_view src = R"(
         module m;
