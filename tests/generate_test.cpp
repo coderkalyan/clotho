@@ -218,9 +218,10 @@ TEST_CASE("a module instance inside a for-generate flattens under the block") {
     CHECK(names.contains("g[1].u.y"));
 }
 
-// An unsupported construct inside a generate block must still fail loudly via
-// the shared member walk, not be silently dropped.
-TEST_CASE("an instance array inside a generate block fails loudly") {
+// An instance array nested inside a generate block flattens under both the
+// block's prefix and the array's own per-element subscript (LRM 23.3.6 +
+// 27.4 composed).
+TEST_CASE("an instance array inside a generate block flattens under both prefixes") {
     const LowerResult r = lower_text(R"(
         module inv(input a, output y);
             assign y = ~a;
@@ -234,6 +235,11 @@ TEST_CASE("an instance array inside a generate block fails loudly") {
             endgenerate
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("instance array") != std::string::npos);
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    const std::set<std::string> names = signal_names(*r.module);
+    for (int i = 0; i < 4; i++) {
+        CHECK(names.contains("g.u[" + std::to_string(i) + "].a"));
+        CHECK(names.contains("g.u[" + std::to_string(i) + "].y"));
+    }
 }

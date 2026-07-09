@@ -5,6 +5,7 @@
 #include <doctest/doctest.h>
 
 #include <cstdio>
+#include <set>
 #include <string>
 #include <string_view>
 
@@ -343,7 +344,10 @@ TEST_CASE("unsupported gate output lvalues are rejected") {
     CHECK(r2.diagnostics.find("2-state") != std::string::npos);
 }
 
-TEST_CASE("module instance arrays still fail loudly") {
+// Module instance arrays (LRM 23.3.6) share InstanceArraySymbol with gate
+// arrays in slang but elaborate to InstanceSymbol leaves; lower_instance_array
+// dispatches each leaf kind to its own scalar lowering path.
+TEST_CASE("module instance arrays lower one instance per element") {
     const LowerResult r = lower_text(R"(
         module sub(input a, output y);
             assign y = a;
@@ -354,8 +358,16 @@ TEST_CASE("module instance arrays still fail loudly") {
             sub u[1:0](a, y);
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("instance arrays") != std::string::npos);
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+
+    std::set<std::string> names;
+    for (const ir::SignalInfo& s : r.module->signals()) {
+        names.insert(s.name);
+    }
+    CHECK(names.contains("u[0].a"));
+    CHECK(names.contains("u[0].y"));
+    CHECK(names.contains("u[1].a"));
+    CHECK(names.contains("u[1].y"));
 }
 
 // -- Runtime behavior (backend table-driven gate evaluation) --
