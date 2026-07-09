@@ -340,10 +340,48 @@ def gen_bigcase(n: int, cycles: int) -> str:
     out.append("endmodule")
     return "\n".join(out) + "\n"
 
+def gen_onehot(n: int, cycles: int, order: str) -> str:
+    """One clocked process holding the reverse-case one-hot priority-encoder
+    idiom: `case (1'b1)` over N single-bit selects `sel[i]` of a packed vector.
+    First set bit (in source order) wins (LRM 12.5). A walking one-hot `sel`
+    rotates each cycle so every arm fires in turn. Lowers to an O(N) `sel[i] ===
+    1'b1` compare chain today; a count-trailing-zeros + jump table would flatten
+    dispatch and compile. `order` picks the arm order: lsb (sel[0]..sel[N-1]),
+    msb (reversed), or s<seed> (shuffled) to exercise the permutation path."""
+    idx = list(range(n))
+    if order == "msb":
+        idx = idx[::-1]
+    elif order.startswith("s"):
+        rng = random.Random(int(order[1:] or 0))
+        rng.shuffle(idx)
+    elif order not in ("lsb", "topo"):  # topo is the shared arg default.
+        raise SystemExit(f"onehot: bad order {order!r} (lsb|msb|s<seed>)")
+    out = []
+    out.append("module top;")
+    out.append("  reg clk = 0;")
+    out.append("  integer c = 0;")
+    out.append(f"  reg [{n - 1}:0] sel = {n}'d1;")
+    out.append("  reg [31:0] out_r = 0;")
+    out.append("  always #5 clk = ~clk;")
+    out.append("  always @(posedge clk) begin")
+    out.append("    case (1'b1)")
+    for i in idx:
+        out.append(f"      sel[{i}]: out_r <= out_r + 32'h{(i * 2654435761) & 0xffffffff:08x};")
+    out.append("    endcase")
+    out.append(f"    sel <= {{sel[{n - 2}:0], sel[{n - 1}]}};")
+    out.append("    c <= c + 1;")
+    out.append(f"    if (c == {cycles}) begin")
+    out.append('      $display("done %h", out_r);')
+    out.append("      $finish;")
+    out.append("    end")
+    out.append("  end")
+    out.append("endmodule")
+    return "\n".join(out) + "\n"
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("bench", choices=["regs", "tri", "chain", "thunk", "wheel",
-                                      "combchain", "timers", "bigcase"])
+                                      "combchain", "timers", "bigcase", "onehot"])
     ap.add_argument("--n", type=int, required=True)
     ap.add_argument("--cycles", type=int, required=True)
     ap.add_argument("--fused", action="store_true")
@@ -365,5 +403,7 @@ if __name__ == "__main__":
         sys.stdout.write(gen_timers(a.n, a.cycles))
     elif a.bench == "bigcase":
         sys.stdout.write(gen_bigcase(a.n, a.cycles))
+    elif a.bench == "onehot":
+        sys.stdout.write(gen_onehot(a.n, a.cycles, a.order))
     else:
         sys.stdout.write(gen_wheel(a.cycles))
