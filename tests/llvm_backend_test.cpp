@@ -2744,6 +2744,36 @@ TEST_CASE("NBA of a z value round-trips the shadow commit; never-z NBAs use the 
     CHECK(run_capture(src, { .block_nba = false }) == "zz01 0101\n");
 }
 
+TEST_CASE("whole-scalar NBAs lower to the block-commit path by default") {
+    constexpr std::string_view src = R"(
+        module m;
+            reg clk = 0;
+            logic [3:0] zq;
+            logic [3:0] nq;
+            logic [3:0] zsrc = 4'bzz01;
+            always @(posedge clk) begin
+                zq <= zsrc;
+                nq <= nq === 4'bxxxx ? 4'd5 : nq + 1;
+            end
+            initial begin
+                #1 clk = 1;
+                #1 $display("%b %b", zq, nq);
+                $finish;
+            end
+        endmodule
+    )";
+    const std::string ir = emit(src);
+    // One straight-line block: a single enqueue registration and one commit
+    // function; no per-signal w4 bucket worklists form.
+    CHECK(ir.find("clotho.nba_block_enqueue") != std::string::npos);
+    CHECK(ir.find("clotho.nba.commit_blk0") != std::string::npos);
+    CHECK(ir.find("clotho.nba.w4.full") == std::string::npos);
+    // Shadow accesses go through the opaque base, not state-relative constant
+    // offsets (memory-dependence mis-speculation defense; see shadow_ptr).
+    CHECK(ir.find("clotho.nba.shadow_base") != std::string::npos);
+    CHECK(run_capture(src) == "zz01 0101\n");
+}
+
 TEST_CASE("partial NBA merges z bits into a z-carrying target") {
     constexpr std::string_view src = R"(
         module m;

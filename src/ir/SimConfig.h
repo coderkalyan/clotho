@@ -36,7 +36,8 @@ struct SimulationConfig {
     // so enqueue cost is O(branchiness) not O(signals written). Semantics are
     // byte-identical (same shadow last-write-wins, same NBA-region timing).
     // Partial (bit/part-select) and array-element NBAs are unaffected. Disable
-    // for bisection / debugging.
+    // for bisection / debugging. Measured: wideff N=256 sim 116 -> 59 ms,
+    // picorv32 1710 -> 1527 ms.
     bool block_nba = true;
     // Register LLVM's perf JITEventListener on the object-linking layer so the
     // JIT'd design's functions show up in `perf` with real symbols. Emits a

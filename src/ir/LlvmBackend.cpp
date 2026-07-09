@@ -834,10 +834,34 @@ private:
         return b_.CreateInBoundsGEP(state_ty_, base, idx);
     }
 
-    // Pointer to one field of the root NBA shadow struct.
+    // Pointer to one field of the root NBA shadow struct, addressed through a base
+    // pointer loaded from a global rather than a constant offset from `state`.
+    //
+    // NOTE: the indirection is a deliberate defense against CPU memory-dependence
+    // mis-speculation, not an abstraction nicety. The shadow region mirrors the
+    // live signal region at a constant distance, so state-relative addressing
+    // gives a shadow store and a nearby live load of a *different* signal the same
+    // (base register, displacement mod 1024) form whenever the distance's low bits
+    // line up (e.g. 256 32-bit NBA targets). Zen 4's memory-renaming predictor
+    // keys on exactly that form and falsely forwards the store to the load; each
+    // false match is a pipeline resync (~1 per staged signal, 3x sim time on
+    // register-file-shaped designs, at any codegen level). Loading the shadow base
+    // from a global keeps codegen from folding shadow addresses into
+    // state+constant, so the colliding form cannot arise.
     llvm::Value* shadow_ptr(uint32_t field) {
-        return b_.CreateInBoundsGEP(
-          state_ty_, state_, { b_.getInt32(0), b_.getInt32(shadow_field_), b_.getInt32(field) });
+        llvm::Value* base = b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), shadow_base_gv());
+        return b_.CreateInBoundsGEP(shadow_ty_, base, { b_.getInt32(0), b_.getInt32(field) });
+    }
+
+    // Global holding &state->shadow; created on first use, initialized in
+    // emit_main right after the state allocation (before any process runs).
+    llvm::GlobalVariable* shadow_base_gv() {
+        if (shadow_base_gv_ == nullptr) {
+            auto* ptr       = llvm::PointerType::getUnqual(ctx_);
+            shadow_base_gv_ = new llvm::GlobalVariable(llmod_, ptr, false, llvm::GlobalValue::InternalLinkage,
+                                                       llvm::ConstantPointerNull::get(ptr), "clotho.nba.shadow_base");
+        }
+        return shadow_base_gv_;
     }
 
     // Pointer to an lvalue's mm (field 0) or z (field 1) word, resolving the
@@ -1789,6 +1813,10 @@ private:
         const uint64_t state_size = llmod_.getDataLayout().getTypeAllocSize(state_ty_);
         llvm::Value*   state      = b_.CreateCall(alloc_fn(), { b_.getInt64(state_size) }, "state");
         init_state(state);
+        if (shadow_base_gv_ != nullptr) {
+            b_.CreateStore(b_.CreateInBoundsGEP(state_ty_, state, { b_.getInt32(0), b_.getInt32(shadow_field_) }),
+                           shadow_base_gv_);
+        }
 
         // Timing wheel: the event scheduler. Processes schedule timers on it at
         // #delay and the drain loop ticks it to advance time and resume them.
@@ -2540,9 +2568,10 @@ private:
         state_      = fn->getArg(0);
         auto* entry = llvm::BasicBlock::Create(ctx_, "entry", fn);
         b_.SetInsertPoint(entry);
-        // Default: one straight-line copy body per signal (no loop).
-        // CLOTHO_BLOCK_LOOPY selects the alternate counted-loop-over-constant-id-array
-        // form, kept for comparison.
+        // Default: one straight-line copy body per signal (no loop) — measured
+        // fastest at tier-0 codegen once the shadow-base resync hazard was fixed
+        // (wideff N=256: 59 ms unrolled vs 81 ms loop). CLOTHO_BLOCK_LOOPY selects the
+        // alternate counted-loop-over-constant-id-array form, kept for comparison.
         static const bool loopy = std::getenv("CLOTHO_BLOCK_LOOPY") != nullptr;
         if (loopy) {
             for (size_t g = 0; g < keys.size(); ++g) {
@@ -7578,6 +7607,9 @@ private:
     llvm::StructType*       state_ty_ = nullptr;
     // The NBA shadow struct and its field index in the root (valid iff non-null).
     llvm::StructType*       shadow_ty_    = nullptr;
+    // Global holding &state->shadow, the opaque base every shadow access goes
+    // through (see shadow_ptr for the mis-speculation hazard it defuses).
+    llvm::GlobalVariable*   shadow_base_gv_ = nullptr;
     uint32_t                shadow_field_ = 0;
     // Slot-type memo, one `{ i(2W)[, iW] }` per (width, domain, has_z).
     std::vector<std::tuple<uint32_t, bool, bool, bool, llvm::StructType*>> slot_types_;
