@@ -3319,8 +3319,41 @@ private:
             const ir::Index idx = lower_expr(*args[1], b);
             return b.str_putc(str, idx, lower_expr(*args[2], b), l);
         }
-        // TODO: atoi / atohex / atooct / atobin / atoreal and the itoa family
-        // (LRM 6.16.9-6.16.10) — need the numeric conversion runtime entries.
+        if (name == "atoi") {
+            return b.unary(T::StrAtoi, recv(), l);
+        }
+        if (name == "atohex") {
+            return b.unary(T::StrAtohex, recv(), l);
+        }
+        if (name == "atooct") {
+            return b.unary(T::StrAtooct, recv(), l);
+        }
+        if (name == "atobin") {
+            return b.unary(T::StrAtobin, recv(), l);
+        }
+        if (name == "atoreal") {
+            return b.unary(T::StrAtoreal, recv(), l);
+        }
+        if (name == "itoa" && args.size() == 2) {
+            const ir::Index str = lower_lvalue(*args[0], b);
+            return b.binary(T::StrItoa, str, lower_expr(*args[1], b), l);
+        }
+        if (name == "hextoa" && args.size() == 2) {
+            const ir::Index str = lower_lvalue(*args[0], b);
+            return b.binary(T::StrHextoa, str, lower_expr(*args[1], b), l);
+        }
+        if (name == "octtoa" && args.size() == 2) {
+            const ir::Index str = lower_lvalue(*args[0], b);
+            return b.binary(T::StrOctoa, str, lower_expr(*args[1], b), l);
+        }
+        if (name == "bintoa" && args.size() == 2) {
+            const ir::Index str = lower_lvalue(*args[0], b);
+            return b.binary(T::StrBintoa, str, lower_expr(*args[1], b), l);
+        }
+        if (name == "realtoa" && args.size() == 2) {
+            const ir::Index str = lower_lvalue(*args[0], b);
+            return b.binary(T::StrRealtoa, str, lower_expr(*args[1], b), l);
+        }
         fail("string method '" + std::string(name) + "' is not supported");
     }
 

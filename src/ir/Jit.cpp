@@ -165,6 +165,16 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config) {
     expose("rt_string_getc", &rt_string_getc);
     expose("rt_string_from_packed", &rt_string_from_packed);
     expose("rt_string_to_packed", &rt_string_to_packed);
+    expose("rt_string_atoi", &rt_string_atoi);
+    expose("rt_string_atohex", &rt_string_atohex);
+    expose("rt_string_atooct", &rt_string_atooct);
+    expose("rt_string_atobin", &rt_string_atobin);
+    expose("rt_string_atoreal", &rt_string_atoreal);
+    expose("rt_string_itoa", &rt_string_itoa);
+    expose("rt_string_hextoa", &rt_string_hextoa);
+    expose("rt_string_octtoa", &rt_string_octtoa);
+    expose("rt_string_bintoa", &rt_string_bintoa);
+    expose("rt_string_realtoa", &rt_string_realtoa);
     expose("rt_wheel_init", &rt_wheel_init);
     expose("rt_wheel_deinit", &rt_wheel_deinit);
     expose("rt_wheel_now", &rt_wheel_now);

@@ -3,6 +3,7 @@
 #include <array>
 #include <bit>
 #include <cerrno>
+#include <charconv>
 #include <csetjmp>
 #include <cstddef>
 #include <cstdio>
@@ -1732,6 +1733,107 @@ extern "C" uint32_t rt_string_getc(const rt_string* s, int32_t i) {
         return 0;
     }
     return static_cast<unsigned char>(str_data(s)[i]);
+}
+
+namespace {
+
+// Shared digit-scan for the atoi family (LRM §6.16.9): consume leading digits
+// (and '_' separators) of `base`, stopping at the first other character or
+// end of string. No leading whitespace or sign handling — the clause
+// explicitly excludes them ("does not parse the full syntax for integer
+// literals"). Verified against iverilog. Underscore
+// interleaving rules out std::from_chars here; overflow wraps silently via
+// plain unsigned 32-bit accumulation, matching the clause's own truncation
+// note.
+int32_t str_atoi_base(const rt_string* s, uint32_t base) {
+    const char*    p     = str_data(s);
+    const uint64_t n     = str_len(s);
+    uint32_t       acc   = 0;
+    bool           found = false;
+    for (uint64_t k = 0; k < n; ++k) {
+        const char c = p[k];
+        if (c == '_') {
+            continue;
+        }
+        uint32_t v;
+        if (c >= '0' && c <= '9') {
+            v = static_cast<uint32_t>(c - '0');
+        } else if (c >= 'a' && c <= 'z') {
+            v = static_cast<uint32_t>(c - 'a') + 10;
+        } else if (c >= 'A' && c <= 'Z') {
+            v = static_cast<uint32_t>(c - 'A') + 10;
+        } else {
+            break;
+        }
+        if (v >= base) {
+            break;
+        }
+        acc   = acc * base + v;
+        found = true;
+    }
+    return found ? static_cast<int32_t>(acc) : 0;
+}
+
+// dst = sign + magnitude of `i` in `base`, lowercase digits (LRM §6.16.11-
+// 6.16.14). std::to_chars natively formats a negative signed integer as '-'
+// followed by the magnitude in any base, matching iverilog's convention for
+// hextoa/octtoa/bintoa — not a two's-complement bit-pattern
+// dump.
+void str_toa_base(rt_string* dst, int32_t i, int base) {
+    char       buf[36]; // sign + up to 32 binary digits
+    const auto res = std::to_chars(buf, buf + sizeof(buf), i, base);
+    str_assign(dst, buf, static_cast<uint64_t>(res.ptr - buf));
+}
+
+} // namespace
+
+extern "C" int32_t rt_string_atoi(const rt_string* s) {
+    return str_atoi_base(s, 10);
+}
+extern "C" int32_t rt_string_atohex(const rt_string* s) {
+    return str_atoi_base(s, 16);
+}
+extern "C" int32_t rt_string_atooct(const rt_string* s) {
+    return str_atoi_base(s, 8);
+}
+extern "C" int32_t rt_string_atobin(const rt_string* s) {
+    return str_atoi_base(s, 2);
+}
+
+extern "C" double rt_string_atoreal(const rt_string* s) {
+    const char* p   = str_data(s);
+    const char* end = p + str_len(s);
+    // Unlike the atoi family, atoreal accepts leading whitespace and a '+'
+    // sign (verified against iverilog); std::from_chars accepts neither, so
+    // both are skipped by hand before the real-literal parse.
+    while (p < end && scan_ws(static_cast<unsigned char>(*p))) {
+        ++p;
+    }
+    if (p < end && *p == '+') {
+        ++p;
+    }
+    double v = 0.0; // Unmodified by from_chars on failure: "0.0 if no digits".
+    std::from_chars(p, end, v);
+    return v;
+}
+
+extern "C" void rt_string_itoa(rt_string* dst, int32_t i) {
+    str_toa_base(dst, i, 10);
+}
+extern "C" void rt_string_hextoa(rt_string* dst, int32_t i) {
+    str_toa_base(dst, i, 16);
+}
+extern "C" void rt_string_octtoa(rt_string* dst, int32_t i) {
+    str_toa_base(dst, i, 8);
+}
+extern "C" void rt_string_bintoa(rt_string* dst, int32_t i) {
+    str_toa_base(dst, i, 2);
+}
+
+extern "C" void rt_string_realtoa(rt_string* dst, double r) {
+    char       buf[32];
+    const auto res = std::to_chars(buf, buf + sizeof(buf), r);
+    str_assign(dst, buf, static_cast<uint64_t>(res.ptr - buf));
 }
 
 extern "C" void rt_string_from_packed(rt_string* dst, const uint8_t* val, uint32_t width_bits) {
