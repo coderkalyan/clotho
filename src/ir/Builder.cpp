@@ -338,6 +338,13 @@ Index Builder::finish(std::string_view banner, uint32_t arg, SourceLoc loc) {
     return emit({ Inst::Tag::Finish, Inst::Payload{ .extra = extra } }, loc);
 }
 
+Index Builder::case_violation(std::string_view banner, SourceLoc loc) {
+    const ExtraIndex banner_at = add_bytes(banner);
+    const ExtraIndex extra =
+      add_extra(FinishInfo{ banner_at, static_cast<uint32_t>(banner.size()), 0 });
+    return emit({ Inst::Tag::CaseViol, Inst::Payload{ .extra = extra } }, loc);
+}
+
 Index Builder::fflush(Index handle, SourceLoc loc) {
     return emit({ Inst::Tag::Fflush, Inst::Payload{ .unary = handle } }, loc);
 }

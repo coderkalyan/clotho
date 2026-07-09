@@ -203,6 +203,8 @@ const char* tag_name(Inst::Tag tag) {
             return "display";
         case T::Finish:
             return "finish";
+        case T::CaseViol:
+            return "case_viol";
         case T::Break:
             return "break";
         case T::Continue:

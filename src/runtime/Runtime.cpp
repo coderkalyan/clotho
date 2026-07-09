@@ -1232,6 +1232,22 @@ extern "C" void rt_finish(const char* banner, uint64_t now, int32_t arg) {
     std::exit(0);
 }
 
+extern "C" void rt_case_violation(const char* banner, uint64_t now) {
+    // LRM 12.5.3: a `priority case` with no default reached with no matching
+    // item. A simulator diagnostic (not design output), so it goes to stderr,
+    // like rt_finish's banner. The message content is not LRM-mandated; the
+    // banner carries the compile-time "<file>:<line>: " location and the time is
+    // appended at runtime. Flush stdout first so buffered $display text is
+    // committed before the warning interleaves.
+    std::fflush(stdout);
+    std::string line = banner;
+    line += "priority case has no matching branch at time ";
+    append_finish_time(line, now);
+    line += '\n';
+    std::fputs(line.c_str(), stderr);
+    std::fflush(stderr);
+}
+
 extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*),
                            void (*finals)(void*, void*)) {
     // Run the simulation, then the `final` blocks (LRM 9.2.3), so the finals see

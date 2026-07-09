@@ -169,6 +169,9 @@ public:
     // prefix "<file>:<line>: <task>"; `arg` is the diagnostic level (0/1/2, LRM
     // Table 20-1). No SSA operands.
     Index finish(std::string_view banner, uint32_t arg, SourceLoc loc);
+    // Priority-case violation report (LRM 12.5.3). `banner` is the compile-time
+    // prefix "<file>:<line>: "; non-fatal, warns and returns. No SSA operands.
+    Index case_violation(std::string_view banner, SourceLoc loc);
     // $fflush: flush the descriptor `handle`'s output buffers. The no-argument
     // form passes a constant 0 (the runtime flushes every open stream).
     Index fflush(Index handle, SourceLoc loc);

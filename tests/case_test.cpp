@@ -517,3 +517,143 @@ TEST_CASE("one-hot non-monotonic order falls back to chain (source priority)") {
     )";
     CHECK(run_capture(src) == "n0\n");
 }
+
+namespace {
+
+// JIT-run a module and return everything it wrote to stderr. Priority-case
+// violation reports (LRM 12.5.3) go to stderr (a simulator diagnostic, not
+// design output), so the captured text is the observable violation behavior.
+std::string run_capture_stderr(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE(r.module != nullptr);
+
+    std::FILE* tmp = std::tmpfile();
+    REQUIRE(tmp != nullptr);
+
+    std::fflush(stderr);
+    const int saved = dup(fileno(stderr));
+    dup2(fileno(tmp), fileno(stderr));
+
+    ir::run_jit(*r.module);
+
+    std::fflush(stderr);
+    dup2(saved, fileno(stderr));
+    close(saved);
+
+    std::rewind(tmp);
+    std::string out;
+    char        buf[256];
+    size_t      n;
+    while ((n = std::fread(buf, 1, sizeof(buf), tmp)) > 0) {
+        out.append(buf, n);
+    }
+    std::fclose(tmp);
+
+    return out;
+}
+
+// Count non-overlapping occurrences of `needle` in `hay`.
+size_t count_occ(std::string_view hay, std::string_view needle) {
+    size_t n = 0;
+    for (size_t p = hay.find(needle); p != std::string_view::npos; p = hay.find(needle, p + needle.size())) {
+        n++;
+    }
+    return n;
+}
+
+} // namespace
+
+// LRM 12.5.3: a `priority case` with no default reached with no matching item
+// issues a violation report. Execution is unchanged (no branch runs); the report
+// is the only added behavior.
+TEST_CASE("priority case: no match, no default reports a violation") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [1:0] sel;
+            initial begin
+                sel = 2'd3;
+                priority case (sel)
+                    2'd0: $display("zero");
+                    2'd1: $display("one");
+                endcase
+            end
+        endmodule
+    )";
+    const std::string err = run_capture_stderr(src);
+    CHECK(err.find("priority case has no matching branch") != std::string::npos);
+    // Design output is unchanged: nothing matched, so no $display fired.
+    CHECK(run_capture(src).empty());
+}
+
+// A matching item suppresses the report (the priority assertion holds).
+TEST_CASE("priority case: a matching item reports nothing") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [1:0] sel;
+            initial begin
+                sel = 2'd1;
+                priority case (sel)
+                    2'd0: $display("zero");
+                    2'd1: $display("one");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).find("priority case") == std::string::npos);
+    CHECK(run_capture(src) == "one\n");
+}
+
+// A priority case WITH a default can never violate: the default always matches.
+TEST_CASE("priority case: a default suppresses the violation") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [1:0] sel;
+            initial begin
+                sel = 2'd3;
+                priority case (sel)
+                    2'd0: $display("zero");
+                    default: $display("def");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).find("priority case") == std::string::npos);
+    CHECK(run_capture(src) == "def\n");
+}
+
+// The report fires once per dynamic execution that finds no match.
+TEST_CASE("priority case: reports once per no-match execution") {
+    constexpr std::string_view src = R"(
+        module m;
+            int i;
+            logic [1:0] sel;
+            initial begin
+                for (i = 0; i < 3; i++) begin
+                    sel = 2'd3;
+                    priority case (sel)
+                        2'd0: $display("zero");
+                    endcase
+                end
+            end
+        endmodule
+    )";
+    CHECK(count_occ(run_capture_stderr(src), "priority case has no matching branch") == 3);
+}
+
+// A wildcard `priority casez` keeps the if-else chain (no switch/one-hot path)
+// and still reports when no item's pattern matches.
+TEST_CASE("priority casez: no matching pattern reports a violation") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [1:0] sel;
+            initial begin
+                sel = 2'd3;
+                priority casez (sel)
+                    2'b0?: $display("lo");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).find("priority case has no matching branch") != std::string::npos);
+}

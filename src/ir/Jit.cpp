@@ -136,6 +136,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config) {
     expose("rt_timeformat_init", &rt_timeformat_init);
     expose("rt_timeformat_set", &rt_timeformat_set);
     expose("rt_finish", &rt_finish);
+    expose("rt_case_violation", &rt_case_violation);
     expose("rt_sim_run", &rt_sim_run);
     expose("rt_fflush", &rt_fflush);
     expose("rt_readmem", &rt_readmem);

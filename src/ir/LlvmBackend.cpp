@@ -3041,6 +3041,7 @@ private:
                 case Inst::Tag::Continue:
                 case Inst::Tag::Display:
                 case Inst::Tag::Finish:
+                case Inst::Tag::CaseViol:
                 case Inst::Tag::Fflush:
                 case Inst::Tag::Fclose:
                 case Inst::Tag::Fopen:
@@ -5426,6 +5427,7 @@ private:
             case Inst::Tag::Display:
             case Inst::Tag::TimeFormat:
             case Inst::Tag::Finish:
+            case Inst::Tag::CaseViol:
             case Inst::Tag::Fflush:
             case Inst::Tag::Fclose:
             case Inst::Tag::Sformat:
@@ -6128,6 +6130,12 @@ private:
                 // $finish / $stop: rt_finish prints the banner then exits, never
                 // returning (noreturn), so the optimizer prunes the region tail.
                 lower_finish(i);
+                return;
+
+            case Inst::Tag::CaseViol:
+                // priority-case violation: rt_case_violation warns and returns
+                // (non-fatal), so the region continues normally after it.
+                lower_case_viol(i);
                 return;
 
             case Inst::Tag::Fflush:
@@ -6863,6 +6871,25 @@ private:
                                   : static_cast<llvm::Value*>(b_.getInt64(0));
         b_.CreateCall(finish_fn(),
                       { b_.CreateGlobalString(banner), now, b_.getInt32(info.arg) });
+    }
+
+    // void rt_case_violation(ptr banner, i64 now) — warns and returns (non-fatal).
+    llvm::FunctionCallee case_violation_fn() {
+        return rt_fn("rt_case_violation", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
+    }
+
+    // Lower a priority-case violation report: pass the compile-time banner prefix
+    // and the current simulation time; the runtime warns and returns, so the
+    // region continues. Reuses FinishInfo for the banner (arg unused). The wheel
+    // fallback mirrors lower_finish: a priority case inside a pure function has no
+    // wheel and reports time 0 (same TODO as $finish).
+    void lower_case_viol(Index i) {
+        const auto        info   = ir_->extra_data<FinishInfo>(ir_->payload(i).extra);
+        const std::string banner = ir_->extra_bytes(info.banner, info.banner_len);
+        llvm::Value*      now = has_wheel()
+                                  ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
+                                  : static_cast<llvm::Value*>(b_.getInt64(0));
+        b_.CreateCall(case_violation_fn(), { b_.CreateGlobalString(banner), now });
     }
 
     // Whether wheel_ points at a live timing wheel: true in a process or task

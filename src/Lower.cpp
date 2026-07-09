@@ -636,6 +636,16 @@ private:
                std::to_string(sm->getLineNumber(sl)) + ": " + std::string(task);
     }
 
+    // Compile-time "<file>:<line>: " banner prefix for a priority-case violation
+    // report, located at the case statement itself. The runtime appends the
+    // descriptive message and the simulation time (rt_case_violation).
+    std::string case_banner(const CaseStatement& c) const {
+        const slang::SourceManager* sm = scope_->getCompilation().getSourceManager();
+        const slang::SourceLocation sl = c.sourceRange.start();
+        return std::string(sm->getFileName(sl)) + ":" +
+               std::to_string(sm->getLineNumber(sl)) + ": ";
+    }
+
     // -- Types --
 
     ir::Ref lower_type(const slang::ast::Type& type) {
@@ -2572,7 +2582,14 @@ private:
         // NOTE: unique / unique0 / priority (c.check) only govern violation
         // reporting, a runtime assertion; the first-match execution below is
         // conforming for all of them.
-        // TODO: emit unique / priority violation reports.
+        //
+        // priority (LRM 12.5.3): if no item matches and there is no default, a
+        // warning is issued. A priority case WITH a default can never violate
+        // (the default always "matches"), so only the default-less form needs
+        // the report — emitted at the terminal else of the if-else chain below.
+        // TODO: emit unique / unique0 overlap violation reports.
+        const bool priority_report =
+          c.check == slang::ast::UniquePriorityCheck::Priority && c.defaultCase == nullptr;
 
         // The one-hot reverse-case idiom `case (1'b1)` over base[i] selects
         // lowers to ctz/clz + jump table. See build_onehot_plan.
@@ -2610,7 +2627,7 @@ private:
         }
 
         const std::vector<std::vector<char>> keep = case_dedup(c);
-        lower_case_item(c, 0, sel, cmp, ty, keep, b);
+        lower_case_item(c, 0, sel, cmp, ty, keep, priority_report, b);
     }
 
     // Emit the if-else chain for items[k..] into the current region: item k's
@@ -2618,11 +2635,19 @@ private:
     // default) as the else branch. Items are tested in textual order and the
     // first match wins; labels for items not yet reached are evaluated lazily,
     // inside the else regions, so they run only until a match is found.
+    //
+    // `report_viol` is set for a default-less `priority case`: the terminal else
+    // (reached only when no item matched) emits a priority-violation report
+    // (LRM 12.5.3). It is mutually exclusive with a default (a default-less case
+    // has no default branch here).
     void lower_case_item(const CaseStatement& c, size_t k, ir::Index sel, ir::Inst::Tag cmp, ir::Ref ty,
-                         const std::vector<std::vector<char>>& keep, ir::Builder& b) {
+                         const std::vector<std::vector<char>>& keep, bool report_viol, ir::Builder& b) {
         if (k == c.items.size()) {
             if (c.defaultCase != nullptr) {
                 lower_stmt(*c.defaultCase, b);
+            }
+            else if (report_viol) {
+                b.case_violation(case_banner(c), loc(c));
             }
             return;
         }
@@ -2646,7 +2671,7 @@ private:
         if (!have) {
             // No surviving label (empty group, or every label deduped away): the
             // body is unreachable, so continue the chain in the current region.
-            lower_case_item(c, k + 1, sel, cmp, ty, keep, b);
+            lower_case_item(c, k + 1, sel, cmp, ty, keep, report_viol, b);
             return;
         }
 
@@ -2655,7 +2680,7 @@ private:
         const ir::ExtraSlice then_region = b.close_region();
 
         b.open_region();
-        lower_case_item(c, k + 1, sel, cmp, ty, keep, b);
+        lower_case_item(c, k + 1, sel, cmp, ty, keep, report_viol, b);
         const ir::ExtraSlice else_region = b.close_region();
 
         b.cond(pred, then_region, else_region, loc(*item.stmt));
