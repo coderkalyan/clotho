@@ -128,6 +128,42 @@ def gen_nbablocks(blocks: int, sig_per_block: int, cycles: int) -> str:
     out.append("endmodule")
     return "\n".join(out) + "\n"
 
+def gen_nbamem(n: int, width: int, cycles: int, select: str) -> str:
+    # N nonblocking writes to distinct elements of one unpacked-array (memory) per
+    # cycle, via a dynamic-index loop -- the array-element NBA deferred-queue path.
+    # `width` is the element width (sweep incl. >64 to exercise wide records).
+    # select="whole": mem[j] <= ...  (mask-elided); select="part": mem[j][lo] <= ...
+    # (masked). Checksum XOR-reduces all elements at the end.
+    w = width
+    inc = "1"
+    # 32-bit XOR fold of each element (>64-bit $display is unsupported).
+    words = " ^ ".join(f"mem[j][{k*32+31}:{k*32}]" for k in range((w + 31) // 32))
+    out = ["module top;", "  reg clk = 0;", "  reg [31:0] cyc = 0;",
+           f"  reg [{w-1}:0] mem [0:{n-1}];",
+           "  reg [31:0] acc;", "  integer j;"]
+    out.append("  initial begin")
+    out.append(f"    for (j = 0; j < {n}; j = j + 1) mem[j] = j * 32'd2654435761;")
+    out.append("  end")
+    out.append("  always #5 clk = ~clk;")
+    out.append("  always @(posedge clk) begin")
+    if select == "part":
+        half = w // 2
+        out.append(f"    for (j = 0; j < {n}; j = j + 1) mem[j][{half-1}:0] <= mem[j][{half-1}:0] + {inc};")
+    else:
+        out.append(f"    for (j = 0; j < {n}; j = j + 1) mem[j] <= mem[j] + {inc};")
+    out.append("  end")
+    out.append("  always @(posedge clk) begin")
+    out.append("    cyc <= cyc + 1;")
+    out.append(f"    if (cyc == 32'd{cycles}) begin")
+    out.append("      acc = 0;")
+    out.append(f"      for (j = 0; j < {n}; j = j + 1) acc = acc ^ {words};")
+    out.append('      $display("done %h", acc);')
+    out.append("      $finish;")
+    out.append("    end")
+    out.append("  end")
+    out.append("endmodule")
+    return "\n".join(out) + "\n"
+
 def gen_partblocks(blocks: int, sig_per_block: int, cycles: int, select: str) -> str:
     # Like nbablocks, but every NBA is a *partial* (bit/part-select) target, to
     # exercise the masked commit path. select="static": a constant [15:0] half-word
@@ -473,7 +509,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("bench", choices=["regs", "tri", "chain", "thunk", "wheel",
                                       "combchain", "timers", "bigcase", "onehot",
-                                      "wideff", "nbablocks", "partblocks"])
+                                      "wideff", "nbablocks", "partblocks", "nbamem"])
     ap.add_argument("--n", type=int, required=True,
                     help="nbablocks: number of blocks (processes)")
     ap.add_argument("--cycles", type=int, required=True)
@@ -484,7 +520,8 @@ if __name__ == "__main__":
     ap.add_argument("--sig-per-block", type=int, default=1,
                     help="nbablocks/partblocks: NBAs per block")
     ap.add_argument("--select", default="static",
-                    help="partblocks: static|dynamic part-select")
+                    help="partblocks: static|dynamic; nbamem: whole|part")
+    ap.add_argument("--width", type=int, default=32, help="nbamem: element width")
     a = ap.parse_args()
     if a.bench == "regs":
         sys.stdout.write(gen_regs(a.n, a.cycles, a.fused, a.seed))
@@ -508,5 +545,7 @@ if __name__ == "__main__":
         sys.stdout.write(gen_nbablocks(a.n, a.sig_per_block, a.cycles))
     elif a.bench == "partblocks":
         sys.stdout.write(gen_partblocks(a.n, a.sig_per_block, a.cycles, a.select))
+    elif a.bench == "nbamem":
+        sys.stdout.write(gen_nbamem(a.n, a.width, a.cycles, a.select))
     else:
         sys.stdout.write(gen_wheel(a.cycles))
