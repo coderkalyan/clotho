@@ -388,6 +388,9 @@ public:
         build_state_types();
         compute_subscription_order();
         compute_fusion_groups(); // before build_wait_queues: bucket capacities count group subscriptions
+        if (std::getenv("CLOTHO_COMB_FUSE_STAT") != nullptr) {
+            report_comb_fuse_stat();
+        }
         build_wait_queues();
         build_sched_flags();
         build_nba_state();
@@ -2207,6 +2210,208 @@ private:
             }
         }
         return true;
+    }
+
+    // Comb-fusion eligibility (analysis only — grouping lands with the comb
+    // fusion phase). A member of a union-sensitivity fused group can be run
+    // when its own trigger did NOT fire. Such a spurious run is unobservable —
+    // hence LRM-legal under the as-if rule — only when the body is a pure
+    // deterministic function of its signal reads and every write is
+    // change-detected: unchanged reads recompute unchanged values, and
+    // service_wait_queue skips the wake scan when old == new, so nothing
+    // downstream can tell the run happened. The verdict enumerates exactly the
+    // conditions that argument needs; purity is a whitelist, so a new IR tag
+    // defaults to ineligible.
+    enum class CombFuse : uint8_t {
+        Eligible,
+        // Fails is_simple_always: suspension point, task call, self-sens
+        // write, or not an Always with a static sensitivity.
+        NotSimpleAlways,
+        // Sensitivity has a posedge/negedge entry. Comb fusion is level-only;
+        // edge-triggered members belong to V1 identical-sens fusion.
+        EdgeSensitive,
+        // Body op with an observable effect or non-deterministic value
+        // ($display, file I/O, $random, $time, string ops, ...).
+        ImpureOp,
+        // Function call: purity closure over callees not implemented yet.
+        HasCall,
+        // Nonblocking store: commits in the NBA region, outside the group's
+        // execution, which breaks the internal-signal subscription reasoning.
+        NbaWrite,
+        // Store whose root is a string or unpacked array: those store paths'
+        // change detection is not verified, so the no-change argument does
+        // not (yet) cover them.
+        UnsupportedWrite,
+        // Reads a signal absent from the sensitivity list: a spurious run
+        // would observe a value the unfused schedule never samples (e.g.
+        // explicit `@(a)` reading `b`).
+        ReadOutsideSens,
+        // Count of verdicts, for histogram sizing.
+        Count,
+    };
+
+    CombFuse comb_fuse_verdict(const Process& p) const {
+        if (!is_simple_always(p)) {
+            return CombFuse::NotSimpleAlways;
+        }
+        for (const WaitEvent& w : p.wait_events) {
+            if (w.edge != Edge::Any) {
+                return CombFuse::EdgeSensitive;
+            }
+        }
+        std::vector<uint32_t> reads;
+        for (size_t k = 0; k < p.ir.inst_count(); ++k) {
+            const auto idx = static_cast<Index>(k);
+            switch (p.ir.tag(idx)) {
+                // Pure value and control ops: no effect beyond their result.
+                case Inst::Tag::Constant:
+                case Inst::Tag::Arg:
+                case Inst::Tag::Signal:
+                case Inst::Tag::Local:
+                case Inst::Tag::BitSelect:
+                case Inst::Tag::PartSelect:
+                case Inst::Tag::DynPartSelect:
+                case Inst::Tag::ElemSelect:
+                case Inst::Tag::Add:
+                case Inst::Tag::Sub:
+                case Inst::Tag::Mul:
+                case Inst::Tag::Div:
+                case Inst::Tag::Mod:
+                case Inst::Tag::Pow:
+                case Inst::Tag::Band:
+                case Inst::Tag::Bor:
+                case Inst::Tag::Bxor:
+                case Inst::Tag::Bxnor:
+                case Inst::Tag::Bnot:
+                case Inst::Tag::RedAnd:
+                case Inst::Tag::RedOr:
+                case Inst::Tag::RedXor:
+                case Inst::Tag::Ctz:
+                case Inst::Tag::Clz:
+                case Inst::Tag::Sll:
+                case Inst::Tag::Srl:
+                case Inst::Tag::Sra:
+                case Inst::Tag::Eq:
+                case Inst::Tag::Ne:
+                case Inst::Tag::Lt:
+                case Inst::Tag::Le:
+                case Inst::Tag::Gt:
+                case Inst::Tag::Ge:
+                case Inst::Tag::CaseEq:
+                case Inst::Tag::CasezEq:
+                case Inst::Tag::CasexEq:
+                case Inst::Tag::WildEq:
+                case Inst::Tag::FAdd:
+                case Inst::Tag::FSub:
+                case Inst::Tag::FMul:
+                case Inst::Tag::FDiv:
+                case Inst::Tag::FPow:
+                case Inst::Tag::FNeg:
+                case Inst::Tag::FEq:
+                case Inst::Tag::FNe:
+                case Inst::Tag::FLt:
+                case Inst::Tag::FLe:
+                case Inst::Tag::FGt:
+                case Inst::Tag::FGe:
+                case Inst::Tag::ItoF:
+                case Inst::Tag::FtoI:
+                case Inst::Tag::FtoITrunc:
+                case Inst::Tag::FBitcast:
+                case Inst::Tag::FResize:
+                case Inst::Tag::RealMath:
+                case Inst::Tag::Land:
+                case Inst::Tag::Lor:
+                case Inst::Tag::Lnot:
+                case Inst::Tag::Select:
+                case Inst::Tag::SelectLazy:
+                case Inst::Tag::Concat:
+                case Inst::Tag::Repl:
+                case Inst::Tag::Resize:
+                case Inst::Tag::Cond:
+                case Inst::Tag::Switch:
+                case Inst::Tag::Loop:
+                case Inst::Tag::Break:
+                case Inst::Tag::Continue:
+                case Inst::Tag::Clog2:
+                    break;
+                case Inst::Tag::Load: {
+                    const LvalueRoot r = lvalue_root(p.ir, p.ir.payload(idx).unary);
+                    if (p.ir.tag(r.root) == Inst::Tag::Signal) {
+                        reads.push_back(static_cast<uint32_t>(p.ir.payload(r.root).signal));
+                    }
+                    break;
+                }
+                case Inst::Tag::Store: {
+                    const LvalueRoot r = lvalue_root(p.ir, p.ir.payload(idx).binary.l);
+                    if (p.ir.tag(r.root) != Inst::Tag::Signal) {
+                        break;
+                    }
+                    const auto  sig = static_cast<uint32_t>(p.ir.payload(r.root).signal);
+                    const auto& ty  = std::get<Type>(mod_.pool.get(mod_.signals()[sig].type));
+                    if (ty.kind == Type::Kind::String || ty.kind == Type::Kind::UnpackedArray) {
+                        return CombFuse::UnsupportedWrite;
+                    }
+                    break;
+                }
+                case Inst::Tag::StoreNb:
+                    return CombFuse::NbaWrite;
+                case Inst::Tag::Call:
+                    return CombFuse::HasCall;
+                default:
+                    return CombFuse::ImpureOp;
+            }
+        }
+        // Every read signal must be in the sensitivity list, else a spurious
+        // run observes state the unfused schedule never samples. Verified here
+        // rather than trusting the frontend's inference: explicit lists and
+        // any inference gap fail mechanically.
+        for (const uint32_t s : reads) {
+            bool in_sens = false;
+            for (const WaitEvent& w : p.wait_events) {
+                if (static_cast<uint32_t>(w.signal) == s) {
+                    in_sens = true;
+                    break;
+                }
+            }
+            if (!in_sens) {
+                return CombFuse::ReadOutsideSens;
+            }
+        }
+        return CombFuse::Eligible;
+    }
+
+    // Comb-fusion coverage probe: verdict histogram over Always processes plus
+    // the count V1 fusion left in singleton groups (the comb-fusion
+    // opportunity). Measurement only, printed when CLOTHO_COMB_FUSE_STAT is
+    // set; the grouping itself is not landed.
+    void report_comb_fuse_stat() const {
+        const auto all = mod_.processes();
+        uint64_t   counts[static_cast<size_t>(CombFuse::Count)] = {};
+        uint64_t   always = 0, singleton_eligible = 0;
+        for (uint32_t k = 0; k < all.size(); ++k) {
+            if (all[k].activation != Activation::Always) {
+                continue;
+            }
+            ++always;
+            const CombFuse v = comb_fuse_verdict(all[k]);
+            counts[static_cast<size_t>(v)]++;
+            if (v == CombFuse::Eligible && groups_[group_of_[k]].size() == 1) {
+                ++singleton_eligible;
+            }
+        }
+        std::fprintf(stderr,
+                     "comb-fuse: %llu/%llu always procs eligible (%llu unfused singletons); "
+                     "excluded: not-simple=%llu edge=%llu impure=%llu call=%llu nba=%llu "
+                     "write=%llu read!sens=%llu\n",
+                     (unsigned long long)counts[static_cast<size_t>(CombFuse::Eligible)],
+                     (unsigned long long)always, (unsigned long long)singleton_eligible,
+                     (unsigned long long)counts[static_cast<size_t>(CombFuse::NotSimpleAlways)],
+                     (unsigned long long)counts[static_cast<size_t>(CombFuse::EdgeSensitive)],
+                     (unsigned long long)counts[static_cast<size_t>(CombFuse::ImpureOp)],
+                     (unsigned long long)counts[static_cast<size_t>(CombFuse::HasCall)],
+                     (unsigned long long)counts[static_cast<size_t>(CombFuse::NbaWrite)],
+                     (unsigned long long)counts[static_cast<size_t>(CombFuse::UnsupportedWrite)],
+                     (unsigned long long)counts[static_cast<size_t>(CombFuse::ReadOutsideSens)]);
     }
 
     // V1 static process fusion: partition processes into groups that lower to a
