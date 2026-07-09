@@ -152,6 +152,7 @@ add_executable(clotho_test
   tests/comb_fusion_test.cpp
   tests/enum_test.cpp
   tests/sysfunc_test.cpp
+  tests/streaming_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho doctest::doctest clotho_warnings)
 

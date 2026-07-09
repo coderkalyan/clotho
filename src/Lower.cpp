@@ -3823,6 +3823,78 @@ private:
 
     // -- Expressions --
 
+    // Lower a fixed-width RHS streaming concatenation (LRM §11.4.14).
+    // `>>` (sliceSize==0): plain left-to-right concat, no reorder.
+    // `<<` (sliceSize>0): concatenate, then reverse the order of sliceSize-bit
+    // blocks (rightmost block becomes the MSB of the result).
+    ir::Index lower_streaming_concat(const StreamingConcatenationExpression& sc,
+                                     ir::Ref target_ty, ir::Builder& b, ir::SourceLoc l) {
+        if (!sc.isFixedSize()) {
+            fail("streaming concatenation with dynamically-sized operands is not supported");
+        }
+        for (const auto& stream : sc.streams()) {
+            if (stream.withExpr) {
+                fail("streaming concatenation `with` clause is not supported");
+            }
+        }
+
+        // Build the generic stream: concatenate operands left-to-right.
+        // A nested streaming concat has void type (slang creates it with getVoidType()),
+        // so detect it and supply the concrete target type derived from bitstream width.
+        const bool is_four_outer = module_.pool.layout(target_ty).domain == ir::Domain::Four;
+        std::vector<ir::Index> parts;
+        for (const auto& stream : sc.streams()) {
+            const Expression& operand = *stream.operand;
+            if (operand.kind == ExpressionKind::Streaming) {
+                const auto& inner = operand.as<StreamingConcatenationExpression>();
+                const ir::Ref inner_ty = make_int_type(
+                    static_cast<uint32_t>(inner.getBitstreamWidth()), is_four_outer, false);
+                parts.push_back(lower_streaming_concat(inner, inner_ty, b, l));
+            } else {
+                parts.push_back(lower_expr(operand, b));
+            }
+        }
+        ir::Index raw = parts.size() == 1 ? parts[0] : b.concat(parts, l);
+
+        const uint64_t W = sc.getBitstreamWidth();
+        const uint64_t S = sc.getSliceSize();
+
+        // sliceSize > 0: '<<' — reverse order of S-bit blocks sliced from the
+        // right. Block i covers bits [min((i+1)*S,W)-1 : i*S]; reversed output
+        // places block 0 (rightmost) in the MSB position (first concat arg).
+        // Extract each block via logical-right-shift + resize (PartSelect is
+        // lvalue-only in the backend and cannot be used on intermediate values).
+        if (S > 0) {
+            const uint64_t N = (W + S - 1) / S;
+            std::vector<ir::Index> blocks;
+            blocks.reserve(N);
+            const bool is_four = module_.pool.layout(target_ty).domain == ir::Domain::Four;
+            for (uint64_t i = 0; i < N; ++i) {
+                const uint32_t lo    = static_cast<uint32_t>(i * S);
+                const uint32_t bw    = static_cast<uint32_t>(std::min((i + 1) * S, W) - lo);
+                const ir::Ref  sh_ty = make_int_type(static_cast<uint32_t>(W), false, false);
+                const ir::Index sh   = b.constant(module_.pool.put_int(sh_ty, lo), l);
+                const ir::Index srl  = b.binary(ir::Inst::Tag::Srl, raw, sh, l);
+                blocks.push_back(b.resize(srl, make_int_type(bw, is_four, false), l));
+            }
+            raw = b.concat(blocks, l);
+        }
+
+        // Widen if the target is wider than the stream (LRM §11.4.14: zero-fill
+        // on the right, i.e. stream occupies the MSBs of the result).
+        const uint32_t target_w = module_.pool.layout(target_ty).width;
+        if (target_w > static_cast<uint32_t>(W)) {
+            const uint32_t pad       = target_w - static_cast<uint32_t>(W);
+            const bool     is_four   = module_.pool.layout(target_ty).domain == ir::Domain::Four;
+            const ir::Ref  pad_ty    = make_int_type(pad, is_four, false);
+            const ir::Index zero_pad = b.constant(module_.pool.put_int(pad_ty, 0), l);
+            std::vector<ir::Index> widened = {raw, zero_pad};
+            raw = b.concat(widened, l);
+        }
+
+        return b.resize(raw, target_ty, l);
+    }
+
     // Lower an expression as an rvalue, returning the SSA value index.
     ir::Index lower_expr(const Expression& expr, ir::Builder& b) {
         const ir::SourceLoc l = loc(expr);
@@ -3979,6 +4051,11 @@ private:
                         fail("unsupported conversion from string");
                     }
                     return b.str_to_packed(lower_expr(cv.operand(), b), lower_type(*expr.type), l);
+                }
+                if (cv.conversionKind == ConversionKind::StreamingConcat) {
+                    return lower_streaming_concat(
+                        cv.operand().as<StreamingConcatenationExpression>(),
+                        lower_type(*expr.type), b, l);
                 }
                 return coerce(lower_expr(cv.operand(), b), *cv.operand().type, lower_type(*expr.type), b, l);
             }
