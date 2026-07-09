@@ -13,12 +13,13 @@
 #include "ir/LlvmBackend.h"
 
 // Dynamic domain specialization (compute_domain_spec in LlvmBackend.cpp): an
-// eligible thunk group carries a second assume-clean body dispatched on a
-// per-group dirty counter maintained at write sites. These tests pin the
-// runtime transition machinery (tag flips through blocking stores, partial
-// stores, NBA commits, and the fast body's own stores) against iverilog-
-// verified outputs, and always A/B the specialized run against
-// --no-domain-spec — the two lowerings must agree byte-for-byte.
+// eligible thunk group carries a second assume-clean body, chosen reader-side
+// at each dispatch by testing its read set for cleanliness. These tests
+// exercise the domain transitions the guard must track (a read set going x ->
+// clean -> x through blocking stores, partial stores, NBA commits, and a
+// producer group's own stores) against iverilog-verified outputs, and always
+// A/B the specialized run against --no-domain-spec — the two lowerings must
+// agree byte-for-byte.
 
 using namespace clotho;
 
@@ -165,9 +166,10 @@ TEST_CASE("NBA commits transition the domain tag, not the staging store") {
 }
 
 TEST_CASE("a fast body's own store promotes a downstream group's read set") {
-    // Once `a` goes clean, thunk1's (fast) store of the clean sum must clear
-    // b's tag so the woken comb reader can dispatch its own fast body; at t0
-    // the x-valued b never changes (x -> x), so the comb thunk never wakes
+    // Once `a` goes clean, thunk1's (fast) store of the clean sum makes b
+    // clean, so the woken comb reader's guard now passes and it dispatches its
+    // own fast body; at t0 the x-valued b never changes (x -> x), so the comb
+    // thunk never wakes
     // (iverilog: "xx 00" then "31 32").
     run_ab(R"(
         module top;
@@ -190,11 +192,11 @@ TEST_CASE("a fast body's own store promotes a downstream group's read set") {
            "xx 00\n31 32\n");
 }
 
-TEST_CASE("flap pin: a signal oscillating between domains stays correct") {
-    // `a` flips clean/x every cycle, far past domain_flap_cap (16), so the
-    // signal pins permanently dirty partway through — after which the reader
-    // must keep following the oscillation through its generic body. 60 edges
-    // of alternation, sampled at the end on both phases.
+TEST_CASE("oscillating domain: a signal flipping clean/x every cycle stays correct") {
+    // `a` flips clean/x every cycle: the reader-side guard re-validates each
+    // dispatch, so it must follow the oscillation exactly (fast body on the
+    // clean cycles, generic on the x cycles). 60 edges of alternation, sampled
+    // at the end on both phases.
     run_ab(R"(
         module top;
           reg clk = 0;
@@ -267,7 +269,11 @@ TEST_CASE("dispatch structure: fast body forms only for eligible groups") {
         endmodule
     )");
     CHECK(ok.find("dom.fast") != std::string::npos);
-    CHECK(ok.find("clotho.domain_ctr") != std::string::npos);
+    // Reader-side validation: a per-signal cleanliness check guards the fast
+    // body (dom.chk), and there is no persistent tag/counter tracking state.
+    CHECK(ok.find("dom.chk") != std::string::npos);
+    CHECK(ok.find("clotho.domain_ctr") == std::string::npos);
+    CHECK(ok.find("clotho.domain_tag") == std::string::npos);
 
     // Division can turn a clean input into x (divide by zero) — ineligible.
     const std::string div = emit_raw(R"(
