@@ -1557,6 +1557,9 @@ private:
             case StatementKind::DoWhileLoop:
                 lower_do_while(stmt.as<DoWhileLoopStatement>(), b);
                 break;
+            case StatementKind::ForeachLoop:
+                lower_foreach(stmt.as<ForeachLoopStatement>(), b);
+                break;
             case StatementKind::Break:
                 b.break_(loc(stmt));
                 break;
@@ -1807,6 +1810,112 @@ private:
         const ir::Index one      = b.constant(module_.pool.put_int(ty, 1), l);
         const ir::Index next     = b.binary(ir::Inst::Tag::Add, step_cur, one, l);
         b.binary(ir::Inst::Tag::Store, b.signal(counter, l), next, l);
+        const ir::ExtraSlice step = b.close_region();
+
+        b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
+    }
+
+    // foreach-loop (12.7.3): nested loops over an array's declared dimensions.
+    // `loopDims` has one entry per bracketed slot the user wrote, in array-
+    // dimension order (leftmost = outermost, matching "outer loops correspond
+    // to lower cardinality indices"); a skipped slot (empty loop var) means
+    // "no iteration over that dimension" per the LRM -- not a loop that runs
+    // once, no loop at all, so it just advances to the next slot in the same
+    // region. Dimension bounds come straight from slang (`LoopDim::range`),
+    // valid for both packed and unpacked fixed-range dimensions alike, so no
+    // separate walk of Clotho's own (unpacked-only) array Type is needed --
+    // whatever indexing the body performs on the result is ordinary,
+    // pre-existing ElemSelect/BitSelect lowering, untouched by this loop nest.
+    void lower_foreach(const ForeachLoopStatement& f, ir::Builder& b) {
+        lower_foreach_dim(f, 0, b);
+    }
+
+    void lower_foreach_dim(const ForeachLoopStatement& f, size_t dim, ir::Builder& b) {
+        if (dim == f.loopDims.size()) {
+            lower_stmt(f.body, b);
+            return;
+        }
+        const ForeachLoopStatement::LoopDim& d = f.loopDims[dim];
+        if (d.loopVar == nullptr) {
+            lower_foreach_dim(f, dim + 1, b);
+            return;
+        }
+
+        const ir::SourceLoc l = loc(f);
+        declare_storage(*d.loopVar, /*force_frame*/ true);
+        const ir::Ref   ty      = lower_type(d.loopVar->getType());
+        const ir::Index iter_lv = value_lvalue(*d.loopVar, b, l);
+
+        if (!d.range.has_value()) {
+            if (!is_string_expr(f.arrayRef)) {
+                // TODO: dynamic array / queue / associative array foreach
+                // dimension -- needs a runtime-sized bound, not modeled
+                // (dynamic/queue/associative arrays fail at Lower.cpp:665).
+                fail("foreach over a dynamically-sized array dimension is not supported");
+            }
+            lower_foreach_string_dim(f, dim, ty, iter_lv, b, l);
+            return;
+        }
+
+        // Fixed-range dimension (packed or unpacked): iterate the declared
+        // range directly, ascending or descending as declared (LRM's own
+        // example iterates a `[5:1]` dimension 5 down to 1). The range is an
+        // elaboration-time constant, so unlike a runtime count there is
+        // nothing to snapshot.
+        const slang::ConstantRange r         = *d.range;
+        const bool                 ascending = r.left <= r.right;
+        b.binary(ir::Inst::Tag::Store, iter_lv,
+                 b.constant(module_.pool.put_int(ty, static_cast<uint64_t>(static_cast<uint32_t>(r.left))), l),
+                 l);
+
+        b.open_region();
+        const ir::Index cur = b.unary(ir::Inst::Tag::Load, iter_lv, l);
+        const ir::Index lim = b.constant(
+          module_.pool.put_int(ty, static_cast<uint64_t>(static_cast<uint32_t>(r.right))), l);
+        const ir::Index      pred = b.binary(ascending ? ir::Inst::Tag::Le : ir::Inst::Tag::Ge, cur, lim, l);
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        lower_foreach_dim(f, dim + 1, b);
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        const ir::Index step_cur = b.unary(ir::Inst::Tag::Load, iter_lv, l);
+        const ir::Index one      = b.constant(module_.pool.put_int(ty, 1), l);
+        const ir::Index next =
+          b.binary(ascending ? ir::Inst::Tag::Add : ir::Inst::Tag::Sub, step_cur, one, l);
+        b.binary(ir::Inst::Tag::Store, iter_lv, next, l);
+        const ir::ExtraSlice step = b.close_region();
+
+        b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
+    }
+
+    // A `string` foreach dimension (LRM 12.7.3: "a string ... is treated as a
+    // dynamic array of bytes indexed from 0 to N-1"). The bound is the
+    // runtime length, snapshotted once on entry like a repeat-loop's count --
+    // resizing the string mid-loop is undefined behavior per the LRM (same
+    // clause), so one read is enough. 0-based, matching StrGetc addressing.
+    void lower_foreach_string_dim(const ForeachLoopStatement& f, size_t dim, ir::Ref ty,
+                                   ir::Index iter_lv, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Signal bound = declare_temp(ty, "foreach_bound");
+        const ir::Index  len   = b.unary(ir::Inst::Tag::StrLen, lower_expr(f.arrayRef, b), l);
+        b.binary(ir::Inst::Tag::Store, b.signal(bound, l), b.resize(len, ty, l), l);
+        b.binary(ir::Inst::Tag::Store, iter_lv, b.constant(module_.pool.put_int(ty, 0), l), l);
+
+        b.open_region();
+        const ir::Index      cur  = b.unary(ir::Inst::Tag::Load, iter_lv, l);
+        const ir::Index      lim  = b.unary(ir::Inst::Tag::Load, b.signal(bound, l), l);
+        const ir::Index      pred = b.binary(ir::Inst::Tag::Lt, cur, lim, l);
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        lower_foreach_dim(f, dim + 1, b);
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        const ir::Index step_cur = b.unary(ir::Inst::Tag::Load, iter_lv, l);
+        const ir::Index one      = b.constant(module_.pool.put_int(ty, 1), l);
+        b.binary(ir::Inst::Tag::Store, iter_lv, b.binary(ir::Inst::Tag::Add, step_cur, one, l), l);
         const ir::ExtraSlice step = b.close_region();
 
         b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
