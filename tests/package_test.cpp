@@ -237,3 +237,65 @@ TEST_CASE("package shared across files and across multiple importing modules") {
 
     CHECK(out == "m1 W=8 b=fe double=8\nm2 W=8 double=10\n");
 }
+
+// A package-scope variable (LRM 6.8) is genuine persistent state, unlike a
+// typedef/parameter/function: it needs its own signal (collect_global_scope_signals)
+// and its declaration initializer must run exactly once, in the shared PreInit
+// process lower_globals builds before any top instance is lowered.
+TEST_CASE("package-scope variable: read, write, and declaration initializer") {
+    const std::string out = run_capture(R"(
+        package p;
+            int counter = 100;
+        endpackage
+        module m;
+            import p::*;
+            initial begin
+                $display("initial=%0d", counter);
+                counter = counter + 1;
+                $display("after=%0d", counter);
+            end
+        endmodule
+    )");
+    CHECK(out == "initial=100\nafter=101\n");
+}
+
+// A `$unit`-scope variable (declared outside any module, in the compilation
+// unit itself) is visible without any import — it hits the exact same
+// collect_global_scope_signals path as a package variable, just walked off
+// RootSymbol::compilationUnits instead of Compilation::getPackages().
+TEST_CASE("$unit-scope variable is visible without any import") {
+    const std::string out = run_capture(R"(
+        int global_var;
+        module m;
+            initial begin
+                global_var = 7;
+                $display("global_var=%0d", global_var);
+            end
+        endmodule
+    )");
+    CHECK(out == "global_var=7\n");
+}
+
+// A package variable has no instance multiplicity (LRM 6.8): two top-level
+// modules importing the same package share the exact same signal, not one
+// copy per top. m2 reads after a #1 delay so its read is ordered after m1's
+// time-zero write, regardless of same-instant top-to-top scheduling order.
+TEST_CASE("package variable is one shared signal across multiple top-level modules") {
+    const std::string out = run_capture(R"(
+        package p;
+            int shared_var;
+        endpackage
+        module m1;
+            import p::*;
+            initial shared_var = 42;
+        endmodule
+        module m2;
+            import p::*;
+            initial begin
+                #1;
+                $display("m2 sees shared_var=%0d", shared_var);
+            end
+        endmodule
+    )");
+    CHECK(out == "m2 sees shared_var=42\n");
+}

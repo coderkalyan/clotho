@@ -483,6 +483,37 @@ public:
         module_.add_top(std::move(top_scope_));
     }
 
+    // Register the persistent state a package or the `$unit` compilation-unit
+    // scope declares (LRM 6.8): a package/$unit variable has no instance
+    // multiplicity, so it gets exactly one signal, shared by every top instance
+    // that references it. Must run once, on a Lowerer of its own, before any
+    // top's own Lowerer starts (see lower_compilation) so `sigmap()` can seed
+    // every top's map with these symbols; its own declaration initializers land
+    // in this Lowerer's PreInit process, so a package variable initializes
+    // exactly once regardless of how many tops import it.
+    void lower_globals(const Compilation& comp, const RootSymbol& root) {
+        for (const PackageSymbol* pkg : comp.getPackages()) {
+            collect_global_scope_signals(*pkg);
+        }
+        for (const CompilationUnitSymbol* unit : root.compilationUnits) {
+            collect_global_scope_signals(*unit);
+        }
+        finalize_preinit();
+    }
+
+    const ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal>& sigmap() const {
+        return sigmap_;
+    }
+
+    // Seed this Lowerer's symbol->signal map with globally-shared entries
+    // (package / $unit variables) collected by lower_globals, so references to
+    // them resolve through the ordinary signal_of path with no special casing.
+    void seed_signals(const ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal>& seed) {
+        for (const auto& [sym, sig] : seed) {
+            sigmap_[sym] = sig;
+        }
+    }
+
 private:
     // Lower the non-signal members of a scope (an instance body or a generate
     // block) into processes: continuous assigns, procedural blocks, child
@@ -820,6 +851,40 @@ private:
     }
 
     // -- Signals --
+
+    // Register the Variable members of a package or `$unit` scope as signals
+    // (see lower_globals). Only `Variable` needs action here: nets can't
+    // legally appear at this scope (LRM 26.2 / A.1.2), and every other member
+    // kind (typedefs, parameters, functions/tasks, imports, classes, ...)
+    // either folds at each reference or lowers lazily at its own call/use site
+    // — including the slang-injected `std` package, whose class declarations
+    // Clotho does not yet support but which no design can reference without
+    // hitting that unsupported-type guard independently. `scope_` is set so
+    // an initializer expression (ASTContext-driven constant fold, format-arg
+    // eval, ...) has a scope to resolve against, matching every other
+    // signal-collection path.
+    void collect_global_scope_signals(const Scope& scope) {
+        scope_ = &scope;
+        for (const Symbol& m : scope.members()) {
+            if (m.kind != SymbolKind::Variable) {
+                continue;
+            }
+            const auto& vs = m.as<VariableSymbol>();
+
+            ir::SignalInfo info;
+            info.name = std::string(vs.name);
+            info.type = lower_type(vs.getType());
+            info.dir  = ir::SignalInfo::Direction::Internal;
+
+            // Not register_signal: these signals belong to no top's
+            // InstanceScope tree (packages/$unit are not part of the instance
+            // hierarchy, and scope_stack_ is empty on this standalone
+            // Lowerer). The backend already treats any signal unclaimed by a
+            // scope tree as a flat root-level field (build_state_types).
+            sigmap_[&vs] = module_.add_signal(std::move(info));
+            lower_var_initializer(vs);
+        }
+    }
 
     void collect_signals(const InstanceBodySymbol& body) {
         // First pass: record port directions by the symbol they back. Ports exist
@@ -5426,15 +5491,25 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
     // pipeline expects. With several tops, each top's instance name (== its
     // module name, LRM 23.3.1) prefixes its flattened paths so they stay unique.
     // Each top gets a fresh Lowerer: their bodies share no symbols (no inter-top
-    // ports), so per-Lowerer maps need not — and must not — be shared.
+    // ports), so per-Lowerer instance/hierarchy state needs not — and must not —
+    // be shared. Package / $unit-scope variables are the one exception (LRM 6.8:
+    // no instance multiplicity, so one signal must serve every top that
+    // references it): a dedicated Lowerer registers them once, up front, and its
+    // symbol->signal entries seed every top's own map below.
     const bool single = root.topInstances.size() == 1;
     if (!single) {
         module->name = std::string(root.topInstances[0]->name);
     }
     try {
+        Lowerer globals(*module, tick_fs);
+        globals.lower_globals(comp, root);
+        const auto& global_sigmap = globals.sigmap();
+
         for (const InstanceSymbol* top : root.topInstances) {
             const std::string prefix = single ? std::string() : std::string(top->name) + ".";
-            Lowerer(*module, tick_fs).lower_top(*top, prefix);
+            Lowerer lw(*module, tick_fs);
+            lw.seed_signals(global_sigmap);
+            lw.lower_top(*top, prefix);
         }
     } catch (const LowerError& e) {
         result.diagnostics += "error: " + e.message + "\n";
