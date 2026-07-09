@@ -877,6 +877,24 @@ private:
         return b.resize(v, to, l);
     }
 
+    // Narrow/widen an already-loaded rvalue to its expression's own declared
+    // type (LRM 6.3.1 domain conversion). A no-op for the ordinary
+    // (domain-uniform) case; skipped for string/real, which have no domain
+    // to narrow (a packed struct member is always integral, LRM 7.2.1) and
+    // whose loaded value a plain Resize instruction rejects outright. Needed
+    // because the backend's PartSelect/BitSelect type inference
+    // (LlvmBackend.cpp compute_type) inherits the base signal's domain
+    // uniformly — correct for an ordinary vector/array, wrong when the base
+    // is a struct field whose own declared domain is narrower than its
+    // struct's physical storage (LRM 6.11.2 forces the whole struct 4-state
+    // if any member is).
+    ir::Index narrow_to_declared(ir::Index v, const slang::ast::Type& declared, ir::Builder& b, ir::SourceLoc l) {
+        if (declared.isString() || declared.isFloating()) {
+            return v;
+        }
+        return b.resize(v, lower_type(declared), l);
+    }
+
     // Intern an integer literal, preserving x/z bits. Slang stores a 4-state
     // SVInt as [value words][unknown words] with X=(val0,unk1), Z=(val1,unk1) —
     // the opposite val convention from the pool's VPI planes (X=(val1,xz1),
@@ -1116,6 +1134,8 @@ private:
                 return lvalue_root(e.as<ElementSelectExpression>().value());
             case ExpressionKind::RangeSelect:
                 return lvalue_root(e.as<RangeSelectExpression>().value());
+            case ExpressionKind::MemberAccess:
+                return lvalue_root(e.as<MemberAccessExpression>().value());
             case ExpressionKind::Conversion:
                 return lvalue_root(e.as<ConversionExpression>().operand());
             default:
@@ -1178,6 +1198,27 @@ private:
                     }
                 }
                 // A dynamic (or indexed +:/-:) select: conservatively the whole net.
+                record_net_driver_range(*root, 0, UINT32_MAX);
+                break;
+            }
+            case ExpressionKind::MemberAccess: {
+                // A struct/union member's bit range is always a compile-time
+                // constant (LRM 7.2.1 field offsets are declared, never
+                // dynamic), so a direct-named-value base gets the exact
+                // range, same precision as the ElementSelect/RangeSelect
+                // cases above.
+                const MemberAccessExpression& ma   = lhs.as<MemberAccessExpression>();
+                const ValueSymbol*            root = lvalue_root(ma.value());
+                if (root == nullptr) {
+                    break;
+                }
+                const auto* field = ma.member.as_if<FieldSymbol>();
+                if (field != nullptr && ma.value().kind == ExpressionKind::NamedValue) {
+                    const auto lsb = static_cast<uint32_t>(field->bitOffset);
+                    const auto msb = lsb + static_cast<uint32_t>(ma.type->getBitWidth()) - 1;
+                    record_net_driver_range(*root, lsb, msb);
+                    break;
+                }
                 record_net_driver_range(*root, 0, UINT32_MAX);
                 break;
             }
@@ -4446,6 +4487,9 @@ private:
             case ExpressionKind::RangeSelect:
                 check_task_nba_target(lhs.as<RangeSelectExpression>().value());
                 return;
+            case ExpressionKind::MemberAccess:
+                check_task_nba_target(lhs.as<MemberAccessExpression>().value());
+                return;
             case ExpressionKind::NamedValue: {
                 const ValueSymbol& vs = lhs.as<NamedValueExpression>().symbol;
                 if (fn_ctx_->localmap.contains(&vs)) {
@@ -4720,7 +4764,7 @@ private:
                 }
                 return b.unary(ir::Inst::Tag::Load, value_lvalue(sym, b, l), l);
             }
-            case ExpressionKind::LValueReference:
+            case ExpressionKind::LValueReference: {
                 // slang rewrites a compound assignment's RHS into
                 // `BinaryExpression(LValueReference, rhs, op)`; the reference
                 // stands for the LHS already lowered once by lower_compound_assign
@@ -4728,7 +4772,13 @@ private:
                 if (!compound_lv_.has_value()) {
                     fail("LValueReference outside a compound assignment");
                 }
-                return b.unary(ir::Inst::Tag::Load, *compound_lv_, l);
+                const ir::Index v = b.unary(ir::Inst::Tag::Load, *compound_lv_, l);
+                // A no-op for every lvalue shape except a struct member
+                // narrower than its struct's own physical domain (see the
+                // MemberAccess case above) — cheap enough to apply generically
+                // rather than special-case the one shape that needs it.
+                return narrow_to_declared(v, *expr.type, b, l);
+            }
             case ExpressionKind::UnaryOp:
                 return lower_unary(expr.as<UnaryExpression>(), b);
             case ExpressionKind::BinaryOp:
@@ -4786,12 +4836,41 @@ private:
                     is_unpacked_array(es.value())
                         ? b.elem_select(base, lower_expr(es.selector(), b), lower_type(*es.value().type), l)
                         : b.binary(ir::Inst::Tag::BitSelect, base, packed_bit_index(es, b, l), l);
-                return b.unary(ir::Inst::Tag::Load, sel, l);
+                const ir::Index v = b.unary(ir::Inst::Tag::Load, sel, l);
+                // See narrow_to_declared / the MemberAccess case below: a
+                // no-op except when `es` selects into a struct field
+                // narrower-domain than its struct's own physical storage
+                // (e.g. `x.b[3]` where `b` is 2-state inside an otherwise
+                // 4-state struct `x`).
+                return narrow_to_declared(v, *expr.type, b, l);
             }
             case ExpressionKind::RangeSelect: {
                 const RangeSelectExpression& rs   = expr.as<RangeSelectExpression>();
                 const ir::Index              base = lower_lvalue(rs.value(), b);
-                return b.unary(ir::Inst::Tag::Load, lower_range_select(rs, base, b, l), l);
+                const ir::Index v = b.unary(ir::Inst::Tag::Load, lower_range_select(rs, base, b, l), l);
+                // See narrow_to_declared (e.g. `x.b[7:4]`).
+                return narrow_to_declared(v, *expr.type, b, l);
+            }
+            case ExpressionKind::MemberAccess: {
+                // The backend's PartSelect/BitSelect type inference
+                // (LlvmBackend.cpp compute_type) inherits the BASE signal's
+                // domain, since an ordinary vector/array is domain-uniform
+                // throughout. A struct is the one aggregate where a field's
+                // own declared domain can be narrower than the whole (mixed)
+                // struct's forced-4-state storage (LRM 6.11.2) — so a 2-state
+                // field (or a further bit/range-select into one, above) read
+                // off 4-state storage must be explicitly narrowed back to its
+                // declared type here (LRM 6.3.1 conversion), or downstream
+                // consumers that trust the declared type (e.g. an arithmetic
+                // operand) see a width/domain mismatch. A no-op when the
+                // field's own domain already matches the struct's (a packed
+                // struct member is always integral, LRM 7.2.1, so
+                // narrow_to_declared's string/real skip never triggers here —
+                // used anyway for uniformity with its ElementSelect/RangeSelect
+                // siblings above).
+                const MemberAccessExpression& ma = expr.as<MemberAccessExpression>();
+                const ir::Index v = b.unary(ir::Inst::Tag::Load, lower_member_lvalue(ma, b, l), l);
+                return narrow_to_declared(v, *ma.type, b, l);
             }
             case ExpressionKind::Conversion: {
                 const ConversionExpression& cv       = expr.as<ConversionExpression>();
@@ -5213,6 +5292,36 @@ private:
         return b.dyn_part_select(base, off, width, l);
     }
 
+    // Struct/union member select (LRM 7.2.1 / 7.3): a packed struct or union is
+    // a flat bit-vector, so `x.field` is exactly a constant part-select at the
+    // field's declared bit offset (0 for every union member — all members
+    // overlay the LSB) — the same IR shape (PartSelect over the base lvalue)
+    // as a plain `vec[msb:lsb]`, so it reuses the backend's existing
+    // partial-write / NBA-shadow machinery with no backend changes. Nested
+    // struct member access (`x.outer.inner`) composes for free: the base
+    // lvalue is itself a part-select, and part-select-of-a-part-select
+    // already works (the same shape a multi-dimensional packed select uses).
+    ir::Index lower_member_lvalue(const MemberAccessExpression& ma, ir::Builder& b, ir::SourceLoc l) {
+        const auto* field = ma.member.as_if<FieldSymbol>();
+        if (field == nullptr) {
+            // TODO: non-field member access (class properties, interface
+            // modports, ...) — not lowered.
+            fail("unsupported member access");
+        }
+        if (ma.value().type->isUnion()) {
+            // TODO: this mechanism happens to produce correct reads/writes for
+            // a packed union already (every member sits at bitOffset 0), but
+            // union has its own LRM corners not yet reviewed here (7.3 fixed
+            // member width, tagged unions, unpacked aliasing) — gated
+            // separately pending that review rather than shipped by accident.
+            fail("union member access is not supported yet");
+        }
+        const ir::Index base = lower_lvalue(ma.value(), b);
+        const auto      lsb  = static_cast<uint32_t>(field->bitOffset);
+        const auto      msb  = lsb + static_cast<uint32_t>(ma.type->getBitWidth()) - 1;
+        return b.part_select(base, msb, lsb, l);
+    }
+
     // Lower an expression as an lvalue, returning the lvalue index (no Load).
     ir::Index lower_lvalue(const Expression& expr, ir::Builder& b) {
         const ir::SourceLoc l = loc(expr);
@@ -5238,6 +5347,8 @@ private:
                 const ir::Index              base = lower_lvalue(rs.value(), b);
                 return lower_range_select(rs, base, b, l);
             }
+            case ExpressionKind::MemberAccess:
+                return lower_member_lvalue(expr.as<MemberAccessExpression>(), b, l);
             default:
                 fail("unsupported assignment target kind=" + std::string(slang::ast::toString(expr.kind)));
         }

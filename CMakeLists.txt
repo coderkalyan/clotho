@@ -157,6 +157,7 @@ add_executable(clotho_test
   tests/sysfunc_test.cpp
   tests/streaming_test.cpp
   tests/uwire_test.cpp
+  tests/struct_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho doctest::doctest clotho_warnings)
 
