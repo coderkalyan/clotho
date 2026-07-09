@@ -388,6 +388,7 @@ public:
         build_state_types();
         compute_subscription_order();
         compute_fusion_groups(); // before build_wait_queues: bucket capacities count group subscriptions
+        compute_domain_spec();   // after fusion (thunk_group_), before build_nba_state (meta tag/dep fields)
         build_wait_queues();
         build_sched_flags();
         build_nba_state();
@@ -912,20 +913,45 @@ private:
             cur_is_task_      = false;
             lowering_preinit_ = false;
             hdl_              = nullptr;
-            b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
+            auto* entry_bb = llvm::BasicBlock::Create(ctx_, "entry", fn_);
+            b_.SetInsertPoint(entry_bb);
             // Run each member body per activation, freeing its string temporaries
             // afterward — a thunk has no frame to persist them in (a per-call cost
             // paid only by string-using bodies). frame_slots_ is empty for a
             // process, so deinit_body_strings frees exactly this member's temps.
-            for (const uint32_t m : members) {
-                select_member(m);
-                str_vals_.assign(ir_->inst_count(), nullptr);
-                build_str_temps();
-                lower_region(ir_->root());
-                deinit_body_strings();
+            const auto lower_bodies = [&] {
+                for (const uint32_t m : members) {
+                    select_member(m);
+                    str_vals_.assign(ir_->inst_count(), nullptr);
+                    build_str_temps();
+                    lower_region(ir_->root());
+                    deinit_body_strings();
+                }
+                b_.CreateStore(b_.getInt32(0), sched_ptr_); // re-arm: ready to be woken
+                b_.CreateRetVoid();
+            };
+            const uint32_t g = group_of_[proc_index];
+            if (!spec_group_[g]) {
+                lower_bodies();
+                return fn_;
             }
-            b_.CreateStore(b_.getInt32(0), sched_ptr_); // re-arm: ready to be woken
-            b_.CreateRetVoid();
+            // Domain-specialized group: dispatch on the dirty counter — zero
+            // means every tracked read-set signal is currently clean, so the
+            // assume-clean body is exact (see compute_domain_spec). The generic
+            // body is emitted first so a design that never (or rarely) goes
+            // clean keeps its hot code adjacent to the entry.
+            auto* gen_bb  = llvm::BasicBlock::Create(ctx_, "dom.gen", fn_);
+            auto* fast_bb = llvm::BasicBlock::Create(ctx_, "dom.fast", fn_);
+            auto* cp      = llvm::ConstantExpr::getInBoundsGetElementPtr(
+              domain_ctr_ty_, domain_ctr_gv_, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(g) });
+            llvm::Value* ctr = b_.CreateLoad(b_.getInt32Ty(), cp);
+            b_.CreateCondBr(b_.CreateICmpEQ(ctr, b_.getInt32(0)), fast_bb, gen_bb);
+            b_.SetInsertPoint(gen_bb);
+            lower_bodies();
+            b_.SetInsertPoint(fast_bb);
+            assume_clean_ = true;
+            lower_bodies();
+            assume_clean_ = false;
             return fn_;
         }
 
@@ -2300,6 +2326,365 @@ private:
         }
     }
 
+    // -- Dynamic domain specialization --
+    //
+    // A 4-state signal rarely changes domain at runtime: typically x until
+    // reset, then clean (no x/z bit) for the rest of the run. A thunk group
+    // whose body meets spec_eligible_body is compiled twice — the generic
+    // 4-state body, plus a fast body lowered as if every 4-state value were
+    // 2-state (assume_clean_ makes type_of report 4-state as 2-state, routing
+    // every operator through the native 2-state paths; stores lift back to the
+    // packed planes via to_four, so storage and outside readers see identical
+    // bits). Dispatch is a per-group counter of currently-dirty read-set
+    // signals, checked once per activation; the counter and a per-signal tag
+    // are maintained at write sites (domain_note_write, plus the NBA commit
+    // loop via four meta fields), where the stored word's x/z-ness is already
+    // at hand. The fast body runs only when the whole read set is clean, where
+    // 2-state and 4-state lowering agree exactly, so results are identical by
+    // construction — only speed changes.
+
+    // Whether one member body may be lowered under assume_clean_. Allow-list:
+    // any tag not listed keeps the group generic, so newly added IR tags are
+    // safe by default. Rejected classes:
+    //  - x-generators (Div / Mod / Pow: a clean-input op whose 4-state result
+    //    can be x, which the 2-state path folds to 0 — observably different);
+    //  - dynamic bit/part selects (an out-of-range or unknown index reads x in
+    //    4-state but 0 on the 2-state path; TODO: admit provably in-range
+    //    selects) and array element selects (per-element cleanliness is not
+    //    tracked);
+    //  - Call (the callee body is lowered generically and may blocking-write
+    //    x into this group's read set mid-activation, invalidating the
+    //    entry-time dispatch);
+    //  - runtime write-backs ($fgets / $*scanf / $fread / $readmem / $ferror:
+    //    they can deposit x mid-body through a pointer);
+    //  - strings (separate value machinery, no need to prove it x-safe);
+    //  - constants carrying x/z bits (their must-plane projection would lose
+    //    the x/z, e.g. casez wildcard patterns).
+    bool spec_eligible_body(const Ir& ir) const {
+        for (size_t k = 0; k < ir.inst_count(); ++k) {
+            const auto           idx = static_cast<Index>(k);
+            const Inst::Payload& p   = ir.payload(idx);
+            switch (ir.tag(idx)) {
+                case Inst::Tag::Constant: {
+                    const Value& v = std::get<Value>(mod_.pool.get(p.ref));
+                    if (std::get<Type>(mod_.pool.get(v.type)).kind == Type::Kind::String) {
+                        return false;
+                    }
+                    const Layout lay = mod_.pool.layout(v.type);
+                    if (lay.domain == Domain::Four) {
+                        const auto     bytes = mod_.pool.bytes(p.ref);
+                        const uint32_t pb    = plane_bytes(lay.width);
+                        for (uint32_t bi = pb; bi < 2 * pb && bi < bytes.size(); ++bi) {
+                            if (bytes[bi] != 0) {
+                                return false; // x/z bits in the literal
+                            }
+                        }
+                    }
+                    break;
+                }
+                case Inst::Tag::Signal: {
+                    const SignalSlot& s = slots_[static_cast<uint32_t>(p.signal)];
+                    if (s.is_string || s.is_array) {
+                        return false;
+                    }
+                    break;
+                }
+                // NOTE: PartSelect is the constant [msb:lsb] form; slang rejects
+                // an out-of-range constant select of a packed type, so it cannot
+                // read x on a clean base.
+                case Inst::Tag::PartSelect:
+                case Inst::Tag::Load:
+                case Inst::Tag::Store:
+                case Inst::Tag::StoreNb:
+                case Inst::Tag::Add:
+                case Inst::Tag::Sub:
+                case Inst::Tag::Mul:
+                case Inst::Tag::Band:
+                case Inst::Tag::Bor:
+                case Inst::Tag::Bxor:
+                case Inst::Tag::Bxnor:
+                case Inst::Tag::Bnot:
+                case Inst::Tag::RedAnd:
+                case Inst::Tag::RedOr:
+                case Inst::Tag::RedXor:
+                case Inst::Tag::Ctz:
+                case Inst::Tag::Clz:
+                case Inst::Tag::Sll:
+                case Inst::Tag::Srl:
+                case Inst::Tag::Sra:
+                case Inst::Tag::Eq:
+                case Inst::Tag::Ne:
+                case Inst::Tag::Lt:
+                case Inst::Tag::Le:
+                case Inst::Tag::Gt:
+                case Inst::Tag::Ge:
+                // Case/wildcard equality with clean operands is a plain compare;
+                // wildcard-carrying patterns were rejected at their Constant.
+                case Inst::Tag::CaseEq:
+                case Inst::Tag::CasezEq:
+                case Inst::Tag::CasexEq:
+                case Inst::Tag::WildEq:
+                // Reals never carry x/z; conversions from clean operands and
+                // real math results are always defined.
+                case Inst::Tag::FAdd:
+                case Inst::Tag::FSub:
+                case Inst::Tag::FMul:
+                case Inst::Tag::FDiv:
+                case Inst::Tag::FPow:
+                case Inst::Tag::FNeg:
+                case Inst::Tag::FEq:
+                case Inst::Tag::FNe:
+                case Inst::Tag::FLt:
+                case Inst::Tag::FLe:
+                case Inst::Tag::FGt:
+                case Inst::Tag::FGe:
+                case Inst::Tag::ItoF:
+                case Inst::Tag::FtoI:
+                case Inst::Tag::FtoITrunc:
+                case Inst::Tag::FBitcast:
+                case Inst::Tag::FResize:
+                case Inst::Tag::RealMath:
+                case Inst::Tag::Land:
+                case Inst::Tag::Lor:
+                case Inst::Tag::Lnot:
+                case Inst::Tag::Select:
+                case Inst::Tag::SelectLazy:
+                case Inst::Tag::Concat:
+                case Inst::Tag::Repl:
+                case Inst::Tag::Resize:
+                case Inst::Tag::Cond:
+                case Inst::Tag::Switch:
+                case Inst::Tag::Loop:
+                case Inst::Tag::Break:
+                case Inst::Tag::Continue:
+                case Inst::Tag::Display:
+                case Inst::Tag::Finish:
+                case Inst::Tag::Fflush:
+                case Inst::Tag::Fclose:
+                case Inst::Tag::Fopen:
+                case Inst::Tag::FileValueOp:
+                case Inst::Tag::TimeFormat:
+                case Inst::Tag::SimTime:
+                case Inst::Tag::Random:
+                // $clog2 of a clean operand is never x.
+                case Inst::Tag::Clog2:
+                    break;
+                default:
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    // Decide which thunk groups get a specialized fast body, compute each
+    // signal's dependent-group list, and build the runtime tracking state:
+    // clotho.domain_tag (one i8 per signal, 1 = dirty, initially dirty — a
+    // 4-state signal powers up x/z) and clotho.domain_ctr (one i32 per group:
+    // the count of currently-dirty signals in its tracked read set, initially
+    // the set size). Runs after build_state_types (slot facts) and
+    // compute_fusion_groups (thunk_group_), before build_nba_state (the commit
+    // loop's meta table carries the tag/dep pointers).
+    void compute_domain_spec() {
+        const auto all     = mod_.processes();
+        const auto nsig    = static_cast<uint32_t>(slots_.size());
+        const auto ngroups = static_cast<uint32_t>(groups_.size());
+        spec_group_.assign(ngroups, false);
+        tracked_.assign(nsig, false);
+        sig_dep_groups_.assign(nsig, {});
+        domain_dep_gv_.assign(nsig, nullptr);
+        domain_dep_ty_.assign(nsig, nullptr);
+        if (!config_.domain_spec) {
+            return;
+        }
+
+        std::vector<uint32_t> ctr_init(ngroups, 0);
+        for (uint32_t g = 0; g < ngroups; ++g) {
+            if (!thunk_group_[g]) {
+                continue;
+            }
+            bool                  ok = true;
+            std::vector<uint32_t> reads;
+            for (const uint32_t m : groups_[g]) {
+                const Ir& ir = all[m].ir;
+                if (!spec_eligible_body(ir)) {
+                    ok = false;
+                    break;
+                }
+                for (size_t k = 0; k < ir.inst_count(); ++k) {
+                    const auto idx = static_cast<Index>(k);
+                    if (ir.tag(idx) != Inst::Tag::Load) {
+                        continue;
+                    }
+                    const LvalueRoot r = lvalue_root(ir, ir.payload(idx).unary);
+                    if (ir.tag(r.root) != Inst::Tag::Signal) {
+                        continue;
+                    }
+                    const auto        si = static_cast<uint32_t>(ir.payload(r.root).signal);
+                    const SignalSlot& s  = slots_[si];
+                    if (s.four_state && !s.is_array && !s.is_string) {
+                        reads.push_back(si);
+                    }
+                }
+            }
+            std::sort(reads.begin(), reads.end());
+            reads.erase(std::unique(reads.begin(), reads.end()), reads.end());
+            // A group with no 4-state reads gains nothing from a second body:
+            // its generic lowering already runs the native 2-state paths.
+            if (!ok || reads.empty()) {
+                continue;
+            }
+            spec_group_[g] = true;
+            ctr_init[g]    = static_cast<uint32_t>(reads.size());
+            for (const uint32_t si : reads) {
+                tracked_[si] = true;
+                sig_dep_groups_[si].push_back(g);
+            }
+        }
+
+        auto* i8  = llvm::Type::getInt8Ty(ctx_);
+        auto* i32 = llvm::Type::getInt32Ty(ctx_);
+        domain_tag_ty_ = llvm::ArrayType::get(i8, std::max<uint32_t>(nsig, 1));
+        std::vector<llvm::Constant*> tags(std::max<uint32_t>(nsig, 1), llvm::ConstantInt::get(i8, 0));
+        for (uint32_t si = 0; si < nsig; ++si) {
+            if (tracked_[si]) {
+                tags[si] = llvm::ConstantInt::get(i8, 1);
+            }
+        }
+        domain_tag_gv_ = new llvm::GlobalVariable(llmod_, domain_tag_ty_, false,
+                                                  llvm::GlobalValue::InternalLinkage,
+                                                  llvm::ConstantArray::get(domain_tag_ty_, tags),
+                                                  "clotho.domain_tag");
+        domain_flips_gv_ = new llvm::GlobalVariable(llmod_, domain_tag_ty_, false,
+                                                    llvm::GlobalValue::InternalLinkage,
+                                                    llvm::ConstantAggregateZero::get(domain_tag_ty_),
+                                                    "clotho.domain_flips");
+        domain_ctr_ty_ = llvm::ArrayType::get(i32, std::max<uint32_t>(ngroups, 1));
+        std::vector<llvm::Constant*> ctrs(std::max<uint32_t>(ngroups, 1), llvm::ConstantInt::get(i32, 0));
+        for (uint32_t g = 0; g < ngroups; ++g) {
+            ctrs[g] = llvm::ConstantInt::get(i32, ctr_init[g]);
+        }
+        domain_ctr_gv_ = new llvm::GlobalVariable(llmod_, domain_ctr_ty_, false,
+                                                  llvm::GlobalValue::InternalLinkage,
+                                                  llvm::ConstantArray::get(domain_ctr_ty_, ctrs),
+                                                  "clotho.domain_ctr");
+        for (uint32_t si = 0; si < nsig; ++si) {
+            if (sig_dep_groups_[si].empty()) {
+                continue;
+            }
+            const auto n = static_cast<uint32_t>(sig_dep_groups_[si].size());
+            auto* ty = llvm::ArrayType::get(i32, n);
+            std::vector<llvm::Constant*> deps;
+            for (const uint32_t g : sig_dep_groups_[si]) {
+                deps.push_back(llvm::ConstantInt::get(i32, g));
+            }
+            domain_dep_ty_[si] = ty;
+            domain_dep_gv_[si] = new llvm::GlobalVariable(llmod_, ty, true, llvm::GlobalValue::InternalLinkage,
+                                                          llvm::ConstantArray::get(ty, deps),
+                                                          "clotho.domain_dep." + std::to_string(si));
+        }
+    }
+
+    // A tag byte is 0 (clean), 1 (dirty), or 3 (pinned dirty). A signal that
+    // keeps flapping between domains (e.g. a bus register that samples x
+    // between transfers) would pay the transition bookkeeping every few
+    // cycles for a fast body that never stably dispatches; after
+    // domain_flap_cap transitions it is pinned permanently dirty and its
+    // maintenance stops — the inline-cache megamorphic fallback. Pinning
+    // keeps the counter invariant (ctr == count of tags != 0 in the read
+    // set): a pin during a toward-dirty transition applies the increment, a
+    // pin during a toward-clean transition skips the decrement.
+    static constexpr uint32_t domain_flap_cap = 16;
+
+    // After a committed write to a tracked signal's storage, retest the whole
+    // stored word's cleanliness and, on a domain transition, flip the signal's
+    // tag and adjust every dependent group's dirty counter. `new_mm` is the
+    // full stored must|may word (i2W — tracked signals are always packed
+    // 4-state); `new_z` the full stored z word or null. The mm test alone
+    // covers x and z (z encodes as x in the planes); the z word is OR'd in as
+    // defense on paths that write z storage directly. Hot path is the xz test
+    // plus one i8 load + compare; the transition machinery is a side block.
+    void domain_note_write(Signal sig, uint32_t width, llvm::Value* new_mm, llvm::Value* new_z) {
+        const auto si = static_cast<uint32_t>(sig);
+        if (si >= tracked_.size() || !tracked_[si]) {
+            return;
+        }
+        auto*        i8 = b_.getInt8Ty();
+        llvm::Value* xz =
+          b_.CreateTrunc(b_.CreateXor(new_mm, b_.CreateLShr(new_mm, llvm::ConstantInt::get(new_mm->getType(), width))),
+                         int_ty(width));
+        if (new_z != nullptr) {
+            xz = b_.CreateOr(xz, new_z);
+        }
+        llvm::Value* dirty1 = b_.CreateICmpNE(xz, zero(width));
+        llvm::Value* dirty8 = b_.CreateZExt(dirty1, i8);
+        auto*        tagp   = llvm::ConstantExpr::getInBoundsGetElementPtr(
+          domain_tag_ty_, domain_tag_gv_, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(si) });
+        llvm::Value* old = b_.CreateLoad(i8, tagp);
+
+        auto* fn      = b_.GetInsertBlock()->getParent();
+        auto* upd     = llvm::BasicBlock::Create(ctx_, "dom.flip", fn);
+        auto* flap    = llvm::BasicBlock::Create(ctx_, "dom.flap", fn);
+        auto* norm    = llvm::BasicBlock::Create(ctx_, "dom.norm", fn);
+        auto* pin     = llvm::BasicBlock::Create(ctx_, "dom.pin", fn);
+        auto* pin_inc = llvm::BasicBlock::Create(ctx_, "dom.pininc", fn);
+        auto* cont    = llvm::BasicBlock::Create(ctx_, "dom.cont", fn);
+        b_.CreateCondBr(b_.CreateICmpNE(old, dirty8), upd, cont);
+
+        // A pinned tag (3) never equals dirty8 (0/1), so it lands here every
+        // changed write; one compare sends it straight out.
+        b_.SetInsertPoint(upd);
+        b_.CreateCondBr(b_.CreateICmpEQ(old, b_.getInt8(3)), cont, flap);
+
+        b_.SetInsertPoint(flap);
+        auto* flipp = llvm::ConstantExpr::getInBoundsGetElementPtr(
+          domain_tag_ty_, domain_flips_gv_, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(si) });
+        llvm::Value* flips = b_.CreateAdd(b_.CreateLoad(i8, flipp), b_.getInt8(1));
+        b_.CreateStore(flips, flipp);
+        b_.CreateCondBr(b_.CreateICmpUGE(flips, b_.getInt8(domain_flap_cap)), pin, norm);
+
+        b_.SetInsertPoint(norm);
+        b_.CreateStore(dirty8, tagp);
+        llvm::Value* delta = b_.CreateSelect(dirty1, b_.getInt32(1), b_.getInt32(-1));
+        for (const uint32_t g : sig_dep_groups_[si]) {
+            auto* cp = llvm::ConstantExpr::getInBoundsGetElementPtr(
+              domain_ctr_ty_, domain_ctr_gv_, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(g) });
+            b_.CreateStore(b_.CreateAdd(b_.CreateLoad(b_.getInt32Ty(), cp), delta), cp);
+        }
+        b_.CreateBr(cont);
+
+        // Pin: force the tag permanently dirty. A toward-dirty transition
+        // (old == 0) still owes the counters its increment; a toward-clean one
+        // (old == 1) just keeps them counting it dirty.
+        b_.SetInsertPoint(pin);
+        b_.CreateStore(b_.getInt8(3), tagp);
+        b_.CreateCondBr(dirty1, pin_inc, cont);
+
+        b_.SetInsertPoint(pin_inc);
+        for (const uint32_t g : sig_dep_groups_[si]) {
+            auto* cp = llvm::ConstantExpr::getInBoundsGetElementPtr(
+              domain_ctr_ty_, domain_ctr_gv_, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(g) });
+            b_.CreateStore(b_.CreateAdd(b_.CreateLoad(b_.getInt32Ty(), cp), b_.getInt32(1)), cp);
+        }
+        b_.CreateBr(cont);
+
+        b_.SetInsertPoint(cont);
+    }
+
+    // domain_note_write for a write whose new value is not at hand in SSA form
+    // (the runtime pointer write-backs: $fgets / $*scanf / scalar $fread):
+    // reload the committed word(s) and retest.
+    void domain_note_write_reload(const LValue& lv) {
+        if (!lv.is_signal) {
+            return;
+        }
+        const auto si = static_cast<uint32_t>(lv.sig);
+        if (si >= tracked_.size() || !tracked_[si]) {
+            return;
+        }
+        domain_note_write(lv.sig, lv.store_width, load_lv_mm(lv),
+                          lv.has_z ? load_lv_z(lv) : nullptr);
+    }
+
     // Build the nonblocking-assignment update state: per-(width, partial) commit
     // worklists, the dense pending-flag array, and a constant per-signal metadata
     // table (live/shadow/mask offsets plus the wait-queue base/cap/len pointers the
@@ -2311,7 +2696,13 @@ private:
         auto* ptr   = llvm::PointerType::getUnqual(ctx_);
         auto* arr3p = llvm::ArrayType::get(ptr, 3);
         auto* arr3i = llvm::ArrayType::get(i32, 3);
-        nba_meta_ty_ = llvm::StructType::get(ctx_, { i32, i32, i32, i32, i32, arr3p, arr3i, arr3p, arr3p });
+        // Fields 9-12 are the domain-specialization hooks (compute_domain_spec):
+        // the signal's tag byte, its dependent-group index array, that array's
+        // length (0 for an untracked signal), and its flap-count byte. The
+        // commit loop's cost for an untracked or value-unchanged commit is one
+        // compare/load + branch.
+        nba_meta_ty_ =
+          llvm::StructType::get(ctx_, { i32, i32, i32, i32, i32, arr3p, arr3i, arr3p, arr3p, ptr, ptr, i32, ptr });
 
         const auto sigs = mod_.signals();
 
@@ -2388,12 +2779,25 @@ private:
                 db[e] = wait_dyn_gv_[i][e] ? llvm::cast<llvm::Constant>(wait_dyn_gv_[i][e]) : nullp;
                 dl[e] = wait_dyn_len_gv_[i][e] ? llvm::cast<llvm::Constant>(wait_dyn_len_gv_[i][e]) : nullp;
             }
+            llvm::Constant* tagp  = nullp;
+            llvm::Constant* depp  = nullp;
+            llvm::Constant* flipp = nullp;
+            uint32_t        ndeps = 0;
+            if (i < tracked_.size() && tracked_[i] && domain_dep_gv_[i] != nullptr) {
+                const std::array<llvm::Constant*, 2> gep_idx{ llvm::ConstantInt::get(i32, 0),
+                                                              llvm::ConstantInt::get(i32, i) };
+                tagp  = llvm::ConstantExpr::getInBoundsGetElementPtr(domain_tag_ty_, domain_tag_gv_, gep_idx);
+                flipp = llvm::ConstantExpr::getInBoundsGetElementPtr(domain_tag_ty_, domain_flips_gv_, gep_idx);
+                depp  = domain_dep_gv_[i];
+                ndeps = static_cast<uint32_t>(sig_dep_groups_[i].size());
+            }
             metas.push_back(llvm::ConstantStruct::get(
               nba_meta_ty_, { llvm::ConstantInt::get(i32, off_mm), llvm::ConstantInt::get(i32, off_z),
                               llvm::ConstantInt::get(i32, off_nmm), llvm::ConstantInt::get(i32, off_nz),
                               llvm::ConstantInt::get(i32, off_mask), llvm::ConstantArray::get(arr3p, sb),
                               llvm::ConstantArray::get(arr3i, sc), llvm::ConstantArray::get(arr3p, db),
-                              llvm::ConstantArray::get(arr3p, dl) }));
+                              llvm::ConstantArray::get(arr3p, dl), tagp, depp,
+                              llvm::ConstantInt::get(i32, ndeps), flipp }));
         }
         if (metas.empty()) {
             metas.push_back(llvm::ConstantAggregateZero::get(nba_meta_ty_));
@@ -2858,6 +3262,97 @@ private:
     // plain 0<->1 classifier — deriving `may` via LShr on the iW word would read
     // 0 and suppress every posedge. A packed 2-state target keeps must == may in
     // every stored word, so the 4-state classifier stays exact for it.
+    // The commit-loop counterpart of domain_note_write: the per-signal tag /
+    // dep / flap pointers come from the meta record (fields 9-12), since one
+    // commit loop is shared per bucket. `old_mm` / `new_mm` are the live and
+    // just-committed full words (i2W — narrow buckets never carry tracked
+    // signals and are skipped by the caller); `new_z` the committed z word or
+    // null. The hot path is gated twice: an unchanged word cannot change the
+    // tag (one compare of already-loaded values), and an untracked signal has
+    // ndeps == 0 (one i32 load + branch). A z-only x<->z change keeps the mm
+    // word identical and both sides dirty, so the changed gate is exact.
+    void emit_nba_domain_note(llvm::Value* meta, llvm::Value* old_mm, llvm::Value* new_mm,
+                              uint32_t width, llvm::Value* new_z) {
+        if (domain_ctr_gv_ == nullptr) {
+            return; // --no-domain-spec: no tracking state exists
+        }
+        auto* fn      = b_.GetInsertBlock()->getParent();
+        auto* i8      = b_.getInt8Ty();
+        auto* i32     = b_.getInt32Ty();
+        auto* ptr     = llvm::PointerType::getUnqual(ctx_);
+        auto* dep_bb  = llvm::BasicBlock::Create(ctx_, "ndom.dep", fn);
+        auto* chk     = llvm::BasicBlock::Create(ctx_, "ndom.chk", fn);
+        auto* upd     = llvm::BasicBlock::Create(ctx_, "ndom.flip", fn);
+        auto* flap    = llvm::BasicBlock::Create(ctx_, "ndom.flap", fn);
+        auto* norm    = llvm::BasicBlock::Create(ctx_, "ndom.norm", fn);
+        auto* pin     = llvm::BasicBlock::Create(ctx_, "ndom.pin", fn);
+        auto* loop_pre = llvm::BasicBlock::Create(ctx_, "ndom.walkpre", fn);
+        auto* loop    = llvm::BasicBlock::Create(ctx_, "ndom.walk", fn);
+        auto* cont    = llvm::BasicBlock::Create(ctx_, "ndom.cont", fn);
+
+        b_.CreateCondBr(b_.CreateICmpNE(old_mm, new_mm), dep_bb, cont);
+
+        b_.SetInsertPoint(dep_bb);
+        llvm::Value* ndeps = meta_i32(meta, 11);
+        b_.CreateCondBr(b_.CreateICmpNE(ndeps, b_.getInt32(0)), chk, cont);
+
+        b_.SetInsertPoint(chk);
+        llvm::Value* xz = b_.CreateTrunc(
+          b_.CreateXor(new_mm, b_.CreateLShr(new_mm, llvm::ConstantInt::get(new_mm->getType(), width))),
+          int_ty(width));
+        if (new_z != nullptr) {
+            xz = b_.CreateOr(xz, new_z);
+        }
+        llvm::Value* dirty1 = b_.CreateICmpNE(xz, zero(width));
+        llvm::Value* dirty8 = b_.CreateZExt(dirty1, i8);
+        llvm::Value* tagp =
+          b_.CreateLoad(ptr, b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(9) }));
+        llvm::Value* old = b_.CreateLoad(i8, tagp);
+        b_.CreateCondBr(b_.CreateICmpNE(old, dirty8), upd, cont);
+
+        // Pinned (3) never equals dirty8; one compare sends it out.
+        b_.SetInsertPoint(upd);
+        b_.CreateCondBr(b_.CreateICmpEQ(old, b_.getInt8(3)), cont, flap);
+
+        b_.SetInsertPoint(flap);
+        llvm::Value* flipp =
+          b_.CreateLoad(ptr, b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(12) }));
+        llvm::Value* flips = b_.CreateAdd(b_.CreateLoad(i8, flipp), b_.getInt8(1));
+        b_.CreateStore(flips, flipp);
+        b_.CreateCondBr(b_.CreateICmpUGE(flips, b_.getInt8(domain_flap_cap)), pin, norm);
+
+        b_.SetInsertPoint(norm);
+        b_.CreateStore(dirty8, tagp);
+        llvm::Value* d_norm = b_.CreateSelect(dirty1, b_.getInt32(1), b_.getInt32(-1));
+        b_.CreateBr(loop_pre);
+
+        // Pin: tag permanently dirty; a toward-dirty transition still owes the
+        // counters its increment, a toward-clean one skips the decrement.
+        b_.SetInsertPoint(pin);
+        b_.CreateStore(b_.getInt8(3), tagp);
+        b_.CreateCondBr(dirty1, loop_pre, cont);
+
+        b_.SetInsertPoint(loop_pre);
+        auto* delta = b_.CreatePHI(i32, 2);
+        delta->addIncoming(d_norm, norm);
+        delta->addIncoming(b_.getInt32(1), pin);
+        llvm::Value* deps =
+          b_.CreateLoad(ptr, b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(10) }));
+        b_.CreateBr(loop);
+
+        b_.SetInsertPoint(loop);
+        auto* j = b_.CreatePHI(i32, 2);
+        j->addIncoming(b_.getInt32(0), loop_pre);
+        llvm::Value* g  = b_.CreateLoad(i32, b_.CreateInBoundsGEP(i32, deps, j));
+        llvm::Value* cp = b_.CreateInBoundsGEP(domain_ctr_ty_, domain_ctr_gv_, { b_.getInt32(0), g });
+        b_.CreateStore(b_.CreateAdd(b_.CreateLoad(i32, cp), delta), cp);
+        llvm::Value* jn = b_.CreateAdd(j, b_.getInt32(1));
+        j->addIncoming(jn, b_.GetInsertBlock());
+        b_.CreateCondBr(b_.CreateICmpULT(jn, ndeps), loop, cont);
+
+        b_.SetInsertPoint(cont);
+    }
+
     void emit_nba_service(llvm::Value* meta, llvm::Value* old_mm, llvm::Value* new_mm,
                           uint32_t width, bool narrow, llvm::Value* old_z, llvm::Value* new_z) {
         const EdgeFacts f = emit_edge_facts(old_mm, new_mm, width, /*four_state=*/!narrow, old_z,
@@ -2953,6 +3448,12 @@ private:
                 b_.CreateAlignedStore(new_z, live_z_p, z_al);
             }
             b_.CreateAlignedStore(zero(W), mask_p, z_al); // clear dirty mask for next slot
+        }
+        // Domain-tag maintenance for a tracked committed signal
+        // (compute_domain_spec): the shadow just became the live value, so the
+        // NBA commit is the transition point, not the staging store.
+        if (!bk.narrow) {
+            emit_nba_domain_note(meta, old_mm, new_mm, W, bk.has_z ? new_z : nullptr);
         }
         emit_nba_service(meta, old_mm, new_mm, bk.width, bk.narrow, old_z, new_z);
         b_.CreateStore(b_.getInt8(0),
@@ -3522,12 +4023,28 @@ private:
 
     // -- Type inference (memoized) --
 
+    // Fast-body domain projection (compute_domain_spec): while assume_clean_ is
+    // set, every 4-state value type reads as 2-state, so the whole body lowers
+    // through the native 2-state operator paths. Sound because the fast body
+    // only runs when its read set is proven clean at runtime, and eligibility
+    // rejected every construct that could produce or consume x/z. Applied both
+    // here (covers compute_type's hardcoded 4-state results — comparisons,
+    // Clog2, Signal) and in from_ref (covers its direct conversion-target
+    // callers). The types_ cache is reset per body pass (select_member), so
+    // fast and generic passes never share entries.
+    ValType domain_fake(ValType t) const {
+        if (assume_clean_ && t.four_state && !t.is_string && !t.is_real) {
+            t.four_state = false;
+        }
+        return t;
+    }
+
     ValType type_of(Index i) {
         const auto slot = static_cast<uint32_t>(i);
         if (types_[slot]) {
             return *types_[slot];
         }
-        const ValType t = compute_type(i);
+        const ValType t = domain_fake(compute_type(i));
         types_[slot]    = t;
         return t;
     }
@@ -3540,8 +4057,8 @@ private:
         const Layout lay = mod_.pool.layout(type);
         const bool fl = mod_.pool.is_float(type);
         // Reals are signed quantities (LRM 11.8.1).
-        return { lay.width == 0 ? 1 : lay.width, lay.domain == Domain::Four, ty.is_signed || fl,
-                 false, fl };
+        return domain_fake({ lay.width == 0 ? 1 : lay.width, lay.domain == Domain::Four,
+                             ty.is_signed || fl, false, fl });
     }
 
     ValType compute_type(Index i) {
@@ -4637,6 +5154,9 @@ private:
             if (lv.has_z) {
                 b_.CreateStore(rhs.z, lv_z_ptr(lv));
             }
+            if (lv.is_signal) {
+                domain_note_write(lv.sig, s_width, rhs.mm, lv.has_z ? rhs.z : nullptr);
+            }
             return;
         }
 
@@ -4649,9 +5169,15 @@ private:
         llvm::Value* must = merge_sel(must_of(old), must_of(rhs), lv, s_width, mask);
         llvm::Value* may  = merge_sel(may_of(old), may_of(rhs), lv, s_width, mask);
         llvm::Value* z    = merge_sel(old.z, rhs.z, lv, s_width, mask);
-        b_.CreateStore(packed(must, may, z).mm, mp);
+        llvm::Value* merged = packed(must, may, z).mm;
+        b_.CreateStore(merged, mp);
         if (lv.has_z) {
             b_.CreateStore(z, zp);
+        }
+        // The merged word covers the whole storage, so a partial write that
+        // clears (or introduces) the last x/z bit transitions the tag exactly.
+        if (lv.is_signal) {
+            domain_note_write(lv.sig, s_width, merged, lv.has_z ? z : nullptr);
         }
     }
 
@@ -5155,6 +5681,7 @@ private:
         const ServiceSnapshot old          = service_snapshot(lvalue_of(dst));
         llvm::Value* r = b_.CreateCall(fgets_fn(), { mm, z, b_.getInt32(width), fd, b_.getInt32(flags) });
         service_after_write(lvalue_of(dst), old);
+        domain_note_write_reload(lvalue_of(dst));
         set_value(i, packed(r, r, zero(32)));
     }
 
@@ -5222,6 +5749,7 @@ private:
         const ServiceSnapshot old          = service_snapshot(lvalue_of(info.dst));
         b_.CreateCall(sformat_fn(), { mm, z, b_.getInt32(width), fmt_ptr, argc, arr, b_.getInt32(flags) });
         service_after_write(lvalue_of(info.dst), old);
+        domain_note_write_reload(lvalue_of(info.dst));
     }
 
     // Lower a $sformatf: format into the instruction's string temp.
@@ -5254,6 +5782,7 @@ private:
         const ServiceSnapshot old          = service_snapshot(lvalue_of(dst));
         llvm::Value* r = b_.CreateCall(ferror_fn(), { fd, mm, z, b_.getInt32(width), b_.getInt32(flags) });
         service_after_write(lvalue_of(dst), old);
+        domain_note_write_reload(lvalue_of(dst));
         set_value(i, packed(r, r, zero(32)));
     }
 
@@ -5341,6 +5870,7 @@ private:
         // (an unconverted target reloads its old value and stays quiet).
         for (uint32_t k = 0; k < n; ++k) {
             service_after_write(lvalue_of(outs[k]), olds[k]);
+            domain_note_write_reload(lvalue_of(outs[k]));
         }
         set_value(i, packed(r, r, zero(32)));
     }
@@ -5406,6 +5936,7 @@ private:
                                                 b_.getInt32(four), b_.getInt64(0), b_.getInt64(0), b_.getInt64(0),
                                                 b_.getInt64(0), b_.getInt32(flags) });
         service_after_write(lv, old);
+        domain_note_write_reload(lv);
         set_value(i, packed(r, r, zero(32)));
     }
 
@@ -7248,6 +7779,23 @@ private:
     // group is suspension-free), not a coroutine. Drives lower_group's emission
     // and the seed/drain dispatch, kept as one table so all three agree.
     std::vector<bool>                   thunk_group_;
+    // Dynamic domain specialization (compute_domain_spec). spec_group_: this
+    // thunk group carries a second, assume-clean body dispatched on its dirty
+    // counter. tracked_: this signal's cleanliness is tagged at write sites.
+    // sig_dep_groups_: the spec groups whose counters a signal's domain
+    // transition adjusts. assume_clean_ flips type_of/from_ref to report
+    // 4-state as 2-state while the fast body lowers.
+    bool                                assume_clean_ = false;
+    std::vector<bool>                   spec_group_;
+    std::vector<bool>                   tracked_;
+    std::vector<std::vector<uint32_t>>  sig_dep_groups_;
+    llvm::ArrayType*                    domain_tag_ty_ = nullptr;
+    llvm::GlobalVariable*               domain_tag_gv_ = nullptr; // [nsig x i8], 0 clean / 1 dirty / 3 pinned
+    llvm::GlobalVariable*               domain_flips_gv_ = nullptr; // [nsig x i8] transition counts (flap pin)
+    llvm::ArrayType*                    domain_ctr_ty_ = nullptr;
+    llvm::GlobalVariable*               domain_ctr_gv_ = nullptr; // [ngroups x i32] dirty counts
+    std::vector<llvm::ArrayType*>       domain_dep_ty_;
+    std::vector<llvm::GlobalVariable*>  domain_dep_gv_; // per signal: [n x i32] dependent groups
     // Per-signal wait queues, indexed by Signal handle and then by edge bucket
     // (`[signal][static_cast<uint32_t>(edge)]`: 0=pos, 1=neg, 2=any); null where the
     // signal has no waiter of that (kind, edge). Splitting by edge hoists the

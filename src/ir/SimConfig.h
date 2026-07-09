@@ -31,6 +31,15 @@ struct SimulationConfig {
     // the thunk path in LlvmBackend.cpp). Disable for bisection / debugging;
     // semantics are byte-identical (same sched-flag timeline, same FIFO order).
     bool thunk = true;
+    // Dynamic domain specialization: compile an eligible thunk group's body a
+    // second time under the assumption that every 4-state signal it reads is
+    // currently clean (no x/z bit), routed through the native 2-state operator
+    // paths, and dispatch per activation on a per-group dirty counter
+    // maintained at write sites (see compute_domain_spec in LlvmBackend.cpp).
+    // Disable for bisection / debugging; semantics are identical either way —
+    // the fast body runs only when the whole read set is clean at runtime,
+    // where 2-state and 4-state lowering agree exactly.
+    bool domain_spec = true;
     // Register LLVM's perf JITEventListener on the object-linking layer so the
     // JIT'd design's functions show up in `perf` with real symbols. Emits a
     // jitdump (`$JITDUMPDIR/jit-<pid>.dump`) consumed by `perf inject --jit`.
