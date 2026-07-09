@@ -70,6 +70,34 @@ def gen_regs(n: int, cycles: int, fused: bool, seed: int | None) -> str:
     out.append("endmodule")
     return "\n".join(out) + "\n"
 
+def gen_wideff(n: int, cycles: int) -> str:
+    # One clocked process whose single straight-line block holds N whole-signal
+    # scalar NBAs to independent flops. Isolates NBA *enqueue* overhead: per-signal
+    # lowering enqueues each of the N signals every cycle (O(N)); block-commit
+    # lowering enqueues the one block (O(1)). Self-increment RHS keeps the work
+    # per assignment trivial so enqueue/commit machinery dominates. All state,
+    # the cycle counter, and the finisher share the one block (one process, one
+    # block) so nothing else perturbs the enqueue count.
+    out = []
+    out.append("module top;")
+    out.append("  reg clk = 0;")
+    out.append("  reg [31:0] cyc = 0;")
+    for i in range(n):
+        out.append(f"  reg [31:0] q{i} = 32'd{i * 2654435761 % 4294967296};")
+    out.append("  always #5 clk = ~clk;")
+    out.append("  always @(posedge clk) begin")
+    out.append("    cyc <= cyc + 1;")
+    for i in range(n):
+        out.append(f"    q{i} <= q{i} + 32'd{(i * 40503 + 12345) % 65536 | 1};")
+    xor = " ^ ".join(f"q{i}" for i in range(n))
+    out.append(f"    if (cyc == 32'd{cycles}) begin")
+    out.append(f'      $display("done %h", {xor});')
+    out.append("      $finish;")
+    out.append("    end")
+    out.append("  end")
+    out.append("endmodule")
+    return "\n".join(out) + "\n"
+
 def gen_thunk(n: int, cycles: int, shape: str) -> str:
     out = []
     out.append("module top;")
@@ -381,7 +409,8 @@ def gen_onehot(n: int, cycles: int, order: str) -> str:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("bench", choices=["regs", "tri", "chain", "thunk", "wheel",
-                                      "combchain", "timers", "bigcase", "onehot"])
+                                      "combchain", "timers", "bigcase", "onehot",
+                                      "wideff"])
     ap.add_argument("--n", type=int, required=True)
     ap.add_argument("--cycles", type=int, required=True)
     ap.add_argument("--fused", action="store_true")
@@ -405,5 +434,7 @@ if __name__ == "__main__":
         sys.stdout.write(gen_bigcase(a.n, a.cycles))
     elif a.bench == "onehot":
         sys.stdout.write(gen_onehot(a.n, a.cycles, a.order))
+    elif a.bench == "wideff":
+        sys.stdout.write(gen_wideff(a.n, a.cycles))
     else:
         sys.stdout.write(gen_wheel(a.cycles))
