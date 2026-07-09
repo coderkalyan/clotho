@@ -149,6 +149,7 @@ add_executable(clotho_test
   tests/runtime_test.cpp
   tests/compound_test.cpp
   tests/final_test.cpp
+  tests/comb_fusion_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho doctest::doctest clotho_warnings)
 

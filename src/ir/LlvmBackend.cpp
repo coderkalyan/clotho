@@ -385,6 +385,9 @@ public:
         build_state_types();
         compute_subscription_order();
         compute_fusion_groups(); // before build_wait_queues: bucket capacities count group subscriptions
+        if (std::getenv("CLOTHO_COMB_FUSE_STAT") != nullptr) {
+            report_comb_fuse_stat();
+        }
         build_wait_queues();
         build_sched_flags();
         build_nba_state();
@@ -2073,6 +2076,8 @@ private:
         for (uint32_t k = 0; k < nprocs; ++k) {
             sub_order_[k] = k;
         }
+        wake_adj_.assign(nprocs, {});
+        scc_nontrivial_.assign(nprocs, 0);
         if (nprocs < 2) {
             return;
         }
@@ -2139,9 +2144,10 @@ private:
             }
         }
 
-        // Adjacency, deduplicated with a per-source stamp.
-        std::vector<std::vector<uint32_t>> adj(nprocs);
-        std::vector<uint32_t>              stamp(nprocs, UINT32_MAX);
+        // Adjacency, deduplicated with a per-source stamp. Kept as a member:
+        // the comb-fusion pass reuses these edges for component grouping.
+        std::vector<std::vector<uint32_t>>& adj = wake_adj_;
+        std::vector<uint32_t>               stamp(nprocs, UINT32_MAX);
         for (uint32_t k = 0; k < nprocs; ++k) {
             std::vector<Signal>     writes;
             std::vector<FunctionId> calls;
@@ -2221,6 +2227,19 @@ private:
             }
         }
 
+        // Nontrivial SCC membership (multi-process combinational loop): those
+        // processes have no producer-before-consumer order, so comb fusion
+        // must leave them on the re-wake iteration path.
+        {
+            std::vector<uint32_t> scc_size(nprocs, 0);
+            for (uint32_t k = 0; k < nprocs; ++k) {
+                scc_size[scc_rank[k]]++;
+            }
+            for (uint32_t k = 0; k < nprocs; ++k) {
+                scc_nontrivial_[k] = scc_size[scc_rank[k]] > 1 ? 1 : 0;
+            }
+        }
+
         // Order by longest-path level in the condensation, not by raw SCC
         // number: distinct SCC numbers would also order UNRELATED processes by
         // arbitrary DFS completion, gratuitously shuffling them against
@@ -2288,6 +2307,224 @@ private:
         return true;
     }
 
+    // Comb-fusion eligibility (analysis only — grouping lands with the comb
+    // fusion phase). A member of a union-sensitivity fused group can be run
+    // when its own trigger did NOT fire. Such a spurious run is unobservable —
+    // hence LRM-legal under the as-if rule — only when the body is a pure
+    // deterministic function of its signal reads and every write is
+    // change-detected: unchanged reads recompute unchanged values, and
+    // service_wait_queue skips the wake scan when old == new, so nothing
+    // downstream can tell the run happened. The verdict enumerates exactly the
+    // conditions that argument needs; purity is a whitelist, so a new IR tag
+    // defaults to ineligible.
+    enum class CombFuse : uint8_t {
+        Eligible,
+        // Fails is_simple_always: suspension point, task call, self-sens
+        // write, or not an Always with a static sensitivity.
+        NotSimpleAlways,
+        // Sensitivity has a posedge/negedge entry. Comb fusion is level-only;
+        // edge-triggered members belong to V1 identical-sens fusion.
+        EdgeSensitive,
+        // Body op with an observable effect or non-deterministic value
+        // ($display, file I/O, $random, $time, string ops, ...).
+        ImpureOp,
+        // Function call: purity closure over callees not implemented yet.
+        HasCall,
+        // Nonblocking store: commits in the NBA region, outside the group's
+        // execution, which breaks the internal-signal subscription reasoning.
+        NbaWrite,
+        // Store whose root is a string or unpacked array: those store paths'
+        // change detection is not verified, so the no-change argument does
+        // not (yet) cover them.
+        UnsupportedWrite,
+        // Reads a signal absent from the sensitivity list: a spurious run
+        // would observe a value the unfused schedule never samples (e.g.
+        // explicit `@(a)` reading `b`).
+        ReadOutsideSens,
+        // Count of verdicts, for histogram sizing.
+        Count,
+    };
+
+    CombFuse comb_fuse_verdict(const Process& p) const {
+        if (!is_simple_always(p)) {
+            return CombFuse::NotSimpleAlways;
+        }
+        for (const WaitEvent& w : p.wait_events) {
+            if (w.edge != Edge::Any) {
+                return CombFuse::EdgeSensitive;
+            }
+        }
+        std::vector<uint32_t> reads;
+        for (size_t k = 0; k < p.ir.inst_count(); ++k) {
+            const auto idx = static_cast<Index>(k);
+            switch (p.ir.tag(idx)) {
+                // Pure value and control ops: no effect beyond their result.
+                case Inst::Tag::Constant:
+                case Inst::Tag::Arg:
+                case Inst::Tag::Signal:
+                case Inst::Tag::Local:
+                case Inst::Tag::BitSelect:
+                case Inst::Tag::PartSelect:
+                case Inst::Tag::DynPartSelect:
+                case Inst::Tag::ElemSelect:
+                case Inst::Tag::Add:
+                case Inst::Tag::Sub:
+                case Inst::Tag::Mul:
+                case Inst::Tag::Div:
+                case Inst::Tag::Mod:
+                case Inst::Tag::Pow:
+                case Inst::Tag::Band:
+                case Inst::Tag::Bor:
+                case Inst::Tag::Bxor:
+                case Inst::Tag::Bxnor:
+                case Inst::Tag::Bnot:
+                case Inst::Tag::RedAnd:
+                case Inst::Tag::RedOr:
+                case Inst::Tag::RedXor:
+                case Inst::Tag::Ctz:
+                case Inst::Tag::Clz:
+                case Inst::Tag::Sll:
+                case Inst::Tag::Srl:
+                case Inst::Tag::Sra:
+                case Inst::Tag::Eq:
+                case Inst::Tag::Ne:
+                case Inst::Tag::Lt:
+                case Inst::Tag::Le:
+                case Inst::Tag::Gt:
+                case Inst::Tag::Ge:
+                case Inst::Tag::CaseEq:
+                case Inst::Tag::CasezEq:
+                case Inst::Tag::CasexEq:
+                case Inst::Tag::WildEq:
+                case Inst::Tag::FAdd:
+                case Inst::Tag::FSub:
+                case Inst::Tag::FMul:
+                case Inst::Tag::FDiv:
+                case Inst::Tag::FPow:
+                case Inst::Tag::FNeg:
+                case Inst::Tag::FEq:
+                case Inst::Tag::FNe:
+                case Inst::Tag::FLt:
+                case Inst::Tag::FLe:
+                case Inst::Tag::FGt:
+                case Inst::Tag::FGe:
+                case Inst::Tag::ItoF:
+                case Inst::Tag::FtoI:
+                case Inst::Tag::FtoITrunc:
+                case Inst::Tag::FBitcast:
+                case Inst::Tag::FResize:
+                case Inst::Tag::RealMath:
+                case Inst::Tag::Land:
+                case Inst::Tag::Lor:
+                case Inst::Tag::Lnot:
+                case Inst::Tag::Select:
+                case Inst::Tag::SelectLazy:
+                case Inst::Tag::Concat:
+                case Inst::Tag::Repl:
+                case Inst::Tag::Resize:
+                case Inst::Tag::Cond:
+                case Inst::Tag::Switch:
+                case Inst::Tag::Loop:
+                case Inst::Tag::Break:
+                case Inst::Tag::Continue:
+                case Inst::Tag::Clog2:
+                    break;
+                case Inst::Tag::Load: {
+                    const LvalueRoot r = lvalue_root(p.ir, p.ir.payload(idx).unary);
+                    if (p.ir.tag(r.root) == Inst::Tag::Signal) {
+                        reads.push_back(static_cast<uint32_t>(p.ir.payload(r.root).signal));
+                    }
+                    break;
+                }
+                case Inst::Tag::Store: {
+                    const LvalueRoot r = lvalue_root(p.ir, p.ir.payload(idx).binary.l);
+                    if (p.ir.tag(r.root) != Inst::Tag::Signal) {
+                        break;
+                    }
+                    const auto  sig = static_cast<uint32_t>(p.ir.payload(r.root).signal);
+                    const auto& ty  = std::get<Type>(mod_.pool.get(mod_.signals()[sig].type));
+                    if (ty.kind == Type::Kind::String || ty.kind == Type::Kind::UnpackedArray) {
+                        return CombFuse::UnsupportedWrite;
+                    }
+                    break;
+                }
+                case Inst::Tag::StoreNb:
+                    return CombFuse::NbaWrite;
+                case Inst::Tag::Call:
+                    return CombFuse::HasCall;
+                default:
+                    return CombFuse::ImpureOp;
+            }
+        }
+        // Every read signal must be in the sensitivity list, else a spurious
+        // run observes state the unfused schedule never samples. Verified here
+        // rather than trusting the frontend's inference: explicit lists and
+        // any inference gap fail mechanically.
+        for (const uint32_t s : reads) {
+            bool in_sens = false;
+            for (const WaitEvent& w : p.wait_events) {
+                if (static_cast<uint32_t>(w.signal) == s) {
+                    in_sens = true;
+                    break;
+                }
+            }
+            if (!in_sens) {
+                return CombFuse::ReadOutsideSens;
+            }
+        }
+        return CombFuse::Eligible;
+    }
+
+    // Comb-fusion coverage probe: verdict histogram over Always processes plus
+    // the count V1 fusion left in singleton groups (the comb-fusion
+    // opportunity). Measurement only, printed when CLOTHO_COMB_FUSE_STAT is
+    // set; the grouping itself is not landed.
+    void report_comb_fuse_stat() const {
+        const auto all = mod_.processes();
+        uint64_t   counts[static_cast<size_t>(CombFuse::Count)] = {};
+        uint64_t   always = 0, singleton_eligible = 0;
+        for (uint32_t k = 0; k < all.size(); ++k) {
+            if (all[k].activation != Activation::Always) {
+                continue;
+            }
+            ++always;
+            const CombFuse v = comb_fuse_verdict(all[k]);
+            counts[static_cast<size_t>(v)]++;
+            if (v == CombFuse::Eligible && groups_[group_of_[k]].size() == 1) {
+                ++singleton_eligible;
+            }
+        }
+        std::fprintf(stderr,
+                     "comb-fuse: %llu/%llu always procs eligible (%llu unfused singletons); "
+                     "excluded: not-simple=%llu edge=%llu impure=%llu call=%llu nba=%llu "
+                     "write=%llu read!sens=%llu\n",
+                     (unsigned long long)counts[static_cast<size_t>(CombFuse::Eligible)],
+                     (unsigned long long)always, (unsigned long long)singleton_eligible,
+                     (unsigned long long)counts[static_cast<size_t>(CombFuse::NotSimpleAlways)],
+                     (unsigned long long)counts[static_cast<size_t>(CombFuse::EdgeSensitive)],
+                     (unsigned long long)counts[static_cast<size_t>(CombFuse::ImpureOp)],
+                     (unsigned long long)counts[static_cast<size_t>(CombFuse::HasCall)],
+                     (unsigned long long)counts[static_cast<size_t>(CombFuse::NbaWrite)],
+                     (unsigned long long)counts[static_cast<size_t>(CombFuse::UnsupportedWrite)],
+                     (unsigned long long)counts[static_cast<size_t>(CombFuse::ReadOutsideSens)]);
+        if (!comb_group_sizes_.empty()) {
+            uint64_t members = 0, mx = 0;
+            for (const uint32_t s : comb_group_sizes_) {
+                members += s;
+                mx = std::max<uint64_t>(mx, s);
+            }
+            std::fprintf(stderr, "comb-fuse: %zu comb groups, %llu members (max %llu): ",
+                         comb_group_sizes_.size(), (unsigned long long)members,
+                         (unsigned long long)mx);
+            std::vector<uint32_t> sorted(comb_group_sizes_.begin(), comb_group_sizes_.end());
+            std::sort(sorted.rbegin(), sorted.rend());
+            for (size_t i = 0; i < sorted.size() && i < 24; ++i) {
+                std::fprintf(stderr, "%u ", sorted[i]);
+            }
+            std::fprintf(stderr, "%s\n", sorted.size() > 24 ? "..." : "");
+        }
+    }
+
     // V1 static process fusion: partition processes into groups that lower to a
     // single coroutine each. A group's members share an identical canonical
     // sensitivity set and self_start flag, so the fused wake set equals every
@@ -2350,6 +2587,144 @@ private:
             groups_.push_back({ k });
         }
 
+        // Comb fusion: merge dependent comb-eligible singletons into
+        // rank-contiguous chunks running producer-before-consumer in one
+        // activation, subscribed to the union sensitivity (see
+        // docs/design/comb-fusion.md for the LRM as-if argument). Two facts
+        // carry the legality: the sched flag is held across the fused body,
+        // so an intra-group store cannot re-enqueue the group (the downstream
+        // member already runs later in the same activation with final
+        // values); and change detection makes a spuriously-run member (pure,
+        // reads unchanged) write no changes and wake nobody. Grouping is by
+        // connected component of the wake graph so independent cones are
+        // never yoked together (a union sensitivity across unrelated cones
+        // would run every body per trigger); nontrivial SCCs (comb loops)
+        // keep re-wake fixpoint iteration.
+        if (config_.fuse && config_.comb_fuse && nprocs >= 2) {
+            std::vector<uint8_t> cand(nprocs, 0);
+            for (const auto& g : groups_) {
+                if (g.size() != 1) {
+                    continue;
+                }
+                const uint32_t k = g.front();
+                if (scc_nontrivial_[k] == 0 && comb_fuse_verdict(all[k]) == CombFuse::Eligible) {
+                    cand[k] = 1;
+                }
+            }
+            // Interior guard: only members whose ENTIRE sensitivity is
+            // candidate-written may merge. A member with a private external
+            // trigger (e.g. star fan-out: `assign c_i = s ^ x_i` with hot
+            // x_i) would drag the whole group awake on every private change —
+            // measured 10.9x slower than unfused on a 256-consumer star.
+            // Interior members wake only via changes propagating through the
+            // component, which is exactly the wave the fused topo order
+            // replaces. Non-interior candidates stay singletons but still
+            // provide edges/writes (their stores wake the groups they feed).
+            std::vector<uint8_t> cand_writes(static_cast<uint32_t>(mod_.signals().size()), 0);
+            for (uint32_t k = 0; k < nprocs; ++k) {
+                if (cand[k] == 0) {
+                    continue;
+                }
+                const Ir& ir = all[k].ir;
+                for (size_t j = 0; j < ir.inst_count(); ++j) {
+                    const auto idx = static_cast<Index>(j);
+                    if (ir.tag(idx) != Inst::Tag::Store) {
+                        continue;
+                    }
+                    const LvalueRoot r = lvalue_root(ir, ir.payload(idx).binary.l);
+                    if (ir.tag(r.root) == Inst::Tag::Signal) {
+                        cand_writes[static_cast<uint32_t>(ir.payload(r.root).signal)] = 1;
+                    }
+                }
+            }
+            std::vector<uint8_t> interior(nprocs, 0);
+            for (uint32_t k = 0; k < nprocs; ++k) {
+                if (cand[k] == 0) {
+                    continue;
+                }
+                interior[k] = 1;
+                for (const WaitEvent& w : all[k].wait_events) {
+                    if (cand_writes[static_cast<uint32_t>(w.signal)] == 0) {
+                        interior[k] = 0;
+                        break;
+                    }
+                }
+            }
+            // Union-find over wake edges between candidates. self_start must
+            // match: the group makes one seed decision (comb populations are
+            // uniformly self_start in practice; a mismatch just splits).
+            std::vector<uint32_t> uf(nprocs);
+            for (uint32_t k = 0; k < nprocs; ++k) {
+                uf[k] = k;
+            }
+            const auto find = [&](uint32_t x) {
+                while (uf[x] != x) {
+                    uf[x] = uf[uf[x]];
+                    x     = uf[x];
+                }
+                return x;
+            };
+            for (uint32_t k = 0; k < nprocs; ++k) {
+                if (cand[k] == 0) {
+                    continue;
+                }
+                for (const uint32_t q : wake_adj_[k]) {
+                    if (cand[q] != 0 && all[q].self_start == all[k].self_start) {
+                        uf[find(k)] = find(q);
+                    }
+                }
+            }
+            // Component members in scheduled-rank order (sub_order_ iteration
+            // yields them pre-sorted), then chunked at the group cap; a
+            // leftover chunk of one stays a singleton. Only interior members
+            // merge; components are still discovered over all candidates so
+            // two interior members joined through a non-interior producer
+            // land in one group.
+            std::vector<std::vector<uint32_t>> comp(nprocs);
+            for (const uint32_t k : sub_order_) {
+                if (interior[k] != 0) {
+                    comp[find(k)].push_back(k);
+                }
+            }
+            bool merged = false;
+            comb_group_sizes_.clear();
+            for (const auto& c : comp) {
+                for (size_t off = 0; off + 1 < c.size(); off += group_cap) {
+                    const size_t end = std::min(c.size(), off + group_cap);
+                    if (end - off < 2) {
+                        break;
+                    }
+                    const uint32_t g0 = group_of_[c[off]];
+                    for (size_t j = off + 1; j < end; ++j) {
+                        const uint32_t m = c[j];
+                        groups_[group_of_[m]].clear();
+                        groups_[g0].push_back(m);
+                        group_of_[m] = g0;
+                        merged       = true;
+                    }
+                    comb_group_sizes_.push_back(static_cast<uint32_t>(end - off));
+                }
+            }
+            // Compact the emptied singleton slots.
+            if (merged) {
+                std::vector<uint32_t> remap(groups_.size(), 0);
+                uint32_t              w = 0;
+                for (uint32_t g = 0; g < groups_.size(); ++g) {
+                    if (!groups_[g].empty()) {
+                        remap[g] = w;
+                        if (w != g) {
+                            groups_[w] = std::move(groups_[g]);
+                        }
+                        ++w;
+                    }
+                }
+                groups_.resize(w);
+                for (uint32_t k = 0; k < nprocs; ++k) {
+                    group_of_[k] = remap[group_of_[k]];
+                }
+            }
+        }
+
         // Members run in scheduled-rank order (the order the unfused FIFO would
         // have popped them); the group subscribes at its earliest member's rank.
         group_events_.resize(groups_.size());
@@ -2360,9 +2735,15 @@ private:
                 group_events_[g] = all[groups_[g].front()].wait_events;
                 continue;
             }
-            // Fused: subscribe the canonical deduped set once (wait_counts sizes
-            // the buckets to match).
-            for (const auto& [s, e] : canonical(all[groups_[g].front()].wait_events)) {
+            // Fused: subscribe the canonical deduped union of member events
+            // once (wait_counts sizes the buckets to match). For V1 groups
+            // the union equals the front member's set; comb groups need the
+            // true union.
+            std::vector<WaitEvent> evs;
+            for (const uint32_t m : groups_[g]) {
+                evs.insert(evs.end(), all[m].wait_events.begin(), all[m].wait_events.end());
+            }
+            for (const auto& [s, e] : canonical(evs)) {
                 group_events_[g].push_back(WaitEvent{ static_cast<Signal>(s), static_cast<Edge>(e) });
             }
         }
@@ -7458,6 +7839,15 @@ private:
     uint32_t                            active_mask_       = 0;
     // Process indices in static-subscription order (compute_subscription_order).
     std::vector<uint32_t>               sub_order_;
+    // Blocking-write wake graph (writer -> statically-subscribed reader) and
+    // per-process membership in a nontrivial SCC (a multi-process
+    // combinational loop), both retained by compute_subscription_order for
+    // the comb-fusion pass in compute_fusion_groups.
+    std::vector<std::vector<uint32_t>>  wake_adj_;
+    std::vector<uint8_t>                scc_nontrivial_;
+    // Sizes of the groups the comb-fusion pass formed (measurement only, for
+    // the CLOTHO_COMB_FUSE_STAT probe).
+    std::vector<uint32_t>               comb_group_sizes_;
     // Fusion groups (compute_fusion_groups): each group lowers to one
     // coroutine. groups_[g] lists member process indices in scheduled-rank
     // order; group_of_ maps a process to its group; group_events_[g] is the
