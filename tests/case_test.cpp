@@ -870,3 +870,94 @@ TEST_CASE("plain if: no match, no else is silent") {
     )";
     CHECK(run_capture_stderr(src).empty());
 }
+
+// More than one condition true is a uniqueness violation; the first true arm
+// still runs.
+TEST_CASE("unique if: overlapping conditions report and run the first") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] a;
+            initial begin
+                a = 4'b1001;
+                unique if (a[0]) $display("lo"); else if (a[3]) $display("hi");
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).find("not unique") != std::string::npos);
+    CHECK(run_capture(src) == "lo\n");  // first true arm wins despite the violation
+}
+
+// Exactly one condition true: no violation.
+TEST_CASE("unique if: exactly one true condition is silent") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] a;
+            initial begin
+                a = 4'b0001;
+                unique if (a[0]) $display("lo"); else if (a[3]) $display("hi");
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).empty());
+    CHECK(run_capture(src) == "lo\n");
+}
+
+// unique reports a no-match (no condition true, no final else) like priority.
+TEST_CASE("unique if: no true condition, no else reports a no-match") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] a;
+            initial begin
+                a = 4'b0100;
+                unique if (a[0]) $display("lo"); else if (a[3]) $display("hi");
+            end
+        endmodule
+    )";
+    const std::string err = run_capture_stderr(src);
+    CHECK(err.find("no condition is true") != std::string::npos);
+    CHECK(err.find("not unique") == std::string::npos);
+}
+
+// unique0 does NOT report a no-match (LRM 12.4.2: zero true is legal).
+TEST_CASE("unique0 if: no true condition is silent") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] a;
+            initial begin
+                a = 4'b0100;
+                unique0 if (a[0]) $display("lo"); else if (a[3]) $display("hi");
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).empty());
+}
+
+// unique0 reports overlap (only its no-match check differs from unique).
+TEST_CASE("unique0 if: overlapping conditions report") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] a;
+            initial begin
+                a = 4'b1001;
+                unique0 if (a[0]) $display("lo"); else if (a[3]) $display("hi");
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).find("not unique") != std::string::npos);
+}
+
+// A final else suppresses the unique no-match report (it always matches); no
+// overlap arises when at most one condition is true.
+TEST_CASE("unique if: a final else suppresses the no-match report") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] a;
+            initial begin
+                a = 4'b0100;
+                unique if (a[0]) $display("lo"); else if (a[3]) $display("hi"); else $display("d");
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).empty());
+    CHECK(run_capture(src) == "d\n");
+}

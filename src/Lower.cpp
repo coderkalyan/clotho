@@ -1966,15 +1966,105 @@ private:
     }
 
     void lower_conditional(const ConditionalStatement& c, ir::Builder& b) {
-        // priority-if (LRM 12.4.2): a violation is reported if no condition is
-        // true and the chain has no explicit final else. Execution (ordered
-        // first-match) is identical to a plain if, so only the report is added,
-        // at the terminal else of the chain. unique / unique0 overlap reports on
-        // `if` are still TODO (execution is already conforming).
-        const bool report_no_match = c.check == slang::ast::UniquePriorityCheck::Priority &&
-                                     !chain_has_final_else(c);
+        // unique / unique0 / priority on `if` add the LRM 12.4.2 violation checks;
+        // execution (ordered first-match) is identical to a plain if.
+        //   - priority / unique: no-match report when no condition is true and the
+        //     chain has no explicit final else (kind 0). unique0 stays silent.
+        //   - unique / unique0: overlap report when >1 condition is true (kind 1).
+        using Check = slang::ast::UniquePriorityCheck;
+        if (c.check == Check::Unique || c.check == Check::Unique0) {
+            lower_unique_if(c, b);
+            return;
+        }
+        // priority (or the plain None case, which sets no flag): the lazy chain
+        // with a no-match report threaded to its terminal.
+        const bool report_no_match = c.check == Check::Priority && !chain_has_final_else(c);
         lower_if_chain(c, report_no_match, report_no_match ? banner_at(c.sourceRange.start()) : std::string{},
                        loc(c), b);
+    }
+
+    // One arm of a collected if / else-if chain: the condition and the statement
+    // it guards.
+    struct IfArm {
+        const Expression* cond;
+        const Statement*  body;
+    };
+
+    // Eager lowering for unique / unique0 `if` (LRM 12.4.2). The else-if spine is
+    // collected into arms, every arm predicate is evaluated once up front (the
+    // LRM permits any-order eager evaluation for unique/unique0 and requires
+    // continuing past the first true condition to detect overlap), and the temps
+    // are reused for the overlap check and the first-match dispatch. Mirrors the
+    // case path (lower_case_unique) over if arms instead of case items.
+    void lower_unique_if(const ConditionalStatement& c, ir::Builder& b) {
+        using Check = slang::ast::UniquePriorityCheck;
+
+        // Walk the ifFalse spine, collecting each same-series arm. The spine ends
+        // at a null ifFalse (no final else) or a non-continuation statement (a
+        // plain else body, a begin-end block, or a nested new-series if) — that
+        // trailing statement becomes the final else.
+        std::vector<IfArm> arms;
+        const Statement*   final_else = nullptr;
+        const ConditionalStatement* cur = &c;
+        for (;;) {
+            if (cur->conditions.size() != 1) {
+                fail("unsupported multi-condition if");
+            }
+            if (cur->conditions[0].pattern != nullptr) {
+                fail("pattern matching in conditions is not supported");
+            }
+            arms.push_back({ &*cur->conditions[0].expr, &cur->ifTrue });
+            if (cur->ifFalse == nullptr) {
+                break;
+            }
+            const auto* nested = cur->ifFalse->as_if<ConditionalStatement>();
+            if (nested == nullptr || nested->check != Check::None) {
+                final_else = cur->ifFalse;
+                break;
+            }
+            cur = nested;
+        }
+
+        // unique reports a no-match (no arm true, no final else); unique0 does not.
+        const bool no_match_report = c.check == Check::Unique && final_else == nullptr;
+        const std::string   banner = banner_at(c.sourceRange.start());
+        const ir::SourceLoc rloc   = loc(c);
+
+        std::vector<ir::Index> preds;
+        preds.reserve(arms.size());
+        for (const IfArm& arm : arms) {
+            preds.push_back(lower_predicate(*arm.cond, b));
+        }
+
+        emit_overlap_check(preds, banner, rloc, b);
+        dispatch_if_arms(arms, 0, preds, final_else, no_match_report, banner, rloc, b);
+    }
+
+    // First-match dispatch for a unique/unique0 if, reusing the precomputed
+    // predicate temps: arm k's body runs when preds[k] is the first true one. The
+    // terminal (no arm true) runs the final else, else emits the no-match report
+    // when requested (unique, no final else).
+    void dispatch_if_arms(const std::vector<IfArm>& arms, size_t k, const std::vector<ir::Index>& preds,
+                          const Statement* final_else, bool no_match_report, const std::string& banner,
+                          ir::SourceLoc rloc, ir::Builder& b) {
+        if (k == arms.size()) {
+            if (final_else != nullptr) {
+                lower_stmt(*final_else, b);
+            }
+            else if (no_match_report) {
+                b.case_violation(banner, 0, rloc);
+            }
+            return;
+        }
+        b.open_region();
+        lower_stmt(*arms[k].body, b);
+        const ir::ExtraSlice then_region = b.close_region();
+
+        b.open_region();
+        dispatch_if_arms(arms, k + 1, preds, final_else, no_match_report, banner, rloc, b);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        b.cond(preds[k], then_region, else_region, loc(*arms[k].body));
     }
 
     // Lower an if / else-if chain. When `report_no_match` is set (a default-less
@@ -2779,26 +2869,31 @@ private:
             preds.push_back(pred);
         }
 
-        // Overlap = (sum of the 1-bit predicates) > 1. A 32-bit accumulator holds
-        // any realistic item count; the predicates are definite 2-state (=== never
-        // yields x), so the zero-extended sum is exact.
-        const ir::Ref       sumty = make_int_type(32, false, false);
-        const ir::SourceLoc cloc  = loc(c);
-        ir::Index       sum   = b.resize(preds[0], sumty, cloc);
-        for (size_t k = 1; k < n; k++) {
-            sum = b.binary(ir::Inst::Tag::Add, sum, b.resize(preds[k], sumty, cloc), cloc);
+        emit_overlap_check(preds, case_banner(c), loc(c), b);
+        dispatch_preds(c, 0, preds, no_match_report, b);
+    }
+
+    // Emit the unique/unique0 overlap check (LRM 12.5.3 / 12.4.2) from precomputed
+    // 1-bit predicate temps: sum them and, on an unlikely branch, report a kind-1
+    // violation when more than one matched. The predicates are definite 2-state
+    // (=== / a reduced if-condition never yields x), so the zero-extended 32-bit
+    // sum is exact for any realistic arm count. Shared by the case and if paths.
+    void emit_overlap_check(const std::vector<ir::Index>& preds, const std::string& banner,
+                            ir::SourceLoc rloc, ir::Builder& b) {
+        const ir::Ref sumty = make_int_type(32, false, false);
+        ir::Index     sum   = b.resize(preds[0], sumty, rloc);
+        for (size_t k = 1; k < preds.size(); k++) {
+            sum = b.binary(ir::Inst::Tag::Add, sum, b.resize(preds[k], sumty, rloc), rloc);
         }
-        const ir::Index one_c   = b.constant(module_.pool.put_int(sumty, 1), cloc);
-        const ir::Index overlap = b.binary(ir::Inst::Tag::Gt, sum, one_c, cloc);
+        const ir::Index one_c   = b.constant(module_.pool.put_int(sumty, 1), rloc);
+        const ir::Index overlap = b.binary(ir::Inst::Tag::Gt, sum, one_c, rloc);
 
         b.open_region();
-        b.case_violation(case_banner(c), 1, cloc);
+        b.case_violation(banner, 1, rloc);
         const ir::ExtraSlice report_region = b.close_region();
         b.open_region();
         const ir::ExtraSlice empty_region = b.close_region();
-        b.cond(overlap, report_region, empty_region, cloc, /*unlikely=*/true);
-
-        dispatch_preds(c, 0, preds, no_match_report, b);
+        b.cond(overlap, report_region, empty_region, rloc, /*unlikely=*/true);
     }
 
     // First-match dispatch for a unique/unique0 case, reusing the precomputed
