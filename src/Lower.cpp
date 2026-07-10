@@ -5511,8 +5511,16 @@ private:
         for (const FormalArgumentSymbol* fa : sub.getArguments()) {
             const auto dir = fa->direction;
             if (dir == slang::ast::ArgumentDirection::Ref) {
-                // TODO: ref arguments — live aliasing of the actual through the body.
-                fail("subroutines with ref arguments are not supported");
+                // ref / const ref (LRM 13.5.2): the formal aliases the actual's live
+                // storage through a passed pointer (see build_function / build_task
+                // and the backend ref ABI). Supported for packed integral formals
+                // (scalar / packed vector) in functions and tasks.
+                if (!fa->getType().getCanonicalType().isIntegral()) {
+                    // TODO: ref of unpacked array / struct / string / real — needs a
+                    // handle pass or offset plumbing, not the packed-slot pointer ABI.
+                    fail("ref arguments are only supported for packed integral types");
+                }
+                continue;
             }
             if (!is_task && dir != slang::ast::ArgumentDirection::In) {
                 // A function copies no arguments back; only tasks carry out/inout.
@@ -5538,7 +5546,7 @@ private:
         return id;
     }
 
-    // Map a slang argument direction to the IR direction (ref is rejected upstream).
+    // Map a slang argument direction to the IR direction.
     static ir::ArgDir to_arg_dir(slang::ast::ArgumentDirection dir) {
         switch (dir) {
             case slang::ast::ArgumentDirection::In:
@@ -5547,6 +5555,8 @@ private:
                 return ir::ArgDir::Out;
             case slang::ast::ArgumentDirection::InOut:
                 return ir::ArgDir::Inout;
+            case slang::ast::ArgumentDirection::Ref:
+                return ir::ArgDir::Ref;
             default:
                 return ir::ArgDir::In;
         }
@@ -5611,16 +5621,24 @@ private:
         saved_blocks.swap(named_blocks_);
         ir::Builder      b(module_.pool);
         std::vector<ir::Ref> param_types;
+        std::vector<ir::ArgDir> arg_dirs;
 
         // Parameters: copy each Arg into the formal's Local at entry, so the body
-        // reads / writes the formal as ordinary frame storage.
+        // reads / writes the formal as ordinary frame storage. A ref formal aliases
+        // the actual's storage (the backend redirects its Local to the passed
+        // pointer), so it takes no Arg copy — but still allocates its Local (formal
+        // k == Local k) and records its direction.
         for (const FormalArgumentSymbol* fa : sub.getArguments()) {
             const ir::Ref       pty = lower_type(fa->getType());
             const ir::SourceLoc fl  = to_source_loc(fa->location);
             const auto          pos = static_cast<uint32_t>(param_types.size());
             param_types.push_back(pty);
+            const ir::ArgDir dir = to_arg_dir(fa->direction);
+            arg_dirs.push_back(dir);
             const uint32_t idx = fn_local(*fa);
-            b.binary(ir::Inst::Tag::Store, b.local(idx, pty, fl), b.arg(pos, pty, fl), fl);
+            if (dir != ir::ArgDir::Ref) {
+                b.binary(ir::Inst::Tag::Store, b.local(idx, pty, fl), b.arg(pos, pty, fl), fl);
+            }
         }
 
         if (!is_void) {
@@ -5643,6 +5661,7 @@ private:
         module_.set_function(id, ir::Function{ .name        = std::string(sub.name),
                                                .return_type = return_type,
                                                .param_types = std::move(param_types),
+                                               .arg_dirs    = std::move(arg_dirs),
                                                .local_types = std::move(ctx.local_types),
                                                .ir          = b.finish() });
         named_blocks_.swap(saved_blocks);
@@ -5676,6 +5695,10 @@ private:
         std::vector<ir::Index> args;
         args.reserve(actuals.size());
         for (size_t i = 0; i < formals.size(); ++i) {
+            if (formals[i]->direction == slang::ast::ArgumentDirection::Ref) {
+                args.push_back(lower_ref_actual(*actuals[i], b));
+                continue;
+            }
             const ir::Ref pty = lower_type(formals[i]->getType());
             // A string actual passes as-is (no width to resize to); the callee's
             // copy-in gives value semantics.
@@ -5716,6 +5739,10 @@ private:
         args.reserve(formals.size());
         for (size_t i = 0; i < formals.size(); ++i) {
             const ir::Ref pty = lower_type(formals[i]->getType());
+            if (formals[i]->direction == slang::ast::ArgumentDirection::Ref) {
+                args.push_back(lower_ref_actual(*actuals[i], b));
+                continue;
+            }
             if (formals[i]->direction == slang::ast::ArgumentDirection::In) {
                 args.push_back(is_string_ref(pty)
                                  ? lower_expr(*actuals[i], b)
@@ -5745,6 +5772,24 @@ private:
             const ir::Index tv  = b.unary(ir::Inst::Tag::Load, oc.temp, l);
             b.binary(ir::Inst::Tag::Store, dst, coerce(tv, *oc.formal_ty, oc.actual_ty, b, l), l);
         }
+    }
+
+    // Lower a ref actual (LRM 13.5.2) to its lvalue leaf: the backend passes one
+    // pointer to the actual's storage and the callee aliases it live. This chunk
+    // supports a whole-variable actual only; a bit / part-select or array-element
+    // ref needs a sub-slot pointer with offset plumbing.
+    ir::Index lower_ref_actual(const Expression& actual, ir::Builder& b) {
+        const Expression* a = &actual;
+        // slang may wrap a ref actual in an AssignmentExpression (as for out/inout);
+        // unwrap to the bound lvalue.
+        if (a->kind == ExpressionKind::Assignment) {
+            a = &a->as<AssignmentExpression>().left();
+        }
+        if (a->kind != ExpressionKind::NamedValue && a->kind != ExpressionKind::HierarchicalValue) {
+            // TODO: ref actual that is a bit/part-select or array element.
+            fail("ref argument actual must be a whole variable");
+        }
+        return lower_lvalue(*a, b);
     }
 
     // A fresh, anonymous storage cell for an output / inout task argument, returned

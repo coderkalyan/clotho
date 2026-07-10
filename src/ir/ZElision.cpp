@@ -285,11 +285,22 @@ struct Analysis {
                     }
                     break;
                 case Inst::Tag::Call: {
-                    const CallInfo               ci   = ir.extra_data<CallInfo>(p.extra);
-                    FnState&                     cs   = fns[static_cast<uint32_t>(ci.func)];
-                    const std::span<const Index> args = ir.region(ci.args);
+                    const CallInfo               ci     = ir.extra_data<CallInfo>(p.extra);
+                    const Function&              callee = m.function(ci.func);
+                    FnState&                     cs     = fns[static_cast<uint32_t>(ci.func)];
+                    const std::span<const Index> args   = ir.region(ci.args);
                     for (size_t k = 0; k < args.size(); ++k) {
-                        if (z_of(args[k]) != 0) {
+                        // A ref formal aliases the actual's storage live (like a task
+                        // inout): the callee reads its z on entry and any z it writes
+                        // through the ref lands in the actual (LRM 13.5.2).
+                        if (!callee.arg_dirs.empty() && callee.arg_dirs[k] == ArgDir::Ref) {
+                            if (storage_z(ir, fn, args[k])) {
+                                mark(cs.param_z[k]);
+                            }
+                            if (cs.local_z[k] != 0) {
+                                store_into(ir, fn, args[k], true);
+                            }
+                        } else if (z_of(args[k]) != 0) {
                             mark(cs.param_z[k]);
                         }
                     }
@@ -304,11 +315,13 @@ struct Analysis {
                     for (size_t k = 0; k < args.size(); ++k) {
                         const ArgDir dir = callee.arg_dirs[k];
                         // Copy-in reads the actual's value (In) or storage (Inout);
-                        // copy-out writes the formal's frame local back (Out/Inout).
+                        // copy-out writes the formal's frame local back (Out/Inout). A
+                        // ref formal reads the actual's storage on entry and writes any
+                        // z it produces straight back (live), like an inout.
                         if (dir == ArgDir::In && z_of(args[k]) != 0) {
                             mark(cs.param_z[k]);
                         }
-                        if (dir == ArgDir::Inout && storage_z(ir, fn, args[k])) {
+                        if ((dir == ArgDir::Inout || dir == ArgDir::Ref) && storage_z(ir, fn, args[k])) {
                             mark(cs.param_z[k]);
                         }
                         if (dir != ArgDir::In && cs.local_z[k] != 0) {
