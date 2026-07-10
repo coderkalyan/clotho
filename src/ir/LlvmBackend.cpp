@@ -5226,6 +5226,7 @@ private:
 
             case Inst::Tag::Store:
             case Inst::Tag::StoreNb:
+            case Inst::Tag::AggCopy:
             case Inst::Tag::Cond:
             case Inst::Tag::Switch:
             case Inst::Tag::Loop:
@@ -5559,6 +5560,19 @@ private:
                 } else {
                     lower_store_nb(lv, rhs);
                 }
+                return;
+            }
+            case Inst::Tag::AggCopy: {
+                // Whole-object blocking copy: one memcpy of the aggregate storage.
+                // The frontend emits this only for a string-free aggregate, so the
+                // byte image is the value (no heap-owning leaf to deep-copy).
+                const auto   info = ir_->extra_data<AggCopyInfo>(p.op_extra.extra);
+                llvm::Value* dst  = agg_slot_ptr(lvalue_of(p.op_extra.op));
+                llvm::Value* src  = agg_slot_ptr(lvalue_of(info.src));
+                llvm::Type*  st   = agg_storage_ty(info.type);
+                const auto   sz   = llmod_.getDataLayout().getTypeAllocSize(st);
+                const auto   al   = llmod_.getDataLayout().getABITypeAlign(st);
+                b_.CreateMemCpy(dst, al, src, al, sz);
                 return;
             }
 

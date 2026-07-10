@@ -821,6 +821,21 @@ private:
         return t.getCanonicalType().isUnpackedStruct();
     }
 
+    // True if a type contains an unpacked struct at any nesting depth (a bare
+    // struct or an unpacked array whose leaf is one): it is backed by the
+    // recursive aggregate model, so whole-object assignment / initialization
+    // routes through the aggregate copy path, not the flat scalar/array path.
+    static bool is_aggregate(const slang::ast::Type& t) {
+        const slang::ast::Type& ct = t.getCanonicalType();
+        if (ct.isUnpackedStruct()) {
+            return true;
+        }
+        if (const auto* arr = ct.as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
+            return is_aggregate(arr->elementType);
+        }
+        return false;
+    }
+
     // Store a whole unpacked struct: one blocking store per member (the aggregate
     // has no flat value, so a whole-object copy decomposes field-wise). `lhs_base`
     // is the struct's lvalue; `sty` its interned Kind::Struct type. The RHS is
@@ -858,24 +873,48 @@ private:
             b.binary(tag, lhs, lower_expr(rhs, b), l);
             return;
         }
-        // Aggregate RHS: another struct/array lvalue, copied member-by-member.
+        // Aggregate RHS: another struct/array lvalue.
         const Expression& src = unwrap_conversion(rhs);
         if (!is_struct_lvalue_shape(src)) {
             fail("unsupported unpacked struct rvalue (only '{...} patterns and struct "
                  "variables are supported)");
         }
-        emit_agg_copy(lhs, lower_lvalue(src, b), type, tag, b, l);
+        const ir::Index src_lv = lower_lvalue(src, b);
+        // A blocking copy of a string-free aggregate is a single memcpy of the
+        // storage (the byte image is the value). A string leaf owns a heap buffer,
+        // so a string-containing aggregate must copy per-leaf (string stores
+        // deep-copy); a nonblocking copy always decomposes per-leaf (it defers).
+        if (tag == ir::Inst::Tag::Store && is_string_free(type)) {
+            b.agg_copy(lhs, src_lv, type, l);
+            return;
+        }
+        emit_agg_copy(lhs, src_lv, type, tag, b, l);
     }
 
-    // Member-by-member copy of one aggregate lvalue into another (both of `type`),
-    // recursing structs to leaves. Array members are guarded.
+    // Per-leaf copy of one aggregate lvalue into another (both of `type`),
+    // recursing structs and (for a blocking copy) unrolling arrays. Reached only
+    // for a string-containing aggregate or a nonblocking copy; a nonblocking
+    // whole-array copy is guarded (element-wise deferral is a follow-up).
     void emit_agg_copy(ir::Index lhs, ir::Index rhs, ir::Ref type, ir::Inst::Tag tag,
                        ir::Builder& b, ir::SourceLoc l) {
         const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
         if (t.kind == ir::Type::Kind::UnpackedArray) {
-            // TODO: whole-object copy of an unpacked-array aggregate member — an
-            // element-wise unroll / copy loop (docs/design/unpacked-struct.md).
-            fail("whole-object copy of an unpacked-array aggregate member is not supported");
+            if (tag != ir::Inst::Tag::Store) {
+                fail("nonblocking whole-object copy of an unpacked-array aggregate is not "
+                     "supported");
+            }
+            const uint32_t n = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
+            for (uint32_t e = 0; e < n; ++e) {
+                const int32_t   coord = t.left <= t.right ? static_cast<int32_t>(t.left + e)
+                                                          : static_cast<int32_t>(t.left - e);
+                const ir::Index idx =
+                  b.constant(module_.pool.put_int(make_int_type(32, false, true),
+                                                  static_cast<uint64_t>(static_cast<int64_t>(coord))),
+                             l);
+                emit_agg_copy(b.elem_select(lhs, idx, type, l), b.elem_select(rhs, idx, type, l),
+                              t.element, tag, b, l);
+            }
+            return;
         }
         if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
             const auto fields = module_.pool.struct_fields(t.fields_id);
@@ -893,6 +932,27 @@ private:
         const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
         return t.kind != ir::Type::Kind::UnpackedArray &&
                !(t.kind == ir::Type::Kind::Struct && !t.is_packed);
+    }
+
+    // Whether an aggregate type has no `string` (heap-owning) leaf, so a whole-
+    // object blocking copy can be a single memcpy of the storage rather than a
+    // per-leaf deep copy.
+    bool is_string_free(ir::Ref type) const {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        if (t.kind == ir::Type::Kind::String) {
+            return false;
+        }
+        if (t.kind == ir::Type::Kind::UnpackedArray) {
+            return is_string_free(t.element);
+        }
+        if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
+            for (const ir::Field& f : module_.pool.struct_fields(t.fields_id)) {
+                if (!is_string_free(f.type)) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     // Downcast to an assignment pattern (`'{...}`) base if the expression is one
@@ -1479,7 +1539,7 @@ private:
         if (init == nullptr) {
             return;
         }
-        if (is_unpacked_struct(ns.getType())) {
+        if (is_aggregate(ns.getType())) {
             // TODO: continuous assignment to a whole unpacked struct net — the
             // field-wise decomposition would need per-member continuous processes
             // with per-member sensitivity. Member-level `assign n.f = ...` (a
@@ -2472,7 +2532,7 @@ private:
                 fail("static function local with an initializer is not supported");
             }
             const ir::SourceLoc l = loc(*init);
-            if (is_unpacked_struct(vs.getType())) {
+            if (is_aggregate(vs.getType())) {
                 emit_struct_store(value_lvalue(vs, b, l), lower_type(vs.getType()), *init, ir::Inst::Tag::Store, b, l);
             } else {
                 b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
@@ -2496,7 +2556,7 @@ private:
         }
         ir::Builder&        b = *preinit_;
         const ir::SourceLoc l = loc(*init);
-        if (is_unpacked_struct(vs.getType())) {
+        if (is_aggregate(vs.getType())) {
             emit_struct_store(value_lvalue(vs, b, l), lower_type(vs.getType()), *init, ir::Inst::Tag::Store, b, l);
         } else {
             b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
@@ -4687,7 +4747,7 @@ private:
     // `y = (x = 5)`) can recover its value; the caller truncates to the LHS type.
     // Statement callers discard the return.
     ir::Index lower_assign(const AssignmentExpression& a, ir::Builder& b) {
-        if (is_unpacked_struct(*a.left().type)) {
+        if (is_aggregate(*a.left().type)) {
             // Whole unpacked-struct assignment: decompose to per-member stores
             // (blocking or nonblocking). Each member commits independently, which
             // is whole-struct NBA semantics.
@@ -4955,7 +5015,7 @@ private:
                     // passing a memory by value). Only element reads are supported.
                     fail("whole unpacked array read is not supported");
                 }
-                if (is_unpacked_struct(*expr.type)) {
+                if (is_aggregate(*expr.type)) {
                     // A whole unpacked struct has no flat value: reads are only
                     // supported where they decompose field-wise (assignment,
                     // equality). A general rvalue context ($display, a by-value

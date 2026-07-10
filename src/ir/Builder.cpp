@@ -103,6 +103,12 @@ Index Builder::member_select(Index base, uint32_t field_index, Ref struct_type, 
     return emit({ Inst::Tag::MemberSelect, Inst::Payload{ .op_extra = { base, extra } } }, loc);
 }
 
+Index Builder::agg_copy(Index dst, Index src, Ref type, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(AggCopyInfo{ src, type });
+
+    return emit({ Inst::Tag::AggCopy, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+}
+
 Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc,
                     bool unlikely) {
     const ExtraIndex extra = add_extra(Regions{ then_region, else_region, unlikely });

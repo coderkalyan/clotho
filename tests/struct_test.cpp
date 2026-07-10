@@ -597,16 +597,63 @@ TEST_CASE("runtime-indexed nonblocking write into a struct array member") {
     )") == "88 0 9\n");
 }
 
-TEST_CASE("whole-object copy of an aggregate with an array member is guarded") {
+// --- Whole-object blocking copy via a single llvm.memcpy (string-free
+// aggregate); the per-leaf path is kept only for string-containing ones. ---
+
+TEST_CASE("whole-object copy of a struct with an array member (memcpy)") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] mem [0:3]; logic [7:0] v; } s_t;
+            s_t x, y;
+            initial begin
+                for (int i = 0; i < 4; i++) x.mem[i] = i[7:0] + 8'd10;
+                x.v = 8'h99;
+                y = x;
+                $display("%h %h %h", y.mem[0], y.mem[3], y.v);
+            end
+        endmodule
+    )") == "0a 0d 99\n");
+}
+
+TEST_CASE("whole array-of-struct copy (memcpy)") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t p [0:2], q [0:2];
+            initial begin
+                for (int i = 0; i < 3; i++) begin p[i].a = i[7:0] + 8'd1; p[i].b = i[3:0]; end
+                q = p;
+                $display("%h %h %h", q[0].a, q[2].a, q[1].b);
+            end
+        endmodule
+    )") == "01 03 1\n");
+}
+
+TEST_CASE("copy a struct-array element into a struct variable") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t arr [0:3]; s_t y;
+            initial begin
+                for (int i = 0; i < 4; i++) begin arr[i].a = i[7:0] + 8'd5; arr[i].b = i[3:0]; end
+                y = arr[2];
+                $display("%h %h", y.a, y.b);
+            end
+        endmodule
+    )") == "07 2\n");
+}
+
+TEST_CASE("nonblocking whole-object copy over an array member is guarded") {
     const LowerResult r = lower_text(R"(
         module m;
             typedef struct { logic [7:0] mem [0:3]; logic v; } s_t;
             s_t x, y;
-            initial y = x;
+            logic clk;
+            always @(posedge clk) y <= x;
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("unpacked-array aggregate member is not supported") != std::string::npos);
+    CHECK(r.diagnostics.find("nonblocking whole-object copy of an unpacked-array") != std::string::npos);
 }
 
 TEST_CASE("whole unpacked struct as a by-value rvalue is guarded") {

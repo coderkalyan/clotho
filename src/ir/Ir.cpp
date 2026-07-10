@@ -137,6 +137,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::DynPartSelect:
         case T::ElemSelect:
         case T::MemberSelect:
+        case T::AggCopy:
         case T::Cond:
         case T::Switch:
         case T::Fopen:
@@ -320,6 +321,13 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 scratch[1]    = ss.i;
                 scratch[2]    = ss.j;
                 return { scratch.data(), 3 };
+            }
+            if (tag == Inst::Tag::AggCopy) {
+                // Both the destination (op) and source lvalues are referenced.
+                const auto info = extra_data<AggCopyInfo>(p.op_extra.extra);
+                scratch[0]      = p.op_extra.op;
+                scratch[1]      = info.src;
+                return { scratch.data(), 2 };
             }
             scratch[0] = p.op_extra.op;
             return { scratch.data(), 1 };

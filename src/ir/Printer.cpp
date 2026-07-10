@@ -80,6 +80,8 @@ const char* tag_name(Inst::Tag tag) {
             return "elem_select";
         case T::MemberSelect:
             return "member_select";
+        case T::AggCopy:
+            return "agg_copy";
         case T::Load:
             return "load";
         case T::Store:
@@ -577,6 +579,14 @@ private:
                 const MemberSelect ms = ir_.extra_data<MemberSelect>(p.op_extra.extra);
                 ref(p.op_extra.op);
                 os_ << "." << ms.field_index << ")\n";
+                break;
+            }
+            case Inst::Tag::AggCopy: {
+                const AggCopyInfo info = ir_.extra_data<AggCopyInfo>(p.op_extra.extra);
+                ref(p.op_extra.op);
+                os_ << " = ";
+                ref(info.src);
+                os_ << ")\n";
                 break;
             }
             case Inst::Tag::StrPutc: {

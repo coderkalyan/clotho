@@ -157,6 +157,18 @@ struct ElemSelect {
     Ref array_type;
 };
 
+// Extra payload for `agg_copy`: a whole-object blocking copy of one aggregate
+// lvalue into another (both of `type`). The op is the destination lvalue; `src`
+// the source lvalue. Lowered to a single llvm.memcpy of the aggregate storage —
+// valid only when the aggregate has no string (heap-owning) leaf, which the
+// frontend checks before emitting it.
+struct AggCopyInfo {
+    // Source aggregate lvalue.
+    Index src;
+    // The aggregate type (gives the storage size to copy).
+    Ref type;
+};
+
 // Extra payload for `member_select`: a member of an unpacked struct (the base is
 // the op). Unlike a packed struct member (a constant part-select over a flat
 // bit-vector), an unpacked struct is an aggregate whose members have their own
@@ -529,6 +541,7 @@ static_assert(ExtraPayload<PartSelect>);
 static_assert(ExtraPayload<DynPartSelect>);
 static_assert(ExtraPayload<ElemSelect>);
 static_assert(ExtraPayload<MemberSelect>);
+static_assert(ExtraPayload<AggCopyInfo>);
 static_assert(ExtraPayload<ReadMemInfo>);
 static_assert(ExtraPayload<Regions>);
 static_assert(ExtraPayload<LoopInfo>);
@@ -597,6 +610,10 @@ struct Inst {
         Store,
         // Nonblocking assignment, lhs <= rhs (payload: binary).
         StoreNb,
+        // Whole-object blocking copy of one aggregate into another (payload:
+        // op_extra -> AggCopyInfo). Lowered to llvm.memcpy of the storage; the
+        // frontend emits it only for a string-free aggregate.
+        AggCopy,
 
         // -- Arithmetic (payload: binary) --
         Add,

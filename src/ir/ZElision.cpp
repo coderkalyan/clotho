@@ -190,6 +190,11 @@ struct Analysis {
                 case Inst::Tag::StoreNb:
                     store_into(ir, fn, p.binary.l, z_of(p.binary.r) != 0);
                     break;
+                case Inst::Tag::AggCopy:
+                    // A whole-aggregate copy; aggregate storage is conservatively
+                    // z-capable regardless of analysis, so mark the target may-z.
+                    store_into(ir, fn, p.op_extra.op, true);
+                    break;
 
                 // Z-transparent value ops: the z plane rides through their
                 // lowerings (an unknown shift count / select condition forces X
