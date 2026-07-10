@@ -376,6 +376,34 @@ TEST_CASE("ref write wakes a process sensitive to the actual") {
     CHECK(run_capture(src) == "mon=11 hits=1\nmon=22 hits=2\n");
 }
 
+TEST_CASE("ref to an unpacked-array element") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic void addone(ref int x); x = x + 1; endfunction
+            function automatic void setb(ref logic [3:0] b); b = b + 4'd7; endfunction
+            task automatic bump(ref int r);
+                r = r + 1;
+                #5 r = r + 10;
+            endtask
+            int a[4];
+            logic [3:0] pa [0:3];
+            int m2 [2][2];
+            initial begin
+                a[0]=100; a[1]=200; a[2]=0; a[3]=400;
+                addone(a[1]); $display("a1=%0d", a[1]);
+                for (int i = 0; i < 4; i++) begin int k; k = i; addone(a[k]); end
+                $display("a=%0d %0d %0d %0d", a[0], a[1], a[2], a[3]);
+                pa[2] = 4'd2; setb(pa[2]); $display("pa2=%0d", pa[2]);
+                m2[1][0] = 5; addone(m2[1][0]); $display("m2=%0d", m2[1][0]);
+                a[2] = 50; bump(a[2]); $display("a2=%0d", a[2]);
+            end
+            initial begin #1 $display("mid=%0d", a[2]); end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "a1=201\na=101 202 1 401\npa2=9\nm2=6\nmid=51\na2=61\n");
+}
+
 // -- Guarded gaps: must fail loudly, not silently miscompile. --
 
 TEST_CASE("ref of a non-integral type is rejected") {
@@ -398,15 +426,18 @@ TEST_CASE("ref of a non-integral type is rejected") {
     CHECK(reject(str).find("ref arguments are only supported for packed integral") != std::string::npos);
 }
 
-TEST_CASE("ref actual that is not a whole variable is rejected") {
+// A packed bit/part-select is not a whole slot, so it is not a legal ref actual —
+// slang itself rejects it ("only variables, class properties, and members of
+// unpacked structs and arrays are allowed"), before Clotho's own guard.
+TEST_CASE("ref actual that is a packed part-select is rejected") {
     constexpr std::string_view src = R"(
         module m;
-            function automatic void f(ref int n); n = 5; endfunction
-            int arr[4];
-            initial f(arr[2]);
+            function automatic void f(ref logic [3:0] n); n = 4'd5; endfunction
+            logic [7:0] v;
+            initial f(v[3:0]);
         endmodule
     )";
-    CHECK(reject(src).find("whole variable") != std::string::npos);
+    CHECK_FALSE(lower_text(src).ok);
 }
 
 TEST_CASE("disable inside a task is rejected") {

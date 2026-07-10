@@ -5522,16 +5522,11 @@ private:
                 }
                 continue;
             }
-            if (!is_task && dir != slang::ast::ArgumentDirection::In) {
-                // A function copies no arguments back; only tasks carry out/inout.
-                // TODO: output / inout arguments on functions.
-                fail("functions with output/inout/ref arguments are not supported");
-            }
-            if (is_task && dir != slang::ast::ArgumentDirection::In &&
+            if (dir != slang::ast::ArgumentDirection::In &&
                 fa->getType().getCanonicalType().isString()) {
-                // TODO: output / inout string task formals (the copy-out path
-                // passes plane pointers, not string handles).
-                fail("output/inout string task arguments are not supported");
+                // TODO: output / inout string formals (the copy-out path passes
+                // plane pointers, not string handles).
+                fail("output/inout string arguments are not supported");
             }
         }
 
@@ -5623,22 +5618,15 @@ private:
         std::vector<ir::Ref> param_types;
         std::vector<ir::ArgDir> arg_dirs;
 
-        // Parameters: copy each Arg into the formal's Local at entry, so the body
-        // reads / writes the formal as ordinary frame storage. A ref formal aliases
-        // the actual's storage (the backend redirects its Local to the passed
-        // pointer), so it takes no Arg copy — but still allocates its Local (formal
-        // k == Local k) and records its direction.
+        // Allocate a frame Local per formal (formal k == Local k), like build_task.
+        // The backend copies parameters into these Locals at entry (emit_copyin) and
+        // copies output / inout formals back at each return (emit_copyout); a ref
+        // formal's Local is redirected to the passed actual pointer. No IR-level Arg
+        // copy is emitted for any direction.
         for (const FormalArgumentSymbol* fa : sub.getArguments()) {
-            const ir::Ref       pty = lower_type(fa->getType());
-            const ir::SourceLoc fl  = to_source_loc(fa->location);
-            const auto          pos = static_cast<uint32_t>(param_types.size());
-            param_types.push_back(pty);
-            const ir::ArgDir dir = to_arg_dir(fa->direction);
-            arg_dirs.push_back(dir);
-            const uint32_t idx = fn_local(*fa);
-            if (dir != ir::ArgDir::Ref) {
-                b.binary(ir::Inst::Tag::Store, b.local(idx, pty, fl), b.arg(pos, pty, fl), fl);
-            }
+            param_types.push_back(lower_type(fa->getType()));
+            arg_dirs.push_back(to_arg_dir(fa->direction));
+            fn_local(*fa);
         }
 
         if (!is_void) {
@@ -5691,33 +5679,21 @@ private:
         if (formals.size() != actuals.size()) {
             fail("function argument count mismatch");
         }
-        const ir::SourceLoc    l = loc(call);
-        std::vector<ir::Index> args;
-        args.reserve(actuals.size());
-        for (size_t i = 0; i < formals.size(); ++i) {
-            if (formals[i]->direction == slang::ast::ArgumentDirection::Ref) {
-                args.push_back(lower_ref_actual(*actuals[i], b));
-                continue;
-            }
-            const ir::Ref pty = lower_type(formals[i]->getType());
-            // A string actual passes as-is (no width to resize to); the callee's
-            // copy-in gives value semantics.
-            args.push_back(is_string_ref(pty)
-                             ? lower_expr(*actuals[i], b)
-                             : coerce(lower_expr(*actuals[i], b), *actuals[i]->type, pty, b, l));
-        }
-        const ir::Index c = b.call(id, args, l);
+        const ir::SourceLoc     l = loc(call);
+        std::vector<CopyOutArg> outs;
+        const std::vector<ir::Index> args = build_call_args(formals, actuals, outs, b, l);
+        const ir::Index         c = b.call(id, args, l);
+        // Output / inout formals copy back to their actuals after the call (a
+        // function is zero-time, so this is the same instant as the call).
+        emit_call_copyouts(outs, b, l);
 
         return sub.returnValVar == nullptr ? std::nullopt : std::optional<ir::Index>(c);
     }
 
     // Lower a task enable (LRM 13.3). The backend drives the task coroutine and
-    // blocks the caller until it completes. Argument passing (13.5): each input is
-    // a value resized to the parameter type; each output / inout uses a caller temp
-    // that the backend passes to the task by pointer. We copy an inout's actual into
-    // its temp before the call and copy every output / inout temp back to its actual
-    // after — both as ordinary assignments, so width conversion and complex actual
-    // lvalues (bit / part selects) reuse the normal store path.
+    // blocks the caller until it completes. Argument passing (13.5) is shared with
+    // function calls: build_call_args prepares each operand and records output /
+    // inout copy-backs, emit_call_copyouts applies them after the call.
     void lower_task_call(const CallExpression& call, const SubroutineSymbol& sub, ir::Builder& b) {
         const ir::FunctionId id      = function_id(sub); // validates + lowers (lazily)
         const auto           formals = sub.getArguments();
@@ -5725,25 +5701,45 @@ private:
         if (formals.size() != actuals.size()) {
             fail("task argument count mismatch");
         }
-        const ir::SourceLoc l = loc(call);
+        const ir::SourceLoc     l = loc(call);
+        std::vector<CopyOutArg> outs;
+        const std::vector<ir::Index> args = build_call_args(formals, actuals, outs, b, l);
+        b.task_call(id, args, l);
+        emit_call_copyouts(outs, b, l);
+    }
 
-        // One temp + copy-back record per output / inout argument.
-        struct OutArg {
-            ir::Index         temp;      // the caller temp lvalue (parameter width)
-            const Expression* actual;    // the call-site lvalue to copy back into
-            ir::Ref           actual_ty; // the actual's type (target of copy-out)
-            const slang::ast::Type* formal_ty; // the formal's type (source of copy-out)
-        };
-        std::vector<OutArg>    outs;
+    // One output / inout argument's copy-back record: the caller temp holding the
+    // formal's value, the actual lvalue to write at completion, and the types to
+    // coerce across (formal -> actual).
+    struct CopyOutArg {
+        ir::Index               temp;
+        const Expression*       actual;
+        ir::Ref                 actual_ty;
+        const slang::ast::Type* formal_ty;
+    };
+
+    // Build the call-argument operands for a user function / task (LRM 13.5): an
+    // input passes a value resized to the formal; a ref passes the actual's lvalue;
+    // an output / inout uses a fresh caller temp (copied in from the actual for
+    // inout) the backend passes by pointer. Each output / inout is recorded in
+    // `outs` for copy-out after the call. Shared by function and task calls — the
+    // copy-in / copy-out semantics are identical and delicate to correctness.
+    std::vector<ir::Index> build_call_args(std::span<const FormalArgumentSymbol* const> formals,
+                                           std::span<const Expression* const> actuals,
+                                           std::vector<CopyOutArg>& outs, ir::Builder& b,
+                                           ir::SourceLoc l) {
         std::vector<ir::Index> args;
         args.reserve(formals.size());
         for (size_t i = 0; i < formals.size(); ++i) {
+            const auto    dir = formals[i]->direction;
             const ir::Ref pty = lower_type(formals[i]->getType());
-            if (formals[i]->direction == slang::ast::ArgumentDirection::Ref) {
+            if (dir == slang::ast::ArgumentDirection::Ref) {
                 args.push_back(lower_ref_actual(*actuals[i], b));
                 continue;
             }
-            if (formals[i]->direction == slang::ast::ArgumentDirection::In) {
+            if (dir == slang::ast::ArgumentDirection::In) {
+                // A string actual passes as-is (no width to resize to); the callee's
+                // copy-in gives value semantics.
                 args.push_back(is_string_ref(pty)
                                  ? lower_expr(*actuals[i], b)
                                  : coerce(lower_expr(*actuals[i], b), *actuals[i]->type, pty, b, l));
@@ -5755,29 +5751,53 @@ private:
             if (actual->kind == ExpressionKind::Assignment) {
                 actual = &actual->as<AssignmentExpression>().left();
             }
-            const ir::Index temp = make_task_temp(pty, b, l);
-            if (formals[i]->direction == slang::ast::ArgumentDirection::InOut) {
+            const ir::Index temp = make_arg_temp(pty, b, l);
+            if (dir == slang::ast::ArgumentDirection::InOut) {
                 // Copy-in: temp = (parameter type) actual.
                 b.binary(ir::Inst::Tag::Store, temp, coerce(lower_expr(*actual, b), *actual->type, pty, b, l), l);
             }
             args.push_back(temp);
-            outs.push_back(OutArg{ temp, actual, lower_type(*actual->type), &formals[i]->getType() });
+            outs.push_back(CopyOutArg{ temp, actual, lower_type(*actual->type), &formals[i]->getType() });
         }
+        return args;
+    }
 
-        b.task_call(id, args, l);
-
-        // Copy-out at completion: actual = (actual type) temp.
-        for (const OutArg& oc : outs) {
+    // Copy each output / inout temp back to its actual after the call: actual =
+    // (actual type) temp. Reuses the normal store path so width conversion and
+    // complex actual lvalues (bit / part selects) work.
+    void emit_call_copyouts(const std::vector<CopyOutArg>& outs, ir::Builder& b, ir::SourceLoc l) {
+        for (const CopyOutArg& oc : outs) {
             const ir::Index dst = lower_lvalue(*oc.actual, b);
             const ir::Index tv  = b.unary(ir::Inst::Tag::Load, oc.temp, l);
             b.binary(ir::Inst::Tag::Store, dst, coerce(tv, *oc.formal_ty, oc.actual_ty, b, l), l);
         }
     }
 
+    // A legal ref actual (LRM 13.5.2) Clotho supports: a whole variable, or a whole
+    // element of an unpacked array (`arr[i]`, possibly nested). Each is one complete
+    // `{ i(2W), iW }` slot, so the backend passes its slot pointer. slang already
+    // rejects a packed bit/part-select as a ref actual ("only variables, class
+    // properties, and members of unpacked structs and arrays are allowed"); an
+    // unpacked-struct member needs struct support, still unimplemented.
+    bool is_whole_ref_actual(const Expression& a) {
+        switch (a.kind) {
+            case ExpressionKind::NamedValue:
+            case ExpressionKind::HierarchicalValue:
+                return true;
+            case ExpressionKind::ElementSelect: {
+                // Only an unpacked-array element is a whole slot; a select of a
+                // packed value is a bit/part-select (a partial ref, unsupported).
+                const auto& es = a.as<ElementSelectExpression>();
+                return is_unpacked_array(es.value()) && is_whole_ref_actual(es.value());
+            }
+            default:
+                return false;
+        }
+    }
+
     // Lower a ref actual (LRM 13.5.2) to its lvalue leaf: the backend passes one
-    // pointer to the actual's storage and the callee aliases it live. This chunk
-    // supports a whole-variable actual only; a bit / part-select or array-element
-    // ref needs a sub-slot pointer with offset plumbing.
+    // pointer to the actual's slot (a scalar's slot, or one array-element slot) and
+    // the callee aliases it live.
     ir::Index lower_ref_actual(const Expression& actual, ir::Builder& b) {
         const Expression* a = &actual;
         // slang may wrap a ref actual in an AssignmentExpression (as for out/inout);
@@ -5785,18 +5805,19 @@ private:
         if (a->kind == ExpressionKind::Assignment) {
             a = &a->as<AssignmentExpression>().left();
         }
-        if (a->kind != ExpressionKind::NamedValue && a->kind != ExpressionKind::HierarchicalValue) {
-            // TODO: ref actual that is a bit/part-select or array element.
-            fail("ref argument actual must be a whole variable");
+        if (!is_whole_ref_actual(*a)) {
+            // TODO: ref actual that is a packed bit/part-select or unpacked-struct
+            // member (needs sub-slot offset plumbing / struct support).
+            fail("ref argument actual must be a whole variable or unpacked-array element");
         }
         return lower_lvalue(*a, b);
     }
 
-    // A fresh, anonymous storage cell for an output / inout task argument, returned
-    // as an lvalue leaf. Inside a task caller it is a per-call frame Local; in a
-    // process it is a module Signal (a process has no frame). The same lvalue Index
-    // is reused for copy-in, the task_call operand, and copy-out.
-    ir::Index make_task_temp(ir::Ref type, ir::Builder& b, ir::SourceLoc l) {
+    // A fresh, anonymous storage cell for an output / inout call argument, returned
+    // as an lvalue leaf. Inside a function / task caller it is a per-call frame
+    // Local; in a process it is a module Signal (a process has no frame). The same
+    // lvalue Index is reused for copy-in, the call operand, and copy-out.
+    ir::Index make_arg_temp(ir::Ref type, ir::Builder& b, ir::SourceLoc l) {
         if (fn_ctx_ != nullptr) {
             const auto idx = static_cast<uint32_t>(fn_ctx_->local_types.size());
             fn_ctx_->local_types.push_back(type);

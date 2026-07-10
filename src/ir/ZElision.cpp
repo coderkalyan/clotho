@@ -285,23 +285,23 @@ struct Analysis {
                     }
                     break;
                 case Inst::Tag::Call: {
+                    // A function shares the task argument ABI: In copies the actual's
+                    // value in; Inout copies storage in and out; Out copies out; Ref
+                    // aliases the actual's storage live. Same z-flow as TaskCall below.
                     const CallInfo               ci     = ir.extra_data<CallInfo>(p.extra);
                     const Function&              callee = m.function(ci.func);
                     FnState&                     cs     = fns[static_cast<uint32_t>(ci.func)];
                     const std::span<const Index> args   = ir.region(ci.args);
                     for (size_t k = 0; k < args.size(); ++k) {
-                        // A ref formal aliases the actual's storage live (like a task
-                        // inout): the callee reads its z on entry and any z it writes
-                        // through the ref lands in the actual (LRM 13.5.2).
-                        if (!callee.arg_dirs.empty() && callee.arg_dirs[k] == ArgDir::Ref) {
-                            if (storage_z(ir, fn, args[k])) {
-                                mark(cs.param_z[k]);
-                            }
-                            if (cs.local_z[k] != 0) {
-                                store_into(ir, fn, args[k], true);
-                            }
-                        } else if (z_of(args[k]) != 0) {
+                        const ArgDir dir = callee.arg_dirs.empty() ? ArgDir::In : callee.arg_dirs[k];
+                        if (dir == ArgDir::In && z_of(args[k]) != 0) {
                             mark(cs.param_z[k]);
+                        }
+                        if ((dir == ArgDir::Inout || dir == ArgDir::Ref) && storage_z(ir, fn, args[k])) {
+                            mark(cs.param_z[k]);
+                        }
+                        if (dir != ArgDir::In && cs.local_z[k] != 0) {
+                            store_into(ir, fn, args[k], true);
                         }
                     }
                     val_z[raw] = cs.result_z;
