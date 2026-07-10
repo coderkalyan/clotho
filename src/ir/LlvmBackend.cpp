@@ -625,8 +625,7 @@ private:
         // through the analysis anyway.
         const std::vector<bool> may_z =
           config_.z_elision ? compute_may_z(mod_) : std::vector<bool>(sigs.size(), true);
-        const std::vector<bool> task_out   = task_out_targets();
-        const std::vector<bool> ref_actual = ref_actual_targets();
+        const std::vector<bool> ptr_arg = ptr_arg_signals();
         // Semantics, not optimization: computed regardless of config_.z_elision.
         // An undriven 4-state net powers up z (LRM 6.6); everything else x / 0.
         const std::vector<bool> undriven = compute_undriven(mod_);
@@ -658,7 +657,7 @@ private:
             // below (pool layout gives Domain::Two for floats).
             slot.is_real     = mod_.pool.is_float(leaf_type(sigs[i].type));
             slot.init_z      = undriven[i] && sigs[i].is_net && slot.four_state;
-            slot.has_z       = may_z[i] || task_out[i] || ref_actual[i] || slot.init_z;
+            slot.has_z       = may_z[i] || ptr_arg[i] || slot.init_z;
             // A 2-state signal drops the packed must|may word for a genuine iW slot
             // (or `[N x { iW }]` memory). The only requirement is never-z: a 2-state
             // value carries no z, and has_z is forced only by a task out/inout target
@@ -837,55 +836,21 @@ private:
         }
     }
 
-    // Signals used as a task out/inout actual anywhere in the design. The task
-    // ABI passes `&signal.z` and stores through it at copy-out (emit_task_copyout),
-    // so such a signal must keep its z word even when proven never-z. A storage/
-    // ABI constraint, not a may-z fact, hence separate from compute_may_z.
-    // (An alternative — a caller-stack z scratch word for elided targets — is
-    // sound but adds a second mechanism for a rare construct.)
-    std::vector<bool> task_out_targets() const {
+    // Signals passed by pointer as a non-In (output / inout / ref) actual anywhere
+    // in the design, in a function `call` or a `task_call`. The pointer ABI reads /
+    // writes the signal's `{ i(2W), iW }` slot (copy-out stores through `&signal.z`;
+    // a ref aliases it live), so such a signal must keep its z word and packed form
+    // even when proven never-z. A storage/ABI constraint, not a may-z fact, hence
+    // separate from compute_may_z. (An alternative — a caller-stack z scratch word
+    // for elided targets — is sound but adds a second mechanism for a rare
+    // construct.)
+    std::vector<bool> ptr_arg_signals() const {
         std::vector<bool> out(mod_.signals().size(), false);
-        const auto        scan = [&](const Ir& ir) {
-            for (size_t k = 0; k < ir.inst_count(); ++k) {
-                const auto idx = static_cast<Index>(k);
-                if (ir.tag(idx) != Inst::Tag::TaskCall) {
-                    continue;
-                }
-                const auto      ti     = ir.extra_data<TaskCallInfo>(ir.payload(idx).extra);
-                const Function& callee = mod_.function(ti.func);
-                const auto      args   = ir.region(ti.args);
-                for (size_t a = 0; a < args.size(); ++a) {
-                    if (callee.arg_dirs[a] == ArgDir::In) {
-                        continue;
-                    }
-                    const Index root = lvalue_root(ir, args[a]).root;
-                    if (ir.tag(root) == Inst::Tag::Signal) {
-                        out[static_cast<uint32_t>(ir.payload(root).signal)] = true;
-                    }
-                }
-            }
-        };
-        for (const Process& p : mod_.processes()) {
-            scan(p.ir);
-        }
-        for (uint32_t i = 0; i < mod_.function_count(); ++i) {
-            scan(mod_.function(static_cast<FunctionId>(i)).ir);
-        }
-        return out;
-    }
-
-    // Signals passed as a ref actual anywhere in the design. The ref ABI passes one
-    // pointer to the actual's `{ i(2W), iW }` slot, which the callee GEPs with a
-    // packed (has_z) slot type; the actual's storage must therefore match, so such a
-    // signal keeps its z word and packed word even when z-elision would drop them.
-    // Same shape constraint as task_out_targets, from a different construct.
-    std::vector<bool> ref_actual_targets() const {
-        std::vector<bool> out(mod_.signals().size(), false);
-        const auto        mark_ref_args = [&](const Ir& ir, FunctionId fid, ExtraSlice argslice) {
+        const auto        mark = [&](const Ir& ir, FunctionId fid, ExtraSlice argslice) {
             const Function& callee = mod_.function(fid);
             const auto      args   = ir.region(argslice);
             for (size_t a = 0; a < args.size(); ++a) {
-                if (callee.arg_dirs.empty() || callee.arg_dirs[a] != ArgDir::Ref) {
+                if (callee.arg_dirs.empty() || callee.arg_dirs[a] == ArgDir::In) {
                     continue;
                 }
                 const Index root = lvalue_root(ir, args[a]).root;
@@ -897,12 +862,12 @@ private:
         const auto scan = [&](const Ir& ir) {
             for (size_t k = 0; k < ir.inst_count(); ++k) {
                 const auto idx = static_cast<Index>(k);
-                if (ir.tag(idx) == Inst::Tag::Call) {
-                    const auto ci = ir.extra_data<CallInfo>(ir.payload(idx).extra);
-                    mark_ref_args(ir, ci.func, ci.args);
-                } else if (ir.tag(idx) == Inst::Tag::TaskCall) {
+                if (ir.tag(idx) == Inst::Tag::TaskCall) {
                     const auto ti = ir.extra_data<TaskCallInfo>(ir.payload(idx).extra);
-                    mark_ref_args(ir, ti.func, ti.args);
+                    mark(ir, ti.func, ti.args);
+                } else if (ir.tag(idx) == Inst::Tag::Call) {
+                    const auto ci = ir.extra_data<CallInfo>(ir.payload(idx).extra);
+                    mark(ir, ci.func, ci.args);
                 }
             }
         };
@@ -1324,9 +1289,15 @@ private:
         // a 2-state arg lifts to must==may with a constant-0 z, which LLVM folds —
         // so this is a call-ABI size micro-opt, not a correctness gap.
         for (size_t k = 0; k < f.param_types.size(); ++k) {
-            const Ref pt = f.param_types[k];
-            if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
+            const Ref     pt  = f.param_types[k];
+            const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
+            if (dir == ArgDir::Ref) {
                 params.push_back(ptr); // one pointer to the actual's packed slot
+                continue;
+            }
+            if (dir == ArgDir::Out || dir == ArgDir::Inout) {
+                params.push_back(ptr); // &caller_temp.mm
+                params.push_back(ptr); // &caller_temp.z (copy-out at each return)
                 continue;
             }
             if (is_string_type(pt)) {
@@ -1567,11 +1538,14 @@ private:
         init_frame();
         build_str_temps();
         bind_ref_formals(f);
+        emit_copyin(f);
 
         lower_region(ir_->root());
         // The frontend appends a trailing Ret, so the entry path always terminates;
-        // guard defensively in case a body lowered to nothing.
+        // guard defensively in case a body lowered to nothing (an implicit return
+        // still copies output / inout formals back).
         if (b_.GetInsertBlock()->getTerminator() == nullptr) {
+            emit_copyout(f);
             deinit_body_strings();
             if (is_void(f.return_type)) {
                 b_.CreateRetVoid();
@@ -1686,7 +1660,7 @@ private:
         init_frame();
         build_str_temps();
         bind_ref_formals(f);
-        emit_task_copyin(f);
+        emit_copyin(f);
         lower_region(ir_->root());
         branch_to(epilogue_bb);
 
@@ -1697,7 +1671,7 @@ private:
         // enqueued; in the blocked path the caller stored its handle before
         // suspending, so we push it onto the active queue here.
         b_.SetInsertPoint(epilogue_bb);
-        emit_task_copyout(f);
+        emit_copyout(f);
         deinit_body_strings(); // string locals + temps die with the call
         llvm::Value* parent = b_.CreateLoad(ptr_ty, fn_->getArg(task_record_param(f)));
         auto*        has_bb = llvm::BasicBlock::Create(ctx_, "task.wake", fn_);
@@ -1732,11 +1706,12 @@ private:
         }
     }
 
-    // Prologue: copy each formal's parameter into its frame Local (Local k == formal
-    // k). Inputs read their value planes; inouts load through their caller pointer;
-    // outputs keep the frame's default (X / 0) until the body assigns them. Ref
-    // formals are bound separately (bind_ref_formals) and skipped here.
-    void emit_task_copyin(const Function& f) {
+    // Prologue (function and task): copy each formal's parameter into its frame
+    // Local (Local k == formal k). Inputs read their value planes; inouts load
+    // through their caller pointer; outputs keep the frame's default (X / 0) until
+    // the body assigns them. Ref formals are bound separately (bind_ref_formals) and
+    // skipped here.
+    void emit_copyin(const Function& f) {
         for (uint32_t k = 0; k < f.param_types.size(); ++k) {
             const uint32_t w    = width_of(f.param_types[k]);
             const uint32_t base = param_llvm_index_[k];
@@ -1760,9 +1735,10 @@ private:
         }
     }
 
-    // Epilogue: copy each output / inout formal's frame Local back through its
-    // caller pointer (LRM 13.5 copy-out at completion).
-    void emit_task_copyout(const Function& f) {
+    // Copy each output / inout formal's frame Local back through its caller pointer
+    // (LRM 13.5 copy-out at completion). For a task this runs once in the completion
+    // epilogue; for a function it runs before every `ret` (each return point).
+    void emit_copyout(const Function& f) {
         for (uint32_t k = 0; k < f.param_types.size(); ++k) {
             // In needs no copy-out; a ref formal is live (aliased), never copied back.
             if (f.arg_dirs[k] == ArgDir::In || f.arg_dirs[k] == ArgDir::Ref) {
@@ -6981,6 +6957,9 @@ private:
             b_.CreateBr(task_epilogue_bb_);
             return;
         }
+        // A function copies output / inout formals back through their pointers at
+        // each return point (LRM 13.5), before releasing the body and returning.
+        emit_copyout(*cur_fn_);
         if (is_string_type(cur_fn_->return_type)) {
             // Copy the result out through the trailing out-param handle BEFORE
             // releasing the body's strings (the value may be one of them).
@@ -7022,12 +7001,20 @@ private:
         std::vector<std::pair<LValue, ServiceSnapshot>> ref_svc;
         size_t k = 0;
         for (Index a : ir_->region(ci.args)) {
-            if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
+            const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
+            if (dir == ArgDir::Ref) {
                 // Pass one pointer to the actual's slot (scalar, or array element);
                 // the callee aliases it.
                 const LValue& lv = lvalue_of(a);
                 argv.push_back(ref_actual_ptr(lv));
                 ref_svc.emplace_back(lv, service_snapshot(lv));
+            } else if (dir == ArgDir::Out || dir == ArgDir::Inout) {
+                // An output / inout temp: pass pointers to its mm and z planes; the
+                // callee copies out through them (the caller copies the temp back to
+                // the actual after the call — frontend emit_call_copyouts).
+                const LValue& lv = lvalue_of(a);
+                argv.push_back(lv_mm_ptr(lv));
+                argv.push_back(lv_z_ptr(lv));
             } else if (is_string_type(f.param_types[k])) {
                 argv.push_back(str_of(a));
             } else {

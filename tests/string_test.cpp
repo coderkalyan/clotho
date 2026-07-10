@@ -701,7 +701,7 @@ TEST_CASE("unsupported string constructs are rejected loudly") {
                 endtask
                 initial t(s);
             endmodule
-        )", "output/inout string task arguments");
+        )", "output/inout string arguments");
     }
     SUBCASE("string argument to a non-%s specifier") {
         check_rejected(R"(
