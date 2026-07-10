@@ -205,6 +205,9 @@ struct Regions {
     ExtraSlice then_;
     // Instructions executed when the condition is false.
     ExtraSlice else_;
+    // Hint that the condition is rarely true; biases backend branch weights
+    // toward the else path (e.g. a violation check).
+    bool unlikely = false;
 };
 
 // Extra payload for `select_lazy`: a value-producing conditional (the predicate

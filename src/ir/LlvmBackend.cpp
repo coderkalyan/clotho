@@ -6873,23 +6873,26 @@ private:
                       { b_.CreateGlobalString(banner), now, b_.getInt32(info.arg) });
     }
 
-    // void rt_case_violation(ptr banner, i64 now) — warns and returns (non-fatal).
+    // void rt_case_violation(ptr banner, i64 now, i32 kind) — warns and returns
+    // (non-fatal). kind selects the message (0 = no match, 1 = overlap).
     llvm::FunctionCallee case_violation_fn() {
-        return rt_fn("rt_case_violation", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
+        return rt_fn("rt_case_violation", b_.getVoidTy(),
+                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty() });
     }
 
-    // Lower a priority-case violation report: pass the compile-time banner prefix
-    // and the current simulation time; the runtime warns and returns, so the
-    // region continues. Reuses FinishInfo for the banner (arg unused). The wheel
-    // fallback mirrors lower_finish: a priority case inside a pure function has no
-    // wheel and reports time 0 (same TODO as $finish).
+    // Lower a unique/priority case violation report: pass the compile-time banner
+    // prefix, the current simulation time, and the message kind (FinishInfo.arg);
+    // the runtime warns and returns, so the region continues. The wheel fallback
+    // mirrors lower_finish: a case inside a pure function has no wheel and reports
+    // time 0 (same TODO as $finish).
     void lower_case_viol(Index i) {
         const auto        info   = ir_->extra_data<FinishInfo>(ir_->payload(i).extra);
         const std::string banner = ir_->extra_bytes(info.banner, info.banner_len);
         llvm::Value*      now = has_wheel()
                                   ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
                                   : static_cast<llvm::Value*>(b_.getInt64(0));
-        b_.CreateCall(case_violation_fn(), { b_.CreateGlobalString(banner), now });
+        b_.CreateCall(case_violation_fn(),
+                      { b_.CreateGlobalString(banner), now, b_.getInt32(info.arg) });
     }
 
     // Whether wheel_ points at a live timing wheel: true in a process or task
@@ -8878,7 +8881,11 @@ private:
         auto* then_bb = llvm::BasicBlock::Create(ctx_, "then", fn_);
         auto* else_bb = llvm::BasicBlock::Create(ctx_, "else", fn_);
         auto* cont_bb = llvm::BasicBlock::Create(ctx_, "endif", fn_);
-        b_.CreateCondBr(take, then_bb, else_bb);
+        // A cold branch (violation check) biases weights toward the else path so
+        // codegen lays the then-block out of line.
+        llvm::MDNode* weights =
+          regs.unlikely ? llvm::MDBuilder(ctx_).createBranchWeights(1, 2000) : nullptr;
+        b_.CreateCondBr(take, then_bb, else_bb, weights);
 
         b_.SetInsertPoint(then_bb);
         lower_region(ir_->region(regs.then_));

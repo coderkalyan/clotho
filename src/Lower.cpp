@@ -2301,8 +2301,9 @@ private:
     // label gates it). Dropped for now: rare, and the constant path is what the
     // downstream jump-table lowering needs.
     //
-    // Skipped for unique/priority checks: their overlap is a reportable
-    // violation, so duplicates must survive (report emission is a TODO above).
+    // Skipped for unique/priority checks: a unique/unique0 overlap is a
+    // reportable violation, so duplicate labels must survive for
+    // lower_case_unique's predicate sum to detect them.
     // Returns keep[k][j] = whether item k's label j survives.
     std::vector<std::vector<char>> case_dedup(const CaseStatement& c) {
         std::vector<std::vector<char>> keep(c.items.size());
@@ -2370,11 +2371,16 @@ private:
     //
     // Dedup happens here in one pass (LRM 12.5 first-match: a later label
     // duplicating an earlier key is dead, so it is dropped), giving the switch
-    // unique keys without a second label evaluation. The caller only reaches
-    // this for a check==None Normal case; casez/casex and unique/priority keep
-    // the chain. Returns nullopt (-> chain) on the first non-constant or x/z
-    // label, or when the key is too wide.
-    std::optional<std::vector<SwitchArmPlan>> build_switch_arms(const CaseStatement& c) {
+    // unique keys without a second label evaluation. Returns nullopt (-> chain)
+    // on the first non-constant or x/z label, or when the key is too wide.
+    //
+    // `had_dup` (when non-null) reports whether a duplicate constant key was
+    // dropped. For a unique/unique0 case a dropped duplicate is a compile-time
+    // overlap violation, so the caller must route those to the chain (which emits
+    // the runtime overlap report) rather than the switch, which would silently
+    // merge the keys.
+    std::optional<std::vector<SwitchArmPlan>> build_switch_arms(const CaseStatement& c,
+                                                                bool* had_dup = nullptr) {
         uint32_t width = c.expr.type->getBitWidth();
         bool     four  = c.expr.type->isFourState();
         for (const CaseStatement::ItemGroup& item : c.items) {
@@ -2409,6 +2415,9 @@ private:
                 }
                 if (seen.insert(*u).second) {  // first occurrence wins; drop dups.
                     keys.push_back(*u);
+                }
+                else if (had_dup != nullptr) {
+                    *had_dup = true;
                 }
             }
             if (!keys.empty()) {
@@ -2579,35 +2588,39 @@ private:
             default:
                 fail("case ... inside is not supported");
         }
-        // NOTE: unique / unique0 / priority (c.check) only govern violation
-        // reporting, a runtime assertion; the first-match execution below is
-        // conforming for all of them.
-        //
-        // priority (LRM 12.5.3): if no item matches and there is no default, a
-        // warning is issued. A priority case WITH a default can never violate
-        // (the default always "matches"), so only the default-less form needs
-        // the report — emitted at the terminal else of the if-else chain below.
-        // TODO: emit unique / unique0 overlap violation reports.
-        const bool priority_report =
-          c.check == slang::ast::UniquePriorityCheck::Priority && c.defaultCase == nullptr;
+        // unique / unique0 / priority (c.check) add the LRM 12.5.3 violation
+        // checks; first-match execution is conforming for all of them.
+        //   - no-match (priority or unique, no default): kind-0 report. unique0
+        //     does NOT report no-match; a default can never no-match.
+        //   - overlap (unique / unique0, >1 item matches): kind-1 report. Distinct
+        //     constant labels can never overlap, so those keep the fast paths.
+        using Check = slang::ast::UniquePriorityCheck;
+        const bool no_match_report =
+          (c.check == Check::Priority || c.check == Check::Unique) && c.defaultCase == nullptr;
+        const bool needs_overlap = c.check == Check::Unique || c.check == Check::Unique0;
 
-        // The one-hot reverse-case idiom `case (1'b1)` over base[i] selects
-        // lowers to ctz/clz + jump table. See build_onehot_plan.
+        // The one-hot reverse-case idiom `case (1'b1)` over base[i] selects lowers
+        // to ctz/clz + jump table (check==None only; unique/priority keep the
+        // chain, see build_onehot_plan's TODO(unique)).
         if (std::optional<OneHotPlan> oh = build_onehot_plan(c)) {
             emit_onehot(c, *oh, b);
             return;
         }
 
         const ir::Ref   ty  = common_case_type(c);
-        // The selector is evaluated exactly once, up front (12.5).
+        // The selector is evaluated exactly once, up front (12.5 / 12.5.3).
         const ir::Index sel = b.resize(lower_expr(c.expr, b), ty, loc(c.expr));
 
-        // A constant, wildcard-free case lowers to a multiway switch (jump table)
-        // instead of an O(N) if-else compare chain. build_switch_arms dedups the
-        // keys itself, so this path never runs case_dedup. See build_switch_arms.
-        if (c.condition == CaseStatementCondition::Normal &&
-            c.check == slang::ast::UniquePriorityCheck::None) {
-            if (std::optional<std::vector<SwitchArmPlan>> plan = build_switch_arms(c)) {
+        // Constant, wildcard-free case -> multiway switch (jump table). Distinct
+        // constant labels can never overlap at runtime, so this fast path stays
+        // valid for unique/unique0; a dropped duplicate key would be a
+        // compile-time overlap, so had_dup routes those to the chain (which emits
+        // the runtime overlap report). A default-less priority/unique case reports
+        // no-match from the switch's own default region.
+        if (c.condition == CaseStatementCondition::Normal) {
+            bool                                      had_dup = false;
+            std::optional<std::vector<SwitchArmPlan>> plan    = build_switch_arms(c, &had_dup);
+            if (plan && !(needs_overlap && had_dup)) {
                 std::vector<ir::Builder::SwitchArmBuild> arms;
                 arms.reserve(plan->size());
                 for (const SwitchArmPlan& ap : *plan) {
@@ -2620,14 +2633,103 @@ private:
                 if (c.defaultCase != nullptr) {
                     lower_stmt(*c.defaultCase, b);
                 }
+                else if (no_match_report) {
+                    b.case_violation(case_banner(c), 0, loc(c));
+                }
                 const ir::ExtraSlice default_region = b.close_region();
                 b.switch_(sel, arms, default_region, loc(c.expr));
                 return;
             }
         }
 
+        // unique / unique0 need the eager overlap check; priority / plain use the
+        // lazy first-match chain.
+        if (needs_overlap) {
+            lower_case_unique(c, sel, cmp, ty, no_match_report, b);
+            return;
+        }
         const std::vector<std::vector<char>> keep = case_dedup(c);
-        lower_case_item(c, 0, sel, cmp, ty, keep, priority_report, b);
+        lower_case_item(c, 0, sel, cmp, ty, keep, no_match_report, b);
+    }
+
+    // Eager lowering for unique / unique0 (LRM 12.5.3). Unlike the lazy
+    // first-match chain, every case_item predicate is evaluated once up front
+    // (the LRM permits any-order eager evaluation for unique/unique0: the
+    // case_expression is evaluated once before the items, items may be compared
+    // in any order, and side effects "may cause nondeterministic results"). The
+    // predicates are held in temps and reused for both the overlap check and the
+    // first-match dispatch, so labels are never re-evaluated.
+    //
+    // Overlap: sum the 1-bit predicates; > 1 match is a uniqueness violation
+    // (kind 1). The check is marked unlikely so the report stays off the hot
+    // path. First-match dispatch and the no-match report (unique only) reuse the
+    // temps and match the plain-case semantics exactly.
+    void lower_case_unique(const CaseStatement& c, ir::Index sel, ir::Inst::Tag cmp, ir::Ref ty,
+                           bool no_match_report, ir::Builder& b) {
+        const size_t           n = c.items.size();
+        std::vector<ir::Index> preds;
+        preds.reserve(n);
+        for (const CaseStatement::ItemGroup& item : c.items) {
+            // A case_item's predicate is the OR of (selector <cmp> label) over its
+            // labels; every item has at least one label. No dedup (a duplicate is
+            // a reportable overlap, not a dead label).
+            ir::Index pred{};
+            bool      have = false;
+            for (const Expression* e : item.expressions) {
+                const ir::Index val = b.resize(lower_expr(*e, b), ty, loc(*e));
+                const ir::Index one = b.binary(cmp, sel, val, loc(*e));
+                pred                = have ? b.binary(ir::Inst::Tag::Lor, pred, one, loc(*e)) : one;
+                have                = true;
+            }
+            preds.push_back(pred);
+        }
+
+        // Overlap = (sum of the 1-bit predicates) > 1. A 32-bit accumulator holds
+        // any realistic item count; the predicates are definite 2-state (=== never
+        // yields x), so the zero-extended sum is exact.
+        const ir::Ref       sumty = make_int_type(32, false, false);
+        const ir::SourceLoc cloc  = loc(c);
+        ir::Index       sum   = b.resize(preds[0], sumty, cloc);
+        for (size_t k = 1; k < n; k++) {
+            sum = b.binary(ir::Inst::Tag::Add, sum, b.resize(preds[k], sumty, cloc), cloc);
+        }
+        const ir::Index one_c   = b.constant(module_.pool.put_int(sumty, 1), cloc);
+        const ir::Index overlap = b.binary(ir::Inst::Tag::Gt, sum, one_c, cloc);
+
+        b.open_region();
+        b.case_violation(case_banner(c), 1, cloc);
+        const ir::ExtraSlice report_region = b.close_region();
+        b.open_region();
+        const ir::ExtraSlice empty_region = b.close_region();
+        b.cond(overlap, report_region, empty_region, cloc, /*unlikely=*/true);
+
+        dispatch_preds(c, 0, preds, no_match_report, b);
+    }
+
+    // First-match dispatch for a unique/unique0 case, reusing the precomputed
+    // predicate temps: item k's body runs when preds[k] is the first true one.
+    // The terminal else (no item matched) runs the default, else emits the
+    // no-match report when the caller requested it (unique, no default).
+    void dispatch_preds(const CaseStatement& c, size_t k, const std::vector<ir::Index>& preds,
+                        bool no_match_report, ir::Builder& b) {
+        if (k == c.items.size()) {
+            if (c.defaultCase != nullptr) {
+                lower_stmt(*c.defaultCase, b);
+            }
+            else if (no_match_report) {
+                b.case_violation(case_banner(c), 0, loc(c));
+            }
+            return;
+        }
+        b.open_region();
+        lower_stmt(*c.items[k].stmt, b);
+        const ir::ExtraSlice then_region = b.close_region();
+
+        b.open_region();
+        dispatch_preds(c, k + 1, preds, no_match_report, b);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        b.cond(preds[k], then_region, else_region, loc(*c.items[k].stmt));
     }
 
     // Emit the if-else chain for items[k..] into the current region: item k's
@@ -2636,10 +2738,11 @@ private:
     // first match wins; labels for items not yet reached are evaluated lazily,
     // inside the else regions, so they run only until a match is found.
     //
-    // `report_viol` is set for a default-less `priority case`: the terminal else
-    // (reached only when no item matched) emits a priority-violation report
-    // (LRM 12.5.3). It is mutually exclusive with a default (a default-less case
-    // has no default branch here).
+    // `report_viol` is set for a default-less priority/unique case: the terminal
+    // else (reached only when no item matched) emits a no-match violation report
+    // (LRM 12.5.3, kind 0). It is mutually exclusive with a default (a
+    // default-less case has no default branch here). This is the lazy chain used
+    // for priority / plain checks; unique/unique0 use the eager lower_case_unique.
     void lower_case_item(const CaseStatement& c, size_t k, ir::Index sel, ir::Inst::Tag cmp, ir::Ref ty,
                          const std::vector<std::vector<char>>& keep, bool report_viol, ir::Builder& b) {
         if (k == c.items.size()) {
@@ -2647,7 +2750,7 @@ private:
                 lower_stmt(*c.defaultCase, b);
             }
             else if (report_viol) {
-                b.case_violation(case_banner(c), loc(c));
+                b.case_violation(case_banner(c), 0, loc(c));
             }
             return;
         }

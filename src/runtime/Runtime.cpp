@@ -1232,16 +1232,11 @@ extern "C" void rt_finish(const char* banner, uint64_t now, int32_t arg) {
     std::exit(0);
 }
 
-extern "C" void rt_case_violation(const char* banner, uint64_t now) {
-    // LRM 12.5.3: a `priority case` with no default reached with no matching
-    // item. A simulator diagnostic (not design output), so it goes to stderr,
-    // like rt_finish's banner. The message content is not LRM-mandated; the
-    // banner carries the compile-time "<file>:<line>: " location and the time is
-    // appended at runtime. Flush stdout first so buffered $display text is
-    // committed before the warning interleaves.
+extern "C" void rt_case_violation(const char* banner, uint64_t now, int32_t kind) {
     std::fflush(stdout);
     std::string line = banner;
-    line += "priority case has no matching branch at time ";
+    line += kind == 0 ? "no condition is true in the unique/priority case at time "
+                      : "case statement is not unique (overlapping items) at time ";
     append_finish_time(line, now);
     line += '\n';
     std::fputs(line.c_str(), stderr);

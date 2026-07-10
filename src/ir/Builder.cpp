@@ -97,8 +97,9 @@ Index Builder::elem_select(Index base, Index index, Ref array_type, SourceLoc lo
     return emit({ Inst::Tag::ElemSelect, Inst::Payload{ .op_extra = { base, extra } } }, loc);
 }
 
-Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(Regions{ then_region, else_region });
+Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc,
+                    bool unlikely) {
+    const ExtraIndex extra = add_extra(Regions{ then_region, else_region, unlikely });
 
     return emit({ Inst::Tag::Cond, Inst::Payload{ .op_extra = { condition, extra } } }, loc);
 }
@@ -338,10 +339,10 @@ Index Builder::finish(std::string_view banner, uint32_t arg, SourceLoc loc) {
     return emit({ Inst::Tag::Finish, Inst::Payload{ .extra = extra } }, loc);
 }
 
-Index Builder::case_violation(std::string_view banner, SourceLoc loc) {
+Index Builder::case_violation(std::string_view banner, uint32_t kind, SourceLoc loc) {
     const ExtraIndex banner_at = add_bytes(banner);
     const ExtraIndex extra =
-      add_extra(FinishInfo{ banner_at, static_cast<uint32_t>(banner.size()), 0 });
+      add_extra(FinishInfo{ banner_at, static_cast<uint32_t>(banner.size()), kind });
     return emit({ Inst::Tag::CaseViol, Inst::Payload{ .extra = extra } }, loc);
 }
 

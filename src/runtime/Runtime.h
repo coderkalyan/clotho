@@ -78,14 +78,13 @@ void rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uin
 // content but not the stream).
 [[noreturn]] void rt_finish(const char* banner, uint64_t now, int32_t arg);
 
-// Report a priority-case violation (LRM 12.5.3): a `priority case` with no
-// default reached at runtime with no matching item. Prints a warning banner to
-// stderr and returns — non-fatal, the simulation continues. `banner` is the
+// Report a unique/priority case violation (LRM 12.5.3). Prints a warning banner
+// to stderr and returns — non-fatal, the simulation continues. `banner` is the
 // compile-time "<file>:<line>: " prefix; `now` is the current simulation time in
-// design ticks. Fires once per dynamic execution that finds no match, matching
-// iverilog. unique / unique0 overlap violations are a separate, unimplemented
-// check (see docs/TODO.md).
-void rt_case_violation(const char* banner, uint64_t now);
+// design ticks. `kind` selects the message: 0 = no case item matched (priority
+// or unique, no default), 1 = more than one case item matched (unique /
+// unique0 overlap). Fires once per dynamic execution that detects the violation.
+void rt_case_violation(const char* banner, uint64_t now, int32_t kind);
 
 // Install (or clear, with null) the setjmp target rt_finish longjmps to, so a
 // $finish ends only the simulation, not the embedding process (the test binary
