@@ -166,20 +166,6 @@ TEST_CASE("multidimensional instance array flattens each leaf with all indices")
     CHECK(names.contains("u[1][1].a"));
 }
 
-// Gate-primitive arrays share InstanceArraySymbol with module/interface arrays
-// in slang, but elaborate to PrimitiveInstanceSymbol elements — gate
-// primitives are not lowered at all yet (unsupported constructs
-// must fail loudly, not be silently dropped), so this must fail the same way
-// a single primitive gate instantiation already does.
-TEST_CASE("a gate-primitive instance array fails loudly") {
-    const LowerResult r = lower_text(R"(
-        module m(input a, input b, output [3:0] o);
-            and g[3:0](o, a, b);
-        endmodule
-    )");
-    CHECK_FALSE(r.ok);
-}
-
 // Per-instance connections (each array element wired to a distinct bit)
 // behave as N independent instances, not N copies sharing one connection —
 // exercised end-to-end with distinguishable per-element inputs.

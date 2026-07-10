@@ -679,45 +679,6 @@ const char* direction_name(SignalInfo::Direction dir) {
     return "?";
 }
 
-const char* gate_op_name(GateOp op) {
-    switch (op) {
-        case GateOp::And:
-            return "and";
-        case GateOp::Nand:
-            return "nand";
-        case GateOp::Or:
-            return "or";
-        case GateOp::Nor:
-            return "nor";
-        case GateOp::Xor:
-            return "xor";
-        case GateOp::Xnor:
-            return "xnor";
-        case GateOp::Buf:
-            return "buf";
-        case GateOp::Not:
-            return "not";
-    }
-
-    return "?";
-}
-
-// A 1-bit 4-state plane code as source-style text.
-const char* const_code_name(uint8_t code) {
-    switch (code & 3) {
-        case 0b00:
-            return "0";
-        case 0b11:
-            return "1";
-        default:
-            return "x";
-    }
-}
-
-void print_gate_term(std::ostream& os, GateTerm t) {
-    os << "s" << static_cast<uint32_t>(t.sig) << "[" << t.bit << "]";
-}
-
 } // namespace
 
 void print_module(const Module& m, std::ostream& os) {
@@ -729,26 +690,6 @@ void print_module(const Module& m, std::ostream& os) {
         os << "  s" << i << ": ";
         render_type(m.pool, s.type, os);
         os << " " << s.name << " (" << direction_name(s.dir) << ")\n";
-    }
-
-    const auto gates       = m.gates();
-    const auto gate_inputs = m.gate_inputs();
-    for (size_t i = 0; i < gates.size(); ++i) {
-        const GateInfo& g = gates[i];
-        os << "gate[" << i << "] " << gate_op_name(g.op) << " ";
-        print_gate_term(os, g.output);
-        os << " <-";
-        for (uint32_t k = 0; k < g.in_count; ++k) {
-            const GateInput& in = gate_inputs[g.in_start + k];
-            os << (k == 0 ? " " : ", ");
-            if (in.is_const) {
-                os << "const:" << const_code_name(in.const_code);
-            }
-            else {
-                print_gate_term(os, GateTerm{ in.sig, in.bit });
-            }
-        }
-        os << "\n";
     }
 
     const auto processes = m.processes();

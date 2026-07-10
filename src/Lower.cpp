@@ -1242,43 +1242,70 @@ private:
 
     // -- Gate primitives (LRM 28.4, 28.5) --
     //
-    // A gate instance is NOT lowered to a process: it becomes one row of the
-    // module's gate table, which the backend turns into constant metadata plus a
-    // shared table-driven eval loop (no per-gate coroutine or code). Terminals
-    // are therefore restricted to static 1-bit locations; any other input
-    // expression is an implicit continuous assignment to an implicit net (LRM
-    // 4.9.6), lowered here as a synthesized temp signal plus an ordinary
-    // continuous-assign process the gate reads from.
+    // Each gate instance lowers to a self-starting continuous-assign process:
+    // the same comb-process path that handles `assign` statements. This reuses
+    // the existing thunk elision, comb-fusion, and topo-sort infrastructure
+    // with no dedicated gate evaluation engine.
+    //
+    // Non-trivial terminal expressions (not a plain signal reference or constant
+    // bit-select) are first lowered to implicit nets via separate continuous
+    // assigns (LRM 4.9.6), same as before.
+
+    // Local gate types — not stored in the module; only used during lowering.
+    enum class GateOp : uint8_t { And, Nand, Or, Nor, Xor, Xnor, Buf, Not };
+    struct GateTerm  { ir::Signal sig = ir::Signal{0}; uint32_t bit = 0; };
+    struct GateInput { ir::Signal sig = ir::Signal{0}; uint32_t bit = 0;
+                       uint8_t const_code = 0; bool is_const = false; };
 
     // Map a built-in gate primitive name to its GateOp; nullopt for primitives
     // outside the supported set.
-    static std::optional<ir::GateOp> gate_op_of(std::string_view name) {
+    static std::optional<GateOp> gate_op_of(std::string_view name) {
         if (name == "and") {
-            return ir::GateOp::And;
+            return GateOp::And;
         }
         if (name == "nand") {
-            return ir::GateOp::Nand;
+            return GateOp::Nand;
         }
         if (name == "or") {
-            return ir::GateOp::Or;
+            return GateOp::Or;
         }
         if (name == "nor") {
-            return ir::GateOp::Nor;
+            return GateOp::Nor;
         }
         if (name == "xor") {
-            return ir::GateOp::Xor;
+            return GateOp::Xor;
         }
         if (name == "xnor") {
-            return ir::GateOp::Xnor;
+            return GateOp::Xnor;
         }
         if (name == "buf") {
-            return ir::GateOp::Buf;
+            return GateOp::Buf;
         }
         if (name == "not") {
-            return ir::GateOp::Not;
+            return GateOp::Not;
         }
 
         return std::nullopt;
+    }
+
+    // Fold IR op for each gate type (XNOR folds with XOR, then inverts).
+    static ir::Inst::Tag gate_fold_tag(GateOp op) {
+        switch (op) {
+            case GateOp::And:
+            case GateOp::Nand: return ir::Inst::Tag::Band;
+            case GateOp::Or:
+            case GateOp::Nor:
+            case GateOp::Buf:
+            case GateOp::Not:  return ir::Inst::Tag::Bor;
+            case GateOp::Xor:
+            case GateOp::Xnor: return ir::Inst::Tag::Bxor;
+        }
+        __builtin_unreachable();
+    }
+
+    static bool gate_inverted(GateOp op) {
+        return op == GateOp::Nand || op == GateOp::Nor ||
+               op == GateOp::Not  || op == GateOp::Xnor;
     }
 
     // Strip conversion wrappers whose operand is still a packed integral value.
@@ -1335,7 +1362,7 @@ private:
     // Resolve a terminal expression to a static (signal, bit) location if it is a
     // plain scalar reference, a constant bit-select, or a constant 1-bit
     // part-select of a packed signal (gate instance arrays produce the latter).
-    std::optional<ir::GateTerm> gate_static_term(const Expression& e) {
+    std::optional<GateTerm> gate_static_term(const Expression& e) {
         const Expression& base = unwrap_conversions(e);
         if (base.kind == ExpressionKind::NamedValue) {
             const ValueSymbol& sym = base.as<NamedValueExpression>().symbol;
@@ -1346,7 +1373,7 @@ private:
                 return std::nullopt;
             }
 
-            return ir::GateTerm{ .sig = signal_of(sym), .bit = 0 };
+            return GateTerm{ .sig = signal_of(sym), .bit = 0 };
         }
         if (base.kind == ExpressionKind::ElementSelect) {
             const ElementSelectExpression& es = base.as<ElementSelectExpression>();
@@ -1359,7 +1386,7 @@ private:
                 return std::nullopt;
             }
 
-            return ir::GateTerm{ .sig = *sig, .bit = *bit };
+            return GateTerm{ .sig = *sig, .bit = *bit };
         }
         if (base.kind == ExpressionKind::RangeSelect) {
             const RangeSelectExpression& rs = base.as<RangeSelectExpression>();
@@ -1373,7 +1400,7 @@ private:
                 return std::nullopt;
             }
 
-            return ir::GateTerm{ .sig = *sig, .bit = *bit };
+            return GateTerm{ .sig = *sig, .bit = *bit };
         }
 
         return std::nullopt;
@@ -1382,7 +1409,7 @@ private:
     // Lower one gate input terminal to a GateInput: a compile-time constant plane
     // code, a static 1-bit location, or (the general case, LRM 4.9.6) a synthesized
     // temp net continuously assigned from the expression.
-    ir::GateInput lower_gate_input(const Expression& e, std::string_view inst_name, uint32_t input_index) {
+    GateInput lower_gate_input(const Expression& e, std::string_view inst_name, uint32_t input_index) {
         // Constant fold first: literals, parameters, and constant expressions
         // (tie cells) melt into the gate at compile time. The terminal is bound
         // as 1-bit logic, so bit 0 of the folded value is the input; x and z both
@@ -1395,12 +1422,12 @@ private:
                 const slang::logic_t bit  = cv.integer()[0];
                 const uint8_t        code = bit.isUnknown() ? 0b10 : (bit.value != 0 ? 0b11 : 0b00);
 
-                return ir::GateInput{ .const_code = code, .is_const = true };
+                return GateInput{ .const_code = code, .is_const = true };
             }
         }
 
         if (const auto term = gate_static_term(e)) {
-            return ir::GateInput{ .sig = term->sig, .bit = term->bit };
+            return GateInput{ .sig = term->sig, .bit = term->bit };
         }
 
         // Implicit continuous assign to an implicit net: temp = expr, sensitive
@@ -1428,14 +1455,14 @@ private:
                                          .loc         = l,
                                          .ir          = b.finish() });
 
-        return ir::GateInput{ .sig = tmp, .bit = 0 };
+        return GateInput{ .sig = tmp, .bit = 0 };
     }
 
     // Lower one gate output terminal. slang wraps each output connection in an
     // AssignmentExpression whose left() is the driven lvalue; only a static 1-bit
     // location on a 4-state signal is accepted (a gate can drive X, which a
     // 2-state slot cannot hold).
-    ir::GateTerm lower_gate_output(const Expression& conn) {
+    GateTerm lower_gate_output(const Expression& conn) {
         if (conn.kind != ExpressionKind::Assignment) {
             fail("malformed gate output terminal");
         }
@@ -1483,24 +1510,86 @@ private:
         }
 
         // NInput: terminal 0 is the output, the rest are inputs. NOutput (buf /
-        // not): the last terminal is the input, the rest are outputs — lowered as
-        // one independent single-output gate per output terminal.
+        // not): the last terminal is the input, the rest are outputs — one
+        // independent process per output terminal.
         const bool n_output    = prim.primitiveKind == PrimitiveSymbol::NOutput;
         const auto input_span  = n_output ? conns.subspan(conns.size() - 1) : conns.subspan(1);
         const auto output_span = n_output ? conns.subspan(0, conns.size() - 1) : conns.subspan(0, 1);
 
-        std::vector<ir::GateInput> inputs;
+        std::vector<GateInput> inputs;
         inputs.reserve(input_span.size());
         for (size_t i = 0; i < input_span.size(); ++i) {
             inputs.push_back(lower_gate_input(*input_span[i], gi.name, static_cast<uint32_t>(i)));
         }
 
+        const ir::SourceLoc loc = to_source_loc(gi.location);
         for (const Expression* out : output_span) {
-            module_.add_gate(ir::GateInfo{ .op     = *op,
-                                           .output = lower_gate_output(*out),
-                                           .loc    = to_source_loc(gi.location) },
-                             inputs);
+            emit_gate_as_process(*op, lower_gate_output(*out), inputs, loc);
         }
+    }
+
+    // Lower one gate output as a continuous-assign process: fold inputs with the
+    // gate operation, store to the output bit, subscribe to input signal changes.
+    void emit_gate_as_process(GateOp op, GateTerm output,
+                              std::span<const GateInput> inputs, ir::SourceLoc l) {
+        ir::Builder   b(module_.pool);
+        const ir::Ref logic1 = module_.pool.logic_type;
+
+        // Intern a 1-bit logic constant from a gate const_code (must=bit0, may=bit1).
+        // Pool VPI encoding: val=may, xz=may&~must (bytes: val-plane then xz-plane).
+        auto make_gate_const = [&](uint8_t code) -> ir::Index {
+            switch (code & 3) {
+                case 0b00: return b.constant(module_.pool.put_int(logic1, 0), l);
+                case 0b11: return b.constant(module_.pool.put_int(logic1, 1), l);
+                default: {
+                    // X (and Z mapped to X, LRM Table 28-3): val=1, xz=1.
+                    const uint8_t xbytes[2] = {0x01, 0x01};
+                    return b.constant(module_.pool.put_value(logic1, {xbytes, 2}), l);
+                }
+            }
+        };
+
+        // lvalue for bit `bit` of `sig`: direct for a 1-bit signal, BitSelect
+        // for a bit of a wider packed signal.
+        const ir::Ref u32 = make_int_type(32, false, false);
+        auto bit_lv = [&](ir::Signal sig, uint32_t bit) -> ir::Index {
+            ir::Index s = b.signal(sig, l);
+            if (module_.pool.layout(module_.signal(sig).type).width == 1) {
+                return s;
+            }
+            return b.binary(ir::Inst::Tag::BitSelect, s,
+                            b.constant(module_.pool.put_int(u32, bit), l), l);
+        };
+
+        // Fold inputs using the gate's binary operation.
+        std::optional<ir::Index> acc;
+        const ir::Inst::Tag      fold = gate_fold_tag(op);
+        for (const GateInput& in : inputs) {
+            ir::Index val = in.is_const ? make_gate_const(in.const_code)
+                                        : b.unary(ir::Inst::Tag::Load, bit_lv(in.sig, in.bit), l);
+            acc = acc ? b.binary(fold, *acc, val, l) : val;
+        }
+        if (!acc) {
+            // 0-input degenerate gate: output X.
+            const uint8_t xbytes[2] = {0x01, 0x01};
+            acc = b.constant(module_.pool.put_value(logic1, {xbytes, 2}), l);
+        }
+        if (gate_inverted(op)) {
+            acc = b.unary(ir::Inst::Tag::Bnot, *acc, l);
+        }
+
+        b.binary(ir::Inst::Tag::Store, bit_lv(output.sig, output.bit),
+                 b.resize(*acc, logic1, l), l);
+
+        // Sensitivity: unique non-const input signals, any-change.
+        std::vector<ir::WaitEvent>                      wait_events;
+        ankerl::unordered_dense::set<uint32_t>          seen;
+        for (const GateInput& in : inputs) {
+            if (!in.is_const && seen.insert(static_cast<uint32_t>(in.sig)).second) {
+                wait_events.push_back(ir::WaitEvent{ .signal = in.sig, .edge = ir::Edge::Any });
+            }
+        }
+        add_continuous_process(std::move(wait_events), l, b);
     }
 
     // Wire one child instance's ports to the parent. Each connection becomes a
