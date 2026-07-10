@@ -51,6 +51,7 @@
 #include <slang/numeric/Time.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/text/SourceManager.h>
+#include <slang/util/SmallVector.h>
 
 #include "SourceMap.h"
 #include "ir/Builder.h"
@@ -556,11 +557,18 @@ private:
                 case SymbolKind::PrimitiveInstance:
                     lower_gate(m.as<PrimitiveInstanceSymbol>());
                     break;
-                case SymbolKind::InstanceArray:
-                    // Gate arrays lower per-element; module instance arrays fail
-                    // inside (TODO there).
-                    lower_primitive_array(m.as<InstanceArraySymbol>());
+                case SymbolKind::InstanceArray: {
+                    // An array of instances — gate primitives (LRM 28.3.6) or
+                    // modules/interfaces (LRM 23.3.6). Slang has already
+                    // elaborated one leaf symbol per element with per-instance
+                    // bit-sliced connections, so this only needs to walk to
+                    // the leaves and lower each like its scalar counterpart.
+                    lower_instance_array(m.as<InstanceArraySymbol>(), self_prefix, scope, self_mul);
+                    prefix_   = self_prefix;
+                    scope_    = &scope;
+                    time_mul_ = self_mul;
                     break;
+                }
                 // Known-inert members: elaboration artifacts and declarations
                 // that bear no simulation behavior of their own. Ports are wired
                 // by wire_ports; parameters/types/genvars are resolved by slang;
@@ -601,6 +609,62 @@ private:
         lower_members(block, block_prefix, self_mul);
     }
 
+    // Recurse through one (possibly multidimensional) array of instances —
+    // gate primitives (LRM 28.3.6) or modules/interfaces (LRM 23.3.6). Slang
+    // builds a nested InstanceArraySymbol per extra unpacked dimension (`foo
+    // u[3][4] (...)`), each ultimately bottoming out at a leaf symbol that
+    // already carries its own bit-sliced port/terminal connections — this
+    // only walks to those leaves and lowers each like its scalar counterpart.
+    // A module/interface leaf flattens under <array>[<index>], mirroring
+    // generate-loop arrays (gen_entry_name); a gate leaf needs no hierarchy
+    // bookkeeping of its own.
+    void lower_instance_array(const InstanceArraySymbol& arr, const std::string& self_prefix,
+                              const Scope& parent_scope, uint64_t self_mul) {
+        for (const Symbol* elem : arr.elements) {
+            switch (elem->kind) {
+                case SymbolKind::InstanceArray:
+                    lower_instance_array(elem->as<InstanceArraySymbol>(), self_prefix, parent_scope,
+                                        self_mul);
+                    break;
+                case SymbolKind::PrimitiveInstance:
+                    lower_gate(elem->as<PrimitiveInstanceSymbol>());
+                    break;
+                case SymbolKind::Instance: {
+                    const InstanceSymbol& child = elem->as<InstanceSymbol>();
+                    lower_instance(child, self_prefix + instance_array_element_name(child) + ".");
+                    prefix_   = self_prefix;
+                    scope_    = &parent_scope;
+                    time_mul_ = self_mul;
+                    wire_ports(child);
+                    break;
+                }
+                default:
+                    // A checker instance array: checkers aren't lowered at
+                    // all today, so fail the same way a lone one would.
+                    fail("unsupported instance array element kind=" + std::string(toString(elem->kind)));
+            }
+        }
+    }
+
+    // Hierarchical-path segment for one instance-array element: <array>[<i0>]
+    // [<i1>].... Mirrors slang's own hierarchical-path formatting (slang's
+    // Symbol::getHierarchicalPath): arrayPath holds one canonical (always
+    // zero-based) index per dimension, and adding each dimension's lower
+    // bound recovers the source-code index regardless of whether that
+    // dimension's range counts up or down.
+    static std::string instance_array_element_name(const InstanceSymbol& elem) {
+        std::string name(elem.getArrayName());
+        slang::SmallVector<slang::ConstantRange, 4> dims;
+        elem.getArrayDimensions(dims);
+        SLANG_ASSERT(dims.size() == elem.arrayPath.size());
+        for (size_t i = 0; i < dims.size(); i++) {
+            name += '[';
+            name += std::to_string(int32_t(elem.arrayPath[i]) + dims[i].lower());
+            name += ']';
+        }
+        return name;
+    }
+
     // Hierarchical-path segment for one loop-generate entry: <array>[<index>].
     // The entry's own name is empty; the genvar value (its arrayIndex) supplies
     // the subscript.
@@ -634,6 +698,16 @@ private:
         const slang::SourceLocation sl = call.sourceRange.start();
         return std::string(sm->getFileName(sl)) + ":" +
                std::to_string(sm->getLineNumber(sl)) + ": " + std::string(task);
+    }
+
+    // Compile-time "<file>:<line>: " banner prefix for a priority-case violation
+    // report, located at the case statement itself. The runtime appends the
+    // descriptive message and the simulation time (rt_case_violation).
+    std::string case_banner(const CaseStatement& c) const {
+        const slang::SourceManager* sm = scope_->getCompilation().getSourceManager();
+        const slang::SourceLocation sl = c.sourceRange.start();
+        return std::string(sm->getFileName(sl)) + ":" +
+               std::to_string(sm->getLineNumber(sl)) + ": ";
     }
 
     // -- Types --
@@ -854,6 +928,9 @@ private:
                     if (m.kind == SymbolKind::Net) {
                         const NetSymbol& net = m.as<NetSymbol>();
                         // Only single-driver, z-defaulting net kinds are modeled.
+                        // uwire (LRM 6.6.7) is complete, not a partial stub: its
+                        // single-driver mandate is enforced by slang's analysis
+                        // pass (MultipleUWireDrivers), which runs before lowering.
                         // TODO: wand/wor/tri0/tri1/trireg/supply0/supply1 carry
                         // resolution, pull, or charge semantics (and different
                         // undriven defaults) clotho does not implement.
@@ -1511,27 +1588,6 @@ private:
             }
         }
         add_continuous_process(std::move(wait_events), l, b);
-    }
-
-    // Lower an array of gate instances: slang has already elaborated one
-    // PrimitiveInstanceSymbol per element with per-instance bit-sliced terminal
-    // connections (LRM 28.3.6), so each leaf lowers like a scalar gate. Module
-    // instance arrays still fail (first non-primitive leaf aborts lowering).
-    void lower_primitive_array(const InstanceArraySymbol& arr) {
-        for (const Symbol* el : arr.elements) {
-            switch (el->kind) {
-                case SymbolKind::PrimitiveInstance:
-                    lower_gate(el->as<PrimitiveInstanceSymbol>());
-                    break;
-                case SymbolKind::InstanceArray:
-                    lower_primitive_array(el->as<InstanceArraySymbol>());
-                    break;
-                default:
-                    // TODO: module instance arrays (foo u[N](...)) — need
-                    // per-element elaboration and bit-sliced port connections.
-                    fail("instance arrays are not supported");
-            }
-        }
     }
 
     // Wire one child instance's ports to the parent. Each connection becomes a
@@ -2380,8 +2436,9 @@ private:
     // label gates it). Dropped for now: rare, and the constant path is what the
     // downstream jump-table lowering needs.
     //
-    // Skipped for unique/priority checks: their overlap is a reportable
-    // violation, so duplicates must survive (report emission is a TODO above).
+    // Skipped for unique/priority checks: a unique/unique0 overlap is a
+    // reportable violation, so duplicate labels must survive for
+    // lower_case_unique's predicate sum to detect them.
     // Returns keep[k][j] = whether item k's label j survives.
     std::vector<std::vector<char>> case_dedup(const CaseStatement& c) {
         std::vector<std::vector<char>> keep(c.items.size());
@@ -2449,11 +2506,16 @@ private:
     //
     // Dedup happens here in one pass (LRM 12.5 first-match: a later label
     // duplicating an earlier key is dead, so it is dropped), giving the switch
-    // unique keys without a second label evaluation. The caller only reaches
-    // this for a check==None Normal case; casez/casex and unique/priority keep
-    // the chain. Returns nullopt (-> chain) on the first non-constant or x/z
-    // label, or when the key is too wide.
-    std::optional<std::vector<SwitchArmPlan>> build_switch_arms(const CaseStatement& c) {
+    // unique keys without a second label evaluation. Returns nullopt (-> chain)
+    // on the first non-constant or x/z label, or when the key is too wide.
+    //
+    // `had_dup` (when non-null) reports whether a duplicate constant key was
+    // dropped. For a unique/unique0 case a dropped duplicate is a compile-time
+    // overlap violation, so the caller must route those to the chain (which emits
+    // the runtime overlap report) rather than the switch, which would silently
+    // merge the keys.
+    std::optional<std::vector<SwitchArmPlan>> build_switch_arms(const CaseStatement& c,
+                                                                bool* had_dup = nullptr) {
         uint32_t width = c.expr.type->getBitWidth();
         bool     four  = c.expr.type->isFourState();
         for (const CaseStatement::ItemGroup& item : c.items) {
@@ -2488,6 +2550,9 @@ private:
                 }
                 if (seen.insert(*u).second) {  // first occurrence wins; drop dups.
                     keys.push_back(*u);
+                }
+                else if (had_dup != nullptr) {
+                    *had_dup = true;
                 }
             }
             if (!keys.empty()) {
@@ -2658,28 +2723,39 @@ private:
             default:
                 fail("case ... inside is not supported");
         }
-        // NOTE: unique / unique0 / priority (c.check) only govern violation
-        // reporting, a runtime assertion; the first-match execution below is
-        // conforming for all of them.
-        // TODO: emit unique / priority violation reports.
+        // unique / unique0 / priority (c.check) add the LRM 12.5.3 violation
+        // checks; first-match execution is conforming for all of them.
+        //   - no-match (priority or unique, no default): kind-0 report. unique0
+        //     does NOT report no-match; a default can never no-match.
+        //   - overlap (unique / unique0, >1 item matches): kind-1 report. Distinct
+        //     constant labels can never overlap, so those keep the fast paths.
+        using Check = slang::ast::UniquePriorityCheck;
+        const bool no_match_report =
+          (c.check == Check::Priority || c.check == Check::Unique) && c.defaultCase == nullptr;
+        const bool needs_overlap = c.check == Check::Unique || c.check == Check::Unique0;
 
-        // The one-hot reverse-case idiom `case (1'b1)` over base[i] selects
-        // lowers to ctz/clz + jump table. See build_onehot_plan.
+        // The one-hot reverse-case idiom `case (1'b1)` over base[i] selects lowers
+        // to ctz/clz + jump table (check==None only; unique/priority keep the
+        // chain, see build_onehot_plan's TODO(unique)).
         if (std::optional<OneHotPlan> oh = build_onehot_plan(c)) {
             emit_onehot(c, *oh, b);
             return;
         }
 
         const ir::Ref   ty  = common_case_type(c);
-        // The selector is evaluated exactly once, up front (12.5).
+        // The selector is evaluated exactly once, up front (12.5 / 12.5.3).
         const ir::Index sel = b.resize(lower_expr(c.expr, b), ty, loc(c.expr));
 
-        // A constant, wildcard-free case lowers to a multiway switch (jump table)
-        // instead of an O(N) if-else compare chain. build_switch_arms dedups the
-        // keys itself, so this path never runs case_dedup. See build_switch_arms.
-        if (c.condition == CaseStatementCondition::Normal &&
-            c.check == slang::ast::UniquePriorityCheck::None) {
-            if (std::optional<std::vector<SwitchArmPlan>> plan = build_switch_arms(c)) {
+        // Constant, wildcard-free case -> multiway switch (jump table). Distinct
+        // constant labels can never overlap at runtime, so this fast path stays
+        // valid for unique/unique0; a dropped duplicate key would be a
+        // compile-time overlap, so had_dup routes those to the chain (which emits
+        // the runtime overlap report). A default-less priority/unique case reports
+        // no-match from the switch's own default region.
+        if (c.condition == CaseStatementCondition::Normal) {
+            bool                                      had_dup = false;
+            std::optional<std::vector<SwitchArmPlan>> plan    = build_switch_arms(c, &had_dup);
+            if (plan && !(needs_overlap && had_dup)) {
                 std::vector<ir::Builder::SwitchArmBuild> arms;
                 arms.reserve(plan->size());
                 for (const SwitchArmPlan& ap : *plan) {
@@ -2692,14 +2768,103 @@ private:
                 if (c.defaultCase != nullptr) {
                     lower_stmt(*c.defaultCase, b);
                 }
+                else if (no_match_report) {
+                    b.case_violation(case_banner(c), 0, loc(c));
+                }
                 const ir::ExtraSlice default_region = b.close_region();
                 b.switch_(sel, arms, default_region, loc(c.expr));
                 return;
             }
         }
 
+        // unique / unique0 need the eager overlap check; priority / plain use the
+        // lazy first-match chain.
+        if (needs_overlap) {
+            lower_case_unique(c, sel, cmp, ty, no_match_report, b);
+            return;
+        }
         const std::vector<std::vector<char>> keep = case_dedup(c);
-        lower_case_item(c, 0, sel, cmp, ty, keep, b);
+        lower_case_item(c, 0, sel, cmp, ty, keep, no_match_report, b);
+    }
+
+    // Eager lowering for unique / unique0 (LRM 12.5.3). Unlike the lazy
+    // first-match chain, every case_item predicate is evaluated once up front
+    // (the LRM permits any-order eager evaluation for unique/unique0: the
+    // case_expression is evaluated once before the items, items may be compared
+    // in any order, and side effects "may cause nondeterministic results"). The
+    // predicates are held in temps and reused for both the overlap check and the
+    // first-match dispatch, so labels are never re-evaluated.
+    //
+    // Overlap: sum the 1-bit predicates; > 1 match is a uniqueness violation
+    // (kind 1). The check is marked unlikely so the report stays off the hot
+    // path. First-match dispatch and the no-match report (unique only) reuse the
+    // temps and match the plain-case semantics exactly.
+    void lower_case_unique(const CaseStatement& c, ir::Index sel, ir::Inst::Tag cmp, ir::Ref ty,
+                           bool no_match_report, ir::Builder& b) {
+        const size_t           n = c.items.size();
+        std::vector<ir::Index> preds;
+        preds.reserve(n);
+        for (const CaseStatement::ItemGroup& item : c.items) {
+            // A case_item's predicate is the OR of (selector <cmp> label) over its
+            // labels; every item has at least one label. No dedup (a duplicate is
+            // a reportable overlap, not a dead label).
+            ir::Index pred{};
+            bool      have = false;
+            for (const Expression* e : item.expressions) {
+                const ir::Index val = b.resize(lower_expr(*e, b), ty, loc(*e));
+                const ir::Index one = b.binary(cmp, sel, val, loc(*e));
+                pred                = have ? b.binary(ir::Inst::Tag::Lor, pred, one, loc(*e)) : one;
+                have                = true;
+            }
+            preds.push_back(pred);
+        }
+
+        // Overlap = (sum of the 1-bit predicates) > 1. A 32-bit accumulator holds
+        // any realistic item count; the predicates are definite 2-state (=== never
+        // yields x), so the zero-extended sum is exact.
+        const ir::Ref       sumty = make_int_type(32, false, false);
+        const ir::SourceLoc cloc  = loc(c);
+        ir::Index       sum   = b.resize(preds[0], sumty, cloc);
+        for (size_t k = 1; k < n; k++) {
+            sum = b.binary(ir::Inst::Tag::Add, sum, b.resize(preds[k], sumty, cloc), cloc);
+        }
+        const ir::Index one_c   = b.constant(module_.pool.put_int(sumty, 1), cloc);
+        const ir::Index overlap = b.binary(ir::Inst::Tag::Gt, sum, one_c, cloc);
+
+        b.open_region();
+        b.case_violation(case_banner(c), 1, cloc);
+        const ir::ExtraSlice report_region = b.close_region();
+        b.open_region();
+        const ir::ExtraSlice empty_region = b.close_region();
+        b.cond(overlap, report_region, empty_region, cloc, /*unlikely=*/true);
+
+        dispatch_preds(c, 0, preds, no_match_report, b);
+    }
+
+    // First-match dispatch for a unique/unique0 case, reusing the precomputed
+    // predicate temps: item k's body runs when preds[k] is the first true one.
+    // The terminal else (no item matched) runs the default, else emits the
+    // no-match report when the caller requested it (unique, no default).
+    void dispatch_preds(const CaseStatement& c, size_t k, const std::vector<ir::Index>& preds,
+                        bool no_match_report, ir::Builder& b) {
+        if (k == c.items.size()) {
+            if (c.defaultCase != nullptr) {
+                lower_stmt(*c.defaultCase, b);
+            }
+            else if (no_match_report) {
+                b.case_violation(case_banner(c), 0, loc(c));
+            }
+            return;
+        }
+        b.open_region();
+        lower_stmt(*c.items[k].stmt, b);
+        const ir::ExtraSlice then_region = b.close_region();
+
+        b.open_region();
+        dispatch_preds(c, k + 1, preds, no_match_report, b);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        b.cond(preds[k], then_region, else_region, loc(*c.items[k].stmt));
     }
 
     // Emit the if-else chain for items[k..] into the current region: item k's
@@ -2707,11 +2872,20 @@ private:
     // default) as the else branch. Items are tested in textual order and the
     // first match wins; labels for items not yet reached are evaluated lazily,
     // inside the else regions, so they run only until a match is found.
+    //
+    // `report_viol` is set for a default-less priority/unique case: the terminal
+    // else (reached only when no item matched) emits a no-match violation report
+    // (LRM 12.5.3, kind 0). It is mutually exclusive with a default (a
+    // default-less case has no default branch here). This is the lazy chain used
+    // for priority / plain checks; unique/unique0 use the eager lower_case_unique.
     void lower_case_item(const CaseStatement& c, size_t k, ir::Index sel, ir::Inst::Tag cmp, ir::Ref ty,
-                         const std::vector<std::vector<char>>& keep, ir::Builder& b) {
+                         const std::vector<std::vector<char>>& keep, bool report_viol, ir::Builder& b) {
         if (k == c.items.size()) {
             if (c.defaultCase != nullptr) {
                 lower_stmt(*c.defaultCase, b);
+            }
+            else if (report_viol) {
+                b.case_violation(case_banner(c), 0, loc(c));
             }
             return;
         }
@@ -2735,7 +2909,7 @@ private:
         if (!have) {
             // No surviving label (empty group, or every label deduped away): the
             // body is unreachable, so continue the chain in the current region.
-            lower_case_item(c, k + 1, sel, cmp, ty, keep, b);
+            lower_case_item(c, k + 1, sel, cmp, ty, keep, report_viol, b);
             return;
         }
 
@@ -2744,7 +2918,7 @@ private:
         const ir::ExtraSlice then_region = b.close_region();
 
         b.open_region();
-        lower_case_item(c, k + 1, sel, cmp, ty, keep, b);
+        lower_case_item(c, k + 1, sel, cmp, ty, keep, report_viol, b);
         const ir::ExtraSlice else_region = b.close_region();
 
         b.cond(pred, then_region, else_region, loc(*item.stmt));

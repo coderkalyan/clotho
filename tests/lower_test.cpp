@@ -539,19 +539,6 @@ TEST_CASE("an inout port connection fails loudly") {
     CHECK(r.diagnostics.find("inout") != std::string::npos);
 }
 
-TEST_CASE("an instance array fails loudly") {
-    const LowerResult r = lower_text(R"(
-        module inv(input a, output y);
-            assign y = ~a;
-        endmodule
-        module top(input [3:0] g, output [3:0] o);
-            inv u[3:0](.a(g), .y(o));
-        endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("instance array") != std::string::npos);
-}
-
 TEST_CASE("whole unpacked array assignment fails loudly") {
     const LowerResult r = lower_text(R"(
         module top;
@@ -711,6 +698,72 @@ TEST_CASE("a parameter expression in a part-select bound folds") {
     )");
     REQUIRE_MESSAGE(r.ok, r.diagnostics);
     CHECK(signal_width(*r.module, "o") == 2);
+}
+
+// -- Type parameters (LRM 6.20.3) --
+
+TEST_CASE("a type parameter default sets a port width") {
+    const LowerResult r = lower_text(R"(
+        module m #(parameter type T = logic [7:0]) (output T o);
+            assign o = 8'hFF;
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    CHECK(signal_width(*r.module, "o") == 8);
+}
+
+TEST_CASE("a #() type override specializes each instance's width independently") {
+    const LowerResult r = lower_text(R"(
+        module m #(parameter type T = logic [7:0]) (output T o);
+            assign o = 0;
+        endmodule
+        module top(output [2:0] a, output [15:0] b);
+            m #(.T(logic [2:0])) u0(.o(a));
+            m #(.T(logic [15:0])) u1(.o(b));
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    CHECK(signal_width(*r.module, "u0.o") == 3);
+    CHECK(signal_width(*r.module, "u1.o") == 16);
+}
+
+TEST_CASE("a type parameter default sets an internal variable's width") {
+    const LowerResult r = lower_text(R"(
+        module m #(parameter type T = logic [3:0]) (output [3:0] o);
+            T v;
+            assign v = 4'd5;
+            assign o = v;
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    CHECK(signal_width(*r.module, "v") == 4);
+}
+
+TEST_CASE("a type parameter bound to an unsupported type fails loudly") {
+    // `event` is not integral/real/string/array, so it falls through
+    // lower_type's final guard; binding a type parameter to one must hit
+    // that guard too, not silently accept it.
+    const LowerResult r = lower_text(R"(
+        module m #(parameter type T = event);
+            T v;
+        endmodule
+    )");
+    CHECK(!r.ok);
+    CHECK(r.diagnostics.find("unsupported non-integral type") != std::string::npos);
+}
+
+TEST_CASE("a type parameter flows into a function argument and return type") {
+    const LowerResult r = lower_text(R"(
+        module m #(parameter type T = logic [7:0]) (input T a, output T o);
+            function automatic T f(T x);
+                f = x;
+            endfunction
+            assign o = f(a);
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    CHECK(signal_width(*r.module, "a") == 8);
+    CHECK(signal_width(*r.module, "o") == 8);
 }
 
 TEST_CASE("a task body neither adds to nor subtracts from always_comb sensitivity") {

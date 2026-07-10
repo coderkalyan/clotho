@@ -392,6 +392,7 @@ public:
         if (std::getenv("CLOTHO_COMB_FUSE_STAT") != nullptr) {
             report_comb_fuse_stat();
         }
+        compute_domain_spec();   // after fusion (thunk_group_): reads spec_group_ in lower_group
         build_wait_queues();
         build_sched_flags();
         build_nba_state();
@@ -995,20 +996,68 @@ private:
             cur_is_task_      = false;
             lowering_preinit_ = false;
             hdl_              = nullptr;
-            b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
+            auto* entry_bb = llvm::BasicBlock::Create(ctx_, "entry", fn_);
+            b_.SetInsertPoint(entry_bb);
             // Run each member body per activation, freeing its string temporaries
             // afterward — a thunk has no frame to persist them in (a per-call cost
             // paid only by string-using bodies). frame_slots_ is empty for a
             // process, so deinit_body_strings frees exactly this member's temps.
-            for (const uint32_t m : members) {
-                select_member(m);
-                str_vals_.assign(ir_->inst_count(), nullptr);
-                build_str_temps();
-                lower_region(ir_->root());
-                deinit_body_strings();
+            const auto lower_bodies = [&] {
+                for (const uint32_t m : members) {
+                    select_member(m);
+                    str_vals_.assign(ir_->inst_count(), nullptr);
+                    build_str_temps();
+                    lower_region(ir_->root());
+                    deinit_body_strings();
+                }
+                b_.CreateStore(b_.getInt32(0), sched_ptr_); // re-arm: ready to be woken
+                b_.CreateRetVoid();
+            };
+            const uint32_t g = group_of_[proc_index];
+            if (!spec_group_[g]) {
+                lower_bodies();
+                return fn_;
             }
-            b_.CreateStore(b_.getInt32(0), sched_ptr_); // re-arm: ready to be woken
-            b_.CreateRetVoid();
+            // Domain-specialized group: validate the read set reader-side. Load
+            // each tracked 4-state signal's packed word and test it clean (no
+            // x/z bit); short-circuit to the generic body on the first dirty
+            // signal. When every read is clean the assume-clean fast body is
+            // exact (see compute_domain_spec). The guard loads CSE with the
+            // body's own loads of the same signals (early-cse), so the marginal
+            // guard cost is the x/z tests, not the loads — and a persistently
+            // dirty read set exits after ~one test. No write-side maintenance:
+            // the check reads the committed live state at dispatch, so nothing
+            // is paid at write sites (unlike the tag/counter scheme this
+            // replaced, whose per-write retest was the whole ungated residual).
+            auto* gen_bb  = llvm::BasicBlock::Create(ctx_, "dom.gen", fn_);
+            auto* fast_bb = llvm::BasicBlock::Create(ctx_, "dom.fast", fn_);
+            for (const uint32_t si : group_reads_[g]) {
+                const LValue   lv = signal_lvalue(static_cast<Signal>(si));
+                llvm::Value*   mm = load_lv_mm(lv); // i2W packed must|may word
+                const uint32_t w  = lv.store_width;
+                llvm::Value*   xz = b_.CreateTrunc(
+                  b_.CreateXor(mm, b_.CreateLShr(mm, llvm::ConstantInt::get(mm->getType(), w))), int_ty(w));
+                auto* next = llvm::BasicBlock::Create(ctx_, "dom.chk", fn_);
+                b_.CreateCondBr(b_.CreateICmpEQ(xz, zero(w)), next, gen_bb);
+                b_.SetInsertPoint(next);
+            }
+            const auto bump = [&](llvm::GlobalVariable* gv) {
+                if (!dom_debug_) {
+                    return;
+                }
+                auto* p = llvm::ConstantExpr::getInBoundsGetElementPtr(
+                  dom_cnt_ty_, gv, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(g) });
+                b_.CreateStore(b_.CreateAdd(b_.CreateLoad(b_.getInt64Ty(), p), b_.getInt64(1)), p);
+            };
+            b_.CreateBr(fast_bb);
+            b_.SetInsertPoint(gen_bb);
+            bump(dom_ngen_gv_);
+            lower_bodies();
+            b_.SetInsertPoint(fast_bb);
+            bump(dom_nfast_gv_);
+            assume_clean_ = true;
+            lower_bodies();
+            assume_clean_ = false;
             return fn_;
         }
 
@@ -2768,6 +2817,350 @@ private:
         }
     }
 
+    // -- Dynamic domain specialization (opt-in: config_.domain_spec) --
+    //
+    // A 4-state signal rarely changes domain at runtime: typically x until
+    // reset, then clean (no x/z bit) for the rest of the run. When enabled,
+    // every thunk group whose body meets spec_eligible_body is compiled twice —
+    // the generic 4-state body, plus a fast body lowered as if every 4-state
+    // value were 2-state (assume_clean_ makes type_of report 4-state as
+    // 2-state, routing every operator through the native 2-state paths; stores
+    // lift back to the packed planes via to_four, so storage and outside
+    // readers see identical bits). Dispatch is reader-side (lower_group): at
+    // each activation the group's tracked read-set signals are loaded and
+    // tested for cleanliness, short-circuiting to the generic body on the first
+    // dirty one. The fast body runs only when the whole read set is clean,
+    // where 2-state and 4-state lowering agree exactly, so results are
+    // identical by construction — only speed changes. Reader-side validation
+    // carries no write-side cost: nothing is maintained at store / NBA-commit
+    // sites.
+    //
+    // No profitability gate. The feature is off by default and applies to
+    // every eligible group when opted in — the fast body's 4-state<->2-state
+    // boundary conversions are amortized only by op-dense bodies, so it is not
+    // a universal win, but choosing that trade-off is the caller's job, not a
+    // magic-number heuristic in the backend. See docs/design/domain-spec.md.
+
+    // Whether one member body may be lowered under assume_clean_. Allow-list:
+    // any tag not listed keeps the group generic, so newly added IR tags are
+    // safe by default. Rejected classes:
+    //  - x-generators (Div / Mod / Pow: a clean-input op whose 4-state result
+    //    can be x, which the 2-state path folds to 0 — observably different);
+    //  - dynamic bit/part selects (an out-of-range or unknown index reads x in
+    //    4-state but 0 on the 2-state path; TODO: admit provably in-range
+    //    selects) and array element selects (per-element cleanliness is not
+    //    tracked);
+    //  - Call (the callee body is lowered generically and may blocking-write
+    //    x into this group's read set mid-activation, invalidating the
+    //    entry-time dispatch);
+    //  - runtime write-backs ($fgets / $*scanf / $fread / $readmem / $ferror:
+    //    they can deposit x mid-body through a pointer);
+    //  - strings (separate value machinery, no need to prove it x-safe);
+    //  - constants carrying x/z bits (their must-plane projection would lose
+    //    the x/z, e.g. casez wildcard patterns).
+    // Debug companion of spec_eligible_body: the numeric Inst::Tag of the
+    // first rejecting instruction, or -1. Kept trivially in sync by calling
+    // the same predicate per single-instruction window.
+    int spec_first_reject(const Ir& ir) {
+        for (size_t k = 0; k < ir.inst_count(); ++k) {
+            if (!spec_inst_ok(ir, static_cast<Index>(k))) {
+                return static_cast<int>(ir.tag(static_cast<Index>(k)));
+            }
+        }
+        return -1;
+    }
+
+    bool spec_eligible_body(const Ir& ir) {
+        for (size_t k = 0; k < ir.inst_count(); ++k) {
+            if (!spec_inst_ok(ir, static_cast<Index>(k))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // The tightest provable bound (in bits) on a select index value: the
+    // lowering zero-extends the index's must bits, so its width bounds it by
+    // 2^w - 1 — but the frontend resizes every index to 32 bits first, so
+    // peel widening Resizes of unsigned sources back to the true source
+    // width (a zext preserves the bound; a sext of a signed source can turn
+    // a negative into a huge zext'd index, so peeling stops there).
+    uint32_t spec_index_bound_width(const Ir& ir, Index idx) {
+        uint32_t w = type_of(idx).width;
+        while (ir.tag(idx) == Inst::Tag::Resize) {
+            const Index   src = ir.payload(idx).op_type.op;
+            const ValType st  = type_of(src);
+            if (st.is_signed && type_of(idx).width > st.width) {
+                break;
+            }
+            w   = std::min(w, st.width);
+            idx = src;
+        }
+        // A constant index (e.g. a localparam, typed 32-bit) is bounded by its
+        // actual value's bit length. Its x/z-freedom was already established:
+        // the eligibility scan visits operands before users (flat store is in
+        // creation order) and rejects any x/z-carrying constant outright.
+        if (ir.tag(idx) == Inst::Tag::Constant) {
+            const Ref                      ref   = ir.payload(idx).ref;
+            const Value&                   v     = std::get<Value>(mod_.pool.get(ref));
+            const std::span<const uint8_t> bytes = mod_.pool.bytes(ref);
+            const uint32_t                 pb    = plane_bytes(mod_.pool.layout(v.type).width);
+            uint32_t                       bits  = 0;
+            for (uint32_t bi = 0; bi < pb && bi < bytes.size(); ++bi) {
+                if (bytes[bi] != 0) {
+                    bits = 8 * bi + (32 - static_cast<uint32_t>(std::countl_zero(uint32_t{ bytes[bi] })));
+                }
+            }
+            w = std::min(w, bits);
+        }
+        return w;
+    }
+
+    // One instruction of the eligibility scan (see spec_eligible_body).
+    bool spec_inst_ok(const Ir& ir, Index idx) {
+        {
+            const Inst::Payload& p = ir.payload(idx);
+            switch (ir.tag(idx)) {
+                case Inst::Tag::Constant: {
+                    const Value& v = std::get<Value>(mod_.pool.get(p.ref));
+                    if (std::get<Type>(mod_.pool.get(v.type)).kind == Type::Kind::String) {
+                        return false;
+                    }
+                    const Layout lay = mod_.pool.layout(v.type);
+                    if (lay.domain == Domain::Four) {
+                        const auto     bytes = mod_.pool.bytes(p.ref);
+                        const uint32_t pb    = plane_bytes(lay.width);
+                        for (uint32_t bi = pb; bi < 2 * pb && bi < bytes.size(); ++bi) {
+                            if (bytes[bi] != 0) {
+                                return false; // x/z bits in the literal
+                            }
+                        }
+                    }
+                    break;
+                }
+                case Inst::Tag::Signal: {
+                    const SignalSlot& s = slots_[static_cast<uint32_t>(p.signal)];
+                    if (s.is_string || s.is_array) {
+                        return false;
+                    }
+                    break;
+                }
+                // A dynamic bit/part select is admitted when it provably cannot
+                // go out of range: the lowering zero-extends the index's must
+                // bits (lower_inst BitSelect/DynPartSelect), so a w-bit index is
+                // bounded by 2^w - 1 regardless of signedness, and a fast-body
+                // index is clean by construction — in range, the 2-state select
+                // equals the 4-state one exactly. Anything wider falls back to
+                // generic (an out-of-range read is x in 4-state, 0 in 2-state).
+                case Inst::Tag::BitSelect: {
+                    const ValType  base = type_of(p.binary.l);
+                    const uint32_t iw   = spec_index_bound_width(ir, p.binary.r);
+                    if (iw < 32 && (1u << iw) <= base.width) {
+                        break;
+                    }
+                    return false;
+                }
+                case Inst::Tag::DynPartSelect: {
+                    const auto     dps  = ir.extra_data<DynPartSelect>(p.op_extra.extra);
+                    const ValType  base = type_of(p.op_extra.op);
+                    const uint32_t ow   = spec_index_bound_width(ir, dps.offset);
+                    if (ow < 32 && (1u << ow) - 1 + dps.width <= base.width) {
+                        break;
+                    }
+                    return false;
+                }
+                // NOTE: PartSelect is the constant [msb:lsb] form; slang rejects
+                // an out-of-range constant select of a packed type, so it cannot
+                // read x on a clean base.
+                case Inst::Tag::PartSelect:
+                case Inst::Tag::Load:
+                case Inst::Tag::Store:
+                case Inst::Tag::StoreNb:
+                case Inst::Tag::Add:
+                case Inst::Tag::Sub:
+                case Inst::Tag::Mul:
+                case Inst::Tag::Band:
+                case Inst::Tag::Bor:
+                case Inst::Tag::Bxor:
+                case Inst::Tag::Bxnor:
+                case Inst::Tag::Bnot:
+                case Inst::Tag::RedAnd:
+                case Inst::Tag::RedOr:
+                case Inst::Tag::RedXor:
+                case Inst::Tag::Ctz:
+                case Inst::Tag::Clz:
+                case Inst::Tag::Sll:
+                case Inst::Tag::Srl:
+                case Inst::Tag::Sra:
+                case Inst::Tag::Eq:
+                case Inst::Tag::Ne:
+                case Inst::Tag::Lt:
+                case Inst::Tag::Le:
+                case Inst::Tag::Gt:
+                case Inst::Tag::Ge:
+                // Case/wildcard equality with clean operands is a plain compare;
+                // wildcard-carrying patterns were rejected at their Constant.
+                case Inst::Tag::CaseEq:
+                case Inst::Tag::CasezEq:
+                case Inst::Tag::CasexEq:
+                case Inst::Tag::WildEq:
+                // Reals never carry x/z; conversions from clean operands and
+                // real math results are always defined.
+                case Inst::Tag::FAdd:
+                case Inst::Tag::FSub:
+                case Inst::Tag::FMul:
+                case Inst::Tag::FDiv:
+                case Inst::Tag::FPow:
+                case Inst::Tag::FNeg:
+                case Inst::Tag::FEq:
+                case Inst::Tag::FNe:
+                case Inst::Tag::FLt:
+                case Inst::Tag::FLe:
+                case Inst::Tag::FGt:
+                case Inst::Tag::FGe:
+                case Inst::Tag::ItoF:
+                case Inst::Tag::FtoI:
+                case Inst::Tag::FtoITrunc:
+                case Inst::Tag::FBitcast:
+                case Inst::Tag::FResize:
+                case Inst::Tag::RealMath:
+                case Inst::Tag::Land:
+                case Inst::Tag::Lor:
+                case Inst::Tag::Lnot:
+                case Inst::Tag::Select:
+                case Inst::Tag::SelectLazy:
+                case Inst::Tag::Concat:
+                case Inst::Tag::Repl:
+                case Inst::Tag::Resize:
+                case Inst::Tag::Cond:
+                case Inst::Tag::Switch:
+                case Inst::Tag::Loop:
+                case Inst::Tag::Break:
+                case Inst::Tag::Continue:
+                case Inst::Tag::Display:
+                case Inst::Tag::Finish:
+                case Inst::Tag::CaseViol:
+                case Inst::Tag::Fflush:
+                case Inst::Tag::Fclose:
+                case Inst::Tag::Fopen:
+                case Inst::Tag::FileValueOp:
+                case Inst::Tag::TimeFormat:
+                case Inst::Tag::SimTime:
+                case Inst::Tag::Random:
+                // $clog2 of a clean operand is never x.
+                case Inst::Tag::Clog2:
+                    break;
+                default:
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    // Decide which thunk groups get a specialized fast body and record each
+    // one's tracked read set (its 4-state scalar signal loads) in
+    // group_reads_. Reader-side validation (lower_group) recomputes the
+    // fast/generic choice from live signal words at each dispatch, so no
+    // persistent per-signal / per-group tracking state is built here. Runs
+    // after build_state_types (slot facts) and compute_fusion_groups
+    // (thunk_group_).
+    void compute_domain_spec() {
+        const auto all     = mod_.processes();
+        const auto ngroups = static_cast<uint32_t>(groups_.size());
+        spec_group_.assign(ngroups, false);
+        group_reads_.assign(ngroups, {});
+        if (!config_.domain_spec) {
+            return;
+        }
+        dom_debug_ = getenv("CLOTHO_DOM_DEBUG") != nullptr;
+
+        bool any_spec = false;
+        for (uint32_t g = 0; g < ngroups; ++g) {
+            if (!thunk_group_[g]) {
+                continue;
+            }
+            bool                  ok = true;
+            std::vector<uint32_t> reads;
+            for (const uint32_t m : groups_[g]) {
+                const Ir& ir = all[m].ir;
+                // The eligibility scan queries operand types (bounded-select
+                // proofs), so bind the member like select_member does; lowering
+                // re-binds later. assume_clean_ is off here — real domains.
+                ir_ = &ir;
+                types_.assign(ir.inst_count(), std::optional<ValType>{});
+                if (!spec_eligible_body(ir)) {
+                    if (dom_debug_) {
+                        fprintf(stderr, "DOM reject g=%u proc=%u insts=%zu first_bad=%d\n", g, m,
+                                ir.inst_count(), spec_first_reject(ir));
+                    }
+                    ok = false;
+                    break;
+                }
+                for (size_t k = 0; k < ir.inst_count(); ++k) {
+                    const auto idx = static_cast<Index>(k);
+                    if (ir.tag(idx) != Inst::Tag::Load) {
+                        continue;
+                    }
+                    const LvalueRoot r = lvalue_root(ir, ir.payload(idx).unary);
+                    if (ir.tag(r.root) != Inst::Tag::Signal) {
+                        continue;
+                    }
+                    const auto        si = static_cast<uint32_t>(ir.payload(r.root).signal);
+                    const SignalSlot& s  = slots_[si];
+                    if (s.four_state && !s.is_array && !s.is_string) {
+                        reads.push_back(si);
+                    }
+                }
+            }
+            std::sort(reads.begin(), reads.end());
+            reads.erase(std::unique(reads.begin(), reads.end()), reads.end());
+            // A group with no 4-state reads gains nothing from a second body:
+            // its generic lowering already runs the native 2-state paths.
+            if (!ok || reads.empty()) {
+                continue;
+            }
+            // No profitability gate: domain specialization is a fully opt-in
+            // feature (config_.domain_spec, off by default), so when it is on
+            // every eligible group is specialized. The fast body pays
+            // 4-state<->2-state boundary conversions that only op-dense bodies
+            // amortize, so it is not a universal win — but that trade-off is
+            // the caller's to make by opting in, not a static heuristic baked
+            // into the backend. See docs/design/domain-spec.md.
+            if (dom_debug_) {
+                fprintf(stderr, "DOM group g=%u procs=[", g);
+                for (const uint32_t m : groups_[g]) {
+                    fprintf(stderr, "%u ", m);
+                }
+                fprintf(stderr, "] reads=[");
+                for (const uint32_t si : reads) {
+                    fprintf(stderr, "%u:%s ", si, mod_.signals()[si].name.c_str());
+                }
+                fprintf(stderr, "]\n");
+            }
+            spec_group_[g]   = true;
+            any_spec         = true;
+            group_reads_[g]  = std::move(reads);
+        }
+
+        // Reader-side validation carries no persistent tracking state: the
+        // fast/generic choice is recomputed from live signal words at each
+        // dispatch (see lower_group), so there are no per-signal tags or
+        // per-group counters to build here. Debug-only dispatch counters are
+        // the sole globals, created under CLOTHO_DOM_DEBUG.
+        if (!any_spec || !dom_debug_) {
+            return;
+        }
+        auto* i64   = llvm::Type::getInt64Ty(ctx_);
+        auto* i32t  = llvm::Type::getInt32Ty(ctx_);
+        dom_cnt_ty_ = llvm::ArrayType::get(i64, std::max<uint32_t>(ngroups, 1));
+        dom_nfast_gv_ = new llvm::GlobalVariable(llmod_, dom_cnt_ty_, false, llvm::GlobalValue::ExternalLinkage,
+                                                 llvm::ConstantAggregateZero::get(dom_cnt_ty_), "clotho.dom_nfast");
+        dom_ngen_gv_ = new llvm::GlobalVariable(llmod_, dom_cnt_ty_, false, llvm::GlobalValue::ExternalLinkage,
+                                                llvm::ConstantAggregateZero::get(dom_cnt_ty_), "clotho.dom_ngen");
+        new llvm::GlobalVariable(llmod_, i32t, true, llvm::GlobalValue::ExternalLinkage,
+                                 llvm::ConstantInt::get(i32t, ngroups), "clotho.dom_ngroups");
+    }
+
     // Build the nonblocking-assignment update state: a constant per-signal metadata
     // table (live/shadow/mask offsets plus the wait-queue base/cap/len pointers the
     // block commit services from). Must run after build_state_layout (slot offsets,
@@ -4192,12 +4585,28 @@ private:
 
     // -- Type inference (memoized) --
 
+    // Fast-body domain projection (compute_domain_spec): while assume_clean_ is
+    // set, every 4-state value type reads as 2-state, so the whole body lowers
+    // through the native 2-state operator paths. Sound because the fast body
+    // only runs when its read set is proven clean at runtime, and eligibility
+    // rejected every construct that could produce or consume x/z. Applied both
+    // here (covers compute_type's hardcoded 4-state results — comparisons,
+    // Clog2, Signal) and in from_ref (covers its direct conversion-target
+    // callers). The types_ cache is reset per body pass (select_member), so
+    // fast and generic passes never share entries.
+    ValType domain_fake(ValType t) const {
+        if (assume_clean_ && t.four_state && !t.is_string && !t.is_real) {
+            t.four_state = false;
+        }
+        return t;
+    }
+
     ValType type_of(Index i) {
         const auto slot = static_cast<uint32_t>(i);
         if (types_[slot]) {
             return *types_[slot];
         }
-        const ValType t = compute_type(i);
+        const ValType t = domain_fake(compute_type(i));
         types_[slot]    = t;
         return t;
     }
@@ -4210,8 +4619,8 @@ private:
         const Layout lay = mod_.pool.layout(type);
         const bool fl = mod_.pool.is_float(type);
         // Reals are signed quantities (LRM 11.8.1).
-        return { lay.width == 0 ? 1 : lay.width, lay.domain == Domain::Four, ty.is_signed || fl,
-                 false, fl };
+        return domain_fake({ lay.width == 0 ? 1 : lay.width, lay.domain == Domain::Four,
+                             ty.is_signed || fl, false, fl });
     }
 
     ValType compute_type(Index i) {
@@ -4419,6 +4828,7 @@ private:
             case Inst::Tag::Display:
             case Inst::Tag::TimeFormat:
             case Inst::Tag::Finish:
+            case Inst::Tag::CaseViol:
             case Inst::Tag::Fflush:
             case Inst::Tag::Fclose:
             case Inst::Tag::Sformat:
@@ -5121,6 +5531,12 @@ private:
                 // $finish / $stop: rt_finish prints the banner then exits, never
                 // returning (noreturn), so the optimizer prunes the region tail.
                 lower_finish(i);
+                return;
+
+            case Inst::Tag::CaseViol:
+                // priority-case violation: rt_case_violation warns and returns
+                // (non-fatal), so the region continues normally after it.
+                lower_case_viol(i);
                 return;
 
             case Inst::Tag::Fflush:
@@ -5855,6 +6271,28 @@ private:
                                   ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
                                   : static_cast<llvm::Value*>(b_.getInt64(0));
         b_.CreateCall(finish_fn(),
+                      { b_.CreateGlobalString(banner), now, b_.getInt32(info.arg) });
+    }
+
+    // void rt_case_violation(ptr banner, i64 now, i32 kind) — warns and returns
+    // (non-fatal). kind selects the message (0 = no match, 1 = overlap).
+    llvm::FunctionCallee case_violation_fn() {
+        return rt_fn("rt_case_violation", b_.getVoidTy(),
+                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty() });
+    }
+
+    // Lower a unique/priority case violation report: pass the compile-time banner
+    // prefix, the current simulation time, and the message kind (FinishInfo.arg);
+    // the runtime warns and returns, so the region continues. The wheel fallback
+    // mirrors lower_finish: a case inside a pure function has no wheel and reports
+    // time 0 (same TODO as $finish).
+    void lower_case_viol(Index i) {
+        const auto        info   = ir_->extra_data<FinishInfo>(ir_->payload(i).extra);
+        const std::string banner = ir_->extra_bytes(info.banner, info.banner_len);
+        llvm::Value*      now = has_wheel()
+                                  ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
+                                  : static_cast<llvm::Value*>(b_.getInt64(0));
+        b_.CreateCall(case_violation_fn(),
                       { b_.CreateGlobalString(banner), now, b_.getInt32(info.arg) });
     }
 
@@ -7844,7 +8282,11 @@ private:
         auto* then_bb = llvm::BasicBlock::Create(ctx_, "then", fn_);
         auto* else_bb = llvm::BasicBlock::Create(ctx_, "else", fn_);
         auto* cont_bb = llvm::BasicBlock::Create(ctx_, "endif", fn_);
-        b_.CreateCondBr(take, then_bb, else_bb);
+        // A cold branch (violation check) biases weights toward the else path so
+        // codegen lays the then-block out of line.
+        llvm::MDNode* weights =
+          regs.unlikely ? llvm::MDBuilder(ctx_).createBranchWeights(1, 2000) : nullptr;
+        b_.CreateCondBr(take, then_bb, else_bb, weights);
 
         b_.SetInsertPoint(then_bb);
         lower_region(ir_->region(regs.then_));
@@ -8104,6 +8546,24 @@ private:
     // group is suspension-free), not a coroutine. Drives lower_group's emission
     // and the seed/drain dispatch, kept as one table so all three agree.
     std::vector<bool>                   thunk_group_;
+    // Dynamic domain specialization (compute_domain_spec). spec_group_: this
+    // thunk group carries a second, assume-clean body chosen reader-side at
+    // dispatch. group_reads_[g]: the group's tracked read set (4-state scalar
+    // signal indices) the dispatch guard tests for cleanliness. assume_clean_
+    // flips type_of/from_ref to report 4-state as 2-state while the fast body
+    // lowers.
+    bool                                assume_clean_ = false;
+    std::vector<bool>                   spec_group_;
+    std::vector<std::vector<uint32_t>>  group_reads_;
+    // CLOTHO_DOM_DEBUG: count fast/generic dispatches per group
+    // (clotho.dom_nfast / dom_ngen) and dump the read sets / rejections to
+    // stderr — run_jit prints the runtime dispatch counts after the sim
+    // (Jit.cpp). Diagnosis only; zero cost when the env var is unset (checked
+    // at compile time). Requires --domain-spec to be on.
+    bool                                dom_debug_ = false;
+    llvm::GlobalVariable*               dom_nfast_gv_ = nullptr;
+    llvm::GlobalVariable*               dom_ngen_gv_  = nullptr;
+    llvm::ArrayType*                    dom_cnt_ty_   = nullptr;
     // Per-signal wait queues, indexed by Signal handle and then by edge bucket
     // (`[signal][static_cast<uint32_t>(edge)]`: 0=pos, 1=neg, 2=any); null where the
     // signal has no waiter of that (kind, edge). Splitting by edge hoists the

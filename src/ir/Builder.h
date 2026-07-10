@@ -63,7 +63,10 @@ public:
     // Unpacked-array element select base[index]. `array_type` is the interned
     // UnpackedArray type being indexed (gives element stride + declared bounds).
     Index elem_select(Index base, Index index, Ref array_type, SourceLoc loc);
-    Index cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc);
+    // `unlikely` hints that the condition is rarely true (e.g. a violation
+    // check), so the backend biases branch weights toward the else path.
+    Index cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc,
+               bool unlikely = false);
     // One arm of a `switch`: the constant case-value keys that select it and the
     // arm's already-closed body region. Several keys share one body for a grouped
     // case item. See Builder::switch_.
@@ -169,6 +172,11 @@ public:
     // prefix "<file>:<line>: <task>"; `arg` is the diagnostic level (0/1/2, LRM
     // Table 20-1). No SSA operands.
     Index finish(std::string_view banner, uint32_t arg, SourceLoc loc);
+    // Unique/priority case violation report (LRM 12.5.3). `banner` is the
+    // compile-time prefix "<file>:<line>: "; `kind` selects the message (0 = no
+    // item matched, 1 = overlapping items). Non-fatal, warns and returns. No SSA
+    // operands.
+    Index case_violation(std::string_view banner, uint32_t kind, SourceLoc loc);
     // $fflush: flush the descriptor `handle`'s output buffers. The no-argument
     // form passes a constant 0 (the runtime flushes every open stream).
     Index fflush(Index handle, SourceLoc loc);

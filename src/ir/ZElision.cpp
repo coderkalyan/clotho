@@ -354,6 +354,7 @@ struct Analysis {
                 case Inst::Tag::Display:
                 case Inst::Tag::TimeFormat:
                 case Inst::Tag::Finish:
+                case Inst::Tag::CaseViol:
                 case Inst::Tag::Fflush:
                 case Inst::Tag::SimTime:
                 case Inst::Tag::Random:

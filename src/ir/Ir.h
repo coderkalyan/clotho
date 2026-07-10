@@ -205,6 +205,9 @@ struct Regions {
     ExtraSlice then_;
     // Instructions executed when the condition is false.
     ExtraSlice else_;
+    // Hint that the condition is rarely true; biases backend branch weights
+    // toward the else path (e.g. a violation check).
+    bool unlikely = false;
 };
 
 // Extra payload for `select_lazy`: a value-producing conditional (the predicate
@@ -861,6 +864,11 @@ struct Inst {
         // mechanism a suspend is observationally an exit, so both are treated
         // identically apart from the banner's task name.
         Finish,
+        // priority-case violation report (payload: extra -> FinishInfo, reusing
+        // the banner prefix; arg is unused). LRM 12.5.3: a `priority case` with
+        // no default reached at runtime with no matching item. Non-fatal —
+        // lowers to an rt_case_violation call that warns and returns.
+        CaseViol,
         // $fflush: flush a descriptor's output buffers (payload: unary, the
         // descriptor value; the no-argument form passes a constant 0, which the
         // runtime treats as "flush all"). LRM §21.3.6. Lowers to an rt_fflush call.

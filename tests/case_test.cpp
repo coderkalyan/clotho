@@ -517,3 +517,274 @@ TEST_CASE("one-hot non-monotonic order falls back to chain (source priority)") {
     )";
     CHECK(run_capture(src) == "n0\n");
 }
+
+namespace {
+
+// JIT-run a module and return everything it wrote to stderr. Priority-case
+// violation reports (LRM 12.5.3) go to stderr (a simulator diagnostic, not
+// design output), so the captured text is the observable violation behavior.
+std::string run_capture_stderr(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE(r.module != nullptr);
+
+    std::FILE* tmp = std::tmpfile();
+    REQUIRE(tmp != nullptr);
+
+    std::fflush(stderr);
+    const int saved = dup(fileno(stderr));
+    dup2(fileno(tmp), fileno(stderr));
+
+    ir::run_jit(*r.module);
+
+    std::fflush(stderr);
+    dup2(saved, fileno(stderr));
+    close(saved);
+
+    std::rewind(tmp);
+    std::string out;
+    char        buf[256];
+    size_t      n;
+    while ((n = std::fread(buf, 1, sizeof(buf), tmp)) > 0) {
+        out.append(buf, n);
+    }
+    std::fclose(tmp);
+
+    return out;
+}
+
+// Count non-overlapping occurrences of `needle` in `hay`.
+size_t count_occ(std::string_view hay, std::string_view needle) {
+    size_t n = 0;
+    for (size_t p = hay.find(needle); p != std::string_view::npos; p = hay.find(needle, p + needle.size())) {
+        n++;
+    }
+    return n;
+}
+
+} // namespace
+
+// LRM 12.5.3: a `priority case` with no default reached with no matching item
+// issues a violation report. Execution is unchanged (no branch runs); the report
+// is the only added behavior.
+TEST_CASE("priority case: no match, no default reports a violation") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [1:0] sel;
+            initial begin
+                sel = 2'd3;
+                priority case (sel)
+                    2'd0: $display("zero");
+                    2'd1: $display("one");
+                endcase
+            end
+        endmodule
+    )";
+    const std::string err = run_capture_stderr(src);
+    CHECK(err.find("no condition is true") != std::string::npos);
+    // Design output is unchanged: nothing matched, so no $display fired.
+    CHECK(run_capture(src).empty());
+}
+
+// A matching item suppresses the report (the priority assertion holds).
+TEST_CASE("priority case: a matching item reports nothing") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [1:0] sel;
+            initial begin
+                sel = 2'd1;
+                priority case (sel)
+                    2'd0: $display("zero");
+                    2'd1: $display("one");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).find("no condition is true") == std::string::npos);
+    CHECK(run_capture(src) == "one\n");
+}
+
+// A priority case WITH a default can never violate: the default always matches.
+TEST_CASE("priority case: a default suppresses the violation") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [1:0] sel;
+            initial begin
+                sel = 2'd3;
+                priority case (sel)
+                    2'd0: $display("zero");
+                    default: $display("def");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).find("no condition is true") == std::string::npos);
+    CHECK(run_capture(src) == "def\n");
+}
+
+// The report fires once per dynamic execution that finds no match.
+TEST_CASE("priority case: reports once per no-match execution") {
+    constexpr std::string_view src = R"(
+        module m;
+            int i;
+            logic [1:0] sel;
+            initial begin
+                for (i = 0; i < 3; i++) begin
+                    sel = 2'd3;
+                    priority case (sel)
+                        2'd0: $display("zero");
+                    endcase
+                end
+            end
+        endmodule
+    )";
+    CHECK(count_occ(run_capture_stderr(src), "no condition is true") == 3);
+}
+
+// A wildcard `priority casez` keeps the if-else chain (no switch/one-hot path)
+// and still reports when no item's pattern matches.
+TEST_CASE("priority casez: no matching pattern reports a violation") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [1:0] sel;
+            initial begin
+                sel = 2'd3;
+                priority casez (sel)
+                    2'b0?: $display("lo");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).find("no condition is true") != std::string::npos);
+}
+
+// unique reports a no-match like priority (default-less, no item matched).
+TEST_CASE("unique case: no match, no default reports a no-match violation") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [1:0] sel;
+            initial begin
+                sel = 2'd3;
+                unique case (sel) 2'd0: $display("z"); 2'd1: $display("o"); endcase
+            end
+        endmodule
+    )";
+    const std::string err = run_capture_stderr(src);
+    CHECK(err.find("no condition is true") != std::string::npos);
+    CHECK(err.find("not unique") == std::string::npos);
+}
+
+// unique0 does NOT report a no-match (LRM 12.5.3: zero matches is legal).
+TEST_CASE("unique0 case: no match is silent") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [1:0] sel;
+            initial begin
+                sel = 2'd3;
+                unique0 case (sel) 2'd0: $display("z"); 2'd1: $display("o"); endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).empty());
+}
+
+// unique reports an overlap when >1 item matches (wildcard patterns), and still
+// executes the first match.
+TEST_CASE("unique casez: overlapping items report and run the first match") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [1:0] sel;
+            initial begin
+                sel = 2'b11;
+                unique casez (sel)
+                    2'b1?: $display("hi");
+                    2'b?1: $display("lo");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).find("not unique") != std::string::npos);
+    CHECK(run_capture(src) == "hi\n");  // first match wins despite the violation
+}
+
+// unique0 reports overlap too (only its no-match check differs from unique).
+TEST_CASE("unique0 casez: overlapping items report a violation") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [1:0] sel;
+            initial begin
+                sel = 2'b11;
+                unique0 casez (sel) 2'b1?: $display("hi"); 2'b?1: $display("lo"); endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).find("not unique") != std::string::npos);
+}
+
+// Distinct constant labels can never overlap: a unique case over them reports
+// nothing and dispatches correctly (the constant switch fast path).
+TEST_CASE("unique case: distinct constants never overlap") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [1:0] sel;
+            initial begin
+                sel = 2'd2;
+                unique case (sel)
+                    2'd0: $display("a");
+                    2'd1: $display("b");
+                    2'd2: $display("c");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).empty());
+    CHECK(run_capture(src) == "c\n");
+}
+
+// A duplicate constant label IS an overlap: when the selector hits the shared
+// value both items match. Detected at runtime (routed off the switch fast path).
+TEST_CASE("unique case: duplicate constant label reports an overlap") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [1:0] sel;
+            initial begin
+                sel = 2'd1;
+                unique case (sel) 2'd1: $display("x"); 2'd1: $display("y"); endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).find("not unique") != std::string::npos);
+    CHECK(run_capture(src) == "x\n");  // first match still runs
+}
+
+// A default suppresses the no-match report for unique (default always matches),
+// and no overlap arises from distinct constants.
+TEST_CASE("unique case: a default suppresses the no-match report") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [1:0] sel;
+            initial begin
+                sel = 2'd3;
+                unique case (sel) 2'd0: $display("a"); default: $display("d"); endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).empty());
+    CHECK(run_capture(src) == "d\n");
+}
+
+// unique over non-constant labels: overlap when two labels evaluate equal to the
+// selector at runtime (no constant fast path applies).
+TEST_CASE("unique case: non-constant labels overlap at runtime") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] sel, a, b;
+            initial begin
+                a = 4'd5; b = 4'd5; sel = 4'd5;
+                unique case (sel) a: $display("a"); b: $display("b"); endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).find("not unique") != std::string::npos);
+    CHECK(run_capture(src) == "a\n");
+}

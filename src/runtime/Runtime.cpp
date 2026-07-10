@@ -1232,6 +1232,17 @@ extern "C" void rt_finish(const char* banner, uint64_t now, int32_t arg) {
     std::exit(0);
 }
 
+extern "C" void rt_case_violation(const char* banner, uint64_t now, int32_t kind) {
+    std::fflush(stdout);
+    std::string line = banner;
+    line += kind == 0 ? "no condition is true in the unique/priority case at time "
+                      : "case statement is not unique (overlapping items) at time ";
+    append_finish_time(line, now);
+    line += '\n';
+    std::fputs(line.c_str(), stderr);
+    std::fflush(stderr);
+}
+
 extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*),
                            void (*finals)(void*, void*)) {
     // Run the simulation, then the `final` blocks (LRM 9.2.3), so the finals see

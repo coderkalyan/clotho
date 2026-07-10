@@ -126,6 +126,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Random:
             return K::None;
         case T::Finish:
+        case T::CaseViol:
             return K::Extra;
         case T::Wait:
             return K::Wait;
