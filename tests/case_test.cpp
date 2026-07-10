@@ -284,8 +284,10 @@ TEST_CASE("duplicate casez wildcard label is dead") {
     CHECK(run_capture(src) == "first\n");
 }
 
-// unique case with duplicate labels: dedup is skipped so the items survive
-// (overlap is a reportable violation; first-match execution stays conforming).
+// unique case with duplicate labels: the whole-statement case_dedup pass is
+// skipped for unique/unique0, so both items' predicates survive for the
+// separate overlap-check sum; dispatch itself still runs through a switch
+// (deduped locally, first occurrence wins), unaffected by the overlap check.
 TEST_CASE("unique case with duplicate label still executes first match") {
     constexpr std::string_view src = R"(
         module m;
@@ -742,7 +744,9 @@ TEST_CASE("unique case: distinct constants never overlap") {
 }
 
 // A duplicate constant label IS an overlap: when the selector hits the shared
-// value both items match. Detected at runtime (routed off the switch fast path).
+// value both items match. Dispatch runs through the deduped switch (first
+// occurrence wins, "x"); the separately-computed overlap-predicate sum still
+// sees both labels and reports the violation regardless.
 TEST_CASE("unique case: duplicate constant label reports an overlap") {
     constexpr std::string_view src = R"(
         module m;
@@ -1125,4 +1129,129 @@ TEST_CASE("case inside: unbounded range bound is reported as unsupported") {
     )");
     CHECK_FALSE(r.ok);
     CHECK(r.diagnostics.find("unbounded") != std::string::npos);
+}
+
+// -- Recursive switch segmentation (find_switch_run) --
+// A non-constant/range/wildcard item no longer disables switch dispatch for
+// the REST of the statement -- only the item's own run boundary. These cases
+// specifically exercise more than one switch run in a single statement.
+
+// Two clean-constant runs split by a residual (non-constant label) item: both
+// runs dispatch through their own switch, the residual item's own test still
+// runs in between, and priority order holds across all three segments.
+TEST_CASE("case: two switch runs split by a residual item stay in priority order") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] s;
+            logic [3:0] k;
+            initial begin
+                k = 4'd15;
+                for (int i = 0; i < 7; i++) begin
+                    s = i[3:0];
+                    case (s)
+                        4'd1: $display("A");
+                        4'd2: $display("B");
+                        k:    $display("K");
+                        4'd5: $display("D");
+                        4'd6: $display("E");
+                        default: $display("F");
+                    endcase
+                end
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "F\nA\nB\nF\nF\nD\nE\n");
+}
+
+// A duplicate constant that lands INSIDE a switch run (not just the residual
+// chain) still resolves to the first occurrence: case_dedup's whole-statement
+// pass is what find_switch_run consults, not a locally re-derived dedup.
+TEST_CASE("case: a within-run duplicate constant resolves to the first occurrence") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] s;
+            logic [3:0] k;
+            initial begin
+                k = 4'd15;
+                s = 4'd5;
+                case (s)
+                    k:    $display("R");
+                    4'd5: $display("A");
+                    4'd5: $display("Adup");
+                    default: $display("F");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "A\n");
+}
+
+// case ... inside with two constant runs split by a range item: a wholly new
+// capability (case-inside previously never reached the switch at all).
+TEST_CASE("case inside: multiple switch runs split by a range item") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] s;
+            initial begin
+                for (int i = 0; i < 7; i++) begin
+                    s = i[3:0];
+                    case (s) inside
+                        1, 2:    $display("A");
+                        [3:4]:   $display("B");
+                        5, 6:    $display("C");
+                        default: $display("D");
+                    endcase
+                end
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "D\nA\nA\nB\nB\nC\nC\n");
+}
+
+// unique: a duplicate constant inside a switch-eligible run is still a
+// reportable overlap (the overlap-check pass is fully decoupled from
+// dispatch -- it sums every item's own predicate unconditionally), while
+// dispatch itself now runs through the run's deduped switch instead of the
+// old had_dup-gated whole-statement chain fallback.
+TEST_CASE("unique case: duplicate inside a switch run still reports overlap") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [1:0] s;
+            initial begin
+                s = 2'd1;
+                unique case (s)
+                    2'd1: $display("A");
+                    2'd1: $display("B");
+                    2'd2: $display("C");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "A\n");
+    CHECK(run_capture_stderr(src).find("not unique") != std::string::npos);
+}
+
+// A run whose every item duplicates an EARLIER residual item's constant
+// dedups to zero live arms; find_switch_run must skip switch emission and
+// recurse straight through rather than emit an empty/invalid switch.
+TEST_CASE("case: a run that dedups to zero arms falls through correctly") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] s;
+            logic [3:0] k;
+            initial begin
+                k = 4'd15;
+                for (int i = 0; i < 10; i++) begin
+                    s = i[3:0];
+                    case (s)
+                        4'd9, k: $display("R");
+                        4'd9:    $display("dup1");
+                        4'd9:    $display("dup2");
+                        default: $display("F");
+                    endcase
+                end
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "F\nF\nF\nF\nF\nF\nF\nF\nF\nR\n");
 }

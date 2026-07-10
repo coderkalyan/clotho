@@ -501,6 +501,49 @@ def gen_bigcase(n: int, cycles: int) -> str:
     out.append("endmodule")
     return "\n".join(out) + "\n"
 
+def gen_case_inside(n: int, cycles: int, gap: int) -> str:
+    """One clocked process holding an N-item `case ... inside` (LRM 12.5.4)
+    over a swept selector: every `gap`-th item is a 4-value `[lo:hi]` range,
+    the rest are singular constants -- each item claims a disjoint slice of
+    the selector domain, so exactly one item (or none) ever matches. Tracks
+    the recursive-switch-segmentation win: constant runs between the range
+    breaks should jump-table, so per-cycle dispatch cost should stay flat as
+    N grows instead of scaling with N like an unsegmented chain. `gap=0`
+    degenerates to all-constant items (an `inside` analog of `bigcase`, no
+    range breaks at all)."""
+    dom = 0
+    items = []
+    for i in range(n):
+        if gap > 0 and (i + 1) % gap == 0:
+            lo = dom
+            dom += 4
+            items.append((f"[{lo}:{dom - 1}]", i))
+        else:
+            items.append((f"{dom}", i))
+            dom += 1
+    sel_bits = max(1, (dom - 1).bit_length())
+    out = []
+    out.append("module top;")
+    out.append("  reg clk = 0;")
+    out.append("  integer c = 0;")
+    out.append(f"  reg [31:0] sel = 0;")
+    out.append("  reg [31:0] out_r = 0;")
+    out.append("  always #5 clk = ~clk;")
+    out.append("  always @(posedge clk) begin")
+    out.append(f"    case (sel[{sel_bits - 1}:0]) inside")
+    for label, i in items:
+        out.append(f"      {label}: out_r = out_r + 32'h{(i * 2654435761) & 0xffffffff:08x};")
+    out.append("    endcase")
+    out.append("    sel <= sel + 32'h9e3779b1;")
+    out.append("    c <= c + 1;")
+    out.append(f"    if (c == {cycles}) begin")
+    out.append('      $display("done %h", out_r);')
+    out.append("      $finish;")
+    out.append("    end")
+    out.append("  end")
+    out.append("endmodule")
+    return "\n".join(out) + "\n"
+
 def gen_onehot(n: int, cycles: int, order: str) -> str:
     """One clocked process holding the reverse-case one-hot priority-encoder
     idiom: `case (1'b1)` over N single-bit selects `sel[i]` of a packed vector.
@@ -544,7 +587,7 @@ if __name__ == "__main__":
     ap.add_argument("bench", choices=["regs", "tri", "chain", "thunk", "wheel",
                                       "combchain", "timers", "bigcase", "onehot",
                                       "wideff", "nbablocks", "partblocks", "nbamem",
-                                      "star"])
+                                      "star", "case_inside"])
     ap.add_argument("--n", type=int, required=True,
                     help="nbablocks: number of blocks (processes)")
     ap.add_argument("--cycles", type=int, required=True)
@@ -557,6 +600,8 @@ if __name__ == "__main__":
     ap.add_argument("--select", default="static",
                     help="partblocks: static|dynamic; nbamem: whole|part")
     ap.add_argument("--width", type=int, default=32, help="nbamem: element width")
+    ap.add_argument("--gap", type=int, default=8,
+                    help="case_inside: insert a [lo:hi] range item every `gap` constant items (0 = none)")
     a = ap.parse_args()
     if a.bench == "regs":
         sys.stdout.write(gen_regs(a.n, a.cycles, a.fused, a.seed))
@@ -584,5 +629,7 @@ if __name__ == "__main__":
         sys.stdout.write(gen_nbamem(a.n, a.width, a.cycles, a.select))
     elif a.bench == "star":
         sys.stdout.write(gen_star(a.n, a.cycles))
+    elif a.bench == "case_inside":
+        sys.stdout.write(gen_case_inside(a.n, a.cycles, a.gap))
     else:
         sys.stdout.write(gen_wheel(a.cycles))

@@ -3571,10 +3571,23 @@ private:
         fail("unsupported for-step expression (only assignment and ++/-- are supported)");
     }
 
+    // The width/four-state/signedness a case's selector and labels are
+    // compared at, plus the interned type built from them. Threading width/
+    // four alongside `ty` lets every downstream user (case_dedup,
+    // find_switch_run) share one computation instead of each re-deriving it
+    // from `c.items` independently -- required once a sub-range of items
+    // (a switch run) must key against the SAME width as the whole statement's
+    // `sel`, not a possibly-narrower local recompute.
+    struct CaseCompareType {
+        ir::Ref  ty;
+        uint32_t width;
+        bool     four;
+    };
+
     // The width/state/signedness all case_expressions are compared at: the
     // longest of the selector and every item label, four-state if any operand is,
     // signed only if all are (IEEE 1800-2023 12.5).
-    ir::Ref common_case_type(const CaseStatement& c) {
+    CaseCompareType common_case_type(const CaseStatement& c) {
         // TODO: case with a real selector or label. LRM 12.5 defines matching
         // with === semantics, which Table 11-1 leaves undefined for reals
         // (iverilog compares with ==). Loud-fail until the semantics call.
@@ -3599,7 +3612,7 @@ private:
             }
         }
 
-        return make_int_type(width, four, signd);
+        return { make_int_type(width, four, signd), width, four };
     }
 
     // Whether a range bound is (possibly conversion-wrapped) the `$` literal.
@@ -3620,7 +3633,7 @@ private:
     // place of the range's own type. Tolerance ranges (`+/-`, `+%-`) and `$`
     // bounds guard loudly here (TODO: LRM 11.4.13 defines both, but neither
     // is exercised by ranged case-inside labels yet).
-    ir::Ref common_inside_type(const CaseStatement& c) {
+    CaseCompareType common_inside_type(const CaseStatement& c) {
         if (c.expr.type->isFloating()) {
             fail("case on a real selector is not supported");
         }
@@ -3654,7 +3667,7 @@ private:
                 fold(vr.right());
             }
         }
-        return make_int_type(width, four, signd);
+        return { make_int_type(width, four, signd), width, four };
     }
 
     // Predicate for one case-inside range_list member (LRM 11.4.13 / 12.5.4).
@@ -3696,8 +3709,14 @@ private:
     // item k's range_list predicate guards its body, with the rest of the chain
     // (eventually the default) as the else branch, so labels not yet reached
     // are evaluated lazily.
+    // Lazy first-match chain for `case ... inside`'s residual (range/wildcard)
+    // items, mirroring lower_case_item -- but first tries find_switch_run at
+    // every step, so a run of plain clean-constant singular labels between
+    // range items still jump-tables instead of chaining one at a time.
     void lower_case_inside_item(const CaseStatement& c, size_t k, ir::Index sel, ir::Ref ty,
-                                bool report_viol, ir::Builder& b) {
+                                uint32_t width, uint32_t key_width,
+                                const std::vector<std::vector<char>>& keep,
+                                const slang::ast::ASTContext& astCtx, bool report_viol, ir::Builder& b) {
         if (k == c.items.size()) {
             if (c.defaultCase != nullptr) {
                 lower_stmt(*c.defaultCase, b);
@@ -3708,6 +3727,21 @@ private:
             return;
         }
 
+        if (std::optional<SwitchRun> run = find_switch_run(c, k, width, key_width, &keep, astCtx)) {
+            if (run->arms.empty()) {
+                lower_case_inside_item(c, k + run->len, sel, ty, width, key_width, keep, astCtx,
+                                       report_viol, b);
+                return;
+            }
+            const std::vector<ir::Builder::SwitchArmBuild> arms = lower_switch_arm_bodies(run->arms, b);
+            b.open_region();
+            lower_case_inside_item(c, k + run->len, sel, ty, width, key_width, keep, astCtx,
+                                   report_viol, b);
+            const ir::ExtraSlice default_region = b.close_region();
+            b.switch_(sel, arms, default_region, loc(c.expr));
+            return;
+        }
+
         const ir::Index pred = lower_inside_item_pred(c.items[k], sel, ty, b);
 
         b.open_region();
@@ -3715,7 +3749,7 @@ private:
         const ir::ExtraSlice then_region = b.close_region();
 
         b.open_region();
-        lower_case_inside_item(c, k + 1, sel, ty, report_viol, b);
+        lower_case_inside_item(c, k + 1, sel, ty, width, key_width, keep, astCtx, report_viol, b);
         const ir::ExtraSlice else_region = b.close_region();
 
         b.cond(pred, then_region, else_region, loc(*c.items[k].stmt));
@@ -3724,7 +3758,8 @@ private:
     // Eager overlap-checked lowering for unique/unique0 `case ... inside`
     // (mirrors lower_case_unique): every item's predicate is computed once up
     // front and shared by emit_overlap_check and dispatch_preds.
-    void lower_case_inside_unique(const CaseStatement& c, ir::Index sel, ir::Ref ty,
+    void lower_case_inside_unique(const CaseStatement& c, ir::Index sel, ir::Ref ty, uint32_t width,
+                                  uint32_t key_width, const slang::ast::ASTContext& astCtx,
                                   bool no_match_report, ir::Builder& b) {
         std::vector<ir::Index> preds;
         preds.reserve(c.items.size());
@@ -3732,26 +3767,32 @@ private:
             preds.push_back(lower_inside_item_pred(item, sel, ty, b));
         }
         emit_overlap_check(preds, case_banner(c), loc(c), b);
-        dispatch_preds(c, 0, preds, no_match_report, b);
+        dispatch_preds(c, 0, sel, width, key_width, astCtx, preds, no_match_report, b);
     }
 
     // `case ... inside` (12.5.4): set-membership matching via the inside
-    // operator (11.4.13). Never reaches the constant-switch or one-hot fast
-    // paths (a range_list member isn't a single constant match key).
+    // operator (11.4.13). A run of clean-constant singular labels jump-tables
+    // via find_switch_run (shared with plain/casex/casez case); a range_list
+    // member or the one-hot idiom's ElementSelect labels never form a run, so
+    // those keep the existing predicate chain unchanged.
     void lower_case_inside(const CaseStatement& c, ir::Builder& b) {
         using Check = slang::ast::UniquePriorityCheck;
         const bool no_match_report =
           (c.check == Check::Priority || c.check == Check::Unique) && c.defaultCase == nullptr;
         const bool needs_overlap = c.check == Check::Unique || c.check == Check::Unique0;
 
-        const ir::Ref   ty  = common_inside_type(c);
-        const ir::Index sel = b.resize(lower_expr(c.expr, b), ty, loc(c.expr));
+        const CaseCompareType   ct        = common_inside_type(c);
+        const ir::Ref           ty        = ct.ty;
+        const uint32_t          key_width = ct.four ? 2 * ct.width : ct.width;
+        const ir::Index         sel       = b.resize(lower_expr(c.expr, b), ty, loc(c.expr));
+        slang::ast::ASTContext  astCtx(*scope_, slang::ast::LookupLocation::max);
 
         if (needs_overlap) {
-            lower_case_inside_unique(c, sel, ty, no_match_report, b);
+            lower_case_inside_unique(c, sel, ty, ct.width, key_width, astCtx, no_match_report, b);
             return;
         }
-        lower_case_inside_item(c, 0, sel, ty, no_match_report, b);
+        const std::vector<std::vector<char>> keep = case_dedup(c, ct.width, astCtx);
+        lower_case_inside_item(c, 0, sel, ty, ct.width, key_width, keep, astCtx, no_match_report, b);
     }
 
     // Priority-order case dedup (LRM 12.5). The first matching case_item wins,
@@ -3773,8 +3814,20 @@ private:
     // Skipped for unique/priority checks: a unique/unique0 overlap is a
     // reportable violation, so duplicate labels must survive for
     // lower_case_unique's predicate sum to detect them.
+    //
+    // `width` is the statement's single common compare width (from
+    // common_case_type/common_inside_type) -- passed in rather than
+    // re-derived here so this pass and find_switch_run's per-run key
+    // extraction always agree on the same width as `sel`. A range_list
+    // member (`case ... inside`, itself typed void) is skipped before eval:
+    // it is never treated as a duplicate-constant candidate (a genuinely
+    // repeated *range* is a missed dead-code opportunity, not a correctness
+    // gap -- see find_switch_run, which never puts a range in a switch key
+    // either).
+    //
     // Returns keep[k][j] = whether item k's label j survives.
-    std::vector<std::vector<char>> case_dedup(const CaseStatement& c) {
+    std::vector<std::vector<char>> case_dedup(const CaseStatement& c, uint32_t width,
+                                              const slang::ast::ASTContext& astCtx) {
         std::vector<std::vector<char>> keep(c.items.size());
         for (size_t k = 0; k < c.items.size(); k++) {
             keep[k].assign(c.items[k].expressions.size(), 1);
@@ -3783,21 +3836,15 @@ private:
             return keep;
         }
 
-        // Common compare width: longest of the selector and all labels (12.5).
-        uint32_t width = c.expr.type->getBitWidth();
-        for (const CaseStatement::ItemGroup& item : c.items) {
-            for (const Expression* e : item.expressions) {
-                width = std::max(width, e->type->getBitWidth());
-            }
-        }
-
         std::vector<slang::SVInt> seen_const;
-        slang::ast::ASTContext    astCtx(*scope_, slang::ast::LookupLocation::max);
 
         for (size_t k = 0; k < c.items.size(); k++) {
             const std::span<const Expression* const> exprs = c.items[k].expressions;
             for (size_t j = 0; j < exprs.size(); j++) {
-                const Expression&          e  = *exprs[j];
+                const Expression& e = *exprs[j];
+                if (e.kind == ExpressionKind::ValueRange) {
+                    continue;
+                }
                 slang::ast::EvalContext    ev(astCtx);
                 const slang::ConstantValue cv = e.eval(ev);
                 if (!cv.isInteger()) {
@@ -3832,47 +3879,95 @@ private:
         const slang::ast::Statement* body;
     };
 
-    // Decide whether a Normal case can lower to a switch, and if so build its
-    // arms. Eligible when every label is a constant with no x/z bits ("clean")
-    // and the packed key fits 64 bits. The backend keys a clean value on its
-    // bare bits ({may^must, must}); an x/z-bearing label would need the z field
-    // and per-bit packing, so it falls back to the if-else chain (rare).
+    // A maximal run of consecutive switch-eligible items starting at some
+    // index k: `len` items are consumed (the caller continues at k + len),
+    // and `arms` (which may be empty -- see find_switch_run) are the surviving
+    // switch keys/bodies.
+    struct SwitchRun {
+        size_t                     len;
+        std::vector<SwitchArmPlan> arms;
+    };
+
+    // Try to consume a maximal run of switch-eligible items starting at index
+    // k (generalizes the old whole-statement-only build_switch_arms to a
+    // sub-range, so one range/wildcard/non-constant item no longer disables
+    // switch dispatch for the rest of the statement -- mirrors how rustc's
+    // match lowering groups a maximal run of SwitchInt-compatible arms and
+    // recurses into the "otherwise" branch for the rest).
     //
-    // Dedup happens here in one pass (LRM 12.5 first-match: a later label
-    // duplicating an earlier key is dead, so it is dropped), giving the switch
-    // unique keys without a second label evaluation. Returns nullopt (-> chain)
-    // on the first non-constant or x/z label, or when the key is too wide.
+    // An item is eligible iff every label is a constant with no x/z bits
+    // ("clean") -- the backend keys a clean value on its bare bits
+    // ({may^must, must}), so this needs the packed key to fit 64 bits, checked
+    // once for the whole statement via `key_width` (not per-run: a statement
+    // too wide for a switch never forms any run at all, matching the old
+    // whole-statement gate). The run stops at the first ineligible item; a
+    // ValueRangeExpression label (`case ... inside`) always disqualifies its
+    // item, so it always ends a run.
     //
-    // `had_dup` (when non-null) reports whether a duplicate constant key was
-    // dropped. For a unique/unique0 case a dropped duplicate is a compile-time
-    // overlap violation, so the caller must route those to the chain (which emits
-    // the runtime overlap report) rather than the switch, which would silently
-    // merge the keys.
-    std::optional<std::vector<SwitchArmPlan>> build_switch_arms(const CaseStatement& c,
-                                                                bool* had_dup = nullptr) {
-        uint32_t width = c.expr.type->getBitWidth();
-        bool     four  = c.expr.type->isFourState();
-        for (const CaseStatement::ItemGroup& item : c.items) {
-            for (const Expression* e : item.expressions) {
-                width = std::max(width, e->type->getBitWidth());
-                four  = four || e->type->isFourState();
-            }
-        }
-        const uint32_t key_width = four ? 2 * width : width;
-        if (key_width == 0 || key_width > 64) {
+    // Clean-and-constant is NOT enough on its own: casex/casez (CasexEq/
+    // CasezEq, see lower_case_compare in LlvmBackend.cpp) wildcard on the
+    // SELECTOR's own x/z bits too ("dc = a.z | b.z" etc., operand-symmetric),
+    // which no fixed compile-time switch key can express -- an x/z selector
+    // must still be able to match a clean casex/casez label, but a switch's
+    // densified key makes any x/z selector land outside every case value.
+    // WildEq (`case ... inside`'s singular labels) only wildcards the LABEL
+    // operand, so a clean Inside label degenerates exactly to plain equality
+    // and is switch-safe. So this is gated to Normal/Inside; casex/casez never
+    // form a run (every call returns nullopt immediately), leaving their
+    // existing chain-only lowering untouched.
+    //
+    // `keep`, when non-null (plain/priority dispatch), filters labels the
+    // single whole-statement case_dedup pass already proved dead -- this
+    // function never re-derives its own cross-item dedup in that mode, so a
+    // duplicate straddling two different runs (or a run and a residual item)
+    // is still resolved consistently by the one shared pass. When null
+    // (unique/unique0 dispatch, which skips case_dedup so every item's label
+    // survives for the overlap-check sum), a fresh set scoped to just this
+    // call dedups keys for THIS run's own switch validity only: a duplicate
+    // constant in an EARLIER run or residual item needs no cross-run
+    // tracking, because that earlier item is always reached first by the
+    // recursion regardless (dispatch skips a claimed key only because it
+    // dispatches first, not because of any bookkeeping here) -- the overlap
+    // itself is still reported by the separate, unconditional
+    // emit_overlap_check pass over every item's own predicate, which this
+    // function has no bearing on.
+    //
+    // Returns nullopt only when the run at k is empty (item k itself isn't
+    // eligible). A non-nullopt run may still have empty `arms` (every label
+    // in it deduped away, e.g. a run of items that all repeat an earlier
+    // item's constant) -- callers must skip switch emission and recurse
+    // directly at k + len in that case.
+    std::optional<SwitchRun> find_switch_run(const CaseStatement& c, size_t k, uint32_t width,
+                                             uint32_t key_width,
+                                             const std::vector<std::vector<char>>* keep,
+                                             const slang::ast::ASTContext& astCtx) {
+        if (key_width == 0 || key_width > 64 ||
+            (c.condition != CaseStatementCondition::Normal &&
+             c.condition != CaseStatementCondition::Inside)) {
             return std::nullopt;
         }
 
-        slang::ast::ASTContext                  astCtx(*scope_, slang::ast::LookupLocation::max);
-        std::vector<SwitchArmPlan>              arms;
-        ankerl::unordered_dense::set<uint64_t>  seen;
-        for (const CaseStatement::ItemGroup& item : c.items) {
-            std::vector<uint64_t> keys;
-            for (const Expression* e : item.expressions) {
+        std::vector<SwitchArmPlan>             arms;
+        ankerl::unordered_dense::set<uint64_t> local_seen;  // only used when keep == nullptr.
+        size_t                                 i = k;
+        for (; i < c.items.size(); i++) {
+            const CaseStatement::ItemGroup& item = c.items[i];
+            std::vector<uint64_t>           keys;
+            bool                             eligible = true;
+            for (size_t j = 0; j < item.expressions.size(); j++) {
+                const Expression* e = item.expressions[j];
+                if (e->kind == ExpressionKind::ValueRange) {
+                    eligible = false;
+                    break;
+                }
+                if (keep != nullptr && !(*keep)[i][j]) {
+                    continue;  // already proven dead by the whole-statement case_dedup.
+                }
                 slang::ast::EvalContext    ev(astCtx);
                 const slang::ConstantValue cv = e->eval(ev);
                 if (!cv.isInteger() || cv.integer().hasUnknown()) {
-                    return std::nullopt;  // non-constant or x/z label -> chain.
+                    eligible = false;
+                    break;
                 }
                 slang::SVInt v = cv.integer();
                 if (v.getBitWidth() < width) {
@@ -3880,21 +3975,42 @@ private:
                 }
                 const std::optional<uint64_t> u = v.as<uint64_t>();
                 if (!u) {
-                    return std::nullopt;
+                    eligible = false;
+                    break;
                 }
-                if (seen.insert(*u).second) {  // first occurrence wins; drop dups.
+                if (keep != nullptr) {
+                    // case_dedup already guarantees this key is unique statement-wide.
                     keys.push_back(*u);
                 }
-                else if (had_dup != nullptr) {
-                    *had_dup = true;
+                else if (local_seen.insert(*u).second) {
+                    keys.push_back(*u);
                 }
+            }
+            if (!eligible) {
+                break;
             }
             if (!keys.empty()) {
                 arms.push_back({ std::move(keys), item.stmt });
             }
         }
-        if (arms.empty()) {
+        if (i == k) {
             return std::nullopt;
+        }
+        return SwitchRun{ i - k, std::move(arms) };
+    }
+
+    // Lower a switch run's surviving arms to region-backed SwitchArmBuilds,
+    // shared by every chain flavor (Normal/casex/casez, case-inside,
+    // unique/unique0 dispatch) that consumes a find_switch_run result.
+    std::vector<ir::Builder::SwitchArmBuild> lower_switch_arm_bodies(
+      const std::vector<SwitchArmPlan>& plan, ir::Builder& b) {
+        std::vector<ir::Builder::SwitchArmBuild> arms;
+        arms.reserve(plan.size());
+        for (const SwitchArmPlan& ap : plan) {
+            b.open_region();
+            lower_stmt(*ap.body, b);
+            const ir::ExtraSlice body = b.close_region();
+            arms.push_back({ std::span<const uint64_t>(ap.keys), body });
         }
         return arms;
     }
@@ -4065,8 +4181,12 @@ private:
         // checks; first-match execution is conforming for all of them.
         //   - no-match (priority or unique, no default): kind-0 report. unique0
         //     does NOT report no-match; a default can never no-match.
-        //   - overlap (unique / unique0, >1 item matches): kind-1 report. Distinct
-        //     constant labels can never overlap, so those keep the fast paths.
+        //   - overlap (unique / unique0, >1 item matches): kind-1 report,
+        //     detected by emit_overlap_check summing every item's own predicate
+        //     unconditionally -- independent of how dispatch is structured, so
+        //     a switch run's own key dedup (see find_switch_run) never needs to
+        //     abandon the switch just because a duplicate constant exists
+        //     somewhere in the statement.
         using Check = slang::ast::UniquePriorityCheck;
         const bool no_match_report =
           (c.check == Check::Priority || c.check == Check::Unique) && c.defaultCase == nullptr;
@@ -4080,49 +4200,23 @@ private:
             return;
         }
 
-        const ir::Ref   ty  = common_case_type(c);
+        const CaseCompareType ct        = common_case_type(c);
+        const ir::Ref         ty        = ct.ty;
+        const uint32_t        key_width = ct.four ? 2 * ct.width : ct.width;
         // The selector is evaluated exactly once, up front (12.5 / 12.5.3).
-        const ir::Index sel = b.resize(lower_expr(c.expr, b), ty, loc(c.expr));
-
-        // Constant, wildcard-free case -> multiway switch (jump table). Distinct
-        // constant labels can never overlap at runtime, so this fast path stays
-        // valid for unique/unique0; a dropped duplicate key would be a
-        // compile-time overlap, so had_dup routes those to the chain (which emits
-        // the runtime overlap report). A default-less priority/unique case reports
-        // no-match from the switch's own default region.
-        if (c.condition == CaseStatementCondition::Normal) {
-            bool                                      had_dup = false;
-            std::optional<std::vector<SwitchArmPlan>> plan    = build_switch_arms(c, &had_dup);
-            if (plan && !(needs_overlap && had_dup)) {
-                std::vector<ir::Builder::SwitchArmBuild> arms;
-                arms.reserve(plan->size());
-                for (const SwitchArmPlan& ap : *plan) {
-                    b.open_region();
-                    lower_stmt(*ap.body, b);
-                    const ir::ExtraSlice body = b.close_region();
-                    arms.push_back({ std::span<const uint64_t>(ap.keys), body });
-                }
-                b.open_region();
-                if (c.defaultCase != nullptr) {
-                    lower_stmt(*c.defaultCase, b);
-                }
-                else if (no_match_report) {
-                    b.case_violation(case_banner(c), 0, loc(c));
-                }
-                const ir::ExtraSlice default_region = b.close_region();
-                b.switch_(sel, arms, default_region, loc(c.expr));
-                return;
-            }
-        }
+        const ir::Index        sel = b.resize(lower_expr(c.expr, b), ty, loc(c.expr));
+        slang::ast::ASTContext astCtx(*scope_, slang::ast::LookupLocation::max);
 
         // unique / unique0 need the eager overlap check; priority / plain use the
-        // lazy first-match chain.
+        // lazy first-match chain. Both segment switch-eligible runs internally
+        // (find_switch_run), so a whole-statement all-clean-constant case still
+        // reproduces one jump table as the degenerate single-run case.
         if (needs_overlap) {
-            lower_case_unique(c, sel, cmp, ty, no_match_report, b);
+            lower_case_unique(c, sel, cmp, ty, ct.width, key_width, astCtx, no_match_report, b);
             return;
         }
-        const std::vector<std::vector<char>> keep = case_dedup(c);
-        lower_case_item(c, 0, sel, cmp, ty, keep, no_match_report, b);
+        const std::vector<std::vector<char>> keep = case_dedup(c, ct.width, astCtx);
+        lower_case_item(c, 0, sel, cmp, ty, ct.width, key_width, keep, astCtx, no_match_report, b);
     }
 
     // Eager lowering for unique / unique0 (LRM 12.5.3). Unlike the lazy
@@ -4138,6 +4232,7 @@ private:
     // path. First-match dispatch and the no-match report (unique only) reuse the
     // temps and match the plain-case semantics exactly.
     void lower_case_unique(const CaseStatement& c, ir::Index sel, ir::Inst::Tag cmp, ir::Ref ty,
+                           uint32_t width, uint32_t key_width, const slang::ast::ASTContext& astCtx,
                            bool no_match_report, ir::Builder& b) {
         const size_t           n = c.items.size();
         std::vector<ir::Index> preds;
@@ -4158,7 +4253,7 @@ private:
         }
 
         emit_overlap_check(preds, case_banner(c), loc(c), b);
-        dispatch_preds(c, 0, preds, no_match_report, b);
+        dispatch_preds(c, 0, sel, width, key_width, astCtx, preds, no_match_report, b);
     }
 
     // Emit the unique/unique0 overlap check (LRM 12.5.3 / 12.4.2) from precomputed
@@ -4188,8 +4283,19 @@ private:
     // predicate temps: item k's body runs when preds[k] is the first true one.
     // The terminal else (no item matched) runs the default, else emits the
     // no-match report when the caller requested it (unique, no default).
-    void dispatch_preds(const CaseStatement& c, size_t k, const std::vector<ir::Index>& preds,
-                        bool no_match_report, ir::Builder& b) {
+    //
+    // Tries find_switch_run first, same as the plain/priority chain -- but
+    // its switch is built fresh from `sel` (a switch case value has to be the
+    // raw selector, not an equality-result boolean), never from `preds[k]`.
+    // `preds` remains used only by the caller's emit_overlap_check; passing
+    // `keep = nullptr` here means find_switch_run dedups a run's own keys
+    // locally (unique/unique0 skip the whole-statement case_dedup, since a
+    // dropped duplicate there would be a swallowed overlap violation) -- the
+    // overlap itself is still reported by the separate, already-computed
+    // `preds` sum regardless of which items a run's switch absorbs.
+    void dispatch_preds(const CaseStatement& c, size_t k, ir::Index sel, uint32_t width,
+                        uint32_t key_width, const slang::ast::ASTContext& astCtx,
+                        const std::vector<ir::Index>& preds, bool no_match_report, ir::Builder& b) {
         if (k == c.items.size()) {
             if (c.defaultCase != nullptr) {
                 lower_stmt(*c.defaultCase, b);
@@ -4199,12 +4305,27 @@ private:
             }
             return;
         }
+
+        if (std::optional<SwitchRun> run =
+              find_switch_run(c, k, width, key_width, /*keep=*/nullptr, astCtx)) {
+            if (run->arms.empty()) {
+                dispatch_preds(c, k + run->len, sel, width, key_width, astCtx, preds, no_match_report, b);
+                return;
+            }
+            const std::vector<ir::Builder::SwitchArmBuild> arms = lower_switch_arm_bodies(run->arms, b);
+            b.open_region();
+            dispatch_preds(c, k + run->len, sel, width, key_width, astCtx, preds, no_match_report, b);
+            const ir::ExtraSlice default_region = b.close_region();
+            b.switch_(sel, arms, default_region, loc(c.expr));
+            return;
+        }
+
         b.open_region();
         lower_stmt(*c.items[k].stmt, b);
         const ir::ExtraSlice then_region = b.close_region();
 
         b.open_region();
-        dispatch_preds(c, k + 1, preds, no_match_report, b);
+        dispatch_preds(c, k + 1, sel, width, key_width, astCtx, preds, no_match_report, b);
         const ir::ExtraSlice else_region = b.close_region();
 
         b.cond(preds[k], then_region, else_region, loc(*c.items[k].stmt));
@@ -4221,8 +4342,16 @@ private:
     // (LRM 12.5.3, kind 0). It is mutually exclusive with a default (a
     // default-less case has no default branch here). This is the lazy chain used
     // for priority / plain checks; unique/unique0 use the eager lower_case_unique.
+    //
+    // Tries find_switch_run at every step first: a run of clean-constant labels
+    // jump-tables (generalizing the old whole-statement-only fast path to a
+    // sub-range), with a non-constant/x-z-bearing item (or, for casex/casez,
+    // any item at all -- see find_switch_run) falling through to the predicate
+    // test below and recursing at k+1 as before.
     void lower_case_item(const CaseStatement& c, size_t k, ir::Index sel, ir::Inst::Tag cmp, ir::Ref ty,
-                         const std::vector<std::vector<char>>& keep, bool report_viol, ir::Builder& b) {
+                         uint32_t width, uint32_t key_width,
+                         const std::vector<std::vector<char>>& keep,
+                         const slang::ast::ASTContext& astCtx, bool report_viol, ir::Builder& b) {
         if (k == c.items.size()) {
             if (c.defaultCase != nullptr) {
                 lower_stmt(*c.defaultCase, b);
@@ -4230,6 +4359,20 @@ private:
             else if (report_viol) {
                 b.case_violation(case_banner(c), 0, loc(c));
             }
+            return;
+        }
+
+        if (std::optional<SwitchRun> run = find_switch_run(c, k, width, key_width, &keep, astCtx)) {
+            if (run->arms.empty()) {
+                lower_case_item(c, k + run->len, sel, cmp, ty, width, key_width, keep, astCtx,
+                                report_viol, b);
+                return;
+            }
+            const std::vector<ir::Builder::SwitchArmBuild> arms = lower_switch_arm_bodies(run->arms, b);
+            b.open_region();
+            lower_case_item(c, k + run->len, sel, cmp, ty, width, key_width, keep, astCtx, report_viol, b);
+            const ir::ExtraSlice default_region = b.close_region();
+            b.switch_(sel, arms, default_region, loc(c.expr));
             return;
         }
 
@@ -4252,7 +4395,7 @@ private:
         if (!have) {
             // No surviving label (empty group, or every label deduped away): the
             // body is unreachable, so continue the chain in the current region.
-            lower_case_item(c, k + 1, sel, cmp, ty, keep, report_viol, b);
+            lower_case_item(c, k + 1, sel, cmp, ty, width, key_width, keep, astCtx, report_viol, b);
             return;
         }
 
@@ -4261,7 +4404,7 @@ private:
         const ir::ExtraSlice then_region = b.close_region();
 
         b.open_region();
-        lower_case_item(c, k + 1, sel, cmp, ty, keep, report_viol, b);
+        lower_case_item(c, k + 1, sel, cmp, ty, width, key_width, keep, astCtx, report_viol, b);
         const ir::ExtraSlice else_region = b.close_region();
 
         b.cond(pred, then_region, else_region, loc(*item.stmt));
