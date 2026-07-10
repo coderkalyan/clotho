@@ -700,15 +700,17 @@ private:
                std::to_string(sm->getLineNumber(sl)) + ": " + std::string(task);
     }
 
-    // Compile-time "<file>:<line>: " banner prefix for a priority-case violation
-    // report, located at the case statement itself. The runtime appends the
-    // descriptive message and the simulation time (rt_case_violation).
-    std::string case_banner(const CaseStatement& c) const {
+    // Compile-time "<file>:<line>: " banner prefix at a source location. The
+    // runtime appends the descriptive message and the simulation time
+    // (rt_case_violation).
+    std::string banner_at(slang::SourceLocation sl) const {
         const slang::SourceManager* sm = scope_->getCompilation().getSourceManager();
-        const slang::SourceLocation sl = c.sourceRange.start();
         return std::string(sm->getFileName(sl)) + ":" +
                std::to_string(sm->getLineNumber(sl)) + ": ";
     }
+
+    // Banner for a unique/priority case or if violation, located at the statement.
+    std::string case_banner(const CaseStatement& c) const { return banner_at(c.sourceRange.start()); }
 
     // -- Types --
 
@@ -1946,7 +1948,43 @@ private:
         return lower_predicate(cond, b);
     }
 
+    // Whether the if/else-if chain rooted at `c` ends in an explicit `else`
+    // (a non-`ConditionalStatement` at the bottom of the ifFalse spine). Used to
+    // decide the priority-if no-match report: an explicit else always matches, so
+    // a chain with one can never no-match. A `begin ... end`-nested inner `if` is
+    // a BlockStatement, so it correctly counts as a final else (LRM 12.4.2).
+    bool chain_has_final_else(const ConditionalStatement& c) const {
+        const ConditionalStatement* cur = &c;
+        while (cur->ifFalse != nullptr) {
+            const auto* nested = cur->ifFalse->as_if<ConditionalStatement>();
+            if (nested == nullptr) {
+                return true;
+            }
+            cur = nested;
+        }
+        return false;
+    }
+
     void lower_conditional(const ConditionalStatement& c, ir::Builder& b) {
+        // priority-if (LRM 12.4.2): a violation is reported if no condition is
+        // true and the chain has no explicit final else. Execution (ordered
+        // first-match) is identical to a plain if, so only the report is added,
+        // at the terminal else of the chain. unique / unique0 overlap reports on
+        // `if` are still TODO (execution is already conforming).
+        const bool report_no_match = c.check == slang::ast::UniquePriorityCheck::Priority &&
+                                     !chain_has_final_else(c);
+        lower_if_chain(c, report_no_match, report_no_match ? banner_at(c.sourceRange.start()) : std::string{},
+                       loc(c), b);
+    }
+
+    // Lower an if / else-if chain. When `report_no_match` is set (a default-less
+    // priority chain), the flag is threaded down the ifFalse spine and the
+    // terminal else (reached only when no condition was true) emits a no-match
+    // report at the chain's `rloc`. With the flag clear this is exactly the plain
+    // nested-cond lowering (the nested ifFalse re-enters lower_conditional, which
+    // handles its own check), so non-priority ifs are unaffected.
+    void lower_if_chain(const ConditionalStatement& c, bool report_no_match, const std::string& banner,
+                        ir::SourceLoc rloc, ir::Builder& b) {
         if (c.conditions.size() != 1) {
             fail("unsupported multi-condition if");
         }
@@ -1964,7 +2002,18 @@ private:
 
         b.open_region();
         if (c.ifFalse != nullptr) {
-            lower_stmt(*c.ifFalse, b);
+            const auto* nested = c.ifFalse->as_if<ConditionalStatement>();
+            if (report_no_match && nested != nullptr &&
+                nested->check == slang::ast::UniquePriorityCheck::None) {
+                // Continue the same priority series, carrying the flag to its end.
+                lower_if_chain(*nested, report_no_match, banner, rloc, b);
+            }
+            else {
+                lower_stmt(*c.ifFalse, b);
+            }
+        }
+        else if (report_no_match) {
+            b.case_violation(banner, 0, rloc);
         }
         const ir::ExtraSlice else_region = b.close_region();
 

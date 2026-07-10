@@ -788,3 +788,85 @@ TEST_CASE("unique case: non-constant labels overlap at runtime") {
     CHECK(run_capture_stderr(src).find("not unique") != std::string::npos);
     CHECK(run_capture(src) == "a\n");
 }
+
+// A default-less priority-if chain with no true condition reports a no-match.
+TEST_CASE("priority if: no true condition, no else reports a violation") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [2:0] a;
+            initial begin
+                a = 3'd5;
+                priority if (a==0) $display("z");
+                else if (a==1) $display("o");
+                else if (a==2) $display("t");
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).find("no condition is true") != std::string::npos);
+    CHECK(run_capture(src).empty());  // nothing matched, so no branch ran
+}
+
+// A matching condition suppresses the report and runs that arm (first match).
+TEST_CASE("priority if: a matching condition reports nothing") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [2:0] a;
+            initial begin
+                a = 3'd1;
+                priority if (a==0) $display("z");
+                else if (a==1) $display("o");
+                else if (a==2) $display("t");
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).empty());
+    CHECK(run_capture(src) == "o\n");
+}
+
+// An explicit final else can never no-match: no report even when no `if`
+// condition is true.
+TEST_CASE("priority if: a final else suppresses the report") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [2:0] a;
+            initial begin
+                a = 3'd5;
+                priority if (a==0) $display("z");
+                else if (a==1) $display("o");
+                else $display("d");
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).empty());
+    CHECK(run_capture(src) == "d\n");
+}
+
+// A single-arm priority if (no else-if, no else) reports when its condition is
+// false.
+TEST_CASE("priority if: single arm, condition false, reports") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [2:0] a;
+            initial begin
+                a = 3'd3;
+                priority if (a==7) $display("hit");
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).find("no condition is true") != std::string::npos);
+    CHECK(run_capture(src).empty());
+}
+
+// A plain (unqualified) if never reports, even with no match and no else.
+TEST_CASE("plain if: no match, no else is silent") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [2:0] a;
+            initial begin
+                a = 3'd5;
+                if (a==0) $display("z"); else if (a==1) $display("o");
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).empty());
+}

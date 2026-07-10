@@ -1235,8 +1235,8 @@ extern "C" void rt_finish(const char* banner, uint64_t now, int32_t arg) {
 extern "C" void rt_case_violation(const char* banner, uint64_t now, int32_t kind) {
     std::fflush(stdout);
     std::string line = banner;
-    line += kind == 0 ? "no condition is true in the unique/priority case at time "
-                      : "case statement is not unique (overlapping items) at time ";
+    line += kind == 0 ? "no condition is true in the unique/priority if/case at time "
+                      : "if/case statement is not unique (overlapping items) at time ";
     append_finish_time(line, now);
     line += '\n';
     std::fputs(line.c_str(), stderr);

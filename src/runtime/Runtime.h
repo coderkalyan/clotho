@@ -78,7 +78,8 @@ void rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uin
 // content but not the stream).
 [[noreturn]] void rt_finish(const char* banner, uint64_t now, int32_t arg);
 
-// Report a unique/priority case violation (LRM 12.5.3). Prints a warning banner
+// Report a unique/priority case (LRM 12.5.3) or if (LRM 12.4.2) violation.
+// Prints a warning banner
 // to stderr and returns — non-fatal, the simulation continues. `banner` is the
 // compile-time "<file>:<line>: " prefix; `now` is the current simulation time in
 // design ticks. `kind` selects the message: 0 = no case item matched (priority
