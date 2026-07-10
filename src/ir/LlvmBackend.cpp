@@ -6724,9 +6724,6 @@ private:
         if (lv.width != lv.store_width) {
             throw BackendError{ "$fread into a part-select target is not supported" };
         }
-        if (lv.store_width > 64) {
-            throw BackendError{ "$fread into a target wider than 64 bits is not supported" };
-        }
         // A never-z target (z elision) passes a null z pointer; a narrow 2-state
         // slot sets flags bit2 so the runtime writes only the iW value word.
         llvm::Value* mm = lv_mm_ptr(lv);
@@ -6755,9 +6752,6 @@ private:
         const SignalSlot& s = slot_of(info.mem);
         if (!s.is_array) {
             throw BackendError{ "$fread memory target is not a memory" };
-        }
-        if (s.width > 64) {
-            throw BackendError{ "$fread into a memory with elements wider than 64 bits is not supported" };
         }
         // Element i's planes at base + i*stride (one slot struct per element); a
         // never-z memory stores no z word, so pass a null z_base.
@@ -6809,11 +6803,6 @@ private:
         const SignalSlot& s     = slot_of(info.target);
         if (!s.is_array) {
             throw BackendError{ "$readmem target is not a memory" };
-        }
-        if (s.width > 64) {
-            // TODO: element width > 64 needs multi-word value assembly in rt_readmem
-            // (the value/mask accumulators are u64 / unsigned __int128 today).
-            throw BackendError{ "$readmem into a memory with elements wider than 64 bits is not supported" };
         }
 
         // A string-object filename (LRM §21.4 allows a string-typed expression) is
