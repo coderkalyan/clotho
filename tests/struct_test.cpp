@@ -190,3 +190,146 @@ TEST_CASE("packed union member access is rejected loudly") {
     CHECK_FALSE(r.ok);
     CHECK(r.diagnostics.find("union member access is not supported") != std::string::npos);
 }
+
+TEST_CASE("blocking read and write of unpacked struct members") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct {
+                logic [7:0] a;
+                bit  [3:0]  b;
+                logic       c;
+            } s_t;
+            s_t x;
+            initial begin
+                x.a = 8'hAB;
+                x.b = 4'd5;
+                x.c = 1'b1;
+                $display("a=%h b=%h c=%b", x.a, x.b, x.c);
+            end
+        endmodule
+    )") == "a=ab b=5 c=1\n");
+}
+
+TEST_CASE("unpacked struct member power-on: 4-state X, 2-state 0") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t x;
+            initial $display("a=%h b=%h", x.a, x.b);
+        endmodule
+    )") == "a=xx b=0\n");
+}
+
+TEST_CASE("whole unpacked struct copy is field-wise") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t x, y;
+            initial begin
+                x.a = 8'h12; x.b = 4'hF;
+                y = x;
+                $display("y=%h %h", y.a, y.b);
+            end
+        endmodule
+    )") == "y=12 f\n");
+}
+
+TEST_CASE("unpacked struct assignment pattern initializes each member") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; logic c; } s_t;
+            s_t x;
+            initial begin
+                x = '{a: 8'hA5, b: 4'h3, c: 1'b1};
+                $display("%h %h %b", x.a, x.b, x.c);
+            end
+        endmodule
+    )") == "a5 3 1\n");
+}
+
+TEST_CASE("unpacked struct declaration initializer") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t x = '{a: 8'h77, b: 4'hE};
+            initial $display("%h %h", x.a, x.b);
+        endmodule
+    )") == "77 e\n");
+}
+
+TEST_CASE("unpacked struct equality is field-wise; X makes it ambiguous (LRM 11.4.5)") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t x, y, z;
+            initial begin
+                x.a = 8'h11; x.b = 4'h2;
+                y.a = 8'h11; y.b = 4'h2;
+                z.a = 8'h11; z.b = 4'h3;
+                $display("eq=%b ne=%b", x == y, x != z);
+                x.a = 8'hxx;
+                $display("xeq=%b", x == y);
+            end
+        endmodule
+    )") == "eq=1 ne=1\nxeq=x\n");
+}
+
+TEST_CASE("arithmetic on a mixed-domain unpacked struct member") {
+    // A 2-state `bit` member beside a 4-state `logic` member: the member read
+    // must carry the member's own declared domain, not the aggregate's.
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [7:0] b; } s_t;
+            s_t x;
+            initial begin
+                x.a = 8'd10;
+                x.b = 8'd20;
+                $display("sum=%0d", x.a + x.b);
+            end
+        endmodule
+    )") == "sum=30\n");
+}
+
+TEST_CASE("nested packed struct member inside an unpacked struct") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct packed { logic [3:0] hi; logic [3:0] lo; } byte_t;
+            typedef struct { byte_t p; logic [7:0] q; } s_t;
+            s_t x;
+            initial begin
+                x.p.hi = 4'hA; x.p.lo = 4'h5;
+                x.q = 8'hCD;
+                $display("p=%h q=%h", x.p, x.q);
+            end
+        endmodule
+    )") == "p=a5 q=cd\n");
+}
+
+TEST_CASE("nonblocking write to an unpacked struct member is guarded (Stage 2)") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            typedef struct { logic [7:0] a; } s_t;
+            s_t x;
+            logic clk;
+            always @(posedge clk) x.a <= 8'h1;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("nonblocking assignment to an unpacked struct") != std::string::npos);
+}
+
+TEST_CASE("whole unpacked struct as a by-value rvalue is guarded") {
+    // Passing a whole unpacked struct by value (here a function argument) has no
+    // flat value to load and no by-value struct ABI yet (Stage 2).
+    const LowerResult r = lower_text(R"(
+        module m;
+            typedef struct { logic [7:0] a; } s_t;
+            s_t x;
+            int y;
+            function int f(s_t s); return 1; endfunction
+            initial y = f(x);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("unpacked struct as a whole-value rvalue") != std::string::npos);
+}

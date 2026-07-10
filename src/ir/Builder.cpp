@@ -97,6 +97,12 @@ Index Builder::elem_select(Index base, Index index, Ref array_type, SourceLoc lo
     return emit({ Inst::Tag::ElemSelect, Inst::Payload{ .op_extra = { base, extra } } }, loc);
 }
 
+Index Builder::member_select(Index base, uint32_t field_index, Ref struct_type, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(MemberSelect{ field_index, struct_type });
+
+    return emit({ Inst::Tag::MemberSelect, Inst::Payload{ .op_extra = { base, extra } } }, loc);
+}
+
 Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc,
                     bool unlikely) {
     const ExtraIndex extra = add_extra(Regions{ then_region, else_region, unlikely });

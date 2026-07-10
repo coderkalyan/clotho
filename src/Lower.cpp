@@ -765,28 +765,40 @@ private:
                 return cached->second;
             }
 
-            const bool is_packed = !ct.isUnpackedStruct();
-            if (!is_packed) {
-                // TODO: unpacked struct/union — aggregate llvm::StructType
-                // backing, member GEP access, state_initializer recursion.
-                // Field-table plumbing (this function) is shared with the
-                // packed path already; only backend storage is missing.
-                fail("unpacked struct is not supported yet");
-            }
-
-            const Scope& body = ct.as<slang::ast::PackedStructType>();
+            const bool   is_packed = !ct.isUnpackedStruct();
+            const Scope& body      = is_packed ? static_cast<const Scope&>(ct.as<slang::ast::PackedStructType>())
+                                               : static_cast<const Scope&>(ct.as<slang::ast::UnpackedStructType>());
             std::vector<ir::Field> fields;
             for (const auto& f : body.membersOfType<slang::ast::FieldSymbol>()) {
+                if (!is_packed) {
+                    // Stage 1 backs an unpacked struct as an aggregate of
+                    // plane-packable scalar members (docs/design/unpacked-struct.md).
+                    // A member that is itself dynamically sized or aggregate-storage
+                    // (string / real / unpacked array / nested unpacked struct) has
+                    // no scalar slot yet — guard it loudly (Stage 2).
+                    const slang::ast::Type& mct = f.getType().getCanonicalType();
+                    if (mct.isString() || mct.isFloating() || mct.isUnpackedArray() ||
+                        mct.isUnpackedStruct() || mct.isUnpackedUnion()) {
+                        fail("unpacked struct member of a non-integral type is not supported");
+                    }
+                }
+                // Packed member: `bitOffset` is the field's bit position. Unpacked
+                // member: addressed by declaration index (`fieldIndex`), no flat
+                // offset — store the index so the field table is self-describing.
                 fields.push_back({ std::string(f.name), lower_type(f.getType()),
-                                    static_cast<uint32_t>(f.bitOffset) });
+                                   is_packed ? static_cast<uint32_t>(f.bitOffset) : f.fieldIndex });
             }
 
             ir::Type t;
             t.kind      = ir::Type::Kind::Struct;
-            t.is_signed = ct.isSigned();
-            t.is_packed = true;
+            t.is_signed = is_packed && ct.isSigned();
+            t.is_packed = is_packed;
+            // Packed: the whole-value scalar domain / width (shares PackedArray
+            // layout). Unpacked: element / bounds are unused (layout reports the
+            // width-0 aggregate sentinel), but element carries the domain for
+            // completeness.
             t.element   = ct.isFourState() ? module_.pool.logic_type : module_.pool.bit_type;
-            t.left      = ct.getBitWidth() - 1;
+            t.left      = is_packed ? ct.getBitWidth() - 1 : 0;
             t.right     = 0;
             t.fields_id = module_.pool.intern_struct_fields(std::move(fields));
 
@@ -806,6 +818,131 @@ private:
     // True if an expression's type is a fixed-size unpacked array (a memory).
     static bool is_unpacked_array(const slang::ast::Expression& e) {
         return e.type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() != nullptr;
+    }
+
+    // True if a type is an unpacked struct (aggregate storage; whole-object ops
+    // decompose field-wise, distinct from a packed struct's flat bit-vector).
+    static bool is_unpacked_struct(const slang::ast::Type& t) {
+        return t.getCanonicalType().isUnpackedStruct();
+    }
+
+    // Store a whole unpacked struct: one blocking store per member (the aggregate
+    // has no flat value, so a whole-object copy decomposes field-wise). `lhs_base`
+    // is the struct's lvalue; `sty` its interned Kind::Struct type. The RHS is
+    // either a `'{...}` assignment pattern (per-field element expressions, already
+    // in declaration order and type-converted by slang) or another struct lvalue
+    // (member-by-member copy). Members are scalar (nested unpacked struct members
+    // are guarded at lower_type), so each store is a plain scalar store.
+    void emit_struct_store(ir::Index lhs_base, ir::Ref sty, const Expression& rhs,
+                           ir::Builder& b, ir::SourceLoc l) {
+        const uint32_t fid = std::get<ir::Type>(module_.pool.get(sty)).fields_id;
+        const auto     n   = static_cast<uint32_t>(module_.pool.struct_fields(fid).size());
+        if (const auto* pat = as_assignment_pattern(rhs)) {
+            const std::span<const Expression* const> elems = pat->elements();
+            for (uint32_t i = 0; i < n; ++i) {
+                const ir::Index m = b.member_select(lhs_base, i, sty, l);
+                b.binary(ir::Inst::Tag::Store, m, lower_expr(*elems[i], b), l);
+            }
+            return;
+        }
+        // A struct-typed value from a call / other non-lvalue rvalue has no
+        // per-member address to copy from (would need a by-value struct ABI).
+        const Expression& src = unwrap_conversion(rhs);
+        if (!is_struct_lvalue_shape(src)) {
+            fail("unsupported unpacked struct rvalue (only '{...} patterns and struct "
+                 "variables are supported)");
+        }
+        const ir::Index rhs_base = lower_lvalue(src, b);
+        for (uint32_t i = 0; i < n; ++i) {
+            const ir::Index lm = b.member_select(lhs_base, i, sty, l);
+            const ir::Index rm = b.member_select(rhs_base, i, sty, l);
+            b.binary(ir::Inst::Tag::Store, lm, b.unary(ir::Inst::Tag::Load, rm, l), l);
+        }
+    }
+
+    // Downcast to an assignment pattern (`'{...}`) base if the expression is one
+    // of the three concrete pattern kinds. The base is abstract (no isKind), so
+    // it cannot go through `as`/`as_if`; the kind check gates the static_cast.
+    static const slang::ast::AssignmentPatternExpressionBase* as_assignment_pattern(const Expression& e) {
+        switch (e.kind) {
+            case ExpressionKind::SimpleAssignmentPattern:
+            case ExpressionKind::StructuredAssignmentPattern:
+            case ExpressionKind::ReplicatedAssignmentPattern:
+                return static_cast<const slang::ast::AssignmentPatternExpressionBase*>(&e);
+            default:
+                return nullptr;
+        }
+    }
+
+    // Whether a nonblocking-assignment target's lvalue chain passes through an
+    // unpacked-struct member (`x.f <= ...`, `x.f[i] <= ...`). Such a write needs
+    // the per-member aggregate shadow (docs/design/unpacked-struct.md, Stage 2)
+    // that the flat-word NBA path cannot express; guarded in the frontend so it
+    // fails at lowering, not only at backend nba_classify.
+    static bool nba_target_is_struct_member(const Expression& e) {
+        switch (e.kind) {
+            case ExpressionKind::MemberAccess: {
+                const MemberAccessExpression& ma = e.as<MemberAccessExpression>();
+                return is_unpacked_struct(*ma.value().type) || nba_target_is_struct_member(ma.value());
+            }
+            case ExpressionKind::ElementSelect:
+                return nba_target_is_struct_member(e.as<ElementSelectExpression>().value());
+            case ExpressionKind::RangeSelect:
+                return nba_target_is_struct_member(e.as<RangeSelectExpression>().value());
+            case ExpressionKind::Conversion:
+                return nba_target_is_struct_member(e.as<ConversionExpression>().operand());
+            default:
+                return false;
+        }
+    }
+
+    // 1-bit 4-state equality of two whole unpacked structs: AND-reduce the
+    // per-member `==` results (Land carries the LRM X-propagation). Both operands
+    // must be struct lvalues (a '{...} pattern compare is a documented follow-up).
+    ir::Index lower_struct_eq(const Expression& lhs, const Expression& rhs, ir::Builder& b,
+                              ir::SourceLoc l) {
+        const Expression& le = unwrap_conversion(lhs);
+        const Expression& re = unwrap_conversion(rhs);
+        if (!is_struct_lvalue_shape(le) || !is_struct_lvalue_shape(re)) {
+            fail("unpacked struct equality is only supported between struct variables");
+        }
+        const ir::Ref  sty = lower_type(*lhs.type);
+        const uint32_t fid = std::get<ir::Type>(module_.pool.get(sty)).fields_id;
+        const auto     n   = static_cast<uint32_t>(module_.pool.struct_fields(fid).size());
+        const ir::Index lbase = lower_lvalue(le, b);
+        const ir::Index rbase = lower_lvalue(re, b);
+        ir::Index acc = ir::Index{ 0 };
+        for (uint32_t i = 0; i < n; ++i) {
+            const ir::Index lm  = b.member_select(lbase, i, sty, l);
+            const ir::Index rm  = b.member_select(rbase, i, sty, l);
+            const ir::Index eqi = b.binary(ir::Inst::Tag::Eq, b.unary(ir::Inst::Tag::Load, lm, l),
+                                           b.unary(ir::Inst::Tag::Load, rm, l), l);
+            acc = i == 0 ? eqi : b.binary(ir::Inst::Tag::Land, acc, eqi, l);
+        }
+        return acc;
+    }
+
+    // Strip an outer identity/struct Conversion wrapper slang may insert on a
+    // struct-typed rvalue, exposing the underlying lvalue-shaped expression.
+    static const Expression& unwrap_conversion(const Expression& e) {
+        const Expression* cur = &e;
+        while (cur->kind == ExpressionKind::Conversion) {
+            cur = &cur->as<ConversionExpression>().operand();
+        }
+        return *cur;
+    }
+
+    // Whether an expression is an lvalue-shaped struct reference (a member-by-member
+    // copy source): a named variable or a select landing on one.
+    static bool is_struct_lvalue_shape(const Expression& e) {
+        switch (e.kind) {
+            case ExpressionKind::NamedValue:
+            case ExpressionKind::MemberAccess:
+            case ExpressionKind::ElementSelect:
+                return true;
+            default:
+                return false;
+        }
     }
 
     // True if an expression is of the dynamic `string` type (LRM 6.16).
@@ -1315,6 +1452,13 @@ private:
         const Expression* init = ns.getInitializer();
         if (init == nullptr) {
             return;
+        }
+        if (is_unpacked_struct(ns.getType())) {
+            // TODO: continuous assignment to a whole unpacked struct net — the
+            // field-wise decomposition would need per-member continuous processes
+            // with per-member sensitivity. Member-level `assign n.f = ...` (a
+            // ContinuousAssignSymbol) is unaffected.
+            fail("continuous assignment to a whole unpacked struct net is not supported");
         }
         record_net_driver_range(ns, 0, UINT32_MAX);
         ir::Builder         b(module_.pool);
@@ -2302,7 +2446,11 @@ private:
                 fail("static function local with an initializer is not supported");
             }
             const ir::SourceLoc l = loc(*init);
-            b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
+            if (is_unpacked_struct(vs.getType())) {
+                emit_struct_store(value_lvalue(vs, b, l), lower_type(vs.getType()), *init, b, l);
+            } else {
+                b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
+            }
         }
     }
 
@@ -2322,7 +2470,11 @@ private:
         }
         ir::Builder&        b = *preinit_;
         const ir::SourceLoc l = loc(*init);
-        b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
+        if (is_unpacked_struct(vs.getType())) {
+            emit_struct_store(value_lvalue(vs, b, l), lower_type(vs.getType()), *init, b, l);
+        } else {
+            b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
+        }
     }
 
     // Emit the accumulated declaration initializers as one run-once PreInit
@@ -4509,6 +4661,29 @@ private:
     // `y = (x = 5)`) can recover its value; the caller truncates to the LHS type.
     // Statement callers discard the return.
     ir::Index lower_assign(const AssignmentExpression& a, ir::Builder& b) {
+        if (is_unpacked_struct(*a.left().type)) {
+            // Whole unpacked-struct assignment: decompose to per-member stores.
+            const ir::SourceLoc l = loc(a);
+            if (a.isNonBlocking()) {
+                // TODO: nonblocking assignment to an unpacked struct — needs a
+                // per-member aggregate shadow (docs/design/unpacked-struct.md,
+                // Stage 2).
+                fail("nonblocking assignment to an unpacked struct is not supported");
+            }
+            if (a.isCompound()) {
+                fail("compound assignment to an unpacked struct is not supported");
+            }
+            if (a.timingControl != nullptr) {
+                fail("intra-assignment timing control (#/@ on an assignment) is not supported");
+            }
+            emit_struct_store(lower_lvalue(a.left(), b), lower_type(*a.left().type), a.right(), b, l);
+            return true_const(b, l);
+        }
+        if (a.isNonBlocking() && nba_target_is_struct_member(a.left())) {
+            // TODO: nonblocking assignment to an unpacked struct member — needs a
+            // per-member aggregate shadow (docs/design/unpacked-struct.md, Stage 2).
+            fail("nonblocking assignment to an unpacked struct member is not supported");
+        }
         if (a.isCompound()) {
             return lower_compound_assign(a, b);
         }
@@ -4761,6 +4936,13 @@ private:
                     // TODO: reading a whole unpacked array as a value (array copy,
                     // passing a memory by value). Only element reads are supported.
                     fail("whole unpacked array read is not supported");
+                }
+                if (is_unpacked_struct(*expr.type)) {
+                    // A whole unpacked struct has no flat value: reads are only
+                    // supported where they decompose field-wise (assignment,
+                    // equality). A general rvalue context ($display, a by-value
+                    // argument, a concat operand) would need a by-value struct ABI.
+                    fail("unpacked struct as a whole-value rvalue is not supported here");
                 }
                 return b.unary(ir::Inst::Tag::Load, value_lvalue(sym, b, l), l);
             }
@@ -5165,6 +5347,20 @@ private:
             return lower_short_circuit(bin, b);
         }
 
+        // Unpacked-struct equality (LRM 7.2, 11.4.5): a whole-struct value cannot
+        // be loaded, so `==` / `!=` reduce to a per-member comparison. The members'
+        // 4-state Eq results fold with Land (X propagates: any definite mismatch
+        // is 0, else X if any member is X, else 1); `!=` negates that reduction.
+        // slang wraps each operand in a bitstream Conversion, so the struct type
+        // is on the unwrapped operand, not `bin.left().type`.
+        if ((bin.op == B::Equality || bin.op == B::Inequality) &&
+            is_unpacked_struct(*unwrap_conversion(bin.left()).type)) {
+            const ir::SourceLoc l   = loc(bin);
+            const ir::Index     acc = lower_struct_eq(unwrap_conversion(bin.left()),
+                                                      unwrap_conversion(bin.right()), b, l);
+            return bin.op == B::Equality ? acc : b.unary(ir::Inst::Tag::Lnot, acc, l);
+        }
+
         const ir::SourceLoc l   = loc(bin);
         const ir::Index     lhs = lower_expr(bin.left(), b);
         const ir::Index     rhs = lower_expr(bin.right(), b);
@@ -5317,8 +5513,14 @@ private:
             fail("union member access is not supported yet");
         }
         const ir::Index base = lower_lvalue(ma.value(), b);
-        const auto      lsb  = static_cast<uint32_t>(field->bitOffset);
-        const auto      msb  = lsb + static_cast<uint32_t>(ma.type->getBitWidth()) - 1;
+        // An unpacked struct is an aggregate: the member is addressed by field
+        // index (MemberSelect -> struct GEP), not a bit range. A packed struct is
+        // a flat bit-vector, so the member is a constant part-select.
+        if (ma.value().type->getCanonicalType().isUnpackedStruct()) {
+            return b.member_select(base, field->fieldIndex, lower_type(*ma.value().type), l);
+        }
+        const auto lsb = static_cast<uint32_t>(field->bitOffset);
+        const auto msb = lsb + static_cast<uint32_t>(ma.type->getBitWidth()) - 1;
         return b.part_select(base, msb, lsb, l);
     }
 

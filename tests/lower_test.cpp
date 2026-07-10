@@ -610,18 +610,23 @@ TEST_CASE("a packed struct declares and carries its field table") {
     CHECK(fields[1].bit_offset == 0);
 }
 
-TEST_CASE("an unpacked struct fails loudly") {
+TEST_CASE("an unpacked struct with a non-integral member fails loudly") {
+    // Stage 1 backs unpacked structs as an aggregate of plane-packable scalar
+    // members; a string / real / array / nested-unpacked member is guarded
+    // (docs/design/unpacked-struct.md).
     const LowerResult r = lower_text(R"(
         module top;
             typedef struct {
                 logic [3:0] a;
-                bit [7:0] b;
+                real        b;
             } s_t;
             s_t x;
+            initial x.a = 4'h1;
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("unpacked struct is not supported") != std::string::npos);
+    CHECK(r.diagnostics.find("unpacked struct member of a non-integral type is not supported") !=
+          std::string::npos);
 }
 
 TEST_CASE("nested instances chain their hierarchical prefixes") {

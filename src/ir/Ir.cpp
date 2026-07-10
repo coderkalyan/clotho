@@ -136,6 +136,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::PartSelect:
         case T::DynPartSelect:
         case T::ElemSelect:
+        case T::MemberSelect:
         case T::Cond:
         case T::Switch:
         case T::Fopen:
@@ -338,6 +339,7 @@ LvalueRoot lvalue_root(const Ir& ir, Index lv) {
             case Inst::Tag::PartSelect:
             case Inst::Tag::DynPartSelect:
             case Inst::Tag::ElemSelect:
+            case Inst::Tag::MemberSelect:
                 lv    = ir.payload(lv).op_extra.op;
                 whole = false;
                 break;

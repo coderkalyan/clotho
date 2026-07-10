@@ -287,6 +287,26 @@ struct LValue {
     // A string target: `base` (indexed by elem_idx for an array) is the
     // rt_string handle; widths / bit_off / has_z are meaningless.
     bool is_string = false;
+    // Unpacked-struct aggregate: `base` points at the struct's backing
+    // StructType (`struct_ty`), and the slot / width fields are placeholders
+    // until a MemberSelect GEPs a member field and fills them from the member's
+    // slot. Null for every non-struct lvalue.
+    llvm::StructType* struct_ty = nullptr;
+};
+
+// One member of an unpacked-struct signal's aggregate storage (Stage 1: every
+// member is a plane-packable scalar, so it is a single `{ i(2W), iW }` / `{ iW }`
+// slot, addressed by its declaration-order field index into the StructType).
+struct StructMember {
+    llvm::StructType* slot_ty    = nullptr;
+    uint32_t          width      = 0;
+    bool              four_state = false;
+    bool              is_signed  = false;
+    // Never-z / narrow flags matching a standalone scalar signal of this type:
+    // a 2-state member is a narrow `{ iW }`; a 4-state member is `{ i(2W) }`
+    // (has_z false — Stage 1 struct members carry no z; NBA / net-z is guarded).
+    bool has_z  = false;
+    bool narrow = false;
 };
 
 // Per-signal placement in the state struct plus its cached layout facts. A
@@ -350,6 +370,13 @@ struct SignalSlot {
     // handle (`clotho.string`), has_z is false, and `nba` is never set (the
     // frontend rejects nonblocking assignment to strings).
     bool is_string = false;
+    // An unpacked-struct signal: `storage_ty` is a StructType of per-member
+    // slots (`members`), addressed by field index via MemberSelect. `slot_ty`
+    // is null and `width` unused (the aggregate has no flat value); whole-object
+    // ops are decomposed field-wise by the frontend, and NBA to a struct member
+    // is guarded (Stage 1 — the aggregate shadow is a follow-up).
+    bool                      is_struct = false;
+    std::vector<StructMember> members;
 };
 
 // One function-frame local: its `{ i(2W), iW }` slot type and width / domain.
@@ -648,6 +675,29 @@ private:
                 }
                 continue;
             }
+            // An unpacked struct is an aggregate: one StructType field per member,
+            // each a standalone scalar slot (Stage 1 members are plane-packable).
+            // Members are addressed by field index (MemberSelect), never a flat
+            // bit offset; whole-object ops decompose field-wise in the frontend.
+            if (ty.kind == Type::Kind::Struct && !ty.is_packed) {
+                slot.is_struct = true;
+                slot.has_z     = false;
+                std::vector<llvm::Type*> field_tys;
+                for (const Field& f : mod_.pool.struct_fields(ty.fields_id)) {
+                    const Layout fl = mod_.pool.layout(f.type);
+                    StructMember m;
+                    m.width      = fl.width == 0 ? 1 : fl.width;
+                    m.four_state = fl.domain == Domain::Four;
+                    m.is_signed  = std::get<Type>(mod_.pool.get(f.type)).is_signed;
+                    m.has_z      = false;
+                    m.narrow     = !m.four_state;
+                    m.slot_ty    = slot_type(m.width, m.four_state, /*has_z*/ false, m.narrow);
+                    field_tys.push_back(m.slot_ty);
+                    slot.members.push_back(m);
+                }
+                slot.storage_ty = llvm::StructType::create(ctx_, field_tys, "clotho.ustruct");
+                continue;
+            }
             // A real / shortreal slot stores the IEEE-754 bit pattern in a
             // 2-state word: never z, so it takes the narrow single-iW form
             // below (pool layout gives Domain::Two for floats).
@@ -744,6 +794,7 @@ private:
                     return true;
                 case Inst::Tag::PartSelect:
                 case Inst::Tag::ElemSelect:
+                case Inst::Tag::MemberSelect:
                     lv = ir.payload(lv).op_extra.op;
                     break;
                 default:
@@ -765,6 +816,7 @@ private:
                 case Inst::Tag::DynPartSelect:
                     return true;
                 case Inst::Tag::ElemSelect:
+                case Inst::Tag::MemberSelect:
                     lv = ir.payload(lv).op_extra.op;
                     break;
                 default:
@@ -785,6 +837,16 @@ private:
             }
             const Index     lv_idx = ir.payload(idx).binary.l;
             const NbaTarget t      = nba_target(ir, lv_idx);
+            // Nonblocking assignment to an unpacked-struct member (or whole
+            // struct) needs a per-member aggregate shadow the flat-word NBA path
+            // cannot express (docs/design/unpacked-struct.md, Stage 2). The
+            // frontend guards this too; this is defense in depth.
+            {
+                const Type& rt = std::get<Type>(mod_.pool.get(sigs[static_cast<uint32_t>(t.sig)].type));
+                if (rt.kind == Type::Kind::Struct && !rt.is_packed) {
+                    throw BackendError{ "nonblocking assignment to an unpacked struct is not supported" };
+                }
+            }
             // An unpacked-array element NBA uses the runtime deferred queue, not
             // the per-signal shadow; record the array signal for wake servicing.
             // (slot.is_array is not set until the placement loop below, so test
@@ -4465,6 +4527,19 @@ private:
         if (s.is_array) {
             return llvm::ConstantAggregateZero::get(s.storage_ty);
         }
+        if (s.is_struct) {
+            // Each member powers on like a standalone scalar of its type: X for a
+            // 4-state member, 0 for a 2-state one (no z — struct members are
+            // never-z in Stage 1).
+            std::vector<llvm::Constant*> fields;
+            fields.reserve(s.members.size());
+            for (const StructMember& m : s.members) {
+                llvm::Constant* mm =
+                  m.narrow ? zero(m.width) : (m.four_state ? x_mm(m.width) : zero(2 * m.width));
+                fields.push_back(llvm::ConstantStruct::get(m.slot_ty, { mm }));
+            }
+            return llvm::ConstantStruct::get(llvm::cast<llvm::StructType>(s.storage_ty), fields);
+        }
         if (s.is_string) {
             // Empty inline handle: byte (cap) holds cap == str_inline_cap, i.e.
             // sizeof(rt_string) - 1 (mirrors rt_string_init).
@@ -4658,6 +4733,13 @@ private:
                 const auto  es = ir_->extra_data<ElemSelect>(p.op_extra.extra);
                 const Type& at = std::get<Type>(mod_.pool.get(es.array_type));
                 return from_ref(at.element);
+            }
+            case Inst::Tag::MemberSelect: {
+                // The result is the selected member's own type.
+                const auto   ms     = ir_->extra_data<MemberSelect>(p.op_extra.extra);
+                const Type&  st     = std::get<Type>(mod_.pool.get(ms.struct_type));
+                const auto   fields = mod_.pool.struct_fields(st.fields_id);
+                return from_ref(fields[ms.field_index].type);
             }
             case Inst::Tag::Load:
                 return type_of(p.unary);
@@ -5056,6 +5138,28 @@ private:
                 llvm::Value* off  = stride == 1 ? norm : b_.CreateMul(norm, b_.getInt32(stride));
                 lv.elem_idx       = lv.elem_idx != nullptr ? b_.CreateAdd(lv.elem_idx, off) : off;
                 lv.bit_off        = b_.getInt32(0);
+                set_lvalue(i, lv);
+                return;
+            }
+            case Inst::Tag::MemberSelect: {
+                // GEP the base struct aggregate to the member field, then build a
+                // scalar lvalue over that member's own slot. The result addresses
+                // the member exactly like a standalone signal of the member type,
+                // so load / blocking-store reuse the scalar path unchanged.
+                const LValue      base = lvalue_of(p.op_extra.op);
+                const auto        ms   = ir_->extra_data<MemberSelect>(p.op_extra.extra);
+                const SignalSlot& s    = slot_of(base.sig);
+                const StructMember& m  = s.members[ms.field_index];
+                LValue lv{};
+                lv.base        = b_.CreateStructGEP(base.struct_ty, base.base, ms.field_index);
+                lv.slot_ty     = m.slot_ty;
+                lv.has_z       = m.has_z;
+                lv.narrow      = m.narrow;
+                lv.store_width = m.width;
+                lv.bit_off     = b_.getInt32(0);
+                lv.width       = m.width;
+                lv.is_signal   = base.is_signal;
+                lv.sig         = base.sig;
                 set_lvalue(i, lv);
                 return;
             }
@@ -5726,6 +5830,17 @@ private:
     // Whole-storage lvalue for a module signal (state struct).
     LValue signal_lvalue(Signal sig) {
         const SignalSlot& s = slot_of(sig);
+        if (s.is_struct) {
+            // The aggregate base; a following MemberSelect GEPs a member field
+            // and fills the slot / width. A bare struct lvalue is never loaded /
+            // stored (whole-object ops decompose field-wise in the frontend).
+            LValue lv{};
+            lv.base      = storage_ptr(state_, s);
+            lv.struct_ty = llvm::cast<llvm::StructType>(s.storage_ty);
+            lv.is_signal = true;
+            lv.sig       = sig;
+            return lv;
+        }
         return LValue{ .base        = storage_ptr(state_, s),
                        .slot_ty     = s.slot_ty,
                        .has_z       = s.has_z,
