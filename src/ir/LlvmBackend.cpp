@@ -292,6 +292,10 @@ struct LValue {
     // until a MemberSelect GEPs a member field and fills them from the member's
     // slot. Null for every non-struct lvalue.
     llvm::StructType* struct_ty = nullptr;
+    // Declaration-order member index when this lvalue is an unpacked-struct
+    // member (set by MemberSelect); -1 otherwise. Nonblocking staging uses it to
+    // reach the member's shadow slot and its commit dirty bit.
+    int struct_member = -1;
 };
 
 // One member of an unpacked-struct signal's aggregate storage (Stage 1: every
@@ -307,6 +311,10 @@ struct StructMember {
     // (has_z false — Stage 1 struct members carry no z; NBA / net-z is guarded).
     bool has_z  = false;
     bool narrow = false;
+    // Shadow-struct field index for this member's nonblocking staging slot,
+    // assigned in build_state_layout when the struct is an NBA target. Unused
+    // when the struct takes no nonblocking write.
+    uint32_t sh_mm_field = 0;
 };
 
 // Per-signal placement in the state struct plus its cached layout facts. A
@@ -377,6 +385,11 @@ struct SignalSlot {
     // is guarded (Stage 1 — the aggregate shadow is a follow-up).
     bool                      is_struct = false;
     std::vector<StructMember> members;
+    // An unpacked-struct nonblocking target: members are committed per-member
+    // from an aggregate shadow (each member owns a shadow slot); the block-commit
+    // BlockSig `mask` is reinterpreted as a member-set (bit k = member k written).
+    // Set by nba_classify; implies `nba` and `nba_block`.
+    bool nba_struct = false;
 };
 
 // One function-frame local: its `{ i(2W), iW }` slot type and width / domain.
@@ -743,6 +756,16 @@ private:
                 if (!slot.nba) {
                     continue;
                 }
+                // An unpacked-struct target shadows each member's mm plane (a
+                // whole StructType field; members are never-z in Stage 1). The
+                // commit selects members by the block's member-set mask.
+                if (slot.nba_struct) {
+                    for (StructMember& m : slot.members) {
+                        m.sh_mm_field = static_cast<uint32_t>(sf.size());
+                        sf.push_back(int_ty(m.narrow ? m.width : 2 * m.width));
+                    }
+                    continue;
+                }
                 slot.sh_mm_field = static_cast<uint32_t>(sf.size());
                 // A narrow 2-state target shadows a single iW word (no z shadow).
                 sf.push_back(int_ty(slot.narrow ? slot.width : 2 * slot.width));
@@ -837,14 +860,18 @@ private:
             }
             const Index     lv_idx = ir.payload(idx).binary.l;
             const NbaTarget t      = nba_target(ir, lv_idx);
-            // Nonblocking assignment to an unpacked-struct member (or whole
-            // struct) needs a per-member aggregate shadow the flat-word NBA path
-            // cannot express (docs/design/unpacked-struct.md, Stage 2). The
-            // frontend guards this too; this is defense in depth.
+            // Nonblocking assignment to an unpacked-struct member: commit through
+            // a per-member aggregate shadow (a member is a whole StructType field,
+            // not a bit range of a flat word). The frontend decomposes a whole-
+            // struct `x <= y` into per-member StoreNb and guards partial-member
+            // writes, so every struct NBA site here is a whole-member store.
             {
                 const Type& rt = std::get<Type>(mod_.pool.get(sigs[static_cast<uint32_t>(t.sig)].type));
                 if (rt.kind == Type::Kind::Struct && !rt.is_packed) {
-                    throw BackendError{ "nonblocking assignment to an unpacked struct is not supported" };
+                    SignalSlot& s  = slots_[static_cast<uint32_t>(t.sig)];
+                    s.nba          = true;
+                    s.nba_struct   = true;
+                    continue;
                 }
             }
             // An unpacked-array element NBA uses the runtime deferred queue, not
@@ -3375,6 +3402,10 @@ private:
     void emit_block_commit_body(uint32_t id) {
         for (const BlockSig& bs : block_commits_[id].sigs) {
             const SignalSlot& s       = slot_of(bs.sig);
+            if (s.nba_struct) {
+                emit_struct_commit(bs.sig, bs.mask);
+                continue;
+            }
             const uint32_t    W       = s.width;
             auto*             mmty     = int_ty(s.narrow ? W : 2 * W);
             auto*             zty      = int_ty(W);
@@ -3427,6 +3458,41 @@ private:
                                                          { b_.getInt32(0), b_.getInt32(s.nba_id) });
                 emit_nba_service(meta, old_mm, new_mm, W, s.narrow, old_z, new_z);
             }
+        }
+    }
+
+    // Commit an unpacked-struct NBA target within a block: copy each member whose
+    // member-set bit is set from its shadow slot to live storage, then wake level
+    // (Any-edge) readers if any member changed. A struct member is a whole
+    // StructType field (not a bit range), so this copies fields, not masked words;
+    // edge sensitivity on a struct member is rejected in the frontend, so Any is
+    // the only wait bucket a struct signal carries.
+    void emit_struct_commit(Signal sig, const llvm::APInt& mask) {
+        const SignalSlot& s       = slot_of(sig);
+        llvm::Value*      live    = storage_ptr(state_, s);
+        llvm::Value*      changed = b_.getFalse();
+        for (uint32_t f = 0; f < s.members.size(); ++f) {
+            if (!mask[f]) {
+                continue;
+            }
+            const StructMember& m       = s.members[f];
+            auto*               mmty    = int_ty(m.narrow ? m.width : 2 * m.width);
+            llvm::Value*        live_m  = b_.CreateStructGEP(s.storage_ty, live, f);
+            llvm::Value*        live_mm = b_.CreateStructGEP(m.slot_ty, live_m, 0);
+            llvm::Value*        old_mm  = b_.CreateLoad(mmty, live_mm);
+            llvm::Value*        new_mm  = b_.CreateLoad(mmty, shadow_ptr(m.sh_mm_field));
+            b_.CreateStore(new_mm, live_mm);
+            changed = b_.CreateOr(changed, b_.CreateICmpNE(old_mm, new_mm));
+        }
+        if (signal_has_waiters(sig)) {
+            auto* fn   = b_.GetInsertBlock()->getParent();
+            auto* svc  = llvm::BasicBlock::Create(ctx_, "ustruct.svc", fn);
+            auto* cont = llvm::BasicBlock::Create(ctx_, "ustruct.cont", fn);
+            b_.CreateCondBr(changed, svc, cont);
+            b_.SetInsertPoint(svc);
+            service_any_waiters(sig);
+            b_.CreateBr(cont);
+            b_.SetInsertPoint(cont);
         }
     }
 
@@ -5160,6 +5226,7 @@ private:
                 lv.width       = m.width;
                 lv.is_signal   = base.is_signal;
                 lv.sig         = base.sig;
+                lv.struct_member = static_cast<int>(ms.field_index);
                 set_lvalue(i, lv);
                 return;
             }
@@ -5978,7 +6045,19 @@ private:
     // serviced here — that happens in the NBA region after the active drain.
     void lower_store_nb(const LValue& lv, Plane rhs) {
         const SignalSlot& s  = slot_of(lv.sig);
-        llvm::Value*      mp = shadow_ptr(s.sh_mm_field);
+
+        // Unpacked-struct member: stage the whole member into its own shadow slot
+        // and register this member's bit in the block's member-set mask. The
+        // member value is signal-width (frontend Resize), so no bit merge.
+        if (lv.struct_member >= 0) {
+            const StructMember& m  = s.members[static_cast<uint32_t>(lv.struct_member)];
+            llvm::Value*        mp = shadow_ptr(m.sh_mm_field);
+            b_.CreateStore(m.narrow ? must_of(rhs) : to_four(rhs).mm, mp);
+            block_register(lv.sig, member_set_mask(s, lv.struct_member), /*dynamic=*/false);
+            return;
+        }
+
+        llvm::Value* mp = shadow_ptr(s.sh_mm_field);
 
         // Narrow 2-state target: stage the single iW value into the iW shadow. No z.
         if (s.narrow) {
@@ -6046,6 +6125,16 @@ private:
         }
         const uint64_t lsb = llvm::cast<llvm::ConstantInt>(lv.bit_off)->getZExtValue();
         return llvm::APInt::getBitsSet(s.width, lsb, lsb + lv.width);
+    }
+
+    // Member-set mask for an unpacked-struct block registration: one bit per
+    // member, bit k set for the written member k. Unioned per block; the struct
+    // commit copies the members whose bit is set. Width is the member count (not
+    // a bit width) — a struct signal's BlockSig mask lives in this space.
+    llvm::APInt member_set_mask(const SignalSlot& s, int member) const {
+        llvm::APInt m(static_cast<uint32_t>(s.members.size()), 0);
+        m.setBit(static_cast<uint32_t>(member));
+        return m;
     }
 
     // Register this NBA store's target on the current block, recording the commit

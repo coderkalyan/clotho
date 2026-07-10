@@ -834,14 +834,14 @@ private:
     // (member-by-member copy). Members are scalar (nested unpacked struct members
     // are guarded at lower_type), so each store is a plain scalar store.
     void emit_struct_store(ir::Index lhs_base, ir::Ref sty, const Expression& rhs,
-                           ir::Builder& b, ir::SourceLoc l) {
+                           ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
         const uint32_t fid = std::get<ir::Type>(module_.pool.get(sty)).fields_id;
         const auto     n   = static_cast<uint32_t>(module_.pool.struct_fields(fid).size());
         if (const auto* pat = as_assignment_pattern(rhs)) {
             const std::span<const Expression* const> elems = pat->elements();
             for (uint32_t i = 0; i < n; ++i) {
                 const ir::Index m = b.member_select(lhs_base, i, sty, l);
-                b.binary(ir::Inst::Tag::Store, m, lower_expr(*elems[i], b), l);
+                b.binary(tag, m, lower_expr(*elems[i], b), l);
             }
             return;
         }
@@ -852,11 +852,14 @@ private:
             fail("unsupported unpacked struct rvalue (only '{...} patterns and struct "
                  "variables are supported)");
         }
+        // A nonblocking whole-struct copy samples every member's RHS now (in the
+        // active region) via the per-member Load; each member commits in the NBA
+        // region independently, which is exactly whole-struct NBA semantics.
         const ir::Index rhs_base = lower_lvalue(src, b);
         for (uint32_t i = 0; i < n; ++i) {
             const ir::Index lm = b.member_select(lhs_base, i, sty, l);
             const ir::Index rm = b.member_select(rhs_base, i, sty, l);
-            b.binary(ir::Inst::Tag::Store, lm, b.unary(ir::Inst::Tag::Load, rm, l), l);
+            b.binary(tag, lm, b.unary(ir::Inst::Tag::Load, rm, l), l);
         }
     }
 
@@ -2447,7 +2450,7 @@ private:
             }
             const ir::SourceLoc l = loc(*init);
             if (is_unpacked_struct(vs.getType())) {
-                emit_struct_store(value_lvalue(vs, b, l), lower_type(vs.getType()), *init, b, l);
+                emit_struct_store(value_lvalue(vs, b, l), lower_type(vs.getType()), *init, ir::Inst::Tag::Store, b, l);
             } else {
                 b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
             }
@@ -2471,7 +2474,7 @@ private:
         ir::Builder&        b = *preinit_;
         const ir::SourceLoc l = loc(*init);
         if (is_unpacked_struct(vs.getType())) {
-            emit_struct_store(value_lvalue(vs, b, l), lower_type(vs.getType()), *init, b, l);
+            emit_struct_store(value_lvalue(vs, b, l), lower_type(vs.getType()), *init, ir::Inst::Tag::Store, b, l);
         } else {
             b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
         }
@@ -4662,27 +4665,31 @@ private:
     // Statement callers discard the return.
     ir::Index lower_assign(const AssignmentExpression& a, ir::Builder& b) {
         if (is_unpacked_struct(*a.left().type)) {
-            // Whole unpacked-struct assignment: decompose to per-member stores.
+            // Whole unpacked-struct assignment: decompose to per-member stores
+            // (blocking or nonblocking). Each member commits independently, which
+            // is whole-struct NBA semantics.
             const ir::SourceLoc l = loc(a);
-            if (a.isNonBlocking()) {
-                // TODO: nonblocking assignment to an unpacked struct — needs a
-                // per-member aggregate shadow (docs/design/unpacked-struct.md,
-                // Stage 2).
-                fail("nonblocking assignment to an unpacked struct is not supported");
-            }
             if (a.isCompound()) {
                 fail("compound assignment to an unpacked struct is not supported");
             }
             if (a.timingControl != nullptr) {
                 fail("intra-assignment timing control (#/@ on an assignment) is not supported");
             }
-            emit_struct_store(lower_lvalue(a.left(), b), lower_type(*a.left().type), a.right(), b, l);
+            const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
+            emit_struct_store(lower_lvalue(a.left(), b), lower_type(*a.left().type), a.right(), tag, b, l);
             return true_const(b, l);
         }
         if (a.isNonBlocking() && nba_target_is_struct_member(a.left())) {
-            // TODO: nonblocking assignment to an unpacked struct member — needs a
-            // per-member aggregate shadow (docs/design/unpacked-struct.md, Stage 2).
-            fail("nonblocking assignment to an unpacked struct member is not supported");
+            // Whole-member NBA (`x.f <= v`) is supported; a partial or nested
+            // write into a member (`x.f[i] <= v`, `x.f.g <= v`) needs sub-member
+            // shadow staging (docs/design/unpacked-struct.md, Stage 2+).
+            const bool whole_member =
+              a.left().kind == ExpressionKind::MemberAccess &&
+              is_unpacked_struct(*a.left().as<MemberAccessExpression>().value().type);
+            if (!whole_member) {
+                fail("nonblocking assignment to part of an unpacked struct member is not "
+                     "supported");
+            }
         }
         if (a.isCompound()) {
             return lower_compound_assign(a, b);

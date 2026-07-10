@@ -305,17 +305,79 @@ TEST_CASE("nested packed struct member inside an unpacked struct") {
     )") == "p=a5 q=cd\n");
 }
 
-TEST_CASE("nonblocking write to an unpacked struct member is guarded (Stage 2)") {
+TEST_CASE("nonblocking write to unpacked struct members, one cycle latency") {
+    // Two clock edges: member NBA reads the pre-edge value and commits after, so
+    // after edge 1 a==11 (10+1), and the comb read settles to the committed value.
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t x;
+            logic clk;
+            initial begin
+                clk = 0;
+                x.a = 8'd10; x.b = 4'd2;
+                #1 clk = 1; #1 clk = 0;
+                #1 clk = 1; #1 clk = 0; #1;
+                $display("a=%0d b=%0d", x.a, x.b);
+            end
+            always @(posedge clk) begin
+                x.a <= x.a + 8'd1;
+                x.b <= x.b + 4'd1;
+            end
+        endmodule
+    )") == "a=12 b=4\n");
+}
+
+TEST_CASE("whole unpacked struct nonblocking copy has NBA sampling") {
+    // y <= x samples x in the active region, so y trails x by one clock.
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t x, y;
+            logic clk;
+            initial begin
+                clk = 0;
+                x.a = 8'd1; x.b = 4'd0;
+                #1 clk = 1; #1 clk = 0;   // x <= 2, y <= 1 (old x)
+                #1 clk = 1; #1 clk = 0; #1;
+                $display("x=%0d y=%0d", x.a, y.a);
+            end
+            always @(posedge clk) x.a <= x.a + 8'd1;
+            always @(posedge clk) y <= x;
+        endmodule
+    )") == "x=3 y=2\n");
+}
+
+TEST_CASE("combinational reader re-evaluates after a struct-member NBA commit") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t x;
+            logic clk;
+            logic [7:0] sum;
+            always_comb sum = x.a + {4'd0, x.b};
+            always @(posedge clk) begin x.a <= 8'd20; x.b <= 4'd5; end
+            initial begin
+                clk = 0; x.a = 8'd0; x.b = 4'd0;
+                #1 clk = 1; #1;
+                $display("sum=%0d", sum);
+            end
+        endmodule
+    )") == "sum=25\n");
+}
+
+TEST_CASE("nonblocking write to part of a struct member is guarded (Stage 2)") {
     const LowerResult r = lower_text(R"(
         module m;
             typedef struct { logic [7:0] a; } s_t;
             s_t x;
             logic clk;
-            always @(posedge clk) x.a <= 8'h1;
+            always @(posedge clk) x.a[3:0] <= 4'h1;
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("nonblocking assignment to an unpacked struct") != std::string::npos);
+    CHECK(r.diagnostics.find("nonblocking assignment to part of an unpacked struct member") !=
+          std::string::npos);
 }
 
 TEST_CASE("whole unpacked struct as a by-value rvalue is guarded") {
