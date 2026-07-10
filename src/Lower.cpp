@@ -909,46 +909,6 @@ private:
         }
     }
 
-    // Whether a nonblocking-assignment target's lvalue chain passes through an
-    // unpacked-struct member (`x.f <= ...`, `x.f[i] <= ...`). Such a write needs
-    // the per-member aggregate shadow (docs/design/unpacked-struct.md, Stage 2)
-    // that the flat-word NBA path cannot express; guarded in the frontend so it
-    // fails at lowering, not only at backend nba_classify.
-    static bool nba_target_is_struct_member(const Expression& e) {
-        switch (e.kind) {
-            case ExpressionKind::MemberAccess: {
-                const MemberAccessExpression& ma = e.as<MemberAccessExpression>();
-                return is_unpacked_struct(*ma.value().type) || nba_target_is_struct_member(ma.value());
-            }
-            case ExpressionKind::ElementSelect:
-                return nba_target_is_struct_member(e.as<ElementSelectExpression>().value());
-            case ExpressionKind::RangeSelect:
-                return nba_target_is_struct_member(e.as<RangeSelectExpression>().value());
-            case ExpressionKind::Conversion:
-                return nba_target_is_struct_member(e.as<ConversionExpression>().operand());
-            default:
-                return false;
-        }
-    }
-
-    // Whether an lvalue chain contains a runtime unpacked-array element select
-    // (`arr[i]`, `x.mem[i]`). A nonblocking write reaching an aggregate leaf
-    // through one has no compile-time leaf address for the block-commit shadow.
-    static bool expr_has_element_select(const Expression& e) {
-        switch (e.kind) {
-            case ExpressionKind::ElementSelect:
-                return true;
-            case ExpressionKind::MemberAccess:
-                return expr_has_element_select(e.as<MemberAccessExpression>().value());
-            case ExpressionKind::RangeSelect:
-                return expr_has_element_select(e.as<RangeSelectExpression>().value());
-            case ExpressionKind::Conversion:
-                return expr_has_element_select(e.as<ConversionExpression>().operand());
-            default:
-                return false;
-        }
-    }
-
     // 1-bit 4-state equality of two whole unpacked structs: AND-reduce the
     // per-leaf `==` results (Land carries the LRM 11.4.5 X-propagation). Both
     // operands must be struct lvalues (a '{...} pattern compare is a follow-up);
@@ -4741,22 +4701,6 @@ private:
             const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
             emit_struct_store(lower_lvalue(a.left(), b), lower_type(*a.left().type), a.right(), tag, b, l);
             return true_const(b, l);
-        }
-        if (a.isNonBlocking() && nba_target_is_struct_member(a.left())) {
-            // Whole-member / whole-array-element NBA into an aggregate (`x.f <= v`,
-            // nested `x.a.b <= v`, `arr[i].f <= v`, `x.mem[i] <= v`) is supported.
-            // A bit/part select landing on an aggregate leaf (`x.f[3:0] <= v`,
-            // `arr[i].f[2] <= v`) is a partial write neither the static shadow nor
-            // the whole-leaf deferred record stages.
-            const Expression& top = a.left();
-            const bool        partial =
-              top.kind == ExpressionKind::RangeSelect ||
-              (top.kind == ExpressionKind::ElementSelect &&
-               !top.as<ElementSelectExpression>().value().type->getCanonicalType().isUnpackedArray());
-            if (partial) {
-                fail("nonblocking assignment to part of an unpacked-struct-member leaf is not "
-                     "supported");
-            }
         }
         if (a.isCompound()) {
             return lower_compound_assign(a, b);

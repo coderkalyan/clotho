@@ -366,17 +366,53 @@ TEST_CASE("combinational reader re-evaluates after a struct-member NBA commit") 
     )") == "sum=25\n");
 }
 
-TEST_CASE("nonblocking write to part of a struct member is guarded (Stage 2)") {
-    const LowerResult r = lower_text(R"(
+TEST_CASE("partial nonblocking write to a struct member (masked deferred record)") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; logic [7:0] b; } s_t;
+            s_t x;
+            logic clk;
+            initial begin
+                clk = 0; x.a = 8'hFF; x.b = 8'h00;
+                #1 clk = 1; #1 clk = 0; #1;
+                $display("%h %h", x.a, x.b);
+            end
+            always @(posedge clk) begin x.a[3:0] <= 4'h5; x.b[7:4] <= 4'hC; end
+        endmodule
+    )") == "f5 c0\n");
+}
+
+TEST_CASE("partial NBA preserves x in the unwritten bits of a 4-state leaf") {
+    CHECK(run_capture(R"(
         module m;
             typedef struct { logic [7:0] a; } s_t;
             s_t x;
             logic clk;
-            always @(posedge clk) x.a[3:0] <= 4'h1;
+            initial begin
+                clk = 0; x.a = 8'hxA;
+                #1 clk = 1; #1 clk = 0; #1;
+                $display("%h", x.a);
+            end
+            always @(posedge clk) x.a[3:0] <= 4'h7;
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("part of an unpacked-struct-member leaf") != std::string::npos);
+    )") == "x7\n");
+}
+
+TEST_CASE("partial NBA through a runtime array index into a struct member") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; } s_t;
+            s_t arr [0:3];
+            logic clk; logic [1:0] idx;
+            initial begin
+                clk = 0; idx = 2'd0;
+                for (int i = 0; i < 4; i++) arr[i].a = 8'hAA;
+                idx = 2'd2; #1 clk = 1; #1 clk = 0; #1;
+                $display("%h %h", arr[2].a, arr[0].a);
+            end
+            always @(posedge clk) arr[idx].a[3:0] <= 4'h3;
+        endmodule
+    )") == "a3 aa\n");
 }
 
 TEST_CASE("array of unpacked struct: runtime-indexed member access") {

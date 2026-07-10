@@ -410,6 +410,11 @@ struct SignalSlot {
     // BlockSig `mask` is reinterpreted as a static-leaf-set (bit k = leaf k
     // written). Set by nba_classify; implies `nba` and `nba_block`.
     bool nba_agg = false;
+    // Any deferred aggregate NBA site is a partial (bit/part-select) leaf write:
+    // its records carry a per-plane mask and the commit does a byte-wise masked
+    // read-modify-write instead of a memcpy (mirrors `arr_masked`). Whole-leaf
+    // writes to a masked aggregate use an all-ones mask.
+    bool agg_masked = false;
 };
 
 // One function-frame local: its `{ i(2W), iW }` slot type and width / domain.
@@ -1020,12 +1025,18 @@ private:
             // record replayed by memcpy — the aggregate analogue of the array
             // deferred queue. A signal can take both paths (different sites).
             if (contains_struct(sigs[static_cast<uint32_t>(t.sig)].type)) {
-                SignalSlot& s = slots_[static_cast<uint32_t>(t.sig)];
-                s.nba         = true;
-                if (lvalue_has_elem_select(ir, lv_idx)) {
+                SignalSlot& s       = slots_[static_cast<uint32_t>(t.sig)];
+                const bool  runtime = lvalue_has_elem_select(ir, lv_idx);
+                const bool  partial = lvalue_has_subselect(ir, lv_idx);
+                s.nba               = true;
+                // A static whole-leaf write commits from the block shadow; a
+                // runtime array index OR a partial (bit/part-select) leaf write
+                // defers (the partial one needs a masked read-modify-write).
+                if (runtime || partial) {
                     if (std::find(agg_nba_sigs_.begin(), agg_nba_sigs_.end(), t.sig) == agg_nba_sigs_.end()) {
                         agg_nba_sigs_.push_back(t.sig);
                     }
+                    s.agg_masked = s.agg_masked || partial;
                 } else {
                     s.nba_agg = true;
                 }
@@ -5539,9 +5550,11 @@ private:
                 // typed record; an aggregate leaf reached through a runtime array
                 // index defers a memcpy record; everything else (a plain signal,
                 // scalar select, or aggregate static leaf) uses the block shadow.
+                const bool agg_partial =
+                  lv.is_agg && lv.agg_leaf && (lv.width != lv.store_width || !is_zero_const(lv.bit_off));
                 if (lv.is_signal && slot_of(lv.sig).is_array) {
                     emit_array_nba(lv, rhs);
-                } else if (lv.is_agg && !lv.agg_static) {
+                } else if (lv.is_agg && (!lv.agg_static || agg_partial)) {
                     emit_agg_nba(lv, rhs);
                 } else {
                     lower_store_nb(lv, rhs);
@@ -6455,13 +6468,19 @@ private:
     }
 
     // Deferred aggregate-NBA record: { ptr dest_slot, i32 nbytes, [max x i8]
-    // payload }. `payload` holds the new leaf value in the leaf's own slot byte
-    // layout; the commit memcpies `nbytes` of it to `dest_slot`, so a leaf of any
+    // payload [, [max x i8] mask] }. `payload` holds the new leaf value in the
+    // leaf's own slot byte layout. Without a mask the commit memcpies `nbytes` of
+    // it to `dest_slot`; with a mask (any partial site in the aggregate) the
+    // commit does a byte-wise masked read-modify-write. Either way a leaf of any
     // width / domain replays uniformly (no per-leaf monomorphization).
     llvm::StructType* agg_rec_ty(const SignalSlot& s) {
-        const uint32_t maxb = agg_max_leaf_bytes(s.ir_type);
-        return llvm::StructType::get(
-          ctx_, { raw_ptr_ty(), b_.getInt32Ty(), llvm::ArrayType::get(b_.getInt8Ty(), maxb) });
+        const uint32_t maxb   = agg_max_leaf_bytes(s.ir_type);
+        auto*          bytes  = llvm::ArrayType::get(b_.getInt8Ty(), maxb);
+        std::vector<llvm::Type*> f{ raw_ptr_ty(), b_.getInt32Ty(), bytes };
+        if (s.agg_masked) {
+            f.push_back(bytes);
+        }
+        return llvm::StructType::get(ctx_, f);
     }
 
     // Pointer to the leaf SLOT an aggregate lvalue designates (its agg_path,
@@ -6483,23 +6502,53 @@ private:
     // wins). Whole-leaf only — a partial leaf write is guarded in the frontend.
     void emit_agg_nba(const LValue& lv, Plane rhs) {
         const SignalSlot& s      = slot_of(lv.sig);
+        const uint32_t    W      = lv.store_width;
         const llvm::Align a1{ 1 };
+        auto*             i8     = b_.getInt8Ty();
         auto*             rt     = agg_rec_ty(s);
         const auto        stride = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(rt));
         llvm::Value* rec = b_.CreateCall(nba_arr_slot_fn(), { b_.getInt32(agg_buf_idx(lv.sig)), b_.getInt32(stride) });
         b_.CreateAlignedStore(agg_slot_ptr(lv), b_.CreateStructGEP(rt, rec, 0), a1);
         const auto nbytes = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(lv.slot_ty));
         b_.CreateAlignedStore(b_.getInt32(nbytes), b_.CreateStructGEP(rt, rec, 1), a1);
+
+        // Byte offset of the leaf slot's z field (4-state leaves only).
+        const uint32_t zoff = (!lv.narrow && lv.has_z)
+                                ? static_cast<uint32_t>(llmod_.getDataLayout().getStructLayout(lv.slot_ty)->getElementOffset(1))
+                                : 0;
+        // Write a plane value into the payload at the slot's field offset.
+        auto put = [&](llvm::Value* region, llvm::Value* v, uint32_t off) {
+            llvm::Value* p = off == 0 ? region : b_.CreateInBoundsGEP(i8, region, { b_.getInt32(off) });
+            b_.CreateAlignedStore(v, p, a1);
+        };
+
         llvm::Value* payload = b_.CreateStructGEP(rt, rec, 2);
+        // The value, positioned at the leaf's bit offset (partial select), in slot
+        // layout: mm plane at offset 0, z plane at zoff.
         if (lv.narrow) {
-            b_.CreateAlignedStore(must_of(rhs), payload, a1);
+            put(payload, place_val(lv, must_of(rhs), W), 0);
         } else {
-            const Plane f = to_four(rhs);
-            b_.CreateAlignedStore(f.mm, payload, a1);
+            const Plane f  = to_four(rhs);
+            llvm::Value* mm = packed(place_val(lv, must_of(f), W), place_val(lv, may_of(f), W),
+                                     place_val(lv, f.z, W)).mm;
+            put(payload, mm, 0);
             if (lv.has_z) {
-                const auto   zoff = llmod_.getDataLayout().getStructLayout(lv.slot_ty)->getElementOffset(1);
-                llvm::Value* zp   = b_.CreateInBoundsGEP(b_.getInt8Ty(), payload, { b_.getInt32(static_cast<uint32_t>(zoff)) });
-                b_.CreateAlignedStore(f.z, zp, a1);
+                put(payload, place_val(lv, f.z, W), zoff);
+            }
+        }
+        // The write mask, same layout: which bits this store touches (all-ones for
+        // a whole-leaf write). Padding bytes of the mask stay garbage but only
+        // ever gate the dest slot's own padding, which is never read.
+        if (s.agg_masked) {
+            llvm::Value* mask   = store_mask(lv, W);
+            llvm::Value* mask_p = b_.CreateStructGEP(rt, rec, 3);
+            if (lv.narrow) {
+                put(mask_p, mask, 0);
+            } else {
+                put(mask_p, packed(mask, mask, zero(W)).mm, 0);
+                if (lv.has_z) {
+                    put(mask_p, mask, zoff);
+                }
             }
         }
     }
@@ -6531,7 +6580,33 @@ private:
         llvm::Value* dest    = b_.CreateAlignedLoad(raw_ptr_ty(), b_.CreateStructGEP(rt, rec, 0), llvm::Align{ 1 });
         llvm::Value* nbytes  = b_.CreateAlignedLoad(b_.getInt32Ty(), b_.CreateStructGEP(rt, rec, 1), llvm::Align{ 1 });
         llvm::Value* payload = b_.CreateStructGEP(rt, rec, 2);
-        b_.CreateMemCpy(dest, llvm::MaybeAlign{ 1 }, payload, llvm::MaybeAlign{ 1 }, nbytes);
+        if (!s.agg_masked) {
+            b_.CreateMemCpy(dest, llvm::MaybeAlign{ 1 }, payload, llvm::MaybeAlign{ 1 }, nbytes);
+        } else {
+            // Byte-wise masked read-modify-write: dest[j] = (dest[j] & ~m) | (val[j] & m).
+            // Width-agnostic — a mask byte of 0 leaves dest[j] unchanged, so an
+            // unselected bit (or a garbage padding byte gating dest padding) is a
+            // no-op. Mirrors the array masked commit without monomorphizing width.
+            llvm::Value* mask_r = b_.CreateStructGEP(rt, rec, 3);
+            auto*        bh     = llvm::BasicBlock::Create(ctx_, "aggnba.bh", fn);
+            auto*        bb     = llvm::BasicBlock::Create(ctx_, "aggnba.bb", fn);
+            auto*        bd     = llvm::BasicBlock::Create(ctx_, "aggnba.bd", fn);
+            auto*        pre    = b_.GetInsertBlock();
+            b_.CreateBr(bh);
+            b_.SetInsertPoint(bh);
+            auto* j = b_.CreatePHI(b_.getInt32Ty(), 2);
+            j->addIncoming(b_.getInt32(0), pre);
+            b_.CreateCondBr(b_.CreateICmpULT(j, nbytes), bb, bd);
+            b_.SetInsertPoint(bb);
+            llvm::Value* dj  = b_.CreateInBoundsGEP(i8, dest, { j });
+            llvm::Value* m   = b_.CreateLoad(i8, b_.CreateInBoundsGEP(i8, mask_r, { j }));
+            llvm::Value* v   = b_.CreateLoad(i8, b_.CreateInBoundsGEP(i8, payload, { j }));
+            llvm::Value* old = b_.CreateLoad(i8, dj);
+            b_.CreateStore(b_.CreateOr(b_.CreateAnd(old, b_.CreateNot(m)), b_.CreateAnd(v, m)), dj);
+            j->addIncoming(b_.CreateAdd(j, b_.getInt32(1)), b_.GetInsertBlock());
+            b_.CreateBr(bh);
+            b_.SetInsertPoint(bd);
+        }
         k->addIncoming(b_.CreateAdd(k, b_.getInt32(1)), b_.GetInsertBlock());
         b_.CreateBr(head);
         b_.SetInsertPoint(done);
