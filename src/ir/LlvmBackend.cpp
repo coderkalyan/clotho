@@ -394,9 +394,7 @@ public:
         }
         build_wait_queues();
         build_sched_flags();
-        build_gate_fanout(); // before build_nba_state: NBA meta embeds fanout slices
         build_nba_state();
-        build_gate_tables();
 
         // Functions and tasks: declare every one up front (so calls resolve,
         // including recursion and forward references), then lower their bodies. A
@@ -2779,9 +2777,7 @@ private:
         auto* ptr   = llvm::PointerType::getUnqual(ctx_);
         auto* arr3p = llvm::ArrayType::get(ptr, 3);
         auto* arr3i = llvm::ArrayType::get(i32, 3);
-        // Fields 4/5 are the target's gate-fanout slice (see build_gate_fanout);
-        // both zero when the target feeds no gates.
-        nba_meta_ty_ = llvm::StructType::get(ctx_, { arr3p, arr3i, arr3p, arr3p, i32, i32 });
+        nba_meta_ty_ = llvm::StructType::get(ctx_, { arr3p, arr3i, arr3p, arr3p });
 
         const auto sigs = mod_.signals();
 
@@ -2812,12 +2808,9 @@ private:
                 db[e] = wait_dyn_gv_[i][e] ? llvm::cast<llvm::Constant>(wait_dyn_gv_[i][e]) : nullp;
                 dl[e] = wait_dyn_len_gv_[i][e] ? llvm::cast<llvm::Constant>(wait_dyn_len_gv_[i][e]) : nullp;
             }
-            const uint32_t fan_lo = gate_fan_lo_.empty() ? 0 : gate_fan_lo_[i];
-            const uint32_t fan_hi = gate_fan_hi_.empty() ? 0 : gate_fan_hi_[i];
             metas.push_back(llvm::ConstantStruct::get(
               nba_meta_ty_, { llvm::ConstantArray::get(arr3p, sb), llvm::ConstantArray::get(arr3i, sc),
-                              llvm::ConstantArray::get(arr3p, db), llvm::ConstantArray::get(arr3p, dl),
-                              llvm::ConstantInt::get(i32, fan_lo), llvm::ConstantInt::get(i32, fan_hi) }));
+                              llvm::ConstantArray::get(arr3p, db), llvm::ConstantArray::get(arr3p, dl) }));
         }
         if (metas.empty()) {
             metas.push_back(llvm::ConstantAggregateZero::get(nba_meta_ty_));
@@ -2978,20 +2971,6 @@ private:
                 llvm::Value* meta = b_.CreateInBoundsGEP(nba_meta_arr_ty_, nba_meta_gv_,
                                                          { b_.getInt32(0), b_.getInt32(s.nba_id) });
                 emit_nba_service(meta, old_mm, new_mm, W, s.narrow, old_z, new_z);
-            } else if (!mod_.gates().empty() && signal_has_gate_fanout(bs.sig)) {
-                // Gate fanout without process waiters: no meta needed, push directly.
-                const auto   idx  = static_cast<uint32_t>(bs.sig);
-                const EdgeFacts f = emit_edge_facts(old_mm, new_mm, W, !s.narrow, old_z, new_z,
-                                                    false, false, true);
-                auto* fn   = b_.GetInsertBlock()->getParent();
-                auto* push = llvm::BasicBlock::Create(ctx_, "nsvc.gfan", fn);
-                auto* cont = llvm::BasicBlock::Create(ctx_, "nsvc.gfan.cont", fn);
-                b_.CreateCondBr(f.changed, push, cont);
-                b_.SetInsertPoint(push);
-                b_.CreateCall(gate_push_range_fn_,
-                              { b_.getInt32(gate_fan_lo_[idx]), b_.getInt32(gate_fan_hi_[idx]) });
-                b_.CreateBr(cont);
-                b_.SetInsertPoint(cont);
             }
         }
     }
@@ -3073,503 +3052,6 @@ private:
         return wait_sta_gv_[i][e] != nullptr || wait_dyn_gv_[i][e] != nullptr;
     }
 
-    // -- Structural gates --
-    //
-    // The module's gate table lowers to constant SoA metadata plus one shared
-    // table-driven eval loop — no per-gate code or coroutine, so JIT time and
-    // memory stay O(1) per gate. Terminal bits are addressed as absolute bit
-    // positions in the state buffer (byte = addr >> 3, bit = addr & 7), which
-    // keeps the loop width-agnostic. Evaluation folds one 2-bit plane code
-    // (bit0 = must, bit1 = may; 00=0, 11=1, 10=X) per input; a Z input reads as
-    // X for free because Z is stored as X in the must/may planes (LRM Table
-    // 28-3), and the output's z bit is always cleared (gate outputs are never
-    // Z, LRM 28.4/28.5).
-    //
-    // Scheduling: a bounded worklist of gate ids with a per-gate pending flag
-    // for dedup. Any blocking store or NBA commit to a signal with gate fanout
-    // pushes the reading gates; the scheduler drains the worklist in the active
-    // region, interleaved with the process queue. A gate whose output changes
-    // pushes its own fanout and wakes process waiters through the same static /
-    // dynamic wait queues a store services, with pos/neg buckets compiled out
-    // for non-LSB output bits (only an LSB write can be a vector edge, matching
-    // service_wait_queue's semantics).
-
-    bool signal_has_gate_fanout(Signal sig) const {
-        const auto i = static_cast<uint32_t>(sig);
-        return !gate_fan_lo_.empty() && gate_fan_lo_[i] != gate_fan_hi_[i];
-    }
-
-    // Build the fanout CSRs over one flat clotho.gate_fanout array:
-    //
-    //   * Per-signal slices (gate_fan_lo_/hi_): every gate reading any bit of
-    //     the signal, deduped. Used by blocking stores and NBA commits, whose
-    //     write may touch any subset of the word.
-    //   * Per-(signal, bit) slices (gate_bitfan_): gates reading exactly that
-    //     bit. A gate's output is a compile-time (signal, bit), so its table
-    //     row embeds this exact slice — a single-bit gate write never wakes
-    //     readers of the vector's other bits. Without this, a gate chain
-    //     threaded through one vector degrades to O(bits) pushes per change.
-    //
-    // Runs before build_nba_state so the NBA meta can embed per-signal slices.
-    void build_gate_fanout() {
-        const auto gates = mod_.gates();
-        const auto nsig  = mod_.signals().size();
-        gate_fan_lo_.assign(nsig, 0);
-        gate_fan_hi_.assign(nsig, 0);
-        gate_bitfan_.clear();
-        if (gates.empty()) {
-            return;
-        }
-
-        std::vector<std::vector<uint32_t>>                            fan(nsig);
-        ankerl::unordered_dense::map<uint64_t, std::vector<uint32_t>> bitfan;
-        for (uint32_t g = 0; g < gates.size(); ++g) {
-            const GateInfo& gi = gates[g];
-            for (uint32_t k = 0; k < gi.in_count; ++k) {
-                const GateInput& in = mod_.gate_inputs()[gi.in_start + k];
-                if (in.is_const) {
-                    continue;
-                }
-                std::vector<uint32_t>& f = fan[static_cast<uint32_t>(in.sig)];
-                if (f.empty() || f.back() != g) { // inputs of one gate are adjacent
-                    f.push_back(g);
-                }
-                std::vector<uint32_t>& bf = bitfan[bitfan_key(in.sig, in.bit)];
-                if (bf.empty() || bf.back() != g) {
-                    bf.push_back(g);
-                }
-            }
-        }
-
-        std::vector<uint32_t> flat;
-        for (uint32_t s = 0; s < nsig; ++s) {
-            gate_fan_lo_[s] = static_cast<uint32_t>(flat.size());
-            flat.insert(flat.end(), fan[s].begin(), fan[s].end());
-            gate_fan_hi_[s] = static_cast<uint32_t>(flat.size());
-        }
-        for (auto& [key, ids] : bitfan) {
-            const auto lo = static_cast<uint32_t>(flat.size());
-            flat.insert(flat.end(), ids.begin(), ids.end());
-            gate_bitfan_[key] = { lo, static_cast<uint32_t>(flat.size()) };
-        }
-
-        auto* i32       = llvm::Type::getInt32Ty(ctx_);
-        gate_fanout_ty_ = llvm::ArrayType::get(i32, std::max<size_t>(flat.size(), 1));
-        gate_fanout_gv_ = new llvm::GlobalVariable(llmod_, gate_fanout_ty_, true, llvm::GlobalValue::InternalLinkage,
-                                                   const_i32_array(gate_fanout_ty_, flat), "clotho.gate_fanout");
-    }
-
-    static uint64_t bitfan_key(Signal sig, uint32_t bit) {
-        return (static_cast<uint64_t>(sig) << 32) | bit;
-    }
-
-    // An [N x i32] constant array initializer from host values.
-    llvm::Constant* const_i32_array(llvm::ArrayType* ty, std::span<const uint32_t> vals) {
-        auto*                        i32 = llvm::Type::getInt32Ty(ctx_);
-        std::vector<llvm::Constant*> cs;
-        cs.reserve(ty->getNumElements());
-        for (const uint32_t v : vals) {
-            cs.push_back(llvm::ConstantInt::get(i32, v));
-        }
-        while (cs.size() < ty->getNumElements()) {
-            cs.push_back(llvm::ConstantInt::get(i32, 0));
-        }
-        return llvm::ConstantArray::get(ty, cs);
-    }
-
-    // Build the gate tables and the two generated functions (push-range and the
-    // eval drain loop). Requires slot offsets (build_state_layout) and the wait
-    // queue globals (build_wait_queues).
-    void build_gate_tables() {
-        const auto gates = mod_.gates();
-        if (gates.empty()) {
-            return;
-        }
-        const auto n   = static_cast<uint32_t>(gates.size());
-        auto*      i8  = llvm::Type::getInt8Ty(ctx_);
-        auto*      i32 = llvm::Type::getInt32Ty(ctx_);
-        auto*      ptr = llvm::PointerType::getUnqual(ctx_);
-
-        // Absolute bit addresses assume the state buffer stays under 2^32 bits.
-        // build_state_layout would need >512 MiB of signal state to break this.
-
-        // Per-gate opcode: bits 0..1 = fold kind (0 AND, 1 OR, 2 XOR), bit 2 =
-        // invert. buf/not are the 1-input OR fold (identity 00), plain / inverted.
-        const auto op_bits = [](GateOp op) -> uint8_t {
-            switch (op) {
-                case GateOp::And: return 0;
-                case GateOp::Nand: return 0 | 4;
-                case GateOp::Or: return 1;
-                case GateOp::Nor: return 1 | 4;
-                case GateOp::Xor: return 2;
-                case GateOp::Xnor: return 2 | 4;
-                case GateOp::Buf: return 1;
-                case GateOp::Not: return 1 | 4;
-            }
-            return 1;
-        };
-        // Host-side fold over 2-bit plane codes, for melting constant inputs
-        // into the accumulator seed at build time. Mirrors the generated fold.
-        const auto fold_code = [](uint8_t kind, uint8_t acc, uint8_t code) -> uint8_t {
-            switch (kind & 3) {
-                case 0: return acc & code;
-                case 1: return acc | code;
-                default: return static_cast<uint8_t>((XOR1_LUT >> (((acc << 2) | code) << 1)) & 3);
-            }
-        };
-
-        std::vector<uint8_t>  ops(n), inits(n);
-        std::vector<uint8_t>  has_z_vec(n);
-        std::vector<uint32_t> in_start;
-        std::vector<uint32_t> in_must, in_may;
-        std::vector<uint32_t> out_must(n), out_may(n), out_z(n), gfan_lo(n), gfan_hi(n);
-        std::vector<uint32_t> wmi(n, UINT32_MAX);
-
-        std::vector<llvm::Constant*> wmetas;
-        auto*                        arr3p            = llvm::ArrayType::get(ptr, 3);
-        auto*                        arr3i            = llvm::ArrayType::get(i32, 3);
-        gate_waitmeta_ty_ = llvm::StructType::get(ctx_, { arr3p, arr3i, arr3p, arr3p });
-
-        for (uint32_t g = 0; g < n; ++g) {
-            const GateInfo& gi = gates[g];
-            ops[g]             = op_bits(gi.op);
-            uint8_t init       = (ops[g] & 3) == 0 ? 0b11 : 0b00; // fold identity
-            in_start.push_back(static_cast<uint32_t>(in_must.size()));
-            for (uint32_t k = 0; k < gi.in_count; ++k) {
-                const GateInput& in = mod_.gate_inputs()[gi.in_start + k];
-                if (in.is_const) {
-                    init = fold_code(ops[g], init, in.const_code);
-                    continue;
-                }
-                const SignalSlot& s       = slot_of(in.sig);
-                const uint32_t    mm_byte = path_offset(s.path);
-                in_must.push_back(mm_byte * 8 + in.bit);
-                in_may.push_back(mm_byte * 8 + s.width + in.bit);
-            }
-            inits[g] = init;
-
-            const SignalSlot& out     = slot_of(gi.output.sig);
-            const uint32_t    mm_byte = path_offset(out.path);
-            const uint32_t    z_byte  = mm_byte + static_cast<uint32_t>(
-              llmod_.getDataLayout().getTypeAllocSize(int_ty(2 * out.width)));
-            out_must[g]               = mm_byte * 8 + gi.output.bit;
-            out_may[g]                = mm_byte * 8 + out.width + gi.output.bit;
-            out_z[g]                  = z_byte * 8 + gi.output.bit;
-            has_z_vec[g]              = out.has_z ? 1 : 0;
-            const auto osig       = static_cast<uint32_t>(gi.output.sig);
-            // A gate writes exactly one bit, so its fanout is the per-(signal,
-            // bit) slice: only gates reading THAT bit re-evaluate.
-            const auto bf = gate_bitfan_.find(bitfan_key(gi.output.sig, gi.output.bit));
-            gfan_lo[g]    = bf != gate_bitfan_.end() ? bf->second.first : 0;
-            gfan_hi[g]    = bf != gate_bitfan_.end() ? bf->second.second : 0;
-
-            // Waiter side-table row, only for gates whose output signal has
-            // process waiters. pos/neg buckets are nulled for a non-LSB output
-            // bit: only an LSB transition is a vector posedge/negedge.
-            if (signal_has_waiters(gi.output.sig)) {
-                auto*                          nullp = llvm::ConstantPointerNull::get(ptr);
-                std::array<llvm::Constant*, 3> sb{}, sc{}, db{}, dl{};
-                for (uint32_t e = 0; e < 3; ++e) {
-                    const bool edge_ok = e == static_cast<uint32_t>(Edge::Any) || gi.output.bit == 0;
-                    sb[e] = edge_ok && wait_sta_gv_[osig][e] ? llvm::cast<llvm::Constant>(wait_sta_gv_[osig][e])
-                                                             : nullp;
-                    sc[e] = llvm::ConstantInt::get(i32, edge_ok ? wait_sta_cap_[osig][e] : 0);
-                    db[e] = edge_ok && wait_dyn_gv_[osig][e] ? llvm::cast<llvm::Constant>(wait_dyn_gv_[osig][e])
-                                                             : nullp;
-                    dl[e] = edge_ok && wait_dyn_len_gv_[osig][e]
-                              ? llvm::cast<llvm::Constant>(wait_dyn_len_gv_[osig][e])
-                              : nullp;
-                }
-                wmi[g] = static_cast<uint32_t>(wmetas.size());
-                wmetas.push_back(llvm::ConstantStruct::get(
-                  gate_waitmeta_ty_, { llvm::ConstantArray::get(arr3p, sb), llvm::ConstantArray::get(arr3i, sc),
-                                       llvm::ConstantArray::get(arr3p, db), llvm::ConstantArray::get(arr3p, dl) }));
-            }
-        }
-        in_start.push_back(static_cast<uint32_t>(in_must.size()));
-
-        const auto mk_i8 = [&](const char* name, std::span<const uint8_t> vals) {
-            auto*                        ty = llvm::ArrayType::get(i8, vals.size());
-            std::vector<llvm::Constant*> cs;
-            cs.reserve(vals.size());
-            for (const uint8_t v : vals) {
-                cs.push_back(llvm::ConstantInt::get(i8, v));
-            }
-            return new llvm::GlobalVariable(llmod_, ty, true, llvm::GlobalValue::InternalLinkage,
-                                            llvm::ConstantArray::get(ty, cs), name);
-        };
-        const auto mk_i32 = [&](const char* name, std::span<const uint32_t> vals) {
-            auto* ty = llvm::ArrayType::get(i32, std::max<size_t>(vals.size(), 1));
-            return new llvm::GlobalVariable(llmod_, ty, true, llvm::GlobalValue::InternalLinkage,
-                                            const_i32_array(ty, vals), name);
-        };
-
-        gate_op_gv_       = mk_i8("clotho.gate_op", ops);
-        gate_init_gv_     = mk_i8("clotho.gate_init", inits);
-        gate_in_start_gv_ = mk_i32("clotho.gate_in_start", in_start);
-        gate_in_must_gv_  = mk_i32("clotho.gate_in_must", in_must);
-        gate_in_may_gv_   = mk_i32("clotho.gate_in_may", in_may);
-        gate_out_must_gv_  = mk_i32("clotho.gate_out_must", out_must);
-        gate_out_may_gv_   = mk_i32("clotho.gate_out_may", out_may);
-        gate_out_z_gv_     = mk_i32("clotho.gate_out_z", out_z);
-        gate_out_has_z_gv_ = mk_i8("clotho.gate_out_has_z", has_z_vec);
-        gate_gfan_lo_gv_  = mk_i32("clotho.gate_out_fan_lo", gfan_lo);
-        gate_gfan_hi_gv_  = mk_i32("clotho.gate_out_fan_hi", gfan_hi);
-        gate_wmi_gv_      = mk_i32("clotho.gate_waitmeta_idx", wmi);
-
-        if (wmetas.empty()) {
-            wmetas.push_back(llvm::ConstantAggregateZero::get(gate_waitmeta_ty_));
-        }
-        gate_waitmeta_arr_ty_ = llvm::ArrayType::get(gate_waitmeta_ty_, wmetas.size());
-        gate_waitmeta_gv_ = new llvm::GlobalVariable(llmod_, gate_waitmeta_arr_ty_, true,
-                                                     llvm::GlobalValue::InternalLinkage,
-                                                     llvm::ConstantArray::get(gate_waitmeta_arr_ty_, wmetas),
-                                                     "clotho.gate_waitmeta");
-
-        // Runtime state: dedup flags plus the bounded worklist. The flag makes a
-        // gate hold at most one worklist slot, so capacity n is exact.
-        gate_pending_ty_ = llvm::ArrayType::get(i8, n);
-        gate_pending_gv_ = new llvm::GlobalVariable(llmod_, gate_pending_ty_, false, llvm::GlobalValue::InternalLinkage,
-                                                    llvm::ConstantAggregateZero::get(gate_pending_ty_),
-                                                    "clotho.gate_pending");
-        gate_wl_ty_      = llvm::ArrayType::get(i32, n);
-        gate_wl_gv_      = new llvm::GlobalVariable(llmod_, gate_wl_ty_, false, llvm::GlobalValue::InternalLinkage,
-                                                    llvm::ConstantAggregateZero::get(gate_wl_ty_), "clotho.gate_wl");
-        gate_wl_top_gv_  = new llvm::GlobalVariable(llmod_, i32, false, llvm::GlobalValue::InternalLinkage,
-                                                    llvm::ConstantInt::get(i32, 0), "clotho.gate_wl_top");
-
-        emit_gate_push_range();
-        emit_gate_eval();
-    }
-
-    // A byte pointer into the state buffer for an absolute bit address (i32).
-    llvm::Value* gate_bit_byte_ptr(llvm::Value* state, llvm::Value* addr) {
-        return b_.CreateInBoundsGEP(b_.getInt8Ty(), state, b_.CreateLShr(addr, b_.getInt32(3)));
-    }
-
-    // Read one state bit at an absolute bit address, widened to i32 (0 / 1).
-    llvm::Value* gate_bit_read(llvm::Value* state, llvm::Value* addr) {
-        llvm::Value* byte = b_.CreateLoad(b_.getInt8Ty(), gate_bit_byte_ptr(state, addr));
-        llvm::Value* sh   = b_.CreateTrunc(b_.CreateAnd(addr, b_.getInt32(7)), b_.getInt8Ty());
-        return b_.CreateAnd(b_.CreateZExt(b_.CreateLShr(byte, sh), b_.getInt32Ty()), b_.getInt32(1));
-    }
-
-    // Read-modify-write one state bit at an absolute bit address to `v` (i32 0/1).
-    void gate_bit_write(llvm::Value* state, llvm::Value* addr, llvm::Value* v) {
-        llvm::Value* p    = gate_bit_byte_ptr(state, addr);
-        llvm::Value* sh   = b_.CreateTrunc(b_.CreateAnd(addr, b_.getInt32(7)), b_.getInt8Ty());
-        llvm::Value* mask = b_.CreateShl(b_.getInt8(1), sh);
-        llvm::Value* byte = b_.CreateLoad(b_.getInt8Ty(), p);
-        llvm::Value* set  = b_.CreateShl(b_.CreateTrunc(v, b_.getInt8Ty()), sh);
-        b_.CreateStore(b_.CreateOr(b_.CreateAnd(byte, b_.CreateNot(mask)), set), p);
-    }
-
-    // Load an i32 element of one of the constant gate tables.
-    llvm::Value* gate_tab_i32(llvm::GlobalVariable* gv, llvm::Value* idx) {
-        auto* i32 = b_.getInt32Ty();
-        return b_.CreateLoad(
-          i32, b_.CreateInBoundsGEP(llvm::cast<llvm::ArrayType>(gv->getValueType()), gv, { b_.getInt32(0), idx }));
-    }
-
-    // void clotho.gate_push_range(i32 lo, i32 hi): push every gate id in the
-    // fanout slice [lo, hi) whose pending flag is clear onto the worklist. One
-    // shared function keeps each store site at a single call.
-    void emit_gate_push_range() {
-        auto* i32  = b_.getInt32Ty();
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { i32, i32 }, false);
-        gate_push_range_fn_ =
-          llvm::Function::Create(fnty, llvm::Function::InternalLinkage, "clotho.gate_push_range", llmod_);
-        llvm::Value* lo = gate_push_range_fn_->getArg(0);
-        llvm::Value* hi = gate_push_range_fn_->getArg(1);
-
-        const auto saved = b_.saveIP();
-        auto*      entry = llvm::BasicBlock::Create(ctx_, "entry", gate_push_range_fn_);
-        auto*      head  = llvm::BasicBlock::Create(ctx_, "head", gate_push_range_fn_);
-        auto*      body  = llvm::BasicBlock::Create(ctx_, "body", gate_push_range_fn_);
-        auto*      push  = llvm::BasicBlock::Create(ctx_, "push", gate_push_range_fn_);
-        auto*      cont  = llvm::BasicBlock::Create(ctx_, "cont", gate_push_range_fn_);
-        auto*      done  = llvm::BasicBlock::Create(ctx_, "done", gate_push_range_fn_);
-        b_.SetInsertPoint(entry);
-        b_.CreateBr(head);
-
-        b_.SetInsertPoint(head);
-        auto* f = b_.CreatePHI(i32, 2);
-        f->addIncoming(lo, entry);
-        b_.CreateCondBr(b_.CreateICmpULT(f, hi), body, done);
-
-        b_.SetInsertPoint(body);
-        llvm::Value* id    = gate_tab_i32(gate_fanout_gv_, f);
-        llvm::Value* fptr  = b_.CreateInBoundsGEP(gate_pending_ty_, gate_pending_gv_, { b_.getInt32(0), id });
-        llvm::Value* pend  = b_.CreateLoad(b_.getInt8Ty(), fptr);
-        b_.CreateCondBr(b_.CreateICmpNE(pend, b_.getInt8(0)), cont, push);
-
-        b_.SetInsertPoint(push);
-        b_.CreateStore(b_.getInt8(1), fptr);
-        llvm::Value* top = b_.CreateLoad(i32, gate_wl_top_gv_);
-        b_.CreateStore(id, b_.CreateInBoundsGEP(gate_wl_ty_, gate_wl_gv_, { b_.getInt32(0), top }));
-        b_.CreateStore(b_.CreateAdd(top, b_.getInt32(1)), gate_wl_top_gv_);
-        b_.CreateBr(cont);
-
-        b_.SetInsertPoint(cont);
-        f->addIncoming(b_.CreateAdd(f, b_.getInt32(1)), cont);
-        b_.CreateBr(head);
-
-        b_.SetInsertPoint(done);
-        b_.CreateRetVoid();
-        b_.restoreIP(saved);
-    }
-
-    // void clotho.gate_eval(ptr state): drain the gate worklist. Per gate: fold
-    // the input plane codes, apply the invert, and on an output change RMW the
-    // output bits (clearing z), push the output's gate fanout, and wake process
-    // waiters through the waitmeta row (if any).
-    void emit_gate_eval() {
-        auto* i32  = b_.getInt32Ty();
-        auto* i8   = b_.getInt8Ty();
-        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr }, false);
-        gate_eval_fn_ = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, "clotho.gate_eval", llmod_);
-        llvm::Value* state = gate_eval_fn_->getArg(0);
-
-        const auto saved = b_.saveIP();
-        auto*      entry = llvm::BasicBlock::Create(ctx_, "entry", gate_eval_fn_);
-        auto*      check = llvm::BasicBlock::Create(ctx_, "check", gate_eval_fn_);
-        auto*      gbody = llvm::BasicBlock::Create(ctx_, "gate", gate_eval_fn_);
-        auto*      ret   = llvm::BasicBlock::Create(ctx_, "ret", gate_eval_fn_);
-        b_.SetInsertPoint(entry);
-        b_.CreateBr(check);
-
-        b_.SetInsertPoint(check);
-        llvm::Value* top = b_.CreateLoad(i32, gate_wl_top_gv_);
-        b_.CreateCondBr(b_.CreateICmpNE(top, b_.getInt32(0)), gbody, ret);
-
-        b_.SetInsertPoint(ret);
-        b_.CreateRetVoid();
-
-        b_.SetInsertPoint(gbody);
-        llvm::Value* nt = b_.CreateSub(top, b_.getInt32(1));
-        b_.CreateStore(nt, gate_wl_top_gv_);
-        llvm::Value* id = b_.CreateLoad(i32, b_.CreateInBoundsGEP(gate_wl_ty_, gate_wl_gv_, { b_.getInt32(0), nt }));
-        b_.CreateStore(b_.getInt8(0), b_.CreateInBoundsGEP(gate_pending_ty_, gate_pending_gv_, { b_.getInt32(0), id }));
-
-        llvm::Value* op     = b_.CreateZExt(
-          b_.CreateLoad(i8, b_.CreateInBoundsGEP(gate_pending_ty_, gate_op_gv_, { b_.getInt32(0), id })), i32);
-        llvm::Value* fold   = b_.CreateAnd(op, b_.getInt32(3));
-        llvm::Value* invert = b_.CreateAnd(op, b_.getInt32(4));
-        llvm::Value* init   = b_.CreateZExt(
-          b_.CreateLoad(i8, b_.CreateInBoundsGEP(gate_pending_ty_, gate_init_gv_, { b_.getInt32(0), id })), i32);
-        llvm::Value* ks = gate_tab_i32(gate_in_start_gv_, id);
-        llvm::Value* ke = gate_tab_i32(gate_in_start_gv_, b_.CreateAdd(id, b_.getInt32(1)));
-
-        // Fold loop: acc = fold(acc, code(k)) for k in [ks, ke).
-        auto* fhead = llvm::BasicBlock::Create(ctx_, "fold.head", gate_eval_fn_);
-        auto* fbody = llvm::BasicBlock::Create(ctx_, "fold.body", gate_eval_fn_);
-        auto* fdone = llvm::BasicBlock::Create(ctx_, "fold.done", gate_eval_fn_);
-        auto* pre   = b_.GetInsertBlock();
-        b_.CreateBr(fhead);
-
-        b_.SetInsertPoint(fhead);
-        auto* k   = b_.CreatePHI(i32, 2);
-        auto* acc = b_.CreatePHI(i32, 2);
-        k->addIncoming(ks, pre);
-        acc->addIncoming(init, pre);
-        b_.CreateCondBr(b_.CreateICmpULT(k, ke), fbody, fdone);
-
-        b_.SetInsertPoint(fbody);
-        llvm::Value* mbit = gate_bit_read(state, gate_tab_i32(gate_in_must_gv_, k));
-        llvm::Value* ybit = gate_bit_read(state, gate_tab_i32(gate_in_may_gv_, k));
-        llvm::Value* code = b_.CreateOr(mbit, b_.CreateShl(ybit, b_.getInt32(1)));
-        // Branchless 3-way fold: AND / OR are single ops; XOR indexes the packed
-        // single-bit truth table.
-        llvm::Value* and_r = b_.CreateAnd(acc, code);
-        llvm::Value* or_r  = b_.CreateOr(acc, code);
-        llvm::Value* xsh   = b_.CreateShl(b_.CreateOr(b_.CreateShl(acc, b_.getInt32(2)), code), b_.getInt32(1));
-        llvm::Value* xor_r = b_.CreateAnd(b_.CreateLShr(b_.getInt32(XOR1_LUT), xsh), b_.getInt32(3));
-        llvm::Value* r01   = b_.CreateSelect(b_.CreateICmpEQ(fold, b_.getInt32(0)), and_r, or_r);
-        llvm::Value* nacc  = b_.CreateSelect(b_.CreateICmpEQ(fold, b_.getInt32(2)), xor_r, r01);
-        k->addIncoming(b_.CreateAdd(k, b_.getInt32(1)), b_.GetInsertBlock());
-        acc->addIncoming(nacc, b_.GetInsertBlock());
-        b_.CreateBr(fhead);
-
-        b_.SetInsertPoint(fdone);
-        // Invert: swap the bits of ~acc (00 <-> 11, 10 -> 10).
-        llvm::Value* t     = b_.CreateAnd(b_.CreateNot(acc), b_.getInt32(3));
-        llvm::Value* inv   = b_.CreateOr(b_.CreateShl(b_.CreateAnd(t, b_.getInt32(1)), b_.getInt32(1)),
-                                         b_.CreateLShr(t, b_.getInt32(1)));
-        llvm::Value* out   = b_.CreateSelect(b_.CreateICmpNE(invert, b_.getInt32(0)), inv, acc);
-
-        llvm::Value* oma  = gate_tab_i32(gate_out_must_gv_, id);
-        llvm::Value* omya = gate_tab_i32(gate_out_may_gv_, id);
-        // NOTE: Include the z bit as bit 2 in old. Gates never output z (bit 2
-        // of out is always 0), so if the signal currently has z=1 the codes
-        // differ and the write path fires, clearing z. Masked by has_z so
-        // z-elided outputs (no z field) never contribute a spurious bit.
-        auto*        hzp  = b_.CreateInBoundsGEP(
-            llvm::cast<llvm::ArrayType>(gate_out_has_z_gv_->getValueType()),
-            gate_out_has_z_gv_, { b_.getInt32(0), id });
-        llvm::Value* hz   = b_.CreateZExt(b_.CreateLoad(b_.getInt8Ty(), hzp), b_.getInt32Ty());
-        llvm::Value* old  = b_.CreateOr(
-            b_.CreateOr(gate_bit_read(state, oma),
-                        b_.CreateShl(gate_bit_read(state, omya), b_.getInt32(1))),
-            b_.CreateShl(b_.CreateAnd(gate_bit_read(state, gate_tab_i32(gate_out_z_gv_, id)), hz),
-                         b_.getInt32(2)));
-
-        auto* wr = llvm::BasicBlock::Create(ctx_, "gate.write", gate_eval_fn_);
-        b_.CreateCondBr(b_.CreateICmpEQ(old, out), check, wr);
-
-        b_.SetInsertPoint(wr);
-        gate_bit_write(state, oma, b_.CreateAnd(out, b_.getInt32(1)));
-        gate_bit_write(state, omya, b_.CreateLShr(out, b_.getInt32(1)));
-        gate_bit_write(state, gate_tab_i32(gate_out_z_gv_, id), b_.getInt32(0));
-        b_.CreateCall(gate_push_range_fn_,
-                      { gate_tab_i32(gate_gfan_lo_gv_, id), gate_tab_i32(gate_gfan_hi_gv_, id) });
-
-        // Process waiters, via the waitmeta row (UINT32_MAX = none). We are on
-        // the changed path, so the Any bucket always scans; pos/neg buckets fire
-        // on the must-bit transition (their pointers are already null for a
-        // non-LSB output bit).
-        llvm::Value* wm    = gate_tab_i32(gate_wmi_gv_, id);
-        auto*        svc   = llvm::BasicBlock::Create(ctx_, "gate.svc", gate_eval_fn_);
-        b_.CreateCondBr(b_.CreateICmpEQ(wm, b_.getInt32(UINT32_MAX)), check, svc);
-
-        b_.SetInsertPoint(svc);
-        llvm::Value* meta    = b_.CreateInBoundsGEP(gate_waitmeta_arr_ty_, gate_waitmeta_gv_, { b_.getInt32(0), wm });
-        llvm::Value* oldm    = b_.CreateTrunc(old, b_.getInt1Ty());
-        llvm::Value* newm    = b_.CreateTrunc(out, b_.getInt1Ty());
-        llvm::Value* pos     = b_.CreateAnd(b_.CreateNot(oldm), newm);
-        llvm::Value* neg     = b_.CreateAnd(oldm, b_.CreateNot(newm));
-        const std::array<std::pair<uint32_t, llvm::Value*>, 3> buckets = {
-            std::make_pair(static_cast<uint32_t>(Edge::Any), b_.getTrue()),
-            std::make_pair(static_cast<uint32_t>(Edge::Positive), pos),
-            std::make_pair(static_cast<uint32_t>(Edge::Negative), neg),
-        };
-        for (const auto& [e, fact] : buckets) {
-            auto* sbody = llvm::BasicBlock::Create(ctx_, "gsvc.body", gate_eval_fn_);
-            auto* scont = llvm::BasicBlock::Create(ctx_, "gsvc.cont", gate_eval_fn_);
-            b_.CreateCondBr(fact, sbody, scont);
-            b_.SetInsertPoint(sbody);
-            emit_static_scan_rt(gwm_ptr_at(meta, 0, e), gwm_i32_at(meta, 1, e));
-            emit_dynamic_scan_rt(gwm_ptr_at(meta, 2, e), gwm_ptr_at(meta, 3, e));
-            b_.CreateBr(scont);
-            b_.SetInsertPoint(scont);
-        }
-        b_.CreateBr(check);
-        b_.restoreIP(saved);
-    }
-
-    // Field accessors for one gate waitmeta row: 0 sta_base[3], 1 sta_cap[3],
-    // 2 dyn_base[3], 3 dyn_len[3].
-    llvm::Value* gwm_ptr_at(llvm::Value* meta, unsigned field, uint32_t e) {
-        return b_.CreateLoad(
-          llvm::PointerType::getUnqual(ctx_),
-          b_.CreateInBoundsGEP(gate_waitmeta_ty_, meta, { b_.getInt32(0), b_.getInt32(field), b_.getInt32(e) }));
-    }
-    llvm::Value* gwm_i32_at(llvm::Value* meta, unsigned field, uint32_t e) {
-        return b_.CreateLoad(
-          b_.getInt32Ty(),
-          b_.CreateInBoundsGEP(gate_waitmeta_ty_, meta, { b_.getInt32(0), b_.getInt32(field), b_.getInt32(e) }));
-    }
-
     // Load a signal's packed must|may state word (field 0 of the slot struct).
     llvm::Value* load_mm(Signal sig) {
         const SignalSlot& s      = slot_of(sig);
@@ -3608,16 +3090,15 @@ private:
     };
 
     // A blocking write to a module signal must service the signal's wait queues
-    // and push gate fanout with the old -> new transition. This pair brackets every
-    // such write path (Store, plus the runtime pointer write-backs: $fgets /
-    // $sformat / $ferror / $*scanf / scalar $fread): snapshot the selected storage
-    // before the write, then detect the transition and service after. The snapshot
-    // is empty — and servicing a no-op — for a target that never wakes anyone: a
-    // frame local, a signal without waiters or gate fanout, or a PreInit store
-    // (variable declaration initializers generate no events).
+    // with the old -> new transition. This pair brackets every such write path
+    // (Store, plus the runtime pointer write-backs: $fgets / $sformat / $ferror /
+    // $*scanf / scalar $fread): snapshot the selected storage before the write,
+    // then detect the transition and service after. The snapshot is empty — and
+    // servicing a no-op — for a target that never wakes anyone: a frame local, a
+    // signal without waiters, or a PreInit store (variable declaration initializers
+    // generate no events).
     ServiceSnapshot service_snapshot(const LValue& lv) {
-        const bool service = !lowering_preinit_ && lv.is_signal &&
-                             (signal_has_waiters(lv.sig) || signal_has_gate_fanout(lv.sig));
+        const bool service = !lowering_preinit_ && lv.is_signal && signal_has_waiters(lv.sig);
         if (!service) {
             return {};
         }
@@ -3706,7 +3187,7 @@ private:
     void service_wait_queue(Signal sig, llvm::Value* old_mm, llvm::Value* new_mm,
                             llvm::Value* old_z, llvm::Value* new_z) {
         const auto i = static_cast<uint32_t>(sig);
-        if (!signal_has_waiters(sig) && !signal_has_gate_fanout(sig)) {
+        if (!signal_has_waiters(sig)) {
             return;
         }
         const auto has_bucket = [&](Edge e) {
@@ -3717,21 +3198,7 @@ private:
         const EdgeFacts   f =
           emit_edge_facts(old_mm, new_mm, slot.width, slot.four_state, old_z, new_z,
                           has_bucket(Edge::Positive), has_bucket(Edge::Negative),
-                          has_bucket(Edge::Any) || signal_has_gate_fanout(sig));
-
-        // Gate fanout: any change pushes the reading gates onto the worklist
-        // (deduped inside), drained in the active region.
-        if (signal_has_gate_fanout(sig)) {
-            auto* fn   = b_.GetInsertBlock()->getParent();
-            auto* push = llvm::BasicBlock::Create(ctx_, "gfan.push", fn);
-            auto* cont = llvm::BasicBlock::Create(ctx_, "gfan.cont", fn);
-            b_.CreateCondBr(f.changed, push, cont);
-            b_.SetInsertPoint(push);
-            b_.CreateCall(gate_push_range_fn_,
-                          { b_.getInt32(gate_fan_lo_[i]), b_.getInt32(gate_fan_hi_[i]) });
-            b_.CreateBr(cont);
-            b_.SetInsertPoint(cont);
-        }
+                          has_bucket(Edge::Any));
 
         // Bucket -> matching fact. `pos`/`neg` each imply `changed`, so the Any
         // bucket also fires on an LSB transition.
@@ -3918,18 +3385,10 @@ private:
     // After the active queue drains, the NBA region commits every staged update:
     // Load edge element `e` of meta array field `field`. Meta layout (per nba-id):
     // 0 sta_base[3], 1 sta_cap[3], 2 dyn_base[3], 3 dyn_len[3] — the wait-queue
-    // pointers emit_nba_service scans per edge. 4 fan_lo, 5 fan_hi — gate fanout
-    // slice (both zero when the target feeds no gates).
+    // pointers emit_nba_service scans per edge.
     llvm::Value* meta_at(llvm::Value* meta, unsigned field, uint32_t e, llvm::Type* ty) {
         return b_.CreateLoad(
           ty, b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(field), b_.getInt32(e) }));
-    }
-
-    // Load a scalar i32 field from the nba_meta record (for fields that are plain
-    // i32, not arrays: currently fields 4=fan_lo and 5=fan_hi).
-    llvm::Value* meta_i32(llvm::Value* meta, unsigned field) {
-        auto* i32 = b_.getInt32Ty();
-        return b_.CreateLoad(i32, b_.CreateInBoundsGEP(nba_meta_ty_, meta, { b_.getInt32(0), b_.getInt32(field) }));
     }
 
     // Generic static-queue scan (base + capacity values), null base => no
@@ -4055,19 +3514,6 @@ private:
             b_.CreateBr(cont);
             b_.SetInsertPoint(cont);
         }
-        // A committed change also pushes the target's gate fanout (slice in
-        // meta fields 9/10); the drain loop re-enters the gate region after the
-        // NBA region, same instant.
-        if (!mod_.gates().empty()) {
-            auto* fn   = b_.GetInsertBlock()->getParent();
-            auto* push = llvm::BasicBlock::Create(ctx_, "nsvc.gfan", fn);
-            auto* cont = llvm::BasicBlock::Create(ctx_, "nsvc.gfan.cont", fn);
-            b_.CreateCondBr(f.changed, push, cont);
-            b_.SetInsertPoint(push);
-            b_.CreateCall(gate_push_range_fn_, { meta_i32(meta, 4), meta_i32(meta, 5) });
-            b_.CreateBr(cont);
-            b_.SetInsertPoint(cont);
-        }
     }
 
     // Run the simulation: seed the active queue with every process, then alternate
@@ -4180,35 +3626,6 @@ private:
             }
         }
 
-        // Seed every gate for its time-zero evaluation (a gate is combinational:
-        // it must settle from the power-on / pre-init values without waiting for
-        // an input event). Runs after PreInit so the fold reads settled
-        // initializers; ordering against initial blocks within the first region
-        // is unspecified (LRM 4.7).
-        const bool has_gates = !mod_.gates().empty();
-        if (has_gates) {
-            const auto ngates = static_cast<uint32_t>(mod_.gates().size());
-            auto*      ghead  = llvm::BasicBlock::Create(ctx_, "gseed.head", b_.GetInsertBlock()->getParent());
-            auto*      gbody  = llvm::BasicBlock::Create(ctx_, "gseed.body", b_.GetInsertBlock()->getParent());
-            auto*      gdone  = llvm::BasicBlock::Create(ctx_, "gseed.done", b_.GetInsertBlock()->getParent());
-            auto*      gentry = b_.GetInsertBlock();
-            b_.CreateBr(ghead);
-
-            b_.SetInsertPoint(ghead);
-            auto* gi = b_.CreatePHI(i32, 2);
-            gi->addIncoming(b_.getInt32(0), gentry);
-            b_.CreateCondBr(b_.CreateICmpULT(gi, b_.getInt32(ngates)), gbody, gdone);
-
-            b_.SetInsertPoint(gbody);
-            b_.CreateStore(b_.getInt8(1), b_.CreateInBoundsGEP(gate_pending_ty_, gate_pending_gv_, { b_.getInt32(0), gi }));
-            b_.CreateStore(gi, b_.CreateInBoundsGEP(gate_wl_ty_, gate_wl_gv_, { b_.getInt32(0), gi }));
-            gi->addIncoming(b_.CreateAdd(gi, b_.getInt32(1)), gbody);
-            b_.CreateBr(ghead);
-
-            b_.SetInsertPoint(gdone);
-            b_.CreateStore(b_.getInt32(ngates), gate_wl_top_gv_);
-        }
-
         // Static subscriptions, in topological order of the blocking-write wake
         // graph (compute_subscription_order): bucket entry order is subscription
         // order, the FIFO drain pops in bucket order, so a settle wave runs
@@ -4261,12 +3678,6 @@ private:
         // and inactive iterate until both settle, then NBA, then the wheel.
         auto* icheck   = has_inactive ? llvm::BasicBlock::Create(ctx_, "inactive.check", fn) : ncheck;
         auto* ipromote = has_inactive ? llvm::BasicBlock::Create(ctx_, "inactive.promote", fn) : nullptr;
-        // Gate region: interleaved with the active drain at the same instant —
-        // when the active queue empties, drain the gate worklist (which may wake
-        // processes) and re-check, until both are empty. Reaching the inactive /
-        // NBA / wheel checks therefore implies gates have settled too.
-        auto* gcheck = has_gates ? llvm::BasicBlock::Create(ctx_, "gate.check", fn) : icheck;
-        auto* grun   = has_gates ? llvm::BasicBlock::Create(ctx_, "gate.run", fn) : nullptr;
         b_.CreateBr(check);
 
         // Drain the active ring: while head != tail, pop active[head++ & mask]
@@ -4274,17 +3685,7 @@ private:
         b_.SetInsertPoint(check);
         llvm::Value* hd = b_.CreateLoad(i32, active_head_gv_);
         llvm::Value* tl = b_.CreateLoad(i32, active_tail_gv_);
-        b_.CreateCondBr(b_.CreateICmpNE(hd, tl), body, gcheck);
-
-        if (has_gates) {
-            b_.SetInsertPoint(gcheck);
-            llvm::Value* gtop = b_.CreateLoad(i32, gate_wl_top_gv_);
-            b_.CreateCondBr(b_.CreateICmpNE(gtop, b_.getInt32(0)), grun, icheck);
-
-            b_.SetInsertPoint(grun);
-            b_.CreateCall(gate_eval_fn_, { state });
-            b_.CreateBr(check);
-        }
+        b_.CreateCondBr(b_.CreateICmpNE(hd, tl), body, icheck);
 
         b_.SetInsertPoint(body);
         b_.CreateStore(b_.CreateAdd(hd, b_.getInt32(1)), active_head_gv_);
@@ -8777,41 +8178,6 @@ private:
     llvm::GlobalVariable*   block_next_gv_        = nullptr;    // [n_block x ptr] intrusive links
     llvm::ArrayType*        block_next_ty_        = nullptr;
     llvm::GlobalVariable*   block_head_gv_        = nullptr;    // ptr: first pending block's commit fn
-
-    // Structural gate state, built in build_gate_fanout / build_gate_tables.
-    // All null/empty when the module has no gates. gate_fan_lo_/hi_ is the
-    // host-side per-signal CSR over clotho.gate_fanout (gate ids reading the
-    // signal); the rest are the constant SoA tables, the worklist runtime
-    // state, and the two generated functions.
-    std::vector<uint32_t> gate_fan_lo_;
-    std::vector<uint32_t> gate_fan_hi_;
-    // (signal << 32 | bit) -> [lo, hi) slice of clotho.gate_fanout holding the
-    // gates that read exactly that bit; a gate's output row embeds its slice.
-    ankerl::unordered_dense::map<uint64_t, std::pair<uint32_t, uint32_t>> gate_bitfan_;
-    llvm::ArrayType*      gate_fanout_ty_ = nullptr;
-    llvm::GlobalVariable* gate_fanout_gv_ = nullptr;
-    llvm::GlobalVariable* gate_op_gv_       = nullptr;
-    llvm::GlobalVariable* gate_init_gv_     = nullptr;
-    llvm::GlobalVariable* gate_in_start_gv_ = nullptr;
-    llvm::GlobalVariable* gate_in_must_gv_  = nullptr;
-    llvm::GlobalVariable* gate_in_may_gv_   = nullptr;
-    llvm::GlobalVariable* gate_out_must_gv_  = nullptr;
-    llvm::GlobalVariable* gate_out_may_gv_   = nullptr;
-    llvm::GlobalVariable* gate_out_z_gv_     = nullptr;
-    llvm::GlobalVariable* gate_out_has_z_gv_ = nullptr;
-    llvm::GlobalVariable* gate_gfan_lo_gv_  = nullptr;
-    llvm::GlobalVariable* gate_gfan_hi_gv_  = nullptr;
-    llvm::GlobalVariable* gate_wmi_gv_      = nullptr;
-    llvm::StructType*     gate_waitmeta_ty_     = nullptr;
-    llvm::ArrayType*      gate_waitmeta_arr_ty_ = nullptr;
-    llvm::GlobalVariable* gate_waitmeta_gv_     = nullptr;
-    llvm::ArrayType*      gate_pending_ty_ = nullptr;
-    llvm::GlobalVariable* gate_pending_gv_ = nullptr;
-    llvm::ArrayType*      gate_wl_ty_      = nullptr;
-    llvm::GlobalVariable* gate_wl_gv_      = nullptr;
-    llvm::GlobalVariable* gate_wl_top_gv_  = nullptr;
-    llvm::Function*       gate_push_range_fn_ = nullptr;
-    llvm::Function*       gate_eval_fn_       = nullptr;
 
     std::vector<Plane>                  values_;
     std::vector<std::optional<LValue>>  lvals_;

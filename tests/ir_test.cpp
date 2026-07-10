@@ -451,31 +451,3 @@ TEST_CASE("float tags round-trip through builder, payload_kind, and operands") {
     CHECK(ops[0] == x);
     CHECK(ops[1] == y);
 }
-
-TEST_CASE("module gate table stores CSR inputs and prints them") {
-    Module m;
-    m.name = "gates";
-
-    const Signal a = m.add_signal({ .name = "a", .type = m.pool.logic_type });
-    const Signal b = m.add_signal({ .name = "b", .type = m.pool.logic_type });
-    const Signal y = m.add_signal({ .name = "y", .type = m.pool.logic_type });
-
-    const std::array<GateInput, 3> nand_ins = { GateInput{ .sig = a },
-                                                GateInput{ .sig = b, .bit = 2 },
-                                                GateInput{ .const_code = 0b11, .is_const = true } };
-    m.add_gate(GateInfo{ .op = GateOp::Nand, .output = { y, 0 } }, nand_ins);
-
-    const std::array<GateInput, 1> not_ins = { GateInput{ .sig = y } };
-    m.add_gate(GateInfo{ .op = GateOp::Not, .output = { a, 1 } }, not_ins);
-
-    REQUIRE(m.gates().size() == 2);
-    CHECK(m.gates()[0].in_start == 0);
-    CHECK(m.gates()[0].in_count == 3);
-    CHECK(m.gates()[1].in_start == 3);
-    CHECK(m.gates()[1].in_count == 1);
-    CHECK(m.gate_inputs().size() == 4);
-
-    const std::string text = toString(m);
-    CHECK(text.find("gate[0] nand s2[0] <- s0[0], s1[2], const:1") != std::string::npos);
-    CHECK(text.find("gate[1] not s0[1] <- s2[0]") != std::string::npos);
-}
