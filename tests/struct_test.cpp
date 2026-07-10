@@ -380,6 +380,20 @@ TEST_CASE("nonblocking write to part of a struct member is guarded (Stage 2)") {
           std::string::npos);
 }
 
+TEST_CASE("array of unpacked struct is guarded (not silently mislowered)") {
+    // A heterogeneous [N x StructType] the homogeneous-leaf array model cannot
+    // express; must fail loudly, never crash (regression: it segfaulted).
+    const LowerResult r = lower_text(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t arr [0:3];
+            initial arr[1].a = 8'hAB;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("array of unpacked struct is not supported") != std::string::npos);
+}
+
 TEST_CASE("whole unpacked struct as a by-value rvalue is guarded") {
     // Passing a whole unpacked struct by value (here a function argument) has no
     // flat value to load and no by-value struct ABI yet (Stage 2).

@@ -735,6 +735,14 @@ private:
             t.element = lower_type(arr->elementType);
             t.left    = static_cast<uint32_t>(r.left);
             t.right   = static_cast<uint32_t>(r.right);
+            // An array whose element is an unpacked struct is a heterogeneous
+            // `[N x StructType]` the array storage model (a homogeneous scalar
+            // leaf) cannot express, and member access on a runtime element would
+            // null-deref the element's struct pointer. Guarded until array-of-
+            // struct lands (docs/design/unpacked-struct.md, "array of struct").
+            if (leaf_is_unpacked_struct(t.element)) {
+                fail("array of unpacked struct is not supported");
+            }
 
             return module_.pool.put(ir::Item{ t });
         }
@@ -951,6 +959,16 @@ private:
     // True if an expression is of the dynamic `string` type (LRM 6.16).
     static bool is_string_expr(const slang::ast::Expression& e) {
         return e.type->getCanonicalType().isString();
+    }
+
+    // True if an interned IR type is an unpacked struct, or an unpacked array
+    // whose (recursive) leaf element is one.
+    bool leaf_is_unpacked_struct(ir::Ref ty) const {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(ty));
+        if (t.kind == ir::Type::Kind::UnpackedArray) {
+            return leaf_is_unpacked_struct(t.element);
+        }
+        return t.kind == ir::Type::Kind::Struct && !t.is_packed;
     }
 
     // True if an interned IR type is the string type, or an unpacked array whose
