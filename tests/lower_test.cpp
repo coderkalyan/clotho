@@ -539,12 +539,26 @@ TEST_CASE("an inout port connection fails loudly") {
     CHECK(r.diagnostics.find("inout") != std::string::npos);
 }
 
-TEST_CASE("whole unpacked array assignment fails loudly") {
+TEST_CASE("whole unpacked array blocking assignment lowers (memcpy)") {
+    // A blocking copy of a string-free unpacked array is a single memcpy; a
+    // nonblocking copy / pattern / string array is still guarded.
     const LowerResult r = lower_text(R"(
         module top;
             logic [7:0] a [0:3];
             logic [7:0] b [0:3];
             initial a = b;
+        endmodule
+    )");
+    CHECK(r.ok);
+}
+
+TEST_CASE("nonblocking whole unpacked array assignment fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            logic [7:0] a [0:3];
+            logic [7:0] b [0:3];
+            logic clk;
+            always @(posedge clk) a <= b;
         endmodule
     )");
     CHECK_FALSE(r.ok);

@@ -190,11 +190,14 @@ struct Analysis {
                 case Inst::Tag::StoreNb:
                     store_into(ir, fn, p.binary.l, z_of(p.binary.r) != 0);
                     break;
-                case Inst::Tag::AggCopy:
-                    // A whole-aggregate copy; aggregate storage is conservatively
-                    // z-capable regardless of analysis, so mark the target may-z.
-                    store_into(ir, fn, p.op_extra.op, true);
+                case Inst::Tag::AggCopy: {
+                    // A whole-object copy propagates the source's may-z to the
+                    // destination (a plain-array memcpy requires both to share the
+                    // z layout; an aggregate uses conservative z regardless).
+                    const auto info = ir.extra_data<AggCopyInfo>(p.op_extra.extra);
+                    store_into(ir, fn, p.op_extra.op, storage_z(ir, fn, info.src));
                     break;
+                }
 
                 // Z-transparent value ops: the z plane rides through their
                 // lowerings (an unknown shift count / select condition forces X

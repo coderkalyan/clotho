@@ -927,6 +927,23 @@ private:
         b.binary(tag, lhs, b.unary(ir::Inst::Tag::Load, rhs, l), l);
     }
 
+    // Whether an expression is a whole unpacked-array lvalue (a named array, or a
+    // member / element that is itself a whole array) — the source of a whole-array
+    // memcpy copy, as opposed to a slice / element / pattern.
+    static bool is_whole_array_lvalue(const Expression& e) {
+        if (e.type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() == nullptr) {
+            return false;
+        }
+        switch (e.kind) {
+            case ExpressionKind::NamedValue:
+            case ExpressionKind::MemberAccess:
+            case ExpressionKind::ElementSelect:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     // Whether an interned IR type is a scalar / string / real leaf.
     bool is_leaf_ref(ir::Ref type) const {
         const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
@@ -4785,9 +4802,18 @@ private:
             check_task_nba_target(a.left());
         }
         if (is_unpacked_array(a.left())) {
-            // TODO: whole-array assignment (mem1 = mem2, mem = '{...}). Needs an
-            // element-wise copy / aggregate lowering; only element assignment is
-            // supported today.
+            // A whole blocking copy of one plain (string-free) unpacked array into
+            // another is a single memcpy of the storage (same AggCopy path as an
+            // aggregate). A nonblocking copy, a `'{...}` pattern, or a string array
+            // (heap-owning elements) still decompose / are unsupported.
+            const ir::Ref     ty  = lower_type(*a.left().type);
+            const Expression& src = unwrap_conversion(a.right());
+            if (!a.isNonBlocking() && is_string_free(ty) && is_whole_array_lvalue(src)) {
+                b.agg_copy(lower_lvalue(a.left(), b), lower_lvalue(src, b), ty, loc(a));
+                return true_const(b, loc(a));
+            }
+            // TODO: nonblocking whole-array copy, `mem = '{...}` patterns, string
+            // arrays — element-wise copy / aggregate lowering.
             fail("whole unpacked array assignment is not supported");
         }
         // s[i] = c writes one character in place; out-of-range or a zero byte is

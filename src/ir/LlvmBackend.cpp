@@ -5563,15 +5563,39 @@ private:
                 return;
             }
             case Inst::Tag::AggCopy: {
-                // Whole-object blocking copy: one memcpy of the aggregate storage.
-                // The frontend emits this only for a string-free aggregate, so the
-                // byte image is the value (no heap-owning leaf to deep-copy).
+                // Whole-object blocking copy: one memcpy of the storage. The
+                // frontend emits this only for a string-free object, so the byte
+                // image is the value (no heap-owning leaf to deep-copy).
                 const auto   info = ir_->extra_data<AggCopyInfo>(p.op_extra.extra);
-                llvm::Value* dst  = agg_slot_ptr(lvalue_of(p.op_extra.op));
-                llvm::Value* src  = agg_slot_ptr(lvalue_of(info.src));
-                llvm::Type*  st   = agg_storage_ty(info.type);
-                const auto   sz   = llmod_.getDataLayout().getTypeAllocSize(st);
-                const auto   al   = llmod_.getDataLayout().getABITypeAlign(st);
+                const LValue dlv  = lvalue_of(p.op_extra.op);
+                const LValue slv  = lvalue_of(info.src);
+                llvm::Value* dst;
+                llvm::Value* src;
+                llvm::Type*  st;
+                if (dlv.is_agg) {
+                    // An aggregate (contains a struct) uses the recursive storage,
+                    // which is deterministic by type — both sides share the layout.
+                    dst = agg_slot_ptr(dlv);
+                    src = agg_slot_ptr(slv);
+                    st  = agg_storage_ty(info.type);
+                } else {
+                    // A plain unpacked array: its slot layout is may-z-analysed per
+                    // signal, so a memcpy is byte-valid only when both arrays landed
+                    // on the same layout (the common never-z / matching case). A
+                    // may-z mismatch (one array assigned z, the other not) would
+                    // differ in the z plane; reject it rather than miscopy.
+                    const SignalSlot& ds = slot_of(dlv.sig);
+                    const SignalSlot& ss = slot_of(slv.sig);
+                    if (ds.storage_ty != ss.storage_ty) {
+                        throw BackendError{ "whole-array copy between arrays of differing "
+                                            "storage layout is not supported" };
+                    }
+                    dst = dlv.base;
+                    src = slv.base;
+                    st  = ds.storage_ty;
+                }
+                const auto sz = llmod_.getDataLayout().getTypeAllocSize(st);
+                const auto al = llmod_.getDataLayout().getABITypeAlign(st);
                 b_.CreateMemCpy(dst, al, src, al, sz);
                 return;
             }

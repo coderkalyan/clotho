@@ -656,6 +656,33 @@ TEST_CASE("nonblocking whole-object copy over an array member is guarded") {
     CHECK(r.diagnostics.find("nonblocking whole-object copy of an unpacked-array") != std::string::npos);
 }
 
+TEST_CASE("whole plain unpacked array copy is an independent memcpy") {
+    CHECK(run_capture(R"(
+        module m;
+            logic [7:0] a [0:3], b [0:3];
+            initial begin
+                for (int i = 0; i < 4; i++) a[i] = i[7:0] + 8'd20;
+                b = a;
+                a[1] = 8'hFF;
+                $display("%h %h %h %h", b[0], b[1], b[3], a[1]);
+            end
+        endmodule
+    )") == "14 15 17 ff\n");
+}
+
+TEST_CASE("whole two-dimensional plain array copy") {
+    CHECK(run_capture(R"(
+        module m;
+            logic [7:0] a [0:1][0:1], b [0:1][0:1];
+            initial begin
+                a[0][0] = 8'hA; a[0][1] = 8'hB; a[1][0] = 8'hC; a[1][1] = 8'hD;
+                b = a;
+                $display("%h %h %h %h", b[0][0], b[0][1], b[1][0], b[1][1]);
+            end
+        endmodule
+    )") == "0a 0b 0c 0d\n");
+}
+
 TEST_CASE("whole unpacked struct as a by-value rvalue is guarded") {
     // Passing a whole unpacked struct by value (here a function argument) has no
     // flat value to load and no by-value struct ABI yet (Stage 2).
