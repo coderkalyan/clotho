@@ -157,8 +157,9 @@ struct Function {
     // Parameter types, in declaration order. The frontend resizes each input call
     // argument to the matching type; output / inout arguments pass by pointer.
     std::vector<Ref> param_types;
-    // Direction of each parameter, parallel to param_types. Empty for a function
-    // (all inputs); populated for a task.
+    // Direction of each parameter, parallel to param_types. Populated whenever any
+    // formal is non-In (tasks always, and a function with a ref formal); empty for
+    // a plain all-input function.
     std::vector<ArgDir> arg_dirs;
     // Storage type of every frame local, indexed by the Local handle's index:
     // the parameter copies, the return variable, and body-local declarations.

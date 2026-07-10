@@ -276,19 +276,137 @@ TEST_CASE("static task locals persist between calls") {
     CHECK(run_capture(src) == "1 2 3\n");
 }
 
-// -- Guarded gaps: must fail loudly, not silently miscompile. --
-
-TEST_CASE("ref argument is rejected") {
+TEST_CASE("function ref mutates the caller variable") {
     constexpr std::string_view src = R"(
         module m;
-            int x;
-            task automatic t(ref int a);
-                a = 1;
-            endtask
-            initial t(x);
+            function automatic void addone(ref int x);
+                x = x + 1;
+            endfunction
+            int p, q;
+            initial begin
+                p = 40; addone(p); $display("p=%0d", p);
+                q = 5; addone(q); addone(q); $display("q=%0d", q);
+            end
         endmodule
     )";
-    CHECK(reject(src).find("ref arguments") != std::string::npos);
+    CHECK(run_capture(src) == "p=41\nq=7\n");
+}
+
+// Two ref formals aliasing distinct variables resolve independently, and the
+// callee's reads observe each other's writes within the body (single live cell).
+TEST_CASE("function ref aliasing across two formals") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic void accum(ref int a, ref int b);
+                a = a + b;
+                b = a - b;
+            endfunction
+            int p, q;
+            initial begin
+                p = 7; q = 3; accum(p, q); $display("p=%0d q=%0d", p, q);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "p=10 q=7\n");
+}
+
+// A const ref reads the actual live; a 4-state actual carries x through the
+// pointer (arithmetic with any x operand is all-x, LRM 11.4.3), and the 2-state
+// int return coerces x to 0 (LRM 6.3.1).
+TEST_CASE("const ref reads the actual, x propagates") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic int rd(const ref logic [7:0] v);
+                return v + 8'd3;
+            endfunction
+            logic [7:0] w;
+            initial begin
+                w = 8'd100; $display("rd=%0d", rd(w));
+                w = 8'bxxxx0000; $display("xref=%0d", rd(w));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "rd=103\nxref=0\n");
+}
+
+// A task ref is live across a #delay: the pre-delay write is observed by a
+// concurrent process mid-suspend, and the post-delay write lands in the caller.
+// This is the case a copy-in/copy-out snapshot would get wrong (it would show the
+// mid value as the caller's stale copy).
+TEST_CASE("task ref observed live across a #delay") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] shared;
+            task automatic bump(ref logic [7:0] r);
+                r = r + 8'd1;
+                #5 r = r + 8'd10;
+            endtask
+            initial begin
+                shared = 8'd0;
+                bump(shared);
+                $display("after=%0d", shared);
+            end
+            initial begin
+                #1 $display("mid=%0d", shared);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "mid=1\nafter=11\n");
+}
+
+TEST_CASE("ref write wakes a process sensitive to the actual") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] g;
+            logic [7:0] mon;
+            int hits;
+            function automatic void gset(ref logic [7:0] r, input logic [7:0] val);
+                r = val;
+            endfunction
+            always @(g) begin mon = g; hits = hits + 1; end
+            initial begin
+                hits = 0; mon = 8'd0;
+                #1 gset(g, 8'h11);
+                #1 $display("mon=%h hits=%0d", mon, hits);
+                gset(g, 8'h22);
+                #1 $display("mon=%h hits=%0d", mon, hits);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "mon=11 hits=1\nmon=22 hits=2\n");
+}
+
+// -- Guarded gaps: must fail loudly, not silently miscompile. --
+
+TEST_CASE("ref of a non-integral type is rejected") {
+    constexpr std::string_view arr = R"(
+        module m;
+            function automatic void f(ref int a[4]); a[0] = 1; endfunction
+            int x[4];
+            initial f(x);
+        endmodule
+    )";
+    CHECK(reject(arr).find("ref arguments are only supported for packed integral") != std::string::npos);
+
+    constexpr std::string_view str = R"(
+        module m;
+            function automatic void f(ref string s); s = "hi"; endfunction
+            string t;
+            initial f(t);
+        endmodule
+    )";
+    CHECK(reject(str).find("ref arguments are only supported for packed integral") != std::string::npos);
+}
+
+TEST_CASE("ref actual that is not a whole variable is rejected") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic void f(ref int n); n = 5; endfunction
+            int arr[4];
+            initial f(arr[2]);
+        endmodule
+    )";
+    CHECK(reject(src).find("whole variable") != std::string::npos);
 }
 
 TEST_CASE("disable inside a task is rejected") {

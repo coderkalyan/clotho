@@ -366,6 +366,10 @@ struct FrameSlot {
     // A string local: the slot is an rt_string handle; init/deinit bracket the
     // call.
     bool is_string = false;
+    // A ref formal: the local has no real frame storage (its dead field is kept
+    // only so Local index == field index). Loads / stores redirect to the passed
+    // actual pointer, recorded in ref_ptr_ by the callee prologue.
+    bool is_ref = false;
 };
 
 // Raised on a construct the backend cannot lower; caught at the top level.
@@ -621,7 +625,8 @@ private:
         // through the analysis anyway.
         const std::vector<bool> may_z =
           config_.z_elision ? compute_may_z(mod_) : std::vector<bool>(sigs.size(), true);
-        const std::vector<bool> task_out = task_out_targets();
+        const std::vector<bool> task_out   = task_out_targets();
+        const std::vector<bool> ref_actual = ref_actual_targets();
         // Semantics, not optimization: computed regardless of config_.z_elision.
         // An undriven 4-state net powers up z (LRM 6.6); everything else x / 0.
         const std::vector<bool> undriven = compute_undriven(mod_);
@@ -653,7 +658,7 @@ private:
             // below (pool layout gives Domain::Two for floats).
             slot.is_real     = mod_.pool.is_float(leaf_type(sigs[i].type));
             slot.init_z      = undriven[i] && sigs[i].is_net && slot.four_state;
-            slot.has_z       = may_z[i] || task_out[i] || slot.init_z;
+            slot.has_z       = may_z[i] || task_out[i] || ref_actual[i] || slot.init_z;
             // A 2-state signal drops the packed must|may word for a genuine iW slot
             // (or `[N x { iW }]` memory). The only requirement is never-z: a 2-state
             // value carries no z, and has_z is forced only by a task out/inout target
@@ -857,6 +862,47 @@ private:
                     if (ir.tag(root) == Inst::Tag::Signal) {
                         out[static_cast<uint32_t>(ir.payload(root).signal)] = true;
                     }
+                }
+            }
+        };
+        for (const Process& p : mod_.processes()) {
+            scan(p.ir);
+        }
+        for (uint32_t i = 0; i < mod_.function_count(); ++i) {
+            scan(mod_.function(static_cast<FunctionId>(i)).ir);
+        }
+        return out;
+    }
+
+    // Signals passed as a ref actual anywhere in the design. The ref ABI passes one
+    // pointer to the actual's `{ i(2W), iW }` slot, which the callee GEPs with a
+    // packed (has_z) slot type; the actual's storage must therefore match, so such a
+    // signal keeps its z word and packed word even when z-elision would drop them.
+    // Same shape constraint as task_out_targets, from a different construct.
+    std::vector<bool> ref_actual_targets() const {
+        std::vector<bool> out(mod_.signals().size(), false);
+        const auto        mark_ref_args = [&](const Ir& ir, FunctionId fid, ExtraSlice argslice) {
+            const Function& callee = mod_.function(fid);
+            const auto      args   = ir.region(argslice);
+            for (size_t a = 0; a < args.size(); ++a) {
+                if (callee.arg_dirs.empty() || callee.arg_dirs[a] != ArgDir::Ref) {
+                    continue;
+                }
+                const Index root = lvalue_root(ir, args[a]).root;
+                if (ir.tag(root) == Inst::Tag::Signal) {
+                    out[static_cast<uint32_t>(ir.payload(root).signal)] = true;
+                }
+            }
+        };
+        const auto scan = [&](const Ir& ir) {
+            for (size_t k = 0; k < ir.inst_count(); ++k) {
+                const auto idx = static_cast<Index>(k);
+                if (ir.tag(idx) == Inst::Tag::Call) {
+                    const auto ci = ir.extra_data<CallInfo>(ir.payload(idx).extra);
+                    mark_ref_args(ir, ci.func, ci.args);
+                } else if (ir.tag(idx) == Inst::Tag::TaskCall) {
+                    const auto ti = ir.extra_data<TaskCallInfo>(ir.payload(idx).extra);
+                    mark_ref_args(ir, ti.func, ti.args);
                 }
             }
         };
@@ -1259,7 +1305,12 @@ private:
         // a bare iW) instead of the packed (mm, z) pair. The wire is packed today —
         // a 2-state arg lifts to must==may with a constant-0 z, which LLVM folds —
         // so this is a call-ABI size micro-opt, not a correctness gap.
-        for (Ref pt : f.param_types) {
+        for (size_t k = 0; k < f.param_types.size(); ++k) {
+            const Ref pt = f.param_types[k];
+            if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
+                params.push_back(ptr); // one pointer to the actual's packed slot
+                continue;
+            }
             if (is_string_type(pt)) {
                 params.push_back(ptr); // rt_string handle (callee copy-in gives value semantics)
                 continue;
@@ -1297,7 +1348,9 @@ private:
         params.push_back(ptr); // state
         params.push_back(ptr); // wheel
         for (size_t k = 0; k < f.param_types.size(); ++k) {
-            if (f.arg_dirs[k] == ArgDir::In) {
+            if (f.arg_dirs[k] == ArgDir::Ref) {
+                params.push_back(ptr); // one pointer to the actual's packed slot
+            } else if (f.arg_dirs[k] == ArgDir::In) {
                 if (is_string_type(f.param_types[k])) {
                     params.push_back(ptr); // rt_string handle
                     continue;
@@ -1325,14 +1378,22 @@ private:
     // functions start after `state`, tasks after `state, wheel`; a string input
     // formal is one ptr, everything else two params. Replaces a fixed
     // 1 + 2k / 2 + 2k stride, which string formals break.
+    // Whether formal k occupies a single LLVM parameter (a ref pointer, or a
+    // string input handle) rather than the (mm, z) pair every other formal uses.
+    bool one_param_formal(const Function& f, size_t k) const {
+        if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
+            return true;
+        }
+        return is_string_type(f.param_types[k]) &&
+               (!f.is_task || f.arg_dirs[k] == ArgDir::In);
+    }
+
     std::vector<uint32_t> param_indices(const Function& f) const {
         std::vector<uint32_t> idx(f.param_types.size());
         uint32_t              cur = f.is_task ? 2 : 1;
         for (size_t k = 0; k < f.param_types.size(); ++k) {
             idx[k] = cur;
-            const bool in_string =
-              is_string_type(f.param_types[k]) && (!f.is_task || f.arg_dirs[k] == ArgDir::In);
-            cur += in_string ? 1 : 2;
+            cur += one_param_formal(f, k) ? 1 : 2;
         }
         return idx;
     }
@@ -1343,36 +1404,41 @@ private:
         if (idx.empty()) {
             return 2;
         }
-        const bool last_string =
-          is_string_type(f.param_types.back()) && f.arg_dirs.back() == ArgDir::In;
-        return idx.back() + (last_string ? 1 : 2);
+        return idx.back() + (one_param_formal(f, f.param_types.size() - 1) ? 1 : 2);
     }
 
     // Build a function's frame struct: one slot field per local, in Local-handle
     // order (a Local's index is its GEP field index).
-    // Locals passed as a task-call output / inout argument: the callee writes them
-    // back through the packed-word pointer ABI, so they cannot use the narrow iW
-    // slot (they stay packed, like an out-target signal). Functions never write
-    // back (their outputs are by-value and dropped), so only task calls matter.
+    // Locals that cannot use the narrow iW slot (they stay packed `{ i(2W), iW }`):
+    //   - passed as a task-call output / inout argument (the callee writes them back
+    //     through the packed-word pointer ABI), or
+    //   - passed as a ref argument to a function or task (the callee GEPs the passed
+    //     pointer with a packed slot type; the actual's storage must match).
+    // A plain function's own outputs are by-value and dropped, so only these apply.
     std::vector<bool> frame_out_targets(const Function& f) const {
         std::vector<bool> out(f.local_types.size(), false);
         const Ir&         ir = f.ir;
-        for (size_t k = 0; k < ir.inst_count(); ++k) {
-            const auto idx = static_cast<Index>(k);
-            if (ir.tag(idx) != Inst::Tag::TaskCall) {
-                continue;
-            }
-            const auto      ti     = ir.extra_data<TaskCallInfo>(ir.payload(idx).extra);
-            const Function& callee = mod_.function(ti.func);
-            const auto      args   = ir.region(ti.args);
+        const auto        mark_packed_args = [&](FunctionId fid, ExtraSlice argslice) {
+            const Function& callee = mod_.function(fid);
+            const auto      args   = ir.region(argslice);
             for (size_t a = 0; a < args.size(); ++a) {
-                if (callee.arg_dirs[a] == ArgDir::In) {
+                if (callee.arg_dirs.empty() || callee.arg_dirs[a] == ArgDir::In) {
                     continue;
                 }
                 const Index root = lvalue_root(ir, args[a]).root;
                 if (ir.tag(root) == Inst::Tag::Local) {
                     out[ir.payload(root).local.index] = true;
                 }
+            }
+        };
+        for (size_t k = 0; k < ir.inst_count(); ++k) {
+            const auto idx = static_cast<Index>(k);
+            if (ir.tag(idx) == Inst::Tag::TaskCall) {
+                const auto ti = ir.extra_data<TaskCallInfo>(ir.payload(idx).extra);
+                mark_packed_args(ti.func, ti.args);
+            } else if (ir.tag(idx) == Inst::Tag::Call) {
+                const auto ci = ir.extra_data<CallInfo>(ir.payload(idx).extra);
+                mark_packed_args(ci.func, ci.args);
             }
         }
         return out;
@@ -1381,12 +1447,18 @@ private:
     void build_frame_layout(const Function& f) {
         const size_t n = f.local_types.size();
         frame_slots_.assign(n, FrameSlot{});
+        ref_ptr_.assign(n, nullptr);
         const std::vector<bool>  out_target = frame_out_targets(f);
         std::vector<llvm::Type*> fields(n);
         for (uint32_t i = 0; i < n; ++i) {
             const Layout lay           = mod_.pool.layout(f.local_types[i]);
             frame_slots_[i].width      = lay.width == 0 ? 1 : lay.width;
             frame_slots_[i].four_state = lay.domain == Domain::Four;
+            // A ref formal (local k for formal k) has no own storage: its dead field
+            // is kept for index alignment and loads / stores redirect to the passed
+            // actual pointer. The redirect GEPs a packed slot, so force one here.
+            const bool is_ref_formal = i < f.arg_dirs.size() && f.arg_dirs[i] == ArgDir::Ref;
+            frame_slots_[i].is_ref   = is_ref_formal;
             if (is_string_type(f.local_types[i])) {
                 frame_slots_[i].is_string = true;
                 frame_slots_[i].slot_ty   = str_slot_ty();
@@ -1396,9 +1468,9 @@ private:
             // A 2-state local uses the genuine iW slot; the packed-word ABI wire is
             // bridged by copy-in/out. A 4-state local keeps its z field (the ABI and
             // copy-in/out use it; LLVM folds the zero-z traffic on its own). A local
-            // passed as a task out/inout target stays packed — the callee writes it
-            // back through the packed-word pointer ABI.
-            frame_slots_[i].narrow  = !frame_slots_[i].four_state && !out_target[i];
+            // passed as a task out/inout target — or a ref formal / ref actual — stays
+            // packed (the packed-word pointer ABI writes it back / aliases it).
+            frame_slots_[i].narrow  = !frame_slots_[i].four_state && !out_target[i] && !is_ref_formal;
             // A non-narrow slot keeps its z field: a 4-state local needs it, and a
             // packed 2-state out-target local is written back through the (mm, z)
             // pointer ABI. A narrow local has no z.
@@ -1415,6 +1487,10 @@ private:
     void init_frame() {
         for (uint32_t i = 0; i < frame_slots_.size(); ++i) {
             const FrameSlot& s    = frame_slots_[i];
+            // A ref formal's field is dead (accesses redirect to the actual); no init.
+            if (s.is_ref) {
+                continue;
+            }
             llvm::Value*     slot = b_.CreateStructGEP(frame_ty_, frame_, i);
             if (s.is_string) {
                 b_.CreateCall(str_init_fn(), { slot });
@@ -1472,6 +1548,7 @@ private:
         frame_ = b_.CreateAlloca(frame_ty_, nullptr, "frame");
         init_frame();
         build_str_temps();
+        bind_ref_formals(f);
 
         lower_region(ir_->root());
         // The frontend appends a trailing Ret, so the entry path always terminates;
@@ -1590,6 +1667,7 @@ private:
         b_.SetInsertPoint(start_bb);
         init_frame();
         build_str_temps();
+        bind_ref_formals(f);
         emit_task_copyin(f);
         lower_region(ir_->root());
         branch_to(epilogue_bb);
@@ -1625,13 +1703,28 @@ private:
         task_epilogue_bb_ = nullptr;
     }
 
+    // Record each ref formal's passed actual pointer into ref_ptr_ (Local k == formal
+    // k), so local_lvalue aliases the actual's storage live. Called in the callee
+    // prologue of both functions and tasks. A ref formal takes no copy-in / copy-out.
+    void bind_ref_formals(const Function& f) {
+        for (uint32_t k = 0; k < f.param_types.size(); ++k) {
+            if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
+                ref_ptr_[k] = fn_->getArg(param_llvm_index_[k]);
+            }
+        }
+    }
+
     // Prologue: copy each formal's parameter into its frame Local (Local k == formal
     // k). Inputs read their value planes; inouts load through their caller pointer;
-    // outputs keep the frame's default (X / 0) until the body assigns them.
+    // outputs keep the frame's default (X / 0) until the body assigns them. Ref
+    // formals are bound separately (bind_ref_formals) and skipped here.
     void emit_task_copyin(const Function& f) {
         for (uint32_t k = 0; k < f.param_types.size(); ++k) {
             const uint32_t w    = width_of(f.param_types[k]);
             const uint32_t base = param_llvm_index_[k];
+            if (f.arg_dirs[k] == ArgDir::Ref) {
+                continue;
+            }
             if (f.arg_dirs[k] == ArgDir::In) {
                 if (is_string_type(f.param_types[k])) {
                     // Deep copy the caller's handle into the frame local (value
@@ -1653,7 +1746,8 @@ private:
     // caller pointer (LRM 13.5 copy-out at completion).
     void emit_task_copyout(const Function& f) {
         for (uint32_t k = 0; k < f.param_types.size(); ++k) {
-            if (f.arg_dirs[k] == ArgDir::In) {
+            // In needs no copy-out; a ref formal is live (aliased), never copied back.
+            if (f.arg_dirs[k] == ArgDir::In || f.arg_dirs[k] == ArgDir::Ref) {
                 continue;
             }
             const uint32_t base = param_llvm_index_[k];
@@ -5755,10 +5849,13 @@ private:
                        .is_string   = s.is_string };
     }
 
-    // Whole-storage lvalue for a function-frame local (per-call frame struct).
+    // Whole-storage lvalue for a function-frame local (per-call frame struct). A ref
+    // formal has no frame storage: its base is the passed actual pointer (recorded
+    // in ref_ptr_ by the prologue), through which every load / store is live.
     LValue local_lvalue(uint32_t index) {
         const FrameSlot& s = frame_slots_[index];
-        return LValue{ .base        = b_.CreateStructGEP(frame_ty_, frame_, index),
+        llvm::Value* base = s.is_ref ? ref_ptr_[index] : b_.CreateStructGEP(frame_ty_, frame_, index);
+        return LValue{ .base        = base,
                        .slot_ty     = s.slot_ty,
                        .has_z       = !s.narrow,
                        .narrow      = s.narrow,
@@ -6901,9 +6998,18 @@ private:
         llvm::Function*           cf = fn_decls_[static_cast<uint32_t>(ci.func)];
         std::vector<llvm::Value*> argv;
         argv.push_back(state_);
+        // A ref actual that is a signal with waiters: the callee writes it live, so
+        // its wait queue must be serviced with the call's net old -> new transition.
+        // Snapshot each before the (atomic, zero-time) function call; service after.
+        std::vector<std::pair<LValue, ServiceSnapshot>> ref_svc;
         size_t k = 0;
         for (Index a : ir_->region(ci.args)) {
-            if (is_string_type(f.param_types[k])) {
+            if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
+                // Pass one pointer to the actual's packed slot; the callee aliases it.
+                const LValue& lv = lvalue_of(a);
+                argv.push_back(lv.base);
+                ref_svc.emplace_back(lv, service_snapshot(lv));
+            } else if (is_string_type(f.param_types[k])) {
                 argv.push_back(str_of(a));
             } else {
                 Plane pl = value_of(a);
@@ -6918,9 +7024,15 @@ private:
             // trailing out-param); str_of(i) was pre-set by build_str_temps.
             argv.push_back(str_of(i));
             b_.CreateCall(cf->getFunctionType(), cf, argv);
+            for (auto& [lv, snap] : ref_svc) {
+                service_after_write(lv, snap);
+            }
             return;
         }
         llvm::Value* r = b_.CreateCall(cf->getFunctionType(), cf, argv);
+        for (auto& [lv, snap] : ref_svc) {
+            service_after_write(lv, snap);
+        }
         if (f.return_type != mod_.pool.void_type) {
             Plane         pl{ b_.CreateExtractValue(r, { 0 }), b_.CreateExtractValue(r, { 1 }) };
             const ValType t = from_ref(f.return_type);
@@ -6966,8 +7078,22 @@ private:
         std::vector<llvm::Value*>    argv;
         argv.push_back(state_);
         argv.push_back(wheel_);
+        // Snapshot each ref-actual signal with waiters before the call; the wait
+        // queue is serviced at the continuation with the net old -> new transition.
+        // NOTE: a task that writes the same ref signal across a #delay (multiple time
+        // steps) wakes level/edge waiters only once, at task completion, with the net
+        // transition — not per intermediate write. Correct for a whole-signal ref
+        // written in one time step (the common case) and for functions (atomic).
+        // Per-write mid-suspend waking needs callee-side servicing (a generic
+        // runtime wake keyed by signal id); TODO once that exists.
+        std::vector<std::pair<LValue, ServiceSnapshot>> ref_svc;
         for (uint32_t k = 0; k < args.size(); ++k) {
-            if (tf.arg_dirs[k] == ArgDir::In) {
+            if (tf.arg_dirs[k] == ArgDir::Ref) {
+                // Pass one pointer to the actual's packed slot; the callee aliases it.
+                const LValue& lv = lvalue_of(args[k]);
+                argv.push_back(lv.base);
+                ref_svc.emplace_back(lv, service_snapshot(lv));
+            } else if (tf.arg_dirs[k] == ArgDir::In) {
                 if (is_string_type(tf.param_types[k])) {
                     argv.push_back(str_of(args[k]));
                     continue;
@@ -7009,6 +7135,9 @@ private:
         b_.CreateBr(cont_bb);
 
         b_.SetInsertPoint(cont_bb);
+        for (auto& [lv, snap] : ref_svc) {
+            service_after_write(lv, snap);
+        }
     }
 
     // Build the runtime rt_arg[] descriptor array shared by every $display-family
@@ -8574,6 +8703,10 @@ private:
     SimulationConfig        config_;
     llvm::Value*            frame_       = nullptr;
     std::vector<FrameSlot>  frame_slots_;
+    // Per-ref-formal actual pointer, indexed by Local index; null for non-ref
+    // locals. Bound in the callee prologue (bind_ref_formals) from the passed
+    // pointer parameter, then read by local_lvalue to alias the actual live.
+    std::vector<llvm::Value*> ref_ptr_;
     // The current function's frame struct (one field per Local, in order).
     llvm::StructType*       frame_ty_    = nullptr;
     // While lowering a task: the shared copy-out + caller-resume epilogue block a
