@@ -1,9 +1,11 @@
 #include <doctest/doctest.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <initializer_list>
 #include <limits>
 #include <string>
@@ -437,8 +439,19 @@ TEST_CASE("rt_string_realtoa formats at full round-trip precision") {
 
 namespace {
 
+// A value-form descriptor for the tests: single-word planes given by value.
+// capture_fwrite materializes the pointer-based rt_arg with stable backing
+// storage (all test operands are <= 64 bits, so one word per plane).
+struct Arg {
+    uint32_t width;
+    uint32_t flags;
+    uint64_t val;
+    uint64_t xz;
+    uint64_t z;
+};
+
 // Capture what rt_fwrite writes to the standard-output MCD.
-std::string capture_fwrite(const char* fmt, std::initializer_list<rt_arg> args) {
+std::string capture_fwrite(const char* fmt, std::initializer_list<Arg> args) {
     std::FILE* tmp = std::tmpfile();
     REQUIRE(tmp != nullptr);
 
@@ -446,7 +459,19 @@ std::string capture_fwrite(const char* fmt, std::initializer_list<rt_arg> args) 
     const int saved = dup(fileno(stdout));
     dup2(fileno(tmp), fileno(stdout));
 
-    const std::vector<rt_arg> argv(args);
+    // `store` holds each plane triple; a deque keeps element addresses stable as
+    // it grows, so the rt_arg plane pointers stay valid through rt_fwrite.
+    std::deque<std::array<uint64_t, 3>> store;
+    std::vector<rt_arg>                 argv;
+    for (const Arg& a : args) {
+        if ((a.flags & 2u) != 0) {
+            argv.push_back(rt_arg{ a.width, a.flags, reinterpret_cast<const uint64_t*>(a.val), nullptr, nullptr });
+            continue;
+        }
+        store.push_back({ a.val, a.xz, a.z });
+        const auto& w = store.back();
+        argv.push_back(rt_arg{ a.width, a.flags, &w[0], &w[1], &w[2] });
+    }
     rt_fwrite(1, fmt, static_cast<uint32_t>(argv.size()), argv.data());
 
     std::fflush(stdout);
@@ -466,10 +491,10 @@ std::string capture_fwrite(const char* fmt, std::initializer_list<rt_arg> args) 
 }
 
 // A real-flagged descriptor (val = double bit pattern, flags bit 2 + signed).
-rt_arg real_arg(double v) {
+Arg real_arg(double v) {
     uint64_t pat = 0;
     std::memcpy(&pat, &v, sizeof pat);
-    return rt_arg{ 64, 0b101u, pat, 0, 0 };
+    return Arg{ 64, 0b101u, pat, 0, 0 };
 }
 
 } // namespace
@@ -496,6 +521,6 @@ TEST_CASE("rt_fwrite renders reals with %e / %f / %g and C passthrough") {
 TEST_CASE("rt_fwrite integer specifiers are unchanged around real fields") {
     // Mixed integer + real fields consume descriptors in order; integer
     // fields keep the width-honoring justification (LRM §21.2.1.2).
-    CHECK(capture_fwrite("a=%0d r=%g", { rt_arg{ 32, 1, 42, 0, 0 }, real_arg(0.5) }) == "a=42 r=0.5");
-    CHECK(capture_fwrite("%5d", { rt_arg{ 8, 0, 7, 0, 0 } }) == "    7");
+    CHECK(capture_fwrite("a=%0d r=%g", { Arg{ 32, 1, 42, 0, 0 }, real_arg(0.5) }) == "a=42 r=0.5");
+    CHECK(capture_fwrite("%5d", { Arg{ 8, 0, 7, 0, 0 } }) == "    7");
 }

@@ -11,26 +11,29 @@ extern "C" {
 
 // -- $display / $write --
 //
-// One value argument of a display task. The codegen packs each operand's 4-state
-// planes into the low 64 bits (wider values are truncated): `val` is the bit
-// pattern, `xz` marks unknown bits (X or Z), and `z` marks the high-impedance
-// subset (z is a subset of xz). Only the low `width` bits are significant.
+// One value argument of a display task. Each plane is a little-endian word array
+// of ceil(width/64) words (LSW first); the codegen zero-extends the bits above
+// `width`, so a plane never carries garbage past the operand width. This carries
+// operands of any width, not only <= 64 bits.
 typedef struct rt_arg {
     // Significant bit width of the value (0 for a string handle).
     uint32_t width;
     // Bit 0: the value is signed (drives %d sign-extension).
-    // Bit 1: `val` carries an rt_string* (a %s string-object argument); the
-    //        width/xz/z fields are meaningless.
-    // Bit 2: the value is real — `val` is an IEEE-754 double bit pattern
-    //        (shortreal is widened to double by the codegen) and xz / z are 0;
-    //        it renders via the %e / %f / %g family (LRM 21.2, Table 21-2).
+    // Bit 1: `val` carries an rt_string* directly (a %s string-object argument);
+    //        the width/xz/z fields are meaningless (val is not a plane pointer).
+    // Bit 2: the value is real — `val` points to one word holding an IEEE-754
+    //        double bit pattern (shortreal is widened to double by the codegen)
+    //        and xz / z are null; it renders via the %e / %f / %g family (LRM
+    //        21.2, Table 21-2).
     uint32_t flags;
-    // Value plane (definitely-1 bits) in the low `width` bits.
-    uint64_t val;
-    // Unknown mask: bit set => the value bit is X or Z.
-    uint64_t xz;
+    // Value plane (definitely-1 bits), or an rt_string* / double-bits word per
+    // the flags above.
+    const uint64_t* val;
+    // Unknown mask: bit set => the value bit is X or Z. Null for string / real.
+    const uint64_t* xz;
     // High-impedance mask: bit set => the value bit is Z (implies the xz bit).
-    uint64_t z;
+    // Null for string / real.
+    const uint64_t* z;
 } rt_arg;
 
 // Format `fmt` with `argc` descriptors and write the result to descriptor

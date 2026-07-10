@@ -6195,11 +6195,12 @@ private:
     // -- System tasks --
 
     // The runtime argument descriptor, mirroring `rt_arg` in runtime/Runtime.h:
-    //   { i32 width, i32 flags, i64 val, i64 xz, i64 z }
-    // val/xz/z carry the low 64 bits of each plane (wider values are truncated).
+    //   { i32 width, i32 flags, ptr val, ptr xz, ptr z }
+    // Each plane is a pointer to a ceil(width/64)-word little-endian buffer
+    // (built in build_rt_args), so operands of any width are carried in full.
     llvm::StructType* arg_struct_ty() {
         return llvm::StructType::get(
-          ctx_, { b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty() });
+          ctx_, { b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
 
     // void rt_fwrite(i32 desc, const char* fmt, i32 argc, const rt_arg* argv)
@@ -7029,66 +7030,90 @@ private:
     }
 
     // Build the runtime rt_arg[] descriptor array shared by every $display-family
-    // format call: stack-allocate one slot per value operand and pack its planes
-    // (width, sign, and the must / xz / z low-64 bits). Returns the array pointer
-    // (a null pointer when there are no operands). `who` names the caller in the
-    // >64-bit loud-fail.
-    // TODO: rt_arg carries only the low 64 bits of each plane, so an operand wider
-    // than 64 bits cannot be passed in full; such an operand is loud-failed rather
-    // than formatted with its high bits silently dropped (docs/TODO.md, M1 $display).
-    llvm::Value* build_rt_args(std::span<const Index> args, const char* who) {
+    // format call: stack-allocate one slot per value operand plus one shared word
+    // buffer holding every integral operand's must / xz / z planes (ceil(w/64)
+    // words each, zero-extended above the operand width). The descriptor's plane
+    // fields point into that buffer, so an operand of any width is passed in full.
+    // Returns the descriptor array pointer (null when there are no operands).
+    // `who` is unused now that no width is rejected; kept for call-site clarity.
+    llvm::Value* build_rt_args(std::span<const Index> args, const char* /*who*/) {
         const auto n = static_cast<uint32_t>(args.size());
         if (n == 0) {
             return llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
         }
-        llvm::StructType* sty = arg_struct_ty();
-        llvm::Value*      arr = b_.CreateAlloca(sty, b_.getInt32(n), "fmt_args");
+
+        // Pass 1: size the shared plane buffer (three planes per integral operand,
+        // one word per real; strings carry the handle in `val` directly).
+        std::vector<uint32_t> words(n, 0);
+        uint32_t              total = 0;
         for (uint32_t k = 0; k < n; ++k) {
-            const Plane   p = value_of(args[k]);
             const ValType t = type_of(args[k]);
             if (t.is_string) {
-                // A string-object argument (%s): flag bit 1, val = the rt_string
-                // handle pointer; the width / plane fields are unused.
-                llvm::Value* selt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
-                store_field(sty, selt, 0, b_.getInt32(0));
-                store_field(sty, selt, 1, b_.getInt32(2));
-                store_field(sty, selt, 2, b_.CreatePtrToInt(str_of(args[k]), b_.getInt64Ty()));
-                store_field(sty, selt, 3, b_.getInt64(0));
-                store_field(sty, selt, 4, b_.getInt64(0));
                 continue;
             }
             if (t.is_real) {
-                // A real rides `val` as a double bit pattern (flags bit 2); a
-                // shortreal widens to double first so the runtime handles one
-                // representation. Reals are signed and have no x/z.
+                words[k] = 1;
+                total += 1;
+                continue;
+            }
+            words[k] = (t.width + 63) / 64;
+            total += 3 * words[k];
+        }
+
+        llvm::StructType* sty    = arg_struct_ty();
+        llvm::Value*      arr    = b_.CreateAlloca(sty, b_.getInt32(n), "fmt_args");
+        auto*             i64    = b_.getInt64Ty();
+        llvm::Value*      planes = total != 0 ? b_.CreateAlloca(i64, b_.getInt32(total), "fmt_planes") : nullptr;
+        auto*             null   = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+
+        // Store an iW plane, zero-extended to a whole number of words, into the
+        // shared buffer at word offset `off`; return the element pointer.
+        uint32_t off = 0;
+        auto     put = [&](llvm::Value* plane, uint32_t nwords) {
+            llvm::Value* ep = b_.CreateConstInBoundsGEP1_32(i64, planes, off);
+            b_.CreateAlignedStore(b_.CreateZExtOrBitCast(plane, int_ty(nwords * 64)), ep, llvm::Align(8));
+            off += nwords;
+            return ep;
+        };
+
+        for (uint32_t k = 0; k < n; ++k) {
+            const Plane   p    = value_of(args[k]);
+            const ValType t    = type_of(args[k]);
+            llvm::Value*  elt  = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
+            if (t.is_string) {
+                // A string-object argument (%s): flag bit 1, val = the rt_string
+                // handle pointer itself; the width / plane fields are unused.
+                store_field(sty, elt, 0, b_.getInt32(0));
+                store_field(sty, elt, 1, b_.getInt32(2));
+                store_field(sty, elt, 2, str_of(args[k]));
+                store_field(sty, elt, 3, null);
+                store_field(sty, elt, 4, null);
+                continue;
+            }
+            if (t.is_real) {
+                // A real rides one `val` word as a double bit pattern (flags bit
+                // 2); a shortreal widens to double first so the runtime handles
+                // one representation. Reals are signed and have no x/z.
                 llvm::Value* fv = fp_of(p);
                 if (t.width == 32) {
                     fv = b_.CreateFPExt(fv, b_.getDoubleTy());
                 }
-                llvm::Value* relt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
-                store_field(sty, relt, 0, b_.getInt32(64));
-                store_field(sty, relt, 1, b_.getInt32(0b101u));
-                store_field(sty, relt, 2, b_.CreateBitCast(fv, int_ty(64)));
-                store_field(sty, relt, 3, b_.getInt64(0));
-                store_field(sty, relt, 4, b_.getInt64(0));
+                store_field(sty, elt, 0, b_.getInt32(64));
+                store_field(sty, elt, 1, b_.getInt32(0b101u));
+                store_field(sty, elt, 2, put(b_.CreateBitCast(fv, i64), 1));
+                store_field(sty, elt, 3, null);
+                store_field(sty, elt, 4, null);
                 continue;
             }
-            if (t.width > 64) {
-                throw BackendError{ std::string(who) +
-                                    " of an operand wider than 64 bits is not supported (it "
-                                    "would format with its high bits truncated)" };
-            }
-            llvm::Value* must = must_of(p);
-            llvm::Value* may  = may_of(p);
             // xz = must ^ may marks every unknown bit (X and Z); z marks the Z
             // subset. The runtime distinguishes them per bit.
-            llvm::Value* xz  = b_.CreateXor(must, may);
-            llvm::Value* elt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
+            llvm::Value* must = must_of(p);
+            llvm::Value* xz   = b_.CreateXor(must, may_of(p));
             store_field(sty, elt, 0, b_.getInt32(t.width));
             store_field(sty, elt, 1, b_.getInt32(t.is_signed ? 1u : 0u));
-            store_field(sty, elt, 2, cast(must, 64, false));
-            store_field(sty, elt, 3, cast(xz, 64, false));
-            store_field(sty, elt, 4, cast(z_of(p), 64, false));
+            store_field(sty, elt, 2, put(must, words[k]));
+            store_field(sty, elt, 3, put(xz, words[k]));
+            store_field(sty, elt, 4, put(z_of(p), words[k]));
         }
         return arr;
     }
