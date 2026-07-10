@@ -380,18 +380,159 @@ TEST_CASE("nonblocking write to part of a struct member is guarded (Stage 2)") {
           std::string::npos);
 }
 
-TEST_CASE("array of unpacked struct is guarded (not silently mislowered)") {
-    // A heterogeneous [N x StructType] the homogeneous-leaf array model cannot
-    // express; must fail loudly, never crash (regression: it segfaulted).
-    const LowerResult r = lower_text(R"(
+TEST_CASE("array of unpacked struct: runtime-indexed member access") {
+    CHECK(run_capture(R"(
         module m;
             typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
             s_t arr [0:3];
-            initial arr[1].a = 8'hAB;
+            initial begin
+                for (int i = 0; i < 4; i++) begin
+                    arr[i].a = i[7:0];
+                    arr[i].b = i[3:0] + 4'd1;
+                end
+                $display("%h %h %h %h", arr[0].a, arr[2].a, arr[2].b, arr[3].b);
+            end
+        endmodule
+    )") == "00 02 3 4\n");
+}
+
+TEST_CASE("nested unpacked struct member access") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } inner_t;
+            typedef struct { inner_t inr; logic [7:0] tag; } outer_t;
+            outer_t o;
+            initial begin
+                o.inr.a = 8'h33; o.inr.b = 4'hC; o.tag = 8'h99;
+                $display("%h %h %h", o.inr.a, o.inr.b, o.tag);
+            end
+        endmodule
+    )") == "33 c 99\n");
+}
+
+TEST_CASE("unpacked struct with an unpacked-array member") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] mem [0:2]; logic v; } s_t;
+            s_t w;
+            initial begin
+                w.mem[0] = 8'h11; w.mem[1] = 8'h77; w.mem[2] = 8'h22; w.v = 1'b1;
+                $display("%h %h %h %b", w.mem[0], w.mem[1], w.mem[2], w.v);
+            end
+        endmodule
+    )") == "11 77 22 1\n");
+}
+
+TEST_CASE("array of unpacked struct power-on: 4-state members are X") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t arr [0:1];
+            initial $display("%h %h", arr[1].a, arr[1].b);
+        endmodule
+    )") == "xx 0\n");
+}
+
+TEST_CASE("two-dimensional array of unpacked struct") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t g [0:1][0:1];
+            initial begin
+                g[0][1].a = 8'hA1; g[1][0].b = 4'h7;
+                $display("%h %h", g[0][1].a, g[1][0].b);
+            end
+        endmodule
+    )") == "a1 7\n");
+}
+
+TEST_CASE("nested struct member nonblocking assignment") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; } inner_t;
+            typedef struct { inner_t inr; logic [7:0] tag; } outer_t;
+            outer_t o;
+            logic clk;
+            initial begin
+                clk = 0; o.inr.a = 8'd5; o.tag = 8'd9;
+                #1 clk = 1; #1 clk = 0; #1;
+                $display("a=%0d tag=%0d", o.inr.a, o.tag);
+            end
+            always @(posedge clk) begin o.inr.a <= o.inr.a + 8'd1; o.tag <= 8'd42; end
+        endmodule
+    )") == "a=6 tag=42\n");
+}
+
+TEST_CASE("combinational reader wakes on a struct-array-member NBA commit") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] mem [0:3]; logic [7:0] cnt; } s_t;
+            s_t w;
+            logic clk;
+            initial begin
+                clk = 0; w.cnt = 8'd0; w.mem[2] = 8'h55;
+                #1 clk = 1; #1 clk = 0; #1;
+                $display("%h %0d", w.mem[2], w.cnt);
+            end
+            always @(posedge clk) w.cnt <= w.cnt + 8'd1;
+        endmodule
+    )") == "55 1\n");
+}
+
+TEST_CASE("whole-object copy of a nested struct is per-leaf") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } inner_t;
+            typedef struct { inner_t inr; logic [7:0] tag; } outer_t;
+            outer_t x, y;
+            initial begin
+                x.inr.a = 8'hAA; x.inr.b = 4'h5; x.tag = 8'h33;
+                y = x;
+                $display("%h %h %h", y.inr.a, y.inr.b, y.tag);
+            end
+        endmodule
+    )") == "aa 5 33\n");
+}
+
+TEST_CASE("nested unpacked struct equality (x-propagating)") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; } inner_t;
+            typedef struct { inner_t i; logic [3:0] t; } outer_t;
+            outer_t x, y;
+            initial begin
+                x.i.a = 8'h5; x.t = 4'h3; y.i.a = 8'h5; y.t = 4'h3;
+                $display("%b", x == y);
+                y.t = 4'h4;
+                $display("%b", x == y);
+            end
+        endmodule
+    )") == "1\n0\n");
+}
+
+TEST_CASE("nonblocking write through a runtime array index into an aggregate is guarded") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            typedef struct { logic [7:0] a; } s_t;
+            s_t arr [0:3];
+            logic clk;
+            always @(posedge clk) arr[1].a <= 8'h1;
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("array of unpacked struct is not supported") != std::string::npos);
+    CHECK(r.diagnostics.find("runtime array index into an aggregate") != std::string::npos);
+}
+
+TEST_CASE("whole-object copy of an aggregate with an array member is guarded") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            typedef struct { logic [7:0] mem [0:3]; logic v; } s_t;
+            s_t x, y;
+            initial y = x;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("unpacked-array aggregate member is not supported") != std::string::npos);
 }
 
 TEST_CASE("whole unpacked struct as a by-value rvalue is guarded") {

@@ -735,14 +735,6 @@ private:
             t.element = lower_type(arr->elementType);
             t.left    = static_cast<uint32_t>(r.left);
             t.right   = static_cast<uint32_t>(r.right);
-            // An array whose element is an unpacked struct is a heterogeneous
-            // `[N x StructType]` the array storage model (a homogeneous scalar
-            // leaf) cannot express, and member access on a runtime element would
-            // null-deref the element's struct pointer. Guarded until array-of-
-            // struct lands (docs/design/unpacked-struct.md, "array of struct").
-            if (leaf_is_unpacked_struct(t.element)) {
-                fail("array of unpacked struct is not supported");
-            }
 
             return module_.pool.put(ir::Item{ t });
         }
@@ -778,17 +770,12 @@ private:
                                                : static_cast<const Scope&>(ct.as<slang::ast::UnpackedStructType>());
             std::vector<ir::Field> fields;
             for (const auto& f : body.membersOfType<slang::ast::FieldSymbol>()) {
-                if (!is_packed) {
-                    // Stage 1 backs an unpacked struct as an aggregate of
-                    // plane-packable scalar members (docs/design/unpacked-struct.md).
-                    // A member that is itself dynamically sized or aggregate-storage
-                    // (string / real / unpacked array / nested unpacked struct) has
-                    // no scalar slot yet — guard it loudly (Stage 2).
-                    const slang::ast::Type& mct = f.getType().getCanonicalType();
-                    if (mct.isString() || mct.isFloating() || mct.isUnpackedArray() ||
-                        mct.isUnpackedStruct() || mct.isUnpackedUnion()) {
-                        fail("unpacked struct member of a non-integral type is not supported");
-                    }
+                if (!is_packed && f.getType().getCanonicalType().isUnpackedUnion()) {
+                    // Unpacked unions are not lowered (packed union member access
+                    // is also guarded). Every other member type — scalar, string,
+                    // real, unpacked array, nested unpacked struct — is backed by
+                    // the recursive aggregate storage model.
+                    fail("unpacked union member is not supported");
                 }
                 // Packed member: `bitOffset` is the field's bit position. Unpacked
                 // member: addressed by declaration index (`fieldIndex`), no flat
@@ -843,32 +830,69 @@ private:
     // are guarded at lower_type), so each store is a plain scalar store.
     void emit_struct_store(ir::Index lhs_base, ir::Ref sty, const Expression& rhs,
                            ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
-        const uint32_t fid = std::get<ir::Type>(module_.pool.get(sty)).fields_id;
-        const auto     n   = static_cast<uint32_t>(module_.pool.struct_fields(fid).size());
+        emit_agg_store(lhs_base, sty, rhs, tag, b, l);
+    }
+
+    // Store an aggregate whole-object value into `lhs` (an aggregate lvalue of
+    // type `type`), decomposing to per-leaf stores. RHS is a `'{...}` pattern
+    // (per-field elements, recursed for aggregate members), a leaf value, or
+    // another aggregate lvalue (member-by-member copy). A nonblocking store
+    // samples each leaf's RHS now and commits per-leaf, which is whole-object NBA
+    // semantics. Array-typed members are guarded (element-wise unroll is a
+    // follow-up), so nesting is struct-through-struct here.
+    void emit_agg_store(ir::Index lhs, ir::Ref type, const Expression& rhs,
+                        ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
         if (const auto* pat = as_assignment_pattern(rhs)) {
-            const std::span<const Expression* const> elems = pat->elements();
-            for (uint32_t i = 0; i < n; ++i) {
-                const ir::Index m = b.member_select(lhs_base, i, sty, l);
-                b.binary(tag, m, lower_expr(*elems[i], b), l);
+            if (t.kind != ir::Type::Kind::Struct || t.is_packed) {
+                fail("'{...} assignment pattern over an unpacked-array aggregate is not supported");
+            }
+            const auto fields = module_.pool.struct_fields(t.fields_id);
+            const auto elems  = pat->elements();
+            for (uint32_t i = 0; i < fields.size(); ++i) {
+                emit_agg_store(b.member_select(lhs, i, type, l), fields[i].type, *elems[i], tag, b, l);
             }
             return;
         }
-        // A struct-typed value from a call / other non-lvalue rvalue has no
-        // per-member address to copy from (would need a by-value struct ABI).
+        if (is_leaf_ref(type)) {
+            b.binary(tag, lhs, lower_expr(rhs, b), l);
+            return;
+        }
+        // Aggregate RHS: another struct/array lvalue, copied member-by-member.
         const Expression& src = unwrap_conversion(rhs);
         if (!is_struct_lvalue_shape(src)) {
             fail("unsupported unpacked struct rvalue (only '{...} patterns and struct "
                  "variables are supported)");
         }
-        // A nonblocking whole-struct copy samples every member's RHS now (in the
-        // active region) via the per-member Load; each member commits in the NBA
-        // region independently, which is exactly whole-struct NBA semantics.
-        const ir::Index rhs_base = lower_lvalue(src, b);
-        for (uint32_t i = 0; i < n; ++i) {
-            const ir::Index lm = b.member_select(lhs_base, i, sty, l);
-            const ir::Index rm = b.member_select(rhs_base, i, sty, l);
-            b.binary(tag, lm, b.unary(ir::Inst::Tag::Load, rm, l), l);
+        emit_agg_copy(lhs, lower_lvalue(src, b), type, tag, b, l);
+    }
+
+    // Member-by-member copy of one aggregate lvalue into another (both of `type`),
+    // recursing structs to leaves. Array members are guarded.
+    void emit_agg_copy(ir::Index lhs, ir::Index rhs, ir::Ref type, ir::Inst::Tag tag,
+                       ir::Builder& b, ir::SourceLoc l) {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        if (t.kind == ir::Type::Kind::UnpackedArray) {
+            // TODO: whole-object copy of an unpacked-array aggregate member — an
+            // element-wise unroll / copy loop (docs/design/unpacked-struct.md).
+            fail("whole-object copy of an unpacked-array aggregate member is not supported");
         }
+        if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
+            const auto fields = module_.pool.struct_fields(t.fields_id);
+            for (uint32_t i = 0; i < fields.size(); ++i) {
+                emit_agg_copy(b.member_select(lhs, i, type, l), b.member_select(rhs, i, type, l),
+                              fields[i].type, tag, b, l);
+            }
+            return;
+        }
+        b.binary(tag, lhs, b.unary(ir::Inst::Tag::Load, rhs, l), l);
+    }
+
+    // Whether an interned IR type is a scalar / string / real leaf.
+    bool is_leaf_ref(ir::Ref type) const {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        return t.kind != ir::Type::Kind::UnpackedArray &&
+               !(t.kind == ir::Type::Kind::Struct && !t.is_packed);
     }
 
     // Downcast to an assignment pattern (`'{...}`) base if the expression is one
@@ -907,9 +931,28 @@ private:
         }
     }
 
+    // Whether an lvalue chain contains a runtime unpacked-array element select
+    // (`arr[i]`, `x.mem[i]`). A nonblocking write reaching an aggregate leaf
+    // through one has no compile-time leaf address for the block-commit shadow.
+    static bool expr_has_element_select(const Expression& e) {
+        switch (e.kind) {
+            case ExpressionKind::ElementSelect:
+                return true;
+            case ExpressionKind::MemberAccess:
+                return expr_has_element_select(e.as<MemberAccessExpression>().value());
+            case ExpressionKind::RangeSelect:
+                return expr_has_element_select(e.as<RangeSelectExpression>().value());
+            case ExpressionKind::Conversion:
+                return expr_has_element_select(e.as<ConversionExpression>().operand());
+            default:
+                return false;
+        }
+    }
+
     // 1-bit 4-state equality of two whole unpacked structs: AND-reduce the
-    // per-member `==` results (Land carries the LRM X-propagation). Both operands
-    // must be struct lvalues (a '{...} pattern compare is a documented follow-up).
+    // per-leaf `==` results (Land carries the LRM 11.4.5 X-propagation). Both
+    // operands must be struct lvalues (a '{...} pattern compare is a follow-up);
+    // an array member is guarded (element-wise compare is a follow-up).
     ir::Index lower_struct_eq(const Expression& lhs, const Expression& rhs, ir::Builder& b,
                               ir::SourceLoc l) {
         const Expression& le = unwrap_conversion(lhs);
@@ -917,20 +960,32 @@ private:
         if (!is_struct_lvalue_shape(le) || !is_struct_lvalue_shape(re)) {
             fail("unpacked struct equality is only supported between struct variables");
         }
-        const ir::Ref  sty = lower_type(*lhs.type);
-        const uint32_t fid = std::get<ir::Type>(module_.pool.get(sty)).fields_id;
-        const auto     n   = static_cast<uint32_t>(module_.pool.struct_fields(fid).size());
-        const ir::Index lbase = lower_lvalue(le, b);
-        const ir::Index rbase = lower_lvalue(re, b);
-        ir::Index acc = ir::Index{ 0 };
-        for (uint32_t i = 0; i < n; ++i) {
-            const ir::Index lm  = b.member_select(lbase, i, sty, l);
-            const ir::Index rm  = b.member_select(rbase, i, sty, l);
-            const ir::Index eqi = b.binary(ir::Inst::Tag::Eq, b.unary(ir::Inst::Tag::Load, lm, l),
-                                           b.unary(ir::Inst::Tag::Load, rm, l), l);
-            acc = i == 0 ? eqi : b.binary(ir::Inst::Tag::Land, acc, eqi, l);
+        const ir::Ref sty = lower_type(*lhs.type);
+        return agg_eq(lower_lvalue(le, b), lower_lvalue(re, b), sty, b, l);
+    }
+
+    // Recursive per-leaf equality AND-reduction of two aggregate lvalues of
+    // `type`. Returns a 1-bit 4-state value. A struct recurses to its members'
+    // leaves; a scalar/string leaf compares directly.
+    ir::Index agg_eq(ir::Index lhs, ir::Index rhs, ir::Ref type, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        if (t.kind == ir::Type::Kind::UnpackedArray) {
+            // TODO: equality of an aggregate with an unpacked-array member — an
+            // element-wise compare (docs/design/unpacked-struct.md).
+            fail("equality of an aggregate with an unpacked-array member is not supported");
         }
-        return acc;
+        if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
+            const auto fields = module_.pool.struct_fields(t.fields_id);
+            ir::Index  acc    = ir::Index{ 0 };
+            for (uint32_t i = 0; i < fields.size(); ++i) {
+                const ir::Index e = agg_eq(b.member_select(lhs, i, type, l),
+                                           b.member_select(rhs, i, type, l), fields[i].type, b, l);
+                acc = i == 0 ? e : b.binary(ir::Inst::Tag::Land, acc, e, l);
+            }
+            return acc;
+        }
+        return b.binary(ir::Inst::Tag::Eq, b.unary(ir::Inst::Tag::Load, lhs, l),
+                        b.unary(ir::Inst::Tag::Load, rhs, l), l);
     }
 
     // Strip an outer identity/struct Conversion wrapper slang may insert on a
@@ -959,16 +1014,6 @@ private:
     // True if an expression is of the dynamic `string` type (LRM 6.16).
     static bool is_string_expr(const slang::ast::Expression& e) {
         return e.type->getCanonicalType().isString();
-    }
-
-    // True if an interned IR type is an unpacked struct, or an unpacked array
-    // whose (recursive) leaf element is one.
-    bool leaf_is_unpacked_struct(ir::Ref ty) const {
-        const ir::Type& t = std::get<ir::Type>(module_.pool.get(ty));
-        if (t.kind == ir::Type::Kind::UnpackedArray) {
-            return leaf_is_unpacked_struct(t.element);
-        }
-        return t.kind == ir::Type::Kind::Struct && !t.is_packed;
     }
 
     // True if an interned IR type is the string type, or an unpacked array whose
@@ -4698,13 +4743,18 @@ private:
             return true_const(b, l);
         }
         if (a.isNonBlocking() && nba_target_is_struct_member(a.left())) {
-            // Whole-member NBA (`x.f <= v`) is supported; a partial or nested
-            // write into a member (`x.f[i] <= v`, `x.f.g <= v`) needs sub-member
-            // shadow staging (docs/design/unpacked-struct.md, Stage 2+).
-            const bool whole_member =
-              a.left().kind == ExpressionKind::MemberAccess &&
-              is_unpacked_struct(*a.left().as<MemberAccessExpression>().value().type);
-            if (!whole_member) {
+            if (expr_has_element_select(a.left())) {
+                // TODO: nonblocking assignment through a runtime array index into
+                // an aggregate (arr[i] <= .., x.mem[i] <= ..) — the target leaf's
+                // address is not compile-time, so the block-commit shadow cannot
+                // hold it; needs the deferred path (docs/design/unpacked-struct.md).
+                fail("nonblocking assignment through a runtime array index into an "
+                     "aggregate is not supported");
+            }
+            // A whole-member NBA (`x.f <= v`, or nested `x.a.b <= v`) is a static
+            // leaf; a bit/part select into a member (`x.f[3:0] <= v`) is a partial
+            // write the leaf shadow cannot express.
+            if (a.left().kind != ExpressionKind::MemberAccess) {
                 fail("nonblocking assignment to part of an unpacked struct member is not "
                      "supported");
             }
