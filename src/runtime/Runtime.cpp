@@ -591,6 +591,102 @@ void write_word_planes(uint8_t* mm, uint8_t* z, uint32_t width, uint64_t must, u
     }
 }
 
+// -- Wide (> 64-bit) plane assembly for $readmem / $fread --
+//
+// The <= 64-bit path above packs into one __int128; a wider element assembles
+// its value in a little-endian word array (ceil(width/64) words) instead. These
+// helpers are the multi-word analogues of the `(v << k) | d` accumulation and
+// the `must | (may << width)` packing the scalar path does in machine words.
+// (plane_words is defined above with the display formatting helpers.)
+
+// Mask the top word of a `words`-word little-endian value to `width` bits.
+void mask_top(uint64_t* a, uint32_t words, uint32_t width) {
+    const uint32_t bits = width % 64;
+    if (bits != 0) {
+        a[words - 1] &= (uint64_t{ 1 } << bits) - 1;
+    }
+}
+
+// Shift the `words`-word value left by `shift` bits, in place (high bits drop).
+void wide_shl(uint64_t* a, uint32_t words, uint32_t shift) {
+    if (shift == 0) {
+        return;
+    }
+    const uint32_t ws = shift / 64;
+    const uint32_t bs = shift % 64;
+    for (int32_t k = static_cast<int32_t>(words) - 1; k >= 0; --k) {
+        uint64_t v = 0;
+        if (static_cast<uint32_t>(k) >= ws) {
+            v = a[k - ws] << bs;
+            if (bs != 0 && static_cast<uint32_t>(k) > ws) {
+                v |= a[k - ws - 1] >> (64 - bs);
+            }
+        }
+        a[k] = v;
+    }
+}
+
+// OR `src` (`words` words) shifted left by `shift` bits into `dst`, which must
+// have room for the shifted result. Used to lay `may` above `must` in the packed
+// must|may vector.
+void wide_or_shifted(uint64_t* dst, const uint64_t* src, uint32_t words, uint32_t shift) {
+    const uint32_t ws = shift / 64;
+    const uint32_t bs = shift % 64;
+    for (uint32_t k = 0; k < words; ++k) {
+        dst[ws + k] |= src[k] << bs;
+        if (bs != 0) {
+            dst[ws + k + 1] |= src[k] >> (64 - bs);
+        }
+    }
+}
+
+// a = a * mul + add, in place (high bits drop). `mul`/`add` are small (base and a
+// single digit), so each partial product fits __int128. The multi-word analogue
+// of the scalar `v = v * 10 + d` decimal accumulation.
+void wide_mul_add(uint64_t* a, uint32_t words, uint64_t mul, uint64_t add) {
+    uint64_t carry = add;
+    for (uint32_t k = 0; k < words; ++k) {
+        const unsigned __int128 p = static_cast<unsigned __int128>(a[k]) * mul + carry;
+        a[k]                      = static_cast<uint64_t>(p);
+        carry                     = static_cast<uint64_t>(p >> 64);
+    }
+}
+
+// Two's-complement negate a `words`-word value in place (~a + 1). For one word
+// this is the scalar `-v`; the target-width masking happens at write time.
+void wide_negate(uint64_t* a, uint32_t words) {
+    uint64_t carry = 1;
+    for (uint32_t k = 0; k < words; ++k) {
+        const uint64_t inv = ~a[k] + carry;
+        carry              = (carry != 0 && inv == 0) ? 1 : 0;
+        a[k]               = inv;
+    }
+}
+
+// Wide sibling of write_word_planes: the value planes are little-endian word
+// arrays (`words` = plane_words(width)). Masks each to `width`, then writes the
+// packed must|may vector (must low, may above) and the z word, matching the
+// scalar layout bit for bit.
+void write_word_planes_wide(uint8_t* mm, uint8_t* z, uint32_t width, uint64_t* must, uint64_t* may, uint64_t* zz,
+                            bool narrow) {
+    const uint32_t words = plane_words(width);
+    mask_top(must, words, width);
+    if (narrow) {
+        std::memcpy(mm, must, (width + 7) / 8);
+        return;
+    }
+    mask_top(may, words, width);
+    // packed holds 2*width bits; +1 word of slack for a shift straddling the top.
+    std::vector<uint64_t> packed((2 * width + 63) / 64 + 1, 0);
+    std::memcpy(packed.data(), must, words * sizeof(uint64_t));
+    wide_or_shifted(packed.data(), may, words, width);
+    std::memcpy(mm, packed.data(), (2 * width + 7) / 8);
+    if (z != nullptr) { // null when the target's slot has no z word (z elision)
+        mask_top(zz, words, width);
+        std::memcpy(z, zz, (width + 7) / 8);
+    }
+}
+
 // -- SystemVerilog string representation --
 //
 // fbstring-style small-string optimization over the 32 opaque bytes of an
@@ -1085,6 +1181,18 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
     int32_t  count     = 0;
     bool     any_input = false;
 
+    // Value planes accumulate into word arrays sized to the widest target: a
+    // target wider than 64 bits assembles multi-word, a <= 64-bit target uses
+    // word 0 and reduces to the scalar accumulation. write_word_planes masks each
+    // conversion to its own arg's width.
+    uint32_t words = 1;
+    for (uint32_t k = 0; k < argc; ++k) {
+        words = std::max(words, plane_words(args[k].width));
+    }
+    std::vector<uint64_t> must(words);
+    std::vector<uint64_t> may(words);
+    std::vector<uint64_t> z(words);
+
     for (const char* p = fmt; *p != '\0'; ++p) {
         if (scan_ws(static_cast<unsigned char>(*p))) {
             skip_ws(src);
@@ -1125,17 +1233,17 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
             break;
         }
 
-        uint64_t must = 0;
-        uint64_t may  = 0;
-        uint64_t z    = 0;
-        bool     ok   = false;
+        std::fill(must.begin(), must.end(), 0);
+        std::fill(may.begin(), may.end(), 0);
+        std::fill(z.begin(), z.end(), 0);
+        bool ok = false;
 
         if (conv == 'c') {
             const int c = src.get();
             if (c != EOF) {
-                any_input = true;
-                must = may = static_cast<uint8_t>(c);
-                ok         = true;
+                any_input   = true;
+                must[0] = may[0] = static_cast<uint8_t>(c);
+                ok               = true;
             }
         } else if (conv == 's') {
             skip_ws(src);
@@ -1153,14 +1261,15 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
             }
             if (!tok.empty()) {
                 any_input = true;
-                // Right-justify the token bytes into `must` (byte 0 = last char),
-                // capped at 8 bytes; wider %s targets are guarded by the backend.
-                const size_t keep = tok.size() < 8 ? tok.size() : 8;
+                // Right-justify the token bytes (byte 0 = last char) into `must`,
+                // capped at the widest target; write_word_planes masks to width.
+                const size_t cap  = static_cast<size_t>(words) * 8;
+                const size_t keep = tok.size() < cap ? tok.size() : cap;
                 for (size_t k = 0; k < keep; ++k) {
-                    must |= static_cast<uint64_t>(tok[tok.size() - 1 - k]) << (8 * k);
+                    must[k / 8] |= static_cast<uint64_t>(tok[tok.size() - 1 - k]) << (8 * (k % 8));
                 }
-                may = must;
-                ok  = true;
+                std::copy(must.begin(), must.end(), may.begin());
+                ok = true;
             }
         } else {
             // Numeric: d (signed decimal), o / b / h / x (power-of-two bases, with
@@ -1209,11 +1318,14 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
                     mv = dv; // known digit: may == must
                 }
                 if (base == 10) {
-                    must = must * 10 + dv;
+                    wide_mul_add(must.data(), words, 10, dv);
                 } else {
-                    must = (must << bits) | dv;
-                    may  = (may << bits) | mv;
-                    z    = (z << bits) | zz;
+                    wide_shl(must.data(), words, bits);
+                    must[0] |= dv;
+                    wide_shl(may.data(), words, bits);
+                    may[0] |= mv;
+                    wide_shl(z.data(), words, bits);
+                    z[0] |= zz;
                 }
                 ok        = true;
                 any_input = true;
@@ -1223,9 +1335,9 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
             src.unget(c);
             if (ok && base == 10) {
                 if (neg) {
-                    must = static_cast<uint64_t>(-static_cast<int64_t>(must));
+                    wide_negate(must.data(), words);
                 }
-                may = must; // decimal values carry no x/z
+                std::copy(must.begin(), must.end(), may.begin()); // decimal: no x/z
             }
         }
 
@@ -1236,8 +1348,13 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
             if (ai >= argc) {
                 break; // more conversions than output args
             }
-            const rt_scan_arg& a = args[ai++];
-            write_word_planes(a.mm, a.z, a.width, must, may, z, (a.flags & 1u) != 0);
+            const rt_scan_arg& a      = args[ai++];
+            const bool         narrow = (a.flags & 1u) != 0;
+            if (a.width > 64) {
+                write_word_planes_wide(a.mm, a.z, a.width, must.data(), may.data(), z.data(), narrow);
+            } else {
+                write_word_planes(a.mm, a.z, a.width, must[0], may[0], z[0], narrow);
+            }
             ++count;
         }
     }
@@ -1462,6 +1579,22 @@ void mem_write(const MemDest& d, int64_t idx, uint64_t must, uint64_t may, uint6
     write_word_planes(d.mm_base + off, zp, d.width, must, may, z, d.narrow);
 }
 
+// Wide (> 64-bit element) sibling of mem_write. The planes are little-endian word
+// arrays (plane_words(d.width) words); write_word_planes_wide masks them in place.
+void mem_write_wide(const MemDest& d, int64_t idx, uint64_t* must, uint64_t* may, uint64_t* z) {
+    if (idx < 0 || idx >= static_cast<int64_t>(d.count)) {
+        return;
+    }
+    const uint32_t words = plane_words(d.width);
+    if (!d.four_state) {
+        std::memcpy(may, must, words * sizeof(uint64_t));
+        std::memset(z, 0, words * sizeof(uint64_t));
+    }
+    const size_t off = static_cast<size_t>(idx) * d.stride;
+    uint8_t*     zp  = d.z_base != nullptr ? d.z_base + off : nullptr;
+    write_word_planes_wide(d.mm_base + off, zp, d.width, must, may, z, d.narrow);
+}
+
 // Map a declared-range address to a 0-based storage index: an ascending range
 // counts up from decl_left, a descending range counts down from it.
 int64_t norm_addr(int64_t decl_left, int64_t decl_right, int64_t addr) {
@@ -1522,13 +1655,26 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
     const int      bits   = hex ? 4 : 1;
     const uint64_t nibble = hex ? 0xFu : 0x1u;
 
+    // Value planes accumulate into word arrays; a <= 64-bit element uses one word
+    // and reduces to the scalar (v << bits) | d path, a wider element assembles
+    // multi-word. Allocated once and reused per token.
+    const uint32_t        words = plane_words(width);
+    const bool            wide  = width > 64;
+    std::vector<uint64_t> must(words);
+    std::vector<uint64_t> may(words);
+    std::vector<uint64_t> z(words);
+
     const MemDest dest{ mm_base, z_base, stride, count, width, four_state, narrow };
-    const auto    write_elem = [&](int64_t idx, uint64_t must, uint64_t may, uint64_t z) {
+    const auto    write_elem = [&](int64_t idx) {
         if (idx < 0 || idx >= static_cast<int64_t>(count)) {
             std::fprintf(stderr, "$readmem: address out of range for '%s'\n", path.c_str());
             return;
         }
-        mem_write(dest, idx, must, may, z);
+        if (wide) {
+            mem_write_wide(dest, idx, must.data(), may.data(), z.data());
+        } else {
+            mem_write(dest, idx, must[0], may[0], z[0]);
+        }
     };
 
     const size_t n = buf.size();
@@ -1565,10 +1711,11 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
             continue;
         }
         // A data token: accumulate digits MSB-first; x/z (and ?) mark unknown bits.
-        uint64_t must = 0;
-        uint64_t may  = 0;
-        uint64_t z    = 0;
-        bool     any  = false;
+        // wide_shl a[0] |= d reduces to (a << bits) | d for a single word.
+        std::fill(must.begin(), must.end(), 0);
+        std::fill(may.begin(), may.end(), 0);
+        std::fill(z.begin(), z.end(), 0);
+        bool any = false;
         while (i < n) {
             const char d = buf[i];
             uint64_t   dv;
@@ -1595,10 +1742,13 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
                 mv = dv;
                 zv = 0;
             }
-            must = (must << bits) | dv;
-            may  = (may << bits) | mv;
-            z    = (z << bits) | zv;
-            any  = true;
+            wide_shl(must.data(), words, bits);
+            must[0] |= dv;
+            wide_shl(may.data(), words, bits);
+            may[0] |= mv;
+            wide_shl(z.data(), words, bits);
+            z[0] |= zv;
+            any = true;
             ++i;
         }
         if (!any) {
@@ -1610,7 +1760,7 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
             std::fprintf(stderr, "$readmem: more data than the memory range for '%s'\n", path.c_str());
             break;
         }
-        write_elem(norm_addr(decl_left, decl_right, addr), must, may, z);
+        write_elem(norm_addr(decl_left, decl_right, addr));
         addr += dir;
     }
 }
@@ -1639,16 +1789,25 @@ extern "C" int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint3
     int64_t       addr      = has_start ? start : lo;
     int64_t       remaining = has_count ? max_count : static_cast<int64_t>(count);
 
+    // Bytes accumulate into a word array; a <= 64-bit element uses one word and
+    // reduces to the scalar (val << 8) | byte path.
+    const uint32_t        words = plane_words(width);
+    const bool            wide  = width > 64;
+    std::vector<uint64_t> val(words);
+    std::vector<uint64_t> may(words);
+    std::vector<uint64_t> z(words, 0);
+
     int32_t bytes_read = 0;
     while (addr <= hi && remaining > 0) {
-        uint64_t val = 0;
-        uint32_t nb  = 0;
+        std::fill(val.begin(), val.end(), 0);
+        uint32_t nb = 0;
         while (nb < elem_bytes) {
             const int c = std::fgetc(f);
             if (c == EOF) {
                 break;
             }
-            val = (val << 8) | static_cast<uint8_t>(c);
+            wide_shl(val.data(), words, 8);
+            val[0] |= static_cast<uint8_t>(c);
             ++nb;
             ++bytes_read;
         }
@@ -1657,8 +1816,17 @@ extern "C" int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint3
         }
         // MSB-first: a short final element left-shifts so the bytes read occupy the
         // high end and the missing low bytes stay 0.
-        val <<= 8u * (elem_bytes - nb);
-        mem_write(dest, norm_addr(decl_left, decl_right, addr), val, val, 0);
+        wide_shl(val.data(), words, 8u * (elem_bytes - nb));
+        const int64_t idx = norm_addr(decl_left, decl_right, addr);
+        if (wide) {
+            // File bytes are all known (must == may, no z); mem_write_wide's
+            // 2-state override handles a narrow memory.
+            std::copy(val.begin(), val.end(), may.begin());
+            std::fill(z.begin(), z.end(), 0);
+            mem_write_wide(dest, idx, val.data(), may.data(), z.data());
+        } else {
+            mem_write(dest, idx, val[0], val[0], 0);
+        }
         ++addr;
         --remaining;
         if (nb < elem_bytes) {
@@ -1748,8 +1916,12 @@ namespace {
 // (z is always 0 — LRM §21.6 writes an all-unknown result as 'bx, never a z
 // bit). Unlike $sscanf, which stops at the first bad character, every
 // character in `rem` must be legal or the whole result is 'bx.
-void value_plusargs_numeric(std::string_view rem, char conv, uint64_t& must, uint64_t& may) {
-    must = may = 0;
+// Parse the plusarg remainder into the `words`-word planes (must == may; plusarg
+// values carry no x/z except the whole-'bx illegal result). A single word reduces
+// to the scalar `val * base + digit` accumulation.
+void value_plusargs_numeric(std::string_view rem, char conv, uint64_t* must, uint64_t* may, uint32_t words) {
+    std::fill(must, must + words, 0);
+    std::fill(may, may + words, 0);
     if (rem.empty()) {
         return; // LRM: no remaining string -> store zero.
     }
@@ -1760,13 +1932,16 @@ void value_plusargs_numeric(std::string_view rem, char conv, uint64_t& must, uin
         neg = rem[0] == '-';
         i   = 1;
     }
+    // Illegal input -> whole result 'bx (VPI: must=0, may=all-1, z=0). Masked to
+    // the target width at write time.
+    const auto set_x = [&] {
+        std::fill(must, must + words, 0);
+        std::fill(may, may + words, ~uint64_t{ 0 });
+    };
     if (i >= rem.size()) {
-        // Bare sign, no digits: illegal -> 'bx (VPI: must=0, may=all-1, z=0).
-        must = 0;
-        may  = ~uint64_t{ 0 };
+        set_x(); // bare sign, no digits
         return;
     }
-    uint64_t val = 0;
     for (; i < rem.size(); ++i) {
         int        hv;
         const char c = rem[i];
@@ -1780,17 +1955,15 @@ void value_plusargs_numeric(std::string_view rem, char conv, uint64_t& must, uin
             hv = hex_digit(c);
         }
         if (hv < 0) {
-            // Illegal character: whole result 'bx (VPI: must=0, may=all-1, z=0).
-            must = 0;
-            may  = ~uint64_t{ 0 };
+            set_x();
             return;
         }
-        val = val * static_cast<uint64_t>(base) + static_cast<uint64_t>(hv);
+        wide_mul_add(must, words, static_cast<uint64_t>(base), static_cast<uint64_t>(hv));
     }
     if (neg) {
-        val = static_cast<uint64_t>(-static_cast<int64_t>(val));
+        wide_negate(must, words);
     }
-    must = may = val;
+    std::copy(must, must + words, may);
 }
 
 } // namespace
@@ -1804,22 +1977,29 @@ rt_value_plusargs(const char* prefix, uint32_t prefix_len, uint32_t conv, const 
     const std::string_view rem(pa->data() + prefix_len, pa->size() - prefix_len);
     const char              c = static_cast<char>(conv);
 
-    uint64_t must = 0;
-    uint64_t may  = 0;
+    const uint32_t        words = plane_words(arg->width);
+    std::vector<uint64_t> must(words, 0);
+    std::vector<uint64_t> may(words, 0);
+    std::vector<uint64_t> z(words, 0);
     if (c == 's') {
-        // Right-justify the remainder bytes (byte 0 = last char), like
-        // $sscanf's %s — capped at 8 bytes; wider targets are guarded by the
-        // backend (rt_scan_arg::width <= 64).
-        const size_t keep = rem.size() < 8 ? rem.size() : 8;
+        // Right-justify the remainder bytes (byte 0 = last char) into `must`, like
+        // $sscanf's %s, capped at the target width; write_word_planes masks it.
+        const size_t cap  = static_cast<size_t>(words) * 8;
+        const size_t keep = rem.size() < cap ? rem.size() : cap;
         for (size_t k = 0; k < keep; ++k) {
-            must |= static_cast<uint64_t>(static_cast<uint8_t>(rem[rem.size() - 1 - k])) << (8 * k);
+            must[k / 8] |= static_cast<uint64_t>(static_cast<uint8_t>(rem[rem.size() - 1 - k])) << (8 * (k % 8));
         }
-        may = must;
+        std::copy(must.begin(), must.end(), may.begin());
     } else {
-        value_plusargs_numeric(rem, c, must, may);
+        value_plusargs_numeric(rem, c, must.data(), may.data(), words);
     }
 
-    write_word_planes(arg->mm, arg->z, arg->width, must, may, 0, (arg->flags & 1u) != 0);
+    const bool narrow = (arg->flags & 1u) != 0;
+    if (arg->width > 64) {
+        write_word_planes_wide(arg->mm, arg->z, arg->width, must.data(), may.data(), z.data(), narrow);
+    } else {
+        write_word_planes(arg->mm, arg->z, arg->width, must[0], may[0], 0, narrow);
+    }
     return 1;
 }
 
@@ -1942,10 +2122,10 @@ extern "C" void rt_string_substr(rt_string* dst, const rt_string* src, int32_t i
     str_assign(dst, str_data(src) + i, static_cast<uint64_t>(j) - static_cast<uint64_t>(i) + 1);
 }
 
-extern "C" void rt_enum_name(rt_string* dst, uint64_t val, uint32_t count, const uint64_t* values,
-                             const char* const* names, const uint32_t* lens) {
+extern "C" void rt_enum_name(rt_string* dst, const uint8_t* val, uint32_t vbytes, uint32_t count,
+                             const uint8_t* values, const char* const* names, const uint32_t* lens) {
     for (uint32_t k = 0; k < count; ++k) {
-        if (values[k] == val) {
+        if (std::memcmp(val, values + static_cast<size_t>(k) * vbytes, vbytes) == 0) {
             str_assign(dst, names[k], lens[k]);
             return;
         }

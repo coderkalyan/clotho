@@ -172,27 +172,28 @@ Index Builder::str_to_packed(Index str, Ref type, SourceLoc loc) {
     return emit({ Inst::Tag::StrToPacked, Inst::Payload{ .op_type = { str, type } } }, loc);
 }
 
-Index Builder::enum_name(Index val, std::span<const std::pair<uint64_t, std::string_view>> members,
-                         SourceLoc loc) {
-    // Pack each member's name bytes first, remembering where they landed, then
-    // pack the entry records contiguously so they form one ExtraSlice. Names and
-    // records share the extra buffer but never overlap.
+Index Builder::enum_name(Index val, std::span<const EnumNameRow> members, SourceLoc loc) {
+    // Pack each member's value + name bytes first, remembering where they landed,
+    // then pack the entry records contiguously so they form one ExtraSlice. The
+    // byte payloads and the records share the extra buffer but never overlap.
     struct Packed {
-        uint64_t   value;
+        ExtraIndex val_at;
+        uint32_t   val_len;
         ExtraIndex name_at;
         uint32_t   name_len;
     };
     std::vector<Packed> packed;
     packed.reserve(members.size());
-    for (const std::pair<uint64_t, std::string_view>& m : members) {
-        const ExtraIndex at = add_bytes(m.second);
-        packed.push_back({ m.first, at, static_cast<uint32_t>(m.second.size()) });
+    for (const EnumNameRow& m : members) {
+        const ExtraIndex vat =
+          add_bytes(std::string_view(reinterpret_cast<const char*>(m.value.data()), m.value.size()));
+        const ExtraIndex nat = add_bytes(m.name);
+        packed.push_back({ vat, static_cast<uint32_t>(m.value.size()), nat, static_cast<uint32_t>(m.name.size()) });
     }
 
     const auto start = static_cast<ExtraIndex>(extra_.size());
     for (const Packed& p : packed) {
-        add_extra(EnumNameEntry{ static_cast<uint32_t>(p.value), static_cast<uint32_t>(p.value >> 32),
-                                 p.name_at, p.name_len });
+        add_extra(EnumNameEntry{ p.val_at, p.val_len, p.name_at, p.name_len });
     }
     const auto end = static_cast<ExtraIndex>(extra_.size());
 

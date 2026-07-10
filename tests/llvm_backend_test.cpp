@@ -2219,6 +2219,88 @@ TEST_CASE("$readmemh accepts a string-expression filename") {
     std::remove(path);
 }
 
+// A memory whose elements are wider than 64 bits: rt_readmem assembles each
+// value across multiple words (the <= 64-bit path stays scalar). Read back
+// through 64-bit part-selects. Cross-checked against Icarus Verilog, including
+// x/z nibbles, a short (zero-extended) token, and an untouched element.
+TEST_CASE("$readmemh into a memory with elements wider than 64 bits") {
+    const char* path = "clotho_readmemh_wide_test.hex";
+    write_file(path,
+               "DEADBEEFCAFEBABE0123456789ABCDEF\n"
+               "FEDCBA9876543210zzzzzzzzxxxxxxxx\n"
+               "00000000000000000000000000000042\n");
+    const std::string src = std::string(R"(
+        module m;
+            reg [127:0] mem [0:3];
+            integer k;
+            initial begin
+                $readmemh(")") + path + R"(", mem);
+                for (k = 0; k < 4; k = k + 1)
+                    $display("%h_%h", mem[k][127:64], mem[k][63:0]);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "deadbeefcafebabe_0123456789abcdef\n"
+                              "fedcba9876543210_zzzzzzzzxxxxxxxx\n"
+                              "0000000000000000_0000000000000042\n"
+                              "xxxxxxxxxxxxxxxx_xxxxxxxxxxxxxxxx\n");
+    std::remove(path);
+}
+
+// A 2-state (narrow) wide memory stores only the iW value word; x/z read as 0
+// (LRM 6.3.1). Cross-checked against Icarus Verilog.
+TEST_CASE("$readmemh into a 2-state memory with elements wider than 64 bits") {
+    const char* path = "clotho_readmemh_wide2s_test.hex";
+    write_file(path, "DEADBEEFCAFEBABE0123456789ABCDEF\n0000000000000000000000000000002A\n");
+    const std::string src = std::string(R"(
+        module m;
+            bit [127:0] mem [0:1];
+            integer k;
+            initial begin
+                $readmemh(")") + path + R"(", mem);
+                for (k = 0; k < 2; k = k + 1)
+                    $display("%h_%h", mem[k][127:64], mem[k][63:0]);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "deadbeefcafebabe_0123456789abcdef\n"
+                              "0000000000000000_000000000000002a\n");
+    std::remove(path);
+}
+
+// $fread into elements wider than 64 bits: bytes pack MSB-first across words.
+// Element 0 is full (16 bytes); element 1 reads 4 bytes then hits EOF, so its
+// unread low bytes zero-fill (Icarus shows the prior x there,
+// a documented Clotho deviation). Element 0 and the byte count match Icarus.
+TEST_CASE("$fread into a memory with elements wider than 64 bits") {
+    const char*       path  = "clotho_fread_wide_test.bin";
+    const std::string bytes = { '\x01', '\x23', '\x45', '\x67', '\x89', '\xab', '\xcd',
+                                '\xef', '\xfe', '\xdc', '\xba', '\x98', '\x76', '\x54',
+                                '\x32', '\x10', '\xaa', '\xbb', '\xcc', '\xdd' };
+    write_file(path, bytes);
+    const std::string src = std::string(R"(
+        module m;
+            reg [127:0] mem [0:1];
+            integer fd, rc;
+            initial begin
+                fd = $fopen(")") + path + R"(", "rb");
+                rc = $fread(mem, fd);
+                $display("rc=%0d", rc);
+                $display("%h_%h", mem[0][127:64], mem[0][63:0]);
+                $display("%h_%h", mem[1][127:64], mem[1][63:0]);
+                $fclose(fd);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "rc=20\n"
+                              "0123456789abcdef_fedcba9876543210\n"
+                              "aabbccdd00000000_0000000000000000\n");
+    std::remove(path);
+}
+
 // Default load fills from the lowest address upward regardless of the declared
 // range direction; a descending range [3:0] therefore maps the first datum to
 // address 0 (storage slot 3). This is the LRM §21.4 rule, which Icarus follows and
@@ -2850,6 +2932,35 @@ TEST_CASE("$sscanf z digits survive z elision; a 2-state target reads 0") {
     // Verified against iverilog except the ? digit, which iverilog reads as x;
     // ? is an alternative for z in the LRM (5.7.1), so z is kept.
     CHECK(run_capture(src) == "zzzzzzzz\nz1x0zz1z\n00000000\n");
+}
+
+// $sscanf into a target wider than 64 bits: the runtime scanner assembles the
+// value multi-word (hex shift, decimal 1e0-base multiply-add, %s byte pack, two's
+// complement for a negative %d). Read back through 64-bit part-selects.
+// Cross-checked against Icarus Verilog.
+TEST_CASE("$sscanf into a target wider than 64 bits") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [127:0] a;
+            logic signed [95:0] s;
+            int rc;
+            initial begin
+                rc = $sscanf("deadbeefcafebabe0123456789abcdef", "%h", a);
+                $display("%0d %h_%h", rc, a[127:64], a[63:0]);
+                rc = $sscanf("340282366920938463463374607431768211455", "%d", a);
+                $display("%0d %h_%h", rc, a[127:64], a[63:0]);
+                rc = $sscanf("-170141183460469231731", "%d", s);
+                $display("%0d %h_%h", rc, s[95:64], s[63:0]);
+                rc = $sscanf("HelloWideWorld!!", "%s", a);
+                $display("%0d %h_%h", rc, a[127:64], a[63:0]);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 deadbeefcafebabe_0123456789abcdef\n"
+                              "1 ffffffffffffffff_ffffffffffffffff\n"
+                              "1 fffffff6_c6d11716de2a2f8d\n"
+                              "1 48656c6c6f576964_65576f726c642121\n");
 }
 
 TEST_CASE("a task output formal carries z back to the caller") {

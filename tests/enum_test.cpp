@@ -155,16 +155,30 @@ TEST_CASE("enum name") {
 // Enum methods (.name/.next/.prev/.first/.last/.num, LRM 6.19.2-6.19.5) are not
 // implemented; each must reject rather than silently mis-lower. slang models
 // them as system subroutines, so they hit the unsupported-system-function guard.
-TEST_CASE("enum methods are rejected") {
-    // name() on a base type wider than 64 bits (the table key packs into u64).
-    check_rejected(R"(
+// name() on a base type wider than 64 bits: the member table stores each value
+// as its must-plane bytes and the runtime byte-compares, so any width works.
+// Cross-checked against Icarus Verilog (A/B/C match, a non-member yields "").
+TEST_CASE("enum name with a base type wider than 64 bits") {
+    const std::string out = run_capture(R"(
         module m;
-          typedef enum bit [71:0] {A, B} e_t;
-          e_t x; string s;
-          initial begin x = A; s = x.name(); end
+          typedef enum logic [95:0] {
+            A = 96'hDEADBEEFCAFEBABE01234567,
+            B = 96'h0000000000000000000000FF,
+            C = 96'hFFFFFFFFFFFFFFFFFFFFFFFF
+          } e_t;
+          e_t e;
+          initial begin
+            e = A; $display("[%s]", e.name());
+            e = B; $display("[%s]", e.name());
+            e = C; $display("[%s]", e.name());
+            e = e_t'(96'h123); $display("[%s]", e.name());
+          end
         endmodule
-    )",
-                   "wider than 64 bits");
+    )");
+    CHECK(out == "[A]\n[B]\n[C]\n[]\n");
+}
+
+TEST_CASE("enum methods are rejected") {
     // A runtime (non-constant) step to next/prev is not supported.
     check_rejected(R"(
         module m;

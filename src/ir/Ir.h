@@ -481,10 +481,12 @@ struct StrSubstrInfo {
 // One row of an enum's name table: a member value (low 64 bits) and its source
 // name, packed little-endian at `name_at` for `name_len` bytes.
 struct EnumNameEntry {
-    // Member value, low word.
-    uint32_t val_lo;
-    // Member value, high word.
-    uint32_t val_hi;
+    // First extra word of the member value's must-plane bytes ((width+7)/8 bytes,
+    // little-endian). Stored as bytes rather than a word so a base wider than 64
+    // bits round-trips.
+    ExtraIndex val_at;
+    // Member value length in bytes ((width+7)/8), identical across all entries.
+    uint32_t val_len;
     // First extra word of the packed name bytes.
     ExtraIndex name_at;
     // Name length in bytes.

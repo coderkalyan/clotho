@@ -4318,10 +4318,12 @@ private:
     llvm::FunctionCallee str_upper_fn() {
         return rt_fn("rt_string_toupper", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
+    // void rt_enum_name(rt_string* dst, const u8* val, u32 vbytes, u32 count,
+    //                   const u8* values, const char* const* names, const u32* lens)
     llvm::FunctionCallee enum_name_fn() {
         return rt_fn("rt_enum_name", b_.getVoidTy(),
-                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty(),
-                       raw_ptr_ty() });
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(),
+                       raw_ptr_ty(), raw_ptr_ty() });
     }
     llvm::FunctionCallee str_lower_fn() {
         return rt_fn("rt_string_tolower", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
@@ -5428,39 +5430,41 @@ private:
                 return;
             }
             case Inst::Tag::EnumName: {
-                // Materialize the member table as three parallel read-only globals
-                // (values / name pointers / lengths) and let the runtime scan it.
-                const auto     info   = ir_->extra_data<EnumNameInfo>(p.op_extra.extra);
-                const auto     start  = static_cast<uint32_t>(info.entries.start);
-                const auto     end    = static_cast<uint32_t>(info.entries.end);
+                // Materialize the member table: one contiguous value-bytes blob
+                // plus parallel name-pointer / length globals, then let the runtime
+                // byte-compare the operand's must plane against each member value.
+                const auto         info   = ir_->extra_data<EnumNameInfo>(p.op_extra.extra);
+                const auto         start  = static_cast<uint32_t>(info.entries.start);
+                const auto         end    = static_cast<uint32_t>(info.entries.end);
                 constexpr uint32_t stride = sizeof(EnumNameEntry) / sizeof(uint32_t);
-                llvm::Type* const i64  = b_.getInt64Ty();
-                llvm::Type* const i32  = b_.getInt32Ty();
-                std::vector<llvm::Constant*> vals, names, lens;
+                llvm::Type* const  i32    = b_.getInt32Ty();
+                std::string                  blob; // count * vbytes value bytes
+                std::vector<llvm::Constant*> names, lens;
+                uint32_t                     vbytes = 0;
                 for (uint32_t w = start; w < end; w += stride) {
-                    const auto     e = ir_->extra_data<EnumNameEntry>(static_cast<ExtraIndex>(w));
-                    const uint64_t v =
-                      static_cast<uint64_t>(e.val_lo) | (static_cast<uint64_t>(e.val_hi) << 32);
-                    vals.push_back(llvm::ConstantInt::get(i64, v));
+                    const auto e = ir_->extra_data<EnumNameEntry>(static_cast<ExtraIndex>(w));
+                    vbytes       = e.val_len;
+                    blob += ir_->extra_bytes(e.val_at, e.val_len);
                     names.push_back(b_.CreateGlobalString(ir_->extra_bytes(e.name_at, e.name_len)));
                     lens.push_back(llvm::ConstantInt::get(i32, e.name_len));
                 }
-                const auto count   = static_cast<uint32_t>(vals.size());
-                auto*      val_arr = llvm::ArrayType::get(i64, count);
+                const auto count   = static_cast<uint32_t>(names.size());
                 auto*      ptr_arr = llvm::ArrayType::get(raw_ptr_ty(), count);
                 auto*      len_arr = llvm::ArrayType::get(i32, count);
-                auto make_gv = [&](llvm::ArrayType* ty, llvm::ArrayRef<llvm::Constant*> els,
-                                   const char* nm) {
-                    return new llvm::GlobalVariable(llmod_, ty, true,
-                                                    llvm::GlobalValue::InternalLinkage,
-                                                    llvm::ConstantArray::get(ty, els), nm);
+                auto*      blob_c  = llvm::ConstantDataArray::get(
+                  ctx_, llvm::ArrayRef<uint8_t>(reinterpret_cast<const uint8_t*>(blob.data()), blob.size()));
+                auto make_gv = [&](llvm::Type* ty, llvm::Constant* init, const char* nm) {
+                    return new llvm::GlobalVariable(llmod_, ty, true, llvm::GlobalValue::InternalLinkage, init, nm);
                 };
-                llvm::Value* vg = make_gv(val_arr, vals, "clotho.enum.vals");
-                llvm::Value* ng = make_gv(ptr_arr, names, "clotho.enum.names");
-                llvm::Value* lg = make_gv(len_arr, lens, "clotho.enum.lens");
-                llvm::Value* val64 = cast(must_of(value_of(p.op_extra.op)), 64, false);
+                llvm::Value* vg = make_gv(blob_c->getType(), blob_c, "clotho.enum.vals");
+                llvm::Value* ng = make_gv(ptr_arr, llvm::ConstantArray::get(ptr_arr, names), "clotho.enum.names");
+                llvm::Value* lg = make_gv(len_arr, llvm::ConstantArray::get(len_arr, lens), "clotho.enum.lens");
+                // Spill the operand's must plane to a byte buffer for the compare.
+                const uint32_t spill  = plane_bytes(type_of(p.op_extra.op).width);
+                llvm::Value*   valbuf = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(spill), "enum.val");
+                b_.CreateAlignedStore(must_of(value_of(p.op_extra.op)), valbuf, llvm::Align(1));
                 b_.CreateCall(enum_name_fn(),
-                              { str_of(i), val64, b_.getInt32(count), vg, ng, lg });
+                              { str_of(i), valbuf, b_.getInt32(vbytes), b_.getInt32(count), vg, ng, lg });
                 return;
             }
             case Inst::Tag::StrFromPacked: {
@@ -6573,12 +6577,6 @@ private:
                     // TODO: a part-select scan target (x[7:0]).
                     throw BackendError{ "$fscanf / $sscanf into a part-select target is not supported" };
                 }
-                if (lv.store_width > 64) {
-                    // TODO: a target wider than 64 bits (e.g. a long %s token) needs
-                    // multi-word plane assembly in the runtime scanner.
-                    throw BackendError{ "$fscanf / $sscanf into a target wider than 64 bits is not "
-                                        "supported" };
-                }
                 // A never-z target (z elision) passes a null z pointer. Flags bit0
                 // marks a narrow 2-state slot: the runtime writes only the iW value
                 // word (parsed x/z digits drop to 0 per LRM 6.3.1).
@@ -6657,11 +6655,6 @@ private:
             // TODO: a part-select $value$plusargs target (x[7:0]).
             throw BackendError{ "$value$plusargs into a part-select target is not supported" };
         }
-        if (lv.store_width > 64) {
-            throw BackendError{
-                "$value$plusargs into a target wider than 64 bits is not supported"
-            };
-        }
 
         llvm::StructType* sty = scan_arg_struct_ty();
         llvm::Value*      arg = b_.CreateAlloca(sty, nullptr, "plusarg_val");
@@ -6725,9 +6718,6 @@ private:
         if (lv.width != lv.store_width) {
             throw BackendError{ "$fread into a part-select target is not supported" };
         }
-        if (lv.store_width > 64) {
-            throw BackendError{ "$fread into a target wider than 64 bits is not supported" };
-        }
         // A never-z target (z elision) passes a null z pointer; a narrow 2-state
         // slot sets flags bit2 so the runtime writes only the iW value word.
         llvm::Value* mm = lv_mm_ptr(lv);
@@ -6756,9 +6746,6 @@ private:
         const SignalSlot& s = slot_of(info.mem);
         if (!s.is_array) {
             throw BackendError{ "$fread memory target is not a memory" };
-        }
-        if (s.width > 64) {
-            throw BackendError{ "$fread into a memory with elements wider than 64 bits is not supported" };
         }
         // Element i's planes at base + i*stride (one slot struct per element); a
         // never-z memory stores no z word, so pass a null z_base.
@@ -6810,11 +6797,6 @@ private:
         const SignalSlot& s     = slot_of(info.target);
         if (!s.is_array) {
             throw BackendError{ "$readmem target is not a memory" };
-        }
-        if (s.width > 64) {
-            // TODO: element width > 64 needs multi-word value assembly in rt_readmem
-            // (the value/mask accumulators are u64 / unsigned __int128 today).
-            throw BackendError{ "$readmem into a memory with elements wider than 64 bits is not supported" };
         }
 
         // A string-object filename (LRM §21.4 allows a string-typed expression) is
