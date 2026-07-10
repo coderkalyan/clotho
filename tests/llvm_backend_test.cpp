@@ -2934,6 +2934,35 @@ TEST_CASE("$sscanf z digits survive z elision; a 2-state target reads 0") {
     CHECK(run_capture(src) == "zzzzzzzz\nz1x0zz1z\n00000000\n");
 }
 
+// $sscanf into a target wider than 64 bits: the runtime scanner assembles the
+// value multi-word (hex shift, decimal 1e0-base multiply-add, %s byte pack, two's
+// complement for a negative %d). Read back through 64-bit part-selects.
+// Cross-checked against Icarus Verilog.
+TEST_CASE("$sscanf into a target wider than 64 bits") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [127:0] a;
+            logic signed [95:0] s;
+            int rc;
+            initial begin
+                rc = $sscanf("deadbeefcafebabe0123456789abcdef", "%h", a);
+                $display("%0d %h_%h", rc, a[127:64], a[63:0]);
+                rc = $sscanf("340282366920938463463374607431768211455", "%d", a);
+                $display("%0d %h_%h", rc, a[127:64], a[63:0]);
+                rc = $sscanf("-170141183460469231731", "%d", s);
+                $display("%0d %h_%h", rc, s[95:64], s[63:0]);
+                rc = $sscanf("HelloWideWorld!!", "%s", a);
+                $display("%0d %h_%h", rc, a[127:64], a[63:0]);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 deadbeefcafebabe_0123456789abcdef\n"
+                              "1 ffffffffffffffff_ffffffffffffffff\n"
+                              "1 fffffff6_c6d11716de2a2f8d\n"
+                              "1 48656c6c6f576964_65576f726c642121\n");
+}
+
 TEST_CASE("a task output formal carries z back to the caller") {
     constexpr std::string_view src = R"(
         module m;

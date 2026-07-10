@@ -520,6 +520,29 @@ void wide_or_shifted(uint64_t* dst, const uint64_t* src, uint32_t words, uint32_
     }
 }
 
+// a = a * mul + add, in place (high bits drop). `mul`/`add` are small (base and a
+// single digit), so each partial product fits __int128. The multi-word analogue
+// of the scalar `v = v * 10 + d` decimal accumulation.
+void wide_mul_add(uint64_t* a, uint32_t words, uint64_t mul, uint64_t add) {
+    uint64_t carry = add;
+    for (uint32_t k = 0; k < words; ++k) {
+        const unsigned __int128 p = static_cast<unsigned __int128>(a[k]) * mul + carry;
+        a[k]                      = static_cast<uint64_t>(p);
+        carry                     = static_cast<uint64_t>(p >> 64);
+    }
+}
+
+// Two's-complement negate a `words`-word value in place (~a + 1). For one word
+// this is the scalar `-v`; the target-width masking happens at write time.
+void wide_negate(uint64_t* a, uint32_t words) {
+    uint64_t carry = 1;
+    for (uint32_t k = 0; k < words; ++k) {
+        const uint64_t inv = ~a[k] + carry;
+        carry              = (carry != 0 && inv == 0) ? 1 : 0;
+        a[k]               = inv;
+    }
+}
+
 // Wide sibling of write_word_planes: the value planes are little-endian word
 // arrays (`words` = plane_words(width)). Masks each to `width`, then writes the
 // packed must|may vector (must low, may above) and the z word, matching the
@@ -1038,6 +1061,18 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
     int32_t  count     = 0;
     bool     any_input = false;
 
+    // Value planes accumulate into word arrays sized to the widest target: a
+    // target wider than 64 bits assembles multi-word, a <= 64-bit target uses
+    // word 0 and reduces to the scalar accumulation. write_word_planes masks each
+    // conversion to its own arg's width.
+    uint32_t words = 1;
+    for (uint32_t k = 0; k < argc; ++k) {
+        words = std::max(words, plane_words(args[k].width));
+    }
+    std::vector<uint64_t> must(words);
+    std::vector<uint64_t> may(words);
+    std::vector<uint64_t> z(words);
+
     for (const char* p = fmt; *p != '\0'; ++p) {
         if (scan_ws(static_cast<unsigned char>(*p))) {
             skip_ws(src);
@@ -1078,17 +1113,17 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
             break;
         }
 
-        uint64_t must = 0;
-        uint64_t may  = 0;
-        uint64_t z    = 0;
-        bool     ok   = false;
+        std::fill(must.begin(), must.end(), 0);
+        std::fill(may.begin(), may.end(), 0);
+        std::fill(z.begin(), z.end(), 0);
+        bool ok = false;
 
         if (conv == 'c') {
             const int c = src.get();
             if (c != EOF) {
-                any_input = true;
-                must = may = static_cast<uint8_t>(c);
-                ok         = true;
+                any_input   = true;
+                must[0] = may[0] = static_cast<uint8_t>(c);
+                ok               = true;
             }
         } else if (conv == 's') {
             skip_ws(src);
@@ -1106,14 +1141,15 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
             }
             if (!tok.empty()) {
                 any_input = true;
-                // Right-justify the token bytes into `must` (byte 0 = last char),
-                // capped at 8 bytes; wider %s targets are guarded by the backend.
-                const size_t keep = tok.size() < 8 ? tok.size() : 8;
+                // Right-justify the token bytes (byte 0 = last char) into `must`,
+                // capped at the widest target; write_word_planes masks to width.
+                const size_t cap  = static_cast<size_t>(words) * 8;
+                const size_t keep = tok.size() < cap ? tok.size() : cap;
                 for (size_t k = 0; k < keep; ++k) {
-                    must |= static_cast<uint64_t>(tok[tok.size() - 1 - k]) << (8 * k);
+                    must[k / 8] |= static_cast<uint64_t>(tok[tok.size() - 1 - k]) << (8 * (k % 8));
                 }
-                may = must;
-                ok  = true;
+                std::copy(must.begin(), must.end(), may.begin());
+                ok = true;
             }
         } else {
             // Numeric: d (signed decimal), o / b / h / x (power-of-two bases, with
@@ -1162,11 +1198,14 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
                     mv = dv; // known digit: may == must
                 }
                 if (base == 10) {
-                    must = must * 10 + dv;
+                    wide_mul_add(must.data(), words, 10, dv);
                 } else {
-                    must = (must << bits) | dv;
-                    may  = (may << bits) | mv;
-                    z    = (z << bits) | zz;
+                    wide_shl(must.data(), words, bits);
+                    must[0] |= dv;
+                    wide_shl(may.data(), words, bits);
+                    may[0] |= mv;
+                    wide_shl(z.data(), words, bits);
+                    z[0] |= zz;
                 }
                 ok        = true;
                 any_input = true;
@@ -1176,9 +1215,9 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
             src.unget(c);
             if (ok && base == 10) {
                 if (neg) {
-                    must = static_cast<uint64_t>(-static_cast<int64_t>(must));
+                    wide_negate(must.data(), words);
                 }
-                may = must; // decimal values carry no x/z
+                std::copy(must.begin(), must.end(), may.begin()); // decimal: no x/z
             }
         }
 
@@ -1189,8 +1228,13 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
             if (ai >= argc) {
                 break; // more conversions than output args
             }
-            const rt_scan_arg& a = args[ai++];
-            write_word_planes(a.mm, a.z, a.width, must, may, z, (a.flags & 1u) != 0);
+            const rt_scan_arg& a      = args[ai++];
+            const bool         narrow = (a.flags & 1u) != 0;
+            if (a.width > 64) {
+                write_word_planes_wide(a.mm, a.z, a.width, must.data(), may.data(), z.data(), narrow);
+            } else {
+                write_word_planes(a.mm, a.z, a.width, must[0], may[0], z[0], narrow);
+            }
             ++count;
         }
     }
@@ -1752,8 +1796,12 @@ namespace {
 // (z is always 0 — LRM §21.6 writes an all-unknown result as 'bx, never a z
 // bit). Unlike $sscanf, which stops at the first bad character, every
 // character in `rem` must be legal or the whole result is 'bx.
-void value_plusargs_numeric(std::string_view rem, char conv, uint64_t& must, uint64_t& may) {
-    must = may = 0;
+// Parse the plusarg remainder into the `words`-word planes (must == may; plusarg
+// values carry no x/z except the whole-'bx illegal result). A single word reduces
+// to the scalar `val * base + digit` accumulation.
+void value_plusargs_numeric(std::string_view rem, char conv, uint64_t* must, uint64_t* may, uint32_t words) {
+    std::fill(must, must + words, 0);
+    std::fill(may, may + words, 0);
     if (rem.empty()) {
         return; // LRM: no remaining string -> store zero.
     }
@@ -1764,13 +1812,16 @@ void value_plusargs_numeric(std::string_view rem, char conv, uint64_t& must, uin
         neg = rem[0] == '-';
         i   = 1;
     }
+    // Illegal input -> whole result 'bx (VPI: must=0, may=all-1, z=0). Masked to
+    // the target width at write time.
+    const auto set_x = [&] {
+        std::fill(must, must + words, 0);
+        std::fill(may, may + words, ~uint64_t{ 0 });
+    };
     if (i >= rem.size()) {
-        // Bare sign, no digits: illegal -> 'bx (VPI: must=0, may=all-1, z=0).
-        must = 0;
-        may  = ~uint64_t{ 0 };
+        set_x(); // bare sign, no digits
         return;
     }
-    uint64_t val = 0;
     for (; i < rem.size(); ++i) {
         int        hv;
         const char c = rem[i];
@@ -1784,17 +1835,15 @@ void value_plusargs_numeric(std::string_view rem, char conv, uint64_t& must, uin
             hv = hex_digit(c);
         }
         if (hv < 0) {
-            // Illegal character: whole result 'bx (VPI: must=0, may=all-1, z=0).
-            must = 0;
-            may  = ~uint64_t{ 0 };
+            set_x();
             return;
         }
-        val = val * static_cast<uint64_t>(base) + static_cast<uint64_t>(hv);
+        wide_mul_add(must, words, static_cast<uint64_t>(base), static_cast<uint64_t>(hv));
     }
     if (neg) {
-        val = static_cast<uint64_t>(-static_cast<int64_t>(val));
+        wide_negate(must, words);
     }
-    must = may = val;
+    std::copy(must, must + words, may);
 }
 
 } // namespace
@@ -1808,22 +1857,29 @@ rt_value_plusargs(const char* prefix, uint32_t prefix_len, uint32_t conv, const 
     const std::string_view rem(pa->data() + prefix_len, pa->size() - prefix_len);
     const char              c = static_cast<char>(conv);
 
-    uint64_t must = 0;
-    uint64_t may  = 0;
+    const uint32_t        words = plane_words(arg->width);
+    std::vector<uint64_t> must(words, 0);
+    std::vector<uint64_t> may(words, 0);
+    std::vector<uint64_t> z(words, 0);
     if (c == 's') {
-        // Right-justify the remainder bytes (byte 0 = last char), like
-        // $sscanf's %s — capped at 8 bytes; wider targets are guarded by the
-        // backend (rt_scan_arg::width <= 64).
-        const size_t keep = rem.size() < 8 ? rem.size() : 8;
+        // Right-justify the remainder bytes (byte 0 = last char) into `must`, like
+        // $sscanf's %s, capped at the target width; write_word_planes masks it.
+        const size_t cap  = static_cast<size_t>(words) * 8;
+        const size_t keep = rem.size() < cap ? rem.size() : cap;
         for (size_t k = 0; k < keep; ++k) {
-            must |= static_cast<uint64_t>(static_cast<uint8_t>(rem[rem.size() - 1 - k])) << (8 * k);
+            must[k / 8] |= static_cast<uint64_t>(static_cast<uint8_t>(rem[rem.size() - 1 - k])) << (8 * (k % 8));
         }
-        may = must;
+        std::copy(must.begin(), must.end(), may.begin());
     } else {
-        value_plusargs_numeric(rem, c, must, may);
+        value_plusargs_numeric(rem, c, must.data(), may.data(), words);
     }
 
-    write_word_planes(arg->mm, arg->z, arg->width, must, may, 0, (arg->flags & 1u) != 0);
+    const bool narrow = (arg->flags & 1u) != 0;
+    if (arg->width > 64) {
+        write_word_planes_wide(arg->mm, arg->z, arg->width, must.data(), may.data(), z.data(), narrow);
+    } else {
+        write_word_planes(arg->mm, arg->z, arg->width, must[0], may[0], 0, narrow);
+    }
     return 1;
 }
 

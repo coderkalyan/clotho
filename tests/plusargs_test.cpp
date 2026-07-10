@@ -237,6 +237,27 @@ TEST_CASE("$value$plusargs: hex conversion") {
     CHECK(run_capture(src, { "X=ff" }) == "255\n");
 }
 
+// A target wider than 64 bits: the plusarg value assembles multi-word (%h shift,
+// %d multiply-add). Read back through 64-bit part-selects.
+TEST_CASE("$value$plusargs into a target wider than 64 bits") {
+    const char* src = R"(
+        module m;
+            logic [127:0] a;
+            initial begin
+                void'($value$plusargs("H=%h", a));
+                $display("%h_%h", a[127:64], a[63:0]);
+                void'($value$plusargs("D=%d", a));
+                $display("%h_%h", a[127:64], a[63:0]);
+                $finish;
+            end
+        endmodule
+    )";
+    // H = the 128-bit hex verbatim; D = 2^127 = 0x8000..0000.
+    CHECK(run_capture(src, { "H=deadbeefcafebabe0123456789abcdef", "D=170141183460469231731687303715884105728" }) ==
+          "deadbeefcafebabe_0123456789abcdef\n"
+          "8000000000000000_0000000000000000\n");
+}
+
 // A written target wakes anything sensitive to it, like $sscanf's write-back.
 TEST_CASE("$value$plusargs wakes waiting processes") {
     const char* src = R"(

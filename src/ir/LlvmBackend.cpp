@@ -6572,12 +6572,6 @@ private:
                     // TODO: a part-select scan target (x[7:0]).
                     throw BackendError{ "$fscanf / $sscanf into a part-select target is not supported" };
                 }
-                if (lv.store_width > 64) {
-                    // TODO: a target wider than 64 bits (e.g. a long %s token) needs
-                    // multi-word plane assembly in the runtime scanner.
-                    throw BackendError{ "$fscanf / $sscanf into a target wider than 64 bits is not "
-                                        "supported" };
-                }
                 // A never-z target (z elision) passes a null z pointer. Flags bit0
                 // marks a narrow 2-state slot: the runtime writes only the iW value
                 // word (parsed x/z digits drop to 0 per LRM 6.3.1).
@@ -6655,11 +6649,6 @@ private:
         if (lv.width != lv.store_width) {
             // TODO: a part-select $value$plusargs target (x[7:0]).
             throw BackendError{ "$value$plusargs into a part-select target is not supported" };
-        }
-        if (lv.store_width > 64) {
-            throw BackendError{
-                "$value$plusargs into a target wider than 64 bits is not supported"
-            };
         }
 
         llvm::StructType* sty = scan_arg_struct_ty();
