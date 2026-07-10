@@ -3602,6 +3602,158 @@ private:
         return make_int_type(width, four, signd);
     }
 
+    // Whether a range bound is (possibly conversion-wrapped) the `$` literal.
+    // slang's binder wraps an UnboundedLiteral operand in an implicit Conversion
+    // to the range's common type, so the literal survives only as the
+    // innermost operand -- peel every Conversion layer to find it.
+    static bool is_unbounded_bound(const Expression& e) {
+        const Expression* cur = &e;
+        while (cur->kind == ExpressionKind::Conversion) {
+            cur = &cur->as<ConversionExpression>().operand();
+        }
+        return cur->kind == ExpressionKind::UnboundedLiteral;
+    }
+
+    // Common compare type for `case ... inside` (12.5.4). As common_case_type,
+    // but a range_list member may be a [lo:hi] ValueRangeExpression (itself
+    // typed void) instead of a plain expression, so its bound types fold in
+    // place of the range's own type. Tolerance ranges (`+/-`, `+%-`) and `$`
+    // bounds guard loudly here (TODO: LRM 11.4.13 defines both, but neither
+    // is exercised by ranged case-inside labels yet).
+    ir::Ref common_inside_type(const CaseStatement& c) {
+        if (c.expr.type->isFloating()) {
+            fail("case on a real selector is not supported");
+        }
+        uint32_t width = c.expr.type->getBitWidth();
+        bool     four  = c.expr.type->isFourState();
+        bool     signd = c.expr.type->isSigned();
+        auto     fold  = [&](const Expression& e) {
+            if (e.type->isFloating()) {
+                fail("case with a real item label is not supported");
+            }
+            width = std::max(width, e.type->getBitWidth());
+            four  = four || e.type->isFourState();
+            signd = signd && e.type->isSigned();
+        };
+        for (const CaseStatement::ItemGroup& item : c.items) {
+            for (const Expression* e : item.expressions) {
+                if (e->kind != ExpressionKind::ValueRange) {
+                    fold(*e);
+                    continue;
+                }
+                const auto& vr = e->as<ValueRangeExpression>();
+                if (vr.rangeKind != ValueRangeKind::Simple) {
+                    // TODO: absolute/relative tolerance ranges (LRM 11.4.13).
+                    fail("case ... inside tolerance ranges ('+/-' / '+%-') are not supported");
+                }
+                if (is_unbounded_bound(vr.left()) || is_unbounded_bound(vr.right())) {
+                    // TODO: `$` range bound (lowest/highest value of the selector's type).
+                    fail("case ... inside unbounded ('$') range bounds are not supported");
+                }
+                fold(vr.left());
+                fold(vr.right());
+            }
+        }
+        return make_int_type(width, four, signd);
+    }
+
+    // Predicate for one case-inside range_list member (LRM 11.4.13 / 12.5.4).
+    // A plain expression uses wildcard equality (`==?`): the case_expression is
+    // the inside operator's definite left operand, so only the label's own x/z
+    // bits are wildcards (WildEq already matches this exactly). A [lo:hi] range
+    // tests inclusive membership with Ge/Le, ANDed -- an x/z bound or selector
+    // makes the comparison ambiguous, which Land propagates as x rather than a
+    // match, and b.cond already branches to else on anything but a definite 1.
+    ir::Index lower_inside_label_pred(const Expression& label, ir::Index sel, ir::Ref ty, ir::Builder& b) {
+        if (label.kind == ExpressionKind::ValueRange) {
+            const auto&     vr = label.as<ValueRangeExpression>();
+            const ir::Index lo = b.resize(lower_expr(vr.left(), b), ty, loc(vr.left()));
+            const ir::Index hi = b.resize(lower_expr(vr.right(), b), ty, loc(vr.right()));
+            const ir::Index ge = b.binary(ir::Inst::Tag::Ge, sel, lo, loc(label));
+            const ir::Index le = b.binary(ir::Inst::Tag::Le, sel, hi, loc(label));
+            return b.binary(ir::Inst::Tag::Land, ge, le, loc(label));
+        }
+        const ir::Index val = b.resize(lower_expr(label, b), ty, loc(label));
+        return b.binary(ir::Inst::Tag::WildEq, sel, val, loc(label));
+    }
+
+    // OR of a case-inside item's range_list member predicates (12.5.4: a
+    // case_item is matched when the inside operation returns 1'b1 for any of
+    // its members). No dedup: 11.4.13 explicitly allows repeated/overlapping
+    // members, so unlike case_dedup nothing is ever dropped here.
+    ir::Index lower_inside_item_pred(const CaseStatement::ItemGroup& item, ir::Index sel, ir::Ref ty,
+                                     ir::Builder& b) {
+        ir::Index pred = lower_inside_label_pred(*item.expressions[0], sel, ty, b);
+        for (size_t j = 1; j < item.expressions.size(); j++) {
+            const Expression* e = item.expressions[j];
+            const ir::Index   one = lower_inside_label_pred(*e, sel, ty, b);
+            pred                  = b.binary(ir::Inst::Tag::Lor, pred, one, loc(*e));
+        }
+        return pred;
+    }
+
+    // Lazy first-match chain for `case ... inside`, mirroring lower_case_item:
+    // item k's range_list predicate guards its body, with the rest of the chain
+    // (eventually the default) as the else branch, so labels not yet reached
+    // are evaluated lazily.
+    void lower_case_inside_item(const CaseStatement& c, size_t k, ir::Index sel, ir::Ref ty,
+                                bool report_viol, ir::Builder& b) {
+        if (k == c.items.size()) {
+            if (c.defaultCase != nullptr) {
+                lower_stmt(*c.defaultCase, b);
+            }
+            else if (report_viol) {
+                b.case_violation(case_banner(c), 0, loc(c));
+            }
+            return;
+        }
+
+        const ir::Index pred = lower_inside_item_pred(c.items[k], sel, ty, b);
+
+        b.open_region();
+        lower_stmt(*c.items[k].stmt, b);
+        const ir::ExtraSlice then_region = b.close_region();
+
+        b.open_region();
+        lower_case_inside_item(c, k + 1, sel, ty, report_viol, b);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        b.cond(pred, then_region, else_region, loc(*c.items[k].stmt));
+    }
+
+    // Eager overlap-checked lowering for unique/unique0 `case ... inside`
+    // (mirrors lower_case_unique): every item's predicate is computed once up
+    // front and shared by emit_overlap_check and dispatch_preds.
+    void lower_case_inside_unique(const CaseStatement& c, ir::Index sel, ir::Ref ty,
+                                  bool no_match_report, ir::Builder& b) {
+        std::vector<ir::Index> preds;
+        preds.reserve(c.items.size());
+        for (const CaseStatement::ItemGroup& item : c.items) {
+            preds.push_back(lower_inside_item_pred(item, sel, ty, b));
+        }
+        emit_overlap_check(preds, case_banner(c), loc(c), b);
+        dispatch_preds(c, 0, preds, no_match_report, b);
+    }
+
+    // `case ... inside` (12.5.4): set-membership matching via the inside
+    // operator (11.4.13). Never reaches the constant-switch or one-hot fast
+    // paths (a range_list member isn't a single constant match key).
+    void lower_case_inside(const CaseStatement& c, ir::Builder& b) {
+        using Check = slang::ast::UniquePriorityCheck;
+        const bool no_match_report =
+          (c.check == Check::Priority || c.check == Check::Unique) && c.defaultCase == nullptr;
+        const bool needs_overlap = c.check == Check::Unique || c.check == Check::Unique0;
+
+        const ir::Ref   ty  = common_inside_type(c);
+        const ir::Index sel = b.resize(lower_expr(c.expr, b), ty, loc(c.expr));
+
+        if (needs_overlap) {
+            lower_case_inside_unique(c, sel, ty, no_match_report, b);
+            return;
+        }
+        lower_case_inside_item(c, 0, sel, ty, no_match_report, b);
+    }
+
     // Priority-order case dedup (LRM 12.5). The first matching case_item wins,
     // so a later label that always evaluates identically to an earlier one is
     // dead -- its body can never run. A constant label's value is fixed, so a
@@ -3891,6 +4043,10 @@ private:
             // common-type/resize machinery below is packed-only).
             fail("case statement over strings is not supported");
         }
+        if (c.condition == CaseStatementCondition::Inside) {
+            lower_case_inside(c, b);
+            return;
+        }
         ir::Inst::Tag cmp;
         switch (c.condition) {
             case CaseStatementCondition::Normal:
@@ -3903,7 +4059,7 @@ private:
                 cmp = ir::Inst::Tag::CasexEq;
                 break;
             default:
-                fail("case ... inside is not supported");
+                fail("unsupported case condition");  // unreachable: Inside handled above.
         }
         // unique / unique0 / priority (c.check) add the LRM 12.5.3 violation
         // checks; first-match execution is conforming for all of them.

@@ -961,3 +961,168 @@ TEST_CASE("unique if: a final else suppresses the no-match report") {
     CHECK(run_capture_stderr(src).empty());
     CHECK(run_capture(src) == "d\n");
 }
+
+// -- case ... inside (LRM 12.5.4 / 11.4.13) --
+
+// The LRM 12.5.4 worked example verbatim: a wildcard singular label (3'b0?0)
+// and a [4:7] range share one item; every 3-bit value is covered.
+TEST_CASE("case inside: LRM 12.5.4 worked example") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [2:0] status;
+            initial begin
+                for (int i = 0; i < 8; i++) begin
+                    status = i[2:0];
+                    priority case (status) inside
+                        1, 3:          $display("task1");
+                        3'b0?0, [4:7]: $display("task2");
+                    endcase
+                end
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "task2\ntask1\ntask2\ntask1\ntask2\ntask2\ntask2\ntask2\n");
+    CHECK(run_capture_stderr(src).empty());
+}
+
+// A singular label uses wildcard equality (11.4.13): the selector's own x/z
+// bits are never wildcards, but a z/? in the label is (2'b1z matches 2'd3,
+// not the selector's own x/z).
+TEST_CASE("case inside: singular label wildcard-matches selector, not vice versa") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [1:0] sel;
+            initial begin
+                sel = 2'd3;
+                case (sel) inside
+                    2'b1z: $display("hit");
+                    default: $display("miss");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "hit\n");
+}
+
+// A [lo:hi] range tests inclusive membership via relational (not wildcard)
+// comparison, so a negative signed selector is handled correctly too.
+TEST_CASE("case inside: signed range membership") {
+    constexpr std::string_view src = R"(
+        module m;
+            int x;
+            initial begin
+                x = -3;
+                case (x) inside
+                    [-5:5]:  $display("in");
+                    default: $display("out");
+                endcase
+                x = 7;
+                case (x) inside
+                    [-5:5]:  $display("in");
+                    default: $display("out");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "in\nout\n");
+}
+
+// 11.4.13: only a label's own x/z is a wildcard, so an x/z selector never
+// matches any singular or range member -- a default-less priority case
+// reports no-match exactly on the LRM's own cited failing values.
+TEST_CASE("case inside: an x/z selector reports no-match (LRM 12.5.4 note)") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [2:0] status;
+            initial begin
+                status = 3'b00x;
+                priority case (status) inside
+                    1, 3:          $display("task1");
+                    3'b0?0, [4:7]: $display("task2");
+                endcase
+                status = 3'bxxx;
+                priority case (status) inside
+                    1, 3:          $display("task1");
+                    3'b0?0, [4:7]: $display("task2");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src).empty());
+    CHECK(count_occ(run_capture_stderr(src), "no condition is true") == 2);
+}
+
+// unique case inside: two items overlapping on the same value is a reportable
+// violation, but first-match execution still runs the earlier item.
+TEST_CASE("unique case inside: overlapping range and label report and run the first") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [2:0] status;
+            initial begin
+                status = 3'd5;
+                unique case (status) inside
+                    [0:5]: $display("A");
+                    5, 7:  $display("B");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).find("not unique") != std::string::npos);
+    CHECK(run_capture(src) == "A\n");
+}
+
+// Repeated/overlapping members within one item are explicitly legal (11.4.13)
+// and never a violation -- only a match across DIFFERENT items is an overlap.
+TEST_CASE("unique case inside: overlapping members of the same item is not a violation") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [2:0] status;
+            initial begin
+                status = 3'd5;
+                unique case (status) inside
+                    [0:5], 5: $display("A");
+                    6, 7:     $display("B");
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).empty());
+    CHECK(run_capture(src) == "A\n");
+}
+
+// A range with a tolerance bound (LRM 11.4.13's `+/-` / `+%-`) is a documented
+// gap -- guarded loudly rather than silently mis-simulated.
+TEST_CASE("case inside: tolerance range bound is reported as unsupported") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            int x;
+            initial begin
+                x = 5;
+                case (x) inside
+                    [3 +/- 2]: $display("hit");
+                    default:   $display("miss");
+                endcase
+            end
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+}
+
+// An unbounded (`$`) range bound is likewise a documented gap.
+TEST_CASE("case inside: unbounded range bound is reported as unsupported") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            int x;
+            initial begin
+                x = 5;
+                case (x) inside
+                    [$:10]:  $display("hit");
+                    default: $display("miss");
+                endcase
+            end
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("unbounded") != std::string::npos);
+}

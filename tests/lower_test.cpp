@@ -272,20 +272,6 @@ TEST_CASE("$timeformat with a non-literal suffix is reported as unsupported") {
     CHECK(r.diagnostics.find("suffix must be a string literal") != std::string::npos);
 }
 
-TEST_CASE("case inside is reported as unsupported") {
-    const LowerResult ri = lower_text(R"(
-        module m(input [2:0] s, output reg x);
-            always @(*)
-                case (s) inside
-                    [0:3]: x = 1'b1;
-                    default: x = 1'b0;
-                endcase
-        endmodule
-    )");
-    CHECK_FALSE(ri.ok);
-    CHECK(ri.diagnostics.find("inside") != std::string::npos);
-}
-
 // A `final` block lowers to a run-once end-of-sim process (LRM 9.2.3), scheduled
 // separately from initial/always (the backend runs it on the exit paths).
 TEST_CASE("final block lowers to a Final-activation process") {
