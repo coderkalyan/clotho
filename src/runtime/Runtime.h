@@ -231,6 +231,29 @@ void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8
 
 int32_t rt_random(void);
 
+// -- Plusargs (LRM §21.6) --
+//
+// Command-line arguments prefixed with `+` (everything after the leading `+`
+// dropped), in the order given on Clotho's own command line. Populated once
+// by the host before the design runs; the backing storage must outlive the
+// run. Not thread-safe (matches the single-simulator-per-process model
+// elsewhere in the runtime, e.g. $random / the file table).
+void rt_plusargs_init(const char* const* args, const uint32_t* lens, uint32_t n);
+
+// $test$plusargs(str) (LRM §21.6): search the plusargs in order; -> nonzero
+// iff some plusarg's prefix matches every character of `s` (`len` bytes).
+int32_t rt_test_plusargs(const char* s, uint32_t len);
+
+// $value$plusargs(user_string, var) (LRM §21.6): `prefix`/`prefix_len` are
+// the plusarg_string portion of user_string (a compile-time literal); `conv`
+// is the format character ('d'/'o'/'b'/'h'/'s'). Searches the plusargs in
+// order for one whose prefix matches `prefix`; on a match, converts its
+// remainder per `conv` into `arg` (zero-padded / truncated to `arg->width`,
+// a negative value always truncates, an illegal character writes 'bx) and
+// returns nonzero. On no match, `arg` is left untouched and the function
+// returns 0.
+int32_t rt_value_plusargs(const char* prefix, uint32_t prefix_len, uint32_t conv, const rt_scan_arg* arg);
+
 // -- Deferred nonblocking writes to unpacked-array elements --
 //
 // A synchronous memory write `mem[i] <= rhs` cannot use the per-signal NBA shadow

@@ -1584,6 +1584,120 @@ extern "C" int32_t rt_random(void) {
     return static_cast<int32_t>(i);
 }
 
+namespace {
+
+// The command-line plusarg list (LRM §21.6), threaded from the host before
+// the design runs. Process-global, like g_random_seed above — matches the
+// single-simulator-per-process model.
+std::vector<std::string> g_plusargs;
+
+// LRM §21.6: "If the prefix of one of the supplied plusargs matches all
+// characters in the provided string" — `query` must be a prefix of the
+// plusarg, and plusargs are searched in the order given.
+const std::string* find_plusarg(std::string_view query) {
+    for (const std::string& pa : g_plusargs) {
+        if (pa.size() >= query.size() && std::string_view(pa).substr(0, query.size()) == query) {
+            return &pa;
+        }
+    }
+    return nullptr;
+}
+
+} // namespace
+
+extern "C" void rt_plusargs_init(const char* const* args, const uint32_t* lens, uint32_t n) {
+    g_plusargs.clear();
+    g_plusargs.reserve(n);
+    for (uint32_t k = 0; k < n; ++k) {
+        g_plusargs.emplace_back(args[k], lens[k]);
+    }
+}
+
+extern "C" int32_t rt_test_plusargs(const char* s, uint32_t len) {
+    return find_plusarg(std::string_view(s, len)) != nullptr ? 1 : 0;
+}
+
+namespace {
+
+// Convert a $value$plusargs remainder string into must/may bits per `conv`
+// (z is always 0 — LRM §21.6 writes an all-unknown result as 'bx, never a z
+// bit). Unlike $sscanf, which stops at the first bad character, every
+// character in `rem` must be legal or the whole result is 'bx.
+void value_plusargs_numeric(std::string_view rem, char conv, uint64_t& must, uint64_t& may) {
+    must = may = 0;
+    if (rem.empty()) {
+        return; // LRM: no remaining string -> store zero.
+    }
+    const int base = conv == 'd' ? 10 : conv == 'o' ? 8 : conv == 'b' ? 2 : 16;
+    size_t    i    = 0;
+    bool      neg  = false;
+    if (base == 10 && (rem[0] == '-' || rem[0] == '+')) {
+        neg = rem[0] == '-';
+        i   = 1;
+    }
+    if (i >= rem.size()) {
+        // Bare sign, no digits: illegal -> 'bx (VPI: must=0, may=all-1, z=0).
+        must = 0;
+        may  = ~uint64_t{ 0 };
+        return;
+    }
+    uint64_t val = 0;
+    for (; i < rem.size(); ++i) {
+        int        hv;
+        const char c = rem[i];
+        if (base == 10) {
+            hv = (c >= '0' && c <= '9') ? c - '0' : -1;
+        } else if (base == 8) {
+            hv = (c >= '0' && c <= '7') ? c - '0' : -1;
+        } else if (base == 2) {
+            hv = (c == '0' || c == '1') ? c - '0' : -1;
+        } else {
+            hv = hex_digit(c);
+        }
+        if (hv < 0) {
+            // Illegal character: whole result 'bx (VPI: must=0, may=all-1, z=0).
+            must = 0;
+            may  = ~uint64_t{ 0 };
+            return;
+        }
+        val = val * static_cast<uint64_t>(base) + static_cast<uint64_t>(hv);
+    }
+    if (neg) {
+        val = static_cast<uint64_t>(-static_cast<int64_t>(val));
+    }
+    must = may = val;
+}
+
+} // namespace
+
+extern "C" int32_t
+rt_value_plusargs(const char* prefix, uint32_t prefix_len, uint32_t conv, const rt_scan_arg* arg) {
+    const std::string* pa = find_plusarg(std::string_view(prefix, prefix_len));
+    if (pa == nullptr) {
+        return 0;
+    }
+    const std::string_view rem(pa->data() + prefix_len, pa->size() - prefix_len);
+    const char              c = static_cast<char>(conv);
+
+    uint64_t must = 0;
+    uint64_t may  = 0;
+    if (c == 's') {
+        // Right-justify the remainder bytes (byte 0 = last char), like
+        // $sscanf's %s — capped at 8 bytes; wider targets are guarded by the
+        // backend (rt_scan_arg::width <= 64).
+        const size_t keep = rem.size() < 8 ? rem.size() : 8;
+        for (size_t k = 0; k < keep; ++k) {
+            must |= static_cast<uint64_t>(static_cast<uint8_t>(rem[rem.size() - 1 - k])) << (8 * k);
+        }
+        may = must;
+    } else {
+        value_plusargs_numeric(rem, c, must, may);
+    }
+
+    write_word_planes(arg->mm, arg->z, arg->width, must, may, 0, (arg->flags & 1u) != 0);
+    return 1;
+}
+
 extern "C" void rt_string_init(rt_string* s) {
     s->storage[31] = str_inline_cap; // Inline form, length 0.
 }

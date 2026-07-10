@@ -245,6 +245,10 @@ const char* tag_name(Inst::Tag tag) {
             return "clog2";
         case T::CountBits:
             return "count_bits";
+        case T::TestPlusArgs:
+            return "test_plusargs";
+        case T::ValuePlusArgs:
+            return "value_plusargs";
         case T::Ctz:
             return "ctz";
         case T::Clz:
@@ -447,6 +451,11 @@ private:
                 os_ << " x" << p.repl.count;
                 break;
             case Inst::PayloadKind::Extra: {
+                if (tag == Inst::Tag::TestPlusArgs) {
+                    const auto info = ir_.extra_data<TestPlusArgsInfo>(p.extra);
+                    os_ << '"' << ir_.extra_bytes(info.str, info.str_len) << '"';
+                    break;
+                }
                 // concat: variadic operands.
                 const auto parts = ir_.region(ir_.extra_data<ExtraSlice>(p.extra));
                 for (size_t k = 0; k < parts.size(); ++k) {
@@ -628,6 +637,13 @@ private:
                 os_ << "\n";
                 indent(depth);
                 os_ << "}\n";
+                break;
+            }
+            case Inst::Tag::ValuePlusArgs: {
+                const auto info = ir_.extra_data<ValuePlusArgsInfo>(p.op_extra.extra);
+                ref(p.op_extra.op);
+                os_ << ", \"" << ir_.extra_bytes(info.prefix, info.prefix_len) << "%"
+                    << static_cast<char>(info.conv) << "\")\n";
                 break;
             }
             default:

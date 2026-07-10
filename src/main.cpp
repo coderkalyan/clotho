@@ -14,7 +14,7 @@
 // then JIT-compile and run it (default), or emit the process IR / LLVM IR for
 // debugging. All compiler logic lives in libclotho / libclotho_ir.
 //
-// Usage: clotho [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] [--no-thunk] [--domain-spec] [-O] [--perf-jitdump] [-o <out>] <file.sv>...
+// Usage: clotho [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] [--no-thunk] [--domain-spec] [-O] [--perf-jitdump] [-o <out>] <file.sv>... [+plusarg...]
 // Multiple source files are compiled together into one design (shared name
 // space, LRM 3.12), parsed in the order given.
 // `llvm` emits the backend's raw IR before the coroutine-lowering pipeline runs
@@ -24,6 +24,7 @@ int main(int argc, char** argv) {
     std::string_view              emit = "run";
     std::string_view              out;
     std::vector<std::string_view> inputs;
+    std::vector<std::string_view> plusargs;
     bool                          time = false;
     clotho::ir::SimulationConfig  config;
 
@@ -49,6 +50,11 @@ int main(int argc, char** argv) {
             config.perf_jitdump = true;
         } else if (arg == "-o" && i + 1 < argc) {
             out = argv[++i];
+        } else if (arg.starts_with("+")) {
+            // A plusarg (LRM §21.6): made available to $test$plusargs /
+            // $value$plusargs, in order, with the leading `+` stripped. Not a
+            // design source or a Clotho option.
+            plusargs.push_back(arg.substr(1));
         } else if (!arg.starts_with("-")) {
             inputs.push_back(arg);
         } else {
@@ -59,7 +65,7 @@ int main(int argc, char** argv) {
 
     if (inputs.empty() || (emit != "run" && emit != "ir" && emit != "llvm" && emit != "opt")) {
         std::println(stderr,
-                     "usage: {} [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] [--no-thunk] [--domain-spec] [-O] [--perf-jitdump] [-o <out>] <file.sv>...",
+                     "usage: {} [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] [--no-thunk] [--domain-spec] [-O] [--perf-jitdump] [-o <out>] <file.sv>... [+plusarg...]",
                      argv[0]);
         return 2;
     }
@@ -94,7 +100,7 @@ int main(int argc, char** argv) {
     }
 
     if (emit == "run") {
-        const int rc = clotho::ir::run_jit(*result.module, tp, config);
+        const int rc = clotho::ir::run_jit(*result.module, tp, config, plusargs);
         report();
         return rc;
     }

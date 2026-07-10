@@ -1,6 +1,7 @@
 #include "Lower.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -3119,10 +3120,11 @@ private:
         }
         if (name == "$fgets" || name == "$fgetc" || name == "$ungetc" || name == "$feof" ||
             name == "$ftell" || name == "$fseek" || name == "$rewind" || name == "$ferror" ||
-            name == "$fscanf" || name == "$sscanf" || name == "$fread") {
-            // File read / positioning / error / scan functions used in statement
-            // position: lower for the side effect (file position, write-back) and
-            // drop the result.
+            name == "$fscanf" || name == "$sscanf" || name == "$fread" ||
+            name == "$test$plusargs" || name == "$value$plusargs") {
+            // File read / positioning / error / scan functions, and plusargs,
+            // used in statement position: lower for the side effect (file
+            // position, write-back) and drop the result.
             lower_sysfunc(call, b);
             return;
         }
@@ -3851,6 +3853,77 @@ private:
         // $fscanf(fd, fmt, args) / $sscanf(str, fmt, args) (LRM §21.3.4).
         if (name == "$fscanf" || name == "$sscanf") {
             return lower_scanf(call, name == "$sscanf", b, l);
+        }
+
+        // $test$plusargs(str) (LRM §21.6): nonzero iff a command-line plusarg's
+        // prefix matches `str`. `str` must be a compile-time string literal for
+        // now (a runtime / integral-variable string argument, which the LRM
+        // also allows, is a documented gap — matches $fscanf/$sscanf's own
+        // literal-format-string requirement above).
+        if (name == "$test$plusargs") {
+            const auto args = call.arguments();
+            if (args.size() != 1) {
+                fail("$test$plusargs expects one argument");
+            }
+            const Expression* e = args[0];
+            while (e->kind == ExpressionKind::Conversion) {
+                e = &e->as<ConversionExpression>().operand();
+            }
+            if (e->kind != ExpressionKind::StringLiteral) {
+                // TODO: a runtime (non-literal) plusarg-string argument.
+                fail("$test$plusargs argument must be a string literal");
+            }
+            return b.test_plusargs(e->as<StringLiteral>().getValue(), l);
+        }
+
+        // $value$plusargs(user_string, var) (LRM §21.6). `user_string` must be
+        // a compile-time string literal of the form "plusarg_string%[0-9]*conv"
+        // for now (a runtime user_string, which the LRM's own ieee1364_example
+        // exercises via a `pstring` variable, is a documented gap). Supported
+        // conversions: d/o/b/h/x/s; %e/%f/%g need real support (the same gap
+        // as $fscanf/$sscanf's own %f/%e/%g, see count_scan_conversions).
+        if (name == "$value$plusargs") {
+            const auto args = call.arguments();
+            if (args.size() != 2) {
+                fail("$value$plusargs expects two arguments (user_string, var)");
+            }
+            const Expression* e = args[0];
+            while (e->kind == ExpressionKind::Conversion) {
+                e = &e->as<ConversionExpression>().operand();
+            }
+            if (e->kind != ExpressionKind::StringLiteral) {
+                // TODO: a runtime (non-literal) user_string argument.
+                fail("$value$plusargs user_string must be a string literal");
+            }
+            const std::string_view us  = e->as<StringLiteral>().getValue();
+            const size_t            pct = us.rfind('%');
+            if (pct == std::string_view::npos) {
+                fail("$value$plusargs user_string must end in a %conversion");
+            }
+            size_t i = pct + 1;
+            while (i < us.size() && us[i] >= '0' && us[i] <= '9') {
+                ++i; // "leading 0 forms" (LRM §21.6) — no width semantics here.
+            }
+            if (i >= us.size() || i + 1 != us.size()) {
+                fail("$value$plusargs user_string must end in a %[0-9]*<conv>");
+            }
+            const char conv =
+              static_cast<char>(std::tolower(static_cast<unsigned char>(us[i])));
+            switch (conv) {
+                case 'd':
+                case 'o':
+                case 'b':
+                case 'h':
+                case 'x':
+                case 's':
+                    break;
+                default:
+                    // TODO: %e/%f/%g need real support.
+                    fail(std::string("$value$plusargs conversion %") + us[i] + " is not supported");
+            }
+            const std::string_view prefix = us.substr(0, pct);
+            const ir::Index        dst    = lower_lvalue(*args[1], b);
+            return b.value_plusargs(dst, prefix, conv, l);
         }
 
         // $sformatf(fmt, args) (LRM §21.3.3): format into a new string value.

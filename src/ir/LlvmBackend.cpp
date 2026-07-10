@@ -4689,6 +4689,10 @@ private:
             case Inst::Tag::FreadMem:
                 // The file read / positioning / error / scan functions return i32.
                 return { 32, false, true };
+            case Inst::Tag::TestPlusArgs:
+            case Inst::Tag::ValuePlusArgs:
+                // LRM §21.6: an always-known (never x/z) boolean 'int'.
+                return { 32, false, true };
 
             case Inst::Tag::Add:
             case Inst::Tag::Sub:
@@ -5573,6 +5577,14 @@ private:
 
             case Inst::Tag::Scanf:
                 lower_scanf(i);
+                return;
+
+            case Inst::Tag::TestPlusArgs:
+                lower_test_plusargs(i);
+                return;
+
+            case Inst::Tag::ValuePlusArgs:
+                lower_value_plusargs(i);
                 return;
 
             case Inst::Tag::FreadWord:
@@ -6595,6 +6607,77 @@ private:
         for (uint32_t k = 0; k < n; ++k) {
             service_after_write(lvalue_of(outs[k]), olds[k]);
         }
+        set_value(i, packed(r, r, zero(32)));
+    }
+
+    // i32 rt_test_plusargs(const char* s, i32 len)
+    llvm::FunctionCallee test_plusargs_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(i32, { ptr, i32 }, false);
+        return llmod_.getOrInsertFunction("rt_test_plusargs", fnty);
+    }
+
+    // Lower $test$plusargs(str): the query string is a compile-time literal
+    // (frontend-checked), so its bytes go straight to the runtime scan.
+    void lower_test_plusargs(Index i) {
+        const auto        info = ir_->extra_data<TestPlusArgsInfo>(ir_->payload(i).extra);
+        const std::string str  = ir_->extra_bytes(info.str, info.str_len);
+        llvm::Value*       str_ptr = b_.CreateGlobalString(str);
+        llvm::Value*       r       = b_.CreateCall(
+          test_plusargs_fn(), { str_ptr, b_.getInt32(static_cast<uint32_t>(str.size())) });
+        set_value(i, packed(r, r, zero(32)));
+    }
+
+    // i32 rt_value_plusargs(const char* prefix, i32 prefix_len, i32 conv, const rt_scan_arg* arg)
+    llvm::FunctionCallee value_plusargs_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(i32, { ptr, i32, i32, ptr }, false);
+        return llmod_.getOrInsertFunction("rt_value_plusargs", fnty);
+    }
+
+    // Lower $value$plusargs(user_string, var): build a single rt_scan_arg
+    // descriptor for the output lvalue (as lower_scanf does per conversion),
+    // then call the runtime with the compile-time-literal prefix + format
+    // char. The target must be whole-storage and <=64 bits, like a scanf
+    // target.
+    void lower_value_plusargs(Index i) {
+        const Index dst  = ir_->payload(i).op_extra.op;
+        const auto  info = ir_->extra_data<ValuePlusArgsInfo>(ir_->payload(i).op_extra.extra);
+        const std::string prefix = ir_->extra_bytes(info.prefix, info.prefix_len);
+
+        const LValue& lv = lvalue_of(dst);
+        if (lv.is_string) {
+            // TODO: $value$plusargs into a dynamic string object.
+            throw BackendError{ "$value$plusargs into a string object is not supported" };
+        }
+        if (lv.width != lv.store_width) {
+            // TODO: a part-select $value$plusargs target (x[7:0]).
+            throw BackendError{ "$value$plusargs into a part-select target is not supported" };
+        }
+        if (lv.store_width > 64) {
+            throw BackendError{
+                "$value$plusargs into a target wider than 64 bits is not supported"
+            };
+        }
+
+        llvm::StructType* sty = scan_arg_struct_ty();
+        llvm::Value*      arg = b_.CreateAlloca(sty, nullptr, "plusarg_val");
+        llvm::Value*       mm = lv_mm_ptr(lv);
+        llvm::Value*       z  = lv.has_z ? lv_z_ptr(lv)
+                                         : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+        b_.CreateStore(mm, b_.CreateStructGEP(sty, arg, 0));
+        b_.CreateStore(z, b_.CreateStructGEP(sty, arg, 1));
+        b_.CreateStore(b_.getInt32(lv.store_width), b_.CreateStructGEP(sty, arg, 2));
+        b_.CreateStore(b_.getInt32(lv.narrow ? 1u : 0u), b_.CreateStructGEP(sty, arg, 3));
+
+        const ServiceSnapshot old        = service_snapshot(lv);
+        llvm::Value*          prefix_ptr = b_.CreateGlobalString(prefix);
+        llvm::Value*           r          = b_.CreateCall(
+          value_plusargs_fn(),
+          { prefix_ptr, b_.getInt32(static_cast<uint32_t>(prefix.size())), b_.getInt32(info.conv), arg });
+        service_after_write(lv, old);
         set_value(i, packed(r, r, zero(32)));
     }
 

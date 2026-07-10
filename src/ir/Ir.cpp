@@ -127,6 +127,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::None;
         case T::Finish:
         case T::CaseViol:
+        case T::TestPlusArgs:
             return K::Extra;
         case T::Wait:
             return K::Wait;
@@ -148,6 +149,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::StrSubstr:
         case T::EnumName:
         case T::CountBits:
+        case T::ValuePlusArgs:
             return K::OpExtra;
     }
 
@@ -201,8 +203,10 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
             // loop: its predicate and regions are not top-level SSA operands
             // (the predicate lives inside the cond region, walked via region()).
             // finish: its FinishInfo carries only the diag level and banner bytes,
-            // no SSA operands.
-            if (tag == Inst::Tag::Loop || tag == Inst::Tag::Finish) {
+            // no SSA operands. test_plusargs: its TestPlusArgsInfo carries only
+            // the query-string bytes, no SSA operands.
+            if (tag == Inst::Tag::Loop || tag == Inst::Tag::Finish ||
+                tag == Inst::Tag::TestPlusArgs) {
                 return {};
             }
             // concat: variadic operands live in the extra buffer.

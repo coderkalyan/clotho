@@ -196,6 +196,14 @@ public:
     Index sim_time(uint64_t scale, SourceLoc loc);
     // $random: a 32-bit signed PRNG draw. No operands.
     Index random(SourceLoc loc);
+    // $test$plusargs(str): nonzero iff a command-line plusarg's prefix matches
+    // `str`. No SSA operands.
+    Index test_plusargs(std::string_view str, SourceLoc loc);
+    // $value$plusargs(user_string, var): on a matching plusarg, convert its
+    // remainder per `conv` ('d'/'o'/'b'/'h'/'s') into the output lvalue `dst`
+    // and yield nonzero; otherwise leave `dst` untouched and yield 0. `prefix`
+    // is the plusarg_string portion of user_string.
+    Index value_plusargs(Index dst, std::string_view prefix, char conv, SourceLoc loc);
 
     // -- Regions --
     // Begin a nested region; subsequent emits accumulate into it until closed.

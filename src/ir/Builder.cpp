@@ -375,4 +375,17 @@ Index Builder::random(SourceLoc loc) {
     return emit({ Inst::Tag::Random, Inst::Payload{ .none = 0 } }, loc);
 }
 
+Index Builder::test_plusargs(std::string_view str, SourceLoc loc) {
+    const ExtraIndex str_at = add_bytes(str);
+    const ExtraIndex extra  = add_extra(TestPlusArgsInfo{ str_at, static_cast<uint32_t>(str.size()) });
+    return emit({ Inst::Tag::TestPlusArgs, Inst::Payload{ .extra = extra } }, loc);
+}
+
+Index Builder::value_plusargs(Index dst, std::string_view prefix, char conv, SourceLoc loc) {
+    const ExtraIndex prefix_at = add_bytes(prefix);
+    const ExtraIndex extra     = add_extra(
+      ValuePlusArgsInfo{ prefix_at, static_cast<uint32_t>(prefix.size()), static_cast<uint32_t>(conv) });
+    return emit({ Inst::Tag::ValuePlusArgs, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+}
+
 } // namespace clotho::ir

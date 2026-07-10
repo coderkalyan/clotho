@@ -407,6 +407,12 @@ struct Analysis {
                 case Inst::Tag::Ferror:
                 case Inst::Tag::FreadWord:
                 case Inst::Tag::FreadMem:
+                // $test$plusargs never writes a signal. $value$plusargs writes
+                // its target from clean ASCII digits, or 'bx on an illegal
+                // character (LRM §21.6 says "'bx", never z) — a 4-state
+                // target's z plane is always zero.
+                case Inst::Tag::TestPlusArgs:
+                case Inst::Tag::ValuePlusArgs:
                     break;
             }
         }

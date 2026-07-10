@@ -418,6 +418,31 @@ struct FreadMemInfo {
     uint32_t has_count;
 };
 
+// Extra payload for `test_plusargs`: $test$plusargs(str) (LRM §21.6). `str` is
+// the packed query-string bytes (a compile-time-literal argument; a runtime
+// string operand is a documented gap, see Lower.cpp).
+struct TestPlusArgsInfo {
+    // First extra word of the packed query-string bytes.
+    ExtraIndex str;
+    // Query-string length in bytes.
+    uint32_t str_len;
+};
+
+// Extra payload for `value_plusargs`: $value$plusargs(user_string, var) (LRM
+// §21.6). `prefix` is the plusarg_string portion of user_string (everything
+// before the trailing `%conv`); `conv` is the lowercase format character
+// (d/o/b/h/s — e/f/g are a documented gap, real conversion needs the same
+// ASCII->real scan $fscanf/$sscanf's own %f/%e/%g gap needs). The
+// instruction's `op` (in the enclosing op_extra payload) is the output lvalue.
+struct ValuePlusArgsInfo {
+    // First extra word of the packed plusarg_string prefix bytes.
+    ExtraIndex prefix;
+    // Prefix length in bytes.
+    uint32_t prefix_len;
+    // Lowercase format conversion character ('d'/'o'/'b'/'h'/'s').
+    uint32_t conv;
+};
+
 // Extra payload for `timeformat`: a $timeformat system task. `units`,
 // `precision`, and `min_width` are value operands (general runtime rvalues); the
 // suffix string is appended after the formatted number and lives packed
@@ -538,6 +563,8 @@ static_assert(ExtraPayload<StrSubstrInfo>);
 static_assert(ExtraPayload<EnumNameEntry>);
 static_assert(ExtraPayload<EnumNameInfo>);
 static_assert(ExtraPayload<CountBitsInfo>);
+static_assert(ExtraPayload<TestPlusArgsInfo>);
+static_assert(ExtraPayload<ValuePlusArgsInfo>);
 
 struct Inst {
     enum class Tag : uint8_t {
@@ -906,6 +933,18 @@ struct Inst {
         // one-hot forms compare `CountBits(CountOne)` against 1. A constant
         // operand folds in slang and never reaches this tag.
         CountBits,
+        // $test$plusargs(str) (payload: extra -> TestPlusArgsInfo), -> a 1-bit
+        // definite boolean. LRM §21.6: nonzero iff some command-line plusarg's
+        // prefix matches every character of `str`. Lowers to an
+        // rt_test_plusargs call.
+        TestPlusArgs,
+        // $value$plusargs(user_string, var) (payload: op_extra ->
+        // ValuePlusArgsInfo; op is the output lvalue), -> a 1-bit definite
+        // boolean. LRM §21.6: on a matching plusarg, converts its remainder per
+        // the user_string's format character into the lvalue and returns
+        // nonzero; otherwise leaves the lvalue untouched and returns 0. Lowers
+        // to an rt_value_plusargs call.
+        ValuePlusArgs,
     };
 
     // Which union member a tag activates. Drives payload_kind() / operands().
