@@ -918,6 +918,9 @@ private:
                     if (m.kind == SymbolKind::Net) {
                         const NetSymbol& net = m.as<NetSymbol>();
                         // Only single-driver, z-defaulting net kinds are modeled.
+                        // uwire (LRM 6.6.7) is complete, not a partial stub: its
+                        // single-driver mandate is enforced by slang's analysis
+                        // pass (MultipleUWireDrivers), which runs before lowering.
                         // TODO: wand/wor/tri0/tri1/trireg/supply0/supply1 carry
                         // resolution, pull, or charge semantics (and different
                         // undriven defaults) clotho does not implement.
