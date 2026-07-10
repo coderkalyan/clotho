@@ -4743,19 +4743,18 @@ private:
             return true_const(b, l);
         }
         if (a.isNonBlocking() && nba_target_is_struct_member(a.left())) {
-            if (expr_has_element_select(a.left())) {
-                // TODO: nonblocking assignment through a runtime array index into
-                // an aggregate (arr[i] <= .., x.mem[i] <= ..) — the target leaf's
-                // address is not compile-time, so the block-commit shadow cannot
-                // hold it; needs the deferred path (docs/design/unpacked-struct.md).
-                fail("nonblocking assignment through a runtime array index into an "
-                     "aggregate is not supported");
-            }
-            // A whole-member NBA (`x.f <= v`, or nested `x.a.b <= v`) is a static
-            // leaf; a bit/part select into a member (`x.f[3:0] <= v`) is a partial
-            // write the leaf shadow cannot express.
-            if (a.left().kind != ExpressionKind::MemberAccess) {
-                fail("nonblocking assignment to part of an unpacked struct member is not "
+            // Whole-member / whole-array-element NBA into an aggregate (`x.f <= v`,
+            // nested `x.a.b <= v`, `arr[i].f <= v`, `x.mem[i] <= v`) is supported.
+            // A bit/part select landing on an aggregate leaf (`x.f[3:0] <= v`,
+            // `arr[i].f[2] <= v`) is a partial write neither the static shadow nor
+            // the whole-leaf deferred record stages.
+            const Expression& top = a.left();
+            const bool        partial =
+              top.kind == ExpressionKind::RangeSelect ||
+              (top.kind == ExpressionKind::ElementSelect &&
+               !top.as<ElementSelectExpression>().value().type->getCanonicalType().isUnpackedArray());
+            if (partial) {
+                fail("nonblocking assignment to part of an unpacked-struct-member leaf is not "
                      "supported");
             }
         }

@@ -376,8 +376,7 @@ TEST_CASE("nonblocking write to part of a struct member is guarded (Stage 2)") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("nonblocking assignment to part of an unpacked struct member") !=
-          std::string::npos);
+    CHECK(r.diagnostics.find("part of an unpacked-struct-member leaf") != std::string::npos);
 }
 
 TEST_CASE("array of unpacked struct: runtime-indexed member access") {
@@ -510,17 +509,56 @@ TEST_CASE("nested unpacked struct equality (x-propagating)") {
     )") == "1\n0\n");
 }
 
-TEST_CASE("nonblocking write through a runtime array index into an aggregate is guarded") {
-    const LowerResult r = lower_text(R"(
+TEST_CASE("runtime-indexed register file of structs (deferred NBA)") {
+    CHECK(run_capture(R"(
         module m;
-            typedef struct { logic [7:0] a; } s_t;
-            s_t arr [0:3];
-            logic clk;
-            always @(posedge clk) arr[1].a <= 8'h1;
+            typedef struct { logic [7:0] a; logic [7:0] b; } s_t;
+            s_t rf [0:3];
+            logic clk; logic [1:0] wa;
+            initial begin
+                clk = 0; wa = 2'd0;
+                for (int i = 0; i < 4; i++) begin rf[i].a = 8'd0; rf[i].b = 8'd0; end
+                wa = 2'd2; #1 clk = 1; #1 clk = 0;
+                wa = 2'd1; #1 clk = 1; #1 clk = 0; #1;
+                $display("%0d %0d %0d %0d", rf[0].a, rf[1].a, rf[2].a, rf[3].a);
+            end
+            always @(posedge clk) rf[wa].a <= rf[wa].a + 8'd7;
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("runtime array index into an aggregate") != std::string::npos);
+    )") == "0 7 7 0\n");
+}
+
+TEST_CASE("whole struct-array element nonblocking assignment") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t arr [0:2]; s_t src;
+            logic clk;
+            initial begin
+                clk = 0; src.a = 8'hDD; src.b = 4'h6; arr[1].a = 8'h11; arr[1].b = 4'h1;
+                #1 clk = 1; #1 clk = 0; #1;
+                $display("%h %h", arr[1].a, arr[1].b);
+            end
+            always @(posedge clk) arr[1] <= src;
+        endmodule
+    )") == "dd 6\n");
+}
+
+TEST_CASE("runtime-indexed nonblocking write into a struct array member") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] mem [0:3]; logic [7:0] tag; } s_t;
+            s_t w;
+            logic clk; logic [1:0] idx;
+            initial begin
+                clk = 0; idx = 2'd0;
+                for (int i = 0; i < 4; i++) w.mem[i] = 8'd0;
+                w.tag = 8'd9;
+                idx = 2'd3; #1 clk = 1; #1 clk = 0; #1;
+                $display("%0d %0d %0d", w.mem[3], w.mem[0], w.tag);
+            end
+            always @(posedge clk) w.mem[idx] <= 8'd88;
+        endmodule
+    )") == "88 0 9\n");
 }
 
 TEST_CASE("whole-object copy of an aggregate with an array member is guarded") {

@@ -881,15 +881,18 @@ private:
                     continue;
                 }
                 // An aggregate target shadows each static leaf's mm (and z, for a
-                // 4-state leaf) plane. The commit selects leaves by the block's
-                // static-leaf-set mask.
-                if (slot.nba_agg) {
-                    for (AggLeaf& m : slot.static_leaves) {
-                        m.sh_mm_field = static_cast<uint32_t>(sf.size());
-                        sf.push_back(int_ty(m.narrow ? m.width : 2 * m.width));
-                        if (m.has_z) {
-                            m.sh_z_field = static_cast<uint32_t>(sf.size());
-                            sf.push_back(int_ty(m.width));
+                // 4-state leaf) plane; the commit selects leaves by the block's
+                // static-leaf-set mask. A runtime-path-only aggregate (deferred
+                // records) needs no block shadow at all.
+                if (slot.is_agg) {
+                    if (slot.nba_agg) {
+                        for (AggLeaf& m : slot.static_leaves) {
+                            m.sh_mm_field = static_cast<uint32_t>(sf.size());
+                            sf.push_back(int_ty(m.narrow ? m.width : 2 * m.width));
+                            if (m.has_z) {
+                                m.sh_z_field = static_cast<uint32_t>(sf.size());
+                                sf.push_back(int_ty(m.width));
+                            }
                         }
                     }
                     continue;
@@ -1010,19 +1013,22 @@ private:
             }
             const Index     lv_idx = ir.payload(idx).binary.l;
             const NbaTarget t      = nba_target(ir, lv_idx);
-            // Nonblocking assignment into an aggregate: a STATIC-path leaf (struct
-            // fields only) commits through the per-leaf aggregate shadow. A write
-            // through a runtime array index (arr[i] <= .., x.mem[i] <= ..) has no
-            // compile-time leaf address for that shadow; the frontend guards it,
-            // this is defense in depth (Stage: deferred aggregate NBA).
+            // Nonblocking assignment into an aggregate. A STATIC-path leaf (struct
+            // fields only) commits through the per-leaf aggregate shadow (block
+            // commit). A leaf reached through a runtime array index has no
+            // compile-time address, so it defers a (dest-slot-pointer, value)
+            // record replayed by memcpy — the aggregate analogue of the array
+            // deferred queue. A signal can take both paths (different sites).
             if (contains_struct(sigs[static_cast<uint32_t>(t.sig)].type)) {
-                if (lvalue_has_elem_select(ir, lv_idx)) {
-                    throw BackendError{ "nonblocking assignment through a runtime array index "
-                                        "into an aggregate is not supported" };
-                }
                 SignalSlot& s = slots_[static_cast<uint32_t>(t.sig)];
                 s.nba         = true;
-                s.nba_agg     = true;
+                if (lvalue_has_elem_select(ir, lv_idx)) {
+                    if (std::find(agg_nba_sigs_.begin(), agg_nba_sigs_.end(), t.sig) == agg_nba_sigs_.end()) {
+                        agg_nba_sigs_.push_back(t.sig);
+                    }
+                } else {
+                    s.nba_agg = true;
+                }
                 continue;
             }
             // An unpacked-array element NBA uses the runtime deferred queue, not
@@ -4262,7 +4268,7 @@ private:
         // The array-NBA record buffers are process-global; clear any state a prior
         // simulation in this process left staged (e.g. a $finish between staging and
         // the NBA commit) so this run starts empty.
-        if (!array_nba_sigs_.empty()) {
+        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty()) {
             b_.CreateCall(nba_arr_reset_fn(), {});
         }
         const auto all = mod_.processes();
@@ -4374,7 +4380,7 @@ private:
         // the active queue drains; if any update is staged it commits them all and
         // re-drains the active queue at the SAME instant; otherwise it falls through
         // to the wheel. So active and NBA iterate until both settle before time moves.
-        const bool has_nba = !array_nba_sigs_.empty() || !block_commits_.empty();
+        const bool has_nba = !array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !block_commits_.empty();
         auto*      ncheck  = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.check", fn) : wcheck;
         auto*      ncommit = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.commit", fn) : nullptr;
         // Inactive region: only when the design has a #0. When the active queue
@@ -4467,7 +4473,8 @@ private:
             // the commits just woke.
             b_.SetInsertPoint(ncheck);
             llvm::Value* any = b_.getFalse();
-            if (!array_nba_sigs_.empty()) {
+            if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty()) {
+                // rt_nba_arr_any is the total across the shared array + aggregate buffers.
                 any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateCall(nba_arr_any_fn(), {}), b_.getInt32(0)));
             }
             if (!block_commits_.empty()) {
@@ -4492,11 +4499,15 @@ private:
                 b_.CreateBr(after);
                 b_.SetInsertPoint(after);
             }
-            // Deferred array-element writes: replay each array's records (monomorphized
-            // commit), waking its Any-edge readers if it took any write, then reset.
-            if (!array_nba_sigs_.empty()) {
+            // Deferred writes through a runtime array index: replay each array's
+            // typed records and each aggregate's memcpy records (both from the
+            // shared rt_nba_arr_* buffers), waking Any-edge readers, then reset.
+            if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty()) {
                 for (const Signal sig : array_nba_sigs_) {
                     emit_array_commit(sig, state);
+                }
+                for (const Signal sig : agg_nba_sigs_) {
+                    emit_agg_array_commit(sig, state);
                 }
                 b_.CreateCall(nba_arr_reset_fn(), {});
             }
@@ -5524,10 +5535,14 @@ private:
                 if (type_of(p.binary.r).is_real) {
                     rhs = real_to_planes(fp_of(rhs));
                 }
-                // An unpacked-array element NBA defers through the runtime queue; a
-                // plain signal / scalar select uses the per-signal shadow.
+                // Deferral splits three ways: an unpacked-array element defers a
+                // typed record; an aggregate leaf reached through a runtime array
+                // index defers a memcpy record; everything else (a plain signal,
+                // scalar select, or aggregate static leaf) uses the block shadow.
                 if (lv.is_signal && slot_of(lv.sig).is_array) {
                     emit_array_nba(lv, rhs);
+                } else if (lv.is_agg && !lv.agg_static) {
+                    emit_agg_nba(lv, rhs);
                 } else {
                     lower_store_nb(lv, rhs);
                 }
@@ -6411,6 +6426,126 @@ private:
         }
     }
 
+
+    // Deferred-buffer index for an aggregate NBA signal: the aggregate buffers
+    // follow the array buffers in the shared runtime index space (rt_nba_arr_*).
+    uint32_t agg_buf_idx(Signal sig) const {
+        const auto it = std::find(agg_nba_sigs_.begin(), agg_nba_sigs_.end(), sig);
+        return static_cast<uint32_t>(array_nba_sigs_.size()) +
+               static_cast<uint32_t>(it - agg_nba_sigs_.begin());
+    }
+
+    // Largest leaf slot byte size across an aggregate type (sizes the deferred
+    // record's payload so any leaf's value fits).
+    uint32_t agg_max_leaf_bytes(Ref type) {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            return agg_max_leaf_bytes(t.element);
+        }
+        if (t.kind == Type::Kind::Struct && !t.is_packed) {
+            uint32_t m = 0;
+            for (const Field& f : mod_.pool.struct_fields(t.fields_id)) {
+                m = std::max(m, agg_max_leaf_bytes(f.type));
+            }
+            return m;
+        }
+        llvm::Type* slot = t.kind == Type::Kind::String ? static_cast<llvm::Type*>(str_slot_ty())
+                                                        : agg_leaf_slot_ty(type);
+        return static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(slot));
+    }
+
+    // Deferred aggregate-NBA record: { ptr dest_slot, i32 nbytes, [max x i8]
+    // payload }. `payload` holds the new leaf value in the leaf's own slot byte
+    // layout; the commit memcpies `nbytes` of it to `dest_slot`, so a leaf of any
+    // width / domain replays uniformly (no per-leaf monomorphization).
+    llvm::StructType* agg_rec_ty(const SignalSlot& s) {
+        const uint32_t maxb = agg_max_leaf_bytes(s.ir_type);
+        return llvm::StructType::get(
+          ctx_, { raw_ptr_ty(), b_.getInt32Ty(), llvm::ArrayType::get(b_.getInt8Ty(), maxb) });
+    }
+
+    // Pointer to the leaf SLOT an aggregate lvalue designates (its agg_path,
+    // without the final mm/z field select).
+    llvm::Value* agg_slot_ptr(const LValue& lv) {
+        std::vector<llvm::Value*> idx;
+        idx.reserve(lv.agg_path.size() + 1);
+        idx.push_back(b_.getInt32(0));
+        for (llvm::Value* step : lv.agg_path) {
+            idx.push_back(step);
+        }
+        return b_.CreateInBoundsGEP(lv.root_ty, lv.base, idx);
+    }
+
+    // Stage a nonblocking write to an aggregate leaf reached through a runtime
+    // array index: reserve a record and fill it with the destination slot pointer,
+    // the leaf's slot byte count, and the new value written in the leaf's own slot
+    // layout. The NBA region replays it by memcpy (later write to the same leaf
+    // wins). Whole-leaf only — a partial leaf write is guarded in the frontend.
+    void emit_agg_nba(const LValue& lv, Plane rhs) {
+        const SignalSlot& s      = slot_of(lv.sig);
+        const llvm::Align a1{ 1 };
+        auto*             rt     = agg_rec_ty(s);
+        const auto        stride = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(rt));
+        llvm::Value* rec = b_.CreateCall(nba_arr_slot_fn(), { b_.getInt32(agg_buf_idx(lv.sig)), b_.getInt32(stride) });
+        b_.CreateAlignedStore(agg_slot_ptr(lv), b_.CreateStructGEP(rt, rec, 0), a1);
+        const auto nbytes = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(lv.slot_ty));
+        b_.CreateAlignedStore(b_.getInt32(nbytes), b_.CreateStructGEP(rt, rec, 1), a1);
+        llvm::Value* payload = b_.CreateStructGEP(rt, rec, 2);
+        if (lv.narrow) {
+            b_.CreateAlignedStore(must_of(rhs), payload, a1);
+        } else {
+            const Plane f = to_four(rhs);
+            b_.CreateAlignedStore(f.mm, payload, a1);
+            if (lv.has_z) {
+                const auto   zoff = llmod_.getDataLayout().getStructLayout(lv.slot_ty)->getElementOffset(1);
+                llvm::Value* zp   = b_.CreateInBoundsGEP(b_.getInt8Ty(), payload, { b_.getInt32(static_cast<uint32_t>(zoff)) });
+                b_.CreateAlignedStore(f.z, zp, a1);
+            }
+        }
+    }
+
+    // Replay an aggregate's deferred records: memcpy each record's payload to its
+    // destination slot (push order, later write wins), then wake level (Any-edge)
+    // readers if any record was staged.
+    void emit_agg_array_commit(Signal sig, llvm::Value* /*state*/) {
+        const SignalSlot& s      = slot_of(sig);
+        const uint32_t    idx    = agg_buf_idx(sig);
+        auto*             rt     = agg_rec_ty(s);
+        const auto        stride = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(rt));
+        auto*             i8     = b_.getInt8Ty();
+        llvm::Value*      base   = b_.CreateCall(nba_arr_base_fn(), { b_.getInt32(idx) });
+        llvm::Value*      count  = b_.CreateCall(nba_arr_count_fn(), { b_.getInt32(idx) });
+
+        auto* fn    = b_.GetInsertBlock()->getParent();
+        auto* head  = llvm::BasicBlock::Create(ctx_, "aggnba.head", fn);
+        auto* body  = llvm::BasicBlock::Create(ctx_, "aggnba.body", fn);
+        auto* done  = llvm::BasicBlock::Create(ctx_, "aggnba.done", fn);
+        auto* entry = b_.GetInsertBlock();
+        b_.CreateBr(head);
+        b_.SetInsertPoint(head);
+        auto* k = b_.CreatePHI(b_.getInt32Ty(), 2);
+        k->addIncoming(b_.getInt32(0), entry);
+        b_.CreateCondBr(b_.CreateICmpULT(k, count), body, done);
+        b_.SetInsertPoint(body);
+        llvm::Value* rec     = b_.CreateInBoundsGEP(i8, base, { b_.CreateMul(k, b_.getInt32(stride)) });
+        llvm::Value* dest    = b_.CreateAlignedLoad(raw_ptr_ty(), b_.CreateStructGEP(rt, rec, 0), llvm::Align{ 1 });
+        llvm::Value* nbytes  = b_.CreateAlignedLoad(b_.getInt32Ty(), b_.CreateStructGEP(rt, rec, 1), llvm::Align{ 1 });
+        llvm::Value* payload = b_.CreateStructGEP(rt, rec, 2);
+        b_.CreateMemCpy(dest, llvm::MaybeAlign{ 1 }, payload, llvm::MaybeAlign{ 1 }, nbytes);
+        k->addIncoming(b_.CreateAdd(k, b_.getInt32(1)), b_.GetInsertBlock());
+        b_.CreateBr(head);
+        b_.SetInsertPoint(done);
+
+        if (signal_has_waiters(sig)) {
+            auto* svc  = llvm::BasicBlock::Create(ctx_, "aggnba.svc", fn);
+            auto* cont = llvm::BasicBlock::Create(ctx_, "aggnba.cont", fn);
+            b_.CreateCondBr(b_.CreateICmpNE(count, b_.getInt32(0)), svc, cont);
+            b_.SetInsertPoint(svc);
+            service_any_waiters(sig);
+            b_.CreateBr(cont);
+            b_.SetInsertPoint(cont);
+        }
+    }
 
     // Stage a nonblocking write to an unpacked-array element: reserve a fixed-stride
     // record slot in this array's deferred buffer (rt_nba_arr_slot) and fill it with
@@ -9064,6 +9199,12 @@ private:
     // rather than the per-signal shadow; after a commit, each is woken if any
     // queued write touched it.
     std::vector<Signal>     array_nba_sigs_;
+    // Aggregate signals with a nonblocking write reaching a leaf through a
+    // runtime array index. Each such write defers a (dest-slot-pointer, nbytes,
+    // payload) record into a per-aggregate runtime buffer (indexed after the
+    // array buffers), replayed by memcpy in the NBA region; the signal is then
+    // woken (Any-edge) if any record touched it.
+    std::vector<Signal>     agg_nba_sigs_;
 
     // Block-commit NBA state. A whole-signal scalar NBA stages its shadow as before,
     // then registers its enclosing straight-line segment ("block") once per instant
