@@ -2002,10 +2002,10 @@ extern "C" void rt_string_substr(rt_string* dst, const rt_string* src, int32_t i
     str_assign(dst, str_data(src) + i, static_cast<uint64_t>(j) - static_cast<uint64_t>(i) + 1);
 }
 
-extern "C" void rt_enum_name(rt_string* dst, uint64_t val, uint32_t count, const uint64_t* values,
-                             const char* const* names, const uint32_t* lens) {
+extern "C" void rt_enum_name(rt_string* dst, const uint8_t* val, uint32_t vbytes, uint32_t count,
+                             const uint8_t* values, const char* const* names, const uint32_t* lens) {
     for (uint32_t k = 0; k < count; ++k) {
-        if (values[k] == val) {
+        if (std::memcmp(val, values + static_cast<size_t>(k) * vbytes, vbytes) == 0) {
             str_assign(dst, names[k], lens[k]);
             return;
         }

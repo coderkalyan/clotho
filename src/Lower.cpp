@@ -3434,21 +3434,31 @@ private:
         // the value is not a member. Delegated to a runtime scan of a per-type
         // member table (a string result rules out a frontend select).
         if (name == "name") {
-            if (et.bitWidth > 64) {
-                // TODO: the table key packs the value into u64; a wider base needs
-                // multi-word keys.
-                fail("enum name() with a base type wider than 64 bits is not supported");
-            }
-            std::vector<std::pair<uint64_t, std::string_view>> table;
-            table.reserve(members.size());
+            // Each member value becomes its must-plane bytes ((width+7)/8), so a
+            // base wider than 64 bits round-trips; the runtime byte-compares.
+            const uint32_t width  = et.bitWidth;
+            const uint32_t vbytes = (width + 7) / 8;
+            const uint32_t words  = (width + 63) / 64;
+            std::vector<std::vector<uint8_t>>     valbufs;
+            std::vector<ir::Builder::EnumNameRow> rows;
+            valbufs.reserve(members.size());
+            rows.reserve(members.size());
             for (const EnumMember& m : members) {
-                uint64_t key = m.value.as<uint64_t>().value_or(0);
-                if (et.bitWidth < 64) {
-                    key &= (static_cast<uint64_t>(1) << et.bitWidth) - 1;
+                const slang::SVInt& v      = m.value;
+                const uint64_t*     raw    = v.getRawPtr();
+                const bool          unk    = v.hasUnknown();
+                const uint32_t      vwords = (static_cast<uint32_t>(v.getBitWidth()) + 63) / 64;
+                std::vector<uint64_t> vplane(std::max(words, vwords), 0);
+                for (uint32_t i = 0; i < vwords; ++i) {
+                    // VPI aval (must plane): value bits, with unknown bits cleared.
+                    vplane[i] = unk ? (raw[i] ^ raw[vwords + i]) : raw[i];
                 }
-                table.push_back({ key, m.name });
+                std::vector<uint8_t> vb(vbytes, 0);
+                std::memcpy(vb.data(), vplane.data(), vbytes);
+                valbufs.push_back(std::move(vb));
+                rows.push_back({ std::span<const uint8_t>(valbufs.back()), m.name });
             }
-            return b.enum_name(lower_expr(*call.arguments()[0], b), table, l);
+            return b.enum_name(lower_expr(*call.arguments()[0], b), rows, l);
         }
 
         // next(N)/prev(N) (LRM 6.19.5): the Nth member after/before the current
