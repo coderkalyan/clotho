@@ -51,6 +51,7 @@
 #include <slang/numeric/Time.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/text/SourceManager.h>
+#include <slang/util/SmallVector.h>
 
 #include "SourceMap.h"
 #include "ir/Builder.h"
@@ -556,11 +557,18 @@ private:
                 case SymbolKind::PrimitiveInstance:
                     lower_gate(m.as<PrimitiveInstanceSymbol>());
                     break;
-                case SymbolKind::InstanceArray:
-                    // Gate arrays lower per-element; module instance arrays fail
-                    // inside (TODO there).
-                    lower_primitive_array(m.as<InstanceArraySymbol>());
+                case SymbolKind::InstanceArray: {
+                    // An array of instances — gate primitives (LRM 28.3.6) or
+                    // modules/interfaces (LRM 23.3.6). Slang has already
+                    // elaborated one leaf symbol per element with per-instance
+                    // bit-sliced connections, so this only needs to walk to
+                    // the leaves and lower each like its scalar counterpart.
+                    lower_instance_array(m.as<InstanceArraySymbol>(), self_prefix, scope, self_mul);
+                    prefix_   = self_prefix;
+                    scope_    = &scope;
+                    time_mul_ = self_mul;
                     break;
+                }
                 // Known-inert members: elaboration artifacts and declarations
                 // that bear no simulation behavior of their own. Ports are wired
                 // by wire_ports; parameters/types/genvars are resolved by slang;
@@ -599,6 +607,62 @@ private:
         prefix_ = block_prefix;
         scope_  = &block;
         lower_members(block, block_prefix, self_mul);
+    }
+
+    // Recurse through one (possibly multidimensional) array of instances —
+    // gate primitives (LRM 28.3.6) or modules/interfaces (LRM 23.3.6). Slang
+    // builds a nested InstanceArraySymbol per extra unpacked dimension (`foo
+    // u[3][4] (...)`), each ultimately bottoming out at a leaf symbol that
+    // already carries its own bit-sliced port/terminal connections — this
+    // only walks to those leaves and lowers each like its scalar counterpart.
+    // A module/interface leaf flattens under <array>[<index>], mirroring
+    // generate-loop arrays (gen_entry_name); a gate leaf needs no hierarchy
+    // bookkeeping of its own.
+    void lower_instance_array(const InstanceArraySymbol& arr, const std::string& self_prefix,
+                              const Scope& parent_scope, uint64_t self_mul) {
+        for (const Symbol* elem : arr.elements) {
+            switch (elem->kind) {
+                case SymbolKind::InstanceArray:
+                    lower_instance_array(elem->as<InstanceArraySymbol>(), self_prefix, parent_scope,
+                                        self_mul);
+                    break;
+                case SymbolKind::PrimitiveInstance:
+                    lower_gate(elem->as<PrimitiveInstanceSymbol>());
+                    break;
+                case SymbolKind::Instance: {
+                    const InstanceSymbol& child = elem->as<InstanceSymbol>();
+                    lower_instance(child, self_prefix + instance_array_element_name(child) + ".");
+                    prefix_   = self_prefix;
+                    scope_    = &parent_scope;
+                    time_mul_ = self_mul;
+                    wire_ports(child);
+                    break;
+                }
+                default:
+                    // A checker instance array: checkers aren't lowered at
+                    // all today, so fail the same way a lone one would.
+                    fail("unsupported instance array element kind=" + std::string(toString(elem->kind)));
+            }
+        }
+    }
+
+    // Hierarchical-path segment for one instance-array element: <array>[<i0>]
+    // [<i1>].... Mirrors slang's own hierarchical-path formatting (slang's
+    // Symbol::getHierarchicalPath): arrayPath holds one canonical (always
+    // zero-based) index per dimension, and adding each dimension's lower
+    // bound recovers the source-code index regardless of whether that
+    // dimension's range counts up or down.
+    static std::string instance_array_element_name(const InstanceSymbol& elem) {
+        std::string name(elem.getArrayName());
+        slang::SmallVector<slang::ConstantRange, 4> dims;
+        elem.getArrayDimensions(dims);
+        SLANG_ASSERT(dims.size() == elem.arrayPath.size());
+        for (size_t i = 0; i < dims.size(); i++) {
+            name += '[';
+            name += std::to_string(int32_t(elem.arrayPath[i]) + dims[i].lower());
+            name += ']';
+        }
+        return name;
     }
 
     // Hierarchical-path segment for one loop-generate entry: <array>[<index>].
@@ -864,6 +928,9 @@ private:
                     if (m.kind == SymbolKind::Net) {
                         const NetSymbol& net = m.as<NetSymbol>();
                         // Only single-driver, z-defaulting net kinds are modeled.
+                        // uwire (LRM 6.6.7) is complete, not a partial stub: its
+                        // single-driver mandate is enforced by slang's analysis
+                        // pass (MultipleUWireDrivers), which runs before lowering.
                         // TODO: wand/wor/tri0/tri1/trireg/supply0/supply1 carry
                         // resolution, pull, or charge semantics (and different
                         // undriven defaults) clotho does not implement.
@@ -1431,27 +1498,6 @@ private:
                                            .output = lower_gate_output(*out),
                                            .loc    = to_source_loc(gi.location) },
                              inputs);
-        }
-    }
-
-    // Lower an array of gate instances: slang has already elaborated one
-    // PrimitiveInstanceSymbol per element with per-instance bit-sliced terminal
-    // connections (LRM 28.3.6), so each leaf lowers like a scalar gate. Module
-    // instance arrays still fail (first non-primitive leaf aborts lowering).
-    void lower_primitive_array(const InstanceArraySymbol& arr) {
-        for (const Symbol* el : arr.elements) {
-            switch (el->kind) {
-                case SymbolKind::PrimitiveInstance:
-                    lower_gate(el->as<PrimitiveInstanceSymbol>());
-                    break;
-                case SymbolKind::InstanceArray:
-                    lower_primitive_array(el->as<InstanceArraySymbol>());
-                    break;
-                default:
-                    // TODO: module instance arrays (foo u[N](...)) — need
-                    // per-element elaboration and bit-sliced port connections.
-                    fail("instance arrays are not supported");
-            }
         }
     }
 

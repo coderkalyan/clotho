@@ -140,6 +140,7 @@ add_executable(clotho_test
   tests/display_test.cpp
   tests/loop_test.cpp
   tests/generate_test.cpp
+  tests/instance_array_test.cpp
   tests/packed_range_test.cpp
   tests/z_elision_test.cpp
   tests/gate_test.cpp
@@ -155,6 +156,7 @@ add_executable(clotho_test
   tests/enum_test.cpp
   tests/sysfunc_test.cpp
   tests/streaming_test.cpp
+  tests/uwire_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho doctest::doctest clotho_warnings)
 
