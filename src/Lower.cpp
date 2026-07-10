@@ -5774,10 +5774,31 @@ private:
         }
     }
 
+    // A legal ref actual (LRM 13.5.2) Clotho supports: a whole variable, or a whole
+    // element of an unpacked array (`arr[i]`, possibly nested). Each is one complete
+    // `{ i(2W), iW }` slot, so the backend passes its slot pointer. slang already
+    // rejects a packed bit/part-select as a ref actual ("only variables, class
+    // properties, and members of unpacked structs and arrays are allowed"); an
+    // unpacked-struct member needs struct support, still unimplemented.
+    bool is_whole_ref_actual(const Expression& a) {
+        switch (a.kind) {
+            case ExpressionKind::NamedValue:
+            case ExpressionKind::HierarchicalValue:
+                return true;
+            case ExpressionKind::ElementSelect: {
+                // Only an unpacked-array element is a whole slot; a select of a
+                // packed value is a bit/part-select (a partial ref, unsupported).
+                const auto& es = a.as<ElementSelectExpression>();
+                return is_unpacked_array(es.value()) && is_whole_ref_actual(es.value());
+            }
+            default:
+                return false;
+        }
+    }
+
     // Lower a ref actual (LRM 13.5.2) to its lvalue leaf: the backend passes one
-    // pointer to the actual's storage and the callee aliases it live. This chunk
-    // supports a whole-variable actual only; a bit / part-select or array-element
-    // ref needs a sub-slot pointer with offset plumbing.
+    // pointer to the actual's slot (a scalar's slot, or one array-element slot) and
+    // the callee aliases it live.
     ir::Index lower_ref_actual(const Expression& actual, ir::Builder& b) {
         const Expression* a = &actual;
         // slang may wrap a ref actual in an AssignmentExpression (as for out/inout);
@@ -5785,9 +5806,10 @@ private:
         if (a->kind == ExpressionKind::Assignment) {
             a = &a->as<AssignmentExpression>().left();
         }
-        if (a->kind != ExpressionKind::NamedValue && a->kind != ExpressionKind::HierarchicalValue) {
-            // TODO: ref actual that is a bit/part-select or array element.
-            fail("ref argument actual must be a whole variable");
+        if (!is_whole_ref_actual(*a)) {
+            // TODO: ref actual that is a packed bit/part-select or unpacked-struct
+            // member (needs sub-slot offset plumbing / struct support).
+            fail("ref argument actual must be a whole variable or unpacked-array element");
         }
         return lower_lvalue(*a, b);
     }

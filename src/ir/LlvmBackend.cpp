@@ -971,6 +971,24 @@ private:
         }
         return b_.CreateStructGEP(lv.slot_ty, lv.base, field);
     }
+    // Pointer to a ref actual's slot, passed to the callee as the aliased storage.
+    // A whole scalar is its slot pointer; an unpacked-array element is `&array[idx]`
+    // (its element slot). The selection must be a whole element — the callee GEPs it
+    // as a packed `{ i(2W), iW }` slot, with no bit/part offset. The frontend guards
+    // to these shapes (is_whole_ref_actual); this rejects anything else defensively.
+    llvm::Value* ref_actual_ptr(const LValue& lv) {
+        const bool whole = !lv.is_string && lv.range_mask == nullptr &&
+                           is_zero_const(lv.bit_off) && lv.width == lv.store_width;
+        if (!whole) {
+            throw BackendError{ "ref actual must be a whole variable or unpacked-array element" };
+        }
+        if (lv.array_ty != nullptr) {
+            llvm::Value* idx = lv.elem_idx != nullptr ? lv.elem_idx : b_.getInt32(0);
+            return b_.CreateInBoundsGEP(lv.array_ty, lv.base, { b_.getInt32(0), idx });
+        }
+        return lv.base;
+    }
+
     llvm::Value* lv_mm_ptr(const LValue& lv) {
         return lv_field_ptr(lv, 0);
     }
@@ -7005,9 +7023,10 @@ private:
         size_t k = 0;
         for (Index a : ir_->region(ci.args)) {
             if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
-                // Pass one pointer to the actual's packed slot; the callee aliases it.
+                // Pass one pointer to the actual's slot (scalar, or array element);
+                // the callee aliases it.
                 const LValue& lv = lvalue_of(a);
-                argv.push_back(lv.base);
+                argv.push_back(ref_actual_ptr(lv));
                 ref_svc.emplace_back(lv, service_snapshot(lv));
             } else if (is_string_type(f.param_types[k])) {
                 argv.push_back(str_of(a));
@@ -7089,9 +7108,10 @@ private:
         std::vector<std::pair<LValue, ServiceSnapshot>> ref_svc;
         for (uint32_t k = 0; k < args.size(); ++k) {
             if (tf.arg_dirs[k] == ArgDir::Ref) {
-                // Pass one pointer to the actual's packed slot; the callee aliases it.
+                // Pass one pointer to the actual's slot (scalar, or array element);
+                // the callee aliases it.
                 const LValue& lv = lvalue_of(args[k]);
-                argv.push_back(lv.base);
+                argv.push_back(ref_actual_ptr(lv));
                 ref_svc.emplace_back(lv, service_snapshot(lv));
             } else if (tf.arg_dirs[k] == ArgDir::In) {
                 if (is_string_type(tf.param_types[k])) {
