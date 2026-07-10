@@ -1,5 +1,6 @@
 #include "Runtime.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cerrno>
@@ -101,28 +102,47 @@ uint64_t width_mask(uint32_t w) {
     return w >= 64 ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << w) - 1);
 }
 
-// Render `val` as ceil(width/bits) digits, most-significant first. `bits` is 1
-// (binary), 3 (octal) or 4 (hex). Unknown digits follow LRM §21.2.1.3 casing:
-// lowercase x/z when every in-range bit of the group is x / z, uppercase X/Z
-// when only some are (Z only when the group has no x bits). The top group
-// clips to the operand width so its "every bit" test ignores out-of-range bits.
-void render_digits(std::string& out, uint64_t val, uint64_t xz, uint64_t z, uint32_t width, uint32_t bits) {
+// Number of 64-bit words a `width`-bit plane occupies (>= 1).
+uint32_t plane_words(uint32_t width) {
+    return width == 0 ? 1 : (width + 63) / 64;
+}
+
+// The `bits`-wide bit group of little-endian word array `p` (`words` words) at
+// bit offset `off`, read straight through the word boundary. `bits` <= 64.
+uint64_t bit_group(const uint64_t* p, uint32_t words, uint32_t off, uint32_t bits) {
+    const uint32_t wi = off / 64;
+    const uint32_t sh = off % 64;
+    uint64_t       g  = p[wi] >> sh;
+    if (sh != 0 && wi + 1 < words) {
+        g |= p[wi + 1] << (64 - sh);
+    }
+    const uint64_t m = bits >= 64 ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << bits) - 1);
+    return g & m;
+}
+
+// Render the plane arrays as ceil(width/bits) digits, most-significant first.
+// `bits` is 1 (binary), 3 (octal) or 4 (hex). Unknown digits follow LRM
+// §21.2.1.3 casing: lowercase x/z when every in-range bit of the group is x / z,
+// uppercase X/Z when only some are (Z only when the group has no x bits). The
+// top group clips to the operand width so its "every bit" test ignores
+// out-of-range bits. `words` is plane_words(width).
+void render_digits(std::string& out, const uint64_t* val, const uint64_t* xz, const uint64_t* z, uint32_t words,
+                   uint32_t width, uint32_t bits) {
     if (width == 0) {
         width = 1;
     }
     static constexpr char kHex[]   = "0123456789abcdef";
-    const uint64_t        dig_mask = (uint64_t{ 1 } << bits) - 1;
-    const uint64_t        all_mask = width_mask(width);
     const uint32_t        digits   = (width + bits - 1) / bits;
     for (uint32_t d = digits; d-- > 0;) {
-        const uint32_t shift = d * bits;
-        const uint64_t gm    = dig_mask & (all_mask >> shift);
-        const uint64_t dxz   = (xz >> shift) & gm;
+        const uint32_t off       = d * bits;
+        const uint32_t grp_bits  = std::min(bits, width - off);
+        const uint64_t gm        = (uint64_t{ 1 } << grp_bits) - 1;
+        const uint64_t dxz       = bit_group(xz, words, off, bits) & gm;
         if (dxz == 0) {
-            out += kHex[(val >> shift) & gm];
+            out += kHex[bit_group(val, words, off, bits) & gm];
             continue;
         }
-        const uint64_t dz = (z >> shift) & gm;
+        const uint64_t dz = bit_group(z, words, off, bits) & gm;
         const uint64_t dx = dxz & ~dz;
         if (dx != 0) {
             out += dx == gm ? 'x' : 'X';
@@ -130,6 +150,70 @@ void render_digits(std::string& out, uint64_t val, uint64_t xz, uint64_t z, uint
             out += dz == gm ? 'z' : 'Z';
         }
     }
+}
+
+// Decimal string of the unsigned magnitude in little-endian word array `w`
+// (`words` words, zero-extended above the value width so no masking is needed).
+// Repeated divmod by 1e9 over 32-bit limbs; "0" for a zero value.
+std::string wide_udec(const uint64_t* w, uint32_t words) {
+    std::vector<uint32_t> limb(2 * words);
+    for (uint32_t i = 0; i < words; ++i) {
+        limb[2 * i]     = static_cast<uint32_t>(w[i]);
+        limb[2 * i + 1] = static_cast<uint32_t>(w[i] >> 32);
+    }
+    while (limb.size() > 1 && limb.back() == 0) {
+        limb.pop_back();
+    }
+    std::string s;
+    for (;;) {
+        bool zero = true;
+        for (const uint32_t l : limb) {
+            if (l != 0) {
+                zero = false;
+                break;
+            }
+        }
+        if (zero) {
+            break;
+        }
+        uint64_t rem = 0;
+        for (uint32_t i = static_cast<uint32_t>(limb.size()); i-- > 0;) {
+            const uint64_t cur = (rem << 32) | limb[i];
+            limb[i]            = static_cast<uint32_t>(cur / 1000000000ull);
+            rem                = cur % 1000000000ull;
+        }
+        // Nine LSD-first digits of this chunk; the final (most-significant) chunk
+        // is trimmed of leading zeros after the loop.
+        for (int k = 0; k < 9; ++k) {
+            s += static_cast<char>('0' + rem % 10);
+            rem /= 10;
+        }
+    }
+    if (s.empty()) {
+        return "0";
+    }
+    while (s.size() > 1 && s.back() == '0') {
+        s.pop_back();
+    }
+    std::reverse(s.begin(), s.end());
+    return s;
+}
+
+// Automatic %d field width for a width > 64 operand: the decimal length of the
+// widest value it can hold. Unsigned -> 2^width - 1; signed -> the most negative
+// value's magnitude 2^(width-1) plus the sign character (LRM §21.2.1.2).
+uint32_t wide_dec_maxlen(uint32_t width, bool is_signed) {
+    const uint32_t        words = plane_words(width);
+    std::vector<uint64_t> ext(words, 0);
+    if (is_signed) {
+        ext[(width - 1) / 64] = uint64_t{ 1 } << ((width - 1) % 64);
+        return 1 + static_cast<uint32_t>(wide_udec(ext.data(), words).size());
+    }
+    for (uint32_t k = 0; k < words; ++k) {
+        ext[k] = ~uint64_t{ 0 };
+    }
+    ext[words - 1] &= (width % 64 == 0) ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << (width % 64)) - 1);
+    return static_cast<uint32_t>(wide_udec(ext.data(), words).size());
 }
 
 // Forward declarations: the rt_string representation lives below with the
@@ -154,11 +238,11 @@ uint32_t dec_digits(uint64_t v) {
 // pads on the left (spaces for d/s/c/t, zeros for h/o/b) and never truncates.
 // `-` left-justifies with trailing spaces (an extension the LRM does not define).
 void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spec) {
-    const uint32_t w    = a.width ? a.width : 1;
-    const uint64_t mask = width_mask(w);
-    const uint64_t val  = a.val & mask;
-    const uint64_t xz   = a.xz & mask;
-    const uint64_t z    = a.z & mask;
+    const uint32_t w     = a.width ? a.width : 1;
+    const uint32_t words = plane_words(w);
+    // Top-word mask; every plane is zero-extended above `w`, so only the top
+    // word needs clipping for the whole-field x/z collapse and magnitude negate.
+    const uint64_t topm = (w % 64 == 0) ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << (w % 64)) - 1);
 
     std::string field;
     // Field width to justify to; an explicit specifier width overrides the
@@ -168,31 +252,65 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
 
     switch (spec.conv) {
         case 'd':
-        case 'D':
-            if (!spec.has_width) {
-                // Automatic size: the largest possible value of a `w`-bit
-                // operand; a signed operand's widest text is its most negative
-                // value, sign included (LRM §21.2.1.2).
-                target = (a.flags & 1u) != 0 ? 1 + dec_digits(uint64_t{ 1 } << (w - 1))
-                                             : dec_digits(mask);
+        case 'D': {
+            // Whole-field x/z collapse test across every plane word (LRM
+            // §21.2.1.3): lowercase only when every bit is x (resp. z),
+            // uppercase X when x bits mix with anything, uppercase Z when z bits
+            // mix with known bits.
+            bool any_unknown = false, any_x = false, all_x = true, all_z = true;
+            for (uint32_t k = 0; k < words; ++k) {
+                const uint64_t full = k + 1 == words ? topm : ~uint64_t{ 0 };
+                const uint64_t xzk  = a.xz[k] & full;
+                const uint64_t zk   = a.z[k] & full;
+                const uint64_t xk   = xzk & ~zk;
+                any_unknown |= xzk != 0;
+                any_x |= xk != 0;
+                all_x &= xk == full;
+                all_z &= zk == full;
             }
-            if (xz != 0) {
-                // LRM §21.2.1.3: whole-field collapse, lowercase only when
-                // every bit is x (resp. z), uppercase X when x bits mix with
-                // anything, uppercase Z when z bits mix with known bits.
-                const uint64_t x = xz & ~z;
-                if (x != 0) {
-                    field += x == mask ? 'x' : 'X';
+            if (!spec.has_width) {
+                // Automatic size: the widest text a `w`-bit operand can take (a
+                // signed operand's most negative value, sign included; LRM
+                // §21.2.1.2).
+                if (w <= 64) {
+                    target = (a.flags & 1u) != 0 ? 1 + dec_digits(uint64_t{ 1 } << (w - 1))
+                                                 : dec_digits(width_mask(w));
                 } else {
-                    field += z == mask ? 'z' : 'Z';
+                    target = wide_dec_maxlen(w, (a.flags & 1u) != 0);
                 }
-            } else if ((a.flags & 1u) != 0) {
-                const uint64_t sext = (w < 64 && ((val >> (w - 1)) & 1u)) ? (val | ~mask) : val;
-                field = std::to_string(static_cast<int64_t>(sext));
+            }
+            if (any_unknown) {
+                if (any_x) {
+                    field += all_x ? 'x' : 'X';
+                } else {
+                    field += all_z ? 'z' : 'Z';
+                }
+            } else if (w <= 64) {
+                const uint64_t mask = width_mask(w);
+                const uint64_t val  = a.val[0] & mask;
+                if ((a.flags & 1u) != 0) {
+                    const uint64_t sext = (w < 64 && ((val >> (w - 1)) & 1u)) ? (val | ~mask) : val;
+                    field               = std::to_string(static_cast<int64_t>(sext));
+                } else {
+                    field = std::to_string(val);
+                }
+            } else if ((a.flags & 1u) != 0 && ((a.val[(w - 1) / 64] >> ((w - 1) % 64)) & 1u) != 0) {
+                // Negative signed: print the sign and the two's-complement
+                // magnitude (2^w - value), computed in place across the words.
+                std::vector<uint64_t> mag(words);
+                uint64_t              carry = 1;
+                for (uint32_t k = 0; k < words; ++k) {
+                    const uint64_t inv = ~a.val[k] + carry;
+                    carry              = (carry != 0 && inv == 0) ? 1 : 0;
+                    mag[k]             = inv;
+                }
+                mag[words - 1] &= topm;
+                field = "-" + wide_udec(mag.data(), words);
             } else {
-                field = std::to_string(val);
+                field = wide_udec(a.val, words);
             }
             break;
+        }
         case 'h':
         case 'H':
         case 'x':
@@ -203,7 +321,7 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
         case 'B': {
             const char     lc   = static_cast<char>(spec.conv | 0x20);
             const uint32_t bits = lc == 'h' || lc == 'x' ? 4 : lc == 'o' ? 3 : 1;
-            render_digits(field, val, xz, z, w, bits);
+            render_digits(field, a.val, a.xz, a.z, words, w, bits);
             if (spec.has_width) {
                 // An explicit width replaces the automatic sizing: reduce to the
                 // minimal digits, then zero-pad back out to the field width
@@ -221,14 +339,14 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
         }
         case 'c':
         case 'C':
-            field += static_cast<char>(val & 0xff);
+            field += static_cast<char>(a.val[0] & 0xff);
             break;
         case 't':
         case 'T':
-            // The frontend scales a %t argument to design ticks, so `val` is the
-            // tick count; render_time converts it per the current $timeformat,
-            // whose min width is the default field width for %t.
-            render_time(field, val);
+            // The frontend scales a %t argument to design ticks, so the low word
+            // is the tick count; render_time converts it per the current
+            // $timeformat, whose min width is the default field width for %t.
+            render_time(field, a.val[0]);
             if (!spec.has_width && timeformat.min_width > 0) {
                 target = static_cast<uint32_t>(timeformat.min_width);
             }
@@ -236,8 +354,8 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
         case 's':
         case 'S':
             if ((a.flags & 2u) != 0) {
-                // A string object: `val` carries the rt_string handle pointer.
-                const auto* s = reinterpret_cast<const rt_string*>(static_cast<uintptr_t>(a.val));
+                // A string object: `val` is the rt_string handle pointer itself.
+                const auto* s = reinterpret_cast<const rt_string*>(a.val);
                 field.append(str_data(s), str_len(s));
                 break;
             }
@@ -247,12 +365,15 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
             // example are explicit, so LRM wins). An embedded/trailing 0x00
             // prints as a space (LRM silent; matches iverilog).
             {
+                const auto byte = [&a](uint32_t j) {
+                    return static_cast<uint8_t>(a.val[j / 8] >> (8 * (j % 8)));
+                };
                 uint32_t k = (w + 7) / 8;
-                while (k > 0 && ((val >> (8 * (k - 1))) & 0xff) == 0) {
+                while (k > 0 && byte(k - 1) == 0) {
                     --k;
                 }
                 while (k-- > 0) {
-                    const auto c = static_cast<char>((val >> (8 * k)) & 0xff);
+                    const auto c = static_cast<char>(byte(k));
                     field += c == '\0' ? ' ' : c;
                 }
             }
@@ -287,7 +408,7 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
             }
             cs += spec.conv;
             double v = 0.0;
-            std::memcpy(&v, &a.val, sizeof v);
+            std::memcpy(&v, a.val, sizeof v);
             const int n = std::snprintf(nullptr, 0, cs.c_str(), v);
             if (n > 0) {
                 field.resize(static_cast<size_t>(n) + 1);
@@ -318,19 +439,23 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
 // word first, native endian. %u transfers the 2-value projection (x/z bits read
 // as zero); %z transfers vpi aval/bval pairs per word (x: a=1 b=1, z: a=0 b=1).
 void render_unformatted(std::string& out, const rt_arg& a, bool four_state) {
-    const uint32_t w    = a.width ? a.width : 1;
-    const uint64_t mask = width_mask(w);
-    const uint64_t xz   = a.xz & mask;
-    const uint64_t aval = ((a.val & ~a.xz) | (xz & ~a.z)) & mask;
-    const uint32_t words = (w + 31) / 32;
-    for (uint32_t k = 0; k < words; ++k) {
-        const auto append_word = [&out](uint64_t plane, uint32_t word) {
-            const auto u = static_cast<uint32_t>(plane >> (32 * word));
-            out.append(reinterpret_cast<const char*>(&u), sizeof(u));
-        };
-        append_word(four_state ? aval : (a.val & ~a.xz & mask), k);
+    const uint32_t w     = a.width ? a.width : 1;
+    const uint32_t lanes = (w + 31) / 32;
+    // The 32-bit lane `k` of a little-endian plane word array; above-width bits
+    // are already zero (the codegen zero-extends every plane).
+    const auto lane = [](const uint64_t* p, uint32_t k) {
+        return static_cast<uint32_t>(p[k / 2] >> (32 * (k % 2)));
+    };
+    const auto append_lane = [&out](uint32_t u) { out.append(reinterpret_cast<const char*>(&u), sizeof(u)); };
+    for (uint32_t k = 0; k < lanes; ++k) {
+        const uint32_t val = lane(a.val, k);
+        const uint32_t xz  = lane(a.xz, k);
+        const uint32_t z   = lane(a.z, k);
+        // %u: 2-value projection (x/z read as 0). %z: vpi aval then bval, where
+        // aval is the known-1 and x bits and bval marks every unknown bit.
+        append_lane(four_state ? ((val & ~xz) | (xz & ~z)) : (val & ~xz));
         if (four_state) {
-            append_word(xz, k);
+            append_lane(xz);
         }
     }
 }

@@ -296,3 +296,124 @@ TEST_CASE("unsupported or invalid format specifiers are rejected") {
         )", "field width not allowed on '%u'");
     }
 }
+
+// Operands wider than 64 bits: the rt_arg planes are multi-word, so every radix
+// renders in full (%d via a bignum divmod). Expectations cross-checked against
+// Icarus Verilog, except the explicit-width h/o/b zero-pad
+// (iverilog space-pads; the LRM says leading zeros, so Clotho zero-pads).
+TEST_CASE("display operands wider than 64 bits (LRM 21.2)") {
+    SUBCASE("128-bit unsigned across every radix") {
+        CHECK(run_capture(R"(
+            module m;
+                logic [127:0] a;
+                initial begin
+                    a = 128'hDEADBEEFCAFEBABE0123456789ABCDEF;
+                    $display(":%0d: :%h: :%o:", a, a, a);
+                    $display(":%b:", a);
+                end
+            endmodule
+        )") == ":295990755076957304698161171062762229231: "
+               ":deadbeefcafebabe0123456789abcdef: "
+               ":3365333735762577272574004432126361152746757:\n"
+               ":11011110101011011011111011101111110010101111111010111010"
+               "101111100000000100100011010001010110011110001001101010111100110111101111:\n");
+    }
+
+    SUBCASE("auto-width %d pads to the wide operand's maximum") {
+        // A 128-bit unsigned's widest value is 39 digits, so a small magnitude
+        // pads left with 37 spaces (LRM 21.2.1.2).
+        CHECK(run_capture(R"(
+            module m;
+                logic [127:0] a;
+                initial begin a = 128'd42; $display(":%d:", a); end
+            endmodule
+        )") == ":                                     42:\n");
+    }
+
+    SUBCASE("signed negative wide %d prints sign and magnitude") {
+        CHECK(run_capture(R"(
+            module m;
+                logic signed [95:0] s;
+                initial begin
+                    s = -96'sd170141183460469231731;
+                    $display(":%0d: :%d:", s, s);
+                end
+            endmodule
+        )") == ":-170141183460469231731: :        -170141183460469231731:\n");
+    }
+
+    SUBCASE("packed ASCII wider than 64 bits (%s)") {
+        CHECK(run_capture(R"(
+            module m;
+                logic [95:0] str;
+                initial begin str = "Hello, world"; $display(":%s:", str); end
+            endmodule
+        )") == ":Hello, world:\n");
+    }
+
+    SUBCASE("x/z bits in a wide operand: per-digit and whole-field collapse") {
+        // A 100-bit value with an x nibble and a z nibble: %h shows them per
+        // digit; %d collapses the whole field to uppercase X (x mixed with
+        // known bits) per LRM 21.2.1.3.
+        CHECK(run_capture(R"(
+            module m;
+                logic [99:0] xv;
+                initial begin
+                    xv = {32'hDEADBEEF, 4'bxxxx, 32'hCAFEBABE, 4'bzzzz, 28'h1234567};
+                    $display(":%h:", xv);
+                    $display(":%0d:", xv);
+                end
+            endmodule
+        )") == ":deadbeefxcafebabez1234567:\n:X:\n");
+    }
+
+    SUBCASE("fully-x and fully-z wide operands collapse lowercase") {
+        CHECK(run_capture(R"(
+            module m;
+                logic [99:0] xv;
+                initial begin
+                    xv = 100'hx; $display(":%0d: :%h:", xv, xv);
+                    xv = 100'hz; $display(":%0d: :%h:", xv, xv);
+                end
+            endmodule
+        )") == ":x: :xxxxxxxxxxxxxxxxxxxxxxxxx:\n:z: :zzzzzzzzzzzzzzzzzzzzzzzzz:\n");
+    }
+
+    SUBCASE("72-bit operand across the word boundary; explicit widths") {
+        // The high 8 bits sit in the second plane word. An explicit width larger
+        // than the natural size zero-pads (LRM 21.2.1.2; iverilog space-pads).
+        CHECK(run_capture(R"(
+            module m;
+                logic [71:0] sm;
+                initial begin
+                    sm = 72'hAA_BBBBBBBB_CCCCCCCC;
+                    $display(":%0d: :%h: :%20h:", sm, sm, sm);
+                end
+            endmodule
+        )") == ":3149474104851630443724: :aabbbbbbbbcccccccc: :00aabbbbbbbbcccccccc:\n");
+    }
+
+    SUBCASE("%u emits wide operands as 32-bit lanes, LSB lane first") {
+        // {32'hC,32'hB,32'hA} -> lanes 0x0A, 0x0B, 0x0C, each little-endian.
+        CHECK(run_capture(R"(
+            module m;
+                logic [95:0] v;
+                initial begin v = {32'hC, 32'hB, 32'hA}; $write("%u", v); end
+            endmodule
+        )") == std::string("\x0a\x00\x00\x00\x0b\x00\x00\x00\x0c\x00\x00\x00", 12));
+    }
+
+    SUBCASE("$sformat with a wide operand") {
+        CHECK(run_capture(R"(
+            module m;
+                logic [127:0] a;
+                string out;
+                initial begin
+                    a = 128'hDEADBEEFCAFEBABE0123456789ABCDEF;
+                    $sformat(out, "%h", a);
+                    $display(":%s:", out);
+                end
+            endmodule
+        )") == ":deadbeefcafebabe0123456789abcdef:\n");
+    }
+}
