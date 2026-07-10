@@ -124,9 +124,11 @@ struct Process {
     Ir ir;
 };
 
-// Direction of a task formal argument (LRM 13.5). A function's arguments are all
-// In; only tasks carry Out / Inout, which copy the formal back to the caller at
-// task completion. (ref is rejected by the frontend for now.)
+// Direction of a subroutine formal argument (LRM 13.5). Out / Inout copy the
+// formal back to the caller at completion (tasks only for now). Ref binds the
+// formal to the actual's live storage — no copy either way; the callee reads and
+// writes it through a passed pointer (functions and tasks). arg_dirs is populated
+// for functions too once any formal is non-In.
 enum class ArgDir : uint8_t {
     // Copy in at call (input).
     In,
@@ -134,6 +136,9 @@ enum class ArgDir : uint8_t {
     Out,
     // Copy in at call and out at completion (inout).
     Inout,
+    // Pass by reference: the formal aliases the actual's storage, accessed live
+    // through a pointer. No copy-in / copy-out.
+    Ref,
 };
 
 // A lowered SystemVerilog function or task. Its body is an Ir whose leaves are
