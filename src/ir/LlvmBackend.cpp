@@ -399,6 +399,7 @@ public:
         compute_domain_spec();   // after fusion (thunk_group_): reads spec_group_ in lower_group
         build_vcd_index();       // before build_nba_state: fills vcd_index_ / design_uses_vcd_
         build_wait_queues();
+        build_delay_event_thunks(); // after build_wait_queues: thunks read the event globals
         build_sched_flags();
         build_nba_state();
 
@@ -791,6 +792,16 @@ private:
                 const Signal sig = ir.payload(idx).signal;
                 if (std::find(nb_event_sigs_.begin(), nb_event_sigs_.end(), sig) == nb_event_sigs_.end()) {
                     nb_event_sigs_.push_back(sig);
+                }
+                continue;
+            }
+            if (ir.tag(idx) == Inst::Tag::EventTriggerNbDelayed) {
+                // `->> #d e` schedules a detached wheel timer; record the event so
+                // a per-event on-expiry thunk is generated.
+                const Signal sig = ir.extra_data<EventDelayInfo>(ir.payload(idx).op_extra.extra).event;
+                if (std::find(nb_delay_event_sigs_.begin(), nb_delay_event_sigs_.end(), sig) ==
+                    nb_delay_event_sigs_.end()) {
+                    nb_delay_event_sigs_.push_back(sig);
                 }
                 continue;
             }
@@ -2463,6 +2474,7 @@ private:
                 // fusion assume, so keep an event-touching process a coroutine.
                 case Inst::Tag::EventTrigger:
                 case Inst::Tag::EventTriggerNb:
+                case Inst::Tag::EventTriggerNbDelayed:
                 case Inst::Tag::EventTriggered:
                     return false;
                 case Inst::Tag::Store: {
@@ -3806,6 +3818,29 @@ private:
         emit_event_fire(sig, wheel_);
     }
 
+    // Generate a detached on-expiry thunk per `->> #d e` target event. The wheel
+    // calls it as on_expire(rt_timer* t, void* ctx) with ctx == the wheel (see the
+    // drain's rt_wheel_advance ctx); it stamps the event's trigger time and
+    // services its waiters, then frees the timer node the schedule site allocated.
+    void build_delay_event_thunks() {
+        event_delay_thunk_.assign(mod_.signals().size(), nullptr);
+        if (nb_delay_event_sigs_.empty()) {
+            return;
+        }
+        auto* ptr  = raw_ptr_ty();
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
+        for (const Signal sig : nb_delay_event_sigs_) {
+            const auto i  = static_cast<uint32_t>(sig);
+            auto*      fn = llvm::Function::Create(fnty, llvm::Function::InternalLinkage,
+                                                   "clotho.ev_delay." + mod_.signal(sig).name, llmod_);
+            event_delay_thunk_[i] = fn;
+            b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn));
+            emit_event_fire(sig, fn->getArg(1));         // ctx (arg 1) is the wheel
+            b_.CreateCall(free_fn(), { fn->getArg(0) }); // free the detached timer node
+            b_.CreateRetVoid();
+        }
+    }
+
     // Stamp event `sig`'s trigger time (from `wheel`) and service its Any-edge
     // static/dynamic wait queues. Shared by `-> e` in a process body (wheel_) and
     // the NBA-region `->> e` service (the drain's local wheel — wheel_ is stale
@@ -4242,7 +4277,6 @@ private:
         auto* wcheck  = llvm::BasicBlock::Create(ctx_, "wheel.check", fn);
         auto* wtick   = llvm::BasicBlock::Create(ctx_, "wheel.tick", fn);
         auto* wdone   = llvm::BasicBlock::Create(ctx_, "wheel.done", fn);
-        auto* null    = llvm::ConstantPointerNull::get(ptr_ty);
         // Any thunk group present means the active queue can carry tagged thunk
         // pointers, so the drain must discriminate; a coro-only design keeps the
         // straight resume path (no per-pop tag test).
@@ -4437,8 +4471,10 @@ private:
         // Advance one instant (firing any timers, which enqueue their handles) and
         // re-drain. rt_wheel_advance folds the pending-check into the tick — one ABI
         // crossing per timestep, no separate occupancy scan — and returns non-zero
-        // iff it fired something (an idle wheel ends the sim).
-        llvm::Value* ticked = b_.CreateCall(wheel_advance_fn(), { wheel, null });
+        // iff it fired something (an idle wheel ends the sim). The tick ctx is the
+        // wheel: coroutine-timer trampolines ignore it, but a detached `->> #d e`
+        // on-expiry thunk reads the current time from it (build_delay_event_thunks).
+        llvm::Value* ticked = b_.CreateCall(wheel_advance_fn(), { wheel, wheel });
         b_.CreateCondBr(b_.CreateICmpNE(ticked, b_.getInt32(0)), check, wdone);
 
         b_.SetInsertPoint(wtick); // unreachable now; kept so block wiring stays valid
@@ -5102,6 +5138,7 @@ private:
             case Inst::Tag::DumpFlush:
             case Inst::Tag::EventTrigger:
             case Inst::Tag::EventTriggerNb:
+            case Inst::Tag::EventTriggerNbDelayed:
                 return { 0, false, false };
         }
         return { 0, false, false };
@@ -5801,6 +5838,20 @@ private:
                 // stamps + wakes. The triggering process does not block.
                 b_.CreateStore(b_.getInt8(1), event_pending_gv_[static_cast<uint32_t>(p.signal)]);
                 return;
+
+            case Inst::Tag::EventTriggerNbDelayed: {
+                // `->> #d e` (LRM 15.5.4): schedule a detached wheel timer that
+                // fires the event's on-expiry thunk `d` ticks from now. The process
+                // does not block. The timer node (a bare rt_timer = {next, on_expire}
+                // = 2 pointers) is heap-allocated here and freed by the thunk.
+                const Signal ev       = ir_->extra_data<EventDelayInfo>(p.op_extra.extra).event;
+                llvm::Value* ticks    = cast(must_of(value_of(p.op_extra.op)), 64, false);
+                llvm::Value* deadline = b_.CreateAdd(b_.CreateCall(wheel_now_fn(), { wheel_ }), ticks);
+                llvm::Value* node     = b_.CreateCall(alloc_fn(), { b_.getInt64(16) });
+                b_.CreateCall(wheel_schedule_fn(),
+                              { wheel_, node, deadline, event_delay_thunk_[static_cast<uint32_t>(ev)] });
+                return;
+            }
 
             case Inst::Tag::Display:
                 lower_display(i);
@@ -9384,6 +9435,13 @@ private:
     // region scans exactly these for a pending nonblocking trigger. Collected in
     // nba_classify_ir.
     std::vector<Signal>                                nb_event_sigs_;
+    // Event signals that are targets of a delayed `->> #d e`; each gets a detached
+    // on-expiry thunk (event_delay_thunk_). Collected in nba_classify_ir.
+    std::vector<Signal>                                nb_delay_event_sigs_;
+    // Per delayed-trigger event: the wheel-timer on_expire thunk that stamps the
+    // trigger time and services the event's waiters. Indexed by signal handle;
+    // null for a non-target. Built in build_delay_event_thunks.
+    std::vector<llvm::Function*>                       event_delay_thunk_;
     // Per-process scheduled flags (clotho.proc_sched), built once in run().
     llvm::GlobalVariable*               sched_gv_     = nullptr;
     llvm::ArrayType*                    sched_arr_ty_ = nullptr;
