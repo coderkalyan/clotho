@@ -576,15 +576,25 @@ TEST_CASE("a nonblocking write to an array element lowers") {
     CHECK(r.ok);
 }
 
-TEST_CASE("a dynamic array fails loudly") {
+TEST_CASE("a dynamic array lowers (LRM 7.5)") {
     const LowerResult r = lower_text(R"(
         module top;
             int dyn [];
             initial dyn = new [4];
         endmodule
     )");
+    CHECK(r.ok);
+}
+
+TEST_CASE("a queue still fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            int q [$];
+            initial q.push_back(1);
+        endmodule
+    )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("dynamic / queue / associative") != std::string::npos);
+    CHECK(r.diagnostics.find("queue / associative") != std::string::npos);
 }
 
 TEST_CASE("a packed struct declares and carries its field table") {

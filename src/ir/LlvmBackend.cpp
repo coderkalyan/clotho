@@ -306,6 +306,12 @@ struct LValue {
     // indices so the target static leaf can be matched in SignalSlot::static_leaves.
     bool                  agg_static = true;
     std::vector<uint32_t> agg_field_path;
+    // A dynamic-array element target (LRM 7.5.1): `base` is the heap data
+    // pointer loaded from the handle, `elem_idx` the element position, and this
+    // is the i1 "index in [0, len)" predicate. When set, a read forces the
+    // element default (x/0) out of range and a write is suppressed out of range,
+    // so the heap buffer is never accessed past its length.
+    llvm::Value* dyn_inrange = nullptr;
 };
 
 // A scalar / string leaf of an aggregate signal reachable by a STATIC path
@@ -415,6 +421,11 @@ struct SignalSlot {
     // read-modify-write instead of a memcpy (mirrors `arr_masked`). Whole-leaf
     // writes to a masked aggregate use an all-ones mask.
     bool agg_masked = false;
+    // A dynamic-array signal: the slot is an opaque rt_dynarr handle
+    // (`clotho.dynarr`), has_z is false. Elements live in its heap buffer,
+    // reached by the ElemSelect dynarr path; the handle powers on { null, 0 }
+    // (an empty array) and is freed at teardown.
+    bool is_dynarr = false;
 };
 
 // One function-frame local: its `{ i(2W), iW }` slot type and width / domain.
@@ -439,6 +450,10 @@ struct FrameSlot {
     llvm::Type* storage_ty = nullptr;
     // The local's interned IR type (aggregate recursion needs it).
     Ref ir_type = Ref::Invalid;
+    // A dynamic-array local: the slot is an rt_dynarr handle; it powers on empty
+    // ({ null, 0 }) and is freed (rt_dynarr_delete) at every body exit, like a
+    // string local.
+    bool is_dynarr = false;
     // A ref formal: the local has no real frame storage (its dead field is kept
     // only so Local index == field index). Loads / stores redirect to the passed
     // actual pointer, recorded in ref_ptr_ by the callee prologue.
@@ -590,6 +605,62 @@ private:
               ctx_, { llvm::ArrayType::get(b_.getInt8Ty(), sizeof(rt_string)) }, "clotho.string");
         }
         return str_slot_ty_;
+    }
+
+    // The opaque rt_dynarr handle slot type (`%clotho.dynarr = { ptr, i64 }`),
+    // memoized. Must mirror the runtime rt_dynarr layout ({ void* data, u64 len }).
+    llvm::StructType* dynarr_slot_ty() {
+        if (dynarr_slot_ty_ == nullptr) {
+            dynarr_slot_ty_ =
+              llvm::StructType::create(ctx_, { raw_ptr_ty(), b_.getInt64Ty() }, "clotho.dynarr");
+        }
+        return dynarr_slot_ty_;
+    }
+
+    // Whether a type is a dynamic array (LRM 7.5).
+    bool is_dynarr_type(Ref type) const {
+        return std::get<Type>(mod_.pool.get(type)).kind == Type::Kind::DynArray;
+    }
+
+    // Per-element slot facts for a dynamic array's element (a POD scalar in phase
+    // 1). Mirrors the scalar-signal slot choice: 4-state keeps its z plane
+    // (`{ i2W, iW }`); 2-state and real take the narrow single-iW form.
+    struct DynElem {
+        llvm::StructType* slot_ty    = nullptr;
+        uint32_t          width      = 0;
+        bool              four_state = false;
+        bool              has_z      = false;
+        bool              narrow     = false;
+    };
+    DynElem dynarr_elem(Ref array_type) {
+        const Type&    at  = std::get<Type>(mod_.pool.get(array_type));
+        const Layout   lay = mod_.pool.layout(at.element);
+        DynElem        e;
+        e.width      = lay.width == 0 ? 1 : lay.width;
+        e.four_state = lay.domain == Domain::Four;
+        e.has_z      = e.four_state;
+        e.narrow     = !e.four_state; // 2-state / real element -> single iW slot
+        e.slot_ty    = slot_type(e.width, e.four_state, e.has_z, e.narrow);
+        return e;
+    }
+
+    // Element power-on prototype for `new[]`: X for a 4-state element, 0 for
+    // 2-state / real. A private constant global whose address the runtime copies
+    // into each freshly allocated element.
+    llvm::Value* dynarr_elem_proto(const DynElem& e) {
+        llvm::Constant*              mm = e.narrow ? zero(e.width) : x_mm(e.width);
+        std::vector<llvm::Constant*> fields{ mm };
+        if (e.has_z) {
+            fields.push_back(zero(e.width));
+        }
+        auto* init = llvm::ConstantStruct::get(e.slot_ty, fields);
+        return new llvm::GlobalVariable(llmod_, e.slot_ty, /*isConstant=*/true,
+                                        llvm::GlobalValue::InternalLinkage, init, "clotho.dynarr.proto");
+    }
+
+    // Byte size of one element slot (the runtime stride for rt_dynarr_*).
+    uint64_t dynarr_stride(const DynElem& e) {
+        return llmod_.getDataLayout().getTypeAllocSize(e.slot_ty);
     }
 
     // Whether a type is a string, or an unpacked array whose leaf element is.
@@ -862,6 +933,15 @@ private:
                 slot.storage_ty = agg_storage_ty(sigs[i].type);
                 std::vector<uint32_t> path;
                 collect_static_leaves(sigs[i].type, path, slot.static_leaves);
+                continue;
+            }
+            // A dynamic-array slot is an opaque rt_dynarr handle ({ data, len }):
+            // no planes, no z word; elements live in its heap buffer.
+            if (ty.kind == Type::Kind::DynArray) {
+                slot.is_dynarr  = true;
+                slot.has_z      = false;
+                slot.slot_ty    = dynarr_slot_ty();
+                slot.storage_ty = slot.slot_ty;
                 continue;
             }
             // A real / shortreal slot stores the IEEE-754 bit pattern in a
@@ -1346,6 +1426,7 @@ private:
                     select_member(m);
                     str_vals_.assign(ir_->inst_count(), nullptr);
                     build_str_temps();
+                    build_dynarr_temps();
                     lower_region(ir_->root());
                     deinit_body_strings();
                 }
@@ -1462,11 +1543,14 @@ private:
         // last member's temps; it feeds deinit_body_strings, which an
         // always-loop group never reaches.)
         std::vector<std::vector<llvm::Value*>> member_strs;
+        std::vector<std::vector<llvm::Value*>> member_dynarr;
         for (const uint32_t m : members) {
             select_member(m); // sizes the type cache build_str_temps consults
             str_vals_.assign(ir_->inst_count(), nullptr);
             build_str_temps();
+            build_dynarr_temps();
             member_strs.push_back(str_vals_);
+            member_dynarr.push_back(dynarr_ret_);
         }
         ir_ = &proc.ir;
 
@@ -1522,7 +1606,8 @@ private:
             b_.SetInsertPoint(loop_bb);
             for (size_t i = 0; i < members.size(); ++i) {
                 select_member(members[i]);
-                str_vals_ = member_strs[i];
+                str_vals_   = member_strs[i];
+                dynarr_ret_ = member_dynarr[i];
                 lower_region(ir_->root());              // member body (per trigger)
             }
             b_.CreateStore(b_.getInt32(0), sched_ptr_); // re-arm: ready to be woken
@@ -1534,7 +1619,8 @@ private:
         } else {
             // Never fused: a non-always (or sensitivity-less) group is a singleton.
             select_member(proc_index);
-            str_vals_ = member_strs.front();
+            str_vals_   = member_strs.front();
+            dynarr_ret_ = member_dynarr.front();
             lower_region(ir_->root());
         }
 
@@ -1606,6 +1692,12 @@ private:
                 params.push_back(ptr); // one pointer to the actual's packed slot
                 continue;
             }
+            // A dynamic array is one handle pointer regardless of direction (the
+            // callee copies in / out through it); it never uses the (mm, z) pair.
+            if (is_dynarr_type(pt)) {
+                params.push_back(ptr); // &actual (rt_dynarr*)
+                continue;
+            }
             if (dir == ArgDir::Out || dir == ArgDir::Inout) {
                 params.push_back(ptr); // &caller_temp.mm
                 params.push_back(ptr); // &caller_temp.z (copy-out at each return)
@@ -1614,7 +1706,8 @@ private:
             if (is_string_type(pt) || contains_struct(pt)) {
                 // A string handle or an aggregate's storage passes by pointer (In
                 // only — the frontend guards aggregate out/inout formals); the
-                // callee copy-in gives value semantics.
+                // callee copy-in gives value semantics. (A dynamic array is
+                // handled above, one pointer in every direction.)
                 params.push_back(ptr);
                 continue;
             }
@@ -1622,10 +1715,11 @@ private:
             params.push_back(int_ty(2 * w)); // must|may
             params.push_back(int_ty(w));     // z
         }
-        // A string or aggregate result returns through a trailing out-param the
-        // caller owns (its call-site temp) — neither has a plane struct form.
+        // A string, aggregate, or dynamic-array result returns through a trailing
+        // out-param the caller owns (its call-site temp) — none has a plane form.
         llvm::Type* rty = fn_return_ty(f.return_type);
-        if (is_string_type(f.return_type) || contains_struct(f.return_type)) {
+        if (is_string_type(f.return_type) || contains_struct(f.return_type) ||
+            is_dynarr_type(f.return_type)) {
             rty = b_.getVoidTy();
             params.push_back(ptr);
         }
@@ -1653,6 +1747,8 @@ private:
         for (size_t k = 0; k < f.param_types.size(); ++k) {
             if (f.arg_dirs[k] == ArgDir::Ref) {
                 params.push_back(ptr); // one pointer to the actual's packed slot
+            } else if (is_dynarr_type(f.param_types[k])) {
+                params.push_back(ptr); // &actual (rt_dynarr*), any direction
             } else if (f.arg_dirs[k] == ArgDir::In) {
                 if (is_string_type(f.param_types[k])) {
                     params.push_back(ptr); // rt_string handle
@@ -1691,8 +1787,12 @@ private:
         if (contains_struct(f.param_types[k])) {
             return true;
         }
-        return is_string_type(f.param_types[k]) &&
-               (!f.is_task || f.arg_dirs[k] == ArgDir::In);
+        // A dynamic array is one handle pointer in every direction (input / output /
+        // inout all pass &actual; the callee copies in/out through it).
+        if (is_dynarr_type(f.param_types[k])) {
+            return true;
+        }
+        return is_string_type(f.param_types[k]) && (!f.is_task || f.arg_dirs[k] == ArgDir::In);
     }
 
     std::vector<uint32_t> param_indices(const Function& f) const {
@@ -1779,6 +1879,15 @@ private:
                 fields[i]                 = frame_slots_[i].slot_ty;
                 continue;
             }
+            // A ref dynamic-array formal aliases the caller's handle (no owned frame
+            // slot, no init/copy/free): fall through to the dead-field path, and
+            // local_lvalue redirects its base to the passed pointer (ref_ptr_).
+            if (is_dynarr_type(f.local_types[i]) && !is_ref_formal) {
+                frame_slots_[i].is_dynarr = true;
+                frame_slots_[i].slot_ty   = dynarr_slot_ty();
+                fields[i]                 = frame_slots_[i].slot_ty;
+                continue;
+            }
             // A 2-state local uses the genuine iW slot; the packed-word ABI wire is
             // bridged by copy-in/out. A 4-state local keeps its z field (the ABI and
             // copy-in/out use it; LLVM folds the zero-z traffic on its own). A local
@@ -1817,6 +1926,12 @@ private:
                 b_.CreateCall(str_init_fn(), { slot });
                 continue;
             }
+            if (s.is_dynarr) {
+                // Empty array handle: { null, 0 } (the frame alloca is not
+                // zeroed; store the empty handle so the buffer pointer is null).
+                b_.CreateStore(llvm::Constant::getNullValue(s.slot_ty), slot);
+                continue;
+            }
             // A narrow 2-state local is a single iW field (comes up 0); a 4-state
             // local is the packed word (X) plus a cleared z field.
             if (s.narrow) {
@@ -1836,10 +1951,17 @@ private:
         for (uint32_t i = 0; i < frame_slots_.size(); ++i) {
             if (frame_slots_[i].is_string) {
                 b_.CreateCall(str_deinit_fn(), { b_.CreateStructGEP(frame_ty_, frame_, i) });
+            } else if (frame_slots_[i].is_dynarr) {
+                // A dynamic-array local owns its heap buffer (value semantics):
+                // free it at every body exit so it does not leak with the frame.
+                b_.CreateCall(dynarr_delete_fn(), { b_.CreateStructGEP(frame_ty_, frame_, i) });
             }
         }
         for (llvm::Value* temp : str_temp_list_) {
             b_.CreateCall(str_deinit_fn(), { temp });
+        }
+        for (llvm::Value* temp : dynarr_temp_list_) {
+            b_.CreateCall(dynarr_delete_fn(), { temp });
         }
     }
 
@@ -1870,6 +1992,7 @@ private:
         init_frame();
         emit_fn_agg_copyin(f);
         build_str_temps();
+        build_dynarr_temps();
         bind_ref_formals(f);
         emit_copyin(f);
 
@@ -1880,7 +2003,9 @@ private:
         if (b_.GetInsertBlock()->getTerminator() == nullptr) {
             emit_copyout(f);
             deinit_body_strings();
-            if (is_void(f.return_type)) {
+            // Check the LLVM return type, not the IR one: a string / dynamic-array
+            // result is void at the ABI (it returns through a trailing out-param).
+            if (fn_->getReturnType()->isVoidTy()) {
                 b_.CreateRetVoid();
             } else {
                 b_.CreateRet(llvm::ConstantAggregateZero::get(fn_->getReturnType()));
@@ -2007,6 +2132,7 @@ private:
         b_.SetInsertPoint(start_bb);
         init_frame();
         build_str_temps();
+        build_dynarr_temps();
         bind_ref_formals(f);
         emit_copyin(f);
         lower_region(ir_->root());
@@ -2090,6 +2216,18 @@ private:
             if (f.arg_dirs[k] == ArgDir::Ref) {
                 continue;
             }
+            if (is_dynarr_type(f.param_types[k])) {
+                // Deep copy the caller's array into the frame handle for input /
+                // inout (value semantics; init_frame left the slot empty). Output
+                // keeps the empty frame — it is filled by the body, copied out at
+                // return.
+                if (f.arg_dirs[k] == ArgDir::In || f.arg_dirs[k] == ArgDir::Inout) {
+                    b_.CreateCall(dynarr_assign_fn(),
+                                  { b_.CreateStructGEP(frame_ty_, frame_, k), fn_->getArg(base),
+                                    b_.getInt64(dynarr_stride(dynarr_elem(f.param_types[k]))) });
+                }
+                continue;
+            }
             if (f.arg_dirs[k] == ArgDir::In) {
                 if (is_string_type(f.param_types[k])) {
                     // Deep copy the caller's handle into the frame local (value
@@ -2117,6 +2255,14 @@ private:
                 continue;
             }
             const uint32_t base = param_llvm_index_[k];
+            // A dynamic-array output / inout formal deep-copies its frame handle
+            // back into the caller's array (the single passed handle pointer).
+            if (is_dynarr_type(f.param_types[k])) {
+                b_.CreateCall(dynarr_assign_fn(),
+                              { fn_->getArg(base), b_.CreateStructGEP(frame_ty_, frame_, k),
+                                b_.getInt64(dynarr_stride(dynarr_elem(f.param_types[k]))) });
+                continue;
+            }
             // The caller's out-target is still the packed word; lift a narrow local.
             const Plane    v    = to_four(lower_load(local_lvalue(k)));
             b_.CreateStore(v.mm, fn_->getArg(base));
@@ -2403,6 +2549,8 @@ private:
         for (const SignalSlot& s : slots_) {
             if (s.is_string) {
                 emit_string_slot_op(state, s, str_deinit_fn());
+            } else if (s.is_dynarr) {
+                b_.CreateCall(dynarr_delete_fn(), { storage_ptr(state, s) });
             }
         }
 
@@ -4998,6 +5146,26 @@ private:
 
     // String runtime (rt_string_*); every ptr is an rt_string handle except
     // where noted.
+    // -- Dynamic array runtime (rt_dynarr_*, LRM 7.5) --
+    // void rt_dynarr_new(rt_dynarr*, i64 stride, i64 n, const void* proto)
+    llvm::FunctionCallee dynarr_new_fn() {
+        return rt_fn("rt_dynarr_new", b_.getVoidTy(),
+                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), raw_ptr_ty() });
+    }
+    // void rt_dynarr_new_copy(rt_dynarr*, i64 stride, i64 n, const void* proto, const rt_dynarr* src)
+    llvm::FunctionCallee dynarr_new_copy_fn() {
+        return rt_fn("rt_dynarr_new_copy", b_.getVoidTy(),
+                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), raw_ptr_ty(), raw_ptr_ty() });
+    }
+    // void rt_dynarr_delete(rt_dynarr*)
+    llvm::FunctionCallee dynarr_delete_fn() {
+        return rt_fn("rt_dynarr_delete", b_.getVoidTy(), { raw_ptr_ty() });
+    }
+    // void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, i64 stride)
+    llvm::FunctionCallee dynarr_assign_fn() {
+        return rt_fn("rt_dynarr_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+    }
+
     llvm::FunctionCallee str_init_fn() {
         return rt_fn("rt_string_init", b_.getVoidTy(), { raw_ptr_ty() });
     }
@@ -5259,6 +5427,10 @@ private:
             // emit_agg_init) writes X into 4-state leaves and inits string leaves.
             return llvm::ConstantAggregateZero::get(s.storage_ty);
         }
+        if (s.is_dynarr) {
+            // Empty array handle: { null data, 0 len } == zeroinitializer.
+            return llvm::ConstantAggregateZero::get(s.storage_ty);
+        }
         if (s.is_string) {
             // Empty inline handle: byte (cap) holds cap == str_inline_cap, i.e.
             // sizeof(rt_string) - 1 (mirrors rt_string_init).
@@ -5496,6 +5668,10 @@ private:
             case Inst::Tag::TestPlusArgs:
             case Inst::Tag::ValuePlusArgs:
                 // LRM §21.6: an always-known (never x/z) boolean 'int'.
+                return { 32, false, true };
+            case Inst::Tag::DynArrayOp:
+                // Only size() is a value (a definite 2-state int); new / delete /
+                // copy are statements whose type is never queried.
                 return { 32, false, true };
 
             case Inst::Tag::Add:
@@ -5797,6 +5973,30 @@ private:
         }
     }
 
+    // Alloca an empty result handle for each dynamic-array-returning call in the
+    // current body (the callee copies its return value into it). The handle is the
+    // call's lvalue, so a `z = f()` assignment / `f().size()` / `foreach(f())`
+    // reads it; it is freed at every body exit (deinit_body_strings).
+    void build_dynarr_temps() {
+        dynarr_temp_list_.clear();
+        dynarr_ret_.assign(ir_->inst_count(), nullptr);
+        for (size_t k = 0; k < ir_->inst_count(); ++k) {
+            const auto i = static_cast<Index>(k);
+            if (ir_->tag(i) != Inst::Tag::Call) {
+                continue;
+            }
+            const auto ci = ir_->extra_data<CallInfo>(ir_->payload(i).extra);
+            if (!is_dynarr_type(mod_.function(ci.func).return_type)) {
+                continue;
+            }
+            auto* temp = b_.CreateAlloca(dynarr_slot_ty(), nullptr, "dynarr.ret");
+            temp->setAlignment(llvm::Align(8));
+            b_.CreateStore(llvm::Constant::getNullValue(dynarr_slot_ty()), temp); // empty handle
+            dynarr_ret_[k] = temp;
+            dynarr_temp_list_.push_back(temp);
+        }
+    }
+
     // -- Instruction dispatch --
 
     void lower_inst(Index i) {
@@ -5855,9 +6055,46 @@ private:
                 return;
             }
             case Inst::Tag::ElemSelect: {
-                LValue       lv = lvalue_of(p.op_extra.op);
-                const auto   es = ir_->extra_data<ElemSelect>(p.op_extra.extra);
-                const Type&  at = std::get<Type>(mod_.pool.get(es.array_type));
+                // Advance the lvalue's flat leaf index to the selected element:
+                // elem_idx += normalized_index * leaf-elements-per-selected-element
+                // (1 for a leaf select; the inner dimensions' product for an outer
+                // dimension of a multidimensional memory). The base lvalue's
+                // slot_ty and store_width already describe a leaf element (set by
+                // the array's signal slot), so this only shifts to the element and
+                // resets any inherited bit offset.
+                LValue         lv     = lvalue_of(p.op_extra.op);
+                const auto     es     = ir_->extra_data<ElemSelect>(p.op_extra.extra);
+                const Type&    at     = std::get<Type>(mod_.pool.get(es.array_type));
+                if (at.kind == Type::Kind::DynArray) {
+                    // Dynamic array (LRM 7.5): the base lvalue addresses the
+                    // { data, len } handle. Load the heap data pointer and length,
+                    // and build a fresh element lvalue over `[0 x elemslot]` at the
+                    // 0-based index, carrying the in-range predicate so the shared
+                    // load/store applies bounds (out-of-range read -> default,
+                    // write -> no-op; the heap is never touched past `len`).
+                    const DynElem e       = dynarr_elem(es.array_type);
+                    llvm::Value*  handle  = lv.base;
+                    llvm::Value*  dataptr = b_.CreateLoad(
+                      raw_ptr_ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 0));
+                    llvm::Value* len = b_.CreateLoad(
+                      b_.getInt64Ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 1));
+                    llvm::Value* idx64 = cast(must_of(value_of(es.index)), 64, false);
+                    LValue       el;
+                    el.base        = dataptr;
+                    el.slot_ty     = e.slot_ty;
+                    el.has_z       = e.has_z;
+                    el.narrow      = e.narrow;
+                    el.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
+                    el.elem_idx    = cast(idx64, 32, false);
+                    el.store_width = e.width;
+                    el.bit_off     = b_.getInt32(0);
+                    el.width       = e.width;
+                    el.is_signal   = lv.is_signal;
+                    el.sig         = lv.sig;
+                    el.dyn_inrange = b_.CreateICmpULT(idx64, len);
+                    set_lvalue(i, el);
+                    return;
+                }
                 // TODO: an X/Z or out-of-range index uses only its must bits, so it
                 // selects a wrong / out-of-bounds element. LRM: an out-of-range read
                 // yields X and such a write is a no-op.
@@ -5915,7 +6152,7 @@ private:
                     return;
                 }
                 const ValType t = type_of(i);
-                Plane         v = lower_load(lv);
+                Plane         v = lv.dyn_inrange != nullptr ? dyn_elem_load(lv) : lower_load(lv);
                 if (t.is_real) {
                     v = real_plane(planes_to_real(v, t.width));
                 }
@@ -5937,6 +6174,12 @@ private:
                     // Deep copy. Strings are guarded out of sensitivity lists in
                     // the frontend, so there is no wait queue to service.
                     b_.CreateCall(str_assign_fn(), { lv_string_ptr(lv), str_of(p.binary.r) });
+                    return;
+                }
+                if (lv.dyn_inrange != nullptr) {
+                    // Out-of-range write is a no-op (LRM 7.5.1): guard the store
+                    // (and its wait servicing) behind the in-range predicate.
+                    dyn_elem_store(lv, value_of(p.binary.r));
                     return;
                 }
                 // The snapshot covers the selected storage (whole signal, or one
@@ -6009,6 +6252,10 @@ private:
                 b_.CreateMemCpy(dst, al, src, al, sz);
                 return;
             }
+
+            case Inst::Tag::DynArrayOp:
+                lower_dyn_array_op(i);
+                return;
 
             case Inst::Tag::Constant: {
                 const Value& v = std::get<Value>(mod_.pool.get(p.ref));
@@ -6781,6 +7028,106 @@ private:
         return packed(cast(b_.CreateLShr(must_of(full), off), lv.width, false),
                       cast(b_.CreateLShr(may_of(full), off), lv.width, false),
                       cast(b_.CreateLShr(z, off), lv.width, false));
+    }
+
+    // Bounds-checked load of a dynamic-array element (LRM 7.5.1): in range, load
+    // from the heap buffer; out of range, yield the element default (X for
+    // 4-state, 0 for 2-state). The heap is only dereferenced on the in-range
+    // path, so an out-of-range or negative index never touches memory. Returns
+    // the same Plane shape lower_load would (narrow -> two_val; else { i2W, iW }),
+    // so the caller's real / domain handling is unchanged.
+    Plane dyn_elem_load(const LValue& lv) {
+        auto* fn    = b_.GetInsertBlock()->getParent();
+        auto* inbb  = llvm::BasicBlock::Create(ctx_, "dyn.load.in", fn);
+        auto* defbb = llvm::BasicBlock::Create(ctx_, "dyn.load.def", fn);
+        auto* cont  = llvm::BasicBlock::Create(ctx_, "dyn.load.cont", fn);
+        b_.CreateCondBr(lv.dyn_inrange, inbb, defbb);
+
+        b_.SetInsertPoint(inbb);
+        LValue clean       = lv;
+        clean.dyn_inrange  = nullptr;
+        const Plane vin    = lower_load(clean);
+        auto*       inend  = b_.GetInsertBlock();
+        b_.CreateBr(cont);
+
+        b_.SetInsertPoint(defbb);
+        b_.CreateBr(cont);
+
+        b_.SetInsertPoint(cont);
+        if (lv.narrow) {
+            auto* phi = b_.CreatePHI(int_ty(lv.width), 2);
+            phi->addIncoming(vin.mm, inend);
+            phi->addIncoming(zero(lv.width), defbb);
+            return two_val(phi);
+        }
+        auto* mmphi = b_.CreatePHI(int_ty(2 * lv.width), 2);
+        mmphi->addIncoming(vin.mm, inend);
+        mmphi->addIncoming(x_mm(lv.width), defbb);
+        auto* zphi = b_.CreatePHI(int_ty(lv.width), 2);
+        zphi->addIncoming(z_of(vin), inend);
+        zphi->addIncoming(zero(lv.width), defbb);
+        return { mmphi, zphi };
+    }
+
+    // Bounds-checked store of a dynamic-array element (LRM 7.5.1): the store and
+    // its wait-queue servicing run only when the index is in [0, len); an
+    // out-of-range write is a no-op.
+    void dyn_elem_store(const LValue& lv, Plane rhs) {
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* dobb = llvm::BasicBlock::Create(ctx_, "dyn.store.do", fn);
+        auto* cont = llvm::BasicBlock::Create(ctx_, "dyn.store.cont", fn);
+        b_.CreateCondBr(lv.dyn_inrange, dobb, cont);
+
+        b_.SetInsertPoint(dobb);
+        LValue clean              = lv;
+        clean.dyn_inrange         = nullptr;
+        const ServiceSnapshot old = service_snapshot(clean);
+        lower_store(clean, rhs);
+        service_after_write(clean, old);
+        b_.CreateBr(cont);
+
+        b_.SetInsertPoint(cont);
+    }
+
+    // Lower a dyn_array_op instruction: new[] / size() / delete() / whole-array
+    // copy over the handle lvalue (LRM 7.5). Element access rides the ElemSelect
+    // dynarr path, not this.
+    void lower_dyn_array_op(Index i) {
+        const Inst::Payload& p      = ir_->payload(i);
+        const auto           da     = ir_->extra_data<DynArrayInfo>(p.op_extra.extra);
+        const LValue&        lv     = lvalue_of(p.op_extra.op);
+        llvm::Value*         handle = lv.base;
+        // Element facts come from the op's own array-type handle, so the op works
+        // for a module signal or a frame-local dynamic array alike.
+        const DynElem e = dynarr_elem(da.array_type);
+        switch (static_cast<DynArrayOp>(da.sub)) {
+            case DynArrayOp::New: {
+                llvm::Value* n     = cast(must_of(value_of(da.size)), 64, false);
+                llvm::Value* proto = dynarr_elem_proto(e);
+                if (da.has_src) {
+                    b_.CreateCall(dynarr_new_copy_fn(),
+                                  { handle, b_.getInt64(dynarr_stride(e)), n, proto,
+                                    lvalue_of(da.src).base });
+                } else {
+                    b_.CreateCall(dynarr_new_fn(),
+                                  { handle, b_.getInt64(dynarr_stride(e)), n, proto });
+                }
+                return;
+            }
+            case DynArrayOp::Size: {
+                llvm::Value* len =
+                  b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 1));
+                set_value(i, two_val(cast(len, 32, false)));
+                return;
+            }
+            case DynArrayOp::Delete:
+                b_.CreateCall(dynarr_delete_fn(), { handle });
+                return;
+            case DynArrayOp::Copy:
+                b_.CreateCall(dynarr_assign_fn(),
+                              { handle, lvalue_of(da.src).base, b_.getInt64(dynarr_stride(e)) });
+                return;
+        }
     }
 
     void lower_store(const LValue& lv, Plane rhs) {
@@ -8414,6 +8761,17 @@ private:
             b_.CreateRetVoid();
             return;
         }
+        if (is_dynarr_type(cur_fn_->return_type)) {
+            // Deep-copy the returned array (an lvalue handle) into the caller's
+            // result handle (the trailing out-param), before freeing the body's
+            // handles (the value may be a frame local or a call result temp).
+            b_.CreateCall(dynarr_assign_fn(),
+                          { fn_->getArg(fn_->arg_size() - 1), lvalue_of(value).base,
+                            b_.getInt64(dynarr_stride(dynarr_elem(cur_fn_->return_type))) });
+            deinit_body_strings();
+            b_.CreateRetVoid();
+            return;
+        }
         if (cur_fn_->return_type == mod_.pool.void_type) {
             deinit_body_strings();
             b_.CreateRetVoid();
@@ -8447,12 +8805,19 @@ private:
         size_t k = 0;
         for (Index a : ir_->region(ci.args)) {
             const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
-            if (dir == ArgDir::Ref) {
-                // Pass one pointer to the actual's slot (scalar, or array element);
-                // the callee aliases it.
+            if (is_dynarr_type(f.param_types[k]) && dir != ArgDir::Ref) {
+                // A dynamic array passes one handle pointer (the actual) in every
+                // by-value direction; the callee copies in / out through it. (A ref
+                // dynarr falls to the Ref branch below, aliasing the same pointer.)
+                argv.push_back(lvalue_of(a).base);
+            } else if (dir == ArgDir::Ref) {
+                // Pass one pointer to the actual's slot (scalar, array element, or a
+                // dynamic-array handle); the callee aliases it.
                 const LValue& lv = lvalue_of(a);
-                argv.push_back(ref_actual_ptr(lv));
-                ref_svc.emplace_back(lv, service_snapshot(lv));
+                argv.push_back(is_dynarr_type(f.param_types[k]) ? lv.base : ref_actual_ptr(lv));
+                if (!is_dynarr_type(f.param_types[k])) {
+                    ref_svc.emplace_back(lv, service_snapshot(lv));
+                }
             } else if (dir == ArgDir::Out || dir == ArgDir::Inout) {
                 // An output / inout temp: pass pointers to its mm and z planes; the
                 // callee copies out through them (the caller copies the temp back to
@@ -8496,6 +8861,23 @@ private:
             b_.CreateCall(cf->getFunctionType(), cf, argv);
             for (auto& [lv, snap] : ref_svc) {
                 service_after_write(lv, snap);
+            }
+            return;
+        }
+        if (is_dynarr_type(f.return_type)) {
+            // The callee copies its return array into this call's result handle
+            // (the trailing out-param, alloc'd by build_dynarr_temps). Publish it as
+            // the call's lvalue so downstream consumers (assign / .size() / element)
+            // read it directly.
+            llvm::Value* temp = dynarr_ret_[static_cast<uint32_t>(i)];
+            LValue       lv;
+            lv.base    = temp;
+            lv.slot_ty = dynarr_slot_ty();
+            set_lvalue(i, lv);
+            argv.push_back(temp);
+            b_.CreateCall(cf->getFunctionType(), cf, argv);
+            for (auto& [lv2, snap] : ref_svc) {
+                service_after_write(lv2, snap);
             }
             return;
         }
@@ -8630,12 +9012,18 @@ private:
         // runtime wake keyed by signal id); TODO once that exists.
         std::vector<std::pair<LValue, ServiceSnapshot>> ref_svc;
         for (uint32_t k = 0; k < args.size(); ++k) {
-            if (tf.arg_dirs[k] == ArgDir::Ref) {
-                // Pass one pointer to the actual's slot (scalar, or array element);
-                // the callee aliases it.
+            if (is_dynarr_type(tf.param_types[k]) && tf.arg_dirs[k] != ArgDir::Ref) {
+                // One handle pointer for every by-value direction; callee copies
+                // in / out through it.
+                argv.push_back(lvalue_of(args[k]).base);
+            } else if (tf.arg_dirs[k] == ArgDir::Ref) {
+                // Pass one pointer to the actual's slot (scalar, array element, or a
+                // dynamic-array handle); the callee aliases it.
                 const LValue& lv = lvalue_of(args[k]);
-                argv.push_back(ref_actual_ptr(lv));
-                ref_svc.emplace_back(lv, service_snapshot(lv));
+                argv.push_back(is_dynarr_type(tf.param_types[k]) ? lv.base : ref_actual_ptr(lv));
+                if (!is_dynarr_type(tf.param_types[k])) {
+                    ref_svc.emplace_back(lv, service_snapshot(lv));
+                }
             } else if (tf.arg_dirs[k] == ArgDir::In) {
                 if (is_string_type(tf.param_types[k])) {
                     argv.push_back(str_of(args[k]));
@@ -10455,6 +10843,17 @@ private:
     std::vector<llvm::Value*> str_temp_list_;
     // Memoized `%clotho.string` handle slot type.
     llvm::StructType* str_slot_ty_ = nullptr;
+    // Memoized `%clotho.dynarr` handle slot type ({ ptr data, i64 len }).
+    llvm::StructType* dynarr_slot_ty_ = nullptr;
+    // Result-handle temporaries for dynamic-array-returning calls in the current
+    // body: alloca'd empty in the prologue, passed as the callee's trailing
+    // out-param, and freed at every body exit (parallel to str_temp_list_).
+    std::vector<llvm::Value*> dynarr_temp_list_;
+    // Per-call-instruction result handle (null for non-dynarr-returning calls),
+    // parallel to str_vals_ and snapshotted per fused member the same way — the
+    // coroutine body lowering resets lvals_ via select_member, so the mapping
+    // cannot live there.
+    std::vector<llvm::Value*> dynarr_ret_;
 };
 
 // Lower the coroutine intrinsics emitted for each process and clean up the

@@ -80,6 +80,18 @@ public:
     // Whole-object blocking copy `dst = src` of two aggregate lvalues of `type`
     // (lowered to llvm.memcpy of the storage; caller ensures no string leaf).
     Index agg_copy(Index dst, Index src, Ref type, SourceLoc loc);
+    // Dynamic-array operations on the handle lvalue `arr` (LRM 7.5). new /
+    // delete / copy are statements; size yields a 32-bit int. See ir::DynArrayOp.
+    // `array_type` is the interned DynArray type (element stride / slot).
+    // arr = new[size] [ (init) ]: reallocate; with `has_init`, copy from the
+    // source handle lvalue `init`.
+    Index dyn_array_new(Index arr, Index size, Index init, bool has_init, Ref array_type, SourceLoc loc);
+    // arr.size(): current element count.
+    Index dyn_array_size(Index arr, Ref array_type, SourceLoc loc);
+    // arr.delete(): free storage, size -> 0.
+    Index dyn_array_delete(Index arr, Ref array_type, SourceLoc loc);
+    // dst = src: deep copy of another dynamic array (value semantics).
+    Index dyn_array_copy(Index dst, Index src, Ref array_type, SourceLoc loc);
     // `unlikely` hints that the condition is rarely true (e.g. a violation
     // check), so the backend biases branch weights toward the else path.
     Index cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc,

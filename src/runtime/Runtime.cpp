@@ -896,6 +896,62 @@ extern "C" void rt_nba_arr_reset(void) {
     arr_total = 0;
 }
 
+// -- Dynamic arrays (LRM 7.5) --
+
+extern "C" void rt_dynarr_new(rt_dynarr* h, uint64_t stride, uint64_t n, const void* proto) {
+    std::free(h->data);
+    h->data = nullptr;
+    h->len  = 0;
+    if (n == 0) {
+        return;
+    }
+    auto* buf = static_cast<uint8_t*>(std::malloc(static_cast<size_t>(n * stride)));
+    for (uint64_t i = 0; i < n; ++i) {
+        std::memcpy(buf + i * stride, proto, static_cast<size_t>(stride));
+    }
+    h->data = buf;
+    h->len  = n;
+}
+
+extern "C" void rt_dynarr_new_copy(rt_dynarr* h, uint64_t stride, uint64_t n, const void* proto,
+                                   const rt_dynarr* src) {
+    // Copy from `src` before freeing `h`: a self-resize (`a = new[n](a)`) aliases
+    // src == h, so the old buffer must stay live through the element copy.
+    const uint64_t copy = src->len < n ? src->len : n;
+    auto*          buf  = n == 0 ? nullptr : static_cast<uint8_t*>(std::malloc(static_cast<size_t>(n * stride)));
+    if (copy != 0) {
+        std::memcpy(buf, src->data, static_cast<size_t>(copy * stride));
+    }
+    for (uint64_t i = copy; i < n; ++i) {
+        std::memcpy(buf + i * stride, proto, static_cast<size_t>(stride));
+    }
+    std::free(h->data);
+    h->data = buf;
+    h->len  = n;
+}
+
+extern "C" void rt_dynarr_delete(rt_dynarr* h) {
+    std::free(h->data);
+    h->data = nullptr;
+    h->len  = 0;
+}
+
+extern "C" void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, uint64_t stride) {
+    if (dst == src) {
+        return;
+    }
+    std::free(dst->data);
+    if (src->len == 0) {
+        dst->data = nullptr;
+        dst->len  = 0;
+        return;
+    }
+    auto* buf = static_cast<uint8_t*>(std::malloc(static_cast<size_t>(src->len * stride)));
+    std::memcpy(buf, src->data, static_cast<size_t>(src->len * stride));
+    dst->data = buf;
+    dst->len  = src->len;
+}
+
 extern "C" void rt_wheel_init(rt_wheel* wheel) {
     new (wheel->storage) RuntimeWheel;
 }

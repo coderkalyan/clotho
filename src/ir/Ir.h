@@ -183,6 +183,42 @@ struct MemberSelect {
     Ref struct_type;
 };
 
+// Which dynamic-array operation a `dyn_array_op` performs (LRM 7.5). Kept in
+// lockstep with the backend dispatch in LlvmBackend and the runtime rt_dynarr_*
+// functions.
+enum class DynArrayOp : uint32_t {
+    // arr = new[size] [ (src) ]: (re)allocate to `size` elements, each the
+    // element's power-on value; with an init source, copy min(size, src.len)
+    // elements from it first (LRM 7.5.1).
+    New,
+    // arr.size(): the current element count (LRM 7.5), a 32-bit int.
+    Size,
+    // arr.delete(): free the storage, size -> 0 (LRM 7.5).
+    Delete,
+    // arr = other: deep copy of another dynamic array's storage (value
+    // semantics, LRM 7.5).
+    Copy,
+};
+
+// Extra payload for `dyn_array_op`: a dynamic-array operation on the handle
+// lvalue `op` (the instruction's op_extra.op). `sub` is the ir::DynArrayOp;
+// `size` is the element count for New (else unused); `src` is the source handle
+// lvalue for a New init source or a Copy, valid iff `has_src`. `array_type` is
+// the interned DynArray type, giving the element stride / slot independently of
+// the target signal — so the op works for a module signal or a frame local.
+struct DynArrayInfo {
+    // ir::DynArrayOp value.
+    uint32_t sub;
+    // Element count operand (New).
+    Index size;
+    // Source dynamic-array handle lvalue (New init source / Copy).
+    Index src;
+    // Whether `src` is present.
+    uint32_t has_src;
+    // The interned DynArray type of the target (element stride / slot).
+    Ref array_type;
+};
+
 // Extra payload for `read_mem`: a $readmemh / $readmemb load of a file into an
 // unpacked-array memory. The filename value is the instruction's `op`: either a
 // packed-ASCII vector (the backend spills its must-bits to a byte buffer) or a
@@ -626,6 +662,7 @@ static_assert(ExtraPayload<DynPartSelect>);
 static_assert(ExtraPayload<ElemSelect>);
 static_assert(ExtraPayload<MemberSelect>);
 static_assert(ExtraPayload<AggCopyInfo>);
+static_assert(ExtraPayload<DynArrayInfo>);
 static_assert(ExtraPayload<ReadMemInfo>);
 static_assert(ExtraPayload<Regions>);
 static_assert(ExtraPayload<LoopInfo>);
@@ -701,6 +738,15 @@ struct Inst {
         // op_extra -> AggCopyInfo). Lowered to llvm.memcpy of the storage; the
         // frontend emits it only for a string-free aggregate.
         AggCopy,
+
+        // Dynamic-array operation on a handle lvalue (payload: op_extra ->
+        // DynArrayInfo; op is the dynamic-array handle lvalue). The `sub` field
+        // selects new[] / size() / delete() / whole-array copy (ir::DynArrayOp,
+        // LRM 7.5). new / delete / copy are statements; size yields a 32-bit
+        // int. Lowers to the matching rt_dynarr_* runtime call, with element
+        // access itself riding the ordinary ElemSelect path over the handle's
+        // heap buffer.
+        DynArrayOp,
 
         // -- Arithmetic (payload: binary) --
         Add,

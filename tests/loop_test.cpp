@@ -721,17 +721,20 @@ TEST_CASE("foreach over a string iterates its bytes") {
     )") == "0 97\n1 98\n2 99\n");
 }
 
-// Dynamic arrays, queues, and associative arrays are not modeled at all
-// (Lower.cpp: "dynamic / queue / associative arrays are not supported"), so a
-// foreach over one must fail loudly rather than silently mis-iterate.
-TEST_CASE("foreach over a dynamic array is rejected") {
-    const LowerResult r = lower_text(R"(
+// Dynamic arrays now lower (LRM 7.5); foreach iterates 0..size-1 over the
+// runtime length. Queues and associative arrays are still unmodeled and must
+// fail loudly rather than silently mis-iterate (see below).
+TEST_CASE("foreach over a dynamic array iterates the runtime size") {
+    CHECK(run_capture(R"(
         module m;
             integer dyn [];
-            initial foreach (dyn[i]) $display("%0d", i);
+            initial begin
+                dyn = new[3];
+                foreach (dyn[i]) dyn[i] = i + 5;
+                foreach (dyn[i]) $display("%0d %0d", i, dyn[i]);
+            end
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
+    )") == "0 5\n1 6\n2 7\n");
 }
 
 TEST_CASE("foreach over a queue is rejected") {

@@ -154,6 +154,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::ElemSelect:
         case T::MemberSelect:
         case T::AggCopy:
+        case T::DynArrayOp:
         case T::Cond:
         case T::Switch:
         case T::Fopen:
@@ -355,6 +356,20 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 scratch[0]      = p.op_extra.op;
                 scratch[1]      = info.src;
                 return { scratch.data(), 2 };
+            }
+            // dyn_array_op exposes the handle lvalue plus the New size and the
+            // New-init / Copy source lvalue; the sub-op selector is not an operand.
+            if (tag == Inst::Tag::DynArrayOp) {
+                const auto da = extra_data<DynArrayInfo>(p.op_extra.extra);
+                size_t     n  = 0;
+                scratch[n++]  = p.op_extra.op;
+                if (da.sub == static_cast<uint32_t>(DynArrayOp::New)) {
+                    scratch[n++] = da.size;
+                }
+                if (da.has_src) {
+                    scratch[n++] = da.src;
+                }
+                return { scratch.data(), n };
             }
             scratch[0] = p.op_extra.op;
             return { scratch.data(), 1 };

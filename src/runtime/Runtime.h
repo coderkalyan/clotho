@@ -372,6 +372,38 @@ uint32_t rt_nba_arr_any(void);
 // after the commit + wake pass.
 void rt_nba_arr_reset(void);
 
+// -- SystemVerilog dynamic arrays --
+//
+// The dynamic array type (LRM §7.5): a runtime-sized vector of a fixed-width
+// element. The value lives in a 16-byte caller-owned handle embedded in design
+// state (same ownership model as rt_string): `data` points at one heap buffer of
+// `len` elements, each `stride` bytes (the backend's per-element slot size),
+// malloc-owned by the handle. Copies are eager deep copies; handles never share
+// storage. A handle powers on zeroed — { null, 0 } is the empty array — and is
+// released with rt_dynarr_delete. The per-element record layout is defined by the
+// backend; the runtime owns only the raw byte buffer.
+typedef struct rt_dynarr {
+    void*    data;
+    uint64_t len;
+} rt_dynarr;
+
+// arr = new[n]: (re)allocate `h` to `n` elements of `stride` bytes, filling each
+// with the `stride`-byte power-on prototype `proto` (the element default: X for
+// 4-state, 0 for 2-state). Frees any prior buffer.
+void rt_dynarr_new(rt_dynarr* h, uint64_t stride, uint64_t n, const void* proto);
+
+// arr = new[n](src): like rt_dynarr_new, but the low min(n, src->len) elements
+// are first copied from `src`; any remaining elements take `proto` (LRM §7.5.1).
+// `src` may alias `h` (a self-resize).
+void rt_dynarr_new_copy(rt_dynarr* h, uint64_t stride, uint64_t n, const void* proto, const rt_dynarr* src);
+
+// arr.delete(): free the buffer and reset to the empty array. Idempotent.
+void rt_dynarr_delete(rt_dynarr* h);
+
+// dst = src: deep copy `src`'s `stride`-byte elements into `dst` (value
+// semantics, LRM §7.5). A no-op when dst == src.
+void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, uint64_t stride);
+
 // -- SystemVerilog string objects --
 //
 // The dynamic `string` type (LRM §6.16). A string value lives in a fixed

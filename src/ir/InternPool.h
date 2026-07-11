@@ -95,6 +95,12 @@ struct Type {
         // plane-packed value representation (mirrors String's width-0 sentinel);
         // the backend owns its own storage layout for it.
         Struct,
+        // Dynamic array (LRM §7.5): a runtime-sized vector of `element`. Not
+        // plane-sized — layout() reports width 0 and runtime storage is an
+        // opaque rt_dynarr handle ({ data, len }); consumers branch on the kind
+        // and query `element` for the per-element slot. left/right are unused
+        // (dynamic arrays are always 0-based [0:len-1]).
+        DynArray,
     };
 
     // Discriminant for this type.

@@ -178,10 +178,24 @@ struct Analysis {
                     break;
                 case Inst::Tag::PartSelect:
                 case Inst::Tag::DynPartSelect:
-                case Inst::Tag::ElemSelect:
                 case Inst::Tag::MemberSelect:
                     val_z[raw] = z_of(p.op_extra.op);
                     break;
+                case Inst::Tag::ElemSelect: {
+                    // A fixed-array element narrows its base's z. A dynamic-array
+                    // element lives in a separate heap slot that keeps its own z
+                    // plane (dynarr_elem), so a 4-state element may carry z
+                    // regardless of the handle; report conservatively so a
+                    // downstream signal is not z-elided.
+                    const auto  es = ir.extra_data<ElemSelect>(p.op_extra.extra);
+                    const Type& at = std::get<Type>(m.pool.get(es.array_type));
+                    if (at.kind == Type::Kind::DynArray) {
+                        val_z[raw] = m.pool.layout(at.element).domain == Domain::Four ? 1 : 0;
+                    } else {
+                        val_z[raw] = z_of(p.op_extra.op);
+                    }
+                    break;
+                }
 
                 case Inst::Tag::Load:
                     val_z[raw] = z_of(p.unary);
@@ -198,6 +212,11 @@ struct Analysis {
                     store_into(ir, fn, p.op_extra.op, storage_z(ir, fn, info.src));
                     break;
                 }
+                case Inst::Tag::DynArrayOp:
+                    // size() is a definite int (no z); new / delete / copy write
+                    // the handle, not a plane slot, so nothing propagates here.
+                    val_z[raw] = 0;
+                    break;
 
                 // Z-transparent value ops: the z plane rides through their
                 // lowerings (an unknown shift count / select condition forces X

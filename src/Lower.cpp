@@ -830,10 +830,29 @@ private:
 
             return module_.pool.put(ir::Item{ t });
         }
+        if (const auto* da = ct.as_if<slang::ast::DynamicArrayType>()) {
+            // Dynamic array (LRM 7.5): a heap-backed rt_dynarr handle. Phase 1
+            // restricts the element to a POD scalar (integral or real) — a single
+            // per-element slot; string / aggregate / nested variable-size elements
+            // need per-element deinit/copy and are a documented follow-up.
+            const slang::ast::Type& et = da->elementType.getCanonicalType();
+            if (!et.isIntegral() && !et.isFloating()) {
+                // TODO: dynamic array of string / struct / array / dynamic /
+                // queue / associative element (managed elements need per-element
+                // lifecycle in the runtime; see docs/design/dynamic-arrays.md).
+                fail("dynamic array element type is not supported (only integral / "
+                     "real elements)");
+            }
+            ir::Type t;
+            t.kind    = ir::Type::Kind::DynArray;
+            t.element = lower_type(da->elementType);
+
+            return module_.pool.put(ir::Item{ t });
+        }
         if (ct.isUnpackedArray()) {
-            // TODO: dynamic arrays, queues, associative arrays (variable-size,
-            // need heap-backed runtime storage).
-            fail("dynamic / queue / associative arrays are not supported");
+            // TODO: queues, associative arrays (variable-size, need heap-backed
+            // runtime storage). Dynamic arrays are handled above.
+            fail("queue / associative arrays are not supported");
         }
         if (ct.isString()) {
             return module_.pool.string_type;
@@ -1171,6 +1190,11 @@ private:
         }
     }
 
+    // True if an expression's type is a dynamic array (LRM 7.5).
+    static bool is_dyn_array(const slang::ast::Expression& e) {
+        return e.type->getCanonicalType().as_if<slang::ast::DynamicArrayType>() != nullptr;
+    }
+
     // True if an expression is of the dynamic `string` type (LRM 6.16).
     static bool is_string_expr(const slang::ast::Expression& e) {
         return e.type->getCanonicalType().isString();
@@ -1184,6 +1208,11 @@ private:
             return is_string_ref(t.element);
         }
         return t.kind == ir::Type::Kind::String;
+    }
+
+    // True if an interned IR type is a dynamic array (LRM 7.5).
+    bool is_dyn_array_ref(ir::Ref ty) const {
+        return std::get<ir::Type>(module_.pool.get(ty)).kind == ir::Type::Kind::DynArray;
     }
 
     // Intern a string literal's characters as a string constant. Every \0 byte
@@ -3171,14 +3200,23 @@ private:
         const ir::Index iter_lv = value_lvalue(*d.loopVar, b, l);
 
         if (!d.range.has_value()) {
-            if (!is_string_expr(f.arrayRef)) {
-                // TODO: dynamic array / queue / associative array foreach
-                // dimension -- needs a runtime-sized bound, not modeled
-                // (dynamic/queue/associative arrays fail at Lower.cpp:665).
-                fail("foreach over a dynamically-sized array dimension is not supported");
+            // A runtime-sized dimension (string or dynamic array): snapshot the
+            // length once and iterate 0..len-1 (0-based, matching StrGetc and
+            // dynamic-array element addressing).
+            if (is_string_expr(f.arrayRef)) {
+                const ir::Index len = b.unary(ir::Inst::Tag::StrLen, lower_expr(f.arrayRef, b), l);
+                lower_foreach_runtime_dim(f, dim, ty, iter_lv, len, b, l);
+                return;
             }
-            lower_foreach_string_dim(f, dim, ty, iter_lv, b, l);
-            return;
+            if (is_dyn_array(f.arrayRef)) {
+                const ir::Index len =
+                  b.dyn_array_size(lower_lvalue(f.arrayRef, b), lower_type(*f.arrayRef.type), l);
+                lower_foreach_runtime_dim(f, dim, ty, iter_lv, len, b, l);
+                return;
+            }
+            // TODO: queue / associative array foreach dimension -- needs the
+            // matching runtime-sized bound / ordered key iteration.
+            fail("foreach over a queue / associative array dimension is not supported");
         }
 
         // Fixed-range dimension (packed or unpacked): iterate the declared
@@ -3214,15 +3252,15 @@ private:
         b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
     }
 
-    // A `string` foreach dimension (LRM 12.7.3: "a string ... is treated as a
-    // dynamic array of bytes indexed from 0 to N-1"). The bound is the
-    // runtime length, snapshotted once on entry like a repeat-loop's count --
-    // resizing the string mid-loop is undefined behavior per the LRM (same
-    // clause), so one read is enough. 0-based, matching StrGetc addressing.
-    void lower_foreach_string_dim(const ForeachLoopStatement& f, size_t dim, ir::Ref ty,
-                                   ir::Index iter_lv, ir::Builder& b, ir::SourceLoc l) {
+    // A runtime-sized foreach dimension (LRM 12.7.3: a `string` "is treated as a
+    // dynamic array of bytes indexed from 0 to N-1"; a dynamic array likewise).
+    // The bound `len` is snapshotted once on entry like a repeat-loop's count --
+    // resizing the container mid-loop is undefined behavior per the LRM (same
+    // clause), so one read is enough. 0-based, matching StrGetc / element
+    // addressing.
+    void lower_foreach_runtime_dim(const ForeachLoopStatement& f, size_t dim, ir::Ref ty,
+                                   ir::Index iter_lv, ir::Index len, ir::Builder& b, ir::SourceLoc l) {
         const ir::Signal bound = declare_temp(ty, "foreach_bound");
-        const ir::Index  len   = b.unary(ir::Inst::Tag::StrLen, lower_expr(f.arrayRef, b), l);
         b.binary(ir::Inst::Tag::Store, b.signal(bound, l), b.resize(len, ty, l), l);
         b.binary(ir::Inst::Tag::Store, iter_lv, b.constant(module_.pool.put_int(ty, 0), l), l);
 
@@ -3837,6 +3875,13 @@ private:
         if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
             is_string_expr(*call.arguments()[0])) {
             lower_string_method(name, call, b);
+            return;
+        }
+        // A dynamic-array method as a statement (arr.delete(); arr.size() is
+        // legal-but-pointless): lower for effect, discard the value.
+        if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
+            is_dyn_array(*call.arguments()[0])) {
+            lower_dyn_array_method(name, call, b, loc(call));
             return;
         }
         if (const char rx = display_radix(name, "$display")) {
@@ -4505,6 +4550,13 @@ private:
         if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
             is_string_expr(*call.arguments()[0])) {
             return lower_string_method(name, call, b);
+        }
+
+        // Dynamic-array built-in methods (arr.size(), LRM 7.5) arrive the same
+        // way, with the array as arguments()[0].
+        if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
+            is_dyn_array(*call.arguments()[0])) {
+            return lower_dyn_array_method(name, call, b, l);
         }
 
         // Enum methods (LRM 6.19.2-6.19.5) arrive the same way, with an enum-typed
@@ -5433,6 +5485,15 @@ private:
             // have that shadow, so reject the rest.
             check_task_nba_target(a.left());
         }
+        if (is_dyn_array(a.left())) {
+            if (a.isNonBlocking()) {
+                // TODO: nonblocking assignment to a dynamic array (needs a
+                // handle-aware NBA staging path; the per-signal shadow is
+                // plane-shaped).
+                fail("nonblocking assignment to a dynamic array is not supported");
+            }
+            return lower_dyn_array_assign(a, b);
+        }
         if (is_unpacked_array(a.left())) {
             // A whole blocking copy of one plain (string-free) unpacked array into
             // another is a single memcpy of the storage (same AggCopy path as an
@@ -5482,6 +5543,45 @@ private:
         }
         b.binary(tag, lower_lvalue(a.left(), b), rhs, loc(a));
         return rhs;
+    }
+
+    // Whole dynamic-array assignment (LRM 7.5): `arr = new[n]` / `arr = new[n](src)`
+    // (allocate + optional element copy) or `arr = other` (deep copy). Element
+    // writes (`arr[i] = x`) are ordinary Stores over an ElemSelect and do not
+    // reach here.
+    ir::Index lower_dyn_array_assign(const AssignmentExpression& a, ir::Builder& b) {
+        const ir::SourceLoc l   = loc(a);
+        const ir::Index     dst = lower_lvalue(a.left(), b);
+        const ir::Ref       aty = lower_type(*a.left().type);
+        if (a.right().kind == ExpressionKind::NewArray) {
+            const auto&     na   = a.right().as<slang::ast::NewArrayExpression>();
+            const ir::Index size = lower_expr(na.sizeExpr(), b);
+            if (const Expression* init = na.initExpr()) {
+                b.dyn_array_new(dst, size, lower_lvalue(*init, b), /*has_init*/ true, aty, l);
+            } else {
+                b.dyn_array_new(dst, size, dst, /*has_init*/ false, aty, l);
+            }
+            return dst;
+        }
+        // arr = other: deep copy the source handle (value semantics).
+        b.dyn_array_copy(dst, lower_lvalue(a.right(), b), aty, l);
+        return dst;
+    }
+
+    // A dynamic-array built-in method used as an rvalue or statement (LRM 7.5).
+    // The receiver arrives as arguments()[0], like a string method.
+    ir::Index lower_dyn_array_method(std::string_view name, const CallExpression& call, ir::Builder& b,
+                                     ir::SourceLoc l) {
+        const ir::Index arr = lower_lvalue(*call.arguments()[0], b);
+        const ir::Ref   aty = lower_type(*call.arguments()[0]->type);
+        if (name == "size") {
+            return b.resize(b.dyn_array_size(arr, aty, l), lower_type(*call.type), l);
+        }
+        if (name == "delete") {
+            return b.dyn_array_delete(arr, aty, l);
+        }
+        // TODO: dynamic array find/sort/sum/etc. reduction & locator methods.
+        fail("dynamic array method '" + std::string(name) + "' is not supported");
     }
 
     // Compound assignment `lhs op= rhs` (LRM 11.4.1, always blocking). slang has
@@ -5771,7 +5871,7 @@ private:
                 }
                 const ir::Index base = select_base_lvalue(es.value(), b, l);
                 const ir::Index sel =
-                    is_unpacked_array(es.value())
+                    is_unpacked_array(es.value()) || is_dyn_array(es.value())
                         ? b.elem_select(base, lower_expr(es.selector(), b), lower_type(*es.value().type), l)
                         : b.binary(ir::Inst::Tag::BitSelect, base, packed_bit_index(es, b, l), l);
                 const ir::Index v = b.unary(ir::Inst::Tag::Load, sel, l);
@@ -6361,7 +6461,7 @@ private:
             case ExpressionKind::ElementSelect: {
                 const ElementSelectExpression& es   = expr.as<ElementSelectExpression>();
                 const ir::Index                base = lower_lvalue(es.value(), b);
-                if (is_unpacked_array(es.value())) {
+                if (is_unpacked_array(es.value()) || is_dyn_array(es.value())) {
                     return b.elem_select(base, lower_expr(es.selector(), b), lower_type(*es.value().type), l);
                 }
                 return b.binary(ir::Inst::Tag::BitSelect, base, packed_bit_index(es, b, l), l);
@@ -6373,6 +6473,18 @@ private:
             }
             case ExpressionKind::MemberAccess:
                 return lower_member_lvalue(expr.as<MemberAccessExpression>(), b, l);
+            case ExpressionKind::Call:
+                // A dynamic-array-returning call is an lvalue: its result handle
+                // (allocated by the backend) is read by an assignment / .size() /
+                // element access / foreach. Other call results are not lvalues.
+                if (is_dyn_array(expr)) {
+                    const std::optional<ir::Index> v = lower_user_call(expr.as<CallExpression>(), b);
+                    if (!v) {
+                        fail("dynamic-array call used as an lvalue produced no value");
+                    }
+                    return *v;
+                }
+                fail("unsupported assignment target kind=Call");
             default:
                 fail("unsupported assignment target kind=" + std::string(slang::ast::toString(expr.kind)));
         }
@@ -6585,6 +6697,12 @@ private:
                 b.unary(ir::Inst::Tag::Ret, lower_lvalue(src, b), l);
                 return;
             }
+            // A dynamic-array result is returned as its handle lvalue; the backend
+            // deep-copies it into the caller's result handle (LRM 13.4 value return).
+            if (is_dyn_array_ref(fn_ctx_->ret_type)) {
+                b.unary(ir::Inst::Tag::Ret, lower_lvalue(*r.expr, b), l);
+                return;
+            }
             // A string result needs no width resize (slang already converted).
             const ir::Index v = lower_expr(*r.expr, b);
             b.unary(ir::Inst::Tag::Ret,
@@ -6593,14 +6711,16 @@ private:
                       : coerce(v, *r.expr->type, fn_ctx_->ret_type, b, l),
                     l);
         } else if (fn_ctx_->has_ret_local) {
-            // `return;` in a non-void function yields the current function-var value.
-            // An aggregate yields the function var's lvalue (copied out by the backend).
+            // `return;` in a non-void function yields the current function-var value:
+            // an aggregate / dynamic array yields its lvalue (copied out by the
+            // backend), else the loaded value.
             if (contains_struct_ref(fn_ctx_->ret_type)) {
                 b.unary(ir::Inst::Tag::Ret, b.local(fn_ctx_->ret_local, fn_ctx_->ret_type, l), l);
                 return;
             }
             const ir::Index rv = b.local(fn_ctx_->ret_local, fn_ctx_->ret_type, l);
-            b.unary(ir::Inst::Tag::Ret, b.unary(ir::Inst::Tag::Load, rv, l), l);
+            b.unary(ir::Inst::Tag::Ret,
+                    is_dyn_array_ref(fn_ctx_->ret_type) ? rv : b.unary(ir::Inst::Tag::Load, rv, l), l);
         } else {
             b.unary(ir::Inst::Tag::Ret, void_ret_operand(b, l), l);
         }
@@ -6657,11 +6777,14 @@ private:
                 // ref / const ref (LRM 13.5.2): the formal aliases the actual's live
                 // storage through a passed pointer (see build_function / build_task
                 // and the backend ref ABI). Supported for packed integral formals
-                // (scalar / packed vector) in functions and tasks.
-                if (!fa->getType().getCanonicalType().isIntegral()) {
+                // (scalar / packed vector) and dynamic arrays (the handle pointer is
+                // aliased directly).
+                const auto& ct = fa->getType().getCanonicalType();
+                if (!ct.isIntegral() && ct.as_if<slang::ast::DynamicArrayType>() == nullptr) {
                     // TODO: ref of unpacked array / struct / string / real — needs a
                     // handle pass or offset plumbing, not the packed-slot pointer ABI.
-                    fail("ref arguments are only supported for packed integral types");
+                    fail("ref arguments are only supported for packed integral types "
+                         "and dynamic arrays");
                 }
                 continue;
             }
@@ -6955,6 +7078,19 @@ private:
                     fail("aggregate argument must be a variable");
                 }
                 args.push_back(lower_lvalue(src, b));
+                continue;
+            }
+            // A dynamic-array actual passes one handle lvalue for every direction:
+            // the callee deep-copies it in (input / inout), copies its frame handle
+            // back out (output / inout), or aliases it (ref). No caller temp — the
+            // actual is always a whole handle. slang wraps an output / inout actual
+            // in an AssignmentExpression; unwrap to the bound lvalue.
+            if (is_dyn_array_ref(pty)) {
+                const Expression* actual = actuals[i];
+                if (actual->kind == ExpressionKind::Assignment) {
+                    actual = &actual->as<AssignmentExpression>().left();
+                }
+                args.push_back(lower_lvalue(*actual, b));
                 continue;
             }
             if (dir == slang::ast::ArgumentDirection::Ref) {

@@ -169,6 +169,10 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_nba_arr_count", &rt_nba_arr_count);
     expose("rt_nba_arr_any", &rt_nba_arr_any);
     expose("rt_nba_arr_reset", &rt_nba_arr_reset);
+    expose("rt_dynarr_new", &rt_dynarr_new);
+    expose("rt_dynarr_new_copy", &rt_dynarr_new_copy);
+    expose("rt_dynarr_delete", &rt_dynarr_delete);
+    expose("rt_dynarr_assign", &rt_dynarr_assign);
     expose("rt_string_init", &rt_string_init);
     expose("rt_string_deinit", &rt_string_deinit);
     expose("rt_string_assign", &rt_string_assign);

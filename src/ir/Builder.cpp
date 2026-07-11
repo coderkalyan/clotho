@@ -126,6 +126,34 @@ Index Builder::agg_copy(Index dst, Index src, Ref type, SourceLoc loc) {
     return emit({ Inst::Tag::AggCopy, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
 }
 
+Index Builder::dyn_array_new(Index arr, Index size, Index init, bool has_init, Ref array_type, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(
+      DynArrayInfo{ static_cast<uint32_t>(DynArrayOp::New), size, init, has_init ? 1u : 0u, array_type });
+
+    return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { arr, extra } } }, loc);
+}
+
+Index Builder::dyn_array_size(Index arr, Ref array_type, SourceLoc loc) {
+    const ExtraIndex extra =
+      add_extra(DynArrayInfo{ static_cast<uint32_t>(DynArrayOp::Size), arr, arr, 0u, array_type });
+
+    return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { arr, extra } } }, loc);
+}
+
+Index Builder::dyn_array_delete(Index arr, Ref array_type, SourceLoc loc) {
+    const ExtraIndex extra =
+      add_extra(DynArrayInfo{ static_cast<uint32_t>(DynArrayOp::Delete), arr, arr, 0u, array_type });
+
+    return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { arr, extra } } }, loc);
+}
+
+Index Builder::dyn_array_copy(Index dst, Index src, Ref array_type, SourceLoc loc) {
+    const ExtraIndex extra =
+      add_extra(DynArrayInfo{ static_cast<uint32_t>(DynArrayOp::Copy), dst, src, 1u, array_type });
+
+    return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+}
+
 Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc,
                     bool unlikely) {
     const ExtraIndex extra = add_extra(Regions{ then_region, else_region, unlikely });
