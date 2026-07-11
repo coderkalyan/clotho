@@ -284,7 +284,8 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     void record_write(const Expression& lhs) {
         switch (lhs.kind) {
             case ExpressionKind::NamedValue:
-                mark_written(lhs.as<NamedValueExpression>().symbol);
+            case ExpressionKind::HierarchicalValue:
+                mark_written(lhs.as<ValueExpressionBase>().symbol);
                 break;
             case ExpressionKind::ElementSelect: {
                 const ElementSelectExpression& es = lhs.as<ElementSelectExpression>();
@@ -316,6 +317,10 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     }
 
     void handle(const NamedValueExpression& nv) { record_read(nv.symbol); }
+
+    // A hierarchical read (`@* … = top.u1.sig`, LRM 23.6) makes the process
+    // sensitive to the target instance's signal, same as a local read.
+    void handle(const HierarchicalValueExpression& hv) { record_read(hv.symbol); }
 
     void handle(const AssignmentExpression& a) {
         a.right().visit(*this); // RHS: pure reads
@@ -423,33 +428,47 @@ public:
       : module_(module)
       , tick_fs_(tick_fs) {}
 
-    // Flatten one elaborated instance into the module: register its signals under
-    // `prefix`, lower its processes, then recurse into child instances and wire
-    // their ports. `prefix` is empty for the top instance and "<inst>." per level
-    // below it. Each instance has its own slang body with distinct ValueSymbols,
-    // so sigmap_ (keyed by symbol) disambiguates repeated instantiations for free.
-    void lower_instance(const InstanceSymbol& inst, std::string_view prefix) {
-        if (prefix.empty()) {
+    // Lowering runs the instance hierarchy twice. Signal registration must
+    // precede body lowering across the *whole* design, not just up the tree:
+    // a hierarchical reference (`top.u1.sig`, LRM 23.6) may point downward or
+    // sideways to a signal whose instance is lowered later, and signal_of needs
+    // it in sigmap_ already. So Collect walks the tree registering every signal
+    // and building the scope tree; Emit walks it again lowering processes. The
+    // two passes traverse identically, so per-scope signal order (and thus the
+    // backend's state layout) is unchanged from a single interleaved pass.
+    enum class Pass : uint8_t { Collect, Emit };
+
+    // Flatten one elaborated instance into the module under `prefix` (empty for
+    // the top, "<inst>." per level below). In Collect: open this instance's
+    // hierarchy scope, register its signals, recurse to collect children. In
+    // Emit: `node` is this instance's already-built scope; lower its processes
+    // and recurse. Repeated instantiations disambiguate for free — slang gives
+    // each instance distinct ValueSymbols, so sigmap_ (keyed by symbol) maps
+    // each to its own signal.
+    void lower_instance(const InstanceSymbol& inst, std::string_view prefix, Pass pass,
+                        ir::InstanceScope* node) {
+        if (prefix.empty() && pass == Pass::Collect) {
             module_.name = std::string(inst.name);
         }
         const std::string         self_prefix(prefix);
         const InstanceBodySymbol& body = inst.body;
 
-        // Open this instance's hierarchy scope: signals registered while it is
-        // on top of the stack (ports, nets/vars, generate-block signals, and
-        // compiler temps) are recorded as declared here. A parent's children
-        // vector only grows after this child pops, so the stacked pointers stay
-        // stable across the recursion.
-        ir::InstanceScope node;
-        node.name     = std::string(inst.name);
-        node.def_name = std::string(inst.getDefinition().name);
-        ir::InstanceScope* self = nullptr;
-        if (scope_stack_.empty()) {
-            top_scope_ = std::move(node);
-            self       = &top_scope_;
-        } else {
-            scope_stack_.back()->children.push_back(std::move(node));
-            self = &scope_stack_.back()->children.back();
+        // Collect builds the scope node; Emit reuses the node Collect built.
+        // A parent's children vector only grows during Collect (before this
+        // child pops), so stacked pointers stay stable across that recursion;
+        // by Emit the tree is frozen, so a child-node pointer is stable too.
+        ir::InstanceScope* self = node;
+        if (pass == Pass::Collect) {
+            ir::InstanceScope fresh;
+            fresh.name     = std::string(inst.name);
+            fresh.def_name = std::string(inst.getDefinition().name);
+            if (scope_stack_.empty()) {
+                top_scope_ = std::move(fresh);
+                self       = &top_scope_;
+            } else {
+                scope_stack_.back()->children.push_back(std::move(fresh));
+                self = &scope_stack_.back()->children.back();
+            }
         }
         scope_stack_.push_back(self);
 
@@ -467,8 +486,11 @@ public:
 
         prefix_ = self_prefix;
         scope_  = &body;
-        collect_signals(body);
-        lower_members(body, self_prefix, self_mul);
+        if (pass == Pass::Collect) {
+            collect_signals(body);
+        }
+        size_t child_cursor = 0;
+        lower_members(body, self_prefix, self_mul, pass, *self, child_cursor);
 
         scope_stack_.pop_back();
     }
@@ -480,7 +502,8 @@ public:
     // all initializers (each top gets its own Lowerer, so this covers each one).
     void lower_top(const InstanceSymbol& top, std::string_view prefix) {
         top_elided_ = prefix.empty();
-        lower_instance(top, prefix);
+        lower_instance(top, prefix, Pass::Collect, nullptr);
+        lower_instance(top, prefix, Pass::Emit, &top_scope_);
         finalize_preinit();
         module_.add_top(std::move(top_scope_));
     }
@@ -532,40 +555,48 @@ private:
     // hierarchical name prefix of `scope`; `self_mul` is the enclosing instance's
     // time multiplier, restored after a child instance recurses. Signals are
     // already registered by collect_signals, which walked the same generate tree.
-    void lower_members(const Scope& scope, const std::string& self_prefix, uint64_t self_mul) {
+    void lower_members(const Scope& scope, const std::string& self_prefix, uint64_t self_mul,
+                       Pass pass, ir::InstanceScope& node, size_t& child_cursor) {
         // prefix_ / scope_ hold this level's values on entry to each iteration:
         // set by the caller and restored after any case that descends and changes
-        // them, so signal-creating process lowering always sees this level.
+        // them, so signal-creating process lowering always sees this level. In
+        // Collect only the structural cases (instances / generate constructs) do
+        // work — signals were registered by collect_signals; behavioral members
+        // lower in Emit. `child_cursor` walks this scope's node.children in the
+        // order Collect pushed them, so Emit hands each recursion its own node.
+        const bool emit = pass == Pass::Emit;
         for (const Symbol& m : scope.members()) {
             switch (m.kind) {
                 case SymbolKind::ContinuousAssign:
-                    lower_continuous_assign(m.as<ContinuousAssignSymbol>());
+                    if (emit) lower_continuous_assign(m.as<ContinuousAssignSymbol>());
                     break;
                 case SymbolKind::ProceduralBlock:
-                    lower_procedural_block(m.as<ProceduralBlockSymbol>());
+                    if (emit) lower_procedural_block(m.as<ProceduralBlockSymbol>());
                     break;
                 case SymbolKind::Variable:
                     // Storage was registered by collect_signals; here only a
                     // declaration initializer (LRM 6.8) needs lowering, into the
                     // pre-init process.
-                    lower_var_initializer(m.as<VariableSymbol>());
+                    if (emit) lower_var_initializer(m.as<VariableSymbol>());
                     break;
                 case SymbolKind::Net:
                     // Storage was registered by collect_signals; a net declaration
                     // assignment (`wire w = expr`) is a continuous assignment.
-                    lower_net_initializer(m.as<NetSymbol>());
+                    if (emit) lower_net_initializer(m.as<NetSymbol>());
                     break;
                 case SymbolKind::Instance: {
                     const InstanceSymbol& child = m.as<InstanceSymbol>();
-                    // Recurse first (collects child signals), then wire ports: a
-                    // connection's parent-side expression resolves against signals
-                    // already registered in this (parent) body. Recursion leaves
-                    // prefix_ at the child level, so restore it before wiring.
-                    lower_instance(child, self_prefix + std::string(child.name) + ".");
+                    // Emit wires ports after the child recurses: a connection's
+                    // parent-side expression resolves against signals in this
+                    // (parent) body. Recursion leaves prefix_ at the child level,
+                    // so restore it before wiring.
+                    ir::InstanceScope* child_node = emit ? &node.children[child_cursor++] : nullptr;
+                    lower_instance(child, self_prefix + std::string(child.name) + ".", pass,
+                                   child_node);
                     prefix_   = self_prefix;
                     scope_    = &scope;
                     time_mul_ = self_mul;
-                    wire_ports(child);
+                    if (emit) wire_ports(child);
                     break;
                 }
                 case SymbolKind::GenerateBlock: {
@@ -574,7 +605,8 @@ private:
                     // contributes nothing (its body is not part of the design).
                     const auto& gb = m.as<GenerateBlockSymbol>();
                     if (!gb.isUninstantiated) {
-                        lower_generate_block(gb, self_prefix + gb.getExternalName() + ".", self_mul);
+                        lower_generate_block(gb, self_prefix + gb.getExternalName() + ".", self_mul,
+                                             pass, node, child_cursor);
                         prefix_ = self_prefix;
                         scope_  = &scope;
                     }
@@ -589,14 +621,14 @@ private:
                             continue;
                         }
                         lower_generate_block(*e, self_prefix + gen_entry_name(ga, *e) + ".",
-                                             self_mul);
+                                             self_mul, pass, node, child_cursor);
                     }
                     prefix_ = self_prefix;
                     scope_  = &scope;
                     break;
                 }
                 case SymbolKind::PrimitiveInstance:
-                    lower_gate(m.as<PrimitiveInstanceSymbol>());
+                    if (emit) lower_gate(m.as<PrimitiveInstanceSymbol>());
                     break;
                 case SymbolKind::InstanceArray: {
                     // An array of instances — gate primitives (LRM 28.3.6) or
@@ -604,7 +636,8 @@ private:
                     // elaborated one leaf symbol per element with per-instance
                     // bit-sliced connections, so this only needs to walk to
                     // the leaves and lower each like its scalar counterpart.
-                    lower_instance_array(m.as<InstanceArraySymbol>(), self_prefix, scope, self_mul);
+                    lower_instance_array(m.as<InstanceArraySymbol>(), self_prefix, scope, self_mul,
+                                         pass, node, child_cursor);
                     prefix_   = self_prefix;
                     scope_    = &scope;
                     time_mul_ = self_mul;
@@ -644,10 +677,15 @@ private:
     // implicit localparams in the block scope, so const folding and parameter
     // reads resolve them once scope_ points at the block.
     void lower_generate_block(const GenerateBlockSymbol& block, const std::string& block_prefix,
-                              uint64_t self_mul) {
+                              uint64_t self_mul, Pass pass, ir::InstanceScope& node,
+                              size_t& child_cursor) {
+        // A generate block gets no scope node of its own: its signals fold into
+        // the enclosing instance's scope (with prefixed names), and any instances
+        // it contains become children of that instance's node. So `node` /
+        // `child_cursor` thread straight through.
         prefix_ = block_prefix;
         scope_  = &block;
-        lower_members(block, block_prefix, self_mul);
+        lower_members(block, block_prefix, self_mul, pass, node, child_cursor);
     }
 
     // Recurse through one (possibly multidimensional) array of instances —
@@ -660,23 +698,27 @@ private:
     // generate-loop arrays (gen_entry_name); a gate leaf needs no hierarchy
     // bookkeeping of its own.
     void lower_instance_array(const InstanceArraySymbol& arr, const std::string& self_prefix,
-                              const Scope& parent_scope, uint64_t self_mul) {
+                              const Scope& parent_scope, uint64_t self_mul, Pass pass,
+                              ir::InstanceScope& node, size_t& child_cursor) {
+        const bool emit = pass == Pass::Emit;
         for (const Symbol* elem : arr.elements) {
             switch (elem->kind) {
                 case SymbolKind::InstanceArray:
                     lower_instance_array(elem->as<InstanceArraySymbol>(), self_prefix, parent_scope,
-                                        self_mul);
+                                        self_mul, pass, node, child_cursor);
                     break;
                 case SymbolKind::PrimitiveInstance:
-                    lower_gate(elem->as<PrimitiveInstanceSymbol>());
+                    if (emit) lower_gate(elem->as<PrimitiveInstanceSymbol>());
                     break;
                 case SymbolKind::Instance: {
                     const InstanceSymbol& child = elem->as<InstanceSymbol>();
-                    lower_instance(child, self_prefix + instance_array_element_name(child) + ".");
+                    ir::InstanceScope* child_node = emit ? &node.children[child_cursor++] : nullptr;
+                    lower_instance(child, self_prefix + instance_array_element_name(child) + ".",
+                                   pass, child_node);
                     prefix_   = self_prefix;
                     scope_    = &parent_scope;
                     time_mul_ = self_mul;
-                    wire_ports(child);
+                    if (emit) wire_ports(child);
                     break;
                 }
                 default:
@@ -1146,7 +1188,8 @@ private:
     static const ValueSymbol* lvalue_root(const Expression& e) {
         switch (e.kind) {
             case ExpressionKind::NamedValue:
-                return &e.as<NamedValueExpression>().symbol;
+            case ExpressionKind::HierarchicalValue:
+                return &e.as<ValueExpressionBase>().symbol;
             case ExpressionKind::ElementSelect:
                 return lvalue_root(e.as<ElementSelectExpression>().value());
             case ExpressionKind::RangeSelect:
@@ -1958,8 +2001,10 @@ private:
             // servicing; string stores skip edge detection).
             fail("string in an event control is not supported");
         }
-        if (e.kind == ExpressionKind::NamedValue) {
-            return signal_of(e.as<NamedValueExpression>().symbol);
+        if (e.kind == ExpressionKind::NamedValue || e.kind == ExpressionKind::HierarchicalValue) {
+            // Waiting on a hierarchical signal (`@(posedge top.dut.clk)`, LRM 23.6)
+            // subscribes to the target instance's signal directly.
+            return signal_of(e.as<ValueExpressionBase>().symbol);
         }
         fail("unsupported event expression");
     }
@@ -4896,8 +4941,14 @@ private:
                 }
                 return b.constant(svint_to_ref(cv.integer(), lower_type(*expr.type)), l);
             }
-            case ExpressionKind::NamedValue: {
-                const ValueSymbol& sym = expr.as<NamedValueExpression>().symbol;
+            case ExpressionKind::NamedValue:
+            case ExpressionKind::HierarchicalValue: {
+                // A hierarchical reference (`top.u1.sig`, LRM 23.6) resolves to the
+                // same ValueSymbol a local name would; slang's whole-design
+                // elaboration binds it to the target instance's symbol, so once all
+                // signals are collected (the two-pass lowering below) it flows
+                // through the ordinary signal_of path.
+                const ValueSymbol& sym = expr.as<ValueExpressionBase>().symbol;
                 if (sym.kind == SymbolKind::Parameter) {
                     const ParameterSymbol& p = sym.as<ParameterSymbol>();
                     return b.constant(lower_constant(p.getValue(), p.getType()), l);
@@ -5482,7 +5533,11 @@ private:
                 // task's output actual has. Unwrap to the target.
                 return lower_lvalue(expr.as<AssignmentExpression>().left(), b);
             case ExpressionKind::NamedValue:
-                return value_lvalue(expr.as<NamedValueExpression>().symbol, b, l);
+            case ExpressionKind::HierarchicalValue:
+                // A hierarchical lvalue (`top.u1.sig = …`, LRM 23.6) writes the
+                // target instance's signal; the resolved symbol goes through the
+                // ordinary signal path (selects below recurse to this base).
+                return value_lvalue(expr.as<ValueExpressionBase>().symbol, b, l);
             case ExpressionKind::ElementSelect: {
                 const ElementSelectExpression& es   = expr.as<ElementSelectExpression>();
                 const ir::Index                base = lower_lvalue(es.value(), b);
