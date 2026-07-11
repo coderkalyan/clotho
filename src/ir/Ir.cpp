@@ -135,6 +135,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::CaseViol:
         case T::TestPlusArgs:
             return K::Extra;
+        case T::Severity:
+            return K::Severity;
         case T::Wait:
             return K::Wait;
 
@@ -224,6 +226,13 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
             // display: the value args are an index slice in the DisplayInfo record;
             // the format string is not an SSA operand.
             const auto info = extra_data<DisplayInfo>(p.display);
+            return index_slice(info.args);
+        }
+
+        case Inst::PayloadKind::Severity: {
+            // severity: the message value args are an index slice in the
+            // SeverityInfo record; the format string and banner are not operands.
+            const auto info = extra_data<SeverityInfo>(p.extra);
             return index_slice(info.args);
         }
 

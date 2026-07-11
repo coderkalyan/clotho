@@ -2116,6 +2116,9 @@ private:
             case StatementKind::ForeachLoop:
                 lower_foreach(stmt.as<ForeachLoopStatement>(), b);
                 break;
+            case StatementKind::ImmediateAssertion:
+                lower_immediate_assertion(stmt.as<ImmediateAssertionStatement>(), b);
+                break;
             case StatementKind::Break:
                 b.break_(loc(stmt));
                 break;
@@ -2177,6 +2180,50 @@ private:
             cur = nested;
         }
         return false;
+    }
+
+    // Immediate assertion (LRM 16.3): assert / assume / cover. A true condition
+    // runs the optional pass action. `assert`/`assume` (which check identically
+    // for simulation, LRM 16.4.3) additionally run the `else` action on a false
+    // condition, or emit the default failure report (error severity) when there
+    // is none. `cover` has no fail action — a false condition does nothing; its
+    // coverage count/report is deliberately unimplemented.
+    void lower_immediate_assertion(const ImmediateAssertionStatement& a, ir::Builder& b) {
+        if (a.isDeferred || a.isFinal) {
+            // TODO: deferred (assert #0) and final immediate assertions defer the
+            // check/report to the Observed/Reactive region, scheduling Clotho
+            // lacks.
+            fail("deferred / final immediate assertions are not supported");
+        }
+        using AK              = slang::ast::AssertionKind;
+        const bool is_cover   = a.assertionKind == AK::CoverProperty;
+        if (a.assertionKind != AK::Assert && a.assertionKind != AK::Assume && !is_cover) {
+            // TODO: immediate restrict / expect (LRM 16.3) need a property engine;
+            // concurrent cover (CoverSequence) needs SVA.
+            fail("only immediate assert / assume / cover are supported");
+        }
+        const ir::Index pred = lower_predicate(a.cond, b);
+
+        b.open_region();
+        if (a.ifTrue != nullptr) {
+            lower_stmt(*a.ifTrue, b);
+        }
+        const ir::ExtraSlice then_region = b.close_region();
+
+        // False branch: cover does nothing; assert/assume run the else action or
+        // the default failure report.
+        b.open_region();
+        if (!is_cover) {
+            if (a.ifFalse != nullptr) {
+                lower_stmt(*a.ifFalse, b);
+            } else {
+                b.severity(static_cast<uint32_t>(ir::Severity::Error),
+                           banner_at(a.sourceRange.start()), "assertion failed", {}, loc(a));
+            }
+        }
+        const ir::ExtraSlice else_region = b.close_region();
+
+        b.cond(pred, then_region, else_region, loc(a));
     }
 
     void lower_conditional(const ConditionalStatement& c, ir::Builder& b) {
@@ -3313,6 +3360,10 @@ private:
                 }
             }
             b.finish(finish_banner(call, name), level, loc(call));
+            return;
+        }
+        if (name == "$info" || name == "$warning" || name == "$error" || name == "$fatal") {
+            lower_severity_task(call, name, b);
             return;
         }
         if (name == "$fflush") {
@@ -4605,6 +4656,46 @@ private:
     }
 
     // Lower $display / $write: format the arguments and write to standard output.
+    // Build the $display-style message from `msg_args` and emit a severity report
+    // (LRM 20.10 / 16.3) at `level`. Non-terminating; $fatal adds a finish after.
+    void emit_severity(ir::Severity level, const std::string& banner,
+                       std::span<const Expression* const> msg_args, const CallExpression& call,
+                       ir::Builder& b) {
+        std::string            fmt;
+        std::vector<ir::Index> args;
+        build_format(msg_args, fmt, args, b);
+        b.severity(static_cast<uint32_t>(level), banner, fmt, args, loc(call));
+    }
+
+    // Lower a severity system task: $info / $warning / $error / $fatal (LRM
+    // 20.10). Each renders an optional $display-style message tail. $fatal's first
+    // argument is the $finish verbosity level (a constant 0/1/2), the rest the
+    // message; it reports, then terminates via $finish(level).
+    void lower_severity_task(const CallExpression& call, std::string_view name, ir::Builder& b) {
+        const std::string banner = banner_at(call.sourceRange.start());
+        const auto        args   = call.arguments();
+        if (name == "$fatal") {
+            uint32_t                           level = 1;
+            std::span<const Expression* const> msg   = args;
+            if (!args.empty()) {
+                slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+                slang::ast::EvalContext    ectx(actx);
+                const slang::ConstantValue cv = args[0]->eval(ectx);
+                if (cv.isInteger()) {
+                    level = cv.integer().as<uint32_t>().value_or(1);
+                }
+                msg = args.subspan(1);
+            }
+            emit_severity(ir::Severity::Fatal, banner, msg, call, b);
+            b.finish(finish_banner(call, "$fatal"), level, loc(call));
+            return;
+        }
+        const ir::Severity sev = name == "$info"      ? ir::Severity::Info
+                                 : name == "$warning" ? ir::Severity::Warning
+                                                      : ir::Severity::Error;
+        emit_severity(sev, banner, args, call, b);
+    }
+
     void lower_display(const CallExpression& call, bool newline, ir::Builder& b, char default_conv) {
         std::string            fmt;
         std::vector<ir::Index> args;

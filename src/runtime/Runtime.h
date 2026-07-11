@@ -90,6 +90,15 @@ void rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uin
 // unique0 overlap). Fires once per dynamic execution that detects the violation.
 void rt_case_violation(const char* banner, uint64_t now, int32_t kind);
 
+// Report a severity system task ($info / $warning / $error / $fatal, LRM 20.10)
+// or an immediate-assertion default failure (LRM 16.3). Renders the $display-
+// style message (`fmt` + `argc` `argv`, empty for a bare `$error;`) and writes
+// "<LABEL>: <banner><message>\n" to stderr, then returns — non-fatal. `level` is
+// the ir::Severity label (0 info, 1 warning, 2 error, 3 fatal); it selects the
+// LABEL only. `banner` is the compile-time "<file>:<line>: " prefix. $fatal's
+// termination is a separate rt_finish the caller emits after this report.
+void rt_severity(int32_t level, const char* banner, const char* fmt, uint32_t argc, const rt_arg* argv);
+
 // Install (or clear, with null) the setjmp target rt_finish longjmps to, so a
 // $finish ends only the simulation, not the embedding process (the test binary
 // runs many simulations). The jump abandons live coroutine frames — acceptable,

@@ -305,6 +305,39 @@ struct FinishInfo {
     uint32_t arg;
 };
 
+// Severity level of a `severity` instruction. Selects the diagnostic label the
+// runtime prints (LRM 20.10); Fatal is `$fatal` (the frontend follows the report
+// with a Finish carrying the finish number, so the report itself never
+// terminates).
+enum class Severity : uint32_t {
+    Info,
+    Warning,
+    Error,
+    Fatal,
+};
+
+// Extra payload for `severity`: an $info / $warning / $error / $fatal report
+// (LRM 20.10) or an immediate-assertion default failure (LRM 16.3). `banner` /
+// `banner_len` are the packed bytes of the compile-time "<file>:<line>: " prefix
+// the runtime completes with the message. `fmt` / `fmt_len` are the packed
+// $display-style format bytes; `args` the value operands its specifiers consume
+// (both empty for a bare `$error;` or a default assertion failure). `level` is
+// the ir::Severity label.
+struct SeverityInfo {
+    // First extra word of the packed banner-prefix bytes.
+    ExtraIndex banner;
+    // Banner-prefix length in bytes.
+    uint32_t banner_len;
+    // First extra word of the packed format-string bytes.
+    ExtraIndex fmt;
+    // Format-string length in bytes.
+    uint32_t fmt_len;
+    // ir::Severity label.
+    uint32_t level;
+    // Value operands consumed by the format specifiers.
+    ExtraSlice args;
+};
+
 // Extra payload for `fopen`: the $fopen(name, mode) form. `mode` is the C stdio
 // mode-string operand (a packed-ASCII vector, spilled by the backend) and is
 // valid iff `has_mode`; the name value is the instruction's `op`. With a mode a
@@ -547,6 +580,7 @@ static_assert(ExtraPayload<LoopInfo>);
 static_assert(ExtraPayload<SwitchArm>);
 static_assert(ExtraPayload<SwitchInfo>);
 static_assert(ExtraPayload<DisplayInfo>);
+static_assert(ExtraPayload<SeverityInfo>);
 static_assert(ExtraPayload<FopenInfo>);
 static_assert(ExtraPayload<FileOpInfo>);
 static_assert(ExtraPayload<RealMathInfo>);
@@ -898,6 +932,14 @@ struct Inst {
         // no default reached at runtime with no matching item. Non-fatal —
         // lowers to an rt_case_violation call that warns and returns.
         CaseViol,
+        // Severity system task report ($info / $warning / $error / $fatal, LRM
+        // 20.10) or the default failure of an immediate assertion (LRM 16.3),
+        // both non-terminating (payload: extra -> SeverityInfo, carrying the
+        // severity level, compile-time banner prefix, and $display-style format
+        // + value args). Lowers to an rt_severity call that renders the message
+        // and writes the labelled diagnostic to stderr, then returns. $fatal's
+        // termination is a separate Finish the frontend emits after this report.
+        Severity,
         // $fflush: flush a descriptor's output buffers (payload: unary, the
         // descriptor value; the no-argument form passes a constant 0, which the
         // runtime treats as "flush all"). LRM §21.3.6. Lowers to an rt_fflush call.
@@ -989,6 +1031,7 @@ struct Inst {
         Sformatf,
         Scanf,
         RealMath,
+        Severity,
     };
 
     union Payload {
