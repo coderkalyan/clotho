@@ -237,13 +237,21 @@ TEST_CASE("element select on a multi-dim packed array is rejected") {
     CHECK(reject(src).find("multi-dimensional packed array") != std::string::npos);
 }
 
-TEST_CASE("fork..join is rejected, not serialized") {
-    constexpr std::string_view src = R"(
+TEST_CASE("fork..join_any / join_none are rejected, not serialized") {
+    // fork..join itself is now supported (see fork_test.cpp); the unbounded
+    // variants stay guarded until V2's growable ring.
+    constexpr std::string_view any = R"(
         module t;
-            initial fork #10 $display("A"); #5 $display("B"); join
+            initial fork #10 $display("A"); #5 $display("B"); join_any
         endmodule
     )";
-    CHECK(reject(src).find("fork..join blocks are not supported") != std::string::npos);
+    CHECK(reject(any).find("join_any") != std::string::npos);
+    constexpr std::string_view none = R"(
+        module t;
+            initial fork #10 $display("A"); #5 $display("B"); join_none
+        endmodule
+    )";
+    CHECK(reject(none).find("join_none") != std::string::npos);
 }
 
 TEST_CASE("iff qualifier on an event control is rejected, not dropped") {

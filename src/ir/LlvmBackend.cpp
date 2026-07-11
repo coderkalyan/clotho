@@ -1043,6 +1043,7 @@ private:
             fn_->addParamAttr(0, llvm::Attribute::NoAlias);
             awaiter_          = nullptr;
             record_           = nullptr;
+            fork_record_      = nullptr;
             cur_is_task_      = false;
             lowering_preinit_ = false;
             hdl_              = nullptr;
@@ -1132,6 +1133,7 @@ private:
         fn_->addParamAttr(0, llvm::Attribute::NoAlias);
         awaiter_          = nullptr;
         record_           = nullptr;
+        fork_record_      = nullptr;
         cur_is_task_      = false;
         lowering_preinit_ = proc.activation == Activation::PreInit;
 
@@ -1694,12 +1696,31 @@ private:
         b_.SetInsertPoint(epilogue_bb);
         emit_copyout(f);
         deinit_body_strings(); // string locals + temps die with the call
-        llvm::Value* parent = b_.CreateLoad(ptr_ty, fn_->getArg(task_record_param(f)));
+        llvm::Value* rec    = fn_->getArg(task_record_param(f));
         auto*        has_bb = llvm::BasicBlock::Create(ctx_, "task.wake", fn_);
-        b_.CreateCondBr(b_.CreateICmpNE(parent, null), has_bb, final_bb);
-        b_.SetInsertPoint(has_bb);
-        emit_active_push(b_, parent);
-        b_.CreateBr(final_bb);
+        if (f.is_fork_child) {
+            // Fork-child epilogue (LRM 9.3.2): the record is { i32 count, ptr
+            // parent } shared by the fork's children. Decrement the live count;
+            // the child that drops it to zero resumes the joined parent (null
+            // until the parent has spawned all children and suspended — a child
+            // that finishes synchronously during the spawn loop just decrements).
+            auto*        cntp   = b_.CreateStructGEP(fork_record_ty(), rec, 0);
+            llvm::Value* cnt    = b_.CreateSub(b_.CreateLoad(b_.getInt32Ty(), cntp), b_.getInt32(1));
+            b_.CreateStore(cnt, cntp);
+            llvm::Value* parent = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(fork_record_ty(), rec, 1));
+            llvm::Value* last   = b_.CreateICmpEQ(cnt, b_.getInt32(0));
+            llvm::Value* wake   = b_.CreateAnd(last, b_.CreateICmpNE(parent, null));
+            b_.CreateCondBr(wake, has_bb, final_bb);
+            b_.SetInsertPoint(has_bb);
+            emit_active_push(b_, parent);
+            b_.CreateBr(final_bb);
+        } else {
+            llvm::Value* parent = b_.CreateLoad(ptr_ty, rec);
+            b_.CreateCondBr(b_.CreateICmpNE(parent, null), has_bb, final_bb);
+            b_.SetInsertPoint(has_bb);
+            emit_active_push(b_, parent);
+            b_.CreateBr(final_bb);
+        }
 
         b_.SetInsertPoint(final_bb);
         auto* res = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { none, b_.getTrue() });
@@ -2476,6 +2497,7 @@ private:
                 case Inst::Tag::EventTriggerNb:
                 case Inst::Tag::EventTriggerNbDelayed:
                 case Inst::Tag::EventTriggered:
+                case Inst::Tag::Fork:
                     return false;
                 case Inst::Tag::Store: {
                     const LvalueRoot r = lvalue_root(p.ir, p.ir.payload(idx).binary.l);
@@ -3935,6 +3957,18 @@ private:
     // fan-in. It also runs same-instant processes in declaration order.
     // Created once, lazily, so the timer callback (built while
     // lowering a process) and emit_active_run share it.
+    // Number of fork-child bodies in the design = Σ fork widths (each fork child
+    // is one Function). Bounds the extra active-ring slots `fork … join` needs.
+    size_t fork_child_count() const {
+        size_t n = 0;
+        for (size_t k = 0; k < mod_.function_count(); ++k) {
+            if (mod_.function(static_cast<FunctionId>(k)).is_fork_child) {
+                ++n;
+            }
+        }
+        return n;
+    }
+
     void ensure_active_queue() {
         if (active_gv_ != nullptr) {
             return;
@@ -3948,7 +3982,16 @@ private:
         // Rounded up to a power of two so the monotone head/tail indices wrap
         // with a mask (total pushes per drain are unbounded — a process may be
         // re-woken after it runs — only the live count is bounded).
-        const auto cap = std::bit_ceil(std::max<size_t>(mod_.processes().size(), 1));
+        //
+        // `fork … join` (LRM 9.3.2) adds live children: a `join` parent blocks
+        // (leaving the ring — its handle sits in the join record), so children
+        // never accumulate across loop iterations or recursion depth. Peak ready
+        // children <= the number of distinct fork-child bodies (Σ fork widths),
+        // since `join` serializes each fork's reuse. Reserve one slot per child
+        // (docs/design/fork-join.md). join_any / join_none are unbounded and
+        // rejected by the frontend until V2's growable ring.
+        const auto cap =
+          std::bit_ceil(std::max<size_t>(mod_.processes().size() + fork_child_count(), 1));
         active_mask_   = static_cast<uint32_t>(cap - 1);
 
         queue_arr_ty_ = llvm::ArrayType::get(ptr_ty, cap);
@@ -5120,6 +5163,7 @@ private:
             case Inst::Tag::Ret:
             case Inst::Tag::Delay:
             case Inst::Tag::Wait:
+            case Inst::Tag::Fork:
             case Inst::Tag::Display:
             case Inst::Tag::TimeFormat:
             case Inst::Tag::Finish:
@@ -6007,6 +6051,13 @@ private:
                 // caller's pre/post-call NBAs never share a block with it.
                 ++cur_seg_epoch_;
                 lower_task_call_inst(i);
+                ++cur_seg_epoch_;
+                return;
+            case Inst::Tag::Fork:
+                // A fork spawns child coroutines and (for `join`) suspends the
+                // parent; end the segment so pre/post-fork NBAs never share a block.
+                ++cur_seg_epoch_;
+                lower_fork_inst(i);
                 ++cur_seg_epoch_;
                 return;
         }
@@ -7662,6 +7713,78 @@ private:
             record_ = ab.CreateAlloca(llvm::PointerType::getUnqual(ctx_), nullptr, "task_record");
         }
         return record_;
+    }
+
+    // The fork join-record type { i32 count, ptr parent }, shared by a fork's
+    // children (see lower_fork_inst and the fork-child epilogue in lower_task).
+    llvm::StructType* fork_record_ty() {
+        if (fork_record_ty_ == nullptr) {
+            fork_record_ty_ = llvm::StructType::create(
+              ctx_, { b_.getInt32Ty(), llvm::PointerType::getUnqual(ctx_) }, "clotho.fork_record");
+        }
+        return fork_record_ty_;
+    }
+
+    // The current coroutine's fork join-record slot: one frame-resident alloca
+    // reused across this coroutine's fork sites (a `join` completes before the
+    // next fork runs). Hoisted to coro.begin so it spills into the frame — it must
+    // outlive both the children's suspends and the parent's join suspend.
+    llvm::Value* fork_record_slot() {
+        if (fork_record_ == nullptr) {
+            llvm::IRBuilder<> ab(coro_begin_->getParent(), std::next(coro_begin_->getIterator()));
+            fork_record_ = ab.CreateAlloca(fork_record_ty(), nullptr, "fork_record");
+        }
+        return fork_record_;
+    }
+
+    // Lower a `Fork` (LRM 9.3.2, V1 = `join`): spawn each child coroutine sharing
+    // one join record, then suspend the parent until the live count reaches zero.
+    void lower_fork_inst(Index i) {
+        const auto fi     = ir_->extra_data<ForkInfo>(ir_->payload(i).extra);
+        const auto kids   = ir_->region(fi.children); // FunctionId u32s
+        auto*      ptr_ty = llvm::PointerType::getUnqual(ctx_);
+        auto*      null   = llvm::ConstantPointerNull::get(ptr_ty);
+        auto*      i32    = b_.getInt32Ty();
+        auto*      rty    = fork_record_ty();
+
+        // Init the shared record { count = W, parent = null }.
+        llvm::Value* rec = fork_record_slot();
+        b_.CreateStore(b_.getInt32(static_cast<uint32_t>(kids.size())),
+                       b_.CreateStructGEP(rty, rec, 0));
+        b_.CreateStore(null, b_.CreateStructGEP(rty, rec, 1));
+
+        // Spawn each child: ramp (state, wheel, rec) -> handle, resume inline to its
+        // first suspend or completion. A child that completes synchronously has
+        // already decremented the count (parent still null -> no wake); destroy its
+        // frame. A child that suspends is parked in the wheel / a wait queue and
+        // decrements + wakes on completion.
+        for (const Index kid : kids) {
+            llvm::Function* cf  = fn_decls_[static_cast<uint32_t>(kid)];
+            llvm::Value*    hdl = b_.CreateCall(cf->getFunctionType(), cf, { state_, wheel_, rec });
+            b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
+            llvm::Value* done = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_done), { hdl });
+            auto*        dz   = llvm::BasicBlock::Create(ctx_, "fork.child.done", fn_);
+            auto*        nx   = llvm::BasicBlock::Create(ctx_, "fork.child.next", fn_);
+            b_.CreateCondBr(done, dz, nx);
+            b_.SetInsertPoint(dz);
+            b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
+            b_.CreateBr(nx);
+            b_.SetInsertPoint(nx);
+        }
+
+        // Join: if every child already finished (count 0), fall through; else record
+        // our handle and suspend — the last child to finish resumes us.
+        llvm::Value* cnt  = b_.CreateLoad(i32, b_.CreateStructGEP(rty, rec, 0));
+        auto*        susp = llvm::BasicBlock::Create(ctx_, "fork.join.suspend", fn_);
+        auto*        cont = llvm::BasicBlock::Create(ctx_, "fork.join.cont", fn_);
+        b_.CreateCondBr(b_.CreateICmpEQ(cnt, b_.getInt32(0)), cont, susp);
+
+        b_.SetInsertPoint(susp);
+        b_.CreateStore(hdl_, b_.CreateStructGEP(rty, rec, 1));
+        emit_suspend("fork.join.resume");
+        b_.CreateBr(cont);
+
+        b_.SetInsertPoint(cont);
     }
 
     // Lower a task enable (LRM 13.3). Create the task coroutine, copy inputs in /
@@ -9334,6 +9457,10 @@ private:
     // `continue` branches to `.first`, a `break` to `.second`.
     std::vector<std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> loop_targets_;
     llvm::AllocaInst*       record_           = nullptr;
+    // Per-function fork join-record slot { i32 count, ptr parent } (lazy, reused
+    // across a coroutine's fork sites — `join` serializes them). Reset per fn.
+    llvm::AllocaInst*       fork_record_      = nullptr;
+    llvm::StructType*       fork_record_ty_   = nullptr; // module-lived, built once
 
     // Per-process scratch, reset in lower_process.
     const Ir*           ir_         = nullptr;

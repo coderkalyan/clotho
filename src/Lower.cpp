@@ -338,6 +338,15 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     // `always @*` (Comb procedures reject timing controls at elaboration).
     void handle(const TimedStatement& t) { t.stmt.visit(*this); }
 
+    // A `fork` block's children are independent concurrent processes (LRM 9.3.2)
+    // with their own sensitivity — their reads never wake the parent process, so
+    // do not descend into them. A plain sequential block descends as usual.
+    void handle(const BlockStatement& blk) {
+        if (blk.blockKind == slang::ast::StatementBlockKind::Sequential) {
+            visitDefault(blk);
+        }
+    }
+
     void handle(const UnaryExpression& u) {
         switch (u.op) {
             case UnaryOperator::Preincrement:
@@ -2107,12 +2116,9 @@ private:
                 break;
             case StatementKind::Block: {
                 const BlockStatement& blk = stmt.as<BlockStatement>();
-                // TODO: fork..join / join_any / join_none (LRM 9.3.2) — needs
-                // child process spawning and join synchronization in the
-                // scheduler. Lowering the body sequentially would silently
-                // serialize concurrent branches.
                 if (blk.blockKind != StatementBlockKind::Sequential) {
-                    fail("fork..join blocks are not supported");
+                    lower_fork(blk, b);
+                    break;
                 }
                 const bool named = blk.blockSymbol != nullptr && !blk.blockSymbol->name.empty();
                 if (named) {
@@ -2212,6 +2218,45 @@ private:
             default:
                 fail("unsupported statement");
         }
+    }
+
+    // Lower `fork … join` (LRM 9.3.2). V1: `join` only, in a process context.
+    // Each top-level child statement becomes its own fork-child coroutine; the
+    // Fork op spawns them and suspends the parent until all complete.
+    void lower_fork(const BlockStatement& blk, ir::Builder& b) {
+        if (blk.blockKind != StatementBlockKind::JoinAll) {
+            // TODO: join_any / join_none (V2) need a growable active ring — a
+            // loop can spawn an unbounded number of concurrently-live children
+            // (docs/design/fork-join.md).
+            fail("fork..join_any / fork..join_none are not supported");
+        }
+        if (fn_ctx_ != nullptr) {
+            // TODO: fork inside a task/function (V1 restriction). A child would
+            // need to alias the enclosing subroutine's frame locals, not the
+            // parent-signal path build_fork_child assumes.
+            fail("fork..join inside a function or task is not supported");
+        }
+
+        // Children are the fork body's top-level statements (a StatementList),
+        // or the single statement / empty body.
+        std::vector<const Statement*> children;
+        if (blk.body.kind == StatementKind::List) {
+            for (const Statement* s : blk.body.as<StatementList>().list) {
+                children.push_back(s);
+            }
+        } else if (blk.body.kind != StatementKind::Empty) {
+            children.push_back(&blk.body);
+        }
+        if (children.empty()) {
+            return; // `fork join` with no children: a no-op.
+        }
+
+        std::vector<ir::FunctionId> ids;
+        ids.reserve(children.size());
+        for (const Statement* c : children) {
+            ids.push_back(build_fork_child(*c));
+        }
+        b.fork(ids, ir::ForkKind::Join, loc(blk));
     }
 
     ir::Index lower_predicate(const Expression& cond, ir::Builder& b) {
@@ -6130,6 +6175,43 @@ private:
                                                .ir          = b.finish() });
         named_blocks_.swap(saved_blocks);
         fn_ctx_ = saved;
+    }
+
+    // Lower one `fork` child statement (LRM 9.3.2) into a synthetic argument-less
+    // fork-child task: a coroutine spawned at the fork, whose completion decrements
+    // the shared join record. Mirrors build_task, but takes a bare Statement (no
+    // formals) and runs in the *parent's* scope context (scope_ / prefix_ /
+    // time_mul_ unchanged) so the child's references to parent variables resolve to
+    // the parent's signals, while the child's own declared locals get per-spawn
+    // frame slots (value_lvalue: localmap first, then signal_of). Returns the
+    // reserved FunctionId.
+    ir::FunctionId build_fork_child(const Statement& body) {
+        const ir::FunctionId id = module_.reserve_function();
+
+        FnCtx ctx;
+        ctx.name_prefix = "fork.child.";
+        ctx.is_task     = true;
+        FnCtx* saved    = fn_ctx_;
+        fn_ctx_         = &ctx;
+        std::vector<std::string_view> saved_blocks;
+        saved_blocks.swap(named_blocks_);
+
+        ir::Builder b(module_.pool);
+        lower_stmt(body, b);
+        const ir::SourceLoc el = loc(body);
+        b.unary(ir::Inst::Tag::Ret, void_ret_operand(b, el), el);
+
+        module_.set_function(id, ir::Function{ .name          = "fork.child",
+                                               .return_type   = module_.pool.void_type,
+                                               .param_types   = {},
+                                               .arg_dirs      = {},
+                                               .local_types   = std::move(ctx.local_types),
+                                               .is_task       = true,
+                                               .is_fork_child = true,
+                                               .ir            = b.finish() });
+        named_blocks_.swap(saved_blocks);
+        fn_ctx_ = saved;
+        return id;
     }
 
     // Lower one function body into the reserved slot. (Ir has no default ctor and

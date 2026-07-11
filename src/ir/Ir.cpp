@@ -138,6 +138,10 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::CaseViol:
         case T::TestPlusArgs:
             return K::Extra;
+        case T::Fork:
+            // Children are FunctionIds (not SSA operands), walked from ForkInfo;
+            // the op has no top-level operands, so it rides the Extra path.
+            return K::Extra;
         case T::Severity:
             return K::Severity;
         case T::Wait:

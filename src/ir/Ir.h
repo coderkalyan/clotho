@@ -199,6 +199,22 @@ struct TaskCallInfo {
     ExtraSlice args;
 };
 
+// Join discipline of a fork block (LRM 9.3.2). V1 implements Join only.
+enum class ForkKind : uint32_t {
+    Join,     // parent blocks until all children complete
+    JoinAny,  // parent blocks until the first child completes (V2)
+    JoinNone, // parent does not block (V2)
+};
+
+// Extra payload for `Fork` (LRM 9.3.2). Each child statement of the fork was
+// lowered into its own argument-less fork-child task (Function::is_fork_child);
+// `children` holds their FunctionIds as raw u32s (one per parallel process).
+struct ForkInfo {
+    // FunctionIds of the child bodies, stored as u32 (FunctionId is a u32 enum).
+    ExtraSlice children;
+    ForkKind   kind;
+};
+
 // Extra payload for `cond`: the then / else regions (the condition is the op).
 struct Regions {
     // Instructions executed when the condition is true.
@@ -577,6 +593,7 @@ struct EventDelayInfo {
 static_assert(ExtraPayload<ExtraSlice>);
 static_assert(ExtraPayload<CallInfo>);
 static_assert(ExtraPayload<TaskCallInfo>);
+static_assert(ExtraPayload<ForkInfo>);
 static_assert(ExtraPayload<Select>);
 static_assert(ExtraPayload<PartSelect>);
 static_assert(ExtraPayload<DynPartSelect>);
@@ -842,6 +859,11 @@ struct Inst {
         // services the event's waiters (LRM 15.5.4). The triggering process does
         // not block. The event-controlled form (`->> @(x) e`) is not lowered here.
         EventTriggerNbDelayed,
+        // Fork block `fork … join` (payload: extra -> ForkInfo). A statement that
+        // spawns each child body as its own coroutine (an argument-less fork-child
+        // task), then — for `join` — suspends the parent until all children
+        // complete. Only legal inside a coroutine (process or task). LRM 9.3.2.
+        Fork,
 
         // -- String ops (operands are string values unless noted) --
         // s.len() -> 32-bit signed (payload: unary).
