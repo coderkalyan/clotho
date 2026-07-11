@@ -2072,7 +2072,7 @@ private:
                 lower_foreach(stmt.as<ForeachLoopStatement>(), b);
                 break;
             case StatementKind::ImmediateAssertion:
-                lower_immediate_assert(stmt.as<ImmediateAssertionStatement>(), b);
+                lower_immediate_assertion(stmt.as<ImmediateAssertionStatement>(), b);
                 break;
             case StatementKind::Break:
                 b.break_(loc(stmt));
@@ -2134,22 +2134,25 @@ private:
         return false;
     }
 
-    // Immediate assertion (LRM 16.3): assert / assume. A true condition runs the
-    // optional pass action; a false condition runs the else action, or emits the
-    // default failure report (error severity, LRM 16.3) when there is none.
-    // `assume` checks identically to `assert` for simulation (LRM 16.4.3).
-    void lower_immediate_assert(const ImmediateAssertionStatement& a, ir::Builder& b) {
+    // Immediate assertion (LRM 16.3): assert / assume / cover. A true condition
+    // runs the optional pass action. `assert`/`assume` (which check identically
+    // for simulation, LRM 16.4.3) additionally run the `else` action on a false
+    // condition, or emit the default failure report (error severity) when there
+    // is none. `cover` has no fail action — a false condition does nothing; its
+    // coverage count/report is deliberately unimplemented.
+    void lower_immediate_assertion(const ImmediateAssertionStatement& a, ir::Builder& b) {
         if (a.isDeferred || a.isFinal) {
             // TODO: deferred (assert #0) and final immediate assertions defer the
             // check/report to the Observed/Reactive region, scheduling Clotho
             // lacks.
             fail("deferred / final immediate assertions are not supported");
         }
-        using AK = slang::ast::AssertionKind;
-        if (a.assertionKind != AK::Assert && a.assertionKind != AK::Assume) {
-            // TODO: immediate cover (LRM 16.3) and restrict / expect need a
-            // coverage / property engine.
-            fail("only immediate assert / assume are supported");
+        using AK              = slang::ast::AssertionKind;
+        const bool is_cover   = a.assertionKind == AK::CoverProperty;
+        if (a.assertionKind != AK::Assert && a.assertionKind != AK::Assume && !is_cover) {
+            // TODO: immediate restrict / expect (LRM 16.3) need a property engine;
+            // concurrent cover (CoverSequence) needs SVA.
+            fail("only immediate assert / assume / cover are supported");
         }
         const ir::Index pred = lower_predicate(a.cond, b);
 
@@ -2159,12 +2162,16 @@ private:
         }
         const ir::ExtraSlice then_region = b.close_region();
 
+        // False branch: cover does nothing; assert/assume run the else action or
+        // the default failure report.
         b.open_region();
-        if (a.ifFalse != nullptr) {
-            lower_stmt(*a.ifFalse, b);
-        } else {
-            b.severity(static_cast<uint32_t>(ir::Severity::Error), banner_at(a.sourceRange.start()),
-                       "assertion failed", {}, loc(a));
+        if (!is_cover) {
+            if (a.ifFalse != nullptr) {
+                lower_stmt(*a.ifFalse, b);
+            } else {
+                b.severity(static_cast<uint32_t>(ir::Severity::Error),
+                           banner_at(a.sourceRange.start()), "assertion failed", {}, loc(a));
+            }
         }
         const ir::ExtraSlice else_region = b.close_region();
 

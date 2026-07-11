@@ -189,7 +189,33 @@ TEST_CASE("deferred and final immediate assertions are rejected") {
                    "deferred / final immediate assertions are not supported"));
 }
 
-TEST_CASE("immediate cover is rejected") {
-    CHECK(contains(reject("module m; initial cover (1);\nendmodule"),
-                   "only immediate assert / assume are supported"));
+// -- Immediate cover (LRM 16.3): pass action on true, nothing on false --
+
+TEST_CASE("immediate cover runs the pass action when true") {
+    const Captured c = run_capture("module m; initial begin\n"
+                                   "  cover (1) $display(\"COVERED\");\n"
+                                   "end endmodule");
+    CHECK(contains(c.out, "COVERED"));
+    CHECK(c.err.empty());
+}
+
+TEST_CASE("immediate cover does nothing when false: no pass action, no report") {
+    const Captured c = run_capture("module m; initial begin\n"
+                                   "  cover (0) $display(\"COVERED\");\n"
+                                   "  $display(\"after\");\n"
+                                   "end endmodule");
+    CHECK_FALSE(contains(c.out, "COVERED"));
+    CHECK(contains(c.out, "after"));
+    // cover has no fail action — a false condition emits no default report.
+    CHECK(c.err.empty());
+}
+
+TEST_CASE("bare immediate cover with no action is a no-op") {
+    const Captured c = run_capture("module m; initial begin\n"
+                                   "  cover (0);\n"
+                                   "  cover (1);\n"
+                                   "  $display(\"done\");\n"
+                                   "end endmodule");
+    CHECK(contains(c.out, "done"));
+    CHECK(c.err.empty());
 }
