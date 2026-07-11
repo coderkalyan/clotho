@@ -785,6 +785,20 @@ private:
         const auto sigs = mod_.signals();
         for (size_t k = 0; k < ir.inst_count(); ++k) {
             const auto idx = static_cast<Index>(k);
+            // A nonblocking intra-assignment delay (`x <= #d y`) targets a whole
+            // integral scalar (frontend-restricted). Its target is a real NBA
+            // target for wake purposes (gets nba_id + meta), but the value is held
+            // in a deferred record on the wheel, not the shadow, so it is tracked
+            // separately for the intra-commit loop.
+            if (ir.tag(idx) == Inst::Tag::StoreNbDelay) {
+                const NbaTarget t = nba_target(ir, ir.payload(idx).op_extra.op);
+                slots_[static_cast<uint32_t>(t.sig)].nba = true;
+                if (std::find(intra_nba_sigs_.begin(), intra_nba_sigs_.end(), t.sig) ==
+                    intra_nba_sigs_.end()) {
+                    intra_nba_sigs_.push_back(t.sig);
+                }
+                continue;
+            }
             if (ir.tag(idx) != Inst::Tag::StoreNb) {
                 continue;
             }
@@ -2430,6 +2444,12 @@ private:
                 case Inst::Tag::Wait:
                 case Inst::Tag::TaskCall:
                     return false;
+                // A deferred store (`x <= #d y`) arms a wheel record with an
+                // observable future effect; keep it out of thunk/fused groups (a
+                // spurious comb-fused run would arm a spurious store), routing it
+                // to a plain coroutine.
+                case Inst::Tag::StoreNbDelay:
+                    return false;
                 case Inst::Tag::Store: {
                     const LvalueRoot r = lvalue_root(p.ir, p.ir.payload(idx).binary.l);
                     if (p.ir.tag(r.root) != Inst::Tag::Signal) {
@@ -2595,6 +2615,7 @@ private:
                     break;
                 }
                 case Inst::Tag::StoreNb:
+                case Inst::Tag::StoreNbDelay:
                     return CombFuse::NbaWrite;
                 case Inst::Tag::Call:
                     return CombFuse::HasCall;
@@ -4072,6 +4093,11 @@ private:
         if (!array_nba_sigs_.empty()) {
             b_.CreateCall(nba_arr_reset_fn(), {});
         }
+        // Same for the deferred intra-assignment record pools — reclaim any records
+        // a prior $finish left armed on the wheel.
+        if (!intra_nba_sigs_.empty()) {
+            b_.CreateCall(intra_reset_fn(), {});
+        }
         const auto all = mod_.processes();
 
         // Pre-init pass first (LRM 6.8): apply variable declaration initializers
@@ -4181,7 +4207,7 @@ private:
         // the active queue drains; if any update is staged it commits them all and
         // re-drains the active queue at the SAME instant; otherwise it falls through
         // to the wheel. So active and NBA iterate until both settle before time moves.
-        const bool has_nba = !array_nba_sigs_.empty() || !block_commits_.empty();
+        const bool has_nba = !array_nba_sigs_.empty() || !block_commits_.empty() || !intra_nba_sigs_.empty();
         auto*      ncheck  = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.check", fn) : wcheck;
         auto*      ncommit = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.commit", fn) : nullptr;
         // Inactive region: only when the design has a #0. When the active queue
@@ -4281,6 +4307,9 @@ private:
                 any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateLoad(ptr_ty, block_head_gv_),
                                                        llvm::ConstantPointerNull::get(ptr_ty)));
             }
+            if (!intra_nba_sigs_.empty()) {
+                any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateCall(intra_any_fn(), {}), b_.getInt32(0)));
+            }
             b_.CreateCondBr(any, ncommit, wcheck);
 
             b_.SetInsertPoint(ncommit);
@@ -4328,6 +4357,14 @@ private:
                     }
                 }
                 b_.CreateCall(nba_arr_reset_fn(), {});
+            }
+            // Deferred nonblocking intra-assignment stores that fired this instant:
+            // each site commits its ready records (last fire wins), wakes readers,
+            // and returns the records to its pool.
+            if (!intra_nba_sigs_.empty()) {
+                for (const Signal sig : intra_nba_sigs_) {
+                    emit_intra_commit(sig, state);
+                }
             }
             b_.CreateBr(check);
         }
@@ -4402,6 +4439,49 @@ private:
     }
     llvm::FunctionCallee nba_arr_reset_fn() {
         return rt_fn("rt_nba_arr_reset", b_.getVoidTy(), {});
+    }
+
+    // Deferred nonblocking intra-assignment stores (rt_intra_*, LRM 9.4.5).
+    llvm::FunctionCallee intra_alloc_fn() {
+        return rt_fn("rt_intra_alloc", raw_ptr_ty(), { b_.getInt32Ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee intra_cb_fn() {
+        return rt_fn("rt_intra_cb", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    llvm::FunctionCallee intra_ready_base_fn() {
+        return rt_fn("rt_intra_ready_base", raw_ptr_ty(), { b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee intra_ready_count_fn() {
+        return rt_fn("rt_intra_ready_count", b_.getInt32Ty(), { b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee intra_any_fn() {
+        return rt_fn("rt_intra_any", b_.getInt32Ty(), {});
+    }
+    llvm::FunctionCallee intra_release_fn() {
+        return rt_fn("rt_intra_release", b_.getVoidTy(), { b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee intra_reset_fn() {
+        return rt_fn("rt_intra_reset", b_.getVoidTy(), {});
+    }
+
+    // Per intra-NBA signal: dense id and the record StructType
+    // { ptr timer.next, ptr timer.on_expire, i32 idx, i32 seq, iMM mm_val, [iW z_val] }.
+    // The rt_timer (fields 0-1) sits at offset 0 so the record base is the timer
+    // pointer handed to the wheel; the runtime reads `idx` (field 2) to route the
+    // fire and owns `seq` (field 3). Value fields: mm=4, z=5.
+    uint32_t intra_idx(Signal sig) const {
+        const auto it = std::find(intra_nba_sigs_.begin(), intra_nba_sigs_.end(), sig);
+        return static_cast<uint32_t>(it - intra_nba_sigs_.begin());
+    }
+    llvm::StructType* intra_rec_ty(const SignalSlot& s) {
+        auto*                    ptr = raw_ptr_ty();
+        auto*                    i32 = b_.getInt32Ty();
+        std::vector<llvm::Type*> f   = { ptr, ptr, i32, i32,
+                                         int_ty(s.narrow ? s.width : 2 * s.width) };
+        if (s.has_z) {
+            f.push_back(int_ty(s.width));
+        }
+        return llvm::StructType::get(ctx_, f);
     }
 
     // Per array-NBA signal: dense id (buffer index) and the record StructType
@@ -4973,6 +5053,7 @@ private:
 
             case Inst::Tag::Store:
             case Inst::Tag::StoreNb:
+            case Inst::Tag::StoreNbDelay:
             case Inst::Tag::Cond:
             case Inst::Tag::Switch:
             case Inst::Tag::Loop:
@@ -5282,6 +5363,19 @@ private:
                 } else {
                     lower_store_nb(lv, rhs);
                 }
+                return;
+            }
+
+            // Nonblocking intra-assignment delay (`x <= #d y`, LRM 9.4.5): sample
+            // the RHS now into a deferred record, arm it on the wheel for `now + d`,
+            // and continue without suspending. The NBA region of `now + d` commits
+            // it (emit_intra_commit).
+            case Inst::Tag::StoreNbDelay: {
+                const auto    info  = ir_->extra_data<StoreNbDelayInfo>(p.op_extra.extra);
+                const LValue& lv    = lvalue_of(p.op_extra.op);
+                const Plane   rhs   = value_of(info.value);
+                llvm::Value*  ticks = cast(must_of(value_of(info.delay)), 64, false);
+                emit_intra_nba_arm(lv, rhs, ticks);
                 return;
             }
 
@@ -6187,6 +6281,141 @@ private:
     // Replay array `sig`'s deferred records in push order (later write to an element
     // wins): a monomorphized loop of typed masked/plain stores into the live element
     // slots, then wake its Any-edge readers if it took any write.
+    // Arm a nonblocking intra-assignment delay (`x <= #d y`): reserve a stable
+    // record from the target signal's pool, fill it with the sampled value planes
+    // (monomorphized per width / z-ness), and schedule it on the wheel for
+    // `now + ticks` with rt_intra_cb. The process does not suspend. The NBA region
+    // of the fired instant commits the record (emit_intra_commit).
+    void emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks) {
+        const SignalSlot& s      = slot_of(lv.sig);
+        const llvm::Align a1{ 1 }; // record lives in an unaligned pooled block
+        llvm::StructType* rt     = intra_rec_ty(s);
+        const uint32_t    stride = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(rt));
+        const uint32_t    idx    = intra_idx(lv.sig);
+
+        llvm::Value* rec = b_.CreateCall(intra_alloc_fn(), { b_.getInt32(idx), b_.getInt32(stride) });
+        b_.CreateStore(b_.getInt32(idx), b_.CreateStructGEP(rt, rec, 2)); // idx routes the fire
+
+        // Value planes: a whole-scalar target is signal-width (frontend Resize), so
+        // no positioning is needed — store the planes directly.
+        llvm::Value* mm_val;
+        if (s.narrow) {
+            mm_val = must_of(rhs);
+        } else {
+            rhs    = to_four(rhs);
+            mm_val = rhs.mm; // i2W: must | (may << W)
+        }
+        b_.CreateAlignedStore(mm_val, b_.CreateStructGEP(rt, rec, 4), a1);
+        if (s.has_z) {
+            b_.CreateAlignedStore(rhs.z, b_.CreateStructGEP(rt, rec, 5), a1);
+        }
+
+        // Arm the wheel for `now + ticks`. A zero delay cannot arm the wheel
+        // (deadline must be > now) and its update lands in the current instant's
+        // NBA region, so push the record straight onto the ready list (rt_intra_cb).
+        // A compile-time-constant delay emits only the taken path; a runtime delay
+        // that happens to be zero branches to the same immediate path.
+        auto* nullp     = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+        auto  schedule  = [&] {
+            llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
+            b_.CreateCall(wheel_schedule_fn(),
+                          { wheel_, rec, b_.CreateAdd(now, ticks), intra_cb_fn().getCallee() });
+        };
+        auto immediate = [&] { b_.CreateCall(intra_cb_fn(), { rec, nullp }); };
+
+        if (auto* c = llvm::dyn_cast<llvm::ConstantInt>(ticks)) {
+            if (c->isZero()) {
+                immediate();
+            } else {
+                schedule();
+            }
+            return;
+        }
+        auto* zbb   = llvm::BasicBlock::Create(ctx_, "intra.zero", fn_);
+        auto* nzbb  = llvm::BasicBlock::Create(ctx_, "intra.sched", fn_);
+        auto* contb = llvm::BasicBlock::Create(ctx_, "intra.armed", fn_);
+        b_.CreateCondBr(b_.CreateICmpEQ(ticks, b_.getInt64(0)), zbb, nzbb);
+        b_.SetInsertPoint(zbb);
+        immediate();
+        b_.CreateBr(contb);
+        b_.SetInsertPoint(nzbb);
+        schedule();
+        b_.CreateBr(contb);
+        b_.SetInsertPoint(contb);
+    }
+
+    // Commit intra-NBA signal `sig`'s fired records in the NBA region: store each
+    // record's sampled planes to the live signal (later fire wins, per the arbitrary
+    // order LRM allows among same-instant updates), then wake edge readers once on
+    // the net old->new change, and return the records to the pool. Mirrors the
+    // whole-signal block-commit body, looped over the ready list.
+    void emit_intra_commit(Signal sig, llvm::Value* state) {
+        const SignalSlot& s    = slot_of(sig);
+        const uint32_t    W    = s.width;
+        auto*             i32  = b_.getInt32Ty();
+        auto*             ptr  = raw_ptr_ty();
+        auto*             mmty = int_ty(s.narrow ? W : 2 * W);
+        auto*             zty  = int_ty(W);
+        auto*             rt   = intra_rec_ty(s);
+        const llvm::Align a1{ 1 };
+        const uint32_t    idx  = intra_idx(sig);
+
+        auto* fn    = b_.GetInsertBlock()->getParent();
+        auto* run   = llvm::BasicBlock::Create(ctx_, "intra.run", fn);
+        auto* head  = llvm::BasicBlock::Create(ctx_, "intra.head", fn);
+        auto* body  = llvm::BasicBlock::Create(ctx_, "intra.body", fn);
+        auto* after = llvm::BasicBlock::Create(ctx_, "intra.after", fn);
+        auto* skip  = llvm::BasicBlock::Create(ctx_, "intra.skip", fn);
+
+        // No fired record for this signal -> nothing to commit / wake / release.
+        llvm::Value* n = b_.CreateCall(intra_ready_count_fn(), { b_.getInt32(idx) });
+        b_.CreateCondBr(b_.CreateICmpNE(n, b_.getInt32(0)), run, skip);
+
+        b_.SetInsertPoint(run);
+        llvm::Value* base    = b_.CreateCall(intra_ready_base_fn(), { b_.getInt32(idx) });
+        llvm::Value* live    = storage_ptr(state, s);
+        llvm::Value* live_mm = b_.CreateStructGEP(s.slot_ty, live, 0);
+        llvm::Value* live_z  = s.has_z ? b_.CreateStructGEP(s.slot_ty, live, 1) : nullptr;
+        llvm::Value* old_mm  = b_.CreateLoad(mmty, live_mm);
+        llvm::Value* old_z   = s.has_z ? b_.CreateLoad(zty, live_z) : nullptr;
+        auto*        pre     = b_.GetInsertBlock();
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(head);
+        auto* i = b_.CreatePHI(i32, 2);
+        i->addIncoming(b_.getInt32(0), pre);
+        b_.CreateCondBr(b_.CreateICmpULT(i, n), body, after);
+
+        b_.SetInsertPoint(body);
+        llvm::Value* recp = b_.CreateLoad(ptr, b_.CreateInBoundsGEP(ptr, base, i));
+        b_.CreateStore(b_.CreateAlignedLoad(mmty, b_.CreateStructGEP(rt, recp, 4), a1), live_mm);
+        if (s.has_z) {
+            b_.CreateStore(b_.CreateAlignedLoad(zty, b_.CreateStructGEP(rt, recp, 5), a1), live_z);
+        }
+        i->addIncoming(b_.CreateAdd(i, b_.getInt32(1)), b_.GetInsertBlock());
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(after);
+        // Wake edge readers once, on the net change over all committed records.
+        if (signal_has_waiters(sig)) {
+            llvm::Value* new_mm = b_.CreateLoad(mmty, live_mm);
+            llvm::Value* new_z  = s.has_z ? b_.CreateLoad(zty, live_z) : nullptr;
+            llvm::Value* meta   = b_.CreateInBoundsGEP(nba_meta_arr_ty_, nba_meta_gv_,
+                                                       { b_.getInt32(0), b_.getInt32(s.nba_id) });
+            emit_nba_service(meta, old_mm, new_mm, W, s.narrow, old_z, new_z);
+        }
+        if (design_uses_vcd_ && nba_vcd_gv_ != nullptr) {
+            llvm::Value* vidx = b_.CreateLoad(
+              i32, b_.CreateInBoundsGEP(nba_vcd_gv_->getValueType(), nba_vcd_gv_,
+                                        { b_.getInt32(0), b_.getInt32(s.nba_id) }));
+            b_.CreateCall(vcd_touch_fn(), { vidx });
+        }
+        b_.CreateCall(intra_release_fn(), { b_.getInt32(idx) });
+        b_.CreateBr(skip);
+
+        b_.SetInsertPoint(skip);
+    }
+
     void emit_array_commit(Signal sig, llvm::Value* state) {
         (void)state;
         const SignalSlot& s      = slot_of(sig);
@@ -9258,6 +9487,12 @@ private:
     // rather than the per-signal shadow; after a commit, each is woken if any
     // queued write touched it.
     std::vector<Signal>     array_nba_sigs_;
+
+    // Whole-scalar targets of a nonblocking intra-assignment delay (`x <= #d y`,
+    // StoreNbDelay). Each gets a dense id; a per-target record (rt_intra_*) holds
+    // the sampled value on the wheel until `now + d`, then the NBA region commits
+    // it (emit_intra_commit). See docs/design/intra-assignment-timing.md.
+    std::vector<Signal>     intra_nba_sigs_;
 
     // Block-commit NBA state. A whole-signal scalar NBA stages its shadow as before,
     // then registers its enclosing straight-line segment ("block") once per instant

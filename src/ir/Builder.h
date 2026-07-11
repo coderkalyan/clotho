@@ -44,6 +44,10 @@ public:
     // logical and/or, store, store_nb, bit_select).
     Index binary(Inst::Tag tag, Index l, Index r, SourceLoc loc);
 
+    // Nonblocking intra-assignment delay `lvalue <= #delay value` (LRM 9.4.5):
+    // sample `value` now, store it to `lvalue` after `delay` ticks.
+    Index store_nb_delay(Index lvalue, Index value, Index delay, SourceLoc loc);
+
     // -- Irregular shapes --
     Index resize(Index op, Ref type, SourceLoc loc);
 

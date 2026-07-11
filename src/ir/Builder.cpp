@@ -47,6 +47,12 @@ Index Builder::binary(Inst::Tag tag, Index l, Index r, SourceLoc loc) {
     return emit({ tag, Inst::Payload{ .binary = { l, r } } }, loc);
 }
 
+Index Builder::store_nb_delay(Index lvalue, Index value, Index delay, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(StoreNbDelayInfo{ value, delay });
+
+    return emit({ Inst::Tag::StoreNbDelay, Inst::Payload{ .op_extra = { lvalue, extra } } }, loc);
+}
+
 Index Builder::resize(Index op, Ref type, SourceLoc loc) {
     return emit({ Inst::Tag::Resize, Inst::Payload{ .op_type = { op, type } } }, loc);
 }

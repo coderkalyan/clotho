@@ -4910,10 +4910,28 @@ private:
             // process and instead schedules a detached future update; that needs
             // scheduler infrastructure not present yet.
             if (a.isNonBlocking()) {
-                // TODO: nonblocking intra-assignment timing (`<= #d` / `<= @e` /
-                // `<= repeat(N) @e`) — sample now, continue, commit after the
-                // delay/event via a detached scheduled store.
-                fail("nonblocking intra-assignment timing control is not supported");
+                // Nonblocking form: sample now, do not block, commit after the
+                // delay via a detached scheduled store (StoreNbDelay). Only the
+                // `#d` delay on a whole integral scalar target is lowered; the
+                // record is monomorphized per whole signal, so selects / concats /
+                // aggregates (needing the masked/array record path) and the
+                // event / repeat forms (needing wait-queue-triggered records) fail
+                // loud, a documented follow-up (docs/design/intra-assignment-timing.md).
+                if (a.timingControl->kind != TimingControlKind::Delay) {
+                    fail("nonblocking intra-assignment event/repeat timing is not supported");
+                }
+                const bool whole_scalar =
+                    (a.left().kind == ExpressionKind::NamedValue ||
+                     a.left().kind == ExpressionKind::HierarchicalValue) &&
+                    a.left().type->isIntegral() && !a.left().type->isUnpackedArray();
+                if (!whole_scalar) {
+                    fail("nonblocking intra-assignment delay is only supported for a whole "
+                         "integral scalar target");
+                }
+                const ir::Index val   = lower_expr(a.right(), b);
+                const ir::Index delay = scaled_delay(a.timingControl->as<DelayControl>().expr, b);
+                b.store_nb_delay(lower_lvalue(a.left(), b), val, delay, loc(a));
+                return val;
             }
             const bool string_lhs =
                 is_string_expr(a.left()) ||

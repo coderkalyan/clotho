@@ -163,16 +163,158 @@ TEST_CASE("blocking intra-assignment repeat-event waits N edges then stores the 
     CHECK(run_capture_finish(src) == "e=1 t=25\n");
 }
 
-// The nonblocking form (`<= #d`) must not block the process and needs a detached
-// scheduled update, which is not implemented — it must fail loudly, never
-// silently drop the delay.
-TEST_CASE("nonblocking intra-assignment timing is rejected") {
+// -- Nonblocking intra-assignment delay (`x <= #d y`, LRM 9.4.5) --
+//
+// The process does not block: the RHS is sampled now and the update is committed
+// in the NBA region of `now + d` (docs/design/intra-assignment-timing.md). All
+// cases below are pinned against iverilog 13.
+
+// Region ordering: an active-region read at `t+d` sees the OLD value; the deferred
+// update lands afterward, in the NBA region. Committing at wheel-fire time (before
+// the active region) would print 0. iverilog prints 1.
+TEST_CASE("nonblocking intra-delay commits in the NBA region, not at wheel-fire") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a, x;
+            initial begin
+                a = 1;
+                a <= #5 0;
+                #5 x = a;
+                $display("x=%0d", x);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "x=1\n");
+}
+
+// The RHS is sampled at the statement's instant, not when the update lands: a
+// source change during the delay does not affect the stored value. iverilog
+// prints 11 (10 sampled at t=0, +1), not 100 (99 + 1 at t=12).
+TEST_CASE("nonblocking intra-delay samples the RHS now") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] b;
+            initial begin b = 8'd10; b <= #12 (b + 1); end
+            initial #3 b = 8'd99;
+            initial begin #20; $display("b=%0d", b); $finish; end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "b=11\n");
+}
+
+// The process does not block: it continues past the `<=` immediately. Here the
+// same process schedules a delayed update and then keeps running in zero time.
+TEST_CASE("nonblocking intra-delay does not block the process") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a;
+            initial begin
+                a = 8'd1;
+                a <= #5 8'd9;
+                $display("after=%0d t=%0t", a, $time);   // a still 1, time still 0
+                #10 $display("later=%0d", a);            // now 9
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "after=1 t=0\nlater=9\n");
+}
+
+// Two updates to the same signal firing at the same instant commit in
+// statement-execution order — last executed wins (LRM 10.4.2), not wheel-fire
+// order. iverilog prints 2.
+TEST_CASE("nonblocking intra-delay same-instant updates apply last-executed-wins") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] mm;
+            initial begin
+                mm = 0;
+                mm <= #5 8'd1;   // executed first  -> fires at t=5
+                #2;
+                mm <= #3 8'd2;   // executed second -> also fires at t=5
+            end
+            initial begin #10; $display("m=%0d", mm); $finish; end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "m=2\n");
+}
+
+// A zero delay cannot arm the wheel; the update lands in the current instant's
+// NBA region. iverilog leaves b == 2 by the end.
+TEST_CASE("nonblocking intra-delay with #0 commits in the current NBA region") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] b;
+            initial begin b = 8'd1; b <= #0 8'd2; end
+            initial begin #5; $display("b=%0d", b); $finish; end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "b=2\n");
+}
+
+// A dynamic (runtime-valued) delay is supported. iverilog: a == 9 at the end.
+TEST_CASE("nonblocking intra-delay accepts a dynamic delay") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a;
+            int n = 4;
+            initial begin a = 8'd5; a <= #(n + 1) 8'd9; end
+            initial begin #20; $display("a=%0d", a); $finish; end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "a=9\n");
+}
+
+// A pipeline: q sampled each posedge and committed a delay later, so several
+// updates are in flight at once. iverilog prints q=6 d=8.
+TEST_CASE("nonblocking intra-delay pipelines multiple in-flight updates") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] d, q;
+            logic       clk = 0;
+            int         cyc = 0;
+            always #5 clk = ~clk;
+            initial begin d = 0; q = 0; end
+            always @(posedge clk) begin
+                d   <= d + 1;
+                q   <= #12 d;
+                cyc <= cyc + 1;
+                if (cyc == 8) begin
+                    $display("q=%0d d=%0d", q, d);
+                    $finish;
+                end
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "q=6 d=8\n");
+}
+
+// A 4-state value with x bits propagates through the deferred store unchanged.
+TEST_CASE("nonblocking intra-delay carries a 4-state x value") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] xr, xs;
+            initial begin xs = 4'bxx01; xr <= #3 xs; end
+            initial begin #10; $display("xr=%b", xr); $finish; end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "xr=xx01\n");
+}
+
+// The event / repeat forms need wait-queue-triggered records (a documented
+// follow-up) and must fail loudly, never silently drop the timing.
+TEST_CASE("nonblocking intra-assignment event timing is rejected") {
     constexpr std::string_view src = R"(
         module m;
             logic [7:0] a, b;
-            initial a <= #5 b;
+            logic       c = 0;
+            initial a <= @(posedge c) b;
         endmodule)";
-    CHECK(lower_error(src).find("nonblocking intra-assignment timing") != std::string::npos);
+    CHECK(lower_error(src).find("event/repeat timing is not supported") != std::string::npos);
+}
+
+// A non-whole-scalar target (bit/part-select, array element) needs the masked /
+// array record path (a documented follow-up) and must fail loudly.
+TEST_CASE("nonblocking intra-delay to a part-select target is rejected") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a;
+            initial a[3:0] <= #5 4'd1;
+        endmodule)";
+    CHECK(lower_error(src).find("whole integral scalar target") != std::string::npos);
 }
 
 // A string / whole-array target with intra-assignment timing is not yet lowered

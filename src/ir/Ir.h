@@ -125,6 +125,15 @@ struct Select {
     Index b;
 };
 
+// Extra payload for `store_nb_delay`: the sampled RHS value and the delay in
+// ticks. The whole-signal lvalue is the enclosing op_extra `op`.
+struct StoreNbDelayInfo {
+    // Value stored after the delay (sampled in the current instant).
+    Index value;
+    // Delay in scaled ticks before the store lands.
+    Index delay;
+};
+
 // Extra payload for `part_select`: a constant [msb:lsb] slice of the base.
 struct PartSelect {
     // Most-significant selected bit.
@@ -640,6 +649,11 @@ struct Inst {
         Store,
         // Nonblocking assignment, lhs <= rhs (payload: binary).
         StoreNb,
+        // Nonblocking intra-assignment delay, lhs <= #d rhs (LRM 9.4.5): sample
+        // rhs now (this instant), schedule the store of the sampled value for
+        // `now + d` without blocking the process (payload: op_extra ->
+        // StoreNbDelayInfo; the op is the whole-signal lvalue).
+        StoreNbDelay,
 
         // -- Arithmetic (payload: binary) --
         Add,

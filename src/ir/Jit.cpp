@@ -168,6 +168,13 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_nba_arr_count", &rt_nba_arr_count);
     expose("rt_nba_arr_any", &rt_nba_arr_any);
     expose("rt_nba_arr_reset", &rt_nba_arr_reset);
+    expose("rt_intra_alloc", &rt_intra_alloc);
+    expose("rt_intra_cb", &rt_intra_cb);
+    expose("rt_intra_ready_base", &rt_intra_ready_base);
+    expose("rt_intra_ready_count", &rt_intra_ready_count);
+    expose("rt_intra_any", &rt_intra_any);
+    expose("rt_intra_release", &rt_intra_release);
+    expose("rt_intra_reset", &rt_intra_reset);
     expose("rt_string_init", &rt_string_init);
     expose("rt_string_deinit", &rt_string_deinit);
     expose("rt_string_assign", &rt_string_assign);

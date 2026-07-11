@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <queue>
@@ -894,6 +895,96 @@ extern "C" void rt_nba_arr_reset(void) {
         q.count = 0;
     }
     arr_total = 0;
+}
+
+namespace {
+
+// One deferred nonblocking-intra-assignment site (a target signal). `pool` owns
+// every record ever allocated for the site (stable addresses — the wheel holds
+// pointers into them across time); `freelist` holds the currently-free ones;
+// `ready` holds records that have fired and await the NBA-region commit. A record
+// cycles pool-backed: freelist -> (armed on wheel) -> ready -> freelist.
+struct IntraSite {
+    std::vector<std::unique_ptr<unsigned char[]>> pool;
+    std::vector<void*>                             freelist;
+    std::vector<void*>                             ready;
+};
+
+std::vector<IntraSite> intra_sites; // indexed by dense intra-nba id
+uint32_t               intra_total = 0; // ready records across all sites
+uint32_t               intra_seq   = 0; // monotonic arm-order stamp
+
+} // namespace
+
+extern "C" void* rt_intra_alloc(uint32_t idx, uint32_t stride) {
+    if (idx >= intra_sites.size()) {
+        intra_sites.resize(idx + 1);
+    }
+    IntraSite& site = intra_sites[idx];
+    void*      p;
+    if (!site.freelist.empty()) {
+        p = site.freelist.back();
+        site.freelist.pop_back();
+    } else {
+        site.pool.push_back(std::make_unique<unsigned char[]>(stride));
+        p = site.pool.back().get();
+    }
+    // Stamp arm order so the commit applies same-instant updates last-executed-wins.
+    reinterpret_cast<rt_intra_rec*>(p)->seq = intra_seq++;
+    return p;
+}
+
+extern "C" void rt_intra_cb(rt_timer* timer, void* /*ctx*/) {
+    // The record base is the timer (timer at offset 0), so recover it by cast.
+    auto*              rec   = reinterpret_cast<rt_intra_rec*>(timer);
+    std::vector<void*>& ready = intra_sites[rec->idx].ready;
+    // Insert keeping ascending seq: the commit loop applies in seq order, so the
+    // last-executed same-instant assignment wins. Same-instant counts are small,
+    // so the linear insert is cheap.
+    size_t pos = ready.size();
+    while (pos > 0 && reinterpret_cast<rt_intra_rec*>(ready[pos - 1])->seq > rec->seq) {
+        --pos;
+    }
+    ready.insert(ready.begin() + static_cast<std::ptrdiff_t>(pos), rec);
+    intra_total++;
+}
+
+extern "C" void* rt_intra_ready_base(uint32_t idx) {
+    return idx < intra_sites.size() ? intra_sites[idx].ready.data() : nullptr;
+}
+
+extern "C" uint32_t rt_intra_ready_count(uint32_t idx) {
+    return idx < intra_sites.size() ? static_cast<uint32_t>(intra_sites[idx].ready.size()) : 0;
+}
+
+extern "C" uint32_t rt_intra_any(void) {
+    return intra_total;
+}
+
+extern "C" void rt_intra_release(uint32_t idx) {
+    if (idx >= intra_sites.size()) {
+        return;
+    }
+    IntraSite& site = intra_sites[idx];
+    intra_total -= static_cast<uint32_t>(site.ready.size());
+    for (void* p : site.ready) {
+        site.freelist.push_back(p);
+    }
+    site.ready.clear();
+}
+
+extern "C" void rt_intra_reset(void) {
+    // A fresh simulation has nothing scheduled, so every pooled record is free —
+    // including any this-process left armed on the wheel at a prior $finish.
+    for (IntraSite& site : intra_sites) {
+        site.freelist.clear();
+        for (const auto& rec : site.pool) {
+            site.freelist.push_back(rec.get());
+        }
+        site.ready.clear();
+    }
+    intra_total = 0;
+    intra_seq   = 0;
 }
 
 extern "C" void rt_wheel_init(rt_wheel* wheel) {
