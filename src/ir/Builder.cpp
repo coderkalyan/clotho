@@ -51,6 +51,11 @@ Index Builder::event_trigger_nb(Signal sig, SourceLoc loc) {
     return emit({ Inst::Tag::EventTriggerNb, Inst::Payload{ .signal = sig } }, loc);
 }
 
+Index Builder::event_trigger_nb_delayed(Signal sig, Index delay, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(EventDelayInfo{ sig });
+    return emit({ Inst::Tag::EventTriggerNbDelayed, Inst::Payload{ .op_extra = { delay, extra } } }, loc);
+}
+
 Index Builder::unary(Inst::Tag tag, Index op, SourceLoc loc) {
     return emit({ tag, Inst::Payload{ .unary = op } }, loc);
 }

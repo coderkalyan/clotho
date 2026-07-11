@@ -567,6 +567,13 @@ struct WaitInfo {
     ExtraSlice events;
 };
 
+// Extra payload for `event_trigger_nb_delayed` (`->> #d e`): the target event
+// signal. The delay (in wheel ticks) is the instruction's `op` operand.
+struct EventDelayInfo {
+    // Event whose synthetic signal owns the wait queue to service on expiry.
+    Signal event;
+};
+
 static_assert(ExtraPayload<ExtraSlice>);
 static_assert(ExtraPayload<CallInfo>);
 static_assert(ExtraPayload<TaskCallInfo>);
@@ -829,6 +836,12 @@ struct Inst {
         // stamps the trigger time and services the waiters. The triggering process
         // does not block.
         EventTriggerNb,
+        // Delayed nonblocking trigger `->> #d e` (payload: op_extra -> op is the
+        // delay in wheel ticks, extra -> EventDelayInfo names the event). Schedules
+        // a detached wheel timer that, on expiry, stamps the trigger time and
+        // services the event's waiters (LRM 15.5.4). The triggering process does
+        // not block. The event-controlled form (`->> @(x) e`) is not lowered here.
+        EventTriggerNbDelayed,
 
         // -- String ops (operands are string values unless noted) --
         // s.len() -> 32-bit signed (payload: unary).

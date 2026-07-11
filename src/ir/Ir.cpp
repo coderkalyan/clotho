@@ -161,6 +161,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::EnumName:
         case T::CountBits:
         case T::ValuePlusArgs:
+        case T::EventTriggerNbDelayed:
             return K::OpExtra;
     }
 

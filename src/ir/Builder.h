@@ -44,6 +44,8 @@ public:
     Index event_triggered(Signal sig, SourceLoc loc);
     // `->> e`: nonblocking trigger of event `sig` (deferred to the NBA region).
     Index event_trigger_nb(Signal sig, SourceLoc loc);
+    // `->> #d e`: delayed nonblocking trigger; `delay` is the tick count.
+    Index event_trigger_nb_delayed(Signal sig, Index delay, SourceLoc loc);
 
     // -- Generic ops sharing a payload shape --
     // tag must be a unary-payload op (load, bnot, lnot, red_*, ret).
