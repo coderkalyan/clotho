@@ -50,8 +50,10 @@
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/diagnostics/TextDiagnosticClient.h>
 #include <slang/numeric/Time.h>
+#include <slang/parsing/Preprocessor.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/text/SourceManager.h>
+#include <slang/util/Bag.h>
 #include <slang/util/SmallVector.h>
 
 #include "SourceMap.h"
@@ -7257,8 +7259,18 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
 
 } // namespace
 
-LowerResult lower_files(std::span<const std::string_view> paths, Timings* timings) {
+LowerResult lower_files(std::span<const std::string_view> paths, const FrontendOptions& fe,
+                        Timings* timings) {
     const auto t_parse = std::chrono::steady_clock::now();
+
+    // Command-line macro predefines and `include search dirs, applied to every
+    // tree via one shared Bag. predefines take "NAME=VALUE"
+    // form; additionalIncludePaths feeds the `` `include `` resolver.
+    slang::parsing::PreprocessorOptions ppo;
+    ppo.predefines = fe.defines;
+    ppo.additionalIncludePaths.assign(fe.include_dirs.begin(), fe.include_dirs.end());
+    slang::Bag options;
+    options.set(ppo);
 
     // One SourceManager shared across every tree so the Compilation's
     // diagnostics resolve file/line locations for all files. It
@@ -7266,7 +7278,7 @@ LowerResult lower_files(std::span<const std::string_view> paths, Timings* timing
     slang::SourceManager    sm;
     slang::ast::Compilation comp;
     for (const std::string_view path : paths) {
-        auto tree = slang::syntax::SyntaxTree::fromFile(path, sm);
+        auto tree = slang::syntax::SyntaxTree::fromFile(path, sm, options);
         if (!tree) {
             LowerResult result;
             result.diagnostics = "error: cannot read '" + std::string(path) +
@@ -7283,7 +7295,7 @@ LowerResult lower_files(std::span<const std::string_view> paths, Timings* timing
 }
 
 LowerResult lower_file(std::string_view path, Timings* timings) {
-    return lower_files({&path, 1}, timings);
+    return lower_files({&path, 1}, {}, timings);
 }
 
 LowerResult lower_text(std::string_view source, Timings* timings) {

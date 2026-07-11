@@ -1,5 +1,6 @@
 #include <iostream>
 #include <print>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -14,7 +15,7 @@
 // then JIT-compile and run it (default), or emit the process IR / LLVM IR for
 // debugging. All compiler logic lives in libclotho / libclotho_ir.
 //
-// Usage: clotho [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] [--no-thunk] [--domain-spec] [-O] [--perf-jitdump] [-o <out>] <file.sv>... [+plusarg...]
+// Usage: clotho [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] [--no-thunk] [--domain-spec] [-O] [--perf-jitdump] [-o <out>] [-D<macro>] [-I<dir>] [+define+...] [+incdir+...] <file.sv>... [+plusarg...]
 // Multiple source files are compiled together into one design (shared name
 // space, LRM 3.12), parsed in the order given.
 // `llvm` emits the backend's raw IR before the coroutine-lowering pipeline runs
@@ -25,8 +26,25 @@ int main(int argc, char** argv) {
     std::string_view              out;
     std::vector<std::string_view> inputs;
     std::vector<std::string_view> plusargs;
+    clotho::FrontendOptions       fe;
     bool                          time = false;
     clotho::ir::SimulationConfig  config;
+
+    // Split a `+define+A=1+B+C` / `+incdir+d1+d2` tail on '+', appending each
+    // non-empty field to `out`. Empty fields (e.g. a trailing '+') are skipped.
+    const auto split_plus = [](std::string_view tail, std::vector<std::string>& out) {
+        for (size_t start = 0; start <= tail.size();) {
+            const size_t end   = tail.find('+', start);
+            const auto   field = tail.substr(start, end - start);
+            if (!field.empty()) {
+                out.emplace_back(field);
+            }
+            if (end == std::string_view::npos) {
+                break;
+            }
+            start = end + 1;
+        }
+    };
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
@@ -50,6 +68,20 @@ int main(int argc, char** argv) {
             config.perf_jitdump = true;
         } else if (arg == "-o" && i + 1 < argc) {
             out = argv[++i];
+        } else if (arg == "-D" && i + 1 < argc) {
+            fe.defines.emplace_back(argv[++i]);
+        } else if (arg.starts_with("-D")) {
+            fe.defines.emplace_back(arg.substr(2));
+        } else if (arg == "-I" && i + 1 < argc) {
+            fe.include_dirs.emplace_back(argv[++i]);
+        } else if (arg.starts_with("-I")) {
+            fe.include_dirs.emplace_back(arg.substr(2));
+        } else if (arg.starts_with("+define+")) {
+            // `+define+NAME=VALUE+NAME2...` macro predefines (LRM 22.5.1).
+            split_plus(arg.substr(8), fe.defines);
+        } else if (arg.starts_with("+incdir+")) {
+            // `+incdir+dir1+dir2...` `include search dirs (LRM 22.4).
+            split_plus(arg.substr(8), fe.include_dirs);
         } else if (arg.starts_with("+")) {
             // A plusarg (LRM §21.6): made available to $test$plusargs /
             // $value$plusargs, in order, with the leading `+` stripped. Not a
@@ -65,7 +97,7 @@ int main(int argc, char** argv) {
 
     if (inputs.empty() || (emit != "run" && emit != "ir" && emit != "llvm" && emit != "opt")) {
         std::println(stderr,
-                     "usage: {} [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] [--no-thunk] [--domain-spec] [-O] [--perf-jitdump] [-o <out>] <file.sv>... [+plusarg...]",
+                     "usage: {} [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] [--no-thunk] [--domain-spec] [-O] [--perf-jitdump] [-o <out>] [-D<macro>] [-I<dir>] [+define+...] [+incdir+...] <file.sv>... [+plusarg...]",
                      argv[0]);
         return 2;
     }
@@ -91,7 +123,7 @@ int main(int argc, char** argv) {
         std::println(stderr, "  {:<16}{:>12.3f}", "total", total);
     };
 
-    const clotho::LowerResult result = clotho::lower_files(inputs, tp);
+    const clotho::LowerResult result = clotho::lower_files(inputs, fe, tp);
     if (!result.diagnostics.empty()) {
         std::print(stderr, "{}", result.diagnostics);
     }
