@@ -456,10 +456,12 @@ struct FrameSlot {
     llvm::Type* storage_ty = nullptr;
     // The local's interned IR type (aggregate recursion needs it).
     Ref ir_type = Ref::Invalid;
-    // A dynamic-array local: the slot is an rt_dynarr handle; it powers on empty
-    // ({ null, 0 }) and is freed (rt_dynarr_delete) at every body exit, like a
-    // string local.
+    // A dynamic-array or queue local: the slot is a handle; it powers on empty
+    // ({0}) and is freed at every body exit, like a string local. `handle_type`
+    // is the interned handle type (picks the runtime slot / delete function).
     bool is_dynarr = false;
+    bool is_queue  = false;
+    Ref  handle_type = Ref::Invalid;
     // A ref formal: the local has no real frame storage (its dead field is kept
     // only so Local index == field index). Loads / stores redirect to the passed
     // actual pointer, recorded in ref_ptr_ by the callee prologue.
@@ -685,6 +687,27 @@ private:
     // Whether a type is a queue (LRM 7.10).
     bool is_queue_type(Ref type) const {
         return std::get<Type>(mod_.pool.get(type)).kind == Type::Kind::Queue;
+    }
+
+    // A heap-backed handle value type (dynamic array or queue): both share the
+    // by-pointer, deep-copy subroutine ABI, differing only in the runtime slot
+    // struct and the copy / free functions.
+    bool is_handle_type(Ref type) const {
+        return is_dynarr_type(type) || is_queue_type(type);
+    }
+    llvm::StructType* handle_slot_ty(Ref type) {
+        return is_queue_type(type) ? queue_slot_ty() : dynarr_slot_ty();
+    }
+    // Deep-copy one handle into another (value semantics), picking the runtime
+    // function and element stride from the type.
+    void emit_handle_assign(llvm::Value* dst, llvm::Value* src, Ref type) {
+        llvm::Value* stride = b_.getInt64(dynarr_stride(dynarr_elem(type)));
+        b_.CreateCall(is_queue_type(type) ? queue_assign_fn() : dynarr_assign_fn(),
+                      { dst, src, stride });
+    }
+    // Free a handle's heap storage (reset to empty).
+    void emit_handle_delete(llvm::Value* handle, Ref type) {
+        b_.CreateCall(is_queue_type(type) ? queue_delete_all_fn() : dynarr_delete_fn(), { handle });
     }
 
     // Whether a type is a string, or an unpacked array whose leaf element is.
@@ -1725,10 +1748,10 @@ private:
                 params.push_back(ptr); // one pointer to the actual's packed slot
                 continue;
             }
-            // A dynamic array is one handle pointer regardless of direction (the
-            // callee copies in / out through it); it never uses the (mm, z) pair.
-            if (is_dynarr_type(pt)) {
-                params.push_back(ptr); // &actual (rt_dynarr*)
+            // A dynamic array or queue is one handle pointer regardless of
+            // direction (the callee copies in / out through it); never a (mm, z) pair.
+            if (is_handle_type(pt)) {
+                params.push_back(ptr); // &actual (rt_dynarr* / rt_queue*)
                 continue;
             }
             if (dir == ArgDir::Out || dir == ArgDir::Inout) {
@@ -1748,11 +1771,11 @@ private:
             params.push_back(int_ty(2 * w)); // must|may
             params.push_back(int_ty(w));     // z
         }
-        // A string, aggregate, or dynamic-array result returns through a trailing
-        // out-param the caller owns (its call-site temp) — none has a plane form.
+        // A string, aggregate, dynamic-array, or queue result returns through a
+        // trailing out-param the caller owns (its call-site temp) — no plane form.
         llvm::Type* rty = fn_return_ty(f.return_type);
         if (is_string_type(f.return_type) || contains_struct(f.return_type) ||
-            is_dynarr_type(f.return_type)) {
+            is_handle_type(f.return_type)) {
             rty = b_.getVoidTy();
             params.push_back(ptr);
         }
@@ -1780,8 +1803,8 @@ private:
         for (size_t k = 0; k < f.param_types.size(); ++k) {
             if (f.arg_dirs[k] == ArgDir::Ref) {
                 params.push_back(ptr); // one pointer to the actual's packed slot
-            } else if (is_dynarr_type(f.param_types[k])) {
-                params.push_back(ptr); // &actual (rt_dynarr*), any direction
+            } else if (is_handle_type(f.param_types[k])) {
+                params.push_back(ptr); // &actual (rt_dynarr* / rt_queue*), any direction
             } else if (f.arg_dirs[k] == ArgDir::In) {
                 if (is_string_type(f.param_types[k])) {
                     params.push_back(ptr); // rt_string handle
@@ -1820,9 +1843,9 @@ private:
         if (contains_struct(f.param_types[k])) {
             return true;
         }
-        // A dynamic array is one handle pointer in every direction (input / output /
-        // inout all pass &actual; the callee copies in/out through it).
-        if (is_dynarr_type(f.param_types[k])) {
+        // A dynamic array or queue is one handle pointer in every direction (input /
+        // output / inout all pass &actual; the callee copies in/out through it).
+        if (is_handle_type(f.param_types[k])) {
             return true;
         }
         return is_string_type(f.param_types[k]) && (!f.is_task || f.arg_dirs[k] == ArgDir::In);
@@ -1912,13 +1935,15 @@ private:
                 fields[i]                 = frame_slots_[i].slot_ty;
                 continue;
             }
-            // A ref dynamic-array formal aliases the caller's handle (no owned frame
-            // slot, no init/copy/free): fall through to the dead-field path, and
-            // local_lvalue redirects its base to the passed pointer (ref_ptr_).
-            if (is_dynarr_type(f.local_types[i]) && !is_ref_formal) {
-                frame_slots_[i].is_dynarr = true;
-                frame_slots_[i].slot_ty   = dynarr_slot_ty();
-                fields[i]                 = frame_slots_[i].slot_ty;
+            // A ref dynamic-array / queue formal aliases the caller's handle (no
+            // owned frame slot, no init/copy/free): fall through to the dead-field
+            // path, and local_lvalue redirects its base to the passed pointer.
+            if (is_handle_type(f.local_types[i]) && !is_ref_formal) {
+                frame_slots_[i].is_dynarr    = is_dynarr_type(f.local_types[i]);
+                frame_slots_[i].is_queue     = is_queue_type(f.local_types[i]);
+                frame_slots_[i].handle_type  = f.local_types[i];
+                frame_slots_[i].slot_ty      = handle_slot_ty(f.local_types[i]);
+                fields[i]                    = frame_slots_[i].slot_ty;
                 continue;
             }
             // A 2-state local uses the genuine iW slot; the packed-word ABI wire is
@@ -1959,9 +1984,9 @@ private:
                 b_.CreateCall(str_init_fn(), { slot });
                 continue;
             }
-            if (s.is_dynarr) {
-                // Empty array handle: { null, 0 } (the frame alloca is not
-                // zeroed; store the empty handle so the buffer pointer is null).
+            if (s.is_dynarr || s.is_queue) {
+                // Empty handle ({0}): the frame alloca is not zeroed, so store the
+                // empty handle (null buffer pointer, zero length).
                 b_.CreateStore(llvm::Constant::getNullValue(s.slot_ty), slot);
                 continue;
             }
@@ -1984,17 +2009,18 @@ private:
         for (uint32_t i = 0; i < frame_slots_.size(); ++i) {
             if (frame_slots_[i].is_string) {
                 b_.CreateCall(str_deinit_fn(), { b_.CreateStructGEP(frame_ty_, frame_, i) });
-            } else if (frame_slots_[i].is_dynarr) {
-                // A dynamic-array local owns its heap buffer (value semantics):
-                // free it at every body exit so it does not leak with the frame.
-                b_.CreateCall(dynarr_delete_fn(), { b_.CreateStructGEP(frame_ty_, frame_, i) });
+            } else if (frame_slots_[i].is_dynarr || frame_slots_[i].is_queue) {
+                // A dynamic-array / queue local owns its heap buffer (value
+                // semantics): free it at every body exit so it does not leak.
+                emit_handle_delete(b_.CreateStructGEP(frame_ty_, frame_, i),
+                                   frame_slots_[i].handle_type);
             }
         }
         for (llvm::Value* temp : str_temp_list_) {
             b_.CreateCall(str_deinit_fn(), { temp });
         }
-        for (llvm::Value* temp : dynarr_temp_list_) {
-            b_.CreateCall(dynarr_delete_fn(), { temp });
+        for (const auto& [temp, type] : dynarr_temp_list_) {
+            emit_handle_delete(temp, type);
         }
     }
 
@@ -2249,15 +2275,14 @@ private:
             if (f.arg_dirs[k] == ArgDir::Ref) {
                 continue;
             }
-            if (is_dynarr_type(f.param_types[k])) {
-                // Deep copy the caller's array into the frame handle for input /
+            if (is_handle_type(f.param_types[k])) {
+                // Deep copy the caller's handle into the frame handle for input /
                 // inout (value semantics; init_frame left the slot empty). Output
                 // keeps the empty frame — it is filled by the body, copied out at
                 // return.
                 if (f.arg_dirs[k] == ArgDir::In || f.arg_dirs[k] == ArgDir::Inout) {
-                    b_.CreateCall(dynarr_assign_fn(),
-                                  { b_.CreateStructGEP(frame_ty_, frame_, k), fn_->getArg(base),
-                                    b_.getInt64(dynarr_stride(dynarr_elem(f.param_types[k]))) });
+                    emit_handle_assign(b_.CreateStructGEP(frame_ty_, frame_, k), fn_->getArg(base),
+                                       f.param_types[k]);
                 }
                 continue;
             }
@@ -2288,12 +2313,11 @@ private:
                 continue;
             }
             const uint32_t base = param_llvm_index_[k];
-            // A dynamic-array output / inout formal deep-copies its frame handle
-            // back into the caller's array (the single passed handle pointer).
-            if (is_dynarr_type(f.param_types[k])) {
-                b_.CreateCall(dynarr_assign_fn(),
-                              { fn_->getArg(base), b_.CreateStructGEP(frame_ty_, frame_, k),
-                                b_.getInt64(dynarr_stride(dynarr_elem(f.param_types[k]))) });
+            // A dynamic-array / queue output / inout formal deep-copies its frame
+            // handle back into the caller's handle (the single passed pointer).
+            if (is_handle_type(f.param_types[k])) {
+                emit_handle_assign(fn_->getArg(base), b_.CreateStructGEP(frame_ty_, frame_, k),
+                                   f.param_types[k]);
                 continue;
             }
             // The caller's out-target is still the packed word; lift a narrow local.
@@ -5757,7 +5781,7 @@ private:
                 const auto qi = ir_->extra_data<QueueInfo>(p.op_extra.extra);
                 if (qi.sub == static_cast<uint32_t>(QueueOp::PopFront) ||
                     qi.sub == static_cast<uint32_t>(QueueOp::PopBack)) {
-                    return from_ref(queue_elem_type(p.op_extra.op));
+                    return from_ref(std::get<Type>(mod_.pool.get(qi.queue_type)).element);
                 }
                 return { 32, false, true };
             }
@@ -6073,15 +6097,17 @@ private:
             if (ir_->tag(i) != Inst::Tag::Call) {
                 continue;
             }
-            const auto ci = ir_->extra_data<CallInfo>(ir_->payload(i).extra);
-            if (!is_dynarr_type(mod_.function(ci.func).return_type)) {
+            const auto ci  = ir_->extra_data<CallInfo>(ir_->payload(i).extra);
+            const Ref  rty = mod_.function(ci.func).return_type;
+            if (!is_handle_type(rty)) {
                 continue;
             }
-            auto* temp = b_.CreateAlloca(dynarr_slot_ty(), nullptr, "dynarr.ret");
+            auto* slot = handle_slot_ty(rty);
+            auto* temp = b_.CreateAlloca(slot, nullptr, "handle.ret");
             temp->setAlignment(llvm::Align(8));
-            b_.CreateStore(llvm::Constant::getNullValue(dynarr_slot_ty()), temp); // empty handle
+            b_.CreateStore(llvm::Constant::getNullValue(slot), temp); // empty handle
             dynarr_ret_[k] = temp;
-            dynarr_temp_list_.push_back(temp);
+            dynarr_temp_list_.push_back({ temp, rty });
         }
     }
 
@@ -7308,7 +7334,7 @@ private:
         const auto           qi     = ir_->extra_data<QueueInfo>(p.op_extra.extra);
         const LValue&        lv     = lvalue_of(p.op_extra.op);
         llvm::Value*         handle = lv.base;
-        const Ref            arr_ty = mod_.signal(lv.sig).type;
+        const Ref            arr_ty = qi.queue_type;
         const DynElem        e      = dynarr_elem(arr_ty);
         llvm::Value*         stride = b_.getInt64(dynarr_stride(e));
         llvm::Value*         bound  = b_.getInt64(std::get<Type>(mod_.pool.get(arr_ty)).left);
@@ -8995,13 +9021,12 @@ private:
             b_.CreateRetVoid();
             return;
         }
-        if (is_dynarr_type(cur_fn_->return_type)) {
-            // Deep-copy the returned array (an lvalue handle) into the caller's
-            // result handle (the trailing out-param), before freeing the body's
-            // handles (the value may be a frame local or a call result temp).
-            b_.CreateCall(dynarr_assign_fn(),
-                          { fn_->getArg(fn_->arg_size() - 1), lvalue_of(value).base,
-                            b_.getInt64(dynarr_stride(dynarr_elem(cur_fn_->return_type))) });
+        if (is_handle_type(cur_fn_->return_type)) {
+            // Deep-copy the returned handle (an lvalue) into the caller's result
+            // handle (the trailing out-param), before freeing the body's handles
+            // (the value may be a frame local or a call result temp).
+            emit_handle_assign(fn_->getArg(fn_->arg_size() - 1), lvalue_of(value).base,
+                               cur_fn_->return_type);
             deinit_body_strings();
             b_.CreateRetVoid();
             return;
@@ -9039,17 +9064,17 @@ private:
         size_t k = 0;
         for (Index a : ir_->region(ci.args)) {
             const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
-            if (is_dynarr_type(f.param_types[k]) && dir != ArgDir::Ref) {
-                // A dynamic array passes one handle pointer (the actual) in every
-                // by-value direction; the callee copies in / out through it. (A ref
-                // dynarr falls to the Ref branch below, aliasing the same pointer.)
+            if (is_handle_type(f.param_types[k]) && dir != ArgDir::Ref) {
+                // A dynamic array / queue passes one handle pointer (the actual) in
+                // every by-value direction; the callee copies in / out through it.
+                // (A ref handle falls to the Ref branch below, aliasing the pointer.)
                 argv.push_back(lvalue_of(a).base);
             } else if (dir == ArgDir::Ref) {
                 // Pass one pointer to the actual's slot (scalar, array element, or a
-                // dynamic-array handle); the callee aliases it.
+                // dynamic-array / queue handle); the callee aliases it.
                 const LValue& lv = lvalue_of(a);
-                argv.push_back(is_dynarr_type(f.param_types[k]) ? lv.base : ref_actual_ptr(lv));
-                if (!is_dynarr_type(f.param_types[k])) {
+                argv.push_back(is_handle_type(f.param_types[k]) ? lv.base : ref_actual_ptr(lv));
+                if (!is_handle_type(f.param_types[k])) {
                     ref_svc.emplace_back(lv, service_snapshot(lv));
                 }
             } else if (dir == ArgDir::Out || dir == ArgDir::Inout) {
@@ -9098,15 +9123,15 @@ private:
             }
             return;
         }
-        if (is_dynarr_type(f.return_type)) {
-            // The callee copies its return array into this call's result handle
+        if (is_handle_type(f.return_type)) {
+            // The callee copies its return handle into this call's result handle
             // (the trailing out-param, alloc'd by build_dynarr_temps). Publish it as
             // the call's lvalue so downstream consumers (assign / .size() / element)
             // read it directly.
             llvm::Value* temp = dynarr_ret_[static_cast<uint32_t>(i)];
             LValue       lv;
             lv.base    = temp;
-            lv.slot_ty = dynarr_slot_ty();
+            lv.slot_ty = handle_slot_ty(f.return_type);
             set_lvalue(i, lv);
             argv.push_back(temp);
             b_.CreateCall(cf->getFunctionType(), cf, argv);
@@ -9246,16 +9271,16 @@ private:
         // runtime wake keyed by signal id); TODO once that exists.
         std::vector<std::pair<LValue, ServiceSnapshot>> ref_svc;
         for (uint32_t k = 0; k < args.size(); ++k) {
-            if (is_dynarr_type(tf.param_types[k]) && tf.arg_dirs[k] != ArgDir::Ref) {
+            if (is_handle_type(tf.param_types[k]) && tf.arg_dirs[k] != ArgDir::Ref) {
                 // One handle pointer for every by-value direction; callee copies
                 // in / out through it.
                 argv.push_back(lvalue_of(args[k]).base);
             } else if (tf.arg_dirs[k] == ArgDir::Ref) {
                 // Pass one pointer to the actual's slot (scalar, array element, or a
-                // dynamic-array handle); the callee aliases it.
+                // dynamic-array / queue handle); the callee aliases it.
                 const LValue& lv = lvalue_of(args[k]);
-                argv.push_back(is_dynarr_type(tf.param_types[k]) ? lv.base : ref_actual_ptr(lv));
-                if (!is_dynarr_type(tf.param_types[k])) {
+                argv.push_back(is_handle_type(tf.param_types[k]) ? lv.base : ref_actual_ptr(lv));
+                if (!is_handle_type(tf.param_types[k])) {
                     ref_svc.emplace_back(lv, service_snapshot(lv));
                 }
             } else if (tf.arg_dirs[k] == ArgDir::In) {
@@ -11079,10 +11104,10 @@ private:
     llvm::StructType* str_slot_ty_ = nullptr;
     // Memoized `%clotho.dynarr` handle slot type ({ ptr data, i64 len }).
     llvm::StructType* dynarr_slot_ty_ = nullptr;
-    // Result-handle temporaries for dynamic-array-returning calls in the current
-    // body: alloca'd empty in the prologue, passed as the callee's trailing
-    // out-param, and freed at every body exit (parallel to str_temp_list_).
-    std::vector<llvm::Value*> dynarr_temp_list_;
+    // Result-handle temporaries for dynamic-array / queue-returning calls in the
+    // current body: alloca'd empty in the prologue, passed as the callee's trailing
+    // out-param, and freed (by handle type) at every body exit.
+    std::vector<std::pair<llvm::Value*, Ref>> dynarr_temp_list_;
     // Per-call-instruction result handle (null for non-dynarr-returning calls),
     // parallel to str_vals_ and snapshotted per fused member the same way — the
     // coroutine body lowering resets lvals_ via select_member, so the mapping

@@ -237,6 +237,10 @@ struct QueueInfo {
     Index val;
     // bit0: `idx` present; bit1: `val` present.
     uint32_t flags;
+    // The interned Queue type of the target (element stride / slot / bound),
+    // independent of the target signal — so the op works for a module signal or
+    // a frame local.
+    Ref queue_type;
 };
 
 // Extra payload for `dyn_array_op`: a dynamic-array operation on the handle

@@ -1251,6 +1251,20 @@ private:
         return std::get<ir::Type>(module_.pool.get(ty)).kind == ir::Type::Kind::DynArray;
     }
 
+    // True if an interned IR type is a heap-handle value type — a dynamic array or
+    // queue — which share the by-pointer, deep-copy subroutine ABI.
+    bool is_handle_ref(ir::Ref ty) const {
+        const ir::Type::Kind k = std::get<ir::Type>(module_.pool.get(ty)).kind;
+        return k == ir::Type::Kind::DynArray || k == ir::Type::Kind::Queue;
+    }
+
+    // True if an expression is a dynamic array or queue (a heap handle).
+    static bool is_handle_expr(const slang::ast::Expression& e) {
+        const slang::ast::Type& ct = e.type->getCanonicalType();
+        return ct.as_if<slang::ast::DynamicArrayType>() != nullptr ||
+               ct.as_if<slang::ast::QueueType>() != nullptr;
+    }
+
     // Intern a string literal's characters as a string constant. Every \0 byte
     // is dropped: a string object never contains one, and literal-to-string
     // assignment strips them (LRM 6.16).
@@ -3251,7 +3265,8 @@ private:
                 return;
             }
             if (is_queue(f.arrayRef)) {
-                const ir::Index len = b.queue_size(lower_lvalue(f.arrayRef, b), l);
+                const ir::Index len =
+                  b.queue_size(lower_lvalue(f.arrayRef, b), lower_type(*f.arrayRef.type), l);
                 lower_foreach_runtime_dim(f, dim, ty, iter_lv, len, b, l);
                 return;
             }
@@ -5663,7 +5678,7 @@ private:
         const ir::Ref arr_ty = lower_type(*es.value().type);
         if (is_queue(es.value()) && es.selector().type->isUnbounded()) {
             const ir::Ref   i32  = make_int_type(32, false, true);
-            const ir::Index size = b.queue_size(base, l);
+            const ir::Index size = b.queue_size(base, arr_ty, l);
             const ir::Index idx =
               b.binary(ir::Inst::Tag::Sub, size, b.constant(module_.pool.put_int(i32, 1), l), l);
             return b.elem_select(base, idx, arr_ty, l);
@@ -5678,19 +5693,22 @@ private:
     ir::Index lower_queue_assign(const AssignmentExpression& a, ir::Builder& b) {
         const ir::SourceLoc l   = loc(a);
         const ir::Index     dst = lower_lvalue(a.left(), b);
-        // Only a plain queue-variable source is a handle copy. A queue-typed
-        // concatenation ({q, e}), assignment pattern ('{...}), or slice is a
-        // value expression, not an lvalue, and needs an element-wise build.
+        const ir::Ref       qty = lower_type(*a.left().type);
+        // A plain queue variable or a queue-returning call is a handle copy (both
+        // have a handle lvalue). A queue-typed concatenation ({q, e}), assignment
+        // pattern ('{...}), or slice is a value expression, not an lvalue, and
+        // needs an element-wise build.
         const bool src_is_var = is_queue(a.right()) &&
                                 (a.right().kind == ExpressionKind::NamedValue ||
-                                 a.right().kind == ExpressionKind::HierarchicalValue);
+                                 a.right().kind == ExpressionKind::HierarchicalValue ||
+                                 a.right().kind == ExpressionKind::Call);
         if (!src_is_var) {
             // TODO: queue init from a concatenation ({q, e}), assignment pattern
             // ('{...}), slice, or unpacked-array source — needs an element-wise
             // build, not a handle copy (see docs/design/dynamic-arrays.md phase 4).
             fail("queue assignment from a non-variable value is not supported");
         }
-        b.queue_copy(dst, lower_lvalue(a.right(), b), l);
+        b.queue_copy(dst, lower_lvalue(a.right(), b), qty, l);
         return dst;
     }
 
@@ -5700,24 +5718,25 @@ private:
                                  ir::SourceLoc l) {
         const auto&     args = call.arguments();
         const ir::Index q    = lower_lvalue(*args[0], b);
+        const ir::Ref   qty  = lower_type(*args[0]->type);
         if (name == "size") {
-            return b.resize(b.queue_size(q, l), lower_type(*call.type), l);
+            return b.resize(b.queue_size(q, qty, l), lower_type(*call.type), l);
         }
         if (name == "push_back" || name == "push_front") {
-            return b.queue_push(q, lower_expr(*args[1], b), name == "push_front", l);
+            return b.queue_push(q, lower_expr(*args[1], b), name == "push_front", qty, l);
         }
         if (name == "pop_back" || name == "pop_front") {
-            return b.queue_pop(q, name == "pop_front", l);
+            return b.queue_pop(q, name == "pop_front", qty, l);
         }
         if (name == "insert") {
-            return b.queue_insert(q, lower_expr(*args[1], b), lower_expr(*args[2], b), l);
+            return b.queue_insert(q, lower_expr(*args[1], b), lower_expr(*args[2], b), qty, l);
         }
         if (name == "delete") {
             // q.delete() clears all; q.delete(i) removes one element.
             if (args.size() > 1) {
-                return b.queue_delete(q, lower_expr(*args[1], b), /*has_idx*/ true, l);
+                return b.queue_delete(q, lower_expr(*args[1], b), /*has_idx*/ true, qty, l);
             }
-            return b.queue_delete(q, q, /*has_idx*/ false, l);
+            return b.queue_delete(q, q, /*has_idx*/ false, qty, l);
         }
         // TODO: queue find/sort/sum/reverse/unique reduction & locator methods.
         fail("queue method '" + std::string(name) + "' is not supported");
@@ -6619,13 +6638,13 @@ private:
             case ExpressionKind::MemberAccess:
                 return lower_member_lvalue(expr.as<MemberAccessExpression>(), b, l);
             case ExpressionKind::Call:
-                // A dynamic-array-returning call is an lvalue: its result handle
-                // (allocated by the backend) is read by an assignment / .size() /
-                // element access / foreach. Other call results are not lvalues.
-                if (is_dyn_array(expr)) {
+                // A dynamic-array / queue-returning call is an lvalue: its result
+                // handle (allocated by the backend) is read by an assignment /
+                // .size() / element access / foreach. Others are not lvalues.
+                if (is_handle_expr(expr)) {
                     const std::optional<ir::Index> v = lower_user_call(expr.as<CallExpression>(), b);
                     if (!v) {
-                        fail("dynamic-array call used as an lvalue produced no value");
+                        fail("handle-returning call used as an lvalue produced no value");
                     }
                     return *v;
                 }
@@ -6792,12 +6811,6 @@ private:
             // per-element array storage yet; only module-level memories are supported.
             fail("unpacked array as a function local is not supported");
         }
-        if (fn_ctx_ != nullptr && vs.getType().getCanonicalType().as_if<slang::ast::QueueType>()) {
-            // TODO: queue as a function-frame local (needs a handle frame slot
-            // with init/deinit bracketing the call, like string / dynamic-array
-            // locals). Implemented for dynamic arrays; queues are the next slice.
-            fail("queue as a function local is not supported");
-        }
         if (fn_ctx_ == nullptr) {
             declare_local(vs);
         } else if (is_static_local(vs, force_frame)) {
@@ -6850,7 +6863,7 @@ private:
             }
             // A dynamic-array result is returned as its handle lvalue; the backend
             // deep-copies it into the caller's result handle (LRM 13.4 value return).
-            if (is_dyn_array_ref(fn_ctx_->ret_type)) {
+            if (is_handle_ref(fn_ctx_->ret_type)) {
                 b.unary(ir::Inst::Tag::Ret, lower_lvalue(*r.expr, b), l);
                 return;
             }
@@ -6871,7 +6884,7 @@ private:
             }
             const ir::Index rv = b.local(fn_ctx_->ret_local, fn_ctx_->ret_type, l);
             b.unary(ir::Inst::Tag::Ret,
-                    is_dyn_array_ref(fn_ctx_->ret_type) ? rv : b.unary(ir::Inst::Tag::Load, rv, l), l);
+                    is_handle_ref(fn_ctx_->ret_type) ? rv : b.unary(ir::Inst::Tag::Load, rv, l), l);
         } else {
             b.unary(ir::Inst::Tag::Ret, void_ret_operand(b, l), l);
         }
@@ -7236,7 +7249,7 @@ private:
             // back out (output / inout), or aliases it (ref). No caller temp — the
             // actual is always a whole handle. slang wraps an output / inout actual
             // in an AssignmentExpression; unwrap to the bound lvalue.
-            if (is_dyn_array_ref(pty)) {
+            if (is_handle_ref(pty)) {
                 const Expression* actual = actuals[i];
                 if (actual->kind == ExpressionKind::Assignment) {
                     actual = &actual->as<AssignmentExpression>().left();

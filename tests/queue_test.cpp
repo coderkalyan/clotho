@@ -232,3 +232,81 @@ TEST_CASE("queue built in a loop") {
     )";
     CHECK(run_capture(src) == "size=100 first=0 last=198 sum=9900\n");
 }
+
+TEST_CASE("queue input argument is copy-in (value semantics)") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic int qsum(int a[$]);
+                int t = 0;
+                foreach (a[i]) t += a[i];
+                a.push_back(999);         // mutate the copy
+                return t;
+            endfunction
+            int q[$];
+            int s;
+            initial begin
+                q.push_back(10); q.push_back(20); q.push_back(30);
+                s = qsum(q);
+                $display("%0d %0d", s, q.size());   // caller unchanged: 60 3
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "60 3\n");
+}
+
+TEST_CASE("queue output and inout arguments") {
+    constexpr std::string_view src = R"(
+        module m;
+            task automatic fill(output int a[$], input int n);
+                for (int i = 0; i < n; i++) a.push_back((i + 1) * 10);
+            endtask
+            function automatic int bump(inout int a[$]);
+                foreach (a[i]) a[i] = a[i] + 1;
+                return a.size();
+            endfunction
+            int q[$];
+            int d;
+            initial begin
+                fill(q, 3);
+                $display("%0d %0d %0d %0d", q.size(), q[0], q[1], q[2]);   // 3 10 20 30
+                d = bump(q);
+                $display("%0d %0d %0d %0d", d, q[0], q[1], q[2]);          // 3 11 21 31
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "3 10 20 30\n3 11 21 31\n");
+}
+
+TEST_CASE("queue function return value") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef int iq[$];
+            function automatic iq mk(int n);
+                iq t;
+                for (int i = 0; i < n; i++) t.push_back(i * i);
+                return t;
+            endfunction
+            int q[$];
+            initial begin
+                q = mk(4);
+                $display("%0d %0d %0d %0d %0d", q.size(), q[0], q[1], q[2], q[3]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "4 0 1 4 9\n");
+}
+
+// A queue as a function-frame local (per-call handle slot, freed at exit).
+TEST_CASE("queue as a function local") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic int f(int n);
+                int t[$];
+                for (int i = 0; i < n; i++) t.push_back(i + 1);
+                return t.size() + t[0] + t[n - 1];
+            endfunction
+            initial $display("%0d %0d", f(4), f(2));
+        endmodule
+    )";
+    CHECK(run_capture(src) == "9 5\n");
+}
