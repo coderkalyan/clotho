@@ -5,6 +5,9 @@
 // ORC LLJIT, eagerly compile it for the host, and run its `main()`. The IR
 // emission paths (emit_llvm / print_module) remain for debugging.
 
+#include <span>
+#include <string_view>
+
 #include "Module.h"
 #include "SimConfig.h"
 #include "Timing.h"
@@ -16,7 +19,10 @@ namespace clotho::ir {
 // compilation failure, writes the reason to llvm::errs() and returns a negative
 // sentinel so the driver can exit non-zero. If `timings` is non-null, the LLVM
 // compile and simulation phase durations are recorded into it. `config` is
-// forwarded to build_module.
-int run_jit(const Module& m, Timings* timings = nullptr, const SimulationConfig& config = {});
+// forwarded to build_module. `plusargs` are the command-line arguments that
+// followed a leading `+` (LRM §21.6), in source order, with the `+` itself
+// stripped; made available to $test$plusargs / $value$plusargs.
+int run_jit(const Module& m, Timings* timings = nullptr, const SimulationConfig& config = {},
+           std::span<const std::string_view> plusargs = {});
 
 } // namespace clotho::ir

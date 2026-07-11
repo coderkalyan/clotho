@@ -37,6 +37,16 @@ public:
     // gives its storage width / domain.
     Index local(uint32_t index, Ref type, SourceLoc loc);
 
+    // -- Named events (LRM 15.5) --
+    // `-> e`: blocking trigger of the event whose synthetic signal is `sig`.
+    Index event_trigger(Signal sig, SourceLoc loc);
+    // `e.triggered`: 1-bit "triggered this time step" property of event `sig`.
+    Index event_triggered(Signal sig, SourceLoc loc);
+    // `->> e`: nonblocking trigger of event `sig` (deferred to the NBA region).
+    Index event_trigger_nb(Signal sig, SourceLoc loc);
+    // `->> #d e`: delayed nonblocking trigger; `delay` is the tick count.
+    Index event_trigger_nb_delayed(Signal sig, Index delay, SourceLoc loc);
+
     // -- Generic ops sharing a payload shape --
     // tag must be a unary-payload op (load, bnot, lnot, red_*, ret).
     Index unary(Inst::Tag tag, Index op, SourceLoc loc);
@@ -107,10 +117,17 @@ public:
     Index str_putc(Index str, Index index, Index ch, SourceLoc loc);
     // s.substr(i, j): a new string value from the source string `str`.
     Index str_substr(Index str, Index i, Index j, SourceLoc loc);
+    // One row of the enum_name member table: the member's value as its must-plane
+    // bytes ((width+7)/8, little-endian; the same length for every row) and its
+    // source name.
+    struct EnumNameRow {
+        std::span<const uint8_t> value;
+        std::string_view         name;
+    };
     // e.name(): a new string value naming the enum member whose value equals
-    // `val`. `members` is the (value, source-name) table in declaration order.
-    Index enum_name(Index val, std::span<const std::pair<uint64_t, std::string_view>> members,
-                    SourceLoc loc);
+    // `val`. `members` is the value/source-name table in declaration order; the
+    // runtime byte-compares `val`'s must plane against each row.
+    Index enum_name(Index val, std::span<const EnumNameRow> members, SourceLoc loc);
     // Packed cast of a string to target packed type `type`.
     Index str_to_packed(Index str, Ref type, SourceLoc loc);
 
@@ -184,6 +201,13 @@ public:
     // item matched, 1 = overlapping items). Non-fatal, warns and returns. No SSA
     // operands.
     Index case_violation(std::string_view banner, uint32_t kind, SourceLoc loc);
+    // Severity report ($info / $warning / $error / $fatal, LRM 20.10, or an
+    // immediate-assertion default failure, LRM 16.3). `level` is the ir::Severity
+    // label; `banner` the compile-time prefix "<file>:<line>: "; `fmt` + `args`
+    // the $display-style message (both empty for a bare `$error;`). Non-fatal,
+    // renders and returns; $fatal's termination is a following finish().
+    Index severity(uint32_t level, std::string_view banner, std::string_view fmt,
+                   std::span<const Index> args, SourceLoc loc);
     // $fflush: flush the descriptor `handle`'s output buffers. The no-argument
     // form passes a constant 0 (the runtime flushes every open stream).
     Index fflush(Index handle, SourceLoc loc);
@@ -197,12 +221,30 @@ public:
     // the formatted number.
     Index timeformat(Index units, Index precision, std::string_view suffix, Index min_width, SourceLoc loc);
 
+    // -- Value-change dump (VCD; see docs/VCD.md) --
+    // $dumpfile: set the output path to the `filename` value.
+    Index dump_file(Index filename, SourceLoc loc);
+    // $dumpvars (whole-design form): begin dumping every dumpable signal. The
+    // backend supplies the signal set; this node carries no operands.
+    Index dump_vars(SourceLoc loc);
+    // $dumpoff / $dumpon / $dumpall / $dumpflush. `tag` selects the control; it
+    // must be one of the Dump* control tags.
+    Index dump_control(Inst::Tag tag, SourceLoc loc);
+
     // -- System functions --
     // $time / $stime: read the simulation clock. Yields a 64-bit unsigned value
     // rounded down by `scale` to the calling module's time unit (1 == unitless).
     Index sim_time(uint64_t scale, SourceLoc loc);
     // $random: a 32-bit signed PRNG draw. No operands.
     Index random(SourceLoc loc);
+    // $test$plusargs(str): nonzero iff a command-line plusarg's prefix matches
+    // `str`. No SSA operands.
+    Index test_plusargs(std::string_view str, SourceLoc loc);
+    // $value$plusargs(user_string, var): on a matching plusarg, convert its
+    // remainder per `conv` ('d'/'o'/'b'/'h'/'s') into the output lvalue `dst`
+    // and yield nonzero; otherwise leave `dst` untouched and yield 0. `prefix`
+    // is the plusarg_string portion of user_string.
+    Index value_plusargs(Index dst, std::string_view prefix, char conv, SourceLoc loc);
 
     // -- Regions --
     // Begin a nested region; subsequent emits accumulate into it until closed.

@@ -42,6 +42,13 @@ struct SignalInfo {
     // defaults to z (LRM 6.6); an undriven variable defaults to x. Also the
     // seed condition for the may-z analysis (ZElision.h).
     bool is_net = false;
+    // A named event (LRM 15.5), modeled as a synthetic 1-bit signal that owns
+    // wait queues but carries no data value: `-> e` services its Any-edge queue
+    // and stamps a per-event trigger time, `@(e)` / `always @(e)` subscribe, and
+    // `e.triggered` compares the stamp to the current instant. `type` is a
+    // 1-bit logic placeholder; the value planes are never read or written, so
+    // value-oriented passes (VCD, edge classification) skip it.
+    bool is_event = false;
 };
 
 // One elaborated instance in the design hierarchy. The frontend flattens every
@@ -124,9 +131,11 @@ struct Process {
     Ir ir;
 };
 
-// Direction of a task formal argument (LRM 13.5). A function's arguments are all
-// In; only tasks carry Out / Inout, which copy the formal back to the caller at
-// task completion. (ref is rejected by the frontend for now.)
+// Direction of a subroutine formal argument (LRM 13.5). Out / Inout copy the
+// formal back to the caller at completion (tasks only for now). Ref binds the
+// formal to the actual's live storage — no copy either way; the callee reads and
+// writes it through a passed pointer (functions and tasks). arg_dirs is populated
+// for functions too once any formal is non-In.
 enum class ArgDir : uint8_t {
     // Copy in at call (input).
     In,
@@ -134,6 +143,9 @@ enum class ArgDir : uint8_t {
     Out,
     // Copy in at call and out at completion (inout).
     Inout,
+    // Pass by reference: the formal aliases the actual's storage, accessed live
+    // through a pointer. No copy-in / copy-out.
+    Ref,
 };
 
 // A lowered SystemVerilog function or task. Its body is an Ir whose leaves are
@@ -152,8 +164,9 @@ struct Function {
     // Parameter types, in declaration order. The frontend resizes each input call
     // argument to the matching type; output / inout arguments pass by pointer.
     std::vector<Ref> param_types;
-    // Direction of each parameter, parallel to param_types. Empty for a function
-    // (all inputs); populated for a task.
+    // Direction of each parameter, parallel to param_types. Populated whenever any
+    // formal is non-In (tasks always, and a function with a ref formal); empty for
+    // a plain all-input function.
     std::vector<ArgDir> arg_dirs;
     // Storage type of every frame local, indexed by the Local handle's index:
     // the parameter copies, the return variable, and body-local declarations.

@@ -807,11 +807,12 @@ TEST_CASE("a type parameter default sets an internal variable's width") {
 }
 
 TEST_CASE("a type parameter bound to an unsupported type fails loudly") {
-    // `event` is not integral/real/string/array, so it falls through
+    // `chandle` is not integral/real/string/array/event, so it falls through
     // lower_type's final guard; binding a type parameter to one must hit
-    // that guard too, not silently accept it.
+    // that guard too, not silently accept it. (`event` was the
+    // prior example here; it is now lowered as a named event, LRM 15.5.)
     const LowerResult r = lower_text(R"(
-        module m #(parameter type T = event);
+        module m #(parameter type T = chandle);
             T v;
         endmodule
     )");

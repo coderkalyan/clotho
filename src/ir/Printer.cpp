@@ -174,6 +174,14 @@ const char* tag_name(Inst::Tag tag) {
             return "delay";
         case T::Wait:
             return "wait";
+        case T::EventTrigger:
+            return "event_trigger";
+        case T::EventTriggered:
+            return "event_triggered";
+        case T::EventTriggerNb:
+            return "event_trigger_nb";
+        case T::EventTriggerNbDelayed:
+            return "event_trigger_nb_delayed";
         case T::StrLen:
             return "str_len";
         case T::StrGetc:
@@ -222,6 +230,8 @@ const char* tag_name(Inst::Tag tag) {
             return "finish";
         case T::CaseViol:
             return "case_viol";
+        case T::Severity:
+            return "severity";
         case T::Break:
             return "break";
         case T::Continue:
@@ -252,6 +262,18 @@ const char* tag_name(Inst::Tag tag) {
             return "dyn_part_select";
         case T::ReadMem:
             return "read_mem";
+        case T::DumpFile:
+            return "dump_file";
+        case T::DumpVars:
+            return "dump_vars";
+        case T::DumpOff:
+            return "dump_off";
+        case T::DumpOn:
+            return "dump_on";
+        case T::DumpAll:
+            return "dump_all";
+        case T::DumpFlush:
+            return "dump_flush";
         case T::SimTime:
             return "sim_time";
         case T::TimeFormat:
@@ -262,6 +284,10 @@ const char* tag_name(Inst::Tag tag) {
             return "clog2";
         case T::CountBits:
             return "count_bits";
+        case T::TestPlusArgs:
+            return "test_plusargs";
+        case T::ValuePlusArgs:
+            return "value_plusargs";
         case T::Ctz:
             return "ctz";
         case T::Clz:
@@ -464,6 +490,11 @@ private:
                 os_ << " x" << p.repl.count;
                 break;
             case Inst::PayloadKind::Extra: {
+                if (tag == Inst::Tag::TestPlusArgs) {
+                    const auto info = ir_.extra_data<TestPlusArgsInfo>(p.extra);
+                    os_ << '"' << ir_.extra_bytes(info.str, info.str_len) << '"';
+                    break;
+                }
                 // concat: variadic operands.
                 const auto parts = ir_.region(ir_.extra_data<ExtraSlice>(p.extra));
                 for (size_t k = 0; k < parts.size(); ++k) {
@@ -477,6 +508,16 @@ private:
             case Inst::PayloadKind::Display: {
                 const auto info = ir_.extra_data<DisplayInfo>(p.display);
                 os_ << '"' << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
+                for (Index a : ir_.region(info.args)) {
+                    os_ << ", ";
+                    ref(a);
+                }
+                break;
+            }
+            case Inst::PayloadKind::Severity: {
+                const auto info = ir_.extra_data<SeverityInfo>(p.extra);
+                os_ << "level" << info.level << ", \"" << ir_.extra_bytes(info.banner, info.banner_len)
+                    << "\", \"" << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
                 for (Index a : ir_.region(info.args)) {
                     os_ << ", ";
                     ref(a);
@@ -659,6 +700,13 @@ private:
                 os_ << "\n";
                 indent(depth);
                 os_ << "}\n";
+                break;
+            }
+            case Inst::Tag::ValuePlusArgs: {
+                const auto info = ir_.extra_data<ValuePlusArgsInfo>(p.op_extra.extra);
+                ref(p.op_extra.op);
+                os_ << ", \"" << ir_.extra_bytes(info.prefix, info.prefix_len) << "%"
+                    << static_cast<char>(info.conv) << "\")\n";
                 break;
             }
             default:

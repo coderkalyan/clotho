@@ -294,12 +294,23 @@ struct Analysis {
                     }
                     break;
                 case Inst::Tag::Call: {
-                    const CallInfo               ci   = ir.extra_data<CallInfo>(p.extra);
-                    FnState&                     cs   = fns[static_cast<uint32_t>(ci.func)];
-                    const std::span<const Index> args = ir.region(ci.args);
+                    // A function shares the task argument ABI: In copies the actual's
+                    // value in; Inout copies storage in and out; Out copies out; Ref
+                    // aliases the actual's storage live. Same z-flow as TaskCall below.
+                    const CallInfo               ci     = ir.extra_data<CallInfo>(p.extra);
+                    const Function&              callee = m.function(ci.func);
+                    FnState&                     cs     = fns[static_cast<uint32_t>(ci.func)];
+                    const std::span<const Index> args   = ir.region(ci.args);
                     for (size_t k = 0; k < args.size(); ++k) {
-                        if (z_of(args[k]) != 0) {
+                        const ArgDir dir = callee.arg_dirs.empty() ? ArgDir::In : callee.arg_dirs[k];
+                        if (dir == ArgDir::In && z_of(args[k]) != 0) {
                             mark(cs.param_z[k]);
+                        }
+                        if ((dir == ArgDir::Inout || dir == ArgDir::Ref) && storage_z(ir, fn, args[k])) {
+                            mark(cs.param_z[k]);
+                        }
+                        if (dir != ArgDir::In && cs.local_z[k] != 0) {
+                            store_into(ir, fn, args[k], true);
                         }
                     }
                     val_z[raw] = cs.result_z;
@@ -313,11 +324,13 @@ struct Analysis {
                     for (size_t k = 0; k < args.size(); ++k) {
                         const ArgDir dir = callee.arg_dirs[k];
                         // Copy-in reads the actual's value (In) or storage (Inout);
-                        // copy-out writes the formal's frame local back (Out/Inout).
+                        // copy-out writes the formal's frame local back (Out/Inout). A
+                        // ref formal reads the actual's storage on entry and writes any
+                        // z it produces straight back (live), like an inout.
                         if (dir == ArgDir::In && z_of(args[k]) != 0) {
                             mark(cs.param_z[k]);
                         }
-                        if (dir == ArgDir::Inout && storage_z(ir, fn, args[k])) {
+                        if ((dir == ArgDir::Inout || dir == ArgDir::Ref) && storage_z(ir, fn, args[k])) {
                             mark(cs.param_z[k]);
                         }
                         if (dir != ArgDir::In && cs.local_z[k] != 0) {
@@ -364,9 +377,17 @@ struct Analysis {
                 case Inst::Tag::TimeFormat:
                 case Inst::Tag::Finish:
                 case Inst::Tag::CaseViol:
+                case Inst::Tag::Severity:
                 case Inst::Tag::Fflush:
                 case Inst::Tag::SimTime:
                 case Inst::Tag::Random:
+                // `-> e` / `->> e` / `->> #d e` are valueless; `e.triggered` is a
+                // definite 2-state bit. A named event carries no bit planes, so
+                // none seed z.
+                case Inst::Tag::EventTrigger:
+                case Inst::Tag::EventTriggerNb:
+                case Inst::Tag::EventTriggerNbDelayed:
+                case Inst::Tag::EventTriggered:
                 // $clog2 yields a count (or X when the operand has unknown bits);
                 // its result z plane is always zero.
                 case Inst::Tag::Clog2:
@@ -416,6 +437,20 @@ struct Analysis {
                 case Inst::Tag::Ferror:
                 case Inst::Tag::FreadWord:
                 case Inst::Tag::FreadMem:
+                // $test$plusargs never writes a signal. $value$plusargs writes
+                // its target from clean ASCII digits, or 'bx on an illegal
+                // character (LRM §21.6 says "'bx", never z) — a 4-state
+                // target's z plane is always zero.
+                case Inst::Tag::TestPlusArgs:
+                case Inst::Tag::ValuePlusArgs:
+                // VCD dump tasks read signal planes but write no design value, so
+                // they seed no z (DumpFile's filename value is always-known bytes).
+                case Inst::Tag::DumpFile:
+                case Inst::Tag::DumpVars:
+                case Inst::Tag::DumpOff:
+                case Inst::Tag::DumpOn:
+                case Inst::Tag::DumpAll:
+                case Inst::Tag::DumpFlush:
                     break;
             }
         }

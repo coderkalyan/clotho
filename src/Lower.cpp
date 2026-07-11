@@ -1,6 +1,7 @@
 #include "Lower.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -283,7 +284,8 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     void record_write(const Expression& lhs) {
         switch (lhs.kind) {
             case ExpressionKind::NamedValue:
-                mark_written(lhs.as<NamedValueExpression>().symbol);
+            case ExpressionKind::HierarchicalValue:
+                mark_written(lhs.as<ValueExpressionBase>().symbol);
                 break;
             case ExpressionKind::ElementSelect: {
                 const ElementSelectExpression& es = lhs.as<ElementSelectExpression>();
@@ -315,6 +317,10 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     }
 
     void handle(const NamedValueExpression& nv) { record_read(nv.symbol); }
+
+    // A hierarchical read (`@* … = top.u1.sig`, LRM 23.6) makes the process
+    // sensitive to the target instance's signal, same as a local read.
+    void handle(const HierarchicalValueExpression& hv) { record_read(hv.symbol); }
 
     void handle(const AssignmentExpression& a) {
         a.right().visit(*this); // RHS: pure reads
@@ -422,33 +428,47 @@ public:
       : module_(module)
       , tick_fs_(tick_fs) {}
 
-    // Flatten one elaborated instance into the module: register its signals under
-    // `prefix`, lower its processes, then recurse into child instances and wire
-    // their ports. `prefix` is empty for the top instance and "<inst>." per level
-    // below it. Each instance has its own slang body with distinct ValueSymbols,
-    // so sigmap_ (keyed by symbol) disambiguates repeated instantiations for free.
-    void lower_instance(const InstanceSymbol& inst, std::string_view prefix) {
-        if (prefix.empty()) {
+    // Lowering runs the instance hierarchy twice. Signal registration must
+    // precede body lowering across the *whole* design, not just up the tree:
+    // a hierarchical reference (`top.u1.sig`, LRM 23.6) may point downward or
+    // sideways to a signal whose instance is lowered later, and signal_of needs
+    // it in sigmap_ already. So Collect walks the tree registering every signal
+    // and building the scope tree; Emit walks it again lowering processes. The
+    // two passes traverse identically, so per-scope signal order (and thus the
+    // backend's state layout) is unchanged from a single interleaved pass.
+    enum class Pass : uint8_t { Collect, Emit };
+
+    // Flatten one elaborated instance into the module under `prefix` (empty for
+    // the top, "<inst>." per level below). In Collect: open this instance's
+    // hierarchy scope, register its signals, recurse to collect children. In
+    // Emit: `node` is this instance's already-built scope; lower its processes
+    // and recurse. Repeated instantiations disambiguate for free — slang gives
+    // each instance distinct ValueSymbols, so sigmap_ (keyed by symbol) maps
+    // each to its own signal.
+    void lower_instance(const InstanceSymbol& inst, std::string_view prefix, Pass pass,
+                        ir::InstanceScope* node) {
+        if (prefix.empty() && pass == Pass::Collect) {
             module_.name = std::string(inst.name);
         }
         const std::string         self_prefix(prefix);
         const InstanceBodySymbol& body = inst.body;
 
-        // Open this instance's hierarchy scope: signals registered while it is
-        // on top of the stack (ports, nets/vars, generate-block signals, and
-        // compiler temps) are recorded as declared here. A parent's children
-        // vector only grows after this child pops, so the stacked pointers stay
-        // stable across the recursion.
-        ir::InstanceScope node;
-        node.name     = std::string(inst.name);
-        node.def_name = std::string(inst.getDefinition().name);
-        ir::InstanceScope* self = nullptr;
-        if (scope_stack_.empty()) {
-            top_scope_ = std::move(node);
-            self       = &top_scope_;
-        } else {
-            scope_stack_.back()->children.push_back(std::move(node));
-            self = &scope_stack_.back()->children.back();
+        // Collect builds the scope node; Emit reuses the node Collect built.
+        // A parent's children vector only grows during Collect (before this
+        // child pops), so stacked pointers stay stable across that recursion;
+        // by Emit the tree is frozen, so a child-node pointer is stable too.
+        ir::InstanceScope* self = node;
+        if (pass == Pass::Collect) {
+            ir::InstanceScope fresh;
+            fresh.name     = std::string(inst.name);
+            fresh.def_name = std::string(inst.getDefinition().name);
+            if (scope_stack_.empty()) {
+                top_scope_ = std::move(fresh);
+                self       = &top_scope_;
+            } else {
+                scope_stack_.back()->children.push_back(std::move(fresh));
+                self = &scope_stack_.back()->children.back();
+            }
         }
         scope_stack_.push_back(self);
 
@@ -466,8 +486,11 @@ public:
 
         prefix_ = self_prefix;
         scope_  = &body;
-        collect_signals(body);
-        lower_members(body, self_prefix, self_mul);
+        if (pass == Pass::Collect) {
+            collect_signals(body);
+        }
+        size_t child_cursor = 0;
+        lower_members(body, self_prefix, self_mul, pass, *self, child_cursor);
 
         scope_stack_.pop_back();
     }
@@ -479,9 +502,50 @@ public:
     // all initializers (each top gets its own Lowerer, so this covers each one).
     void lower_top(const InstanceSymbol& top, std::string_view prefix) {
         top_elided_ = prefix.empty();
-        lower_instance(top, prefix);
+        lower_instance(top, prefix, Pass::Collect, nullptr);
+        lower_instance(top, prefix, Pass::Emit, &top_scope_);
         finalize_preinit();
         module_.add_top(std::move(top_scope_));
+    }
+
+    // Register the persistent state a package or the `$unit` compilation-unit
+    // scope declares (LRM 6.8): a package/$unit variable has no instance
+    // multiplicity, so it gets exactly one signal, shared by every top instance
+    // that references it. Must run once, on a Lowerer of its own, before any
+    // top's own Lowerer starts (see lower_compilation) so `sigmap()` can seed
+    // every top's map with these symbols; its own declaration initializers land
+    // in this Lowerer's PreInit process, so a package variable initializes
+    // exactly once regardless of how many tops import it.
+    void lower_globals(const Compilation& comp, const RootSymbol& root) {
+        for (const PackageSymbol* pkg : comp.getPackages()) {
+            collect_global_scope_signals(*pkg);
+        }
+        for (const CompilationUnitSymbol* unit : root.compilationUnits) {
+            collect_global_scope_signals(*unit);
+        }
+        finalize_preinit();
+    }
+
+    const ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal>& sigmap() const {
+        return sigmap_;
+    }
+
+    // Seed this Lowerer's symbol->signal map with globally-shared entries
+    // (package / $unit variables) collected by lower_globals, so references to
+    // them resolve through the ordinary signal_of path with no special casing.
+    void seed_signals(const ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal>& seed) {
+        for (const auto& [sym, sig] : seed) {
+            sigmap_[sym] = sig;
+        }
+    }
+
+    // Point this top's Lowerer at the shared globals Lowerer (the one
+    // lower_globals ran on), so a package/$unit-scope subroutine call can
+    // delegate its lowering there instead of duplicating it per top (see
+    // function_id's is_global_subroutine check). `g` must outlive every call
+    // made through this Lowerer.
+    void set_globals(Lowerer* g) {
+        globals_ = g;
     }
 
 private:
@@ -491,40 +555,48 @@ private:
     // hierarchical name prefix of `scope`; `self_mul` is the enclosing instance's
     // time multiplier, restored after a child instance recurses. Signals are
     // already registered by collect_signals, which walked the same generate tree.
-    void lower_members(const Scope& scope, const std::string& self_prefix, uint64_t self_mul) {
+    void lower_members(const Scope& scope, const std::string& self_prefix, uint64_t self_mul,
+                       Pass pass, ir::InstanceScope& node, size_t& child_cursor) {
         // prefix_ / scope_ hold this level's values on entry to each iteration:
         // set by the caller and restored after any case that descends and changes
-        // them, so signal-creating process lowering always sees this level.
+        // them, so signal-creating process lowering always sees this level. In
+        // Collect only the structural cases (instances / generate constructs) do
+        // work — signals were registered by collect_signals; behavioral members
+        // lower in Emit. `child_cursor` walks this scope's node.children in the
+        // order Collect pushed them, so Emit hands each recursion its own node.
+        const bool emit = pass == Pass::Emit;
         for (const Symbol& m : scope.members()) {
             switch (m.kind) {
                 case SymbolKind::ContinuousAssign:
-                    lower_continuous_assign(m.as<ContinuousAssignSymbol>());
+                    if (emit) lower_continuous_assign(m.as<ContinuousAssignSymbol>());
                     break;
                 case SymbolKind::ProceduralBlock:
-                    lower_procedural_block(m.as<ProceduralBlockSymbol>());
+                    if (emit) lower_procedural_block(m.as<ProceduralBlockSymbol>());
                     break;
                 case SymbolKind::Variable:
                     // Storage was registered by collect_signals; here only a
                     // declaration initializer (LRM 6.8) needs lowering, into the
                     // pre-init process.
-                    lower_var_initializer(m.as<VariableSymbol>());
+                    if (emit) lower_var_initializer(m.as<VariableSymbol>());
                     break;
                 case SymbolKind::Net:
                     // Storage was registered by collect_signals; a net declaration
                     // assignment (`wire w = expr`) is a continuous assignment.
-                    lower_net_initializer(m.as<NetSymbol>());
+                    if (emit) lower_net_initializer(m.as<NetSymbol>());
                     break;
                 case SymbolKind::Instance: {
                     const InstanceSymbol& child = m.as<InstanceSymbol>();
-                    // Recurse first (collects child signals), then wire ports: a
-                    // connection's parent-side expression resolves against signals
-                    // already registered in this (parent) body. Recursion leaves
-                    // prefix_ at the child level, so restore it before wiring.
-                    lower_instance(child, self_prefix + std::string(child.name) + ".");
+                    // Emit wires ports after the child recurses: a connection's
+                    // parent-side expression resolves against signals in this
+                    // (parent) body. Recursion leaves prefix_ at the child level,
+                    // so restore it before wiring.
+                    ir::InstanceScope* child_node = emit ? &node.children[child_cursor++] : nullptr;
+                    lower_instance(child, self_prefix + std::string(child.name) + ".", pass,
+                                   child_node);
                     prefix_   = self_prefix;
                     scope_    = &scope;
                     time_mul_ = self_mul;
-                    wire_ports(child);
+                    if (emit) wire_ports(child);
                     break;
                 }
                 case SymbolKind::GenerateBlock: {
@@ -533,7 +605,8 @@ private:
                     // contributes nothing (its body is not part of the design).
                     const auto& gb = m.as<GenerateBlockSymbol>();
                     if (!gb.isUninstantiated) {
-                        lower_generate_block(gb, self_prefix + gb.getExternalName() + ".", self_mul);
+                        lower_generate_block(gb, self_prefix + gb.getExternalName() + ".", self_mul,
+                                             pass, node, child_cursor);
                         prefix_ = self_prefix;
                         scope_  = &scope;
                     }
@@ -548,14 +621,14 @@ private:
                             continue;
                         }
                         lower_generate_block(*e, self_prefix + gen_entry_name(ga, *e) + ".",
-                                             self_mul);
+                                             self_mul, pass, node, child_cursor);
                     }
                     prefix_ = self_prefix;
                     scope_  = &scope;
                     break;
                 }
                 case SymbolKind::PrimitiveInstance:
-                    lower_gate(m.as<PrimitiveInstanceSymbol>());
+                    if (emit) lower_gate(m.as<PrimitiveInstanceSymbol>());
                     break;
                 case SymbolKind::InstanceArray: {
                     // An array of instances — gate primitives (LRM 28.3.6) or
@@ -563,7 +636,8 @@ private:
                     // elaborated one leaf symbol per element with per-instance
                     // bit-sliced connections, so this only needs to walk to
                     // the leaves and lower each like its scalar counterpart.
-                    lower_instance_array(m.as<InstanceArraySymbol>(), self_prefix, scope, self_mul);
+                    lower_instance_array(m.as<InstanceArraySymbol>(), self_prefix, scope, self_mul,
+                                         pass, node, child_cursor);
                     prefix_   = self_prefix;
                     scope_    = &scope;
                     time_mul_ = self_mul;
@@ -603,10 +677,15 @@ private:
     // implicit localparams in the block scope, so const folding and parameter
     // reads resolve them once scope_ points at the block.
     void lower_generate_block(const GenerateBlockSymbol& block, const std::string& block_prefix,
-                              uint64_t self_mul) {
+                              uint64_t self_mul, Pass pass, ir::InstanceScope& node,
+                              size_t& child_cursor) {
+        // A generate block gets no scope node of its own: its signals fold into
+        // the enclosing instance's scope (with prefixed names), and any instances
+        // it contains become children of that instance's node. So `node` /
+        // `child_cursor` thread straight through.
         prefix_ = block_prefix;
         scope_  = &block;
-        lower_members(block, block_prefix, self_mul);
+        lower_members(block, block_prefix, self_mul, pass, node, child_cursor);
     }
 
     // Recurse through one (possibly multidimensional) array of instances —
@@ -619,23 +698,27 @@ private:
     // generate-loop arrays (gen_entry_name); a gate leaf needs no hierarchy
     // bookkeeping of its own.
     void lower_instance_array(const InstanceArraySymbol& arr, const std::string& self_prefix,
-                              const Scope& parent_scope, uint64_t self_mul) {
+                              const Scope& parent_scope, uint64_t self_mul, Pass pass,
+                              ir::InstanceScope& node, size_t& child_cursor) {
+        const bool emit = pass == Pass::Emit;
         for (const Symbol* elem : arr.elements) {
             switch (elem->kind) {
                 case SymbolKind::InstanceArray:
                     lower_instance_array(elem->as<InstanceArraySymbol>(), self_prefix, parent_scope,
-                                        self_mul);
+                                        self_mul, pass, node, child_cursor);
                     break;
                 case SymbolKind::PrimitiveInstance:
-                    lower_gate(elem->as<PrimitiveInstanceSymbol>());
+                    if (emit) lower_gate(elem->as<PrimitiveInstanceSymbol>());
                     break;
                 case SymbolKind::Instance: {
                     const InstanceSymbol& child = elem->as<InstanceSymbol>();
-                    lower_instance(child, self_prefix + instance_array_element_name(child) + ".");
+                    ir::InstanceScope* child_node = emit ? &node.children[child_cursor++] : nullptr;
+                    lower_instance(child, self_prefix + instance_array_element_name(child) + ".",
+                                   pass, child_node);
                     prefix_   = self_prefix;
                     scope_    = &parent_scope;
                     time_mul_ = self_mul;
-                    wire_ports(child);
+                    if (emit) wire_ports(child);
                     break;
                 }
                 default:
@@ -802,8 +885,15 @@ private:
 
             return ref;
         }
+        if (ct.isEvent()) {
+            // Named event (LRM 15.5): no data value. Modeled as a 1-bit logic
+            // placeholder signal whose only role is to own wait queues; the
+            // trigger state lives in a separate per-event timestamp. See
+            // docs/design/named-events.md.
+            return module_.pool.logic_type;
+        }
         if (!ct.isIntegral()) {
-            // TODO: string / chandle / event / class types.
+            // TODO: string / chandle / class types.
             fail("unsupported non-integral type");
         }
 
@@ -1221,6 +1311,35 @@ private:
 
     // -- Signals --
 
+    // Register the Variable members of a package or `$unit` scope as signals
+    // (see lower_globals). Only `Variable` needs action here: nets can't
+    // legally appear at this scope (LRM 26.2 / A.1.2), and every other member
+    // kind (typedefs, parameters, functions/tasks, imports, classes, ...)
+    // either folds at each reference or lowers lazily at its own call/use site
+    // — including the slang-injected `std` package, whose class declarations
+    // Clotho does not yet support but which no design can reference without
+    // hitting that unsupported-type guard independently. `scope_` is set so
+    // an initializer expression (ASTContext-driven constant fold, format-arg
+    // eval, ...) has a scope to resolve against, matching every other
+    // signal-collection path.
+    void collect_global_scope_signals(const Scope& scope) {
+        scope_ = &scope;
+        for (const Symbol& m : scope.members()) {
+            if (m.kind != SymbolKind::Variable) {
+                continue;
+            }
+            const auto& vs = m.as<VariableSymbol>();
+
+            ir::SignalInfo info;
+            info.name = std::string(vs.name);
+            info.type = lower_type(vs.getType());
+            info.dir  = ir::SignalInfo::Direction::Internal;
+
+            sigmap_[&vs] = register_signal(std::move(info));
+            lower_var_initializer(vs);
+        }
+    }
+
     void collect_signals(const InstanceBodySymbol& body) {
         // First pass: record port directions by the symbol they back. Ports exist
         // only on the instance body, never inside a generate block.
@@ -1277,14 +1396,20 @@ private:
                         check_drive_strength(net.getDriveStrength(), "a net declaration");
                         info.is_net = true;
                     }
-                    info.name = prefix + std::string(vs.name);
-                    info.type = lower_type(vs.getType());
-                    info.dir  = ir::SignalInfo::Direction::Internal;
+                    info.name     = prefix + std::string(vs.name);
+                    info.type     = lower_type(vs.getType());
+                    info.is_event = vs.getType().isEvent();
+                    info.dir      = ir::SignalInfo::Direction::Internal;
                     if (port_dir != nullptr) {
                         const auto found = port_dir->find(&m);
                         if (found != port_dir->end()) {
                             info.dir = found->second;
                         }
+                    }
+                    if (info.dir != ir::SignalInfo::Direction::Internal && info.is_event) {
+                        // TODO: event ports (LRM 15.5) — needs cross-boundary
+                        // event aliasing (Tier 2, docs/design/named-events.md).
+                        fail("event ports are not supported");
                     }
                     if (info.dir != ir::SignalInfo::Direction::Internal && is_string_ref(info.type)) {
                         // TODO: string module ports (needs string-aware port
@@ -1317,10 +1442,17 @@ private:
 
     // Append a signal to the module and record it in the currently open
     // hierarchy scope. Every signal-creating path funnels through here so the
-    // scope tree covers the signal table exactly.
+    // scope tree covers the signal table exactly. scope_stack_ is empty only on
+    // the standalone Lowerer that registers package/$unit-scope state (globals;
+    // see lower_globals) and package-scope function statics reached through it
+    // (see function_id's is_global_subroutine delegation) — those signals
+    // belong to no top's InstanceScope tree, and the backend already treats an
+    // unclaimed signal as a flat root-level field (build_state_types).
     ir::Signal register_signal(ir::SignalInfo info) {
         const ir::Signal sig = module_.add_signal(std::move(info));
-        scope_stack_.back()->signals.push_back(sig);
+        if (!scope_stack_.empty()) {
+            scope_stack_.back()->signals.push_back(sig);
+        }
 
         return sig;
     }
@@ -1393,7 +1525,8 @@ private:
     static const ValueSymbol* lvalue_root(const Expression& e) {
         switch (e.kind) {
             case ExpressionKind::NamedValue:
-                return &e.as<NamedValueExpression>().symbol;
+            case ExpressionKind::HierarchicalValue:
+                return &e.as<ValueExpressionBase>().symbol;
             case ExpressionKind::ElementSelect:
                 return lvalue_root(e.as<ElementSelectExpression>().value());
             case ExpressionKind::RangeSelect:
@@ -2235,8 +2368,10 @@ private:
             // servicing; string stores skip edge detection).
             fail("string in an event control is not supported");
         }
-        if (e.kind == ExpressionKind::NamedValue) {
-            return signal_of(e.as<NamedValueExpression>().symbol);
+        if (e.kind == ExpressionKind::NamedValue || e.kind == ExpressionKind::HierarchicalValue) {
+            // Waiting on a hierarchical signal (`@(posedge top.dut.clk)`, LRM 23.6)
+            // subscribes to the target instance's signal directly.
+            return signal_of(e.as<ValueExpressionBase>().symbol);
         }
         fail("unsupported event expression");
     }
@@ -2257,6 +2392,63 @@ private:
         }
         b.wait(edges, l);
     }
+
+    // Resolve the target of `-> e` to the event's synthetic signal, verifying it
+    // is an event (defensive — slang types the target as an event already).
+    ir::Signal trigger_target(const Expression& target) {
+        if (target.kind != ExpressionKind::NamedValue || !target.type->isEvent()) {
+            // TODO: triggering an event element of an array / struct member, or an
+            // event through a hierarchical / handle expression (Tier 2).
+            fail("unsupported event trigger target");
+        }
+        return signal_of(target.as<NamedValueExpression>().symbol);
+    }
+
+    // Lower `-> e` / `->> e` / `->> #d e` (LRM 15.5.2, 15.5.4).
+    void lower_event_trigger(const EventTriggerStatement& ev, ir::Builder& b) {
+        const ir::Signal sig = trigger_target(ev.target);
+        if (ev.timing != nullptr) {
+            // Only `->>` carries a timing control (grammar), so a delayed trigger
+            // is always nonblocking. A fixed delay `->> #d e` schedules a detached
+            // wheel timer; the event-controlled form is not yet lowered.
+            if (ev.timing->kind == slang::ast::TimingControlKind::Delay) {
+                const Expression& amount = ev.timing->as<slang::ast::DelayControl>().expr;
+                b.event_trigger_nb_delayed(sig, scaled_delay(amount, b), loc(ev));
+                return;
+            }
+            // TODO: event-controlled nonblocking trigger (`->> @(x) e`,
+            // `->> repeat(n) @(x) e`) — needs a detached one-shot event
+            // subscription (docs/design/named-events.md, Tier 2 Form 2).
+            fail("event-controlled nonblocking trigger ('->> @(...) e') is not supported");
+        }
+        if (ev.isNonBlocking) {
+            b.event_trigger_nb(sig, loc(ev)); // `->> e`: wake in the NBA region
+        } else {
+            b.event_trigger(sig, loc(ev)); // `-> e`: wake now
+        }
+    }
+
+    // If `e` is an `<event>.triggered` system-method call (LRM 15.5.3), return the
+    // event operand; else nullptr. slang models the property as a system method
+    // whose receiver is arguments()[0].
+    const Expression* triggered_event(const Expression& e) {
+        if (e.kind != ExpressionKind::Call) {
+            return nullptr;
+        }
+        const CallExpression& call = e.as<CallExpression>();
+        if (!call.isSystemCall() || call.getSubroutineName() != "triggered") {
+            return nullptr;
+        }
+        if (call.arguments().empty() || !call.arguments()[0]->type->isEvent()) {
+            return nullptr;
+        }
+        return call.arguments()[0];
+    }
+
+    // NOTE: `wait(...)` is lowered by the general `lower_wait_stmt` below (from
+    // the wait(expr) feature). It subsumes `wait(e.triggered)`: the read set of
+    // the condition includes the event, so `-> e` wakes the wait and the
+    // re-tested `.triggered` (stamped this instant) ends it.
 
     // -- Statements --
 
@@ -2348,6 +2540,9 @@ private:
             case StatementKind::ForeachLoop:
                 lower_foreach(stmt.as<ForeachLoopStatement>(), b);
                 break;
+            case StatementKind::ImmediateAssertion:
+                lower_immediate_assertion(stmt.as<ImmediateAssertionStatement>(), b);
+                break;
             case StatementKind::Break:
                 b.break_(loc(stmt));
                 break;
@@ -2356,6 +2551,12 @@ private:
                 break;
             case StatementKind::Return:
                 lower_return(stmt.as<ReturnStatement>(), b);
+                break;
+            case StatementKind::EventTrigger:
+                lower_event_trigger(stmt.as<EventTriggerStatement>(), b);
+                break;
+            case StatementKind::Wait:
+                lower_wait_stmt(stmt.as<WaitStatement>(), b);
                 break;
             case StatementKind::Disable:
             case StatementKind::DisableFork:
@@ -2406,6 +2607,50 @@ private:
             cur = nested;
         }
         return false;
+    }
+
+    // Immediate assertion (LRM 16.3): assert / assume / cover. A true condition
+    // runs the optional pass action. `assert`/`assume` (which check identically
+    // for simulation, LRM 16.4.3) additionally run the `else` action on a false
+    // condition, or emit the default failure report (error severity) when there
+    // is none. `cover` has no fail action — a false condition does nothing; its
+    // coverage count/report is deliberately unimplemented.
+    void lower_immediate_assertion(const ImmediateAssertionStatement& a, ir::Builder& b) {
+        if (a.isDeferred || a.isFinal) {
+            // TODO: deferred (assert #0) and final immediate assertions defer the
+            // check/report to the Observed/Reactive region, scheduling Clotho
+            // lacks.
+            fail("deferred / final immediate assertions are not supported");
+        }
+        using AK              = slang::ast::AssertionKind;
+        const bool is_cover   = a.assertionKind == AK::CoverProperty;
+        if (a.assertionKind != AK::Assert && a.assertionKind != AK::Assume && !is_cover) {
+            // TODO: immediate restrict / expect (LRM 16.3) need a property engine;
+            // concurrent cover (CoverSequence) needs SVA.
+            fail("only immediate assert / assume / cover are supported");
+        }
+        const ir::Index pred = lower_predicate(a.cond, b);
+
+        b.open_region();
+        if (a.ifTrue != nullptr) {
+            lower_stmt(*a.ifTrue, b);
+        }
+        const ir::ExtraSlice then_region = b.close_region();
+
+        // False branch: cover does nothing; assert/assume run the else action or
+        // the default failure report.
+        b.open_region();
+        if (!is_cover) {
+            if (a.ifFalse != nullptr) {
+                lower_stmt(*a.ifFalse, b);
+            } else {
+                b.severity(static_cast<uint32_t>(ir::Severity::Error),
+                           banner_at(a.sourceRange.start()), "assertion failed", {}, loc(a));
+            }
+        }
+        const ir::ExtraSlice else_region = b.close_region();
+
+        b.cond(pred, then_region, else_region, loc(a));
     }
 
     void lower_conditional(const ConditionalStatement& c, ir::Builder& b) {
@@ -2682,6 +2927,46 @@ private:
         const ir::ExtraSlice step = b.close_region(); // empty
 
         b.loop(cond, pred, body, step, /*bottom_test*/ true, loc(d));
+    }
+
+    void lower_wait_stmt(const WaitStatement& w, ir::Builder& b) {
+        const ir::SourceLoc l = loc(w);
+
+        // The wait sensitivity: every signal the condition reads, each as an
+        // any-change (level) event. Fails loudly on a string operand (wait
+        // queues are not string-aware — see collect_expr_reads).
+        std::vector<ir::WaitEvent> reads;
+        collect_expr_reads(w.cond, reads);
+        std::vector<ir::WaitEdge> edges;
+        edges.reserve(reads.size());
+        for (const ir::WaitEvent& e : reads) {
+            edges.push_back(ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge) });
+        }
+
+        // forever { if (cond) break; @(reads); }
+        b.open_region();
+        const ir::Index      lpred = true_const(b, l);
+        const ir::ExtraSlice lcond = b.close_region();
+
+        b.open_region();
+        {
+            const ir::Index c = lower_predicate(w.cond, b);
+            b.open_region();
+            b.break_(l);
+            const ir::ExtraSlice then_r = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice else_r = b.close_region(); // empty
+            b.cond(c, then_r, else_r, l);
+            b.wait(edges, l);
+        }
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        const ir::ExtraSlice step = b.close_region(); // empty
+
+        b.loop(lcond, lpred, body, step, /*bottom_test*/ false, l);
+
+        lower_stmt(w.stmt, b);
     }
 
     // A forever loop around `body`: a constant-true Loop. Lowers both an
@@ -3481,10 +3766,11 @@ private:
         }
         if (name == "$fgets" || name == "$fgetc" || name == "$ungetc" || name == "$feof" ||
             name == "$ftell" || name == "$fseek" || name == "$rewind" || name == "$ferror" ||
-            name == "$fscanf" || name == "$sscanf" || name == "$fread") {
-            // File read / positioning / error / scan functions used in statement
-            // position: lower for the side effect (file position, write-back) and
-            // drop the result.
+            name == "$fscanf" || name == "$sscanf" || name == "$fread" ||
+            name == "$test$plusargs" || name == "$value$plusargs") {
+            // File read / positioning / error / scan functions, and plusargs,
+            // used in statement position: lower for the side effect (file
+            // position, write-back) and drop the result.
             lower_sysfunc(call, b);
             return;
         }
@@ -3509,6 +3795,10 @@ private:
                 }
             }
             b.finish(finish_banner(call, name), level, loc(call));
+            return;
+        }
+        if (name == "$info" || name == "$warning" || name == "$error" || name == "$fatal") {
+            lower_severity_task(call, name, b);
             return;
         }
         if (name == "$fflush") {
@@ -3537,7 +3827,87 @@ private:
             lower_readmem(call, name == "$readmemh", b);
             return;
         }
+        if (name == "$dumpfile") {
+            // $dumpfile(name) (LRM §21.7.1.1): set the output path.
+            if (call.arguments().size() != 1) {
+                fail("$dumpfile requires one filename argument");
+            }
+            b.dump_file(lower_expr(*call.arguments()[0], b), loc(call));
+            return;
+        }
+        if (name == "$dumpvars") {
+            lower_dumpvars(call, b);
+            return;
+        }
+        if (name == "$dumpoff") {
+            b.dump_control(ir::Inst::Tag::DumpOff, loc(call));
+            return;
+        }
+        if (name == "$dumpon") {
+            b.dump_control(ir::Inst::Tag::DumpOn, loc(call));
+            return;
+        }
+        if (name == "$dumpall") {
+            b.dump_control(ir::Inst::Tag::DumpAll, loc(call));
+            return;
+        }
+        if (name == "$dumpflush") {
+            b.dump_control(ir::Inst::Tag::DumpFlush, loc(call));
+            return;
+        }
         fail("unsupported system task '" + std::string(name) + "'");
+    }
+
+    // $dumpvars (LRM §21.7.1.3). Phase 0 supports only the whole-design form:
+    // $dumpvars, $dumpvars(0), or $dumpvars(0, <top>...) whose listed scopes are
+    // exactly the design's top-module instances (so the request equals the whole
+    // design). A level > 0 limits hierarchy depth and any other scope / variable
+    // argument selects a subset; both are deferred (docs/VCD.md, sparse dumping) and
+    // loud-fail rather than dumping the wrong set.
+    void lower_dumpvars(const CallExpression& call, ir::Builder& b) {
+        const auto args = call.arguments();
+        if (!args.empty()) {
+            const std::optional<int32_t> level = try_const_int(*args[0]);
+            if (!level.has_value() || *level != 0) {
+                fail("$dumpvars with a nonzero level is not supported (whole-design dump only)");
+            }
+            if (args.size() > 1) {
+                const auto tops = scope_->getCompilation().getRoot().topInstances;
+                std::vector<const slang::ast::Symbol*> listed;
+                for (size_t k = 1; k < args.size(); ++k) {
+                    const auto* as = args[k]->as_if<slang::ast::ArbitrarySymbolExpression>();
+                    if (as == nullptr || as->symbol->kind != slang::ast::SymbolKind::Instance) {
+                        fail("$dumpvars of a scope/variable subset is not supported (whole-design dump only)");
+                    }
+                    bool is_top = false;
+                    for (const slang::ast::InstanceSymbol* t : tops) {
+                        if (t == as->symbol.get()) {
+                            is_top = true;
+                            break;
+                        }
+                    }
+                    if (!is_top) {
+                        fail("$dumpvars of a non-top scope is not supported (whole-design dump only)");
+                    }
+                    listed.push_back(as->symbol.get());
+                }
+                // The list must cover every top, else the whole-design dump would be
+                // a superset of what was requested.
+                for (const slang::ast::InstanceSymbol* top : tops) {
+                    bool covered = false;
+                    for (const slang::ast::Symbol* l : listed) {
+                        if (l == top) {
+                            covered = true;
+                            break;
+                        }
+                    }
+                    if (!covered) {
+                        fail("$dumpvars must list every top module to dump the whole design");
+                    }
+                }
+            }
+        }
+        b.dump_vars(loc(call));
     }
 
     // $readmemh / $readmemb (LRM §21.4): load a file into an unpacked-array memory.
@@ -3794,21 +4164,31 @@ private:
         // the value is not a member. Delegated to a runtime scan of a per-type
         // member table (a string result rules out a frontend select).
         if (name == "name") {
-            if (et.bitWidth > 64) {
-                // TODO: the table key packs the value into u64; a wider base needs
-                // multi-word keys.
-                fail("enum name() with a base type wider than 64 bits is not supported");
-            }
-            std::vector<std::pair<uint64_t, std::string_view>> table;
-            table.reserve(members.size());
+            // Each member value becomes its must-plane bytes ((width+7)/8), so a
+            // base wider than 64 bits round-trips; the runtime byte-compares.
+            const uint32_t width  = et.bitWidth;
+            const uint32_t vbytes = (width + 7) / 8;
+            const uint32_t words  = (width + 63) / 64;
+            std::vector<std::vector<uint8_t>>     valbufs;
+            std::vector<ir::Builder::EnumNameRow> rows;
+            valbufs.reserve(members.size());
+            rows.reserve(members.size());
             for (const EnumMember& m : members) {
-                uint64_t key = m.value.as<uint64_t>().value_or(0);
-                if (et.bitWidth < 64) {
-                    key &= (static_cast<uint64_t>(1) << et.bitWidth) - 1;
+                const slang::SVInt& v      = m.value;
+                const uint64_t*     raw    = v.getRawPtr();
+                const bool          unk    = v.hasUnknown();
+                const uint32_t      vwords = (static_cast<uint32_t>(v.getBitWidth()) + 63) / 64;
+                std::vector<uint64_t> vplane(std::max(words, vwords), 0);
+                for (uint32_t i = 0; i < vwords; ++i) {
+                    // VPI aval (must plane): value bits, with unknown bits cleared.
+                    vplane[i] = unk ? (raw[i] ^ raw[vwords + i]) : raw[i];
                 }
-                table.push_back({ key, m.name });
+                std::vector<uint8_t> vb(vbytes, 0);
+                std::memcpy(vb.data(), vplane.data(), vbytes);
+                valbufs.push_back(std::move(vb));
+                rows.push_back({ std::span<const uint8_t>(valbufs.back()), m.name });
             }
-            return b.enum_name(lower_expr(*call.arguments()[0], b), table, l);
+            return b.enum_name(lower_expr(*call.arguments()[0], b), rows, l);
         }
 
         // next(N)/prev(N) (LRM 6.19.5): the Nth member after/before the current
@@ -4030,6 +4410,11 @@ private:
             }
         }
 
+        // `e.triggered` (LRM 15.5.3): 1-bit "triggered this time step" property.
+        if (const Expression* ev = triggered_event(call)) {
+            return b.event_triggered(event_signal(*ev), l);
+        }
+
         if (fn_ctx_ != nullptr && !fn_ctx_->is_task &&
             (name == "$time" || name == "$stime" || name == "$realtime")) {
             // A function is a plain callable with no wheel pointer in its ABI, so
@@ -4213,6 +4598,77 @@ private:
         // $fscanf(fd, fmt, args) / $sscanf(str, fmt, args) (LRM §21.3.4).
         if (name == "$fscanf" || name == "$sscanf") {
             return lower_scanf(call, name == "$sscanf", b, l);
+        }
+
+        // $test$plusargs(str) (LRM §21.6): nonzero iff a command-line plusarg's
+        // prefix matches `str`. `str` must be a compile-time string literal for
+        // now (a runtime / integral-variable string argument, which the LRM
+        // also allows, is a documented gap — matches $fscanf/$sscanf's own
+        // literal-format-string requirement above).
+        if (name == "$test$plusargs") {
+            const auto args = call.arguments();
+            if (args.size() != 1) {
+                fail("$test$plusargs expects one argument");
+            }
+            const Expression* e = args[0];
+            while (e->kind == ExpressionKind::Conversion) {
+                e = &e->as<ConversionExpression>().operand();
+            }
+            if (e->kind != ExpressionKind::StringLiteral) {
+                // TODO: a runtime (non-literal) plusarg-string argument.
+                fail("$test$plusargs argument must be a string literal");
+            }
+            return b.test_plusargs(e->as<StringLiteral>().getValue(), l);
+        }
+
+        // $value$plusargs(user_string, var) (LRM §21.6). `user_string` must be
+        // a compile-time string literal of the form "plusarg_string%[0-9]*conv"
+        // for now (a runtime user_string, which the LRM's own ieee1364_example
+        // exercises via a `pstring` variable, is a documented gap). Supported
+        // conversions: d/o/b/h/x/s; %e/%f/%g need real support (the same gap
+        // as $fscanf/$sscanf's own %f/%e/%g, see count_scan_conversions).
+        if (name == "$value$plusargs") {
+            const auto args = call.arguments();
+            if (args.size() != 2) {
+                fail("$value$plusargs expects two arguments (user_string, var)");
+            }
+            const Expression* e = args[0];
+            while (e->kind == ExpressionKind::Conversion) {
+                e = &e->as<ConversionExpression>().operand();
+            }
+            if (e->kind != ExpressionKind::StringLiteral) {
+                // TODO: a runtime (non-literal) user_string argument.
+                fail("$value$plusargs user_string must be a string literal");
+            }
+            const std::string_view us  = e->as<StringLiteral>().getValue();
+            const size_t            pct = us.rfind('%');
+            if (pct == std::string_view::npos) {
+                fail("$value$plusargs user_string must end in a %conversion");
+            }
+            size_t i = pct + 1;
+            while (i < us.size() && us[i] >= '0' && us[i] <= '9') {
+                ++i; // "leading 0 forms" (LRM §21.6) — no width semantics here.
+            }
+            if (i >= us.size() || i + 1 != us.size()) {
+                fail("$value$plusargs user_string must end in a %[0-9]*<conv>");
+            }
+            const char conv =
+              static_cast<char>(std::tolower(static_cast<unsigned char>(us[i])));
+            switch (conv) {
+                case 'd':
+                case 'o':
+                case 'b':
+                case 'h':
+                case 'x':
+                case 's':
+                    break;
+                default:
+                    // TODO: %e/%f/%g need real support.
+                    fail(std::string("$value$plusargs conversion %") + us[i] + " is not supported");
+            }
+            const std::string_view prefix = us.substr(0, pct);
+            const ir::Index        dst    = lower_lvalue(*args[1], b);
+            return b.value_plusargs(dst, prefix, conv, l);
         }
 
         // $sformatf(fmt, args) (LRM §21.3.3): format into a new string value.
@@ -4640,6 +5096,46 @@ private:
     }
 
     // Lower $display / $write: format the arguments and write to standard output.
+    // Build the $display-style message from `msg_args` and emit a severity report
+    // (LRM 20.10 / 16.3) at `level`. Non-terminating; $fatal adds a finish after.
+    void emit_severity(ir::Severity level, const std::string& banner,
+                       std::span<const Expression* const> msg_args, const CallExpression& call,
+                       ir::Builder& b) {
+        std::string            fmt;
+        std::vector<ir::Index> args;
+        build_format(msg_args, fmt, args, b);
+        b.severity(static_cast<uint32_t>(level), banner, fmt, args, loc(call));
+    }
+
+    // Lower a severity system task: $info / $warning / $error / $fatal (LRM
+    // 20.10). Each renders an optional $display-style message tail. $fatal's first
+    // argument is the $finish verbosity level (a constant 0/1/2), the rest the
+    // message; it reports, then terminates via $finish(level).
+    void lower_severity_task(const CallExpression& call, std::string_view name, ir::Builder& b) {
+        const std::string banner = banner_at(call.sourceRange.start());
+        const auto        args   = call.arguments();
+        if (name == "$fatal") {
+            uint32_t                           level = 1;
+            std::span<const Expression* const> msg   = args;
+            if (!args.empty()) {
+                slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+                slang::ast::EvalContext    ectx(actx);
+                const slang::ConstantValue cv = args[0]->eval(ectx);
+                if (cv.isInteger()) {
+                    level = cv.integer().as<uint32_t>().value_or(1);
+                }
+                msg = args.subspan(1);
+            }
+            emit_severity(ir::Severity::Fatal, banner, msg, call, b);
+            b.finish(finish_banner(call, "$fatal"), level, loc(call));
+            return;
+        }
+        const ir::Severity sev = name == "$info"      ? ir::Severity::Info
+                                 : name == "$warning" ? ir::Severity::Warning
+                                                      : ir::Severity::Error;
+        emit_severity(sev, banner, args, call, b);
+    }
+
     void lower_display(const CallExpression& call, bool newline, ir::Builder& b, char default_conv) {
         std::string            fmt;
         std::vector<ir::Index> args;
@@ -4788,6 +5284,12 @@ private:
     // `y = (x = 5)`) can recover its value; the caller truncates to the LHS type.
     // Statement callers discard the return.
     ir::Index lower_assign(const AssignmentExpression& a, ir::Builder& b) {
+        if (a.left().type->isEvent()) {
+            // `e2 = e1` (merge) / `e = null` (LRM 15.5.5): event variables are
+            // handles; assignment aliases the underlying sync object. Tier 2 —
+            // needs event reference semantics (docs/design/named-events.md).
+            fail("event assignment is not supported");
+        }
         if (is_aggregate(*a.left().type)) {
             // Whole unpacked-struct assignment: decompose to per-member stores
             // (blocking or nonblocking). Each member commits independently, which
@@ -5046,8 +5548,23 @@ private:
                 }
                 return b.constant(svint_to_ref(cv.integer(), lower_type(*expr.type)), l);
             }
-            case ExpressionKind::NamedValue: {
-                const ValueSymbol& sym = expr.as<NamedValueExpression>().symbol;
+            case ExpressionKind::NamedValue:
+            case ExpressionKind::HierarchicalValue: {
+                // A hierarchical reference (`top.u1.sig`, LRM 23.6) resolves to the
+                // same ValueSymbol a local name would; slang's whole-design
+                // elaboration binds it to the target instance's symbol, so once all
+                // signals are collected (the two-pass lowering below) it flows
+                // through the ordinary signal_of path.
+                const ValueSymbol& sym = expr.as<ValueExpressionBase>().symbol;
+                if (expr.type->isEvent()) {
+                    // A named event has no data value; the legal forms (`@(e)`,
+                    // `-> e`, `e.triggered`) resolve the event symbol directly and
+                    // never reach this value path. This catches the Tier-2 handle
+                    // forms — `e2 = e1` merge, `e == null` — which need event
+                    // reference semantics (docs/design/named-events.md).
+                    fail("event used as a value is not supported (event assignment / "
+                         "comparison / null)");
+                }
                 if (sym.kind == SymbolKind::Parameter) {
                     const ParameterSymbol& p = sym.as<ParameterSymbol>();
                     return b.constant(lower_constant(p.getValue(), p.getType()), l);
@@ -5093,6 +5610,8 @@ private:
                 return lower_unary(expr.as<UnaryExpression>(), b);
             case ExpressionKind::BinaryOp:
                 return lower_binary(expr.as<BinaryExpression>(), b);
+            case ExpressionKind::Inside:
+                return lower_inside(expr.as<InsideExpression>(), b);
             case ExpressionKind::ConditionalOp: {
                 const ConditionalExpression& c = expr.as<ConditionalExpression>();
                 if (is_string_expr(expr)) {
@@ -5577,6 +6096,65 @@ private:
         }
     }
 
+    // The `inside` set-membership operator (LRM 11.4.13): `sel inside { m0, m1, … }`
+    // is 1'b1 if any member matches, 1'bx if some comparison is x with no definite
+    // match, else 1'b0 — exactly a logical-OR reduction of the per-member
+    // predicates. slang has already widened the left operand and every member (and
+    // range bound) to a common comparison type (bindMembershipExpressions ->
+    // contextDetermined), so the compares are width-matched.
+    ir::Index lower_inside(const InsideExpression& e, ir::Builder& b) {
+        const ir::SourceLoc l = loc(e);
+        if (is_string_expr(e.left())) {
+            // TODO: string-typed `inside` — members would need string comparison,
+            // not the integral WildEq / relational ops used here.
+            fail("inside operator over string operands is not supported");
+        }
+        if (e.left().type->isFloating()) {
+            // TODO: real `inside` — members need the float compare ops (FEq / FGe /
+            // FLe), not the integral WildEq / Ge / Le used here (LRM 11.4.13; reals
+            // carry no x/z, so it reduces to == / >= && <=).
+            fail("inside operator over real operands is not supported");
+        }
+        const ir::Ref             ty  = lower_type(*e.left().type);
+        const ir::Index           sel = lower_expr(e.left(), b);
+        std::optional<ir::Index>  acc;
+        for (const Expression* m : e.rangeList()) {
+            const ir::Index pred = lower_inside_member(*m, sel, ty, b);
+            acc = acc ? b.binary(ir::Inst::Tag::Lor, *acc, pred, l) : pred;
+        }
+        return *acc;
+    }
+
+    // One `inside` range_list member's 1-bit predicate. A `[lo:hi]` range is
+    // `sel >= lo && sel <= hi`; a singular member uses ==? wildcard equality, where
+    // only the member's own x/z bits are wildcards (LRM 11.4.13), which is exactly
+    // WildEq's right-operand-wildcards semantics.
+    ir::Index lower_inside_member(const Expression& m, ir::Index sel, ir::Ref ty, ir::Builder& b) {
+        if (m.kind == ExpressionKind::ValueRange) {
+            const auto& vr = m.as<ValueRangeExpression>();
+            if (vr.rangeKind != ValueRangeKind::Simple) {
+                // TODO: tolerance ranges (`[c +/- d]`, `[c +%- d]`, LRM 11.4.13).
+                fail("inside operator tolerance ranges are not supported");
+            }
+            if (vr.left().type->isUnbounded() || vr.right().type->isUnbounded()) {
+                // TODO: unbounded `$` range bounds (`[lo:$]` / `[$:hi]`).
+                fail("inside operator unbounded ($) range bounds are not supported");
+            }
+            const ir::Index lo = b.resize(lower_expr(vr.left(), b), ty, loc(vr.left()));
+            const ir::Index hi = b.resize(lower_expr(vr.right(), b), ty, loc(vr.right()));
+            const ir::Index ge = b.binary(ir::Inst::Tag::Ge, sel, lo, loc(m));
+            const ir::Index le = b.binary(ir::Inst::Tag::Le, sel, hi, loc(m));
+            return b.binary(ir::Inst::Tag::Land, ge, le, loc(m));
+        }
+        if (m.type->getCanonicalType().isUnpackedArray()) {
+            // TODO: an unpacked-array set member (`sel inside {arr}`) matches any
+            // element (LRM 11.4.13 array unwrap); needs runtime element iteration.
+            fail("inside operator with an unpacked-array set member is not supported");
+        }
+        const ir::Index val = b.resize(lower_expr(m, b), ty, loc(m));
+        return b.binary(ir::Inst::Tag::WildEq, sel, val, loc(m));
+    }
+
     // Build the lvalue for a part-select over an already-lowered base lvalue: a
     // constant `[msb:lsb]` slice, or a runtime-base indexed slice `[off +: w]` /
     // `[off -: w]` (width constant, base a runtime value). Shared by the rvalue and
@@ -5663,7 +6241,11 @@ private:
                 // task's output actual has. Unwrap to the target.
                 return lower_lvalue(expr.as<AssignmentExpression>().left(), b);
             case ExpressionKind::NamedValue:
-                return value_lvalue(expr.as<NamedValueExpression>().symbol, b, l);
+            case ExpressionKind::HierarchicalValue:
+                // A hierarchical lvalue (`top.u1.sig = …`, LRM 23.6) writes the
+                // target instance's signal; the resolved symbol goes through the
+                // ordinary signal path (selects below recurse to this base).
+                return value_lvalue(expr.as<ValueExpressionBase>().symbol, b, l);
             case ExpressionKind::ElementSelect: {
                 const ElementSelectExpression& es   = expr.as<ElementSelectExpression>();
                 const ir::Index                base = lower_lvalue(es.value(), b);
@@ -5912,10 +6494,42 @@ private:
         }
     }
 
+    // True for a subroutine declared directly in a package or `$unit` scope
+    // (LRM 6.8's "no instance multiplicity" applies to these exactly as it
+    // does to a variable): walks up from the subroutine's declaring scope,
+    // stopping at the first Package/CompilationUnit (global) or InstanceBody
+    // (module-scope, possibly through an intervening generate block).
+    static bool is_global_subroutine(const SubroutineSymbol& sub) {
+        const Scope* s = sub.getParentScope();
+        while (s != nullptr) {
+            switch (s->asSymbol().kind) {
+                case SymbolKind::Package:
+                case SymbolKind::CompilationUnit:
+                    return true;
+                case SymbolKind::InstanceBody:
+                    return false;
+                default:
+                    s = s->asSymbol().getParentScope();
+            }
+        }
+        return false;
+    }
+
     // Resolve a subroutine (function or task) to a FunctionId, lowering its body
     // on first reference. The id is reserved before the body is built so a
-    // recursive call resolves it.
+    // recursive call resolves it. A package/$unit-scope subroutine has no
+    // instance multiplicity (LRM 6.8): delegate its whole lowering to the
+    // shared globals_ Lowerer instead of duplicating it (and any static
+    // local's storage) per top instance.
     ir::FunctionId function_id(const SubroutineSymbol& sub) {
+        if (globals_ != nullptr && this != globals_ && is_global_subroutine(sub)) {
+            const Scope* saved_scope = globals_->scope_;
+            globals_->scope_         = sub.getParentScope();
+            const ir::FunctionId id  = globals_->function_id(sub);
+            globals_->scope_         = saved_scope;
+            return id;
+        }
+
         const auto cached = fnmap_.find(&sub);
         if (cached != fnmap_.end()) {
             return cached->second;
@@ -5928,19 +6542,22 @@ private:
         for (const FormalArgumentSymbol* fa : sub.getArguments()) {
             const auto dir = fa->direction;
             if (dir == slang::ast::ArgumentDirection::Ref) {
-                // TODO: ref arguments — live aliasing of the actual through the body.
-                fail("subroutines with ref arguments are not supported");
+                // ref / const ref (LRM 13.5.2): the formal aliases the actual's live
+                // storage through a passed pointer (see build_function / build_task
+                // and the backend ref ABI). Supported for packed integral formals
+                // (scalar / packed vector) in functions and tasks.
+                if (!fa->getType().getCanonicalType().isIntegral()) {
+                    // TODO: ref of unpacked array / struct / string / real — needs a
+                    // handle pass or offset plumbing, not the packed-slot pointer ABI.
+                    fail("ref arguments are only supported for packed integral types");
+                }
+                continue;
             }
-            if (!is_task && dir != slang::ast::ArgumentDirection::In) {
-                // A function copies no arguments back; only tasks carry out/inout.
-                // TODO: output / inout arguments on functions.
-                fail("functions with output/inout/ref arguments are not supported");
-            }
-            if (is_task && dir != slang::ast::ArgumentDirection::In &&
+            if (dir != slang::ast::ArgumentDirection::In &&
                 fa->getType().getCanonicalType().isString()) {
-                // TODO: output / inout string task formals (the copy-out path
-                // passes plane pointers, not string handles).
-                fail("output/inout string task arguments are not supported");
+                // TODO: output / inout string formals (the copy-out path passes
+                // plane pointers, not string handles).
+                fail("output/inout string arguments are not supported");
             }
         }
 
@@ -5955,7 +6572,7 @@ private:
         return id;
     }
 
-    // Map a slang argument direction to the IR direction (ref is rejected upstream).
+    // Map a slang argument direction to the IR direction.
     static ir::ArgDir to_arg_dir(slang::ast::ArgumentDirection dir) {
         switch (dir) {
             case slang::ast::ArgumentDirection::In:
@@ -5964,6 +6581,8 @@ private:
                 return ir::ArgDir::Out;
             case slang::ast::ArgumentDirection::InOut:
                 return ir::ArgDir::Inout;
+            case slang::ast::ArgumentDirection::Ref:
+                return ir::ArgDir::Ref;
             default:
                 return ir::ArgDir::In;
         }
@@ -6028,29 +6647,29 @@ private:
         saved_blocks.swap(named_blocks_);
         ir::Builder      b(module_.pool);
         std::vector<ir::Ref> param_types;
+        std::vector<ir::ArgDir> arg_dirs;
 
-        // Parameters: copy each Arg into the formal's Local at entry, so the body
-        // reads / writes the formal as ordinary frame storage. An aggregate formal
-        // is passed by pointer and copied in by the backend (no Arg / Store here).
+        // Allocate a frame Local per formal (formal k == Local k), like build_task.
+        // The backend copies parameters into these Locals at entry (emit_copyin) and
+        // copies output / inout formals back at each return (emit_copyout); a ref
+        // formal's Local is redirected to the passed actual pointer. No IR-level Arg
+        // copy is emitted for any direction. An aggregate formal is passed by pointer
+        // and copied into its Local by the backend's aggregate copy-in.
         for (const FormalArgumentSymbol* fa : sub.getArguments()) {
-            const ir::Ref       pty = lower_type(fa->getType());
-            const ir::SourceLoc fl  = to_source_loc(fa->location);
-            const auto          pos = static_cast<uint32_t>(param_types.size());
-            param_types.push_back(pty);
-            const uint32_t idx = fn_local(*fa);
             if (is_aggregate(fa->getType())) {
                 if (fa->direction != slang::ast::ArgumentDirection::In) {
                     // TODO: aggregate output / inout function arg (copy-out).
                     fail("aggregate output / inout function argument is not supported");
                 }
-                if (!is_string_free(pty)) {
+                if (!is_string_free(lower_type(fa->getType()))) {
                     // TODO: by-value copy of a string-containing aggregate (needs a
                     // per-leaf deep copy of the storage, not a memcpy).
                     fail("by-value pass of a string-containing aggregate is not supported");
                 }
-                continue;
             }
-            b.binary(ir::Inst::Tag::Store, b.local(idx, pty, fl), b.arg(pos, pty, fl), fl);
+            param_types.push_back(lower_type(fa->getType()));
+            arg_dirs.push_back(to_arg_dir(fa->direction));
+            fn_local(*fa);
         }
 
         if (!is_void) {
@@ -6081,6 +6700,7 @@ private:
         module_.set_function(id, ir::Function{ .name        = std::string(sub.name),
                                                .return_type = return_type,
                                                .param_types = std::move(param_types),
+                                               .arg_dirs    = std::move(arg_dirs),
                                                .local_types = std::move(ctx.local_types),
                                                .ir          = b.finish() });
         named_blocks_.swap(saved_blocks);
@@ -6110,14 +6730,73 @@ private:
         if (formals.size() != actuals.size()) {
             fail("function argument count mismatch");
         }
-        const ir::SourceLoc    l = loc(call);
+        const ir::SourceLoc     l = loc(call);
+        std::vector<CopyOutArg> outs;
+        const std::vector<ir::Index> args = build_call_args(formals, actuals, outs, b, l);
+        const ir::Index         c = b.call(id, args, l);
+        // Output / inout formals copy back to their actuals after the call (a
+        // function is zero-time, so this is the same instant as the call).
+        emit_call_copyouts(outs, b, l);
+
+        return sub.returnValVar == nullptr ? std::nullopt : std::optional<ir::Index>(c);
+    }
+
+    // Lower a task enable (LRM 13.3). The backend drives the task coroutine and
+    // blocks the caller until it completes. Argument passing (13.5) is shared with
+    // function calls: build_call_args prepares each operand and records output /
+    // inout copy-backs, emit_call_copyouts applies them after the call.
+    void lower_task_call(const CallExpression& call, const SubroutineSymbol& sub, ir::Builder& b) {
+        const ir::FunctionId id      = function_id(sub); // validates + lowers (lazily)
+        const auto           formals = sub.getArguments();
+        const auto           actuals = call.arguments();
+        if (formals.size() != actuals.size()) {
+            fail("task argument count mismatch");
+        }
+        for (const FormalArgumentSymbol* fa : formals) {
+            if (contains_struct_ref(lower_type(fa->getType()))) {
+                // TODO: aggregate task argument (by-pointer copy-in, plus copy-out
+                // for output / inout). The task coroutine ABI does not yet marshal
+                // aggregates; only functions do.
+                fail("unpacked struct / aggregate task argument is not supported");
+            }
+        }
+        const ir::SourceLoc     l = loc(call);
+        std::vector<CopyOutArg> outs;
+        const std::vector<ir::Index> args = build_call_args(formals, actuals, outs, b, l);
+        b.task_call(id, args, l);
+        emit_call_copyouts(outs, b, l);
+    }
+
+    // One output / inout argument's copy-back record: the caller temp holding the
+    // formal's value, the actual lvalue to write at completion, and the types to
+    // coerce across (formal -> actual).
+    struct CopyOutArg {
+        ir::Index               temp;
+        const Expression*       actual;
+        ir::Ref                 actual_ty;
+        const slang::ast::Type* formal_ty;
+    };
+
+    // Build the call-argument operands for a user function / task (LRM 13.5): an
+    // input passes a value resized to the formal; a ref passes the actual's lvalue;
+    // an output / inout uses a fresh caller temp (copied in from the actual for
+    // inout) the backend passes by pointer. Each output / inout is recorded in
+    // `outs` for copy-out after the call. Shared by function and task calls — the
+    // copy-in / copy-out semantics are identical and delicate to correctness.
+    std::vector<ir::Index> build_call_args(std::span<const FormalArgumentSymbol* const> formals,
+                                           std::span<const Expression* const> actuals,
+                                           std::vector<CopyOutArg>& outs, ir::Builder& b,
+                                           ir::SourceLoc l) {
         std::vector<ir::Index> args;
-        args.reserve(actuals.size());
+        args.reserve(formals.size());
         for (size_t i = 0; i < formals.size(); ++i) {
+            const auto    dir = formals[i]->direction;
             const ir::Ref pty = lower_type(formals[i]->getType());
             if (contains_struct_ref(pty)) {
                 // An aggregate actual passes by pointer (its lvalue); the callee
-                // copies it in for value semantics.
+                // copies it in for value semantics. Only In reaches here: the
+                // callee guards aggregate output / inout, and aggregate task
+                // arguments are guarded before build_call_args (lower_task_call).
                 if (!is_string_free(pty)) {
                     fail("by-value pass of a string-containing aggregate is not supported");
                 }
@@ -6129,52 +6808,13 @@ private:
                 args.push_back(lower_lvalue(src, b));
                 continue;
             }
-            // A string actual passes as-is (no width to resize to); the callee's
-            // copy-in gives value semantics.
-            args.push_back(is_string_ref(pty)
-                             ? lower_expr(*actuals[i], b)
-                             : coerce(lower_expr(*actuals[i], b), *actuals[i]->type, pty, b, l));
-        }
-        const ir::Index c = b.call(id, args, l);
-
-        return sub.returnValVar == nullptr ? std::nullopt : std::optional<ir::Index>(c);
-    }
-
-    // Lower a task enable (LRM 13.3). The backend drives the task coroutine and
-    // blocks the caller until it completes. Argument passing (13.5): each input is
-    // a value resized to the parameter type; each output / inout uses a caller temp
-    // that the backend passes to the task by pointer. We copy an inout's actual into
-    // its temp before the call and copy every output / inout temp back to its actual
-    // after — both as ordinary assignments, so width conversion and complex actual
-    // lvalues (bit / part selects) reuse the normal store path.
-    void lower_task_call(const CallExpression& call, const SubroutineSymbol& sub, ir::Builder& b) {
-        const ir::FunctionId id      = function_id(sub); // validates + lowers (lazily)
-        const auto           formals = sub.getArguments();
-        const auto           actuals = call.arguments();
-        if (formals.size() != actuals.size()) {
-            fail("task argument count mismatch");
-        }
-        const ir::SourceLoc l = loc(call);
-
-        // One temp + copy-back record per output / inout argument.
-        struct OutArg {
-            ir::Index         temp;      // the caller temp lvalue (parameter width)
-            const Expression* actual;    // the call-site lvalue to copy back into
-            ir::Ref           actual_ty; // the actual's type (target of copy-out)
-            const slang::ast::Type* formal_ty; // the formal's type (source of copy-out)
-        };
-        std::vector<OutArg>    outs;
-        std::vector<ir::Index> args;
-        args.reserve(formals.size());
-        for (size_t i = 0; i < formals.size(); ++i) {
-            const ir::Ref pty = lower_type(formals[i]->getType());
-            if (contains_struct_ref(pty)) {
-                // TODO: aggregate task argument (by-pointer copy-in, plus copy-out
-                // for output / inout). The task coroutine ABI does not yet marshal
-                // aggregates; only functions do.
-                fail("unpacked struct / aggregate task argument is not supported");
+            if (dir == slang::ast::ArgumentDirection::Ref) {
+                args.push_back(lower_ref_actual(*actuals[i], b));
+                continue;
             }
-            if (formals[i]->direction == slang::ast::ArgumentDirection::In) {
+            if (dir == slang::ast::ArgumentDirection::In) {
+                // A string actual passes as-is (no width to resize to); the callee's
+                // copy-in gives value semantics.
                 args.push_back(is_string_ref(pty)
                                  ? lower_expr(*actuals[i], b)
                                  : coerce(lower_expr(*actuals[i], b), *actuals[i]->type, pty, b, l));
@@ -6186,30 +6826,73 @@ private:
             if (actual->kind == ExpressionKind::Assignment) {
                 actual = &actual->as<AssignmentExpression>().left();
             }
-            const ir::Index temp = make_task_temp(pty, b, l);
-            if (formals[i]->direction == slang::ast::ArgumentDirection::InOut) {
+            const ir::Index temp = make_arg_temp(pty, b, l);
+            if (dir == slang::ast::ArgumentDirection::InOut) {
                 // Copy-in: temp = (parameter type) actual.
                 b.binary(ir::Inst::Tag::Store, temp, coerce(lower_expr(*actual, b), *actual->type, pty, b, l), l);
             }
             args.push_back(temp);
-            outs.push_back(OutArg{ temp, actual, lower_type(*actual->type), &formals[i]->getType() });
+            outs.push_back(CopyOutArg{ temp, actual, lower_type(*actual->type), &formals[i]->getType() });
         }
+        return args;
+    }
 
-        b.task_call(id, args, l);
-
-        // Copy-out at completion: actual = (actual type) temp.
-        for (const OutArg& oc : outs) {
+    // Copy each output / inout temp back to its actual after the call: actual =
+    // (actual type) temp. Reuses the normal store path so width conversion and
+    // complex actual lvalues (bit / part selects) work.
+    void emit_call_copyouts(const std::vector<CopyOutArg>& outs, ir::Builder& b, ir::SourceLoc l) {
+        for (const CopyOutArg& oc : outs) {
             const ir::Index dst = lower_lvalue(*oc.actual, b);
             const ir::Index tv  = b.unary(ir::Inst::Tag::Load, oc.temp, l);
             b.binary(ir::Inst::Tag::Store, dst, coerce(tv, *oc.formal_ty, oc.actual_ty, b, l), l);
         }
     }
 
-    // A fresh, anonymous storage cell for an output / inout task argument, returned
-    // as an lvalue leaf. Inside a task caller it is a per-call frame Local; in a
-    // process it is a module Signal (a process has no frame). The same lvalue Index
-    // is reused for copy-in, the task_call operand, and copy-out.
-    ir::Index make_task_temp(ir::Ref type, ir::Builder& b, ir::SourceLoc l) {
+    // A legal ref actual (LRM 13.5.2) Clotho supports: a whole variable, or a whole
+    // element of an unpacked array (`arr[i]`, possibly nested). Each is one complete
+    // `{ i(2W), iW }` slot, so the backend passes its slot pointer. slang already
+    // rejects a packed bit/part-select as a ref actual ("only variables, class
+    // properties, and members of unpacked structs and arrays are allowed"); an
+    // unpacked-struct member needs struct support, still unimplemented.
+    bool is_whole_ref_actual(const Expression& a) {
+        switch (a.kind) {
+            case ExpressionKind::NamedValue:
+            case ExpressionKind::HierarchicalValue:
+                return true;
+            case ExpressionKind::ElementSelect: {
+                // Only an unpacked-array element is a whole slot; a select of a
+                // packed value is a bit/part-select (a partial ref, unsupported).
+                const auto& es = a.as<ElementSelectExpression>();
+                return is_unpacked_array(es.value()) && is_whole_ref_actual(es.value());
+            }
+            default:
+                return false;
+        }
+    }
+
+    // Lower a ref actual (LRM 13.5.2) to its lvalue leaf: the backend passes one
+    // pointer to the actual's slot (a scalar's slot, or one array-element slot) and
+    // the callee aliases it live.
+    ir::Index lower_ref_actual(const Expression& actual, ir::Builder& b) {
+        const Expression* a = &actual;
+        // slang may wrap a ref actual in an AssignmentExpression (as for out/inout);
+        // unwrap to the bound lvalue.
+        if (a->kind == ExpressionKind::Assignment) {
+            a = &a->as<AssignmentExpression>().left();
+        }
+        if (!is_whole_ref_actual(*a)) {
+            // TODO: ref actual that is a packed bit/part-select or unpacked-struct
+            // member (needs sub-slot offset plumbing / struct support).
+            fail("ref argument actual must be a whole variable or unpacked-array element");
+        }
+        return lower_lvalue(*a, b);
+    }
+
+    // A fresh, anonymous storage cell for an output / inout call argument, returned
+    // as an lvalue leaf. Inside a function / task caller it is a per-call frame
+    // Local; in a process it is a module Signal (a process has no frame). The same
+    // lvalue Index is reused for copy-in, the call operand, and copy-out.
+    ir::Index make_arg_temp(ir::Ref type, ir::Builder& b, ir::SourceLoc l) {
         if (fn_ctx_ != nullptr) {
             const auto idx = static_cast<uint32_t>(fn_ctx_->local_types.size());
             fn_ctx_->local_types.push_back(type);
@@ -6259,6 +6942,10 @@ private:
     uint32_t temp_id_ = 0;
     // Subroutine -> its lowered FunctionId, so each function is lowered once and
     // shared across call sites (and a recursive call resolves its own id).
+    // Package/$unit-scope subroutines never populate this map directly on a
+    // per-top Lowerer — function_id delegates those to globals_ instead, so a
+    // package function called from multiple top instances still gets exactly
+    // one FunctionId and one copy of any static local's storage.
     ankerl::unordered_dense::map<const SubroutineSymbol*, ir::FunctionId> fnmap_;
     // Canonical slang struct/union type -> its lowered ir::Ref, so a type used by
     // many variables (e.g. a bus of the same struct) interns its field table
@@ -6266,6 +6953,11 @@ private:
     // built field lists get different `fields_id`s and would never compare
     // equal, defeating InternPool::put's content-based dedup.
     ankerl::unordered_dense::map<const slang::ast::Type*, ir::Ref> struct_type_cache_;
+    // The shared Lowerer that owns package/$unit-scope subroutine bodies (see
+    // set_globals / function_id). Null on the shared Lowerer itself and on any
+    // Lowerer built without one (e.g. tests that lower a single module with no
+    // packages in play).
+    Lowerer* globals_ = nullptr;
     // The function currently being lowered, or null when lowering a process. Drives
     // local-vs-signal name resolution and `return` handling.
     FnCtx* fn_ctx_ = nullptr;
@@ -6380,15 +7072,25 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
     // pipeline expects. With several tops, each top's instance name (== its
     // module name, LRM 23.3.1) prefixes its flattened paths so they stay unique.
     // Each top gets a fresh Lowerer: their bodies share no symbols (no inter-top
-    // ports), so per-Lowerer maps need not — and must not — be shared.
+    // ports), so per-Lowerer instance/hierarchy state needs not — and must not —
+    // be shared. Package / $unit-scope variables are the one exception (LRM 6.8:
+    // no instance multiplicity, so one signal must serve every top that
+    // references it): a dedicated Lowerer registers them once, up front, and its
+    // symbol->signal entries seed every top's own map below.
     const bool single = root.topInstances.size() == 1;
     if (!single) {
         module->name = std::string(root.topInstances[0]->name);
     }
     try {
+        Lowerer globals(*module, tick_fs);
+        globals.lower_globals(comp, root);
+
         for (const InstanceSymbol* top : root.topInstances) {
             const std::string prefix = single ? std::string() : std::string(top->name) + ".";
-            Lowerer(*module, tick_fs).lower_top(*top, prefix);
+            Lowerer lw(*module, tick_fs);
+            lw.seed_signals(globals.sigmap());
+            lw.set_globals(&globals);
+            lw.lower_top(*top, prefix);
         }
     } catch (const LowerError& e) {
         result.diagnostics += "error: " + e.message + "\n";

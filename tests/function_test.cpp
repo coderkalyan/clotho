@@ -303,17 +303,52 @@ TEST_CASE("static local with an initializer is rejected") {
     CHECK(reject(src).find("static function local with an initializer") != std::string::npos);
 }
 
-// Output / inout / ref formal arguments need copy-out / aliasing and are not
-// implemented.
-TEST_CASE("function with an output argument is rejected") {
+TEST_CASE("function output and inout arguments copy back") {
     constexpr std::string_view src = R"(
         module m;
-            function void dbl(input int a, output int o); o = a * 2; endfunction
-            int y;
-            initial dbl(3, y);
+            function automatic void divmod(input int a, input int b,
+                                           output int q, output int r);
+                q = a / b;
+                r = a % b;
+            endfunction
+            function automatic void accumulate(inout int acc, input int x);
+                acc = acc + x;
+            endfunction
+            int q, r, acc;
+            initial begin
+                divmod(17, 5, q, r); $display("q=%0d r=%0d", q, r);
+                acc = 10; accumulate(acc, 7); accumulate(acc, 3);
+                $display("acc=%0d", acc);
+            end
         endmodule
     )";
-    CHECK(reject(src).find("output/inout/ref") != std::string::npos);
+    CHECK(run_capture(src) == "q=3 r=2\nacc=20\n");
+}
+
+// A conditional output write with an early `return` copies out on every return
+// path, and an output / inout formal coexists with the function's own return
+// value. An output to a bit-select actual copies back through the normal store.
+TEST_CASE("function inout with early return and a complex output actual") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic int trydec(inout int n);
+                if (n == 0) return 0;
+                n = n - 1;
+                return 1;
+            endfunction
+            function automatic void setlow(output logic [3:0] o);
+                o = 4'hA;
+            endfunction
+            int q, rc;
+            logic [7:0] v;
+            initial begin
+                q = 3; rc = trydec(q); $display("rc=%0d q=%0d", rc, q);
+                q = 0; rc = trydec(q); $display("rc=%0d q=%0d", rc, q);
+                v = 8'hF0; setlow(v[3:0]); $display("v=%h", v);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "rc=1 q=2\nrc=0 q=0\nv=fa\n");
 }
 
 // Short-circuit `&&` / `||` must not evaluate the right operand when the left

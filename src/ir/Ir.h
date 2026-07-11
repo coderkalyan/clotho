@@ -331,6 +331,39 @@ struct FinishInfo {
     uint32_t arg;
 };
 
+// Severity level of a `severity` instruction. Selects the diagnostic label the
+// runtime prints (LRM 20.10); Fatal is `$fatal` (the frontend follows the report
+// with a Finish carrying the finish number, so the report itself never
+// terminates).
+enum class Severity : uint32_t {
+    Info,
+    Warning,
+    Error,
+    Fatal,
+};
+
+// Extra payload for `severity`: an $info / $warning / $error / $fatal report
+// (LRM 20.10) or an immediate-assertion default failure (LRM 16.3). `banner` /
+// `banner_len` are the packed bytes of the compile-time "<file>:<line>: " prefix
+// the runtime completes with the message. `fmt` / `fmt_len` are the packed
+// $display-style format bytes; `args` the value operands its specifiers consume
+// (both empty for a bare `$error;` or a default assertion failure). `level` is
+// the ir::Severity label.
+struct SeverityInfo {
+    // First extra word of the packed banner-prefix bytes.
+    ExtraIndex banner;
+    // Banner-prefix length in bytes.
+    uint32_t banner_len;
+    // First extra word of the packed format-string bytes.
+    ExtraIndex fmt;
+    // Format-string length in bytes.
+    uint32_t fmt_len;
+    // ir::Severity label.
+    uint32_t level;
+    // Value operands consumed by the format specifiers.
+    ExtraSlice args;
+};
+
 // Extra payload for `fopen`: the $fopen(name, mode) form. `mode` is the C stdio
 // mode-string operand (a packed-ASCII vector, spilled by the backend) and is
 // valid iff `has_mode`; the name value is the instruction's `op`. With a mode a
@@ -444,6 +477,31 @@ struct FreadMemInfo {
     uint32_t has_count;
 };
 
+// Extra payload for `test_plusargs`: $test$plusargs(str) (LRM §21.6). `str` is
+// the packed query-string bytes (a compile-time-literal argument; a runtime
+// string operand is a documented gap, see Lower.cpp).
+struct TestPlusArgsInfo {
+    // First extra word of the packed query-string bytes.
+    ExtraIndex str;
+    // Query-string length in bytes.
+    uint32_t str_len;
+};
+
+// Extra payload for `value_plusargs`: $value$plusargs(user_string, var) (LRM
+// §21.6). `prefix` is the plusarg_string portion of user_string (everything
+// before the trailing `%conv`); `conv` is the lowercase format character
+// (d/o/b/h/s — e/f/g are a documented gap, real conversion needs the same
+// ASCII->real scan $fscanf/$sscanf's own %f/%e/%g gap needs). The
+// instruction's `op` (in the enclosing op_extra payload) is the output lvalue.
+struct ValuePlusArgsInfo {
+    // First extra word of the packed plusarg_string prefix bytes.
+    ExtraIndex prefix;
+    // Prefix length in bytes.
+    uint32_t prefix_len;
+    // Lowercase format conversion character ('d'/'o'/'b'/'h'/'s').
+    uint32_t conv;
+};
+
 // Extra payload for `timeformat`: a $timeformat system task. `units`,
 // `precision`, and `min_width` are value operands (general runtime rvalues); the
 // suffix string is appended after the formatted number and lives packed
@@ -482,10 +540,12 @@ struct StrSubstrInfo {
 // One row of an enum's name table: a member value (low 64 bits) and its source
 // name, packed little-endian at `name_at` for `name_len` bytes.
 struct EnumNameEntry {
-    // Member value, low word.
-    uint32_t val_lo;
-    // Member value, high word.
-    uint32_t val_hi;
+    // First extra word of the member value's must-plane bytes ((width+7)/8 bytes,
+    // little-endian). Stored as bytes rather than a word so a base wider than 64
+    // bits round-trips.
+    ExtraIndex val_at;
+    // Member value length in bytes ((width+7)/8), identical across all entries.
+    uint32_t val_len;
     // First extra word of the packed name bytes.
     ExtraIndex name_at;
     // Name length in bytes.
@@ -533,6 +593,13 @@ struct WaitInfo {
     ExtraSlice events;
 };
 
+// Extra payload for `event_trigger_nb_delayed` (`->> #d e`): the target event
+// signal. The delay (in wheel ticks) is the instruction's `op` operand.
+struct EventDelayInfo {
+    // Event whose synthetic signal owns the wait queue to service on expiry.
+    Signal event;
+};
+
 static_assert(ExtraPayload<ExtraSlice>);
 static_assert(ExtraPayload<CallInfo>);
 static_assert(ExtraPayload<TaskCallInfo>);
@@ -548,6 +615,7 @@ static_assert(ExtraPayload<LoopInfo>);
 static_assert(ExtraPayload<SwitchArm>);
 static_assert(ExtraPayload<SwitchInfo>);
 static_assert(ExtraPayload<DisplayInfo>);
+static_assert(ExtraPayload<SeverityInfo>);
 static_assert(ExtraPayload<FopenInfo>);
 static_assert(ExtraPayload<FileOpInfo>);
 static_assert(ExtraPayload<RealMathInfo>);
@@ -566,6 +634,8 @@ static_assert(ExtraPayload<StrSubstrInfo>);
 static_assert(ExtraPayload<EnumNameEntry>);
 static_assert(ExtraPayload<EnumNameInfo>);
 static_assert(ExtraPayload<CountBitsInfo>);
+static_assert(ExtraPayload<TestPlusArgsInfo>);
+static_assert(ExtraPayload<ValuePlusArgsInfo>);
 
 struct Inst {
     enum class Tag : uint8_t {
@@ -786,6 +856,29 @@ struct Inst {
         // registering the process on each event's wait queue plus a coroutine
         // suspend; a matching blocking assignment to one of the signals wakes it.
         Wait,
+        // Blocking trigger of a named event `-> e` (payload: signal, the event's
+        // synthetic signal). Records the trigger time (for `.triggered`) and
+        // unconditionally services the event signal's Any-edge wait queues,
+        // waking every `@(e)` / `always @(e)` waiter in the current instant
+        // (LRM 15.5.2). An event has no value, so there is no edge computation.
+        EventTrigger,
+        // The `e.triggered` event property (payload: signal), -> a definite 1-bit
+        // value: 1 iff the event was triggered in the current time step, else 0
+        // (LRM 15.5.3). Lowers to a compare of the recorded trigger time against
+        // the current sim time.
+        EventTriggered,
+        // Nonblocking trigger of a named event `->> e` (payload: signal). Unlike
+        // EventTrigger, the wake is deferred to the NBA region of the current time
+        // step (LRM 15.5.4): it marks the event pending; the NBA region then
+        // stamps the trigger time and services the waiters. The triggering process
+        // does not block.
+        EventTriggerNb,
+        // Delayed nonblocking trigger `->> #d e` (payload: op_extra -> op is the
+        // delay in wheel ticks, extra -> EventDelayInfo names the event). Schedules
+        // a detached wheel timer that, on expiry, stamps the trigger time and
+        // services the event's waiters (LRM 15.5.4). The triggering process does
+        // not block. The event-controlled form (`->> @(x) e`) is not lowered here.
+        EventTriggerNbDelayed,
 
         // -- String ops (operands are string values unless noted) --
         // s.len() -> 32-bit signed (payload: unary).
@@ -906,6 +999,14 @@ struct Inst {
         // no default reached at runtime with no matching item. Non-fatal —
         // lowers to an rt_case_violation call that warns and returns.
         CaseViol,
+        // Severity system task report ($info / $warning / $error / $fatal, LRM
+        // 20.10) or the default failure of an immediate assertion (LRM 16.3),
+        // both non-terminating (payload: extra -> SeverityInfo, carrying the
+        // severity level, compile-time banner prefix, and $display-style format
+        // + value args). Lowers to an rt_severity call that renders the message
+        // and writes the labelled diagnostic to stderr, then returns. $fatal's
+        // termination is a separate Finish the frontend emits after this report.
+        Severity,
         // $fflush: flush a descriptor's output buffers (payload: unary, the
         // descriptor value; the no-argument form passes a constant 0, which the
         // runtime treats as "flush all"). LRM §21.3.6. Lowers to an rt_fflush call.
@@ -914,6 +1015,23 @@ struct Inst {
         // memory (payload: op_extra -> ReadMemInfo; op is the filename value). LRM
         // §21.4. Lowers to an rt_readmem call.
         ReadMem,
+
+        // -- Value-change dump (VCD, LRM §21.7; see docs/VCD.md) --
+        // $dumpfile("f.vcd"): set the output path (payload: unary, the filename
+        // value). Lowers to an rt_vcd_open call.
+        DumpFile,
+        // $dumpvars: begin dumping (payload: none). Phase 0 supports only the
+        // whole-design form ($dumpvars / $dumpvars(0)); a scope-subset selector is
+        // rejected at the frontend. The backend enumerates every dumpable signal,
+        // emits the descriptor table, and lowers this to an rt_vcd_start call.
+        DumpVars,
+        // $dumpoff / $dumpon / $dumpall / $dumpflush (payload: none). Suspend (with
+        // an all-x checkpoint) / resume / force-dump-now / flush-to-disk. Each
+        // lowers to the matching rt_vcd_* control call.
+        DumpOff,
+        DumpOn,
+        DumpAll,
+        DumpFlush,
 
         // -- System functions --
         // $time / $stime: read the simulation clock, -> 64-bit unsigned (payload:
@@ -943,6 +1061,18 @@ struct Inst {
         // one-hot forms compare `CountBits(CountOne)` against 1. A constant
         // operand folds in slang and never reaches this tag.
         CountBits,
+        // $test$plusargs(str) (payload: extra -> TestPlusArgsInfo), -> a 1-bit
+        // definite boolean. LRM §21.6: nonzero iff some command-line plusarg's
+        // prefix matches every character of `str`. Lowers to an
+        // rt_test_plusargs call.
+        TestPlusArgs,
+        // $value$plusargs(user_string, var) (payload: op_extra ->
+        // ValuePlusArgsInfo; op is the output lvalue), -> a 1-bit definite
+        // boolean. LRM §21.6: on a matching plusarg, converts its remainder per
+        // the user_string's format character into the lvalue and returns
+        // nonzero; otherwise leaves the lvalue untouched and returns 0. Lowers
+        // to an rt_value_plusargs call.
+        ValuePlusArgs,
     };
 
     // Which union member a tag activates. Drives payload_kind() / operands().
@@ -968,6 +1098,7 @@ struct Inst {
         Sformatf,
         Scanf,
         RealMath,
+        Severity,
     };
 
     union Payload {

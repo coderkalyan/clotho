@@ -39,6 +39,23 @@ Index Builder::local(uint32_t index, Ref type, SourceLoc loc) {
     return emit({ Inst::Tag::Local, Inst::Payload{ .local = { index, type } } }, loc);
 }
 
+Index Builder::event_trigger(Signal sig, SourceLoc loc) {
+    return emit({ Inst::Tag::EventTrigger, Inst::Payload{ .signal = sig } }, loc);
+}
+
+Index Builder::event_triggered(Signal sig, SourceLoc loc) {
+    return emit({ Inst::Tag::EventTriggered, Inst::Payload{ .signal = sig } }, loc);
+}
+
+Index Builder::event_trigger_nb(Signal sig, SourceLoc loc) {
+    return emit({ Inst::Tag::EventTriggerNb, Inst::Payload{ .signal = sig } }, loc);
+}
+
+Index Builder::event_trigger_nb_delayed(Signal sig, Index delay, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(EventDelayInfo{ sig });
+    return emit({ Inst::Tag::EventTriggerNbDelayed, Inst::Payload{ .op_extra = { delay, extra } } }, loc);
+}
+
 Index Builder::unary(Inst::Tag tag, Index op, SourceLoc loc) {
     return emit({ tag, Inst::Payload{ .unary = op } }, loc);
 }
@@ -184,27 +201,28 @@ Index Builder::str_to_packed(Index str, Ref type, SourceLoc loc) {
     return emit({ Inst::Tag::StrToPacked, Inst::Payload{ .op_type = { str, type } } }, loc);
 }
 
-Index Builder::enum_name(Index val, std::span<const std::pair<uint64_t, std::string_view>> members,
-                         SourceLoc loc) {
-    // Pack each member's name bytes first, remembering where they landed, then
-    // pack the entry records contiguously so they form one ExtraSlice. Names and
-    // records share the extra buffer but never overlap.
+Index Builder::enum_name(Index val, std::span<const EnumNameRow> members, SourceLoc loc) {
+    // Pack each member's value + name bytes first, remembering where they landed,
+    // then pack the entry records contiguously so they form one ExtraSlice. The
+    // byte payloads and the records share the extra buffer but never overlap.
     struct Packed {
-        uint64_t   value;
+        ExtraIndex val_at;
+        uint32_t   val_len;
         ExtraIndex name_at;
         uint32_t   name_len;
     };
     std::vector<Packed> packed;
     packed.reserve(members.size());
-    for (const std::pair<uint64_t, std::string_view>& m : members) {
-        const ExtraIndex at = add_bytes(m.second);
-        packed.push_back({ m.first, at, static_cast<uint32_t>(m.second.size()) });
+    for (const EnumNameRow& m : members) {
+        const ExtraIndex vat =
+          add_bytes(std::string_view(reinterpret_cast<const char*>(m.value.data()), m.value.size()));
+        const ExtraIndex nat = add_bytes(m.name);
+        packed.push_back({ vat, static_cast<uint32_t>(m.value.size()), nat, static_cast<uint32_t>(m.name.size()) });
     }
 
     const auto start = static_cast<ExtraIndex>(extra_.size());
     for (const Packed& p : packed) {
-        add_extra(EnumNameEntry{ static_cast<uint32_t>(p.value), static_cast<uint32_t>(p.value >> 32),
-                                 p.name_at, p.name_len });
+        add_extra(EnumNameEntry{ p.val_at, p.val_len, p.name_at, p.name_len });
     }
     const auto end = static_cast<ExtraIndex>(extra_.size());
 
@@ -358,6 +376,19 @@ Index Builder::case_violation(std::string_view banner, uint32_t kind, SourceLoc 
     return emit({ Inst::Tag::CaseViol, Inst::Payload{ .extra = extra } }, loc);
 }
 
+Index Builder::severity(uint32_t level, std::string_view banner, std::string_view fmt,
+                        std::span<const Index> args, SourceLoc loc) {
+    // Order in the extra buffer: banner bytes, format bytes, then the arg-index
+    // slice, then the SeverityInfo record pointing at all three.
+    const ExtraIndex banner_at = add_bytes(banner);
+    const ExtraIndex fmt_at    = add_bytes(fmt);
+    const ExtraSlice slice     = add_slice(args);
+    const ExtraIndex extra     = add_extra(SeverityInfo{
+      banner_at, static_cast<uint32_t>(banner.size()), fmt_at, static_cast<uint32_t>(fmt.size()),
+      level, slice });
+    return emit({ Inst::Tag::Severity, Inst::Payload{ .extra = extra } }, loc);
+}
+
 Index Builder::fflush(Index handle, SourceLoc loc) {
     return emit({ Inst::Tag::Fflush, Inst::Payload{ .unary = handle } }, loc);
 }
@@ -379,12 +410,37 @@ Index Builder::timeformat(Index units, Index precision, std::string_view suffix,
     return emit({ Inst::Tag::TimeFormat, Inst::Payload{ .timeformat = extra } }, loc);
 }
 
+Index Builder::dump_file(Index filename, SourceLoc loc) {
+    return emit({ Inst::Tag::DumpFile, Inst::Payload{ .unary = filename } }, loc);
+}
+
+Index Builder::dump_vars(SourceLoc loc) {
+    return emit({ Inst::Tag::DumpVars, Inst::Payload{ .none = 0 } }, loc);
+}
+
+Index Builder::dump_control(Inst::Tag tag, SourceLoc loc) {
+    return emit({ tag, Inst::Payload{ .none = 0 } }, loc);
+}
+
 Index Builder::sim_time(uint64_t scale, SourceLoc loc) {
     return emit({ Inst::Tag::SimTime, Inst::Payload{ .scale = scale } }, loc);
 }
 
 Index Builder::random(SourceLoc loc) {
     return emit({ Inst::Tag::Random, Inst::Payload{ .none = 0 } }, loc);
+}
+
+Index Builder::test_plusargs(std::string_view str, SourceLoc loc) {
+    const ExtraIndex str_at = add_bytes(str);
+    const ExtraIndex extra  = add_extra(TestPlusArgsInfo{ str_at, static_cast<uint32_t>(str.size()) });
+    return emit({ Inst::Tag::TestPlusArgs, Inst::Payload{ .extra = extra } }, loc);
+}
+
+Index Builder::value_plusargs(Index dst, std::string_view prefix, char conv, SourceLoc loc) {
+    const ExtraIndex prefix_at = add_bytes(prefix);
+    const ExtraIndex extra     = add_extra(
+      ValuePlusArgsInfo{ prefix_at, static_cast<uint32_t>(prefix.size()), static_cast<uint32_t>(conv) });
+    return emit({ Inst::Tag::ValuePlusArgs, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
 }
 
 } // namespace clotho::ir

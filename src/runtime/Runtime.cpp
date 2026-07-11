@@ -4,13 +4,18 @@
 #include <bit>
 #include <cerrno>
 #include <charconv>
+#include <condition_variable>
 #include <csetjmp>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <new>
+#include <queue>
+#include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <sys/resource.h>
@@ -101,28 +106,47 @@ uint64_t width_mask(uint32_t w) {
     return w >= 64 ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << w) - 1);
 }
 
-// Render `val` as ceil(width/bits) digits, most-significant first. `bits` is 1
-// (binary), 3 (octal) or 4 (hex). Unknown digits follow LRM §21.2.1.3 casing:
-// lowercase x/z when every in-range bit of the group is x / z, uppercase X/Z
-// when only some are (Z only when the group has no x bits). The top group
-// clips to the operand width so its "every bit" test ignores out-of-range bits.
-void render_digits(std::string& out, uint64_t val, uint64_t xz, uint64_t z, uint32_t width, uint32_t bits) {
+// Number of 64-bit words a `width`-bit plane occupies (>= 1).
+uint32_t plane_words(uint32_t width) {
+    return width == 0 ? 1 : (width + 63) / 64;
+}
+
+// The `bits`-wide bit group of little-endian word array `p` (`words` words) at
+// bit offset `off`, read straight through the word boundary. `bits` <= 64.
+uint64_t bit_group(const uint64_t* p, uint32_t words, uint32_t off, uint32_t bits) {
+    const uint32_t wi = off / 64;
+    const uint32_t sh = off % 64;
+    uint64_t       g  = p[wi] >> sh;
+    if (sh != 0 && wi + 1 < words) {
+        g |= p[wi + 1] << (64 - sh);
+    }
+    const uint64_t m = bits >= 64 ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << bits) - 1);
+    return g & m;
+}
+
+// Render the plane arrays as ceil(width/bits) digits, most-significant first.
+// `bits` is 1 (binary), 3 (octal) or 4 (hex). Unknown digits follow LRM
+// §21.2.1.3 casing: lowercase x/z when every in-range bit of the group is x / z,
+// uppercase X/Z when only some are (Z only when the group has no x bits). The
+// top group clips to the operand width so its "every bit" test ignores
+// out-of-range bits. `words` is plane_words(width).
+void render_digits(std::string& out, const uint64_t* val, const uint64_t* xz, const uint64_t* z, uint32_t words,
+                   uint32_t width, uint32_t bits) {
     if (width == 0) {
         width = 1;
     }
     static constexpr char kHex[]   = "0123456789abcdef";
-    const uint64_t        dig_mask = (uint64_t{ 1 } << bits) - 1;
-    const uint64_t        all_mask = width_mask(width);
     const uint32_t        digits   = (width + bits - 1) / bits;
     for (uint32_t d = digits; d-- > 0;) {
-        const uint32_t shift = d * bits;
-        const uint64_t gm    = dig_mask & (all_mask >> shift);
-        const uint64_t dxz   = (xz >> shift) & gm;
+        const uint32_t off       = d * bits;
+        const uint32_t grp_bits  = std::min(bits, width - off);
+        const uint64_t gm        = (uint64_t{ 1 } << grp_bits) - 1;
+        const uint64_t dxz       = bit_group(xz, words, off, bits) & gm;
         if (dxz == 0) {
-            out += kHex[(val >> shift) & gm];
+            out += kHex[bit_group(val, words, off, bits) & gm];
             continue;
         }
-        const uint64_t dz = (z >> shift) & gm;
+        const uint64_t dz = bit_group(z, words, off, bits) & gm;
         const uint64_t dx = dxz & ~dz;
         if (dx != 0) {
             out += dx == gm ? 'x' : 'X';
@@ -130,6 +154,70 @@ void render_digits(std::string& out, uint64_t val, uint64_t xz, uint64_t z, uint
             out += dz == gm ? 'z' : 'Z';
         }
     }
+}
+
+// Decimal string of the unsigned magnitude in little-endian word array `w`
+// (`words` words, zero-extended above the value width so no masking is needed).
+// Repeated divmod by 1e9 over 32-bit limbs; "0" for a zero value.
+std::string wide_udec(const uint64_t* w, uint32_t words) {
+    std::vector<uint32_t> limb(2 * words);
+    for (uint32_t i = 0; i < words; ++i) {
+        limb[2 * i]     = static_cast<uint32_t>(w[i]);
+        limb[2 * i + 1] = static_cast<uint32_t>(w[i] >> 32);
+    }
+    while (limb.size() > 1 && limb.back() == 0) {
+        limb.pop_back();
+    }
+    std::string s;
+    for (;;) {
+        bool zero = true;
+        for (const uint32_t l : limb) {
+            if (l != 0) {
+                zero = false;
+                break;
+            }
+        }
+        if (zero) {
+            break;
+        }
+        uint64_t rem = 0;
+        for (uint32_t i = static_cast<uint32_t>(limb.size()); i-- > 0;) {
+            const uint64_t cur = (rem << 32) | limb[i];
+            limb[i]            = static_cast<uint32_t>(cur / 1000000000ull);
+            rem                = cur % 1000000000ull;
+        }
+        // Nine LSD-first digits of this chunk; the final (most-significant) chunk
+        // is trimmed of leading zeros after the loop.
+        for (int k = 0; k < 9; ++k) {
+            s += static_cast<char>('0' + rem % 10);
+            rem /= 10;
+        }
+    }
+    if (s.empty()) {
+        return "0";
+    }
+    while (s.size() > 1 && s.back() == '0') {
+        s.pop_back();
+    }
+    std::reverse(s.begin(), s.end());
+    return s;
+}
+
+// Automatic %d field width for a width > 64 operand: the decimal length of the
+// widest value it can hold. Unsigned -> 2^width - 1; signed -> the most negative
+// value's magnitude 2^(width-1) plus the sign character (LRM §21.2.1.2).
+uint32_t wide_dec_maxlen(uint32_t width, bool is_signed) {
+    const uint32_t        words = plane_words(width);
+    std::vector<uint64_t> ext(words, 0);
+    if (is_signed) {
+        ext[(width - 1) / 64] = uint64_t{ 1 } << ((width - 1) % 64);
+        return 1 + static_cast<uint32_t>(wide_udec(ext.data(), words).size());
+    }
+    for (uint32_t k = 0; k < words; ++k) {
+        ext[k] = ~uint64_t{ 0 };
+    }
+    ext[words - 1] &= (width % 64 == 0) ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << (width % 64)) - 1);
+    return static_cast<uint32_t>(wide_udec(ext.data(), words).size());
 }
 
 // Forward declarations: the rt_string representation lives below with the
@@ -154,11 +242,11 @@ uint32_t dec_digits(uint64_t v) {
 // pads on the left (spaces for d/s/c/t, zeros for h/o/b) and never truncates.
 // `-` left-justifies with trailing spaces (an extension the LRM does not define).
 void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spec) {
-    const uint32_t w    = a.width ? a.width : 1;
-    const uint64_t mask = width_mask(w);
-    const uint64_t val  = a.val & mask;
-    const uint64_t xz   = a.xz & mask;
-    const uint64_t z    = a.z & mask;
+    const uint32_t w     = a.width ? a.width : 1;
+    const uint32_t words = plane_words(w);
+    // Top-word mask; every plane is zero-extended above `w`, so only the top
+    // word needs clipping for the whole-field x/z collapse and magnitude negate.
+    const uint64_t topm = (w % 64 == 0) ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << (w % 64)) - 1);
 
     std::string field;
     // Field width to justify to; an explicit specifier width overrides the
@@ -168,31 +256,65 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
 
     switch (spec.conv) {
         case 'd':
-        case 'D':
-            if (!spec.has_width) {
-                // Automatic size: the largest possible value of a `w`-bit
-                // operand; a signed operand's widest text is its most negative
-                // value, sign included (LRM §21.2.1.2).
-                target = (a.flags & 1u) != 0 ? 1 + dec_digits(uint64_t{ 1 } << (w - 1))
-                                             : dec_digits(mask);
+        case 'D': {
+            // Whole-field x/z collapse test across every plane word (LRM
+            // §21.2.1.3): lowercase only when every bit is x (resp. z),
+            // uppercase X when x bits mix with anything, uppercase Z when z bits
+            // mix with known bits.
+            bool any_unknown = false, any_x = false, all_x = true, all_z = true;
+            for (uint32_t k = 0; k < words; ++k) {
+                const uint64_t full = k + 1 == words ? topm : ~uint64_t{ 0 };
+                const uint64_t xzk  = a.xz[k] & full;
+                const uint64_t zk   = a.z[k] & full;
+                const uint64_t xk   = xzk & ~zk;
+                any_unknown |= xzk != 0;
+                any_x |= xk != 0;
+                all_x &= xk == full;
+                all_z &= zk == full;
             }
-            if (xz != 0) {
-                // LRM §21.2.1.3: whole-field collapse, lowercase only when
-                // every bit is x (resp. z), uppercase X when x bits mix with
-                // anything, uppercase Z when z bits mix with known bits.
-                const uint64_t x = xz & ~z;
-                if (x != 0) {
-                    field += x == mask ? 'x' : 'X';
+            if (!spec.has_width) {
+                // Automatic size: the widest text a `w`-bit operand can take (a
+                // signed operand's most negative value, sign included; LRM
+                // §21.2.1.2).
+                if (w <= 64) {
+                    target = (a.flags & 1u) != 0 ? 1 + dec_digits(uint64_t{ 1 } << (w - 1))
+                                                 : dec_digits(width_mask(w));
                 } else {
-                    field += z == mask ? 'z' : 'Z';
+                    target = wide_dec_maxlen(w, (a.flags & 1u) != 0);
                 }
-            } else if ((a.flags & 1u) != 0) {
-                const uint64_t sext = (w < 64 && ((val >> (w - 1)) & 1u)) ? (val | ~mask) : val;
-                field = std::to_string(static_cast<int64_t>(sext));
+            }
+            if (any_unknown) {
+                if (any_x) {
+                    field += all_x ? 'x' : 'X';
+                } else {
+                    field += all_z ? 'z' : 'Z';
+                }
+            } else if (w <= 64) {
+                const uint64_t mask = width_mask(w);
+                const uint64_t val  = a.val[0] & mask;
+                if ((a.flags & 1u) != 0) {
+                    const uint64_t sext = (w < 64 && ((val >> (w - 1)) & 1u)) ? (val | ~mask) : val;
+                    field               = std::to_string(static_cast<int64_t>(sext));
+                } else {
+                    field = std::to_string(val);
+                }
+            } else if ((a.flags & 1u) != 0 && ((a.val[(w - 1) / 64] >> ((w - 1) % 64)) & 1u) != 0) {
+                // Negative signed: print the sign and the two's-complement
+                // magnitude (2^w - value), computed in place across the words.
+                std::vector<uint64_t> mag(words);
+                uint64_t              carry = 1;
+                for (uint32_t k = 0; k < words; ++k) {
+                    const uint64_t inv = ~a.val[k] + carry;
+                    carry              = (carry != 0 && inv == 0) ? 1 : 0;
+                    mag[k]             = inv;
+                }
+                mag[words - 1] &= topm;
+                field = "-" + wide_udec(mag.data(), words);
             } else {
-                field = std::to_string(val);
+                field = wide_udec(a.val, words);
             }
             break;
+        }
         case 'h':
         case 'H':
         case 'x':
@@ -203,7 +325,7 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
         case 'B': {
             const char     lc   = static_cast<char>(spec.conv | 0x20);
             const uint32_t bits = lc == 'h' || lc == 'x' ? 4 : lc == 'o' ? 3 : 1;
-            render_digits(field, val, xz, z, w, bits);
+            render_digits(field, a.val, a.xz, a.z, words, w, bits);
             if (spec.has_width) {
                 // An explicit width replaces the automatic sizing: reduce to the
                 // minimal digits, then zero-pad back out to the field width
@@ -221,14 +343,14 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
         }
         case 'c':
         case 'C':
-            field += static_cast<char>(val & 0xff);
+            field += static_cast<char>(a.val[0] & 0xff);
             break;
         case 't':
         case 'T':
-            // The frontend scales a %t argument to design ticks, so `val` is the
-            // tick count; render_time converts it per the current $timeformat,
-            // whose min width is the default field width for %t.
-            render_time(field, val);
+            // The frontend scales a %t argument to design ticks, so the low word
+            // is the tick count; render_time converts it per the current
+            // $timeformat, whose min width is the default field width for %t.
+            render_time(field, a.val[0]);
             if (!spec.has_width && timeformat.min_width > 0) {
                 target = static_cast<uint32_t>(timeformat.min_width);
             }
@@ -236,8 +358,8 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
         case 's':
         case 'S':
             if ((a.flags & 2u) != 0) {
-                // A string object: `val` carries the rt_string handle pointer.
-                const auto* s = reinterpret_cast<const rt_string*>(static_cast<uintptr_t>(a.val));
+                // A string object: `val` is the rt_string handle pointer itself.
+                const auto* s = reinterpret_cast<const rt_string*>(a.val);
                 field.append(str_data(s), str_len(s));
                 break;
             }
@@ -247,12 +369,15 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
             // example are explicit, so LRM wins). An embedded/trailing 0x00
             // prints as a space (LRM silent; matches iverilog).
             {
+                const auto byte = [&a](uint32_t j) {
+                    return static_cast<uint8_t>(a.val[j / 8] >> (8 * (j % 8)));
+                };
                 uint32_t k = (w + 7) / 8;
-                while (k > 0 && ((val >> (8 * (k - 1))) & 0xff) == 0) {
+                while (k > 0 && byte(k - 1) == 0) {
                     --k;
                 }
                 while (k-- > 0) {
-                    const auto c = static_cast<char>((val >> (8 * k)) & 0xff);
+                    const auto c = static_cast<char>(byte(k));
                     field += c == '\0' ? ' ' : c;
                 }
             }
@@ -287,7 +412,7 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
             }
             cs += spec.conv;
             double v = 0.0;
-            std::memcpy(&v, &a.val, sizeof v);
+            std::memcpy(&v, a.val, sizeof v);
             const int n = std::snprintf(nullptr, 0, cs.c_str(), v);
             if (n > 0) {
                 field.resize(static_cast<size_t>(n) + 1);
@@ -318,19 +443,23 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
 // word first, native endian. %u transfers the 2-value projection (x/z bits read
 // as zero); %z transfers vpi aval/bval pairs per word (x: a=1 b=1, z: a=0 b=1).
 void render_unformatted(std::string& out, const rt_arg& a, bool four_state) {
-    const uint32_t w    = a.width ? a.width : 1;
-    const uint64_t mask = width_mask(w);
-    const uint64_t xz   = a.xz & mask;
-    const uint64_t aval = ((a.val & ~a.xz) | (xz & ~a.z)) & mask;
-    const uint32_t words = (w + 31) / 32;
-    for (uint32_t k = 0; k < words; ++k) {
-        const auto append_word = [&out](uint64_t plane, uint32_t word) {
-            const auto u = static_cast<uint32_t>(plane >> (32 * word));
-            out.append(reinterpret_cast<const char*>(&u), sizeof(u));
-        };
-        append_word(four_state ? aval : (a.val & ~a.xz & mask), k);
+    const uint32_t w     = a.width ? a.width : 1;
+    const uint32_t lanes = (w + 31) / 32;
+    // The 32-bit lane `k` of a little-endian plane word array; above-width bits
+    // are already zero (the codegen zero-extends every plane).
+    const auto lane = [](const uint64_t* p, uint32_t k) {
+        return static_cast<uint32_t>(p[k / 2] >> (32 * (k % 2)));
+    };
+    const auto append_lane = [&out](uint32_t u) { out.append(reinterpret_cast<const char*>(&u), sizeof(u)); };
+    for (uint32_t k = 0; k < lanes; ++k) {
+        const uint32_t val = lane(a.val, k);
+        const uint32_t xz  = lane(a.xz, k);
+        const uint32_t z   = lane(a.z, k);
+        // %u: 2-value projection (x/z read as 0). %z: vpi aval then bval, where
+        // aval is the known-1 and x bits and bval marks every unknown bit.
+        append_lane(four_state ? ((val & ~xz) | (xz & ~z)) : (val & ~xz));
         if (four_state) {
-            append_word(xz, k);
+            append_lane(xz);
         }
     }
 }
@@ -463,6 +592,102 @@ void write_word_planes(uint8_t* mm, uint8_t* z, uint32_t width, uint64_t must, u
     std::memcpy(mm, &mmv, (2 * width + 7) / 8);
     if (z != nullptr) { // null when the target's slot has no z word (z elision)
         std::memcpy(z, &zz, (width + 7) / 8);
+    }
+}
+
+// -- Wide (> 64-bit) plane assembly for $readmem / $fread --
+//
+// The <= 64-bit path above packs into one __int128; a wider element assembles
+// its value in a little-endian word array (ceil(width/64) words) instead. These
+// helpers are the multi-word analogues of the `(v << k) | d` accumulation and
+// the `must | (may << width)` packing the scalar path does in machine words.
+// (plane_words is defined above with the display formatting helpers.)
+
+// Mask the top word of a `words`-word little-endian value to `width` bits.
+void mask_top(uint64_t* a, uint32_t words, uint32_t width) {
+    const uint32_t bits = width % 64;
+    if (bits != 0) {
+        a[words - 1] &= (uint64_t{ 1 } << bits) - 1;
+    }
+}
+
+// Shift the `words`-word value left by `shift` bits, in place (high bits drop).
+void wide_shl(uint64_t* a, uint32_t words, uint32_t shift) {
+    if (shift == 0) {
+        return;
+    }
+    const uint32_t ws = shift / 64;
+    const uint32_t bs = shift % 64;
+    for (int32_t k = static_cast<int32_t>(words) - 1; k >= 0; --k) {
+        uint64_t v = 0;
+        if (static_cast<uint32_t>(k) >= ws) {
+            v = a[k - ws] << bs;
+            if (bs != 0 && static_cast<uint32_t>(k) > ws) {
+                v |= a[k - ws - 1] >> (64 - bs);
+            }
+        }
+        a[k] = v;
+    }
+}
+
+// OR `src` (`words` words) shifted left by `shift` bits into `dst`, which must
+// have room for the shifted result. Used to lay `may` above `must` in the packed
+// must|may vector.
+void wide_or_shifted(uint64_t* dst, const uint64_t* src, uint32_t words, uint32_t shift) {
+    const uint32_t ws = shift / 64;
+    const uint32_t bs = shift % 64;
+    for (uint32_t k = 0; k < words; ++k) {
+        dst[ws + k] |= src[k] << bs;
+        if (bs != 0) {
+            dst[ws + k + 1] |= src[k] >> (64 - bs);
+        }
+    }
+}
+
+// a = a * mul + add, in place (high bits drop). `mul`/`add` are small (base and a
+// single digit), so each partial product fits __int128. The multi-word analogue
+// of the scalar `v = v * 10 + d` decimal accumulation.
+void wide_mul_add(uint64_t* a, uint32_t words, uint64_t mul, uint64_t add) {
+    uint64_t carry = add;
+    for (uint32_t k = 0; k < words; ++k) {
+        const unsigned __int128 p = static_cast<unsigned __int128>(a[k]) * mul + carry;
+        a[k]                      = static_cast<uint64_t>(p);
+        carry                     = static_cast<uint64_t>(p >> 64);
+    }
+}
+
+// Two's-complement negate a `words`-word value in place (~a + 1). For one word
+// this is the scalar `-v`; the target-width masking happens at write time.
+void wide_negate(uint64_t* a, uint32_t words) {
+    uint64_t carry = 1;
+    for (uint32_t k = 0; k < words; ++k) {
+        const uint64_t inv = ~a[k] + carry;
+        carry              = (carry != 0 && inv == 0) ? 1 : 0;
+        a[k]               = inv;
+    }
+}
+
+// Wide sibling of write_word_planes: the value planes are little-endian word
+// arrays (`words` = plane_words(width)). Masks each to `width`, then writes the
+// packed must|may vector (must low, may above) and the z word, matching the
+// scalar layout bit for bit.
+void write_word_planes_wide(uint8_t* mm, uint8_t* z, uint32_t width, uint64_t* must, uint64_t* may, uint64_t* zz,
+                            bool narrow) {
+    const uint32_t words = plane_words(width);
+    mask_top(must, words, width);
+    if (narrow) {
+        std::memcpy(mm, must, (width + 7) / 8);
+        return;
+    }
+    mask_top(may, words, width);
+    // packed holds 2*width bits; +1 word of slack for a shift straddling the top.
+    std::vector<uint64_t> packed((2 * width + 63) / 64 + 1, 0);
+    std::memcpy(packed.data(), must, words * sizeof(uint64_t));
+    wide_or_shifted(packed.data(), may, words, width);
+    std::memcpy(mm, packed.data(), (2 * width + 7) / 8);
+    if (z != nullptr) { // null when the target's slot has no z word (z elision)
+        mask_top(zz, words, width);
+        std::memcpy(z, zz, (width + 7) / 8);
     }
 }
 
@@ -692,6 +917,14 @@ extern "C" void rt_wheel_schedule(rt_wheel* wheel, rt_timer* timer, uint64_t dea
     // callback's first parameter is sound — the same pointer-cast the wheel
     // already relies on for its type-erased dispatch.
     unwrap(wheel)->schedule(unwrap(timer), deadline, reinterpret_cast<RuntimeWheel::Callback>(on_expire));
+}
+
+extern "C" void rt_wheel_schedule_rel(rt_wheel* wheel, rt_timer* timer, uint64_t delay, rt_timer_fn on_expire) {
+    // now + delay computed runtime-side so a #delay crosses the ABI once, not
+    // twice (rt_wheel_now then rt_wheel_schedule). See rt_wheel_schedule for the
+    // callback-cast rationale.
+    RuntimeWheel& w = *unwrap(wheel);
+    w.schedule(unwrap(timer), w.now() + delay, reinterpret_cast<RuntimeWheel::Callback>(on_expire));
 }
 
 extern "C" void rt_wheel_tick(rt_wheel* wheel, void* ctx) {
@@ -960,6 +1193,18 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
     int32_t  count     = 0;
     bool     any_input = false;
 
+    // Value planes accumulate into word arrays sized to the widest target: a
+    // target wider than 64 bits assembles multi-word, a <= 64-bit target uses
+    // word 0 and reduces to the scalar accumulation. write_word_planes masks each
+    // conversion to its own arg's width.
+    uint32_t words = 1;
+    for (uint32_t k = 0; k < argc; ++k) {
+        words = std::max(words, plane_words(args[k].width));
+    }
+    std::vector<uint64_t> must(words);
+    std::vector<uint64_t> may(words);
+    std::vector<uint64_t> z(words);
+
     for (const char* p = fmt; *p != '\0'; ++p) {
         if (scan_ws(static_cast<unsigned char>(*p))) {
             skip_ws(src);
@@ -1000,17 +1245,17 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
             break;
         }
 
-        uint64_t must = 0;
-        uint64_t may  = 0;
-        uint64_t z    = 0;
-        bool     ok   = false;
+        std::fill(must.begin(), must.end(), 0);
+        std::fill(may.begin(), may.end(), 0);
+        std::fill(z.begin(), z.end(), 0);
+        bool ok = false;
 
         if (conv == 'c') {
             const int c = src.get();
             if (c != EOF) {
-                any_input = true;
-                must = may = static_cast<uint8_t>(c);
-                ok         = true;
+                any_input   = true;
+                must[0] = may[0] = static_cast<uint8_t>(c);
+                ok               = true;
             }
         } else if (conv == 's') {
             skip_ws(src);
@@ -1028,14 +1273,15 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
             }
             if (!tok.empty()) {
                 any_input = true;
-                // Right-justify the token bytes into `must` (byte 0 = last char),
-                // capped at 8 bytes; wider %s targets are guarded by the backend.
-                const size_t keep = tok.size() < 8 ? tok.size() : 8;
+                // Right-justify the token bytes (byte 0 = last char) into `must`,
+                // capped at the widest target; write_word_planes masks to width.
+                const size_t cap  = static_cast<size_t>(words) * 8;
+                const size_t keep = tok.size() < cap ? tok.size() : cap;
                 for (size_t k = 0; k < keep; ++k) {
-                    must |= static_cast<uint64_t>(tok[tok.size() - 1 - k]) << (8 * k);
+                    must[k / 8] |= static_cast<uint64_t>(tok[tok.size() - 1 - k]) << (8 * (k % 8));
                 }
-                may = must;
-                ok  = true;
+                std::copy(must.begin(), must.end(), may.begin());
+                ok = true;
             }
         } else {
             // Numeric: d (signed decimal), o / b / h / x (power-of-two bases, with
@@ -1084,11 +1330,14 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
                     mv = dv; // known digit: may == must
                 }
                 if (base == 10) {
-                    must = must * 10 + dv;
+                    wide_mul_add(must.data(), words, 10, dv);
                 } else {
-                    must = (must << bits) | dv;
-                    may  = (may << bits) | mv;
-                    z    = (z << bits) | zz;
+                    wide_shl(must.data(), words, bits);
+                    must[0] |= dv;
+                    wide_shl(may.data(), words, bits);
+                    may[0] |= mv;
+                    wide_shl(z.data(), words, bits);
+                    z[0] |= zz;
                 }
                 ok        = true;
                 any_input = true;
@@ -1098,9 +1347,9 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
             src.unget(c);
             if (ok && base == 10) {
                 if (neg) {
-                    must = static_cast<uint64_t>(-static_cast<int64_t>(must));
+                    wide_negate(must.data(), words);
                 }
-                may = must; // decimal values carry no x/z
+                std::copy(must.begin(), must.end(), may.begin()); // decimal: no x/z
             }
         }
 
@@ -1111,8 +1360,13 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
             if (ai >= argc) {
                 break; // more conversions than output args
             }
-            const rt_scan_arg& a = args[ai++];
-            write_word_planes(a.mm, a.z, a.width, must, may, z, (a.flags & 1u) != 0);
+            const rt_scan_arg& a      = args[ai++];
+            const bool         narrow = (a.flags & 1u) != 0;
+            if (a.width > 64) {
+                write_word_planes_wide(a.mm, a.z, a.width, must.data(), may.data(), z.data(), narrow);
+            } else {
+                write_word_planes(a.mm, a.z, a.width, must[0], may[0], z[0], narrow);
+            }
             ++count;
         }
     }
@@ -1222,6 +1476,11 @@ extern "C" void rt_finish(const char* banner, uint64_t now, int32_t arg) {
         std::fputs(line.c_str(), stderr);
         std::fflush(stderr);
     }
+    // Flush and close the VCD while the design's stack (state + wheel the engine
+    // points at) is still live — the longjmp below unwinds it, so the sim loop's
+    // own close at wheel-drain is never reached on this path. A no-op when no dump
+    // is open.
+    rt_vcd_close();
     // Jump back to the host that started the run when one is installed — the
     // codegen relies on rt_finish being noreturn, so returning normally is not an
     // option. Otherwise exit; std::exit runs atexit handlers and flushes C stdio,
@@ -1238,6 +1497,27 @@ extern "C" void rt_case_violation(const char* banner, uint64_t now, int32_t kind
     line += kind == 0 ? "no condition is true in the unique/priority if/case at time "
                       : "if/case statement is not unique (overlapping items) at time ";
     append_finish_time(line, now);
+    line += '\n';
+    std::fputs(line.c_str(), stderr);
+    std::fflush(stderr);
+}
+
+extern "C" void rt_severity(int32_t level, const char* banner, const char* fmt, uint32_t argc,
+                            const rt_arg* argv) {
+    // $info / $warning / $error / $fatal (LRM 20.10) or an immediate-assertion
+    // default failure (LRM 16.3). A simulator diagnostic, not design output, so
+    // it goes to stderr like the $finish / case-violation banners; flush stdout
+    // first so buffered $display text is committed before the report interleaves.
+    // The exact layout is not LRM-mandated; "<LABEL>: <file>:
+    // <line>: <message>" tracks iverilog's first report line.
+    static const char* const labels[] = { "INFO", "WARNING", "ERROR", "FATAL" };
+    const char* const        label    = labels[level < 4 ? level : 2];
+    io_ensure_init();
+    std::fflush(stdout);
+    std::string line = label;
+    line += ": ";
+    line += banner;
+    render(line, fmt, argc, argv);
     line += '\n';
     std::fputs(line.c_str(), stderr);
     std::fflush(stderr);
@@ -1337,6 +1617,22 @@ void mem_write(const MemDest& d, int64_t idx, uint64_t must, uint64_t may, uint6
     write_word_planes(d.mm_base + off, zp, d.width, must, may, z, d.narrow);
 }
 
+// Wide (> 64-bit element) sibling of mem_write. The planes are little-endian word
+// arrays (plane_words(d.width) words); write_word_planes_wide masks them in place.
+void mem_write_wide(const MemDest& d, int64_t idx, uint64_t* must, uint64_t* may, uint64_t* z) {
+    if (idx < 0 || idx >= static_cast<int64_t>(d.count)) {
+        return;
+    }
+    const uint32_t words = plane_words(d.width);
+    if (!d.four_state) {
+        std::memcpy(may, must, words * sizeof(uint64_t));
+        std::memset(z, 0, words * sizeof(uint64_t));
+    }
+    const size_t off = static_cast<size_t>(idx) * d.stride;
+    uint8_t*     zp  = d.z_base != nullptr ? d.z_base + off : nullptr;
+    write_word_planes_wide(d.mm_base + off, zp, d.width, must, may, z, d.narrow);
+}
+
 // Map a declared-range address to a 0-based storage index: an ascending range
 // counts up from decl_left, a descending range counts down from it.
 int64_t norm_addr(int64_t decl_left, int64_t decl_right, int64_t addr) {
@@ -1397,13 +1693,26 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
     const int      bits   = hex ? 4 : 1;
     const uint64_t nibble = hex ? 0xFu : 0x1u;
 
+    // Value planes accumulate into word arrays; a <= 64-bit element uses one word
+    // and reduces to the scalar (v << bits) | d path, a wider element assembles
+    // multi-word. Allocated once and reused per token.
+    const uint32_t        words = plane_words(width);
+    const bool            wide  = width > 64;
+    std::vector<uint64_t> must(words);
+    std::vector<uint64_t> may(words);
+    std::vector<uint64_t> z(words);
+
     const MemDest dest{ mm_base, z_base, stride, count, width, four_state, narrow };
-    const auto    write_elem = [&](int64_t idx, uint64_t must, uint64_t may, uint64_t z) {
+    const auto    write_elem = [&](int64_t idx) {
         if (idx < 0 || idx >= static_cast<int64_t>(count)) {
             std::fprintf(stderr, "$readmem: address out of range for '%s'\n", path.c_str());
             return;
         }
-        mem_write(dest, idx, must, may, z);
+        if (wide) {
+            mem_write_wide(dest, idx, must.data(), may.data(), z.data());
+        } else {
+            mem_write(dest, idx, must[0], may[0], z[0]);
+        }
     };
 
     const size_t n = buf.size();
@@ -1440,10 +1749,11 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
             continue;
         }
         // A data token: accumulate digits MSB-first; x/z (and ?) mark unknown bits.
-        uint64_t must = 0;
-        uint64_t may  = 0;
-        uint64_t z    = 0;
-        bool     any  = false;
+        // wide_shl a[0] |= d reduces to (a << bits) | d for a single word.
+        std::fill(must.begin(), must.end(), 0);
+        std::fill(may.begin(), may.end(), 0);
+        std::fill(z.begin(), z.end(), 0);
+        bool any = false;
         while (i < n) {
             const char d = buf[i];
             uint64_t   dv;
@@ -1470,10 +1780,13 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
                 mv = dv;
                 zv = 0;
             }
-            must = (must << bits) | dv;
-            may  = (may << bits) | mv;
-            z    = (z << bits) | zv;
-            any  = true;
+            wide_shl(must.data(), words, bits);
+            must[0] |= dv;
+            wide_shl(may.data(), words, bits);
+            may[0] |= mv;
+            wide_shl(z.data(), words, bits);
+            z[0] |= zv;
+            any = true;
             ++i;
         }
         if (!any) {
@@ -1485,7 +1798,7 @@ extern "C" void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_
             std::fprintf(stderr, "$readmem: more data than the memory range for '%s'\n", path.c_str());
             break;
         }
-        write_elem(norm_addr(decl_left, decl_right, addr), must, may, z);
+        write_elem(norm_addr(decl_left, decl_right, addr));
         addr += dir;
     }
 }
@@ -1514,16 +1827,25 @@ extern "C" int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint3
     int64_t       addr      = has_start ? start : lo;
     int64_t       remaining = has_count ? max_count : static_cast<int64_t>(count);
 
+    // Bytes accumulate into a word array; a <= 64-bit element uses one word and
+    // reduces to the scalar (val << 8) | byte path.
+    const uint32_t        words = plane_words(width);
+    const bool            wide  = width > 64;
+    std::vector<uint64_t> val(words);
+    std::vector<uint64_t> may(words);
+    std::vector<uint64_t> z(words, 0);
+
     int32_t bytes_read = 0;
     while (addr <= hi && remaining > 0) {
-        uint64_t val = 0;
-        uint32_t nb  = 0;
+        std::fill(val.begin(), val.end(), 0);
+        uint32_t nb = 0;
         while (nb < elem_bytes) {
             const int c = std::fgetc(f);
             if (c == EOF) {
                 break;
             }
-            val = (val << 8) | static_cast<uint8_t>(c);
+            wide_shl(val.data(), words, 8);
+            val[0] |= static_cast<uint8_t>(c);
             ++nb;
             ++bytes_read;
         }
@@ -1532,8 +1854,17 @@ extern "C" int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint3
         }
         // MSB-first: a short final element left-shifts so the bytes read occupy the
         // high end and the missing low bytes stay 0.
-        val <<= 8u * (elem_bytes - nb);
-        mem_write(dest, norm_addr(decl_left, decl_right, addr), val, val, 0);
+        wide_shl(val.data(), words, 8u * (elem_bytes - nb));
+        const int64_t idx = norm_addr(decl_left, decl_right, addr);
+        if (wide) {
+            // File bytes are all known (must == may, no z); mem_write_wide's
+            // 2-state override handles a narrow memory.
+            std::copy(val.begin(), val.end(), may.begin());
+            std::fill(z.begin(), z.end(), 0);
+            mem_write_wide(dest, idx, val.data(), may.data(), z.data());
+        } else {
+            mem_write(dest, idx, val[0], val[0], 0);
+        }
         ++addr;
         --remaining;
         if (nb < elem_bytes) {
@@ -1582,6 +1913,132 @@ extern "C" int32_t rt_random(void) {
     r        = r * 4294967296.0 - 2147483648.0;
     const long i = r >= 0 ? static_cast<long>(r) : static_cast<long>(r - 1);
     return static_cast<int32_t>(i);
+}
+
+namespace {
+
+// The command-line plusarg list (LRM §21.6), threaded from the host before
+// the design runs. Process-global, like g_random_seed above — matches the
+// single-simulator-per-process model.
+std::vector<std::string> g_plusargs;
+
+// LRM §21.6: "If the prefix of one of the supplied plusargs matches all
+// characters in the provided string" — `query` must be a prefix of the
+// plusarg, and plusargs are searched in the order given.
+const std::string* find_plusarg(std::string_view query) {
+    for (const std::string& pa : g_plusargs) {
+        if (pa.size() >= query.size() && std::string_view(pa).substr(0, query.size()) == query) {
+            return &pa;
+        }
+    }
+    return nullptr;
+}
+
+} // namespace
+
+extern "C" void rt_plusargs_init(const char* const* args, const uint32_t* lens, uint32_t n) {
+    g_plusargs.clear();
+    g_plusargs.reserve(n);
+    for (uint32_t k = 0; k < n; ++k) {
+        g_plusargs.emplace_back(args[k], lens[k]);
+    }
+}
+
+extern "C" int32_t rt_test_plusargs(const char* s, uint32_t len) {
+    return find_plusarg(std::string_view(s, len)) != nullptr ? 1 : 0;
+}
+
+namespace {
+
+// Convert a $value$plusargs remainder string into must/may bits per `conv`
+// (z is always 0 — LRM §21.6 writes an all-unknown result as 'bx, never a z
+// bit). Unlike $sscanf, which stops at the first bad character, every
+// character in `rem` must be legal or the whole result is 'bx.
+// Parse the plusarg remainder into the `words`-word planes (must == may; plusarg
+// values carry no x/z except the whole-'bx illegal result). A single word reduces
+// to the scalar `val * base + digit` accumulation.
+void value_plusargs_numeric(std::string_view rem, char conv, uint64_t* must, uint64_t* may, uint32_t words) {
+    std::fill(must, must + words, 0);
+    std::fill(may, may + words, 0);
+    if (rem.empty()) {
+        return; // LRM: no remaining string -> store zero.
+    }
+    const int base = conv == 'd' ? 10 : conv == 'o' ? 8 : conv == 'b' ? 2 : 16;
+    size_t    i    = 0;
+    bool      neg  = false;
+    if (base == 10 && (rem[0] == '-' || rem[0] == '+')) {
+        neg = rem[0] == '-';
+        i   = 1;
+    }
+    // Illegal input -> whole result 'bx (VPI: must=0, may=all-1, z=0). Masked to
+    // the target width at write time.
+    const auto set_x = [&] {
+        std::fill(must, must + words, 0);
+        std::fill(may, may + words, ~uint64_t{ 0 });
+    };
+    if (i >= rem.size()) {
+        set_x(); // bare sign, no digits
+        return;
+    }
+    for (; i < rem.size(); ++i) {
+        int        hv;
+        const char c = rem[i];
+        if (base == 10) {
+            hv = (c >= '0' && c <= '9') ? c - '0' : -1;
+        } else if (base == 8) {
+            hv = (c >= '0' && c <= '7') ? c - '0' : -1;
+        } else if (base == 2) {
+            hv = (c == '0' || c == '1') ? c - '0' : -1;
+        } else {
+            hv = hex_digit(c);
+        }
+        if (hv < 0) {
+            set_x();
+            return;
+        }
+        wide_mul_add(must, words, static_cast<uint64_t>(base), static_cast<uint64_t>(hv));
+    }
+    if (neg) {
+        wide_negate(must, words);
+    }
+    std::copy(must, must + words, may);
+}
+
+} // namespace
+
+extern "C" int32_t
+rt_value_plusargs(const char* prefix, uint32_t prefix_len, uint32_t conv, const rt_scan_arg* arg) {
+    const std::string* pa = find_plusarg(std::string_view(prefix, prefix_len));
+    if (pa == nullptr) {
+        return 0;
+    }
+    const std::string_view rem(pa->data() + prefix_len, pa->size() - prefix_len);
+    const char              c = static_cast<char>(conv);
+
+    const uint32_t        words = plane_words(arg->width);
+    std::vector<uint64_t> must(words, 0);
+    std::vector<uint64_t> may(words, 0);
+    std::vector<uint64_t> z(words, 0);
+    if (c == 's') {
+        // Right-justify the remainder bytes (byte 0 = last char) into `must`, like
+        // $sscanf's %s, capped at the target width; write_word_planes masks it.
+        const size_t cap  = static_cast<size_t>(words) * 8;
+        const size_t keep = rem.size() < cap ? rem.size() : cap;
+        for (size_t k = 0; k < keep; ++k) {
+            must[k / 8] |= static_cast<uint64_t>(static_cast<uint8_t>(rem[rem.size() - 1 - k])) << (8 * (k % 8));
+        }
+        std::copy(must.begin(), must.end(), may.begin());
+    } else {
+        value_plusargs_numeric(rem, c, must.data(), may.data(), words);
+    }
+
+    const bool narrow = (arg->flags & 1u) != 0;
+    if (arg->width > 64) {
+        write_word_planes_wide(arg->mm, arg->z, arg->width, must.data(), may.data(), z.data(), narrow);
+    } else {
+        write_word_planes(arg->mm, arg->z, arg->width, must[0], may[0], 0, narrow);
+    }
+    return 1;
 }
 
 extern "C" void rt_string_init(rt_string* s) {
@@ -1703,10 +2160,10 @@ extern "C" void rt_string_substr(rt_string* dst, const rt_string* src, int32_t i
     str_assign(dst, str_data(src) + i, static_cast<uint64_t>(j) - static_cast<uint64_t>(i) + 1);
 }
 
-extern "C" void rt_enum_name(rt_string* dst, uint64_t val, uint32_t count, const uint64_t* values,
-                             const char* const* names, const uint32_t* lens) {
+extern "C" void rt_enum_name(rt_string* dst, const uint8_t* val, uint32_t vbytes, uint32_t count,
+                             const uint8_t* values, const char* const* names, const uint32_t* lens) {
     for (uint32_t k = 0; k < count; ++k) {
-        if (values[k] == val) {
+        if (std::memcmp(val, values + static_cast<size_t>(k) * vbytes, vbytes) == 0) {
             str_assign(dst, names[k], lens[k]);
             return;
         }
@@ -1901,4 +2358,786 @@ extern "C" void* rt_alloc(uint64_t size) {
 
 extern "C" void rt_free(void* p) {
     std::free(p);
+}
+
+// -- Value-change dump (VCD, LRM §21.7; design in docs/VCD.md) --
+//
+// Phase 0: a single-threaded, full-scan writer. rt_vcd_flush is the sole emitter;
+// at each settled instant it reads every dumped variable's planes, diffs against a
+// per-variable shadow, and writes the changes under one `#tick` marker. Storage is
+// allocated once at rt_vcd_start (the FILE gets a fixed setvbuf buffer); the steady
+// state performs no heap allocation. See docs/VCD.md for the phased plan (the
+// activity-driven dirty set, off-thread formatting, and alternate backends land
+// later behind the same producer/sink split).
+
+namespace {
+
+// 64-bit words needed to hold `width` bits.
+inline uint32_t vcd_nwords(uint32_t width) {
+    return (width + 63) / 64;
+}
+
+// One dumped scalar/vector variable: its live plane pointers into design state,
+// its VCD identifier, and the last value emitted (shadow) for change suppression.
+// Planes are multi-word to support arbitrary width; a value is `nwords` 64-bit
+// words per plane (little-endian, low word first).
+struct VcdVar {
+    const uint8_t* mm = nullptr;   // packed must|may plane (i(2W)), or the iW word when narrow
+    const uint8_t* z  = nullptr;   // z plane (iW), or null for a never-z / narrow variable
+    uint32_t       width       = 0;
+    uint32_t       nwords      = 0;   // words per plane
+    uint32_t       mm_bytes    = 0;   // significant bytes of the mm slot field (for the raw diff)
+    uint32_t       z_bytes     = 0;   // significant bytes of the z field (0 for never-z / narrow)
+    bool           four_state  = false;
+    bool           narrow      = false;   // 2-state `{ iW }` slot: mm is a bare iW value word
+    bool           seen        = false;   // shadow valid (a value has been dumped)
+    // Shadow of the last dumped *raw* slot: mm_bytes of the mm field, then z_bytes
+    // of the z field. The diff is a memcmp of these against the live slot; the
+    // planes are assembled (vcd_read_planes) only when they differ.
+    std::vector<uint8_t> shadow;
+    // VCD identifier code, and the precomputed line suffix: idcode+"\n" for a
+    // scalar, " "+idcode+"\n" for a vector (appended after the value in one copy).
+    std::string idcode;
+    std::string suffix;
+};
+
+// The producer -> sink record stream is a byte buffer of self-describing records
+// (docs/VCD.md §4), so a value of any width travels inline and the sink stays
+// stateless. A record is a tag byte followed by:
+//   tag 1 (time):   u64 tick
+//   tag 0 (change): u32 idx, u32 nwords, then nwords u64 each of must, may, z
+// Keeping the planes in the record (not a shadow reference) is what lets the sink
+// run on another thread or format an alternate backend (FST, viewer).
+
+// The single global VCD engine (the simulator is single-threaded, one dump per
+// run). Reset by rt_vcd_close so the next simulation in the same process starts
+// clean.
+struct VcdEngine {
+    std::FILE*            file    = nullptr;
+    char*                 iobuf   = nullptr;   // owned output buffer (rendered VCD bytes)
+    size_t                out_len = 0;         // bytes pending in iobuf
+    rt_wheel*             wheel   = nullptr;    // cached for the close-time flush
+    std::string           path;
+    std::vector<VcdVar>   vars;
+    std::vector<uint8_t>  recbuf;    // producer -> sink record byte stream for pending instants
+    std::vector<uint64_t> scratch;   // scan buffer: 3*max_nwords words (must | may | z)
+    // Activity-driven dirty set: `epoch[i]` is set by rt_vcd_touch when var i is
+    // written this instant. `always` marks array elements (scanned every instant,
+    // not touched). Both are dense byte arrays parallel to `vars`, so the flush's
+    // per-instant index scan touches only these two, not the fat VcdVar struct.
+    std::vector<uint8_t> epoch;
+    std::vector<uint8_t> always;
+    uint32_t max_nwords = 1;    // widest variable, in words (sizes scratch / buffers)
+    uint32_t next_id    = 0;    // next VCD identifier index (assigned per registration)
+    bool started        = false;   // header finished ($enddefinitions written)
+    bool active         = false;   // dumping (cleared by $dumpoff)
+    bool force_all      = false;   // next flush emits every var ($dumpall / $dumpon / initial)
+    bool pending_off    = false;   // next flush emits an all-x checkpoint, then deactivates
+
+    static constexpr size_t iobuf_size = 1u << 20;   // 1 MiB
+};
+
+VcdEngine g_vcd;
+
+// All VCD text is rendered into g_vcd.iobuf and written in bulk. This avoids the
+// per-character locked stdio (std::fputc takes the FILE lock on every call), which
+// dominated the formatter's cost. The buffer is written by whichever thread is
+// appending (the sim thread for the header before the writer spawns, the writer
+// thread for the body afterwards) -- never concurrently.
+void vcd_flush_out() {
+    if (g_vcd.out_len != 0) {
+        std::fwrite(g_vcd.iobuf, 1, g_vcd.out_len, g_vcd.file);
+        g_vcd.out_len = 0;
+    }
+}
+
+inline void vcd_put(char c) {
+    if (g_vcd.out_len >= VcdEngine::iobuf_size) {
+        vcd_flush_out();
+    }
+    g_vcd.iobuf[g_vcd.out_len++] = c;
+}
+
+inline void vcd_puts(std::string_view s) {
+    if (g_vcd.out_len + s.size() > VcdEngine::iobuf_size) {
+        vcd_flush_out();
+        if (s.size() > VcdEngine::iobuf_size) {   // a single string larger than the buffer
+            std::fwrite(s.data(), 1, s.size(), g_vcd.file);
+            return;
+        }
+    }
+    std::memcpy(g_vcd.iobuf + g_vcd.out_len, s.data(), s.size());
+    g_vcd.out_len += s.size();
+}
+
+void vcd_put_dec(uint64_t v) {
+    char t[20];
+    int  n = 0;
+    if (v == 0) {
+        vcd_put('0');
+        return;
+    }
+    while (v != 0) {
+        t[n++] = static_cast<char>('0' + v % 10);
+        v /= 10;
+    }
+    while (n != 0) {
+        vcd_put(t[--n]);
+    }
+}
+
+// Dense VCD identifier from a variable index: base-94 over the printable range
+// 33..126. Uniqueness is all VCD requires; the exact spelling is unspecified.
+std::string vcd_idcode(uint32_t n) {
+    std::string s;
+    do {
+        s.push_back(static_cast<char>(33 + n % 94));
+        n = n / 94;
+    } while (n-- != 0);
+    return s;
+}
+
+// Decompose femtoseconds-per-tick into a VCD `<magnitude><unit>` timescale. The
+// design precision is a power of ten, so the magnitude lands on 1 / 10 / 100.
+void vcd_write_timescale(uint64_t tick_fs) {
+    struct Unit {
+        uint64_t    fs;
+        const char* suffix;
+    };
+    static constexpr Unit units[] = { { 1000000000000000ull, "s" }, { 1000000000000ull, "ms" },
+                                      { 1000000000ull, "us" },       { 1000000ull, "ns" },
+                                      { 1000ull, "ps" },             { 1ull, "fs" } };
+    if (tick_fs == 0) {
+        tick_fs = 1;
+    }
+    for (const Unit& u : units) {
+        if (tick_fs % u.fs == 0) {
+            vcd_puts("$timescale\n\t");
+            vcd_put_dec(tick_fs / u.fs);
+            vcd_puts(u.suffix);
+            vcd_puts("\n$end\n");
+            return;
+        }
+    }
+    vcd_puts("$timescale\n\t");
+    vcd_put_dec(tick_fs);
+    vcd_puts("fs\n$end\n");
+}
+
+// Mask keeping the significant bits of a plane's top word (all bits when the width
+// is a multiple of 64).
+inline uint64_t vcd_topmask(uint32_t width) {
+    const uint32_t r = width % 64;
+    return r == 0 ? ~0ull : ((1ull << r) - 1);
+}
+
+// dst[0..dstw) = (src[0..srcw) as a bignum) >> shift. Words are little-endian.
+void vcd_shr(const uint64_t* src, uint32_t srcw, uint32_t shift, uint64_t* dst, uint32_t dstw) {
+    const uint32_t ws = shift / 64;
+    const uint32_t bs = shift % 64;
+    for (uint32_t k = 0; k < dstw; ++k) {
+        const uint64_t lo  = ws + k < srcw ? src[ws + k] : 0;
+        uint64_t       val = lo >> bs;
+        if (bs != 0) {
+            const uint64_t hi = ws + k + 1 < srcw ? src[ws + k + 1] : 0;
+            val |= hi << (64 - bs);
+        }
+        dst[k] = val;
+    }
+}
+
+// Read a variable's live planes into `out`, laid out must | may | z, each
+// `v.nwords` little-endian 64-bit words. The must|may plane is the packed i(2W)
+// slot field (bits [0,W) must, [W,2W) may); a narrow slot is a bare iW value.
+void vcd_read_planes(const VcdVar& v, uint64_t* out) {
+    if (v.nwords == 1) {
+        // Fast path for the common width <= 64: three word stores, no memset / no
+        // bignum shift. The 2W-bit slot is <= 128 bits, read once via __int128.
+        const uint64_t tm = vcd_topmask(v.width);
+        if (v.narrow) {
+            uint64_t val = 0;
+            std::memcpy(&val, v.mm, (v.width + 7) / 8);
+            val    = val & tm;
+            out[0] = val;   // must
+            out[1] = val;   // may == must
+            out[2] = 0;     // z
+            return;
+        }
+        unsigned __int128 mm = 0;
+        std::memcpy(&mm, v.mm, (2 * v.width + 7) / 8);
+        out[0] = static_cast<uint64_t>(mm) & tm;             // must (low W)
+        out[1] = static_cast<uint64_t>(mm >> v.width) & tm;  // may  (bits [W,2W))
+        uint64_t zz = 0;
+        if (v.z != nullptr) {
+            std::memcpy(&zz, v.z, (v.width + 7) / 8);
+            zz &= tm;
+        }
+        out[2] = zz;
+        return;
+    }
+    const uint32_t w    = v.width;
+    const uint32_t nw   = v.nwords;
+    uint64_t*      must = out;
+    uint64_t*      may  = out + nw;
+    uint64_t*      z    = out + 2 * nw;
+    const uint64_t tm   = vcd_topmask(w);
+    std::memset(out, 0, static_cast<size_t>(3) * nw * 8);
+    if (v.narrow) {
+        // A 2-state `{ iW }` slot: the single value word is fully known (may==must).
+        std::memcpy(must, v.mm, (w + 7) / 8);
+        must[nw - 1] &= tm;
+        std::memcpy(may, must, static_cast<size_t>(nw) * 8);
+        return;   // z stays 0
+    }
+    // Copy the 2W-bit must|may field into a zeroed scratch, then split it: must is
+    // the low W bits, may is the field shifted right by W.
+    const uint32_t rw  = vcd_nwords(2 * w);
+    uint64_t*      raw = g_vcd.scratch.data() + 3 * g_vcd.max_nwords;   // scratch tail, reserved
+    std::memset(raw, 0, static_cast<size_t>(rw) * 8);
+    std::memcpy(raw, v.mm, (2 * w + 7) / 8);
+    std::memcpy(must, raw, static_cast<size_t>(nw) * 8);
+    must[nw - 1] &= tm;
+    vcd_shr(raw, rw, w, may, nw);
+    may[nw - 1] &= tm;
+    if (v.z != nullptr) {
+        std::memcpy(z, v.z, (w + 7) / 8);
+        z[nw - 1] &= tm;
+    }
+}
+
+// Emit one variable's value-change line for the given planes (each `v.nwords`
+// little-endian words). Scalars print the value char then the id; vectors print
+// `b<bits> <id>` with the LRM §21.7.2.1 asymmetric leading-bit compression
+// (leftmost printed digit sets the reader's left-extension: 0->0, x->x, z->z, but
+// 1->0, so a 1-MSB cannot be compressed).
+void vcd_emit(const VcdVar& v, const uint64_t* must, const uint64_t* may, const uint64_t* z) {
+    const auto bitc = [&](uint32_t i) -> char {
+        const uint64_t m = 1ull << (i & 63);
+        const uint32_t w = i >> 6;
+        if ((z[w] & m) != 0) {
+            return 'z';
+        }
+        if ((may[w] & m) == 0) {
+            return '0';
+        }
+        return (must[w] & m) != 0 ? '1' : 'x';
+    };
+    // One capacity check for the whole line: 'b' + up to width digits + suffix. Then
+    // write through a local pointer, no per-character bounds check.
+    const size_t need = static_cast<size_t>(v.width) + v.suffix.size() + 2;
+    if (g_vcd.out_len + need > VcdEngine::iobuf_size) {
+        vcd_flush_out();
+    }
+    char* wp = g_vcd.iobuf + g_vcd.out_len;
+    if (v.width == 1) {
+        *wp++ = bitc(0);
+    } else {
+        *wp++          = 'b';
+        const char msb = bitc(v.width - 1);
+        if (msb == '0') {
+            int hi = -1;
+            for (int i = static_cast<int>(v.width) - 1; i >= 0; --i) {
+                if (bitc(static_cast<uint32_t>(i)) != '0') {
+                    hi = i;
+                    break;
+                }
+            }
+            if (hi < 0) {
+                *wp++ = '0';
+            } else {
+                for (int i = hi; i >= 0; --i) {
+                    *wp++ = bitc(static_cast<uint32_t>(i));
+                }
+            }
+        } else if (msb == '1') {
+            for (int i = static_cast<int>(v.width) - 1; i >= 0; --i) {
+                *wp++ = bitc(static_cast<uint32_t>(i));
+            }
+        } else {
+            // x / z MSB: one marker char forces the reader's left-extension, then the
+            // bits below the leading run (every bit above `hi` equals the marker).
+            *wp++  = msb;
+            int hi = -1;
+            for (int i = static_cast<int>(v.width) - 2; i >= 0; --i) {
+                if (bitc(static_cast<uint32_t>(i)) != msb) {
+                    hi = i;
+                    break;
+                }
+            }
+            for (int i = hi; i >= 0; --i) {
+                *wp++ = bitc(static_cast<uint32_t>(i));
+            }
+        }
+    }
+    // Precomputed suffix: scalar idcode+"\n", vector " "+idcode+"\n".
+    std::memcpy(wp, v.suffix.data(), v.suffix.size());
+    wp += v.suffix.size();
+    g_vcd.out_len = static_cast<size_t>(wp - g_vcd.iobuf);
+}
+
+// -- Producer / sink seam --
+//
+// The producer (rt_vcd_flush, on the sim thread) diffs against the shadow and
+// appends records; the sink (vcd_drain) turns records into VCD text. Splitting the
+// two here is what lets a later step move vcd_drain onto a writer thread, or swap
+// in an FST / viewer sink, without touching the producer.
+
+// Grow recbuf by `n` and return a pointer to the fresh region. recbuf is reserved
+// to a whole handoff batch at start, so resize never reallocates -- far cheaper
+// than std::vector::insert's range machinery, which dominated the producer's cost
+// in profiling.
+inline uint8_t* vcd_rec_grow(size_t n) {
+    const size_t o = g_vcd.recbuf.size();
+    g_vcd.recbuf.resize(o + n);
+    return g_vcd.recbuf.data() + o;
+}
+
+void vcd_rec_time(uint64_t tick) {
+    uint8_t* d = vcd_rec_grow(1 + sizeof(tick));
+    d[0]       = 1;
+    std::memcpy(d + 1, &tick, sizeof(tick));
+}
+
+// Append a value-change record: idx, nwords, then the must | may | z planes
+// (3*nwords words, contiguous at `planes`).
+void vcd_rec_change(uint32_t idx, const uint64_t* planes, uint32_t nwords) {
+    const size_t pbytes = static_cast<size_t>(3) * nwords * 8;
+    uint8_t*     d      = vcd_rec_grow(9 + pbytes);
+    d[0]                = 0;
+    std::memcpy(d + 1, &idx, 4);
+    std::memcpy(d + 5, &nwords, 4);
+    std::memcpy(d + 9, planes, pbytes);
+}
+
+// Diff variable `i` against its shadow; if changed (or `force`), append a change
+// record and update the shadow. Returns true when a record was appended.
+bool vcd_scan_var(uint32_t i, bool force) {
+    VcdVar&  v  = g_vcd.vars[i];
+    uint8_t* sh = v.shadow.data();
+    // Cheap diff on the raw slot bytes (no plane assembly). Assemble the planes
+    // only when the value actually changed.
+    if (!force && v.seen && std::memcmp(v.mm, sh, v.mm_bytes) == 0
+        && (v.z_bytes == 0 || std::memcmp(v.z, sh + v.mm_bytes, v.z_bytes) == 0)) {
+        return false;
+    }
+    uint64_t* scan = g_vcd.scratch.data();
+    vcd_read_planes(v, scan);
+    vcd_rec_change(i, scan, v.nwords);
+    std::memcpy(sh, v.mm, v.mm_bytes);
+    if (v.z_bytes != 0) {
+        std::memcpy(sh + v.mm_bytes, v.z, v.z_bytes);
+    }
+    v.seen = true;
+    return true;
+}
+
+// Writer-thread scratch for the aligned plane copy (only the writer touches it).
+std::vector<uint64_t> vcd_writer_scratch;
+
+// Format one record byte buffer to the output file. Reads only the record bytes
+// and the read-only var table (no diff / shadow state), so it runs on the writer
+// thread while the sim thread fills the next buffer.
+void vcd_write_records(const std::vector<uint8_t>& buf) {
+    size_t p = 0;
+    while (p < buf.size()) {
+        const uint8_t tag = buf[p++];
+        if (tag == 1) {
+            uint64_t tick = 0;
+            std::memcpy(&tick, &buf[p], sizeof(tick));
+            p += sizeof(tick);
+            vcd_put('#');
+            vcd_put_dec(tick);
+            vcd_put('\n');
+        } else {
+            uint32_t idx = 0, nw = 0;
+            std::memcpy(&idx, &buf[p], sizeof(idx));
+            p += sizeof(idx);
+            std::memcpy(&nw, &buf[p], sizeof(nw));
+            p += sizeof(nw);
+            // Copy the (unaligned) planes into the aligned scratch (reserved to
+            // 3*max_nwords at start, so no resize) before formatting.
+            std::memcpy(vcd_writer_scratch.data(), &buf[p], static_cast<size_t>(3) * nw * 8);
+            p += static_cast<size_t>(3) * nw * 8;
+            const uint64_t* planes = vcd_writer_scratch.data();
+            vcd_emit(g_vcd.vars[idx], planes, planes + nw, planes + 2 * nw);
+        }
+    }
+}
+
+// -- Writer thread --
+//
+// The sim thread fills g_vcd.recbuf and, at instant boundaries, hands a full
+// buffer to the writer thread through a bounded pool: the sim thread never blocks
+// on formatting or the disk unless the writer falls a whole pool behind
+// (backpressure). Buffers are recycled, so steady state does not allocate. The
+// var table and file are the only shared state: the table is read-only after
+// rt_vcd_start, and after the thread spawns the file is written by the writer
+// alone (the header is written earlier, on the sim thread, before the spawn).
+
+constexpr size_t kVcdBuffers      = 8;             // record buffers in the pool
+constexpr size_t kVcdHandoffBytes = 64u * 1024u;   // hand off once a buffer holds this many bytes
+
+std::thread                        vcd_thread;
+std::mutex                         vcd_mu;
+std::condition_variable            vcd_cv_ready;   // writer waits for filled buffers
+std::condition_variable            vcd_cv_free;    // sim waits for a recycled buffer
+std::condition_variable            vcd_cv_idle;    // $dumpflush waits for the writer to catch up
+std::queue<std::vector<uint8_t>>   vcd_ready;      // filled buffers awaiting write
+std::vector<std::vector<uint8_t>>  vcd_pool;       // recycled empty buffers
+size_t                             vcd_inflight = 0;  // buffers handed off but not yet written
+bool                               vcd_stop     = false;
+
+void vcd_writer_loop() {
+    for (;;) {
+        std::vector<uint8_t> buf;
+        {
+            std::unique_lock<std::mutex> lk(vcd_mu);
+            vcd_cv_ready.wait(lk, [] { return !vcd_ready.empty() || vcd_stop; });
+            if (vcd_ready.empty()) {
+                return;   // stop requested and nothing left to write
+            }
+            buf = std::move(vcd_ready.front());
+            vcd_ready.pop();
+        }
+        vcd_write_records(buf);   // format + write outside the lock
+        {
+            std::unique_lock<std::mutex> lk(vcd_mu);
+            buf.clear();
+            vcd_pool.push_back(std::move(buf));
+            --vcd_inflight;
+            vcd_cv_free.notify_one();
+            if (vcd_ready.empty() && vcd_inflight == 0) {
+                vcd_cv_idle.notify_all();
+            }
+        }
+    }
+}
+
+// Hand the current record buffer to the writer and take a recycled one. Blocks
+// only if every pooled buffer is in flight (backpressure). A no-op on an empty
+// buffer.
+void vcd_handoff() {
+    if (g_vcd.recbuf.empty()) {
+        return;
+    }
+    std::unique_lock<std::mutex> lk(vcd_mu);
+    vcd_cv_free.wait(lk, [] { return !vcd_pool.empty(); });
+    std::vector<uint8_t> next = std::move(vcd_pool.back());
+    vcd_pool.pop_back();
+    next.clear();
+    vcd_ready.push(std::move(g_vcd.recbuf));
+    ++vcd_inflight;
+    g_vcd.recbuf = std::move(next);
+    vcd_cv_ready.notify_one();
+}
+
+} // namespace
+
+extern "C" void rt_vcd_open(const char* path_buf, uint32_t path_len, uint32_t forward) {
+    g_vcd.path = forward != 0 ? std::string(path_buf, path_len) : unpack_ascii(path_buf, path_len);
+}
+
+extern "C" void rt_vcd_begin(void* wheel, uint64_t tick_fs, int32_t units) {
+    (void)units;
+    if (g_vcd.file != nullptr) {
+        return;   // a repeat $dumpvars: header already written (rt_vcd_start re-arms)
+    }
+    if (g_vcd.path.empty()) {
+        g_vcd.path = "dump.vcd";   // LRM default when $dumpfile is omitted
+    }
+    g_vcd.file = std::fopen(g_vcd.path.c_str(), "wb");
+    if (g_vcd.file == nullptr) {
+        std::fprintf(stderr, "$dumpvars: cannot open '%s'\n", g_vcd.path.c_str());
+        return;
+    }
+    g_vcd.iobuf   = static_cast<char*>(std::malloc(VcdEngine::iobuf_size));
+    g_vcd.out_len = 0;
+    // We buffer output ourselves in iobuf; make the FILE unbuffered so a bulk
+    // fwrite of the rendered bytes goes straight to write() with no second copy.
+    std::setvbuf(g_vcd.file, nullptr, _IONBF, 0);
+    g_vcd.wheel = static_cast<rt_wheel*>(wheel);
+
+    vcd_puts("$date\n\tClotho simulation\n$end\n");
+    vcd_puts("$version\n\tClotho VCD dump\n$end\n");
+    vcd_write_timescale(tick_fs);
+}
+
+extern "C" void rt_vcd_scope(const char* name, uint32_t name_len) {
+    if (g_vcd.file == nullptr || g_vcd.started) {
+        return;
+    }
+    vcd_puts("$scope module ");
+    vcd_puts(std::string_view(name, name_len));
+    vcd_puts(" $end\n");
+}
+
+extern "C" void rt_vcd_upscope(void) {
+    if (g_vcd.file == nullptr || g_vcd.started) {
+        return;
+    }
+    vcd_puts("$upscope $end\n");
+}
+
+// Write one $var line and add the variable to the scan table. Shared by the
+// scalar (rt_vcd_var) and per-element array (rt_vcd_array) registration.
+// `always_scan` marks an array element: its writes are not instrumented with
+// rt_vcd_touch, so the flush scans it every instant instead of relying on the
+// dirty set.
+static void vcd_register(std::string_view ref, uint32_t width, uint32_t flags, const uint8_t* mm, const uint8_t* z,
+                         bool always_scan) {
+    g_vcd.always.push_back(static_cast<uint8_t>(always_scan ? 1 : 0));
+    VcdVar v;
+    v.mm         = mm;
+    v.z          = z;
+    v.width      = width;
+    v.nwords     = vcd_nwords(width);
+    v.four_state = (flags & RT_VCD_FLAG_FOUR_STATE) != 0;
+    v.narrow     = (flags & RT_VCD_FLAG_NARROW) != 0;
+    v.idcode     = vcd_idcode(g_vcd.next_id++);
+    v.mm_bytes   = v.narrow ? (width + 7) / 8 : (2 * width + 7) / 8;
+    v.z_bytes    = z != nullptr ? (width + 7) / 8 : 0;
+    v.shadow.assign(static_cast<size_t>(v.mm_bytes) + v.z_bytes, 0);
+    v.suffix     = width == 1 ? v.idcode + "\n" : " " + v.idcode + "\n";
+    if (v.nwords > g_vcd.max_nwords) {
+        g_vcd.max_nwords = v.nwords;
+    }
+    const char* vtype = (flags & RT_VCD_FLAG_NET) != 0 ? "wire" : "reg";
+    vcd_puts("$var ");
+    vcd_puts(vtype);
+    vcd_put(' ');
+    vcd_put_dec(width);
+    vcd_put(' ');
+    vcd_puts(v.idcode);
+    vcd_put(' ');
+    vcd_puts(ref);
+    vcd_puts(" $end\n");
+    g_vcd.vars.push_back(std::move(v));
+}
+
+extern "C" void rt_vcd_var(const char* name, uint32_t name_len, uint32_t width, uint32_t flags,
+                           const uint8_t* mm, const uint8_t* z) {
+    if (g_vcd.file == nullptr || g_vcd.started) {
+        return;
+    }
+    vcd_register(std::string_view(name, name_len), width, flags, mm, z, false);
+}
+
+extern "C" void rt_vcd_touch(uint32_t idx) {
+    // idx >= epoch.size() covers a not-dumped NBA target passed as (uint32_t)-1.
+    // Setting the flag is idempotent, so no dedup / list bookkeeping is needed.
+    if (g_vcd.active && idx < g_vcd.epoch.size()) {
+        g_vcd.epoch[idx] = 1;
+    }
+}
+
+extern "C" void rt_vcd_touch_range(uint32_t base, uint32_t count) {
+    if (!g_vcd.active) {
+        return;
+    }
+    uint32_t end = base + count;
+    if (end > g_vcd.epoch.size()) {
+        end = static_cast<uint32_t>(g_vcd.epoch.size());
+    }
+    for (uint32_t i = base; i < end; ++i) {
+        g_vcd.epoch[i] = 1;
+    }
+}
+
+extern "C" void rt_vcd_array(const char* name, uint32_t name_len, uint32_t count, uint32_t width, uint32_t flags,
+                             const uint8_t* mm_base, const uint8_t* z_base, uint32_t stride, int64_t left,
+                             int64_t right) {
+    if (g_vcd.file == nullptr || g_vcd.started) {
+        return;
+    }
+    const std::string_view leaf(name, name_len);
+    for (uint32_t k = 0; k < count; ++k) {
+        // Storage index k maps to declared address left+k (ascending range) or
+        // left-k (descending), matching the element-select normalization.
+        const int64_t     addr = left <= right ? left + static_cast<int64_t>(k) : left - static_cast<int64_t>(k);
+        const std::string ref  = std::string(leaf) + "[" + std::to_string(addr) + "]";
+        const uint8_t*    mm   = mm_base + static_cast<size_t>(k) * stride;
+        const uint8_t*    z    = z_base != nullptr ? z_base + static_cast<size_t>(k) * stride : nullptr;
+        // Array elements are touched on write (not always-scanned), so register
+        // them like scalars; the backend instruments blocking and NBA array writes.
+        vcd_register(ref, width, flags, mm, z, false);
+    }
+}
+
+extern "C" void rt_vcd_start(void) {
+    if (g_vcd.file == nullptr) {
+        return;
+    }
+    if (!g_vcd.started) {
+        vcd_puts("$enddefinitions $end\n");
+        // The scan scratch holds one variable's 3*nwords planes plus, in its tail,
+        // the raw 2W-bit must|may read buffer (up to 2*max_nwords+1 words).
+        g_vcd.scratch.assign(static_cast<size_t>(5) * g_vcd.max_nwords + 2, 0);
+        // Dirty set: one epoch flag per var, set by rt_vcd_touch and scanned +
+        // cleared in index order at flush.
+        g_vcd.epoch.assign(g_vcd.vars.size(), 0);
+        vcd_writer_scratch.reserve(static_cast<size_t>(3) * g_vcd.max_nwords);
+        // Size every record buffer to hold a full handoff batch plus one more whole
+        // instant, so the producer never allocates and never splits an instant
+        // across buffers. A worst-case instant is a full-dump change for every
+        // variable plus one time marker. Spawn the writer only after the header is
+        // fully written on this (sim) thread, so file access never overlaps.
+        size_t instant_bytes = 1 + sizeof(uint64_t);   // one time marker
+        for (const VcdVar& v : g_vcd.vars) {
+            instant_bytes += 1 + 2 * sizeof(uint32_t) + static_cast<size_t>(3) * v.nwords * 8;
+        }
+        const size_t cap = kVcdHandoffBytes + instant_bytes;
+        g_vcd.recbuf.reserve(cap);
+        vcd_pool.clear();
+        for (size_t k = 0; k < kVcdBuffers; ++k) {
+            std::vector<uint8_t> b;
+            b.reserve(cap);
+            vcd_pool.push_back(std::move(b));
+        }
+        vcd_stop      = false;
+        vcd_inflight  = 0;
+        vcd_thread    = std::thread(vcd_writer_loop);
+        g_vcd.started = true;
+    }
+    g_vcd.active    = true;
+    g_vcd.force_all = true;   // the first flush emits every variable's initial value
+}
+
+extern "C" void rt_vcd_flush(uint64_t tick) {
+    if (g_vcd.file == nullptr) {
+        return;
+    }
+    uint64_t* const scan  = g_vcd.scratch.data();
+    const uint32_t  nvars = static_cast<uint32_t>(g_vcd.vars.size());
+    if (g_vcd.pending_off) {
+        // $dumpoff checkpoint: mark every variable all-x at this instant.
+        vcd_rec_time(tick);
+        for (uint32_t i = 0; i < nvars; ++i) {
+            VcdVar&        v  = g_vcd.vars[i];
+            const uint32_t nw = v.nwords;
+            std::memset(scan, 0, static_cast<size_t>(3) * nw * 8);   // must = 0, z = 0
+            for (uint32_t k = 0; k < nw; ++k) {
+                scan[nw + k] = ~0ull;   // may = all ones (x)
+            }
+            scan[2 * nw - 1] &= vcd_topmask(v.width);
+            vcd_rec_change(i, scan, nw);
+            // The shadow (raw slot) is left stale: $dumpon re-arms a full dump
+            // (force_all), which re-emits every variable and rewrites the shadow.
+            v.seen         = true;
+            g_vcd.epoch[i] = 0;
+        }
+        g_vcd.pending_off = false;
+        g_vcd.active      = false;
+        vcd_handoff();
+        return;
+    }
+    if (!g_vcd.active) {
+        return;
+    }
+    // Produce a time marker followed by the changed variables; drop the marker if
+    // nothing changed (no-change instants emit nothing). Scan in index order,
+    // reading + diffing only variables the dirty set marked (or always-scanned
+    // array elements). No per-instant sort: index order is byte-identical to a full
+    // scan for free, and the epoch check skips the expensive read/diff for the rest.
+    const size_t mark = g_vcd.recbuf.size();
+    vcd_rec_time(tick);
+    bool any = false;
+    if (g_vcd.force_all) {
+        for (uint32_t i = 0; i < nvars; ++i) {
+            g_vcd.epoch[i] = 0;
+            any |= vcd_scan_var(i, true);
+        }
+    } else {
+        // Hot loop over two dense byte arrays only (no fat-struct access): scan a
+        // var iff it was touched this instant or is an always-scan array element.
+        const uint8_t* ep = g_vcd.epoch.data();
+        const uint8_t* al = g_vcd.always.data();
+        for (uint32_t i = 0; i < nvars; ++i) {
+            const uint8_t s = ep[i];
+            g_vcd.epoch[i]  = 0;
+            if ((s | al[i]) != 0) {
+                any |= vcd_scan_var(i, false);
+            }
+        }
+    }
+    if (!any) {
+        g_vcd.recbuf.resize(mark);
+    }
+    g_vcd.force_all = false;
+    // Hand the batch to the writer once it is large enough; small instants
+    // accumulate to amortize the handoff. The remainder flushes at $dumpflush /
+    // close.
+    if (g_vcd.recbuf.size() >= kVcdHandoffBytes) {
+        vcd_handoff();
+    }
+}
+
+extern "C" void rt_vcd_off(void) {
+    if (g_vcd.active) {
+        g_vcd.pending_off = true;
+    }
+}
+
+extern "C" void rt_vcd_on(void) {
+    if (g_vcd.started) {
+        g_vcd.active    = true;
+        g_vcd.force_all = true;
+    }
+}
+
+extern "C" void rt_vcd_all(void) {
+    if (g_vcd.active) {
+        g_vcd.force_all = true;
+    }
+}
+
+extern "C" void rt_vcd_dumpflush(void) {
+    if (g_vcd.file == nullptr) {
+        return;
+    }
+    // Hand off any buffered records and wait until the writer has drained
+    // everything, then push the file's own buffer to the OS. Waiting until the
+    // writer is idle means no write is in flight, so the fflush cannot race it.
+    vcd_handoff();
+    std::unique_lock<std::mutex> lk(vcd_mu);
+    vcd_cv_idle.wait(lk, [] { return vcd_ready.empty() && vcd_inflight == 0; });
+    vcd_flush_out();   // writer is idle -> no concurrent append into iobuf
+    std::fflush(g_vcd.file);
+}
+
+// Stop the writer thread and reset all threading state. Safe to call when no
+// thread was ever spawned (a $dumpvars that never ran).
+static void vcd_shutdown_writer() {
+    if (vcd_thread.joinable()) {
+        {
+            std::unique_lock<std::mutex> lk(vcd_mu);
+            vcd_stop = true;
+            vcd_cv_ready.notify_all();
+        }
+        vcd_thread.join();
+    }
+    while (!vcd_ready.empty()) {
+        vcd_ready.pop();
+    }
+    vcd_pool.clear();
+    vcd_inflight = 0;
+    vcd_stop     = false;
+}
+
+extern "C" void rt_vcd_close(void) {
+    if (g_vcd.file == nullptr) {
+        vcd_shutdown_writer();
+        g_vcd = VcdEngine{};
+        return;
+    }
+    if (g_vcd.active || g_vcd.pending_off) {
+        const uint64_t now = g_vcd.wheel != nullptr ? unwrap(g_vcd.wheel)->now() : 0;
+        rt_vcd_flush(now);
+    }
+    vcd_handoff();            // push the final partial buffer
+    vcd_shutdown_writer();    // drain + join the writer before touching the file
+    vcd_flush_out();          // writer joined -> flush the last rendered bytes
+    std::fflush(g_vcd.file);
+    std::fclose(g_vcd.file);
+    std::free(g_vcd.iobuf);
+    g_vcd = VcdEngine{};      // reset for the next simulation in this process
 }

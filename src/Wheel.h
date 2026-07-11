@@ -49,8 +49,18 @@ struct Timer {
 class WheelImpl {
 public:
     // Slot count: compile-time, a power of two and a multiple of 64 (so the
-    // occupancy bitfield is whole words). One revolution spans `slots` ticks.
-    static constexpr uint64_t slots = 256;
+    // occupancy bitfield is whole words). One revolution spans `slots` ticks; a
+    // delay within it is an O(1) slot insert, one beyond it spills into the
+    // O(log n) overflow heap. A wider window therefore keeps more concurrent
+    // timers on the fast path — e.g. many independent `always #p` toggles or
+    // clocking-block delays in a testbench, whose periods routinely exceed 256.
+    // The ceiling is the L1 working set: `advance` sweeps `now & mask` across
+    // every slot over a revolution, so the whole slots_ array is touched, and
+    // once it stops fitting in L1 the trivial single-clock case regresses (the
+    // clock microbench measured neutral at 1024 = 8 KiB of pointers, +7% at 2048,
+    // +8% at 4096). 1024 keeps the array L1-resident on a 32 KiB L1D while cutting
+    // the populated-wheel bench (512 concurrent prime-period timers) ~19%.
+    static constexpr uint64_t slots = 1024;
     static_assert((slots & (slots - 1)) == 0 && slots != 0, "slots must be a power of two");
     static_assert(slots % 64 == 0, "slots must be a multiple of 64");
 

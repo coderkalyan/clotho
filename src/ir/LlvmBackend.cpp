@@ -439,6 +439,10 @@ struct FrameSlot {
     llvm::Type* storage_ty = nullptr;
     // The local's interned IR type (aggregate recursion needs it).
     Ref ir_type = Ref::Invalid;
+    // A ref formal: the local has no real frame storage (its dead field is kept
+    // only so Local index == field index). Loads / stores redirect to the passed
+    // actual pointer, recorded in ref_ptr_ by the callee prologue.
+    bool is_ref = false;
 };
 
 // Raised on a construct the backend cannot lower; caught at the top level.
@@ -466,7 +470,9 @@ public:
             report_comb_fuse_stat();
         }
         compute_domain_spec();   // after fusion (thunk_group_): reads spec_group_ in lower_group
+        build_vcd_index();       // before build_nba_state: fills vcd_index_ / design_uses_vcd_
         build_wait_queues();
+        build_delay_event_thunks(); // after build_wait_queues: thunks read the event globals
         build_sched_flags();
         build_nba_state();
 
@@ -817,7 +823,7 @@ private:
         // through the analysis anyway.
         const std::vector<bool> may_z =
           config_.z_elision ? compute_may_z(mod_) : std::vector<bool>(sigs.size(), true);
-        const std::vector<bool> task_out = task_out_targets();
+        const std::vector<bool> ptr_arg = ptr_arg_signals();
         // Semantics, not optimization: computed regardless of config_.z_elision.
         // An undriven 4-state net powers up z (LRM 6.6); everything else x / 0.
         const std::vector<bool> undriven = compute_undriven(mod_);
@@ -863,7 +869,7 @@ private:
             // below (pool layout gives Domain::Two for floats).
             slot.is_real     = mod_.pool.is_float(leaf_type(sigs[i].type));
             slot.init_z      = undriven[i] && sigs[i].is_net && slot.four_state;
-            slot.has_z       = may_z[i] || task_out[i] || slot.init_z;
+            slot.has_z       = may_z[i] || ptr_arg[i] || slot.init_z;
             // A 2-state signal drops the packed must|may word for a genuine iW slot
             // (or `[N x { iW }]` memory). The only requirement is never-z: a 2-state
             // value carries no z, and has_z is forced only by a task out/inout target
@@ -1031,6 +1037,25 @@ private:
         const auto sigs = mod_.signals();
         for (size_t k = 0; k < ir.inst_count(); ++k) {
             const auto idx = static_cast<Index>(k);
+            if (ir.tag(idx) == Inst::Tag::EventTriggerNb) {
+                // `->> e` defers its wake to the NBA region; record the event so
+                // the region scans it. (Distinct events dedup; the list is tiny.)
+                const Signal sig = ir.payload(idx).signal;
+                if (std::find(nb_event_sigs_.begin(), nb_event_sigs_.end(), sig) == nb_event_sigs_.end()) {
+                    nb_event_sigs_.push_back(sig);
+                }
+                continue;
+            }
+            if (ir.tag(idx) == Inst::Tag::EventTriggerNbDelayed) {
+                // `->> #d e` schedules a detached wheel timer; record the event so
+                // a per-event on-expiry thunk is generated.
+                const Signal sig = ir.extra_data<EventDelayInfo>(ir.payload(idx).op_extra.extra).event;
+                if (std::find(nb_delay_event_sigs_.begin(), nb_delay_event_sigs_.end(), sig) ==
+                    nb_delay_event_sigs_.end()) {
+                    nb_delay_event_sigs_.push_back(sig);
+                }
+                continue;
+            }
             if (ir.tag(idx) != Inst::Tag::StoreNb) {
                 continue;
             }
@@ -1107,31 +1132,38 @@ private:
         }
     }
 
-    // Signals used as a task out/inout actual anywhere in the design. The task
-    // ABI passes `&signal.z` and stores through it at copy-out (emit_task_copyout),
-    // so such a signal must keep its z word even when proven never-z. A storage/
-    // ABI constraint, not a may-z fact, hence separate from compute_may_z.
-    // (An alternative — a caller-stack z scratch word for elided targets — is
-    // sound but adds a second mechanism for a rare construct.)
-    std::vector<bool> task_out_targets() const {
+    // Signals passed by pointer as a non-In (output / inout / ref) actual anywhere
+    // in the design, in a function `call` or a `task_call`. The pointer ABI reads /
+    // writes the signal's `{ i(2W), iW }` slot (copy-out stores through `&signal.z`;
+    // a ref aliases it live), so such a signal must keep its z word and packed form
+    // even when proven never-z. A storage/ABI constraint, not a may-z fact, hence
+    // separate from compute_may_z. (An alternative — a caller-stack z scratch word
+    // for elided targets — is sound but adds a second mechanism for a rare
+    // construct.)
+    std::vector<bool> ptr_arg_signals() const {
         std::vector<bool> out(mod_.signals().size(), false);
-        const auto        scan = [&](const Ir& ir) {
-            for (size_t k = 0; k < ir.inst_count(); ++k) {
-                const auto idx = static_cast<Index>(k);
-                if (ir.tag(idx) != Inst::Tag::TaskCall) {
+        const auto        mark = [&](const Ir& ir, FunctionId fid, ExtraSlice argslice) {
+            const Function& callee = mod_.function(fid);
+            const auto      args   = ir.region(argslice);
+            for (size_t a = 0; a < args.size(); ++a) {
+                if (callee.arg_dirs.empty() || callee.arg_dirs[a] == ArgDir::In) {
                     continue;
                 }
-                const auto      ti     = ir.extra_data<TaskCallInfo>(ir.payload(idx).extra);
-                const Function& callee = mod_.function(ti.func);
-                const auto      args   = ir.region(ti.args);
-                for (size_t a = 0; a < args.size(); ++a) {
-                    if (callee.arg_dirs[a] == ArgDir::In) {
-                        continue;
-                    }
-                    const Index root = lvalue_root(ir, args[a]).root;
-                    if (ir.tag(root) == Inst::Tag::Signal) {
-                        out[static_cast<uint32_t>(ir.payload(root).signal)] = true;
-                    }
+                const Index root = lvalue_root(ir, args[a]).root;
+                if (ir.tag(root) == Inst::Tag::Signal) {
+                    out[static_cast<uint32_t>(ir.payload(root).signal)] = true;
+                }
+            }
+        };
+        const auto scan = [&](const Ir& ir) {
+            for (size_t k = 0; k < ir.inst_count(); ++k) {
+                const auto idx = static_cast<Index>(k);
+                if (ir.tag(idx) == Inst::Tag::TaskCall) {
+                    const auto ti = ir.extra_data<TaskCallInfo>(ir.payload(idx).extra);
+                    mark(ir, ti.func, ti.args);
+                } else if (ir.tag(idx) == Inst::Tag::Call) {
+                    const auto ci = ir.extra_data<CallInfo>(ir.payload(idx).extra);
+                    mark(ir, ci.func, ci.args);
                 }
             }
         };
@@ -1213,6 +1245,24 @@ private:
         }
         return b_.CreateStructGEP(lv.slot_ty, lv.base, field);
     }
+    // Pointer to a ref actual's slot, passed to the callee as the aliased storage.
+    // A whole scalar is its slot pointer; an unpacked-array element is `&array[idx]`
+    // (its element slot). The selection must be a whole element — the callee GEPs it
+    // as a packed `{ i(2W), iW }` slot, with no bit/part offset. The frontend guards
+    // to these shapes (is_whole_ref_actual); this rejects anything else defensively.
+    llvm::Value* ref_actual_ptr(const LValue& lv) {
+        const bool whole = !lv.is_string && lv.range_mask == nullptr &&
+                           is_zero_const(lv.bit_off) && lv.width == lv.store_width;
+        if (!whole) {
+            throw BackendError{ "ref actual must be a whole variable or unpacked-array element" };
+        }
+        if (lv.array_ty != nullptr) {
+            llvm::Value* idx = lv.elem_idx != nullptr ? lv.elem_idx : b_.getInt32(0);
+            return b_.CreateInBoundsGEP(lv.array_ty, lv.base, { b_.getInt32(0), idx });
+        }
+        return lv.base;
+    }
+
     llvm::Value* lv_mm_ptr(const LValue& lv) {
         return lv_field_ptr(lv, 0);
     }
@@ -1547,11 +1597,22 @@ private:
         // a bare iW) instead of the packed (mm, z) pair. The wire is packed today —
         // a 2-state arg lifts to must==may with a constant-0 z, which LLVM folds —
         // so this is a call-ABI size micro-opt, not a correctness gap.
-        for (Ref pt : f.param_types) {
+        for (size_t k = 0; k < f.param_types.size(); ++k) {
+            const Ref     pt  = f.param_types[k];
+            const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
+            if (dir == ArgDir::Ref) {
+                params.push_back(ptr); // one pointer to the actual's packed slot
+                continue;
+            }
+            if (dir == ArgDir::Out || dir == ArgDir::Inout) {
+                params.push_back(ptr); // &caller_temp.mm
+                params.push_back(ptr); // &caller_temp.z (copy-out at each return)
+                continue;
+            }
             if (is_string_type(pt) || contains_struct(pt)) {
-                // A string handle or an aggregate's storage passes by pointer; the
-                // callee copy-in gives value semantics (an out/inout aggregate is
-                // written back through the same pointer).
+                // A string handle or an aggregate's storage passes by pointer (In
+                // only — the frontend guards aggregate out/inout formals); the
+                // callee copy-in gives value semantics.
                 params.push_back(ptr);
                 continue;
             }
@@ -1588,7 +1649,9 @@ private:
         params.push_back(ptr); // state
         params.push_back(ptr); // wheel
         for (size_t k = 0; k < f.param_types.size(); ++k) {
-            if (f.arg_dirs[k] == ArgDir::In) {
+            if (f.arg_dirs[k] == ArgDir::Ref) {
+                params.push_back(ptr); // one pointer to the actual's packed slot
+            } else if (f.arg_dirs[k] == ArgDir::In) {
                 if (is_string_type(f.param_types[k])) {
                     params.push_back(ptr); // rt_string handle
                     continue;
@@ -1616,17 +1679,26 @@ private:
     // functions start after `state`, tasks after `state, wheel`; a string input
     // formal is one ptr, everything else two params. Replaces a fixed
     // 1 + 2k / 2 + 2k stride, which string formals break.
+    // Whether formal k occupies a single LLVM parameter (a ref pointer, or a
+    // string input handle) rather than the (mm, z) pair every other formal uses.
+    bool one_param_formal(const Function& f, size_t k) const {
+        if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
+            return true;
+        }
+        // An aggregate is one pointer (In only — out/inout aggregates are guarded).
+        if (contains_struct(f.param_types[k])) {
+            return true;
+        }
+        return is_string_type(f.param_types[k]) &&
+               (!f.is_task || f.arg_dirs[k] == ArgDir::In);
+    }
+
     std::vector<uint32_t> param_indices(const Function& f) const {
         std::vector<uint32_t> idx(f.param_types.size());
         uint32_t              cur = f.is_task ? 2 : 1;
         for (size_t k = 0; k < f.param_types.size(); ++k) {
             idx[k] = cur;
-            // An aggregate is always one pointer (both directions). A string input
-            // is one pointer; a string out/inout task formal keeps the two-ptr form.
-            const bool one =
-              contains_struct(f.param_types[k]) ||
-              (is_string_type(f.param_types[k]) && (!f.is_task || f.arg_dirs[k] == ArgDir::In));
-            cur += one ? 1 : 2;
+            cur += one_param_formal(f, k) ? 1 : 2;
         }
         return idx;
     }
@@ -1637,36 +1709,41 @@ private:
         if (idx.empty()) {
             return 2;
         }
-        const bool last_string =
-          is_string_type(f.param_types.back()) && f.arg_dirs.back() == ArgDir::In;
-        return idx.back() + (last_string ? 1 : 2);
+        return idx.back() + (one_param_formal(f, f.param_types.size() - 1) ? 1 : 2);
     }
 
     // Build a function's frame struct: one slot field per local, in Local-handle
     // order (a Local's index is its GEP field index).
-    // Locals passed as a task-call output / inout argument: the callee writes them
-    // back through the packed-word pointer ABI, so they cannot use the narrow iW
-    // slot (they stay packed, like an out-target signal). Functions never write
-    // back (their outputs are by-value and dropped), so only task calls matter.
+    // Locals that cannot use the narrow iW slot (they stay packed `{ i(2W), iW }`):
+    //   - passed as a task-call output / inout argument (the callee writes them back
+    //     through the packed-word pointer ABI), or
+    //   - passed as a ref argument to a function or task (the callee GEPs the passed
+    //     pointer with a packed slot type; the actual's storage must match).
+    // A plain function's own outputs are by-value and dropped, so only these apply.
     std::vector<bool> frame_out_targets(const Function& f) const {
         std::vector<bool> out(f.local_types.size(), false);
         const Ir&         ir = f.ir;
-        for (size_t k = 0; k < ir.inst_count(); ++k) {
-            const auto idx = static_cast<Index>(k);
-            if (ir.tag(idx) != Inst::Tag::TaskCall) {
-                continue;
-            }
-            const auto      ti     = ir.extra_data<TaskCallInfo>(ir.payload(idx).extra);
-            const Function& callee = mod_.function(ti.func);
-            const auto      args   = ir.region(ti.args);
+        const auto        mark_packed_args = [&](FunctionId fid, ExtraSlice argslice) {
+            const Function& callee = mod_.function(fid);
+            const auto      args   = ir.region(argslice);
             for (size_t a = 0; a < args.size(); ++a) {
-                if (callee.arg_dirs[a] == ArgDir::In) {
+                if (callee.arg_dirs.empty() || callee.arg_dirs[a] == ArgDir::In) {
                     continue;
                 }
                 const Index root = lvalue_root(ir, args[a]).root;
                 if (ir.tag(root) == Inst::Tag::Local) {
                     out[ir.payload(root).local.index] = true;
                 }
+            }
+        };
+        for (size_t k = 0; k < ir.inst_count(); ++k) {
+            const auto idx = static_cast<Index>(k);
+            if (ir.tag(idx) == Inst::Tag::TaskCall) {
+                const auto ti = ir.extra_data<TaskCallInfo>(ir.payload(idx).extra);
+                mark_packed_args(ti.func, ti.args);
+            } else if (ir.tag(idx) == Inst::Tag::Call) {
+                const auto ci = ir.extra_data<CallInfo>(ir.payload(idx).extra);
+                mark_packed_args(ci.func, ci.args);
             }
         }
         return out;
@@ -1675,6 +1752,7 @@ private:
     void build_frame_layout(const Function& f) {
         const size_t n = f.local_types.size();
         frame_slots_.assign(n, FrameSlot{});
+        ref_ptr_.assign(n, nullptr);
         const std::vector<bool>  out_target = frame_out_targets(f);
         std::vector<llvm::Type*> fields(n);
         for (uint32_t i = 0; i < n; ++i) {
@@ -1682,6 +1760,11 @@ private:
             frame_slots_[i].ir_type    = f.local_types[i];
             frame_slots_[i].width      = lay.width == 0 ? 1 : lay.width;
             frame_slots_[i].four_state = lay.domain == Domain::Four;
+            // A ref formal (local k for formal k) has no own storage: its dead field
+            // is kept for index alignment and loads / stores redirect to the passed
+            // actual pointer. The redirect GEPs a packed slot, so force one here.
+            const bool is_ref_formal = i < f.arg_dirs.size() && f.arg_dirs[i] == ArgDir::Ref;
+            frame_slots_[i].is_ref   = is_ref_formal;
             if (contains_struct(f.local_types[i])) {
                 frame_slots_[i].is_agg     = true;
                 frame_slots_[i].storage_ty = agg_storage_ty(f.local_types[i]);
@@ -1697,9 +1780,9 @@ private:
             // A 2-state local uses the genuine iW slot; the packed-word ABI wire is
             // bridged by copy-in/out. A 4-state local keeps its z field (the ABI and
             // copy-in/out use it; LLVM folds the zero-z traffic on its own). A local
-            // passed as a task out/inout target stays packed — the callee writes it
-            // back through the packed-word pointer ABI.
-            frame_slots_[i].narrow  = !frame_slots_[i].four_state && !out_target[i];
+            // passed as a task out/inout target — or a ref formal / ref actual — stays
+            // packed (the packed-word pointer ABI writes it back / aliases it).
+            frame_slots_[i].narrow  = !frame_slots_[i].four_state && !out_target[i] && !is_ref_formal;
             // A non-narrow slot keeps its z field: a 4-state local needs it, and a
             // packed 2-state out-target local is written back through the (mm, z)
             // pointer ABI. A narrow local has no z.
@@ -1716,6 +1799,10 @@ private:
     void init_frame() {
         for (uint32_t i = 0; i < frame_slots_.size(); ++i) {
             const FrameSlot& s    = frame_slots_[i];
+            // A ref formal's field is dead (accesses redirect to the actual); no init.
+            if (s.is_ref) {
+                continue;
+            }
             llvm::Value*     slot = b_.CreateStructGEP(frame_ty_, frame_, i);
             if (s.is_agg) {
                 // Recursive fill (X into 4-state leaves, init string leaves); an
@@ -1781,11 +1868,15 @@ private:
         init_frame();
         emit_fn_agg_copyin(f);
         build_str_temps();
+        bind_ref_formals(f);
+        emit_copyin(f);
 
         lower_region(ir_->root());
         // The frontend appends a trailing Ret, so the entry path always terminates;
-        // guard defensively in case a body lowered to nothing.
+        // guard defensively in case a body lowered to nothing (an implicit return
+        // still copies output / inout formals back).
         if (b_.GetInsertBlock()->getTerminator() == nullptr) {
+            emit_copyout(f);
             deinit_body_strings();
             if (is_void(f.return_type)) {
                 b_.CreateRetVoid();
@@ -1914,7 +2005,8 @@ private:
         b_.SetInsertPoint(start_bb);
         init_frame();
         build_str_temps();
-        emit_task_copyin(f);
+        bind_ref_formals(f);
+        emit_copyin(f);
         lower_region(ir_->root());
         branch_to(epilogue_bb);
 
@@ -1925,7 +2017,7 @@ private:
         // enqueued; in the blocked path the caller stored its handle before
         // suspending, so we push it onto the active queue here.
         b_.SetInsertPoint(epilogue_bb);
-        emit_task_copyout(f);
+        emit_copyout(f);
         deinit_body_strings(); // string locals + temps die with the call
         llvm::Value* parent = b_.CreateLoad(ptr_ty, fn_->getArg(task_record_param(f)));
         auto*        has_bb = llvm::BasicBlock::Create(ctx_, "task.wake", fn_);
@@ -1949,13 +2041,34 @@ private:
         task_epilogue_bb_ = nullptr;
     }
 
-    // Prologue: copy each formal's parameter into its frame Local (Local k == formal
-    // k). Inputs read their value planes; inouts load through their caller pointer;
-    // outputs keep the frame's default (X / 0) until the body assigns them.
-    void emit_task_copyin(const Function& f) {
+    // Record each ref formal's passed actual pointer into ref_ptr_ (Local k == formal
+    // k), so local_lvalue aliases the actual's storage live. Called in the callee
+    // prologue of both functions and tasks. A ref formal takes no copy-in / copy-out.
+    void bind_ref_formals(const Function& f) {
         for (uint32_t k = 0; k < f.param_types.size(); ++k) {
+            if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
+                ref_ptr_[k] = fn_->getArg(param_llvm_index_[k]);
+            }
+        }
+    }
+
+    // Prologue (function and task): copy each formal's parameter into its frame
+    // Local (Local k == formal k). Inputs read their value planes; inouts load
+    // through their caller pointer; outputs keep the frame's default (X / 0) until
+    // the body assigns them. Ref formals are bound separately (bind_ref_formals) and
+    // skipped here.
+    void emit_copyin(const Function& f) {
+        for (uint32_t k = 0; k < f.param_types.size(); ++k) {
+            // An aggregate formal is passed by pointer and copied in by
+            // emit_fn_agg_copyin (functions only; aggregate task args are guarded).
+            if (contains_struct(f.param_types[k])) {
+                continue;
+            }
             const uint32_t w    = width_of(f.param_types[k]);
             const uint32_t base = param_llvm_index_[k];
+            if (f.arg_dirs[k] == ArgDir::Ref) {
+                continue;
+            }
             if (f.arg_dirs[k] == ArgDir::In) {
                 if (is_string_type(f.param_types[k])) {
                     // Deep copy the caller's handle into the frame local (value
@@ -1973,11 +2086,13 @@ private:
         }
     }
 
-    // Epilogue: copy each output / inout formal's frame Local back through its
-    // caller pointer (LRM 13.5 copy-out at completion).
-    void emit_task_copyout(const Function& f) {
+    // Copy each output / inout formal's frame Local back through its caller pointer
+    // (LRM 13.5 copy-out at completion). For a task this runs once in the completion
+    // epilogue; for a function it runs before every `ret` (each return point).
+    void emit_copyout(const Function& f) {
         for (uint32_t k = 0; k < f.param_types.size(); ++k) {
-            if (f.arg_dirs[k] == ArgDir::In) {
+            // In needs no copy-out; a ref formal is live (aliased), never copied back.
+            if (f.arg_dirs[k] == ArgDir::In || f.arg_dirs[k] == ArgDir::Ref) {
                 continue;
             }
             const uint32_t base = param_llvm_index_[k];
@@ -2095,9 +2210,10 @@ private:
     void emit_delay_timer(llvm::Value* ticks) {
         auto* aw = awaiter();
         b_.CreateStore(hdl_, b_.CreateStructGEP(awaiter_ty(), aw, 2));
-        llvm::Value* now      = b_.CreateCall(wheel_now_fn(), { wheel_ });
-        llvm::Value* deadline = b_.CreateAdd(now, ticks);
-        b_.CreateCall(wheel_schedule_fn(), { wheel_, aw, deadline, enqueue_trampoline() });
+        // Schedule-relative: the runtime adds `now` so this #delay crosses the ABI
+        // once (rt_wheel_schedule_rel) rather than twice (rt_wheel_now then
+        // rt_wheel_schedule).
+        b_.CreateCall(wheel_schedule_rel_fn(), { wheel_, aw, ticks, enqueue_trampoline() });
     }
 
     // Store a { handle, flag_ptr } entry at a chosen slot of a queue array. The
@@ -2404,10 +2520,28 @@ private:
         wait_dyn_ty_.assign(sigs.size(), { nullptr, nullptr, nullptr });
         wait_dyn_len_gv_.assign(sigs.size(), { nullptr, nullptr, nullptr });
         sta_next_.assign(sigs.size(), { 0, 0, 0 });
+        event_trig_gv_.assign(sigs.size(), nullptr);
+        event_pending_gv_.assign(sigs.size(), nullptr);
 
+        auto* i8   = llvm::Type::getInt8Ty(ctx_);
         auto* i32  = llvm::Type::getInt32Ty(ctx_);
+        auto* i64  = llvm::Type::getInt64Ty(ctx_);
         auto* elem = wait_elem_ty();
         for (uint32_t i = 0; i < sigs.size(); ++i) {
+            if (sigs[i].is_event) {
+                // Never-triggered sentinel: UINT64_MAX never equals a real tick,
+                // so `.triggered` reads 0 until the first `-> e`.
+                event_trig_gv_[i] = new llvm::GlobalVariable(
+                  llmod_, i64, false, llvm::GlobalValue::InternalLinkage,
+                  llvm::ConstantInt::get(i64, ~uint64_t{ 0 }),
+                  "clotho.event_trig." + sigs[i].name);
+                // Nonblocking-trigger pending flag (`->> e`), cleared in the NBA
+                // region. Allocated for every event; the NBA scan only visits the
+                // ones actually `->>`-triggered (nb_event_sigs_).
+                event_pending_gv_[i] = new llvm::GlobalVariable(
+                  llmod_, i8, false, llvm::GlobalValue::InternalLinkage,
+                  llvm::ConstantInt::get(i8, 0), "clotho.event_pending." + sigs[i].name);
+            }
             for (uint32_t e = 0; e < 3; ++e) {
                 const std::string base = "clotho.wait." + sigs[i].name + "." ;
                 if (c.sta[i][e] > 0) {
@@ -2664,6 +2798,14 @@ private:
                 case Inst::Tag::Delay:
                 case Inst::Tag::Wait:
                 case Inst::Tag::TaskCall:
+                // A named-event trigger has a scheduling side effect (it wakes
+                // waiters) and `.triggered` reads per-event state outside the
+                // pure-function-of-signal-reads model that thunk elision and comb
+                // fusion assume, so keep an event-touching process a coroutine.
+                case Inst::Tag::EventTrigger:
+                case Inst::Tag::EventTriggerNb:
+                case Inst::Tag::EventTriggerNbDelayed:
+                case Inst::Tag::EventTriggered:
                     return false;
                 case Inst::Tag::Store: {
                     const LvalueRoot r = lvalue_root(p.ir, p.ir.payload(idx).binary.l);
@@ -3364,6 +3506,7 @@ private:
                 case Inst::Tag::Display:
                 case Inst::Tag::Finish:
                 case Inst::Tag::CaseViol:
+                case Inst::Tag::Severity:
                 case Inst::Tag::Fflush:
                 case Inst::Tag::Fclose:
                 case Inst::Tag::Fopen:
@@ -3513,11 +3656,19 @@ private:
         // (storage_ptr / shadow_ptr), so no byte offsets are baked here.
         auto*                        nullp = llvm::ConstantPointerNull::get(ptr);
         std::vector<llvm::Constant*> metas;
+        // Parallel to `metas` (nba_id order): the dump-var index of each NBA-target
+        // signal, or -1 when it is not a dumped scalar. Read in the commit loop to
+        // mark the signal in the VCD dirty set.
+        std::vector<llvm::Constant*> nba_vcd;
         for (uint32_t i = 0; i < sigs.size(); ++i) {
             const SignalSlot& s = slots_[i];
             if (!s.nba) {
                 continue;
             }
+            // Parallel to metas: this NBA target's dump-var index, or -1 when it is
+            // not a dumped scalar. The commit loop reads it to mark the signal dirty.
+            nba_vcd.push_back(llvm::ConstantInt::get(
+              i32, static_cast<uint64_t>(static_cast<int64_t>(design_uses_vcd_ ? vcd_index_[i] : -1))));
             std::array<llvm::Constant*, 3> sb{}, sc{}, db{}, dl{};
             for (uint32_t e = 0; e < 3; ++e) {
                 sb[e] = wait_sta_gv_[i][e] ? llvm::cast<llvm::Constant>(wait_sta_gv_[i][e]) : nullp;
@@ -3535,6 +3686,14 @@ private:
         nba_meta_arr_ty_ = llvm::ArrayType::get(nba_meta_ty_, metas.size());
         nba_meta_gv_     = new llvm::GlobalVariable(llmod_, nba_meta_arr_ty_, true, llvm::GlobalValue::InternalLinkage,
                                                     llvm::ConstantArray::get(nba_meta_arr_ty_, metas), "clotho.nba_meta");
+
+        // Parallel dump-var index array (nba_id order), consumed by the commit loop
+        // to mark committed signals dirty in the VCD dirty set.
+        if (design_uses_vcd_ && !nba_vcd.empty()) {
+            auto* ty    = llvm::ArrayType::get(i32, nba_vcd.size());
+            nba_vcd_gv_ = new llvm::GlobalVariable(llmod_, ty, true, llvm::GlobalValue::InternalLinkage,
+                                                   llvm::ConstantArray::get(ty, nba_vcd), "clotho.nba_vcd");
+        }
 
         // Declare the block-commit enqueue stub up front so StoreNb lowering can call
         // it (its body + the worklist/pending globals are emitted post-lowering by
@@ -3692,6 +3851,15 @@ private:
                 llvm::Value* meta = b_.CreateInBoundsGEP(nba_meta_arr_ty_, nba_meta_gv_,
                                                          { b_.getInt32(0), b_.getInt32(s.nba_id) });
                 emit_nba_service(meta, old_mm, new_mm, W, s.narrow, old_z, new_z);
+            }
+            // Mark a dumped scalar target dirty in the VCD set (rt_vcd_touch ignores
+            // the -1 index of a non-dumped signal). Commit is unconditional, so a
+            // no-change commit over-touches; the flush diff suppresses it.
+            if (design_uses_vcd_ && nba_vcd_gv_ != nullptr) {
+                llvm::Value* vidx = b_.CreateLoad(
+                  b_.getInt32Ty(), b_.CreateInBoundsGEP(nba_vcd_gv_->getValueType(), nba_vcd_gv_,
+                                                        { b_.getInt32(0), b_.getInt32(s.nba_id) }));
+                b_.CreateCall(vcd_touch_fn(), { vidx });
             }
         }
     }
@@ -3891,6 +4059,9 @@ private:
             service_wait_queue(lv.sig, old.mm, load_lv_mm(lv), old.z,
                                old.z != nullptr ? load_lv_z(lv) : nullptr);
         }
+        // Mark the signal changed for the VCD dirty set. Independent of wait-queue
+        // servicing: a dumped signal with no waiters still needs a touch.
+        vcd_touch_lvalue(lv);
     }
 
     // One old -> new transition's wake facts: which edge buckets fire. A fact is
@@ -4024,6 +4195,66 @@ private:
     void service_dynamic_queue(Signal sig, uint32_t edge) {
         const auto i = static_cast<uint32_t>(sig);
         emit_dynamic_scan_rt(wait_dyn_gv_[i][edge], wait_dyn_len_gv_[i][edge]);
+    }
+
+    // Lower `-> e` (LRM 15.5.2): stamp the current sim tick into the event's
+    // trigger timestamp (so `.triggered` reads 1 for the rest of the step) and
+    // wake every waiter now. A named event has no value, so — unlike a signal
+    // store — there is no edge computation: it services the Any-edge static and
+    // dynamic queues unconditionally. `@(e)` and `always @(e)` both subscribe the
+    // Any bucket (edge None -> Any), so this reaches every waiter.
+    void lower_event_trigger(Signal sig) {
+        emit_event_fire(sig, wheel_);
+    }
+
+    // Generate a detached on-expiry thunk per `->> #d e` target event. The wheel
+    // calls it as on_expire(rt_timer* t, void* ctx) with ctx == the wheel (see the
+    // drain's rt_wheel_advance ctx); it stamps the event's trigger time and
+    // services its waiters, then frees the timer node the schedule site allocated.
+    void build_delay_event_thunks() {
+        event_delay_thunk_.assign(mod_.signals().size(), nullptr);
+        if (nb_delay_event_sigs_.empty()) {
+            return;
+        }
+        auto* ptr  = raw_ptr_ty();
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
+        for (const Signal sig : nb_delay_event_sigs_) {
+            const auto i  = static_cast<uint32_t>(sig);
+            auto*      fn = llvm::Function::Create(fnty, llvm::Function::InternalLinkage,
+                                                   "clotho.ev_delay." + mod_.signal(sig).name, llmod_);
+            event_delay_thunk_[i] = fn;
+            b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn));
+            emit_event_fire(sig, fn->getArg(1));         // ctx (arg 1) is the wheel
+            b_.CreateCall(free_fn(), { fn->getArg(0) }); // free the detached timer node
+            b_.CreateRetVoid();
+        }
+    }
+
+    // Stamp event `sig`'s trigger time (from `wheel`) and service its Any-edge
+    // static/dynamic wait queues. Shared by `-> e` in a process body (wheel_) and
+    // the NBA-region `->> e` service (the drain's local wheel — wheel_ is stale
+    // there, so it must be passed in).
+    void emit_event_fire(Signal sig, llvm::Value* wheel) {
+        const auto   i   = static_cast<uint32_t>(sig);
+        llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel });
+        b_.CreateStore(now, event_trig_gv_[i]);
+        const auto any = static_cast<uint32_t>(Edge::Any);
+        if (wait_sta_gv_[i][any] != nullptr) {
+            service_static_queue(sig, any);
+        }
+        if (wait_dyn_gv_[i][any] != nullptr) {
+            service_dynamic_queue(sig, any);
+        }
+    }
+
+    // Lower `e.triggered` (LRM 15.5.3) to a definite 2-state 1-bit: 1 iff the last
+    // trigger tick equals the current tick (true across all delta cycles of the
+    // step, false once time advances — no per-step reset needed).
+    Plane lower_event_triggered(Signal sig) {
+        const auto   i     = static_cast<uint32_t>(sig);
+        llvm::Value* stamp = b_.CreateLoad(b_.getInt64Ty(), event_trig_gv_[i]);
+        llvm::Value* now   = b_.CreateCall(wheel_now_fn(), { wheel_ });
+        return { b_.CreateICmpEQ(stamp, now), nullptr, true };
     }
 
     // Compacting removal of this coroutine's entries from one (signal, edge)
@@ -4308,9 +4539,10 @@ private:
     // runs together. Repeat until no timers remain.
     void emit_active_run(llvm::Value* state, llvm::Value* wheel, const std::vector<llvm::Function*>& procs) {
         ensure_active_queue();
-        auto* ptr_ty    = llvm::PointerType::getUnqual(ctx_);
-        auto* i32       = b_.getInt32Ty();
-        auto* proc_fnty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
+        auto* ptr_ty        = llvm::PointerType::getUnqual(ctx_);
+        auto* i32           = b_.getInt32Ty();
+        auto* proc_fnty     = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
+        const bool uses_vcd = design_uses_vcd();
 
         // Init: empty the stack, then create every process (the ramp call builds
         // the frame and stops at the initial suspend, no body yet).
@@ -4434,7 +4666,6 @@ private:
         auto* wcheck  = llvm::BasicBlock::Create(ctx_, "wheel.check", fn);
         auto* wtick   = llvm::BasicBlock::Create(ctx_, "wheel.tick", fn);
         auto* wdone   = llvm::BasicBlock::Create(ctx_, "wheel.done", fn);
-        auto* null    = llvm::ConstantPointerNull::get(ptr_ty);
         // Any thunk group present means the active queue can carry tagged thunk
         // pointers, so the drain must discriminate; a coro-only design keeps the
         // straight resume path (no per-pop tag test).
@@ -4445,7 +4676,8 @@ private:
         // the active queue drains; if any update is staged it commits them all and
         // re-drains the active queue at the SAME instant; otherwise it falls through
         // to the wheel. So active and NBA iterate until both settle before time moves.
-        const bool has_nba = !array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !block_commits_.empty();
+        const bool has_nba = !array_nba_sigs_.empty() || !agg_nba_sigs_.empty() ||
+                             !block_commits_.empty() || !nb_event_sigs_.empty();
         auto*      ncheck  = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.check", fn) : wcheck;
         auto*      ncommit = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.commit", fn) : nullptr;
         // Inactive region: only when the design has a #0. When the active queue
@@ -4546,6 +4778,11 @@ private:
                 any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateLoad(ptr_ty, block_head_gv_),
                                                        llvm::ConstantPointerNull::get(ptr_ty)));
             }
+            for (const Signal sig : nb_event_sigs_) {
+                // A pending `->> e` this instant.
+                llvm::Value* pend = b_.CreateLoad(b_.getInt8Ty(), event_pending_gv_[static_cast<uint32_t>(sig)]);
+                any = b_.CreateOr(any, b_.CreateICmpNE(pend, b_.getInt8(0)));
+            }
             b_.CreateCondBr(any, ncommit, wcheck);
 
             b_.SetInsertPoint(ncommit);
@@ -4574,23 +4811,74 @@ private:
                 for (const Signal sig : agg_nba_sigs_) {
                     emit_agg_array_commit(sig, state);
                 }
+                // VCD: touch each dumped array that took an NBA write this instant,
+                // so the flush scans its elements only on write instants (not every
+                // instant). The runtime queue has no per-element index, so touch the
+                // whole element range; the flush diff still emits only what changed.
+                if (uses_vcd) {
+                    for (const Signal sig : array_nba_sigs_) {
+                        if (vcd_index_[static_cast<uint32_t>(sig)] < 0) {
+                            continue;
+                        }
+                        auto* fn     = b_.GetInsertBlock()->getParent();
+                        auto* svc    = llvm::BasicBlock::Create(ctx_, "vcd.arr.svc", fn);
+                        auto* nextbb = llvm::BasicBlock::Create(ctx_, "vcd.arr.next", fn);
+                        // Nonzero record count == the array took writes this instant
+                        // (records are not reset until nba_arr_reset below).
+                        auto* dirty  = b_.CreateCall(nba_arr_count_fn(), { b_.getInt32(arr_idx(sig)) });
+                        b_.CreateCondBr(b_.CreateICmpNE(dirty, b_.getInt32(0)), svc, nextbb);
+                        b_.SetInsertPoint(svc);
+                        vcd_touch_array(sig);
+                        b_.CreateBr(nextbb);
+                        b_.SetInsertPoint(nextbb);
+                    }
+                }
                 b_.CreateCall(nba_arr_reset_fn(), {});
+            }
+            // Nonblocking event triggers (`->> e`, LRM 15.5.4): for each pending
+            // event, stamp the trigger time and wake its Any-edge waiters, then
+            // clear the flag. Done in the NBA region so the wake lands after this
+            // instant's nonblocking updates; the loop-back to `check` then drains
+            // the woken waiters.
+            for (const Signal sig : nb_event_sigs_) {
+                const auto   i    = static_cast<uint32_t>(sig);
+                auto*        cfn  = b_.GetInsertBlock()->getParent();
+                auto*        fire = llvm::BasicBlock::Create(ctx_, "nbev.fire", cfn);
+                auto*        skip = llvm::BasicBlock::Create(ctx_, "nbev.skip", cfn);
+                llvm::Value* pend = b_.CreateLoad(b_.getInt8Ty(), event_pending_gv_[i]);
+                b_.CreateCondBr(b_.CreateICmpNE(pend, b_.getInt8(0)), fire, skip);
+                b_.SetInsertPoint(fire);
+                b_.CreateStore(b_.getInt8(0), event_pending_gv_[i]);
+                emit_event_fire(sig, wheel); // stamp now + service Any static/dynamic queues
+                b_.CreateBr(skip);
+                b_.SetInsertPoint(skip);
             }
             b_.CreateBr(check);
         }
 
-        // Queue empty: advance one instant (firing any timers, which enqueue their
-        // handles) and re-drain. rt_wheel_advance folds the pending-check into the
-        // tick — one ABI crossing per timestep, no separate occupancy scan — and
-        // returns non-zero iff it fired something (an idle wheel ends the sim).
+        // Queue empty: this instant has fully settled. Sample the VCD dump at the
+        // current time (the postponed region, LRM §21.7) before the wheel advances,
+        // so each variable's final settled value is recorded once per instant.
         b_.SetInsertPoint(wcheck);
-        llvm::Value* ticked = b_.CreateCall(wheel_advance_fn(), { wheel, null });
+        if (uses_vcd) {
+            b_.CreateCall(vcd_flush_fn(), { b_.CreateCall(wheel_now_fn(), { wheel }) });
+        }
+        // Advance one instant (firing any timers, which enqueue their handles) and
+        // re-drain. rt_wheel_advance folds the pending-check into the tick — one ABI
+        // crossing per timestep, no separate occupancy scan — and returns non-zero
+        // iff it fired something (an idle wheel ends the sim). The tick ctx is the
+        // wheel: coroutine-timer trampolines ignore it, but a detached `->> #d e`
+        // on-expiry thunk reads the current time from it (build_delay_event_thunks).
+        llvm::Value* ticked = b_.CreateCall(wheel_advance_fn(), { wheel, wheel });
         b_.CreateCondBr(b_.CreateICmpNE(ticked, b_.getInt32(0)), check, wdone);
 
         b_.SetInsertPoint(wtick); // unreachable now; kept so block wiring stays valid
         b_.CreateBr(wdone);
 
         b_.SetInsertPoint(wdone);
+        if (uses_vcd) {
+            b_.CreateCall(vcd_close_fn(), {});
+        }
     }
 
     // -- Coroutine intrinsics / frame allocator --
@@ -4706,10 +4994,12 @@ private:
     llvm::FunctionCallee str_upper_fn() {
         return rt_fn("rt_string_toupper", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
+    // void rt_enum_name(rt_string* dst, const u8* val, u32 vbytes, u32 count,
+    //                   const u8* values, const char* const* names, const u32* lens)
     llvm::FunctionCallee enum_name_fn() {
         return rt_fn("rt_enum_name", b_.getVoidTy(),
-                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty(),
-                       raw_ptr_ty() });
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(),
+                       raw_ptr_ty(), raw_ptr_ty() });
     }
     llvm::FunctionCallee str_lower_fn() {
         return rt_fn("rt_string_tolower", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
@@ -4776,6 +5066,11 @@ private:
     // void rt_wheel_schedule(rt_wheel*, rt_timer*, i64 deadline, rt_timer_fn)
     llvm::FunctionCallee wheel_schedule_fn() {
         return rt_fn("rt_wheel_schedule", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
+    }
+    // void rt_wheel_schedule_rel(rt_wheel*, rt_timer*, i64 delay, rt_timer_fn)
+    llvm::FunctionCallee wheel_schedule_rel_fn() {
+        return rt_fn("rt_wheel_schedule_rel", b_.getVoidTy(),
                      { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
     }
     // void rt_wheel_tick(rt_wheel*, void* ctx)
@@ -5126,6 +5421,9 @@ private:
                 return type_of(p.unary);
             case Inst::Tag::SimTime:
                 return { 64, false, false };
+            case Inst::Tag::EventTriggered:
+                // `e.triggered` (LRM 15.5.3): a definite 2-state 1-bit `bit`.
+                return { 1, false, false };
             case Inst::Tag::Random:
                 return { 32, false, true };
             case Inst::Tag::Clog2:
@@ -5151,6 +5449,10 @@ private:
             case Inst::Tag::FreadWord:
             case Inst::Tag::FreadMem:
                 // The file read / positioning / error / scan functions return i32.
+                return { 32, false, true };
+            case Inst::Tag::TestPlusArgs:
+            case Inst::Tag::ValuePlusArgs:
+                // LRM §21.6: an always-known (never x/z) boolean 'int'.
                 return { 32, false, true };
 
             case Inst::Tag::Add:
@@ -5293,11 +5595,21 @@ private:
             case Inst::Tag::TimeFormat:
             case Inst::Tag::Finish:
             case Inst::Tag::CaseViol:
+            case Inst::Tag::Severity:
             case Inst::Tag::Fflush:
             case Inst::Tag::Fclose:
             case Inst::Tag::Sformat:
             case Inst::Tag::ReadMem:
             case Inst::Tag::TaskCall:
+            case Inst::Tag::DumpFile:
+            case Inst::Tag::DumpVars:
+            case Inst::Tag::DumpOff:
+            case Inst::Tag::DumpOn:
+            case Inst::Tag::DumpAll:
+            case Inst::Tag::DumpFlush:
+            case Inst::Tag::EventTrigger:
+            case Inst::Tag::EventTriggerNb:
+            case Inst::Tag::EventTriggerNbDelayed:
                 return { 0, false, false };
         }
         return { 0, false, false };
@@ -5956,39 +6268,41 @@ private:
                 return;
             }
             case Inst::Tag::EnumName: {
-                // Materialize the member table as three parallel read-only globals
-                // (values / name pointers / lengths) and let the runtime scan it.
-                const auto     info   = ir_->extra_data<EnumNameInfo>(p.op_extra.extra);
-                const auto     start  = static_cast<uint32_t>(info.entries.start);
-                const auto     end    = static_cast<uint32_t>(info.entries.end);
+                // Materialize the member table: one contiguous value-bytes blob
+                // plus parallel name-pointer / length globals, then let the runtime
+                // byte-compare the operand's must plane against each member value.
+                const auto         info   = ir_->extra_data<EnumNameInfo>(p.op_extra.extra);
+                const auto         start  = static_cast<uint32_t>(info.entries.start);
+                const auto         end    = static_cast<uint32_t>(info.entries.end);
                 constexpr uint32_t stride = sizeof(EnumNameEntry) / sizeof(uint32_t);
-                llvm::Type* const i64  = b_.getInt64Ty();
-                llvm::Type* const i32  = b_.getInt32Ty();
-                std::vector<llvm::Constant*> vals, names, lens;
+                llvm::Type* const  i32    = b_.getInt32Ty();
+                std::string                  blob; // count * vbytes value bytes
+                std::vector<llvm::Constant*> names, lens;
+                uint32_t                     vbytes = 0;
                 for (uint32_t w = start; w < end; w += stride) {
-                    const auto     e = ir_->extra_data<EnumNameEntry>(static_cast<ExtraIndex>(w));
-                    const uint64_t v =
-                      static_cast<uint64_t>(e.val_lo) | (static_cast<uint64_t>(e.val_hi) << 32);
-                    vals.push_back(llvm::ConstantInt::get(i64, v));
+                    const auto e = ir_->extra_data<EnumNameEntry>(static_cast<ExtraIndex>(w));
+                    vbytes       = e.val_len;
+                    blob += ir_->extra_bytes(e.val_at, e.val_len);
                     names.push_back(b_.CreateGlobalString(ir_->extra_bytes(e.name_at, e.name_len)));
                     lens.push_back(llvm::ConstantInt::get(i32, e.name_len));
                 }
-                const auto count   = static_cast<uint32_t>(vals.size());
-                auto*      val_arr = llvm::ArrayType::get(i64, count);
+                const auto count   = static_cast<uint32_t>(names.size());
                 auto*      ptr_arr = llvm::ArrayType::get(raw_ptr_ty(), count);
                 auto*      len_arr = llvm::ArrayType::get(i32, count);
-                auto make_gv = [&](llvm::ArrayType* ty, llvm::ArrayRef<llvm::Constant*> els,
-                                   const char* nm) {
-                    return new llvm::GlobalVariable(llmod_, ty, true,
-                                                    llvm::GlobalValue::InternalLinkage,
-                                                    llvm::ConstantArray::get(ty, els), nm);
+                auto*      blob_c  = llvm::ConstantDataArray::get(
+                  ctx_, llvm::ArrayRef<uint8_t>(reinterpret_cast<const uint8_t*>(blob.data()), blob.size()));
+                auto make_gv = [&](llvm::Type* ty, llvm::Constant* init, const char* nm) {
+                    return new llvm::GlobalVariable(llmod_, ty, true, llvm::GlobalValue::InternalLinkage, init, nm);
                 };
-                llvm::Value* vg = make_gv(val_arr, vals, "clotho.enum.vals");
-                llvm::Value* ng = make_gv(ptr_arr, names, "clotho.enum.names");
-                llvm::Value* lg = make_gv(len_arr, lens, "clotho.enum.lens");
-                llvm::Value* val64 = cast(must_of(value_of(p.op_extra.op)), 64, false);
+                llvm::Value* vg = make_gv(blob_c->getType(), blob_c, "clotho.enum.vals");
+                llvm::Value* ng = make_gv(ptr_arr, llvm::ConstantArray::get(ptr_arr, names), "clotho.enum.names");
+                llvm::Value* lg = make_gv(len_arr, llvm::ConstantArray::get(len_arr, lens), "clotho.enum.lens");
+                // Spill the operand's must plane to a byte buffer for the compare.
+                const uint32_t spill  = plane_bytes(type_of(p.op_extra.op).width);
+                llvm::Value*   valbuf = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(spill), "enum.val");
+                b_.CreateAlignedStore(must_of(value_of(p.op_extra.op)), valbuf, llvm::Align(1));
                 b_.CreateCall(enum_name_fn(),
-                              { str_of(i), val64, b_.getInt32(count), vg, ng, lg });
+                              { str_of(i), valbuf, b_.getInt32(vbytes), b_.getInt32(count), vg, ng, lg });
                 return;
             }
             case Inst::Tag::StrFromPacked: {
@@ -6051,6 +6365,33 @@ private:
                 lower_wait(p.wait);
                 return;
 
+            case Inst::Tag::EventTrigger:
+                // `-> e` (LRM 15.5.2): stamp the trigger time and wake every
+                // waiter now. Zero-time — the current process does not suspend, so
+                // it does not end the NBA segment.
+                lower_event_trigger(p.signal);
+                return;
+
+            case Inst::Tag::EventTriggerNb:
+                // `->> e` (LRM 15.5.4): mark the event pending; the NBA region
+                // stamps + wakes. The triggering process does not block.
+                b_.CreateStore(b_.getInt8(1), event_pending_gv_[static_cast<uint32_t>(p.signal)]);
+                return;
+
+            case Inst::Tag::EventTriggerNbDelayed: {
+                // `->> #d e` (LRM 15.5.4): schedule a detached wheel timer that
+                // fires the event's on-expiry thunk `d` ticks from now. The process
+                // does not block. The timer node (a bare rt_timer = {next, on_expire}
+                // = 2 pointers) is heap-allocated here and freed by the thunk.
+                const Signal ev       = ir_->extra_data<EventDelayInfo>(p.op_extra.extra).event;
+                llvm::Value* ticks    = cast(must_of(value_of(p.op_extra.op)), 64, false);
+                llvm::Value* deadline = b_.CreateAdd(b_.CreateCall(wheel_now_fn(), { wheel_ }), ticks);
+                llvm::Value* node     = b_.CreateCall(alloc_fn(), { b_.getInt64(16) });
+                b_.CreateCall(wheel_schedule_fn(),
+                              { wheel_, node, deadline, event_delay_thunk_[static_cast<uint32_t>(ev)] });
+                return;
+            }
+
             case Inst::Tag::Display:
                 lower_display(i);
                 return;
@@ -6069,6 +6410,14 @@ private:
                 // priority-case violation: rt_case_violation warns and returns
                 // (non-fatal), so the region continues normally after it.
                 lower_case_viol(i);
+                return;
+
+            case Inst::Tag::Severity:
+                // $info / $warning / $error / $fatal report (LRM 20.10) or an
+                // immediate-assertion default failure (LRM 16.3): rt_severity
+                // renders the message and returns (non-fatal). $fatal's
+                // termination is a separate Finish following this node.
+                lower_severity(i);
                 return;
 
             case Inst::Tag::Fflush:
@@ -6107,6 +6456,14 @@ private:
                 lower_scanf(i);
                 return;
 
+            case Inst::Tag::TestPlusArgs:
+                lower_test_plusargs(i);
+                return;
+
+            case Inst::Tag::ValuePlusArgs:
+                lower_value_plusargs(i);
+                return;
+
             case Inst::Tag::FreadWord:
                 lower_fread_word(i);
                 return;
@@ -6117,6 +6474,21 @@ private:
 
             case Inst::Tag::ReadMem:
                 lower_readmem(i);
+                return;
+
+            case Inst::Tag::DumpFile:
+                lower_dump_file(i);
+                return;
+
+            case Inst::Tag::DumpVars:
+                lower_dump_vars();
+                return;
+
+            case Inst::Tag::DumpOff:
+            case Inst::Tag::DumpOn:
+            case Inst::Tag::DumpAll:
+            case Inst::Tag::DumpFlush:
+                lower_dump_control(ir_->tag(i));
                 return;
 
             case Inst::Tag::SimTime: {
@@ -6133,6 +6505,10 @@ private:
                 set_value(i, packed(now, now, zero(64)));
                 return;
             }
+
+            case Inst::Tag::EventTriggered:
+                set_value(i, lower_event_triggered(p.signal));
+                return;
 
             case Inst::Tag::Random: {
                 // The PRNG draw is always known (no x/z): must == may, z == 0.
@@ -6283,7 +6659,9 @@ private:
                        .is_string   = s.is_string };
     }
 
-    // Whole-storage lvalue for a function-frame local (per-call frame struct).
+    // Whole-storage lvalue for a function-frame local (per-call frame struct). A ref
+    // formal has no frame storage: its base is the passed actual pointer (recorded
+    // in ref_ptr_ by the prologue), through which every load / store is live.
     LValue local_lvalue(uint32_t index) {
         const FrameSlot& s = frame_slots_[index];
         if (s.is_agg) {
@@ -6294,7 +6672,8 @@ private:
             lv.is_signal = false;
             return lv;
         }
-        return LValue{ .base        = b_.CreateStructGEP(frame_ty_, frame_, index),
+        llvm::Value* base = s.is_ref ? ref_ptr_[index] : b_.CreateStructGEP(frame_ty_, frame_, index);
+        return LValue{ .base        = base,
                        .slot_ty     = s.slot_ty,
                        .has_z       = !s.narrow,
                        .narrow      = s.narrow,
@@ -6960,11 +7339,12 @@ private:
     // -- System tasks --
 
     // The runtime argument descriptor, mirroring `rt_arg` in runtime/Runtime.h:
-    //   { i32 width, i32 flags, i64 val, i64 xz, i64 z }
-    // val/xz/z carry the low 64 bits of each plane (wider values are truncated).
+    //   { i32 width, i32 flags, ptr val, ptr xz, ptr z }
+    // Each plane is a pointer to a ceil(width/64)-word little-endian buffer
+    // (built in build_rt_args), so operands of any width are carried in full.
     llvm::StructType* arg_struct_ty() {
         return llvm::StructType::get(
-          ctx_, { b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty() });
+          ctx_, { b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
 
     // void rt_fwrite(i32 desc, const char* fmt, i32 argc, const rt_arg* argv)
@@ -7071,6 +7451,31 @@ private:
                                   : static_cast<llvm::Value*>(b_.getInt64(0));
         b_.CreateCall(case_violation_fn(),
                       { b_.CreateGlobalString(banner), now, b_.getInt32(info.arg) });
+    }
+
+    // void rt_severity(i32 level, ptr banner, ptr fmt, i32 argc, ptr argv) —
+    // renders the message and writes the labelled diagnostic to stderr, then
+    // returns (non-fatal).
+    llvm::FunctionCallee severity_fn() {
+        return rt_fn("rt_severity", b_.getVoidTy(),
+                     { b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
+    }
+
+    // Lower a severity report ($info / $warning / $error / $fatal, or an
+    // immediate-assertion default failure): build the message descriptor array
+    // and call the runtime, passing the severity label, compile-time banner, and
+    // format string. Needs no wheel (the report carries no simulation time), so
+    // it lowers cleanly inside a pure function too.
+    void lower_severity(Index i) {
+        const auto  info = ir_->extra_data<SeverityInfo>(ir_->payload(i).extra);
+        const std::string banner = ir_->extra_bytes(info.banner, info.banner_len);
+        const std::string fmt    = ir_->extra_bytes(info.fmt, info.fmt_len);
+
+        const std::span<const Index> args = ir_->region(info.args);
+        llvm::Value*                 arr  = build_rt_args(args, "severity task");
+        b_.CreateCall(severity_fn(), { b_.getInt32(static_cast<int32_t>(info.level)),
+                                       b_.CreateGlobalString(banner), b_.CreateGlobalString(fmt),
+                                       b_.getInt32(static_cast<uint32_t>(args.size())), arr });
     }
 
     // Whether wheel_ points at a live timing wheel: true in a process or task
@@ -7337,12 +7742,6 @@ private:
                     // TODO: a part-select scan target (x[7:0]).
                     throw BackendError{ "$fscanf / $sscanf into a part-select target is not supported" };
                 }
-                if (lv.store_width > 64) {
-                    // TODO: a target wider than 64 bits (e.g. a long %s token) needs
-                    // multi-word plane assembly in the runtime scanner.
-                    throw BackendError{ "$fscanf / $sscanf into a target wider than 64 bits is not "
-                                        "supported" };
-                }
                 // A never-z target (z elision) passes a null z pointer. Flags bit0
                 // marks a narrow 2-state slot: the runtime writes only the iW value
                 // word (parsed x/z digits drop to 0 per LRM 6.3.1).
@@ -7372,6 +7771,72 @@ private:
         for (uint32_t k = 0; k < n; ++k) {
             service_after_write(lvalue_of(outs[k]), olds[k]);
         }
+        set_value(i, packed(r, r, zero(32)));
+    }
+
+    // i32 rt_test_plusargs(const char* s, i32 len)
+    llvm::FunctionCallee test_plusargs_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(i32, { ptr, i32 }, false);
+        return llmod_.getOrInsertFunction("rt_test_plusargs", fnty);
+    }
+
+    // Lower $test$plusargs(str): the query string is a compile-time literal
+    // (frontend-checked), so its bytes go straight to the runtime scan.
+    void lower_test_plusargs(Index i) {
+        const auto        info = ir_->extra_data<TestPlusArgsInfo>(ir_->payload(i).extra);
+        const std::string str  = ir_->extra_bytes(info.str, info.str_len);
+        llvm::Value*       str_ptr = b_.CreateGlobalString(str);
+        llvm::Value*       r       = b_.CreateCall(
+          test_plusargs_fn(), { str_ptr, b_.getInt32(static_cast<uint32_t>(str.size())) });
+        set_value(i, packed(r, r, zero(32)));
+    }
+
+    // i32 rt_value_plusargs(const char* prefix, i32 prefix_len, i32 conv, const rt_scan_arg* arg)
+    llvm::FunctionCallee value_plusargs_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(i32, { ptr, i32, i32, ptr }, false);
+        return llmod_.getOrInsertFunction("rt_value_plusargs", fnty);
+    }
+
+    // Lower $value$plusargs(user_string, var): build a single rt_scan_arg
+    // descriptor for the output lvalue (as lower_scanf does per conversion),
+    // then call the runtime with the compile-time-literal prefix + format
+    // char. The target must be whole-storage and <=64 bits, like a scanf
+    // target.
+    void lower_value_plusargs(Index i) {
+        const Index dst  = ir_->payload(i).op_extra.op;
+        const auto  info = ir_->extra_data<ValuePlusArgsInfo>(ir_->payload(i).op_extra.extra);
+        const std::string prefix = ir_->extra_bytes(info.prefix, info.prefix_len);
+
+        const LValue& lv = lvalue_of(dst);
+        if (lv.is_string) {
+            // TODO: $value$plusargs into a dynamic string object.
+            throw BackendError{ "$value$plusargs into a string object is not supported" };
+        }
+        if (lv.width != lv.store_width) {
+            // TODO: a part-select $value$plusargs target (x[7:0]).
+            throw BackendError{ "$value$plusargs into a part-select target is not supported" };
+        }
+
+        llvm::StructType* sty = scan_arg_struct_ty();
+        llvm::Value*      arg = b_.CreateAlloca(sty, nullptr, "plusarg_val");
+        llvm::Value*       mm = lv_mm_ptr(lv);
+        llvm::Value*       z  = lv.has_z ? lv_z_ptr(lv)
+                                         : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+        b_.CreateStore(mm, b_.CreateStructGEP(sty, arg, 0));
+        b_.CreateStore(z, b_.CreateStructGEP(sty, arg, 1));
+        b_.CreateStore(b_.getInt32(lv.store_width), b_.CreateStructGEP(sty, arg, 2));
+        b_.CreateStore(b_.getInt32(lv.narrow ? 1u : 0u), b_.CreateStructGEP(sty, arg, 3));
+
+        const ServiceSnapshot old        = service_snapshot(lv);
+        llvm::Value*          prefix_ptr = b_.CreateGlobalString(prefix);
+        llvm::Value*           r          = b_.CreateCall(
+          value_plusargs_fn(),
+          { prefix_ptr, b_.getInt32(static_cast<uint32_t>(prefix.size())), b_.getInt32(info.conv), arg });
+        service_after_write(lv, old);
         set_value(i, packed(r, r, zero(32)));
     }
 
@@ -7418,9 +7883,6 @@ private:
         if (lv.width != lv.store_width) {
             throw BackendError{ "$fread into a part-select target is not supported" };
         }
-        if (lv.store_width > 64) {
-            throw BackendError{ "$fread into a target wider than 64 bits is not supported" };
-        }
         // A never-z target (z elision) passes a null z pointer; a narrow 2-state
         // slot sets flags bit2 so the runtime writes only the iW value word.
         llvm::Value* mm = lv_mm_ptr(lv);
@@ -7449,9 +7911,6 @@ private:
         const SignalSlot& s = slot_of(info.mem);
         if (!s.is_array) {
             throw BackendError{ "$fread memory target is not a memory" };
-        }
-        if (s.width > 64) {
-            throw BackendError{ "$fread into a memory with elements wider than 64 bits is not supported" };
         }
         // Element i's planes at base + i*stride (one slot struct per element); a
         // never-z memory stores no z word, so pass a null z_base.
@@ -7488,6 +7947,9 @@ private:
             b_.CreateBr(cont);
             b_.SetInsertPoint(cont);
         }
+        if (!lowering_preinit_) {
+            vcd_touch_array(info.mem);   // bulk write: mark the array for the dump
+        }
         set_value(i, packed(r, r, zero(32)));
     }
 
@@ -7503,11 +7965,6 @@ private:
         const SignalSlot& s     = slot_of(info.target);
         if (!s.is_array) {
             throw BackendError{ "$readmem target is not a memory" };
-        }
-        if (s.width > 64) {
-            // TODO: element width > 64 needs multi-word value assembly in rt_readmem
-            // (the value/mask accumulators are u64 / unsigned __int128 today).
-            throw BackendError{ "$readmem into a memory with elements wider than 64 bits is not supported" };
         }
 
         // A string-object filename (LRM §21.4 allows a string-typed expression) is
@@ -7560,10 +8017,318 @@ private:
                       { path, path_len, mm_base, z_base, b_.getInt32(stride),
                         b_.getInt32(s.elem_count), b_.getInt32(s.width), b_.getInt64(at.left),
                         b_.getInt64(at.right), start, finish, b_.getInt32(flags) });
+        if (!lowering_preinit_) {
+            vcd_touch_array(info.target);   // bulk write: mark the array for the dump
+        }
         // TODO: $readmem services no wait queues — a process already waiting on
         // the memory sleeps through the load (pre-existing gap). rt_readmem would
         // need a did-write result (it returns void) to gate an Any-edge wake the
         // way lower_fread_mem does.
+    }
+
+    // -- Value-change dump (VCD, LRM §21.7; runtime in src/runtime/Runtime.cpp,
+    //    design in docs/VCD.md) --
+
+    llvm::FunctionCallee vcd_open_fn() {
+        return rt_fn("rt_vcd_open", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() });
+    }
+    // void rt_vcd_begin(rt_wheel*, i64 tick_fs, i32 units)
+    llvm::FunctionCallee vcd_begin_fn() {
+        return rt_fn("rt_vcd_begin", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee vcd_scope_fn() {
+        return rt_fn("rt_vcd_scope", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee vcd_upscope_fn() {
+        return rt_fn("rt_vcd_upscope", b_.getVoidTy(), {});
+    }
+    // void rt_vcd_var(i8* name, i32 len, i32 width, i32 flags, i8* mm, i8* z)
+    llvm::FunctionCallee vcd_var_fn() {
+        auto* ptr = raw_ptr_ty();
+        auto* i32 = b_.getInt32Ty();
+        return rt_fn("rt_vcd_var", b_.getVoidTy(), { ptr, i32, i32, i32, ptr, ptr });
+    }
+    // void rt_vcd_array(i8* name, i32 len, i32 count, i32 width, i32 flags, i8* mm_base,
+    //                   i8* z_base, i32 stride, i64 left, i64 right)
+    llvm::FunctionCallee vcd_array_fn() {
+        auto* ptr = raw_ptr_ty();
+        auto* i32 = b_.getInt32Ty();
+        auto* i64 = b_.getInt64Ty();
+        return rt_fn("rt_vcd_array", b_.getVoidTy(), { ptr, i32, i32, i32, i32, ptr, ptr, i32, i64, i64 });
+    }
+    llvm::FunctionCallee vcd_start_fn() {
+        return rt_fn("rt_vcd_start", b_.getVoidTy(), {});
+    }
+    llvm::FunctionCallee vcd_touch_fn() {
+        return rt_fn("rt_vcd_touch", b_.getVoidTy(), { b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee vcd_flush_fn() {
+        return rt_fn("rt_vcd_flush", b_.getVoidTy(), { b_.getInt64Ty() });
+    }
+    llvm::FunctionCallee vcd_close_fn() {
+        return rt_fn("rt_vcd_close", b_.getVoidTy(), {});
+    }
+    llvm::FunctionCallee vcd_nullary_fn(const char* name) {
+        return rt_fn(name, b_.getVoidTy(), {});
+    }
+
+    // Any Dump* instruction anywhere in the design? Gates the per-instant flush and
+    // the close at the end of the sim loop, so a design with no dump task pays
+    // nothing.
+    bool design_uses_vcd() const {
+        for (const Process& p : mod_.processes()) {
+            for (uint32_t k = 0; k < p.ir.inst_count(); ++k) {
+                switch (p.ir.tag(static_cast<Index>(k))) {
+                    case Inst::Tag::DumpFile:
+                    case Inst::Tag::DumpVars:
+                    case Inst::Tag::DumpOff:
+                    case Inst::Tag::DumpOn:
+                    case Inst::Tag::DumpAll:
+                    case Inst::Tag::DumpFlush:
+                        return true;
+                    default:
+                        break;
+                }
+            }
+        }
+        return false;
+    }
+
+    // Assign each dumped scalar signal its runtime dump-var index, in the exact
+    // order rt_vcd_var / rt_vcd_array register variables (the emit_vcd_var walk):
+    // an unpacked array consumes elem_count indices (its always-scanned elements),
+    // a scalar consumes one. Precomputed before any process body so a store's touch
+    // uses a compile-time-constant index. Kept in lockstep with emit_vcd_var /
+    // emit_vcd_scope_tree; a byte-diff of the dump verifies the two match.
+    void build_vcd_index() {
+        design_uses_vcd_ = design_uses_vcd();
+        if (!design_uses_vcd_) {
+            return;
+        }
+        vcd_index_.assign(mod_.signals().size(), -1);
+        uint32_t   next = 0;
+        const auto tops = mod_.tops();
+        if (tops.empty()) {
+            for (uint32_t si = 0; si < mod_.signals().size(); ++si) {
+                vcd_index_signal(static_cast<Signal>(si), next);
+            }
+        } else {
+            for (const InstanceScope& top : tops) {
+                vcd_index_scope(top, next);
+            }
+        }
+    }
+
+    void vcd_index_scope(const InstanceScope& sc, uint32_t& next) {
+        for (const Signal sig : sc.signals) {
+            vcd_index_signal(sig, next);
+        }
+        for (const InstanceScope& child : sc.children) {
+            vcd_index_scope(child, next);
+        }
+    }
+
+    void vcd_index_signal(Signal sig, uint32_t& next) {
+        const SignalInfo& info = mod_.signal(sig);
+        if (info.name.empty()) {
+            return;
+        }
+        const SignalSlot& s = slot_of(sig);
+        if (s.is_string) {
+            return;   // never registers (emit_vcd_var loud-fails on a string)
+        }
+        if (s.is_array) {
+            // Record the first element's dump-var index; element k is base + k. An
+            // element write touches base + normalized index (blocking) or the whole
+            // range (NBA), instead of being scanned every instant.
+            vcd_index_[static_cast<uint32_t>(sig)] = static_cast<int32_t>(next);
+            next += s.elem_count;
+            return;
+        }
+        vcd_index_[static_cast<uint32_t>(sig)] = static_cast<int32_t>(next++);
+    }
+
+    llvm::FunctionCallee vcd_touch_range_fn() {
+        return rt_fn("rt_vcd_touch_range", b_.getVoidTy(), { b_.getInt32Ty(), b_.getInt32Ty() });
+    }
+
+    // Emit rt_vcd_touch for a blocking write to a dumped signal, marking it in the
+    // dirty set. A scalar touches its index; an array element touches base + its
+    // normalized element index (a whole-array store touches the range). A no-op for
+    // a non-dumped signal or a PreInit store (before $dumpvars, subsumed by the
+    // initial dump).
+    void vcd_touch_lvalue(const LValue& lv) {
+        if (!design_uses_vcd_ || lowering_preinit_ || !lv.is_signal) {
+            return;
+        }
+        const int32_t base = vcd_index_[static_cast<uint32_t>(lv.sig)];
+        if (base < 0) {
+            return;
+        }
+        const SignalSlot& s = slot_of(lv.sig);
+        if (s.is_array) {
+            if (lv.elem_idx != nullptr) {
+                llvm::Value* idx = b_.CreateAdd(b_.getInt32(static_cast<uint32_t>(base)), lv.elem_idx);
+                b_.CreateCall(vcd_touch_fn(), { idx });
+            } else {
+                b_.CreateCall(vcd_touch_range_fn(),
+                              { b_.getInt32(static_cast<uint32_t>(base)), b_.getInt32(s.elem_count) });
+            }
+            return;
+        }
+        b_.CreateCall(vcd_touch_fn(), { b_.getInt32(static_cast<uint32_t>(base)) });
+    }
+
+    // Emit an rt_vcd_touch_range for a dumped array signal (whole element range).
+    // Used at the array-NBA commit, where the runtime queue does not carry the
+    // per-element index, and after $readmem / $fread bulk writes.
+    void vcd_touch_array(Signal sig) {
+        if (!design_uses_vcd_) {
+            return;
+        }
+        const int32_t base = vcd_index_[static_cast<uint32_t>(sig)];
+        if (base >= 0) {
+            b_.CreateCall(vcd_touch_range_fn(),
+                          { b_.getInt32(static_cast<uint32_t>(base)), b_.getInt32(slot_of(sig).elem_count) });
+        }
+    }
+
+    // $dumpfile: record the output path. A string-object filename is read straight
+    // from its rt_string handle (natural byte order, forward=1); otherwise the
+    // value is a packed-ASCII vector whose must-bits spill to a byte buffer
+    // (forward=0), the same split as $readmem's filename.
+    void lower_dump_file(Index i) {
+        const Index   fname = ir_->payload(i).unary;
+        const ValType fty   = type_of(fname);
+        llvm::Value*  path  = nullptr;
+        llvm::Value*  len   = nullptr;
+        uint32_t      fwd   = 0;
+        if (fty.is_string) {
+            llvm::Value* handle = str_of(fname);
+            path                = b_.CreateCall(str_data_fn(), { handle });
+            len                 = b_.CreateTrunc(b_.CreateCall(str_len_fn(), { handle }), b_.getInt32Ty());
+            fwd                 = 1;
+        } else {
+            const uint32_t fbytes = std::max<uint32_t>((fty.width + 7) / 8, 1);
+            path                  = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(fbytes), "dumpfile.path");
+            len                   = b_.getInt32(fbytes);
+            b_.CreateAlignedStore(must_of(value_of(fname)), path, llvm::Align(1));
+        }
+        b_.CreateCall(vcd_open_fn(), { path, len, b_.getInt32(fwd) });
+    }
+
+    // $dumpvars (whole-design form): walk the design scope tree, registering every
+    // dumpable signal with the runtime, then arm the dump.
+    void lower_dump_vars() {
+        b_.CreateCall(vcd_begin_fn(),
+                      { wheel_, b_.getInt64(mod_.tick_fs), b_.getInt32(mod_.timeformat_units) });
+        const auto tops = mod_.tops();
+        if (tops.empty()) {
+            emit_vcd_scope(mod_.name);
+            for (uint32_t s = 0; s < mod_.signals().size(); ++s) {
+                emit_vcd_var(static_cast<Signal>(s));
+            }
+            b_.CreateCall(vcd_upscope_fn(), {});
+        } else {
+            for (const InstanceScope& top : tops) {
+                emit_vcd_scope_tree(top);
+            }
+        }
+        b_.CreateCall(vcd_start_fn(), {});
+    }
+
+    void emit_vcd_scope(std::string_view name) {
+        llvm::Value* np = b_.CreateGlobalString(llvm::StringRef(name.data(), name.size()), "vcd.scope");
+        b_.CreateCall(vcd_scope_fn(), { np, b_.getInt32(static_cast<uint32_t>(name.size())) });
+    }
+
+    void emit_vcd_scope_tree(const InstanceScope& sc) {
+        emit_vcd_scope(sc.name);
+        for (const Signal sig : sc.signals) {
+            emit_vcd_var(sig);
+        }
+        for (const InstanceScope& child : sc.children) {
+            emit_vcd_scope_tree(child);
+        }
+        b_.CreateCall(vcd_upscope_fn(), {});
+    }
+
+    // Register one dumped signal: leaf name, width/flags, and live plane pointers.
+    // An unpacked array expands to one $var per element (rt_vcd_array). A
+    // whole-design dump must represent every declared signal, so an unrepresentable
+    // one (string, element wider than 64 bits, multidimensional array) loud-fails
+    // rather than being silently omitted; an unnamed compiler temporary
+    // is not a declared variable and is skipped.
+    void emit_vcd_var(Signal sig) {
+        const SignalInfo& info = mod_.signal(sig);
+        if (info.name.empty()) {
+            return;
+        }
+        if (info.is_event) {
+            // A named event (LRM 15.5) has no dumpable value; its 1-bit placeholder
+            // slot is never written. A whole-design dump must represent every
+            // declared signal, so loud-fail rather than emit a phantom wire.
+            throw BackendError{ "VCD dump of event '" + info.name + "' is not supported" };
+        }
+        const SignalSlot& s = slot_of(sig);
+        if (s.is_string) {
+            throw BackendError{ "VCD dump of string signal '" + info.name + "' is not supported" };
+        }
+        std::string leaf = info.name;
+        if (const auto pos = leaf.rfind('.'); pos != std::string::npos) {
+            leaf = leaf.substr(pos + 1);
+        }
+        auto*          nullp = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+        const uint32_t flags = (s.four_state ? 1u : 0u) | (info.is_net ? 2u : 0u) | (s.narrow ? 4u : 0u);
+        llvm::Value*   np    = b_.CreateGlobalString(leaf, "vcd.var");
+        llvm::Value*   nlen  = b_.getInt32(static_cast<uint32_t>(leaf.size()));
+
+        if (!s.is_array) {
+            llvm::Value* storage = storage_ptr(state_, s);
+            llvm::Value* mm      = b_.CreateStructGEP(s.slot_ty, storage, 0);
+            llvm::Value* zp = s.has_z ? b_.CreateStructGEP(s.slot_ty, storage, 1) : llvm::cast<llvm::Value>(nullp);
+            b_.CreateCall(vcd_var_fn(), { np, nlen, b_.getInt32(s.width), b_.getInt32(flags), mm, zp });
+            return;
+        }
+
+        // Unpacked array (memory): one $var per element. Multidimensional arrays
+        // (a nested UnpackedArray element type) need per-dimension index naming and
+        // are deferred.
+        const Type& at = std::get<Type>(mod_.pool.get(info.type));
+        if (std::get<Type>(mod_.pool.get(at.element)).kind == Type::Kind::UnpackedArray) {
+            throw BackendError{ "VCD dump of multidimensional array '" + info.name + "' is not supported" };
+        }
+        auto*        arr_ty  = llvm::cast<llvm::ArrayType>(s.storage_ty);
+        llvm::Value* base    = storage_ptr(state_, s);
+        llvm::Value* mm_base = b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(0) });
+        llvm::Value* z_base =
+          s.has_z ? b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(1) })
+                  : llvm::cast<llvm::Value>(nullp);
+        const auto stride = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(s.slot_ty));
+        b_.CreateCall(vcd_array_fn(), { np, nlen, b_.getInt32(s.elem_count), b_.getInt32(s.width),
+                                        b_.getInt32(flags), mm_base, z_base, b_.getInt32(stride),
+                                        b_.getInt64(at.left), b_.getInt64(at.right) });
+    }
+
+    // $dumpoff / $dumpon / $dumpall / $dumpflush: forward to the matching runtime
+    // control entry.
+    void lower_dump_control(Inst::Tag tag) {
+        switch (tag) {
+            case Inst::Tag::DumpOff:
+                b_.CreateCall(vcd_nullary_fn("rt_vcd_off"), {});
+                return;
+            case Inst::Tag::DumpOn:
+                b_.CreateCall(vcd_nullary_fn("rt_vcd_on"), {});
+                return;
+            case Inst::Tag::DumpAll:
+                b_.CreateCall(vcd_nullary_fn("rt_vcd_all"), {});
+                return;
+            case Inst::Tag::DumpFlush:
+                b_.CreateCall(vcd_nullary_fn("rt_vcd_dumpflush"), {});
+                return;
+            default:
+                throw BackendError{ "internal: non-control dump tag" };
+        }
     }
 
     // Lower a function `return`: a real `ret`, so it terminates the block and any
@@ -7577,6 +8342,9 @@ private:
             b_.CreateBr(task_epilogue_bb_);
             return;
         }
+        // A function copies output / inout formals back through their pointers at
+        // each return point (LRM 13.5), before releasing the body and returning.
+        emit_copyout(*cur_fn_);
         if (is_string_type(cur_fn_->return_type)) {
             // Copy the result out through the trailing out-param handle BEFORE
             // releasing the body's strings (the value may be one of them).
@@ -7621,9 +8389,27 @@ private:
         llvm::Function*           cf = fn_decls_[static_cast<uint32_t>(ci.func)];
         std::vector<llvm::Value*> argv;
         argv.push_back(state_);
+        // A ref actual that is a signal with waiters: the callee writes it live, so
+        // its wait queue must be serviced with the call's net old -> new transition.
+        // Snapshot each before the (atomic, zero-time) function call; service after.
+        std::vector<std::pair<LValue, ServiceSnapshot>> ref_svc;
         size_t k = 0;
         for (Index a : ir_->region(ci.args)) {
-            if (contains_struct(f.param_types[k])) {
+            const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
+            if (dir == ArgDir::Ref) {
+                // Pass one pointer to the actual's slot (scalar, or array element);
+                // the callee aliases it.
+                const LValue& lv = lvalue_of(a);
+                argv.push_back(ref_actual_ptr(lv));
+                ref_svc.emplace_back(lv, service_snapshot(lv));
+            } else if (dir == ArgDir::Out || dir == ArgDir::Inout) {
+                // An output / inout temp: pass pointers to its mm and z planes; the
+                // callee copies out through them (the caller copies the temp back to
+                // the actual after the call — frontend emit_call_copyouts).
+                const LValue& lv = lvalue_of(a);
+                argv.push_back(lv_mm_ptr(lv));
+                argv.push_back(lv_z_ptr(lv));
+            } else if (contains_struct(f.param_types[k])) {
                 // An aggregate actual passes its storage pointer (the frontend
                 // emitted it as an lvalue); the callee copies it in.
                 argv.push_back(agg_slot_ptr(lvalue_of(a)));
@@ -7657,9 +8443,15 @@ private:
             // trailing out-param); str_of(i) was pre-set by build_str_temps.
             argv.push_back(str_of(i));
             b_.CreateCall(cf->getFunctionType(), cf, argv);
+            for (auto& [lv, snap] : ref_svc) {
+                service_after_write(lv, snap);
+            }
             return;
         }
         llvm::Value* r = b_.CreateCall(cf->getFunctionType(), cf, argv);
+        for (auto& [lv, snap] : ref_svc) {
+            service_after_write(lv, snap);
+        }
         if (f.return_type != mod_.pool.void_type) {
             Plane         pl{ b_.CreateExtractValue(r, { 0 }), b_.CreateExtractValue(r, { 1 }) };
             const ValType t = from_ref(f.return_type);
@@ -7705,8 +8497,23 @@ private:
         std::vector<llvm::Value*>    argv;
         argv.push_back(state_);
         argv.push_back(wheel_);
+        // Snapshot each ref-actual signal with waiters before the call; the wait
+        // queue is serviced at the continuation with the net old -> new transition.
+        // NOTE: a task that writes the same ref signal across a #delay (multiple time
+        // steps) wakes level/edge waiters only once, at task completion, with the net
+        // transition — not per intermediate write. Correct for a whole-signal ref
+        // written in one time step (the common case) and for functions (atomic).
+        // Per-write mid-suspend waking needs callee-side servicing (a generic
+        // runtime wake keyed by signal id); TODO once that exists.
+        std::vector<std::pair<LValue, ServiceSnapshot>> ref_svc;
         for (uint32_t k = 0; k < args.size(); ++k) {
-            if (tf.arg_dirs[k] == ArgDir::In) {
+            if (tf.arg_dirs[k] == ArgDir::Ref) {
+                // Pass one pointer to the actual's slot (scalar, or array element);
+                // the callee aliases it.
+                const LValue& lv = lvalue_of(args[k]);
+                argv.push_back(ref_actual_ptr(lv));
+                ref_svc.emplace_back(lv, service_snapshot(lv));
+            } else if (tf.arg_dirs[k] == ArgDir::In) {
                 if (is_string_type(tf.param_types[k])) {
                     argv.push_back(str_of(args[k]));
                     continue;
@@ -7748,69 +8555,96 @@ private:
         b_.CreateBr(cont_bb);
 
         b_.SetInsertPoint(cont_bb);
+        for (auto& [lv, snap] : ref_svc) {
+            service_after_write(lv, snap);
+        }
     }
 
     // Build the runtime rt_arg[] descriptor array shared by every $display-family
-    // format call: stack-allocate one slot per value operand and pack its planes
-    // (width, sign, and the must / xz / z low-64 bits). Returns the array pointer
-    // (a null pointer when there are no operands). `who` names the caller in the
-    // >64-bit loud-fail.
-    // TODO: rt_arg carries only the low 64 bits of each plane, so an operand wider
-    // than 64 bits cannot be passed in full; such an operand is loud-failed rather
-    // than formatted with its high bits silently dropped (docs/TODO.md, M1 $display).
-    llvm::Value* build_rt_args(std::span<const Index> args, const char* who) {
+    // format call: stack-allocate one slot per value operand plus one shared word
+    // buffer holding every integral operand's must / xz / z planes (ceil(w/64)
+    // words each, zero-extended above the operand width). The descriptor's plane
+    // fields point into that buffer, so an operand of any width is passed in full.
+    // Returns the descriptor array pointer (null when there are no operands).
+    // `who` is unused now that no width is rejected; kept for call-site clarity.
+    llvm::Value* build_rt_args(std::span<const Index> args, const char* /*who*/) {
         const auto n = static_cast<uint32_t>(args.size());
         if (n == 0) {
             return llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
         }
-        llvm::StructType* sty = arg_struct_ty();
-        llvm::Value*      arr = b_.CreateAlloca(sty, b_.getInt32(n), "fmt_args");
+
+        // Pass 1: size the shared plane buffer (three planes per integral operand,
+        // one word per real; strings carry the handle in `val` directly).
+        std::vector<uint32_t> words(n, 0);
+        uint32_t              total = 0;
         for (uint32_t k = 0; k < n; ++k) {
-            const Plane   p = value_of(args[k]);
             const ValType t = type_of(args[k]);
             if (t.is_string) {
-                // A string-object argument (%s): flag bit 1, val = the rt_string
-                // handle pointer; the width / plane fields are unused.
-                llvm::Value* selt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
-                store_field(sty, selt, 0, b_.getInt32(0));
-                store_field(sty, selt, 1, b_.getInt32(2));
-                store_field(sty, selt, 2, b_.CreatePtrToInt(str_of(args[k]), b_.getInt64Ty()));
-                store_field(sty, selt, 3, b_.getInt64(0));
-                store_field(sty, selt, 4, b_.getInt64(0));
                 continue;
             }
             if (t.is_real) {
-                // A real rides `val` as a double bit pattern (flags bit 2); a
-                // shortreal widens to double first so the runtime handles one
-                // representation. Reals are signed and have no x/z.
+                words[k] = 1;
+                total += 1;
+                continue;
+            }
+            words[k] = (t.width + 63) / 64;
+            total += 3 * words[k];
+        }
+
+        llvm::StructType* sty    = arg_struct_ty();
+        llvm::Value*      arr    = b_.CreateAlloca(sty, b_.getInt32(n), "fmt_args");
+        auto*             i64    = b_.getInt64Ty();
+        llvm::Value*      planes = total != 0 ? b_.CreateAlloca(i64, b_.getInt32(total), "fmt_planes") : nullptr;
+        auto*             null   = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+
+        // Store an iW plane, zero-extended to a whole number of words, into the
+        // shared buffer at word offset `off`; return the element pointer.
+        uint32_t off = 0;
+        auto     put = [&](llvm::Value* plane, uint32_t nwords) {
+            llvm::Value* ep = b_.CreateConstInBoundsGEP1_32(i64, planes, off);
+            b_.CreateAlignedStore(b_.CreateZExtOrBitCast(plane, int_ty(nwords * 64)), ep, llvm::Align(8));
+            off += nwords;
+            return ep;
+        };
+
+        for (uint32_t k = 0; k < n; ++k) {
+            const Plane   p    = value_of(args[k]);
+            const ValType t    = type_of(args[k]);
+            llvm::Value*  elt  = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
+            if (t.is_string) {
+                // A string-object argument (%s): flag bit 1, val = the rt_string
+                // handle pointer itself; the width / plane fields are unused.
+                store_field(sty, elt, 0, b_.getInt32(0));
+                store_field(sty, elt, 1, b_.getInt32(2));
+                store_field(sty, elt, 2, str_of(args[k]));
+                store_field(sty, elt, 3, null);
+                store_field(sty, elt, 4, null);
+                continue;
+            }
+            if (t.is_real) {
+                // A real rides one `val` word as a double bit pattern (flags bit
+                // 2); a shortreal widens to double first so the runtime handles
+                // one representation. Reals are signed and have no x/z.
                 llvm::Value* fv = fp_of(p);
                 if (t.width == 32) {
                     fv = b_.CreateFPExt(fv, b_.getDoubleTy());
                 }
-                llvm::Value* relt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
-                store_field(sty, relt, 0, b_.getInt32(64));
-                store_field(sty, relt, 1, b_.getInt32(0b101u));
-                store_field(sty, relt, 2, b_.CreateBitCast(fv, int_ty(64)));
-                store_field(sty, relt, 3, b_.getInt64(0));
-                store_field(sty, relt, 4, b_.getInt64(0));
+                store_field(sty, elt, 0, b_.getInt32(64));
+                store_field(sty, elt, 1, b_.getInt32(0b101u));
+                store_field(sty, elt, 2, put(b_.CreateBitCast(fv, i64), 1));
+                store_field(sty, elt, 3, null);
+                store_field(sty, elt, 4, null);
                 continue;
             }
-            if (t.width > 64) {
-                throw BackendError{ std::string(who) +
-                                    " of an operand wider than 64 bits is not supported (it "
-                                    "would format with its high bits truncated)" };
-            }
-            llvm::Value* must = must_of(p);
-            llvm::Value* may  = may_of(p);
             // xz = must ^ may marks every unknown bit (X and Z); z marks the Z
             // subset. The runtime distinguishes them per bit.
-            llvm::Value* xz  = b_.CreateXor(must, may);
-            llvm::Value* elt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
+            llvm::Value* must = must_of(p);
+            llvm::Value* xz   = b_.CreateXor(must, may_of(p));
             store_field(sty, elt, 0, b_.getInt32(t.width));
             store_field(sty, elt, 1, b_.getInt32(t.is_signed ? 1u : 0u));
-            store_field(sty, elt, 2, cast(must, 64, false));
-            store_field(sty, elt, 3, cast(xz, 64, false));
-            store_field(sty, elt, 4, cast(z_of(p), 64, false));
+            store_field(sty, elt, 2, put(must, words[k]));
+            store_field(sty, elt, 3, put(xz, words[k]));
+            store_field(sty, elt, 4, put(z_of(p), words[k]));
         }
         return arr;
     }
@@ -9271,6 +10105,15 @@ private:
     std::vector<std::tuple<std::string, std::vector<llvm::Type*>, llvm::StructType*>> def_types_;
     std::vector<SignalSlot> slots_;
 
+    // VCD dirty set (meaningful iff design_uses_vcd_). vcd_index_[sig] is the
+    // runtime dump-var index of a dumped scalar signal, or -1 when the signal is
+    // not a touched scalar (an unnamed temporary, a string, or an unpacked array —
+    // array elements are always-scanned, not instrumented). nba_vcd_gv_ is a
+    // parallel [n_nba x i32] of those indices, read in the NBA commit loop.
+    bool                  design_uses_vcd_ = false;
+    std::vector<int32_t>  vcd_index_;
+    llvm::GlobalVariable* nba_vcd_gv_ = nullptr;
+
     // Function declarations, indexed by FunctionId; filled before any body is
     // lowered so calls (including recursive / forward) resolve.
     std::vector<llvm::Function*> fn_decls_;
@@ -9289,6 +10132,10 @@ private:
     SimulationConfig        config_;
     llvm::Value*            frame_       = nullptr;
     std::vector<FrameSlot>  frame_slots_;
+    // Per-ref-formal actual pointer, indexed by Local index; null for non-ref
+    // locals. Bound in the callee prologue (bind_ref_formals) from the passed
+    // pointer parameter, then read by local_lvalue to alias the actual live.
+    std::vector<llvm::Value*> ref_ptr_;
     // The current function's frame struct (one field per Local, in order).
     llvm::StructType*       frame_ty_    = nullptr;
     // While lowering a task: the shared copy-out + caller-resume epilogue block a
@@ -9386,6 +10233,27 @@ private:
     // Next free static slot per (signal, edge), handed out during lowering
     // (parallels the capacities computed in build_wait_queues).
     std::vector<std::array<uint32_t, 3>>               sta_next_;
+    // Per named-event trigger timestamp (clotho.event_trig.<name>), an i64 holding
+    // the sim tick of the last `-> e`, or UINT64_MAX if never triggered. Indexed
+    // by signal handle; null for a non-event signal. `.triggered` compares this to
+    // the current tick (LRM 15.5.3). Built in build_wait_queues.
+    std::vector<llvm::GlobalVariable*>                 event_trig_gv_;
+    // Per named-event nonblocking-trigger pending flag (clotho.event_pending.<name>),
+    // an i8 set by `->> e` and cleared after the NBA region stamps + services the
+    // event (LRM 15.5.4). Indexed by signal handle; null for a non-event signal.
+    // Built in build_wait_queues.
+    std::vector<llvm::GlobalVariable*>                 event_pending_gv_;
+    // Event signals that are targets of a `->> e` somewhere in the design; the NBA
+    // region scans exactly these for a pending nonblocking trigger. Collected in
+    // nba_classify_ir.
+    std::vector<Signal>                                nb_event_sigs_;
+    // Event signals that are targets of a delayed `->> #d e`; each gets a detached
+    // on-expiry thunk (event_delay_thunk_). Collected in nba_classify_ir.
+    std::vector<Signal>                                nb_delay_event_sigs_;
+    // Per delayed-trigger event: the wheel-timer on_expire thunk that stamps the
+    // trigger time and services the event's waiters. Indexed by signal handle;
+    // null for a non-target. Built in build_delay_event_thunks.
+    std::vector<llvm::Function*>                       event_delay_thunk_;
     // Per-process scheduled flags (clotho.proc_sched), built once in run().
     llvm::GlobalVariable*               sched_gv_     = nullptr;
     llvm::ArrayType*                    sched_arr_ty_ = nullptr;

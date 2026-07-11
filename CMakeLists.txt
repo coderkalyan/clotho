@@ -158,6 +158,14 @@ add_executable(clotho_test
   tests/streaming_test.cpp
   tests/uwire_test.cpp
   tests/struct_test.cpp
+  tests/plusargs_test.cpp
+  tests/vcd_test.cpp
+  tests/package_test.cpp
+  tests/inside_test.cpp
+  tests/wait_test.cpp
+  tests/xhier_test.cpp
+  tests/severity_test.cpp
+  tests/event_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho doctest::doctest clotho_warnings)
 

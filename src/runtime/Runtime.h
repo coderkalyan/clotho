@@ -11,26 +11,29 @@ extern "C" {
 
 // -- $display / $write --
 //
-// One value argument of a display task. The codegen packs each operand's 4-state
-// planes into the low 64 bits (wider values are truncated): `val` is the bit
-// pattern, `xz` marks unknown bits (X or Z), and `z` marks the high-impedance
-// subset (z is a subset of xz). Only the low `width` bits are significant.
+// One value argument of a display task. Each plane is a little-endian word array
+// of ceil(width/64) words (LSW first); the codegen zero-extends the bits above
+// `width`, so a plane never carries garbage past the operand width. This carries
+// operands of any width, not only <= 64 bits.
 typedef struct rt_arg {
     // Significant bit width of the value (0 for a string handle).
     uint32_t width;
     // Bit 0: the value is signed (drives %d sign-extension).
-    // Bit 1: `val` carries an rt_string* (a %s string-object argument); the
-    //        width/xz/z fields are meaningless.
-    // Bit 2: the value is real — `val` is an IEEE-754 double bit pattern
-    //        (shortreal is widened to double by the codegen) and xz / z are 0;
-    //        it renders via the %e / %f / %g family (LRM 21.2, Table 21-2).
+    // Bit 1: `val` carries an rt_string* directly (a %s string-object argument);
+    //        the width/xz/z fields are meaningless (val is not a plane pointer).
+    // Bit 2: the value is real — `val` points to one word holding an IEEE-754
+    //        double bit pattern (shortreal is widened to double by the codegen)
+    //        and xz / z are null; it renders via the %e / %f / %g family (LRM
+    //        21.2, Table 21-2).
     uint32_t flags;
-    // Value plane (definitely-1 bits) in the low `width` bits.
-    uint64_t val;
-    // Unknown mask: bit set => the value bit is X or Z.
-    uint64_t xz;
+    // Value plane (definitely-1 bits), or an rt_string* / double-bits word per
+    // the flags above.
+    const uint64_t* val;
+    // Unknown mask: bit set => the value bit is X or Z. Null for string / real.
+    const uint64_t* xz;
     // High-impedance mask: bit set => the value bit is Z (implies the xz bit).
-    uint64_t z;
+    // Null for string / real.
+    const uint64_t* z;
 } rt_arg;
 
 // Format `fmt` with `argc` descriptors and write the result to descriptor
@@ -86,6 +89,15 @@ void rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uin
 // or unique, no default), 1 = more than one case item matched (unique /
 // unique0 overlap). Fires once per dynamic execution that detects the violation.
 void rt_case_violation(const char* banner, uint64_t now, int32_t kind);
+
+// Report a severity system task ($info / $warning / $error / $fatal, LRM 20.10)
+// or an immediate-assertion default failure (LRM 16.3). Renders the $display-
+// style message (`fmt` + `argc` `argv`, empty for a bare `$error;`) and writes
+// "<LABEL>: <banner><message>\n" to stderr, then returns — non-fatal. `level` is
+// the ir::Severity label (0 info, 1 warning, 2 error, 3 fatal); it selects the
+// LABEL only. `banner` is the compile-time "<file>:<line>: " prefix. $fatal's
+// termination is a separate rt_finish the caller emits after this report.
+void rt_severity(int32_t level, const char* banner, const char* fmt, uint32_t argc, const rt_arg* argv);
 
 // Install (or clear, with null) the setjmp target rt_finish longjmps to, so a
 // $finish ends only the simulation, not the embedding process (the test binary
@@ -229,7 +241,108 @@ void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8
                 uint32_t count, uint32_t width, int64_t decl_left, int64_t decl_right, int64_t start,
                 int64_t finish, uint32_t flags);
 
+// -- Value-change dump (VCD, LRM 1800-2023 §21.7; design in docs/VCD.md) --
+//
+// Registration is call-based: at the $dumpvars site the backend walks the design
+// scope tree, calling rt_vcd_begin, then rt_vcd_scope / rt_vcd_var / rt_vcd_upscope
+// in tree order, then rt_vcd_start. Each rt_vcd_var passes live pointers to the
+// signal's planes in the design state buffer (stable for the run), so the runtime
+// needs no offset math or state base. See docs/VCD.md.
+
+// rt_vcd_var flags: bit 0 four-state (has x/z), bit 1 net (`wire` vs `reg` var),
+// bit 2 narrow (a 2-state `{ iW }` slot: read the single iW word as the value,
+// with must == may and no z plane).
+#define RT_VCD_FLAG_FOUR_STATE 1u
+#define RT_VCD_FLAG_NET        2u
+#define RT_VCD_FLAG_NARROW     4u
+
+// $dumpfile: record the output path. When `forward` is 0 the path is a right-
+// justified packed-ASCII vector (byte 0 = last character), as the backend spills a
+// packed value; when 1 it is the natural-order bytes of a string object. The file
+// is opened at rt_vcd_begin.
+void rt_vcd_open(const char* path_buf, uint32_t path_len, uint32_t forward);
+
+// Begin the header: open the file and write $date / $version / $timescale. `wheel`
+// is cached for the close-time flush; `tick_fs` / `units` set the timescale.
+void rt_vcd_begin(void* wheel, uint64_t tick_fs, int32_t units);
+
+// $scope module <name> / $upscope: open / close a hierarchy level in the header.
+void rt_vcd_scope(const char* name, uint32_t name_len);
+void rt_vcd_upscope(void);
+
+// Register one dumped variable: `name` its leaf reference, `width` its bit width
+// (1..64 in phase 0), `flags` per RT_VCD_FLAG_*, `mm` its packed must|may plane
+// pointer, `z` its z plane pointer (null for a never-z / narrow slot). Writes the
+// $var line and adds the variable to the scan table.
+void rt_vcd_var(const char* name, uint32_t name_len, uint32_t width, uint32_t flags, const uint8_t* mm,
+                const uint8_t* z);
+
+// Register a whole unpacked-array (memory) as one $var per element, named
+// `<name>[<addr>]` over the declared address range [left:right]. Element k's
+// planes sit at `mm_base + k*stride` (and `z_base + k*stride`, or z_base null for a
+// never-z / narrow memory). `width`/`flags` describe one element. Registering the
+// array in a single call keeps the emitted design independent of the array size.
+void rt_vcd_array(const char* name, uint32_t name_len, uint32_t count, uint32_t width, uint32_t flags,
+                  const uint8_t* mm_base, const uint8_t* z_base, uint32_t stride, int64_t left, int64_t right);
+
+// Finish the header ($enddefinitions) and arm the initial full dump.
+void rt_vcd_start(void);
+
+// Mark variable `idx` changed this instant (activity-driven dirty set). Called
+// from the design at each write to a dumped scalar signal (blocking store and NBA
+// commit); the next rt_vcd_flush visits only the marked variables. A no-op when
+// dumping is not active.
+void rt_vcd_touch(uint32_t idx);
+
+// Mark the `count` variables [base, base+count) changed -- used for a whole
+// unpacked-array (memory) write, where `base` is the array's first element var.
+// A blocking element write touches the single element; an NBA array commit
+// touches the whole array (the runtime queue does not carry per-element indices).
+void rt_vcd_touch_range(uint32_t base, uint32_t count);
+
+// Postponed-region sample at a settled instant, called from the sim loop before
+// the wheel advances (`tick` is rt_wheel_now). Emits changed variables under one
+// `#tick` marker; a no-change instant emits nothing. A no-op when dumping is not
+// active. Also services a pending $dumpoff / $dumpall / $dumpon at this instant.
+void rt_vcd_flush(uint64_t tick);
+
+// $dumpoff / $dumpon / $dumpall / $dumpflush (LRM §21.7.4-7). off/on/all only set
+// a deferred flag serviced by the next rt_vcd_flush, so rt_vcd_flush stays the
+// sole writer and the change lands at the correct instant; dumpflush drains the
+// output buffer to disk immediately.
+void rt_vcd_off(void);
+void rt_vcd_on(void);
+void rt_vcd_all(void);
+void rt_vcd_dumpflush(void);
+
+// Final flush of the in-progress instant + output buffer, then close the file.
+// Called on normal simulation end and on the $finish longjmp path.
+void rt_vcd_close(void);
+
 int32_t rt_random(void);
+
+// -- Plusargs (LRM §21.6) --
+//
+// Command-line arguments prefixed with `+` (everything after the leading `+`
+// dropped), in the order given on Clotho's own command line. Populated once
+// by the host before the design runs; the backing storage must outlive the
+// run. Not thread-safe (matches the single-simulator-per-process model
+// elsewhere in the runtime, e.g. $random / the file table).
+void rt_plusargs_init(const char* const* args, const uint32_t* lens, uint32_t n);
+
+// $test$plusargs(str) (LRM §21.6): search the plusargs in order; -> nonzero
+// iff some plusarg's prefix matches every character of `s` (`len` bytes).
+int32_t rt_test_plusargs(const char* s, uint32_t len);
+
+// $value$plusargs(user_string, var) (LRM §21.6): `prefix`/`prefix_len` are
+// the plusarg_string portion of user_string (a compile-time literal); `conv`
+// is the format character ('d'/'o'/'b'/'h'/'s'). Searches the plusargs in
+// order for one whose prefix matches `prefix`; on a match, converts its
+// remainder per `conv` into `arg` (zero-padded / truncated to `arg->width`,
+// a negative value always truncates, an illegal character writes 'bx) and
+// returns nonzero. On no match, `arg` is left untouched and the function
+// returns 0.
+int32_t rt_value_plusargs(const char* prefix, uint32_t prefix_len, uint32_t conv, const rt_scan_arg* arg);
 
 // -- Deferred nonblocking writes to unpacked-array elements --
 //
@@ -318,9 +431,11 @@ void rt_string_toupper(rt_string* dst, const rt_string* src);
 void rt_string_tolower(rt_string* dst, const rt_string* src);
 
 // dst = the source name of the enum member whose value equals `val`, or "" if
-// none matches (LRM §6.19.2 e.name()). `values` / `names` / `lens` are the
-// member table (parallel arrays of `count` rows) emitted per enum type.
-void rt_enum_name(rt_string* dst, uint64_t val, uint32_t count, const uint64_t* values,
+// none matches (LRM §6.19.2 e.name()). `val` is the operand's must-plane bytes
+// (`vbytes` = (width+7)/8) and `values` is the `count` member values packed
+// contiguously (`vbytes` each); `names` / `lens` are the parallel name table.
+// Byte-compared, so a base wider than 64 bits works.
+void rt_enum_name(rt_string* dst, const uint8_t* val, uint32_t vbytes, uint32_t count, const uint8_t* values,
                   const char* const* names, const uint32_t* lens);
 
 // s[i] = c ($.putc()): a no-op when i is out of range or (c & 0xff) == 0 — a
@@ -396,7 +511,7 @@ void  rt_free(void* p);
 // hold the concrete clotho::Wheel (both checked in Runtime.cpp); the design never
 // inspects it.
 typedef struct rt_wheel {
-    alignas(8) unsigned char storage[2560];
+    alignas(8) unsigned char storage[9216];
 } rt_wheel;
 
 // Intrusive timer node the design embeds inside an owning awaiter and recovers
@@ -431,6 +546,11 @@ int rt_wheel_pending(const rt_wheel* wheel);
 // Link `timer` to fire at absolute tick `deadline` (must be > rt_wheel_now),
 // calling `on_expire(timer, ctx)` when it fires.
 void rt_wheel_schedule(rt_wheel* wheel, rt_timer* timer, uint64_t deadline, rt_timer_fn on_expire);
+
+// Like rt_wheel_schedule but the deadline is `rt_wheel_now + delay`, computed
+// runtime-side so a #delay crosses the C ABI once instead of twice. `delay`
+// must be > 0 (a #0 never reaches the wheel — it parks in the inactive queue).
+void rt_wheel_schedule_rel(rt_wheel* wheel, rt_timer* timer, uint64_t delay, rt_timer_fn on_expire);
 
 // Jump to the next non-empty tick and fire its timers in list order, passing
 // `ctx` to each callback. A no-op on an idle wheel. A node is unlinked before
