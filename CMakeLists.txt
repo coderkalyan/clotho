@@ -159,6 +159,7 @@ add_executable(clotho_test
   tests/uwire_test.cpp
   tests/plusargs_test.cpp
   tests/vcd_test.cpp
+  tests/wait_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho doctest::doctest clotho_warnings)
 
