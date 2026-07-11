@@ -511,7 +511,7 @@ void  rt_free(void* p);
 // hold the concrete clotho::Wheel (both checked in Runtime.cpp); the design never
 // inspects it.
 typedef struct rt_wheel {
-    alignas(8) unsigned char storage[2560];
+    alignas(8) unsigned char storage[9216];
 } rt_wheel;
 
 // Intrusive timer node the design embeds inside an owning awaiter and recovers
