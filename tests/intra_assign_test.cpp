@@ -248,6 +248,20 @@ TEST_CASE("nonblocking intra-delay with #0 commits in the current NBA region") {
     CHECK(run_capture_finish(src) == "b=2\n");
 }
 
+// A compile-time `#0` lowers as a plain NBA, so a `#0` update and a plain NBA to
+// the same signal in the same instant order by statement-execution order — last
+// written wins (LRM 10.4.2), regardless of which carries the `#0`. iverilog: the
+// plain `a <= 2` executes last, so a == 2.
+TEST_CASE("nonblocking intra-delay #0 orders with plain NBAs by execution order") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a;
+            initial begin a = 0; a <= #0 1; a <= 2; end
+            initial begin #1; $display("a=%0d", a); $finish; end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "a=2\n");
+}
+
 // A dynamic (runtime-valued) delay is supported. iverilog: a == 9 at the end.
 TEST_CASE("nonblocking intra-delay accepts a dynamic delay") {
     constexpr std::string_view src = R"(

@@ -4928,8 +4928,29 @@ private:
                     fail("nonblocking intra-assignment delay is only supported for a whole "
                          "integral scalar target");
                 }
+                const Expression& delay_expr = a.timingControl->as<DelayControl>().expr;
+                // A compile-time `#0` nonblocking assignment is identical to a plain
+                // `<= ` — the update lands in the current instant's NBA region — so
+                // lower it as a normal NBA. This keeps update ordering to a signal
+                // uniform with its other NBAs (LRM 10.4.2, statement-execution order:
+                // last written wins) via the one block-commit path, instead of
+                // splitting the same signal across block-commit and the deferred
+                // record path (whose commit order is fixed, not execution order).
+                {
+                    slang::ast::ASTContext     ectx(*scope_, slang::ast::LookupLocation::max);
+                    slang::ast::EvalContext    ev(ectx);
+                    const slang::ConstantValue cv = delay_expr.eval(ev);
+                    if (cv.isInteger()) {
+                        const auto v = cv.integer().as<uint64_t>();
+                        if (v && *v == 0) {
+                            const ir::Index val0 = lower_expr(a.right(), b);
+                            b.binary(ir::Inst::Tag::StoreNb, lower_lvalue(a.left(), b), val0, loc(a));
+                            return val0;
+                        }
+                    }
+                }
                 const ir::Index val   = lower_expr(a.right(), b);
-                const ir::Index delay = scaled_delay(a.timingControl->as<DelayControl>().expr, b);
+                const ir::Index delay = scaled_delay(delay_expr, b);
                 b.store_nb_delay(lower_lvalue(a.left(), b), val, delay, loc(a));
                 return val;
             }
