@@ -907,6 +907,23 @@ struct Inst {
         // §21.4. Lowers to an rt_readmem call.
         ReadMem,
 
+        // -- Value-change dump (VCD, LRM §21.7; see docs/VCD.md) --
+        // $dumpfile("f.vcd"): set the output path (payload: unary, the filename
+        // value). Lowers to an rt_vcd_open call.
+        DumpFile,
+        // $dumpvars: begin dumping (payload: none). Phase 0 supports only the
+        // whole-design form ($dumpvars / $dumpvars(0)); a scope-subset selector is
+        // rejected at the frontend. The backend enumerates every dumpable signal,
+        // emits the descriptor table, and lowers this to an rt_vcd_start call.
+        DumpVars,
+        // $dumpoff / $dumpon / $dumpall / $dumpflush (payload: none). Suspend (with
+        // an all-x checkpoint) / resume / force-dump-now / flush-to-disk. Each
+        // lowers to the matching rt_vcd_* control call.
+        DumpOff,
+        DumpOn,
+        DumpAll,
+        DumpFlush,
+
         // -- System functions --
         // $time / $stime: read the simulation clock, -> 64-bit unsigned (payload:
         // scale). Lowers to a `rt_wheel_now` call; the value is always known (no

@@ -26,6 +26,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Delay:
         case T::Fclose:
         case T::Fflush:
+        case T::DumpFile:
         case T::StrLen:
         case T::StrUpper:
         case T::StrLower:
@@ -122,6 +123,11 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::TimeFormat;
         case T::Break:
         case T::Continue:
+        case T::DumpVars:
+        case T::DumpOff:
+        case T::DumpOn:
+        case T::DumpAll:
+        case T::DumpFlush:
         case T::SimTime:
         case T::Random:
             return K::None;

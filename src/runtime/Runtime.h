@@ -232,6 +232,84 @@ void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8
                 uint32_t count, uint32_t width, int64_t decl_left, int64_t decl_right, int64_t start,
                 int64_t finish, uint32_t flags);
 
+// -- Value-change dump (VCD, LRM 1800-2023 §21.7; design in docs/VCD.md) --
+//
+// Registration is call-based: at the $dumpvars site the backend walks the design
+// scope tree, calling rt_vcd_begin, then rt_vcd_scope / rt_vcd_var / rt_vcd_upscope
+// in tree order, then rt_vcd_start. Each rt_vcd_var passes live pointers to the
+// signal's planes in the design state buffer (stable for the run), so the runtime
+// needs no offset math or state base. See docs/VCD.md.
+
+// rt_vcd_var flags: bit 0 four-state (has x/z), bit 1 net (`wire` vs `reg` var),
+// bit 2 narrow (a 2-state `{ iW }` slot: read the single iW word as the value,
+// with must == may and no z plane).
+#define RT_VCD_FLAG_FOUR_STATE 1u
+#define RT_VCD_FLAG_NET        2u
+#define RT_VCD_FLAG_NARROW     4u
+
+// $dumpfile: record the output path. When `forward` is 0 the path is a right-
+// justified packed-ASCII vector (byte 0 = last character), as the backend spills a
+// packed value; when 1 it is the natural-order bytes of a string object. The file
+// is opened at rt_vcd_begin.
+void rt_vcd_open(const char* path_buf, uint32_t path_len, uint32_t forward);
+
+// Begin the header: open the file and write $date / $version / $timescale. `wheel`
+// is cached for the close-time flush; `tick_fs` / `units` set the timescale.
+void rt_vcd_begin(void* wheel, uint64_t tick_fs, int32_t units);
+
+// $scope module <name> / $upscope: open / close a hierarchy level in the header.
+void rt_vcd_scope(const char* name, uint32_t name_len);
+void rt_vcd_upscope(void);
+
+// Register one dumped variable: `name` its leaf reference, `width` its bit width
+// (1..64 in phase 0), `flags` per RT_VCD_FLAG_*, `mm` its packed must|may plane
+// pointer, `z` its z plane pointer (null for a never-z / narrow slot). Writes the
+// $var line and adds the variable to the scan table.
+void rt_vcd_var(const char* name, uint32_t name_len, uint32_t width, uint32_t flags, const uint8_t* mm,
+                const uint8_t* z);
+
+// Register a whole unpacked-array (memory) as one $var per element, named
+// `<name>[<addr>]` over the declared address range [left:right]. Element k's
+// planes sit at `mm_base + k*stride` (and `z_base + k*stride`, or z_base null for a
+// never-z / narrow memory). `width`/`flags` describe one element. Registering the
+// array in a single call keeps the emitted design independent of the array size.
+void rt_vcd_array(const char* name, uint32_t name_len, uint32_t count, uint32_t width, uint32_t flags,
+                  const uint8_t* mm_base, const uint8_t* z_base, uint32_t stride, int64_t left, int64_t right);
+
+// Finish the header ($enddefinitions) and arm the initial full dump.
+void rt_vcd_start(void);
+
+// Mark variable `idx` changed this instant (activity-driven dirty set). Called
+// from the design at each write to a dumped scalar signal (blocking store and NBA
+// commit); the next rt_vcd_flush visits only the marked variables. A no-op when
+// dumping is not active.
+void rt_vcd_touch(uint32_t idx);
+
+// Mark the `count` variables [base, base+count) changed -- used for a whole
+// unpacked-array (memory) write, where `base` is the array's first element var.
+// A blocking element write touches the single element; an NBA array commit
+// touches the whole array (the runtime queue does not carry per-element indices).
+void rt_vcd_touch_range(uint32_t base, uint32_t count);
+
+// Postponed-region sample at a settled instant, called from the sim loop before
+// the wheel advances (`tick` is rt_wheel_now). Emits changed variables under one
+// `#tick` marker; a no-change instant emits nothing. A no-op when dumping is not
+// active. Also services a pending $dumpoff / $dumpall / $dumpon at this instant.
+void rt_vcd_flush(uint64_t tick);
+
+// $dumpoff / $dumpon / $dumpall / $dumpflush (LRM §21.7.4-7). off/on/all only set
+// a deferred flag serviced by the next rt_vcd_flush, so rt_vcd_flush stays the
+// sole writer and the change lands at the correct instant; dumpflush drains the
+// output buffer to disk immediately.
+void rt_vcd_off(void);
+void rt_vcd_on(void);
+void rt_vcd_all(void);
+void rt_vcd_dumpflush(void);
+
+// Final flush of the in-progress instant + output buffer, then close the file.
+// Called on normal simulation end and on the $finish longjmp path.
+void rt_vcd_close(void);
+
 int32_t rt_random(void);
 
 // -- Plusargs (LRM §21.6) --

@@ -368,6 +368,18 @@ Index Builder::timeformat(Index units, Index precision, std::string_view suffix,
     return emit({ Inst::Tag::TimeFormat, Inst::Payload{ .timeformat = extra } }, loc);
 }
 
+Index Builder::dump_file(Index filename, SourceLoc loc) {
+    return emit({ Inst::Tag::DumpFile, Inst::Payload{ .unary = filename } }, loc);
+}
+
+Index Builder::dump_vars(SourceLoc loc) {
+    return emit({ Inst::Tag::DumpVars, Inst::Payload{ .none = 0 } }, loc);
+}
+
+Index Builder::dump_control(Inst::Tag tag, SourceLoc loc) {
+    return emit({ tag, Inst::Payload{ .none = 0 } }, loc);
+}
+
 Index Builder::sim_time(uint64_t scale, SourceLoc loc) {
     return emit({ Inst::Tag::SimTime, Inst::Payload{ .scale = scale } }, loc);
 }
