@@ -836,8 +836,15 @@ private:
             return ft.floatKind == slang::ast::FloatingType::ShortReal ? module_.pool.shortreal_type
                                                                        : module_.pool.real_type;
         }
+        if (ct.isEvent()) {
+            // Named event (LRM 15.5): no data value. Modeled as a 1-bit logic
+            // placeholder signal whose only role is to own wait queues; the
+            // trigger state lives in a separate per-event timestamp. See
+            // docs/design/named-events.md.
+            return module_.pool.logic_type;
+        }
         if (!ct.isIntegral()) {
-            // TODO: string / chandle / event / class types.
+            // TODO: string / chandle / class types.
             fail("unsupported non-integral type");
         }
 
@@ -1065,14 +1072,20 @@ private:
                         check_drive_strength(net.getDriveStrength(), "a net declaration");
                         info.is_net = true;
                     }
-                    info.name = prefix + std::string(vs.name);
-                    info.type = lower_type(vs.getType());
-                    info.dir  = ir::SignalInfo::Direction::Internal;
+                    info.name     = prefix + std::string(vs.name);
+                    info.type     = lower_type(vs.getType());
+                    info.is_event = vs.getType().isEvent();
+                    info.dir      = ir::SignalInfo::Direction::Internal;
                     if (port_dir != nullptr) {
                         const auto found = port_dir->find(&m);
                         if (found != port_dir->end()) {
                             info.dir = found->second;
                         }
+                    }
+                    if (info.dir != ir::SignalInfo::Direction::Internal && info.is_event) {
+                        // TODO: event ports (LRM 15.5) — needs cross-boundary
+                        // event aliasing (Tier 2, docs/design/named-events.md).
+                        fail("event ports are not supported");
                     }
                     if (info.dir != ir::SignalInfo::Direction::Internal && is_string_ref(info.type)) {
                         // TODO: string module ports (needs string-aware port
@@ -2026,6 +2039,51 @@ private:
         b.wait(edges, l);
     }
 
+    // Resolve the target of `-> e` to the event's synthetic signal, verifying it
+    // is an event (defensive — slang types the target as an event already).
+    ir::Signal trigger_target(const Expression& target) {
+        if (target.kind != ExpressionKind::NamedValue || !target.type->isEvent()) {
+            // TODO: triggering an event element of an array / struct member, or an
+            // event through a hierarchical / handle expression (Tier 2).
+            fail("unsupported event trigger target");
+        }
+        return signal_of(target.as<NamedValueExpression>().symbol);
+    }
+
+    // Lower `-> e` (LRM 15.5.2). The nonblocking `->> e` and any delayed trigger
+    // (`->> #n e`) are Tier 2 (need NBA-region / wheel scheduling of the wake).
+    void lower_event_trigger(const EventTriggerStatement& ev, ir::Builder& b) {
+        if (ev.isNonBlocking) {
+            fail("nonblocking event trigger '->>' is not supported");
+        }
+        if (ev.timing != nullptr) {
+            fail("delayed event trigger ('-> #n e') is not supported");
+        }
+        b.event_trigger(trigger_target(ev.target), loc(ev));
+    }
+
+    // If `e` is an `<event>.triggered` system-method call (LRM 15.5.3), return the
+    // event operand; else nullptr. slang models the property as a system method
+    // whose receiver is arguments()[0].
+    const Expression* triggered_event(const Expression& e) {
+        if (e.kind != ExpressionKind::Call) {
+            return nullptr;
+        }
+        const CallExpression& call = e.as<CallExpression>();
+        if (!call.isSystemCall() || call.getSubroutineName() != "triggered") {
+            return nullptr;
+        }
+        if (call.arguments().empty() || !call.arguments()[0]->type->isEvent()) {
+            return nullptr;
+        }
+        return call.arguments()[0];
+    }
+
+    // NOTE: `wait(...)` is lowered by the general `lower_wait_stmt` below (from
+    // the wait(expr) feature). It subsumes `wait(e.triggered)`: the read set of
+    // the condition includes the event, so `-> e` wakes the wait and the
+    // re-tested `.triggered` (stamped this instant) ends it.
+
     // -- Statements --
 
     void lower_stmt(const Statement& stmt, ir::Builder& b) {
@@ -2127,6 +2185,9 @@ private:
                 break;
             case StatementKind::Return:
                 lower_return(stmt.as<ReturnStatement>(), b);
+                break;
+            case StatementKind::EventTrigger:
+                lower_event_trigger(stmt.as<EventTriggerStatement>(), b);
                 break;
             case StatementKind::Wait:
                 lower_wait_stmt(stmt.as<WaitStatement>(), b);
@@ -3975,6 +4036,11 @@ private:
             }
         }
 
+        // `e.triggered` (LRM 15.5.3): 1-bit "triggered this time step" property.
+        if (const Expression* ev = triggered_event(call)) {
+            return b.event_triggered(event_signal(*ev), l);
+        }
+
         if (fn_ctx_ != nullptr && !fn_ctx_->is_task &&
             (name == "$time" || name == "$stime" || name == "$realtime")) {
             // A function is a plain callable with no wheel pointer in its ABI, so
@@ -4841,6 +4907,12 @@ private:
     // `y = (x = 5)`) can recover its value; the caller truncates to the LHS type.
     // Statement callers discard the return.
     ir::Index lower_assign(const AssignmentExpression& a, ir::Builder& b) {
+        if (a.left().type->isEvent()) {
+            // `e2 = e1` (merge) / `e = null` (LRM 15.5.5): event variables are
+            // handles; assignment aliases the underlying sync object. Tier 2 —
+            // needs event reference semantics (docs/design/named-events.md).
+            fail("event assignment is not supported");
+        }
         if (a.isCompound()) {
             return lower_compound_assign(a, b);
         }
@@ -5083,6 +5155,15 @@ private:
                 // signals are collected (the two-pass lowering below) it flows
                 // through the ordinary signal_of path.
                 const ValueSymbol& sym = expr.as<ValueExpressionBase>().symbol;
+                if (expr.type->isEvent()) {
+                    // A named event has no data value; the legal forms (`@(e)`,
+                    // `-> e`, `e.triggered`) resolve the event symbol directly and
+                    // never reach this value path. This catches the Tier-2 handle
+                    // forms — `e2 = e1` merge, `e == null` — which need event
+                    // reference semantics (docs/design/named-events.md).
+                    fail("event used as a value is not supported (event assignment / "
+                         "comparison / null)");
+                }
                 if (sym.kind == SymbolKind::Parameter) {
                     const ParameterSymbol& p = sym.as<ParameterSymbol>();
                     return b.constant(lower_constant(p.getValue(), p.getType()), l);
