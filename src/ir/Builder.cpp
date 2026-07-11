@@ -347,6 +347,19 @@ Index Builder::case_violation(std::string_view banner, uint32_t kind, SourceLoc 
     return emit({ Inst::Tag::CaseViol, Inst::Payload{ .extra = extra } }, loc);
 }
 
+Index Builder::severity(uint32_t level, std::string_view banner, std::string_view fmt,
+                        std::span<const Index> args, SourceLoc loc) {
+    // Order in the extra buffer: banner bytes, format bytes, then the arg-index
+    // slice, then the SeverityInfo record pointing at all three.
+    const ExtraIndex banner_at = add_bytes(banner);
+    const ExtraIndex fmt_at    = add_bytes(fmt);
+    const ExtraSlice slice     = add_slice(args);
+    const ExtraIndex extra     = add_extra(SeverityInfo{
+      banner_at, static_cast<uint32_t>(banner.size()), fmt_at, static_cast<uint32_t>(fmt.size()),
+      level, slice });
+    return emit({ Inst::Tag::Severity, Inst::Payload{ .extra = extra } }, loc);
+}
+
 Index Builder::fflush(Index handle, SourceLoc loc) {
     return emit({ Inst::Tag::Fflush, Inst::Payload{ .unary = handle } }, loc);
 }

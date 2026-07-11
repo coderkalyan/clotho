@@ -184,6 +184,13 @@ public:
     // item matched, 1 = overlapping items). Non-fatal, warns and returns. No SSA
     // operands.
     Index case_violation(std::string_view banner, uint32_t kind, SourceLoc loc);
+    // Severity report ($info / $warning / $error / $fatal, LRM 20.10, or an
+    // immediate-assertion default failure, LRM 16.3). `level` is the ir::Severity
+    // label; `banner` the compile-time prefix "<file>:<line>: "; `fmt` + `args`
+    // the $display-style message (both empty for a bare `$error;`). Non-fatal,
+    // renders and returns; $fatal's termination is a following finish().
+    Index severity(uint32_t level, std::string_view banner, std::string_view fmt,
+                   std::span<const Index> args, SourceLoc loc);
     // $fflush: flush the descriptor `handle`'s output buffers. The no-argument
     // form passes a constant 0 (the runtime flushes every open stream).
     Index fflush(Index handle, SourceLoc loc);

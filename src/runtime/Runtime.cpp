@@ -1494,6 +1494,27 @@ extern "C" void rt_case_violation(const char* banner, uint64_t now, int32_t kind
     std::fflush(stderr);
 }
 
+extern "C" void rt_severity(int32_t level, const char* banner, const char* fmt, uint32_t argc,
+                            const rt_arg* argv) {
+    // $info / $warning / $error / $fatal (LRM 20.10) or an immediate-assertion
+    // default failure (LRM 16.3). A simulator diagnostic, not design output, so
+    // it goes to stderr like the $finish / case-violation banners; flush stdout
+    // first so buffered $display text is committed before the report interleaves.
+    // The exact layout is not LRM-mandated; "<LABEL>: <file>:
+    // <line>: <message>" tracks iverilog's first report line.
+    static const char* const labels[] = { "INFO", "WARNING", "ERROR", "FATAL" };
+    const char* const        label    = labels[level < 4 ? level : 2];
+    io_ensure_init();
+    std::fflush(stdout);
+    std::string line = label;
+    line += ": ";
+    line += banner;
+    render(line, fmt, argc, argv);
+    line += '\n';
+    std::fputs(line.c_str(), stderr);
+    std::fflush(stderr);
+}
+
 extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*),
                            void (*finals)(void*, void*)) {
     // Run the simulation, then the `final` blocks (LRM 9.2.3), so the finals see

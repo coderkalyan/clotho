@@ -205,6 +205,8 @@ const char* tag_name(Inst::Tag tag) {
             return "finish";
         case T::CaseViol:
             return "case_viol";
+        case T::Severity:
+            return "severity";
         case T::Break:
             return "break";
         case T::Continue:
@@ -481,6 +483,16 @@ private:
             case Inst::PayloadKind::Display: {
                 const auto info = ir_.extra_data<DisplayInfo>(p.display);
                 os_ << '"' << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
+                for (Index a : ir_.region(info.args)) {
+                    os_ << ", ";
+                    ref(a);
+                }
+                break;
+            }
+            case Inst::PayloadKind::Severity: {
+                const auto info = ir_.extra_data<SeverityInfo>(p.extra);
+                os_ << "level" << info.level << ", \"" << ir_.extra_bytes(info.banner, info.banner_len)
+                    << "\", \"" << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
                 for (Index a : ir_.region(info.args)) {
                     os_ << ", ";
                     ref(a);

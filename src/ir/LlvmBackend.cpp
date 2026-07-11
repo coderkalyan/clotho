@@ -3129,6 +3129,7 @@ private:
                 case Inst::Tag::Display:
                 case Inst::Tag::Finish:
                 case Inst::Tag::CaseViol:
+                case Inst::Tag::Severity:
                 case Inst::Tag::Fflush:
                 case Inst::Tag::Fclose:
                 case Inst::Tag::Fopen:
@@ -4984,6 +4985,7 @@ private:
             case Inst::Tag::TimeFormat:
             case Inst::Tag::Finish:
             case Inst::Tag::CaseViol:
+            case Inst::Tag::Severity:
             case Inst::Tag::Fflush:
             case Inst::Tag::Fclose:
             case Inst::Tag::Sformat:
@@ -5700,6 +5702,14 @@ private:
                 // priority-case violation: rt_case_violation warns and returns
                 // (non-fatal), so the region continues normally after it.
                 lower_case_viol(i);
+                return;
+
+            case Inst::Tag::Severity:
+                // $info / $warning / $error / $fatal report (LRM 20.10) or an
+                // immediate-assertion default failure (LRM 16.3): rt_severity
+                // renders the message and returns (non-fatal). $fatal's
+                // termination is a separate Finish following this node.
+                lower_severity(i);
                 return;
 
             case Inst::Tag::Fflush:
@@ -6484,6 +6494,31 @@ private:
                                   : static_cast<llvm::Value*>(b_.getInt64(0));
         b_.CreateCall(case_violation_fn(),
                       { b_.CreateGlobalString(banner), now, b_.getInt32(info.arg) });
+    }
+
+    // void rt_severity(i32 level, ptr banner, ptr fmt, i32 argc, ptr argv) —
+    // renders the message and writes the labelled diagnostic to stderr, then
+    // returns (non-fatal).
+    llvm::FunctionCallee severity_fn() {
+        return rt_fn("rt_severity", b_.getVoidTy(),
+                     { b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
+    }
+
+    // Lower a severity report ($info / $warning / $error / $fatal, or an
+    // immediate-assertion default failure): build the message descriptor array
+    // and call the runtime, passing the severity label, compile-time banner, and
+    // format string. Needs no wheel (the report carries no simulation time), so
+    // it lowers cleanly inside a pure function too.
+    void lower_severity(Index i) {
+        const auto  info = ir_->extra_data<SeverityInfo>(ir_->payload(i).extra);
+        const std::string banner = ir_->extra_bytes(info.banner, info.banner_len);
+        const std::string fmt    = ir_->extra_bytes(info.fmt, info.fmt_len);
+
+        const std::span<const Index> args = ir_->region(info.args);
+        llvm::Value*                 arr  = build_rt_args(args, "severity task");
+        b_.CreateCall(severity_fn(), { b_.getInt32(static_cast<int32_t>(info.level)),
+                                       b_.CreateGlobalString(banner), b_.CreateGlobalString(fmt),
+                                       b_.getInt32(static_cast<uint32_t>(args.size())), arr });
     }
 
     // Whether wheel_ points at a live timing wheel: true in a process or task
