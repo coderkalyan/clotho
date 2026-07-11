@@ -37,6 +37,16 @@ public:
     // gives its storage width / domain.
     Index local(uint32_t index, Ref type, SourceLoc loc);
 
+    // -- Named events (LRM 15.5) --
+    // `-> e`: blocking trigger of the event whose synthetic signal is `sig`.
+    Index event_trigger(Signal sig, SourceLoc loc);
+    // `e.triggered`: 1-bit "triggered this time step" property of event `sig`.
+    Index event_triggered(Signal sig, SourceLoc loc);
+    // `->> e`: nonblocking trigger of event `sig` (deferred to the NBA region).
+    Index event_trigger_nb(Signal sig, SourceLoc loc);
+    // `->> #d e`: delayed nonblocking trigger; `delay` is the tick count.
+    Index event_trigger_nb_delayed(Signal sig, Index delay, SourceLoc loc);
+
     // -- Generic ops sharing a payload shape --
     // tag must be a unary-payload op (load, bnot, lnot, red_*, ret).
     Index unary(Inst::Tag tag, Index op, SourceLoc loc);
@@ -73,6 +83,13 @@ public:
     // Unpacked-array element select base[index]. `array_type` is the interned
     // UnpackedArray type being indexed (gives element stride + declared bounds).
     Index elem_select(Index base, Index index, Ref array_type, SourceLoc loc);
+    // Unpacked-struct member select base.field. `field_index` is the member's
+    // declaration-order position; `struct_type` is the interned unpacked
+    // Kind::Struct type being accessed (gives per-member layout).
+    Index member_select(Index base, uint32_t field_index, Ref struct_type, SourceLoc loc);
+    // Whole-object blocking copy `dst = src` of two aggregate lvalues of `type`
+    // (lowered to llvm.memcpy of the storage; caller ensures no string leaf).
+    Index agg_copy(Index dst, Index src, Ref type, SourceLoc loc);
     // `unlikely` hints that the condition is rarely true (e.g. a violation
     // check), so the backend biases branch weights toward the else path.
     Index cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc,
@@ -144,6 +161,11 @@ public:
     // an input formal, an lvalue leaf (a caller temp) for an output / inout formal.
     // A statement, never a value; the caller blocks until the task completes.
     Index task_call(FunctionId func, std::span<const Index> args, SourceLoc loc);
+
+    // Fork `fork … join` (LRM 9.3.2): spawn each child body as a concurrent
+    // coroutine, then join per `kind`. `children` are the fork-child task
+    // FunctionIds. A statement, never a value.
+    Index fork(std::span<const FunctionId> children, ForkKind kind, SourceLoc loc);
 
     // -- System tasks --
     // $display / $write: a literal format string, a newline flag (true for

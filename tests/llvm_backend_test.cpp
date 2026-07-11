@@ -802,11 +802,11 @@ TEST_CASE("delay suspends and reschedules on the wheel") {
     )";
     const std::string          ir  = emit(src);
 
-    // #20 lowers to: read current tick, schedule a wheel timer, and suspend. The
-    // coroutine intrinsics themselves are lowered away by CoroSplit; the runtime
-    // calls are what remain.
-    CHECK(ir.find("call i64 @rt_wheel_now") != std::string::npos);
-    CHECK(ir.find("call void @rt_wheel_schedule") != std::string::npos);
+    // #20 lowers to: schedule a wheel timer relative to now (one ABI crossing, the
+    // runtime adds `now`), and suspend. The coroutine intrinsics themselves are
+    // lowered away by CoroSplit; the runtime calls are what remain.
+    CHECK(ir.find("call i64 @rt_wheel_now") == std::string::npos);
+    CHECK(ir.find("call void @rt_wheel_schedule_rel") != std::string::npos);
     // The timer callback that wakes the suspended coroutine by pushing its handle
     // onto the active queue.
     CHECK(ir.find("define internal void @clotho.enqueue_timer") != std::string::npos);

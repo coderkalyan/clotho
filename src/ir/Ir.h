@@ -180,6 +180,32 @@ struct ElemSelect {
     Ref array_type;
 };
 
+// Extra payload for `agg_copy`: a whole-object blocking copy of one aggregate
+// lvalue into another (both of `type`). The op is the destination lvalue; `src`
+// the source lvalue. Lowered to a single llvm.memcpy of the aggregate storage —
+// valid only when the aggregate has no string (heap-owning) leaf, which the
+// frontend checks before emitting it.
+struct AggCopyInfo {
+    // Source aggregate lvalue.
+    Index src;
+    // The aggregate type (gives the storage size to copy).
+    Ref type;
+};
+
+// Extra payload for `member_select`: a member of an unpacked struct (the base is
+// the op). Unlike a packed struct member (a constant part-select over a flat
+// bit-vector), an unpacked struct is an aggregate whose members have their own
+// storage, so a member is addressed by its declaration-order field index into
+// the struct's backing StructType, not a bit offset. `field_index` is the
+// member's position in declaration order; `struct_type` is the interned
+// Kind::Struct (is_packed=false) type, giving the member layout.
+struct MemberSelect {
+    // Declaration-order field index of the selected member.
+    uint32_t field_index;
+    // The unpacked Kind::Struct type being accessed.
+    Ref struct_type;
+};
+
 // Extra payload for `read_mem`: a $readmemh / $readmemb load of a file into an
 // unpacked-array memory. The filename value is the instruction's `op`: either a
 // packed-ASCII vector (the backend spills its must-bits to a byte buffer) or a
@@ -220,6 +246,22 @@ struct TaskCallInfo {
     FunctionId func;
     // One operand per formal, in order (value for input, lvalue for output/inout).
     ExtraSlice args;
+};
+
+// Join discipline of a fork block (LRM 9.3.2). V1 implements Join only.
+enum class ForkKind : uint32_t {
+    Join,     // parent blocks until all children complete
+    JoinAny,  // parent blocks until the first child completes (V2)
+    JoinNone, // parent does not block (V2)
+};
+
+// Extra payload for `Fork` (LRM 9.3.2). Each child statement of the fork was
+// lowered into its own argument-less fork-child task (Function::is_fork_child);
+// `children` holds their FunctionIds as raw u32s (one per parallel process).
+struct ForkInfo {
+    // FunctionIds of the child bodies, stored as u32 (FunctionId is a u32 enum).
+    ExtraSlice children;
+    ForkKind   kind;
 };
 
 // Extra payload for `cond`: the then / else regions (the condition is the op).
@@ -590,13 +632,23 @@ struct WaitInfo {
     ExtraSlice events;
 };
 
+// Extra payload for `event_trigger_nb_delayed` (`->> #d e`): the target event
+// signal. The delay (in wheel ticks) is the instruction's `op` operand.
+struct EventDelayInfo {
+    // Event whose synthetic signal owns the wait queue to service on expiry.
+    Signal event;
+};
+
 static_assert(ExtraPayload<ExtraSlice>);
 static_assert(ExtraPayload<CallInfo>);
 static_assert(ExtraPayload<TaskCallInfo>);
+static_assert(ExtraPayload<ForkInfo>);
 static_assert(ExtraPayload<Select>);
 static_assert(ExtraPayload<PartSelect>);
 static_assert(ExtraPayload<DynPartSelect>);
 static_assert(ExtraPayload<ElemSelect>);
+static_assert(ExtraPayload<MemberSelect>);
+static_assert(ExtraPayload<AggCopyInfo>);
 static_assert(ExtraPayload<ReadMemInfo>);
 static_assert(ExtraPayload<Regions>);
 static_assert(ExtraPayload<LoopInfo>);
@@ -655,6 +707,11 @@ struct Inst {
         // storage size, not one bit, and the index is normalized against the
         // array's declared bounds.
         ElemSelect,
+        // Unpacked-struct member select base.field (payload: op_extra ->
+        // MemberSelect). The base is an unpacked struct aggregate; the member is
+        // addressed by declaration-order field index into the backing StructType,
+        // not a bit offset (a packed struct member is a PartSelect instead).
+        MemberSelect,
 
         // -- State access --
         // Read the current value of an lvalue (payload: unary).
@@ -673,6 +730,10 @@ struct Inst {
         // occurrences of the trigger edge, without blocking the process (payload:
         // op_extra -> StoreNbEventInfo; the op is the whole-signal lvalue).
         StoreNbEvent,
+        // Whole-object blocking copy of one aggregate into another (payload:
+        // op_extra -> AggCopyInfo). Lowered to llvm.memcpy of the storage; the
+        // frontend emits it only for a string-free aggregate.
+        AggCopy,
 
         // -- Arithmetic (payload: binary) --
         Add,
@@ -845,6 +906,34 @@ struct Inst {
         // registering the process on each event's wait queue plus a coroutine
         // suspend; a matching blocking assignment to one of the signals wakes it.
         Wait,
+        // Blocking trigger of a named event `-> e` (payload: signal, the event's
+        // synthetic signal). Records the trigger time (for `.triggered`) and
+        // unconditionally services the event signal's Any-edge wait queues,
+        // waking every `@(e)` / `always @(e)` waiter in the current instant
+        // (LRM 15.5.2). An event has no value, so there is no edge computation.
+        EventTrigger,
+        // The `e.triggered` event property (payload: signal), -> a definite 1-bit
+        // value: 1 iff the event was triggered in the current time step, else 0
+        // (LRM 15.5.3). Lowers to a compare of the recorded trigger time against
+        // the current sim time.
+        EventTriggered,
+        // Nonblocking trigger of a named event `->> e` (payload: signal). Unlike
+        // EventTrigger, the wake is deferred to the NBA region of the current time
+        // step (LRM 15.5.4): it marks the event pending; the NBA region then
+        // stamps the trigger time and services the waiters. The triggering process
+        // does not block.
+        EventTriggerNb,
+        // Delayed nonblocking trigger `->> #d e` (payload: op_extra -> op is the
+        // delay in wheel ticks, extra -> EventDelayInfo names the event). Schedules
+        // a detached wheel timer that, on expiry, stamps the trigger time and
+        // services the event's waiters (LRM 15.5.4). The triggering process does
+        // not block. The event-controlled form (`->> @(x) e`) is not lowered here.
+        EventTriggerNbDelayed,
+        // Fork block `fork … join` (payload: extra -> ForkInfo). A statement that
+        // spawns each child body as its own coroutine (an argument-less fork-child
+        // task), then — for `join` — suspends the parent until all children
+        // complete. Only legal inside a coroutine (process or task). LRM 9.3.2.
+        Fork,
 
         // -- String ops (operands are string values unless noted) --
         // s.len() -> 32-bit signed (payload: unary).

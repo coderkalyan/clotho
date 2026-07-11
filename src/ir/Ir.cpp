@@ -9,6 +9,9 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Constant:
             return K::Ref;
         case T::Signal:
+        case T::EventTrigger:
+        case T::EventTriggered:
+        case T::EventTriggerNb:
             return K::Signal;
         case T::Arg:
             return K::Arg;
@@ -135,6 +138,10 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::CaseViol:
         case T::TestPlusArgs:
             return K::Extra;
+        case T::Fork:
+            // Children are FunctionIds (not SSA operands), walked from ForkInfo;
+            // the op has no top-level operands, so it rides the Extra path.
+            return K::Extra;
         case T::Severity:
             return K::Severity;
         case T::Wait:
@@ -147,6 +154,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::PartSelect:
         case T::DynPartSelect:
         case T::ElemSelect:
+        case T::MemberSelect:
+        case T::AggCopy:
         case T::Cond:
         case T::Switch:
         case T::Fopen:
@@ -160,6 +169,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::EnumName:
         case T::CountBits:
         case T::ValuePlusArgs:
+        case T::EventTriggerNbDelayed:
             return K::OpExtra;
     }
 
@@ -358,6 +368,13 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 scratch[2]      = info.count;
                 return { scratch.data(), 3 };
             }
+            if (tag == Inst::Tag::AggCopy) {
+                // Both the destination (op) and source lvalues are referenced.
+                const auto info = extra_data<AggCopyInfo>(p.op_extra.extra);
+                scratch[0]      = p.op_extra.op;
+                scratch[1]      = info.src;
+                return { scratch.data(), 2 };
+            }
             scratch[0] = p.op_extra.op;
             return { scratch.data(), 1 };
     }
@@ -376,6 +393,7 @@ LvalueRoot lvalue_root(const Ir& ir, Index lv) {
             case Inst::Tag::PartSelect:
             case Inst::Tag::DynPartSelect:
             case Inst::Tag::ElemSelect:
+            case Inst::Tag::MemberSelect:
                 lv    = ir.payload(lv).op_extra.op;
                 whole = false;
                 break;

@@ -1044,6 +1044,14 @@ extern "C" void rt_wheel_schedule(rt_wheel* wheel, rt_timer* timer, uint64_t dea
     unwrap(wheel)->schedule(unwrap(timer), deadline, reinterpret_cast<RuntimeWheel::Callback>(on_expire));
 }
 
+extern "C" void rt_wheel_schedule_rel(rt_wheel* wheel, rt_timer* timer, uint64_t delay, rt_timer_fn on_expire) {
+    // now + delay computed runtime-side so a #delay crosses the ABI once, not
+    // twice (rt_wheel_now then rt_wheel_schedule). See rt_wheel_schedule for the
+    // callback-cast rationale.
+    RuntimeWheel& w = *unwrap(wheel);
+    w.schedule(unwrap(timer), w.now() + delay, reinterpret_cast<RuntimeWheel::Callback>(on_expire));
+}
+
 extern "C" void rt_wheel_tick(rt_wheel* wheel, void* ctx) {
     unwrap(wheel)->tick(ctx);
 }

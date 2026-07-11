@@ -44,6 +44,19 @@ void render_type(const InternPool& pool, Ref type, std::ostream& os) {
         case Type::Kind::String:
             os << "string";
             break;
+        case Type::Kind::Struct: {
+            const auto fields = pool.struct_fields(t.fields_id);
+            os << (t.is_packed ? "struct packed{" : "struct{");
+            for (size_t i = 0; i < fields.size(); ++i) {
+                if (i != 0) {
+                    os << ", ";
+                }
+                os << fields[i].name << ":";
+                render_type(pool, fields[i].type, os);
+            }
+            os << "}";
+            break;
+        }
     }
 }
 
@@ -65,6 +78,10 @@ const char* tag_name(Inst::Tag tag) {
             return "part_select";
         case T::ElemSelect:
             return "elem_select";
+        case T::MemberSelect:
+            return "member_select";
+        case T::AggCopy:
+            return "agg_copy";
         case T::Load:
             return "load";
         case T::Store:
@@ -155,12 +172,22 @@ const char* tag_name(Inst::Tag tag) {
             return "call";
         case T::TaskCall:
             return "task_call";
+        case T::Fork:
+            return "fork";
         case T::Loop:
             return "loop";
         case T::Delay:
             return "delay";
         case T::Wait:
             return "wait";
+        case T::EventTrigger:
+            return "event_trigger";
+        case T::EventTriggered:
+            return "event_triggered";
+        case T::EventTriggerNb:
+            return "event_trigger_nb";
+        case T::EventTriggerNbDelayed:
+            return "event_trigger_nb_delayed";
         case T::StrLen:
             return "str_len";
         case T::StrGetc:
@@ -593,6 +620,20 @@ private:
                 os_ << "[";
                 ref(es.index);
                 os_ << "])\n";
+                break;
+            }
+            case Inst::Tag::MemberSelect: {
+                const MemberSelect ms = ir_.extra_data<MemberSelect>(p.op_extra.extra);
+                ref(p.op_extra.op);
+                os_ << "." << ms.field_index << ")\n";
+                break;
+            }
+            case Inst::Tag::AggCopy: {
+                const AggCopyInfo info = ir_.extra_data<AggCopyInfo>(p.op_extra.extra);
+                ref(p.op_extra.op);
+                os_ << " = ";
+                ref(info.src);
+                os_ << ")\n";
                 break;
             }
             case Inst::Tag::StrPutc: {

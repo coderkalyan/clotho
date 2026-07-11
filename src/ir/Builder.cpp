@@ -39,6 +39,23 @@ Index Builder::local(uint32_t index, Ref type, SourceLoc loc) {
     return emit({ Inst::Tag::Local, Inst::Payload{ .local = { index, type } } }, loc);
 }
 
+Index Builder::event_trigger(Signal sig, SourceLoc loc) {
+    return emit({ Inst::Tag::EventTrigger, Inst::Payload{ .signal = sig } }, loc);
+}
+
+Index Builder::event_triggered(Signal sig, SourceLoc loc) {
+    return emit({ Inst::Tag::EventTriggered, Inst::Payload{ .signal = sig } }, loc);
+}
+
+Index Builder::event_trigger_nb(Signal sig, SourceLoc loc) {
+    return emit({ Inst::Tag::EventTriggerNb, Inst::Payload{ .signal = sig } }, loc);
+}
+
+Index Builder::event_trigger_nb_delayed(Signal sig, Index delay, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(EventDelayInfo{ sig });
+    return emit({ Inst::Tag::EventTriggerNbDelayed, Inst::Payload{ .op_extra = { delay, extra } } }, loc);
+}
+
 Index Builder::unary(Inst::Tag tag, Index op, SourceLoc loc) {
     return emit({ tag, Inst::Payload{ .unary = op } }, loc);
 }
@@ -108,6 +125,18 @@ Index Builder::elem_select(Index base, Index index, Ref array_type, SourceLoc lo
     const ExtraIndex extra = add_extra(ElemSelect{ index, array_type });
 
     return emit({ Inst::Tag::ElemSelect, Inst::Payload{ .op_extra = { base, extra } } }, loc);
+}
+
+Index Builder::member_select(Index base, uint32_t field_index, Ref struct_type, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(MemberSelect{ field_index, struct_type });
+
+    return emit({ Inst::Tag::MemberSelect, Inst::Payload{ .op_extra = { base, extra } } }, loc);
+}
+
+Index Builder::agg_copy(Index dst, Index src, Ref type, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(AggCopyInfo{ src, type });
+
+    return emit({ Inst::Tag::AggCopy, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
 }
 
 Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc,
@@ -248,6 +277,19 @@ Index Builder::task_call(FunctionId func, std::span<const Index> args, SourceLoc
     const ExtraIndex extra = add_extra(TaskCallInfo{ func, slice });
 
     return emit({ Inst::Tag::TaskCall, Inst::Payload{ .extra = extra } }, loc);
+}
+
+Index Builder::fork(std::span<const FunctionId> children, ForkKind kind, SourceLoc loc) {
+    // FunctionId is a u32 enum; store the child ids in the extra arena as raw u32s
+    // (the same encoding add_slice uses for Index operands).
+    const auto start = static_cast<ExtraIndex>(extra_.size());
+    for (const FunctionId c : children) {
+        extra_.push_back(static_cast<uint32_t>(c));
+    }
+    const ExtraSlice slice{ start, static_cast<ExtraIndex>(extra_.size()) };
+    const ExtraIndex extra = add_extra(ForkInfo{ slice, kind });
+
+    return emit({ Inst::Tag::Fork, Inst::Payload{ .extra = extra } }, loc);
 }
 
 Index Builder::display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc) {

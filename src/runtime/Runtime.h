@@ -511,7 +511,7 @@ void  rt_free(void* p);
 // hold the concrete clotho::Wheel (both checked in Runtime.cpp); the design never
 // inspects it.
 typedef struct rt_wheel {
-    alignas(8) unsigned char storage[2560];
+    alignas(8) unsigned char storage[9216];
 } rt_wheel;
 
 // Intrusive timer node the design embeds inside an owning awaiter and recovers
@@ -546,6 +546,11 @@ int rt_wheel_pending(const rt_wheel* wheel);
 // Link `timer` to fire at absolute tick `deadline` (must be > rt_wheel_now),
 // calling `on_expire(timer, ctx)` when it fires.
 void rt_wheel_schedule(rt_wheel* wheel, rt_timer* timer, uint64_t deadline, rt_timer_fn on_expire);
+
+// Like rt_wheel_schedule but the deadline is `rt_wheel_now + delay`, computed
+// runtime-side so a #delay crosses the C ABI once instead of twice. `delay`
+// must be > 0 (a #0 never reaches the wheel — it parks in the inactive queue).
+void rt_wheel_schedule_rel(rt_wheel* wheel, rt_timer* timer, uint64_t delay, rt_timer_fn on_expire);
 
 // Jump to the next non-empty tick and fire its timers in list order, passing
 // `ctx` to each callback. A no-op on an idle wheel. A node is unlinked before

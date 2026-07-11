@@ -179,6 +179,7 @@ struct Analysis {
                 case Inst::Tag::PartSelect:
                 case Inst::Tag::DynPartSelect:
                 case Inst::Tag::ElemSelect:
+                case Inst::Tag::MemberSelect:
                     val_z[raw] = z_of(p.op_extra.op);
                     break;
 
@@ -199,6 +200,14 @@ struct Analysis {
                 case Inst::Tag::StoreNbEvent: {
                     const auto info = ir.extra_data<StoreNbEventInfo>(p.op_extra.extra);
                     store_into(ir, fn, p.op_extra.op, z_of(info.value) != 0);
+                    break;
+                }
+                case Inst::Tag::AggCopy: {
+                    // A whole-object copy propagates the source's may-z to the
+                    // destination (a plain-array memcpy requires both to share the
+                    // z layout; an aggregate uses conservative z regardless).
+                    const auto info = ir.extra_data<AggCopyInfo>(p.op_extra.extra);
+                    store_into(ir, fn, p.op_extra.op, storage_z(ir, fn, info.src));
                     break;
                 }
 
@@ -376,6 +385,7 @@ struct Analysis {
                 case Inst::Tag::Continue:
                 case Inst::Tag::Delay:
                 case Inst::Tag::Wait:
+                case Inst::Tag::Fork:
                 case Inst::Tag::Display:
                 case Inst::Tag::TimeFormat:
                 case Inst::Tag::Finish:
@@ -384,6 +394,13 @@ struct Analysis {
                 case Inst::Tag::Fflush:
                 case Inst::Tag::SimTime:
                 case Inst::Tag::Random:
+                // `-> e` / `->> e` / `->> #d e` are valueless; `e.triggered` is a
+                // definite 2-state bit. A named event carries no bit planes, so
+                // none seed z.
+                case Inst::Tag::EventTrigger:
+                case Inst::Tag::EventTriggerNb:
+                case Inst::Tag::EventTriggerNbDelayed:
+                case Inst::Tag::EventTriggered:
                 // $clog2 yields a count (or X when the operand has unknown bits);
                 // its result z plane is always zero.
                 case Inst::Tag::Clog2:

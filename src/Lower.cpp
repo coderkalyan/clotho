@@ -338,6 +338,15 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     // `always @*` (Comb procedures reject timing controls at elaboration).
     void handle(const TimedStatement& t) { t.stmt.visit(*this); }
 
+    // A `fork` block's children are independent concurrent processes (LRM 9.3.2)
+    // with their own sensitivity — their reads never wake the parent process, so
+    // do not descend into them. A plain sequential block descends as usual.
+    void handle(const BlockStatement& blk) {
+        if (blk.blockKind == slang::ast::StatementBlockKind::Sequential) {
+            visitDefault(blk);
+        }
+    }
+
     void handle(const UnaryExpression& u) {
         switch (u.op) {
             case UnaryOperator::Preincrement:
@@ -836,8 +845,64 @@ private:
             return ft.floatKind == slang::ast::FloatingType::ShortReal ? module_.pool.shortreal_type
                                                                        : module_.pool.real_type;
         }
+        if (ct.isStruct()) {
+            // Checked ahead of the isIntegral() fallback below: PackedStructType
+            // derives IntegralType in slang (LRM 7.2.1 - a packed struct is a
+            // single bit-vector value), so without this branch a packed struct
+            // would silently fall through to make_int_type and lose its field
+            // identity (member access / assignment patterns need it; whole-
+            // object declare/assign works either way since the storage is the
+            // same bit-vector shape).
+            if (const auto cached = struct_type_cache_.find(&ct); cached != struct_type_cache_.end()) {
+                return cached->second;
+            }
+
+            const bool   is_packed = !ct.isUnpackedStruct();
+            const Scope& body      = is_packed ? static_cast<const Scope&>(ct.as<slang::ast::PackedStructType>())
+                                               : static_cast<const Scope&>(ct.as<slang::ast::UnpackedStructType>());
+            std::vector<ir::Field> fields;
+            for (const auto& f : body.membersOfType<slang::ast::FieldSymbol>()) {
+                if (!is_packed && f.getType().getCanonicalType().isUnpackedUnion()) {
+                    // Unpacked unions are not lowered (packed union member access
+                    // is also guarded). Every other member type — scalar, string,
+                    // real, unpacked array, nested unpacked struct — is backed by
+                    // the recursive aggregate storage model.
+                    fail("unpacked union member is not supported");
+                }
+                // Packed member: `bitOffset` is the field's bit position. Unpacked
+                // member: addressed by declaration index (`fieldIndex`), no flat
+                // offset — store the index so the field table is self-describing.
+                fields.push_back({ std::string(f.name), lower_type(f.getType()),
+                                   is_packed ? static_cast<uint32_t>(f.bitOffset) : f.fieldIndex });
+            }
+
+            ir::Type t;
+            t.kind      = ir::Type::Kind::Struct;
+            t.is_signed = is_packed && ct.isSigned();
+            t.is_packed = is_packed;
+            // Packed: the whole-value scalar domain / width (shares PackedArray
+            // layout). Unpacked: element / bounds are unused (layout reports the
+            // width-0 aggregate sentinel), but element carries the domain for
+            // completeness.
+            t.element   = ct.isFourState() ? module_.pool.logic_type : module_.pool.bit_type;
+            t.left      = is_packed ? ct.getBitWidth() - 1 : 0;
+            t.right     = 0;
+            t.fields_id = module_.pool.intern_struct_fields(std::move(fields));
+
+            const ir::Ref ref = module_.pool.put(ir::Item{ t });
+            struct_type_cache_.emplace(&ct, ref);
+
+            return ref;
+        }
+        if (ct.isEvent()) {
+            // Named event (LRM 15.5): no data value. Modeled as a 1-bit logic
+            // placeholder signal whose only role is to own wait queues; the
+            // trigger state lives in a separate per-event timestamp. See
+            // docs/design/named-events.md.
+            return module_.pool.logic_type;
+        }
         if (!ct.isIntegral()) {
-            // TODO: string / chandle / event / class types.
+            // TODO: string / chandle / class types.
             fail("unsupported non-integral type");
         }
 
@@ -847,6 +912,263 @@ private:
     // True if an expression's type is a fixed-size unpacked array (a memory).
     static bool is_unpacked_array(const slang::ast::Expression& e) {
         return e.type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() != nullptr;
+    }
+
+    // True if a type is an unpacked struct (aggregate storage; whole-object ops
+    // decompose field-wise, distinct from a packed struct's flat bit-vector).
+    static bool is_unpacked_struct(const slang::ast::Type& t) {
+        return t.getCanonicalType().isUnpackedStruct();
+    }
+
+    // True if a type contains an unpacked struct at any nesting depth (a bare
+    // struct or an unpacked array whose leaf is one): it is backed by the
+    // recursive aggregate model, so whole-object assignment / initialization
+    // routes through the aggregate copy path, not the flat scalar/array path.
+    static bool is_aggregate(const slang::ast::Type& t) {
+        const slang::ast::Type& ct = t.getCanonicalType();
+        if (ct.isUnpackedStruct()) {
+            return true;
+        }
+        if (const auto* arr = ct.as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
+            return is_aggregate(arr->elementType);
+        }
+        return false;
+    }
+
+    // Store a whole unpacked struct: one blocking store per member (the aggregate
+    // has no flat value, so a whole-object copy decomposes field-wise). `lhs_base`
+    // is the struct's lvalue; `sty` its interned Kind::Struct type. The RHS is
+    // either a `'{...}` assignment pattern (per-field element expressions, already
+    // in declaration order and type-converted by slang) or another struct lvalue
+    // (member-by-member copy). Members are scalar (nested unpacked struct members
+    // are guarded at lower_type), so each store is a plain scalar store.
+    void emit_struct_store(ir::Index lhs_base, ir::Ref sty, const Expression& rhs,
+                           ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
+        emit_agg_store(lhs_base, sty, rhs, tag, b, l);
+    }
+
+    // Store an aggregate whole-object value into `lhs` (an aggregate lvalue of
+    // type `type`), decomposing to per-leaf stores. RHS is a `'{...}` pattern
+    // (per-field elements, recursed for aggregate members), a leaf value, or
+    // another aggregate lvalue (member-by-member copy). A nonblocking store
+    // samples each leaf's RHS now and commits per-leaf, which is whole-object NBA
+    // semantics. Array-typed members are guarded (element-wise unroll is a
+    // follow-up), so nesting is struct-through-struct here.
+    void emit_agg_store(ir::Index lhs, ir::Ref type, const Expression& rhs,
+                        ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        if (const auto* pat = as_assignment_pattern(rhs)) {
+            if (t.kind != ir::Type::Kind::Struct || t.is_packed) {
+                fail("'{...} assignment pattern over an unpacked-array aggregate is not supported");
+            }
+            const auto fields = module_.pool.struct_fields(t.fields_id);
+            const auto elems  = pat->elements();
+            for (uint32_t i = 0; i < fields.size(); ++i) {
+                emit_agg_store(b.member_select(lhs, i, type, l), fields[i].type, *elems[i], tag, b, l);
+            }
+            return;
+        }
+        if (is_leaf_ref(type)) {
+            b.binary(tag, lhs, lower_expr(rhs, b), l);
+            return;
+        }
+        // Aggregate RHS: another struct/array lvalue, or an aggregate-returning
+        // call (the callee writes into a caller temp — the Call's lvalue — which
+        // this copies into the target).
+        const Expression& src = unwrap_conversion(rhs);
+        if (src.kind == ExpressionKind::Call) {
+            const std::optional<ir::Index> cv = lower_user_call(src.as<CallExpression>(), b);
+            if (!cv) {
+                fail("aggregate assignment from a void call");
+            }
+            if (tag == ir::Inst::Tag::Store && is_string_free(type)) {
+                b.agg_copy(lhs, *cv, type, l);
+            } else {
+                emit_agg_copy(lhs, *cv, type, tag, b, l);
+            }
+            return;
+        }
+        if (!is_struct_lvalue_shape(src)) {
+            fail("unsupported unpacked struct rvalue (only '{...} patterns, struct "
+                 "variables, and function results are supported)");
+        }
+        const ir::Index src_lv = lower_lvalue(src, b);
+        // A blocking copy of a string-free aggregate is a single memcpy of the
+        // storage (the byte image is the value). A string leaf owns a heap buffer,
+        // so a string-containing aggregate must copy per-leaf (string stores
+        // deep-copy); a nonblocking copy always decomposes per-leaf (it defers).
+        if (tag == ir::Inst::Tag::Store && is_string_free(type)) {
+            b.agg_copy(lhs, src_lv, type, l);
+            return;
+        }
+        emit_agg_copy(lhs, src_lv, type, tag, b, l);
+    }
+
+    // Per-leaf copy of one aggregate lvalue into another (both of `type`),
+    // recursing structs and (for a blocking copy) unrolling arrays. Reached only
+    // for a string-containing aggregate or a nonblocking copy; a nonblocking
+    // whole-array copy is guarded (element-wise deferral is a follow-up).
+    void emit_agg_copy(ir::Index lhs, ir::Index rhs, ir::Ref type, ir::Inst::Tag tag,
+                       ir::Builder& b, ir::SourceLoc l) {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        if (t.kind == ir::Type::Kind::UnpackedArray) {
+            if (tag != ir::Inst::Tag::Store) {
+                fail("nonblocking whole-object copy of an unpacked-array aggregate is not "
+                     "supported");
+            }
+            const uint32_t n = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
+            for (uint32_t e = 0; e < n; ++e) {
+                const int32_t   coord = t.left <= t.right ? static_cast<int32_t>(t.left + e)
+                                                          : static_cast<int32_t>(t.left - e);
+                const ir::Index idx =
+                  b.constant(module_.pool.put_int(make_int_type(32, false, true),
+                                                  static_cast<uint64_t>(static_cast<int64_t>(coord))),
+                             l);
+                emit_agg_copy(b.elem_select(lhs, idx, type, l), b.elem_select(rhs, idx, type, l),
+                              t.element, tag, b, l);
+            }
+            return;
+        }
+        if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
+            const auto fields = module_.pool.struct_fields(t.fields_id);
+            for (uint32_t i = 0; i < fields.size(); ++i) {
+                emit_agg_copy(b.member_select(lhs, i, type, l), b.member_select(rhs, i, type, l),
+                              fields[i].type, tag, b, l);
+            }
+            return;
+        }
+        b.binary(tag, lhs, b.unary(ir::Inst::Tag::Load, rhs, l), l);
+    }
+
+    // Whether an expression is a whole unpacked-array lvalue (a named array, or a
+    // member / element that is itself a whole array) — the source of a whole-array
+    // memcpy copy, as opposed to a slice / element / pattern.
+    static bool is_whole_array_lvalue(const Expression& e) {
+        if (e.type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() == nullptr) {
+            return false;
+        }
+        switch (e.kind) {
+            case ExpressionKind::NamedValue:
+            case ExpressionKind::MemberAccess:
+            case ExpressionKind::ElementSelect:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // Whether an interned IR type is a scalar / string / real leaf.
+    bool is_leaf_ref(ir::Ref type) const {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        return t.kind != ir::Type::Kind::UnpackedArray &&
+               !(t.kind == ir::Type::Kind::Struct && !t.is_packed);
+    }
+
+    // Whether an interned IR type contains an unpacked struct at any nesting depth
+    // (backed by the recursive aggregate model; passed / returned by pointer).
+    bool contains_struct_ref(ir::Ref type) const {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        if (t.kind == ir::Type::Kind::UnpackedArray) {
+            return contains_struct_ref(t.element);
+        }
+        return t.kind == ir::Type::Kind::Struct && !t.is_packed;
+    }
+
+    // Whether an aggregate type has no `string` (heap-owning) leaf, so a whole-
+    // object blocking copy can be a single memcpy of the storage rather than a
+    // per-leaf deep copy.
+    bool is_string_free(ir::Ref type) const {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        if (t.kind == ir::Type::Kind::String) {
+            return false;
+        }
+        if (t.kind == ir::Type::Kind::UnpackedArray) {
+            return is_string_free(t.element);
+        }
+        if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
+            for (const ir::Field& f : module_.pool.struct_fields(t.fields_id)) {
+                if (!is_string_free(f.type)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // Downcast to an assignment pattern (`'{...}`) base if the expression is one
+    // of the three concrete pattern kinds. The base is abstract (no isKind), so
+    // it cannot go through `as`/`as_if`; the kind check gates the static_cast.
+    static const slang::ast::AssignmentPatternExpressionBase* as_assignment_pattern(const Expression& e) {
+        switch (e.kind) {
+            case ExpressionKind::SimpleAssignmentPattern:
+            case ExpressionKind::StructuredAssignmentPattern:
+            case ExpressionKind::ReplicatedAssignmentPattern:
+                return static_cast<const slang::ast::AssignmentPatternExpressionBase*>(&e);
+            default:
+                return nullptr;
+        }
+    }
+
+    // 1-bit 4-state equality of two whole unpacked structs: AND-reduce the
+    // per-leaf `==` results (Land carries the LRM 11.4.5 X-propagation). Both
+    // operands must be struct lvalues (a '{...} pattern compare is a follow-up);
+    // an array member is guarded (element-wise compare is a follow-up).
+    ir::Index lower_struct_eq(const Expression& lhs, const Expression& rhs, ir::Builder& b,
+                              ir::SourceLoc l) {
+        const Expression& le = unwrap_conversion(lhs);
+        const Expression& re = unwrap_conversion(rhs);
+        if (!is_struct_lvalue_shape(le) || !is_struct_lvalue_shape(re)) {
+            fail("unpacked struct equality is only supported between struct variables");
+        }
+        const ir::Ref sty = lower_type(*lhs.type);
+        return agg_eq(lower_lvalue(le, b), lower_lvalue(re, b), sty, b, l);
+    }
+
+    // Recursive per-leaf equality AND-reduction of two aggregate lvalues of
+    // `type`. Returns a 1-bit 4-state value. A struct recurses to its members'
+    // leaves; a scalar/string leaf compares directly.
+    ir::Index agg_eq(ir::Index lhs, ir::Index rhs, ir::Ref type, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        if (t.kind == ir::Type::Kind::UnpackedArray) {
+            // TODO: equality of an aggregate with an unpacked-array member — an
+            // element-wise compare (docs/design/unpacked-struct.md).
+            fail("equality of an aggregate with an unpacked-array member is not supported");
+        }
+        if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
+            const auto fields = module_.pool.struct_fields(t.fields_id);
+            ir::Index  acc    = ir::Index{ 0 };
+            for (uint32_t i = 0; i < fields.size(); ++i) {
+                const ir::Index e = agg_eq(b.member_select(lhs, i, type, l),
+                                           b.member_select(rhs, i, type, l), fields[i].type, b, l);
+                acc = i == 0 ? e : b.binary(ir::Inst::Tag::Land, acc, e, l);
+            }
+            return acc;
+        }
+        return b.binary(ir::Inst::Tag::Eq, b.unary(ir::Inst::Tag::Load, lhs, l),
+                        b.unary(ir::Inst::Tag::Load, rhs, l), l);
+    }
+
+    // Strip an outer identity/struct Conversion wrapper slang may insert on a
+    // struct-typed rvalue, exposing the underlying lvalue-shaped expression.
+    static const Expression& unwrap_conversion(const Expression& e) {
+        const Expression* cur = &e;
+        while (cur->kind == ExpressionKind::Conversion) {
+            cur = &cur->as<ConversionExpression>().operand();
+        }
+        return *cur;
+    }
+
+    // Whether an expression is an lvalue-shaped struct reference (a member-by-member
+    // copy source): a named variable or a select landing on one.
+    static bool is_struct_lvalue_shape(const Expression& e) {
+        switch (e.kind) {
+            case ExpressionKind::NamedValue:
+            case ExpressionKind::MemberAccess:
+            case ExpressionKind::ElementSelect:
+                return true;
+            default:
+                return false;
+        }
     }
 
     // True if an expression is of the dynamic `string` type (LRM 6.16).
@@ -916,6 +1238,24 @@ private:
             return b.float_cvt(ir::Inst::Tag::FtoI, v, to, l);
         }
         return b.resize(v, to, l);
+    }
+
+    // Narrow/widen an already-loaded rvalue to its expression's own declared
+    // type (LRM 6.3.1 domain conversion). A no-op for the ordinary
+    // (domain-uniform) case; skipped for string/real, which have no domain
+    // to narrow (a packed struct member is always integral, LRM 7.2.1) and
+    // whose loaded value a plain Resize instruction rejects outright. Needed
+    // because the backend's PartSelect/BitSelect type inference
+    // (LlvmBackend.cpp compute_type) inherits the base signal's domain
+    // uniformly — correct for an ordinary vector/array, wrong when the base
+    // is a struct field whose own declared domain is narrower than its
+    // struct's physical storage (LRM 6.11.2 forces the whole struct 4-state
+    // if any member is).
+    ir::Index narrow_to_declared(ir::Index v, const slang::ast::Type& declared, ir::Builder& b, ir::SourceLoc l) {
+        if (declared.isString() || declared.isFloating()) {
+            return v;
+        }
+        return b.resize(v, lower_type(declared), l);
     }
 
     // Intern an integer literal, preserving x/z bits. Slang stores a 4-state
@@ -1065,14 +1405,20 @@ private:
                         check_drive_strength(net.getDriveStrength(), "a net declaration");
                         info.is_net = true;
                     }
-                    info.name = prefix + std::string(vs.name);
-                    info.type = lower_type(vs.getType());
-                    info.dir  = ir::SignalInfo::Direction::Internal;
+                    info.name     = prefix + std::string(vs.name);
+                    info.type     = lower_type(vs.getType());
+                    info.is_event = vs.getType().isEvent();
+                    info.dir      = ir::SignalInfo::Direction::Internal;
                     if (port_dir != nullptr) {
                         const auto found = port_dir->find(&m);
                         if (found != port_dir->end()) {
                             info.dir = found->second;
                         }
+                    }
+                    if (info.dir != ir::SignalInfo::Direction::Internal && info.is_event) {
+                        // TODO: event ports (LRM 15.5) — needs cross-boundary
+                        // event aliasing (Tier 2, docs/design/named-events.md).
+                        fail("event ports are not supported");
                     }
                     if (info.dir != ir::SignalInfo::Direction::Internal && is_string_ref(info.type)) {
                         // TODO: string module ports (needs string-aware port
@@ -1194,6 +1540,8 @@ private:
                 return lvalue_root(e.as<ElementSelectExpression>().value());
             case ExpressionKind::RangeSelect:
                 return lvalue_root(e.as<RangeSelectExpression>().value());
+            case ExpressionKind::MemberAccess:
+                return lvalue_root(e.as<MemberAccessExpression>().value());
             case ExpressionKind::Conversion:
                 return lvalue_root(e.as<ConversionExpression>().operand());
             default:
@@ -1256,6 +1604,27 @@ private:
                     }
                 }
                 // A dynamic (or indexed +:/-:) select: conservatively the whole net.
+                record_net_driver_range(*root, 0, UINT32_MAX);
+                break;
+            }
+            case ExpressionKind::MemberAccess: {
+                // A struct/union member's bit range is always a compile-time
+                // constant (LRM 7.2.1 field offsets are declared, never
+                // dynamic), so a direct-named-value base gets the exact
+                // range, same precision as the ElementSelect/RangeSelect
+                // cases above.
+                const MemberAccessExpression& ma   = lhs.as<MemberAccessExpression>();
+                const ValueSymbol*            root = lvalue_root(ma.value());
+                if (root == nullptr) {
+                    break;
+                }
+                const auto* field = ma.member.as_if<FieldSymbol>();
+                if (field != nullptr && ma.value().kind == ExpressionKind::NamedValue) {
+                    const auto lsb = static_cast<uint32_t>(field->bitOffset);
+                    const auto msb = lsb + static_cast<uint32_t>(ma.type->getBitWidth()) - 1;
+                    record_net_driver_range(*root, lsb, msb);
+                    break;
+                }
                 record_net_driver_range(*root, 0, UINT32_MAX);
                 break;
             }
@@ -1352,6 +1721,13 @@ private:
         const Expression* init = ns.getInitializer();
         if (init == nullptr) {
             return;
+        }
+        if (is_aggregate(ns.getType())) {
+            // TODO: continuous assignment to a whole unpacked struct net — the
+            // field-wise decomposition would need per-member continuous processes
+            // with per-member sensitivity. Member-level `assign n.f = ...` (a
+            // ContinuousAssignSymbol) is unaffected.
+            fail("continuous assignment to a whole unpacked struct net is not supported");
         }
         record_net_driver_range(ns, 0, UINT32_MAX);
         ir::Builder         b(module_.pool);
@@ -2083,6 +2459,63 @@ private:
         }
     }
 
+    // Resolve the target of `-> e` to the event's synthetic signal, verifying it
+    // is an event (defensive — slang types the target as an event already).
+    ir::Signal trigger_target(const Expression& target) {
+        if (target.kind != ExpressionKind::NamedValue || !target.type->isEvent()) {
+            // TODO: triggering an event element of an array / struct member, or an
+            // event through a hierarchical / handle expression (Tier 2).
+            fail("unsupported event trigger target");
+        }
+        return signal_of(target.as<NamedValueExpression>().symbol);
+    }
+
+    // Lower `-> e` / `->> e` / `->> #d e` (LRM 15.5.2, 15.5.4).
+    void lower_event_trigger(const EventTriggerStatement& ev, ir::Builder& b) {
+        const ir::Signal sig = trigger_target(ev.target);
+        if (ev.timing != nullptr) {
+            // Only `->>` carries a timing control (grammar), so a delayed trigger
+            // is always nonblocking. A fixed delay `->> #d e` schedules a detached
+            // wheel timer; the event-controlled form is not yet lowered.
+            if (ev.timing->kind == slang::ast::TimingControlKind::Delay) {
+                const Expression& amount = ev.timing->as<slang::ast::DelayControl>().expr;
+                b.event_trigger_nb_delayed(sig, scaled_delay(amount, b), loc(ev));
+                return;
+            }
+            // TODO: event-controlled nonblocking trigger (`->> @(x) e`,
+            // `->> repeat(n) @(x) e`) — needs a detached one-shot event
+            // subscription (docs/design/named-events.md, Tier 2 Form 2).
+            fail("event-controlled nonblocking trigger ('->> @(...) e') is not supported");
+        }
+        if (ev.isNonBlocking) {
+            b.event_trigger_nb(sig, loc(ev)); // `->> e`: wake in the NBA region
+        } else {
+            b.event_trigger(sig, loc(ev)); // `-> e`: wake now
+        }
+    }
+
+    // If `e` is an `<event>.triggered` system-method call (LRM 15.5.3), return the
+    // event operand; else nullptr. slang models the property as a system method
+    // whose receiver is arguments()[0].
+    const Expression* triggered_event(const Expression& e) {
+        if (e.kind != ExpressionKind::Call) {
+            return nullptr;
+        }
+        const CallExpression& call = e.as<CallExpression>();
+        if (!call.isSystemCall() || call.getSubroutineName() != "triggered") {
+            return nullptr;
+        }
+        if (call.arguments().empty() || !call.arguments()[0]->type->isEvent()) {
+            return nullptr;
+        }
+        return call.arguments()[0];
+    }
+
+    // NOTE: `wait(...)` is lowered by the general `lower_wait_stmt` below (from
+    // the wait(expr) feature). It subsumes `wait(e.triggered)`: the read set of
+    // the condition includes the event, so `-> e` wakes the wait and the
+    // re-tested `.triggered` (stamped this instant) ends it.
+
     // -- Statements --
 
     void lower_stmt(const Statement& stmt, ir::Builder& b) {
@@ -2094,12 +2527,9 @@ private:
                 break;
             case StatementKind::Block: {
                 const BlockStatement& blk = stmt.as<BlockStatement>();
-                // TODO: fork..join / join_any / join_none (LRM 9.3.2) — needs
-                // child process spawning and join synchronization in the
-                // scheduler. Lowering the body sequentially would silently
-                // serialize concurrent branches.
                 if (blk.blockKind != StatementBlockKind::Sequential) {
-                    fail("fork..join blocks are not supported");
+                    lower_fork(blk, b);
+                    break;
                 }
                 const bool named = blk.blockSymbol != nullptr && !blk.blockSymbol->name.empty();
                 if (named) {
@@ -2185,6 +2615,9 @@ private:
             case StatementKind::Return:
                 lower_return(stmt.as<ReturnStatement>(), b);
                 break;
+            case StatementKind::EventTrigger:
+                lower_event_trigger(stmt.as<EventTriggerStatement>(), b);
+                break;
             case StatementKind::Wait:
                 lower_wait_stmt(stmt.as<WaitStatement>(), b);
                 break;
@@ -2196,6 +2629,45 @@ private:
             default:
                 fail("unsupported statement");
         }
+    }
+
+    // Lower `fork … join` (LRM 9.3.2). V1: `join` only, in a process context.
+    // Each top-level child statement becomes its own fork-child coroutine; the
+    // Fork op spawns them and suspends the parent until all complete.
+    void lower_fork(const BlockStatement& blk, ir::Builder& b) {
+        if (blk.blockKind != StatementBlockKind::JoinAll) {
+            // TODO: join_any / join_none (V2) need a growable active ring — a
+            // loop can spawn an unbounded number of concurrently-live children
+            // (docs/design/fork-join.md).
+            fail("fork..join_any / fork..join_none are not supported");
+        }
+        if (fn_ctx_ != nullptr) {
+            // TODO: fork inside a task/function (V1 restriction). A child would
+            // need to alias the enclosing subroutine's frame locals, not the
+            // parent-signal path build_fork_child assumes.
+            fail("fork..join inside a function or task is not supported");
+        }
+
+        // Children are the fork body's top-level statements (a StatementList),
+        // or the single statement / empty body.
+        std::vector<const Statement*> children;
+        if (blk.body.kind == StatementKind::List) {
+            for (const Statement* s : blk.body.as<StatementList>().list) {
+                children.push_back(s);
+            }
+        } else if (blk.body.kind != StatementKind::Empty) {
+            children.push_back(&blk.body);
+        }
+        if (children.empty()) {
+            return; // `fork join` with no children: a no-op.
+        }
+
+        std::vector<ir::FunctionId> ids;
+        ids.reserve(children.size());
+        for (const Statement* c : children) {
+            ids.push_back(build_fork_child(*c));
+        }
+        b.fork(ids, ir::ForkKind::Join, loc(blk));
     }
 
     ir::Index lower_predicate(const Expression& cond, ir::Builder& b) {
@@ -2448,7 +2920,11 @@ private:
                 fail("static function local with an initializer is not supported");
             }
             const ir::SourceLoc l = loc(*init);
-            b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
+            if (is_aggregate(vs.getType())) {
+                emit_struct_store(value_lvalue(vs, b, l), lower_type(vs.getType()), *init, ir::Inst::Tag::Store, b, l);
+            } else {
+                b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
+            }
         }
     }
 
@@ -2468,7 +2944,11 @@ private:
         }
         ir::Builder&        b = *preinit_;
         const ir::SourceLoc l = loc(*init);
-        b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
+        if (is_aggregate(vs.getType())) {
+            emit_struct_store(value_lvalue(vs, b, l), lower_type(vs.getType()), *init, ir::Inst::Tag::Store, b, l);
+        } else {
+            b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
+        }
     }
 
     // Emit the accumulated declaration initializers as one run-once PreInit
@@ -4032,6 +4512,11 @@ private:
             }
         }
 
+        // `e.triggered` (LRM 15.5.3): 1-bit "triggered this time step" property.
+        if (const Expression* ev = triggered_event(call)) {
+            return b.event_triggered(event_signal(*ev), l);
+        }
+
         if (fn_ctx_ != nullptr && !fn_ctx_->is_task &&
             (name == "$time" || name == "$stime" || name == "$realtime")) {
             // A function is a plain callable with no wheel pointer in its ABI, so
@@ -4879,6 +5364,9 @@ private:
             case ExpressionKind::RangeSelect:
                 check_task_nba_target(lhs.as<RangeSelectExpression>().value());
                 return;
+            case ExpressionKind::MemberAccess:
+                check_task_nba_target(lhs.as<MemberAccessExpression>().value());
+                return;
             case ExpressionKind::NamedValue: {
                 const ValueSymbol& vs = lhs.as<NamedValueExpression>().symbol;
                 if (fn_ctx_->localmap.contains(&vs)) {
@@ -4898,6 +5386,27 @@ private:
     // `y = (x = 5)`) can recover its value; the caller truncates to the LHS type.
     // Statement callers discard the return.
     ir::Index lower_assign(const AssignmentExpression& a, ir::Builder& b) {
+        if (a.left().type->isEvent()) {
+            // `e2 = e1` (merge) / `e = null` (LRM 15.5.5): event variables are
+            // handles; assignment aliases the underlying sync object. Tier 2 —
+            // needs event reference semantics (docs/design/named-events.md).
+            fail("event assignment is not supported");
+        }
+        if (is_aggregate(*a.left().type)) {
+            // Whole unpacked-struct assignment: decompose to per-member stores
+            // (blocking or nonblocking). Each member commits independently, which
+            // is whole-struct NBA semantics.
+            const ir::SourceLoc l = loc(a);
+            if (a.isCompound()) {
+                fail("compound assignment to an unpacked struct is not supported");
+            }
+            if (a.timingControl != nullptr) {
+                fail("intra-assignment timing control (#/@ on an assignment) is not supported");
+            }
+            const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
+            emit_struct_store(lower_lvalue(a.left(), b), lower_type(*a.left().type), a.right(), tag, b, l);
+            return true_const(b, l);
+        }
         if (a.isCompound()) {
             return lower_compound_assign(a, b);
         }
@@ -5015,9 +5524,18 @@ private:
             check_task_nba_target(a.left());
         }
         if (is_unpacked_array(a.left())) {
-            // TODO: whole-array assignment (mem1 = mem2, mem = '{...}). Needs an
-            // element-wise copy / aggregate lowering; only element assignment is
-            // supported today.
+            // A whole blocking copy of one plain (string-free) unpacked array into
+            // another is a single memcpy of the storage (same AggCopy path as an
+            // aggregate). A nonblocking copy, a `'{...}` pattern, or a string array
+            // (heap-owning elements) still decompose / are unsupported.
+            const ir::Ref     ty  = lower_type(*a.left().type);
+            const Expression& src = unwrap_conversion(a.right());
+            if (!a.isNonBlocking() && is_string_free(ty) && is_whole_array_lvalue(src)) {
+                b.agg_copy(lower_lvalue(a.left(), b), lower_lvalue(src, b), ty, loc(a));
+                return true_const(b, loc(a));
+            }
+            // TODO: nonblocking whole-array copy, `mem = '{...}` patterns, string
+            // arrays — element-wise copy / aggregate lowering.
             fail("whole unpacked array assignment is not supported");
         }
         // s[i] = c writes one character in place; out-of-range or a zero byte is
@@ -5234,6 +5752,15 @@ private:
                 // signals are collected (the two-pass lowering below) it flows
                 // through the ordinary signal_of path.
                 const ValueSymbol& sym = expr.as<ValueExpressionBase>().symbol;
+                if (expr.type->isEvent()) {
+                    // A named event has no data value; the legal forms (`@(e)`,
+                    // `-> e`, `e.triggered`) resolve the event symbol directly and
+                    // never reach this value path. This catches the Tier-2 handle
+                    // forms — `e2 = e1` merge, `e == null` — which need event
+                    // reference semantics (docs/design/named-events.md).
+                    fail("event used as a value is not supported (event assignment / "
+                         "comparison / null)");
+                }
                 if (sym.kind == SymbolKind::Parameter) {
                     const ParameterSymbol& p = sym.as<ParameterSymbol>();
                     return b.constant(lower_constant(p.getValue(), p.getType()), l);
@@ -5251,9 +5778,16 @@ private:
                     // passing a memory by value). Only element reads are supported.
                     fail("whole unpacked array read is not supported");
                 }
+                if (is_aggregate(*expr.type)) {
+                    // A whole unpacked struct has no flat value: reads are only
+                    // supported where they decompose field-wise (assignment,
+                    // equality). A general rvalue context ($display, a by-value
+                    // argument, a concat operand) would need a by-value struct ABI.
+                    fail("unpacked struct as a whole-value rvalue is not supported here");
+                }
                 return b.unary(ir::Inst::Tag::Load, value_lvalue(sym, b, l), l);
             }
-            case ExpressionKind::LValueReference:
+            case ExpressionKind::LValueReference: {
                 // slang rewrites a compound assignment's RHS into
                 // `BinaryExpression(LValueReference, rhs, op)`; the reference
                 // stands for the LHS already lowered once by lower_compound_assign
@@ -5261,7 +5795,13 @@ private:
                 if (!compound_lv_.has_value()) {
                     fail("LValueReference outside a compound assignment");
                 }
-                return b.unary(ir::Inst::Tag::Load, *compound_lv_, l);
+                const ir::Index v = b.unary(ir::Inst::Tag::Load, *compound_lv_, l);
+                // A no-op for every lvalue shape except a struct member
+                // narrower than its struct's own physical domain (see the
+                // MemberAccess case above) — cheap enough to apply generically
+                // rather than special-case the one shape that needs it.
+                return narrow_to_declared(v, *expr.type, b, l);
+            }
             case ExpressionKind::UnaryOp:
                 return lower_unary(expr.as<UnaryExpression>(), b);
             case ExpressionKind::BinaryOp:
@@ -5321,12 +5861,41 @@ private:
                     is_unpacked_array(es.value())
                         ? b.elem_select(base, lower_expr(es.selector(), b), lower_type(*es.value().type), l)
                         : b.binary(ir::Inst::Tag::BitSelect, base, packed_bit_index(es, b, l), l);
-                return b.unary(ir::Inst::Tag::Load, sel, l);
+                const ir::Index v = b.unary(ir::Inst::Tag::Load, sel, l);
+                // See narrow_to_declared / the MemberAccess case below: a
+                // no-op except when `es` selects into a struct field
+                // narrower-domain than its struct's own physical storage
+                // (e.g. `x.b[3]` where `b` is 2-state inside an otherwise
+                // 4-state struct `x`).
+                return narrow_to_declared(v, *expr.type, b, l);
             }
             case ExpressionKind::RangeSelect: {
                 const RangeSelectExpression& rs   = expr.as<RangeSelectExpression>();
                 const ir::Index              base = lower_lvalue(rs.value(), b);
-                return b.unary(ir::Inst::Tag::Load, lower_range_select(rs, base, b, l), l);
+                const ir::Index v = b.unary(ir::Inst::Tag::Load, lower_range_select(rs, base, b, l), l);
+                // See narrow_to_declared (e.g. `x.b[7:4]`).
+                return narrow_to_declared(v, *expr.type, b, l);
+            }
+            case ExpressionKind::MemberAccess: {
+                // The backend's PartSelect/BitSelect type inference
+                // (LlvmBackend.cpp compute_type) inherits the BASE signal's
+                // domain, since an ordinary vector/array is domain-uniform
+                // throughout. A struct is the one aggregate where a field's
+                // own declared domain can be narrower than the whole (mixed)
+                // struct's forced-4-state storage (LRM 6.11.2) — so a 2-state
+                // field (or a further bit/range-select into one, above) read
+                // off 4-state storage must be explicitly narrowed back to its
+                // declared type here (LRM 6.3.1 conversion), or downstream
+                // consumers that trust the declared type (e.g. an arithmetic
+                // operand) see a width/domain mismatch. A no-op when the
+                // field's own domain already matches the struct's (a packed
+                // struct member is always integral, LRM 7.2.1, so
+                // narrow_to_declared's string/real skip never triggers here —
+                // used anyway for uniformity with its ElementSelect/RangeSelect
+                // siblings above).
+                const MemberAccessExpression& ma = expr.as<MemberAccessExpression>();
+                const ir::Index v = b.unary(ir::Inst::Tag::Load, lower_member_lvalue(ma, b, l), l);
+                return narrow_to_declared(v, *ma.type, b, l);
             }
             case ExpressionKind::Conversion: {
                 const ConversionExpression& cv       = expr.as<ConversionExpression>();
@@ -5621,6 +6190,20 @@ private:
             return lower_short_circuit(bin, b);
         }
 
+        // Unpacked-struct equality (LRM 7.2, 11.4.5): a whole-struct value cannot
+        // be loaded, so `==` / `!=` reduce to a per-member comparison. The members'
+        // 4-state Eq results fold with Land (X propagates: any definite mismatch
+        // is 0, else X if any member is X, else 1); `!=` negates that reduction.
+        // slang wraps each operand in a bitstream Conversion, so the struct type
+        // is on the unwrapped operand, not `bin.left().type`.
+        if ((bin.op == B::Equality || bin.op == B::Inequality) &&
+            is_unpacked_struct(*unwrap_conversion(bin.left()).type)) {
+            const ir::SourceLoc l   = loc(bin);
+            const ir::Index     acc = lower_struct_eq(unwrap_conversion(bin.left()),
+                                                      unwrap_conversion(bin.right()), b, l);
+            return bin.op == B::Equality ? acc : b.unary(ir::Inst::Tag::Lnot, acc, l);
+        }
+
         const ir::SourceLoc l   = loc(bin);
         const ir::Index     lhs = lower_expr(bin.left(), b);
         const ir::Index     rhs = lower_expr(bin.right(), b);
@@ -5807,6 +6390,42 @@ private:
         return b.dyn_part_select(base, off, width, l);
     }
 
+    // Struct/union member select (LRM 7.2.1 / 7.3): a packed struct or union is
+    // a flat bit-vector, so `x.field` is exactly a constant part-select at the
+    // field's declared bit offset (0 for every union member — all members
+    // overlay the LSB) — the same IR shape (PartSelect over the base lvalue)
+    // as a plain `vec[msb:lsb]`, so it reuses the backend's existing
+    // partial-write / NBA-shadow machinery with no backend changes. Nested
+    // struct member access (`x.outer.inner`) composes for free: the base
+    // lvalue is itself a part-select, and part-select-of-a-part-select
+    // already works (the same shape a multi-dimensional packed select uses).
+    ir::Index lower_member_lvalue(const MemberAccessExpression& ma, ir::Builder& b, ir::SourceLoc l) {
+        const auto* field = ma.member.as_if<FieldSymbol>();
+        if (field == nullptr) {
+            // TODO: non-field member access (class properties, interface
+            // modports, ...) — not lowered.
+            fail("unsupported member access");
+        }
+        if (ma.value().type->isUnion()) {
+            // TODO: this mechanism happens to produce correct reads/writes for
+            // a packed union already (every member sits at bitOffset 0), but
+            // union has its own LRM corners not yet reviewed here (7.3 fixed
+            // member width, tagged unions, unpacked aliasing) — gated
+            // separately pending that review rather than shipped by accident.
+            fail("union member access is not supported yet");
+        }
+        const ir::Index base = lower_lvalue(ma.value(), b);
+        // An unpacked struct is an aggregate: the member is addressed by field
+        // index (MemberSelect -> struct GEP), not a bit range. A packed struct is
+        // a flat bit-vector, so the member is a constant part-select.
+        if (ma.value().type->getCanonicalType().isUnpackedStruct()) {
+            return b.member_select(base, field->fieldIndex, lower_type(*ma.value().type), l);
+        }
+        const auto lsb = static_cast<uint32_t>(field->bitOffset);
+        const auto msb = lsb + static_cast<uint32_t>(ma.type->getBitWidth()) - 1;
+        return b.part_select(base, msb, lsb, l);
+    }
+
     // Lower an expression as an lvalue, returning the lvalue index (no Load).
     ir::Index lower_lvalue(const Expression& expr, ir::Builder& b) {
         const ir::SourceLoc l = loc(expr);
@@ -5836,6 +6455,8 @@ private:
                 const ir::Index              base = lower_lvalue(rs.value(), b);
                 return lower_range_select(rs, base, b, l);
             }
+            case ExpressionKind::MemberAccess:
+                return lower_member_lvalue(expr.as<MemberAccessExpression>(), b, l);
             default:
                 fail("unsupported assignment target kind=" + std::string(slang::ast::toString(expr.kind)));
         }
@@ -6036,6 +6657,18 @@ private:
             if (!fn_ctx_->has_ret_local) {
                 fail("return with a value in a void function");
             }
+            // An aggregate result's Ret operand is the returned object's lvalue
+            // (the backend copies its storage out through the return out-param).
+            if (contains_struct_ref(fn_ctx_->ret_type)) {
+                const Expression& src = unwrap_conversion(*r.expr);
+                if (!is_struct_lvalue_shape(src)) {
+                    // TODO: return of a `'{...}` pattern / call result — materialize
+                    // into a temp first.
+                    fail("aggregate return of a non-lvalue expression is not supported");
+                }
+                b.unary(ir::Inst::Tag::Ret, lower_lvalue(src, b), l);
+                return;
+            }
             // A string result needs no width resize (slang already converted).
             const ir::Index v = lower_expr(*r.expr, b);
             b.unary(ir::Inst::Tag::Ret,
@@ -6045,6 +6678,11 @@ private:
                     l);
         } else if (fn_ctx_->has_ret_local) {
             // `return;` in a non-void function yields the current function-var value.
+            // An aggregate yields the function var's lvalue (copied out by the backend).
+            if (contains_struct_ref(fn_ctx_->ret_type)) {
+                b.unary(ir::Inst::Tag::Ret, b.local(fn_ctx_->ret_local, fn_ctx_->ret_type, l), l);
+                return;
+            }
             const ir::Index rv = b.local(fn_ctx_->ret_local, fn_ctx_->ret_type, l);
             b.unary(ir::Inst::Tag::Ret, b.unary(ir::Inst::Tag::Load, rv, l), l);
         } else {
@@ -6190,6 +6828,43 @@ private:
         fn_ctx_ = saved;
     }
 
+    // Lower one `fork` child statement (LRM 9.3.2) into a synthetic argument-less
+    // fork-child task: a coroutine spawned at the fork, whose completion decrements
+    // the shared join record. Mirrors build_task, but takes a bare Statement (no
+    // formals) and runs in the *parent's* scope context (scope_ / prefix_ /
+    // time_mul_ unchanged) so the child's references to parent variables resolve to
+    // the parent's signals, while the child's own declared locals get per-spawn
+    // frame slots (value_lvalue: localmap first, then signal_of). Returns the
+    // reserved FunctionId.
+    ir::FunctionId build_fork_child(const Statement& body) {
+        const ir::FunctionId id = module_.reserve_function();
+
+        FnCtx ctx;
+        ctx.name_prefix = "fork.child.";
+        ctx.is_task     = true;
+        FnCtx* saved    = fn_ctx_;
+        fn_ctx_         = &ctx;
+        std::vector<std::string_view> saved_blocks;
+        saved_blocks.swap(named_blocks_);
+
+        ir::Builder b(module_.pool);
+        lower_stmt(body, b);
+        const ir::SourceLoc el = loc(body);
+        b.unary(ir::Inst::Tag::Ret, void_ret_operand(b, el), el);
+
+        module_.set_function(id, ir::Function{ .name          = "fork.child",
+                                               .return_type   = module_.pool.void_type,
+                                               .param_types   = {},
+                                               .arg_dirs      = {},
+                                               .local_types   = std::move(ctx.local_types),
+                                               .is_task       = true,
+                                               .is_fork_child = true,
+                                               .ir            = b.finish() });
+        named_blocks_.swap(saved_blocks);
+        fn_ctx_ = saved;
+        return id;
+    }
+
     // Lower one function body into the reserved slot. (Ir has no default ctor and
     // is not assignable, so every field is built locally and the Function is
     // constructed once, at the end.)
@@ -6211,14 +6886,30 @@ private:
         // The backend copies parameters into these Locals at entry (emit_copyin) and
         // copies output / inout formals back at each return (emit_copyout); a ref
         // formal's Local is redirected to the passed actual pointer. No IR-level Arg
-        // copy is emitted for any direction.
+        // copy is emitted for any direction. An aggregate formal is passed by pointer
+        // and copied into its Local by the backend's aggregate copy-in.
         for (const FormalArgumentSymbol* fa : sub.getArguments()) {
+            if (is_aggregate(fa->getType())) {
+                if (fa->direction != slang::ast::ArgumentDirection::In) {
+                    // TODO: aggregate output / inout function arg (copy-out).
+                    fail("aggregate output / inout function argument is not supported");
+                }
+                if (!is_string_free(lower_type(fa->getType()))) {
+                    // TODO: by-value copy of a string-containing aggregate (needs a
+                    // per-leaf deep copy of the storage, not a memcpy).
+                    fail("by-value pass of a string-containing aggregate is not supported");
+                }
+            }
             param_types.push_back(lower_type(fa->getType()));
             arg_dirs.push_back(to_arg_dir(fa->direction));
             fn_local(*fa);
         }
 
         if (!is_void) {
+            if (is_aggregate(sub.returnValVar->getType()) && !is_string_free(return_type)) {
+                // TODO: by-value return of a string-containing aggregate.
+                fail("by-value return of a string-containing aggregate is not supported");
+            }
             ctx.has_ret_local = true;
             ctx.ret_type      = return_type;
             ctx.ret_local     = fn_local(*sub.returnValVar);
@@ -6227,9 +6918,13 @@ private:
         lower_stmt(sub.getBody(), b);
 
         // Fall-through return: yields the function variable (X if never assigned).
+        // An aggregate result's Ret operand is its lvalue (the backend copies its
+        // storage out through the trailing return out-param), not a loaded value.
         const ir::SourceLoc el = to_source_loc(sub.location);
         if (is_void) {
             b.unary(ir::Inst::Tag::Ret, void_ret_operand(b, el), el);
+        } else if (is_aggregate(sub.returnValVar->getType())) {
+            b.unary(ir::Inst::Tag::Ret, b.local(ctx.ret_local, ctx.ret_type, el), el);
         } else {
             const ir::Index rv = b.local(ctx.ret_local, ctx.ret_type, el);
             b.unary(ir::Inst::Tag::Ret, b.unary(ir::Inst::Tag::Load, rv, el), el);
@@ -6290,6 +6985,14 @@ private:
         if (formals.size() != actuals.size()) {
             fail("task argument count mismatch");
         }
+        for (const FormalArgumentSymbol* fa : formals) {
+            if (contains_struct_ref(lower_type(fa->getType()))) {
+                // TODO: aggregate task argument (by-pointer copy-in, plus copy-out
+                // for output / inout). The task coroutine ABI does not yet marshal
+                // aggregates; only functions do.
+                fail("unpacked struct / aggregate task argument is not supported");
+            }
+        }
         const ir::SourceLoc     l = loc(call);
         std::vector<CopyOutArg> outs;
         const std::vector<ir::Index> args = build_call_args(formals, actuals, outs, b, l);
@@ -6322,6 +7025,22 @@ private:
         for (size_t i = 0; i < formals.size(); ++i) {
             const auto    dir = formals[i]->direction;
             const ir::Ref pty = lower_type(formals[i]->getType());
+            if (contains_struct_ref(pty)) {
+                // An aggregate actual passes by pointer (its lvalue); the callee
+                // copies it in for value semantics. Only In reaches here: the
+                // callee guards aggregate output / inout, and aggregate task
+                // arguments are guarded before build_call_args (lower_task_call).
+                if (!is_string_free(pty)) {
+                    fail("by-value pass of a string-containing aggregate is not supported");
+                }
+                const Expression& src = unwrap_conversion(*actuals[i]);
+                if (!is_struct_lvalue_shape(src)) {
+                    // TODO: a `'{...}` / call aggregate actual — materialize a temp.
+                    fail("aggregate argument must be a variable");
+                }
+                args.push_back(lower_lvalue(src, b));
+                continue;
+            }
             if (dir == slang::ast::ArgumentDirection::Ref) {
                 args.push_back(lower_ref_actual(*actuals[i], b));
                 continue;
@@ -6461,6 +7180,12 @@ private:
     // package function called from multiple top instances still gets exactly
     // one FunctionId and one copy of any static local's storage.
     ankerl::unordered_dense::map<const SubroutineSymbol*, ir::FunctionId> fnmap_;
+    // Canonical slang struct/union type -> its lowered ir::Ref, so a type used by
+    // many variables (e.g. a bus of the same struct) interns its field table
+    // once. The pool's own structural dedup can't do this: two independently
+    // built field lists get different `fields_id`s and would never compare
+    // equal, defeating InternPool::put's content-based dedup.
+    ankerl::unordered_dense::map<const slang::ast::Type*, ir::Ref> struct_type_cache_;
     // The shared Lowerer that owns package/$unit-scope subroutine bodies (see
     // set_globals / function_id). Null on the shared Lowerer itself and on any
     // Lowerer built without one (e.g. tests that lower a single module with no
