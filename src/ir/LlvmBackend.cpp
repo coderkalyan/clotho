@@ -2170,10 +2170,20 @@ private:
         wait_dyn_ty_.assign(sigs.size(), { nullptr, nullptr, nullptr });
         wait_dyn_len_gv_.assign(sigs.size(), { nullptr, nullptr, nullptr });
         sta_next_.assign(sigs.size(), { 0, 0, 0 });
+        event_trig_gv_.assign(sigs.size(), nullptr);
 
         auto* i32  = llvm::Type::getInt32Ty(ctx_);
+        auto* i64  = llvm::Type::getInt64Ty(ctx_);
         auto* elem = wait_elem_ty();
         for (uint32_t i = 0; i < sigs.size(); ++i) {
+            if (sigs[i].is_event) {
+                // Never-triggered sentinel: UINT64_MAX never equals a real tick,
+                // so `.triggered` reads 0 until the first `-> e`.
+                event_trig_gv_[i] = new llvm::GlobalVariable(
+                  llmod_, i64, false, llvm::GlobalValue::InternalLinkage,
+                  llvm::ConstantInt::get(i64, ~uint64_t{ 0 }),
+                  "clotho.event_trig." + sigs[i].name);
+            }
             for (uint32_t e = 0; e < 3; ++e) {
                 const std::string base = "clotho.wait." + sigs[i].name + "." ;
                 if (c.sta[i][e] > 0) {
@@ -2430,6 +2440,12 @@ private:
                 case Inst::Tag::Delay:
                 case Inst::Tag::Wait:
                 case Inst::Tag::TaskCall:
+                // A named-event trigger has a scheduling side effect (it wakes
+                // waiters) and `.triggered` reads per-event state outside the
+                // pure-function-of-signal-reads model that thunk elision and comb
+                // fusion assume, so keep an event-touching process a coroutine.
+                case Inst::Tag::EventTrigger:
+                case Inst::Tag::EventTriggered:
                     return false;
                 case Inst::Tag::Store: {
                     const LvalueRoot r = lvalue_root(p.ir, p.ir.payload(idx).binary.l);
@@ -3762,6 +3778,35 @@ private:
         emit_dynamic_scan_rt(wait_dyn_gv_[i][edge], wait_dyn_len_gv_[i][edge]);
     }
 
+    // Lower `-> e` (LRM 15.5.2): stamp the current sim tick into the event's
+    // trigger timestamp (so `.triggered` reads 1 for the rest of the step) and
+    // wake every waiter now. A named event has no value, so — unlike a signal
+    // store — there is no edge computation: it services the Any-edge static and
+    // dynamic queues unconditionally. `@(e)` and `always @(e)` both subscribe the
+    // Any bucket (edge None -> Any), so this reaches every waiter.
+    void lower_event_trigger(Signal sig) {
+        const auto   i   = static_cast<uint32_t>(sig);
+        llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
+        b_.CreateStore(now, event_trig_gv_[i]);
+        const auto any = static_cast<uint32_t>(Edge::Any);
+        if (wait_sta_gv_[i][any] != nullptr) {
+            service_static_queue(sig, any);
+        }
+        if (wait_dyn_gv_[i][any] != nullptr) {
+            service_dynamic_queue(sig, any);
+        }
+    }
+
+    // Lower `e.triggered` (LRM 15.5.3) to a definite 2-state 1-bit: 1 iff the last
+    // trigger tick equals the current tick (true across all delta cycles of the
+    // step, false once time advances — no per-step reset needed).
+    Plane lower_event_triggered(Signal sig) {
+        const auto   i     = static_cast<uint32_t>(sig);
+        llvm::Value* stamp = b_.CreateLoad(b_.getInt64Ty(), event_trig_gv_[i]);
+        llvm::Value* now   = b_.CreateCall(wheel_now_fn(), { wheel_ });
+        return { b_.CreateICmpEQ(stamp, now), nullptr, true };
+    }
+
     // Compacting removal of this coroutine's entries from one (signal, edge)
     // dynamic bucket, used on resume from a multi-signal wait: the firing bucket
     // already cleared us, but the others still hold our now-stale entry. Slides
@@ -4821,6 +4866,9 @@ private:
                 return type_of(p.unary);
             case Inst::Tag::SimTime:
                 return { 64, false, false };
+            case Inst::Tag::EventTriggered:
+                // `e.triggered` (LRM 15.5.3): a definite 2-state 1-bit `bit`.
+                return { 1, false, false };
             case Inst::Tag::Random:
                 return { 32, false, true };
             case Inst::Tag::Clog2:
@@ -5003,6 +5051,7 @@ private:
             case Inst::Tag::DumpOn:
             case Inst::Tag::DumpAll:
             case Inst::Tag::DumpFlush:
+            case Inst::Tag::EventTrigger:
                 return { 0, false, false };
         }
         return { 0, false, false };
@@ -5690,6 +5739,13 @@ private:
                 lower_wait(p.wait);
                 return;
 
+            case Inst::Tag::EventTrigger:
+                // `-> e` (LRM 15.5.2): stamp the trigger time and wake every
+                // waiter now. Zero-time — the current process does not suspend, so
+                // it does not end the NBA segment.
+                lower_event_trigger(p.signal);
+                return;
+
             case Inst::Tag::Display:
                 lower_display(i);
                 return;
@@ -5803,6 +5859,10 @@ private:
                 set_value(i, packed(now, now, zero(64)));
                 return;
             }
+
+            case Inst::Tag::EventTriggered:
+                set_value(i, lower_event_triggered(p.signal));
+                return;
 
             case Inst::Tag::Random: {
                 // The PRNG draw is always known (no x/z): must == may, z == 0.
@@ -7312,6 +7372,12 @@ private:
         const SignalInfo& info = mod_.signal(sig);
         if (info.name.empty()) {
             return;
+        }
+        if (info.is_event) {
+            // A named event (LRM 15.5) has no dumpable value; its 1-bit placeholder
+            // slot is never written. A whole-design dump must represent every
+            // declared signal, so loud-fail rather than emit a phantom wire.
+            throw BackendError{ "VCD dump of event '" + info.name + "' is not supported" };
         }
         const SignalSlot& s = slot_of(sig);
         if (s.is_string) {
@@ -9248,6 +9314,11 @@ private:
     // Next free static slot per (signal, edge), handed out during lowering
     // (parallels the capacities computed in build_wait_queues).
     std::vector<std::array<uint32_t, 3>>               sta_next_;
+    // Per named-event trigger timestamp (clotho.event_trig.<name>), an i64 holding
+    // the sim tick of the last `-> e`, or UINT64_MAX if never triggered. Indexed
+    // by signal handle; null for a non-event signal. `.triggered` compares this to
+    // the current tick (LRM 15.5.3). Built in build_wait_queues.
+    std::vector<llvm::GlobalVariable*>                 event_trig_gv_;
     // Per-process scheduled flags (clotho.proc_sched), built once in run().
     llvm::GlobalVariable*               sched_gv_     = nullptr;
     llvm::ArrayType*                    sched_arr_ty_ = nullptr;
