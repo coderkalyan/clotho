@@ -2050,17 +2050,23 @@ private:
         return signal_of(target.as<NamedValueExpression>().symbol);
     }
 
-    // Lower `-> e` / `->> e` (LRM 15.5.2, 15.5.4). A delayed / event-controlled
-    // trigger (`->> #n e`, `->> @(x) e`) needs a detached timer and is not yet
-    // supported.
+    // Lower `-> e` / `->> e` / `->> #d e` (LRM 15.5.2, 15.5.4).
     void lower_event_trigger(const EventTriggerStatement& ev, ir::Builder& b) {
-        if (ev.timing != nullptr) {
-            // TODO: delayed / event-controlled nonblocking trigger — needs a
-            // detached wheel timer / event wait that fires the trigger with no
-            // hosting coroutine (docs/design/named-events.md, Tier 2).
-            fail("delayed event trigger ('->> #n e' / '->> @(...) e') is not supported");
-        }
         const ir::Signal sig = trigger_target(ev.target);
+        if (ev.timing != nullptr) {
+            // Only `->>` carries a timing control (grammar), so a delayed trigger
+            // is always nonblocking. A fixed delay `->> #d e` schedules a detached
+            // wheel timer; the event-controlled form is not yet lowered.
+            if (ev.timing->kind == slang::ast::TimingControlKind::Delay) {
+                const Expression& amount = ev.timing->as<slang::ast::DelayControl>().expr;
+                b.event_trigger_nb_delayed(sig, scaled_delay(amount, b), loc(ev));
+                return;
+            }
+            // TODO: event-controlled nonblocking trigger (`->> @(x) e`,
+            // `->> repeat(n) @(x) e`) — needs a detached one-shot event
+            // subscription (docs/design/named-events.md, Tier 2 Form 2).
+            fail("event-controlled nonblocking trigger ('->> @(...) e') is not supported");
+        }
         if (ev.isNonBlocking) {
             b.event_trigger_nb(sig, loc(ev)); // `->> e`: wake in the NBA region
         } else {
