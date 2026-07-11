@@ -168,6 +168,8 @@ const char* tag_name(Inst::Tag tag) {
             return "call";
         case T::TaskCall:
             return "task_call";
+        case T::Fork:
+            return "fork";
         case T::Loop:
             return "loop";
         case T::Delay:

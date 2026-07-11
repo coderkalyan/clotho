@@ -164,6 +164,7 @@ add_executable(clotho_test
   tests/inside_test.cpp
   tests/wait_test.cpp
   tests/xhier_test.cpp
+  tests/fork_test.cpp
   tests/severity_test.cpp
   tests/event_test.cpp
 )

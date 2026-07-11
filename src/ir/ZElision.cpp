@@ -373,6 +373,7 @@ struct Analysis {
                 case Inst::Tag::Continue:
                 case Inst::Tag::Delay:
                 case Inst::Tag::Wait:
+                case Inst::Tag::Fork:
                 case Inst::Tag::Display:
                 case Inst::Tag::TimeFormat:
                 case Inst::Tag::Finish:

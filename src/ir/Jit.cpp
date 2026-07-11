@@ -1,6 +1,7 @@
 #include "Jit.h"
 
 #include <csetjmp>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -204,6 +205,15 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_wheel_schedule_rel", &rt_wheel_schedule_rel);
     expose("rt_wheel_tick", &rt_wheel_tick);
     expose("rt_wheel_advance", &rt_wheel_advance);
+    // libc mem* helpers that LLVM's loop-idiom pass synthesizes under -O (a
+    // zeroing loop becomes memset, a copy loop memcpy, etc.). A dynamically
+    // linked clotho resolves these through the process symbol table below, but
+    // glibc's mem* are IFUNCs that dlsym cannot resolve in a fully static
+    // binary, so bind them to the host implementations directly.
+    expose("memset", &std::memset);
+    expose("memcpy", &std::memcpy);
+    expose("memmove", &std::memmove);
+    expose("memcmp", &std::memcmp);
     if (auto err = jd.define(llvm::orc::absoluteSymbols(std::move(rt_syms)))) {
         llvm::errs() << "jit: " << llvm::toString(std::move(err)) << "\n";
         return -1;
