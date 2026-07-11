@@ -952,6 +952,138 @@ extern "C" void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, uint64_t 
     dst->len  = src->len;
 }
 
+// -- Queues (LRM 7.10) --
+//
+// A queue is a growable ring buffer: `base` holds `cap` element slots, the `len`
+// live elements at physical positions (head + i) mod cap. All indexing is via
+// q_elem; growth linearises to head == 0.
+
+namespace {
+
+// Address of logical element `i` (0-based) in the ring. Requires cap > 0.
+uint8_t* q_elem(const rt_queue* h, uint64_t stride, uint64_t i) {
+    const uint64_t phys = (h->head + i) % h->cap;
+    return static_cast<uint8_t*>(h->base) + phys * stride;
+}
+
+// Ensure capacity for at least `need` elements, relocating the live elements to
+// a contiguous head == 0 layout when a larger buffer is allocated. Geometric
+// growth keeps repeated push amortised O(1).
+void q_reserve(rt_queue* h, uint64_t stride, uint64_t need) {
+    if (need <= h->cap) {
+        return;
+    }
+    uint64_t newcap = h->cap < 4 ? 4 : h->cap * 2;
+    if (newcap < need) {
+        newcap = need;
+    }
+    auto* buf = static_cast<uint8_t*>(std::malloc(static_cast<size_t>(newcap * stride)));
+    for (uint64_t i = 0; i < h->len; ++i) {
+        std::memcpy(buf + i * stride, q_elem(h, stride, i), static_cast<size_t>(stride));
+    }
+    std::free(h->base);
+    h->base = buf;
+    h->head = 0;
+    h->cap  = newcap;
+}
+
+// Drop elements from the back until the bounded-queue limit holds (LRM 7.10.4:
+// keep the first `bound + 1` elements; bound == 0 is unbounded).
+void q_apply_bound(rt_queue* h, uint64_t bound) {
+    if (bound != 0 && h->len > bound + 1) {
+        h->len = bound + 1;
+    }
+}
+
+} // namespace
+
+extern "C" void rt_queue_push_back(rt_queue* h, uint64_t stride, uint64_t bound, const void* elem) {
+    q_reserve(h, stride, h->len + 1);
+    std::memcpy(q_elem(h, stride, h->len), elem, static_cast<size_t>(stride));
+    h->len += 1;
+    q_apply_bound(h, bound);
+}
+
+extern "C" void rt_queue_push_front(rt_queue* h, uint64_t stride, uint64_t bound, const void* elem) {
+    q_reserve(h, stride, h->len + 1);
+    h->head = (h->head + h->cap - 1) % h->cap;
+    std::memcpy(q_elem(h, stride, 0), elem, static_cast<size_t>(stride));
+    h->len += 1;
+    q_apply_bound(h, bound);
+}
+
+extern "C" void rt_queue_pop_back(rt_queue* h, uint64_t stride, void* out) {
+    if (h->len == 0) {
+        return;
+    }
+    h->len -= 1;
+    std::memcpy(out, q_elem(h, stride, h->len), static_cast<size_t>(stride));
+}
+
+extern "C" void rt_queue_pop_front(rt_queue* h, uint64_t stride, void* out) {
+    if (h->len == 0) {
+        return;
+    }
+    std::memcpy(out, q_elem(h, stride, 0), static_cast<size_t>(stride));
+    h->head = (h->head + 1) % h->cap;
+    h->len -= 1;
+}
+
+extern "C" void rt_queue_insert(rt_queue* h, uint64_t stride, uint64_t bound, uint64_t i,
+                                const void* elem) {
+    if (i > h->len) {
+        return;
+    }
+    q_reserve(h, stride, h->len + 1);
+    // Shift [i, len) up by one to open a slot at i.
+    for (uint64_t j = h->len; j > i; --j) {
+        std::memcpy(q_elem(h, stride, j), q_elem(h, stride, j - 1), static_cast<size_t>(stride));
+    }
+    std::memcpy(q_elem(h, stride, i), elem, static_cast<size_t>(stride));
+    h->len += 1;
+    q_apply_bound(h, bound);
+}
+
+extern "C" void rt_queue_delete_idx(rt_queue* h, uint64_t stride, uint64_t i) {
+    if (i >= h->len) {
+        return;
+    }
+    // Shift (i, len) down by one over the removed slot.
+    for (uint64_t j = i; j + 1 < h->len; ++j) {
+        std::memcpy(q_elem(h, stride, j), q_elem(h, stride, j + 1), static_cast<size_t>(stride));
+    }
+    h->len -= 1;
+}
+
+extern "C" void rt_queue_delete_all(rt_queue* h) {
+    std::free(h->base);
+    h->base = nullptr;
+    h->head = 0;
+    h->len  = 0;
+    h->cap  = 0;
+}
+
+extern "C" void rt_queue_assign(rt_queue* dst, const rt_queue* src, uint64_t stride) {
+    if (dst == src) {
+        return;
+    }
+    std::free(dst->base);
+    dst->head = 0;
+    if (src->len == 0) {
+        dst->base = nullptr;
+        dst->len  = 0;
+        dst->cap  = 0;
+        return;
+    }
+    auto* buf = static_cast<uint8_t*>(std::malloc(static_cast<size_t>(src->len * stride)));
+    for (uint64_t i = 0; i < src->len; ++i) {
+        std::memcpy(buf + i * stride, q_elem(src, stride, i), static_cast<size_t>(stride));
+    }
+    dst->base = buf;
+    dst->len  = src->len;
+    dst->cap  = src->len;
+}
+
 extern "C" void rt_wheel_init(rt_wheel* wheel) {
     new (wheel->storage) RuntimeWheel;
 }

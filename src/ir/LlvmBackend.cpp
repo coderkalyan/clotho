@@ -306,11 +306,12 @@ struct LValue {
     // indices so the target static leaf can be matched in SignalSlot::static_leaves.
     bool                  agg_static = true;
     std::vector<uint32_t> agg_field_path;
-    // A dynamic-array element target (LRM 7.5.1): `base` is the heap data
-    // pointer loaded from the handle, `elem_idx` the element position, and this
-    // is the i1 "index in [0, len)" predicate. When set, a read forces the
-    // element default (x/0) out of range and a write is suppressed out of range,
-    // so the heap buffer is never accessed past its length.
+    // A dynamic-array or queue element target (LRM 7.5.1 / 7.10): `base` is the
+    // heap data pointer loaded from the handle, `elem_idx` the physical element
+    // position (the wrapped ring index for a queue), and this is the i1 "index in
+    // [0, len)" predicate. When set, a read forces the element default (x/0) out
+    // of range and a write is suppressed out of range, so the heap buffer is
+    // never accessed past its length.
     llvm::Value* dyn_inrange = nullptr;
 };
 
@@ -426,6 +427,11 @@ struct SignalSlot {
     // reached by the ElemSelect dynarr path; the handle powers on { null, 0 }
     // (an empty array) and is freed at teardown.
     bool is_dynarr = false;
+    // A queue signal: the slot is an opaque rt_queue ring handle
+    // (`clotho.queue`), has_z is false. Elements live in its heap ring buffer,
+    // reached by the ElemSelect queue path; the handle powers on
+    // { null, 0, 0, 0 } (an empty queue) and is freed at teardown.
+    bool is_queue = false;
 };
 
 // One function-frame local: its `{ i(2W), iW }` slot type and width / domain.
@@ -658,9 +664,27 @@ private:
                                         llvm::GlobalValue::InternalLinkage, init, "clotho.dynarr.proto");
     }
 
-    // Byte size of one element slot (the runtime stride for rt_dynarr_*).
+    // Byte size of one element slot (the runtime stride for rt_dynarr_* /
+    // rt_queue_*). Queue elements reuse DynElem (identical POD-scalar slot).
     uint64_t dynarr_stride(const DynElem& e) {
         return llmod_.getDataLayout().getTypeAllocSize(e.slot_ty);
+    }
+
+    // The opaque rt_queue ring handle slot type
+    // (`%clotho.queue = { ptr, i64, i64, i64 }`), memoized. Must mirror the
+    // runtime rt_queue layout ({ void* base, u64 head, u64 len, u64 cap }).
+    llvm::StructType* queue_slot_ty() {
+        if (queue_slot_ty_ == nullptr) {
+            queue_slot_ty_ = llvm::StructType::create(
+              ctx_, { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty() },
+              "clotho.queue");
+        }
+        return queue_slot_ty_;
+    }
+
+    // Whether a type is a queue (LRM 7.10).
+    bool is_queue_type(Ref type) const {
+        return std::get<Type>(mod_.pool.get(type)).kind == Type::Kind::Queue;
     }
 
     // Whether a type is a string, or an unpacked array whose leaf element is.
@@ -941,6 +965,15 @@ private:
                 slot.is_dynarr  = true;
                 slot.has_z      = false;
                 slot.slot_ty    = dynarr_slot_ty();
+                slot.storage_ty = slot.slot_ty;
+                continue;
+            }
+            // A queue slot is an opaque rt_queue ring handle ({ base, head, len,
+            // cap }): no planes, no z word; elements live in its heap ring buffer.
+            if (ty.kind == Type::Kind::Queue) {
+                slot.is_queue   = true;
+                slot.has_z      = false;
+                slot.slot_ty    = queue_slot_ty();
                 slot.storage_ty = slot.slot_ty;
                 continue;
             }
@@ -2551,6 +2584,8 @@ private:
                 emit_string_slot_op(state, s, str_deinit_fn());
             } else if (s.is_dynarr) {
                 b_.CreateCall(dynarr_delete_fn(), { storage_ptr(state, s) });
+            } else if (s.is_queue) {
+                b_.CreateCall(queue_delete_all_fn(), { storage_ptr(state, s) });
             }
         }
 
@@ -5166,6 +5201,36 @@ private:
         return rt_fn("rt_dynarr_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
     }
 
+    // -- Queue runtime (rt_queue_*, LRM 7.10) --
+    // void rt_queue_push_{back,front}(rt_queue*, i64 stride, i64 bound, const void* elem)
+    llvm::FunctionCallee queue_push_fn(bool front) {
+        return rt_fn(front ? "rt_queue_push_front" : "rt_queue_push_back", b_.getVoidTy(),
+                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), raw_ptr_ty() });
+    }
+    // void rt_queue_pop_{back,front}(rt_queue*, i64 stride, void* out)
+    llvm::FunctionCallee queue_pop_fn(bool front) {
+        return rt_fn(front ? "rt_queue_pop_front" : "rt_queue_pop_back", b_.getVoidTy(),
+                     { raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
+    }
+    // void rt_queue_insert(rt_queue*, i64 stride, i64 bound, i64 i, const void* elem)
+    llvm::FunctionCallee queue_insert_fn() {
+        return rt_fn("rt_queue_insert", b_.getVoidTy(),
+                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty(), raw_ptr_ty() });
+    }
+    // void rt_queue_delete_idx(rt_queue*, i64 stride, i64 i)
+    llvm::FunctionCallee queue_delete_idx_fn() {
+        return rt_fn("rt_queue_delete_idx", b_.getVoidTy(),
+                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty() });
+    }
+    // void rt_queue_delete_all(rt_queue*)
+    llvm::FunctionCallee queue_delete_all_fn() {
+        return rt_fn("rt_queue_delete_all", b_.getVoidTy(), { raw_ptr_ty() });
+    }
+    // void rt_queue_assign(rt_queue* dst, const rt_queue* src, i64 stride)
+    llvm::FunctionCallee queue_assign_fn() {
+        return rt_fn("rt_queue_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+    }
+
     llvm::FunctionCallee str_init_fn() {
         return rt_fn("rt_string_init", b_.getVoidTy(), { raw_ptr_ty() });
     }
@@ -5431,6 +5496,10 @@ private:
             // Empty array handle: { null data, 0 len } == zeroinitializer.
             return llvm::ConstantAggregateZero::get(s.storage_ty);
         }
+        if (s.is_queue) {
+            // Empty queue handle: { null base, 0 head, 0 len, 0 cap } == zeroinitializer.
+            return llvm::ConstantAggregateZero::get(s.storage_ty);
+        }
         if (s.is_string) {
             // Empty inline handle: byte (cap) holds cap == str_inline_cap, i.e.
             // sizeof(rt_string) - 1 (mirrors rt_string_init).
@@ -5589,6 +5658,14 @@ private:
                              ty.is_signed || fl, false, fl });
     }
 
+    // The element type Ref of the queue whose handle lvalue is `queue_lv`. The
+    // lvalue is a plain Signal (queue-of-queue is rejected at the frontend), so
+    // the queue type comes straight from the signal table.
+    Ref queue_elem_type(Index queue_lv) {
+        const Signal sig = ir_->payload(queue_lv).signal;
+        return std::get<Type>(mod_.pool.get(mod_.signal(sig).type)).element;
+    }
+
     ValType compute_type(Index i) {
         const Inst::Payload& p = ir_->payload(i);
         switch (ir_->tag(i)) {
@@ -5673,6 +5750,17 @@ private:
                 // Only size() is a value (a definite 2-state int); new / delete /
                 // copy are statements whose type is never queried.
                 return { 32, false, true };
+            case Inst::Tag::QueueOp: {
+                // pop_front/back yield one element (the queue's element type);
+                // size() is a definite 2-state int; the rest are statements whose
+                // type is never queried.
+                const auto qi = ir_->extra_data<QueueInfo>(p.op_extra.extra);
+                if (qi.sub == static_cast<uint32_t>(QueueOp::PopFront) ||
+                    qi.sub == static_cast<uint32_t>(QueueOp::PopBack)) {
+                    return from_ref(queue_elem_type(p.op_extra.op));
+                }
+                return { 32, false, true };
+            }
 
             case Inst::Tag::Add:
             case Inst::Tag::Sub:
@@ -6095,6 +6183,44 @@ private:
                     set_lvalue(i, el);
                     return;
                 }
+                if (at.kind == Type::Kind::Queue) {
+                    // Queue (LRM 7.10): the base lvalue addresses the
+                    // { base, head, len, cap } ring handle. Element i lives at the
+                    // physical slot (head + i) mod cap; build a fresh element
+                    // lvalue over `[0 x elemslot]` at that physical index with the
+                    // in-range predicate i < len (an empty queue has len == 0, so
+                    // the modulo divisor is clamped to 1 to keep it defined on the
+                    // never-taken out-of-range path).
+                    const DynElem e       = dynarr_elem(es.array_type);
+                    llvm::Value*  handle  = lv.base;
+                    llvm::Value*  baseptr = b_.CreateLoad(
+                      raw_ptr_ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 0));
+                    llvm::Value* head = b_.CreateLoad(
+                      b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 1));
+                    llvm::Value* len = b_.CreateLoad(
+                      b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 2));
+                    llvm::Value* cap = b_.CreateLoad(
+                      b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 3));
+                    llvm::Value* idx64 = cast(must_of(value_of(es.index)), 64, false);
+                    llvm::Value* safe_cap =
+                      b_.CreateSelect(b_.CreateICmpEQ(cap, b_.getInt64(0)), b_.getInt64(1), cap);
+                    llvm::Value* phys = b_.CreateURem(b_.CreateAdd(head, idx64), safe_cap);
+                    LValue       el;
+                    el.base        = baseptr;
+                    el.slot_ty     = e.slot_ty;
+                    el.has_z       = e.has_z;
+                    el.narrow      = e.narrow;
+                    el.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
+                    el.elem_idx    = cast(phys, 32, false);
+                    el.store_width = e.width;
+                    el.bit_off     = b_.getInt32(0);
+                    el.width       = e.width;
+                    el.is_signal   = lv.is_signal;
+                    el.sig         = lv.sig;
+                    el.dyn_inrange = b_.CreateICmpULT(idx64, len);
+                    set_lvalue(i, el);
+                    return;
+                }
                 // TODO: an X/Z or out-of-range index uses only its must bits, so it
                 // selects a wrong / out-of-bounds element. LRM: an out-of-range read
                 // yields X and such a write is a no-op.
@@ -6255,6 +6381,10 @@ private:
 
             case Inst::Tag::DynArrayOp:
                 lower_dyn_array_op(i);
+                return;
+
+            case Inst::Tag::QueueOp:
+                lower_queue_op(i);
                 return;
 
             case Inst::Tag::Constant: {
@@ -7126,6 +7256,110 @@ private:
             case DynArrayOp::Copy:
                 b_.CreateCall(dynarr_assign_fn(),
                               { handle, lvalue_of(da.src).base, b_.getInt64(dynarr_stride(e)) });
+                return;
+        }
+    }
+
+    // An alloca placed at the top of the current function's entry block (not the
+    // current insert point), so a scratch buffer used inside a loop body is
+    // allocated once per activation rather than growing the stack per iteration.
+    llvm::AllocaInst* entry_alloca(llvm::Type* ty, const llvm::Twine& name) {
+        auto*             fn = b_.GetInsertBlock()->getParent();
+        auto&             eb = fn->getEntryBlock();
+        llvm::IRBuilder<> ab(&eb, eb.getFirstInsertionPt());
+        return ab.CreateAlloca(ty, nullptr, name);
+    }
+
+    // An lvalue addressing a single element slot at raw pointer `ptr` (a scratch
+    // alloca), for the shared lower_load / lower_store plane machinery.
+    LValue elem_scratch_lvalue(llvm::Value* ptr, const DynElem& e) {
+        LValue lv;
+        lv.base        = ptr;
+        lv.slot_ty     = e.slot_ty;
+        lv.has_z       = e.has_z;
+        lv.narrow      = e.narrow;
+        lv.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
+        lv.elem_idx    = b_.getInt32(0);
+        lv.store_width = e.width;
+        lv.bit_off     = b_.getInt32(0);
+        lv.width       = e.width;
+        lv.is_signal   = false;
+        return lv;
+    }
+
+    // The element power-on default as an in-register constant (X for 4-state, 0
+    // for 2-state / real), used to pre-fill a pop scratch so an empty-queue pop
+    // yields the default.
+    llvm::Constant* elem_default_const(const DynElem& e) {
+        llvm::Constant*              mm = e.narrow ? zero(e.width) : x_mm(e.width);
+        std::vector<llvm::Constant*> fields{ mm };
+        if (e.has_z) {
+            fields.push_back(zero(e.width));
+        }
+        return llvm::ConstantStruct::get(e.slot_ty, fields);
+    }
+
+    // Lower a queue_op instruction: size / push* / pop* / insert / delete / copy
+    // over the handle lvalue (LRM 7.10.2). Indexed element access q[i] rides the
+    // ElemSelect queue path, not this. Element values cross to the runtime through
+    // a scratch element slot (push / insert stage the value in; pop copies out).
+    void lower_queue_op(Index i) {
+        const Inst::Payload& p      = ir_->payload(i);
+        const auto           qi     = ir_->extra_data<QueueInfo>(p.op_extra.extra);
+        const LValue&        lv     = lvalue_of(p.op_extra.op);
+        llvm::Value*         handle = lv.base;
+        const Ref            arr_ty = mod_.signal(lv.sig).type;
+        const DynElem        e      = dynarr_elem(arr_ty);
+        llvm::Value*         stride = b_.getInt64(dynarr_stride(e));
+        llvm::Value*         bound  = b_.getInt64(std::get<Type>(mod_.pool.get(arr_ty)).left);
+        switch (static_cast<QueueOp>(qi.sub)) {
+            case QueueOp::Size: {
+                llvm::Value* len =
+                  b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 2));
+                set_value(i, two_val(cast(len, 32, false)));
+                return;
+            }
+            case QueueOp::PushBack:
+            case QueueOp::PushFront: {
+                const bool front   = static_cast<QueueOp>(qi.sub) == QueueOp::PushFront;
+                auto*      scratch = entry_alloca(e.slot_ty, "q.elem");
+                lower_store(elem_scratch_lvalue(scratch, e), value_of(qi.val));
+                b_.CreateCall(queue_push_fn(front), { handle, stride, bound, scratch });
+                return;
+            }
+            case QueueOp::PopBack:
+            case QueueOp::PopFront: {
+                const bool front   = static_cast<QueueOp>(qi.sub) == QueueOp::PopFront;
+                auto*      scratch = entry_alloca(e.slot_ty, "q.elem");
+                // Pre-fill with the default: the runtime leaves an empty-queue pop
+                // untouched, so the load below then reads the element default.
+                b_.CreateStore(elem_default_const(e), scratch);
+                b_.CreateCall(queue_pop_fn(front), { handle, stride, scratch });
+                Plane         v = lower_load(elem_scratch_lvalue(scratch, e));
+                const ValType t = type_of(i);
+                if (t.is_real) {
+                    v = real_plane(planes_to_real(v, t.width));
+                }
+                set_value(i, v);
+                return;
+            }
+            case QueueOp::Insert: {
+                auto* scratch = entry_alloca(e.slot_ty, "q.elem");
+                lower_store(elem_scratch_lvalue(scratch, e), value_of(qi.val));
+                llvm::Value* idx = cast(must_of(value_of(qi.idx)), 64, false);
+                b_.CreateCall(queue_insert_fn(), { handle, stride, bound, idx, scratch });
+                return;
+            }
+            case QueueOp::DeleteIdx: {
+                llvm::Value* idx = cast(must_of(value_of(qi.idx)), 64, false);
+                b_.CreateCall(queue_delete_idx_fn(), { handle, stride, idx });
+                return;
+            }
+            case QueueOp::DeleteAll:
+                b_.CreateCall(queue_delete_all_fn(), { handle });
+                return;
+            case QueueOp::Copy:
+                b_.CreateCall(queue_assign_fn(), { handle, lvalue_of(qi.val).base, stride });
                 return;
         }
     }
@@ -10854,6 +11088,8 @@ private:
     // coroutine body lowering resets lvals_ via select_member, so the mapping
     // cannot live there.
     std::vector<llvm::Value*> dynarr_ret_;
+    // Memoized `%clotho.queue` handle slot type ({ ptr base, i64 head, len, cap }).
+    llvm::StructType* queue_slot_ty_ = nullptr;
 };
 
 // Lower the coroutine intrinsics emitted for each process and clean up the

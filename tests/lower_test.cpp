@@ -586,15 +586,36 @@ TEST_CASE("a dynamic array lowers (LRM 7.5)") {
     CHECK(r.ok);
 }
 
-TEST_CASE("a queue still fails loudly") {
+TEST_CASE("a queue lowers (LRM 7.10)") {
     const LowerResult r = lower_text(R"(
         module top;
             int q [$];
             initial q.push_back(1);
         endmodule
     )");
+    CHECK(r.ok);
+}
+
+TEST_CASE("an unpacked array of queues fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            int q [2][$];
+            initial q[0].push_back(1);
+        endmodule
+    )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("queue / associative") != std::string::npos);
+    CHECK(r.diagnostics.find("unpacked array of a queue") != std::string::npos);
+}
+
+TEST_CASE("an associative array still fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            int a [string];
+            initial a["x"] = 1;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("associative") != std::string::npos);
 }
 
 TEST_CASE("a packed struct declares and carries its field table") {

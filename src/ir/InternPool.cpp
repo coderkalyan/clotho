@@ -147,6 +147,10 @@ Layout InternPool::layout(Ref type) const {
             // Not plane-sized: an opaque rt_dynarr handle. Width 0 is the
             // sentinel; the backend queries `element` for per-element sizing.
             return { Domain::Two, 0, 0 };
+        case Type::Kind::Queue:
+            // Not plane-sized: an opaque rt_queue ring handle. Width 0 is the
+            // sentinel; the backend queries `element` for per-element sizing.
+            return { Domain::Two, 0, 0 };
         case Type::Kind::UnpackedArray: {
             // Report the leaf element's domain / width (recursion drills through
             // nested arrays), so callers sizing a per-element access see the

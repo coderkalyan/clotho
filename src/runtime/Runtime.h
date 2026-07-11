@@ -404,6 +404,54 @@ void rt_dynarr_delete(rt_dynarr* h);
 // semantics, LRM §7.5). A no-op when dst == src.
 void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, uint64_t stride);
 
+// -- SystemVerilog queues --
+//
+// The queue type (LRM §7.10): a runtime-sized double-ended vector of a
+// fixed-width element. The value lives in a 32-byte caller-owned handle embedded
+// in design state (same ownership model as rt_string / rt_dynarr): `base` points
+// at one heap ring buffer of `cap` elements, each `stride` bytes; the `len` live
+// elements occupy physical slots (head + i) mod cap for i in [0, len). Copies are
+// eager deep copies; handles never share storage. A handle powers on zeroed —
+// { null, 0, 0, 0 } is the empty queue — and is released with rt_queue_delete_all.
+// The per-element record layout is defined by the backend; the runtime owns only
+// the raw byte buffer.
+typedef struct rt_queue {
+    void*    base;
+    uint64_t head;
+    uint64_t len;
+    uint64_t cap;
+} rt_queue;
+
+// Bounded-queue max size argument for the push helpers: `bound` is the `[$:N]`
+// maximum index (max size N+1); 0 means unbounded (LRM §7.10.4). An overflowing
+// push drops the element at the opposite end.
+//
+// q.push_back(e) / q.push_front(e): append `elem` (a `stride`-byte element slot)
+// to the tail / head, growing the ring as needed.
+void rt_queue_push_back(rt_queue* h, uint64_t stride, uint64_t bound, const void* elem);
+void rt_queue_push_front(rt_queue* h, uint64_t stride, uint64_t bound, const void* elem);
+
+// q.pop_back() / q.pop_front(): remove the tail / head element and copy it into
+// `out` (a `stride`-byte slot). On an empty queue `out` is left untouched (the
+// caller pre-fills it with the element default).
+void rt_queue_pop_back(rt_queue* h, uint64_t stride, void* out);
+void rt_queue_pop_front(rt_queue* h, uint64_t stride, void* out);
+
+// q.insert(i, e): insert `elem` before position `i` (0 <= i <= len); out-of-range
+// `i` is ignored. Honours the bound like a push.
+void rt_queue_insert(rt_queue* h, uint64_t stride, uint64_t bound, uint64_t i, const void* elem);
+
+// q.delete(i): remove the element at position `i` (0 <= i < len); out-of-range
+// `i` is ignored.
+void rt_queue_delete_idx(rt_queue* h, uint64_t stride, uint64_t i);
+
+// q.delete(): free the buffer and reset to the empty queue. Idempotent.
+void rt_queue_delete_all(rt_queue* h);
+
+// dst = src: deep copy `src`'s `stride`-byte elements into `dst`, linearised so
+// dst->head == 0 (value semantics, LRM §7.10). A no-op when dst == src.
+void rt_queue_assign(rt_queue* dst, const rt_queue* src, uint64_t stride);
+
 // -- SystemVerilog string objects --
 //
 // The dynamic `string` type (LRM §6.16). A string value lives in a fixed

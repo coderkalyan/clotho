@@ -173,6 +173,14 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_dynarr_new_copy", &rt_dynarr_new_copy);
     expose("rt_dynarr_delete", &rt_dynarr_delete);
     expose("rt_dynarr_assign", &rt_dynarr_assign);
+    expose("rt_queue_push_back", &rt_queue_push_back);
+    expose("rt_queue_push_front", &rt_queue_push_front);
+    expose("rt_queue_pop_back", &rt_queue_pop_back);
+    expose("rt_queue_pop_front", &rt_queue_pop_front);
+    expose("rt_queue_insert", &rt_queue_insert);
+    expose("rt_queue_delete_idx", &rt_queue_delete_idx);
+    expose("rt_queue_delete_all", &rt_queue_delete_all);
+    expose("rt_queue_assign", &rt_queue_assign);
     expose("rt_string_init", &rt_string_init);
     expose("rt_string_deinit", &rt_string_deinit);
     expose("rt_string_assign", &rt_string_assign);

@@ -154,6 +154,49 @@ Index Builder::dyn_array_copy(Index dst, Index src, Ref array_type, SourceLoc lo
     return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
 }
 
+Index Builder::queue_size(Index q, SourceLoc loc) {
+    const ExtraIndex extra =
+      add_extra(QueueInfo{ static_cast<uint32_t>(QueueOp::Size), q, q, 0u });
+
+    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
+}
+
+Index Builder::queue_push(Index q, Index elem, bool front, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(QueueInfo{
+      static_cast<uint32_t>(front ? QueueOp::PushFront : QueueOp::PushBack), q, elem, 2u });
+
+    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
+}
+
+Index Builder::queue_pop(Index q, bool front, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(
+      QueueInfo{ static_cast<uint32_t>(front ? QueueOp::PopFront : QueueOp::PopBack), q, q, 0u });
+
+    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
+}
+
+Index Builder::queue_insert(Index q, Index idx, Index elem, SourceLoc loc) {
+    const ExtraIndex extra =
+      add_extra(QueueInfo{ static_cast<uint32_t>(QueueOp::Insert), idx, elem, 3u });
+
+    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
+}
+
+Index Builder::queue_delete(Index q, Index idx, bool has_idx, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(QueueInfo{
+      static_cast<uint32_t>(has_idx ? QueueOp::DeleteIdx : QueueOp::DeleteAll), idx, q,
+      has_idx ? 1u : 0u });
+
+    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
+}
+
+Index Builder::queue_copy(Index dst, Index src, SourceLoc loc) {
+    const ExtraIndex extra =
+      add_extra(QueueInfo{ static_cast<uint32_t>(QueueOp::Copy), dst, src, 2u });
+
+    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+}
+
 Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc,
                     bool unlikely) {
     const ExtraIndex extra = add_extra(Regions{ then_region, else_region, unlikely });

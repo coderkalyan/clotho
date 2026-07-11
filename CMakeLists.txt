@@ -168,6 +168,7 @@ add_executable(clotho_test
   tests/severity_test.cpp
   tests/event_test.cpp
   tests/dynamic_array_test.cpp
+  tests/queue_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho doctest::doctest clotho_warnings)
 

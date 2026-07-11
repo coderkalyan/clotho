@@ -189,7 +189,7 @@ struct Analysis {
                     // downstream signal is not z-elided.
                     const auto  es = ir.extra_data<ElemSelect>(p.op_extra.extra);
                     const Type& at = std::get<Type>(m.pool.get(es.array_type));
-                    if (at.kind == Type::Kind::DynArray) {
+                    if (at.kind == Type::Kind::DynArray || at.kind == Type::Kind::Queue) {
                         val_z[raw] = m.pool.layout(at.element).domain == Domain::Four ? 1 : 0;
                     } else {
                         val_z[raw] = z_of(p.op_extra.op);
@@ -217,6 +217,27 @@ struct Analysis {
                     // the handle, not a plane slot, so nothing propagates here.
                     val_z[raw] = 0;
                     break;
+                case Inst::Tag::QueueOp: {
+                    // size() is a definite int (no z). pop* yields an element,
+                    // which for a 4-state element may carry z; report
+                    // conservatively. push / insert / delete / copy are statements
+                    // that write the handle, not a plane slot.
+                    const auto qi = ir.extra_data<QueueInfo>(p.op_extra.extra);
+                    bool       popped_z = false;
+                    if (qi.sub == static_cast<uint32_t>(QueueOp::PopFront) ||
+                        qi.sub == static_cast<uint32_t>(QueueOp::PopBack)) {
+                        const Index root = lvalue_root(ir, p.op_extra.op).root;
+                        if (ir.tag(root) == Inst::Tag::Signal) {
+                            const Ref qty = m.signal(ir.payload(root).signal).type;
+                            popped_z =
+                              m.pool.layout(std::get<Type>(m.pool.get(qty)).element).domain == Domain::Four;
+                        } else {
+                            popped_z = true;
+                        }
+                    }
+                    val_z[raw] = popped_z ? 1 : 0;
+                    break;
+                }
 
                 // Z-transparent value ops: the z plane rides through their
                 // lowerings (an unknown shift count / select condition forces X

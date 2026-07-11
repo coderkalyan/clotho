@@ -92,6 +92,20 @@ public:
     Index dyn_array_delete(Index arr, Ref array_type, SourceLoc loc);
     // dst = src: deep copy of another dynamic array (value semantics).
     Index dyn_array_copy(Index dst, Index src, Ref array_type, SourceLoc loc);
+    // Queue operations on the handle lvalue `q` (LRM 7.10.2). size / pop* yield
+    // a value; push* / insert / delete / copy are statements. See ir::QueueOp.
+    // q.size(): current element count (32-bit int).
+    Index queue_size(Index q, SourceLoc loc);
+    // q.push_back(e) / q.push_front(e): append the element value `elem`.
+    Index queue_push(Index q, Index elem, bool front, SourceLoc loc);
+    // q.pop_back() / q.pop_front(): remove and return the tail / head element.
+    Index queue_pop(Index q, bool front, SourceLoc loc);
+    // q.insert(idx, e): insert `elem` before position `idx`.
+    Index queue_insert(Index q, Index idx, Index elem, SourceLoc loc);
+    // q.delete(idx): remove the element at `idx`. q.delete(): remove all.
+    Index queue_delete(Index q, Index idx, bool has_idx, SourceLoc loc);
+    // dst = src: deep copy of another queue (value semantics).
+    Index queue_copy(Index dst, Index src, SourceLoc loc);
     // `unlikely` hints that the condition is rarely true (e.g. a violation
     // check), so the backend biases branch weights toward the else path.
     Index cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc,

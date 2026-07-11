@@ -200,6 +200,45 @@ enum class DynArrayOp : uint32_t {
     Copy,
 };
 
+// Which queue operation a `queue_op` performs (LRM 7.10.2). Kept in lockstep
+// with the backend dispatch in LlvmBackend and the runtime rt_queue_* functions.
+enum class QueueOp : uint32_t {
+    // q.size(): the current element count (a 32-bit int).
+    Size,
+    // q.push_back(e) / q.push_front(e): append `val` to the tail / head; on a
+    // bounded queue an overflowing element is dropped from the opposite end.
+    PushBack,
+    PushFront,
+    // q.pop_back() / q.pop_front(): remove and return the tail / head element
+    // (element default on an empty queue).
+    PopBack,
+    PopFront,
+    // q.insert(idx, e): insert `val` before position `idx` (LRM 7.10.2.4).
+    Insert,
+    // q.delete(idx): remove the element at `idx` (LRM 7.10.2.5).
+    DeleteIdx,
+    // q.delete(): remove all elements, size -> 0.
+    DeleteAll,
+    // q = other: deep copy of another queue's storage (value semantics).
+    Copy,
+};
+
+// Extra payload for `queue_op`: a queue operation on the handle lvalue `op`
+// (the instruction's op_extra.op). `sub` is the ir::QueueOp; `idx` is the
+// position operand (Insert / DeleteIdx), `val` the element value (PushBack /
+// PushFront / Insert) or the source handle lvalue (Copy). `flags` bit 0 marks
+// `idx` present, bit 1 marks `val` present.
+struct QueueInfo {
+    // ir::QueueOp value.
+    uint32_t sub;
+    // Position operand (Insert / DeleteIdx).
+    Index idx;
+    // Element value (PushBack / PushFront / Insert) or source lvalue (Copy).
+    Index val;
+    // bit0: `idx` present; bit1: `val` present.
+    uint32_t flags;
+};
+
 // Extra payload for `dyn_array_op`: a dynamic-array operation on the handle
 // lvalue `op` (the instruction's op_extra.op). `sub` is the ir::DynArrayOp;
 // `size` is the element count for New (else unused); `src` is the source handle
@@ -663,6 +702,7 @@ static_assert(ExtraPayload<ElemSelect>);
 static_assert(ExtraPayload<MemberSelect>);
 static_assert(ExtraPayload<AggCopyInfo>);
 static_assert(ExtraPayload<DynArrayInfo>);
+static_assert(ExtraPayload<QueueInfo>);
 static_assert(ExtraPayload<ReadMemInfo>);
 static_assert(ExtraPayload<Regions>);
 static_assert(ExtraPayload<LoopInfo>);
@@ -747,6 +787,14 @@ struct Inst {
         // access itself riding the ordinary ElemSelect path over the handle's
         // heap buffer.
         DynArrayOp,
+
+        // Queue operation on a handle lvalue (payload: op_extra -> QueueInfo; op
+        // is the queue handle lvalue). The `sub` field selects size / push* /
+        // pop* / insert / delete (ir::QueueOp, LRM 7.10.2). size / pop* yield a
+        // value; the rest are statements. Lowers to the matching rt_queue_*
+        // call; indexed element access q[i] rides the ElemSelect queue path
+        // (ring math over the handle's buffer).
+        QueueOp,
 
         // -- Arithmetic (payload: binary) --
         Add,

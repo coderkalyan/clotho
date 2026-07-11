@@ -61,6 +61,10 @@ void render_type(const InternPool& pool, Ref type, std::ostream& os) {
             render_type(pool, t.element, os);
             os << " []";
             break;
+        case Type::Kind::Queue:
+            render_type(pool, t.element, os);
+            os << " [$]";
+            break;
     }
 }
 
@@ -94,6 +98,8 @@ const char* tag_name(Inst::Tag tag) {
             return "store_nb";
         case T::DynArrayOp:
             return "dyn_array_op";
+        case T::QueueOp:
+            return "queue_op";
         case T::Add:
             return "add";
         case T::Sub:

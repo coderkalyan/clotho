@@ -737,14 +737,16 @@ TEST_CASE("foreach over a dynamic array iterates the runtime size") {
     )") == "0 5\n1 6\n2 7\n");
 }
 
-TEST_CASE("foreach over a queue is rejected") {
-    const LowerResult r = lower_text(R"(
+TEST_CASE("foreach over a queue iterates the runtime size") {
+    CHECK(run_capture(R"(
         module m;
             integer q [$];
-            initial foreach (q[i]) $display("%0d", i);
+            initial begin
+                q.push_back(5); q.push_back(6); q.push_back(7);
+                foreach (q[i]) $display("%0d %0d", i, q[i]);
+            end
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
+    )") == "0 5\n1 6\n2 7\n");
 }
 
 TEST_CASE("foreach over an associative array is rejected") {

@@ -155,6 +155,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::MemberSelect:
         case T::AggCopy:
         case T::DynArrayOp:
+        case T::QueueOp:
         case T::Cond:
         case T::Switch:
         case T::Fopen:
@@ -368,6 +369,21 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 }
                 if (da.has_src) {
                     scratch[n++] = da.src;
+                }
+                return { scratch.data(), n };
+            }
+            // queue_op exposes the handle lvalue plus its optional idx / val
+            // operands (element value or Copy source lvalue); the sub-op selector
+            // is not an operand.
+            if (tag == Inst::Tag::QueueOp) {
+                const auto qi = extra_data<QueueInfo>(p.op_extra.extra);
+                size_t     n  = 0;
+                scratch[n++]  = p.op_extra.op;
+                if (qi.flags & 1u) {
+                    scratch[n++] = qi.idx;
+                }
+                if (qi.flags & 2u) {
+                    scratch[n++] = qi.val;
                 }
                 return { scratch.data(), n };
             }

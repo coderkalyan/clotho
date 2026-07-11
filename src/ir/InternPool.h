@@ -101,6 +101,14 @@ struct Type {
         // and query `element` for the per-element slot. left/right are unused
         // (dynamic arrays are always 0-based [0:len-1]).
         DynArray,
+        // Queue (LRM §7.10): a runtime-sized double-ended vector of `element`.
+        // Not plane-sized — layout() reports width 0 and runtime storage is an
+        // opaque rt_queue ring handle ({ base, head, len, cap }); consumers
+        // branch on the kind and query `element` for the per-element slot.
+        // `left` holds the queue bound (max index N of a `[$:N]` bounded queue,
+        // so max size N+1; 0 means unbounded). right is unused; a queue is
+        // always 0-based [0:len-1].
+        Queue,
     };
 
     // Discriminant for this type.

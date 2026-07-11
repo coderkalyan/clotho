@@ -827,6 +827,17 @@ private:
             t.element = lower_type(arr->elementType);
             t.left    = static_cast<uint32_t>(r.left);
             t.right   = static_cast<uint32_t>(r.right);
+            // A variable-size element (queue / dynamic array) is a per-cell heap
+            // handle; the fixed-array slot is plane-shaped and has no per-element
+            // init/deinit/copy for handles, so it would silently miscompile.
+            // Lowering is bottom-up, so this immediate check also rejects deeper
+            // nesting (int q[2][3][$] fails at the [3][$] level).
+            const ir::Type::Kind ek = std::get<ir::Type>(module_.pool.get(t.element)).kind;
+            if (ek == ir::Type::Kind::Queue || ek == ir::Type::Kind::DynArray) {
+                // TODO: unpacked array of queue / dynamic array (needs handle-aware
+                // per-cell lifecycle; see docs/design/dynamic-arrays.md).
+                fail("unpacked array of a queue / dynamic array is not supported");
+            }
 
             return module_.pool.put(ir::Item{ t });
         }
@@ -849,10 +860,30 @@ private:
 
             return module_.pool.put(ir::Item{ t });
         }
+        if (const auto* qt = ct.as_if<slang::ast::QueueType>()) {
+            // Queue (LRM 7.10): a heap-backed rt_queue ring handle. Phase-1
+            // restricts the element to a POD scalar (integral or real), same as
+            // dynamic arrays — managed elements need per-element lifecycle.
+            const slang::ast::Type& et = qt->elementType.getCanonicalType();
+            if (!et.isIntegral() && !et.isFloating()) {
+                // TODO: queue of string / struct / array / dynamic / queue /
+                // associative element (managed elements need per-element
+                // lifecycle in the runtime; see docs/design/dynamic-arrays.md).
+                fail("queue element type is not supported (only integral / real "
+                     "elements)");
+            }
+            ir::Type t;
+            t.kind    = ir::Type::Kind::Queue;
+            t.element = lower_type(qt->elementType);
+            // maxBound is the `[$:N]` max index (0 == unbounded); stored in left.
+            t.left = qt->maxBound;
+
+            return module_.pool.put(ir::Item{ t });
+        }
         if (ct.isUnpackedArray()) {
-            // TODO: queues, associative arrays (variable-size, need heap-backed
-            // runtime storage). Dynamic arrays are handled above.
-            fail("queue / associative arrays are not supported");
+            // TODO: associative arrays (variable-size, need heap-backed runtime
+            // storage). Dynamic arrays and queues are handled above.
+            fail("associative arrays are not supported");
         }
         if (ct.isString()) {
             return module_.pool.string_type;
@@ -1193,6 +1224,11 @@ private:
     // True if an expression's type is a dynamic array (LRM 7.5).
     static bool is_dyn_array(const slang::ast::Expression& e) {
         return e.type->getCanonicalType().as_if<slang::ast::DynamicArrayType>() != nullptr;
+    }
+
+    // True if an expression's type is a queue (LRM 7.10).
+    static bool is_queue(const slang::ast::Expression& e) {
+        return e.type->getCanonicalType().as_if<slang::ast::QueueType>() != nullptr;
     }
 
     // True if an expression is of the dynamic `string` type (LRM 6.16).
@@ -3214,9 +3250,14 @@ private:
                 lower_foreach_runtime_dim(f, dim, ty, iter_lv, len, b, l);
                 return;
             }
-            // TODO: queue / associative array foreach dimension -- needs the
-            // matching runtime-sized bound / ordered key iteration.
-            fail("foreach over a queue / associative array dimension is not supported");
+            if (is_queue(f.arrayRef)) {
+                const ir::Index len = b.queue_size(lower_lvalue(f.arrayRef, b), l);
+                lower_foreach_runtime_dim(f, dim, ty, iter_lv, len, b, l);
+                return;
+            }
+            // TODO: associative array foreach dimension -- needs ordered key
+            // iteration.
+            fail("foreach over an associative array dimension is not supported");
         }
 
         // Fixed-range dimension (packed or unpacked): iterate the declared
@@ -3882,6 +3923,13 @@ private:
         if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
             is_dyn_array(*call.arguments()[0])) {
             lower_dyn_array_method(name, call, b, loc(call));
+            return;
+        }
+        // A queue method as a statement (push/pop/insert/delete): lower for
+        // effect, discard any returned element.
+        if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
+            is_queue(*call.arguments()[0])) {
+            lower_queue_method(name, call, b, loc(call));
             return;
         }
         if (const char rx = display_radix(name, "$display")) {
@@ -4557,6 +4605,13 @@ private:
         if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
             is_dyn_array(*call.arguments()[0])) {
             return lower_dyn_array_method(name, call, b, l);
+        }
+
+        // Queue built-in methods (q.size(), q.pop_front(), LRM 7.10.2) arrive the
+        // same way, with the queue as arguments()[0].
+        if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
+            is_queue(*call.arguments()[0])) {
+            return lower_queue_method(name, call, b, l);
         }
 
         // Enum methods (LRM 6.19.2-6.19.5) arrive the same way, with an enum-typed
@@ -5494,6 +5549,14 @@ private:
             }
             return lower_dyn_array_assign(a, b);
         }
+        if (is_queue(a.left())) {
+            if (a.isNonBlocking()) {
+                // TODO: nonblocking assignment to a queue (needs a handle-aware
+                // NBA staging path; the per-signal shadow is plane-shaped).
+                fail("nonblocking assignment to a queue is not supported");
+            }
+            return lower_queue_assign(a, b);
+        }
         if (is_unpacked_array(a.left())) {
             // A whole blocking copy of one plain (string-free) unpacked array into
             // another is a single memcpy of the storage (same AggCopy path as an
@@ -5530,6 +5593,13 @@ private:
             // TODO: nonblocking assignment to strings (needs a string-aware NBA
             // staging path; the per-signal shadow is plane-shaped).
             fail("nonblocking assignment to a string is not supported");
+        }
+        if (a.isNonBlocking() && a.left().kind == ExpressionKind::ElementSelect &&
+            is_queue(a.left().as<ElementSelectExpression>().value())) {
+            // TODO: nonblocking assignment to a queue element (needs a
+            // handle-aware NBA staging path; the per-signal shadow is
+            // plane-shaped and cannot reach the heap ring buffer).
+            fail("nonblocking assignment to a queue element is not supported");
         }
         // StoreNb gets correct two-phase NBA semantics in the backend: the RHS is
         // sampled here in the active region and committed in the NBA update region.
@@ -5582,6 +5652,75 @@ private:
         }
         // TODO: dynamic array find/sort/sum/etc. reduction & locator methods.
         fail("dynamic array method '" + std::string(name) + "' is not supported");
+    }
+
+    // Element address for a variable-size array (dynamic array or queue) index
+    // over the handle lvalue `base`. Handles the queue `$` selector (q[$] is the
+    // last element, index size-1; size-1 == -1 selects the OOB default on an
+    // empty queue).
+    ir::Index var_elem_select(const ElementSelectExpression& es, ir::Index base, ir::Builder& b,
+                              ir::SourceLoc l) {
+        const ir::Ref arr_ty = lower_type(*es.value().type);
+        if (is_queue(es.value()) && es.selector().type->isUnbounded()) {
+            const ir::Ref   i32  = make_int_type(32, false, true);
+            const ir::Index size = b.queue_size(base, l);
+            const ir::Index idx =
+              b.binary(ir::Inst::Tag::Sub, size, b.constant(module_.pool.put_int(i32, 1), l), l);
+            return b.elem_select(base, idx, arr_ty, l);
+        }
+        return b.elem_select(base, lower_expr(es.selector(), b), arr_ty, l);
+    }
+
+    // Whole-queue assignment (LRM 7.10): `q = other` deep-copies the source
+    // handle. Element writes (`q[i] = x`) are ordinary Stores over an ElemSelect
+    // and do not reach here. Non-queue sources (concatenation / assignment
+    // pattern) are a documented follow-up.
+    ir::Index lower_queue_assign(const AssignmentExpression& a, ir::Builder& b) {
+        const ir::SourceLoc l   = loc(a);
+        const ir::Index     dst = lower_lvalue(a.left(), b);
+        // Only a plain queue-variable source is a handle copy. A queue-typed
+        // concatenation ({q, e}), assignment pattern ('{...}), or slice is a
+        // value expression, not an lvalue, and needs an element-wise build.
+        const bool src_is_var = is_queue(a.right()) &&
+                                (a.right().kind == ExpressionKind::NamedValue ||
+                                 a.right().kind == ExpressionKind::HierarchicalValue);
+        if (!src_is_var) {
+            // TODO: queue init from a concatenation ({q, e}), assignment pattern
+            // ('{...}), slice, or unpacked-array source — needs an element-wise
+            // build, not a handle copy (see docs/design/dynamic-arrays.md phase 4).
+            fail("queue assignment from a non-variable value is not supported");
+        }
+        b.queue_copy(dst, lower_lvalue(a.right(), b), l);
+        return dst;
+    }
+
+    // A queue built-in method used as an rvalue or statement (LRM 7.10.2). The
+    // receiver arrives as arguments()[0], like a string / dynamic-array method.
+    ir::Index lower_queue_method(std::string_view name, const CallExpression& call, ir::Builder& b,
+                                 ir::SourceLoc l) {
+        const auto&     args = call.arguments();
+        const ir::Index q    = lower_lvalue(*args[0], b);
+        if (name == "size") {
+            return b.resize(b.queue_size(q, l), lower_type(*call.type), l);
+        }
+        if (name == "push_back" || name == "push_front") {
+            return b.queue_push(q, lower_expr(*args[1], b), name == "push_front", l);
+        }
+        if (name == "pop_back" || name == "pop_front") {
+            return b.queue_pop(q, name == "pop_front", l);
+        }
+        if (name == "insert") {
+            return b.queue_insert(q, lower_expr(*args[1], b), lower_expr(*args[2], b), l);
+        }
+        if (name == "delete") {
+            // q.delete() clears all; q.delete(i) removes one element.
+            if (args.size() > 1) {
+                return b.queue_delete(q, lower_expr(*args[1], b), /*has_idx*/ true, l);
+            }
+            return b.queue_delete(q, q, /*has_idx*/ false, l);
+        }
+        // TODO: queue find/sort/sum/reverse/unique reduction & locator methods.
+        fail("queue method '" + std::string(name) + "' is not supported");
     }
 
     // Compound assignment `lhs op= rhs` (LRM 11.4.1, always blocking). slang has
@@ -5871,8 +6010,8 @@ private:
                 }
                 const ir::Index base = select_base_lvalue(es.value(), b, l);
                 const ir::Index sel =
-                    is_unpacked_array(es.value()) || is_dyn_array(es.value())
-                        ? b.elem_select(base, lower_expr(es.selector(), b), lower_type(*es.value().type), l)
+                    is_unpacked_array(es.value()) || is_dyn_array(es.value()) || is_queue(es.value())
+                        ? var_elem_select(es, base, b, l)
                         : b.binary(ir::Inst::Tag::BitSelect, base, packed_bit_index(es, b, l), l);
                 const ir::Index v = b.unary(ir::Inst::Tag::Load, sel, l);
                 // See narrow_to_declared / the MemberAccess case below: a
@@ -6372,6 +6511,12 @@ private:
     // `[off -: w]` (width constant, base a runtime value). Shared by the rvalue and
     // lvalue paths so a read and a write of the same shape lower identically.
     ir::Index lower_range_select(const RangeSelectExpression& rs, ir::Index base, ir::Builder& b, ir::SourceLoc l) {
+        if (is_queue(rs.value()) || is_dyn_array(rs.value())) {
+            // TODO: queue / dynamic-array slice `q[a:b]` (LRM 7.10.4) yields a new
+            // queue; needs an element-range copy into a fresh handle, not a packed
+            // part-select.
+            fail("slice of a queue / dynamic array is not supported");
+        }
         // TODO: range select on a multi-dim packed array selects whole
         // elements, so both bounds and the width scale by the element width.
         const auto* pa = rs.value().type->getCanonicalType().as_if<slang::ast::PackedArrayType>();
@@ -6461,8 +6606,8 @@ private:
             case ExpressionKind::ElementSelect: {
                 const ElementSelectExpression& es   = expr.as<ElementSelectExpression>();
                 const ir::Index                base = lower_lvalue(es.value(), b);
-                if (is_unpacked_array(es.value()) || is_dyn_array(es.value())) {
-                    return b.elem_select(base, lower_expr(es.selector(), b), lower_type(*es.value().type), l);
+                if (is_unpacked_array(es.value()) || is_dyn_array(es.value()) || is_queue(es.value())) {
+                    return var_elem_select(es, base, b, l);
                 }
                 return b.binary(ir::Inst::Tag::BitSelect, base, packed_bit_index(es, b, l), l);
             }
@@ -6646,6 +6791,12 @@ private:
             // TODO: unpacked arrays as function-frame locals. The frame layout has no
             // per-element array storage yet; only module-level memories are supported.
             fail("unpacked array as a function local is not supported");
+        }
+        if (fn_ctx_ != nullptr && vs.getType().getCanonicalType().as_if<slang::ast::QueueType>()) {
+            // TODO: queue as a function-frame local (needs a handle frame slot
+            // with init/deinit bracketing the call, like string / dynamic-array
+            // locals). Implemented for dynamic arrays; queues are the next slice.
+            fail("queue as a function local is not supported");
         }
         if (fn_ctx_ == nullptr) {
             declare_local(vs);
