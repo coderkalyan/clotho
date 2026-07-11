@@ -4930,6 +4930,8 @@ private:
                 return lower_unary(expr.as<UnaryExpression>(), b);
             case ExpressionKind::BinaryOp:
                 return lower_binary(expr.as<BinaryExpression>(), b);
+            case ExpressionKind::Inside:
+                return lower_inside(expr.as<InsideExpression>(), b);
             case ExpressionKind::ConditionalOp: {
                 const ConditionalExpression& c = expr.as<ConditionalExpression>();
                 if (is_string_expr(expr)) {
@@ -5369,6 +5371,65 @@ private:
             default:
                 fail("unsupported binary operator");
         }
+    }
+
+    // The `inside` set-membership operator (LRM 11.4.13): `sel inside { m0, m1, … }`
+    // is 1'b1 if any member matches, 1'bx if some comparison is x with no definite
+    // match, else 1'b0 — exactly a logical-OR reduction of the per-member
+    // predicates. slang has already widened the left operand and every member (and
+    // range bound) to a common comparison type (bindMembershipExpressions ->
+    // contextDetermined), so the compares are width-matched.
+    ir::Index lower_inside(const InsideExpression& e, ir::Builder& b) {
+        const ir::SourceLoc l = loc(e);
+        if (is_string_expr(e.left())) {
+            // TODO: string-typed `inside` — members would need string comparison,
+            // not the integral WildEq / relational ops used here.
+            fail("inside operator over string operands is not supported");
+        }
+        if (e.left().type->isFloating()) {
+            // TODO: real `inside` — members need the float compare ops (FEq / FGe /
+            // FLe), not the integral WildEq / Ge / Le used here (LRM 11.4.13; reals
+            // carry no x/z, so it reduces to == / >= && <=).
+            fail("inside operator over real operands is not supported");
+        }
+        const ir::Ref             ty  = lower_type(*e.left().type);
+        const ir::Index           sel = lower_expr(e.left(), b);
+        std::optional<ir::Index>  acc;
+        for (const Expression* m : e.rangeList()) {
+            const ir::Index pred = lower_inside_member(*m, sel, ty, b);
+            acc = acc ? b.binary(ir::Inst::Tag::Lor, *acc, pred, l) : pred;
+        }
+        return *acc;
+    }
+
+    // One `inside` range_list member's 1-bit predicate. A `[lo:hi]` range is
+    // `sel >= lo && sel <= hi`; a singular member uses ==? wildcard equality, where
+    // only the member's own x/z bits are wildcards (LRM 11.4.13), which is exactly
+    // WildEq's right-operand-wildcards semantics.
+    ir::Index lower_inside_member(const Expression& m, ir::Index sel, ir::Ref ty, ir::Builder& b) {
+        if (m.kind == ExpressionKind::ValueRange) {
+            const auto& vr = m.as<ValueRangeExpression>();
+            if (vr.rangeKind != ValueRangeKind::Simple) {
+                // TODO: tolerance ranges (`[c +/- d]`, `[c +%- d]`, LRM 11.4.13).
+                fail("inside operator tolerance ranges are not supported");
+            }
+            if (vr.left().type->isUnbounded() || vr.right().type->isUnbounded()) {
+                // TODO: unbounded `$` range bounds (`[lo:$]` / `[$:hi]`).
+                fail("inside operator unbounded ($) range bounds are not supported");
+            }
+            const ir::Index lo = b.resize(lower_expr(vr.left(), b), ty, loc(vr.left()));
+            const ir::Index hi = b.resize(lower_expr(vr.right(), b), ty, loc(vr.right()));
+            const ir::Index ge = b.binary(ir::Inst::Tag::Ge, sel, lo, loc(m));
+            const ir::Index le = b.binary(ir::Inst::Tag::Le, sel, hi, loc(m));
+            return b.binary(ir::Inst::Tag::Land, ge, le, loc(m));
+        }
+        if (m.type->getCanonicalType().isUnpackedArray()) {
+            // TODO: an unpacked-array set member (`sel inside {arr}`) matches any
+            // element (LRM 11.4.13 array unwrap); needs runtime element iteration.
+            fail("inside operator with an unpacked-array set member is not supported");
+        }
+        const ir::Index val = b.resize(lower_expr(m, b), ty, loc(m));
+        return b.binary(ir::Inst::Tag::WildEq, sel, val, loc(m));
     }
 
     // Build the lvalue for a part-select over an already-lowered base lvalue: a
