@@ -192,14 +192,33 @@ TEST_CASE("->> e wakes in the NBA region, after nonblocking updates") {
     CHECK(out.find("nb=aa") != std::string::npos);
 }
 
+// `->> #d e` (LRM 15.5.4) is a nonblocking, *delayed* trigger: the process does
+// not block, and the event fires `d` ticks later (unlike `#d -> e`, which sleeps
+// the process). iverilog implements no `->>`, so this is pinned to the LRM.
+TEST_CASE("->> #d e schedules a detached trigger without blocking") {
+    const std::string out = run_capture(R"(
+        module top;
+          event e;
+          initial begin
+            ->> #5 e;
+            $display("cont=%0t", $time);   // still 0 — did not block
+          end
+          initial begin @(e); $display("fired=%0t", $time); end
+          initial #10 $finish;
+        endmodule
+    )");
+    CHECK(out.find("cont=0") != std::string::npos);
+    CHECK(out.find("fired=5") != std::string::npos);
+}
+
 // Tier-2 forms loud-fail rather than being silently mis-lowered.
-TEST_CASE("event handle / delayed-trigger forms are rejected") {
+TEST_CASE("event handle / event-controlled trigger forms are rejected") {
     CHECK(reject("module top; event e, f; initial e = f; endmodule").find(
             "event assignment") != std::string::npos);
     CHECK(reject("module top; event e; initial e = null; endmodule").find(
             "event assignment") != std::string::npos);
-    CHECK(reject("module top; event e; initial ->> #5 e; endmodule").find(
-            "delayed event trigger") != std::string::npos);
+    CHECK(reject("module top; logic clk; event e; initial ->> @(posedge clk) e; endmodule").find(
+            "event-controlled nonblocking trigger") != std::string::npos);
     CHECK(reject("module top; event e; input e; endmodule").find(
             "event") != std::string::npos);
 }
