@@ -48,6 +48,12 @@ public:
     // sample `value` now, store it to `lvalue` after `delay` ticks.
     Index store_nb_delay(Index lvalue, Index value, Index delay, SourceLoc loc);
 
+    // Nonblocking intra-assignment event `lvalue <= repeat(count) @(edge trig) value`
+    // (LRM 9.4.5): sample `value` and `count` now, store to `lvalue` after `count`
+    // occurrences of `trig`'s `edge`. `count` is a constant 1 for a plain `@e`.
+    Index store_nb_event(Index lvalue, Index value, Index count, Signal trig, uint32_t edge,
+                         SourceLoc loc);
+
     // -- Irregular shapes --
     Index resize(Index op, Ref type, SourceLoc loc);
 

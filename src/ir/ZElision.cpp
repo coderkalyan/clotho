@@ -196,6 +196,11 @@ struct Analysis {
                     store_into(ir, fn, p.op_extra.op, z_of(info.value) != 0);
                     break;
                 }
+                case Inst::Tag::StoreNbEvent: {
+                    const auto info = ir.extra_data<StoreNbEventInfo>(p.op_extra.extra);
+                    store_into(ir, fn, p.op_extra.op, z_of(info.value) != 0);
+                    break;
+                }
 
                 // Z-transparent value ops: the z plane rides through their
                 // lowerings (an unknown shift count / select condition forces X

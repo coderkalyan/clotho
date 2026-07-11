@@ -576,14 +576,16 @@ int rt_wheel_advance(rt_wheel* wheel, void* ctx);
 
 // Runtime-owned record header the backend places at offset 0 of every record;
 // the backend's value tail follows. `timer` is the wheel node (offset 0, so the
-// record base doubles as the rt_timer*); `idx` routes the record to its site;
-// `seq` is a monotonic arm-order stamp (set by rt_intra_alloc) so same-instant
-// commits apply in statement-execution order (LRM 10.4.2, last-executed wins),
-// which the wheel's per-tick fire order does not preserve.
+// record base doubles as the rt_timer*, used by the `#d` delay path); `idx`
+// routes the record to its target site; `seq` is a monotonic arm-order stamp (set
+// by rt_intra_alloc) so same-instant commits apply in statement-execution order
+// (LRM 10.4.2, last-executed wins), which fire order does not preserve; `count`
+// is the event countdown for the `@e` / `repeat(N) @e` path (unused by `#d`).
 typedef struct rt_intra_rec {
     rt_timer timer;
     uint32_t idx;
     uint32_t seq;
+    uint32_t count;
 } rt_intra_rec;
 
 // Reserve a `stride`-byte record for site `idx` (from its freelist; allocates
@@ -612,5 +614,22 @@ void rt_intra_release(uint32_t idx);
 // Reclaim every record (including any left scheduled by a $finish mid-flight)
 // into its freelist and clear all ready lists. Called once at simulation start.
 void rt_intra_reset(void);
+
+// -- Event-triggered deferred stores (`x <= @e y` / `x <= repeat(N) @e y`) --
+//
+// Same records and NBA-region commit as the `#d` path, but fired by a signal edge
+// instead of the wheel. A `<= @e` site registers its record on a dense trigger id
+// `trig_id` (a distinct (trigger-signal, edge) pair); when that edge fires (from a
+// blocking store or an NBA commit), the backend calls rt_intra_event_fire, which
+// counts the record down and, at zero, moves it to its target's ready list for the
+// NBA region. `count` is N for `repeat(N) @e`, 1 for a plain `@e`.
+
+// Register `rec` (its idx/seq/count already filled) to fire on trigger `trig_id`.
+void rt_intra_event_register(uint32_t trig_id, void* rec);
+
+// Fire trigger `trig_id`: decrement each pending record's count; at zero, move it
+// to its target's ready list (bumping the NBA-pending total), else keep it pending
+// for the next edge. Called from both wake paths when the trigger edge matches.
+void rt_intra_event_fire(uint32_t trig_id);
 
 } // extern "C"

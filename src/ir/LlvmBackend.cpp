@@ -799,6 +799,23 @@ private:
                 }
                 continue;
             }
+            // A nonblocking intra-assignment event (`x <= @e y`): the target is an
+            // intra target (deferred record + NBA-region commit), and the trigger
+            // (signal, edge) gets a dense id so both wake paths can fire its records.
+            if (ir.tag(idx) == Inst::Tag::StoreNbEvent) {
+                const auto      info = ir.extra_data<StoreNbEventInfo>(ir.payload(idx).op_extra.extra);
+                const NbaTarget t    = nba_target(ir, ir.payload(idx).op_extra.op);
+                slots_[static_cast<uint32_t>(t.sig)].nba = true;
+                if (std::find(intra_nba_sigs_.begin(), intra_nba_sigs_.end(), t.sig) ==
+                    intra_nba_sigs_.end()) {
+                    intra_nba_sigs_.push_back(t.sig);
+                }
+                int32_t& tid = trigger_id_[static_cast<uint32_t>(info.trig)][info.edge];
+                if (tid < 0) {
+                    tid = static_cast<int32_t>(n_triggers_++);
+                }
+                continue;
+            }
             if (ir.tag(idx) != Inst::Tag::StoreNb) {
                 continue;
             }
@@ -833,6 +850,7 @@ private:
     // targets must be classified here too. Bucket assignment happens later in
     // build_nba_state once widths are final.
     void nba_classify() {
+        trigger_id_.assign(mod_.signals().size(), { -1, -1, -1 });
         for (const Process& p : mod_.processes()) {
             nba_classify_ir(p.ir);
         }
@@ -2444,11 +2462,12 @@ private:
                 case Inst::Tag::Wait:
                 case Inst::Tag::TaskCall:
                     return false;
-                // A deferred store (`x <= #d y`) arms a wheel record with an
+                // A deferred store (`x <= #d y` / `x <= @e y`) arms a record with an
                 // observable future effect; keep it out of thunk/fused groups (a
                 // spurious comb-fused run would arm a spurious store), routing it
                 // to a plain coroutine.
                 case Inst::Tag::StoreNbDelay:
+                case Inst::Tag::StoreNbEvent:
                     return false;
                 case Inst::Tag::Store: {
                     const LvalueRoot r = lvalue_root(p.ir, p.ir.payload(idx).binary.l);
@@ -2616,6 +2635,7 @@ private:
                 }
                 case Inst::Tag::StoreNb:
                 case Inst::Tag::StoreNbDelay:
+                case Inst::Tag::StoreNbEvent:
                     return CombFuse::NbaWrite;
                 case Inst::Tag::Call:
                     return CombFuse::HasCall;
@@ -3490,7 +3510,7 @@ private:
             if (signal_has_waiters(bs.sig)) {
                 llvm::Value* meta = b_.CreateInBoundsGEP(nba_meta_arr_ty_, nba_meta_gv_,
                                                          { b_.getInt32(0), b_.getInt32(s.nba_id) });
-                emit_nba_service(meta, old_mm, new_mm, W, s.narrow, old_z, new_z);
+                emit_nba_service(bs.sig, meta, old_mm, new_mm, W, s.narrow, old_z, new_z);
             }
             // Mark a dumped scalar target dirty in the VCD set (rt_vcd_touch ignores
             // the -1 index of a non-dumped signal). Commit is unconditional, so a
@@ -3562,10 +3582,19 @@ private:
         tb.CreateRetVoid();
     }
 
+    // The dense trigger id for a (signal, edge) that fires a `<= @e` deferred store,
+    // or -1. Both wake paths call this to decide whether to fire event records.
+    int32_t trigger_id(Signal sig, uint32_t edge) const {
+        return trigger_id_.empty() ? -1 : trigger_id_[static_cast<uint32_t>(sig)][edge];
+    }
+
     bool signal_has_waiters(Signal sig) const {
         const auto i = static_cast<uint32_t>(sig);
         for (uint32_t e = 0; e < 3; ++e) {
-            if (wait_sta_gv_[i][e] != nullptr || wait_dyn_gv_[i][e] != nullptr) {
+            // A `<= @e` trigger has no coroutine waiter but its edge must still be
+            // watched so a store/commit fires its deferred records.
+            if (wait_sta_gv_[i][e] != nullptr || wait_dyn_gv_[i][e] != nullptr ||
+                trigger_id(sig, e) >= 0) {
                 return true;
             }
         }
@@ -3724,7 +3753,8 @@ private:
         }
         const auto has_bucket = [&](Edge e) {
             const auto k = static_cast<uint32_t>(e);
-            return wait_sta_gv_[i][k] != nullptr || wait_dyn_gv_[i][k] != nullptr;
+            return wait_sta_gv_[i][k] != nullptr || wait_dyn_gv_[i][k] != nullptr ||
+                   trigger_id(sig, k) >= 0;
         };
         const SignalSlot& slot = slot_of(sig);
         const EdgeFacts   f =
@@ -3755,8 +3785,19 @@ private:
             if (wait_dyn_gv_[i][e] != nullptr) {
                 service_dynamic_queue(sig, e);
             }
+            fire_event_trigger(sig, e);
             b_.CreateBr(cont);
             b_.SetInsertPoint(cont);
+        }
+    }
+
+    // If (sig, edge) fires a `<= @e` deferred store, count down its records and
+    // move any that reach zero to their target ready lists (rt_intra_event_fire).
+    // Called from both wake paths inside a block already guarded by the edge fact.
+    void fire_event_trigger(Signal sig, uint32_t edge) {
+        const int32_t tid = trigger_id(sig, edge);
+        if (tid >= 0) {
+            b_.CreateCall(intra_event_fire_fn(), { b_.getInt32(static_cast<uint32_t>(tid)) });
         }
     }
 
@@ -4023,7 +4064,7 @@ private:
     // plain 0<->1 classifier — deriving `may` via LShr on the iW word would read
     // 0 and suppress every posedge. A packed 2-state target keeps must == may in
     // every stored word, so the 4-state classifier stays exact for it.
-    void emit_nba_service(llvm::Value* meta, llvm::Value* old_mm, llvm::Value* new_mm,
+    void emit_nba_service(Signal sig, llvm::Value* meta, llvm::Value* old_mm, llvm::Value* new_mm,
                           uint32_t width, bool narrow, llvm::Value* old_z, llvm::Value* new_z) {
         const EdgeFacts f = emit_edge_facts(old_mm, new_mm, width, /*four_state=*/!narrow, old_z,
                                             new_z, /*need_pos=*/true, /*need_neg=*/true,
@@ -4043,6 +4084,9 @@ private:
             auto* i32 = b_.getInt32Ty();
             emit_static_scan_rt(meta_at(meta, 0, e, ptr), meta_at(meta, 1, e, i32));
             emit_dynamic_scan_rt(meta_at(meta, 2, e, ptr), meta_at(meta, 3, e, ptr));
+            // An NBA commit to a `<= @e` trigger fires its records too (the other
+            // wake path is a blocking store, in service_wait_queue).
+            fire_event_trigger(sig, e);
             b_.CreateBr(cont);
             b_.SetInsertPoint(cont);
         }
@@ -4463,12 +4507,19 @@ private:
     llvm::FunctionCallee intra_reset_fn() {
         return rt_fn("rt_intra_reset", b_.getVoidTy(), {});
     }
+    llvm::FunctionCallee intra_event_register_fn() {
+        return rt_fn("rt_intra_event_register", b_.getVoidTy(), { b_.getInt32Ty(), raw_ptr_ty() });
+    }
+    llvm::FunctionCallee intra_event_fire_fn() {
+        return rt_fn("rt_intra_event_fire", b_.getVoidTy(), { b_.getInt32Ty() });
+    }
 
-    // Per intra-NBA signal: dense id and the record StructType
-    // { ptr timer.next, ptr timer.on_expire, i32 idx, i32 seq, iMM mm_val, [iW z_val] }.
+    // Per intra-NBA signal: dense id and the record StructType { ptr timer.next,
+    // ptr timer.on_expire, i32 idx, i32 seq, i32 count, iMM mm_val, [iW z_val] }.
     // The rt_timer (fields 0-1) sits at offset 0 so the record base is the timer
     // pointer handed to the wheel; the runtime reads `idx` (field 2) to route the
-    // fire and owns `seq` (field 3). Value fields: mm=4, z=5.
+    // fire and owns `seq` (field 3); `count` (field 4) is the `@e` event countdown
+    // (unused by `#d`). Value fields: mm=5, z=6.
     uint32_t intra_idx(Signal sig) const {
         const auto it = std::find(intra_nba_sigs_.begin(), intra_nba_sigs_.end(), sig);
         return static_cast<uint32_t>(it - intra_nba_sigs_.begin());
@@ -4476,7 +4527,7 @@ private:
     llvm::StructType* intra_rec_ty(const SignalSlot& s) {
         auto*                    ptr = raw_ptr_ty();
         auto*                    i32 = b_.getInt32Ty();
-        std::vector<llvm::Type*> f   = { ptr, ptr, i32, i32,
+        std::vector<llvm::Type*> f   = { ptr, ptr, i32, i32, i32,
                                          int_ty(s.narrow ? s.width : 2 * s.width) };
         if (s.has_z) {
             f.push_back(int_ty(s.width));
@@ -5054,6 +5105,7 @@ private:
             case Inst::Tag::Store:
             case Inst::Tag::StoreNb:
             case Inst::Tag::StoreNbDelay:
+            case Inst::Tag::StoreNbEvent:
             case Inst::Tag::Cond:
             case Inst::Tag::Switch:
             case Inst::Tag::Loop:
@@ -5376,6 +5428,20 @@ private:
                 const Plane   rhs   = value_of(info.value);
                 llvm::Value*  ticks = cast(must_of(value_of(info.delay)), 64, false);
                 emit_intra_nba_arm(lv, rhs, ticks);
+                return;
+            }
+
+            // Nonblocking intra-assignment event (`x <= @e y`, LRM 9.4.5): sample the
+            // RHS + count now into a deferred record, register it on the trigger's
+            // edge, continue without suspending. The trigger's wake path fires it and
+            // the NBA region commits (emit_intra_commit).
+            case Inst::Tag::StoreNbEvent: {
+                const auto    info  = ir_->extra_data<StoreNbEventInfo>(p.op_extra.extra);
+                const LValue& lv    = lvalue_of(p.op_extra.op);
+                const Plane   rhs   = value_of(info.value);
+                llvm::Value*  count = must_of(value_of(info.count));
+                emit_intra_event_arm(lv, rhs, count,
+                                     static_cast<uint32_t>(trigger_id(info.trig, info.edge)));
                 return;
             }
 
@@ -6305,9 +6371,9 @@ private:
             rhs    = to_four(rhs);
             mm_val = rhs.mm; // i2W: must | (may << W)
         }
-        b_.CreateAlignedStore(mm_val, b_.CreateStructGEP(rt, rec, 4), a1);
+        b_.CreateAlignedStore(mm_val, b_.CreateStructGEP(rt, rec, 5), a1);
         if (s.has_z) {
-            b_.CreateAlignedStore(rhs.z, b_.CreateStructGEP(rt, rec, 5), a1);
+            b_.CreateAlignedStore(rhs.z, b_.CreateStructGEP(rt, rec, 6), a1);
         }
 
         // Arm the wheel for `now + ticks`. A zero delay cannot arm the wheel
@@ -6342,6 +6408,37 @@ private:
         schedule();
         b_.CreateBr(contb);
         b_.SetInsertPoint(contb);
+    }
+
+    // Arm a nonblocking intra-assignment event (`x <= @e y` / `repeat(N) @e`):
+    // reserve a record, fill the sampled value planes and the countdown, and
+    // register it on trigger `trig_id`. The process does not suspend. When the
+    // trigger edge fires (blocking store or NBA commit), rt_intra_event_fire counts
+    // the record down and, at zero, moves it to the target ready list for the NBA
+    // region (emit_intra_commit). Same value/plane layout as emit_intra_nba_arm.
+    void emit_intra_event_arm(const LValue& lv, Plane rhs, llvm::Value* count, uint32_t trig_id) {
+        const SignalSlot& s      = slot_of(lv.sig);
+        const llvm::Align a1{ 1 };
+        llvm::StructType* rt     = intra_rec_ty(s);
+        const uint32_t    stride = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(rt));
+        const uint32_t    idx    = intra_idx(lv.sig);
+
+        llvm::Value* rec = b_.CreateCall(intra_alloc_fn(), { b_.getInt32(idx), b_.getInt32(stride) });
+        b_.CreateStore(b_.getInt32(idx), b_.CreateStructGEP(rt, rec, 2));
+        b_.CreateStore(cast(count, 32, false), b_.CreateStructGEP(rt, rec, 4)); // event countdown
+
+        llvm::Value* mm_val;
+        if (s.narrow) {
+            mm_val = must_of(rhs);
+        } else {
+            rhs    = to_four(rhs);
+            mm_val = rhs.mm;
+        }
+        b_.CreateAlignedStore(mm_val, b_.CreateStructGEP(rt, rec, 5), a1);
+        if (s.has_z) {
+            b_.CreateAlignedStore(rhs.z, b_.CreateStructGEP(rt, rec, 6), a1);
+        }
+        b_.CreateCall(intra_event_register_fn(), { b_.getInt32(trig_id), rec });
     }
 
     // Commit intra-NBA signal `sig`'s fired records in the NBA region: store each
@@ -6388,9 +6485,9 @@ private:
 
         b_.SetInsertPoint(body);
         llvm::Value* recp = b_.CreateLoad(ptr, b_.CreateInBoundsGEP(ptr, base, i));
-        b_.CreateStore(b_.CreateAlignedLoad(mmty, b_.CreateStructGEP(rt, recp, 4), a1), live_mm);
+        b_.CreateStore(b_.CreateAlignedLoad(mmty, b_.CreateStructGEP(rt, recp, 5), a1), live_mm);
         if (s.has_z) {
-            b_.CreateStore(b_.CreateAlignedLoad(zty, b_.CreateStructGEP(rt, recp, 5), a1), live_z);
+            b_.CreateStore(b_.CreateAlignedLoad(zty, b_.CreateStructGEP(rt, recp, 6), a1), live_z);
         }
         i->addIncoming(b_.CreateAdd(i, b_.getInt32(1)), b_.GetInsertBlock());
         b_.CreateBr(head);
@@ -6402,7 +6499,7 @@ private:
             llvm::Value* new_z  = s.has_z ? b_.CreateLoad(zty, live_z) : nullptr;
             llvm::Value* meta   = b_.CreateInBoundsGEP(nba_meta_arr_ty_, nba_meta_gv_,
                                                        { b_.getInt32(0), b_.getInt32(s.nba_id) });
-            emit_nba_service(meta, old_mm, new_mm, W, s.narrow, old_z, new_z);
+            emit_nba_service(sig, meta, old_mm, new_mm, W, s.narrow, old_z, new_z);
         }
         if (design_uses_vcd_ && nba_vcd_gv_ != nullptr) {
             llvm::Value* vidx = b_.CreateLoad(
@@ -9493,6 +9590,14 @@ private:
     // the sampled value on the wheel until `now + d`, then the NBA region commits
     // it (emit_intra_commit). See docs/design/intra-assignment-timing.md.
     std::vector<Signal>     intra_nba_sigs_;
+
+    // Per (signal, edge): the dense trigger id if that signal+edge fires a
+    // nonblocking `<= @e` deferred store (StoreNbEvent), else -1. A trigger
+    // signal's edges must be watched (signal_has_waiters) even with no coroutine
+    // waiter, so both wake paths (blocking store, NBA commit) fire its records.
+    // Indexed [signal][edge]; empty when the design has no `<= @e`.
+    std::vector<std::array<int32_t, 3>> trigger_id_;
+    uint32_t                            n_triggers_ = 0;
 
     // Block-commit NBA state. A whole-signal scalar NBA stages its shadow as before,
     // then registers its enclosing straight-line segment ("block") once per instant

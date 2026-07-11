@@ -4911,32 +4911,29 @@ private:
             // scheduler infrastructure not present yet.
             if (a.isNonBlocking()) {
                 // Nonblocking form: sample now, do not block, commit after the
-                // delay via a detached scheduled store (StoreNbDelay). Only the
-                // `#d` delay on a whole integral scalar target is lowered; the
-                // record is monomorphized per whole signal, so selects / concats /
-                // aggregates (needing the masked/array record path) and the
-                // event / repeat forms (needing wait-queue-triggered records) fail
-                // loud, a documented follow-up (docs/design/intra-assignment-timing.md).
-                if (a.timingControl->kind != TimingControlKind::Delay) {
-                    fail("nonblocking intra-assignment event/repeat timing is not supported");
-                }
+                // timing via a detached scheduled store. Only a whole integral scalar
+                // target is lowered — the record is monomorphized per whole signal —
+                // so selects / concats / aggregates (needing the masked/array record
+                // path) fail loud, a documented follow-up
+                // (docs/design/intra-assignment-timing.md).
                 const bool whole_scalar =
                     (a.left().kind == ExpressionKind::NamedValue ||
                      a.left().kind == ExpressionKind::HierarchicalValue) &&
                     a.left().type->isIntegral() && !a.left().type->isUnpackedArray();
                 if (!whole_scalar) {
-                    fail("nonblocking intra-assignment delay is only supported for a whole "
+                    fail("nonblocking intra-assignment timing is only supported for a whole "
                          "integral scalar target");
                 }
-                const Expression& delay_expr = a.timingControl->as<DelayControl>().expr;
-                // A compile-time `#0` nonblocking assignment is identical to a plain
-                // `<= ` — the update lands in the current instant's NBA region — so
-                // lower it as a normal NBA. This keeps update ordering to a signal
-                // uniform with its other NBAs (LRM 10.4.2, statement-execution order:
-                // last written wins) via the one block-commit path, instead of
-                // splitting the same signal across block-commit and the deferred
-                // record path (whose commit order is fixed, not execution order).
-                {
+                const TimingControl& tc = *a.timingControl;
+                if (tc.kind == TimingControlKind::Delay) {
+                    const Expression& delay_expr = tc.as<DelayControl>().expr;
+                    // A compile-time `#0` nonblocking assignment is identical to a plain
+                    // `<= ` — the update lands in the current instant's NBA region — so
+                    // lower it as a normal NBA. This keeps update ordering to a signal
+                    // uniform with its other NBAs (LRM 10.4.2, statement-execution order:
+                    // last written wins) via the one block-commit path, instead of
+                    // splitting the same signal across block-commit and the deferred
+                    // record path (whose commit order is fixed, not execution order).
                     slang::ast::ASTContext     ectx(*scope_, slang::ast::LookupLocation::max);
                     slang::ast::EvalContext    ev(ectx);
                     const slang::ConstantValue cv = delay_expr.eval(ev);
@@ -4948,10 +4945,40 @@ private:
                             return val0;
                         }
                     }
+                    const ir::Index val   = lower_expr(a.right(), b);
+                    const ir::Index delay = scaled_delay(delay_expr, b);
+                    b.store_nb_delay(lower_lvalue(a.left(), b), val, delay, loc(a));
+                    return val;
                 }
-                const ir::Index val   = lower_expr(a.right(), b);
-                const ir::Index delay = scaled_delay(delay_expr, b);
-                b.store_nb_delay(lower_lvalue(a.left(), b), val, delay, loc(a));
+                // Event / repeat-event form: `x <= @e y` / `x <= repeat(N) @e y`.
+                // Sample the value (and N) now; store after N occurrences of the
+                // trigger edge. Only a single (signal, edge) trigger is lowered.
+                const TimingControl* evt   = &tc;
+                ir::Index            count = ir::Index{};
+                if (tc.kind == TimingControlKind::RepeatedEvent) {
+                    const RepeatedEventControl& rec = tc.as<RepeatedEventControl>();
+                    if (rec.expr.type->isFloating()) {
+                        fail("repeat with a real count is not supported");
+                    }
+                    evt   = &rec.event;
+                    count = lower_expr(rec.expr, b);
+                } else {
+                    // Plain `@e` waits for one occurrence.
+                    count = b.constant(module_.pool.put_int(make_int_type(32, false, false), 1), loc(a));
+                }
+                if (!is_event_control(*evt)) {
+                    fail("nonblocking intra-assignment requires a delay or event control");
+                }
+                std::vector<ir::WaitEvent> events;
+                collect_wait_events(*evt, events);
+                if (events.size() != 1) {
+                    // TODO: a multi-signal trigger `@(a or b)` needs the record on
+                    // several trigger lists with first-fire-wins removal.
+                    fail("nonblocking intra-assignment multi-signal event trigger is not supported");
+                }
+                const ir::Index val = lower_expr(a.right(), b);
+                b.store_nb_event(lower_lvalue(a.left(), b), val, count, events[0].signal,
+                                 static_cast<uint32_t>(events[0].edge), loc(a));
                 return val;
             }
             const bool string_lhs =

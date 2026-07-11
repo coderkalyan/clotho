@@ -134,6 +134,20 @@ struct StoreNbDelayInfo {
     Index delay;
 };
 
+// Extra payload for `store_nb_event`: the sampled RHS value, the repeat count
+// (constant 1 for a plain `@e`), and the single (trigger signal, edge) the store
+// waits on. The whole-signal lvalue is the enclosing op_extra `op`.
+struct StoreNbEventInfo {
+    // Value stored when the trigger fires (sampled in the current instant).
+    Index    value;
+    // Number of trigger occurrences to wait for (sampled now); 1 for plain `@e`.
+    Index    count;
+    // Trigger signal whose edge fires the store.
+    Signal   trig;
+    // Edge to trigger on (ir::Edge value).
+    uint32_t edge;
+};
+
 // Extra payload for `part_select`: a constant [msb:lsb] slice of the base.
 struct PartSelect {
     // Most-significant selected bit.
@@ -654,6 +668,11 @@ struct Inst {
         // `now + d` without blocking the process (payload: op_extra ->
         // StoreNbDelayInfo; the op is the whole-signal lvalue).
         StoreNbDelay,
+        // Nonblocking intra-assignment event, lhs <= @e rhs / lhs <= repeat(N) @e
+        // rhs (LRM 9.4.5): sample rhs (and N) now, store the sampled value after N
+        // occurrences of the trigger edge, without blocking the process (payload:
+        // op_extra -> StoreNbEventInfo; the op is the whole-signal lvalue).
+        StoreNbEvent,
 
         // -- Arithmetic (payload: binary) --
         Add,

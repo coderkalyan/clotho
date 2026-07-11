@@ -73,6 +73,8 @@ const char* tag_name(Inst::Tag tag) {
             return "store_nb";
         case T::StoreNbDelay:
             return "store_nb_delay";
+        case T::StoreNbEvent:
+            return "store_nb_event";
         case T::Add:
             return "add";
         case T::Sub:

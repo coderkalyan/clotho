@@ -308,16 +308,87 @@ TEST_CASE("nonblocking intra-delay carries a 4-state x value") {
     CHECK(run_capture_finish(src) == "xr=xx01\n");
 }
 
-// The event / repeat forms need wait-queue-triggered records (a documented
-// follow-up) and must fail loudly, never silently drop the timing.
-TEST_CASE("nonblocking intra-assignment event timing is rejected") {
+// -- Nonblocking intra-assignment event / repeat (`x <= @e y`, LRM 9.4.5) --
+//
+// The RHS is sampled now; the store lands after N occurrences of the trigger
+// edge, committed in that edge instant's NBA region. All pinned against iverilog.
+
+// Plain `<= @(posedge clk)`: sample d now, store to q at the next posedge.
+TEST_CASE("nonblocking intra-delay event stores at the next matching edge") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] d, q;
+            logic       clk = 0;
+            always #5 clk = ~clk;
+            initial begin d = 0; q = 0; end
+            always @(posedge clk) d <= d + 1;
+            always @(posedge clk) q <= @(posedge clk) d;
+            initial begin #48; $display("d=%0d q=%0d", d, q); $finish; end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "d=5 q=3\n");
+}
+
+// `repeat(N) @e` stores after N occurrences of the edge. iverilog: r == 42.
+TEST_CASE("nonblocking intra-delay repeat-event stores after N edges") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] r;
+            logic       clk = 0;
+            always #5 clk = ~clk;
+            initial begin r = 0; #1 r <= repeat(2) @(posedge clk) 8'd42; end
+            initial begin #48; $display("r=%0d", r); $finish; end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "r=42\n");
+}
+
+// The trigger edge may come from an NBA commit (`clk <= ~clk`), not just a
+// blocking store — the record-fire hook is in both wake paths. iverilog: d=8 q=6.
+TEST_CASE("nonblocking intra-delay event fires on an NBA-driven trigger edge") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] d, q;
+            logic       clk = 0, go = 0;
+            always #5 go  = ~go;
+            always @(go) clk <= ~clk;
+            initial begin d = 0; q = 0; end
+            always @(posedge clk) d <= d + 1;
+            always @(posedge clk) q <= @(posedge clk) d;
+            initial begin #80; $display("d=%0d q=%0d", d, q); $finish; end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "d=8 q=6\n");
+}
+
+// Multiple arms before the first edge all sample now and all fire at that edge;
+// last executed wins (LRM 10.4.2). A source change after sampling is ignored.
+// iverilog: a == 9 (7 sampled at t=0, +2 from the last arm).
+TEST_CASE("nonblocking intra-delay event samples now and orders same-edge arms") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a, s;
+            logic       clk = 0;
+            always #5 clk = ~clk;
+            initial begin
+                s = 8'd7;
+                a <= @(posedge clk) s;
+                a <= @(posedge clk) s + 1;
+                a <= @(posedge clk) s + 2;
+            end
+            initial #1 s = 8'd99;
+            initial begin #8; $display("a=%0d", a); $finish; end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "a=9\n");
+}
+
+// A multi-signal trigger `@(a or b)` needs the record on several trigger lists
+// with first-fire-wins removal (a documented follow-up) and must fail loudly.
+TEST_CASE("nonblocking intra-assignment multi-signal event trigger is rejected") {
     constexpr std::string_view src = R"(
         module m;
             logic [7:0] a, b;
-            logic       c = 0;
-            initial a <= @(posedge c) b;
+            logic       c = 0, d = 0;
+            initial a <= @(posedge c or posedge d) b;
         endmodule)";
-    CHECK(lower_error(src).find("event/repeat timing is not supported") != std::string::npos);
+    CHECK(lower_error(src).find("multi-signal event trigger") != std::string::npos);
 }
 
 // A non-whole-scalar target (bit/part-select, array element) needs the masked /
