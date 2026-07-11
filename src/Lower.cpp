@@ -49,11 +49,10 @@
 #include <slang/diagnostics/AnalysisDiags.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/diagnostics/TextDiagnosticClient.h>
+#include <slang/driver/Driver.h>
 #include <slang/numeric/Time.h>
-#include <slang/parsing/Preprocessor.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/text/SourceManager.h>
-#include <slang/util/Bag.h>
 #include <slang/util/SmallVector.h>
 
 #include "SourceMap.h"
@@ -7259,18 +7258,8 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
 
 } // namespace
 
-LowerResult lower_files(std::span<const std::string_view> paths, const FrontendOptions& fe,
-                        Timings* timings) {
+LowerResult lower_files(std::span<const std::string_view> paths, Timings* timings) {
     const auto t_parse = std::chrono::steady_clock::now();
-
-    // Command-line macro predefines and `include search dirs, applied to every
-    // tree via one shared Bag. predefines take "NAME=VALUE"
-    // form; additionalIncludePaths feeds the `` `include `` resolver.
-    slang::parsing::PreprocessorOptions ppo;
-    ppo.predefines = fe.defines;
-    ppo.additionalIncludePaths.assign(fe.include_dirs.begin(), fe.include_dirs.end());
-    slang::Bag options;
-    options.set(ppo);
 
     // One SourceManager shared across every tree so the Compilation's
     // diagnostics resolve file/line locations for all files. It
@@ -7278,7 +7267,7 @@ LowerResult lower_files(std::span<const std::string_view> paths, const FrontendO
     slang::SourceManager    sm;
     slang::ast::Compilation comp;
     for (const std::string_view path : paths) {
-        auto tree = slang::syntax::SyntaxTree::fromFile(path, sm, options);
+        auto tree = slang::syntax::SyntaxTree::fromFile(path, sm);
         if (!tree) {
             LowerResult result;
             result.diagnostics = "error: cannot read '" + std::string(path) +
@@ -7295,7 +7284,54 @@ LowerResult lower_files(std::span<const std::string_view> paths, const FrontendO
 }
 
 LowerResult lower_file(std::string_view path, Timings* timings) {
-    return lower_files({&path, 1}, {}, timings);
+    return lower_files({&path, 1}, timings);
+}
+
+LowerResult lower_sources(std::span<const std::string_view> args, Timings* timings) {
+    const auto t_parse = std::chrono::steady_clock::now();
+
+    // slang's Driver owns arg parsing, source loading (incl. `-f` command files,
+    // `-y`/`-v` libraries, globbing), the SourceManager, and the option Bag; we
+    // consume the Compilation it produces and keep Clotho's own diagnostic
+    // rendering in lower_compilation. The Driver must outlive the
+    // Compilation, so it lives for the whole call; the lowered ir::Module holds
+    // no slang pointers, so it may outlive both.
+    slang::driver::Driver driver;
+    driver.addStandardArgs();
+
+    // Driver's parseCommandLine treats argv[0] as the program name and needs
+    // null-terminated C strings; copy the views and prepend a placeholder.
+    std::vector<std::string> owned(args.begin(), args.end());
+    std::vector<const char*> argv;
+    argv.reserve(owned.size() + 1);
+    argv.push_back("clotho");
+    for (const std::string& a : owned) {
+        argv.push_back(a.c_str());
+    }
+
+    LowerResult result;
+    if (!driver.parseCommandLine(static_cast<int>(argv.size()), argv.data()) ||
+        !driver.processOptions()) {
+        // Driver prints the specific CLI / missing-file errors to stderr itself.
+        result.diagnostics = "error: command-line or source-loading error\n";
+        return result;
+    }
+
+    // Merge every source file into one compilation unit so `` `define `` macros
+    // and `$unit` declarations are shared across files (LRM 3.12). Set before
+    // parseAllSources, which is where the SourceLoader consumes it.
+    driver.options.singleUnit = true;
+    if (!driver.parseAllSources()) {
+        result.diagnostics = "error: failed to parse one or more source files\n";
+        return result;
+    }
+
+    std::unique_ptr<slang::ast::Compilation> comp = driver.createCompilation();
+    if (timings != nullptr) {
+        timings->frontend_ms += ms_since(t_parse);
+    }
+
+    return lower_compilation(*comp, timings);
 }
 
 LowerResult lower_text(std::string_view source, Timings* timings) {

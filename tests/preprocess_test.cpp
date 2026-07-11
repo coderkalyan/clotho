@@ -17,14 +17,16 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// A scratch directory that writes source files to disk (needed to exercise
-// `` `include `` search, which cannot run from an in-memory buffer) and removes
-// them on destruction.
+// A scratch directory that writes source files to disk (slang's Driver loads
+// files from disk, and `` `include `` search needs real paths) and removes them
+// on destruction.
 struct ScratchDir {
     fs::path root;
     ScratchDir()
       : root(fs::temp_directory_path() /
              fs::path("clotho_pp_" + std::to_string(::getpid()))) {
+        std::error_code ec;
+        fs::remove_all(root, ec);
         fs::create_directories(root);
     }
     ~ScratchDir() {
@@ -40,11 +42,12 @@ struct ScratchDir {
     }
 };
 
-// Lower the on-disk files with the given front-end options, JIT, and capture
-// stdout. Mirrors run_capture in the backend tests.
-std::string run_files(const std::vector<std::string>& paths, const FrontendOptions& fe) {
-    std::vector<std::string_view> views(paths.begin(), paths.end());
-    const LowerResult             r = lower_files(views, fe);
+// Lower via the slang-Driver entry (source files + preprocessor flags exactly
+// as the CLI passes them), JIT, and capture stdout. Mirrors run_capture in the
+// backend tests.
+std::string run_args(const std::vector<std::string>& args) {
+    std::vector<std::string_view> views(args.begin(), args.end());
+    const LowerResult             r = lower_sources(views);
     REQUIRE_MESSAGE(r.ok, r.diagnostics);
     REQUIRE(r.module != nullptr);
 
@@ -76,8 +79,8 @@ std::string run_files(const std::vector<std::string>& paths, const FrontendOptio
 // -- `+define` / `-D` macro predefines (LRM 22.5.1) ---------------------
 
 TEST_CASE("command-line define selects an `ifdef branch") {
-    ScratchDir  dir;
-    const auto  top = dir.write("top.sv", R"(
+    ScratchDir dir;
+    const auto top = dir.write("top.sv", R"(
 module m;
   initial begin
 `ifdef FOO
@@ -88,15 +91,11 @@ module m;
   end
 endmodule
 )");
+    const std::string tp = top.string();
 
-    SUBCASE("defined") {
-        FrontendOptions fe;
-        fe.defines = {"FOO"};
-        CHECK(run_files({top.string()}, fe) == "foo_on\n");
-    }
-    SUBCASE("undefined") {
-        CHECK(run_files({top.string()}, {}) == "foo_off\n");
-    }
+    SUBCASE("-D form") { CHECK(run_args({"-DFOO", tp}) == "foo_on\n"); }
+    SUBCASE("+define+ form") { CHECK(run_args({"+define+FOO", tp}) == "foo_on\n"); }
+    SUBCASE("undefined") { CHECK(run_args({tp}) == "foo_off\n"); }
 }
 
 TEST_CASE("command-line define carries a value") {
@@ -106,9 +105,9 @@ module m;
   initial $display("w=%0d", `WIDTH);
 endmodule
 )");
-    FrontendOptions fe;
-    fe.defines = {"WIDTH=12"};
-    CHECK(run_files({top.string()}, fe) == "w=12\n");
+    const std::string tp = top.string();
+    CHECK(run_args({"-DWIDTH=12", tp}) == "w=12\n");
+    CHECK(run_args({"+define+WIDTH=9", tp}) == "w=9\n");
 }
 
 // -- `+incdir` / `-I` include search dirs (LRM 22.4) --------------------
@@ -122,9 +121,10 @@ module m;
   initial $display("k=%0d", K);
 endmodule
 )");
-    FrontendOptions fe;
-    fe.include_dirs = {(dir.root / "inc").string()};
-    CHECK(run_files({top.string()}, fe) == "k=7\n");
+    const std::string tp     = top.string();
+    const std::string incdir = (dir.root / "inc").string();
+    CHECK(run_args({"-I" + incdir, tp}) == "k=7\n");
+    CHECK(run_args({"+incdir+" + incdir, tp}) == "k=7\n");
 }
 
 TEST_CASE("include without a matching search dir fails loudly") {
@@ -135,8 +135,24 @@ module m;
   initial $display("unreachable");
 endmodule
 )");
-    const std::string             path  = top.string();
-    std::vector<std::string_view> views = {path};
-    const LowerResult             r     = lower_files(views, {});
+    const std::string             tp    = top.string();
+    std::vector<std::string_view> views = {tp};
+    const LowerResult             r     = lower_sources(views);
     CHECK_FALSE(r.ok);
+}
+
+// -- single compilation unit (LRM 3.12) ---------------------------------
+
+// Files are merged into one CU, so a macro defined in one file is visible in a
+// later one. This is the chosen default (docs/TODO.md); under multi-unit it
+// would be an undeclared-macro error.
+TEST_CASE("macro defined in one file is visible in a later file (single unit)") {
+    ScratchDir dir;
+    const auto a = dir.write("a.sv", "`define SHARED 42\n");
+    const auto b = dir.write("b.sv", R"(
+module m;
+  initial $display("s=%0d", `SHARED);
+endmodule
+)");
+    CHECK(run_args({a.string(), b.string()}) == "s=42\n");
 }
