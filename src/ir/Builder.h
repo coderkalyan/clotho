@@ -37,6 +37,16 @@ public:
     // gives its storage width / domain.
     Index local(uint32_t index, Ref type, SourceLoc loc);
 
+    // -- Named events (LRM 15.5) --
+    // `-> e`: blocking trigger of the event whose synthetic signal is `sig`.
+    Index event_trigger(Signal sig, SourceLoc loc);
+    // `e.triggered`: 1-bit "triggered this time step" property of event `sig`.
+    Index event_triggered(Signal sig, SourceLoc loc);
+    // `->> e`: nonblocking trigger of event `sig` (deferred to the NBA region).
+    Index event_trigger_nb(Signal sig, SourceLoc loc);
+    // `->> #d e`: delayed nonblocking trigger; `delay` is the tick count.
+    Index event_trigger_nb_delayed(Signal sig, Index delay, SourceLoc loc);
+
     // -- Generic ops sharing a payload shape --
     // tag must be a unary-payload op (load, bnot, lnot, red_*, ret).
     Index unary(Inst::Tag tag, Index op, SourceLoc loc);

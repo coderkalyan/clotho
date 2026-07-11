@@ -399,6 +399,7 @@ public:
         compute_domain_spec();   // after fusion (thunk_group_): reads spec_group_ in lower_group
         build_vcd_index();       // before build_nba_state: fills vcd_index_ / design_uses_vcd_
         build_wait_queues();
+        build_delay_event_thunks(); // after build_wait_queues: thunks read the event globals
         build_sched_flags();
         build_nba_state();
 
@@ -785,6 +786,25 @@ private:
         const auto sigs = mod_.signals();
         for (size_t k = 0; k < ir.inst_count(); ++k) {
             const auto idx = static_cast<Index>(k);
+            if (ir.tag(idx) == Inst::Tag::EventTriggerNb) {
+                // `->> e` defers its wake to the NBA region; record the event so
+                // the region scans it. (Distinct events dedup; the list is tiny.)
+                const Signal sig = ir.payload(idx).signal;
+                if (std::find(nb_event_sigs_.begin(), nb_event_sigs_.end(), sig) == nb_event_sigs_.end()) {
+                    nb_event_sigs_.push_back(sig);
+                }
+                continue;
+            }
+            if (ir.tag(idx) == Inst::Tag::EventTriggerNbDelayed) {
+                // `->> #d e` schedules a detached wheel timer; record the event so
+                // a per-event on-expiry thunk is generated.
+                const Signal sig = ir.extra_data<EventDelayInfo>(ir.payload(idx).op_extra.extra).event;
+                if (std::find(nb_delay_event_sigs_.begin(), nb_delay_event_sigs_.end(), sig) ==
+                    nb_delay_event_sigs_.end()) {
+                    nb_delay_event_sigs_.push_back(sig);
+                }
+                continue;
+            }
             if (ir.tag(idx) != Inst::Tag::StoreNb) {
                 continue;
             }
@@ -2170,10 +2190,28 @@ private:
         wait_dyn_ty_.assign(sigs.size(), { nullptr, nullptr, nullptr });
         wait_dyn_len_gv_.assign(sigs.size(), { nullptr, nullptr, nullptr });
         sta_next_.assign(sigs.size(), { 0, 0, 0 });
+        event_trig_gv_.assign(sigs.size(), nullptr);
+        event_pending_gv_.assign(sigs.size(), nullptr);
 
+        auto* i8   = llvm::Type::getInt8Ty(ctx_);
         auto* i32  = llvm::Type::getInt32Ty(ctx_);
+        auto* i64  = llvm::Type::getInt64Ty(ctx_);
         auto* elem = wait_elem_ty();
         for (uint32_t i = 0; i < sigs.size(); ++i) {
+            if (sigs[i].is_event) {
+                // Never-triggered sentinel: UINT64_MAX never equals a real tick,
+                // so `.triggered` reads 0 until the first `-> e`.
+                event_trig_gv_[i] = new llvm::GlobalVariable(
+                  llmod_, i64, false, llvm::GlobalValue::InternalLinkage,
+                  llvm::ConstantInt::get(i64, ~uint64_t{ 0 }),
+                  "clotho.event_trig." + sigs[i].name);
+                // Nonblocking-trigger pending flag (`->> e`), cleared in the NBA
+                // region. Allocated for every event; the NBA scan only visits the
+                // ones actually `->>`-triggered (nb_event_sigs_).
+                event_pending_gv_[i] = new llvm::GlobalVariable(
+                  llmod_, i8, false, llvm::GlobalValue::InternalLinkage,
+                  llvm::ConstantInt::get(i8, 0), "clotho.event_pending." + sigs[i].name);
+            }
             for (uint32_t e = 0; e < 3; ++e) {
                 const std::string base = "clotho.wait." + sigs[i].name + "." ;
                 if (c.sta[i][e] > 0) {
@@ -2430,6 +2468,14 @@ private:
                 case Inst::Tag::Delay:
                 case Inst::Tag::Wait:
                 case Inst::Tag::TaskCall:
+                // A named-event trigger has a scheduling side effect (it wakes
+                // waiters) and `.triggered` reads per-event state outside the
+                // pure-function-of-signal-reads model that thunk elision and comb
+                // fusion assume, so keep an event-touching process a coroutine.
+                case Inst::Tag::EventTrigger:
+                case Inst::Tag::EventTriggerNb:
+                case Inst::Tag::EventTriggerNbDelayed:
+                case Inst::Tag::EventTriggered:
                     return false;
                 case Inst::Tag::Store: {
                     const LvalueRoot r = lvalue_root(p.ir, p.ir.payload(idx).binary.l);
@@ -3762,6 +3808,66 @@ private:
         emit_dynamic_scan_rt(wait_dyn_gv_[i][edge], wait_dyn_len_gv_[i][edge]);
     }
 
+    // Lower `-> e` (LRM 15.5.2): stamp the current sim tick into the event's
+    // trigger timestamp (so `.triggered` reads 1 for the rest of the step) and
+    // wake every waiter now. A named event has no value, so — unlike a signal
+    // store — there is no edge computation: it services the Any-edge static and
+    // dynamic queues unconditionally. `@(e)` and `always @(e)` both subscribe the
+    // Any bucket (edge None -> Any), so this reaches every waiter.
+    void lower_event_trigger(Signal sig) {
+        emit_event_fire(sig, wheel_);
+    }
+
+    // Generate a detached on-expiry thunk per `->> #d e` target event. The wheel
+    // calls it as on_expire(rt_timer* t, void* ctx) with ctx == the wheel (see the
+    // drain's rt_wheel_advance ctx); it stamps the event's trigger time and
+    // services its waiters, then frees the timer node the schedule site allocated.
+    void build_delay_event_thunks() {
+        event_delay_thunk_.assign(mod_.signals().size(), nullptr);
+        if (nb_delay_event_sigs_.empty()) {
+            return;
+        }
+        auto* ptr  = raw_ptr_ty();
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
+        for (const Signal sig : nb_delay_event_sigs_) {
+            const auto i  = static_cast<uint32_t>(sig);
+            auto*      fn = llvm::Function::Create(fnty, llvm::Function::InternalLinkage,
+                                                   "clotho.ev_delay." + mod_.signal(sig).name, llmod_);
+            event_delay_thunk_[i] = fn;
+            b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn));
+            emit_event_fire(sig, fn->getArg(1));         // ctx (arg 1) is the wheel
+            b_.CreateCall(free_fn(), { fn->getArg(0) }); // free the detached timer node
+            b_.CreateRetVoid();
+        }
+    }
+
+    // Stamp event `sig`'s trigger time (from `wheel`) and service its Any-edge
+    // static/dynamic wait queues. Shared by `-> e` in a process body (wheel_) and
+    // the NBA-region `->> e` service (the drain's local wheel — wheel_ is stale
+    // there, so it must be passed in).
+    void emit_event_fire(Signal sig, llvm::Value* wheel) {
+        const auto   i   = static_cast<uint32_t>(sig);
+        llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel });
+        b_.CreateStore(now, event_trig_gv_[i]);
+        const auto any = static_cast<uint32_t>(Edge::Any);
+        if (wait_sta_gv_[i][any] != nullptr) {
+            service_static_queue(sig, any);
+        }
+        if (wait_dyn_gv_[i][any] != nullptr) {
+            service_dynamic_queue(sig, any);
+        }
+    }
+
+    // Lower `e.triggered` (LRM 15.5.3) to a definite 2-state 1-bit: 1 iff the last
+    // trigger tick equals the current tick (true across all delta cycles of the
+    // step, false once time advances — no per-step reset needed).
+    Plane lower_event_triggered(Signal sig) {
+        const auto   i     = static_cast<uint32_t>(sig);
+        llvm::Value* stamp = b_.CreateLoad(b_.getInt64Ty(), event_trig_gv_[i]);
+        llvm::Value* now   = b_.CreateCall(wheel_now_fn(), { wheel_ });
+        return { b_.CreateICmpEQ(stamp, now), nullptr, true };
+    }
+
     // Compacting removal of this coroutine's entries from one (signal, edge)
     // dynamic bucket, used on resume from a multi-signal wait: the firing bucket
     // already cleared us, but the others still hold our now-stale entry. Slides
@@ -4171,7 +4277,6 @@ private:
         auto* wcheck  = llvm::BasicBlock::Create(ctx_, "wheel.check", fn);
         auto* wtick   = llvm::BasicBlock::Create(ctx_, "wheel.tick", fn);
         auto* wdone   = llvm::BasicBlock::Create(ctx_, "wheel.done", fn);
-        auto* null    = llvm::ConstantPointerNull::get(ptr_ty);
         // Any thunk group present means the active queue can carry tagged thunk
         // pointers, so the drain must discriminate; a coro-only design keeps the
         // straight resume path (no per-pop tag test).
@@ -4182,7 +4287,7 @@ private:
         // the active queue drains; if any update is staged it commits them all and
         // re-drains the active queue at the SAME instant; otherwise it falls through
         // to the wheel. So active and NBA iterate until both settle before time moves.
-        const bool has_nba = !array_nba_sigs_.empty() || !block_commits_.empty();
+        const bool has_nba = !array_nba_sigs_.empty() || !block_commits_.empty() || !nb_event_sigs_.empty();
         auto*      ncheck  = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.check", fn) : wcheck;
         auto*      ncommit = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.commit", fn) : nullptr;
         // Inactive region: only when the design has a #0. When the active queue
@@ -4282,6 +4387,11 @@ private:
                 any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateLoad(ptr_ty, block_head_gv_),
                                                        llvm::ConstantPointerNull::get(ptr_ty)));
             }
+            for (const Signal sig : nb_event_sigs_) {
+                // A pending `->> e` this instant.
+                llvm::Value* pend = b_.CreateLoad(b_.getInt8Ty(), event_pending_gv_[static_cast<uint32_t>(sig)]);
+                any = b_.CreateOr(any, b_.CreateICmpNE(pend, b_.getInt8(0)));
+            }
             b_.CreateCondBr(any, ncommit, wcheck);
 
             b_.SetInsertPoint(ncommit);
@@ -4330,6 +4440,24 @@ private:
                 }
                 b_.CreateCall(nba_arr_reset_fn(), {});
             }
+            // Nonblocking event triggers (`->> e`, LRM 15.5.4): for each pending
+            // event, stamp the trigger time and wake its Any-edge waiters, then
+            // clear the flag. Done in the NBA region so the wake lands after this
+            // instant's nonblocking updates; the loop-back to `check` then drains
+            // the woken waiters.
+            for (const Signal sig : nb_event_sigs_) {
+                const auto   i    = static_cast<uint32_t>(sig);
+                auto*        cfn  = b_.GetInsertBlock()->getParent();
+                auto*        fire = llvm::BasicBlock::Create(ctx_, "nbev.fire", cfn);
+                auto*        skip = llvm::BasicBlock::Create(ctx_, "nbev.skip", cfn);
+                llvm::Value* pend = b_.CreateLoad(b_.getInt8Ty(), event_pending_gv_[i]);
+                b_.CreateCondBr(b_.CreateICmpNE(pend, b_.getInt8(0)), fire, skip);
+                b_.SetInsertPoint(fire);
+                b_.CreateStore(b_.getInt8(0), event_pending_gv_[i]);
+                emit_event_fire(sig, wheel); // stamp now + service Any static/dynamic queues
+                b_.CreateBr(skip);
+                b_.SetInsertPoint(skip);
+            }
             b_.CreateBr(check);
         }
 
@@ -4343,8 +4471,10 @@ private:
         // Advance one instant (firing any timers, which enqueue their handles) and
         // re-drain. rt_wheel_advance folds the pending-check into the tick — one ABI
         // crossing per timestep, no separate occupancy scan — and returns non-zero
-        // iff it fired something (an idle wheel ends the sim).
-        llvm::Value* ticked = b_.CreateCall(wheel_advance_fn(), { wheel, null });
+        // iff it fired something (an idle wheel ends the sim). The tick ctx is the
+        // wheel: coroutine-timer trampolines ignore it, but a detached `->> #d e`
+        // on-expiry thunk reads the current time from it (build_delay_event_thunks).
+        llvm::Value* ticked = b_.CreateCall(wheel_advance_fn(), { wheel, wheel });
         b_.CreateCondBr(b_.CreateICmpNE(ticked, b_.getInt32(0)), check, wdone);
 
         b_.SetInsertPoint(wtick); // unreachable now; kept so block wiring stays valid
@@ -4821,6 +4951,9 @@ private:
                 return type_of(p.unary);
             case Inst::Tag::SimTime:
                 return { 64, false, false };
+            case Inst::Tag::EventTriggered:
+                // `e.triggered` (LRM 15.5.3): a definite 2-state 1-bit `bit`.
+                return { 1, false, false };
             case Inst::Tag::Random:
                 return { 32, false, true };
             case Inst::Tag::Clog2:
@@ -5003,6 +5136,9 @@ private:
             case Inst::Tag::DumpOn:
             case Inst::Tag::DumpAll:
             case Inst::Tag::DumpFlush:
+            case Inst::Tag::EventTrigger:
+            case Inst::Tag::EventTriggerNb:
+            case Inst::Tag::EventTriggerNbDelayed:
                 return { 0, false, false };
         }
         return { 0, false, false };
@@ -5690,6 +5826,33 @@ private:
                 lower_wait(p.wait);
                 return;
 
+            case Inst::Tag::EventTrigger:
+                // `-> e` (LRM 15.5.2): stamp the trigger time and wake every
+                // waiter now. Zero-time — the current process does not suspend, so
+                // it does not end the NBA segment.
+                lower_event_trigger(p.signal);
+                return;
+
+            case Inst::Tag::EventTriggerNb:
+                // `->> e` (LRM 15.5.4): mark the event pending; the NBA region
+                // stamps + wakes. The triggering process does not block.
+                b_.CreateStore(b_.getInt8(1), event_pending_gv_[static_cast<uint32_t>(p.signal)]);
+                return;
+
+            case Inst::Tag::EventTriggerNbDelayed: {
+                // `->> #d e` (LRM 15.5.4): schedule a detached wheel timer that
+                // fires the event's on-expiry thunk `d` ticks from now. The process
+                // does not block. The timer node (a bare rt_timer = {next, on_expire}
+                // = 2 pointers) is heap-allocated here and freed by the thunk.
+                const Signal ev       = ir_->extra_data<EventDelayInfo>(p.op_extra.extra).event;
+                llvm::Value* ticks    = cast(must_of(value_of(p.op_extra.op)), 64, false);
+                llvm::Value* deadline = b_.CreateAdd(b_.CreateCall(wheel_now_fn(), { wheel_ }), ticks);
+                llvm::Value* node     = b_.CreateCall(alloc_fn(), { b_.getInt64(16) });
+                b_.CreateCall(wheel_schedule_fn(),
+                              { wheel_, node, deadline, event_delay_thunk_[static_cast<uint32_t>(ev)] });
+                return;
+            }
+
             case Inst::Tag::Display:
                 lower_display(i);
                 return;
@@ -5803,6 +5966,10 @@ private:
                 set_value(i, packed(now, now, zero(64)));
                 return;
             }
+
+            case Inst::Tag::EventTriggered:
+                set_value(i, lower_event_triggered(p.signal));
+                return;
 
             case Inst::Tag::Random: {
                 // The PRNG draw is always known (no x/z): must == may, z == 0.
@@ -7312,6 +7479,12 @@ private:
         const SignalInfo& info = mod_.signal(sig);
         if (info.name.empty()) {
             return;
+        }
+        if (info.is_event) {
+            // A named event (LRM 15.5) has no dumpable value; its 1-bit placeholder
+            // slot is never written. A whole-design dump must represent every
+            // declared signal, so loud-fail rather than emit a phantom wire.
+            throw BackendError{ "VCD dump of event '" + info.name + "' is not supported" };
         }
         const SignalSlot& s = slot_of(sig);
         if (s.is_string) {
@@ -9248,6 +9421,27 @@ private:
     // Next free static slot per (signal, edge), handed out during lowering
     // (parallels the capacities computed in build_wait_queues).
     std::vector<std::array<uint32_t, 3>>               sta_next_;
+    // Per named-event trigger timestamp (clotho.event_trig.<name>), an i64 holding
+    // the sim tick of the last `-> e`, or UINT64_MAX if never triggered. Indexed
+    // by signal handle; null for a non-event signal. `.triggered` compares this to
+    // the current tick (LRM 15.5.3). Built in build_wait_queues.
+    std::vector<llvm::GlobalVariable*>                 event_trig_gv_;
+    // Per named-event nonblocking-trigger pending flag (clotho.event_pending.<name>),
+    // an i8 set by `->> e` and cleared after the NBA region stamps + services the
+    // event (LRM 15.5.4). Indexed by signal handle; null for a non-event signal.
+    // Built in build_wait_queues.
+    std::vector<llvm::GlobalVariable*>                 event_pending_gv_;
+    // Event signals that are targets of a `->> e` somewhere in the design; the NBA
+    // region scans exactly these for a pending nonblocking trigger. Collected in
+    // nba_classify_ir.
+    std::vector<Signal>                                nb_event_sigs_;
+    // Event signals that are targets of a delayed `->> #d e`; each gets a detached
+    // on-expiry thunk (event_delay_thunk_). Collected in nba_classify_ir.
+    std::vector<Signal>                                nb_delay_event_sigs_;
+    // Per delayed-trigger event: the wheel-timer on_expire thunk that stamps the
+    // trigger time and services the event's waiters. Indexed by signal handle;
+    // null for a non-target. Built in build_delay_event_thunks.
+    std::vector<llvm::Function*>                       event_delay_thunk_;
     // Per-process scheduled flags (clotho.proc_sched), built once in run().
     llvm::GlobalVariable*               sched_gv_     = nullptr;
     llvm::ArrayType*                    sched_arr_ty_ = nullptr;

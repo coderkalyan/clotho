@@ -9,6 +9,9 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Constant:
             return K::Ref;
         case T::Signal:
+        case T::EventTrigger:
+        case T::EventTriggered:
+        case T::EventTriggerNb:
             return K::Signal;
         case T::Arg:
             return K::Arg;
@@ -158,6 +161,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::EnumName:
         case T::CountBits:
         case T::ValuePlusArgs:
+        case T::EventTriggerNbDelayed:
             return K::OpExtra;
     }
 

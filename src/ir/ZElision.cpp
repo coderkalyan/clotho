@@ -372,6 +372,13 @@ struct Analysis {
                 case Inst::Tag::Fflush:
                 case Inst::Tag::SimTime:
                 case Inst::Tag::Random:
+                // `-> e` / `->> e` / `->> #d e` are valueless; `e.triggered` is a
+                // definite 2-state bit. A named event carries no bit planes, so
+                // none seed z.
+                case Inst::Tag::EventTrigger:
+                case Inst::Tag::EventTriggerNb:
+                case Inst::Tag::EventTriggerNbDelayed:
+                case Inst::Tag::EventTriggered:
                 // $clog2 yields a count (or X when the operand has unknown bits);
                 // its result z plane is always zero.
                 case Inst::Tag::Clog2:

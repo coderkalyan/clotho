@@ -42,6 +42,13 @@ struct SignalInfo {
     // defaults to z (LRM 6.6); an undriven variable defaults to x. Also the
     // seed condition for the may-z analysis (ZElision.h).
     bool is_net = false;
+    // A named event (LRM 15.5), modeled as a synthetic 1-bit signal that owns
+    // wait queues but carries no data value: `-> e` services its Any-edge queue
+    // and stamps a per-event trigger time, `@(e)` / `always @(e)` subscribe, and
+    // `e.triggered` compares the stamp to the current instant. `type` is a
+    // 1-bit logic placeholder; the value planes are never read or written, so
+    // value-oriented passes (VCD, edge classification) skip it.
+    bool is_event = false;
 };
 
 // One elaborated instance in the design hierarchy. The frontend flattens every

@@ -567,6 +567,13 @@ struct WaitInfo {
     ExtraSlice events;
 };
 
+// Extra payload for `event_trigger_nb_delayed` (`->> #d e`): the target event
+// signal. The delay (in wheel ticks) is the instruction's `op` operand.
+struct EventDelayInfo {
+    // Event whose synthetic signal owns the wait queue to service on expiry.
+    Signal event;
+};
+
 static_assert(ExtraPayload<ExtraSlice>);
 static_assert(ExtraPayload<CallInfo>);
 static_assert(ExtraPayload<TaskCallInfo>);
@@ -812,6 +819,29 @@ struct Inst {
         // registering the process on each event's wait queue plus a coroutine
         // suspend; a matching blocking assignment to one of the signals wakes it.
         Wait,
+        // Blocking trigger of a named event `-> e` (payload: signal, the event's
+        // synthetic signal). Records the trigger time (for `.triggered`) and
+        // unconditionally services the event signal's Any-edge wait queues,
+        // waking every `@(e)` / `always @(e)` waiter in the current instant
+        // (LRM 15.5.2). An event has no value, so there is no edge computation.
+        EventTrigger,
+        // The `e.triggered` event property (payload: signal), -> a definite 1-bit
+        // value: 1 iff the event was triggered in the current time step, else 0
+        // (LRM 15.5.3). Lowers to a compare of the recorded trigger time against
+        // the current sim time.
+        EventTriggered,
+        // Nonblocking trigger of a named event `->> e` (payload: signal). Unlike
+        // EventTrigger, the wake is deferred to the NBA region of the current time
+        // step (LRM 15.5.4): it marks the event pending; the NBA region then
+        // stamps the trigger time and services the waiters. The triggering process
+        // does not block.
+        EventTriggerNb,
+        // Delayed nonblocking trigger `->> #d e` (payload: op_extra -> op is the
+        // delay in wheel ticks, extra -> EventDelayInfo names the event). Schedules
+        // a detached wheel timer that, on expiry, stamps the trigger time and
+        // services the event's waiters (LRM 15.5.4). The triggering process does
+        // not block. The event-controlled form (`->> @(x) e`) is not lowered here.
+        EventTriggerNbDelayed,
 
         // -- String ops (operands are string values unless noted) --
         // s.len() -> 32-bit signed (payload: unary).
