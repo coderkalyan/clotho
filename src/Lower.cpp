@@ -514,6 +514,15 @@ public:
         }
     }
 
+    // Point this top's Lowerer at the shared globals Lowerer (the one
+    // lower_globals ran on), so a package/$unit-scope subroutine call can
+    // delegate its lowering there instead of duplicating it per top (see
+    // function_id's is_global_subroutine check). `g` must outlive every call
+    // made through this Lowerer.
+    void set_globals(Lowerer* g) {
+        globals_ = g;
+    }
+
 private:
     // Lower the non-signal members of a scope (an instance body or a generate
     // block) into processes: continuous assigns, procedural blocks, child
@@ -876,12 +885,7 @@ private:
             info.type = lower_type(vs.getType());
             info.dir  = ir::SignalInfo::Direction::Internal;
 
-            // Not register_signal: these signals belong to no top's
-            // InstanceScope tree (packages/$unit are not part of the instance
-            // hierarchy, and scope_stack_ is empty on this standalone
-            // Lowerer). The backend already treats any signal unclaimed by a
-            // scope tree as a flat root-level field (build_state_types).
-            sigmap_[&vs] = module_.add_signal(std::move(info));
+            sigmap_[&vs] = register_signal(std::move(info));
             lower_var_initializer(vs);
         }
     }
@@ -979,10 +983,17 @@ private:
 
     // Append a signal to the module and record it in the currently open
     // hierarchy scope. Every signal-creating path funnels through here so the
-    // scope tree covers the signal table exactly.
+    // scope tree covers the signal table exactly. scope_stack_ is empty only on
+    // the standalone Lowerer that registers package/$unit-scope state (globals;
+    // see lower_globals) and package-scope function statics reached through it
+    // (see function_id's is_global_subroutine delegation) — those signals
+    // belong to no top's InstanceScope tree, and the backend already treats an
+    // unclaimed signal as a flat root-level field (build_state_types).
     ir::Signal register_signal(ir::SignalInfo info) {
         const ir::Signal sig = module_.add_signal(std::move(info));
-        scope_stack_.back()->signals.push_back(sig);
+        if (!scope_stack_.empty()) {
+            scope_stack_.back()->signals.push_back(sig);
+        }
 
         return sig;
     }
@@ -5070,10 +5081,42 @@ private:
         }
     }
 
+    // True for a subroutine declared directly in a package or `$unit` scope
+    // (LRM 6.8's "no instance multiplicity" applies to these exactly as it
+    // does to a variable): walks up from the subroutine's declaring scope,
+    // stopping at the first Package/CompilationUnit (global) or InstanceBody
+    // (module-scope, possibly through an intervening generate block).
+    static bool is_global_subroutine(const SubroutineSymbol& sub) {
+        const Scope* s = sub.getParentScope();
+        while (s != nullptr) {
+            switch (s->asSymbol().kind) {
+                case SymbolKind::Package:
+                case SymbolKind::CompilationUnit:
+                    return true;
+                case SymbolKind::InstanceBody:
+                    return false;
+                default:
+                    s = s->asSymbol().getParentScope();
+            }
+        }
+        return false;
+    }
+
     // Resolve a subroutine (function or task) to a FunctionId, lowering its body
     // on first reference. The id is reserved before the body is built so a
-    // recursive call resolves it.
+    // recursive call resolves it. A package/$unit-scope subroutine has no
+    // instance multiplicity (LRM 6.8): delegate its whole lowering to the
+    // shared globals_ Lowerer instead of duplicating it (and any static
+    // local's storage) per top instance.
     ir::FunctionId function_id(const SubroutineSymbol& sub) {
+        if (globals_ != nullptr && this != globals_ && is_global_subroutine(sub)) {
+            const Scope* saved_scope = globals_->scope_;
+            globals_->scope_         = sub.getParentScope();
+            const ir::FunctionId id  = globals_->function_id(sub);
+            globals_->scope_         = saved_scope;
+            return id;
+        }
+
         const auto cached = fnmap_.find(&sub);
         if (cached != fnmap_.end()) {
             return cached->second;
@@ -5376,7 +5419,16 @@ private:
     uint32_t temp_id_ = 0;
     // Subroutine -> its lowered FunctionId, so each function is lowered once and
     // shared across call sites (and a recursive call resolves its own id).
+    // Package/$unit-scope subroutines never populate this map directly on a
+    // per-top Lowerer — function_id delegates those to globals_ instead, so a
+    // package function called from multiple top instances still gets exactly
+    // one FunctionId and one copy of any static local's storage.
     ankerl::unordered_dense::map<const SubroutineSymbol*, ir::FunctionId> fnmap_;
+    // The shared Lowerer that owns package/$unit-scope subroutine bodies (see
+    // set_globals / function_id). Null on the shared Lowerer itself and on any
+    // Lowerer built without one (e.g. tests that lower a single module with no
+    // packages in play).
+    Lowerer* globals_ = nullptr;
     // The function currently being lowered, or null when lowering a process. Drives
     // local-vs-signal name resolution and `return` handling.
     FnCtx* fn_ctx_ = nullptr;
@@ -5503,12 +5555,12 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
     try {
         Lowerer globals(*module, tick_fs);
         globals.lower_globals(comp, root);
-        const auto& global_sigmap = globals.sigmap();
 
         for (const InstanceSymbol* top : root.topInstances) {
             const std::string prefix = single ? std::string() : std::string(top->name) + ".";
             Lowerer lw(*module, tick_fs);
-            lw.seed_signals(global_sigmap);
+            lw.seed_signals(globals.sigmap());
+            lw.set_globals(&globals);
             lw.lower_top(*top, prefix);
         }
     } catch (const LowerError& e) {

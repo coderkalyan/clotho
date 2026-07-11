@@ -367,3 +367,31 @@ TEST_CASE("export re-export via a further import") {
     )");
     CHECK(out == "W=8 W2=16\n");
 }
+
+// A package-scope function has no instance multiplicity (LRM 6.8): its
+// static local must be exactly one persistent storage location shared by
+// every top-level module that calls it, not one copy per top ("Wall A" —
+// each top used to get its own fresh Lowerer with its own fnmap_/sigmap_, so
+// the same package function got lowered — and its static local's signal
+// created — once per top, independently). m2 waits #1 so its call is ordered
+// after m1's two time-zero calls. Verified vs iverilog.
+TEST_CASE("package function's static local is shared across top-level modules") {
+    const std::string out = run_capture(R"(
+        package p;
+            function int counter();
+                static int n;
+                n++;
+                return n;
+            endfunction
+        endpackage
+        module m1;
+            import p::*;
+            initial $display("m1 counter=%0d counter=%0d", counter(), counter());
+        endmodule
+        module m2;
+            import p::*;
+            initial #1 $display("m2 counter=%0d", counter());
+        endmodule
+    )");
+    CHECK(out == "m1 counter=1 counter=2\nm2 counter=3\n");
+}
