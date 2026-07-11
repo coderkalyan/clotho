@@ -266,14 +266,24 @@ def cmd_compare(args):
         sys.exit(1)
     print("\nOK: no significant regressions")
 
-def oracle_cmds(tool, files, top):
-    """Return (compile_cmd, sim_cmd) shell strings, run from the case dir."""
+def oracle_cmds(tool, files, top, incdirs=()):
+    """Return (compile_cmd, sim_cmd) shell strings, run from the case dir.
+
+    incdirs lists `include search directories (case-relative). Clotho's slang
+    frontend searches the including file's own directory, so a case that stages
+    a flat source tree needs no incdir for clotho — but iverilog and verilator
+    do, hence this per-tool flag threading. Empty incdirs leaves commands byte
+    for byte as before.
+    """
     fq = " ".join(shlex.quote(f) for f in files)
+    dirs = [shlex.quote(d) for d in incdirs]
+    inc_dash_i   = "".join(f" -I {d}" for d in dirs)          # iverilog
+    inc_verilator = "".join(f" -I{d}" for d in dirs)          # verilator
     if tool == "iverilog":
-        return f"iverilog -g2012 -o iv.out {fq}", "vvp iv.out"
+        return f"iverilog -g2012{inc_dash_i} -o iv.out {fq}", "vvp iv.out"
     if tool == "verilator":
         return (f"rm -rf obj_dir && verilator --binary --timing -Wno-fatal -j 0"
-                f" --top-module {top} {fq}",
+                f"{inc_verilator} --top-module {top} {fq}",
                 f"obj_dir/V{top}")
     fail(f"unknown oracle tool '{tool}'")
 
@@ -328,7 +338,8 @@ def cmd_oracles(args):
                 print(f"[{name}/{tool}] SKIPPED: not on PATH{hint} (existing numbers kept)")
                 continue
             files = tool_cfg.get("files", case["clotho"]["files"])
-            compile_cmd, sim_cmd = oracle_cmds(tool, files, top)
+            incdirs = case.get("incdirs", [])
+            compile_cmd, sim_cmd = oracle_cmds(tool, files, top, incdirs)
             print(f"[{name}/{tool}] sanity compile + sim")
             sanity_run(compile_cmd, cwd, None, f"{name}/{tool}/compile", env=env)
             sanity_run(sim_cmd, cwd, regex, f"{name}/{tool}/sim", env=env)

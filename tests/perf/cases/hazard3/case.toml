@@ -1,0 +1,54 @@
+name = "hazard3"
+description = "Wren6991 Hazard3 RISC-V core (RV32IMACB + debug, all extensions) running a fixed multiply/divide compute kernel to a deterministic checksum. Larger and gnarlier than picorv32: AHB-Lite, C-decompressor, PMP, triggers, sequential muldiv."
+top = "tb_hazard3"
+
+# Header search dir for oracle front ends (iverilog etc.). Clotho's slang
+# frontend searches the including file's own directory, so it needs none.
+incdirs = ["src"]
+
+[fetch]
+script = "fetch.sh"
+# Fetch runs when this file is missing (staged flat by fetch.sh).
+probe = "src/hazard3_core.v"
+
+[clotho]
+# Flat file list (fetch.sh stages hazard3.f's CPU set + headers into src/).
+# hazard3_cpu_1port.v is omitted: the testbench uses the 2-port core, and an
+# uninstantiated 1-port core would be a second top candidate.
+files = [
+  "src/hazard3_core.v",
+  "src/hazard3_cpu_2port.v",
+  "src/hazard3_alu.v",
+  "src/hazard3_branchcmp.v",
+  "src/hazard3_mul_fast.v",
+  "src/hazard3_muldiv_seq.v",
+  "src/hazard3_onehot_encode.v",
+  "src/hazard3_onehot_priority.v",
+  "src/hazard3_onehot_priority_dynamic.v",
+  "src/hazard3_priority_encode.v",
+  "src/hazard3_shift_barrel.v",
+  "src/hazard3_csr.v",
+  "src/hazard3_decode.v",
+  "src/hazard3_frontend.v",
+  "src/hazard3_instr_decompress.v",
+  "src/hazard3_irq_ctrl.v",
+  "src/hazard3_pmp.v",
+  "src/hazard3_power_ctrl.v",
+  "src/hazard3_regfile_1w2r.v",
+  "src/hazard3_triggers.v",
+  "tb_hazard3.sv",
+]
+
+[check]
+# Firmware prints this exact checksum (host-verified, independent of any
+# simulator) then writes IO_EXIT. Anything else (trap prints '!', or the
+# watchdog prints TIMEOUT) is a broken run.
+stdout_regex = "checksum=1d3351a6"
+
+[oracles.iverilog]
+enabled = true
+
+[oracles.verilator]
+enabled = false
+note = "Candidate fast oracle (the testbench is plain Verilog), but verilator is 2-state/cycle-accurate and not yet cross-checked on this case."
+

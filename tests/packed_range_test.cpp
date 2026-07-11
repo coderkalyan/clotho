@@ -278,3 +278,40 @@ TEST_CASE("behavior-bearing members are rejected, not dropped") {
     )";
     CHECK(reject(specify).find("SpecifyBlock") != std::string::npos);
 }
+
+// A bit/part/indexed select of a parameter has no signal storage: a constant
+// select folds (LRM 11.2.1), and a runtime index into a packed parameter spills
+// the constant into a temp and selects at run time (hazard3_pmp.v PMP_HARDWIRED[i]
+// with a procedural loop variable). Regression for "reference to unknown signal".
+// Every line cross-checked against iverilog v13.
+TEST_CASE("parameter bit/part/indexed selects agree with iverilog") {
+    constexpr std::string_view src = R"(
+        module t;
+            parameter [15:0] P = 16'hBEEF;
+            parameter        Q = 6;
+            parameter [7:0]  R = 8'hB5;
+            parameter [31:0] W = 32'hDEADBEEF;
+            reg [3:0] ctr;
+            integer i;
+            initial begin
+                $display("cbit %b %b", P[0], P[15]);
+                $display("rng %h %h", P[7:0], P[11:4]);
+                $display("ips %h", P[4 +: 8]);
+                $display("qsel %b %h", Q[0], Q[2:0]);
+                ctr = 4'd10; ctr = ctr - Q[2:0];   // the hazard3 muldiv shape
+                $display("ctr %0d", ctr);
+                for (i = 0; i < 8; i = i + 1) $write("%b", R[i]);       // runtime bit-select
+                $write("\n");
+                for (i = 0; i < 4; i = i + 1) $display("nib %h", W[8*i +: 8]); // runtime part-select
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "cbit 1 1\n"
+          "rng ef ee\n"
+          "ips ee\n"
+          "qsel 0 6\n"
+          "ctr 4\n"
+          "10101101\n"
+          "nib ef\nnib be\nnib ad\nnib de\n");
+}
