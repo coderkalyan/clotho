@@ -42,6 +42,8 @@ public:
     Index event_trigger(Signal sig, SourceLoc loc);
     // `e.triggered`: 1-bit "triggered this time step" property of event `sig`.
     Index event_triggered(Signal sig, SourceLoc loc);
+    // `->> e`: nonblocking trigger of event `sig` (deferred to the NBA region).
+    Index event_trigger_nb(Signal sig, SourceLoc loc);
 
     // -- Generic ops sharing a payload shape --
     // tag must be a unary-payload op (load, bnot, lnot, red_*, ret).

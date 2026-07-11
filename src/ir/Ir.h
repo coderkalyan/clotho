@@ -823,6 +823,12 @@ struct Inst {
         // (LRM 15.5.3). Lowers to a compare of the recorded trigger time against
         // the current sim time.
         EventTriggered,
+        // Nonblocking trigger of a named event `->> e` (payload: signal). Unlike
+        // EventTrigger, the wake is deferred to the NBA region of the current time
+        // step (LRM 15.5.4): it marks the event pending; the NBA region then
+        // stamps the trigger time and services the waiters. The triggering process
+        // does not block.
+        EventTriggerNb,
 
         // -- String ops (operands are string values unless noted) --
         // s.len() -> 32-bit signed (payload: unary).

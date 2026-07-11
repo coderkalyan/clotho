@@ -11,6 +11,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Signal:
         case T::EventTrigger:
         case T::EventTriggered:
+        case T::EventTriggerNb:
             return K::Signal;
         case T::Arg:
             return K::Arg;

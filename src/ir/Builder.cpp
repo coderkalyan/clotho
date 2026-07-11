@@ -47,6 +47,10 @@ Index Builder::event_triggered(Signal sig, SourceLoc loc) {
     return emit({ Inst::Tag::EventTriggered, Inst::Payload{ .signal = sig } }, loc);
 }
 
+Index Builder::event_trigger_nb(Signal sig, SourceLoc loc) {
+    return emit({ Inst::Tag::EventTriggerNb, Inst::Payload{ .signal = sig } }, loc);
+}
+
 Index Builder::unary(Inst::Tag tag, Index op, SourceLoc loc) {
     return emit({ tag, Inst::Payload{ .unary = op } }, loc);
 }
