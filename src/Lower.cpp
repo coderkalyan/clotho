@@ -1549,6 +1549,67 @@ private:
         }
     }
 
+    // An elaboration-time constant (parameter/localparam, enum member, genvar,
+    // specparam) has a value but no signal storage. A whole reference folds at
+    // the NamedValue case; a bit/part/element-select of one does not root at a
+    // signal, so it must be folded rather than routed through signal_of.
+    static bool is_elaboration_constant(const ValueSymbol& s) {
+        switch (s.kind) {
+            case SymbolKind::Parameter:
+            case SymbolKind::EnumValue:
+            case SymbolKind::Genvar:
+            case SymbolKind::Specparam:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // Fold a select whose base is an elaboration constant (e.g. `P[W-1:0]`,
+    // LRM 11.2.1) into a constant. Returns nullopt when the base is signal-
+    // backed (normal path) or when the select itself is not constant — e.g. a
+    // runtime index into a constant array, which stays an unsupported gap
+    // rather than a hard eval failure here.
+    std::optional<ir::Index> try_lower_constant_select(const Expression& expr, ir::Builder& b,
+                                                       ir::SourceLoc l) {
+        const ValueSymbol* root = lvalue_root(expr);
+        if (root == nullptr || !is_elaboration_constant(*root)) {
+            return std::nullopt;
+        }
+        slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+        slang::ast::EvalContext    ectx(actx);
+        const slang::ConstantValue cv = expr.eval(ectx);
+        if (cv.bad()) {
+            return std::nullopt;
+        }
+
+        return b.constant(lower_constant(cv, *expr.type), l);
+    }
+
+    // Provide a select's base as an lvalue. A signal-backed base lowers the
+    // usual way; a packed elaboration-constant base (a parameter with no
+    // storage, indexed by a runtime value — e.g. `PMP_HARDWIRED[i]` with a
+    // procedural loop variable in hazard3_pmp.v) is spilled into a fresh temp
+    // cell so the runtime bit/part-select has something to read. A constant
+    // select of such a base is already folded upstream by
+    // try_lower_constant_select, so this path is the runtime-index case only.
+    ir::Index select_base_lvalue(const Expression& base, ir::Builder& b, ir::SourceLoc l) {
+        const ValueSymbol* root = lvalue_root(base);
+        if (root != nullptr && is_elaboration_constant(*root) &&
+            base.type->getCanonicalType().isIntegral()) {
+            slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+            slang::ast::EvalContext    ectx(actx);
+            const slang::ConstantValue cv = base.eval(ectx);
+            if (!cv.bad()) {
+                const ir::Index tmp = make_arg_temp(lower_type(*base.type), b, l);
+                b.binary(ir::Inst::Tag::Store, tmp, b.constant(lower_constant(cv, *base.type), l), l);
+                return tmp;
+            }
+        }
+
+        return lower_lvalue(base, b);
+    }
+
     // Record the net-driver coverage of one continuous-assignment lvalue. A
     // constant bit/part-select directly on the net drives an exact bit range;
     // any dynamic or nested select conservatively drives the whole net
@@ -5705,7 +5766,10 @@ private:
                     const ir::Index str = b.unary(ir::Inst::Tag::Load, lower_lvalue(es.value(), b), l);
                     return b.binary(ir::Inst::Tag::StrGetc, str, lower_expr(es.selector(), b), l);
                 }
-                const ir::Index base = lower_lvalue(es.value(), b);
+                if (auto c = try_lower_constant_select(expr, b, l)) {
+                    return *c;
+                }
+                const ir::Index base = select_base_lvalue(es.value(), b, l);
                 const ir::Index sel =
                     is_unpacked_array(es.value())
                         ? b.elem_select(base, lower_expr(es.selector(), b), lower_type(*es.value().type), l)
@@ -5720,7 +5784,10 @@ private:
             }
             case ExpressionKind::RangeSelect: {
                 const RangeSelectExpression& rs   = expr.as<RangeSelectExpression>();
-                const ir::Index              base = lower_lvalue(rs.value(), b);
+                if (auto c = try_lower_constant_select(expr, b, l)) {
+                    return *c;
+                }
+                const ir::Index              base = select_base_lvalue(rs.value(), b, l);
                 const ir::Index v = b.unary(ir::Inst::Tag::Load, lower_range_select(rs, base, b, l), l);
                 // See narrow_to_declared (e.g. `x.b[7:4]`).
                 return narrow_to_declared(v, *expr.type, b, l);
