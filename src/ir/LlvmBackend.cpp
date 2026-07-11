@@ -6006,7 +6006,31 @@ private:
                 }
                 const auto sz = llmod_.getDataLayout().getTypeAllocSize(st);
                 const auto al = llmod_.getDataLayout().getABITypeAlign(st);
+                // A blocking whole-object copy into a signal must wake its Any-edge
+                // readers (a continuous / port copy or a comb process feeds off the
+                // destination), but only when the bytes actually change — an
+                // unconditional wake would never settle a feedback delta wave. Detect
+                // the change with a memcmp of old dest vs new source *before* the copy.
+                const bool service = !lowering_preinit_ && dlv.is_signal &&
+                                     signal_has_waiters(dlv.sig);
+                llvm::Value* changed = nullptr;
+                if (service) {
+                    auto cmp = rt_fn("memcmp", b_.getInt32Ty(),
+                                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+                    changed   = b_.CreateICmpNE(
+                      b_.CreateCall(cmp, { dst, src, b_.getInt64(sz) }), b_.getInt32(0));
+                }
                 b_.CreateMemCpy(dst, al, src, al, sz);
+                if (service) {
+                    auto* fn   = b_.GetInsertBlock()->getParent();
+                    auto* svc  = llvm::BasicBlock::Create(ctx_, "aggcopy.svc", fn);
+                    auto* cont = llvm::BasicBlock::Create(ctx_, "aggcopy.cont", fn);
+                    b_.CreateCondBr(changed, svc, cont);
+                    b_.SetInsertPoint(svc);
+                    service_any_waiters(dlv.sig);
+                    b_.CreateBr(cont);
+                    b_.SetInsertPoint(cont);
+                }
                 return;
             }
 
