@@ -2050,16 +2050,22 @@ private:
         return signal_of(target.as<NamedValueExpression>().symbol);
     }
 
-    // Lower `-> e` (LRM 15.5.2). The nonblocking `->> e` and any delayed trigger
-    // (`->> #n e`) are Tier 2 (need NBA-region / wheel scheduling of the wake).
+    // Lower `-> e` / `->> e` (LRM 15.5.2, 15.5.4). A delayed / event-controlled
+    // trigger (`->> #n e`, `->> @(x) e`) needs a detached timer and is not yet
+    // supported.
     void lower_event_trigger(const EventTriggerStatement& ev, ir::Builder& b) {
-        if (ev.isNonBlocking) {
-            fail("nonblocking event trigger '->>' is not supported");
-        }
         if (ev.timing != nullptr) {
-            fail("delayed event trigger ('-> #n e') is not supported");
+            // TODO: delayed / event-controlled nonblocking trigger — needs a
+            // detached wheel timer / event wait that fires the trigger with no
+            // hosting coroutine (docs/design/named-events.md, Tier 2).
+            fail("delayed event trigger ('->> #n e' / '->> @(...) e') is not supported");
         }
-        b.event_trigger(trigger_target(ev.target), loc(ev));
+        const ir::Signal sig = trigger_target(ev.target);
+        if (ev.isNonBlocking) {
+            b.event_trigger_nb(sig, loc(ev)); // `->> e`: wake in the NBA region
+        } else {
+            b.event_trigger(sig, loc(ev)); // `-> e`: wake now
+        }
     }
 
     // If `e` is an `<event>.triggered` system-method call (LRM 15.5.3), return the
