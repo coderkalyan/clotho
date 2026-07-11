@@ -147,6 +147,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Wait:
             return K::Wait;
 
+        case T::StoreNbDelay:
+        case T::StoreNbEvent:
         case T::Select:
         case T::SelectLazy:
         case T::PartSelect:
@@ -347,6 +349,23 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 scratch[0]    = p.op_extra.op;
                 scratch[1]    = ss.i;
                 scratch[2]    = ss.j;
+                return { scratch.data(), 3 };
+            }
+            // store_nb_delay exposes its lvalue, the sampled value, and the delay.
+            if (tag == Inst::Tag::StoreNbDelay) {
+                const auto info = extra_data<StoreNbDelayInfo>(p.op_extra.extra);
+                scratch[0]      = p.op_extra.op;
+                scratch[1]      = info.value;
+                scratch[2]      = info.delay;
+                return { scratch.data(), 3 };
+            }
+            // store_nb_event exposes its lvalue, the sampled value, and the count
+            // (the trigger signal is a subscription target, not an SSA operand).
+            if (tag == Inst::Tag::StoreNbEvent) {
+                const auto info = extra_data<StoreNbEventInfo>(p.op_extra.extra);
+                scratch[0]      = p.op_extra.op;
+                scratch[1]      = info.value;
+                scratch[2]      = info.count;
                 return { scratch.data(), 3 };
             }
             if (tag == Inst::Tag::AggCopy) {
