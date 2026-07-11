@@ -1860,9 +1860,10 @@ private:
     void emit_delay_timer(llvm::Value* ticks) {
         auto* aw = awaiter();
         b_.CreateStore(hdl_, b_.CreateStructGEP(awaiter_ty(), aw, 2));
-        llvm::Value* now      = b_.CreateCall(wheel_now_fn(), { wheel_ });
-        llvm::Value* deadline = b_.CreateAdd(now, ticks);
-        b_.CreateCall(wheel_schedule_fn(), { wheel_, aw, deadline, enqueue_trampoline() });
+        // Schedule-relative: the runtime adds `now` so this #delay crosses the ABI
+        // once (rt_wheel_schedule_rel) rather than twice (rt_wheel_now then
+        // rt_wheel_schedule).
+        b_.CreateCall(wheel_schedule_rel_fn(), { wheel_, aw, ticks, enqueue_trampoline() });
     }
 
     // Store a { handle, flag_ptr } entry at a chosen slot of a queue array. The
@@ -4540,6 +4541,11 @@ private:
     // void rt_wheel_schedule(rt_wheel*, rt_timer*, i64 deadline, rt_timer_fn)
     llvm::FunctionCallee wheel_schedule_fn() {
         return rt_fn("rt_wheel_schedule", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
+    }
+    // void rt_wheel_schedule_rel(rt_wheel*, rt_timer*, i64 delay, rt_timer_fn)
+    llvm::FunctionCallee wheel_schedule_rel_fn() {
+        return rt_fn("rt_wheel_schedule_rel", b_.getVoidTy(),
                      { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
     }
     // void rt_wheel_tick(rt_wheel*, void* ctx)
