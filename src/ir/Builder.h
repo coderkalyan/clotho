@@ -37,6 +37,12 @@ public:
     // gives its storage width / domain.
     Index local(uint32_t index, Ref type, SourceLoc loc);
 
+    // -- Named events (LRM 15.5) --
+    // `-> e`: blocking trigger of the event whose synthetic signal is `sig`.
+    Index event_trigger(Signal sig, SourceLoc loc);
+    // `e.triggered`: 1-bit "triggered this time step" property of event `sig`.
+    Index event_triggered(Signal sig, SourceLoc loc);
+
     // -- Generic ops sharing a payload shape --
     // tag must be a unary-payload op (load, bnot, lnot, red_*, ret).
     Index unary(Inst::Tag tag, Index op, SourceLoc loc);

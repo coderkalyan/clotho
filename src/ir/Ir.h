@@ -812,6 +812,17 @@ struct Inst {
         // registering the process on each event's wait queue plus a coroutine
         // suspend; a matching blocking assignment to one of the signals wakes it.
         Wait,
+        // Blocking trigger of a named event `-> e` (payload: signal, the event's
+        // synthetic signal). Records the trigger time (for `.triggered`) and
+        // unconditionally services the event signal's Any-edge wait queues,
+        // waking every `@(e)` / `always @(e)` waiter in the current instant
+        // (LRM 15.5.2). An event has no value, so there is no edge computation.
+        EventTrigger,
+        // The `e.triggered` event property (payload: signal), -> a definite 1-bit
+        // value: 1 iff the event was triggered in the current time step, else 0
+        // (LRM 15.5.3). Lowers to a compare of the recorded trigger time against
+        // the current sim time.
+        EventTriggered,
 
         // -- String ops (operands are string values unless noted) --
         // s.len() -> 32-bit signed (payload: unary).

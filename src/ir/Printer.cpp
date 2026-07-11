@@ -157,6 +157,10 @@ const char* tag_name(Inst::Tag tag) {
             return "delay";
         case T::Wait:
             return "wait";
+        case T::EventTrigger:
+            return "event_trigger";
+        case T::EventTriggered:
+            return "event_triggered";
         case T::StrLen:
             return "str_len";
         case T::StrGetc:
