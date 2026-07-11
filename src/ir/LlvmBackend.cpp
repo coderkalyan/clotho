@@ -431,6 +431,14 @@ struct FrameSlot {
     // A string local: the slot is an rt_string handle; init/deinit bracket the
     // call.
     bool is_string = false;
+    // An aggregate local (its type contains an unpacked struct): `storage_ty` is
+    // the recursive mirror (agg_storage_ty), addressed by an is_agg LValue rooted
+    // at the frame slot. Passed / returned by pointer; copy-in/out is a whole-
+    // object copy. `slot_ty` is null and `width` unused.
+    bool        is_agg     = false;
+    llvm::Type* storage_ty = nullptr;
+    // The local's interned IR type (aggregate recursion needs it).
+    Ref ir_type = Ref::Invalid;
 };
 
 // Raised on a construct the backend cannot lower; caught at the top level.
@@ -655,6 +663,16 @@ private:
             return str_slot_ty();
         }
         return agg_leaf_slot_ty(type);
+    }
+
+    // memcpy a whole aggregate from `src` to `dst` (both pointers to its storage).
+    // Valid because the frontend passes an aggregate by value only when it is
+    // string-free, so its byte image is the value (no heap-owning leaf).
+    void emit_agg_storage_copy(llvm::Value* dst, llvm::Value* src, Ref type) {
+        llvm::Type* st = agg_storage_ty(type);
+        const auto  sz = llmod_.getDataLayout().getTypeAllocSize(st);
+        const auto  al = llmod_.getDataLayout().getABITypeAlign(st);
+        b_.CreateMemCpy(dst, al, src, al, sz);
     }
 
     // Fill an LValue's leaf metadata (slot type, width, domain flags) from the
@@ -1530,18 +1548,21 @@ private:
         // a 2-state arg lifts to must==may with a constant-0 z, which LLVM folds —
         // so this is a call-ABI size micro-opt, not a correctness gap.
         for (Ref pt : f.param_types) {
-            if (is_string_type(pt)) {
-                params.push_back(ptr); // rt_string handle (callee copy-in gives value semantics)
+            if (is_string_type(pt) || contains_struct(pt)) {
+                // A string handle or an aggregate's storage passes by pointer; the
+                // callee copy-in gives value semantics (an out/inout aggregate is
+                // written back through the same pointer).
+                params.push_back(ptr);
                 continue;
             }
             const uint32_t w = width_of(pt);
             params.push_back(int_ty(2 * w)); // must|may
             params.push_back(int_ty(w));     // z
         }
-        // A string result returns through a trailing out-param handle the caller
-        // owns (its call-site temp) — a 32-byte handle has no plane struct form.
+        // A string or aggregate result returns through a trailing out-param the
+        // caller owns (its call-site temp) — neither has a plane struct form.
         llvm::Type* rty = fn_return_ty(f.return_type);
-        if (is_string_type(f.return_type)) {
+        if (is_string_type(f.return_type) || contains_struct(f.return_type)) {
             rty = b_.getVoidTy();
             params.push_back(ptr);
         }
@@ -1600,9 +1621,12 @@ private:
         uint32_t              cur = f.is_task ? 2 : 1;
         for (size_t k = 0; k < f.param_types.size(); ++k) {
             idx[k] = cur;
-            const bool in_string =
-              is_string_type(f.param_types[k]) && (!f.is_task || f.arg_dirs[k] == ArgDir::In);
-            cur += in_string ? 1 : 2;
+            // An aggregate is always one pointer (both directions). A string input
+            // is one pointer; a string out/inout task formal keeps the two-ptr form.
+            const bool one =
+              contains_struct(f.param_types[k]) ||
+              (is_string_type(f.param_types[k]) && (!f.is_task || f.arg_dirs[k] == ArgDir::In));
+            cur += one ? 1 : 2;
         }
         return idx;
     }
@@ -1655,8 +1679,15 @@ private:
         std::vector<llvm::Type*> fields(n);
         for (uint32_t i = 0; i < n; ++i) {
             const Layout lay           = mod_.pool.layout(f.local_types[i]);
+            frame_slots_[i].ir_type    = f.local_types[i];
             frame_slots_[i].width      = lay.width == 0 ? 1 : lay.width;
             frame_slots_[i].four_state = lay.domain == Domain::Four;
+            if (contains_struct(f.local_types[i])) {
+                frame_slots_[i].is_agg     = true;
+                frame_slots_[i].storage_ty = agg_storage_ty(f.local_types[i]);
+                fields[i]                  = frame_slots_[i].storage_ty;
+                continue;
+            }
             if (is_string_type(f.local_types[i])) {
                 frame_slots_[i].is_string = true;
                 frame_slots_[i].slot_ty   = str_slot_ty();
@@ -1686,6 +1717,13 @@ private:
         for (uint32_t i = 0; i < frame_slots_.size(); ++i) {
             const FrameSlot& s    = frame_slots_[i];
             llvm::Value*     slot = b_.CreateStructGEP(frame_ty_, frame_, i);
+            if (s.is_agg) {
+                // Recursive fill (X into 4-state leaves, init string leaves); an
+                // input formal's slot is then overwritten by copy-in.
+                std::vector<llvm::Value*> path;
+                emit_agg_init(s.ir_type, slot, path, s.storage_ty);
+                continue;
+            }
             if (s.is_string) {
                 b_.CreateCall(str_init_fn(), { slot });
                 continue;
@@ -1741,6 +1779,7 @@ private:
 
         frame_ = b_.CreateAlloca(frame_ty_, nullptr, "frame");
         init_frame();
+        emit_fn_agg_copyin(f);
         build_str_temps();
 
         lower_region(ir_->root());
@@ -1757,6 +1796,21 @@ private:
 
         cur_fn_ = nullptr;
         frame_  = nullptr;
+    }
+
+    // Copy each aggregate input formal's caller storage (passed by pointer) into
+    // its frame slot at function entry (value semantics). Scalar / string formals
+    // copy in via the frontend's Store(Local, Arg); an aggregate formal emits no
+    // Arg, so the copy is done here. Aggregate output / inout function formals are
+    // guarded in the frontend, so only inputs occur.
+    void emit_fn_agg_copyin(const Function& f) {
+        for (uint32_t k = 0; k < f.param_types.size(); ++k) {
+            if (!contains_struct(f.param_types[k])) {
+                continue;
+            }
+            emit_agg_storage_copy(b_.CreateStructGEP(frame_ty_, frame_, k),
+                                  fn_->getArg(param_llvm_index_[k]), f.param_types[k]);
+        }
     }
 
     // -- Tasks --
@@ -6232,6 +6286,14 @@ private:
     // Whole-storage lvalue for a function-frame local (per-call frame struct).
     LValue local_lvalue(uint32_t index) {
         const FrameSlot& s = frame_slots_[index];
+        if (s.is_agg) {
+            LValue lv{};
+            lv.base      = b_.CreateStructGEP(frame_ty_, frame_, index);
+            lv.root_ty   = s.storage_ty;
+            lv.is_agg    = true;
+            lv.is_signal = false;
+            return lv;
+        }
         return LValue{ .base        = b_.CreateStructGEP(frame_ty_, frame_, index),
                        .slot_ty     = s.slot_ty,
                        .has_z       = !s.narrow,
@@ -7524,6 +7586,15 @@ private:
             b_.CreateRetVoid();
             return;
         }
+        if (contains_struct(cur_fn_->return_type)) {
+            // Copy the aggregate result (the Ret operand is its lvalue) out through
+            // the trailing storage-pointer out-param the caller owns.
+            emit_agg_storage_copy(fn_->getArg(fn_->arg_size() - 1),
+                                  agg_slot_ptr(lvalue_of(value)), cur_fn_->return_type);
+            deinit_body_strings();
+            b_.CreateRetVoid();
+            return;
+        }
         if (cur_fn_->return_type == mod_.pool.void_type) {
             deinit_body_strings();
             b_.CreateRetVoid();
@@ -7552,7 +7623,11 @@ private:
         argv.push_back(state_);
         size_t k = 0;
         for (Index a : ir_->region(ci.args)) {
-            if (is_string_type(f.param_types[k])) {
+            if (contains_struct(f.param_types[k])) {
+                // An aggregate actual passes its storage pointer (the frontend
+                // emitted it as an lvalue); the callee copies it in.
+                argv.push_back(agg_slot_ptr(lvalue_of(a)));
+            } else if (is_string_type(f.param_types[k])) {
                 argv.push_back(str_of(a));
             } else {
                 Plane pl = value_of(a);
@@ -7561,6 +7636,21 @@ private:
                 argv.push_back(pl.z);
             }
             ++k;
+        }
+        if (contains_struct(f.return_type)) {
+            // Safe-temp aggregate return: the callee memcpies its result into a
+            // caller stack temp we pass as the trailing out-param; the call result
+            // is that temp lvalue (the frontend copies it into the target).
+            auto*        st  = agg_storage_ty(f.return_type);
+            llvm::Value* tmp = b_.CreateAlloca(st, nullptr, "call.agg.ret");
+            argv.push_back(tmp);
+            b_.CreateCall(cf->getFunctionType(), cf, argv);
+            LValue lv{};
+            lv.base    = tmp;
+            lv.root_ty = st;
+            lv.is_agg  = true;
+            set_lvalue(i, lv);
+            return;
         }
         if (is_string_type(f.return_type)) {
             // The callee assigns the result into this call's temp handle (the

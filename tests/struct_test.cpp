@@ -683,18 +683,125 @@ TEST_CASE("whole two-dimensional plain array copy") {
     )") == "0a 0b 0c 0d\n");
 }
 
-TEST_CASE("whole unpacked struct as a by-value rvalue is guarded") {
-    // Passing a whole unpacked struct by value (here a function argument) has no
-    // flat value to load and no by-value struct ABI yet (Stage 2).
+TEST_CASE("unpacked struct passed by value to a function") {
+    // The actual passes by pointer; the callee copies it into its frame, so a
+    // mutation of the formal does not touch the caller (LRM 13.5.1 copy-in).
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; logic [7:0] b; } s_t;
+            s_t x;
+            int s, mret;
+            function automatic int sum(s_t v); return v.a + v.b; endfunction
+            function automatic int mutate(s_t v); v.a = 999; return v.a; endfunction
+            initial begin
+                x.a = 5; x.b = 8'd7;
+                s = sum(x);
+                mret = mutate(x);
+                $display("sum=%0d mret=%0d xa=%0d", s, mret, x.a);
+            end
+        endmodule
+    )") == "sum=12 mret=999 xa=5\n");
+}
+
+TEST_CASE("unpacked struct returned by value from a function") {
+    // The callee writes the result into a caller-provided temp; the assignment
+    // copies the temp into the target.
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; logic [7:0] b; } s_t;
+            s_t q;
+            function automatic s_t mk(int a, logic [7:0] b);
+                s_t r; r.a = a; r.b = b; return r;
+            endfunction
+            initial begin
+                q = mk(5, 8'd7);
+                $display("qa=%0d qb=%0d", q.a, q.b);
+            end
+        endmodule
+    )") == "qa=5 qb=7\n");
+}
+
+TEST_CASE("nested unpacked struct passed and returned by value") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; logic [7:0] b; } pair_t;
+            typedef struct { pair_t p; int c; } nest_t;
+            pair_t q;
+            nest_t z;
+            function automatic nest_t mknest(pair_t p, int c);
+                nest_t n; n.p = p; n.c = c; return n;
+            endfunction
+            initial begin
+                q.a = 5; q.b = 8'd7;
+                z = mknest(q, 42);
+                $display("%0d %0d %0d", z.p.a, z.p.b, z.c);
+            end
+        endmodule
+    )") == "5 7 42\n");
+}
+
+TEST_CASE("array of unpacked struct passed by value (recursive copy-in)") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; logic [7:0] b; } pair_t;
+            pair_t pa [0:1];
+            int s;
+            function automatic int sum_arr(pair_t v [0:1]);
+                v[0].a = -1;
+                return v[0].a + v[1].a + v[0].b + v[1].b;
+            endfunction
+            initial begin
+                pa[0].a = 3; pa[0].b = 8'd4;
+                pa[1].a = 5; pa[1].b = 8'd6;
+                s = sum_arr(pa);
+                $display("s=%0d pa0a=%0d", s, pa[0].a);
+            end
+        endmodule
+    )") == "s=14 pa0a=3\n");
+}
+
+TEST_CASE("unpacked struct with an array member returned by value") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int m [0:2]; int c; } arrm_t;
+            arrm_t z;
+            function automatic arrm_t mk(int base);
+                arrm_t r;
+                r.m[0] = base; r.m[1] = base+1; r.m[2] = base+2;
+                r.c = base*10;
+                return r;
+            endfunction
+            initial begin
+                z = mk(7);
+                $display("%0d %0d %0d c=%0d", z.m[0], z.m[1], z.m[2], z.c);
+            end
+        endmodule
+    )") == "7 8 9 c=70\n");
+}
+
+TEST_CASE("unpacked struct / aggregate task argument is guarded") {
+    // The task coroutine ABI does not yet marshal aggregates (functions do).
+    const LowerResult r = lower_text(R"(
+        module m;
+            typedef struct { int a; } s_t;
+            s_t x;
+            task automatic t(s_t v); $display("%0d", v.a); endtask
+            initial t(x);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("aggregate task argument") != std::string::npos);
+}
+
+TEST_CASE("whole unpacked struct as a $display rvalue is still guarded") {
+    // A general whole-struct rvalue (here a $display %p operand) has no flat
+    // value and no non-argument by-value path yet.
     const LowerResult r = lower_text(R"(
         module m;
             typedef struct { logic [7:0] a; } s_t;
             s_t x;
-            int y;
-            function int f(s_t s); return 1; endfunction
-            initial y = f(x);
+            initial $display("%p", x);
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("unpacked struct as a whole-value rvalue") != std::string::npos);
 }

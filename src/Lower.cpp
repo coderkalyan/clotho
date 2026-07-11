@@ -873,11 +873,25 @@ private:
             b.binary(tag, lhs, lower_expr(rhs, b), l);
             return;
         }
-        // Aggregate RHS: another struct/array lvalue.
+        // Aggregate RHS: another struct/array lvalue, or an aggregate-returning
+        // call (the callee writes into a caller temp — the Call's lvalue — which
+        // this copies into the target).
         const Expression& src = unwrap_conversion(rhs);
+        if (src.kind == ExpressionKind::Call) {
+            const std::optional<ir::Index> cv = lower_user_call(src.as<CallExpression>(), b);
+            if (!cv) {
+                fail("aggregate assignment from a void call");
+            }
+            if (tag == ir::Inst::Tag::Store && is_string_free(type)) {
+                b.agg_copy(lhs, *cv, type, l);
+            } else {
+                emit_agg_copy(lhs, *cv, type, tag, b, l);
+            }
+            return;
+        }
         if (!is_struct_lvalue_shape(src)) {
-            fail("unsupported unpacked struct rvalue (only '{...} patterns and struct "
-                 "variables are supported)");
+            fail("unsupported unpacked struct rvalue (only '{...} patterns, struct "
+                 "variables, and function results are supported)");
         }
         const ir::Index src_lv = lower_lvalue(src, b);
         // A blocking copy of a string-free aggregate is a single memcpy of the
@@ -949,6 +963,16 @@ private:
         const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
         return t.kind != ir::Type::Kind::UnpackedArray &&
                !(t.kind == ir::Type::Kind::Struct && !t.is_packed);
+    }
+
+    // Whether an interned IR type contains an unpacked struct at any nesting depth
+    // (backed by the recursive aggregate model; passed / returned by pointer).
+    bool contains_struct_ref(ir::Ref type) const {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        if (t.kind == ir::Type::Kind::UnpackedArray) {
+            return contains_struct_ref(t.element);
+        }
+        return t.kind == ir::Type::Kind::Struct && !t.is_packed;
     }
 
     // Whether an aggregate type has no `string` (heap-owning) leaf, so a whole-
@@ -5855,6 +5879,18 @@ private:
             if (!fn_ctx_->has_ret_local) {
                 fail("return with a value in a void function");
             }
+            // An aggregate result's Ret operand is the returned object's lvalue
+            // (the backend copies its storage out through the return out-param).
+            if (contains_struct_ref(fn_ctx_->ret_type)) {
+                const Expression& src = unwrap_conversion(*r.expr);
+                if (!is_struct_lvalue_shape(src)) {
+                    // TODO: return of a `'{...}` pattern / call result — materialize
+                    // into a temp first.
+                    fail("aggregate return of a non-lvalue expression is not supported");
+                }
+                b.unary(ir::Inst::Tag::Ret, lower_lvalue(src, b), l);
+                return;
+            }
             // A string result needs no width resize (slang already converted).
             const ir::Index v = lower_expr(*r.expr, b);
             b.unary(ir::Inst::Tag::Ret,
@@ -5864,6 +5900,11 @@ private:
                     l);
         } else if (fn_ctx_->has_ret_local) {
             // `return;` in a non-void function yields the current function-var value.
+            // An aggregate yields the function var's lvalue (copied out by the backend).
+            if (contains_struct_ref(fn_ctx_->ret_type)) {
+                b.unary(ir::Inst::Tag::Ret, b.local(fn_ctx_->ret_local, fn_ctx_->ret_type, l), l);
+                return;
+            }
             const ir::Index rv = b.local(fn_ctx_->ret_local, fn_ctx_->ret_type, l);
             b.unary(ir::Inst::Tag::Ret, b.unary(ir::Inst::Tag::Load, rv, l), l);
         } else {
@@ -5989,17 +6030,34 @@ private:
         std::vector<ir::Ref> param_types;
 
         // Parameters: copy each Arg into the formal's Local at entry, so the body
-        // reads / writes the formal as ordinary frame storage.
+        // reads / writes the formal as ordinary frame storage. An aggregate formal
+        // is passed by pointer and copied in by the backend (no Arg / Store here).
         for (const FormalArgumentSymbol* fa : sub.getArguments()) {
             const ir::Ref       pty = lower_type(fa->getType());
             const ir::SourceLoc fl  = to_source_loc(fa->location);
             const auto          pos = static_cast<uint32_t>(param_types.size());
             param_types.push_back(pty);
             const uint32_t idx = fn_local(*fa);
+            if (is_aggregate(fa->getType())) {
+                if (fa->direction != slang::ast::ArgumentDirection::In) {
+                    // TODO: aggregate output / inout function arg (copy-out).
+                    fail("aggregate output / inout function argument is not supported");
+                }
+                if (!is_string_free(pty)) {
+                    // TODO: by-value copy of a string-containing aggregate (needs a
+                    // per-leaf deep copy of the storage, not a memcpy).
+                    fail("by-value pass of a string-containing aggregate is not supported");
+                }
+                continue;
+            }
             b.binary(ir::Inst::Tag::Store, b.local(idx, pty, fl), b.arg(pos, pty, fl), fl);
         }
 
         if (!is_void) {
+            if (is_aggregate(sub.returnValVar->getType()) && !is_string_free(return_type)) {
+                // TODO: by-value return of a string-containing aggregate.
+                fail("by-value return of a string-containing aggregate is not supported");
+            }
             ctx.has_ret_local = true;
             ctx.ret_type      = return_type;
             ctx.ret_local     = fn_local(*sub.returnValVar);
@@ -6008,9 +6066,13 @@ private:
         lower_stmt(sub.getBody(), b);
 
         // Fall-through return: yields the function variable (X if never assigned).
+        // An aggregate result's Ret operand is its lvalue (the backend copies its
+        // storage out through the trailing return out-param), not a loaded value.
         const ir::SourceLoc el = to_source_loc(sub.location);
         if (is_void) {
             b.unary(ir::Inst::Tag::Ret, void_ret_operand(b, el), el);
+        } else if (is_aggregate(sub.returnValVar->getType())) {
+            b.unary(ir::Inst::Tag::Ret, b.local(ctx.ret_local, ctx.ret_type, el), el);
         } else {
             const ir::Index rv = b.local(ctx.ret_local, ctx.ret_type, el);
             b.unary(ir::Inst::Tag::Ret, b.unary(ir::Inst::Tag::Load, rv, el), el);
@@ -6053,6 +6115,20 @@ private:
         args.reserve(actuals.size());
         for (size_t i = 0; i < formals.size(); ++i) {
             const ir::Ref pty = lower_type(formals[i]->getType());
+            if (contains_struct_ref(pty)) {
+                // An aggregate actual passes by pointer (its lvalue); the callee
+                // copies it in for value semantics.
+                if (!is_string_free(pty)) {
+                    fail("by-value pass of a string-containing aggregate is not supported");
+                }
+                const Expression& src = unwrap_conversion(*actuals[i]);
+                if (!is_struct_lvalue_shape(src)) {
+                    // TODO: a `'{...}` / call aggregate actual — materialize a temp.
+                    fail("aggregate argument must be a variable");
+                }
+                args.push_back(lower_lvalue(src, b));
+                continue;
+            }
             // A string actual passes as-is (no width to resize to); the callee's
             // copy-in gives value semantics.
             args.push_back(is_string_ref(pty)
@@ -6092,6 +6168,12 @@ private:
         args.reserve(formals.size());
         for (size_t i = 0; i < formals.size(); ++i) {
             const ir::Ref pty = lower_type(formals[i]->getType());
+            if (contains_struct_ref(pty)) {
+                // TODO: aggregate task argument (by-pointer copy-in, plus copy-out
+                // for output / inout). The task coroutine ABI does not yet marshal
+                // aggregates; only functions do.
+                fail("unpacked struct / aggregate task argument is not supported");
+            }
             if (formals[i]->direction == slang::ast::ArgumentDirection::In) {
                 args.push_back(is_string_ref(pty)
                                  ? lower_expr(*actuals[i], b)
