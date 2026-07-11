@@ -151,14 +151,55 @@ TEST_CASE("wait(e.triggered) catches a same-step trigger") {
     CHECK(out.find("wait fired t=5") != std::string::npos);
 }
 
+// `wait(<level-expr>)` (LRM 9.4.3): block until an arbitrary condition is true,
+// re-testing on any change of the signals it reads. Verified vs iverilog.
+TEST_CASE("wait(<level-expr>) blocks until the condition holds") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic [7:0] count = 0;
+          initial forever #1 count++;
+          initial begin
+            wait(count == 8);
+            $display("reached at t=%0t", $time);
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out.find("reached at t=8") != std::string::npos);
+}
+
+// `->> e` (LRM 15.5.4) defers the wake to the NBA region: a blocking `-> e`
+// waiter wakes in the Active region and sees the pre-commit value, while a
+// nonblocking `->> e` waiter wakes after the NBA commit and sees the new value.
+// (iverilog implements neither `->>` nor `.triggered`; pinned to the LRM.)
+TEST_CASE("->> e wakes in the NBA region, after nonblocking updates") {
+    const std::string out = run_capture(R"(
+        module top;
+          event eb, en;
+          logic [7:0] q = 0;
+          initial begin
+            #5;
+            q <= 8'hAA;
+            -> eb;
+            ->> en;
+          end
+          initial begin @(eb); $display("blk=%02h", q); end
+          initial begin @(en); $display("nb=%02h", q); end
+          initial #10 $finish;
+        endmodule
+    )");
+    CHECK(out.find("blk=00") != std::string::npos);
+    CHECK(out.find("nb=aa") != std::string::npos);
+}
+
 // Tier-2 forms loud-fail rather than being silently mis-lowered.
-TEST_CASE("event handle / nonblocking forms are rejected") {
+TEST_CASE("event handle / delayed-trigger forms are rejected") {
     CHECK(reject("module top; event e, f; initial e = f; endmodule").find(
             "event assignment") != std::string::npos);
     CHECK(reject("module top; event e; initial e = null; endmodule").find(
             "event assignment") != std::string::npos);
-    CHECK(reject("module top; event e; initial ->> e; endmodule").find(
-            "nonblocking event trigger") != std::string::npos);
+    CHECK(reject("module top; event e; initial ->> #5 e; endmodule").find(
+            "delayed event trigger") != std::string::npos);
     CHECK(reject("module top; event e; input e; endmodule").find(
             "event") != std::string::npos);
 }
