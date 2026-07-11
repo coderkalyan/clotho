@@ -4316,7 +4316,9 @@ private:
                         auto* fn     = b_.GetInsertBlock()->getParent();
                         auto* svc    = llvm::BasicBlock::Create(ctx_, "vcd.arr.svc", fn);
                         auto* nextbb = llvm::BasicBlock::Create(ctx_, "vcd.arr.next", fn);
-                        auto* dirty  = b_.CreateCall(nba_arr_dirty_fn(), { b_.getInt32(static_cast<uint32_t>(sig)) });
+                        // Nonzero record count == the array took writes this instant
+                        // (records are not reset until nba_arr_reset below).
+                        auto* dirty  = b_.CreateCall(nba_arr_count_fn(), { b_.getInt32(arr_idx(sig)) });
                         b_.CreateCondBr(b_.CreateICmpNE(dirty, b_.getInt32(0)), svc, nextbb);
                         b_.SetInsertPoint(svc);
                         vcd_touch_array(sig);

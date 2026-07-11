@@ -348,8 +348,13 @@ TEST_CASE("vcd: high-activity trace stays ordered through the writer thread") {
         }
         ++i;
     }
-    CHECK(times == 2000);                       // one instant per tick, 0..1999
-    CHECK(contains(body, "b11111001111 !"));    // a == 1999 at the last instant
+    // One instant per tick 0..2000: the always block fires at t=2000 (a -> 2000)
+    // before $finish, and that final value is dumped at #2000 — matches iverilog 13
+    // (both emit 2001 markers ending b11111010000). $finish does not suppress the
+    // current instant's postponed-region dump.
+    CHECK(times == 2001);
+    CHECK(contains(body, "b11111001111 !"));    // a == 1999 at the penultimate instant
+    CHECK(contains(body, "#2000\nb11111010000 !")); // a == 2000 dumped at the finish instant
 }
 
 TEST_CASE("vcd: dirty set re-emits only signals that actually change") {
