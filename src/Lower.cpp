@@ -1040,6 +1040,18 @@ private:
         b.binary(tag, lhs, b.unary(ir::Inst::Tag::Load, rhs, l), l);
     }
 
+    // Whole-object blocking copy of one aggregate lvalue into another, for a port
+    // connection or net-declaration continuous copy (both are string-free-fast /
+    // string-slow like a blocking `a = b`). A string-free aggregate is one memcpy
+    // (AggCopy); a string leaf owns a heap buffer, so it copies per-leaf.
+    void emit_port_agg_copy(ir::Index dst, ir::Index src, ir::Ref ty, ir::Builder& b, ir::SourceLoc l) {
+        if (is_string_free(ty)) {
+            b.agg_copy(dst, src, ty, l);
+        } else {
+            emit_agg_copy(dst, src, ty, ir::Inst::Tag::Store, b, l);
+        }
+    }
+
     // Whether an expression is a whole unpacked-array lvalue (a named array, or a
     // member / element that is itself a whole array) — the source of a whole-array
     // memcpy copy, as opposed to a slice / element / pattern.
@@ -1785,10 +1797,16 @@ private:
         }
         if (is_aggregate(ns.getType())) {
             // TODO: continuous assignment to a whole unpacked struct net — the
-            // field-wise decomposition would need per-member continuous processes
-            // with per-member sensitivity. Member-level `assign n.f = ...` (a
-            // ContinuousAssignSymbol) is unaffected.
-            fail("continuous assignment to a whole unpacked struct net is not supported");
+            // A whole unpacked-struct / aggregate net initializer is a whole-object
+            // continuous copy (one process on the source's sensitivity), the same
+            // as a bare `assign n = ...` on a struct.
+            record_net_driver_range(ns, 0, UINT32_MAX);
+            ir::Builder         ab(module_.pool);
+            const ir::SourceLoc al = loc(*init);
+            emit_agg_store(value_lvalue(ns, ab, al), lower_type(ns.getType()), *init,
+                           ir::Inst::Tag::Store, ab, al);
+            add_continuous_process(continuous_events(*init), to_source_loc(ns.location), ab);
+            return;
         }
         record_net_driver_range(ns, 0, UINT32_MAX);
         ir::Builder         b(module_.pool);
@@ -2201,10 +2219,19 @@ private:
                 const AssignmentExpression& a = expr->as<AssignmentExpression>();
                 // The connection is a continuous driver of the parent-side net.
                 record_net_driver(a.left());
-                const ir::Ref   ty  = lower_type(*a.left().type);
-                const ir::Index val = b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l);
-                b.binary(ir::Inst::Tag::Store, lower_lvalue(a.left(), b),
-                         coerce(val, *a.right().type, ty, b, l), l);
+                if (is_aggregate(*a.left().type)) {
+                    // A whole unpacked-struct / aggregate port: the copy is a
+                    // per-leaf (or memcpy) whole-object copy, not a scalar store.
+                    // Port types are equivalent (LRM 23.3.3), so both sides share
+                    // the recursive storage layout.
+                    emit_port_agg_copy(lower_lvalue(a.left(), b), b.signal(child_sig, l),
+                                       lower_type(*a.left().type), b, l);
+                } else {
+                    const ir::Ref   ty  = lower_type(*a.left().type);
+                    const ir::Index val = b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l);
+                    b.binary(ir::Inst::Tag::Store, lower_lvalue(a.left(), b),
+                             coerce(val, *a.right().type, ty, b, l), l);
+                }
                 sens.push_back(ir::WaitEvent{ .signal = child_sig, .edge = ir::Edge::Any });
             } else {
                 // Input: drive the child net from the source rvalue, resized to the
@@ -2212,8 +2239,20 @@ private:
                 // driver of the whole child-side net.
                 record_net_driver_range(p.internalSymbol->as<ValueSymbol>(), 0, UINT32_MAX);
                 const ir::Ref ty = lower_type(p.internalSymbol->as<ValueSymbol>().getType());
-                b.binary(ir::Inst::Tag::Store, b.signal(child_sig, l),
-                         coerce(lower_expr(*expr, b), *expr->type, ty, b, l), l);
+                if (is_aggregate(p.internalSymbol->as<ValueSymbol>().getType())) {
+                    // A whole unpacked-struct / aggregate input port: whole-object
+                    // copy of the source into the child net.
+                    const Expression& src = unwrap_conversion(*expr);
+                    if (!is_struct_lvalue_shape(src)) {
+                        // TODO: an aggregate port driven by a `'{...}` pattern / call
+                        // (needs a materialized temp, like an aggregate call actual).
+                        fail("aggregate port connection must be a variable");
+                    }
+                    emit_port_agg_copy(b.signal(child_sig, l), lower_lvalue(src, b), ty, b, l);
+                } else {
+                    b.binary(ir::Inst::Tag::Store, b.signal(child_sig, l),
+                             coerce(lower_expr(*expr, b), *expr->type, ty, b, l), l);
+                }
                 collect_expr_reads(*expr, sens);
             }
             // A port connection is a continuous copy: evaluate at time zero so the
