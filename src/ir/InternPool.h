@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <limits>
 #include <span>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -86,20 +87,50 @@ struct Type {
         // and runtime storage is an opaque rt_string handle, so every consumer
         // must branch on the kind before using layout facts.
         String,
+        // struct / union (LRM §7.2 / §7.3), declaration-order member list in the
+        // pool's field-table side array (see `fields_id` / `struct_fields`).
+        // Packed: a single bit-vector value (LRM 7.2.1) — `element`/`left`/
+        // `right` describe it exactly like PackedArray, so it shares layout()'s
+        // PackedArray math. Unpacked: a heterogeneous aggregate with no
+        // plane-packed value representation (mirrors String's width-0 sentinel);
+        // the backend owns its own storage layout for it.
+        Struct,
     };
 
     // Discriminant for this type.
     Kind kind = Kind::Void;
-    // Signedness, for Logic / Bit / PackedArray.
+    // Signedness, for Logic / Bit / PackedArray, and packed Struct.
     bool is_signed = false;
-    // Element type, for PackedArray / UnpackedArray.
+    // Kind::Struct only: true for a packed struct/union (bit-vector value
+    // semantics), false for unpacked (aggregate storage).
+    bool is_packed = false;
+    // Element type, for PackedArray / UnpackedArray, and packed Struct (the
+    // scalar - logic or bit - whose domain the whole packed value shares).
     Ref element = Ref::Invalid;
-    // Declared most-significant bound [left:right], for array kinds.
+    // Declared most-significant bound [left:right], for array kinds and packed
+    // Struct (width - 1, mirroring PackedArray's convention).
     uint32_t left = 0;
-    // Declared least-significant bound [left:right], for array kinds.
+    // Declared least-significant bound [left:right], for array kinds and packed
+    // Struct (always 0).
     uint32_t right = 0;
+    // Kind::Struct only: index into the pool's struct field-table side array.
+    uint32_t fields_id = 0;
 
     bool operator==(const Type&) const = default;
+};
+
+// One declared member of a struct/union type, in declaration order.
+struct Field {
+    // Declared member name (LRM 7.2.1 / 7.3: struct/union members are always
+    // named).
+    std::string name;
+    // Field's own interned type.
+    Ref type = Ref::Invalid;
+    // Bit offset from the LSB (packed only; LRM 7.2.1 - first declared member
+    // is the most-significant). Unused (0) for an unpacked member — those are
+    // addressed by declaration index (this entry's position in the field list)
+    // instead.
+    uint32_t bit_offset = 0;
 };
 
 // An interned value, in the canonical plane-packed format shared with runtime
@@ -142,11 +173,13 @@ struct ankerl::unordered_dense::hash<clotho::ir::Type> {
     using is_avalanching = void;
 
     auto operator()(const clotho::ir::Type& t) const noexcept -> uint64_t {
-        const std::array<uint32_t, 4> words{
-            (static_cast<uint32_t>(t.kind) << 1) | static_cast<uint32_t>(t.is_signed),
+        const std::array<uint32_t, 5> words{
+            (static_cast<uint32_t>(t.kind) << 2) | (static_cast<uint32_t>(t.is_signed) << 1) |
+              static_cast<uint32_t>(t.is_packed),
             static_cast<uint32_t>(t.element),
             t.left,
             t.right,
+            t.fields_id,
         };
         return detail::wyhash::hash(words.data(), sizeof(words));
     }
@@ -248,6 +281,15 @@ public:
     // Packed layout (domain / width / size) of a type.
     Layout layout(Ref type) const;
 
+    // Intern a struct/union's declaration-order field list, returning the id a
+    // Type::Kind::Struct stores in `fields_id`. Not deduplicated against
+    // existing entries (each struct/union AST symbol lowers its own field list
+    // at most once — the caller is expected to cache by symbol, as
+    // Lower.cpp's lower_type does).
+    uint32_t intern_struct_fields(std::vector<Field> fields);
+    // Declared member list of a Kind::Struct type, in declaration order.
+    std::span<const Field> struct_fields(uint32_t fields_id) const;
+
 private:
     // Transparent functors: a stored u32 index and an ItemView probe both fold
     // into the same view, so hashing / equality have one implementation and a
@@ -286,6 +328,9 @@ private:
     std::vector<Item> items_;
     // Canonical bytes of spilled (wide) values.
     std::vector<uint8_t> value_bytes_;
+    // Struct/union field-table storage; a Kind::Struct type's `fields_id`
+    // indexes here.
+    std::vector<std::vector<Field>> struct_fields_;
     // Dedup index: u32 handles into items_, hashed / compared via the store.
     ankerl::unordered_dense::set<uint32_t, Hash, Eq> set_;
 };

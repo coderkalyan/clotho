@@ -157,6 +157,32 @@ struct ElemSelect {
     Ref array_type;
 };
 
+// Extra payload for `agg_copy`: a whole-object blocking copy of one aggregate
+// lvalue into another (both of `type`). The op is the destination lvalue; `src`
+// the source lvalue. Lowered to a single llvm.memcpy of the aggregate storage —
+// valid only when the aggregate has no string (heap-owning) leaf, which the
+// frontend checks before emitting it.
+struct AggCopyInfo {
+    // Source aggregate lvalue.
+    Index src;
+    // The aggregate type (gives the storage size to copy).
+    Ref type;
+};
+
+// Extra payload for `member_select`: a member of an unpacked struct (the base is
+// the op). Unlike a packed struct member (a constant part-select over a flat
+// bit-vector), an unpacked struct is an aggregate whose members have their own
+// storage, so a member is addressed by its declaration-order field index into
+// the struct's backing StructType, not a bit offset. `field_index` is the
+// member's position in declaration order; `struct_type` is the interned
+// Kind::Struct (is_packed=false) type, giving the member layout.
+struct MemberSelect {
+    // Declaration-order field index of the selected member.
+    uint32_t field_index;
+    // The unpacked Kind::Struct type being accessed.
+    Ref struct_type;
+};
+
 // Extra payload for `read_mem`: a $readmemh / $readmemb load of a file into an
 // unpacked-array memory. The filename value is the instruction's `op`: either a
 // packed-ASCII vector (the backend spills its must-bits to a byte buffer) or a
@@ -598,6 +624,8 @@ static_assert(ExtraPayload<Select>);
 static_assert(ExtraPayload<PartSelect>);
 static_assert(ExtraPayload<DynPartSelect>);
 static_assert(ExtraPayload<ElemSelect>);
+static_assert(ExtraPayload<MemberSelect>);
+static_assert(ExtraPayload<AggCopyInfo>);
 static_assert(ExtraPayload<ReadMemInfo>);
 static_assert(ExtraPayload<Regions>);
 static_assert(ExtraPayload<LoopInfo>);
@@ -656,6 +684,11 @@ struct Inst {
         // storage size, not one bit, and the index is normalized against the
         // array's declared bounds.
         ElemSelect,
+        // Unpacked-struct member select base.field (payload: op_extra ->
+        // MemberSelect). The base is an unpacked struct aggregate; the member is
+        // addressed by declaration-order field index into the backing StructType,
+        // not a bit offset (a packed struct member is a PartSelect instead).
+        MemberSelect,
 
         // -- State access --
         // Read the current value of an lvalue (payload: unary).
@@ -664,6 +697,10 @@ struct Inst {
         Store,
         // Nonblocking assignment, lhs <= rhs (payload: binary).
         StoreNb,
+        // Whole-object blocking copy of one aggregate into another (payload:
+        // op_extra -> AggCopyInfo). Lowered to llvm.memcpy of the storage; the
+        // frontend emits it only for a string-free aggregate.
+        AggCopy,
 
         // -- Arithmetic (payload: binary) --
         Add,

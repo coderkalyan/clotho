@@ -154,9 +154,30 @@ Layout InternPool::layout(Ref type) const {
             const uint32_t count = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
             return { el.domain, el.width, count * el.byte_count };
         }
+        case Type::Kind::Struct: {
+            if (!t.is_packed) {
+                // Aggregate storage, no plane-packed value (mirrors String's
+                // width-0 sentinel) — the backend builds its own layout.
+                return { Domain::Two, 0, 0 };
+            }
+            const Layout   el    = layout(t.element);
+            const uint32_t width = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
+            const auto     bytes = static_cast<uint32_t>(static_cast<uint8_t>(el.domain)) * plane_bytes(width);
+            return { el.domain, width, bytes };
+        }
     }
 
     return { Domain::Two, 0, 0 };
+}
+
+uint32_t InternPool::intern_struct_fields(std::vector<Field> fields) {
+    struct_fields_.push_back(std::move(fields));
+
+    return static_cast<uint32_t>(struct_fields_.size() - 1);
+}
+
+std::span<const Field> InternPool::struct_fields(uint32_t fields_id) const {
+    return struct_fields_[fields_id];
 }
 
 } // namespace clotho::ir

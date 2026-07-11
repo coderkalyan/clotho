@@ -539,12 +539,26 @@ TEST_CASE("an inout port connection fails loudly") {
     CHECK(r.diagnostics.find("inout") != std::string::npos);
 }
 
-TEST_CASE("whole unpacked array assignment fails loudly") {
+TEST_CASE("whole unpacked array blocking assignment lowers (memcpy)") {
+    // A blocking copy of a string-free unpacked array is a single memcpy; a
+    // nonblocking copy / pattern / string array is still guarded.
     const LowerResult r = lower_text(R"(
         module top;
             logic [7:0] a [0:3];
             logic [7:0] b [0:3];
             initial a = b;
+        endmodule
+    )");
+    CHECK(r.ok);
+}
+
+TEST_CASE("nonblocking whole unpacked array assignment fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            logic [7:0] a [0:3];
+            logic [7:0] b [0:3];
+            logic clk;
+            always @(posedge clk) a <= b;
         endmodule
     )");
     CHECK_FALSE(r.ok);
@@ -571,6 +585,59 @@ TEST_CASE("a dynamic array fails loudly") {
     )");
     CHECK_FALSE(r.ok);
     CHECK(r.diagnostics.find("dynamic / queue / associative") != std::string::npos);
+}
+
+TEST_CASE("a packed struct declares and carries its field table") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            typedef struct packed {
+                logic [3:0] a;
+                bit [7:0] b;
+            } s_t;
+            s_t x;
+            s_t y;
+            initial y = x;
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE(r.module != nullptr);
+
+    const ir::Module& m = *r.module;
+    REQUIRE(m.signals().size() == 2);
+    const ir::Ref ty = m.signals()[0].type;
+
+    const ir::Layout lay = m.pool.layout(ty);
+    // a (4-bit logic) makes the whole struct four-state; total width 4 + 8.
+    CHECK(lay.domain == ir::Domain::Four);
+    CHECK(lay.width == 12);
+
+    const ir::Type& t = std::get<ir::Type>(m.pool.get(ty));
+    REQUIRE(t.kind == ir::Type::Kind::Struct);
+    CHECK(t.is_packed);
+    const auto fields = m.pool.struct_fields(t.fields_id);
+    REQUIRE(fields.size() == 2);
+    CHECK(fields[0].name == "a");
+    CHECK(fields[1].name == "b");
+    // LRM 7.2.1: the first declared member is the most significant, so `a`
+    // (the second field, width 8) sits above `b` at the LSB.
+    CHECK(fields[0].bit_offset == 8);
+    CHECK(fields[1].bit_offset == 0);
+}
+
+TEST_CASE("an unpacked struct with a real member lowers (recursive aggregate)") {
+    // The recursive aggregate model backs a real / string / array / nested-struct
+    // member; only an unpacked union member stays guarded.
+    const LowerResult r = lower_text(R"(
+        module top;
+            typedef struct {
+                logic [3:0] a;
+                real        b;
+            } s_t;
+            s_t x;
+            initial begin x.a = 4'h1; x.b = 2.5; end
+        endmodule
+    )");
+    CHECK(r.ok);
 }
 
 TEST_CASE("nested instances chain their hierarchical prefixes") {

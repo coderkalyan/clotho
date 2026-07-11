@@ -1,0 +1,807 @@
+#include <doctest/doctest.h>
+
+#include <cstdio>
+#include <string>
+#include <string_view>
+
+#include <unistd.h>
+
+#include "Lower.h"
+#include "ir/Jit.h"
+
+using namespace clotho;
+
+// Packed struct member access (LRM 7.2.1). Field lowering itself (the IR
+// Type::Kind::Struct, its field table, and the frontend-only guards) is
+// covered in ir_test.cpp / lower_test.cpp; these are end-to-end JIT-run tests
+// since the one real bug found here (a field narrower than the struct's own
+// forced-4-state domain producing a mismatched LLVM type) only surfaced at
+// LLVM verification, not in the IR.
+
+namespace {
+
+// JIT-run a module and capture stdout (mirrors display_test.cpp).
+std::string run_capture(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE(r.module != nullptr);
+
+    std::FILE* tmp = std::tmpfile();
+    REQUIRE(tmp != nullptr);
+
+    std::fflush(stdout);
+    const int saved = dup(fileno(stdout));
+    dup2(fileno(tmp), fileno(stdout));
+
+    ir::run_jit(*r.module);
+
+    std::fflush(stdout);
+    dup2(saved, fileno(stdout));
+    close(saved);
+
+    std::rewind(tmp);
+    std::string out;
+    char        buf[256];
+    size_t      n;
+    while ((n = std::fread(buf, 1, sizeof(buf), tmp)) > 0) {
+        out.append(buf, n);
+    }
+    std::fclose(tmp);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("blocking read and write of packed struct fields") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct packed {
+                logic [3:0] a;
+                bit [7:0] b;
+            } s_t;
+            s_t x;
+            initial begin
+                x.b = 8'hAB;
+                x.a = 4'h5;
+                $display("a=%h b=%h whole=%h", x.a, x.b, x);
+            end
+        endmodule
+    )") == "a=5 b=ab whole=5ab\n");
+}
+
+TEST_CASE("nonblocking write to a struct field") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct packed {
+                logic [3:0] a;
+                bit [7:0] b;
+            } s_t;
+            s_t x;
+            logic clk;
+            initial begin
+                clk = 0;
+                x.b = 8'h00;
+                #1 clk = 1;
+                #1; // let the NBA region commit before reading
+                $display("b=%h", x.b);
+            end
+            always @(posedge clk) x.b <= x.b + 8'd1;
+        endmodule
+    )") == "b=01\n");
+}
+
+// Regression: field `b` is 2-state (`bit`) but sibling field `a` is 4-state
+// (`logic`), so the whole struct's physical storage is forced 4-state (LRM
+// 6.11.2). The backend's PartSelect type inference inherits the base
+// signal's domain (correct for a domain-uniform vector/array, the only prior
+// case), so a bare struct-field read was 4-state-shaped even though `b`'s
+// declared type is 2-state — invisible until the value fed an arithmetic op
+// that trusts the declared type, which crashed LLVM verification (mismatched
+// operand widths). Fixed by resizing a MemberAccess read to the field's own
+// declared type before use.
+TEST_CASE("arithmetic on a 2-state field of an otherwise 4-state struct") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct packed {
+                logic [3:0] a;
+                bit [7:0] b;
+            } s_t;
+            s_t x;
+            initial begin
+                x.b = 8'd1;
+                x.b = x.b + 8'd1;
+                $display("b=%h", x.b);
+            end
+        endmodule
+    )") == "b=02\n");
+}
+
+// Same regression class, reached through a bit/range-select stacked on top
+// of a narrow-domain field (`x.b[7:4]`) rather than the bare field read.
+// SV can't chain a second bit/range-select onto that result (only member
+// access dots further), so this and the MemberAccess case above are the only
+// two points a struct field's value can escape into further computation.
+TEST_CASE("arithmetic on a range-select of a 2-state struct field") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct packed {
+                logic [3:0] a;
+                bit [7:0] b;
+            } s_t;
+            s_t x;
+            initial begin
+                x.b = 8'hF0;
+                $display("slice=%h add=%h", x.b[7:4], x.b[7:4] + 4'h1);
+            end
+        endmodule
+    )") == "slice=f add=0\n");
+}
+
+TEST_CASE("compound assignment to a struct field") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct packed {
+                logic [3:0] a;
+                bit [7:0] b;
+            } s_t;
+            s_t x;
+            initial begin
+                x.b = 8'd10;
+                x.b += 8'd5;
+                $display("b=%h", x.b);
+            end
+        endmodule
+    )") == "b=0f\n");
+}
+
+TEST_CASE("nested packed struct member access") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct packed {
+                logic [1:0] suba;
+                bit [3:0] subb;
+            } inner_t;
+            typedef struct packed {
+                inner_t x;
+                logic [2:0] y;
+            } outer_t;
+            outer_t o;
+            initial begin
+                o.x.suba = 2'b10;
+                o.x.subb = 4'hC;
+                o.y = 3'b101;
+                $display("whole=%h", o);
+            end
+        endmodule
+    )") == "whole=165\n");
+}
+
+TEST_CASE("packed union member access is rejected loudly") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            typedef union packed {
+                logic [7:0] a;
+                bit [7:0] b;
+            } u_t;
+            u_t u;
+            initial u.a = 8'hAB;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("union member access is not supported") != std::string::npos);
+}
+
+TEST_CASE("blocking read and write of unpacked struct members") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct {
+                logic [7:0] a;
+                bit  [3:0]  b;
+                logic       c;
+            } s_t;
+            s_t x;
+            initial begin
+                x.a = 8'hAB;
+                x.b = 4'd5;
+                x.c = 1'b1;
+                $display("a=%h b=%h c=%b", x.a, x.b, x.c);
+            end
+        endmodule
+    )") == "a=ab b=5 c=1\n");
+}
+
+TEST_CASE("unpacked struct member power-on: 4-state X, 2-state 0") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t x;
+            initial $display("a=%h b=%h", x.a, x.b);
+        endmodule
+    )") == "a=xx b=0\n");
+}
+
+TEST_CASE("whole unpacked struct copy is field-wise") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t x, y;
+            initial begin
+                x.a = 8'h12; x.b = 4'hF;
+                y = x;
+                $display("y=%h %h", y.a, y.b);
+            end
+        endmodule
+    )") == "y=12 f\n");
+}
+
+TEST_CASE("unpacked struct assignment pattern initializes each member") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; logic c; } s_t;
+            s_t x;
+            initial begin
+                x = '{a: 8'hA5, b: 4'h3, c: 1'b1};
+                $display("%h %h %b", x.a, x.b, x.c);
+            end
+        endmodule
+    )") == "a5 3 1\n");
+}
+
+TEST_CASE("unpacked struct declaration initializer") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t x = '{a: 8'h77, b: 4'hE};
+            initial $display("%h %h", x.a, x.b);
+        endmodule
+    )") == "77 e\n");
+}
+
+TEST_CASE("unpacked struct equality is field-wise; X makes it ambiguous (LRM 11.4.5)") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t x, y, z;
+            initial begin
+                x.a = 8'h11; x.b = 4'h2;
+                y.a = 8'h11; y.b = 4'h2;
+                z.a = 8'h11; z.b = 4'h3;
+                $display("eq=%b ne=%b", x == y, x != z);
+                x.a = 8'hxx;
+                $display("xeq=%b", x == y);
+            end
+        endmodule
+    )") == "eq=1 ne=1\nxeq=x\n");
+}
+
+TEST_CASE("arithmetic on a mixed-domain unpacked struct member") {
+    // A 2-state `bit` member beside a 4-state `logic` member: the member read
+    // must carry the member's own declared domain, not the aggregate's.
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [7:0] b; } s_t;
+            s_t x;
+            initial begin
+                x.a = 8'd10;
+                x.b = 8'd20;
+                $display("sum=%0d", x.a + x.b);
+            end
+        endmodule
+    )") == "sum=30\n");
+}
+
+TEST_CASE("nested packed struct member inside an unpacked struct") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct packed { logic [3:0] hi; logic [3:0] lo; } byte_t;
+            typedef struct { byte_t p; logic [7:0] q; } s_t;
+            s_t x;
+            initial begin
+                x.p.hi = 4'hA; x.p.lo = 4'h5;
+                x.q = 8'hCD;
+                $display("p=%h q=%h", x.p, x.q);
+            end
+        endmodule
+    )") == "p=a5 q=cd\n");
+}
+
+TEST_CASE("nonblocking write to unpacked struct members, one cycle latency") {
+    // Two clock edges: member NBA reads the pre-edge value and commits after, so
+    // after edge 1 a==11 (10+1), and the comb read settles to the committed value.
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t x;
+            logic clk;
+            initial begin
+                clk = 0;
+                x.a = 8'd10; x.b = 4'd2;
+                #1 clk = 1; #1 clk = 0;
+                #1 clk = 1; #1 clk = 0; #1;
+                $display("a=%0d b=%0d", x.a, x.b);
+            end
+            always @(posedge clk) begin
+                x.a <= x.a + 8'd1;
+                x.b <= x.b + 4'd1;
+            end
+        endmodule
+    )") == "a=12 b=4\n");
+}
+
+TEST_CASE("whole unpacked struct nonblocking copy has NBA sampling") {
+    // y <= x samples x in the active region, so y trails x by one clock.
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t x, y;
+            logic clk;
+            initial begin
+                clk = 0;
+                x.a = 8'd1; x.b = 4'd0;
+                #1 clk = 1; #1 clk = 0;   // x <= 2, y <= 1 (old x)
+                #1 clk = 1; #1 clk = 0; #1;
+                $display("x=%0d y=%0d", x.a, y.a);
+            end
+            always @(posedge clk) x.a <= x.a + 8'd1;
+            always @(posedge clk) y <= x;
+        endmodule
+    )") == "x=3 y=2\n");
+}
+
+TEST_CASE("combinational reader re-evaluates after a struct-member NBA commit") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t x;
+            logic clk;
+            logic [7:0] sum;
+            always_comb sum = x.a + {4'd0, x.b};
+            always @(posedge clk) begin x.a <= 8'd20; x.b <= 4'd5; end
+            initial begin
+                clk = 0; x.a = 8'd0; x.b = 4'd0;
+                #1 clk = 1; #1;
+                $display("sum=%0d", sum);
+            end
+        endmodule
+    )") == "sum=25\n");
+}
+
+TEST_CASE("partial nonblocking write to a struct member (masked deferred record)") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; logic [7:0] b; } s_t;
+            s_t x;
+            logic clk;
+            initial begin
+                clk = 0; x.a = 8'hFF; x.b = 8'h00;
+                #1 clk = 1; #1 clk = 0; #1;
+                $display("%h %h", x.a, x.b);
+            end
+            always @(posedge clk) begin x.a[3:0] <= 4'h5; x.b[7:4] <= 4'hC; end
+        endmodule
+    )") == "f5 c0\n");
+}
+
+TEST_CASE("partial NBA preserves x in the unwritten bits of a 4-state leaf") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; } s_t;
+            s_t x;
+            logic clk;
+            initial begin
+                clk = 0; x.a = 8'hxA;
+                #1 clk = 1; #1 clk = 0; #1;
+                $display("%h", x.a);
+            end
+            always @(posedge clk) x.a[3:0] <= 4'h7;
+        endmodule
+    )") == "x7\n");
+}
+
+TEST_CASE("partial NBA through a runtime array index into a struct member") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; } s_t;
+            s_t arr [0:3];
+            logic clk; logic [1:0] idx;
+            initial begin
+                clk = 0; idx = 2'd0;
+                for (int i = 0; i < 4; i++) arr[i].a = 8'hAA;
+                idx = 2'd2; #1 clk = 1; #1 clk = 0; #1;
+                $display("%h %h", arr[2].a, arr[0].a);
+            end
+            always @(posedge clk) arr[idx].a[3:0] <= 4'h3;
+        endmodule
+    )") == "a3 aa\n");
+}
+
+TEST_CASE("array of unpacked struct: runtime-indexed member access") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t arr [0:3];
+            initial begin
+                for (int i = 0; i < 4; i++) begin
+                    arr[i].a = i[7:0];
+                    arr[i].b = i[3:0] + 4'd1;
+                end
+                $display("%h %h %h %h", arr[0].a, arr[2].a, arr[2].b, arr[3].b);
+            end
+        endmodule
+    )") == "00 02 3 4\n");
+}
+
+TEST_CASE("nested unpacked struct member access") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } inner_t;
+            typedef struct { inner_t inr; logic [7:0] tag; } outer_t;
+            outer_t o;
+            initial begin
+                o.inr.a = 8'h33; o.inr.b = 4'hC; o.tag = 8'h99;
+                $display("%h %h %h", o.inr.a, o.inr.b, o.tag);
+            end
+        endmodule
+    )") == "33 c 99\n");
+}
+
+TEST_CASE("unpacked struct with an unpacked-array member") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] mem [0:2]; logic v; } s_t;
+            s_t w;
+            initial begin
+                w.mem[0] = 8'h11; w.mem[1] = 8'h77; w.mem[2] = 8'h22; w.v = 1'b1;
+                $display("%h %h %h %b", w.mem[0], w.mem[1], w.mem[2], w.v);
+            end
+        endmodule
+    )") == "11 77 22 1\n");
+}
+
+TEST_CASE("array of unpacked struct power-on: 4-state members are X") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t arr [0:1];
+            initial $display("%h %h", arr[1].a, arr[1].b);
+        endmodule
+    )") == "xx 0\n");
+}
+
+TEST_CASE("two-dimensional array of unpacked struct") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t g [0:1][0:1];
+            initial begin
+                g[0][1].a = 8'hA1; g[1][0].b = 4'h7;
+                $display("%h %h", g[0][1].a, g[1][0].b);
+            end
+        endmodule
+    )") == "a1 7\n");
+}
+
+TEST_CASE("nested struct member nonblocking assignment") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; } inner_t;
+            typedef struct { inner_t inr; logic [7:0] tag; } outer_t;
+            outer_t o;
+            logic clk;
+            initial begin
+                clk = 0; o.inr.a = 8'd5; o.tag = 8'd9;
+                #1 clk = 1; #1 clk = 0; #1;
+                $display("a=%0d tag=%0d", o.inr.a, o.tag);
+            end
+            always @(posedge clk) begin o.inr.a <= o.inr.a + 8'd1; o.tag <= 8'd42; end
+        endmodule
+    )") == "a=6 tag=42\n");
+}
+
+TEST_CASE("combinational reader wakes on a struct-array-member NBA commit") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] mem [0:3]; logic [7:0] cnt; } s_t;
+            s_t w;
+            logic clk;
+            initial begin
+                clk = 0; w.cnt = 8'd0; w.mem[2] = 8'h55;
+                #1 clk = 1; #1 clk = 0; #1;
+                $display("%h %0d", w.mem[2], w.cnt);
+            end
+            always @(posedge clk) w.cnt <= w.cnt + 8'd1;
+        endmodule
+    )") == "55 1\n");
+}
+
+TEST_CASE("whole-object copy of a nested struct is per-leaf") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } inner_t;
+            typedef struct { inner_t inr; logic [7:0] tag; } outer_t;
+            outer_t x, y;
+            initial begin
+                x.inr.a = 8'hAA; x.inr.b = 4'h5; x.tag = 8'h33;
+                y = x;
+                $display("%h %h %h", y.inr.a, y.inr.b, y.tag);
+            end
+        endmodule
+    )") == "aa 5 33\n");
+}
+
+TEST_CASE("nested unpacked struct equality (x-propagating)") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; } inner_t;
+            typedef struct { inner_t i; logic [3:0] t; } outer_t;
+            outer_t x, y;
+            initial begin
+                x.i.a = 8'h5; x.t = 4'h3; y.i.a = 8'h5; y.t = 4'h3;
+                $display("%b", x == y);
+                y.t = 4'h4;
+                $display("%b", x == y);
+            end
+        endmodule
+    )") == "1\n0\n");
+}
+
+TEST_CASE("runtime-indexed register file of structs (deferred NBA)") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; logic [7:0] b; } s_t;
+            s_t rf [0:3];
+            logic clk; logic [1:0] wa;
+            initial begin
+                clk = 0; wa = 2'd0;
+                for (int i = 0; i < 4; i++) begin rf[i].a = 8'd0; rf[i].b = 8'd0; end
+                wa = 2'd2; #1 clk = 1; #1 clk = 0;
+                wa = 2'd1; #1 clk = 1; #1 clk = 0; #1;
+                $display("%0d %0d %0d %0d", rf[0].a, rf[1].a, rf[2].a, rf[3].a);
+            end
+            always @(posedge clk) rf[wa].a <= rf[wa].a + 8'd7;
+        endmodule
+    )") == "0 7 7 0\n");
+}
+
+TEST_CASE("whole struct-array element nonblocking assignment") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t arr [0:2]; s_t src;
+            logic clk;
+            initial begin
+                clk = 0; src.a = 8'hDD; src.b = 4'h6; arr[1].a = 8'h11; arr[1].b = 4'h1;
+                #1 clk = 1; #1 clk = 0; #1;
+                $display("%h %h", arr[1].a, arr[1].b);
+            end
+            always @(posedge clk) arr[1] <= src;
+        endmodule
+    )") == "dd 6\n");
+}
+
+TEST_CASE("runtime-indexed nonblocking write into a struct array member") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] mem [0:3]; logic [7:0] tag; } s_t;
+            s_t w;
+            logic clk; logic [1:0] idx;
+            initial begin
+                clk = 0; idx = 2'd0;
+                for (int i = 0; i < 4; i++) w.mem[i] = 8'd0;
+                w.tag = 8'd9;
+                idx = 2'd3; #1 clk = 1; #1 clk = 0; #1;
+                $display("%0d %0d %0d", w.mem[3], w.mem[0], w.tag);
+            end
+            always @(posedge clk) w.mem[idx] <= 8'd88;
+        endmodule
+    )") == "88 0 9\n");
+}
+
+// --- Whole-object blocking copy via a single llvm.memcpy (string-free
+// aggregate); the per-leaf path is kept only for string-containing ones. ---
+
+TEST_CASE("whole-object copy of a struct with an array member (memcpy)") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] mem [0:3]; logic [7:0] v; } s_t;
+            s_t x, y;
+            initial begin
+                for (int i = 0; i < 4; i++) x.mem[i] = i[7:0] + 8'd10;
+                x.v = 8'h99;
+                y = x;
+                $display("%h %h %h", y.mem[0], y.mem[3], y.v);
+            end
+        endmodule
+    )") == "0a 0d 99\n");
+}
+
+TEST_CASE("whole array-of-struct copy (memcpy)") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t p [0:2], q [0:2];
+            initial begin
+                for (int i = 0; i < 3; i++) begin p[i].a = i[7:0] + 8'd1; p[i].b = i[3:0]; end
+                q = p;
+                $display("%h %h %h", q[0].a, q[2].a, q[1].b);
+            end
+        endmodule
+    )") == "01 03 1\n");
+}
+
+TEST_CASE("copy a struct-array element into a struct variable") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
+            s_t arr [0:3]; s_t y;
+            initial begin
+                for (int i = 0; i < 4; i++) begin arr[i].a = i[7:0] + 8'd5; arr[i].b = i[3:0]; end
+                y = arr[2];
+                $display("%h %h", y.a, y.b);
+            end
+        endmodule
+    )") == "07 2\n");
+}
+
+TEST_CASE("nonblocking whole-object copy over an array member is guarded") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            typedef struct { logic [7:0] mem [0:3]; logic v; } s_t;
+            s_t x, y;
+            logic clk;
+            always @(posedge clk) y <= x;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("nonblocking whole-object copy of an unpacked-array") != std::string::npos);
+}
+
+TEST_CASE("whole plain unpacked array copy is an independent memcpy") {
+    CHECK(run_capture(R"(
+        module m;
+            logic [7:0] a [0:3], b [0:3];
+            initial begin
+                for (int i = 0; i < 4; i++) a[i] = i[7:0] + 8'd20;
+                b = a;
+                a[1] = 8'hFF;
+                $display("%h %h %h %h", b[0], b[1], b[3], a[1]);
+            end
+        endmodule
+    )") == "14 15 17 ff\n");
+}
+
+TEST_CASE("whole two-dimensional plain array copy") {
+    CHECK(run_capture(R"(
+        module m;
+            logic [7:0] a [0:1][0:1], b [0:1][0:1];
+            initial begin
+                a[0][0] = 8'hA; a[0][1] = 8'hB; a[1][0] = 8'hC; a[1][1] = 8'hD;
+                b = a;
+                $display("%h %h %h %h", b[0][0], b[0][1], b[1][0], b[1][1]);
+            end
+        endmodule
+    )") == "0a 0b 0c 0d\n");
+}
+
+TEST_CASE("unpacked struct passed by value to a function") {
+    // The actual passes by pointer; the callee copies it into its frame, so a
+    // mutation of the formal does not touch the caller (LRM 13.5.1 copy-in).
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; logic [7:0] b; } s_t;
+            s_t x;
+            int s, mret;
+            function automatic int sum(s_t v); return v.a + v.b; endfunction
+            function automatic int mutate(s_t v); v.a = 999; return v.a; endfunction
+            initial begin
+                x.a = 5; x.b = 8'd7;
+                s = sum(x);
+                mret = mutate(x);
+                $display("sum=%0d mret=%0d xa=%0d", s, mret, x.a);
+            end
+        endmodule
+    )") == "sum=12 mret=999 xa=5\n");
+}
+
+TEST_CASE("unpacked struct returned by value from a function") {
+    // The callee writes the result into a caller-provided temp; the assignment
+    // copies the temp into the target.
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; logic [7:0] b; } s_t;
+            s_t q;
+            function automatic s_t mk(int a, logic [7:0] b);
+                s_t r; r.a = a; r.b = b; return r;
+            endfunction
+            initial begin
+                q = mk(5, 8'd7);
+                $display("qa=%0d qb=%0d", q.a, q.b);
+            end
+        endmodule
+    )") == "qa=5 qb=7\n");
+}
+
+TEST_CASE("nested unpacked struct passed and returned by value") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; logic [7:0] b; } pair_t;
+            typedef struct { pair_t p; int c; } nest_t;
+            pair_t q;
+            nest_t z;
+            function automatic nest_t mknest(pair_t p, int c);
+                nest_t n; n.p = p; n.c = c; return n;
+            endfunction
+            initial begin
+                q.a = 5; q.b = 8'd7;
+                z = mknest(q, 42);
+                $display("%0d %0d %0d", z.p.a, z.p.b, z.c);
+            end
+        endmodule
+    )") == "5 7 42\n");
+}
+
+TEST_CASE("array of unpacked struct passed by value (recursive copy-in)") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; logic [7:0] b; } pair_t;
+            pair_t pa [0:1];
+            int s;
+            function automatic int sum_arr(pair_t v [0:1]);
+                v[0].a = -1;
+                return v[0].a + v[1].a + v[0].b + v[1].b;
+            endfunction
+            initial begin
+                pa[0].a = 3; pa[0].b = 8'd4;
+                pa[1].a = 5; pa[1].b = 8'd6;
+                s = sum_arr(pa);
+                $display("s=%0d pa0a=%0d", s, pa[0].a);
+            end
+        endmodule
+    )") == "s=14 pa0a=3\n");
+}
+
+TEST_CASE("unpacked struct with an array member returned by value") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int m [0:2]; int c; } arrm_t;
+            arrm_t z;
+            function automatic arrm_t mk(int base);
+                arrm_t r;
+                r.m[0] = base; r.m[1] = base+1; r.m[2] = base+2;
+                r.c = base*10;
+                return r;
+            endfunction
+            initial begin
+                z = mk(7);
+                $display("%0d %0d %0d c=%0d", z.m[0], z.m[1], z.m[2], z.c);
+            end
+        endmodule
+    )") == "7 8 9 c=70\n");
+}
+
+TEST_CASE("unpacked struct / aggregate task argument is guarded") {
+    // The task coroutine ABI does not yet marshal aggregates (functions do).
+    const LowerResult r = lower_text(R"(
+        module m;
+            typedef struct { int a; } s_t;
+            s_t x;
+            task automatic t(s_t v); $display("%0d", v.a); endtask
+            initial t(x);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("aggregate task argument") != std::string::npos);
+}
+
+TEST_CASE("whole unpacked struct as a $display rvalue is still guarded") {
+    // A general whole-struct rvalue (here a $display %p operand) has no flat
+    // value and no non-argument by-value path yet.
+    const LowerResult r = lower_text(R"(
+        module m;
+            typedef struct { logic [7:0] a; } s_t;
+            s_t x;
+            initial $display("%p", x);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+}

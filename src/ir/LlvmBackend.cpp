@@ -287,6 +287,48 @@ struct LValue {
     // A string target: `base` (indexed by elem_idx for an array) is the
     // rt_string handle; widths / bit_off / has_z are meaningless.
     bool is_string = false;
+    // Recursive aggregate addressing (a signal whose type contains an unpacked
+    // struct). `root_ty` is the signal's whole storage type; `agg_path` is the
+    // GEP index vector from `base` to the current sub-object (a leaf slot once a
+    // select chain resolves to a scalar/string). A struct field is a constant
+    // index, an array element a runtime index — composed uniformly, so arbitrary
+    // nesting works. `is_agg` selects this addressing in lv_field_ptr.
+    bool                      is_agg  = false;
+    llvm::Type*               root_ty = nullptr;
+    std::vector<llvm::Value*> agg_path;
+    // True once `agg_path` has reached a scalar/string leaf (leaf metadata is
+    // filled); false while the lvalue still designates an interior aggregate that
+    // a further select must descend.
+    bool agg_leaf = false;
+    // Whether the aggregate path is fully STATIC (struct fields only, no runtime
+    // array index): a static leaf commits via the block-commit shadow, a runtime
+    // one via the deferred path. `agg_field_path` records the constant field
+    // indices so the target static leaf can be matched in SignalSlot::static_leaves.
+    bool                  agg_static = true;
+    std::vector<uint32_t> agg_field_path;
+};
+
+// A scalar / string leaf of an aggregate signal reachable by a STATIC path
+// (struct fields only, never an array index), so its location is a compile-time
+// constant GEP. Used for nonblocking staging: the block-commit path can shadow
+// and commit these leaves because their addresses are known. A leaf under an
+// array dimension is not static (its element index is runtime) and takes the
+// deferred path instead, so it is not listed here.
+struct AggLeaf {
+    // Constant GEP field indices from the aggregate storage root to this leaf
+    // slot (each a struct field index; no array indices by construction).
+    std::vector<uint32_t> path;
+    llvm::StructType*     slot_ty    = nullptr;
+    uint32_t              width      = 0;
+    bool                  four_state = false;
+    bool                  has_z      = false;
+    bool                  narrow     = false;
+    bool                  is_string  = false;
+    // Shadow-struct field indices for nonblocking staging (mm plane, and z plane
+    // when has_z), assigned in build_state_layout when the aggregate is an NBA
+    // target. Unused otherwise.
+    uint32_t sh_mm_field = 0;
+    uint32_t sh_z_field  = 0;
 };
 
 // Per-signal placement in the state struct plus its cached layout facts. A
@@ -350,6 +392,29 @@ struct SignalSlot {
     // handle (`clotho.string`), has_z is false, and `nba` is never set (the
     // frontend rejects nonblocking assignment to strings).
     bool is_string = false;
+    // An aggregate signal (its type contains an unpacked struct at some nesting
+    // depth): `storage_ty` is the recursive mirror built by agg_storage_ty
+    // (nested StructType / ArrayType / leaf slots), addressed by a GEP path
+    // (LValue::agg_path) that a MemberSelect / ElemSelect chain composes. `slot_ty`
+    // is null and `width` unused (an aggregate has no flat value); whole-object
+    // ops decompose in the frontend. `static_leaves` lists the scalar/string
+    // leaves reachable by a struct-field-only (static) path, used for nonblocking
+    // staging (a leaf under an array is runtime and takes the deferred path).
+    bool                  is_agg = false;
+    std::vector<AggLeaf>  static_leaves;
+    // The signal's interned IR type (aggregate recursion needs it: emit_agg_init,
+    // the deferred-runtime-index guard). Set for every slot.
+    Ref ir_type = Ref::Invalid;
+    // An aggregate nonblocking target: static leaves are committed from an
+    // aggregate shadow (each static leaf owns a shadow slot); the block-commit
+    // BlockSig `mask` is reinterpreted as a static-leaf-set (bit k = leaf k
+    // written). Set by nba_classify; implies `nba` and `nba_block`.
+    bool nba_agg = false;
+    // Any deferred aggregate NBA site is a partial (bit/part-select) leaf write:
+    // its records carry a per-plane mask and the commit does a byte-wise masked
+    // read-modify-write instead of a memcpy (mirrors `arr_masked`). Whole-leaf
+    // writes to a masked aggregate use an all-ones mask.
+    bool agg_masked = false;
 };
 
 // One function-frame local: its `{ i(2W), iW }` slot type and width / domain.
@@ -366,6 +431,14 @@ struct FrameSlot {
     // A string local: the slot is an rt_string handle; init/deinit bracket the
     // call.
     bool is_string = false;
+    // An aggregate local (its type contains an unpacked struct): `storage_ty` is
+    // the recursive mirror (agg_storage_ty), addressed by an is_agg LValue rooted
+    // at the frame slot. Passed / returned by pointer; copy-in/out is a whole-
+    // object copy. `slot_ty` is null and `width` unused.
+    bool        is_agg     = false;
+    llvm::Type* storage_ty = nullptr;
+    // The local's interned IR type (aggregate recursion needs it).
+    Ref ir_type = Ref::Invalid;
     // A ref formal: the local has no real frame storage (its dead field is kept
     // only so Local index == field index). Loads / stores redirect to the passed
     // actual pointer, recorded in ref_ptr_ by the callee prologue.
@@ -548,6 +621,129 @@ private:
         return 1;
     }
 
+    // Whether a type contains an unpacked struct anywhere (at any array/struct
+    // nesting depth). Such a signal is routed through the recursive aggregate
+    // storage / addressing / init path, not the flat scalar-or-array fast paths.
+    bool contains_struct(Ref type) const {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            return contains_struct(t.element);
+        }
+        return t.kind == Type::Kind::Struct && !t.is_packed;
+    }
+
+    // Element count of one unpacked-array dimension.
+    uint32_t array_dim(const Type& t) const {
+        return (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
+    }
+
+    // Leaf slot type for a scalar / real aggregate leaf. A 4-state leaf carries a
+    // z plane conservatively (there is no per-leaf may-z analysis under an
+    // aggregate), so z assigned to a member is representable; a 2-state / real
+    // leaf is the narrow single-iW form.
+    llvm::StructType* agg_leaf_slot_ty(Ref type) {
+        const Layout   lay  = mod_.pool.layout(type);
+        const uint32_t w    = lay.width == 0 ? 1 : lay.width;
+        const bool     four = lay.domain == Domain::Four;
+        return slot_type(w, four, /*has_z=*/four, /*narrow=*/!four);
+    }
+
+    // Recursive LLVM storage type mirroring an (aggregate) IR type: a nested
+    // StructType per unpacked struct, one ArrayType per unpacked-array dimension,
+    // and a leaf slot for each scalar / string / real. Unlike the flat memory
+    // path this does NOT flatten array dimensions, so arbitrary nesting
+    // (array-of-struct, struct-with-array-member, ...) is a direct mirror.
+    llvm::Type* agg_storage_ty(Ref type) {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            return llvm::ArrayType::get(agg_storage_ty(t.element), array_dim(t));
+        }
+        if (t.kind == Type::Kind::Struct && !t.is_packed) {
+            std::vector<llvm::Type*> fields;
+            for (const Field& f : mod_.pool.struct_fields(t.fields_id)) {
+                fields.push_back(agg_storage_ty(f.type));
+            }
+            return llvm::StructType::create(ctx_, fields, "clotho.agg");
+        }
+        if (t.kind == Type::Kind::String) {
+            return str_slot_ty();
+        }
+        return agg_leaf_slot_ty(type);
+    }
+
+    // memcpy a whole aggregate from `src` to `dst` (both pointers to its storage).
+    // Valid because the frontend passes an aggregate by value only when it is
+    // string-free, so its byte image is the value (no heap-owning leaf).
+    void emit_agg_storage_copy(llvm::Value* dst, llvm::Value* src, Ref type) {
+        llvm::Type* st = agg_storage_ty(type);
+        const auto  sz = llmod_.getDataLayout().getTypeAllocSize(st);
+        const auto  al = llmod_.getDataLayout().getABITypeAlign(st);
+        b_.CreateMemCpy(dst, al, src, al, sz);
+    }
+
+    // Fill an LValue's leaf metadata (slot type, width, domain flags) from the
+    // scalar / string leaf type a select chain has resolved to. Conservative z
+    // for a 4-state leaf, matching agg_leaf_slot_ty.
+    void fill_agg_leaf(LValue& lv, Ref leaf_type) {
+        const Type& t = std::get<Type>(mod_.pool.get(leaf_type));
+        if (t.kind == Type::Kind::String) {
+            lv.is_string = true;
+            lv.slot_ty   = str_slot_ty();
+            return;
+        }
+        const Layout   lay  = mod_.pool.layout(leaf_type);
+        const uint32_t w    = lay.width == 0 ? 1 : lay.width;
+        const bool     four = lay.domain == Domain::Four;
+        lv.store_width = w;
+        lv.width       = w;
+        lv.has_z       = four;
+        lv.narrow      = !four;
+        lv.slot_ty     = slot_type(w, four, four, !four);
+        lv.bit_off     = b_.getInt32(0);
+    }
+
+    // Enumerate an aggregate's scalar/string leaves reachable by a STATIC path
+    // (struct fields only). Recursion stops at an unpacked-array dimension — a
+    // leaf under an array has a runtime element index, so it is not static and
+    // takes the deferred nonblocking path, not the block-commit shadow. `path`
+    // accumulates the constant GEP field indices from the aggregate root.
+    void collect_static_leaves(Ref type, std::vector<uint32_t>& path, std::vector<AggLeaf>& out) {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            return;
+        }
+        if (t.kind == Type::Kind::Struct && !t.is_packed) {
+            uint32_t f = 0;
+            for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
+                path.push_back(f++);
+                collect_static_leaves(fld.type, path, out);
+                path.pop_back();
+            }
+            return;
+        }
+        AggLeaf leaf;
+        leaf.path = path;
+        if (t.kind == Type::Kind::String) {
+            leaf.is_string = true;
+            leaf.slot_ty   = str_slot_ty();
+        } else {
+            const Layout lay = mod_.pool.layout(type);
+            leaf.width       = lay.width == 0 ? 1 : lay.width;
+            leaf.four_state  = lay.domain == Domain::Four;
+            leaf.has_z       = leaf.four_state;
+            leaf.narrow      = !leaf.four_state;
+            leaf.slot_ty     = slot_type(leaf.width, leaf.four_state, leaf.four_state, !leaf.four_state);
+        }
+        out.push_back(leaf);
+    }
+
+    // Whether an IR type is a scalar / string / real leaf (as opposed to an
+    // unpacked struct or array that a select must descend further).
+    bool is_leaf_type(Ref type) const {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        return t.kind != Type::Kind::UnpackedArray && !(t.kind == Type::Kind::Struct && !t.is_packed);
+    }
+
     // Byte offset of a GEP field-index path from the root state struct, per the
     // module's DataLayout. Used where the runtime needs raw offsets (the NBA
     // commit loop's meta table).
@@ -637,6 +833,7 @@ private:
             const Type&  ty  = std::get<Type>(mod_.pool.get(sigs[i].type));
 
             SignalSlot& slot = slots_[i];
+            slot.ir_type     = sigs[i].type;
             slot.width       = lay.width == 0 ? 1 : lay.width;
             slot.four_state  = lay.domain == Domain::Four;
             slot.is_signed   = ty.is_signed;
@@ -652,6 +849,19 @@ private:
                 } else {
                     slot.storage_ty = slot.slot_ty;
                 }
+                continue;
+            }
+            // A signal whose type contains an unpacked struct (at any nesting) is
+            // an aggregate: a recursive storage mirror (nested StructType /
+            // ArrayType / leaf slots), addressed by a composed GEP path. Its
+            // scalar/string leaves reachable by a static (struct-field-only) path
+            // are enumerated for nonblocking staging.
+            if (contains_struct(sigs[i].type)) {
+                slot.is_agg     = true;
+                slot.has_z      = false;
+                slot.storage_ty = agg_storage_ty(sigs[i].type);
+                std::vector<uint32_t> path;
+                collect_static_leaves(sigs[i].type, path, slot.static_leaves);
                 continue;
             }
             // A real / shortreal slot stores the IEEE-754 bit pattern in a
@@ -697,6 +907,23 @@ private:
             for (uint32_t i = 0; i < sigs.size(); ++i) {
                 SignalSlot& slot = slots_[i];
                 if (!slot.nba) {
+                    continue;
+                }
+                // An aggregate target shadows each static leaf's mm (and z, for a
+                // 4-state leaf) plane; the commit selects leaves by the block's
+                // static-leaf-set mask. A runtime-path-only aggregate (deferred
+                // records) needs no block shadow at all.
+                if (slot.is_agg) {
+                    if (slot.nba_agg) {
+                        for (AggLeaf& m : slot.static_leaves) {
+                            m.sh_mm_field = static_cast<uint32_t>(sf.size());
+                            sf.push_back(int_ty(m.narrow ? m.width : 2 * m.width));
+                            if (m.has_z) {
+                                m.sh_z_field = static_cast<uint32_t>(sf.size());
+                                sf.push_back(int_ty(m.width));
+                            }
+                        }
+                    }
                     continue;
                 }
                 slot.sh_mm_field = static_cast<uint32_t>(sf.size());
@@ -750,6 +977,7 @@ private:
                     return true;
                 case Inst::Tag::PartSelect:
                 case Inst::Tag::ElemSelect:
+                case Inst::Tag::MemberSelect:
                     lv = ir.payload(lv).op_extra.op;
                     break;
                 default:
@@ -771,6 +999,29 @@ private:
                 case Inst::Tag::DynPartSelect:
                     return true;
                 case Inst::Tag::ElemSelect:
+                case Inst::Tag::MemberSelect:
+                    lv = ir.payload(lv).op_extra.op;
+                    break;
+                default:
+                    return false;
+            }
+        }
+    }
+
+    // Whether an lvalue chain contains an unpacked-array element select (a
+    // runtime element index). For an aggregate NBA target this discriminates a
+    // static-path leaf (block-commit shadow) from a runtime one (deferred path).
+    static bool lvalue_has_elem_select(const Ir& ir, Index lv) {
+        for (;;) {
+            switch (ir.tag(lv)) {
+                case Inst::Tag::ElemSelect:
+                    return true;
+                case Inst::Tag::BitSelect:
+                    lv = ir.payload(lv).binary.l;
+                    break;
+                case Inst::Tag::PartSelect:
+                case Inst::Tag::DynPartSelect:
+                case Inst::Tag::MemberSelect:
                     lv = ir.payload(lv).op_extra.op;
                     break;
                 default:
@@ -810,6 +1061,30 @@ private:
             }
             const Index     lv_idx = ir.payload(idx).binary.l;
             const NbaTarget t      = nba_target(ir, lv_idx);
+            // Nonblocking assignment into an aggregate. A STATIC-path leaf (struct
+            // fields only) commits through the per-leaf aggregate shadow (block
+            // commit). A leaf reached through a runtime array index has no
+            // compile-time address, so it defers a (dest-slot-pointer, value)
+            // record replayed by memcpy — the aggregate analogue of the array
+            // deferred queue. A signal can take both paths (different sites).
+            if (contains_struct(sigs[static_cast<uint32_t>(t.sig)].type)) {
+                SignalSlot& s       = slots_[static_cast<uint32_t>(t.sig)];
+                const bool  runtime = lvalue_has_elem_select(ir, lv_idx);
+                const bool  partial = lvalue_has_subselect(ir, lv_idx);
+                s.nba               = true;
+                // A static whole-leaf write commits from the block shadow; a
+                // runtime array index OR a partial (bit/part-select) leaf write
+                // defers (the partial one needs a masked read-modify-write).
+                if (runtime || partial) {
+                    if (std::find(agg_nba_sigs_.begin(), agg_nba_sigs_.end(), t.sig) == agg_nba_sigs_.end()) {
+                        agg_nba_sigs_.push_back(t.sig);
+                    }
+                    s.agg_masked = s.agg_masked || partial;
+                } else {
+                    s.nba_agg = true;
+                }
+                continue;
+            }
             // An unpacked-array element NBA uses the runtime deferred queue, not
             // the per-signal shadow; record the array signal for wake servicing.
             // (slot.is_array is not set until the placement loop below, so test
@@ -951,6 +1226,19 @@ private:
     // Pointer to an lvalue's mm (field 0) or z (field 1) word, resolving the
     // selected leaf element for a memory target.
     llvm::Value* lv_field_ptr(const LValue& lv, uint32_t field) {
+        if (lv.is_agg) {
+            // Walk the composed GEP path from the aggregate root to the leaf slot,
+            // then select the leaf's mm (0) / z (1) field. Struct fields and array
+            // indices are indistinguishable to the GEP — both are index operands.
+            std::vector<llvm::Value*> idx;
+            idx.reserve(lv.agg_path.size() + 2);
+            idx.push_back(b_.getInt32(0));
+            for (llvm::Value* step : lv.agg_path) {
+                idx.push_back(step);
+            }
+            idx.push_back(b_.getInt32(field));
+            return b_.CreateInBoundsGEP(lv.root_ty, lv.base, idx);
+        }
         if (lv.array_ty != nullptr) {
             llvm::Value* idx = lv.elem_idx != nullptr ? lv.elem_idx : b_.getInt32(0);
             return b_.CreateInBoundsGEP(lv.array_ty, lv.base, { b_.getInt32(0), idx, b_.getInt32(field) });
@@ -1323,18 +1611,21 @@ private:
                 params.push_back(ptr); // &caller_temp.z (copy-out at each return)
                 continue;
             }
-            if (is_string_type(pt)) {
-                params.push_back(ptr); // rt_string handle (callee copy-in gives value semantics)
+            if (is_string_type(pt) || contains_struct(pt)) {
+                // A string handle or an aggregate's storage passes by pointer (In
+                // only — the frontend guards aggregate out/inout formals); the
+                // callee copy-in gives value semantics.
+                params.push_back(ptr);
                 continue;
             }
             const uint32_t w = width_of(pt);
             params.push_back(int_ty(2 * w)); // must|may
             params.push_back(int_ty(w));     // z
         }
-        // A string result returns through a trailing out-param handle the caller
-        // owns (its call-site temp) — a 32-byte handle has no plane struct form.
+        // A string or aggregate result returns through a trailing out-param the
+        // caller owns (its call-site temp) — neither has a plane struct form.
         llvm::Type* rty = fn_return_ty(f.return_type);
-        if (is_string_type(f.return_type)) {
+        if (is_string_type(f.return_type) || contains_struct(f.return_type)) {
             rty = b_.getVoidTy();
             params.push_back(ptr);
         }
@@ -1394,6 +1685,10 @@ private:
     // string input handle) rather than the (mm, z) pair every other formal uses.
     bool one_param_formal(const Function& f, size_t k) const {
         if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
+            return true;
+        }
+        // An aggregate is one pointer (In only — out/inout aggregates are guarded).
+        if (contains_struct(f.param_types[k])) {
             return true;
         }
         return is_string_type(f.param_types[k]) &&
@@ -1464,6 +1759,7 @@ private:
         std::vector<llvm::Type*> fields(n);
         for (uint32_t i = 0; i < n; ++i) {
             const Layout lay           = mod_.pool.layout(f.local_types[i]);
+            frame_slots_[i].ir_type    = f.local_types[i];
             frame_slots_[i].width      = lay.width == 0 ? 1 : lay.width;
             frame_slots_[i].four_state = lay.domain == Domain::Four;
             // A ref formal (local k for formal k) has no own storage: its dead field
@@ -1471,6 +1767,12 @@ private:
             // actual pointer. The redirect GEPs a packed slot, so force one here.
             const bool is_ref_formal = i < f.arg_dirs.size() && f.arg_dirs[i] == ArgDir::Ref;
             frame_slots_[i].is_ref   = is_ref_formal;
+            if (contains_struct(f.local_types[i])) {
+                frame_slots_[i].is_agg     = true;
+                frame_slots_[i].storage_ty = agg_storage_ty(f.local_types[i]);
+                fields[i]                  = frame_slots_[i].storage_ty;
+                continue;
+            }
             if (is_string_type(f.local_types[i])) {
                 frame_slots_[i].is_string = true;
                 frame_slots_[i].slot_ty   = str_slot_ty();
@@ -1504,6 +1806,13 @@ private:
                 continue;
             }
             llvm::Value*     slot = b_.CreateStructGEP(frame_ty_, frame_, i);
+            if (s.is_agg) {
+                // Recursive fill (X into 4-state leaves, init string leaves); an
+                // input formal's slot is then overwritten by copy-in.
+                std::vector<llvm::Value*> path;
+                emit_agg_init(s.ir_type, slot, path, s.storage_ty);
+                continue;
+            }
             if (s.is_string) {
                 b_.CreateCall(str_init_fn(), { slot });
                 continue;
@@ -1559,6 +1868,7 @@ private:
 
         frame_ = b_.CreateAlloca(frame_ty_, nullptr, "frame");
         init_frame();
+        emit_fn_agg_copyin(f);
         build_str_temps();
         bind_ref_formals(f);
         emit_copyin(f);
@@ -1579,6 +1889,21 @@ private:
 
         cur_fn_ = nullptr;
         frame_  = nullptr;
+    }
+
+    // Copy each aggregate input formal's caller storage (passed by pointer) into
+    // its frame slot at function entry (value semantics). Scalar / string formals
+    // copy in via the frontend's Store(Local, Arg); an aggregate formal emits no
+    // Arg, so the copy is done here. Aggregate output / inout function formals are
+    // guarded in the frontend, so only inputs occur.
+    void emit_fn_agg_copyin(const Function& f) {
+        for (uint32_t k = 0; k < f.param_types.size(); ++k) {
+            if (!contains_struct(f.param_types[k])) {
+                continue;
+            }
+            emit_agg_storage_copy(b_.CreateStructGEP(frame_ty_, frame_, k),
+                                  fn_->getArg(param_llvm_index_[k]), f.param_types[k]);
+        }
     }
 
     // -- Tasks --
@@ -1755,6 +2080,11 @@ private:
     // skipped here.
     void emit_copyin(const Function& f) {
         for (uint32_t k = 0; k < f.param_types.size(); ++k) {
+            // An aggregate formal is passed by pointer and copied in by
+            // emit_fn_agg_copyin (functions only; aggregate task args are guarded).
+            if (contains_struct(f.param_types[k])) {
+                continue;
+            }
             const uint32_t w    = width_of(f.param_types[k]);
             const uint32_t base = param_llvm_index_[k];
             if (f.arg_dirs[k] == ArgDir::Ref) {
@@ -3488,6 +3818,10 @@ private:
     void emit_block_commit_body(uint32_t id) {
         for (const BlockSig& bs : block_commits_[id].sigs) {
             const SignalSlot& s       = slot_of(bs.sig);
+            if (s.nba_agg) {
+                emit_agg_commit(bs.sig, bs.mask);
+                continue;
+            }
             const uint32_t    W       = s.width;
             auto*             mmty     = int_ty(s.narrow ? W : 2 * W);
             auto*             zty      = int_ty(W);
@@ -3549,6 +3883,61 @@ private:
                                                         { b_.getInt32(0), b_.getInt32(s.nba_id) }));
                 b_.CreateCall(vcd_touch_fn(), { vidx });
             }
+        }
+    }
+
+    // Pointer to an aggregate leaf's mm (0) / z (1) field, via the leaf's static
+    // constant GEP path from the aggregate storage root.
+    llvm::Value* agg_leaf_ptr(llvm::Value* base, llvm::Type* root_ty,
+                              const std::vector<uint32_t>& path, uint32_t field) {
+        std::vector<llvm::Value*> idx;
+        idx.reserve(path.size() + 2);
+        idx.push_back(b_.getInt32(0));
+        for (const uint32_t f : path) {
+            idx.push_back(b_.getInt32(f));
+        }
+        idx.push_back(b_.getInt32(field));
+        return b_.CreateInBoundsGEP(root_ty, base, idx);
+    }
+
+    // Commit an aggregate NBA target within a block: copy each static leaf whose
+    // leaf-set bit is set from its shadow slot to live storage, then wake level
+    // (Any-edge) readers if any leaf changed. A leaf is a whole slot (not a bit
+    // range), so this copies planes, not masked words; edge sensitivity on an
+    // aggregate member is rejected in the frontend, so Any is the only bucket.
+    void emit_agg_commit(Signal sig, const llvm::APInt& mask) {
+        const SignalSlot& s       = slot_of(sig);
+        llvm::Value*      live    = storage_ptr(state_, s);
+        llvm::Value*      changed = b_.getFalse();
+        for (uint32_t k = 0; k < s.static_leaves.size(); ++k) {
+            if (!mask[k]) {
+                continue;
+            }
+            const AggLeaf& m       = s.static_leaves[k];
+            auto*          mmty    = int_ty(m.narrow ? m.width : 2 * m.width);
+            llvm::Value*   live_mm = agg_leaf_ptr(live, s.storage_ty, m.path, 0);
+            llvm::Value*   old_mm  = b_.CreateLoad(mmty, live_mm);
+            llvm::Value*   new_mm  = b_.CreateLoad(mmty, shadow_ptr(m.sh_mm_field));
+            b_.CreateStore(new_mm, live_mm);
+            changed = b_.CreateOr(changed, b_.CreateICmpNE(old_mm, new_mm));
+            if (m.has_z) {
+                auto*        zty    = int_ty(m.width);
+                llvm::Value* live_z = agg_leaf_ptr(live, s.storage_ty, m.path, 1);
+                llvm::Value* old_z  = b_.CreateLoad(zty, live_z);
+                llvm::Value* new_z  = b_.CreateLoad(zty, shadow_ptr(m.sh_z_field));
+                b_.CreateStore(new_z, live_z);
+                changed = b_.CreateOr(changed, b_.CreateICmpNE(old_z, new_z));
+            }
+        }
+        if (signal_has_waiters(sig)) {
+            auto* fn   = b_.GetInsertBlock()->getParent();
+            auto* svc  = llvm::BasicBlock::Create(ctx_, "uagg.svc", fn);
+            auto* cont = llvm::BasicBlock::Create(ctx_, "uagg.cont", fn);
+            b_.CreateCondBr(changed, svc, cont);
+            b_.SetInsertPoint(svc);
+            service_any_waiters(sig);
+            b_.CreateBr(cont);
+            b_.SetInsertPoint(cont);
         }
     }
 
@@ -4219,7 +4608,7 @@ private:
         // The array-NBA record buffers are process-global; clear any state a prior
         // simulation in this process left staged (e.g. a $finish between staging and
         // the NBA commit) so this run starts empty.
-        if (!array_nba_sigs_.empty()) {
+        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty()) {
             b_.CreateCall(nba_arr_reset_fn(), {});
         }
         const auto all = mod_.processes();
@@ -4330,7 +4719,8 @@ private:
         // the active queue drains; if any update is staged it commits them all and
         // re-drains the active queue at the SAME instant; otherwise it falls through
         // to the wheel. So active and NBA iterate until both settle before time moves.
-        const bool has_nba = !array_nba_sigs_.empty() || !block_commits_.empty() || !nb_event_sigs_.empty();
+        const bool has_nba = !array_nba_sigs_.empty() || !agg_nba_sigs_.empty() ||
+                             !block_commits_.empty() || !nb_event_sigs_.empty();
         auto*      ncheck  = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.check", fn) : wcheck;
         auto*      ncommit = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.commit", fn) : nullptr;
         // Inactive region: only when the design has a #0. When the active queue
@@ -4423,7 +4813,8 @@ private:
             // the commits just woke.
             b_.SetInsertPoint(ncheck);
             llvm::Value* any = b_.getFalse();
-            if (!array_nba_sigs_.empty()) {
+            if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty()) {
+                // rt_nba_arr_any is the total across the shared array + aggregate buffers.
                 any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateCall(nba_arr_any_fn(), {}), b_.getInt32(0)));
             }
             if (!block_commits_.empty()) {
@@ -4453,11 +4844,15 @@ private:
                 b_.CreateBr(after);
                 b_.SetInsertPoint(after);
             }
-            // Deferred array-element writes: replay each array's records (monomorphized
-            // commit), waking its Any-edge readers if it took any write, then reset.
-            if (!array_nba_sigs_.empty()) {
+            // Deferred writes through a runtime array index: replay each array's
+            // typed records and each aggregate's memcpy records (both from the
+            // shared rt_nba_arr_* buffers), waking Any-edge readers, then reset.
+            if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty()) {
                 for (const Signal sig : array_nba_sigs_) {
                     emit_array_commit(sig, state);
+                }
+                for (const Signal sig : agg_nba_sigs_) {
+                    emit_agg_array_commit(sig, state);
                 }
                 // VCD: touch each dumped array that took an NBA write this instant,
                 // so the flush scans its elements only on write instants (not every
@@ -4742,6 +5137,11 @@ private:
     // O(1) emitted instructions instead.
     void init_state(llvm::Value* state) {
         for (const SignalSlot& s : slots_) {
+            if (s.is_agg) {
+                std::vector<llvm::Value*> path;
+                emit_agg_init(s.ir_type, storage_ptr(state, s), path, s.storage_ty);
+                continue;
+            }
             if (!s.is_array) {
                 continue;
             }
@@ -4751,6 +5151,67 @@ private:
                 emit_array_init(state, s);
             }
         }
+    }
+
+    // Recursive power-on fill for an aggregate signal: X into every 4-state leaf
+    // and rt_string_init on every string leaf. 2-state / real leaves are already
+    // zero from the state global's zeroinitializer. Array dimensions become
+    // runtime loops (keeping init O(size) in emitted instructions), struct fields
+    // straight-line GEPs. `root_ty` is the aggregate's storage type; `path`
+    // accumulates GEP indices from its root.
+    void emit_agg_init(Ref type, llvm::Value* base, std::vector<llvm::Value*>& path, llvm::Type* root_ty) {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            const uint32_t n     = array_dim(t);
+            auto*          i32   = b_.getInt32Ty();
+            auto*          fn    = b_.GetInsertBlock()->getParent();
+            auto*          head  = llvm::BasicBlock::Create(ctx_, "ainit.head", fn);
+            auto*          body  = llvm::BasicBlock::Create(ctx_, "ainit.body", fn);
+            auto*          done  = llvm::BasicBlock::Create(ctx_, "ainit.done", fn);
+            auto*          entry = b_.GetInsertBlock();
+            b_.CreateBr(head);
+            b_.SetInsertPoint(head);
+            auto* idx = b_.CreatePHI(i32, 2);
+            idx->addIncoming(b_.getInt32(0), entry);
+            b_.CreateCondBr(b_.CreateICmpULT(idx, b_.getInt32(n)), body, done);
+            b_.SetInsertPoint(body);
+            path.push_back(idx);
+            emit_agg_init(t.element, base, path, root_ty);
+            path.pop_back();
+            idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), b_.GetInsertBlock());
+            b_.CreateBr(head);
+            b_.SetInsertPoint(done);
+            return;
+        }
+        if (t.kind == Type::Kind::Struct && !t.is_packed) {
+            uint32_t f = 0;
+            for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
+                path.push_back(b_.getInt32(f++));
+                emit_agg_init(fld.type, base, path, root_ty);
+                path.pop_back();
+            }
+            return;
+        }
+        // Leaf: GEP through the path to the slot, then init only if it needs a
+        // non-zero power-on (4-state -> X, string -> handle).
+        std::vector<llvm::Value*> idx;
+        idx.reserve(path.size() + 2);
+        idx.push_back(b_.getInt32(0));
+        for (llvm::Value* s : path) {
+            idx.push_back(s);
+        }
+        if (t.kind == Type::Kind::String) {
+            b_.CreateCall(str_init_fn(), { b_.CreateInBoundsGEP(root_ty, base, idx) });
+            return;
+        }
+        const Layout lay  = mod_.pool.layout(type);
+        const bool   four = lay.domain == Domain::Four;
+        if (!four) {
+            return; // 2-state / real: zeroinitializer is the power-on value.
+        }
+        const uint32_t w = lay.width == 0 ? 1 : lay.width;
+        idx.push_back(b_.getInt32(0)); // mm field of the leaf slot
+        b_.CreateStore(x_mm(w), b_.CreateInBoundsGEP(root_ty, base, idx));
     }
 
     // Constant initializer for the `clotho.state` global: the whole power-on
@@ -4793,7 +5254,9 @@ private:
     // a scalar plane is X (4-state) or 0 (2-state) with the z word set for an
     // undriven-net may-z seed.
     llvm::Constant* slot_const(const SignalSlot& s) {
-        if (s.is_array) {
+        if (s.is_array || s.is_agg) {
+            // Zeroinitialized; the runtime fill (init_state -> emit_array_init /
+            // emit_agg_init) writes X into 4-state leaves and inits string leaves.
             return llvm::ConstantAggregateZero::get(s.storage_ty);
         }
         if (s.is_string) {
@@ -4990,6 +5453,13 @@ private:
                 const Type& at = std::get<Type>(mod_.pool.get(es.array_type));
                 return from_ref(at.element);
             }
+            case Inst::Tag::MemberSelect: {
+                // The result is the selected member's own type.
+                const auto   ms     = ir_->extra_data<MemberSelect>(p.op_extra.extra);
+                const Type&  st     = std::get<Type>(mod_.pool.get(ms.struct_type));
+                const auto   fields = mod_.pool.struct_fields(st.fields_id);
+                return from_ref(fields[ms.field_index].type);
+            }
             case Inst::Tag::Load:
                 return type_of(p.unary);
             case Inst::Tag::SimTime:
@@ -5155,6 +5625,7 @@ private:
 
             case Inst::Tag::Store:
             case Inst::Tag::StoreNb:
+            case Inst::Tag::AggCopy:
             case Inst::Tag::Cond:
             case Inst::Tag::Switch:
             case Inst::Tag::Loop:
@@ -5384,17 +5855,9 @@ private:
                 return;
             }
             case Inst::Tag::ElemSelect: {
-                // Advance the lvalue's flat leaf index to the selected element:
-                // elem_idx += normalized_index * leaf-elements-per-selected-element
-                // (1 for a leaf select; the inner dimensions' product for an outer
-                // dimension of a multidimensional memory). The base lvalue's
-                // slot_ty and store_width already describe a leaf element (set by
-                // the array's signal slot), so this only shifts to the element and
-                // resets any inherited bit offset.
-                LValue         lv     = lvalue_of(p.op_extra.op);
-                const auto     es     = ir_->extra_data<ElemSelect>(p.op_extra.extra);
-                const Type&    at     = std::get<Type>(mod_.pool.get(es.array_type));
-                const uint32_t stride = array_leaf_count(at.element);
+                LValue       lv = lvalue_of(p.op_extra.op);
+                const auto   es = ir_->extra_data<ElemSelect>(p.op_extra.extra);
+                const Type&  at = std::get<Type>(mod_.pool.get(es.array_type));
                 // TODO: an X/Z or out-of-range index uses only its must bits, so it
                 // selects a wrong / out-of-bounds element. LRM: an out-of-range read
                 // yields X and such a write is a no-op.
@@ -5402,9 +5865,42 @@ private:
                 // Normalize the declared-range coordinate to a 0-based position.
                 llvm::Value* norm = at.left <= at.right ? b_.CreateSub(idx, b_.getInt32(at.left))
                                                         : b_.CreateSub(b_.getInt32(at.left), idx);
-                llvm::Value* off  = stride == 1 ? norm : b_.CreateMul(norm, b_.getInt32(stride));
-                lv.elem_idx       = lv.elem_idx != nullptr ? b_.CreateAdd(lv.elem_idx, off) : off;
-                lv.bit_off        = b_.getInt32(0);
+                if (lv.is_agg) {
+                    // Recursive storage is one ArrayType per dimension (not
+                    // flattened): push a nested-GEP index step. A runtime element
+                    // index makes the path non-static (deferred nonblocking path).
+                    lv.agg_path.push_back(norm);
+                    lv.agg_static = false;
+                    lv.agg_leaf   = is_leaf_type(at.element);
+                    if (lv.agg_leaf) {
+                        fill_agg_leaf(lv, at.element);
+                    }
+                    set_lvalue(i, lv);
+                    return;
+                }
+                // Flat memory: advance the single flattened leaf index by
+                // normalized_index * inner-dimension leaf count.
+                const uint32_t stride = array_leaf_count(at.element);
+                llvm::Value*   off    = stride == 1 ? norm : b_.CreateMul(norm, b_.getInt32(stride));
+                lv.elem_idx           = lv.elem_idx != nullptr ? b_.CreateAdd(lv.elem_idx, off) : off;
+                lv.bit_off            = b_.getInt32(0);
+                set_lvalue(i, lv);
+                return;
+            }
+            case Inst::Tag::MemberSelect: {
+                // Push the member's constant field index onto the aggregate GEP
+                // path; resolve the leaf metadata if the member is a scalar/string
+                // (a struct/array member stays interior for a further select).
+                LValue      lv     = lvalue_of(p.op_extra.op);
+                const auto  ms     = ir_->extra_data<MemberSelect>(p.op_extra.extra);
+                const Type& st     = std::get<Type>(mod_.pool.get(ms.struct_type));
+                const Ref   mt     = mod_.pool.struct_fields(st.fields_id)[ms.field_index].type;
+                lv.agg_path.push_back(b_.getInt32(ms.field_index));
+                lv.agg_field_path.push_back(ms.field_index);
+                lv.agg_leaf = is_leaf_type(mt);
+                if (lv.agg_leaf) {
+                    fill_agg_leaf(lv, mt);
+                }
                 set_lvalue(i, lv);
                 return;
             }
@@ -5461,13 +5957,56 @@ private:
                 if (type_of(p.binary.r).is_real) {
                     rhs = real_to_planes(fp_of(rhs));
                 }
-                // An unpacked-array element NBA defers through the runtime queue; a
-                // plain signal / scalar select uses the per-signal shadow.
+                // Deferral splits three ways: an unpacked-array element defers a
+                // typed record; an aggregate leaf reached through a runtime array
+                // index defers a memcpy record; everything else (a plain signal,
+                // scalar select, or aggregate static leaf) uses the block shadow.
+                const bool agg_partial =
+                  lv.is_agg && lv.agg_leaf && (lv.width != lv.store_width || !is_zero_const(lv.bit_off));
                 if (lv.is_signal && slot_of(lv.sig).is_array) {
                     emit_array_nba(lv, rhs);
+                } else if (lv.is_agg && (!lv.agg_static || agg_partial)) {
+                    emit_agg_nba(lv, rhs);
                 } else {
                     lower_store_nb(lv, rhs);
                 }
+                return;
+            }
+            case Inst::Tag::AggCopy: {
+                // Whole-object blocking copy: one memcpy of the storage. The
+                // frontend emits this only for a string-free object, so the byte
+                // image is the value (no heap-owning leaf to deep-copy).
+                const auto   info = ir_->extra_data<AggCopyInfo>(p.op_extra.extra);
+                const LValue dlv  = lvalue_of(p.op_extra.op);
+                const LValue slv  = lvalue_of(info.src);
+                llvm::Value* dst;
+                llvm::Value* src;
+                llvm::Type*  st;
+                if (dlv.is_agg) {
+                    // An aggregate (contains a struct) uses the recursive storage,
+                    // which is deterministic by type — both sides share the layout.
+                    dst = agg_slot_ptr(dlv);
+                    src = agg_slot_ptr(slv);
+                    st  = agg_storage_ty(info.type);
+                } else {
+                    // A plain unpacked array: its slot layout is may-z-analysed per
+                    // signal, so a memcpy is byte-valid only when both arrays landed
+                    // on the same layout (the common never-z / matching case). A
+                    // may-z mismatch (one array assigned z, the other not) would
+                    // differ in the z plane; reject it rather than miscopy.
+                    const SignalSlot& ds = slot_of(dlv.sig);
+                    const SignalSlot& ss = slot_of(slv.sig);
+                    if (ds.storage_ty != ss.storage_ty) {
+                        throw BackendError{ "whole-array copy between arrays of differing "
+                                            "storage layout is not supported" };
+                    }
+                    dst = dlv.base;
+                    src = slv.base;
+                    st  = ds.storage_ty;
+                }
+                const auto sz = llmod_.getDataLayout().getTypeAllocSize(st);
+                const auto al = llmod_.getDataLayout().getABITypeAlign(st);
+                b_.CreateMemCpy(dst, al, src, al, sz);
                 return;
             }
 
@@ -6146,6 +6685,18 @@ private:
     // Whole-storage lvalue for a module signal (state struct).
     LValue signal_lvalue(Signal sig) {
         const SignalSlot& s = slot_of(sig);
+        if (s.is_agg) {
+            // The aggregate root; a following MemberSelect / ElemSelect chain
+            // extends agg_path and (at a scalar/string leaf) fills the leaf
+            // metadata. A bare aggregate lvalue is never loaded/stored directly.
+            LValue lv{};
+            lv.base      = storage_ptr(state_, s);
+            lv.root_ty   = s.storage_ty;
+            lv.is_agg    = true;
+            lv.is_signal = true;
+            lv.sig       = sig;
+            return lv;
+        }
         return LValue{ .base        = storage_ptr(state_, s),
                        .slot_ty     = s.slot_ty,
                        .has_z       = s.has_z,
@@ -6164,6 +6715,14 @@ private:
     // in ref_ptr_ by the prologue), through which every load / store is live.
     LValue local_lvalue(uint32_t index) {
         const FrameSlot& s = frame_slots_[index];
+        if (s.is_agg) {
+            LValue lv{};
+            lv.base      = b_.CreateStructGEP(frame_ty_, frame_, index);
+            lv.root_ty   = s.storage_ty;
+            lv.is_agg    = true;
+            lv.is_signal = false;
+            return lv;
+        }
         llvm::Value* base = s.is_ref ? ref_ptr_[index] : b_.CreateStructGEP(frame_ty_, frame_, index);
         return LValue{ .base        = base,
                        .slot_ty     = s.slot_ty,
@@ -6286,7 +6845,28 @@ private:
     // serviced here — that happens in the NBA region after the active drain.
     void lower_store_nb(const LValue& lv, Plane rhs) {
         const SignalSlot& s  = slot_of(lv.sig);
-        llvm::Value*      mp = shadow_ptr(s.sh_mm_field);
+
+        // Aggregate static-path leaf: stage the whole leaf into its shadow slot
+        // and register its leaf-set bit. The value is leaf-width (frontend
+        // Resize), so no bit merge. (Runtime-path aggregate NBA is rejected in
+        // nba_classify, so the path is static here.)
+        if (lv.is_agg) {
+            const int      k = agg_static_leaf_index(s, lv.agg_field_path);
+            const AggLeaf& m = s.static_leaves[static_cast<uint32_t>(k)];
+            if (m.narrow) {
+                b_.CreateStore(must_of(rhs), shadow_ptr(m.sh_mm_field));
+            } else {
+                const Plane f = to_four(rhs);
+                b_.CreateStore(f.mm, shadow_ptr(m.sh_mm_field));
+                if (m.has_z) {
+                    b_.CreateStore(f.z, shadow_ptr(m.sh_z_field));
+                }
+            }
+            block_register(lv.sig, leaf_set_mask(s, static_cast<uint32_t>(k)), /*dynamic=*/false);
+            return;
+        }
+
+        llvm::Value* mp = shadow_ptr(s.sh_mm_field);
 
         // Narrow 2-state target: stage the single iW value into the iW shadow. No z.
         if (s.narrow) {
@@ -6356,6 +6936,28 @@ private:
         return llvm::APInt::getBitsSet(s.width, lsb, lsb + lv.width);
     }
 
+    // Index of the aggregate static leaf whose constant field path equals `fpath`
+    // (the MemberSelect chain's field indices). Linear over the small static-leaf
+    // list; -1 if not found (never, for a well-formed static-path NBA).
+    int agg_static_leaf_index(const SignalSlot& s, const std::vector<uint32_t>& fpath) const {
+        for (uint32_t k = 0; k < s.static_leaves.size(); ++k) {
+            if (s.static_leaves[k].path == fpath) {
+                return static_cast<int>(k);
+            }
+        }
+        return -1;
+    }
+
+    // Leaf-set mask for an aggregate block registration: one bit per static leaf,
+    // bit k set for the written leaf k. Unioned per block; the aggregate commit
+    // copies the leaves whose bit is set. Width is the static-leaf count — an
+    // aggregate signal's BlockSig mask lives in this space.
+    llvm::APInt leaf_set_mask(const SignalSlot& s, uint32_t leaf) const {
+        llvm::APInt m(static_cast<uint32_t>(s.static_leaves.size()), 0);
+        m.setBit(leaf);
+        return m;
+    }
+
     // Register this NBA store's target on the current block, recording the commit
     // mask: a runtime dirty-mask field for a dynamic-select signal, else the union
     // of this site's compile-time mask.
@@ -6367,6 +6969,188 @@ private:
         }
     }
 
+
+    // Deferred-buffer index for an aggregate NBA signal: the aggregate buffers
+    // follow the array buffers in the shared runtime index space (rt_nba_arr_*).
+    uint32_t agg_buf_idx(Signal sig) const {
+        const auto it = std::find(agg_nba_sigs_.begin(), agg_nba_sigs_.end(), sig);
+        return static_cast<uint32_t>(array_nba_sigs_.size()) +
+               static_cast<uint32_t>(it - agg_nba_sigs_.begin());
+    }
+
+    // Largest leaf slot byte size across an aggregate type (sizes the deferred
+    // record's payload so any leaf's value fits).
+    uint32_t agg_max_leaf_bytes(Ref type) {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            return agg_max_leaf_bytes(t.element);
+        }
+        if (t.kind == Type::Kind::Struct && !t.is_packed) {
+            uint32_t m = 0;
+            for (const Field& f : mod_.pool.struct_fields(t.fields_id)) {
+                m = std::max(m, agg_max_leaf_bytes(f.type));
+            }
+            return m;
+        }
+        llvm::Type* slot = t.kind == Type::Kind::String ? static_cast<llvm::Type*>(str_slot_ty())
+                                                        : agg_leaf_slot_ty(type);
+        return static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(slot));
+    }
+
+    // Deferred aggregate-NBA record: { ptr dest_slot, i32 nbytes, [max x i8]
+    // payload [, [max x i8] mask] }. `payload` holds the new leaf value in the
+    // leaf's own slot byte layout. Without a mask the commit memcpies `nbytes` of
+    // it to `dest_slot`; with a mask (any partial site in the aggregate) the
+    // commit does a byte-wise masked read-modify-write. Either way a leaf of any
+    // width / domain replays uniformly (no per-leaf monomorphization).
+    llvm::StructType* agg_rec_ty(const SignalSlot& s) {
+        const uint32_t maxb   = agg_max_leaf_bytes(s.ir_type);
+        auto*          bytes  = llvm::ArrayType::get(b_.getInt8Ty(), maxb);
+        std::vector<llvm::Type*> f{ raw_ptr_ty(), b_.getInt32Ty(), bytes };
+        if (s.agg_masked) {
+            f.push_back(bytes);
+        }
+        return llvm::StructType::get(ctx_, f);
+    }
+
+    // Pointer to the leaf SLOT an aggregate lvalue designates (its agg_path,
+    // without the final mm/z field select).
+    llvm::Value* agg_slot_ptr(const LValue& lv) {
+        std::vector<llvm::Value*> idx;
+        idx.reserve(lv.agg_path.size() + 1);
+        idx.push_back(b_.getInt32(0));
+        for (llvm::Value* step : lv.agg_path) {
+            idx.push_back(step);
+        }
+        return b_.CreateInBoundsGEP(lv.root_ty, lv.base, idx);
+    }
+
+    // Stage a nonblocking write to an aggregate leaf reached through a runtime
+    // array index: reserve a record and fill it with the destination slot pointer,
+    // the leaf's slot byte count, and the new value written in the leaf's own slot
+    // layout. The NBA region replays it by memcpy (later write to the same leaf
+    // wins). Whole-leaf only — a partial leaf write is guarded in the frontend.
+    void emit_agg_nba(const LValue& lv, Plane rhs) {
+        const SignalSlot& s      = slot_of(lv.sig);
+        const uint32_t    W      = lv.store_width;
+        const llvm::Align a1{ 1 };
+        auto*             i8     = b_.getInt8Ty();
+        auto*             rt     = agg_rec_ty(s);
+        const auto        stride = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(rt));
+        llvm::Value* rec = b_.CreateCall(nba_arr_slot_fn(), { b_.getInt32(agg_buf_idx(lv.sig)), b_.getInt32(stride) });
+        b_.CreateAlignedStore(agg_slot_ptr(lv), b_.CreateStructGEP(rt, rec, 0), a1);
+        const auto nbytes = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(lv.slot_ty));
+        b_.CreateAlignedStore(b_.getInt32(nbytes), b_.CreateStructGEP(rt, rec, 1), a1);
+
+        // Byte offset of the leaf slot's z field (4-state leaves only).
+        const uint32_t zoff = (!lv.narrow && lv.has_z)
+                                ? static_cast<uint32_t>(llmod_.getDataLayout().getStructLayout(lv.slot_ty)->getElementOffset(1))
+                                : 0;
+        // Write a plane value into the payload at the slot's field offset.
+        auto put = [&](llvm::Value* region, llvm::Value* v, uint32_t off) {
+            llvm::Value* p = off == 0 ? region : b_.CreateInBoundsGEP(i8, region, { b_.getInt32(off) });
+            b_.CreateAlignedStore(v, p, a1);
+        };
+
+        llvm::Value* payload = b_.CreateStructGEP(rt, rec, 2);
+        // The value, positioned at the leaf's bit offset (partial select), in slot
+        // layout: mm plane at offset 0, z plane at zoff.
+        if (lv.narrow) {
+            put(payload, place_val(lv, must_of(rhs), W), 0);
+        } else {
+            const Plane f  = to_four(rhs);
+            llvm::Value* mm = packed(place_val(lv, must_of(f), W), place_val(lv, may_of(f), W),
+                                     place_val(lv, f.z, W)).mm;
+            put(payload, mm, 0);
+            if (lv.has_z) {
+                put(payload, place_val(lv, f.z, W), zoff);
+            }
+        }
+        // The write mask, same layout: which bits this store touches (all-ones for
+        // a whole-leaf write). Padding bytes of the mask stay garbage but only
+        // ever gate the dest slot's own padding, which is never read.
+        if (s.agg_masked) {
+            llvm::Value* mask   = store_mask(lv, W);
+            llvm::Value* mask_p = b_.CreateStructGEP(rt, rec, 3);
+            if (lv.narrow) {
+                put(mask_p, mask, 0);
+            } else {
+                put(mask_p, packed(mask, mask, zero(W)).mm, 0);
+                if (lv.has_z) {
+                    put(mask_p, mask, zoff);
+                }
+            }
+        }
+    }
+
+    // Replay an aggregate's deferred records: memcpy each record's payload to its
+    // destination slot (push order, later write wins), then wake level (Any-edge)
+    // readers if any record was staged.
+    void emit_agg_array_commit(Signal sig, llvm::Value* /*state*/) {
+        const SignalSlot& s      = slot_of(sig);
+        const uint32_t    idx    = agg_buf_idx(sig);
+        auto*             rt     = agg_rec_ty(s);
+        const auto        stride = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(rt));
+        auto*             i8     = b_.getInt8Ty();
+        llvm::Value*      base   = b_.CreateCall(nba_arr_base_fn(), { b_.getInt32(idx) });
+        llvm::Value*      count  = b_.CreateCall(nba_arr_count_fn(), { b_.getInt32(idx) });
+
+        auto* fn    = b_.GetInsertBlock()->getParent();
+        auto* head  = llvm::BasicBlock::Create(ctx_, "aggnba.head", fn);
+        auto* body  = llvm::BasicBlock::Create(ctx_, "aggnba.body", fn);
+        auto* done  = llvm::BasicBlock::Create(ctx_, "aggnba.done", fn);
+        auto* entry = b_.GetInsertBlock();
+        b_.CreateBr(head);
+        b_.SetInsertPoint(head);
+        auto* k = b_.CreatePHI(b_.getInt32Ty(), 2);
+        k->addIncoming(b_.getInt32(0), entry);
+        b_.CreateCondBr(b_.CreateICmpULT(k, count), body, done);
+        b_.SetInsertPoint(body);
+        llvm::Value* rec     = b_.CreateInBoundsGEP(i8, base, { b_.CreateMul(k, b_.getInt32(stride)) });
+        llvm::Value* dest    = b_.CreateAlignedLoad(raw_ptr_ty(), b_.CreateStructGEP(rt, rec, 0), llvm::Align{ 1 });
+        llvm::Value* nbytes  = b_.CreateAlignedLoad(b_.getInt32Ty(), b_.CreateStructGEP(rt, rec, 1), llvm::Align{ 1 });
+        llvm::Value* payload = b_.CreateStructGEP(rt, rec, 2);
+        if (!s.agg_masked) {
+            b_.CreateMemCpy(dest, llvm::MaybeAlign{ 1 }, payload, llvm::MaybeAlign{ 1 }, nbytes);
+        } else {
+            // Byte-wise masked read-modify-write: dest[j] = (dest[j] & ~m) | (val[j] & m).
+            // Width-agnostic — a mask byte of 0 leaves dest[j] unchanged, so an
+            // unselected bit (or a garbage padding byte gating dest padding) is a
+            // no-op. Mirrors the array masked commit without monomorphizing width.
+            llvm::Value* mask_r = b_.CreateStructGEP(rt, rec, 3);
+            auto*        bh     = llvm::BasicBlock::Create(ctx_, "aggnba.bh", fn);
+            auto*        bb     = llvm::BasicBlock::Create(ctx_, "aggnba.bb", fn);
+            auto*        bd     = llvm::BasicBlock::Create(ctx_, "aggnba.bd", fn);
+            auto*        pre    = b_.GetInsertBlock();
+            b_.CreateBr(bh);
+            b_.SetInsertPoint(bh);
+            auto* j = b_.CreatePHI(b_.getInt32Ty(), 2);
+            j->addIncoming(b_.getInt32(0), pre);
+            b_.CreateCondBr(b_.CreateICmpULT(j, nbytes), bb, bd);
+            b_.SetInsertPoint(bb);
+            llvm::Value* dj  = b_.CreateInBoundsGEP(i8, dest, { j });
+            llvm::Value* m   = b_.CreateLoad(i8, b_.CreateInBoundsGEP(i8, mask_r, { j }));
+            llvm::Value* v   = b_.CreateLoad(i8, b_.CreateInBoundsGEP(i8, payload, { j }));
+            llvm::Value* old = b_.CreateLoad(i8, dj);
+            b_.CreateStore(b_.CreateOr(b_.CreateAnd(old, b_.CreateNot(m)), b_.CreateAnd(v, m)), dj);
+            j->addIncoming(b_.CreateAdd(j, b_.getInt32(1)), b_.GetInsertBlock());
+            b_.CreateBr(bh);
+            b_.SetInsertPoint(bd);
+        }
+        k->addIncoming(b_.CreateAdd(k, b_.getInt32(1)), b_.GetInsertBlock());
+        b_.CreateBr(head);
+        b_.SetInsertPoint(done);
+
+        if (signal_has_waiters(sig)) {
+            auto* svc  = llvm::BasicBlock::Create(ctx_, "aggnba.svc", fn);
+            auto* cont = llvm::BasicBlock::Create(ctx_, "aggnba.cont", fn);
+            b_.CreateCondBr(b_.CreateICmpNE(count, b_.getInt32(0)), svc, cont);
+            b_.SetInsertPoint(svc);
+            service_any_waiters(sig);
+            b_.CreateBr(cont);
+            b_.SetInsertPoint(cont);
+        }
+    }
 
     // Stage a nonblocking write to an unpacked-array element: reserve a fixed-stride
     // record slot in this array's deferred buffer (rt_nba_arr_slot) and fill it with
@@ -7621,6 +8405,15 @@ private:
             b_.CreateRetVoid();
             return;
         }
+        if (contains_struct(cur_fn_->return_type)) {
+            // Copy the aggregate result (the Ret operand is its lvalue) out through
+            // the trailing storage-pointer out-param the caller owns.
+            emit_agg_storage_copy(fn_->getArg(fn_->arg_size() - 1),
+                                  agg_slot_ptr(lvalue_of(value)), cur_fn_->return_type);
+            deinit_body_strings();
+            b_.CreateRetVoid();
+            return;
+        }
         if (cur_fn_->return_type == mod_.pool.void_type) {
             deinit_body_strings();
             b_.CreateRetVoid();
@@ -7667,6 +8460,10 @@ private:
                 const LValue& lv = lvalue_of(a);
                 argv.push_back(lv_mm_ptr(lv));
                 argv.push_back(lv_z_ptr(lv));
+            } else if (contains_struct(f.param_types[k])) {
+                // An aggregate actual passes its storage pointer (the frontend
+                // emitted it as an lvalue); the callee copies it in.
+                argv.push_back(agg_slot_ptr(lvalue_of(a)));
             } else if (is_string_type(f.param_types[k])) {
                 argv.push_back(str_of(a));
             } else {
@@ -7676,6 +8473,21 @@ private:
                 argv.push_back(pl.z);
             }
             ++k;
+        }
+        if (contains_struct(f.return_type)) {
+            // Safe-temp aggregate return: the callee memcpies its result into a
+            // caller stack temp we pass as the trailing out-param; the call result
+            // is that temp lvalue (the frontend copies it into the target).
+            auto*        st  = agg_storage_ty(f.return_type);
+            llvm::Value* tmp = b_.CreateAlloca(st, nullptr, "call.agg.ret");
+            argv.push_back(tmp);
+            b_.CreateCall(cf->getFunctionType(), cf, argv);
+            LValue lv{};
+            lv.base    = tmp;
+            lv.root_ty = st;
+            lv.is_agg  = true;
+            set_lvalue(i, lv);
+            return;
         }
         if (is_string_type(f.return_type)) {
             // The callee assigns the result into this call's temp handle (the
@@ -9585,6 +10397,12 @@ private:
     // rather than the per-signal shadow; after a commit, each is woken if any
     // queued write touched it.
     std::vector<Signal>     array_nba_sigs_;
+    // Aggregate signals with a nonblocking write reaching a leaf through a
+    // runtime array index. Each such write defers a (dest-slot-pointer, nbytes,
+    // payload) record into a per-aggregate runtime buffer (indexed after the
+    // array buffers), replayed by memcpy in the NBA region; the signal is then
+    // woken (Any-edge) if any record touched it.
+    std::vector<Signal>     agg_nba_sigs_;
 
     // Block-commit NBA state. A whole-signal scalar NBA stages its shadow as before,
     // then registers its enclosing straight-line segment ("block") once per instant

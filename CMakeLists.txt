@@ -157,6 +157,7 @@ add_executable(clotho_test
   tests/sysfunc_test.cpp
   tests/streaming_test.cpp
   tests/uwire_test.cpp
+  tests/struct_test.cpp
   tests/plusargs_test.cpp
   tests/vcd_test.cpp
   tests/package_test.cpp
