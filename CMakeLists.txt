@@ -161,6 +161,7 @@ add_executable(clotho_test
   tests/vcd_test.cpp
   tests/package_test.cpp
   tests/inside_test.cpp
+  tests/wait_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho doctest::doctest clotho_warnings)
 

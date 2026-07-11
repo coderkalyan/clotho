@@ -2080,6 +2080,9 @@ private:
             case StatementKind::Return:
                 lower_return(stmt.as<ReturnStatement>(), b);
                 break;
+            case StatementKind::Wait:
+                lower_wait_stmt(stmt.as<WaitStatement>(), b);
+                break;
             case StatementKind::Disable:
             case StatementKind::DisableFork:
                 // TODO: disable — unwinding a suspended task coroutine and clearing
@@ -2397,6 +2400,46 @@ private:
         const ir::ExtraSlice step = b.close_region(); // empty
 
         b.loop(cond, pred, body, step, /*bottom_test*/ true, loc(d));
+    }
+
+    void lower_wait_stmt(const WaitStatement& w, ir::Builder& b) {
+        const ir::SourceLoc l = loc(w);
+
+        // The wait sensitivity: every signal the condition reads, each as an
+        // any-change (level) event. Fails loudly on a string operand (wait
+        // queues are not string-aware — see collect_expr_reads).
+        std::vector<ir::WaitEvent> reads;
+        collect_expr_reads(w.cond, reads);
+        std::vector<ir::WaitEdge> edges;
+        edges.reserve(reads.size());
+        for (const ir::WaitEvent& e : reads) {
+            edges.push_back(ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge) });
+        }
+
+        // forever { if (cond) break; @(reads); }
+        b.open_region();
+        const ir::Index      lpred = true_const(b, l);
+        const ir::ExtraSlice lcond = b.close_region();
+
+        b.open_region();
+        {
+            const ir::Index c = lower_predicate(w.cond, b);
+            b.open_region();
+            b.break_(l);
+            const ir::ExtraSlice then_r = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice else_r = b.close_region(); // empty
+            b.cond(c, then_r, else_r, l);
+            b.wait(edges, l);
+        }
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        const ir::ExtraSlice step = b.close_region(); // empty
+
+        b.loop(lcond, lpred, body, step, /*bottom_test*/ false, l);
+
+        lower_stmt(w.stmt, b);
     }
 
     // A forever loop around `body`: a constant-true Loop. Lowers both an
