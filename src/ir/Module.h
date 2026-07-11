@@ -166,6 +166,11 @@ struct Function {
     std::vector<Ref> local_types;
     // True for a task: lowered as a coroutine that may suspend on timing controls.
     bool is_task = false;
+    // True for a synthetic fork-child body (LRM 9.3.2): a parameterless coroutine
+    // spawned at a `fork`, whose completion epilogue decrements a shared join
+    // record and wakes the parent when the count reaches zero (rather than a
+    // task's unconditional single-parent resume). Implies is_task.
+    bool is_fork_child = false;
     // The lowered body.
     Ir ir;
 };

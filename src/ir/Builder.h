@@ -135,6 +135,11 @@ public:
     // A statement, never a value; the caller blocks until the task completes.
     Index task_call(FunctionId func, std::span<const Index> args, SourceLoc loc);
 
+    // Fork `fork … join` (LRM 9.3.2): spawn each child body as a concurrent
+    // coroutine, then join per `kind`. `children` are the fork-child task
+    // FunctionIds. A statement, never a value.
+    Index fork(std::span<const FunctionId> children, ForkKind kind, SourceLoc loc);
+
     // -- System tasks --
     // $display / $write: a literal format string, a newline flag (true for
     // $display), and the already-lowered value args its specifiers consume. The

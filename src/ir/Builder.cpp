@@ -237,6 +237,19 @@ Index Builder::task_call(FunctionId func, std::span<const Index> args, SourceLoc
     return emit({ Inst::Tag::TaskCall, Inst::Payload{ .extra = extra } }, loc);
 }
 
+Index Builder::fork(std::span<const FunctionId> children, ForkKind kind, SourceLoc loc) {
+    // FunctionId is a u32 enum; store the child ids in the extra arena as raw u32s
+    // (the same encoding add_slice uses for Index operands).
+    const auto start = static_cast<ExtraIndex>(extra_.size());
+    for (const FunctionId c : children) {
+        extra_.push_back(static_cast<uint32_t>(c));
+    }
+    const ExtraSlice slice{ start, static_cast<ExtraIndex>(extra_.size()) };
+    const ExtraIndex extra = add_extra(ForkInfo{ slice, kind });
+
+    return emit({ Inst::Tag::Fork, Inst::Payload{ .extra = extra } }, loc);
+}
+
 Index Builder::display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc) {
     // $display / $write: no descriptor operand; the backend targets standard output.
     return display_impl(static_cast<Index>(0), false, fmt, newline, args, loc);
