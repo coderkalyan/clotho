@@ -164,6 +164,7 @@ add_executable(clotho_test
   tests/wait_test.cpp
   tests/xhier_test.cpp
   tests/severity_test.cpp
+  tests/event_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho doctest::doctest clotho_warnings)
 
