@@ -5664,6 +5664,13 @@ private:
         switch (expr.kind) {
             case ExpressionKind::IntegerLiteral:
                 return b.constant(lower_int_literal(expr.as<IntegerLiteral>()), l);
+            case ExpressionKind::UnbasedUnsizedIntegerLiteral:
+                // '0/'1/'x/'z (LRM 5.7.1): the single bit fills the whole
+                // context-determined width. slang has already propagated the
+                // type and getValue() returns the SVInt sized+filled per the
+                // table (setAllOnes / createFillX / createFillZ).
+                return b.constant(
+                    svint_to_ref(expr.as<UnbasedUnsizedIntegerLiteral>().getValue(), lower_type(*expr.type)), l);
             case ExpressionKind::RealLiteral:
                 // An IEEE-754 double (LRM 5.7.2); a shortreal literal arrives as
                 // a cast around this, handled by the Conversion case.
