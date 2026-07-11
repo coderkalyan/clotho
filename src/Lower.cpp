@@ -2026,6 +2026,63 @@ private:
         b.wait(edges, l);
     }
 
+    // Emit the suspend for a blocking intra-assignment timing control
+    // (`lhs = #d rhs` / `lhs = @e rhs` / `lhs = repeat(N) @e rhs`, LRM 9.4.5).
+    // The caller has already sampled the RHS; this blocks the process on the
+    // delay/event, after which the caller stores the sampled value. A repeat
+    // event control waits for its child event N times (count evaluated once,
+    // N <= 0 falls through with no wait). The nonblocking form is not routed
+    // here — it needs a detached scheduled update (see lower_assign).
+    void lower_intra_timing(const TimingControl& tc, ir::Builder& b, ir::SourceLoc l) {
+        switch (tc.kind) {
+            case TimingControlKind::Delay:
+                b.unary(ir::Inst::Tag::Delay, scaled_delay(tc.as<DelayControl>().expr, b), l);
+                return;
+            case TimingControlKind::SignalEvent:
+            case TimingControlKind::EventList:
+                lower_event_wait(tc, b, l);
+                return;
+            case TimingControlKind::RepeatedEvent: {
+                const RepeatedEventControl& rec = tc.as<RepeatedEventControl>();
+                if (!is_event_control(rec.event)) {
+                    fail("repeat intra-assignment timing requires an event control");
+                }
+                if (rec.expr.type->isFloating()) {
+                    fail("repeat with a real count is not supported");
+                }
+                const ir::Ref    ty      = lower_type(*rec.expr.type);
+                const ir::Signal bound   = declare_temp(ty, "repeat_bound");
+                const ir::Signal counter = declare_temp(ty, "repeat_count");
+                b.binary(ir::Inst::Tag::Store, b.signal(bound, l),
+                         b.resize(lower_expr(rec.expr, b), ty, l), l);
+                b.binary(ir::Inst::Tag::Store, b.signal(counter, l),
+                         b.constant(module_.pool.put_int(ty, 0), l), l);
+
+                b.open_region();
+                const ir::Index cur  = b.unary(ir::Inst::Tag::Load, b.signal(counter, l), l);
+                const ir::Index lim  = b.unary(ir::Inst::Tag::Load, b.signal(bound, l), l);
+                const ir::Index pred = b.binary(ir::Inst::Tag::Lt, cur, lim, l);
+                const ir::ExtraSlice cond = b.close_region();
+
+                b.open_region();
+                lower_event_wait(rec.event, b, l);
+                const ir::ExtraSlice body = b.close_region();
+
+                b.open_region();
+                const ir::Index sc   = b.unary(ir::Inst::Tag::Load, b.signal(counter, l), l);
+                const ir::Index one  = b.constant(module_.pool.put_int(ty, 1), l);
+                b.binary(ir::Inst::Tag::Store, b.signal(counter, l),
+                         b.binary(ir::Inst::Tag::Add, sc, one, l), l);
+                const ir::ExtraSlice step = b.close_region();
+
+                b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
+                return;
+            }
+            default:
+                fail("unsupported intra-assignment timing control");
+        }
+    }
+
     // -- Statements --
 
     void lower_stmt(const Statement& stmt, ir::Builder& b) {
@@ -4845,10 +4902,38 @@ private:
             return lower_compound_assign(a, b);
         }
         if (a.timingControl != nullptr) {
-            // Intra-assignment timing: `x = #5 y;` / `x = @(posedge clk) y;`. The
-            // delay/event is dropped today, so the update would land immediately at
-            // the wrong time. Reject until the scheduler exists.
-            fail("intra-assignment timing control (#/@ on an assignment) is not supported");
+            // Intra-assignment timing (LRM 9.4.5): sample the RHS now, suspend on
+            // the delay/event, then store the sampled value. The blocking form is a
+            // pure reorder over the existing Delay/Wait suspends — the sampled RHS
+            // is an SSA value live across the suspend, which CoroSplit spills into
+            // the process frame. The nonblocking form (`<= #d`) must not block the
+            // process and instead schedules a detached future update; that needs
+            // scheduler infrastructure not present yet.
+            if (a.isNonBlocking()) {
+                // TODO: nonblocking intra-assignment timing (`<= #d` / `<= @e` /
+                // `<= repeat(N) @e`) — sample now, continue, commit after the
+                // delay/event via a detached scheduled store.
+                fail("nonblocking intra-assignment timing control is not supported");
+            }
+            const bool string_lhs =
+                is_string_expr(a.left()) ||
+                (a.left().kind == ExpressionKind::ElementSelect &&
+                 is_string_expr(a.left().as<ElementSelectExpression>().value()));
+            if (string_lhs || is_unpacked_array(a.left())) {
+                // TODO: intra-assignment timing on a string / whole-array target —
+                // the string/array store paths evaluate the LHS before the RHS, so
+                // reordering them across the suspend needs care.
+                fail("intra-assignment timing on a string or array target is not supported");
+            }
+            const ir::Index rhs = lower_expr(a.right(), b);
+            lower_intra_timing(*a.timingControl, b, loc(a));
+            if (a.left().kind == ExpressionKind::Concatenation) {
+                store_concat(a.left().as<ConcatenationExpression>(), rhs, ir::Inst::Tag::Store, b,
+                             loc(a));
+                return rhs;
+            }
+            b.binary(ir::Inst::Tag::Store, lower_lvalue(a.left(), b), rhs, loc(a));
+            return rhs;
         }
         if (a.isNonBlocking() && fn_ctx_ != nullptr) {
             if (!fn_ctx_->is_task) {
