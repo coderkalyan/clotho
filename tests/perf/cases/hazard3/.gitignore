@@ -1,0 +1,14 @@
+# Fetched + staged Hazard3 sources (see fetch.sh).
+/src/
+/_clone/
+# Headers fetched next to the testbench for its `include directives.
+/config.vh
+/hazard3_config_inst.vh
+# Firmware build intermediates.
+/fw/fw.elf
+/fw/fw.bin
+/fw/fw.dis
+# Oracle / run artifacts.
+/iv.out
+/splits.txt
+/hyperfine.json
