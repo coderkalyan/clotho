@@ -145,7 +145,14 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_fflush", &rt_fflush);
     expose("rt_readmem", &rt_readmem);
     expose("rt_random", &rt_random);
-    expose("rt_random_seeded", &rt_random_seeded);
+    expose("rt_dist_uniform", &rt_dist_uniform);
+    expose("rt_dist_normal", &rt_dist_normal);
+    expose("rt_dist_exponential", &rt_dist_exponential);
+    expose("rt_dist_poisson", &rt_dist_poisson);
+    expose("rt_dist_chi_square", &rt_dist_chi_square);
+    expose("rt_dist_t", &rt_dist_t);
+    expose("rt_dist_erlang", &rt_dist_erlang);
+    expose("rt_urandom_seed", &rt_urandom_seed);
     expose("rt_test_plusargs", &rt_test_plusargs);
     expose("rt_value_plusargs", &rt_value_plusargs);
     expose("rt_vcd_open", &rt_vcd_open);

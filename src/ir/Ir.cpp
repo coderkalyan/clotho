@@ -42,7 +42,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Clog2:
         case T::Ctz:
         case T::Clz:
-        case T::RandomSeeded:
+        case T::UrandomSeeded:
             return K::Unary;
 
         case T::BitSelect:
@@ -92,6 +92,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::FLe:
         case T::FGt:
         case T::FGe:
+        case T::UrandomRange:
             return K::Binary;
 
         case T::Resize:
@@ -123,6 +124,8 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::Scanf;
         case T::RealMath:
             return K::RealMath;
+        case T::DistCall:
+            return K::Dist;
         case T::TimeFormat:
             return K::TimeFormat;
         case T::Break:
@@ -134,6 +137,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::DumpFlush:
         case T::SimTime:
         case T::Random:
+        case T::Urandom:
             return K::None;
         case T::Finish:
         case T::CaseViol:
@@ -283,6 +287,13 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
             // real_math: the value args live in the RealMathInfo record; the
             // opcode is not an SSA operand.
             const auto info = extra_data<RealMathInfo>(p.extra);
+            return index_slice(info.args);
+        }
+
+        case Inst::PayloadKind::Dist: {
+            // dist_call: the seed + parameter operands live in the DistInfo
+            // record; the DistOp opcode is not an SSA operand.
+            const auto info = extra_data<DistInfo>(p.extra);
             return index_slice(info.args);
         }
 

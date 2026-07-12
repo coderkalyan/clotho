@@ -1679,6 +1679,18 @@ private:
         // #delay / @-wait suspend creates), leaving the insert point on a
         // terminator-less block that falls through to the final suspend.
         b_.SetInsertPoint(start_bb);
+        // Per-process $urandom RNG (LRM §18.13): allocate the xoshiro256++ state
+        // in the coroutine frame and seed it once here in the ramp, before the
+        // body loop, so it persists across activations (the loop back-edge is
+        // below this point) and CoroSplit frames it. The seed selector is the
+        // process index — an independent, run-stable stream per process,
+        // schedule-independent; $urandom(seed) reseeds in place. Forked-child
+        // seeding from the parent's stream lands with fork.
+        rng_slot_ = nullptr;
+        if (process_uses_urandom(proc)) {
+            rng_slot_ = b_.CreateAlloca(llvm::ArrayType::get(b_.getInt64Ty(), 4), nullptr, "urng");
+            b_.CreateCall(urandom_seed_fn(), { rng_slot_, b_.getInt64(proc_index) });
+        }
         const bool always_loop = proc.activation == Activation::Always && !proc.wait_events.empty();
         if (always_loop) {
             // An always block with a sensitivity list. It is subscribed to its
@@ -3048,6 +3060,22 @@ private:
     // plain per-activation thunk instead of a coroutine (see the thunk path in
     // lower_group) and can be fused with peers sharing its sensitivity. Shared
     // by compute_fusion_groups and the thunk decision.
+    // True when a process body contains any $urandom-family node, so lower_group
+    // must materialize and seed its per-process frame RNG.
+    static bool process_uses_urandom(const Process& p) {
+        for (size_t k = 0; k < p.ir.inst_count(); ++k) {
+            switch (p.ir.tag(static_cast<Index>(k))) {
+                case Inst::Tag::Urandom:
+                case Inst::Tag::UrandomSeeded:
+                case Inst::Tag::UrandomRange:
+                    return true;
+                default:
+                    break;
+            }
+        }
+        return false;
+    }
+
     bool is_simple_always(const Process& p) const {
         if (p.activation != Activation::Always || p.wait_events.empty()) {
             return false;
@@ -3067,6 +3095,15 @@ private:
                 case Inst::Tag::EventTriggerNbDelayed:
                 case Inst::Tag::EventTriggered:
                 case Inst::Tag::Fork:
+                    return false;
+                // The $urandom family keeps its per-process RNG state in the
+                // coroutine frame (LRM §18.13 thread stability), so a thunk (no
+                // frame) cannot host it — force a coroutine. $random / $dist_*
+                // carry their state in an explicit seed variable or the global
+                // stream, so they stay thunk/fusion eligible.
+                case Inst::Tag::Urandom:
+                case Inst::Tag::UrandomSeeded:
+                case Inst::Tag::UrandomRange:
                     return false;
                 // A deferred store (`x <= #d y` / `x <= @e y`) arms a record with an
                 // observable future effect; keep it out of thunk/fused groups (a
@@ -3784,8 +3821,6 @@ private:
                 case Inst::Tag::TimeFormat:
                 case Inst::Tag::SimTime:
                 case Inst::Tag::Random:
-                // $random(seed): the packed {seed, draw} result is never x.
-                case Inst::Tag::RandomSeeded:
                 // $clog2 of a clean operand is never x.
                 case Inst::Tag::Clog2:
                     break;
@@ -5494,9 +5529,16 @@ private:
     llvm::FunctionCallee random_fn() {
         return rt_fn("rt_random", b_.getInt32Ty(), {});
     }
-
-    llvm::FunctionCallee random_seeded_fn() {
-        return rt_fn("rt_random_seeded", b_.getInt64Ty(), { b_.getInt32Ty() });
+    // rt_dist_<op>(i32 seed, i32 params...) -> i64 {seed:32, draw:32}. `nparam`
+    // is the count of distribution parameters after the seed (1 or 2).
+    llvm::FunctionCallee dist_fn(const char* name, unsigned nparam) {
+        std::vector<llvm::Type*> params(nparam + 1, b_.getInt32Ty());
+        return rt_fn(name, b_.getInt64Ty(), params);
+    }
+    // void rt_urandom_seed(i64* state, i64 seed): splitmix64 expansion of a
+    // 64-bit selector into the process's xoshiro256++ frame state.
+    llvm::FunctionCallee urandom_seed_fn() {
+        return rt_fn("rt_urandom_seed", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
     }
     llvm::FunctionCallee wheel_pending_fn() {
         return rt_fn("rt_wheel_pending", b_.getInt32Ty(), { raw_ptr_ty() });
@@ -5880,10 +5922,6 @@ private:
                 return { 1, false, false };
             case Inst::Tag::Random:
                 return { 32, false, true };
-            case Inst::Tag::RandomSeeded:
-                // Packed {updated seed : 32, signed draw : 32}; sliced by the
-                // frontend. An opaque bit container, so unsigned.
-                return { 64, false, false };
             case Inst::Tag::Clog2:
                 // $clog2 returns a 32-bit signed `integer` (4-state: the result
                 // is X when the operand carries x/z).
@@ -5976,6 +6014,16 @@ private:
             // Every LRM 20.8.2 routine returns a real.
             case Inst::Tag::RealMath:
                 return { 64, false, true, false, true };
+
+            // $dist_* / seeded $random: a packed i64 {seed:32, draw:32}, sliced
+            // by the frontend. A definite 2-state word (never x/z).
+            case Inst::Tag::DistCall:
+                return { 64, false, false };
+            // $urandom / $urandom_range: a 32-bit unsigned `int` (2-state).
+            case Inst::Tag::Urandom:
+            case Inst::Tag::UrandomSeeded:
+            case Inst::Tag::UrandomRange:
+                return { 32, false, false };
 
             case Inst::Tag::RedAnd:
             case Inst::Tag::RedOr:
@@ -7159,12 +7207,63 @@ private:
                 return;
             }
 
-            case Inst::Tag::RandomSeeded: {
-                // Advance the seed word and receive {updated seed : 32, draw : 32}
-                // packed in an i64. Always known (no x/z): must == may, z == 0.
-                llvm::Value* seed = cast(must_of(value_of(p.unary)), 32, false);
-                llvm::Value* r    = b_.CreateCall(random_seeded_fn(), { seed });
-                set_value(i, packed(r, r, zero(64)));
+            case Inst::Tag::DistCall: {
+                // $dist_* / seeded $random: call the reference routine with the
+                // seed word and parameters (must planes, sign-extended to i32);
+                // the packed {seed, draw} i64 is a definite 2-state value the
+                // frontend slices.
+                const auto info = ir_->extra_data<DistInfo>(ir_->payload(i).extra);
+                const auto args = ir_->region(info.args);
+                std::vector<llvm::Value*> call_args;
+                call_args.reserve(args.size());
+                for (Index a : args) {
+                    call_args.push_back(cast(must_of(value_of(a)), 32, true));
+                }
+                llvm::FunctionCallee fn;
+                switch (static_cast<DistOp>(info.op)) {
+                    case DistOp::Uniform:     fn = dist_fn("rt_dist_uniform", 2); break;
+                    case DistOp::Normal:      fn = dist_fn("rt_dist_normal", 2); break;
+                    case DistOp::Exponential: fn = dist_fn("rt_dist_exponential", 1); break;
+                    case DistOp::Poisson:     fn = dist_fn("rt_dist_poisson", 1); break;
+                    case DistOp::ChiSquare:   fn = dist_fn("rt_dist_chi_square", 1); break;
+                    case DistOp::StudentT:    fn = dist_fn("rt_dist_t", 1); break;
+                    case DistOp::Erlang:      fn = dist_fn("rt_dist_erlang", 2); break;
+                }
+                set_value(i, two_val(b_.CreateCall(fn, call_args)));
+                return;
+            }
+
+            case Inst::Tag::Urandom:
+                set_value(i, lower_urandom());
+                return;
+
+            case Inst::Tag::UrandomSeeded: {
+                // $urandom(seed): reseed the process RNG from `seed`, then draw.
+                llvm::Value* seed = cast(must_of(value_of(ir_->payload(i).unary)), 64, false);
+                b_.CreateCall(urandom_seed_fn(), { rng_slot_, seed });
+                set_value(i, lower_urandom());
+                return;
+            }
+
+            case Inst::Tag::UrandomRange: {
+                // $urandom_range(maxval, minval): Lemire multiply-shift of one
+                // draw into [lo, hi]; swap when min > max (LRM §18.13.2). The
+                // negligible bias of the un-rejected multiply-shift is acceptable
+                // (the algorithm is LRM-unspecified).
+                llvm::Value* mx = cast(must_of(value_of(ir_->payload(i).binary.l)), 32, false);
+                llvm::Value* mn = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, false);
+                llvm::Value* ge = b_.CreateICmpUGE(mx, mn);
+                llvm::Value* hi = b_.CreateSelect(ge, mx, mn);
+                llvm::Value* lo = b_.CreateSelect(ge, mn, mx);
+                // range = (hi - lo) + 1, in [1, 2^32], in 64 bits.
+                llvm::Value* range =
+                  b_.CreateAdd(b_.CreateZExt(b_.CreateSub(hi, lo), b_.getInt64Ty()), b_.getInt64(1));
+                // draw32 = high 32 bits of the 64-bit result (already zero-extended
+                // into the low half by the shift).
+                llvm::Value* draw32 = b_.CreateLShr(emit_xoshiro_next(), 32);
+                llvm::Value* off =
+                  b_.CreateTrunc(b_.CreateLShr(b_.CreateMul(draw32, range), 32), b_.getInt32Ty());
+                set_value(i, two_val(b_.CreateAdd(lo, off)));
                 return;
             }
 
@@ -10050,6 +10149,48 @@ private:
         return b_.CreateCall(llmod_.getOrInsertFunction(name, dbl, dbl), { x });
     }
 
+    // rotl64(x, k) = (x << k) | (x >> (64 - k)).
+    llvm::Value* rotl64(llvm::Value* x, unsigned k) {
+        return b_.CreateOr(b_.CreateShl(x, k), b_.CreateLShr(x, 64 - k));
+    }
+
+    // One xoshiro256++ step against the process frame RNG (rng_slot_): load the
+    // four state words, produce the 64-bit result, advance and store the state.
+    // Inlined at each $urandom site (no per-draw runtime call).
+    llvm::Value* emit_xoshiro_next() {
+        auto* i64ty = b_.getInt64Ty();
+        auto* arrty = llvm::ArrayType::get(i64ty, 4);
+        llvm::Value* s[4];
+        for (int k = 0; k < 4; ++k) {
+            auto* ptr =
+              b_.CreateInBoundsGEP(arrty, rng_slot_, { b_.getInt32(0), b_.getInt32(k) });
+            s[k] = b_.CreateLoad(i64ty, ptr);
+        }
+        // result = rotl(s0 + s3, 23) + s0.
+        llvm::Value* result = b_.CreateAdd(rotl64(b_.CreateAdd(s[0], s[3]), 23), s[0]);
+        // State update (order matters: reads see already-updated words).
+        llvm::Value* t   = b_.CreateShl(s[1], 17);
+        llvm::Value* n2  = b_.CreateXor(s[2], s[0]);
+        llvm::Value* n3  = b_.CreateXor(s[3], s[1]);
+        llvm::Value* n1  = b_.CreateXor(s[1], n2);
+        llvm::Value* n0  = b_.CreateXor(s[0], n3);
+        n2               = b_.CreateXor(n2, t);
+        n3               = rotl64(n3, 45);
+        llvm::Value* ns[4] = { n0, n1, n2, n3 };
+        for (int k = 0; k < 4; ++k) {
+            auto* ptr =
+              b_.CreateInBoundsGEP(arrty, rng_slot_, { b_.getInt32(0), b_.getInt32(k) });
+            b_.CreateStore(ns[k], ptr);
+        }
+        return result;
+    }
+
+    // $urandom (LRM §18.13.1): the high 32 bits of one xoshiro256++ draw.
+    Plane lower_urandom() {
+        llvm::Value* hi = b_.CreateTrunc(b_.CreateLShr(emit_xoshiro_next(), 32), b_.getInt32Ty());
+        return two_val(hi);
+    }
+
     Plane lower_real_math(Index i) {
         const auto info = ir_->extra_data<RealMathInfo>(ir_->payload(i).extra);
         const auto args = ir_->region(info.args);
@@ -11299,6 +11440,11 @@ private:
     llvm::Value*        hdl_        = nullptr;
     llvm::Instruction*  coro_begin_ = nullptr;
     llvm::AllocaInst*   awaiter_    = nullptr;
+    // The current process's $urandom RNG state: a [4 x i64] xoshiro256++ alloca
+    // in the coroutine frame, seeded once in the ramp. Null for a process that
+    // never calls $urandom (no state materialized) or a thunk (which the
+    // $urandom-forces-coroutine rule keeps $urandom out of).
+    llvm::Value*        rng_slot_   = nullptr;
     // Reused scratch for staging array-NBA value/mask bytes before a push call
     // (one per process, hoisted to coro.begin so a loop of element NBAs does not
     // grow the stack). Layout: [16]mm_val [16]mm_mask [8]z_val [8]z_mask.

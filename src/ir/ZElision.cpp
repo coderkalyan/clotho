@@ -434,8 +434,13 @@ struct Analysis {
                 case Inst::Tag::Fflush:
                 case Inst::Tag::SimTime:
                 case Inst::Tag::Random:
-                // $random(seed): the packed {seed, draw} result is always known.
-                case Inst::Tag::RandomSeeded:
+                // $dist_* / seeded $random return a packed {seed, draw} i64 and
+                // $urandom family a 2-state draw — all definite bits, z = 0. The
+                // seed writeback is a plain Store swept by the Store cases.
+                case Inst::Tag::DistCall:
+                case Inst::Tag::Urandom:
+                case Inst::Tag::UrandomSeeded:
+                case Inst::Tag::UrandomRange:
                 // `-> e` / `->> e` / `->> #d e` are valueless; `e.triggered` is a
                 // definite 2-state bit. A named event carries no bit planes, so
                 // none seed z.

@@ -527,8 +527,22 @@ Index Builder::random(SourceLoc loc) {
     return emit({ Inst::Tag::Random, Inst::Payload{ .none = 0 } }, loc);
 }
 
-Index Builder::random_seeded(Index seed, SourceLoc loc) {
-    return emit({ Inst::Tag::RandomSeeded, Inst::Payload{ .unary = seed } }, loc);
+Index Builder::dist_call(DistOp op, std::span<const Index> args, SourceLoc loc) {
+    const ExtraSlice slice = add_slice(args);
+    const ExtraIndex extra = add_extra(DistInfo{ static_cast<uint32_t>(op), slice });
+    return emit({ Inst::Tag::DistCall, Inst::Payload{ .extra = extra } }, loc);
+}
+
+Index Builder::urandom(SourceLoc loc) {
+    return emit({ Inst::Tag::Urandom, Inst::Payload{ .none = 0 } }, loc);
+}
+
+Index Builder::urandom_seeded(Index seed, SourceLoc loc) {
+    return emit({ Inst::Tag::UrandomSeeded, Inst::Payload{ .unary = seed } }, loc);
+}
+
+Index Builder::urandom_range(Index maxval, Index minval, SourceLoc loc) {
+    return emit({ Inst::Tag::UrandomRange, Inst::Payload{ .binary = { maxval, minval } } }, loc);
 }
 
 Index Builder::test_plusargs(std::string_view str, SourceLoc loc) {

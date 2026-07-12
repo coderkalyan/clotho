@@ -206,3 +206,88 @@ TEST_CASE("$typename of an unsupported type kind fails loudly") {
                       " initial $display($typename(x)); endmodule")
             .find("$typename") != std::string::npos);
 }
+
+// -- $random(seed) / $dist_* / $urandom (LRM 20.15, 18.13) ------------------
+//
+// The $dist_* routines and seeded $random are the IEEE reference algorithm
+// (mandated verbatim), so the expected values below are byte-identical to
+// iverilog (cross-checked). $urandom is a per-process xoshiro256++ whose stream
+// is intentionally NOT iverilog-identical (LRM leaves it unspecified); it is pinned to its own deterministic output and its
+// LRM-required properties (range bounds, per-process independence, reseed).
+
+TEST_CASE("$random(seed) threads the seed and matches the reference stream") {
+    const std::string out = run_capture(prog(
+      "integer seed; integer r; int i;",
+      "seed = 1;"
+      "for (i=0;i<3;i=i+1) begin r=$random(seed); $display(\"%0d %0d\", r, seed); end"));
+    CHECK(out == "-2147414528 69070\n"
+                 "-1671855048 475628535\n"
+                 "1129920902 -1017563188\n");
+}
+
+TEST_CASE("$dist_* match the IEEE reference stream (iverilog oracle)") {
+    const std::string out = run_capture(prog(
+      "integer s; int i;",
+      "s=7; for(i=0;i<3;i=i+1) $display(\"%0d\", $dist_uniform(s,10,20));"
+      "s=7; for(i=0;i<3;i=i+1) $display(\"%0d\", $dist_normal(s,100,15));"
+      "s=7; for(i=0;i<3;i=i+1) $display(\"%0d\", $dist_exponential(s,5));"
+      "s=7; for(i=0;i<3;i=i+1) $display(\"%0d\", $dist_poisson(s,4));"
+      "s=7; for(i=0;i<3;i=i+1) $display(\"%0d\", $dist_chi_square(s,3));"
+      "s=7; for(i=0;i<3;i=i+1) $display(\"%0d\", $dist_t(s,3));"
+      "s=7; for(i=0;i<3;i=i+1) $display(\"%0d\", $dist_erlang(s,2,5));"));
+    CHECK(out == "10\n18\n17\n"      // uniform
+                 "117\n91\n98\n"     // normal
+                 "45\n1\n2\n"        // exponential
+                 "0\n6\n1\n"         // poisson
+                 "4\n11\n4\n"        // chi_square
+                 "1\n-1\n0\n"        // t
+                 "23\n2\n4\n");      // erlang
+}
+
+TEST_CASE("$urandom_range stays within [min,max] and swaps min>max") {
+    const std::string out = run_capture(prog(
+      "int a,i,ok; ",
+      "ok=1; for(i=0;i<20000;i=i+1) begin a=$urandom_range(50,10);"
+      "  if (a<10||a>50) ok=0; end $display(\"lo %0d\", ok);"
+      "ok=1; for(i=0;i<20000;i=i+1) begin a=$urandom_range(10,50);"  // swapped args
+      "  if (a<10||a>50) ok=0; end $display(\"sw %0d\", ok);"
+      "$display(\"one %0d\", $urandom_range(7,7));"));
+    CHECK(out == "lo 1\nsw 1\none 7\n");
+}
+
+TEST_CASE("$urandom is a deterministic per-process stream (pinned)") {
+    // A single process's first draws — deterministic across runs (seeded from
+    // the process index). Pins the xoshiro256++ stream so a lowering change that
+    // perturbs it is caught.
+    const std::string out = run_capture(prog(
+      "int i;",
+      "for(i=0;i<4;i=i+1) $display(\"%0d\", $urandom);"));
+    CHECK(out == "1394040161\n1641705277\n1544544145\n49201036\n");
+}
+
+TEST_CASE("$urandom(seed) reseeds reproducibly") {
+    const std::string out = run_capture(prog(
+      "int a,b;",
+      "a=$urandom(42); b=$urandom(42); $display(\"eq %0d\", a==b);"));
+    CHECK(out == "eq 1\n");
+}
+
+TEST_CASE("two processes each get an independent $urandom stream") {
+    // Distinct per-process frame RNGs: the two processes' first draws differ.
+    // Written to module vars at t0, compared by a later process (robust to the
+    // t0 process order and to the exact draw values).
+    const std::string out = run_capture(
+      "module m;\n"
+      " int va, vb;\n"
+      " initial va = $urandom;\n"
+      " initial vb = $urandom;\n"
+      " initial #1 begin $display(\"indep %0d\", va != vb); $finish; end\n"
+      "endmodule\n");
+    CHECK(out == "indep 1\n");
+}
+
+TEST_CASE("$urandom in a function fails loudly (no per-process RNG in frame)") {
+    CHECK(lower_error("module m; function int f(); return $urandom; endfunction\n"
+                      " initial $display(\"%0d\", f()); endmodule")
+            .find("$urandom") != std::string::npos);
+}

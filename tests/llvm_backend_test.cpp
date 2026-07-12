@@ -1409,7 +1409,7 @@ TEST_CASE("$random(seed) yields the deterministic seeded stream and writes the s
           "-103324941 seed=2044158073\n");
 }
 
-TEST_CASE("$random(seed) lowers to an rt_random_seeded call") {
+TEST_CASE("$random(seed) lowers to a seeded rt_dist_uniform call") {
     constexpr std::string_view src = R"(
         module m;
             integer seed;
@@ -1422,7 +1422,9 @@ TEST_CASE("$random(seed) lowers to an rt_random_seeded call") {
     )";
     const std::string          ir  = emit(src);
 
-    CHECK(ir.find("call i64 @rt_random_seeded(") != std::string::npos);
+    // $random(seed) == rtl_dist_uniform(seed, INT32_MIN, INT32_MAX): it shares
+    // the DistCall path, so the runtime crossing is the packed-i64 dist call.
+    CHECK(ir.find("call i64 @rt_dist_uniform(") != std::string::npos);
 }
 
 // $clog2 (LRM §20.8.1): ceil(log2(arg)), arg unsigned, $clog2(0) == 0. A

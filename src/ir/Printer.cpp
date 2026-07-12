@@ -298,8 +298,14 @@ const char* tag_name(Inst::Tag tag) {
             return "timeformat";
         case T::Random:
             return "random";
-        case T::RandomSeeded:
-            return "random_seeded";
+        case T::DistCall:
+            return "dist_call";
+        case T::Urandom:
+            return "urandom";
+        case T::UrandomSeeded:
+            return "urandom_seeded";
+        case T::UrandomRange:
+            return "urandom_range";
         case T::Clog2:
             return "clog2";
         case T::CountBits:
@@ -592,6 +598,15 @@ private:
             }
             case Inst::PayloadKind::RealMath: {
                 const auto info = ir_.extra_data<RealMathInfo>(p.extra);
+                os_ << "op" << info.op;
+                for (Index a : ir_.region(info.args)) {
+                    os_ << ", ";
+                    ref(a);
+                }
+                break;
+            }
+            case Inst::PayloadKind::Dist: {
+                const auto info = ir_.extra_data<DistInfo>(p.extra);
                 os_ << "op" << info.op;
                 for (Index a : ir_.region(info.args)) {
                     os_ << ", ";

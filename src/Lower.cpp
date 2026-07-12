@@ -5206,28 +5206,111 @@ private:
             return b.resize(b.sim_time(time_mul_, l), lower_type(*call.type), l);
         }
 
-        // $random (LRM §20.15.1): a 32-bit signed PRNG draw. The plain form
-        // returns the next value of the simulator's global random stream.
-        if (name == "$random") {
-            // Plain form: the next value of the simulator's global stream.
-            if (call.arguments().empty()) {
-                return b.random(l);
-            }
-            // Seeded form `$random(seed)` (LRM §20.15.1): the inout `seed` integer
-            // carries the whole PRNG state. Read it, advance the reference stream,
-            // write the updated state back, and return the draw. rt_random_seeded
-            // packs {updated seed : 32, signed draw : 32} into an i64, sliced here.
-            // slang wraps the inout seed arg in an identity Conversion; peel it to
-            // reach the underlying lvalue.
-            const Expression& seed_arg = unwrap_conversion(*call.arguments()[0]);
-            const ir::Index   seed_lv  = lower_lvalue(seed_arg, b);
-            const ir::Index   packed   = b.random_seeded(lower_expr(seed_arg, b), l);
-            const ir::Ref     i32s     = make_int_type(32, false, true);
-            const ir::Index   sh32 =
-              b.constant(module_.pool.put_int(make_int_type(64, false, false), 32u), l);
+        // The seed operand of a $dist_* (an output arg, slang §hasOutputArgs) is
+        // wrapped as Assignment{left = seed, right = EmptyArgument} — the same
+        // placeholder shape slang uses for output ports. $random's seed is a
+        // plain value arg. Reach the underlying seed lvalue in both cases.
+        const auto seed_lvalue_expr = [](const Expression& a) -> const Expression& {
+            const Expression& inner =
+              a.kind == ExpressionKind::Assignment ? a.as<AssignmentExpression>().left() : a;
+            return unwrap_conversion(inner);
+        };
+
+        // A $dist_* / seeded-$random result is a packed {seed:32, draw:32} i64.
+        // Store the updated seed back to the inout `seed` lvalue and yield the
+        // signed draw. Shared by $random(seed) and every $dist_* (LRM §20.15).
+        const auto seed_writeback = [&](const Expression& seed_arg, ir::Index packed) -> ir::Index {
+            const ir::Ref   i32s    = make_int_type(32, false, true);
+            const ir::Index sh32    = b.constant(module_.pool.put_int(make_int_type(64, false, false), 32u), l);
+            const ir::Index seed_lv = lower_lvalue(seed_lvalue_expr(seed_arg), b);
             b.binary(ir::Inst::Tag::Store, seed_lv,
                      b.resize(b.binary(ir::Inst::Tag::Srl, packed, sh32, l), i32s, l), l);
             return b.resize(packed, i32s, l);
+        };
+
+        // $random (LRM §20.15.1): a 32-bit signed PRNG draw. The plain form
+        // returns the next value of the simulator's global random stream; the
+        // seeded form `$random(seed)` is rtl_dist_uniform(seed, INT32_MIN,
+        // INT32_MAX), lowered through the shared DistCall path so its inout-seed
+        // writeback matches $dist_*.
+        if (name == "$random") {
+            if (call.arguments().empty()) {
+                return b.random(l);
+            }
+            const Expression& seed_arg = *call.arguments()[0];
+            const ir::Ref     i32s     = make_int_type(32, false, true);
+            const ir::Index   lo = b.constant(module_.pool.put_int(i32s, 0x80000000ull), l);
+            const ir::Index   hi = b.constant(module_.pool.put_int(i32s, 0x7fffffffull), l);
+            const std::array<ir::Index, 3> args{ lower_expr(seed_lvalue_expr(seed_arg), b), lo, hi };
+            return seed_writeback(seed_arg, b.dist_call(ir::DistOp::Uniform, args, l));
+        }
+
+        // $dist_* (LRM §20.15.2): the IEEE reference distributions, each with an
+        // inout `seed` first argument and 1-2 distribution parameters. The
+        // rtl_dist_* algorithms are mandated verbatim, so the stream is
+        // byte-identical to any conforming tool for a given seed.
+        struct DistSpec {
+            const char* nm;
+            ir::DistOp  op;
+            size_t      nparam;
+        };
+        static constexpr DistSpec kDists[] = {
+            { "$dist_uniform", ir::DistOp::Uniform, 2 },
+            { "$dist_normal", ir::DistOp::Normal, 2 },
+            { "$dist_exponential", ir::DistOp::Exponential, 1 },
+            { "$dist_poisson", ir::DistOp::Poisson, 1 },
+            { "$dist_chi_square", ir::DistOp::ChiSquare, 1 },
+            { "$dist_t", ir::DistOp::StudentT, 1 },
+            { "$dist_erlang", ir::DistOp::Erlang, 2 },
+        };
+        for (const DistSpec& d : kDists) {
+            if (name != d.nm) {
+                continue;
+            }
+            const auto argv = call.arguments();
+            if (argv.size() != d.nparam + 1) {
+                fail(std::string(d.nm) + " requires a seed and " + std::to_string(d.nparam) +
+                     " parameter(s)");
+            }
+            std::vector<ir::Index> args;
+            args.reserve(argv.size());
+            // The seed (arg 0) is read as a bare integer lvalue; the distribution
+            // parameters keep any value conversion slang inserted.
+            args.push_back(lower_expr(seed_lvalue_expr(*argv[0]), b));
+            for (size_t k = 1; k < argv.size(); ++k) {
+                args.push_back(lower_expr(*argv[k], b));
+            }
+            return seed_writeback(*argv[0], b.dist_call(d.op, args, l));
+        }
+
+        // $urandom / $urandom_range (LRM §18.13): the per-process RNG lives in
+        // the process's coroutine frame, so these are only legal in a process
+        // context. A function/task body has no frame RNG (threading the caller's
+        // RNG through the call ABI is future work — tracked in docs/TODO.md).
+        if (name == "$urandom") {
+            if (fn_ctx_ != nullptr) {
+                fail("$urandom inside a function/task is not supported yet (no per-process "
+                     "RNG in the call frame); call it directly from a process");
+            }
+            if (call.arguments().empty()) {
+                return b.urandom(l);
+            }
+            return b.urandom_seeded(lower_expr(*call.arguments()[0], b), l);
+        }
+        if (name == "$urandom_range") {
+            if (fn_ctx_ != nullptr) {
+                fail("$urandom_range inside a function/task is not supported yet (no per-process "
+                     "RNG in the call frame); call it directly from a process");
+            }
+            const auto argv = call.arguments();
+            if (argv.empty() || argv.size() > 2) {
+                fail("$urandom_range requires one or two arguments (maxval [, minval])");
+            }
+            const ir::Index maxv = lower_expr(*argv[0], b);
+            const ir::Index minv =
+              argv.size() == 2 ? lower_expr(*argv[1], b)
+                               : b.constant(module_.pool.put_int(make_int_type(32, false, false), 0), l);
+            return b.urandom_range(maxv, minv, l);
         }
 
         // $signed / $unsigned (LRM §20.10): reinterpret the self-determined

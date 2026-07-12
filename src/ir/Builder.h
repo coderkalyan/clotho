@@ -279,10 +279,19 @@ public:
     Index sim_time(uint64_t scale, SourceLoc loc);
     // $random: a 32-bit signed PRNG draw. No operands.
     Index random(SourceLoc loc);
-    // $random(seed): the seeded PRNG draw. `seed` is the current seed word; the
-    // result is a 64-bit two-state value packing the updated seed (high 32) with
-    // the signed draw (low 32).
-    Index random_seeded(Index seed, SourceLoc loc);
+    // A distribution function (LRM §20.15.2) or seeded $random (§20.15.1): the
+    // DistOp plus its value operands (the seed word, then the parameters).
+    // Yields an i64 with the updated seed packed in [32,64) and the signed draw
+    // in [0,32).
+    Index dist_call(DistOp op, std::span<const Index> args, SourceLoc loc);
+    // $urandom (LRM §18.13.1): a 32-bit unsigned per-process xoshiro256++ draw.
+    // No operands; reads/advances the process frame RNG.
+    Index urandom(SourceLoc loc);
+    // $urandom(seed) (LRM §18.13.1): reseed the process RNG from `seed`, then draw.
+    Index urandom_seeded(Index seed, SourceLoc loc);
+    // $urandom_range(maxval, minval) (LRM §18.13.2): one draw mapped into
+    // [min, max] (the backend swaps when min > max).
+    Index urandom_range(Index maxval, Index minval, SourceLoc loc);
     // $test$plusargs(str): nonzero iff a command-line plusarg's prefix matches
     // `str`. No SSA operands.
     Index test_plusargs(std::string_view str, SourceLoc loc);

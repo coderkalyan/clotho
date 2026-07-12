@@ -102,6 +102,20 @@ enum class RealMathOp : uint32_t {
     Atanh,
 };
 
+// Which probabilistic distribution function a `dist_call` selects (LRM
+// §20.15.2). Kept in lockstep with the rt_dist_* runtime entries and the
+// backend dispatch. Uniform doubles as the seeded $random(seed) form
+// (§20.15.1), which is rtl_dist_uniform over the full int32 span.
+enum class DistOp : uint32_t {
+    Uniform,
+    Normal,
+    Exponential,
+    Poisson,
+    ChiSquare,
+    StudentT,
+    Erlang,
+};
+
 // A struct may be overlaid on the extra buffer iff it is trivially copyable
 // and a whole number of u32 words wide. Because every field is a 4-byte
 // handle/enum, such structs carry no padding and round-trip via bit_cast.
@@ -513,6 +527,17 @@ struct RealMathInfo {
     ExtraSlice args;
 };
 
+// Extra payload for `dist_call`: a probabilistic distribution function (LRM
+// §20.15.2) or seeded $random (§20.15.1). `op` is the ir::DistOp; `args` are the
+// value operands in call order — the seed word first, then the distribution
+// parameters (0-2 of them).
+struct DistInfo {
+    // ir::DistOp value.
+    uint32_t op;
+    // Value operands: seed, then parameters.
+    ExtraSlice args;
+};
+
 // Extra payload for `fgets`: $fgets(str, fd) (LRM §21.3.4) reads a line from the
 // descriptor `fd` into the packed-vector lvalue `str` (the instruction's `op`),
 // returning the character count. `fd` is a value operand.
@@ -740,6 +765,7 @@ static_assert(ExtraPayload<SeverityInfo>);
 static_assert(ExtraPayload<FopenInfo>);
 static_assert(ExtraPayload<FileOpInfo>);
 static_assert(ExtraPayload<RealMathInfo>);
+static_assert(ExtraPayload<DistInfo>);
 static_assert(ExtraPayload<FgetsInfo>);
 static_assert(ExtraPayload<SformatInfo>);
 static_assert(ExtraPayload<SformatfInfo>);
@@ -1197,15 +1223,31 @@ struct Inst {
         SimTime,
         // $random: IEEE Annex N reference PRNG, -> 32-bit signed two-state (payload:
         // none). Lowers to an `rt_random` call; the value is always known (no
-        // x/z).
+        // x/z). The unseeded (process-global) form only; the seeded form
+        // `$random(seed)` lowers to DistCall(Uniform, ...) instead.
         Random,
-        // $random(seed) (LRM §20.15.1): the seeded PRNG draw. `op` (payload: unary)
-        // is the current seed word; the result is a 64-bit two-state value packing
-        // the updated seed in the high 32 bits with the signed draw in the low 32.
-        // The frontend reads the inout seed lvalue, feeds it here, stores the high
-        // half back, and returns the low half. Lowers to `rt_random_seeded`; the
-        // value is always known (no x/z).
-        RandomSeeded,
+        // A probabilistic distribution function (LRM §20.15.2) or the seeded
+        // $random(seed) (§20.15.1). Payload: extra -> DistInfo (the DistOp plus
+        // the value operands: the seed word, then the distribution parameters).
+        // Lowers to the matching rt_dist_* call, returning an i64 with the
+        // updated seed packed in [32,64) and the signed integer draw in [0,32);
+        // the frontend slices the seed back to the inout lvalue and takes the
+        // draw. The result is always known (no x/z).
+        DistCall,
+        // $urandom (LRM §18.13.1): a per-process xoshiro256++ draw, -> a 32-bit
+        // unsigned two-state `int`. No operand (payload: none); reads and
+        // advances the process's coroutine-frame RNG state, inlined by the
+        // backend. A process containing this tag is forced to a coroutine (it
+        // needs the frame) — see is_simple_always.
+        Urandom,
+        // $urandom(seed) (LRM §18.13.1): reseed the process RNG from `seed`
+        // (payload: unary) then draw, -> a 32-bit unsigned `int`.
+        UrandomSeeded,
+        // $urandom_range(maxval, minval) (LRM §18.13.2): an inlined Lemire
+        // multiply-shift of one process RNG draw into [min, max] (payload:
+        // binary l=maxval, r=minval; the backend swaps when min > max), -> a
+        // 32-bit unsigned `int`.
+        UrandomRange,
         // $clog2: ceil(log2(operand)) with the operand treated as unsigned and
         // $clog2(0) == 0, -> a 32-bit signed `integer` (payload: unary). LRM
         // §20.8.1. The operand's own width bounds the count; any x/z bit in it
@@ -1257,6 +1299,7 @@ struct Inst {
         Sformatf,
         Scanf,
         RealMath,
+        Dist,
         Severity,
     };
 
