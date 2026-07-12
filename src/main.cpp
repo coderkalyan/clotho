@@ -57,6 +57,10 @@ int main(int argc, char** argv) {
             config.perf_jitdump = true;
         } else if (arg == "-o" && i + 1 < argc) {
             out = argv[++i];
+        } else if (arg == "--dpi-lib" && i + 1 < argc) {
+            // A shared object searched to resolve `import "DPI-C"` symbols at JIT
+            // link time (LRM 35); repeatable, searched in order.
+            config.dpi_libs.push_back(argv[++i]);
         } else if (arg.starts_with("+") && !arg.starts_with("+define+") &&
                    !arg.starts_with("+incdir+")) {
             // A plusarg (LRM §21.6): made available to $test$plusargs /
@@ -72,7 +76,7 @@ int main(int argc, char** argv) {
 
     if (slang_args.empty() || (emit != "run" && emit != "ir" && emit != "llvm" && emit != "opt")) {
         std::println(stderr,
-                     "usage: {} [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] [--no-thunk] [--domain-spec] [-O] [--perf-jitdump] [-o <out>] [-D<macro>] [-I<dir>] [+define+...] [+incdir+...] [-f <cmd.f>] [--top <mod>] <file.sv>... [+plusarg...]",
+                     "usage: {} [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] [--no-thunk] [--domain-spec] [-O] [--perf-jitdump] [-o <out>] [--dpi-lib <lib.so>] [-D<macro>] [-I<dir>] [+define+...] [+incdir+...] [-f <cmd.f>] [--top <mod>] <file.sv>... [+plusarg...]",
                      argv[0]);
         return 2;
     }

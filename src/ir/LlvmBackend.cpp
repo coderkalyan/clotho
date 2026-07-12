@@ -1771,10 +1771,83 @@ private:
         return llvm::StructType::get(ctx_, { int_ty(2 * w), int_ty(w) });
     }
 
+    // The native LLVM type of a DPI-C scalar (LRM 35.5.6): the by-value C type
+    // each SV scalar maps to. Wider SV types never reach here (frontend-guarded).
+    llvm::Type* dpi_c_llvm_ty(DpiCType t) {
+        switch (t) {
+            case DpiCType::Void:
+                return b_.getVoidTy();
+            case DpiCType::Byte:
+            case DpiCType::BitScalar:   // svBit
+            case DpiCType::LogicScalar: // svLogic
+                return b_.getInt8Ty();
+            case DpiCType::Shortint:
+                return b_.getInt16Ty();
+            case DpiCType::Int:
+                return b_.getInt32Ty();
+            case DpiCType::Longint:
+                return b_.getInt64Ty();
+            case DpiCType::Real:
+                return b_.getDoubleTy();
+            case DpiCType::Shortreal:
+                return b_.getFloatTy();
+            case DpiCType::BitVec:
+            case DpiCType::LogicVec:
+                // A packed vector is always passed by pointer and is never a return
+                // type; declare_dpi_import emits the pointer directly, so this is
+                // never reached for a by-value slot.
+                throw BackendError{ "internal: DPI vec has no by-value C type" };
+        }
+        throw BackendError{ "internal: unknown DPI C type" };
+    }
+
+    // A packed-vector DPI arg (svBitVecVal* / svLogicVecVal*), passed by pointer in
+    // every direction — as opposed to a by-value scalar.
+    static bool is_dpi_vec(DpiCType ct) {
+        return ct == DpiCType::BitVec || ct == DpiCType::LogicVec;
+    }
+
+    // Declare a DPI-C import (LRM 35) as an external C function with its native
+    // scalar signature (no `state` param, no plane-pair expansion). extern_name
+    // resolves at JIT link time against a --dpi-lib shared object. A `pure` import
+    // is side-effect-free, so mark it readnone + willreturn + nounwind so the
+    // optimizer can CSE / hoist / DCE the call.
+    llvm::Function* declare_dpi_import(FunctionId id) {
+        const Function&          f   = mod_.function(id);
+        auto*                    ptr = llvm::PointerType::getUnqual(ctx_);
+        std::vector<llvm::Type*> params;
+        params.reserve(f.dpi_arg_ctypes.size());
+        for (size_t k = 0; k < f.dpi_arg_ctypes.size(); ++k) {
+            const ArgDir   dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
+            const DpiCType ct  = f.dpi_arg_ctypes[k];
+            // A packed vector is a pointer in every direction (svBitVecVal* /
+            // svLogicVecVal*); a scalar is by value for input, by pointer for
+            // output / inout (the C function writes through it).
+            const bool by_ptr = is_dpi_vec(ct) || dir != ArgDir::In;
+            params.push_back(by_ptr ? ptr : dpi_c_llvm_ty(ct));
+        }
+        auto* fnty   = llvm::FunctionType::get(dpi_c_llvm_ty(f.dpi_ret_ctype), params, false);
+        auto  callee = llmod_.getOrInsertFunction(f.extern_name, fnty);
+        auto* fn     = llvm::dyn_cast<llvm::Function>(callee.getCallee());
+        if (fn == nullptr) {
+            throw BackendError{ "DPI import '" + f.extern_name +
+                                "' conflicts with an existing symbol of a different type" };
+        }
+        if (f.is_pure) {
+            fn->setDoesNotAccessMemory();
+            fn->setWillReturn();
+            fn->setDoesNotThrow();
+        }
+        return fn;
+    }
+
     // Create (but do not yet lower) a function's declaration, so calls — including
     // recursive and forward ones — resolve before any body is emitted.
     llvm::Function* declare_function(FunctionId id) {
         const Function& f = mod_.function(id);
+        if (f.is_dpi) {
+            return declare_dpi_import(id);
+        }
         if (f.is_task) {
             return declare_task(id);
         }
@@ -2073,7 +2146,12 @@ private:
     // frame, Ret is a real return, Call invokes another function.
     void lower_function(FunctionId id) {
         const Function& f = mod_.function(id);
-        ir_               = &f.ir;
+        if (f.is_dpi) {
+            // A DPI import is only an external declaration (declare_dpi_import);
+            // its body is native C, so there is nothing to lower.
+            return;
+        }
+        ir_ = &f.ir;
         cur_fn_           = &f;
         cur_is_task_      = false;
         param_llvm_index_ = param_indices(f);
@@ -9523,6 +9601,10 @@ private:
     void lower_call_inst(Index i) {
         const auto                ci = ir_->extra_data<CallInfo>(ir_->payload(i).extra);
         const Function&           f  = mod_.function(ci.func);
+        if (f.is_dpi) {
+            lower_dpi_call(i, ci, f);
+            return;
+        }
         llvm::Function*           cf = fn_decls_[static_cast<uint32_t>(ci.func)];
         std::vector<llvm::Value*> argv;
         argv.push_back(state_);
@@ -9620,6 +9702,195 @@ private:
                 pl = real_plane(planes_to_real(pl, t.width));
             }
             set_value(i, pl);
+        }
+    }
+
+    // 32-bit chunk count of a width-W packed vector (the svBitVecVal / svLogicVecVal
+    // element count).
+    static uint32_t dpi_nchunks(uint32_t w) {
+        return (w + 31) / 32;
+    }
+
+    llvm::FunctionCallee dpi_pack_logicvec_fn() {
+        auto* p = raw_ptr_ty();
+        return rt_fn("rt_dpi_pack_logicvec", b_.getVoidTy(), { p, p, p, b_.getInt32Ty(), p });
+    }
+    llvm::FunctionCallee dpi_unpack_logicvec_fn() {
+        auto* p = raw_ptr_ty();
+        return rt_fn("rt_dpi_unpack_logicvec", b_.getVoidTy(), { p, b_.getInt32Ty(), p, p, p });
+    }
+
+    // Spill an iW plane into a fresh entry-block buffer of `nchunks` 32-bit words
+    // (zero-extended above W), returned as a pointer the runtime reads as uint32*.
+    llvm::Value* dpi_spill_words(llvm::Value* plane, uint32_t nchunks) {
+        auto* bufty = int_ty(nchunks * 32);
+        auto* buf   = entry_alloca(bufty, "dpi.words");
+        b_.CreateStore(b_.CreateZExtOrTrunc(plane, bufty), buf);
+        return buf;
+    }
+    // Load an iW value back from an `nchunks`-word buffer.
+    llvm::Value* dpi_load_words(llvm::Value* buf, uint32_t nchunks, uint32_t w) {
+        return b_.CreateTrunc(b_.CreateLoad(int_ty(nchunks * 32), buf), int_ty(w));
+    }
+
+    // A fresh svVecVal scratch: nchunks 32-bit words for a bit vector, 2*nchunks
+    // (interleaved {aval,bval}) for a logic vector.
+    llvm::Value* dpi_vec_alloca(DpiCType ct, uint32_t nchunks) {
+        return entry_alloca(int_ty((ct == DpiCType::BitVec ? 1u : 2u) * nchunks * 32), "dpi.vec");
+    }
+
+    // Fill an svVecVal scratch from a value Plane (input build / inout copy-in).
+    void dpi_vec_copyin(DpiCType ct, Plane pl, uint32_t w, llvm::Value* scratch) {
+        const uint32_t nc = dpi_nchunks(w);
+        if (ct == DpiCType::BitVec) {
+            // svBitVecVal: the (2-state) value plane chunked is already the layout.
+            b_.CreateStore(b_.CreateZExtOrTrunc(must_of(pl), int_ty(nc * 32)), scratch);
+            return;
+        }
+        // svLogicVecVal: spill must/may/z; the runtime computes aval/bval + interleave.
+        llvm::Value* zv = (pl.two || pl.z == nullptr) ? zero(w) : pl.z;
+        b_.CreateCall(dpi_pack_logicvec_fn(), { dpi_spill_words(must_of(pl), nc),
+                                                dpi_spill_words(may_of(pl), nc),
+                                                dpi_spill_words(zv, nc), b_.getInt32(nc), scratch });
+    }
+
+    // Reconstruct a value Plane from an svVecVal scratch (output / inout copy-out).
+    Plane dpi_vec_copyout(DpiCType ct, llvm::Value* scratch, uint32_t w) {
+        const uint32_t nc = dpi_nchunks(w);
+        if (ct == DpiCType::BitVec) {
+            return two_val(dpi_load_words(scratch, nc, w));
+        }
+        llvm::Value* must = entry_alloca(int_ty(nc * 32), "dpi.must");
+        llvm::Value* may  = entry_alloca(int_ty(nc * 32), "dpi.may");
+        llvm::Value* zv   = entry_alloca(int_ty(nc * 32), "dpi.z");
+        b_.CreateCall(dpi_unpack_logicvec_fn(), { scratch, b_.getInt32(nc), must, may, zv });
+        return packed(dpi_load_words(must, nc, w), dpi_load_words(may, nc, w),
+                      dpi_load_words(zv, nc, w));
+    }
+
+    // Lower a `call` to a DPI-C import (LRM 35): marshal each argument — scalar by
+    // value (input) or through a C-native scratch pointer (output / inout), packed
+    // vector always through an svBitVecVal* / svLogicVecVal* scratch — call the
+    // external symbol directly (no state pointer), and convert the C return back to
+    // a Plane. The frontend guards unsupported types, so no ref servicing.
+    void lower_dpi_call(Index i, const CallInfo& ci, const Function& f) {
+        llvm::Function*           cf = fn_decls_[static_cast<uint32_t>(ci.func)];
+        std::vector<llvm::Value*> argv;
+        // output / inout scratches to read back into the caller temp after the
+        // call; the frontend's CopyOutArg then copies temp -> actual. `cty` is null
+        // for a vec scratch (read back via dpi_vec_copyout instead).
+        struct DpiOut {
+            Index        temp;
+            DpiCType     ct;
+            llvm::Value* scratch;
+            llvm::Type*  cty;
+            uint32_t     w;
+        };
+        std::vector<DpiOut> outs;
+        size_t              k = 0;
+        for (Index a : ir_->region(ci.args)) {
+            const DpiCType ct  = f.dpi_arg_ctypes[k];
+            const ArgDir   dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
+            const uint32_t w   = width_of(f.param_types[k]);
+            // Scratch allocas are entry-block-hoisted (entry_alloca), so a DPI call
+            // in a loop does not grow the stack per iteration.
+            if (is_dpi_vec(ct)) {
+                // Packed vector: always by pointer. Input builds the scratch from the
+                // value; output leaves it empty for the C to fill; inout copies in.
+                llvm::Value* scratch = dpi_vec_alloca(ct, dpi_nchunks(w));
+                if (dir == ArgDir::In) {
+                    dpi_vec_copyin(ct, value_of(a), w, scratch);
+                } else if (dir == ArgDir::Inout) {
+                    dpi_vec_copyin(ct, lower_load(lvalue_of(a)), w, scratch);
+                }
+                argv.push_back(scratch);
+                if (dir != ArgDir::In) {
+                    outs.push_back({ a, ct, scratch, nullptr, w });
+                }
+            } else if (dir == ArgDir::In) {
+                argv.push_back(dpi_arg_to_c(ct, value_of(a)));
+            } else {
+                llvm::Type*  cty     = dpi_c_llvm_ty(ct);
+                llvm::Value* scratch = entry_alloca(cty, "dpi.out");
+                if (dir == ArgDir::Inout) {
+                    b_.CreateStore(dpi_arg_to_c(ct, lower_load(lvalue_of(a))), scratch);
+                }
+                argv.push_back(scratch);
+                outs.push_back({ a, ct, scratch, cty, w });
+            }
+            ++k;
+        }
+        llvm::Value* r = b_.CreateCall(cf->getFunctionType(), cf, argv);
+        for (const DpiOut& o : outs) {
+            const Plane pl = is_dpi_vec(o.ct)
+                               ? dpi_vec_copyout(o.ct, o.scratch, o.w)
+                               : dpi_c_to_plane(o.ct, b_.CreateLoad(o.cty, o.scratch));
+            lower_store(lvalue_of(o.temp), pl);
+        }
+        if (f.dpi_ret_ctype != DpiCType::Void) {
+            set_value(i, dpi_c_to_plane(f.dpi_ret_ctype, r));
+        }
+    }
+
+    // Marshal an SV scalar value (a Plane the frontend resized to the formal type)
+    // to its DPI-C native argument (LRM 35.5.6). A 2-state integer passes its value
+    // plane; a scalar logic packs to svLogic (0/1/2=Z/3=X); a real rides its fp.
+    llvm::Value* dpi_arg_to_c(DpiCType t, Plane p) {
+        switch (t) {
+            case DpiCType::Byte:
+                return cast(must_of(p), 8, true);
+            case DpiCType::Shortint:
+                return cast(must_of(p), 16, true);
+            case DpiCType::Int:
+                return cast(must_of(p), 32, true);
+            case DpiCType::Longint:
+                return cast(must_of(p), 64, true);
+            case DpiCType::Real:
+            case DpiCType::Shortreal:
+                return fp_of(p);
+            case DpiCType::BitScalar:
+                return cast(must_of(p), 8, false); // zext the 1-bit value to svBit
+            case DpiCType::LogicScalar: {
+                // svLogic: sv_0=0, sv_1=1, sv_z=2, sv_x=3. z wins; else 1 for a
+                // definite 1; else 3 (X) for any other unknown; else 0. The formal
+                // is width 1. A 4-state Plane may carry no z plane (never-z), so
+                // materialize the z bit safely rather than through z_of (nullptr).
+                const uint32_t w    = width_of(p);
+                llvm::Value*   zbit = (p.two || p.z == nullptr) ? b_.getFalse()
+                                                                : b_.CreateICmpNE(p.z, zero(w));
+                return b_.CreateSelect(
+                  zbit, b_.getInt8(2),
+                  b_.CreateSelect(b_.CreateICmpNE(must_of(p), zero(w)), b_.getInt8(1),
+                                  b_.CreateSelect(b_.CreateICmpNE(may_of(p), zero(w)),
+                                                  b_.getInt8(3), b_.getInt8(0))));
+            }
+            default:
+                throw BackendError{ "internal: DPI void argument" };
+        }
+    }
+
+    // Convert a DPI-C native return value back to a Plane of the SV return type.
+    Plane dpi_c_to_plane(DpiCType t, llvm::Value* r) {
+        switch (t) {
+            case DpiCType::Byte:
+            case DpiCType::Shortint:
+            case DpiCType::Int:
+            case DpiCType::Longint:
+                return two_val(r); // the C iW is the 2-state value plane
+            case DpiCType::Real:
+            case DpiCType::Shortreal:
+                return real_plane(r);
+            case DpiCType::BitScalar:
+                return two_val(b_.CreateTrunc(r, int_ty(1)));
+            case DpiCType::LogicScalar: {
+                // Decode svLogic (i8): 0->0, 1->1, 2->Z, 3->X into must/may/z (i1).
+                llvm::Value* must = b_.CreateICmpEQ(r, b_.getInt8(1));
+                llvm::Value* may  = b_.CreateICmpNE(r, b_.getInt8(0));
+                llvm::Value* z    = b_.CreateICmpEQ(r, b_.getInt8(2));
+                return packed(must, may, z);
+            }
+            default:
+                throw BackendError{ "internal: DPI void return has no value" };
         }
     }
 

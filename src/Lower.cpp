@@ -51,6 +51,7 @@
 #include <slang/diagnostics/TextDiagnosticClient.h>
 #include <slang/driver/Driver.h>
 #include <slang/numeric/Time.h>
+#include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/text/SourceManager.h>
 #include <slang/util/SmallVector.h>
@@ -7742,6 +7743,139 @@ private:
     // instance multiplicity (LRM 6.8): delegate its whole lowering to the
     // shared globals_ Lowerer instead of duplicating it (and any static
     // local's storage) per top instance.
+    // The DPI-C C type of a formal / return type (LRM 35.5.6): a by-value scalar
+    // for the small named types, else the by-pointer chunk-array form (BitVec /
+    // LogicVec) for a packed vector. nullopt for a type Clotho does not marshal
+    // (string, chandle, open array, unpacked aggregate) — the caller loud-fails
+    // those. Never returns Void.
+    static std::optional<ir::DpiCType> dpi_ctype(const slang::ast::Type& type) {
+        const slang::ast::Type& ct = type.getCanonicalType();
+        if (ct.isFloating()) {
+            return ct.as<slang::ast::FloatingType>().floatKind == slang::ast::FloatingType::ShortReal
+                     ? ir::DpiCType::Shortreal
+                     : ir::DpiCType::Real;
+        }
+        if (ct.isPredefinedInteger()) {
+            switch (ct.as<slang::ast::PredefinedIntegerType>().integerKind) {
+                case slang::ast::PredefinedIntegerType::Byte:
+                    return ir::DpiCType::Byte;
+                case slang::ast::PredefinedIntegerType::ShortInt:
+                    return ir::DpiCType::Shortint;
+                case slang::ast::PredefinedIntegerType::Int:
+                    return ir::DpiCType::Int;
+                case slang::ast::PredefinedIntegerType::LongInt:
+                    return ir::DpiCType::Longint;
+                default:
+                    // `integer` (4-state 32) / `time` (2-state 64): the vec form.
+                    return ct.isFourState() ? ir::DpiCType::LogicVec : ir::DpiCType::BitVec;
+            }
+        }
+        if (ct.isScalar()) {
+            return ct.isFourState() ? ir::DpiCType::LogicScalar : ir::DpiCType::BitScalar;
+        }
+        if (ct.isIntegral()) {
+            // A packed vector / packed struct / enum: the svBitVecVal /
+            // svLogicVecVal chunk-array form (slang has already checked it is a
+            // legal DPI arg type via isValidForDPIArg).
+            return ct.isFourState() ? ir::DpiCType::LogicVec : ir::DpiCType::BitVec;
+        }
+        return std::nullopt; // chandle, string, unpacked array / struct, ...
+    }
+
+    // Lower a DPI-C import (LRM 35) into the reserved slot. There is no IR body:
+    // the backend emits an external C declaration keyed on the linkage name and
+    // marshals each scalar argument at the call site (lower_dpi_call). PoC scope:
+    // import functions, `input` arguments, scalar-mapped types only — everything
+    // else loud-fails with a TODO (see docs/design/dpi-c.md).
+    void build_dpi_import(const SubroutineSymbol& sub, ir::FunctionId id) {
+        if (sub.subroutineKind == SubroutineKind::Task) {
+            // TODO: DPI import tasks (LRM 35.5.5) — can consume time via disable;
+            // the native boundary is coroutine-shaped. Import functions only.
+            fail("DPI import tasks are not supported");
+        }
+        if (sub.flags.has(MethodFlags::DPIContext)) {
+            // TODO: context imports (LRM 35.5.3) — need svScope and access to
+            // exported subroutines.
+            fail("DPI context imports are not supported");
+        }
+
+        // A DPI import has no body, so slang leaves returnValVar null even for a
+        // non-void function; decide void-ness from the declared return type.
+        ir::DpiCType ret_ct = ir::DpiCType::Void;
+        ir::Ref      ret_ty = module_.pool.void_type;
+        if (!sub.getReturnType().isVoid()) {
+            const auto c = dpi_ctype(sub.getReturnType());
+            if (!c.has_value() || *c == ir::DpiCType::BitVec || *c == ir::DpiCType::LogicVec) {
+                // A DPI return must be a "small value" (LRM 35.5.5): slang already
+                // rejects a packed-array return, so a vec here is defensive. string
+                // / chandle returns are the deferred marshal.
+                fail("DPI return type is not a supported scalar type (only "
+                     "byte/shortint/int/longint/real/shortreal/bit/logic)");
+            }
+            ret_ct = *c;
+            ret_ty = lower_type(sub.getReturnType());
+        }
+
+        std::vector<ir::Ref>      param_types;
+        std::vector<ir::ArgDir>   arg_dirs;
+        std::vector<ir::DpiCType> arg_cts;
+        for (const FormalArgumentSymbol* fa : sub.getArguments()) {
+            if (fa->direction == slang::ast::ArgumentDirection::Ref) {
+                // DPI-C has no `ref` formals (slang rejects DPIRefArg); guard
+                // defensively in case a future slang change lets one through.
+                fail("DPI ref arguments are not supported");
+            }
+            const auto c = dpi_ctype(fa->getType());
+            if (!c.has_value()) {
+                // string / chandle / open array / unpacked aggregate — deferred.
+                fail("DPI argument type is not supported (scalar types and packed "
+                     "vectors only; not string/chandle/open-array/unpacked)");
+            }
+            // input / output / inout: the direction drives the C ABI (by value vs
+            // by pointer) in declare_dpi_import / lower_dpi_call. build_call_args
+            // already makes the caller temp + CopyOutArg for a non-In direction.
+            param_types.push_back(lower_type(fa->getType()));
+            arg_dirs.push_back(to_arg_dir(fa->direction));
+            arg_cts.push_back(*c);
+        }
+
+        // The C linkage name is the import's c_identifier, or the SV name when
+        // omitted (LRM 35.5.4). slang does not store it on the symbol — read it
+        // off the syntax node.
+        std::string cid(sub.name);
+        if (const auto* syn = sub.getSyntax()) {
+            if (const auto* d = syn->as_if<slang::syntax::DPIImportSyntax>()) {
+                if (d->c_identifier) {
+                    cid = std::string(d->c_identifier.valueText());
+                }
+            }
+        }
+
+        // Emit a trivial void Ret so the (never-lowered) Ir is well-formed for the
+        // whole-function scans in the backend (nba shadow, ptr-arg signals).
+        ir::Builder         b(module_.pool);
+        const ir::SourceLoc el = to_source_loc(sub.location);
+        b.unary(ir::Inst::Tag::Ret, void_ret_operand(b, el), el);
+
+        // Mirror param_types into local_types (formal k == Local k), the invariant
+        // every whole-function analysis assumes (e.g. compute_may_z joins param_z
+        // into local_z). The backend never materializes these — lower_function
+        // early-returns for a DPI import — so they are phantom slots.
+        std::vector<ir::Ref> local_types = param_types;
+
+        module_.set_function(id, ir::Function{ .name           = std::string(sub.name),
+                                               .return_type    = ret_ty,
+                                               .param_types    = std::move(param_types),
+                                               .arg_dirs       = std::move(arg_dirs),
+                                               .local_types    = std::move(local_types),
+                                               .is_dpi         = true,
+                                               .is_pure        = sub.flags.has(MethodFlags::Pure),
+                                               .extern_name    = std::move(cid),
+                                               .dpi_arg_ctypes = std::move(arg_cts),
+                                               .dpi_ret_ctype  = ret_ct,
+                                               .ir             = b.finish() });
+    }
+
     ir::FunctionId function_id(const SubroutineSymbol& sub) {
         if (globals_ != nullptr && this != globals_ && is_global_subroutine(sub)) {
             const Scope* saved_scope = globals_->scope_;
@@ -7756,8 +7890,10 @@ private:
             return cached->second;
         }
         if (sub.flags.has(MethodFlags::DPIImport)) {
-            // TODO: DPI imports — call out to native code via the runtime.
-            fail("DPI imported subroutines are not supported");
+            const ir::FunctionId id = module_.reserve_function();
+            fnmap_[&sub]            = id;
+            build_dpi_import(sub, id);
+            return id;
         }
         const bool is_task = sub.subroutineKind == SubroutineKind::Task;
         for (const FormalArgumentSymbol* fa : sub.getArguments()) {
@@ -7999,7 +8135,11 @@ private:
         // function is zero-time, so this is the same instant as the call).
         emit_call_copyouts(outs, b, l);
 
-        return sub.returnValVar == nullptr ? std::nullopt : std::optional<ir::Index>(c);
+        // A DPI import has no returnValVar even when non-void, so key the result
+        // on the declared return type (void == no value). Uses the slang type, not
+        // the lowered Function record, which is not yet set during a recursive
+        // call (build_function sets the slot only after lowering its body).
+        return sub.getReturnType().isVoid() ? std::nullopt : std::optional<ir::Index>(c);
     }
 
     // Lower a task enable (LRM 13.3). The backend drives the task coroutine and

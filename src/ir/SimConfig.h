@@ -1,5 +1,8 @@
 #pragma once
 
+#include <string>
+#include <vector>
+
 // Configuration knobs shared by the compile (LlvmBackend.h) and run (Jit.h)
 // entry points. Grows as new optimizations and simulation modes land.
 
@@ -57,6 +60,10 @@ struct SimulationConfig {
     // Off by default: the listener adds per-object bookkeeping and writes the
     // dump file. Run-only knob (build_module ignores it).
     bool perf_jitdump = false;
+    // Shared libraries (`--dpi-lib <path>`, repeatable) searched to resolve
+    // `import "DPI-C"` symbols at JIT link time. Each is added to the JIT
+    // dylib as a DynamicLibrarySearchGenerator (see run_jit).
+    std::vector<std::string> dpi_libs;
 };
 
 } // namespace clotho::ir
