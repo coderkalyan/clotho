@@ -7790,6 +7790,9 @@ private:
         if (ct.isCHandle()) {
             return ir::DpiCType::Chandle; // opaque void*
         }
+        if (ct.isString()) {
+            return ir::DpiCType::String; // char*
+        }
         if (ct.isIntegral()) {
             // A packed vector / packed struct / enum: the svBitVecVal /
             // svLogicVecVal chunk-array form (slang has already checked it is a
@@ -7844,9 +7847,15 @@ private:
             }
             const auto c = dpi_ctype(fa->getType());
             if (!c.has_value()) {
-                // string / chandle / open array / unpacked aggregate — deferred.
-                fail("DPI argument type is not supported (scalar types and packed "
-                     "vectors only; not string/chandle/open-array/unpacked)");
+                // open array / unpacked aggregate — deferred.
+                fail("DPI argument type is not supported (scalar, packed vector, "
+                     "chandle, and string only; not open-array/unpacked)");
+            }
+            if (*c == ir::DpiCType::String && fa->direction != slang::ast::ArgumentDirection::In) {
+                // TODO: output / inout string. The C writes an unbounded NUL-
+                // terminated char* back and DPI gives no size contract, so there is
+                // no safe fixed buffer — deferred (see docs/design/dpi-c.md).
+                fail("DPI output/inout string arguments are not supported");
             }
             // input / output / inout: the direction drives the C ABI (by value vs
             // by pointer) in declare_dpi_import / lower_dpi_call. build_call_args

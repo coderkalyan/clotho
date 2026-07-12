@@ -1793,6 +1793,8 @@ private:
                 return b_.getFloatTy();
             case DpiCType::Chandle:
                 return raw_ptr_ty(); // void*
+            case DpiCType::String:
+                return raw_ptr_ty(); // char* (input const char* by value; return char*)
             case DpiCType::BitVec:
             case DpiCType::LogicVec:
                 // A packed vector is always passed by pointer and is never a return
@@ -9721,6 +9723,11 @@ private:
         auto* p = raw_ptr_ty();
         return rt_fn("rt_dpi_unpack_logicvec", b_.getVoidTy(), { p, b_.getInt32Ty(), p, p, p });
     }
+    // void rt_dpi_str_out(rt_string* dst, const char* p) — copy a returned C string.
+    llvm::FunctionCallee dpi_str_out_fn() {
+        auto* p = raw_ptr_ty();
+        return rt_fn("rt_dpi_str_out", b_.getVoidTy(), { p, p });
+    }
 
     // Spill an iW plane into a fresh entry-block buffer of `nchunks` 32-bit words
     // (zero-extended above W), returned as a pointer the runtime reads as uint32*.
@@ -9796,7 +9803,13 @@ private:
             const uint32_t w   = width_of(f.param_types[k]);
             // Scratch allocas are entry-block-hoisted (entry_alloca), so a DPI call
             // in a loop does not grow the stack per iteration.
-            if (is_dpi_vec(ct)) {
+            if (ct == DpiCType::String) {
+                // input string -> const char*: the handle's bytes are already NUL-
+                // terminated (rt_string_data), so pass the pointer directly, no
+                // copy. Valid for the call's duration; the C must not retain it.
+                // output / inout string is frontend-guarded.
+                argv.push_back(b_.CreateCall(str_data_fn(), { str_of(a) }));
+            } else if (is_dpi_vec(ct)) {
                 // Packed vector: always by pointer. Input builds the scratch from the
                 // value; output leaves it empty for the C to fill; inout copies in.
                 llvm::Value* scratch = dpi_vec_alloca(ct, dpi_nchunks(w));
@@ -9829,7 +9842,11 @@ private:
                                : dpi_c_to_plane(o.ct, b_.CreateLoad(o.cty, o.scratch));
             lower_store(lvalue_of(o.temp), pl);
         }
-        if (f.dpi_ret_ctype != DpiCType::Void) {
+        if (f.dpi_ret_ctype == DpiCType::String) {
+            // The C returns a NUL-terminated char*; copy it into this call's result
+            // handle (str_of(i), alloc'd by build_str_temps). C keeps ownership.
+            b_.CreateCall(dpi_str_out_fn(), { str_of(i), r });
+        } else if (f.dpi_ret_ctype != DpiCType::Void) {
             set_value(i, dpi_c_to_plane(f.dpi_ret_ctype, r));
         }
     }

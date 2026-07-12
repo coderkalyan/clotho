@@ -132,16 +132,29 @@ TEST_CASE("DPI import: chandle round-trips an opaque pointer") {
     CHECK(run_capture(src) == "1\n1\n");
 }
 
+TEST_CASE("DPI import: input string passes a NUL-terminated char*") {
+    constexpr std::string_view src = R"(
+        module m;
+          import "DPI-C" function longint strlen(input string s);
+          initial begin
+            $display("%0d", strlen("hello world"));   // 11
+            $display("%0d", strlen(""));               // 0 (empty-string NUL)
+          end
+        endmodule)";
+    CHECK(run_capture(src) == "11\n0\n");
+}
+
 // Out-of-scope constructs must fail loudly with a TODO, never silently miscompile.
 // Each is a distinct guard in build_dpi_import.
 TEST_CASE("DPI import: unsupported forms are rejected") {
-    SUBCASE("string argument") {
+    SUBCASE("output string argument (unbounded-buffer hazard, deferred)") {
         constexpr std::string_view src = R"(
             module m;
-              import "DPI-C" function int f(input string s);
-              initial $display(f("hi"));
+              import "DPI-C" function void f(output string s);
+              string y;
+              initial f(y);
             endmodule)";
-        CHECK(lower_fail(src).find("not supported") != std::string::npos);
+        CHECK(lower_fail(src).find("output/inout string") != std::string::npos);
     }
     SUBCASE("DPI import task") {
         constexpr std::string_view src = R"(

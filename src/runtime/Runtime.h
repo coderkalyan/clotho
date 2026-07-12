@@ -775,4 +775,10 @@ void rt_dpi_pack_logicvec(const uint32_t* must, const uint32_t* may, const uint3
 void rt_dpi_unpack_logicvec(const uint32_t* in, uint32_t nchunks, uint32_t* must, uint32_t* may,
                             uint32_t* z);
 
+// Copy a NUL-terminated C string into an SV string handle — the copy-out for a
+// DPI import that returns `string` (LRM 35.5.6). The C retains ownership of `p`;
+// a null `p` yields the empty string. (An SV string argument passed to C needs no
+// helper — rt_string_data() is already a valid C `const char*`.)
+void rt_dpi_str_out(rt_string* dst, const char* p);
+
 } // extern "C"

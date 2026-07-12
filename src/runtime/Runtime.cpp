@@ -3703,3 +3703,7 @@ void rt_dpi_unpack_logicvec(const uint32_t* in, uint32_t nchunks, uint32_t* must
         z[k]    = bval & ~aval;
     }
 }
+
+void rt_dpi_str_out(rt_string* dst, const char* p) {
+    rt_string_assign_bytes(dst, p, p != nullptr ? std::strlen(p) : 0);
+}
