@@ -1771,10 +1771,64 @@ private:
         return llvm::StructType::get(ctx_, { int_ty(2 * w), int_ty(w) });
     }
 
+    // The native LLVM type of a DPI-C scalar (LRM 35.5.6): the by-value C type
+    // each SV scalar maps to. Wider SV types never reach here (frontend-guarded).
+    llvm::Type* dpi_c_llvm_ty(DpiCType t) {
+        switch (t) {
+            case DpiCType::Void:
+                return b_.getVoidTy();
+            case DpiCType::Byte:
+            case DpiCType::BitScalar:   // svBit
+            case DpiCType::LogicScalar: // svLogic
+                return b_.getInt8Ty();
+            case DpiCType::Shortint:
+                return b_.getInt16Ty();
+            case DpiCType::Int:
+                return b_.getInt32Ty();
+            case DpiCType::Longint:
+                return b_.getInt64Ty();
+            case DpiCType::Real:
+                return b_.getDoubleTy();
+            case DpiCType::Shortreal:
+                return b_.getFloatTy();
+        }
+        throw BackendError{ "internal: unknown DPI C type" };
+    }
+
+    // Declare a DPI-C import (LRM 35) as an external C function with its native
+    // scalar signature (no `state` param, no plane-pair expansion). extern_name
+    // resolves at JIT link time against a --dpi-lib shared object. A `pure` import
+    // is side-effect-free, so mark it readnone + willreturn + nounwind so the
+    // optimizer can CSE / hoist / DCE the call.
+    llvm::Function* declare_dpi_import(FunctionId id) {
+        const Function&          f = mod_.function(id);
+        std::vector<llvm::Type*> params;
+        params.reserve(f.dpi_arg_ctypes.size());
+        for (DpiCType ct : f.dpi_arg_ctypes) {
+            params.push_back(dpi_c_llvm_ty(ct));
+        }
+        auto* fnty   = llvm::FunctionType::get(dpi_c_llvm_ty(f.dpi_ret_ctype), params, false);
+        auto  callee = llmod_.getOrInsertFunction(f.extern_name, fnty);
+        auto* fn     = llvm::dyn_cast<llvm::Function>(callee.getCallee());
+        if (fn == nullptr) {
+            throw BackendError{ "DPI import '" + f.extern_name +
+                                "' conflicts with an existing symbol of a different type" };
+        }
+        if (f.is_pure) {
+            fn->setDoesNotAccessMemory();
+            fn->setWillReturn();
+            fn->setDoesNotThrow();
+        }
+        return fn;
+    }
+
     // Create (but do not yet lower) a function's declaration, so calls — including
     // recursive and forward ones — resolve before any body is emitted.
     llvm::Function* declare_function(FunctionId id) {
         const Function& f = mod_.function(id);
+        if (f.is_dpi) {
+            return declare_dpi_import(id);
+        }
         if (f.is_task) {
             return declare_task(id);
         }
@@ -2073,7 +2127,12 @@ private:
     // frame, Ret is a real return, Call invokes another function.
     void lower_function(FunctionId id) {
         const Function& f = mod_.function(id);
-        ir_               = &f.ir;
+        if (f.is_dpi) {
+            // A DPI import is only an external declaration (declare_dpi_import);
+            // its body is native C, so there is nothing to lower.
+            return;
+        }
+        ir_ = &f.ir;
         cur_fn_           = &f;
         cur_is_task_      = false;
         param_llvm_index_ = param_indices(f);
@@ -9523,6 +9582,10 @@ private:
     void lower_call_inst(Index i) {
         const auto                ci = ir_->extra_data<CallInfo>(ir_->payload(i).extra);
         const Function&           f  = mod_.function(ci.func);
+        if (f.is_dpi) {
+            lower_dpi_call(i, ci, f);
+            return;
+        }
         llvm::Function*           cf = fn_decls_[static_cast<uint32_t>(ci.func)];
         std::vector<llvm::Value*> argv;
         argv.push_back(state_);
@@ -9620,6 +9683,86 @@ private:
                 pl = real_plane(planes_to_real(pl, t.width));
             }
             set_value(i, pl);
+        }
+    }
+
+    // Lower a `call` to a DPI-C import (LRM 35): marshal each scalar argument to
+    // its native C value, call the external symbol directly (no state pointer), and
+    // convert the C return back to a Plane. Input-only, scalar types (the frontend
+    // guards the rest), so there is no ref servicing or copy-out.
+    void lower_dpi_call(Index i, const CallInfo& ci, const Function& f) {
+        llvm::Function*           cf = fn_decls_[static_cast<uint32_t>(ci.func)];
+        std::vector<llvm::Value*> argv;
+        size_t                    k = 0;
+        for (Index a : ir_->region(ci.args)) {
+            argv.push_back(dpi_arg_to_c(f.dpi_arg_ctypes[k], value_of(a)));
+            ++k;
+        }
+        llvm::Value* r = b_.CreateCall(cf->getFunctionType(), cf, argv);
+        if (f.dpi_ret_ctype != DpiCType::Void) {
+            set_value(i, dpi_c_to_plane(f.dpi_ret_ctype, r));
+        }
+    }
+
+    // Marshal an SV scalar value (a Plane the frontend resized to the formal type)
+    // to its DPI-C native argument (LRM 35.5.6). A 2-state integer passes its value
+    // plane; a scalar logic packs to svLogic (0/1/2=Z/3=X); a real rides its fp.
+    llvm::Value* dpi_arg_to_c(DpiCType t, Plane p) {
+        switch (t) {
+            case DpiCType::Byte:
+                return cast(must_of(p), 8, true);
+            case DpiCType::Shortint:
+                return cast(must_of(p), 16, true);
+            case DpiCType::Int:
+                return cast(must_of(p), 32, true);
+            case DpiCType::Longint:
+                return cast(must_of(p), 64, true);
+            case DpiCType::Real:
+            case DpiCType::Shortreal:
+                return fp_of(p);
+            case DpiCType::BitScalar:
+                return cast(must_of(p), 8, false); // zext the 1-bit value to svBit
+            case DpiCType::LogicScalar: {
+                // svLogic: sv_0=0, sv_1=1, sv_z=2, sv_x=3. z wins; else 1 for a
+                // definite 1; else 3 (X) for any other unknown; else 0. The formal
+                // is width 1. A 4-state Plane may carry no z plane (never-z), so
+                // materialize the z bit safely rather than through z_of (nullptr).
+                const uint32_t w    = width_of(p);
+                llvm::Value*   zbit = (p.two || p.z == nullptr) ? b_.getFalse()
+                                                                : b_.CreateICmpNE(p.z, zero(w));
+                return b_.CreateSelect(
+                  zbit, b_.getInt8(2),
+                  b_.CreateSelect(b_.CreateICmpNE(must_of(p), zero(w)), b_.getInt8(1),
+                                  b_.CreateSelect(b_.CreateICmpNE(may_of(p), zero(w)),
+                                                  b_.getInt8(3), b_.getInt8(0))));
+            }
+            default:
+                throw BackendError{ "internal: DPI void argument" };
+        }
+    }
+
+    // Convert a DPI-C native return value back to a Plane of the SV return type.
+    Plane dpi_c_to_plane(DpiCType t, llvm::Value* r) {
+        switch (t) {
+            case DpiCType::Byte:
+            case DpiCType::Shortint:
+            case DpiCType::Int:
+            case DpiCType::Longint:
+                return two_val(r); // the C iW is the 2-state value plane
+            case DpiCType::Real:
+            case DpiCType::Shortreal:
+                return real_plane(r);
+            case DpiCType::BitScalar:
+                return two_val(b_.CreateTrunc(r, int_ty(1)));
+            case DpiCType::LogicScalar: {
+                // Decode svLogic (i8): 0->0, 1->1, 2->Z, 3->X into must/may/z (i1).
+                llvm::Value* must = b_.CreateICmpEQ(r, b_.getInt8(1));
+                llvm::Value* may  = b_.CreateICmpNE(r, b_.getInt8(0));
+                llvm::Value* z    = b_.CreateICmpEQ(r, b_.getInt8(2));
+                return packed(must, may, z);
+            }
+            default:
+                throw BackendError{ "internal: DPI void return has no value" };
         }
     }
 

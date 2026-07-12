@@ -148,6 +148,24 @@ enum class ArgDir : uint8_t {
     Ref,
 };
 
+// The DPI-C canonical scalar type of a DPI import formal or return (LRM 35.5.6,
+// the by-value subset of Table 35-1): each maps to a native C scalar passed in a
+// register, so the boundary is a width coercion, not a marshal. Wider SV types
+// (packed vectors, open arrays, strings) use the svBitVecVal / svLogicVecVal
+// pointer ABI and are not lowered yet — the frontend loud-fails them, so this
+// enum has no "not scalar" member. Only meaningful on an is_dpi Function.
+enum class DpiCType : uint8_t {
+    Void,        // void return
+    Byte,        // SV byte      -> char       (i8, signed)
+    Shortint,    // SV shortint  -> short      (i16, signed)
+    Int,         // SV int       -> int        (i32, signed)
+    Longint,     // SV longint   -> long long  (i64, signed)
+    Real,        // SV real      -> double
+    Shortreal,   // SV shortreal -> float
+    BitScalar,   // SV bit       -> svBit   (unsigned char: 0/1)
+    LogicScalar, // SV logic/reg -> svLogic (unsigned char: 0/1/2=Z/3=X)
+};
+
 // A lowered SystemVerilog function or task. Its body is an Ir whose leaves are
 // Arg (parameters), Local (frame storage), and Signal (module signals it
 // references); it ends every path in a Ret. A function becomes one plain LLVM
@@ -178,6 +196,22 @@ struct Function {
     // record and wakes the parent when the count reaches zero (rather than a
     // task's unconditional single-parent resume). Implies is_task.
     bool is_fork_child = false;
+    // A DPI-C import (LRM 35): the body is native C resolved at JIT link time by
+    // extern_name, not lowered from IR. The backend emits an external declaration
+    // (dpi_arg_ctypes / dpi_ret_ctype give the native C signature) and marshals
+    // each scalar argument at the call site (see lower_dpi_call). `ir` is a
+    // trivial void return, never lowered.
+    bool is_dpi = false;
+    // A `pure` DPI import (LRM 35.6): side-effect-free and value-only, so the
+    // backend marks its declaration readnone + willreturn for the optimizer.
+    bool is_pure = false;
+    // C linkage name of a DPI import (the `c_identifier`, or the SV name when the
+    // import omits it — LRM 35.5.4). Empty for a non-DPI function.
+    std::string extern_name;
+    // DPI C scalar type of each parameter (parallel to param_types) and the
+    // return. Only populated when is_dpi.
+    std::vector<DpiCType> dpi_arg_ctypes;
+    DpiCType              dpi_ret_ctype = DpiCType::Void;
     // The lowered body.
     Ir ir;
 };

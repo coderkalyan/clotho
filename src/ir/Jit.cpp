@@ -260,6 +260,21 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     }
     jd.addGenerator(std::move(*builtins));
 
+    // Resolve `import "DPI-C"` symbols (LRM 35) from each --dpi-lib shared object,
+    // searched in the order given. A generator per library adds its exported
+    // symbols to the JIT dylib; an import that matches none surfaces as an
+    // unresolved-symbol error at the lookup("main") below.
+    for (const std::string& lib : config.dpi_libs) {
+        auto gen = llvm::orc::DynamicLibrarySearchGenerator::Load(
+          lib.c_str(), (*jit)->getDataLayout().getGlobalPrefix());
+        if (!gen) {
+            llvm::errs() << "jit: cannot load DPI library '" << lib
+                         << "': " << llvm::toString(gen.takeError()) << "\n";
+            return -1;
+        }
+        jd.addGenerator(std::move(*gen));
+    }
+
     if (auto err = (*jit)->addIRModule(std::move(tsm))) {
         llvm::errs() << "jit: " << llvm::toString(std::move(err)) << "\n";
         return -1;
