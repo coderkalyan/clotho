@@ -1,0 +1,7 @@
+# Fetched / built by fetch.sh (regenerated on demand):
+src/
+fw/cm/
+_core/
+fw/coremark.elf
+fw/coremark.bin
+fw/coremark.hex

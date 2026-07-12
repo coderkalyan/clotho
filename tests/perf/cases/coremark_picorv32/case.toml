@@ -1,0 +1,27 @@
+name = "coremark_picorv32"
+description = "Stock YosysHQ picorv32 (RV32IM, no compressed ISA) running EEMBC CoreMark to its self-checking CRC, driven by picorv32's own AXI testbench (word-addressed RAM + magic-address char/exit peripherals). Firmware is bare-metal CoreMark: rdcycle timing (picorv32 has no mcycle/mcountinhibit CSR), ee_printf to the char register, freestanding crt0/libnano, exit via ebreak trap. ITER=3 ~= 5.4M cycles (MCYCLES 5366858, trap at 5512309)."
+top = "testbench"
+
+[fetch]
+# fetch.sh clones the pinned core + CoreMark, stages src/picorv32.v, builds coremark.hex.
+script = "fetch.sh"
+probe = "src/picorv32.v"
+
+[clotho]
+# testbench.v is vendored (plusargs disabled, watchdog raised, loads coremark.hex);
+# picorv32.v is stock from the pinned clone.
+files = ["src/picorv32.v", "testbench.v"]
+
+[check]
+# CoreMark validates its own result CRC and prints this line on a match;
+# a wrong CRC, an illegal-instruction trap, or the watchdog TIMEOUT all fail.
+stdout_regex = "Correct operation validated"
+
+[oracles.iverilog]
+enabled = true
+note = "iverilog 13 runs the plain-Verilog core + TB directly (verified: MCYCLES 5366858, validated)."
+
+[oracles.verilator]
+enabled = false
+note = "Not comparable: the picorv32 testbench module is under `ifndef VERILATOR`, so verilator needs its C++ harness (testbench.cc) which drives the clock differently and ends at a different cycle count (same reason as the picorv32 case)."
+
