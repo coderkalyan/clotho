@@ -805,3 +805,74 @@ TEST_CASE("whole unpacked struct as a $display rvalue is still guarded") {
     )");
     CHECK_FALSE(r.ok);
 }
+
+TEST_CASE("chained continuous copy of a struct wakes downstream readers") {
+    // A whole-object copy (AggCopy memcpy) into a signal must service its Any-edge
+    // waiters, so a second `assign` sensitive to the first's target re-evaluates.
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; logic [7:0] b; } p_t;
+            p_t x, mid, y;
+            assign mid = x;
+            assign y = mid;
+            initial begin
+                x.a = 5; x.b = 8'd9;
+                #1 $display("mid=%0d y=%0d %0d", mid.a, y.a, y.b);
+            end
+        endmodule
+    )") == "mid=5 y=5 9\n");
+}
+
+TEST_CASE("unpacked struct passed through module ports") {
+    CHECK(run_capture(R"(
+        typedef struct { int a; logic [7:0] b; } p_t;
+        module passthru(input p_t i, output p_t o);
+            assign o = i;
+        endmodule
+        module m;
+            p_t x, y;
+            passthru u(.i(x), .o(y));
+            initial begin
+                x.a = 5; x.b = 8'd9;
+                #1 $display("y=%0d %0d", y.a, y.b);
+                x.a = 7;
+                #1 $display("y=%0d", y.a);
+            end
+        endmodule
+    )") == "y=5 9\ny=7\n");
+}
+
+TEST_CASE("nested unpacked struct through a module port") {
+    CHECK(run_capture(R"(
+        typedef struct { int a; logic [7:0] b; } p_t;
+        typedef struct { p_t p; int c; } n_t;
+        module sub(input n_t i, output int suma);
+            assign suma = i.p.a + i.c;
+        endmodule
+        module m;
+            n_t z;
+            int s;
+            sub v(.i(z), .suma(s));
+            initial begin
+                z.p.a = 10; z.p.b = 8'd1; z.c = 20;
+                #1 $display("s=%0d", s);
+            end
+        endmodule
+    )") == "s=30\n");
+}
+
+TEST_CASE("unpacked struct net declaration continuous assignment") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; logic [7:0] b; } p_t;
+            p_t x;
+            wire p_t n = x;
+            initial begin
+                x.a = 8'd5; x.b = 8'd9;
+                #1 $display("n=%0d %0d", n.a, n.b);
+                x.a = 8'd7;
+                #1 $display("n=%0d", n.a);
+            end
+        endmodule
+    )") == "n=5 9\nn=7\n");
+}

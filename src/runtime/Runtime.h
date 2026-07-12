@@ -643,4 +643,78 @@ void rt_wheel_tick(rt_wheel* wheel, void* ctx);
 // separate occupancy scan (advance already reports emptiness).
 int rt_wheel_advance(rt_wheel* wheel, void* ctx);
 
+// -- Deferred nonblocking intra-assignment stores (LRM 9.4.5) --
+//
+// `lhs <= #d rhs` samples the RHS now and schedules the LHS update for `now + d`
+// without blocking the process, so any number of updates can be in flight at
+// once (a pipeline `q <= #1 d` firing each cycle). Each is a fixed record the
+// backend fills (its value planes, monomorphized per target width/z-ness) and
+// arms on the timing wheel; on fire the record is queued for the NBA region of
+// that instant, where a backend-emitted commit stores it and wakes readers —
+// same region ordering as a same-instant `<=`. Records are keyed by a dense
+// per-target-signal `idx`.
+//
+// Unlike the array-NBA buffers, a record must keep a STABLE address from arm
+// (the wheel holds a pointer to its embedded timer) until it fires, so records
+// are individually owned and recycled through a per-idx freelist rather than
+// packed in a reallocating buffer. Steady state allocates nothing.
+
+// Runtime-owned record header the backend places at offset 0 of every record;
+// the backend's value tail follows. `timer` is the wheel node (offset 0, so the
+// record base doubles as the rt_timer*, used by the `#d` delay path); `idx`
+// routes the record to its target site; `seq` is a monotonic arm-order stamp (set
+// by rt_intra_alloc) so same-instant commits apply in statement-execution order
+// (LRM 10.4.2, last-executed wins), which fire order does not preserve; `count`
+// is the event countdown for the `@e` / `repeat(N) @e` path (unused by `#d`).
+typedef struct rt_intra_rec {
+    rt_timer timer;
+    uint32_t idx;
+    uint32_t seq;
+    uint32_t count;
+} rt_intra_rec;
+
+// Reserve a `stride`-byte record for site `idx` (from its freelist; allocates
+// only to grow the pool). The backend fills the value tail, sets `idx`, and arms
+// the record on the wheel with rt_intra_cb as the expiry callback.
+void* rt_intra_alloc(uint32_t idx, uint32_t stride);
+
+// Wheel expiry callback: recover the record, link it onto its site's ready list,
+// and bump the global pending count. Shared by every deferred-store site; does
+// not touch design state (commit is the NBA region's job).
+void rt_intra_cb(rt_timer* timer, void* ctx);
+
+// Base (a `void**` array of record pointers) and length of site `idx`'s ready
+// list, read once in the NBA region to drive the backend-emitted commit loop.
+void*    rt_intra_ready_base(uint32_t idx);
+uint32_t rt_intra_ready_count(uint32_t idx);
+
+// Total ready records across all sites; nba.check tests this to decide whether a
+// deferred commit is needed.
+uint32_t rt_intra_any(void);
+
+// Return site `idx`'s committed records to its freelist and clear its ready list
+// (called by the backend after the site's commit loop).
+void rt_intra_release(uint32_t idx);
+
+// Reclaim every record (including any left scheduled by a $finish mid-flight)
+// into its freelist and clear all ready lists. Called once at simulation start.
+void rt_intra_reset(void);
+
+// -- Event-triggered deferred stores (`x <= @e y` / `x <= repeat(N) @e y`) --
+//
+// Same records and NBA-region commit as the `#d` path, but fired by a signal edge
+// instead of the wheel. A `<= @e` site registers its record on a dense trigger id
+// `trig_id` (a distinct (trigger-signal, edge) pair); when that edge fires (from a
+// blocking store or an NBA commit), the backend calls rt_intra_event_fire, which
+// counts the record down and, at zero, moves it to its target's ready list for the
+// NBA region. `count` is N for `repeat(N) @e`, 1 for a plain `@e`.
+
+// Register `rec` (its idx/seq/count already filled) to fire on trigger `trig_id`.
+void rt_intra_event_register(uint32_t trig_id, void* rec);
+
+// Fire trigger `trig_id`: decrement each pending record's count; at zero, move it
+// to its target's ready list (bumping the NBA-pending total), else keep it pending
+// for the next edge. Called from both wake paths when the trigger edge matches.
+void rt_intra_event_fire(uint32_t trig_id);
+
 } // extern "C"

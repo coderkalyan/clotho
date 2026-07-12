@@ -1107,6 +1107,83 @@ TEST_CASE("non-overlapping constant part-select drivers are accepted") {
     CHECK_MESSAGE(r.ok, r.diagnostics);
 }
 
+// -- Unpacked net arrays driven one element at a time (LRM 6.6.1) --
+//
+// Distinct constant array elements are distinct storage, so per-element
+// continuous drivers are single-driver and must be accepted; the guard tracks
+// an element band, not just a packed bit range.
+
+TEST_CASE("distinct constant elements of an unpacked net array are accepted") {
+    const LowerResult r = lower_text(R"(
+        module m(input [7:0] a, input [7:0] b);
+            wire [7:0] mem [0:3];
+            assign mem[0] = a;
+            assign mem[1] = b;
+            assign mem[2] = a ^ b;
+        endmodule
+    )");
+    CHECK_MESSAGE(r.ok, r.diagnostics);
+}
+
+TEST_CASE("distinct elements of a scalar unpacked net array are accepted") {
+    const LowerResult r = lower_text(R"(
+        module m(input a, input b);
+            wire w [0:1];
+            assign w[0] = a;
+            assign w[1] = b;
+        endmodule
+    )");
+    CHECK_MESSAGE(r.ok, r.diagnostics);
+}
+
+TEST_CASE("distinct elements of a multidimensional net array are accepted") {
+    const LowerResult r = lower_text(R"(
+        module m(input [7:0] a, input [7:0] b, input [7:0] c, input [7:0] d);
+            wire [7:0] mem [0:1][0:1];
+            assign mem[0][0] = a;
+            assign mem[0][1] = b;
+            assign mem[1][0] = c;
+            assign mem[1][1] = d;
+        endmodule
+    )");
+    CHECK_MESSAGE(r.ok, r.diagnostics);
+}
+
+TEST_CASE("disjoint bits of one net-array element are accepted") {
+    const LowerResult r = lower_text(R"(
+        module m(input [3:0] a, input [3:0] b);
+            wire [7:0] mem [0:1];
+            assign mem[0][3:0] = a;
+            assign mem[0][7:4] = b;
+        endmodule
+    )");
+    CHECK_MESSAGE(r.ok, r.diagnostics);
+}
+
+TEST_CASE("two drivers of the same net-array element fail loudly") {
+    const LowerResult r = lower_text(R"(
+        module m(input [7:0] a, input [7:0] b);
+            wire [7:0] mem [0:3];
+            assign mem[0] = a;
+            assign mem[0] = b;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("multiple drivers on net 'mem'") != std::string::npos);
+}
+
+TEST_CASE("overlapping bit drivers of one net-array element fail loudly") {
+    const LowerResult r = lower_text(R"(
+        module m(input [7:0] a, input [7:0] b);
+            wire [7:0] mem [0:1];
+            assign mem[0][3:0] = a;
+            assign mem[0][2:1] = b;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("multiple drivers on net 'mem'") != std::string::npos);
+}
+
 TEST_CASE("a net with one continuous driver read procedurally is accepted") {
     // Procedural blocks are not continuous drivers: one assign plus reads
     // (including in an always body) must not trip the multi-driver guard.

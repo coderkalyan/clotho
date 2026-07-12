@@ -1671,6 +1671,26 @@ TEST_CASE("unpacked array blocking write and read") {
     CHECK(out == "1\n17\n33\n49\n");
 }
 
+// Per-element continuous drivers on an unpacked net array (LRM 6.6.1): each
+// element is an independent single-driver, so the values are the per-element
+// assigns, not a last-write-wins collision. Matches iverilog.
+TEST_CASE("unpacked net array driven one element at a time") {
+    const std::string out = run_capture(R"(
+        module top;
+            logic [7:0] a, b;
+            wire [7:0] mem [0:3];
+            assign mem[0] = a;
+            assign mem[1] = b;
+            assign mem[2] = a ^ b;
+            initial begin
+                a = 8'h0A; b = 8'h05;
+                #1 $display("%h %h %h", mem[0], mem[1], mem[2]);
+            end
+        endmodule
+    )");
+    CHECK(out == "0a 05 0f\n");
+}
+
 // A nested select indexes a bit / part of an element: mem[i][bit] and a
 // read-modify-write part-select mem[i][3:0].
 TEST_CASE("unpacked array element bit- and part-select") {

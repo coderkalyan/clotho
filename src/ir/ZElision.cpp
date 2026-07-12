@@ -204,6 +204,18 @@ struct Analysis {
                 case Inst::Tag::StoreNb:
                     store_into(ir, fn, p.binary.l, z_of(p.binary.r) != 0);
                     break;
+                case Inst::Tag::StoreNbDelay: {
+                    // The deferred store writes the target with the sampled value's
+                    // z-ness (drives whether the target keeps a z plane).
+                    const auto info = ir.extra_data<StoreNbDelayInfo>(p.op_extra.extra);
+                    store_into(ir, fn, p.op_extra.op, z_of(info.value) != 0);
+                    break;
+                }
+                case Inst::Tag::StoreNbEvent: {
+                    const auto info = ir.extra_data<StoreNbEventInfo>(p.op_extra.extra);
+                    store_into(ir, fn, p.op_extra.op, z_of(info.value) != 0);
+                    break;
+                }
                 case Inst::Tag::AggCopy: {
                     // A whole-object copy propagates the source's may-z to the
                     // destination (a plain-array memcpy requires both to share the

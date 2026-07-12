@@ -136,6 +136,7 @@ add_executable(clotho_test
   tests/case_test.cpp
   tests/function_test.cpp
   tests/task_test.cpp
+  tests/intra_assign_test.cpp
   tests/string_test.cpp
   tests/display_test.cpp
   tests/loop_test.cpp
@@ -169,6 +170,7 @@ add_executable(clotho_test
   tests/event_test.cpp
   tests/dynamic_array_test.cpp
   tests/queue_test.cpp
+  tests/unbased_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho doctest::doctest clotho_warnings)
 

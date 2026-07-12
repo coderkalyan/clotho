@@ -1090,6 +1090,18 @@ private:
         b.binary(tag, lhs, b.unary(ir::Inst::Tag::Load, rhs, l), l);
     }
 
+    // Whole-object blocking copy of one aggregate lvalue into another, for a port
+    // connection or net-declaration continuous copy (both are string-free-fast /
+    // string-slow like a blocking `a = b`). A string-free aggregate is one memcpy
+    // (AggCopy); a string leaf owns a heap buffer, so it copies per-leaf.
+    void emit_port_agg_copy(ir::Index dst, ir::Index src, ir::Ref ty, ir::Builder& b, ir::SourceLoc l) {
+        if (is_string_free(ty)) {
+            b.agg_copy(dst, src, ty, l);
+        } else {
+            emit_agg_copy(dst, src, ty, ir::Inst::Tag::Store, b, l);
+        }
+    }
+
     // Whether an expression is a whole unpacked-array lvalue (a named array, or a
     // member / element that is itself a whole array) — the source of a whole-array
     // memcpy copy, as opposed to a slice / element / pattern.
@@ -1586,26 +1598,50 @@ private:
     // to x per LRM 6.6.1 Table 6-2. Until resolution exists, a net whose bits
     // gain a second continuous/structural driver (continuous assign, output
     // port connection, input port copy, net declaration assignment) must fail
-    // loudly. Procedural writes are not continuous drivers and are not tracked;
-    // non-overlapping constant selects (assign w[0]=..., assign w[1]=...) are
-    // legal single-driver-per-bit and stay accepted.
+    // loudly. Procedural writes are not continuous drivers and are not tracked.
+    // Coverage is tracked as an unpacked-array element band crossed with a
+    // packed bit range, so genuinely disjoint drivers stay accepted: distinct
+    // constant elements (assign mem[0]=.., assign mem[1]=..) and disjoint bits
+    // (assign w[0]=.., assign w[1]=..). Anything not provably disjoint (a
+    // dynamic index, a whole-net/array driver) covers the whole net and so
+    // still conflicts with every other driver.
     // TODO: multiple-driver net resolution (LRM 6.6.1); then delete this guard.
 
-    // Record that bits [lo, hi] of a net gained a continuous driver; fail on
-    // overlap with a previously recorded driver. Non-net symbols are ignored
-    // (slang already rejects multiple continuous drivers on variables).
-    void record_net_driver_range(const ValueSymbol& sym, uint32_t lo, uint32_t hi) {
+    // A driven region of a net: an unpacked-array element band crossed with a
+    // packed bit range within one element. A packed (non-array) net uses the
+    // single element band [0, 0]; a whole-element or whole-net driver uses the
+    // full bit range [0, UINT32_MAX].
+    struct NetRegion {
+        uint64_t elem_lo, elem_hi;  // linearized unpacked-element ordinals
+        uint32_t bit_lo, bit_hi;    // packed bit range within one element
+    };
+
+    static constexpr NetRegion kWholeNet{ 0, UINT64_MAX, 0, UINT32_MAX };
+
+    // Record that `reg` of a net gained a continuous driver; fail on overlap
+    // with a previously recorded driver. Two regions overlap iff their element
+    // bands intersect AND their bit ranges intersect. Non-net symbols are
+    // ignored (slang already rejects multiple continuous drivers on variables).
+    void record_net_driver_region(const ValueSymbol& sym, const NetRegion& reg) {
         if (sym.kind != SymbolKind::Net) {
             return;
         }
-        auto& ranges = net_driven_[static_cast<uint32_t>(signal_of(sym))];
-        for (const auto& [plo, phi] : ranges) {
-            if (lo <= phi && plo <= hi) {
+        auto& regions = net_driven_[static_cast<uint32_t>(signal_of(sym))];
+        for (const NetRegion& p : regions) {
+            if (reg.elem_lo <= p.elem_hi && p.elem_lo <= reg.elem_hi &&
+                reg.bit_lo <= p.bit_hi && p.bit_lo <= reg.bit_hi) {
                 fail("multiple drivers on net '" + std::string(sym.name) +
                      "' are not supported (no resolution)");
             }
         }
-        ranges.emplace_back(lo, hi);
+        regions.push_back(reg);
+    }
+
+    // A whole-net driver (whole named net, dynamic select, port copy, net-decl
+    // init): covers every element and every bit, so it conflicts with any other
+    // driver of the same net.
+    void record_net_driver_whole(const ValueSymbol& sym) {
+        record_net_driver_region(sym, kWholeNet);
     }
 
     // The root value symbol of an lvalue select chain, or null for shapes with
@@ -1690,87 +1726,162 @@ private:
     }
 
     // Record the net-driver coverage of one continuous-assignment lvalue. A
-    // constant bit/part-select directly on the net drives an exact bit range;
-    // any dynamic or nested select conservatively drives the whole net
-    // ([0, UINT32_MAX], which overlaps every other driver).
+    // concatenation drives each operand; any other rooted lvalue drives the
+    // region computed by net_region_of.
     void record_net_driver(const Expression& lhs) {
         switch (lhs.kind) {
-            case ExpressionKind::NamedValue:
-                record_net_driver_range(lhs.as<NamedValueExpression>().symbol, 0, UINT32_MAX);
-                break;
             case ExpressionKind::Concatenation:
                 for (const Expression* op : lhs.as<ConcatenationExpression>().operands()) {
                     record_net_driver(*op);
                 }
-                break;
+                return;
             case ExpressionKind::Conversion:
                 record_net_driver(lhs.as<ConversionExpression>().operand());
+                return;
+            default:
                 break;
+        }
+        const ValueSymbol* root = lvalue_root(lhs);
+        if (root == nullptr || root->kind != SymbolKind::Net) {
+            // Non-net or shapes rejected by lower_lvalue: nothing to track.
+            return;
+        }
+        record_net_driver_region(*root, net_region_of(lhs, *root));
+    }
+
+    // Compute the driven region of a rooted continuous-assign lvalue: an
+    // unpacked-array element band crossed with a packed bit range within one
+    // element. Constant element-selects consume the outer unpacked dimensions
+    // (so distinct constant indices are disjoint, and a partial select spans
+    // the remaining dimensions); a trailing constant bit/part/member select
+    // narrows the bit range. Any dynamic index or unsupported shape falls back
+    // to the whole net, which conflicts with every other driver.
+    NetRegion net_region_of(const Expression& lhs, const ValueSymbol& root) {
+        // Collect select steps leaf-first, then reverse to root-first — the
+        // order that consumes outer unpacked dimensions before inner packed bits
+        // (`mem[i][bit]` nests the unpacked select below the packed one).
+        slang::SmallVector<const Expression*, 4> steps;
+        for (const Expression* cur = &lhs;;) {
+            if (cur->kind == ExpressionKind::ElementSelect) {
+                steps.push_back(cur);
+                cur = &cur->as<ElementSelectExpression>().value();
+            } else if (cur->kind == ExpressionKind::RangeSelect) {
+                steps.push_back(cur);
+                cur = &cur->as<RangeSelectExpression>().value();
+            } else if (cur->kind == ExpressionKind::MemberAccess) {
+                steps.push_back(cur);
+                cur = &cur->as<MemberAccessExpression>().value();
+            } else if (cur->kind == ExpressionKind::Conversion) {
+                cur = &cur->as<ConversionExpression>().operand();
+            } else {
+                break;
+            }
+        }
+        std::reverse(steps.begin(), steps.end());
+
+        // Unpacked dimensions of the net, outermost first.
+        slang::SmallVector<slang::ConstantRange, 4> dims;
+        const slang::ast::Type* et = &root.getType().getCanonicalType();
+        while (const auto* arr = et->as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
+            dims.push_back(arr->range);
+            et = &arr->elementType.getCanonicalType();
+        }
+        const size_t m = dims.size();
+
+        // Suffix products: sp[k] = product of dim widths k..m-1, sp[m] = 1. Dim
+        // k index p contributes p * sp[k+1] to the ordinal; a select consuming
+        // t dims leaves an sp[t]-element band.
+        std::vector<uint64_t> sp(m + 1, 1);
+        for (size_t k = m; k-- > 0;) {
+            sp[k] = sp[k + 1] * static_cast<uint64_t>(dims[k].width());
+        }
+
+        uint64_t base    = 0;
+        size_t   t       = 0;  // unpacked dims consumed so far
+        uint32_t bit_lo  = 0;
+        uint32_t bit_hi  = UINT32_MAX;
+        bool     bit_set = false;
+        for (const Expression* step : steps) {
+            if (t < m) {
+                if (step->kind != ExpressionKind::ElementSelect) {
+                    return kWholeNet;
+                }
+                const std::optional<int32_t> c =
+                  try_const_int(step->as<ElementSelectExpression>().selector());
+                if (!c) {
+                    return kWholeNet;
+                }
+                base += static_cast<uint64_t>(dims[t].translateIndex(*c)) * sp[t + 1];
+                ++t;
+                continue;
+            }
+            // Trailing packed select on the element. One constant bit/part/member
+            // select narrows; a second (or a non-constant) widens to the whole
+            // element (rare, stays a conservative reject within the element).
+            if (bit_set) {
+                bit_lo = 0;
+                bit_hi = UINT32_MAX;
+                continue;
+            }
+            if (const auto br = packed_bit_range(*step)) {
+                bit_lo = br->first;
+                bit_hi = br->second;
+            } else {
+                bit_lo = 0;
+                bit_hi = UINT32_MAX;
+            }
+            bit_set = true;
+        }
+
+        return NetRegion{ base, base + sp[t] - 1, bit_lo, bit_hi };
+    }
+
+    // Constant packed bit range of a trailing select on an element: a 1-bit
+    // element-select -> one bit; a simple part-select -> [min, max]; a struct
+    // member -> its declared field offset span (LRM 7.2.1). nullopt for a
+    // dynamic or unsupported shape (the caller then covers the whole element).
+    std::optional<std::pair<uint32_t, uint32_t>> packed_bit_range(const Expression& step) {
+        switch (step.kind) {
             case ExpressionKind::ElementSelect: {
-                const ElementSelectExpression& es   = lhs.as<ElementSelectExpression>();
-                const ValueSymbol*             root = lvalue_root(es.value());
-                if (root == nullptr) {
-                    break;
+                const ElementSelectExpression& es = step.as<ElementSelectExpression>();
+                if (!es.value().type->isIntegral() || es.type->getBitWidth() != 1) {
+                    return std::nullopt;
                 }
-                if (es.value().kind == ExpressionKind::NamedValue &&
-                    es.value().type->isIntegral() && es.type->getBitWidth() == 1) {
-                    if (const std::optional<int32_t> c = try_const_int(es.selector())) {
-                        const auto bit =
-                          static_cast<uint32_t>(packed_range_of(es.value()).translateIndex(*c));
-                        record_net_driver_range(*root, bit, bit);
-                        break;
-                    }
+                if (const std::optional<int32_t> c = try_const_int(es.selector())) {
+                    const auto bit =
+                      static_cast<uint32_t>(packed_range_of(es.value()).translateIndex(*c));
+                    return std::make_pair(bit, bit);
                 }
-                record_net_driver_range(*root, 0, UINT32_MAX);
-                break;
+                return std::nullopt;
             }
             case ExpressionKind::RangeSelect: {
-                const RangeSelectExpression& rs   = lhs.as<RangeSelectExpression>();
-                const ValueSymbol*           root = lvalue_root(rs.value());
-                if (root == nullptr) {
-                    break;
+                const RangeSelectExpression& rs = step.as<RangeSelectExpression>();
+                if (!rs.value().type->isIntegral() ||
+                    rs.getSelectionKind() != RangeSelectionKind::Simple) {
+                    return std::nullopt;
                 }
-                if (rs.value().kind == ExpressionKind::NamedValue &&
-                    rs.value().type->isIntegral() &&
-                    rs.getSelectionKind() == RangeSelectionKind::Simple) {
-                    const std::optional<int32_t> left  = try_const_int(rs.left());
-                    const std::optional<int32_t> right = try_const_int(rs.right());
-                    if (left && right) {
-                        const slang::ConstantRange range = packed_range_of(rs.value());
-                        const auto a = static_cast<uint32_t>(range.translateIndex(*left));
-                        const auto b = static_cast<uint32_t>(range.translateIndex(*right));
-                        record_net_driver_range(*root, std::min(a, b), std::max(a, b));
-                        break;
-                    }
+                const std::optional<int32_t> left  = try_const_int(rs.left());
+                const std::optional<int32_t> right = try_const_int(rs.right());
+                if (!left || !right) {
+                    return std::nullopt;
                 }
-                // A dynamic (or indexed +:/-:) select: conservatively the whole net.
-                record_net_driver_range(*root, 0, UINT32_MAX);
-                break;
+                const slang::ConstantRange range = packed_range_of(rs.value());
+                const auto a = static_cast<uint32_t>(range.translateIndex(*left));
+                const auto b = static_cast<uint32_t>(range.translateIndex(*right));
+                return std::make_pair(std::min(a, b), std::max(a, b));
             }
             case ExpressionKind::MemberAccess: {
-                // A struct/union member's bit range is always a compile-time
-                // constant (LRM 7.2.1 field offsets are declared, never
-                // dynamic), so a direct-named-value base gets the exact
-                // range, same precision as the ElementSelect/RangeSelect
-                // cases above.
-                const MemberAccessExpression& ma   = lhs.as<MemberAccessExpression>();
-                const ValueSymbol*            root = lvalue_root(ma.value());
-                if (root == nullptr) {
-                    break;
+                const MemberAccessExpression& ma    = step.as<MemberAccessExpression>();
+                const auto*                   field = ma.member.as_if<FieldSymbol>();
+                if (field == nullptr) {
+                    return std::nullopt;
                 }
-                const auto* field = ma.member.as_if<FieldSymbol>();
-                if (field != nullptr && ma.value().kind == ExpressionKind::NamedValue) {
-                    const auto lsb = static_cast<uint32_t>(field->bitOffset);
-                    const auto msb = lsb + static_cast<uint32_t>(ma.type->getBitWidth()) - 1;
-                    record_net_driver_range(*root, lsb, msb);
-                    break;
-                }
-                record_net_driver_range(*root, 0, UINT32_MAX);
-                break;
+                const auto lsb = static_cast<uint32_t>(field->bitOffset);
+                const auto msb = lsb + static_cast<uint32_t>(ma.type->getBitWidth()) - 1;
+                return std::make_pair(lsb, msb);
             }
             default:
-                // Other lvalue shapes are rejected by lower_lvalue.
-                break;
+                return std::nullopt;
         }
     }
 
@@ -1864,12 +1975,18 @@ private:
         }
         if (is_aggregate(ns.getType())) {
             // TODO: continuous assignment to a whole unpacked struct net — the
-            // field-wise decomposition would need per-member continuous processes
-            // with per-member sensitivity. Member-level `assign n.f = ...` (a
-            // ContinuousAssignSymbol) is unaffected.
-            fail("continuous assignment to a whole unpacked struct net is not supported");
+            // A whole unpacked-struct / aggregate net initializer is a whole-object
+            // continuous copy (one process on the source's sensitivity), the same
+            // as a bare `assign n = ...` on a struct.
+            record_net_driver_whole(ns);
+            ir::Builder         ab(module_.pool);
+            const ir::SourceLoc al = loc(*init);
+            emit_agg_store(value_lvalue(ns, ab, al), lower_type(ns.getType()), *init,
+                           ir::Inst::Tag::Store, ab, al);
+            add_continuous_process(continuous_events(*init), to_source_loc(ns.location), ab);
+            return;
         }
-        record_net_driver_range(ns, 0, UINT32_MAX);
+        record_net_driver_whole(ns);
         ir::Builder         b(module_.pool);
         const ir::SourceLoc l = loc(*init);
         b.binary(ir::Inst::Tag::Store, value_lvalue(ns, b, l), lower_expr(*init, b), l);
@@ -2280,19 +2397,40 @@ private:
                 const AssignmentExpression& a = expr->as<AssignmentExpression>();
                 // The connection is a continuous driver of the parent-side net.
                 record_net_driver(a.left());
-                const ir::Ref   ty  = lower_type(*a.left().type);
-                const ir::Index val = b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l);
-                b.binary(ir::Inst::Tag::Store, lower_lvalue(a.left(), b),
-                         coerce(val, *a.right().type, ty, b, l), l);
+                if (is_aggregate(*a.left().type)) {
+                    // A whole unpacked-struct / aggregate port: the copy is a
+                    // per-leaf (or memcpy) whole-object copy, not a scalar store.
+                    // Port types are equivalent (LRM 23.3.3), so both sides share
+                    // the recursive storage layout.
+                    emit_port_agg_copy(lower_lvalue(a.left(), b), b.signal(child_sig, l),
+                                       lower_type(*a.left().type), b, l);
+                } else {
+                    const ir::Ref   ty  = lower_type(*a.left().type);
+                    const ir::Index val = b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l);
+                    b.binary(ir::Inst::Tag::Store, lower_lvalue(a.left(), b),
+                             coerce(val, *a.right().type, ty, b, l), l);
+                }
                 sens.push_back(ir::WaitEvent{ .signal = child_sig, .edge = ir::Edge::Any });
             } else {
                 // Input: drive the child net from the source rvalue, resized to the
                 // port width; wakes on the source's reads. The copy is a continuous
                 // driver of the whole child-side net.
-                record_net_driver_range(p.internalSymbol->as<ValueSymbol>(), 0, UINT32_MAX);
+                record_net_driver_whole(p.internalSymbol->as<ValueSymbol>());
                 const ir::Ref ty = lower_type(p.internalSymbol->as<ValueSymbol>().getType());
-                b.binary(ir::Inst::Tag::Store, b.signal(child_sig, l),
-                         coerce(lower_expr(*expr, b), *expr->type, ty, b, l), l);
+                if (is_aggregate(p.internalSymbol->as<ValueSymbol>().getType())) {
+                    // A whole unpacked-struct / aggregate input port: whole-object
+                    // copy of the source into the child net.
+                    const Expression& src = unwrap_conversion(*expr);
+                    if (!is_struct_lvalue_shape(src)) {
+                        // TODO: an aggregate port driven by a `'{...}` pattern / call
+                        // (needs a materialized temp, like an aggregate call actual).
+                        fail("aggregate port connection must be a variable");
+                    }
+                    emit_port_agg_copy(b.signal(child_sig, l), lower_lvalue(src, b), ty, b, l);
+                } else {
+                    b.binary(ir::Inst::Tag::Store, b.signal(child_sig, l),
+                             coerce(lower_expr(*expr, b), *expr->type, ty, b, l), l);
+                }
                 collect_expr_reads(*expr, sens);
             }
             // A port connection is a continuous copy: evaluate at time zero so the
@@ -2540,6 +2678,63 @@ private:
             edges.push_back(ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge) });
         }
         b.wait(edges, l);
+    }
+
+    // Emit the suspend for a blocking intra-assignment timing control
+    // (`lhs = #d rhs` / `lhs = @e rhs` / `lhs = repeat(N) @e rhs`, LRM 9.4.5).
+    // The caller has already sampled the RHS; this blocks the process on the
+    // delay/event, after which the caller stores the sampled value. A repeat
+    // event control waits for its child event N times (count evaluated once,
+    // N <= 0 falls through with no wait). The nonblocking form is not routed
+    // here — it needs a detached scheduled update (see lower_assign).
+    void lower_intra_timing(const TimingControl& tc, ir::Builder& b, ir::SourceLoc l) {
+        switch (tc.kind) {
+            case TimingControlKind::Delay:
+                b.unary(ir::Inst::Tag::Delay, scaled_delay(tc.as<DelayControl>().expr, b), l);
+                return;
+            case TimingControlKind::SignalEvent:
+            case TimingControlKind::EventList:
+                lower_event_wait(tc, b, l);
+                return;
+            case TimingControlKind::RepeatedEvent: {
+                const RepeatedEventControl& rec = tc.as<RepeatedEventControl>();
+                if (!is_event_control(rec.event)) {
+                    fail("repeat intra-assignment timing requires an event control");
+                }
+                if (rec.expr.type->isFloating()) {
+                    fail("repeat with a real count is not supported");
+                }
+                const ir::Ref    ty      = lower_type(*rec.expr.type);
+                const ir::Signal bound   = declare_temp(ty, "repeat_bound");
+                const ir::Signal counter = declare_temp(ty, "repeat_count");
+                b.binary(ir::Inst::Tag::Store, b.signal(bound, l),
+                         b.resize(lower_expr(rec.expr, b), ty, l), l);
+                b.binary(ir::Inst::Tag::Store, b.signal(counter, l),
+                         b.constant(module_.pool.put_int(ty, 0), l), l);
+
+                b.open_region();
+                const ir::Index cur  = b.unary(ir::Inst::Tag::Load, b.signal(counter, l), l);
+                const ir::Index lim  = b.unary(ir::Inst::Tag::Load, b.signal(bound, l), l);
+                const ir::Index pred = b.binary(ir::Inst::Tag::Lt, cur, lim, l);
+                const ir::ExtraSlice cond = b.close_region();
+
+                b.open_region();
+                lower_event_wait(rec.event, b, l);
+                const ir::ExtraSlice body = b.close_region();
+
+                b.open_region();
+                const ir::Index sc   = b.unary(ir::Inst::Tag::Load, b.signal(counter, l), l);
+                const ir::Index one  = b.constant(module_.pool.put_int(ty, 1), l);
+                b.binary(ir::Inst::Tag::Store, b.signal(counter, l),
+                         b.binary(ir::Inst::Tag::Add, sc, one, l), l);
+                const ir::ExtraSlice step = b.close_region();
+
+                b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
+                return;
+            }
+            default:
+                fail("unsupported intra-assignment timing control");
+        }
     }
 
     // Resolve the target of `-> e` to the event's synthetic signal, verifying it
@@ -5560,10 +5755,104 @@ private:
             return lower_compound_assign(a, b);
         }
         if (a.timingControl != nullptr) {
-            // Intra-assignment timing: `x = #5 y;` / `x = @(posedge clk) y;`. The
-            // delay/event is dropped today, so the update would land immediately at
-            // the wrong time. Reject until the scheduler exists.
-            fail("intra-assignment timing control (#/@ on an assignment) is not supported");
+            // Intra-assignment timing (LRM 9.4.5): sample the RHS now, suspend on
+            // the delay/event, then store the sampled value. The blocking form is a
+            // pure reorder over the existing Delay/Wait suspends — the sampled RHS
+            // is an SSA value live across the suspend, which CoroSplit spills into
+            // the process frame. The nonblocking form (`<= #d`) must not block the
+            // process and instead schedules a detached future update; that needs
+            // scheduler infrastructure not present yet.
+            if (a.isNonBlocking()) {
+                // Nonblocking form: sample now, do not block, commit after the
+                // timing via a detached scheduled store. Only a whole integral scalar
+                // target is lowered — the record is monomorphized per whole signal —
+                // so selects / concats / aggregates (needing the masked/array record
+                // path) fail loud, a documented follow-up
+                // (docs/design/intra-assignment-timing.md).
+                const bool whole_scalar =
+                    (a.left().kind == ExpressionKind::NamedValue ||
+                     a.left().kind == ExpressionKind::HierarchicalValue) &&
+                    a.left().type->isIntegral() && !a.left().type->isUnpackedArray();
+                if (!whole_scalar) {
+                    fail("nonblocking intra-assignment timing is only supported for a whole "
+                         "integral scalar target");
+                }
+                const TimingControl& tc = *a.timingControl;
+                if (tc.kind == TimingControlKind::Delay) {
+                    const Expression& delay_expr = tc.as<DelayControl>().expr;
+                    // A compile-time `#0` nonblocking assignment is identical to a plain
+                    // `<= ` — the update lands in the current instant's NBA region — so
+                    // lower it as a normal NBA. This keeps update ordering to a signal
+                    // uniform with its other NBAs (LRM 10.4.2, statement-execution order:
+                    // last written wins) via the one block-commit path, instead of
+                    // splitting the same signal across block-commit and the deferred
+                    // record path (whose commit order is fixed, not execution order).
+                    slang::ast::ASTContext     ectx(*scope_, slang::ast::LookupLocation::max);
+                    slang::ast::EvalContext    ev(ectx);
+                    const slang::ConstantValue cv = delay_expr.eval(ev);
+                    if (cv.isInteger()) {
+                        const auto v = cv.integer().as<uint64_t>();
+                        if (v && *v == 0) {
+                            const ir::Index val0 = lower_expr(a.right(), b);
+                            b.binary(ir::Inst::Tag::StoreNb, lower_lvalue(a.left(), b), val0, loc(a));
+                            return val0;
+                        }
+                    }
+                    const ir::Index val   = lower_expr(a.right(), b);
+                    const ir::Index delay = scaled_delay(delay_expr, b);
+                    b.store_nb_delay(lower_lvalue(a.left(), b), val, delay, loc(a));
+                    return val;
+                }
+                // Event / repeat-event form: `x <= @e y` / `x <= repeat(N) @e y`.
+                // Sample the value (and N) now; store after N occurrences of the
+                // trigger edge. Only a single (signal, edge) trigger is lowered.
+                const TimingControl* evt   = &tc;
+                ir::Index            count = ir::Index{};
+                if (tc.kind == TimingControlKind::RepeatedEvent) {
+                    const RepeatedEventControl& rec = tc.as<RepeatedEventControl>();
+                    if (rec.expr.type->isFloating()) {
+                        fail("repeat with a real count is not supported");
+                    }
+                    evt   = &rec.event;
+                    count = lower_expr(rec.expr, b);
+                } else {
+                    // Plain `@e` waits for one occurrence.
+                    count = b.constant(module_.pool.put_int(make_int_type(32, false, false), 1), loc(a));
+                }
+                if (!is_event_control(*evt)) {
+                    fail("nonblocking intra-assignment requires a delay or event control");
+                }
+                std::vector<ir::WaitEvent> events;
+                collect_wait_events(*evt, events);
+                if (events.size() != 1) {
+                    // TODO: a multi-signal trigger `@(a or b)` needs the record on
+                    // several trigger lists with first-fire-wins removal.
+                    fail("nonblocking intra-assignment multi-signal event trigger is not supported");
+                }
+                const ir::Index val = lower_expr(a.right(), b);
+                b.store_nb_event(lower_lvalue(a.left(), b), val, count, events[0].signal,
+                                 static_cast<uint32_t>(events[0].edge), loc(a));
+                return val;
+            }
+            const bool string_lhs =
+                is_string_expr(a.left()) ||
+                (a.left().kind == ExpressionKind::ElementSelect &&
+                 is_string_expr(a.left().as<ElementSelectExpression>().value()));
+            if (string_lhs || is_unpacked_array(a.left())) {
+                // TODO: intra-assignment timing on a string / whole-array target —
+                // the string/array store paths evaluate the LHS before the RHS, so
+                // reordering them across the suspend needs care.
+                fail("intra-assignment timing on a string or array target is not supported");
+            }
+            const ir::Index rhs = lower_expr(a.right(), b);
+            lower_intra_timing(*a.timingControl, b, loc(a));
+            if (a.left().kind == ExpressionKind::Concatenation) {
+                store_concat(a.left().as<ConcatenationExpression>(), rhs, ir::Inst::Tag::Store, b,
+                             loc(a));
+                return rhs;
+            }
+            b.binary(ir::Inst::Tag::Store, lower_lvalue(a.left(), b), rhs, loc(a));
+            return rhs;
         }
         if (a.isNonBlocking() && fn_ctx_ != nullptr) {
             if (!fn_ctx_->is_task) {
@@ -5906,6 +6195,13 @@ private:
         switch (expr.kind) {
             case ExpressionKind::IntegerLiteral:
                 return b.constant(lower_int_literal(expr.as<IntegerLiteral>()), l);
+            case ExpressionKind::UnbasedUnsizedIntegerLiteral:
+                // '0/'1/'x/'z (LRM 5.7.1): the single bit fills the whole
+                // context-determined width. slang has already propagated the
+                // type and getValue() returns the SVInt sized+filled per the
+                // table (setAllOnes / createFillX / createFillZ).
+                return b.constant(
+                    svint_to_ref(expr.as<UnbasedUnsizedIntegerLiteral>().getValue(), lower_type(*expr.type)), l);
             case ExpressionKind::RealLiteral:
                 // An IEEE-754 double (LRM 5.7.2); a shortreal literal arrives as
                 // a cast around this, handled by the Conversion case.
@@ -7388,9 +7684,10 @@ private:
     const slang::ast::Scope* scope_ = nullptr;
     // Maps an elaborated value symbol to its module Signal handle.
     ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal> sigmap_;
-    // Continuous-driver coverage per net signal: the closed bit ranges [lo, hi]
-    // already driven, checked for overlap by record_net_driver_range.
-    ankerl::unordered_dense::map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> net_driven_;
+    // Continuous-driver coverage per net signal: the closed regions already
+    // driven, checked for overlap by record_net_driver_region (NetRegion defined
+    // in the net-driver-tracking section).
+    ankerl::unordered_dense::map<uint32_t, std::vector<NetRegion>> net_driven_;
     // Hierarchical name prefix of the instance currently being lowered (e.g.
     // "u_alu.u_sub."); empty for the top. Prepended to every signal name created
     // while this instance's body is processed so flattened signals stay unique.

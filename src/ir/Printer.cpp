@@ -100,6 +100,10 @@ const char* tag_name(Inst::Tag tag) {
             return "dyn_array_op";
         case T::QueueOp:
             return "queue_op";
+        case T::StoreNbDelay:
+            return "store_nb_delay";
+        case T::StoreNbEvent:
+            return "store_nb_event";
         case T::Add:
             return "add";
         case T::Sub:
