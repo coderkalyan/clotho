@@ -227,14 +227,54 @@ TEST_CASE("wide-typed lowering constants: repeat, ++, unary minus") {
           "neg2 ffffffff fffffffffffffffb\n");
 }
 
-TEST_CASE("element select on a multi-dim packed array is rejected") {
+TEST_CASE("multi-dim packed array: element/range/nested selects (LRM 7.4.5/7.4.6)") {
+    // iverilog crashes on a multi-dim packed select (elab_expr.cc assertion), so
+    // the oracle here is Verilator 5.048; every string is also hand-derivable
+    // from the flat bit layout (element k of width W occupies bits [k*W+W-1:k*W]).
     constexpr std::string_view src = R"(
         module t;
-            logic [3:0][7:0] x;
-            initial $display("%h", x[1]);
+            logic [3:0][7:0]      a;   // 4 elements x 8 bits, descending
+            logic [1:0][2:0][3:0] b;   // 3-D: 2 x 3 x 4
+            logic [0:3][7:0]      c;   // ascending outer dim
+            integer i;
+            initial begin
+                a = 32'hDEADBEEF;      // a[3]=DE a[2]=AD a[1]=BE a[0]=EF
+                $display("e %h %h %h %h", a[0], a[1], a[2], a[3]);
+                $display("nb %b %b", a[2][7], a[0][0]);          // nested bit
+                $display("ps %h %h", a[1][7:4], a[3][3:0]);      // part of element
+                $display("rs %h %h", a[2:1], a[3:2]);            // element range (16b)
+                for (i = 0; i < 4; i = i + 1) $display("dyn %0d %h", i, a[i]);
+                $display("ips %h %h", a[1 +: 2], a[3 -: 2]);     // indexed element range
+                i = 9; $display("oor %h", a[i]);                 // out of range -> X
+                a = 0;
+                a[2] = 8'h5A; a[0][3:0] = 4'hF; a[3][7] = 1'b1; a[1:0] = 16'h1234;
+                $display("wr %h", a);
+                for (i = 0; i < 4; i = i + 1) a[i] = i[7:0] + 8'h10;
+                $display("dw %h", a);
+                b = 24'hABCDEF;        // b[1]=ABC b[0]=DEF (each 12 bits = 3x4)
+                $display("d3 %h %h %h %b", b[0], b[1], b[1][2], b[0][0][3]);
+                b[1][0] = 4'h7; $display("d3w %h", b);
+                c = 32'h11223344;      // c[0]=11 c[1]=22 c[2]=33 c[3]=44
+                $display("asc %h %h %h", c[0], c[3], c[1:2]);
+            end
         endmodule
     )";
-    CHECK(reject(src).find("multi-dimensional packed array") != std::string::npos);
+    CHECK(run_capture(src) ==
+          "e ef be ad de\n"
+          "nb 1 1\n"
+          "ps b e\n"
+          "rs adbe dead\n"
+          "dyn 0 ef\n"
+          "dyn 1 be\n"
+          "dyn 2 ad\n"
+          "dyn 3 de\n"
+          "ips adbe dead\n"
+          "oor xx\n"
+          "wr 805a1234\n"
+          "dw 13121110\n"
+          "d3 def abc a 1\n"
+          "d3w ab7def\n"
+          "asc 11 44 2233\n");
 }
 
 TEST_CASE("fork..join_any / join_none are rejected, not serialized") {
