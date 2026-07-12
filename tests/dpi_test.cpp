@@ -98,6 +98,19 @@ TEST_CASE("DPI import: pure function runs correctly") {
     CHECK(run_capture(src) == "4\n");
 }
 
+TEST_CASE("DPI import: output argument") {
+    constexpr std::string_view src = R"(
+        module m;
+          import "DPI-C" function real frexp(input real x, output int e);
+          initial begin
+            real mant; int ex;
+            mant = frexp(8.0, ex);
+            $display("%0d %0d", ex, int'(mant * 1000.0));
+          end
+        endmodule)";
+    CHECK(run_capture(src) == "4 500\n");
+}
+
 // Out-of-scope constructs must fail loudly with a TODO, never silently miscompile.
 // Each is a distinct guard in build_dpi_import.
 TEST_CASE("DPI import: unsupported forms are rejected") {
@@ -125,14 +138,16 @@ TEST_CASE("DPI import: unsupported forms are rejected") {
             endmodule)";
         CHECK(lower_fail(src).find("not a supported scalar type") != std::string::npos);
     }
-    SUBCASE("output argument (Phase 2)") {
+    SUBCASE("packed-vector output argument (svVecVal, deferred)") {
+        // output/inout of a scalar is supported (Phase 2); a packed-vector output
+        // is still the deferred svBitVecVal marshal.
         constexpr std::string_view src = R"(
             module m;
-              import "DPI-C" function void f(output int x);
-              int y;
+              import "DPI-C" function void f(output bit [7:0] x);
+              bit [7:0] y;
               initial f(y);
             endmodule)";
-        CHECK(lower_fail(src).find("output/inout/ref") != std::string::npos);
+        CHECK(lower_fail(src).find("not a supported scalar type") != std::string::npos);
     }
     SUBCASE("DPI import task") {
         constexpr std::string_view src = R"(

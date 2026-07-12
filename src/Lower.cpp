@@ -7814,18 +7814,21 @@ private:
         std::vector<ir::ArgDir>   arg_dirs;
         std::vector<ir::DpiCType> arg_cts;
         for (const FormalArgumentSymbol* fa : sub.getArguments()) {
-            if (fa->direction != slang::ast::ArgumentDirection::In) {
-                // TODO: DPI output / inout / ref (Phase 2) — pass a C-native
-                // scratch pointer and copy back through the CopyOutArg path.
-                fail("DPI output/inout/ref arguments are not supported");
+            if (fa->direction == slang::ast::ArgumentDirection::Ref) {
+                // DPI-C has no `ref` formals (slang rejects DPIRefArg); guard
+                // defensively in case a future slang change lets one through.
+                fail("DPI ref arguments are not supported");
             }
             const auto c = dpi_scalar_ctype(fa->getType());
             if (!c.has_value()) {
                 fail("DPI argument type is not a supported scalar type (only "
                      "byte/shortint/int/longint/real/shortreal/bit/logic)");
             }
+            // input / output / inout: the direction drives the C ABI (by value vs
+            // by pointer) in declare_dpi_import / lower_dpi_call. build_call_args
+            // already makes the caller temp + CopyOutArg for a non-In direction.
             param_types.push_back(lower_type(fa->getType()));
-            arg_dirs.push_back(ir::ArgDir::In);
+            arg_dirs.push_back(to_arg_dir(fa->direction));
             arg_cts.push_back(*c);
         }
 

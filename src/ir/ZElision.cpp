@@ -576,6 +576,22 @@ std::vector<bool> compute_may_z(const Module& m) {
         a.fns[f].func      = &fn;
         a.fns[f].param_z.assign(fn.param_types.size(), 0);
         a.fns[f].local_z.assign(fn.local_types.size(), 0);
+        if (fn.is_dpi) {
+            // A DPI import's C body is opaque (its fake IR body returns a constant),
+            // so it cannot be analyzed for z. Conservatively assume it can produce z
+            // on any 4-state return / output / inout — otherwise z-elision drops the
+            // z plane of a DPI logic result (the Call result reads result_z; an
+            // output arg copies out only if local_z[k] is set).
+            if (fn.return_type != m.pool.void_type &&
+                m.pool.layout(fn.return_type).domain == Domain::Four) {
+                a.fns[f].result_z = 1;
+            }
+            for (size_t k = 0; k < fn.param_types.size(); ++k) {
+                if (m.pool.layout(fn.param_types[k]).domain == Domain::Four) {
+                    a.fns[f].local_z[k] = 1;
+                }
+            }
+        }
     }
 
     // Seed 1: an undriven 4-state net holds its default value z (LRM 6.6).

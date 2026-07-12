@@ -1801,11 +1801,15 @@ private:
     // is side-effect-free, so mark it readnone + willreturn + nounwind so the
     // optimizer can CSE / hoist / DCE the call.
     llvm::Function* declare_dpi_import(FunctionId id) {
-        const Function&          f = mod_.function(id);
+        const Function&          f   = mod_.function(id);
+        auto*                    ptr = llvm::PointerType::getUnqual(ctx_);
         std::vector<llvm::Type*> params;
         params.reserve(f.dpi_arg_ctypes.size());
-        for (DpiCType ct : f.dpi_arg_ctypes) {
-            params.push_back(dpi_c_llvm_ty(ct));
+        for (size_t k = 0; k < f.dpi_arg_ctypes.size(); ++k) {
+            const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
+            // input passes the C scalar by value; output / inout pass a pointer to
+            // it (the C function writes through it).
+            params.push_back(dir == ArgDir::In ? dpi_c_llvm_ty(f.dpi_arg_ctypes[k]) : ptr);
         }
         auto* fnty   = llvm::FunctionType::get(dpi_c_llvm_ty(f.dpi_ret_ctype), params, false);
         auto  callee = llmod_.getOrInsertFunction(f.extern_name, fnty);
@@ -9687,18 +9691,46 @@ private:
     }
 
     // Lower a `call` to a DPI-C import (LRM 35): marshal each scalar argument to
-    // its native C value, call the external symbol directly (no state pointer), and
-    // convert the C return back to a Plane. Input-only, scalar types (the frontend
-    // guards the rest), so there is no ref servicing or copy-out.
+    // its native C value (input by value, output / inout through a C-native scratch
+    // pointer), call the external symbol directly (no state pointer), and convert
+    // the C return back to a Plane. Scalar types only (the frontend guards the
+    // rest), so no ref servicing.
     void lower_dpi_call(Index i, const CallInfo& ci, const Function& f) {
         llvm::Function*           cf = fn_decls_[static_cast<uint32_t>(ci.func)];
         std::vector<llvm::Value*> argv;
-        size_t                    k = 0;
+        // output / inout scratches to read back into the caller temp after the
+        // call; the frontend's CopyOutArg then copies temp -> actual.
+        struct DpiOut {
+            Index        temp;
+            DpiCType     ct;
+            llvm::Value* scratch;
+            llvm::Type*  cty;
+        };
+        std::vector<DpiOut> outs;
+        size_t              k = 0;
         for (Index a : ir_->region(ci.args)) {
-            argv.push_back(dpi_arg_to_c(f.dpi_arg_ctypes[k], value_of(a)));
+            const DpiCType ct  = f.dpi_arg_ctypes[k];
+            const ArgDir   dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
+            if (dir == ArgDir::In) {
+                argv.push_back(dpi_arg_to_c(ct, value_of(a)));
+            } else {
+                // A C-native scratch passed by pointer, hoisted to the entry block
+                // (entry_alloca) so a DPI call in a loop does not grow the stack per
+                // iteration. inout copies the caller temp in first.
+                llvm::Type*  cty     = dpi_c_llvm_ty(ct);
+                llvm::Value* scratch = entry_alloca(cty, "dpi.out");
+                if (dir == ArgDir::Inout) {
+                    b_.CreateStore(dpi_arg_to_c(ct, lower_load(lvalue_of(a))), scratch);
+                }
+                argv.push_back(scratch);
+                outs.push_back({ a, ct, scratch, cty });
+            }
             ++k;
         }
         llvm::Value* r = b_.CreateCall(cf->getFunctionType(), cf, argv);
+        for (const DpiOut& o : outs) {
+            lower_store(lvalue_of(o.temp), dpi_c_to_plane(o.ct, b_.CreateLoad(o.cty, o.scratch)));
+        }
         if (f.dpi_ret_ctype != DpiCType::Void) {
             set_value(i, dpi_c_to_plane(f.dpi_ret_ctype, r));
         }
