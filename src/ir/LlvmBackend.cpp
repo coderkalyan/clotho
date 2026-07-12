@@ -4244,7 +4244,7 @@ private:
                 llvm::Value* vidx = b_.CreateLoad(
                   b_.getInt32Ty(), b_.CreateInBoundsGEP(nba_vcd_gv_->getValueType(), nba_vcd_gv_,
                                                         { b_.getInt32(0), b_.getInt32(s.nba_id) }));
-                b_.CreateCall(vcd_touch_fn(), { vidx });
+                emit_guarded_vcd_touch(vcd_touch_fn(), { vidx });
             }
         }
     }
@@ -8341,7 +8341,7 @@ private:
             llvm::Value* vidx = b_.CreateLoad(
               i32, b_.CreateInBoundsGEP(nba_vcd_gv_->getValueType(), nba_vcd_gv_,
                                         { b_.getInt32(0), b_.getInt32(s.nba_id) }));
-            b_.CreateCall(vcd_touch_fn(), { vidx });
+            emit_guarded_vcd_touch(vcd_touch_fn(), { vidx });
         }
         b_.CreateCall(intra_release_fn(), { b_.getInt32(idx) });
         b_.CreateBr(skip);
@@ -9267,6 +9267,24 @@ private:
     llvm::FunctionCallee vcd_touch_fn() {
         return rt_fn("rt_vcd_touch", b_.getVoidTy(), { b_.getInt32Ty() });
     }
+    // The runtime rt_vcd_active byte, non-zero only while VCD dumping is live.
+    llvm::Constant* vcd_active_gv() {
+        return llmod_.getOrInsertGlobal("rt_vcd_active", b_.getInt8Ty());
+    }
+    // Emit a VCD touch call guarded by the runtime active flag, so a design that
+    // compiles in $dumpvars (possibly plusarg-guarded) but is not dumping pays
+    // only a predictable-not-taken load+branch per store, not a runtime call.
+    void emit_guarded_vcd_touch(llvm::FunctionCallee fn, llvm::ArrayRef<llvm::Value*> args) {
+        llvm::Function*   f      = b_.GetInsertBlock()->getParent();
+        llvm::Value*      active = b_.CreateLoad(b_.getInt8Ty(), vcd_active_gv());
+        llvm::BasicBlock* touch  = llvm::BasicBlock::Create(ctx_, "vcd.touch", f);
+        llvm::BasicBlock* cont   = llvm::BasicBlock::Create(ctx_, "vcd.cont", f);
+        b_.CreateCondBr(b_.CreateICmpNE(active, b_.getInt8(0)), touch, cont);
+        b_.SetInsertPoint(touch);
+        b_.CreateCall(fn, args);
+        b_.CreateBr(cont);
+        b_.SetInsertPoint(cont);
+    }
     llvm::FunctionCallee vcd_flush_fn() {
         return rt_fn("rt_vcd_flush", b_.getVoidTy(), { b_.getInt64Ty() });
     }
@@ -9374,14 +9392,14 @@ private:
         if (s.is_array) {
             if (lv.elem_idx != nullptr) {
                 llvm::Value* idx = b_.CreateAdd(b_.getInt32(static_cast<uint32_t>(base)), lv.elem_idx);
-                b_.CreateCall(vcd_touch_fn(), { idx });
+                emit_guarded_vcd_touch(vcd_touch_fn(), { idx });
             } else {
-                b_.CreateCall(vcd_touch_range_fn(),
+                emit_guarded_vcd_touch(vcd_touch_range_fn(),
                               { b_.getInt32(static_cast<uint32_t>(base)), b_.getInt32(s.elem_count) });
             }
             return;
         }
-        b_.CreateCall(vcd_touch_fn(), { b_.getInt32(static_cast<uint32_t>(base)) });
+        emit_guarded_vcd_touch(vcd_touch_fn(), { b_.getInt32(static_cast<uint32_t>(base)) });
     }
 
     // Emit an rt_vcd_touch_range for a dumped array signal (whole element range).
@@ -9393,7 +9411,7 @@ private:
         }
         const int32_t base = vcd_index_[static_cast<uint32_t>(sig)];
         if (base >= 0) {
-            b_.CreateCall(vcd_touch_range_fn(),
+            emit_guarded_vcd_touch(vcd_touch_range_fn(),
                           { b_.getInt32(static_cast<uint32_t>(base)), b_.getInt32(slot_of(sig).elem_count) });
         }
     }

@@ -292,6 +292,9 @@ void rt_vcd_start(void);
 // from the design at each write to a dumped scalar signal (blocking store and NBA
 // commit); the next rt_vcd_flush visits only the marked variables. A no-op when
 // dumping is not active.
+// Non-zero while VCD dumping is active. The JIT loads this to skip the
+// rt_vcd_touch call when nothing is being dumped (see LlvmBackend touch gate).
+extern unsigned char rt_vcd_active;
 void rt_vcd_touch(uint32_t idx);
 
 // Mark the `count` variables [base, base+count) changed -- used for a whole

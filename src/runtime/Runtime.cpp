@@ -3440,6 +3440,11 @@ static void vcd_register(std::string_view ref, uint32_t width, uint32_t flags, c
     g_vcd.vars.push_back(std::move(v));
 }
 
+// Mirror of g_vcd.active exposed as a plain external byte (global scope so the
+// symbol matches the JIT's external reference) so the JIT can inline the "is VCD
+// dumping active?" check and skip the rt_vcd_touch call entirely when it is not.
+extern "C" unsigned char rt_vcd_active = 0;
+
 extern "C" void rt_vcd_var(const char* name, uint32_t name_len, uint32_t width, uint32_t flags,
                            const uint8_t* mm, const uint8_t* z) {
     if (g_vcd.file == nullptr || g_vcd.started) {
@@ -3525,6 +3530,7 @@ extern "C" void rt_vcd_start(void) {
         g_vcd.started = true;
     }
     g_vcd.active    = true;
+    rt_vcd_active   = 1;
     g_vcd.force_all = true;   // the first flush emits every variable's initial value
 }
 
@@ -3553,6 +3559,7 @@ extern "C" void rt_vcd_flush(uint64_t tick) {
         }
         g_vcd.pending_off = false;
         g_vcd.active      = false;
+        rt_vcd_active     = 0;
         vcd_handoff();
         return;
     }
@@ -3606,6 +3613,7 @@ extern "C" void rt_vcd_off(void) {
 extern "C" void rt_vcd_on(void) {
     if (g_vcd.started) {
         g_vcd.active    = true;
+        rt_vcd_active   = 1;
         g_vcd.force_all = true;
     }
 }

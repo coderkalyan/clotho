@@ -164,6 +164,12 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_vcd_start", &rt_vcd_start);
     expose("rt_vcd_touch", &rt_vcd_touch);
     expose("rt_vcd_touch_range", &rt_vcd_touch_range);
+    // rt_vcd_active is a data symbol (the VCD-active flag the JIT loads to gate
+    // touch calls), so it is exposed without the Callable flag.
+    rt_syms[(*jit)->mangleAndIntern("rt_vcd_active")] = {
+        llvm::orc::ExecutorAddr::fromPtr(&rt_vcd_active),
+        llvm::JITSymbolFlags::Exported,
+    };
     expose("rt_vcd_flush", &rt_vcd_flush);
     expose("rt_vcd_off", &rt_vcd_off);
     expose("rt_vcd_on", &rt_vcd_on);
