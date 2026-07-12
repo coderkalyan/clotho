@@ -1,5 +1,6 @@
 #include "Runtime.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cerrno>
@@ -7,6 +8,7 @@
 #include <condition_variable>
 #include <csetjmp>
 #include <cstddef>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -2233,13 +2235,210 @@ extern "C" int32_t rt_random(void) {
     return rng_draw(g_random_seed);
 }
 
-extern "C" uint64_t rt_random_seeded(uint32_t seed_in) {
-    // $random(seed): the seed word IS the whole PRNG state. Advance a local copy
-    // and pack the updated seed in the high 32 bits with the draw in the low 32,
-    // so the JIT writes the seed back and uses the value from one call.
-    uint32_t seed  = seed_in;
-    int32_t  value = rng_draw(seed);
-    return (static_cast<uint64_t>(seed) << 32) | static_cast<uint32_t>(value);
+// -- Distribution routines (LRM §20.15.2) ----------------------------------------
+//
+// Implement the algorithms IEEE Std 1800-2023 Annex N defines, so the streams
+// are identical to any conforming tool for a given seed. The float/double steps
+// round, so (as with rng_uniform above) they follow the Annex's arithmetic step
+// for step and are never reassociated — no fast-math. `dist_uniform_real` is the
+// general two-argument `uniform(seed, start, end)`; rng_uniform above is its
+// full-int32-span specialisation kept separate so the verified unseeded
+// $random stream is untouched.
+namespace {
+
+// Annex N `uniform(seed, start, end)`: advance the seed's 32-bit LCG once, use
+// the high 23 bits of the new state as the mantissa of a float in [1, 2), and
+// scale that into [start, end). A degenerate range draws over [0, 2^31 - 1].
+// The state is a uint32_t, so the LCG wraps without signed overflow, and the
+// float is assembled with std::bit_cast, as in rng_uniform.
+double dist_uniform_real(int32_t* seed, int32_t start, int32_t end) {
+    constexpr double epsilon = 0x1p-23;
+    const bool       ordered = start < end;
+    const double     low     = ordered ? static_cast<double>(start) : 0.0;
+    const double     high    = ordered ? static_cast<double>(end) : 2147483647.0;
+
+    uint32_t state = std::bit_cast<uint32_t>(*seed);
+    if (state == 0) {
+        state = 259341593u;
+    }
+    state = 69069u * state + 1u;
+    *seed = std::bit_cast<int32_t>(state);
+
+    double unit = static_cast<double>(std::bit_cast<float>((state >> 9) | 0x3f800000u));
+    unit        = unit + unit * epsilon;
+    return (high - low) * (unit - 1.0) + low;
+}
+
+// Annex N's conversion of a real draw to an integer: truncate toward zero, and
+// one lower for any negative value, integral or not.
+int32_t annex_floor(double r) {
+    return r >= 0 ? static_cast<int32_t>(r) : static_cast<int32_t>(r - 1);
+}
+
+// $dist_uniform: an integer in [start, end] from one real draw. The draw's span
+// is widened by one at an end that is not already the int32 limit, so both
+// endpoints are reachable, and the result is clamped back into the range.
+int32_t rtl_dist_uniform(int32_t* seed, int32_t start, int32_t end) {
+    if (start >= end) {
+        return start;
+    }
+    if (end != INT32_MAX) {
+        const int32_t upper = end + 1;
+        const int32_t value = annex_floor(dist_uniform_real(seed, start, upper));
+        return std::clamp(value, start, upper - 1);
+    }
+    if (start != INT32_MIN) {
+        const int32_t lower = start - 1;
+        const int32_t value = annex_floor(dist_uniform_real(seed, lower, end) + 1.0);
+        return std::clamp(value, lower + 1, end);
+    }
+    const double unit = (dist_uniform_real(seed, start, end) + 2147483648.0) / 4294967295.0;
+    return annex_floor(unit * 4294967296.0 - 2147483648.0);
+}
+
+// $dist_normal: the polar method. Draw points in the square until one lands
+// strictly inside the unit circle, away from the origin, then scale it.
+double dist_normal_real(int32_t* seed, int32_t mean, int32_t deviation) {
+    double x, y, radius;
+    do {
+        x      = dist_uniform_real(seed, -1, 1);
+        y      = dist_uniform_real(seed, -1, 1);
+        radius = x * x + y * y;
+    } while (radius >= 1.0 || radius == 0.0);
+    const double gauss = x * std::sqrt(-2.0 * std::log(radius) / radius);
+    return gauss * static_cast<double>(deviation) + static_cast<double>(mean);
+}
+
+// $dist_exponential: inverse transform of one draw in [0, 1).
+double dist_exponential_real(int32_t* seed, int32_t mean) {
+    const double u = dist_uniform_real(seed, 0, 1);
+    return u == 0.0 ? 0.0 : -std::log(u) * mean;
+}
+
+// $dist_poisson: count the draws whose running product stays above e^-mean.
+int32_t dist_poisson_int(int32_t* seed, int32_t mean) {
+    const double limit   = std::exp(-static_cast<double>(mean));
+    double       product = dist_uniform_real(seed, 0, 1);
+    int32_t      count   = 0;
+    while (limit < product) {
+        ++count;
+        product = dist_uniform_real(seed, 0, 1) * product;
+    }
+    return count;
+}
+
+// $dist_chi_square: an odd degree contributes one squared normal draw, and each
+// further pair of degrees one doubled exponential draw.
+double dist_chi_square_real(int32_t* seed, int32_t degrees) {
+    double sum = 0.0;
+    if (degrees % 2 != 0) {
+        const double z = dist_normal_real(seed, 0, 1);
+        sum            = z * z;
+    }
+    for (int32_t pair = 2; pair <= degrees; pair += 2) {
+        sum = sum + 2 * dist_exponential_real(seed, 1);
+    }
+    return sum;
+}
+
+// $dist_t: a normal draw over the root of a chi-square draw per degree.
+double dist_t_real(int32_t* seed, int32_t degrees) {
+    const double chi   = dist_chi_square_real(seed, degrees);
+    const double scale = std::sqrt(chi / static_cast<double>(degrees));
+    return dist_normal_real(seed, 0, 1) / scale;
+}
+
+// $dist_erlang: the log of a product of k uniform draws, scaled by mean / k.
+double dist_erlang_real(int32_t* seed, int32_t k, int32_t mean) {
+    double product = 1.0;
+    for (int32_t i = 1; i <= k; ++i) {
+        product = product * dist_uniform_real(seed, 0, 1);
+    }
+    return -static_cast<double>(mean) * std::log(product) / static_cast<double>(k);
+}
+
+// Round-half-away-from-zero to int32, matching the reference rtl_dist_* wrappers.
+int32_t dist_round(double r) {
+    if (r >= 0) {
+        return static_cast<int32_t>(r + 0.5);
+    }
+    return -static_cast<int32_t>(-r + 0.5);
+}
+
+// Pack the updated seed (high 32) with the signed integer draw (low 32).
+uint64_t dist_pack(int32_t seed, int32_t value) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(seed)) << 32) |
+           static_cast<uint32_t>(value);
+}
+
+} // namespace
+
+extern "C" uint64_t rt_dist_uniform(int32_t seed, int32_t start, int32_t end) {
+    const int32_t v = rtl_dist_uniform(&seed, start, end);
+    return dist_pack(seed, v);
+}
+
+extern "C" uint64_t rt_dist_normal(int32_t seed, int32_t mean, int32_t deviation) {
+    const int32_t v = dist_round(dist_normal_real(&seed, mean, deviation));
+    return dist_pack(seed, v);
+}
+
+extern "C" uint64_t rt_dist_exponential(int32_t seed, int32_t mean) {
+    // Reference guards: a non-positive parameter yields 0 (LRM §20.15.2). The
+    // seed is still consumed by the guard's own path only when the routine runs;
+    // matching the reference, a guarded call leaves the seed untouched.
+    if (mean <= 0) {
+        return dist_pack(seed, 0);
+    }
+    const int32_t v = dist_round(dist_exponential_real(&seed, mean));
+    return dist_pack(seed, v);
+}
+
+extern "C" uint64_t rt_dist_poisson(int32_t seed, int32_t mean) {
+    if (mean <= 0) {
+        return dist_pack(seed, 0);
+    }
+    const int32_t v = dist_poisson_int(&seed, mean);
+    return dist_pack(seed, v);
+}
+
+extern "C" uint64_t rt_dist_chi_square(int32_t seed, int32_t df) {
+    if (df <= 0) {
+        return dist_pack(seed, 0);
+    }
+    const int32_t v = dist_round(dist_chi_square_real(&seed, df));
+    return dist_pack(seed, v);
+}
+
+extern "C" uint64_t rt_dist_t(int32_t seed, int32_t df) {
+    if (df <= 0) {
+        return dist_pack(seed, 0);
+    }
+    const int32_t v = dist_round(dist_t_real(&seed, df));
+    return dist_pack(seed, v);
+}
+
+extern "C" uint64_t rt_dist_erlang(int32_t seed, int32_t k, int32_t mean) {
+    if (k <= 0) {
+        return dist_pack(seed, 0);
+    }
+    const int32_t v = dist_round(dist_erlang_real(&seed, k, mean));
+    return dist_pack(seed, v);
+}
+
+// -- $urandom seeding (LRM §18.13) --------------------------------------------
+//
+// splitmix64 expansion of a 64-bit selector into the 256-bit xoshiro256++ state,
+// the seeding scheme recommended by the xoshiro authors. Called once per process
+// (selector = process index) and on $urandom(seed) reseed (selector = user seed).
+extern "C" void rt_urandom_seed(uint64_t* state, uint64_t seed) {
+    uint64_t x = seed;
+    for (int i = 0; i < 4; ++i) {
+        uint64_t z = (x += 0x9e3779b97f4a7c15ull);
+        z          = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+        z          = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+        state[i]   = z ^ (z >> 31);
+    }
 }
 
 namespace {

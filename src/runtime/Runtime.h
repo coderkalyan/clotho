@@ -321,13 +321,40 @@ void rt_vcd_close(void);
 
 int32_t rt_random(void);
 
-// $random(seed) (LRM §20.15.1): the seeded form, where the caller's inout `seed`
-// integer carries the entire PRNG state. Advance the generator off `seed_in` and
-// return the updated seed in the high 32 bits packed with the signed draw in the
-// low 32 — the JIT writes the seed back to the lvalue and takes the value. Runs
-// the same reference stream as rt_random, so seeding with 0 reproduces the
-// unseeded stream's first draws.
-uint64_t rt_random_seeded(uint32_t seed_in);
+// -- Probabilistic distribution functions (LRM §20.15.2) and $random(seed) --
+//
+// Implementations of the distribution algorithms IEEE Std 1800-2023 (formerly
+// IEEE 1364) defines in Annex N. The LRM mandates the exact algorithm so every
+// conforming tool produces the same stream from the same seed (and these match
+// iverilog's output byte-for-byte). Each takes the caller's inout `seed` (the
+// whole PRNG state, one int32) plus the distribution parameters, and returns the
+// updated seed packed in the high 32 bits with the signed integer draw in the
+// low 32 — the JIT slices the two halves, writing the seed back to the lvalue.
+//
+// $random(seed) is exactly rt_dist_uniform(seed, INT32_MIN, INT32_MAX) and is
+// lowered through this same path (the unseeded $random above keeps its own
+// process-global stream).
+uint64_t rt_dist_uniform(int32_t seed, int32_t start, int32_t end);
+uint64_t rt_dist_normal(int32_t seed, int32_t mean, int32_t deviation);
+uint64_t rt_dist_exponential(int32_t seed, int32_t mean);
+uint64_t rt_dist_poisson(int32_t seed, int32_t mean);
+uint64_t rt_dist_chi_square(int32_t seed, int32_t df);
+uint64_t rt_dist_t(int32_t seed, int32_t df);
+uint64_t rt_dist_erlang(int32_t seed, int32_t k, int32_t mean);
+
+// -- $urandom / $urandom_range (LRM §18.13) --
+//
+// Unlike $random/$dist_* the LRM leaves the $urandom algorithm unspecified,
+// requiring only that it be deterministic and per-process ("thread") stable. Its
+// RNG is a per-process xoshiro256++ generator whose 256-bit state lives in the
+// process's coroutine frame; the draw and the $urandom_range mapping are inlined
+// into the JIT (no runtime call per draw). The only runtime entry is the
+// one-per-process seeding of that state from a 64-bit selector (splitmix64
+// expansion): the process index at startup, or the user seed for $urandom(seed).
+// A modern integer PRNG (not the $random LCG) is chosen for quality and speed
+// per the project's "unspecified -> pick performance and simplicity"; the stream is
+// therefore intentionally not iverilog-identical.
+void rt_urandom_seed(uint64_t* state, uint64_t seed);
 
 // -- Plusargs (LRM §21.6) --
 //
