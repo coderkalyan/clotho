@@ -1791,6 +1791,8 @@ private:
                 return b_.getDoubleTy();
             case DpiCType::Shortreal:
                 return b_.getFloatTy();
+            case DpiCType::Chandle:
+                return raw_ptr_ty(); // void*
             case DpiCType::BitVec:
             case DpiCType::LogicVec:
                 // A packed vector is always passed by pointer and is never a return
@@ -9848,6 +9850,9 @@ private:
             case DpiCType::Real:
             case DpiCType::Shortreal:
                 return fp_of(p);
+            case DpiCType::Chandle:
+                // The i64 handle bits reinterpreted as an opaque void*.
+                return b_.CreateIntToPtr(cast(must_of(p), 64, false), raw_ptr_ty());
             case DpiCType::BitScalar:
                 return cast(must_of(p), 8, false); // zext the 1-bit value to svBit
             case DpiCType::LogicScalar: {
@@ -9880,6 +9885,9 @@ private:
             case DpiCType::Real:
             case DpiCType::Shortreal:
                 return real_plane(r);
+            case DpiCType::Chandle:
+                // The returned void* reinterpreted as the i64 handle value.
+                return two_val(b_.CreatePtrToInt(r, int_ty(64)));
             case DpiCType::BitScalar:
                 return two_val(b_.CreateTrunc(r, int_ty(1)));
             case DpiCType::LogicScalar: {

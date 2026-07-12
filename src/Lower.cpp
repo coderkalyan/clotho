@@ -953,8 +953,15 @@ private:
             // docs/design/named-events.md.
             return module_.pool.logic_type;
         }
+        if (ct.isCHandle()) {
+            // chandle (LRM 6.14): an opaque pointer-width handle. Lowered as a
+            // 2-state 64-bit value — the only legal operations are null /
+            // assignment / equality (slang rejects arithmetic), all integer ops on
+            // the handle bits. Enables DPI chandle args (marshaled to/from void*).
+            return make_int_type(64, false, false);
+        }
         if (!ct.isIntegral()) {
-            // TODO: string / chandle / class types.
+            // TODO: string / class types.
             fail("unsupported non-integral type");
         }
 
@@ -6665,6 +6672,13 @@ private:
         switch (expr.kind) {
             case ExpressionKind::IntegerLiteral:
                 return b.constant(lower_int_literal(expr.as<IntegerLiteral>()), l);
+            case ExpressionKind::NullLiteral:
+                // `null` for a chandle (LRM 6.14) is the empty handle, value 0.
+                // slang types the literal as NullType (not chandle), so lower a
+                // 64-bit 0 in the chandle representation directly; a surrounding
+                // conversion to chandle (also i64) is a width-preserving no-op.
+                // (Class / event null handles are separate and not lowered here.)
+                return b.constant(module_.pool.put_int(make_int_type(64, false, false), 0), l);
             case ExpressionKind::UnbasedUnsizedIntegerLiteral:
                 // '0/'1/'x/'z (LRM 5.7.1): the single bit fills the whole
                 // context-determined width. slang has already propagated the
@@ -7772,6 +7786,9 @@ private:
         }
         if (ct.isScalar()) {
             return ct.isFourState() ? ir::DpiCType::LogicScalar : ir::DpiCType::BitScalar;
+        }
+        if (ct.isCHandle()) {
+            return ir::DpiCType::Chandle; // opaque void*
         }
         if (ct.isIntegral()) {
             // A packed vector / packed struct / enum: the svBitVecVal /
