@@ -5785,11 +5785,11 @@ private:
             return llvm::ConstantAggregateZero::get(s.storage_ty);
         }
         if (s.is_string) {
-            // Empty inline handle: byte (cap) holds cap == str_inline_cap, i.e.
-            // sizeof(rt_string) - 1 (mirrors rt_string_init).
-            constexpr uint8_t cap = sizeof(rt_string) - 1;
+            // Empty inline handle (mirrors rt_string_init): the length-marker byte
+            // (index sizeof(rt_string)-1) holds rt_string_inline_cap for len 0, and
+            // byte[0] is the NUL terminator (already 0 from the zero-fill).
             std::vector<uint8_t> bytes(sizeof(rt_string), 0);
-            bytes[cap] = cap;
+            bytes[sizeof(rt_string) - 1] = static_cast<uint8_t>(rt_string_inline_cap);
             return llvm::ConstantStruct::get(
               s.slot_ty, { llvm::ConstantDataArray::get(ctx_, bytes) });
         }

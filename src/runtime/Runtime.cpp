@@ -699,15 +699,19 @@ void write_word_planes_wide(uint8_t* mm, uint8_t* z, uint32_t width, uint64_t* m
 // fbstring-style small-string optimization over the 32 opaque bytes of an
 // rt_string (Runtime.h). Two forms, discriminated by the MSB of byte 31:
 //
-//   inline: bytes[0..30] hold the characters; byte 31 holds 31 - len, so a full
-//           31-char string stores 0 there and no separate flag byte is spent.
-//   heap:   a StrHeap {ptr, len, cap} occupies bytes[0..23]; byte 31 is 0x80.
+//   inline: bytes[0..29] hold up to 30 characters; byte[len] is a NUL
+//           terminator; byte 31 holds 30 - len, so a full 30-char string stores 0
+//           there and no separate flag byte is spent.
+//   heap:   a StrHeap {ptr, len, cap} occupies bytes[0..23]; byte 31 is 0x80. The
+//           buffer is always cap+1 bytes so byte[len] can hold the terminator.
 //
-// Strings are raw byte sequences with an explicit length; no NUL terminator is
-// stored or relied upon. A heap buffer never shrinks back to inline — the
-// capacity is kept for reuse so reassignment in a loop stops allocating.
+// The length is explicit (O(1) str_len) and authoritative; a NUL terminator is
+// ALSO maintained at byte[len] so str_data() is a valid C string (C interop /
+// DPI). Embedded NULs are legal — only a C-string *view* truncates at the first;
+// every clotho op uses the length. A heap buffer never shrinks back to inline —
+// the capacity is kept for reuse so reassignment in a loop stops allocating.
 
-constexpr uint64_t      str_inline_cap = 31;
+constexpr uint64_t      str_inline_cap = rt_string_inline_cap; // 30 (see Runtime.h)
 constexpr unsigned char str_heap_flag  = 0x80;
 
 // The heap form's header, memcpy'd in and out of the handle bytes.
@@ -756,11 +760,13 @@ void str_assign(rt_string* s, const char* p, uint64_t n) {
             if (n != 0) {
                 std::memmove(s->storage, p, n);
             }
+            s->storage[n]  = 0; // NUL terminator (n <= 30, byte 31 stays the marker)
             s->storage[31] = static_cast<unsigned char>(str_inline_cap - n);
             return;
         }
-        char* buf = static_cast<char*>(std::malloc(n));
+        char* buf = static_cast<char*>(std::malloc(n + 1));
         std::memcpy(buf, p, n);
+        buf[n] = 0;
         str_set_heap(s, StrHeap{ buf, n, n });
         return;
     }
@@ -769,14 +775,16 @@ void str_assign(rt_string* s, const char* p, uint64_t n) {
         if (n != 0) {
             std::memmove(h.ptr, p, n);
         }
-        h.len = n;
+        h.ptr[n] = 0; // buffer is cap+1 bytes, so byte[n] is in range
+        h.len    = n;
         str_set_heap(s, h);
         return;
     }
     // Geometric growth so repeated append-style reassignment amortizes.
     const uint64_t cap = h.cap * 2 > n ? h.cap * 2 : n;
-    char*          buf = static_cast<char*>(std::malloc(cap));
+    char*          buf = static_cast<char*>(std::malloc(cap + 1));
     std::memcpy(buf, p, n);
+    buf[n] = 0;
     std::free(h.ptr);
     str_set_heap(s, StrHeap{ buf, n, cap });
 }
@@ -790,8 +798,9 @@ void str_reserve(rt_string* s, uint64_t n) {
             return;
         }
         const uint64_t len = str_inline_cap - s->storage[31];
-        char*          buf = static_cast<char*>(std::malloc(n));
+        char*          buf = static_cast<char*>(std::malloc(n + 1));
         std::memcpy(buf, s->storage, len);
+        buf[len] = 0; // preserve the NUL at byte[len] in the new buffer
         str_set_heap(s, StrHeap{ buf, len, n });
         return;
     }
@@ -801,20 +810,24 @@ void str_reserve(rt_string* s, uint64_t n) {
     }
     // Geometric growth so repeated append-style reassignment amortizes.
     const uint64_t cap = h.cap * 2 > n ? h.cap * 2 : n;
-    char*          buf = static_cast<char*>(std::malloc(cap));
+    char*          buf = static_cast<char*>(std::malloc(cap + 1));
     std::memcpy(buf, h.ptr, h.len);
+    buf[h.len] = 0;
     std::free(h.ptr);
     str_set_heap(s, StrHeap{ buf, h.len, cap });
 }
 
-// Set the length of s; capacity for n bytes must already be reserved.
+// Set the length of s; capacity for n bytes must already be reserved (str_reserve
+// / str_assign allocate cap+1, so byte[n] holds the NUL terminator).
 void str_set_len(rt_string* s, uint64_t n) {
     if (str_is_heap(s)) {
         StrHeap h = str_heap(s);
+        h.ptr[n]  = 0;
         h.len     = n;
         str_set_heap(s, h);
         return;
     }
+    s->storage[n]  = 0;
     s->storage[31] = static_cast<unsigned char>(str_inline_cap - n);
 }
 
@@ -2568,6 +2581,7 @@ rt_value_plusargs(const char* prefix, uint32_t prefix_len, uint32_t conv, const 
 }
 
 extern "C" void rt_string_init(rt_string* s) {
+    s->storage[0]  = 0;              // NUL terminator for the empty string
     s->storage[31] = str_inline_cap; // Inline form, length 0.
 }
 
@@ -2575,6 +2589,7 @@ extern "C" void rt_string_deinit(rt_string* s) {
     if (str_is_heap(s)) {
         std::free(str_heap(s).ptr);
     }
+    s->storage[0]  = 0;
     s->storage[31] = str_inline_cap;
 }
 
