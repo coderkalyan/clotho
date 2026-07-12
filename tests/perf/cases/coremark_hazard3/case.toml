@@ -1,0 +1,54 @@
+name = "coremark_hazard3"
+description = "Wren6991 Hazard3 RISC-V core (RV32IMACB + debug, all extensions) running EEMBC CoreMark to its self-checking CRC. Same core/testbench as the hazard3 case (AHB-Lite, C-decompressor, PMP, triggers, sequential muldiv) but driven by a full memory-heavy workload: bare-metal CoreMark (mcycle timing, ee_printf to the 0xc0000000 char register, crt0/libnano BSP). ITER=11 ~= 4.9M cycles; CoreMark keeps the whole pipeline active every cycle, so per-cycle cost is well above the hazard3 compute kernel."
+top = "tb_hazard3"
+
+# Header search dir for oracle front ends (iverilog etc.). Clotho's slang
+# frontend searches the including file's own directory, so it needs none.
+incdirs = ["src"]
+
+[fetch]
+# fetch.sh clones the pinned core + CoreMark, stages src/, builds coremark.hex.
+script = "fetch.sh"
+probe = "src/hazard3_core.v"
+
+[clotho]
+# Flat file list (fetch.sh stages hazard3.f's CPU set + headers into src/).
+# hazard3_cpu_1port.v is omitted: the testbench uses the 2-port core, and an
+# uninstantiated 1-port core would be a second top candidate.
+files = [
+  "tb_hazard3.sv",
+  "src/hazard3_core.v",
+  "src/hazard3_cpu_2port.v",
+  "src/hazard3_alu.v",
+  "src/hazard3_branchcmp.v",
+  "src/hazard3_mul_fast.v",
+  "src/hazard3_muldiv_seq.v",
+  "src/hazard3_onehot_encode.v",
+  "src/hazard3_onehot_priority.v",
+  "src/hazard3_onehot_priority_dynamic.v",
+  "src/hazard3_priority_encode.v",
+  "src/hazard3_shift_barrel.v",
+  "src/hazard3_csr.v",
+  "src/hazard3_decode.v",
+  "src/hazard3_frontend.v",
+  "src/hazard3_instr_decompress.v",
+  "src/hazard3_irq_ctrl.v",
+  "src/hazard3_pmp.v",
+  "src/hazard3_power_ctrl.v",
+  "src/hazard3_regfile_1w2r.v",
+  "src/hazard3_triggers.v",
+]
+
+[check]
+# CoreMark validates its own result CRC; anything else (wrong CRC, trap prints
+# '!', watchdog prints TIMEOUT) fails.
+stdout_regex = "Correct operation validated"
+
+[oracles.iverilog]
+enabled = true
+note = "Runs (the testbench is plain Verilog + the SV core parses), but CoreMark on the big core is very slow (tens of minutes)."
+
+[oracles.verilator]
+enabled = true
+note = "2-state cycle-accurate reference; build with -Isrc, --binary --timing runs tb_hazard3 directly. Validated (MCYCLES match)."
+

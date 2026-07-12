@@ -1,0 +1,16 @@
+# Fetched + staged Hazard3 sources (see fetch.sh).
+/src/
+/_clone/
+# Headers fetched next to the testbench for its `include directives.
+/config.vh
+/hazard3_config_inst.vh
+# Fetched CoreMark tree + firmware build intermediates.
+/fw/cm/
+/fw/coremark.elf
+/fw/coremark.bin
+/fw/coremark.hex
+# Oracle / run artifacts.
+/iv.out
+/obj_dir/
+/splits.txt
+/hyperfine.json
