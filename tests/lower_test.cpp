@@ -234,7 +234,7 @@ TEST_CASE("timeunit / timeprecision declarations lower") {
     CHECK(r.ok);
 }
 
-TEST_CASE("$random with a seed argument is reported as unsupported") {
+TEST_CASE("$random(seed) lowers to a seeded draw with a seed write-back") {
     const LowerResult r = lower_text(R"(
         module m;
             integer seed;
@@ -245,8 +245,17 @@ TEST_CASE("$random with a seed argument is reported as unsupported") {
             end
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("$random with a seed argument") != std::string::npos);
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    // The seeded form emits the RandomSeeded op and stores the updated seed
+    // half back to the inout `seed` lvalue (the write-back).
+    bool found = false;
+    for (const ir::Process& p : r.module->processes()) {
+        if (has_tag(p.ir, ir::Inst::Tag::RandomSeeded)) {
+            found = true;
+            CHECK(has_tag(p.ir, ir::Inst::Tag::Store));
+        }
+    }
+    CHECK(found);
 }
 
 TEST_CASE("a real (fractional) delay is reported as unsupported") {

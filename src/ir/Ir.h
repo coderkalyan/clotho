@@ -1197,9 +1197,15 @@ struct Inst {
         SimTime,
         // $random: IEEE Annex N reference PRNG, -> 32-bit signed two-state (payload:
         // none). Lowers to an `rt_random` call; the value is always known (no
-        // x/z). The seeded form `$random(seed)` is rejected by the frontend, so
-        // this tag never carries a seed operand.
+        // x/z).
         Random,
+        // $random(seed) (LRM §20.15.1): the seeded PRNG draw. `op` (payload: unary)
+        // is the current seed word; the result is a 64-bit two-state value packing
+        // the updated seed in the high 32 bits with the signed draw in the low 32.
+        // The frontend reads the inout seed lvalue, feeds it here, stores the high
+        // half back, and returns the low half. Lowers to `rt_random_seeded`; the
+        // value is always known (no x/z).
+        RandomSeeded,
         // $clog2: ceil(log2(operand)) with the operand treated as unsigned and
         // $clog2(0) == 0, -> a 32-bit signed `integer` (payload: unary). LRM
         // §20.8.1. The operand's own width bounds the count; any x/z bit in it

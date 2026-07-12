@@ -434,6 +434,8 @@ struct Analysis {
                 case Inst::Tag::Fflush:
                 case Inst::Tag::SimTime:
                 case Inst::Tag::Random:
+                // $random(seed): the packed {seed, draw} result is always known.
+                case Inst::Tag::RandomSeeded:
                 // `-> e` / `->> e` / `->> #d e` are valueless; `e.triggered` is a
                 // definite 2-state bit. A named event carries no bit planes, so
                 // none seed z.

@@ -527,6 +527,10 @@ Index Builder::random(SourceLoc loc) {
     return emit({ Inst::Tag::Random, Inst::Payload{ .none = 0 } }, loc);
 }
 
+Index Builder::random_seeded(Index seed, SourceLoc loc) {
+    return emit({ Inst::Tag::RandomSeeded, Inst::Payload{ .unary = seed } }, loc);
+}
+
 Index Builder::test_plusargs(std::string_view str, SourceLoc loc) {
     const ExtraIndex str_at = add_bytes(str);
     const ExtraIndex extra  = add_extra(TestPlusArgsInfo{ str_at, static_cast<uint32_t>(str.size()) });

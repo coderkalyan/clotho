@@ -3784,6 +3784,8 @@ private:
                 case Inst::Tag::TimeFormat:
                 case Inst::Tag::SimTime:
                 case Inst::Tag::Random:
+                // $random(seed): the packed {seed, draw} result is never x.
+                case Inst::Tag::RandomSeeded:
                 // $clog2 of a clean operand is never x.
                 case Inst::Tag::Clog2:
                     break;
@@ -5492,6 +5494,10 @@ private:
     llvm::FunctionCallee random_fn() {
         return rt_fn("rt_random", b_.getInt32Ty(), {});
     }
+
+    llvm::FunctionCallee random_seeded_fn() {
+        return rt_fn("rt_random_seeded", b_.getInt64Ty(), { b_.getInt32Ty() });
+    }
     llvm::FunctionCallee wheel_pending_fn() {
         return rt_fn("rt_wheel_pending", b_.getInt32Ty(), { raw_ptr_ty() });
     }
@@ -5874,6 +5880,10 @@ private:
                 return { 1, false, false };
             case Inst::Tag::Random:
                 return { 32, false, true };
+            case Inst::Tag::RandomSeeded:
+                // Packed {updated seed : 32, signed draw : 32}; sliced by the
+                // frontend. An opaque bit container, so unsigned.
+                return { 64, false, false };
             case Inst::Tag::Clog2:
                 // $clog2 returns a 32-bit signed `integer` (4-state: the result
                 // is X when the operand carries x/z).
@@ -7146,6 +7156,15 @@ private:
                 // The PRNG draw is always known (no x/z): must == may, z == 0.
                 llvm::Value* draw = b_.CreateCall(random_fn(), {});
                 set_value(i, packed(draw, draw, zero(32)));
+                return;
+            }
+
+            case Inst::Tag::RandomSeeded: {
+                // Advance the seed word and receive {updated seed : 32, draw : 32}
+                // packed in an i64. Always known (no x/z): must == may, z == 0.
+                llvm::Value* seed = cast(must_of(value_of(p.unary)), 32, false);
+                llvm::Value* r    = b_.CreateCall(random_seeded_fn(), { seed });
+                set_value(i, packed(r, r, zero(64)));
                 return;
             }
 

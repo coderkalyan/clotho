@@ -1378,6 +1378,53 @@ TEST_CASE("$random lowers to an rt_random call") {
     CHECK(ir.find("call i32 @rt_random(") != std::string::npos);
 }
 
+// $random(seed) (LRM §20.15.1): the inout `seed` integer carries the whole PRNG
+// state, so the draw and the updated seed after each call are both observable.
+// These exact numbers (draw and seed, seed initialized to 1) are produced
+// bit-for-bit by iverilog (verified), which validates both the reference stream
+// off a nonzero seed and the inout write-back.
+TEST_CASE("$random(seed) yields the deterministic seeded stream and writes the seed back") {
+    const std::string out = run_capture(R"(
+        module top;
+            integer seed;
+            integer i;
+            integer x;
+            initial begin
+                seed = 1;
+                for (i = 0; i < 8; i = i + 1) begin
+                    x = $random(seed);
+                    $display("%0d seed=%0d", x, seed);
+                end
+            end
+        endmodule
+    )");
+    CHECK(out ==
+          "-2147414528 seed=69070\n"
+          "-1671855048 seed=475628535\n"
+          "1129920902 seed=-1017563188\n"
+          "-1374483364 seed=772999773\n"
+          "1730349006 seed=-417135238\n"
+          "1674352583 seed=-473131853\n"
+          "-485282618 seed=1662200408\n"
+          "-103324941 seed=2044158073\n");
+}
+
+TEST_CASE("$random(seed) lowers to an rt_random_seeded call") {
+    constexpr std::string_view src = R"(
+        module m;
+            integer seed;
+            integer x;
+            initial begin
+                seed = 7;
+                x = $random(seed);
+            end
+        endmodule
+    )";
+    const std::string          ir  = emit(src);
+
+    CHECK(ir.find("call i64 @rt_random_seeded(") != std::string::npos);
+}
+
 // $clog2 (LRM §20.8.1): ceil(log2(arg)), arg unsigned, $clog2(0) == 0. A
 // constant argument folds to a literal; here it drives a localparam width and
 // direct literal/parameter arguments. Boundary values (exact powers of two vs

@@ -2217,15 +2217,29 @@ double rng_uniform(uint32_t& seed) {
     return (b - a) * (c - 1.0) + a;
 }
 
-} // namespace
-
-extern "C" int32_t rt_random(void) {
-    // rtl_dist_uniform's INT32_MIN/INT32_MAX branch: renormalize the uniform
-    // draw across the full 32-bit span, then floor toward negative infinity.
-    double r = (rng_uniform(g_random_seed) + 2147483648.0) / 4294967295.0;
+// One $random draw off `seed`: advance the generator (mutating `seed`) and take
+// rtl_dist_uniform's INT32_MIN/INT32_MAX branch — renormalize the uniform across
+// the full 32-bit span, then floor toward negative infinity.
+int32_t rng_draw(uint32_t& seed) {
+    double r = (rng_uniform(seed) + 2147483648.0) / 4294967295.0;
     r        = r * 4294967296.0 - 2147483648.0;
     const long i = r >= 0 ? static_cast<long>(r) : static_cast<long>(r - 1);
     return static_cast<int32_t>(i);
+}
+
+} // namespace
+
+extern "C" int32_t rt_random(void) {
+    return rng_draw(g_random_seed);
+}
+
+extern "C" uint64_t rt_random_seeded(uint32_t seed_in) {
+    // $random(seed): the seed word IS the whole PRNG state. Advance a local copy
+    // and pack the updated seed in the high 32 bits with the draw in the low 32,
+    // so the JIT writes the seed back and uses the value from one call.
+    uint32_t seed  = seed_in;
+    int32_t  value = rng_draw(seed);
+    return (static_cast<uint64_t>(seed) << 32) | static_cast<uint32_t>(value);
 }
 
 namespace {

@@ -298,6 +298,8 @@ const char* tag_name(Inst::Tag tag) {
             return "timeformat";
         case T::Random:
             return "random";
+        case T::RandomSeeded:
+            return "random_seeded";
         case T::Clog2:
             return "clog2";
         case T::CountBits:

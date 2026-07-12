@@ -279,6 +279,10 @@ public:
     Index sim_time(uint64_t scale, SourceLoc loc);
     // $random: a 32-bit signed PRNG draw. No operands.
     Index random(SourceLoc loc);
+    // $random(seed): the seeded PRNG draw. `seed` is the current seed word; the
+    // result is a 64-bit two-state value packing the updated seed (high 32) with
+    // the signed draw (low 32).
+    Index random_seeded(Index seed, SourceLoc loc);
     // $test$plusargs(str): nonzero iff a command-line plusarg's prefix matches
     // `str`. No SSA operands.
     Index test_plusargs(std::string_view str, SourceLoc loc);

@@ -42,6 +42,7 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Clog2:
         case T::Ctz:
         case T::Clz:
+        case T::RandomSeeded:
             return K::Unary;
 
         case T::BitSelect:

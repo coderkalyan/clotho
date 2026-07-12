@@ -5209,17 +5209,25 @@ private:
         // $random (LRM §20.15.1): a 32-bit signed PRNG draw. The plain form
         // returns the next value of the simulator's global random stream.
         if (name == "$random") {
-            // TODO: the seeded form `$random(seed)` (LRM §20.15.1) threads PRNG
-            // state through an inout `seed` integer — it must read the seed
-            // lvalue, advance a per-seed stream, and write the updated state
-            // back. The reference PRNG (rt_random) already carries its whole
-            // state in one 32-bit word, so the stream maps cleanly; the blocker
-            // is only the IR's missing inout-arg writeback path, so the seeded
-            // form is rejected rather than silently ignoring the seed.
-            if (!call.arguments().empty()) {
-                fail("$random with a seed argument is not supported");
+            // Plain form: the next value of the simulator's global stream.
+            if (call.arguments().empty()) {
+                return b.random(l);
             }
-            return b.random(l);
+            // Seeded form `$random(seed)` (LRM §20.15.1): the inout `seed` integer
+            // carries the whole PRNG state. Read it, advance the reference stream,
+            // write the updated state back, and return the draw. rt_random_seeded
+            // packs {updated seed : 32, signed draw : 32} into an i64, sliced here.
+            // slang wraps the inout seed arg in an identity Conversion; peel it to
+            // reach the underlying lvalue.
+            const Expression& seed_arg = unwrap_conversion(*call.arguments()[0]);
+            const ir::Index   seed_lv  = lower_lvalue(seed_arg, b);
+            const ir::Index   packed   = b.random_seeded(lower_expr(seed_arg, b), l);
+            const ir::Ref     i32s     = make_int_type(32, false, true);
+            const ir::Index   sh32 =
+              b.constant(module_.pool.put_int(make_int_type(64, false, false), 32u), l);
+            b.binary(ir::Inst::Tag::Store, seed_lv,
+                     b.resize(b.binary(ir::Inst::Tag::Srl, packed, sh32, l), i32s, l), l);
+            return b.resize(packed, i32s, l);
         }
 
         // $signed / $unsigned (LRM §20.10): reinterpret the self-determined

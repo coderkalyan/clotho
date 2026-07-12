@@ -321,6 +321,14 @@ void rt_vcd_close(void);
 
 int32_t rt_random(void);
 
+// $random(seed) (LRM §20.15.1): the seeded form, where the caller's inout `seed`
+// integer carries the entire PRNG state. Advance the generator off `seed_in` and
+// return the updated seed in the high 32 bits packed with the signed draw in the
+// low 32 — the JIT writes the seed back to the lvalue and takes the value. Runs
+// the same reference stream as rt_random, so seeding with 0 reproduces the
+// unseeded stream's first draws.
+uint64_t rt_random_seeded(uint32_t seed_in);
+
 // -- Plusargs (LRM §21.6) --
 //
 // Command-line arguments prefixed with `+` (everything after the leading `+`
