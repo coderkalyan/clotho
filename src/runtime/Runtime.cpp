@@ -3667,3 +3667,24 @@ extern "C" void rt_vcd_close(void) {
     std::free(g_vcd.iobuf);
     g_vcd = VcdEngine{};      // reset for the next simulation in this process
 }
+
+// -- DPI-C packed-vector marshalling (see Runtime.h) --
+
+void rt_dpi_pack_logicvec(const uint32_t* must, const uint32_t* may, const uint32_t* z,
+                          uint32_t nchunks, uint32_t* out) {
+    for (uint32_t k = 0; k < nchunks; ++k) {
+        out[2 * k]     = may[k] & ~z[k];   // aval: value-1 or X, but not Z
+        out[2 * k + 1] = must[k] ^ may[k]; // bval: any unknown (X or Z)
+    }
+}
+
+void rt_dpi_unpack_logicvec(const uint32_t* in, uint32_t nchunks, uint32_t* must, uint32_t* may,
+                            uint32_t* z) {
+    for (uint32_t k = 0; k < nchunks; ++k) {
+        const uint32_t aval = in[2 * k];
+        const uint32_t bval = in[2 * k + 1];
+        must[k] = aval & ~bval;
+        may[k]  = aval | bval;
+        z[k]    = bval & ~aval;
+    }
+}

@@ -752,4 +752,19 @@ void rt_intra_event_register(uint32_t trig_id, void* rec);
 // for the next edge. Called from both wake paths when the trigger edge matches.
 void rt_intra_event_fire(uint32_t trig_id);
 
+// -- DPI-C packed-vector marshalling (LRM 35.5.6) --
+//
+// Convert Clotho's must/may/z planes (each chunked to uint32) to/from the DPI
+// canonical svLogicVecVal — an array of {aval, bval} 32-bit chunks. Per bit:
+// aval = value-or-X, bval = unknown-or-Z, so
+//   aval = may & ~z ,  bval = must ^ may
+// and inversely must = aval & ~bval, may = aval | bval, z = bval & ~aval.
+// `nchunks` = ceil(width/32); `out`/`in` is the flat svLogicVecVal (2*nchunks
+// uint32). The 2-state form (svBitVecVal) needs no helper — the value plane
+// chunked is already the canonical layout.
+void rt_dpi_pack_logicvec(const uint32_t* must, const uint32_t* may, const uint32_t* z,
+                          uint32_t nchunks, uint32_t* out);
+void rt_dpi_unpack_logicvec(const uint32_t* in, uint32_t nchunks, uint32_t* must, uint32_t* may,
+                            uint32_t* z);
+
 } // extern "C"

@@ -164,6 +164,11 @@ enum class DpiCType : uint8_t {
     Shortreal,   // SV shortreal -> float
     BitScalar,   // SV bit       -> svBit   (unsigned char: 0/1)
     LogicScalar, // SV logic/reg -> svLogic (unsigned char: 0/1/2=Z/3=X)
+    // Packed vectors wider than a scalar map to a by-pointer chunk array (LRM
+    // 35.5.6.2). Always passed as a pointer, every direction. Never a return type
+    // (slang rejects a packed-array DPI return — a return is a "small value").
+    BitVec,   // SV 2-state packed (bit[N] / time / packed struct) -> svBitVecVal*
+    LogicVec, // SV 4-state packed (logic[N] / integer)           -> svLogicVecVal*
 };
 
 // A lowered SystemVerilog function or task. Its body is an Ir whose leaves are

@@ -1791,8 +1791,20 @@ private:
                 return b_.getDoubleTy();
             case DpiCType::Shortreal:
                 return b_.getFloatTy();
+            case DpiCType::BitVec:
+            case DpiCType::LogicVec:
+                // A packed vector is always passed by pointer and is never a return
+                // type; declare_dpi_import emits the pointer directly, so this is
+                // never reached for a by-value slot.
+                throw BackendError{ "internal: DPI vec has no by-value C type" };
         }
         throw BackendError{ "internal: unknown DPI C type" };
+    }
+
+    // A packed-vector DPI arg (svBitVecVal* / svLogicVecVal*), passed by pointer in
+    // every direction — as opposed to a by-value scalar.
+    static bool is_dpi_vec(DpiCType ct) {
+        return ct == DpiCType::BitVec || ct == DpiCType::LogicVec;
     }
 
     // Declare a DPI-C import (LRM 35) as an external C function with its native
@@ -1806,10 +1818,13 @@ private:
         std::vector<llvm::Type*> params;
         params.reserve(f.dpi_arg_ctypes.size());
         for (size_t k = 0; k < f.dpi_arg_ctypes.size(); ++k) {
-            const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
-            // input passes the C scalar by value; output / inout pass a pointer to
-            // it (the C function writes through it).
-            params.push_back(dir == ArgDir::In ? dpi_c_llvm_ty(f.dpi_arg_ctypes[k]) : ptr);
+            const ArgDir   dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
+            const DpiCType ct  = f.dpi_arg_ctypes[k];
+            // A packed vector is a pointer in every direction (svBitVecVal* /
+            // svLogicVecVal*); a scalar is by value for input, by pointer for
+            // output / inout (the C function writes through it).
+            const bool by_ptr = is_dpi_vec(ct) || dir != ArgDir::In;
+            params.push_back(by_ptr ? ptr : dpi_c_llvm_ty(ct));
         }
         auto* fnty   = llvm::FunctionType::get(dpi_c_llvm_ty(f.dpi_ret_ctype), params, false);
         auto  callee = llmod_.getOrInsertFunction(f.extern_name, fnty);
@@ -9690,46 +9705,127 @@ private:
         }
     }
 
-    // Lower a `call` to a DPI-C import (LRM 35): marshal each scalar argument to
-    // its native C value (input by value, output / inout through a C-native scratch
-    // pointer), call the external symbol directly (no state pointer), and convert
-    // the C return back to a Plane. Scalar types only (the frontend guards the
-    // rest), so no ref servicing.
+    // 32-bit chunk count of a width-W packed vector (the svBitVecVal / svLogicVecVal
+    // element count).
+    static uint32_t dpi_nchunks(uint32_t w) {
+        return (w + 31) / 32;
+    }
+
+    llvm::FunctionCallee dpi_pack_logicvec_fn() {
+        auto* p = raw_ptr_ty();
+        return rt_fn("rt_dpi_pack_logicvec", b_.getVoidTy(), { p, p, p, b_.getInt32Ty(), p });
+    }
+    llvm::FunctionCallee dpi_unpack_logicvec_fn() {
+        auto* p = raw_ptr_ty();
+        return rt_fn("rt_dpi_unpack_logicvec", b_.getVoidTy(), { p, b_.getInt32Ty(), p, p, p });
+    }
+
+    // Spill an iW plane into a fresh entry-block buffer of `nchunks` 32-bit words
+    // (zero-extended above W), returned as a pointer the runtime reads as uint32*.
+    llvm::Value* dpi_spill_words(llvm::Value* plane, uint32_t nchunks) {
+        auto* bufty = int_ty(nchunks * 32);
+        auto* buf   = entry_alloca(bufty, "dpi.words");
+        b_.CreateStore(b_.CreateZExtOrTrunc(plane, bufty), buf);
+        return buf;
+    }
+    // Load an iW value back from an `nchunks`-word buffer.
+    llvm::Value* dpi_load_words(llvm::Value* buf, uint32_t nchunks, uint32_t w) {
+        return b_.CreateTrunc(b_.CreateLoad(int_ty(nchunks * 32), buf), int_ty(w));
+    }
+
+    // A fresh svVecVal scratch: nchunks 32-bit words for a bit vector, 2*nchunks
+    // (interleaved {aval,bval}) for a logic vector.
+    llvm::Value* dpi_vec_alloca(DpiCType ct, uint32_t nchunks) {
+        return entry_alloca(int_ty((ct == DpiCType::BitVec ? 1u : 2u) * nchunks * 32), "dpi.vec");
+    }
+
+    // Fill an svVecVal scratch from a value Plane (input build / inout copy-in).
+    void dpi_vec_copyin(DpiCType ct, Plane pl, uint32_t w, llvm::Value* scratch) {
+        const uint32_t nc = dpi_nchunks(w);
+        if (ct == DpiCType::BitVec) {
+            // svBitVecVal: the (2-state) value plane chunked is already the layout.
+            b_.CreateStore(b_.CreateZExtOrTrunc(must_of(pl), int_ty(nc * 32)), scratch);
+            return;
+        }
+        // svLogicVecVal: spill must/may/z; the runtime computes aval/bval + interleave.
+        llvm::Value* zv = (pl.two || pl.z == nullptr) ? zero(w) : pl.z;
+        b_.CreateCall(dpi_pack_logicvec_fn(), { dpi_spill_words(must_of(pl), nc),
+                                                dpi_spill_words(may_of(pl), nc),
+                                                dpi_spill_words(zv, nc), b_.getInt32(nc), scratch });
+    }
+
+    // Reconstruct a value Plane from an svVecVal scratch (output / inout copy-out).
+    Plane dpi_vec_copyout(DpiCType ct, llvm::Value* scratch, uint32_t w) {
+        const uint32_t nc = dpi_nchunks(w);
+        if (ct == DpiCType::BitVec) {
+            return two_val(dpi_load_words(scratch, nc, w));
+        }
+        llvm::Value* must = entry_alloca(int_ty(nc * 32), "dpi.must");
+        llvm::Value* may  = entry_alloca(int_ty(nc * 32), "dpi.may");
+        llvm::Value* zv   = entry_alloca(int_ty(nc * 32), "dpi.z");
+        b_.CreateCall(dpi_unpack_logicvec_fn(), { scratch, b_.getInt32(nc), must, may, zv });
+        return packed(dpi_load_words(must, nc, w), dpi_load_words(may, nc, w),
+                      dpi_load_words(zv, nc, w));
+    }
+
+    // Lower a `call` to a DPI-C import (LRM 35): marshal each argument — scalar by
+    // value (input) or through a C-native scratch pointer (output / inout), packed
+    // vector always through an svBitVecVal* / svLogicVecVal* scratch — call the
+    // external symbol directly (no state pointer), and convert the C return back to
+    // a Plane. The frontend guards unsupported types, so no ref servicing.
     void lower_dpi_call(Index i, const CallInfo& ci, const Function& f) {
         llvm::Function*           cf = fn_decls_[static_cast<uint32_t>(ci.func)];
         std::vector<llvm::Value*> argv;
         // output / inout scratches to read back into the caller temp after the
-        // call; the frontend's CopyOutArg then copies temp -> actual.
+        // call; the frontend's CopyOutArg then copies temp -> actual. `cty` is null
+        // for a vec scratch (read back via dpi_vec_copyout instead).
         struct DpiOut {
             Index        temp;
             DpiCType     ct;
             llvm::Value* scratch;
             llvm::Type*  cty;
+            uint32_t     w;
         };
         std::vector<DpiOut> outs;
         size_t              k = 0;
         for (Index a : ir_->region(ci.args)) {
             const DpiCType ct  = f.dpi_arg_ctypes[k];
             const ArgDir   dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
-            if (dir == ArgDir::In) {
+            const uint32_t w   = width_of(f.param_types[k]);
+            // Scratch allocas are entry-block-hoisted (entry_alloca), so a DPI call
+            // in a loop does not grow the stack per iteration.
+            if (is_dpi_vec(ct)) {
+                // Packed vector: always by pointer. Input builds the scratch from the
+                // value; output leaves it empty for the C to fill; inout copies in.
+                llvm::Value* scratch = dpi_vec_alloca(ct, dpi_nchunks(w));
+                if (dir == ArgDir::In) {
+                    dpi_vec_copyin(ct, value_of(a), w, scratch);
+                } else if (dir == ArgDir::Inout) {
+                    dpi_vec_copyin(ct, lower_load(lvalue_of(a)), w, scratch);
+                }
+                argv.push_back(scratch);
+                if (dir != ArgDir::In) {
+                    outs.push_back({ a, ct, scratch, nullptr, w });
+                }
+            } else if (dir == ArgDir::In) {
                 argv.push_back(dpi_arg_to_c(ct, value_of(a)));
             } else {
-                // A C-native scratch passed by pointer, hoisted to the entry block
-                // (entry_alloca) so a DPI call in a loop does not grow the stack per
-                // iteration. inout copies the caller temp in first.
                 llvm::Type*  cty     = dpi_c_llvm_ty(ct);
                 llvm::Value* scratch = entry_alloca(cty, "dpi.out");
                 if (dir == ArgDir::Inout) {
                     b_.CreateStore(dpi_arg_to_c(ct, lower_load(lvalue_of(a))), scratch);
                 }
                 argv.push_back(scratch);
-                outs.push_back({ a, ct, scratch, cty });
+                outs.push_back({ a, ct, scratch, cty, w });
             }
             ++k;
         }
         llvm::Value* r = b_.CreateCall(cf->getFunctionType(), cf, argv);
         for (const DpiOut& o : outs) {
-            lower_store(lvalue_of(o.temp), dpi_c_to_plane(o.ct, b_.CreateLoad(o.cty, o.scratch)));
+            const Plane pl = is_dpi_vec(o.ct)
+                               ? dpi_vec_copyout(o.ct, o.scratch, o.w)
+                               : dpi_c_to_plane(o.ct, b_.CreateLoad(o.cty, o.scratch));
+            lower_store(lvalue_of(o.temp), pl);
         }
         if (f.dpi_ret_ctype != DpiCType::Void) {
             set_value(i, dpi_c_to_plane(f.dpi_ret_ctype, r));

@@ -114,21 +114,13 @@ TEST_CASE("DPI import: output argument") {
 // Out-of-scope constructs must fail loudly with a TODO, never silently miscompile.
 // Each is a distinct guard in build_dpi_import.
 TEST_CASE("DPI import: unsupported forms are rejected") {
-    SUBCASE("packed-vector argument (svBitVecVal, deferred)") {
-        constexpr std::string_view src = R"(
-            module m;
-              import "DPI-C" function int f(input bit [7:0] x);
-              initial $display(f(8'd5));
-            endmodule)";
-        CHECK(lower_fail(src).find("not a supported scalar type") != std::string::npos);
-    }
     SUBCASE("string argument") {
         constexpr std::string_view src = R"(
             module m;
               import "DPI-C" function int f(input string s);
               initial $display(f("hi"));
             endmodule)";
-        CHECK(lower_fail(src).find("not a supported scalar type") != std::string::npos);
+        CHECK(lower_fail(src).find("not supported") != std::string::npos);
     }
     SUBCASE("chandle argument (needs chandle lowering)") {
         constexpr std::string_view src = R"(
@@ -136,18 +128,7 @@ TEST_CASE("DPI import: unsupported forms are rejected") {
               import "DPI-C" function int f(input chandle c);
               initial $display(f(null));
             endmodule)";
-        CHECK(lower_fail(src).find("not a supported scalar type") != std::string::npos);
-    }
-    SUBCASE("packed-vector output argument (svVecVal, deferred)") {
-        // output/inout of a scalar is supported (Phase 2); a packed-vector output
-        // is still the deferred svBitVecVal marshal.
-        constexpr std::string_view src = R"(
-            module m;
-              import "DPI-C" function void f(output bit [7:0] x);
-              bit [7:0] y;
-              initial f(y);
-            endmodule)";
-        CHECK(lower_fail(src).find("not a supported scalar type") != std::string::npos);
+        CHECK(lower_fail(src).find("not supported") != std::string::npos);
     }
     SUBCASE("DPI import task") {
         constexpr std::string_view src = R"(

@@ -7743,12 +7743,12 @@ private:
     // instance multiplicity (LRM 6.8): delegate its whole lowering to the
     // shared globals_ Lowerer instead of duplicating it (and any static
     // local's storage) per top instance.
-    // The DPI-C canonical scalar C type of a formal / return type (LRM 35.5.6,
-    // the by-value subset of Table 35-1), or nullopt for a type that maps to the
-    // svBitVecVal / svLogicVecVal pointer ABI (packed vectors, open arrays) or is
-    // otherwise not a lowered scalar (string, chandle, aggregate) — the caller
-    // loud-fails those as unimplemented. Never returns Void.
-    static std::optional<ir::DpiCType> dpi_scalar_ctype(const slang::ast::Type& type) {
+    // The DPI-C C type of a formal / return type (LRM 35.5.6): a by-value scalar
+    // for the small named types, else the by-pointer chunk-array form (BitVec /
+    // LogicVec) for a packed vector. nullopt for a type Clotho does not marshal
+    // (string, chandle, open array, unpacked aggregate) — the caller loud-fails
+    // those. Never returns Void.
+    static std::optional<ir::DpiCType> dpi_ctype(const slang::ast::Type& type) {
         const slang::ast::Type& ct = type.getCanonicalType();
         if (ct.isFloating()) {
             return ct.as<slang::ast::FloatingType>().floatKind == slang::ast::FloatingType::ShortReal
@@ -7766,15 +7766,20 @@ private:
                 case slang::ast::PredefinedIntegerType::LongInt:
                     return ir::DpiCType::Longint;
                 default:
-                    // `integer` (4-state 32) and `time` (2-state 64) map to
-                    // svLogicVecVal / svBitVecVal, not a direct C scalar.
-                    return std::nullopt;
+                    // `integer` (4-state 32) / `time` (2-state 64): the vec form.
+                    return ct.isFourState() ? ir::DpiCType::LogicVec : ir::DpiCType::BitVec;
             }
         }
         if (ct.isScalar()) {
             return ct.isFourState() ? ir::DpiCType::LogicScalar : ir::DpiCType::BitScalar;
         }
-        return std::nullopt; // chandle, string, packed vector, aggregate, ...
+        if (ct.isIntegral()) {
+            // A packed vector / packed struct / enum: the svBitVecVal /
+            // svLogicVecVal chunk-array form (slang has already checked it is a
+            // legal DPI arg type via isValidForDPIArg).
+            return ct.isFourState() ? ir::DpiCType::LogicVec : ir::DpiCType::BitVec;
+        }
+        return std::nullopt; // chandle, string, unpacked array / struct, ...
     }
 
     // Lower a DPI-C import (LRM 35) into the reserved slot. There is no IR body:
@@ -7799,10 +7804,11 @@ private:
         ir::DpiCType ret_ct = ir::DpiCType::Void;
         ir::Ref      ret_ty = module_.pool.void_type;
         if (!sub.getReturnType().isVoid()) {
-            const auto c = dpi_scalar_ctype(sub.getReturnType());
-            if (!c.has_value()) {
-                // TODO: non-scalar DPI return (packed vector -> svBitVecVal,
-                // string, chandle) — needs the pointer marshal / chandle lowering.
+            const auto c = dpi_ctype(sub.getReturnType());
+            if (!c.has_value() || *c == ir::DpiCType::BitVec || *c == ir::DpiCType::LogicVec) {
+                // A DPI return must be a "small value" (LRM 35.5.5): slang already
+                // rejects a packed-array return, so a vec here is defensive. string
+                // / chandle returns are the deferred marshal.
                 fail("DPI return type is not a supported scalar type (only "
                      "byte/shortint/int/longint/real/shortreal/bit/logic)");
             }
@@ -7819,10 +7825,11 @@ private:
                 // defensively in case a future slang change lets one through.
                 fail("DPI ref arguments are not supported");
             }
-            const auto c = dpi_scalar_ctype(fa->getType());
+            const auto c = dpi_ctype(fa->getType());
             if (!c.has_value()) {
-                fail("DPI argument type is not a supported scalar type (only "
-                     "byte/shortint/int/longint/real/shortreal/bit/logic)");
+                // string / chandle / open array / unpacked aggregate — deferred.
+                fail("DPI argument type is not supported (scalar types and packed "
+                     "vectors only; not string/chandle/open-array/unpacked)");
             }
             // input / output / inout: the direction drives the C ABI (by value vs
             // by pointer) in declare_dpi_import / lower_dpi_call. build_call_args
