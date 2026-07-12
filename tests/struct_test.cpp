@@ -876,3 +876,39 @@ TEST_CASE("unpacked struct net declaration continuous assignment") {
         endmodule
     )") == "n=5 9\nn=7\n");
 }
+
+// Member select of an elaboration-constant struct (localparam / parameter,
+// LRM 11.2.1). The outermost MemberAccess has no signal to load; it must fold
+// via constant evaluation like its ElementSelect/RangeSelect siblings. A
+// trailing bit/part select (`P.a[3]`) already folded through those paths — the
+// gap was the bare and nested member form.
+TEST_CASE("member select of a constant packed struct folds") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct packed { logic [7:0] a; logic [7:0] b; } pair_t;
+            localparam pair_t P = '{a: 8'hAB, b: 8'hCD};
+            initial $display("%h %h", P.a, P.b);
+        endmodule
+    )") == "ab cd\n");
+}
+
+TEST_CASE("member select of a constant unpacked struct folds") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; int b; } pair_t;
+            localparam pair_t P = '{a: 1, b: 2};
+            initial $display("%0d %0d", P.a, P.b);
+        endmodule
+    )") == "1 2\n");
+}
+
+TEST_CASE("nested member select of a constant struct folds") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct packed { logic [7:0] a; logic [7:0] b; } inner_t;
+            typedef struct packed { inner_t x; logic [3:0] y; } outer_t;
+            localparam outer_t P = '{x: '{a: 8'h11, b: 8'h22}, y: 4'h3};
+            initial $display("%h %h %h", P.x.a, P.x.b, P.y);
+        endmodule
+    )") == "11 22 3\n");
+}

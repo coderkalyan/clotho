@@ -6706,6 +6706,9 @@ private:
                 // narrow_to_declared's string/real skip never triggers here —
                 // used anyway for uniformity with its ElementSelect/RangeSelect
                 // siblings above).
+                if (auto c = try_lower_constant_select(expr, b, l)) {
+                    return *c;
+                }
                 const MemberAccessExpression& ma = expr.as<MemberAccessExpression>();
                 const ir::Index v = b.unary(ir::Inst::Tag::Load, lower_member_lvalue(ma, b, l), l);
                 return narrow_to_declared(v, *ma.type, b, l);
