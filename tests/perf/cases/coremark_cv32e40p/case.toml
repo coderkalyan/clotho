@@ -1,0 +1,65 @@
+name = "coremark_cv32e40p"
+description = "OpenHW cv32e40p (RV32IMC integer core) running EEMBC CoreMark to its self-checking CRC. Industrial-class SystemVerilog core (packages, structs, enums, multi-dim packed arrays, unique case-inside, assignment patterns) driven by its own example testbench (mm_ram + magic-address char/exit peripherals). Firmware is bare-metal CoreMark (mcycle timing, ee_printf to the char register). ITER=10 ~= 5.0M cycles."
+top = "tb_top"
+
+[fetch]
+# fetch.sh clones the pinned core + CoreMark, stages src/, builds coremark.hex.
+script = "fetch.sh"
+probe = "src/cv32e40p_core.sv"
+
+[clotho]
+args = ["--top", "tb_top", "+define+VERILATOR"]
+files = [
+  "tb/tb_top.sv",
+  "tb/cv32e40p_tb_subsystem.sv",
+  "tb/mm_ram.sv",
+  "tb/dp_ram.sv",
+  "tb/cv32e40p_random_interrupt_generator.sv",
+  "src/amo_shim.sv",
+  "src/cv32e40p_aligner.sv",
+  "src/cv32e40p_alu_div.sv",
+  "src/cv32e40p_alu.sv",
+  "src/cv32e40p_apu_core_pkg.sv",
+  "src/cv32e40p_apu_disp.sv",
+  "src/cv32e40p_compressed_decoder.sv",
+  "src/cv32e40p_controller.sv",
+  "src/cv32e40p_core.sv",
+  "src/cv32e40p_cs_registers.sv",
+  "src/cv32e40p_decoder.sv",
+  "src/cv32e40p_ex_stage.sv",
+  "src/cv32e40p_ff_one.sv",
+  "src/cv32e40p_fifo.sv",
+  "src/cv32e40p_fpu_pkg.sv",
+  "src/cv32e40p_hwloop_regs.sv",
+  "src/cv32e40p_id_stage.sv",
+  "src/cv32e40p_if_stage.sv",
+  "src/cv32e40p_int_controller.sv",
+  "src/cv32e40p_load_store_unit.sv",
+  "src/cv32e40p_mult.sv",
+  "src/cv32e40p_obi_interface.sv",
+  "src/cv32e40p_pkg.sv",
+  "src/cv32e40p_popcnt.sv",
+  "src/cv32e40p_prefetch_buffer.sv",
+  "src/cv32e40p_prefetch_controller.sv",
+  "src/cv32e40p_register_file_ff.sv",
+  "src/cv32e40p_sim_clock_gate.sv",
+  "src/cv32e40p_sleep_unit.sv",
+  "src/cv32e40p_top.sv",
+  "src/cv32e40p_tracer_pkg.sv",
+  "src/perturbation_pkg.sv",
+  "src/riscv_gnt_stall.sv",
+  "src/riscv_rvalid_stall.sv",
+]
+
+[check]
+# CoreMark validates its own result CRC; anything else (wrong CRC, trap) fails.
+stdout_regex = "Correct operation validated"
+
+[oracles.iverilog]
+enabled = false
+note = "iverilog 13 cannot parse cv32e40p (import pkg::* in the ANSI module header, LRM 26.4)."
+
+[oracles.verilator]
+enabled = true
+note = "2-state cycle-accurate reference. Build with packages first; --binary --timing runs tb_top directly."
+
