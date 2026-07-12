@@ -1009,15 +1009,37 @@ private:
                         ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
         const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
         if (const auto* pat = as_assignment_pattern(rhs)) {
-            if (t.kind != ir::Type::Kind::Struct || t.is_packed) {
-                fail("'{...} assignment pattern over an unpacked-array aggregate is not supported");
+            const auto elems = pat->elements();
+            if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
+                const auto fields = module_.pool.struct_fields(t.fields_id);
+                for (uint32_t i = 0; i < fields.size(); ++i) {
+                    emit_agg_store(b.member_select(lhs, i, type, l), fields[i].type, *elems[i], tag, b, l);
+                }
+                return;
             }
-            const auto fields = module_.pool.struct_fields(t.fields_id);
-            const auto elems  = pat->elements();
-            for (uint32_t i = 0; i < fields.size(); ++i) {
-                emit_agg_store(b.member_select(lhs, i, type, l), fields[i].type, *elems[i], tag, b, l);
+            if (t.kind == ir::Type::Kind::UnpackedArray) {
+                const bool     keyed = rhs.kind == ExpressionKind::StructuredAssignmentPattern;
+                const uint32_t n     = static_cast<uint32_t>(elems.size());
+                const uint32_t reps =
+                    rhs.kind == ExpressionKind::ReplicatedAssignmentPattern
+                        ? static_cast<uint32_t>(
+                              const_uint(rhs.as<ReplicatedAssignmentPatternExpression>().count()))
+                        : 1;
+                const uint32_t lo = std::min(t.left, t.right);
+                for (uint32_t k = 0; k < n * reps; ++k) {
+                    const int32_t coord =
+                        keyed ? static_cast<int32_t>(lo + k)
+                              : (t.left <= t.right ? static_cast<int32_t>(t.left + k)
+                                                   : static_cast<int32_t>(t.left - k));
+                    const ir::Index idx =
+                        b.constant(module_.pool.put_int(make_int_type(32, false, true),
+                                                        static_cast<uint64_t>(static_cast<int64_t>(coord))),
+                                   l);
+                    emit_agg_store(b.elem_select(lhs, idx, type, l), t.element, *elems[k % n], tag, b, l);
+                }
+                return;
             }
-            return;
+            fail("'{...} assignment pattern over this aggregate is not supported");
         }
         if (is_leaf_ref(type)) {
             b.binary(tag, lhs, lower_expr(rhs, b), l);
@@ -1170,6 +1192,30 @@ private:
             default:
                 return nullptr;
         }
+    }
+
+    ir::Index lower_packed_pattern(const Expression& expr, ir::Builder& b) {
+        const ir::SourceLoc l   = loc(expr);
+        const auto*         pat = as_assignment_pattern(expr);
+        const auto          es  = pat->elements();
+        std::vector<ir::Index> parts;
+        parts.reserve(es.size());
+        for (const Expression* e : es) {
+            parts.push_back(lower_expr(*e, b));
+        }
+        if (expr.kind == ExpressionKind::StructuredAssignmentPattern &&
+            expr.type->isPackedArray()) {
+            const slang::ConstantRange r = expr.type->getFixedRange();
+            if (r.left > r.right) {
+                std::reverse(parts.begin(), parts.end());
+            }
+        }
+        if (expr.kind == ExpressionKind::ReplicatedAssignmentPattern) {
+            const uint64_t count =
+                const_uint(expr.as<ReplicatedAssignmentPatternExpression>().count());
+            return b.repl(b.concat(parts, l), static_cast<uint32_t>(count), l);
+        }
+        return b.concat(parts, l);
     }
 
     // 1-bit 4-state equality of two whole unpacked structs: AND-reduce the
@@ -6215,8 +6261,20 @@ private:
                 b.agg_copy(lower_lvalue(a.left(), b), lower_lvalue(src, b), ty, loc(a));
                 return true_const(b, loc(a));
             }
-            // TODO: nonblocking whole-array copy, `mem = '{...}` patterns, string
-            // arrays — element-wise copy / aggregate lowering.
+            if (as_assignment_pattern(src)) {
+                // `mem = '{...}`: element-wise store of the (slang-ordered) pattern
+                // into a scalar-element unpacked array (`is_aggregate` routes an
+                // array of aggregates through emit_struct_store instead).
+                if (a.isNonBlocking()) {
+                    // TODO: nonblocking `'{...}` to an unpacked array — per-leaf NBA
+                    // into array elements needs the deferred array-record path.
+                    fail("nonblocking '{...} assignment to an unpacked array is not supported");
+                }
+                emit_agg_store(lower_lvalue(a.left(), b), ty, src, ir::Inst::Tag::Store, b, loc(a));
+                return true_const(b, loc(a));
+            }
+            // TODO: nonblocking whole-array copy, string arrays — element-wise
+            // copy / aggregate lowering.
             fail("whole unpacked array assignment is not supported");
         }
         // s[i] = c writes one character in place; out-of-range or a zero byte is
@@ -6768,6 +6826,10 @@ private:
                 const ir::Index             v = lower_assign(a, b);
                 return is_string_expr(a.left()) ? v : b.resize(v, lower_type(*a.left().type), l);
             }
+            case ExpressionKind::SimpleAssignmentPattern:
+            case ExpressionKind::StructuredAssignmentPattern:
+            case ExpressionKind::ReplicatedAssignmentPattern:
+                return lower_packed_pattern(expr, b);
             default:
                 fail("unsupported expression kind=" + std::string(slang::ast::toString(expr.kind)));
         }
