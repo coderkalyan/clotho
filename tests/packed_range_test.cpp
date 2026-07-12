@@ -277,6 +277,40 @@ TEST_CASE("multi-dim packed array: element/range/nested selects (LRM 7.4.5/7.4.6
           "asc 11 44 2233\n");
 }
 
+TEST_CASE("array query functions (LRM 20.7): $size/$dimensions/$left/... fold to constants") {
+    // All eight are constant type/bounds queries for a fixed-size operand, so
+    // slang folds them; every string below matches iverilog v13 exactly (it
+    // supports these on fixed arrays, unlike a multi-dim packed *select*).
+    constexpr std::string_view src = R"(
+        module t;
+            logic [15:0]     v;
+            logic [0:7]      asc;              // ascending, negative increment
+            logic [3:0][7:0] a;                // packed 2-D
+            logic [7:0]      mem [0:15];       // unpacked 1-D
+            logic [7:0]      m2  [3:0][0:9];   // unpacked 2-D
+            initial begin
+                $display("v L%0d R%0d H%0d Lo%0d I%0d S%0d D%0d",
+                         $left(v), $right(v), $high(v), $low(v), $increment(v), $size(v), $dimensions(v));
+                $display("asc L%0d R%0d H%0d Lo%0d I%0d",
+                         $left(asc), $right(asc), $high(asc), $low(asc), $increment(asc));
+                $display("a S%0d D%0d bits%0d", $size(a), $dimensions(a), $bits(a));
+                $display("a2 L%0d R%0d S%0d", $left(a, 2), $right(a, 2), $size(a, 2));
+                $display("mem S%0d L%0d H%0d D%0d UD%0d",
+                         $size(mem), $left(mem), $high(mem), $dimensions(mem), $unpacked_dimensions(mem));
+                $display("m2 S%0d Sd2%0d D%0d UD%0d",
+                         $size(m2), $size(m2, 2), $dimensions(m2), $unpacked_dimensions(m2));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "v L15 R0 H15 Lo0 I1 S16 D1\n"
+          "asc L0 R7 H7 Lo0 I-1\n"
+          "a S4 D2 bits32\n"
+          "a2 L7 R0 S8\n"
+          "mem S16 L0 H15 D2 UD1\n"
+          "m2 S4 Sd210 D3 UD2\n");
+}
+
 TEST_CASE("fork..join_any / join_none are rejected, not serialized") {
     // fork..join itself is now supported (see fork_test.cpp); the unbounded
     // variants stay guarded until V2's growable ring.

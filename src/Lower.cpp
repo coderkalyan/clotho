@@ -5249,6 +5249,26 @@ private:
             fail("$size of this operand is not supported");
         }
 
+        // Remaining array query functions (LRM 20.7): $dimensions /
+        // $unpacked_dimensions / $left / $right / $low / $high / $increment.
+        // Each is a pure type/bounds query, so slang folds it to a 32-bit
+        // constant for a fixed-size operand (the only kind these reach here for)
+        // — including the optional dimension argument, an out-of-range dimension
+        // (folds to 'x), and arbitrary packed/unpacked nesting. A non-constant
+        // result is only possible for a dynamically-sized operand, which Clotho
+        // does not lower for these queries yet ($size has its own runtime path
+        // above).
+        if (name == "$dimensions" || name == "$unpacked_dimensions" || name == "$left" ||
+            name == "$right" || name == "$low" || name == "$high" || name == "$increment") {
+            slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+            slang::ast::EvalContext    ectx(actx);
+            const slang::ConstantValue cv = call.eval(ectx);
+            if (cv.isInteger()) {
+                return b.constant(svint_to_ref(cv.integer(), lower_type(*call.type)), l);
+            }
+            fail("array query function on a dynamically-sized operand is not supported");
+        }
+
         // TODO: $typename (LRM 20.6.1). slang folds it to a string, but its type
         // $typename (LRM 20.6.1): the operand's resolved type name as a string
         // constant. Clotho formats the type itself (format_typename) rather than
