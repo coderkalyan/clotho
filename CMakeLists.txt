@@ -169,6 +169,7 @@ add_executable(clotho_test
   tests/severity_test.cpp
   tests/event_test.cpp
   tests/unbased_test.cpp
+  tests/preprocess_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho doctest::doctest clotho_warnings)
 
