@@ -513,6 +513,14 @@ private:
                     os_ << '"' << ir_.extra_bytes(info.str, info.str_len) << '"';
                     break;
                 }
+                // Finish / CaseViol carry a FinishInfo (banner bytes + level), not a
+                // variadic operand slice — render the banner rather than mis-reading
+                // the packed bytes as instruction indices.
+                if (tag == Inst::Tag::Finish || tag == Inst::Tag::CaseViol) {
+                    const auto info = ir_.extra_data<FinishInfo>(p.extra);
+                    os_ << '"' << ir_.extra_bytes(info.banner, info.banner_len) << "\", " << info.arg;
+                    break;
+                }
                 // concat: variadic operands.
                 const auto parts = ir_.region(ir_.extra_data<ExtraSlice>(p.extra));
                 for (size_t k = 0; k < parts.size(); ++k) {
