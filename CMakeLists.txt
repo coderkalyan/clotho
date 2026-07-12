@@ -171,6 +171,7 @@ add_executable(clotho_test
   tests/dynamic_array_test.cpp
   tests/queue_test.cpp
   tests/unbased_test.cpp
+  tests/preprocess_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho doctest::doctest clotho_warnings)
 
