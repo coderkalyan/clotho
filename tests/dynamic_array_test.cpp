@@ -371,3 +371,14 @@ TEST_CASE("dynamic array 4-state element defaults to x") {
     )";
     CHECK(run_capture(src) == "xx xx\na5 xx\n");
 }
+
+// $size(a) on a runtime dynamic array lowers to .size() (LRM 20.7).
+TEST_CASE("dynamic array $size") {
+    constexpr std::string_view src = R"(
+        module m;
+            int a[];
+            initial begin a = new[5]; $display("%0d", $size(a)); end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "5\n");
+}

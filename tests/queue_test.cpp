@@ -310,3 +310,17 @@ TEST_CASE("queue as a function local") {
     )";
     CHECK(run_capture(src) == "9 5\n");
 }
+
+// $size(q) on a runtime queue lowers to .size() (LRM 20.7).
+TEST_CASE("queue $size") {
+    constexpr std::string_view src = R"(
+        module m;
+            int q[$];
+            initial begin
+                q.push_back(1); q.push_back(2); q.push_back(3);
+                $display("%0d", $size(q));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "3\n");
+}

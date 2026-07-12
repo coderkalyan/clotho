@@ -4731,6 +4731,29 @@ private:
             return lower_bit_query(name, call, b, l);
         }
 
+        // $size (LRM 20.7): const-folds in slang for a fixed-size array; a runtime
+        // queue / dynamic array cannot fold and reaches here — it is exactly the
+        // collection's .size() (the sole/first dimension is 0..len-1).
+        if (name == "$size" && !call.arguments().empty()) {
+            slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+            slang::ast::EvalContext    ectx(actx);
+            const slang::ConstantValue cv = call.eval(ectx);
+            if (cv.isInteger()) {
+                return b.constant(svint_to_ref(cv.integer(), lower_type(*call.type)), l);
+            }
+            const Expression& arr = *call.arguments()[0];
+            if (is_dyn_array(arr)) {
+                return b.resize(b.dyn_array_size(lower_lvalue(arr, b), lower_type(*arr.type), l),
+                                lower_type(*call.type), l);
+            }
+            if (is_queue(arr)) {
+                return b.resize(b.queue_size(lower_lvalue(arr, b), lower_type(*arr.type), l),
+                                lower_type(*call.type), l);
+            }
+            // TODO: $size(coll, dim) on a multidimensional dynamic collection.
+            fail("$size of this operand is not supported");
+        }
+
         // TODO: $typename (LRM 20.6.1). slang folds it to a string, but its type
         // $typename (LRM 20.6.1): the operand's resolved type name as a string
         // constant. Clotho formats the type itself (format_typename) rather than
