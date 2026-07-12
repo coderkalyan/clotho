@@ -504,6 +504,13 @@ typedef struct rt_string {
     alignas(8) unsigned char storage[32];
 } rt_string;
 
+// Max inline (SSO) string length. One byte shorter than the 31 free bytes so
+// byte[len] can always hold the NUL terminator (rt_string_data is a valid C
+// string). Shared with the backend, which materializes the power-on empty-string
+// constant — the two MUST agree or that constant corrupts. See the SSO block in
+// Runtime.cpp.
+constexpr uint64_t rt_string_inline_cap = 30;
+
 // Construct the empty string "" in caller-owned storage. Never allocates.
 void rt_string_init(rt_string* s);
 
@@ -521,7 +528,8 @@ void rt_string_assign_bytes(rt_string* dst, const char* p, uint64_t n);
 // Length in bytes ($.len()). The empty string has length 0.
 uint64_t rt_string_len(const rt_string* s);
 
-// Pointer to the string's bytes (not NUL-terminated; length via rt_string_len).
+// Pointer to the string's bytes, NUL-terminated at byte[len] so it is a valid C
+// string (length via rt_string_len; embedded NULs make the C view stop early).
 // Valid until the next mutation of `s`.
 const char* rt_string_data(const rt_string* s);
 
@@ -769,5 +777,11 @@ void rt_dpi_pack_logicvec(const uint32_t* must, const uint32_t* may, const uint3
                           uint32_t nchunks, uint32_t* out);
 void rt_dpi_unpack_logicvec(const uint32_t* in, uint32_t nchunks, uint32_t* must, uint32_t* may,
                             uint32_t* z);
+
+// Copy a NUL-terminated C string into an SV string handle — the copy-out for a
+// DPI import that returns `string` (LRM 35.5.6). The C retains ownership of `p`;
+// a null `p` yields the empty string. (An SV string argument passed to C needs no
+// helper — rt_string_data() is already a valid C `const char*`.)
+void rt_dpi_str_out(rt_string* dst, const char* p);
 
 } // extern "C"

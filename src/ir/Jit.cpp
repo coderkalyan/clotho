@@ -206,6 +206,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_intra_event_fire", &rt_intra_event_fire);
     expose("rt_dpi_pack_logicvec", &rt_dpi_pack_logicvec);
     expose("rt_dpi_unpack_logicvec", &rt_dpi_unpack_logicvec);
+    expose("rt_dpi_str_out", &rt_dpi_str_out);
     expose("rt_string_init", &rt_string_init);
     expose("rt_string_deinit", &rt_string_deinit);
     expose("rt_string_assign", &rt_string_assign);

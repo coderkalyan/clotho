@@ -164,6 +164,8 @@ enum class DpiCType : uint8_t {
     Shortreal,   // SV shortreal -> float
     BitScalar,   // SV bit       -> svBit   (unsigned char: 0/1)
     LogicScalar, // SV logic/reg -> svLogic (unsigned char: 0/1/2=Z/3=X)
+    Chandle,     // SV chandle   -> void*   (opaque handle, i64 <-> ptr)
+    String,      // SV string    -> char*   (input: rt_string_data; return: copy-in)
     // Packed vectors wider than a scalar map to a by-pointer chunk array (LRM
     // 35.5.6.2). Always passed as a pointer, every direction. Never a return type
     // (slang rejects a packed-array DPI return — a return is a "small value").

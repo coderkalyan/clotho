@@ -111,24 +111,50 @@ TEST_CASE("DPI import: output argument") {
     CHECK(run_capture(src) == "4 500\n");
 }
 
+// A `chandle` (LRM 6.14) round-trips an opaque C pointer: it is lowered as a
+// 2-state i64 and marshaled to/from `void*`. libc `malloc`/`free` are the ideal
+// no-.so probe — malloc returns a chandle, free takes one; `null` / `==` / `!=`
+// are integer ops on the handle bits.
+TEST_CASE("DPI import: chandle round-trips an opaque pointer") {
+    constexpr std::string_view src = R"(
+        module m;
+          import "DPI-C" function chandle malloc(input longint size);
+          import "DPI-C" function void    free(input chandle p);
+          chandle h;
+          initial begin
+            h = malloc(64);
+            $display("%b", h != null);   // malloc(64) succeeds -> non-null handle
+            free(h);
+            h = null;
+            $display("%b", h == null);    // 1
+          end
+        endmodule)";
+    CHECK(run_capture(src) == "1\n1\n");
+}
+
+TEST_CASE("DPI import: input string passes a NUL-terminated char*") {
+    constexpr std::string_view src = R"(
+        module m;
+          import "DPI-C" function longint strlen(input string s);
+          initial begin
+            $display("%0d", strlen("hello world"));   // 11
+            $display("%0d", strlen(""));               // 0 (empty-string NUL)
+          end
+        endmodule)";
+    CHECK(run_capture(src) == "11\n0\n");
+}
+
 // Out-of-scope constructs must fail loudly with a TODO, never silently miscompile.
 // Each is a distinct guard in build_dpi_import.
 TEST_CASE("DPI import: unsupported forms are rejected") {
-    SUBCASE("string argument") {
+    SUBCASE("output string argument (unbounded-buffer hazard, deferred)") {
         constexpr std::string_view src = R"(
             module m;
-              import "DPI-C" function int f(input string s);
-              initial $display(f("hi"));
+              import "DPI-C" function void f(output string s);
+              string y;
+              initial f(y);
             endmodule)";
-        CHECK(lower_fail(src).find("not supported") != std::string::npos);
-    }
-    SUBCASE("chandle argument (needs chandle lowering)") {
-        constexpr std::string_view src = R"(
-            module m;
-              import "DPI-C" function int f(input chandle c);
-              initial $display(f(null));
-            endmodule)";
-        CHECK(lower_fail(src).find("not supported") != std::string::npos);
+        CHECK(lower_fail(src).find("output/inout string") != std::string::npos);
     }
     SUBCASE("DPI import task") {
         constexpr std::string_view src = R"(

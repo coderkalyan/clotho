@@ -193,6 +193,29 @@ struct Str {
 
 } // namespace
 
+TEST_CASE("rt_string_data is NUL-terminated at byte[len] (C-string interop)") {
+    // Empty, short inline, exactly the inline cap (30), one past (heap), and a long
+    // heap string — rt_string_data must be a valid C string in every form.
+    for (const size_t n : { size_t{ 0 }, size_t{ 1 }, size_t{ 15 }, size_t{ 30 }, size_t{ 31 }, size_t{ 200 } }) {
+        std::string v;
+        for (size_t k = 0; k < n; ++k) {
+            v += static_cast<char>('a' + k % 26);
+        }
+        Str         s(v);
+        const char* c = rt_string_data(&s.s);
+        REQUIRE(rt_string_len(&s.s) == n);
+        CHECK(c[n] == '\0');            // terminator at byte[len]
+        CHECK(std::string(c) == v);     // C-string view equals the content
+    }
+}
+
+TEST_CASE("rt_string keeps the length authoritative with an embedded NUL") {
+    Str s(std::string_view("ab\0cd", 5)); // 5 bytes including a mid-string NUL
+    CHECK(rt_string_len(&s.s) == 5);                 // full length preserved
+    CHECK(rt_string_data(&s.s)[5] == '\0');          // terminator still at byte[len]
+    CHECK(std::strlen(rt_string_data(&s.s)) == 2);   // C view stops at the embedded NUL
+}
+
 TEST_CASE("rt_string round-trips byte sequences across the inline/heap boundary") {
     Str s;
     CHECK(rt_string_len(&s.s) == 0);
