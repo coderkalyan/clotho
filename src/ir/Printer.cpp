@@ -371,6 +371,12 @@ const char* tag_name(Inst::Tag tag) {
             return "clog2";
         case T::CountBits:
             return "count_bits";
+        case T::OneHot:
+            return "onehot";
+        case T::OneHot0:
+            return "onehot0";
+        case T::IsUnknown:
+            return "isunknown";
         case T::TestPlusArgs:
             return "test_plusargs";
         case T::ValuePlusArgs:

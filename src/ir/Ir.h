@@ -1277,9 +1277,17 @@ struct Inst {
         // value). Tallies the operand's bits whose 4-state value is in the
         // info mask (LRM 20.9), -> a definite 2-state 32-bit `int`. $countones
         // masks CountOne; $isunknown is `CountBits(CountX|CountZ) != 0`; the
-        // one-hot forms compare `CountBits(CountOne)` against 1. A constant
-        // operand folds in slang and never reaches this tag.
+        // one-hot forms have their own tags below. A constant operand folds in
+        // slang and never reaches this tag.
         CountBits,
+        // $onehot / $onehot0: exactly-one / at-most-one definite-1 bit in the
+        // operand (LRM 20.9), -> a definite 1-bit result (payload: unary).
+        // x/z bits are not definite 1, so they never count.
+        OneHot,
+        OneHot0,
+        // $isunknown: nonzero iff any operand bit is x/z (LRM 20.9), -> a
+        // definite 1-bit result (payload: unary).
+        IsUnknown,
         // $test$plusargs(str) (payload: extra -> TestPlusArgsInfo), -> a 1-bit
         // definite boolean. LRM §21.6: nonzero iff some command-line plusarg's
         // prefix matches every character of `str`. Lowers to an
@@ -1449,6 +1457,9 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Clog2:
         case T::Ctz:
         case T::Clz:
+        case T::OneHot:
+        case T::OneHot0:
+        case T::IsUnknown:
         case T::UrandomSeeded:
             return K::Unary;
 

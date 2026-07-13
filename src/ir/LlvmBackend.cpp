@@ -3459,6 +3459,9 @@ private:
                 case Inst::Tag::Ctz:
                 case Inst::Tag::Clz:
                 case Inst::Tag::CountBits:
+                case Inst::Tag::OneHot:
+                case Inst::Tag::OneHot0:
+                case Inst::Tag::IsUnknown:
                 case Inst::Tag::Sll:
                 case Inst::Tag::Srl:
                 case Inst::Tag::Sra:
@@ -6217,6 +6220,11 @@ private:
                 // (LRM 20.9 return type). Never X — it counts, it does not
                 // propagate.
                 return { 32, false, true };
+            case Inst::Tag::OneHot:
+            case Inst::Tag::OneHot0:
+            case Inst::Tag::IsUnknown:
+                // Definite 1-bit qualifier results (LRM 20.9); never X.
+                return { 1, false, false };
             case Inst::Tag::FopenFd:
             case Inst::Tag::FopenMcd:
                 // $fopen returns a 32-bit descriptor integer.
@@ -7093,6 +7101,18 @@ private:
                 set_value(i,
                           lower_count_bits(value_of(p.op_extra.op),
                                            ir_->extra_data<CountBitsInfo>(p.op_extra.extra).mask));
+                return;
+
+            case Inst::Tag::OneHot:
+                set_value(i, lower_onehot(value_of(p.unary), /*allow_zero=*/false));
+                return;
+
+            case Inst::Tag::OneHot0:
+                set_value(i, lower_onehot(value_of(p.unary), /*allow_zero=*/true));
+                return;
+
+            case Inst::Tag::IsUnknown:
+                set_value(i, lower_isunknown(value_of(p.unary)));
                 return;
 
             case Inst::Tag::Sll:
@@ -11845,7 +11865,9 @@ private:
     // ~may; unknown = may & ~must; z = unknown & z-plane; x = unknown & ~z. The
     // selected classes (disjoint per bit) OR together, then popcount. The result
     // is definite (2-state) — counting never propagates X.
-    Plane lower_count_bits(Plane a, uint32_t mask) {
+    // 32-bit definite popcount of the operand bits whose 4-state class is in
+    // `mask` (LRM 20.9).
+    llvm::Value* count_bits_pop(Plane a, uint32_t mask) {
         a = to_four(a);
         const uint32_t w       = width_of(a);
         llvm::Value*   m       = must_of(a);
@@ -11866,7 +11888,28 @@ private:
             sel = b_.CreateOr(sel, b_.CreateAnd(unknown, z));
         }
         llvm::Value* pop = b_.CreateUnaryIntrinsic(llvm::Intrinsic::ctpop, sel);
-        return two_val(cast(pop, 32, false));
+        return cast(pop, 32, false);
+    }
+
+    Plane lower_count_bits(Plane a, uint32_t mask) {
+        return two_val(count_bits_pop(a, mask));
+    }
+
+    // $onehot / $onehot0 (LRM 20.9): popcount of the definite-1 bits compared
+    // against 1. x/z bits are never definite 1, so the result is definite.
+    Plane lower_onehot(Plane a, bool allow_zero) {
+        llvm::Value* pop = count_bits_pop(a, CountOne);
+        llvm::Value* r   = allow_zero ? b_.CreateICmpULE(pop, b_.getInt32(1))
+                                      : b_.CreateICmpEQ(pop, b_.getInt32(1));
+        return two_val(r);
+    }
+
+    // $isunknown (LRM 20.9): the union of the x and z classes is exactly the
+    // unknown plane, so this is one reduction, not a popcount-compare.
+    Plane lower_isunknown(Plane a) {
+        a = to_four(a);
+        llvm::Value* unknown = b_.CreateAnd(may_of(a), b_.CreateNot(must_of(a)));
+        return two_val(b_.CreateICmpNE(unknown, zero(width_of(a))));
     }
 
     Plane lower_clog2(Plane a) {

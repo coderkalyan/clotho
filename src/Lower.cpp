@@ -5259,35 +5259,25 @@ private:
         // which 4-state values to tally.
         const ir::Index val = lower_expr(*args[0], b);
 
-        uint32_t mask = ir::CountOne; // $countones / $onehot* count definite-1 bits
-        if (name == "$isunknown") {
-            mask = ir::CountX | ir::CountZ;
+        // $onehot / $onehot0 / $isunknown carry their qualifier in the tag.
+        if (name == "$onehot") {
+            return b.resize(b.unary(ir::Inst::Tag::OneHot, val, l), lower_type(*call.type), l);
         }
-        else if (name == "$countbits") {
+        if (name == "$onehot0") {
+            return b.resize(b.unary(ir::Inst::Tag::OneHot0, val, l), lower_type(*call.type), l);
+        }
+        if (name == "$isunknown") {
+            return b.resize(b.unary(ir::Inst::Tag::IsUnknown, val, l), lower_type(*call.type), l);
+        }
+
+        uint32_t mask = ir::CountOne; // $countones counts definite-1 bits
+        if (name == "$countbits") {
             mask = 0;
             for (size_t k = 1; k < args.size(); ++k) {
                 mask |= count_control_class(*args[k]);
             }
         }
-
-        const ir::Index count = b.count_bits(val, mask, l);
-
-        if (name == "$countones" || name == "$countbits") {
-            return b.resize(count, lower_type(*call.type), l);
-        }
-        // $onehot -> count == 1; $onehot0 -> count <= 1; $isunknown -> count != 0.
-        ir::Inst::Tag   op  = ir::Inst::Tag::Ne;
-        uint64_t        rhs = 0;
-        if (name == "$onehot") {
-            op  = ir::Inst::Tag::Eq;
-            rhs = 1;
-        }
-        else if (name == "$onehot0") {
-            op  = ir::Inst::Tag::Le;
-            rhs = 1;
-        }
-        return b.resize(b.binary(op, count, b.constant(module_.pool.put_int(i32, rhs), l), l),
-                        lower_type(*call.type), l);
+        return b.resize(b.count_bits(val, mask, l), lower_type(*call.type), l);
     }
 
     // Lower a system function call used as an rvalue (e.g. `$time`). User function
