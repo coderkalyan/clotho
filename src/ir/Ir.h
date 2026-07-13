@@ -49,25 +49,6 @@ enum class Signal : uint32_t {};
 // `call`. Resolved by the module, like Signal.
 enum class FunctionId : uint32_t {};
 
-// Which file-I/O system function a `file_value_op` invokes (LRM §21.3). Each
-// returns a 32-bit integer and takes its operands (a file descriptor, plus a
-// character or offset) as plain value args. Kept in lockstep with the runtime
-// dispatch in LlvmBackend.
-enum class FileOp : uint32_t {
-    // $fgetc(fd) -> next byte, or -1 at EOF.
-    Fgetc,
-    // $ungetc(c, fd) -> c, or -1 on failure.
-    Ungetc,
-    // $feof(fd) -> nonzero once EOF has been seen.
-    Feof,
-    // $ftell(fd) -> current byte offset, or -1.
-    Ftell,
-    // $fseek(fd, offset, operation) -> 0 on success, -1 on failure.
-    Fseek,
-    // $rewind(fd) -> 0 (seek to start).
-    Rewind,
-};
-
 // Which real math system function a `real_math` invokes (LRM §20.8.2, Table
 // 20-4). Each takes real operands and returns a real; the LRM requires each to
 // match the equivalent C standard math library function. Pow / Atan2 / Hypot
@@ -210,6 +191,29 @@ struct AggCopyInfo {
     Ref type;
 };
 
+// Extra payload for `inside_set`: the `inside` operator's membership test of
+// the op against a set (LRM 11.4.13), OR-reduced across members with LRM
+// 11.4.5 X-propagation. The OR is order-insensitive, so members are grouped
+// by kind: `values` is a run of singular member values, each tested with
+// wildcard equality (only the member's own x/z bits are wildcards); `ranges`
+// is a run of back-to-back [lo, hi] operand pairs tested as
+// `sel >= lo && sel <= hi`. All operands are pre-resized to the selector type.
+struct InsideSetInfo {
+    // Singular member values (wildcard-equality tests).
+    ExtraSlice values;
+    // [lo, hi] range operand pairs, two indices per range.
+    ExtraSlice ranges;
+};
+
+// Extra payload for `agg_eq`: whole-aggregate equality of two unpacked
+// aggregate lvalues of `type` (LRM 11.2.2). The op is the left lvalue.
+struct AggEqInfo {
+    // Right-hand aggregate lvalue.
+    Index rhs;
+    // The aggregate type (gives the member layout to compare).
+    Ref type;
+};
+
 // Extra payload for `member_select`: a member of an unpacked struct (the base is
 // the op). Unlike a packed struct member (a constant part-select over a flat
 // bit-vector), an unpacked struct is an aggregate whose members have their own
@@ -224,101 +228,51 @@ struct MemberSelect {
     Ref struct_type;
 };
 
-// Which dynamic-array operation a `dyn_array_op` performs (LRM 7.5). Kept in
-// lockstep with the backend dispatch in LlvmBackend and the runtime rt_dynarr_*
-// functions.
-enum class DynArrayOp : uint32_t {
-    // arr = new[size]: (re)allocate to `size` elements, each the element's
-    // power-on value (LRM 7.5.1).
-    New,
-    // arr = new[size](src): like New, then copy min(size, src.len) elements
-    // from the `src` handle lvalue (LRM 7.5.1).
-    NewInit,
-    // arr.size(): the current element count (LRM 7.5), a 32-bit int.
-    Size,
-    // arr.delete(): free the storage, size -> 0 (LRM 7.5).
-    Delete,
-    // arr = other: deep copy of another dynamic array's storage (value
-    // semantics, LRM 7.5).
-    Copy,
-    // arr.reverse(): reverse element order in place (LRM 7.12.2). Element-agnostic.
-    Reverse,
-    // arr.sort() / arr.rsort(): order elements ascending / descending by value
-    // (LRM 7.12.2). Restricted to a 2-state integral (width <= 64) or real element.
-    Sort,
-    Rsort,
-    // arr.shuffle(): randomize element order in place (LRM 7.12.2) via the
-    // process frame RNG (LRM 18.13). Element-agnostic. Forces a coroutine.
-    Shuffle,
+// Extra payload for `dyn_array_new` / `dyn_array_copy`: the tag's single
+// non-handle operand (element count for New, source handle for Copy) plus the
+// interned DynArray type (element stride / slot), independent of the target
+// signal — so the op works for a module signal or a frame local. The handle
+// lvalue is the instruction's op.
+struct DynArrayArg {
+    // Element count (new) or source handle lvalue (copy).
+    Index arg;
+    // The interned DynArray type of the target.
+    Ref array_type;
 };
 
-// Which queue operation a `queue_op` performs (LRM 7.10.2). Kept in lockstep
-// with the backend dispatch in LlvmBackend and the runtime rt_queue_* functions.
-enum class QueueOp : uint32_t {
-    // q.size(): the current element count (a 32-bit int).
-    Size,
-    // q.push_back(e) / q.push_front(e): append `val` to the tail / head; on a
-    // bounded queue an overflowing element is dropped from the opposite end.
-    PushBack,
-    PushFront,
-    // q.pop_back() / q.pop_front(): remove and return the tail / head element
-    // (element default on an empty queue).
-    PopBack,
-    PopFront,
-    // q.insert(idx, e): insert `val` before position `idx` (LRM 7.10.2.4).
-    Insert,
-    // q.delete(idx): remove the element at `idx` (LRM 7.10.2.5).
-    DeleteIdx,
-    // q.delete(): remove all elements, size -> 0.
-    DeleteAll,
-    // q = other: deep copy of another queue's storage (value semantics).
-    Copy,
-    // q.reverse(): reverse element order in place (LRM 7.12.2). Element-agnostic.
-    Reverse,
-    // q.sort() / q.rsort(): order elements ascending / descending by value
-    // (LRM 7.12.2). Restricted to a 2-state integral (width <= 64) or real element.
-    Sort,
-    Rsort,
-    // q.shuffle(): randomize element order in place (LRM 7.12.2) via the process
-    // frame RNG (LRM 18.13). Element-agnostic. Forces a coroutine.
-    Shuffle,
+// Extra payload for `dyn_array_new_init`: arr = new[size](src) (LRM 7.5.1) —
+// reallocate to `size` elements, then copy min(size, src.len) elements from
+// the source handle lvalue. The handle lvalue is the op.
+struct DynArrayNewInitInfo {
+    // Element count operand.
+    Index size;
+    // Source dynamic-array handle lvalue.
+    Index src;
+    // The interned DynArray type of the target.
+    Ref array_type;
 };
 
-// Extra payload for `queue_op`: a queue operation on the handle lvalue `op`
-// (the instruction's op_extra.op). `sub` is the ir::QueueOp; `idx` is the
-// position operand (Insert / DeleteIdx), `val` the element value (PushBack /
-// PushFront / Insert) or the source handle lvalue (Copy). Operand presence is
-// derived from `sub`; a slot unused by the sub-op holds the handle lvalue as
-// deterministic filler.
-struct QueueInfo {
-    // ir::QueueOp value.
-    uint32_t sub;
-    // Position operand (Insert / DeleteIdx).
-    Index idx;
-    // Element value (PushBack / PushFront / Insert) or source lvalue (Copy).
-    Index val;
-    // The interned Queue type of the target (element stride / slot / bound),
-    // independent of the target signal — so the op works for a module signal or
-    // a frame local.
+// Extra payload for the one-operand queue tags (QueuePushBack / QueuePushFront
+// / QueueDeleteIdx / QueueCopy): the tag's single non-handle operand plus the
+// interned Queue type of the target (element stride / slot / bound),
+// independent of the target signal — so the op works for a module signal or a
+// frame local. The handle lvalue is the instruction's op.
+struct QueueArg {
+    // Element value (push), position (delete-idx), or source handle (copy).
+    Index arg;
+    // The interned Queue type of the target.
     Ref queue_type;
 };
 
-// Extra payload for `dyn_array_op`: a dynamic-array operation on the handle
-// lvalue `op` (the instruction's op_extra.op). `sub` is the ir::DynArrayOp;
-// `size` is the element count (New / NewInit); `src` the source handle lvalue
-// (NewInit / Copy). Operand presence is derived from `sub`; a slot unused by
-// the sub-op holds the handle lvalue as deterministic filler. `array_type` is
-// the interned DynArray type, giving the element stride / slot independently of
-// the target signal — so the op works for a module signal or a frame local.
-struct DynArrayInfo {
-    // ir::DynArrayOp value.
-    uint32_t sub;
-    // Element count operand (New / NewInit).
-    Index size;
-    // Source dynamic-array handle lvalue (NewInit / Copy).
-    Index src;
-    // The interned DynArray type of the target (element stride / slot).
-    Ref array_type;
+// Extra payload for `queue_insert`: q.insert(idx, e) inserts the element value
+// `val` before position `idx` (LRM 7.10.2.4). The handle lvalue is the op.
+struct QueueInsertInfo {
+    // Position operand.
+    Index idx;
+    // Element value operand.
+    Index val;
+    // The interned Queue type of the target.
+    Ref queue_type;
 };
 
 // Extra payload for `read_mem`: a $readmemh / $readmemb load of a file into an
@@ -449,13 +403,13 @@ struct SwitchInfo {
     ExtraSlice default_;
 };
 
-// Extra payload for `display`: a $display / $write / $fdisplay / $fwrite system
-// task. The format-string bytes live packed little-endian (4 chars per u32 word)
-// at `fmt` for `fmt_len` bytes; `args` is the slice of value operands the format
-// specifiers consume, in order; `newline` is 1 for the $*display forms (append
-// '\n') and 0 for the $*write forms. `fd` is the destination descriptor operand
-// for the $f* forms; when `has_fd` is 0 ($display / $write) the backend writes to
-// the standard-output MCD and `fd` is unused.
+// Extra payload for `display` / `fdisplay`: a $display / $write / $fdisplay /
+// $fwrite system task. The format-string bytes live packed little-endian
+// (4 chars per u32 word) at `fmt` for `fmt_len` bytes; `args` is the slice of
+// value operands the format specifiers consume, in order; `newline` is 1 for
+// the $*display forms (append '\n') and 0 for the $*write forms. The
+// destination is the tag's: Display writes the standard-output MCD, FDisplay
+// carries the descriptor as its primary operand.
 struct DisplayInfo {
     // First extra word of the packed format-string bytes.
     ExtraIndex fmt;
@@ -463,10 +417,6 @@ struct DisplayInfo {
     uint32_t fmt_len;
     // 1 => append a trailing newline ($display / $fdisplay); 0 => none.
     uint32_t newline;
-    // Destination descriptor operand ($fdisplay / $fwrite); valid iff has_fd.
-    Index fd;
-    // 1 => fd is a real descriptor operand; 0 => write to standard output.
-    uint32_t has_fd;
     // Value operands consumed by the format specifiers.
     ExtraSlice args;
 };
@@ -483,6 +433,19 @@ struct FinishInfo {
     uint32_t banner_len;
     // Diagnostic level (0/1/2), defaulting to 1 when the source omits it.
     uint32_t arg;
+};
+
+// Extra payload for `case_viol`: a unique/priority violation report (LRM
+// 12.4.2 / 12.5.3). `banner` / `banner_len` are the packed bytes of the
+// compile-time "<file>:<line>: " prefix; `kind` selects the message (0: no
+// item matched, 1: overlapping items).
+struct CaseViolInfo {
+    // First extra word of the packed banner-prefix bytes.
+    ExtraIndex banner;
+    // Banner-prefix length in bytes.
+    uint32_t banner_len;
+    // Violation-message selector: 0 no-match, 1 overlap.
+    uint32_t kind;
 };
 
 // Severity level of a `severity` instruction. Selects the diagnostic label the
@@ -518,46 +481,46 @@ struct SeverityInfo {
     ExtraSlice args;
 };
 
-// Extra payload for `fopen`: the $fopen(name, mode) form. `mode` is the C stdio
-// mode-string operand (a packed-ASCII vector, spilled by the backend) and is
-// valid iff `has_mode`; the name value is the instruction's `op`. With a mode a
-// single FD is opened, without one a fresh MCD is opened for writing.
-struct FopenInfo {
-    // C stdio mode-string operand; valid iff has_mode.
-    Index mode;
-    // 1 => two-argument $fopen (FD); 0 => one-argument $fopen (MCD).
-    uint32_t has_mode;
+// Extra payload for `fseek`: $fseek(fd, offset, operation) — the descriptor is
+// the instruction's op; these are the remaining two value operands.
+struct FseekInfo {
+    // Byte-offset operand.
+    Index offset;
+    // Seek-origin operand (0/1/2 per C fseek whence).
+    Index operation;
 };
 
-// Extra payload for `file_value_op`: a file-I/O system function returning a
-// 32-bit integer. `op` is the ir::FileOp selecting the routine; `args` are its
-// value operands in call order (a descriptor, plus a character / offset).
-struct FileOpInfo {
-    // ir::FileOp value.
-    uint32_t op;
-    // Value operands in call order.
-    ExtraSlice args;
-};
-
-// Extra payload for `real_math`: a real math system function (LRM §20.8.2).
-// `op` is the ir::RealMathOp selecting the routine; `args` are its real value
-// operands in call order (one for most, two for Pow / Atan2 / Hypot).
-struct RealMathInfo {
+// Extra payload for `real_math_binary`: the second real operand plus the
+// ir::RealMathOp selecting the routine (Pow / Atan2 / Hypot); the first
+// operand is the instruction's op.
+struct RealMathBinaryInfo {
+    // Second real operand (exponent / x / second leg).
+    Index rhs;
     // ir::RealMathOp value.
-    uint32_t op;
-    // Real value operands in call order.
-    ExtraSlice args;
+    uint32_t fn;
 };
 
-// Extra payload for `dist_call`: a probabilistic distribution function (LRM
-// §20.15.2) or seeded $random (§20.15.1). `op` is the ir::DistOp; `args` are the
-// value operands in call order — the seed word first, then the distribution
-// parameters (0-2 of them).
-struct DistInfo {
+// Extra payload for `dist_unary`: a one-parameter distribution function
+// ($dist_exponential / $dist_poisson / $dist_chi_square / $dist_t, LRM
+// §20.15.2). The seed word is the instruction's op.
+struct DistUnaryInfo {
+    // The distribution parameter (mean / degrees of freedom).
+    Index p1;
     // ir::DistOp value.
-    uint32_t op;
-    // Value operands: seed, then parameters.
-    ExtraSlice args;
+    uint32_t fn;
+};
+
+// Extra payload for `dist_binary`: a two-parameter distribution function
+// ($dist_uniform / $dist_normal / $dist_erlang, LRM §20.15.2) or seeded
+// $random (§20.15.1, Uniform over the full int32 span). The seed word is the
+// instruction's op.
+struct DistBinaryInfo {
+    // First distribution parameter.
+    Index p1;
+    // Second distribution parameter.
+    Index p2;
+    // ir::DistOp value.
+    uint32_t fn;
 };
 
 // Extra payload for `sformat`: $sformat / $swrite (LRM §21.3.3) format the value
@@ -587,20 +550,17 @@ struct SformatfInfo {
     ExtraSlice args;
 };
 
-// Extra payload for `scanf`: $fscanf / $sscanf (LRM §21.3.4) parse `source` per the
+// Extra payload for `fscanf` / `sscanf` (LRM §21.3.4): parse `source` per the
 // packed format-string bytes at `fmt` (`fmt_len` bytes) into the output lvalues
-// `args`, returning the conversion count. When `is_string` is 1 ($sscanf) `source`
-// is a packed-ASCII string value the backend spills; otherwise ($fscanf) it is a
-// file-descriptor value.
+// `args`, returning the conversion count. The tag says what `source` is: an FD
+// value (Fscanf) or a packed-ASCII string value the backend spills (Sscanf).
 struct ScanfInfo {
     // First extra word of the packed format-string bytes.
     ExtraIndex fmt;
     // Format-string length in bytes.
     uint32_t fmt_len;
-    // Source operand: an FD value ($fscanf) or a packed string value ($sscanf).
+    // Source operand: an FD value (Fscanf) or a packed string value (Sscanf).
     Index source;
-    // 1 => $sscanf (source is a packed string); 0 => $fscanf (source is an FD).
-    uint32_t is_string;
     // Output lvalue operands, one per conversion, in order.
     ExtraSlice args;
 };
@@ -752,19 +712,25 @@ static_assert(ExtraPayload<DynPartSelect>);
 static_assert(ExtraPayload<ElemSelect>);
 static_assert(ExtraPayload<MemberSelect>);
 static_assert(ExtraPayload<AggCopyInfo>);
-static_assert(ExtraPayload<DynArrayInfo>);
-static_assert(ExtraPayload<QueueInfo>);
+static_assert(ExtraPayload<AggEqInfo>);
+static_assert(ExtraPayload<InsideSetInfo>);
+static_assert(ExtraPayload<DynArrayArg>);
+static_assert(ExtraPayload<DynArrayNewInitInfo>);
+static_assert(ExtraPayload<QueueArg>);
+static_assert(ExtraPayload<QueueInsertInfo>);
 static_assert(ExtraPayload<ReadMemInfo>);
 static_assert(ExtraPayload<Regions>);
 static_assert(ExtraPayload<LoopInfo>);
 static_assert(ExtraPayload<SwitchArm>);
 static_assert(ExtraPayload<SwitchInfo>);
 static_assert(ExtraPayload<DisplayInfo>);
+static_assert(ExtraPayload<FinishInfo>);
+static_assert(ExtraPayload<CaseViolInfo>);
 static_assert(ExtraPayload<SeverityInfo>);
-static_assert(ExtraPayload<FopenInfo>);
-static_assert(ExtraPayload<FileOpInfo>);
-static_assert(ExtraPayload<RealMathInfo>);
-static_assert(ExtraPayload<DistInfo>);
+static_assert(ExtraPayload<FseekInfo>);
+static_assert(ExtraPayload<RealMathBinaryInfo>);
+static_assert(ExtraPayload<DistUnaryInfo>);
+static_assert(ExtraPayload<DistBinaryInfo>);
 static_assert(ExtraPayload<SformatInfo>);
 static_assert(ExtraPayload<SformatfInfo>);
 static_assert(ExtraPayload<ScanfInfo>);
@@ -850,23 +816,80 @@ struct Inst {
         // op_extra -> AggCopyInfo). Lowered to llvm.memcpy of the storage; the
         // frontend emits it only for a string-free aggregate.
         AggCopy,
+        // 1-bit 4-state equality of two whole unpacked aggregates (payload:
+        // op_extra -> AggEqInfo; op is the left lvalue). The backend expands
+        // the member walk, AND-reducing per-leaf `==` results so LRM 11.4.5
+        // X-propagation is carried exactly; `!=` is a Lnot
+        // of this.
+        AggEq,
 
-        // Dynamic-array operation on a handle lvalue (payload: op_extra ->
-        // DynArrayInfo; op is the dynamic-array handle lvalue). The `sub` field
-        // selects new[] / size() / delete() / whole-array copy (ir::DynArrayOp,
-        // LRM 7.5). new / delete / copy are statements; size yields a 32-bit
-        // int. Lowers to the matching rt_dynarr_* runtime call, with element
-        // access itself riding the ordinary ElemSelect path over the handle's
-        // heap buffer.
-        DynArrayOp,
+        // -- Dynamic-array operations on a handle lvalue (LRM 7.5) --
+        // Each lowers to its rt_dynarr_* runtime call; element access rides
+        // the ordinary ElemSelect path over the handle's heap buffer, not
+        // these tags.
+        // arr = new[size]: (re)allocate to `size` elements, each the element's
+        // power-on value (LRM 7.5.1; payload: op_extra -> DynArrayArg, whose
+        // arg is the element count; op is the handle lvalue).
+        DynArrayNew,
+        // arr = new[size](src): like DynArrayNew, then copy min(size, src.len)
+        // elements from the source handle (payload: op_extra ->
+        // DynArrayNewInitInfo; op is the handle lvalue).
+        DynArrayNewInit,
+        // arr.size() -> 32-bit int (payload: op_type — op is the handle
+        // lvalue, type the interned DynArray type).
+        DynArraySize,
+        // arr.delete(): free the storage, size -> 0 (payload: op_type).
+        DynArrayDelete,
+        // arr = other: deep copy of another dynamic array's storage (value
+        // semantics; payload: op_extra -> DynArrayArg, whose arg is the source
+        // handle lvalue; op is the destination handle lvalue).
+        DynArrayCopy,
 
-        // Queue operation on a handle lvalue (payload: op_extra -> QueueInfo; op
-        // is the queue handle lvalue). The `sub` field selects size / push* /
-        // pop* / insert / delete (ir::QueueOp, LRM 7.10.2). size / pop* yield a
-        // value; the rest are statements. Lowers to the matching rt_queue_*
-        // call; indexed element access q[i] rides the ElemSelect queue path
-        // (ring math over the handle's buffer).
-        QueueOp,
+        // -- Queue operations on a handle lvalue (LRM 7.10.2) --
+        // Each lowers to its rt_queue_* runtime call; indexed element access
+        // q[i] rides the ElemSelect queue path (ring math over the handle's
+        // buffer), not these tags.
+        // q.size() -> 32-bit int (payload: op_type — op is the handle lvalue,
+        // type the interned Queue type).
+        QueueSize,
+        // q.push_back(e) / q.push_front(e): append the element value (payload:
+        // op_extra -> QueueArg; op is the handle lvalue). On a bounded queue an
+        // overflowing element is dropped from the opposite end.
+        QueuePushBack,
+        QueuePushFront,
+        // q.pop_back() / q.pop_front(): remove and return the tail / head
+        // element — the element default on an empty queue (payload: op_type,
+        // like QueueSize).
+        QueuePopBack,
+        QueuePopFront,
+        // q.insert(idx, e) (payload: op_extra -> QueueInsertInfo; op is the
+        // handle lvalue).
+        QueueInsert,
+        // q.delete(idx): remove the element at idx (payload: op_extra ->
+        // QueueArg, whose arg is the position; op is the handle lvalue).
+        QueueDeleteIdx,
+        // q.delete(): remove all elements, size -> 0 (payload: op_type).
+        QueueDeleteAll,
+        // q = other: deep copy of another queue's storage (value semantics;
+        // payload: op_extra -> QueueArg, whose arg is the source handle
+        // lvalue; op is the destination handle lvalue).
+        QueueCopy,
+
+        // -- Array ordering methods on a handle lvalue (LRM 7.12.2) --
+        // Each lowers to its rt_{dynarr,queue}_* runtime call; all carry only
+        // the handle lvalue + interned type (payload: op_type, like
+        // DynArrayDelete). Reverse / Shuffle are element-agnostic; Sort / Rsort
+        // are value-keyed (2-state integral width<=64 or real, guarded in the
+        // frontend). Shuffle draws from the process frame RNG (forces a
+        // coroutine); the backend threads the frame RNG slot at lowering.
+        DynArrayReverse,
+        DynArraySort,
+        DynArrayRsort,
+        DynArrayShuffle,
+        QueueReverse,
+        QueueSort,
+        QueueRsort,
+        QueueShuffle,
 
         // -- Arithmetic (payload: binary) --
         Add,
@@ -929,6 +952,11 @@ struct Inst {
         // are wildcards; unlike the case-equality tags this is X-propagating — a
         // left-operand x/z on a non-wildcard bit yields X.
         WildEq,
+        // The `inside` operator as an expression (payload: op_extra ->
+        // InsideSetInfo; op is the selector), -> 1-bit 4-state. The backend
+        // expands the member tests and OR-reduces them; the statement twin
+        // (`case ... inside`) has its own switch machinery in the frontend.
+        InsideSet,
 
         // -- Floating point (real / shortreal; LRM 6.12) --
         // Operands and result share one float type: the frontend inserts all
@@ -968,9 +996,13 @@ struct Inst {
         FBitcast,
         // real <-> shortreal value conversion (fpext / fptrunc, LRM 6.12.1).
         FResize,
-        // Real math system function $sqrt / $sin / ... (payload: extra ->
-        // RealMathInfo). LRM §20.8.2: each matches the C math library function.
-        RealMath,
+        // One-operand real math system function — $ln / $sqrt / $sin / ...
+        // (payload: op_imm — op is the real operand, imm the ir::RealMathOp).
+        // LRM §20.8.2: each matches the C math library function.
+        RealMathUnary,
+        // Two-operand real math system function — $pow / $atan2 / $hypot
+        // (payload: op_extra -> RealMathBinaryInfo; op is the first operand).
+        RealMathBinary,
 
         // -- Logical, -> 1-bit --
         // Logical and (payload: binary).
@@ -984,7 +1016,7 @@ struct Inst {
         // Ternary cond ? a : b (payload: op_extra -> Select).
         Select,
         // Value-producing short-circuit conditional (payload: op_extra ->
-        // Select). The op is a definite 2-state predicate; the then-branch
+        // SelectLazy). The op is a definite 2-state predicate; the then-branch
         // (predicate 1) and else-branch each yield a value, merged by the
         // backend. Used for &&/|| so the right operand is not evaluated when the
         // left already decides the result (LRM 11.3.5, 11.4.7). Lowers to
@@ -994,6 +1026,12 @@ struct Inst {
         Concat,
         // Replication {count{value}} (payload: repl).
         Repl,
+        // Streaming-concat block reversal {<<S{x}} (LRM 11.4.14.2): reverse
+        // the order of the operand's S-bit blocks, sliced from the LSB (a
+        // final partial block keeps its own width; block 0 lands at the MSB).
+        // A pure per-plane bit permutation of the operand's width (payload:
+        // op_imm — op is the built stream value, imm the slice size S).
+        StreamReverse,
 
         // -- Width --
         // Resize (zero/sign extend or truncate) to a target type (payload: op_type).
@@ -1007,10 +1045,14 @@ struct Inst {
         // llvm switch over a packed key; unmatched keys (incl. any x/z selector)
         // run the default region. See SwitchInfo.
         Switch,
-        // Return from a function (payload: unary, the return value; ignored for a
-        // void function). A real terminator: instructions after it in the same
-        // region are unreachable. Early `return` works without any flag.
+        // Return a value from a non-void function (payload: unary, the return
+        // value). A real terminator: instructions after it in the same region
+        // are unreachable. Early `return` works without any flag.
         Ret,
+        // Return from a void function, task, or fork-child body (payload: none).
+        // A terminator like Ret; tasks branch to their copy-out epilogue instead
+        // of a real `ret`.
+        RetVoid,
         // Call a function (payload: extra -> CallInfo). The result is this
         // instruction's value (absent for a void function called as a statement).
         Call,
@@ -1131,21 +1173,41 @@ struct Inst {
         StrRealtoa,
 
         // -- System tasks --
-        // $display / $write / $fdisplay / $fwrite: format string + variadic args,
-        // with an optional destination descriptor (payload: display -> DisplayInfo).
+        // $display / $write: format string + variadic args to standard output
+        // (payload: display -> DisplayInfo).
         Display,
-        // $fopen: open a file, -> 32-bit descriptor value (payload: op_extra ->
-        // FopenInfo; op is the filename value). LRM §21.3. One-argument form yields
-        // an MCD, two-argument form yields an FD. Lowers to rt_fopen_mcd/_fd.
-        Fopen,
+        // $fdisplay / $fwrite: like Display, but writes the MCD / FD given by
+        // the descriptor operand (payload: fdisplay — op_extra whose op is the
+        // descriptor and extra a DisplayInfo).
+        FDisplay,
+        // Two-argument $fopen(name, mode): open a single file descriptor with
+        // the C stdio mode string, -> 32-bit FD value (payload: binary — l is
+        // the filename value, r the mode string; both packed-ASCII vectors the
+        // backend spills). LRM §21.3. Lowers to rt_fopen_fd.
+        FopenFd,
+        // One-argument $fopen(name): open a fresh multichannel descriptor for
+        // writing, -> 32-bit MCD value (payload: unary, the filename value).
+        // LRM §21.3. Lowers to rt_fopen_mcd.
+        FopenMcd,
         // $fclose: close a file descriptor (payload: unary, the descriptor value).
         // LRM §21.3.2. Lowers to an rt_fclose call.
         Fclose,
-        // $fgetc / $ungetc / $feof / $ftell / $fseek / $rewind: file read /
-        // positioning system functions, each -> a 32-bit integer (payload: extra ->
-        // FileOpInfo, whose `op` picks the routine and `args` are its value
-        // operands). LRM §21.3. Lowers to the matching rt_* call.
-        FileValueOp,
+        // -- File read / positioning system functions (LRM §21.3) --
+        // Each -> a 32-bit integer, lowered to its rt_* call.
+        // $fgetc(fd) -> next byte, or -1 at EOF (payload: unary, the fd).
+        Fgetc,
+        // $ungetc(c, fd) -> c, or -1 on failure (payload: binary — l is the
+        // character, r the fd, in call order).
+        Ungetc,
+        // $feof(fd) -> nonzero once EOF has been seen (payload: unary).
+        Feof,
+        // $ftell(fd) -> current byte offset, or -1 (payload: unary).
+        Ftell,
+        // $fseek(fd, offset, operation) -> 0 on success, -1 on failure
+        // (payload: op_extra -> FseekInfo; op is the fd).
+        Fseek,
+        // $rewind(fd) -> 0, seek to start (payload: unary).
+        Rewind,
         // $fgets: read a line from a descriptor into a packed-vector lvalue, ->
         // character count (payload: binary — l is the destination lvalue, r the
         // descriptor value). LRM §21.3.4. Lowers to rt_fgets.
@@ -1161,10 +1223,13 @@ struct Inst {
         // error code (payload: binary — l is the destination lvalue, r the
         // descriptor value). LRM §21.3.6. Lowers to an rt_ferror call.
         Ferror,
-        // $fscanf / $sscanf: parse a source into output lvalues per a format, ->
-        // conversion count (payload: extra -> ScanfInfo). LRM §21.3.4. Lowers to an
-        // rt_fscanf / rt_sscanf call.
-        Scanf,
+        // $fscanf: parse an FD source into output lvalues per a format, ->
+        // conversion count (payload: extra -> ScanfInfo, whose source is the FD
+        // value). LRM §21.3.4. Lowers to an rt_fscanf call.
+        Fscanf,
+        // $sscanf: like Fscanf, but the source is a packed-ASCII string value
+        // the backend spills (payload: extra -> ScanfInfo). Lowers to rt_sscanf.
+        Sscanf,
         // $fread into a single packed-vector lvalue (payload: binary — l is the
         // destination lvalue, r the descriptor value), -> bytes read. LRM
         // §21.3.4. Lowers to an rt_fread call.
@@ -1182,10 +1247,9 @@ struct Inst {
         // mechanism a suspend is observationally an exit, so both are treated
         // identically apart from the banner's task name.
         Finish,
-        // priority-case violation report (payload: extra -> FinishInfo, reusing
-        // the banner prefix; arg is unused). LRM 12.5.3: a `priority case` with
-        // no default reached at runtime with no matching item. Non-fatal —
-        // lowers to an rt_case_violation call that warns and returns.
+        // unique/priority violation report (payload: extra -> CaseViolInfo).
+        // LRM 12.5.3 / 12.4.2. Non-fatal — lowers to an rt_case_violation call
+        // that warns and returns.
         CaseViol,
         // Severity system task report ($info / $warning / $error / $fatal, LRM
         // 20.10) or the default failure of an immediate assertion (LRM 16.3),
@@ -1233,16 +1297,19 @@ struct Inst {
         // $random: IEEE Annex N reference PRNG, -> 32-bit signed two-state (payload:
         // none). Lowers to an `rt_random` call; the value is always known (no
         // x/z). The unseeded (process-global) form only; the seeded form
-        // `$random(seed)` lowers to DistCall(Uniform, ...) instead.
+        // `$random(seed)` lowers to DistBinary(Uniform, ...) instead.
         Random,
-        // A probabilistic distribution function (LRM §20.15.2) or the seeded
-        // $random(seed) (§20.15.1). Payload: extra -> DistInfo (the DistOp plus
-        // the value operands: the seed word, then the distribution parameters).
-        // Lowers to the matching rt_dist_* call, returning an i64 with the
-        // updated seed packed in [32,64) and the signed integer draw in [0,32);
-        // the frontend slices the seed back to the inout lvalue and takes the
-        // draw. The result is always known (no x/z).
-        DistCall,
+        // A probabilistic distribution function (LRM §20.15.2), split by
+        // parameter count; DistBinary also covers the seeded $random(seed)
+        // (§20.15.1, Uniform over the full int32 span). Payload: op_extra —
+        // op is the seed word, extra a DistUnaryInfo / DistBinaryInfo carrying
+        // the parameter(s) and the ir::DistOp. Lowers to the matching
+        // rt_dist_* call, returning an i64 with the updated seed packed in
+        // [32,64) and the signed integer draw in [0,32); the frontend slices
+        // the seed back to the inout lvalue and takes the draw. The result is
+        // always known (no x/z).
+        DistUnary,
+        DistBinary,
         // $urandom (LRM §18.13.1): a per-process xoshiro256++ draw, -> a 32-bit
         // unsigned two-state `int`. No operand (payload: none); reads and
         // advances the process's coroutine-frame RNG state, inlined by the
@@ -1268,9 +1335,17 @@ struct Inst {
         // value). Tallies the operand's bits whose 4-state value is in the
         // info mask (LRM 20.9), -> a definite 2-state 32-bit `int`. $countones
         // masks CountOne; $isunknown is `CountBits(CountX|CountZ) != 0`; the
-        // one-hot forms compare `CountBits(CountOne)` against 1. A constant
-        // operand folds in slang and never reaches this tag.
+        // one-hot forms have their own tags below. A constant operand folds in
+        // slang and never reaches this tag.
         CountBits,
+        // $onehot / $onehot0: exactly-one / at-most-one definite-1 bit in the
+        // operand (LRM 20.9), -> a definite 1-bit result (payload: unary).
+        // x/z bits are not definite 1, so they never count.
+        OneHot,
+        OneHot0,
+        // $isunknown: nonzero iff any operand bit is x/z (LRM 20.9), -> a
+        // definite 1-bit result (payload: unary).
+        IsUnknown,
         // $test$plusargs(str) (payload: extra -> TestPlusArgsInfo), -> a 1-bit
         // definite boolean. LRM §21.6: nonzero iff some command-line plusarg's
         // prefix matches every character of `str`. Lowers to an
@@ -1298,19 +1373,20 @@ struct Inst {
         Arg,
         Local,
         Repl,
+        // The op_imm member: one operand plus a 32-bit immediate.
+        OpImm,
         OpExtra,
         Extra,
         Call,
         TaskCall,
         Display,
+        // The op_extra member with a DisplayInfo record: op is the descriptor.
+        FDisplay,
         TimeFormat,
         Wait,
-        FileOp,
         Sformat,
         Sformatf,
         Scanf,
-        RealMath,
-        Dist,
         Severity,
     };
 
@@ -1361,6 +1437,14 @@ struct Inst {
             // Replication count.
             uint32_t count;
         } repl;
+        // One operand plus a 32-bit immediate (real_math_unary's RealMathOp,
+        // stream_reverse's slice size).
+        struct {
+            // The operand value.
+            Index op;
+            // Tag-defined immediate.
+            uint32_t imm;
+        } op_imm;
         // Primary operand plus a handle to an extra struct (select, part_select, cond).
         struct {
             // Condition / base operand.
@@ -1413,6 +1497,11 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Ret:
         case T::Delay:
         case T::Fclose:
+        case T::FopenMcd:
+        case T::Fgetc:
+        case T::Feof:
+        case T::Ftell:
+        case T::Rewind:
         case T::Fflush:
         case T::DumpFile:
         case T::StrLen:
@@ -1427,6 +1516,9 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Clog2:
         case T::Ctz:
         case T::Clz:
+        case T::OneHot:
+        case T::OneHot0:
+        case T::IsUnknown:
         case T::UrandomSeeded:
             return K::Unary;
 
@@ -1483,6 +1575,10 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Fgets:
         case T::Ferror:
         case T::FreadWord:
+        // Two-argument $fopen: l is the filename, r the mode string.
+        case T::FopenFd:
+        // $ungetc: l is the character, r the descriptor.
+        case T::Ungetc:
             return K::Binary;
 
         case T::Resize:
@@ -1493,6 +1589,24 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::FBitcast:
         case T::FResize:
         case T::HandleDeref:
+        // Handle-lvalue queue / dynamic-array ops with no extra operand: op is
+        // the handle, type the interned Queue / DynArray type.
+        case T::QueueSize:
+        case T::QueuePopBack:
+        case T::QueuePopFront:
+        case T::QueueDeleteAll:
+        case T::DynArraySize:
+        case T::DynArrayDelete:
+        // Array ordering methods (LRM 7.12.2): op is the handle, type the
+        // interned DynArray / Queue type; no extra operand.
+        case T::DynArrayReverse:
+        case T::DynArraySort:
+        case T::DynArrayRsort:
+        case T::DynArrayShuffle:
+        case T::QueueReverse:
+        case T::QueueSort:
+        case T::QueueRsort:
+        case T::QueueShuffle:
             return K::OpType;
         case T::ClassNew:
             return K::Ref;
@@ -1507,22 +1621,23 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::TaskCall;
         case T::Display:
             return K::Display;
-        case T::FileValueOp:
-            return K::FileOp;
+        case T::FDisplay:
+            return K::FDisplay;
         case T::Sformat:
             return K::Sformat;
         case T::Sformatf:
             return K::Sformatf;
-        case T::Scanf:
+        case T::Fscanf:
+        case T::Sscanf:
             return K::Scanf;
-        case T::RealMath:
-            return K::RealMath;
-        case T::DistCall:
-            return K::Dist;
+        case T::RealMathUnary:
+        case T::StreamReverse:
+            return K::OpImm;
         case T::TimeFormat:
             return K::TimeFormat;
         case T::Break:
         case T::Continue:
+        case T::RetVoid:
         case T::DumpVars:
         case T::DumpOff:
         case T::DumpOn:
@@ -1555,11 +1670,22 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::ElemSelect:
         case T::MemberSelect:
         case T::AggCopy:
-        case T::DynArrayOp:
-        case T::QueueOp:
+        case T::AggEq:
+        case T::DynArrayNew:
+        case T::DynArrayNewInit:
+        case T::DynArrayCopy:
+        case T::QueuePushBack:
+        case T::QueuePushFront:
+        case T::QueueInsert:
+        case T::QueueDeleteIdx:
+        case T::QueueCopy:
         case T::Cond:
         case T::Switch:
-        case T::Fopen:
+        case T::Fseek:
+        case T::RealMathBinary:
+        case T::DistUnary:
+        case T::DistBinary:
+        case T::InsideSet:
         case T::FreadMem:
         case T::ReadMem:
         case T::StrPutc:
@@ -1612,6 +1738,13 @@ public:
         return index_slice(root_);
     }
 
+    // The whole extra side-table, raw. For content hashing / serialization
+    // (regions, operand runs, packed strings, records — byte-stable since the
+    // padding-free ExtraPayload guarantee); typed access stays extra_data().
+    std::span<const uint32_t> extra_raw() const {
+        return { extra_.data(), extra_.size() };
+    }
+
     // The instructions of a region (e.g. a cond's then/else branch), in order.
     std::span<const Index> region(ExtraSlice r) const {
         return index_slice(r);
@@ -1662,8 +1795,9 @@ public:
     //
     // NOTE: not exhaustive for the variadic system tasks — a tag whose args are
     // an extra slice can also carry a scalar operand outside it, which one
-    // span cannot express: Display omits its fd, Scanf its source. A pass
-    // needing every use of those tags must read their info records directly.
+    // span cannot express: FDisplay omits its fd, Fscanf/Sscanf their source,
+    // InsideSet its member operands. A pass needing every use of those tags
+    // must read their info records directly.
     std::span<const Index> operands(Index inst, std::array<Index, 3>& scratch) const;
 
 private:

@@ -107,16 +107,58 @@ const char* tag_name(Inst::Tag tag) {
             return "handle_deref";
         case T::AggCopy:
             return "agg_copy";
+        case T::AggEq:
+            return "agg_eq";
         case T::Load:
             return "load";
         case T::Store:
             return "store";
         case T::StoreNb:
             return "store_nb";
-        case T::DynArrayOp:
-            return "dyn_array_op";
-        case T::QueueOp:
-            return "queue_op";
+        case T::DynArrayNew:
+            return "dyn_array_new";
+        case T::DynArrayNewInit:
+            return "dyn_array_new_init";
+        case T::DynArraySize:
+            return "dyn_array_size";
+        case T::DynArrayDelete:
+            return "dyn_array_delete";
+        case T::DynArrayCopy:
+            return "dyn_array_copy";
+        case T::QueueSize:
+            return "queue_size";
+        case T::QueuePushBack:
+            return "queue_push_back";
+        case T::QueuePushFront:
+            return "queue_push_front";
+        case T::QueuePopBack:
+            return "queue_pop_back";
+        case T::QueuePopFront:
+            return "queue_pop_front";
+        case T::QueueInsert:
+            return "queue_insert";
+        case T::QueueDeleteIdx:
+            return "queue_delete_idx";
+        case T::QueueDeleteAll:
+            return "queue_delete_all";
+        case T::QueueCopy:
+            return "queue_copy";
+        case T::DynArrayReverse:
+            return "dyn_array_reverse";
+        case T::DynArraySort:
+            return "dyn_array_sort";
+        case T::DynArrayRsort:
+            return "dyn_array_rsort";
+        case T::DynArrayShuffle:
+            return "dyn_array_shuffle";
+        case T::QueueReverse:
+            return "queue_reverse";
+        case T::QueueSort:
+            return "queue_sort";
+        case T::QueueRsort:
+            return "queue_rsort";
+        case T::QueueShuffle:
+            return "queue_shuffle";
         case T::StoreNbDelay:
             return "store_nb_delay";
         case T::StoreNbEvent:
@@ -175,6 +217,8 @@ const char* tag_name(Inst::Tag tag) {
             return "casex_eq";
         case T::WildEq:
             return "wild_eq";
+        case T::InsideSet:
+            return "inside_set";
         case T::Land:
             return "land";
         case T::Lor:
@@ -189,6 +233,8 @@ const char* tag_name(Inst::Tag tag) {
             return "concat";
         case T::Repl:
             return "repl";
+        case T::StreamReverse:
+            return "stream_reverse";
         case T::Resize:
             return "resize";
         case T::Cond:
@@ -197,6 +243,8 @@ const char* tag_name(Inst::Tag tag) {
             return "switch";
         case T::Ret:
             return "ret";
+        case T::RetVoid:
+            return "ret_void";
         case T::Call:
             return "call";
         case T::TaskCall:
@@ -261,6 +309,8 @@ const char* tag_name(Inst::Tag tag) {
             return "str_realtoa";
         case T::Display:
             return "display";
+        case T::FDisplay:
+            return "fdisplay";
         case T::Finish:
             return "finish";
         case T::CaseViol:
@@ -273,12 +323,24 @@ const char* tag_name(Inst::Tag tag) {
             return "continue";
         case T::Fflush:
             return "fflush";
-        case T::Fopen:
-            return "fopen";
+        case T::FopenFd:
+            return "fopen_fd";
+        case T::FopenMcd:
+            return "fopen_mcd";
         case T::Fclose:
             return "fclose";
-        case T::FileValueOp:
-            return "file_op";
+        case T::Fgetc:
+            return "fgetc";
+        case T::Ungetc:
+            return "ungetc";
+        case T::Feof:
+            return "feof";
+        case T::Ftell:
+            return "ftell";
+        case T::Fseek:
+            return "fseek";
+        case T::Rewind:
+            return "rewind";
         case T::Fgets:
             return "fgets";
         case T::Sformat:
@@ -287,8 +349,10 @@ const char* tag_name(Inst::Tag tag) {
             return "sformatf";
         case T::Ferror:
             return "ferror";
-        case T::Scanf:
-            return "scanf";
+        case T::Fscanf:
+            return "fscanf";
+        case T::Sscanf:
+            return "sscanf";
         case T::FreadWord:
             return "fread_word";
         case T::FreadMem:
@@ -315,8 +379,10 @@ const char* tag_name(Inst::Tag tag) {
             return "timeformat";
         case T::Random:
             return "random";
-        case T::DistCall:
-            return "dist_call";
+        case T::DistUnary:
+            return "dist_unary";
+        case T::DistBinary:
+            return "dist_binary";
         case T::Urandom:
             return "urandom";
         case T::UrandomSeeded:
@@ -327,6 +393,12 @@ const char* tag_name(Inst::Tag tag) {
             return "clog2";
         case T::CountBits:
             return "count_bits";
+        case T::OneHot:
+            return "onehot";
+        case T::OneHot0:
+            return "onehot0";
+        case T::IsUnknown:
+            return "isunknown";
         case T::TestPlusArgs:
             return "test_plusargs";
         case T::ValuePlusArgs:
@@ -369,8 +441,10 @@ const char* tag_name(Inst::Tag tag) {
             return "fbitcast";
         case T::FResize:
             return "fresize";
-        case T::RealMath:
-            return "real_math";
+        case T::RealMathUnary:
+            return "real_math_unary";
+        case T::RealMathBinary:
+            return "real_math_binary";
     }
 
     return "?";
@@ -546,12 +620,18 @@ private:
                     os_ << '"' << ir_.extra_bytes(info.str, info.str_len) << '"';
                     break;
                 }
-                // Finish / CaseViol carry a FinishInfo (banner bytes + level), not a
-                // variadic operand slice — render the banner rather than mis-reading
-                // the packed bytes as instruction indices.
-                if (tag == Inst::Tag::Finish || tag == Inst::Tag::CaseViol) {
+                // Finish / CaseViol carry a banner-bytes record, not a variadic
+                // operand slice — render the banner rather than mis-reading the
+                // packed bytes as instruction indices.
+                if (tag == Inst::Tag::Finish) {
                     const auto info = ir_.extra_data<FinishInfo>(p.extra);
                     os_ << '"' << ir_.extra_bytes(info.banner, info.banner_len) << "\", " << info.arg;
+                    break;
+                }
+                if (tag == Inst::Tag::CaseViol) {
+                    const auto info = ir_.extra_data<CaseViolInfo>(p.extra);
+                    os_ << '"' << ir_.extra_bytes(info.banner, info.banner_len) << "\", "
+                        << info.kind;
                     break;
                 }
                 // concat: variadic operands.
@@ -573,19 +653,20 @@ private:
                 }
                 break;
             }
-            case Inst::PayloadKind::Severity: {
-                const auto info = ir_.extra_data<SeverityInfo>(p.extra);
-                os_ << "level" << info.level << ", \"" << ir_.extra_bytes(info.banner, info.banner_len)
-                    << "\", \"" << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
+            case Inst::PayloadKind::FDisplay: {
+                const auto info = ir_.extra_data<DisplayInfo>(p.op_extra.extra);
+                ref(p.op_extra.op);
+                os_ << ", \"" << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
                 for (Index a : ir_.region(info.args)) {
                     os_ << ", ";
                     ref(a);
                 }
                 break;
             }
-            case Inst::PayloadKind::FileOp: {
-                const auto info = ir_.extra_data<FileOpInfo>(p.extra);
-                os_ << "op" << info.op;
+            case Inst::PayloadKind::Severity: {
+                const auto info = ir_.extra_data<SeverityInfo>(p.extra);
+                os_ << "level" << info.level << ", \"" << ir_.extra_bytes(info.banner, info.banner_len)
+                    << "\", \"" << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
                 for (Index a : ir_.region(info.args)) {
                     os_ << ", ";
                     ref(a);
@@ -621,24 +702,10 @@ private:
                 }
                 break;
             }
-            case Inst::PayloadKind::RealMath: {
-                const auto info = ir_.extra_data<RealMathInfo>(p.extra);
-                os_ << "op" << info.op;
-                for (Index a : ir_.region(info.args)) {
-                    os_ << ", ";
-                    ref(a);
-                }
+            case Inst::PayloadKind::OpImm:
+                os_ << "op" << p.op_imm.imm << ", ";
+                ref(p.op_imm.op);
                 break;
-            }
-            case Inst::PayloadKind::Dist: {
-                const auto info = ir_.extra_data<DistInfo>(p.extra);
-                os_ << "op" << info.op;
-                for (Index a : ir_.region(info.args)) {
-                    os_ << ", ";
-                    ref(a);
-                }
-                break;
-            }
             case Inst::PayloadKind::TimeFormat: {
                 const auto info = ir_.extra_data<TimeFormatInfo>(p.extra);
                 ref(info.units);
@@ -695,6 +762,14 @@ private:
                 ref(p.op_extra.op);
                 os_ << " = ";
                 ref(info.src);
+                os_ << ")\n";
+                break;
+            }
+            case Inst::Tag::AggEq: {
+                const AggEqInfo info = ir_.extra_data<AggEqInfo>(p.op_extra.extra);
+                ref(p.op_extra.op);
+                os_ << " == ";
+                ref(info.rhs);
                 os_ << ")\n";
                 break;
             }

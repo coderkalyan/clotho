@@ -469,6 +469,18 @@ struct Anchor {
     // True when the scope's definition state type is instantiated more than
     // once: address through a runtime base-pointer load.
     bool indirect = false;
+    // Lowest process index owned by this scope (~0 when it owns none). An owned
+    // group's sched flag is addressed instance-base + (proc - first_proc), the
+    // def-local ordinal — identical slot, def-relative form (dedup prep).
+    uint32_t first_proc = ~0u;
+    // Reused definitions only: pointer global holding &proc_sched[first_proc],
+    // stored by main; a unique definition folds to the absolute constant.
+    llvm::GlobalVariable* sched_sym = nullptr;
+    // Lowest VCD dump-var index of the scope's own dumped signals (-1: none).
+    // Touch sites address a dumped signal as vcd base + def-local offset.
+    int32_t first_vcd = -1;
+    // Reused definitions only: i32 global holding first_vcd, stored by main.
+    llvm::GlobalVariable* vcd_sym = nullptr;
 };
 
 // One function-frame local: its `{ i(2W), iW }` slot type and width / domain.
@@ -525,6 +537,9 @@ public:
     void run() {
         build_state_types();
         emit_state_global(); // before any body: storage_ptr resolves through the anchors
+        if (std::getenv("CLOTHO_DEDUP_STAT") != nullptr) {
+            report_dedup_stat();
+        }
         compute_subscription_order();
         compute_fusion_groups(); // before build_wait_queues: bucket capacities count group subscriptions
         if (std::getenv("CLOTHO_COMB_FUSE_STAT") != nullptr) {
@@ -955,6 +970,23 @@ private:
         return t.kind != Type::Kind::UnpackedArray && !(t.kind == Type::Kind::Struct && !t.is_packed);
     }
 
+    // Derive member `field_index`'s lvalue from an aggregate lvalue: push the
+    // constant field index onto the aggregate GEP path and resolve the leaf
+    // metadata if the member is a scalar/string (a struct/array member stays
+    // interior for a further select). Shared by MemberSelect and the AggEq
+    // member walk.
+    LValue agg_member(LValue lv, Ref struct_type, uint32_t field_index) {
+        const Type& st = std::get<Type>(mod_.pool.get(struct_type));
+        const Ref   mt = mod_.pool.struct_fields(st.fields_id)[field_index].type;
+        lv.agg_path.push_back(b_.getInt32(field_index));
+        lv.agg_field_path.push_back(field_index);
+        lv.agg_leaf = is_leaf_type(mt);
+        if (lv.agg_leaf) {
+            fill_agg_leaf(lv, mt);
+        }
+        return lv;
+    }
+
     // Byte offset of a GEP field-index path from the root state struct, per the
     // module's DataLayout. Used where the runtime needs raw offsets (the NBA
     // commit loop's meta table).
@@ -988,6 +1020,10 @@ private:
                                  std::vector<bool>& claimed, const std::string& hier) {
         const auto aid = static_cast<uint32_t>(anchors_.size());
         anchors_.push_back(Anchor{ .path = path, .name = hier });
+        if (scope.id >= anchor_of_scope_.size()) {
+            anchor_of_scope_.resize(scope.id + 1, SignalSlot::no_anchor);
+        }
+        anchor_of_scope_[scope.id] = aid;
         std::vector<llvm::Type*> fields;
         for (uint32_t k = 0; k < scope.signals.size(); ++k) {
             const auto si = static_cast<uint32_t>(scope.signals[k]);
@@ -1518,12 +1554,29 @@ private:
         state_gv->setAlignment(llvm::Align(64));
         state_global_ = state_gv;
 
+        const auto procs = mod_.processes();
+        for (uint32_t k = 0; k < procs.size(); ++k) {
+            const uint32_t sc = procs[k].scope;
+            if (sc == Process::no_scope || sc >= anchor_of_scope_.size() ||
+                anchor_of_scope_[sc] == SignalSlot::no_anchor) {
+                continue;
+            }
+            uint32_t& first = anchors_[anchor_of_scope_[sc]].first_proc;
+            first           = std::min(first, k);
+        }
+
         auto* ptr = llvm::PointerType::getUnqual(ctx_);
         for (Anchor& a : anchors_) {
             if (a.indirect) {
                 a.sym = new llvm::GlobalVariable(llmod_, ptr, false, llvm::GlobalValue::InternalLinkage,
                                                  llvm::ConstantPointerNull::get(ptr),
                                                  "clotho.inst." + a.name);
+                if (a.first_proc != ~0u) {
+                    a.sched_sym = new llvm::GlobalVariable(llmod_, ptr, false,
+                                                           llvm::GlobalValue::InternalLinkage,
+                                                           llvm::ConstantPointerNull::get(ptr),
+                                                           "clotho.inst." + a.name + ".sched");
+                }
                 continue;
             }
             std::vector<llvm::Constant*> idx;
@@ -1534,6 +1587,25 @@ private:
             }
             a.sym = llvm::ConstantExpr::getInBoundsGetElementPtr(state_ty_, state_gv, idx);
         }
+    }
+
+    // Materialize the group's deferred def-relative context at the current
+    // insert point (a function entry, so it dominates every use): the sched-flag
+    // pointer (instance sched base + def-local ordinal) and, when the group can
+    // register NBA blocks, the instance's block-id base (block_register adds the
+    // group-local block ordinal). No-op when lower_group chose the absolute
+    // constants; a dead base load in a group that ends up registering no block
+    // is swept by the tier-0 dce pass.
+    void materialize_group_ctx() {
+        if (blk_base_sym_ != nullptr) {
+            blk_base_val_ = b_.CreateLoad(b_.getInt32Ty(), blk_base_sym_);
+        }
+        if (sched_ptr_ != nullptr) {
+            return;
+        }
+        const Anchor& a    = anchors_[sched_anchor_];
+        llvm::Value*  base = b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), a.sched_sym);
+        sched_ptr_ = b_.CreateInBoundsGEP(b_.getInt32Ty(), base, b_.getInt32(sched_ordinal_));
     }
 
     // Global holding &state->shadow; created on first use, initialized in
@@ -1613,9 +1685,48 @@ private:
         frame_slots_.clear(); // a process has no frame; deinit sees only temps
 
         // This group's scheduled-flag slot: &clotho.proc_sched[proc_index]. A
-        // constant GEP so it is valid in any block of the function.
-        sched_ptr_ = llvm::ConstantExpr::getInBoundsGetElementPtr(
-          sched_arr_ty_, sched_gv_, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(proc_index) });
+        // constant GEP so it is valid in any block of the function. Dedup prep:
+        // a group fully inside one reused-definition instance instead loads the
+        // instance's sched base and indexes the def-local ordinal — the same
+        // slot, materialized at function entry (materialize_sched_ptr); a
+        // unique-definition or cross-instance group keeps the folded constant.
+        sched_anchor_ = SignalSlot::no_anchor;
+        {
+            const uint32_t sc   = proc.scope;
+            bool           same = sc != Process::no_scope;
+            for (const uint32_t m : members) {
+                same = same && all[m].scope == sc;
+            }
+            if (same && sc < anchor_of_scope_.size() &&
+                anchor_of_scope_[sc] != SignalSlot::no_anchor) {
+                const Anchor& a = anchors_[anchor_of_scope_[sc]];
+                if (a.sched_sym != nullptr) {
+                    sched_anchor_  = anchor_of_scope_[sc];
+                    sched_ordinal_ = proc_index - a.first_proc;
+                }
+            }
+        }
+        sched_ptr_ = sched_anchor_ != SignalSlot::no_anchor
+                       ? nullptr
+                       : llvm::ConstantExpr::getInBoundsGetElementPtr(
+                           sched_arr_ty_, sched_gv_,
+                           llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(proc_index) });
+
+        // Same-eligibility NBA prep: the group's block registrations pass
+        // (instance block base + group-local ordinal) instead of the absolute
+        // block id — identical value (a group's blocks are id-contiguous by
+        // construction: block_register only runs while its group lowers), in the
+        // def-relative form a shared body needs. main stores the base after
+        // lowering, once the ids are known.
+        blk_base_sym_      = nullptr;
+        blk_base_val_      = nullptr;
+        group_first_block_ = -1;
+        if (sched_anchor_ != SignalSlot::no_anchor && nba_block_enqueue_fn_ != nullptr) {
+            blk_base_sym_ = new llvm::GlobalVariable(
+              llmod_, b_.getInt32Ty(), false, llvm::GlobalValue::InternalLinkage, b_.getInt32(0),
+              "clotho.inst." + anchors_[sched_anchor_].name + ".blk.g" +
+                std::to_string(sched_ordinal_));
+        }
 
         // Name a process by its index: @<module>.p<index>. Source-offset naming
         // would collide once the design has multiple instances of one module —
@@ -1662,6 +1773,7 @@ private:
             hdl_              = nullptr;
             auto* entry_bb = llvm::BasicBlock::Create(ctx_, "entry", fn_);
             b_.SetInsertPoint(entry_bb);
+            materialize_group_ctx();
             // Run each member body per activation, freeing its string temporaries
             // afterward — a thunk has no frame to persist them in (a per-call cost
             // paid only by string-using bodies). frame_slots_ is empty for a
@@ -1760,6 +1872,7 @@ private:
         // Identify the coroutine; coro.alloc lets the optimizer skip the dynamic
         // frame allocation when the frame can live on the caller's stack.
         b_.SetInsertPoint(entry);
+        materialize_group_ctx();
         auto* id   = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_id), { b_.getInt32(0), null, null, null });
         auto* need = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_alloc), { id });
         b_.CreateCondBr(need, alloc_bb, begin_bb);
@@ -2441,6 +2554,10 @@ private:
         // intra-body @event waits, exactly like a process's proc_sched slot.
         frame_     = b_.CreateAlloca(frame_ty_, nullptr, "frame");
         sched_ptr_ = b_.CreateAlloca(b_.getInt32Ty(), nullptr, "task_sched");
+        sched_anchor_      = SignalSlot::no_anchor;
+        blk_base_sym_      = nullptr;
+        blk_base_val_      = nullptr;
+        group_first_block_ = -1;
 
         auto* trap_bb    = llvm::BasicBlock::Create(ctx_, "coro.trap", fn_);
         auto* free_bb    = llvm::BasicBlock::Create(ctx_, "coro.free", fn_);
@@ -2875,6 +2992,18 @@ private:
                 idx.push_back(b_.getInt32(f));
             }
             b_.CreateStore(b_.CreateInBoundsGEP(state_ty_, state, idx), a.sym);
+            if (a.sched_sym != nullptr) {
+                b_.CreateStore(
+                  b_.CreateInBoundsGEP(sched_arr_ty_, sched_gv_,
+                                       { b_.getInt32(0), b_.getInt32(a.first_proc) }),
+                  a.sched_sym);
+            }
+            if (a.vcd_sym != nullptr) {
+                b_.CreateStore(b_.getInt32(static_cast<uint32_t>(a.first_vcd)), a.vcd_sym);
+            }
+        }
+        for (const auto& [sym, first_id] : group_blk_bases_) {
+            b_.CreateStore(b_.getInt32(first_id), sym);
         }
         init_state();
         if (shadow_base_gv_ != nullptr) {
@@ -3045,8 +3174,71 @@ private:
     // guards each whole bucket with a single branch on the matching transition
     // fact. Both kinds share the { handle, flag_ptr } element type.
     void build_wait_queues() {
-        const auto       sigs = mod_.signals();
-        const WaitCounts c    = wait_counts();
+        const auto sigs = mod_.signals();
+        WaitCounts c    = wait_counts();
+
+        // Module-dedup prep, option (a): every instance of a reused definition
+        // gets the per-def MAXIMUM bucket capacity for each def-local signal,
+        // so twin bodies emit identical fixed-trip service scans regardless of
+        // per-instance fan-out (subscribers cross instance boundaries through
+        // ports). A padded slot is zeroinit — null flag pointer — and the
+        // inline scan skips it (emit_static_scan_rt `padded`). The true
+        // per-instance counts are kept for the NBA meta table, whose
+        // commit-side scans stay exact and check-free.
+        wait_sta_true_.assign(sigs.size(), { 0, 0, 0 });
+        wait_sta_padded_.assign(sigs.size(), { 0, 0, 0 });
+        for (uint32_t i = 0; i < sigs.size(); ++i) {
+            wait_sta_true_[i] = c.sta[i];
+        }
+        {
+            // Def-local signal table per scope occurrence: slot.path's last
+            // element is the signal's field index within its own scope.
+            std::vector<std::vector<Signal>> by_anchor(anchors_.size());
+            for (uint32_t i = 0; i < sigs.size(); ++i) {
+                const SignalSlot& sl = slots_[i];
+                if (sl.anchor == SignalSlot::no_anchor) {
+                    continue;
+                }
+                const auto k = sl.path.back();
+                auto&      v = by_anchor[sl.anchor];
+                if (k >= v.size()) {
+                    v.resize(k + 1, Signal{ ~0u });
+                }
+                v[k] = static_cast<Signal>(i);
+            }
+            ankerl::unordered_dense::map<llvm::StructType*, std::vector<uint32_t>> groups;
+            for (uint32_t a = 0; a < anchors_.size(); ++a) {
+                groups[anchors_[a].ty].push_back(a);
+            }
+            for (const auto& [ty, members] : groups) {
+                if (members.size() < 2) {
+                    continue;
+                }
+                const size_t nsig = by_anchor[members.front()].size();
+                for (size_t j = 0; j < nsig; ++j) {
+                    for (uint32_t e = 0; e < 3; ++e) {
+                        uint32_t max_sta = 0, max_dyn = 0;
+                        uint32_t min_sta = ~0u;
+                        for (const uint32_t a : members) {
+                            const auto si = static_cast<uint32_t>(by_anchor[a][j]);
+                            max_sta       = std::max(max_sta, c.sta[si][e]);
+                            min_sta       = std::min(min_sta, c.sta[si][e]);
+                            max_dyn       = std::max(max_dyn, c.dyn[si][e]);
+                        }
+                        // The padded (null-checked) scan shape must be uniform
+                        // across every instance of the def — including the one
+                        // whose true count equals the maximum — or twin bodies
+                        // would still diverge.
+                        for (const uint32_t a : members) {
+                            const auto si = static_cast<uint32_t>(by_anchor[a][j]);
+                            wait_sta_padded_[si][e] = min_sta < max_sta ? 1 : 0;
+                            c.sta[si][e]            = max_sta;
+                            c.dyn[si][e]            = max_dyn;
+                        }
+                    }
+                }
+            }
+        }
         wait_sta_gv_.assign(sigs.size(), { nullptr, nullptr, nullptr });
         wait_sta_ty_.assign(sigs.size(), { nullptr, nullptr, nullptr });
         wait_sta_cap_.assign(sigs.size(), { 0, 0, 0 });
@@ -3322,19 +3514,11 @@ private:
     // plain per-activation thunk instead of a coroutine (see the thunk path in
     // lower_group) and can be fused with peers sharing its sensitivity. Shared
     // by compute_fusion_groups and the thunk decision.
-    // True when instruction `i` in `ir` is an array shuffle (DynArrayOp/QueueOp
-    // with sub == Shuffle), which draws from the process frame RNG like $urandom.
+    // True when instruction `i` in `ir` is an array shuffle (DynArrayShuffle /
+    // QueueShuffle), which draws from the process frame RNG like $urandom.
     static bool is_shuffle(const Ir& ir, Index i) {
         const Inst::Tag tag = ir.tag(i);
-        if (tag == Inst::Tag::DynArrayOp) {
-            return ir.extra_data<DynArrayInfo>(ir.payload(i).op_extra.extra).sub ==
-                   static_cast<uint32_t>(DynArrayOp::Shuffle);
-        }
-        if (tag == Inst::Tag::QueueOp) {
-            return ir.extra_data<QueueInfo>(ir.payload(i).op_extra.extra).sub ==
-                   static_cast<uint32_t>(QueueOp::Shuffle);
-        }
-        return false;
+        return tag == Inst::Tag::DynArrayShuffle || tag == Inst::Tag::QueueShuffle;
     }
 
     // True when a process body contains any node that draws from the per-process
@@ -3390,12 +3574,9 @@ private:
                 // An array shuffle draws from the frame RNG (same reason as the
                 // $urandom family); other dynarr/queue ops carry no frame state
                 // and stay thunk-eligible, so only Shuffle disqualifies.
-                case Inst::Tag::DynArrayOp:
-                case Inst::Tag::QueueOp:
-                    if (is_shuffle(p.ir, idx)) {
-                        return false;
-                    }
-                    break;
+                case Inst::Tag::DynArrayShuffle:
+                case Inst::Tag::QueueShuffle:
+                    return false;
                 // A deferred store (`x <= #d y` / `x <= @e y`) arms a record with an
                 // observable future effect; keep it out of thunk/fused groups (a
                 // spurious comb-fused run would arm a spurious store), routing it
@@ -3502,6 +3683,9 @@ private:
                 case Inst::Tag::Ctz:
                 case Inst::Tag::Clz:
                 case Inst::Tag::CountBits:
+                case Inst::Tag::OneHot:
+                case Inst::Tag::OneHot0:
+                case Inst::Tag::IsUnknown:
                 case Inst::Tag::Sll:
                 case Inst::Tag::Srl:
                 case Inst::Tag::Sra:
@@ -3515,6 +3699,7 @@ private:
                 case Inst::Tag::CasezEq:
                 case Inst::Tag::CasexEq:
                 case Inst::Tag::WildEq:
+                case Inst::Tag::InsideSet:
                 case Inst::Tag::FAdd:
                 case Inst::Tag::FSub:
                 case Inst::Tag::FMul:
@@ -3532,7 +3717,8 @@ private:
                 case Inst::Tag::FtoITrunc:
                 case Inst::Tag::FBitcast:
                 case Inst::Tag::FResize:
-                case Inst::Tag::RealMath:
+                case Inst::Tag::RealMathUnary:
+                case Inst::Tag::RealMathBinary:
                 case Inst::Tag::Land:
                 case Inst::Tag::Lor:
                 case Inst::Tag::Lnot:
@@ -3540,6 +3726,7 @@ private:
                 case Inst::Tag::SelectLazy:
                 case Inst::Tag::Concat:
                 case Inst::Tag::Repl:
+                case Inst::Tag::StreamReverse:
                 case Inst::Tag::Resize:
                 case Inst::Tag::Cond:
                 case Inst::Tag::Switch:
@@ -3600,6 +3787,136 @@ private:
     // the count V1 fusion left in singleton groups (the comb-fusion
     // opportunity). Measurement only, printed when CLOTHO_COMB_FUSE_STAT is
     // set; the grouping itself is not landed.
+    // Module-deduplication detector (CLOTHO_DEDUP_STAT): canonicalize each
+    // attributed process body to definition-relative form and report how many
+    // bodies across instances of reused definitions are byte-identical — the
+    // shareable population one compiled body per definition would cover, and
+    // what blocks the rest. Read-only; sharing itself is future work.
+    //
+    // Canonical form: every payload-level Signal reference under the process's
+    // home instance subtree is rewritten to its def-relative field path; a
+    // reference outside the subtree stays absolute (an unscoped/package signal
+    // is the same signal for every instance, so twins still match on it; a
+    // cross-instance hierarchical reference differs per instance and honestly
+    // blocks matching). V1 keeps the extra buffer raw, so a body carrying a
+    // signal inside an extra record (Wait / StoreNbEvent / ReadMem / FreadMem /
+    // EventTriggerNbDelayed) or a FunctionId (per-instance function copies)
+    // hashes instance-specific — counted as blockers, not miscounted as twins.
+    void report_dedup_stat() const {
+        struct Key {
+            llvm::StructType* ty;
+            uint64_t          hash;
+            bool              operator==(const Key&) const = default;
+        };
+        struct KeyHash {
+            uint64_t operator()(const Key& k) const {
+                return ankerl::unordered_dense::detail::wyhash::hash(
+                  reinterpret_cast<uintptr_t>(k.ty) ^ k.hash);
+            }
+        };
+
+        // Instantiation count per definition state type (the anchors' reuse rule).
+        ankerl::unordered_dense::map<llvm::StructType*, uint32_t> ty_uses;
+        for (const Anchor& a : anchors_) {
+            ty_uses[a.ty]++;
+        }
+
+        const auto all = mod_.processes();
+        uint64_t attributed = 0, eligible = 0, covered = 0, blocked_call = 0, blocked_extra_sig = 0,
+                 blocked_xhier = 0;
+        ankerl::unordered_dense::map<Key, uint32_t, KeyHash> twins;
+        std::vector<uint8_t>                                 buf;
+        for (const Process& p : all) {
+            if (p.scope == Process::no_scope || p.scope >= anchor_of_scope_.size() ||
+                anchor_of_scope_[p.scope] == SignalSlot::no_anchor) {
+                continue;
+            }
+            ++attributed;
+            const Anchor& home = anchors_[anchor_of_scope_[p.scope]];
+            if (ty_uses[home.ty] < 2) {
+                continue; // unique definition: nothing to share with
+            }
+            ++eligible;
+
+            buf.clear();
+            const auto put = [&](const void* d, size_t n) {
+                const auto* b = static_cast<const uint8_t*>(d);
+                buf.insert(buf.end(), b, b + n);
+            };
+            const auto put32 = [&](uint32_t v) { put(&v, 4); };
+            bool       xhier = false;
+            const auto canon_signal = [&](Signal sig) {
+                const SignalSlot& s = slot_of(sig);
+                const bool        under_home =
+                  s.anchor != SignalSlot::no_anchor && s.path.size() > home.path.size() &&
+                  std::equal(home.path.begin(), home.path.end(), s.path.begin());
+                if (under_home) {
+                    put32(1u);
+                    for (size_t f = home.path.size(); f < s.path.size(); ++f) {
+                        put32(s.path[f]);
+                    }
+                    return;
+                }
+                // Unscoped/package signal: identical for every instance, still
+                // shareable. A signal under another instance: instance-specific.
+                xhier = xhier || s.anchor != SignalSlot::no_anchor;
+                put32(2u);
+                put32(static_cast<uint32_t>(sig));
+            };
+
+            put32(static_cast<uint32_t>(p.activation));
+            put32(p.self_start ? 1u : 0u);
+            for (const WaitEvent& w : p.wait_events) {
+                canon_signal(w.signal);
+                put32(static_cast<uint32_t>(w.edge));
+            }
+            bool      calls = false, extra_sig = false;
+            const Ir& ir    = p.ir;
+            for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+                const auto tag = ir.tag(static_cast<Index>(k));
+                put(&tag, 1);
+                const Inst::Payload& pl = ir.payload(static_cast<Index>(k));
+                if (payload_kind(tag) == Inst::PayloadKind::Signal) {
+                    canon_signal(pl.signal);
+                } else {
+                    put(&pl, sizeof(pl));
+                }
+                calls = calls || tag == Inst::Tag::Call || tag == Inst::Tag::TaskCall;
+                extra_sig = extra_sig || tag == Inst::Tag::Wait || tag == Inst::Tag::StoreNbEvent ||
+                            tag == Inst::Tag::ReadMem || tag == Inst::Tag::FreadMem ||
+                            tag == Inst::Tag::EventTriggerNbDelayed;
+            }
+            // Raw extra buffer: region slices, operand runs, packed strings —
+            // body-local and deterministic, except the embedded-Signal records
+            // flagged above.
+            const std::span<const uint32_t> extra = ir.extra_raw();
+            put(extra.data(), extra.size() * sizeof(uint32_t));
+            blocked_call += calls ? 1 : 0;
+            blocked_extra_sig += extra_sig ? 1 : 0;
+            blocked_xhier += xhier ? 1 : 0;
+            twins[Key{ home.ty,
+                       ankerl::unordered_dense::detail::wyhash::hash(buf.data(), buf.size()) }]++;
+        }
+
+        uint64_t groups2 = 0;
+        for (const auto& [k, n] : twins) {
+            if (n >= 2) {
+                ++groups2;
+                covered += n;
+            }
+        }
+        std::fprintf(stderr,
+                     "dedup: %llu/%llu attributed procs in reused defs; %llu shareable in %llu "
+                     "twin groups (%.1f%%); instance-specific hints: call=%llu extra-sig=%llu "
+                     "xhier=%llu\n",
+                     (unsigned long long)eligible, (unsigned long long)attributed,
+                     (unsigned long long)covered, (unsigned long long)groups2,
+                     eligible != 0 ? 100.0 * static_cast<double>(covered) / static_cast<double>(eligible)
+                                   : 0.0,
+                     (unsigned long long)blocked_call, (unsigned long long)blocked_extra_sig,
+                     (unsigned long long)blocked_xhier);
+    }
+
     void report_comb_fuse_stat() const {
         const auto all = mod_.processes();
         uint64_t   counts[static_cast<size_t>(CombFuse::Count)] = {};
@@ -4068,6 +4385,7 @@ private:
                 case Inst::Tag::CasezEq:
                 case Inst::Tag::CasexEq:
                 case Inst::Tag::WildEq:
+                case Inst::Tag::InsideSet:
                 // Reals never carry x/z; conversions from clean operands and
                 // real math results are always defined.
                 case Inst::Tag::FAdd:
@@ -4087,7 +4405,8 @@ private:
                 case Inst::Tag::FtoITrunc:
                 case Inst::Tag::FBitcast:
                 case Inst::Tag::FResize:
-                case Inst::Tag::RealMath:
+                case Inst::Tag::RealMathUnary:
+                case Inst::Tag::RealMathBinary:
                 case Inst::Tag::Land:
                 case Inst::Tag::Lor:
                 case Inst::Tag::Lnot:
@@ -4095,6 +4414,7 @@ private:
                 case Inst::Tag::SelectLazy:
                 case Inst::Tag::Concat:
                 case Inst::Tag::Repl:
+                case Inst::Tag::StreamReverse:
                 case Inst::Tag::Resize:
                 case Inst::Tag::Cond:
                 case Inst::Tag::Switch:
@@ -4102,13 +4422,20 @@ private:
                 case Inst::Tag::Break:
                 case Inst::Tag::Continue:
                 case Inst::Tag::Display:
+                case Inst::Tag::FDisplay:
                 case Inst::Tag::Finish:
                 case Inst::Tag::CaseViol:
                 case Inst::Tag::Severity:
                 case Inst::Tag::Fflush:
                 case Inst::Tag::Fclose:
-                case Inst::Tag::Fopen:
-                case Inst::Tag::FileValueOp:
+                case Inst::Tag::FopenFd:
+                case Inst::Tag::FopenMcd:
+                case Inst::Tag::Fgetc:
+                case Inst::Tag::Ungetc:
+                case Inst::Tag::Feof:
+                case Inst::Tag::Ftell:
+                case Inst::Tag::Fseek:
+                case Inst::Tag::Rewind:
                 case Inst::Tag::TimeFormat:
                 case Inst::Tag::SimTime:
                 case Inst::Tag::Random:
@@ -4271,7 +4598,7 @@ private:
             std::array<llvm::Constant*, 3> sb{}, sc{}, db{}, dl{};
             for (uint32_t e = 0; e < 3; ++e) {
                 sb[e] = wait_sta_gv_[i][e] ? llvm::cast<llvm::Constant>(wait_sta_gv_[i][e]) : nullp;
-                sc[e] = llvm::ConstantInt::get(i32, wait_sta_cap_[i][e]);
+                sc[e] = llvm::ConstantInt::get(i32, wait_sta_true_[i][e]);
                 db[e] = wait_dyn_gv_[i][e] ? llvm::cast<llvm::Constant>(wait_dyn_gv_[i][e]) : nullp;
                 dl[e] = wait_dyn_len_gv_[i][e] ? llvm::cast<llvm::Constant>(wait_dyn_len_gv_[i][e]) : nullp;
             }
@@ -4320,7 +4647,17 @@ private:
             cur_block_id_    = static_cast<uint32_t>(block_commits_.size());
             block_commits_.push_back({});
             cur_block_epoch_ = static_cast<int64_t>(cur_seg_epoch_);
-            b_.CreateCall(nba_block_enqueue_fn_, { b_.getInt32(cur_block_id_) });
+            llvm::Value* id  = b_.getInt32(cur_block_id_);
+            if (blk_base_val_ != nullptr) {
+                if (group_first_block_ < 0) {
+                    group_first_block_ = static_cast<int64_t>(cur_block_id_);
+                    group_blk_bases_.emplace_back(blk_base_sym_, cur_block_id_);
+                }
+                id = b_.CreateAdd(
+                  blk_base_val_,
+                  b_.getInt32(cur_block_id_ - static_cast<uint32_t>(group_first_block_)));
+            }
+            b_.CreateCall(nba_block_enqueue_fn_, { id });
         }
         std::vector<BlockSig>& sigs = block_commits_[cur_block_id_].sigs;
         auto it = std::find_if(sigs.begin(), sigs.end(), [&](const BlockSig& b) { return b.sig == sig; });
@@ -4455,10 +4792,11 @@ private:
             // the -1 index of a non-dumped signal). Commit is unconditional, so a
             // no-change commit over-touches; the flush diff suppresses it.
             if (design_uses_vcd_ && nba_vcd_gv_ != nullptr) {
-                llvm::Value* vidx = b_.CreateLoad(
-                  b_.getInt32Ty(), b_.CreateInBoundsGEP(nba_vcd_gv_->getValueType(), nba_vcd_gv_,
-                                                        { b_.getInt32(0), b_.getInt32(s.nba_id) }));
-                emit_guarded_vcd_touch(vcd_touch_fn(), { vidx });
+                emit_guarded_vcd_touch(vcd_touch_fn(), [&] {
+                    return llvm::SmallVector<llvm::Value*, 2>{ b_.CreateLoad(
+                      b_.getInt32Ty(), b_.CreateInBoundsGEP(nba_vcd_gv_->getValueType(), nba_vcd_gv_,
+                                                            { b_.getInt32(0), b_.getInt32(s.nba_id) })) };
+                });
             }
         }
     }
@@ -4804,7 +5142,8 @@ private:
     // unroll. Membership never changes — no compaction, no length.
     void service_static_queue(Signal sig, uint32_t edge) {
         const auto i = static_cast<uint32_t>(sig);
-        emit_static_scan_rt(wait_sta_gv_[i][edge], b_.getInt32(wait_sta_cap_[i][edge]));
+        emit_static_scan_rt(wait_sta_gv_[i][edge], b_.getInt32(wait_sta_cap_[i][edge]),
+                            wait_sta_padded_[i][edge] != 0);
     }
 
     // Dynamic sub-queue scan (one edge bucket): a straight loop over the live
@@ -5045,7 +5384,11 @@ private:
     // entry wakes its process only if its scheduled flag is 0, then sets the
     // flag — collapsing a multi-signal sensitivity (the same process
     // subscribed under several signals) into a single wake.
-    void emit_static_scan_rt(llvm::Value* base, llvm::Value* cap) {
+    // `padded`: the bucket is capacity-padded to its definition's maximum (see
+    // build_wait_queues), so trailing slots are zeroinit — skip a null flag
+    // pointer instead of dereferencing it. Exact buckets keep the check-free
+    // scan.
+    void emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded = false) {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
         auto* elem = wait_elem_ty();
@@ -5067,6 +5410,11 @@ private:
         llvm::Value* src  = b_.CreateInBoundsGEP(elem, base, idx);
         llvm::Value* h    = b_.CreateLoad(ptr, b_.CreateStructGEP(elem, src, 0));
         llvm::Value* fptr = b_.CreateLoad(ptr, b_.CreateStructGEP(elem, src, 1));
+        if (padded) {
+            auto* live = llvm::BasicBlock::Create(ctx_, "nsta.live", fn);
+            b_.CreateCondBr(b_.CreateICmpNE(fptr, llvm::ConstantPointerNull::get(ptr)), live, cont);
+            b_.SetInsertPoint(live);
+        }
         b_.CreateCondBr(b_.CreateICmpNE(b_.CreateLoad(i32, fptr), b_.getInt32(0)), cont, wake);
 
         b_.SetInsertPoint(wake);
@@ -5853,6 +6201,26 @@ private:
         std::vector<llvm::Type*> params(nparam + 1, b_.getInt32Ty());
         return rt_fn(name, b_.getInt64Ty(), params);
     }
+    // Reference-routine symbol for a distribution selector (LRM §20.15.2).
+    static const char* dist_symbol(uint32_t fn) {
+        switch (static_cast<DistOp>(fn)) {
+            case DistOp::Uniform:
+                return "rt_dist_uniform";
+            case DistOp::Normal:
+                return "rt_dist_normal";
+            case DistOp::Exponential:
+                return "rt_dist_exponential";
+            case DistOp::Poisson:
+                return "rt_dist_poisson";
+            case DistOp::ChiSquare:
+                return "rt_dist_chi_square";
+            case DistOp::StudentT:
+                return "rt_dist_t";
+            case DistOp::Erlang:
+                return "rt_dist_erlang";
+        }
+        throw BackendError{ "internal: unknown dist op" };
+    }
     // void rt_urandom_seed(i64* state, i64 seed): splitmix64 expansion of a
     // 64-bit selector into the process's xoshiro256++ frame state.
     llvm::FunctionCallee urandom_seed_fn() {
@@ -6257,13 +6625,25 @@ private:
                 // (LRM 20.9 return type). Never X — it counts, it does not
                 // propagate.
                 return { 32, false, true };
-            case Inst::Tag::Fopen:
+            case Inst::Tag::OneHot:
+            case Inst::Tag::OneHot0:
+            case Inst::Tag::IsUnknown:
+                // Definite 1-bit qualifier results (LRM 20.9); never X.
+                return { 1, false, false };
+            case Inst::Tag::FopenFd:
+            case Inst::Tag::FopenMcd:
                 // $fopen returns a 32-bit descriptor integer.
                 return { 32, false, true };
-            case Inst::Tag::FileValueOp:
+            case Inst::Tag::Fgetc:
+            case Inst::Tag::Ungetc:
+            case Inst::Tag::Feof:
+            case Inst::Tag::Ftell:
+            case Inst::Tag::Fseek:
+            case Inst::Tag::Rewind:
             case Inst::Tag::Fgets:
             case Inst::Tag::Ferror:
-            case Inst::Tag::Scanf:
+            case Inst::Tag::Fscanf:
+            case Inst::Tag::Sscanf:
             case Inst::Tag::FreadWord:
             case Inst::Tag::FreadMem:
                 // The file read / positioning / error / scan functions return i32.
@@ -6272,21 +6652,40 @@ private:
             case Inst::Tag::ValuePlusArgs:
                 // LRM §21.6: an always-known (never x/z) boolean 'int'.
                 return { 32, false, true };
-            case Inst::Tag::DynArrayOp:
+            case Inst::Tag::DynArrayNew:
+            case Inst::Tag::DynArrayNewInit:
+            case Inst::Tag::DynArraySize:
+            case Inst::Tag::DynArrayDelete:
+            case Inst::Tag::DynArrayCopy:
                 // Only size() is a value (a definite 2-state int); new / delete /
                 // copy are statements whose type is never queried.
                 return { 32, false, true };
-            case Inst::Tag::QueueOp: {
-                // pop_front/back yield one element (the queue's element type);
-                // size() is a definite 2-state int; the rest are statements whose
-                // type is never queried.
-                const auto qi = ir_->extra_data<QueueInfo>(p.op_extra.extra);
-                if (qi.sub == static_cast<uint32_t>(QueueOp::PopFront) ||
-                    qi.sub == static_cast<uint32_t>(QueueOp::PopBack)) {
-                    return from_ref(std::get<Type>(mod_.pool.get(qi.queue_type)).element);
-                }
+            case Inst::Tag::QueuePopBack:
+            case Inst::Tag::QueuePopFront:
+                // One element of the queue's element type, straight off the
+                // payload's Queue type.
+                return from_ref(std::get<Type>(mod_.pool.get(p.op_type.type)).element);
+            case Inst::Tag::QueueSize:
+            case Inst::Tag::QueuePushBack:
+            case Inst::Tag::QueuePushFront:
+            case Inst::Tag::QueueInsert:
+            case Inst::Tag::QueueDeleteIdx:
+            case Inst::Tag::QueueDeleteAll:
+            case Inst::Tag::QueueCopy:
+                // size() is a definite 2-state int; the rest are statements
+                // whose type is never queried.
                 return { 32, false, true };
-            }
+            case Inst::Tag::DynArrayReverse:
+            case Inst::Tag::DynArraySort:
+            case Inst::Tag::DynArrayRsort:
+            case Inst::Tag::DynArrayShuffle:
+            case Inst::Tag::QueueReverse:
+            case Inst::Tag::QueueSort:
+            case Inst::Tag::QueueRsort:
+            case Inst::Tag::QueueShuffle:
+                // Ordering methods (LRM 7.12.2) are void statements; their type
+                // is never queried.
+                return { 32, false, true };
 
             case Inst::Tag::Add:
             case Inst::Tag::Sub:
@@ -6306,6 +6705,9 @@ private:
                 return type_of(p.binary.l);
             case Inst::Tag::Bnot:
                 return type_of(p.unary);
+            case Inst::Tag::StreamReverse:
+                // A bit permutation: the operand's width and domain.
+                return type_of(p.op_imm.op);
             case Inst::Tag::Select:
                 return type_of(ir_->extra_data<Select>(p.op_extra.extra).a);
             case Inst::Tag::SelectLazy:
@@ -6334,12 +6736,14 @@ private:
             case Inst::Tag::FResize:
                 return from_ref(p.op_type.type);
             // Every LRM 20.8.2 routine returns a real.
-            case Inst::Tag::RealMath:
+            case Inst::Tag::RealMathUnary:
+            case Inst::Tag::RealMathBinary:
                 return { 64, false, true, false, true };
 
             // $dist_* / seeded $random: a packed i64 {seed:32, draw:32}, sliced
             // by the frontend. A definite 2-state word (never x/z).
-            case Inst::Tag::DistCall:
+            case Inst::Tag::DistUnary:
+            case Inst::Tag::DistBinary:
                 return { 64, false, false };
             // $urandom / $urandom_range: a 32-bit unsigned `int` (2-state).
             case Inst::Tag::Urandom:
@@ -6363,6 +6767,8 @@ private:
             case Inst::Tag::Land:
             case Inst::Tag::Lor:
             case Inst::Tag::Lnot:
+            case Inst::Tag::AggEq:
+            case Inst::Tag::InsideSet:
                 return { 1, true, false };
 
             case Inst::Tag::Concat: {
@@ -6436,10 +6842,12 @@ private:
             case Inst::Tag::HandleDeref:
                 // An lvalue producer (rooted at the object body); no value type.
             case Inst::Tag::Ret:
+            case Inst::Tag::RetVoid:
             case Inst::Tag::Delay:
             case Inst::Tag::Wait:
             case Inst::Tag::Fork:
             case Inst::Tag::Display:
+            case Inst::Tag::FDisplay:
             case Inst::Tag::TimeFormat:
             case Inst::Tag::Finish:
             case Inst::Tag::CaseViol:
@@ -6798,20 +7206,8 @@ private:
                 return;
             }
             case Inst::Tag::MemberSelect: {
-                // Push the member's constant field index onto the aggregate GEP
-                // path; resolve the leaf metadata if the member is a scalar/string
-                // (a struct/array member stays interior for a further select).
-                LValue      lv     = lvalue_of(p.op_extra.op);
-                const auto  ms     = ir_->extra_data<MemberSelect>(p.op_extra.extra);
-                const Type& st     = std::get<Type>(mod_.pool.get(ms.struct_type));
-                const Ref   mt     = mod_.pool.struct_fields(st.fields_id)[ms.field_index].type;
-                lv.agg_path.push_back(b_.getInt32(ms.field_index));
-                lv.agg_field_path.push_back(ms.field_index);
-                lv.agg_leaf = is_leaf_type(mt);
-                if (lv.agg_leaf) {
-                    fill_agg_leaf(lv, mt);
-                }
-                set_lvalue(i, lv);
+                const auto ms = ir_->extra_data<MemberSelect>(p.op_extra.extra);
+                set_lvalue(i, agg_member(lvalue_of(p.op_extra.op), ms.struct_type, ms.field_index));
                 return;
             }
             case Inst::Tag::ClassNew: {
@@ -7006,12 +7402,74 @@ private:
                 return;
             }
 
-            case Inst::Tag::DynArrayOp:
-                lower_dyn_array_op(i);
+            case Inst::Tag::DynArrayNew:
+                lower_dyn_array_new(i);
+                return;
+            case Inst::Tag::DynArrayNewInit:
+                lower_dyn_array_new_init(i);
+                return;
+            case Inst::Tag::DynArraySize:
+                lower_dyn_array_size(i);
+                return;
+            case Inst::Tag::DynArrayDelete:
+                b_.CreateCall(dynarr_delete_fn(),
+                              { lvalue_of(ir_->payload(i).op_type.op).base });
+                return;
+            case Inst::Tag::DynArrayCopy:
+                lower_dyn_array_copy(i);
                 return;
 
-            case Inst::Tag::QueueOp:
-                lower_queue_op(i);
+            case Inst::Tag::QueueSize:
+                lower_queue_size(i);
+                return;
+            case Inst::Tag::QueuePushBack:
+                lower_queue_push(i, /*front=*/false);
+                return;
+            case Inst::Tag::QueuePushFront:
+                lower_queue_push(i, /*front=*/true);
+                return;
+            case Inst::Tag::QueuePopBack:
+                lower_queue_pop(i, /*front=*/false);
+                return;
+            case Inst::Tag::QueuePopFront:
+                lower_queue_pop(i, /*front=*/true);
+                return;
+            case Inst::Tag::QueueInsert:
+                lower_queue_insert(i);
+                return;
+            case Inst::Tag::QueueDeleteIdx:
+                lower_queue_delete_idx(i);
+                return;
+            case Inst::Tag::QueueDeleteAll:
+                lower_queue_delete_all(i);
+                return;
+            case Inst::Tag::QueueCopy:
+                lower_queue_copy(i);
+                return;
+
+            case Inst::Tag::DynArrayReverse:
+                lower_dyn_array_reverse(i);
+                return;
+            case Inst::Tag::DynArraySort:
+                lower_dyn_array_sort(i, /*reversed=*/false);
+                return;
+            case Inst::Tag::DynArrayRsort:
+                lower_dyn_array_sort(i, /*reversed=*/true);
+                return;
+            case Inst::Tag::DynArrayShuffle:
+                lower_dyn_array_shuffle(i);
+                return;
+            case Inst::Tag::QueueReverse:
+                lower_queue_reverse(i);
+                return;
+            case Inst::Tag::QueueSort:
+                lower_queue_sort(i, /*reversed=*/false);
+                return;
+            case Inst::Tag::QueueRsort:
+                lower_queue_sort(i, /*reversed=*/true);
+                return;
+            case Inst::Tag::QueueShuffle:
+                lower_queue_shuffle(i);
                 return;
 
             case Inst::Tag::Constant: {
@@ -7079,6 +7537,18 @@ private:
                                            ir_->extra_data<CountBitsInfo>(p.op_extra.extra).mask));
                 return;
 
+            case Inst::Tag::OneHot:
+                set_value(i, lower_onehot(value_of(p.unary), /*allow_zero=*/false));
+                return;
+
+            case Inst::Tag::OneHot0:
+                set_value(i, lower_onehot(value_of(p.unary), /*allow_zero=*/true));
+                return;
+
+            case Inst::Tag::IsUnknown:
+                set_value(i, lower_isunknown(value_of(p.unary)));
+                return;
+
             case Inst::Tag::Sll:
             case Inst::Tag::Srl:
             case Inst::Tag::Sra:
@@ -7108,8 +7578,18 @@ private:
                 set_value(i, lower_case_compare(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
                 return;
 
+            case Inst::Tag::AggEq: {
+                const auto info = ir_->extra_data<AggEqInfo>(p.op_extra.extra);
+                set_value(i, lower_agg_eq(lvalue_of(p.op_extra.op), lvalue_of(info.rhs), info.type));
+                return;
+            }
+
             case Inst::Tag::WildEq:
                 set_value(i, lower_wildeq(value_of(p.binary.l), value_of(p.binary.r)));
+                return;
+
+            case Inst::Tag::InsideSet:
+                set_value(i, lower_inside_set(i));
                 return;
 
             case Inst::Tag::FAdd:
@@ -7173,8 +7653,11 @@ private:
                 set_value(i, real_plane(v));
                 return;
             }
-            case Inst::Tag::RealMath:
-                set_value(i, lower_real_math(i));
+            case Inst::Tag::RealMathUnary:
+                set_value(i, lower_real_math_unary(i));
+                return;
+            case Inst::Tag::RealMathBinary:
+                set_value(i, lower_real_math_binary(i));
                 return;
 
             case Inst::Tag::Land:
@@ -7211,6 +7694,9 @@ private:
                     return;
                 }
                 set_value(i, lower_repl(value_of(p.repl.value), type_of(p.repl.value).width, p.repl.count));
+                return;
+            case Inst::Tag::StreamReverse:
+                set_value(i, lower_stream_reverse(value_of(p.op_imm.op), p.op_imm.imm));
                 return;
             case Inst::Tag::Resize: {
                 // Truncate or extend all planes (sign per target type).
@@ -7444,6 +7930,10 @@ private:
                 lower_display(i);
                 return;
 
+            case Inst::Tag::FDisplay:
+                lower_fdisplay(i);
+                return;
+
             case Inst::Tag::TimeFormat:
                 lower_timeformat(i);
                 return;
@@ -7472,16 +7962,35 @@ private:
                 lower_fflush(i);
                 return;
 
-            case Inst::Tag::Fopen:
-                lower_fopen(i);
+            case Inst::Tag::FopenFd:
+                lower_fopen_fd(i);
+                return;
+
+            case Inst::Tag::FopenMcd:
+                lower_fopen_mcd(i);
                 return;
 
             case Inst::Tag::Fclose:
                 lower_fclose(i);
                 return;
 
-            case Inst::Tag::FileValueOp:
-                lower_file_op(i);
+            case Inst::Tag::Fgetc:
+                lower_file_unary(i, "rt_fgetc");
+                return;
+            case Inst::Tag::Feof:
+                lower_file_unary(i, "rt_feof");
+                return;
+            case Inst::Tag::Ftell:
+                lower_file_unary(i, "rt_ftell");
+                return;
+            case Inst::Tag::Rewind:
+                lower_file_unary(i, "rt_rewind");
+                return;
+            case Inst::Tag::Ungetc:
+                lower_ungetc(i);
+                return;
+            case Inst::Tag::Fseek:
+                lower_fseek(i);
                 return;
 
             case Inst::Tag::Fgets:
@@ -7500,7 +8009,8 @@ private:
                 lower_ferror(i);
                 return;
 
-            case Inst::Tag::Scanf:
+            case Inst::Tag::Fscanf:
+            case Inst::Tag::Sscanf:
                 lower_scanf(i);
                 return;
 
@@ -7565,29 +8075,26 @@ private:
                 return;
             }
 
-            case Inst::Tag::DistCall: {
+            case Inst::Tag::DistUnary: {
                 // $dist_* / seeded $random: call the reference routine with the
-                // seed word and parameters (must planes, sign-extended to i32);
-                // the packed {seed, draw} i64 is a definite 2-state value the
-                // frontend slices.
-                const auto info = ir_->extra_data<DistInfo>(ir_->payload(i).extra);
-                const auto args = ir_->region(info.args);
-                std::vector<llvm::Value*> call_args;
-                call_args.reserve(args.size());
-                for (Index a : args) {
-                    call_args.push_back(cast(must_of(value_of(a)), 32, true));
-                }
-                llvm::FunctionCallee fn;
-                switch (static_cast<DistOp>(info.op)) {
-                    case DistOp::Uniform:     fn = dist_fn("rt_dist_uniform", 2); break;
-                    case DistOp::Normal:      fn = dist_fn("rt_dist_normal", 2); break;
-                    case DistOp::Exponential: fn = dist_fn("rt_dist_exponential", 1); break;
-                    case DistOp::Poisson:     fn = dist_fn("rt_dist_poisson", 1); break;
-                    case DistOp::ChiSquare:   fn = dist_fn("rt_dist_chi_square", 1); break;
-                    case DistOp::StudentT:    fn = dist_fn("rt_dist_t", 1); break;
-                    case DistOp::Erlang:      fn = dist_fn("rt_dist_erlang", 2); break;
-                }
-                set_value(i, two_val(b_.CreateCall(fn, call_args)));
+                // seed word and parameter(s) (must planes, sign-extended to
+                // i32); the packed {seed, draw} i64 is a definite 2-state value
+                // the frontend slices.
+                const auto&  p    = ir_->payload(i).op_extra;
+                const auto   info = ir_->extra_data<DistUnaryInfo>(p.extra);
+                llvm::Value* seed = cast(must_of(value_of(p.op)), 32, true);
+                llvm::Value* p1   = cast(must_of(value_of(info.p1)), 32, true);
+                set_value(i, two_val(b_.CreateCall(dist_fn(dist_symbol(info.fn), 1), { seed, p1 })));
+                return;
+            }
+            case Inst::Tag::DistBinary: {
+                const auto&  p    = ir_->payload(i).op_extra;
+                const auto   info = ir_->extra_data<DistBinaryInfo>(p.extra);
+                llvm::Value* seed = cast(must_of(value_of(p.op)), 32, true);
+                llvm::Value* p1   = cast(must_of(value_of(info.p1)), 32, true);
+                llvm::Value* p2   = cast(must_of(value_of(info.p2)), 32, true);
+                set_value(
+                  i, two_val(b_.CreateCall(dist_fn(dist_symbol(info.fn), 2), { seed, p1, p2 })));
                 return;
             }
 
@@ -7644,6 +8151,9 @@ private:
             }
             case Inst::Tag::Ret:
                 lower_ret(p.unary);
+                return;
+            case Inst::Tag::RetVoid:
+                lower_ret_void();
                 return;
             case Inst::Tag::Call:
                 lower_call_inst(i);
@@ -7906,65 +8416,71 @@ private:
         b_.SetInsertPoint(cont);
     }
 
-    // Lower a dyn_array_op instruction: new[] / size() / delete() / whole-array
-    // copy over the handle lvalue (LRM 7.5). Element access rides the ElemSelect
-    // dynarr path, not this.
-    void lower_dyn_array_op(Index i) {
-        const Inst::Payload& p      = ir_->payload(i);
-        const auto           da     = ir_->extra_data<DynArrayInfo>(p.op_extra.extra);
-        const LValue&        lv     = lvalue_of(p.op_extra.op);
-        llvm::Value*         handle = lv.base;
-        // Element facts come from the op's own array-type handle, so the op works
-        // for a module signal or a frame-local dynamic array alike.
-        const DynElem e = dynarr_elem(da.array_type);
-        switch (static_cast<DynArrayOp>(da.sub)) {
-            case DynArrayOp::New:
-            case DynArrayOp::NewInit: {
-                llvm::Value* n     = cast(must_of(value_of(da.size)), 64, false);
-                llvm::Value* proto = dynarr_elem_proto(e);
-                if (static_cast<DynArrayOp>(da.sub) == DynArrayOp::NewInit) {
-                    b_.CreateCall(dynarr_new_copy_fn(),
-                                  { handle, b_.getInt64(dynarr_stride(e)), n, proto,
-                                    lvalue_of(da.src).base });
-                } else {
-                    b_.CreateCall(dynarr_new_fn(),
-                                  { handle, b_.getInt64(dynarr_stride(e)), n, proto });
-                }
-                return;
-            }
-            case DynArrayOp::Size: {
-                llvm::Value* len =
-                  b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 1));
-                set_value(i, two_val(cast(len, 32, false)));
-                return;
-            }
-            case DynArrayOp::Delete:
-                b_.CreateCall(dynarr_delete_fn(), { handle });
-                return;
-            case DynArrayOp::Copy:
-                b_.CreateCall(dynarr_assign_fn(),
-                              { handle, lvalue_of(da.src).base, b_.getInt64(dynarr_stride(e)) });
-                return;
-            case DynArrayOp::Reverse:
-                b_.CreateCall(dynarr_reverse_fn(), { handle, b_.getInt64(dynarr_stride(e)) });
-                return;
-            case DynArrayOp::Sort:
-            case DynArrayOp::Rsort: {
-                const SortDesc d   = dynarr_sort_desc(da.array_type);
-                const bool     rev = static_cast<DynArrayOp>(da.sub) == DynArrayOp::Rsort;
-                b_.CreateCall(dynarr_sort_fn(), { handle, b_.getInt64(dynarr_stride(e)),
-                                                  b_.getInt32(d.kind), b_.getInt32(d.width),
-                                                  b_.getInt32(rev ? 1 : 0) });
-                return;
-            }
-            case DynArrayOp::Shuffle:
-                // rng_slot_ is non-null: process_uses_urandom flags a shuffling
-                // process, so lower_group allocates and seeds the frame RNG.
-                assert(rng_slot_ != nullptr && "shuffle needs the frame RNG");
-                b_.CreateCall(dynarr_shuffle_fn(),
-                              { handle, b_.getInt64(dynarr_stride(e)), rng_slot_ });
-                return;
-        }
+    // Dynamic-array operations over the handle lvalue (LRM 7.5). Element access
+    // rides the ElemSelect dynarr path, not these. Element facts come from the
+    // payload's own array-type handle, so each op works for a module signal or
+    // a frame-local dynamic array alike.
+    void lower_dyn_array_new(Index i) {
+        const auto&   p  = ir_->payload(i).op_extra;
+        const auto    da = ir_->extra_data<DynArrayArg>(p.extra);
+        const DynElem e  = dynarr_elem(da.array_type);
+        llvm::Value*  n  = cast(must_of(value_of(da.arg)), 64, false);
+        b_.CreateCall(dynarr_new_fn(), { lvalue_of(p.op).base, b_.getInt64(dynarr_stride(e)), n,
+                                         dynarr_elem_proto(e) });
+    }
+
+    void lower_dyn_array_new_init(Index i) {
+        const auto&   p  = ir_->payload(i).op_extra;
+        const auto    da = ir_->extra_data<DynArrayNewInitInfo>(p.extra);
+        const DynElem e  = dynarr_elem(da.array_type);
+        llvm::Value*  n  = cast(must_of(value_of(da.size)), 64, false);
+        b_.CreateCall(dynarr_new_copy_fn(),
+                      { lvalue_of(p.op).base, b_.getInt64(dynarr_stride(e)), n,
+                        dynarr_elem_proto(e), lvalue_of(da.src).base });
+    }
+
+    void lower_dyn_array_size(Index i) {
+        llvm::Value* handle = lvalue_of(ir_->payload(i).op_type.op).base;
+        llvm::Value* len =
+          b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 1));
+        set_value(i, two_val(cast(len, 32, false)));
+    }
+
+    void lower_dyn_array_copy(Index i) {
+        const auto&  p      = ir_->payload(i).op_extra;
+        const auto   da     = ir_->extra_data<DynArrayArg>(p.extra);
+        llvm::Value* stride = b_.getInt64(dynarr_stride(dynarr_elem(da.array_type)));
+        b_.CreateCall(dynarr_assign_fn(),
+                      { lvalue_of(p.op).base, lvalue_of(da.arg).base, stride });
+    }
+
+    // Array ordering methods (LRM 7.12.2). Each carries only the handle lvalue +
+    // interned type (op_type payload). Reverse is element-agnostic; Sort/Rsort
+    // pass the value comparator descriptor derived from the element type;
+    // Shuffle threads the process frame RNG slot.
+    void lower_dyn_array_reverse(Index i) {
+        const auto&   p = ir_->payload(i).op_type;
+        const DynElem e = dynarr_elem(p.type);
+        b_.CreateCall(dynarr_reverse_fn(), { lvalue_of(p.op).base, b_.getInt64(dynarr_stride(e)) });
+    }
+
+    void lower_dyn_array_sort(Index i, bool reversed) {
+        const auto&    p = ir_->payload(i).op_type;
+        const DynElem  e = dynarr_elem(p.type);
+        const SortDesc d = dynarr_sort_desc(p.type);
+        b_.CreateCall(dynarr_sort_fn(), { lvalue_of(p.op).base, b_.getInt64(dynarr_stride(e)),
+                                          b_.getInt32(d.kind), b_.getInt32(d.width),
+                                          b_.getInt32(reversed ? 1 : 0) });
+    }
+
+    void lower_dyn_array_shuffle(Index i) {
+        const auto&   p = ir_->payload(i).op_type;
+        const DynElem e = dynarr_elem(p.type);
+        // rng_slot_ is non-null: process_uses_urandom flags a shuffling process,
+        // so lower_group allocates and seeds the frame RNG.
+        assert(rng_slot_ != nullptr && "shuffle needs the frame RNG");
+        b_.CreateCall(dynarr_shuffle_fn(),
+                      { lvalue_of(p.op).base, b_.getInt64(dynarr_stride(e)), rng_slot_ });
     }
 
     // An alloca placed at the top of the current function's entry block (not the
@@ -8006,84 +8522,97 @@ private:
         return llvm::ConstantStruct::get(e.slot_ty, fields);
     }
 
-    // Lower a queue_op instruction: size / push* / pop* / insert / delete / copy
-    // over the handle lvalue (LRM 7.10.2). Indexed element access q[i] rides the
-    // ElemSelect queue path, not this. Element values cross to the runtime through
-    // a scratch element slot (push / insert stage the value in; pop copies out).
-    void lower_queue_op(Index i) {
-        const Inst::Payload& p      = ir_->payload(i);
-        const auto           qi     = ir_->extra_data<QueueInfo>(p.op_extra.extra);
-        const LValue&        lv     = lvalue_of(p.op_extra.op);
-        llvm::Value*         handle = lv.base;
-        const Ref            arr_ty = qi.queue_type;
-        const DynElem        e      = dynarr_elem(arr_ty);
-        llvm::Value*         stride = b_.getInt64(dynarr_stride(e));
-        llvm::Value*         bound  = b_.getInt64(std::get<Type>(mod_.pool.get(arr_ty)).left);
-        switch (static_cast<QueueOp>(qi.sub)) {
-            case QueueOp::Size: {
-                llvm::Value* len =
-                  b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 2));
-                set_value(i, two_val(cast(len, 32, false)));
-                return;
-            }
-            case QueueOp::PushBack:
-            case QueueOp::PushFront: {
-                const bool front   = static_cast<QueueOp>(qi.sub) == QueueOp::PushFront;
-                auto*      scratch = entry_alloca(e.slot_ty, "q.elem");
-                lower_store(elem_scratch_lvalue(scratch, e), value_of(qi.val));
-                b_.CreateCall(queue_push_fn(front), { handle, stride, bound, scratch });
-                return;
-            }
-            case QueueOp::PopBack:
-            case QueueOp::PopFront: {
-                const bool front   = static_cast<QueueOp>(qi.sub) == QueueOp::PopFront;
-                auto*      scratch = entry_alloca(e.slot_ty, "q.elem");
-                // Pre-fill with the default: the runtime leaves an empty-queue pop
-                // untouched, so the load below then reads the element default.
-                b_.CreateStore(elem_default_const(e), scratch);
-                b_.CreateCall(queue_pop_fn(front), { handle, stride, scratch });
-                Plane         v = lower_load(elem_scratch_lvalue(scratch, e));
-                const ValType t = type_of(i);
-                if (t.is_real) {
-                    v = real_plane(planes_to_real(v, t.width));
-                }
-                set_value(i, v);
-                return;
-            }
-            case QueueOp::Insert: {
-                auto* scratch = entry_alloca(e.slot_ty, "q.elem");
-                lower_store(elem_scratch_lvalue(scratch, e), value_of(qi.val));
-                llvm::Value* idx = cast(must_of(value_of(qi.idx)), 64, false);
-                b_.CreateCall(queue_insert_fn(), { handle, stride, bound, idx, scratch });
-                return;
-            }
-            case QueueOp::DeleteIdx: {
-                llvm::Value* idx = cast(must_of(value_of(qi.idx)), 64, false);
-                b_.CreateCall(queue_delete_idx_fn(), { handle, stride, idx });
-                return;
-            }
-            case QueueOp::DeleteAll:
-                b_.CreateCall(queue_delete_all_fn(), { handle });
-                return;
-            case QueueOp::Copy:
-                b_.CreateCall(queue_assign_fn(), { handle, lvalue_of(qi.val).base, stride });
-                return;
-            case QueueOp::Reverse:
-                b_.CreateCall(queue_reverse_fn(), { handle, stride });
-                return;
-            case QueueOp::Sort:
-            case QueueOp::Rsort: {
-                const SortDesc d   = dynarr_sort_desc(arr_ty);
-                const bool     rev = static_cast<QueueOp>(qi.sub) == QueueOp::Rsort;
-                b_.CreateCall(queue_sort_fn(), { handle, stride, b_.getInt32(d.kind),
-                                                 b_.getInt32(d.width), b_.getInt32(rev ? 1 : 0) });
-                return;
-            }
-            case QueueOp::Shuffle:
-                assert(rng_slot_ != nullptr && "shuffle needs the frame RNG");
-                b_.CreateCall(queue_shuffle_fn(), { handle, stride, rng_slot_ });
-                return;
+    // Queue operations over the handle lvalue (LRM 7.10.2). Indexed element
+    // access q[i] rides the ElemSelect queue path, not these. Element values
+    // cross to the runtime through a scratch element slot (push / insert stage
+    // the value in; pop copies out).
+    void lower_queue_size(Index i) {
+        llvm::Value* handle = lvalue_of(ir_->payload(i).op_type.op).base;
+        llvm::Value* len =
+          b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 2));
+        set_value(i, two_val(cast(len, 32, false)));
+    }
+
+    void lower_queue_push(Index i, bool front) {
+        const auto&   p       = ir_->payload(i).op_extra;
+        const auto    qa      = ir_->extra_data<QueueArg>(p.extra);
+        const DynElem e       = dynarr_elem(qa.queue_type);
+        auto*         scratch = entry_alloca(e.slot_ty, "q.elem");
+        lower_store(elem_scratch_lvalue(scratch, e), value_of(qa.arg));
+        llvm::Value* stride = b_.getInt64(dynarr_stride(e));
+        llvm::Value* bound  = b_.getInt64(std::get<Type>(mod_.pool.get(qa.queue_type)).left);
+        b_.CreateCall(queue_push_fn(front), { lvalue_of(p.op).base, stride, bound, scratch });
+    }
+
+    void lower_queue_pop(Index i, bool front) {
+        const auto&   p       = ir_->payload(i).op_type;
+        const DynElem e       = dynarr_elem(p.type);
+        auto*         scratch = entry_alloca(e.slot_ty, "q.elem");
+        // Pre-fill with the default: the runtime leaves an empty-queue pop
+        // untouched, so the load below then reads the element default.
+        b_.CreateStore(elem_default_const(e), scratch);
+        b_.CreateCall(queue_pop_fn(front),
+                      { lvalue_of(p.op).base, b_.getInt64(dynarr_stride(e)), scratch });
+        Plane         v = lower_load(elem_scratch_lvalue(scratch, e));
+        const ValType t = type_of(i);
+        if (t.is_real) {
+            v = real_plane(planes_to_real(v, t.width));
         }
+        set_value(i, v);
+    }
+
+    void lower_queue_insert(Index i) {
+        const auto&   p       = ir_->payload(i).op_extra;
+        const auto    qi      = ir_->extra_data<QueueInsertInfo>(p.extra);
+        const DynElem e       = dynarr_elem(qi.queue_type);
+        auto*         scratch = entry_alloca(e.slot_ty, "q.elem");
+        lower_store(elem_scratch_lvalue(scratch, e), value_of(qi.val));
+        llvm::Value* idx    = cast(must_of(value_of(qi.idx)), 64, false);
+        llvm::Value* stride = b_.getInt64(dynarr_stride(e));
+        llvm::Value* bound  = b_.getInt64(std::get<Type>(mod_.pool.get(qi.queue_type)).left);
+        b_.CreateCall(queue_insert_fn(), { lvalue_of(p.op).base, stride, bound, idx, scratch });
+    }
+
+    void lower_queue_delete_idx(Index i) {
+        const auto&  p      = ir_->payload(i).op_extra;
+        const auto   qa     = ir_->extra_data<QueueArg>(p.extra);
+        llvm::Value* stride = b_.getInt64(dynarr_stride(dynarr_elem(qa.queue_type)));
+        llvm::Value* idx    = cast(must_of(value_of(qa.arg)), 64, false);
+        b_.CreateCall(queue_delete_idx_fn(), { lvalue_of(p.op).base, stride, idx });
+    }
+
+    void lower_queue_delete_all(Index i) {
+        b_.CreateCall(queue_delete_all_fn(), { lvalue_of(ir_->payload(i).op_type.op).base });
+    }
+
+    void lower_queue_copy(Index i) {
+        const auto&  p      = ir_->payload(i).op_extra;
+        const auto   qa     = ir_->extra_data<QueueArg>(p.extra);
+        llvm::Value* stride = b_.getInt64(dynarr_stride(dynarr_elem(qa.queue_type)));
+        b_.CreateCall(queue_assign_fn(), { lvalue_of(p.op).base, lvalue_of(qa.arg).base, stride });
+    }
+
+    // Queue ordering methods (LRM 7.12.2) — same shape as the dynarr variants
+    // over the ring's logical order (op_type payload: handle lvalue + type).
+    void lower_queue_reverse(Index i) {
+        const auto&  p      = ir_->payload(i).op_type;
+        llvm::Value* stride = b_.getInt64(dynarr_stride(dynarr_elem(p.type)));
+        b_.CreateCall(queue_reverse_fn(), { lvalue_of(p.op).base, stride });
+    }
+
+    void lower_queue_sort(Index i, bool reversed) {
+        const auto&    p      = ir_->payload(i).op_type;
+        llvm::Value*   stride = b_.getInt64(dynarr_stride(dynarr_elem(p.type)));
+        const SortDesc d      = dynarr_sort_desc(p.type);
+        b_.CreateCall(queue_sort_fn(), { lvalue_of(p.op).base, stride, b_.getInt32(d.kind),
+                                         b_.getInt32(d.width), b_.getInt32(reversed ? 1 : 0) });
+    }
+
+    void lower_queue_shuffle(Index i) {
+        const auto&  p      = ir_->payload(i).op_type;
+        llvm::Value* stride = b_.getInt64(dynarr_stride(dynarr_elem(p.type)));
+        assert(rng_slot_ != nullptr && "shuffle needs the frame RNG");
+        b_.CreateCall(queue_shuffle_fn(), { lvalue_of(p.op).base, stride, rng_slot_ });
     }
 
     void lower_store(const LValue& lv, Plane rhs) {
@@ -8653,10 +9182,11 @@ private:
             emit_nba_service(sig, meta, old_mm, new_mm, W, s.narrow, old_z, new_z);
         }
         if (design_uses_vcd_ && nba_vcd_gv_ != nullptr) {
-            llvm::Value* vidx = b_.CreateLoad(
-              i32, b_.CreateInBoundsGEP(nba_vcd_gv_->getValueType(), nba_vcd_gv_,
-                                        { b_.getInt32(0), b_.getInt32(s.nba_id) }));
-            emit_guarded_vcd_touch(vcd_touch_fn(), { vidx });
+            emit_guarded_vcd_touch(vcd_touch_fn(), [&] {
+                return llvm::SmallVector<llvm::Value*, 2>{ b_.CreateLoad(
+                  i32, b_.CreateInBoundsGEP(nba_vcd_gv_->getValueType(), nba_vcd_gv_,
+                                            { b_.getInt32(0), b_.getInt32(s.nba_id) })) };
+            });
         }
         b_.CreateCall(intra_release_fn(), { b_.getInt32(idx) });
         b_.CreateBr(skip);
@@ -8959,18 +9489,18 @@ private:
     }
 
     // Lower a unique/priority case violation report: pass the compile-time banner
-    // prefix, the current simulation time, and the message kind (FinishInfo.arg);
-    // the runtime warns and returns, so the region continues. The wheel fallback
-    // mirrors lower_finish: a case inside a pure function has no wheel and reports
+    // prefix, the current simulation time, and the message kind; the runtime
+    // warns and returns, so the region continues. The wheel fallback mirrors
+    // lower_finish: a case inside a pure function has no wheel and reports
     // time 0 (same TODO as $finish).
     void lower_case_viol(Index i) {
-        const auto        info   = ir_->extra_data<FinishInfo>(ir_->payload(i).extra);
+        const auto        info   = ir_->extra_data<CaseViolInfo>(ir_->payload(i).extra);
         const std::string banner = ir_->extra_bytes(info.banner, info.banner_len);
         llvm::Value*      now = has_wheel()
                                   ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
                                   : static_cast<llvm::Value*>(b_.getInt64(0));
         b_.CreateCall(case_violation_fn(),
-                      { b_.CreateGlobalString(banner), now, b_.getInt32(info.arg) });
+                      { b_.CreateGlobalString(banner), now, b_.getInt32(info.kind) });
     }
 
     // void rt_severity(i32 level, ptr banner, ptr fmt, i32 argc, ptr argv) —
@@ -9024,22 +9554,22 @@ private:
         b_.CreateCall(fflush_fn(), { desc });
     }
 
-    // Lower a $fopen: spill the filename (and mode, for the FD form) to stack byte
-    // buffers and call the matching runtime opener; the result is the descriptor.
-    void lower_fopen(Index i) {
-        const Index fname = ir_->payload(i).op_extra.op;
-        const auto  info  = ir_->extra_data<FopenInfo>(ir_->payload(i).op_extra.extra);
-        const auto [name_ptr, name_len] = spill_ascii(fname, "fopen.name");
-
-        llvm::Value* desc = nullptr;
-        if (info.has_mode) {
-            const auto [mode_ptr, mode_len] = spill_ascii(info.mode, "fopen.mode");
-            desc = b_.CreateCall(
-              fopen_fd_fn(), { name_ptr, b_.getInt32(name_len), mode_ptr, b_.getInt32(mode_len) });
-        } else {
-            desc = b_.CreateCall(fopen_mcd_fn(), { name_ptr, b_.getInt32(name_len) });
-        }
+    // Lower a two-argument $fopen: spill the filename and mode to stack byte
+    // buffers and call the FD opener; the result is the descriptor.
+    void lower_fopen_fd(Index i) {
+        const auto& p                   = ir_->payload(i).binary;
+        const auto [name_ptr, name_len] = spill_ascii(p.l, "fopen.name");
+        const auto [mode_ptr, mode_len] = spill_ascii(p.r, "fopen.mode");
+        llvm::Value* desc               = b_.CreateCall(
+          fopen_fd_fn(), { name_ptr, b_.getInt32(name_len), mode_ptr, b_.getInt32(mode_len) });
         // The descriptor is a plain known integer (no x/z): must == may, z == 0.
+        set_value(i, packed(desc, desc, zero(32)));
+    }
+
+    // Lower a one-argument $fopen: spill the filename and open a fresh MCD.
+    void lower_fopen_mcd(Index i) {
+        const auto [name_ptr, name_len] = spill_ascii(ir_->payload(i).unary, "fopen.name");
+        llvm::Value* desc = b_.CreateCall(fopen_mcd_fn(), { name_ptr, b_.getInt32(name_len) });
         set_value(i, packed(desc, desc, zero(32)));
     }
 
@@ -9049,44 +9579,38 @@ private:
         b_.CreateCall(fclose_fn(), { desc });
     }
 
-    // Lower a $fgetc / $ungetc / $feof / $ftell / $fseek / $rewind: every one takes
-    // i32 operands and returns i32, so the call is built generically and only the
-    // runtime symbol varies with the opcode. The result is a known integer.
-    void lower_file_op(Index i) {
-        const auto                   info = ir_->extra_data<FileOpInfo>(ir_->payload(i).extra);
-        const std::span<const Index> args = ir_->region(info.args);
+    // The file read / positioning system functions take i32 operands and
+    // return i32; the results are always-known integers.
+    // $fgetc / $feof / $ftell / $rewind: one descriptor operand.
+    void lower_file_unary(Index i, const char* fn) {
+        llvm::Value* fd   = cast(must_of(value_of(ir_->payload(i).unary)), 32, true);
+        auto*        i32  = b_.getInt32Ty();
+        auto*        fnty = llvm::FunctionType::get(i32, { i32 }, false);
+        llvm::Value* r    = b_.CreateCall(llmod_.getOrInsertFunction(fn, fnty), { fd });
+        set_value(i, packed(r, r, zero(32)));
+    }
 
-        std::vector<llvm::Value*> argv;
-        argv.reserve(args.size());
-        for (Index a : args) {
-            argv.push_back(cast(must_of(value_of(a)), 32, true));
-        }
+    // $ungetc(c, fd).
+    void lower_ungetc(Index i) {
+        const auto&  p    = ir_->payload(i).binary;
+        llvm::Value* c    = cast(must_of(value_of(p.l)), 32, true);
+        llvm::Value* fd   = cast(must_of(value_of(p.r)), 32, true);
+        auto*        i32  = b_.getInt32Ty();
+        auto*        fnty = llvm::FunctionType::get(i32, { i32, i32 }, false);
+        llvm::Value* r = b_.CreateCall(llmod_.getOrInsertFunction("rt_ungetc", fnty), { c, fd });
+        set_value(i, packed(r, r, zero(32)));
+    }
 
-        const char* fn = nullptr;
-        switch (static_cast<FileOp>(info.op)) {
-            case FileOp::Fgetc:
-                fn = "rt_fgetc";
-                break;
-            case FileOp::Ungetc:
-                fn = "rt_ungetc";
-                break;
-            case FileOp::Feof:
-                fn = "rt_feof";
-                break;
-            case FileOp::Ftell:
-                fn = "rt_ftell";
-                break;
-            case FileOp::Fseek:
-                fn = "rt_fseek";
-                break;
-            case FileOp::Rewind:
-                fn = "rt_rewind";
-                break;
-        }
-
-        std::vector<llvm::Type*> params(args.size(), b_.getInt32Ty());
-        auto*        fnty = llvm::FunctionType::get(b_.getInt32Ty(), params, false);
-        llvm::Value* r    = b_.CreateCall(llmod_.getOrInsertFunction(fn, fnty), argv);
+    // $fseek(fd, offset, operation).
+    void lower_fseek(Index i) {
+        const auto&  p    = ir_->payload(i).op_extra;
+        const auto   info = ir_->extra_data<FseekInfo>(p.extra);
+        llvm::Value* fd   = cast(must_of(value_of(p.op)), 32, true);
+        llvm::Value* off  = cast(must_of(value_of(info.offset)), 32, true);
+        llvm::Value* op   = cast(must_of(value_of(info.operation)), 32, true);
+        auto*        i32  = b_.getInt32Ty();
+        auto*        fnty = llvm::FunctionType::get(i32, { i32, i32, i32 }, false);
+        llvm::Value* r = b_.CreateCall(llmod_.getOrInsertFunction("rt_fseek", fnty), { fd, off, op });
         set_value(i, packed(r, r, zero(32)));
     }
 
@@ -9277,7 +9801,7 @@ private:
 
         llvm::Value* fmt_ptr = b_.CreateGlobalString(fmt);
         llvm::Value* r       = nullptr;
-        if (info.is_string) {
+        if (ir_->tag(i) == Inst::Tag::Sscanf) {
             const auto [buf, len] = spill_ascii(info.source, "sscanf.buf");
             r = b_.CreateCall(sscanf_fn(), { buf, b_.getInt32(len), fmt_ptr, b_.getInt32(n), arr });
         } else {
@@ -9586,14 +10110,18 @@ private:
     // Emit a VCD touch call guarded by the runtime active flag, so a design that
     // compiles in $dumpvars (possibly plusarg-guarded) but is not dumping pays
     // only a predictable-not-taken load+branch per store, not a runtime call.
-    void emit_guarded_vcd_touch(llvm::FunctionCallee fn, llvm::ArrayRef<llvm::Value*> args) {
+    // `make_args` runs inside the taken branch, so index loads (the NBA vcd
+    // table, a reused instance's vcd base) stay off the inactive hot path —
+    // the point of the gate.
+    void emit_guarded_vcd_touch(llvm::FunctionCallee                                  fn,
+                                llvm::function_ref<llvm::SmallVector<llvm::Value*, 2>()> make_args) {
         llvm::Function*   f      = b_.GetInsertBlock()->getParent();
         llvm::Value*      active = b_.CreateLoad(b_.getInt8Ty(), vcd_active_gv());
         llvm::BasicBlock* touch  = llvm::BasicBlock::Create(ctx_, "vcd.touch", f);
         llvm::BasicBlock* cont   = llvm::BasicBlock::Create(ctx_, "vcd.cont", f);
         b_.CreateCondBr(b_.CreateICmpNE(active, b_.getInt8(0)), touch, cont);
         b_.SetInsertPoint(touch);
-        b_.CreateCall(fn, args);
+        b_.CreateCall(fn, make_args());
         b_.CreateBr(cont);
         b_.SetInsertPoint(cont);
     }
@@ -9652,11 +10180,24 @@ private:
                 vcd_index_scope(top, next);
             }
         }
+        for (Anchor& a : anchors_) {
+            if (a.indirect && a.first_vcd >= 0) {
+                a.vcd_sym = new llvm::GlobalVariable(
+                  llmod_, b_.getInt32Ty(), false, llvm::GlobalValue::InternalLinkage, b_.getInt32(0),
+                  "clotho.inst." + a.name + ".vcd");
+            }
+        }
     }
 
     void vcd_index_scope(const InstanceScope& sc, uint32_t& next) {
+        const uint32_t aid =
+          sc.id < anchor_of_scope_.size() ? anchor_of_scope_[sc.id] : SignalSlot::no_anchor;
         for (const Signal sig : sc.signals) {
+            const uint32_t before = next;
             vcd_index_signal(sig, next);
+            if (next != before && aid != SignalSlot::no_anchor && anchors_[aid].first_vcd < 0) {
+                anchors_[aid].first_vcd = static_cast<int32_t>(before);
+            }
         }
         for (const InstanceScope& child : sc.children) {
             vcd_index_scope(child, next);
@@ -9687,6 +10228,21 @@ private:
         return rt_fn("rt_vcd_touch_range", b_.getVoidTy(), { b_.getInt32Ty(), b_.getInt32Ty() });
     }
 
+    // The rt_vcd_touch index of a dumped signal: def-relative (instance vcd base
+    // + def-local offset) when the owner is a reused instance, the folded
+    // constant otherwise — dedup prep, same split as storage / sched anchors.
+    llvm::Value* vcd_index_value(Signal sig, int32_t base) {
+        const SignalSlot& s = slot_of(sig);
+        if (s.anchor != SignalSlot::no_anchor) {
+            const Anchor& a = anchors_[s.anchor];
+            if (a.vcd_sym != nullptr) {
+                llvm::Value* b0 = b_.CreateLoad(b_.getInt32Ty(), a.vcd_sym);
+                return b_.CreateAdd(b0, b_.getInt32(static_cast<uint32_t>(base - a.first_vcd)));
+            }
+        }
+        return b_.getInt32(static_cast<uint32_t>(base));
+    }
+
     // Emit rt_vcd_touch for a blocking write to a dumped signal, marking it in the
     // dirty set. A scalar touches its index; an array element touches base + its
     // normalized element index (a whole-array store touches the range). A no-op for
@@ -9703,15 +10259,22 @@ private:
         const SignalSlot& s = slot_of(lv.sig);
         if (s.is_array) {
             if (lv.elem_idx != nullptr) {
-                llvm::Value* idx = b_.CreateAdd(b_.getInt32(static_cast<uint32_t>(base)), lv.elem_idx);
-                emit_guarded_vcd_touch(vcd_touch_fn(), { idx });
+                emit_guarded_vcd_touch(vcd_touch_fn(), [&] {
+                    return llvm::SmallVector<llvm::Value*, 2>{
+                        b_.CreateAdd(vcd_index_value(lv.sig, base), lv.elem_idx)
+                    };
+                });
             } else {
-                emit_guarded_vcd_touch(vcd_touch_range_fn(),
-                              { b_.getInt32(static_cast<uint32_t>(base)), b_.getInt32(s.elem_count) });
+                emit_guarded_vcd_touch(vcd_touch_range_fn(), [&] {
+                    return llvm::SmallVector<llvm::Value*, 2>{ vcd_index_value(lv.sig, base),
+                                                               b_.getInt32(s.elem_count) };
+                });
             }
             return;
         }
-        emit_guarded_vcd_touch(vcd_touch_fn(), { b_.getInt32(static_cast<uint32_t>(base)) });
+        emit_guarded_vcd_touch(vcd_touch_fn(), [&] {
+            return llvm::SmallVector<llvm::Value*, 2>{ vcd_index_value(lv.sig, base) };
+        });
     }
 
     // Emit an rt_vcd_touch_range for a dumped array signal (whole element range).
@@ -9723,8 +10286,10 @@ private:
         }
         const int32_t base = vcd_index_[static_cast<uint32_t>(sig)];
         if (base >= 0) {
-            emit_guarded_vcd_touch(vcd_touch_range_fn(),
-                          { b_.getInt32(static_cast<uint32_t>(base)), b_.getInt32(slot_of(sig).elem_count) });
+            emit_guarded_vcd_touch(vcd_touch_range_fn(), [&] {
+                return llvm::SmallVector<llvm::Value*, 2>{ vcd_index_value(sig, base),
+                                                           b_.getInt32(slot_of(sig).elem_count) };
+            });
         }
     }
 
@@ -9866,17 +10431,25 @@ private:
         }
     }
 
-    // Lower a function `return`: a real `ret`, so it terminates the block and any
-    // instructions after it in the region are unreachable (lower_region stops).
-    // A void function ignores the operand and returns void; otherwise the result
-    // is packed into the `{ i(2W), iW }` return struct.
-    void lower_ret(Index value) {
+    // Lower a void `return` (no operand): a task branches to its copy-out +
+    // caller-resume epilogue; a void function copies out formals, releases the
+    // body's strings, and returns void.
+    void lower_ret_void() {
         if (cur_is_task_) {
-            // A task is a coroutine: `return` runs the copy-out + caller-resume
-            // epilogue and falls into the final suspend, never a real `ret`.
             b_.CreateBr(task_epilogue_bb_);
             return;
         }
+        emit_copyout(*cur_fn_);
+        deinit_body_strings();
+        b_.CreateRetVoid();
+    }
+
+    // Lower a non-void function `return`: a real `ret`, so it terminates the
+    // block and any instructions after it in the region are unreachable
+    // (lower_region stops). The result is packed into the `{ i(2W), iW }` return
+    // struct (string / aggregate / handle results copy out through the trailing
+    // out-param instead).
+    void lower_ret(Index value) {
         // A function copies output / inout formals back through their pointers at
         // each return point (LRM 13.5), before releasing the body and returning.
         emit_copyout(*cur_fn_);
@@ -9904,11 +10477,6 @@ private:
             // (the value may be a frame local or a call result temp).
             emit_handle_assign(fn_->getArg(fn_->arg_size() - 1), lvalue_of(value).base,
                                cur_fn_->return_type);
-            deinit_body_strings();
-            b_.CreateRetVoid();
-            return;
-        }
-        if (cur_fn_->return_type == mod_.pool.void_type) {
             deinit_body_strings();
             b_.CreateRetVoid();
             return;
@@ -11005,19 +11573,25 @@ private:
     // Lower a $display / $write / $fdisplay / $fwrite: build the descriptor array
     // and call the runtime formatter with the destination descriptor.
     void lower_display(Index i) {
-        const auto  info = ir_->extra_data<DisplayInfo>(ir_->payload(i).extra);
-        std::string fmt  = ir_->extra_bytes(info.fmt, info.fmt_len);
+        // $display / $write target the standard-output MCD (bit 0).
+        emit_display(ir_->extra_data<DisplayInfo>(ir_->payload(i).extra), b_.getInt32(1));
+    }
+
+    void lower_fdisplay(Index i) {
+        // $fdisplay / $fwrite carry an explicit descriptor operand.
+        const auto& p = ir_->payload(i).op_extra;
+        emit_display(ir_->extra_data<DisplayInfo>(p.extra), cast(must_of(value_of(p.op)), 32, true));
+    }
+
+    void emit_display(const DisplayInfo& info, llvm::Value* desc) {
+        std::string fmt = ir_->extra_bytes(info.fmt, info.fmt_len);
         if (info.newline) {
             fmt += '\n';
         }
 
         const std::span<const Index> args = ir_->region(info.args);
         llvm::Value*                 arr  = build_rt_args(args, "$display / $write");
-
-        // $display / $write target the standard-output MCD (bit 0); $fdisplay /
-        // $fwrite carry an explicit descriptor operand.
-        llvm::Value* desc = info.has_fd ? cast(must_of(value_of(info.fd)), 32, true) : b_.getInt32(1);
-        llvm::Value* fmt_ptr = b_.CreateGlobalString(fmt);
+        llvm::Value*                 fmt_ptr = b_.CreateGlobalString(fmt);
         b_.CreateCall(fwrite_fn(), { desc, fmt_ptr, b_.getInt32(static_cast<uint32_t>(args.size())), arr });
     }
 
@@ -11305,14 +11879,12 @@ private:
         return two_val(hi);
     }
 
-    Plane lower_real_math(Index i) {
-        const auto info = ir_->extra_data<RealMathInfo>(ir_->payload(i).extra);
-        const auto args = ir_->region(info.args);
-        llvm::Value* x = fp_of(value_of(args[0]));
-        llvm::Value* y = args.size() > 1 ? fp_of(value_of(args[1])) : nullptr;
+    Plane lower_real_math_unary(Index i) {
+        const auto&  p = ir_->payload(i).op_imm;
+        llvm::Value* x = fp_of(value_of(p.op));
         using O = RealMathOp;
         namespace In = llvm::Intrinsic;
-        switch (static_cast<O>(info.op)) {
+        switch (static_cast<O>(p.imm)) {
             // LRM Table 20-4 names the C math function each maps to. The
             // classic routines lower to LLVM intrinsics (constant-foldable);
             // the inverse / hyperbolic ones call libm directly.
@@ -11324,8 +11896,6 @@ private:
                 return real_plane(b_.CreateUnaryIntrinsic(In::exp, x));
             case O::Sqrt:
                 return real_plane(b_.CreateUnaryIntrinsic(In::sqrt, x));
-            case O::Pow:
-                return real_plane(b_.CreateBinaryIntrinsic(In::pow, x, y));
             case O::Floor:
                 return real_plane(b_.CreateUnaryIntrinsic(In::floor, x));
             case O::Ceil:
@@ -11342,10 +11912,6 @@ private:
                 return real_plane(libm_call("acos", x));
             case O::Atan:
                 return real_plane(libm_call("atan", x));
-            case O::Atan2:
-                return real_plane(libm_call("atan2", x, y));
-            case O::Hypot:
-                return real_plane(libm_call("hypot", x, y));
             case O::Sinh:
                 return real_plane(libm_call("sinh", x));
             case O::Cosh:
@@ -11358,8 +11924,30 @@ private:
                 return real_plane(libm_call("acosh", x));
             case O::Atanh:
                 return real_plane(libm_call("atanh", x));
+            case O::Pow:
+            case O::Atan2:
+            case O::Hypot:
+                break;
         }
-        throw BackendError{ "unknown real math op" };
+        throw BackendError{ "internal: two-operand routine on RealMathUnary" };
+    }
+
+    Plane lower_real_math_binary(Index i) {
+        const auto&  p    = ir_->payload(i).op_extra;
+        const auto   info = ir_->extra_data<RealMathBinaryInfo>(p.extra);
+        llvm::Value* x    = fp_of(value_of(p.op));
+        llvm::Value* y    = fp_of(value_of(info.rhs));
+        using O = RealMathOp;
+        switch (static_cast<O>(info.fn)) {
+            case O::Pow:
+                return real_plane(b_.CreateBinaryIntrinsic(llvm::Intrinsic::pow, x, y));
+            case O::Atan2:
+                return real_plane(libm_call("atan2", x, y));
+            case O::Hypot:
+                return real_plane(libm_call("hypot", x, y));
+            default:
+                throw BackendError{ "internal: one-operand routine on RealMathBinary" };
+        }
     }
 
     // -- Arithmetic: any X/Z in an operand makes the whole result X. --
@@ -11818,7 +12406,9 @@ private:
     // ~may; unknown = may & ~must; z = unknown & z-plane; x = unknown & ~z. The
     // selected classes (disjoint per bit) OR together, then popcount. The result
     // is definite (2-state) — counting never propagates X.
-    Plane lower_count_bits(Plane a, uint32_t mask) {
+    // 32-bit definite popcount of the operand bits whose 4-state class is in
+    // `mask` (LRM 20.9).
+    llvm::Value* count_bits_pop(Plane a, uint32_t mask) {
         a = to_four(a);
         const uint32_t w       = width_of(a);
         llvm::Value*   m       = must_of(a);
@@ -11839,7 +12429,28 @@ private:
             sel = b_.CreateOr(sel, b_.CreateAnd(unknown, z));
         }
         llvm::Value* pop = b_.CreateUnaryIntrinsic(llvm::Intrinsic::ctpop, sel);
-        return two_val(cast(pop, 32, false));
+        return cast(pop, 32, false);
+    }
+
+    Plane lower_count_bits(Plane a, uint32_t mask) {
+        return two_val(count_bits_pop(a, mask));
+    }
+
+    // $onehot / $onehot0 (LRM 20.9): popcount of the definite-1 bits compared
+    // against 1. x/z bits are never definite 1, so the result is definite.
+    Plane lower_onehot(Plane a, bool allow_zero) {
+        llvm::Value* pop = count_bits_pop(a, CountOne);
+        llvm::Value* r   = allow_zero ? b_.CreateICmpULE(pop, b_.getInt32(1))
+                                      : b_.CreateICmpEQ(pop, b_.getInt32(1));
+        return two_val(r);
+    }
+
+    // $isunknown (LRM 20.9): the union of the x and z classes is exactly the
+    // unknown plane, so this is one reduction, not a popcount-compare.
+    Plane lower_isunknown(Plane a) {
+        a = to_four(a);
+        llvm::Value* unknown = b_.CreateAnd(may_of(a), b_.CreateNot(must_of(a)));
+        return two_val(b_.CreateICmpNE(unknown, zero(width_of(a))));
     }
 
     Plane lower_clog2(Plane a) {
@@ -11983,6 +12594,37 @@ private:
         return { mm, zero(1) };
     }
 
+    // Whole-aggregate `==` (LRM 11.2.2): recursively AND-reduce per-leaf
+    // logical equality over the member walk. Any definite member mismatch is
+    // 0, else X if any member is unknown, else 1 — the Land reduction carries
+    // LRM 11.4.5 X-propagation exactly.
+    Plane lower_agg_eq(const LValue& lhs, const LValue& rhs, Ref type) {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::Struct && !t.is_packed) {
+            const auto fields = mod_.pool.struct_fields(t.fields_id);
+            Plane      acc{};
+            for (uint32_t k = 0; k < fields.size(); ++k) {
+                const Plane e = lower_agg_eq(agg_member(lhs, type, k), agg_member(rhs, type, k),
+                                             fields[k].type);
+                acc = k == 0 ? e : lower_logical(Inst::Tag::Land, acc, e);
+            }
+            return acc;
+        }
+        if (t.kind == Type::Kind::String) {
+            llvm::Value* c = b_.CreateCall(str_cmp_fn(), { lv_string_ptr(lhs), lv_string_ptr(rhs) });
+            llvm::Value* bit = b_.CreateICmpEQ(c, b_.getInt32(0));
+            return bit_plane(bit, bit);
+        }
+        const ValType vt = from_ref(type);
+        Plane         pa = lower_load(lhs);
+        Plane         pb = lower_load(rhs);
+        if (vt.is_real) {
+            pa = real_plane(planes_to_real(pa, vt.width));
+            pb = real_plane(planes_to_real(pb, vt.width));
+        }
+        return lower_compare(Inst::Tag::Eq, pa, pb, vt.is_signed);
+    }
+
     Plane lower_compare(Inst::Tag tag, Plane a, Plane b, bool sign) {
         // The result is always a definite 4-state bit (compute_type), so lift a
         // 2-state operand into the packed encoding; with no x/z the any_unknown
@@ -12094,6 +12736,31 @@ private:
     // running `==` gives exactly that: the right is known on kept bits so only a
     // left x/z can make a kept position unknown, and a definite mismatch on any
     // kept position still decides the result.
+    // `inside` (LRM 11.4.13): OR-reduce the wildcard-eq singular members and
+    // the >=/<= range members. lower_logical carries the LRM 11.4.5
+    // X-propagation of the reduction.
+    Plane lower_inside_set(Index i) {
+        const auto& p    = ir_->payload(i).op_extra;
+        const auto  info = ir_->extra_data<InsideSetInfo>(p.extra);
+        const Plane sel  = value_of(p.op);
+        const bool  sign = type_of(p.op).is_signed;
+
+        std::optional<Plane> acc;
+        const auto add = [&](Plane pred) {
+            acc = acc ? lower_logical(Inst::Tag::Lor, *acc, pred) : pred;
+        };
+        for (const Index v : ir_->region(info.values)) {
+            add(lower_wildeq(sel, value_of(v)));
+        }
+        const std::span<const Index> rngs = ir_->region(info.ranges);
+        for (size_t k = 0; k + 1 < rngs.size(); k += 2) {
+            const Plane ge = lower_compare(Inst::Tag::Ge, sel, value_of(rngs[k]), sign);
+            const Plane le = lower_compare(Inst::Tag::Le, sel, value_of(rngs[k + 1]), sign);
+            add(lower_logical(Inst::Tag::Land, ge, le));
+        }
+        return *acc;
+    }
+
     Plane lower_wildeq(Plane a, Plane b) {
         const uint32_t w     = std::max(width_of(a), width_of(b));
         // Definite 4-state bit result; lift operands. 2-state operands have no
@@ -12261,6 +12928,39 @@ private:
             first = false;
         }
         return packed(must, may, z);
+    }
+
+    // {<<S{x}}: reverse the order of the operand's S-bit blocks, sliced from
+    // the LSB (a final partial block keeps its own width; block 0 lands at the
+    // MSB). Applied to each plane independently — a pure bit permutation.
+    llvm::Value* reverse_blocks(llvm::Value* v, uint32_t w, uint32_t slice) {
+        const uint32_t n     = (w + slice - 1) / slice;
+        llvm::Value*   acc   = zero(w);
+        bool           first = true;
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t lo = i * slice;
+            const uint32_t bw = std::min<uint32_t>((i + 1) * slice, w) - lo;
+            llvm::Value*   blk =
+              b_.CreateAnd(b_.CreateLShr(v, lo),
+                           llvm::ConstantInt::get(ctx_, llvm::APInt::getLowBitsSet(w, bw)));
+            // Skip the shift before the first block: for a single block bw == w,
+            // and a shift by the full width is poison in LLVM.
+            if (!first) {
+                acc = b_.CreateShl(acc, bw);
+            }
+            acc   = b_.CreateOr(acc, blk);
+            first = false;
+        }
+        return acc;
+    }
+
+    Plane lower_stream_reverse(Plane v, uint32_t slice) {
+        const uint32_t w = width_of(v);
+        if (v.two) {
+            return two_val(reverse_blocks(v.mm, w, slice));
+        }
+        return packed(reverse_blocks(must_of(v), w, slice), reverse_blocks(may_of(v), w, slice),
+                      reverse_blocks(z_of(v), w, slice));
     }
 
     Plane lower_repl(Plane v, uint32_t part_width, uint32_t count) {
@@ -12505,6 +13205,8 @@ private:
     // Instance-scope anchors, one per scope occurrence (see Anchor); filled by
     // scope_type, symbols created by emit_state_global.
     std::vector<Anchor> anchors_;
+    // InstanceScope::id -> anchor index (no_anchor when the id is unknown).
+    std::vector<uint32_t> anchor_of_scope_;
 
     // VCD dirty set (meaningful iff design_uses_vcd_). vcd_index_[sig] is the
     // runtime dump-var index of a dumped scalar signal, or -1 when the signal is
@@ -12573,6 +13275,18 @@ private:
     // The current coroutine's scheduled flag: &clotho.proc_sched[this process] for
     // a process (a Constant GEP), or a frame-resident i32 alloca for a task.
     llvm::Value*        sched_ptr_       = nullptr;
+    // Deferred def-relative sched addressing chosen by lower_group (see
+    // materialize_sched_ptr); no_anchor when the absolute constant is used.
+    uint32_t sched_anchor_  = SignalSlot::no_anchor;
+    uint32_t sched_ordinal_ = 0;
+    // Def-relative NBA block-id base of the current group (see lower_group /
+    // block_register): the i32 global holding the group's first block id, its
+    // entry-materialized load, and the first id itself (-1 until a block opens).
+    llvm::GlobalVariable* blk_base_sym_      = nullptr;
+    llvm::Value*          blk_base_val_      = nullptr;
+    int64_t               group_first_block_ = -1;
+    // (base symbol, first block id) pairs main stores at startup.
+    std::vector<std::pair<llvm::GlobalVariable*, uint32_t>> group_blk_bases_;
     // The shared timer callback (pushes a woken handle onto the active queue) and
     // the active/inactive queue globals, all built once per module. The inactive
     // queue holds processes parked on a zero delay (#0): drained into active at
@@ -12637,6 +13351,10 @@ private:
     std::vector<std::array<llvm::GlobalVariable*, 3>>  wait_sta_gv_;
     std::vector<std::array<llvm::ArrayType*, 3>>       wait_sta_ty_;
     std::vector<std::array<uint32_t, 3>>               wait_sta_cap_;
+    // True (pre-padding) per-instance subscriber counts, and whether the bucket
+    // is padded past them to the definition maximum (see build_wait_queues).
+    std::vector<std::array<uint32_t, 3>> wait_sta_true_;
+    std::vector<std::array<uint8_t, 3>>  wait_sta_padded_;
     std::vector<std::array<llvm::GlobalVariable*, 3>>  wait_dyn_gv_;
     std::vector<std::array<llvm::ArrayType*, 3>>       wait_dyn_ty_;
     std::vector<std::array<llvm::GlobalVariable*, 3>>  wait_dyn_len_gv_;

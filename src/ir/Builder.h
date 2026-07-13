@@ -74,6 +74,9 @@ public:
     // Emit a real math system function call (LRM §20.8.2).
     Index real_math(RealMathOp op, std::span<const Index> args, SourceLoc loc);
     Index repl(Index value, uint32_t count, SourceLoc loc);
+    // {<<slice{...}} block reversal of the built stream value `op` (LRM
+    // 11.4.14.2). The result keeps op's width.
+    Index stream_reverse(Index op, uint32_t slice, SourceLoc loc);
     Index select(Index cond, Index a, Index b, SourceLoc loc);
     Index concat(std::span<const Index> parts, SourceLoc loc);
     Index part_select(Index base, uint32_t msb, uint32_t lsb, SourceLoc loc);
@@ -98,9 +101,13 @@ public:
     // Whole-object blocking copy `dst = src` of two aggregate lvalues of `type`
     // (lowered to llvm.memcpy of the storage; caller ensures no string leaf).
     Index agg_copy(Index dst, Index src, Ref type, SourceLoc loc);
+    // 1-bit 4-state equality of two whole unpacked-aggregate lvalues of `type`
+    // (the backend expands the per-leaf compare + Land reduction).
+    Index agg_eq(Index lhs, Index rhs, Ref type, SourceLoc loc);
     // Dynamic-array operations on the handle lvalue `arr` (LRM 7.5). new /
-    // delete / copy are statements; size yields a 32-bit int. See ir::DynArrayOp.
-    // `array_type` is the interned DynArray type (element stride / slot).
+    // delete / copy are statements; size yields a 32-bit int. Each emits its
+    // dedicated DynArray* tag. `array_type` is the interned DynArray type
+    // (element stride / slot).
     // arr = new[size] [ (init) ]: reallocate; with `has_init`, copy from the
     // source handle lvalue `init`.
     Index dyn_array_new(Index arr, Index size, Index init, bool has_init, Ref array_type, SourceLoc loc);
@@ -117,8 +124,9 @@ public:
     // arr.shuffle() (LRM 7.12.2): randomize element order via the process RNG.
     Index dyn_array_shuffle(Index arr, Ref array_type, SourceLoc loc);
     // Queue operations on the handle lvalue `q` (LRM 7.10.2). size / pop* yield
-    // a value; push* / insert / delete / copy are statements. See ir::QueueOp.
-    // `queue_type` is the interned Queue type (element stride / slot / bound).
+    // a value; push* / insert / delete / copy are statements. Each emits its
+    // dedicated Queue* tag. `queue_type` is the interned Queue type (element
+    // stride / slot / bound).
     // q.size(): current element count (32-bit int).
     Index queue_size(Index q, Ref queue_type, SourceLoc loc);
     // q.push_back(e) / q.push_front(e): append the element value `elem`.
@@ -168,6 +176,8 @@ public:
     // break / continue: jump out of / to the next iteration of the innermost loop.
     Index break_(SourceLoc loc);
     Index continue_(SourceLoc loc);
+    // Return from a void function / task / fork-child body (no operand).
+    Index ret_void(SourceLoc loc);
 
     // -- String ops (unary/binary-shaped ones go through unary()/binary()) --
     // s[i] = c / s.putc(i, c): mutate the string lvalue `str` in place.
@@ -192,6 +202,13 @@ public:
     // bits of `op` whose 4-state value is selected by `mask` (a CountBitsClass
     // OR-mask). Yields a definite 2-state 32-bit int.
     Index count_bits(Index op, uint32_t mask, SourceLoc loc);
+
+    // `sel inside { ... }` (LRM 11.4.13): `values` are the singular members
+    // (wildcard-equality tests), `ranges` back-to-back [lo, hi] operand pairs.
+    // All must already be resized to the selector type. Yields a 1-bit 4-state
+    // value.
+    Index inside_set(Index sel, std::span<const Index> values, std::span<const Index> ranges,
+                     SourceLoc loc);
 
     // -- Timing --
     // Event wait `@(a or posedge b ...)`: suspend until ANY listed (signal, edge)
@@ -222,16 +239,17 @@ public:
     // $fdisplay / $fwrite: like display, but `fd` selects the destination
     // descriptor (an MCD or FD value).
     Index fdisplay(Index fd, std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc);
-    // $fopen: open `name`, yielding a 32-bit descriptor. With `has_mode`, `mode`
-    // is the C stdio mode string and the result is an FD; without it a fresh MCD
-    // is opened for writing (`mode` is ignored, pass any Index).
-    Index fopen(Index name, Index mode, bool has_mode, SourceLoc loc);
+    // Two-argument $fopen: open `name` with the C stdio mode string `mode`,
+    // yielding a 32-bit FD.
+    Index fopen_fd(Index name, Index mode, SourceLoc loc);
+    // One-argument $fopen: open a fresh MCD on `name` for writing.
+    Index fopen_mcd(Index name, SourceLoc loc);
     // $fclose: close the descriptor `handle`. No value.
     Index fclose(Index handle, SourceLoc loc);
-    // $fgetc / $ungetc / $feof / $ftell / $fseek / $rewind: a file read /
-    // positioning function selected by `op`, with `args` its already-lowered value
-    // operands (in call order). Yields a 32-bit integer.
-    Index file_value_op(FileOp op, std::span<const Index> args, SourceLoc loc);
+    // $fseek(fd, offset, operation): seek the descriptor. Yields a 32-bit
+    // integer (0 / -1). $fgetc / $feof / $ftell / $rewind ride the generic
+    // unary() and $ungetc the generic binary() with their dedicated tags.
+    Index fseek(Index fd, Index offset, Index operation, SourceLoc loc);
     // $fgets: read a line from descriptor `fd` into the packed-vector lvalue `dst`.
     // Yields the character count.
     Index fgets(Index dst, Index fd, SourceLoc loc);
@@ -245,7 +263,7 @@ public:
     Index ferror(Index dst, Index fd, SourceLoc loc);
     // $fscanf / $sscanf: parse `source` (an FD value, or a packed string value when
     // `is_string`) per `fmt` into the output lvalues `args`. Yields the conversion
-    // count.
+    // count. `is_string` selects the Sscanf tag.
     Index scanf(Index source, bool is_string, std::string_view fmt, std::span<const Index> args, SourceLoc loc);
     // $fread(reg, fd): read raw bytes from `fd` into the packed-vector lvalue `dst`.
     // Yields the byte count.
@@ -300,9 +318,9 @@ public:
     // $random: a 32-bit signed PRNG draw. No operands.
     Index random(SourceLoc loc);
     // A distribution function (LRM §20.15.2) or seeded $random (§20.15.1): the
-    // DistOp plus its value operands (the seed word, then the parameters).
-    // Yields an i64 with the updated seed packed in [32,64) and the signed draw
-    // in [0,32).
+    // DistOp plus its value operands (the seed word, then the 1-2 parameters —
+    // the count selects the DistUnary / DistBinary tag). Yields an i64 with the
+    // updated seed packed in [32,64) and the signed draw in [0,32).
     Index dist_call(DistOp op, std::span<const Index> args, SourceLoc loc);
     // $urandom (LRM §18.13.1): a 32-bit unsigned per-process xoshiro256++ draw.
     // No operands; reads/advances the process frame RNG.
@@ -332,11 +350,9 @@ public:
     Ir finish();
 
 private:
-    // Shared body of display / fdisplay: emit a Display inst carrying the format
-    // string, the value args, and an optional destination descriptor (`fd` valid
-    // iff `has_fd`; otherwise the backend targets standard output).
-    Index display_impl(Index fd, bool has_fd, std::string_view fmt, bool newline, std::span<const Index> args,
-                       SourceLoc loc);
+    // Shared body of display / fdisplay: pack the format bytes, the value-arg
+    // slice, and the DisplayInfo record into the extra buffer.
+    ExtraIndex display_info(std::string_view fmt, bool newline, std::span<const Index> args);
 
     Index emit(const Inst& inst, SourceLoc loc) {
         const auto index = static_cast<uint32_t>(tags_.size());

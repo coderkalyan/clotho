@@ -235,32 +235,49 @@ struct Analysis {
                     store_into(ir, fn, p.op_extra.op, storage_z(ir, fn, info.src));
                     break;
                 }
-                case Inst::Tag::DynArrayOp:
+                case Inst::Tag::DynArrayNew:
+                case Inst::Tag::DynArrayNewInit:
+                case Inst::Tag::DynArraySize:
+                case Inst::Tag::DynArrayDelete:
+                case Inst::Tag::DynArrayCopy:
                     // size() is a definite int (no z); new / delete / copy write
                     // the handle, not a plane slot, so nothing propagates here.
                     val_z[raw] = 0;
                     break;
-                case Inst::Tag::QueueOp: {
-                    // size() is a definite int (no z). pop* yields an element,
-                    // which for a 4-state element may carry z; report
-                    // conservatively. push / insert / delete / copy are statements
-                    // that write the handle, not a plane slot.
-                    const auto qi = ir.extra_data<QueueInfo>(p.op_extra.extra);
-                    bool       popped_z = false;
-                    if (qi.sub == static_cast<uint32_t>(QueueOp::PopFront) ||
-                        qi.sub == static_cast<uint32_t>(QueueOp::PopBack)) {
-                        const Index root = lvalue_root(ir, p.op_extra.op).root;
-                        if (ir.tag(root) == Inst::Tag::Signal) {
-                            const Ref qty = m.signal(ir.payload(root).signal).type;
-                            popped_z =
-                              m.pool.layout(std::get<Type>(m.pool.get(qty)).element).domain == Domain::Four;
-                        } else {
-                            popped_z = true;
-                        }
-                    }
-                    val_z[raw] = popped_z ? 1 : 0;
+                case Inst::Tag::QueuePopBack:
+                case Inst::Tag::QueuePopFront:
+                    // pop* yields an element, which for a 4-state element may
+                    // carry z (each element keeps its own z plane in the heap
+                    // buffer); report conservatively by element domain.
+                    val_z[raw] =
+                      m.pool.layout(std::get<Type>(m.pool.get(p.op_type.type)).element).domain ==
+                          Domain::Four
+                        ? 1
+                        : 0;
                     break;
-                }
+                case Inst::Tag::QueueSize:
+                case Inst::Tag::QueuePushBack:
+                case Inst::Tag::QueuePushFront:
+                case Inst::Tag::QueueInsert:
+                case Inst::Tag::QueueDeleteIdx:
+                case Inst::Tag::QueueDeleteAll:
+                case Inst::Tag::QueueCopy:
+                    // size() is a definite int (no z); the rest are statements
+                    // that write the handle, not a plane slot.
+                    val_z[raw] = 0;
+                    break;
+                case Inst::Tag::DynArrayReverse:
+                case Inst::Tag::DynArraySort:
+                case Inst::Tag::DynArrayRsort:
+                case Inst::Tag::DynArrayShuffle:
+                case Inst::Tag::QueueReverse:
+                case Inst::Tag::QueueSort:
+                case Inst::Tag::QueueRsort:
+                case Inst::Tag::QueueShuffle:
+                    // Ordering methods (LRM 7.12.2) are void statements that
+                    // permute the handle's buffer in place — no value, no z.
+                    val_z[raw] = 0;
+                    break;
 
                 // Z-transparent value ops: the z plane rides through their
                 // lowerings (an unknown shift count / select condition forces X
@@ -289,6 +306,10 @@ struct Analysis {
                     break;
                 case Inst::Tag::Repl:
                     val_z[raw] = z_of(p.repl.value);
+                    break;
+                case Inst::Tag::StreamReverse:
+                    // A pure bit permutation: z rides through unchanged.
+                    val_z[raw] = z_of(p.op_imm.op);
                     break;
                 case Inst::Tag::Resize:
                     // Sign extension replicates a z MSB; truncation keeps low z
@@ -326,6 +347,10 @@ struct Analysis {
                 case Inst::Tag::Land:
                 case Inst::Tag::Lor:
                 case Inst::Tag::Lnot:
+                // Aggregate equality and the inside operator are compare +
+                // logical reductions: z-absorbing.
+                case Inst::Tag::AggEq:
+                case Inst::Tag::InsideSet:
                     break;
 
                 // Real ops absorb z too: a real value carries no z plane and
@@ -348,13 +373,17 @@ struct Analysis {
                 case Inst::Tag::FtoITrunc:
                 case Inst::Tag::FBitcast:
                 case Inst::Tag::FResize:
-                case Inst::Tag::RealMath:
+                case Inst::Tag::RealMathUnary:
+                case Inst::Tag::RealMathBinary:
                     break;
 
                 case Inst::Tag::Ret:
                     if (fn != nullptr && z_of(p.unary) != 0) {
                         mark(fn->result_z);
                     }
+                    break;
+                case Inst::Tag::RetVoid:
+                    // No value returned; nothing to join.
                     break;
                 case Inst::Tag::Call: {
                     // A function shares the task argument ABI: In copies the actual's
@@ -412,7 +441,8 @@ struct Analysis {
                     }
                     break;
                 }
-                case Inst::Tag::Scanf: {
+                case Inst::Tag::Fscanf:
+                case Inst::Tag::Sscanf: {
                     // Seed: %h / %b / %o accept z and ? digits (LRM Table 21-7),
                     // which land in a 4-state target's z plane. A 2-state target
                     // has no z plane; the runtime drops parsed x/z to 0 there
@@ -438,6 +468,7 @@ struct Analysis {
                 case Inst::Tag::Wait:
                 case Inst::Tag::Fork:
                 case Inst::Tag::Display:
+                case Inst::Tag::FDisplay:
                 case Inst::Tag::TimeFormat:
                 case Inst::Tag::Finish:
                 case Inst::Tag::CaseViol:
@@ -448,7 +479,8 @@ struct Analysis {
                 // $dist_* / seeded $random return a packed {seed, draw} i64 and
                 // $urandom family a 2-state draw — all definite bits, z = 0. The
                 // seed writeback is a plain Store swept by the Store cases.
-                case Inst::Tag::DistCall:
+                case Inst::Tag::DistUnary:
+                case Inst::Tag::DistBinary:
                 case Inst::Tag::Urandom:
                 case Inst::Tag::UrandomSeeded:
                 case Inst::Tag::UrandomRange:
@@ -465,8 +497,12 @@ struct Analysis {
                 // Ctz / Clz count the must plane -> a definite bit index, z = 0.
                 case Inst::Tag::Ctz:
                 case Inst::Tag::Clz:
-                // $countbits family: a definite 2-state count, z = 0.
+                // $countbits family and its one-hot / isunknown qualifiers: a
+                // definite 2-state result, z = 0.
                 case Inst::Tag::CountBits:
+                case Inst::Tag::OneHot:
+                case Inst::Tag::OneHot0:
+                case Inst::Tag::IsUnknown:
                 // String values carry no bit planes and the integral string ops
                 // (len / getc / cmp / to_packed) always produce known bits.
                 case Inst::Tag::StrLen:
@@ -499,9 +535,15 @@ struct Analysis {
                 // target ($*scanf, which can parse z digits, seeds above). A
                 // never-z target's z word is elided and the runtime is handed a
                 // null z pointer.
-                case Inst::Tag::Fopen:
+                case Inst::Tag::FopenFd:
+                case Inst::Tag::FopenMcd:
                 case Inst::Tag::Fclose:
-                case Inst::Tag::FileValueOp:
+                case Inst::Tag::Fgetc:
+                case Inst::Tag::Ungetc:
+                case Inst::Tag::Feof:
+                case Inst::Tag::Ftell:
+                case Inst::Tag::Fseek:
+                case Inst::Tag::Rewind:
                 case Inst::Tag::Fgets:
                 case Inst::Tag::Sformat:
                 case Inst::Tag::Sformatf:

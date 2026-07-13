@@ -509,6 +509,7 @@ public:
         ir::InstanceScope* self = node;
         if (pass == Pass::Collect) {
             ir::InstanceScope fresh;
+            fresh.id       = module_.alloc_scope_id();
             fresh.name     = std::string(inst.name);
             fresh.def_name = std::string(inst.getDefinition().name);
             if (scope_stack_.empty()) {
@@ -1346,10 +1347,11 @@ private:
         return b.concat(parts, l);
     }
 
-    // 1-bit 4-state equality of two whole unpacked structs: AND-reduce the
-    // per-leaf `==` results (Land carries the LRM 11.4.5 X-propagation). Both
-    // operands must be struct lvalues (a '{...} pattern compare is a follow-up);
-    // an array member is guarded (element-wise compare is a follow-up).
+    // 1-bit 4-state equality of two whole unpacked structs: one AggEq node the
+    // backend expands into per-leaf `==` results AND-reduced with Land (the
+    // reduction carries the LRM 11.4.5 X-propagation). Both operands must be
+    // struct lvalues (a '{...} pattern compare is a follow-up); an array member
+    // is guarded (element-wise compare is a follow-up).
     ir::Index lower_struct_eq(const Expression& lhs, const Expression& rhs, ir::Builder& b,
                               ir::SourceLoc l) {
         const Expression& le = unwrap_conversion(lhs);
@@ -1358,13 +1360,12 @@ private:
             fail("unpacked struct equality is only supported between struct variables");
         }
         const ir::Ref sty = lower_type(*lhs.type);
-        return agg_eq(lower_lvalue(le, b), lower_lvalue(re, b), sty, b, l);
+        guard_agg_eq_members(sty);
+        return b.agg_eq(lower_lvalue(le, b), lower_lvalue(re, b), sty, l);
     }
 
-    // Recursive per-leaf equality AND-reduction of two aggregate lvalues of
-    // `type`. Returns a 1-bit 4-state value. A struct recurses to its members'
-    // leaves; a scalar/string leaf compares directly.
-    ir::Index agg_eq(ir::Index lhs, ir::Index rhs, ir::Ref type, ir::Builder& b, ir::SourceLoc l) {
+    // Reject comparable-aggregate shapes the backend expansion does not cover.
+    void guard_agg_eq_members(ir::Ref type) {
         const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
         if (t.kind == ir::Type::Kind::UnpackedArray) {
             // TODO: equality of an aggregate with an unpacked-array member — an
@@ -1372,17 +1373,10 @@ private:
             fail("equality of an aggregate with an unpacked-array member is not supported");
         }
         if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
-            const auto fields = module_.pool.struct_fields(t.fields_id);
-            ir::Index  acc    = ir::Index{ 0 };
-            for (uint32_t i = 0; i < fields.size(); ++i) {
-                const ir::Index e = agg_eq(b.member_select(lhs, i, type, l),
-                                           b.member_select(rhs, i, type, l), fields[i].type, b, l);
-                acc = i == 0 ? e : b.binary(ir::Inst::Tag::Land, acc, e, l);
+            for (const auto& f : module_.pool.struct_fields(t.fields_id)) {
+                guard_agg_eq_members(f.type);
             }
-            return acc;
         }
-        return b.binary(ir::Inst::Tag::Eq, b.unary(ir::Inst::Tag::Load, lhs, l),
-                        b.unary(ir::Inst::Tag::Load, rhs, l), l);
     }
 
     // Strip an outer identity/struct Conversion wrapper slang may insert on a
@@ -2148,7 +2142,8 @@ private:
                                          .wait_events = std::move(wait_events),
                                          .self_start  = true,
                                          .loc         = l,
-                                         .ir          = b.finish() });
+                                         .ir          = b.finish(),
+                                         .scope       = cur_scope_id() });
     }
 
     // A net declaration assignment (`wire w = expr;`) is a continuous assignment
@@ -2395,7 +2390,8 @@ private:
                                          .wait_events = std::move(wait_events),
                                          .self_start  = true,
                                          .loc         = l,
-                                         .ir          = b.finish() });
+                                         .ir          = b.finish(),
+                                         .scope       = cur_scope_id() });
 
         return GateInput{ .sig = tmp, .bit = 0 };
     }
@@ -2755,7 +2751,8 @@ private:
                                          .wait_events = std::move(wait_events),
                                          .self_start  = self_start,
                                          .loc         = to_source_loc(sym.location),
-                                         .ir          = std::move(body_ir) });
+                                         .ir          = std::move(body_ir),
+                                         .scope       = cur_scope_id() });
     }
 
     // True if `tc` is an @-style event control (the kinds usable as a process's
@@ -5259,35 +5256,25 @@ private:
         // which 4-state values to tally.
         const ir::Index val = lower_expr(*args[0], b);
 
-        uint32_t mask = ir::CountOne; // $countones / $onehot* count definite-1 bits
-        if (name == "$isunknown") {
-            mask = ir::CountX | ir::CountZ;
+        // $onehot / $onehot0 / $isunknown carry their qualifier in the tag.
+        if (name == "$onehot") {
+            return b.resize(b.unary(ir::Inst::Tag::OneHot, val, l), lower_type(*call.type), l);
         }
-        else if (name == "$countbits") {
+        if (name == "$onehot0") {
+            return b.resize(b.unary(ir::Inst::Tag::OneHot0, val, l), lower_type(*call.type), l);
+        }
+        if (name == "$isunknown") {
+            return b.resize(b.unary(ir::Inst::Tag::IsUnknown, val, l), lower_type(*call.type), l);
+        }
+
+        uint32_t mask = ir::CountOne; // $countones counts definite-1 bits
+        if (name == "$countbits") {
             mask = 0;
             for (size_t k = 1; k < args.size(); ++k) {
                 mask |= count_control_class(*args[k]);
             }
         }
-
-        const ir::Index count = b.count_bits(val, mask, l);
-
-        if (name == "$countones" || name == "$countbits") {
-            return b.resize(count, lower_type(*call.type), l);
-        }
-        // $onehot -> count == 1; $onehot0 -> count <= 1; $isunknown -> count != 0.
-        ir::Inst::Tag   op  = ir::Inst::Tag::Ne;
-        uint64_t        rhs = 0;
-        if (name == "$onehot") {
-            op  = ir::Inst::Tag::Eq;
-            rhs = 1;
-        }
-        else if (name == "$onehot0") {
-            op  = ir::Inst::Tag::Le;
-            rhs = 1;
-        }
-        return b.resize(b.binary(op, count, b.constant(module_.pool.put_int(i32, rhs), l), l),
-                        lower_type(*call.type), l);
+        return b.resize(b.count_bits(val, mask, l), lower_type(*call.type), l);
     }
 
     // Lower a system function call used as an rvalue (e.g. `$time`). User function
@@ -5579,10 +5566,11 @@ private:
             if (args.empty() || args.size() > 2) {
                 fail("$fopen expects one or two arguments");
             }
-            const ir::Index fname    = lower_string_arg(*args[0], b);
-            const bool      has_mode = args.size() == 2;
-            const ir::Index mode     = has_mode ? lower_string_arg(*args[1], b) : fname;
-            return b.fopen(fname, mode, has_mode, l);
+            const ir::Index fname = lower_string_arg(*args[0], b);
+            if (args.size() == 2) {
+                return b.fopen_fd(fname, lower_string_arg(*args[1], b), l);
+            }
+            return b.fopen_mcd(fname, l);
         }
 
         // $fgetc / $ungetc / $feof / $ftell / $fseek / $rewind (LRM §21.3): file
@@ -5591,25 +5579,25 @@ private:
         // call order.
         if (name == "$fgetc" || name == "$feof" || name == "$ftell" || name == "$rewind" ||
             name == "$ungetc" || name == "$fseek") {
-            ir::FileOp op;
-            size_t     want;
+            ir::Inst::Tag tag;
+            size_t        want;
             if (name == "$fgetc") {
-                op   = ir::FileOp::Fgetc;
+                tag  = ir::Inst::Tag::Fgetc;
                 want = 1;
             } else if (name == "$feof") {
-                op   = ir::FileOp::Feof;
+                tag  = ir::Inst::Tag::Feof;
                 want = 1;
             } else if (name == "$ftell") {
-                op   = ir::FileOp::Ftell;
+                tag  = ir::Inst::Tag::Ftell;
                 want = 1;
             } else if (name == "$rewind") {
-                op   = ir::FileOp::Rewind;
+                tag  = ir::Inst::Tag::Rewind;
                 want = 1;
             } else if (name == "$ungetc") {
-                op   = ir::FileOp::Ungetc;
+                tag  = ir::Inst::Tag::Ungetc;
                 want = 2;
             } else {
-                op   = ir::FileOp::Fseek;
+                tag  = ir::Inst::Tag::Fseek;
                 want = 3;
             }
             const auto args = call.arguments();
@@ -5621,7 +5609,13 @@ private:
             for (const Expression* a : args) {
                 vals.push_back(lower_expr(*a, b));
             }
-            return b.file_value_op(op, vals, l);
+            if (want == 1) {
+                return b.unary(tag, vals[0], l);
+            }
+            if (want == 2) {
+                return b.binary(tag, vals[0], vals[1], l);
+            }
+            return b.fseek(vals[0], vals[1], vals[2], l);
         }
 
         // $fgets(str, fd) (LRM §21.3.4): read a line into the packed-vector lvalue
@@ -6833,25 +6827,12 @@ private:
         const uint64_t W = sc.getBitstreamWidth();
         const uint64_t S = sc.getSliceSize();
 
-        // sliceSize > 0: '<<' — reverse order of S-bit blocks sliced from the
-        // right. Block i covers bits [min((i+1)*S,W)-1 : i*S]; reversed output
-        // places block 0 (rightmost) in the MSB position (first concat arg).
-        // Extract each block via logical-right-shift + resize (PartSelect is
-        // lvalue-only in the backend and cannot be used on intermediate values).
+        // sliceSize > 0: '<<' — reverse the order of the stream's S-bit blocks
+        // (block i covers bits [min((i+1)*S,W)-1 : i*S]; block 0, the
+        // rightmost, lands at the MSB). One StreamReverse node; the backend
+        // owns the per-plane block permutation.
         if (S > 0) {
-            const uint64_t N = (W + S - 1) / S;
-            std::vector<ir::Index> blocks;
-            blocks.reserve(N);
-            const bool is_four = module_.pool.layout(target_ty).domain == ir::Domain::Four;
-            for (uint64_t i = 0; i < N; ++i) {
-                const uint32_t lo    = static_cast<uint32_t>(i * S);
-                const uint32_t bw    = static_cast<uint32_t>(std::min((i + 1) * S, W) - lo);
-                const ir::Ref  sh_ty = make_int_type(static_cast<uint32_t>(W), false, false);
-                const ir::Index sh   = b.constant(module_.pool.put_int(sh_ty, lo), l);
-                const ir::Index srl  = b.binary(ir::Inst::Tag::Srl, raw, sh, l);
-                blocks.push_back(b.resize(srl, make_int_type(bw, is_four, false), l));
-            }
-            raw = b.concat(blocks, l);
+            raw = b.stream_reverse(raw, static_cast<uint32_t>(S), l);
         }
 
         // Widen if the target is wider than the stream (LRM §11.4.14: zero-fill
@@ -7500,44 +7481,39 @@ private:
             // carry no x/z, so it reduces to == / >= && <=).
             fail("inside operator over real operands is not supported");
         }
-        const ir::Ref             ty  = lower_type(*e.left().type);
-        const ir::Index           sel = lower_expr(e.left(), b);
-        std::optional<ir::Index>  acc;
+        // One InsideSet node carries the whole set; member operands are still
+        // evaluated in source order. A `[lo:hi]` range tests
+        // `sel >= lo && sel <= hi`; a singular member uses ==? wildcard
+        // equality, where only the member's own x/z bits are wildcards
+        // (LRM 11.4.13), which is exactly WildEq's right-operand-wildcards
+        // semantics.
+        const ir::Ref          ty  = lower_type(*e.left().type);
+        const ir::Index        sel = lower_expr(e.left(), b);
+        std::vector<ir::Index> values;
+        std::vector<ir::Index> ranges;
         for (const Expression* m : e.rangeList()) {
-            const ir::Index pred = lower_inside_member(*m, sel, ty, b);
-            acc = acc ? b.binary(ir::Inst::Tag::Lor, *acc, pred, l) : pred;
-        }
-        return *acc;
-    }
-
-    // One `inside` range_list member's 1-bit predicate. A `[lo:hi]` range is
-    // `sel >= lo && sel <= hi`; a singular member uses ==? wildcard equality, where
-    // only the member's own x/z bits are wildcards (LRM 11.4.13), which is exactly
-    // WildEq's right-operand-wildcards semantics.
-    ir::Index lower_inside_member(const Expression& m, ir::Index sel, ir::Ref ty, ir::Builder& b) {
-        if (m.kind == ExpressionKind::ValueRange) {
-            const auto& vr = m.as<ValueRangeExpression>();
-            if (vr.rangeKind != ValueRangeKind::Simple) {
-                // TODO: tolerance ranges (`[c +/- d]`, `[c +%- d]`, LRM 11.4.13).
-                fail("inside operator tolerance ranges are not supported");
+            if (m->kind == ExpressionKind::ValueRange) {
+                const auto& vr = m->as<ValueRangeExpression>();
+                if (vr.rangeKind != ValueRangeKind::Simple) {
+                    // TODO: tolerance ranges (`[c +/- d]`, `[c +%- d]`, LRM 11.4.13).
+                    fail("inside operator tolerance ranges are not supported");
+                }
+                if (vr.left().type->isUnbounded() || vr.right().type->isUnbounded()) {
+                    // TODO: unbounded `$` range bounds (`[lo:$]` / `[$:hi]`).
+                    fail("inside operator unbounded ($) range bounds are not supported");
+                }
+                ranges.push_back(b.resize(lower_expr(vr.left(), b), ty, loc(vr.left())));
+                ranges.push_back(b.resize(lower_expr(vr.right(), b), ty, loc(vr.right())));
+                continue;
             }
-            if (vr.left().type->isUnbounded() || vr.right().type->isUnbounded()) {
-                // TODO: unbounded `$` range bounds (`[lo:$]` / `[$:hi]`).
-                fail("inside operator unbounded ($) range bounds are not supported");
+            if (m->type->getCanonicalType().isUnpackedArray()) {
+                // TODO: an unpacked-array set member (`sel inside {arr}`) matches any
+                // element (LRM 11.4.13 array unwrap); needs runtime element iteration.
+                fail("inside operator with an unpacked-array set member is not supported");
             }
-            const ir::Index lo = b.resize(lower_expr(vr.left(), b), ty, loc(vr.left()));
-            const ir::Index hi = b.resize(lower_expr(vr.right(), b), ty, loc(vr.right()));
-            const ir::Index ge = b.binary(ir::Inst::Tag::Ge, sel, lo, loc(m));
-            const ir::Index le = b.binary(ir::Inst::Tag::Le, sel, hi, loc(m));
-            return b.binary(ir::Inst::Tag::Land, ge, le, loc(m));
+            values.push_back(b.resize(lower_expr(*m, b), ty, loc(*m)));
         }
-        if (m.type->getCanonicalType().isUnpackedArray()) {
-            // TODO: an unpacked-array set member (`sel inside {arr}`) matches any
-            // element (LRM 11.4.13 array unwrap); needs runtime element iteration.
-            fail("inside operator with an unpacked-array set member is not supported");
-        }
-        const ir::Index val = b.resize(lower_expr(m, b), ty, loc(m));
-        return b.binary(ir::Inst::Tag::WildEq, sel, val, loc(m));
+        return b.inside_set(sel, values, ranges, l);
     }
 
     // Build the lvalue for a part-select over an already-lowered base lvalue: a
@@ -7900,12 +7876,6 @@ private:
         return b.signal(signal_of(vs), l);
     }
 
-    // A 1-bit zero, used as the (ignored) operand of a void function's Ret. Ret
-    // always carries an operand; the backend drops it for a void return.
-    ir::Index void_ret_operand(ir::Builder& b, ir::SourceLoc l) {
-        return b.constant(module_.pool.put_int(make_int_type(1, false, false), 0), l);
-    }
-
     void lower_return(const ReturnStatement& r, ir::Builder& b) {
         if (fn_ctx_ == nullptr) {
             fail("return statement outside of a function");
@@ -7952,7 +7922,7 @@ private:
             b.unary(ir::Inst::Tag::Ret,
                     is_handle_ref(fn_ctx_->ret_type) ? rv : b.unary(ir::Inst::Tag::Load, rv, l), l);
         } else {
-            b.unary(ir::Inst::Tag::Ret, void_ret_operand(b, l), l);
+            b.ret_void(l);
         }
     }
 
@@ -8124,7 +8094,7 @@ private:
         // whole-function scans in the backend (nba shadow, ptr-arg signals).
         ir::Builder         b(module_.pool);
         const ir::SourceLoc el = to_source_loc(sub.location);
-        b.unary(ir::Inst::Tag::Ret, void_ret_operand(b, el), el);
+        b.ret_void(el);
 
         // Mirror param_types into local_types (formal k == Local k), the invariant
         // every whole-function analysis assumes (e.g. compute_may_z joins param_z
@@ -8378,7 +8348,7 @@ private:
 
         // Fall-through return: the void Ret drives the backend's copy-out epilogue.
         const ir::SourceLoc el = to_source_loc(sub.location);
-        b.unary(ir::Inst::Tag::Ret, void_ret_operand(b, el), el);
+        b.ret_void(el);
 
         module_.set_function(id, ir::Function{ .name        = std::string(sub.name),
                                                .return_type = module_.pool.void_type,
@@ -8413,7 +8383,7 @@ private:
         ir::Builder b(module_.pool);
         lower_stmt(body, b);
         const ir::SourceLoc el = loc(body);
-        b.unary(ir::Inst::Tag::Ret, void_ret_operand(b, el), el);
+        b.ret_void(el);
 
         module_.set_function(id, ir::Function{ .name          = "fork.child",
                                                .return_type   = module_.pool.void_type,
@@ -8488,7 +8458,7 @@ private:
         // storage out through the trailing return out-param), not a loaded value.
         const ir::SourceLoc el = to_source_loc(sub.location);
         if (is_void) {
-            b.unary(ir::Inst::Tag::Ret, void_ret_operand(b, el), el);
+            b.ret_void(el);
         } else if (is_aggregate(sub.returnValVar->getType())) {
             b.unary(ir::Inst::Tag::Ret, b.local(ctx.ret_local, ctx.ret_type, el), el);
         } else {
@@ -8826,6 +8796,12 @@ private:
     // currently being lowered; register_signal records into its back().
     ir::InstanceScope               top_scope_;
     std::vector<ir::InstanceScope*> scope_stack_;
+
+    // Scope id of the instance currently being lowered, for Process::scope;
+    // no_scope outside any instance (the package/$unit Lowerer).
+    uint32_t cur_scope_id() const {
+        return scope_stack_.empty() ? ir::Process::no_scope : scope_stack_.back()->id;
+    }
     // Scope of the instance body currently being lowered; used to fold constant
     // expressions (parameter references and arithmetic over them).
     const slang::ast::Scope* scope_ = nullptr;

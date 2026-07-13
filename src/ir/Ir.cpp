@@ -49,11 +49,12 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
         case Inst::PayloadKind::Extra: {
             // loop: its predicate and regions are not top-level SSA operands
             // (the predicate lives inside the cond region, walked via region()).
-            // finish: its FinishInfo carries only the diag level and banner bytes,
-            // no SSA operands. test_plusargs: its TestPlusArgsInfo carries only
-            // the query-string bytes, no SSA operands.
+            // finish / case_viol / test_plusargs carry only banner / query
+            // bytes, no SSA operands. fork's children are FunctionIds, not
+            // operands.
             if (tag == Inst::Tag::Loop || tag == Inst::Tag::Finish ||
-                tag == Inst::Tag::TestPlusArgs) {
+                tag == Inst::Tag::CaseViol || tag == Inst::Tag::TestPlusArgs ||
+                tag == Inst::Tag::Fork) {
                 return {};
             }
             // concat: variadic operands live in the extra buffer.
@@ -68,17 +69,17 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
             return index_slice(info.args);
         }
 
+        case Inst::PayloadKind::FDisplay: {
+            // fdisplay: like display; the descriptor (op_extra.op) cannot ride
+            // the same span as the variadic args (see the header NOTE).
+            const auto info = extra_data<DisplayInfo>(p.op_extra.extra);
+            return index_slice(info.args);
+        }
+
         case Inst::PayloadKind::Severity: {
             // severity: the message value args are an index slice in the
             // SeverityInfo record; the format string and banner are not operands.
             const auto info = extra_data<SeverityInfo>(p.extra);
-            return index_slice(info.args);
-        }
-
-        case Inst::PayloadKind::FileOp: {
-            // file_value_op: the value args live in the FileOpInfo record; the
-            // opcode is not an SSA operand.
-            const auto info = extra_data<FileOpInfo>(p.extra);
             return index_slice(info.args);
         }
 
@@ -103,19 +104,9 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
             return index_slice(info.args);
         }
 
-        case Inst::PayloadKind::RealMath: {
-            // real_math: the value args live in the RealMathInfo record; the
-            // opcode is not an SSA operand.
-            const auto info = extra_data<RealMathInfo>(p.extra);
-            return index_slice(info.args);
-        }
-
-        case Inst::PayloadKind::Dist: {
-            // dist_call: the seed + parameter operands live in the DistInfo
-            // record; the DistOp opcode is not an SSA operand.
-            const auto info = extra_data<DistInfo>(p.extra);
-            return index_slice(info.args);
-        }
+        case Inst::PayloadKind::OpImm:
+            scratch[0] = p.op_imm.op;
+            return { scratch.data(), 1 };
 
         case Inst::PayloadKind::TimeFormat: {
             // timeformat: units / precision / min_width are SSA operands; the
@@ -147,6 +138,37 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 scratch[1]    = es.index;
                 return { scratch.data(), 2 };
             }
+            // dist_unary / dist_binary expose the seed word plus the
+            // distribution parameter(s); the DistOp selector is not an operand.
+            if (tag == Inst::Tag::DistUnary) {
+                const auto d = extra_data<DistUnaryInfo>(p.op_extra.extra);
+                scratch[0]   = p.op_extra.op;
+                scratch[1]   = d.p1;
+                return { scratch.data(), 2 };
+            }
+            if (tag == Inst::Tag::DistBinary) {
+                const auto d = extra_data<DistBinaryInfo>(p.op_extra.extra);
+                scratch[0]   = p.op_extra.op;
+                scratch[1]   = d.p1;
+                scratch[2]   = d.p2;
+                return { scratch.data(), 3 };
+            }
+            // real_math_binary exposes its two real operands; the routine
+            // selector is not an operand.
+            if (tag == Inst::Tag::RealMathBinary) {
+                const auto rm = extra_data<RealMathBinaryInfo>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = rm.rhs;
+                return { scratch.data(), 2 };
+            }
+            // fseek exposes its descriptor plus the offset / operation operands.
+            if (tag == Inst::Tag::Fseek) {
+                const auto fs = extra_data<FseekInfo>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = fs.offset;
+                scratch[2]    = fs.operation;
+                return { scratch.data(), 3 };
+            }
             // dyn_part_select exposes its base and the runtime offset value; the
             // constant width is not an operand.
             if (tag == Inst::Tag::DynPartSelect) {
@@ -154,17 +176,6 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 scratch[0]     = p.op_extra.op;
                 scratch[1]     = dps.offset;
                 return { scratch.data(), 2 };
-            }
-            // fopen exposes its filename value plus the optional mode-string
-            // operand of the two-argument form.
-            if (tag == Inst::Tag::Fopen) {
-                const auto fo = extra_data<FopenInfo>(p.op_extra.extra);
-                size_t     n  = 0;
-                scratch[n++]  = p.op_extra.op;
-                if (fo.has_mode) {
-                    scratch[n++] = fo.mode;
-                }
-                return { scratch.data(), n };
             }
             // fread_mem exposes its fd value plus the optional start / count
             // operands; the target memory is a Signal handle, not an operand.
@@ -234,37 +245,46 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 scratch[1]      = info.src;
                 return { scratch.data(), 2 };
             }
-            // dyn_array_op exposes the handle lvalue plus the size / src
-            // operands its sub-op takes; the sub-op selector is not an operand.
-            if (tag == Inst::Tag::DynArrayOp) {
-                const auto da  = extra_data<DynArrayInfo>(p.op_extra.extra);
-                const auto sub = static_cast<DynArrayOp>(da.sub);
-                size_t     n   = 0;
-                scratch[n++]   = p.op_extra.op;
-                if (sub == DynArrayOp::New || sub == DynArrayOp::NewInit) {
-                    scratch[n++] = da.size;
-                }
-                if (sub == DynArrayOp::NewInit || sub == DynArrayOp::Copy) {
-                    scratch[n++] = da.src;
-                }
-                return { scratch.data(), n };
+            if (tag == Inst::Tag::AggEq) {
+                // Both compared aggregate lvalues are referenced.
+                const auto info = extra_data<AggEqInfo>(p.op_extra.extra);
+                scratch[0]      = p.op_extra.op;
+                scratch[1]      = info.rhs;
+                return { scratch.data(), 2 };
             }
-            // queue_op exposes the handle lvalue plus the idx / val operands its
-            // sub-op takes (position for Insert / DeleteIdx; element value or
-            // Copy source lvalue); the sub-op selector is not an operand.
-            if (tag == Inst::Tag::QueueOp) {
-                const auto qi  = extra_data<QueueInfo>(p.op_extra.extra);
-                const auto sub = static_cast<QueueOp>(qi.sub);
-                size_t     n   = 0;
-                scratch[n++]   = p.op_extra.op;
-                if (sub == QueueOp::Insert || sub == QueueOp::DeleteIdx) {
-                    scratch[n++] = qi.idx;
-                }
-                if (sub == QueueOp::PushBack || sub == QueueOp::PushFront ||
-                    sub == QueueOp::Insert || sub == QueueOp::Copy) {
-                    scratch[n++] = qi.val;
-                }
-                return { scratch.data(), n };
+            // dyn_array_new / dyn_array_copy expose the handle lvalue plus
+            // their DynArrayArg operand (element count / copy source).
+            if (tag == Inst::Tag::DynArrayNew || tag == Inst::Tag::DynArrayCopy) {
+                const auto da = extra_data<DynArrayArg>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = da.arg;
+                return { scratch.data(), 2 };
+            }
+            // dyn_array_new_init exposes the handle lvalue, element count, and
+            // the copy-source handle lvalue.
+            if (tag == Inst::Tag::DynArrayNewInit) {
+                const auto da = extra_data<DynArrayNewInitInfo>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = da.size;
+                scratch[2]    = da.src;
+                return { scratch.data(), 3 };
+            }
+            // The one-extra-operand queue ops expose the handle lvalue plus
+            // their QueueArg operand (element value / position / copy source).
+            if (tag == Inst::Tag::QueuePushBack || tag == Inst::Tag::QueuePushFront ||
+                tag == Inst::Tag::QueueDeleteIdx || tag == Inst::Tag::QueueCopy) {
+                const auto qa = extra_data<QueueArg>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = qa.arg;
+                return { scratch.data(), 2 };
+            }
+            // queue_insert exposes the handle lvalue, position, and element value.
+            if (tag == Inst::Tag::QueueInsert) {
+                const auto qi = extra_data<QueueInsertInfo>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = qi.idx;
+                scratch[2]    = qi.val;
+                return { scratch.data(), 3 };
             }
             scratch[0] = p.op_extra.op;
             return { scratch.data(), 1 };

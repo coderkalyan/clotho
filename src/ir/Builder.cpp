@@ -103,14 +103,23 @@ Index Builder::float_cvt(Inst::Tag tag, Index op, Ref type, SourceLoc loc) {
 }
 
 Index Builder::real_math(RealMathOp op, std::span<const Index> args, SourceLoc loc) {
-    const ExtraSlice slice = add_slice(args);
-    const ExtraIndex extra = add_extra(RealMathInfo{ static_cast<uint32_t>(op), slice });
+    if (args.size() == 2) {
+        const ExtraIndex extra = add_extra(RealMathBinaryInfo{ args[1], static_cast<uint32_t>(op) });
 
-    return emit({ Inst::Tag::RealMath, pay(&Inst::Payload::extra, extra) }, loc);
+        return emit({ Inst::Tag::RealMathBinary, Inst::Payload{ .op_extra = { args[0], extra } } },
+                    loc);
+    }
+    return emit({ Inst::Tag::RealMathUnary,
+                  Inst::Payload{ .op_imm = { args[0], static_cast<uint32_t>(op) } } },
+                loc);
 }
 
 Index Builder::repl(Index value, uint32_t count, SourceLoc loc) {
     return emit({ Inst::Tag::Repl, Inst::Payload{ .repl = { value, count } } }, loc);
+}
+
+Index Builder::stream_reverse(Index op, uint32_t slice, SourceLoc loc) {
+    return emit({ Inst::Tag::StreamReverse, Inst::Payload{ .op_imm = { op, slice } } }, loc);
 }
 
 Index Builder::select(Index cond, Index a, Index b, SourceLoc loc) {
@@ -164,117 +173,103 @@ Index Builder::agg_copy(Index dst, Index src, Ref type, SourceLoc loc) {
     return emit({ Inst::Tag::AggCopy, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
 }
 
-Index Builder::dyn_array_new(Index arr, Index size, Index init, bool has_init, Ref array_type, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(
-      DynArrayInfo{ static_cast<uint32_t>(has_init ? DynArrayOp::NewInit : DynArrayOp::New), size,
-                    has_init ? init : arr, array_type });
+Index Builder::agg_eq(Index lhs, Index rhs, Ref type, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(AggEqInfo{ rhs, type });
 
-    return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { arr, extra } } }, loc);
+    return emit({ Inst::Tag::AggEq, Inst::Payload{ .op_extra = { lhs, extra } } }, loc);
+}
+
+Index Builder::dyn_array_new(Index arr, Index size, Index init, bool has_init, Ref array_type, SourceLoc loc) {
+    if (has_init) {
+        const ExtraIndex extra = add_extra(DynArrayNewInitInfo{ size, init, array_type });
+
+        return emit({ Inst::Tag::DynArrayNewInit, Inst::Payload{ .op_extra = { arr, extra } } },
+                    loc);
+    }
+    const ExtraIndex extra = add_extra(DynArrayArg{ size, array_type });
+
+    return emit({ Inst::Tag::DynArrayNew, Inst::Payload{ .op_extra = { arr, extra } } }, loc);
 }
 
 Index Builder::dyn_array_size(Index arr, Ref array_type, SourceLoc loc) {
-    const ExtraIndex extra =
-      add_extra(DynArrayInfo{ static_cast<uint32_t>(DynArrayOp::Size), arr, arr, array_type });
-
-    return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { arr, extra } } }, loc);
+    return emit({ Inst::Tag::DynArraySize, Inst::Payload{ .op_type = { arr, array_type } } }, loc);
 }
 
 Index Builder::dyn_array_delete(Index arr, Ref array_type, SourceLoc loc) {
-    const ExtraIndex extra =
-      add_extra(DynArrayInfo{ static_cast<uint32_t>(DynArrayOp::Delete), arr, arr, array_type });
-
-    return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { arr, extra } } }, loc);
+    return emit({ Inst::Tag::DynArrayDelete, Inst::Payload{ .op_type = { arr, array_type } } },
+                loc);
 }
 
 Index Builder::dyn_array_copy(Index dst, Index src, Ref array_type, SourceLoc loc) {
-    const ExtraIndex extra =
-      add_extra(DynArrayInfo{ static_cast<uint32_t>(DynArrayOp::Copy), dst, src, array_type });
+    const ExtraIndex extra = add_extra(DynArrayArg{ src, array_type });
 
-    return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+    return emit({ Inst::Tag::DynArrayCopy, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
 }
 
 Index Builder::dyn_array_reverse(Index arr, Ref array_type, SourceLoc loc) {
-    const ExtraIndex extra =
-      add_extra(DynArrayInfo{ static_cast<uint32_t>(DynArrayOp::Reverse), arr, arr, array_type });
-
-    return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { arr, extra } } }, loc);
+    return emit({ Inst::Tag::DynArrayReverse, Inst::Payload{ .op_type = { arr, array_type } } }, loc);
 }
 
 Index Builder::dyn_array_sort(Index arr, bool reversed, Ref array_type, SourceLoc loc) {
-    const auto       sub   = reversed ? DynArrayOp::Rsort : DynArrayOp::Sort;
-    const ExtraIndex extra = add_extra(DynArrayInfo{ static_cast<uint32_t>(sub), arr, arr, array_type });
-
-    return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { arr, extra } } }, loc);
+    const Inst::Tag tag = reversed ? Inst::Tag::DynArrayRsort : Inst::Tag::DynArraySort;
+    return emit({ tag, Inst::Payload{ .op_type = { arr, array_type } } }, loc);
 }
 
 Index Builder::dyn_array_shuffle(Index arr, Ref array_type, SourceLoc loc) {
-    const ExtraIndex extra =
-      add_extra(DynArrayInfo{ static_cast<uint32_t>(DynArrayOp::Shuffle), arr, arr, array_type });
-
-    return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { arr, extra } } }, loc);
+    return emit({ Inst::Tag::DynArrayShuffle, Inst::Payload{ .op_type = { arr, array_type } } }, loc);
 }
 
 Index Builder::queue_size(Index q, Ref queue_type, SourceLoc loc) {
-    const ExtraIndex extra =
-      add_extra(QueueInfo{ static_cast<uint32_t>(QueueOp::Size), q, q, queue_type });
-
-    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
+    return emit({ Inst::Tag::QueueSize, Inst::Payload{ .op_type = { q, queue_type } } }, loc);
 }
 
 Index Builder::queue_push(Index q, Index elem, bool front, Ref queue_type, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(QueueInfo{
-      static_cast<uint32_t>(front ? QueueOp::PushFront : QueueOp::PushBack), q, elem, queue_type });
+    const ExtraIndex extra = add_extra(QueueArg{ elem, queue_type });
 
-    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
+    return emit({ front ? Inst::Tag::QueuePushFront : Inst::Tag::QueuePushBack,
+                  Inst::Payload{ .op_extra = { q, extra } } },
+                loc);
 }
 
 Index Builder::queue_pop(Index q, bool front, Ref queue_type, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(
-      QueueInfo{ static_cast<uint32_t>(front ? QueueOp::PopFront : QueueOp::PopBack), q, q, queue_type });
-
-    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
+    return emit({ front ? Inst::Tag::QueuePopFront : Inst::Tag::QueuePopBack,
+                  Inst::Payload{ .op_type = { q, queue_type } } },
+                loc);
 }
 
 Index Builder::queue_insert(Index q, Index idx, Index elem, Ref queue_type, SourceLoc loc) {
-    const ExtraIndex extra =
-      add_extra(QueueInfo{ static_cast<uint32_t>(QueueOp::Insert), idx, elem, queue_type });
+    const ExtraIndex extra = add_extra(QueueInsertInfo{ idx, elem, queue_type });
 
-    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
+    return emit({ Inst::Tag::QueueInsert, Inst::Payload{ .op_extra = { q, extra } } }, loc);
 }
 
 Index Builder::queue_delete(Index q, Index idx, bool has_idx, Ref queue_type, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(QueueInfo{
-      static_cast<uint32_t>(has_idx ? QueueOp::DeleteIdx : QueueOp::DeleteAll), idx, q, queue_type });
+    if (!has_idx) {
+        return emit({ Inst::Tag::QueueDeleteAll, Inst::Payload{ .op_type = { q, queue_type } } },
+                    loc);
+    }
+    const ExtraIndex extra = add_extra(QueueArg{ idx, queue_type });
 
-    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
+    return emit({ Inst::Tag::QueueDeleteIdx, Inst::Payload{ .op_extra = { q, extra } } }, loc);
 }
 
 Index Builder::queue_copy(Index dst, Index src, Ref queue_type, SourceLoc loc) {
-    const ExtraIndex extra =
-      add_extra(QueueInfo{ static_cast<uint32_t>(QueueOp::Copy), dst, src, queue_type });
+    const ExtraIndex extra = add_extra(QueueArg{ src, queue_type });
 
-    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+    return emit({ Inst::Tag::QueueCopy, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
 }
 
 Index Builder::queue_reverse(Index q, Ref queue_type, SourceLoc loc) {
-    const ExtraIndex extra =
-      add_extra(QueueInfo{ static_cast<uint32_t>(QueueOp::Reverse), q, q, queue_type });
-
-    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
+    return emit({ Inst::Tag::QueueReverse, Inst::Payload{ .op_type = { q, queue_type } } }, loc);
 }
 
 Index Builder::queue_sort(Index q, bool reversed, Ref queue_type, SourceLoc loc) {
-    const auto       sub   = reversed ? QueueOp::Rsort : QueueOp::Sort;
-    const ExtraIndex extra = add_extra(QueueInfo{ static_cast<uint32_t>(sub), q, q, queue_type });
-
-    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
+    const Inst::Tag tag = reversed ? Inst::Tag::QueueRsort : Inst::Tag::QueueSort;
+    return emit({ tag, Inst::Payload{ .op_type = { q, queue_type } } }, loc);
 }
 
 Index Builder::queue_shuffle(Index q, Ref queue_type, SourceLoc loc) {
-    const ExtraIndex extra =
-      add_extra(QueueInfo{ static_cast<uint32_t>(QueueOp::Shuffle), q, q, queue_type });
-
-    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
+    return emit({ Inst::Tag::QueueShuffle, Inst::Payload{ .op_type = { q, queue_type } } }, loc);
 }
 
 Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc,
@@ -330,6 +325,10 @@ Index Builder::loop(ExtraSlice cond_region, Index pred, ExtraSlice body_region, 
 
 Index Builder::break_(SourceLoc loc) {
     return emit({ Inst::Tag::Break, pay(&Inst::Payload::none, 0u) }, loc);
+}
+
+Index Builder::ret_void(SourceLoc loc) {
+    return emit({ Inst::Tag::RetVoid, pay(&Inst::Payload::none, 0u) }, loc);
 }
 
 Index Builder::continue_(SourceLoc loc) {
@@ -388,6 +387,15 @@ Index Builder::count_bits(Index op, uint32_t mask, SourceLoc loc) {
     return emit({ Inst::Tag::CountBits, Inst::Payload{ .op_extra = { op, extra } } }, loc);
 }
 
+Index Builder::inside_set(Index sel, std::span<const Index> values, std::span<const Index> ranges,
+                          SourceLoc loc) {
+    const ExtraSlice vals  = add_slice(values);
+    const ExtraSlice rngs  = add_slice(ranges);
+    const ExtraIndex extra = add_extra(InsideSetInfo{ vals, rngs });
+
+    return emit({ Inst::Tag::InsideSet, Inst::Payload{ .op_extra = { sel, extra } } }, loc);
+}
+
 Index Builder::wait(std::span<const WaitEdge> events, SourceLoc loc) {
     // Pack the WaitEdge records back-to-back, then a WaitInfo pointing at the run.
     const auto start = static_cast<uint32_t>(extra_.size());
@@ -432,42 +440,44 @@ Index Builder::fork(std::span<const FunctionId> children, ForkKind kind, SourceL
 
 Index Builder::display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc) {
     // $display / $write: no descriptor operand; the backend targets standard output.
-    return display_impl(static_cast<Index>(0), false, fmt, newline, args, loc);
+    return emit({ Inst::Tag::Display, pay(&Inst::Payload::extra, display_info(fmt, newline, args)) },
+                loc);
 }
 
 Index Builder::fdisplay(Index fd, std::string_view fmt, bool newline, std::span<const Index> args,
                         SourceLoc loc) {
     // $fdisplay / $fwrite: `fd` selects the destination descriptor.
-    return display_impl(fd, true, fmt, newline, args, loc);
+    return emit({ Inst::Tag::FDisplay,
+                  Inst::Payload{ .op_extra = { fd, display_info(fmt, newline, args) } } },
+                loc);
 }
 
-Index Builder::display_impl(Index fd, bool has_fd, std::string_view fmt, bool newline,
-                            std::span<const Index> args, SourceLoc loc) {
+ExtraIndex Builder::display_info(std::string_view fmt, bool newline, std::span<const Index> args) {
     // Order in the extra buffer: format bytes, then the arg-index slice, then the
     // DisplayInfo record pointing at both. None of the three regions overlap.
     const ExtraIndex fmt_at = add_bytes(fmt);
     const ExtraSlice slice  = add_slice(args);
-    const ExtraIndex extra  = add_extra(DisplayInfo{
-      fmt_at, static_cast<uint32_t>(fmt.size()), newline ? 1u : 0u, fd, has_fd ? 1u : 0u, slice });
 
-    return emit({ Inst::Tag::Display, pay(&Inst::Payload::extra, extra) }, loc);
+    return add_extra(
+      DisplayInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), newline ? 1u : 0u, slice });
 }
 
-Index Builder::fopen(Index name, Index mode, bool has_mode, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(FopenInfo{ mode, has_mode ? 1u : 0u });
+Index Builder::fopen_fd(Index name, Index mode, SourceLoc loc) {
+    return emit({ Inst::Tag::FopenFd, Inst::Payload{ .binary = { name, mode } } }, loc);
+}
 
-    return emit({ Inst::Tag::Fopen, Inst::Payload{ .op_extra = { name, extra } } }, loc);
+Index Builder::fopen_mcd(Index name, SourceLoc loc) {
+    return emit({ Inst::Tag::FopenMcd, pay(&Inst::Payload::unary, name) }, loc);
 }
 
 Index Builder::fclose(Index handle, SourceLoc loc) {
     return emit({ Inst::Tag::Fclose, pay(&Inst::Payload::unary, handle) }, loc);
 }
 
-Index Builder::file_value_op(FileOp op, std::span<const Index> args, SourceLoc loc) {
-    const ExtraSlice slice = add_slice(args);
-    const ExtraIndex extra = add_extra(FileOpInfo{ static_cast<uint32_t>(op), slice });
+Index Builder::fseek(Index fd, Index offset, Index operation, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(FseekInfo{ offset, operation });
 
-    return emit({ Inst::Tag::FileValueOp, pay(&Inst::Payload::extra, extra) }, loc);
+    return emit({ Inst::Tag::Fseek, Inst::Payload{ .op_extra = { fd, extra } } }, loc);
 }
 
 Index Builder::fgets(Index dst, Index fd, SourceLoc loc) {
@@ -514,10 +524,12 @@ Index Builder::scanf(Index source, bool is_string, std::string_view fmt, std::sp
     // the ScanfInfo record pointing at both.
     const ExtraIndex fmt_at = add_bytes(fmt);
     const ExtraSlice slice  = add_slice(args);
-    const ExtraIndex extra  = add_extra(
-      ScanfInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), source, is_string ? 1u : 0u, slice });
+    const ExtraIndex extra =
+      add_extra(ScanfInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), source, slice });
 
-    return emit({ Inst::Tag::Scanf, pay(&Inst::Payload::extra, extra) }, loc);
+    return emit({ is_string ? Inst::Tag::Sscanf : Inst::Tag::Fscanf,
+                  pay(&Inst::Payload::extra, extra) },
+                loc);
 }
 
 Index Builder::finish(std::string_view banner, uint32_t arg, SourceLoc loc) {
@@ -530,7 +542,7 @@ Index Builder::finish(std::string_view banner, uint32_t arg, SourceLoc loc) {
 Index Builder::case_violation(std::string_view banner, uint32_t kind, SourceLoc loc) {
     const ExtraIndex banner_at = add_bytes(banner);
     const ExtraIndex extra =
-      add_extra(FinishInfo{ banner_at, static_cast<uint32_t>(banner.size()), kind });
+      add_extra(CaseViolInfo{ banner_at, static_cast<uint32_t>(banner.size()), kind });
     return emit({ Inst::Tag::CaseViol, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
@@ -590,9 +602,14 @@ Index Builder::random(SourceLoc loc) {
 }
 
 Index Builder::dist_call(DistOp op, std::span<const Index> args, SourceLoc loc) {
-    const ExtraSlice slice = add_slice(args);
-    const ExtraIndex extra = add_extra(DistInfo{ static_cast<uint32_t>(op), slice });
-    return emit({ Inst::Tag::DistCall, pay(&Inst::Payload::extra, extra) }, loc);
+    if (args.size() == 3) {
+        const ExtraIndex extra =
+          add_extra(DistBinaryInfo{ args[1], args[2], static_cast<uint32_t>(op) });
+        return emit({ Inst::Tag::DistBinary, Inst::Payload{ .op_extra = { args[0], extra } } },
+                    loc);
+    }
+    const ExtraIndex extra = add_extra(DistUnaryInfo{ args[1], static_cast<uint32_t>(op) });
+    return emit({ Inst::Tag::DistUnary, Inst::Payload{ .op_extra = { args[0], extra } } }, loc);
 }
 
 Index Builder::urandom(SourceLoc loc) {
