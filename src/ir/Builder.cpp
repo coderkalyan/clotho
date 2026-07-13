@@ -212,7 +212,7 @@ Index Builder::queue_copy(Index dst, Index src, Ref queue_type, SourceLoc loc) {
 
 Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc,
                     bool unlikely) {
-    const ExtraIndex extra = add_extra(Regions{ then_region, else_region, unlikely });
+    const ExtraIndex extra = add_extra(Regions{ then_region, else_region, unlikely ? 1u : 0u });
 
     return emit({ Inst::Tag::Cond, Inst::Payload{ .op_extra = { condition, extra } } }, loc);
 }
@@ -256,7 +256,7 @@ Index Builder::select_lazy(Index pred, ExtraSlice then_region, Index then_val, E
 Index Builder::loop(ExtraSlice cond_region, Index pred, ExtraSlice body_region, ExtraSlice step_region,
                     bool bottom_test, SourceLoc loc) {
     const ExtraIndex extra =
-      add_extra(LoopInfo{ cond_region, pred, body_region, step_region, bottom_test });
+      add_extra(LoopInfo{ cond_region, pred, body_region, step_region, bottom_test ? 1u : 0u });
 
     return emit({ Inst::Tag::Loop, Inst::Payload{ .extra = extra } }, loc);
 }
@@ -492,7 +492,8 @@ Index Builder::fflush(Index handle, SourceLoc loc) {
 
 Index Builder::read_mem(Signal target, Index filename, Index start, Index finish, bool hex, bool has_start,
                         bool has_finish, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(ReadMemInfo{ target, start, finish, hex, has_start, has_finish });
+    const ExtraIndex extra = add_extra(
+      ReadMemInfo{ target, start, finish, hex ? 1u : 0u, has_start ? 1u : 0u, has_finish ? 1u : 0u });
 
     return emit({ Inst::Tag::ReadMem, Inst::Payload{ .op_extra = { filename, extra } } }, loc);
 }

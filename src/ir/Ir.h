@@ -116,11 +116,15 @@ enum class DistOp : uint32_t {
     Erlang,
 };
 
-// A struct may be overlaid on the extra buffer iff it is trivially copyable
-// and a whole number of u32 words wide. Because every field is a 4-byte
-// handle/enum, such structs carry no padding and round-trip via bit_cast.
+// A struct may be overlaid on the extra buffer iff it is trivially copyable, a
+// whole number of u32 words wide, and padding-free (every field a 4-byte
+// handle/enum — flags are u32, never bool). Padding would bit_cast
+// indeterminate bytes into the extra buffer, making the IR bytes
+// non-deterministic across identical runs (a hazard for hashing and future
+// serialization); has_unique_object_representations rejects it at compile time.
 template<class T>
-concept ExtraPayload = std::is_trivially_copyable_v<T> && (sizeof(T) % sizeof(uint32_t) == 0);
+concept ExtraPayload = std::is_trivially_copyable_v<T> && (sizeof(T) % sizeof(uint32_t) == 0) &&
+                       std::has_unique_object_representations_v<T>;
 
 // Half-open range [start, end) of u32 words in the extra buffer. Doubles as a
 // region: a run of instruction indices in nested-execution order.
@@ -312,11 +316,11 @@ struct ReadMemInfo {
     // Optional first / last address operands (declared-range coordinates).
     Index start;
     Index finish;
-    // True for $readmemh, false for $readmemb.
-    bool hex;
+    // 1 for $readmemh, 0 for $readmemb.
+    uint32_t hex;
     // Whether the start / finish operands are present.
-    bool has_start;
-    bool has_finish;
+    uint32_t has_start;
+    uint32_t has_finish;
 };
 
 // Extra payload for `call`: the callee plus its already-lowered argument values,
@@ -363,9 +367,9 @@ struct Regions {
     ExtraSlice then_;
     // Instructions executed when the condition is false.
     ExtraSlice else_;
-    // Hint that the condition is rarely true; biases backend branch weights
-    // toward the else path (e.g. a violation check).
-    bool unlikely = false;
+    // Hint (1/0) that the condition is rarely true; biases backend branch
+    // weights toward the else path (e.g. a violation check).
+    uint32_t unlikely = 0;
 };
 
 // Extra payload for `select_lazy`: a value-producing conditional (the predicate
@@ -397,9 +401,9 @@ struct LoopInfo {
     ExtraSlice body;
     // Per-iteration update, executed after the body (empty for while / forever).
     ExtraSlice step;
-    // do-while: run the body once before the first predicate test. The backend
-    // branches entry -> body instead of entry -> header (LRM 12.7.1).
-    bool bottom_test;
+    // do-while (1/0): run the body once before the first predicate test. The
+    // backend branches entry -> body instead of entry -> header (LRM 12.7.1).
+    uint32_t bottom_test;
 };
 
 // Extra payload for one arm of a `switch`: the constant case-value keys that
