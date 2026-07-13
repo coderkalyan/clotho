@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "runtime/Runtime.h"
+#include "runtime/svdpi.h"
 
 namespace {
 
@@ -546,4 +547,55 @@ TEST_CASE("rt_fwrite integer specifiers are unchanged around real fields") {
     // fields keep the width-honoring justification (LRM §21.2.1.2).
     CHECK(capture_fwrite("a=%0d r=%g", { Arg{ 32, 1, 42, 0, 0 }, real_arg(0.5) }) == "a=42 r=0.5");
     CHECK(capture_fwrite("%5d", { Arg{ 8, 0, 7, 0, 0 } }) == "    7");
+}
+
+// -- svdpi.h packed-vector accessors (LRM Annex H) --
+
+TEST_CASE("svdpi bit-select round-trips across word boundaries") {
+    svBitVecVal b[2] = { 0, 0 }; // 64 bits
+    for (int i = 0; i < 64; ++i) {
+        svPutBitselBit(b, i, static_cast<svBit>(i % 5 == 0 ? 1 : 0));
+    }
+    for (int i = 0; i < 64; ++i) {
+        CHECK(svGetBitselBit(b, i) == static_cast<svBit>(i % 5 == 0 ? 1 : 0));
+    }
+    CHECK(b[0] == 0x42108421u); // bits 0,5,10,15,20,25,30 set in the low word
+}
+
+TEST_CASE("svdpi logic bit-select encodes 0/1/Z/X into aval/bval") {
+    svLogicVecVal v = { 0, 0 };
+    svPutBitselLogic(&v, 0, sv_0);
+    svPutBitselLogic(&v, 1, sv_1);
+    svPutBitselLogic(&v, 2, sv_z);
+    svPutBitselLogic(&v, 3, sv_x);
+    CHECK(svGetBitselLogic(&v, 0) == sv_0);
+    CHECK(svGetBitselLogic(&v, 1) == sv_1);
+    CHECK(svGetBitselLogic(&v, 2) == sv_z);
+    CHECK(svGetBitselLogic(&v, 3) == sv_x);
+    // aval = value-or-X bits (1 and X): bits 1,3. bval = unknown bits (Z and X): 2,3.
+    CHECK(v.aval == 0xAu);
+    CHECK(v.bval == 0xCu);
+}
+
+TEST_CASE("svdpi part-select extracts and inserts a slice") {
+    const svBitVecVal s = 0x1234ABCDu;
+    svBitVecVal       d = 0;
+    svGetPartselBit(&d, &s, 8, 8); // s[15:8]
+    CHECK(d == 0xABu);
+
+    svBitVecVal e = 0;
+    svPutPartselBit(&e, 0xABu, 8, 8); // write 0xAB at bit 8
+    CHECK(e == 0x0000AB00u);
+}
+
+TEST_CASE("svdpi logic part-select preserves x/z") {
+    svLogicVecVal s = { 0, 0 };
+    svPutBitselLogic(&s, 4, sv_x);
+    svPutBitselLogic(&s, 5, sv_z);
+    svPutBitselLogic(&s, 6, sv_1);
+    svLogicVecVal d = { 0, 0 };
+    svGetPartselLogic(&d, &s, 4, 3); // s[6:4] -> d[2:0]
+    CHECK(svGetBitselLogic(&d, 0) == sv_x);
+    CHECK(svGetBitselLogic(&d, 1) == sv_z);
+    CHECK(svGetBitselLogic(&d, 2) == sv_1);
 }

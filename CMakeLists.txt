@@ -81,6 +81,7 @@ FetchContent_MakeAvailable(unordered_dense)
 # timing wheel is part of this surface: the runtime exposes it behind a C ABI.
 add_library(clotho_runtime STATIC
   src/runtime/Runtime.cpp
+  src/runtime/Svdpi.cpp
   src/Wheel.cpp
 )
 target_include_directories(clotho_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)

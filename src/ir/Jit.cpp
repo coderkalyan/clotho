@@ -26,6 +26,7 @@
 
 #include "LlvmBackend.h"
 #include "runtime/Runtime.h"
+#include "runtime/svdpi.h"
 
 namespace clotho::ir {
 
@@ -208,6 +209,17 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_dpi_pack_logicvec", &rt_dpi_pack_logicvec);
     expose("rt_dpi_unpack_logicvec", &rt_dpi_unpack_logicvec);
     expose("rt_dpi_str_out", &rt_dpi_str_out);
+    // svdpi.h helper API (LRM Annex H): the packed-vector accessors DPI C calls.
+    // A DPI object (--dpi-lib *.o) resolves these against the JITDylib.
+    expose("svDpiVersion", &svDpiVersion);
+    expose("svGetBitselBit", &svGetBitselBit);
+    expose("svGetBitselLogic", &svGetBitselLogic);
+    expose("svPutBitselBit", &svPutBitselBit);
+    expose("svPutBitselLogic", &svPutBitselLogic);
+    expose("svGetPartselBit", &svGetPartselBit);
+    expose("svGetPartselLogic", &svGetPartselLogic);
+    expose("svPutPartselBit", &svPutPartselBit);
+    expose("svPutPartselLogic", &svPutPartselLogic);
     expose("rt_string_init", &rt_string_init);
     expose("rt_string_deinit", &rt_string_deinit);
     expose("rt_string_assign", &rt_string_assign);
