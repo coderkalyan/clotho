@@ -8575,6 +8575,7 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
     // references it): a dedicated Lowerer registers them once, up front, and its
     // symbol->signal entries seed every top's own map below.
     const bool single = root.topInstances.size() == 1;
+    module->top_name  = std::string(root.topInstances[0]->name); // DPI svScope name
     if (!single) {
         module->name = std::string(root.topInstances[0]->name);
     }

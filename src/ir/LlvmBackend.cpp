@@ -2714,6 +2714,14 @@ private:
                            shadow_base_gv_);
         }
 
+        // Register the single DPI scope (svGetScope / user-data, LRM 35.5.3) before
+        // any process runs, so a context import can read it. Only when DPI is used.
+        if (design_uses_dpi()) {
+            b_.CreateCall(rt_fn("rt_svdpi_scope_init", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() }),
+                          { b_.CreateGlobalString(mod_.top_name),
+                            b_.getInt32(static_cast<uint32_t>(mod_.top_name.size())) });
+        }
+
         // Timing wheel: the event scheduler. Processes schedule timers on it at
         // #delay and the drain loop ticks it to advance time and resume them.
         auto* wheel_ty = llvm::ArrayType::get(b_.getInt8Ty(), sizeof(rt_wheel));
@@ -9871,6 +9879,19 @@ private:
         } else if (f.dpi_ret_ctype != DpiCType::Void) {
             set_value(i, dpi_c_to_plane(f.dpi_ret_ctype, r));
         }
+    }
+
+    // Whether the design has any DPI import or export — gates the svScope init.
+    bool design_uses_dpi() const {
+        if (!mod_.dpi_exports.empty()) {
+            return true;
+        }
+        for (size_t i = 0; i < mod_.function_count(); ++i) {
+            if (mod_.function(static_cast<FunctionId>(i)).is_dpi) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // Emit one C-ABI thunk per `export "DPI-C"` (LRM 35.5). Runs last (after

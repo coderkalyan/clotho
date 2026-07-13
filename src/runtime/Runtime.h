@@ -784,4 +784,10 @@ void rt_dpi_unpack_logicvec(const uint32_t* in, uint32_t nchunks, uint32_t* must
 // helper — rt_string_data() is already a valid C `const char*`.)
 void rt_dpi_str_out(rt_string* dst, const char* p);
 
+// Register the single DPI scope (LRM 35.5.3) for the svScope API — the design's
+// hierarchical name. Called once from main when the design uses DPI; also resets
+// the scope's user-data (so a fresh simulation in the same process starts clean).
+// Implemented in Svdpi.cpp alongside svGetScope / svSetScope / svGetUserData.
+void rt_svdpi_scope_init(const char* name, uint32_t name_len);
+
 } // extern "C"

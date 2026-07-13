@@ -599,3 +599,30 @@ TEST_CASE("svdpi logic part-select preserves x/z") {
     CHECK(svGetBitselLogic(&d, 1) == sv_z);
     CHECK(svGetBitselLogic(&d, 2) == sv_1);
 }
+
+// -- svScope (LRM 35.5.3): single-instance scope + user data --
+
+TEST_CASE("svdpi scope: get/set, name, and per-key user data") {
+    rt_svdpi_scope_init("top.dut", 7);
+    svScope s = svGetScope();
+    REQUIRE(s != nullptr);
+    CHECK(std::string(svGetNameFromScope(s)) == "top.dut");
+    CHECK(svGetScopeFromName("top.dut") == s);
+    CHECK(svGetScopeFromName("nope") == nullptr);
+
+    // svSetScope swaps the active scope and returns the previous.
+    CHECK(svSetScope(s) == s);
+
+    // User data is per (scope, key); absent keys read null.
+    int a = 11, b = 22;
+    CHECK(svGetUserData(s, const_cast<char*>("a")) == nullptr);
+    svPutUserData(s, const_cast<char*>("a"), &a);
+    svPutUserData(s, const_cast<char*>("b"), &b);
+    CHECK(svGetUserData(s, const_cast<char*>("a")) == &a);
+    CHECK(svGetUserData(s, const_cast<char*>("b")) == &b);
+
+    // Re-init resets the user data (a fresh simulation starts clean).
+    rt_svdpi_scope_init("m", 1);
+    CHECK(svGetUserData(svGetScope(), const_cast<char*>("a")) == nullptr);
+    CHECK(std::string(svGetNameFromScope(svGetScope())) == "m");
+}

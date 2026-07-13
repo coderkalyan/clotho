@@ -47,6 +47,16 @@ typedef void* svOpenArrayHandle;
 // The implemented DPI standard version.
 const char* svDpiVersion(void);
 
+// Scope (LRM 35.5.3). Clotho is single-instance: one scope carrying the design's
+// name and a per-key user-data map. svGetScope returns the active scope (of the
+// context import currently running); svSetScope swaps it (returns the previous).
+svScope     svGetScope(void);
+svScope     svSetScope(const svScope scope);
+const char* svGetNameFromScope(const svScope scope);
+svScope     svGetScopeFromName(const char* scopeName);
+int         svPutUserData(const svScope scope, void* userKey, void* userData);
+void*       svGetUserData(const svScope scope, void* userKey);
+
 // Bit-select: read/write bit `i` of a packed vector.
 svBit   svGetBitselBit(const svBitVecVal* s, int i);
 svLogic svGetBitselLogic(const svLogicVecVal* s, int i);

@@ -220,6 +220,13 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("svGetPartselLogic", &svGetPartselLogic);
     expose("svPutPartselBit", &svPutPartselBit);
     expose("svPutPartselLogic", &svPutPartselLogic);
+    expose("svGetScope", &svGetScope);
+    expose("svSetScope", &svSetScope);
+    expose("svGetNameFromScope", &svGetNameFromScope);
+    expose("svGetScopeFromName", &svGetScopeFromName);
+    expose("svPutUserData", &svPutUserData);
+    expose("svGetUserData", &svGetUserData);
+    expose("rt_svdpi_scope_init", &rt_svdpi_scope_init);
     expose("rt_string_init", &rt_string_init);
     expose("rt_string_deinit", &rt_string_deinit);
     expose("rt_string_assign", &rt_string_assign);

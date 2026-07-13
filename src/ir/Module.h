@@ -243,6 +243,10 @@ public:
     InternPool pool;
     // DPI-C exports (LRM 35.5): SV functions exposed as C-callable thunks.
     std::vector<DpiExport> dpi_exports;
+    // The top instance's name, used as the DPI svScope name (LRM 35.5.3). For a
+    // multi-top design it is the first top's name (multi-top DPI export is
+    // guarded; a multi-top context import's scope is an edge case).
+    std::string top_name;
     // Module name.
     std::string name;
     // Femtoseconds per wheel tick (the design's finest time unit). Used by %t to

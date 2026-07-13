@@ -7,11 +7,73 @@
 
 #include "svdpi.h"
 
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+
 // 4-state per-bit encoding (svdpi.h): aval = value-or-X, bval = unknown.
 //   svLogic 0 = (a0,b0)   1 = (a1,b0)   Z(2) = (a0,b1)   X(3) = (a1,b1)
 // so svLogic == aval_bit | (bval_bit << 1).
 
+// -- svScope (LRM 35.5.3): single-instance model --
+//
+// Clotho has one flat design state, so there is exactly one DPI scope. It carries
+// the design's hierarchical name and a per-key C user-data map (svPutUserData /
+// svGetUserData). `g_current` is the active scope svGetScope returns and svSetScope
+// swaps — trivial with a single scope, but a context import may save/restore it
+// around export calls. rt_svdpi_scope_init (called from main when the design uses
+// DPI) sets the name and resets state per simulation. Multi-instance scope
+// (mapping a handle to an instance's state sub-region) is deferred with svScope
+// export.
+
+namespace {
+struct SvScopeObj {
+    std::string                      name;
+    std::unordered_map<void*, void*> user_data;
+};
+SvScopeObj g_scope;
+void*      g_current = nullptr;
+} // namespace
+
+extern "C" void rt_svdpi_scope_init(const char* name, uint32_t name_len) {
+    g_scope.name.assign(name, name_len);
+    g_scope.user_data.clear();
+    g_current = &g_scope;
+}
+
 extern "C" {
+
+svScope svGetScope(void) {
+    if (g_current == nullptr) {
+        g_current = &g_scope; // defensive: a design that did not call the init
+    }
+    return g_current;
+}
+
+svScope svSetScope(const svScope scope) {
+    svScope old = g_current;
+    g_current   = scope;
+    return old;
+}
+
+const char* svGetNameFromScope(const svScope scope) {
+    return static_cast<const SvScopeObj*>(scope)->name.c_str();
+}
+
+svScope svGetScopeFromName(const char* scopeName) {
+    return g_scope.name == scopeName ? &g_scope : nullptr;
+}
+
+int svPutUserData(const svScope scope, void* userKey, void* userData) {
+    static_cast<SvScopeObj*>(scope)->user_data[userKey] = userData;
+    return 0;
+}
+
+void* svGetUserData(const svScope scope, void* userKey) {
+    auto&      m  = static_cast<SvScopeObj*>(scope)->user_data;
+    const auto it = m.find(userKey);
+    return it != m.end() ? it->second : nullptr;
+}
 
 const char* svDpiVersion(void) {
     return "1800-2023";
