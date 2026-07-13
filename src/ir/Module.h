@@ -58,6 +58,11 @@ struct SignalInfo {
 // compose the types nested per instance. Signals of generate blocks and
 // compiler temporaries belong to the enclosing instance's scope.
 struct InstanceScope {
+    // Design-unique scope handle, assigned by the frontend (Module::alloc_scope_id)
+    // when the node is created. Process::scope refers to it, and the backend maps
+    // it to the scope's addressing anchor — the authoritative process-to-instance
+    // attribution the module-deduplication work keys on.
+    uint32_t id = 0;
     // Instance name (the top module's name for a top scope).
     std::string name;
     // Module definition name. Instances of one definition with the same
@@ -129,6 +134,11 @@ struct Process {
     SourceLoc loc = SourceLoc{ 0 };
     // The lowered process body.
     Ir ir;
+    // Scope id (InstanceScope::id) of the instance whose definition declared
+    // this process, or no_scope for a process that belongs to no single
+    // instance (a per-top PreInit pass, package/$unit lowering).
+    static constexpr uint32_t no_scope = ~0u;
+    uint32_t scope = no_scope;
 };
 
 // Direction of a subroutine formal argument (LRM 13.5). Out / Inout copy the
@@ -265,6 +275,11 @@ public:
     // $timeformat default at startup.
     int32_t timeformat_units = 0;
 
+    // Allot the next design-unique InstanceScope id (frontend, at node creation).
+    uint32_t alloc_scope_id() {
+        return next_scope_id_++;
+    }
+
     // Append a signal; the returned Signal handle is its index in `signals`.
     Signal add_signal(SignalInfo info) {
         const auto index = static_cast<uint32_t>(signals_.size());
@@ -336,6 +351,8 @@ private:
     std::deque<Function> functions_;
     // Instance hierarchy, one scope tree per top-level module.
     std::vector<InstanceScope> tops_;
+    // Next InstanceScope::id (see alloc_scope_id).
+    uint32_t next_scope_id_ = 0;
 };
 
 } // namespace clotho::ir

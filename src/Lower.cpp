@@ -509,6 +509,7 @@ public:
         ir::InstanceScope* self = node;
         if (pass == Pass::Collect) {
             ir::InstanceScope fresh;
+            fresh.id       = module_.alloc_scope_id();
             fresh.name     = std::string(inst.name);
             fresh.def_name = std::string(inst.getDefinition().name);
             if (scope_stack_.empty()) {
@@ -2141,7 +2142,8 @@ private:
                                          .wait_events = std::move(wait_events),
                                          .self_start  = true,
                                          .loc         = l,
-                                         .ir          = b.finish() });
+                                         .ir          = b.finish(),
+                                         .scope       = cur_scope_id() });
     }
 
     // A net declaration assignment (`wire w = expr;`) is a continuous assignment
@@ -2388,7 +2390,8 @@ private:
                                          .wait_events = std::move(wait_events),
                                          .self_start  = true,
                                          .loc         = l,
-                                         .ir          = b.finish() });
+                                         .ir          = b.finish(),
+                                         .scope       = cur_scope_id() });
 
         return GateInput{ .sig = tmp, .bit = 0 };
     }
@@ -2748,7 +2751,8 @@ private:
                                          .wait_events = std::move(wait_events),
                                          .self_start  = self_start,
                                          .loc         = to_source_loc(sym.location),
-                                         .ir          = std::move(body_ir) });
+                                         .ir          = std::move(body_ir),
+                                         .scope       = cur_scope_id() });
     }
 
     // True if `tc` is an @-style event control (the kinds usable as a process's
@@ -8738,6 +8742,12 @@ private:
     // currently being lowered; register_signal records into its back().
     ir::InstanceScope               top_scope_;
     std::vector<ir::InstanceScope*> scope_stack_;
+
+    // Scope id of the instance currently being lowered, for Process::scope;
+    // no_scope outside any instance (the package/$unit Lowerer).
+    uint32_t cur_scope_id() const {
+        return scope_stack_.empty() ? ir::Process::no_scope : scope_stack_.back()->id;
+    }
     // Scope of the instance body currently being lowered; used to fold constant
     // expressions (parameter references and arithmetic over them).
     const slang::ast::Scope* scope_ = nullptr;
