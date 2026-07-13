@@ -267,8 +267,9 @@ enum class QueueOp : uint32_t {
 // Extra payload for `queue_op`: a queue operation on the handle lvalue `op`
 // (the instruction's op_extra.op). `sub` is the ir::QueueOp; `idx` is the
 // position operand (Insert / DeleteIdx), `val` the element value (PushBack /
-// PushFront / Insert) or the source handle lvalue (Copy). `flags` bit 0 marks
-// `idx` present, bit 1 marks `val` present.
+// PushFront / Insert) or the source handle lvalue (Copy). Operand presence is
+// derived from `sub`; a slot unused by the sub-op holds the handle lvalue as
+// deterministic filler.
 struct QueueInfo {
     // ir::QueueOp value.
     uint32_t sub;
@@ -276,8 +277,6 @@ struct QueueInfo {
     Index idx;
     // Element value (PushBack / PushFront / Insert) or source lvalue (Copy).
     Index val;
-    // bit0: `idx` present; bit1: `val` present.
-    uint32_t flags;
     // The interned Queue type of the target (element stride / slot / bound),
     // independent of the target signal — so the op works for a module signal or
     // a frame local.

@@ -405,17 +405,19 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 }
                 return { scratch.data(), n };
             }
-            // queue_op exposes the handle lvalue plus its optional idx / val
-            // operands (element value or Copy source lvalue); the sub-op selector
-            // is not an operand.
+            // queue_op exposes the handle lvalue plus the idx / val operands its
+            // sub-op takes (position for Insert / DeleteIdx; element value or
+            // Copy source lvalue); the sub-op selector is not an operand.
             if (tag == Inst::Tag::QueueOp) {
-                const auto qi = extra_data<QueueInfo>(p.op_extra.extra);
-                size_t     n  = 0;
-                scratch[n++]  = p.op_extra.op;
-                if (qi.flags & 1u) {
+                const auto qi  = extra_data<QueueInfo>(p.op_extra.extra);
+                const auto sub = static_cast<QueueOp>(qi.sub);
+                size_t     n   = 0;
+                scratch[n++]   = p.op_extra.op;
+                if (sub == QueueOp::Insert || sub == QueueOp::DeleteIdx) {
                     scratch[n++] = qi.idx;
                 }
-                if (qi.flags & 2u) {
+                if (sub == QueueOp::PushBack || sub == QueueOp::PushFront ||
+                    sub == QueueOp::Insert || sub == QueueOp::Copy) {
                     scratch[n++] = qi.val;
                 }
                 return { scratch.data(), n };
