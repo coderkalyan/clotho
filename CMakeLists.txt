@@ -93,7 +93,7 @@ target_link_libraries(clotho_runtime PRIVATE clotho_warnings)
 # there (asserts stay live — NDEBUG is not forced, so the runtime keeps its
 # safety checks). Release / RelWithDebInfo already optimize; the genex leaves
 # them untouched.
-target_compile_options(clotho_runtime PRIVATE $<$<CONFIG:Debug>:-O2>)
+target_compile_options(clotho_runtime PRIVATE $<$<CONFIG:Debug>:-O3>)
 
 # Backend IR + passes. Target-agnostic, no slang dependency: handles the bulk
 # of compiler logic short of the slang -> IR translation layer.
