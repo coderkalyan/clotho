@@ -7950,13 +7950,9 @@ private:
             fail("DPI open-array element type is not supported (byte/shortint/int/"
                  "longint or packed bit/logic vector only)");
         }
-        if ((*ec == ir::DpiCType::BitVec || *ec == ir::DpiCType::LogicVec) &&
-            elem.getBitWidth() > 64) {
-            // The per-element marshal packs into 1 (<= 32 bits) or 2 (33..64) svVecVal
-            // words via a native/128-bit split. A wider packed element needs a general
-            // bignum bit-slice marshal — deferred.
-            fail("DPI open-array packed element wider than 64 bits is not supported");
-        }
+        // Any element width is supported: <= 64 bits marshals through the
+        // autovectorized C runtime (1 word for <= 32, 2 for 33..64), wider elements
+        // through inline LLVM IR (native iW/i2W ops) at the call site.
         param_types.push_back(lower_type(elem));
         arg_dirs.push_back(dir);
         arg_cts.push_back(ir::DpiCType::OpenArray);

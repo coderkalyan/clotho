@@ -9851,16 +9851,152 @@ private:
     // svVecVal scratch buffer is unpacked into the design element storage. Only
     // recorded for a marshalled (packed) element in a non-input direction — a named-
     // scalar zero-copy element has the C writing the design storage directly.
+    // `wide` (element > 64 bits) uses the inline-IR unpack (native iW/i2W ops);
+    // otherwise the autovectorized C runtime (rt_dpi_unpack_arr_*).
     struct OaMarshalBack {
-        bool         is_logic;
-        llvm::Value* buf;     // svVecVal scratch the C wrote
-        llvm::Value* storage; // `[N x slot]` design storage
-        uint32_t     stride;
-        uint32_t     ew;
-        uint32_t     n;
-        uint32_t     has_z;
-        uint32_t     zoff;
+        bool              is_logic;
+        bool              wide;
+        llvm::Value*      buf;     // svVecVal scratch the C wrote
+        llvm::Value*      storage; // `[N x slot]` design storage
+        llvm::StructType* slot;    // element slot type (for the wide-IR path)
+        uint32_t          stride;
+        uint32_t          ew;
+        uint32_t          n;
+        uint32_t          nch;
+        uint32_t          has_z;
+        uint32_t          zoff;
     };
+
+    // Element GEP into a marshalled svVecVal buffer: `[N*nch x elem]` where elem is
+    // `{ i32, i32 }` (svLogicVecVal) or `i32` (svBitVecVal). `flat` is the element's
+    // flat position k*nch + c.
+    llvm::Value* dpi_oa_buf_elem(llvm::Value* buf, uint32_t total, bool is_logic, llvm::Value* flat) {
+        auto* i32   = b_.getInt32Ty();
+        auto* elem  = is_logic ? static_cast<llvm::Type*>(llvm::StructType::get(ctx_, { i32, i32 }))
+                               : static_cast<llvm::Type*>(i32);
+        auto* arrty = llvm::ArrayType::get(elem, total);
+        return b_.CreateInBoundsGEP(arrty, buf, { b_.getInt32(0), flat });
+    }
+
+    // Inline per-element pack (design `[N x slot]` storage -> svVecVal buffer) for a
+    // wide (> 64-bit) open-array element the C runtime's native-integer marshal
+    // cannot reach. N is a compile-time constant (fixed unpacked-array actual), so
+    // this is a constant-trip loop; each element loads the native iW / i2W slot
+    // fields and LLVM legalizes the multi-word shifts. The unaligned `may` region
+    // (mm bits [W, 2W)) is a single `lshr i2W, W` — no hand-rolled funnel shift.
+    void emit_dpi_oa_pack_ir(llvm::Value* storage, llvm::Value* buf, llvm::StructType* slot,
+                             uint32_t n, uint32_t ew, uint32_t nch, bool has_z, bool is_logic) {
+        auto* iW    = int_ty(ew);
+        auto* i32   = b_.getInt32Ty();
+        auto* arrty = llvm::ArrayType::get(slot, n);
+        auto* fn    = b_.GetInsertBlock()->getParent();
+        auto* head  = llvm::BasicBlock::Create(ctx_, "oapk.head", fn);
+        auto* body  = llvm::BasicBlock::Create(ctx_, "oapk.body", fn);
+        auto* done  = llvm::BasicBlock::Create(ctx_, "oapk.done", fn);
+        auto* entry = b_.GetInsertBlock();
+        b_.CreateBr(head);
+        b_.SetInsertPoint(head);
+        auto* k = b_.CreatePHI(i32, 2);
+        k->addIncoming(b_.getInt32(0), entry);
+        b_.CreateCondBr(b_.CreateICmpULT(k, b_.getInt32(n)), body, done);
+        b_.SetInsertPoint(body);
+
+        auto*        slotptr = b_.CreateInBoundsGEP(arrty, storage, { b_.getInt32(0), k });
+        llvm::Value* aval    = nullptr; // iW: value-or-X
+        llvm::Value* bval    = nullptr; // iW: X-or-Z (null for 2-state)
+        if (is_logic) {
+            auto* i2w  = int_ty(2 * ew);
+            auto*        mm = b_.CreateLoad(i2w, b_.CreateStructGEP(slot, slotptr, 0));
+            llvm::Value* z  = has_z ? static_cast<llvm::Value*>(
+                                        b_.CreateLoad(iW, b_.CreateStructGEP(slot, slotptr, 1)))
+                                    : static_cast<llvm::Value*>(llvm::ConstantInt::get(iW, 0));
+            auto* must = b_.CreateTrunc(mm, iW);
+            auto* may  = b_.CreateTrunc(b_.CreateLShr(mm, llvm::ConstantInt::get(i2w, ew)), iW);
+            aval       = b_.CreateAnd(may, b_.CreateNot(z));
+            bval       = b_.CreateXor(must, may);
+        } else {
+            // 2-state: the value is the low W bits of field 0 (narrow iW, or the must
+            // region of a non-narrow i2W) — mirrors the C pack_bit low-W read.
+            auto* raw = b_.CreateLoad(slot->getElementType(0), b_.CreateStructGEP(slot, slotptr, 0));
+            aval      = b_.CreateZExtOrTrunc(raw, iW);
+        }
+        auto* base = b_.CreateMul(k, b_.getInt32(nch));
+        for (uint32_t c = 0; c < nch; ++c) {
+            auto* flat  = b_.CreateAdd(base, b_.getInt32(c));
+            auto* eptr  = dpi_oa_buf_elem(buf, n * nch, is_logic, flat);
+            auto* shamt = llvm::ConstantInt::get(iW, 32u * c); // 32c < ew, never poison
+            auto* ac    = b_.CreateTrunc(b_.CreateLShr(aval, shamt), i32);
+            if (is_logic) {
+                auto* i32x2 = llvm::StructType::get(ctx_, { i32, i32 });
+                auto* bc    = b_.CreateTrunc(b_.CreateLShr(bval, shamt), i32);
+                b_.CreateStore(ac, b_.CreateStructGEP(i32x2, eptr, 0));
+                b_.CreateStore(bc, b_.CreateStructGEP(i32x2, eptr, 1));
+            } else {
+                b_.CreateStore(ac, eptr);
+            }
+        }
+        k->addIncoming(b_.CreateAdd(k, b_.getInt32(1)), b_.GetInsertBlock());
+        b_.CreateBr(head);
+        b_.SetInsertPoint(done);
+    }
+
+    // Inline per-element unpack (svVecVal buffer -> design storage) — the reverse of
+    // emit_dpi_oa_pack_ir, for a wide output/inout element. Reassembles aval/bval
+    // from the chunks, reconstructs mm = must | (may << W) with a single `shl i2W`,
+    // and writes the z field when present.
+    void emit_dpi_oa_unpack_ir(llvm::Value* buf, llvm::Value* storage, llvm::StructType* slot,
+                               uint32_t n, uint32_t ew, uint32_t nch, bool has_z, bool is_logic) {
+        auto* iW    = int_ty(ew);
+        auto* i32   = b_.getInt32Ty();
+        auto* arrty = llvm::ArrayType::get(slot, n);
+        auto* fn    = b_.GetInsertBlock()->getParent();
+        auto* head  = llvm::BasicBlock::Create(ctx_, "oaupk.head", fn);
+        auto* body  = llvm::BasicBlock::Create(ctx_, "oaupk.body", fn);
+        auto* done  = llvm::BasicBlock::Create(ctx_, "oaupk.done", fn);
+        auto* entry = b_.GetInsertBlock();
+        b_.CreateBr(head);
+        b_.SetInsertPoint(head);
+        auto* k = b_.CreatePHI(i32, 2);
+        k->addIncoming(b_.getInt32(0), entry);
+        b_.CreateCondBr(b_.CreateICmpULT(k, b_.getInt32(n)), body, done);
+        b_.SetInsertPoint(body);
+
+        auto*        i32x2 = llvm::StructType::get(ctx_, { i32, i32 });
+        auto*        base  = b_.CreateMul(k, b_.getInt32(nch));
+        llvm::Value* aval  = llvm::ConstantInt::get(iW, 0);
+        llvm::Value* bval  = llvm::ConstantInt::get(iW, 0);
+        for (uint32_t c = 0; c < nch; ++c) {
+            auto* flat  = b_.CreateAdd(base, b_.getInt32(c));
+            auto* eptr  = dpi_oa_buf_elem(buf, n * nch, is_logic, flat);
+            auto* shamt = llvm::ConstantInt::get(iW, 32u * c);
+            auto* ac    = is_logic ? b_.CreateLoad(i32, b_.CreateStructGEP(i32x2, eptr, 0))
+                                   : b_.CreateLoad(i32, eptr);
+            aval = b_.CreateOr(aval, b_.CreateShl(b_.CreateZExt(ac, iW), shamt));
+            if (is_logic) {
+                auto* bc = b_.CreateLoad(i32, b_.CreateStructGEP(i32x2, eptr, 1));
+                bval     = b_.CreateOr(bval, b_.CreateShl(b_.CreateZExt(bc, iW), shamt));
+            }
+        }
+        auto* slotptr = b_.CreateInBoundsGEP(arrty, storage, { b_.getInt32(0), k });
+        if (is_logic) {
+            auto* i2w  = int_ty(2 * ew);
+            auto* must = b_.CreateAnd(aval, b_.CreateNot(bval));
+            auto* may  = b_.CreateOr(aval, bval);
+            auto* mm   = b_.CreateOr(b_.CreateZExt(must, i2w),
+                                     b_.CreateShl(b_.CreateZExt(may, i2w), llvm::ConstantInt::get(i2w, ew)));
+            b_.CreateStore(mm, b_.CreateStructGEP(slot, slotptr, 0));
+            if (has_z) {
+                auto* z = b_.CreateAnd(bval, b_.CreateNot(aval));
+                b_.CreateStore(z, b_.CreateStructGEP(slot, slotptr, 1));
+            }
+        } else {
+            b_.CreateStore(b_.CreateZExtOrTrunc(aval, slot->getElementType(0)),
+                           b_.CreateStructGEP(slot, slotptr, 0));
+        }
+        k->addIncoming(b_.CreateAdd(k, b_.getInt32(1)), b_.GetInsertBlock());
+        b_.CreateBr(head);
+        b_.SetInsertPoint(done);
+    }
 
     // The ir::Type Ref of a DPI open-array actual: resolve the operand's lvalue leaf
     // to its root Signal / Local / Arg and read that root's declared type (the whole
@@ -9939,13 +10075,14 @@ private:
                     is_logic   = 0;
                     break;
                 }
+                // A named scalar is always <= 64 bits (longint), so never wide.
                 auto* buf = entry_alloca(llvm::ArrayType::get(b_.getInt32Ty(), n * nch), "dpi.oa.bit");
                 if (pack_in) {
                     b_.CreateCall(dpi_pack_arr_bit_fn(),
                                   { storage, b_.getInt32(stride), b_.getInt32(ew), b_.getInt32(n), buf });
                 }
                 if (copy_out) {
-                    backs.push_back({ false, buf, storage, stride, ew, n, 0, 0 });
+                    backs.push_back({ false, false, buf, storage, slot, stride, ew, n, nch, 0, 0 });
                 }
                 data       = buf;
                 elem_bytes = 4 * nch;
@@ -9953,14 +10090,20 @@ private:
                 break;
             }
             case DpiCType::BitVec: {
-                // 1 svVecVal word per element for w <= 32, 2 for 33..64.
+                // 1 svVecVal word per element for w <= 32, 2 for 33..64; wider elements
+                // marshal in inline LLVM IR (native iW), which the C runtime can't do.
+                const bool wide = ew > 64;
                 auto* buf = entry_alloca(llvm::ArrayType::get(b_.getInt32Ty(), n * nch), "dpi.oa.bit");
                 if (pack_in) {
-                    b_.CreateCall(dpi_pack_arr_bit_fn(),
-                                  { storage, b_.getInt32(stride), b_.getInt32(ew), b_.getInt32(n), buf });
+                    if (wide) {
+                        emit_dpi_oa_pack_ir(storage, buf, slot, n, ew, nch, /*has_z=*/false, /*is_logic=*/false);
+                    } else {
+                        b_.CreateCall(dpi_pack_arr_bit_fn(),
+                                      { storage, b_.getInt32(stride), b_.getInt32(ew), b_.getInt32(n), buf });
+                    }
                 }
                 if (copy_out) {
-                    backs.push_back({ false, buf, storage, stride, ew, n, 0, 0 });
+                    backs.push_back({ false, wide, buf, storage, slot, stride, ew, n, nch, 0, 0 });
                 }
                 data       = buf;
                 elem_bytes = 4 * nch; // svBitVecVal[nch]
@@ -9968,19 +10111,24 @@ private:
                 break;
             }
             case DpiCType::LogicVec: {
-                auto* svl = llvm::StructType::get(ctx_, { b_.getInt32Ty(), b_.getInt32Ty() });
-                auto* buf = entry_alloca(llvm::ArrayType::get(svl, n * nch), "dpi.oa.logic");
+                const bool wide  = ew > 64;
+                auto*      svl   = llvm::StructType::get(ctx_, { b_.getInt32Ty(), b_.getInt32Ty() });
+                auto*      buf   = entry_alloca(llvm::ArrayType::get(svl, n * nch), "dpi.oa.logic");
                 // z field offset only when the slot actually carries a z word.
                 const uint32_t has_z = lv.has_z ? 1u : 0u;
                 const uint32_t zoff  = lv.has_z ? static_cast<uint32_t>(
                     llmod_.getDataLayout().getStructLayout(slot)->getElementOffset(1)) : 0u;
                 if (pack_in) {
-                    b_.CreateCall(dpi_pack_arr_logic_fn(),
-                                  { storage, b_.getInt32(stride), b_.getInt32(zoff), b_.getInt32(has_z),
-                                    b_.getInt32(ew), b_.getInt32(n), buf });
+                    if (wide) {
+                        emit_dpi_oa_pack_ir(storage, buf, slot, n, ew, nch, has_z != 0, /*is_logic=*/true);
+                    } else {
+                        b_.CreateCall(dpi_pack_arr_logic_fn(),
+                                      { storage, b_.getInt32(stride), b_.getInt32(zoff), b_.getInt32(has_z),
+                                        b_.getInt32(ew), b_.getInt32(n), buf });
+                    }
                 }
                 if (copy_out) {
-                    backs.push_back({ true, buf, storage, stride, ew, n, has_z, zoff });
+                    backs.push_back({ true, wide, buf, storage, slot, stride, ew, n, nch, has_z, zoff });
                 }
                 data       = buf;
                 elem_bytes = 8 * nch; // svLogicVecVal[nch] {aval,bval}
@@ -10076,10 +10224,13 @@ private:
             lower_store(lvalue_of(o.temp), pl);
         }
         // Marshalled open-array output/inout: unpack the C-written svVecVal scratch
-        // back into the design element storage (rt_dpi_unpack_arr_*). A zero-copy
-        // element was written in place and is not recorded here.
+        // back into the design element storage. A wide (> 64-bit) element uses the
+        // inline-IR unpack (native iW/i2W); otherwise the C runtime
+        // (rt_dpi_unpack_arr_*). A zero-copy element was written in place, not here.
         for (const OaMarshalBack& o : oa_backs) {
-            if (o.is_logic) {
+            if (o.wide) {
+                emit_dpi_oa_unpack_ir(o.buf, o.storage, o.slot, o.n, o.ew, o.nch, o.has_z != 0, o.is_logic);
+            } else if (o.is_logic) {
                 b_.CreateCall(dpi_unpack_arr_logic_fn(),
                               { o.buf, b_.getInt32(o.stride), b_.getInt32(o.zoff), b_.getInt32(o.has_z),
                                 b_.getInt32(o.ew), b_.getInt32(o.n), o.storage });

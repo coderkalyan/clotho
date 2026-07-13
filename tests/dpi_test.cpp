@@ -76,6 +76,30 @@ long long dpi_oa_xor64(const svOpenArrayHandle h) {
     return static_cast<long long>(acc);
 }
 
+// input bit[127:0] (> 64-bit -> inline-IR marshal, 4 chunks): XOR every 32-bit chunk
+// of every element.
+int dpi_oa_fold128(const svOpenArrayHandle h) {
+    unsigned acc = 0;
+    for (int i = svLow(h, 1); i <= svHigh(h, 1); ++i) {
+        svBitVecVal v[4];
+        svGetBitArrElem1VecVal(v, h, i);
+        acc ^= v[0] ^ v[1] ^ v[2] ^ v[3];
+    }
+    return static_cast<int>(acc);
+}
+
+// inout logic[99:0] (> 64-bit, W not 32-aligned -> exercises the unaligned may
+// extract/insert): overwrite each element with a definite 0x3<<96 | 0xF, clearing
+// any x/z. Verifies the wide-IR write-back.
+void dpi_oa_set100(const svOpenArrayHandle h) {
+    for (int i = svLow(h, 1); i <= svHigh(h, 1); ++i) {
+        svLogicVecVal v[4] = {};
+        v[0].aval = 0xF;
+        v[3].aval = 0x3;
+        svPutLogicArrElem1VecVal(h, v, i);
+    }
+}
+
 // inout: increment each definite logic[7:0] element (marshalled read + write-back).
 void dpi_oa_inc_logic(const svOpenArrayHandle h) {
     for (int i = svLow(h, 1); i <= svHigh(h, 1); ++i) {
@@ -319,6 +343,42 @@ TEST_CASE("DPI import: open array of 64-bit vector (two-chunk marshal)") {
     CHECK(run_capture(src) == "bb8888ff99aaaa54\n");
 }
 
+// A > 64-bit packed element exceeds any native/128-bit integer, so its marshal is
+// emitted as inline LLVM IR (native iW/i2W ops) instead of the C runtime. bit[127:0]
+// input: four svVecVal chunks per element.
+TEST_CASE("DPI import: open array of 128-bit vector (inline-IR marshal)") {
+    constexpr std::string_view src = R"(
+        module m;
+          import "DPI-C" function int dpi_oa_fold128(input bit [127:0] a[]);
+          bit [127:0] a[0:1];
+          initial begin
+            a[0]=128'h11112222_33334444_55556666_77778888;
+            a[1]=128'hDEADBEEF_CAFEBABE_01234567_89ABCDEF;
+            $display("%0d", dpi_oa_fold128(a));
+          end
+        endmodule)";
+    // 0x9CE1_A791 folded across both elements; as a signed int (the return type).
+    CHECK(run_capture(src) == "-1663368111\n");
+}
+
+// An inout > 64-bit element whose width is NOT 32-aligned (logic[99:0], W=100): the
+// `may` region starts mid-word, so the inline-IR marshal's `lshr i2W, W` crosses a
+// 32-bit boundary — the case a hand-written C bignum would need a funnel shift for.
+// The C writes a definite value back, clearing the input's x/z.
+TEST_CASE("DPI import: inout 100-bit element (unaligned wide write-back)") {
+    constexpr std::string_view src = R"(
+        module m;
+          import "DPI-C" function void dpi_oa_set100(inout logic [99:0] b[]);
+          logic [99:0] b[0:0];
+          initial begin
+            b[0]={4'b10xz, 96'hDEADBEEF_00000000_0000FFFF};
+            dpi_oa_set100(b);
+            $display("%h", b[0]);
+          end
+        endmodule)";
+    CHECK(run_capture(src) == "300000000000000000000000f\n");
+}
+
 // Out-of-scope constructs must fail loudly with a TODO, never silently miscompile.
 // Each is a distinct guard in build_dpi_import.
 TEST_CASE("DPI import: unsupported forms are rejected") {
@@ -347,15 +407,6 @@ TEST_CASE("DPI import: unsupported forms are rejected") {
               initial void'(f(q));
             endmodule)";
         CHECK(lower_fail(src).find("open-array element type") != std::string::npos);
-    }
-    SUBCASE("open array of packed element wider than 64 bits") {
-        constexpr std::string_view src = R"(
-            module m;
-              import "DPI-C" function int f(input logic [71:0] a[]);
-              logic [71:0] q[0:1];
-              initial void'(f(q));
-            endmodule)";
-        CHECK(lower_fail(src).find("wider than 64 bits") != std::string::npos);
     }
 }
 
