@@ -64,6 +64,18 @@ void dpi_oa_fill_sq(const svOpenArrayHandle h) {
     }
 }
 
+// input bit[63:0]: XOR-reduce, reading each element as two svBitVecVal chunks —
+// exercises the wide (33..64-bit) two-chunk marshal.
+long long dpi_oa_xor64(const svOpenArrayHandle h) {
+    unsigned long long acc = 0;
+    for (int i = svLow(h, 1); i <= svHigh(h, 1); ++i) {
+        svBitVecVal v[2];
+        svGetBitArrElem1VecVal(v, h, i);
+        acc ^= (static_cast<unsigned long long>(v[1]) << 32) | v[0];
+    }
+    return static_cast<long long>(acc);
+}
+
 // inout: increment each definite logic[7:0] element (marshalled read + write-back).
 void dpi_oa_inc_logic(const svOpenArrayHandle h) {
     for (int i = svLow(h, 1); i <= svHigh(h, 1); ++i) {
@@ -291,6 +303,22 @@ TEST_CASE("DPI import: inout open array marshals in and back") {
     CHECK(run_capture(src) == "11 21 100\n");
 }
 
+// A 33..64-bit packed element marshals into two svVecVal words per element (the
+// mm plane is split through a 128-bit intermediate). bit[63:0] here.
+TEST_CASE("DPI import: open array of 64-bit vector (two-chunk marshal)") {
+    constexpr std::string_view src = R"(
+        module m;
+          import "DPI-C" function longint dpi_oa_xor64(input bit [63:0] a[]);
+          bit [63:0] a[0:2];
+          initial begin
+            a[0]=64'h1122334455667788; a[1]=64'hAAAABBBBCCCCDDDD; a[2]=64'h1;
+            $display("%h", dpi_oa_xor64(a));
+          end
+        endmodule)";
+    // 0x1122334455667788 ^ 0xAAAABBBBCCCCDDDD ^ 0x1 = 0xBB8888FF99AAAA54.
+    CHECK(run_capture(src) == "bb8888ff99aaaa54\n");
+}
+
 // Out-of-scope constructs must fail loudly with a TODO, never silently miscompile.
 // Each is a distinct guard in build_dpi_import.
 TEST_CASE("DPI import: unsupported forms are rejected") {
@@ -320,14 +348,14 @@ TEST_CASE("DPI import: unsupported forms are rejected") {
             endmodule)";
         CHECK(lower_fail(src).find("open-array element type") != std::string::npos);
     }
-    SUBCASE("open array of packed element wider than 32 bits") {
+    SUBCASE("open array of packed element wider than 64 bits") {
         constexpr std::string_view src = R"(
             module m;
-              import "DPI-C" function int f(input logic [63:0] a[]);
-              logic [63:0] q[0:1];
+              import "DPI-C" function int f(input logic [71:0] a[]);
+              logic [71:0] q[0:1];
               initial void'(f(q));
             endmodule)";
-        CHECK(lower_fail(src).find("wider than 32 bits") != std::string::npos);
+        CHECK(lower_fail(src).find("wider than 64 bits") != std::string::npos);
     }
 }
 

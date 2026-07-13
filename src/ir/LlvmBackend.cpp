@@ -9907,6 +9907,7 @@ private:
         const int32_t  left  = static_cast<int32_t>(at.left);
         const int32_t  right = static_cast<int32_t>(at.right);
         const uint32_t ew    = lv.store_width; // element bit width
+        const uint32_t nch   = (ew + 31) / 32; // svVecVal words per marshalled element
         const bool     pack_in  = dir != ArgDir::Out;   // input / inout read the actual
         const bool     copy_out = dir != ArgDir::In;    // output / inout write it back
 
@@ -9938,7 +9939,7 @@ private:
                     is_logic   = 0;
                     break;
                 }
-                auto* buf = entry_alloca(llvm::ArrayType::get(b_.getInt32Ty(), n), "dpi.oa.bit");
+                auto* buf = entry_alloca(llvm::ArrayType::get(b_.getInt32Ty(), n * nch), "dpi.oa.bit");
                 if (pack_in) {
                     b_.CreateCall(dpi_pack_arr_bit_fn(),
                                   { storage, b_.getInt32(stride), b_.getInt32(ew), b_.getInt32(n), buf });
@@ -9947,12 +9948,13 @@ private:
                     backs.push_back({ false, buf, storage, stride, ew, n, 0, 0 });
                 }
                 data       = buf;
-                elem_bytes = 4;
+                elem_bytes = 4 * nch;
                 is_logic   = 0;
                 break;
             }
             case DpiCType::BitVec: {
-                auto* buf = entry_alloca(llvm::ArrayType::get(b_.getInt32Ty(), n), "dpi.oa.bit");
+                // 1 svVecVal word per element for w <= 32, 2 for 33..64.
+                auto* buf = entry_alloca(llvm::ArrayType::get(b_.getInt32Ty(), n * nch), "dpi.oa.bit");
                 if (pack_in) {
                     b_.CreateCall(dpi_pack_arr_bit_fn(),
                                   { storage, b_.getInt32(stride), b_.getInt32(ew), b_.getInt32(n), buf });
@@ -9961,13 +9963,13 @@ private:
                     backs.push_back({ false, buf, storage, stride, ew, n, 0, 0 });
                 }
                 data       = buf;
-                elem_bytes = 4; // svBitVecVal
+                elem_bytes = 4 * nch; // svBitVecVal[nch]
                 is_logic   = 0;
                 break;
             }
             case DpiCType::LogicVec: {
                 auto* svl = llvm::StructType::get(ctx_, { b_.getInt32Ty(), b_.getInt32Ty() });
-                auto* buf = entry_alloca(llvm::ArrayType::get(svl, n), "dpi.oa.logic");
+                auto* buf = entry_alloca(llvm::ArrayType::get(svl, n * nch), "dpi.oa.logic");
                 // z field offset only when the slot actually carries a z word.
                 const uint32_t has_z = lv.has_z ? 1u : 0u;
                 const uint32_t zoff  = lv.has_z ? static_cast<uint32_t>(
@@ -9981,7 +9983,7 @@ private:
                     backs.push_back({ true, buf, storage, stride, ew, n, has_z, zoff });
                 }
                 data       = buf;
-                elem_bytes = 8; // svLogicVecVal {aval,bval}
+                elem_bytes = 8 * nch; // svLogicVecVal[nch] {aval,bval}
                 is_logic   = 1;
                 break;
             }

@@ -807,11 +807,12 @@ typedef struct rt_svopen {
 } rt_svopen;
 
 // Marshal a design unpacked-array of packed elements — Clotho's `[nelem x slot]`
-// layout, element stride `stride`, plane width `w` (<= 32, one svVecVal word) — to
-// and from a contiguous svVecVal buffer. The logic (4-state) form also takes the z
-// field offset `z_off` within the slot. Fixed-width strided loops (autovectorized
-// by the -O2 runtime). Named-scalar 2-state elements need no marshal — their narrow
-// `[N x iW]` storage is already the C array (zero-copy).
+// layout, element stride `stride`, plane width `w` (<= 64: one svVecVal word for
+// w <= 32, two for 33..64) — to and from a contiguous svVecVal buffer. The logic
+// (4-state) form also takes the z field offset `z_off` within the slot and `has_z`.
+// Fixed-width strided loops (autovectorized by the -O2 runtime). Named-scalar
+// 2-state elements need no marshal — their narrow `[N x iW]` storage is already the
+// C array (zero-copy).
 void rt_dpi_pack_arr_bit(const void* base, uint32_t stride, uint32_t w, uint32_t n, void* out);
 void rt_dpi_unpack_arr_bit(const void* in, uint32_t stride, uint32_t w, uint32_t n, void* base);
 // `has_z` == 0 for a never-z element whose slot carries no z word ({ i2W } only,

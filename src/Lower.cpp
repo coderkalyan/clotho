@@ -7951,10 +7951,11 @@ private:
                  "longint or packed bit/logic vector only)");
         }
         if ((*ec == ir::DpiCType::BitVec || *ec == ir::DpiCType::LogicVec) &&
-            elem.getBitWidth() > 32) {
-            // The per-element marshal is one svVecVal word (<= 32 bits). A wider
-            // packed element needs a multi-word chunk marshal — deferred.
-            fail("DPI open-array packed element wider than 32 bits is not supported");
+            elem.getBitWidth() > 64) {
+            // The per-element marshal packs into 1 (<= 32 bits) or 2 (33..64) svVecVal
+            // words via a native/128-bit split. A wider packed element needs a general
+            // bignum bit-slice marshal — deferred.
+            fail("DPI open-array packed element wider than 64 bits is not supported");
         }
         param_types.push_back(lower_type(elem));
         arg_dirs.push_back(dir);
