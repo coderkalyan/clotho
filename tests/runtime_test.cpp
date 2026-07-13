@@ -626,3 +626,67 @@ TEST_CASE("svdpi scope: get/set, name, and per-key user data") {
     CHECK(svGetUserData(svGetScope(), const_cast<char*>("a")) == nullptr);
     CHECK(std::string(svGetNameFromScope(svGetScope())) == "m");
 }
+
+// -- svdpi open-array descriptor + element marshal (LRM 35.5.6.2) --
+
+TEST_CASE("svdpi open array: 1-D descriptor accessors") {
+    int data[4] = { 10, 20, 30, 40 };
+    rt_svopen a{ data, 0, 3, 4, sizeof(int), 32, 0 }; // int a[0:3], zero-copy
+    auto*     h = static_cast<svOpenArrayHandle>(&a);
+    CHECK(svDimensions(h) == 1);
+    CHECK(svSize(h, 1) == 4);
+    CHECK(svLeft(h, 1) == 0);
+    CHECK(svRight(h, 1) == 3);
+    CHECK(svLow(h, 1) == 0);
+    CHECK(svHigh(h, 1) == 3);
+    CHECK(svIncrement(h, 1) == -1); // left < right
+    CHECK(svGetArrayPtr(h) == data);
+    CHECK(*static_cast<int*>(svGetArrElemPtr1(h, 0)) == 10);
+    CHECK(*static_cast<int*>(svGetArrElemPtr1(h, 3)) == 40);
+}
+
+TEST_CASE("svdpi open array: descending bounds normalize the element index") {
+    int       data[3] = { 100, 200, 300 };
+    rt_svopen a{ data, 2, 0, 3, sizeof(int), 32, 0 }; // int a[2:0]: a[2] is elem 0
+    auto*     h = static_cast<svOpenArrayHandle>(&a);
+    CHECK(svIncrement(h, 1) == 1); // left >= right
+    CHECK(*static_cast<int*>(svGetArrElemPtr1(h, 2)) == 100); // a[2] -> pos 0
+    CHECK(*static_cast<int*>(svGetArrElemPtr1(h, 0)) == 300); // a[0] -> pos 2
+}
+
+TEST_CASE("svdpi open array: 2-state element marshal (bit[15:0] <-> svBitVecVal)") {
+    uint16_t    in[3] = { 0x1234, 0xABCD, 0x0001 }; // narrow {i16} slots, stride 2
+    svBitVecVal out[3];
+    rt_dpi_pack_arr_bit(in, sizeof(uint16_t), 16, 3, out);
+    CHECK(out[0] == 0x1234u);
+    CHECK(out[1] == 0xABCDu);
+    CHECK(out[2] == 1u);
+    uint16_t back[3] = {};
+    rt_dpi_unpack_arr_bit(out, sizeof(uint16_t), 16, 3, back);
+    CHECK(back[0] == in[0]);
+    CHECK(back[1] == in[1]);
+    CHECK(back[2] == in[2]);
+}
+
+TEST_CASE("svdpi open array: 4-state element marshal preserves x/z (logic[7:0])") {
+    // Clotho logic[7:0] element slot {i16 mm, i8 z} padded to 4 bytes.
+    struct Slot {
+        uint16_t mm;
+        uint8_t  z;
+        uint8_t  pad;
+    };
+    static_assert(sizeof(Slot) == 4);
+    Slot in[2] = { { 0x7744, 0x11, 0 }, { 0xFFFF, 0x00, 0 } }; // 01xz01xz, then 8'hFF
+    svLogicVecVal out[2];
+    rt_dpi_pack_arr_logic(in, sizeof(Slot), offsetof(Slot, z), 8, 2, out);
+    CHECK(out[0].aval == 0x66u); // value-or-X
+    CHECK(out[0].bval == 0x33u); // X or Z
+    CHECK(out[1].aval == 0xFFu);
+    CHECK(out[1].bval == 0x00u);
+    Slot back[2] = {};
+    rt_dpi_unpack_arr_logic(out, sizeof(Slot), offsetof(Slot, z), 8, 2, back);
+    CHECK(back[0].mm == in[0].mm);
+    CHECK(back[0].z == in[0].z);
+    CHECK(back[1].mm == in[1].mm);
+    CHECK(back[1].z == in[1].z);
+}

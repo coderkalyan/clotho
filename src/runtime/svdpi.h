@@ -57,6 +57,27 @@ svScope     svGetScopeFromName(const char* scopeName);
 int         svPutUserData(const svScope scope, void* userKey, void* userData);
 void*       svGetUserData(const svScope scope, void* userKey);
 
+// Open arrays (LRM 35.5.6.2). A formal with an unsized `[]` dimension arrives as
+// an svOpenArrayHandle whose bounds come from the actual at each call. The
+// dimension `d` is 1-based (d == 1 for a 1-D array — the only form supported).
+int   svDimensions(const svOpenArrayHandle h);
+int   svSize(const svOpenArrayHandle h, int d);
+int   svLeft(const svOpenArrayHandle h, int d);
+int   svRight(const svOpenArrayHandle h, int d);
+int   svLow(const svOpenArrayHandle h, int d);
+int   svHigh(const svOpenArrayHandle h, int d);
+int   svIncrement(const svOpenArrayHandle h, int d);
+int   svSizeOfArray(const svOpenArrayHandle h);
+// Pointer to the element storage (valid for a C-layout element: named scalars) /
+// to one element by its SV index.
+void* svGetArrayPtr(const svOpenArrayHandle h);
+void* svGetArrElemPtr1(const svOpenArrayHandle h, int indx1);
+// Copy an element to/from a caller vecval (for packed bit/logic elements).
+void svGetBitArrElem1VecVal(svBitVecVal* value, const svOpenArrayHandle h, int indx1);
+void svPutBitArrElem1VecVal(const svOpenArrayHandle h, svBitVecVal* value, int indx1);
+void svGetLogicArrElem1VecVal(svLogicVecVal* value, const svOpenArrayHandle h, int indx1);
+void svPutLogicArrElem1VecVal(const svOpenArrayHandle h, svLogicVecVal* value, int indx1);
+
 // Bit-select: read/write bit `i` of a packed vector.
 svBit   svGetBitselBit(const svBitVecVal* s, int i);
 svLogic svGetBitselLogic(const svLogicVecVal* s, int i);

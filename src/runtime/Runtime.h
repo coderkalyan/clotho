@@ -790,4 +790,33 @@ void rt_dpi_str_out(rt_string* dst, const char* p);
 // Implemented in Svdpi.cpp alongside svGetScope / svSetScope / svGetUserData.
 void rt_svdpi_scope_init(const char* name, uint32_t name_len);
 
+// -- DPI open arrays (LRM 35.5.6.2) --
+//
+// Clotho's backing for a 1-D svOpenArrayHandle: the JIT builds one per call and
+// the svdpi accessors (Svdpi.cpp) read it. `data` points at the element buffer —
+// the design array itself for a zero-copy 2-state (named-scalar) element, or a
+// marshaled contiguous svBitVecVal/svLogicVecVal buffer for a packed element.
+typedef struct rt_svopen {
+    void*    data;
+    int32_t  left;
+    int32_t  right;
+    uint32_t nelem;
+    uint32_t elem_bytes; // C stride per element (data buffer)
+    uint32_t elem_width; // element bit width
+    uint32_t is_logic;   // 4-state element (svLogicVecVal) vs 2-state (svBitVecVal)
+} rt_svopen;
+
+// Marshal a design unpacked-array of packed elements — Clotho's `[nelem x slot]`
+// layout, element stride `stride`, plane width `w` (<= 32, one svVecVal word) — to
+// and from a contiguous svVecVal buffer. The logic (4-state) form also takes the z
+// field offset `z_off` within the slot. Fixed-width strided loops (autovectorized
+// by the -O2 runtime). Named-scalar 2-state elements need no marshal — their narrow
+// `[N x iW]` storage is already the C array (zero-copy).
+void rt_dpi_pack_arr_bit(const void* base, uint32_t stride, uint32_t w, uint32_t n, void* out);
+void rt_dpi_unpack_arr_bit(const void* in, uint32_t stride, uint32_t w, uint32_t n, void* base);
+void rt_dpi_pack_arr_logic(const void* base, uint32_t stride, uint32_t z_off, uint32_t w, uint32_t n,
+                           void* out);
+void rt_dpi_unpack_arr_logic(const void* in, uint32_t stride, uint32_t z_off, uint32_t w, uint32_t n,
+                             void* base);
+
 } // extern "C"

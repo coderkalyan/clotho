@@ -7,7 +7,10 @@
 
 #include "svdpi.h"
 
+#include "Runtime.h" // rt_svopen + the array marshal declarations
+
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 
@@ -141,6 +144,172 @@ void svPutPartselLogic(svLogicVecVal* d, const svLogicVecVal s, int i, int w) {
     for (int k = 0; k < w; ++k) {
         svPutBitselLogic(d, i + k, svGetBitselLogic(&s, k));
     }
+}
+
+} // extern "C"
+
+// -- Open arrays (LRM 35.5.6.2): 1-D descriptor accessors + element marshal --
+
+namespace {
+
+// SV index -> linear element position 0..nelem-1 (handles descending [left:right]).
+uint32_t open_pos(const rt_svopen* a, int i) {
+    return static_cast<uint32_t>(a->left <= a->right ? (i - a->left) : (a->left - i));
+}
+
+// A W-bit-per-element pack/unpack between Clotho's `[n x slot]` design storage and
+// a contiguous svVecVal buffer. Templated on the concrete slot integer types so
+// each is a fixed-stride strided-load loop with branch-free arithmetic (the -O2
+// runtime autovectorizes it). W <= 32 (one svVecVal word).
+template <typename MM, typename Z>
+void pack_logic(const uint8_t* b, uint32_t stride, uint32_t z_off, uint32_t w, uint32_t n,
+                svLogicVecVal* o) {
+    const uint32_t mask = w >= 32 ? 0xffffffffu : ((1u << w) - 1);
+    for (uint32_t k = 0; k < n; ++k) {
+        MM mm;
+        Z  z;
+        std::memcpy(&mm, b + static_cast<size_t>(k) * stride, sizeof(MM));
+        std::memcpy(&z, b + static_cast<size_t>(k) * stride + z_off, sizeof(Z));
+        const uint32_t must = static_cast<uint32_t>(mm) & mask;
+        const uint32_t may  = static_cast<uint32_t>(static_cast<uint64_t>(mm) >> w) & mask;
+        o[k].aval = may & ~static_cast<uint32_t>(z);
+        o[k].bval = must ^ may;
+    }
+}
+
+template <typename MM, typename Z>
+void unpack_logic(const svLogicVecVal* in, uint8_t* b, uint32_t stride, uint32_t z_off, uint32_t w,
+                  uint32_t n) {
+    for (uint32_t k = 0; k < n; ++k) {
+        const uint32_t aval = in[k].aval;
+        const uint32_t bval = in[k].bval;
+        const MM       mm =
+          static_cast<MM>(static_cast<uint64_t>(aval & ~bval) | (static_cast<uint64_t>(aval | bval) << w));
+        const Z z = static_cast<Z>(bval & ~aval);
+        std::memcpy(b + static_cast<size_t>(k) * stride, &mm, sizeof(MM));
+        std::memcpy(b + static_cast<size_t>(k) * stride + z_off, &z, sizeof(Z));
+    }
+}
+
+template <typename V>
+void pack_bit(const uint8_t* b, uint32_t stride, uint32_t w, uint32_t n, svBitVecVal* o) {
+    const uint32_t mask = w >= 32 ? 0xffffffffu : ((1u << w) - 1);
+    for (uint32_t k = 0; k < n; ++k) {
+        V v;
+        std::memcpy(&v, b + static_cast<size_t>(k) * stride, sizeof(V));
+        o[k] = static_cast<uint32_t>(v) & mask;
+    }
+}
+
+template <typename V>
+void unpack_bit(const svBitVecVal* in, uint8_t* b, uint32_t stride, uint32_t w, uint32_t n) {
+    const uint32_t mask = w >= 32 ? 0xffffffffu : ((1u << w) - 1);
+    for (uint32_t k = 0; k < n; ++k) {
+        const V v = static_cast<V>(in[k] & mask);
+        std::memcpy(b + static_cast<size_t>(k) * stride, &v, sizeof(V));
+    }
+}
+
+} // namespace
+
+extern "C" {
+
+void rt_dpi_pack_arr_bit(const void* base, uint32_t stride, uint32_t w, uint32_t n, void* out) {
+    const auto* b = static_cast<const uint8_t*>(base);
+    auto*       o = static_cast<svBitVecVal*>(out);
+    if (w <= 8) {
+        pack_bit<uint8_t>(b, stride, w, n, o);
+    } else if (w <= 16) {
+        pack_bit<uint16_t>(b, stride, w, n, o);
+    } else {
+        pack_bit<uint32_t>(b, stride, w, n, o);
+    }
+}
+
+void rt_dpi_unpack_arr_bit(const void* in, uint32_t stride, uint32_t w, uint32_t n, void* base) {
+    const auto* i = static_cast<const svBitVecVal*>(in);
+    auto*       b = static_cast<uint8_t*>(base);
+    if (w <= 8) {
+        unpack_bit<uint8_t>(i, b, stride, w, n);
+    } else if (w <= 16) {
+        unpack_bit<uint16_t>(i, b, stride, w, n);
+    } else {
+        unpack_bit<uint32_t>(i, b, stride, w, n);
+    }
+}
+
+void rt_dpi_pack_arr_logic(const void* base, uint32_t stride, uint32_t z_off, uint32_t w, uint32_t n,
+                           void* out) {
+    const auto* b = static_cast<const uint8_t*>(base);
+    auto*       o = static_cast<svLogicVecVal*>(out);
+    if (w <= 8) {
+        pack_logic<uint16_t, uint8_t>(b, stride, z_off, w, n, o);
+    } else if (w <= 16) {
+        pack_logic<uint32_t, uint16_t>(b, stride, z_off, w, n, o);
+    } else {
+        pack_logic<uint64_t, uint32_t>(b, stride, z_off, w, n, o);
+    }
+}
+
+void rt_dpi_unpack_arr_logic(const void* in, uint32_t stride, uint32_t z_off, uint32_t w, uint32_t n,
+                             void* base) {
+    const auto* i = static_cast<const svLogicVecVal*>(in);
+    auto*       b = static_cast<uint8_t*>(base);
+    if (w <= 8) {
+        unpack_logic<uint16_t, uint8_t>(i, b, stride, z_off, w, n);
+    } else if (w <= 16) {
+        unpack_logic<uint32_t, uint16_t>(i, b, stride, z_off, w, n);
+    } else {
+        unpack_logic<uint64_t, uint32_t>(i, b, stride, z_off, w, n);
+    }
+}
+
+int svDimensions(const svOpenArrayHandle) {
+    return 1;
+}
+int svSize(const svOpenArrayHandle h, int) {
+    return static_cast<int>(static_cast<const rt_svopen*>(h)->nelem);
+}
+int svLeft(const svOpenArrayHandle h, int) {
+    return static_cast<const rt_svopen*>(h)->left;
+}
+int svRight(const svOpenArrayHandle h, int) {
+    return static_cast<const rt_svopen*>(h)->right;
+}
+int svLow(const svOpenArrayHandle h, int) {
+    const auto* a = static_cast<const rt_svopen*>(h);
+    return a->left < a->right ? a->left : a->right;
+}
+int svHigh(const svOpenArrayHandle h, int) {
+    const auto* a = static_cast<const rt_svopen*>(h);
+    return a->left > a->right ? a->left : a->right;
+}
+int svIncrement(const svOpenArrayHandle h, int) {
+    const auto* a = static_cast<const rt_svopen*>(h);
+    return a->left >= a->right ? 1 : -1;
+}
+int svSizeOfArray(const svOpenArrayHandle h) {
+    const auto* a = static_cast<const rt_svopen*>(h);
+    return static_cast<int>(a->nelem * a->elem_bytes);
+}
+void* svGetArrayPtr(const svOpenArrayHandle h) {
+    return static_cast<const rt_svopen*>(h)->data;
+}
+void* svGetArrElemPtr1(const svOpenArrayHandle h, int indx1) {
+    const auto* a = static_cast<const rt_svopen*>(h);
+    return static_cast<char*>(a->data) + static_cast<size_t>(open_pos(a, indx1)) * a->elem_bytes;
+}
+void svGetBitArrElem1VecVal(svBitVecVal* value, const svOpenArrayHandle h, int indx1) {
+    *value = *static_cast<const svBitVecVal*>(svGetArrElemPtr1(h, indx1));
+}
+void svPutBitArrElem1VecVal(const svOpenArrayHandle h, svBitVecVal* value, int indx1) {
+    *static_cast<svBitVecVal*>(svGetArrElemPtr1(h, indx1)) = *value;
+}
+void svGetLogicArrElem1VecVal(svLogicVecVal* value, const svOpenArrayHandle h, int indx1) {
+    *value = *static_cast<const svLogicVecVal*>(svGetArrElemPtr1(h, indx1));
+}
+void svPutLogicArrElem1VecVal(const svOpenArrayHandle h, svLogicVecVal* value, int indx1) {
+    *static_cast<svLogicVecVal*>(svGetArrElemPtr1(h, indx1)) = *value;
 }
 
 } // extern "C"
