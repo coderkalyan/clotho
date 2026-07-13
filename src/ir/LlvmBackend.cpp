@@ -1575,11 +1575,17 @@ private:
         }
     }
 
-    // Materialize the deferred def-relative sched-flag pointer at the current
-    // insert point (a function entry, so it dominates every use): load the
-    // instance's sched base and index the group's def-local ordinal. No-op when
-    // lower_group chose the absolute constant.
-    void materialize_sched_ptr() {
+    // Materialize the group's deferred def-relative context at the current
+    // insert point (a function entry, so it dominates every use): the sched-flag
+    // pointer (instance sched base + def-local ordinal) and, when the group can
+    // register NBA blocks, the instance's block-id base (block_register adds the
+    // group-local block ordinal). No-op when lower_group chose the absolute
+    // constants; a dead base load in a group that ends up registering no block
+    // is swept by the tier-0 dce pass.
+    void materialize_group_ctx() {
+        if (blk_base_sym_ != nullptr) {
+            blk_base_val_ = b_.CreateLoad(b_.getInt32Ty(), blk_base_sym_);
+        }
         if (sched_ptr_ != nullptr) {
             return;
         }
@@ -1692,6 +1698,22 @@ private:
                            sched_arr_ty_, sched_gv_,
                            llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(proc_index) });
 
+        // Same-eligibility NBA prep: the group's block registrations pass
+        // (instance block base + group-local ordinal) instead of the absolute
+        // block id — identical value (a group's blocks are id-contiguous by
+        // construction: block_register only runs while its group lowers), in the
+        // def-relative form a shared body needs. main stores the base after
+        // lowering, once the ids are known.
+        blk_base_sym_      = nullptr;
+        blk_base_val_      = nullptr;
+        group_first_block_ = -1;
+        if (sched_anchor_ != SignalSlot::no_anchor && nba_block_enqueue_fn_ != nullptr) {
+            blk_base_sym_ = new llvm::GlobalVariable(
+              llmod_, b_.getInt32Ty(), false, llvm::GlobalValue::InternalLinkage, b_.getInt32(0),
+              "clotho.inst." + anchors_[sched_anchor_].name + ".blk.g" +
+                std::to_string(sched_ordinal_));
+        }
+
         // Name a process by its index: @<module>.p<index>. Source-offset naming
         // would collide once the design has multiple instances of one module —
         // their processes share the same AST source location. The index is unique
@@ -1737,7 +1759,7 @@ private:
             hdl_              = nullptr;
             auto* entry_bb = llvm::BasicBlock::Create(ctx_, "entry", fn_);
             b_.SetInsertPoint(entry_bb);
-            materialize_sched_ptr();
+            materialize_group_ctx();
             // Run each member body per activation, freeing its string temporaries
             // afterward — a thunk has no frame to persist them in (a per-call cost
             // paid only by string-using bodies). frame_slots_ is empty for a
@@ -1836,7 +1858,7 @@ private:
         // Identify the coroutine; coro.alloc lets the optimizer skip the dynamic
         // frame allocation when the frame can live on the caller's stack.
         b_.SetInsertPoint(entry);
-        materialize_sched_ptr();
+        materialize_group_ctx();
         auto* id   = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_id), { b_.getInt32(0), null, null, null });
         auto* need = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_alloc), { id });
         b_.CreateCondBr(need, alloc_bb, begin_bb);
@@ -2518,6 +2540,10 @@ private:
         // intra-body @event waits, exactly like a process's proc_sched slot.
         frame_     = b_.CreateAlloca(frame_ty_, nullptr, "frame");
         sched_ptr_ = b_.CreateAlloca(b_.getInt32Ty(), nullptr, "task_sched");
+        sched_anchor_      = SignalSlot::no_anchor;
+        blk_base_sym_      = nullptr;
+        blk_base_val_      = nullptr;
+        group_first_block_ = -1;
 
         auto* trap_bb    = llvm::BasicBlock::Create(ctx_, "coro.trap", fn_);
         auto* free_bb    = llvm::BasicBlock::Create(ctx_, "coro.free", fn_);
@@ -2961,6 +2987,9 @@ private:
             if (a.vcd_sym != nullptr) {
                 b_.CreateStore(b_.getInt32(static_cast<uint32_t>(a.first_vcd)), a.vcd_sym);
             }
+        }
+        for (const auto& [sym, first_id] : group_blk_bases_) {
+            b_.CreateStore(b_.getInt32(first_id), sym);
         }
         init_state();
         if (shadow_base_gv_ != nullptr) {
@@ -4523,7 +4552,17 @@ private:
             cur_block_id_    = static_cast<uint32_t>(block_commits_.size());
             block_commits_.push_back({});
             cur_block_epoch_ = static_cast<int64_t>(cur_seg_epoch_);
-            b_.CreateCall(nba_block_enqueue_fn_, { b_.getInt32(cur_block_id_) });
+            llvm::Value* id  = b_.getInt32(cur_block_id_);
+            if (blk_base_val_ != nullptr) {
+                if (group_first_block_ < 0) {
+                    group_first_block_ = static_cast<int64_t>(cur_block_id_);
+                    group_blk_bases_.emplace_back(blk_base_sym_, cur_block_id_);
+                }
+                id = b_.CreateAdd(
+                  blk_base_val_,
+                  b_.getInt32(cur_block_id_ - static_cast<uint32_t>(group_first_block_)));
+            }
+            b_.CreateCall(nba_block_enqueue_fn_, { id });
         }
         std::vector<BlockSig>& sigs = block_commits_[cur_block_id_].sigs;
         auto it = std::find_if(sigs.begin(), sigs.end(), [&](const BlockSig& b) { return b.sig == sig; });
@@ -13021,6 +13060,14 @@ private:
     // materialize_sched_ptr); no_anchor when the absolute constant is used.
     uint32_t sched_anchor_  = SignalSlot::no_anchor;
     uint32_t sched_ordinal_ = 0;
+    // Def-relative NBA block-id base of the current group (see lower_group /
+    // block_register): the i32 global holding the group's first block id, its
+    // entry-materialized load, and the first id itself (-1 until a block opens).
+    llvm::GlobalVariable* blk_base_sym_      = nullptr;
+    llvm::Value*          blk_base_val_      = nullptr;
+    int64_t               group_first_block_ = -1;
+    // (base symbol, first block id) pairs main stores at startup.
+    std::vector<std::pair<llvm::GlobalVariable*, uint32_t>> group_blk_bases_;
     // The shared timer callback (pushes a woken handle onto the active queue) and
     // the active/inactive queue globals, all built once per module. The inactive
     // queue holds processes parked on a zero delay (#0): drained into active at
