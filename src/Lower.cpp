@@ -877,6 +877,14 @@ private:
                 // in the backend element-select. Rare in RTL memories.
                 fail("unpacked array with negative index bounds is not supported");
             }
+            if (arr->elementType.getCanonicalType().isEvent()) {
+                // An event lowers to a 1-bit placeholder whose trigger state is a
+                // separate static per-event timestamp, so an event under an array
+                // dimension would declare fine but have no trigger/wait machinery
+                // (every use already fails; the declaration must too).
+                // TODO: event arrays (need per-element trigger state, LRM 15.5).
+                fail("unpacked array of events is not supported");
+            }
             ir::Type t;
             t.kind    = ir::Type::Kind::UnpackedArray;
             t.element = lower_type(arr->elementType);
@@ -970,14 +978,31 @@ private:
                 if (!is_packed && f.getType().getCanonicalType().isUnpackedUnion()) {
                     // Unpacked unions are not lowered (packed union member access
                     // is also guarded). Every other member type — scalar, string,
-                    // real, unpacked array, nested unpacked struct — is backed by
-                    // the recursive aggregate storage model.
+                    // real, unpacked array, nested unpacked struct, dynamic
+                    // array, queue — is backed by the recursive aggregate
+                    // storage model.
                     fail("unpacked union member is not supported");
+                }
+                if (!is_packed && f.getType().getCanonicalType().isEvent()) {
+                    // Same as the array-of-event guard above: the member would
+                    // declare as an inert 1-bit placeholder with no trigger state.
+                    // TODO: event struct members (LRM 15.5).
+                    fail("event struct member is not supported");
                 }
                 // Packed member: `bitOffset` is the field's bit position. Unpacked
                 // member: addressed by declaration index (`fieldIndex`), no flat
                 // offset — store the index so the field table is self-describing.
-                fields.push_back({ f.name, lower_type(f.getType()),
+                const ir::Ref fref = lower_type(f.getType());
+                if (!is_packed) {
+                    const ir::Type::Kind fk = std::get<ir::Type>(module_.pool.get(fref)).kind;
+                    if (fk == ir::Type::Kind::Queue || fk == ir::Type::Kind::DynArray) {
+                        // TODO: queue / dynamic-array struct members (need the
+                        // handle-aware per-leaf lifecycle: real handle slots in
+                        // the aggregate storage, init/deinit walks, deep copy).
+                        fail("queue / dynamic array struct member is not supported");
+                    }
+                }
+                fields.push_back({ f.name, fref,
                                    is_packed ? static_cast<uint32_t>(f.bitOffset) : f.fieldIndex });
             }
 
@@ -1076,8 +1101,20 @@ private:
                 // TODO: rand / randc properties and randomize() (Phase 3).
                 fail("rand / randc class properties are not supported");
             }
+            if (prop.getType().getCanonicalType().isEvent()) {
+                // TODO: event class properties (LRM 15.5) — the property would
+                // declare as an inert placeholder with no trigger state.
+                fail("event class property is not supported");
+            }
+            const ir::Ref pref = lower_type(prop.getType());
+            const ir::Type::Kind pk = std::get<ir::Type>(module_.pool.get(pref)).kind;
+            if (pk == ir::Type::Kind::Queue || pk == ir::Type::Kind::DynArray) {
+                // TODO: queue / dynamic-array class properties (need the
+                // handle-aware per-leaf lifecycle in the object body).
+                fail("queue / dynamic array class property is not supported");
+            }
             class_prop_index_.emplace(&prop, idx);
-            fields.push_back({ prop.name, lower_type(prop.getType()), idx });
+            fields.push_back({ prop.name, pref, idx });
             ++idx;
         }
         module_.pool.set_struct_fields(fid, std::move(fields));

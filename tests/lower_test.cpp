@@ -703,6 +703,77 @@ TEST_CASE("an associative array still fails loudly") {
     CHECK(r.diagnostics.find("associative") != std::string::npos);
 }
 
+TEST_CASE("a queue struct member fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            typedef struct { int q[$]; int x; } t;
+            t a;
+            initial a.x = 1;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("queue / dynamic array struct member") != std::string::npos);
+}
+
+TEST_CASE("a dynamic array struct member fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            typedef struct { int d[]; int x; } t;
+            t a;
+            initial a.x = 1;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("queue / dynamic array struct member") != std::string::npos);
+}
+
+TEST_CASE("a queue class property fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            class C; int q[$]; endclass
+            C c;
+            initial c = new;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("queue / dynamic array class property") != std::string::npos);
+}
+
+TEST_CASE("an event struct member fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            typedef struct { event e; int x; } t;
+            t a;
+            initial a.x = 1;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("event struct member") != std::string::npos);
+}
+
+TEST_CASE("an unpacked array of events fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            event ev [4];
+            initial ->ev[0];
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("unpacked array of events") != std::string::npos);
+}
+
+TEST_CASE("an event class property fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            class C; event e; endclass
+            C c;
+            initial c = new;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("event class property") != std::string::npos);
+}
+
 TEST_CASE("a packed struct declares and carries its field table") {
     const LowerResult r = lower_text(R"(
         module top;
