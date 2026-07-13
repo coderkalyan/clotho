@@ -356,6 +356,9 @@ struct Analysis {
                         mark(fn->result_z);
                     }
                     break;
+                case Inst::Tag::RetVoid:
+                    // No value returned; nothing to join.
+                    break;
                 case Inst::Tag::Call: {
                     // A function shares the task argument ABI: In copies the actual's
                     // value in; Inout copies storage in and out; Out copies out; Ref

@@ -156,6 +156,8 @@ public:
     // break / continue: jump out of / to the next iteration of the innermost loop.
     Index break_(SourceLoc loc);
     Index continue_(SourceLoc loc);
+    // Return from a void function / task / fork-child body (no operand).
+    Index ret_void(SourceLoc loc);
 
     // -- String ops (unary/binary-shaped ones go through unary()/binary()) --
     // s[i] = c / s.putc(i, c): mutate the string lvalue `str` in place.

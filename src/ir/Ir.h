@@ -989,10 +989,14 @@ struct Inst {
         // llvm switch over a packed key; unmatched keys (incl. any x/z selector)
         // run the default region. See SwitchInfo.
         Switch,
-        // Return from a function (payload: unary, the return value; ignored for a
-        // void function). A real terminator: instructions after it in the same
-        // region are unreachable. Early `return` works without any flag.
+        // Return a value from a non-void function (payload: unary, the return
+        // value). A real terminator: instructions after it in the same region
+        // are unreachable. Early `return` works without any flag.
         Ret,
+        // Return from a void function, task, or fork-child body (payload: none).
+        // A terminator like Ret; tasks branch to their copy-out epilogue instead
+        // of a real `ret`.
+        RetVoid,
         // Call a function (payload: extra -> CallInfo). The result is this
         // instruction's value (absent for a void function called as a statement).
         Call,
@@ -1505,6 +1509,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::TimeFormat;
         case T::Break:
         case T::Continue:
+        case T::RetVoid:
         case T::DumpVars:
         case T::DumpOff:
         case T::DumpOn:

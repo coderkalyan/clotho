@@ -197,6 +197,8 @@ const char* tag_name(Inst::Tag tag) {
             return "switch";
         case T::Ret:
             return "ret";
+        case T::RetVoid:
+            return "ret_void";
         case T::Call:
             return "call";
         case T::TaskCall:

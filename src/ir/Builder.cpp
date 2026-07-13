@@ -290,6 +290,10 @@ Index Builder::break_(SourceLoc loc) {
     return emit({ Inst::Tag::Break, pay(&Inst::Payload::none, 0u) }, loc);
 }
 
+Index Builder::ret_void(SourceLoc loc) {
+    return emit({ Inst::Tag::RetVoid, pay(&Inst::Payload::none, 0u) }, loc);
+}
+
 Index Builder::continue_(SourceLoc loc) {
     return emit({ Inst::Tag::Continue, pay(&Inst::Payload::none, 0u) }, loc);
 }

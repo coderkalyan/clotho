@@ -6367,6 +6367,7 @@ private:
             case Inst::Tag::HandleDeref:
                 // An lvalue producer (rooted at the object body); no value type.
             case Inst::Tag::Ret:
+            case Inst::Tag::RetVoid:
             case Inst::Tag::Delay:
             case Inst::Tag::Wait:
             case Inst::Tag::Fork:
@@ -7575,6 +7576,9 @@ private:
             }
             case Inst::Tag::Ret:
                 lower_ret(p.unary);
+                return;
+            case Inst::Tag::RetVoid:
+                lower_ret_void();
                 return;
             case Inst::Tag::Call:
                 lower_call_inst(i);
@@ -9763,17 +9767,25 @@ private:
         }
     }
 
-    // Lower a function `return`: a real `ret`, so it terminates the block and any
-    // instructions after it in the region are unreachable (lower_region stops).
-    // A void function ignores the operand and returns void; otherwise the result
-    // is packed into the `{ i(2W), iW }` return struct.
-    void lower_ret(Index value) {
+    // Lower a void `return` (no operand): a task branches to its copy-out +
+    // caller-resume epilogue; a void function copies out formals, releases the
+    // body's strings, and returns void.
+    void lower_ret_void() {
         if (cur_is_task_) {
-            // A task is a coroutine: `return` runs the copy-out + caller-resume
-            // epilogue and falls into the final suspend, never a real `ret`.
             b_.CreateBr(task_epilogue_bb_);
             return;
         }
+        emit_copyout(*cur_fn_);
+        deinit_body_strings();
+        b_.CreateRetVoid();
+    }
+
+    // Lower a non-void function `return`: a real `ret`, so it terminates the
+    // block and any instructions after it in the region are unreachable
+    // (lower_region stops). The result is packed into the `{ i(2W), iW }` return
+    // struct (string / aggregate / handle results copy out through the trailing
+    // out-param instead).
+    void lower_ret(Index value) {
         // A function copies output / inout formals back through their pointers at
         // each return point (LRM 13.5), before releasing the body and returning.
         emit_copyout(*cur_fn_);
@@ -9801,11 +9813,6 @@ private:
             // (the value may be a frame local or a call result temp).
             emit_handle_assign(fn_->getArg(fn_->arg_size() - 1), lvalue_of(value).base,
                                cur_fn_->return_type);
-            deinit_body_strings();
-            b_.CreateRetVoid();
-            return;
-        }
-        if (cur_fn_->return_type == mod_.pool.void_type) {
             deinit_body_strings();
             b_.CreateRetVoid();
             return;

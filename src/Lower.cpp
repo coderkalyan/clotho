@@ -7846,12 +7846,6 @@ private:
         return b.signal(signal_of(vs), l);
     }
 
-    // A 1-bit zero, used as the (ignored) operand of a void function's Ret. Ret
-    // always carries an operand; the backend drops it for a void return.
-    ir::Index void_ret_operand(ir::Builder& b, ir::SourceLoc l) {
-        return b.constant(module_.pool.put_int(make_int_type(1, false, false), 0), l);
-    }
-
     void lower_return(const ReturnStatement& r, ir::Builder& b) {
         if (fn_ctx_ == nullptr) {
             fail("return statement outside of a function");
@@ -7898,7 +7892,7 @@ private:
             b.unary(ir::Inst::Tag::Ret,
                     is_handle_ref(fn_ctx_->ret_type) ? rv : b.unary(ir::Inst::Tag::Load, rv, l), l);
         } else {
-            b.unary(ir::Inst::Tag::Ret, void_ret_operand(b, l), l);
+            b.ret_void(l);
         }
     }
 
@@ -8070,7 +8064,7 @@ private:
         // whole-function scans in the backend (nba shadow, ptr-arg signals).
         ir::Builder         b(module_.pool);
         const ir::SourceLoc el = to_source_loc(sub.location);
-        b.unary(ir::Inst::Tag::Ret, void_ret_operand(b, el), el);
+        b.ret_void(el);
 
         // Mirror param_types into local_types (formal k == Local k), the invariant
         // every whole-function analysis assumes (e.g. compute_may_z joins param_z
@@ -8324,7 +8318,7 @@ private:
 
         // Fall-through return: the void Ret drives the backend's copy-out epilogue.
         const ir::SourceLoc el = to_source_loc(sub.location);
-        b.unary(ir::Inst::Tag::Ret, void_ret_operand(b, el), el);
+        b.ret_void(el);
 
         module_.set_function(id, ir::Function{ .name        = std::string(sub.name),
                                                .return_type = module_.pool.void_type,
@@ -8359,7 +8353,7 @@ private:
         ir::Builder b(module_.pool);
         lower_stmt(body, b);
         const ir::SourceLoc el = loc(body);
-        b.unary(ir::Inst::Tag::Ret, void_ret_operand(b, el), el);
+        b.ret_void(el);
 
         module_.set_function(id, ir::Function{ .name          = "fork.child",
                                                .return_type   = module_.pool.void_type,
@@ -8434,7 +8428,7 @@ private:
         // storage out through the trailing return out-param), not a loaded value.
         const ir::SourceLoc el = to_source_loc(sub.location);
         if (is_void) {
-            b.unary(ir::Inst::Tag::Ret, void_ret_operand(b, el), el);
+            b.ret_void(el);
         } else if (is_aggregate(sub.returnValVar->getType())) {
             b.unary(ir::Inst::Tag::Ret, b.local(ctx.ret_local, ctx.ret_type, el), el);
         } else {
