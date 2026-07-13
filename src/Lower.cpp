@@ -1123,6 +1123,85 @@ private:
         emit_agg_store(lhs_base, sty, rhs, tag, b, l);
     }
 
+    static bool struct_has_field_defaults(const slang::ast::Type& t) {
+        const slang::ast::Type& ct = t.getCanonicalType();
+        if (!ct.isUnpackedStruct()) {
+            return false;
+        }
+        for (const auto& f : ct.as<slang::ast::UnpackedStructType>().membersOfType<slang::ast::FieldSymbol>()) {
+            if (f.getInitializer() != nullptr || struct_has_field_defaults(f.getType())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Apply an unpacked struct type's field-level default initializers (see
+    // struct_has_field_defaults) to `lhs`, for a variable declared with no
+    // initializer of its own: one store per field that declares a default, in
+    // declaration order, recursing into a nested struct field that has one of
+    // its own. A field with no default (direct or nested) is left alone --
+    // its storage already carries the plain power-on value (X / 0) the
+    // backend's state initializer set, same as any other uninitialized
+    // scalar. `sv_type` is the same struct as `sty`'s interned Kind::Struct
+    // (needed alongside it: field initializer expressions and their real
+    // types live on the slang AST, not the IR field table).
+    void emit_struct_field_defaults(ir::Index lhs, ir::Ref sty, const slang::ast::Type& sv_type,
+                                    ir::Builder& b, ir::SourceLoc l) {
+        const auto& ct = sv_type.getCanonicalType().as<slang::ast::UnpackedStructType>();
+        uint32_t idx = 0;
+        for (const auto& f : ct.membersOfType<slang::ast::FieldSymbol>()) {
+            if (const Expression* init = f.getInitializer()) {
+                const ir::Index fld_lv = b.member_select(lhs, idx, sty, l);
+                const ir::Index rhs    = lower_expr(*init, b);
+                if (f.getType().getCanonicalType().isString()) {
+                    b.binary(ir::Inst::Tag::Store, fld_lv, rhs, l);
+                } else {
+                    b.binary(ir::Inst::Tag::Store, fld_lv,
+                             coerce(rhs, *init->type, lower_type(f.getType()), b, l), l);
+                }
+            } else if (struct_has_field_defaults(f.getType())) {
+                emit_struct_field_defaults(b.member_select(lhs, idx, sty, l), lower_type(f.getType()),
+                                           f.getType(), b, l);
+            }
+            ++idx;
+        }
+    }
+
+    // True if a type is, or (through unpacked-array nesting) contains, an
+    // unpacked struct with a field-level default (struct_has_field_defaults).
+    static bool aggregate_has_field_defaults(const slang::ast::Type& t) {
+        const slang::ast::Type& ct = t.getCanonicalType();
+        if (ct.isUnpackedStruct()) {
+            return struct_has_field_defaults(ct);
+        }
+        if (const auto* arr = ct.as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
+            return aggregate_has_field_defaults(arr->elementType);
+        }
+        return false;
+    }
+
+    // Apply a struct-typed variable's field-level default initializers when
+    // the variable itself has none (see struct_has_field_defaults /
+    // emit_struct_field_defaults). An array of such a struct is a documented
+    // follow-up: loud-guarded, not a silent no-op, since silently skipping it
+    // would leave every element at its plain power-on value with the field
+    // defaults dropped -- the exact bug this function exists to fix.
+    void emit_var_field_defaults(const VariableSymbol& vs, ir::Index lv, ir::Builder& b, ir::SourceLoc l) {
+        if (!aggregate_has_field_defaults(vs.getType())) {
+            return;
+        }
+        if (is_unpacked_struct(vs.getType())) {
+            emit_struct_field_defaults(lv, lower_type(vs.getType()), vs.getType(), b, l);
+            return;
+        }
+        // TODO: an array of a struct with field-level defaults, and no array
+        // initializer of its own -- each element needs the same per-field
+        // defaulting emit_struct_field_defaults does for a bare struct.
+        fail("an array of a struct with field-level default initializers, and no "
+             "array initializer of its own, is not supported");
+    }
+
     // Store an aggregate whole-object value into `lhs` (an aggregate lvalue of
     // type `type`), decomposing to per-leaf stores. RHS is a `'{...}` pattern
     // (per-field elements, recursed for aggregate members), a leaf value, or
@@ -3397,6 +3476,17 @@ private:
             } else {
                 b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
             }
+        } else if (aggregate_has_field_defaults(vs.getType())) {
+            // No initializer of its own, but the struct type declares field-level
+            // defaults (LRM 7.2 / 8.8). Same "runs once, not per call" hazard as
+            // an explicit static-local initializer above: applying the defaults
+            // here would re-store them on every call, clobbering a previous
+            // call's mutations.
+            if (is_static_local(vs, force_frame)) {
+                fail("static function local with a struct field-level default initializer is not supported");
+            }
+            const ir::SourceLoc l = to_source_loc(vs.location);
+            emit_var_field_defaults(vs, value_lvalue(vs, b, l), b, l);
         }
     }
 
@@ -3404,11 +3494,20 @@ private:
     // as a store in the run-once pre-init process. The store services no wait queue
     // (the backend suppresses servicing for a PreInit process), so initialization
     // generates no events and every Initial / Always process starts from the
-    // settled value, before any of them run. A variable with no initializer keeps
+    // settled value, before any of them run. A variable with no initializer of
+    // its own, and whose struct type has no field-level defaults either, keeps
     // its power-on default (X / 0), set by the backend's init_state.
     void lower_var_initializer(const VariableSymbol& vs) {
         const Expression* init = vs.getInitializer();
         if (init == nullptr) {
+            if (aggregate_has_field_defaults(vs.getType())) {
+                if (!preinit_) {
+                    preinit_.emplace(module_.pool);
+                }
+                ir::Builder&        b = *preinit_;
+                const ir::SourceLoc l = to_source_loc(vs.location);
+                emit_var_field_defaults(vs, value_lvalue(vs, b, l), b, l);
+            }
             return;
         }
         if (!preinit_) {

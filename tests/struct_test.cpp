@@ -220,6 +220,89 @@ TEST_CASE("unpacked struct member power-on: 4-state X, 2-state 0") {
     )") == "a=xx b=0\n");
 }
 
+TEST_CASE("struct field default applies when the variable has no initializer") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int x = 5; int y; } s_t;
+            s_t s;
+            initial $display("%0d %0d", s.x, s.y);
+        endmodule
+    )") == "5 0\n");
+}
+
+TEST_CASE("struct field default equal to a parameter") {
+    CHECK(run_capture(R"(
+        module m;
+            parameter int W = 8;
+            typedef struct { int x = W; int y = 5; } s_t;
+            s_t s;
+            initial $display("%0d %0d", s.x, s.y);
+        endmodule
+    )") == "8 5\n");
+}
+
+// An explicit variable initializer overrides every field default (it's a
+// whole different '{...} pattern, not merged with the type's defaults).
+TEST_CASE("an explicit variable initializer overrides struct field defaults") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int x = 5; int y = 6; } s_t;
+            s_t s = '{x: 99, y: 100};
+            initial $display("%0d %0d", s.x, s.y);
+        endmodule
+    )") == "99 100\n");
+}
+
+// A field default nested inside another struct field applies recursively.
+TEST_CASE("a nested struct field's own default applies") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a = 7; } inner_t;
+            typedef struct { inner_t i; int b = 3; } outer_t;
+            outer_t o;
+            initial $display("%0d %0d", o.i.a, o.b);
+        endmodule
+    )") == "7 3\n");
+}
+
+// A static function-local with a struct field default is guarded loudly
+// (same "runs once, not per call" hazard as an explicit static-local
+// initializer): applying it per call would clobber a previous call's
+// mutations.
+TEST_CASE("a static local struct with a field default fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            typedef struct { int x = 5; } s_t;
+            function automatic int f();
+                static s_t s;
+                s.x++;
+                return s.x;
+            endfunction
+            initial $display("%0d", f());
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("static function local with a struct field-level default") !=
+          std::string::npos);
+}
+
+// An array of a struct with field defaults, and no array initializer of its
+// own, is a documented follow-up (not yet element-wise defaulted) -- guarded
+// loudly rather than silently leaving every element's fields at their plain
+// power-on value.
+TEST_CASE("an array of a struct with field defaults fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            typedef struct { int x = 5; } s_t;
+            s_t arr [1:0];
+            initial $display("%0d", arr[0].x);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("array of a struct with field-level default initializers") !=
+          std::string::npos);
+}
+
 TEST_CASE("whole unpacked struct copy is field-wise") {
     CHECK(run_capture(R"(
         module m;
