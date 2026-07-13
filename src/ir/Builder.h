@@ -110,6 +110,10 @@ public:
     Index dyn_array_delete(Index arr, Ref array_type, SourceLoc loc);
     // dst = src: deep copy of another dynamic array (value semantics).
     Index dyn_array_copy(Index dst, Index src, Ref array_type, SourceLoc loc);
+    // arr.reverse() (LRM 7.12.2): reverse element order in place.
+    Index dyn_array_reverse(Index arr, Ref array_type, SourceLoc loc);
+    // arr.sort() (`reversed` false) / arr.rsort() (`reversed` true): value order.
+    Index dyn_array_sort(Index arr, bool reversed, Ref array_type, SourceLoc loc);
     // Queue operations on the handle lvalue `q` (LRM 7.10.2). size / pop* yield
     // a value; push* / insert / delete / copy are statements. See ir::QueueOp.
     // `queue_type` is the interned Queue type (element stride / slot / bound).
@@ -125,6 +129,10 @@ public:
     Index queue_delete(Index q, Index idx, bool has_idx, Ref queue_type, SourceLoc loc);
     // dst = src: deep copy of another queue (value semantics).
     Index queue_copy(Index dst, Index src, Ref queue_type, SourceLoc loc);
+    // q.reverse() (LRM 7.12.2): reverse element order in place.
+    Index queue_reverse(Index q, Ref queue_type, SourceLoc loc);
+    // q.sort() (`reversed` false) / q.rsort() (`reversed` true): value order.
+    Index queue_sort(Index q, bool reversed, Ref queue_type, SourceLoc loc);
     // `unlikely` hints that the condition is rarely true (e.g. a violation
     // check), so the backend biases branch weights toward the else path.
     Index cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc,

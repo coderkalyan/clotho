@@ -968,6 +968,102 @@ extern "C" void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, uint64_t 
     dst->len  = src->len;
 }
 
+// -- Array ordering methods (LRM 7.12.2) --
+//
+// Element-agnostic reverse and value-keyed sort over `stride`-byte slots, shared
+// by the dynamic-array and queue entry points. reverse() moves whole slots and
+// works for any element; sort()/rsort() key on a scalar element value, restricted
+// by the frontend to a 2-state integral (width <= 64) or real element.
+
+namespace {
+
+// Sort-key kind for the ordering comparator; mirrors the backend descriptor.
+enum : uint32_t { sort_unsigned = 0, sort_signed = 1, sort_real = 2 };
+
+// Swap two `stride`-byte element slots through a caller-provided scratch slot.
+void swap_slots(uint8_t* a, uint8_t* b, uint64_t stride, uint8_t* tmp) {
+    std::memcpy(tmp, a, static_cast<size_t>(stride));
+    std::memcpy(a, b, static_cast<size_t>(stride));
+    std::memcpy(b, tmp, static_cast<size_t>(stride));
+}
+
+// Reverse `n` contiguous `stride`-byte slots in place.
+void reverse_run(uint8_t* data, uint64_t n, uint64_t stride) {
+    if (n < 2) {
+        return;
+    }
+    std::vector<uint8_t> tmp(static_cast<size_t>(stride));
+    for (uint64_t i = 0, j = n - 1; i < j; ++i, --j) {
+        swap_slots(data + i * stride, data + j * stride, stride, tmp.data());
+    }
+}
+
+// The low min(stride, 8) bytes of a slot as a raw 64-bit word (little-endian).
+uint64_t slot_word(const uint8_t* p, uint64_t stride) {
+    uint64_t v = 0;
+    std::memcpy(&v, p, stride < 8 ? static_cast<size_t>(stride) : 8);
+    return v;
+}
+
+// Ascending `a < b` over one element slot for the element's compare kind.
+bool slot_less(const uint8_t* a, const uint8_t* b, uint64_t stride, uint32_t kind, uint32_t width) {
+    if (kind == sort_real) {
+        double da = 0.0;
+        double db = 0.0;
+        std::memcpy(&da, a, sizeof(double));
+        std::memcpy(&db, b, sizeof(double));
+        return da < db;
+    }
+    uint64_t ua = slot_word(a, stride);
+    uint64_t ub = slot_word(b, stride);
+    if (width < 64) {
+        const uint64_t mask = (uint64_t{ 1 } << width) - 1;
+        ua &= mask;
+        ub &= mask;
+    }
+    if (kind == sort_signed) {
+        // Sign-extend the width-bit value so the compare is arithmetic.
+        const uint64_t sbit = uint64_t{ 1 } << (width - 1);
+        return static_cast<int64_t>((ua ^ sbit) - sbit) < static_cast<int64_t>((ub ^ sbit) - sbit);
+    }
+    return ua < ub;
+}
+
+// Sort `n` contiguous slots ascending; `rev` then flips to descending (rsort).
+// A scalar element equals its own sort key, so ties are unobservable and an
+// unstable sort suffices (LRM 7.12.2 does not require stability).
+void sort_run(uint8_t* data, uint64_t n, uint64_t stride, uint32_t kind, uint32_t width, uint32_t rev) {
+    if (n < 2) {
+        return;
+    }
+    std::vector<uint64_t> order(static_cast<size_t>(n));
+    for (uint64_t i = 0; i < n; ++i) {
+        order[i] = i;
+    }
+    std::sort(order.begin(), order.end(), [&](uint64_t x, uint64_t y) {
+        return slot_less(data + x * stride, data + y * stride, stride, kind, width);
+    });
+    std::vector<uint8_t> tmp(static_cast<size_t>(n * stride));
+    for (uint64_t i = 0; i < n; ++i) {
+        std::memcpy(tmp.data() + i * stride, data + order[i] * stride, static_cast<size_t>(stride));
+    }
+    std::memcpy(data, tmp.data(), static_cast<size_t>(n * stride));
+    if (rev != 0) {
+        reverse_run(data, n, stride);
+    }
+}
+
+} // namespace
+
+extern "C" void rt_dynarr_reverse(rt_dynarr* h, uint64_t stride) {
+    reverse_run(static_cast<uint8_t*>(h->data), h->len, stride);
+}
+
+extern "C" void rt_dynarr_sort(rt_dynarr* h, uint64_t stride, uint32_t kind, uint32_t width,
+                               uint32_t rev) {
+    sort_run(static_cast<uint8_t*>(h->data), h->len, stride, kind, width, rev);
+}
+
 // -- Queues (LRM 7.10) --
 //
 // A queue is a growable ring buffer: `base` holds `cap` element slots, the `len`
@@ -1134,6 +1230,34 @@ extern "C" void rt_queue_assign(rt_queue* dst, const rt_queue* src, uint64_t str
     dst->base = buf;
     dst->len  = src->len;
     dst->cap  = src->len;
+}
+
+extern "C" void rt_queue_reverse(rt_queue* h, uint64_t stride) {
+    if (h->len < 2) {
+        return;
+    }
+    std::vector<uint8_t> tmp(static_cast<size_t>(stride));
+    for (uint64_t i = 0, j = h->len - 1; i < j; ++i, --j) {
+        swap_slots(q_elem(h, stride, i), q_elem(h, stride, j), stride, tmp.data());
+    }
+}
+
+extern "C" void rt_queue_sort(rt_queue* h, uint64_t stride, uint32_t kind, uint32_t width,
+                              uint32_t rev) {
+    if (h->len < 2) {
+        return;
+    }
+    const uint64_t n = h->len;
+    // Gather the ring's logical order into a contiguous scratch, sort there, then
+    // scatter back into the same ring positions (head unchanged).
+    std::vector<uint8_t> buf(static_cast<size_t>(n * stride));
+    for (uint64_t i = 0; i < n; ++i) {
+        std::memcpy(buf.data() + i * stride, q_elem(h, stride, i), static_cast<size_t>(stride));
+    }
+    sort_run(buf.data(), n, stride, kind, width, rev);
+    for (uint64_t i = 0; i < n; ++i) {
+        std::memcpy(q_elem(h, stride, i), buf.data() + i * stride, static_cast<size_t>(stride));
+    }
 }
 
 extern "C" void* rt_intra_alloc(uint32_t idx, uint32_t stride) {

@@ -6603,8 +6603,36 @@ private:
         if (name == "delete") {
             return b.dyn_array_delete(arr, aty, l);
         }
-        // TODO: dynamic array find/sort/sum/etc. reduction & locator methods.
+        if (name == "reverse") {
+            return b.dyn_array_reverse(arr, aty, l);
+        }
+        if (name == "sort" || name == "rsort") {
+            guard_ordering_sort(name, call);
+            return b.dyn_array_sort(arr, name == "rsort", aty, l);
+        }
+        // TODO: dynamic-array shuffle (needs the per-process RNG, LRM 18.13),
+        // sort/rsort `with` clause, 4-state / wide sort, and find/min/max/unique/
+        // sum reduction & locator methods (need iterator-clause lowering).
         fail("dynamic array method '" + std::string(name) + "' is not supported");
+    }
+
+    // Loud guard for the array ordering methods sort()/rsort() (LRM 7.12.2): the
+    // V1 comparator handles a 2-state integral (width <= 64) or real element and
+    // no `with` clause. 4-state ordering (x/z placement is LRM-unspecified), wide
+    // elements, and a keyed `with` comparator are documented follow-ups.
+    void guard_ordering_sort(std::string_view name, const CallExpression& call) {
+        const auto& sci = std::get<CallExpression::SystemCallInfo>(call.subroutine);
+        if (sci.getIteratorInfo().first != nullptr) {
+            fail("'" + std::string(name) + "' with a `with` clause is not supported");
+        }
+        const slang::ast::Type* et = call.arguments()[0]->type->getArrayElementType();
+        const slang::ast::Type& ec = et->getCanonicalType();
+        const bool ok = ec.isFloating() ||
+                        (ec.isIntegral() && !ec.isFourState() && ec.getBitWidth() <= 64);
+        if (!ok) {
+            fail("'" + std::string(name) +
+                 "' is only supported for a 2-state integral (width <= 64) or real element");
+        }
     }
 
     // Element address for a variable-size array (dynamic array or queue) index
@@ -6676,7 +6704,16 @@ private:
             }
             return b.queue_delete(q, q, /*has_idx*/ false, qty, l);
         }
-        // TODO: queue find/sort/sum/reverse/unique reduction & locator methods.
+        if (name == "reverse") {
+            return b.queue_reverse(q, qty, l);
+        }
+        if (name == "sort" || name == "rsort") {
+            guard_ordering_sort(name, call);
+            return b.queue_sort(q, name == "rsort", qty, l);
+        }
+        // TODO: queue shuffle (needs the per-process RNG, LRM 18.13), sort/rsort
+        // `with` clause, 4-state / wide sort, and find/min/max/unique/sum
+        // reduction & locator methods (need iterator-clause lowering).
         fail("queue method '" + std::string(name) + "' is not supported");
     }
 

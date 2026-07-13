@@ -173,6 +173,7 @@ add_executable(clotho_test
   tests/event_test.cpp
   tests/dynamic_array_test.cpp
   tests/queue_test.cpp
+  tests/array_ordering_test.cpp
   tests/class_test.cpp
   tests/unbased_test.cpp
   tests/preprocess_test.cpp

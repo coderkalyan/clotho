@@ -193,6 +193,20 @@ Index Builder::dyn_array_copy(Index dst, Index src, Ref array_type, SourceLoc lo
     return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
 }
 
+Index Builder::dyn_array_reverse(Index arr, Ref array_type, SourceLoc loc) {
+    const ExtraIndex extra =
+      add_extra(DynArrayInfo{ static_cast<uint32_t>(DynArrayOp::Reverse), arr, arr, array_type });
+
+    return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { arr, extra } } }, loc);
+}
+
+Index Builder::dyn_array_sort(Index arr, bool reversed, Ref array_type, SourceLoc loc) {
+    const auto       sub   = reversed ? DynArrayOp::Rsort : DynArrayOp::Sort;
+    const ExtraIndex extra = add_extra(DynArrayInfo{ static_cast<uint32_t>(sub), arr, arr, array_type });
+
+    return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { arr, extra } } }, loc);
+}
+
 Index Builder::queue_size(Index q, Ref queue_type, SourceLoc loc) {
     const ExtraIndex extra =
       add_extra(QueueInfo{ static_cast<uint32_t>(QueueOp::Size), q, q, queue_type });
@@ -233,6 +247,20 @@ Index Builder::queue_copy(Index dst, Index src, Ref queue_type, SourceLoc loc) {
       add_extra(QueueInfo{ static_cast<uint32_t>(QueueOp::Copy), dst, src, queue_type });
 
     return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+}
+
+Index Builder::queue_reverse(Index q, Ref queue_type, SourceLoc loc) {
+    const ExtraIndex extra =
+      add_extra(QueueInfo{ static_cast<uint32_t>(QueueOp::Reverse), q, q, queue_type });
+
+    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
+}
+
+Index Builder::queue_sort(Index q, bool reversed, Ref queue_type, SourceLoc loc) {
+    const auto       sub   = reversed ? QueueOp::Rsort : QueueOp::Sort;
+    const ExtraIndex extra = add_extra(QueueInfo{ static_cast<uint32_t>(sub), q, q, queue_type });
+
+    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
 }
 
 Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc,

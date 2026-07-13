@@ -442,6 +442,20 @@ void rt_dynarr_delete(rt_dynarr* h);
 // semantics, LRM §7.5). A no-op when dst == src.
 void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, uint64_t stride);
 
+// -- Array ordering methods (LRM 7.12.2) --
+//
+// `kind` selects the sort comparator over an element's `width`-bit value:
+// 0 = unsigned integral, 1 = signed integral, 2 = IEEE real (double). The
+// frontend restricts sort()/rsort() to a 2-state integral (width <= 64) or real
+// element; reverse() is element-agnostic (whole-slot move) and takes no kind.
+
+// arr.reverse(): reverse the element order in place.
+void rt_dynarr_reverse(rt_dynarr* h, uint64_t stride);
+
+// arr.sort() (rev == 0) / arr.rsort() (rev == 1): order elements ascending /
+// descending by value.
+void rt_dynarr_sort(rt_dynarr* h, uint64_t stride, uint32_t kind, uint32_t width, uint32_t rev);
+
 // -- SystemVerilog queues --
 //
 // The queue type (LRM §7.10): a runtime-sized double-ended vector of a
@@ -489,6 +503,11 @@ void rt_queue_delete_all(rt_queue* h);
 // dst = src: deep copy `src`'s `stride`-byte elements into `dst`, linearised so
 // dst->head == 0 (value semantics, LRM §7.10). A no-op when dst == src.
 void rt_queue_assign(rt_queue* dst, const rt_queue* src, uint64_t stride);
+
+// q.reverse() / q.sort() / q.rsort() (LRM 7.12.2). `kind` / `width` / `rev` match
+// the rt_dynarr_* ordering entry points; operates on the ring's logical order.
+void rt_queue_reverse(rt_queue* h, uint64_t stride);
+void rt_queue_sort(rt_queue* h, uint64_t stride, uint32_t kind, uint32_t width, uint32_t rev);
 
 // -- SystemVerilog string objects --
 //

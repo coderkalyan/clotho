@@ -713,6 +713,20 @@ private:
         return llmod_.getDataLayout().getTypeAllocSize(e.slot_ty);
     }
 
+    // Sort comparator descriptor for the element of `array_type` (LRM 7.12.2
+    // sort()/rsort()). `kind`: 0 = unsigned integral, 1 = signed integral,
+    // 2 = real. Derived from the element value type; the frontend has already
+    // restricted the element to a 2-state integral (width <= 64) or real.
+    struct SortDesc {
+        uint32_t kind;
+        uint32_t width;
+    };
+    SortDesc dynarr_sort_desc(Ref array_type) const {
+        const Ref     elem = std::get<Type>(mod_.pool.get(array_type)).element;
+        const ValType vt   = from_ref(elem);
+        return { vt.is_real ? 2u : (vt.is_signed ? 1u : 0u), vt.width };
+    }
+
     // The opaque rt_queue ring handle slot type
     // (`%clotho.queue = { ptr, i64, i64, i64 }`), memoized. Must mirror the
     // runtime rt_queue layout ({ void* base, u64 head, u64 len, u64 cap }).
@@ -5642,6 +5656,15 @@ private:
     llvm::FunctionCallee dynarr_assign_fn() {
         return rt_fn("rt_dynarr_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
     }
+    // void rt_dynarr_reverse(rt_dynarr*, i64 stride)  (LRM 7.12.2)
+    llvm::FunctionCallee dynarr_reverse_fn() {
+        return rt_fn("rt_dynarr_reverse", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
+    }
+    // void rt_dynarr_sort(rt_dynarr*, i64 stride, i32 kind, i32 width, i32 rev)
+    llvm::FunctionCallee dynarr_sort_fn() {
+        return rt_fn("rt_dynarr_sort", b_.getVoidTy(),
+                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty() });
+    }
 
     // -- Queue runtime (rt_queue_*, LRM 7.10) --
     // void rt_queue_push_{back,front}(rt_queue*, i64 stride, i64 bound, const void* elem)
@@ -5671,6 +5694,15 @@ private:
     // void rt_queue_assign(rt_queue* dst, const rt_queue* src, i64 stride)
     llvm::FunctionCallee queue_assign_fn() {
         return rt_fn("rt_queue_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+    }
+    // void rt_queue_reverse(rt_queue*, i64 stride)  (LRM 7.12.2)
+    llvm::FunctionCallee queue_reverse_fn() {
+        return rt_fn("rt_queue_reverse", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
+    }
+    // void rt_queue_sort(rt_queue*, i64 stride, i32 kind, i32 width, i32 rev)
+    llvm::FunctionCallee queue_sort_fn() {
+        return rt_fn("rt_queue_sort", b_.getVoidTy(),
+                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty() });
     }
 
     llvm::FunctionCallee str_init_fn() {
@@ -7876,6 +7908,18 @@ private:
                 b_.CreateCall(dynarr_assign_fn(),
                               { handle, lvalue_of(da.src).base, b_.getInt64(dynarr_stride(e)) });
                 return;
+            case DynArrayOp::Reverse:
+                b_.CreateCall(dynarr_reverse_fn(), { handle, b_.getInt64(dynarr_stride(e)) });
+                return;
+            case DynArrayOp::Sort:
+            case DynArrayOp::Rsort: {
+                const SortDesc d   = dynarr_sort_desc(da.array_type);
+                const bool     rev = static_cast<DynArrayOp>(da.sub) == DynArrayOp::Rsort;
+                b_.CreateCall(dynarr_sort_fn(), { handle, b_.getInt64(dynarr_stride(e)),
+                                                  b_.getInt32(d.kind), b_.getInt32(d.width),
+                                                  b_.getInt32(rev ? 1 : 0) });
+                return;
+            }
         }
     }
 
@@ -7980,6 +8024,17 @@ private:
             case QueueOp::Copy:
                 b_.CreateCall(queue_assign_fn(), { handle, lvalue_of(qi.val).base, stride });
                 return;
+            case QueueOp::Reverse:
+                b_.CreateCall(queue_reverse_fn(), { handle, stride });
+                return;
+            case QueueOp::Sort:
+            case QueueOp::Rsort: {
+                const SortDesc d   = dynarr_sort_desc(arr_ty);
+                const bool     rev = static_cast<QueueOp>(qi.sub) == QueueOp::Rsort;
+                b_.CreateCall(queue_sort_fn(), { handle, stride, b_.getInt32(d.kind),
+                                                 b_.getInt32(d.width), b_.getInt32(rev ? 1 : 0) });
+                return;
+            }
         }
     }
 

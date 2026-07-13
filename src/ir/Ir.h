@@ -241,6 +241,12 @@ enum class DynArrayOp : uint32_t {
     // arr = other: deep copy of another dynamic array's storage (value
     // semantics, LRM 7.5).
     Copy,
+    // arr.reverse(): reverse element order in place (LRM 7.12.2). Element-agnostic.
+    Reverse,
+    // arr.sort() / arr.rsort(): order elements ascending / descending by value
+    // (LRM 7.12.2). Restricted to a 2-state integral (width <= 64) or real element.
+    Sort,
+    Rsort,
 };
 
 // Which queue operation a `queue_op` performs (LRM 7.10.2). Kept in lockstep
@@ -264,6 +270,12 @@ enum class QueueOp : uint32_t {
     DeleteAll,
     // q = other: deep copy of another queue's storage (value semantics).
     Copy,
+    // q.reverse(): reverse element order in place (LRM 7.12.2). Element-agnostic.
+    Reverse,
+    // q.sort() / q.rsort(): order elements ascending / descending by value
+    // (LRM 7.12.2). Restricted to a 2-state integral (width <= 64) or real element.
+    Sort,
+    Rsort,
 };
 
 // Extra payload for `queue_op`: a queue operation on the handle lvalue `op`
