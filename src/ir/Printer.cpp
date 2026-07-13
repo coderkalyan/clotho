@@ -291,8 +291,10 @@ const char* tag_name(Inst::Tag tag) {
             return "sformatf";
         case T::Ferror:
             return "ferror";
-        case T::Scanf:
-            return "scanf";
+        case T::Fscanf:
+            return "fscanf";
+        case T::Sscanf:
+            return "sscanf";
         case T::FreadWord:
             return "fread_word";
         case T::FreadMem:

@@ -478,10 +478,12 @@ Index Builder::scanf(Index source, bool is_string, std::string_view fmt, std::sp
     // the ScanfInfo record pointing at both.
     const ExtraIndex fmt_at = add_bytes(fmt);
     const ExtraSlice slice  = add_slice(args);
-    const ExtraIndex extra  = add_extra(
-      ScanfInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), source, is_string ? 1u : 0u, slice });
+    const ExtraIndex extra =
+      add_extra(ScanfInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), source, slice });
 
-    return emit({ Inst::Tag::Scanf, pay(&Inst::Payload::extra, extra) }, loc);
+    return emit({ is_string ? Inst::Tag::Sscanf : Inst::Tag::Fscanf,
+                  pay(&Inst::Payload::extra, extra) },
+                loc);
 }
 
 Index Builder::finish(std::string_view banner, uint32_t arg, SourceLoc loc) {

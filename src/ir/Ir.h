@@ -558,20 +558,17 @@ struct SformatfInfo {
     ExtraSlice args;
 };
 
-// Extra payload for `scanf`: $fscanf / $sscanf (LRM §21.3.4) parse `source` per the
+// Extra payload for `fscanf` / `sscanf` (LRM §21.3.4): parse `source` per the
 // packed format-string bytes at `fmt` (`fmt_len` bytes) into the output lvalues
-// `args`, returning the conversion count. When `is_string` is 1 ($sscanf) `source`
-// is a packed-ASCII string value the backend spills; otherwise ($fscanf) it is a
-// file-descriptor value.
+// `args`, returning the conversion count. The tag says what `source` is: an FD
+// value (Fscanf) or a packed-ASCII string value the backend spills (Sscanf).
 struct ScanfInfo {
     // First extra word of the packed format-string bytes.
     ExtraIndex fmt;
     // Format-string length in bytes.
     uint32_t fmt_len;
-    // Source operand: an FD value ($fscanf) or a packed string value ($sscanf).
+    // Source operand: an FD value (Fscanf) or a packed string value (Sscanf).
     Index source;
-    // 1 => $sscanf (source is a packed string); 0 => $fscanf (source is an FD).
-    uint32_t is_string;
     // Output lvalue operands, one per conversion, in order.
     ExtraSlice args;
 };
@@ -1140,10 +1137,13 @@ struct Inst {
         // error code (payload: binary — l is the destination lvalue, r the
         // descriptor value). LRM §21.3.6. Lowers to an rt_ferror call.
         Ferror,
-        // $fscanf / $sscanf: parse a source into output lvalues per a format, ->
-        // conversion count (payload: extra -> ScanfInfo). LRM §21.3.4. Lowers to an
-        // rt_fscanf / rt_sscanf call.
-        Scanf,
+        // $fscanf: parse an FD source into output lvalues per a format, ->
+        // conversion count (payload: extra -> ScanfInfo, whose source is the FD
+        // value). LRM §21.3.4. Lowers to an rt_fscanf call.
+        Fscanf,
+        // $sscanf: like Fscanf, but the source is a packed-ASCII string value
+        // the backend spills (payload: extra -> ScanfInfo). Lowers to rt_sscanf.
+        Sscanf,
         // $fread into a single packed-vector lvalue (payload: binary — l is the
         // destination lvalue, r the descriptor value), -> bytes read. LRM
         // §21.3.4. Lowers to an rt_fread call.
@@ -1495,7 +1495,8 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::Sformat;
         case T::Sformatf:
             return K::Sformatf;
-        case T::Scanf:
+        case T::Fscanf:
+        case T::Sscanf:
             return K::Scanf;
         case T::RealMath:
             return K::RealMath;

@@ -6196,7 +6196,8 @@ private:
             case Inst::Tag::FileValueOp:
             case Inst::Tag::Fgets:
             case Inst::Tag::Ferror:
-            case Inst::Tag::Scanf:
+            case Inst::Tag::Fscanf:
+            case Inst::Tag::Sscanf:
             case Inst::Tag::FreadWord:
             case Inst::Tag::FreadMem:
                 // The file read / positioning / error / scan functions return i32.
@@ -7438,7 +7439,8 @@ private:
                 lower_ferror(i);
                 return;
 
-            case Inst::Tag::Scanf:
+            case Inst::Tag::Fscanf:
+            case Inst::Tag::Sscanf:
                 lower_scanf(i);
                 return;
 
@@ -9184,7 +9186,7 @@ private:
 
         llvm::Value* fmt_ptr = b_.CreateGlobalString(fmt);
         llvm::Value* r       = nullptr;
-        if (info.is_string) {
+        if (ir_->tag(i) == Inst::Tag::Sscanf) {
             const auto [buf, len] = spill_ascii(info.source, "sscanf.buf");
             r = b_.CreateCall(sscanf_fn(), { buf, b_.getInt32(len), fmt_ptr, b_.getInt32(n), arr });
         } else {

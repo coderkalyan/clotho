@@ -415,7 +415,8 @@ struct Analysis {
                     }
                     break;
                 }
-                case Inst::Tag::Scanf: {
+                case Inst::Tag::Fscanf:
+                case Inst::Tag::Sscanf: {
                     // Seed: %h / %b / %o accept z and ? digits (LRM Table 21-7),
                     // which land in a 4-state target's z plane. A 2-state target
                     // has no z plane; the runtime drops parsed x/z to 0 there

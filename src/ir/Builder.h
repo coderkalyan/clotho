@@ -236,7 +236,7 @@ public:
     Index ferror(Index dst, Index fd, SourceLoc loc);
     // $fscanf / $sscanf: parse `source` (an FD value, or a packed string value when
     // `is_string`) per `fmt` into the output lvalues `args`. Yields the conversion
-    // count.
+    // count. `is_string` selects the Sscanf tag.
     Index scanf(Index source, bool is_string, std::string_view fmt, std::span<const Index> args, SourceLoc loc);
     // $fread(reg, fd): read raw bytes from `fd` into the packed-vector lvalue `dst`.
     // Yields the byte count.
