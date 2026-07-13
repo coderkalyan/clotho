@@ -3160,8 +3160,71 @@ private:
     // guards each whole bucket with a single branch on the matching transition
     // fact. Both kinds share the { handle, flag_ptr } element type.
     void build_wait_queues() {
-        const auto       sigs = mod_.signals();
-        const WaitCounts c    = wait_counts();
+        const auto sigs = mod_.signals();
+        WaitCounts c    = wait_counts();
+
+        // Module-dedup prep, option (a): every instance of a reused definition
+        // gets the per-def MAXIMUM bucket capacity for each def-local signal,
+        // so twin bodies emit identical fixed-trip service scans regardless of
+        // per-instance fan-out (subscribers cross instance boundaries through
+        // ports). A padded slot is zeroinit — null flag pointer — and the
+        // inline scan skips it (emit_static_scan_rt `padded`). The true
+        // per-instance counts are kept for the NBA meta table, whose
+        // commit-side scans stay exact and check-free.
+        wait_sta_true_.assign(sigs.size(), { 0, 0, 0 });
+        wait_sta_padded_.assign(sigs.size(), { 0, 0, 0 });
+        for (uint32_t i = 0; i < sigs.size(); ++i) {
+            wait_sta_true_[i] = c.sta[i];
+        }
+        {
+            // Def-local signal table per scope occurrence: slot.path's last
+            // element is the signal's field index within its own scope.
+            std::vector<std::vector<Signal>> by_anchor(anchors_.size());
+            for (uint32_t i = 0; i < sigs.size(); ++i) {
+                const SignalSlot& sl = slots_[i];
+                if (sl.anchor == SignalSlot::no_anchor) {
+                    continue;
+                }
+                const auto k = sl.path.back();
+                auto&      v = by_anchor[sl.anchor];
+                if (k >= v.size()) {
+                    v.resize(k + 1, Signal{ ~0u });
+                }
+                v[k] = static_cast<Signal>(i);
+            }
+            ankerl::unordered_dense::map<llvm::StructType*, std::vector<uint32_t>> groups;
+            for (uint32_t a = 0; a < anchors_.size(); ++a) {
+                groups[anchors_[a].ty].push_back(a);
+            }
+            for (const auto& [ty, members] : groups) {
+                if (members.size() < 2) {
+                    continue;
+                }
+                const size_t nsig = by_anchor[members.front()].size();
+                for (size_t j = 0; j < nsig; ++j) {
+                    for (uint32_t e = 0; e < 3; ++e) {
+                        uint32_t max_sta = 0, max_dyn = 0;
+                        uint32_t min_sta = ~0u;
+                        for (const uint32_t a : members) {
+                            const auto si = static_cast<uint32_t>(by_anchor[a][j]);
+                            max_sta       = std::max(max_sta, c.sta[si][e]);
+                            min_sta       = std::min(min_sta, c.sta[si][e]);
+                            max_dyn       = std::max(max_dyn, c.dyn[si][e]);
+                        }
+                        // The padded (null-checked) scan shape must be uniform
+                        // across every instance of the def — including the one
+                        // whose true count equals the maximum — or twin bodies
+                        // would still diverge.
+                        for (const uint32_t a : members) {
+                            const auto si = static_cast<uint32_t>(by_anchor[a][j]);
+                            wait_sta_padded_[si][e] = min_sta < max_sta ? 1 : 0;
+                            c.sta[si][e]            = max_sta;
+                            c.dyn[si][e]            = max_dyn;
+                        }
+                    }
+                }
+            }
+        }
         wait_sta_gv_.assign(sigs.size(), { nullptr, nullptr, nullptr });
         wait_sta_ty_.assign(sigs.size(), { nullptr, nullptr, nullptr });
         wait_sta_cap_.assign(sigs.size(), { 0, 0, 0 });
@@ -4503,7 +4566,7 @@ private:
             std::array<llvm::Constant*, 3> sb{}, sc{}, db{}, dl{};
             for (uint32_t e = 0; e < 3; ++e) {
                 sb[e] = wait_sta_gv_[i][e] ? llvm::cast<llvm::Constant>(wait_sta_gv_[i][e]) : nullp;
-                sc[e] = llvm::ConstantInt::get(i32, wait_sta_cap_[i][e]);
+                sc[e] = llvm::ConstantInt::get(i32, wait_sta_true_[i][e]);
                 db[e] = wait_dyn_gv_[i][e] ? llvm::cast<llvm::Constant>(wait_dyn_gv_[i][e]) : nullp;
                 dl[e] = wait_dyn_len_gv_[i][e] ? llvm::cast<llvm::Constant>(wait_dyn_len_gv_[i][e]) : nullp;
             }
@@ -5047,7 +5110,8 @@ private:
     // unroll. Membership never changes — no compaction, no length.
     void service_static_queue(Signal sig, uint32_t edge) {
         const auto i = static_cast<uint32_t>(sig);
-        emit_static_scan_rt(wait_sta_gv_[i][edge], b_.getInt32(wait_sta_cap_[i][edge]));
+        emit_static_scan_rt(wait_sta_gv_[i][edge], b_.getInt32(wait_sta_cap_[i][edge]),
+                            wait_sta_padded_[i][edge] != 0);
     }
 
     // Dynamic sub-queue scan (one edge bucket): a straight loop over the live
@@ -5288,7 +5352,11 @@ private:
     // entry wakes its process only if its scheduled flag is 0, then sets the
     // flag — collapsing a multi-signal sensitivity (the same process
     // subscribed under several signals) into a single wake.
-    void emit_static_scan_rt(llvm::Value* base, llvm::Value* cap) {
+    // `padded`: the bucket is capacity-padded to its definition's maximum (see
+    // build_wait_queues), so trailing slots are zeroinit — skip a null flag
+    // pointer instead of dereferencing it. Exact buckets keep the check-free
+    // scan.
+    void emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded = false) {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
         auto* elem = wait_elem_ty();
@@ -5310,6 +5378,11 @@ private:
         llvm::Value* src  = b_.CreateInBoundsGEP(elem, base, idx);
         llvm::Value* h    = b_.CreateLoad(ptr, b_.CreateStructGEP(elem, src, 0));
         llvm::Value* fptr = b_.CreateLoad(ptr, b_.CreateStructGEP(elem, src, 1));
+        if (padded) {
+            auto* live = llvm::BasicBlock::Create(ctx_, "nsta.live", fn);
+            b_.CreateCondBr(b_.CreateICmpNE(fptr, llvm::ConstantPointerNull::get(ptr)), live, cont);
+            b_.SetInsertPoint(live);
+        }
         b_.CreateCondBr(b_.CreateICmpNE(b_.CreateLoad(i32, fptr), b_.getInt32(0)), cont, wake);
 
         b_.SetInsertPoint(wake);
@@ -13132,6 +13205,10 @@ private:
     std::vector<std::array<llvm::GlobalVariable*, 3>>  wait_sta_gv_;
     std::vector<std::array<llvm::ArrayType*, 3>>       wait_sta_ty_;
     std::vector<std::array<uint32_t, 3>>               wait_sta_cap_;
+    // True (pre-padding) per-instance subscriber counts, and whether the bucket
+    // is padded past them to the definition maximum (see build_wait_queues).
+    std::vector<std::array<uint32_t, 3>> wait_sta_true_;
+    std::vector<std::array<uint8_t, 3>>  wait_sta_padded_;
     std::vector<std::array<llvm::GlobalVariable*, 3>>  wait_dyn_gv_;
     std::vector<std::array<llvm::ArrayType*, 3>>       wait_dyn_ty_;
     std::vector<std::array<llvm::GlobalVariable*, 3>>  wait_dyn_len_gv_;
