@@ -254,7 +254,7 @@ inline bool eq_view(const ItemView& a, const ItemView& b) {
            std::equal(a.value_bytes.begin(), a.value_bytes.end(), b.value_bytes.begin());
 }
 
-// Cached layout facts derived from a type (computed on demand for now).
+// Cached layout facts derived from a type (memoized per Ref in the pool).
 struct Layout {
     // State encoding / plane count.
     Domain domain = Domain::Two;
@@ -303,7 +303,9 @@ public:
     // Canonical bytes of an interned value.
     std::span<const uint8_t> bytes(Ref ref) const;
 
-    // Packed layout (domain / width / size) of a type.
+    // Packed layout (domain / width / size) of a type. Memoized: the raw
+    // computation recurses through composite element types, and the backend
+    // queries layouts repeatedly per signal / operand.
     Layout layout(Ref type) const;
 
     // Intern a struct/union's declaration-order field list, returning the id a
@@ -370,6 +372,13 @@ private:
     std::vector<char> field_names_;
     // Dedup index: u32 handles into items_, hashed / compared via the store.
     ankerl::unordered_dense::set<uint32_t, Hash, Eq> set_;
+    // Lazily-filled layout() memo, indexed by Ref (grown to items_.size() on
+    // first miss). Mutable: memoizing a pure derivation of immutable items.
+    mutable std::vector<Layout>  layout_cache_;
+    mutable std::vector<uint8_t> layout_valid_;
+
+    // The uncached recursive layout derivation behind layout().
+    Layout compute_layout(Ref type) const;
 };
 
 } // namespace clotho::ir

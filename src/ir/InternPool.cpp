@@ -119,6 +119,22 @@ std::span<const uint8_t> InternPool::bytes(Ref ref) const {
 }
 
 Layout InternPool::layout(Ref type) const {
+    const auto idx = static_cast<uint32_t>(type);
+    if (idx < layout_valid_.size() && layout_valid_[idx] != 0) {
+        return layout_cache_[idx];
+    }
+    const Layout lay = compute_layout(type);
+    if (layout_cache_.size() < items_.size()) {
+        layout_cache_.resize(items_.size());
+        layout_valid_.resize(items_.size(), 0);
+    }
+    layout_cache_[idx] = lay;
+    layout_valid_[idx] = 1;
+
+    return lay;
+}
+
+Layout InternPool::compute_layout(Ref type) const {
     const Type& t = std::get<Type>(get(type));
     switch (t.kind) {
         case Type::Kind::Void:
