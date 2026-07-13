@@ -74,6 +74,9 @@ public:
     // Emit a real math system function call (LRM §20.8.2).
     Index real_math(RealMathOp op, std::span<const Index> args, SourceLoc loc);
     Index repl(Index value, uint32_t count, SourceLoc loc);
+    // {<<slice{...}} block reversal of the built stream value `op` (LRM
+    // 11.4.14.2). The result keeps op's width.
+    Index stream_reverse(Index op, uint32_t slice, SourceLoc loc);
     Index select(Index cond, Index a, Index b, SourceLoc loc);
     Index concat(std::span<const Index> parts, SourceLoc loc);
     Index part_select(Index base, uint32_t msb, uint32_t lsb, SourceLoc loc);

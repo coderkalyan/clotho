@@ -981,7 +981,7 @@ struct Inst {
         // real <-> shortreal value conversion (fpext / fptrunc, LRM 6.12.1).
         FResize,
         // One-operand real math system function — $ln / $sqrt / $sin / ...
-        // (payload: fn_unary — op is the real operand, fn the ir::RealMathOp).
+        // (payload: op_imm — op is the real operand, imm the ir::RealMathOp).
         // LRM §20.8.2: each matches the C math library function.
         RealMathUnary,
         // Two-operand real math system function — $pow / $atan2 / $hypot
@@ -1010,6 +1010,12 @@ struct Inst {
         Concat,
         // Replication {count{value}} (payload: repl).
         Repl,
+        // Streaming-concat block reversal {<<S{x}} (LRM 11.4.14.2): reverse
+        // the order of the operand's S-bit blocks, sliced from the LSB (a
+        // final partial block keeps its own width; block 0 lands at the MSB).
+        // A pure per-plane bit permutation of the operand's width (payload:
+        // op_imm — op is the built stream value, imm the slice size S).
+        StreamReverse,
 
         // -- Width --
         // Resize (zero/sign extend or truncate) to a target type (payload: op_type).
@@ -1351,8 +1357,8 @@ struct Inst {
         Arg,
         Local,
         Repl,
-        // The fn_unary member: one operand plus a routine selector.
-        FnUnary,
+        // The op_imm member: one operand plus a 32-bit immediate.
+        OpImm,
         OpExtra,
         Extra,
         Call,
@@ -1415,13 +1421,14 @@ struct Inst {
             // Replication count.
             uint32_t count;
         } repl;
-        // One operand plus a routine selector (real_math_unary).
+        // One operand plus a 32-bit immediate (real_math_unary's RealMathOp,
+        // stream_reverse's slice size).
         struct {
             // The operand value.
             Index op;
-            // Routine selector (ir::RealMathOp value).
-            uint32_t fn;
-        } fn_unary;
+            // Tag-defined immediate.
+            uint32_t imm;
+        } op_imm;
         // Primary operand plus a handle to an extra struct (select, part_select, cond).
         struct {
             // Condition / base operand.
@@ -1598,7 +1605,8 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Sscanf:
             return K::Scanf;
         case T::RealMathUnary:
-            return K::FnUnary;
+        case T::StreamReverse:
+            return K::OpImm;
         case T::TimeFormat:
             return K::TimeFormat;
         case T::Break:

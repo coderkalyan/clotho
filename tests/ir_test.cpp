@@ -507,7 +507,7 @@ TEST_CASE("float tags round-trip through builder, payload_kind, and operands") {
     CHECK(ops[1] == y);
 }
 
-TEST_CASE("one-operand real math rides the fn_unary payload") {
+TEST_CASE("one-operand real math rides the op_imm payload") {
     InternPool pool;
     Builder    b(pool);
     const auto l = static_cast<SourceLoc>(0);
@@ -518,8 +518,8 @@ TEST_CASE("one-operand real math rides the fn_unary payload") {
     b.unary(Inst::Tag::Ret, sq, l);
 
     const Ir ir = b.finish();
-    CHECK(payload_kind(ir.tag(sq)) == Inst::PayloadKind::FnUnary);
-    CHECK(ir.payload(sq).fn_unary.fn == static_cast<uint32_t>(RealMathOp::Sqrt));
+    CHECK(payload_kind(ir.tag(sq)) == Inst::PayloadKind::OpImm);
+    CHECK(ir.payload(sq).op_imm.imm == static_cast<uint32_t>(RealMathOp::Sqrt));
 
     std::array<Index, 3> scratch;
     const auto           ops = ir.operands(sq, scratch);

@@ -104,8 +104,8 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
             return index_slice(info.args);
         }
 
-        case Inst::PayloadKind::FnUnary:
-            scratch[0] = p.fn_unary.op;
+        case Inst::PayloadKind::OpImm:
+            scratch[0] = p.op_imm.op;
             return { scratch.data(), 1 };
 
         case Inst::PayloadKind::TimeFormat: {

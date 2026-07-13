@@ -295,6 +295,10 @@ struct Analysis {
                 case Inst::Tag::Repl:
                     val_z[raw] = z_of(p.repl.value);
                     break;
+                case Inst::Tag::StreamReverse:
+                    // A pure bit permutation: z rides through unchanged.
+                    val_z[raw] = z_of(p.op_imm.op);
+                    break;
                 case Inst::Tag::Resize:
                     // Sign extension replicates a z MSB; truncation keeps low z
                     // bits; a 4->2-state resize does NOT clear z (the backend

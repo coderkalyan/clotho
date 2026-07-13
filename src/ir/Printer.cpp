@@ -217,6 +217,8 @@ const char* tag_name(Inst::Tag tag) {
             return "concat";
         case T::Repl:
             return "repl";
+        case T::StreamReverse:
+            return "stream_reverse";
         case T::Resize:
             return "resize";
         case T::Cond:
@@ -684,9 +686,9 @@ private:
                 }
                 break;
             }
-            case Inst::PayloadKind::FnUnary:
-                os_ << "op" << p.fn_unary.fn << ", ";
-                ref(p.fn_unary.op);
+            case Inst::PayloadKind::OpImm:
+                os_ << "op" << p.op_imm.imm << ", ";
+                ref(p.op_imm.op);
                 break;
             case Inst::PayloadKind::TimeFormat: {
                 const auto info = ir_.extra_data<TimeFormatInfo>(p.extra);

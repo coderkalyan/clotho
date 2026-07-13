@@ -110,12 +110,16 @@ Index Builder::real_math(RealMathOp op, std::span<const Index> args, SourceLoc l
                     loc);
     }
     return emit({ Inst::Tag::RealMathUnary,
-                  Inst::Payload{ .fn_unary = { args[0], static_cast<uint32_t>(op) } } },
+                  Inst::Payload{ .op_imm = { args[0], static_cast<uint32_t>(op) } } },
                 loc);
 }
 
 Index Builder::repl(Index value, uint32_t count, SourceLoc loc) {
     return emit({ Inst::Tag::Repl, Inst::Payload{ .repl = { value, count } } }, loc);
+}
+
+Index Builder::stream_reverse(Index op, uint32_t slice, SourceLoc loc) {
+    return emit({ Inst::Tag::StreamReverse, Inst::Payload{ .op_imm = { op, slice } } }, loc);
 }
 
 Index Builder::select(Index cond, Index a, Index b, SourceLoc loc) {

@@ -6769,25 +6769,12 @@ private:
         const uint64_t W = sc.getBitstreamWidth();
         const uint64_t S = sc.getSliceSize();
 
-        // sliceSize > 0: '<<' — reverse order of S-bit blocks sliced from the
-        // right. Block i covers bits [min((i+1)*S,W)-1 : i*S]; reversed output
-        // places block 0 (rightmost) in the MSB position (first concat arg).
-        // Extract each block via logical-right-shift + resize (PartSelect is
-        // lvalue-only in the backend and cannot be used on intermediate values).
+        // sliceSize > 0: '<<' — reverse the order of the stream's S-bit blocks
+        // (block i covers bits [min((i+1)*S,W)-1 : i*S]; block 0, the
+        // rightmost, lands at the MSB). One StreamReverse node; the backend
+        // owns the per-plane block permutation.
         if (S > 0) {
-            const uint64_t N = (W + S - 1) / S;
-            std::vector<ir::Index> blocks;
-            blocks.reserve(N);
-            const bool is_four = module_.pool.layout(target_ty).domain == ir::Domain::Four;
-            for (uint64_t i = 0; i < N; ++i) {
-                const uint32_t lo    = static_cast<uint32_t>(i * S);
-                const uint32_t bw    = static_cast<uint32_t>(std::min((i + 1) * S, W) - lo);
-                const ir::Ref  sh_ty = make_int_type(static_cast<uint32_t>(W), false, false);
-                const ir::Index sh   = b.constant(module_.pool.put_int(sh_ty, lo), l);
-                const ir::Index srl  = b.binary(ir::Inst::Tag::Srl, raw, sh, l);
-                blocks.push_back(b.resize(srl, make_int_type(bw, is_four, false), l));
-            }
-            raw = b.concat(blocks, l);
+            raw = b.stream_reverse(raw, static_cast<uint32_t>(S), l);
         }
 
         // Widen if the target is wider than the stream (LRM §11.4.14: zero-fill

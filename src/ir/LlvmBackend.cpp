@@ -3519,6 +3519,7 @@ private:
                 case Inst::Tag::SelectLazy:
                 case Inst::Tag::Concat:
                 case Inst::Tag::Repl:
+                case Inst::Tag::StreamReverse:
                 case Inst::Tag::Resize:
                 case Inst::Tag::Cond:
                 case Inst::Tag::Switch:
@@ -4076,6 +4077,7 @@ private:
                 case Inst::Tag::SelectLazy:
                 case Inst::Tag::Concat:
                 case Inst::Tag::Repl:
+                case Inst::Tag::StreamReverse:
                 case Inst::Tag::Resize:
                 case Inst::Tag::Cond:
                 case Inst::Tag::Switch:
@@ -6308,6 +6310,9 @@ private:
                 return type_of(p.binary.l);
             case Inst::Tag::Bnot:
                 return type_of(p.unary);
+            case Inst::Tag::StreamReverse:
+                // A bit permutation: the operand's width and domain.
+                return type_of(p.op_imm.op);
             case Inst::Tag::Select:
                 return type_of(ir_->extra_data<Select>(p.op_extra.extra).a);
             case Inst::Tag::SelectLazy:
@@ -7269,6 +7274,9 @@ private:
                     return;
                 }
                 set_value(i, lower_repl(value_of(p.repl.value), type_of(p.repl.value).width, p.repl.count));
+                return;
+            case Inst::Tag::StreamReverse:
+                set_value(i, lower_stream_reverse(value_of(p.op_imm.op), p.op_imm.imm));
                 return;
             case Inst::Tag::Resize: {
                 // Truncate or extend all planes (sign per target type).
@@ -11358,11 +11366,11 @@ private:
     }
 
     Plane lower_real_math_unary(Index i) {
-        const auto&  p = ir_->payload(i).fn_unary;
+        const auto&  p = ir_->payload(i).op_imm;
         llvm::Value* x = fp_of(value_of(p.op));
         using O = RealMathOp;
         namespace In = llvm::Intrinsic;
-        switch (static_cast<O>(p.fn)) {
+        switch (static_cast<O>(p.imm)) {
             // LRM Table 20-4 names the C math function each maps to. The
             // classic routines lower to LLVM intrinsics (constant-foldable);
             // the inverse / hyperbolic ones call libm directly.
@@ -12406,6 +12414,39 @@ private:
             first = false;
         }
         return packed(must, may, z);
+    }
+
+    // {<<S{x}}: reverse the order of the operand's S-bit blocks, sliced from
+    // the LSB (a final partial block keeps its own width; block 0 lands at the
+    // MSB). Applied to each plane independently — a pure bit permutation.
+    llvm::Value* reverse_blocks(llvm::Value* v, uint32_t w, uint32_t slice) {
+        const uint32_t n     = (w + slice - 1) / slice;
+        llvm::Value*   acc   = zero(w);
+        bool           first = true;
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t lo = i * slice;
+            const uint32_t bw = std::min<uint32_t>((i + 1) * slice, w) - lo;
+            llvm::Value*   blk =
+              b_.CreateAnd(b_.CreateLShr(v, lo),
+                           llvm::ConstantInt::get(ctx_, llvm::APInt::getLowBitsSet(w, bw)));
+            // Skip the shift before the first block: for a single block bw == w,
+            // and a shift by the full width is poison in LLVM.
+            if (!first) {
+                acc = b_.CreateShl(acc, bw);
+            }
+            acc   = b_.CreateOr(acc, blk);
+            first = false;
+        }
+        return acc;
+    }
+
+    Plane lower_stream_reverse(Plane v, uint32_t slice) {
+        const uint32_t w = width_of(v);
+        if (v.two) {
+            return two_val(reverse_blocks(v.mm, w, slice));
+        }
+        return packed(reverse_blocks(must_of(v), w, slice), reverse_blocks(may_of(v), w, slice),
+                      reverse_blocks(z_of(v), w, slice));
     }
 
     Plane lower_repl(Plane v, uint32_t part_width, uint32_t count) {
