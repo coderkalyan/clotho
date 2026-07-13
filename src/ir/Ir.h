@@ -191,6 +191,20 @@ struct AggCopyInfo {
     Ref type;
 };
 
+// Extra payload for `inside_set`: the `inside` operator's membership test of
+// the op against a set (LRM 11.4.13), OR-reduced across members with LRM
+// 11.4.5 X-propagation. The OR is order-insensitive, so members are grouped
+// by kind: `values` is a run of singular member values, each tested with
+// wildcard equality (only the member's own x/z bits are wildcards); `ranges`
+// is a run of back-to-back [lo, hi] operand pairs tested as
+// `sel >= lo && sel <= hi`. All operands are pre-resized to the selector type.
+struct InsideSetInfo {
+    // Singular member values (wildcard-equality tests).
+    ExtraSlice values;
+    // [lo, hi] range operand pairs, two indices per range.
+    ExtraSlice ranges;
+};
+
 // Extra payload for `agg_eq`: whole-aggregate equality of two unpacked
 // aggregate lvalues of `type` (LRM 11.2.2). The op is the left lvalue.
 struct AggEqInfo {
@@ -699,6 +713,7 @@ static_assert(ExtraPayload<ElemSelect>);
 static_assert(ExtraPayload<MemberSelect>);
 static_assert(ExtraPayload<AggCopyInfo>);
 static_assert(ExtraPayload<AggEqInfo>);
+static_assert(ExtraPayload<InsideSetInfo>);
 static_assert(ExtraPayload<DynArrayArg>);
 static_assert(ExtraPayload<DynArrayNewInitInfo>);
 static_assert(ExtraPayload<QueueArg>);
@@ -921,6 +936,11 @@ struct Inst {
         // are wildcards; unlike the case-equality tags this is X-propagating — a
         // left-operand x/z on a non-wildcard bit yields X.
         WildEq,
+        // The `inside` operator as an expression (payload: op_extra ->
+        // InsideSetInfo; op is the selector), -> 1-bit 4-state. The backend
+        // expands the member tests and OR-reduces them; the statement twin
+        // (`case ... inside`) has its own switch machinery in the frontend.
+        InsideSet,
 
         // -- Floating point (real / shortreal; LRM 6.12) --
         // Operands and result share one float type: the frontend inserts all
@@ -1631,6 +1651,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::RealMathBinary:
         case T::DistUnary:
         case T::DistBinary:
+        case T::InsideSet:
         case T::FreadMem:
         case T::ReadMem:
         case T::StrPutc:
@@ -1733,9 +1754,9 @@ public:
     //
     // NOTE: not exhaustive for the variadic system tasks — a tag whose args are
     // an extra slice can also carry a scalar operand outside it, which one
-    // span cannot express: FDisplay omits its fd, Fscanf/Sscanf their source.
-    // A pass needing every use of those tags must read their info records
-    // directly.
+    // span cannot express: FDisplay omits its fd, Fscanf/Sscanf their source,
+    // InsideSet its member operands. A pass needing every use of those tags
+    // must read their info records directly.
     std::span<const Index> operands(Index inst, std::array<Index, 3>& scratch) const;
 
 private:

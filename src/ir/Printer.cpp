@@ -201,6 +201,8 @@ const char* tag_name(Inst::Tag tag) {
             return "casex_eq";
         case T::WildEq:
             return "wild_eq";
+        case T::InsideSet:
+            return "inside_set";
         case T::Land:
             return "land";
         case T::Lor:

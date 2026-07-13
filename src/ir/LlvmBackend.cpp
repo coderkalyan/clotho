@@ -3492,6 +3492,7 @@ private:
                 case Inst::Tag::CasezEq:
                 case Inst::Tag::CasexEq:
                 case Inst::Tag::WildEq:
+                case Inst::Tag::InsideSet:
                 case Inst::Tag::FAdd:
                 case Inst::Tag::FSub:
                 case Inst::Tag::FMul:
@@ -4046,6 +4047,7 @@ private:
                 case Inst::Tag::CasezEq:
                 case Inst::Tag::CasexEq:
                 case Inst::Tag::WildEq:
+                case Inst::Tag::InsideSet:
                 // Reals never carry x/z; conversions from clean operands and
                 // real math results are always defined.
                 case Inst::Tag::FAdd:
@@ -6366,6 +6368,7 @@ private:
             case Inst::Tag::Lor:
             case Inst::Tag::Lnot:
             case Inst::Tag::AggEq:
+            case Inst::Tag::InsideSet:
                 return { 1, true, false };
 
             case Inst::Tag::Concat: {
@@ -7158,6 +7161,10 @@ private:
 
             case Inst::Tag::WildEq:
                 set_value(i, lower_wildeq(value_of(p.binary.l), value_of(p.binary.r)));
+                return;
+
+            case Inst::Tag::InsideSet:
+                set_value(i, lower_inside_set(i));
                 return;
 
             case Inst::Tag::FAdd:
@@ -12207,6 +12214,31 @@ private:
     // running `==` gives exactly that: the right is known on kept bits so only a
     // left x/z can make a kept position unknown, and a definite mismatch on any
     // kept position still decides the result.
+    // `inside` (LRM 11.4.13): OR-reduce the wildcard-eq singular members and
+    // the >=/<= range members. lower_logical carries the LRM 11.4.5
+    // X-propagation of the reduction.
+    Plane lower_inside_set(Index i) {
+        const auto& p    = ir_->payload(i).op_extra;
+        const auto  info = ir_->extra_data<InsideSetInfo>(p.extra);
+        const Plane sel  = value_of(p.op);
+        const bool  sign = type_of(p.op).is_signed;
+
+        std::optional<Plane> acc;
+        const auto add = [&](Plane pred) {
+            acc = acc ? lower_logical(Inst::Tag::Lor, *acc, pred) : pred;
+        };
+        for (const Index v : ir_->region(info.values)) {
+            add(lower_wildeq(sel, value_of(v)));
+        }
+        const std::span<const Index> rngs = ir_->region(info.ranges);
+        for (size_t k = 0; k + 1 < rngs.size(); k += 2) {
+            const Plane ge = lower_compare(Inst::Tag::Ge, sel, value_of(rngs[k]), sign);
+            const Plane le = lower_compare(Inst::Tag::Le, sel, value_of(rngs[k + 1]), sign);
+            add(lower_logical(Inst::Tag::Land, ge, le));
+        }
+        return *acc;
+    }
+
     Plane lower_wildeq(Plane a, Plane b) {
         const uint32_t w     = std::max(width_of(a), width_of(b));
         // Definite 4-state bit result; lift operands. 2-state operands have no

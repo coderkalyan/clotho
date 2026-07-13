@@ -7436,44 +7436,39 @@ private:
             // carry no x/z, so it reduces to == / >= && <=).
             fail("inside operator over real operands is not supported");
         }
-        const ir::Ref             ty  = lower_type(*e.left().type);
-        const ir::Index           sel = lower_expr(e.left(), b);
-        std::optional<ir::Index>  acc;
+        // One InsideSet node carries the whole set; member operands are still
+        // evaluated in source order. A `[lo:hi]` range tests
+        // `sel >= lo && sel <= hi`; a singular member uses ==? wildcard
+        // equality, where only the member's own x/z bits are wildcards
+        // (LRM 11.4.13), which is exactly WildEq's right-operand-wildcards
+        // semantics.
+        const ir::Ref          ty  = lower_type(*e.left().type);
+        const ir::Index        sel = lower_expr(e.left(), b);
+        std::vector<ir::Index> values;
+        std::vector<ir::Index> ranges;
         for (const Expression* m : e.rangeList()) {
-            const ir::Index pred = lower_inside_member(*m, sel, ty, b);
-            acc = acc ? b.binary(ir::Inst::Tag::Lor, *acc, pred, l) : pred;
-        }
-        return *acc;
-    }
-
-    // One `inside` range_list member's 1-bit predicate. A `[lo:hi]` range is
-    // `sel >= lo && sel <= hi`; a singular member uses ==? wildcard equality, where
-    // only the member's own x/z bits are wildcards (LRM 11.4.13), which is exactly
-    // WildEq's right-operand-wildcards semantics.
-    ir::Index lower_inside_member(const Expression& m, ir::Index sel, ir::Ref ty, ir::Builder& b) {
-        if (m.kind == ExpressionKind::ValueRange) {
-            const auto& vr = m.as<ValueRangeExpression>();
-            if (vr.rangeKind != ValueRangeKind::Simple) {
-                // TODO: tolerance ranges (`[c +/- d]`, `[c +%- d]`, LRM 11.4.13).
-                fail("inside operator tolerance ranges are not supported");
+            if (m->kind == ExpressionKind::ValueRange) {
+                const auto& vr = m->as<ValueRangeExpression>();
+                if (vr.rangeKind != ValueRangeKind::Simple) {
+                    // TODO: tolerance ranges (`[c +/- d]`, `[c +%- d]`, LRM 11.4.13).
+                    fail("inside operator tolerance ranges are not supported");
+                }
+                if (vr.left().type->isUnbounded() || vr.right().type->isUnbounded()) {
+                    // TODO: unbounded `$` range bounds (`[lo:$]` / `[$:hi]`).
+                    fail("inside operator unbounded ($) range bounds are not supported");
+                }
+                ranges.push_back(b.resize(lower_expr(vr.left(), b), ty, loc(vr.left())));
+                ranges.push_back(b.resize(lower_expr(vr.right(), b), ty, loc(vr.right())));
+                continue;
             }
-            if (vr.left().type->isUnbounded() || vr.right().type->isUnbounded()) {
-                // TODO: unbounded `$` range bounds (`[lo:$]` / `[$:hi]`).
-                fail("inside operator unbounded ($) range bounds are not supported");
+            if (m->type->getCanonicalType().isUnpackedArray()) {
+                // TODO: an unpacked-array set member (`sel inside {arr}`) matches any
+                // element (LRM 11.4.13 array unwrap); needs runtime element iteration.
+                fail("inside operator with an unpacked-array set member is not supported");
             }
-            const ir::Index lo = b.resize(lower_expr(vr.left(), b), ty, loc(vr.left()));
-            const ir::Index hi = b.resize(lower_expr(vr.right(), b), ty, loc(vr.right()));
-            const ir::Index ge = b.binary(ir::Inst::Tag::Ge, sel, lo, loc(m));
-            const ir::Index le = b.binary(ir::Inst::Tag::Le, sel, hi, loc(m));
-            return b.binary(ir::Inst::Tag::Land, ge, le, loc(m));
+            values.push_back(b.resize(lower_expr(*m, b), ty, loc(*m)));
         }
-        if (m.type->getCanonicalType().isUnpackedArray()) {
-            // TODO: an unpacked-array set member (`sel inside {arr}`) matches any
-            // element (LRM 11.4.13 array unwrap); needs runtime element iteration.
-            fail("inside operator with an unpacked-array set member is not supported");
-        }
-        const ir::Index val = b.resize(lower_expr(m, b), ty, loc(m));
-        return b.binary(ir::Inst::Tag::WildEq, sel, val, loc(m));
+        return b.inside_set(sel, values, ranges, l);
     }
 
     // Build the lvalue for a part-select over an already-lowered base lvalue: a

@@ -331,8 +331,10 @@ struct Analysis {
                 case Inst::Tag::Land:
                 case Inst::Tag::Lor:
                 case Inst::Tag::Lnot:
-                // Aggregate equality is a compare + Land reduction: z-absorbing.
+                // Aggregate equality and the inside operator are compare +
+                // logical reductions: z-absorbing.
                 case Inst::Tag::AggEq:
+                case Inst::Tag::InsideSet:
                     break;
 
                 // Real ops absorb z too: a real value carries no z plane and

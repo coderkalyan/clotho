@@ -357,6 +357,15 @@ Index Builder::count_bits(Index op, uint32_t mask, SourceLoc loc) {
     return emit({ Inst::Tag::CountBits, Inst::Payload{ .op_extra = { op, extra } } }, loc);
 }
 
+Index Builder::inside_set(Index sel, std::span<const Index> values, std::span<const Index> ranges,
+                          SourceLoc loc) {
+    const ExtraSlice vals  = add_slice(values);
+    const ExtraSlice rngs  = add_slice(ranges);
+    const ExtraIndex extra = add_extra(InsideSetInfo{ vals, rngs });
+
+    return emit({ Inst::Tag::InsideSet, Inst::Payload{ .op_extra = { sel, extra } } }, loc);
+}
+
 Index Builder::wait(std::span<const WaitEdge> events, SourceLoc loc) {
     // Pack the WaitEdge records back-to-back, then a WaitInfo pointing at the run.
     const auto start = static_cast<uint32_t>(extra_.size());

@@ -188,6 +188,13 @@ public:
     // OR-mask). Yields a definite 2-state 32-bit int.
     Index count_bits(Index op, uint32_t mask, SourceLoc loc);
 
+    // `sel inside { ... }` (LRM 11.4.13): `values` are the singular members
+    // (wildcard-equality tests), `ranges` back-to-back [lo, hi] operand pairs.
+    // All must already be resized to the selector type. Yields a 1-bit 4-state
+    // value.
+    Index inside_set(Index sel, std::span<const Index> values, std::span<const Index> ranges,
+                     SourceLoc loc);
+
     // -- Timing --
     // Event wait `@(a or posedge b ...)`: suspend until ANY listed (signal, edge)
     // fires. Each WaitEdge carries an ir::Edge value as u32, keeping the builder
