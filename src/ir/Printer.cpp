@@ -113,8 +113,16 @@ const char* tag_name(Inst::Tag tag) {
             return "store";
         case T::StoreNb:
             return "store_nb";
-        case T::DynArrayOp:
-            return "dyn_array_op";
+        case T::DynArrayNew:
+            return "dyn_array_new";
+        case T::DynArrayNewInit:
+            return "dyn_array_new_init";
+        case T::DynArraySize:
+            return "dyn_array_size";
+        case T::DynArrayDelete:
+            return "dyn_array_delete";
+        case T::DynArrayCopy:
+            return "dyn_array_copy";
         case T::QueueSize:
             return "queue_size";
         case T::QueuePushBack:

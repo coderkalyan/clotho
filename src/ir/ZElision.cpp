@@ -235,7 +235,11 @@ struct Analysis {
                     store_into(ir, fn, p.op_extra.op, storage_z(ir, fn, info.src));
                     break;
                 }
-                case Inst::Tag::DynArrayOp:
+                case Inst::Tag::DynArrayNew:
+                case Inst::Tag::DynArrayNewInit:
+                case Inst::Tag::DynArraySize:
+                case Inst::Tag::DynArrayDelete:
+                case Inst::Tag::DynArrayCopy:
                     // size() is a definite int (no z); new / delete / copy write
                     // the handle, not a plane slot, so nothing propagates here.
                     val_z[raw] = 0;

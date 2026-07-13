@@ -223,20 +223,22 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 scratch[1]      = info.src;
                 return { scratch.data(), 2 };
             }
-            // dyn_array_op exposes the handle lvalue plus the size / src
-            // operands its sub-op takes; the sub-op selector is not an operand.
-            if (tag == Inst::Tag::DynArrayOp) {
-                const auto da  = extra_data<DynArrayInfo>(p.op_extra.extra);
-                const auto sub = static_cast<DynArrayOp>(da.sub);
-                size_t     n   = 0;
-                scratch[n++]   = p.op_extra.op;
-                if (sub == DynArrayOp::New || sub == DynArrayOp::NewInit) {
-                    scratch[n++] = da.size;
-                }
-                if (sub == DynArrayOp::NewInit || sub == DynArrayOp::Copy) {
-                    scratch[n++] = da.src;
-                }
-                return { scratch.data(), n };
+            // dyn_array_new / dyn_array_copy expose the handle lvalue plus
+            // their DynArrayArg operand (element count / copy source).
+            if (tag == Inst::Tag::DynArrayNew || tag == Inst::Tag::DynArrayCopy) {
+                const auto da = extra_data<DynArrayArg>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = da.arg;
+                return { scratch.data(), 2 };
+            }
+            // dyn_array_new_init exposes the handle lvalue, element count, and
+            // the copy-source handle lvalue.
+            if (tag == Inst::Tag::DynArrayNewInit) {
+                const auto da = extra_data<DynArrayNewInitInfo>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = da.size;
+                scratch[2]    = da.src;
+                return { scratch.data(), 3 };
             }
             // The one-extra-operand queue ops expose the handle lvalue plus
             // their QueueArg operand (element value / position / copy source).

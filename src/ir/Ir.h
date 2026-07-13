@@ -224,23 +224,28 @@ struct MemberSelect {
     Ref struct_type;
 };
 
-// Which dynamic-array operation a `dyn_array_op` performs (LRM 7.5). Kept in
-// lockstep with the backend dispatch in LlvmBackend and the runtime rt_dynarr_*
-// functions.
-enum class DynArrayOp : uint32_t {
-    // arr = new[size]: (re)allocate to `size` elements, each the element's
-    // power-on value (LRM 7.5.1).
-    New,
-    // arr = new[size](src): like New, then copy min(size, src.len) elements
-    // from the `src` handle lvalue (LRM 7.5.1).
-    NewInit,
-    // arr.size(): the current element count (LRM 7.5), a 32-bit int.
-    Size,
-    // arr.delete(): free the storage, size -> 0 (LRM 7.5).
-    Delete,
-    // arr = other: deep copy of another dynamic array's storage (value
-    // semantics, LRM 7.5).
-    Copy,
+// Extra payload for `dyn_array_new` / `dyn_array_copy`: the tag's single
+// non-handle operand (element count for New, source handle for Copy) plus the
+// interned DynArray type (element stride / slot), independent of the target
+// signal — so the op works for a module signal or a frame local. The handle
+// lvalue is the instruction's op.
+struct DynArrayArg {
+    // Element count (new) or source handle lvalue (copy).
+    Index arg;
+    // The interned DynArray type of the target.
+    Ref array_type;
+};
+
+// Extra payload for `dyn_array_new_init`: arr = new[size](src) (LRM 7.5.1) —
+// reallocate to `size` elements, then copy min(size, src.len) elements from
+// the source handle lvalue. The handle lvalue is the op.
+struct DynArrayNewInitInfo {
+    // Element count operand.
+    Index size;
+    // Source dynamic-array handle lvalue.
+    Index src;
+    // The interned DynArray type of the target.
+    Ref array_type;
 };
 
 // Extra payload for the one-operand queue tags (QueuePushBack / QueuePushFront
@@ -264,24 +269,6 @@ struct QueueInsertInfo {
     Index val;
     // The interned Queue type of the target.
     Ref queue_type;
-};
-
-// Extra payload for `dyn_array_op`: a dynamic-array operation on the handle
-// lvalue `op` (the instruction's op_extra.op). `sub` is the ir::DynArrayOp;
-// `size` is the element count (New / NewInit); `src` the source handle lvalue
-// (NewInit / Copy). Operand presence is derived from `sub`; a slot unused by
-// the sub-op holds the handle lvalue as deterministic filler. `array_type` is
-// the interned DynArray type, giving the element stride / slot independently of
-// the target signal — so the op works for a module signal or a frame local.
-struct DynArrayInfo {
-    // ir::DynArrayOp value.
-    uint32_t sub;
-    // Element count operand (New / NewInit).
-    Index size;
-    // Source dynamic-array handle lvalue (NewInit / Copy).
-    Index src;
-    // The interned DynArray type of the target (element stride / slot).
-    Ref array_type;
 };
 
 // Extra payload for `read_mem`: a $readmemh / $readmemb load of a file into an
@@ -701,7 +688,8 @@ static_assert(ExtraPayload<DynPartSelect>);
 static_assert(ExtraPayload<ElemSelect>);
 static_assert(ExtraPayload<MemberSelect>);
 static_assert(ExtraPayload<AggCopyInfo>);
-static_assert(ExtraPayload<DynArrayInfo>);
+static_assert(ExtraPayload<DynArrayArg>);
+static_assert(ExtraPayload<DynArrayNewInitInfo>);
 static_assert(ExtraPayload<QueueArg>);
 static_assert(ExtraPayload<QueueInsertInfo>);
 static_assert(ExtraPayload<ReadMemInfo>);
@@ -800,14 +788,27 @@ struct Inst {
         // frontend emits it only for a string-free aggregate.
         AggCopy,
 
-        // Dynamic-array operation on a handle lvalue (payload: op_extra ->
-        // DynArrayInfo; op is the dynamic-array handle lvalue). The `sub` field
-        // selects new[] / size() / delete() / whole-array copy (ir::DynArrayOp,
-        // LRM 7.5). new / delete / copy are statements; size yields a 32-bit
-        // int. Lowers to the matching rt_dynarr_* runtime call, with element
-        // access itself riding the ordinary ElemSelect path over the handle's
-        // heap buffer.
-        DynArrayOp,
+        // -- Dynamic-array operations on a handle lvalue (LRM 7.5) --
+        // Each lowers to its rt_dynarr_* runtime call; element access rides
+        // the ordinary ElemSelect path over the handle's heap buffer, not
+        // these tags.
+        // arr = new[size]: (re)allocate to `size` elements, each the element's
+        // power-on value (LRM 7.5.1; payload: op_extra -> DynArrayArg, whose
+        // arg is the element count; op is the handle lvalue).
+        DynArrayNew,
+        // arr = new[size](src): like DynArrayNew, then copy min(size, src.len)
+        // elements from the source handle (payload: op_extra ->
+        // DynArrayNewInitInfo; op is the handle lvalue).
+        DynArrayNewInit,
+        // arr.size() -> 32-bit int (payload: op_type — op is the handle
+        // lvalue, type the interned DynArray type).
+        DynArraySize,
+        // arr.delete(): free the storage, size -> 0 (payload: op_type).
+        DynArrayDelete,
+        // arr = other: deep copy of another dynamic array's storage (value
+        // semantics; payload: op_extra -> DynArrayArg, whose arg is the source
+        // handle lvalue; op is the destination handle lvalue).
+        DynArrayCopy,
 
         // -- Queue operations on a handle lvalue (LRM 7.10.2) --
         // Each lowers to its rt_queue_* runtime call; indexed element access
@@ -1479,12 +1480,14 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::FBitcast:
         case T::FResize:
         case T::HandleDeref:
-        // Handle-lvalue queue ops with no extra operand: op is the handle,
-        // type the interned Queue type.
+        // Handle-lvalue queue / dynamic-array ops with no extra operand: op is
+        // the handle, type the interned Queue / DynArray type.
         case T::QueueSize:
         case T::QueuePopBack:
         case T::QueuePopFront:
         case T::QueueDeleteAll:
+        case T::DynArraySize:
+        case T::DynArrayDelete:
             return K::OpType;
         case T::ClassNew:
             return K::Ref;
@@ -1549,7 +1552,9 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::ElemSelect:
         case T::MemberSelect:
         case T::AggCopy:
-        case T::DynArrayOp:
+        case T::DynArrayNew:
+        case T::DynArrayNewInit:
+        case T::DynArrayCopy:
         case T::QueuePushBack:
         case T::QueuePushFront:
         case T::QueueInsert:

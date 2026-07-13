@@ -99,8 +99,9 @@ public:
     // (lowered to llvm.memcpy of the storage; caller ensures no string leaf).
     Index agg_copy(Index dst, Index src, Ref type, SourceLoc loc);
     // Dynamic-array operations on the handle lvalue `arr` (LRM 7.5). new /
-    // delete / copy are statements; size yields a 32-bit int. See ir::DynArrayOp.
-    // `array_type` is the interned DynArray type (element stride / slot).
+    // delete / copy are statements; size yields a 32-bit int. Each emits its
+    // dedicated DynArray* tag. `array_type` is the interned DynArray type
+    // (element stride / slot).
     // arr = new[size] [ (init) ]: reallocate; with `has_init`, copy from the
     // source handle lvalue `init`.
     Index dyn_array_new(Index arr, Index size, Index init, bool has_init, Ref array_type, SourceLoc loc);

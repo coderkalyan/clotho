@@ -6206,7 +6206,11 @@ private:
             case Inst::Tag::ValuePlusArgs:
                 // LRM §21.6: an always-known (never x/z) boolean 'int'.
                 return { 32, false, true };
-            case Inst::Tag::DynArrayOp:
+            case Inst::Tag::DynArrayNew:
+            case Inst::Tag::DynArrayNewInit:
+            case Inst::Tag::DynArraySize:
+            case Inst::Tag::DynArrayDelete:
+            case Inst::Tag::DynArrayCopy:
                 // Only size() is a value (a definite 2-state int); new / delete /
                 // copy are statements whose type is never queried.
                 return { 32, false, true };
@@ -6945,8 +6949,21 @@ private:
                 return;
             }
 
-            case Inst::Tag::DynArrayOp:
-                lower_dyn_array_op(i);
+            case Inst::Tag::DynArrayNew:
+                lower_dyn_array_new(i);
+                return;
+            case Inst::Tag::DynArrayNewInit:
+                lower_dyn_array_new_init(i);
+                return;
+            case Inst::Tag::DynArraySize:
+                lower_dyn_array_size(i);
+                return;
+            case Inst::Tag::DynArrayDelete:
+                b_.CreateCall(dynarr_delete_fn(),
+                              { lvalue_of(ir_->payload(i).op_type.op).base });
+                return;
+            case Inst::Tag::DynArrayCopy:
+                lower_dyn_array_copy(i);
                 return;
 
             case Inst::Tag::QueueSize:
@@ -7877,46 +7894,42 @@ private:
         b_.SetInsertPoint(cont);
     }
 
-    // Lower a dyn_array_op instruction: new[] / size() / delete() / whole-array
-    // copy over the handle lvalue (LRM 7.5). Element access rides the ElemSelect
-    // dynarr path, not this.
-    void lower_dyn_array_op(Index i) {
-        const Inst::Payload& p      = ir_->payload(i);
-        const auto           da     = ir_->extra_data<DynArrayInfo>(p.op_extra.extra);
-        const LValue&        lv     = lvalue_of(p.op_extra.op);
-        llvm::Value*         handle = lv.base;
-        // Element facts come from the op's own array-type handle, so the op works
-        // for a module signal or a frame-local dynamic array alike.
-        const DynElem e = dynarr_elem(da.array_type);
-        switch (static_cast<DynArrayOp>(da.sub)) {
-            case DynArrayOp::New:
-            case DynArrayOp::NewInit: {
-                llvm::Value* n     = cast(must_of(value_of(da.size)), 64, false);
-                llvm::Value* proto = dynarr_elem_proto(e);
-                if (static_cast<DynArrayOp>(da.sub) == DynArrayOp::NewInit) {
-                    b_.CreateCall(dynarr_new_copy_fn(),
-                                  { handle, b_.getInt64(dynarr_stride(e)), n, proto,
-                                    lvalue_of(da.src).base });
-                } else {
-                    b_.CreateCall(dynarr_new_fn(),
-                                  { handle, b_.getInt64(dynarr_stride(e)), n, proto });
-                }
-                return;
-            }
-            case DynArrayOp::Size: {
-                llvm::Value* len =
-                  b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 1));
-                set_value(i, two_val(cast(len, 32, false)));
-                return;
-            }
-            case DynArrayOp::Delete:
-                b_.CreateCall(dynarr_delete_fn(), { handle });
-                return;
-            case DynArrayOp::Copy:
-                b_.CreateCall(dynarr_assign_fn(),
-                              { handle, lvalue_of(da.src).base, b_.getInt64(dynarr_stride(e)) });
-                return;
-        }
+    // Dynamic-array operations over the handle lvalue (LRM 7.5). Element access
+    // rides the ElemSelect dynarr path, not these. Element facts come from the
+    // payload's own array-type handle, so each op works for a module signal or
+    // a frame-local dynamic array alike.
+    void lower_dyn_array_new(Index i) {
+        const auto&   p  = ir_->payload(i).op_extra;
+        const auto    da = ir_->extra_data<DynArrayArg>(p.extra);
+        const DynElem e  = dynarr_elem(da.array_type);
+        llvm::Value*  n  = cast(must_of(value_of(da.arg)), 64, false);
+        b_.CreateCall(dynarr_new_fn(), { lvalue_of(p.op).base, b_.getInt64(dynarr_stride(e)), n,
+                                         dynarr_elem_proto(e) });
+    }
+
+    void lower_dyn_array_new_init(Index i) {
+        const auto&   p  = ir_->payload(i).op_extra;
+        const auto    da = ir_->extra_data<DynArrayNewInitInfo>(p.extra);
+        const DynElem e  = dynarr_elem(da.array_type);
+        llvm::Value*  n  = cast(must_of(value_of(da.size)), 64, false);
+        b_.CreateCall(dynarr_new_copy_fn(),
+                      { lvalue_of(p.op).base, b_.getInt64(dynarr_stride(e)), n,
+                        dynarr_elem_proto(e), lvalue_of(da.src).base });
+    }
+
+    void lower_dyn_array_size(Index i) {
+        llvm::Value* handle = lvalue_of(ir_->payload(i).op_type.op).base;
+        llvm::Value* len =
+          b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 1));
+        set_value(i, two_val(cast(len, 32, false)));
+    }
+
+    void lower_dyn_array_copy(Index i) {
+        const auto&  p      = ir_->payload(i).op_extra;
+        const auto   da     = ir_->extra_data<DynArrayArg>(p.extra);
+        llvm::Value* stride = b_.getInt64(dynarr_stride(dynarr_elem(da.array_type)));
+        b_.CreateCall(dynarr_assign_fn(),
+                      { lvalue_of(p.op).base, lvalue_of(da.arg).base, stride });
     }
 
     // An alloca placed at the top of the current function's entry block (not the

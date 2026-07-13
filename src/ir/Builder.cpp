@@ -165,32 +165,30 @@ Index Builder::agg_copy(Index dst, Index src, Ref type, SourceLoc loc) {
 }
 
 Index Builder::dyn_array_new(Index arr, Index size, Index init, bool has_init, Ref array_type, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(
-      DynArrayInfo{ static_cast<uint32_t>(has_init ? DynArrayOp::NewInit : DynArrayOp::New), size,
-                    has_init ? init : arr, array_type });
+    if (has_init) {
+        const ExtraIndex extra = add_extra(DynArrayNewInitInfo{ size, init, array_type });
 
-    return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { arr, extra } } }, loc);
+        return emit({ Inst::Tag::DynArrayNewInit, Inst::Payload{ .op_extra = { arr, extra } } },
+                    loc);
+    }
+    const ExtraIndex extra = add_extra(DynArrayArg{ size, array_type });
+
+    return emit({ Inst::Tag::DynArrayNew, Inst::Payload{ .op_extra = { arr, extra } } }, loc);
 }
 
 Index Builder::dyn_array_size(Index arr, Ref array_type, SourceLoc loc) {
-    const ExtraIndex extra =
-      add_extra(DynArrayInfo{ static_cast<uint32_t>(DynArrayOp::Size), arr, arr, array_type });
-
-    return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { arr, extra } } }, loc);
+    return emit({ Inst::Tag::DynArraySize, Inst::Payload{ .op_type = { arr, array_type } } }, loc);
 }
 
 Index Builder::dyn_array_delete(Index arr, Ref array_type, SourceLoc loc) {
-    const ExtraIndex extra =
-      add_extra(DynArrayInfo{ static_cast<uint32_t>(DynArrayOp::Delete), arr, arr, array_type });
-
-    return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { arr, extra } } }, loc);
+    return emit({ Inst::Tag::DynArrayDelete, Inst::Payload{ .op_type = { arr, array_type } } },
+                loc);
 }
 
 Index Builder::dyn_array_copy(Index dst, Index src, Ref array_type, SourceLoc loc) {
-    const ExtraIndex extra =
-      add_extra(DynArrayInfo{ static_cast<uint32_t>(DynArrayOp::Copy), dst, src, array_type });
+    const ExtraIndex extra = add_extra(DynArrayArg{ src, array_type });
 
-    return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+    return emit({ Inst::Tag::DynArrayCopy, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
 }
 
 Index Builder::queue_size(Index q, Ref queue_type, SourceLoc loc) {
