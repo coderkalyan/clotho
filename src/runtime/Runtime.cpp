@@ -1491,6 +1491,22 @@ extern "C" int32_t rt_ferror(int32_t fd, uint8_t* mm, uint8_t* z, uint32_t width
     return code;
 }
 
+extern "C" int32_t rt_ferror_str(int32_t fd, rt_string* dst) {
+    io_ensure_init();
+    std::FILE*  f    = fd_stream(fd);
+    int         code = 0;
+    const char* msg  = "";
+    if (f == nullptr) {
+        code = -1;
+        msg  = "invalid file descriptor";
+    } else if (std::ferror(f) != 0) {
+        code = errno;
+        msg  = std::strerror(errno);
+    }
+    rt_string_assign_bytes(dst, msg, std::strlen(msg));
+    return code;
+}
+
 namespace {
 
 // Defined below, next to $readmem which shares them.

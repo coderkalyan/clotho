@@ -2699,6 +2699,40 @@ TEST_CASE("$ferror on a clear stream returns 0") {
     std::remove(path);
 }
 
+TEST_CASE("$ferror into a string variable on a clear stream returns 0") {
+    const char* path = "clotho_ferror_str_test.txt";
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, code;
+            string msg;
+            initial begin
+                fd = $fopen(")") + path + R"(", "w");
+                code = $ferror(fd, msg);
+                $display("%0d :%s:", code, msg);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "0 ::\n");
+    std::remove(path);
+}
+
+// An invalid descriptor (never opened) reports code -1 with a diagnostic
+// message, same as the packed-vector destination.
+TEST_CASE("$ferror into a string variable on an invalid descriptor") {
+    const std::string src = R"(
+        module m;
+            integer code;
+            string msg;
+            initial begin
+                code = $ferror(32'h8000_0063, msg);
+                $display("%0d %s", code, msg);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "-1 invalid file descriptor\n");
+}
+
 // $fscanf parses fields into integer lvalues and returns the conversion count.
 // Values cross-checked against Icarus Verilog.
 TEST_CASE("$fscanf parses integer fields") {

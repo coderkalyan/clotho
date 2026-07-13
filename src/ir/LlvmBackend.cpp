@@ -9023,7 +9023,9 @@ private:
     std::tuple<llvm::Value*, llvm::Value*, uint32_t, uint32_t> string_dest(Index dst, const char* who) {
         const LValue& lv = lvalue_of(dst);
         if (lv.is_string) {
-            // TODO: file write-back into a dynamic string object (rt_string).
+            // Every caller (fgets/ferror/sformat) checks lv.is_string and branches to
+            // its own rt_string-handle path before reaching here; this is defense in
+            // depth against a future caller doing otherwise.
             throw BackendError{ std::string(who) + " into a string object is not supported" };
         }
         if (lv.width != lv.store_width) {
@@ -9101,15 +9103,31 @@ private:
         return llmod_.getOrInsertFunction("rt_ferror", fnty);
     }
 
-    // Lower a $ferror: pass the descriptor plus the destination string's planes; the
-    // runtime writes the message and returns the error code.
+    // i32 rt_ferror_str(i32 fd, rt_string* dst)
+    llvm::FunctionCallee ferror_str_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(i32, { i32, ptr }, false);
+        return llmod_.getOrInsertFunction("rt_ferror_str", fnty);
+    }
+
+    // Lower a $ferror: a string-object destination goes straight to the runtime's
+    // rt_string handle (mirrors lower_fgets's string branch); a packed-vector
+    // destination passes the descriptor plus the destination's planes. Either way
+    // the runtime writes the message and returns the error code.
     void lower_ferror(Index i) {
-        const Index dst                  = ir_->payload(i).binary.l;
+        const Index   dst = ir_->payload(i).binary.l;
+        llvm::Value*  fd  = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, true);
+        const LValue& lv  = lvalue_of(dst);
+        if (lv.is_string) {
+            llvm::Value* r = b_.CreateCall(ferror_str_fn(), { fd, lv_string_ptr(lv) });
+            set_value(i, packed(r, r, zero(32)));
+            return;
+        }
         const auto [mm, z, width, flags] = string_dest(dst, "$ferror");
-        llvm::Value* fd                  = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, true);
-        const ServiceSnapshot old          = service_snapshot(lvalue_of(dst));
+        const ServiceSnapshot old          = service_snapshot(lv);
         llvm::Value* r = b_.CreateCall(ferror_fn(), { fd, mm, z, b_.getInt32(width), b_.getInt32(flags) });
-        service_after_write(lvalue_of(dst), old);
+        service_after_write(lv, old);
         set_value(i, packed(r, r, zero(32)));
     }
 

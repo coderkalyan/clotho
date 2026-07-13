@@ -195,6 +195,10 @@ int32_t rt_fgets_str(struct rt_string* dst, int32_t fd);
 // (0 when the stream is clear). `flags` as rt_fgets.
 int32_t rt_ferror(int32_t fd, uint8_t* mm, uint8_t* z, uint32_t width, uint32_t flags);
 
+// $ferror(fd, str) into a `string` destination: same as rt_ferror, but always
+// assigns `dst` (even the empty message when the stream is clear).
+int32_t rt_ferror_str(int32_t fd, struct rt_string* dst);
+
 // One output destination of a $fscanf / $sscanf conversion: the must|may plane
 // pointer (2*`width` bits), the z plane pointer (`width` bits), and the width. The
 // conversion char in the format decides how the parsed value is stored here.
