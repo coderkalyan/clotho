@@ -476,6 +476,11 @@ struct Anchor {
     // Reused definitions only: pointer global holding &proc_sched[first_proc],
     // stored by main; a unique definition folds to the absolute constant.
     llvm::GlobalVariable* sched_sym = nullptr;
+    // Lowest VCD dump-var index of the scope's own dumped signals (-1: none).
+    // Touch sites address a dumped signal as vcd base + def-local offset.
+    int32_t first_vcd = -1;
+    // Reused definitions only: i32 global holding first_vcd, stored by main.
+    llvm::GlobalVariable* vcd_sym = nullptr;
 };
 
 // One function-frame local: its `{ i(2W), iW }` slot type and width / domain.
@@ -2953,6 +2958,9 @@ private:
                                        { b_.getInt32(0), b_.getInt32(a.first_proc) }),
                   a.sched_sym);
             }
+            if (a.vcd_sym != nullptr) {
+                b_.CreateStore(b_.getInt32(static_cast<uint32_t>(a.first_vcd)), a.vcd_sym);
+            }
         }
         init_state();
         if (shadow_base_gv_ != nullptr) {
@@ -4650,10 +4658,11 @@ private:
             // the -1 index of a non-dumped signal). Commit is unconditional, so a
             // no-change commit over-touches; the flush diff suppresses it.
             if (design_uses_vcd_ && nba_vcd_gv_ != nullptr) {
-                llvm::Value* vidx = b_.CreateLoad(
-                  b_.getInt32Ty(), b_.CreateInBoundsGEP(nba_vcd_gv_->getValueType(), nba_vcd_gv_,
-                                                        { b_.getInt32(0), b_.getInt32(s.nba_id) }));
-                emit_guarded_vcd_touch(vcd_touch_fn(), { vidx });
+                emit_guarded_vcd_touch(vcd_touch_fn(), [&] {
+                    return llvm::SmallVector<llvm::Value*, 2>{ b_.CreateLoad(
+                      b_.getInt32Ty(), b_.CreateInBoundsGEP(nba_vcd_gv_->getValueType(), nba_vcd_gv_,
+                                                            { b_.getInt32(0), b_.getInt32(s.nba_id) })) };
+                });
             }
         }
     }
@@ -8915,10 +8924,11 @@ private:
             emit_nba_service(sig, meta, old_mm, new_mm, W, s.narrow, old_z, new_z);
         }
         if (design_uses_vcd_ && nba_vcd_gv_ != nullptr) {
-            llvm::Value* vidx = b_.CreateLoad(
-              i32, b_.CreateInBoundsGEP(nba_vcd_gv_->getValueType(), nba_vcd_gv_,
-                                        { b_.getInt32(0), b_.getInt32(s.nba_id) }));
-            emit_guarded_vcd_touch(vcd_touch_fn(), { vidx });
+            emit_guarded_vcd_touch(vcd_touch_fn(), [&] {
+                return llvm::SmallVector<llvm::Value*, 2>{ b_.CreateLoad(
+                  i32, b_.CreateInBoundsGEP(nba_vcd_gv_->getValueType(), nba_vcd_gv_,
+                                            { b_.getInt32(0), b_.getInt32(s.nba_id) })) };
+            });
         }
         b_.CreateCall(intra_release_fn(), { b_.getInt32(idx) });
         b_.CreateBr(skip);
@@ -9842,14 +9852,18 @@ private:
     // Emit a VCD touch call guarded by the runtime active flag, so a design that
     // compiles in $dumpvars (possibly plusarg-guarded) but is not dumping pays
     // only a predictable-not-taken load+branch per store, not a runtime call.
-    void emit_guarded_vcd_touch(llvm::FunctionCallee fn, llvm::ArrayRef<llvm::Value*> args) {
+    // `make_args` runs inside the taken branch, so index loads (the NBA vcd
+    // table, a reused instance's vcd base) stay off the inactive hot path —
+    // the point of the gate.
+    void emit_guarded_vcd_touch(llvm::FunctionCallee                                  fn,
+                                llvm::function_ref<llvm::SmallVector<llvm::Value*, 2>()> make_args) {
         llvm::Function*   f      = b_.GetInsertBlock()->getParent();
         llvm::Value*      active = b_.CreateLoad(b_.getInt8Ty(), vcd_active_gv());
         llvm::BasicBlock* touch  = llvm::BasicBlock::Create(ctx_, "vcd.touch", f);
         llvm::BasicBlock* cont   = llvm::BasicBlock::Create(ctx_, "vcd.cont", f);
         b_.CreateCondBr(b_.CreateICmpNE(active, b_.getInt8(0)), touch, cont);
         b_.SetInsertPoint(touch);
-        b_.CreateCall(fn, args);
+        b_.CreateCall(fn, make_args());
         b_.CreateBr(cont);
         b_.SetInsertPoint(cont);
     }
@@ -9908,11 +9922,24 @@ private:
                 vcd_index_scope(top, next);
             }
         }
+        for (Anchor& a : anchors_) {
+            if (a.indirect && a.first_vcd >= 0) {
+                a.vcd_sym = new llvm::GlobalVariable(
+                  llmod_, b_.getInt32Ty(), false, llvm::GlobalValue::InternalLinkage, b_.getInt32(0),
+                  "clotho.inst." + a.name + ".vcd");
+            }
+        }
     }
 
     void vcd_index_scope(const InstanceScope& sc, uint32_t& next) {
+        const uint32_t aid =
+          sc.id < anchor_of_scope_.size() ? anchor_of_scope_[sc.id] : SignalSlot::no_anchor;
         for (const Signal sig : sc.signals) {
+            const uint32_t before = next;
             vcd_index_signal(sig, next);
+            if (next != before && aid != SignalSlot::no_anchor && anchors_[aid].first_vcd < 0) {
+                anchors_[aid].first_vcd = static_cast<int32_t>(before);
+            }
         }
         for (const InstanceScope& child : sc.children) {
             vcd_index_scope(child, next);
@@ -9943,6 +9970,21 @@ private:
         return rt_fn("rt_vcd_touch_range", b_.getVoidTy(), { b_.getInt32Ty(), b_.getInt32Ty() });
     }
 
+    // The rt_vcd_touch index of a dumped signal: def-relative (instance vcd base
+    // + def-local offset) when the owner is a reused instance, the folded
+    // constant otherwise — dedup prep, same split as storage / sched anchors.
+    llvm::Value* vcd_index_value(Signal sig, int32_t base) {
+        const SignalSlot& s = slot_of(sig);
+        if (s.anchor != SignalSlot::no_anchor) {
+            const Anchor& a = anchors_[s.anchor];
+            if (a.vcd_sym != nullptr) {
+                llvm::Value* b0 = b_.CreateLoad(b_.getInt32Ty(), a.vcd_sym);
+                return b_.CreateAdd(b0, b_.getInt32(static_cast<uint32_t>(base - a.first_vcd)));
+            }
+        }
+        return b_.getInt32(static_cast<uint32_t>(base));
+    }
+
     // Emit rt_vcd_touch for a blocking write to a dumped signal, marking it in the
     // dirty set. A scalar touches its index; an array element touches base + its
     // normalized element index (a whole-array store touches the range). A no-op for
@@ -9959,15 +10001,22 @@ private:
         const SignalSlot& s = slot_of(lv.sig);
         if (s.is_array) {
             if (lv.elem_idx != nullptr) {
-                llvm::Value* idx = b_.CreateAdd(b_.getInt32(static_cast<uint32_t>(base)), lv.elem_idx);
-                emit_guarded_vcd_touch(vcd_touch_fn(), { idx });
+                emit_guarded_vcd_touch(vcd_touch_fn(), [&] {
+                    return llvm::SmallVector<llvm::Value*, 2>{
+                        b_.CreateAdd(vcd_index_value(lv.sig, base), lv.elem_idx)
+                    };
+                });
             } else {
-                emit_guarded_vcd_touch(vcd_touch_range_fn(),
-                              { b_.getInt32(static_cast<uint32_t>(base)), b_.getInt32(s.elem_count) });
+                emit_guarded_vcd_touch(vcd_touch_range_fn(), [&] {
+                    return llvm::SmallVector<llvm::Value*, 2>{ vcd_index_value(lv.sig, base),
+                                                               b_.getInt32(s.elem_count) };
+                });
             }
             return;
         }
-        emit_guarded_vcd_touch(vcd_touch_fn(), { b_.getInt32(static_cast<uint32_t>(base)) });
+        emit_guarded_vcd_touch(vcd_touch_fn(), [&] {
+            return llvm::SmallVector<llvm::Value*, 2>{ vcd_index_value(lv.sig, base) };
+        });
     }
 
     // Emit an rt_vcd_touch_range for a dumped array signal (whole element range).
@@ -9979,8 +10028,10 @@ private:
         }
         const int32_t base = vcd_index_[static_cast<uint32_t>(sig)];
         if (base >= 0) {
-            emit_guarded_vcd_touch(vcd_touch_range_fn(),
-                          { b_.getInt32(static_cast<uint32_t>(base)), b_.getInt32(slot_of(sig).elem_count) });
+            emit_guarded_vcd_touch(vcd_touch_range_fn(), [&] {
+                return llvm::SmallVector<llvm::Value*, 2>{ vcd_index_value(sig, base),
+                                                           b_.getInt32(slot_of(sig).elem_count) };
+            });
         }
     }
 
