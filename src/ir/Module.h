@@ -6,12 +6,12 @@
 // handles to names / types and holds the lowered processes together.
 //
 // Ownership: a Module owns the InternPool shared by every process it holds, so
-// each Process's `Ir.pool` reference stays valid for the module's lifetime. The
-// pool (and thus the Module) is non-movable, so a Module is the owning root,
+// each Process's `Ir.pool()` stays valid for the module's lifetime. The pool
+// (and thus the Module) is non-movable, so a Module is the owning root,
 // typically held behind a unique_ptr by the front-end.
 
 #include <cstdint>
-#include <memory>
+#include <deque>
 #include <span>
 #include <string>
 #include <vector>
@@ -283,18 +283,18 @@ public:
     // slot must be filled with set_function before the module is used.
     FunctionId reserve_function() {
         const auto index = static_cast<uint32_t>(functions_.size());
-        functions_.push_back(nullptr);
+        functions_.emplace_back();
 
         return static_cast<FunctionId>(index);
     }
 
     // Fill a previously reserved slot with the built function.
     void set_function(FunctionId id, Function fn) {
-        functions_[static_cast<uint32_t>(id)] = std::make_unique<Function>(std::move(fn));
+        functions_[static_cast<uint32_t>(id)] = std::move(fn);
     }
 
     const Function& function(FunctionId id) const {
-        return *functions_[static_cast<uint32_t>(id)];
+        return functions_[static_cast<uint32_t>(id)];
     }
 
     size_t function_count() const {
@@ -330,9 +330,10 @@ private:
     std::vector<SignalInfo> signals_;
     // Lowered processes, in creation order.
     std::vector<Process> processes_;
-    // Lowered functions; index == FunctionId handle. Held behind unique_ptr so a
-    // slot can be reserved (recursion) before its body exists.
-    std::vector<std::unique_ptr<Function>> functions_;
+    // Lowered functions; index == FunctionId handle. A deque so a slot can be
+    // reserved default-constructed (recursion) and assigned later, with
+    // references handed out by function() staying stable as the table grows.
+    std::deque<Function> functions_;
     // Instance hierarchy, one scope tree per top-level module.
     std::vector<InstanceScope> tops_;
 };

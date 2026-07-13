@@ -11,10 +11,12 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <limits>
 #include <span>
-#include <string>
+#include <string_view>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -109,6 +111,18 @@ struct Type {
         // so max size N+1; 0 means unbounded). right is unused; a queue is
         // always 0-based [0:len-1].
         Queue,
+        // Class (LRM §8): a reference type. Not plane-sized — layout() reports
+        // width 0 and the runtime value is a handle (a bare pointer to a heap
+        // object body); the backend owns the body layout, built like an unpacked
+        // struct over the property table. Reference semantics: assignment copies
+        // the pointer, `==` is identity, `null` is a distinct state (contrast the
+        // DynArray/Queue/String handle kinds, which are value types that
+        // deep-copy). `fields_id` is the declaration-order property table (reused
+        // Field machinery); crucially it is UNIQUE per class (intern_struct_fields
+        // never dedups), which gives a class NOMINAL identity — two structurally
+        // identical classes, even two empty ones, never unify. `element` holds the
+        // base-class Ref for inheritance (Invalid in V1). See docs/design/classes.md.
+        Class,
     };
 
     // Discriminant for this type.
@@ -118,6 +132,9 @@ struct Type {
     // Kind::Struct only: true for a packed struct/union (bit-vector value
     // semantics), false for unpacked (aggregate storage).
     bool is_packed = false;
+    // Explicit padding, always 0, so Type has unique object representations
+    // (its bytes hash / compare / serialize directly).
+    uint8_t reserved = 0;
     // Element type, for PackedArray / UnpackedArray, and packed Struct (the
     // scalar - logic or bit - whose domain the whole packed value shares).
     Ref element = Ref::Invalid;
@@ -133,18 +150,31 @@ struct Type {
     bool operator==(const Type&) const = default;
 };
 
-// One declared member of a struct/union type, in declaration order.
+static_assert(std::has_unique_object_representations_v<Type>,
+              "Type must stay padding-free: its bytes are hashed directly");
+
+// One declared member of a struct/union type, in declaration order. Plain
+// 16-byte data: the member name lives in the pool's flat name arena, resolved
+// via InternPool::field_name.
 struct Field {
-    // Declared member name (LRM 7.2.1 / 7.3: struct/union members are always
-    // named).
-    std::string name;
+    // Byte range of the declared member name in the pool's name arena (LRM
+    // 7.2.1 / 7.3: struct/union members are always named).
+    uint32_t name_at  = 0;
+    uint32_t name_len = 0;
     // Field's own interned type.
     Ref type = Ref::Invalid;
-    // Bit offset from the LSB (packed only; LRM 7.2.1 - first declared member
-    // is the most-significant). Unused (0) for an unpacked member — those are
-    // addressed by declaration index (this entry's position in the field list)
-    // instead.
+    // Bit offset from the LSB (packed; LRM 7.2.1 - first declared member is
+    // the most-significant) or the declaration index (unpacked members are
+    // addressed by position, not a flat bit offset).
     uint32_t bit_offset = 0;
+};
+
+// Build-time form of one Field row handed to intern_struct_fields; the pool
+// copies the name into its arena.
+struct FieldRow {
+    std::string_view name;
+    Ref              type       = Ref::Invalid;
+    uint32_t         bit_offset = 0;
 };
 
 // An interned value, in the canonical plane-packed format shared with runtime
@@ -180,22 +210,15 @@ inline std::span<const uint8_t> value_bytes(const Value& v, const std::vector<ui
 
 } // namespace clotho::ir
 
-// wyhash for interned types. Fields are marshalled into padding-free words so
-// the byte hash is deterministic.
+// wyhash for interned types. Type is padding-free (explicit reserved byte,
+// static_assert above), so its object bytes hash directly — no marshalling.
 template<>
 struct ankerl::unordered_dense::hash<clotho::ir::Type> {
     using is_avalanching = void;
 
     auto operator()(const clotho::ir::Type& t) const noexcept -> uint64_t {
-        const std::array<uint32_t, 5> words{
-            (static_cast<uint32_t>(t.kind) << 2) | (static_cast<uint32_t>(t.is_signed) << 1) |
-              static_cast<uint32_t>(t.is_packed),
-            static_cast<uint32_t>(t.element),
-            t.left,
-            t.right,
-            t.fields_id,
-        };
-        return detail::wyhash::hash(words.data(), sizeof(words));
+        const auto bytes = std::bit_cast<std::array<uint8_t, sizeof(clotho::ir::Type)>>(t);
+        return detail::wyhash::hash(bytes.data(), bytes.size());
     }
 };
 
@@ -243,7 +266,7 @@ inline bool eq_view(const ItemView& a, const ItemView& b) {
            std::equal(a.value_bytes.begin(), a.value_bytes.end(), b.value_bytes.begin());
 }
 
-// Cached layout facts derived from a type (computed on demand for now).
+// Cached layout facts derived from a type (memoized per Ref in the pool).
 struct Layout {
     // State encoding / plane count.
     Domain domain = Domain::Two;
@@ -292,7 +315,9 @@ public:
     // Canonical bytes of an interned value.
     std::span<const uint8_t> bytes(Ref ref) const;
 
-    // Packed layout (domain / width / size) of a type.
+    // Packed layout (domain / width / size) of a type. Memoized: the raw
+    // computation recurses through composite element types, and the backend
+    // queries layouts repeatedly per signal / operand.
     Layout layout(Ref type) const;
 
     // Intern a struct/union's declaration-order field list, returning the id a
@@ -300,9 +325,28 @@ public:
     // existing entries (each struct/union AST symbol lowers its own field list
     // at most once — the caller is expected to cache by symbol, as
     // Lower.cpp's lower_type does).
-    uint32_t intern_struct_fields(std::vector<Field> fields);
-    // Declared member list of a Kind::Struct type, in declaration order.
+    uint32_t intern_struct_fields(std::vector<FieldRow> rows);
+    // Reserve an empty field-table id whose rows are filled later by
+    // set_struct_fields. Breaks the forward-reference cycle of a Kind::Class whose
+    // own property is a handle to itself: reserve the id, build + intern the class
+    // Type (so the class Ref exists), cache it, lower the properties (a self-handle
+    // now resolves), then fill. The rows are appended to the flat arena at fill
+    // time (fields_id indexes field_runs_, so the run need not be contiguous with
+    // the reservation). A value struct cannot contain itself, so only classes need
+    // this.
+    uint32_t reserve_struct_fields();
+    // Fill an id reserved by reserve_struct_fields (appends its rows to the arena).
+    void set_struct_fields(uint32_t fields_id, std::vector<FieldRow> rows);
+    // Declared member list of a Kind::Struct / Kind::Class type, in declaration
+    // order (struct members / class properties). The rows live in one flat array,
+    // so the span is invalidated by a later intern_struct_fields / set_struct_fields
+    // — copy or re-fetch when interleaving with interning (only Lower can intern;
+    // the backend's const pool never invalidates).
     std::span<const Field> struct_fields(uint32_t fields_id) const;
+    // Declared name of a struct/union member (resolves the name-arena range).
+    std::string_view field_name(const Field& f) const {
+        return { field_names_.data() + f.name_at, f.name_len };
+    }
 
 private:
     // Transparent functors: a stored u32 index and an ItemView probe both fold
@@ -342,11 +386,23 @@ private:
     std::vector<Item> items_;
     // Canonical bytes of spilled (wide) values.
     std::vector<uint8_t> value_bytes_;
-    // Struct/union field-table storage; a Kind::Struct type's `fields_id`
-    // indexes here.
-    std::vector<std::vector<Field>> struct_fields_;
+    // Struct/union field rows, flat across every field table; a Kind::Struct
+    // type's `fields_id` indexes field_runs_, which slices this. Member name
+    // bytes live in field_names_.
+    std::vector<Field> struct_fields_;
+    // (start, count) run of each interned field table in struct_fields_.
+    std::vector<std::pair<uint32_t, uint32_t>> field_runs_;
+    // Flat member-name byte arena; Field::name_at / name_len index here.
+    std::vector<char> field_names_;
     // Dedup index: u32 handles into items_, hashed / compared via the store.
     ankerl::unordered_dense::set<uint32_t, Hash, Eq> set_;
+    // Lazily-filled layout() memo, indexed by Ref (grown to items_.size() on
+    // first miss). Mutable: memoizing a pure derivation of immutable items.
+    mutable std::vector<Layout>  layout_cache_;
+    mutable std::vector<uint8_t> layout_valid_;
+
+    // The uncached recursive layout derivation behind layout().
+    Layout compute_layout(Ref type) const;
 };
 
 } // namespace clotho::ir

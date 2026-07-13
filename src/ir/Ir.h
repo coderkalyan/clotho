@@ -116,11 +116,15 @@ enum class DistOp : uint32_t {
     Erlang,
 };
 
-// A struct may be overlaid on the extra buffer iff it is trivially copyable
-// and a whole number of u32 words wide. Because every field is a 4-byte
-// handle/enum, such structs carry no padding and round-trip via bit_cast.
+// A struct may be overlaid on the extra buffer iff it is trivially copyable, a
+// whole number of u32 words wide, and padding-free (every field a 4-byte
+// handle/enum — flags are u32, never bool). Padding would bit_cast
+// indeterminate bytes into the extra buffer, making the IR bytes
+// non-deterministic across identical runs (a hazard for hashing and future
+// serialization); has_unique_object_representations rejects it at compile time.
 template<class T>
-concept ExtraPayload = std::is_trivially_copyable_v<T> && (sizeof(T) % sizeof(uint32_t) == 0);
+concept ExtraPayload = std::is_trivially_copyable_v<T> && (sizeof(T) % sizeof(uint32_t) == 0) &&
+                       std::has_unique_object_representations_v<T>;
 
 // Half-open range [start, end) of u32 words in the extra buffer. Doubles as a
 // region: a run of instruction indices in nested-execution order.
@@ -224,10 +228,12 @@ struct MemberSelect {
 // lockstep with the backend dispatch in LlvmBackend and the runtime rt_dynarr_*
 // functions.
 enum class DynArrayOp : uint32_t {
-    // arr = new[size] [ (src) ]: (re)allocate to `size` elements, each the
-    // element's power-on value; with an init source, copy min(size, src.len)
-    // elements from it first (LRM 7.5.1).
+    // arr = new[size]: (re)allocate to `size` elements, each the element's
+    // power-on value (LRM 7.5.1).
     New,
+    // arr = new[size](src): like New, then copy min(size, src.len) elements
+    // from the `src` handle lvalue (LRM 7.5.1).
+    NewInit,
     // arr.size(): the current element count (LRM 7.5), a 32-bit int.
     Size,
     // arr.delete(): free the storage, size -> 0 (LRM 7.5).
@@ -263,8 +269,9 @@ enum class QueueOp : uint32_t {
 // Extra payload for `queue_op`: a queue operation on the handle lvalue `op`
 // (the instruction's op_extra.op). `sub` is the ir::QueueOp; `idx` is the
 // position operand (Insert / DeleteIdx), `val` the element value (PushBack /
-// PushFront / Insert) or the source handle lvalue (Copy). `flags` bit 0 marks
-// `idx` present, bit 1 marks `val` present.
+// PushFront / Insert) or the source handle lvalue (Copy). Operand presence is
+// derived from `sub`; a slot unused by the sub-op holds the handle lvalue as
+// deterministic filler.
 struct QueueInfo {
     // ir::QueueOp value.
     uint32_t sub;
@@ -272,8 +279,6 @@ struct QueueInfo {
     Index idx;
     // Element value (PushBack / PushFront / Insert) or source lvalue (Copy).
     Index val;
-    // bit0: `idx` present; bit1: `val` present.
-    uint32_t flags;
     // The interned Queue type of the target (element stride / slot / bound),
     // independent of the target signal — so the op works for a module signal or
     // a frame local.
@@ -282,19 +287,18 @@ struct QueueInfo {
 
 // Extra payload for `dyn_array_op`: a dynamic-array operation on the handle
 // lvalue `op` (the instruction's op_extra.op). `sub` is the ir::DynArrayOp;
-// `size` is the element count for New (else unused); `src` is the source handle
-// lvalue for a New init source or a Copy, valid iff `has_src`. `array_type` is
+// `size` is the element count (New / NewInit); `src` the source handle lvalue
+// (NewInit / Copy). Operand presence is derived from `sub`; a slot unused by
+// the sub-op holds the handle lvalue as deterministic filler. `array_type` is
 // the interned DynArray type, giving the element stride / slot independently of
 // the target signal — so the op works for a module signal or a frame local.
 struct DynArrayInfo {
     // ir::DynArrayOp value.
     uint32_t sub;
-    // Element count operand (New).
+    // Element count operand (New / NewInit).
     Index size;
-    // Source dynamic-array handle lvalue (New init source / Copy).
+    // Source dynamic-array handle lvalue (NewInit / Copy).
     Index src;
-    // Whether `src` is present.
-    uint32_t has_src;
     // The interned DynArray type of the target (element stride / slot).
     Ref array_type;
 };
@@ -312,11 +316,11 @@ struct ReadMemInfo {
     // Optional first / last address operands (declared-range coordinates).
     Index start;
     Index finish;
-    // True for $readmemh, false for $readmemb.
-    bool hex;
+    // 1 for $readmemh, 0 for $readmemb.
+    uint32_t hex;
     // Whether the start / finish operands are present.
-    bool has_start;
-    bool has_finish;
+    uint32_t has_start;
+    uint32_t has_finish;
 };
 
 // Extra payload for `call`: the callee plus its already-lowered argument values,
@@ -363,9 +367,9 @@ struct Regions {
     ExtraSlice then_;
     // Instructions executed when the condition is false.
     ExtraSlice else_;
-    // Hint that the condition is rarely true; biases backend branch weights
-    // toward the else path (e.g. a violation check).
-    bool unlikely = false;
+    // Hint (1/0) that the condition is rarely true; biases backend branch
+    // weights toward the else path (e.g. a violation check).
+    uint32_t unlikely = 0;
 };
 
 // Extra payload for `select_lazy`: a value-producing conditional (the predicate
@@ -397,9 +401,9 @@ struct LoopInfo {
     ExtraSlice body;
     // Per-iteration update, executed after the body (empty for while / forever).
     ExtraSlice step;
-    // do-while: run the body once before the first predicate test. The backend
-    // branches entry -> body instead of entry -> header (LRM 12.7.1).
-    bool bottom_test;
+    // do-while (1/0): run the body once before the first predicate test. The
+    // backend branches entry -> body instead of entry -> header (LRM 12.7.1).
+    uint32_t bottom_test;
 };
 
 // Extra payload for one arm of a `switch`: the constant case-value keys that
@@ -538,14 +542,6 @@ struct DistInfo {
     ExtraSlice args;
 };
 
-// Extra payload for `fgets`: $fgets(str, fd) (LRM §21.3.4) reads a line from the
-// descriptor `fd` into the packed-vector lvalue `str` (the instruction's `op`),
-// returning the character count. `fd` is a value operand.
-struct FgetsInfo {
-    // File-descriptor value operand.
-    Index fd;
-};
-
 // Extra payload for `sformat`: $sformat / $swrite (LRM §21.3.3) format the value
 // args per the packed format-string bytes at `fmt` (`fmt_len` bytes) and store the
 // result into the destination string lvalue `dst`. `args` is the value-operand
@@ -573,14 +569,6 @@ struct SformatfInfo {
     ExtraSlice args;
 };
 
-// Extra payload for `ferror`: $ferror(fd, str) (LRM §21.3.6) writes the
-// descriptor's error message into the string lvalue (the instruction's `op`) and
-// returns the error code. `fd` is a value operand.
-struct FerrorInfo {
-    // File-descriptor value operand.
-    Index fd;
-};
-
 // Extra payload for `scanf`: $fscanf / $sscanf (LRM §21.3.4) parse `source` per the
 // packed format-string bytes at `fmt` (`fmt_len` bytes) into the output lvalues
 // `args`, returning the conversion count. When `is_string` is 1 ($sscanf) `source`
@@ -597,13 +585,6 @@ struct ScanfInfo {
     uint32_t is_string;
     // Output lvalue operands, one per conversion, in order.
     ExtraSlice args;
-};
-
-// Extra payload for `fread_word`: $fread(reg, fd) (LRM §21.3.4) reads raw bytes into
-// the packed-vector lvalue `reg` (the instruction's `op`). `fd` is a value operand.
-struct FreadWordInfo {
-    // File-descriptor value operand.
-    Index fd;
 };
 
 // Extra payload for `fread_mem`: $fread(mem, fd[, start[, count]]) reads raw bytes
@@ -766,12 +747,9 @@ static_assert(ExtraPayload<FopenInfo>);
 static_assert(ExtraPayload<FileOpInfo>);
 static_assert(ExtraPayload<RealMathInfo>);
 static_assert(ExtraPayload<DistInfo>);
-static_assert(ExtraPayload<FgetsInfo>);
 static_assert(ExtraPayload<SformatInfo>);
 static_assert(ExtraPayload<SformatfInfo>);
-static_assert(ExtraPayload<FerrorInfo>);
 static_assert(ExtraPayload<ScanfInfo>);
-static_assert(ExtraPayload<FreadWordInfo>);
 static_assert(ExtraPayload<FreadMemInfo>);
 static_assert(ExtraPayload<TimeFormatInfo>);
 static_assert(ExtraPayload<WaitEdge>);
@@ -819,6 +797,19 @@ struct Inst {
         // addressed by declaration-order field index into the backing StructType,
         // not a bit offset (a packed struct member is a PartSelect instead).
         MemberSelect,
+        // Class object `new` (LRM 8.7): allocate the heap object body, power-on
+        // init its properties, and yield the object handle as a 2-state 64-bit
+        // value (payload: ref -> the Kind::Class type). The constructor call is
+        // emitted separately by the frontend (a normal call with the handle spliced
+        // as `this`). Reference semantics: the handle is a bare pointer.
+        ClassNew,
+        // Dereference a class object handle to an aggregate lvalue rooted at the
+        // object body (payload: op_type -> op is the handle value, type is the
+        // Kind::Class). Produces an is_agg lvalue whose base is the body pointer, so
+        // a following MemberSelect addresses a property. The one op that turns a
+        // reference handle into a body lvalue (contrast a value struct, addressed
+        // inline).
+        HandleDeref,
 
         // -- State access --
         // Read the current value of an lvalue (payload: unary).
@@ -1138,8 +1129,8 @@ struct Inst {
         // operands). LRM §21.3. Lowers to the matching rt_* call.
         FileValueOp,
         // $fgets: read a line from a descriptor into a packed-vector lvalue, ->
-        // character count (payload: op_extra -> FgetsInfo; op is the destination
-        // lvalue, extra holds the descriptor value). LRM §21.3.4. Lowers to rt_fgets.
+        // character count (payload: binary — l is the destination lvalue, r the
+        // descriptor value). LRM §21.3.4. Lowers to rt_fgets.
         Fgets,
         // $sformat / $swrite: format value args and store the result into a string
         // lvalue (payload: extra -> SformatInfo). LRM §21.3.3. Lowers to rt_sformat.
@@ -1149,16 +1140,16 @@ struct Inst {
         // instruction's string temp.
         Sformatf,
         // $ferror: write a descriptor's error message into a string lvalue, ->
-        // error code (payload: op_extra -> FerrorInfo; op is the destination
-        // lvalue). LRM §21.3.6. Lowers to an rt_ferror call.
+        // error code (payload: binary — l is the destination lvalue, r the
+        // descriptor value). LRM §21.3.6. Lowers to an rt_ferror call.
         Ferror,
         // $fscanf / $sscanf: parse a source into output lvalues per a format, ->
         // conversion count (payload: extra -> ScanfInfo). LRM §21.3.4. Lowers to an
         // rt_fscanf / rt_sscanf call.
         Scanf,
-        // $fread into a single packed-vector lvalue (payload: op_extra ->
-        // FreadWordInfo; op is the destination lvalue), -> bytes read. LRM §21.3.4.
-        // Lowers to an rt_fread call.
+        // $fread into a single packed-vector lvalue (payload: binary — l is the
+        // destination lvalue, r the descriptor value), -> bytes read. LRM
+        // §21.3.4. Lowers to an rt_fread call.
         FreadWord,
         // $fread into an unpacked-array memory (payload: op_extra -> FreadMemInfo;
         // op is the fd value), -> bytes read. LRM §21.3.4. Lowers to an rt_fread call.
@@ -1279,6 +1270,8 @@ struct Inst {
     // Which union member a tag activates. Drives payload_kind() / operands().
     enum class PayloadKind : uint8_t {
         None,
+        // The u64 scale member (sim_time). No SSA operands.
+        Scale,
         Ref,
         Signal,
         Unary,
@@ -1357,16 +1350,11 @@ struct Inst {
             // Handle to the op's extra payload.
             ExtraIndex extra;
         } op_extra;
-        // Handle to a variable-length operand slice (concat).
+        // Handle to a variable-length operand slice (concat) or to a tag's
+        // extra record with no primary operand (loop, call, display, wait,
+        // timeformat, ...). The record type is selected by the tag's
+        // PayloadKind.
         ExtraIndex extra;
-        // Handle to a DisplayInfo extra record (display).
-        ExtraIndex display;
-        // Handle to a TimeFormatInfo extra record (timeformat).
-        ExtraIndex timeformat;
-        // Handle to a WaitInfo extra record (wait): the list of (signal, edge)
-        // events to suspend on. The process wakes when ANY of them fires. No SSA
-        // operands.
-        ExtraIndex wait;
     };
 
     // Discriminant selecting the active payload member.
@@ -1378,16 +1366,210 @@ struct Inst {
 static_assert(sizeof(Inst::Payload) <= 8, "payload must stay compact");
 static_assert(std::is_trivially_copyable_v<Inst::Payload>);
 
-// Maps an instruction tag to the active payload union member.
-Inst::PayloadKind payload_kind(Inst::Tag tag);
+// Maps an instruction tag to the active payload union member. Constexpr in the
+// header so per-instruction dispatch (printer, operand walks, passes) inlines
+// to a dense-switch lookup instead of an out-of-line call.
+constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
+    using T = Inst::Tag;
+    using K = Inst::PayloadKind;
+    switch (tag) {
+        case T::Constant:
+            return K::Ref;
+        case T::Signal:
+        case T::EventTrigger:
+        case T::EventTriggered:
+        case T::EventTriggerNb:
+            return K::Signal;
+        case T::Arg:
+            return K::Arg;
+        case T::Local:
+            return K::Local;
+
+        case T::Load:
+        case T::Bnot:
+        case T::RedAnd:
+        case T::RedOr:
+        case T::RedXor:
+        case T::Lnot:
+        case T::FNeg:
+        case T::Ret:
+        case T::Delay:
+        case T::Fclose:
+        case T::Fflush:
+        case T::DumpFile:
+        case T::StrLen:
+        case T::StrUpper:
+        case T::StrLower:
+        case T::StrFromPacked:
+        case T::StrAtoi:
+        case T::StrAtohex:
+        case T::StrAtooct:
+        case T::StrAtobin:
+        case T::StrAtoreal:
+        case T::Clog2:
+        case T::Ctz:
+        case T::Clz:
+        case T::UrandomSeeded:
+            return K::Unary;
+
+        case T::BitSelect:
+        case T::Store:
+        case T::StoreNb:
+        case T::Add:
+        case T::Sub:
+        case T::Mul:
+        case T::Div:
+        case T::Mod:
+        case T::Pow:
+        case T::Band:
+        case T::Bor:
+        case T::Bxor:
+        case T::Bxnor:
+        case T::Sll:
+        case T::Srl:
+        case T::Sra:
+        case T::Eq:
+        case T::Ne:
+        case T::Lt:
+        case T::Le:
+        case T::Gt:
+        case T::Ge:
+        case T::CaseEq:
+        case T::CasezEq:
+        case T::CasexEq:
+        case T::WildEq:
+        case T::Land:
+        case T::Lor:
+        case T::StrGetc:
+        case T::StrCmp:
+        case T::StrICmp:
+        case T::StrItoa:
+        case T::StrHextoa:
+        case T::StrOctoa:
+        case T::StrBintoa:
+        case T::StrRealtoa:
+        case T::FAdd:
+        case T::FSub:
+        case T::FMul:
+        case T::FDiv:
+        case T::FPow:
+        case T::FEq:
+        case T::FNe:
+        case T::FLt:
+        case T::FLe:
+        case T::FGt:
+        case T::FGe:
+        case T::UrandomRange:
+        // The write-back file reads: l is the destination lvalue (like Store's
+        // lhs), r the descriptor value.
+        case T::Fgets:
+        case T::Ferror:
+        case T::FreadWord:
+            return K::Binary;
+
+        case T::Resize:
+        case T::StrToPacked:
+        case T::ItoF:
+        case T::FtoI:
+        case T::FtoITrunc:
+        case T::FBitcast:
+        case T::FResize:
+        case T::HandleDeref:
+            return K::OpType;
+        case T::ClassNew:
+            return K::Ref;
+        case T::Repl:
+            return K::Repl;
+        case T::Concat:
+        case T::Loop:
+            return K::Extra;
+        case T::Call:
+            return K::Call;
+        case T::TaskCall:
+            return K::TaskCall;
+        case T::Display:
+            return K::Display;
+        case T::FileValueOp:
+            return K::FileOp;
+        case T::Sformat:
+            return K::Sformat;
+        case T::Sformatf:
+            return K::Sformatf;
+        case T::Scanf:
+            return K::Scanf;
+        case T::RealMath:
+            return K::RealMath;
+        case T::DistCall:
+            return K::Dist;
+        case T::TimeFormat:
+            return K::TimeFormat;
+        case T::Break:
+        case T::Continue:
+        case T::DumpVars:
+        case T::DumpOff:
+        case T::DumpOn:
+        case T::DumpAll:
+        case T::DumpFlush:
+        case T::Random:
+        case T::Urandom:
+            return K::None;
+        case T::SimTime:
+            return K::Scale;
+        case T::Finish:
+        case T::CaseViol:
+        case T::TestPlusArgs:
+            return K::Extra;
+        case T::Fork:
+            // Children are FunctionIds (not SSA operands), walked from ForkInfo;
+            // the op has no top-level operands, so it rides the Extra path.
+            return K::Extra;
+        case T::Severity:
+            return K::Severity;
+        case T::Wait:
+            return K::Wait;
+
+        case T::StoreNbDelay:
+        case T::StoreNbEvent:
+        case T::Select:
+        case T::SelectLazy:
+        case T::PartSelect:
+        case T::DynPartSelect:
+        case T::ElemSelect:
+        case T::MemberSelect:
+        case T::AggCopy:
+        case T::DynArrayOp:
+        case T::QueueOp:
+        case T::Cond:
+        case T::Switch:
+        case T::Fopen:
+        case T::FreadMem:
+        case T::ReadMem:
+        case T::StrPutc:
+        case T::StrSubstr:
+        case T::EnumName:
+        case T::CountBits:
+        case T::ValuePlusArgs:
+        case T::EventTriggerNbDelayed:
+            return K::OpExtra;
+    }
+
+    return K::None;
+}
 
 // Immutable, finished process IR: a structure of arrays (parallel tag / payload
 // / location columns indexed by Index) plus a flat extra side-table. The body
-// is the root region. Constructed by Builder::finish().
+// is the root region. Constructed by Builder::finish(); default construction
+// yields an inert empty body (no pool), so an Ir-holding record (Function,
+// Process) can be slotted before its body is built and move-assigned later.
 class Ir {
 public:
-    // Intern pool backing this IR's constant / type handles.
-    const InternPool& pool;
+    Ir() = default;
+
+    // Intern pool backing this IR's constant / type handles. Valid only on a
+    // built Ir (Builder::finish()), never on a default-constructed one.
+    const InternPool& pool() const {
+        return *pool_;
+    }
 
     // Total number of instructions across all regions.
     size_t inst_count() const {
@@ -1442,32 +1624,41 @@ public:
         return s;
     }
 
-    // Decode the (signal, edge) events of a `wait` instruction's WaitInfo. The
-    // events are packed WaitEdge records (each two words wide) in the extra
-    // buffer; this returns them in order.
-    std::vector<WaitEdge> wait_edges(ExtraIndex info) const {
-        const WaitInfo        wi    = extra_data<WaitInfo>(info);
-        const auto            start = static_cast<uint32_t>(wi.events.start);
-        const auto            end   = static_cast<uint32_t>(wi.events.end);
-        constexpr uint32_t    stride = sizeof(WaitEdge) / sizeof(uint32_t);
-        std::vector<WaitEdge> out;
-        for (uint32_t w = start; w < end; w += stride) {
-            out.push_back(extra_data<WaitEdge>(static_cast<ExtraIndex>(w)));
-        }
+    // The (signal, edge) events of a `wait` instruction's WaitInfo, in order,
+    // viewed directly over the extra buffer: WaitEdge is two u32-sized fields
+    // (ExtraPayload), so the packed records overlay the words exactly. Valid
+    // while this Ir lives, like every other extra view.
+    std::span<const WaitEdge> wait_edges(ExtraIndex info) const {
+        const WaitInfo     wi     = extra_data<WaitInfo>(info);
+        const auto         start  = static_cast<uint32_t>(wi.events.start);
+        constexpr uint32_t stride = sizeof(WaitEdge) / sizeof(uint32_t);
+        const uint32_t     count  = (static_cast<uint32_t>(wi.events.end) - start) / stride;
 
-        return out;
+        return { reinterpret_cast<const WaitEdge*>(extra_.data() + start), count };
     }
 
     // Fill `scratch` with the SSA operands of an instruction and return a view
     // of them. Fixed-arity ops use the scratch buffer; variadic ops (concat)
     // return a view straight into the extra buffer. Region bodies are not
     // operands — walk them via region().
+    //
+    // NOTE: not exhaustive for the variadic system tasks — a tag whose args are
+    // an extra slice can also carry a scalar operand outside it, which one
+    // span cannot express: Display omits its fd, Scanf its source. A pass
+    // needing every use of those tags must read their info records directly.
     std::span<const Index> operands(Index inst, std::array<Index, 3>& scratch) const;
 
 private:
     friend class Builder;
 
     // A slice reinterpreted as a run of instruction indices.
+    //
+    // NOTE: viewing u32 extra words as enum-class handles (here and in
+    // wait_edges) is formally an aliasing violation — an enum is not
+    // aliasing-compatible with its underlying type ([basic.lval]). Accepted
+    // deliberately: the representation is identical, every compiler this
+    // builds on reads it as intended, and the alternative (per-element
+    // copies) costs the zero-copy view this layout exists for.
     std::span<const Index> index_slice(ExtraSlice s) const {
         const auto a = static_cast<uint32_t>(s.start);
         const auto b = static_cast<uint32_t>(s.end);
@@ -1482,13 +1673,15 @@ private:
        std::vector<SourceLoc>     locs,
        std::vector<uint32_t>      extra,
        ExtraSlice                 root)
-      : pool(pool)
+      : pool_(&pool)
       , tags_(std::move(tags))
       , payloads_(std::move(payloads))
       , locs_(std::move(locs))
       , extra_(std::move(extra))
       , root_(root) {}
 
+    // Intern pool backing this IR's handles; null only when default-constructed.
+    const InternPool* pool_ = nullptr;
     // Instruction tags.
     Array<Inst::Tag> tags_;
     // Per-instruction payloads, parallel to tags_.
@@ -1497,8 +1690,8 @@ private:
     Array<SourceLoc> locs_;
     // Flat u32 side-table for region bodies, operand slices, and extra structs.
     Array<uint32_t> extra_;
-    // Top-level region: the process body.
-    ExtraSlice root_;
+    // Top-level region: the process body (empty when default-constructed).
+    ExtraSlice root_{};
 };
 
 // Result of walking an lvalue's select chain to its root storage leaf.

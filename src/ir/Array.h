@@ -17,9 +17,12 @@ public:
     Array() = default;
 
     // Take ownership of a vector's elements, dropping any spare capacity.
+    // for_overwrite: every element is move-assigned right below, so the
+    // value-initialization (memset for the POD instruction columns) that plain
+    // make_unique performs would be a dead double-touch of the allocation.
     explicit Array(std::vector<T> values)
       : size_(values.size())
-      , data_(size_ ? std::make_unique<T[]>(size_) : nullptr) {
+      , data_(size_ ? std::make_unique_for_overwrite<T[]>(size_) : nullptr) {
         std::move(values.begin(), values.end(), data_.get());
     }
 

@@ -258,6 +258,49 @@ TEST_CASE("a real (fractional) delay is reported as unsupported") {
     CHECK(r.diagnostics.find("delay") != std::string::npos);
 }
 
+// LRM 6.5 / 10.3.2: "shall be an error" for a variable driven by more than one
+// continuous assignment, or by a mix of continuous and procedural assignments.
+// slang defaults both to warnings; Clotho promotes them to errors (its signal
+// model has no multi-driver resolution for variables, so silently keeping the
+// default severity would mean one driver is silently dropped).
+TEST_CASE("mixing continuous and procedural assignment to a variable is an error") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            logic a;
+            assign a = 1'b0;
+            initial a = 1'b1;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("cannot mix continuous and procedural assignments") != std::string::npos);
+}
+
+TEST_CASE("multiple continuous assignments to a variable is an error") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            logic a;
+            assign a = 1'b0;
+            assign a = 1'b1;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("cannot have multiple continuous assignments") != std::string::npos);
+}
+
+// slang also defaults a same-scope name redefinition to a warning and
+// silently keeps one declaration; Clotho's symbol table has no "last one
+// wins" rule, so this is promoted to an error too.
+TEST_CASE("redefining a name in the same scope is an error") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            logic a;
+            logic a;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("redefinition of") != std::string::npos);
+}
+
 TEST_CASE("$timeformat with a non-literal suffix is reported as unsupported") {
     // The suffix must be a compile-time string literal; a string parameter
     // reference has no runtime string representation yet, so it is rejected.
@@ -632,8 +675,8 @@ TEST_CASE("a packed struct declares and carries its field table") {
     CHECK(t.is_packed);
     const auto fields = m.pool.struct_fields(t.fields_id);
     REQUIRE(fields.size() == 2);
-    CHECK(fields[0].name == "a");
-    CHECK(fields[1].name == "b");
+    CHECK(m.pool.field_name(fields[0]) == "a");
+    CHECK(m.pool.field_name(fields[1]) == "b");
     // LRM 7.2.1: the first declared member is the most significant, so `a`
     // (the second field, width 8) sits above `b` at the LSB.
     CHECK(fields[0].bit_offset == 8);
@@ -823,19 +866,31 @@ TEST_CASE("a type parameter default sets an internal variable's width") {
 }
 
 TEST_CASE("a type parameter bound to an unsupported type fails loudly") {
-    // A class handle is not integral/real/string/array/event/chandle, so it falls
-    // through lower_type's final guard; binding a type parameter to one must hit
-    // that guard too, not silently accept it. (`event` and `chandle`
-    // were prior examples here; both are now lowered — named event LRM 15.5,
-    // chandle as a 2-state i64 handle LRM 6.14.)
+    // Binding a type parameter to a not-yet-lowered type must hit the same loud
+    // guard as a direct declaration, not silently accept it. (`event`,
+    // `chandle`, and now `class` were prior examples here; all are lowered now —
+    // named event LRM 15.5, chandle as a 2-state i64 handle LRM 6.14, class LRM 8.)
+    // An associative array is still unsupported, so it stands in as the example.
     const LowerResult r = lower_text(R"(
-        class C; endclass
-        module m #(parameter type T = C);
+        typedef int AA[string];
+        module m #(parameter type T = AA);
             T v;
         endmodule
     )");
     CHECK(!r.ok);
-    CHECK(r.diagnostics.find("unsupported non-integral type") != std::string::npos);
+    CHECK(r.diagnostics.find("associative arrays are not supported") != std::string::npos);
+}
+
+TEST_CASE("a class type parameter lowers as a handle") {
+    // The class example above now lowers: a class-typed signal is a handle (a
+    // 2-state 64-bit value), so binding a type parameter to a class succeeds.
+    const LowerResult r = lower_text(R"(
+        class C; int f; endclass
+        module m #(parameter type T = C);
+            T v;
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
 }
 
 TEST_CASE("a type parameter flows into a function argument and return type") {

@@ -119,6 +119,22 @@ std::span<const uint8_t> InternPool::bytes(Ref ref) const {
 }
 
 Layout InternPool::layout(Ref type) const {
+    const auto idx = static_cast<uint32_t>(type);
+    if (idx < layout_valid_.size() && layout_valid_[idx] != 0) {
+        return layout_cache_[idx];
+    }
+    const Layout lay = compute_layout(type);
+    if (layout_cache_.size() < items_.size()) {
+        layout_cache_.resize(items_.size());
+        layout_valid_.resize(items_.size(), 0);
+    }
+    layout_cache_[idx] = lay;
+    layout_valid_[idx] = 1;
+
+    return lay;
+}
+
+Layout InternPool::compute_layout(Ref type) const {
     const Type& t = std::get<Type>(get(type));
     switch (t.kind) {
         case Type::Kind::Void:
@@ -151,6 +167,12 @@ Layout InternPool::layout(Ref type) const {
             // Not plane-sized: an opaque rt_queue ring handle. Width 0 is the
             // sentinel; the backend queries `element` for per-element sizing.
             return { Domain::Two, 0, 0 };
+        case Type::Kind::Class:
+            // A class variable holds a handle: the pointer to a heap object body,
+            // stored as a 2-state 64-bit value (identical storage/assign/compare
+            // to chandle). The object body layout is backend-owned (built from the
+            // property table `fields_id`), reached by dereferencing the handle.
+            return { Domain::Two, 64, plane_bytes(64) };
         case Type::Kind::UnpackedArray: {
             // Report the leaf element's domain / width (recursion drills through
             // nested arrays), so callers sizing a per-element access see the
@@ -178,14 +200,36 @@ Layout InternPool::layout(Ref type) const {
     return { Domain::Two, 0, 0 };
 }
 
-uint32_t InternPool::intern_struct_fields(std::vector<Field> fields) {
-    struct_fields_.push_back(std::move(fields));
+uint32_t InternPool::intern_struct_fields(std::vector<FieldRow> rows) {
+    field_runs_.emplace_back(0, 0);
+    const auto id = static_cast<uint32_t>(field_runs_.size() - 1);
+    set_struct_fields(id, std::move(rows));
 
-    return static_cast<uint32_t>(struct_fields_.size() - 1);
+    return id;
+}
+
+uint32_t InternPool::reserve_struct_fields() {
+    // A placeholder run; the rows (and their real (start, count)) are appended by
+    // set_struct_fields once the class's properties are lowered. Empty until then.
+    field_runs_.emplace_back(0, 0);
+
+    return static_cast<uint32_t>(field_runs_.size() - 1);
+}
+
+void InternPool::set_struct_fields(uint32_t fields_id, std::vector<FieldRow> rows) {
+    const auto start = static_cast<uint32_t>(struct_fields_.size());
+    for (const FieldRow& r : rows) {
+        const auto name_at = static_cast<uint32_t>(field_names_.size());
+        field_names_.insert(field_names_.end(), r.name.begin(), r.name.end());
+        struct_fields_.push_back({ name_at, static_cast<uint32_t>(r.name.size()), r.type, r.bit_offset });
+    }
+    field_runs_[fields_id] = { start, static_cast<uint32_t>(rows.size()) };
 }
 
 std::span<const Field> InternPool::struct_fields(uint32_t fields_id) const {
-    return struct_fields_[fields_id];
+    const auto [start, count] = field_runs_[fields_id];
+
+    return { struct_fields_.data() + start, count };
 }
 
 } // namespace clotho::ir

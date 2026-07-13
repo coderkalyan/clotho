@@ -87,6 +87,14 @@ public:
     // declaration-order position; `struct_type` is the interned unpacked
     // Kind::Struct type being accessed (gives per-member layout).
     Index member_select(Index base, uint32_t field_index, Ref struct_type, SourceLoc loc);
+    // Class `new` (LRM 8.7): allocate + power-on the object body of `class_type`
+    // (a Kind::Class), yielding the object handle (a 2-state 64-bit value). The
+    // constructor call is emitted separately.
+    Index class_new(Ref class_type, SourceLoc loc);
+    // Dereference a class object handle value to an aggregate lvalue rooted at the
+    // object body. `handle` is the loaded handle value; `class_type` the Kind::Class
+    // giving the body layout. A following member_select addresses a property.
+    Index handle_deref(Index handle, Ref class_type, SourceLoc loc);
     // Whole-object blocking copy `dst = src` of two aggregate lvalues of `type`
     // (lowered to llvm.memcpy of the storage; caller ensures no string leaf).
     Index agg_copy(Index dst, Index src, Ref type, SourceLoc loc);

@@ -51,7 +51,7 @@ void render_type(const InternPool& pool, Ref type, std::ostream& os) {
                 if (i != 0) {
                     os << ", ";
                 }
-                os << fields[i].name << ":";
+                os << pool.field_name(fields[i]) << ":";
                 render_type(pool, fields[i].type, os);
             }
             os << "}";
@@ -65,6 +65,19 @@ void render_type(const InternPool& pool, Ref type, std::ostream& os) {
             render_type(pool, t.element, os);
             os << " [$]";
             break;
+        case Type::Kind::Class: {
+            const auto fields = pool.struct_fields(t.fields_id);
+            os << "class{";
+            for (size_t i = 0; i < fields.size(); ++i) {
+                if (i != 0) {
+                    os << ", ";
+                }
+                os << pool.field_name(fields[i]) << ":";
+                render_type(pool, fields[i].type, os);
+            }
+            os << "}";
+            break;
+        }
     }
 }
 
@@ -88,6 +101,10 @@ const char* tag_name(Inst::Tag tag) {
             return "elem_select";
         case T::MemberSelect:
             return "member_select";
+        case T::ClassNew:
+            return "class_new";
+        case T::HandleDeref:
+            return "handle_deref";
         case T::AggCopy:
             return "agg_copy";
         case T::Load:
@@ -388,18 +405,18 @@ private:
 
     // Render an interned type compactly, e.g. `logic[7:0]`.
     void render_type(Ref type) {
-        clotho::ir::render_type(ir_.pool, type, os_);
+        clotho::ir::render_type(ir_.pool(), type, os_);
     }
 
     // Render an interned constant as `<type> 0x<val-plane>`. Only the value
     // plane is shown; a trailing `+xz` flags any unknown bits.
     void render_constant(Ref value) {
-        const Value& v   = std::get<Value>(ir_.pool.get(value));
-        const auto   all = ir_.pool.bytes(value);
+        const Value& v   = std::get<Value>(ir_.pool().get(value));
+        const auto   all = ir_.pool().bytes(value);
         render_type(v.type);
 
         // A string constant's bytes are its characters, not plane data.
-        if (std::get<Type>(ir_.pool.get(v.type)).kind == Type::Kind::String) {
+        if (std::get<Type>(ir_.pool().get(v.type)).kind == Type::Kind::String) {
             os_ << " \"";
             for (const uint8_t c : all) {
                 os_ << static_cast<char>(c);
@@ -408,7 +425,7 @@ private:
             return;
         }
 
-        const auto planes      = static_cast<size_t>(ir_.pool.layout(v.type).domain);
+        const auto planes      = static_cast<size_t>(ir_.pool().layout(v.type).domain);
         const auto plane_bytes = planes ? all.size() / planes : all.size();
         os_ << " 0x" << std::hex;
         if (plane_bytes == 0) {
@@ -453,14 +470,22 @@ private:
         switch (payload_kind(tag)) {
             case Inst::PayloadKind::None:
                 break;
+            case Inst::PayloadKind::Scale:
+                os_ << "scale=" << p.scale;
+                break;
             case Inst::PayloadKind::Ref:
-                render_constant(p.ref);
+                // ClassNew's ref is the class *type*, not an interned value.
+                if (tag == Inst::Tag::ClassNew) {
+                    render_type(p.ref);
+                } else {
+                    render_constant(p.ref);
+                }
                 break;
             case Inst::PayloadKind::Signal:
                 os_ << "s" << static_cast<uint32_t>(p.signal);
                 break;
             case Inst::PayloadKind::Wait: {
-                const auto events = ir_.wait_edges(p.wait);
+                const auto events = ir_.wait_edges(p.extra);
                 for (size_t k = 0; k < events.size(); ++k) {
                     if (k != 0) {
                         os_ << " or ";
@@ -540,7 +565,7 @@ private:
                 break;
             }
             case Inst::PayloadKind::Display: {
-                const auto info = ir_.extra_data<DisplayInfo>(p.display);
+                const auto info = ir_.extra_data<DisplayInfo>(p.extra);
                 os_ << '"' << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
                 for (Index a : ir_.region(info.args)) {
                     os_ << ", ";
@@ -615,7 +640,7 @@ private:
                 break;
             }
             case Inst::PayloadKind::TimeFormat: {
-                const auto info = ir_.extra_data<TimeFormatInfo>(p.timeformat);
+                const auto info = ir_.extra_data<TimeFormatInfo>(p.extra);
                 ref(info.units);
                 os_ << ", ";
                 ref(info.precision);

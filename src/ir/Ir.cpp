@@ -2,193 +2,13 @@
 
 namespace clotho::ir {
 
-Inst::PayloadKind payload_kind(Inst::Tag tag) {
-    using T = Inst::Tag;
-    using K = Inst::PayloadKind;
-    switch (tag) {
-        case T::Constant:
-            return K::Ref;
-        case T::Signal:
-        case T::EventTrigger:
-        case T::EventTriggered:
-        case T::EventTriggerNb:
-            return K::Signal;
-        case T::Arg:
-            return K::Arg;
-        case T::Local:
-            return K::Local;
-
-        case T::Load:
-        case T::Bnot:
-        case T::RedAnd:
-        case T::RedOr:
-        case T::RedXor:
-        case T::Lnot:
-        case T::FNeg:
-        case T::Ret:
-        case T::Delay:
-        case T::Fclose:
-        case T::Fflush:
-        case T::DumpFile:
-        case T::StrLen:
-        case T::StrUpper:
-        case T::StrLower:
-        case T::StrFromPacked:
-        case T::StrAtoi:
-        case T::StrAtohex:
-        case T::StrAtooct:
-        case T::StrAtobin:
-        case T::StrAtoreal:
-        case T::Clog2:
-        case T::Ctz:
-        case T::Clz:
-        case T::UrandomSeeded:
-            return K::Unary;
-
-        case T::BitSelect:
-        case T::Store:
-        case T::StoreNb:
-        case T::Add:
-        case T::Sub:
-        case T::Mul:
-        case T::Div:
-        case T::Mod:
-        case T::Pow:
-        case T::Band:
-        case T::Bor:
-        case T::Bxor:
-        case T::Bxnor:
-        case T::Sll:
-        case T::Srl:
-        case T::Sra:
-        case T::Eq:
-        case T::Ne:
-        case T::Lt:
-        case T::Le:
-        case T::Gt:
-        case T::Ge:
-        case T::CaseEq:
-        case T::CasezEq:
-        case T::CasexEq:
-        case T::WildEq:
-        case T::Land:
-        case T::Lor:
-        case T::StrGetc:
-        case T::StrCmp:
-        case T::StrICmp:
-        case T::StrItoa:
-        case T::StrHextoa:
-        case T::StrOctoa:
-        case T::StrBintoa:
-        case T::StrRealtoa:
-        case T::FAdd:
-        case T::FSub:
-        case T::FMul:
-        case T::FDiv:
-        case T::FPow:
-        case T::FEq:
-        case T::FNe:
-        case T::FLt:
-        case T::FLe:
-        case T::FGt:
-        case T::FGe:
-        case T::UrandomRange:
-            return K::Binary;
-
-        case T::Resize:
-        case T::StrToPacked:
-        case T::ItoF:
-        case T::FtoI:
-        case T::FtoITrunc:
-        case T::FBitcast:
-        case T::FResize:
-            return K::OpType;
-        case T::Repl:
-            return K::Repl;
-        case T::Concat:
-        case T::Loop:
-            return K::Extra;
-        case T::Call:
-            return K::Call;
-        case T::TaskCall:
-            return K::TaskCall;
-        case T::Display:
-            return K::Display;
-        case T::FileValueOp:
-            return K::FileOp;
-        case T::Sformat:
-            return K::Sformat;
-        case T::Sformatf:
-            return K::Sformatf;
-        case T::Scanf:
-            return K::Scanf;
-        case T::RealMath:
-            return K::RealMath;
-        case T::DistCall:
-            return K::Dist;
-        case T::TimeFormat:
-            return K::TimeFormat;
-        case T::Break:
-        case T::Continue:
-        case T::DumpVars:
-        case T::DumpOff:
-        case T::DumpOn:
-        case T::DumpAll:
-        case T::DumpFlush:
-        case T::SimTime:
-        case T::Random:
-        case T::Urandom:
-            return K::None;
-        case T::Finish:
-        case T::CaseViol:
-        case T::TestPlusArgs:
-            return K::Extra;
-        case T::Fork:
-            // Children are FunctionIds (not SSA operands), walked from ForkInfo;
-            // the op has no top-level operands, so it rides the Extra path.
-            return K::Extra;
-        case T::Severity:
-            return K::Severity;
-        case T::Wait:
-            return K::Wait;
-
-        case T::StoreNbDelay:
-        case T::StoreNbEvent:
-        case T::Select:
-        case T::SelectLazy:
-        case T::PartSelect:
-        case T::DynPartSelect:
-        case T::ElemSelect:
-        case T::MemberSelect:
-        case T::AggCopy:
-        case T::DynArrayOp:
-        case T::QueueOp:
-        case T::Cond:
-        case T::Switch:
-        case T::Fopen:
-        case T::Fgets:
-        case T::Ferror:
-        case T::FreadWord:
-        case T::FreadMem:
-        case T::ReadMem:
-        case T::StrPutc:
-        case T::StrSubstr:
-        case T::EnumName:
-        case T::CountBits:
-        case T::ValuePlusArgs:
-        case T::EventTriggerNbDelayed:
-            return K::OpExtra;
-    }
-
-    return K::None;
-}
-
 std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) const {
     const auto  tag = this->tag(inst);
     const auto& p   = payload(inst);
 
     switch (payload_kind(tag)) {
         case Inst::PayloadKind::None:
+        case Inst::PayloadKind::Scale:
         case Inst::PayloadKind::Ref:
         case Inst::PayloadKind::Signal:
         case Inst::PayloadKind::Arg:
@@ -244,7 +64,7 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
         case Inst::PayloadKind::Display: {
             // display: the value args are an index slice in the DisplayInfo record;
             // the format string is not an SSA operand.
-            const auto info = extra_data<DisplayInfo>(p.display);
+            const auto info = extra_data<DisplayInfo>(p.extra);
             return index_slice(info.args);
         }
 
@@ -300,7 +120,7 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
         case Inst::PayloadKind::TimeFormat: {
             // timeformat: units / precision / min_width are SSA operands; the
             // suffix bytes are not.
-            const auto info = extra_data<TimeFormatInfo>(p.timeformat);
+            const auto info = extra_data<TimeFormatInfo>(p.extra);
             scratch[0]      = info.units;
             scratch[1]      = info.precision;
             scratch[2]      = info.min_width;
@@ -334,6 +154,31 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 scratch[0]     = p.op_extra.op;
                 scratch[1]     = dps.offset;
                 return { scratch.data(), 2 };
+            }
+            // fopen exposes its filename value plus the optional mode-string
+            // operand of the two-argument form.
+            if (tag == Inst::Tag::Fopen) {
+                const auto fo = extra_data<FopenInfo>(p.op_extra.extra);
+                size_t     n  = 0;
+                scratch[n++]  = p.op_extra.op;
+                if (fo.has_mode) {
+                    scratch[n++] = fo.mode;
+                }
+                return { scratch.data(), n };
+            }
+            // fread_mem exposes its fd value plus the optional start / count
+            // operands; the target memory is a Signal handle, not an operand.
+            if (tag == Inst::Tag::FreadMem) {
+                const auto fm = extra_data<FreadMemInfo>(p.op_extra.extra);
+                size_t     n  = 0;
+                scratch[n++]  = p.op_extra.op;
+                if (fm.has_start) {
+                    scratch[n++] = fm.start;
+                }
+                if (fm.has_count) {
+                    scratch[n++] = fm.count;
+                }
+                return { scratch.data(), n };
             }
             // read_mem exposes its filename value plus the optional start / finish
             // address operands; the target memory is a Signal handle, not an operand.
@@ -389,31 +234,34 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 scratch[1]      = info.src;
                 return { scratch.data(), 2 };
             }
-            // dyn_array_op exposes the handle lvalue plus the New size and the
-            // New-init / Copy source lvalue; the sub-op selector is not an operand.
+            // dyn_array_op exposes the handle lvalue plus the size / src
+            // operands its sub-op takes; the sub-op selector is not an operand.
             if (tag == Inst::Tag::DynArrayOp) {
-                const auto da = extra_data<DynArrayInfo>(p.op_extra.extra);
-                size_t     n  = 0;
-                scratch[n++]  = p.op_extra.op;
-                if (da.sub == static_cast<uint32_t>(DynArrayOp::New)) {
+                const auto da  = extra_data<DynArrayInfo>(p.op_extra.extra);
+                const auto sub = static_cast<DynArrayOp>(da.sub);
+                size_t     n   = 0;
+                scratch[n++]   = p.op_extra.op;
+                if (sub == DynArrayOp::New || sub == DynArrayOp::NewInit) {
                     scratch[n++] = da.size;
                 }
-                if (da.has_src) {
+                if (sub == DynArrayOp::NewInit || sub == DynArrayOp::Copy) {
                     scratch[n++] = da.src;
                 }
                 return { scratch.data(), n };
             }
-            // queue_op exposes the handle lvalue plus its optional idx / val
-            // operands (element value or Copy source lvalue); the sub-op selector
-            // is not an operand.
+            // queue_op exposes the handle lvalue plus the idx / val operands its
+            // sub-op takes (position for Insert / DeleteIdx; element value or
+            // Copy source lvalue); the sub-op selector is not an operand.
             if (tag == Inst::Tag::QueueOp) {
-                const auto qi = extra_data<QueueInfo>(p.op_extra.extra);
-                size_t     n  = 0;
-                scratch[n++]  = p.op_extra.op;
-                if (qi.flags & 1u) {
+                const auto qi  = extra_data<QueueInfo>(p.op_extra.extra);
+                const auto sub = static_cast<QueueOp>(qi.sub);
+                size_t     n   = 0;
+                scratch[n++]   = p.op_extra.op;
+                if (sub == QueueOp::Insert || sub == QueueOp::DeleteIdx) {
                     scratch[n++] = qi.idx;
                 }
-                if (qi.flags & 2u) {
+                if (sub == QueueOp::PushBack || sub == QueueOp::PushFront ||
+                    sub == QueueOp::Insert || sub == QueueOp::Copy) {
                     scratch[n++] = qi.val;
                 }
                 return { scratch.data(), n };

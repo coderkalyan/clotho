@@ -74,9 +74,9 @@ TEST_CASE("a packed struct's field table participates in interning") {
 
     const auto fields = pool.struct_fields(fields_a);
     REQUIRE(fields.size() == 2);
-    CHECK(fields[0].name == "a");
+    CHECK(pool.field_name(fields[0]) == "a");
     CHECK(fields[0].bit_offset == 8);
-    CHECK(fields[1].name == "b");
+    CHECK(pool.field_name(fields[1]) == "b");
     CHECK(fields[1].bit_offset == 0);
 
     // A second, independently-interned field table with the *same shape* is a
