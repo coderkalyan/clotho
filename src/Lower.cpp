@@ -989,10 +989,14 @@ private:
             t.is_signed = is_packed && ct.isSigned();
             t.is_packed = is_packed;
             // Packed: the whole-value scalar domain / width (shares PackedArray
-            // layout). Unpacked: element / bounds are unused (layout reports the
-            // width-0 aggregate sentinel), but element carries the domain for
-            // completeness.
-            t.element   = ct.isFourState() ? module_.pool.logic_type : module_.pool.bit_type;
+            // layout; a packed struct with any 4-state member is wholly 4-state
+            // per LRM 7.2.1, so the single domain is exact). Unpacked: element /
+            // bounds are meaningless — each member's domain lives in its own
+            // field-table type, so no flattened whole-struct domain exists; the
+            // element stays void so no consumer can mistake it for one.
+            t.element   = is_packed
+                            ? (ct.isFourState() ? module_.pool.logic_type : module_.pool.bit_type)
+                            : module_.pool.void_type;
             t.left      = is_packed ? ct.getBitWidth() - 1 : 0;
             t.right     = 0;
             t.fields_id = module_.pool.intern_struct_fields(std::move(fields));
