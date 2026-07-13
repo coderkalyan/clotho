@@ -207,6 +207,13 @@ Index Builder::dyn_array_sort(Index arr, bool reversed, Ref array_type, SourceLo
     return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { arr, extra } } }, loc);
 }
 
+Index Builder::dyn_array_shuffle(Index arr, Ref array_type, SourceLoc loc) {
+    const ExtraIndex extra =
+      add_extra(DynArrayInfo{ static_cast<uint32_t>(DynArrayOp::Shuffle), arr, arr, array_type });
+
+    return emit({ Inst::Tag::DynArrayOp, Inst::Payload{ .op_extra = { arr, extra } } }, loc);
+}
+
 Index Builder::queue_size(Index q, Ref queue_type, SourceLoc loc) {
     const ExtraIndex extra =
       add_extra(QueueInfo{ static_cast<uint32_t>(QueueOp::Size), q, q, queue_type });
@@ -259,6 +266,13 @@ Index Builder::queue_reverse(Index q, Ref queue_type, SourceLoc loc) {
 Index Builder::queue_sort(Index q, bool reversed, Ref queue_type, SourceLoc loc) {
     const auto       sub   = reversed ? QueueOp::Rsort : QueueOp::Sort;
     const ExtraIndex extra = add_extra(QueueInfo{ static_cast<uint32_t>(sub), q, q, queue_type });
+
+    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
+}
+
+Index Builder::queue_shuffle(Index q, Ref queue_type, SourceLoc loc) {
+    const ExtraIndex extra =
+      add_extra(QueueInfo{ static_cast<uint32_t>(QueueOp::Shuffle), q, q, queue_type });
 
     return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
 }

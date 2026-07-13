@@ -456,6 +456,10 @@ void rt_dynarr_reverse(rt_dynarr* h, uint64_t stride);
 // descending by value.
 void rt_dynarr_sort(rt_dynarr* h, uint64_t stride, uint32_t kind, uint32_t width, uint32_t rev);
 
+// arr.shuffle() (LRM 7.12.2): randomize element order in place via `rng`, the
+// process's 256-bit xoshiro256++ frame state (LRM 18.13); advances that state.
+void rt_dynarr_shuffle(rt_dynarr* h, uint64_t stride, uint64_t* rng);
+
 // -- SystemVerilog queues --
 //
 // The queue type (LRM §7.10): a runtime-sized double-ended vector of a
@@ -508,6 +512,7 @@ void rt_queue_assign(rt_queue* dst, const rt_queue* src, uint64_t stride);
 // the rt_dynarr_* ordering entry points; operates on the ring's logical order.
 void rt_queue_reverse(rt_queue* h, uint64_t stride);
 void rt_queue_sort(rt_queue* h, uint64_t stride, uint32_t kind, uint32_t width, uint32_t rev);
+void rt_queue_shuffle(rt_queue* h, uint64_t stride, uint64_t* rng);
 
 // -- SystemVerilog string objects --
 //

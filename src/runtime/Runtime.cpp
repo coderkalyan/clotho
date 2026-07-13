@@ -980,6 +980,27 @@ namespace {
 // Sort-key kind for the ordering comparator; mirrors the backend descriptor.
 enum : uint32_t { sort_unsigned = 0, sort_signed = 1, sort_real = 2 };
 
+// One xoshiro256++ step against a process frame RNG state. Byte-for-byte the
+// same recurrence the backend inlines at each $urandom site
+// (`emit_xoshiro_next` in LlvmBackend.cpp), so a shuffle drawing from the frame
+// state leaves the stream consistent for subsequent inlined $urandom draws.
+uint64_t xoshiro_next(uint64_t* s) {
+    const auto rotl = [](uint64_t x, unsigned k) { return (x << k) | (x >> (64 - k)); };
+    const uint64_t result = rotl(s[0] + s[3], 23) + s[0];
+    const uint64_t t      = s[1] << 17;
+    uint64_t       n2     = s[2] ^ s[0];
+    uint64_t       n3     = s[3] ^ s[1];
+    const uint64_t n1     = s[1] ^ n2;
+    const uint64_t n0     = s[0] ^ n3;
+    n2 ^= t;
+    n3    = rotl(n3, 45);
+    s[0]  = n0;
+    s[1]  = n1;
+    s[2]  = n2;
+    s[3]  = n3;
+    return result;
+}
+
 // Swap two `stride`-byte element slots through a caller-provided scratch slot.
 void swap_slots(uint8_t* a, uint8_t* b, uint64_t stride, uint8_t* tmp) {
     std::memcpy(tmp, a, static_cast<size_t>(stride));
@@ -1062,6 +1083,21 @@ extern "C" void rt_dynarr_reverse(rt_dynarr* h, uint64_t stride) {
 extern "C" void rt_dynarr_sort(rt_dynarr* h, uint64_t stride, uint32_t kind, uint32_t width,
                                uint32_t rev) {
     sort_run(static_cast<uint8_t*>(h->data), h->len, stride, kind, width, rev);
+}
+
+extern "C" void rt_dynarr_shuffle(rt_dynarr* h, uint64_t stride, uint64_t* rng) {
+    if (h->len < 2) {
+        return;
+    }
+    auto*                data = static_cast<uint8_t*>(h->data);
+    std::vector<uint8_t> tmp(static_cast<size_t>(stride));
+    // Fisher-Yates. The LRM does not fix the permutation (18.13-class
+    // tool-private), only that it draw from the process RNG; a modulo index
+    // reduction is sufficient.
+    for (uint64_t i = h->len - 1; i > 0; --i) {
+        const uint64_t j = xoshiro_next(rng) % (i + 1);
+        swap_slots(data + i * stride, data + j * stride, stride, tmp.data());
+    }
 }
 
 // -- Queues (LRM 7.10) --
@@ -1257,6 +1293,17 @@ extern "C" void rt_queue_sort(rt_queue* h, uint64_t stride, uint32_t kind, uint3
     sort_run(buf.data(), n, stride, kind, width, rev);
     for (uint64_t i = 0; i < n; ++i) {
         std::memcpy(q_elem(h, stride, i), buf.data() + i * stride, static_cast<size_t>(stride));
+    }
+}
+
+extern "C" void rt_queue_shuffle(rt_queue* h, uint64_t stride, uint64_t* rng) {
+    if (h->len < 2) {
+        return;
+    }
+    std::vector<uint8_t> tmp(static_cast<size_t>(stride));
+    for (uint64_t i = h->len - 1; i > 0; --i) {
+        const uint64_t j = xoshiro_next(rng) % (i + 1);
+        swap_slots(q_elem(h, stride, i), q_elem(h, stride, j), stride, tmp.data());
     }
 }
 

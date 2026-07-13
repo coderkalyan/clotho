@@ -247,6 +247,9 @@ enum class DynArrayOp : uint32_t {
     // (LRM 7.12.2). Restricted to a 2-state integral (width <= 64) or real element.
     Sort,
     Rsort,
+    // arr.shuffle(): randomize element order in place (LRM 7.12.2) via the
+    // process frame RNG (LRM 18.13). Element-agnostic. Forces a coroutine.
+    Shuffle,
 };
 
 // Which queue operation a `queue_op` performs (LRM 7.10.2). Kept in lockstep
@@ -276,6 +279,9 @@ enum class QueueOp : uint32_t {
     // (LRM 7.12.2). Restricted to a 2-state integral (width <= 64) or real element.
     Sort,
     Rsort,
+    // q.shuffle(): randomize element order in place (LRM 7.12.2) via the process
+    // frame RNG (LRM 18.13). Element-agnostic. Forces a coroutine.
+    Shuffle,
 };
 
 // Extra payload for `queue_op`: a queue operation on the handle lvalue `op`

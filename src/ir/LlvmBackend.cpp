@@ -3322,16 +3322,36 @@ private:
     // plain per-activation thunk instead of a coroutine (see the thunk path in
     // lower_group) and can be fused with peers sharing its sensitivity. Shared
     // by compute_fusion_groups and the thunk decision.
-    // True when a process body contains any $urandom-family node, so lower_group
-    // must materialize and seed its per-process frame RNG.
+    // True when instruction `i` in `ir` is an array shuffle (DynArrayOp/QueueOp
+    // with sub == Shuffle), which draws from the process frame RNG like $urandom.
+    static bool is_shuffle(const Ir& ir, Index i) {
+        const Inst::Tag tag = ir.tag(i);
+        if (tag == Inst::Tag::DynArrayOp) {
+            return ir.extra_data<DynArrayInfo>(ir.payload(i).op_extra.extra).sub ==
+                   static_cast<uint32_t>(DynArrayOp::Shuffle);
+        }
+        if (tag == Inst::Tag::QueueOp) {
+            return ir.extra_data<QueueInfo>(ir.payload(i).op_extra.extra).sub ==
+                   static_cast<uint32_t>(QueueOp::Shuffle);
+        }
+        return false;
+    }
+
+    // True when a process body contains any node that draws from the per-process
+    // frame RNG ($urandom family or an array shuffle), so lower_group must
+    // materialize and seed the frame RNG.
     static bool process_uses_urandom(const Process& p) {
         for (size_t k = 0; k < p.ir.inst_count(); ++k) {
-            switch (p.ir.tag(static_cast<Index>(k))) {
+            const auto idx = static_cast<Index>(k);
+            switch (p.ir.tag(idx)) {
                 case Inst::Tag::Urandom:
                 case Inst::Tag::UrandomSeeded:
                 case Inst::Tag::UrandomRange:
                     return true;
                 default:
+                    if (is_shuffle(p.ir, idx)) {
+                        return true;
+                    }
                     break;
             }
         }
@@ -3367,6 +3387,15 @@ private:
                 case Inst::Tag::UrandomSeeded:
                 case Inst::Tag::UrandomRange:
                     return false;
+                // An array shuffle draws from the frame RNG (same reason as the
+                // $urandom family); other dynarr/queue ops carry no frame state
+                // and stay thunk-eligible, so only Shuffle disqualifies.
+                case Inst::Tag::DynArrayOp:
+                case Inst::Tag::QueueOp:
+                    if (is_shuffle(p.ir, idx)) {
+                        return false;
+                    }
+                    break;
                 // A deferred store (`x <= #d y` / `x <= @e y`) arms a record with an
                 // observable future effect; keep it out of thunk/fused groups (a
                 // spurious comb-fused run would arm a spurious store), routing it
@@ -5665,6 +5694,10 @@ private:
         return rt_fn("rt_dynarr_sort", b_.getVoidTy(),
                      { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty() });
     }
+    // void rt_dynarr_shuffle(rt_dynarr*, i64 stride, i64* rng)  (LRM 7.12.2)
+    llvm::FunctionCallee dynarr_shuffle_fn() {
+        return rt_fn("rt_dynarr_shuffle", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
+    }
 
     // -- Queue runtime (rt_queue_*, LRM 7.10) --
     // void rt_queue_push_{back,front}(rt_queue*, i64 stride, i64 bound, const void* elem)
@@ -5703,6 +5736,10 @@ private:
     llvm::FunctionCallee queue_sort_fn() {
         return rt_fn("rt_queue_sort", b_.getVoidTy(),
                      { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty() });
+    }
+    // void rt_queue_shuffle(rt_queue*, i64 stride, i64* rng)  (LRM 7.12.2)
+    llvm::FunctionCallee queue_shuffle_fn() {
+        return rt_fn("rt_queue_shuffle", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
     }
 
     llvm::FunctionCallee str_init_fn() {
@@ -7920,6 +7957,13 @@ private:
                                                   b_.getInt32(rev ? 1 : 0) });
                 return;
             }
+            case DynArrayOp::Shuffle:
+                // rng_slot_ is non-null: process_uses_urandom flags a shuffling
+                // process, so lower_group allocates and seeds the frame RNG.
+                assert(rng_slot_ != nullptr && "shuffle needs the frame RNG");
+                b_.CreateCall(dynarr_shuffle_fn(),
+                              { handle, b_.getInt64(dynarr_stride(e)), rng_slot_ });
+                return;
         }
     }
 
@@ -8035,6 +8079,10 @@ private:
                                                  b_.getInt32(d.width), b_.getInt32(rev ? 1 : 0) });
                 return;
             }
+            case QueueOp::Shuffle:
+                assert(rng_slot_ != nullptr && "shuffle needs the frame RNG");
+                b_.CreateCall(queue_shuffle_fn(), { handle, stride, rng_slot_ });
+                return;
         }
     }
 

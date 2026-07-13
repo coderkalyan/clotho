@@ -6610,10 +6610,24 @@ private:
             guard_ordering_sort(name, call);
             return b.dyn_array_sort(arr, name == "rsort", aty, l);
         }
-        // TODO: dynamic-array shuffle (needs the per-process RNG, LRM 18.13),
-        // sort/rsort `with` clause, 4-state / wide sort, and find/min/max/unique/
-        // sum reduction & locator methods (need iterator-clause lowering).
+        if (name == "shuffle") {
+            guard_shuffle();
+            return b.dyn_array_shuffle(arr, aty, l);
+        }
+        // TODO: sort/rsort `with` clause, 4-state / wide sort, and find/min/max/
+        // unique/sum reduction & locator methods (need iterator-clause lowering).
         fail("dynamic array method '" + std::string(name) + "' is not supported");
+    }
+
+    // Loud guard for shuffle() (LRM 7.12.2): the per-process RNG lives in the
+    // process coroutine frame (LRM 18.13), so it is only legal directly in a
+    // process — a function/task body has no frame RNG (same restriction as
+    // $urandom; threading the caller RNG through the call ABI is future work).
+    void guard_shuffle() {
+        if (fn_ctx_ != nullptr) {
+            fail("shuffle inside a function/task is not supported yet (no per-process RNG "
+                 "in the call frame); call it directly from a process");
+        }
     }
 
     // Loud guard for the array ordering methods sort()/rsort() (LRM 7.12.2): the
@@ -6711,9 +6725,12 @@ private:
             guard_ordering_sort(name, call);
             return b.queue_sort(q, name == "rsort", qty, l);
         }
-        // TODO: queue shuffle (needs the per-process RNG, LRM 18.13), sort/rsort
-        // `with` clause, 4-state / wide sort, and find/min/max/unique/sum
-        // reduction & locator methods (need iterator-clause lowering).
+        if (name == "shuffle") {
+            guard_shuffle();
+            return b.queue_shuffle(q, qty, l);
+        }
+        // TODO: sort/rsort `with` clause, 4-state / wide sort, and find/min/max/
+        // unique/sum reduction & locator methods (need iterator-clause lowering).
         fail("queue method '" + std::string(name) + "' is not supported");
     }
 

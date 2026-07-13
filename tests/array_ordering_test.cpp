@@ -157,6 +157,51 @@ TEST_CASE("queue sort after push_front (wrapped head)") {
     CHECK(run_capture(src) == "1 2 7 9 \n");
 }
 
+// shuffle() produces a permutation (LRM 7.12.2): sorting the shuffled array
+// recovers the original, and the specific order is the process RNG's stable
+// stream (seed = process index, like $urandom). Both the exact
+// permutation and the sort-recovers invariant are pinned.
+TEST_CASE("dynamic array + queue shuffle is a stable permutation") {
+    constexpr std::string_view src = R"(
+        module m;
+            int a[]; int q[$]; int i;
+            initial begin
+                a = new[6]; foreach (a[i]) a[i] = i;
+                a.shuffle();
+                $write("sh:"); foreach (a[i]) $write(" %0d", a[i]); $display;
+                a.sort();
+                $write("re:"); foreach (a[i]) $write(" %0d", a[i]); $display;
+                for (i = 0; i < 5; i++) q.push_back(i);
+                q.shuffle();
+                $write("q:"); foreach (q[i]) $write(" %0d", q[i]); $display;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "sh: 2 3 1 4 0 5\nre: 0 1 2 3 4 5\nq: 0 4 1 2 3\n");
+}
+
+// shuffle draws from the frame RNG shared with $urandom: the process becomes a
+// coroutine and the RNG state persists across activations (each posedge draws a
+// fresh permutation) while the multiset is preserved (sum invariant).
+TEST_CASE("shuffle in an always block keeps a per-process RNG") {
+    constexpr std::string_view src = R"(
+        module m;
+            reg clk = 0; int a[]; int i, s;
+            initial begin
+                a = new[5]; foreach (a[i]) a[i] = i + 1;
+                repeat (4) #5 clk = ~clk;
+                $finish;
+            end
+            always @(posedge clk) begin
+                a.shuffle();
+                s = 0; foreach (a[i]) s += a[i];
+                $display("sum=%0d a0=%0d", s, a[0]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "sum=15 a0=5\nsum=15 a0=3\n");
+}
+
 // Ordering an empty or single-element container is a no-op (no crash).
 TEST_CASE("array ordering on empty / single element is a no-op") {
     constexpr std::string_view src = R"(
