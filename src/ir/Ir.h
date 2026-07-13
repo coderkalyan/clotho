@@ -966,7 +966,7 @@ struct Inst {
         // Ternary cond ? a : b (payload: op_extra -> Select).
         Select,
         // Value-producing short-circuit conditional (payload: op_extra ->
-        // Select). The op is a definite 2-state predicate; the then-branch
+        // SelectLazy). The op is a definite 2-state predicate; the then-branch
         // (predicate 1) and else-branch each yield a value, merged by the
         // backend. Used for &&/|| so the right operand is not evaluated when the
         // left already decides the result (LRM 11.3.5, 11.4.7). Lowers to
@@ -1164,9 +1164,9 @@ struct Inst {
         // mechanism a suspend is observationally an exit, so both are treated
         // identically apart from the banner's task name.
         Finish,
-        // priority-case violation report (payload: extra -> FinishInfo, reusing
-        // the banner prefix; arg is unused). LRM 12.5.3: a `priority case` with
-        // no default reached at runtime with no matching item. Non-fatal —
+        // unique/priority violation report (payload: extra -> FinishInfo,
+        // reusing the banner prefix; arg selects the message — 0: no item
+        // matched, 1: overlapping items). LRM 12.5.3 / 12.4.2. Non-fatal —
         // lowers to an rt_case_violation call that warns and returns.
         CaseViol,
         // Severity system task report ($info / $warning / $error / $fatal, LRM
