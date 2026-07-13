@@ -711,6 +711,15 @@ private:
                 case SymbolKind::Parameter:
                 case SymbolKind::TypeParameter:
                 case SymbolKind::TypeAlias:
+                // `typedef class C;` (LRM 6.18 / 8.27): pure elaboration-time name
+                // binding, entirely resolved by slang's own forward-decl machinery
+                // (ForwardingTypedefSymbol::addForwardDecl / checkType) before this
+                // walk ever sees it. No type, value, or statement content of its
+                // own -- the class it names lowers on demand like any other
+                // ClassType, via lower_class_type's intern-first symbol-pointer
+                // cache, which already treats a forward decl and its later full
+                // definition as the same ClassType symbol.
+                case SymbolKind::ForwardingTypedef:
                 // A class declaration is a type, not a per-instance member: its
                 // methods and object body lower on demand when a variable of the
                 // class is declared / used (lower_class_type).
