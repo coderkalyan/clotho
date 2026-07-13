@@ -238,22 +238,22 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 }
                 return { scratch.data(), n };
             }
-            // queue_op exposes the handle lvalue plus the idx / val operands its
-            // sub-op takes (position for Insert / DeleteIdx; element value or
-            // Copy source lvalue); the sub-op selector is not an operand.
-            if (tag == Inst::Tag::QueueOp) {
-                const auto qi  = extra_data<QueueInfo>(p.op_extra.extra);
-                const auto sub = static_cast<QueueOp>(qi.sub);
-                size_t     n   = 0;
-                scratch[n++]   = p.op_extra.op;
-                if (sub == QueueOp::Insert || sub == QueueOp::DeleteIdx) {
-                    scratch[n++] = qi.idx;
-                }
-                if (sub == QueueOp::PushBack || sub == QueueOp::PushFront ||
-                    sub == QueueOp::Insert || sub == QueueOp::Copy) {
-                    scratch[n++] = qi.val;
-                }
-                return { scratch.data(), n };
+            // The one-extra-operand queue ops expose the handle lvalue plus
+            // their QueueArg operand (element value / position / copy source).
+            if (tag == Inst::Tag::QueuePushBack || tag == Inst::Tag::QueuePushFront ||
+                tag == Inst::Tag::QueueDeleteIdx || tag == Inst::Tag::QueueCopy) {
+                const auto qa = extra_data<QueueArg>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = qa.arg;
+                return { scratch.data(), 2 };
+            }
+            // queue_insert exposes the handle lvalue, position, and element value.
+            if (tag == Inst::Tag::QueueInsert) {
+                const auto qi = extra_data<QueueInsertInfo>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = qi.idx;
+                scratch[2]    = qi.val;
+                return { scratch.data(), 3 };
             }
             scratch[0] = p.op_extra.op;
             return { scratch.data(), 1 };

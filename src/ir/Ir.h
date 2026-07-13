@@ -243,45 +243,26 @@ enum class DynArrayOp : uint32_t {
     Copy,
 };
 
-// Which queue operation a `queue_op` performs (LRM 7.10.2). Kept in lockstep
-// with the backend dispatch in LlvmBackend and the runtime rt_queue_* functions.
-enum class QueueOp : uint32_t {
-    // q.size(): the current element count (a 32-bit int).
-    Size,
-    // q.push_back(e) / q.push_front(e): append `val` to the tail / head; on a
-    // bounded queue an overflowing element is dropped from the opposite end.
-    PushBack,
-    PushFront,
-    // q.pop_back() / q.pop_front(): remove and return the tail / head element
-    // (element default on an empty queue).
-    PopBack,
-    PopFront,
-    // q.insert(idx, e): insert `val` before position `idx` (LRM 7.10.2.4).
-    Insert,
-    // q.delete(idx): remove the element at `idx` (LRM 7.10.2.5).
-    DeleteIdx,
-    // q.delete(): remove all elements, size -> 0.
-    DeleteAll,
-    // q = other: deep copy of another queue's storage (value semantics).
-    Copy,
+// Extra payload for the one-operand queue tags (QueuePushBack / QueuePushFront
+// / QueueDeleteIdx / QueueCopy): the tag's single non-handle operand plus the
+// interned Queue type of the target (element stride / slot / bound),
+// independent of the target signal — so the op works for a module signal or a
+// frame local. The handle lvalue is the instruction's op.
+struct QueueArg {
+    // Element value (push), position (delete-idx), or source handle (copy).
+    Index arg;
+    // The interned Queue type of the target.
+    Ref queue_type;
 };
 
-// Extra payload for `queue_op`: a queue operation on the handle lvalue `op`
-// (the instruction's op_extra.op). `sub` is the ir::QueueOp; `idx` is the
-// position operand (Insert / DeleteIdx), `val` the element value (PushBack /
-// PushFront / Insert) or the source handle lvalue (Copy). Operand presence is
-// derived from `sub`; a slot unused by the sub-op holds the handle lvalue as
-// deterministic filler.
-struct QueueInfo {
-    // ir::QueueOp value.
-    uint32_t sub;
-    // Position operand (Insert / DeleteIdx).
+// Extra payload for `queue_insert`: q.insert(idx, e) inserts the element value
+// `val` before position `idx` (LRM 7.10.2.4). The handle lvalue is the op.
+struct QueueInsertInfo {
+    // Position operand.
     Index idx;
-    // Element value (PushBack / PushFront / Insert) or source lvalue (Copy).
+    // Element value operand.
     Index val;
-    // The interned Queue type of the target (element stride / slot / bound),
-    // independent of the target signal — so the op works for a module signal or
-    // a frame local.
+    // The interned Queue type of the target.
     Ref queue_type;
 };
 
@@ -721,7 +702,8 @@ static_assert(ExtraPayload<ElemSelect>);
 static_assert(ExtraPayload<MemberSelect>);
 static_assert(ExtraPayload<AggCopyInfo>);
 static_assert(ExtraPayload<DynArrayInfo>);
-static_assert(ExtraPayload<QueueInfo>);
+static_assert(ExtraPayload<QueueArg>);
+static_assert(ExtraPayload<QueueInsertInfo>);
 static_assert(ExtraPayload<ReadMemInfo>);
 static_assert(ExtraPayload<Regions>);
 static_assert(ExtraPayload<LoopInfo>);
@@ -827,13 +809,35 @@ struct Inst {
         // heap buffer.
         DynArrayOp,
 
-        // Queue operation on a handle lvalue (payload: op_extra -> QueueInfo; op
-        // is the queue handle lvalue). The `sub` field selects size / push* /
-        // pop* / insert / delete (ir::QueueOp, LRM 7.10.2). size / pop* yield a
-        // value; the rest are statements. Lowers to the matching rt_queue_*
-        // call; indexed element access q[i] rides the ElemSelect queue path
-        // (ring math over the handle's buffer).
-        QueueOp,
+        // -- Queue operations on a handle lvalue (LRM 7.10.2) --
+        // Each lowers to its rt_queue_* runtime call; indexed element access
+        // q[i] rides the ElemSelect queue path (ring math over the handle's
+        // buffer), not these tags.
+        // q.size() -> 32-bit int (payload: op_type — op is the handle lvalue,
+        // type the interned Queue type).
+        QueueSize,
+        // q.push_back(e) / q.push_front(e): append the element value (payload:
+        // op_extra -> QueueArg; op is the handle lvalue). On a bounded queue an
+        // overflowing element is dropped from the opposite end.
+        QueuePushBack,
+        QueuePushFront,
+        // q.pop_back() / q.pop_front(): remove and return the tail / head
+        // element — the element default on an empty queue (payload: op_type,
+        // like QueueSize).
+        QueuePopBack,
+        QueuePopFront,
+        // q.insert(idx, e) (payload: op_extra -> QueueInsertInfo; op is the
+        // handle lvalue).
+        QueueInsert,
+        // q.delete(idx): remove the element at idx (payload: op_extra ->
+        // QueueArg, whose arg is the position; op is the handle lvalue).
+        QueueDeleteIdx,
+        // q.delete(): remove all elements, size -> 0 (payload: op_type).
+        QueueDeleteAll,
+        // q = other: deep copy of another queue's storage (value semantics;
+        // payload: op_extra -> QueueArg, whose arg is the source handle
+        // lvalue; op is the destination handle lvalue).
+        QueueCopy,
 
         // -- Arithmetic (payload: binary) --
         Add,
@@ -1475,6 +1479,12 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::FBitcast:
         case T::FResize:
         case T::HandleDeref:
+        // Handle-lvalue queue ops with no extra operand: op is the handle,
+        // type the interned Queue type.
+        case T::QueueSize:
+        case T::QueuePopBack:
+        case T::QueuePopFront:
+        case T::QueueDeleteAll:
             return K::OpType;
         case T::ClassNew:
             return K::Ref;
@@ -1540,7 +1550,11 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::MemberSelect:
         case T::AggCopy:
         case T::DynArrayOp:
-        case T::QueueOp:
+        case T::QueuePushBack:
+        case T::QueuePushFront:
+        case T::QueueInsert:
+        case T::QueueDeleteIdx:
+        case T::QueueCopy:
         case T::Cond:
         case T::Switch:
         case T::FreadMem:

@@ -194,45 +194,43 @@ Index Builder::dyn_array_copy(Index dst, Index src, Ref array_type, SourceLoc lo
 }
 
 Index Builder::queue_size(Index q, Ref queue_type, SourceLoc loc) {
-    const ExtraIndex extra =
-      add_extra(QueueInfo{ static_cast<uint32_t>(QueueOp::Size), q, q, queue_type });
-
-    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
+    return emit({ Inst::Tag::QueueSize, Inst::Payload{ .op_type = { q, queue_type } } }, loc);
 }
 
 Index Builder::queue_push(Index q, Index elem, bool front, Ref queue_type, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(QueueInfo{
-      static_cast<uint32_t>(front ? QueueOp::PushFront : QueueOp::PushBack), q, elem, queue_type });
+    const ExtraIndex extra = add_extra(QueueArg{ elem, queue_type });
 
-    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
+    return emit({ front ? Inst::Tag::QueuePushFront : Inst::Tag::QueuePushBack,
+                  Inst::Payload{ .op_extra = { q, extra } } },
+                loc);
 }
 
 Index Builder::queue_pop(Index q, bool front, Ref queue_type, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(
-      QueueInfo{ static_cast<uint32_t>(front ? QueueOp::PopFront : QueueOp::PopBack), q, q, queue_type });
-
-    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
+    return emit({ front ? Inst::Tag::QueuePopFront : Inst::Tag::QueuePopBack,
+                  Inst::Payload{ .op_type = { q, queue_type } } },
+                loc);
 }
 
 Index Builder::queue_insert(Index q, Index idx, Index elem, Ref queue_type, SourceLoc loc) {
-    const ExtraIndex extra =
-      add_extra(QueueInfo{ static_cast<uint32_t>(QueueOp::Insert), idx, elem, queue_type });
+    const ExtraIndex extra = add_extra(QueueInsertInfo{ idx, elem, queue_type });
 
-    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
+    return emit({ Inst::Tag::QueueInsert, Inst::Payload{ .op_extra = { q, extra } } }, loc);
 }
 
 Index Builder::queue_delete(Index q, Index idx, bool has_idx, Ref queue_type, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(QueueInfo{
-      static_cast<uint32_t>(has_idx ? QueueOp::DeleteIdx : QueueOp::DeleteAll), idx, q, queue_type });
+    if (!has_idx) {
+        return emit({ Inst::Tag::QueueDeleteAll, Inst::Payload{ .op_type = { q, queue_type } } },
+                    loc);
+    }
+    const ExtraIndex extra = add_extra(QueueArg{ idx, queue_type });
 
-    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { q, extra } } }, loc);
+    return emit({ Inst::Tag::QueueDeleteIdx, Inst::Payload{ .op_extra = { q, extra } } }, loc);
 }
 
 Index Builder::queue_copy(Index dst, Index src, Ref queue_type, SourceLoc loc) {
-    const ExtraIndex extra =
-      add_extra(QueueInfo{ static_cast<uint32_t>(QueueOp::Copy), dst, src, queue_type });
+    const ExtraIndex extra = add_extra(QueueArg{ src, queue_type });
 
-    return emit({ Inst::Tag::QueueOp, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+    return emit({ Inst::Tag::QueueCopy, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
 }
 
 Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc,

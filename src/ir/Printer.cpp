@@ -115,8 +115,24 @@ const char* tag_name(Inst::Tag tag) {
             return "store_nb";
         case T::DynArrayOp:
             return "dyn_array_op";
-        case T::QueueOp:
-            return "queue_op";
+        case T::QueueSize:
+            return "queue_size";
+        case T::QueuePushBack:
+            return "queue_push_back";
+        case T::QueuePushFront:
+            return "queue_push_front";
+        case T::QueuePopBack:
+            return "queue_pop_back";
+        case T::QueuePopFront:
+            return "queue_pop_front";
+        case T::QueueInsert:
+            return "queue_insert";
+        case T::QueueDeleteIdx:
+            return "queue_delete_idx";
+        case T::QueueDeleteAll:
+            return "queue_delete_all";
+        case T::QueueCopy:
+            return "queue_copy";
         case T::StoreNbDelay:
             return "store_nb_delay";
         case T::StoreNbEvent:

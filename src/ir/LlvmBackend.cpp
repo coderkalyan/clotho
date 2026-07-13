@@ -6210,17 +6210,21 @@ private:
                 // Only size() is a value (a definite 2-state int); new / delete /
                 // copy are statements whose type is never queried.
                 return { 32, false, true };
-            case Inst::Tag::QueueOp: {
-                // pop_front/back yield one element (the queue's element type);
-                // size() is a definite 2-state int; the rest are statements whose
-                // type is never queried.
-                const auto qi = ir_->extra_data<QueueInfo>(p.op_extra.extra);
-                if (qi.sub == static_cast<uint32_t>(QueueOp::PopFront) ||
-                    qi.sub == static_cast<uint32_t>(QueueOp::PopBack)) {
-                    return from_ref(std::get<Type>(mod_.pool.get(qi.queue_type)).element);
-                }
+            case Inst::Tag::QueuePopBack:
+            case Inst::Tag::QueuePopFront:
+                // One element of the queue's element type, straight off the
+                // payload's Queue type.
+                return from_ref(std::get<Type>(mod_.pool.get(p.op_type.type)).element);
+            case Inst::Tag::QueueSize:
+            case Inst::Tag::QueuePushBack:
+            case Inst::Tag::QueuePushFront:
+            case Inst::Tag::QueueInsert:
+            case Inst::Tag::QueueDeleteIdx:
+            case Inst::Tag::QueueDeleteAll:
+            case Inst::Tag::QueueCopy:
+                // size() is a definite 2-state int; the rest are statements
+                // whose type is never queried.
                 return { 32, false, true };
-            }
 
             case Inst::Tag::Add:
             case Inst::Tag::Sub:
@@ -6945,8 +6949,32 @@ private:
                 lower_dyn_array_op(i);
                 return;
 
-            case Inst::Tag::QueueOp:
-                lower_queue_op(i);
+            case Inst::Tag::QueueSize:
+                lower_queue_size(i);
+                return;
+            case Inst::Tag::QueuePushBack:
+                lower_queue_push(i, /*front=*/false);
+                return;
+            case Inst::Tag::QueuePushFront:
+                lower_queue_push(i, /*front=*/true);
+                return;
+            case Inst::Tag::QueuePopBack:
+                lower_queue_pop(i, /*front=*/false);
+                return;
+            case Inst::Tag::QueuePopFront:
+                lower_queue_pop(i, /*front=*/true);
+                return;
+            case Inst::Tag::QueueInsert:
+                lower_queue_insert(i);
+                return;
+            case Inst::Tag::QueueDeleteIdx:
+                lower_queue_delete_idx(i);
+                return;
+            case Inst::Tag::QueueDeleteAll:
+                lower_queue_delete_all(i);
+                return;
+            case Inst::Tag::QueueCopy:
+                lower_queue_copy(i);
                 return;
 
             case Inst::Tag::Constant: {
@@ -7930,69 +7958,74 @@ private:
         return llvm::ConstantStruct::get(e.slot_ty, fields);
     }
 
-    // Lower a queue_op instruction: size / push* / pop* / insert / delete / copy
-    // over the handle lvalue (LRM 7.10.2). Indexed element access q[i] rides the
-    // ElemSelect queue path, not this. Element values cross to the runtime through
-    // a scratch element slot (push / insert stage the value in; pop copies out).
-    void lower_queue_op(Index i) {
-        const Inst::Payload& p      = ir_->payload(i);
-        const auto           qi     = ir_->extra_data<QueueInfo>(p.op_extra.extra);
-        const LValue&        lv     = lvalue_of(p.op_extra.op);
-        llvm::Value*         handle = lv.base;
-        const Ref            arr_ty = qi.queue_type;
-        const DynElem        e      = dynarr_elem(arr_ty);
-        llvm::Value*         stride = b_.getInt64(dynarr_stride(e));
-        llvm::Value*         bound  = b_.getInt64(std::get<Type>(mod_.pool.get(arr_ty)).left);
-        switch (static_cast<QueueOp>(qi.sub)) {
-            case QueueOp::Size: {
-                llvm::Value* len =
-                  b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 2));
-                set_value(i, two_val(cast(len, 32, false)));
-                return;
-            }
-            case QueueOp::PushBack:
-            case QueueOp::PushFront: {
-                const bool front   = static_cast<QueueOp>(qi.sub) == QueueOp::PushFront;
-                auto*      scratch = entry_alloca(e.slot_ty, "q.elem");
-                lower_store(elem_scratch_lvalue(scratch, e), value_of(qi.val));
-                b_.CreateCall(queue_push_fn(front), { handle, stride, bound, scratch });
-                return;
-            }
-            case QueueOp::PopBack:
-            case QueueOp::PopFront: {
-                const bool front   = static_cast<QueueOp>(qi.sub) == QueueOp::PopFront;
-                auto*      scratch = entry_alloca(e.slot_ty, "q.elem");
-                // Pre-fill with the default: the runtime leaves an empty-queue pop
-                // untouched, so the load below then reads the element default.
-                b_.CreateStore(elem_default_const(e), scratch);
-                b_.CreateCall(queue_pop_fn(front), { handle, stride, scratch });
-                Plane         v = lower_load(elem_scratch_lvalue(scratch, e));
-                const ValType t = type_of(i);
-                if (t.is_real) {
-                    v = real_plane(planes_to_real(v, t.width));
-                }
-                set_value(i, v);
-                return;
-            }
-            case QueueOp::Insert: {
-                auto* scratch = entry_alloca(e.slot_ty, "q.elem");
-                lower_store(elem_scratch_lvalue(scratch, e), value_of(qi.val));
-                llvm::Value* idx = cast(must_of(value_of(qi.idx)), 64, false);
-                b_.CreateCall(queue_insert_fn(), { handle, stride, bound, idx, scratch });
-                return;
-            }
-            case QueueOp::DeleteIdx: {
-                llvm::Value* idx = cast(must_of(value_of(qi.idx)), 64, false);
-                b_.CreateCall(queue_delete_idx_fn(), { handle, stride, idx });
-                return;
-            }
-            case QueueOp::DeleteAll:
-                b_.CreateCall(queue_delete_all_fn(), { handle });
-                return;
-            case QueueOp::Copy:
-                b_.CreateCall(queue_assign_fn(), { handle, lvalue_of(qi.val).base, stride });
-                return;
+    // Queue operations over the handle lvalue (LRM 7.10.2). Indexed element
+    // access q[i] rides the ElemSelect queue path, not these. Element values
+    // cross to the runtime through a scratch element slot (push / insert stage
+    // the value in; pop copies out).
+    void lower_queue_size(Index i) {
+        llvm::Value* handle = lvalue_of(ir_->payload(i).op_type.op).base;
+        llvm::Value* len =
+          b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 2));
+        set_value(i, two_val(cast(len, 32, false)));
+    }
+
+    void lower_queue_push(Index i, bool front) {
+        const auto&   p       = ir_->payload(i).op_extra;
+        const auto    qa      = ir_->extra_data<QueueArg>(p.extra);
+        const DynElem e       = dynarr_elem(qa.queue_type);
+        auto*         scratch = entry_alloca(e.slot_ty, "q.elem");
+        lower_store(elem_scratch_lvalue(scratch, e), value_of(qa.arg));
+        llvm::Value* stride = b_.getInt64(dynarr_stride(e));
+        llvm::Value* bound  = b_.getInt64(std::get<Type>(mod_.pool.get(qa.queue_type)).left);
+        b_.CreateCall(queue_push_fn(front), { lvalue_of(p.op).base, stride, bound, scratch });
+    }
+
+    void lower_queue_pop(Index i, bool front) {
+        const auto&   p       = ir_->payload(i).op_type;
+        const DynElem e       = dynarr_elem(p.type);
+        auto*         scratch = entry_alloca(e.slot_ty, "q.elem");
+        // Pre-fill with the default: the runtime leaves an empty-queue pop
+        // untouched, so the load below then reads the element default.
+        b_.CreateStore(elem_default_const(e), scratch);
+        b_.CreateCall(queue_pop_fn(front),
+                      { lvalue_of(p.op).base, b_.getInt64(dynarr_stride(e)), scratch });
+        Plane         v = lower_load(elem_scratch_lvalue(scratch, e));
+        const ValType t = type_of(i);
+        if (t.is_real) {
+            v = real_plane(planes_to_real(v, t.width));
         }
+        set_value(i, v);
+    }
+
+    void lower_queue_insert(Index i) {
+        const auto&   p       = ir_->payload(i).op_extra;
+        const auto    qi      = ir_->extra_data<QueueInsertInfo>(p.extra);
+        const DynElem e       = dynarr_elem(qi.queue_type);
+        auto*         scratch = entry_alloca(e.slot_ty, "q.elem");
+        lower_store(elem_scratch_lvalue(scratch, e), value_of(qi.val));
+        llvm::Value* idx    = cast(must_of(value_of(qi.idx)), 64, false);
+        llvm::Value* stride = b_.getInt64(dynarr_stride(e));
+        llvm::Value* bound  = b_.getInt64(std::get<Type>(mod_.pool.get(qi.queue_type)).left);
+        b_.CreateCall(queue_insert_fn(), { lvalue_of(p.op).base, stride, bound, idx, scratch });
+    }
+
+    void lower_queue_delete_idx(Index i) {
+        const auto&  p      = ir_->payload(i).op_extra;
+        const auto   qa     = ir_->extra_data<QueueArg>(p.extra);
+        llvm::Value* stride = b_.getInt64(dynarr_stride(dynarr_elem(qa.queue_type)));
+        llvm::Value* idx    = cast(must_of(value_of(qa.arg)), 64, false);
+        b_.CreateCall(queue_delete_idx_fn(), { lvalue_of(p.op).base, stride, idx });
+    }
+
+    void lower_queue_delete_all(Index i) {
+        b_.CreateCall(queue_delete_all_fn(), { lvalue_of(ir_->payload(i).op_type.op).base });
+    }
+
+    void lower_queue_copy(Index i) {
+        const auto&  p      = ir_->payload(i).op_extra;
+        const auto   qa     = ir_->extra_data<QueueArg>(p.extra);
+        llvm::Value* stride = b_.getInt64(dynarr_stride(dynarr_elem(qa.queue_type)));
+        b_.CreateCall(queue_assign_fn(), { lvalue_of(p.op).base, lvalue_of(qa.arg).base, stride });
     }
 
     void lower_store(const LValue& lv, Plane rhs) {

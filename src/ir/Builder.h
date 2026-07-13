@@ -111,8 +111,9 @@ public:
     // dst = src: deep copy of another dynamic array (value semantics).
     Index dyn_array_copy(Index dst, Index src, Ref array_type, SourceLoc loc);
     // Queue operations on the handle lvalue `q` (LRM 7.10.2). size / pop* yield
-    // a value; push* / insert / delete / copy are statements. See ir::QueueOp.
-    // `queue_type` is the interned Queue type (element stride / slot / bound).
+    // a value; push* / insert / delete / copy are statements. Each emits its
+    // dedicated Queue* tag. `queue_type` is the interned Queue type (element
+    // stride / slot / bound).
     // q.size(): current element count (32-bit int).
     Index queue_size(Index q, Ref queue_type, SourceLoc loc);
     // q.push_back(e) / q.push_front(e): append the element value `elem`.
