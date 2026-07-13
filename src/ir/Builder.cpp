@@ -349,7 +349,7 @@ Index Builder::wait(std::span<const WaitEdge> events, SourceLoc loc) {
     const ExtraIndex info = add_extra(
       WaitInfo{ ExtraSlice{ static_cast<ExtraIndex>(start), static_cast<ExtraIndex>(end) } });
 
-    return emit({ Inst::Tag::Wait, pay(&Inst::Payload::wait, info) }, loc);
+    return emit({ Inst::Tag::Wait, pay(&Inst::Payload::extra, info) }, loc);
 }
 
 Index Builder::call(FunctionId func, std::span<const Index> args, SourceLoc loc) {
@@ -399,7 +399,7 @@ Index Builder::display_impl(Index fd, bool has_fd, std::string_view fmt, bool ne
     const ExtraIndex extra  = add_extra(DisplayInfo{
       fmt_at, static_cast<uint32_t>(fmt.size()), newline ? 1u : 0u, fd, has_fd ? 1u : 0u, slice });
 
-    return emit({ Inst::Tag::Display, pay(&Inst::Payload::display, extra) }, loc);
+    return emit({ Inst::Tag::Display, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
 Index Builder::fopen(Index name, Index mode, bool has_mode, SourceLoc loc) {
@@ -521,7 +521,7 @@ Index Builder::timeformat(Index units, Index precision, std::string_view suffix,
     const ExtraIndex extra     = add_extra(
       TimeFormatInfo{ units, precision, min_width, suffix_at, static_cast<uint32_t>(suffix.size()) });
 
-    return emit({ Inst::Tag::TimeFormat, pay(&Inst::Payload::timeformat, extra) }, loc);
+    return emit({ Inst::Tag::TimeFormat, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
 Index Builder::dump_file(Index filename, SourceLoc loc) {

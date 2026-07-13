@@ -1362,16 +1362,11 @@ struct Inst {
             // Handle to the op's extra payload.
             ExtraIndex extra;
         } op_extra;
-        // Handle to a variable-length operand slice (concat).
+        // Handle to a variable-length operand slice (concat) or to a tag's
+        // extra record with no primary operand (loop, call, display, wait,
+        // timeformat, ...). The record type is selected by the tag's
+        // PayloadKind.
         ExtraIndex extra;
-        // Handle to a DisplayInfo extra record (display).
-        ExtraIndex display;
-        // Handle to a TimeFormatInfo extra record (timeformat).
-        ExtraIndex timeformat;
-        // Handle to a WaitInfo extra record (wait): the list of (signal, edge)
-        // events to suspend on. The process wakes when ANY of them fires. No SSA
-        // operands.
-        ExtraIndex wait;
     };
 
     // Discriminant selecting the active payload member.

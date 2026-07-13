@@ -2783,7 +2783,7 @@ private:
                 if (p.ir.tag(idx) != Inst::Tag::Wait) {
                     continue;
                 }
-                for (const WaitEdge& we : p.ir.wait_edges(p.ir.payload(idx).wait)) {
+                for (const WaitEdge& we : p.ir.wait_edges(p.ir.payload(idx).extra)) {
                     const std::pair<Signal, uint32_t> key{ we.signal, we.edge };
                     if (!std::ranges::contains(seen, key)) {
                         seen.push_back(key);
@@ -2812,7 +2812,7 @@ private:
                     if (f.ir.tag(idx) != Inst::Tag::Wait) {
                         continue;
                     }
-                    for (const WaitEdge& we : f.ir.wait_edges(f.ir.payload(idx).wait)) {
+                    for (const WaitEdge& we : f.ir.wait_edges(f.ir.payload(idx).extra)) {
                         task_waits[static_cast<uint32_t>(we.signal)][we.edge] = true;
                     }
                 }
@@ -7138,7 +7138,7 @@ private:
 
             case Inst::Tag::Wait:
                 ++cur_seg_epoch_;
-                lower_wait(p.wait);
+                lower_wait(p.extra);
                 return;
 
             case Inst::Tag::EventTrigger:
@@ -8597,7 +8597,7 @@ private:
     // hand them, plus the literal suffix, to the runtime setter. The operands were
     // lowered earlier in this region, so their values are available.
     void lower_timeformat(Index i) {
-        const auto   info  = ir_->extra_data<TimeFormatInfo>(ir_->payload(i).timeformat);
+        const auto   info  = ir_->extra_data<TimeFormatInfo>(ir_->payload(i).extra);
         llvm::Value* units = cast(must_of(value_of(info.units)), 32, true);
         llvm::Value* prec  = cast(must_of(value_of(info.precision)), 32, true);
         llvm::Value* width = cast(must_of(value_of(info.min_width)), 32, true);
@@ -10337,7 +10337,7 @@ private:
     // Lower a $display / $write / $fdisplay / $fwrite: build the descriptor array
     // and call the runtime formatter with the destination descriptor.
     void lower_display(Index i) {
-        const auto  info = ir_->extra_data<DisplayInfo>(ir_->payload(i).display);
+        const auto  info = ir_->extra_data<DisplayInfo>(ir_->payload(i).extra);
         std::string fmt  = ir_->extra_bytes(info.fmt, info.fmt_len);
         if (info.newline) {
             fmt += '\n';

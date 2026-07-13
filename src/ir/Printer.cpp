@@ -463,7 +463,7 @@ private:
                 os_ << "s" << static_cast<uint32_t>(p.signal);
                 break;
             case Inst::PayloadKind::Wait: {
-                const auto events = ir_.wait_edges(p.wait);
+                const auto events = ir_.wait_edges(p.extra);
                 for (size_t k = 0; k < events.size(); ++k) {
                     if (k != 0) {
                         os_ << " or ";
@@ -543,7 +543,7 @@ private:
                 break;
             }
             case Inst::PayloadKind::Display: {
-                const auto info = ir_.extra_data<DisplayInfo>(p.display);
+                const auto info = ir_.extra_data<DisplayInfo>(p.extra);
                 os_ << '"' << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
                 for (Index a : ir_.region(info.args)) {
                     os_ << ", ";
@@ -618,7 +618,7 @@ private:
                 break;
             }
             case Inst::PayloadKind::TimeFormat: {
-                const auto info = ir_.extra_data<TimeFormatInfo>(p.timeformat);
+                const auto info = ir_.extra_data<TimeFormatInfo>(p.extra);
                 ref(info.units);
                 os_ << ", ";
                 ref(info.precision);

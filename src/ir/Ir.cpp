@@ -246,7 +246,7 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
         case Inst::PayloadKind::Display: {
             // display: the value args are an index slice in the DisplayInfo record;
             // the format string is not an SSA operand.
-            const auto info = extra_data<DisplayInfo>(p.display);
+            const auto info = extra_data<DisplayInfo>(p.extra);
             return index_slice(info.args);
         }
 
@@ -302,7 +302,7 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
         case Inst::PayloadKind::TimeFormat: {
             // timeformat: units / precision / min_width are SSA operands; the
             // suffix bytes are not.
-            const auto info = extra_data<TimeFormatInfo>(p.timeformat);
+            const auto info = extra_data<TimeFormatInfo>(p.extra);
             scratch[0]      = info.units;
             scratch[1]      = info.precision;
             scratch[2]      = info.min_width;
