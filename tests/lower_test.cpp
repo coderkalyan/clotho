@@ -1376,3 +1376,25 @@ TEST_CASE("a matches pattern in a conditional expression fails loudly") {
     CHECK_FALSE(r.ok);
     CHECK(r.diagnostics.find("pattern matching in conditions") != std::string::npos);
 }
+
+// A compilation unit with no top-level module/interface/program instance
+// (e.g. a package-only file) has nothing to simulate, but is not an
+// elaboration error (LRM 23.3 resolves whatever top instances exist; nothing
+// obligates a compilation unit to declare any).
+TEST_CASE("a package-only source with no module compiles successfully") {
+    const LowerResult r = lower_text(R"(
+        package p;
+            parameter int W = 8;
+            function int double_w(); return W * 2; endfunction
+        endpackage
+    )");
+    CHECK_MESSAGE(r.ok, r.diagnostics);
+    CHECK(r.module != nullptr);
+}
+
+// Same for a bare $unit-scope declaration with no module at all.
+TEST_CASE("a source with only a $unit-scope declaration compiles successfully") {
+    const LowerResult r = lower_text("parameter int W = 8;");
+    CHECK_MESSAGE(r.ok, r.diagnostics);
+    CHECK(r.module != nullptr);
+}

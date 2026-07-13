@@ -9055,10 +9055,15 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
     if (timings != nullptr) {
         timings->frontend_ms += ms_since(t_fe);
     }
-    if (root.topInstances.empty()) {
-        result.diagnostics += "error: no top-level module found\n";
-        return result;
-    }
+
+    // A compilation unit with no top-level module/interface/program instance
+    // (e.g. a package-only file) is not an elaboration error -- LRM
+    // elaboration (§23.3) resolves whatever top instances exist; nothing
+    // obligates a compilation unit to declare any. It simply has nothing to
+    // simulate: globals (package / $unit-scope declarations) still lower
+    // below so --emit=ir can show them and package-scope errors are still
+    // caught, but the loop over root.topInstances runs zero times and the
+    // resulting module carries no processes or per-instance signals.
 
     // Analysis: walk the elaborated AST into clotho IR. The wheel tick is the
     // design's smallest time unit; if no design unit set a timescale, time stays
@@ -9106,9 +9111,11 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
     // references it): a dedicated Lowerer registers them once, up front, and its
     // symbol->signal entries seed every top's own map below.
     const bool single = root.topInstances.size() == 1;
-    module->top_name  = std::string(root.topInstances[0]->name); // DPI svScope name
-    if (!single) {
-        module->name = std::string(root.topInstances[0]->name);
+    if (!root.topInstances.empty()) {
+        module->top_name = std::string(root.topInstances[0]->name); // DPI svScope name
+        if (!single) {
+            module->name = std::string(root.topInstances[0]->name);
+        }
     }
     if (!single && !comp.getDPIExports().empty()) {
         // A context export runs in a specific instance's scope (svScope, LRM
