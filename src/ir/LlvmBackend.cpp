@@ -8988,6 +8988,11 @@ private:
             }
             return m;
         }
+        if (t.kind == Type::Kind::DynArray || t.kind == Type::Kind::Queue) {
+            // A handle leaf is never a nonblocking target (frontend-guarded),
+            // so it contributes nothing to the record payload size.
+            return 0;
+        }
         llvm::Type* slot = t.kind == Type::Kind::String ? static_cast<llvm::Type*>(str_slot_ty())
                                                         : agg_leaf_slot_ty(type);
         return static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(slot));

@@ -1013,3 +1013,59 @@ TEST_CASE("nested member select of a constant struct folds") {
         endmodule
     )") == "11 22 3\n");
 }
+
+TEST_CASE("2-state and real members compute and copy through narrow leaf slots") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { bit [15:0] b; int i; real r; logic [7:0] l; } t;
+            t a, b2;
+            initial begin
+                a.b = 16'hBEEF; a.i = -7; a.r = 2.5; a.l = 8'h5A;
+                a.i = a.i + 10;
+                a.r = a.r * 2.0;
+                b2 = a;
+                a.b = 0;
+                $display("%h %0d %g %h", b2.b, b2.i, b2.r, b2.l);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "beef 3 5 5a\n");
+}
+
+TEST_CASE("NBA to a 2-state member commits through the narrow shadow") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int i; logic [7:0] l; } t;
+            t s;
+            logic clk = 0;
+            always @(posedge clk) begin
+                s.i <= 41 + 1;
+                s.l <= 8'hCD;
+            end
+            initial begin
+                #1 clk = 1;
+                #1 $display("%0d %h", s.i, s.l);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "42 cd\n");
+}
+
+TEST_CASE("NBA to a narrow leaf under an array index uses the deferred record") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int i; logic [7:0] l; } t;
+            t arr [2];
+            logic clk = 0;
+            always @(posedge clk) begin
+                arr[1].i <= 7;
+                arr[1].l <= 8'h3C;
+            end
+            initial begin
+                #1 clk = 1;
+                #1 $display("%0d %h %0d", arr[1].i, arr[1].l, arr[0].i);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "7 3c 0\n");
+}
