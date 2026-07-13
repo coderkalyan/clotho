@@ -232,6 +232,7 @@ struct DpiExport {
     FunctionId            func;
     std::string           extern_name;   // C linkage name (the c_identifier)
     std::vector<DpiCType> arg_ctypes;    // parallel to the function's formals
+    std::vector<ArgDir>   arg_dirs;      // direction of each formal (In / Out / Inout)
     DpiCType              ret_ctype;
 };
 

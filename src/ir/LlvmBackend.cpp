@@ -9881,35 +9881,112 @@ private:
         }
     }
 
+    // The C-visible parameter type of an export formal: an input scalar passes by
+    // value; output/inout scalars, packed vectors (any direction), and input
+    // strings pass by pointer — mirroring declare_dpi_import.
+    llvm::Type* dpi_export_c_param_ty(DpiCType ct, ArgDir dir) {
+        if (is_dpi_vec(ct) || ct == DpiCType::String || dir != ArgDir::In) {
+            return raw_ptr_ty();
+        }
+        return dpi_c_llvm_ty(ct);
+    }
+
+    // Convert a Plane (a value the C side provided) into the SV function's input
+    // formal ABI — the packed (mm, z) pair, appended to argv (real via
+    // real_to_planes). Shared by scalar and vec input args.
+    void dpi_push_plane_arg(std::vector<llvm::Value*>& argv, Plane pl) {
+        const Plane four = pl.fp != nullptr ? real_to_planes(fp_of(pl)) : to_four(pl);
+        argv.push_back(four.mm);
+        argv.push_back(four.z);
+    }
+
     // A C-callable entry point `<c_ret> <cid>(<c_args>)` (external linkage) that
     // marshals C arguments into the SV function's plane ABI, calls it against the
-    // design-state global, and marshals the result back to C. V1: input
-    // scalar/chandle args, scalar/chandle/void return (the frontend guards the
-    // rest). The marshal reuses the import helpers in reverse.
+    // design-state global, and marshals results back to C. Input scalar/chandle/
+    // real/vec and input string args; output/inout scalar/chandle/real/vec args;
+    // scalar/chandle/real/void return (the frontend guards the rest). The marshal
+    // reuses the import helpers in reverse.
     void emit_dpi_export(const DpiExport& ex) {
         const Function& f    = mod_.function(ex.func);
         llvm::Function* svfn = fn_decls_[static_cast<uint32_t>(ex.func)];
 
         std::vector<llvm::Type*> cparams;
         cparams.reserve(ex.arg_ctypes.size());
-        for (DpiCType ct : ex.arg_ctypes) {
-            cparams.push_back(dpi_c_llvm_ty(ct));
+        for (size_t k = 0; k < ex.arg_ctypes.size(); ++k) {
+            cparams.push_back(dpi_export_c_param_ty(ex.arg_ctypes[k], ex.arg_dirs[k]));
         }
         auto* fnty  = llvm::FunctionType::get(dpi_c_llvm_ty(ex.ret_ctype), cparams, false);
         auto* thunk = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, ex.extern_name, llmod_);
         b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", thunk));
 
-        // state pointer, then each formal as its (mm, z) plane pair — the same ABI
-        // lower_call_inst builds for an input scalar formal (real via real_to_planes).
+        // Output / inout copy-back after the call: the (mm, z) plane cells the SV
+        // function wrote, plus the C pointer to store the result through.
+        struct ExpOut {
+            llvm::Value* c_ptr;   // the C output pointer (scalar*) or svVecVal*
+            llvm::Value* mm_ptr;  // SV out ABI: i(2W) cell
+            llvm::Value* z_ptr;   // SV out ABI: iW cell
+            DpiCType     ct;
+            uint32_t     w;
+        };
+        std::vector<ExpOut>       outs;
+        std::vector<llvm::Value*> str_temps; // input rt_string handles to deinit
+
         std::vector<llvm::Value*> argv;
         argv.push_back(state_global_);
         for (size_t k = 0; k < ex.arg_ctypes.size(); ++k) {
-            const Plane pl   = dpi_c_to_plane(ex.arg_ctypes[k], thunk->getArg(k));
-            const Plane four = pl.fp != nullptr ? real_to_planes(fp_of(pl)) : to_four(pl);
-            argv.push_back(four.mm);
-            argv.push_back(four.z);
+            const DpiCType ct     = ex.arg_ctypes[k];
+            const ArgDir   dir    = ex.arg_dirs[k];
+            const uint32_t w      = width_of(f.param_types[k]);
+            llvm::Value*   cparam = thunk->getArg(k);
+
+            if (ct == DpiCType::String) { // input only (guarded)
+                auto* h = entry_alloca(str_slot_ty(), "dpi.exp.str");
+                b_.CreateCall(str_init_fn(), { h });
+                b_.CreateCall(dpi_str_out_fn(), { h, cparam }); // h = the C const char*
+                argv.push_back(h);
+                str_temps.push_back(h);
+            } else if (dir == ArgDir::In) {
+                // Input value -> plane. A vec unpacks the C svVecVal; a scalar decodes
+                // the C value directly.
+                const Plane pl = is_dpi_vec(ct) ? dpi_vec_copyout(ct, cparam, w)
+                                                : dpi_c_to_plane(ct, cparam);
+                dpi_push_plane_arg(argv, pl);
+            } else {
+                // output / inout: the SV ABI is two pointers to (i(2W) mm, iW z)
+                // cells the callee writes. inout copies the C value in first.
+                llvm::Value* mm_ptr = entry_alloca(int_ty(2 * w), "dpi.exp.mm");
+                llvm::Value* z_ptr  = entry_alloca(int_ty(w), "dpi.exp.z");
+                if (dir == ArgDir::Inout) {
+                    const Plane pl = is_dpi_vec(ct)
+                                       ? dpi_vec_copyout(ct, cparam, w)
+                                       : dpi_c_to_plane(ct, b_.CreateLoad(dpi_c_llvm_ty(ct), cparam));
+                    const Plane four = pl.fp != nullptr ? real_to_planes(fp_of(pl)) : to_four(pl);
+                    b_.CreateStore(four.mm, mm_ptr);
+                    b_.CreateStore(four.z, z_ptr);
+                }
+                argv.push_back(mm_ptr);
+                argv.push_back(z_ptr);
+                outs.push_back({ cparam, mm_ptr, z_ptr, ct, w });
+            }
         }
+
         llvm::Value* r = b_.CreateCall(svfn->getFunctionType(), svfn, argv);
+
+        // Copy each output / inout result back to its C pointer.
+        for (const ExpOut& o : outs) {
+            Plane pl{ b_.CreateLoad(int_ty(2 * o.w), o.mm_ptr), b_.CreateLoad(int_ty(o.w), o.z_ptr) };
+            if (is_dpi_vec(o.ct)) {
+                dpi_vec_copyin(o.ct, pl, o.w, o.c_ptr); // plane -> C svVecVal
+            } else {
+                if (o.ct == DpiCType::Real || o.ct == DpiCType::Shortreal) {
+                    pl = real_plane(planes_to_real(pl, o.w));
+                }
+                b_.CreateStore(dpi_arg_to_c(o.ct, pl), o.c_ptr);
+            }
+        }
+        for (llvm::Value* h : str_temps) {
+            b_.CreateCall(str_deinit_fn(), { h });
+        }
 
         if (ex.ret_ctype == DpiCType::Void) {
             b_.CreateRetVoid();

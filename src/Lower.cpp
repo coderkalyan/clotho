@@ -7903,24 +7903,14 @@ private:
                                                .ir             = b.finish() });
     }
 
-    // Classify a DPI export formal / return type, restricted to V1's by-value
-    // scalar set (scalar / chandle / real). Packed vectors and strings are deferred
-    // (the reverse svVecVal / rt_string thunk marshal is the follow-up).
-    ir::DpiCType dpi_export_ctype(const slang::ast::Type& type, const char* what) {
-        const auto c = dpi_ctype(type);
-        if (!c.has_value() || *c == ir::DpiCType::BitVec || *c == ir::DpiCType::LogicVec ||
-            *c == ir::DpiCType::String) {
-            fail(std::string("DPI export ") + what +
-                 " type is not supported yet (scalar and chandle types only)");
-        }
-        return *c;
-    }
-
     // Collect `export "DPI-C"` directives (LRM 35.5): for each, force-lower the SV
     // function and record a DpiExport so the backend emits its C-callable thunk.
     // slang resolves the export -> subroutine binding and the c_identifier
-    // (Compilation::getDPIExports). V1 scope: functions, input args, scalar/chandle
-    // types — everything else loud-fails. Public: called by lower_compilation.
+    // (Compilation::getDPIExports). Scope: functions; input/output/inout scalar /
+    // chandle / real / packed-vector args; input string args; scalar/chandle/real/
+    // void return. Deferred (loud-fail): string return (returned-char* lifetime),
+    // output/inout string, open-array/unpacked args, tasks. Public: called by
+    // lower_compilation.
 public:
     void collect_dpi_exports(const slang::ast::Compilation& comp) {
         for (const auto& ex : comp.getDPIExports()) {
@@ -7932,19 +7922,38 @@ public:
             }
             ir::DpiCType ret_ct = ir::DpiCType::Void;
             if (!sub.getReturnType().isVoid()) {
-                ret_ct = dpi_export_ctype(sub.getReturnType(), "return");
+                const auto c = dpi_ctype(sub.getReturnType());
+                if (!c.has_value() || *c == ir::DpiCType::BitVec ||
+                    *c == ir::DpiCType::LogicVec || *c == ir::DpiCType::String) {
+                    // slang rejects a packed-array return; a string return is deferred
+                    // (the returned char* would dangle past the thunk).
+                    fail("DPI export return type is not supported "
+                         "(scalar/chandle/real; string return is deferred)");
+                }
+                ret_ct = *c;
             }
             std::vector<ir::DpiCType> arg_cts;
+            std::vector<ir::ArgDir>   arg_dirs;
             for (const FormalArgumentSymbol* fa : sub.getArguments()) {
-                if (fa->direction != slang::ast::ArgumentDirection::In) {
-                    // TODO: output / inout export formals (copy back to the C pointer).
-                    fail("DPI export output/inout arguments are not supported");
+                if (fa->direction == slang::ast::ArgumentDirection::Ref) {
+                    fail("DPI export ref arguments are not supported");
                 }
-                arg_cts.push_back(dpi_export_ctype(fa->getType(), "argument"));
+                const auto c = dpi_ctype(fa->getType());
+                if (!c.has_value()) {
+                    fail("DPI export argument type is not supported "
+                         "(open-array / unpacked aggregate)");
+                }
+                if (*c == ir::DpiCType::String &&
+                    fa->direction != slang::ast::ArgumentDirection::In) {
+                    // TODO: output / inout string (unbounded C-written char*).
+                    fail("DPI export output/inout string arguments are not supported");
+                }
+                arg_cts.push_back(*c);
+                arg_dirs.push_back(to_arg_dir(fa->direction));
             }
             const ir::FunctionId id = function_id(sub); // force-lower the SV function
-            module_.dpi_exports.push_back(
-              ir::DpiExport{ id, std::string(ex.cIdentifier), std::move(arg_cts), ret_ct });
+            module_.dpi_exports.push_back(ir::DpiExport{
+              id, std::string(ex.cIdentifier), std::move(arg_cts), std::move(arg_dirs), ret_ct });
         }
     }
 
