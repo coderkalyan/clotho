@@ -1629,6 +1629,13 @@ private:
     friend class Builder;
 
     // A slice reinterpreted as a run of instruction indices.
+    //
+    // NOTE: viewing u32 extra words as enum-class handles (here and in
+    // wait_edges) is formally an aliasing violation — an enum is not
+    // aliasing-compatible with its underlying type ([basic.lval]). Accepted
+    // deliberately: the representation is identical, every compiler this
+    // builds on reads it as intended, and the alternative (per-element
+    // copies) costs the zero-copy view this layout exists for.
     std::span<const Index> index_slice(ExtraSlice s) const {
         const auto a = static_cast<uint32_t>(s.start);
         const auto b = static_cast<uint32_t>(s.end);
