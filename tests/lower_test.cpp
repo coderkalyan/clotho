@@ -258,6 +258,49 @@ TEST_CASE("a real (fractional) delay is reported as unsupported") {
     CHECK(r.diagnostics.find("delay") != std::string::npos);
 }
 
+// LRM 6.5 / 10.3.2: "shall be an error" for a variable driven by more than one
+// continuous assignment, or by a mix of continuous and procedural assignments.
+// slang defaults both to warnings; Clotho promotes them to errors (its signal
+// model has no multi-driver resolution for variables, so silently keeping the
+// default severity would mean one driver is silently dropped).
+TEST_CASE("mixing continuous and procedural assignment to a variable is an error") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            logic a;
+            assign a = 1'b0;
+            initial a = 1'b1;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("cannot mix continuous and procedural assignments") != std::string::npos);
+}
+
+TEST_CASE("multiple continuous assignments to a variable is an error") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            logic a;
+            assign a = 1'b0;
+            assign a = 1'b1;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("cannot have multiple continuous assignments") != std::string::npos);
+}
+
+// slang also defaults a same-scope name redefinition to a warning and
+// silently keeps one declaration; Clotho's symbol table has no "last one
+// wins" rule, so this is promoted to an error too.
+TEST_CASE("redefining a name in the same scope is an error") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            logic a;
+            logic a;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("redefinition of") != std::string::npos);
+}
+
 TEST_CASE("$timeformat with a non-literal suffix is reported as unsupported") {
     // The suffix must be a compile-time string literal; a string parameter
     // reference has no runtime string representation yet, so it is rejected.

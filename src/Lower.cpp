@@ -49,6 +49,7 @@
 #include <slang/analysis/AnalysisManager.h>
 #include <slang/diagnostics/AnalysisDiags.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
+#include <slang/diagnostics/LookupDiags.h>
 #include <slang/diagnostics/TextDiagnosticClient.h>
 #include <slang/driver/Driver.h>
 #include <slang/numeric/Time.h>
@@ -8798,6 +8799,21 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
         // downgrade to a warning.
         engine.setSeverity(slang::diag::AlwaysWithoutTimingControl,
                            slang::DiagnosticSeverity::Warning);
+        // LRM 6.5 / 10.3.2 both use normative "shall be an error" for a
+        // variable driven by more than one continuous assignment, or by a mix
+        // of continuous and procedural assignments -- slang defaults these to
+        // warnings. Clotho's signal model has one driver per variable slot
+        // with no multi-driver resolution, so silently keeping the default
+        // severity would mean one of the conflicting drivers is silently
+        // dropped instead of the design being rejected.
+        engine.setSeverity(slang::diag::MixedVarAssigns, slang::DiagnosticSeverity::Error);
+        engine.setSeverity(slang::diag::MultipleContAssigns, slang::DiagnosticSeverity::Error);
+        // A name redeclared in the same scope: slang also defaults this to a
+        // warning and silently keeps one declaration. Clotho's symbol table
+        // has no "last one wins" rule, so promote to an error rather than
+        // silently favoring whichever declaration slang's lookup resolves to.
+        engine.setSeverity(slang::diag::Redefinition, slang::DiagnosticSeverity::Error);
+        engine.setSeverity(slang::diag::RedefinitionDifferentType, slang::DiagnosticSeverity::Error);
         for (const slang::Diagnostic& d : diags) {
             engine.issue(d);
         }
