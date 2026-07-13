@@ -8963,18 +8963,18 @@ private:
     }
 
     // Lower a unique/priority case violation report: pass the compile-time banner
-    // prefix, the current simulation time, and the message kind (FinishInfo.arg);
-    // the runtime warns and returns, so the region continues. The wheel fallback
-    // mirrors lower_finish: a case inside a pure function has no wheel and reports
+    // prefix, the current simulation time, and the message kind; the runtime
+    // warns and returns, so the region continues. The wheel fallback mirrors
+    // lower_finish: a case inside a pure function has no wheel and reports
     // time 0 (same TODO as $finish).
     void lower_case_viol(Index i) {
-        const auto        info   = ir_->extra_data<FinishInfo>(ir_->payload(i).extra);
+        const auto        info   = ir_->extra_data<CaseViolInfo>(ir_->payload(i).extra);
         const std::string banner = ir_->extra_bytes(info.banner, info.banner_len);
         llvm::Value*      now = has_wheel()
                                   ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
                                   : static_cast<llvm::Value*>(b_.getInt64(0));
         b_.CreateCall(case_violation_fn(),
-                      { b_.CreateGlobalString(banner), now, b_.getInt32(info.arg) });
+                      { b_.CreateGlobalString(banner), now, b_.getInt32(info.kind) });
     }
 
     // void rt_severity(i32 level, ptr banner, ptr fmt, i32 argc, ptr argv) —

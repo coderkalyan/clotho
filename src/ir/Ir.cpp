@@ -49,11 +49,12 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
         case Inst::PayloadKind::Extra: {
             // loop: its predicate and regions are not top-level SSA operands
             // (the predicate lives inside the cond region, walked via region()).
-            // finish: its FinishInfo carries only the diag level and banner bytes,
-            // no SSA operands. test_plusargs: its TestPlusArgsInfo carries only
-            // the query-string bytes, no SSA operands.
+            // finish / case_viol / test_plusargs carry only banner / query
+            // bytes, no SSA operands. fork's children are FunctionIds, not
+            // operands.
             if (tag == Inst::Tag::Loop || tag == Inst::Tag::Finish ||
-                tag == Inst::Tag::TestPlusArgs) {
+                tag == Inst::Tag::CaseViol || tag == Inst::Tag::TestPlusArgs ||
+                tag == Inst::Tag::Fork) {
                 return {};
             }
             // concat: variadic operands live in the extra buffer.

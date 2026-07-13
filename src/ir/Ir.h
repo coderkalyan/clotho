@@ -416,6 +416,19 @@ struct FinishInfo {
     uint32_t arg;
 };
 
+// Extra payload for `case_viol`: a unique/priority violation report (LRM
+// 12.4.2 / 12.5.3). `banner` / `banner_len` are the packed bytes of the
+// compile-time "<file>:<line>: " prefix; `kind` selects the message (0: no
+// item matched, 1: overlapping items).
+struct CaseViolInfo {
+    // First extra word of the packed banner-prefix bytes.
+    ExtraIndex banner;
+    // Banner-prefix length in bytes.
+    uint32_t banner_len;
+    // Violation-message selector: 0 no-match, 1 overlap.
+    uint32_t kind;
+};
+
 // Severity level of a `severity` instruction. Selects the diagnostic label the
 // runtime prints (LRM 20.10); Fatal is `$fatal` (the frontend follows the report
 // with a Finish carrying the finish number, so the report itself never
@@ -690,6 +703,8 @@ static_assert(ExtraPayload<LoopInfo>);
 static_assert(ExtraPayload<SwitchArm>);
 static_assert(ExtraPayload<SwitchInfo>);
 static_assert(ExtraPayload<DisplayInfo>);
+static_assert(ExtraPayload<FinishInfo>);
+static_assert(ExtraPayload<CaseViolInfo>);
 static_assert(ExtraPayload<SeverityInfo>);
 static_assert(ExtraPayload<FseekInfo>);
 static_assert(ExtraPayload<RealMathBinaryInfo>);
@@ -1174,10 +1189,9 @@ struct Inst {
         // mechanism a suspend is observationally an exit, so both are treated
         // identically apart from the banner's task name.
         Finish,
-        // unique/priority violation report (payload: extra -> FinishInfo,
-        // reusing the banner prefix; arg selects the message — 0: no item
-        // matched, 1: overlapping items). LRM 12.5.3 / 12.4.2. Non-fatal —
-        // lowers to an rt_case_violation call that warns and returns.
+        // unique/priority violation report (payload: extra -> CaseViolInfo).
+        // LRM 12.5.3 / 12.4.2. Non-fatal — lowers to an rt_case_violation call
+        // that warns and returns.
         CaseViol,
         // Severity system task report ($info / $warning / $error / $fatal, LRM
         // 20.10) or the default failure of an immediate assertion (LRM 16.3),

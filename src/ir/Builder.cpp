@@ -496,7 +496,7 @@ Index Builder::finish(std::string_view banner, uint32_t arg, SourceLoc loc) {
 Index Builder::case_violation(std::string_view banner, uint32_t kind, SourceLoc loc) {
     const ExtraIndex banner_at = add_bytes(banner);
     const ExtraIndex extra =
-      add_extra(FinishInfo{ banner_at, static_cast<uint32_t>(banner.size()), kind });
+      add_extra(CaseViolInfo{ banner_at, static_cast<uint32_t>(banner.size()), kind });
     return emit({ Inst::Tag::CaseViol, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
