@@ -96,6 +96,10 @@ struct ValType {
     bool is_real = false;
 };
 
+// The type_of memo stores one ValType per instruction; keep it one dense
+// 8-byte word (validity lives in a parallel byte vector, not an optional).
+static_assert(sizeof(ValType) == 8);
+
 // A lowered value: the must/may planes packed into one i(2W) integer (low W bits
 // = must / definitely 1, high W bits = may / could be 1), plus a separate iW `z`
 // (high-impedance marker). Packing lets the monotone ops (AND/OR/NOT, select select)
@@ -1480,7 +1484,8 @@ private:
             const size_t n = ir_->inst_count();
             values_.assign(n, Plane{});
             lvals_.assign(n, std::optional<LValue>{});
-            types_.assign(n, std::optional<ValType>{});
+            types_.resize(n);
+            types_valid_.assign(n, 0);
         };
 
         // Coroutine elision: a suspension-free always-with-sensitivity group (see
@@ -2168,7 +2173,8 @@ private:
         const size_t n = ir_->inst_count();
         values_.assign(n, Plane{});
         lvals_.assign(n, std::optional<LValue>{});
-        types_.assign(n, std::optional<ValType>{});
+        types_.resize(n);
+        types_valid_.assign(n, 0);
         str_vals_.assign(n, nullptr);
 
         auto* entry = llvm::BasicBlock::Create(ctx_, "entry", fn_);
@@ -2239,7 +2245,8 @@ private:
         const size_t n = ir_->inst_count();
         values_.assign(n, Plane{});
         lvals_.assign(n, std::optional<LValue>{});
-        types_.assign(n, std::optional<ValType>{});
+        types_.resize(n);
+        types_valid_.assign(n, 0);
         str_vals_.assign(n, nullptr);
 
         auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
@@ -3947,7 +3954,8 @@ private:
                 // proofs), so bind the member like select_member does; lowering
                 // re-binds later. assume_clean_ is off here — real domains.
                 ir_ = &ir;
-                types_.assign(ir.inst_count(), std::optional<ValType>{});
+                types_.resize(ir.inst_count());
+                types_valid_.assign(ir.inst_count(), 0);
                 if (!spec_eligible_body(ir)) {
                     if (dom_debug_) {
                         fprintf(stderr, "DOM reject g=%u proc=%u insts=%zu first_bad=%d\n", g, m,
@@ -5928,11 +5936,12 @@ private:
 
     ValType type_of(Index i) {
         const auto slot = static_cast<uint32_t>(i);
-        if (types_[slot]) {
-            return *types_[slot];
+        if (types_valid_[slot] != 0) {
+            return types_[slot];
         }
-        const ValType t = domain_fake(compute_type(i));
-        types_[slot]    = t;
+        const ValType t    = domain_fake(compute_type(i));
+        types_[slot]       = t;
+        types_valid_[slot] = 1;
         return t;
     }
 
@@ -12069,9 +12078,14 @@ private:
     llvm::ArrayType*        block_next_ty_        = nullptr;
     llvm::GlobalVariable*   block_head_gv_        = nullptr;    // ptr: first pending block's commit fn
 
-    std::vector<Plane>                  values_;
-    std::vector<std::optional<LValue>>  lvals_;
-    std::vector<std::optional<ValType>> types_;
+    std::vector<Plane>                 values_;
+    std::vector<std::optional<LValue>> lvals_;
+    // Per-instruction type_of memo. Validity lives in a parallel byte vector
+    // instead of std::optional<ValType> (12B/entry from the engaged flag +
+    // padding): entries stay 8B dense, and a body reset only clears the
+    // bitmap — stale types_ values are gated by types_valid_ == 0.
+    std::vector<ValType> types_;
+    std::vector<uint8_t> types_valid_;
     // rt_string handle pointers of string-valued instructions, parallel to
     // values_ (a string never flows as a Plane).
     std::vector<llvm::Value*> str_vals_;
