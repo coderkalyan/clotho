@@ -1618,6 +1618,11 @@ public:
     // of them. Fixed-arity ops use the scratch buffer; variadic ops (concat)
     // return a view straight into the extra buffer. Region bodies are not
     // operands — walk them via region().
+    //
+    // NOTE: not exhaustive for the variadic system tasks — a tag whose args are
+    // an extra slice can also carry a scalar operand outside it, which one
+    // span cannot express: Display omits its fd, Scanf its source. A pass
+    // needing every use of those tags must read their info records directly.
     std::span<const Index> operands(Index inst, std::array<Index, 3>& scratch) const;
 
 private:

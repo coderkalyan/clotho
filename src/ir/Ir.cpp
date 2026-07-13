@@ -155,6 +155,31 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 scratch[1]     = dps.offset;
                 return { scratch.data(), 2 };
             }
+            // fopen exposes its filename value plus the optional mode-string
+            // operand of the two-argument form.
+            if (tag == Inst::Tag::Fopen) {
+                const auto fo = extra_data<FopenInfo>(p.op_extra.extra);
+                size_t     n  = 0;
+                scratch[n++]  = p.op_extra.op;
+                if (fo.has_mode) {
+                    scratch[n++] = fo.mode;
+                }
+                return { scratch.data(), n };
+            }
+            // fread_mem exposes its fd value plus the optional start / count
+            // operands; the target memory is a Signal handle, not an operand.
+            if (tag == Inst::Tag::FreadMem) {
+                const auto fm = extra_data<FreadMemInfo>(p.op_extra.extra);
+                size_t     n  = 0;
+                scratch[n++]  = p.op_extra.op;
+                if (fm.has_start) {
+                    scratch[n++] = fm.start;
+                }
+                if (fm.has_count) {
+                    scratch[n++] = fm.count;
+                }
+                return { scratch.data(), n };
+            }
             // read_mem exposes its filename value plus the optional start / finish
             // address operands; the target memory is a Signal handle, not an operand.
             if (tag == Inst::Tag::ReadMem) {
