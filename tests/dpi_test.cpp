@@ -164,12 +164,58 @@ TEST_CASE("DPI import: unsupported forms are rejected") {
             endmodule)";
         CHECK(lower_fail(src).find("DPI import tasks") != std::string::npos);
     }
-    SUBCASE("context import") {
+}
+
+// `context` (LRM 35.5.3) is accepted and lowers like a plain import — Clotho's
+// single flat design state needs no svScope. Here it lowers and runs (libc strlen).
+TEST_CASE("DPI import: context is accepted") {
+    constexpr std::string_view src = R"(
+        module m;
+          import "DPI-C" context function longint strlen(input string s);
+          initial $display("%0d", strlen("hello"));   // 5
+        endmodule)";
+    CHECK(run_capture(src) == "5\n");
+}
+
+// export "DPI-C" (LRM 35.5): the SV function is exposed as a C-callable thunk and
+// still works as an ordinary SV function. The full C-calls-into-SV round-trip
+// needs a .o linked via addObjectFile, so it is the verilator CLI cross-check
+// (docs/design/dpi-c.md); here we confirm the export directive lowers, the thunk
+// emits, and the design runs.
+TEST_CASE("DPI export: a design with an export directive lowers and runs") {
+    constexpr std::string_view src = R"(
+        module m;
+          export "DPI-C" function dbl;
+          function int dbl(input int x); return x * 2; endfunction
+          initial $display("%0d", dbl(21));   // SV-side call still works: 42
+        endmodule)";
+    CHECK(run_capture(src) == "42\n");
+}
+
+// Export out-of-scope forms loud-fail (collect_dpi_exports guards).
+TEST_CASE("DPI export: unsupported forms are rejected") {
+    SUBCASE("exported task") {
         constexpr std::string_view src = R"(
             module m;
-              import "DPI-C" context function int f(input int x);
-              initial $display(f(1));
+              export "DPI-C" task t;
+              task t(input int x); endtask
             endmodule)";
-        CHECK(lower_fail(src).find("context") != std::string::npos);
+        CHECK(lower_fail(src).find("DPI export tasks") != std::string::npos);
+    }
+    SUBCASE("exported output argument") {
+        constexpr std::string_view src = R"(
+            module m;
+              export "DPI-C" function f;
+              function void f(output int x); x = 1; endfunction
+            endmodule)";
+        CHECK(lower_fail(src).find("output/inout") != std::string::npos);
+    }
+    SUBCASE("exported packed-vector argument (deferred)") {
+        constexpr std::string_view src = R"(
+            module m;
+              export "DPI-C" function g;
+              function int g(input bit [7:0] v); return v; endfunction
+            endmodule)";
+        CHECK(lower_fail(src).find("not supported yet") != std::string::npos);
     }
 }

@@ -531,6 +531,9 @@ public:
         // wires the NBA-region drain that references them.
         finalize_block_nba();
         emit_main(group_fns);
+        // Export thunks come last: they reference @clotho.state (created in
+        // emit_main) and every SV function's declaration.
+        emit_dpi_exports();
     }
 
     // Per-process "scheduled" flags, one i32 per process: clotho.proc_sched[k] is
@@ -2703,6 +2706,7 @@ private:
                                                   llvm::GlobalValue::InternalLinkage,
                                                   state_initializer(), "clotho.state");
         state_gv->setAlignment(llvm::Align(64));
+        state_global_      = state_gv; // reached by DPI export thunks
         llvm::Value* state = state_gv;
         init_state(state);
         if (shadow_base_gv_ != nullptr) {
@@ -9869,6 +9873,57 @@ private:
         }
     }
 
+    // Emit one C-ABI thunk per `export "DPI-C"` (LRM 35.5). Runs last (after
+    // emit_main creates @clotho.state and every SV function is declared).
+    void emit_dpi_exports() {
+        for (const DpiExport& ex : mod_.dpi_exports) {
+            emit_dpi_export(ex);
+        }
+    }
+
+    // A C-callable entry point `<c_ret> <cid>(<c_args>)` (external linkage) that
+    // marshals C arguments into the SV function's plane ABI, calls it against the
+    // design-state global, and marshals the result back to C. V1: input
+    // scalar/chandle args, scalar/chandle/void return (the frontend guards the
+    // rest). The marshal reuses the import helpers in reverse.
+    void emit_dpi_export(const DpiExport& ex) {
+        const Function& f    = mod_.function(ex.func);
+        llvm::Function* svfn = fn_decls_[static_cast<uint32_t>(ex.func)];
+
+        std::vector<llvm::Type*> cparams;
+        cparams.reserve(ex.arg_ctypes.size());
+        for (DpiCType ct : ex.arg_ctypes) {
+            cparams.push_back(dpi_c_llvm_ty(ct));
+        }
+        auto* fnty  = llvm::FunctionType::get(dpi_c_llvm_ty(ex.ret_ctype), cparams, false);
+        auto* thunk = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, ex.extern_name, llmod_);
+        b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", thunk));
+
+        // state pointer, then each formal as its (mm, z) plane pair — the same ABI
+        // lower_call_inst builds for an input scalar formal (real via real_to_planes).
+        std::vector<llvm::Value*> argv;
+        argv.push_back(state_global_);
+        for (size_t k = 0; k < ex.arg_ctypes.size(); ++k) {
+            const Plane pl   = dpi_c_to_plane(ex.arg_ctypes[k], thunk->getArg(k));
+            const Plane four = pl.fp != nullptr ? real_to_planes(fp_of(pl)) : to_four(pl);
+            argv.push_back(four.mm);
+            argv.push_back(four.z);
+        }
+        llvm::Value* r = b_.CreateCall(svfn->getFunctionType(), svfn, argv);
+
+        if (ex.ret_ctype == DpiCType::Void) {
+            b_.CreateRetVoid();
+            return;
+        }
+        // Unpack the SV {mm, z} return struct into a Plane, then marshal to C.
+        Plane         rp{ b_.CreateExtractValue(r, { 0 }), b_.CreateExtractValue(r, { 1 }) };
+        const ValType t = from_ref(f.return_type);
+        if (t.is_real) {
+            rp = real_plane(planes_to_real(rp, t.width));
+        }
+        b_.CreateRet(dpi_arg_to_c(ex.ret_ctype, rp));
+    }
+
     // Marshal an SV scalar value (a Plane the frontend resized to the formal type)
     // to its DPI-C native argument (LRM 35.5.6). A 2-state integer passes its value
     // plane; a scalar logic packs to svLogic (0/1/2=Z/3=X); a real rides its fp.
@@ -11691,6 +11746,9 @@ private:
     // Global holding &state->shadow, the opaque base every shadow access goes
     // through (see shadow_ptr for the mis-speculation hazard it defuses).
     llvm::GlobalVariable*   shadow_base_gv_ = nullptr;
+    // The design-state global (@clotho.state), created in emit_main; DPI export
+    // thunks call the SV function against it. Null until emit_main runs.
+    llvm::GlobalVariable*   state_global_ = nullptr;
     uint32_t                shadow_field_ = 0;
     // Slot-type memo, one `{ i(2W)[, iW] }` per (width, domain, has_z).
     std::vector<std::tuple<uint32_t, bool, bool, bool, llvm::StructType*>> slot_types_;

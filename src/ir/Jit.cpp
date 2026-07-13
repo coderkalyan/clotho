@@ -20,6 +20,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/Support/CodeGen.h>
 #include <llvm/Support/Error.h>
+#include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
 
@@ -269,19 +270,39 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     }
     jd.addGenerator(std::move(*builtins));
 
-    // Resolve `import "DPI-C"` symbols (LRM 35) from each --dpi-lib shared object,
-    // searched in the order given. A generator per library adds its exported
-    // symbols to the JIT dylib; an import that matches none surfaces as an
-    // unresolved-symbol error at the lookup("main") below.
+    // Load each --dpi-lib for DPI-C (LRM 35), dispatched by file format — the two
+    // ORC loaders differ in linking model, not in import-vs-export:
+    //   * .o / .a (relocatable object): LLJIT::addObjectFile links it INTO the
+    //     JITDylib, so its undefined symbols resolve against the design — the C's
+    //     `import` calls bind to the design AND its `export` calls bind to the
+    //     JIT-compiled export thunks. Two-way; required for export.
+    //   * .so (sealed shared object): dlopen'd via DynamicLibrarySearchGenerator;
+    //     ORC can only read symbols out of it (import), never inject a JIT'd thunk
+    //     into it. One-way, import only.
     for (const std::string& lib : config.dpi_libs) {
-        auto gen = llvm::orc::DynamicLibrarySearchGenerator::Load(
-          lib.c_str(), (*jit)->getDataLayout().getGlobalPrefix());
-        if (!gen) {
-            llvm::errs() << "jit: cannot load DPI library '" << lib
-                         << "': " << llvm::toString(gen.takeError()) << "\n";
-            return -1;
+        const bool is_object = lib.ends_with(".o") || lib.ends_with(".a");
+        if (is_object) {
+            auto buf = llvm::MemoryBuffer::getFile(lib);
+            if (!buf) {
+                llvm::errs() << "jit: cannot read DPI object '" << lib
+                             << "': " << buf.getError().message() << "\n";
+                return -1;
+            }
+            if (auto err = (*jit)->addObjectFile(jd, std::move(*buf))) {
+                llvm::errs() << "jit: cannot link DPI object '" << lib
+                             << "': " << llvm::toString(std::move(err)) << "\n";
+                return -1;
+            }
+        } else {
+            auto gen = llvm::orc::DynamicLibrarySearchGenerator::Load(
+              lib.c_str(), (*jit)->getDataLayout().getGlobalPrefix());
+            if (!gen) {
+                llvm::errs() << "jit: cannot load DPI library '" << lib
+                             << "': " << llvm::toString(gen.takeError()) << "\n";
+                return -1;
+            }
+            jd.addGenerator(std::move(*gen));
         }
-        jd.addGenerator(std::move(*gen));
     }
 
     if (auto err = (*jit)->addIRModule(std::move(tsm))) {

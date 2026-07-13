@@ -7813,11 +7813,12 @@ private:
             // the native boundary is coroutine-shaped. Import functions only.
             fail("DPI import tasks are not supported");
         }
-        if (sub.flags.has(MethodFlags::DPIContext)) {
-            // TODO: context imports (LRM 35.5.3) — need svScope and access to
-            // exported subroutines.
-            fail("DPI context imports are not supported");
-        }
+        // `context` (LRM 35.5.3) is accepted and lowered identically to a plain
+        // import: its purpose is to let the C call exported SV functions (and
+        // svScope APIs), which Clotho's export thunks already service against the
+        // single flat design-state global — no scope tracking needed for a single
+        // instance. (The svScope C API — svGetScope/svSetScope — is not provided;
+        // C that calls it gets an unresolved-symbol error, the deferred piece.)
 
         // A DPI import has no body, so slang leaves returnValVar null even for a
         // non-void function; decide void-ness from the declared return type.
@@ -7902,6 +7903,52 @@ private:
                                                .ir             = b.finish() });
     }
 
+    // Classify a DPI export formal / return type, restricted to V1's by-value
+    // scalar set (scalar / chandle / real). Packed vectors and strings are deferred
+    // (the reverse svVecVal / rt_string thunk marshal is the follow-up).
+    ir::DpiCType dpi_export_ctype(const slang::ast::Type& type, const char* what) {
+        const auto c = dpi_ctype(type);
+        if (!c.has_value() || *c == ir::DpiCType::BitVec || *c == ir::DpiCType::LogicVec ||
+            *c == ir::DpiCType::String) {
+            fail(std::string("DPI export ") + what +
+                 " type is not supported yet (scalar and chandle types only)");
+        }
+        return *c;
+    }
+
+    // Collect `export "DPI-C"` directives (LRM 35.5): for each, force-lower the SV
+    // function and record a DpiExport so the backend emits its C-callable thunk.
+    // slang resolves the export -> subroutine binding and the c_identifier
+    // (Compilation::getDPIExports). V1 scope: functions, input args, scalar/chandle
+    // types — everything else loud-fails. Public: called by lower_compilation.
+public:
+    void collect_dpi_exports(const slang::ast::Compilation& comp) {
+        for (const auto& ex : comp.getDPIExports()) {
+            const SubroutineSymbol& sub = *ex.subroutine;
+            if (sub.subroutineKind == SubroutineKind::Task) {
+                // TODO: exported tasks — need the timing wheel + coroutine driving
+                // from C (docs/design/dpi-c.md).
+                fail("DPI export tasks are not supported");
+            }
+            ir::DpiCType ret_ct = ir::DpiCType::Void;
+            if (!sub.getReturnType().isVoid()) {
+                ret_ct = dpi_export_ctype(sub.getReturnType(), "return");
+            }
+            std::vector<ir::DpiCType> arg_cts;
+            for (const FormalArgumentSymbol* fa : sub.getArguments()) {
+                if (fa->direction != slang::ast::ArgumentDirection::In) {
+                    // TODO: output / inout export formals (copy back to the C pointer).
+                    fail("DPI export output/inout arguments are not supported");
+                }
+                arg_cts.push_back(dpi_export_ctype(fa->getType(), "argument"));
+            }
+            const ir::FunctionId id = function_id(sub); // force-lower the SV function
+            module_.dpi_exports.push_back(
+              ir::DpiExport{ id, std::string(ex.cIdentifier), std::move(arg_cts), ret_ct });
+        }
+    }
+
+private:
     ir::FunctionId function_id(const SubroutineSymbol& sub) {
         if (globals_ != nullptr && this != globals_ && is_global_subroutine(sub)) {
             const Scope* saved_scope = globals_->scope_;
@@ -8522,6 +8569,13 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
     if (!single) {
         module->name = std::string(root.topInstances[0]->name);
     }
+    if (!single && !comp.getDPIExports().empty()) {
+        // A context export runs in a specific instance's scope (svScope, LRM
+        // 35.5.3); with several tops there is no single design-state root to bind
+        // the thunk to. Deferred with the rest of svScope.
+        result.diagnostics += "error: DPI export in a multi-top design is not supported\n";
+        return result;
+    }
     try {
         Lowerer globals(*module, tick_fs);
         globals.lower_globals(comp, root);
@@ -8532,6 +8586,12 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
             lw.seed_signals(globals.sigmap());
             lw.set_globals(&globals);
             lw.lower_top(*top, prefix);
+            // Exported functions (single-top only, guarded above) resolve in this
+            // top's scope — module-scope functions via `lw`, $unit/package via the
+            // shared `globals` delegation in function_id.
+            if (single) {
+                lw.collect_dpi_exports(comp);
+            }
         }
     } catch (const LowerError& e) {
         result.diagnostics += "error: " + e.message + "\n";

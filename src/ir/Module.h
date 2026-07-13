@@ -223,11 +223,25 @@ struct Function {
     Ir ir;
 };
 
+// An `export "DPI-C"` directive (LRM 35.5): a SystemVerilog function made
+// callable from native C. The backend emits a C-ABI thunk named `extern_name`
+// that marshals C arguments to the SV function's plane ABI, calls it against the
+// design-state global, and marshals the result back. `func` is the lowered SV
+// function (an ordinary IR Function).
+struct DpiExport {
+    FunctionId            func;
+    std::string           extern_name;   // C linkage name (the c_identifier)
+    std::vector<DpiCType> arg_ctypes;    // parallel to the function's formals
+    DpiCType              ret_ctype;
+};
+
 class Module {
 public:
     // Shared intern pool backing every process's constant / type handles. Owned
     // here so all processes outlive their pool reference.
     InternPool pool;
+    // DPI-C exports (LRM 35.5): SV functions exposed as C-callable thunks.
+    std::vector<DpiExport> dpi_exports;
     // Module name.
     std::string name;
     // Femtoseconds per wheel tick (the design's finest time unit). Used by %t to
