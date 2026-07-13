@@ -4064,7 +4064,8 @@ private:
                 case Inst::Tag::Severity:
                 case Inst::Tag::Fflush:
                 case Inst::Tag::Fclose:
-                case Inst::Tag::Fopen:
+                case Inst::Tag::FopenFd:
+                case Inst::Tag::FopenMcd:
                 case Inst::Tag::FileValueOp:
                 case Inst::Tag::TimeFormat:
                 case Inst::Tag::SimTime:
@@ -6188,7 +6189,8 @@ private:
                 // (LRM 20.9 return type). Never X — it counts, it does not
                 // propagate.
                 return { 32, false, true };
-            case Inst::Tag::Fopen:
+            case Inst::Tag::FopenFd:
+            case Inst::Tag::FopenMcd:
                 // $fopen returns a 32-bit descriptor integer.
                 return { 32, false, true };
             case Inst::Tag::FileValueOp:
@@ -7404,8 +7406,12 @@ private:
                 lower_fflush(i);
                 return;
 
-            case Inst::Tag::Fopen:
-                lower_fopen(i);
+            case Inst::Tag::FopenFd:
+                lower_fopen_fd(i);
+                return;
+
+            case Inst::Tag::FopenMcd:
+                lower_fopen_mcd(i);
                 return;
 
             case Inst::Tag::Fclose:
@@ -8925,22 +8931,22 @@ private:
         b_.CreateCall(fflush_fn(), { desc });
     }
 
-    // Lower a $fopen: spill the filename (and mode, for the FD form) to stack byte
-    // buffers and call the matching runtime opener; the result is the descriptor.
-    void lower_fopen(Index i) {
-        const Index fname = ir_->payload(i).op_extra.op;
-        const auto  info  = ir_->extra_data<FopenInfo>(ir_->payload(i).op_extra.extra);
-        const auto [name_ptr, name_len] = spill_ascii(fname, "fopen.name");
-
-        llvm::Value* desc = nullptr;
-        if (info.has_mode) {
-            const auto [mode_ptr, mode_len] = spill_ascii(info.mode, "fopen.mode");
-            desc = b_.CreateCall(
-              fopen_fd_fn(), { name_ptr, b_.getInt32(name_len), mode_ptr, b_.getInt32(mode_len) });
-        } else {
-            desc = b_.CreateCall(fopen_mcd_fn(), { name_ptr, b_.getInt32(name_len) });
-        }
+    // Lower a two-argument $fopen: spill the filename and mode to stack byte
+    // buffers and call the FD opener; the result is the descriptor.
+    void lower_fopen_fd(Index i) {
+        const auto& p                   = ir_->payload(i).binary;
+        const auto [name_ptr, name_len] = spill_ascii(p.l, "fopen.name");
+        const auto [mode_ptr, mode_len] = spill_ascii(p.r, "fopen.mode");
+        llvm::Value* desc               = b_.CreateCall(
+          fopen_fd_fn(), { name_ptr, b_.getInt32(name_len), mode_ptr, b_.getInt32(mode_len) });
         // The descriptor is a plain known integer (no x/z): must == may, z == 0.
+        set_value(i, packed(desc, desc, zero(32)));
+    }
+
+    // Lower a one-argument $fopen: spill the filename and open a fresh MCD.
+    void lower_fopen_mcd(Index i) {
+        const auto [name_ptr, name_len] = spill_ascii(ir_->payload(i).unary, "fopen.name");
+        llvm::Value* desc = b_.CreateCall(fopen_mcd_fn(), { name_ptr, b_.getInt32(name_len) });
         set_value(i, packed(desc, desc, zero(32)));
     }
 

@@ -500,17 +500,6 @@ struct SeverityInfo {
     ExtraSlice args;
 };
 
-// Extra payload for `fopen`: the $fopen(name, mode) form. `mode` is the C stdio
-// mode-string operand (a packed-ASCII vector, spilled by the backend) and is
-// valid iff `has_mode`; the name value is the instruction's `op`. With a mode a
-// single FD is opened, without one a fresh MCD is opened for writing.
-struct FopenInfo {
-    // C stdio mode-string operand; valid iff has_mode.
-    Index mode;
-    // 1 => two-argument $fopen (FD); 0 => one-argument $fopen (MCD).
-    uint32_t has_mode;
-};
-
 // Extra payload for `file_value_op`: a file-I/O system function returning a
 // 32-bit integer. `op` is the ir::FileOp selecting the routine; `args` are its
 // value operands in call order (a descriptor, plus a character / offset).
@@ -743,7 +732,6 @@ static_assert(ExtraPayload<SwitchArm>);
 static_assert(ExtraPayload<SwitchInfo>);
 static_assert(ExtraPayload<DisplayInfo>);
 static_assert(ExtraPayload<SeverityInfo>);
-static_assert(ExtraPayload<FopenInfo>);
 static_assert(ExtraPayload<FileOpInfo>);
 static_assert(ExtraPayload<RealMathInfo>);
 static_assert(ExtraPayload<DistInfo>);
@@ -1120,10 +1108,15 @@ struct Inst {
         // $display / $write / $fdisplay / $fwrite: format string + variadic args,
         // with an optional destination descriptor (payload: display -> DisplayInfo).
         Display,
-        // $fopen: open a file, -> 32-bit descriptor value (payload: op_extra ->
-        // FopenInfo; op is the filename value). LRM §21.3. One-argument form yields
-        // an MCD, two-argument form yields an FD. Lowers to rt_fopen_mcd/_fd.
-        Fopen,
+        // Two-argument $fopen(name, mode): open a single file descriptor with
+        // the C stdio mode string, -> 32-bit FD value (payload: binary — l is
+        // the filename value, r the mode string; both packed-ASCII vectors the
+        // backend spills). LRM §21.3. Lowers to rt_fopen_fd.
+        FopenFd,
+        // One-argument $fopen(name): open a fresh multichannel descriptor for
+        // writing, -> 32-bit MCD value (payload: unary, the filename value).
+        // LRM §21.3. Lowers to rt_fopen_mcd.
+        FopenMcd,
         // $fclose: close a file descriptor (payload: unary, the descriptor value).
         // LRM §21.3.2. Lowers to an rt_fclose call.
         Fclose,
@@ -1399,6 +1392,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Ret:
         case T::Delay:
         case T::Fclose:
+        case T::FopenMcd:
         case T::Fflush:
         case T::DumpFile:
         case T::StrLen:
@@ -1469,6 +1463,8 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Fgets:
         case T::Ferror:
         case T::FreadWord:
+        // Two-argument $fopen: l is the filename, r the mode string.
+        case T::FopenFd:
             return K::Binary;
 
         case T::Resize:
@@ -1546,7 +1542,6 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::QueueOp:
         case T::Cond:
         case T::Switch:
-        case T::Fopen:
         case T::FreadMem:
         case T::ReadMem:
         case T::StrPutc:

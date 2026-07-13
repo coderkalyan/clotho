@@ -502,7 +502,8 @@ struct Analysis {
                 // target ($*scanf, which can parse z digits, seeds above). A
                 // never-z target's z word is elided and the runtime is handed a
                 // null z pointer.
-                case Inst::Tag::Fopen:
+                case Inst::Tag::FopenFd:
+                case Inst::Tag::FopenMcd:
                 case Inst::Tag::Fclose:
                 case Inst::Tag::FileValueOp:
                 case Inst::Tag::Fgets:

@@ -212,10 +212,11 @@ public:
     // $fdisplay / $fwrite: like display, but `fd` selects the destination
     // descriptor (an MCD or FD value).
     Index fdisplay(Index fd, std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc);
-    // $fopen: open `name`, yielding a 32-bit descriptor. With `has_mode`, `mode`
-    // is the C stdio mode string and the result is an FD; without it a fresh MCD
-    // is opened for writing (`mode` is ignored, pass any Index).
-    Index fopen(Index name, Index mode, bool has_mode, SourceLoc loc);
+    // Two-argument $fopen: open `name` with the C stdio mode string `mode`,
+    // yielding a 32-bit FD.
+    Index fopen_fd(Index name, Index mode, SourceLoc loc);
+    // One-argument $fopen: open a fresh MCD on `name` for writing.
+    Index fopen_mcd(Index name, SourceLoc loc);
     // $fclose: close the descriptor `handle`. No value.
     Index fclose(Index handle, SourceLoc loc);
     // $fgetc / $ungetc / $feof / $ftell / $fseek / $rewind: a file read /

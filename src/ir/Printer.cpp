@@ -275,8 +275,10 @@ const char* tag_name(Inst::Tag tag) {
             return "continue";
         case T::Fflush:
             return "fflush";
-        case T::Fopen:
-            return "fopen";
+        case T::FopenFd:
+            return "fopen_fd";
+        case T::FopenMcd:
+            return "fopen_mcd";
         case T::Fclose:
             return "fclose";
         case T::FileValueOp:

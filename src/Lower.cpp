@@ -5579,10 +5579,11 @@ private:
             if (args.empty() || args.size() > 2) {
                 fail("$fopen expects one or two arguments");
             }
-            const ir::Index fname    = lower_string_arg(*args[0], b);
-            const bool      has_mode = args.size() == 2;
-            const ir::Index mode     = has_mode ? lower_string_arg(*args[1], b) : fname;
-            return b.fopen(fname, mode, has_mode, l);
+            const ir::Index fname = lower_string_arg(*args[0], b);
+            if (args.size() == 2) {
+                return b.fopen_fd(fname, lower_string_arg(*args[1], b), l);
+            }
+            return b.fopen_mcd(fname, l);
         }
 
         // $fgetc / $ungetc / $feof / $ftell / $fseek / $rewind (LRM §21.3): file

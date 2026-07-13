@@ -415,10 +415,12 @@ Index Builder::display_impl(Index fd, bool has_fd, std::string_view fmt, bool ne
     return emit({ Inst::Tag::Display, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
-Index Builder::fopen(Index name, Index mode, bool has_mode, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(FopenInfo{ mode, has_mode ? 1u : 0u });
+Index Builder::fopen_fd(Index name, Index mode, SourceLoc loc) {
+    return emit({ Inst::Tag::FopenFd, Inst::Payload{ .binary = { name, mode } } }, loc);
+}
 
-    return emit({ Inst::Tag::Fopen, Inst::Payload{ .op_extra = { name, extra } } }, loc);
+Index Builder::fopen_mcd(Index name, SourceLoc loc) {
+    return emit({ Inst::Tag::FopenMcd, pay(&Inst::Payload::unary, name) }, loc);
 }
 
 Index Builder::fclose(Index handle, SourceLoc loc) {
