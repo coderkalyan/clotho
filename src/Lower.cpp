@@ -1299,7 +1299,7 @@ private:
             if (!cv) {
                 fail("aggregate assignment from a void call");
             }
-            if (tag == ir::Inst::Tag::Store && is_string_free(type)) {
+            if (tag == ir::Inst::Tag::Store && is_trivially_copyable(type)) {
                 b.agg_copy(lhs, *cv, type, l);
             } else {
                 emit_agg_copy(lhs, *cv, type, tag, b, l);
@@ -1311,11 +1311,11 @@ private:
                  "variables, and function results are supported)");
         }
         const ir::Index src_lv = lower_lvalue(src, b);
-        // A blocking copy of a string-free aggregate is a single memcpy of the
-        // storage (the byte image is the value). A string leaf owns a heap buffer,
-        // so a string-containing aggregate must copy per-leaf (string stores
+        // A blocking copy of a trivially copyable aggregate is a single memcpy
+        // of the storage (the byte image is the value). A heap-owning leaf
+        // (string / dynamic array / queue) must copy per-leaf (its stores
         // deep-copy); a nonblocking copy always decomposes per-leaf (it defers).
-        if (tag == ir::Inst::Tag::Store && is_string_free(type)) {
+        if (tag == ir::Inst::Tag::Store && is_trivially_copyable(type)) {
             b.agg_copy(lhs, src_lv, type, l);
             return;
         }
@@ -1359,11 +1359,11 @@ private:
     }
 
     // Whole-object blocking copy of one aggregate lvalue into another, for a port
-    // connection or net-declaration continuous copy (both are string-free-fast /
-    // string-slow like a blocking `a = b`). A string-free aggregate is one memcpy
-    // (AggCopy); a string leaf owns a heap buffer, so it copies per-leaf.
+    // connection or net-declaration continuous copy (same fast/slow split as a
+    // blocking `a = b`). A trivially copyable aggregate is one memcpy (AggCopy);
+    // a heap-owning leaf forces the per-leaf deep copy.
     void emit_port_agg_copy(ir::Index dst, ir::Index src, ir::Ref ty, ir::Builder& b, ir::SourceLoc l) {
-        if (is_string_free(ty)) {
+        if (is_trivially_copyable(ty)) {
             b.agg_copy(dst, src, ty, l);
         } else {
             emit_agg_copy(dst, src, ty, ir::Inst::Tag::Store, b, l);
@@ -1387,11 +1387,36 @@ private:
         }
     }
 
-    // Whether an interned IR type is a scalar / string / real leaf.
-    bool is_leaf_ref(ir::Ref type) const {
+    // Storage/copy category of an interned IR type, driving whole-object and
+    // aggregate-leaf dispatch. Exhaustive over every type kind, so a leaf that
+    // needs special copy semantics (a heap-owning handle) can never silently
+    // take the plane-store path.
+    enum class ValueCat {
+        scalar,    // plane / real / class-or-chandle word: copy = plane store
+        string,    // rt_string handle: copy = deep string assign
+        handle,    // dynamic array / queue handle: copy = deep runtime assign
+        aggregate, // unpacked struct / fixed unpacked array: decomposes per leaf
+    };
+    ValueCat value_cat(ir::Ref type) const {
         const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
-        return t.kind != ir::Type::Kind::UnpackedArray &&
-               !(t.kind == ir::Type::Kind::Struct && !t.is_packed);
+        switch (t.kind) {
+            case ir::Type::Kind::String:
+                return ValueCat::string;
+            case ir::Type::Kind::DynArray:
+            case ir::Type::Kind::Queue:
+                return ValueCat::handle;
+            case ir::Type::Kind::UnpackedArray:
+                return ValueCat::aggregate;
+            case ir::Type::Kind::Struct:
+                return t.is_packed ? ValueCat::scalar : ValueCat::aggregate;
+            default:
+                return ValueCat::scalar;
+        }
+    }
+
+    // Whether an interned IR type is a scalar / string / real / handle leaf.
+    bool is_leaf_ref(ir::Ref type) const {
+        return value_cat(type) != ValueCat::aggregate;
     }
 
     // Whether an interned IR type contains an unpacked struct at any nesting depth
@@ -1404,25 +1429,36 @@ private:
         return t.kind == ir::Type::Kind::Struct && !t.is_packed;
     }
 
-    // Whether an aggregate type has no `string` (heap-owning) leaf, so a whole-
-    // object blocking copy can be a single memcpy of the storage rather than a
-    // per-leaf deep copy.
-    bool is_string_free(ir::Ref type) const {
-        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
-        if (t.kind == ir::Type::Kind::String) {
-            return false;
-        }
-        if (t.kind == ir::Type::Kind::UnpackedArray) {
-            return is_string_free(t.element);
-        }
-        if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
-            for (const ir::Field& f : module_.pool.struct_fields(t.fields_id)) {
-                if (!is_string_free(f.type)) {
-                    return false;
+    // Whether a whole-object copy of the type may be a single memcpy of its
+    // storage: no leaf owns a heap buffer (string / dynamic array / queue), so
+    // duplicating the byte image duplicates the value. A class-handle leaf IS
+    // trivially copyable — the pointer copy is the reference semantics.
+    //
+    // NOTE: distinct from trivial relocatability, which every value type here
+    // has (no self-pointers): the runtime containers memcpy-MOVE elements
+    // (ring growth, insert/delete shifts) even for heap-owning element types;
+    // only memcpy DUPLICATION is what this predicate gates.
+    bool is_trivially_copyable(ir::Ref type) const {
+        switch (value_cat(type)) {
+            case ValueCat::string:
+            case ValueCat::handle:
+                return false;
+            case ValueCat::scalar:
+                return true;
+            case ValueCat::aggregate: {
+                const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+                if (t.kind == ir::Type::Kind::UnpackedArray) {
+                    return is_trivially_copyable(t.element);
                 }
+                for (const ir::Field& f : module_.pool.struct_fields(t.fields_id)) {
+                    if (!is_trivially_copyable(f.type)) {
+                        return false;
+                    }
+                }
+                return true;
             }
         }
-        return true;
+        return false;
     }
 
     // Downcast to an assignment pattern (`'{...}`) base if the expression is one
@@ -6632,13 +6668,13 @@ private:
             return lower_queue_assign(a, b);
         }
         if (is_unpacked_array(a.left())) {
-            // A whole blocking copy of one plain (string-free) unpacked array into
+            // A whole blocking copy of one trivially copyable unpacked array into
             // another is a single memcpy of the storage (same AggCopy path as an
             // aggregate). A nonblocking copy, a `'{...}` pattern, or a string array
             // (heap-owning elements) still decompose / are unsupported.
             const ir::Ref     ty  = lower_type(*a.left().type);
             const Expression& src = unwrap_conversion(a.right());
-            if (!a.isNonBlocking() && is_string_free(ty) && is_whole_array_lvalue(src)) {
+            if (!a.isNonBlocking() && is_trivially_copyable(ty) && is_whole_array_lvalue(src)) {
                 b.agg_copy(lower_lvalue(a.left(), b), lower_lvalue(src, b), ty, loc(a));
                 return true_const(b, loc(a));
             }
@@ -8581,7 +8617,7 @@ private:
                     // TODO: aggregate output / inout function arg (copy-out).
                     fail("aggregate output / inout function argument is not supported");
                 }
-                if (!is_string_free(lower_type(fa->getType()))) {
+                if (!is_trivially_copyable(lower_type(fa->getType()))) {
                     // TODO: by-value copy of a string-containing aggregate (needs a
                     // per-leaf deep copy of the storage, not a memcpy).
                     fail("by-value pass of a string-containing aggregate is not supported");
@@ -8593,7 +8629,7 @@ private:
         }
 
         if (!is_void) {
-            if (is_aggregate(sub.returnValVar->getType()) && !is_string_free(return_type)) {
+            if (is_aggregate(sub.returnValVar->getType()) && !is_trivially_copyable(return_type)) {
                 // TODO: by-value return of a string-containing aggregate.
                 fail("by-value return of a string-containing aggregate is not supported");
             }
@@ -8820,7 +8856,7 @@ private:
                 // copies it in for value semantics. Only In reaches here: the
                 // callee guards aggregate output / inout, and aggregate task
                 // arguments are guarded before build_call_args (lower_task_call).
-                if (!is_string_free(pty)) {
+                if (!is_trivially_copyable(pty)) {
                     fail("by-value pass of a string-containing aggregate is not supported");
                 }
                 const Expression& src = unwrap_conversion(*actuals[i]);

@@ -899,7 +899,7 @@ private:
 
     // memcpy a whole aggregate from `src` to `dst` (both pointers to its storage).
     // Valid because the frontend passes an aggregate by value only when it is
-    // string-free, so its byte image is the value (no heap-owning leaf).
+    // trivially copyable (no heap-owning leaf), so its byte image is the value.
     void emit_agg_storage_copy(llvm::Value* dst, llvm::Value* src, Ref type) {
         llvm::Type* st = agg_storage_ty(type);
         const auto  sz = llmod_.getDataLayout().getTypeAllocSize(st);
@@ -7315,7 +7315,7 @@ private:
             }
             case Inst::Tag::AggCopy: {
                 // Whole-object blocking copy: one memcpy of the storage. The
-                // frontend emits this only for a string-free object, so the byte
+                // frontend emits this only for a trivially copyable object, so the byte
                 // image is the value (no heap-owning leaf to deep-copy).
                 const auto   info = ir_->extra_data<AggCopyInfo>(p.op_extra.extra);
                 const LValue dlv  = lvalue_of(p.op_extra.op);
