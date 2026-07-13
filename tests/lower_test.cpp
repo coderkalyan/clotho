@@ -681,17 +681,6 @@ TEST_CASE("a queue lowers (LRM 7.10)") {
     CHECK(r.ok);
 }
 
-TEST_CASE("an unpacked array of queues fails loudly") {
-    const LowerResult r = lower_text(R"(
-        module top;
-            int q [2][$];
-            initial q[0].push_back(1);
-        endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("unpacked array of a queue") != std::string::npos);
-}
-
 TEST_CASE("an associative array still fails loudly") {
     const LowerResult r = lower_text(R"(
         module top;
@@ -703,40 +692,40 @@ TEST_CASE("an associative array still fails loudly") {
     CHECK(r.diagnostics.find("associative") != std::string::npos);
 }
 
-TEST_CASE("a queue struct member fails loudly") {
+TEST_CASE("nonblocking whole-struct copy with a queue member fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            typedef struct { int q[$]; int x; } t;
+            t a, b;
+            initial b <= a;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("queue / dynamic array member") != std::string::npos);
+}
+
+TEST_CASE("equality of a struct with a queue member fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            typedef struct { int q[$]; int x; } t;
+            t a, b;
+            initial $display("%0d", a == b);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("queue / dynamic array member") != std::string::npos);
+}
+
+TEST_CASE("queue member assignment from a pattern fails loudly") {
     const LowerResult r = lower_text(R"(
         module top;
             typedef struct { int q[$]; int x; } t;
             t a;
-            initial a.x = 1;
+            initial a = '{ '{1, 2}, 3 };
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("queue / dynamic array struct member") != std::string::npos);
-}
-
-TEST_CASE("a dynamic array struct member fails loudly") {
-    const LowerResult r = lower_text(R"(
-        module top;
-            typedef struct { int d[]; int x; } t;
-            t a;
-            initial a.x = 1;
-        endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("queue / dynamic array struct member") != std::string::npos);
-}
-
-TEST_CASE("a queue class property fails loudly") {
-    const LowerResult r = lower_text(R"(
-        module top;
-            class C; int q[$]; endclass
-            C c;
-            initial c = new;
-        endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("queue / dynamic array class property") != std::string::npos);
+    CHECK(r.diagnostics.find("assignment pattern over this aggregate") != std::string::npos);
 }
 
 TEST_CASE("an event struct member fails loudly") {

@@ -890,18 +890,6 @@ private:
             t.element = lower_type(arr->elementType);
             t.left    = static_cast<uint32_t>(r.left);
             t.right   = static_cast<uint32_t>(r.right);
-            // A variable-size element (queue / dynamic array) is a per-cell heap
-            // handle; the fixed-array slot is plane-shaped and has no per-element
-            // init/deinit/copy for handles, so it would silently miscompile.
-            // Lowering is bottom-up, so this immediate check also rejects deeper
-            // nesting (int q[2][3][$] fails at the [3][$] level).
-            const ir::Type::Kind ek = std::get<ir::Type>(module_.pool.get(t.element)).kind;
-            if (ek == ir::Type::Kind::Queue || ek == ir::Type::Kind::DynArray) {
-                // TODO: unpacked array of queue / dynamic array (needs handle-aware
-                // per-cell lifecycle; see docs/design/dynamic-arrays.md).
-                fail("unpacked array of a queue / dynamic array is not supported");
-            }
-
             return module_.pool.put(ir::Item{ t });
         }
         if (const auto* da = ct.as_if<slang::ast::DynamicArrayType>()) {
@@ -992,17 +980,7 @@ private:
                 // Packed member: `bitOffset` is the field's bit position. Unpacked
                 // member: addressed by declaration index (`fieldIndex`), no flat
                 // offset — store the index so the field table is self-describing.
-                const ir::Ref fref = lower_type(f.getType());
-                if (!is_packed) {
-                    const ir::Type::Kind fk = std::get<ir::Type>(module_.pool.get(fref)).kind;
-                    if (fk == ir::Type::Kind::Queue || fk == ir::Type::Kind::DynArray) {
-                        // TODO: queue / dynamic-array struct members (need the
-                        // handle-aware per-leaf lifecycle: real handle slots in
-                        // the aggregate storage, init/deinit walks, deep copy).
-                        fail("queue / dynamic array struct member is not supported");
-                    }
-                }
-                fields.push_back({ f.name, fref,
+                fields.push_back({ f.name, lower_type(f.getType()),
                                    is_packed ? static_cast<uint32_t>(f.bitOffset) : f.fieldIndex });
             }
 
@@ -1106,15 +1084,8 @@ private:
                 // declare as an inert placeholder with no trigger state.
                 fail("event class property is not supported");
             }
-            const ir::Ref pref = lower_type(prop.getType());
-            const ir::Type::Kind pk = std::get<ir::Type>(module_.pool.get(pref)).kind;
-            if (pk == ir::Type::Kind::Queue || pk == ir::Type::Kind::DynArray) {
-                // TODO: queue / dynamic-array class properties (need the
-                // handle-aware per-leaf lifecycle in the object body).
-                fail("queue / dynamic array class property is not supported");
-            }
             class_prop_index_.emplace(&prop, idx);
-            fields.push_back({ prop.name, pref, idx });
+            fields.push_back({ prop.name, lower_type(prop.getType()), idx });
             ++idx;
         }
         module_.pool.set_struct_fields(fid, std::move(fields));
@@ -1143,6 +1114,14 @@ private:
             return true;
         }
         if (const auto* arr = ct.as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
+            // A fixed array over a queue / dynamic-array element also takes the
+            // recursive aggregate model (its cells are heap handles needing
+            // per-cell lifecycle), mirroring the backend's needs_agg_storage.
+            const slang::ast::Type& et = arr->elementType.getCanonicalType();
+            if (et.as_if<slang::ast::QueueType>() != nullptr ||
+                et.as_if<slang::ast::DynamicArrayType>() != nullptr) {
+                return true;
+            }
             return is_aggregate(arr->elementType);
         }
         return false;
@@ -1286,6 +1265,13 @@ private:
             }
             fail("'{...} assignment pattern over this aggregate is not supported");
         }
+        if (value_cat(type) == ValueCat::handle) {
+            // A queue / dynamic-array member: deep-copy from another handle
+            // lvalue. A pattern / concat / slice source needs an element-wise
+            // build (same follow-up as the top-level queue assignment).
+            emit_handle_member_copy(lhs, rhs, type, tag, b, l);
+            return;
+        }
         if (is_leaf_ref(type)) {
             b.binary(tag, lhs, lower_expr(rhs, b), l);
             return;
@@ -1355,7 +1341,53 @@ private:
             }
             return;
         }
+        if (value_cat(type) == ValueCat::handle) {
+            if (tag != ir::Inst::Tag::Store) {
+                // TODO: nonblocking copy of a queue / dynamic-array member
+                // (needs a handle-aware NBA staging path).
+                fail("nonblocking assignment to an aggregate with a queue / "
+                     "dynamic array member is not supported");
+            }
+            if (t.kind == ir::Type::Kind::Queue) {
+                b.queue_copy(lhs, rhs, type, l);
+            } else {
+                b.dyn_array_copy(lhs, rhs, type, l);
+            }
+            return;
+        }
         b.binary(tag, lhs, b.unary(ir::Inst::Tag::Load, rhs, l), l);
+    }
+
+    // Deep-copy into a queue / dynamic-array member of an aggregate from an
+    // aggregate-store RHS element: the member's slot in the RHS lvalue. Only a
+    // handle-shaped source is supported (variable / member / element).
+    void emit_handle_member_copy(ir::Index lhs, const Expression& rhs, ir::Ref type,
+                                 ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        if (tag != ir::Inst::Tag::Store) {
+            // TODO: nonblocking copy of a queue / dynamic-array member.
+            fail("nonblocking assignment to an aggregate with a queue / dynamic "
+                 "array member is not supported");
+        }
+        const Expression& src = unwrap_conversion(rhs);
+        const bool        src_is_handle_lvalue =
+            src.kind == ExpressionKind::NamedValue ||
+            src.kind == ExpressionKind::HierarchicalValue ||
+            src.kind == ExpressionKind::MemberAccess ||
+            src.kind == ExpressionKind::ElementSelect;
+        if (!src_is_handle_lvalue) {
+            // TODO: queue / dynamic-array member init from a '{...} pattern or
+            // concatenation needs an element-wise build (dynamic-arrays doc
+            // phase 4), same as the top-level queue assignment.
+            fail("queue / dynamic array member assignment from a non-variable "
+                 "value is not supported");
+        }
+        const ir::Index src_lv = lower_lvalue(src, b);
+        if (t.kind == ir::Type::Kind::Queue) {
+            b.queue_copy(lhs, src_lv, type, l);
+        } else {
+            b.dyn_array_copy(lhs, src_lv, type, l);
+        }
     }
 
     // Whole-object blocking copy of one aggregate lvalue into another, for a port
@@ -1528,6 +1560,12 @@ private:
             for (const auto& f : module_.pool.struct_fields(t.fields_id)) {
                 guard_agg_eq_members(f.type);
             }
+        }
+        if (value_cat(type) == ValueCat::handle) {
+            // TODO: equality of an aggregate with a queue / dynamic-array member
+            // needs a length compare plus an element-wise walk (LRM 7.5/7.10).
+            fail("equality of an aggregate with a queue / dynamic array member is "
+                 "not supported");
         }
     }
 

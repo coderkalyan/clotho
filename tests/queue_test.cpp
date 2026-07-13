@@ -324,3 +324,140 @@ TEST_CASE("queue $size") {
     )";
     CHECK(run_capture(src) == "3\n");
 }
+
+TEST_CASE("queue struct member: push/size/index and whole-struct deep copy") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int q[$]; int x; } sq_t;
+            sq_t a, b;
+            initial begin
+                a.x = 5; a.q.push_back(42); a.q.push_back(7);
+                b = a;
+                a.q.push_back(99); a.x = 1;
+                $display("a: x=%0d n=%0d %0d %0d %0d", a.x, a.q.size(), a.q[0], a.q[1], a.q[2]);
+                $display("b: x=%0d n=%0d %0d %0d", b.x, b.q.size(), b.q[0], b.q[1]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a: x=1 n=3 42 7 99\nb: x=5 n=2 42 7\n");
+}
+
+TEST_CASE("dynamic-array struct member: new/write and whole-struct deep copy") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int d[]; int x; } sd_t;
+            sd_t a, b;
+            initial begin
+                a.x = 3; a.d = new[2]; a.d[0] = 7; a.d[1] = 8;
+                b = a;
+                a.d[0] = 100;
+                $display("a: %0d %0d %0d %0d", a.x, a.d.size(), a.d[0], a.d[1]);
+                $display("b: %0d %0d %0d %0d", b.x, b.d.size(), b.d[0], b.d[1]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a: 3 2 100 8\nb: 3 2 7 8\n");
+}
+
+TEST_CASE("queue class property") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C; int q[$]; int x; endclass
+            C c;
+            initial begin
+                c = new; c.x = 1; c.q.push_back(2); c.q.push_back(3);
+                $display("%0d %0d %0d %0d", c.x, c.q.size(), c.q[0], c.q.pop_back());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 2 2 3\n");
+}
+
+TEST_CASE("fixed array of queues: per-cell independence and whole-array copy") {
+    constexpr std::string_view src = R"(
+        module m;
+            int q[3][$];
+            int a[2][$], b[2][$];
+            initial begin
+                q[0].push_back(10); q[2].push_back(30); q[2].push_back(31);
+                $display("%0d %0d %0d %0d %0d", q[0].size(), q[1].size(), q[2].size(),
+                         q[0][0], q[2][1]);
+                a[0].push_back(1); a[1].push_back(2); a[1].push_back(3);
+                b = a;
+                a[1].push_back(4);
+                $display("%0d %0d %0d %0d", b[0].size(), b[1].size(), b[1][1], a[1].size());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 0 2 10 31\n1 2 3 3\n");
+}
+
+TEST_CASE("nested struct with queue and string leaves deep-copies per leaf") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int q[$]; string s; } in_t;
+            typedef struct { in_t inner; int y; } out_t;
+            out_t a, b;
+            initial begin
+                a.y = 9; a.inner.s = "hi"; a.inner.q.push_back(5);
+                b = a;
+                a.inner.q.push_back(6); a.inner.s = "bye";
+                $display("a: %0d %s %0d", a.y, a.inner.s, a.inner.q.size());
+                $display("b: %0d %s %0d %0d", b.y, b.inner.s, b.inner.q.size(), b.inner.q[0]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a: 9 bye 2\nb: 9 hi 1 5\n");
+}
+
+TEST_CASE("frame-local struct with queue and string members: per-call lifecycle") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int q[$]; string s; } t;
+            function automatic int f(int i);
+                t v;
+                v.q.push_back(i); v.s = "x";
+                return v.q[0] + v.q.size();
+            endfunction
+            initial begin
+                int acc;
+                for (int i = 0; i < 100; i++) acc += f(i);
+                $display("acc=%0d", acc);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "acc=5050\n");
+}
+
+TEST_CASE("NBA to a scalar member coexists with a queue member") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int q[$]; logic [7:0] v; } t;
+            t s;
+            logic clk = 0;
+            always @(posedge clk) s.v <= 8'hAB;
+            initial begin
+                s.q.push_back(3);
+                #1 clk = 1;
+                #1 $display("%h %0d", s.v, s.q[0]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "ab 3\n");
+}
+
+TEST_CASE("foreach over a struct-member queue") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int q[$]; } t;
+            t s;
+            initial begin
+                int acc;
+                s.q.push_back(1); s.q.push_back(2); s.q.push_back(3);
+                foreach (s.q[i]) acc += s.q[i];
+                $display("acc=%0d", acc);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "acc=6\n");
+}

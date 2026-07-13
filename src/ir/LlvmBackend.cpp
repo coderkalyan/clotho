@@ -291,6 +291,10 @@ struct LValue {
     // A string target: `base` (indexed by elem_idx for an array) is the
     // rt_string handle; widths / bit_off / has_z are meaningless.
     bool is_string = false;
+    // A dynamic-array / queue handle leaf (inside an aggregate or a class
+    // body). Addressed via lv_handle_ptr by the queue / dynamic-array ops;
+    // plane Load/Store on it traps (the frontend never emits one).
+    bool is_handle = false;
     // Recursive aggregate addressing (a signal whose type contains an unpacked
     // struct). `root_ty` is the signal's whole storage type; `agg_path` is the
     // GEP index vector from `base` to the current sub-object (a leaf slot once a
@@ -779,6 +783,12 @@ private:
     void emit_handle_delete(llvm::Value* handle, Ref type) {
         b_.CreateCall(is_queue_type(type) ? queue_delete_all_fn() : dynarr_delete_fn(), { handle });
     }
+    // Pointer to the rt handle slot an lvalue designates: the resolved
+    // aggregate leaf slot for a struct-member / class-property / array-element
+    // handle, or the bare base for a whole signal / frame local.
+    llvm::Value* lv_handle_ptr(const LValue& lv) {
+        return lv.is_agg ? agg_slot_ptr(lv) : lv.base;
+    }
 
     // Whether a type is a string, or an unpacked array whose leaf element is.
     bool is_string_type(Ref type) const {
@@ -820,6 +830,50 @@ private:
         return t.kind == Type::Kind::Struct && !t.is_packed;
     }
 
+    // Whether a type takes the recursive aggregate storage mirror: it contains
+    // an unpacked struct, or a fixed array dimension over a heap-handle
+    // (dynamic array / queue) element whose per-cell init/deinit/copy only the
+    // recursive walks provide. Flat string arrays keep the dedicated
+    // string-array path (is_string_type is tested first at both call sites).
+    bool needs_agg_storage(Ref type) const {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            const Type::Kind ek = std::get<Type>(mod_.pool.get(t.element)).kind;
+            if (ek == Type::Kind::DynArray || ek == Type::Kind::Queue) {
+                return true;
+            }
+            return needs_agg_storage(t.element);
+        }
+        return t.kind == Type::Kind::Struct && !t.is_packed;
+    }
+
+    // Whether a type owns heap anywhere (string / dynamic array / queue leaf
+    // at any nesting depth), so its aggregate storage needs a deinit walk.
+    bool has_heap_leaf(Ref type) const {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        switch (t.kind) {
+            case Type::Kind::String:
+            case Type::Kind::DynArray:
+            case Type::Kind::Queue:
+                return true;
+            case Type::Kind::UnpackedArray:
+                return has_heap_leaf(t.element);
+            case Type::Kind::Struct: {
+                if (t.is_packed) {
+                    return false;
+                }
+                for (const Field& f : mod_.pool.struct_fields(t.fields_id)) {
+                    if (has_heap_leaf(f.type)) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            default:
+                return false;
+        }
+    }
+
     // Element count of one unpacked-array dimension.
     uint32_t array_dim(const Type& t) const {
         return (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
@@ -855,6 +909,9 @@ private:
         }
         if (t.kind == Type::Kind::String) {
             return str_slot_ty();
+        }
+        if (t.kind == Type::Kind::DynArray || t.kind == Type::Kind::Queue) {
+            return handle_slot_ty(type);
         }
         return agg_leaf_slot_ty(type);
     }
@@ -908,13 +965,21 @@ private:
     }
 
     // Fill an LValue's leaf metadata (slot type, width, domain flags) from the
-    // scalar / string leaf type a select chain has resolved to. Conservative z
-    // for a 4-state leaf, matching agg_leaf_slot_ty.
+    // scalar / string / handle leaf type a select chain has resolved to.
+    // Conservative z for a 4-state leaf, matching agg_leaf_slot_ty.
     void fill_agg_leaf(LValue& lv, Ref leaf_type) {
         const Type& t = std::get<Type>(mod_.pool.get(leaf_type));
         if (t.kind == Type::Kind::String) {
             lv.is_string = true;
             lv.slot_ty   = str_slot_ty();
+            return;
+        }
+        if (t.kind == Type::Kind::DynArray || t.kind == Type::Kind::Queue) {
+            // A handle leaf is consumed only by the queue / dynamic-array ops
+            // (which address it via lv_handle_ptr) and by ElemSelect descent;
+            // a plane Load/Store on it is a lowering bug and traps.
+            lv.is_handle = true;
+            lv.slot_ty   = handle_slot_ty(leaf_type);
             return;
         }
         const Layout   lay  = mod_.pool.layout(leaf_type);
@@ -936,6 +1001,11 @@ private:
     void collect_static_leaves(Ref type, std::vector<uint32_t>& path, std::vector<AggLeaf>& out) {
         const Type& t = std::get<Type>(mod_.pool.get(type));
         if (t.kind == Type::Kind::UnpackedArray) {
+            return;
+        }
+        // A handle leaf (dynamic array / queue) can never be nonblocking-staged
+        // (guarded in the frontend), so it gets no shadow entry.
+        if (t.kind == Type::Kind::DynArray || t.kind == Type::Kind::Queue) {
             return;
         }
         if (t.kind == Type::Kind::Struct && !t.is_packed) {
@@ -1106,12 +1176,13 @@ private:
                 }
                 continue;
             }
-            // A signal whose type contains an unpacked struct (at any nesting) is
-            // an aggregate: a recursive storage mirror (nested StructType /
+            // A signal whose type contains an unpacked struct (at any nesting),
+            // or a fixed array over a queue / dynamic-array element, is an
+            // aggregate: a recursive storage mirror (nested StructType /
             // ArrayType / leaf slots), addressed by a composed GEP path. Its
             // scalar/string leaves reachable by a static (struct-field-only) path
             // are enumerated for nonblocking staging.
-            if (contains_struct(sigs[i].type)) {
+            if (needs_agg_storage(sigs[i].type)) {
                 slot.is_agg     = true;
                 slot.has_z      = false;
                 slot.storage_ty = agg_storage_ty(sigs[i].type);
@@ -2316,7 +2387,7 @@ private:
             // actual pointer. The redirect GEPs a packed slot, so force one here.
             const bool is_ref_formal = i < f.arg_dirs.size() && f.arg_dirs[i] == ArgDir::Ref;
             frame_slots_[i].is_ref   = is_ref_formal;
-            if (contains_struct(f.local_types[i])) {
+            if (needs_agg_storage(f.local_types[i])) {
                 frame_slots_[i].is_agg     = true;
                 frame_slots_[i].storage_ty = agg_storage_ty(f.local_types[i]);
                 fields[i]                  = frame_slots_[i].storage_ty;
@@ -2407,6 +2478,13 @@ private:
                 // semantics): free it at every body exit so it does not leak.
                 emit_handle_delete(b_.CreateStructGEP(frame_ty_, frame_, i),
                                    frame_slots_[i].handle_type);
+            } else if (frame_slots_[i].is_agg && !frame_slots_[i].is_ref &&
+                       has_heap_leaf(frame_slots_[i].ir_type)) {
+                // An aggregate local with string / handle leaves owns their heap
+                // buffers at any nesting depth: recursive teardown.
+                std::vector<llvm::Value*> path;
+                emit_agg_deinit(frame_slots_[i].ir_type, b_.CreateStructGEP(frame_ty_, frame_, i),
+                                path, frame_slots_[i].storage_ty);
             }
         }
         for (llvm::Value* temp : str_temp_list_) {
@@ -3045,6 +3123,11 @@ private:
                 b_.CreateCall(dynarr_delete_fn(), { storage_ptr(s) });
             } else if (s.is_queue) {
                 b_.CreateCall(queue_delete_all_fn(), { storage_ptr(s) });
+            } else if (s.is_agg && has_heap_leaf(s.ir_type)) {
+                // Aggregate signal with string / handle leaves: recursive
+                // teardown of every heap-owning leaf.
+                std::vector<llvm::Value*> path;
+                emit_agg_deinit(s.ir_type, storage_ptr(s), path, s.storage_ty);
             }
         }
 
@@ -6327,6 +6410,13 @@ private:
             b_.CreateCall(str_init_fn(), { b_.CreateInBoundsGEP(root_ty, base, idx) });
             return;
         }
+        if (t.kind == Type::Kind::DynArray || t.kind == Type::Kind::Queue) {
+            // Empty handle (null buffer, zero counts). A signal slot is already
+            // zero from the state global's initializer; a frame alloca is not.
+            b_.CreateStore(llvm::Constant::getNullValue(handle_slot_ty(type)),
+                           b_.CreateInBoundsGEP(root_ty, base, idx));
+            return;
+        }
         const Layout lay  = mod_.pool.layout(type);
         const bool   four = lay.domain == Domain::Four;
         if (!four) {
@@ -6335,6 +6425,66 @@ private:
         const uint32_t w = lay.width == 0 ? 1 : lay.width;
         idx.push_back(b_.getInt32(0)); // mm field of the leaf slot
         b_.CreateStore(x_mm(w), b_.CreateInBoundsGEP(root_ty, base, idx));
+    }
+
+    // Recursive teardown for an aggregate's heap-owning leaves: rt_string_deinit
+    // on every string leaf, rt_dynarr_delete / rt_queue_delete_all on every
+    // handle leaf. The mirror of emit_agg_init; plane leaves need nothing. Call
+    // sites gate on has_heap_leaf so a plane-only aggregate emits no walk.
+    void emit_agg_deinit(Ref type, llvm::Value* base, std::vector<llvm::Value*>& path,
+                         llvm::Type* root_ty) {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            if (!has_heap_leaf(t.element)) {
+                return;
+            }
+            const uint32_t n     = array_dim(t);
+            auto*          i32   = b_.getInt32Ty();
+            auto*          fn    = b_.GetInsertBlock()->getParent();
+            auto*          head  = llvm::BasicBlock::Create(ctx_, "adeinit.head", fn);
+            auto*          body  = llvm::BasicBlock::Create(ctx_, "adeinit.body", fn);
+            auto*          done  = llvm::BasicBlock::Create(ctx_, "adeinit.done", fn);
+            auto*          entry = b_.GetInsertBlock();
+            b_.CreateBr(head);
+            b_.SetInsertPoint(head);
+            auto* idx = b_.CreatePHI(i32, 2);
+            idx->addIncoming(b_.getInt32(0), entry);
+            b_.CreateCondBr(b_.CreateICmpULT(idx, b_.getInt32(n)), body, done);
+            b_.SetInsertPoint(body);
+            path.push_back(idx);
+            emit_agg_deinit(t.element, base, path, root_ty);
+            path.pop_back();
+            idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), b_.GetInsertBlock());
+            b_.CreateBr(head);
+            b_.SetInsertPoint(done);
+            return;
+        }
+        if (t.kind == Type::Kind::Struct && !t.is_packed) {
+            uint32_t f = 0;
+            for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
+                path.push_back(b_.getInt32(f++));
+                emit_agg_deinit(fld.type, base, path, root_ty);
+                path.pop_back();
+            }
+            return;
+        }
+        const bool is_str    = t.kind == Type::Kind::String;
+        const bool is_handle = t.kind == Type::Kind::DynArray || t.kind == Type::Kind::Queue;
+        if (!is_str && !is_handle) {
+            return;
+        }
+        std::vector<llvm::Value*> idx;
+        idx.reserve(path.size() + 1);
+        idx.push_back(b_.getInt32(0));
+        for (llvm::Value* s : path) {
+            idx.push_back(s);
+        }
+        llvm::Value* slot = b_.CreateInBoundsGEP(root_ty, base, idx);
+        if (is_str) {
+            b_.CreateCall(str_deinit_fn(), { slot });
+        } else {
+            emit_handle_delete(slot, type);
+        }
     }
 
     // Constant initializer for the `clotho.state` global: the whole power-on
@@ -7116,7 +7266,7 @@ private:
                     // load/store applies bounds (out-of-range read -> default,
                     // write -> no-op; the heap is never touched past `len`).
                     const DynElem e       = dynarr_elem(es.array_type);
-                    llvm::Value*  handle  = lv.base;
+                    llvm::Value*  handle  = lv_handle_ptr(lv);
                     llvm::Value*  dataptr = b_.CreateLoad(
                       raw_ptr_ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 0));
                     llvm::Value* len = b_.CreateLoad(
@@ -7147,7 +7297,7 @@ private:
                     // the modulo divisor is clamped to 1 to keep it defined on the
                     // never-taken out-of-range path).
                     const DynElem e       = dynarr_elem(es.array_type);
-                    llvm::Value*  handle  = lv.base;
+                    llvm::Value*  handle  = lv_handle_ptr(lv);
                     llvm::Value*  baseptr = b_.CreateLoad(
                       raw_ptr_ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 0));
                     llvm::Value* head = b_.CreateLoad(
@@ -7242,6 +7392,12 @@ private:
 
             case Inst::Tag::Load: {
                 const LValue& lv = lvalue_of(p.unary);
+                if (lv.is_handle) {
+                    // Defense in depth: a queue / dynamic-array handle has no
+                    // plane value; every legal consumer goes through the
+                    // dedicated ops (frontend value_cat dispatch).
+                    throw BackendError{ "plane load of a queue / dynamic-array handle" };
+                }
                 if (lv.is_string) {
                     // A string load is the storage handle pointer, not a copy:
                     // every mutation point (Store, string ops) deep-copies, and
@@ -7263,6 +7419,9 @@ private:
                 // is woken. Snapshot the old value first so the transition can be
                 // detected from old -> new.
                 const LValue& lv      = lvalue_of(p.binary.l);
+                if (lv.is_handle) {
+                    throw BackendError{ "plane store to a queue / dynamic-array handle" };
+                }
                 if (lv.is_string) {
                     // A forwarded concat already built its result in the target
                     // (build_str_temps handed it the target's handle).
@@ -8419,13 +8578,15 @@ private:
     // Dynamic-array operations over the handle lvalue (LRM 7.5). Element access
     // rides the ElemSelect dynarr path, not these. Element facts come from the
     // payload's own array-type handle, so each op works for a module signal or
-    // a frame-local dynamic array alike.
+    // a frame-local dynamic array alike. Handles resolve through lv_handle_ptr
+    // so a struct-member / class-property array works too.
     void lower_dyn_array_new(Index i) {
         const auto&   p  = ir_->payload(i).op_extra;
         const auto    da = ir_->extra_data<DynArrayArg>(p.extra);
         const DynElem e  = dynarr_elem(da.array_type);
         llvm::Value*  n  = cast(must_of(value_of(da.arg)), 64, false);
-        b_.CreateCall(dynarr_new_fn(), { lvalue_of(p.op).base, b_.getInt64(dynarr_stride(e)), n,
+        b_.CreateCall(dynarr_new_fn(), { lv_handle_ptr(lvalue_of(p.op)),
+                                         b_.getInt64(dynarr_stride(e)), n,
                                          dynarr_elem_proto(e) });
     }
 
@@ -8435,12 +8596,12 @@ private:
         const DynElem e  = dynarr_elem(da.array_type);
         llvm::Value*  n  = cast(must_of(value_of(da.size)), 64, false);
         b_.CreateCall(dynarr_new_copy_fn(),
-                      { lvalue_of(p.op).base, b_.getInt64(dynarr_stride(e)), n,
-                        dynarr_elem_proto(e), lvalue_of(da.src).base });
+                      { lv_handle_ptr(lvalue_of(p.op)), b_.getInt64(dynarr_stride(e)), n,
+                        dynarr_elem_proto(e), lv_handle_ptr(lvalue_of(da.src)) });
     }
 
     void lower_dyn_array_size(Index i) {
-        llvm::Value* handle = lvalue_of(ir_->payload(i).op_type.op).base;
+        llvm::Value* handle = lv_handle_ptr(lvalue_of(ir_->payload(i).op_type.op));
         llvm::Value* len =
           b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 1));
         set_value(i, two_val(cast(len, 32, false)));
@@ -8451,7 +8612,7 @@ private:
         const auto   da     = ir_->extra_data<DynArrayArg>(p.extra);
         llvm::Value* stride = b_.getInt64(dynarr_stride(dynarr_elem(da.array_type)));
         b_.CreateCall(dynarr_assign_fn(),
-                      { lvalue_of(p.op).base, lvalue_of(da.arg).base, stride });
+                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(da.arg)), stride });
     }
 
     // Array ordering methods (LRM 7.12.2). Each carries only the handle lvalue +
@@ -8525,9 +8686,10 @@ private:
     // Queue operations over the handle lvalue (LRM 7.10.2). Indexed element
     // access q[i] rides the ElemSelect queue path, not these. Element values
     // cross to the runtime through a scratch element slot (push / insert stage
-    // the value in; pop copies out).
+    // the value in; pop copies out). Handles resolve through lv_handle_ptr so a
+    // struct-member / class-property queue works too.
     void lower_queue_size(Index i) {
-        llvm::Value* handle = lvalue_of(ir_->payload(i).op_type.op).base;
+        llvm::Value* handle = lv_handle_ptr(lvalue_of(ir_->payload(i).op_type.op));
         llvm::Value* len =
           b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 2));
         set_value(i, two_val(cast(len, 32, false)));
@@ -8541,7 +8703,7 @@ private:
         lower_store(elem_scratch_lvalue(scratch, e), value_of(qa.arg));
         llvm::Value* stride = b_.getInt64(dynarr_stride(e));
         llvm::Value* bound  = b_.getInt64(std::get<Type>(mod_.pool.get(qa.queue_type)).left);
-        b_.CreateCall(queue_push_fn(front), { lvalue_of(p.op).base, stride, bound, scratch });
+        b_.CreateCall(queue_push_fn(front), { lv_handle_ptr(lvalue_of(p.op)), stride, bound, scratch });
     }
 
     void lower_queue_pop(Index i, bool front) {
@@ -8552,7 +8714,7 @@ private:
         // untouched, so the load below then reads the element default.
         b_.CreateStore(elem_default_const(e), scratch);
         b_.CreateCall(queue_pop_fn(front),
-                      { lvalue_of(p.op).base, b_.getInt64(dynarr_stride(e)), scratch });
+                      { lv_handle_ptr(lvalue_of(p.op)), b_.getInt64(dynarr_stride(e)), scratch });
         Plane         v = lower_load(elem_scratch_lvalue(scratch, e));
         const ValType t = type_of(i);
         if (t.is_real) {
@@ -8570,7 +8732,7 @@ private:
         llvm::Value* idx    = cast(must_of(value_of(qi.idx)), 64, false);
         llvm::Value* stride = b_.getInt64(dynarr_stride(e));
         llvm::Value* bound  = b_.getInt64(std::get<Type>(mod_.pool.get(qi.queue_type)).left);
-        b_.CreateCall(queue_insert_fn(), { lvalue_of(p.op).base, stride, bound, idx, scratch });
+        b_.CreateCall(queue_insert_fn(), { lv_handle_ptr(lvalue_of(p.op)), stride, bound, idx, scratch });
     }
 
     void lower_queue_delete_idx(Index i) {
@@ -8578,18 +8740,20 @@ private:
         const auto   qa     = ir_->extra_data<QueueArg>(p.extra);
         llvm::Value* stride = b_.getInt64(dynarr_stride(dynarr_elem(qa.queue_type)));
         llvm::Value* idx    = cast(must_of(value_of(qa.arg)), 64, false);
-        b_.CreateCall(queue_delete_idx_fn(), { lvalue_of(p.op).base, stride, idx });
+        b_.CreateCall(queue_delete_idx_fn(), { lv_handle_ptr(lvalue_of(p.op)), stride, idx });
     }
 
     void lower_queue_delete_all(Index i) {
-        b_.CreateCall(queue_delete_all_fn(), { lvalue_of(ir_->payload(i).op_type.op).base });
+        b_.CreateCall(queue_delete_all_fn(),
+                      { lv_handle_ptr(lvalue_of(ir_->payload(i).op_type.op)) });
     }
 
     void lower_queue_copy(Index i) {
         const auto&  p      = ir_->payload(i).op_extra;
         const auto   qa     = ir_->extra_data<QueueArg>(p.extra);
         llvm::Value* stride = b_.getInt64(dynarr_stride(dynarr_elem(qa.queue_type)));
-        b_.CreateCall(queue_assign_fn(), { lvalue_of(p.op).base, lvalue_of(qa.arg).base, stride });
+        b_.CreateCall(queue_assign_fn(),
+                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qa.arg)), stride });
     }
 
     // Queue ordering methods (LRM 7.12.2) — same shape as the dynarr variants
