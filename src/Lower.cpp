@@ -7629,6 +7629,18 @@ private:
             // part-select.
             fail("slice of a queue / dynamic array is not supported");
         }
+        if (is_unpacked_array(rs.value())) {
+            // TODO: fixed-size unpacked array slice (LRM 7.4.5 `busB = busA[7:6]`,
+            // "a slice name of an unpacked array is an unpacked array"). Element
+            // storage is address-indexed, not a flat bit-vector, so the packed
+            // part-select math below is wrong for it -- guard loudly rather than
+            // let a slice comparison (`busA[7:6] == other`) silently fall through
+            // to a bogus bit-level compare (only caught here because neither
+            // operand is a *plain* whole-array reference -- that path is guarded
+            // separately, "whole unpacked array read is not supported" -- so two
+            // sliced operands slipped past every existing check).
+            fail("slice of a fixed-size unpacked array is not supported");
+        }
         // A range select on a multi-dim packed array picks whole W-wide elements
         // (LRM 7.4.6): both bounds and the width scale by the element width W.
         // W is 1 for an ordinary vector, leaving the bit-select math unchanged.

@@ -593,6 +593,63 @@ TEST_CASE("nonblocking whole unpacked array assignment fails loudly") {
     CHECK(r.diagnostics.find("whole unpacked array assignment") != std::string::npos);
 }
 
+// A fixed-size unpacked array slice (LRM 7.4.5: "a slice name of an unpacked
+// array is an unpacked array", e.g. `busB = busA[7:6]`) is element-addressed
+// storage, not a flat bit-vector -- the packed part-select math used for a
+// packed range-select is wrong for it. Every existing guard only caught a
+// *plain* whole-array reference ("whole unpacked array read"), so two
+// sliced operands on either side of `==` slipped past every check and
+// silently compared garbage bit offsets instead of the real elements
+// (found via a direct repro: two equal-valued slices of the same array
+// compared unequal). Guarded loudly at the source (lower_range_select), so
+// a slice lvalue and a slice comparison operand both hit it directly; a
+// slice as an assignment RHS never reaches it at all -- lower_assignment's
+// own is_unpacked_array branch rejects any non-plain-array, non-pattern RHS
+// first -- but still fails loudly, just via that older, more general guard.
+TEST_CASE("a fixed-size unpacked array slice is rejected loudly") {
+    SUBCASE("as a comparison operand") {
+        const LowerResult r = lower_text(R"(
+            module top;
+                bit [31:0] a [7:0];
+                bit [31:0] b [7:0];
+                logic eq;
+                initial eq = a[7:6] == b[7:6];
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostics.find("slice of a fixed-size unpacked array") != std::string::npos);
+    }
+    // The RHS-is-a-slice and LHS-is-a-slice assignment shapes never reach
+    // lower_range_select at all: lower_assignment's own is_unpacked_array
+    // branch rejects any RHS that is not a plain whole-array reference or a
+    // '{...} pattern first (a slice is neither) -- so they hit that
+    // pre-existing, more general guard instead, with its own message.
+    SUBCASE("as an assignment rvalue") {
+        const LowerResult r = lower_text(R"(
+            module top;
+                bit signed [31:0] a [7:0];
+                int b [1:0];
+                initial b = a[7:6];
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostics.find("whole unpacked array assignment") != std::string::npos);
+    }
+    SUBCASE("as an assignment lvalue") {
+        // lower_lvalue's RangeSelect case routes straight through
+        // lower_range_select, so this hits the new guard directly.
+        const LowerResult r = lower_text(R"(
+            module top;
+                bit signed [31:0] a [7:0];
+                int b [1:0];
+                initial a[7:6] = b;
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostics.find("slice of a fixed-size unpacked array") != std::string::npos);
+    }
+}
+
 TEST_CASE("a nonblocking write to an array element lowers") {
     const LowerResult r = lower_text(R"(
         module top;
