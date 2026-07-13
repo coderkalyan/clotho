@@ -2,7 +2,6 @@
 
 namespace clotho::ir {
 
-
 std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) const {
     const auto  tag = this->tag(inst);
     const auto& p   = payload(inst);

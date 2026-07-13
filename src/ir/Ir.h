@@ -541,14 +541,6 @@ struct DistInfo {
     ExtraSlice args;
 };
 
-// Extra payload for `fgets`: $fgets(str, fd) (LRM §21.3.4) reads a line from the
-// descriptor `fd` into the packed-vector lvalue `str` (the instruction's `op`),
-// returning the character count. `fd` is a value operand.
-struct FgetsInfo {
-    // File-descriptor value operand.
-    Index fd;
-};
-
 // Extra payload for `sformat`: $sformat / $swrite (LRM §21.3.3) format the value
 // args per the packed format-string bytes at `fmt` (`fmt_len` bytes) and store the
 // result into the destination string lvalue `dst`. `args` is the value-operand
@@ -576,14 +568,6 @@ struct SformatfInfo {
     ExtraSlice args;
 };
 
-// Extra payload for `ferror`: $ferror(fd, str) (LRM §21.3.6) writes the
-// descriptor's error message into the string lvalue (the instruction's `op`) and
-// returns the error code. `fd` is a value operand.
-struct FerrorInfo {
-    // File-descriptor value operand.
-    Index fd;
-};
-
 // Extra payload for `scanf`: $fscanf / $sscanf (LRM §21.3.4) parse `source` per the
 // packed format-string bytes at `fmt` (`fmt_len` bytes) into the output lvalues
 // `args`, returning the conversion count. When `is_string` is 1 ($sscanf) `source`
@@ -600,13 +584,6 @@ struct ScanfInfo {
     uint32_t is_string;
     // Output lvalue operands, one per conversion, in order.
     ExtraSlice args;
-};
-
-// Extra payload for `fread_word`: $fread(reg, fd) (LRM §21.3.4) reads raw bytes into
-// the packed-vector lvalue `reg` (the instruction's `op`). `fd` is a value operand.
-struct FreadWordInfo {
-    // File-descriptor value operand.
-    Index fd;
 };
 
 // Extra payload for `fread_mem`: $fread(mem, fd[, start[, count]]) reads raw bytes
@@ -769,12 +746,9 @@ static_assert(ExtraPayload<FopenInfo>);
 static_assert(ExtraPayload<FileOpInfo>);
 static_assert(ExtraPayload<RealMathInfo>);
 static_assert(ExtraPayload<DistInfo>);
-static_assert(ExtraPayload<FgetsInfo>);
 static_assert(ExtraPayload<SformatInfo>);
 static_assert(ExtraPayload<SformatfInfo>);
-static_assert(ExtraPayload<FerrorInfo>);
 static_assert(ExtraPayload<ScanfInfo>);
-static_assert(ExtraPayload<FreadWordInfo>);
 static_assert(ExtraPayload<FreadMemInfo>);
 static_assert(ExtraPayload<TimeFormatInfo>);
 static_assert(ExtraPayload<WaitEdge>);
@@ -1141,8 +1115,8 @@ struct Inst {
         // operands). LRM §21.3. Lowers to the matching rt_* call.
         FileValueOp,
         // $fgets: read a line from a descriptor into a packed-vector lvalue, ->
-        // character count (payload: op_extra -> FgetsInfo; op is the destination
-        // lvalue, extra holds the descriptor value). LRM §21.3.4. Lowers to rt_fgets.
+        // character count (payload: binary — l is the destination lvalue, r the
+        // descriptor value). LRM §21.3.4. Lowers to rt_fgets.
         Fgets,
         // $sformat / $swrite: format value args and store the result into a string
         // lvalue (payload: extra -> SformatInfo). LRM §21.3.3. Lowers to rt_sformat.
@@ -1152,16 +1126,16 @@ struct Inst {
         // instruction's string temp.
         Sformatf,
         // $ferror: write a descriptor's error message into a string lvalue, ->
-        // error code (payload: op_extra -> FerrorInfo; op is the destination
-        // lvalue). LRM §21.3.6. Lowers to an rt_ferror call.
+        // error code (payload: binary — l is the destination lvalue, r the
+        // descriptor value). LRM §21.3.6. Lowers to an rt_ferror call.
         Ferror,
         // $fscanf / $sscanf: parse a source into output lvalues per a format, ->
         // conversion count (payload: extra -> ScanfInfo). LRM §21.3.4. Lowers to an
         // rt_fscanf / rt_sscanf call.
         Scanf,
-        // $fread into a single packed-vector lvalue (payload: op_extra ->
-        // FreadWordInfo; op is the destination lvalue), -> bytes read. LRM §21.3.4.
-        // Lowers to an rt_fread call.
+        // $fread into a single packed-vector lvalue (payload: binary — l is the
+        // destination lvalue, r the descriptor value), -> bytes read. LRM
+        // §21.3.4. Lowers to an rt_fread call.
         FreadWord,
         // $fread into an unpacked-array memory (payload: op_extra -> FreadMemInfo;
         // op is the fd value), -> bytes read. LRM §21.3.4. Lowers to an rt_fread call.
@@ -1472,6 +1446,11 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::FGt:
         case T::FGe:
         case T::UrandomRange:
+        // The write-back file reads: l is the destination lvalue (like Store's
+        // lhs), r the descriptor value.
+        case T::Fgets:
+        case T::Ferror:
+        case T::FreadWord:
             return K::Binary;
 
         case T::Resize:
@@ -1546,9 +1525,6 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Cond:
         case T::Switch:
         case T::Fopen:
-        case T::Fgets:
-        case T::Ferror:
-        case T::FreadWord:
         case T::FreadMem:
         case T::ReadMem:
         case T::StrPutc:

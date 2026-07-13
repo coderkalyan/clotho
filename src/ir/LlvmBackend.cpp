@@ -8796,10 +8796,9 @@ private:
     // right-justified into the must|may plane, clears the z plane, and returns the
     // character count.
     void lower_fgets(Index i) {
-        const Index dst  = ir_->payload(i).op_extra.op;
-        const auto  info = ir_->extra_data<FgetsInfo>(ir_->payload(i).op_extra.extra);
+        const Index dst                  = ir_->payload(i).binary.l;
         const auto [mm, z, width, flags] = string_dest(dst, "$fgets");
-        llvm::Value* fd                  = cast(must_of(value_of(info.fd)), 32, true);
+        llvm::Value* fd                  = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, true);
         const ServiceSnapshot old          = service_snapshot(lvalue_of(dst));
         llvm::Value* r = b_.CreateCall(fgets_fn(), { mm, z, b_.getInt32(width), fd, b_.getInt32(flags) });
         service_after_write(lvalue_of(dst), old);
@@ -8895,10 +8894,9 @@ private:
     // Lower a $ferror: pass the descriptor plus the destination string's planes; the
     // runtime writes the message and returns the error code.
     void lower_ferror(Index i) {
-        const Index dst  = ir_->payload(i).op_extra.op;
-        const auto  info = ir_->extra_data<FerrorInfo>(ir_->payload(i).op_extra.extra);
+        const Index dst                  = ir_->payload(i).binary.l;
         const auto [mm, z, width, flags] = string_dest(dst, "$ferror");
-        llvm::Value* fd                  = cast(must_of(value_of(info.fd)), 32, true);
+        llvm::Value* fd                  = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, true);
         const ServiceSnapshot old          = service_snapshot(lvalue_of(dst));
         llvm::Value* r = b_.CreateCall(ferror_fn(), { fd, mm, z, b_.getInt32(width), b_.getInt32(flags) });
         service_after_write(lvalue_of(dst), old);
@@ -9086,8 +9084,7 @@ private:
     // Lower a $fread into a single vector: one element, no addressing. The runtime
     // reads ceil(width/8) bytes MSB-first into the destination planes.
     void lower_fread_word(Index i) {
-        const Index dst  = ir_->payload(i).op_extra.op;
-        const auto  info = ir_->extra_data<FreadWordInfo>(ir_->payload(i).op_extra.extra);
+        const Index dst = ir_->payload(i).binary.l;
 
         const LValue& lv = lvalue_of(dst);
         if (lv.is_string) {
@@ -9101,7 +9098,7 @@ private:
         llvm::Value* mm = lv_mm_ptr(lv);
         llvm::Value* z =
           lv.has_z ? lv_z_ptr(lv) : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
-        llvm::Value* fd = cast(must_of(value_of(info.fd)), 32, true);
+        llvm::Value* fd = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, true);
 
         const uint32_t four   = type_of(dst).four_state ? 1u : 0u;
         const uint32_t flags  = lv.narrow ? 4u : 0u;

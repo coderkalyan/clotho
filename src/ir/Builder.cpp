@@ -420,9 +420,7 @@ Index Builder::file_value_op(FileOp op, std::span<const Index> args, SourceLoc l
 }
 
 Index Builder::fgets(Index dst, Index fd, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(FgetsInfo{ fd });
-
-    return emit({ Inst::Tag::Fgets, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+    return emit({ Inst::Tag::Fgets, Inst::Payload{ .binary = { dst, fd } } }, loc);
 }
 
 Index Builder::sformat(Index dst, std::string_view fmt, std::span<const Index> args, SourceLoc loc) {
@@ -444,15 +442,11 @@ Index Builder::sformatf(std::string_view fmt, std::span<const Index> args, Sourc
 }
 
 Index Builder::ferror(Index dst, Index fd, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(FerrorInfo{ fd });
-
-    return emit({ Inst::Tag::Ferror, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+    return emit({ Inst::Tag::Ferror, Inst::Payload{ .binary = { dst, fd } } }, loc);
 }
 
 Index Builder::fread_word(Index dst, Index fd, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(FreadWordInfo{ fd });
-
-    return emit({ Inst::Tag::FreadWord, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+    return emit({ Inst::Tag::FreadWord, Inst::Payload{ .binary = { dst, fd } } }, loc);
 }
 
 Index Builder::fread_mem(Index fd, Signal mem, Index start, Index count, bool has_start, bool has_count,
