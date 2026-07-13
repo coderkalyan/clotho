@@ -2548,6 +2548,71 @@ TEST_CASE("$fgets reads a line right-justified") {
     std::remove(path);
 }
 
+TEST_CASE("$fgets into a string variable") {
+    const char* path = "clotho_fgets_str_test.txt";
+    write_file(path, "hello\nworld\n");
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, n;
+            string line;
+            initial begin
+                fd = $fopen(")") + path + R"(", "r");
+                n = $fgets(line, fd);
+                $display("%0d %s", n, line);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "6 hello\n\n");
+    std::remove(path);
+}
+
+// Unlike the packed-vector destination (capped at its declared width), a
+// string destination has no capacity limit: a line longer than any
+// reasonable fixed-width reg is still read in full.
+TEST_CASE("$fgets into a string variable is not width-capped") {
+    const char* path = "clotho_fgets_str_long_test.txt";
+    const std::string long_line(100, 'x');
+    write_file(path, long_line + "\n");
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, n;
+            string line;
+            initial begin
+                fd = $fopen(")") + path + R"(", "r");
+                n = $fgets(line, fd);
+                $display("%0d", n);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "101\n"); // 100 'x' + the newline
+    std::remove(path);
+}
+
+// $fgets into a string variable at EOF (nothing read) leaves the destination
+// unchanged and returns 0, mirroring the packed-vector destination's
+// behavior on a 0-byte read.
+TEST_CASE("$fgets into a string variable at EOF leaves it unchanged") {
+    const char* path = "clotho_fgets_str_eof_test.txt";
+    write_file(path, "");
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, n;
+            string line;
+            initial begin
+                line = "untouched";
+                fd = $fopen(")") + path + R"(", "r");
+                n = $fgets(line, fd);
+                $display("%0d %s", n, line);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "0 untouched\n");
+    std::remove(path);
+}
+
 // $fgetc returns bytes then -1 at EOF; $ungetc pushes a byte back for the next
 // read; $feof reports the end condition (LRM §21.3.4).
 TEST_CASE("$fgetc / $ungetc / $feof") {

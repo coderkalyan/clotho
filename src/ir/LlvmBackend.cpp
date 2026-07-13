@@ -8985,17 +8985,33 @@ private:
         return llmod_.getOrInsertFunction("rt_fgets", fnty);
     }
 
-    // Lower a $fgets: hand the runtime the destination vector's plane pointers plus
-    // its bit width and the descriptor. The runtime reads a line, stores it
-    // right-justified into the must|may plane, clears the z plane, and returns the
-    // character count.
+    // i32 rt_fgets_str(rt_string* dst, i32 fd)
+    llvm::FunctionCallee fgets_str_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(i32, { ptr, i32 }, false);
+        return llmod_.getOrInsertFunction("rt_fgets_str", fnty);
+    }
+
+    // Lower a $fgets: a string-object destination goes straight to the runtime's
+    // rt_string handle (no fixed width, no wait-queue plane snapshot -- mirrors
+    // lower_sformat's string branch). A packed-vector destination hands the
+    // runtime the plane pointers plus bit width and the descriptor; the runtime
+    // reads a line, stores it right-justified into the must|may plane, clears the
+    // z plane, and returns the character count.
     void lower_fgets(Index i) {
-        const Index dst                  = ir_->payload(i).binary.l;
+        const Index  dst = ir_->payload(i).binary.l;
+        llvm::Value* fd  = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, true);
+        const LValue& lv = lvalue_of(dst);
+        if (lv.is_string) {
+            llvm::Value* r = b_.CreateCall(fgets_str_fn(), { lv_string_ptr(lv), fd });
+            set_value(i, packed(r, r, zero(32)));
+            return;
+        }
         const auto [mm, z, width, flags] = string_dest(dst, "$fgets");
-        llvm::Value* fd                  = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, true);
-        const ServiceSnapshot old          = service_snapshot(lvalue_of(dst));
+        const ServiceSnapshot old          = service_snapshot(lv);
         llvm::Value* r = b_.CreateCall(fgets_fn(), { mm, z, b_.getInt32(width), fd, b_.getInt32(flags) });
-        service_after_write(lvalue_of(dst), old);
+        service_after_write(lv, old);
         set_value(i, packed(r, r, zero(32)));
     }
 
