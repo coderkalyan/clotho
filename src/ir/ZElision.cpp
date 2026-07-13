@@ -326,6 +326,8 @@ struct Analysis {
                 case Inst::Tag::Land:
                 case Inst::Tag::Lor:
                 case Inst::Tag::Lnot:
+                case Inst::Tag::Limplies:
+                case Inst::Tag::Lequiv:
                     break;
 
                 // Real ops absorb z too: a real value carries no z plane and

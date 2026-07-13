@@ -7176,17 +7176,21 @@ private:
         }
     }
 
-    // Short-circuit `&&` / `||` (LRM 11.3.5, 11.4.7). The left operand is always
-    // evaluated; the right operand is evaluated only in the Select's then-branch,
-    // taken when the left has not already fixed the result. A definite left
-    // operand short-circuits (`&&` on a false left -> 0, `||` on a true left ->
-    // 1); an x/z left is ambiguous, so the right operand is still evaluated and
-    // the full 3-valued Land/Lor computes the merged result.
+    // Short-circuit `&&` / `||` / `->` (LRM 11.3.5, 11.4.7 — the LRM's own
+    // short-circuit list is exactly these three plus `?:`; `<->` is
+    // deliberately absent, see lower_binary). The left operand is always
+    // evaluated; the right operand is evaluated only in the Select's
+    // then-branch, taken when the left has not already fixed the result. A
+    // definite left operand short-circuits (`&&` on a false left -> 0, `||`
+    // on a true left -> 1, `->` on a false left -> 1 — LRM 11.4.7: `a -> b` is
+    // `!a || b`, so a false `a` makes it true without needing `b`); an x/z
+    // left is ambiguous, so the right operand is still evaluated and the full
+    // 3-valued Land/Lor/Limplies computes the merged result.
     ir::Index lower_short_circuit(const BinaryExpression& bin, ir::Builder& b) {
-        using T                = ir::Inst::Tag;
-        const ir::SourceLoc l  = loc(bin);
-        const bool          is_and = bin.op == slang::ast::BinaryOperator::LogicalAnd;
-        const ir::Ref       bit  = make_int_type(1, true, false);
+        using T = ir::Inst::Tag;
+        using B = slang::ast::BinaryOperator;
+        const ir::SourceLoc l   = loc(bin);
+        const ir::Ref        bit = make_int_type(1, true, false);
 
         // A real operand reduces to its own definite truth bit (!= 0.0, reals
         // carry no x/z) before the integer machinery below (LRM 11.4.7).
@@ -7196,13 +7200,17 @@ private:
         }
 
         // Predicate is a definite 2-state bit: 1 iff the right operand must still
-        // be evaluated. `&&` skips when the left is logically false (all bits a
-        // definite 0); `||` skips when the left is logically true (its reduction
-        // or is a definite 1). Case-equality (===) yields a definite bit even for
-        // an x/z left, so the backend can branch on it directly.
+        // be evaluated. `&&` and `->` both skip when the left is logically false
+        // (all bits a definite 0) -- `->`'s skip condition is "!left is definite
+        // true", which is the same "left is exactly 0" test `&&` already uses.
+        // `||` skips when the left is logically true (its reduction is a definite
+        // 1). Case-equality (===) yields a definite bit even for an x/z left, so
+        // the backend can branch on it directly.
         const ir::Ref lhs_ty = bin.left().type->isFloating() ? bit : lower_type(*bin.left().type);
-        ir::Index     pred;
-        if (is_and) {
+        const bool    skip_on_false =
+          bin.op == B::LogicalAnd || bin.op == B::LogicalImplication;
+        ir::Index pred;
+        if (skip_on_false) {
             const ir::Index zero = b.constant(module_.pool.put_int(lhs_ty, 0), l);
             pred                 = b.unary(T::Lnot, b.binary(T::CaseEq, lhs, zero, l), l);
         } else {
@@ -7211,16 +7219,38 @@ private:
             pred                = b.unary(T::Lnot, b.binary(T::CaseEq, ror, one, l), l);
         }
 
+        // Skipped-branch dominant value and the not-skipped combine op differ per
+        // operator: `&&` -> 0 / Land, `||` -> 1 / Lor, `->` -> 1 / Limplies (a
+        // false left forces true without needing the right operand at all).
+        uint32_t dom_val;
+        T        combine_tag;
+        switch (bin.op) {
+            case B::LogicalAnd:
+                dom_val     = 0;
+                combine_tag = T::Land;
+                break;
+            case B::LogicalOr:
+                dom_val     = 1;
+                combine_tag = T::Lor;
+                break;
+            case B::LogicalImplication:
+                dom_val     = 1;
+                combine_tag = T::Limplies;
+                break;
+            default:
+                fail("unsupported short-circuit operator"); // unreachable: see call site.
+        }
+
         b.open_region();
         ir::Index rhs = lower_expr(bin.right(), b);
         if (bin.right().type->isFloating()) {
             rhs = b.binary(T::FNe, rhs, real_zero(bin.right(), b, l), l);
         }
-        const ir::Index      combined    = b.binary(is_and ? T::Land : T::Lor, lhs, rhs, l);
+        const ir::Index      combined    = b.binary(combine_tag, lhs, rhs, l);
         const ir::ExtraSlice then_region = b.close_region();
 
         b.open_region();
-        const ir::Index     dom         = b.constant(module_.pool.put_int(bit, is_and ? 0 : 1), l);
+        const ir::Index      dom         = b.constant(module_.pool.put_int(bit, dom_val), l);
         const ir::ExtraSlice else_region = b.close_region();
 
         return b.select_lazy(pred, then_region, combined, else_region, dom, l);
@@ -7315,6 +7345,18 @@ private:
                                        : rhs;
                 return b.binary(bin.op == B::LogicalAnd ? T::Land : T::Lor, lp, rp, l);
             }
+            case B::LogicalEquivalence: {
+                // Real operand reduction mirrors LogicalAnd/LogicalOr above.
+                // <-> does not short-circuit (LRM 11.3.5), so lhs/rhs here are
+                // already the eagerly lowered operands lower_binary passed in.
+                const ir::Index lp = bin.left().type->isFloating()
+                                       ? b.binary(T::FNe, lhs, real_zero(bin.left(), b, l), l)
+                                       : lhs;
+                const ir::Index rp = bin.right().type->isFloating()
+                                       ? b.binary(T::FNe, rhs, real_zero(bin.right(), b, l), l)
+                                       : rhs;
+                return b.binary(T::Lequiv, lp, rp, l);
+            }
             default:
                 // %, bitwise, shifts, ===, ==? are illegal on reals (LRM Table
                 // 11-1); slang rejects them upstream.
@@ -7328,9 +7370,13 @@ private:
 
         // Short-circuit logical operators: the right operand must not be
         // evaluated when the left already decides the result, so its side
-        // effects (a function call) do not occur (LRM 11.3.5, 11.4.7). Handled
-        // before the eager operand lowering below, which always evaluates both.
-        if (bin.op == B::LogicalAnd || bin.op == B::LogicalOr) {
+        // effects (a function call) do not occur (LRM 11.3.5, 11.4.7). `<->`
+        // is deliberately excluded -- LRM 11.3.5 lists only &&, ||, ->, and
+        // ?: as short-circuiting; <-> "shall be evaluated exactly once" per
+        // operand, so it falls through to the eager path below like any other
+        // binary op (see the LogicalEquivalence case further down).
+        if (bin.op == B::LogicalAnd || bin.op == B::LogicalOr ||
+            bin.op == B::LogicalImplication) {
             return lower_short_circuit(bin, b);
         }
 
@@ -7416,6 +7462,10 @@ private:
                 // !=? is the logical negation of ==? (X-propagating, so Lnot keeps
                 // x as x).
                 return b.unary(T::Lnot, b.binary(T::WildEq, lhs, rhs, l), l);
+            case B::LogicalEquivalence:
+                // <-> does not short-circuit (LRM 11.3.5); both integral
+                // operands are already the eagerly lowered lhs/rhs.
+                return b.binary(T::Lequiv, lhs, rhs, l);
             case B::GreaterThanEqual:
                 return b.binary(T::Ge, lhs, rhs, l);
             case B::GreaterThan:

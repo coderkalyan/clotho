@@ -3483,6 +3483,8 @@ private:
                 case Inst::Tag::Land:
                 case Inst::Tag::Lor:
                 case Inst::Tag::Lnot:
+                case Inst::Tag::Limplies:
+                case Inst::Tag::Lequiv:
                 case Inst::Tag::Select:
                 case Inst::Tag::SelectLazy:
                 case Inst::Tag::Concat:
@@ -6284,6 +6286,8 @@ private:
             case Inst::Tag::Land:
             case Inst::Tag::Lor:
             case Inst::Tag::Lnot:
+            case Inst::Tag::Limplies:
+            case Inst::Tag::Lequiv:
                 return { 1, true, false };
 
             case Inst::Tag::Concat: {
@@ -7104,6 +7108,12 @@ private:
                 return;
             case Inst::Tag::Lnot:
                 set_value(i, lower_lnot(value_of(p.unary)));
+                return;
+            case Inst::Tag::Limplies:
+                set_value(i, lower_limplies(value_of(p.binary.l), value_of(p.binary.r)));
+                return;
+            case Inst::Tag::Lequiv:
+                set_value(i, lower_lequiv(value_of(p.binary.l), value_of(p.binary.r)));
                 return;
 
             case Inst::Tag::Select: {
@@ -11732,6 +11742,41 @@ private:
         const Truth t = truth_of(a);
         // true -> 0, false -> 1, x -> x: must = was-false, may = not was-true.
         return bit_plane(t.f, b_.CreateNot(t.t));
+    }
+
+    // Logical implication a -> b (LRM 11.4.7). Reached only on the
+    // not-short-circuited path -- lower_short_circuit already skips lowering
+    // b entirely when a is definitely false (LRM 11.3.5), so by the time this
+    // runs both operands are real values needing only the combine. Direct
+    // truth table of (!a || b) without materializing an intermediate Lnot:
+    // definitely true when a is definitely false OR b is definitely true
+    // (either half of the OR is settled); definitely false only when a is
+    // definitely true AND b is definitely false; x otherwise.
+    Plane lower_limplies(Plane a, Plane b) {
+        a = to_four(a);
+        b = to_four(b);
+        const Truth ta = truth_of(a);
+        const Truth tb = truth_of(b);
+        llvm::Value* t = b_.CreateOr(ta.f, tb.t);
+        llvm::Value* f = b_.CreateAnd(ta.t, tb.f);
+        return bit_plane(t, b_.CreateNot(f));
+    }
+
+    // Logical equivalence a <-> b (LRM 11.4.7). Unlike && / || / ->, LRM
+    // 11.3.5 does not list <-> as short-circuiting, so the frontend always
+    // lowers both operands (lower_binary) before this runs. No domination
+    // shortcut exists either: definitely true when both operands share the
+    // same definite truth, definitely false when both are definite but
+    // differ, x whenever either operand is itself ambiguous (an ambiguous
+    // operand's two possible resolutions give different equivalence answers).
+    Plane lower_lequiv(Plane a, Plane b) {
+        a = to_four(a);
+        b = to_four(b);
+        const Truth ta = truth_of(a);
+        const Truth tb = truth_of(b);
+        llvm::Value* t = b_.CreateOr(b_.CreateAnd(ta.t, tb.t), b_.CreateAnd(ta.f, tb.f));
+        llvm::Value* f = b_.CreateOr(b_.CreateAnd(ta.t, tb.f), b_.CreateAnd(ta.f, tb.t));
+        return bit_plane(t, b_.CreateNot(f));
     }
 
     // -- Select: known condition selects (one packed select); unknown merges bitwise

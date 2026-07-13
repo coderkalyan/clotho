@@ -751,6 +751,28 @@ TEST_CASE("single-bit &&, ||, !, ~ agree with LRM Kleene semantics") {
     CHECK(run_capture(src) == "0011\nx100\n0x11\nxxxx\n0100\n");
 }
 
+// -> / <-> (LRM 11.4.7): a -> b == !a || b, a <-> b == (a->b) && (b->a).
+// Verified against iverilog -- no side effects here, so the short-circuit vs.
+// eager evaluation difference (see function_test.cpp) does not affect the
+// computed value, only whether a side effect runs.
+TEST_CASE("-> and <-> agree with LRM Kleene semantics") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a, b;
+            initial begin
+                a = 1'b0; b = 1'b0; $display("%b%b", a->b, a<->b);
+                a = 1'b0; b = 1'b1; $display("%b%b", a->b, a<->b);
+                a = 1'b1; b = 1'b0; $display("%b%b", a->b, a<->b);
+                a = 1'b1; b = 1'b1; $display("%b%b", a->b, a<->b);
+                a = 1'bx; b = 1'b1; $display("%b%b", a->b, a<->b);
+                a = 1'bx; b = 1'b0; $display("%b%b", a->b, a<->b);
+                a = 1'bx; b = 1'bx; $display("%b%b", a->b, a<->b);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "11\n10\n00\n11\n1x\nxx\nxx\n");
+}
+
 TEST_CASE("single-bit && lowers to a packed and (no truth reduction)") {
     const std::string ir = emit(R"(
         module m(input logic a, input logic b, output logic y); assign y = a && b; endmodule

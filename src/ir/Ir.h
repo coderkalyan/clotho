@@ -961,6 +961,19 @@ struct Inst {
         Lor,
         // Logical not (payload: unary).
         Lnot,
+        // Logical implication a -> b, LRM 11.4.7: logically equivalent to
+        // (!a || b), but its own op rather than composed Lnot+Lor -- -> is one
+        // of the LRM 11.3.5 short-circuit operators (skip b when a is
+        // definitely false), which the frontend handles by conditionally not
+        // lowering b at all (lower_short_circuit); this op is only reached on
+        // the not-skipped path, where both operands are already-lowered
+        // values (payload: binary).
+        Limplies,
+        // Logical equivalence a <-> b, LRM 11.4.7: unlike -> and &&/||, LRM
+        // 11.3.5 does NOT list <-> as short-circuiting -- "each of the two
+        // operands... shall be evaluated exactly once" -- so the frontend
+        // always lowers both operands (payload: binary).
+        Lequiv,
 
         // -- Selection / structural --
         // Ternary cond ? a : b (payload: op_extra -> Select).
@@ -1440,6 +1453,8 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::WildEq:
         case T::Land:
         case T::Lor:
+        case T::Limplies:
+        case T::Lequiv:
         case T::StrGetc:
         case T::StrCmp:
         case T::StrICmp:

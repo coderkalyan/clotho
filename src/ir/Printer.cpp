@@ -181,6 +181,10 @@ const char* tag_name(Inst::Tag tag) {
             return "lor";
         case T::Lnot:
             return "lnot";
+        case T::Limplies:
+            return "limplies";
+        case T::Lequiv:
+            return "lequiv";
         case T::Select:
             return "select";
         case T::SelectLazy:
