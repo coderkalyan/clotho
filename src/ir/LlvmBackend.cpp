@@ -9822,49 +9822,19 @@ private:
     }
     llvm::StructType* rt_svopen_ty_ = nullptr;
 
-    // void rt_dpi_pack_arr_bit(const void* base, u32 stride, u32 w, u32 n, void* out).
-    llvm::FunctionCallee dpi_pack_arr_bit_fn() {
-        auto* p = raw_ptr_ty();
-        auto* i = b_.getInt32Ty();
-        return rt_fn("rt_dpi_pack_arr_bit", b_.getVoidTy(), { p, i, i, i, p });
-    }
-    // void rt_dpi_pack_arr_logic(base, stride, z_off, has_z, w, n, out).
-    llvm::FunctionCallee dpi_pack_arr_logic_fn() {
-        auto* p = raw_ptr_ty();
-        auto* i = b_.getInt32Ty();
-        return rt_fn("rt_dpi_pack_arr_logic", b_.getVoidTy(), { p, i, i, i, i, i, p });
-    }
-    // void rt_dpi_unpack_arr_bit(const void* in, u32 stride, u32 w, u32 n, void* base).
-    llvm::FunctionCallee dpi_unpack_arr_bit_fn() {
-        auto* p = raw_ptr_ty();
-        auto* i = b_.getInt32Ty();
-        return rt_fn("rt_dpi_unpack_arr_bit", b_.getVoidTy(), { p, i, i, i, p });
-    }
-    // void rt_dpi_unpack_arr_logic(in, stride, z_off, has_z, w, n, base).
-    llvm::FunctionCallee dpi_unpack_arr_logic_fn() {
-        auto* p = raw_ptr_ty();
-        auto* i = b_.getInt32Ty();
-        return rt_fn("rt_dpi_unpack_arr_logic", b_.getVoidTy(), { p, i, i, i, i, i, p });
-    }
-
-    // A marshalled open-array output/inout argument to copy back after the call: the
-    // svVecVal scratch buffer is unpacked into the design element storage. Only
-    // recorded for a marshalled (packed) element in a non-input direction — a named-
-    // scalar zero-copy element has the C writing the design storage directly.
-    // `wide` (element > 64 bits) uses the inline-IR unpack (native iW/i2W ops);
-    // otherwise the autovectorized C runtime (rt_dpi_unpack_arr_*).
+    // A marshalled open-array output/inout argument to unpack back after the call
+    // (inline IR, emit_dpi_oa_unpack_ir). Only recorded for a marshalled (packed)
+    // element in a non-input direction — a named-scalar zero-copy element has the C
+    // writing the design storage directly.
     struct OaMarshalBack {
         bool              is_logic;
-        bool              wide;
         llvm::Value*      buf;     // svVecVal scratch the C wrote
         llvm::Value*      storage; // `[N x slot]` design storage
-        llvm::StructType* slot;    // element slot type (for the wide-IR path)
-        uint32_t          stride;
+        llvm::StructType* slot;    // element slot type
         uint32_t          ew;
         uint32_t          n;
         uint32_t          nch;
         uint32_t          has_z;
-        uint32_t          zoff;
     };
 
     // Element GEP into a marshalled svVecVal buffer: `[N*nch x elem]` where elem is
@@ -9879,11 +9849,11 @@ private:
     }
 
     // Inline per-element pack (design `[N x slot]` storage -> svVecVal buffer) for a
-    // wide (> 64-bit) open-array element the C runtime's native-integer marshal
-    // cannot reach. N is a compile-time constant (fixed unpacked-array actual), so
-    // this is a constant-trip loop; each element loads the native iW / i2W slot
-    // fields and LLVM legalizes the multi-word shifts. The unaligned `may` region
-    // (mm bits [W, 2W)) is a single `lshr i2W, W` — no hand-rolled funnel shift.
+    // marshalled open-array element, any width. N is a compile-time constant (fixed
+    // unpacked-array actual), so this is a constant-trip loop; each element loads the
+    // native iW / i2W slot fields and LLVM legalizes the ops at any width — the
+    // unaligned `may` region (mm bits [W, 2W)) is a single `lshr i2W, W`, no
+    // hand-rolled funnel shift, and no separate C marshal to keep in sync.
     void emit_dpi_oa_pack_ir(llvm::Value* storage, llvm::Value* buf, llvm::StructType* slot,
                              uint32_t n, uint32_t ew, uint32_t nch, bool has_z, bool is_logic) {
         auto* iW    = int_ty(ew);
@@ -9925,10 +9895,11 @@ private:
             auto* flat  = b_.CreateAdd(base, b_.getInt32(c));
             auto* eptr  = dpi_oa_buf_elem(buf, n * nch, is_logic, flat);
             auto* shamt = llvm::ConstantInt::get(iW, 32u * c); // 32c < ew, never poison
-            auto* ac    = b_.CreateTrunc(b_.CreateLShr(aval, shamt), i32);
+            // ZExtOrTrunc, not Trunc: iW may be narrower than i32 (w < 32).
+            auto* ac    = b_.CreateZExtOrTrunc(b_.CreateLShr(aval, shamt), i32);
             if (is_logic) {
                 auto* i32x2 = llvm::StructType::get(ctx_, { i32, i32 });
-                auto* bc    = b_.CreateTrunc(b_.CreateLShr(bval, shamt), i32);
+                auto* bc    = b_.CreateZExtOrTrunc(b_.CreateLShr(bval, shamt), i32);
                 b_.CreateStore(ac, b_.CreateStructGEP(i32x2, eptr, 0));
                 b_.CreateStore(bc, b_.CreateStructGEP(i32x2, eptr, 1));
             } else {
@@ -9941,9 +9912,9 @@ private:
     }
 
     // Inline per-element unpack (svVecVal buffer -> design storage) — the reverse of
-    // emit_dpi_oa_pack_ir, for a wide output/inout element. Reassembles aval/bval
-    // from the chunks, reconstructs mm = must | (may << W) with a single `shl i2W`,
-    // and writes the z field when present.
+    // emit_dpi_oa_pack_ir, for an output/inout element of any width. Reassembles
+    // aval/bval from the chunks, reconstructs mm = must | (may << W) with a single
+    // `shl i2W`, and writes the z field when present.
     void emit_dpi_oa_unpack_ir(llvm::Value* buf, llvm::Value* storage, llvm::StructType* slot,
                                uint32_t n, uint32_t ew, uint32_t nch, bool has_z, bool is_logic) {
         auto* iW    = int_ty(ew);
@@ -9971,10 +9942,12 @@ private:
             auto* shamt = llvm::ConstantInt::get(iW, 32u * c);
             auto* ac    = is_logic ? b_.CreateLoad(i32, b_.CreateStructGEP(i32x2, eptr, 0))
                                    : b_.CreateLoad(i32, eptr);
-            aval = b_.CreateOr(aval, b_.CreateShl(b_.CreateZExt(ac, iW), shamt));
+            // ZExtOrTrunc, not ZExt: iW may be narrower than i32 (w < 32), and the
+            // trunc also drops the chunk's undefined bits above W.
+            aval = b_.CreateOr(aval, b_.CreateShl(b_.CreateZExtOrTrunc(ac, iW), shamt));
             if (is_logic) {
                 auto* bc = b_.CreateLoad(i32, b_.CreateStructGEP(i32x2, eptr, 1));
-                bval     = b_.CreateOr(bval, b_.CreateShl(b_.CreateZExt(bc, iW), shamt));
+                bval     = b_.CreateOr(bval, b_.CreateShl(b_.CreateZExtOrTrunc(bc, iW), shamt));
             }
         }
         auto* slotptr = b_.CreateInBoundsGEP(arrty, storage, { b_.getInt32(0), k });
@@ -10049,7 +10022,7 @@ private:
 
         // Use the actual element storage slot (`lv.slot_ty`) — not a conservative
         // reconstruction — so may-z elision (a `{ i2W }` slot with no z word) is
-        // reflected in the stride and the has_z flag the marshal needs.
+        // reflected in the has_z flag the marshal needs.
         llvm::StructType* slot   = lv.slot_ty;
         const auto        stride = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(slot));
         llvm::Value*      storage = lv.base; // whole `[N x slot]` storage pointer
@@ -10075,14 +10048,12 @@ private:
                     is_logic   = 0;
                     break;
                 }
-                // A named scalar is always <= 64 bits (longint), so never wide.
                 auto* buf = entry_alloca(llvm::ArrayType::get(b_.getInt32Ty(), n * nch), "dpi.oa.bit");
                 if (pack_in) {
-                    b_.CreateCall(dpi_pack_arr_bit_fn(),
-                                  { storage, b_.getInt32(stride), b_.getInt32(ew), b_.getInt32(n), buf });
+                    emit_dpi_oa_pack_ir(storage, buf, slot, n, ew, nch, /*has_z=*/false, /*is_logic=*/false);
                 }
                 if (copy_out) {
-                    backs.push_back({ false, false, buf, storage, slot, stride, ew, n, nch, 0, 0 });
+                    backs.push_back({ false, buf, storage, slot, ew, n, nch, 0 });
                 }
                 data       = buf;
                 elem_bytes = 4 * nch;
@@ -10090,20 +10061,12 @@ private:
                 break;
             }
             case DpiCType::BitVec: {
-                // 1 svVecVal word per element for w <= 32, 2 for 33..64; wider elements
-                // marshal in inline LLVM IR (native iW), which the C runtime can't do.
-                const bool wide = ew > 64;
                 auto* buf = entry_alloca(llvm::ArrayType::get(b_.getInt32Ty(), n * nch), "dpi.oa.bit");
                 if (pack_in) {
-                    if (wide) {
-                        emit_dpi_oa_pack_ir(storage, buf, slot, n, ew, nch, /*has_z=*/false, /*is_logic=*/false);
-                    } else {
-                        b_.CreateCall(dpi_pack_arr_bit_fn(),
-                                      { storage, b_.getInt32(stride), b_.getInt32(ew), b_.getInt32(n), buf });
-                    }
+                    emit_dpi_oa_pack_ir(storage, buf, slot, n, ew, nch, /*has_z=*/false, /*is_logic=*/false);
                 }
                 if (copy_out) {
-                    backs.push_back({ false, wide, buf, storage, slot, stride, ew, n, nch, 0, 0 });
+                    backs.push_back({ false, buf, storage, slot, ew, n, nch, 0 });
                 }
                 data       = buf;
                 elem_bytes = 4 * nch; // svBitVecVal[nch]
@@ -10111,24 +10074,14 @@ private:
                 break;
             }
             case DpiCType::LogicVec: {
-                const bool wide  = ew > 64;
-                auto*      svl   = llvm::StructType::get(ctx_, { b_.getInt32Ty(), b_.getInt32Ty() });
-                auto*      buf   = entry_alloca(llvm::ArrayType::get(svl, n * nch), "dpi.oa.logic");
-                // z field offset only when the slot actually carries a z word.
+                auto* svl = llvm::StructType::get(ctx_, { b_.getInt32Ty(), b_.getInt32Ty() });
+                auto* buf = entry_alloca(llvm::ArrayType::get(svl, n * nch), "dpi.oa.logic");
                 const uint32_t has_z = lv.has_z ? 1u : 0u;
-                const uint32_t zoff  = lv.has_z ? static_cast<uint32_t>(
-                    llmod_.getDataLayout().getStructLayout(slot)->getElementOffset(1)) : 0u;
                 if (pack_in) {
-                    if (wide) {
-                        emit_dpi_oa_pack_ir(storage, buf, slot, n, ew, nch, has_z != 0, /*is_logic=*/true);
-                    } else {
-                        b_.CreateCall(dpi_pack_arr_logic_fn(),
-                                      { storage, b_.getInt32(stride), b_.getInt32(zoff), b_.getInt32(has_z),
-                                        b_.getInt32(ew), b_.getInt32(n), buf });
-                    }
+                    emit_dpi_oa_pack_ir(storage, buf, slot, n, ew, nch, has_z != 0, /*is_logic=*/true);
                 }
                 if (copy_out) {
-                    backs.push_back({ true, wide, buf, storage, slot, stride, ew, n, nch, has_z, zoff });
+                    backs.push_back({ true, buf, storage, slot, ew, n, nch, has_z });
                 }
                 data       = buf;
                 elem_bytes = 8 * nch; // svLogicVecVal[nch] {aval,bval}
@@ -10224,21 +10177,10 @@ private:
             lower_store(lvalue_of(o.temp), pl);
         }
         // Marshalled open-array output/inout: unpack the C-written svVecVal scratch
-        // back into the design element storage. A wide (> 64-bit) element uses the
-        // inline-IR unpack (native iW/i2W); otherwise the C runtime
-        // (rt_dpi_unpack_arr_*). A zero-copy element was written in place, not here.
+        // back into the design element storage (inline IR, native iW/i2W). A
+        // zero-copy element was written in place, not here.
         for (const OaMarshalBack& o : oa_backs) {
-            if (o.wide) {
-                emit_dpi_oa_unpack_ir(o.buf, o.storage, o.slot, o.n, o.ew, o.nch, o.has_z != 0, o.is_logic);
-            } else if (o.is_logic) {
-                b_.CreateCall(dpi_unpack_arr_logic_fn(),
-                              { o.buf, b_.getInt32(o.stride), b_.getInt32(o.zoff), b_.getInt32(o.has_z),
-                                b_.getInt32(o.ew), b_.getInt32(o.n), o.storage });
-            } else {
-                b_.CreateCall(dpi_unpack_arr_bit_fn(),
-                              { o.buf, b_.getInt32(o.stride), b_.getInt32(o.ew), b_.getInt32(o.n),
-                                o.storage });
-            }
+            emit_dpi_oa_unpack_ir(o.buf, o.storage, o.slot, o.n, o.ew, o.nch, o.has_z != 0, o.is_logic);
         }
         if (f.dpi_ret_ctype == DpiCType::String) {
             // The C returns a NUL-terminated char*; copy it into this call's result

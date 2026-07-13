@@ -241,10 +241,6 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("svPutBitArrElem1VecVal", &svPutBitArrElem1VecVal);
     expose("svGetLogicArrElem1VecVal", &svGetLogicArrElem1VecVal);
     expose("svPutLogicArrElem1VecVal", &svPutLogicArrElem1VecVal);
-    expose("rt_dpi_pack_arr_bit", &rt_dpi_pack_arr_bit);
-    expose("rt_dpi_unpack_arr_bit", &rt_dpi_unpack_arr_bit);
-    expose("rt_dpi_pack_arr_logic", &rt_dpi_pack_arr_logic);
-    expose("rt_dpi_unpack_arr_logic", &rt_dpi_unpack_arr_logic);
     expose("rt_string_init", &rt_string_init);
     expose("rt_string_deinit", &rt_string_deinit);
     expose("rt_string_assign", &rt_string_assign);

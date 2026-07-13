@@ -7,7 +7,7 @@
 
 #include "svdpi.h"
 
-#include "Runtime.h" // rt_svopen + the array marshal declarations
+#include "Runtime.h" // rt_svopen
 
 #include <cstdint>
 #include <cstring>
@@ -148,7 +148,12 @@ void svPutPartselLogic(svLogicVecVal* d, const svLogicVecVal s, int i, int w) {
 
 } // extern "C"
 
-// -- Open arrays (LRM 35.5.6.2): 1-D descriptor accessors + element marshal --
+// -- Open arrays (LRM 35.5.6.2): 1-D svOpenArrayHandle descriptor accessors --
+//
+// The element pack/unpack marshal is emitted inline as LLVM IR at the DPI call site
+// (emit_dpi_oa_pack_ir / emit_dpi_oa_unpack_ir in the backend), operating on the
+// native iW/i2W design slot at any width; the runtime only provides these accessors
+// the DPI C calls on the resulting descriptor.
 
 namespace {
 
@@ -157,151 +162,9 @@ uint32_t open_pos(const rt_svopen* a, int i) {
     return static_cast<uint32_t>(a->left <= a->right ? (i - a->left) : (a->left - i));
 }
 
-using u128 = unsigned __int128;
-
-// Low-`w`-bit mask over a `>= w`-bit unsigned integer, `w <= 64`.
-inline uint64_t low_mask(uint32_t w) {
-    return w >= 64 ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << w) - 1);
-}
-
-// A w-bit-per-element pack/unpack between Clotho's `[n x slot]` design storage and a
-// contiguous svVecVal buffer. Templated on the slot integer types, the number of
-// svVecVal chunks per element `NCH` (1 for w <= 32, 2 for 33..64), and (logic)
-// whether the slot carries a z word — so each instantiation is a fixed-stride,
-// branch-free strided loop the -O2 runtime autovectorizes. `sizeof(MM)` equals the
-// mm field's alloc size (i2W rounds to 2/4/8/16 bytes for these widths), so the
-// memcpy is exact — never reads past the slot. `HasZ=false` (a z-elided `{ i2W }`
-// slot) compiles the z read out entirely.
-template <typename MM, typename Z, bool HasZ, uint32_t NCH>
-void pack_logic(const uint8_t* b, uint32_t stride, uint32_t z_off, uint32_t w, uint32_t n,
-                svLogicVecVal* o) {
-    const uint64_t mask = low_mask(w);
-    for (uint32_t k = 0; k < n; ++k) {
-        MM mm;
-        std::memcpy(&mm, b + static_cast<size_t>(k) * stride, sizeof(MM));
-        uint64_t z = 0;
-        if constexpr (HasZ) {
-            Z zc;
-            std::memcpy(&zc, b + static_cast<size_t>(k) * stride + z_off, sizeof(Z));
-            z = static_cast<uint64_t>(zc);
-        }
-        const uint64_t must = static_cast<uint64_t>(mm & static_cast<MM>(mask));
-        const uint64_t may  = static_cast<uint64_t>((mm >> w) & static_cast<MM>(mask));
-        for (uint32_t c = 0; c < NCH; ++c) {
-            const uint32_t mustc = static_cast<uint32_t>(must >> (32 * c));
-            const uint32_t mayc  = static_cast<uint32_t>(may >> (32 * c));
-            const uint32_t zc    = static_cast<uint32_t>(z >> (32 * c));
-            o[static_cast<size_t>(k) * NCH + c].aval = mayc & ~zc;
-            o[static_cast<size_t>(k) * NCH + c].bval = mustc ^ mayc;
-        }
-    }
-}
-
-template <typename MM, typename Z, bool HasZ, uint32_t NCH>
-void unpack_logic(const svLogicVecVal* in, uint8_t* b, uint32_t stride, uint32_t z_off, uint32_t w,
-                  uint32_t n) {
-    const uint64_t mask = low_mask(w);
-    for (uint32_t k = 0; k < n; ++k) {
-        uint64_t aval = 0;
-        uint64_t bval = 0;
-        for (uint32_t c = 0; c < NCH; ++c) {
-            aval |= static_cast<uint64_t>(in[static_cast<size_t>(k) * NCH + c].aval) << (32 * c);
-            bval |= static_cast<uint64_t>(in[static_cast<size_t>(k) * NCH + c].bval) << (32 * c);
-        }
-        aval &= mask;
-        bval &= mask;
-        const MM must = static_cast<MM>(aval & ~bval);
-        const MM may  = static_cast<MM>(aval | bval);
-        const MM mm   = static_cast<MM>(must | (may << w));
-        std::memcpy(b + static_cast<size_t>(k) * stride, &mm, sizeof(MM));
-        if constexpr (HasZ) {
-            const Z z = static_cast<Z>(bval & ~aval);
-            std::memcpy(b + static_cast<size_t>(k) * stride + z_off, &z, sizeof(Z));
-        }
-    }
-}
-
-template <typename V, uint32_t NCH>
-void pack_bit(const uint8_t* b, uint32_t stride, uint32_t w, uint32_t n, svBitVecVal* o) {
-    const uint64_t mask = low_mask(w);
-    for (uint32_t k = 0; k < n; ++k) {
-        V v;
-        std::memcpy(&v, b + static_cast<size_t>(k) * stride, sizeof(V));
-        const uint64_t val = static_cast<uint64_t>(v) & mask;
-        for (uint32_t c = 0; c < NCH; ++c) {
-            o[static_cast<size_t>(k) * NCH + c] = static_cast<svBitVecVal>(val >> (32 * c));
-        }
-    }
-}
-
-template <typename V, uint32_t NCH>
-void unpack_bit(const svBitVecVal* in, uint8_t* b, uint32_t stride, uint32_t w, uint32_t n) {
-    const uint64_t mask = low_mask(w);
-    for (uint32_t k = 0; k < n; ++k) {
-        uint64_t val = 0;
-        for (uint32_t c = 0; c < NCH; ++c) {
-            val |= static_cast<uint64_t>(in[static_cast<size_t>(k) * NCH + c]) << (32 * c);
-        }
-        const V v = static_cast<V>(val & mask);
-        std::memcpy(b + static_cast<size_t>(k) * stride, &v, sizeof(V));
-    }
-}
-
 } // namespace
 
 extern "C" {
-
-void rt_dpi_pack_arr_bit(const void* base, uint32_t stride, uint32_t w, uint32_t n, void* out) {
-    const auto* b = static_cast<const uint8_t*>(base);
-    auto*       o = static_cast<svBitVecVal*>(out);
-    if (w <= 8)       pack_bit<uint8_t, 1>(b, stride, w, n, o);
-    else if (w <= 16) pack_bit<uint16_t, 1>(b, stride, w, n, o);
-    else if (w <= 32) pack_bit<uint32_t, 1>(b, stride, w, n, o);
-    else              pack_bit<uint64_t, 2>(b, stride, w, n, o);
-}
-
-void rt_dpi_unpack_arr_bit(const void* in, uint32_t stride, uint32_t w, uint32_t n, void* base) {
-    const auto* i = static_cast<const svBitVecVal*>(in);
-    auto*       b = static_cast<uint8_t*>(base);
-    if (w <= 8)       unpack_bit<uint8_t, 1>(i, b, stride, w, n);
-    else if (w <= 16) unpack_bit<uint16_t, 1>(i, b, stride, w, n);
-    else if (w <= 32) unpack_bit<uint32_t, 1>(i, b, stride, w, n);
-    else              unpack_bit<uint64_t, 2>(i, b, stride, w, n);
-}
-
-void rt_dpi_pack_arr_logic(const void* base, uint32_t stride, uint32_t z_off, uint32_t has_z,
-                           uint32_t w, uint32_t n, void* out) {
-    const auto* b = static_cast<const uint8_t*>(base);
-    auto*       o = static_cast<svLogicVecVal*>(out);
-    if (has_z) {
-        if (w <= 8)       pack_logic<uint16_t, uint8_t, true, 1>(b, stride, z_off, w, n, o);
-        else if (w <= 16) pack_logic<uint32_t, uint16_t, true, 1>(b, stride, z_off, w, n, o);
-        else if (w <= 32) pack_logic<uint64_t, uint32_t, true, 1>(b, stride, z_off, w, n, o);
-        else              pack_logic<u128, uint64_t, true, 2>(b, stride, z_off, w, n, o);
-    } else {
-        if (w <= 8)       pack_logic<uint16_t, uint8_t, false, 1>(b, stride, z_off, w, n, o);
-        else if (w <= 16) pack_logic<uint32_t, uint16_t, false, 1>(b, stride, z_off, w, n, o);
-        else if (w <= 32) pack_logic<uint64_t, uint32_t, false, 1>(b, stride, z_off, w, n, o);
-        else              pack_logic<u128, uint64_t, false, 2>(b, stride, z_off, w, n, o);
-    }
-}
-
-void rt_dpi_unpack_arr_logic(const void* in, uint32_t stride, uint32_t z_off, uint32_t has_z,
-                             uint32_t w, uint32_t n, void* base) {
-    const auto* i = static_cast<const svLogicVecVal*>(in);
-    auto*       b = static_cast<uint8_t*>(base);
-    if (has_z) {
-        if (w <= 8)       unpack_logic<uint16_t, uint8_t, true, 1>(i, b, stride, z_off, w, n);
-        else if (w <= 16) unpack_logic<uint32_t, uint16_t, true, 1>(i, b, stride, z_off, w, n);
-        else if (w <= 32) unpack_logic<uint64_t, uint32_t, true, 1>(i, b, stride, z_off, w, n);
-        else              unpack_logic<u128, uint64_t, true, 2>(i, b, stride, z_off, w, n);
-    } else {
-        if (w <= 8)       unpack_logic<uint16_t, uint8_t, false, 1>(i, b, stride, z_off, w, n);
-        else if (w <= 16) unpack_logic<uint32_t, uint16_t, false, 1>(i, b, stride, z_off, w, n);
-        else if (w <= 32) unpack_logic<uint64_t, uint32_t, false, 1>(i, b, stride, z_off, w, n);
-        else              unpack_logic<u128, uint64_t, false, 2>(i, b, stride, z_off, w, n);
-    }
-}
 
 int svDimensions(const svOpenArrayHandle) {
     return 1;

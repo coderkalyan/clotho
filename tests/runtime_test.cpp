@@ -654,51 +654,6 @@ TEST_CASE("svdpi open array: descending bounds normalize the element index") {
     CHECK(*static_cast<int*>(svGetArrElemPtr1(h, 0)) == 300); // a[0] -> pos 2
 }
 
-TEST_CASE("svdpi open array: 2-state element marshal (bit[15:0] <-> svBitVecVal)") {
-    uint16_t    in[3] = { 0x1234, 0xABCD, 0x0001 }; // narrow {i16} slots, stride 2
-    svBitVecVal out[3];
-    rt_dpi_pack_arr_bit(in, sizeof(uint16_t), 16, 3, out);
-    CHECK(out[0] == 0x1234u);
-    CHECK(out[1] == 0xABCDu);
-    CHECK(out[2] == 1u);
-    uint16_t back[3] = {};
-    rt_dpi_unpack_arr_bit(out, sizeof(uint16_t), 16, 3, back);
-    CHECK(back[0] == in[0]);
-    CHECK(back[1] == in[1]);
-    CHECK(back[2] == in[2]);
-}
-
-TEST_CASE("svdpi open array: 4-state element marshal preserves x/z (logic[7:0])") {
-    // Clotho logic[7:0] element slot {i16 mm, i8 z} padded to 4 bytes.
-    struct Slot {
-        uint16_t mm;
-        uint8_t  z;
-        uint8_t  pad;
-    };
-    static_assert(sizeof(Slot) == 4);
-    Slot in[2] = { { 0x7744, 0x11, 0 }, { 0xFFFF, 0x00, 0 } }; // 01xz01xz, then 8'hFF
-    svLogicVecVal out[2];
-    rt_dpi_pack_arr_logic(in, sizeof(Slot), offsetof(Slot, z), /*has_z=*/1, 8, 2, out);
-    CHECK(out[0].aval == 0x66u); // value-or-X
-    CHECK(out[0].bval == 0x33u); // X or Z
-    CHECK(out[1].aval == 0xFFu);
-    CHECK(out[1].bval == 0x00u);
-    Slot back[2] = {};
-    rt_dpi_unpack_arr_logic(out, sizeof(Slot), offsetof(Slot, z), /*has_z=*/1, 8, 2, back);
-    CHECK(back[0].mm == in[0].mm);
-    CHECK(back[0].z == in[0].z);
-    CHECK(back[1].mm == in[1].mm);
-    CHECK(back[1].z == in[1].z);
-}
-
-TEST_CASE("svdpi open array: never-z 4-state element (no z word, has_z=0)") {
-    // A logic[7:0] whose z was elided: slot is {i16 mm} only, stride 2, no z field.
-    // A clean value V has must==may==V, so mm = V | (V<<8).
-    uint16_t      in[3] = { 0xA5A5, 0x3C3C, 0x0F0F }; // clean values (must==may)
-    svLogicVecVal out[3];
-    rt_dpi_pack_arr_logic(in, sizeof(uint16_t), /*z_off=*/0, /*has_z=*/0, 8, 3, out);
-    CHECK(out[0].aval == 0xA5u);
-    CHECK(out[0].bval == 0x00u);
-    CHECK(out[1].aval == 0x3Cu);
-    CHECK(out[2].aval == 0x0Fu);
-}
+// The element pack/unpack marshal (any width, 2-state / 4-state, x/z, z-elided
+// slots) is emitted inline as LLVM IR at the DPI call site, so it is exercised
+// end-to-end against verilator in dpi_test.cpp rather than unit-tested here.

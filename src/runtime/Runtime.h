@@ -806,20 +806,10 @@ typedef struct rt_svopen {
     uint32_t is_logic;   // 4-state element (svLogicVecVal) vs 2-state (svBitVecVal)
 } rt_svopen;
 
-// Marshal a design unpacked-array of packed elements — Clotho's `[nelem x slot]`
-// layout, element stride `stride`, plane width `w` (<= 64: one svVecVal word for
-// w <= 32, two for 33..64) — to and from a contiguous svVecVal buffer. The logic
-// (4-state) form also takes the z field offset `z_off` within the slot and `has_z`.
-// Fixed-width strided loops (autovectorized by the -O2 runtime). Named-scalar
-// 2-state elements need no marshal — their narrow `[N x iW]` storage is already the
-// C array (zero-copy).
-void rt_dpi_pack_arr_bit(const void* base, uint32_t stride, uint32_t w, uint32_t n, void* out);
-void rt_dpi_unpack_arr_bit(const void* in, uint32_t stride, uint32_t w, uint32_t n, void* base);
-// `has_z` == 0 for a never-z element whose slot carries no z word ({ i2W } only,
-// z-elided); z_off is then ignored and the marshalled z is 0.
-void rt_dpi_pack_arr_logic(const void* base, uint32_t stride, uint32_t z_off, uint32_t has_z,
-                           uint32_t w, uint32_t n, void* out);
-void rt_dpi_unpack_arr_logic(const void* in, uint32_t stride, uint32_t z_off, uint32_t has_z,
-                             uint32_t w, uint32_t n, void* base);
+// The element pack/unpack marshal is emitted inline as LLVM IR at the DPI call site
+// (emit_dpi_oa_pack_ir / emit_dpi_oa_unpack_ir), operating on the native iW/i2W
+// design slot at any width — there is no C-runtime marshal. A named-scalar 2-state
+// element needs no marshal at all: its narrow `[N x iW]` storage is already the C
+// array (zero-copy), and the descriptor points straight at it.
 
 } // extern "C"
