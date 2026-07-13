@@ -511,7 +511,12 @@ struct Analysis {
                 case Inst::Tag::FopenFd:
                 case Inst::Tag::FopenMcd:
                 case Inst::Tag::Fclose:
-                case Inst::Tag::FileValueOp:
+                case Inst::Tag::Fgetc:
+                case Inst::Tag::Ungetc:
+                case Inst::Tag::Feof:
+                case Inst::Tag::Ftell:
+                case Inst::Tag::Fseek:
+                case Inst::Tag::Rewind:
                 case Inst::Tag::Fgets:
                 case Inst::Tag::Sformat:
                 case Inst::Tag::Sformatf:

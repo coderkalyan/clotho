@@ -5592,25 +5592,25 @@ private:
         // call order.
         if (name == "$fgetc" || name == "$feof" || name == "$ftell" || name == "$rewind" ||
             name == "$ungetc" || name == "$fseek") {
-            ir::FileOp op;
-            size_t     want;
+            ir::Inst::Tag tag;
+            size_t        want;
             if (name == "$fgetc") {
-                op   = ir::FileOp::Fgetc;
+                tag  = ir::Inst::Tag::Fgetc;
                 want = 1;
             } else if (name == "$feof") {
-                op   = ir::FileOp::Feof;
+                tag  = ir::Inst::Tag::Feof;
                 want = 1;
             } else if (name == "$ftell") {
-                op   = ir::FileOp::Ftell;
+                tag  = ir::Inst::Tag::Ftell;
                 want = 1;
             } else if (name == "$rewind") {
-                op   = ir::FileOp::Rewind;
+                tag  = ir::Inst::Tag::Rewind;
                 want = 1;
             } else if (name == "$ungetc") {
-                op   = ir::FileOp::Ungetc;
+                tag  = ir::Inst::Tag::Ungetc;
                 want = 2;
             } else {
-                op   = ir::FileOp::Fseek;
+                tag  = ir::Inst::Tag::Fseek;
                 want = 3;
             }
             const auto args = call.arguments();
@@ -5622,7 +5622,13 @@ private:
             for (const Expression* a : args) {
                 vals.push_back(lower_expr(*a, b));
             }
-            return b.file_value_op(op, vals, l);
+            if (want == 1) {
+                return b.unary(tag, vals[0], l);
+            }
+            if (want == 2) {
+                return b.binary(tag, vals[0], vals[1], l);
+            }
+            return b.fseek(vals[0], vals[1], vals[2], l);
         }
 
         // $fgets(str, fd) (LRM §21.3.4): read a line into the packed-vector lvalue

@@ -221,10 +221,10 @@ public:
     Index fopen_mcd(Index name, SourceLoc loc);
     // $fclose: close the descriptor `handle`. No value.
     Index fclose(Index handle, SourceLoc loc);
-    // $fgetc / $ungetc / $feof / $ftell / $fseek / $rewind: a file read /
-    // positioning function selected by `op`, with `args` its already-lowered value
-    // operands (in call order). Yields a 32-bit integer.
-    Index file_value_op(FileOp op, std::span<const Index> args, SourceLoc loc);
+    // $fseek(fd, offset, operation): seek the descriptor. Yields a 32-bit
+    // integer (0 / -1). $fgetc / $feof / $ftell / $rewind ride the generic
+    // unary() and $ungetc the generic binary() with their dedicated tags.
+    Index fseek(Index fd, Index offset, Index operation, SourceLoc loc);
     // $fgets: read a line from descriptor `fd` into the packed-vector lvalue `dst`.
     // Yields the character count.
     Index fgets(Index dst, Index fd, SourceLoc loc);

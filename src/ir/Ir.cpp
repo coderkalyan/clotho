@@ -75,13 +75,6 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
             return index_slice(info.args);
         }
 
-        case Inst::PayloadKind::FileOp: {
-            // file_value_op: the value args live in the FileOpInfo record; the
-            // opcode is not an SSA operand.
-            const auto info = extra_data<FileOpInfo>(p.extra);
-            return index_slice(info.args);
-        }
-
         case Inst::PayloadKind::Sformat: {
             // sformat: the value args live in the SformatInfo record; the format
             // bytes and the destination lvalue are not value operands.
@@ -146,6 +139,14 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 scratch[0]    = p.op_extra.op;
                 scratch[1]    = es.index;
                 return { scratch.data(), 2 };
+            }
+            // fseek exposes its descriptor plus the offset / operation operands.
+            if (tag == Inst::Tag::Fseek) {
+                const auto fs = extra_data<FseekInfo>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = fs.offset;
+                scratch[2]    = fs.operation;
+                return { scratch.data(), 3 };
             }
             // dyn_part_select exposes its base and the runtime offset value; the
             // constant width is not an operand.

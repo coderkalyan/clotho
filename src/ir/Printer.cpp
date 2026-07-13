@@ -305,8 +305,18 @@ const char* tag_name(Inst::Tag tag) {
             return "fopen_mcd";
         case T::Fclose:
             return "fclose";
-        case T::FileValueOp:
-            return "file_op";
+        case T::Fgetc:
+            return "fgetc";
+        case T::Ungetc:
+            return "ungetc";
+        case T::Feof:
+            return "feof";
+        case T::Ftell:
+            return "ftell";
+        case T::Fseek:
+            return "fseek";
+        case T::Rewind:
+            return "rewind";
         case T::Fgets:
             return "fgets";
         case T::Sformat:
@@ -607,15 +617,6 @@ private:
                 const auto info = ir_.extra_data<SeverityInfo>(p.extra);
                 os_ << "level" << info.level << ", \"" << ir_.extra_bytes(info.banner, info.banner_len)
                     << "\", \"" << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
-                for (Index a : ir_.region(info.args)) {
-                    os_ << ", ";
-                    ref(a);
-                }
-                break;
-            }
-            case Inst::PayloadKind::FileOp: {
-                const auto info = ir_.extra_data<FileOpInfo>(p.extra);
-                os_ << "op" << info.op;
                 for (Index a : ir_.region(info.args)) {
                     os_ << ", ";
                     ref(a);

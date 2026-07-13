@@ -4066,7 +4066,12 @@ private:
                 case Inst::Tag::Fclose:
                 case Inst::Tag::FopenFd:
                 case Inst::Tag::FopenMcd:
-                case Inst::Tag::FileValueOp:
+                case Inst::Tag::Fgetc:
+                case Inst::Tag::Ungetc:
+                case Inst::Tag::Feof:
+                case Inst::Tag::Ftell:
+                case Inst::Tag::Fseek:
+                case Inst::Tag::Rewind:
                 case Inst::Tag::TimeFormat:
                 case Inst::Tag::SimTime:
                 case Inst::Tag::Random:
@@ -6193,7 +6198,12 @@ private:
             case Inst::Tag::FopenMcd:
                 // $fopen returns a 32-bit descriptor integer.
                 return { 32, false, true };
-            case Inst::Tag::FileValueOp:
+            case Inst::Tag::Fgetc:
+            case Inst::Tag::Ungetc:
+            case Inst::Tag::Feof:
+            case Inst::Tag::Ftell:
+            case Inst::Tag::Fseek:
+            case Inst::Tag::Rewind:
             case Inst::Tag::Fgets:
             case Inst::Tag::Ferror:
             case Inst::Tag::Fscanf:
@@ -7464,8 +7474,23 @@ private:
                 lower_fclose(i);
                 return;
 
-            case Inst::Tag::FileValueOp:
-                lower_file_op(i);
+            case Inst::Tag::Fgetc:
+                lower_file_unary(i, "rt_fgetc");
+                return;
+            case Inst::Tag::Feof:
+                lower_file_unary(i, "rt_feof");
+                return;
+            case Inst::Tag::Ftell:
+                lower_file_unary(i, "rt_ftell");
+                return;
+            case Inst::Tag::Rewind:
+                lower_file_unary(i, "rt_rewind");
+                return;
+            case Inst::Tag::Ungetc:
+                lower_ungetc(i);
+                return;
+            case Inst::Tag::Fseek:
+                lower_fseek(i);
                 return;
 
             case Inst::Tag::Fgets:
@@ -9004,44 +9029,38 @@ private:
         b_.CreateCall(fclose_fn(), { desc });
     }
 
-    // Lower a $fgetc / $ungetc / $feof / $ftell / $fseek / $rewind: every one takes
-    // i32 operands and returns i32, so the call is built generically and only the
-    // runtime symbol varies with the opcode. The result is a known integer.
-    void lower_file_op(Index i) {
-        const auto                   info = ir_->extra_data<FileOpInfo>(ir_->payload(i).extra);
-        const std::span<const Index> args = ir_->region(info.args);
+    // The file read / positioning system functions take i32 operands and
+    // return i32; the results are always-known integers.
+    // $fgetc / $feof / $ftell / $rewind: one descriptor operand.
+    void lower_file_unary(Index i, const char* fn) {
+        llvm::Value* fd   = cast(must_of(value_of(ir_->payload(i).unary)), 32, true);
+        auto*        i32  = b_.getInt32Ty();
+        auto*        fnty = llvm::FunctionType::get(i32, { i32 }, false);
+        llvm::Value* r    = b_.CreateCall(llmod_.getOrInsertFunction(fn, fnty), { fd });
+        set_value(i, packed(r, r, zero(32)));
+    }
 
-        std::vector<llvm::Value*> argv;
-        argv.reserve(args.size());
-        for (Index a : args) {
-            argv.push_back(cast(must_of(value_of(a)), 32, true));
-        }
+    // $ungetc(c, fd).
+    void lower_ungetc(Index i) {
+        const auto&  p    = ir_->payload(i).binary;
+        llvm::Value* c    = cast(must_of(value_of(p.l)), 32, true);
+        llvm::Value* fd   = cast(must_of(value_of(p.r)), 32, true);
+        auto*        i32  = b_.getInt32Ty();
+        auto*        fnty = llvm::FunctionType::get(i32, { i32, i32 }, false);
+        llvm::Value* r = b_.CreateCall(llmod_.getOrInsertFunction("rt_ungetc", fnty), { c, fd });
+        set_value(i, packed(r, r, zero(32)));
+    }
 
-        const char* fn = nullptr;
-        switch (static_cast<FileOp>(info.op)) {
-            case FileOp::Fgetc:
-                fn = "rt_fgetc";
-                break;
-            case FileOp::Ungetc:
-                fn = "rt_ungetc";
-                break;
-            case FileOp::Feof:
-                fn = "rt_feof";
-                break;
-            case FileOp::Ftell:
-                fn = "rt_ftell";
-                break;
-            case FileOp::Fseek:
-                fn = "rt_fseek";
-                break;
-            case FileOp::Rewind:
-                fn = "rt_rewind";
-                break;
-        }
-
-        std::vector<llvm::Type*> params(args.size(), b_.getInt32Ty());
-        auto*        fnty = llvm::FunctionType::get(b_.getInt32Ty(), params, false);
-        llvm::Value* r    = b_.CreateCall(llmod_.getOrInsertFunction(fn, fnty), argv);
+    // $fseek(fd, offset, operation).
+    void lower_fseek(Index i) {
+        const auto&  p    = ir_->payload(i).op_extra;
+        const auto   info = ir_->extra_data<FseekInfo>(p.extra);
+        llvm::Value* fd   = cast(must_of(value_of(p.op)), 32, true);
+        llvm::Value* off  = cast(must_of(value_of(info.offset)), 32, true);
+        llvm::Value* op   = cast(must_of(value_of(info.operation)), 32, true);
+        auto*        i32  = b_.getInt32Ty();
+        auto*        fnty = llvm::FunctionType::get(i32, { i32, i32, i32 }, false);
+        llvm::Value* r = b_.CreateCall(llmod_.getOrInsertFunction("rt_fseek", fnty), { fd, off, op });
         set_value(i, packed(r, r, zero(32)));
     }
 
