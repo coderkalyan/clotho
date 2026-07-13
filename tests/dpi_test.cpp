@@ -379,6 +379,33 @@ TEST_CASE("DPI import: inout 100-bit element (unaligned wide write-back)") {
     CHECK(run_capture(src) == "300000000000000000000000f\n");
 }
 
+TEST_CASE("DPI import: dynamic-array actual is zero-copy (runtime size)") {
+    constexpr std::string_view src = R"(
+        module m;
+          import "DPI-C" function int  dpi_oa_sum_int(input int a[]);
+          import "DPI-C" function void dpi_oa_fill_sq(output int a[]);
+          int da[];
+          initial begin
+            da = new[5];
+            da[0]=10; da[1]=20; da[2]=30; da[3]=40; da[4]=50;
+            $display("%0d", dpi_oa_sum_int(da));    // 150
+            dpi_oa_fill_sq(da);
+            $display("%0d %0d %0d %0d %0d", da[0], da[1], da[2], da[3], da[4]); // 0 1 4 9 16
+          end
+        endmodule)";
+    CHECK(run_capture(src) == "150\n0 1 4 9 16\n");
+}
+
+TEST_CASE("DPI import: empty dynamic-array actual reads as size 0") {
+    constexpr std::string_view src = R"(
+        module m;
+          import "DPI-C" function int dpi_oa_sum_int(input int a[]);
+          int da[];
+          initial $display("%0d", dpi_oa_sum_int(da));   // 0, no crash
+        endmodule)";
+    CHECK(run_capture(src) == "0\n");
+}
+
 // Out-of-scope constructs must fail loudly with a TODO, never silently miscompile.
 // Each is a distinct guard in build_dpi_import.
 TEST_CASE("DPI import: unsupported forms are rejected") {

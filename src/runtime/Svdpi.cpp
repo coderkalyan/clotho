@@ -178,12 +178,18 @@ int svLeft(const svOpenArrayHandle h, int) {
 int svRight(const svOpenArrayHandle h, int) {
     return static_cast<const rt_svopen*>(h)->right;
 }
+// An empty array (a 0-length dynamic array / queue) has right == left - 1, which the
+// min/max form would misread as a descending range and hand back an inverted
+// [high >= low] span — so a `for (i = svLow; i <= svHigh; i++)` C loop would deref a
+// null buffer. Return low > high (0 > -1) for the empty case so the loop is empty.
 int svLow(const svOpenArrayHandle h, int) {
     const auto* a = static_cast<const rt_svopen*>(h);
+    if (a->nelem == 0) return a->left;
     return a->left < a->right ? a->left : a->right;
 }
 int svHigh(const svOpenArrayHandle h, int) {
     const auto* a = static_cast<const rt_svopen*>(h);
+    if (a->nelem == 0) return a->left - 1;
     return a->left > a->right ? a->left : a->right;
 }
 int svIncrement(const svOpenArrayHandle h, int) {

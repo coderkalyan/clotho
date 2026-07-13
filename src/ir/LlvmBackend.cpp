@@ -9990,24 +9990,74 @@ private:
         }
     }
 
+    // Materialize an rt_svopen descriptor on the stack from its seven fields (data
+    // pointer + six i32s). Fields may be runtime Values (dynamic-array length) or
+    // constants (fixed array), so all are passed as Values.
+    llvm::Value* emit_svopen(llvm::Value* data, llvm::Value* left, llvm::Value* right,
+                             llvm::Value* nelem, llvm::Value* elem_bytes, llvm::Value* ew,
+                             llvm::Value* is_logic) {
+        auto* ty   = rt_svopen_ty();
+        auto* desc = entry_alloca(ty, "dpi.oa.desc");
+        b_.CreateStore(data, b_.CreateStructGEP(ty, desc, 0));
+        b_.CreateStore(left, b_.CreateStructGEP(ty, desc, 1));
+        b_.CreateStore(right, b_.CreateStructGEP(ty, desc, 2));
+        b_.CreateStore(nelem, b_.CreateStructGEP(ty, desc, 3));
+        b_.CreateStore(elem_bytes, b_.CreateStructGEP(ty, desc, 4));
+        b_.CreateStore(ew, b_.CreateStructGEP(ty, desc, 5));
+        b_.CreateStore(is_logic, b_.CreateStructGEP(ty, desc, 6));
+        return desc;
+    }
+
+    // Build the svOpenArrayHandle for a dynamic-array open-array actual (LRM 7.5).
+    // The actual is a runtime `{ data, len }` handle; for a named-scalar element the
+    // heap buffer is already a contiguous C `T[len]`, so the descriptor points
+    // straight at it (zero-copy, all directions — the C reads/writes the heap in
+    // place; a fixed-size view, so it never resizes). Bounds are the array's natural
+    // 0-based [0 : len-1]. Packed elements (a runtime-sized marshal scratch) are a
+    // follow-up. NOTE: an empty array (len == 0) yields right == -1; a C consumer
+    // must use svSize, not svLow..svHigh, to bound an empty array.
+    llvm::Value* build_dpi_dynarray_desc(const LValue& lv, Ref arr_ref, DpiCType elem_ct) {
+        const DynElem e            = dynarr_elem(arr_ref);
+        const bool    named_scalar = elem_ct == DpiCType::Byte || elem_ct == DpiCType::Shortint ||
+                                  elem_ct == DpiCType::Int || elem_ct == DpiCType::Longint;
+        if (!named_scalar || !e.narrow) {
+            throw BackendError{ "DPI open-array over a dynamic array supports only "
+                                "byte/shortint/int/longint (zero-copy) elements so far" };
+        }
+        llvm::Value* handle = lv.base; // &rt_dynarr { data, len }
+        llvm::Value* data =
+          b_.CreateLoad(raw_ptr_ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 0));
+        llvm::Value* len = b_.CreateZExtOrTrunc(
+          b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 1)),
+          b_.getInt32Ty());
+        const uint32_t ew = e.width;
+        return emit_svopen(data, b_.getInt32(0), b_.CreateSub(len, b_.getInt32(1)), len,
+                           b_.getInt32(ew / 8), b_.getInt32(ew), b_.getInt32(0));
+    }
+
     // Build the svOpenArrayHandle (rt_svopen*) for a DPI open-array argument
     // (LRM 35.5.6.2). Named-scalar (byte/shortint/int/longint) elements are zero-copy
     // — Clotho's narrow `[N x iW]` element storage is already a contiguous C array —
     // so the descriptor points straight at the design array (the C reads and, for
-    // output/inout, writes it directly). Packed bit/logic elements are marshalled
-    // into a contiguous svVecVal buffer (autovectorized rt_dpi_pack_arr_*): packed in
-    // for input/inout, and recorded in `backs` for the unpack-back after the call for
-    // output/inout.
+    // output/inout, writes it directly). Packed bit/logic elements are marshalled in
+    // inline LLVM IR into a contiguous svVecVal buffer: packed in for input/inout,
+    // and recorded in `backs` for the unpack-back after the call for output/inout.
     llvm::Value* build_dpi_open_array_desc(Index a, DpiCType elem_ct, ArgDir dir,
                                            std::vector<OaMarshalBack>& backs) {
         const LValue lv = lvalue_of(a);
         const Ref    arr_ref = open_array_type_ref(a);
         const Type&  at      = std::get<Type>(mod_.pool.get(arr_ref));
+        if (at.kind == Type::Kind::DynArray) {
+            // Dynamic array actual (LRM 7.5): a runtime `{ data, len }` handle. A
+            // named-scalar element is zero-copy — the heap buffer is already the C
+            // array; packed/queue elements (marshal to a runtime-sized scratch) are a
+            // follow-up (see docs/design/dpi-c.md).
+            return build_dpi_dynarray_desc(lv, arr_ref, elem_ct);
+        }
         if (at.kind != Type::Kind::UnpackedArray) {
-            // Dynamic array / queue actuals need a heap-data-pointer load + a runtime
-            // length; deferred (see docs/design/dpi-c.md).
+            // Queue actuals need a ring-de-indexed marshal; deferred.
             throw BackendError{ "DPI open-array actual must be a fixed-size unpacked "
-                                "array (dynamic array / queue deferred)" };
+                                "array or dynamic array (queue deferred)" };
         }
         if (lv.array_ty == nullptr || lv.slot_ty == nullptr) {
             throw BackendError{ "internal: DPI open-array actual is not a whole memory" };
@@ -10092,16 +10142,9 @@ private:
                 throw BackendError{ "internal: bad DPI open-array element ctype" };
         }
 
-        auto* ty   = rt_svopen_ty();
-        auto* desc = entry_alloca(ty, "dpi.oa.desc");
-        b_.CreateStore(data, b_.CreateStructGEP(ty, desc, 0));
-        b_.CreateStore(b_.getInt32(static_cast<uint32_t>(left)), b_.CreateStructGEP(ty, desc, 1));
-        b_.CreateStore(b_.getInt32(static_cast<uint32_t>(right)), b_.CreateStructGEP(ty, desc, 2));
-        b_.CreateStore(b_.getInt32(n), b_.CreateStructGEP(ty, desc, 3));
-        b_.CreateStore(b_.getInt32(elem_bytes), b_.CreateStructGEP(ty, desc, 4));
-        b_.CreateStore(b_.getInt32(ew), b_.CreateStructGEP(ty, desc, 5));
-        b_.CreateStore(b_.getInt32(is_logic), b_.CreateStructGEP(ty, desc, 6));
-        return desc;
+        return emit_svopen(data, b_.getInt32(static_cast<uint32_t>(left)),
+                           b_.getInt32(static_cast<uint32_t>(right)), b_.getInt32(n),
+                           b_.getInt32(elem_bytes), b_.getInt32(ew), b_.getInt32(is_logic));
     }
 
     // Lower a `call` to a DPI-C import (LRM 35): marshal each argument — scalar by
