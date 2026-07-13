@@ -1442,20 +1442,17 @@ public:
         return s;
     }
 
-    // Decode the (signal, edge) events of a `wait` instruction's WaitInfo. The
-    // events are packed WaitEdge records (each two words wide) in the extra
-    // buffer; this returns them in order.
-    std::vector<WaitEdge> wait_edges(ExtraIndex info) const {
-        const WaitInfo        wi    = extra_data<WaitInfo>(info);
-        const auto            start = static_cast<uint32_t>(wi.events.start);
-        const auto            end   = static_cast<uint32_t>(wi.events.end);
-        constexpr uint32_t    stride = sizeof(WaitEdge) / sizeof(uint32_t);
-        std::vector<WaitEdge> out;
-        for (uint32_t w = start; w < end; w += stride) {
-            out.push_back(extra_data<WaitEdge>(static_cast<ExtraIndex>(w)));
-        }
+    // The (signal, edge) events of a `wait` instruction's WaitInfo, in order,
+    // viewed directly over the extra buffer: WaitEdge is two u32-sized fields
+    // (ExtraPayload), so the packed records overlay the words exactly. Valid
+    // while this Ir lives, like every other extra view.
+    std::span<const WaitEdge> wait_edges(ExtraIndex info) const {
+        const WaitInfo     wi     = extra_data<WaitInfo>(info);
+        const auto         start  = static_cast<uint32_t>(wi.events.start);
+        constexpr uint32_t stride = sizeof(WaitEdge) / sizeof(uint32_t);
+        const uint32_t     count  = (static_cast<uint32_t>(wi.events.end) - start) / stride;
 
-        return out;
+        return { reinterpret_cast<const WaitEdge*>(extra_.data() + start), count };
     }
 
     // Fill `scratch` with the SSA operands of an instruction and return a view
