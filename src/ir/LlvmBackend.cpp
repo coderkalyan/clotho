@@ -3489,7 +3489,8 @@ private:
                 case Inst::Tag::FtoITrunc:
                 case Inst::Tag::FBitcast:
                 case Inst::Tag::FResize:
-                case Inst::Tag::RealMath:
+                case Inst::Tag::RealMathUnary:
+                case Inst::Tag::RealMathBinary:
                 case Inst::Tag::Land:
                 case Inst::Tag::Lor:
                 case Inst::Tag::Lnot:
@@ -4044,7 +4045,8 @@ private:
                 case Inst::Tag::FtoITrunc:
                 case Inst::Tag::FBitcast:
                 case Inst::Tag::FResize:
-                case Inst::Tag::RealMath:
+                case Inst::Tag::RealMathUnary:
+                case Inst::Tag::RealMathBinary:
                 case Inst::Tag::Land:
                 case Inst::Tag::Lor:
                 case Inst::Tag::Lnot:
@@ -6286,7 +6288,8 @@ private:
             case Inst::Tag::FResize:
                 return from_ref(p.op_type.type);
             // Every LRM 20.8.2 routine returns a real.
-            case Inst::Tag::RealMath:
+            case Inst::Tag::RealMathUnary:
+            case Inst::Tag::RealMathBinary:
                 return { 64, false, true, false, true };
 
             // $dist_* / seeded $random: a packed i64 {seed:32, draw:32}, sliced
@@ -7163,8 +7166,11 @@ private:
                 set_value(i, real_plane(v));
                 return;
             }
-            case Inst::Tag::RealMath:
-                set_value(i, lower_real_math(i));
+            case Inst::Tag::RealMathUnary:
+                set_value(i, lower_real_math_unary(i));
+                return;
+            case Inst::Tag::RealMathBinary:
+                set_value(i, lower_real_math_binary(i));
                 return;
 
             case Inst::Tag::Land:
@@ -11282,14 +11288,12 @@ private:
         return two_val(hi);
     }
 
-    Plane lower_real_math(Index i) {
-        const auto info = ir_->extra_data<RealMathInfo>(ir_->payload(i).extra);
-        const auto args = ir_->region(info.args);
-        llvm::Value* x = fp_of(value_of(args[0]));
-        llvm::Value* y = args.size() > 1 ? fp_of(value_of(args[1])) : nullptr;
+    Plane lower_real_math_unary(Index i) {
+        const auto&  p = ir_->payload(i).fn_unary;
+        llvm::Value* x = fp_of(value_of(p.op));
         using O = RealMathOp;
         namespace In = llvm::Intrinsic;
-        switch (static_cast<O>(info.op)) {
+        switch (static_cast<O>(p.fn)) {
             // LRM Table 20-4 names the C math function each maps to. The
             // classic routines lower to LLVM intrinsics (constant-foldable);
             // the inverse / hyperbolic ones call libm directly.
@@ -11301,8 +11305,6 @@ private:
                 return real_plane(b_.CreateUnaryIntrinsic(In::exp, x));
             case O::Sqrt:
                 return real_plane(b_.CreateUnaryIntrinsic(In::sqrt, x));
-            case O::Pow:
-                return real_plane(b_.CreateBinaryIntrinsic(In::pow, x, y));
             case O::Floor:
                 return real_plane(b_.CreateUnaryIntrinsic(In::floor, x));
             case O::Ceil:
@@ -11319,10 +11321,6 @@ private:
                 return real_plane(libm_call("acos", x));
             case O::Atan:
                 return real_plane(libm_call("atan", x));
-            case O::Atan2:
-                return real_plane(libm_call("atan2", x, y));
-            case O::Hypot:
-                return real_plane(libm_call("hypot", x, y));
             case O::Sinh:
                 return real_plane(libm_call("sinh", x));
             case O::Cosh:
@@ -11335,8 +11333,30 @@ private:
                 return real_plane(libm_call("acosh", x));
             case O::Atanh:
                 return real_plane(libm_call("atanh", x));
+            case O::Pow:
+            case O::Atan2:
+            case O::Hypot:
+                break;
         }
-        throw BackendError{ "unknown real math op" };
+        throw BackendError{ "internal: two-operand routine on RealMathUnary" };
+    }
+
+    Plane lower_real_math_binary(Index i) {
+        const auto&  p    = ir_->payload(i).op_extra;
+        const auto   info = ir_->extra_data<RealMathBinaryInfo>(p.extra);
+        llvm::Value* x    = fp_of(value_of(p.op));
+        llvm::Value* y    = fp_of(value_of(info.rhs));
+        using O = RealMathOp;
+        switch (static_cast<O>(info.fn)) {
+            case O::Pow:
+                return real_plane(b_.CreateBinaryIntrinsic(llvm::Intrinsic::pow, x, y));
+            case O::Atan2:
+                return real_plane(libm_call("atan2", x, y));
+            case O::Hypot:
+                return real_plane(libm_call("hypot", x, y));
+            default:
+                throw BackendError{ "internal: one-operand routine on RealMathBinary" };
+        }
     }
 
     // -- Arithmetic: any X/Z in an operand makes the whole result X. --

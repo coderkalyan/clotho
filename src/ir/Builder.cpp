@@ -103,10 +103,15 @@ Index Builder::float_cvt(Inst::Tag tag, Index op, Ref type, SourceLoc loc) {
 }
 
 Index Builder::real_math(RealMathOp op, std::span<const Index> args, SourceLoc loc) {
-    const ExtraSlice slice = add_slice(args);
-    const ExtraIndex extra = add_extra(RealMathInfo{ static_cast<uint32_t>(op), slice });
+    if (args.size() == 2) {
+        const ExtraIndex extra = add_extra(RealMathBinaryInfo{ args[1], static_cast<uint32_t>(op) });
 
-    return emit({ Inst::Tag::RealMath, pay(&Inst::Payload::extra, extra) }, loc);
+        return emit({ Inst::Tag::RealMathBinary, Inst::Payload{ .op_extra = { args[0], extra } } },
+                    loc);
+    }
+    return emit({ Inst::Tag::RealMathUnary,
+                  Inst::Payload{ .fn_unary = { args[0], static_cast<uint32_t>(op) } } },
+                loc);
 }
 
 Index Builder::repl(Index value, uint32_t count, SourceLoc loc) {

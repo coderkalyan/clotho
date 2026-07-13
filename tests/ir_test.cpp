@@ -493,16 +493,36 @@ TEST_CASE("float tags round-trip through builder, payload_kind, and operands") {
     CHECK(payload_kind(ir.tag(sum)) == Inst::PayloadKind::Binary);
     CHECK(payload_kind(ir.tag(neg)) == Inst::PayloadKind::Unary);
     CHECK(payload_kind(ir.tag(cvt)) == Inst::PayloadKind::OpType);
-    CHECK(payload_kind(ir.tag(pw)) == Inst::PayloadKind::RealMath);
+    CHECK(payload_kind(ir.tag(pw)) == Inst::PayloadKind::OpExtra);
 
     CHECK(ir.payload(cvt).op_type.type == pool.bit_type);
 
-    const auto info = ir.extra_data<RealMathInfo>(ir.payload(pw).extra);
-    CHECK(info.op == static_cast<uint32_t>(RealMathOp::Pow));
+    const auto info = ir.extra_data<RealMathBinaryInfo>(ir.payload(pw).op_extra.extra);
+    CHECK(info.fn == static_cast<uint32_t>(RealMathOp::Pow));
 
     std::array<Index, 3> scratch;
     const auto           ops = ir.operands(pw, scratch);
     REQUIRE(ops.size() == 2);
     CHECK(ops[0] == x);
     CHECK(ops[1] == y);
+}
+
+TEST_CASE("one-operand real math rides the fn_unary payload") {
+    InternPool pool;
+    Builder    b(pool);
+    const auto l = static_cast<SourceLoc>(0);
+
+    const Index                x = b.constant(pool.put_real(pool.real_type, 1.5), l);
+    const std::array<Index, 1> margs{ x };
+    const Index                sq = b.real_math(RealMathOp::Sqrt, margs, l);
+    b.unary(Inst::Tag::Ret, sq, l);
+
+    const Ir ir = b.finish();
+    CHECK(payload_kind(ir.tag(sq)) == Inst::PayloadKind::FnUnary);
+    CHECK(ir.payload(sq).fn_unary.fn == static_cast<uint32_t>(RealMathOp::Sqrt));
+
+    std::array<Index, 3> scratch;
+    const auto           ops = ir.operands(sq, scratch);
+    REQUIRE(ops.size() == 1);
+    CHECK(ops[0] == x);
 }

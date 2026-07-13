@@ -458,14 +458,14 @@ struct FseekInfo {
     Index operation;
 };
 
-// Extra payload for `real_math`: a real math system function (LRM §20.8.2).
-// `op` is the ir::RealMathOp selecting the routine; `args` are its real value
-// operands in call order (one for most, two for Pow / Atan2 / Hypot).
-struct RealMathInfo {
+// Extra payload for `real_math_binary`: the second real operand plus the
+// ir::RealMathOp selecting the routine (Pow / Atan2 / Hypot); the first
+// operand is the instruction's op.
+struct RealMathBinaryInfo {
+    // Second real operand (exponent / x / second leg).
+    Index rhs;
     // ir::RealMathOp value.
-    uint32_t op;
-    // Real value operands in call order.
-    ExtraSlice args;
+    uint32_t fn;
 };
 
 // Extra payload for `dist_call`: a probabilistic distribution function (LRM
@@ -680,7 +680,7 @@ static_assert(ExtraPayload<SwitchInfo>);
 static_assert(ExtraPayload<DisplayInfo>);
 static_assert(ExtraPayload<SeverityInfo>);
 static_assert(ExtraPayload<FseekInfo>);
-static_assert(ExtraPayload<RealMathInfo>);
+static_assert(ExtraPayload<RealMathBinaryInfo>);
 static_assert(ExtraPayload<DistInfo>);
 static_assert(ExtraPayload<SformatInfo>);
 static_assert(ExtraPayload<SformatfInfo>);
@@ -920,9 +920,13 @@ struct Inst {
         FBitcast,
         // real <-> shortreal value conversion (fpext / fptrunc, LRM 6.12.1).
         FResize,
-        // Real math system function $sqrt / $sin / ... (payload: extra ->
-        // RealMathInfo). LRM §20.8.2: each matches the C math library function.
-        RealMath,
+        // One-operand real math system function — $ln / $sqrt / $sin / ...
+        // (payload: fn_unary — op is the real operand, fn the ir::RealMathOp).
+        // LRM §20.8.2: each matches the C math library function.
+        RealMathUnary,
+        // Two-operand real math system function — $pow / $atan2 / $hypot
+        // (payload: op_extra -> RealMathBinaryInfo; op is the first operand).
+        RealMathBinary,
 
         // -- Logical, -> 1-bit --
         // Logical and (payload: binary).
@@ -1273,6 +1277,8 @@ struct Inst {
         Arg,
         Local,
         Repl,
+        // The fn_unary member: one operand plus a routine selector.
+        FnUnary,
         OpExtra,
         Extra,
         Call,
@@ -1283,7 +1289,6 @@ struct Inst {
         Sformat,
         Sformatf,
         Scanf,
-        RealMath,
         Dist,
         Severity,
     };
@@ -1335,6 +1340,13 @@ struct Inst {
             // Replication count.
             uint32_t count;
         } repl;
+        // One operand plus a routine selector (real_math_unary).
+        struct {
+            // The operand value.
+            Index op;
+            // Routine selector (ir::RealMathOp value).
+            uint32_t fn;
+        } fn_unary;
         // Primary operand plus a handle to an extra struct (select, part_select, cond).
         struct {
             // Condition / base operand.
@@ -1505,8 +1517,8 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Fscanf:
         case T::Sscanf:
             return K::Scanf;
-        case T::RealMath:
-            return K::RealMath;
+        case T::RealMathUnary:
+            return K::FnUnary;
         case T::DistCall:
             return K::Dist;
         case T::TimeFormat:
@@ -1557,6 +1569,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Cond:
         case T::Switch:
         case T::Fseek:
+        case T::RealMathBinary:
         case T::FreadMem:
         case T::ReadMem:
         case T::StrPutc:

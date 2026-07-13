@@ -96,12 +96,9 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
             return index_slice(info.args);
         }
 
-        case Inst::PayloadKind::RealMath: {
-            // real_math: the value args live in the RealMathInfo record; the
-            // opcode is not an SSA operand.
-            const auto info = extra_data<RealMathInfo>(p.extra);
-            return index_slice(info.args);
-        }
+        case Inst::PayloadKind::FnUnary:
+            scratch[0] = p.fn_unary.op;
+            return { scratch.data(), 1 };
 
         case Inst::PayloadKind::Dist: {
             // dist_call: the seed + parameter operands live in the DistInfo
@@ -138,6 +135,14 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 const auto es = extra_data<ElemSelect>(p.op_extra.extra);
                 scratch[0]    = p.op_extra.op;
                 scratch[1]    = es.index;
+                return { scratch.data(), 2 };
+            }
+            // real_math_binary exposes its two real operands; the routine
+            // selector is not an operand.
+            if (tag == Inst::Tag::RealMathBinary) {
+                const auto rm = extra_data<RealMathBinaryInfo>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = rm.rhs;
                 return { scratch.data(), 2 };
             }
             // fseek exposes its descriptor plus the offset / operation operands.

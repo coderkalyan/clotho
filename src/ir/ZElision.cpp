@@ -353,7 +353,8 @@ struct Analysis {
                 case Inst::Tag::FtoITrunc:
                 case Inst::Tag::FBitcast:
                 case Inst::Tag::FResize:
-                case Inst::Tag::RealMath:
+                case Inst::Tag::RealMathUnary:
+                case Inst::Tag::RealMathBinary:
                     break;
 
                 case Inst::Tag::Ret:

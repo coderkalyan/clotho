@@ -409,8 +409,10 @@ const char* tag_name(Inst::Tag tag) {
             return "fbitcast";
         case T::FResize:
             return "fresize";
-        case T::RealMath:
-            return "real_math";
+        case T::RealMathUnary:
+            return "real_math_unary";
+        case T::RealMathBinary:
+            return "real_math_binary";
     }
 
     return "?";
@@ -652,15 +654,10 @@ private:
                 }
                 break;
             }
-            case Inst::PayloadKind::RealMath: {
-                const auto info = ir_.extra_data<RealMathInfo>(p.extra);
-                os_ << "op" << info.op;
-                for (Index a : ir_.region(info.args)) {
-                    os_ << ", ";
-                    ref(a);
-                }
+            case Inst::PayloadKind::FnUnary:
+                os_ << "op" << p.fn_unary.fn << ", ";
+                ref(p.fn_unary.op);
                 break;
-            }
             case Inst::PayloadKind::Dist: {
                 const auto info = ir_.extra_data<DistInfo>(p.extra);
                 os_ << "op" << info.op;
