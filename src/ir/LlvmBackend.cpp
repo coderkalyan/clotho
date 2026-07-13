@@ -7646,10 +7646,11 @@ private:
         // for a module signal or a frame-local dynamic array alike.
         const DynElem e = dynarr_elem(da.array_type);
         switch (static_cast<DynArrayOp>(da.sub)) {
-            case DynArrayOp::New: {
+            case DynArrayOp::New:
+            case DynArrayOp::NewInit: {
                 llvm::Value* n     = cast(must_of(value_of(da.size)), 64, false);
                 llvm::Value* proto = dynarr_elem_proto(e);
-                if (da.has_src) {
+                if (static_cast<DynArrayOp>(da.sub) == DynArrayOp::NewInit) {
                     b_.CreateCall(dynarr_new_copy_fn(),
                                   { handle, b_.getInt64(dynarr_stride(e)), n, proto,
                                     lvalue_of(da.src).base });

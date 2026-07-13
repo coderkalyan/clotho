@@ -209,16 +209,17 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 scratch[1]      = info.src;
                 return { scratch.data(), 2 };
             }
-            // dyn_array_op exposes the handle lvalue plus the New size and the
-            // New-init / Copy source lvalue; the sub-op selector is not an operand.
+            // dyn_array_op exposes the handle lvalue plus the size / src
+            // operands its sub-op takes; the sub-op selector is not an operand.
             if (tag == Inst::Tag::DynArrayOp) {
-                const auto da = extra_data<DynArrayInfo>(p.op_extra.extra);
-                size_t     n  = 0;
-                scratch[n++]  = p.op_extra.op;
-                if (da.sub == static_cast<uint32_t>(DynArrayOp::New)) {
+                const auto da  = extra_data<DynArrayInfo>(p.op_extra.extra);
+                const auto sub = static_cast<DynArrayOp>(da.sub);
+                size_t     n   = 0;
+                scratch[n++]   = p.op_extra.op;
+                if (sub == DynArrayOp::New || sub == DynArrayOp::NewInit) {
                     scratch[n++] = da.size;
                 }
-                if (da.has_src) {
+                if (sub == DynArrayOp::NewInit || sub == DynArrayOp::Copy) {
                     scratch[n++] = da.src;
                 }
                 return { scratch.data(), n };

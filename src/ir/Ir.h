@@ -228,10 +228,12 @@ struct MemberSelect {
 // lockstep with the backend dispatch in LlvmBackend and the runtime rt_dynarr_*
 // functions.
 enum class DynArrayOp : uint32_t {
-    // arr = new[size] [ (src) ]: (re)allocate to `size` elements, each the
-    // element's power-on value; with an init source, copy min(size, src.len)
-    // elements from it first (LRM 7.5.1).
+    // arr = new[size]: (re)allocate to `size` elements, each the element's
+    // power-on value (LRM 7.5.1).
     New,
+    // arr = new[size](src): like New, then copy min(size, src.len) elements
+    // from the `src` handle lvalue (LRM 7.5.1).
+    NewInit,
     // arr.size(): the current element count (LRM 7.5), a 32-bit int.
     Size,
     // arr.delete(): free the storage, size -> 0 (LRM 7.5).
@@ -285,19 +287,18 @@ struct QueueInfo {
 
 // Extra payload for `dyn_array_op`: a dynamic-array operation on the handle
 // lvalue `op` (the instruction's op_extra.op). `sub` is the ir::DynArrayOp;
-// `size` is the element count for New (else unused); `src` is the source handle
-// lvalue for a New init source or a Copy, valid iff `has_src`. `array_type` is
+// `size` is the element count (New / NewInit); `src` the source handle lvalue
+// (NewInit / Copy). Operand presence is derived from `sub`; a slot unused by
+// the sub-op holds the handle lvalue as deterministic filler. `array_type` is
 // the interned DynArray type, giving the element stride / slot independently of
 // the target signal — so the op works for a module signal or a frame local.
 struct DynArrayInfo {
     // ir::DynArrayOp value.
     uint32_t sub;
-    // Element count operand (New).
+    // Element count operand (New / NewInit).
     Index size;
-    // Source dynamic-array handle lvalue (New init source / Copy).
+    // Source dynamic-array handle lvalue (NewInit / Copy).
     Index src;
-    // Whether `src` is present.
-    uint32_t has_src;
     // The interned DynArray type of the target (element stride / slot).
     Ref array_type;
 };
