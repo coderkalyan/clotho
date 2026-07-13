@@ -912,58 +912,171 @@ extern "C" void rt_nba_arr_reset(void) {
     arr_total = 0;
 }
 
+// -- Container element lifecycle (rt_elem_ops) --
+//
+// Generic recursion over the element descriptor. POD short-circuits to raw
+// byte moves, so the descriptor adds no cost to the plane-scalar fast paths.
+
+extern "C" void rt_elem_init(const rt_elem_ops* o, void* p) {
+    std::memcpy(p, o->proto, static_cast<size_t>(o->stride));
+}
+
+extern "C" void rt_elem_deinit(const rt_elem_ops* o, void* p) {
+    switch (o->kind) {
+        case rt_elem_pod:
+            return;
+        case rt_elem_string:
+            rt_string_deinit(static_cast<rt_string*>(p));
+            return;
+        case rt_elem_dynarr:
+            rt_dynarr_delete(static_cast<rt_dynarr*>(p), o->inner);
+            return;
+        case rt_elem_queue:
+            rt_queue_delete_all(static_cast<rt_queue*>(p), o->inner);
+            return;
+        case rt_elem_aggregate:
+            for (uint32_t i = 0; i < o->nleaves; ++i) {
+                rt_elem_deinit(o->leaves[i].ops,
+                               static_cast<uint8_t*>(p) + o->leaves[i].offset);
+            }
+            return;
+        default:
+            return;
+    }
+}
+
+extern "C" void rt_elem_copy(const rt_elem_ops* o, void* dst, const void* src) {
+    switch (o->kind) {
+        case rt_elem_pod:
+            std::memcpy(dst, src, static_cast<size_t>(o->stride));
+            return;
+        case rt_elem_string:
+            rt_string_assign(static_cast<rt_string*>(dst), static_cast<const rt_string*>(src));
+            return;
+        case rt_elem_dynarr:
+            rt_dynarr_assign(static_cast<rt_dynarr*>(dst), static_cast<const rt_dynarr*>(src),
+                             o->inner);
+            return;
+        case rt_elem_queue:
+            rt_queue_assign(static_cast<rt_queue*>(dst), static_cast<const rt_queue*>(src),
+                            o->inner);
+            return;
+        case rt_elem_aggregate:
+            // Deep-assign every heap leaf (dst's owned buffers are reused per
+            // leaf), then raw-copy the POD gaps between the leaf slots. The gap
+            // walk relies on `leaves` being offset-sorted (backend invariant).
+            for (uint32_t i = 0; i < o->nleaves; ++i) {
+                rt_elem_copy(o->leaves[i].ops,
+                             static_cast<uint8_t*>(dst) + o->leaves[i].offset,
+                             static_cast<const uint8_t*>(src) + o->leaves[i].offset);
+            }
+            {
+                uint64_t pos = 0;
+                for (uint32_t i = 0; i <= o->nleaves; ++i) {
+                    const uint64_t end =
+                        i < o->nleaves ? o->leaves[i].offset : o->stride;
+                    if (end > pos) {
+                        std::memcpy(static_cast<uint8_t*>(dst) + pos,
+                                    static_cast<const uint8_t*>(src) + pos,
+                                    static_cast<size_t>(end - pos));
+                    }
+                    if (i < o->nleaves) {
+                        pos = o->leaves[i].offset + o->leaves[i].ops->stride;
+                    }
+                }
+            }
+            return;
+        default:
+            return;
+    }
+}
+
+namespace {
+
+// Whether elements need per-element construction / destruction (anything but
+// raw bytes).
+bool elem_managed(const rt_elem_ops* o) {
+    return o->kind != rt_elem_pod;
+}
+
+} // namespace
+
 // -- Dynamic arrays (LRM 7.5) --
 
-extern "C" void rt_dynarr_new(rt_dynarr* h, uint64_t stride, uint64_t n, const void* proto) {
-    std::free(h->data);
-    h->data = nullptr;
-    h->len  = 0;
+extern "C" void rt_dynarr_new(rt_dynarr* h, const rt_elem_ops* ops, uint64_t n) {
+    rt_dynarr_delete(h, ops);
     if (n == 0) {
         return;
     }
+    const uint64_t stride = ops->stride;
     auto* buf = static_cast<uint8_t*>(std::malloc(static_cast<size_t>(n * stride)));
     for (uint64_t i = 0; i < n; ++i) {
-        std::memcpy(buf + i * stride, proto, static_cast<size_t>(stride));
+        std::memcpy(buf + i * stride, ops->proto, static_cast<size_t>(stride));
     }
     h->data = buf;
     h->len  = n;
 }
 
-extern "C" void rt_dynarr_new_copy(rt_dynarr* h, uint64_t stride, uint64_t n, const void* proto,
+extern "C" void rt_dynarr_new_copy(rt_dynarr* h, const rt_elem_ops* ops, uint64_t n,
                                    const rt_dynarr* src) {
-    // Copy from `src` before freeing `h`: a self-resize (`a = new[n](a)`) aliases
-    // src == h, so the old buffer must stay live through the element copy.
-    const uint64_t copy = src->len < n ? src->len : n;
+    // Build the new buffer before destroying `h`'s old one: a self-resize
+    // (`a = new[n](a)`) aliases src == h, so the old elements must stay live
+    // through the deep copy.
+    const uint64_t stride = ops->stride;
+    const uint64_t copy   = src->len < n ? src->len : n;
     auto*          buf  = n == 0 ? nullptr : static_cast<uint8_t*>(std::malloc(static_cast<size_t>(n * stride)));
-    if (copy != 0) {
-        std::memcpy(buf, src->data, static_cast<size_t>(copy * stride));
+    if (!elem_managed(ops)) {
+        if (copy != 0) {
+            std::memcpy(buf, src->data, static_cast<size_t>(copy * stride));
+        }
+        for (uint64_t i = copy; i < n; ++i) {
+            std::memcpy(buf + i * stride, ops->proto, static_cast<size_t>(stride));
+        }
+    } else {
+        const auto* sdata = static_cast<const uint8_t*>(src->data);
+        for (uint64_t i = 0; i < n; ++i) {
+            rt_elem_init(ops, buf + i * stride);
+            if (i < copy) {
+                rt_elem_copy(ops, buf + i * stride, sdata + i * stride);
+            }
+        }
     }
-    for (uint64_t i = copy; i < n; ++i) {
-        std::memcpy(buf + i * stride, proto, static_cast<size_t>(stride));
-    }
-    std::free(h->data);
+    rt_dynarr_delete(h, ops);
     h->data = buf;
     h->len  = n;
 }
 
-extern "C" void rt_dynarr_delete(rt_dynarr* h) {
+extern "C" void rt_dynarr_delete(rt_dynarr* h, const rt_elem_ops* ops) {
+    if (elem_managed(ops)) {
+        auto* data = static_cast<uint8_t*>(h->data);
+        for (uint64_t i = 0; i < h->len; ++i) {
+            rt_elem_deinit(ops, data + i * ops->stride);
+        }
+    }
     std::free(h->data);
     h->data = nullptr;
     h->len  = 0;
 }
 
-extern "C" void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, uint64_t stride) {
+extern "C" void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, const rt_elem_ops* ops) {
     if (dst == src) {
         return;
     }
-    std::free(dst->data);
+    rt_dynarr_delete(dst, ops);
     if (src->len == 0) {
-        dst->data = nullptr;
-        dst->len  = 0;
         return;
     }
+    const uint64_t stride = ops->stride;
     auto* buf = static_cast<uint8_t*>(std::malloc(static_cast<size_t>(src->len * stride)));
-    std::memcpy(buf, src->data, static_cast<size_t>(src->len * stride));
+    if (!elem_managed(ops)) {
+        std::memcpy(buf, src->data, static_cast<size_t>(src->len * stride));
+    } else {
+        const auto* sdata = static_cast<const uint8_t*>(src->data);
+        for (uint64_t i = 0; i < src->len; ++i) {
+            rt_elem_init(ops, buf + i * stride);
+            rt_elem_copy(ops, buf + i * stride, sdata + i * stride);
+        }
+    }
     dst->data = buf;
     dst->len  = src->len;
 }
@@ -1135,14 +1248,6 @@ void q_reserve(rt_queue* h, uint64_t stride, uint64_t need) {
     h->cap  = newcap;
 }
 
-// Drop elements from the back until the bounded-queue limit holds (LRM 7.10.4:
-// keep the first `bound + 1` elements; bound == 0 is unbounded).
-void q_apply_bound(rt_queue* h, uint64_t bound) {
-    if (bound != 0 && h->len > bound + 1) {
-        h->len = bound + 1;
-    }
-}
-
 } // namespace
 
 namespace {
@@ -1181,65 +1286,113 @@ void intra_ready_push(rt_intra_rec* rec) {
 
 } // namespace
 
-extern "C" void rt_queue_push_back(rt_queue* h, uint64_t stride, uint64_t bound, const void* elem) {
-    q_reserve(h, stride, h->len + 1);
-    std::memcpy(q_elem(h, stride, h->len), elem, static_cast<size_t>(stride));
-    h->len += 1;
-    q_apply_bound(h, bound);
+// Drop elements past the bounded-queue limit, destroying managed ones
+// (LRM 7.10.4: keep the first `bound + 1` elements; bound == 0 is unbounded).
+static void q_apply_bound_ops(rt_queue* h, const rt_elem_ops* ops, uint64_t bound) {
+    if (bound == 0 || h->len <= bound + 1) {
+        return;
+    }
+    if (ops->kind != rt_elem_pod) {
+        for (uint64_t i = bound + 1; i < h->len; ++i) {
+            rt_elem_deinit(ops, q_elem(h, ops->stride, i));
+        }
+    }
+    h->len = bound + 1;
 }
 
-extern "C" void rt_queue_push_front(rt_queue* h, uint64_t stride, uint64_t bound, const void* elem) {
+extern "C" void rt_queue_push_back(rt_queue* h, const rt_elem_ops* ops, uint64_t bound,
+                                   const void* elem) {
+    const uint64_t stride = ops->stride;
+    q_reserve(h, stride, h->len + 1);
+    void* slot = q_elem(h, stride, h->len);
+    if (ops->kind == rt_elem_pod) {
+        std::memcpy(slot, elem, static_cast<size_t>(stride));
+    } else {
+        rt_elem_init(ops, slot);
+        rt_elem_copy(ops, slot, elem);
+    }
+    h->len += 1;
+    q_apply_bound_ops(h, ops, bound);
+}
+
+extern "C" void rt_queue_push_front(rt_queue* h, const rt_elem_ops* ops, uint64_t bound,
+                                    const void* elem) {
+    const uint64_t stride = ops->stride;
     q_reserve(h, stride, h->len + 1);
     h->head = (h->head + h->cap - 1) % h->cap;
-    std::memcpy(q_elem(h, stride, 0), elem, static_cast<size_t>(stride));
+    void* slot = q_elem(h, stride, 0);
+    if (ops->kind == rt_elem_pod) {
+        std::memcpy(slot, elem, static_cast<size_t>(stride));
+    } else {
+        rt_elem_init(ops, slot);
+        rt_elem_copy(ops, slot, elem);
+    }
     h->len += 1;
-    q_apply_bound(h, bound);
+    q_apply_bound_ops(h, ops, bound);
 }
 
-extern "C" void rt_queue_pop_back(rt_queue* h, uint64_t stride, void* out) {
+extern "C" void rt_queue_pop_back(rt_queue* h, const rt_elem_ops* ops, void* out) {
     if (h->len == 0) {
         return;
     }
+    // Relocation: the element's bytes (and heap ownership) move to `out`; the
+    // vacated slot is not destroyed.
     h->len -= 1;
-    std::memcpy(out, q_elem(h, stride, h->len), static_cast<size_t>(stride));
+    std::memcpy(out, q_elem(h, ops->stride, h->len), static_cast<size_t>(ops->stride));
 }
 
-extern "C" void rt_queue_pop_front(rt_queue* h, uint64_t stride, void* out) {
+extern "C" void rt_queue_pop_front(rt_queue* h, const rt_elem_ops* ops, void* out) {
     if (h->len == 0) {
         return;
     }
-    std::memcpy(out, q_elem(h, stride, 0), static_cast<size_t>(stride));
+    std::memcpy(out, q_elem(h, ops->stride, 0), static_cast<size_t>(ops->stride));
     h->head = (h->head + 1) % h->cap;
     h->len -= 1;
 }
 
-extern "C" void rt_queue_insert(rt_queue* h, uint64_t stride, uint64_t bound, uint64_t i,
+extern "C" void rt_queue_insert(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, uint64_t i,
                                 const void* elem) {
     if (i > h->len) {
         return;
     }
+    const uint64_t stride = ops->stride;
     q_reserve(h, stride, h->len + 1);
-    // Shift [i, len) up by one to open a slot at i.
+    // Shift [i, len) up by one to open a slot at i (relocation, raw memcpy).
     for (uint64_t j = h->len; j > i; --j) {
         std::memcpy(q_elem(h, stride, j), q_elem(h, stride, j - 1), static_cast<size_t>(stride));
     }
-    std::memcpy(q_elem(h, stride, i), elem, static_cast<size_t>(stride));
+    void* slot = q_elem(h, stride, i);
+    if (ops->kind == rt_elem_pod) {
+        std::memcpy(slot, elem, static_cast<size_t>(stride));
+    } else {
+        rt_elem_init(ops, slot);
+        rt_elem_copy(ops, slot, elem);
+    }
     h->len += 1;
-    q_apply_bound(h, bound);
+    q_apply_bound_ops(h, ops, bound);
 }
 
-extern "C" void rt_queue_delete_idx(rt_queue* h, uint64_t stride, uint64_t i) {
+extern "C" void rt_queue_delete_idx(rt_queue* h, const rt_elem_ops* ops, uint64_t i) {
     if (i >= h->len) {
         return;
     }
-    // Shift (i, len) down by one over the removed slot.
+    const uint64_t stride = ops->stride;
+    if (ops->kind != rt_elem_pod) {
+        rt_elem_deinit(ops, q_elem(h, stride, i));
+    }
+    // Shift (i, len) down by one over the removed slot (relocation).
     for (uint64_t j = i; j + 1 < h->len; ++j) {
         std::memcpy(q_elem(h, stride, j), q_elem(h, stride, j + 1), static_cast<size_t>(stride));
     }
     h->len -= 1;
 }
 
-extern "C" void rt_queue_delete_all(rt_queue* h) {
+extern "C" void rt_queue_delete_all(rt_queue* h, const rt_elem_ops* ops) {
+    if (ops->kind != rt_elem_pod) {
+        for (uint64_t i = 0; i < h->len; ++i) {
+            rt_elem_deinit(ops, q_elem(h, ops->stride, i));
+        }
+    }
     std::free(h->base);
     h->base = nullptr;
     h->head = 0;
@@ -1247,23 +1400,28 @@ extern "C" void rt_queue_delete_all(rt_queue* h) {
     h->cap  = 0;
 }
 
-extern "C" void rt_queue_assign(rt_queue* dst, const rt_queue* src, uint64_t stride) {
+extern "C" void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_elem_ops* ops) {
     if (dst == src) {
         return;
     }
-    std::free(dst->base);
-    dst->head = 0;
+    rt_queue_delete_all(dst, ops);
     if (src->len == 0) {
-        dst->base = nullptr;
-        dst->len  = 0;
-        dst->cap  = 0;
         return;
     }
+    const uint64_t stride = ops->stride;
     auto* buf = static_cast<uint8_t*>(std::malloc(static_cast<size_t>(src->len * stride)));
-    for (uint64_t i = 0; i < src->len; ++i) {
-        std::memcpy(buf + i * stride, q_elem(src, stride, i), static_cast<size_t>(stride));
+    if (ops->kind == rt_elem_pod) {
+        for (uint64_t i = 0; i < src->len; ++i) {
+            std::memcpy(buf + i * stride, q_elem(src, stride, i), static_cast<size_t>(stride));
+        }
+    } else {
+        for (uint64_t i = 0; i < src->len; ++i) {
+            rt_elem_init(ops, buf + i * stride);
+            rt_elem_copy(ops, buf + i * stride, q_elem(src, stride, i));
+        }
     }
     dst->base = buf;
+    dst->head = 0;
     dst->len  = src->len;
     dst->cap  = src->len;
 }

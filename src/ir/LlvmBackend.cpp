@@ -699,11 +699,29 @@ private:
         bool              four_state = false;
         bool              has_z      = false;
         bool              narrow     = false;
+        // Managed element shapes: a string handle slot, or a nested container
+        // (dynamic array / queue) handle slot. Width / domain fields are
+        // meaningless for these.
+        bool is_string = false;
+        bool is_handle = false;
+        Ref  elem_type{};
     };
     DynElem dynarr_elem(Ref array_type) {
-        const Type&    at  = std::get<Type>(mod_.pool.get(array_type));
-        const Layout   lay = mod_.pool.layout(at.element);
-        DynElem        e;
+        const Type& at = std::get<Type>(mod_.pool.get(array_type));
+        DynElem     e;
+        e.elem_type    = at.element;
+        const Type& et = std::get<Type>(mod_.pool.get(at.element));
+        if (et.kind == Type::Kind::String) {
+            e.is_string = true;
+            e.slot_ty   = str_slot_ty();
+            return e;
+        }
+        if (et.kind == Type::Kind::DynArray || et.kind == Type::Kind::Queue) {
+            e.is_handle = true;
+            e.slot_ty   = handle_slot_ty(at.element);
+            return e;
+        }
+        const Layout lay = mod_.pool.layout(at.element);
         e.width      = lay.width == 0 ? 1 : lay.width;
         e.four_state = lay.domain == Domain::Four;
         e.has_z      = e.four_state;
@@ -712,24 +730,78 @@ private:
         return e;
     }
 
-    // Element power-on prototype for `new[]`: X for a 4-state element, 0 for
-    // 2-state / real. A private constant global whose address the runtime copies
-    // into each freshly allocated element.
-    llvm::Value* dynarr_elem_proto(const DynElem& e) {
+    // Byte size of one element slot (the runtime stride).
+    uint64_t dynarr_stride(const DynElem& e) {
+        return llmod_.getDataLayout().getTypeAllocSize(e.slot_ty);
+    }
+
+    // The rt_elem_ops mirror type:
+    // { i32 kind, i32 nleaves, i64 stride, ptr proto, ptr inner, ptr leaves }.
+    // Must match the runtime struct exactly.
+    llvm::StructType* elem_ops_ty() {
+        if (elem_ops_ty_ == nullptr) {
+            elem_ops_ty_ = llvm::StructType::create(
+              ctx_,
+              { b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt64Ty(), raw_ptr_ty(), raw_ptr_ty(),
+                raw_ptr_ty() },
+              "clotho.elemops");
+        }
+        return elem_ops_ty_;
+    }
+
+    // The element power-on byte image as a typed constant: X planes for a
+    // 4-state scalar, zero for 2-state / real, the empty inline handle for a
+    // string, the null handle for a nested container.
+    llvm::Constant* elem_proto_const(const DynElem& e) {
+        if (e.is_string) {
+            std::vector<uint8_t> bytes(sizeof(rt_string), 0);
+            bytes[sizeof(rt_string) - 1] = static_cast<uint8_t>(rt_string_inline_cap);
+            return llvm::ConstantStruct::get(
+              e.slot_ty, { llvm::ConstantDataArray::get(ctx_, bytes) });
+        }
+        if (e.is_handle) {
+            return llvm::Constant::getNullValue(e.slot_ty);
+        }
         llvm::Constant*              mm = e.narrow ? zero(e.width) : x_mm(e.width);
         std::vector<llvm::Constant*> fields{ mm };
         if (e.has_z) {
             fields.push_back(zero(e.width));
         }
-        auto* init = llvm::ConstantStruct::get(e.slot_ty, fields);
-        return new llvm::GlobalVariable(llmod_, e.slot_ty, /*isConstant=*/true,
-                                        llvm::GlobalValue::InternalLinkage, init, "clotho.dynarr.proto");
+        return llvm::ConstantStruct::get(e.slot_ty, fields);
     }
 
-    // Byte size of one element slot (the runtime stride for rt_dynarr_* /
-    // rt_queue_*). Queue elements reuse DynElem (identical POD-scalar slot).
-    uint64_t dynarr_stride(const DynElem& e) {
-        return llmod_.getDataLayout().getTypeAllocSize(e.slot_ty);
+    // The constant rt_elem_ops descriptor for a container's element type,
+    // memoized per element type Ref. Nested containers chain through `inner`
+    // (finite: type nesting is a DAG). Aggregate elements are frontend-guarded,
+    // so no leaf table is ever emitted yet.
+    llvm::Constant* elem_ops_global(Ref container_type) {
+        const Type& at = std::get<Type>(mod_.pool.get(container_type));
+        if (const auto it = elem_ops_globals_.find(static_cast<uint32_t>(at.element));
+            it != elem_ops_globals_.end()) {
+            return it->second;
+        }
+        const DynElem e     = dynarr_elem(container_type);
+        uint32_t      kind  = 0;
+        llvm::Constant* inner = llvm::Constant::getNullValue(raw_ptr_ty());
+        if (e.is_string) {
+            kind = 1;
+        } else if (e.is_handle) {
+            const Type& et = std::get<Type>(mod_.pool.get(at.element));
+            kind  = et.kind == Type::Kind::DynArray ? 2 : 3;
+            inner = elem_ops_global(at.element);
+        }
+        auto* proto = new llvm::GlobalVariable(llmod_, e.slot_ty, /*isConstant=*/true,
+                                               llvm::GlobalValue::InternalLinkage,
+                                               elem_proto_const(e), "clotho.elem.proto");
+        auto* init = llvm::ConstantStruct::get(
+          elem_ops_ty(),
+          { b_.getInt32(kind), b_.getInt32(0), b_.getInt64(dynarr_stride(e)), proto, inner,
+            llvm::Constant::getNullValue(raw_ptr_ty()) });
+        auto* gv = new llvm::GlobalVariable(llmod_, elem_ops_ty(), /*isConstant=*/true,
+                                            llvm::GlobalValue::InternalLinkage, init,
+                                            "clotho.elem.ops");
+        elem_ops_globals_.emplace(static_cast<uint32_t>(at.element), gv);
+        return gv;
     }
 
     // Sort comparator descriptor for the element of `array_type` (LRM 7.12.2
@@ -773,15 +845,15 @@ private:
         return is_queue_type(type) ? queue_slot_ty() : dynarr_slot_ty();
     }
     // Deep-copy one handle into another (value semantics), picking the runtime
-    // function and element stride from the type.
+    // function and element descriptor from the type.
     void emit_handle_assign(llvm::Value* dst, llvm::Value* src, Ref type) {
-        llvm::Value* stride = b_.getInt64(dynarr_stride(dynarr_elem(type)));
         b_.CreateCall(is_queue_type(type) ? queue_assign_fn() : dynarr_assign_fn(),
-                      { dst, src, stride });
+                      { dst, src, elem_ops_global(type) });
     }
-    // Free a handle's heap storage (reset to empty).
+    // Destroy a handle's elements and free its storage (reset to empty).
     void emit_handle_delete(llvm::Value* handle, Ref type) {
-        b_.CreateCall(is_queue_type(type) ? queue_delete_all_fn() : dynarr_delete_fn(), { handle });
+        b_.CreateCall(is_queue_type(type) ? queue_delete_all_fn() : dynarr_delete_fn(),
+                      { handle, elem_ops_global(type) });
     }
     // Pointer to the rt handle slot an lvalue designates: the resolved
     // aggregate leaf slot for a struct-member / class-property / array-element
@@ -3119,10 +3191,8 @@ private:
         for (const SignalSlot& s : slots_) {
             if (s.is_string) {
                 emit_string_slot_op(s, str_deinit_fn());
-            } else if (s.is_dynarr) {
-                b_.CreateCall(dynarr_delete_fn(), { storage_ptr(s) });
-            } else if (s.is_queue) {
-                b_.CreateCall(queue_delete_all_fn(), { storage_ptr(s) });
+            } else if (s.is_dynarr || s.is_queue) {
+                emit_handle_delete(storage_ptr(s), s.ir_type);
             } else if (s.is_agg && has_heap_leaf(s.ir_type)) {
                 // Aggregate signal with string / handle leaves: recursive
                 // teardown of every heap-owning leaf.
@@ -6099,22 +6169,25 @@ private:
     // where noted.
     // -- Dynamic array runtime (rt_dynarr_*, LRM 7.5) --
     // void rt_dynarr_new(rt_dynarr*, i64 stride, i64 n, const void* proto)
+    // void rt_dynarr_new(rt_dynarr*, const rt_elem_ops*, u64 n)
     llvm::FunctionCallee dynarr_new_fn() {
-        return rt_fn("rt_dynarr_new", b_.getVoidTy(),
-                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), raw_ptr_ty() });
+        return rt_fn("rt_dynarr_new", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
     }
     // void rt_dynarr_new_copy(rt_dynarr*, i64 stride, i64 n, const void* proto, const rt_dynarr* src)
+    // void rt_dynarr_new_copy(rt_dynarr*, const rt_elem_ops*, u64 n, const rt_dynarr* src)
     llvm::FunctionCallee dynarr_new_copy_fn() {
         return rt_fn("rt_dynarr_new_copy", b_.getVoidTy(),
-                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), raw_ptr_ty(), raw_ptr_ty() });
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
     }
     // void rt_dynarr_delete(rt_dynarr*)
+    // void rt_dynarr_delete(rt_dynarr*, const rt_elem_ops*)
     llvm::FunctionCallee dynarr_delete_fn() {
-        return rt_fn("rt_dynarr_delete", b_.getVoidTy(), { raw_ptr_ty() });
+        return rt_fn("rt_dynarr_delete", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
     // void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, i64 stride)
+    // void rt_dynarr_assign(rt_dynarr*, const rt_dynarr*, const rt_elem_ops*)
     llvm::FunctionCallee dynarr_assign_fn() {
-        return rt_fn("rt_dynarr_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+        return rt_fn("rt_dynarr_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
     // void rt_dynarr_reverse(rt_dynarr*, i64 stride)  (LRM 7.12.2)
     llvm::FunctionCallee dynarr_reverse_fn() {
@@ -6132,32 +6205,38 @@ private:
 
     // -- Queue runtime (rt_queue_*, LRM 7.10) --
     // void rt_queue_push_{back,front}(rt_queue*, i64 stride, i64 bound, const void* elem)
+    // void rt_queue_push_{back,front}(rt_queue*, const rt_elem_ops*, u64 bound, const void* elem)
     llvm::FunctionCallee queue_push_fn(bool front) {
         return rt_fn(front ? "rt_queue_push_front" : "rt_queue_push_back", b_.getVoidTy(),
-                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), raw_ptr_ty() });
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
     }
     // void rt_queue_pop_{back,front}(rt_queue*, i64 stride, void* out)
+    // void rt_queue_pop_{back,front}(rt_queue*, const rt_elem_ops*, void* out)
     llvm::FunctionCallee queue_pop_fn(bool front) {
         return rt_fn(front ? "rt_queue_pop_front" : "rt_queue_pop_back", b_.getVoidTy(),
-                     { raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
+                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
     // void rt_queue_insert(rt_queue*, i64 stride, i64 bound, i64 i, const void* elem)
+    // void rt_queue_insert(rt_queue*, const rt_elem_ops*, u64 bound, u64 i, const void* elem)
     llvm::FunctionCallee queue_insert_fn() {
         return rt_fn("rt_queue_insert", b_.getVoidTy(),
-                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty(), raw_ptr_ty() });
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), raw_ptr_ty() });
     }
     // void rt_queue_delete_idx(rt_queue*, i64 stride, i64 i)
+    // void rt_queue_delete_idx(rt_queue*, const rt_elem_ops*, u64 i)
     llvm::FunctionCallee queue_delete_idx_fn() {
         return rt_fn("rt_queue_delete_idx", b_.getVoidTy(),
-                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty() });
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
     }
     // void rt_queue_delete_all(rt_queue*)
+    // void rt_queue_delete_all(rt_queue*, const rt_elem_ops*)
     llvm::FunctionCallee queue_delete_all_fn() {
-        return rt_fn("rt_queue_delete_all", b_.getVoidTy(), { raw_ptr_ty() });
+        return rt_fn("rt_queue_delete_all", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
     // void rt_queue_assign(rt_queue* dst, const rt_queue* src, i64 stride)
+    // void rt_queue_assign(rt_queue*, const rt_queue*, const rt_elem_ops*)
     llvm::FunctionCallee queue_assign_fn() {
-        return rt_fn("rt_queue_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+        return rt_fn("rt_queue_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
     // void rt_queue_reverse(rt_queue*, i64 stride)  (LRM 7.12.2)
     llvm::FunctionCallee queue_reverse_fn() {
@@ -7066,16 +7145,43 @@ private:
     // The rt_string handle pointer of a string lvalue (one array element when
     // elem_idx selects it).
     llvm::Value* lv_string_ptr(const LValue& lv) {
+        llvm::Value* ptr = nullptr;
         if (lv.array_ty != nullptr) {
             llvm::Value* idx = lv.elem_idx != nullptr ? lv.elem_idx : b_.getInt32(0);
-            return b_.CreateInBoundsGEP(lv.array_ty, lv.base, { b_.getInt32(0), idx });
+            ptr = b_.CreateInBoundsGEP(lv.array_ty, lv.base, { b_.getInt32(0), idx });
+        } else if (lv.is_agg) {
+            // A string leaf inside an aggregate (struct member / class property)
+            // is reached through the aggregate GEP path, not the bare base.
+            ptr = agg_slot_ptr(lv);
+        } else {
+            ptr = lv.base;
         }
-        // A string leaf inside an aggregate (struct member / class property) is
-        // reached through the aggregate GEP path, not the bare base pointer.
-        if (lv.is_agg) {
-            return agg_slot_ptr(lv);
+        if (lv.dyn_inrange != nullptr) {
+            // Out-of-range dynamic-array / queue string element: redirect to the
+            // writable sink handle, reset to owned-empty right here — an OOB
+            // read yields "" (Table 7-1 string default) and an OOB write /
+            // mutating method lands in the sink and is discarded (LRM 7.5.1).
+            llvm::Value* sink = str_sink_global();
+            b_.CreateCall(str_deinit_fn(), { sink });
+            b_.CreateCall(str_init_fn(), { sink });
+            ptr = b_.CreateSelect(lv.dyn_inrange, ptr, sink);
         }
-        return lv.base;
+        return ptr;
+    }
+
+    // The shared out-of-range string-element sink: a writable rt_string handle
+    // that powers on owned-empty and is reset before every use (lv_string_ptr).
+    llvm::Value* str_sink_global() {
+        if (str_sink_ == nullptr) {
+            std::vector<uint8_t> bytes(sizeof(rt_string), 0);
+            bytes[sizeof(rt_string) - 1] = static_cast<uint8_t>(rt_string_inline_cap);
+            auto* init = llvm::ConstantStruct::get(
+              str_slot_ty(), { llvm::ConstantDataArray::get(ctx_, bytes) });
+            str_sink_ = new llvm::GlobalVariable(llmod_, str_slot_ty(), /*isConstant=*/false,
+                                                 llvm::GlobalValue::InternalLinkage, init,
+                                                 "clotho.str.sink");
+        }
+        return str_sink_;
     }
 
     // Whether an instruction produces a fresh string value that needs its own
@@ -7093,6 +7199,10 @@ private:
             case Inst::Tag::Concat:
             case Inst::Tag::Repl:
             case Inst::Tag::Call:
+            // A pop of a string-element queue relocates the element into the
+            // instruction's own temp handle (lower_queue_pop).
+            case Inst::Tag::QueuePopBack:
+            case Inst::Tag::QueuePopFront:
                 return type_of(i).is_string;
             default:
                 return false;
@@ -7272,6 +7382,21 @@ private:
                     llvm::Value* len = b_.CreateLoad(
                       b_.getInt64Ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 1));
                     llvm::Value* idx64 = cast(must_of(value_of(es.index)), 64, false);
+                    if (e.is_string) {
+                        // String element: an rt_string handle slot in the heap
+                        // buffer. Bounds ride lv_string_ptr's sink redirect.
+                        LValue sel;
+                        sel.base        = dataptr;
+                        sel.is_string   = true;
+                        sel.slot_ty     = e.slot_ty;
+                        sel.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
+                        sel.elem_idx    = cast(idx64, 32, false);
+                        sel.is_signal   = lv.is_signal;
+                        sel.sig         = lv.sig;
+                        sel.dyn_inrange = b_.CreateICmpULT(idx64, len);
+                        set_lvalue(i, sel);
+                        return;
+                    }
                     LValue       el;
                     el.base        = dataptr;
                     el.slot_ty     = e.slot_ty;
@@ -7310,6 +7435,19 @@ private:
                     llvm::Value* safe_cap =
                       b_.CreateSelect(b_.CreateICmpEQ(cap, b_.getInt64(0)), b_.getInt64(1), cap);
                     llvm::Value* phys = b_.CreateURem(b_.CreateAdd(head, idx64), safe_cap);
+                    if (e.is_string) {
+                        LValue sel;
+                        sel.base        = baseptr;
+                        sel.is_string   = true;
+                        sel.slot_ty     = e.slot_ty;
+                        sel.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
+                        sel.elem_idx    = cast(phys, 32, false);
+                        sel.is_signal   = lv.is_signal;
+                        sel.sig         = lv.sig;
+                        sel.dyn_inrange = b_.CreateICmpULT(idx64, len);
+                        set_lvalue(i, sel);
+                        return;
+                    }
                     LValue       el;
                     el.base        = baseptr;
                     el.slot_ty     = e.slot_ty;
@@ -7570,10 +7708,11 @@ private:
             case Inst::Tag::DynArraySize:
                 lower_dyn_array_size(i);
                 return;
-            case Inst::Tag::DynArrayDelete:
-                b_.CreateCall(dynarr_delete_fn(),
-                              { lvalue_of(ir_->payload(i).op_type.op).base });
+            case Inst::Tag::DynArrayDelete: {
+                const auto& pd = ir_->payload(i).op_type;
+                emit_handle_delete(lv_handle_ptr(lvalue_of(pd.op)), pd.type);
                 return;
+            }
             case Inst::Tag::DynArrayCopy:
                 lower_dyn_array_copy(i);
                 return;
@@ -8585,9 +8724,8 @@ private:
         const auto    da = ir_->extra_data<DynArrayArg>(p.extra);
         const DynElem e  = dynarr_elem(da.array_type);
         llvm::Value*  n  = cast(must_of(value_of(da.arg)), 64, false);
-        b_.CreateCall(dynarr_new_fn(), { lv_handle_ptr(lvalue_of(p.op)),
-                                         b_.getInt64(dynarr_stride(e)), n,
-                                         dynarr_elem_proto(e) });
+        b_.CreateCall(dynarr_new_fn(),
+                      { lv_handle_ptr(lvalue_of(p.op)), elem_ops_global(da.array_type), n });
     }
 
     void lower_dyn_array_new_init(Index i) {
@@ -8596,8 +8734,8 @@ private:
         const DynElem e  = dynarr_elem(da.array_type);
         llvm::Value*  n  = cast(must_of(value_of(da.size)), 64, false);
         b_.CreateCall(dynarr_new_copy_fn(),
-                      { lv_handle_ptr(lvalue_of(p.op)), b_.getInt64(dynarr_stride(e)), n,
-                        dynarr_elem_proto(e), lv_handle_ptr(lvalue_of(da.src)) });
+                      { lv_handle_ptr(lvalue_of(p.op)), elem_ops_global(da.array_type), n,
+                        lv_handle_ptr(lvalue_of(da.src)) });
     }
 
     void lower_dyn_array_size(Index i) {
@@ -8608,11 +8746,11 @@ private:
     }
 
     void lower_dyn_array_copy(Index i) {
-        const auto&  p      = ir_->payload(i).op_extra;
-        const auto   da     = ir_->extra_data<DynArrayArg>(p.extra);
-        llvm::Value* stride = b_.getInt64(dynarr_stride(dynarr_elem(da.array_type)));
+        const auto& p  = ir_->payload(i).op_extra;
+        const auto  da = ir_->extra_data<DynArrayArg>(p.extra);
         b_.CreateCall(dynarr_assign_fn(),
-                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(da.arg)), stride });
+                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(da.arg)),
+                        elem_ops_global(da.array_type) });
     }
 
     // Array ordering methods (LRM 7.12.2). Each carries only the handle lvalue +
@@ -8696,25 +8834,43 @@ private:
     }
 
     void lower_queue_push(Index i, bool front) {
-        const auto&   p       = ir_->payload(i).op_extra;
-        const auto    qa      = ir_->extra_data<QueueArg>(p.extra);
-        const DynElem e       = dynarr_elem(qa.queue_type);
-        auto*         scratch = entry_alloca(e.slot_ty, "q.elem");
+        const auto&   p     = ir_->payload(i).op_extra;
+        const auto    qa    = ir_->extra_data<QueueArg>(p.extra);
+        const DynElem e     = dynarr_elem(qa.queue_type);
+        llvm::Value*  ops   = elem_ops_global(qa.queue_type);
+        llvm::Value*  bound = b_.getInt64(std::get<Type>(mod_.pool.get(qa.queue_type)).left);
+        if (e.is_string) {
+            // A string value is already an rt_string handle pointer; the runtime
+            // deep-copies it into the new slot, so it is passed directly.
+            b_.CreateCall(queue_push_fn(front),
+                          { lv_handle_ptr(lvalue_of(p.op)), ops, bound, str_of(qa.arg) });
+            return;
+        }
+        auto* scratch = entry_alloca(e.slot_ty, "q.elem");
         lower_store(elem_scratch_lvalue(scratch, e), value_of(qa.arg));
-        llvm::Value* stride = b_.getInt64(dynarr_stride(e));
-        llvm::Value* bound  = b_.getInt64(std::get<Type>(mod_.pool.get(qa.queue_type)).left);
-        b_.CreateCall(queue_push_fn(front), { lv_handle_ptr(lvalue_of(p.op)), stride, bound, scratch });
+        b_.CreateCall(queue_push_fn(front), { lv_handle_ptr(lvalue_of(p.op)), ops, bound, scratch });
     }
 
     void lower_queue_pop(Index i, bool front) {
-        const auto&   p       = ir_->payload(i).op_type;
-        const DynElem e       = dynarr_elem(p.type);
-        auto*         scratch = entry_alloca(e.slot_ty, "q.elem");
+        const auto&   p   = ir_->payload(i).op_type;
+        const DynElem e   = dynarr_elem(p.type);
+        llvm::Value*  ops = elem_ops_global(p.type);
+        if (e.is_string) {
+            // The result handle is this instruction's string temp
+            // (produces_string_temp). Reset it to the owned-empty state, then
+            // the runtime RELOCATES the popped element into it (an empty pop
+            // leaves the empty string, the Table 7-1 default).
+            llvm::Value* out = str_of(i);
+            b_.CreateCall(str_deinit_fn(), { out });
+            b_.CreateCall(str_init_fn(), { out });
+            b_.CreateCall(queue_pop_fn(front), { lv_handle_ptr(lvalue_of(p.op)), ops, out });
+            return;
+        }
+        auto* scratch = entry_alloca(e.slot_ty, "q.elem");
         // Pre-fill with the default: the runtime leaves an empty-queue pop
         // untouched, so the load below then reads the element default.
         b_.CreateStore(elem_default_const(e), scratch);
-        b_.CreateCall(queue_pop_fn(front),
-                      { lv_handle_ptr(lvalue_of(p.op)), b_.getInt64(dynarr_stride(e)), scratch });
+        b_.CreateCall(queue_pop_fn(front), { lv_handle_ptr(lvalue_of(p.op)), ops, scratch });
         Plane         v = lower_load(elem_scratch_lvalue(scratch, e));
         const ValType t = type_of(i);
         if (t.is_real) {
@@ -8724,36 +8880,41 @@ private:
     }
 
     void lower_queue_insert(Index i) {
-        const auto&   p       = ir_->payload(i).op_extra;
-        const auto    qi      = ir_->extra_data<QueueInsertInfo>(p.extra);
-        const DynElem e       = dynarr_elem(qi.queue_type);
-        auto*         scratch = entry_alloca(e.slot_ty, "q.elem");
+        const auto&   p     = ir_->payload(i).op_extra;
+        const auto    qi    = ir_->extra_data<QueueInsertInfo>(p.extra);
+        const DynElem e     = dynarr_elem(qi.queue_type);
+        llvm::Value*  ops   = elem_ops_global(qi.queue_type);
+        llvm::Value*  idx   = cast(must_of(value_of(qi.idx)), 64, false);
+        llvm::Value*  bound = b_.getInt64(std::get<Type>(mod_.pool.get(qi.queue_type)).left);
+        if (e.is_string) {
+            b_.CreateCall(queue_insert_fn(),
+                          { lv_handle_ptr(lvalue_of(p.op)), ops, bound, idx, str_of(qi.val) });
+            return;
+        }
+        auto* scratch = entry_alloca(e.slot_ty, "q.elem");
         lower_store(elem_scratch_lvalue(scratch, e), value_of(qi.val));
-        llvm::Value* idx    = cast(must_of(value_of(qi.idx)), 64, false);
-        llvm::Value* stride = b_.getInt64(dynarr_stride(e));
-        llvm::Value* bound  = b_.getInt64(std::get<Type>(mod_.pool.get(qi.queue_type)).left);
-        b_.CreateCall(queue_insert_fn(), { lv_handle_ptr(lvalue_of(p.op)), stride, bound, idx, scratch });
+        b_.CreateCall(queue_insert_fn(), { lv_handle_ptr(lvalue_of(p.op)), ops, bound, idx, scratch });
     }
 
     void lower_queue_delete_idx(Index i) {
-        const auto&  p      = ir_->payload(i).op_extra;
-        const auto   qa     = ir_->extra_data<QueueArg>(p.extra);
-        llvm::Value* stride = b_.getInt64(dynarr_stride(dynarr_elem(qa.queue_type)));
-        llvm::Value* idx    = cast(must_of(value_of(qa.arg)), 64, false);
-        b_.CreateCall(queue_delete_idx_fn(), { lv_handle_ptr(lvalue_of(p.op)), stride, idx });
+        const auto&  p   = ir_->payload(i).op_extra;
+        const auto   qa  = ir_->extra_data<QueueArg>(p.extra);
+        llvm::Value* idx = cast(must_of(value_of(qa.arg)), 64, false);
+        b_.CreateCall(queue_delete_idx_fn(),
+                      { lv_handle_ptr(lvalue_of(p.op)), elem_ops_global(qa.queue_type), idx });
     }
 
     void lower_queue_delete_all(Index i) {
-        b_.CreateCall(queue_delete_all_fn(),
-                      { lv_handle_ptr(lvalue_of(ir_->payload(i).op_type.op)) });
+        const auto& p = ir_->payload(i).op_type;
+        emit_handle_delete(lv_handle_ptr(lvalue_of(p.op)), p.type);
     }
 
     void lower_queue_copy(Index i) {
-        const auto&  p      = ir_->payload(i).op_extra;
-        const auto   qa     = ir_->extra_data<QueueArg>(p.extra);
-        llvm::Value* stride = b_.getInt64(dynarr_stride(dynarr_elem(qa.queue_type)));
+        const auto& p  = ir_->payload(i).op_extra;
+        const auto  qa = ir_->extra_data<QueueArg>(p.extra);
         b_.CreateCall(queue_assign_fn(),
-                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qa.arg)), stride });
+                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qa.arg)),
+                        elem_ops_global(qa.queue_type) });
     }
 
     // Queue ordering methods (LRM 7.12.2) — same shape as the dynarr variants
@@ -13659,6 +13820,10 @@ private:
     std::vector<llvm::Value*> dynarr_ret_;
     // Memoized `%clotho.queue` handle slot type ({ ptr base, i64 head, len, cap }).
     llvm::StructType* queue_slot_ty_ = nullptr;
+    llvm::StructType* elem_ops_ty_ = nullptr;
+    llvm::GlobalVariable* str_sink_ = nullptr;
+    // rt_elem_ops descriptor globals, keyed by container element type Ref.
+    ankerl::unordered_dense::map<uint32_t, llvm::Constant*> elem_ops_globals_;
 };
 
 // Lower the coroutine intrinsics emitted for each process and clean up the

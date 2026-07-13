@@ -410,6 +410,53 @@ uint32_t rt_nba_arr_any(void);
 // after the commit + wake pass.
 void rt_nba_arr_reset(void);
 
+// -- Container element lifecycle descriptors --
+//
+// A dynamic array / queue element is described by a constant rt_elem_ops the
+// backend materializes per element type. A POD element (plane scalar / real /
+// packed vector / class handle) is pure bytes: init is a proto memcpy, copy a
+// memcpy, deinit a no-op. A managed element owns heap somewhere (a string, a
+// nested container, or - future - an aggregate with such leaves) and recurses
+// through the descriptor. Every element type is trivially RELOCATABLE (no
+// self-pointers), so the containers move elements by raw memcpy (ring growth,
+// insert / delete shifts, pop-out) even when managed; only DUPLICATION and
+// destruction dispatch through the descriptor.
+typedef struct rt_elem_ops rt_elem_ops;
+
+// One heap-owning leaf of an aggregate element: byte offset of its slot inside
+// the element image, and its own descriptor.
+typedef struct rt_elem_leaf {
+    uint64_t           offset;
+    const rt_elem_ops* ops;
+} rt_elem_leaf;
+
+// Element kinds, by lifecycle shape.
+enum {
+    rt_elem_pod       = 0, // raw bytes; proto init, memcpy copy, no deinit
+    rt_elem_string    = 1, // one rt_string handle
+    rt_elem_dynarr    = 2, // one rt_dynarr handle; `inner` describes ITS element
+    rt_elem_queue     = 3, // one rt_queue handle; `inner` describes ITS element
+    rt_elem_aggregate = 4, // fixed byte image with `nleaves` heap leaves
+};
+
+struct rt_elem_ops {
+    uint32_t            kind;
+    uint32_t            nleaves; // rt_elem_aggregate only
+    uint64_t            stride;  // element slot bytes
+    const void*         proto;   // power-on byte image, `stride` bytes
+    const rt_elem_ops*  inner;   // rt_elem_dynarr / rt_elem_queue only
+    const rt_elem_leaf* leaves;  // rt_elem_aggregate only
+};
+
+// Construct an element in raw storage (the proto byte image: X planes, empty
+// string handle, null container handles).
+void rt_elem_init(const rt_elem_ops* o, void* p);
+// Destroy an element's owned heap (recursively). No-op for POD.
+void rt_elem_deinit(const rt_elem_ops* o, void* p);
+// Deep-copy one element over another; both constructed (dst's owned buffers
+// are reused / released per leaf, never leaked).
+void rt_elem_copy(const rt_elem_ops* o, void* dst, const void* src);
+
 // -- SystemVerilog dynamic arrays --
 //
 // The dynamic array type (LRM §7.5): a runtime-sized vector of a fixed-width
@@ -425,22 +472,22 @@ typedef struct rt_dynarr {
     uint64_t len;
 } rt_dynarr;
 
-// arr = new[n]: (re)allocate `h` to `n` elements of `stride` bytes, filling each
-// with the `stride`-byte power-on prototype `proto` (the element default: X for
-// 4-state, 0 for 2-state). Frees any prior buffer.
-void rt_dynarr_new(rt_dynarr* h, uint64_t stride, uint64_t n, const void* proto);
+// arr = new[n]: (re)allocate `h` to `n` elements, constructing each from the
+// descriptor's proto. Destroys the prior elements and frees the buffer.
+void rt_dynarr_new(rt_dynarr* h, const rt_elem_ops* ops, uint64_t n);
 
 // arr = new[n](src): like rt_dynarr_new, but the low min(n, src->len) elements
-// are first copied from `src`; any remaining elements take `proto` (LRM §7.5.1).
+// are first deep-copied from `src`; any remaining take the proto (LRM §7.5.1).
 // `src` may alias `h` (a self-resize).
-void rt_dynarr_new_copy(rt_dynarr* h, uint64_t stride, uint64_t n, const void* proto, const rt_dynarr* src);
+void rt_dynarr_new_copy(rt_dynarr* h, const rt_elem_ops* ops, uint64_t n, const rt_dynarr* src);
 
-// arr.delete(): free the buffer and reset to the empty array. Idempotent.
-void rt_dynarr_delete(rt_dynarr* h);
+// arr.delete(): destroy every element, free the buffer, reset to the empty
+// array. Idempotent.
+void rt_dynarr_delete(rt_dynarr* h, const rt_elem_ops* ops);
 
-// dst = src: deep copy `src`'s `stride`-byte elements into `dst` (value
-// semantics, LRM §7.5). A no-op when dst == src.
-void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, uint64_t stride);
+// dst = src: deep copy `src`'s elements into `dst` (value semantics, LRM
+// §7.5). A no-op when dst == src.
+void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, const rt_elem_ops* ops);
 
 // -- Array ordering methods (LRM 7.12.2) --
 //
@@ -484,29 +531,30 @@ typedef struct rt_queue {
 //
 // q.push_back(e) / q.push_front(e): append `elem` (a `stride`-byte element slot)
 // to the tail / head, growing the ring as needed.
-void rt_queue_push_back(rt_queue* h, uint64_t stride, uint64_t bound, const void* elem);
-void rt_queue_push_front(rt_queue* h, uint64_t stride, uint64_t bound, const void* elem);
+void rt_queue_push_back(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, const void* elem);
+void rt_queue_push_front(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, const void* elem);
 
-// q.pop_back() / q.pop_front(): remove the tail / head element and copy it into
-// `out` (a `stride`-byte slot). On an empty queue `out` is left untouched (the
-// caller pre-fills it with the element default).
-void rt_queue_pop_back(rt_queue* h, uint64_t stride, void* out);
-void rt_queue_pop_front(rt_queue* h, uint64_t stride, void* out);
+// q.pop_back() / q.pop_front(): remove the tail / head element and RELOCATE it
+// into `out` (a raw element slot whose prior contents must be unconstructed or
+// already destroyed - ownership of the element's heap moves to `out`). On an
+// empty queue `out` is left untouched (the caller pre-fills the default).
+void rt_queue_pop_back(rt_queue* h, const rt_elem_ops* ops, void* out);
+void rt_queue_pop_front(rt_queue* h, const rt_elem_ops* ops, void* out);
 
 // q.insert(i, e): insert `elem` before position `i` (0 <= i <= len); out-of-range
 // `i` is ignored. Honours the bound like a push.
-void rt_queue_insert(rt_queue* h, uint64_t stride, uint64_t bound, uint64_t i, const void* elem);
+void rt_queue_insert(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, uint64_t i, const void* elem);
 
 // q.delete(i): remove the element at position `i` (0 <= i < len); out-of-range
 // `i` is ignored.
-void rt_queue_delete_idx(rt_queue* h, uint64_t stride, uint64_t i);
+void rt_queue_delete_idx(rt_queue* h, const rt_elem_ops* ops, uint64_t i);
 
 // q.delete(): free the buffer and reset to the empty queue. Idempotent.
-void rt_queue_delete_all(rt_queue* h);
+void rt_queue_delete_all(rt_queue* h, const rt_elem_ops* ops);
 
-// dst = src: deep copy `src`'s `stride`-byte elements into `dst`, linearised so
-// dst->head == 0 (value semantics, LRM §7.10). A no-op when dst == src.
-void rt_queue_assign(rt_queue* dst, const rt_queue* src, uint64_t stride);
+// dst = src: deep copy `src`'s elements into `dst`, linearised so dst->head
+// == 0 (value semantics, LRM §7.10). A no-op when dst == src.
+void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_elem_ops* ops);
 
 // q.reverse() / q.sort() / q.rsort() (LRM 7.12.2). `kind` / `width` / `rev` match
 // the rt_dynarr_* ordering entry points; operates on the ring's logical order.

@@ -461,3 +461,80 @@ TEST_CASE("foreach over a struct-member queue") {
     )";
     CHECK(run_capture(src) == "acc=6\n");
 }
+
+TEST_CASE("string queue: push/pop/index/element methods/OOB default") {
+    constexpr std::string_view src = R"(
+        module m;
+            string q[$];
+            initial begin
+                q.push_back("hello");
+                q.push_back("world");
+                q.push_front("first");
+                $display("%0d %s %s %s", q.size(), q[0], q[1], q[2]);
+                $display("pop=%s pop=%s n=%0d", q.pop_front(), q.pop_back(), q.size());
+                q[0] = "changed";
+                $display("%s len=%0d oob=[%s]", q[0], q[0].len(), q[5]);
+                q.delete(0);
+                $display("after del n=%0d", q.size());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "3 first hello world\npop=first pop=world n=1\nchanged len=7 oob=[]\n"
+          "after del n=0\n");
+}
+
+TEST_CASE("string queue deep copy is per-element") {
+    constexpr std::string_view src = R"(
+        module m;
+            string q[$], q2[$];
+            initial begin
+                q.push_back("keep");
+                q2 = q;
+                q[0] = "zzz";
+                $display("copy=%s orig=%s", q2[0], q[0]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "copy=keep orig=zzz\n");
+}
+
+TEST_CASE("string dynamic array: new/element write/concat from element") {
+    constexpr std::string_view src = R"(
+        module m;
+            string d[];
+            initial begin
+                d = new[2];
+                d[0] = "dyn0"; d[1] = {d[0], "+"};
+                $display("%s %s %0d", d[0], d[1], d.size());
+                d = new[1](d);
+                $display("%s %0d", d[0], d.size());
+                d.delete();
+                $display("%0d", d.size());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "dyn0 dyn0+ 2\ndyn0 1\n0\n");
+}
+
+TEST_CASE("struct member queue of strings deep-copies; frame-local lifecycle") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { string q[$]; int x; } t;
+            t a, b;
+            function automatic string f(string base);
+                string lq[$];
+                lq.push_back({base, "!"});
+                return lq.pop_front();
+            endfunction
+            initial begin
+                a.x = 1; a.q.push_back("aa"); a.q.push_back("bb");
+                b = a;
+                a.q[0] = "mut";
+                $display("%0d %s %s | %s", b.x, b.q[0], b.q[1], a.q[0]);
+                $display("%s", f("hi"));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 aa bb | mut\nhi!\n");
+}

@@ -898,12 +898,14 @@ private:
             // per-element slot; string / aggregate / nested variable-size elements
             // need per-element deinit/copy and are a documented follow-up.
             const slang::ast::Type& et = da->elementType.getCanonicalType();
-            if (!et.isIntegral() && !et.isFloating()) {
-                // TODO: dynamic array of string / struct / array / dynamic /
-                // queue / associative element (managed elements need per-element
-                // lifecycle in the runtime; see docs/design/dynamic-arrays.md).
+            if (!et.isIntegral() && !et.isFloating() && !et.isString()) {
+                // TODO: dynamic array of struct / array / nested dynamic-array /
+                // queue / associative element. The rt_elem_ops runtime lifecycle
+                // already supports nested containers; the remaining work is the
+                // element-select lvalue plumbing (handle-element OOB semantics)
+                // and, for aggregates, whole-element rvalue staging.
                 fail("dynamic array element type is not supported (only integral / "
-                     "real elements)");
+                     "real / string elements)");
             }
             ir::Type t;
             t.kind    = ir::Type::Kind::DynArray;
@@ -916,12 +918,14 @@ private:
             // restricts the element to a POD scalar (integral or real), same as
             // dynamic arrays — managed elements need per-element lifecycle.
             const slang::ast::Type& et = qt->elementType.getCanonicalType();
-            if (!et.isIntegral() && !et.isFloating()) {
-                // TODO: queue of string / struct / array / dynamic / queue /
-                // associative element (managed elements need per-element
-                // lifecycle in the runtime; see docs/design/dynamic-arrays.md).
-                fail("queue element type is not supported (only integral / real "
-                     "elements)");
+            if (!et.isIntegral() && !et.isFloating() && !et.isString()) {
+                // TODO: queue of struct / array / nested dynamic-array / queue /
+                // associative element. The rt_elem_ops runtime lifecycle already
+                // supports nested containers; the remaining work is the
+                // element-select lvalue plumbing (handle-element OOB semantics)
+                // and, for aggregates, whole-element rvalue staging.
+                fail("queue element type is not supported (only integral / real / "
+                     "string elements)");
             }
             ir::Type t;
             t.kind    = ir::Type::Kind::Queue;
