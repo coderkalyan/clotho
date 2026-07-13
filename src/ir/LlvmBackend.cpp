@@ -469,6 +469,13 @@ struct Anchor {
     // True when the scope's definition state type is instantiated more than
     // once: address through a runtime base-pointer load.
     bool indirect = false;
+    // Lowest process index owned by this scope (~0 when it owns none). An owned
+    // group's sched flag is addressed instance-base + (proc - first_proc), the
+    // def-local ordinal — identical slot, def-relative form (dedup prep).
+    uint32_t first_proc = ~0u;
+    // Reused definitions only: pointer global holding &proc_sched[first_proc],
+    // stored by main; a unique definition folds to the absolute constant.
+    llvm::GlobalVariable* sched_sym = nullptr;
 };
 
 // One function-frame local: its `{ i(2W), iW }` slot type and width / domain.
@@ -1528,12 +1535,29 @@ private:
         state_gv->setAlignment(llvm::Align(64));
         state_global_ = state_gv;
 
+        const auto procs = mod_.processes();
+        for (uint32_t k = 0; k < procs.size(); ++k) {
+            const uint32_t sc = procs[k].scope;
+            if (sc == Process::no_scope || sc >= anchor_of_scope_.size() ||
+                anchor_of_scope_[sc] == SignalSlot::no_anchor) {
+                continue;
+            }
+            uint32_t& first = anchors_[anchor_of_scope_[sc]].first_proc;
+            first           = std::min(first, k);
+        }
+
         auto* ptr = llvm::PointerType::getUnqual(ctx_);
         for (Anchor& a : anchors_) {
             if (a.indirect) {
                 a.sym = new llvm::GlobalVariable(llmod_, ptr, false, llvm::GlobalValue::InternalLinkage,
                                                  llvm::ConstantPointerNull::get(ptr),
                                                  "clotho.inst." + a.name);
+                if (a.first_proc != ~0u) {
+                    a.sched_sym = new llvm::GlobalVariable(llmod_, ptr, false,
+                                                           llvm::GlobalValue::InternalLinkage,
+                                                           llvm::ConstantPointerNull::get(ptr),
+                                                           "clotho.inst." + a.name + ".sched");
+                }
                 continue;
             }
             std::vector<llvm::Constant*> idx;
@@ -1544,6 +1568,19 @@ private:
             }
             a.sym = llvm::ConstantExpr::getInBoundsGetElementPtr(state_ty_, state_gv, idx);
         }
+    }
+
+    // Materialize the deferred def-relative sched-flag pointer at the current
+    // insert point (a function entry, so it dominates every use): load the
+    // instance's sched base and index the group's def-local ordinal. No-op when
+    // lower_group chose the absolute constant.
+    void materialize_sched_ptr() {
+        if (sched_ptr_ != nullptr) {
+            return;
+        }
+        const Anchor& a    = anchors_[sched_anchor_];
+        llvm::Value*  base = b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), a.sched_sym);
+        sched_ptr_ = b_.CreateInBoundsGEP(b_.getInt32Ty(), base, b_.getInt32(sched_ordinal_));
     }
 
     // Global holding &state->shadow; created on first use, initialized in
@@ -1623,9 +1660,32 @@ private:
         frame_slots_.clear(); // a process has no frame; deinit sees only temps
 
         // This group's scheduled-flag slot: &clotho.proc_sched[proc_index]. A
-        // constant GEP so it is valid in any block of the function.
-        sched_ptr_ = llvm::ConstantExpr::getInBoundsGetElementPtr(
-          sched_arr_ty_, sched_gv_, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(proc_index) });
+        // constant GEP so it is valid in any block of the function. Dedup prep:
+        // a group fully inside one reused-definition instance instead loads the
+        // instance's sched base and indexes the def-local ordinal — the same
+        // slot, materialized at function entry (materialize_sched_ptr); a
+        // unique-definition or cross-instance group keeps the folded constant.
+        sched_anchor_ = SignalSlot::no_anchor;
+        {
+            const uint32_t sc   = proc.scope;
+            bool           same = sc != Process::no_scope;
+            for (const uint32_t m : members) {
+                same = same && all[m].scope == sc;
+            }
+            if (same && sc < anchor_of_scope_.size() &&
+                anchor_of_scope_[sc] != SignalSlot::no_anchor) {
+                const Anchor& a = anchors_[anchor_of_scope_[sc]];
+                if (a.sched_sym != nullptr) {
+                    sched_anchor_  = anchor_of_scope_[sc];
+                    sched_ordinal_ = proc_index - a.first_proc;
+                }
+            }
+        }
+        sched_ptr_ = sched_anchor_ != SignalSlot::no_anchor
+                       ? nullptr
+                       : llvm::ConstantExpr::getInBoundsGetElementPtr(
+                           sched_arr_ty_, sched_gv_,
+                           llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(proc_index) });
 
         // Name a process by its index: @<module>.p<index>. Source-offset naming
         // would collide once the design has multiple instances of one module —
@@ -1672,6 +1732,7 @@ private:
             hdl_              = nullptr;
             auto* entry_bb = llvm::BasicBlock::Create(ctx_, "entry", fn_);
             b_.SetInsertPoint(entry_bb);
+            materialize_sched_ptr();
             // Run each member body per activation, freeing its string temporaries
             // afterward — a thunk has no frame to persist them in (a per-call cost
             // paid only by string-using bodies). frame_slots_ is empty for a
@@ -1770,6 +1831,7 @@ private:
         // Identify the coroutine; coro.alloc lets the optimizer skip the dynamic
         // frame allocation when the frame can live on the caller's stack.
         b_.SetInsertPoint(entry);
+        materialize_sched_ptr();
         auto* id   = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_id), { b_.getInt32(0), null, null, null });
         auto* need = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_alloc), { id });
         b_.CreateCondBr(need, alloc_bb, begin_bb);
@@ -2885,6 +2947,12 @@ private:
                 idx.push_back(b_.getInt32(f));
             }
             b_.CreateStore(b_.CreateInBoundsGEP(state_ty_, state, idx), a.sym);
+            if (a.sched_sym != nullptr) {
+                b_.CreateStore(
+                  b_.CreateInBoundsGEP(sched_arr_ty_, sched_gv_,
+                                       { b_.getInt32(0), b_.getInt32(a.first_proc) }),
+                  a.sched_sym);
+            }
         }
         init_state();
         if (shadow_base_gv_ != nullptr) {
@@ -12898,6 +12966,10 @@ private:
     // The current coroutine's scheduled flag: &clotho.proc_sched[this process] for
     // a process (a Constant GEP), or a frame-resident i32 alloca for a task.
     llvm::Value*        sched_ptr_       = nullptr;
+    // Deferred def-relative sched addressing chosen by lower_group (see
+    // materialize_sched_ptr); no_anchor when the absolute constant is used.
+    uint32_t sched_anchor_  = SignalSlot::no_anchor;
+    uint32_t sched_ordinal_ = 0;
     // The shared timer callback (pushes a woken handle onto the active queue) and
     // the active/inactive queue globals, all built once per module. The inactive
     // queue holds processes parked on a zero delay (#0): drained into active at
