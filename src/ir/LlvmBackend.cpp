@@ -796,6 +796,44 @@ private:
         return agg_leaf_slot_ty(type);
     }
 
+    // The heap object-body LLVM type of a class (LRM 8.3): a StructType mirroring
+    // the property table, one field per property (`agg_storage_ty` of its type — a
+    // class-handle property is a leaf i64 slot, not a nested body, which is what
+    // makes a self-referential class resolve without a fixpoint). Cached so the
+    // body pointer's GEP source type (`HandleDeref` root_ty) and the MemberSelect
+    // field GEPs share one identity. Distinct from `agg_storage_ty(classRef)`,
+    // which yields the *handle* leaf slot (a class value is a handle, not a body).
+    llvm::StructType* class_body_ty(Ref class_ref) {
+        const auto key = static_cast<uint32_t>(class_ref);
+        if (const auto it = class_body_ty_.find(key); it != class_body_ty_.end()) {
+            return it->second;
+        }
+        const Type&              t = std::get<Type>(mod_.pool.get(class_ref));
+        std::vector<llvm::Type*> fields;
+        for (const Field& f : mod_.pool.struct_fields(t.fields_id)) {
+            fields.push_back(agg_storage_ty(f.type));
+        }
+        auto* st              = llvm::StructType::create(ctx_, fields, "clotho.class.body");
+        class_body_ty_[key]   = st;
+        return st;
+    }
+
+    // Power-on the properties of a freshly-allocated class object body (LRM 8.8):
+    // the caller has already zeroed the block (2-state leaves and class-handle
+    // properties power on 0 / null), so this writes X into 4-state leaves and
+    // initializes string leaves, per-property, reusing emit_agg_init.
+    void emit_class_body_init(Ref class_ref, llvm::Value* body_ptr) {
+        const Type&               t       = std::get<Type>(mod_.pool.get(class_ref));
+        llvm::Type*               root_ty = class_body_ty(class_ref);
+        std::vector<llvm::Value*> path;
+        uint32_t                  f = 0;
+        for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
+            path.push_back(b_.getInt32(f++));
+            emit_agg_init(fld.type, body_ptr, path, root_ty);
+            path.pop_back();
+        }
+    }
+
     // memcpy a whole aggregate from `src` to `dst` (both pointers to its storage).
     // Valid because the frontend passes an aggregate by value only when it is
     // string-free, so its byte image is the value (no heap-owning leaf).
@@ -6008,6 +6046,9 @@ private:
                 const auto   fields = mod_.pool.struct_fields(st.fields_id);
                 return from_ref(fields[ms.field_index].type);
             }
+            case Inst::Tag::ClassNew:
+                // The object handle (a 2-state 64-bit value, per layout(Class)).
+                return from_ref(p.ref);
             case Inst::Tag::Load:
                 return type_of(p.unary);
             case Inst::Tag::SimTime:
@@ -6206,6 +6247,8 @@ private:
             case Inst::Tag::Loop:
             case Inst::Tag::Break:
             case Inst::Tag::Continue:
+            case Inst::Tag::HandleDeref:
+                // An lvalue producer (rooted at the object body); no value type.
             case Inst::Tag::Ret:
             case Inst::Tag::Delay:
             case Inst::Tag::Wait:
@@ -6282,6 +6325,11 @@ private:
         if (lv.array_ty != nullptr) {
             llvm::Value* idx = lv.elem_idx != nullptr ? lv.elem_idx : b_.getInt32(0);
             return b_.CreateInBoundsGEP(lv.array_ty, lv.base, { b_.getInt32(0), idx });
+        }
+        // A string leaf inside an aggregate (struct member / class property) is
+        // reached through the aggregate GEP path, not the bare base pointer.
+        if (lv.is_agg) {
+            return agg_slot_ptr(lv);
         }
         return lv.base;
     }
@@ -6577,6 +6625,35 @@ private:
                 if (lv.agg_leaf) {
                     fill_agg_leaf(lv, mt);
                 }
+                set_lvalue(i, lv);
+                return;
+            }
+            case Inst::Tag::ClassNew: {
+                // Allocate the object body, zero it (2-state / handle leaves power
+                // on 0 / null), X-init 4-state leaves and init string leaves, and
+                // yield the handle as an i64 (reference semantics: the pointer is
+                // the value). Lifetime is leaked in V1 (LRM 8.4 objects are GC'd;
+                // a program cannot observe a free) — see docs/design/classes.md §7.
+                const Ref      class_ref = p.ref;
+                llvm::Type*    body_ty   = class_body_ty(class_ref);
+                const uint64_t size      = llmod_.getDataLayout().getTypeAllocSize(body_ty);
+                llvm::Value*   body      = b_.CreateCall(alloc_fn(), { b_.getInt64(size) });
+                b_.CreateMemSet(body, b_.getInt8(0), b_.getInt64(size), llvm::MaybeAlign(64));
+                emit_class_body_init(class_ref, body);
+                set_value(i, two_val(b_.CreatePtrToInt(body, b_.getInt64Ty())));
+                return;
+            }
+            case Inst::Tag::HandleDeref: {
+                // Turn a class handle value (i64 pointer bits) into an aggregate
+                // lvalue rooted at the object body. No copy — the handle IS the
+                // object (reference semantics), unlike a value struct addressed
+                // inline. A following MemberSelect addresses a property.
+                llvm::Value* handle = must_of(value_of(p.op_type.op));
+                LValue       lv{};
+                lv.base      = b_.CreateIntToPtr(handle, raw_ptr_ty());
+                lv.root_ty   = class_body_ty(p.op_type.type);
+                lv.is_agg    = true;
+                lv.is_signal = false;
                 set_lvalue(i, lv);
                 return;
             }
@@ -12093,6 +12170,8 @@ private:
     std::vector<llvm::Value*> str_temp_list_;
     // Memoized `%clotho.string` handle slot type.
     llvm::StructType* str_slot_ty_ = nullptr;
+    // Memoized class object-body StructType per Kind::Class Ref (see class_body_ty).
+    ankerl::unordered_dense::map<uint32_t, llvm::StructType*> class_body_ty_;
     // Memoized `%clotho.dynarr` handle slot type ({ ptr data, i64 len }).
     llvm::StructType* dynarr_slot_ty_ = nullptr;
     // Result-handle temporaries for dynamic-array / queue-returning calls in the

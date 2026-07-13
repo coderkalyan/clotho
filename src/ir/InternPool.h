@@ -111,6 +111,18 @@ struct Type {
         // so max size N+1; 0 means unbounded). right is unused; a queue is
         // always 0-based [0:len-1].
         Queue,
+        // Class (LRM §8): a reference type. Not plane-sized — layout() reports
+        // width 0 and the runtime value is a handle (a bare pointer to a heap
+        // object body); the backend owns the body layout, built like an unpacked
+        // struct over the property table. Reference semantics: assignment copies
+        // the pointer, `==` is identity, `null` is a distinct state (contrast the
+        // DynArray/Queue/String handle kinds, which are value types that
+        // deep-copy). `fields_id` is the declaration-order property table (reused
+        // Field machinery); crucially it is UNIQUE per class (intern_struct_fields
+        // never dedups), which gives a class NOMINAL identity — two structurally
+        // identical classes, even two empty ones, never unify. `element` holds the
+        // base-class Ref for inheritance (Invalid in V1). See docs/design/classes.md.
+        Class,
     };
 
     // Discriminant for this type.
@@ -314,10 +326,22 @@ public:
     // at most once — the caller is expected to cache by symbol, as
     // Lower.cpp's lower_type does).
     uint32_t intern_struct_fields(std::vector<FieldRow> rows);
-    // Declared member list of a Kind::Struct type, in declaration order. The
-    // rows live in one flat array, so the span is invalidated by a later
-    // intern_struct_fields — copy or re-fetch when interleaving with interning
-    // (only Lower can intern; the backend's const pool never invalidates).
+    // Reserve an empty field-table id whose rows are filled later by
+    // set_struct_fields. Breaks the forward-reference cycle of a Kind::Class whose
+    // own property is a handle to itself: reserve the id, build + intern the class
+    // Type (so the class Ref exists), cache it, lower the properties (a self-handle
+    // now resolves), then fill. The rows are appended to the flat arena at fill
+    // time (fields_id indexes field_runs_, so the run need not be contiguous with
+    // the reservation). A value struct cannot contain itself, so only classes need
+    // this.
+    uint32_t reserve_struct_fields();
+    // Fill an id reserved by reserve_struct_fields (appends its rows to the arena).
+    void set_struct_fields(uint32_t fields_id, std::vector<FieldRow> rows);
+    // Declared member list of a Kind::Struct / Kind::Class type, in declaration
+    // order (struct members / class properties). The rows live in one flat array,
+    // so the span is invalidated by a later intern_struct_fields / set_struct_fields
+    // — copy or re-fetch when interleaving with interning (only Lower can intern;
+    // the backend's const pool never invalidates).
     std::span<const Field> struct_fields(uint32_t fields_id) const;
     // Declared name of a struct/union member (resolves the name-arena range).
     std::string_view field_name(const Field& f) const {

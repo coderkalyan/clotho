@@ -33,6 +33,7 @@
 #include <slang/ast/statements/LoopStatements.h>
 #include <slang/ast/statements/MiscStatements.h>
 #include <slang/ast/symbols/BlockSymbols.h>
+#include <slang/ast/symbols/ClassSymbols.h>
 #include <slang/ast/symbols/CompilationUnitSymbols.h>
 #include <slang/ast/symbols/InstanceSymbols.h>
 #include <slang/ast/symbols/MemberSymbols.h>
@@ -664,6 +665,11 @@ private:
                 case SymbolKind::Parameter:
                 case SymbolKind::TypeParameter:
                 case SymbolKind::TypeAlias:
+                // A class declaration is a type, not a per-instance member: its
+                // methods and object body lower on demand when a variable of the
+                // class is declared / used (lower_class_type).
+                case SymbolKind::ClassType:
+                case SymbolKind::GenericClassDef:
                 case SymbolKind::TransparentMember:
                 case SymbolKind::Genvar:
                 case SymbolKind::Subroutine:
@@ -960,12 +966,69 @@ private:
             // the handle bits. Enables DPI chandle args (marshaled to/from void*).
             return make_int_type(64, false, false);
         }
+        if (ct.isClass()) {
+            return lower_class_type(ct.as<slang::ast::ClassType>());
+        }
         if (!ct.isIntegral()) {
             // TODO: string / class types.
             fail("unsupported non-integral type");
         }
 
         return make_int_type(ct.getBitWidth(), ct.isFourState(), ct.isSigned());
+    }
+
+    // Lower a class type (LRM 8) to a Kind::Class reference type. A class variable
+    // holds a handle (a pointer, stored as a 2-state 64-bit value); the object body
+    // layout is the property table, reused from the struct Field machinery but
+    // NOMINAL (each class gets a fresh, never-deduped fields_id, so two structurally
+    // identical classes — even two empty ones — never unify). Cached per ClassType
+    // symbol; the class Ref is interned BEFORE its properties are lowered, so a
+    // self-referential property (`class Node; Node next; endclass`) resolves through
+    // the handle indirection with no fixpoint. See docs/design/classes.md.
+    ir::Ref lower_class_type(const slang::ast::ClassType& clt) {
+        if (const auto cached = class_type_cache_.find(&clt); cached != class_type_cache_.end()) {
+            return cached->second;
+        }
+        // Phase 2/3 features (docs/design/classes.md §2): guarded loud.
+        if (clt.getBaseClass() != nullptr) {
+            // TODO: single inheritance (`extends`), `super`, override (Phase 2).
+            fail("class inheritance is not supported");
+        }
+        if (clt.isAbstract || clt.isInterface) {
+            // TODO: virtual / interface classes and dynamic dispatch (Phase 3).
+            fail("virtual / interface classes are not supported");
+        }
+        if (clt.genericClass != nullptr) {
+            // TODO: parameterized classes (Phase 3).
+            fail("parameterized classes are not supported");
+        }
+        // Intern-first: reserve the field slot and build the class Ref before
+        // lowering the properties, so a self-handle resolves via the cache.
+        const uint32_t fid = module_.pool.reserve_struct_fields();
+        ir::Type       t;
+        t.kind      = ir::Type::Kind::Class;
+        t.fields_id = fid;
+        const ir::Ref ref = module_.pool.put(ir::Item{ t });
+        class_type_cache_.emplace(&clt, ref);
+
+        std::vector<ir::FieldRow> fields;
+        uint32_t                  idx = 0;
+        for (const auto& prop : clt.membersOfType<slang::ast::ClassPropertySymbol>()) {
+            if (prop.lifetime == slang::ast::VariableLifetime::Static) {
+                // TODO: static class members (one shared slot, Phase 2).
+                fail("static class properties are not supported");
+            }
+            if (prop.randMode != slang::ast::RandMode::None) {
+                // TODO: rand / randc properties and randomize() (Phase 3).
+                fail("rand / randc class properties are not supported");
+            }
+            class_prop_index_.emplace(&prop, idx);
+            fields.push_back({ prop.name, lower_type(prop.getType()), idx });
+            ++idx;
+        }
+        module_.pool.set_struct_fields(fid, std::move(fields));
+
+        return ref;
     }
 
     // True if an expression's type is a fixed-size unpacked array (a memory).
@@ -6205,6 +6268,13 @@ private:
             // needs event reference semantics (docs/design/named-events.md).
             fail("event assignment is not supported");
         }
+        if (a.isNonBlocking() && a.left().kind == ExpressionKind::MemberAccess &&
+            a.left().as<MemberAccessExpression>().member.kind == SymbolKind::ClassProperty) {
+            // TODO: nonblocking assignment to a class property. The aggregate NBA
+            // staging path shadows a signal's storage, but an object body is a heap
+            // block with no per-object shadow (docs/design/classes.md §8).
+            fail("nonblocking assignment to a class property is not supported");
+        }
         if (is_aggregate(*a.left().type)) {
             // Whole unpacked-struct assignment: decompose to per-member stores
             // (blocking or nonblocking). Each member commits independently, which
@@ -6927,6 +6997,8 @@ private:
                 }
                 return *v;
             }
+            case ExpressionKind::NewClass:
+                return lower_new_class(expr.as<slang::ast::NewClassExpression>(), b);
             case ExpressionKind::Assignment: {
                 // Assignment used as an rvalue (`y = (x += 1)`, `y = (x = 5)`). Its
                 // value is the LHS after the store, truncated to the LHS type (LRM
@@ -7418,10 +7490,16 @@ private:
     // lvalue is itself a part-select, and part-select-of-a-part-select
     // already works (the same shape a multi-dimensional packed select uses).
     ir::Index lower_member_lvalue(const MemberAccessExpression& ma, ir::Builder& b, ir::SourceLoc l) {
+        if (const auto* prop = ma.member.as_if<slang::ast::ClassPropertySymbol>()) {
+            // `obj.prop` (LRM 8.4): load the object handle (a value), then a
+            // handle-deref + field select rooted at the object body. The base
+            // handle is an rvalue (the pointer), not the slot's lvalue.
+            const ir::Index handle = lower_expr(ma.value(), b);
+            return class_member_lvalue(handle, *prop, lower_type(*ma.value().type), b, l);
+        }
         const auto* field = ma.member.as_if<FieldSymbol>();
         if (field == nullptr) {
-            // TODO: non-field member access (class properties, interface
-            // modports, ...) — not lowered.
+            // TODO: non-field member access (interface modports, ...) — not lowered.
             fail("unsupported member access");
         }
         if (ma.value().type->isUnion()) {
@@ -7606,6 +7684,12 @@ private:
         // True while lowering a task body (a coroutine): unlike a function, timing
         // controls and $time are allowed.
         bool is_task = false;
+        // Class method context (valid iff has_this): `this` is spliced as frame
+        // Local 0, `this_class` is its Kind::Class handle type. A bare property
+        // reference inside the body roots at this Local (value_lvalue).
+        bool     has_this   = false;
+        uint32_t this_local = 0;
+        ir::Ref  this_class = ir::Ref::Invalid;
     };
 
     // Get (creating if needed) the frame Local index for a function-local symbol.
@@ -7672,6 +7756,15 @@ private:
             const auto it = fn_ctx_->localmap.find(&vs);
             if (it != fn_ctx_->localmap.end()) {
                 return b.local(it->second, fn_ctx_->local_types[it->second], l);
+            }
+            if (fn_ctx_->has_this) {
+                if (const auto* prop = vs.as_if<slang::ast::ClassPropertySymbol>()) {
+                    // A bare property reference inside a method (implicit `this`):
+                    // load the `this` handle (Local 0) and select the property.
+                    const ir::Index handle = b.unary(
+                      ir::Inst::Tag::Load, b.local(fn_ctx_->this_local, fn_ctx_->this_class, l), l);
+                    return class_member_lvalue(handle, *prop, fn_ctx_->this_class, b, l);
+                }
             }
         }
 
@@ -8034,6 +8127,36 @@ private:
         }
     }
 
+    // Splice the implicit `this` handle of a class method (LRM 8.11) as frame Local
+    // 0. Called at the start of build_function / build_task before the real formals,
+    // so `this` occupies Local 0 and every real formal / return var shifts up. A
+    // free subroutine (thisVar == nullptr) is a no-op. `this` is an In pointer passed
+    // by value (reference semantics): it must NOT take the aggregate copy-in, and
+    // does not — a class handle is a scalar i64, routed through the scalar-arg ABI.
+    void splice_this(const SubroutineSymbol& sub, std::vector<ir::Ref>& param_types,
+                     std::vector<ir::ArgDir>& arg_dirs) {
+        if (sub.thisVar == nullptr) {
+            return;
+        }
+        const ir::Ref hty = lower_type(sub.thisVar->getType());
+        param_types.push_back(hty);
+        arg_dirs.push_back(ir::ArgDir::In);
+        fn_ctx_->this_local = fn_local(*sub.thisVar);
+        fn_ctx_->has_this   = true;
+        fn_ctx_->this_class = hty;
+    }
+
+    // The lvalue of a class property `prop` reached through an object handle value
+    // `handle_val` (the loaded i64 pointer bits of a class of type `class_ref`):
+    // dereference the handle to the object body, then a MemberSelect on the
+    // property's field index. Shared by member access (`obj.prop`) and a bare
+    // property reference inside a method (rooted at `this`).
+    ir::Index class_member_lvalue(ir::Index handle_val, const slang::ast::Symbol& prop,
+                                  ir::Ref class_ref, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Index body = b.handle_deref(handle_val, class_ref, l);
+        return b.member_select(body, class_prop_index_.at(&prop), class_ref, l);
+    }
+
     // Lower one task body into the reserved slot. Like build_function, but the task
     // is void and becomes a coroutine: the backend emits the parameter copy-in /
     // copy-out (output / inout pass by pointer) and the completion handshake, so
@@ -8051,6 +8174,11 @@ private:
         ir::Builder          b(module_.pool);
         std::vector<ir::Ref> param_types;
         std::vector<ir::ArgDir> arg_dirs;
+
+        // A class method (LRM 8.11): splice the implicit `this` handle as formal 0,
+        // before the real formals, so they (and the return var) keep formal k ==
+        // Local k with `this` at Local 0.
+        splice_this(sub, param_types, arg_dirs);
 
         // Allocate the formals' frame Locals first so formal k maps to Local k (the
         // backend's prologue / epilogue rely on this). No Arg copy is emitted: the
@@ -8132,6 +8260,9 @@ private:
         std::vector<ir::Ref> param_types;
         std::vector<ir::ArgDir> arg_dirs;
 
+        // A class method (LRM 8.11): splice the implicit `this` handle as formal 0.
+        splice_this(sub, param_types, arg_dirs);
+
         // Allocate a frame Local per formal (formal k == Local k), like build_task.
         // The backend copies parameters into these Locals at entry (emit_copyin) and
         // copies output / inout formals back at each return (emit_copyout); a ref
@@ -8190,20 +8321,80 @@ private:
         fn_ctx_ = saved;
     }
 
+    // Lower a class `new` expression (LRM 8.7): allocate + power-on the object body
+    // (ClassNew yields the handle), then run the constructor with the fresh handle
+    // spliced as `this`. Yields the object handle (a 2-state 64-bit value). A
+    // default (implicit) constructor with no initializers has no constructorCall
+    // and only the power-on defaults apply.
+    ir::Index lower_new_class(const slang::ast::NewClassExpression& nc, ir::Builder& b) {
+        const ir::SourceLoc l = loc(nc);
+        if (nc.isSuperClass) {
+            // TODO: super.new (chained base construction, Phase 2).
+            fail("super.new is not supported");
+        }
+        const auto&     clt       = nc.type->getCanonicalType().as<slang::ast::ClassType>();
+        const ir::Ref   class_ref = lower_type(*nc.type);
+        const ir::Index handle    = b.class_new(class_ref, l);
+        // Non-static property default initializers run at construction, in
+        // declaration order, BEFORE the constructor body (LRM 8.8). slang attaches
+        // them to the property (not the constructor body), and a class with no
+        // explicit constructor has no constructorCall at all, so apply them here.
+        emit_class_property_inits(clt, handle, class_ref, b);
+        if (const Expression* ctor = nc.constructorCall()) {
+            const CallExpression&   cc   = ctor->as<CallExpression>();
+            const SubroutineSymbol& sub  = *std::get<0>(cc.subroutine);
+            const ir::FunctionId    id   = function_id(sub); // splices `this` as formal 0
+            const auto              formals = sub.getArguments();
+            const auto              actuals = cc.arguments();
+            if (formals.size() != actuals.size()) {
+                fail("constructor argument count mismatch");
+            }
+            std::vector<CopyOutArg> outs;
+            std::vector<ir::Index>  args = build_call_args(formals, actuals, outs, b, l);
+            args.insert(args.begin(), handle);
+            b.call(id, args, l); // the constructor is void
+            emit_call_copyouts(outs, b, l);
+        }
+        return handle;
+    }
+
+    // Apply a class's non-static property default initializers to a freshly-new'd
+    // object `handle` (LRM 8.8): a store per property that has an initializer, in
+    // declaration order. Lowered in the enclosing context (the `new` site), so an
+    // initializer that references `this` or another property fails loudly via
+    // signal_of — a documented V1 gap (most initializers are constants / params).
+    void emit_class_property_inits(const slang::ast::ClassType& clt, ir::Index handle,
+                                   ir::Ref class_ref, ir::Builder& b) {
+        for (const auto& prop : clt.membersOfType<slang::ast::ClassPropertySymbol>()) {
+            const Expression* init = prop.getInitializer();
+            if (init == nullptr) {
+                continue;
+            }
+            const ir::SourceLoc il = loc(*init);
+            const ir::Index     lv = class_member_lvalue(handle, prop, class_ref, b, il);
+            if (prop.getType().getCanonicalType().isString()) {
+                b.binary(ir::Inst::Tag::Store, lv, lower_expr(*init, b), il);
+            } else {
+                b.binary(ir::Inst::Tag::Store, lv,
+                         coerce(lower_expr(*init, b), *init->type, lower_type(prop.getType()), b, il), il);
+            }
+        }
+    }
+
     // Lower a user function call: the actuals (resized to the parameter types)
     // become a `call`. Returns the result value, or nullopt for a void function.
     std::optional<ir::Index> lower_user_call(const CallExpression& call, ir::Builder& b) {
         if (call.subroutine.index() != 0) {
             fail("system call used where a user subroutine was expected");
         }
-        if (call.thisClass() != nullptr) {
-            // TODO: class methods — need object handles.
-            fail("class method calls are not supported");
-        }
         const SubroutineSymbol& sub = *std::get<0>(call.subroutine);
+        // A class method (LRM 8.11): resolve the `this` object handle, spliced as
+        // arg 0 (the callee splices it as formal 0). An explicit receiver
+        // (`obj.method()`) is call.thisClass(); a bare in-method call uses `this`.
+        const std::optional<ir::Index> this_val = resolve_method_this(call, sub, b);
         if (sub.subroutineKind == SubroutineKind::Task) {
             // A task is a statement, never a value; it blocks the caller until done.
-            lower_task_call(call, sub, b);
+            lower_task_call(call, sub, b, this_val);
             return std::nullopt;
         }
         const ir::FunctionId id = function_id(sub); // validates + lowers (lazily)
@@ -8215,7 +8406,10 @@ private:
         }
         const ir::SourceLoc     l = loc(call);
         std::vector<CopyOutArg> outs;
-        const std::vector<ir::Index> args = build_call_args(formals, actuals, outs, b, l);
+        std::vector<ir::Index>  args = build_call_args(formals, actuals, outs, b, l);
+        if (this_val) {
+            args.insert(args.begin(), *this_val);
+        }
         const ir::Index         c = b.call(id, args, l);
         // Output / inout formals copy back to their actuals after the call (a
         // function is zero-time, so this is the same instant as the call).
@@ -8232,7 +8426,8 @@ private:
     // blocks the caller until it completes. Argument passing (13.5) is shared with
     // function calls: build_call_args prepares each operand and records output /
     // inout copy-backs, emit_call_copyouts applies them after the call.
-    void lower_task_call(const CallExpression& call, const SubroutineSymbol& sub, ir::Builder& b) {
+    void lower_task_call(const CallExpression& call, const SubroutineSymbol& sub, ir::Builder& b,
+                         std::optional<ir::Index> this_val = std::nullopt) {
         const ir::FunctionId id      = function_id(sub); // validates + lowers (lazily)
         const auto           formals = sub.getArguments();
         const auto           actuals = call.arguments();
@@ -8249,9 +8444,32 @@ private:
         }
         const ir::SourceLoc     l = loc(call);
         std::vector<CopyOutArg> outs;
-        const std::vector<ir::Index> args = build_call_args(formals, actuals, outs, b, l);
+        std::vector<ir::Index>  args = build_call_args(formals, actuals, outs, b, l);
+        if (this_val) {
+            args.insert(args.begin(), *this_val);
+        }
         b.task_call(id, args, l);
         emit_call_copyouts(outs, b, l);
+    }
+
+    // Resolve the `this` object handle for a possible method call (LRM 8.11). An
+    // explicit receiver (`obj.method()`) is call.thisClass(); a bare in-method call
+    // (`method()`) uses the enclosing method's `this` Local. Returns nullopt for a
+    // free subroutine (no thisVar).
+    std::optional<ir::Index> resolve_method_this(const CallExpression& call,
+                                                 const SubroutineSymbol& sub, ir::Builder& b) {
+        if (call.thisClass() != nullptr) {
+            return lower_expr(*call.thisClass(), b);
+        }
+        if (sub.thisVar == nullptr) {
+            return std::nullopt;
+        }
+        if (fn_ctx_ == nullptr || !fn_ctx_->has_this) {
+            fail("class method call without an object handle is not supported");
+        }
+        const ir::SourceLoc l = loc(call);
+        return b.unary(ir::Inst::Tag::Load,
+                       b.local(fn_ctx_->this_local, fn_ctx_->this_class, l), l);
     }
 
     // One output / inout argument's copy-back record: the caller temp holding the
@@ -8454,6 +8672,13 @@ private:
     // built field lists get different `fields_id`s and would never compare
     // equal, defeating InternPool::put's content-based dedup.
     ankerl::unordered_dense::map<const slang::ast::Type*, ir::Ref> struct_type_cache_;
+    // Canonical slang ClassType -> its lowered Kind::Class ir::Ref. Separate from
+    // struct_type_cache_ because a class is nominal (not deduped) and interned
+    // before its properties, breaking self-reference cycles (see lower_class_type).
+    ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::Ref> class_type_cache_;
+    // Class property symbol -> its declaration-order field index in the owning
+    // class's property table (used to lower a member access to a MemberSelect).
+    ankerl::unordered_dense::map<const slang::ast::Symbol*, uint32_t> class_prop_index_;
     // The shared Lowerer that owns package/$unit-scope subroutine bodies (see
     // set_globals / function_id). Null on the shared Lowerer itself and on any
     // Lowerer built without one (e.g. tests that lower a single module with no

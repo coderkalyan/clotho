@@ -197,6 +197,17 @@ struct Analysis {
                     break;
                 }
 
+                case Inst::Tag::ClassNew:
+                    // The object handle is a 2-state 64-bit pointer value; never z.
+                    val_z[raw] = 0;
+                    break;
+                case Inst::Tag::HandleDeref:
+                    // An aggregate lvalue rooted at the heap object body, whose
+                    // 4-state property leaves keep their own z plane (like a
+                    // dynamic-array element); report conservatively so a member
+                    // read cannot z-elide a downstream signal.
+                    val_z[raw] = 1;
+                    break;
                 case Inst::Tag::Load:
                     val_z[raw] = z_of(p.unary);
                     break;

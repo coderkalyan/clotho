@@ -150,6 +150,14 @@ Index Builder::member_select(Index base, uint32_t field_index, Ref struct_type, 
     return emit({ Inst::Tag::MemberSelect, Inst::Payload{ .op_extra = { base, extra } } }, loc);
 }
 
+Index Builder::class_new(Ref class_type, SourceLoc loc) {
+    return emit({ Inst::Tag::ClassNew, Inst::Payload{ .ref = class_type } }, loc);
+}
+
+Index Builder::handle_deref(Index handle, Ref class_type, SourceLoc loc) {
+    return emit({ Inst::Tag::HandleDeref, Inst::Payload{ .op_type = { handle, class_type } } }, loc);
+}
+
 Index Builder::agg_copy(Index dst, Index src, Ref type, SourceLoc loc) {
     const ExtraIndex extra = add_extra(AggCopyInfo{ src, type });
 

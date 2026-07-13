@@ -65,6 +65,19 @@ void render_type(const InternPool& pool, Ref type, std::ostream& os) {
             render_type(pool, t.element, os);
             os << " [$]";
             break;
+        case Type::Kind::Class: {
+            const auto fields = pool.struct_fields(t.fields_id);
+            os << "class{";
+            for (size_t i = 0; i < fields.size(); ++i) {
+                if (i != 0) {
+                    os << ", ";
+                }
+                os << pool.field_name(fields[i]) << ":";
+                render_type(pool, fields[i].type, os);
+            }
+            os << "}";
+            break;
+        }
     }
 }
 
@@ -88,6 +101,10 @@ const char* tag_name(Inst::Tag tag) {
             return "elem_select";
         case T::MemberSelect:
             return "member_select";
+        case T::ClassNew:
+            return "class_new";
+        case T::HandleDeref:
+            return "handle_deref";
         case T::AggCopy:
             return "agg_copy";
         case T::Load:
@@ -457,7 +474,12 @@ private:
                 os_ << "scale=" << p.scale;
                 break;
             case Inst::PayloadKind::Ref:
-                render_constant(p.ref);
+                // ClassNew's ref is the class *type*, not an interned value.
+                if (tag == Inst::Tag::ClassNew) {
+                    render_type(p.ref);
+                } else {
+                    render_constant(p.ref);
+                }
                 break;
             case Inst::PayloadKind::Signal:
                 os_ << "s" << static_cast<uint32_t>(p.signal);

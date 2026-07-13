@@ -797,6 +797,19 @@ struct Inst {
         // addressed by declaration-order field index into the backing StructType,
         // not a bit offset (a packed struct member is a PartSelect instead).
         MemberSelect,
+        // Class object `new` (LRM 8.7): allocate the heap object body, power-on
+        // init its properties, and yield the object handle as a 2-state 64-bit
+        // value (payload: ref -> the Kind::Class type). The constructor call is
+        // emitted separately by the frontend (a normal call with the handle spliced
+        // as `this`). Reference semantics: the handle is a bare pointer.
+        ClassNew,
+        // Dereference a class object handle to an aggregate lvalue rooted at the
+        // object body (payload: op_type -> op is the handle value, type is the
+        // Kind::Class). Produces an is_agg lvalue whose base is the body pointer, so
+        // a following MemberSelect addresses a property. The one op that turns a
+        // reference handle into a body lvalue (contrast a value struct, addressed
+        // inline).
+        HandleDeref,
 
         // -- State access --
         // Read the current value of an lvalue (payload: unary).
@@ -1461,7 +1474,10 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::FtoITrunc:
         case T::FBitcast:
         case T::FResize:
+        case T::HandleDeref:
             return K::OpType;
+        case T::ClassNew:
+            return K::Ref;
         case T::Repl:
             return K::Repl;
         case T::Concat:

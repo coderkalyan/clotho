@@ -823,19 +823,31 @@ TEST_CASE("a type parameter default sets an internal variable's width") {
 }
 
 TEST_CASE("a type parameter bound to an unsupported type fails loudly") {
-    // A class handle is not integral/real/string/array/event/chandle, so it falls
-    // through lower_type's final guard; binding a type parameter to one must hit
-    // that guard too, not silently accept it. (`event` and `chandle`
-    // were prior examples here; both are now lowered — named event LRM 15.5,
-    // chandle as a 2-state i64 handle LRM 6.14.)
+    // Binding a type parameter to a not-yet-lowered type must hit the same loud
+    // guard as a direct declaration, not silently accept it. (`event`,
+    // `chandle`, and now `class` were prior examples here; all are lowered now —
+    // named event LRM 15.5, chandle as a 2-state i64 handle LRM 6.14, class LRM 8.)
+    // An associative array is still unsupported, so it stands in as the example.
     const LowerResult r = lower_text(R"(
-        class C; endclass
-        module m #(parameter type T = C);
+        typedef int AA[string];
+        module m #(parameter type T = AA);
             T v;
         endmodule
     )");
     CHECK(!r.ok);
-    CHECK(r.diagnostics.find("unsupported non-integral type") != std::string::npos);
+    CHECK(r.diagnostics.find("associative arrays are not supported") != std::string::npos);
+}
+
+TEST_CASE("a class type parameter lowers as a handle") {
+    // The class example above now lowers: a class-typed signal is a handle (a
+    // 2-state 64-bit value), so binding a type parameter to a class succeeds.
+    const LowerResult r = lower_text(R"(
+        class C; int f; endclass
+        module m #(parameter type T = C);
+            T v;
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
 }
 
 TEST_CASE("a type parameter flows into a function argument and return type") {
