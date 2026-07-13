@@ -453,6 +453,9 @@ private:
         switch (payload_kind(tag)) {
             case Inst::PayloadKind::None:
                 break;
+            case Inst::PayloadKind::Scale:
+                os_ << "scale=" << p.scale;
+                break;
             case Inst::PayloadKind::Ref:
                 render_constant(p.ref);
                 break;

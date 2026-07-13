@@ -1283,6 +1283,8 @@ struct Inst {
     // Which union member a tag activates. Drives payload_kind() / operands().
     enum class PayloadKind : uint8_t {
         None,
+        // The u64 scale member (sim_time). No SSA operands.
+        Scale,
         Ref,
         Signal,
         Unary,

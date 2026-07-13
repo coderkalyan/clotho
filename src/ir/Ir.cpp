@@ -135,10 +135,11 @@ Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::DumpOn:
         case T::DumpAll:
         case T::DumpFlush:
-        case T::SimTime:
         case T::Random:
         case T::Urandom:
             return K::None;
+        case T::SimTime:
+            return K::Scale;
         case T::Finish:
         case T::CaseViol:
         case T::TestPlusArgs:
@@ -189,6 +190,7 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
 
     switch (payload_kind(tag)) {
         case Inst::PayloadKind::None:
+        case Inst::PayloadKind::Scale:
         case Inst::PayloadKind::Ref:
         case Inst::PayloadKind::Signal:
         case Inst::PayloadKind::Arg:
