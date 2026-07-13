@@ -73,6 +73,28 @@ struct LowerError {
     std::string message;
 };
 
+// Resolve an interface modport-port proxy to the interface instance's own
+// storage symbol. A modport (LRM 25.5) exposes each interface signal through a
+// distinct ModportPortSymbol whose `internalSymbol` is the underlying interface
+// VariableSymbol/NetSymbol; a plain interface-port (`m(bus w); w.sig`) or direct
+// hierarchical reference to the same signal already binds to that underlying
+// symbol. Keying every reference on the canonical symbol makes interface storage
+// shared for free — a modport read, a plain-port read, and a direct hierarchical
+// read all map to one ir::Signal, with no cross-boundary copy process. The loop
+// handles a modport re-exported through a nested interface's modport.
+const ValueSymbol& canonical_value_symbol(const ValueSymbol& sym) {
+    const ValueSymbol* cur = &sym;
+    while (cur->kind == SymbolKind::ModportPort) {
+        const Symbol*      inner = cur->as<ModportPortSymbol>().internalSymbol;
+        const ValueSymbol* vs    = inner ? inner->as_if<ValueSymbol>() : nullptr;
+        if (vs == nullptr) {
+            break;
+        }
+        cur = vs;
+    }
+    return *cur;
+}
+
 // Femtoseconds in one unit of a time-scale value. Magnitude is 1/10/100 and the
 // unit is a power-of-ten fraction of a second, so the result is a power of ten.
 uint64_t tsv_to_fs(slang::TimeScaleValue v) {
@@ -265,7 +287,7 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     SensitivityCollector(const SigMap& m, SensitivityMode mode) : sigmap(m), mode(mode) {}
 
     void record_read(const ValueSymbol& sym) {
-        const auto it = sigmap.find(&sym);
+        const auto it = sigmap.find(&canonical_value_symbol(sym));
         if (it == sigmap.end()) {
             return;
         }
@@ -275,7 +297,7 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     }
 
     void mark_written(const ValueSymbol& sym) {
-        const auto it = sigmap.find(&sym);
+        const auto it = sigmap.find(&canonical_value_symbol(sym));
         if (it != sigmap.end()) {
             written.insert(static_cast<uint32_t>(it->second));
         }
@@ -662,6 +684,15 @@ private:
                 // lower with their enclosing procedure; elab system tasks were
                 // already issued as elaboration diagnostics.
                 case SymbolKind::Port:
+                // Interface members with no simulation behavior of their own.
+                // An interface body is walked when lower_instance recurses into
+                // the interface instance; a Modport is a named view (LRM 25.5),
+                // an InterfacePort/ModportPort is a reference proxy resolved at
+                // use via canonical_value_symbol. Their signals are ordinary
+                // Variable/Net members handled above and by collect_signals.
+                case SymbolKind::Modport:
+                case SymbolKind::InterfacePort:
+                case SymbolKind::ModportPort:
                 case SymbolKind::Parameter:
                 case SymbolKind::TypeParameter:
                 case SymbolKind::TypeAlias:
@@ -1680,9 +1711,10 @@ private:
     }
 
     ir::Signal signal_of(const ValueSymbol& sym) {
-        const auto it = sigmap_.find(&sym);
+        const ValueSymbol& csym = canonical_value_symbol(sym);
+        const auto         it   = sigmap_.find(&csym);
         if (it == sigmap_.end()) {
-            fail("reference to unknown signal '" + std::string(sym.name) + "'");
+            fail("reference to unknown signal '" + std::string(csym.name) + "'");
         }
 
         return it->second;
@@ -1744,7 +1776,12 @@ private:
     // with a previously recorded driver. Two regions overlap iff their element
     // bands intersect AND their bit ranges intersect. Non-net symbols are
     // ignored (slang already rejects multiple continuous drivers on variables).
-    void record_net_driver_region(const ValueSymbol& sym, const NetRegion& reg) {
+    void record_net_driver_region(const ValueSymbol& raw, const NetRegion& reg) {
+        // Canonicalize first: a net driven through an interface modport output
+        // (`assign p.sig = …`) arrives as a ModportPort proxy (kind != Net) that
+        // would otherwise bypass driver tracking — the underlying interface net
+        // still needs multi-driver detection.
+        const ValueSymbol& sym = canonical_value_symbol(raw);
         if (sym.kind != SymbolKind::Net) {
             return;
         }
@@ -2478,9 +2515,17 @@ private:
     // an input yields the bare source rvalue to drive the child net with.
     void wire_ports(const InstanceSymbol& child) {
         for (const PortConnection* pc : child.getPortConnections()) {
+            if (pc->port.kind == SymbolKind::InterfacePort) {
+                // An interface port carries no value to copy: the interface
+                // instance owns the storage and every reference to it (plain,
+                // modport, or hierarchical) resolves to that shared ir::Signal
+                // via canonical_value_symbol (LRM 25, docs/design/interfaces.md).
+                // Nothing to wire here.
+                continue;
+            }
             if (pc->port.kind != SymbolKind::Port) {
-                // TODO: interface / modport ports — need virtual-interface plumbing.
-                fail("interface/modport port connections are not supported");
+                // TODO: any other non-value port kind.
+                fail("unsupported port connection kind");
             }
             const PortSymbol& p = pc->port.as<PortSymbol>();
             if (p.direction == slang::ast::ArgumentDirection::InOut ||
