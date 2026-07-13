@@ -98,6 +98,9 @@ public:
     // Whole-object blocking copy `dst = src` of two aggregate lvalues of `type`
     // (lowered to llvm.memcpy of the storage; caller ensures no string leaf).
     Index agg_copy(Index dst, Index src, Ref type, SourceLoc loc);
+    // 1-bit 4-state equality of two whole unpacked-aggregate lvalues of `type`
+    // (the backend expands the per-leaf compare + Land reduction).
+    Index agg_eq(Index lhs, Index rhs, Ref type, SourceLoc loc);
     // Dynamic-array operations on the handle lvalue `arr` (LRM 7.5). new /
     // delete / copy are statements; size yields a 32-bit int. Each emits its
     // dedicated DynArray* tag. `array_type` is the interned DynArray type

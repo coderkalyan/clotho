@@ -1346,10 +1346,11 @@ private:
         return b.concat(parts, l);
     }
 
-    // 1-bit 4-state equality of two whole unpacked structs: AND-reduce the
-    // per-leaf `==` results (Land carries the LRM 11.4.5 X-propagation). Both
-    // operands must be struct lvalues (a '{...} pattern compare is a follow-up);
-    // an array member is guarded (element-wise compare is a follow-up).
+    // 1-bit 4-state equality of two whole unpacked structs: one AggEq node the
+    // backend expands into per-leaf `==` results AND-reduced with Land (the
+    // reduction carries the LRM 11.4.5 X-propagation). Both operands must be
+    // struct lvalues (a '{...} pattern compare is a follow-up); an array member
+    // is guarded (element-wise compare is a follow-up).
     ir::Index lower_struct_eq(const Expression& lhs, const Expression& rhs, ir::Builder& b,
                               ir::SourceLoc l) {
         const Expression& le = unwrap_conversion(lhs);
@@ -1358,13 +1359,12 @@ private:
             fail("unpacked struct equality is only supported between struct variables");
         }
         const ir::Ref sty = lower_type(*lhs.type);
-        return agg_eq(lower_lvalue(le, b), lower_lvalue(re, b), sty, b, l);
+        guard_agg_eq_members(sty);
+        return b.agg_eq(lower_lvalue(le, b), lower_lvalue(re, b), sty, l);
     }
 
-    // Recursive per-leaf equality AND-reduction of two aggregate lvalues of
-    // `type`. Returns a 1-bit 4-state value. A struct recurses to its members'
-    // leaves; a scalar/string leaf compares directly.
-    ir::Index agg_eq(ir::Index lhs, ir::Index rhs, ir::Ref type, ir::Builder& b, ir::SourceLoc l) {
+    // Reject comparable-aggregate shapes the backend expansion does not cover.
+    void guard_agg_eq_members(ir::Ref type) {
         const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
         if (t.kind == ir::Type::Kind::UnpackedArray) {
             // TODO: equality of an aggregate with an unpacked-array member — an
@@ -1372,17 +1372,10 @@ private:
             fail("equality of an aggregate with an unpacked-array member is not supported");
         }
         if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
-            const auto fields = module_.pool.struct_fields(t.fields_id);
-            ir::Index  acc    = ir::Index{ 0 };
-            for (uint32_t i = 0; i < fields.size(); ++i) {
-                const ir::Index e = agg_eq(b.member_select(lhs, i, type, l),
-                                           b.member_select(rhs, i, type, l), fields[i].type, b, l);
-                acc = i == 0 ? e : b.binary(ir::Inst::Tag::Land, acc, e, l);
+            for (const auto& f : module_.pool.struct_fields(t.fields_id)) {
+                guard_agg_eq_members(f.type);
             }
-            return acc;
         }
-        return b.binary(ir::Inst::Tag::Eq, b.unary(ir::Inst::Tag::Load, lhs, l),
-                        b.unary(ir::Inst::Tag::Load, rhs, l), l);
     }
 
     // Strip an outer identity/struct Conversion wrapper slang may insert on a

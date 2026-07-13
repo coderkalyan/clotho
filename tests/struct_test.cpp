@@ -274,6 +274,24 @@ TEST_CASE("unpacked struct equality is field-wise; X makes it ambiguous (LRM 11.
     )") == "eq=1 ne=1\nxeq=x\n");
 }
 
+TEST_CASE("unpacked struct equality with a string member") {
+    // The string leaf compares by content (strcmp == 0), reduced with the
+    // scalar members like any other leaf.
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { string s; bit [3:0] b; } s_t;
+            s_t x, y;
+            initial begin
+                x.s = "hi"; x.b = 4'h2;
+                y.s = "hi"; y.b = 4'h2;
+                $display("eq=%b", x == y);
+                y.s = "ho";
+                $display("eq=%b ne=%b", x == y, x != y);
+            end
+        endmodule
+    )") == "eq=1\neq=0 ne=1\n");
+}
+
 TEST_CASE("arithmetic on a mixed-domain unpacked struct member") {
     // A 2-state `bit` member beside a 4-state `logic` member: the member read
     // must carry the member's own declared domain, not the aggregate's.

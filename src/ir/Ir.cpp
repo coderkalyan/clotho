@@ -245,6 +245,13 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 scratch[1]      = info.src;
                 return { scratch.data(), 2 };
             }
+            if (tag == Inst::Tag::AggEq) {
+                // Both compared aggregate lvalues are referenced.
+                const auto info = extra_data<AggEqInfo>(p.op_extra.extra);
+                scratch[0]      = p.op_extra.op;
+                scratch[1]      = info.rhs;
+                return { scratch.data(), 2 };
+            }
             // dyn_array_new / dyn_array_copy expose the handle lvalue plus
             // their DynArrayArg operand (element count / copy source).
             if (tag == Inst::Tag::DynArrayNew || tag == Inst::Tag::DynArrayCopy) {

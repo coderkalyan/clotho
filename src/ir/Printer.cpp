@@ -107,6 +107,8 @@ const char* tag_name(Inst::Tag tag) {
             return "handle_deref";
         case T::AggCopy:
             return "agg_copy";
+        case T::AggEq:
+            return "agg_eq";
         case T::Load:
             return "load";
         case T::Store:
@@ -740,6 +742,14 @@ private:
                 ref(p.op_extra.op);
                 os_ << " = ";
                 ref(info.src);
+                os_ << ")\n";
+                break;
+            }
+            case Inst::Tag::AggEq: {
+                const AggEqInfo info = ir_.extra_data<AggEqInfo>(p.op_extra.extra);
+                ref(p.op_extra.op);
+                os_ << " == ";
+                ref(info.rhs);
                 os_ << ")\n";
                 break;
             }

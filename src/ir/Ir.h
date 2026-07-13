@@ -191,6 +191,15 @@ struct AggCopyInfo {
     Ref type;
 };
 
+// Extra payload for `agg_eq`: whole-aggregate equality of two unpacked
+// aggregate lvalues of `type` (LRM 11.2.2). The op is the left lvalue.
+struct AggEqInfo {
+    // Right-hand aggregate lvalue.
+    Index rhs;
+    // The aggregate type (gives the member layout to compare).
+    Ref type;
+};
+
 // Extra payload for `member_select`: a member of an unpacked struct (the base is
 // the op). Unlike a packed struct member (a constant part-select over a flat
 // bit-vector), an unpacked struct is an aggregate whose members have their own
@@ -689,6 +698,7 @@ static_assert(ExtraPayload<DynPartSelect>);
 static_assert(ExtraPayload<ElemSelect>);
 static_assert(ExtraPayload<MemberSelect>);
 static_assert(ExtraPayload<AggCopyInfo>);
+static_assert(ExtraPayload<AggEqInfo>);
 static_assert(ExtraPayload<DynArrayArg>);
 static_assert(ExtraPayload<DynArrayNewInitInfo>);
 static_assert(ExtraPayload<QueueArg>);
@@ -791,6 +801,12 @@ struct Inst {
         // op_extra -> AggCopyInfo). Lowered to llvm.memcpy of the storage; the
         // frontend emits it only for a string-free aggregate.
         AggCopy,
+        // 1-bit 4-state equality of two whole unpacked aggregates (payload:
+        // op_extra -> AggEqInfo; op is the left lvalue). The backend expands
+        // the member walk, AND-reducing per-leaf `==` results so LRM 11.4.5
+        // X-propagation is carried exactly; `!=` is a Lnot
+        // of this.
+        AggEq,
 
         // -- Dynamic-array operations on a handle lvalue (LRM 7.5) --
         // Each lowers to its rt_dynarr_* runtime call; element access rides
@@ -1600,6 +1616,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::ElemSelect:
         case T::MemberSelect:
         case T::AggCopy:
+        case T::AggEq:
         case T::DynArrayNew:
         case T::DynArrayNewInit:
         case T::DynArrayCopy:

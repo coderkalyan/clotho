@@ -169,6 +169,12 @@ Index Builder::agg_copy(Index dst, Index src, Ref type, SourceLoc loc) {
     return emit({ Inst::Tag::AggCopy, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
 }
 
+Index Builder::agg_eq(Index lhs, Index rhs, Ref type, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(AggEqInfo{ rhs, type });
+
+    return emit({ Inst::Tag::AggEq, Inst::Payload{ .op_extra = { lhs, extra } } }, loc);
+}
+
 Index Builder::dyn_array_new(Index arr, Index size, Index init, bool has_init, Ref array_type, SourceLoc loc) {
     if (has_init) {
         const ExtraIndex extra = add_extra(DynArrayNewInitInfo{ size, init, array_type });

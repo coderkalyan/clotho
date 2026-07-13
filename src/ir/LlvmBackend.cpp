@@ -941,6 +941,23 @@ private:
         return t.kind != Type::Kind::UnpackedArray && !(t.kind == Type::Kind::Struct && !t.is_packed);
     }
 
+    // Derive member `field_index`'s lvalue from an aggregate lvalue: push the
+    // constant field index onto the aggregate GEP path and resolve the leaf
+    // metadata if the member is a scalar/string (a struct/array member stays
+    // interior for a further select). Shared by MemberSelect and the AggEq
+    // member walk.
+    LValue agg_member(LValue lv, Ref struct_type, uint32_t field_index) {
+        const Type& st = std::get<Type>(mod_.pool.get(struct_type));
+        const Ref   mt = mod_.pool.struct_fields(st.fields_id)[field_index].type;
+        lv.agg_path.push_back(b_.getInt32(field_index));
+        lv.agg_field_path.push_back(field_index);
+        lv.agg_leaf = is_leaf_type(mt);
+        if (lv.agg_leaf) {
+            fill_agg_leaf(lv, mt);
+        }
+        return lv;
+    }
+
     // Byte offset of a GEP field-index path from the root state struct, per the
     // module's DataLayout. Used where the runtime needs raw offsets (the NBA
     // commit loop's meta table).
@@ -6348,6 +6365,7 @@ private:
             case Inst::Tag::Land:
             case Inst::Tag::Lor:
             case Inst::Tag::Lnot:
+            case Inst::Tag::AggEq:
                 return { 1, true, false };
 
             case Inst::Tag::Concat: {
@@ -6785,20 +6803,8 @@ private:
                 return;
             }
             case Inst::Tag::MemberSelect: {
-                // Push the member's constant field index onto the aggregate GEP
-                // path; resolve the leaf metadata if the member is a scalar/string
-                // (a struct/array member stays interior for a further select).
-                LValue      lv     = lvalue_of(p.op_extra.op);
-                const auto  ms     = ir_->extra_data<MemberSelect>(p.op_extra.extra);
-                const Type& st     = std::get<Type>(mod_.pool.get(ms.struct_type));
-                const Ref   mt     = mod_.pool.struct_fields(st.fields_id)[ms.field_index].type;
-                lv.agg_path.push_back(b_.getInt32(ms.field_index));
-                lv.agg_field_path.push_back(ms.field_index);
-                lv.agg_leaf = is_leaf_type(mt);
-                if (lv.agg_leaf) {
-                    fill_agg_leaf(lv, mt);
-                }
-                set_lvalue(i, lv);
+                const auto ms = ir_->extra_data<MemberSelect>(p.op_extra.extra);
+                set_lvalue(i, agg_member(lvalue_of(p.op_extra.op), ms.struct_type, ms.field_index));
                 return;
             }
             case Inst::Tag::ClassNew: {
@@ -7143,6 +7149,12 @@ private:
             case Inst::Tag::CasexEq:
                 set_value(i, lower_case_compare(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
                 return;
+
+            case Inst::Tag::AggEq: {
+                const auto info = ir_->extra_data<AggEqInfo>(p.op_extra.extra);
+                set_value(i, lower_agg_eq(lvalue_of(p.op_extra.op), lvalue_of(info.rhs), info.type));
+                return;
+            }
 
             case Inst::Tag::WildEq:
                 set_value(i, lower_wildeq(value_of(p.binary.l), value_of(p.binary.r)));
@@ -12051,6 +12063,37 @@ private:
         mm->addIncoming(x_mm, x_bb);
         mm->addIncoming(val_mm, val_bb);
         return { mm, zero(1) };
+    }
+
+    // Whole-aggregate `==` (LRM 11.2.2): recursively AND-reduce per-leaf
+    // logical equality over the member walk. Any definite member mismatch is
+    // 0, else X if any member is unknown, else 1 — the Land reduction carries
+    // LRM 11.4.5 X-propagation exactly.
+    Plane lower_agg_eq(const LValue& lhs, const LValue& rhs, Ref type) {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::Struct && !t.is_packed) {
+            const auto fields = mod_.pool.struct_fields(t.fields_id);
+            Plane      acc{};
+            for (uint32_t k = 0; k < fields.size(); ++k) {
+                const Plane e = lower_agg_eq(agg_member(lhs, type, k), agg_member(rhs, type, k),
+                                             fields[k].type);
+                acc = k == 0 ? e : lower_logical(Inst::Tag::Land, acc, e);
+            }
+            return acc;
+        }
+        if (t.kind == Type::Kind::String) {
+            llvm::Value* c = b_.CreateCall(str_cmp_fn(), { lv_string_ptr(lhs), lv_string_ptr(rhs) });
+            llvm::Value* bit = b_.CreateICmpEQ(c, b_.getInt32(0));
+            return bit_plane(bit, bit);
+        }
+        const ValType vt = from_ref(type);
+        Plane         pa = lower_load(lhs);
+        Plane         pb = lower_load(rhs);
+        if (vt.is_real) {
+            pa = real_plane(planes_to_real(pa, vt.width));
+            pb = real_plane(planes_to_real(pb, vt.width));
+        }
+        return lower_compare(Inst::Tag::Eq, pa, pb, vt.is_signed);
     }
 
     Plane lower_compare(Inst::Tag tag, Plane a, Plane b, bool sign) {
