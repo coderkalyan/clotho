@@ -7840,17 +7840,33 @@ private:
         std::vector<ir::Ref>      param_types;
         std::vector<ir::ArgDir>   arg_dirs;
         std::vector<ir::DpiCType> arg_cts;
+        std::vector<ir::DpiCType> arg_elem_cts;
         for (const FormalArgumentSymbol* fa : sub.getArguments()) {
             if (fa->direction == slang::ast::ArgumentDirection::Ref) {
                 // DPI-C has no `ref` formals (slang rejects DPIRefArg); guard
                 // defensively in case a future slang change lets one through.
                 fail("DPI ref arguments are not supported");
             }
+            // Open array (LRM 35.5.6.2): an unsized `[]` formal arrives as an
+            // svOpenArrayHandle. The element's own DpiCType is recorded separately;
+            // the bounds/storage come from the actual at each call.
+            if (const auto* oa =
+                    fa->getType().getCanonicalType().as_if<slang::ast::DPIOpenArrayType>()) {
+                if (fa->direction == slang::ast::ArgumentDirection::In) {
+                    build_dpi_open_array_arg(*oa, param_types, arg_dirs, arg_cts,
+                                             arg_elem_cts);
+                    continue;
+                }
+                // TODO: output/inout open array — the C writes elements back through
+                // svPut*ArrElem; needs the unpack-after-call marshal path. Deferred.
+                fail("DPI output/inout open-array arguments are not supported");
+            }
             const auto c = dpi_ctype(fa->getType());
             if (!c.has_value()) {
-                // open array / unpacked aggregate — deferred.
+                // multi-dim open array / unpacked aggregate — deferred.
                 fail("DPI argument type is not supported (scalar, packed vector, "
-                     "chandle, and string only; not open-array/unpacked)");
+                     "chandle, string, 1-D open array only; not "
+                     "multi-dim-open-array/unpacked)");
             }
             if (*c == ir::DpiCType::String && fa->direction != slang::ast::ArgumentDirection::In) {
                 // TODO: output / inout string. The C writes an unbounded NUL-
@@ -7864,6 +7880,7 @@ private:
             param_types.push_back(lower_type(fa->getType()));
             arg_dirs.push_back(to_arg_dir(fa->direction));
             arg_cts.push_back(*c);
+            arg_elem_cts.push_back(ir::DpiCType::Void);
         }
 
         // The C linkage name is the import's c_identifier, or the SV name when
@@ -7900,7 +7917,50 @@ private:
                                                .extern_name    = std::move(cid),
                                                .dpi_arg_ctypes = std::move(arg_cts),
                                                .dpi_ret_ctype  = ret_ct,
+                                               .dpi_arg_elem_ctypes = std::move(arg_elem_cts),
                                                .ir             = b.finish() });
+    }
+
+    // Classify a 1-D DPI open-array formal (LRM 35.5.6.2). Records DpiCType::OpenArray
+    // in arg_cts and the element's own DpiCType in arg_elem_cts; param_types gets the
+    // element's lowered type (a phantom slot — the backend reads the actual's array
+    // type at each call, but the whole-function scans want a benign non-handle Ref).
+    // Only input direction, 1-D, with a marshalable element (named scalar / packed
+    // bit / packed logic) is supported; everything else loud-fails.
+    void build_dpi_open_array_arg(const slang::ast::DPIOpenArrayType& oa,
+                                  std::vector<ir::Ref>&      param_types,
+                                  std::vector<ir::ArgDir>&   arg_dirs,
+                                  std::vector<ir::DpiCType>& arg_cts,
+                                  std::vector<ir::DpiCType>& arg_elem_cts) {
+        const slang::ast::Type& elem = oa.elementType.getCanonicalType();
+        if (elem.isUnpackedArray() || elem.getCanonicalType().as_if<slang::ast::DPIOpenArrayType>()) {
+            // TODO: multi-dimensional open array (element itself an array). Deferred —
+            // the descriptor + marshal are 1-D only.
+            fail("DPI multi-dimensional open-array arguments are not supported");
+        }
+        const auto ec = dpi_ctype(elem);
+        // V1 elements: the named integers (Byte/Shortint/Int/Longint — zero-copy,
+        // Clotho's narrow element storage is already a contiguous C array) and packed
+        // bit/logic vectors (marshalled via rt_dpi_pack_arr_*). Scalar bit/logic, real,
+        // string, chandle elements are deferred (docs/design/dpi-c.md).
+        const bool ok = ec.has_value() &&
+                        (*ec == ir::DpiCType::Byte || *ec == ir::DpiCType::Shortint ||
+                         *ec == ir::DpiCType::Int || *ec == ir::DpiCType::Longint ||
+                         *ec == ir::DpiCType::BitVec || *ec == ir::DpiCType::LogicVec);
+        if (!ok) {
+            fail("DPI open-array element type is not supported (byte/shortint/int/"
+                 "longint or packed bit/logic vector only)");
+        }
+        if ((*ec == ir::DpiCType::BitVec || *ec == ir::DpiCType::LogicVec) &&
+            elem.getBitWidth() > 32) {
+            // The per-element marshal is one svVecVal word (<= 32 bits). A wider
+            // packed element needs a multi-word chunk marshal — deferred.
+            fail("DPI open-array packed element wider than 32 bits is not supported");
+        }
+        param_types.push_back(lower_type(elem));
+        arg_dirs.push_back(ir::ArgDir::In);
+        arg_cts.push_back(ir::DpiCType::OpenArray);
+        arg_elem_cts.push_back(*ec);
     }
 
     // Collect `export "DPI-C"` directives (LRM 35.5): for each, force-lower the SV
@@ -8273,7 +8333,19 @@ private:
         std::vector<ir::Index> args;
         args.reserve(formals.size());
         for (size_t i = 0; i < formals.size(); ++i) {
-            const auto    dir = formals[i]->direction;
+            const auto dir = formals[i]->direction;
+            // A DPI open-array formal (LRM 35.5.6.2): pass the actual array's lvalue
+            // leaf. The backend builds the svOpenArray descriptor from the actual's
+            // array type at the call site. lower_type would fail on DPIOpenArrayType,
+            // so intercept before it. Input-only (guarded in build_dpi_open_array_arg).
+            if (formals[i]->getType().getCanonicalType().as_if<slang::ast::DPIOpenArrayType>()) {
+                const Expression* actual = actuals[i];
+                if (actual->kind == ExpressionKind::Assignment) {
+                    actual = &actual->as<AssignmentExpression>().left();
+                }
+                args.push_back(lower_lvalue(unwrap_conversion(*actual), b));
+                continue;
+            }
             const ir::Ref pty = lower_type(formals[i]->getType());
             if (contains_struct_ref(pty)) {
                 // An aggregate actual passes by pointer (its lvalue); the callee

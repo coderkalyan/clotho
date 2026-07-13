@@ -171,6 +171,10 @@ enum class DpiCType : uint8_t {
     // (slang rejects a packed-array DPI return — a return is a "small value").
     BitVec,   // SV 2-state packed (bit[N] / time / packed struct) -> svBitVecVal*
     LogicVec, // SV 4-state packed (logic[N] / integer)           -> svLogicVecVal*
+    // An unsized `[]` (open) array formal (LRM 35.5.6.2) -> svOpenArrayHandle. The
+    // element's own DpiCType is carried in Function::dpi_arg_elem_ctypes; the
+    // bounds come from the actual at each call.
+    OpenArray,
 };
 
 // A lowered SystemVerilog function or task. Its body is an Ir whose leaves are
@@ -219,6 +223,10 @@ struct Function {
     // return. Only populated when is_dpi.
     std::vector<DpiCType> dpi_arg_ctypes;
     DpiCType              dpi_ret_ctype = DpiCType::Void;
+    // For each OpenArray argument, the element's own DpiCType (Byte/Int/BitVec/
+    // LogicVec/...); DpiCType::Void for a non-OpenArray argument. Parallel to
+    // dpi_arg_ctypes; only populated when is_dpi.
+    std::vector<DpiCType> dpi_arg_elem_ctypes;
     // The lowered body.
     Ir ir;
 };

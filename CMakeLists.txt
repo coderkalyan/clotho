@@ -178,6 +178,11 @@ add_executable(clotho_test
 )
 target_link_libraries(clotho_test PRIVATE clotho doctest::doctest clotho_warnings)
 
+# Export the test executable's dynamic symbols so DPI-C imports defined in the
+# test TUs (extern "C") resolve through the JIT's process-symbol generator
+# (dlsym(RTLD_DEFAULT)), the same path libc/libm DPI imports already use.
+set_target_properties(clotho_test PROPERTIES ENABLE_EXPORTS ON)
+
 # Register each doctest case as its own CTest test for parallelism and
 # per-case reporting.
 include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)

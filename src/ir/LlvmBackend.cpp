@@ -1800,10 +1800,11 @@ private:
                 return raw_ptr_ty(); // char* (input const char* by value; return char*)
             case DpiCType::BitVec:
             case DpiCType::LogicVec:
-                // A packed vector is always passed by pointer and is never a return
-                // type; declare_dpi_import emits the pointer directly, so this is
-                // never reached for a by-value slot.
-                throw BackendError{ "internal: DPI vec has no by-value C type" };
+            case DpiCType::OpenArray:
+                // A packed vector / open array is always passed by pointer and is
+                // never a return type; declare_dpi_import emits the pointer directly,
+                // so this is never reached for a by-value slot.
+                throw BackendError{ "internal: DPI vec / open array has no by-value C type" };
         }
         throw BackendError{ "internal: unknown DPI C type" };
     }
@@ -1828,9 +1829,10 @@ private:
             const ArgDir   dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
             const DpiCType ct  = f.dpi_arg_ctypes[k];
             // A packed vector is a pointer in every direction (svBitVecVal* /
-            // svLogicVecVal*); a scalar is by value for input, by pointer for
-            // output / inout (the C function writes through it).
-            const bool by_ptr = is_dpi_vec(ct) || dir != ArgDir::In;
+            // svLogicVecVal*); an open array is a pointer (svOpenArrayHandle); a
+            // scalar is by value for input, by pointer for output / inout (the C
+            // function writes through it).
+            const bool by_ptr = is_dpi_vec(ct) || ct == DpiCType::OpenArray || dir != ArgDir::In;
             params.push_back(by_ptr ? ptr : dpi_c_llvm_ty(ct));
         }
         auto* fnty   = llvm::FunctionType::get(dpi_c_llvm_ty(f.dpi_ret_ctype), params, false);
@@ -9807,6 +9809,148 @@ private:
                       dpi_load_words(zv, nc, w));
     }
 
+    // The LLVM struct mirroring the runtime rt_svopen descriptor (Runtime.h):
+    // { ptr data, i32 left, i32 right, i32 nelem, i32 elem_bytes, i32 elem_width,
+    // i32 is_logic }. Memoized; must match the C layout exactly.
+    llvm::StructType* rt_svopen_ty() {
+        if (rt_svopen_ty_ == nullptr) {
+            auto* i32 = b_.getInt32Ty();
+            rt_svopen_ty_ = llvm::StructType::create(
+              ctx_, { raw_ptr_ty(), i32, i32, i32, i32, i32, i32 }, "clotho.svopen");
+        }
+        return rt_svopen_ty_;
+    }
+    llvm::StructType* rt_svopen_ty_ = nullptr;
+
+    // void rt_dpi_pack_arr_bit(const void* base, u32 stride, u32 w, u32 n, void* out).
+    llvm::FunctionCallee dpi_pack_arr_bit_fn() {
+        auto* p = raw_ptr_ty();
+        auto* i = b_.getInt32Ty();
+        return rt_fn("rt_dpi_pack_arr_bit", b_.getVoidTy(), { p, i, i, i, p });
+    }
+    // void rt_dpi_pack_arr_logic(base, stride, z_off, has_z, w, n, out).
+    llvm::FunctionCallee dpi_pack_arr_logic_fn() {
+        auto* p = raw_ptr_ty();
+        auto* i = b_.getInt32Ty();
+        return rt_fn("rt_dpi_pack_arr_logic", b_.getVoidTy(), { p, i, i, i, i, i, p });
+    }
+
+    // The ir::Type Ref of a DPI open-array actual: resolve the operand's lvalue leaf
+    // to its root Signal / Local / Arg and read that root's declared type (the whole
+    // unpacked-array type, carrying element / left / right). The actual is always a
+    // whole array (build_call_args passes its lvalue leaf).
+    Ref open_array_type_ref(Index a) {
+        const Index root = lvalue_root(*ir_, a).root;
+        switch (ir_->tag(root)) {
+            case Inst::Tag::Signal:
+                return mod_.signal(ir_->payload(root).signal).type;
+            case Inst::Tag::Local:
+                return ir_->payload(root).local.type;
+            case Inst::Tag::Arg:
+                return ir_->payload(root).arg.type;
+            default:
+                throw BackendError{ "internal: DPI open-array actual is not a "
+                                    "signal / local / arg root" };
+        }
+    }
+
+    // Build the svOpenArrayHandle (rt_svopen*) for a DPI open-array input argument
+    // (LRM 35.5.6.2). Named-scalar (byte/shortint/int/longint) elements are zero-copy
+    // — Clotho's narrow `[N x iW]` element storage is already a contiguous C array —
+    // so the descriptor points straight at the design array. Packed bit/logic
+    // elements are marshalled once into a contiguous svVecVal buffer (autovectorized
+    // rt_dpi_pack_arr_*). Input-only in V1 (no unpack-back), so no output plumbing.
+    llvm::Value* build_dpi_open_array_desc(Index a, DpiCType elem_ct) {
+        const LValue lv = lvalue_of(a);
+        const Ref    arr_ref = open_array_type_ref(a);
+        const Type&  at      = std::get<Type>(mod_.pool.get(arr_ref));
+        if (at.kind != Type::Kind::UnpackedArray) {
+            // Dynamic array / queue actuals need a heap-data-pointer load + a runtime
+            // length; deferred (see docs/design/dpi-c.md).
+            throw BackendError{ "DPI open-array actual must be a fixed-size unpacked "
+                                "array (dynamic array / queue deferred)" };
+        }
+        if (lv.array_ty == nullptr || lv.slot_ty == nullptr) {
+            throw BackendError{ "internal: DPI open-array actual is not a whole memory" };
+        }
+        const uint32_t n     = array_dim(at);
+        const int32_t  left  = static_cast<int32_t>(at.left);
+        const int32_t  right = static_cast<int32_t>(at.right);
+        const uint32_t ew    = lv.store_width; // element bit width
+
+        // Use the actual element storage slot (`lv.slot_ty`) — not a conservative
+        // reconstruction — so may-z elision (a `{ i2W }` slot with no z word) is
+        // reflected in the stride and the has_z flag the marshal needs.
+        llvm::StructType* slot   = lv.slot_ty;
+        const auto        stride = static_cast<uint32_t>(llmod_.getDataLayout().getTypeAllocSize(slot));
+        llvm::Value*      storage = lv.base; // whole `[N x slot]` storage pointer
+
+        llvm::Value* data;
+        uint32_t     elem_bytes;
+        uint32_t     is_logic;
+        switch (elem_ct) {
+            case DpiCType::Byte:
+            case DpiCType::Shortint:
+            case DpiCType::Int:
+            case DpiCType::Longint: {
+                // Zero-copy requires the narrow single-iW element slot (stride ==
+                // C element size). A never-narrow named scalar (its z word forced by
+                // a task out/inout use elsewhere) would not be C-layout — marshal it
+                // as a bit vector instead (the mm plane's low W bits are the value).
+                if (lv.narrow && stride == ew / 8) {
+                    data       = storage;
+                    elem_bytes = ew / 8;
+                    is_logic   = 0;
+                    break;
+                }
+                auto* buf = entry_alloca(llvm::ArrayType::get(b_.getInt32Ty(), n), "dpi.oa.bit");
+                b_.CreateCall(dpi_pack_arr_bit_fn(),
+                              { storage, b_.getInt32(stride), b_.getInt32(ew), b_.getInt32(n), buf });
+                data       = buf;
+                elem_bytes = 4;
+                is_logic   = 0;
+                break;
+            }
+            case DpiCType::BitVec: {
+                auto* buf = entry_alloca(llvm::ArrayType::get(b_.getInt32Ty(), n), "dpi.oa.bit");
+                b_.CreateCall(dpi_pack_arr_bit_fn(),
+                              { storage, b_.getInt32(stride), b_.getInt32(ew), b_.getInt32(n), buf });
+                data       = buf;
+                elem_bytes = 4; // svBitVecVal
+                is_logic   = 0;
+                break;
+            }
+            case DpiCType::LogicVec: {
+                auto* svl = llvm::StructType::get(ctx_, { b_.getInt32Ty(), b_.getInt32Ty() });
+                auto* buf = entry_alloca(llvm::ArrayType::get(svl, n), "dpi.oa.logic");
+                // z field offset only when the slot actually carries a z word.
+                const uint32_t has_z = lv.has_z ? 1u : 0u;
+                const uint32_t zoff  = lv.has_z ? static_cast<uint32_t>(
+                    llmod_.getDataLayout().getStructLayout(slot)->getElementOffset(1)) : 0u;
+                b_.CreateCall(dpi_pack_arr_logic_fn(),
+                              { storage, b_.getInt32(stride), b_.getInt32(zoff), b_.getInt32(has_z),
+                                b_.getInt32(ew), b_.getInt32(n), buf });
+                data       = buf;
+                elem_bytes = 8; // svLogicVecVal {aval,bval}
+                is_logic   = 1;
+                break;
+            }
+            default:
+                throw BackendError{ "internal: bad DPI open-array element ctype" };
+        }
+
+        auto* ty   = rt_svopen_ty();
+        auto* desc = entry_alloca(ty, "dpi.oa.desc");
+        b_.CreateStore(data, b_.CreateStructGEP(ty, desc, 0));
+        b_.CreateStore(b_.getInt32(static_cast<uint32_t>(left)), b_.CreateStructGEP(ty, desc, 1));
+        b_.CreateStore(b_.getInt32(static_cast<uint32_t>(right)), b_.CreateStructGEP(ty, desc, 2));
+        b_.CreateStore(b_.getInt32(n), b_.CreateStructGEP(ty, desc, 3));
+        b_.CreateStore(b_.getInt32(elem_bytes), b_.CreateStructGEP(ty, desc, 4));
+        b_.CreateStore(b_.getInt32(ew), b_.CreateStructGEP(ty, desc, 5));
+        b_.CreateStore(b_.getInt32(is_logic), b_.CreateStructGEP(ty, desc, 6));
+        return desc;
+    }
+
     // Lower a `call` to a DPI-C import (LRM 35): marshal each argument — scalar by
     // value (input) or through a C-native scratch pointer (output / inout), packed
     // vector always through an svBitVecVal* / svLogicVecVal* scratch — call the
@@ -9839,6 +9983,10 @@ private:
                 // copy. Valid for the call's duration; the C must not retain it.
                 // output / inout string is frontend-guarded.
                 argv.push_back(b_.CreateCall(str_data_fn(), { str_of(a) }));
+            } else if (ct == DpiCType::OpenArray) {
+                // Open array (LRM 35.5.6.2): build the svOpenArrayHandle descriptor
+                // (zero-copy or marshalled) and pass it. Input-only in V1.
+                argv.push_back(build_dpi_open_array_desc(a, f.dpi_arg_elem_ctypes[k]));
             } else if (is_dpi_vec(ct)) {
                 // Packed vector: always by pointer. Input builds the scratch from the
                 // value; output leaves it empty for the C to fill; inout copies in.

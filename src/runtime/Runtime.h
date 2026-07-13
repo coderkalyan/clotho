@@ -814,9 +814,11 @@ typedef struct rt_svopen {
 // `[N x iW]` storage is already the C array (zero-copy).
 void rt_dpi_pack_arr_bit(const void* base, uint32_t stride, uint32_t w, uint32_t n, void* out);
 void rt_dpi_unpack_arr_bit(const void* in, uint32_t stride, uint32_t w, uint32_t n, void* base);
-void rt_dpi_pack_arr_logic(const void* base, uint32_t stride, uint32_t z_off, uint32_t w, uint32_t n,
-                           void* out);
-void rt_dpi_unpack_arr_logic(const void* in, uint32_t stride, uint32_t z_off, uint32_t w, uint32_t n,
-                             void* base);
+// `has_z` == 0 for a never-z element whose slot carries no z word ({ i2W } only,
+// z-elided); z_off is then ignored and the marshalled z is 0.
+void rt_dpi_pack_arr_logic(const void* base, uint32_t stride, uint32_t z_off, uint32_t has_z,
+                           uint32_t w, uint32_t n, void* out);
+void rt_dpi_unpack_arr_logic(const void* in, uint32_t stride, uint32_t z_off, uint32_t has_z,
+                             uint32_t w, uint32_t n, void* base);
 
 } // extern "C"

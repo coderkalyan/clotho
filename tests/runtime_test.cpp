@@ -678,15 +678,27 @@ TEST_CASE("svdpi open array: 4-state element marshal preserves x/z (logic[7:0])"
     static_assert(sizeof(Slot) == 4);
     Slot in[2] = { { 0x7744, 0x11, 0 }, { 0xFFFF, 0x00, 0 } }; // 01xz01xz, then 8'hFF
     svLogicVecVal out[2];
-    rt_dpi_pack_arr_logic(in, sizeof(Slot), offsetof(Slot, z), 8, 2, out);
+    rt_dpi_pack_arr_logic(in, sizeof(Slot), offsetof(Slot, z), /*has_z=*/1, 8, 2, out);
     CHECK(out[0].aval == 0x66u); // value-or-X
     CHECK(out[0].bval == 0x33u); // X or Z
     CHECK(out[1].aval == 0xFFu);
     CHECK(out[1].bval == 0x00u);
     Slot back[2] = {};
-    rt_dpi_unpack_arr_logic(out, sizeof(Slot), offsetof(Slot, z), 8, 2, back);
+    rt_dpi_unpack_arr_logic(out, sizeof(Slot), offsetof(Slot, z), /*has_z=*/1, 8, 2, back);
     CHECK(back[0].mm == in[0].mm);
     CHECK(back[0].z == in[0].z);
     CHECK(back[1].mm == in[1].mm);
     CHECK(back[1].z == in[1].z);
+}
+
+TEST_CASE("svdpi open array: never-z 4-state element (no z word, has_z=0)") {
+    // A logic[7:0] whose z was elided: slot is {i16 mm} only, stride 2, no z field.
+    // A clean value V has must==may==V, so mm = V | (V<<8).
+    uint16_t      in[3] = { 0xA5A5, 0x3C3C, 0x0F0F }; // clean values (must==may)
+    svLogicVecVal out[3];
+    rt_dpi_pack_arr_logic(in, sizeof(uint16_t), /*z_off=*/0, /*has_z=*/0, 8, 3, out);
+    CHECK(out[0].aval == 0xA5u);
+    CHECK(out[0].bval == 0x00u);
+    CHECK(out[1].aval == 0x3Cu);
+    CHECK(out[2].aval == 0x0Fu);
 }

@@ -2,10 +2,11 @@
 #define CLOTHO_SVDPI_H
 
 // DPI-C helper API (IEEE 1800-2023 Annex H) — the subset Clotho's runtime
-// implements: the canonical value types and the packed-vector bit/part-select
-// accessors. Scope (svGetScope/svSetScope), open arrays, and the rest of svdpi
-// are not yet provided; calling one is an unresolved-symbol error at JIT link
-// time. Any conforming svdpi.h is equally usable — these signatures are standardized.
+// implements: the canonical value types, the packed-vector bit/part-select
+// accessors, the single-instance scope API, and the 1-D open-array accessors. The
+// disable API and svGetCallerInfo are not yet provided; calling one is an
+// unresolved-symbol error at JIT link time. Any conforming svdpi.h is equally usable —
+// these signatures are standardized.
 //
 // Compile DPI C against this header (or any svdpi.h) and pass the object with
 // `--dpi-lib dpi.o` (a `.o`/`.a` is JIT-linked, so the accessors resolve to the

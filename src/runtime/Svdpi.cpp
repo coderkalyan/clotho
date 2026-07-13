@@ -161,23 +161,31 @@ uint32_t open_pos(const rt_svopen* a, int i) {
 // a contiguous svVecVal buffer. Templated on the concrete slot integer types so
 // each is a fixed-stride strided-load loop with branch-free arithmetic (the -O2
 // runtime autovectorizes it). W <= 32 (one svVecVal word).
-template <typename MM, typename Z>
+// `HasZ` is a template parameter so each instantiation is a straight-line,
+// branch-free loop the -O2 runtime autovectorizes. A never-z element (its z word
+// elided by may-z analysis, so the slot is `{ i2W }` with no z field) instantiates
+// HasZ=false: z is the constant 0 and the z read is compiled out entirely.
+template <typename MM, typename Z, bool HasZ>
 void pack_logic(const uint8_t* b, uint32_t stride, uint32_t z_off, uint32_t w, uint32_t n,
                 svLogicVecVal* o) {
     const uint32_t mask = w >= 32 ? 0xffffffffu : ((1u << w) - 1);
     for (uint32_t k = 0; k < n; ++k) {
         MM mm;
-        Z  z;
         std::memcpy(&mm, b + static_cast<size_t>(k) * stride, sizeof(MM));
-        std::memcpy(&z, b + static_cast<size_t>(k) * stride + z_off, sizeof(Z));
+        uint32_t z = 0;
+        if constexpr (HasZ) {
+            Z zc;
+            std::memcpy(&zc, b + static_cast<size_t>(k) * stride + z_off, sizeof(Z));
+            z = static_cast<uint32_t>(zc);
+        }
         const uint32_t must = static_cast<uint32_t>(mm) & mask;
         const uint32_t may  = static_cast<uint32_t>(static_cast<uint64_t>(mm) >> w) & mask;
-        o[k].aval = may & ~static_cast<uint32_t>(z);
+        o[k].aval = may & ~z;
         o[k].bval = must ^ may;
     }
 }
 
-template <typename MM, typename Z>
+template <typename MM, typename Z, bool HasZ>
 void unpack_logic(const svLogicVecVal* in, uint8_t* b, uint32_t stride, uint32_t z_off, uint32_t w,
                   uint32_t n) {
     for (uint32_t k = 0; k < n; ++k) {
@@ -185,9 +193,11 @@ void unpack_logic(const svLogicVecVal* in, uint8_t* b, uint32_t stride, uint32_t
         const uint32_t bval = in[k].bval;
         const MM       mm =
           static_cast<MM>(static_cast<uint64_t>(aval & ~bval) | (static_cast<uint64_t>(aval | bval) << w));
-        const Z z = static_cast<Z>(bval & ~aval);
         std::memcpy(b + static_cast<size_t>(k) * stride, &mm, sizeof(MM));
-        std::memcpy(b + static_cast<size_t>(k) * stride + z_off, &z, sizeof(Z));
+        if constexpr (HasZ) {
+            const Z z = static_cast<Z>(bval & ~aval);
+            std::memcpy(b + static_cast<size_t>(k) * stride + z_off, &z, sizeof(Z));
+        }
     }
 }
 
@@ -238,29 +248,33 @@ void rt_dpi_unpack_arr_bit(const void* in, uint32_t stride, uint32_t w, uint32_t
     }
 }
 
-void rt_dpi_pack_arr_logic(const void* base, uint32_t stride, uint32_t z_off, uint32_t w, uint32_t n,
-                           void* out) {
+void rt_dpi_pack_arr_logic(const void* base, uint32_t stride, uint32_t z_off, uint32_t has_z,
+                           uint32_t w, uint32_t n, void* out) {
     const auto* b = static_cast<const uint8_t*>(base);
     auto*       o = static_cast<svLogicVecVal*>(out);
-    if (w <= 8) {
-        pack_logic<uint16_t, uint8_t>(b, stride, z_off, w, n, o);
-    } else if (w <= 16) {
-        pack_logic<uint32_t, uint16_t>(b, stride, z_off, w, n, o);
+    if (has_z) {
+        if (w <= 8)       pack_logic<uint16_t, uint8_t, true>(b, stride, z_off, w, n, o);
+        else if (w <= 16) pack_logic<uint32_t, uint16_t, true>(b, stride, z_off, w, n, o);
+        else              pack_logic<uint64_t, uint32_t, true>(b, stride, z_off, w, n, o);
     } else {
-        pack_logic<uint64_t, uint32_t>(b, stride, z_off, w, n, o);
+        if (w <= 8)       pack_logic<uint16_t, uint8_t, false>(b, stride, z_off, w, n, o);
+        else if (w <= 16) pack_logic<uint32_t, uint16_t, false>(b, stride, z_off, w, n, o);
+        else              pack_logic<uint64_t, uint32_t, false>(b, stride, z_off, w, n, o);
     }
 }
 
-void rt_dpi_unpack_arr_logic(const void* in, uint32_t stride, uint32_t z_off, uint32_t w, uint32_t n,
-                             void* base) {
+void rt_dpi_unpack_arr_logic(const void* in, uint32_t stride, uint32_t z_off, uint32_t has_z,
+                             uint32_t w, uint32_t n, void* base) {
     const auto* i = static_cast<const svLogicVecVal*>(in);
     auto*       b = static_cast<uint8_t*>(base);
-    if (w <= 8) {
-        unpack_logic<uint16_t, uint8_t>(i, b, stride, z_off, w, n);
-    } else if (w <= 16) {
-        unpack_logic<uint32_t, uint16_t>(i, b, stride, z_off, w, n);
+    if (has_z) {
+        if (w <= 8)       unpack_logic<uint16_t, uint8_t, true>(i, b, stride, z_off, w, n);
+        else if (w <= 16) unpack_logic<uint32_t, uint16_t, true>(i, b, stride, z_off, w, n);
+        else              unpack_logic<uint64_t, uint32_t, true>(i, b, stride, z_off, w, n);
     } else {
-        unpack_logic<uint64_t, uint32_t>(i, b, stride, z_off, w, n);
+        if (w <= 8)       unpack_logic<uint16_t, uint8_t, false>(i, b, stride, z_off, w, n);
+        else if (w <= 16) unpack_logic<uint32_t, uint16_t, false>(i, b, stride, z_off, w, n);
+        else              unpack_logic<uint64_t, uint32_t, false>(i, b, stride, z_off, w, n);
     }
 }
 
