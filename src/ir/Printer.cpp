@@ -388,18 +388,18 @@ private:
 
     // Render an interned type compactly, e.g. `logic[7:0]`.
     void render_type(Ref type) {
-        clotho::ir::render_type(ir_.pool, type, os_);
+        clotho::ir::render_type(ir_.pool(), type, os_);
     }
 
     // Render an interned constant as `<type> 0x<val-plane>`. Only the value
     // plane is shown; a trailing `+xz` flags any unknown bits.
     void render_constant(Ref value) {
-        const Value& v   = std::get<Value>(ir_.pool.get(value));
-        const auto   all = ir_.pool.bytes(value);
+        const Value& v   = std::get<Value>(ir_.pool().get(value));
+        const auto   all = ir_.pool().bytes(value);
         render_type(v.type);
 
         // A string constant's bytes are its characters, not plane data.
-        if (std::get<Type>(ir_.pool.get(v.type)).kind == Type::Kind::String) {
+        if (std::get<Type>(ir_.pool().get(v.type)).kind == Type::Kind::String) {
             os_ << " \"";
             for (const uint8_t c : all) {
                 os_ << static_cast<char>(c);
@@ -408,7 +408,7 @@ private:
             return;
         }
 
-        const auto planes      = static_cast<size_t>(ir_.pool.layout(v.type).domain);
+        const auto planes      = static_cast<size_t>(ir_.pool().layout(v.type).domain);
         const auto plane_bytes = planes ? all.size() / planes : all.size();
         os_ << " 0x" << std::hex;
         if (plane_bytes == 0) {

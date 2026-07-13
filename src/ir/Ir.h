@@ -1542,11 +1542,18 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
 
 // Immutable, finished process IR: a structure of arrays (parallel tag / payload
 // / location columns indexed by Index) plus a flat extra side-table. The body
-// is the root region. Constructed by Builder::finish().
+// is the root region. Constructed by Builder::finish(); default construction
+// yields an inert empty body (no pool), so an Ir-holding record (Function,
+// Process) can be slotted before its body is built and move-assigned later.
 class Ir {
 public:
-    // Intern pool backing this IR's constant / type handles.
-    const InternPool& pool;
+    Ir() = default;
+
+    // Intern pool backing this IR's constant / type handles. Valid only on a
+    // built Ir (Builder::finish()), never on a default-constructed one.
+    const InternPool& pool() const {
+        return *pool_;
+    }
 
     // Total number of instructions across all regions.
     size_t inst_count() const {
@@ -1650,13 +1657,15 @@ private:
        std::vector<SourceLoc>     locs,
        std::vector<uint32_t>      extra,
        ExtraSlice                 root)
-      : pool(pool)
+      : pool_(&pool)
       , tags_(std::move(tags))
       , payloads_(std::move(payloads))
       , locs_(std::move(locs))
       , extra_(std::move(extra))
       , root_(root) {}
 
+    // Intern pool backing this IR's handles; null only when default-constructed.
+    const InternPool* pool_ = nullptr;
     // Instruction tags.
     Array<Inst::Tag> tags_;
     // Per-instruction payloads, parallel to tags_.
@@ -1665,8 +1674,8 @@ private:
     Array<SourceLoc> locs_;
     // Flat u32 side-table for region bodies, operand slices, and extra structs.
     Array<uint32_t> extra_;
-    // Top-level region: the process body.
-    ExtraSlice root_;
+    // Top-level region: the process body (empty when default-constructed).
+    ExtraSlice root_{};
 };
 
 // Result of walking an lvalue's select chain to its root storage leaf.
