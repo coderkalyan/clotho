@@ -458,7 +458,8 @@ struct Analysis {
                 // $dist_* / seeded $random return a packed {seed, draw} i64 and
                 // $urandom family a 2-state draw — all definite bits, z = 0. The
                 // seed writeback is a plain Store swept by the Store cases.
-                case Inst::Tag::DistCall:
+                case Inst::Tag::DistUnary:
+                case Inst::Tag::DistBinary:
                 case Inst::Tag::Urandom:
                 case Inst::Tag::UrandomSeeded:
                 case Inst::Tag::UrandomRange:

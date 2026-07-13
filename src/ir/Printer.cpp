@@ -355,8 +355,10 @@ const char* tag_name(Inst::Tag tag) {
             return "timeformat";
         case T::Random:
             return "random";
-        case T::DistCall:
-            return "dist_call";
+        case T::DistUnary:
+            return "dist_unary";
+        case T::DistBinary:
+            return "dist_binary";
         case T::Urandom:
             return "urandom";
         case T::UrandomSeeded:
@@ -658,15 +660,6 @@ private:
                 os_ << "op" << p.fn_unary.fn << ", ";
                 ref(p.fn_unary.op);
                 break;
-            case Inst::PayloadKind::Dist: {
-                const auto info = ir_.extra_data<DistInfo>(p.extra);
-                os_ << "op" << info.op;
-                for (Index a : ir_.region(info.args)) {
-                    os_ << ", ";
-                    ref(a);
-                }
-                break;
-            }
             case Inst::PayloadKind::TimeFormat: {
                 const auto info = ir_.extra_data<TimeFormatInfo>(p.extra);
                 ref(info.units);

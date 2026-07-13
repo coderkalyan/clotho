@@ -293,9 +293,9 @@ public:
     // $random: a 32-bit signed PRNG draw. No operands.
     Index random(SourceLoc loc);
     // A distribution function (LRM §20.15.2) or seeded $random (§20.15.1): the
-    // DistOp plus its value operands (the seed word, then the parameters).
-    // Yields an i64 with the updated seed packed in [32,64) and the signed draw
-    // in [0,32).
+    // DistOp plus its value operands (the seed word, then the 1-2 parameters —
+    // the count selects the DistUnary / DistBinary tag). Yields an i64 with the
+    // updated seed packed in [32,64) and the signed draw in [0,32).
     Index dist_call(DistOp op, std::span<const Index> args, SourceLoc loc);
     // $urandom (LRM §18.13.1): a 32-bit unsigned per-process xoshiro256++ draw.
     // No operands; reads/advances the process frame RNG.

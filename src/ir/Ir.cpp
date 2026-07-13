@@ -100,13 +100,6 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
             scratch[0] = p.fn_unary.op;
             return { scratch.data(), 1 };
 
-        case Inst::PayloadKind::Dist: {
-            // dist_call: the seed + parameter operands live in the DistInfo
-            // record; the DistOp opcode is not an SSA operand.
-            const auto info = extra_data<DistInfo>(p.extra);
-            return index_slice(info.args);
-        }
-
         case Inst::PayloadKind::TimeFormat: {
             // timeformat: units / precision / min_width are SSA operands; the
             // suffix bytes are not.
@@ -136,6 +129,21 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 scratch[0]    = p.op_extra.op;
                 scratch[1]    = es.index;
                 return { scratch.data(), 2 };
+            }
+            // dist_unary / dist_binary expose the seed word plus the
+            // distribution parameter(s); the DistOp selector is not an operand.
+            if (tag == Inst::Tag::DistUnary) {
+                const auto d = extra_data<DistUnaryInfo>(p.op_extra.extra);
+                scratch[0]   = p.op_extra.op;
+                scratch[1]   = d.p1;
+                return { scratch.data(), 2 };
+            }
+            if (tag == Inst::Tag::DistBinary) {
+                const auto d = extra_data<DistBinaryInfo>(p.op_extra.extra);
+                scratch[0]   = p.op_extra.op;
+                scratch[1]   = d.p1;
+                scratch[2]   = d.p2;
+                return { scratch.data(), 3 };
             }
             // real_math_binary exposes its two real operands; the routine
             // selector is not an operand.

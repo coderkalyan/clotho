@@ -5792,6 +5792,26 @@ private:
         std::vector<llvm::Type*> params(nparam + 1, b_.getInt32Ty());
         return rt_fn(name, b_.getInt64Ty(), params);
     }
+    // Reference-routine symbol for a distribution selector (LRM §20.15.2).
+    static const char* dist_symbol(uint32_t fn) {
+        switch (static_cast<DistOp>(fn)) {
+            case DistOp::Uniform:
+                return "rt_dist_uniform";
+            case DistOp::Normal:
+                return "rt_dist_normal";
+            case DistOp::Exponential:
+                return "rt_dist_exponential";
+            case DistOp::Poisson:
+                return "rt_dist_poisson";
+            case DistOp::ChiSquare:
+                return "rt_dist_chi_square";
+            case DistOp::StudentT:
+                return "rt_dist_t";
+            case DistOp::Erlang:
+                return "rt_dist_erlang";
+        }
+        throw BackendError{ "internal: unknown dist op" };
+    }
     // void rt_urandom_seed(i64* state, i64 seed): splitmix64 expansion of a
     // 64-bit selector into the process's xoshiro256++ frame state.
     llvm::FunctionCallee urandom_seed_fn() {
@@ -6294,7 +6314,8 @@ private:
 
             // $dist_* / seeded $random: a packed i64 {seed:32, draw:32}, sliced
             // by the frontend. A definite 2-state word (never x/z).
-            case Inst::Tag::DistCall:
+            case Inst::Tag::DistUnary:
+            case Inst::Tag::DistBinary:
                 return { 64, false, false };
             // $urandom / $urandom_range: a 32-bit unsigned `int` (2-state).
             case Inst::Tag::Urandom:
@@ -7581,29 +7602,26 @@ private:
                 return;
             }
 
-            case Inst::Tag::DistCall: {
+            case Inst::Tag::DistUnary: {
                 // $dist_* / seeded $random: call the reference routine with the
-                // seed word and parameters (must planes, sign-extended to i32);
-                // the packed {seed, draw} i64 is a definite 2-state value the
-                // frontend slices.
-                const auto info = ir_->extra_data<DistInfo>(ir_->payload(i).extra);
-                const auto args = ir_->region(info.args);
-                std::vector<llvm::Value*> call_args;
-                call_args.reserve(args.size());
-                for (Index a : args) {
-                    call_args.push_back(cast(must_of(value_of(a)), 32, true));
-                }
-                llvm::FunctionCallee fn;
-                switch (static_cast<DistOp>(info.op)) {
-                    case DistOp::Uniform:     fn = dist_fn("rt_dist_uniform", 2); break;
-                    case DistOp::Normal:      fn = dist_fn("rt_dist_normal", 2); break;
-                    case DistOp::Exponential: fn = dist_fn("rt_dist_exponential", 1); break;
-                    case DistOp::Poisson:     fn = dist_fn("rt_dist_poisson", 1); break;
-                    case DistOp::ChiSquare:   fn = dist_fn("rt_dist_chi_square", 1); break;
-                    case DistOp::StudentT:    fn = dist_fn("rt_dist_t", 1); break;
-                    case DistOp::Erlang:      fn = dist_fn("rt_dist_erlang", 2); break;
-                }
-                set_value(i, two_val(b_.CreateCall(fn, call_args)));
+                // seed word and parameter(s) (must planes, sign-extended to
+                // i32); the packed {seed, draw} i64 is a definite 2-state value
+                // the frontend slices.
+                const auto&  p    = ir_->payload(i).op_extra;
+                const auto   info = ir_->extra_data<DistUnaryInfo>(p.extra);
+                llvm::Value* seed = cast(must_of(value_of(p.op)), 32, true);
+                llvm::Value* p1   = cast(must_of(value_of(info.p1)), 32, true);
+                set_value(i, two_val(b_.CreateCall(dist_fn(dist_symbol(info.fn), 1), { seed, p1 })));
+                return;
+            }
+            case Inst::Tag::DistBinary: {
+                const auto&  p    = ir_->payload(i).op_extra;
+                const auto   info = ir_->extra_data<DistBinaryInfo>(p.extra);
+                llvm::Value* seed = cast(must_of(value_of(p.op)), 32, true);
+                llvm::Value* p1   = cast(must_of(value_of(info.p1)), 32, true);
+                llvm::Value* p2   = cast(must_of(value_of(info.p2)), 32, true);
+                set_value(
+                  i, two_val(b_.CreateCall(dist_fn(dist_symbol(info.fn), 2), { seed, p1, p2 })));
                 return;
             }
 

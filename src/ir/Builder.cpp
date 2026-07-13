@@ -556,9 +556,14 @@ Index Builder::random(SourceLoc loc) {
 }
 
 Index Builder::dist_call(DistOp op, std::span<const Index> args, SourceLoc loc) {
-    const ExtraSlice slice = add_slice(args);
-    const ExtraIndex extra = add_extra(DistInfo{ static_cast<uint32_t>(op), slice });
-    return emit({ Inst::Tag::DistCall, pay(&Inst::Payload::extra, extra) }, loc);
+    if (args.size() == 3) {
+        const ExtraIndex extra =
+          add_extra(DistBinaryInfo{ args[1], args[2], static_cast<uint32_t>(op) });
+        return emit({ Inst::Tag::DistBinary, Inst::Payload{ .op_extra = { args[0], extra } } },
+                    loc);
+    }
+    const ExtraIndex extra = add_extra(DistUnaryInfo{ args[1], static_cast<uint32_t>(op) });
+    return emit({ Inst::Tag::DistUnary, Inst::Payload{ .op_extra = { args[0], extra } } }, loc);
 }
 
 Index Builder::urandom(SourceLoc loc) {

@@ -468,15 +468,27 @@ struct RealMathBinaryInfo {
     uint32_t fn;
 };
 
-// Extra payload for `dist_call`: a probabilistic distribution function (LRM
-// §20.15.2) or seeded $random (§20.15.1). `op` is the ir::DistOp; `args` are the
-// value operands in call order — the seed word first, then the distribution
-// parameters (0-2 of them).
-struct DistInfo {
+// Extra payload for `dist_unary`: a one-parameter distribution function
+// ($dist_exponential / $dist_poisson / $dist_chi_square / $dist_t, LRM
+// §20.15.2). The seed word is the instruction's op.
+struct DistUnaryInfo {
+    // The distribution parameter (mean / degrees of freedom).
+    Index p1;
     // ir::DistOp value.
-    uint32_t op;
-    // Value operands: seed, then parameters.
-    ExtraSlice args;
+    uint32_t fn;
+};
+
+// Extra payload for `dist_binary`: a two-parameter distribution function
+// ($dist_uniform / $dist_normal / $dist_erlang, LRM §20.15.2) or seeded
+// $random (§20.15.1, Uniform over the full int32 span). The seed word is the
+// instruction's op.
+struct DistBinaryInfo {
+    // First distribution parameter.
+    Index p1;
+    // Second distribution parameter.
+    Index p2;
+    // ir::DistOp value.
+    uint32_t fn;
 };
 
 // Extra payload for `sformat`: $sformat / $swrite (LRM §21.3.3) format the value
@@ -681,7 +693,8 @@ static_assert(ExtraPayload<DisplayInfo>);
 static_assert(ExtraPayload<SeverityInfo>);
 static_assert(ExtraPayload<FseekInfo>);
 static_assert(ExtraPayload<RealMathBinaryInfo>);
-static_assert(ExtraPayload<DistInfo>);
+static_assert(ExtraPayload<DistUnaryInfo>);
+static_assert(ExtraPayload<DistBinaryInfo>);
 static_assert(ExtraPayload<SformatInfo>);
 static_assert(ExtraPayload<SformatfInfo>);
 static_assert(ExtraPayload<ScanfInfo>);
@@ -1212,16 +1225,19 @@ struct Inst {
         // $random: IEEE Annex N reference PRNG, -> 32-bit signed two-state (payload:
         // none). Lowers to an `rt_random` call; the value is always known (no
         // x/z). The unseeded (process-global) form only; the seeded form
-        // `$random(seed)` lowers to DistCall(Uniform, ...) instead.
+        // `$random(seed)` lowers to DistBinary(Uniform, ...) instead.
         Random,
-        // A probabilistic distribution function (LRM §20.15.2) or the seeded
-        // $random(seed) (§20.15.1). Payload: extra -> DistInfo (the DistOp plus
-        // the value operands: the seed word, then the distribution parameters).
-        // Lowers to the matching rt_dist_* call, returning an i64 with the
-        // updated seed packed in [32,64) and the signed integer draw in [0,32);
-        // the frontend slices the seed back to the inout lvalue and takes the
-        // draw. The result is always known (no x/z).
-        DistCall,
+        // A probabilistic distribution function (LRM §20.15.2), split by
+        // parameter count; DistBinary also covers the seeded $random(seed)
+        // (§20.15.1, Uniform over the full int32 span). Payload: op_extra —
+        // op is the seed word, extra a DistUnaryInfo / DistBinaryInfo carrying
+        // the parameter(s) and the ir::DistOp. Lowers to the matching
+        // rt_dist_* call, returning an i64 with the updated seed packed in
+        // [32,64) and the signed integer draw in [0,32); the frontend slices
+        // the seed back to the inout lvalue and takes the draw. The result is
+        // always known (no x/z).
+        DistUnary,
+        DistBinary,
         // $urandom (LRM §18.13.1): a per-process xoshiro256++ draw, -> a 32-bit
         // unsigned two-state `int`. No operand (payload: none); reads and
         // advances the process's coroutine-frame RNG state, inlined by the
@@ -1289,7 +1305,6 @@ struct Inst {
         Sformat,
         Sformatf,
         Scanf,
-        Dist,
         Severity,
     };
 
@@ -1519,8 +1534,6 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::Scanf;
         case T::RealMathUnary:
             return K::FnUnary;
-        case T::DistCall:
-            return K::Dist;
         case T::TimeFormat:
             return K::TimeFormat;
         case T::Break:
@@ -1570,6 +1583,8 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Switch:
         case T::Fseek:
         case T::RealMathBinary:
+        case T::DistUnary:
+        case T::DistBinary:
         case T::FreadMem:
         case T::ReadMem:
         case T::StrPutc:
