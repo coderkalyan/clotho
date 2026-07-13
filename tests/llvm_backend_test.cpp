@@ -194,9 +194,10 @@ TEST_CASE("alu emits verifiable llvm ir") {
     CHECK(ir.find(" add ") != std::string::npos);
     CHECK(ir.find(" sub ") != std::string::npos);
 
-    // Signal access via constant-index typed GEPs into the state structs
-    // (asserted on raw IR; instcombine canonicalizes GEP shapes).
-    CHECK(raw.find("getelementptr inbounds %clotho.state, ptr") != std::string::npos);
+    // Signal access via constant typed GEPs, anchored at the owning instance
+    // scope: def-relative (%alu.state) off @clotho.state, folded link-time
+    // constant (asserted on raw IR; instcombine canonicalizes GEP shapes).
+    CHECK(raw.find("%alu.state, ptr @clotho.state") != std::string::npos);
     CHECK(ir.find("store i16") != std::string::npos);
 
     // The if/else lowers to branches.

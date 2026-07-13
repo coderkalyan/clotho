@@ -436,6 +436,39 @@ struct SignalSlot {
     // reached by the ElemSelect queue path; the handle powers on
     // { null, 0, 0, 0 } (an empty queue) and is freed at teardown.
     bool is_queue = false;
+    // Index of the instance-scope anchor this signal is addressed through
+    // (Anchor / storage_ptr); no_anchor for an unscoped root-level signal,
+    // which is addressed directly off @clotho.state.
+    static constexpr uint32_t no_anchor = ~0u;
+    uint32_t anchor = no_anchor;
+};
+
+// One instance-scope occurrence: the addressing anchor for every signal the
+// scope declares. Prep for per-module-definition compilation units: a signal
+// access is `anchor symbol + def-relative offset` instead of a constant path
+// from the state root, so a definition's code never embeds whole-design layout.
+// A scope whose definition is instantiated once resolves through a GlobalAlias
+// of @clotho.state (a link-time constant — the relocation shape, free at run
+// time); a scope of a reused definition loads a base pointer main stores at
+// startup (indirect — the shape one shared body per definition will need).
+struct Anchor {
+    // Field-index path from the root state struct to this scope's struct.
+    std::vector<uint32_t> path;
+    // The scope's definition state struct (GEP source type for member access).
+    llvm::StructType* ty = nullptr;
+    // Hierarchical instance name (diagnostic / symbol naming).
+    std::string name;
+    // Base of the scope's storage: a constant GEP of @clotho.state (unique
+    // definition — link-time constant; a per-definition split externalizes
+    // exactly this into a root-defined symbol) or a pointer-holding global main
+    // initializes at startup (reused definition; storage_ptr loads it).
+    // NOTE: not a GlobalAlias — JITLink's symbol-bounds validation rejects an
+    // alias into the interior of a global whose value type extends past the
+    // containing block, so the constant form stays an anonymous expression.
+    llvm::Constant* sym = nullptr;
+    // True when the scope's definition state type is instantiated more than
+    // once: address through a runtime base-pointer load.
+    bool indirect = false;
 };
 
 // One function-frame local: its `{ i(2W), iW }` slot type and width / domain.
@@ -491,6 +524,7 @@ public:
 
     void run() {
         build_state_types();
+        emit_state_global(); // before any body: storage_ptr resolves through the anchors
         compute_subscription_order();
         compute_fusion_groups(); // before build_wait_queues: bucket capacities count group subscriptions
         if (std::getenv("CLOTHO_COMB_FUSE_STAT") != nullptr) {
@@ -933,8 +967,13 @@ private:
     // scope. Struct types are deduplicated per module definition — instances of
     // one definition (same parameterization) produce identical field lists and
     // share one identified type, so the type is replicated per instantiation.
+    // Each call is one scope occurrence and records one Anchor; the signal keeps
+    // its full root path (initializer / NBA offset math) plus the anchor id, and
+    // storage_ptr addresses it anchor-relative.
     llvm::StructType* scope_type(const InstanceScope& scope, std::vector<uint32_t>& path,
-                                 std::vector<bool>& claimed) {
+                                 std::vector<bool>& claimed, const std::string& hier) {
+        const auto aid = static_cast<uint32_t>(anchors_.size());
+        anchors_.push_back(Anchor{ .path = path, .name = hier });
         std::vector<llvm::Type*> fields;
         for (uint32_t k = 0; k < scope.signals.size(); ++k) {
             const auto si = static_cast<uint32_t>(scope.signals[k]);
@@ -944,22 +983,25 @@ private:
             claimed[si] = true;
             slots_[si].path = path;
             slots_[si].path.push_back(k);
+            slots_[si].anchor = aid;
             fields.push_back(slots_[si].storage_ty);
         }
         const auto nsig = static_cast<uint32_t>(scope.signals.size());
         for (uint32_t c = 0; c < scope.children.size(); ++c) {
             path.push_back(nsig + c);
-            fields.push_back(scope_type(scope.children[c], path, claimed));
+            fields.push_back(scope_type(scope.children[c], path, claimed, hier + "." + scope.children[c].name));
             path.pop_back();
         }
 
         for (const auto& [def, flds, ty] : def_types_) {
             if (def == scope.def_name && flds == fields) {
+                anchors_[aid].ty = ty;
                 return ty;
             }
         }
         auto* ty = llvm::StructType::create(ctx_, fields, scope.def_name + ".state");
         def_types_.emplace_back(scope.def_name, fields, ty);
+        anchors_[aid].ty = ty;
         return ty;
     }
 
@@ -1072,7 +1114,16 @@ private:
         std::vector<bool>        claimed(sigs.size(), false);
         for (const InstanceScope& top : mod_.tops()) {
             std::vector<uint32_t> path{ static_cast<uint32_t>(root_fields.size()) };
-            root_fields.push_back(scope_type(top, path, claimed));
+            root_fields.push_back(scope_type(top, path, claimed, top.name));
+        }
+        // A definition state type produced by more than one scope occurrence is
+        // a reused module: those instances address indirectly (see Anchor).
+        for (Anchor& a : anchors_) {
+            uint32_t uses = 0;
+            for (const Anchor& b : anchors_) {
+                uses += b.ty == a.ty ? 1u : 0u;
+            }
+            a.indirect = uses > 1;
         }
         for (uint32_t i = 0; i < sigs.size(); ++i) {
             if (!claimed[i]) {
@@ -1394,16 +1445,30 @@ private:
     }
 
     // Pointer to a signal's whole storage (its slot struct, or its [N x slot]
-    // memory) within the state struct `base` points at: one constant-index GEP
-    // along the slot's field path.
-    llvm::Value* storage_ptr(llvm::Value* base, const SignalSlot& s) {
+    // memory), addressed through its owning scope's anchor: `anchor + the
+    // def-relative field path`. A unique-definition anchor is a constant alias
+    // of @clotho.state, so the GEP folds to the same link-time-constant address
+    // as the old root-path form; a reused-definition anchor is a base pointer
+    // loaded at each access (stored once by main before any process runs). An
+    // unscoped signal (flat root scope) keeps the direct root-path GEP.
+    llvm::Value* storage_ptr(const SignalSlot& s) {
         std::vector<llvm::Value*> idx;
-        idx.reserve(s.path.size() + 1);
         idx.push_back(b_.getInt32(0));
-        for (const uint32_t f : s.path) {
-            idx.push_back(b_.getInt32(f));
+        if (s.anchor == SignalSlot::no_anchor) {
+            for (const uint32_t f : s.path) {
+                idx.push_back(b_.getInt32(f));
+            }
+            return b_.CreateInBoundsGEP(state_ty_, state_global_, idx);
         }
-        return b_.CreateInBoundsGEP(state_ty_, base, idx);
+        const Anchor& a    = anchors_[s.anchor];
+        llvm::Value*  base = a.sym;
+        if (a.indirect) {
+            base = b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), a.sym);
+        }
+        for (size_t f = a.path.size(); f < s.path.size(); ++f) {
+            idx.push_back(b_.getInt32(s.path[f]));
+        }
+        return b_.CreateInBoundsGEP(a.ty, base, idx);
     }
 
     // Pointer to one field of the root NBA shadow struct, addressed through a base
@@ -1423,6 +1488,38 @@ private:
     llvm::Value* shadow_ptr(uint32_t field) {
         llvm::Value* base = b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), shadow_base_gv());
         return b_.CreateInBoundsGEP(shadow_ty_, base, { b_.getInt32(0), b_.getInt32(field) });
+    }
+
+    // Create @clotho.state and one anchor symbol per instance scope, before any
+    // body is emitted (storage_ptr resolves through them). The state global's
+    // initializer is the whole power-on state (see emit_main's comment). A
+    // unique-definition anchor is a GlobalAlias of the scope's storage — a
+    // link-time constant, the shape a future per-definition split externalizes
+    // as a root-defined symbol. A reused-definition anchor is a pointer global
+    // main fills at startup (emit_main), before init_state and every process.
+    void emit_state_global() {
+        auto* state_gv = new llvm::GlobalVariable(llmod_, state_ty_, false,
+                                                  llvm::GlobalValue::InternalLinkage,
+                                                  state_initializer(), "clotho.state");
+        state_gv->setAlignment(llvm::Align(64));
+        state_global_ = state_gv;
+
+        auto* ptr = llvm::PointerType::getUnqual(ctx_);
+        for (Anchor& a : anchors_) {
+            if (a.indirect) {
+                a.sym = new llvm::GlobalVariable(llmod_, ptr, false, llvm::GlobalValue::InternalLinkage,
+                                                 llvm::ConstantPointerNull::get(ptr),
+                                                 "clotho.inst." + a.name);
+                continue;
+            }
+            std::vector<llvm::Constant*> idx;
+            idx.reserve(a.path.size() + 1);
+            idx.push_back(b_.getInt32(0));
+            for (const uint32_t f : a.path) {
+                idx.push_back(b_.getInt32(f));
+            }
+            a.sym = llvm::ConstantExpr::getInBoundsGetElementPtr(state_ty_, state_gv, idx);
+        }
     }
 
     // Global holding &state->shadow; created on first use, initialized in
@@ -2747,13 +2844,23 @@ private:
         // fixed base into every signal GEP, and no per-signal init store is
         // emitted (only arrays keep a runtime fill loop; see `init_state`).
         // 64-byte aligned to cover any packed-vector alignment in the struct.
-        auto* state_gv = new llvm::GlobalVariable(llmod_, state_ty_, false,
-                                                  llvm::GlobalValue::InternalLinkage,
-                                                  state_initializer(), "clotho.state");
-        state_gv->setAlignment(llvm::Align(64));
-        state_global_      = state_gv; // reached by DPI export thunks
-        llvm::Value* state = state_gv;
-        init_state(state);
+        // Created up front by emit_state_global (bodies address it through the
+        // instance anchors); reused-definition anchor bases are stored here,
+        // before init_state and any process, so every later load sees them.
+        llvm::Value* state = state_global_;
+        for (const Anchor& a : anchors_) {
+            if (!a.indirect) {
+                continue;
+            }
+            std::vector<llvm::Value*> idx;
+            idx.reserve(a.path.size() + 1);
+            idx.push_back(b_.getInt32(0));
+            for (const uint32_t f : a.path) {
+                idx.push_back(b_.getInt32(f));
+            }
+            b_.CreateStore(b_.CreateInBoundsGEP(state_ty_, state, idx), a.sym);
+        }
+        init_state();
         if (shadow_base_gv_ != nullptr) {
             b_.CreateStore(b_.CreateInBoundsGEP(state_ty_, state, { b_.getInt32(0), b_.getInt32(shadow_field_) }),
                            shadow_base_gv_);
@@ -2780,11 +2887,11 @@ private:
         // longjmps past this, its heap reclaimed at process exit.
         for (const SignalSlot& s : slots_) {
             if (s.is_string) {
-                emit_string_slot_op(state, s, str_deinit_fn());
+                emit_string_slot_op(s, str_deinit_fn());
             } else if (s.is_dynarr) {
-                b_.CreateCall(dynarr_delete_fn(), { storage_ptr(state, s) });
+                b_.CreateCall(dynarr_delete_fn(), { storage_ptr(s) });
             } else if (s.is_queue) {
-                b_.CreateCall(queue_delete_all_fn(), { storage_ptr(state, s) });
+                b_.CreateCall(queue_delete_all_fn(), { storage_ptr(s) });
             }
         }
 
@@ -4242,7 +4349,7 @@ private:
             const uint32_t    W       = s.width;
             auto*             mmty     = int_ty(s.narrow ? W : 2 * W);
             auto*             zty      = int_ty(W);
-            llvm::Value*      live     = storage_ptr(state_, s);
+            llvm::Value*      live     = storage_ptr(s);
             llvm::Value*      live_mm  = b_.CreateStructGEP(s.slot_ty, live, 0);
             llvm::Value*      sh_mm    = shadow_ptr(s.sh_mm_field);
             llvm::Value*      live_z   = s.has_z ? b_.CreateStructGEP(s.slot_ty, live, 1) : nullptr;
@@ -4324,7 +4431,7 @@ private:
     // aggregate member is rejected in the frontend, so Any is the only bucket.
     void emit_agg_commit(Signal sig, const llvm::APInt& mask) {
         const SignalSlot& s       = slot_of(sig);
-        llvm::Value*      live    = storage_ptr(state_, s);
+        llvm::Value*      live    = storage_ptr(s);
         llvm::Value*      changed = b_.getFalse();
         for (uint32_t k = 0; k < s.static_leaves.size(); ++k) {
             if (!mask[k]) {
@@ -4447,7 +4554,7 @@ private:
     // Load a signal's packed must|may state word (field 0 of the slot struct).
     llvm::Value* load_mm(Signal sig) {
         const SignalSlot& s      = slot_of(sig);
-        llvm::Value*      mm_ptr = b_.CreateStructGEP(s.slot_ty, storage_ptr(state_, s), 0);
+        llvm::Value*      mm_ptr = b_.CreateStructGEP(s.slot_ty, storage_ptr(s), 0);
         return b_.CreateAlignedLoad(
           int_ty(2 * s.width), mm_ptr,
           llmod_.getDataLayout().getABITypeAlign(int_ty(2 * s.width)));
@@ -5333,7 +5440,7 @@ private:
             // and returns the records to its pool.
             if (!intra_nba_sigs_.empty()) {
                 for (const Signal sig : intra_nba_sigs_) {
-                    emit_intra_commit(sig, state);
+                    emit_intra_commit(sig);
                 }
             }
             // Nonblocking event triggers (`->> e`, LRM 15.5.4): for each pending
@@ -5704,20 +5811,20 @@ private:
     // large memory's X-fill as a global constant would bloat the JIT object's
     // `.data` (a non-zero pattern cannot go in `.bss`), so it is filled in
     // O(1) emitted instructions instead.
-    void init_state(llvm::Value* state) {
+    void init_state() {
         for (const SignalSlot& s : slots_) {
             if (s.is_agg) {
                 std::vector<llvm::Value*> path;
-                emit_agg_init(s.ir_type, storage_ptr(state, s), path, s.storage_ty);
+                emit_agg_init(s.ir_type, storage_ptr(s), path, s.storage_ty);
                 continue;
             }
             if (!s.is_array) {
                 continue;
             }
             if (s.is_string) {
-                emit_string_slot_op(state, s, str_init_fn());
+                emit_string_slot_op(s, str_init_fn());
             } else {
-                emit_array_init(state, s);
+                emit_array_init(s);
             }
         }
     }
@@ -5857,8 +5964,8 @@ private:
     // Apply `callee` (rt_string_init / rt_string_deinit) to a string signal's
     // handle, or to every element handle of an array-of-string signal (a runtime
     // loop, like emit_array_init).
-    void emit_string_slot_op(llvm::Value* state, const SignalSlot& s, llvm::FunctionCallee callee) {
-        llvm::Value* base = storage_ptr(state, s);
+    void emit_string_slot_op(const SignalSlot& s, llvm::FunctionCallee callee) {
+        llvm::Value* base = storage_ptr(s);
         if (!s.is_array) {
             b_.CreateCall(callee, { base });
             return;
@@ -5889,12 +5996,12 @@ private:
     // storing the per-element power-on value (X for 4-state, 0 for 2-state) into
     // each leaf slot. A loop keeps init O(elem_count) emitted instructions, so a
     // large memory does not bloat the IR.
-    void emit_array_init(llvm::Value* state, const SignalSlot& s) {
+    void emit_array_init(const SignalSlot& s) {
         const uint32_t w   = s.width;
         auto*          i32 = b_.getInt32Ty();
         llvm::Value*   mm  = s.narrow ? zero(w) : (s.four_state ? x_mm(w) : zero(2 * w));
         auto*        arr_ty = llvm::cast<llvm::ArrayType>(s.storage_ty);
-        llvm::Value* base   = storage_ptr(state, s);
+        llvm::Value* base   = storage_ptr(s);
 
         auto* fn    = b_.GetInsertBlock()->getParent();
         auto* head  = llvm::BasicBlock::Create(ctx_, "ainit.head", fn);
@@ -7568,14 +7675,14 @@ private:
             // extends agg_path and (at a scalar/string leaf) fills the leaf
             // metadata. A bare aggregate lvalue is never loaded/stored directly.
             LValue lv{};
-            lv.base      = storage_ptr(state_, s);
+            lv.base      = storage_ptr(s);
             lv.root_ty   = s.storage_ty;
             lv.is_agg    = true;
             lv.is_signal = true;
             lv.sig       = sig;
             return lv;
         }
-        return LValue{ .base        = storage_ptr(state_, s),
+        return LValue{ .base        = storage_ptr(s),
                        .slot_ty     = s.slot_ty,
                        .has_z       = s.has_z,
                        .narrow      = s.narrow,
@@ -8377,7 +8484,7 @@ private:
     // order LRM allows among same-instant updates), then wake edge readers once on
     // the net old->new change, and return the records to the pool. Mirrors the
     // whole-signal block-commit body, looped over the ready list.
-    void emit_intra_commit(Signal sig, llvm::Value* state) {
+    void emit_intra_commit(Signal sig) {
         const SignalSlot& s    = slot_of(sig);
         const uint32_t    W    = s.width;
         auto*             i32  = b_.getInt32Ty();
@@ -8401,7 +8508,7 @@ private:
 
         b_.SetInsertPoint(run);
         llvm::Value* base    = b_.CreateCall(intra_ready_base_fn(), { b_.getInt32(idx) });
-        llvm::Value* live    = storage_ptr(state, s);
+        llvm::Value* live    = storage_ptr(s);
         llvm::Value* live_mm = b_.CreateStructGEP(s.slot_ty, live, 0);
         llvm::Value* live_z  = s.has_z ? b_.CreateStructGEP(s.slot_ty, live, 1) : nullptr;
         llvm::Value* old_mm  = b_.CreateLoad(mmty, live_mm);
@@ -9212,7 +9319,7 @@ private:
         // Element i's planes at base + i*stride (one slot struct per element); a
         // never-z memory stores no z word, so pass a null z_base.
         auto*        arr_ty  = llvm::cast<llvm::ArrayType>(s.storage_ty);
-        llvm::Value* storage = storage_ptr(state_, s);
+        llvm::Value* storage = storage_ptr(s);
         llvm::Value* mm_base =
           b_.CreateInBoundsGEP(arr_ty, storage, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(0) });
         llvm::Value* z_base =
@@ -9288,7 +9395,7 @@ private:
         // The runtime addresses element i's planes at base + i*stride, so hand it
         // element 0's typed field pointers and the slot struct's alloc size.
         auto*        arr_ty  = llvm::cast<llvm::ArrayType>(s.storage_ty);
-        llvm::Value* storage = storage_ptr(state_, s);
+        llvm::Value* storage = storage_ptr(s);
         llvm::Value* mm_base =
           b_.CreateInBoundsGEP(arr_ty, storage, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(0) });
         // A never-z memory (always the case for a 2-state element type) stores no
@@ -9599,7 +9706,7 @@ private:
         llvm::Value*   nlen  = b_.getInt32(static_cast<uint32_t>(leaf.size()));
 
         if (!s.is_array) {
-            llvm::Value* storage = storage_ptr(state_, s);
+            llvm::Value* storage = storage_ptr(s);
             llvm::Value* mm      = b_.CreateStructGEP(s.slot_ty, storage, 0);
             llvm::Value* zp = s.has_z ? b_.CreateStructGEP(s.slot_ty, storage, 1) : llvm::cast<llvm::Value>(nullp);
             b_.CreateCall(vcd_var_fn(), { np, nlen, b_.getInt32(s.width), b_.getInt32(flags), mm, zp });
@@ -9614,7 +9721,7 @@ private:
             throw BackendError{ "VCD dump of multidimensional array '" + info.name + "' is not supported" };
         }
         auto*        arr_ty  = llvm::cast<llvm::ArrayType>(s.storage_ty);
-        llvm::Value* base    = storage_ptr(state_, s);
+        llvm::Value* base    = storage_ptr(s);
         llvm::Value* mm_base = b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(0) });
         llvm::Value* z_base =
           s.has_z ? b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(1) })
@@ -11918,6 +12025,9 @@ private:
     // different fields (different parameterization) gets its own entry.
     std::vector<std::tuple<std::string, std::vector<llvm::Type*>, llvm::StructType*>> def_types_;
     std::vector<SignalSlot> slots_;
+    // Instance-scope anchors, one per scope occurrence (see Anchor); filled by
+    // scope_type, symbols created by emit_state_global.
+    std::vector<Anchor> anchors_;
 
     // VCD dirty set (meaningful iff design_uses_vcd_). vcd_index_[sig] is the
     // runtime dump-var index of a dumped scalar signal, or -1 when the signal is
