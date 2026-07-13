@@ -11,10 +11,12 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <limits>
 #include <span>
 #include <string_view>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -118,6 +120,9 @@ struct Type {
     // Kind::Struct only: true for a packed struct/union (bit-vector value
     // semantics), false for unpacked (aggregate storage).
     bool is_packed = false;
+    // Explicit padding, always 0, so Type has unique object representations
+    // (its bytes hash / compare / serialize directly).
+    uint8_t reserved = 0;
     // Element type, for PackedArray / UnpackedArray, and packed Struct (the
     // scalar - logic or bit - whose domain the whole packed value shares).
     Ref element = Ref::Invalid;
@@ -132,6 +137,9 @@ struct Type {
 
     bool operator==(const Type&) const = default;
 };
+
+static_assert(std::has_unique_object_representations_v<Type>,
+              "Type must stay padding-free: its bytes are hashed directly");
 
 // One declared member of a struct/union type, in declaration order. Plain
 // 16-byte data: the member name lives in the pool's flat name arena, resolved
@@ -190,22 +198,15 @@ inline std::span<const uint8_t> value_bytes(const Value& v, const std::vector<ui
 
 } // namespace clotho::ir
 
-// wyhash for interned types. Fields are marshalled into padding-free words so
-// the byte hash is deterministic.
+// wyhash for interned types. Type is padding-free (explicit reserved byte,
+// static_assert above), so its object bytes hash directly — no marshalling.
 template<>
 struct ankerl::unordered_dense::hash<clotho::ir::Type> {
     using is_avalanching = void;
 
     auto operator()(const clotho::ir::Type& t) const noexcept -> uint64_t {
-        const std::array<uint32_t, 5> words{
-            (static_cast<uint32_t>(t.kind) << 2) | (static_cast<uint32_t>(t.is_signed) << 1) |
-              static_cast<uint32_t>(t.is_packed),
-            static_cast<uint32_t>(t.element),
-            t.left,
-            t.right,
-            t.fields_id,
-        };
-        return detail::wyhash::hash(words.data(), sizeof(words));
+        const auto bytes = std::bit_cast<std::array<uint8_t, sizeof(clotho::ir::Type)>>(t);
+        return detail::wyhash::hash(bytes.data(), bytes.size());
     }
 };
 
