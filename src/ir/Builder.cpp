@@ -395,25 +395,26 @@ Index Builder::fork(std::span<const FunctionId> children, ForkKind kind, SourceL
 
 Index Builder::display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc) {
     // $display / $write: no descriptor operand; the backend targets standard output.
-    return display_impl(static_cast<Index>(0), false, fmt, newline, args, loc);
+    return emit({ Inst::Tag::Display, pay(&Inst::Payload::extra, display_info(fmt, newline, args)) },
+                loc);
 }
 
 Index Builder::fdisplay(Index fd, std::string_view fmt, bool newline, std::span<const Index> args,
                         SourceLoc loc) {
     // $fdisplay / $fwrite: `fd` selects the destination descriptor.
-    return display_impl(fd, true, fmt, newline, args, loc);
+    return emit({ Inst::Tag::FDisplay,
+                  Inst::Payload{ .op_extra = { fd, display_info(fmt, newline, args) } } },
+                loc);
 }
 
-Index Builder::display_impl(Index fd, bool has_fd, std::string_view fmt, bool newline,
-                            std::span<const Index> args, SourceLoc loc) {
+ExtraIndex Builder::display_info(std::string_view fmt, bool newline, std::span<const Index> args) {
     // Order in the extra buffer: format bytes, then the arg-index slice, then the
     // DisplayInfo record pointing at both. None of the three regions overlap.
     const ExtraIndex fmt_at = add_bytes(fmt);
     const ExtraSlice slice  = add_slice(args);
-    const ExtraIndex extra  = add_extra(DisplayInfo{
-      fmt_at, static_cast<uint32_t>(fmt.size()), newline ? 1u : 0u, fd, has_fd ? 1u : 0u, slice });
 
-    return emit({ Inst::Tag::Display, pay(&Inst::Payload::extra, extra) }, loc);
+    return add_extra(
+      DisplayInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), newline ? 1u : 0u, slice });
 }
 
 Index Builder::fopen_fd(Index name, Index mode, SourceLoc loc) {

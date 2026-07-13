@@ -69,6 +69,13 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
             return index_slice(info.args);
         }
 
+        case Inst::PayloadKind::FDisplay: {
+            // fdisplay: like display; the descriptor (op_extra.op) cannot ride
+            // the same span as the variadic args (see the header NOTE).
+            const auto info = extra_data<DisplayInfo>(p.op_extra.extra);
+            return index_slice(info.args);
+        }
+
         case Inst::PayloadKind::Severity: {
             // severity: the message value args are an index slice in the
             // SeverityInfo record; the format string and banner are not operands.

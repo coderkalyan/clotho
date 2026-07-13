@@ -287,6 +287,8 @@ const char* tag_name(Inst::Tag tag) {
             return "str_realtoa";
         case T::Display:
             return "display";
+        case T::FDisplay:
+            return "fdisplay";
         case T::Finish:
             return "finish";
         case T::CaseViol:
@@ -617,6 +619,16 @@ private:
             case Inst::PayloadKind::Display: {
                 const auto info = ir_.extra_data<DisplayInfo>(p.extra);
                 os_ << '"' << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
+                for (Index a : ir_.region(info.args)) {
+                    os_ << ", ";
+                    ref(a);
+                }
+                break;
+            }
+            case Inst::PayloadKind::FDisplay: {
+                const auto info = ir_.extra_data<DisplayInfo>(p.op_extra.extra);
+                ref(p.op_extra.op);
+                os_ << ", \"" << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
                 for (Index a : ir_.region(info.args)) {
                     os_ << ", ";
                     ref(a);

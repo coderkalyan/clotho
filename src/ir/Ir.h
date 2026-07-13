@@ -380,13 +380,13 @@ struct SwitchInfo {
     ExtraSlice default_;
 };
 
-// Extra payload for `display`: a $display / $write / $fdisplay / $fwrite system
-// task. The format-string bytes live packed little-endian (4 chars per u32 word)
-// at `fmt` for `fmt_len` bytes; `args` is the slice of value operands the format
-// specifiers consume, in order; `newline` is 1 for the $*display forms (append
-// '\n') and 0 for the $*write forms. `fd` is the destination descriptor operand
-// for the $f* forms; when `has_fd` is 0 ($display / $write) the backend writes to
-// the standard-output MCD and `fd` is unused.
+// Extra payload for `display` / `fdisplay`: a $display / $write / $fdisplay /
+// $fwrite system task. The format-string bytes live packed little-endian
+// (4 chars per u32 word) at `fmt` for `fmt_len` bytes; `args` is the slice of
+// value operands the format specifiers consume, in order; `newline` is 1 for
+// the $*display forms (append '\n') and 0 for the $*write forms. The
+// destination is the tag's: Display writes the standard-output MCD, FDisplay
+// carries the descriptor as its primary operand.
 struct DisplayInfo {
     // First extra word of the packed format-string bytes.
     ExtraIndex fmt;
@@ -394,10 +394,6 @@ struct DisplayInfo {
     uint32_t fmt_len;
     // 1 => append a trailing newline ($display / $fdisplay); 0 => none.
     uint32_t newline;
-    // Destination descriptor operand ($fdisplay / $fwrite); valid iff has_fd.
-    Index fd;
-    // 1 => fd is a real descriptor operand; 0 => write to standard output.
-    uint32_t has_fd;
     // Value operands consumed by the format specifiers.
     ExtraSlice args;
 };
@@ -1119,9 +1115,13 @@ struct Inst {
         StrRealtoa,
 
         // -- System tasks --
-        // $display / $write / $fdisplay / $fwrite: format string + variadic args,
-        // with an optional destination descriptor (payload: display -> DisplayInfo).
+        // $display / $write: format string + variadic args to standard output
+        // (payload: display -> DisplayInfo).
         Display,
+        // $fdisplay / $fwrite: like Display, but writes the MCD / FD given by
+        // the descriptor operand (payload: fdisplay — op_extra whose op is the
+        // descriptor and extra a DisplayInfo).
+        FDisplay,
         // Two-argument $fopen(name, mode): open a single file descriptor with
         // the C stdio mode string, -> 32-bit FD value (payload: binary — l is
         // the filename value, r the mode string; both packed-ASCII vectors the
@@ -1314,6 +1314,8 @@ struct Inst {
         Call,
         TaskCall,
         Display,
+        // The op_extra member with a DisplayInfo record: op is the descriptor.
+        FDisplay,
         TimeFormat,
         Wait,
         Sformat,
@@ -1539,6 +1541,8 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::TaskCall;
         case T::Display:
             return K::Display;
+        case T::FDisplay:
+            return K::FDisplay;
         case T::Sformat:
             return K::Sformat;
         case T::Sformatf:
@@ -1701,8 +1705,9 @@ public:
     //
     // NOTE: not exhaustive for the variadic system tasks — a tag whose args are
     // an extra slice can also carry a scalar operand outside it, which one
-    // span cannot express: Display omits its fd, Scanf its source. A pass
-    // needing every use of those tags must read their info records directly.
+    // span cannot express: FDisplay omits its fd, Fscanf/Sscanf their source.
+    // A pass needing every use of those tags must read their info records
+    // directly.
     std::span<const Index> operands(Index inst, std::array<Index, 3>& scratch) const;
 
 private:

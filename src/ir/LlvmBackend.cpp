@@ -4061,6 +4061,7 @@ private:
                 case Inst::Tag::Break:
                 case Inst::Tag::Continue:
                 case Inst::Tag::Display:
+                case Inst::Tag::FDisplay:
                 case Inst::Tag::Finish:
                 case Inst::Tag::CaseViol:
                 case Inst::Tag::Severity:
@@ -6417,6 +6418,7 @@ private:
             case Inst::Tag::Wait:
             case Inst::Tag::Fork:
             case Inst::Tag::Display:
+            case Inst::Tag::FDisplay:
             case Inst::Tag::TimeFormat:
             case Inst::Tag::Finish:
             case Inst::Tag::CaseViol:
@@ -7459,6 +7461,10 @@ private:
 
             case Inst::Tag::Display:
                 lower_display(i);
+                return;
+
+            case Inst::Tag::FDisplay:
+                lower_fdisplay(i);
                 return;
 
             case Inst::Tag::TimeFormat:
@@ -11006,19 +11012,25 @@ private:
     // Lower a $display / $write / $fdisplay / $fwrite: build the descriptor array
     // and call the runtime formatter with the destination descriptor.
     void lower_display(Index i) {
-        const auto  info = ir_->extra_data<DisplayInfo>(ir_->payload(i).extra);
-        std::string fmt  = ir_->extra_bytes(info.fmt, info.fmt_len);
+        // $display / $write target the standard-output MCD (bit 0).
+        emit_display(ir_->extra_data<DisplayInfo>(ir_->payload(i).extra), b_.getInt32(1));
+    }
+
+    void lower_fdisplay(Index i) {
+        // $fdisplay / $fwrite carry an explicit descriptor operand.
+        const auto& p = ir_->payload(i).op_extra;
+        emit_display(ir_->extra_data<DisplayInfo>(p.extra), cast(must_of(value_of(p.op)), 32, true));
+    }
+
+    void emit_display(const DisplayInfo& info, llvm::Value* desc) {
+        std::string fmt = ir_->extra_bytes(info.fmt, info.fmt_len);
         if (info.newline) {
             fmt += '\n';
         }
 
         const std::span<const Index> args = ir_->region(info.args);
         llvm::Value*                 arr  = build_rt_args(args, "$display / $write");
-
-        // $display / $write target the standard-output MCD (bit 0); $fdisplay /
-        // $fwrite carry an explicit descriptor operand.
-        llvm::Value* desc = info.has_fd ? cast(must_of(value_of(info.fd)), 32, true) : b_.getInt32(1);
-        llvm::Value* fmt_ptr = b_.CreateGlobalString(fmt);
+        llvm::Value*                 fmt_ptr = b_.CreateGlobalString(fmt);
         b_.CreateCall(fwrite_fn(), { desc, fmt_ptr, b_.getInt32(static_cast<uint32_t>(args.size())), arr });
     }
 

@@ -325,11 +325,9 @@ public:
     Ir finish();
 
 private:
-    // Shared body of display / fdisplay: emit a Display inst carrying the format
-    // string, the value args, and an optional destination descriptor (`fd` valid
-    // iff `has_fd`; otherwise the backend targets standard output).
-    Index display_impl(Index fd, bool has_fd, std::string_view fmt, bool newline, std::span<const Index> args,
-                       SourceLoc loc);
+    // Shared body of display / fdisplay: pack the format bytes, the value-arg
+    // slice, and the DisplayInfo record into the extra buffer.
+    ExtraIndex display_info(std::string_view fmt, bool newline, std::span<const Index> args);
 
     Index emit(const Inst& inst, SourceLoc loc) {
         const auto index = static_cast<uint32_t>(tags_.size());
