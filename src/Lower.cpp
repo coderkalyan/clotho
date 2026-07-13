@@ -6052,6 +6052,10 @@ private:
         return path;
     }
 
+    std::string lib_cell_name() const {
+        return "work." + scope_stack_.back()->def_name;
+    }
+
     // Validate one non-%% specifier parsed from a display format literal and
     // return its lowercase conversion char. Everything the engine does not
     // implement fails loudly here, so the runtime renderer only ever sees legal
@@ -6074,6 +6078,7 @@ private:
             case 's':
             case 't':
             case 'm':
+            case 'l':
                 break;
             case 'u':
             case 'z':
@@ -6090,9 +6095,6 @@ private:
             case 'v':
                 // TODO: %v needs net strength modeling (LRM §21.2.1.4).
                 fail("%v (net signal strength) is not supported");
-            case 'l':
-                // TODO: %l needs library/config info (LRM §21.2.1.1, Clause 33).
-                fail("%l (library binding) is not supported");
             case 'p':
                 // TODO: %p needs aggregate rendering (LRM §21.2.1.6).
                 fail("%p (assignment pattern) is not supported");
@@ -6122,10 +6124,11 @@ private:
                 continue;
             }
             const char conv = check_specifier(spec);
-            if (conv == 'm') {
-                // %m consumes no argument; the invoking scope is static at lower
-                // time, so splice its name (width-padded) into the text.
-                std::string name = hier_name();
+            if (conv == 'm' || conv == 'l') {
+                // %m / %l consume no argument; both are static at lower time
+                // (the invoking scope's hierarchical name, or its library.cell),
+                // so splice the text in directly (width-padded).
+                std::string name = conv == 'm' ? hier_name() : lib_cell_name();
                 if (spec.has_width && name.size() < spec.width) {
                     if (spec.left_justify) {
                         name.append(spec.width - name.size(), ' ');

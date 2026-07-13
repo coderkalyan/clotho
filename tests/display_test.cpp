@@ -202,6 +202,18 @@ TEST_CASE("%m reports the invoking scope") {
     )") == "blk m.blk\ntask m.t\nsub m2.u1\n");
 }
 
+TEST_CASE("%l reports the invoking instance's library.cell") {
+    CHECK(run_capture(R"(
+        module sub;
+            initial $display("sub scope: %l");
+        endmodule
+        module top;
+            sub s1();
+            initial $display("top scope: %l");
+        endmodule
+    )") == "sub scope: work.sub\ntop scope: work.top\n");
+}
+
 // An explicit %t width overrides $timeformat's minimum width; %0t is minimal.
 TEST_CASE("%t honors explicit widths over $timeformat") {
     CHECK(run_capture(R"(
@@ -255,13 +267,6 @@ TEST_CASE("unsupported or invalid format specifiers are rejected") {
                 initial $display("%p", 1);
             endmodule
         )", "%p (assignment pattern) is not supported");
-    }
-    SUBCASE("%l library binding") {
-        check_rejected(R"(
-            module m;
-                initial $display("%l");
-            endmodule
-        )", "%l (library binding) is not supported");
     }
     SUBCASE("integral under a real specifier converts (LRM 6.12.1)") {
         CHECK(run_capture(R"(
