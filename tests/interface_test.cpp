@@ -164,3 +164,56 @@ TEST_CASE("multiple continuous drivers on an interface net fail loudly") {
     )");
     CHECK(diag.find("multiple drivers") != std::string::npos);
 }
+
+TEST_CASE("modport rename expression port") {
+    const std::string out = run_capture(R"(
+        interface ibus;
+          logic [7:0] raw;
+          modport mp (output .clean(raw));
+        endinterface
+        module leaf(ibus.mp p);
+          initial p.clean = 8'd5;
+        endmodule
+        module top;
+          ibus bus();
+          leaf l(bus);
+          initial #1 begin $display("%0d", bus.raw); $finish; end
+        endmodule
+    )");
+    CHECK(out == "5\n");
+}
+
+// A modport expression port over a bit sub-range (`.lo(raw[3:0])`) maps to
+// part of a signal, not a whole one; Clotho does not lower it as a sub-lvalue
+// yet, so it must reject rather than silently write the whole signal.
+TEST_CASE("modport part-select expression port fails loudly") {
+    const std::string diag = reject(R"(
+        interface ibus;
+          logic [7:0] raw;
+          modport mp (output .lo(raw[3:0]));
+        endinterface
+        module leaf(ibus.mp p);
+          initial p.lo = 4'd7;
+        endmodule
+        module top;
+          ibus bus();
+          leaf l(bus);
+          initial #1 begin $display("%0h", bus.raw); $finish; end
+        endmodule
+    )");
+    CHECK(diag.find("modport expression port") != std::string::npos);
+}
+
+// A virtual interface (LRM 25.9) is a deferred runtime-handle feature; it must
+// fail loudly with a specific message, not a generic type error.
+TEST_CASE("virtual interface fails loudly") {
+    const std::string diag = reject(R"(
+        interface ibus; logic [7:0] d; endinterface
+        module top;
+          ibus bus();
+          virtual ibus vif;
+          initial begin vif = bus; #1 $finish; end
+        endmodule
+    )");
+    CHECK(diag.find("virtual interface is not supported") != std::string::npos);
+}

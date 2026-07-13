@@ -85,12 +85,26 @@ struct LowerError {
 const ValueSymbol& canonical_value_symbol(const ValueSymbol& sym) {
     const ValueSymbol* cur = &sym;
     while (cur->kind == SymbolKind::ModportPort) {
-        const Symbol*      inner = cur->as<ModportPortSymbol>().internalSymbol;
-        const ValueSymbol* vs    = inner ? inner->as_if<ValueSymbol>() : nullptr;
-        if (vs == nullptr) {
+        const ModportPortSymbol& mp   = cur->as<ModportPortSymbol>();
+        const ValueSymbol*       next = nullptr;
+        if (mp.internalSymbol != nullptr) {
+            next = mp.internalSymbol->as_if<ValueSymbol>();
+        } else if (const Expression* conn = mp.getConnectionExpr()) {
+            // A modport expression port (`.name(expr)`, LRM 25.5.3): the port
+            // maps to an explicit expression, not a direct internal symbol. A
+            // plain rename (`.clean(raw)`) wraps a single whole signal that
+            // shares storage, so follow it; a structural expression
+            // (part-select / concat) maps to a bit sub-range with no single
+            // canonical symbol and is rejected loudly in signal_of.
+            if (conn->kind == ExpressionKind::NamedValue ||
+                conn->kind == ExpressionKind::HierarchicalValue) {
+                next = &conn->as<ValueExpressionBase>().symbol;
+            }
+        }
+        if (next == nullptr) {
             break;
         }
-        cur = vs;
+        cur = next;
     }
     return *cur;
 }
@@ -1000,6 +1014,13 @@ private:
         if (ct.isClass()) {
             return lower_class_type(ct.as<slang::ast::ClassType>());
         }
+        if (ct.isVirtualInterface()) {
+            // TODO: virtual interface (LRM 25.9) — a runtime handle to an
+            // interface instance. Needs a handle slot plus either static
+            // single-binding resolution or a runtime-indexable subscribe path
+            // for `@(vif.sig)`. See docs/design/interfaces.md (deferred).
+            fail("virtual interface is not supported");
+        }
         if (!ct.isIntegral()) {
             // TODO: string / class types.
             fail("unsupported non-integral type");
@@ -1712,7 +1733,15 @@ private:
 
     ir::Signal signal_of(const ValueSymbol& sym) {
         const ValueSymbol& csym = canonical_value_symbol(sym);
-        const auto         it   = sigmap_.find(&csym);
+        if (csym.kind == SymbolKind::ModportPort) {
+            // TODO: modport expression port with a structural connection
+            // (`.name(sig[hi:lo])` or a concat, LRM 25.5.3) — maps to a bit
+            // sub-range, not a whole signal, so it must lower as that
+            // sub-lvalue. Plain renames resolve above.
+            fail("modport expression port with a non-trivial connection "
+                 "expression is not supported");
+        }
+        const auto it = sigmap_.find(&csym);
         if (it == sigmap_.end()) {
             fail("reference to unknown signal '" + std::string(csym.name) + "'");
         }
