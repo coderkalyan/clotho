@@ -1712,6 +1712,13 @@ public:
         return index_slice(root_);
     }
 
+    // The whole extra side-table, raw. For content hashing / serialization
+    // (regions, operand runs, packed strings, records — byte-stable since the
+    // padding-free ExtraPayload guarantee); typed access stays extra_data().
+    std::span<const uint32_t> extra_raw() const {
+        return { extra_.data(), extra_.size() };
+    }
+
     // The instructions of a region (e.g. a cond's then/else branch), in order.
     std::span<const Index> region(ExtraSlice r) const {
         return index_slice(r);

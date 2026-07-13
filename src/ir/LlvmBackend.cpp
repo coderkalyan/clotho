@@ -525,6 +525,9 @@ public:
     void run() {
         build_state_types();
         emit_state_global(); // before any body: storage_ptr resolves through the anchors
+        if (std::getenv("CLOTHO_DEDUP_STAT") != nullptr) {
+            report_dedup_stat();
+        }
         compute_subscription_order();
         compute_fusion_groups(); // before build_wait_queues: bucket capacities count group subscriptions
         if (std::getenv("CLOTHO_COMB_FUSE_STAT") != nullptr) {
@@ -991,6 +994,10 @@ private:
                                  std::vector<bool>& claimed, const std::string& hier) {
         const auto aid = static_cast<uint32_t>(anchors_.size());
         anchors_.push_back(Anchor{ .path = path, .name = hier });
+        if (scope.id >= anchor_of_scope_.size()) {
+            anchor_of_scope_.resize(scope.id + 1, SignalSlot::no_anchor);
+        }
+        anchor_of_scope_[scope.id] = aid;
         std::vector<llvm::Type*> fields;
         for (uint32_t k = 0; k < scope.signals.size(); ++k) {
             const auto si = static_cast<uint32_t>(scope.signals[k]);
@@ -3580,6 +3587,136 @@ private:
     // the count V1 fusion left in singleton groups (the comb-fusion
     // opportunity). Measurement only, printed when CLOTHO_COMB_FUSE_STAT is
     // set; the grouping itself is not landed.
+    // Module-deduplication detector (CLOTHO_DEDUP_STAT): canonicalize each
+    // attributed process body to definition-relative form and report how many
+    // bodies across instances of reused definitions are byte-identical — the
+    // shareable population one compiled body per definition would cover, and
+    // what blocks the rest. Read-only; sharing itself is future work.
+    //
+    // Canonical form: every payload-level Signal reference under the process's
+    // home instance subtree is rewritten to its def-relative field path; a
+    // reference outside the subtree stays absolute (an unscoped/package signal
+    // is the same signal for every instance, so twins still match on it; a
+    // cross-instance hierarchical reference differs per instance and honestly
+    // blocks matching). V1 keeps the extra buffer raw, so a body carrying a
+    // signal inside an extra record (Wait / StoreNbEvent / ReadMem / FreadMem /
+    // EventTriggerNbDelayed) or a FunctionId (per-instance function copies)
+    // hashes instance-specific — counted as blockers, not miscounted as twins.
+    void report_dedup_stat() const {
+        struct Key {
+            llvm::StructType* ty;
+            uint64_t          hash;
+            bool              operator==(const Key&) const = default;
+        };
+        struct KeyHash {
+            uint64_t operator()(const Key& k) const {
+                return ankerl::unordered_dense::detail::wyhash::hash(
+                  reinterpret_cast<uintptr_t>(k.ty) ^ k.hash);
+            }
+        };
+
+        // Instantiation count per definition state type (the anchors' reuse rule).
+        ankerl::unordered_dense::map<llvm::StructType*, uint32_t> ty_uses;
+        for (const Anchor& a : anchors_) {
+            ty_uses[a.ty]++;
+        }
+
+        const auto all = mod_.processes();
+        uint64_t attributed = 0, eligible = 0, covered = 0, blocked_call = 0, blocked_extra_sig = 0,
+                 blocked_xhier = 0;
+        ankerl::unordered_dense::map<Key, uint32_t, KeyHash> twins;
+        std::vector<uint8_t>                                 buf;
+        for (const Process& p : all) {
+            if (p.scope == Process::no_scope || p.scope >= anchor_of_scope_.size() ||
+                anchor_of_scope_[p.scope] == SignalSlot::no_anchor) {
+                continue;
+            }
+            ++attributed;
+            const Anchor& home = anchors_[anchor_of_scope_[p.scope]];
+            if (ty_uses[home.ty] < 2) {
+                continue; // unique definition: nothing to share with
+            }
+            ++eligible;
+
+            buf.clear();
+            const auto put = [&](const void* d, size_t n) {
+                const auto* b = static_cast<const uint8_t*>(d);
+                buf.insert(buf.end(), b, b + n);
+            };
+            const auto put32 = [&](uint32_t v) { put(&v, 4); };
+            bool       xhier = false;
+            const auto canon_signal = [&](Signal sig) {
+                const SignalSlot& s = slot_of(sig);
+                const bool        under_home =
+                  s.anchor != SignalSlot::no_anchor && s.path.size() > home.path.size() &&
+                  std::equal(home.path.begin(), home.path.end(), s.path.begin());
+                if (under_home) {
+                    put32(1u);
+                    for (size_t f = home.path.size(); f < s.path.size(); ++f) {
+                        put32(s.path[f]);
+                    }
+                    return;
+                }
+                // Unscoped/package signal: identical for every instance, still
+                // shareable. A signal under another instance: instance-specific.
+                xhier = xhier || s.anchor != SignalSlot::no_anchor;
+                put32(2u);
+                put32(static_cast<uint32_t>(sig));
+            };
+
+            put32(static_cast<uint32_t>(p.activation));
+            put32(p.self_start ? 1u : 0u);
+            for (const WaitEvent& w : p.wait_events) {
+                canon_signal(w.signal);
+                put32(static_cast<uint32_t>(w.edge));
+            }
+            bool      calls = false, extra_sig = false;
+            const Ir& ir    = p.ir;
+            for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+                const auto tag = ir.tag(static_cast<Index>(k));
+                put(&tag, 1);
+                const Inst::Payload& pl = ir.payload(static_cast<Index>(k));
+                if (payload_kind(tag) == Inst::PayloadKind::Signal) {
+                    canon_signal(pl.signal);
+                } else {
+                    put(&pl, sizeof(pl));
+                }
+                calls = calls || tag == Inst::Tag::Call || tag == Inst::Tag::TaskCall;
+                extra_sig = extra_sig || tag == Inst::Tag::Wait || tag == Inst::Tag::StoreNbEvent ||
+                            tag == Inst::Tag::ReadMem || tag == Inst::Tag::FreadMem ||
+                            tag == Inst::Tag::EventTriggerNbDelayed;
+            }
+            // Raw extra buffer: region slices, operand runs, packed strings —
+            // body-local and deterministic, except the embedded-Signal records
+            // flagged above.
+            const std::span<const uint32_t> extra = ir.extra_raw();
+            put(extra.data(), extra.size() * sizeof(uint32_t));
+            blocked_call += calls ? 1 : 0;
+            blocked_extra_sig += extra_sig ? 1 : 0;
+            blocked_xhier += xhier ? 1 : 0;
+            twins[Key{ home.ty,
+                       ankerl::unordered_dense::detail::wyhash::hash(buf.data(), buf.size()) }]++;
+        }
+
+        uint64_t groups2 = 0;
+        for (const auto& [k, n] : twins) {
+            if (n >= 2) {
+                ++groups2;
+                covered += n;
+            }
+        }
+        std::fprintf(stderr,
+                     "dedup: %llu/%llu attributed procs in reused defs; %llu shareable in %llu "
+                     "twin groups (%.1f%%); instance-specific hints: call=%llu extra-sig=%llu "
+                     "xhier=%llu\n",
+                     (unsigned long long)eligible, (unsigned long long)attributed,
+                     (unsigned long long)covered, (unsigned long long)groups2,
+                     eligible != 0 ? 100.0 * static_cast<double>(covered) / static_cast<double>(eligible)
+                                   : 0.0,
+                     (unsigned long long)blocked_call, (unsigned long long)blocked_extra_sig,
+                     (unsigned long long)blocked_xhier);
+    }
+
     void report_comb_fuse_stat() const {
         const auto all = mod_.processes();
         uint64_t   counts[static_cast<size_t>(CombFuse::Count)] = {};
@@ -12691,6 +12828,8 @@ private:
     // Instance-scope anchors, one per scope occurrence (see Anchor); filled by
     // scope_type, symbols created by emit_state_global.
     std::vector<Anchor> anchors_;
+    // InstanceScope::id -> anchor index (no_anchor when the id is unknown).
+    std::vector<uint32_t> anchor_of_scope_;
 
     // VCD dirty set (meaningful iff design_uses_vcd_). vcd_index_[sig] is the
     // runtime dump-var index of a dumped scalar signal, or -1 when the signal is
