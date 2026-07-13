@@ -57,6 +57,25 @@ int dpi_oa_bit_xor(const svOpenArrayHandle h) {
     return static_cast<int>(acc);
 }
 
+// output: fill an int array with i*i (zero-copy write through element pointers).
+void dpi_oa_fill_sq(const svOpenArrayHandle h) {
+    for (int i = svLow(h, 1); i <= svHigh(h, 1); ++i) {
+        *static_cast<int*>(svGetArrElemPtr1(h, i)) = i * i;
+    }
+}
+
+// inout: increment each definite logic[7:0] element (marshalled read + write-back).
+void dpi_oa_inc_logic(const svOpenArrayHandle h) {
+    for (int i = svLow(h, 1); i <= svHigh(h, 1); ++i) {
+        svLogicVecVal v;
+        svGetLogicArrElem1VecVal(&v, h, i);
+        const unsigned val = ((v.aval & ~v.bval) + 1) & 0xff;
+        v.aval = val;
+        v.bval = 0;
+        svPutLogicArrElem1VecVal(h, &v, i);
+    }
+}
+
 } // extern "C"
 
 namespace {
@@ -240,6 +259,38 @@ TEST_CASE("DPI import: open array of bit vector marshals to svBitVecVal") {
     CHECK(run_capture(src) == "b9f8\n");
 }
 
+// An `output` open array: the C writes elements back. A named-scalar (`int`)
+// element is zero-copy, so the C writes the design storage directly (no copy-back).
+TEST_CASE("DPI import: output open array (zero-copy write-back)") {
+    constexpr std::string_view src = R"(
+        module m;
+          import "DPI-C" function void dpi_oa_fill_sq(output int a[]);
+          int arr[0:4];
+          initial begin
+            dpi_oa_fill_sq(arr);
+            $display("%0d %0d %0d %0d %0d", arr[0], arr[1], arr[2], arr[3], arr[4]);
+          end
+        endmodule)";
+    CHECK(run_capture(src) == "0 1 4 9 16\n");
+}
+
+// An `inout` open array of a packed `logic[7:0]` element: marshalled in, the C
+// mutates it, and the scratch is unpacked back into the design storage after the
+// call (rt_dpi_unpack_arr_logic).
+TEST_CASE("DPI import: inout open array marshals in and back") {
+    constexpr std::string_view src = R"(
+        module m;
+          import "DPI-C" function void dpi_oa_inc_logic(inout logic [7:0] b[]);
+          logic [7:0] la[0:2];
+          initial begin
+            la[0]=8'd10; la[1]=8'd20; la[2]=8'd99;
+            dpi_oa_inc_logic(la);
+            $display("%0d %0d %0d", la[0], la[1], la[2]);
+          end
+        endmodule)";
+    CHECK(run_capture(src) == "11 21 100\n");
+}
+
 // Out-of-scope constructs must fail loudly with a TODO, never silently miscompile.
 // Each is a distinct guard in build_dpi_import.
 TEST_CASE("DPI import: unsupported forms are rejected") {
@@ -259,15 +310,6 @@ TEST_CASE("DPI import: unsupported forms are rejected") {
               initial t(1);
             endmodule)";
         CHECK(lower_fail(src).find("DPI import tasks") != std::string::npos);
-    }
-    SUBCASE("output open array (no unpack-back path yet)") {
-        constexpr std::string_view src = R"(
-            module m;
-              import "DPI-C" function void f(output int a[]);
-              int q[0:1];
-              initial f(q);
-            endmodule)";
-        CHECK(lower_fail(src).find("output/inout open-array") != std::string::npos);
     }
     SUBCASE("open array of unsupported element (string)") {
         constexpr std::string_view src = R"(

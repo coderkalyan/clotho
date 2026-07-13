@@ -9834,6 +9834,33 @@ private:
         auto* i = b_.getInt32Ty();
         return rt_fn("rt_dpi_pack_arr_logic", b_.getVoidTy(), { p, i, i, i, i, i, p });
     }
+    // void rt_dpi_unpack_arr_bit(const void* in, u32 stride, u32 w, u32 n, void* base).
+    llvm::FunctionCallee dpi_unpack_arr_bit_fn() {
+        auto* p = raw_ptr_ty();
+        auto* i = b_.getInt32Ty();
+        return rt_fn("rt_dpi_unpack_arr_bit", b_.getVoidTy(), { p, i, i, i, p });
+    }
+    // void rt_dpi_unpack_arr_logic(in, stride, z_off, has_z, w, n, base).
+    llvm::FunctionCallee dpi_unpack_arr_logic_fn() {
+        auto* p = raw_ptr_ty();
+        auto* i = b_.getInt32Ty();
+        return rt_fn("rt_dpi_unpack_arr_logic", b_.getVoidTy(), { p, i, i, i, i, i, p });
+    }
+
+    // A marshalled open-array output/inout argument to copy back after the call: the
+    // svVecVal scratch buffer is unpacked into the design element storage. Only
+    // recorded for a marshalled (packed) element in a non-input direction — a named-
+    // scalar zero-copy element has the C writing the design storage directly.
+    struct OaMarshalBack {
+        bool         is_logic;
+        llvm::Value* buf;     // svVecVal scratch the C wrote
+        llvm::Value* storage; // `[N x slot]` design storage
+        uint32_t     stride;
+        uint32_t     ew;
+        uint32_t     n;
+        uint32_t     has_z;
+        uint32_t     zoff;
+    };
 
     // The ir::Type Ref of a DPI open-array actual: resolve the operand's lvalue leaf
     // to its root Signal / Local / Arg and read that root's declared type (the whole
@@ -9854,13 +9881,16 @@ private:
         }
     }
 
-    // Build the svOpenArrayHandle (rt_svopen*) for a DPI open-array input argument
+    // Build the svOpenArrayHandle (rt_svopen*) for a DPI open-array argument
     // (LRM 35.5.6.2). Named-scalar (byte/shortint/int/longint) elements are zero-copy
     // — Clotho's narrow `[N x iW]` element storage is already a contiguous C array —
-    // so the descriptor points straight at the design array. Packed bit/logic
-    // elements are marshalled once into a contiguous svVecVal buffer (autovectorized
-    // rt_dpi_pack_arr_*). Input-only in V1 (no unpack-back), so no output plumbing.
-    llvm::Value* build_dpi_open_array_desc(Index a, DpiCType elem_ct) {
+    // so the descriptor points straight at the design array (the C reads and, for
+    // output/inout, writes it directly). Packed bit/logic elements are marshalled
+    // into a contiguous svVecVal buffer (autovectorized rt_dpi_pack_arr_*): packed in
+    // for input/inout, and recorded in `backs` for the unpack-back after the call for
+    // output/inout.
+    llvm::Value* build_dpi_open_array_desc(Index a, DpiCType elem_ct, ArgDir dir,
+                                           std::vector<OaMarshalBack>& backs) {
         const LValue lv = lvalue_of(a);
         const Ref    arr_ref = open_array_type_ref(a);
         const Type&  at      = std::get<Type>(mod_.pool.get(arr_ref));
@@ -9877,6 +9907,8 @@ private:
         const int32_t  left  = static_cast<int32_t>(at.left);
         const int32_t  right = static_cast<int32_t>(at.right);
         const uint32_t ew    = lv.store_width; // element bit width
+        const bool     pack_in  = dir != ArgDir::Out;   // input / inout read the actual
+        const bool     copy_out = dir != ArgDir::In;    // output / inout write it back
 
         // Use the actual element storage slot (`lv.slot_ty`) — not a conservative
         // reconstruction — so may-z elision (a `{ i2W }` slot with no z word) is
@@ -9898,14 +9930,22 @@ private:
                 // a task out/inout use elsewhere) would not be C-layout — marshal it
                 // as a bit vector instead (the mm plane's low W bits are the value).
                 if (lv.narrow && stride == ew / 8) {
+                    // The C reads/writes the design array directly; an output/inout
+                    // write lands in storage with no copy-back (and, per DPI, does not
+                    // trigger wait/NBA scheduling on the array — a documented gap).
                     data       = storage;
                     elem_bytes = ew / 8;
                     is_logic   = 0;
                     break;
                 }
                 auto* buf = entry_alloca(llvm::ArrayType::get(b_.getInt32Ty(), n), "dpi.oa.bit");
-                b_.CreateCall(dpi_pack_arr_bit_fn(),
-                              { storage, b_.getInt32(stride), b_.getInt32(ew), b_.getInt32(n), buf });
+                if (pack_in) {
+                    b_.CreateCall(dpi_pack_arr_bit_fn(),
+                                  { storage, b_.getInt32(stride), b_.getInt32(ew), b_.getInt32(n), buf });
+                }
+                if (copy_out) {
+                    backs.push_back({ false, buf, storage, stride, ew, n, 0, 0 });
+                }
                 data       = buf;
                 elem_bytes = 4;
                 is_logic   = 0;
@@ -9913,8 +9953,13 @@ private:
             }
             case DpiCType::BitVec: {
                 auto* buf = entry_alloca(llvm::ArrayType::get(b_.getInt32Ty(), n), "dpi.oa.bit");
-                b_.CreateCall(dpi_pack_arr_bit_fn(),
-                              { storage, b_.getInt32(stride), b_.getInt32(ew), b_.getInt32(n), buf });
+                if (pack_in) {
+                    b_.CreateCall(dpi_pack_arr_bit_fn(),
+                                  { storage, b_.getInt32(stride), b_.getInt32(ew), b_.getInt32(n), buf });
+                }
+                if (copy_out) {
+                    backs.push_back({ false, buf, storage, stride, ew, n, 0, 0 });
+                }
                 data       = buf;
                 elem_bytes = 4; // svBitVecVal
                 is_logic   = 0;
@@ -9927,9 +9972,14 @@ private:
                 const uint32_t has_z = lv.has_z ? 1u : 0u;
                 const uint32_t zoff  = lv.has_z ? static_cast<uint32_t>(
                     llmod_.getDataLayout().getStructLayout(slot)->getElementOffset(1)) : 0u;
-                b_.CreateCall(dpi_pack_arr_logic_fn(),
-                              { storage, b_.getInt32(stride), b_.getInt32(zoff), b_.getInt32(has_z),
-                                b_.getInt32(ew), b_.getInt32(n), buf });
+                if (pack_in) {
+                    b_.CreateCall(dpi_pack_arr_logic_fn(),
+                                  { storage, b_.getInt32(stride), b_.getInt32(zoff), b_.getInt32(has_z),
+                                    b_.getInt32(ew), b_.getInt32(n), buf });
+                }
+                if (copy_out) {
+                    backs.push_back({ true, buf, storage, stride, ew, n, has_z, zoff });
+                }
                 data       = buf;
                 elem_bytes = 8; // svLogicVecVal {aval,bval}
                 is_logic   = 1;
@@ -9969,8 +10019,9 @@ private:
             llvm::Type*  cty;
             uint32_t     w;
         };
-        std::vector<DpiOut> outs;
-        size_t              k = 0;
+        std::vector<DpiOut>        outs;
+        std::vector<OaMarshalBack> oa_backs; // marshalled open-array out/inout copy-backs
+        size_t                     k = 0;
         for (Index a : ir_->region(ci.args)) {
             const DpiCType ct  = f.dpi_arg_ctypes[k];
             const ArgDir   dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
@@ -9985,8 +10036,10 @@ private:
                 argv.push_back(b_.CreateCall(str_data_fn(), { str_of(a) }));
             } else if (ct == DpiCType::OpenArray) {
                 // Open array (LRM 35.5.6.2): build the svOpenArrayHandle descriptor
-                // (zero-copy or marshalled) and pass it. Input-only in V1.
-                argv.push_back(build_dpi_open_array_desc(a, f.dpi_arg_elem_ctypes[k]));
+                // (zero-copy or marshalled) and pass it; a marshalled output/inout is
+                // recorded in oa_backs for the unpack-back after the call.
+                argv.push_back(
+                  build_dpi_open_array_desc(a, f.dpi_arg_elem_ctypes[k], dir, oa_backs));
             } else if (is_dpi_vec(ct)) {
                 // Packed vector: always by pointer. Input builds the scratch from the
                 // value; output leaves it empty for the C to fill; inout copies in.
@@ -10019,6 +10072,20 @@ private:
                                ? dpi_vec_copyout(o.ct, o.scratch, o.w)
                                : dpi_c_to_plane(o.ct, b_.CreateLoad(o.cty, o.scratch));
             lower_store(lvalue_of(o.temp), pl);
+        }
+        // Marshalled open-array output/inout: unpack the C-written svVecVal scratch
+        // back into the design element storage (rt_dpi_unpack_arr_*). A zero-copy
+        // element was written in place and is not recorded here.
+        for (const OaMarshalBack& o : oa_backs) {
+            if (o.is_logic) {
+                b_.CreateCall(dpi_unpack_arr_logic_fn(),
+                              { o.buf, b_.getInt32(o.stride), b_.getInt32(o.zoff), b_.getInt32(o.has_z),
+                                b_.getInt32(o.ew), b_.getInt32(o.n), o.storage });
+            } else {
+                b_.CreateCall(dpi_unpack_arr_bit_fn(),
+                              { o.buf, b_.getInt32(o.stride), b_.getInt32(o.ew), b_.getInt32(o.n),
+                                o.storage });
+            }
         }
         if (f.dpi_ret_ctype == DpiCType::String) {
             // The C returns a NUL-terminated char*; copy it into this call's result

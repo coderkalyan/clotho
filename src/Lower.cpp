@@ -7852,14 +7852,13 @@ private:
             // the bounds/storage come from the actual at each call.
             if (const auto* oa =
                     fa->getType().getCanonicalType().as_if<slang::ast::DPIOpenArrayType>()) {
-                if (fa->direction == slang::ast::ArgumentDirection::In) {
-                    build_dpi_open_array_arg(*oa, param_types, arg_dirs, arg_cts,
-                                             arg_elem_cts);
-                    continue;
-                }
-                // TODO: output/inout open array — the C writes elements back through
-                // svPut*ArrElem; needs the unpack-after-call marshal path. Deferred.
-                fail("DPI output/inout open-array arguments are not supported");
+                // input / output / inout all supported: the C reads (input/inout) and
+                // writes (output/inout) elements through svGet/PutArrElem. The backend
+                // marshals in before the call and back out after (or, for a named-
+                // scalar zero-copy element, the C writes the design array directly).
+                build_dpi_open_array_arg(*oa, to_arg_dir(fa->direction), param_types,
+                                         arg_dirs, arg_cts, arg_elem_cts);
+                continue;
             }
             const auto c = dpi_ctype(fa->getType());
             if (!c.has_value()) {
@@ -7925,9 +7924,9 @@ private:
     // in arg_cts and the element's own DpiCType in arg_elem_cts; param_types gets the
     // element's lowered type (a phantom slot — the backend reads the actual's array
     // type at each call, but the whole-function scans want a benign non-handle Ref).
-    // Only input direction, 1-D, with a marshalable element (named scalar / packed
-    // bit / packed logic) is supported; everything else loud-fails.
-    void build_dpi_open_array_arg(const slang::ast::DPIOpenArrayType& oa,
+    // 1-D, with a marshalable element (named scalar / packed bit / packed logic), in
+    // any direction; everything else loud-fails.
+    void build_dpi_open_array_arg(const slang::ast::DPIOpenArrayType& oa, ir::ArgDir dir,
                                   std::vector<ir::Ref>&      param_types,
                                   std::vector<ir::ArgDir>&   arg_dirs,
                                   std::vector<ir::DpiCType>& arg_cts,
@@ -7958,7 +7957,7 @@ private:
             fail("DPI open-array packed element wider than 32 bits is not supported");
         }
         param_types.push_back(lower_type(elem));
-        arg_dirs.push_back(ir::ArgDir::In);
+        arg_dirs.push_back(dir);
         arg_cts.push_back(ir::DpiCType::OpenArray);
         arg_elem_cts.push_back(*ec);
     }
