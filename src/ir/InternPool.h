@@ -14,7 +14,7 @@
 #include <cstdint>
 #include <limits>
 #include <span>
-#include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -133,18 +133,28 @@ struct Type {
     bool operator==(const Type&) const = default;
 };
 
-// One declared member of a struct/union type, in declaration order.
+// One declared member of a struct/union type, in declaration order. Plain
+// 16-byte data: the member name lives in the pool's flat name arena, resolved
+// via InternPool::field_name.
 struct Field {
-    // Declared member name (LRM 7.2.1 / 7.3: struct/union members are always
-    // named).
-    std::string name;
+    // Byte range of the declared member name in the pool's name arena (LRM
+    // 7.2.1 / 7.3: struct/union members are always named).
+    uint32_t name_at  = 0;
+    uint32_t name_len = 0;
     // Field's own interned type.
     Ref type = Ref::Invalid;
-    // Bit offset from the LSB (packed only; LRM 7.2.1 - first declared member
-    // is the most-significant). Unused (0) for an unpacked member — those are
-    // addressed by declaration index (this entry's position in the field list)
-    // instead.
+    // Bit offset from the LSB (packed; LRM 7.2.1 - first declared member is
+    // the most-significant) or the declaration index (unpacked members are
+    // addressed by position, not a flat bit offset).
     uint32_t bit_offset = 0;
+};
+
+// Build-time form of one Field row handed to intern_struct_fields; the pool
+// copies the name into its arena.
+struct FieldRow {
+    std::string_view name;
+    Ref              type       = Ref::Invalid;
+    uint32_t         bit_offset = 0;
 };
 
 // An interned value, in the canonical plane-packed format shared with runtime
@@ -300,9 +310,16 @@ public:
     // existing entries (each struct/union AST symbol lowers its own field list
     // at most once — the caller is expected to cache by symbol, as
     // Lower.cpp's lower_type does).
-    uint32_t intern_struct_fields(std::vector<Field> fields);
-    // Declared member list of a Kind::Struct type, in declaration order.
+    uint32_t intern_struct_fields(std::vector<FieldRow> rows);
+    // Declared member list of a Kind::Struct type, in declaration order. The
+    // rows live in one flat array, so the span is invalidated by a later
+    // intern_struct_fields — copy or re-fetch when interleaving with interning
+    // (only Lower can intern; the backend's const pool never invalidates).
     std::span<const Field> struct_fields(uint32_t fields_id) const;
+    // Declared name of a struct/union member (resolves the name-arena range).
+    std::string_view field_name(const Field& f) const {
+        return { field_names_.data() + f.name_at, f.name_len };
+    }
 
 private:
     // Transparent functors: a stored u32 index and an ItemView probe both fold
@@ -342,9 +359,14 @@ private:
     std::vector<Item> items_;
     // Canonical bytes of spilled (wide) values.
     std::vector<uint8_t> value_bytes_;
-    // Struct/union field-table storage; a Kind::Struct type's `fields_id`
-    // indexes here.
-    std::vector<std::vector<Field>> struct_fields_;
+    // Struct/union field rows, flat across every field table; a Kind::Struct
+    // type's `fields_id` indexes field_runs_, which slices this. Member name
+    // bytes live in field_names_.
+    std::vector<Field> struct_fields_;
+    // (start, count) run of each interned field table in struct_fields_.
+    std::vector<std::pair<uint32_t, uint32_t>> field_runs_;
+    // Flat member-name byte arena; Field::name_at / name_len index here.
+    std::vector<char> field_names_;
     // Dedup index: u32 handles into items_, hashed / compared via the store.
     ankerl::unordered_dense::set<uint32_t, Hash, Eq> set_;
 };

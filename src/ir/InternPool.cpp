@@ -178,14 +178,22 @@ Layout InternPool::layout(Ref type) const {
     return { Domain::Two, 0, 0 };
 }
 
-uint32_t InternPool::intern_struct_fields(std::vector<Field> fields) {
-    struct_fields_.push_back(std::move(fields));
+uint32_t InternPool::intern_struct_fields(std::vector<FieldRow> rows) {
+    const auto start = static_cast<uint32_t>(struct_fields_.size());
+    for (const FieldRow& r : rows) {
+        const auto name_at = static_cast<uint32_t>(field_names_.size());
+        field_names_.insert(field_names_.end(), r.name.begin(), r.name.end());
+        struct_fields_.push_back({ name_at, static_cast<uint32_t>(r.name.size()), r.type, r.bit_offset });
+    }
+    field_runs_.emplace_back(start, static_cast<uint32_t>(rows.size()));
 
-    return static_cast<uint32_t>(struct_fields_.size() - 1);
+    return static_cast<uint32_t>(field_runs_.size() - 1);
 }
 
 std::span<const Field> InternPool::struct_fields(uint32_t fields_id) const {
-    return struct_fields_[fields_id];
+    const auto [start, count] = field_runs_[fields_id];
+
+    return { struct_fields_.data() + start, count };
 }
 
 } // namespace clotho::ir

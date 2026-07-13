@@ -51,7 +51,7 @@ void render_type(const InternPool& pool, Ref type, std::ostream& os) {
                 if (i != 0) {
                     os << ", ";
                 }
-                os << fields[i].name << ":";
+                os << pool.field_name(fields[i]) << ":";
                 render_type(pool, fields[i].type, os);
             }
             os << "}";

@@ -912,7 +912,7 @@ private:
             const bool   is_packed = !ct.isUnpackedStruct();
             const Scope& body      = is_packed ? static_cast<const Scope&>(ct.as<slang::ast::PackedStructType>())
                                                : static_cast<const Scope&>(ct.as<slang::ast::UnpackedStructType>());
-            std::vector<ir::Field> fields;
+            std::vector<ir::FieldRow> fields;
             for (const auto& f : body.membersOfType<slang::ast::FieldSymbol>()) {
                 if (!is_packed && f.getType().getCanonicalType().isUnpackedUnion()) {
                     // Unpacked unions are not lowered (packed union member access
@@ -924,7 +924,7 @@ private:
                 // Packed member: `bitOffset` is the field's bit position. Unpacked
                 // member: addressed by declaration index (`fieldIndex`), no flat
                 // offset — store the index so the field table is self-describing.
-                fields.push_back({ std::string(f.name), lower_type(f.getType()),
+                fields.push_back({ f.name, lower_type(f.getType()),
                                    is_packed ? static_cast<uint32_t>(f.bitOffset) : f.fieldIndex });
             }
 
@@ -1019,9 +1019,13 @@ private:
         if (const auto* pat = as_assignment_pattern(rhs)) {
             const auto elems = pat->elements();
             if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
-                const auto fields = module_.pool.struct_fields(t.fields_id);
-                for (uint32_t i = 0; i < fields.size(); ++i) {
-                    emit_agg_store(b.member_select(lhs, i, type, l), fields[i].type, *elems[i], tag, b, l);
+                // Re-fetch each row: lowering an element expression can intern a
+                // new struct's field table, which invalidates a held
+                // struct_fields span (see InternPool::struct_fields).
+                const auto nfields = module_.pool.struct_fields(t.fields_id).size();
+                for (uint32_t i = 0; i < nfields; ++i) {
+                    const ir::Field f = module_.pool.struct_fields(t.fields_id)[i];
+                    emit_agg_store(b.member_select(lhs, i, type, l), f.type, *elems[i], tag, b, l);
                 }
                 return;
             }

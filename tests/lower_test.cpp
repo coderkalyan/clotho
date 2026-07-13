@@ -632,8 +632,8 @@ TEST_CASE("a packed struct declares and carries its field table") {
     CHECK(t.is_packed);
     const auto fields = m.pool.struct_fields(t.fields_id);
     REQUIRE(fields.size() == 2);
-    CHECK(fields[0].name == "a");
-    CHECK(fields[1].name == "b");
+    CHECK(m.pool.field_name(fields[0]) == "a");
+    CHECK(m.pool.field_name(fields[1]) == "b");
     // LRM 7.2.1: the first declared member is the most significant, so `a`
     // (the second field, width 8) sits above `b` at the LSB.
     CHECK(fields[0].bit_offset == 8);
