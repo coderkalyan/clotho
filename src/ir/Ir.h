@@ -179,6 +179,19 @@ struct ElemSelect {
     Ref array_type;
 };
 
+// Extra payload for `arr_slice`: a constant-bounds slice of a fixed unpacked
+// array (LRM 7.4.5, `busB = busA[7:6]`). The op is the base array lvalue; the
+// slice is position-0-anchored (a downstream elem_select's index normalizes
+// against `slice_type`'s bounds, added to the base pre-advance), so it reads /
+// writes as an ordinary array of `slice_type`. `first_pos` is the 0-based flat
+// position of the slice's first element within the base array's storage.
+struct ArrSlice {
+    // The slice's own UnpackedArray type (gives element stride + declared bounds).
+    Ref slice_type;
+    // 0-based storage position of the slice's first element in the base array.
+    uint32_t first_pos;
+};
+
 // Extra payload for `agg_copy`: a whole-object blocking copy of one aggregate
 // lvalue into another (both of `type`). The op is the destination lvalue; `src`
 // the source lvalue. Lowered to a single llvm.memcpy of the aggregate storage —
@@ -710,6 +723,7 @@ static_assert(ExtraPayload<Select>);
 static_assert(ExtraPayload<PartSelect>);
 static_assert(ExtraPayload<DynPartSelect>);
 static_assert(ExtraPayload<ElemSelect>);
+static_assert(ExtraPayload<ArrSlice>);
 static_assert(ExtraPayload<MemberSelect>);
 static_assert(ExtraPayload<AggCopyInfo>);
 static_assert(ExtraPayload<AggEqInfo>);
@@ -776,6 +790,11 @@ struct Inst {
         // storage size, not one bit, and the index is normalized against the
         // array's declared bounds.
         ElemSelect,
+        // Constant-bounds slice of a fixed unpacked array base[hi:lo] (payload:
+        // op_extra -> ArrSlice). Yields a position-0-anchored sub-array lvalue;
+        // an lvalue-only op, consumed by the per-element aggregate copy / eq /
+        // store paths, never lowered as a value.
+        ArrSlice,
         // Unpacked-struct member select base.field (payload: op_extra ->
         // MemberSelect). The base is an unpacked struct aggregate; the member is
         // addressed by declaration-order field index into the backing StructType,
@@ -1696,6 +1715,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::PartSelect:
         case T::DynPartSelect:
         case T::ElemSelect:
+        case T::ArrSlice:
         case T::MemberSelect:
         case T::AggCopy:
         case T::AggEq:

@@ -99,6 +99,8 @@ const char* tag_name(Inst::Tag tag) {
             return "part_select";
         case T::ElemSelect:
             return "elem_select";
+        case T::ArrSlice:
+            return "arr_slice";
         case T::MemberSelect:
             return "member_select";
         case T::ClassNew:

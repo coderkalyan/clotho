@@ -1565,10 +1565,8 @@ private:
                        ir::Builder& b, ir::SourceLoc l) {
         const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
         if (t.kind == ir::Type::Kind::UnpackedArray) {
-            if (tag != ir::Inst::Tag::Store) {
-                fail("nonblocking whole-object copy of an unpacked-array aggregate is not "
-                     "supported");
-            }
+            // A nonblocking copy decomposes to per-element StoreNb: each element
+            // write into the array rides the backend's deferred array-NBA queue.
             const uint32_t n = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
             for (uint32_t e = 0; e < n; ++e) {
                 const int32_t   coord = t.left <= t.right ? static_cast<int32_t>(t.left + e)
@@ -7524,13 +7522,19 @@ private:
             return lower_queue_assign(a, b);
         }
         if (is_unpacked_array(a.left())) {
-            // A whole blocking copy of one trivially copyable unpacked array into
-            // another is a single memcpy of the storage (same AggCopy path as an
-            // aggregate). A nonblocking copy, a `'{...}` pattern, or a string array
-            // (heap-owning elements) still decompose / are unsupported.
-            const ir::Ref     ty  = lower_type(*a.left().type);
-            const Expression& src = unwrap_conversion(a.right());
-            if (!a.isNonBlocking() && is_trivially_copyable(ty) && is_whole_array_lvalue(src)) {
+            // A whole blocking copy of one trivially copyable plain array into
+            // another plain array is a single memcpy of the storage (AggCopy). A
+            // nonblocking copy, a `'{...}` pattern, a string-literal assignment,
+            // or a slice on either side decomposes per element: each leaf store
+            // into an array element rides the backend's deferred array-NBA queue
+            // (nba_classify_ir) for the NBA case. A string array (heap-owning
+            // elements) is still unsupported.
+            const ir::Ref       ty  = lower_type(*a.left().type);
+            const Expression&   src = unwrap_conversion(a.right());
+            const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
+            const bool          whole_lhs = is_whole_array_lvalue(a.left());
+            if (!a.isNonBlocking() && whole_lhs && is_trivially_copyable(ty) &&
+                is_whole_array_lvalue(src)) {
                 b.agg_copy(lower_lvalue(a.left(), b), lower_lvalue(src, b), ty, loc(a));
                 return true_const(b, loc(a));
             }
@@ -7538,28 +7542,27 @@ private:
                 // `mem = '{...}`: element-wise store of the (slang-ordered) pattern
                 // into a scalar-element unpacked array (`is_aggregate` routes an
                 // array of aggregates through emit_struct_store instead).
-                if (a.isNonBlocking()) {
-                    // TODO: nonblocking `'{...}` to an unpacked array — per-leaf NBA
-                    // into array elements needs the deferred array-record path.
-                    fail("nonblocking '{...} assignment to an unpacked array is not supported");
-                }
-                emit_agg_store(lower_lvalue(a.left(), b), ty, src, ir::Inst::Tag::Store, b, loc(a));
+                emit_agg_store(lower_lvalue(a.left(), b), ty, src, tag, b, loc(a));
                 return true_const(b, loc(a));
             }
             if (src.kind == ExpressionKind::StringLiteral) {
                 // `mem = "literal"` (LRM 5.9): same element-wise store as the
                 // '{...} pattern case above.
-                if (a.isNonBlocking()) {
-                    // TODO: nonblocking string-literal assignment to an unpacked
-                    // array — per-leaf NBA into array elements needs the
-                    // deferred array-record path.
-                    fail("nonblocking string literal assignment to an unpacked array is not supported");
-                }
-                emit_agg_store(lower_lvalue(a.left(), b), ty, src, ir::Inst::Tag::Store, b, loc(a));
+                emit_agg_store(lower_lvalue(a.left(), b), ty, src, tag, b, loc(a));
                 return true_const(b, loc(a));
             }
-            // TODO: nonblocking whole-array copy, string arrays — element-wise
-            // copy / aggregate lowering.
+            const bool slice_src = src.kind == ExpressionKind::RangeSelect && is_unpacked_array(src);
+            if (is_trivially_copyable(ty) && (is_whole_array_lvalue(src) || slice_src)) {
+                // Array-to-array copy where a fast memcpy does not apply: a
+                // nonblocking copy, or a slice (ArrSlice lvalue) on either side.
+                // Per-element, element-order (position k of dst <- position k of
+                // the source). A single-memcpy deferred record for the NBA
+                // whole-array case is a perf follow-up.
+                emit_agg_copy(lower_lvalue(a.left(), b), lower_lvalue(src, b), ty, tag, b, loc(a));
+                return true_const(b, loc(a));
+            }
+            // TODO: whole-array copy of a string array (heap-owning elements) —
+            // element-wise deep copy.
             fail("whole unpacked array assignment is not supported");
         }
         // s[i] = c writes one character in place; out-of-range or a zero byte is
@@ -8074,6 +8077,14 @@ private:
                 const RangeSelectExpression& rs   = expr.as<RangeSelectExpression>();
                 if (auto c = try_lower_constant_select(expr, b, l)) {
                     return *c;
+                }
+                if (is_unpacked_array(expr)) {
+                    // A fixed unpacked-array slice as a general by-value rvalue
+                    // (concat operand, $display %p, by-value argument). Supported
+                    // slice contexts (copy / equality / lvalue target) intercept
+                    // before this Load path; a raw value read needs a by-value
+                    // array ABI (same follow-up as a whole-array read).
+                    fail("whole unpacked array read is not supported");
                 }
                 const ir::Index              base = select_base_lvalue(rs.value(), b, l);
                 const ir::Index v = b.unary(ir::Inst::Tag::Load, lower_range_select(rs, base, b, l), l);
@@ -8603,16 +8614,38 @@ private:
             fail("slice of a queue / dynamic array is not supported");
         }
         if (is_unpacked_array(rs.value())) {
-            // TODO: fixed-size unpacked array slice (LRM 7.4.5 `busB = busA[7:6]`,
-            // "a slice name of an unpacked array is an unpacked array"). Element
-            // storage is address-indexed, not a flat bit-vector, so the packed
-            // part-select math below is wrong for it -- guard loudly rather than
-            // let a slice comparison (`busA[7:6] == other`) silently fall through
-            // to a bogus bit-level compare (only caught here because neither
-            // operand is a *plain* whole-array reference -- that path is guarded
-            // separately, "whole unpacked array read is not supported" -- so two
-            // sliced operands slipped past every existing check).
-            fail("slice of a fixed-size unpacked array is not supported");
+            // Fixed-size unpacked array slice (LRM 7.4.5 `busB = busA[7:6]`, "a
+            // slice name of an unpacked array is an unpacked array"). Element
+            // storage is address-indexed, so this is an ArrSlice lvalue (a
+            // position-0-anchored sub-array), not a packed part-select. The
+            // per-element copy / eq / store paths consume it; a whole-slice
+            // by-value read is still guarded upstream.
+            if (rs.getSelectionKind() != RangeSelectionKind::Simple) {
+                // TODO: indexed part-select slice `a[i +: 2]` of an unpacked array
+                // (runtime base makes the first-element position non-constant).
+                fail("indexed part-select slice of an unpacked array is not supported");
+            }
+            if (is_aggregate(*rs.value().type)) {
+                // TODO: slice of an array whose element is an unpacked struct /
+                // heap handle (recursive aggregate storage) — the ArrSlice
+                // pre-advance is a flat-storage elem_idx step.
+                fail("slice of an unpacked array with aggregate elements is not supported");
+            }
+            const std::optional<int32_t> lo = try_const_int(rs.left());
+            if (!lo) {
+                fail("expected constant unpacked-array slice bounds");
+            }
+            const slang::ConstantRange base_range =
+                rs.value().type->getCanonicalType().as<slang::ast::FixedSizeUnpackedArrayType>().range;
+            // Storage position of the slice's first element (its left bound) in
+            // the base array: coordinate `left` maps to position 0 at the base's
+            // own left bound (the backend's element normalization), for either
+            // endianness.
+            const uint32_t first_pos =
+                base_range.left <= base_range.right
+                    ? static_cast<uint32_t>(*lo - base_range.left)
+                    : static_cast<uint32_t>(base_range.left - *lo);
+            return b.arr_slice(base, lower_type(*rs.type), first_pos, l);
         }
         // A range select on a multi-dim packed array picks whole W-wide elements
         // (LRM 7.4.6): both bounds and the width scale by the element width W.

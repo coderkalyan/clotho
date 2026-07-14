@@ -1696,6 +1696,7 @@ private:
                     return true;
                 case Inst::Tag::PartSelect:
                 case Inst::Tag::ElemSelect:
+                case Inst::Tag::ArrSlice:
                 case Inst::Tag::MemberSelect:
                     lv = ir.payload(lv).op_extra.op;
                     break;
@@ -1718,6 +1719,7 @@ private:
                 case Inst::Tag::DynPartSelect:
                     return true;
                 case Inst::Tag::ElemSelect:
+                case Inst::Tag::ArrSlice:
                 case Inst::Tag::MemberSelect:
                     lv = ir.payload(lv).op_extra.op;
                     break;
@@ -1740,6 +1742,7 @@ private:
                     break;
                 case Inst::Tag::PartSelect:
                 case Inst::Tag::DynPartSelect:
+                case Inst::Tag::ArrSlice:
                 case Inst::Tag::MemberSelect:
                     lv = ir.payload(lv).op_extra.op;
                     break;
@@ -4377,6 +4380,7 @@ private:
                 case Inst::Tag::PartSelect:
                 case Inst::Tag::DynPartSelect:
                 case Inst::Tag::ElemSelect:
+                case Inst::Tag::ArrSlice:
                 case Inst::Tag::Add:
                 case Inst::Tag::Sub:
                 case Inst::Tag::Mul:
@@ -7754,6 +7758,14 @@ private:
                 const Type& at = std::get<Type>(mod_.pool.get(es.array_type));
                 return from_ref(at.element);
             }
+            case Inst::Tag::ArrSlice: {
+                // An array lvalue, never a scalar value; report the element leaf
+                // type for exhaustiveness (the slice is only ever consumed as an
+                // aggregate, so this is not used on a value path).
+                const auto  as = ir_->extra_data<ArrSlice>(p.op_extra.extra);
+                const Type& st = std::get<Type>(mod_.pool.get(as.slice_type));
+                return from_ref(st.element);
+            }
             case Inst::Tag::MemberSelect: {
                 // The result is the selected member's own type.
                 const auto   ms     = ir_->extra_data<MemberSelect>(p.op_extra.extra);
@@ -8458,6 +8470,26 @@ private:
             case Inst::Tag::MemberSelect: {
                 const auto ms = ir_->extra_data<MemberSelect>(p.op_extra.extra);
                 set_lvalue(i, agg_member(lvalue_of(p.op_extra.op), ms.struct_type, ms.field_index));
+                return;
+            }
+            case Inst::Tag::ArrSlice: {
+                // Pre-advance the base array lvalue to the slice's first element
+                // (position 0). Downstream elem_select / agg_elem then index the
+                // slice relative to this anchor. Flat-storage arrays only -- an
+                // aggregate-element (array-of-struct) slice is frontend-guarded.
+                LValue     lv = lvalue_of(p.op_extra.op);
+                const auto as = ir_->extra_data<ArrSlice>(p.op_extra.extra);
+                const Type& st = std::get<Type>(mod_.pool.get(as.slice_type));
+                if (lv.is_agg) {
+                    throw BackendError{ "aggregate-element unpacked-array slice not supported" };
+                }
+                const uint32_t stride = array_leaf_count(st.element);
+                if (as.first_pos != 0) {
+                    llvm::Value* off = b_.getInt32(as.first_pos * stride);
+                    lv.elem_idx      = lv.elem_idx != nullptr ? b_.CreateAdd(lv.elem_idx, off) : off;
+                }
+                lv.bit_off = b_.getInt32(0);
+                set_lvalue(i, lv);
                 return;
             }
             case Inst::Tag::ClassNew: {

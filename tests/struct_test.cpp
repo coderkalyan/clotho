@@ -864,17 +864,32 @@ TEST_CASE("copy a struct-array element into a struct variable") {
     )") == "07 2\n");
 }
 
-TEST_CASE("nonblocking whole-object copy over an array member is guarded") {
-    const LowerResult r = lower_text(R"(
+TEST_CASE("nonblocking whole-object copy over an array member commits deferred") {
+    // A struct with an unpacked-array member: `y <= x` decomposes to per-leaf
+    // StoreNb (each array element rides the deferred array-NBA queue), so y
+    // reads x's OLD value at the NBA commit -- the classic swap idiom leaves y
+    // holding x's pre-edge contents. Verified vs verilator (iverilog rejects
+    // whole-array NBA).
+    CHECK(run_capture(R"(
         module m;
             typedef struct { logic [7:0] mem [0:3]; logic v; } s_t;
             s_t x, y;
-            logic clk;
-            always @(posedge clk) y <= x;
+            logic clk = 0;
+            int i;
+            always #5 clk = ~clk;
+            always @(posedge clk) begin
+                y <= x;
+                x.mem[0] <= x.mem[0] + 8'd1;
+            end
+            initial begin
+                for (i = 0; i < 4; i++) x.mem[i] = i[7:0] + 8'd10;
+                x.v = 1;
+                @(posedge clk); #1;
+                $display("%0d %0d %0d %0d %0d", y.mem[0], y.mem[1], y.mem[2], y.mem[3], y.v);
+                $finish;
+            end
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("nonblocking whole-object copy of an unpacked-array") != std::string::npos);
+    )") == "10 11 12 13 1\n");
 }
 
 TEST_CASE("whole plain unpacked array copy is an independent memcpy") {
