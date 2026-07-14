@@ -1734,16 +1734,30 @@ private:
     // register-file-shaped designs, at any codegen level). Loading the shadow base
     // from a global keeps codegen from folding shadow addresses into
     // state+constant, so the colliding form cannot arise.
+    // Whether the code being emitted should address `owner`'s per-instance
+    // runtime structures def-relatively. True only inside a single-scope group
+    // of `owner`'s own instance — the population body sharing can cover.
+    // Everything else (cross-instance fused groups, tasks, commit functions,
+    // cross-hierarchy references) is unshareable by construction and keeps the
+    // absolute/folded form, which the optimizer amortizes to one hoisted base:
+    // a 32-member cross-instance fused NBA thunk measured +23% -O sim with
+    // unconditional indirection (32 per-instance base loads GVN cannot merge).
+    // Either form addresses the same storage; this is codegen policy only.
+    bool def_relative_for(const SignalSlot& owner) const {
+        return sched_anchor_ != SignalSlot::no_anchor && owner.anchor == sched_anchor_;
+    }
+
     // `owner` is the signal whose (def-local, for an anchored signal) shadow
-    // field is addressed. Reused definitions load their instance's shadow base
-    // (@clotho.inst.*.shadow); unique definitions fold the sub-struct index
-    // through the root base; unscoped signals keep the flat root field. Every
-    // path loads a base pointer, preserving the opacity requirement above.
+    // field is addressed. A reused definition's own single-scope group loads
+    // its instance's shadow base (@clotho.inst.*.shadow); every other context
+    // folds the sub-struct index through the root base; unscoped signals keep
+    // the flat root field. Every path loads a base pointer, preserving the
+    // opacity requirement above.
     llvm::Value* shadow_ptr(const SignalSlot& owner, uint32_t field) {
         auto* ptr = llvm::PointerType::getUnqual(ctx_);
         if (owner.anchor != SignalSlot::no_anchor) {
             const Anchor& a = anchors_[owner.anchor];
-            if (a.shadow_sym != nullptr) {
+            if (a.shadow_sym != nullptr && def_relative_for(owner)) {
                 llvm::Value* base = b_.CreateLoad(ptr, a.shadow_sym);
                 return b_.CreateInBoundsGEP(a.shadow_ty, base, { b_.getInt32(0), b_.getInt32(field) });
             }
@@ -2640,6 +2654,7 @@ private:
     // shared instruction lowering — Arg reads a parameter, Local addresses the
     // frame, Ret is a real return, Call invokes another function.
     void lower_function(FunctionId id) {
+        sched_anchor_ = SignalSlot::no_anchor; // functions are not a shareable group
         const Function& f = mod_.function(id);
         if (f.is_dpi) {
             // A DPI import is only an external declaration (declare_dpi_import);
@@ -3164,6 +3179,7 @@ private:
     // the wheel (advancing time, resuming delayed/woken processes) until idle,
     // then run the `final` blocks. Returns 0.
     void emit_main(const std::vector<llvm::Function*>& procs) {
+        sched_anchor_ = SignalSlot::no_anchor; // startup code addresses absolutely
         auto* ptr_ty  = llvm::PointerType::getUnqual(ctx_);
         auto* subfnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
 
@@ -5262,6 +5278,7 @@ private:
     // commit function, and emit the enqueue stub body. No-op when the path was never
     // used.
     void finalize_block_nba() {
+        sched_anchor_ = SignalSlot::no_anchor; // commit machinery addresses absolutely
         if (nba_block_enqueue_fn_ == nullptr) {
             return;
         }
@@ -5546,7 +5563,7 @@ private:
     // slot constant — twin bodies stay identical), the absolute queue global
     // otherwise. Commit functions / the seed loop keep the globals directly.
     llvm::Value* wait_base(uint32_t slot, llvm::Constant* gv, uint32_t sig) {
-        if (slot == no_wait_slot) {
+        if (slot == no_wait_slot || !def_relative_for(slots_[sig])) {
             return gv;
         }
         const Anchor& a = anchors_[slots_[sig].anchor];
@@ -10863,7 +10880,7 @@ private:
     // constant otherwise — dedup prep, same split as storage / sched anchors.
     llvm::Value* vcd_index_value(Signal sig, int32_t base) {
         const SignalSlot& s = slot_of(sig);
-        if (s.anchor != SignalSlot::no_anchor) {
+        if (s.anchor != SignalSlot::no_anchor && def_relative_for(s)) {
             const Anchor& a = anchors_[s.anchor];
             if (a.vcd_sym != nullptr) {
                 llvm::Value* b0 = b_.CreateLoad(b_.getInt32Ty(), a.vcd_sym);
