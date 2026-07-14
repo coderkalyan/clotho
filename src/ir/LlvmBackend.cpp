@@ -7464,17 +7464,34 @@ private:
                     set_lvalue(i, el);
                     return;
                 }
-                // TODO: an X/Z or out-of-range index uses only its must bits, so it
-                // selects a wrong / out-of-bounds element. LRM: an out-of-range read
-                // yields X and such a write is a no-op.
-                llvm::Value* idx = cast(must_of(value_of(es.index)), 32, false);
+                // A variable index into a fixed-size unpacked array has no static
+                // guarantee of staying in range (LRM 7.4.5 / 11.5.1), and an X/Z
+                // index is itself out of range (Table 7-1 draws no distinction
+                // between an unknown index and one that misses the declared
+                // bound -- both read the element default / no-op the write).
+                // Normalize to a 0-based position and gate the element with the
+                // same dyn_inrange machinery a dynamic-array/queue element uses:
+                // out-of-range read yields the element default, write is a
+                // no-op, the storage itself is never addressed out-of-bounds. An
+                // unsigned compare also catches a normalized index that went
+                // negative (wrapped to a huge unsigned value).
+                const Plane  idxp = value_of(es.index);
+                llvm::Value* idx  = cast(must_of(idxp), 32, false);
                 // Normalize the declared-range coordinate to a 0-based position.
                 llvm::Value* norm = at.left <= at.right ? b_.CreateSub(idx, b_.getInt32(at.left))
                                                         : b_.CreateSub(b_.getInt32(at.left), idx);
+                const uint32_t count = (at.left <= at.right ? at.right - at.left : at.left - at.right) + 1;
+                llvm::Value*   inrange =
+                    b_.CreateAnd(b_.CreateICmpULT(norm, b_.getInt32(count)), b_.CreateNot(any_unknown(idxp)));
+                lv.dyn_inrange = lv.dyn_inrange != nullptr ? b_.CreateAnd(lv.dyn_inrange, inrange)
+                                                           : inrange;
                 if (lv.is_agg) {
                     // Recursive storage is one ArrayType per dimension (not
                     // flattened): push a nested-GEP index step. A runtime element
                     // index makes the path non-static (deferred nonblocking path).
+                    // The GEP step itself still uses the raw (unclamped) norm --
+                    // an out-of-range dimension is caught by dyn_inrange above,
+                    // which gates the eventual leaf load/store, not the GEP path.
                     lv.agg_path.push_back(norm);
                     lv.agg_static = false;
                     lv.agg_leaf   = is_leaf_type(at.element);
@@ -9320,6 +9337,26 @@ private:
     // write mask. The NBA region replays it. Element width is unrestricted — the
     // value is a native iMM word of any size.
     void emit_array_nba(const LValue& lv, Plane rhs) {
+        if (lv.dyn_inrange != nullptr) {
+            // A variable-indexed element outside the array's declared bound
+            // (LRM 7.4.5 / 11.5.1): the write is a no-op, so no record is
+            // staged at all -- lv_mm_ptr(lv) below would otherwise compute an
+            // out-of-bounds destination pointer that the NBA region later
+            // dereferences unconditionally when replaying the record.
+            auto* fn   = b_.GetInsertBlock()->getParent();
+            auto* dobb = llvm::BasicBlock::Create(ctx_, "arrnba.do", fn);
+            auto* cont = llvm::BasicBlock::Create(ctx_, "arrnba.cont", fn);
+            b_.CreateCondBr(lv.dyn_inrange, dobb, cont);
+
+            b_.SetInsertPoint(dobb);
+            LValue clean      = lv;
+            clean.dyn_inrange = nullptr;
+            emit_array_nba(clean, rhs);
+            b_.CreateBr(cont);
+
+            b_.SetInsertPoint(cont);
+            return;
+        }
         const uint32_t    W = lv.store_width;
         const SignalSlot& s = slot_of(lv.sig);
         const llvm::Align a1{ 1 }; // records live in an unaligned byte buffer

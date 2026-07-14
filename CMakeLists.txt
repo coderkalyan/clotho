@@ -172,6 +172,7 @@ add_executable(clotho_test
   tests/severity_test.cpp
   tests/event_test.cpp
   tests/dynamic_array_test.cpp
+  tests/memory_bounds_test.cpp
   tests/queue_test.cpp
   tests/array_ordering_test.cpp
   tests/class_test.cpp
