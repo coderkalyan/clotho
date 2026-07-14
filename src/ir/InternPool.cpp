@@ -167,6 +167,11 @@ Layout InternPool::compute_layout(Ref type) const {
             // Not plane-sized: an opaque rt_queue ring handle. Width 0 is the
             // sentinel; the backend queries `element` for per-element sizing.
             return { Domain::Two, 0, 0 };
+        case Type::Kind::Assoc:
+            // Not plane-sized: an opaque rt_assoc handle. Width 0 is the
+            // sentinel; the backend queries `element`/`fields_id` for the value
+            // and key types.
+            return { Domain::Two, 0, 0 };
         case Type::Kind::Class:
             // A class variable holds a handle: the pointer to a heap object body,
             // stored as a 2-state 64-bit value (identical storage/assign/compare

@@ -148,6 +148,25 @@ public:
     Index queue_sort(Index q, bool reversed, Ref queue_type, SourceLoc loc);
     // q.shuffle() (LRM 7.12.2): randomize element order via the process RNG.
     Index queue_shuffle(Index q, Ref queue_type, SourceLoc loc);
+    // Associative-array operations on the handle lvalue `a` (LRM 7.8/7.9).
+    // `assoc_type` is the interned Assoc type (value element + key type). See
+    // docs/design/dynamic-arrays.md §4a/§6.
+    // a[key] element select producing an lvalue: a Load calls rt_assoc_get_ptr
+    // (absent -> element default, no create); a Store calls rt_assoc_put_ptr.
+    Index assoc_select(Index a, Index key, Ref assoc_type, SourceLoc loc);
+    // a.num() / a.size(): entry count (32-bit int).
+    Index assoc_num(Index a, Ref assoc_type, SourceLoc loc);
+    // a.exists(key): 32-bit int 0/1.
+    Index assoc_exists(Index a, Index key, Ref assoc_type, SourceLoc loc);
+    // a.delete(key): remove one key if present. a.delete(): remove all.
+    Index assoc_delete(Index a, Index key, bool has_key, Ref assoc_type, SourceLoc loc);
+    // dst = src: deep copy of another associative array (value semantics).
+    Index assoc_copy(Index dst, Index src, Ref assoc_type, SourceLoc loc);
+    // a.first(k)/last(k)/next(k)/prev(k) (LRM 7.9.3): ordered traversal. `key`
+    // is the key-variable lvalue; returns 32-bit int 1 if a key was written,
+    // 0 at the end. `which` selects first/last/next/prev.
+    enum class AssocStep { First, Last, Next, Prev };
+    Index assoc_traverse(Index a, Index key, AssocStep which, Ref assoc_type, SourceLoc loc);
     // `unlikely` hints that the condition is rarely true (e.g. a violation
     // check), so the backend biases branch weights toward the else path.
     Index cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc,

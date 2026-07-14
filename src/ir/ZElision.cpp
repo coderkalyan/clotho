@@ -197,6 +197,30 @@ struct Analysis {
                     break;
                 }
 
+                case Inst::Tag::AssocSelect: {
+                    // An associative-array element lives in its own heap slot
+                    // that keeps its own z plane, so a 4-state value element may
+                    // carry z regardless of the handle; report conservatively.
+                    const auto  aa = ir.extra_data<AssocArg>(p.op_extra.extra);
+                    const Type& at = std::get<Type>(m.pool.get(aa.assoc_type));
+                    val_z[raw]     = m.pool.layout(at.element).domain == Domain::Four ? 1 : 0;
+                    break;
+                }
+                case Inst::Tag::AssocNum:
+                case Inst::Tag::AssocExists:
+                case Inst::Tag::AssocDeleteKey:
+                case Inst::Tag::AssocDeleteAll:
+                case Inst::Tag::AssocCopy:
+                case Inst::Tag::AssocFirst:
+                case Inst::Tag::AssocLast:
+                case Inst::Tag::AssocNext:
+                case Inst::Tag::AssocPrev:
+                    // num()/exists() and the first/last/next/prev traversal
+                    // status are definite ints (no z); delete/copy write the
+                    // handle or a key variable, not a value plane slot here.
+                    val_z[raw] = 0;
+                    break;
+
                 case Inst::Tag::ClassNew:
                     // The object handle is a 2-state 64-bit pointer value; never z.
                     val_z[raw] = 0;

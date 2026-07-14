@@ -1,0 +1,236 @@
+#include <doctest/doctest.h>
+
+#include <cstdio>
+#include <string>
+#include <string_view>
+
+#include <unistd.h>
+
+#include "Lower.h"
+#include "ir/Jit.h"
+
+using namespace clotho;
+
+namespace {
+
+std::string run_capture(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE(r.module != nullptr);
+
+    std::FILE* tmp = std::tmpfile();
+    REQUIRE(tmp != nullptr);
+
+    std::fflush(stdout);
+    const int saved = dup(fileno(stdout));
+    dup2(fileno(tmp), fileno(stdout));
+
+    ir::run_jit(*r.module);
+
+    std::fflush(stdout);
+    dup2(saved, fileno(stdout));
+    close(saved);
+
+    std::rewind(tmp);
+    std::string out;
+    char        buf[256];
+    size_t      n;
+    while ((n = std::fread(buf, 1, sizeof(buf), tmp)) > 0) {
+        out.append(buf, n);
+    }
+    std::fclose(tmp);
+
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("assoc integral put/get/num, absent-read no create") {
+    constexpr std::string_view src = R"(
+        module m;
+            int a[int];
+            initial begin
+                a[5] = 100;
+                a[2] = 200;
+                $display("num=%0d a5=%0d a2=%0d", a.num(), a[5], a[2]);
+                $display("miss=%0d numafter=%0d", a[7], a.num());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "num=2 a5=100 a2=200\nmiss=0 numafter=2\n");
+}
+
+// exists() reports membership without creating; delete(k) removes one entry;
+// delete() clears all (LRM 7.9.1/7.9.2).
+TEST_CASE("assoc exists/delete/delete-all") {
+    constexpr std::string_view src = R"(
+        module m;
+            int a[int];
+            initial begin
+                a[5] = 1; a[2] = 2; a[9] = 3;
+                $display("ex5=%0d ex7=%0d", a.exists(5), a.exists(7));
+                a.delete(2);
+                $display("num=%0d ex2=%0d", a.num(), a.exists(2));
+                a.delete();
+                $display("cleared=%0d", a.num());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "ex5=1 ex7=0\nnum=2 ex2=0\ncleared=0\n");
+}
+
+// foreach binds the loop variable to each key in ASCENDING key order
+// (LRM 7.9.3), regardless of insertion order.
+TEST_CASE("assoc foreach ascending key order") {
+    constexpr std::string_view src = R"(
+        module m;
+            int a[int];
+            int k;
+            initial begin
+                a[9] = 90; a[2] = 20; a[5] = 50; a[7] = 70;
+                foreach (a[k]) $display("k=%0d v=%0d", k, a[k]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "k=2 v=20\nk=5 v=50\nk=7 v=70\nk=9 v=90\n");
+}
+
+// A signed key type orders negative keys below positive ones (the normalized
+// offset-binary form makes two's-complement sort numerically).
+TEST_CASE("assoc signed key ordering") {
+    constexpr std::string_view src = R"(
+        module m;
+            int a[int];
+            int k;
+            initial begin
+                a[3] = 1; a[-7] = 2; a[0] = 3; a[-1] = 4;
+                foreach (a[k]) $display("k=%0d", k);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "k=-7\nk=-1\nk=0\nk=3\n");
+}
+
+// first/last seed the min/max key; next/prev step; each returns 1 while a key
+// remains, 0 at the end (LRM 7.9.3/7.9.4). next/prev accept an absent probe key.
+TEST_CASE("assoc first/last/next/prev traversal") {
+    constexpr std::string_view src = R"(
+        module m;
+            int a[int];
+            int k;
+            initial begin
+                a[10] = 0; a[20] = 0; a[30] = 0;
+                void'(a.first(k)); $display("first=%0d", k);
+                void'(a.last(k));  $display("last=%0d", k);
+                k = 20; void'(a.next(k)); $display("next20=%0d", k);
+                k = 20; void'(a.prev(k)); $display("prev20=%0d", k);
+                k = 15; void'(a.next(k)); $display("next15=%0d", k);
+                k = 30; $display("nextend=%0d", a.next(k));
+                k = 10; $display("preven=%0d", a.prev(k));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "first=10\nlast=30\nnext20=30\nprev20=10\nnext15=20\nnextend=0\npreven=0\n");
+}
+
+// String-keyed arrays iterate in lexicographic (byte) order (LRM 7.8.2/7.9.3),
+// and exists/index/foreach work as for integral keys.
+TEST_CASE("assoc string keys, lexicographic foreach") {
+    constexpr std::string_view src = R"(
+        module m;
+            int a[string];
+            string s;
+            initial begin
+                a["bob"] = 1; a["amy"] = 2; a["cat"] = 3; a["ab"] = 4;
+                $display("num=%0d ex=%0d exmiss=%0d amy=%0d", a.num(),
+                         a.exists("amy"), a.exists("zzz"), a["amy"]);
+                foreach (a[s]) $display("s=%s v=%0d", s, a[s]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "num=4 ex=1 exmiss=0 amy=2\n"
+                              "s=ab v=4\ns=amy v=2\ns=bob v=1\ns=cat v=3\n");
+}
+
+// A wildcard index (`[*]`, LRM 7.8.1) treats numerically-equal indices of any
+// width as the SAME entry, and supports index/num/exists/delete (no ordered
+// traversal — there is no key type).
+TEST_CASE("assoc wildcard cross-width equality") {
+    constexpr std::string_view src = R"(
+        module m;
+            int a[*];
+            initial begin
+                a[8'd5]  = 50;
+                a[32'd5] = 99;
+                a[300]   = 7;
+                $display("num=%0d w5=%0d w300=%0d ex5=%0d ex6=%0d",
+                         a.num(), a[5], a[300], a.exists(5), a.exists(6));
+                a.delete(5);
+                $display("afterdel num=%0d ex5=%0d", a.num(), a.exists(5));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "num=2 w5=99 w300=7 ex5=1 ex6=0\nafterdel num=1 ex5=0\n");
+}
+
+// A 4-state value element reads its power-on default X for an absent key
+// (Table 7-1); a 2-state element reads 0.
+TEST_CASE("assoc absent-key element default by domain") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a[int];
+            bit   [7:0] b[int];
+            initial begin
+                a[1] = 8'hAB; b[1] = 8'hCD;
+                $display("a1=%h amiss=%h", a[1], a[9]);
+                $display("b1=%h bmiss=%h", b[1], b[9]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a1=ab amiss=xx\nb1=cd bmiss=00\n");
+}
+
+// Assignment is a deep copy (value semantics, LRM 7.9): mutating the copy does
+// not touch the source, and vice versa.
+TEST_CASE("assoc deep-copy independence") {
+    constexpr std::string_view src = R"(
+        module m;
+            int a[int];
+            int c[int];
+            initial begin
+                a[1] = 10; a[2] = 20;
+                c = a;
+                c[1] = 999;   // mutate copy
+                c[3] = 30;    // add to copy
+                a[2] = 888;   // mutate source
+                $display("a1=%0d a2=%0d a3ex=%0d anum=%0d", a[1], a[2], a.exists(3), a.num());
+                $display("c1=%0d c2=%0d c3=%0d cnum=%0d", c[1], c[2], c[3], c.num());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a1=10 a2=888 a3ex=0 anum=2\n"
+                              "c1=999 c2=20 c3=30 cnum=3\n");
+}
+
+// An input associative-array argument is a copy-in (LRM 13.5.1 value semantics):
+// the callee mutating its formal leaves the caller's array unchanged.
+TEST_CASE("assoc input argument is copy-in") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic int clobber(input int x[int]);
+                x[1] = 777;
+                x[9] = 9;
+                return x.num();
+            endfunction
+            int a[int];
+            int rc;
+            initial begin
+                a[1] = 1; a[2] = 2;
+                rc = clobber(a);
+                $display("rc=%0d a1=%0d anum=%0d a9ex=%0d", rc, a[1], a.num(), a.exists(9));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "rc=3 a1=1 anum=2 a9ex=0\n");
+}

@@ -749,12 +749,16 @@ TEST_CASE("foreach over a queue iterates the runtime size") {
     )") == "0 5\n1 6\n2 7\n");
 }
 
-TEST_CASE("foreach over an associative array is rejected") {
+// foreach over an associative array binds the loop variable to each key in
+// ascending order (LRM 7.9.3); see associative_array_test.cpp for the runtime
+// behavior. Here we only check it lowers cleanly.
+TEST_CASE("foreach over an associative array lowers") {
     const LowerResult r = lower_text(R"(
         module m;
             integer assoc [int];
+            int i;
             initial foreach (assoc[i]) $display("%0d", i);
         endmodule
     )");
-    CHECK_FALSE(r.ok);
+    CHECK_MESSAGE(r.ok, r.diagnostics);
 }

@@ -23,6 +23,8 @@
 
 #include <sys/resource.h>
 
+#include <ankerl/unordered_dense.h>
+
 #include "Format.h"
 #include "Wheel.h"
 
@@ -1462,6 +1464,234 @@ extern "C" void rt_queue_shuffle(rt_queue* h, uint64_t stride, uint64_t* rng) {
     for (uint64_t i = h->len - 1; i > 0; --i) {
         const uint64_t j = xoshiro_next(rng) % (i + 1);
         swap_slots(q_elem(h, stride, i), q_elem(h, stride, j), stride, tmp.data());
+    }
+}
+
+// -- Associative arrays (LRM 7.8/7.9) --
+//
+// The map is keyed by the backend's normalized order-preserving key bytes
+// (docs/design/dynamic-arrays.md §4a), so hashing / equality / ordering are all
+// key-kind-agnostic byte operations. The value is the element slot bytes (which
+// may carry managed sub-handles, serviced through the rt_elem_ops descriptor).
+namespace {
+
+// Unsigned lexicographic order (shorter-is-less on a prefix) — the order the
+// backend's normalization is built to make equal to each key kind's LRM order.
+struct AssocKeyLess {
+    bool operator()(const std::string* a, const std::string* b) const {
+        const size_t n = a->size() < b->size() ? a->size() : b->size();
+        const int    c = std::memcmp(a->data(), b->data(), n);
+        if (c != 0) {
+            return c < 0;
+        }
+        return a->size() < b->size();
+    }
+    // Heterogeneous compares against a bare key span, for lower/upper_bound.
+    bool operator()(const std::string* a, std::string_view b) const {
+        const size_t n = a->size() < b.size() ? a->size() : b.size();
+        const int    c = std::memcmp(a->data(), b.data(), n);
+        if (c != 0) {
+            return c < 0;
+        }
+        return a->size() < b.size();
+    }
+    bool operator()(std::string_view a, const std::string* b) const {
+        const size_t n = a.size() < b->size() ? a.size() : b->size();
+        const int    c = std::memcmp(a.data(), b->data(), n);
+        if (c != 0) {
+            return c < 0;
+        }
+        return a.size() < b->size();
+    }
+};
+
+struct AssocMap {
+    ankerl::unordered_dense::map<std::string, std::vector<uint8_t>> entries;
+    std::vector<const std::string*>                                sorted;
+    bool                                                           sorted_valid = false;
+
+    void invalidate() { sorted_valid = false; }
+
+    const std::vector<const std::string*>& sorted_keys() {
+        if (!sorted_valid) {
+            sorted.clear();
+            sorted.reserve(entries.size());
+            for (const auto& kv : entries) {
+                sorted.push_back(&kv.first);
+            }
+            std::sort(sorted.begin(), sorted.end(), AssocKeyLess{});
+            sorted_valid = true;
+        }
+        return sorted;
+    }
+};
+
+AssocMap* assoc_impl(rt_assoc* h) { return static_cast<AssocMap*>(h->impl); }
+
+// Deinit every element value through the descriptor, then drop the map.
+void assoc_free(AssocMap* m, const rt_elem_ops* ops) {
+    if (m == nullptr) {
+        return;
+    }
+    if (ops->kind != rt_elem_pod) {
+        for (auto& kv : m->entries) {
+            rt_elem_deinit(ops, kv.second.data());
+        }
+    }
+    delete m;
+}
+
+void assoc_set_span(const std::string* k, const uint8_t** out_ptr, uint32_t* out_len) {
+    *out_ptr = reinterpret_cast<const uint8_t*>(k->data());
+    *out_len = static_cast<uint32_t>(k->size());
+}
+
+} // namespace
+
+extern "C" void* rt_assoc_get_ptr(rt_assoc* h, const uint8_t* kptr, uint32_t klen) {
+    AssocMap* m = assoc_impl(h);
+    if (m == nullptr) {
+        return nullptr;
+    }
+    const auto it = m->entries.find(
+      std::string(reinterpret_cast<const char*>(kptr), static_cast<size_t>(klen)));
+    return it == m->entries.end() ? nullptr : it->second.data();
+}
+
+extern "C" void* rt_assoc_put_ptr(rt_assoc* h, const rt_elem_ops* ops, const uint8_t* kptr,
+                                  uint32_t klen) {
+    AssocMap* m = assoc_impl(h);
+    if (m == nullptr) {
+        m       = new AssocMap();
+        h->impl = m;
+    }
+    std::string key(reinterpret_cast<const char*>(kptr), static_cast<size_t>(klen));
+    const auto  it = m->entries.find(key);
+    if (it != m->entries.end()) {
+        return it->second.data();
+    }
+    auto& slot = m->entries[std::move(key)];
+    slot.resize(static_cast<size_t>(ops->stride));
+    rt_elem_init(ops, slot.data());
+    m->invalidate();
+    return slot.data();
+}
+
+extern "C" int rt_assoc_exists(rt_assoc* h, const uint8_t* kptr, uint32_t klen) {
+    AssocMap* m = assoc_impl(h);
+    if (m == nullptr) {
+        return 0;
+    }
+    return m->entries.contains(
+             std::string(reinterpret_cast<const char*>(kptr), static_cast<size_t>(klen)))
+             ? 1
+             : 0;
+}
+
+extern "C" void rt_assoc_delete_key(rt_assoc* h, const rt_elem_ops* ops, const uint8_t* kptr,
+                                    uint32_t klen) {
+    AssocMap* m = assoc_impl(h);
+    if (m == nullptr) {
+        return;
+    }
+    const auto it = m->entries.find(
+      std::string(reinterpret_cast<const char*>(kptr), static_cast<size_t>(klen)));
+    if (it == m->entries.end()) {
+        return;
+    }
+    if (ops->kind != rt_elem_pod) {
+        rt_elem_deinit(ops, it->second.data());
+    }
+    m->entries.erase(it);
+    m->invalidate();
+}
+
+extern "C" void rt_assoc_delete_all(rt_assoc* h, const rt_elem_ops* ops) {
+    assoc_free(assoc_impl(h), ops);
+    h->impl = nullptr;
+}
+
+extern "C" uint64_t rt_assoc_num(rt_assoc* h) {
+    AssocMap* m = assoc_impl(h);
+    return m == nullptr ? 0 : static_cast<uint64_t>(m->entries.size());
+}
+
+extern "C" int rt_assoc_first(rt_assoc* h, const uint8_t** out_ptr, uint32_t* out_len) {
+    AssocMap* m = assoc_impl(h);
+    if (m == nullptr || m->entries.empty()) {
+        return 0;
+    }
+    assoc_set_span(m->sorted_keys().front(), out_ptr, out_len);
+    return 1;
+}
+
+extern "C" int rt_assoc_last(rt_assoc* h, const uint8_t** out_ptr, uint32_t* out_len) {
+    AssocMap* m = assoc_impl(h);
+    if (m == nullptr || m->entries.empty()) {
+        return 0;
+    }
+    assoc_set_span(m->sorted_keys().back(), out_ptr, out_len);
+    return 1;
+}
+
+extern "C" int rt_assoc_next(rt_assoc* h, const uint8_t* cur_ptr, uint32_t cur_len,
+                             const uint8_t** out_ptr, uint32_t* out_len) {
+    AssocMap* m = assoc_impl(h);
+    if (m == nullptr || m->entries.empty()) {
+        return 0;
+    }
+    const std::string_view cur(reinterpret_cast<const char*>(cur_ptr),
+                               static_cast<size_t>(cur_len));
+    const auto&            keys = m->sorted_keys();
+    // First key strictly greater than `cur` (upper_bound), robust to cur absent.
+    const auto it = std::upper_bound(keys.begin(), keys.end(), cur, AssocKeyLess{});
+    if (it == keys.end()) {
+        return 0;
+    }
+    assoc_set_span(*it, out_ptr, out_len);
+    return 1;
+}
+
+extern "C" int rt_assoc_prev(rt_assoc* h, const uint8_t* cur_ptr, uint32_t cur_len,
+                             const uint8_t** out_ptr, uint32_t* out_len) {
+    AssocMap* m = assoc_impl(h);
+    if (m == nullptr || m->entries.empty()) {
+        return 0;
+    }
+    const std::string_view cur(reinterpret_cast<const char*>(cur_ptr),
+                               static_cast<size_t>(cur_len));
+    const auto&            keys = m->sorted_keys();
+    // Largest key strictly less than `cur`: lower_bound, then step back.
+    const auto it = std::lower_bound(keys.begin(), keys.end(), cur, AssocKeyLess{});
+    if (it == keys.begin()) {
+        return 0;
+    }
+    assoc_set_span(*(it - 1), out_ptr, out_len);
+    return 1;
+}
+
+extern "C" void rt_assoc_assign(rt_assoc* dst, const rt_assoc* src, const rt_elem_ops* ops) {
+    if (dst == src) {
+        return;
+    }
+    rt_assoc_delete_all(dst, ops);
+    AssocMap* sm = assoc_impl(const_cast<rt_assoc*>(src));
+    if (sm == nullptr || sm->entries.empty()) {
+        return;
+    }
+    auto* dm  = new AssocMap();
+    dst->impl = dm;
+    dm->entries.reserve(sm->entries.size());
+    const bool managed = ops->kind != rt_elem_pod;
+    for (const auto& kv : sm->entries) {
+        auto& slot = dm->entries[kv.first];
+        slot.resize(static_cast<size_t>(ops->stride));
+        if (managed) {
+            rt_elem_init(ops, slot.data());
+            rt_elem_copy(ops, slot.data(), kv.second.data());
+        } else {
+            std::memcpy(slot.data(), kv.second.data(), static_cast<size_t>(ops->stride));
+        }
     }
 }
 

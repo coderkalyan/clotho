@@ -85,7 +85,10 @@ add_library(clotho_runtime STATIC
   src/Wheel.cpp
 )
 target_include_directories(clotho_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(clotho_runtime PRIVATE clotho_warnings)
+# unordered_dense is header-only (INTERFACE): the runtime uses ankerl's map for
+# associative-array storage (LRM 7.8/7.9). This adds only its include dir, not a
+# link dependency, keeping the runtime otherwise dependency-free.
+target_link_libraries(clotho_runtime PRIVATE clotho_warnings unordered_dense::unordered_dense)
 # Always optimize the runtime, even in a Debug build. It is stable native code
 # the JIT'd design calls into on every event; at -O0 its trivial leaf functions
 # (unwrap, WheelImpl accessors) stop inlining and the timing wheel reads as pure
@@ -175,6 +178,7 @@ add_executable(clotho_test
   tests/dynamic_array_test.cpp
   tests/memory_bounds_test.cpp
   tests/queue_test.cpp
+  tests/associative_array_test.cpp
   tests/array_ordering_test.cpp
   tests/class_test.cpp
   tests/unbased_test.cpp

@@ -978,9 +978,53 @@ private:
 
             return module_.pool.put(ir::Item{ t });
         }
+        if (const auto* aa = ct.as_if<slang::ast::AssociativeArrayType>()) {
+            // Associative array (LRM 7.8/7.9): a heap-backed rt_assoc handle
+            // (ankerl map + lazy sorted key index). The value element rides the
+            // rt_elem_ops descriptor; keys reach the runtime as normalized
+            // byte spans built in the backend (docs/design/dynamic-arrays.md
+            // §4a). Value element restricted to integral / real (a string /
+            // nested-container value needs the a[k] read/write to route a handle,
+            // a documented follow-up); keys of every kind are supported.
+            const slang::ast::Type& et = aa->elementType.getCanonicalType();
+            if (!et.isIntegral() && !et.isFloating()) {
+                // TODO: associative array with a string / aggregate / nested
+                // variable-size value element.
+                fail("associative array value element type is not supported (only "
+                     "integral / real elements)");
+            }
+            ir::Type t;
+            t.kind    = ir::Type::Kind::Assoc;
+            t.element = lower_type(aa->elementType);
+            if (aa->hasWildcardIndexType()) {
+                // Wildcard index (`[*]`): keys are unsigned integral of arbitrary
+                // size, normalized to a fixed 64-bit form. `fields_id` names a
+                // canonical unsigned placeholder; `right` flags wildcard.
+                t.right     = 1;
+                t.fields_id = static_cast<uint32_t>(make_int_type(64, false, false));
+            } else {
+                const slang::ast::Type& kt = aa->indexType->getCanonicalType();
+                if (kt.isClass()) {
+                    // TODO: class-handle keys (LRM 7.8.3) — ordering is
+                    // unspecified and entangles with class object lifetime.
+                    fail("associative array with a class-handle key is not supported");
+                }
+                if (!kt.isIntegral() && !kt.isString()) {
+                    fail("associative array key type is not supported (integral, "
+                         "enum, packed, string, or wildcard [*])");
+                }
+                // Typed integral keys of any width normalize via the backend's
+                // per-byte big-endian emit (wide keys included). String keys pass
+                // their bytes through. Both are handled downstream.
+                t.right     = 0;
+                t.fields_id = static_cast<uint32_t>(lower_type(*aa->indexType));
+            }
+
+            return module_.pool.put(ir::Item{ t });
+        }
         if (ct.isUnpackedArray()) {
-            // TODO: associative arrays (variable-size, need heap-backed runtime
-            // storage). Dynamic arrays and queues are handled above.
+            // TODO: associative arrays are handled above; any other unpacked
+            // array kind reaching here is unhandled.
             fail("associative arrays are not supported");
         }
         if (ct.isString()) {
@@ -1599,6 +1643,8 @@ private:
             }
             if (t.kind == ir::Type::Kind::Queue) {
                 b.queue_copy(lhs, rhs, type, l);
+            } else if (t.kind == ir::Type::Kind::Assoc) {
+                b.assoc_copy(lhs, rhs, type, l);
             } else {
                 b.dyn_array_copy(lhs, rhs, type, l);
             }
@@ -1634,6 +1680,8 @@ private:
         const ir::Index src_lv = lower_lvalue(src, b);
         if (t.kind == ir::Type::Kind::Queue) {
             b.queue_copy(lhs, src_lv, type, l);
+        } else if (t.kind == ir::Type::Kind::Assoc) {
+            b.assoc_copy(lhs, src_lv, type, l);
         } else {
             b.dyn_array_copy(lhs, src_lv, type, l);
         }
@@ -1685,6 +1733,7 @@ private:
                 return ValueCat::string;
             case ir::Type::Kind::DynArray:
             case ir::Type::Kind::Queue:
+            case ir::Type::Kind::Assoc:
                 return ValueCat::handle;
             case ir::Type::Kind::UnpackedArray:
                 return ValueCat::aggregate;
@@ -1851,6 +1900,11 @@ private:
         return e.type->getCanonicalType().as_if<slang::ast::QueueType>() != nullptr;
     }
 
+    // True if an expression's type is an associative array (LRM 7.8/7.9).
+    static bool is_assoc(const slang::ast::Expression& e) {
+        return e.type->getCanonicalType().as_if<slang::ast::AssociativeArrayType>() != nullptr;
+    }
+
     // True if an expression is of the dynamic `string` type (LRM 6.16).
     static bool is_string_expr(const slang::ast::Expression& e) {
         return e.type->getCanonicalType().isString();
@@ -1871,18 +1925,22 @@ private:
         return std::get<ir::Type>(module_.pool.get(ty)).kind == ir::Type::Kind::DynArray;
     }
 
-    // True if an interned IR type is a heap-handle value type — a dynamic array or
-    // queue — which share the by-pointer, deep-copy subroutine ABI.
+    // True if an interned IR type is a heap-handle value type — a dynamic array,
+    // queue, or associative array — which share the by-pointer, deep-copy
+    // subroutine ABI.
     bool is_handle_ref(ir::Ref ty) const {
         const ir::Type::Kind k = std::get<ir::Type>(module_.pool.get(ty)).kind;
-        return k == ir::Type::Kind::DynArray || k == ir::Type::Kind::Queue;
+        return k == ir::Type::Kind::DynArray || k == ir::Type::Kind::Queue ||
+               k == ir::Type::Kind::Assoc;
     }
 
-    // True if an expression is a dynamic array or queue (a heap handle).
+    // True if an expression is a dynamic array, queue, or associative array (a
+    // heap handle).
     static bool is_handle_expr(const slang::ast::Expression& e) {
         const slang::ast::Type& ct = e.type->getCanonicalType();
         return ct.as_if<slang::ast::DynamicArrayType>() != nullptr ||
-               ct.as_if<slang::ast::QueueType>() != nullptr;
+               ct.as_if<slang::ast::QueueType>() != nullptr ||
+               ct.as_if<slang::ast::AssociativeArrayType>() != nullptr;
     }
 
     // Intern a string literal's characters as a string constant. Every \0 byte
@@ -4648,9 +4706,11 @@ private:
                 lower_foreach_runtime_dim(f, dim, ty, iter_lv, len, b, l);
                 return;
             }
-            // TODO: associative array foreach dimension -- needs ordered key
-            // iteration.
-            fail("foreach over an associative array dimension is not supported");
+            if (is_assoc(f.arrayRef)) {
+                lower_foreach_assoc_dim(f, dim, ty, iter_lv, b, l);
+                return;
+            }
+            fail("foreach over an unsupported runtime-sized dimension");
         }
 
         // Fixed-range dimension (packed or unpacked): iterate the declared
@@ -4712,6 +4772,39 @@ private:
         const ir::Index step_cur = b.unary(ir::Inst::Tag::Load, iter_lv, l);
         const ir::Index one      = b.constant(module_.pool.put_int(ty, 1), l);
         b.binary(ir::Inst::Tag::Store, iter_lv, b.binary(ir::Inst::Tag::Add, step_cur, one, l), l);
+        const ir::ExtraSlice step = b.close_region();
+
+        b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
+    }
+
+    // foreach over an associative-array dimension (LRM 7.9.3/12.7.3): iterate the
+    // keys in ascending order, binding the loop variable `iter_lv` to each key.
+    // `first(iter_lv)` seeds the min key; `next(iter_lv)` advances to the
+    // successor. Each returns 1 while a key remains, 0 at the end.
+    void lower_foreach_assoc_dim(const ForeachLoopStatement& f, size_t dim, ir::Ref /*ty*/,
+                                 ir::Index iter_lv, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Ref    bit1 = make_int_type(1, false, false);
+        const ir::Ref    aty  = lower_type(*f.arrayRef.type);
+        const ir::Signal ok   = declare_temp(bit1, "foreach_ok");
+        using Step            = ir::Builder::AssocStep;
+        b.binary(ir::Inst::Tag::Store, b.signal(ok, l),
+                 b.resize(b.assoc_traverse(lower_lvalue(f.arrayRef, b), iter_lv, Step::First, aty, l),
+                          bit1, l),
+                 l);
+
+        b.open_region();
+        const ir::Index      pred = b.unary(ir::Inst::Tag::Load, b.signal(ok, l), l);
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        lower_foreach_dim(f, dim + 1, b);
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        b.binary(ir::Inst::Tag::Store, b.signal(ok, l),
+                 b.resize(b.assoc_traverse(lower_lvalue(f.arrayRef, b), iter_lv, Step::Next, aty, l),
+                          bit1, l),
+                 l);
         const ir::ExtraSlice step = b.close_region();
 
         b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
@@ -5652,6 +5745,13 @@ private:
             lower_queue_method(name, call, b, loc(call));
             return;
         }
+        // An associative-array method as a statement (delete; first/next/... are
+        // legal-but-pointless without their return): lower for effect.
+        if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
+            is_assoc(*call.arguments()[0])) {
+            lower_assoc_method(name, call, b, loc(call));
+            return;
+        }
         if (const char rx = display_radix(name, "$display")) {
             lower_display(call, /*newline=*/true, b, rx);
             return;
@@ -6322,6 +6422,13 @@ private:
         if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
             is_queue(*call.arguments()[0])) {
             return lower_queue_method(name, call, b, l);
+        }
+
+        // Associative-array built-in methods (a.num(), a.exists(k), a.first(k),
+        // LRM 7.9) arrive the same way, with the assoc as arguments()[0].
+        if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
+            is_assoc(*call.arguments()[0])) {
+            return lower_assoc_method(name, call, b, l);
         }
 
         // Enum methods (LRM 6.19.2-6.19.5) arrive the same way, with an enum-typed
@@ -7516,6 +7623,14 @@ private:
             }
             return lower_queue_assign(a, b);
         }
+        if (is_assoc(a.left())) {
+            if (a.isNonBlocking()) {
+                // TODO: nonblocking assignment to an associative array (needs a
+                // handle-aware NBA staging path).
+                fail("nonblocking assignment to an associative array is not supported");
+            }
+            return lower_assoc_assign(a, b);
+        }
         if (is_unpacked_array(a.left())) {
             // A whole blocking copy of one trivially copyable unpacked array into
             // another is a single memcpy of the storage (same AggCopy path as an
@@ -7696,6 +7811,15 @@ private:
         return b.elem_select(base, lower_expr(es.selector(), b), arr_ty, l);
     }
 
+    // Element address for an associative array (LRM 7.8): `a[key]` over the
+    // handle lvalue `base`. The key is lowered as an ordinary value expression;
+    // the backend normalizes it and resolves get_ptr (read) / put_ptr (write).
+    ir::Index var_assoc_select(const ElementSelectExpression& es, ir::Index base, ir::Builder& b,
+                               ir::SourceLoc l) {
+        const ir::Ref aty = lower_type(*es.value().type);
+        return b.assoc_select(base, lower_expr(es.selector(), b), aty, l);
+    }
+
     // Whole-queue assignment (LRM 7.10): `q = other` deep-copies the source
     // handle. Element writes (`q[i] = x`) are ordinary Stores over an ElemSelect
     // and do not reach here. Non-queue sources (concatenation / assignment
@@ -7719,6 +7843,27 @@ private:
             fail("queue assignment from a non-variable value is not supported");
         }
         b.queue_copy(dst, lower_lvalue(a.right(), b), qty, l);
+        return dst;
+    }
+
+    // Whole-associative-array assignment (LRM 7.9): `a = other` deep-copies the
+    // source map. Element writes (`a[k] = x`) are ordinary Stores over an
+    // AssocSelect and do not reach here. Only a plain assoc variable / assoc-
+    // returning call source is a handle copy; an assignment-pattern source is a
+    // documented follow-up.
+    ir::Index lower_assoc_assign(const AssignmentExpression& a, ir::Builder& b) {
+        const ir::SourceLoc l   = loc(a);
+        const ir::Index     dst = lower_lvalue(a.left(), b);
+        const ir::Ref       aty = lower_type(*a.left().type);
+        const bool          src_is_var =
+          is_assoc(a.right()) && (a.right().kind == ExpressionKind::NamedValue ||
+                                  a.right().kind == ExpressionKind::HierarchicalValue ||
+                                  a.right().kind == ExpressionKind::Call);
+        if (!src_is_var) {
+            // TODO: associative-array init from an assignment pattern ('{...}).
+            fail("associative array assignment from a non-variable value is not supported");
+        }
+        b.assoc_copy(dst, lower_lvalue(a.right(), b), aty, l);
         return dst;
     }
 
@@ -7762,6 +7907,48 @@ private:
         // TODO: sort/rsort `with` clause, 4-state / wide sort, and find/min/max/
         // unique/sum reduction & locator methods (need iterator-clause lowering).
         fail("queue method '" + std::string(name) + "' is not supported");
+    }
+
+    // An associative-array built-in method used as an rvalue or statement (LRM
+    // 7.9). The receiver arrives as arguments()[0]. Keys are lowered as ordinary
+    // value expressions (normalized in the backend); first/last/next/prev take
+    // their key argument by ref (an lvalue output), which slang may wrap in an
+    // AssignmentExpression.
+    ir::Index lower_assoc_method(std::string_view name, const CallExpression& call, ir::Builder& b,
+                                 ir::SourceLoc l) {
+        const auto&     args = call.arguments();
+        const ir::Index a    = lower_lvalue(*args[0], b);
+        const ir::Ref   aty  = lower_type(*args[0]->type);
+        if (name == "num" || name == "size") {
+            return b.resize(b.assoc_num(a, aty, l), lower_type(*call.type), l);
+        }
+        if (name == "exists") {
+            return b.resize(b.assoc_exists(a, lower_expr(*args[1], b), aty, l),
+                            lower_type(*call.type), l);
+        }
+        if (name == "delete") {
+            // a.delete() clears all; a.delete(k) removes one entry.
+            if (args.size() > 1) {
+                return b.assoc_delete(a, lower_expr(*args[1], b), /*has_key*/ true, aty, l);
+            }
+            return b.assoc_delete(a, a, /*has_key*/ false, aty, l);
+        }
+        if (name == "first" || name == "last" || name == "next" || name == "prev") {
+            const slang::ast::Expression* karg = args[1];
+            if (karg->kind == slang::ast::ExpressionKind::Assignment) {
+                karg = &karg->as<AssignmentExpression>().left();
+            }
+            const ir::Index key_lv = lower_lvalue(*karg, b);
+            using Step             = ir::Builder::AssocStep;
+            const Step step        = name == "first"  ? Step::First
+                                     : name == "last" ? Step::Last
+                                     : name == "next" ? Step::Next
+                                                      : Step::Prev;
+            return b.resize(b.assoc_traverse(a, key_lv, step, aty, l), lower_type(*call.type), l);
+        }
+        // TODO: find/find_index/min/max/unique/sum reduction & locator methods
+        // (need iterator-clause lowering, shared with the queue/dynarr gap above).
+        fail("associative array method '" + std::string(name) + "' is not supported");
     }
 
     // Compound assignment `lhs op= rhs` (LRM 11.4.1, always blocking). slang has
@@ -8052,9 +8239,11 @@ private:
                 }
                 const ir::Index base = select_base_lvalue(es.value(), b, l);
                 const ir::Index sel =
-                    is_unpacked_array(es.value()) || is_dyn_array(es.value()) || is_queue(es.value())
-                        ? var_elem_select(es, base, b, l)
-                        : lower_packed_element_lvalue(es, base, b, l);
+                    is_assoc(es.value()) ? var_assoc_select(es, base, b, l)
+                    : is_unpacked_array(es.value()) || is_dyn_array(es.value()) ||
+                          is_queue(es.value())
+                      ? var_elem_select(es, base, b, l)
+                      : lower_packed_element_lvalue(es, base, b, l);
                 const ir::Index v = b.unary(ir::Inst::Tag::Load, sel, l);
                 // See narrow_to_declared / the MemberAccess case below: a
                 // no-op except when `es` selects into a struct field
@@ -8721,6 +8910,9 @@ private:
             case ExpressionKind::ElementSelect: {
                 const ElementSelectExpression& es   = expr.as<ElementSelectExpression>();
                 const ir::Index                base = lower_lvalue(es.value(), b);
+                if (is_assoc(es.value())) {
+                    return var_assoc_select(es, base, b, l);
+                }
                 if (is_unpacked_array(es.value()) || is_dyn_array(es.value()) || is_queue(es.value())) {
                     return var_elem_select(es, base, b, l);
                 }

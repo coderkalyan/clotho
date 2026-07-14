@@ -276,6 +276,51 @@ Index Builder::queue_shuffle(Index q, Ref queue_type, SourceLoc loc) {
     return emit({ Inst::Tag::QueueShuffle, Inst::Payload{ .op_type = { q, queue_type } } }, loc);
 }
 
+Index Builder::assoc_select(Index a, Index key, Ref assoc_type, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(AssocArg{ key, assoc_type });
+
+    return emit({ Inst::Tag::AssocSelect, Inst::Payload{ .op_extra = { a, extra } } }, loc);
+}
+
+Index Builder::assoc_num(Index a, Ref assoc_type, SourceLoc loc) {
+    return emit({ Inst::Tag::AssocNum, Inst::Payload{ .op_type = { a, assoc_type } } }, loc);
+}
+
+Index Builder::assoc_exists(Index a, Index key, Ref assoc_type, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(AssocArg{ key, assoc_type });
+
+    return emit({ Inst::Tag::AssocExists, Inst::Payload{ .op_extra = { a, extra } } }, loc);
+}
+
+Index Builder::assoc_delete(Index a, Index key, bool has_key, Ref assoc_type, SourceLoc loc) {
+    if (!has_key) {
+        return emit({ Inst::Tag::AssocDeleteAll, Inst::Payload{ .op_type = { a, assoc_type } } },
+                    loc);
+    }
+    const ExtraIndex extra = add_extra(AssocArg{ key, assoc_type });
+
+    return emit({ Inst::Tag::AssocDeleteKey, Inst::Payload{ .op_extra = { a, extra } } }, loc);
+}
+
+Index Builder::assoc_copy(Index dst, Index src, Ref assoc_type, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(AssocArg{ src, assoc_type });
+
+    return emit({ Inst::Tag::AssocCopy, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+}
+
+Index Builder::assoc_traverse(Index a, Index key, AssocStep which, Ref assoc_type, SourceLoc loc) {
+    Inst::Tag tag = Inst::Tag::AssocFirst;
+    switch (which) {
+        case AssocStep::First: tag = Inst::Tag::AssocFirst; break;
+        case AssocStep::Last:  tag = Inst::Tag::AssocLast; break;
+        case AssocStep::Next:  tag = Inst::Tag::AssocNext; break;
+        case AssocStep::Prev:  tag = Inst::Tag::AssocPrev; break;
+    }
+    const ExtraIndex extra = add_extra(AssocArg{ key, assoc_type });
+
+    return emit({ tag, Inst::Payload{ .op_extra = { a, extra } } }, loc);
+}
+
 Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc,
                     bool unlikely) {
     const ExtraIndex extra = add_extra(Regions{ then_region, else_region, unlikely ? 1u : 0u });

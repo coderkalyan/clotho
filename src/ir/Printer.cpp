@@ -65,6 +65,16 @@ void render_type(const InternPool& pool, Ref type, std::ostream& os) {
             render_type(pool, t.element, os);
             os << " [$]";
             break;
+        case Type::Kind::Assoc:
+            render_type(pool, t.element, os);
+            if (t.right != 0) {
+                os << " [*]";
+            } else {
+                os << " [";
+                render_type(pool, static_cast<Ref>(t.fields_id), os);
+                os << "]";
+            }
+            break;
         case Type::Kind::Class: {
             const auto fields = pool.struct_fields(t.fields_id);
             os << "class{";
@@ -159,6 +169,26 @@ const char* tag_name(Inst::Tag tag) {
             return "queue_rsort";
         case T::QueueShuffle:
             return "queue_shuffle";
+        case T::AssocSelect:
+            return "assoc_select";
+        case T::AssocNum:
+            return "assoc_num";
+        case T::AssocExists:
+            return "assoc_exists";
+        case T::AssocDeleteKey:
+            return "assoc_delete_key";
+        case T::AssocDeleteAll:
+            return "assoc_delete_all";
+        case T::AssocCopy:
+            return "assoc_copy";
+        case T::AssocFirst:
+            return "assoc_first";
+        case T::AssocLast:
+            return "assoc_last";
+        case T::AssocNext:
+            return "assoc_next";
+        case T::AssocPrev:
+            return "assoc_prev";
         case T::StoreNbDelay:
             return "store_nb_delay";
         case T::StoreNbEvent:

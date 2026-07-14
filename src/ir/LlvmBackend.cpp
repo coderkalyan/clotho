@@ -325,6 +325,20 @@ struct LValue {
     // of range and a write is suppressed out of range, so the heap buffer is
     // never accessed past its length.
     llvm::Value* dyn_inrange = nullptr;
+    // An associative-array element target (LRM 7.8/7.9). Unlike dyn/queue the
+    // element pointer is not yet resolved: the get_ptr (read) vs put_ptr (write)
+    // choice depends on Load/Store context, so it is deferred. `assoc_handle` is
+    // the rt_assoc handle pointer; `assoc_key_ptr` / `assoc_key_len` are the
+    // normalized key span (built into a scratch alloca by the AssocSelect
+    // lowering); `assoc_ops` is the value element's rt_elem_ops descriptor. The
+    // value element slot facts (slot_ty / has_z / narrow / width / store_width /
+    // bit_off / array_ty) are filled as for a dyn element. A Load resolves via
+    // rt_assoc_get_ptr (absent -> element default); a Store via rt_assoc_put_ptr.
+    bool            is_assoc      = false;
+    llvm::Value*    assoc_handle  = nullptr;
+    llvm::Value*    assoc_key_ptr = nullptr;
+    llvm::Value*    assoc_key_len = nullptr;
+    llvm::Constant* assoc_ops     = nullptr;
 };
 
 // A scalar / string leaf of an aggregate signal reachable by a STATIC path
@@ -444,6 +458,11 @@ struct SignalSlot {
     // reached by the ElemSelect queue path; the handle powers on
     // { null, 0, 0, 0 } (an empty queue) and is freed at teardown.
     bool is_queue = false;
+    // An associative-array signal: the slot is an opaque rt_assoc handle
+    // (`clotho.assoc`), has_z is false. Entries live in its heap map, reached by
+    // the AssocSelect path; the handle powers on { null } (an empty map) and is
+    // freed at teardown.
+    bool is_assoc = false;
     // Index of the instance-scope anchor this signal is addressed through
     // (Anchor / storage_ptr); no_anchor for an unscoped root-level signal,
     // which is addressed directly off @clotho.state.
@@ -539,11 +558,13 @@ struct FrameSlot {
     llvm::Type* storage_ty = nullptr;
     // The local's interned IR type (aggregate recursion needs it).
     Ref ir_type = Ref::Invalid;
-    // A dynamic-array or queue local: the slot is a handle; it powers on empty
-    // ({0}) and is freed at every body exit, like a string local. `handle_type`
-    // is the interned handle type (picks the runtime slot / delete function).
+    // A dynamic-array, queue, or associative-array local: the slot is a handle;
+    // it powers on empty ({0}) and is freed at every body exit, like a string
+    // local. `handle_type` is the interned handle type (picks the runtime slot /
+    // delete function).
     bool is_dynarr = false;
     bool is_queue  = false;
+    bool is_assoc  = false;
     Ref  handle_type = Ref::Invalid;
     // A ref formal: the local has no real frame storage (its dead field is kept
     // only so Local index == field index). Loads / stores redirect to the passed
@@ -947,9 +968,23 @@ private:
         return dynarr_slot_ty_;
     }
 
+    // The opaque rt_assoc handle slot type (`%clotho.assoc = { ptr }`), memoized.
+    // Must mirror the runtime rt_assoc layout ({ void* impl }).
+    llvm::StructType* assoc_slot_ty() {
+        if (assoc_slot_ty_ == nullptr) {
+            assoc_slot_ty_ = llvm::StructType::create(ctx_, { raw_ptr_ty() }, "clotho.assoc");
+        }
+        return assoc_slot_ty_;
+    }
+
     // Whether a type is a dynamic array (LRM 7.5).
     bool is_dynarr_type(Ref type) const {
         return std::get<Type>(mod_.pool.get(type)).kind == Type::Kind::DynArray;
+    }
+
+    // Whether a type is an associative array (LRM 7.8/7.9).
+    bool is_assoc_type(Ref type) const {
+        return std::get<Type>(mod_.pool.get(type)).kind == Type::Kind::Assoc;
     }
 
     // Per-element slot facts for a dynamic array's element (a POD scalar in phase
@@ -1097,23 +1132,34 @@ private:
         return std::get<Type>(mod_.pool.get(type)).kind == Type::Kind::Queue;
     }
 
-    // A heap-backed handle value type (dynamic array or queue): both share the
-    // by-pointer, deep-copy subroutine ABI, differing only in the runtime slot
-    // struct and the copy / free functions.
+    // A heap-backed handle value type (dynamic array, queue, or associative
+    // array): all share the by-pointer, deep-copy subroutine ABI, differing only
+    // in the runtime slot struct and the copy / free functions.
     bool is_handle_type(Ref type) const {
-        return is_dynarr_type(type) || is_queue_type(type);
+        return is_dynarr_type(type) || is_queue_type(type) || is_assoc_type(type);
     }
     llvm::StructType* handle_slot_ty(Ref type) {
+        if (is_assoc_type(type)) {
+            return assoc_slot_ty();
+        }
         return is_queue_type(type) ? queue_slot_ty() : dynarr_slot_ty();
     }
     // Deep-copy one handle into another (value semantics), picking the runtime
     // function and element descriptor from the type.
     void emit_handle_assign(llvm::Value* dst, llvm::Value* src, Ref type) {
+        if (is_assoc_type(type)) {
+            b_.CreateCall(assoc_assign_fn(), { dst, src, elem_ops_global(type) });
+            return;
+        }
         b_.CreateCall(is_queue_type(type) ? queue_assign_fn() : dynarr_assign_fn(),
                       { dst, src, elem_ops_global(type) });
     }
     // Destroy a handle's elements and free its storage (reset to empty).
     void emit_handle_delete(llvm::Value* handle, Ref type) {
+        if (is_assoc_type(type)) {
+            b_.CreateCall(assoc_delete_all_fn(), { handle, elem_ops_global(type) });
+            return;
+        }
         b_.CreateCall(is_queue_type(type) ? queue_delete_all_fn() : dynarr_delete_fn(),
                       { handle, elem_ops_global(type) });
     }
@@ -1173,7 +1219,8 @@ private:
         const Type& t = std::get<Type>(mod_.pool.get(type));
         if (t.kind == Type::Kind::UnpackedArray) {
             const Type::Kind ek = std::get<Type>(mod_.pool.get(t.element)).kind;
-            if (ek == Type::Kind::DynArray || ek == Type::Kind::Queue) {
+            if (ek == Type::Kind::DynArray || ek == Type::Kind::Queue ||
+                ek == Type::Kind::Assoc) {
                 return true;
             }
             return needs_agg_storage(t.element);
@@ -1189,6 +1236,7 @@ private:
             case Type::Kind::String:
             case Type::Kind::DynArray:
             case Type::Kind::Queue:
+            case Type::Kind::Assoc:
                 return true;
             case Type::Kind::UnpackedArray:
                 return has_heap_leaf(t.element);
@@ -1244,7 +1292,8 @@ private:
         if (t.kind == Type::Kind::String) {
             return str_slot_ty();
         }
-        if (t.kind == Type::Kind::DynArray || t.kind == Type::Kind::Queue) {
+        if (t.kind == Type::Kind::DynArray || t.kind == Type::Kind::Queue ||
+            t.kind == Type::Kind::Assoc) {
             return handle_slot_ty(type);
         }
         return agg_leaf_slot_ty(type);
@@ -1308,10 +1357,12 @@ private:
             lv.slot_ty   = str_slot_ty();
             return;
         }
-        if (t.kind == Type::Kind::DynArray || t.kind == Type::Kind::Queue) {
-            // A handle leaf is consumed only by the queue / dynamic-array ops
-            // (which address it via lv_handle_ptr) and by ElemSelect descent;
-            // a plane Load/Store on it is a lowering bug and traps.
+        if (t.kind == Type::Kind::DynArray || t.kind == Type::Kind::Queue ||
+            t.kind == Type::Kind::Assoc) {
+            // A handle leaf is consumed only by the queue / dynamic-array /
+            // associative-array ops (which address it via lv_handle_ptr) and by
+            // ElemSelect / AssocSelect descent; a plane Load/Store on it is a
+            // lowering bug and traps.
             lv.is_handle = true;
             lv.slot_ty   = handle_slot_ty(leaf_type);
             return;
@@ -1513,6 +1564,15 @@ private:
                 slot.is_queue   = true;
                 slot.has_z      = false;
                 slot.slot_ty    = queue_slot_ty();
+                slot.storage_ty = slot.slot_ty;
+                continue;
+            }
+            // An associative-array slot is an opaque rt_assoc handle ({ impl }):
+            // no planes, no z word; entries live in its heap map.
+            if (ty.kind == Type::Kind::Assoc) {
+                slot.is_assoc   = true;
+                slot.has_z      = false;
+                slot.slot_ty    = assoc_slot_ty();
                 slot.storage_ty = slot.slot_ty;
                 continue;
             }
@@ -2878,6 +2938,7 @@ private:
             if (is_handle_type(f.local_types[i]) && !is_ref_formal) {
                 frame_slots_[i].is_dynarr    = is_dynarr_type(f.local_types[i]);
                 frame_slots_[i].is_queue     = is_queue_type(f.local_types[i]);
+                frame_slots_[i].is_assoc     = is_assoc_type(f.local_types[i]);
                 frame_slots_[i].handle_type  = f.local_types[i];
                 frame_slots_[i].slot_ty      = handle_slot_ty(f.local_types[i]);
                 fields[i]                    = frame_slots_[i].slot_ty;
@@ -2921,7 +2982,7 @@ private:
                 b_.CreateCall(str_init_fn(), { slot });
                 continue;
             }
-            if (s.is_dynarr || s.is_queue) {
+            if (s.is_dynarr || s.is_queue || s.is_assoc) {
                 // Empty handle ({0}): the frame alloca is not zeroed, so store the
                 // empty handle (null buffer pointer, zero length).
                 b_.CreateStore(llvm::Constant::getNullValue(s.slot_ty), slot);
@@ -2946,9 +3007,10 @@ private:
         for (uint32_t i = 0; i < frame_slots_.size(); ++i) {
             if (frame_slots_[i].is_string) {
                 b_.CreateCall(str_deinit_fn(), { b_.CreateStructGEP(frame_ty_, frame_, i) });
-            } else if (frame_slots_[i].is_dynarr || frame_slots_[i].is_queue) {
-                // A dynamic-array / queue local owns its heap buffer (value
-                // semantics): free it at every body exit so it does not leak.
+            } else if (frame_slots_[i].is_dynarr || frame_slots_[i].is_queue ||
+                       frame_slots_[i].is_assoc) {
+                // A dynamic-array / queue / associative-array local owns its heap
+                // storage (value semantics): free it at every body exit.
                 emit_handle_delete(b_.CreateStructGEP(frame_ty_, frame_, i),
                                    frame_slots_[i].handle_type);
             } else if (frame_slots_[i].is_agg && !frame_slots_[i].is_ref &&
@@ -3616,7 +3678,7 @@ private:
         for (const SignalSlot& s : slots_) {
             if (s.is_string) {
                 emit_string_slot_op(s, str_deinit_fn());
-            } else if (s.is_dynarr || s.is_queue) {
+            } else if (s.is_dynarr || s.is_queue || s.is_assoc) {
                 emit_handle_delete(storage_ptr(s), s.ir_type);
             } else if (s.is_agg && has_heap_leaf(s.ir_type)) {
                 // Aggregate signal with string / handle leaves: recursive
@@ -7156,6 +7218,52 @@ private:
         return rt_fn("rt_queue_shuffle", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
     }
 
+    // -- Associative-array runtime entry points (LRM 7.8/7.9). Keys pass as a
+    // normalized byte span (ptr + i32 len); the value element lifecycle rides the
+    // rt_elem_ops descriptor. See docs/design/dynamic-arrays.md §6. --
+    // void* rt_assoc_get_ptr(rt_assoc*, const u8* kptr, u32 klen)
+    llvm::FunctionCallee assoc_get_ptr_fn() {
+        return rt_fn("rt_assoc_get_ptr", raw_ptr_ty(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    // void* rt_assoc_put_ptr(rt_assoc*, const rt_elem_ops*, const u8* kptr, u32 klen)
+    llvm::FunctionCallee assoc_put_ptr_fn() {
+        return rt_fn("rt_assoc_put_ptr", raw_ptr_ty(),
+                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    // i32 rt_assoc_exists(rt_assoc*, const u8* kptr, u32 klen)
+    llvm::FunctionCallee assoc_exists_fn() {
+        return rt_fn("rt_assoc_exists", b_.getInt32Ty(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    // void rt_assoc_delete_key(rt_assoc*, const rt_elem_ops*, const u8* kptr, u32 klen)
+    llvm::FunctionCallee assoc_delete_key_fn() {
+        return rt_fn("rt_assoc_delete_key", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    // void rt_assoc_delete_all(rt_assoc*, const rt_elem_ops*)
+    llvm::FunctionCallee assoc_delete_all_fn() {
+        return rt_fn("rt_assoc_delete_all", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    // u64 rt_assoc_num(rt_assoc*)
+    llvm::FunctionCallee assoc_num_fn() {
+        return rt_fn("rt_assoc_num", b_.getInt64Ty(), { raw_ptr_ty() });
+    }
+    // i32 rt_assoc_first/last(rt_assoc*, const u8** out_ptr, u32* out_len)
+    llvm::FunctionCallee assoc_end_fn(bool last) {
+        return rt_fn(last ? "rt_assoc_last" : "rt_assoc_first", b_.getInt32Ty(),
+                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
+    }
+    // i32 rt_assoc_next/prev(rt_assoc*, const u8* cur, u32 curlen, const u8** out, u32* outlen)
+    llvm::FunctionCallee assoc_step_fn(bool prev) {
+        return rt_fn(prev ? "rt_assoc_prev" : "rt_assoc_next", b_.getInt32Ty(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty() });
+    }
+    // void rt_assoc_assign(rt_assoc* dst, const rt_assoc* src, const rt_elem_ops*)
+    llvm::FunctionCallee assoc_assign_fn() {
+        return rt_fn("rt_assoc_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
+    }
+
     llvm::FunctionCallee str_init_fn() {
         return rt_fn("rt_string_init", b_.getVoidTy(), { raw_ptr_ty() });
     }
@@ -7393,7 +7501,8 @@ private:
             b_.CreateCall(str_init_fn(), { b_.CreateInBoundsGEP(root_ty, base, idx) });
             return;
         }
-        if (t.kind == Type::Kind::DynArray || t.kind == Type::Kind::Queue) {
+        if (t.kind == Type::Kind::DynArray || t.kind == Type::Kind::Queue ||
+            t.kind == Type::Kind::Assoc) {
             // Empty handle (null buffer, zero counts). A signal slot is already
             // zero from the state global's initializer; a frame alloca is not.
             b_.CreateStore(llvm::Constant::getNullValue(handle_slot_ty(type)),
@@ -7452,7 +7561,8 @@ private:
             return;
         }
         const bool is_str    = t.kind == Type::Kind::String;
-        const bool is_handle = t.kind == Type::Kind::DynArray || t.kind == Type::Kind::Queue;
+        const bool is_handle = t.kind == Type::Kind::DynArray || t.kind == Type::Kind::Queue ||
+                               t.kind == Type::Kind::Assoc;
         if (!is_str && !is_handle) {
             return;
         }
@@ -7526,6 +7636,10 @@ private:
         }
         if (s.is_queue) {
             // Empty queue handle: { null base, 0 head, 0 len, 0 cap } == zeroinitializer.
+            return llvm::ConstantAggregateZero::get(s.storage_ty);
+        }
+        if (s.is_assoc) {
+            // Empty associative-array handle: { null impl } == zeroinitializer.
             return llvm::ConstantAggregateZero::get(s.storage_ty);
         }
         if (s.is_string) {
@@ -7823,6 +7937,22 @@ private:
             case Inst::Tag::QueueShuffle:
                 // Ordering methods (LRM 7.12.2) are void statements; their type
                 // is never queried.
+                return { 32, false, true };
+            case Inst::Tag::AssocSelect:
+                // One entry of the associative array's value element type.
+                return from_ref(std::get<Type>(mod_.pool.get(
+                  ir_->extra_data<AssocArg>(p.op_extra.extra).assoc_type)).element);
+            case Inst::Tag::AssocNum:
+            case Inst::Tag::AssocExists:
+            case Inst::Tag::AssocFirst:
+            case Inst::Tag::AssocLast:
+            case Inst::Tag::AssocNext:
+            case Inst::Tag::AssocPrev:
+            case Inst::Tag::AssocDeleteKey:
+            case Inst::Tag::AssocDeleteAll:
+            case Inst::Tag::AssocCopy:
+                // num()/exists() and the traversal status are definite 2-state
+                // ints; delete/copy are statements whose type is never queried.
                 return { 32, false, true };
 
             case Inst::Tag::Add:
@@ -8432,6 +8562,37 @@ private:
                 set_lvalue(i, lv);
                 return;
             }
+            case Inst::Tag::AssocSelect: {
+                // a[key] (LRM 7.8/7.9): build a deferred assoc element lvalue.
+                // The get_ptr (read) vs put_ptr (write) resolution is left to the
+                // Load / Store consumer (see assoc_elem_lvalue). Here we resolve
+                // the handle, normalize the key into a scratch span, and record
+                // the value element slot facts.
+                const auto    aa = ir_->extra_data<AssocArg>(p.op_extra.extra);
+                const DynElem e  = dynarr_elem(aa.assoc_type);
+                if (e.is_string || e.is_handle) {
+                    // TODO: managed (string / nested container) value elements in
+                    // an associative array (needs the a[k] read/write to route a
+                    // handle, not a plane). Keys of every kind are supported.
+                    throw BackendError{ "associative array with a string / nested-container "
+                                        "value element is not supported" };
+                }
+                const LValue     hlv = lvalue_of(p.op_extra.op);
+                auto [kptr, klen]    = normalize_assoc_key_value(aa.arg, aa.assoc_type);
+                LValue el;
+                el.is_assoc      = true;
+                el.assoc_handle  = lv_handle_ptr(hlv);
+                el.assoc_key_ptr = kptr;
+                el.assoc_key_len = klen;
+                el.assoc_ops     = elem_ops_global(aa.assoc_type);
+                el.slot_ty       = e.slot_ty;
+                el.has_z         = e.has_z;
+                el.narrow        = e.narrow;
+                el.store_width   = e.width;
+                el.width         = e.width;
+                set_lvalue(i, el);
+                return;
+            }
             case Inst::Tag::MemberSelect: {
                 const auto ms = ir_->extra_data<MemberSelect>(p.op_extra.extra);
                 set_lvalue(i, agg_member(lvalue_of(p.op_extra.op), ms.struct_type, ms.field_index));
@@ -8483,7 +8644,13 @@ private:
                     return;
                 }
                 const ValType t = type_of(i);
-                Plane         v = lv.dyn_inrange != nullptr ? dyn_elem_load(lv) : lower_load(lv);
+                // An assoc read resolves the element via get_ptr (absent key ->
+                // element default through the dyn_inrange=false path, no entry
+                // created); dyn/queue elements ride the same in-range machinery.
+                Plane         v =
+                  lv.is_assoc ? dyn_elem_load(assoc_elem_lvalue(lv, /*for_write=*/false))
+                  : lv.dyn_inrange != nullptr ? dyn_elem_load(lv)
+                                              : lower_load(lv);
                 if (t.is_real) {
                     v = real_plane(planes_to_real(v, t.width));
                 }
@@ -8508,6 +8675,13 @@ private:
                     // Deep copy. Strings are guarded out of sensitivity lists in
                     // the frontend, so there is no wait queue to service.
                     b_.CreateCall(str_assign_fn(), { lv_string_ptr(lv), str_of(p.binary.r) });
+                    return;
+                }
+                if (lv.is_assoc) {
+                    // a[key] = v (LRM 7.8): put_ptr creates + proto-inits the
+                    // entry, then the value stores into it. Assoc elements are
+                    // guarded out of sensitivity lists, so no wait servicing.
+                    lower_store(assoc_elem_lvalue(lv, /*for_write=*/true), value_of(p.binary.r));
                     return;
                 }
                 if (lv.dyn_inrange != nullptr) {
@@ -8707,6 +8881,28 @@ private:
                 return;
             case Inst::Tag::QueueShuffle:
                 lower_queue_shuffle(i);
+                return;
+
+            case Inst::Tag::AssocNum:
+                lower_assoc_num(i);
+                return;
+            case Inst::Tag::AssocExists:
+                lower_assoc_exists(i);
+                return;
+            case Inst::Tag::AssocDeleteKey:
+                lower_assoc_delete_key(i);
+                return;
+            case Inst::Tag::AssocDeleteAll:
+                lower_assoc_delete_all(i);
+                return;
+            case Inst::Tag::AssocCopy:
+                lower_assoc_copy(i);
+                return;
+            case Inst::Tag::AssocFirst:
+            case Inst::Tag::AssocLast:
+            case Inst::Tag::AssocNext:
+            case Inst::Tag::AssocPrev:
+                lower_assoc_traverse(i, ir_->tag(i));
                 return;
 
             case Inst::Tag::Constant: {
@@ -9885,6 +10081,211 @@ private:
         llvm::Value* stride = b_.getInt64(dynarr_stride(dynarr_elem(p.type)));
         assert(rng_slot_ != nullptr && "shuffle needs the frame RNG");
         b_.CreateCall(queue_shuffle_fn(), { lvalue_of(p.op).base, stride, rng_slot_ });
+    }
+
+    // -- Associative arrays (LRM 7.8/7.9). The value element rides the dynarr
+    // element slot machinery; keys are normalized to order-preserving byte spans
+    // (docs/design/dynamic-arrays.md §4a) built here from the interned key type. --
+
+    // The key kind facts of an assoc type: wildcard (`[*]`), string, or a typed
+    // integral key of width W with signedness (packed struct/enum reduce to the
+    // integral case via their layout width).
+    struct AssocKeyInfo {
+        bool     wildcard  = false;
+        bool     is_string = false;
+        uint32_t W         = 0;
+        bool     is_signed = false;
+    };
+    AssocKeyInfo assoc_key_info(Ref assoc_type) {
+        const Type&  at = std::get<Type>(mod_.pool.get(assoc_type));
+        AssocKeyInfo info;
+        info.wildcard = at.right != 0;
+        if (info.wildcard) {
+            // Wildcard keys normalize to a fixed 64-bit unsigned big-endian form,
+            // so numerically-equal indices of any width collapse to one entry.
+            info.W = 64;
+            return info;
+        }
+        const Ref key_ty = static_cast<Ref>(at.fields_id);
+        if (is_string_type(key_ty)) {
+            info.is_string = true;
+            return info;
+        }
+        const uint32_t w = mod_.pool.layout(key_ty).width;
+        info.W           = w == 0 ? 1 : w;
+        info.is_signed   = std::get<Type>(mod_.pool.get(key_ty)).is_signed;
+        return info;
+    }
+
+    // Normalize an integral must-value to fixed big-endian bytes (byte 0 = most
+    // significant), sign-flipping the top bit for a signed key so unsigned
+    // lexicographic byte order equals numeric order. Returns { i8* ptr, i32 len }.
+    std::pair<llvm::Value*, llvm::Value*> normalize_integral_key(llvm::Value* mustval,
+                                                                 const AssocKeyInfo& info) {
+        llvm::Value* val = cast(mustval, info.W, false);
+        if (info.is_signed) {
+            val = b_.CreateXor(val, llvm::ConstantInt::get(
+                                      int_ty(info.W), llvm::APInt::getSignedMinValue(info.W)));
+        }
+        const uint32_t nbytes = (info.W + 7) / 8;
+        llvm::Value*   wide   = cast(val, nbytes * 8, false);
+        auto*          arr_ty = llvm::ArrayType::get(b_.getInt8Ty(), nbytes);
+        auto*          scratch = entry_alloca(arr_ty, "assoc.key");
+        for (uint32_t k = 0; k < nbytes; ++k) {
+            const uint32_t shift = 8 * (nbytes - 1 - k);
+            llvm::Value*   src   = shift == 0 ? wide
+                                             : b_.CreateLShr(wide, llvm::ConstantInt::get(
+                                                                     int_ty(nbytes * 8), shift));
+            b_.CreateStore(b_.CreateTrunc(src, b_.getInt8Ty()),
+                           b_.CreateConstInBoundsGEP2_32(arr_ty, scratch, 0, k));
+        }
+        return { scratch, b_.getInt32(nbytes) };
+    }
+
+    // Normalized key span for a key VALUE operand (a[k] / exists / delete).
+    std::pair<llvm::Value*, llvm::Value*> normalize_assoc_key_value(Index key, Ref assoc_type) {
+        const AssocKeyInfo info = assoc_key_info(assoc_type);
+        if (info.is_string) {
+            llvm::Value* sh = str_of(key);
+            return { b_.CreateCall(str_data_fn(), { sh }),
+                     cast(b_.CreateCall(str_len_fn(), { sh }), 32, false) };
+        }
+        return normalize_integral_key(must_of(value_of(key)), info);
+    }
+
+    // Normalized key span for the CURRENT value of a key VARIABLE lvalue (next /
+    // prev traversal).
+    std::pair<llvm::Value*, llvm::Value*> normalize_assoc_key_lvalue(const LValue& key_lv,
+                                                                     Ref              assoc_type) {
+        const AssocKeyInfo info = assoc_key_info(assoc_type);
+        if (info.is_string) {
+            llvm::Value* sh = lv_string_ptr(key_lv);
+            return { b_.CreateCall(str_data_fn(), { sh }),
+                     cast(b_.CreateCall(str_len_fn(), { sh }), 32, false) };
+        }
+        return normalize_integral_key(must_of(lower_load(key_lv)), info);
+    }
+
+    // Write a key span (kptr / klen) back into the key-variable lvalue (foreach /
+    // first / next readout): inverse of the normalization above.
+    void denormalize_assoc_key(llvm::Value* kptr, llvm::Value* klen, Ref assoc_type,
+                               const LValue& key_lv) {
+        const AssocKeyInfo info = assoc_key_info(assoc_type);
+        if (info.is_string) {
+            b_.CreateCall(str_assign_bytes_fn(),
+                          { lv_string_ptr(key_lv), kptr, cast(klen, 64, false) });
+            return;
+        }
+        const uint32_t nbytes = (info.W + 7) / 8;
+        llvm::Value*   wide   = zero(nbytes * 8);
+        for (uint32_t k = 0; k < nbytes; ++k) {
+            llvm::Value* byte = b_.CreateLoad(
+              b_.getInt8Ty(), b_.CreateInBoundsGEP(b_.getInt8Ty(), kptr, b_.getInt32(k)));
+            llvm::Value* contrib =
+              b_.CreateShl(cast(byte, nbytes * 8, false),
+                           llvm::ConstantInt::get(int_ty(nbytes * 8), 8 * (nbytes - 1 - k)));
+            wide = b_.CreateOr(wide, contrib);
+        }
+        llvm::Value* val = cast(wide, info.W, false);
+        if (info.is_signed) {
+            val = b_.CreateXor(val, llvm::ConstantInt::get(
+                                      int_ty(info.W), llvm::APInt::getSignedMinValue(info.W)));
+        }
+        llvm::Value* out = cast(val, key_lv.store_width, info.is_signed);
+        lower_store(key_lv, two_val(out));
+    }
+
+    // Resolve an assoc element lvalue (deferred in AssocSelect) to a concrete
+    // element lvalue over the heap slot: get_ptr for a read (absent -> the
+    // dyn_inrange=false default path, no entry created), put_ptr for a write
+    // (creates + proto-inits the entry).
+    LValue assoc_elem_lvalue(const LValue& lv, bool for_write) {
+        LValue el;
+        el.slot_ty     = lv.slot_ty;
+        el.has_z       = lv.has_z;
+        el.narrow      = lv.narrow;
+        el.array_ty    = llvm::ArrayType::get(lv.slot_ty, 0);
+        el.elem_idx    = b_.getInt32(0);
+        el.store_width = lv.store_width;
+        el.bit_off     = b_.getInt32(0);
+        el.width       = lv.width;
+        if (for_write) {
+            el.base = b_.CreateCall(
+              assoc_put_ptr_fn(), { lv.assoc_handle, lv.assoc_ops, lv.assoc_key_ptr, lv.assoc_key_len });
+            return el;
+        }
+        llvm::Value* found = b_.CreateCall(
+          assoc_get_ptr_fn(), { lv.assoc_handle, lv.assoc_key_ptr, lv.assoc_key_len });
+        el.base        = found;
+        el.dyn_inrange = b_.CreateICmpNE(found, llvm::Constant::getNullValue(raw_ptr_ty()));
+        return el;
+    }
+
+    void lower_assoc_num(Index i) {
+        const auto&  p   = ir_->payload(i).op_type;
+        llvm::Value* n   = b_.CreateCall(assoc_num_fn(), { lv_handle_ptr(lvalue_of(p.op)) });
+        set_value(i, two_val(cast(n, 32, false)));
+    }
+
+    void lower_assoc_exists(Index i) {
+        const auto&  p        = ir_->payload(i).op_extra;
+        const auto   aa       = ir_->extra_data<AssocArg>(p.extra);
+        auto [kptr, klen]     = normalize_assoc_key_value(aa.arg, aa.assoc_type);
+        llvm::Value* r        = b_.CreateCall(assoc_exists_fn(),
+                                              { lv_handle_ptr(lvalue_of(p.op)), kptr, klen });
+        set_value(i, two_val(cast(r, 32, false)));
+    }
+
+    void lower_assoc_delete_key(Index i) {
+        const auto& p    = ir_->payload(i).op_extra;
+        const auto  aa   = ir_->extra_data<AssocArg>(p.extra);
+        auto [kptr, klen] = normalize_assoc_key_value(aa.arg, aa.assoc_type);
+        b_.CreateCall(assoc_delete_key_fn(),
+                      { lv_handle_ptr(lvalue_of(p.op)), elem_ops_global(aa.assoc_type), kptr, klen });
+    }
+
+    void lower_assoc_delete_all(Index i) {
+        const auto& p = ir_->payload(i).op_type;
+        emit_handle_delete(lv_handle_ptr(lvalue_of(p.op)), p.type);
+    }
+
+    void lower_assoc_copy(Index i) {
+        const auto& p  = ir_->payload(i).op_extra;
+        const auto  aa = ir_->extra_data<AssocArg>(p.extra);
+        b_.CreateCall(assoc_assign_fn(),
+                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(aa.arg)),
+                        elem_ops_global(aa.assoc_type) });
+    }
+
+    // first / last / next / prev (LRM 7.9.3/7.9.4): write the ordered key into
+    // the key-variable lvalue and yield the 0/1 found status.
+    void lower_assoc_traverse(Index i, Inst::Tag tag) {
+        const auto&  p      = ir_->payload(i).op_extra;
+        const auto   aa     = ir_->extra_data<AssocArg>(p.extra);
+        llvm::Value* handle = lv_handle_ptr(lvalue_of(p.op));
+        const LValue key_lv = lvalue_of(aa.arg);
+        auto*        outptr = entry_alloca(raw_ptr_ty(), "assoc.kp");
+        auto*        outlen = entry_alloca(b_.getInt32Ty(), "assoc.kl");
+        llvm::Value* status = nullptr;
+        if (tag == Inst::Tag::AssocFirst || tag == Inst::Tag::AssocLast) {
+            status = b_.CreateCall(assoc_end_fn(tag == Inst::Tag::AssocLast),
+                                   { handle, outptr, outlen });
+        } else {
+            auto [cptr, clen] = normalize_assoc_key_lvalue(key_lv, aa.assoc_type);
+            status            = b_.CreateCall(assoc_step_fn(tag == Inst::Tag::AssocPrev),
+                                              { handle, cptr, clen, outptr, outlen });
+        }
+        auto* got  = b_.CreateICmpNE(status, zero(32));
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* dobb = llvm::BasicBlock::Create(ctx_, "assoc.trav.do", fn);
+        auto* cont = llvm::BasicBlock::Create(ctx_, "assoc.trav.cont", fn);
+        b_.CreateCondBr(got, dobb, cont);
+        b_.SetInsertPoint(dobb);
+        denormalize_assoc_key(b_.CreateLoad(raw_ptr_ty(), outptr),
+                              b_.CreateLoad(b_.getInt32Ty(), outlen), aa.assoc_type, key_lv);
+        b_.CreateBr(cont);
+        b_.SetInsertPoint(cont);
+        set_value(i, two_val(cast(status, 32, false)));
     }
 
     void lower_store(const LValue& lv, Plane rhs) {
@@ -14932,6 +15333,8 @@ private:
     std::vector<llvm::Value*> dynarr_ret_;
     // Memoized `%clotho.queue` handle slot type ({ ptr base, i64 head, len, cap }).
     llvm::StructType* queue_slot_ty_ = nullptr;
+    // Memoized `%clotho.assoc` handle slot type ({ ptr impl }).
+    llvm::StructType* assoc_slot_ty_ = nullptr;
     llvm::StructType* elem_ops_ty_ = nullptr;
 };
 

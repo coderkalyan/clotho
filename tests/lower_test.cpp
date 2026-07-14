@@ -681,15 +681,28 @@ TEST_CASE("a queue lowers (LRM 7.10)") {
     CHECK(r.ok);
 }
 
-TEST_CASE("an associative array still fails loudly") {
+// Associative arrays (LRM 7.8/7.9) lower and run; see
+// associative_array_test.cpp. A string / nested-container VALUE element is the
+// remaining guarded gap.
+TEST_CASE("an associative array lowers") {
     const LowerResult r = lower_text(R"(
         module top;
             int a [string];
             initial a["x"] = 1;
         endmodule
     )");
+    CHECK_MESSAGE(r.ok, r.diagnostics);
+}
+
+TEST_CASE("an associative array with a string value element fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            string a [int];
+            initial a[0] = "x";
+        endmodule
+    )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("associative") != std::string::npos);
+    CHECK(r.diagnostics.find("value element") != std::string::npos);
 }
 
 TEST_CASE("nonblocking whole-struct copy with a queue member fails loudly") {
@@ -986,15 +999,16 @@ TEST_CASE("a type parameter bound to an unsupported type fails loudly") {
     // guard as a direct declaration, not silently accept it. (`event`,
     // `chandle`, and now `class` were prior examples here; all are lowered now —
     // named event LRM 15.5, chandle as a 2-state i64 handle LRM 6.14, class LRM 8.)
-    // An associative array is still unsupported, so it stands in as the example.
+    // An associative array with a string VALUE element is still guarded, so it
+    // stands in as the example.
     const LowerResult r = lower_text(R"(
-        typedef int AA[string];
+        typedef string AA[int];
         module m #(parameter type T = AA);
             T v;
         endmodule
     )");
     CHECK(!r.ok);
-    CHECK(r.diagnostics.find("associative arrays are not supported") != std::string::npos);
+    CHECK(r.diagnostics.find("value element") != std::string::npos);
 }
 
 TEST_CASE("a class type parameter lowers as a handle") {

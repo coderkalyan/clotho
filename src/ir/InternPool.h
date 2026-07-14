@@ -111,6 +111,16 @@ struct Type {
         // so max size N+1; 0 means unbounded). right is unused; a queue is
         // always 0-based [0:len-1].
         Queue,
+        // Associative array (LRM §7.8/7.9): a runtime-sized key->value map. Not
+        // plane-sized — layout() reports width 0 and runtime storage is an
+        // opaque rt_assoc handle (a pointer to an ankerl map + cached sorted key
+        // index; see docs/design/dynamic-arrays.md §4a/§6). `element` is the
+        // value type; `fields_id` stashes the interned KEY type Ref; `right` is
+        // 1 for a wildcard index (`[*]`, LRM 7.8.1 — `fields_id` then names a
+        // canonical unsigned integral placeholder) and 0 for a typed key. Keys
+        // reach the runtime as normalized order-preserving byte spans (§4a), so
+        // the runtime never learns the key kind. `left` unused.
+        Assoc,
         // Class (LRM §8): a reference type. Not plane-sized — layout() reports
         // width 0 and the runtime value is a handle (a bare pointer to a heap
         // object body); the backend owns the body layout, built like an unpacked

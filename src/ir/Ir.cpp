@@ -286,6 +286,18 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 scratch[2]    = qi.val;
                 return { scratch.data(), 3 };
             }
+            // The one-extra-operand associative-array ops expose the handle
+            // lvalue plus their AssocArg operand (key value / key lvalue / copy
+            // source).
+            if (tag == Inst::Tag::AssocSelect || tag == Inst::Tag::AssocExists ||
+                tag == Inst::Tag::AssocDeleteKey || tag == Inst::Tag::AssocCopy ||
+                tag == Inst::Tag::AssocFirst || tag == Inst::Tag::AssocLast ||
+                tag == Inst::Tag::AssocNext || tag == Inst::Tag::AssocPrev) {
+                const auto aa = extra_data<AssocArg>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = aa.arg;
+                return { scratch.data(), 2 };
+            }
             scratch[0] = p.op_extra.op;
             return { scratch.data(), 1 };
     }

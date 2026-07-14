@@ -562,6 +562,62 @@ void rt_queue_reverse(rt_queue* h, uint64_t stride);
 void rt_queue_sort(rt_queue* h, uint64_t stride, uint32_t kind, uint32_t width, uint32_t rev);
 void rt_queue_shuffle(rt_queue* h, uint64_t stride, uint64_t* rng);
 
+// -- SystemVerilog associative arrays --
+//
+// The associative-array type (LRM §7.8/7.9): a runtime-sized key->value map. The
+// value lives in an 8-byte caller-owned handle embedded in design state (same
+// ownership model as the other containers): `impl` is null for the empty map,
+// else points at a heap AssocMap (an ankerl map of normalized-key-bytes ->
+// element slot bytes, plus a lazily-rebuilt sorted key index for ordered
+// traversal). Keys reach the runtime as normalized order-preserving byte spans
+// built by the backend (docs/design/dynamic-arrays.md §4a) — the runtime is
+// key-kind-agnostic: it hashes the span, compares with memcmp, and sorts
+// lexicographically. Copies are eager deep copies; handles never share storage.
+typedef struct rt_assoc {
+    void* impl;
+} rt_assoc;
+
+// a[key] read: pointer to the element slot for `key`, or null if absent (LRM
+// 7.8: a read of an absent key does NOT create it — the backend materializes the
+// element default). The pointer is valid until the next mutation of `h`.
+void* rt_assoc_get_ptr(rt_assoc* h, const uint8_t* kptr, uint32_t klen);
+
+// a[key] write: pointer to the element slot for `key`, creating (and proto-
+// initializing) the entry if absent (LRM 7.8). Valid until the next mutation.
+void* rt_assoc_put_ptr(rt_assoc* h, const rt_elem_ops* ops, const uint8_t* kptr, uint32_t klen);
+
+// a.exists(key) -> 0/1 (LRM 7.9.1).
+int rt_assoc_exists(rt_assoc* h, const uint8_t* kptr, uint32_t klen);
+
+// a.delete(key): remove one entry if present (LRM 7.9.2). Idempotent.
+void rt_assoc_delete_key(rt_assoc* h, const rt_elem_ops* ops, const uint8_t* kptr, uint32_t klen);
+
+// a.delete(): destroy every entry and reset `h` to the empty map. Idempotent;
+// also the teardown entry point.
+void rt_assoc_delete_all(rt_assoc* h, const rt_elem_ops* ops);
+
+// a.num() / a.size(): entry count (LRM 7.9.5).
+uint64_t rt_assoc_num(rt_assoc* h);
+
+// a.first(k) / a.last(k) (LRM 7.9.3): write the min / max key's normalized span
+// to *out_ptr / *out_len, return 1; return 0 for an empty map. The span points
+// into the map's key storage — valid until the next mutation.
+int rt_assoc_first(rt_assoc* h, const uint8_t** out_ptr, uint32_t* out_len);
+int rt_assoc_last(rt_assoc* h, const uint8_t** out_ptr, uint32_t* out_len);
+
+// a.next(k) / a.prev(k) (LRM 7.9.4): given the current key span, write the
+// smallest key strictly greater (next) / largest strictly less (prev) to
+// *out_ptr / *out_len, return 1; return 0 past the end. `cur` need not be a
+// present key. The span points into the map's key storage.
+int rt_assoc_next(rt_assoc* h, const uint8_t* cur_ptr, uint32_t cur_len, const uint8_t** out_ptr,
+                  uint32_t* out_len);
+int rt_assoc_prev(rt_assoc* h, const uint8_t* cur_ptr, uint32_t cur_len, const uint8_t** out_ptr,
+                  uint32_t* out_len);
+
+// dst = src: deep copy `src`'s entries into `dst` (value semantics, LRM §7.9).
+// A no-op when dst == src.
+void rt_assoc_assign(rt_assoc* dst, const rt_assoc* src, const rt_elem_ops* ops);
+
 // -- SystemVerilog string objects --
 //
 // The dynamic `string` type (LRM §6.16). A string value lives in a fixed

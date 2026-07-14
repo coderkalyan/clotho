@@ -237,6 +237,17 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_queue_reverse", &rt_queue_reverse);
     expose("rt_queue_sort", &rt_queue_sort);
     expose("rt_queue_shuffle", &rt_queue_shuffle);
+    expose("rt_assoc_get_ptr", &rt_assoc_get_ptr);
+    expose("rt_assoc_put_ptr", &rt_assoc_put_ptr);
+    expose("rt_assoc_exists", &rt_assoc_exists);
+    expose("rt_assoc_delete_key", &rt_assoc_delete_key);
+    expose("rt_assoc_delete_all", &rt_assoc_delete_all);
+    expose("rt_assoc_num", &rt_assoc_num);
+    expose("rt_assoc_first", &rt_assoc_first);
+    expose("rt_assoc_last", &rt_assoc_last);
+    expose("rt_assoc_next", &rt_assoc_next);
+    expose("rt_assoc_prev", &rt_assoc_prev);
+    expose("rt_assoc_assign", &rt_assoc_assign);
     expose("rt_intra_alloc", &rt_intra_alloc);
     expose("rt_intra_cb", &rt_intra_cb);
     expose("rt_intra_ready_base", &rt_intra_ready_base);

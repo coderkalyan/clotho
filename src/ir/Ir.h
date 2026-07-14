@@ -275,6 +275,18 @@ struct QueueInsertInfo {
     Ref queue_type;
 };
 
+// Extra payload for the one-operand associative-array tags (AssocSelect,
+// AssocExists, AssocDeleteKey, AssocCopy, AssocFirst/Last/Next/Prev). `arg` is
+// the key value (select/exists/delete-key), the source handle lvalue (copy), or
+// the key-variable lvalue (first/last/next/prev). The handle lvalue is the op.
+struct AssocArg {
+    // Key value / source handle / key-variable lvalue, per the tag.
+    Index arg;
+    // The interned Assoc type of the target (element = value, fields_id = key,
+    // right = wildcard flag).
+    Ref assoc_type;
+};
+
 // Extra payload for `read_mem`: a $readmemh / $readmemb load of a file into an
 // unpacked-array memory. The filename value is the instruction's `op`: either a
 // packed-ASCII vector (the backend spills its must-bits to a byte buffer) or a
@@ -718,6 +730,7 @@ static_assert(ExtraPayload<DynArrayArg>);
 static_assert(ExtraPayload<DynArrayNewInitInfo>);
 static_assert(ExtraPayload<QueueArg>);
 static_assert(ExtraPayload<QueueInsertInfo>);
+static_assert(ExtraPayload<AssocArg>);
 static_assert(ExtraPayload<ReadMemInfo>);
 static_assert(ExtraPayload<Regions>);
 static_assert(ExtraPayload<LoopInfo>);
@@ -890,6 +903,40 @@ struct Inst {
         QueueSort,
         QueueRsort,
         QueueShuffle,
+
+        // -- Associative-array operations on a handle lvalue (LRM 7.8/7.9) --
+        // Each lowers to its rt_assoc_* runtime call; keys cross the ABI as
+        // normalized order-preserving byte spans, built by a backend converter
+        // keyed on the interned Assoc type (element = value, fields_id = key,
+        // right = wildcard flag). See docs/design/dynamic-arrays.md §4a/§6.
+        // a[k] element select producing an lvalue (payload: op_extra ->
+        // AssocArg, whose arg is the key value/lvalue; op is the handle lvalue).
+        // A Load of it calls rt_assoc_get_ptr (absent -> element default, no
+        // create); a Store calls rt_assoc_put_ptr (create + default-fill). The
+        // get/put dispatch is deferred to lower_load/lower_store.
+        AssocSelect,
+        // a.num() / a.size() -> 32-bit int entry count (payload: op_type).
+        AssocNum,
+        // a.exists(k) -> 32-bit int 0/1 (payload: op_extra -> AssocArg, arg is
+        // the key value; op is the handle lvalue).
+        AssocExists,
+        // a.delete(k): remove one key if present (payload: op_extra ->
+        // AssocArg, arg is the key value; op is the handle lvalue).
+        AssocDeleteKey,
+        // a.delete(): remove all entries, num -> 0 (payload: op_type).
+        AssocDeleteAll,
+        // a = other: deep copy of another assoc's entries (value semantics;
+        // payload: op_extra -> AssocArg, arg is the source handle lvalue).
+        AssocCopy,
+        // a.first(k)/last(k)/next(k)/prev(k): ordered traversal (LRM 7.9.3).
+        // Return 32-bit int 1 if a key was written, 0 at the end. `arg` is the
+        // key-variable LVALUE: first/last write the min/max key into it; next/
+        // prev read its current value and write the successor/predecessor. The
+        // backend normalizes the current key and denormalizes the result key.
+        AssocFirst,
+        AssocLast,
+        AssocNext,
+        AssocPrev,
 
         // -- Arithmetic (payload: binary) --
         Add,
@@ -1634,6 +1681,10 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::QueueSort:
         case T::QueueRsort:
         case T::QueueShuffle:
+        // Associative-array ops with no extra operand: op is the handle, type
+        // the interned Assoc type.
+        case T::AssocNum:
+        case T::AssocDeleteAll:
             return K::OpType;
         case T::ClassNew:
             return K::Ref;
@@ -1707,6 +1758,14 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::QueueInsert:
         case T::QueueDeleteIdx:
         case T::QueueCopy:
+        case T::AssocSelect:
+        case T::AssocExists:
+        case T::AssocDeleteKey:
+        case T::AssocCopy:
+        case T::AssocFirst:
+        case T::AssocLast:
+        case T::AssocNext:
+        case T::AssocPrev:
         case T::Cond:
         case T::Switch:
         case T::Fseek:
