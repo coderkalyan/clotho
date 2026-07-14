@@ -3527,6 +3527,7 @@ private:
     void lower_procedural_block(const ProceduralBlockSymbol& sym) {
         ir::Activation             activation = ir::Activation::Always;
         std::vector<ir::WaitEvent> wait_events;
+        const Expression*          iff_guard = nullptr;
 
         if (sym.procedureKind == ProceduralBlockKind::Initial) {
             activation = ir::Activation::Initial;
@@ -3567,8 +3568,8 @@ private:
                 infer = true;
                 body  = &timed.stmt;
             } else if (is_event_control(timed.timing)) {
-                collect_wait_events(timed.timing, wait_events);
-                body = &timed.stmt;
+                iff_guard = collect_wait_events(timed.timing, wait_events);
+                body      = &timed.stmt;
             }
         }
 
@@ -3586,6 +3587,12 @@ private:
         ir::Builder b(module_.pool);
         if (looping) {
             lower_forever(*body, b);
+        } else if (iff_guard != nullptr) {
+            // `always @(ev iff C) BODY` — wake on `ev`, run the body only when the
+            // guard holds at event time (LRM 9.4.2.3). Gating the already-lowered
+            // body with `if (C)` is observably identical: the body is
+            // side-effect-free when skipped and the block re-subscribes each pass.
+            emit_guarded_body(*body, *iff_guard, b, to_source_loc(sym.location));
         } else {
             lower_stmt(*body, b);
         }
@@ -3639,15 +3646,36 @@ private:
     // Collect the signal events of a timing control into `out`, descending into
     // event lists (@(posedge clk or a or negedge rst)). Each SignalEventControl
     // contributes one wait event; an implicit (@*) or other control adds nothing.
-    void collect_wait_events(const TimingControl& tc, std::vector<ir::WaitEvent>& out) {
+    // Returns the `iff` guard expression (LRM 9.4.2.3) when the control carries
+    // one, else null; the caller gates the wake on it. A guard is representable
+    // only on a single-event control: on a multi-event list the woken process
+    // cannot tell which event fired, so it cannot select the matching per-event
+    // guard (the shared-wake engine carries no waking-source id).
+    const Expression* collect_wait_events(const TimingControl& tc, std::vector<ir::WaitEvent>& out) {
+        const Expression* iff      = nullptr;
+        uint32_t          n_events = 0;
+        collect_wait_events_impl(tc, out, iff, n_events);
+        if (iff != nullptr && n_events > 1) {
+            // TODO: per-event `iff` in a multi-event list needs waking-source
+            // identification to pick the matching guard (or a synthesized
+            // edge-and-guard net per event). Rare in practice.
+            fail("iff qualifier on a multi-event control is not supported");
+        }
+        return iff;
+    }
+
+    // Recursive worker for collect_wait_events. Accumulates the single `iff`
+    // guard seen (last wins; the multi-event validity check is on n_events) and
+    // counts source SignalEvents so the caller can reject an unrepresentable
+    // guarded list.
+    void collect_wait_events_impl(const TimingControl& tc, std::vector<ir::WaitEvent>& out,
+                                  const Expression*& iff, uint32_t& n_events) {
         switch (tc.kind) {
             case TimingControlKind::SignalEvent: {
                 const SignalEventControl& ev = tc.as<SignalEventControl>();
-                // TODO: `@(edge sig iff cond)` (LRM 9.4.2.3) — the wake must be
-                // gated on the condition at event time; dropping it fires the
-                // process regardless of the guard.
+                ++n_events;
                 if (ev.iffCondition != nullptr) {
-                    fail("iff qualifier on an event control is not supported");
+                    iff = ev.iffCondition;
                 }
                 const ir::Signal sig = event_signal(ev.expr);
                 if (ev.edge == slang::ast::EdgeKind::BothEdges) {
@@ -3663,7 +3691,7 @@ private:
             }
             case TimingControlKind::EventList:
                 for (const TimingControl* e : tc.as<EventListControl>().events) {
-                    collect_wait_events(*e, out);
+                    collect_wait_events_impl(*e, out, iff, n_events);
                 }
                 break;
             default:
@@ -3757,7 +3785,7 @@ private:
     // (signal, edge) queue at once; it wakes when any of them fires.
     void lower_event_wait(const TimingControl& tc, ir::Builder& b, ir::SourceLoc l) {
         std::vector<ir::WaitEvent> events;
-        collect_wait_events(tc, events);
+        const Expression*          iff = collect_wait_events(tc, events);
         if (events.empty()) {
             fail("intra-body event wait has no signal events");
         }
@@ -3766,7 +3794,53 @@ private:
         for (const ir::WaitEvent& e : events) {
             edges.push_back(ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge) });
         }
-        b.wait(edges, l);
+        if (iff != nullptr) {
+            emit_guarded_wait(edges, *iff, b, l);
+        } else {
+            b.wait(edges, l);
+        }
+    }
+
+    // Lower `if (guard) body` as an entire process body: the `iff` qualifier on a
+    // top-level sensitivity list (LRM 9.4.2.3). The guard predicate is evaluated
+    // in the body's own scope, so it sees the event-time values.
+    void emit_guarded_body(const Statement& body, const Expression& guard, ir::Builder& b,
+                           ir::SourceLoc l) {
+        const ir::Index c = lower_predicate(guard, b);
+        b.open_region();
+        lower_stmt(body, b);
+        const ir::ExtraSlice then_r = b.close_region();
+        b.open_region();
+        const ir::ExtraSlice else_r = b.close_region(); // empty
+        b.cond(c, then_r, else_r, l);
+    }
+
+    // Lower an intra-body `@(ev iff C)` (LRM 9.4.2.3): re-wait until the edge
+    // fires with the guard true at event time, `forever { @(ev); if (C) break; }`.
+    // The guard is re-tested on every wake, so a fire with C false parks again.
+    void emit_guarded_wait(const std::vector<ir::WaitEdge>& edges, const Expression& guard,
+                           ir::Builder& b, ir::SourceLoc l) {
+        b.open_region();
+        const ir::Index      lpred = true_const(b, l);
+        const ir::ExtraSlice lcond = b.close_region();
+
+        b.open_region();
+        {
+            b.wait(edges, l);
+            const ir::Index c = lower_predicate(guard, b);
+            b.open_region();
+            b.break_(l);
+            const ir::ExtraSlice then_r = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice else_r = b.close_region(); // empty
+            b.cond(c, then_r, else_r, l);
+        }
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        const ir::ExtraSlice step = b.close_region(); // empty
+
+        b.loop(lcond, lpred, body, step, /*bottom_test*/ false, l);
     }
 
     // Emit the suspend for a blocking intra-assignment timing control
@@ -7377,7 +7451,11 @@ private:
                     fail("nonblocking intra-assignment requires a delay or event control");
                 }
                 std::vector<ir::WaitEvent> events;
-                collect_wait_events(*evt, events);
+                if (collect_wait_events(*evt, events) != nullptr) {
+                    // TODO: `iff` on a nonblocking intra-assignment event trigger —
+                    // the deferred-record path (store_nb_event) has no guard hook.
+                    fail("iff qualifier on a nonblocking intra-assignment event is not supported");
+                }
                 if (events.size() != 1) {
                     // TODO: a multi-signal trigger `@(a or b)` needs the record on
                     // several trigger lists with first-fire-wins removal.

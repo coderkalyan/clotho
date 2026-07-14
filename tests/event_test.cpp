@@ -248,6 +248,42 @@ TEST_CASE("event handle / event-controlled trigger forms are rejected") {
             "event") != std::string::npos);
 }
 
+TEST_CASE("iff qualifier gates a top-level sensitivity list") {
+    const std::string out = run_capture(R"(
+        module m;
+            logic clk=0, en=0; int count=0;
+            always @(posedge clk iff en) count++;
+            initial begin
+                en=0; clk=1; #1 clk=0; #1;
+                en=1; clk=1; #1 clk=0; #1;
+                clk=1; #1 clk=0; #1;
+                en=0; clk=1; #1 clk=0; #1;
+                $display("count=%0d", count);
+            end
+        endmodule
+    )");
+    CHECK(out == "count=2\n");
+}
+
+TEST_CASE("iff qualifier gates an intra-body event wait") {
+    const std::string out = run_capture(R"(
+        module m;
+            logic clk=0, en=0; int hits=0;
+            initial forever begin
+                @(posedge clk iff en);
+                hits++;
+                if (hits==2) begin $display("hits=%0d", hits); $finish; end
+            end
+            initial begin
+                en=0; clk=1; #1 clk=0; #1;
+                en=1; clk=1; #1 clk=0; #1;
+                clk=1; #1 clk=0; #1;
+            end
+        endmodule
+    )");
+    CHECK(out == "hits=2\n");
+}
+
 // An event control on a struct member (`@(posedge s.clk)`) has no direct
 // whole-signal to watch (the member is a part-select at a nonzero bit offset).
 // Clotho synthesizes a temp net driven by the member and subscribes to it: the
@@ -291,4 +327,13 @@ TEST_CASE("event control on a dynamic element select") {
         endmodule
     )");
     CHECK(out == "cnt=2\n");
+}
+
+// Per-event `iff` in a multi-event list is not representable: the shared-wake
+// engine cannot tell which event fired to pick the matching guard, so it is
+// rejected loudly (LRM 9.4.2.3, documented gap).
+TEST_CASE("iff on a multi-event control is rejected") {
+    CHECK(reject("module m; logic a=0,b=0,en=0; int c=0; "
+                 "always @(posedge a iff en or posedge b) c++; endmodule")
+            .find("iff qualifier on a multi-event control") != std::string::npos);
 }

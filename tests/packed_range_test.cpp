@@ -328,15 +328,21 @@ TEST_CASE("fork..join_any / join_none are rejected, not serialized") {
     CHECK(reject(none).find("join_none") != std::string::npos);
 }
 
-TEST_CASE("iff qualifier on an event control is rejected, not dropped") {
+// The `iff` guard (LRM 9.4.2.3) must be honored, not dropped: a posedge with the
+// guard false does not run the body, one with it true does. (This construct was
+// formerly rejected; it is now lowered as `always @(ev) if (cond) body`.)
+TEST_CASE("iff qualifier on an event control gates the body, not dropped") {
     constexpr std::string_view src = R"(
         module t;
-            logic clk, en;
+            logic clk = 0, en = 0;
             always @(posedge clk iff en) $display("tick");
-            initial begin en = 0; clk = 0; #1 clk = 1; #1 $finish; end
+            initial begin
+                en = 0; clk = 1; #1 clk = 0; #1;   // guard false: no tick
+                en = 1; clk = 1; #1 clk = 0; #1;   // guard true: tick
+            end
         endmodule
     )";
-    CHECK(reject(src).find("iff qualifier") != std::string::npos);
+    CHECK(run_capture(src) == "tick\n");
 }
 
 TEST_CASE("behavior-bearing members are rejected, not dropped") {
