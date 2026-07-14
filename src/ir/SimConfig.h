@@ -62,6 +62,21 @@ struct SimulationConfig {
     // literal post-lowering IR identity, so semantics are byte-identical
     // either way. Disable for bisection / debugging.
     bool dedup = true;
+    // Under `split`: lower a cross-instance fused thunk group as per-member
+    // functions emitted into each member's own definition unit plus a root
+    // dispatcher calling them in rank order, so the member code is
+    // per-definition cacheable (the merged form lives in the always-
+    // recompiled root). Costs one call per member per activation. Disable
+    // for bisection; no effect with split off.
+    bool outline = true;
+    // Emit one llvm::Module per elaborated definition (unit = the definition
+    // state-struct identity) holding its single-scope process groups, plus a
+    // root module with everything else (state globals, scheduler machinery,
+    // functions/tasks, cross-instance groups, main). Prep for per-definition
+    // object caching; the JIT links the set into one dylib, so semantics are
+    // identical either way. Disable for bisection / debugging (one module,
+    // exactly the pre-split emission).
+    bool split = true;
     // Register LLVM's perf JITEventListener on the object-linking layer so the
     // JIT'd design's functions show up in `perf` with real symbols. Emits a
     // jitdump (`$JITDUMPDIR/jit-<pid>.dump`) consumed by `perf inject --jit`.

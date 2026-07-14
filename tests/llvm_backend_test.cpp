@@ -183,11 +183,13 @@ TEST_CASE("alu emits verifiable llvm ir") {
     // timing-wheel ptr, no coroutine. Under --no-thunk each is instead a
     // switched-resume coroutine ramp returning the handle (CoroSplit then emits
     // .resume/.destroy/.cleanup parts, which don't match "define ptr @alu.p").
-    CHECK(count_substr(ir, "define void @alu.p") == 3);
-    CHECK(count_substr(ir, ".thunk(") == 3);
+    CHECK(count_substr(ir, "define void @clotho.inst.alu.p") == 3);
+    // Definitions only: the root module's seed loop re-declares each thunk
+    // (split emission), and declarations print without argument names.
+    CHECK(count_substr(ir, ".thunk(ptr noalias %state") == 3);
     CHECK(ir.find("(ptr noalias %state, ptr %wheel)") != std::string::npos);
     const std::string co = emit(kAlu, { .thunk = false });
-    CHECK(count_substr(co, "define ptr @alu.p") == 3);
+    CHECK(count_substr(co, "define ptr @clotho.inst.alu.p") == 3);
     CHECK(co.find("(ptr %state, ptr %wheel)") != std::string::npos);
 
     // Datapath ops present.
@@ -195,9 +197,10 @@ TEST_CASE("alu emits verifiable llvm ir") {
     CHECK(ir.find(" sub ") != std::string::npos);
 
     // Signal access via constant typed GEPs, anchored at the owning instance
-    // scope: def-relative (%alu.state) off @clotho.state, folded link-time
-    // constant (asserted on raw IR; instcombine canonicalizes GEP shapes).
-    CHECK(raw.find("%alu.state, ptr @clotho.state") != std::string::npos);
+    // scope's own state global: def-relative (%alu.state) off
+    // @clotho.inst.alu.state, folded link-time constant (asserted on raw IR;
+    // instcombine canonicalizes GEP shapes).
+    CHECK(raw.find("%alu.state, ptr @clotho.inst.alu.state") != std::string::npos);
     CHECK(ir.find("store i16") != std::string::npos);
 
     // The if/else lowers to branches.
@@ -231,10 +234,10 @@ TEST_CASE("2-state vs 4-state widths") {
     CHECK(raw.find("@clotho.state = internal global") != std::string::npos);
     // z's must|may word is an i16 (2W = 16).
     CHECK(ir.find("store i16") != std::string::npos);
-    CHECK(ir.find("define ptr @m.") != std::string::npos);
+    CHECK(ir.find("define ptr @clotho.inst.m.p") != std::string::npos);
 }
 
-TEST_CASE("instance state structs compose nested and replicate per instantiation") {
+TEST_CASE("instance state structs replicate per instantiation as per-scope globals") {
     constexpr std::string_view src = R"(
         module leaf(input logic a, output logic [7:0] q);
             logic [7:0] cnt;
@@ -250,14 +253,21 @@ TEST_CASE("instance state structs compose nested and replicate per instantiation
     )";
     const std::string          raw = emit_raw(src);
 
-    // One state struct per module definition; the parent embeds one field per
-    // child instance (two %leaf.state replicas), and the root composes the top
-    // instance plus the NBA shadow region. No z sources → every slot elided.
-    // Named-type layout survives only in the raw IR (the optimizer drops it).
+    // One state struct per module definition holding its OWN signals only;
+    // each instance scope owns a separate state global of that type (two
+    // %leaf.state globals for the two instances), and the standalone NBA
+    // shadow global carries the staging fields. No z sources → every slot
+    // elided. Named-type layout survives only in the raw IR (the optimizer
+    // drops it).
     CHECK(raw.find("%leaf.state = type { %logic.nz.1, %logic.nz.8, %logic.nz.8 }") != std::string::npos);
-    CHECK(raw.find("%top.state = type { %logic.nz.1, %logic.nz.8, %logic.nz.8, %leaf.state, %leaf.state }") !=
-          std::string::npos);
-    CHECK(raw.find("%clotho.state = type { %top.state, %clotho.nba.shadow }") != std::string::npos);
+    CHECK(raw.find("%top.state = type { %logic.nz.1, %logic.nz.8, %logic.nz.8 }") != std::string::npos);
+    // Referenced from the definition-unit modules, so the split emission
+    // promotes them out of internal linkage (plain external `global`).
+    CHECK(raw.find("@clotho.inst.top.state = dso_local global %top.state") != std::string::npos);
+    CHECK(raw.find("@clotho.inst.top.u0.state = dso_local global %leaf.state") != std::string::npos);
+    CHECK(raw.find("@clotho.inst.top.u1.state = dso_local global %leaf.state") != std::string::npos);
+    CHECK(raw.find("@clotho.inst.top.u0.shadow = internal global %leaf.state.shadow") != std::string::npos);
+    CHECK(raw.find("@clotho.inst.top.u1.shadow = internal global %leaf.state.shadow") != std::string::npos);
     // Exactly one definition of the leaf struct type (deduplicated, no .0 clone).
     CHECK(raw.find("%leaf.state.0") == std::string::npos);
 }
@@ -985,11 +995,13 @@ TEST_CASE("event waits emit wait queues, always loops, and queue servicing") {
     // doubled's dynamic any-change bucket (with a length). Each queue is named for
     // its edge and emitted only when used; the per-process scheduled-flag array
     // backs the wake-once dedup.
-    CHECK(ir.find("@clotho.wait.clk.sta.pos = internal global") != std::string::npos);
-    CHECK(ir.find("@clotho.wait.d.sta.any = internal global") != std::string::npos);
-    CHECK(ir.find("@clotho.wait.q.sta.any = internal global") != std::string::npos);
-    CHECK(ir.find("@clotho.wait.doubled.dyn.any = internal global") != std::string::npos);
-    CHECK(ir.find("@clotho.wait.doubled.dyn.any.len = internal global") != std::string::npos);
+    // Root-defined, promoted to external (dso_local) linkage where the
+    // definition-unit module's bodies reference them (split emission).
+    CHECK(ir.find("@clotho.wait.clk.sta.pos = dso_local global") != std::string::npos);
+    CHECK(ir.find("@clotho.wait.d.sta.any = dso_local global") != std::string::npos);
+    CHECK(ir.find("@clotho.wait.q.sta.any = dso_local global") != std::string::npos);
+    CHECK(ir.find("@clotho.wait.doubled.dyn.any = dso_local global") != std::string::npos);
+    CHECK(ir.find("@clotho.wait.doubled.dyn.any.len = dso_local global") != std::string::npos);
     CHECK(ir.find("@clotho.proc_sched = internal global") != std::string::npos);
     // Both always blocks are suspension-free, so by default they lower to plain
     // per-activation thunks (no forever wait loop); servicing still has a static
@@ -999,7 +1011,7 @@ TEST_CASE("event waits emit wait queues, always loops, and queue servicing") {
     const std::string raw = emit_raw(src);
     CHECK(raw.find("sta.head") != std::string::npos);
     CHECK(raw.find("dyn.head") != std::string::npos);
-    CHECK(count_substr(raw, ".thunk(") == 2);
+    CHECK(count_substr(raw, ".thunk(ptr noalias %state") == 2);
     CHECK(raw.find("always.loop") == std::string::npos);
     CHECK(emit_raw(src, { .thunk = false }).find("always.loop") != std::string::npos);
 }
@@ -1322,12 +1334,14 @@ TEST_CASE("repeated instantiation emits distinct process symbols") {
     // per-instance clk locals and stay separate. 6 processes emit as 5 distinct
     // @top.p<N> units. All are suspension-free, so by default they are thunks
     // (the fused pair is `.f2.thunk`); under --no-thunk they are coroutine ramps.
-    CHECK(count_substr(ir, "define void @top.p") == 5);
-    CHECK(count_substr(ir, ".thunk(") == 5);
-    CHECK(count_substr(ir, ".f2.thunk(") == 1);
+    // Definitions only (split emission re-declares cross-module symbols;
+    // declarations and calls print without argument names).
+    CHECK(count_substr(ir, "define void @clotho.inst.top.") == 5);
+    CHECK(count_substr(ir, ".thunk(ptr noalias %state") == 5);
+    CHECK(count_substr(ir, ".f2.thunk(ptr noalias %state") == 1);
     const std::string co = emit(src, { .thunk = false });
-    CHECK(count_substr(co, "define ptr @top.p") == 5);
-    CHECK(count_substr(co, ".f2(") == 1);
+    CHECK(count_substr(co, "define ptr @clotho.inst.top.") == 5);
+    CHECK(count_substr(co, ".f2(ptr %state") == 1);
 }
 
 // Regression: a single-operand concat ({x}) and a single replication ({1{x}})
@@ -2973,9 +2987,10 @@ TEST_CASE("whole-scalar NBAs lower to the block-commit path by default") {
     CHECK(ir.find("clotho.nba_block_enqueue") != std::string::npos);
     CHECK(ir.find("clotho.nba.commit_blk0") != std::string::npos);
     CHECK(ir.find("clotho.nba.w4.full") == std::string::npos);
-    // Shadow accesses go through the opaque base, not state-relative constant
-    // offsets (memory-dependence mis-speculation defense; see shadow_ptr).
-    CHECK(ir.find("clotho.nba.shadow_base") != std::string::npos);
+    // Shadow accesses go through the owning instance's opaque base pointer,
+    // not state-relative constant offsets (memory-dependence mis-speculation
+    // defense; see shadow_ptr).
+    CHECK(ir.find("clotho.inst.m.shadow_base") != std::string::npos);
     CHECK(run_capture(src) == "zz01 0101\n");
 }
 
@@ -3642,8 +3657,8 @@ TEST_CASE("identical-sensitivity clocked processes fuse and stay correct") {
     CHECK(run_capture(src) == "211 112 121\n");
     // All three lower into one fused unit: a thunk by default (suspension-free),
     // a coroutine under --no-thunk.
-    CHECK(count_substr(emit(src), ".f3.thunk(") == 1);
-    CHECK(count_substr(emit(src, { .thunk = false }), ".f3(") == 1);
+    CHECK(count_substr(emit(src), ".f3.thunk(ptr noalias %state") == 1);
+    CHECK(count_substr(emit(src, { .thunk = false }), ".f3(ptr %state") == 1);
 }
 
 TEST_CASE("thunk lowering: eligibility matrix and coroutine equivalence") {
@@ -3664,7 +3679,7 @@ TEST_CASE("thunk lowering: eligibility matrix and coroutine equivalence") {
     )";
     // Exactly the two simple always blocks become thunks; the two non-elidable
     // always blocks and the initial stay coroutines.
-    CHECK(count_substr(emit(src), ".thunk(") == 2);
+    CHECK(count_substr(emit(src), ".thunk(ptr noalias %state") == 2);
     // Under --no-thunk nothing elides, and there are strictly more coroutine
     // frames (the two simple procs are coroutines again).
     CHECK(count_substr(emit(src, { .thunk = false }), ".thunk(") == 0);
