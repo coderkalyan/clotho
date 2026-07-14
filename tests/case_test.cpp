@@ -1255,3 +1255,64 @@ TEST_CASE("case: a run that dedups to zero arms falls through correctly") {
     )";
     CHECK(run_capture(src) == "F\nF\nF\nF\nF\nF\nF\nF\nF\nR\n");
 }
+
+// type() (LRM 6.23): a type reference is a compile-time-only marker, legal
+// only in an equality comparison with another type reference or as a case
+// selector/item. Resolved entirely at lowering time (Type::isMatching), not
+// through the runtime packed-comparison path.
+TEST_CASE("type() equality and inequality comparisons") {
+    constexpr std::string_view src = R"(
+        module m;
+            bit [12:0] a;
+            real r;
+            initial begin
+                if (type(a) == type(bit[12:0])) $display("eq-same"); else $display("eq-diff");
+                if (type(a) == type(r)) $display("eq-same"); else $display("eq-diff");
+                if (type(a) != type(r)) $display("ne-diff"); else $display("ne-same");
+                // byte is `bit signed [7:0]` (LRM 6.11.1) -- matches only the
+                // signed form, not plain (unsigned) bit[7:0].
+                if (type(bit[7:0]) == type(byte)) $display("eq-same"); else $display("eq-diff");
+                if (type(bit signed [7:0]) == type(byte)) $display("eq-same"); else $display("eq-diff");
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "eq-same\neq-diff\nne-diff\neq-diff\neq-same\n");
+}
+
+// LRM 6.23's own example shape: a parameter type resolved via type(), dispatched
+// through a `case (type(...))` selector.
+TEST_CASE("case statement over type() selects the matching type item") {
+    constexpr std::string_view src = R"(
+        module m #(parameter type T = int) ();
+            initial begin
+                case (type(T))
+                    type(bit[12:0]): $display("bit12");
+                    type(real):      $display("real");
+                    default:         $display("other");
+                endcase
+            end
+        endmodule
+        module top;
+            m #(.T(bit[12:0])) u1();
+            m #(.T(real)) u2();
+            m #(.T(int)) u3();
+        endmodule
+    )";
+    CHECK(run_capture(src) == "bit12\nreal\nother\n");
+}
+
+// No matching item and no default: the case statement is a no-op (mirrors
+// plain-value case semantics), not a loud failure.
+TEST_CASE("case statement over type() with no match and no default is a no-op") {
+    constexpr std::string_view src = R"(
+        module m;
+            initial begin
+                case (type(int))
+                    type(real): $display("real");
+                endcase
+                $display("done");
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "done\n");
+}
