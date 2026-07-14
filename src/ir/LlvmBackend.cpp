@@ -4,6 +4,7 @@
 #include <array>
 #include <bit>
 #include <cassert>
+#include <chrono>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -28,6 +29,7 @@
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/MDBuilder.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/ModuleSlotTracker.h>
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Passes/PassBuilder.h>
@@ -4318,11 +4320,16 @@ private:
     // per-instance bake the def-relative families missed; sharing must not
     // proceed past a DIFF. Only singleton fusion groups compare — a fused
     // function mixes members, so per-process comparison is meaningless there.
-    static std::string normalize_shape(llvm::Function* fn) {
+    static std::string normalize_shape(llvm::Function* fn, llvm::ModuleSlotTracker* mst = nullptr) {
         std::string raw;
         {
             llvm::raw_string_ostream os(raw);
-            fn->print(os);
+            if (mst != nullptr) {
+                // Function::print(OS, AAW*) hides Value's slot-tracker overload.
+                fn->Value::print(os, *mst);
+            } else {
+                fn->print(os);
+            }
         }
         const auto ident = [](char c) {
             return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
@@ -4532,11 +4539,30 @@ private:
     // finalize_block_nba / emit_main (nothing reads group function bodies,
     // only their addresses). Disabled by --no-dedup.
     void share_twin_groups(const std::vector<llvm::Function*>& group_fns) {
+        const auto t0 = std::chrono::steady_clock::now();
+        uint64_t   eligible = 0;
         struct Cand {
             uint32_t              g;
             llvm::GlobalVariable* ctx;
         };
-        ankerl::unordered_dense::map<std::string, std::vector<Cand>> buckets;
+        // Cheap structural pre-key: definition identity (ctx type) and size
+        // counts — NOT the def-local ordinal: twins whose ordinal never
+        // reaches the IR (no NBA block, sched constant equal by shape) may
+        // share across ordinals, and shape equality is the actual gate. Only
+        // pre-buckets of >= 2 pay the IR print — a singleton can share with
+        // nothing.
+        struct PreKey {
+            const void* ctx_ty;
+            uint64_t    sizes;
+            bool        operator==(const PreKey&) const = default;
+        };
+        struct PreKeyHash {
+            uint64_t operator()(const PreKey& k) const {
+                return ankerl::unordered_dense::detail::wyhash::hash(
+                  reinterpret_cast<uintptr_t>(k.ctx_ty) ^ k.sizes);
+            }
+        };
+        ankerl::unordered_dense::map<PreKey, std::vector<Cand>, PreKeyHash> pre;
         for (uint32_t g = 0; g < groups_.size(); ++g) {
             if (!thunk_group_[g] || group_anchor_of_[g] == SignalSlot::no_anchor) {
                 continue;
@@ -4549,8 +4575,26 @@ private:
             if (ctx == nullptr || ctx != anchors_[group_anchor_of_[g]].ctx_gv) {
                 continue;
             }
-            buckets[normalize_shape(fn)].push_back({ g, ctx });
+            ++eligible;
+            uint64_t insts = 0, bbs = 0;
+            for (const llvm::BasicBlock& bb : *fn) {
+                ++bbs;
+                insts += bb.size();
+            }
+            const Anchor& a = anchors_[group_anchor_of_[g]];
+            pre[PreKey{ a.ctx_ty, bbs << 24 | insts << 40 }].push_back({ g, ctx });
         }
+        llvm::ModuleSlotTracker mst(&llmod_, /*ShouldInitializeAllMetadata=*/false);
+        ankerl::unordered_dense::map<std::string, std::vector<Cand>> buckets;
+        for (auto& [pk, cs] : pre) {
+            if (cs.size() < 2) {
+                continue;
+            }
+            for (const Cand& c : cs) {
+                buckets[normalize_shape(group_fns[c.g], &mst)].push_back(c);
+            }
+        }
+        const auto t1 = std::chrono::steady_clock::now();
         uint64_t sets = 0, members = 0;
         for (auto& [shape, cs] : buckets) {
             if (cs.size() < 2) {
@@ -4564,8 +4608,15 @@ private:
             }
         }
         if (std::getenv("CLOTHO_DEDUP_STAT") != nullptr) {
-            std::fprintf(stderr, "dedup-share: %llu bodies -> %llu shared\n",
-                         (unsigned long long)members, (unsigned long long)sets);
+            const auto t2 = std::chrono::steady_clock::now();
+            const auto ms = [](auto d) {
+                return std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
+            };
+            std::fprintf(stderr,
+                         "dedup-share: %llu bodies -> %llu shared (%llu eligible; bucket %lld ms, "
+                         "rewrite %lld ms)\n",
+                         (unsigned long long)members, (unsigned long long)sets,
+                         (unsigned long long)eligible, (long long)ms(t1 - t0), (long long)ms(t2 - t1));
         }
     }
 
