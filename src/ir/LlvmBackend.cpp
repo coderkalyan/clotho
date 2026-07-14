@@ -12328,7 +12328,18 @@ private:
         const uint32_t w    = width_of(a);
 
         // 2-state: a single native op on the value; no X rule, no plane duplication.
-        if (a.two) {
+        // Both operands must be 2-state for this -- a 4-state/2-state mix (LRM
+        // 5.7: any 4-state operand makes the result 4-state) still needs the
+        // packed-plane path below, which assumes both operands already arrived
+        // as i(2W) (xz_mask reads a.mm/b.mm raw, not through must_of/may_of).
+        // Promote the narrower side instead of trusting the dispatch on `a`
+        // alone -- a mismatched-domain pair here is malformed LLVM IR (an i(2W)
+        // vs iW operand pair), not just a wrong answer.
+        if (a.two && !b.two) {
+            a = to_four(a);
+        } else if (!a.two && b.two) {
+            b = to_four(b);
+        } else if (a.two) {
             switch (tag) {
                 case Inst::Tag::Add: return two_val(b_.CreateAdd(a.mm, b.mm));
                 case Inst::Tag::Sub: return two_val(b_.CreateSub(a.mm, b.mm));
@@ -12404,7 +12415,20 @@ private:
         // the divisor to avoid poison, then select 0 on a zero divisor. Signed
         // INT_MIN / -1 is also poison, patched to the wrapped value like the
         // 4-state path.
-        if (a.two) {
+        //
+        // Both operands must be 2-state for this fast path -- a 4-state/2-state
+        // mix (LRM 5.7: any 4-state operand makes the result 4-state) still
+        // needs the packed-plane path below, which assumes both operands
+        // already arrived as i(2W) (xz_mask reads a.mm/b.mm raw). Promote the
+        // narrower side instead of trusting the dispatch on `a` alone -- a
+        // mismatched-domain pair here is malformed LLVM IR (an i(2W) vs iW
+        // operand to the same icmp/select), observed to crash inside LLVM's
+        // constant folder rather than just miscompile.
+        if (a.two && !b.two) {
+            a = to_four(a);
+        } else if (!a.two && b.two) {
+            b = to_four(b);
+        } else if (a.two) {
             llvm::Value* dz = b_.CreateICmpEQ(b.mm, zero(w));
             llvm::Value* r;
             if (!sign) {
@@ -12638,8 +12662,18 @@ private:
     Plane lower_bitwise(Inst::Tag tag, Plane a, Plane b) {
         const uint32_t w = width_of(a);
 
-        // 2-state: one native bitwise op; xnor is ~(xor).
-        if (a.two) {
+        // 2-state: one native bitwise op; xnor is ~(xor). Both operands must be
+        // 2-state for this -- a 4-state/2-state mix (LRM 5.7: any 4-state
+        // operand makes the result 4-state) still needs the packed-plane path
+        // below, which assumes both operands already arrived as i(2W). Promote
+        // the narrower side instead of trusting the dispatch on `a` alone -- a
+        // mismatched-domain pair here is malformed LLVM IR, not just a wrong
+        // answer.
+        if (a.two && !b.two) {
+            a = to_four(a);
+        } else if (!a.two && b.two) {
+            b = to_four(b);
+        } else if (a.two) {
             switch (tag) {
                 case Inst::Tag::Band:  return two_val(b_.CreateAnd(a.mm, b.mm));
                 case Inst::Tag::Bor:   return two_val(b_.CreateOr(a.mm, b.mm));

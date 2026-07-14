@@ -424,3 +424,42 @@ TEST_CASE("a 2-state NBA clock fires posedge and negedge waiters") {
     )");
     CHECK(out == "pos=3 neg=3\n");
 }
+
+// Regression: lower_arith/lower_divmod/lower_bitwise dispatched their native
+// (2-state) fast path solely on the LEFT operand's domain (`if (a.two)`),
+// blindly using the right operand's .mm as if it were also a bare iW value.
+// A 2-state left operand (`int`) mixed with a 4-state right operand (`logic`)
+// fed an i(2W) value where an iW was assumed (or vice versa): malformed LLVM
+// IR (mismatched-width icmp/select/binop operands), which crashed inside
+// LLVM's constant folder for a large enough design (sv-tests ivtest
+// comp1000/comp1001) rather than just miscompiling. Verified vs iverilog 13.
+TEST_CASE("arithmetic/bitwise ops mix a 2-state and a 4-state operand correctly") {
+    const std::string out = run_capture(R"(
+        module m;
+            int a;
+            logic [7:0] b;
+            initial begin
+                a = 17;
+                b = 5;
+                $display("%0d %0d %0d %0d %0d %0d %0d", a % b, a / b, a & b, a | b, a ^ b,
+                         a + b, a - b);
+            end
+        endmodule
+    )");
+    CHECK(out == "2 3 1 21 20 22 12\n");
+}
+
+TEST_CASE("arithmetic/bitwise ops mix a 4-state left operand with a 2-state right operand") {
+    const std::string out = run_capture(R"(
+        module m;
+            logic [7:0] a;
+            int b;
+            initial begin
+                a = 17;
+                b = 5;
+                $display("%0d %0d %0d %0d %0d", a % b, a / b, a & b, a | b, a ^ b);
+            end
+        endmodule
+    )");
+    CHECK(out == "2 3 1 21 20\n");
+}
