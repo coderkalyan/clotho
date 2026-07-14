@@ -312,6 +312,30 @@ TEST_CASE("a partial driver on a tri0 vector pulls the undriven bits") {
     CHECK(out == "0000\n0011\n");
 }
 
+// A gate primitive driving a multiply-driven net stages into a per-driver slot
+// and folds through the wire resolver, like a continuous assign (ivtest
+// many_drivers). A buf treats a z input as x (LRM Table 28-3), so an all-z input
+// blends to x, not z. Oracle: iverilog 13.
+TEST_CASE("gate primitives resolve as drivers of a multiply-driven net") {
+    const std::string out = run_capture(R"(
+        module top;
+          reg [2:0] in;
+          wire      out;
+          buf (out, in[0]);
+          buf (out, in[1]);
+          buf (out, in[2]);
+          initial begin
+            in = 3'b000; #1; $display("%b", out); // all agree 0
+            in = 3'b111; #1; $display("%b", out); // all agree 1
+            in = 3'b010; #1; $display("%b", out); // 0 vs 1 conflict -> x
+            in = 3'bzzz; #1; $display("%b", out); // buf(z)=x, all x -> x
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "0\n1\nx\nx\n");
+}
+
 // -- Loud-failure guards for the shapes V2 does not resolve --
 
 TEST_CASE("an unpacked-array-element driver of a resolved net fails loudly") {

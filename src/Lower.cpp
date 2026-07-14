@@ -3237,15 +3237,6 @@ private:
             }
             return;
         }
-        for (const Expression* out : output_span) {
-            if (out->kind == ExpressionKind::Assignment &&
-                resolved_net_of(out->as<AssignmentExpression>().left())) {
-                // TODO: fold gate outputs into WireRes resolution (they already
-                // produce a 1-bit logic value, like a continuous assign).
-                fail("gate primitive driving a multiply-driven net is not supported");
-            }
-        }
-
         std::vector<GateInput> inputs;
         inputs.reserve(input_span.size());
         for (size_t i = 0; i < input_span.size(); ++i) {
@@ -3254,15 +3245,38 @@ private:
 
         const ir::SourceLoc loc = to_source_loc(gi.location);
         for (const Expression* out : output_span) {
-            emit_gate_as_process(*op, lower_gate_output(*out), inputs, loc);
+            // A gate output is always an AssignmentExpression (lower_gate_output
+            // enforces this); its left() is the driven lvalue. When that lvalue is
+            // a multiply-driven net, stage into a per-driver slot so the net's
+            // resolver folds it against the other drivers, else store directly.
+            const Expression& left = out->as<AssignmentExpression>().left();
+            if (const std::optional<ir::Signal> net = resolved_net_of(left)) {
+                emit_gate_resolved_driver(*op, left, inputs, *net, loc);
+            } else {
+                emit_gate_as_process(*op, lower_gate_output(*out), inputs, loc);
+            }
         }
     }
 
-    // Lower one gate output as a continuous-assign process: fold inputs with the
-    // gate operation, store to the output bit, subscribe to input signal changes.
-    void emit_gate_as_process(GateOp op, GateTerm output,
-                              std::span<const GateInput> inputs, ir::SourceLoc l) {
-        ir::Builder   b(module_.pool);
+    // lvalue for bit `bit` of `sig`: direct for a 1-bit signal, BitSelect for a
+    // bit of a wider packed signal. Shared by gate input loads and output stores.
+    ir::Index gate_bit_lvalue(ir::Signal sig, uint32_t bit, ir::Builder& b, ir::SourceLoc l) {
+        ir::Index s = b.signal(sig, l);
+        if (module_.pool.layout(module_.signal(sig).type).width == 1) {
+            return s;
+        }
+        const ir::Ref u32 = make_int_type(32, false, false);
+        return b.binary(ir::Inst::Tag::BitSelect, s,
+                        b.constant(module_.pool.put_int(u32, bit), l), l);
+    }
+
+    // Fold the gate inputs with its binary operation into a 1-bit logic value and
+    // collect the any-change sensitivity over the non-const input signals (into
+    // `wait_events`). Shared by the direct-store path (emit_gate_as_process) and
+    // the resolved-net driver path (emit_gate_resolved_driver).
+    ir::Index gate_folded_value(GateOp op, std::span<const GateInput> inputs,
+                                std::vector<ir::WaitEvent>& wait_events, ir::Builder& b,
+                                ir::SourceLoc l) {
         const ir::Ref logic1 = module_.pool.logic_type;
 
         // Intern a 1-bit logic constant from a gate const_code (must=bit0, may=bit1).
@@ -3279,24 +3293,12 @@ private:
             }
         };
 
-        // lvalue for bit `bit` of `sig`: direct for a 1-bit signal, BitSelect
-        // for a bit of a wider packed signal.
-        const ir::Ref u32 = make_int_type(32, false, false);
-        auto bit_lv = [&](ir::Signal sig, uint32_t bit) -> ir::Index {
-            ir::Index s = b.signal(sig, l);
-            if (module_.pool.layout(module_.signal(sig).type).width == 1) {
-                return s;
-            }
-            return b.binary(ir::Inst::Tag::BitSelect, s,
-                            b.constant(module_.pool.put_int(u32, bit), l), l);
-        };
-
-        // Fold inputs using the gate's binary operation.
         std::optional<ir::Index> acc;
         const ir::Inst::Tag      fold = gate_fold_tag(op);
         for (const GateInput& in : inputs) {
-            ir::Index val = in.is_const ? make_gate_const(in.const_code)
-                                        : b.unary(ir::Inst::Tag::Load, bit_lv(in.sig, in.bit), l);
+            ir::Index val = in.is_const
+                              ? make_gate_const(in.const_code)
+                              : b.unary(ir::Inst::Tag::Load, gate_bit_lvalue(in.sig, in.bit, b, l), l);
             acc = acc ? b.binary(fold, *acc, val, l) : val;
         }
         if (!acc) {
@@ -3306,19 +3308,58 @@ private:
         }
         if (gate_inverted(op)) {
             acc = b.unary(ir::Inst::Tag::Bnot, *acc, l);
+        } else if (inputs.size() == 1) {
+            // A gate primitive never outputs z: a z input is treated as x (LRM
+            // Table 28-3). Multi-input folds (Band/Bor/Bxor) and the inverting
+            // Bnot already clear the z plane, but a single-input non-inverting
+            // buf/and passes the loaded value through unchanged — so its z plane
+            // survives and the resolver would mistake the driver for undriven.
+            // AND with 1 forces z to x (a no-op the z-elision pass removes when
+            // the input provably carries no z).
+            acc = b.binary(ir::Inst::Tag::Band, *acc, b.constant(module_.pool.put_int(logic1, 1), l), l);
         }
 
-        b.binary(ir::Inst::Tag::Store, bit_lv(output.sig, output.bit),
-                 b.resize(*acc, logic1, l), l);
-
         // Sensitivity: unique non-const input signals, any-change.
-        std::vector<ir::WaitEvent>                      wait_events;
-        ankerl::unordered_dense::set<uint32_t>          seen;
+        ankerl::unordered_dense::set<uint32_t> seen;
         for (const GateInput& in : inputs) {
             if (!in.is_const && seen.insert(static_cast<uint32_t>(in.sig)).second) {
                 wait_events.push_back(ir::WaitEvent{ .signal = in.sig, .edge = ir::Edge::Any });
             }
         }
+        return b.resize(*acc, logic1, l);
+    }
+
+    // Lower one gate output as a continuous-assign process: fold inputs with the
+    // gate operation, store to the output bit, subscribe to input signal changes.
+    void emit_gate_as_process(GateOp op, GateTerm output,
+                              std::span<const GateInput> inputs, ir::SourceLoc l) {
+        ir::Builder                b(module_.pool);
+        std::vector<ir::WaitEvent> wait_events;
+        const ir::Index            val = gate_folded_value(op, inputs, wait_events, b, l);
+        b.binary(ir::Inst::Tag::Store, gate_bit_lvalue(output.sig, output.bit, b, l), val, l);
+        add_continuous_process(std::move(wait_events), l, b);
+    }
+
+    // Lower one gate output that drives a multiply-driven (resolved) net: fold the
+    // inputs like a normal gate, but stage the 1-bit result into this driver's own
+    // slot (whole net, or a constant sub-range with a Z background) so the net's
+    // resolver folds it against the other drivers — exactly like a resolved
+    // continuous assign (emit_resolved_driver). `left` is the output lvalue.
+    void emit_gate_resolved_driver(GateOp op, const Expression& left,
+                                   std::span<const GateInput> inputs, ir::Signal net,
+                                   ir::SourceLoc l) {
+        if (!left.type->isFourState()) {
+            // Mirrors lower_gate_output: a gate can drive X, which a 2-state slot
+            // cannot hold. TODO: gate outputs on 2-state nets need an X-coercion
+            // policy (and build_driver_slot_value already rejects 2-state partials).
+            fail("gate output on a 2-state net is not supported");
+        }
+        ir::Builder                b(module_.pool);
+        std::vector<ir::WaitEvent> wait_events;
+        const ir::Index            folded = gate_folded_value(op, inputs, wait_events, b, l);
+        const ir::Index            val    = build_driver_slot_value(net, left, folded, b, l);
+        const ir::Signal           slot   = alloc_driver_slot(net, l);
+        b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
         add_continuous_process(std::move(wait_events), l, b);
     }
 
