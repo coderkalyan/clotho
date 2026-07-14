@@ -1457,3 +1457,45 @@ TEST_CASE("a source with only a $unit-scope declaration compiles successfully") 
     CHECK_MESSAGE(r.ok, r.diagnostics);
     CHECK(r.module != nullptr);
 }
+
+// Regression: a bit-stream cast of a dynamic array to a packed vector
+// (`byte_vector'(a)`) fell through to the plain scalar `coerce`/resize path,
+// which silently produced the wrong value for a variable operand and
+// SIGSEGV'd for a function-call operand (the call's temporary dynamic-array
+// return handle). Neither is implemented (LRM 6.24.2 needs an element-wise
+// pack of the heap contents); guard loudly instead of miscompiling or
+// crashing. Fixes the sv-tests ivtest sv_darray_function crash.
+TEST_CASE("bit-stream cast of a dynamic array to a packed type fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            typedef logic [7:0] byte_array [];
+            typedef logic [23:0] byte_vector;
+            byte_vector c;
+            byte_array a;
+            initial begin
+                a = new[3];
+                c = byte_vector'(a);
+            end
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("bit-stream cast") != std::string::npos);
+}
+
+TEST_CASE("bit-stream cast of a dynamic-array-returning call fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            typedef logic [7:0] byte_array [];
+            typedef logic [23:0] byte_vector;
+            function byte_array make();
+                byte_array tmp;
+                tmp = new[3];
+                return tmp;
+            endfunction
+            byte_vector c;
+            initial c = byte_vector'(make());
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("bit-stream cast") != std::string::npos);
+}

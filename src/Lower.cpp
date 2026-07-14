@@ -7388,6 +7388,15 @@ private:
                         cv.operand().as<StreamingConcatenationExpression>(),
                         lower_type(*expr.type), b, l);
                 }
+                if (is_handle_expr(cv.operand()) && !expr.type->getCanonicalType().isUnpackedArray()) {
+                    // TODO: bit-stream cast from a dynamic array / queue to a
+                    // packed type (LRM 6.24.2) -- needs an element-wise pack of
+                    // the runtime handle's heap contents, not a plain integer
+                    // coerce/resize (which silently produced the wrong value
+                    // for a variable operand, and crashed for a call operand's
+                    // temporary return handle).
+                    fail("bit-stream cast from a dynamic array or queue to a packed type is not supported");
+                }
                 return coerce(lower_expr(cv.operand(), b), *cv.operand().type, lower_type(*expr.type), b, l);
             }
             case ExpressionKind::Call: {
