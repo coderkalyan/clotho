@@ -382,3 +382,62 @@ TEST_CASE("dynamic array $size") {
     )";
     CHECK(run_capture(src) == "5\n");
 }
+
+// Regression: a dynamic-array declaration initializer used to lower a `{...}`
+// or `'{...}` literal as a plain packed bit-concat and Store it raw into the
+// {ptr,len} handle slot -- an out-of-bounds write past the 16-byte handle that
+// corrupted adjacent global state (SIGSEGV). Verified vs iverilog 13.
+TEST_CASE("dynamic array decl initializer from a bare concatenation literal") {
+    constexpr std::string_view src = R"(
+        module m;
+            int ia[] = {4,5,3,1};
+            initial $display("%0d %0d %0d %0d", ia[0], ia[1], ia[2], ia[3]);
+        endmodule
+    )";
+    CHECK(run_capture(src) == "4 5 3 1\n");
+}
+
+TEST_CASE("dynamic array decl initializer from a '{...} pattern literal") {
+    constexpr std::string_view src = R"(
+        module m;
+            int ia[] = '{4,5,3,1};
+            initial $display("%0d %0d %0d %0d", ia[0], ia[1], ia[2], ia[3]);
+        endmodule
+    )";
+    CHECK(run_capture(src) == "4 5 3 1\n");
+}
+
+TEST_CASE("dynamic array decl initializer copied from another dynamic array is a deep copy") {
+    constexpr std::string_view src = R"(
+        module m;
+            int src[] = '{7,8,9};
+            int ia[] = src;
+            initial $display("%0d %0d %0d %0d %0d", ia.size(), ia[0], ia[1], ia[2], src[0]);
+        endmodule
+    )";
+    CHECK(run_capture(src) == "3 7 8 9 7\n");
+}
+
+TEST_CASE("queue decl initializer from a bare concatenation literal") {
+    constexpr std::string_view src = R"(
+        module m;
+            int q[$] = {4,5,3,1};
+            initial $display("%0d %0d %0d %0d %0d", q.size(), q[0], q[1], q[2], q[3]);
+        endmodule
+    )";
+    CHECK(run_capture(src) == "4 4 5 3 1\n");
+}
+
+// Fixed-size unpacked array of scalar elements: the same decl-initializer gap
+// previously silently mis-lowered the packed-concat bit order into the flat
+// array storage (ia[0] printed 1 instead of 4) instead of crashing -- a
+// silent miscompile, now closed by the same fix.
+TEST_CASE("fixed-size unpacked array decl initializer from a bare concatenation literal") {
+    constexpr std::string_view src = R"(
+        module m;
+            int ia[4] = {4,5,3,1};
+            initial $display("%0d %0d %0d %0d", ia[0], ia[1], ia[2], ia[3]);
+        endmodule
+    )";
+    CHECK(run_capture(src) == "4 5 3 1\n");
+}

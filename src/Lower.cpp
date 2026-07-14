@@ -1135,6 +1135,20 @@ private:
         return false;
     }
 
+    // True if a type is a fixed-size unpacked array, dynamic array, or queue: the
+    // remaining unpacked container shapes (scalar-element, so not is_aggregate)
+    // whose declaration initializer must route through the same element-wise /
+    // handle-aware emit_agg_store path as a struct-bearing aggregate, rather than
+    // the plain scalar Store fallback (which mis-lowers a `'{...}` or bare `{...}`
+    // literal, or a copy from another handle variable, into a raw bit-blast over
+    // the container's handle/flat storage).
+    static bool is_unpacked_container(const slang::ast::Type& t) {
+        const slang::ast::Type& ct = t.getCanonicalType();
+        return ct.as_if<slang::ast::FixedSizeUnpackedArrayType>() != nullptr ||
+               ct.as_if<slang::ast::DynamicArrayType>() != nullptr ||
+               ct.as_if<slang::ast::QueueType>() != nullptr;
+    }
+
     // Store a whole unpacked struct: one blocking store per member (the aggregate
     // has no flat value, so a whole-object copy decomposes field-wise). `lhs_base`
     // is the struct's lvalue; `sty` its interned Kind::Struct type. The RHS is
@@ -1235,10 +1249,27 @@ private:
     // follow-up), so nesting is struct-through-struct here.
     void emit_agg_store(ir::Index lhs, ir::Ref type, const Expression& rhs,
                         ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
-        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
-        if (const auto* pat = as_assignment_pattern(rhs)) {
-            const auto elems = pat->elements();
+        const ir::Type& t   = std::get<ir::Type>(module_.pool.get(type));
+        const auto*     pat = as_assignment_pattern(rhs);
+        // A bare `{...}` concatenation literal targeting a queue / dynamic array /
+        // fixed unpacked array is an unpacked-array concatenation (LRM 11.4.14),
+        // not a packed bit-concat — slang already resolved the expression's own
+        // type to the unpacked target, so it is positional like a `'{...}`
+        // pattern and only differs in the element-span accessor.
+        const bool is_concat_literal =
+            pat == nullptr && rhs.kind == ExpressionKind::Concatenation && rhs.type->isUnpackedArray();
+        if (pat != nullptr || is_concat_literal) {
+            const auto elems =
+                pat != nullptr ? pat->elements() : rhs.as<ConcatenationExpression>().operands();
+            const uint32_t reps =
+                pat != nullptr && rhs.kind == ExpressionKind::ReplicatedAssignmentPattern
+                    ? static_cast<uint32_t>(
+                          const_uint(rhs.as<ReplicatedAssignmentPatternExpression>().count()))
+                    : 1;
             if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
+                if (pat == nullptr) {
+                    fail("unpacked concatenation literal into a struct is not supported");
+                }
                 // Re-fetch each row: lowering an element expression can intern a
                 // new struct's field table, which invalidates a held
                 // struct_fields span (see InternPool::struct_fields).
@@ -1250,14 +1281,9 @@ private:
                 return;
             }
             if (t.kind == ir::Type::Kind::UnpackedArray) {
-                const bool     keyed = rhs.kind == ExpressionKind::StructuredAssignmentPattern;
+                const bool     keyed = pat != nullptr && rhs.kind == ExpressionKind::StructuredAssignmentPattern;
                 const uint32_t n     = static_cast<uint32_t>(elems.size());
-                const uint32_t reps =
-                    rhs.kind == ExpressionKind::ReplicatedAssignmentPattern
-                        ? static_cast<uint32_t>(
-                              const_uint(rhs.as<ReplicatedAssignmentPatternExpression>().count()))
-                        : 1;
-                const uint32_t lo = std::min(t.left, t.right);
+                const uint32_t lo    = std::min(t.left, t.right);
                 for (uint32_t k = 0; k < n * reps; ++k) {
                     const int32_t coord =
                         keyed ? static_cast<int32_t>(lo + k)
@@ -1269,6 +1295,10 @@ private:
                                    l);
                     emit_agg_store(b.elem_select(lhs, idx, type, l), t.element, *elems[k % n], tag, b, l);
                 }
+                return;
+            }
+            if (t.kind == ir::Type::Kind::DynArray || t.kind == ir::Type::Kind::Queue) {
+                emit_handle_literal_init(lhs, type, t, elems, reps, tag, b, l);
                 return;
             }
             fail("'{...} assignment pattern over this aggregate is not supported");
@@ -1314,6 +1344,43 @@ private:
             return;
         }
         emit_agg_copy(lhs, src_lv, type, tag, b, l);
+    }
+
+    // Build a dynamic-array or queue handle from a flat positional element list
+    // (an assignment-pattern or bare unpacked-concatenation literal, LRM 7.5 /
+    // 7.10 / 11.4.14). A dynamic array is allocated to the element count and
+    // stored element-wise; a queue has no bulk-allocate op, so it is cleared
+    // (whole-handle assignment replaces, not appends) then rebuilt with
+    // push_back. `reps` is the `'{N{...}}` replicated-pattern multiplier (1 for
+    // a positional/keyed pattern or a bare concatenation, which has no repeat
+    // form of its own).
+    void emit_handle_literal_init(ir::Index lhs, ir::Ref type, const ir::Type& t,
+                                  std::span<const Expression* const> elems, uint32_t reps,
+                                  ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
+        if (tag != ir::Inst::Tag::Store) {
+            // TODO: nonblocking '{...}/concatenation literal into a queue or
+            // dynamic array (needs a handle-aware NBA staging path — same gap as
+            // the sibling top-level nonblocking dynamic-array/queue guards).
+            fail("nonblocking assignment of a literal into a queue or dynamic array is not supported");
+        }
+        const uint32_t n     = static_cast<uint32_t>(elems.size());
+        const uint32_t count = n * reps;
+        if (t.kind == ir::Type::Kind::DynArray) {
+            const ir::Index size =
+                b.constant(module_.pool.put_int(make_int_type(32, false, false), count), l);
+            b.dyn_array_new(lhs, size, lhs, /*has_init*/ false, type, l);
+            for (uint32_t k = 0; k < count; ++k) {
+                const ir::Index idx =
+                    b.constant(module_.pool.put_int(make_int_type(32, false, true), k), l);
+                b.binary(ir::Inst::Tag::Store, b.elem_select(lhs, idx, type, l),
+                        lower_expr(*elems[k % n], b), l);
+            }
+            return;
+        }
+        b.queue_delete(lhs, lhs, /*has_idx*/ false, type, l);
+        for (uint32_t k = 0; k < count; ++k) {
+            b.queue_push(lhs, lower_expr(*elems[k % n], b), /*front*/ false, type, l);
+        }
     }
 
     // Per-leaf copy of one aggregate lvalue into another (both of `type`),
@@ -3590,7 +3657,7 @@ private:
                 fail("static function local with an initializer is not supported");
             }
             const ir::SourceLoc l = loc(*init);
-            if (is_aggregate(vs.getType())) {
+            if (is_aggregate(vs.getType()) || is_unpacked_container(vs.getType())) {
                 emit_struct_store(value_lvalue(vs, b, l), lower_type(vs.getType()), *init, ir::Inst::Tag::Store, b, l);
             } else {
                 b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
@@ -3634,7 +3701,7 @@ private:
         }
         ir::Builder&        b = *preinit_;
         const ir::SourceLoc l = loc(*init);
-        if (is_aggregate(vs.getType())) {
+        if (is_aggregate(vs.getType()) || is_unpacked_container(vs.getType())) {
             emit_struct_store(value_lvalue(vs, b, l), lower_type(vs.getType()), *init, ir::Inst::Tag::Store, b, l);
         } else {
             b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
