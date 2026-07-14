@@ -2432,7 +2432,10 @@ private:
     // and register it (in the net's own scope) for the resolver to fold. Slots
     // power up like any signal; a tri-state driver writes its own Z, and a
     // driver that always writes the whole net leaves no undriven bits.
-    ir::Signal alloc_driver_slot(ir::Signal net, const slang::ast::Type& net_type, ir::SourceLoc l) {
+    // Allocate a fresh full-width slot for one driver of `net` (slot type == net
+    // type, so a partial driver's slot still spans the whole net with z in its
+    // undriven bits). Registered in the net's scope; cross-scope drivers fail.
+    ir::Signal alloc_driver_slot(ir::Signal net, ir::SourceLoc l) {
         const auto net_u = static_cast<uint32_t>(net);
         const auto it    = resolved_scope_.find(net_u);
         if (it != resolved_scope_.end() && it->second != cur_scope_id()) {
@@ -2446,13 +2449,79 @@ private:
         auto& slots = resolved_slots_[net_u];
         ir::SignalInfo info;
         info.name = std::string(module_.signal(net).name) + "$drv" + std::to_string(slots.size());
-        info.type = lower_type(net_type);
+        info.type = module_.signal(net).type;
         info.dir  = ir::SignalInfo::Direction::Internal;
         const ir::Signal slot = register_signal(std::move(info));
         slots.push_back(slot);
-        resolved_scope_[static_cast<uint32_t>(net)] = cur_scope_id();
-        resolved_loc_[static_cast<uint32_t>(net)]   = l;
+        resolved_scope_[net_u] = cur_scope_id();
+        resolved_loc_[net_u]   = l;
         return slot;
+    }
+
+    // An all-Z constant of `width` bits (VPI planes: val = 0, xz = 1 for every
+    // bit). Used as the resolution identity in the undriven bits of a partial
+    // driver's slot value.
+    ir::Ref z_constant_ref(uint32_t width) {
+        const uint32_t      pb = (width + 7) / 8;
+        std::vector<uint8_t> bytes(2 * static_cast<size_t>(pb), 0); // val plane = 0
+        for (uint32_t bit = 0; bit < width; ++bit) {
+            bytes[pb + bit / 8] |= static_cast<uint8_t>(1u << (bit % 8)); // xz plane = 1 (Z)
+        }
+        return module_.pool.put_value(make_int_type(width, /*is_four=*/true, /*is_signed=*/false),
+                                      bytes);
+    }
+
+    // The full-width value one driver stages into its slot: for a whole-net
+    // driver the driven value itself; for a constant packed partial driver
+    // (`w[7:4] = ...`), the value placed at its bit range with Z — the
+    // resolution identity — in every other bit, so the resolver folds each bit
+    // only across the drivers that actually reach it. `driven` is the already-
+    // lowered right-hand value. Shapes V2 cannot slot (dynamic index, unpacked
+    // element, or a 2-state net that cannot hold the Z background) fail loudly.
+    ir::Index build_driver_slot_value(ir::Signal net, const Expression& left, ir::Index driven,
+                                      ir::Builder& b, ir::SourceLoc l) {
+        const ValueSymbol* root = lvalue_root(left);
+        if (root != nullptr && !root->getType().getCanonicalType().isIntegral()) {
+            // A packed vector or packed struct is integral and folds directly;
+            // an unpacked array / unpacked struct net has no single packed plane.
+            // TODO: per-element slots + a per-element resolver for unpacked nets.
+            fail("unpacked-array or unpacked-struct multiply-driven net is not supported");
+        }
+        const ir::Ref  net_ty = module_.signal(net).type;
+        const uint32_t net_w  = module_.pool.layout(net_ty).width;
+        if (is_whole_net_lvalue(left)) {
+            return b.resize(driven, net_ty, l);
+        }
+        const NetRegion reg = root != nullptr ? net_region_of(left, *root) : kWholeNet;
+        // A constant packed sub-range: one element band [0,0], a bounded bit
+        // range strictly inside the net. Anything else (dynamic index, unpacked-
+        // array element, whole-net via select) is not a slot-able partial.
+        const bool packed_const = reg.elem_lo == 0 && reg.elem_hi == 0 &&
+                                  reg.bit_hi != UINT32_MAX && reg.bit_lo <= reg.bit_hi &&
+                                  reg.bit_hi < net_w;
+        if (!packed_const) {
+            // TODO: dynamic-index / unpacked-array-element partial drivers (a
+            // runtime-varying region needs a per-activation Z refill or a
+            // per-element resolver).
+            fail("dynamic or unpacked-array partial driver of a multiply-driven net is not supported");
+        }
+        if (module_.pool.layout(net_ty).domain != ir::Domain::Four) {
+            // TODO: 2-state resolved nets have no Z to mark undriven bits, so a
+            // partial driver cannot leave an identity background.
+            fail("partial driver of a 2-state multiply-driven net is not supported");
+        }
+        const uint32_t region_w = reg.bit_hi - reg.bit_lo + 1;
+        const ir::Index rhs = b.resize(driven, make_int_type(region_w, true, false), l);
+        // Concatenation is MSB-first: { Z above the range, the value, Z below }.
+        std::vector<ir::Index> parts;
+        if (reg.bit_hi < net_w - 1) {
+            parts.push_back(b.constant(z_constant_ref(net_w - 1 - reg.bit_hi), l));
+        }
+        parts.push_back(rhs);
+        if (reg.bit_lo > 0) {
+            parts.push_back(b.constant(z_constant_ref(reg.bit_lo), l));
+        }
+        return parts.size() == 1 ? parts.front() : b.concat(parts, l);
     }
 
     // Reject a concatenation (or conversion-wrapped) lvalue any of whose operands
@@ -2477,19 +2546,14 @@ private:
         }
     }
 
-    // Emit one whole-net continuous-assign driver of a resolved net: stage the
-    // RHS into this driver's slot, sensitive to the RHS reads.
+    // Emit one continuous-assign driver of a resolved net: stage its value (whole
+    // net, or a constant packed sub-range with a Z background) into this driver's
+    // slot, sensitive to the RHS reads.
     void emit_resolved_driver(ir::Signal net, const AssignmentExpression& a, const Expression& left,
                               ir::Builder& b, ir::SourceLoc l) {
-        if (!is_whole_net_lvalue(left)) {
-            // TODO: partial-select drivers of a multiply-driven net (each slot
-            // would carry only its region, resolved per bit).
-            fail("partial-select driver of a multiply-driven net is not supported");
-        }
-        const ir::Ref    ty   = lower_type(*left.type);
-        const ir::Signal slot = alloc_driver_slot(net, *left.type, l);
-        b.binary(ir::Inst::Tag::Store, b.signal(slot, l),
-                 b.resize(lower_expr(a.right(), b), ty, l), l);
+        const ir::Index val  = build_driver_slot_value(net, left, lower_expr(a.right(), b), b, l);
+        const ir::Signal slot = alloc_driver_slot(net, l);
+        b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
         add_continuous_process(continuous_events(a), l, b);
     }
 
@@ -2654,7 +2718,7 @@ private:
         if (resolved) {
             // A net-declaration assignment is a whole-net driver: stage the
             // initializer into this driver's slot (emit_wire_resolvers folds it).
-            const ir::Signal slot = alloc_driver_slot(signal_of(ns), ns.getType(), l);
+            const ir::Signal slot = alloc_driver_slot(signal_of(ns), l);
             b.binary(ir::Inst::Tag::Store, b.signal(slot, l),
                      b.resize(lower_expr(*init, b), lower_type(ns.getType()), l), l);
             add_continuous_process(continuous_events(*init), to_source_loc(ns.location), b);
@@ -3108,17 +3172,18 @@ private:
                 const AssignmentExpression& a = expr->as<AssignmentExpression>();
                 if (const std::optional<ir::Signal> net = resolved_net_of(a.left())) {
                     // The parent net has multiple drivers: stage this child's
-                    // output into its own slot (the resolver folds them). A
-                    // partial or aggregate connection is not a whole-net driver.
-                    if (is_aggregate(*a.left().type) || !is_whole_net_lvalue(a.left())) {
-                        // TODO: partial / aggregate driver of a multiply-driven net.
-                        fail("partial or aggregate driver of a multiply-driven net is not supported");
+                    // output (whole net, or a constant sub-range with a Z
+                    // background) into its own slot; the resolver folds them.
+                    if (is_aggregate(*a.left().type)) {
+                        // TODO: aggregate driver of a multiply-driven net.
+                        fail("aggregate driver of a multiply-driven net is not supported");
                     }
-                    const ir::Ref    ty   = lower_type(*a.left().type);
-                    const ir::Signal slot = alloc_driver_slot(*net, *a.left().type, l);
-                    const ir::Index  val  = b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l);
-                    b.binary(ir::Inst::Tag::Store, b.signal(slot, l),
-                             coerce(val, *a.right().type, ty, b, l), l);
+                    const ir::Ref   ty        = lower_type(*a.left().type);
+                    const ir::Index child_val = coerce(
+                      b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l), *a.right().type, ty, b, l);
+                    const ir::Index  val  = build_driver_slot_value(*net, a.left(), child_val, b, l);
+                    const ir::Signal slot = alloc_driver_slot(*net, l);
+                    b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
                     sens.push_back(ir::WaitEvent{ .signal = child_sig, .edge = ir::Edge::Any });
                     add_continuous_process(std::move(sens), l, b);
                     continue;

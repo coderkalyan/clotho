@@ -203,16 +203,76 @@ TEST_CASE("triand/trior synonyms fold, single-driver wand takes the plain path")
     CHECK(out == "1000 1111 0\n0010 1111 1\n");
 }
 
-// -- Loud-failure guards for the shapes V1 does not resolve --
+TEST_CASE("overlapping partial-select drivers resolve per bit") {
+    // Driver A drives bits [5:0], driver B drives [7:2] -> [5:2] overlap; the
+    // undriven bits of each slot carry Z (the identity) so a bit resolves only
+    // across the drivers that reach it.
+    const std::string out = run_capture(R"(
+        module top;
+          logic [7:0] va, vb;
+          logic ea, eb;
+          wire  [7:0] bus;
+          assign bus[5:0] = ea ? va[5:0] : 6'bz;
+          assign bus[7:2] = eb ? vb[7:2] : 6'bz;
+          initial begin
+            va = 8'hFF; vb = 8'h00;
+            ea=0; eb=0; #1; $display("%b", bus); // zzzzzzzz
+            ea=1; eb=0; #1; $display("%b", bus); // A: [5:0]=1, [7:6]=z
+            ea=0; eb=1; #1; $display("%b", bus); // B: [7:2]=0, [1:0]=z
+            ea=1; eb=1; #1; $display("%b", bus); // [7:6]=0, [5:2]=1vs0=x, [1:0]=1
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "zzzzzzzz\nzz111111\n000000zz\n00xxxx11\n");
+}
 
-TEST_CASE("a partial-select driver of a resolved net fails loudly") {
+TEST_CASE("a whole-net driver and a partial-select driver resolve together") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic [7:0] vw, va;
+          logic ew, ea;
+          wire  [7:0] mix;
+          assign mix      = ew ? vw : 8'bz;
+          assign mix[3:0] = ea ? va[3:0] : 4'bz;
+          initial begin
+            vw = 8'hA5; va = 8'hFF;
+            ew=1; ea=0; #1; $display("%b", mix); // whole = A5
+            ew=1; ea=1; #1; $display("%b", mix); // [7:4]=1010, [3:0]=0101 vs 1111 -> x1x1
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "10100101\n1010x1x1\n");
+}
+
+TEST_CASE("wand/wor fold partial drivers per bit") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic vc, vb;
+          wand [3:0] wa;
+          wor  [3:0] wo;
+          assign wa = {vc,vc,vc,vc}; assign wa[0] = vb; // bit0: vc wand vb
+          assign wo = {vb,vb,vb,vb}; assign wo[0] = vc; // bit0: vb wor  vc
+          initial begin
+            vc=1; vb=0; #1; $display("%b %b", wa, wo); // wa: 1110, wo: 0001
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "1110 0001\n");
+}
+
+// -- Loud-failure guards for the shapes V2 does not resolve --
+
+TEST_CASE("an unpacked-array-element driver of a resolved net fails loudly") {
     const LowerResult r = lower_text(R"(
-        module m(input [3:0] a, input [4:0] b);
-            wire [7:0] w;
-            assign w[3:0] = a;
-            assign w[6:2] = b;
+        module m(input [7:0] a, input [7:0] b);
+            wire [7:0] mem [0:3];
+            assign mem[0] = a;
+            assign mem[0] = b;
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("partial-select driver of a multiply-driven net") != std::string::npos);
+    CHECK(r.diagnostics.find("unpacked-array or unpacked-struct multiply-driven net") != std::string::npos);
 }

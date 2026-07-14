@@ -1173,14 +1173,16 @@ TEST_CASE("a timing-control-free always warns but still lowers") {
     CHECK(r.diagnostics.find("does not advance time") != std::string::npos);
 }
 
-// -- Multiple continuous drivers on one net (LRM 6.6.1) --
+// -- Multiple continuous drivers on one net (LRM 6.6) --
 //
-// Multi-driver net resolution (LRM 6.6.1, wire/tri, no strengths): whole-net
-// overlapping drivers resolve through per-driver slots + a WireRes resolver;
-// partial-select, concatenation-operand, and net-array-element drivers of a
-// resolved net are not yet supported and fail loudly (never silently
-// last-writer-win). Runtime resolution values are checked in
-// net_resolution_test.cpp against iverilog.
+// Multi-driver net resolution (LRM 6.6, no strengths): overlapping drivers of a
+// packed net resolve through per-driver slots + a resolver (whole-net drivers
+// stage their value, constant packed part-select drivers stage it with a Z
+// background so each bit resolves only across its own drivers). Concatenation-
+// operand, dynamic-index, and unpacked-array/struct drivers of a resolved net
+// are not yet supported and fail loudly (never silently last-writer-win).
+// Runtime resolution values are checked in net_resolution_test.cpp against
+// iverilog.
 
 TEST_CASE("two whole-net continuous assigns resolve") {
     const LowerResult r = lower_text(R"(
@@ -1217,7 +1219,7 @@ TEST_CASE("an output port connection plus a whole-net continuous assign resolve"
     CHECK_MESSAGE(r.ok, r.diagnostics);
 }
 
-TEST_CASE("overlapping constant part-select drivers fail loudly") {
+TEST_CASE("overlapping constant part-select drivers resolve") {
     const LowerResult r = lower_text(R"(
         module m(input [3:0] a, input [4:0] b);
             wire [7:0] w;
@@ -1225,8 +1227,7 @@ TEST_CASE("overlapping constant part-select drivers fail loudly") {
             assign w[6:2] = b;
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("partial-select driver of a multiply-driven net") != std::string::npos);
+    CHECK_MESSAGE(r.ok, r.diagnostics);
 }
 
 TEST_CASE("a concatenation lvalue operand overlapping another driver fails loudly") {
@@ -1319,8 +1320,8 @@ TEST_CASE("disjoint bits of one net-array element are accepted") {
 }
 
 TEST_CASE("two drivers of the same net-array element fail loudly") {
-    // A whole-element driver of an array net is still a partial (select) driver
-    // of the net, so V1 resolution rejects it rather than silently winning.
+    // An unpacked-array net has no packed plane the resolver can fold; per-element
+    // resolution is a documented follow-up, so it fails loudly rather than winning.
     const LowerResult r = lower_text(R"(
         module m(input [7:0] a, input [7:0] b);
             wire [7:0] mem [0:3];
@@ -1329,7 +1330,7 @@ TEST_CASE("two drivers of the same net-array element fail loudly") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("partial-select driver of a multiply-driven net") != std::string::npos);
+    CHECK(r.diagnostics.find("unpacked-array or unpacked-struct multiply-driven net") != std::string::npos);
 }
 
 TEST_CASE("overlapping bit drivers of one net-array element fail loudly") {
@@ -1341,7 +1342,7 @@ TEST_CASE("overlapping bit drivers of one net-array element fail loudly") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("partial-select driver of a multiply-driven net") != std::string::npos);
+    CHECK(r.diagnostics.find("unpacked-array or unpacked-struct multiply-driven net") != std::string::npos);
 }
 
 TEST_CASE("a net with one continuous driver read procedurally is accepted") {
