@@ -1690,6 +1690,33 @@ TEST_CASE("multiple top-level modules each elaborate into the design") {
 
 // Same-named signals in separate tops must not collide: each top's instance
 // name prefixes its flattened paths, and signals resolve by handle regardless.
+// Reused-definition instances: nonblocking assignment through the per-instance
+// shadow bases and def-relative block registration (module-dedup prep). A
+// design whose every NBA target lives in a reused definition exercises the
+// instance shadow path with no root shadow-base consumer at all — the shape
+// that once crashed when the per-instance base stores were guarded on the
+// (never-created) root base. Values pinned against iverilog.
+TEST_CASE("nonblocking assignment across reused module instances") {
+    const std::string out = run_capture(R"(
+        module leaf(input wire clk, input wire [7:0] d, output reg [7:0] q, output reg [7:0] r);
+            initial begin q = 8'h5a; r = 8'ha5; end
+            always @(posedge clk) begin q <= d + q; r <= q ^ d; end
+        endmodule
+        module top;
+            reg clk = 0; reg [7:0] d = 1;
+            wire [7:0] q0, r0, q1, r1, q2, r2;
+            leaf l0(clk, d, q0, r0);
+            leaf l1(clk, q0, q1, r1);
+            leaf l2(clk, r1, q2, r2);
+            initial begin
+                repeat (200) begin #5 clk = ~clk; d = d + 3; end
+                $display("%h %h %h %h %h %h", q0, r0, q1, r1, q2, r2);
+            end
+        endmodule
+    )");
+    CHECK(out == "ee ce b2 82 d3 a3\n");
+}
+
 TEST_CASE("identically named signals in separate tops stay independent") {
     const std::string out = run_capture(R"(
         module a;

@@ -483,6 +483,22 @@ struct Anchor {
     // Created lazily by the first group that addresses through it, so a design
     // whose eligible groups all fuse cross-instance emits no dead symbols.
     llvm::GlobalVariable* sched_sym = nullptr;
+    // Index of this scope's shadow sub-struct within %clotho.nba.shadow, and
+    // the per-def sub-struct type (~0 / null when the scope has no NBA shadow
+    // fields). A reused definition also gets shadow_sym — a pointer global main
+    // fills with &shadow.<sub> — so twin staging/commit code carries only
+    // def-local field constants; a unique definition folds the two-level
+    // constant GEP through the root shadow base.
+    llvm::StructType*     shadow_ty    = nullptr;
+    uint32_t              shadow_field = ~0u;
+    llvm::GlobalVariable* shadow_sym   = nullptr;
+    // Reused definitions only: [n x ptr] table of this instance's wait-queue
+    // base pointers (sta base / dyn base / dyn len per def-local bucket, slot
+    // order fixed by the def walk), filled by main. Body-side service scans and
+    // dynamic registration load their bases here, so twin bodies carry a
+    // def-local slot constant instead of a per-instance queue symbol. Commit
+    // functions and the seed loop keep the absolute globals.
+    llvm::GlobalVariable* wait_sym = nullptr;
     // Lowest VCD dump-var index of the scope's own dumped signals (-1: none).
     // Touch sites address a dumped signal as vcd base + def-local offset.
     int32_t first_vcd = -1;
@@ -1331,15 +1347,16 @@ private:
             }
         }
 
-        // Shadow staging fields for NBA targets, in nba-id order. A shadow
-        // mirrors the live i(2W) / iW planes; a partial target adds a dirty mask.
+        // Shadow staging fields for NBA targets. A shadow mirrors the live
+        // i(2W) / iW planes; a partial target adds a dirty mask. Fields are
+        // grouped into one sub-struct per instance scope (per-definition type,
+        // deduplicated like the state structs), then the unscoped signals'
+        // fields flat behind them: an anchored signal's sh_* indices are
+        // def-local, so twin instances stage through identical constants
+        // (shadow_ptr resolves the instance base). Root shadow layout is
+        // otherwise as before — one struct behind the opaque shadow base.
         if (n_nba_ > 0) {
-            std::vector<llvm::Type*> sf;
-            for (uint32_t i = 0; i < sigs.size(); ++i) {
-                SignalSlot& slot = slots_[i];
-                if (!slot.nba) {
-                    continue;
-                }
+            const auto add_fields = [&](SignalSlot& slot, std::vector<llvm::Type*>& sf) {
                 // An aggregate target shadows each static leaf's mm (and z, for a
                 // 4-state leaf) plane; the commit selects leaves by the block's
                 // static-leaf-set mask. A runtime-path-only aggregate (deferred
@@ -1355,7 +1372,7 @@ private:
                             }
                         }
                     }
-                    continue;
+                    return;
                 }
                 slot.sh_mm_field = static_cast<uint32_t>(sf.size());
                 // A narrow 2-state target shadows a single iW word (no z shadow).
@@ -1371,6 +1388,39 @@ private:
                 if (slot.nba_dyn) {
                     slot.sh_mask_field = static_cast<uint32_t>(sf.size());
                     sf.push_back(int_ty(slot.width));
+                }
+            };
+
+            std::vector<llvm::Type*> sf;
+            std::vector<std::tuple<llvm::StructType*, std::vector<llvm::Type*>, llvm::StructType*>>
+              shadow_defs;
+            for (uint32_t a = 0; a < anchors_.size(); ++a) {
+                std::vector<llvm::Type*> af;
+                for (uint32_t i = 0; i < sigs.size(); ++i) {
+                    if (slots_[i].anchor == a && slots_[i].nba) {
+                        add_fields(slots_[i], af);
+                    }
+                }
+                if (af.empty()) {
+                    continue;
+                }
+                Anchor& an      = anchors_[a];
+                an.shadow_field = static_cast<uint32_t>(sf.size());
+                for (const auto& [ty, flds, st] : shadow_defs) {
+                    if (ty == an.ty && flds == af) {
+                        an.shadow_ty = st;
+                        break;
+                    }
+                }
+                if (an.shadow_ty == nullptr) {
+                    an.shadow_ty = llvm::StructType::create(ctx_, af, an.ty->getName().str() + ".shadow");
+                    shadow_defs.emplace_back(an.ty, std::move(af), an.shadow_ty);
+                }
+                sf.push_back(an.shadow_ty);
+            }
+            for (uint32_t i = 0; i < sigs.size(); ++i) {
+                if (slots_[i].anchor == SignalSlot::no_anchor && slots_[i].nba) {
+                    add_fields(slots_[i], sf);
                 }
             }
             shadow_ty_    = llvm::StructType::create(ctx_, sf, "clotho.nba.shadow");
@@ -1684,8 +1734,24 @@ private:
     // register-file-shaped designs, at any codegen level). Loading the shadow base
     // from a global keeps codegen from folding shadow addresses into
     // state+constant, so the colliding form cannot arise.
-    llvm::Value* shadow_ptr(uint32_t field) {
-        llvm::Value* base = b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), shadow_base_gv());
+    // `owner` is the signal whose (def-local, for an anchored signal) shadow
+    // field is addressed. Reused definitions load their instance's shadow base
+    // (@clotho.inst.*.shadow); unique definitions fold the sub-struct index
+    // through the root base; unscoped signals keep the flat root field. Every
+    // path loads a base pointer, preserving the opacity requirement above.
+    llvm::Value* shadow_ptr(const SignalSlot& owner, uint32_t field) {
+        auto* ptr = llvm::PointerType::getUnqual(ctx_);
+        if (owner.anchor != SignalSlot::no_anchor) {
+            const Anchor& a = anchors_[owner.anchor];
+            if (a.shadow_sym != nullptr) {
+                llvm::Value* base = b_.CreateLoad(ptr, a.shadow_sym);
+                return b_.CreateInBoundsGEP(a.shadow_ty, base, { b_.getInt32(0), b_.getInt32(field) });
+            }
+            llvm::Value* base = b_.CreateLoad(ptr, shadow_base_gv());
+            return b_.CreateInBoundsGEP(
+              shadow_ty_, base, { b_.getInt32(0), b_.getInt32(a.shadow_field), b_.getInt32(field) });
+        }
+        llvm::Value* base = b_.CreateLoad(ptr, shadow_base_gv());
         return b_.CreateInBoundsGEP(shadow_ty_, base, { b_.getInt32(0), b_.getInt32(field) });
     }
 
@@ -1720,6 +1786,11 @@ private:
                 a.sym = new llvm::GlobalVariable(llmod_, ptr, false, llvm::GlobalValue::InternalLinkage,
                                                  llvm::ConstantPointerNull::get(ptr),
                                                  "clotho.inst." + a.name);
+                if (a.shadow_ty != nullptr) {
+                    a.shadow_sym = new llvm::GlobalVariable(
+                      llmod_, ptr, false, llvm::GlobalValue::InternalLinkage,
+                      llvm::ConstantPointerNull::get(ptr), "clotho.inst." + a.name + ".shadow");
+                }
                 continue;
             }
             std::vector<llvm::Constant*> idx;
@@ -3021,12 +3092,13 @@ private:
     // count of distinct processes that intra-body-wait on the signal, and a process
     // holds at most one dynamic slot per signal at a time.
     void emit_dynamic_register(Signal sig, uint32_t edge) {
-        const auto   i      = static_cast<uint32_t>(sig);
-        auto*        len_gv = wait_dyn_len_gv_[i][edge];
-        auto*        i32    = b_.getInt32Ty();
-        llvm::Value* len    = b_.CreateLoad(i32, len_gv);
-        emit_entry(wait_dyn_ty_[i][edge], wait_dyn_gv_[i][edge], len, hdl_, sched_ptr_);
-        b_.CreateStore(b_.CreateAdd(len, b_.getInt32(1)), len_gv);
+        const auto   i       = static_cast<uint32_t>(sig);
+        llvm::Value* len_ptr = wait_base(wait_slot_len_[i][edge], wait_dyn_len_gv_[i][edge], i);
+        llvm::Value* q       = wait_base(wait_slot_dyn_[i][edge], wait_dyn_gv_[i][edge], i);
+        auto*        i32     = b_.getInt32Ty();
+        llvm::Value* len     = b_.CreateLoad(i32, len_ptr);
+        emit_entry(wait_dyn_ty_[i][edge], q, len, hdl_, sched_ptr_);
+        b_.CreateStore(b_.CreateAdd(len, b_.getInt32(1)), len_ptr);
     }
 
     // Suspend the coroutine and continue in a fresh resume block, woken by a wait
@@ -3152,10 +3224,28 @@ private:
         for (const auto& [sym, first_id] : group_blk_bases_) {
             b_.CreateStore(b_.getInt32(first_id), sym);
         }
+        for (const auto& [tab, slot, target] : wait_table_fills_) {
+            b_.CreateStore(target, b_.CreateInBoundsGEP(tab->getValueType(), tab,
+                                                        { b_.getInt32(0), b_.getInt32(slot) }));
+        }
         init_state();
-        if (shadow_base_gv_ != nullptr) {
-            b_.CreateStore(b_.CreateInBoundsGEP(state_ty_, state, { b_.getInt32(0), b_.getInt32(shadow_field_) }),
-                           shadow_base_gv_);
+        // The root shadow base fills only when some shadow access loaded it
+        // (lazy shadow_base_gv); the per-instance bases fill whenever their
+        // symbol exists — a design whose NBA targets all live in reused
+        // definitions never touches the root base at all.
+        if (shadow_ty_ != nullptr) {
+            llvm::Value* shadow =
+              b_.CreateInBoundsGEP(state_ty_, state, { b_.getInt32(0), b_.getInt32(shadow_field_) });
+            if (shadow_base_gv_ != nullptr) {
+                b_.CreateStore(shadow, shadow_base_gv_);
+            }
+            for (const Anchor& a : anchors_) {
+                if (a.shadow_sym != nullptr) {
+                    b_.CreateStore(b_.CreateInBoundsGEP(shadow_ty_, shadow,
+                                                        { b_.getInt32(0), b_.getInt32(a.shadow_field) }),
+                                   a.shadow_sym);
+                }
+            }
         }
 
         // Register the single DPI scope (svGetScope / user-data, LRM 35.5.3) before
@@ -3340,10 +3430,11 @@ private:
         for (uint32_t i = 0; i < sigs.size(); ++i) {
             wait_sta_true_[i] = c.sta[i];
         }
+        // Def-local signal table per scope occurrence: slot.path's last
+        // element is the signal's field index within its own scope. Shared by
+        // the capacity padding below and the wait-pointer table builder.
+        std::vector<std::vector<Signal>> by_anchor(anchors_.size());
         {
-            // Def-local signal table per scope occurrence: slot.path's last
-            // element is the signal's field index within its own scope.
-            std::vector<std::vector<Signal>> by_anchor(anchors_.size());
             for (uint32_t i = 0; i < sigs.size(); ++i) {
                 const SignalSlot& sl = slots_[i];
                 if (sl.anchor == SignalSlot::no_anchor) {
@@ -3438,6 +3529,54 @@ private:
                       llmod_, i32, false, llvm::GlobalValue::InternalLinkage,
                       llvm::ConstantInt::get(i32, 0), base + "dyn." + edge_suffix(e) + ".len");
                 }
+            }
+        }
+
+        // Per-instance wait-pointer tables (module-dedup prep): for a reused
+        // definition, body-side queue access goes through a def-local slot into
+        // the instance's table instead of the per-instance queue globals. Slot
+        // numbering follows the def-local signal walk and the (padded, so
+        // def-uniform) bucket existence — identical across twin instances by
+        // construction. main fills the tables at startup (wait_table_fills_).
+        wait_slot_sta_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
+        wait_slot_dyn_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
+        wait_slot_len_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
+        auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
+        for (uint32_t a = 0; a < anchors_.size(); ++a) {
+            Anchor& an = anchors_[a];
+            if (!an.indirect) {
+                continue;
+            }
+            std::vector<std::pair<uint32_t, llvm::Constant*>> fills;
+            uint32_t                                          next = 0;
+            for (const Signal sj : by_anchor[a]) {
+                if (sj == Signal{ ~0u }) {
+                    continue;
+                }
+                const auto si = static_cast<uint32_t>(sj);
+                for (uint32_t e = 0; e < 3; ++e) {
+                    if (wait_sta_gv_[si][e] != nullptr) {
+                        wait_slot_sta_[si][e] = next;
+                        fills.emplace_back(next++, wait_sta_gv_[si][e]);
+                    }
+                    if (wait_dyn_gv_[si][e] != nullptr) {
+                        wait_slot_dyn_[si][e] = next;
+                        fills.emplace_back(next++, wait_dyn_gv_[si][e]);
+                        wait_slot_len_[si][e] = next;
+                        fills.emplace_back(next++, wait_dyn_len_gv_[si][e]);
+                    }
+                }
+            }
+            if (next == 0) {
+                continue;
+            }
+            auto* tab_ty = llvm::ArrayType::get(ptr_ty, next);
+            an.wait_sym  = new llvm::GlobalVariable(llmod_, tab_ty, false,
+                                                    llvm::GlobalValue::InternalLinkage,
+                                                    llvm::ConstantAggregateZero::get(tab_ty),
+                                                    "clotho.inst." + an.name + ".waits");
+            for (const auto& [slot, target] : fills) {
+                wait_table_fills_.emplace_back(an.wait_sym, slot, target);
             }
         }
     }
@@ -5003,9 +5142,9 @@ private:
             auto*             zty      = int_ty(W);
             llvm::Value*      live     = storage_ptr(s);
             llvm::Value*      live_mm  = b_.CreateStructGEP(s.slot_ty, live, 0);
-            llvm::Value*      sh_mm    = shadow_ptr(s.sh_mm_field);
+            llvm::Value*      sh_mm    = shadow_ptr(s, s.sh_mm_field);
             llvm::Value*      live_z   = s.has_z ? b_.CreateStructGEP(s.slot_ty, live, 1) : nullptr;
-            llvm::Value*      sh_z     = s.has_z ? shadow_ptr(s.sh_z_field) : nullptr;
+            llvm::Value*      sh_z     = s.has_z ? shadow_ptr(s, s.sh_z_field) : nullptr;
             llvm::Value*      old_mm   = b_.CreateLoad(mmty, live_mm);
             llvm::Value*      new_mm   = nullptr;
             llvm::Value*      old_z    = nullptr;
@@ -5024,7 +5163,7 @@ private:
                 // Masked RMW: mask is a compile-time immediate for a static-select
                 // target, or the runtime dirty field for a dynamic-select one.
                 llvm::Value* maskw = bs.dynamic
-                                       ? static_cast<llvm::Value*>(b_.CreateLoad(zty, shadow_ptr(s.sh_mask_field)))
+                                       ? static_cast<llvm::Value*>(b_.CreateLoad(zty, shadow_ptr(s, s.sh_mask_field)))
                                        : static_cast<llvm::Value*>(llvm::ConstantInt::get(zty, bs.mask));
                 // A narrow (iW) word masks directly; a packed (i2W) word replicates
                 // the W-bit mask into both must|may halves.
@@ -5042,7 +5181,7 @@ private:
                     b_.CreateStore(new_z, live_z);
                 }
                 if (bs.dynamic) {
-                    b_.CreateStore(zero(W), shadow_ptr(s.sh_mask_field)); // clear for next instant
+                    b_.CreateStore(zero(W), shadow_ptr(s, s.sh_mask_field)); // clear for next instant
                 }
             }
             if (signal_has_waiters(bs.sig)) {
@@ -5094,14 +5233,14 @@ private:
             auto*          mmty    = int_ty(m.narrow ? m.width : 2 * m.width);
             llvm::Value*   live_mm = agg_leaf_ptr(live, s.storage_ty, m.path, 0);
             llvm::Value*   old_mm  = b_.CreateLoad(mmty, live_mm);
-            llvm::Value*   new_mm  = b_.CreateLoad(mmty, shadow_ptr(m.sh_mm_field));
+            llvm::Value*   new_mm  = b_.CreateLoad(mmty, shadow_ptr(s, m.sh_mm_field));
             b_.CreateStore(new_mm, live_mm);
             changed = b_.CreateOr(changed, b_.CreateICmpNE(old_mm, new_mm));
             if (m.has_z) {
                 auto*        zty    = int_ty(m.width);
                 llvm::Value* live_z = agg_leaf_ptr(live, s.storage_ty, m.path, 1);
                 llvm::Value* old_z  = b_.CreateLoad(zty, live_z);
-                llvm::Value* new_z  = b_.CreateLoad(zty, shadow_ptr(m.sh_z_field));
+                llvm::Value* new_z  = b_.CreateLoad(zty, shadow_ptr(s, m.sh_z_field));
                 b_.CreateStore(new_z, live_z);
                 changed = b_.CreateOr(changed, b_.CreateICmpNE(old_z, new_z));
             }
@@ -5402,10 +5541,24 @@ private:
     // non-null base and constant cap: simplifycfg (lower_coroutines) folds the
     // dead null guard and the constant trip count still lets the optimizer
     // unroll. Membership never changes — no compaction, no length.
+    // Body-side base pointer of a wait bucket: loaded from the owning
+    // instance's wait-pointer table when its definition is reused (def-local
+    // slot constant — twin bodies stay identical), the absolute queue global
+    // otherwise. Commit functions / the seed loop keep the globals directly.
+    llvm::Value* wait_base(uint32_t slot, llvm::Constant* gv, uint32_t sig) {
+        if (slot == no_wait_slot) {
+            return gv;
+        }
+        const Anchor& a = anchors_[slots_[sig].anchor];
+        return b_.CreateLoad(llvm::PointerType::getUnqual(ctx_),
+                             b_.CreateInBoundsGEP(a.wait_sym->getValueType(), a.wait_sym,
+                                                  { b_.getInt32(0), b_.getInt32(slot) }));
+    }
+
     void service_static_queue(Signal sig, uint32_t edge) {
         const auto i = static_cast<uint32_t>(sig);
-        emit_static_scan_rt(wait_sta_gv_[i][edge], b_.getInt32(wait_sta_cap_[i][edge]),
-                            wait_sta_padded_[i][edge] != 0);
+        emit_static_scan_rt(wait_base(wait_slot_sta_[i][edge], wait_sta_gv_[i][edge], i),
+                            b_.getInt32(wait_sta_cap_[i][edge]), wait_sta_padded_[i][edge] != 0);
     }
 
     // Dynamic sub-queue scan (one edge bucket): a straight loop over the live
@@ -5415,7 +5568,8 @@ private:
     // OTHER buckets itself on resume (eager removal in lower_wait).
     void service_dynamic_queue(Signal sig, uint32_t edge) {
         const auto i = static_cast<uint32_t>(sig);
-        emit_dynamic_scan_rt(wait_dyn_gv_[i][edge], wait_dyn_len_gv_[i][edge]);
+        emit_dynamic_scan_rt(wait_base(wait_slot_dyn_[i][edge], wait_dyn_gv_[i][edge], i),
+                             wait_base(wait_slot_len_[i][edge], wait_dyn_len_gv_[i][edge], i));
     }
 
     // Lower `-> e` (LRM 15.5.2): stamp the current sim tick into the event's
@@ -5485,9 +5639,9 @@ private:
     //   w = 0; for i in 0..len: if Q[i].handle != hdl_ { Q[w++] = Q[i] } ; len = w
     void emit_dynamic_remove(Signal sig, uint32_t edge) {
         const auto        i      = static_cast<uint32_t>(sig);
-        auto*             q      = wait_dyn_gv_[i][edge];
+        llvm::Value*      q      = wait_base(wait_slot_dyn_[i][edge], wait_dyn_gv_[i][edge], i);
         auto*             arr_ty = wait_dyn_ty_[i][edge];
-        auto*             len_gv = wait_dyn_len_gv_[i][edge];
+        llvm::Value*      len_gv = wait_base(wait_slot_len_[i][edge], wait_dyn_len_gv_[i][edge], i);
         llvm::StructType* elem   = wait_elem_ty();
         auto*             ptr_ty = llvm::PointerType::getUnqual(ctx_);
         auto*             i32    = b_.getInt32Ty();
@@ -9137,19 +9291,19 @@ private:
             const int      k = agg_static_leaf_index(s, lv.agg_field_path);
             const AggLeaf& m = s.static_leaves[static_cast<uint32_t>(k)];
             if (m.narrow) {
-                b_.CreateStore(must_of(rhs), shadow_ptr(m.sh_mm_field));
+                b_.CreateStore(must_of(rhs), shadow_ptr(s, m.sh_mm_field));
             } else {
                 const Plane f = to_four(rhs);
-                b_.CreateStore(f.mm, shadow_ptr(m.sh_mm_field));
+                b_.CreateStore(f.mm, shadow_ptr(s, m.sh_mm_field));
                 if (m.has_z) {
-                    b_.CreateStore(f.z, shadow_ptr(m.sh_z_field));
+                    b_.CreateStore(f.z, shadow_ptr(s, m.sh_z_field));
                 }
             }
             block_register(lv.sig, leaf_set_mask(s, static_cast<uint32_t>(k)), /*dynamic=*/false);
             return;
         }
 
-        llvm::Value* mp = shadow_ptr(s.sh_mm_field);
+        llvm::Value* mp = shadow_ptr(s, s.sh_mm_field);
 
         // Narrow 2-state target: stage the single iW value into the iW shadow. No z.
         if (s.narrow) {
@@ -9168,7 +9322,7 @@ private:
 
         rhs                  = to_four(rhs);
         // A never-z target stages no z shadow (and its commit loop skips z).
-        llvm::Value* zp = s.has_z ? shadow_ptr(s.sh_z_field) : nullptr;
+        llvm::Value* zp = s.has_z ? shadow_ptr(s, s.sh_z_field) : nullptr;
 
         if (!s.nba_partial) {
             // Whole-signal target: the RHS is already signal-width (frontend Resize),
@@ -9203,7 +9357,7 @@ private:
         if (!s.nba_dyn) {
             return;
         }
-        llvm::Value* maskp = shadow_ptr(s.sh_mask_field);
+        llvm::Value* maskp = shadow_ptr(s, s.sh_mask_field);
         b_.CreateStore(b_.CreateOr(b_.CreateLoad(int_ty(s.width), maskp), bmask), maskp);
     }
 
@@ -13868,6 +14022,15 @@ private:
     // is padded past them to the definition maximum (see build_wait_queues).
     std::vector<std::array<uint32_t, 3>> wait_sta_true_;
     std::vector<std::array<uint8_t, 3>>  wait_sta_padded_;
+    // Def-local wait-table slots per (signal, edge): index into the owning
+    // instance's Anchor::wait_sym table, or ~0 when the signal's owner is not a
+    // reused definition (body-side code then uses the absolute queue global).
+    static constexpr uint32_t no_wait_slot = ~0u;
+    std::vector<std::array<uint32_t, 3>> wait_slot_sta_;
+    std::vector<std::array<uint32_t, 3>> wait_slot_dyn_;
+    std::vector<std::array<uint32_t, 3>> wait_slot_len_;
+    // (table, slot, queue global) stores main emits at startup.
+    std::vector<std::tuple<llvm::GlobalVariable*, uint32_t, llvm::Constant*>> wait_table_fills_;
     std::vector<std::array<llvm::GlobalVariable*, 3>>  wait_dyn_gv_;
     std::vector<std::array<llvm::ArrayType*, 3>>       wait_dyn_ty_;
     std::vector<std::array<llvm::GlobalVariable*, 3>>  wait_dyn_len_gv_;
