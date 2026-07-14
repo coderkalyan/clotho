@@ -323,6 +323,8 @@ struct Analysis {
                 // its result always may carry Z — this keeps the resolved net's
                 // Z plane alive through elision.
                 case Inst::Tag::WireRes:
+                case Inst::Tag::WandRes:
+                case Inst::Tag::WorRes:
                     val_z[raw] = 1;
                     break;
 

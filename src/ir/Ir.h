@@ -917,6 +917,13 @@ struct Inst {
         // Emitted only by the multi-driver-net resolver (Lower.cpp
         // emit_wire_resolvers); single-driver nets never use it.
         WireRes,
+        // Wired-AND / wired-OR multi-driver resolution (LRM 6.6.2 / 6.6.3) for
+        // wand/triand and wor/trior nets. Same slot machinery and z-identity as
+        // WireRes, only a different per-bit reducer: wand forces 0 on any 0
+        // driver, wor forces 1 on any 1 driver, else x on any x, else z. Both
+        // associative + commutative, so K drivers fold left (payload: binary).
+        WandRes,
+        WorRes,
 
         // -- Reductions, e.g. &x (payload: unary) --
         RedAnd,
@@ -1546,6 +1553,8 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Bxor:
         case T::Bxnor:
         case T::WireRes:
+        case T::WandRes:
+        case T::WorRes:
         case T::Sll:
         case T::Srl:
         case T::Sra:

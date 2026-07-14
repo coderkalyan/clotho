@@ -185,6 +185,10 @@ const char* tag_name(Inst::Tag tag) {
             return "bxnor";
         case T::WireRes:
             return "wire_res";
+        case T::WandRes:
+            return "wand_res";
+        case T::WorRes:
+            return "wor_res";
         case T::Bnot:
             return "bnot";
         case T::RedAnd:
