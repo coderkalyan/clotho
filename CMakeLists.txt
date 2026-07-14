@@ -43,7 +43,7 @@ endif()
 if(TARGET LLVM)
   set(LLVM_LIBS LLVM)
 else()
-  llvm_map_components_to_libnames(LLVM_LIBS core support orcjit jitlink native)
+  llvm_map_components_to_libnames(LLVM_LIBS core support orcjit jitlink native bitwriter bitreader)
 endif()
 
 FetchContent_Declare(
