@@ -193,3 +193,30 @@ TEST_CASE("nonblocking packed-array pattern commits whole value") {
         endmodule
     )") == "0000000a0000000a\n");
 }
+
+// Whole fixed unpacked-array / unpacked-struct equality (LRM 11.2.2 / 11.4.5):
+// a per-leaf compare AND-reduced with X-propagation. iverilog rejects
+// whole-array `==`; the value expectation is cross-checked against verilator
+// 5.048 (definite cases) and the LRM (the X-propagating case).
+TEST_CASE("whole unpacked-array equality is per-element, X-propagating") {
+    CHECK(run_capture(R"(
+        module m;
+            logic [7:0] a [0:3];
+            logic [7:0] b [0:3];
+            int i;
+            logic r1, r2, r3;
+            initial begin
+                for (i = 0; i < 4; i++) begin a[i] = i; b[i] = i; end
+                r1 = (a == b);
+                b[2] = 8'd99;
+                r2 = (a != b);
+                for (i = 0; i < 4; i++) b[i] = i;
+                a[1] = 8'hxx;
+                r3 = (a == b);
+                $display("%b %b %b", r1, r2, r3);
+                $finish;
+            end
+        endmodule
+    )") == "1 1 x\n");
+}
+

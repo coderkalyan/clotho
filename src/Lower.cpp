@@ -1780,41 +1780,48 @@ private:
         return b.concat(parts, l);
     }
 
-    // 1-bit 4-state equality of two whole unpacked structs: one AggEq node the
-    // backend expands into per-leaf `==` results AND-reduced with Land (the
-    // reduction carries the LRM 11.4.5 X-propagation). Both operands must be
-    // struct lvalues (a '{...} pattern compare is a follow-up); an array member
-    // is guarded (element-wise compare is a follow-up).
+    // 1-bit 4-state equality of two whole unpacked aggregates (struct or fixed
+    // unpacked array): one AggEq node the backend expands per leaf, AND-reducing
+    // the per-leaf `==` results with Land (the reduction carries LRM 11.4.5
+    // X-propagation). Both operands must be aggregate lvalues (a '{...} pattern
+    // compare is a follow-up); a heap-owning leaf (string is handled; queue /
+    // dynamic array is guarded) is rejected.
     ir::Index lower_struct_eq(const Expression& lhs, const Expression& rhs, ir::Builder& b,
                               ir::SourceLoc l) {
         const Expression& le = unwrap_conversion(lhs);
         const Expression& re = unwrap_conversion(rhs);
-        if (!is_struct_lvalue_shape(le) || !is_struct_lvalue_shape(re)) {
-            fail("unpacked struct equality is only supported between struct variables");
+        // An aggregate lvalue: a variable / member / element, or a fixed
+        // unpacked-array slice (an ArrSlice lvalue), on either side.
+        const auto agg_eq_operand = [](const Expression& e) {
+            return is_struct_lvalue_shape(e) ||
+                   (e.kind == ExpressionKind::RangeSelect && is_unpacked_array(e));
+        };
+        if (!agg_eq_operand(le) || !agg_eq_operand(re)) {
+            fail("unpacked aggregate equality is only supported between aggregate variables");
         }
         const ir::Ref sty = lower_type(*lhs.type);
         guard_agg_eq_members(sty);
         return b.agg_eq(lower_lvalue(le, b), lower_lvalue(re, b), sty, l);
     }
 
-    // Reject comparable-aggregate shapes the backend expansion does not cover.
+    // Reject comparable-aggregate leaf shapes the backend AggEq expansion does
+    // not cover. An unpacked-array member is walked element-wise (supported);
+    // only a queue / dynamic-array leaf still needs the length+element compare.
     void guard_agg_eq_members(ir::Ref type) {
         const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
-        if (t.kind == ir::Type::Kind::UnpackedArray) {
-            // TODO: equality of an aggregate with an unpacked-array member — an
-            // element-wise compare (docs/design/unpacked-struct.md).
-            fail("equality of an aggregate with an unpacked-array member is not supported");
-        }
-        if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
-            for (const auto& f : module_.pool.struct_fields(t.fields_id)) {
-                guard_agg_eq_members(f.type);
-            }
-        }
         if (value_cat(type) == ValueCat::handle) {
             // TODO: equality of an aggregate with a queue / dynamic-array member
             // needs a length compare plus an element-wise walk (LRM 7.5/7.10).
             fail("equality of an aggregate with a queue / dynamic array member is "
                  "not supported");
+        }
+        if (t.kind == ir::Type::Kind::UnpackedArray) {
+            guard_agg_eq_members(t.element);
+        }
+        if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
+            for (const auto& f : module_.pool.struct_fields(t.fields_id)) {
+                guard_agg_eq_members(f.type);
+            }
         }
     }
 
@@ -8405,14 +8412,16 @@ private:
             return lower_short_circuit(bin, b);
         }
 
-        // Unpacked-struct equality (LRM 7.2, 11.4.5): a whole-struct value cannot
-        // be loaded, so `==` / `!=` reduce to a per-member comparison. The members'
-        // 4-state Eq results fold with Land (X propagates: any definite mismatch
-        // is 0, else X if any member is X, else 1); `!=` negates that reduction.
-        // slang wraps each operand in a bitstream Conversion, so the struct type
-        // is on the unwrapped operand, not `bin.left().type`.
+        // Unpacked aggregate equality (LRM 7.2, 11.2.2, 11.4.5): a whole struct /
+        // fixed unpacked array value cannot be loaded, so `==` / `!=` reduce to a
+        // per-leaf comparison. The leaf Eq results fold with Land (X propagates:
+        // any definite mismatch is 0, else X if any leaf is X, else 1); `!=`
+        // negates that reduction. slang wraps each operand in a bitstream
+        // Conversion, so the aggregate type is on the unwrapped operand.
         if ((bin.op == B::Equality || bin.op == B::Inequality) &&
-            is_unpacked_struct(*unwrap_conversion(bin.left()).type)) {
+            (is_unpacked_struct(*unwrap_conversion(bin.left()).type) ||
+             unwrap_conversion(bin.left()).type->getCanonicalType().as_if<
+                 slang::ast::FixedSizeUnpackedArrayType>() != nullptr)) {
             const ir::SourceLoc l   = loc(bin);
             const ir::Index     acc = lower_struct_eq(unwrap_conversion(bin.left()),
                                                       unwrap_conversion(bin.right()), b, l);

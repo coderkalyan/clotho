@@ -1391,6 +1391,29 @@ private:
         return lv;
     }
 
+    // Derive the `pos`-th (0-based) element's lvalue from a fixed unpacked-array
+    // lvalue, for a constant-index aggregate walk (whole-array `==` / copy). A
+    // recursive-storage (is_agg) array pushes a nested-GEP index step; a flat
+    // memory advances the single flattened leaf index by pos * inner leaf count
+    // -- the same two storage models the runtime ElemSelect path handles, minus
+    // the dyn_inrange gate (an in-bounds constant position is always valid).
+    LValue agg_elem(LValue lv, Ref array_type, uint32_t pos) {
+        const Type& at = std::get<Type>(mod_.pool.get(array_type));
+        if (lv.is_agg) {
+            lv.agg_path.push_back(b_.getInt32(pos));
+            lv.agg_leaf = is_leaf_type(at.element);
+            if (lv.agg_leaf) {
+                fill_agg_leaf(lv, at.element);
+            }
+            return lv;
+        }
+        const uint32_t stride = array_leaf_count(at.element);
+        llvm::Value*   off    = b_.getInt32(pos * stride);
+        lv.elem_idx           = lv.elem_idx != nullptr ? b_.CreateAdd(lv.elem_idx, off) : off;
+        lv.bit_off            = b_.getInt32(0);
+        return lv;
+    }
+
     // Build one instance scope's state struct: its own signals' slots (field k
     // == scope signal k). Children are NOT nested as fields — each scope owns
     // its own state global, so a child scope recurses into its own anchor and
@@ -14001,6 +14024,18 @@ private:
             for (uint32_t k = 0; k < fields.size(); ++k) {
                 const Plane e = lower_agg_eq(agg_member(lhs, type, k), agg_member(rhs, type, k),
                                              fields[k].type);
+                acc = k == 0 ? e : lower_logical(Inst::Tag::Land, acc, e);
+            }
+            return acc;
+        }
+        if (t.kind == Type::Kind::UnpackedArray) {
+            // Element-wise compare AND-reduced with Land (LRM 11.4.5 X-propagation,
+            // same reduction as the struct case). Position order is irrelevant to
+            // the reduction, so walk 0..count-1.
+            const uint32_t count = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
+            Plane          acc{};
+            for (uint32_t k = 0; k < count; ++k) {
+                const Plane e = lower_agg_eq(agg_elem(lhs, type, k), agg_elem(rhs, type, k), t.element);
                 acc = k == 0 ? e : lower_logical(Inst::Tag::Land, acc, e);
             }
             return acc;
