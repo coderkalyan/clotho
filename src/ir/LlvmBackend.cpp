@@ -1210,6 +1210,18 @@ private:
         return t.kind == Type::Kind::Struct && !t.is_packed;
     }
 
+    // Whether a type is an unpacked aggregate passed / stored via the recursive
+    // canonical (never may-z-narrowed) storage mirror: any fixed unpacked array,
+    // or an unpacked struct. Broader than contains_struct (which is false for a
+    // plain scalar-element array) — the function-call ABI and frame-local layout
+    // use this so a whole array passes by pointer with a canonical layout, memcpy
+    // -compatible with the caller's canonical actual (a flat module array may be
+    // z-elided narrower, so the caller materializes a canonical temp first).
+    bool is_agg_abi(Ref type) const {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        return t.kind == Type::Kind::UnpackedArray || (t.kind == Type::Kind::Struct && !t.is_packed);
+    }
+
     // Whether a type takes the recursive aggregate storage mirror: it contains
     // an unpacked struct, or a fixed array dimension over a heap-handle
     // (dynamic array / queue) element whose per-cell init/deinit/copy only the
@@ -1442,6 +1454,29 @@ private:
         return lv;
     }
 
+    // Derive the `pos`-th (0-based) element's lvalue from a fixed unpacked-array
+    // lvalue, for a constant-index aggregate walk (whole-array `==` / copy). A
+    // recursive-storage (is_agg) array pushes a nested-GEP index step; a flat
+    // memory advances the single flattened leaf index by pos * inner leaf count
+    // -- the same two storage models the runtime ElemSelect path handles, minus
+    // the dyn_inrange gate (an in-bounds constant position is always valid).
+    LValue agg_elem(LValue lv, Ref array_type, uint32_t pos) {
+        const Type& at = std::get<Type>(mod_.pool.get(array_type));
+        if (lv.is_agg) {
+            lv.agg_path.push_back(b_.getInt32(pos));
+            lv.agg_leaf = is_leaf_type(at.element);
+            if (lv.agg_leaf) {
+                fill_agg_leaf(lv, at.element);
+            }
+            return lv;
+        }
+        const uint32_t stride = array_leaf_count(at.element);
+        llvm::Value*   off    = b_.getInt32(pos * stride);
+        lv.elem_idx           = lv.elem_idx != nullptr ? b_.CreateAdd(lv.elem_idx, off) : off;
+        lv.bit_off            = b_.getInt32(0);
+        return lv;
+    }
+
     // Build one instance scope's state struct: its own signals' slots (field k
     // == scope signal k). Children are NOT nested as fields — each scope owns
     // its own state global, so a child scope recurses into its own anchor and
@@ -1541,7 +1576,7 @@ private:
             // ArrayType / leaf slots), addressed by a composed GEP path. Its
             // scalar/string leaves reachable by a static (struct-field-only) path
             // are enumerated for nonblocking staging.
-            if (needs_agg_storage(sigs[i].type)) {
+            if (needs_agg_storage(sigs[i].type) || (sigs[i].force_agg && is_agg_abi(sigs[i].type))) {
                 slot.is_agg     = true;
                 slot.has_z      = false;
                 slot.storage_ty = agg_storage_ty(sigs[i].type);
@@ -1733,6 +1768,7 @@ private:
                     return true;
                 case Inst::Tag::PartSelect:
                 case Inst::Tag::ElemSelect:
+                case Inst::Tag::ArrSlice:
                 case Inst::Tag::MemberSelect:
                     lv = ir.payload(lv).op_extra.op;
                     break;
@@ -1755,6 +1791,7 @@ private:
                 case Inst::Tag::DynPartSelect:
                     return true;
                 case Inst::Tag::ElemSelect:
+                case Inst::Tag::ArrSlice:
                 case Inst::Tag::MemberSelect:
                     lv = ir.payload(lv).op_extra.op;
                     break;
@@ -1777,6 +1814,7 @@ private:
                     break;
                 case Inst::Tag::PartSelect:
                 case Inst::Tag::DynPartSelect:
+                case Inst::Tag::ArrSlice:
                 case Inst::Tag::MemberSelect:
                     lv = ir.payload(lv).op_extra.op;
                     break;
@@ -2756,7 +2794,7 @@ private:
                 params.push_back(ptr); // &caller_temp.z (copy-out at each return)
                 continue;
             }
-            if (is_string_type(pt) || contains_struct(pt)) {
+            if (is_string_type(pt) || is_agg_abi(pt)) {
                 // A string handle or an aggregate's storage passes by pointer (In
                 // only — the frontend guards aggregate out/inout formals); the
                 // callee copy-in gives value semantics. (A dynamic array is
@@ -2771,7 +2809,7 @@ private:
         // A string, aggregate, dynamic-array, or queue result returns through a
         // trailing out-param the caller owns (its call-site temp) — no plane form.
         llvm::Type* rty = fn_return_ty(f.return_type);
-        if (is_string_type(f.return_type) || contains_struct(f.return_type) ||
+        if (is_string_type(f.return_type) || is_agg_abi(f.return_type) ||
             is_handle_type(f.return_type)) {
             rty = b_.getVoidTy();
             params.push_back(ptr);
@@ -2837,7 +2875,7 @@ private:
             return true;
         }
         // An aggregate is one pointer (In only — out/inout aggregates are guarded).
-        if (contains_struct(f.param_types[k])) {
+        if (is_agg_abi(f.param_types[k])) {
             return true;
         }
         // A dynamic array or queue is one handle pointer in every direction (input /
@@ -2920,7 +2958,13 @@ private:
             // actual pointer. The redirect GEPs a packed slot, so force one here.
             const bool is_ref_formal = i < f.arg_dirs.size() && f.arg_dirs[i] == ArgDir::Ref;
             frame_slots_[i].is_ref   = is_ref_formal;
-            if (needs_agg_storage(f.local_types[i])) {
+            // A plain fixed unpacked array frame local / by-value formal takes the
+            // canonical aggregate storage mirror too, so its element addressing and
+            // copy-in reuse the aggregate path. Struct-bearing types keep their
+            // exact prior treatment (needs_agg_storage); a ref array formal keeps
+            // the dead-field redirect (handled below).
+            if (needs_agg_storage(f.local_types[i]) ||
+                (!is_ref_formal && is_agg_abi(f.local_types[i]))) {
                 frame_slots_[i].is_agg     = true;
                 frame_slots_[i].storage_ty = agg_storage_ty(f.local_types[i]);
                 fields[i]                  = frame_slots_[i].storage_ty;
@@ -3095,7 +3139,7 @@ private:
     // guarded in the frontend, so only inputs occur.
     void emit_fn_agg_copyin(const Function& f) {
         for (uint32_t k = 0; k < f.param_types.size(); ++k) {
-            if (!contains_struct(f.param_types[k])) {
+            if (!is_agg_abi(f.param_types[k])) {
                 continue;
             }
             emit_agg_storage_copy(b_.CreateStructGEP(frame_ty_, frame_, k),
@@ -3283,7 +3327,7 @@ private:
         for (uint32_t k = 0; k < f.param_types.size(); ++k) {
             // An aggregate formal is passed by pointer and copied in by
             // emit_fn_agg_copyin (functions only; aggregate task args are guarded).
-            if (contains_struct(f.param_types[k])) {
+            if (is_agg_abi(f.param_types[k])) {
                 continue;
             }
             const uint32_t w    = width_of(f.param_types[k]);
@@ -4416,6 +4460,7 @@ private:
                 case Inst::Tag::PartSelect:
                 case Inst::Tag::DynPartSelect:
                 case Inst::Tag::ElemSelect:
+                case Inst::Tag::ArrSlice:
                 case Inst::Tag::Add:
                 case Inst::Tag::Sub:
                 case Inst::Tag::Mul:
@@ -7845,6 +7890,14 @@ private:
                 const Type& at = std::get<Type>(mod_.pool.get(es.array_type));
                 return from_ref(at.element);
             }
+            case Inst::Tag::ArrSlice: {
+                // An array lvalue, never a scalar value; report the element leaf
+                // type for exhaustiveness (the slice is only ever consumed as an
+                // aggregate, so this is not used on a value path).
+                const auto  as = ir_->extra_data<ArrSlice>(p.op_extra.extra);
+                const Type& st = std::get<Type>(mod_.pool.get(as.slice_type));
+                return from_ref(st.element);
+            }
             case Inst::Tag::MemberSelect: {
                 // The result is the selected member's own type.
                 const auto   ms     = ir_->extra_data<MemberSelect>(p.op_extra.extra);
@@ -8596,6 +8649,26 @@ private:
             case Inst::Tag::MemberSelect: {
                 const auto ms = ir_->extra_data<MemberSelect>(p.op_extra.extra);
                 set_lvalue(i, agg_member(lvalue_of(p.op_extra.op), ms.struct_type, ms.field_index));
+                return;
+            }
+            case Inst::Tag::ArrSlice: {
+                // Pre-advance the base array lvalue to the slice's first element
+                // (position 0). Downstream elem_select / agg_elem then index the
+                // slice relative to this anchor. Flat-storage arrays only -- an
+                // aggregate-element (array-of-struct) slice is frontend-guarded.
+                LValue     lv = lvalue_of(p.op_extra.op);
+                const auto as = ir_->extra_data<ArrSlice>(p.op_extra.extra);
+                const Type& st = std::get<Type>(mod_.pool.get(as.slice_type));
+                if (lv.is_agg) {
+                    throw BackendError{ "aggregate-element unpacked-array slice not supported" };
+                }
+                const uint32_t stride = array_leaf_count(st.element);
+                if (as.first_pos != 0) {
+                    llvm::Value* off = b_.getInt32(as.first_pos * stride);
+                    lv.elem_idx      = lv.elem_idx != nullptr ? b_.CreateAdd(lv.elem_idx, off) : off;
+                }
+                lv.bit_off = b_.getInt32(0);
+                set_lvalue(i, lv);
                 return;
             }
             case Inst::Tag::ClassNew: {
@@ -12158,7 +12231,7 @@ private:
             b_.CreateRetVoid();
             return;
         }
-        if (contains_struct(cur_fn_->return_type)) {
+        if (is_agg_abi(cur_fn_->return_type)) {
             // Copy the aggregate result (the Ret operand is its lvalue) out through
             // the trailing storage-pointer out-param the caller owns.
             emit_agg_storage_copy(fn_->getArg(fn_->arg_size() - 1),
@@ -12229,7 +12302,7 @@ private:
                 const LValue& lv = lvalue_of(a);
                 argv.push_back(lv_mm_ptr(lv));
                 argv.push_back(lv_z_ptr(lv));
-            } else if (contains_struct(f.param_types[k])) {
+            } else if (is_agg_abi(f.param_types[k])) {
                 // An aggregate actual passes its storage pointer (the frontend
                 // emitted it as an lvalue); the callee copies it in.
                 argv.push_back(agg_slot_ptr(lvalue_of(a)));
@@ -12243,7 +12316,7 @@ private:
             }
             ++k;
         }
-        if (contains_struct(f.return_type)) {
+        if (is_agg_abi(f.return_type)) {
             // Safe-temp aggregate return: the callee memcpies its result into a
             // caller stack temp we pass as the trailing out-param; the call result
             // is that temp lvalue (the frontend copies it into the target).
@@ -14402,6 +14475,18 @@ private:
             for (uint32_t k = 0; k < fields.size(); ++k) {
                 const Plane e = lower_agg_eq(agg_member(lhs, type, k), agg_member(rhs, type, k),
                                              fields[k].type);
+                acc = k == 0 ? e : lower_logical(Inst::Tag::Land, acc, e);
+            }
+            return acc;
+        }
+        if (t.kind == Type::Kind::UnpackedArray) {
+            // Element-wise compare AND-reduced with Land (LRM 11.4.5 X-propagation,
+            // same reduction as the struct case). Position order is irrelevant to
+            // the reduction, so walk 0..count-1.
+            const uint32_t count = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
+            Plane          acc{};
+            for (uint32_t k = 0; k < count; ++k) {
+                const Plane e = lower_agg_eq(agg_elem(lhs, type, k), agg_elem(rhs, type, k), t.element);
                 acc = k == 0 ? e : lower_logical(Inst::Tag::Land, acc, e);
             }
             return acc;

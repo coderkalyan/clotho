@@ -179,6 +179,7 @@ struct Analysis {
                 case Inst::Tag::PartSelect:
                 case Inst::Tag::DynPartSelect:
                 case Inst::Tag::MemberSelect:
+                case Inst::Tag::ArrSlice:
                     val_z[raw] = z_of(p.op_extra.op);
                     break;
                 case Inst::Tag::ElemSelect: {

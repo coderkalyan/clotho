@@ -248,3 +248,21 @@ TEST_CASE("stream dynamic operand rejected") {
         endmodule
     )", "dynamically-sized");
 }
+
+TEST_CASE("whole unpacked array as a streaming-concat operand (LRM 11.4.14)") {
+    // The array serializes to its leaf bit-concatenation, first element at the
+    // MSB; `<<` reverses the block order. Cross-checked against verilator.
+    CHECK(run_capture(R"(
+        module m;
+            logic [7:0] a [0:3];
+            logic [31:0] be, le;
+            int i;
+            initial begin
+                for (i = 0; i < 4; i++) a[i] = 8'h10 + i;
+                be = {>>{a}};
+                le = {<<8{a}};
+                $display("%h %h", be, le);
+            end
+        endmodule
+    )") == "10111213 13121110\n");
+}

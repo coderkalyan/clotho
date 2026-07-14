@@ -316,6 +316,7 @@ LvalueRoot lvalue_root(const Ir& ir, Index lv) {
             case Inst::Tag::PartSelect:
             case Inst::Tag::DynPartSelect:
             case Inst::Tag::ElemSelect:
+            case Inst::Tag::ArrSlice:
             case Inst::Tag::MemberSelect:
                 lv    = ir.payload(lv).op_extra.op;
                 whole = false;

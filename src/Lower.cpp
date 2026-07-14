@@ -1286,6 +1286,16 @@ private:
         return t.getCanonicalType().isUnpackedStruct();
     }
 
+    // True if a type uses the by-pointer aggregate function-call ABI: any fixed
+    // unpacked array or unpacked struct (mirrors the backend is_agg_abi). Distinct
+    // from is_aggregate (struct-bearing only), which selects the storage model — a
+    // plain array is by-pointer at the ABI but flat in module storage.
+    static bool is_agg_abi_type(const slang::ast::Type& t) {
+        const slang::ast::Type& ct = t.getCanonicalType();
+        return ct.isUnpackedStruct() ||
+               ct.as_if<slang::ast::FixedSizeUnpackedArrayType>() != nullptr;
+    }
+
     // True if a type contains an unpacked struct at any nesting depth (a bare
     // struct or an unpacked array whose leaf is one): it is backed by the
     // recursive aggregate model, so whole-object assignment / initialization
@@ -1609,10 +1619,8 @@ private:
                        ir::Builder& b, ir::SourceLoc l) {
         const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
         if (t.kind == ir::Type::Kind::UnpackedArray) {
-            if (tag != ir::Inst::Tag::Store) {
-                fail("nonblocking whole-object copy of an unpacked-array aggregate is not "
-                     "supported");
-            }
+            // A nonblocking copy decomposes to per-element StoreNb: each element
+            // write into the array rides the backend's deferred array-NBA queue.
             const uint32_t n = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
             for (uint32_t e = 0; e < n; ++e) {
                 const int32_t   coord = t.left <= t.right ? static_cast<int32_t>(t.left + e)
@@ -1759,6 +1767,16 @@ private:
         return t.kind == ir::Type::Kind::Struct && !t.is_packed;
     }
 
+    // Whether an interned IR type is an unpacked aggregate passed / returned by
+    // pointer through the canonical aggregate ABI: any fixed unpacked array, or an
+    // unpacked struct (mirrors the backend is_agg_abi). Broader than
+    // contains_struct_ref, which is false for a plain scalar-element array.
+    bool is_agg_abi_ref(ir::Ref type) const {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        return t.kind == ir::Type::Kind::UnpackedArray ||
+               (t.kind == ir::Type::Kind::Struct && !t.is_packed);
+    }
+
     // Whether a whole-object copy of the type may be a single memcpy of its
     // storage: no leaf owns a heap buffer (string / dynamic array / queue), so
     // duplicating the byte image duplicates the value. A class-handle leaf IS
@@ -1829,41 +1847,48 @@ private:
         return b.concat(parts, l);
     }
 
-    // 1-bit 4-state equality of two whole unpacked structs: one AggEq node the
-    // backend expands into per-leaf `==` results AND-reduced with Land (the
-    // reduction carries the LRM 11.4.5 X-propagation). Both operands must be
-    // struct lvalues (a '{...} pattern compare is a follow-up); an array member
-    // is guarded (element-wise compare is a follow-up).
+    // 1-bit 4-state equality of two whole unpacked aggregates (struct or fixed
+    // unpacked array): one AggEq node the backend expands per leaf, AND-reducing
+    // the per-leaf `==` results with Land (the reduction carries LRM 11.4.5
+    // X-propagation). Both operands must be aggregate lvalues (a '{...} pattern
+    // compare is a follow-up); a heap-owning leaf (string is handled; queue /
+    // dynamic array is guarded) is rejected.
     ir::Index lower_struct_eq(const Expression& lhs, const Expression& rhs, ir::Builder& b,
                               ir::SourceLoc l) {
         const Expression& le = unwrap_conversion(lhs);
         const Expression& re = unwrap_conversion(rhs);
-        if (!is_struct_lvalue_shape(le) || !is_struct_lvalue_shape(re)) {
-            fail("unpacked struct equality is only supported between struct variables");
+        // An aggregate lvalue: a variable / member / element, or a fixed
+        // unpacked-array slice (an ArrSlice lvalue), on either side.
+        const auto agg_eq_operand = [](const Expression& e) {
+            return is_struct_lvalue_shape(e) ||
+                   (e.kind == ExpressionKind::RangeSelect && is_unpacked_array(e));
+        };
+        if (!agg_eq_operand(le) || !agg_eq_operand(re)) {
+            fail("unpacked aggregate equality is only supported between aggregate variables");
         }
         const ir::Ref sty = lower_type(*lhs.type);
         guard_agg_eq_members(sty);
         return b.agg_eq(lower_lvalue(le, b), lower_lvalue(re, b), sty, l);
     }
 
-    // Reject comparable-aggregate shapes the backend expansion does not cover.
+    // Reject comparable-aggregate leaf shapes the backend AggEq expansion does
+    // not cover. An unpacked-array member is walked element-wise (supported);
+    // only a queue / dynamic-array leaf still needs the length+element compare.
     void guard_agg_eq_members(ir::Ref type) {
         const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
-        if (t.kind == ir::Type::Kind::UnpackedArray) {
-            // TODO: equality of an aggregate with an unpacked-array member — an
-            // element-wise compare (docs/design/unpacked-struct.md).
-            fail("equality of an aggregate with an unpacked-array member is not supported");
-        }
-        if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
-            for (const auto& f : module_.pool.struct_fields(t.fields_id)) {
-                guard_agg_eq_members(f.type);
-            }
-        }
         if (value_cat(type) == ValueCat::handle) {
             // TODO: equality of an aggregate with a queue / dynamic-array member
             // needs a length compare plus an element-wise walk (LRM 7.5/7.10).
             fail("equality of an aggregate with a queue / dynamic array member is "
                  "not supported");
+        }
+        if (t.kind == ir::Type::Kind::UnpackedArray) {
+            guard_agg_eq_members(t.element);
+        }
+        if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
+            for (const auto& f : module_.pool.struct_fields(t.fields_id)) {
+                guard_agg_eq_members(f.type);
+            }
         }
     }
 
@@ -7121,8 +7146,14 @@ private:
                 // TODO: %v needs net strength modeling (LRM §21.2.1.4).
                 fail("%v (net signal strength) is not supported");
             case 'p':
-                // TODO: %p needs aggregate rendering (LRM §21.2.1.6).
-                fail("%p (assignment pattern) is not supported");
+                // %p renders an aggregate as an assignment pattern (LRM §21.2.1.6);
+                // build_format expands it at lower time into `'{...}` text plus a
+                // per-leaf spec. Only the bare form is supported (a width / flags on
+                // the whole pattern is not modeled).
+                if (spec.has_width || spec.has_prec || spec.left_justify) {
+                    fail("%p does not take a field width, precision, or justification");
+                }
+                break;
             default:
                 fail(std::string("undefined format specifier '%") + spec.conv +
                      "' (LRM 21.2.1.1)");
@@ -7170,6 +7201,70 @@ private:
         }
     }
 
+    // Expand a %p operand (LRM §21.2.1.6) into assignment-pattern text plus its
+    // per-leaf value args. A scalar renders as its decimal value; a fixed unpacked
+    // array / unpacked struct renders `'{e0, e1, ...}` recursively. Integral and
+    // real leaves only (a string / handle leaf is guarded).
+    void expand_p_arg(const Expression& arg, std::string& frag, std::vector<ir::Index>& args,
+                      ir::Builder& b) {
+        const ir::Ref ty = lower_type(*arg.type);
+        if (!is_agg_abi_ref(ty)) {
+            frag += "%0d";
+            args.push_back(lower_expr(arg, b));
+            return;
+        }
+        expand_p_lvalue(lower_lvalue(unwrap_conversion(arg), b), ty, frag, args, b, loc(arg));
+    }
+
+    void expand_p_lvalue(ir::Index lv, ir::Ref ty, std::string& frag, std::vector<ir::Index>& args,
+                         ir::Builder& b, ir::SourceLoc l) {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(ty));
+        if (t.kind == ir::Type::Kind::UnpackedArray) {
+            frag += "'{";
+            const uint32_t n = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
+            for (uint32_t k = 0; k < n; ++k) {
+                if (k != 0) {
+                    frag += ", ";
+                }
+                const int32_t coord = t.left <= t.right ? static_cast<int32_t>(t.left + k)
+                                                        : static_cast<int32_t>(t.left - k);
+                const ir::Index idx = b.constant(
+                    module_.pool.put_int(make_int_type(32, false, true),
+                                         static_cast<uint64_t>(static_cast<int64_t>(coord))),
+                    l);
+                expand_p_lvalue(b.elem_select(lv, idx, ty, l), t.element, frag, args, b, l);
+            }
+            frag += "}";
+            return;
+        }
+        if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
+            // `'{field:val, ...}` — the member names are emitted (matching the
+            // available %p oracle, verilator; the LRM leaves the exact layout
+            // implementation-defined).
+            frag += "'{";
+            const auto fields = module_.pool.struct_fields(t.fields_id);
+            for (uint32_t i = 0; i < fields.size(); ++i) {
+                if (i != 0) {
+                    frag += ", ";
+                }
+                frag += module_.pool.field_name(fields[i]);
+                frag += ':';
+                expand_p_lvalue(b.member_select(lv, i, ty, l), fields[i].type, frag, args, b, l);
+            }
+            frag += "}";
+            return;
+        }
+        if (value_cat(ty) != ValueCat::scalar) {
+            // TODO: %p of a string / dynamic-array / queue leaf (needs the element
+            // string / handle rendering path).
+            fail("%p of a string or heap-handle aggregate leaf is not supported");
+        }
+        // Integral leaves render in hex with a `'h` base tag; reals as %g (matching
+        // verilator's %p leaf format).
+        frag += module_.pool.is_float(ty) ? "%g" : "'h%0h";
+        args.push_back(b.unary(ir::Inst::Tag::Load, lv, l));
+    }
+
     void build_format(std::span<const Expression* const> format_args, std::string& fmt,
                       std::vector<ir::Index>& args, ir::Builder& b, char default_conv = 'd') {
         // Conversion chars (lowercase) of specifiers seen but not yet matched to
@@ -7211,6 +7306,19 @@ private:
                     // (LRM §21.2.1.1); a string object formats as a string.
                     fmt += '%';
                     fmt += str ? 's' : default_conv;
+                }
+                if (conv == 'p') {
+                    // Expand the aggregate operand into `'{...}` text plus a per-leaf
+                    // value spec (LRM §21.2.1.6), splicing it in place of the `%p`
+                    // token. The leaf args are pushed here, in the same order the
+                    // spliced specs appear, so positional matching stays correct.
+                    std::string frag;
+                    expand_p_arg(*arg, frag, args, b);
+                    const size_t pos = fmt.find("%p");
+                    if (pos != std::string::npos) {
+                        fmt.replace(pos, 2, frag);
+                    }
+                    continue;
                 }
                 if (str && conv != 's') {
                     // TODO: %d/%h/... of a string object (would need the packed
@@ -7632,13 +7740,19 @@ private:
             return lower_assoc_assign(a, b);
         }
         if (is_unpacked_array(a.left())) {
-            // A whole blocking copy of one trivially copyable unpacked array into
-            // another is a single memcpy of the storage (same AggCopy path as an
-            // aggregate). A nonblocking copy, a `'{...}` pattern, or a string array
-            // (heap-owning elements) still decompose / are unsupported.
-            const ir::Ref     ty  = lower_type(*a.left().type);
-            const Expression& src = unwrap_conversion(a.right());
-            if (!a.isNonBlocking() && is_trivially_copyable(ty) && is_whole_array_lvalue(src)) {
+            // A whole blocking copy of one trivially copyable plain array into
+            // another plain array is a single memcpy of the storage (AggCopy). A
+            // nonblocking copy, a `'{...}` pattern, a string-literal assignment,
+            // or a slice on either side decomposes per element: each leaf store
+            // into an array element rides the backend's deferred array-NBA queue
+            // (nba_classify_ir) for the NBA case. A string array (heap-owning
+            // elements) is still unsupported.
+            const ir::Ref       ty  = lower_type(*a.left().type);
+            const Expression&   src = unwrap_conversion(a.right());
+            const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
+            const bool          whole_lhs = is_whole_array_lvalue(a.left());
+            if (!a.isNonBlocking() && whole_lhs && is_trivially_copyable(ty) &&
+                is_whole_array_lvalue(src)) {
                 b.agg_copy(lower_lvalue(a.left(), b), lower_lvalue(src, b), ty, loc(a));
                 return true_const(b, loc(a));
             }
@@ -7646,28 +7760,42 @@ private:
                 // `mem = '{...}`: element-wise store of the (slang-ordered) pattern
                 // into a scalar-element unpacked array (`is_aggregate` routes an
                 // array of aggregates through emit_struct_store instead).
-                if (a.isNonBlocking()) {
-                    // TODO: nonblocking `'{...}` to an unpacked array — per-leaf NBA
-                    // into array elements needs the deferred array-record path.
-                    fail("nonblocking '{...} assignment to an unpacked array is not supported");
-                }
-                emit_agg_store(lower_lvalue(a.left(), b), ty, src, ir::Inst::Tag::Store, b, loc(a));
+                emit_agg_store(lower_lvalue(a.left(), b), ty, src, tag, b, loc(a));
                 return true_const(b, loc(a));
             }
             if (src.kind == ExpressionKind::StringLiteral) {
                 // `mem = "literal"` (LRM 5.9): same element-wise store as the
                 // '{...} pattern case above.
-                if (a.isNonBlocking()) {
-                    // TODO: nonblocking string-literal assignment to an unpacked
-                    // array — per-leaf NBA into array elements needs the
-                    // deferred array-record path.
-                    fail("nonblocking string literal assignment to an unpacked array is not supported");
-                }
-                emit_agg_store(lower_lvalue(a.left(), b), ty, src, ir::Inst::Tag::Store, b, loc(a));
+                emit_agg_store(lower_lvalue(a.left(), b), ty, src, tag, b, loc(a));
                 return true_const(b, loc(a));
             }
-            // TODO: nonblocking whole-array copy, string arrays — element-wise
-            // copy / aggregate lowering.
+            const bool slice_src = src.kind == ExpressionKind::RangeSelect && is_unpacked_array(src);
+            if (is_trivially_copyable(ty) && (is_whole_array_lvalue(src) || slice_src)) {
+                // Array-to-array copy where a fast memcpy does not apply: a
+                // nonblocking copy, or a slice (ArrSlice lvalue) on either side.
+                // Per-element, element-order (position k of dst <- position k of
+                // the source). A single-memcpy deferred record for the NBA
+                // whole-array case is a perf follow-up.
+                emit_agg_copy(lower_lvalue(a.left(), b), lower_lvalue(src, b), ty, tag, b, loc(a));
+                return true_const(b, loc(a));
+            }
+            if (src.kind == ExpressionKind::Call && is_trivially_copyable(ty)) {
+                // `arr = f(...)`: the callee returns its result into a canonical
+                // aggregate temp (the call result lvalue); copy it into the array
+                // target element-wise (a flat / narrowed target is not memcpy-
+                // compatible with the canonical result — the same layout hazard the
+                // by-value argument path handles). Blocking and nonblocking both
+                // decompose per element.
+                const std::optional<ir::Index> cv =
+                    lower_user_call(src.as<CallExpression>(), b);
+                if (!cv) {
+                    fail("whole-array assignment from a void call");
+                }
+                emit_agg_copy(lower_lvalue(a.left(), b), *cv, ty, tag, b, loc(a));
+                return true_const(b, loc(a));
+            }
+            // TODO: whole-array copy of a string array (heap-owning elements) —
+            // element-wise deep copy.
             fail("whole unpacked array assignment is not supported");
         }
         // s[i] = c writes one character in place; out-of-range or a zero byte is
@@ -8018,6 +8146,47 @@ private:
     // `>>` (sliceSize==0): plain left-to-right concat, no reorder.
     // `<<` (sliceSize>0): concatenate, then reverse the order of sliceSize-bit
     // blocks (rightmost block becomes the MSB of the result).
+    // Whether an expression is a whole unpacked aggregate (fixed array / unpacked
+    // struct) used as a bitstream operand — it has no flat load, so it serializes
+    // to a concatenation of its leaf bits (LRM 11.4.14 / §11.2.2).
+    bool is_agg_bitstream_operand(const Expression& e) const {
+        return is_agg_abi_type(*e.type);
+    }
+
+    // Serialize a whole unpacked aggregate lvalue to a packed bit-value: a
+    // left-to-right concatenation of its leaf values (declaration / declared-range
+    // order, first element/field at the MSB, per LRM 11.4.14.2 / 7.2.1). The
+    // element / field bit widths sum to $bits of the aggregate.
+    ir::Index serialize_agg_lvalue(ir::Index lv, ir::Ref ty, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(ty));
+        std::vector<ir::Index> parts;
+        if (t.kind == ir::Type::Kind::UnpackedArray) {
+            const uint32_t n = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
+            for (uint32_t k = 0; k < n; ++k) {
+                const int32_t coord = t.left <= t.right ? static_cast<int32_t>(t.left + k)
+                                                        : static_cast<int32_t>(t.left - k);
+                const ir::Index idx = b.constant(
+                    module_.pool.put_int(make_int_type(32, false, true),
+                                         static_cast<uint64_t>(static_cast<int64_t>(coord))),
+                    l);
+                parts.push_back(serialize_agg_lvalue(b.elem_select(lv, idx, ty, l), t.element, b, l));
+            }
+        } else if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
+            const auto fields = module_.pool.struct_fields(t.fields_id);
+            for (uint32_t i = 0; i < fields.size(); ++i) {
+                parts.push_back(serialize_agg_lvalue(b.member_select(lv, i, ty, l), fields[i].type, b, l));
+            }
+        } else {
+            if (value_cat(ty) != ValueCat::scalar || module_.pool.is_float(ty)) {
+                // TODO: a string / real / heap-handle leaf in a bitstream (LRM
+                // 11.4.14 restricts streams to bit-stream types anyway).
+                fail("streaming a non-integral aggregate leaf is not supported");
+            }
+            return b.unary(ir::Inst::Tag::Load, lv, l);
+        }
+        return parts.size() == 1 ? parts[0] : b.concat(parts, l);
+    }
+
     ir::Index lower_streaming_concat(const StreamingConcatenationExpression& sc,
                                      ir::Ref target_ty, ir::Builder& b, ir::SourceLoc l) {
         if (!sc.isFixedSize()) {
@@ -8041,6 +8210,12 @@ private:
                 const ir::Ref inner_ty = make_int_type(
                     static_cast<uint32_t>(inner.getBitstreamWidth()), is_four_outer, false);
                 parts.push_back(lower_streaming_concat(inner, inner_ty, b, l));
+            } else if (is_agg_bitstream_operand(operand)) {
+                // A whole unpacked array / struct operand serializes to its leaf
+                // bit-concatenation (LRM 11.4.14); it has no flat load.
+                parts.push_back(
+                    serialize_agg_lvalue(lower_lvalue(unwrap_conversion(operand), b),
+                                         lower_type(*operand.type), b, l));
             } else {
                 parts.push_back(lower_expr(operand, b));
             }
@@ -8256,6 +8431,14 @@ private:
                 const RangeSelectExpression& rs   = expr.as<RangeSelectExpression>();
                 if (auto c = try_lower_constant_select(expr, b, l)) {
                     return *c;
+                }
+                if (is_unpacked_array(expr)) {
+                    // A fixed unpacked-array slice as a general by-value rvalue
+                    // (concat operand, $display %p, by-value argument). Supported
+                    // slice contexts (copy / equality / lvalue target) intercept
+                    // before this Load path; a raw value read needs a by-value
+                    // array ABI (same follow-up as a whole-array read).
+                    fail("whole unpacked array read is not supported");
                 }
                 const ir::Index              base = select_base_lvalue(rs.value(), b, l);
                 const ir::Index v = b.unary(ir::Inst::Tag::Load, lower_range_select(rs, base, b, l), l);
@@ -8594,14 +8777,16 @@ private:
             return lower_short_circuit(bin, b);
         }
 
-        // Unpacked-struct equality (LRM 7.2, 11.4.5): a whole-struct value cannot
-        // be loaded, so `==` / `!=` reduce to a per-member comparison. The members'
-        // 4-state Eq results fold with Land (X propagates: any definite mismatch
-        // is 0, else X if any member is X, else 1); `!=` negates that reduction.
-        // slang wraps each operand in a bitstream Conversion, so the struct type
-        // is on the unwrapped operand, not `bin.left().type`.
+        // Unpacked aggregate equality (LRM 7.2, 11.2.2, 11.4.5): a whole struct /
+        // fixed unpacked array value cannot be loaded, so `==` / `!=` reduce to a
+        // per-leaf comparison. The leaf Eq results fold with Land (X propagates:
+        // any definite mismatch is 0, else X if any leaf is X, else 1); `!=`
+        // negates that reduction. slang wraps each operand in a bitstream
+        // Conversion, so the aggregate type is on the unwrapped operand.
         if ((bin.op == B::Equality || bin.op == B::Inequality) &&
-            is_unpacked_struct(*unwrap_conversion(bin.left()).type)) {
+            (is_unpacked_struct(*unwrap_conversion(bin.left()).type) ||
+             unwrap_conversion(bin.left()).type->getCanonicalType().as_if<
+                 slang::ast::FixedSizeUnpackedArrayType>() != nullptr)) {
             const ir::SourceLoc l   = loc(bin);
             const ir::Index     acc = lower_struct_eq(unwrap_conversion(bin.left()),
                                                       unwrap_conversion(bin.right()), b, l);
@@ -8783,16 +8968,38 @@ private:
             fail("slice of a queue / dynamic array is not supported");
         }
         if (is_unpacked_array(rs.value())) {
-            // TODO: fixed-size unpacked array slice (LRM 7.4.5 `busB = busA[7:6]`,
-            // "a slice name of an unpacked array is an unpacked array"). Element
-            // storage is address-indexed, not a flat bit-vector, so the packed
-            // part-select math below is wrong for it -- guard loudly rather than
-            // let a slice comparison (`busA[7:6] == other`) silently fall through
-            // to a bogus bit-level compare (only caught here because neither
-            // operand is a *plain* whole-array reference -- that path is guarded
-            // separately, "whole unpacked array read is not supported" -- so two
-            // sliced operands slipped past every existing check).
-            fail("slice of a fixed-size unpacked array is not supported");
+            // Fixed-size unpacked array slice (LRM 7.4.5 `busB = busA[7:6]`, "a
+            // slice name of an unpacked array is an unpacked array"). Element
+            // storage is address-indexed, so this is an ArrSlice lvalue (a
+            // position-0-anchored sub-array), not a packed part-select. The
+            // per-element copy / eq / store paths consume it; a whole-slice
+            // by-value read is still guarded upstream.
+            if (rs.getSelectionKind() != RangeSelectionKind::Simple) {
+                // TODO: indexed part-select slice `a[i +: 2]` of an unpacked array
+                // (runtime base makes the first-element position non-constant).
+                fail("indexed part-select slice of an unpacked array is not supported");
+            }
+            if (is_aggregate(*rs.value().type)) {
+                // TODO: slice of an array whose element is an unpacked struct /
+                // heap handle (recursive aggregate storage) — the ArrSlice
+                // pre-advance is a flat-storage elem_idx step.
+                fail("slice of an unpacked array with aggregate elements is not supported");
+            }
+            const std::optional<int32_t> lo = try_const_int(rs.left());
+            if (!lo) {
+                fail("expected constant unpacked-array slice bounds");
+            }
+            const slang::ConstantRange base_range =
+                rs.value().type->getCanonicalType().as<slang::ast::FixedSizeUnpackedArrayType>().range;
+            // Storage position of the slice's first element (its left bound) in
+            // the base array: coordinate `left` maps to position 0 at the base's
+            // own left bound (the backend's element normalization), for either
+            // endianness.
+            const uint32_t first_pos =
+                base_range.left <= base_range.right
+                    ? static_cast<uint32_t>(*lo - base_range.left)
+                    : static_cast<uint32_t>(base_range.left - *lo);
+            return b.arr_slice(base, lower_type(*rs.type), first_pos, l);
         }
         // A range select on a multi-dim packed array picks whole W-wide elements
         // (LRM 7.4.6): both bounds and the width scale by the element width W.
@@ -9106,10 +9313,17 @@ private:
     // Outside a function: a module Signal. Inside a function: a persistent Signal
     // for a static local, else a per-call frame Local.
     void declare_storage(const VariableSymbol& vs, bool force_frame) {
-        if (fn_ctx_ != nullptr && vs.getType().getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
-            // TODO: unpacked arrays as function-frame locals. The frame layout has no
-            // per-element array storage yet; only module-level memories are supported.
-            fail("unpacked array as a function local is not supported");
+        if (fn_ctx_ != nullptr && !is_static_local(vs, force_frame) &&
+            vs.getType().getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
+            if (!is_trivially_copyable(lower_type(vs.getType()))) {
+                // TODO: a string / heap-handle-element array frame local (per-element
+                // init/deinit in the frame — the "unpacked arrays of string" gap).
+                fail("string- or handle-element unpacked array as a function local is "
+                     "not supported");
+            }
+            // A trivially copyable fixed array is a per-call frame Local with the
+            // canonical aggregate storage mirror (build_frame_layout). A static-
+            // lifetime array local keeps persistent module-memory storage below.
         }
         if (fn_ctx_ == nullptr) {
             declare_local(vs);
@@ -9152,13 +9366,14 @@ private:
             if (!fn_ctx_->has_ret_local) {
                 fail("return with a value in a void function");
             }
-            // An aggregate result's Ret operand is the returned object's lvalue
-            // (the backend copies its storage out through the return out-param).
-            if (contains_struct_ref(fn_ctx_->ret_type)) {
+            // An aggregate / whole-array result's Ret operand is the returned
+            // object's lvalue (the backend copies its storage out through the
+            // return out-param).
+            if (is_agg_abi_ref(fn_ctx_->ret_type)) {
                 const Expression& src = unwrap_conversion(*r.expr);
                 if (!is_struct_lvalue_shape(src)) {
-                    // TODO: return of a `'{...}` pattern / call result — materialize
-                    // into a temp first.
+                    // TODO: return of a `'{...}` pattern / call result / slice —
+                    // materialize into a temp first.
                     fail("aggregate return of a non-lvalue expression is not supported");
                 }
                 b.unary(ir::Inst::Tag::Ret, lower_lvalue(src, b), l);
@@ -9179,9 +9394,9 @@ private:
                     l);
         } else if (fn_ctx_->has_ret_local) {
             // `return;` in a non-void function yields the current function-var value:
-            // an aggregate / dynamic array yields its lvalue (copied out by the
-            // backend), else the loaded value.
-            if (contains_struct_ref(fn_ctx_->ret_type)) {
+            // an aggregate / whole array / dynamic array yields its lvalue (copied
+            // out by the backend), else the loaded value.
+            if (is_agg_abi_ref(fn_ctx_->ret_type)) {
                 b.unary(ir::Inst::Tag::Ret, b.local(fn_ctx_->ret_local, fn_ctx_->ret_type, l), l);
                 return;
             }
@@ -9692,9 +9907,10 @@ private:
         // copy is emitted for any direction. An aggregate formal is passed by pointer
         // and copied into its Local by the backend's aggregate copy-in.
         for (const FormalArgumentSymbol* fa : sub.getArguments()) {
-            if (is_aggregate(fa->getType())) {
+            if (is_agg_abi_type(fa->getType()) && fa->direction != slang::ast::ArgumentDirection::Ref) {
                 if (fa->direction != slang::ast::ArgumentDirection::In) {
-                    // TODO: aggregate output / inout function arg (copy-out).
+                    // TODO: aggregate / whole-array output / inout function arg
+                    // (copy-out through the pointer at each return).
                     fail("aggregate output / inout function argument is not supported");
                 }
                 if (!is_trivially_copyable(lower_type(fa->getType()))) {
@@ -9709,8 +9925,8 @@ private:
         }
 
         if (!is_void) {
-            if (is_aggregate(sub.returnValVar->getType()) && !is_trivially_copyable(return_type)) {
-                // TODO: by-value return of a string-containing aggregate.
+            if (is_agg_abi_type(sub.returnValVar->getType()) && !is_trivially_copyable(return_type)) {
+                // TODO: by-value return of a string-containing aggregate / array.
                 fail("by-value return of a string-containing aggregate is not supported");
             }
             ctx.has_ret_local = true;
@@ -9726,7 +9942,7 @@ private:
         const ir::SourceLoc el = to_source_loc(sub.location);
         if (is_void) {
             b.ret_void(el);
-        } else if (is_aggregate(sub.returnValVar->getType())) {
+        } else if (is_agg_abi_type(sub.returnValVar->getType())) {
             b.unary(ir::Inst::Tag::Ret, b.local(ctx.ret_local, ctx.ret_type, el), el);
         } else {
             const ir::Index rv = b.local(ctx.ret_local, ctx.ret_type, el);
@@ -9857,11 +10073,13 @@ private:
             fail("task argument count mismatch");
         }
         for (const FormalArgumentSymbol* fa : formals) {
-            if (contains_struct_ref(lower_type(fa->getType()))) {
-                // TODO: aggregate task argument (by-pointer copy-in, plus copy-out
-                // for output / inout). The task coroutine ABI does not yet marshal
-                // aggregates; only functions do.
-                fail("unpacked struct / aggregate task argument is not supported");
+            if (is_agg_abi_ref(lower_type(fa->getType()))) {
+                // TODO: aggregate / whole-array task argument (by-pointer copy-in,
+                // plus copy-out for output / inout). The task coroutine ABI does not
+                // yet marshal aggregates by pointer; only functions do (declare_task
+                // has no aggregate param shape), so guard loud to avoid a silent
+                // ABI mismatch.
+                fail("unpacked struct / whole-array task argument is not supported");
             }
         }
         const ir::SourceLoc     l = loc(call);
@@ -9932,10 +10150,10 @@ private:
             }
             const ir::Ref pty = lower_type(formals[i]->getType());
             if (contains_struct_ref(pty)) {
-                // An aggregate actual passes by pointer (its lvalue); the callee
-                // copies it in for value semantics. Only In reaches here: the
-                // callee guards aggregate output / inout, and aggregate task
-                // arguments are guarded before build_call_args (lower_task_call).
+                // A struct-bearing aggregate actual passes by pointer (its lvalue);
+                // its storage is already the canonical aggregate mirror. Only In
+                // reaches here: the callee guards aggregate output / inout, and
+                // aggregate task arguments are guarded before build_call_args.
                 if (!is_trivially_copyable(pty)) {
                     fail("by-value pass of a string-containing aggregate is not supported");
                 }
@@ -9945,6 +10163,33 @@ private:
                     fail("aggregate argument must be a variable");
                 }
                 args.push_back(lower_lvalue(src, b));
+                continue;
+            }
+            if (is_agg_abi_ref(pty)) {
+                // A plain (flat-stored) fixed unpacked array In actual. A flat
+                // module array may be may-z-narrowed (z-elided) smaller than the
+                // callee's canonical aggregate formal, so materialize a canonical
+                // aggregate temp and copy the actual into it element-wise
+                // (layout-converting), then pass the temp by pointer.
+                if (dir != slang::ast::ArgumentDirection::In) {
+                    // TODO: output / inout whole-array function argument (copy-out).
+                    fail("output / inout whole-array function argument is not supported");
+                }
+                if (!is_trivially_copyable(pty)) {
+                    fail("by-value pass of a string- or handle-element array is not supported");
+                }
+                const Expression& src = unwrap_conversion(*actuals[i]);
+                const bool array_lvalue =
+                    is_struct_lvalue_shape(src) ||
+                    (src.kind == ExpressionKind::RangeSelect && is_unpacked_array(src));
+                if (!array_lvalue) {
+                    // TODO: a `'{...}` / call array actual — build the temp from the
+                    // pattern / call result directly.
+                    fail("whole-array argument must be a variable or slice");
+                }
+                const ir::Index temp = make_canonical_agg_temp(pty, b, l);
+                emit_agg_copy(temp, lower_lvalue(src, b), pty, ir::Inst::Tag::Store, b, l);
+                args.push_back(temp);
                 continue;
             }
             // A dynamic-array actual passes one handle lvalue for every direction:
@@ -10054,6 +10299,25 @@ private:
         info.name = prefix_ + "__taskarg" + std::to_string(task_temp_seq_++);
         info.type = type;
         info.dir  = ir::SignalInfo::Direction::Internal;
+        return b.signal(register_signal(std::move(info)), l);
+    }
+
+    // A fresh canonical-aggregate array temp for a by-value whole-array actual: a
+    // per-call frame Local inside a function / task (which build_frame_layout gives
+    // canonical aggregate storage), or a force_agg module Signal in a process
+    // (whose flat storage would otherwise be may-z-narrowed). Either way its layout
+    // is memcpy-compatible with the callee's canonical aggregate formal.
+    ir::Index make_canonical_agg_temp(ir::Ref type, ir::Builder& b, ir::SourceLoc l) {
+        if (fn_ctx_ != nullptr) {
+            const auto idx = static_cast<uint32_t>(fn_ctx_->local_types.size());
+            fn_ctx_->local_types.push_back(type);
+            return b.local(idx, type, l);
+        }
+        ir::SignalInfo info;
+        info.name      = prefix_ + "__aggarg" + std::to_string(task_temp_seq_++);
+        info.type      = type;
+        info.dir       = ir::SignalInfo::Direction::Internal;
+        info.force_agg = true;
         return b.signal(register_signal(std::move(info)), l);
     }
 

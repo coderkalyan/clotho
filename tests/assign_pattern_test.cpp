@@ -193,3 +193,115 @@ TEST_CASE("nonblocking packed-array pattern commits whole value") {
         endmodule
     )") == "0000000a0000000a\n");
 }
+
+// ---------------------------------------------------------------------------
+// Whole fixed unpacked-array operations (LRM 7.4.5 / 11.2.2): nonblocking
+// whole-array copy + pattern, whole-array equality, and array slices. iverilog
+// supports none of these (rejects whole-array `<=`, `==`, and slices); all
+// value expectations below are cross-checked against verilator 5.048.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("nonblocking whole unpacked-array copy commits deferred (swap idiom)") {
+    // b <= a and a <= b in one block both read OLD values -> the arrays swap.
+    CHECK(run_capture(R"(
+        module m;
+            logic [7:0] a [0:3];
+            logic [7:0] b [0:3];
+            logic clk = 0;
+            int i;
+            always #5 clk = ~clk;
+            always @(posedge clk) begin
+                b <= a;
+                a <= b;
+            end
+            initial begin
+                for (i = 0; i < 4; i++) begin a[i] = i + 1; b[i] = 8'hF0 + i; end
+                @(posedge clk); #1;
+                $display("%0d %0d %0d %0d %0h %0h %0h %0h",
+                    a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
+                $finish;
+            end
+        endmodule
+    )") == "240 241 242 243 1 2 3 4\n");
+}
+
+TEST_CASE("nonblocking '{...} pattern to an unpacked array") {
+    CHECK(run_capture(R"(
+        module m;
+            logic [7:0] a [0:3];
+            logic clk = 0;
+            always #5 clk = ~clk;
+            always @(posedge clk) a <= '{8'd10, 8'd20, 8'd30, 8'd40};
+            initial begin
+                @(posedge clk); #1;
+                $display("%0d %0d %0d %0d", a[0], a[1], a[2], a[3]);
+                $finish;
+            end
+        endmodule
+    )") == "10 20 30 40\n");
+}
+
+TEST_CASE("whole unpacked-array equality is per-element, X-propagating") {
+    CHECK(run_capture(R"(
+        module m;
+            logic [7:0] a [0:3];
+            logic [7:0] b [0:3];
+            int i;
+            logic r1, r2, r3;
+            initial begin
+                for (i = 0; i < 4; i++) begin a[i] = i; b[i] = i; end
+                r1 = (a == b);
+                b[2] = 8'd99;
+                r2 = (a != b);
+                for (i = 0; i < 4; i++) b[i] = i;
+                a[1] = 8'hxx;
+                r3 = (a == b);
+                $display("%b %b %b", r1, r2, r3);
+                $finish;
+            end
+        endmodule
+    )") == "1 1 x\n");
+}
+
+TEST_CASE("fixed unpacked-array slice: copy, equality, lvalue, descending base") {
+    CHECK(run_capture(R"(
+        module m;
+            logic [7:0] a [0:7];
+            logic [7:0] bd [7:0];
+            logic [7:0] s2 [0:1];
+            logic [7:0] sd [1:0];
+            int i;
+            logic eqa, eqb;
+            initial begin
+                for (i = 0; i < 8; i++) begin a[i] = i + 1; bd[i] = 8'h10 + i; end
+                s2 = a[2:3];             // element order: s2[0]=a[2]=3, s2[1]=a[3]=4
+                sd = bd[5:4];            // descending base: sd[1]=bd[5], sd[0]=bd[4]
+                a[5:6] = '{8'd100, 8'd101};
+                eqa = (a[2:3] == s2);    // 1
+                eqb = (a[2:3] == a[0:1]);// 0
+                $display("%0d %0d %0h %0h %0d %0d %b %b",
+                    s2[0], s2[1], sd[1], sd[0], a[5], a[6], eqa, eqb);
+                $finish;
+            end
+        endmodule
+    )") == "3 4 15 14 100 101 1 0\n");
+}
+
+TEST_CASE("nonblocking unpacked-array slice copy commits deferred") {
+    CHECK(run_capture(R"(
+        module m;
+            logic [7:0] a [0:3];
+            logic [7:0] b [0:3];
+            logic clk = 0;
+            int i;
+            always #5 clk = ~clk;
+            always @(posedge clk) a[1:2] <= b[1:2];
+            initial begin
+                for (i = 0; i < 4; i++) begin a[i] = i; b[i] = 8'hA0 + i; end
+                @(posedge clk); #1;
+                $display("%0d %0h %0h %0d", a[0], a[1], a[2], a[3]);
+                $finish;
+            end
+        endmodule
+    )") == "0 a1 a2 3\n");
+}

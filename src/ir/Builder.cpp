@@ -157,6 +157,12 @@ Index Builder::elem_select(Index base, Index index, Ref array_type, SourceLoc lo
     return emit({ Inst::Tag::ElemSelect, Inst::Payload{ .op_extra = { base, extra } } }, loc);
 }
 
+Index Builder::arr_slice(Index base, Ref slice_type, uint32_t first_pos, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(ArrSlice{ slice_type, first_pos });
+
+    return emit({ Inst::Tag::ArrSlice, Inst::Payload{ .op_extra = { base, extra } } }, loc);
+}
+
 Index Builder::member_select(Index base, uint32_t field_index, Ref struct_type, SourceLoc loc) {
     const ExtraIndex extra = add_extra(MemberSelect{ field_index, struct_type });
 

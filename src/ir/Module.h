@@ -49,6 +49,11 @@ struct SignalInfo {
     // 1-bit logic placeholder; the value planes are never read or written, so
     // value-oriented passes (VCD, edge classification) skip it.
     bool is_event = false;
+    // Force the canonical aggregate storage mirror (never may-z-narrowed) for an
+    // unpacked array, even when a plain array would otherwise take flat storage.
+    // Set on a compiler temp that materializes a by-value array actual so its
+    // storage is layout-compatible with the callee's canonical aggregate formal.
+    bool force_agg = false;
 };
 
 // One elaborated instance in the design hierarchy. The frontend flattens every

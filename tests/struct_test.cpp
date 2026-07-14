@@ -864,17 +864,32 @@ TEST_CASE("copy a struct-array element into a struct variable") {
     )") == "07 2\n");
 }
 
-TEST_CASE("nonblocking whole-object copy over an array member is guarded") {
-    const LowerResult r = lower_text(R"(
+TEST_CASE("nonblocking whole-object copy over an array member commits deferred") {
+    // A struct with an unpacked-array member: `y <= x` decomposes to per-leaf
+    // StoreNb (each array element rides the deferred array-NBA queue), so y
+    // reads x's OLD value at the NBA commit -- the classic swap idiom leaves y
+    // holding x's pre-edge contents. Verified vs verilator (iverilog rejects
+    // whole-array NBA).
+    CHECK(run_capture(R"(
         module m;
             typedef struct { logic [7:0] mem [0:3]; logic v; } s_t;
             s_t x, y;
-            logic clk;
-            always @(posedge clk) y <= x;
+            logic clk = 0;
+            int i;
+            always #5 clk = ~clk;
+            always @(posedge clk) begin
+                y <= x;
+                x.mem[0] <= x.mem[0] + 8'd1;
+            end
+            initial begin
+                for (i = 0; i < 4; i++) x.mem[i] = i[7:0] + 8'd10;
+                x.v = 1;
+                @(posedge clk); #1;
+                $display("%0d %0d %0d %0d %0d", y.mem[0], y.mem[1], y.mem[2], y.mem[3], y.v);
+                $finish;
+            end
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("nonblocking whole-object copy of an unpacked-array") != std::string::npos);
+    )") == "10 11 12 13 1\n");
 }
 
 TEST_CASE("whole plain unpacked array copy is an independent memcpy") {
@@ -1011,20 +1026,22 @@ TEST_CASE("unpacked struct / aggregate task argument is guarded") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("aggregate task argument") != std::string::npos);
+    CHECK(r.diagnostics.find("task argument is not supported") != std::string::npos);
 }
 
-TEST_CASE("whole unpacked struct as a $display rvalue is still guarded") {
-    // A general whole-struct rvalue (here a $display %p operand) has no flat
-    // value and no non-argument by-value path yet.
-    const LowerResult r = lower_text(R"(
+TEST_CASE("whole unpacked struct as a $display %p operand renders a pattern") {
+    // %p expands the struct at lower time into `'{field:val, ...}` (LRM 21.2.1.6);
+    // integral leaves render in hex with a `'h` tag (matches verilator).
+    CHECK(run_capture(R"(
         module m;
-            typedef struct { logic [7:0] a; } s_t;
+            typedef struct { logic [7:0] a; int b; } s_t;
             s_t x;
-            initial $display("%p", x);
+            initial begin
+                x.a = 8'hAB; x.b = 42;
+                $display("%p", x);
+            end
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
+    )") == "'{a:'hab, b:'h2a}\n");
 }
 
 TEST_CASE("chained continuous copy of a struct wakes downstream readers") {

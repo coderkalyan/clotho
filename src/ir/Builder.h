@@ -89,6 +89,11 @@ public:
     // Unpacked-array element select base[index]. `array_type` is the interned
     // UnpackedArray type being indexed (gives element stride + declared bounds).
     Index elem_select(Index base, Index index, Ref array_type, SourceLoc loc);
+    // Constant-bounds slice of a fixed unpacked array. `slice_type` is the
+    // slice's own UnpackedArray type; `first_pos` the 0-based storage position
+    // of its first element in the base array. Yields a position-0-anchored
+    // sub-array lvalue (see Inst::Tag::ArrSlice).
+    Index arr_slice(Index base, Ref slice_type, uint32_t first_pos, SourceLoc loc);
     // Unpacked-struct member select base.field. `field_index` is the member's
     // declaration-order position; `struct_type` is the interned unpacked
     // Kind::Struct type being accessed (gives per-member layout).
