@@ -351,8 +351,11 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     if (!built.abs_ids.empty()) {
         llvm::orc::SymbolMap ids;
         for (const auto& [key, value] : built.abs_ids) {
+            // +1 bias: a zero-valued id would sit at address null, which the
+            // RTDyld object layer treats as an unresolved symbol. The code
+            // side subtracts 1 in the relocation addend (abs_id_const).
             ids[(*jit)->mangleAndIntern("clotho.absid." + key)] = {
-                llvm::orc::ExecutorAddr(value),
+                llvm::orc::ExecutorAddr(value + 1),
                 llvm::JITSymbolFlags::Exported,
             };
         }

@@ -782,7 +782,11 @@ private:
         llvm::Constant* gv = env_->llmod.getOrInsertGlobal("clotho.absid." + key, b_.getInt8Ty());
         llvm::Constant* id = llvm::ConstantExpr::getTrunc(
           llvm::ConstantExpr::getPtrToInt(gv, b_.getInt64Ty()), b_.getInt32Ty());
-        return addend == 0 ? static_cast<llvm::Value*>(id) : b_.CreateAdd(id, b_.getInt32(addend));
+        // The symbol's address value is biased +1 (run_jit registers value+1):
+        // an id of 0 would define the symbol at address null, which the RTDyld
+        // object layer (--perf-jitdump path) reports as unresolved. The -1
+        // folds into the relocation addend — still zero runtime cost.
+        return b_.CreateAdd(id, b_.getInt32(addend - 1));
     }
 
     // Whether `s`'s design-numbering ids should emit as absolute-symbol
