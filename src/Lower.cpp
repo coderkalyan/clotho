@@ -1030,6 +1030,55 @@ private:
 
             return ref;
         }
+        if (ct.isPackedUnion()) {
+            // A packed union (LRM 7.3.1) is a single bit-vector value whose members
+            // all overlay the least-significant bits (every member is the same
+            // width). Like a packed struct it derives IntegralType in slang, so this
+            // branch must sit ahead of the isIntegral() fallback or the union loses
+            // its field identity (member access needs it). Reuses Kind::Struct with
+            // is_packed=true: every field sits at bit_offset 0, so the packed
+            // member-select path (a constant PartSelect) produces correct
+            // reads/writes with no backend changes. Unpacked unions are a separate,
+            // larger change (overlapping aggregate storage) and stay loud-failed.
+            const auto& ut = ct.as<slang::ast::PackedUnionType>();
+            if (ut.isTagged) {
+                // TODO: tagged unions (LRM 7.3.2) carry a member tag and per-member
+                // validity — no flat bit-vector overlay. Not lowered.
+                fail("tagged union is not supported");
+            }
+            if (const auto cached = struct_type_cache_.find(&ct); cached != struct_type_cache_.end()) {
+                return cached->second;
+            }
+
+            std::vector<ir::FieldRow> fields;
+            for (const auto& f : static_cast<const Scope&>(ut).membersOfType<slang::ast::FieldSymbol>()) {
+                // Every packed-union member overlays the LSB (bit_offset 0), so a
+                // narrower member is a low part-select of the union value.
+                fields.push_back({ f.name, lower_type(f.getType()), 0 });
+            }
+
+            ir::Type t;
+            t.kind      = ir::Type::Kind::Struct;
+            t.is_signed = ct.isSigned();
+            t.is_packed = true;
+            t.element   = ct.isFourState() ? module_.pool.logic_type : module_.pool.bit_type;
+            t.left      = ct.getBitWidth() - 1;
+            t.right     = 0;
+            t.fields_id = module_.pool.intern_struct_fields(std::move(fields));
+
+            const ir::Ref ref = module_.pool.put(ir::Item{ t });
+            struct_type_cache_.emplace(&ct, ref);
+
+            return ref;
+        }
+        if (ct.isUnpackedUnion()) {
+            // TODO: unpacked unions (LRM 7.3) need overlapping aggregate storage —
+            // a byte blob every member reinterprets — which the sequential-field
+            // agg_storage_ty mirror does not model. A separate change; guarded
+            // loud here (and at the member-access site) so an unpacked union never
+            // lowers by accident.
+            fail("unpacked union is not supported");
+        }
         if (ct.isEvent()) {
             // Named event (LRM 15.5): no data value. Modeled as a 1-bit logic
             // placeholder signal whose only role is to own wait queues; the
@@ -8427,14 +8476,14 @@ private:
             // TODO: non-field member access (interface modports, ...) — not lowered.
             fail("unsupported member access");
         }
-        if (ma.value().type->isUnion()) {
-            // TODO: this mechanism happens to produce correct reads/writes for
-            // a packed union already (every member sits at bitOffset 0), but
-            // union has its own LRM corners not yet reviewed here (7.3 fixed
-            // member width, tagged unions, unpacked aliasing) — gated
-            // separately pending that review rather than shipped by accident.
-            fail("union member access is not supported yet");
+        if (ma.value().type->isUnpackedUnion()) {
+            // TODO: unpacked unions need overlapping aggregate storage (a byte
+            // blob every member reinterprets), which the sequential-field
+            // agg_storage_ty mirror does not model. A separate change.
+            fail("unpacked union member access is not supported");
         }
+        // A packed union member sits at bit_offset 0 (all members overlay the LSB),
+        // so it flows to the packed part-select path below unchanged.
         const ir::Index base = lower_lvalue(ma.value(), b);
         // An unpacked struct is an aggregate: the member is addressed by field
         // index (MemberSelect -> struct GEP), not a bit range. A packed struct is

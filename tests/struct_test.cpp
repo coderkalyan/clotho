@@ -176,19 +176,84 @@ TEST_CASE("nested packed struct member access") {
     )") == "whole=165\n");
 }
 
-TEST_CASE("packed union member access is rejected loudly") {
-    const LowerResult r = lower_text(R"(
+TEST_CASE("packed union members overlay the LSB (LRM 7.3.1)") {
+    // Every member of a packed union overlays the least-significant bits, so a
+    // whole-value write is visible through the members and a member write is
+    // visible through the whole value. Byte-identical to iverilog.
+    CHECK(run_capture(R"(
         module m;
             typedef union packed {
-                logic [7:0] a;
-                bit [7:0] b;
+                logic [15:0] w;
+                struct packed { logic [7:0] hi; logic [7:0] lo; } b;
+                logic [15:0] aliasw;
             } u_t;
             u_t u;
+            initial begin
+                u.w = 16'hABCD;
+                $display("w=%h hi=%h lo=%h alias=%h", u.w, u.b.hi, u.b.lo, u.aliasw);
+                u.b.hi = 8'h12;
+                u.b.lo = 8'h34;
+                $display("w=%h hi=%h lo=%h", u.w, u.b.hi, u.b.lo);
+            end
+        endmodule
+    )") == "w=abcd hi=ab lo=cd alias=abcd\nw=1234 hi=12 lo=34\n");
+}
+
+TEST_CASE("packed union nested in a packed struct") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef union packed {
+                logic [15:0] w;
+                struct packed { logic [7:0] hi; logic [7:0] lo; } b;
+            } u_t;
+            typedef struct packed { logic [3:0] tag; u_t payload; } wrap_t;
+            wrap_t wr;
+            initial begin
+                wr.tag = 4'h5;
+                wr.payload.w = 16'hDEAD;
+                $display("tag=%h w=%h hi=%h", wr.tag, wr.payload.w, wr.payload.b.hi);
+                wr.payload.b.lo = 8'hEE;
+                $display("w=%h", wr.payload.w);
+            end
+        endmodule
+    )") == "tag=5 w=dead hi=de\nw=deee\n");
+}
+
+TEST_CASE("packed union x-propagates through overlaid members") {
+    CHECK(run_capture(R"(
+        module m;
+            union packed {
+                logic [7:0] a;
+                struct packed { logic [3:0] h; logic [3:0] l; } b;
+            } u;
+            initial begin
+                u.a = 8'bxxxx_0011;
+                $display("a=%b h=%b l=%b", u.a, u.b.h, u.b.l);
+            end
+        endmodule
+    )") == "a=xxxx0011 h=xxxx l=0011\n");
+}
+
+TEST_CASE("tagged union is rejected loudly") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            union tagged packed { logic [7:0] a; logic [7:0] b; } u;
             initial u.a = 8'hAB;
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("union member access is not supported") != std::string::npos);
+    CHECK(r.diagnostics.find("tagged union is not supported") != std::string::npos);
+}
+
+TEST_CASE("unpacked union is rejected loudly") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            union { int a; byte b; } u;
+            initial u.a = 5;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("unpacked union is not supported") != std::string::npos);
 }
 
 TEST_CASE("blocking read and write of unpacked struct members") {
