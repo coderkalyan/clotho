@@ -4676,6 +4676,34 @@ private:
     }
 
     void lower_case(const CaseStatement& c, ir::Builder& b) {
+        if (unwrap_conversion(c.expr).kind == ExpressionKind::TypeReference) {
+            // type() case selector (LRM 6.23): a type reference is a compile-time
+            // marker with no runtime value, so this resolves entirely at lowering
+            // time via Type::isMatching, rather than through the packed-comparison
+            // machinery below (which cannot represent a type-ref key). Not routed
+            // through slang's own CaseStatement::getKnownBranch: that fold keys off
+            // `c.expr`'s own (possibly Conversion-wrapped) ExpressionKind directly,
+            // so a plain `case (type(x))` selector -- wrapped here just like any
+            // other case selector -- would silently fail its TypeReference check.
+            const slang::ast::Type& sel_ty =
+                unwrap_conversion(c.expr).as<TypeReferenceExpression>().targetType;
+            for (const auto& group : c.items) {
+                for (const Expression* item : group.expressions) {
+                    const Expression& ue = unwrap_conversion(*item);
+                    if (ue.kind != ExpressionKind::TypeReference) {
+                        fail("case statement over type() with a non-type() item is not supported");
+                    }
+                    if (ue.as<TypeReferenceExpression>().targetType.isMatching(sel_ty)) {
+                        lower_stmt(*group.stmt, b);
+                        return;
+                    }
+                }
+            }
+            if (c.defaultCase != nullptr) {
+                lower_stmt(*c.defaultCase, b);
+            }
+            return;
+        }
         if (is_string_expr(c.expr)) {
             // TODO: case over strings (labels compare with rt_string_cmp; the
             // common-type/resize machinery below is packed-only).
@@ -7725,6 +7753,27 @@ private:
             const ir::Index     acc = lower_struct_eq(unwrap_conversion(bin.left()),
                                                       unwrap_conversion(bin.right()), b, l);
             return bin.op == B::Equality ? acc : b.unary(ir::Inst::Tag::Lnot, acc, l);
+        }
+
+        if (bin.left().kind == ExpressionKind::TypeReference ||
+            bin.right().kind == ExpressionKind::TypeReference) {
+            // type(a) == type(b) (LRM 6.23): a type reference is a compile-time
+            // marker, not a value -- slang restricts this expression kind to
+            // exactly this position (an equality/case-equality comparison with
+            // another type reference) and to a case-statement selector/item
+            // (handled separately in lower_case), so both operands are
+            // guaranteed TypeReference here; mirrors slang's own constant fold
+            // in BinaryExpression::evalImpl.
+            if (bin.left().kind != ExpressionKind::TypeReference ||
+                bin.right().kind != ExpressionKind::TypeReference ||
+                (bin.op != B::Equality && bin.op != B::Inequality && bin.op != B::CaseEquality &&
+                 bin.op != B::CaseInequality)) {
+                fail("type() is only supported in an equality comparison with another type()");
+            }
+            const bool matches = bin.left().as<TypeReferenceExpression>().targetType.isMatching(
+                bin.right().as<TypeReferenceExpression>().targetType);
+            const bool result  = (bin.op == B::Equality || bin.op == B::CaseEquality) ? matches : !matches;
+            return b.constant(module_.pool.put_int(make_int_type(1, false, false), result ? 1 : 0), loc(bin));
         }
 
         const ir::SourceLoc l   = loc(bin);
