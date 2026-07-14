@@ -786,13 +786,16 @@ private:
             throw BackendError{ "absolute id symbol '" + key + "' bound to two values" };
         }
         llvm::Constant* gv = env_->llmod.getOrInsertGlobal("clotho.absid." + key, b_.getInt8Ty());
-        llvm::Constant* id = llvm::ConstantExpr::getTrunc(
-          llvm::ConstantExpr::getPtrToInt(gv, b_.getInt64Ty()), b_.getInt32Ty());
-        // The symbol's address value is biased +1 (run_jit registers value+1):
-        // an id of 0 would define the symbol at address null, which the RTDyld
-        // object layer (--perf-jitdump path) reports as unresolved. The -1
-        // folds into the relocation addend — still zero runtime cost.
-        return b_.CreateAdd(id, b_.getInt32(addend - 1));
+        // The def-local addend and the -1 bias fold into the symbol reference
+        // as a byte GEP, so the whole id is ONE relocated immediate (a lone
+        // movabs at FastISel, no add). The +1 bias (run_jit registers
+        // value+1): an id of 0 would define the symbol at address null, which
+        // the RTDyld object layer (--perf-jitdump path) reports as
+        // unresolved.
+        llvm::Constant* off = llvm::ConstantExpr::getGetElementPtr(
+          b_.getInt8Ty(), gv, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(addend - 1) });
+        return llvm::ConstantExpr::getTrunc(llvm::ConstantExpr::getPtrToInt(off, b_.getInt64Ty()),
+                                            b_.getInt32Ty());
     }
 
     // Whether `s`'s design-numbering ids should emit as absolute-symbol
