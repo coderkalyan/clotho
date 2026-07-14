@@ -2016,9 +2016,10 @@ private:
             const auto& vs = m.as<VariableSymbol>();
 
             ir::SignalInfo info;
-            info.name = std::string(vs.name);
-            info.type = lower_type(vs.getType());
-            info.dir  = ir::SignalInfo::Direction::Internal;
+            info.name     = std::string(vs.name);
+            info.type     = lower_type(vs.getType());
+            info.is_event = vs.getType().isEvent();
+            info.dir      = ir::SignalInfo::Direction::Internal;
 
             sigmap_[&vs] = register_signal(std::move(info));
             lower_var_initializer(vs);

@@ -212,6 +212,31 @@ TEST_CASE("->> #d e schedules a detached trigger without blocking") {
 }
 
 // Tier-2 forms loud-fail rather than being silently mis-lowered.
+// A named event declared at package scope materializes its trigger state like a
+// module-scope event, so triggering/waiting it (imported or explicitly scoped)
+// works instead of dereferencing a null event slot. Regression: it used to
+// SIGSEGV (collect_global_scope_signals never set SignalInfo::is_event, so the
+// backend allocated no trigger-timestamp global).
+TEST_CASE("package-scoped named event triggers and wakes a waiter") {
+    const std::string out = run_capture(R"(
+        package p;
+          event e;
+        endpackage
+        import p::*;
+        module top;
+          initial begin
+            #5 -> e;
+            #5 $finish;
+          end
+          initial forever begin
+            @(e);
+            $display("woke t=%0t", $time);
+          end
+        endmodule
+    )");
+    CHECK(out.find("woke t=5") != std::string::npos);
+}
+
 TEST_CASE("event handle / event-controlled trigger forms are rejected") {
     CHECK(reject("module top; event e, f; initial e = f; endmodule").find(
             "event assignment") != std::string::npos);
