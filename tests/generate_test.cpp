@@ -97,6 +97,31 @@ TEST_CASE("for-generate flattens each entry under a subscripted prefix") {
     CHECK(names.contains("g[1].x"));
 }
 
+// A module instantiated inside a loop-generate needs its scope node (and the
+// backend's per-instance symbol anchor @clotho.inst.<hier>) qualified by the
+// generate entry, else two same-named instances in different entries collide.
+// Regression: generate blocks fold no scope node of their own, so the child
+// instance node was named just "dut" for every entry -> duplicate-symbol crash
+// in the JIT (ivtest pr3409749). Oracle: iverilog 13.
+TEST_CASE("for-generate instances get generate-qualified scope names") {
+    const std::string out = run_capture(R"(
+        module top;
+          genvar i;
+          for (i = 0; i < 4; i = i + 1) begin : loop
+            sub #(i) dut ();
+          end
+          initial #1 $display("done");
+        endmodule
+        module sub;
+          parameter P = 0;
+          initial $display("sub P=%0d", P);
+        endmodule
+    )");
+    CHECK(out.find("sub P=0") != std::string::npos);
+    CHECK(out.find("sub P=3") != std::string::npos);
+    CHECK(out.find("done") != std::string::npos);
+}
+
 // 27.5: a conditional generate instantiates the taken branch only; the other is
 // uninstantiated and must not contribute a second driver.
 TEST_CASE("if-generate selects the true branch") {

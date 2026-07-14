@@ -503,7 +503,7 @@ public:
     // each instance distinct ValueSymbols, so sigmap_ (keyed by symbol) maps
     // each to its own signal.
     void lower_instance(const InstanceSymbol& inst, std::string_view prefix, Pass pass,
-                        ir::InstanceScope* node) {
+                        ir::InstanceScope* node, std::string_view leaf_name) {
         if (prefix.empty() && pass == Pass::Collect) {
             module_.name = std::string(inst.name);
         }
@@ -517,8 +517,16 @@ public:
         ir::InstanceScope* self = node;
         if (pass == Pass::Collect) {
             ir::InstanceScope fresh;
-            fresh.id       = module_.alloc_scope_id();
-            fresh.name     = std::string(inst.name);
+            fresh.id = module_.alloc_scope_id();
+            // The scope-node name must be unique among an instance's children
+            // and feeds the backend's per-instance symbol anchor
+            // (@clotho.inst.<hier>): `node_rel_` carries the generate-block
+            // segments (loop[i]/cond-block) since the enclosing instance node,
+            // which folds no node of its own (see lower_generate_block), so two
+            // instances of the same name in distinct generate entries do not
+            // collide. `leaf_name` is the instance segment (its own name, or
+            // arr[i] for an instance array).
+            fresh.name     = node_rel_ + std::string(leaf_name);
             fresh.def_name = std::string(inst.getDefinition().name);
             if (scope_stack_.empty()) {
                 top_scope_ = std::move(fresh);
@@ -529,6 +537,10 @@ public:
             }
         }
         scope_stack_.push_back(self);
+        // This instance's own members are named relative to it, so the
+        // generate-path accumulator resets here and is restored after the walk.
+        const std::string saved_node_rel = node_rel_;
+        node_rel_.clear();
 
         // This instance's delay / $time multiplier: its time unit divided by the
         // wheel tick (the design's finest precision). Both are powers of ten and
@@ -550,6 +562,7 @@ public:
         size_t child_cursor = 0;
         lower_members(body, self_prefix, self_mul, pass, *self, child_cursor);
 
+        node_rel_ = saved_node_rel;
         scope_stack_.pop_back();
     }
 
@@ -560,11 +573,11 @@ public:
     // all initializers (each top gets its own Lowerer, so this covers each one).
     void lower_top(const InstanceSymbol& top, std::string_view prefix) {
         top_elided_ = prefix.empty();
-        lower_instance(top, prefix, Pass::Collect, nullptr);
+        lower_instance(top, prefix, Pass::Collect, nullptr, top.name);
         // Classify reuses the scope tree Collect built (Emit has not yet moved
         // it out); it only reads node pointers to walk children in order.
-        lower_instance(top, prefix, Pass::Classify, &top_scope_);
-        lower_instance(top, prefix, Pass::Emit, &top_scope_);
+        lower_instance(top, prefix, Pass::Classify, &top_scope_, top.name);
+        lower_instance(top, prefix, Pass::Emit, &top_scope_, top.name);
         emit_wire_resolvers();
         finalize_preinit();
         module_.add_top(std::move(top_scope_));
@@ -661,7 +674,7 @@ private:
                     ir::InstanceScope* child_node =
                       driver_pass ? &node.children[child_cursor++] : nullptr;
                     lower_instance(child, self_prefix + std::string(child.name) + ".", pass,
-                                   child_node);
+                                   child_node, child.name);
                     prefix_   = self_prefix;
                     scope_    = &scope;
                     time_mul_ = self_mul;
@@ -674,10 +687,17 @@ private:
                     // contributes nothing (its body is not part of the design).
                     const auto& gb = m.as<GenerateBlockSymbol>();
                     if (!gb.isUninstantiated) {
+                        // A generate block folds no scope node of its own, so its
+                        // name segment accumulates into node_rel_ to keep the
+                        // enclosed instances' node names unique (see
+                        // lower_instance / lower_generate_block).
+                        const std::string saved_node_rel = node_rel_;
+                        node_rel_ += std::string(gb.getExternalName()) + ".";
                         lower_generate_block(gb, self_prefix + gb.getExternalName() + ".", self_mul,
                                              pass, node, child_cursor);
-                        prefix_ = self_prefix;
-                        scope_  = &scope;
+                        node_rel_ = saved_node_rel;
+                        prefix_   = self_prefix;
+                        scope_    = &scope;
                     }
                     break;
                 }
@@ -689,8 +709,11 @@ private:
                         if (e->isUninstantiated) {
                             continue;
                         }
+                        const std::string saved_node_rel = node_rel_;
+                        node_rel_ += gen_entry_name(ga, *e) + ".";
                         lower_generate_block(*e, self_prefix + gen_entry_name(ga, *e) + ".",
                                              self_mul, pass, node, child_cursor);
+                        node_rel_ = saved_node_rel;
                     }
                     prefix_ = self_prefix;
                     scope_  = &scope;
@@ -798,7 +821,7 @@ private:
                     ir::InstanceScope*    child_node =
                       driver_pass ? &node.children[child_cursor++] : nullptr;
                     lower_instance(child, self_prefix + instance_array_element_name(child) + ".",
-                                   pass, child_node);
+                                   pass, child_node, instance_array_element_name(child));
                     prefix_   = self_prefix;
                     scope_    = &parent_scope;
                     time_mul_ = self_mul;
@@ -9743,6 +9766,12 @@ private:
     // "u_alu.u_sub."); empty for the top. Prepended to every signal name created
     // while this instance's body is processed so flattened signals stay unique.
     std::string prefix_;
+    // Generate-block name segments (loop[i]/cond-block, dot-terminated)
+    // accumulated since the enclosing instance's scope node, which folds no node
+    // of its own. Forms the leading part of a child instance's scope-node name so
+    // two same-named instances in distinct generate entries get distinct anchors
+    // (@clotho.inst.<hier>). Reset entering an instance, restored on exit.
+    std::string node_rel_;
     // True when flattened paths omit the single top instance's name (the
     // single-top case); %m and $printtimescale re-prepend module_.name.
     bool top_elided_ = false;
