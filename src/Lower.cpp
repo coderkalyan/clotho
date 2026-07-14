@@ -3721,7 +3721,35 @@ private:
             // subscribes to the target instance's signal directly.
             return signal_of(e.as<ValueExpressionBase>().symbol);
         }
-        fail("unsupported event expression");
+        // A non-simple event expression (struct/union member, array element,
+        // bit/part-select, arithmetic): the wait engine subscribes by whole-signal
+        // id and detects edges on the whole signal's LSB, so a sub-expression at a
+        // nonzero bit offset cannot be watched directly. Synthesize a temp net
+        // continuously assigned from the expression and subscribe to it: the net's
+        // bit 0 is the expression's LSB (exact for edge detection) and its whole
+        // word feeds the level `changed` compare. Costs one delta of latency vs. a
+        // direct signal (the continuous process runs first) — identical to
+        // hand-writing the intermediate `assign`.
+        if (!e.type->isIntegral()) {
+            // A real / aggregate / other non-integral event expression has no flat
+            // packed net to extract onto; the temp-net store expects a scalar.
+            fail("unsupported event expression (non-integral)");
+        }
+        return synth_event_net(e);
+    }
+
+    // Synthesize the temp net an expression event control subscribes to: a fresh
+    // internal signal of the expression's type, driven by a self-starting
+    // continuous process sensitive to the expression's reads (LRM 4.9.1).
+    ir::Signal synth_event_net(const Expression& e) {
+        const ir::Ref      ty  = lower_type(*e.type);
+        const ir::Signal   tmp = declare_temp(ty, "event");
+        const ir::SourceLoc l  = loc(e);
+
+        ir::Builder b(module_.pool);
+        b.binary(ir::Inst::Tag::Store, b.signal(tmp, l), b.resize(lower_expr(e, b), ty, l), l);
+        add_continuous_process(continuous_events(e), l, b);
+        return tmp;
     }
 
     // Lower an intra-body event control `@(...)` to a Wait instruction. A

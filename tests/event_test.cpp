@@ -247,3 +247,48 @@ TEST_CASE("event handle / event-controlled trigger forms are rejected") {
     CHECK(reject("module top; event e; input e; endmodule").find(
             "event") != std::string::npos);
 }
+
+// An event control on a struct member (`@(posedge s.clk)`) has no direct
+// whole-signal to watch (the member is a part-select at a nonzero bit offset).
+// Clotho synthesizes a temp net driven by the member and subscribes to it: the
+// net's bit 0 is the member's LSB (exact edge), its whole word feeds the level
+// `changed` compare. Oracle: iverilog 13 (cnt=2 lvl=3).
+TEST_CASE("event control on struct members (edge and level)") {
+    const std::string out = run_capture(R"(
+        module m;
+            typedef struct packed { logic [7:0] data; logic clk; } s_t;
+            s_t s; int cnt=0, lvl=0;
+            always @(posedge s.clk) cnt++;
+            always @(s.data) lvl++;
+            initial begin
+                s='0;
+                #1 s.clk=1; #1 s.clk=0; #1 s.clk=1;
+                #1 s.data=8'hAA; #1 s.data=8'h55;
+                #1 $display("cnt=%0d lvl=%0d", cnt, lvl);
+            end
+        endmodule
+    )");
+    CHECK(out == "cnt=2 lvl=3\n");
+}
+
+// A dynamically-indexed element select in an event control (`@(posedge
+// arr[idx][0])`) synthesizes a temp net whose continuous driver is sensitive to
+// both `arr` and `idx` (the select's reads). Oracle: iverilog 13 (cnt=2).
+TEST_CASE("event control on a dynamic element select") {
+    const std::string out = run_capture(R"(
+        module m;
+            logic [7:0] arr [0:3]; int idx=0, cnt=0;
+            always @(posedge arr[idx][0]) cnt++;
+            initial begin
+                arr[0]=0; arr[1]=0; arr[2]=0; arr[3]=0;
+                #1 arr[0][0]=1;
+                #1 arr[1][0]=1;
+                #1 idx=1;
+                #1 arr[1][0]=0;
+                #1 arr[1][0]=1;
+                #1 $display("cnt=%0d", cnt);
+            end
+        endmodule
+    )");
+    CHECK(out == "cnt=2\n");
+}
