@@ -1260,6 +1260,32 @@ private:
              "array initializer of its own, is not supported");
     }
 
+    // Store a string literal into a fixed-size unpacked array of byte-shaped
+    // elements (LRM 5.9: "A string literal can be assigned to an unpacked
+    // array of bytes. If the size differs, it is left justified."). Character
+    // 0 lands at the array's declared left bound, one element per character,
+    // walking toward the right bound; a shorter string zero-pads the
+    // remaining (rightmost) elements, a longer string's excess tail is
+    // dropped. Unlike a `string`-typed object, an array element is not
+    // string-terminated, so an embedded NUL byte is kept, not stripped.
+    void emit_string_literal_array_store(ir::Index lhs, ir::Ref type, const ir::Type& t,
+                                         std::string_view text, ir::Inst::Tag tag, ir::Builder& b,
+                                         ir::SourceLoc l) {
+        const uint32_t array_len =
+            (t.left > t.right ? t.left - t.right : t.right - t.left) + 1;
+        for (uint32_t k = 0; k < array_len; ++k) {
+            const int32_t coord = t.left <= t.right ? static_cast<int32_t>(t.left + k)
+                                                     : static_cast<int32_t>(t.left - k);
+            const uint8_t   byte_val = k < text.size() ? static_cast<uint8_t>(text[k]) : 0;
+            const ir::Index idx      = b.constant(
+              module_.pool.put_int(make_int_type(32, false, true),
+                                    static_cast<uint64_t>(static_cast<int64_t>(coord))),
+              l);
+            const ir::Index val = b.constant(module_.pool.put_int(t.element, byte_val), l);
+            b.binary(tag, b.elem_select(lhs, idx, type, l), val, l);
+        }
+    }
+
     // Store an aggregate whole-object value into `lhs` (an aggregate lvalue of
     // type `type`), decomposing to per-leaf stores. RHS is a `'{...}` pattern
     // (per-field elements, recursed for aggregate members), a leaf value, or
@@ -1344,6 +1370,18 @@ private:
         // call (the callee writes into a caller temp — the Call's lvalue — which
         // this copies into the target).
         const Expression& src = unwrap_conversion(rhs);
+        if (t.kind == ir::Type::Kind::UnpackedArray && src.kind == ExpressionKind::StringLiteral) {
+            if (!is_leaf_ref(t.element) || module_.pool.is_float(t.element) ||
+                module_.pool.layout(t.element).width != 8) {
+                // TODO: string literal assigned to an unpacked array whose element
+                // isn't an 8-bit byte -- LRM 5.9 only defines this for "an
+                // unpacked array of bytes".
+                fail("string literal assignment to an unpacked array of non-byte "
+                     "elements is not supported");
+            }
+            emit_string_literal_array_store(lhs, type, t, src.as<StringLiteral>().getValue(), tag, b, l);
+            return;
+        }
         if (src.kind == ExpressionKind::Call) {
             const std::optional<ir::Index> cv = lower_user_call(src.as<CallExpression>(), b);
             if (!cv) {
@@ -5044,6 +5082,34 @@ private:
     }
 
     void lower_case(const CaseStatement& c, ir::Builder& b) {
+        if (unwrap_conversion(c.expr).kind == ExpressionKind::TypeReference) {
+            // type() case selector (LRM 6.23): a type reference is a compile-time
+            // marker with no runtime value, so this resolves entirely at lowering
+            // time via Type::isMatching, rather than through the packed-comparison
+            // machinery below (which cannot represent a type-ref key). Not routed
+            // through slang's own CaseStatement::getKnownBranch: that fold keys off
+            // `c.expr`'s own (possibly Conversion-wrapped) ExpressionKind directly,
+            // so a plain `case (type(x))` selector -- wrapped here just like any
+            // other case selector -- would silently fail its TypeReference check.
+            const slang::ast::Type& sel_ty =
+                unwrap_conversion(c.expr).as<TypeReferenceExpression>().targetType;
+            for (const auto& group : c.items) {
+                for (const Expression* item : group.expressions) {
+                    const Expression& ue = unwrap_conversion(*item);
+                    if (ue.kind != ExpressionKind::TypeReference) {
+                        fail("case statement over type() with a non-type() item is not supported");
+                    }
+                    if (ue.as<TypeReferenceExpression>().targetType.isMatching(sel_ty)) {
+                        lower_stmt(*group.stmt, b);
+                        return;
+                    }
+                }
+            }
+            if (c.defaultCase != nullptr) {
+                lower_stmt(*c.defaultCase, b);
+            }
+            return;
+        }
         if (is_string_expr(c.expr)) {
             // TODO: case over strings (labels compare with rt_string_cmp; the
             // common-type/resize machinery below is packed-only).
@@ -7215,6 +7281,18 @@ private:
                 emit_agg_store(lower_lvalue(a.left(), b), ty, src, ir::Inst::Tag::Store, b, loc(a));
                 return true_const(b, loc(a));
             }
+            if (src.kind == ExpressionKind::StringLiteral) {
+                // `mem = "literal"` (LRM 5.9): same element-wise store as the
+                // '{...} pattern case above.
+                if (a.isNonBlocking()) {
+                    // TODO: nonblocking string-literal assignment to an unpacked
+                    // array — per-leaf NBA into array elements needs the
+                    // deferred array-record path.
+                    fail("nonblocking string literal assignment to an unpacked array is not supported");
+                }
+                emit_agg_store(lower_lvalue(a.left(), b), ty, src, ir::Inst::Tag::Store, b, loc(a));
+                return true_const(b, loc(a));
+            }
             // TODO: nonblocking whole-array copy, string arrays — element-wise
             // copy / aggregate lowering.
             fail("whole unpacked array assignment is not supported");
@@ -8081,6 +8159,27 @@ private:
             const ir::Index     acc = lower_struct_eq(unwrap_conversion(bin.left()),
                                                       unwrap_conversion(bin.right()), b, l);
             return bin.op == B::Equality ? acc : b.unary(ir::Inst::Tag::Lnot, acc, l);
+        }
+
+        if (bin.left().kind == ExpressionKind::TypeReference ||
+            bin.right().kind == ExpressionKind::TypeReference) {
+            // type(a) == type(b) (LRM 6.23): a type reference is a compile-time
+            // marker, not a value -- slang restricts this expression kind to
+            // exactly this position (an equality/case-equality comparison with
+            // another type reference) and to a case-statement selector/item
+            // (handled separately in lower_case), so both operands are
+            // guaranteed TypeReference here; mirrors slang's own constant fold
+            // in BinaryExpression::evalImpl.
+            if (bin.left().kind != ExpressionKind::TypeReference ||
+                bin.right().kind != ExpressionKind::TypeReference ||
+                (bin.op != B::Equality && bin.op != B::Inequality && bin.op != B::CaseEquality &&
+                 bin.op != B::CaseInequality)) {
+                fail("type() is only supported in an equality comparison with another type()");
+            }
+            const bool matches = bin.left().as<TypeReferenceExpression>().targetType.isMatching(
+                bin.right().as<TypeReferenceExpression>().targetType);
+            const bool result  = (bin.op == B::Equality || bin.op == B::CaseEquality) ? matches : !matches;
+            return b.constant(module_.pool.put_int(make_int_type(1, false, false), result ? 1 : 0), loc(bin));
         }
 
         const ir::SourceLoc l   = loc(bin);

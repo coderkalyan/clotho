@@ -495,6 +495,37 @@ TEST_CASE("unpacked arrays of string init empty and assign per element") {
     CHECK(run_capture(src) == "[zero] [one] [] [zero-one]\n8 0\n[zero+one]\n");
 }
 
+TEST_CASE("string literal assigns element-wise into an unpacked byte array") {
+    constexpr std::string_view src = R"(
+        module m;
+            byte exact [0:2] = "abc";
+            byte sm [0:4] = "abcdefgh";
+            byte big [0:4] = "ab";
+            byte desc [4:0] = "ab";
+            initial begin
+                $display("%0d %0d %0d", exact[0], exact[1], exact[2]);
+                $display("%0d %0d %0d %0d %0d", sm[0], sm[1], sm[2], sm[3], sm[4]);
+                $display("%0d %0d %0d %0d %0d", big[0], big[1], big[2], big[3], big[4]);
+                $display("%0d %0d %0d %0d %0d", desc[4], desc[3], desc[2], desc[1], desc[0]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "97 98 99\n97 98 99 100 101\n97 98 0 0 0\n97 98 0 0 0\n");
+}
+
+TEST_CASE("string literal assigns element-wise into an unpacked byte array via plain assignment") {
+    constexpr std::string_view src = R"(
+        module m;
+            byte arr [0:4];
+            initial begin
+                arr = "hi";
+                $display("%0d %0d %0d %0d %0d", arr[0], arr[1], arr[2], arr[3], arr[4]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "104 105 0 0 0\n");
+}
+
 TEST_CASE("string reassignment in a loop reuses capacity (leak smoke)") {
     constexpr std::string_view src = R"(
         module m;
