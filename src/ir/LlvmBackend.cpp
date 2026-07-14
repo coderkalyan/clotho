@@ -452,16 +452,19 @@ struct SignalSlot {
 };
 
 // One instance-scope occurrence: the addressing anchor for every signal the
-// scope declares. Prep for per-module-definition compilation units: a signal
-// access is `anchor symbol + def-relative offset` instead of a constant path
-// from the state root, so a definition's code never embeds whole-design layout.
-// A scope whose definition is instantiated once resolves through a GlobalAlias
-// of @clotho.state (a link-time constant — the relocation shape, free at run
-// time); a scope of a reused definition loads a base pointer main stores at
-// startup (indirect — the shape one shared body per definition will need).
+// scope declares. Each scope owns its own state global
+// (@clotho.inst.<hier>.state, own signals only — children own theirs), so a
+// signal access is `scope global + def-local offset`: a real symbol plus a
+// def-content-derived addend, the relocation shape per-definition compilation
+// units and object caching need. A definition's code never embeds
+// whole-design layout. Unique-definition instances bake the symbol directly
+// (link-time constant, free at run time); a scope of a reused definition
+// loads a base pointer main stores at startup when the body is shareable
+// (one shared body cannot bake N instance symbols).
 struct Anchor {
-    // Field-index path from the root state struct to this scope's struct.
-    std::vector<uint32_t> path;
+    // The scope's own state global (@clotho.inst.<hier>.state), created by
+    // emit_state_global.
+    llvm::GlobalVariable* state_gv = nullptr;
     // The scope's definition state struct (GEP source type for member access).
     llvm::StructType* ty = nullptr;
     // Hierarchical instance name (diagnostic / symbol naming).
@@ -1207,39 +1210,17 @@ private:
         return lv;
     }
 
-    // Byte offset of a GEP field-index path from the root state struct, per the
-    // module's DataLayout. Used where the runtime needs raw offsets (the NBA
-    // commit loop's meta table).
-    uint32_t path_offset(std::span<const uint32_t> path) const {
-        const llvm::DataLayout& dl  = env_.llmod.getDataLayout();
-        llvm::Type*             ty  = state_ty_;
-        uint64_t                off = 0;
-        for (const uint32_t f : path) {
-            if (auto* st = llvm::dyn_cast<llvm::StructType>(ty)) {
-                off += dl.getStructLayout(st)->getElementOffset(f);
-                ty = st->getElementType(f);
-            } else {
-                auto* at = llvm::cast<llvm::ArrayType>(ty);
-                off += f * dl.getTypeAllocSize(at->getElementType());
-                ty = at->getElementType();
-            }
-        }
-        return static_cast<uint32_t>(off);
-    }
-
-    // Build one instance scope's state struct: its signals' slots (field k ==
-    // scope signal k), then one field per child instance. Assigns every covered
-    // signal's GEP path; `path` holds the field indices from the root to this
-    // scope. Struct types are deduplicated per module definition — instances of
-    // one definition (same parameterization) produce identical field lists and
-    // share one identified type, so the type is replicated per instantiation.
-    // Each call is one scope occurrence and records one Anchor; the signal keeps
-    // its full root path (initializer / NBA offset math) plus the anchor id, and
-    // storage_ptr addresses it anchor-relative.
-    llvm::StructType* scope_type(const InstanceScope& scope, std::vector<uint32_t>& path,
-                                 std::vector<bool>& claimed, const std::string& hier) {
+    // Build one instance scope's state struct: its own signals' slots (field k
+    // == scope signal k). Children are NOT nested as fields — each scope owns
+    // its own state global, so a child scope recurses into its own anchor and
+    // struct. Assigns every covered signal's scope-relative GEP path ({k}).
+    // Struct types are deduplicated per module definition — instances of one
+    // definition (same parameterization) produce identical field lists and
+    // share one identified type. Each call is one scope occurrence and records
+    // one Anchor; storage_ptr addresses signals anchor-relative.
+    void scope_type(const InstanceScope& scope, std::vector<bool>& claimed, const std::string& hier) {
         const auto aid = static_cast<uint32_t>(anchors_.size());
-        anchors_.push_back(Anchor{ .path = path, .name = hier });
+        anchors_.push_back(Anchor{ .name = hier });
         if (scope.id >= anchor_of_scope_.size()) {
             anchor_of_scope_.resize(scope.id + 1, SignalSlot::no_anchor);
         }
@@ -1251,38 +1232,34 @@ private:
                 throw BackendError{ "malformed instance hierarchy: signal claimed twice" };
             }
             claimed[si] = true;
-            slots_[si].path = path;
-            slots_[si].path.push_back(k);
+            slots_[si].path   = { k };
             slots_[si].anchor = aid;
             fields.push_back(slots_[si].storage_ty);
         }
-        const auto nsig = static_cast<uint32_t>(scope.signals.size());
-        for (uint32_t c = 0; c < scope.children.size(); ++c) {
-            path.push_back(nsig + c);
-            fields.push_back(scope_type(scope.children[c], path, claimed, hier + "." + scope.children[c].name));
-            path.pop_back();
+        for (const InstanceScope& child : scope.children) {
+            scope_type(child, claimed, hier + "." + child.name);
         }
 
         for (const auto& [def, flds, ty] : def_types_) {
             if (def == scope.def_name && flds == fields) {
                 anchors_[aid].ty = ty;
-                return ty;
+                return;
             }
         }
         auto* ty = llvm::StructType::create(ctx_, fields, scope.def_name + ".state");
         def_types_.emplace_back(scope.def_name, fields, ty);
         anchors_[aid].ty = ty;
-        return ty;
     }
 
     // Build the design's state types: per-signal slot / storage types, one
-    // struct per module definition composed nested along the instance tree, and
-    // the root `%clotho.state` = { <top instances...>, <unscoped signals...>,
-    // <NBA shadow struct> }. Unscoped signals only occur for a module built
-    // without hierarchy info (they form one flat root scope). The NBA shadow
-    // region lives at the root, not inside the definition structs, because
-    // staging is a backend artifact of which signals the design nonblocking-
-    // assigns, not part of a module's declared state.
+    // struct per module definition (own signals only — every instance scope
+    // owns a separate state global, children own theirs), and the root
+    // `%clotho.state` = { <unscoped signals...> }. Unscoped signals only occur
+    // for a module built without hierarchy info (they form one flat root
+    // scope). The NBA shadow region is a separate root-level global, not part
+    // of any definition struct, because staging is a backend artifact of which
+    // signals the design nonblocking-assigns, not part of a module's declared
+    // state.
     void build_state_types() {
         const auto sigs = mod_.signals();
         slots_.resize(sigs.size());
@@ -1384,8 +1361,7 @@ private:
         std::vector<llvm::Type*> root_fields;
         std::vector<bool>        claimed(sigs.size(), false);
         for (const InstanceScope& top : mod_.tops()) {
-            std::vector<uint32_t> path{ static_cast<uint32_t>(root_fields.size()) };
-            root_fields.push_back(scope_type(top, path, claimed, top.name));
+            scope_type(top, claimed, top.name);
         }
         // A definition state type produced by more than one scope occurrence is
         // a reused module: those instances address indirectly (see Anchor).
@@ -1479,9 +1455,11 @@ private:
                     add_fields(slots_[i], sf);
                 }
             }
-            shadow_ty_    = llvm::StructType::create(ctx_, sf, "clotho.nba.shadow");
-            shadow_field_ = static_cast<uint32_t>(root_fields.size());
-            root_fields.push_back(shadow_ty_);
+            // The shadow region is its own global (@clotho.nba.shadow), not a
+            // field of the root state struct — the root struct holds only
+            // unscoped signals now that every instance scope owns its own
+            // state global.
+            shadow_ty_ = llvm::StructType::create(ctx_, sf, "clotho.nba.shadow");
         }
 
         state_ty_ = llvm::StructType::create(ctx_, root_fields, "clotho.state");
@@ -1750,12 +1728,13 @@ private:
     }
 
     // Pointer to a signal's whole storage (its slot struct, or its [N x slot]
-    // memory), addressed through its owning scope's anchor: `anchor + the
-    // def-relative field path`. A unique-definition anchor is a constant alias
-    // of @clotho.state, so the GEP folds to the same link-time-constant address
-    // as the old root-path form; a reused-definition anchor is a base pointer
-    // loaded at each access (stored once by main before any process runs). An
-    // unscoped signal (flat root scope) keeps the direct root-path GEP.
+    // memory), addressed through its owning scope's own state global:
+    // `@clotho.inst.<hier>.state + the scope-relative field path`. A real
+    // symbol plus a def-local addend, so the GEP folds to a link-time-constant
+    // address and the code bytes never depend on whole-design layout. A
+    // shareable reused-definition body instead loads the base pointer from its
+    // instance context (one shared body cannot bake N instance symbols). An
+    // unscoped signal (flat root scope) keeps the direct root GEP.
     llvm::Value* storage_ptr(const SignalSlot& s) {
         std::vector<llvm::Value*> idx;
         idx.push_back(b_.getInt32(0));
@@ -1768,9 +1747,9 @@ private:
         Anchor&      a    = anchors_[s.anchor];
         llvm::Value* base = a.indirect && def_relative_for(s)
                               ? ctx_field(a, 0, llvm::PointerType::getUnqual(ctx_))
-                              : static_cast<llvm::Value*>(anchor_const_base(a));
-        for (size_t f = a.path.size(); f < s.path.size(); ++f) {
-            idx.push_back(b_.getInt32(s.path[f]));
+                              : static_cast<llvm::Value*>(sym(a.state_gv));
+        for (const uint32_t f : s.path) {
+            idx.push_back(b_.getInt32(f));
         }
         return b_.CreateInBoundsGEP(a.ty, base, idx);
     }
@@ -1824,21 +1803,39 @@ private:
         return b_.CreateInBoundsGEP(shadow_ty_, base, { b_.getInt32(0), b_.getInt32(field) });
     }
 
-    // Create @clotho.state and record each anchor's lowest owned process index,
-    // before any body is emitted (storage_ptr resolves through the anchors).
-    // The state global's initializer is the whole power-on state (see
-    // emit_main's comment). A unique-definition anchor addresses through a
-    // constant GEP of the scope's storage — a link-time constant, the shape a
-    // future per-definition split externalizes as a root-defined symbol. A
-    // reused definition's def-relative accesses go through its instance
-    // context (ensure_ctx), which main fills at startup before init_state and
-    // every process.
+    // Create the state globals — one per instance scope
+    // (@clotho.inst.<hier>.state, own signals only) plus the root
+    // @clotho.state for unscoped signals and the standalone NBA shadow global
+    // — and record each anchor's lowest owned process index, before any body
+    // is emitted (storage_ptr resolves through the anchors). Every global's
+    // initializer is its power-on state (see emit_main's comment). A reused
+    // definition's shareable accesses instead go through its instance context
+    // (ensure_ctx), which main fills at startup before init_state and every
+    // process.
     void emit_state_global() {
         auto* state_gv = new llvm::GlobalVariable(env_.llmod, state_ty_, false,
                                                   llvm::GlobalValue::InternalLinkage,
-                                                  state_initializer(), "clotho.state");
+                                                  root_state_initializer(), "clotho.state");
         state_gv->setAlignment(llvm::Align(64));
         state_global_ = state_gv;
+
+        for (Anchor& a : anchors_) {
+            a.state_gv = new llvm::GlobalVariable(env_.llmod, a.ty, false,
+                                                  llvm::GlobalValue::InternalLinkage,
+                                                  scope_state_initializer(a),
+                                                  "clotho.inst." + a.name + ".state");
+            // ABI alignment (no explicit override): small scope structs pack
+            // into shared cache lines; 64-byte over-alignment measured +1.5%
+            // hazard3 sim from scattering hot signals across lines.
+        }
+
+        if (shadow_ty_ != nullptr) {
+            shadow_global_ = new llvm::GlobalVariable(env_.llmod, shadow_ty_, false,
+                                                      llvm::GlobalValue::InternalLinkage,
+                                                      llvm::ConstantAggregateZero::get(shadow_ty_),
+                                                      "clotho.nba.shadow");
+            shadow_global_->setAlignment(llvm::Align(64));
+        }
 
         const auto procs = mod_.processes();
         for (uint32_t k = 0; k < procs.size(); ++k) {
@@ -1851,20 +1848,6 @@ private:
             first           = std::min(first, k);
         }
 
-    }
-
-    // The scope's storage as a link-time constant: a GEP of @clotho.state along
-    // the anchor path. Valid for every anchor — a reused definition uses it in
-    // ineligible (unshareable) contexts, its instance context field 0
-    // otherwise.
-    llvm::Constant* anchor_const_base(const Anchor& a) {
-        std::vector<llvm::Constant*> idx;
-        idx.reserve(a.path.size() + 1);
-        idx.push_back(b_.getInt32(0));
-        for (const uint32_t f : a.path) {
-            idx.push_back(b_.getInt32(f));
-        }
-        return llvm::ConstantExpr::getInBoundsGetElementPtr(state_ty_, sym(state_global_), idx);
     }
 
     // Lazily create the instance context global (see Anchor). The type is
@@ -3274,17 +3257,9 @@ private:
             if (a.ctx_gv == nullptr) {
                 continue;
             }
-            std::vector<llvm::Value*> idx;
-            idx.reserve(a.path.size() + 1);
-            idx.push_back(b_.getInt32(0));
-            for (const uint32_t f : a.path) {
-                idx.push_back(b_.getInt32(f));
-            }
-            b_.CreateStore(b_.CreateInBoundsGEP(state_ty_, state, idx), ctx_ptr(a, 0));
+            b_.CreateStore(sym(a.state_gv), ctx_ptr(a, 0));
             if (shadow_ty_ != nullptr && a.shadow_ty != nullptr) {
-                llvm::Value* shadow = b_.CreateInBoundsGEP(
-                  state_ty_, state, { b_.getInt32(0), b_.getInt32(shadow_field_) });
-                b_.CreateStore(b_.CreateInBoundsGEP(shadow_ty_, shadow,
+                b_.CreateStore(b_.CreateInBoundsGEP(shadow_ty_, sym(shadow_global_),
                                                     { b_.getInt32(0), b_.getInt32(a.shadow_field) }),
                                ctx_ptr(a, 1));
             }
@@ -3325,9 +3300,7 @@ private:
         // above — a design whose NBA targets all live in reused definitions
         // never touches the root base at all.
         if (shadow_ty_ != nullptr && shadow_base_gv_ != nullptr) {
-            b_.CreateStore(b_.CreateInBoundsGEP(state_ty_, state,
-                                                { b_.getInt32(0), b_.getInt32(shadow_field_) }),
-                           shadow_base_gv_);
+            b_.CreateStore(sym(shadow_global_), sym(shadow_base_gv_));
         }
 
         // Register the single DPI scope (svGetScope / user-data, LRM 35.5.3) before
@@ -4273,13 +4246,14 @@ private:
             bool       xhier = false;
             const auto canon_signal = [&](Signal sig) {
                 const SignalSlot& s = slot_of(sig);
-                const bool        under_home =
-                  s.anchor != SignalSlot::no_anchor && s.path.size() > home.path.size() &&
-                  std::equal(home.path.begin(), home.path.end(), s.path.begin());
-                if (under_home) {
+                // Own-scope signal: canonical by its def-local field path.
+                // (Scopes no longer nest, so a descendant instance's signal is
+                // instance-specific like any other cross-hierarchy reference.)
+                if (s.anchor != SignalSlot::no_anchor &&
+                    &anchors_[s.anchor] == &home) {
                     put32(1u);
-                    for (size_t f = home.path.size(); f < s.path.size(); ++f) {
-                        put32(s.path[f]);
+                    for (const uint32_t f : s.path) {
+                        put32(f);
                     }
                     return;
                 }
@@ -7184,38 +7158,43 @@ private:
         }
     }
 
-    // Constant initializer for the `clotho.state` global: the whole power-on
-    // state as an LLVM constant. Recurses the nested scope struct; each signal
-    // leaf (matched by its GEP path) gets its power-on constant, array leaves
-    // and the shadow region get zeroinitializer (arrays are filled by
-    // `init_state`, shadows are written before read).
-    llvm::Constant* state_initializer() {
-        std::map<std::vector<uint32_t>, const SignalSlot*> by_path;
-        for (const SignalSlot& s : slots_) {
-            by_path.emplace(s.path, &s);
+    // Constant power-on initializer for one state global. Every state struct
+    // is now flat — field k is signal k's storage (scope-relative path {k}) —
+    // so the initializer is a direct per-field loop: each signal gets its
+    // power-on constant (slot_const), array leaves zeroinitializer (filled at
+    // runtime by `init_state`). The shadow global is all-zero (written before
+    // read; masks power on clear).
+    llvm::Constant* state_init_fields(llvm::StructType* ty,
+                                      const std::vector<const SignalSlot*>& by_field) {
+        std::vector<llvm::Constant*> elems;
+        elems.reserve(ty->getNumElements());
+        for (uint32_t f = 0; f < ty->getNumElements(); ++f) {
+            elems.push_back(by_field[f] != nullptr
+                              ? slot_const(*by_field[f])
+                              : llvm::Constant::getNullValue(ty->getElementType(f)));
         }
-        std::vector<uint32_t> path;
-        return const_for_path(state_ty_, path, by_path);
+        return llvm::ConstantStruct::get(ty, elems);
     }
 
-    llvm::Constant* const_for_path(llvm::Type* ty, std::vector<uint32_t>& path,
-                                   const std::map<std::vector<uint32_t>, const SignalSlot*>& by_path) {
-        if (const auto it = by_path.find(path); it != by_path.end()) {
-            return slot_const(*it->second);
-        }
-        if (auto* st = llvm::dyn_cast<llvm::StructType>(ty)) {
-            std::vector<llvm::Constant*> elems;
-            elems.reserve(st->getNumElements());
-            for (uint32_t i = 0; i < st->getNumElements(); ++i) {
-                path.push_back(i);
-                elems.push_back(const_for_path(st->getElementType(i), path, by_path));
-                path.pop_back();
+    llvm::Constant* root_state_initializer() {
+        std::vector<const SignalSlot*> by_field(state_ty_->getNumElements(), nullptr);
+        for (const SignalSlot& s : slots_) {
+            if (s.anchor == SignalSlot::no_anchor && !s.path.empty()) {
+                by_field[s.path.front()] = &s;
             }
-            return llvm::ConstantStruct::get(st, elems);
         }
-        // Non-slot leaf: a shadow-region scalar (mm/z shadow or dirty mask).
-        // Shadows are written before read and the mask powers on clear.
-        return llvm::Constant::getNullValue(ty);
+        return state_init_fields(state_ty_, by_field);
+    }
+
+    llvm::Constant* scope_state_initializer(const Anchor& a) {
+        const auto aid = static_cast<uint32_t>(&a - anchors_.data());
+        std::vector<const SignalSlot*> by_field(a.ty->getNumElements(), nullptr);
+        for (const SignalSlot& s : slots_) {
+            if (s.anchor == aid) {
+                by_field[s.path.front()] = &s;
+            }
+        }
+        return state_init_fields(a.ty, by_field);
     }
 
     // Power-on constant for one signal's storage. Arrays and string arrays are
@@ -14197,18 +14176,19 @@ private:
     // over the whole design today; the per-definition split swaps it per unit.
     ModuleEnv               env_;
     llvm::IRBuilder<>       b_;
-    // The root `%clotho.state` struct: top-instance state structs, unscoped
-    // signals, then the NBA shadow struct (when the design has NBAs).
+    // The root `%clotho.state` struct: unscoped signals only (instance scopes
+    // own their own state globals, see Anchor::state_gv).
     llvm::StructType*       state_ty_ = nullptr;
-    // The NBA shadow struct and its field index in the root (valid iff non-null).
-    llvm::StructType*       shadow_ty_    = nullptr;
-    // Global holding &state->shadow, the opaque base every shadow access goes
+    // The NBA shadow struct (valid iff non-null) and its standalone global.
+    llvm::StructType*       shadow_ty_     = nullptr;
+    llvm::GlobalVariable*   shadow_global_ = nullptr;
+    // Global holding &shadow, the opaque base every shadow access goes
     // through (see shadow_ptr for the mis-speculation hazard it defuses).
     llvm::GlobalVariable*   shadow_base_gv_ = nullptr;
-    // The design-state global (@clotho.state), created in emit_main; DPI export
-    // thunks call the SV function against it. Null until emit_main runs.
+    // The root state global (@clotho.state, unscoped signals), created by
+    // emit_state_global; also the vestigial `state` argument main threads
+    // through the process/drain ABI.
     llvm::GlobalVariable*   state_global_ = nullptr;
-    uint32_t                shadow_field_ = 0;
     // Slot-type memo, one `{ i(2W)[, iW] }` per (width, domain, has_z).
     std::vector<std::tuple<uint32_t, bool, bool, bool, llvm::StructType*>> slot_types_;
     // Per-definition state-struct memo: (definition name, field types, type).

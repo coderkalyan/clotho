@@ -195,9 +195,10 @@ TEST_CASE("alu emits verifiable llvm ir") {
     CHECK(ir.find(" sub ") != std::string::npos);
 
     // Signal access via constant typed GEPs, anchored at the owning instance
-    // scope: def-relative (%alu.state) off @clotho.state, folded link-time
-    // constant (asserted on raw IR; instcombine canonicalizes GEP shapes).
-    CHECK(raw.find("%alu.state, ptr @clotho.state") != std::string::npos);
+    // scope's own state global: def-relative (%alu.state) off
+    // @clotho.inst.alu.state, folded link-time constant (asserted on raw IR;
+    // instcombine canonicalizes GEP shapes).
+    CHECK(raw.find("%alu.state, ptr @clotho.inst.alu.state") != std::string::npos);
     CHECK(ir.find("store i16") != std::string::npos);
 
     // The if/else lowers to branches.
@@ -234,7 +235,7 @@ TEST_CASE("2-state vs 4-state widths") {
     CHECK(ir.find("define ptr @m.") != std::string::npos);
 }
 
-TEST_CASE("instance state structs compose nested and replicate per instantiation") {
+TEST_CASE("instance state structs replicate per instantiation as per-scope globals") {
     constexpr std::string_view src = R"(
         module leaf(input logic a, output logic [7:0] q);
             logic [7:0] cnt;
@@ -250,14 +251,18 @@ TEST_CASE("instance state structs compose nested and replicate per instantiation
     )";
     const std::string          raw = emit_raw(src);
 
-    // One state struct per module definition; the parent embeds one field per
-    // child instance (two %leaf.state replicas), and the root composes the top
-    // instance plus the NBA shadow region. No z sources → every slot elided.
-    // Named-type layout survives only in the raw IR (the optimizer drops it).
+    // One state struct per module definition holding its OWN signals only;
+    // each instance scope owns a separate state global of that type (two
+    // %leaf.state globals for the two instances), and the standalone NBA
+    // shadow global carries the staging fields. No z sources → every slot
+    // elided. Named-type layout survives only in the raw IR (the optimizer
+    // drops it).
     CHECK(raw.find("%leaf.state = type { %logic.nz.1, %logic.nz.8, %logic.nz.8 }") != std::string::npos);
-    CHECK(raw.find("%top.state = type { %logic.nz.1, %logic.nz.8, %logic.nz.8, %leaf.state, %leaf.state }") !=
-          std::string::npos);
-    CHECK(raw.find("%clotho.state = type { %top.state, %clotho.nba.shadow }") != std::string::npos);
+    CHECK(raw.find("%top.state = type { %logic.nz.1, %logic.nz.8, %logic.nz.8 }") != std::string::npos);
+    CHECK(raw.find("@clotho.inst.top.state = internal global %top.state") != std::string::npos);
+    CHECK(raw.find("@clotho.inst.top.u0.state = internal global %leaf.state") != std::string::npos);
+    CHECK(raw.find("@clotho.inst.top.u1.state = internal global %leaf.state") != std::string::npos);
+    CHECK(raw.find("@clotho.nba.shadow = internal global %clotho.nba.shadow") != std::string::npos);
     // Exactly one definition of the leaf struct type (deduplicated, no .0 clone).
     CHECK(raw.find("%leaf.state.0") == std::string::npos);
 }
