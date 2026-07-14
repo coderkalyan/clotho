@@ -2090,12 +2090,20 @@ private:
         // instance ctx after lowering, once the ids are known (ctx_blk_fills_).
         group_first_block_ = -1;
 
-        // Name a process by its index: @<module>.p<index>. Source-offset naming
-        // would collide once the design has multiple instances of one module —
-        // their processes share the same AST source location. The index is unique
-        // across the flattened module; proc.loc still carries the source mapping.
+        // Name a process by its owner: a definition-unit group (split mode) is
+        // @clotho.inst.<hier>.p<def-local ordinal> — instance-qualified (twin
+        // instances land in one module, so a bare def-local name would
+        // collide) with a def-local index, keeping the unit module's bytes
+        // independent of whole-design process numbering (cache-stability
+        // prep). Everything else keeps @<module>.p<flat index>; source-offset
+        // naming would collide across instances of one module (processes
+        // share the AST location); proc.loc still carries the source mapping.
         // A fused group is named by its first member plus its size.
-        std::string name = mod_.name + ".p" + std::to_string(proc_index);
+        const uint32_t ua   = group_unit_anchor_[group_of_[proc_index]];
+        std::string    name = config_.split && ua != SignalSlot::no_anchor
+                                ? "clotho.inst." + anchors_[ua].name + ".p" +
+                                    std::to_string(proc_sched_ord_[proc_index])
+                                : mod_.name + ".p" + std::to_string(proc_index);
         if (members.size() > 1) {
             name += ".f" + std::to_string(members.size());
         }

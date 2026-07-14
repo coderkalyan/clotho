@@ -183,13 +183,13 @@ TEST_CASE("alu emits verifiable llvm ir") {
     // timing-wheel ptr, no coroutine. Under --no-thunk each is instead a
     // switched-resume coroutine ramp returning the handle (CoroSplit then emits
     // .resume/.destroy/.cleanup parts, which don't match "define ptr @alu.p").
-    CHECK(count_substr(ir, "define void @alu.p") == 3);
+    CHECK(count_substr(ir, "define void @clotho.inst.alu.p") == 3);
     // Definitions only: the root module's seed loop re-declares each thunk
     // (split emission), and declarations print without argument names.
     CHECK(count_substr(ir, ".thunk(ptr noalias %state") == 3);
     CHECK(ir.find("(ptr noalias %state, ptr %wheel)") != std::string::npos);
     const std::string co = emit(kAlu, { .thunk = false });
-    CHECK(count_substr(co, "define ptr @alu.p") == 3);
+    CHECK(count_substr(co, "define ptr @clotho.inst.alu.p") == 3);
     CHECK(co.find("(ptr %state, ptr %wheel)") != std::string::npos);
 
     // Datapath ops present.
@@ -234,7 +234,7 @@ TEST_CASE("2-state vs 4-state widths") {
     CHECK(raw.find("@clotho.state = internal global") != std::string::npos);
     // z's must|may word is an i16 (2W = 16).
     CHECK(ir.find("store i16") != std::string::npos);
-    CHECK(ir.find("define ptr @m.") != std::string::npos);
+    CHECK(ir.find("define ptr @clotho.inst.m.p") != std::string::npos);
 }
 
 TEST_CASE("instance state structs replicate per instantiation as per-scope globals") {
@@ -1336,11 +1336,11 @@ TEST_CASE("repeated instantiation emits distinct process symbols") {
     // (the fused pair is `.f2.thunk`); under --no-thunk they are coroutine ramps.
     // Definitions only (split emission re-declares cross-module symbols;
     // declarations and calls print without argument names).
-    CHECK(count_substr(ir, "define void @top.p") == 5);
+    CHECK(count_substr(ir, "define void @clotho.inst.top.") == 5);
     CHECK(count_substr(ir, ".thunk(ptr noalias %state") == 5);
     CHECK(count_substr(ir, ".f2.thunk(ptr noalias %state") == 1);
     const std::string co = emit(src, { .thunk = false });
-    CHECK(count_substr(co, "define ptr @top.p") == 5);
+    CHECK(count_substr(co, "define ptr @clotho.inst.top.") == 5);
     CHECK(count_substr(co, ".f2(ptr %state") == 1);
 }
 
