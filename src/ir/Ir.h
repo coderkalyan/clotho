@@ -924,6 +924,13 @@ struct Inst {
         // associative + commutative, so K drivers fold left (payload: binary).
         WandRes,
         WorRes,
+        // Resistive pull applied after a tri0/tri1 net's drivers are resolved
+        // (LRM 6.6.4): a bit still Z (all drivers off) is pulled to the immediate
+        // (0 for tri0, 1 for tri1); a definitely-driven or X bit is unchanged.
+        // A post-fold unary transform, not a per-pair rule — the pull only fills
+        // Z once every driver has folded. Result never carries Z (payload:
+        // op_imm — op is the resolved value, imm the pull value).
+        NetPull,
 
         // -- Reductions, e.g. &x (payload: unary) --
         RedAnd,
@@ -1652,6 +1659,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::Scanf;
         case T::RealMathUnary:
         case T::StreamReverse:
+        case T::NetPull:
             return K::OpImm;
         case T::TimeFormat:
             return K::TimeFormat;

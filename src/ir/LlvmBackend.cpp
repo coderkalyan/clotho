@@ -4103,6 +4103,7 @@ private:
                 case Inst::Tag::Concat:
                 case Inst::Tag::Repl:
                 case Inst::Tag::StreamReverse:
+                case Inst::Tag::NetPull:
                 case Inst::Tag::Resize:
                 case Inst::Tag::Cond:
                 case Inst::Tag::Switch:
@@ -5124,6 +5125,7 @@ private:
                 case Inst::Tag::Concat:
                 case Inst::Tag::Repl:
                 case Inst::Tag::StreamReverse:
+                case Inst::Tag::NetPull:
                 case Inst::Tag::Resize:
                 case Inst::Tag::Cond:
                 case Inst::Tag::Switch:
@@ -7518,6 +7520,10 @@ private:
             case Inst::Tag::StreamReverse:
                 // A bit permutation: the operand's width and domain.
                 return type_of(p.op_imm.op);
+            case Inst::Tag::NetPull:
+                // A pulled net is 4-state (a driver conflict is still X) but
+                // never Z, at the resolved value's width.
+                return { type_of(p.op_imm.op).width, true, false };
             case Inst::Tag::Select:
                 return type_of(ir_->extra_data<Select>(p.op_extra.extra).a);
             case Inst::Tag::SelectLazy:
@@ -8598,6 +8604,9 @@ private:
                 return;
             case Inst::Tag::StreamReverse:
                 set_value(i, lower_stream_reverse(value_of(p.op_imm.op), p.op_imm.imm));
+                return;
+            case Inst::Tag::NetPull:
+                set_value(i, lower_net_pull(value_of(p.op_imm.op), p.op_imm.imm));
                 return;
             case Inst::Tag::Resize: {
                 // Truncate or extend all planes (sign per target type).
@@ -12707,6 +12716,20 @@ private:
                 throw BackendError{ "lower_net_res: not a resolution tag" };
         }
         return packed(rmust, rmay, rz);
+    }
+
+    // Resistive pull of a resolved tri0/tri1 net (LRM 6.6.4): a still-Z bit
+    // becomes `pull` (0 or 1), a definitely-driven or X bit is unchanged, and the
+    // result carries no Z. A Z bit is (must 0, may 1, z 1); pulling to 0 clears
+    // its may bit, pulling to 1 sets its must bit.
+    Plane lower_net_pull(Plane a, uint32_t pull) {
+        llvm::Value* must = must_of(a);
+        llvm::Value* may  = may_of(a);
+        llvm::Value* z    = z_of(a);
+        if (pull == 0) {
+            return packed(must, b_.CreateAnd(may, b_.CreateNot(z)), zero(width_of(a)));
+        }
+        return packed(b_.CreateOr(must, z), may, zero(width_of(a)));
     }
 
     // -- Real (floating point) helpers --

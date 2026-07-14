@@ -122,6 +122,10 @@ Index Builder::stream_reverse(Index op, uint32_t slice, SourceLoc loc) {
     return emit({ Inst::Tag::StreamReverse, Inst::Payload{ .op_imm = { op, slice } } }, loc);
 }
 
+Index Builder::net_pull(Index op, uint32_t pull, SourceLoc loc) {
+    return emit({ Inst::Tag::NetPull, Inst::Payload{ .op_imm = { op, pull } } }, loc);
+}
+
 Index Builder::select(Index cond, Index a, Index b, SourceLoc loc) {
     const ExtraIndex extra = add_extra(Select{ a, b });
 

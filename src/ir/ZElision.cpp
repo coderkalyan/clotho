@@ -328,6 +328,10 @@ struct Analysis {
                     val_z[raw] = 1;
                     break;
 
+                // A tri0/tri1 pull replaces every Z bit with 0 / 1, so its
+                // result never carries Z — the pulled net can be Z-elided even
+                // though its driver slots (and the WireRes fold) may be Z.
+                case Inst::Tag::NetPull:
                 // Z-absorbing ops: their lowerings emit a zero z plane (a z
                 // input reads as X through the must/may planes).
                 case Inst::Tag::Add:
