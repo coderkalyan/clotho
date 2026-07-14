@@ -262,7 +262,8 @@ TEST_CASE("instance state structs replicate per instantiation as per-scope globa
     CHECK(raw.find("@clotho.inst.top.state = internal global %top.state") != std::string::npos);
     CHECK(raw.find("@clotho.inst.top.u0.state = internal global %leaf.state") != std::string::npos);
     CHECK(raw.find("@clotho.inst.top.u1.state = internal global %leaf.state") != std::string::npos);
-    CHECK(raw.find("@clotho.nba.shadow = internal global %clotho.nba.shadow") != std::string::npos);
+    CHECK(raw.find("@clotho.inst.top.u0.shadow = internal global %leaf.state.shadow") != std::string::npos);
+    CHECK(raw.find("@clotho.inst.top.u1.shadow = internal global %leaf.state.shadow") != std::string::npos);
     // Exactly one definition of the leaf struct type (deduplicated, no .0 clone).
     CHECK(raw.find("%leaf.state.0") == std::string::npos);
 }
@@ -2978,9 +2979,10 @@ TEST_CASE("whole-scalar NBAs lower to the block-commit path by default") {
     CHECK(ir.find("clotho.nba_block_enqueue") != std::string::npos);
     CHECK(ir.find("clotho.nba.commit_blk0") != std::string::npos);
     CHECK(ir.find("clotho.nba.w4.full") == std::string::npos);
-    // Shadow accesses go through the opaque base, not state-relative constant
-    // offsets (memory-dependence mis-speculation defense; see shadow_ptr).
-    CHECK(ir.find("clotho.nba.shadow_base") != std::string::npos);
+    // Shadow accesses go through the owning instance's opaque base pointer,
+    // not state-relative constant offsets (memory-dependence mis-speculation
+    // defense; see shadow_ptr).
+    CHECK(ir.find("clotho.inst.m.shadow_base") != std::string::npos);
     CHECK(run_capture(src) == "zz01 0101\n");
 }
 

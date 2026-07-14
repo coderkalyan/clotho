@@ -476,12 +476,15 @@ struct Anchor {
     // group's sched flag is addressed instance-base + (proc - first_proc), the
     // def-local ordinal — identical slot, def-relative form (dedup prep).
     uint32_t first_proc = ~0u;
-    // Index of this scope's shadow sub-struct within %clotho.nba.shadow, and
-    // the per-def sub-struct type (~0 / null when the scope has no NBA shadow
-    // fields). Unique definitions and ineligible contexts fold the two-level
-    // constant GEP through the opaque root shadow base.
-    llvm::StructType* shadow_ty    = nullptr;
-    uint32_t          shadow_field = ~0u;
+    // This scope's NBA shadow: the per-def staging struct type (null when
+    // the scope has no NBA shadow fields), its own global
+    // (@clotho.inst.<hier>.shadow), and the opaque base-pointer global
+    // (@clotho.inst.<hier>.shadow_base, lazy) every unshared shadow access
+    // loads — one load, preserving the mis-speculation opacity (see
+    // shadow_ptr) with a def-stable symbol.
+    llvm::StructType*     shadow_ty      = nullptr;
+    llvm::GlobalVariable* shadow_gv      = nullptr;
+    llvm::GlobalVariable* shadow_base_gv = nullptr;
     // Lowest VCD dump-var index of the scope's own dumped signals (-1: none).
     // Touch sites address a dumped signal as vcd base + def-local offset.
     int32_t first_vcd = -1;
@@ -1436,8 +1439,7 @@ private:
                 if (af.empty()) {
                     continue;
                 }
-                Anchor& an      = anchors_[a];
-                an.shadow_field = static_cast<uint32_t>(sf.size());
+                Anchor& an = anchors_[a];
                 for (const auto& [ty, flds, st] : shadow_defs) {
                     if (ty == an.ty && flds == af) {
                         an.shadow_ty = st;
@@ -1448,18 +1450,19 @@ private:
                     an.shadow_ty = llvm::StructType::create(ctx_, af, an.ty->getName().str() + ".shadow");
                     shadow_defs.emplace_back(an.ty, std::move(af), an.shadow_ty);
                 }
-                sf.push_back(an.shadow_ty);
             }
             for (uint32_t i = 0; i < sigs.size(); ++i) {
                 if (slots_[i].anchor == SignalSlot::no_anchor && slots_[i].nba) {
                     add_fields(slots_[i], sf);
                 }
             }
-            // The shadow region is its own global (@clotho.nba.shadow), not a
-            // field of the root state struct — the root struct holds only
-            // unscoped signals now that every instance scope owns its own
-            // state global.
-            shadow_ty_ = llvm::StructType::create(ctx_, sf, "clotho.nba.shadow");
+            // Anchored scopes' staging lives in per-instance shadow globals
+            // (Anchor::shadow_gv); the root @clotho.nba.shadow holds only the
+            // unscoped signals' fields, and is skipped entirely when every
+            // NBA target is scope-owned.
+            if (!sf.empty()) {
+                shadow_ty_ = llvm::StructType::create(ctx_, sf, "clotho.nba.shadow");
+            }
         }
 
         state_ty_ = llvm::StructType::create(ctx_, root_fields, "clotho.state");
@@ -1790,17 +1793,30 @@ private:
     llvm::Value* shadow_ptr(const SignalSlot& owner, uint32_t field) {
         auto* ptr = llvm::PointerType::getUnqual(ctx_);
         if (owner.anchor != SignalSlot::no_anchor) {
-            Anchor& a = anchors_[owner.anchor];
-            if (a.shadow_ty != nullptr && a.indirect && def_relative_for(owner)) {
-                llvm::Value* base = ctx_field(a, 1, ptr);
-                return b_.CreateInBoundsGEP(a.shadow_ty, base, { b_.getInt32(0), b_.getInt32(field) });
-            }
-            llvm::Value* base = b_.CreateLoad(ptr, shadow_base_gv());
-            return b_.CreateInBoundsGEP(
-              shadow_ty_, base, { b_.getInt32(0), b_.getInt32(a.shadow_field), b_.getInt32(field) });
+            // An NBA target's anchor always carries a shadow struct (the
+            // fields were assigned per anchor in build_state_types).
+            Anchor&      a    = anchors_[owner.anchor];
+            llvm::Value* base = a.indirect && def_relative_for(owner)
+                                  ? ctx_field(a, 1, ptr)
+                                  : b_.CreateLoad(ptr, anchor_shadow_base(a));
+            return b_.CreateInBoundsGEP(a.shadow_ty, base, { b_.getInt32(0), b_.getInt32(field) });
         }
         llvm::Value* base = b_.CreateLoad(ptr, shadow_base_gv());
         return b_.CreateInBoundsGEP(shadow_ty_, base, { b_.getInt32(0), b_.getInt32(field) });
+    }
+
+    // Per-instance opaque shadow base (@clotho.inst.<hier>.shadow_base):
+    // created on first unshared shadow access, filled by main right after the
+    // ctx fills. Same one-load opacity as the root shadow_base_gv.
+    llvm::GlobalVariable* anchor_shadow_base(Anchor& a) {
+        if (a.shadow_base_gv == nullptr) {
+            auto* ptr        = llvm::PointerType::getUnqual(ctx_);
+            a.shadow_base_gv = new llvm::GlobalVariable(env_.llmod, ptr, false,
+                                                        llvm::GlobalValue::InternalLinkage,
+                                                        llvm::ConstantPointerNull::get(ptr),
+                                                        "clotho.inst." + a.name + ".shadow_base");
+        }
+        return sym(a.shadow_base_gv);
     }
 
     // Create the state globals — one per instance scope
@@ -1829,12 +1845,19 @@ private:
             // hazard3 sim from scattering hot signals across lines.
         }
 
+        for (Anchor& a : anchors_) {
+            if (a.shadow_ty != nullptr) {
+                a.shadow_gv = new llvm::GlobalVariable(env_.llmod, a.shadow_ty, false,
+                                                       llvm::GlobalValue::InternalLinkage,
+                                                       llvm::ConstantAggregateZero::get(a.shadow_ty),
+                                                       "clotho.inst." + a.name + ".shadow");
+            }
+        }
         if (shadow_ty_ != nullptr) {
             shadow_global_ = new llvm::GlobalVariable(env_.llmod, shadow_ty_, false,
                                                       llvm::GlobalValue::InternalLinkage,
                                                       llvm::ConstantAggregateZero::get(shadow_ty_),
                                                       "clotho.nba.shadow");
-            shadow_global_->setAlignment(llvm::Align(64));
         }
 
         const auto procs = mod_.processes();
@@ -3258,10 +3281,8 @@ private:
                 continue;
             }
             b_.CreateStore(sym(a.state_gv), ctx_ptr(a, 0));
-            if (shadow_ty_ != nullptr && a.shadow_ty != nullptr) {
-                b_.CreateStore(b_.CreateInBoundsGEP(shadow_ty_, sym(shadow_global_),
-                                                    { b_.getInt32(0), b_.getInt32(a.shadow_field) }),
-                               ctx_ptr(a, 1));
+            if (a.shadow_ty != nullptr) {
+                b_.CreateStore(sym(a.shadow_gv), ctx_ptr(a, 1));
             }
             if (a.first_proc != ~0u) {
                 b_.CreateStore(
@@ -3295,12 +3316,17 @@ private:
             b_.CreateStore(b_.getInt32(first_id), ctx_ptr(anchors_[aid], field));
         }
         init_state();
-        // The root shadow base fills only when some shadow access loaded it
-        // (lazy shadow_base_gv); the per-instance bases live in the ctx fills
-        // above — a design whose NBA targets all live in reused definitions
-        // never touches the root base at all.
-        if (shadow_ty_ != nullptr && shadow_base_gv_ != nullptr) {
+        // Shadow bases fill only when some shadow access loaded them (lazy):
+        // the root base covers unscoped targets, the per-instance bases each
+        // scope's unshared accesses; shareable reused-definition accesses go
+        // through the ctx fills above instead.
+        if (shadow_global_ != nullptr && shadow_base_gv_ != nullptr) {
             b_.CreateStore(sym(shadow_global_), sym(shadow_base_gv_));
+        }
+        for (Anchor& a : anchors_) {
+            if (a.shadow_base_gv != nullptr) {
+                b_.CreateStore(sym(a.shadow_gv), sym(a.shadow_base_gv));
+            }
         }
 
         // Register the single DPI scope (svGetScope / user-data, LRM 35.5.3) before
