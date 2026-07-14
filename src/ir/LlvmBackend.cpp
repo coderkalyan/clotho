@@ -463,47 +463,44 @@ struct Anchor {
     llvm::StructType* ty = nullptr;
     // Hierarchical instance name (diagnostic / symbol naming).
     std::string name;
-    // Base of the scope's storage: a constant GEP of @clotho.state (unique
-    // definition — link-time constant; a per-definition split externalizes
-    // exactly this into a root-defined symbol) or a pointer-holding global main
-    // initializes at startup (reused definition; storage_ptr loads it).
-    // NOTE: not a GlobalAlias — JITLink's symbol-bounds validation rejects an
-    // alias into the interior of a global whose value type extends past the
-    // containing block, so the constant form stays an anonymous expression.
-    llvm::Constant* sym = nullptr;
     // True when the scope's definition state type is instantiated more than
-    // once: address through a runtime base-pointer load.
+    // once: def-relative code addresses through the instance context.
     bool indirect = false;
     // Lowest process index owned by this scope (~0 when it owns none). An owned
     // group's sched flag is addressed instance-base + (proc - first_proc), the
     // def-local ordinal — identical slot, def-relative form (dedup prep).
     uint32_t first_proc = ~0u;
-    // Reused definitions only: pointer global holding &proc_sched[first_proc],
-    // stored by main; a unique definition folds to the absolute constant.
-    // Created lazily by the first group that addresses through it, so a design
-    // whose eligible groups all fuse cross-instance emits no dead symbols.
-    llvm::GlobalVariable* sched_sym = nullptr;
     // Index of this scope's shadow sub-struct within %clotho.nba.shadow, and
     // the per-def sub-struct type (~0 / null when the scope has no NBA shadow
-    // fields). A reused definition also gets shadow_sym — a pointer global main
-    // fills with &shadow.<sub> — so twin staging/commit code carries only
-    // def-local field constants; a unique definition folds the two-level
-    // constant GEP through the root shadow base.
-    llvm::StructType*     shadow_ty    = nullptr;
-    uint32_t              shadow_field = ~0u;
-    llvm::GlobalVariable* shadow_sym   = nullptr;
-    // Reused definitions only: [n x ptr] table of this instance's wait-queue
-    // base pointers (sta base / dyn base / dyn len per def-local bucket, slot
-    // order fixed by the def walk), filled by main. Body-side service scans and
-    // dynamic registration load their bases here, so twin bodies carry a
-    // def-local slot constant instead of a per-instance queue symbol. Commit
-    // functions and the seed loop keep the absolute globals.
-    llvm::GlobalVariable* wait_sym = nullptr;
+    // fields). Unique definitions and ineligible contexts fold the two-level
+    // constant GEP through the opaque root shadow base.
+    llvm::StructType* shadow_ty    = nullptr;
+    uint32_t          shadow_field = ~0u;
     // Lowest VCD dump-var index of the scope's own dumped signals (-1: none).
     // Touch sites address a dumped signal as vcd base + def-local offset.
     int32_t first_vcd = -1;
-    // Reused definitions only: i32 global holding first_vcd, stored by main.
-    llvm::GlobalVariable* vcd_sym = nullptr;
+
+    // Instance context (reused definitions): ONE per-instance global
+    // (@clotho.inst.<hier>.ctx) holding every base a def-relative body needs,
+    // laid out per definition so twin instances load identical field
+    // constants — the single symbol a shared body later swaps for a
+    // parameter. Filled by main at startup. Layout:
+    //   0             ptr  state base (the scope's storage)
+    //   1             ptr  shadow sub-struct base (null when no NBA shadows)
+    //   2             ptr  &proc_sched[first_proc]
+    //   3             i32  first_vcd
+    //   ctx_blk_base  i32  first NBA block id, one per def-local single-scope
+    //                      group ordinal (0 when the group registers none)
+    //   ctx_wait_base ptr  wait bucket bases (sta / dyn / dyn-len), def-local
+    //                      slot order from the bucket walk
+    // ctx_ty is shared across instances of one definition; the global is
+    // created lazily by the first def-relative use.
+    llvm::StructType*     ctx_ty        = nullptr;
+    llvm::GlobalVariable* ctx_gv        = nullptr;
+    uint32_t              ctx_blk_base  = 0;
+    uint32_t              ctx_wait_base = 0;
+    // Def-local single-scope group count (sizes the blk fields).
+    uint32_t n_groups = 0;
 };
 
 // One function-frame local: its `{ i(2W), iW }` slot type and width / domain.
@@ -571,6 +568,7 @@ public:
         compute_domain_spec();   // after fusion (thunk_group_): reads spec_group_ in lower_group
         build_vcd_index();       // before build_nba_state: fills vcd_index_ / design_uses_vcd_
         build_wait_queues();
+        build_instance_ctx_layout(); // after build_wait_queues: ctx sizes need wait slots
         build_delay_event_thunks(); // after build_wait_queues: thunks read the event globals
         build_sched_flags();
         build_nba_state();
@@ -1709,11 +1707,10 @@ private:
             }
             return b_.CreateInBoundsGEP(state_ty_, state_global_, idx);
         }
-        const Anchor& a    = anchors_[s.anchor];
-        llvm::Value*  base = a.sym;
-        if (a.indirect) {
-            base = b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), a.sym);
-        }
+        Anchor&      a    = anchors_[s.anchor];
+        llvm::Value* base = a.indirect && def_relative_for(s)
+                              ? ctx_field(a, 0, llvm::PointerType::getUnqual(ctx_))
+                              : static_cast<llvm::Value*>(anchor_const_base(a));
         for (size_t f = a.path.size(); f < s.path.size(); ++f) {
             idx.push_back(b_.getInt32(s.path[f]));
         }
@@ -1756,9 +1753,9 @@ private:
     llvm::Value* shadow_ptr(const SignalSlot& owner, uint32_t field) {
         auto* ptr = llvm::PointerType::getUnqual(ctx_);
         if (owner.anchor != SignalSlot::no_anchor) {
-            const Anchor& a = anchors_[owner.anchor];
-            if (a.shadow_sym != nullptr && def_relative_for(owner)) {
-                llvm::Value* base = b_.CreateLoad(ptr, a.shadow_sym);
+            Anchor& a = anchors_[owner.anchor];
+            if (a.shadow_ty != nullptr && a.indirect && def_relative_for(owner)) {
+                llvm::Value* base = ctx_field(a, 1, ptr);
                 return b_.CreateInBoundsGEP(a.shadow_ty, base, { b_.getInt32(0), b_.getInt32(field) });
             }
             llvm::Value* base = b_.CreateLoad(ptr, shadow_base_gv());
@@ -1769,13 +1766,15 @@ private:
         return b_.CreateInBoundsGEP(shadow_ty_, base, { b_.getInt32(0), b_.getInt32(field) });
     }
 
-    // Create @clotho.state and one anchor symbol per instance scope, before any
-    // body is emitted (storage_ptr resolves through them). The state global's
-    // initializer is the whole power-on state (see emit_main's comment). A
-    // unique-definition anchor is a GlobalAlias of the scope's storage — a
-    // link-time constant, the shape a future per-definition split externalizes
-    // as a root-defined symbol. A reused-definition anchor is a pointer global
-    // main fills at startup (emit_main), before init_state and every process.
+    // Create @clotho.state and record each anchor's lowest owned process index,
+    // before any body is emitted (storage_ptr resolves through the anchors).
+    // The state global's initializer is the whole power-on state (see
+    // emit_main's comment). A unique-definition anchor addresses through a
+    // constant GEP of the scope's storage — a link-time constant, the shape a
+    // future per-definition split externalizes as a root-defined symbol. A
+    // reused definition's def-relative accesses go through its instance
+    // context (ensure_ctx), which main fills at startup before init_state and
+    // every process.
     void emit_state_global() {
         auto* state_gv = new llvm::GlobalVariable(llmod_, state_ty_, false,
                                                   llvm::GlobalValue::InternalLinkage,
@@ -1794,27 +1793,40 @@ private:
             first           = std::min(first, k);
         }
 
-        auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        for (Anchor& a : anchors_) {
-            if (a.indirect) {
-                a.sym = new llvm::GlobalVariable(llmod_, ptr, false, llvm::GlobalValue::InternalLinkage,
-                                                 llvm::ConstantPointerNull::get(ptr),
-                                                 "clotho.inst." + a.name);
-                if (a.shadow_ty != nullptr) {
-                    a.shadow_sym = new llvm::GlobalVariable(
-                      llmod_, ptr, false, llvm::GlobalValue::InternalLinkage,
-                      llvm::ConstantPointerNull::get(ptr), "clotho.inst." + a.name + ".shadow");
-                }
-                continue;
-            }
-            std::vector<llvm::Constant*> idx;
-            idx.reserve(a.path.size() + 1);
-            idx.push_back(b_.getInt32(0));
-            for (const uint32_t f : a.path) {
-                idx.push_back(b_.getInt32(f));
-            }
-            a.sym = llvm::ConstantExpr::getInBoundsGetElementPtr(state_ty_, state_gv, idx);
+    }
+
+    // The scope's storage as a link-time constant: a GEP of @clotho.state along
+    // the anchor path. Valid for every anchor — a reused definition uses it in
+    // ineligible (unshareable) contexts, its instance context field 0
+    // otherwise.
+    llvm::Constant* anchor_const_base(const Anchor& a) {
+        std::vector<llvm::Constant*> idx;
+        idx.reserve(a.path.size() + 1);
+        idx.push_back(b_.getInt32(0));
+        for (const uint32_t f : a.path) {
+            idx.push_back(b_.getInt32(f));
         }
+        return llvm::ConstantExpr::getInBoundsGetElementPtr(state_ty_, state_global_, idx);
+    }
+
+    // Lazily create the instance context global (see Anchor). The type is
+    // computed by build_instance_ctx_layout; only instances actually addressed
+    // def-relatively materialize a global (and a fill in main).
+    llvm::GlobalVariable* ensure_ctx(Anchor& a) {
+        if (a.ctx_gv == nullptr) {
+            a.ctx_gv = new llvm::GlobalVariable(llmod_, a.ctx_ty, false,
+                                                llvm::GlobalValue::InternalLinkage,
+                                                llvm::ConstantAggregateZero::get(a.ctx_ty),
+                                                "clotho.inst." + a.name + ".ctx");
+        }
+        return a.ctx_gv;
+    }
+
+    // A def-relative load of one instance-context field.
+    llvm::Value* ctx_field(Anchor& a, uint32_t field, llvm::Type* ty) {
+        auto* gep = llvm::ConstantExpr::getInBoundsGetElementPtr(
+          a.ctx_ty, ensure_ctx(a), llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(field) });
+        return b_.CreateLoad(ty, gep);
     }
 
     // Materialize the group's deferred def-relative context at the current
@@ -1828,8 +1840,8 @@ private:
         if (sched_ptr_ != nullptr) {
             return;
         }
-        const Anchor& a    = anchors_[sched_anchor_];
-        llvm::Value*  base = b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), a.sched_sym);
+        Anchor&      a    = anchors_[sched_anchor_];
+        llvm::Value* base = ctx_field(a, 2, llvm::PointerType::getUnqual(ctx_));
         sched_ptr_ = b_.CreateInBoundsGEP(b_.getInt32Ty(), base, b_.getInt32(sched_ordinal_));
     }
 
@@ -1915,27 +1927,12 @@ private:
         // instance's sched base and indexes the def-local ordinal — the same
         // slot, materialized at function entry (materialize_sched_ptr); a
         // unique-definition or cross-instance group keeps the folded constant.
-        sched_anchor_ = SignalSlot::no_anchor;
-        {
-            const uint32_t sc   = proc.scope;
-            bool           same = sc != Process::no_scope;
-            for (const uint32_t m : members) {
-                same = same && all[m].scope == sc;
-            }
-            if (same && sc < anchor_of_scope_.size() &&
-                anchor_of_scope_[sc] != SignalSlot::no_anchor) {
-                Anchor& a = anchors_[anchor_of_scope_[sc]];
-                if (a.indirect && a.first_proc != ~0u) {
-                    if (a.sched_sym == nullptr) {
-                        auto* ptr   = llvm::PointerType::getUnqual(ctx_);
-                        a.sched_sym = new llvm::GlobalVariable(
-                          llmod_, ptr, false, llvm::GlobalValue::InternalLinkage,
-                          llvm::ConstantPointerNull::get(ptr), "clotho.inst." + a.name + ".sched");
-                    }
-                    sched_anchor_  = anchor_of_scope_[sc];
-                    sched_ordinal_ = proc_index - a.first_proc;
-                }
-            }
+        sched_anchor_      = SignalSlot::no_anchor;
+        sched_group_       = group_of_[proc_index];
+        const uint32_t gaid = group_anchor_of_[sched_group_];
+        if (gaid != SignalSlot::no_anchor) {
+            sched_anchor_  = gaid;
+            sched_ordinal_ = proc_index - anchors_[gaid].first_proc;
         }
         sched_ptr_ = sched_anchor_ != SignalSlot::no_anchor
                        ? nullptr
@@ -1947,11 +1944,8 @@ private:
         // (instance block base + group-local ordinal) instead of the absolute
         // block id — identical value (a group's blocks are id-contiguous by
         // construction: block_register only runs while its group lowers), in the
-        // def-relative form a shared body needs. The base symbol is created at
-        // the group's first registration (no dead symbol for a block-free
-        // group) and loaded per registration; main stores the base after
-        // lowering, once the ids are known.
-        blk_base_sym_      = nullptr;
+        // def-relative form a shared body needs. Main stores the base into the
+        // instance ctx after lowering, once the ids are known (ctx_blk_fills_).
         group_first_block_ = -1;
 
         // Name a process by its index: @<module>.p<index>. Source-offset naming
@@ -2789,7 +2783,6 @@ private:
         frame_     = b_.CreateAlloca(frame_ty_, nullptr, "frame");
         sched_ptr_ = b_.CreateAlloca(b_.getInt32Ty(), nullptr, "task_sched");
         sched_anchor_      = SignalSlot::no_anchor;
-        blk_base_sym_      = nullptr;
         group_first_block_ = -1;
 
         auto* trap_bb    = llvm::BasicBlock::Create(ctx_, "coro.trap", fn_);
@@ -3216,8 +3209,11 @@ private:
         // instance anchors); reused-definition anchor bases are stored here,
         // before init_state and any process, so every later load sees them.
         llvm::Value* state = state_global_;
-        for (const Anchor& a : anchors_) {
-            if (!a.indirect) {
+        const auto ctx_ptr = [&](Anchor& a, uint32_t field) {
+            return b_.CreateInBoundsGEP(a.ctx_ty, a.ctx_gv, { b_.getInt32(0), b_.getInt32(field) });
+        };
+        for (Anchor& a : anchors_) {
+            if (a.ctx_gv == nullptr) {
                 continue;
             }
             std::vector<llvm::Value*> idx;
@@ -3226,42 +3222,54 @@ private:
             for (const uint32_t f : a.path) {
                 idx.push_back(b_.getInt32(f));
             }
-            b_.CreateStore(b_.CreateInBoundsGEP(state_ty_, state, idx), a.sym);
-            if (a.sched_sym != nullptr) {
+            b_.CreateStore(b_.CreateInBoundsGEP(state_ty_, state, idx), ctx_ptr(a, 0));
+            if (shadow_ty_ != nullptr && a.shadow_ty != nullptr) {
+                llvm::Value* shadow = b_.CreateInBoundsGEP(
+                  state_ty_, state, { b_.getInt32(0), b_.getInt32(shadow_field_) });
+                b_.CreateStore(b_.CreateInBoundsGEP(shadow_ty_, shadow,
+                                                    { b_.getInt32(0), b_.getInt32(a.shadow_field) }),
+                               ctx_ptr(a, 1));
+            }
+            if (a.first_proc != ~0u) {
                 b_.CreateStore(
                   b_.CreateInBoundsGEP(sched_arr_ty_, sched_gv_,
                                        { b_.getInt32(0), b_.getInt32(a.first_proc) }),
-                  a.sched_sym);
+                  ctx_ptr(a, 2));
             }
-            if (a.vcd_sym != nullptr) {
-                b_.CreateStore(b_.getInt32(static_cast<uint32_t>(a.first_vcd)), a.vcd_sym);
+            if (a.first_vcd >= 0) {
+                b_.CreateStore(b_.getInt32(static_cast<uint32_t>(a.first_vcd)), ctx_ptr(a, 3));
+            }
+            for (const Signal sj : anchor_signals_[static_cast<size_t>(&a - anchors_.data())]) {
+                if (sj == Signal{ ~0u }) {
+                    continue;
+                }
+                const auto si = static_cast<uint32_t>(sj);
+                for (uint32_t e = 0; e < 3; ++e) {
+                    if (wait_slot_sta_[si][e] != no_wait_slot) {
+                        b_.CreateStore(wait_sta_gv_[si][e],
+                                       ctx_ptr(a, a.ctx_wait_base + wait_slot_sta_[si][e]));
+                    }
+                    if (wait_slot_dyn_[si][e] != no_wait_slot) {
+                        b_.CreateStore(wait_dyn_gv_[si][e],
+                                       ctx_ptr(a, a.ctx_wait_base + wait_slot_dyn_[si][e]));
+                        b_.CreateStore(wait_dyn_len_gv_[si][e],
+                                       ctx_ptr(a, a.ctx_wait_base + wait_slot_len_[si][e]));
+                    }
+                }
             }
         }
-        for (const auto& [sym, first_id] : group_blk_bases_) {
-            b_.CreateStore(b_.getInt32(first_id), sym);
-        }
-        for (const auto& [tab, slot, target] : wait_table_fills_) {
-            b_.CreateStore(target, b_.CreateInBoundsGEP(tab->getValueType(), tab,
-                                                        { b_.getInt32(0), b_.getInt32(slot) }));
+        for (const auto& [aid, field, first_id] : ctx_blk_fills_) {
+            b_.CreateStore(b_.getInt32(first_id), ctx_ptr(anchors_[aid], field));
         }
         init_state();
         // The root shadow base fills only when some shadow access loaded it
-        // (lazy shadow_base_gv); the per-instance bases fill whenever their
-        // symbol exists — a design whose NBA targets all live in reused
-        // definitions never touches the root base at all.
-        if (shadow_ty_ != nullptr) {
-            llvm::Value* shadow =
-              b_.CreateInBoundsGEP(state_ty_, state, { b_.getInt32(0), b_.getInt32(shadow_field_) });
-            if (shadow_base_gv_ != nullptr) {
-                b_.CreateStore(shadow, shadow_base_gv_);
-            }
-            for (const Anchor& a : anchors_) {
-                if (a.shadow_sym != nullptr) {
-                    b_.CreateStore(b_.CreateInBoundsGEP(shadow_ty_, shadow,
-                                                        { b_.getInt32(0), b_.getInt32(a.shadow_field) }),
-                                   a.shadow_sym);
-                }
-            }
+        // (lazy shadow_base_gv); the per-instance bases live in the ctx fills
+        // above — a design whose NBA targets all live in reused definitions
+        // never touches the root base at all.
+        if (shadow_ty_ != nullptr && shadow_base_gv_ != nullptr) {
+            b_.CreateStore(b_.CreateInBoundsGEP(state_ty_, state,
+                                                { b_.getInt32(0), b_.getInt32(shadow_field_) }),
+                           shadow_base_gv_);
         }
 
         // Register the single DPI scope (svGetScope / user-data, LRM 35.5.3) before
@@ -3448,8 +3456,10 @@ private:
         }
         // Def-local signal table per scope occurrence: slot.path's last
         // element is the signal's field index within its own scope. Shared by
-        // the capacity padding below and the wait-pointer table builder.
-        std::vector<std::vector<Signal>> by_anchor(anchors_.size());
+        // the capacity padding below, the instance-context layout, and block
+        // translation (anchor_signals_).
+        anchor_signals_.assign(anchors_.size(), {});
+        std::vector<std::vector<Signal>>& by_anchor = anchor_signals_;
         {
             for (uint32_t i = 0; i < sigs.size(); ++i) {
                 const SignalSlot& sl = slots_[i];
@@ -3548,23 +3558,20 @@ private:
             }
         }
 
-        // Per-instance wait-pointer tables (module-dedup prep): for a reused
-        // definition, body-side queue access goes through a def-local slot into
-        // the instance's table instead of the per-instance queue globals. Slot
-        // numbering follows the def-local signal walk and the (padded, so
-        // def-uniform) bucket existence — identical across twin instances by
-        // construction. main fills the tables at startup (wait_table_fills_).
+        // Def-local wait-bucket slots (module-dedup prep): for a reused
+        // definition, body-side queue access goes through a def-local slot in
+        // the instance context (ctx_wait_base + slot) instead of a per-instance
+        // queue global. Slot numbering follows the def-local signal walk and
+        // the (padded, so def-uniform) bucket existence — identical across
+        // twin instances by construction. main fills the pointers at startup.
         wait_slot_sta_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
         wait_slot_dyn_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
         wait_slot_len_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
-        auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
         for (uint32_t a = 0; a < anchors_.size(); ++a) {
-            Anchor& an = anchors_[a];
-            if (!an.indirect) {
+            if (!anchors_[a].indirect) {
                 continue;
             }
-            std::vector<std::pair<uint32_t, llvm::Constant*>> fills;
-            uint32_t                                          next = 0;
+            uint32_t next = 0;
             for (const Signal sj : by_anchor[a]) {
                 if (sj == Signal{ ~0u }) {
                     continue;
@@ -3572,28 +3579,83 @@ private:
                 const auto si = static_cast<uint32_t>(sj);
                 for (uint32_t e = 0; e < 3; ++e) {
                     if (wait_sta_gv_[si][e] != nullptr) {
-                        wait_slot_sta_[si][e] = next;
-                        fills.emplace_back(next++, wait_sta_gv_[si][e]);
+                        wait_slot_sta_[si][e] = next++;
                     }
                     if (wait_dyn_gv_[si][e] != nullptr) {
-                        wait_slot_dyn_[si][e] = next;
-                        fills.emplace_back(next++, wait_dyn_gv_[si][e]);
-                        wait_slot_len_[si][e] = next;
-                        fills.emplace_back(next++, wait_dyn_len_gv_[si][e]);
+                        wait_slot_dyn_[si][e] = next++;
+                        wait_slot_len_[si][e] = next++;
                     }
                 }
             }
-            if (next == 0) {
+        }
+    }
+
+    // Compute each instance context's type (see Anchor): shared per definition,
+    // fields sized from the def-local single-scope group count and wait-bucket
+    // slots. Runs after fusion grouping and wait-queue sizing, before lowering.
+    // Also attributes each fusion group to its scope anchor + def-local
+    // ordinal (the shareable-group identity every def-relative site keys on).
+    void build_instance_ctx_layout() {
+        const auto all = mod_.processes();
+        group_anchor_of_.assign(groups_.size(), SignalSlot::no_anchor);
+        group_def_ordinal_.assign(groups_.size(), ~0u);
+        std::vector<uint32_t> scope_counter(anchors_.size(), 0);
+        for (uint32_t g = 0; g < groups_.size(); ++g) {
+            const uint32_t sc   = all[groups_[g].front()].scope;
+            bool           same = sc != Process::no_scope;
+            for (const uint32_t m : groups_[g]) {
+                same = same && all[m].scope == sc;
+            }
+            if (!same || sc >= anchor_of_scope_.size() ||
+                anchor_of_scope_[sc] == SignalSlot::no_anchor) {
                 continue;
             }
-            auto* tab_ty = llvm::ArrayType::get(ptr_ty, next);
-            an.wait_sym  = new llvm::GlobalVariable(llmod_, tab_ty, false,
-                                                    llvm::GlobalValue::InternalLinkage,
-                                                    llvm::ConstantAggregateZero::get(tab_ty),
-                                                    "clotho.inst." + an.name + ".waits");
-            for (const auto& [slot, target] : fills) {
-                wait_table_fills_.emplace_back(an.wait_sym, slot, target);
+            const uint32_t aid = anchor_of_scope_[sc];
+            if (!anchors_[aid].indirect || anchors_[aid].first_proc == ~0u) {
+                continue;
             }
+            group_anchor_of_[g]   = aid;
+            group_def_ordinal_[g] = scope_counter[aid]++;
+        }
+        // Twin instances see the same def-local group count; size blk fields by
+        // the definition-wide maximum so layouts agree even if a member's group
+        // list degenerated (they should be equal by construction).
+        ankerl::unordered_dense::map<llvm::StructType*, uint32_t> def_groups;
+        for (uint32_t a = 0; a < anchors_.size(); ++a) {
+            auto& n = def_groups[anchors_[a].ty];
+            n       = std::max(n, scope_counter[a]);
+        }
+
+        auto* ptr = llvm::PointerType::getUnqual(ctx_);
+        auto* i32 = b_.getInt32Ty();
+        ankerl::unordered_dense::map<llvm::StructType*, llvm::StructType*> def_ctx;
+        for (Anchor& a : anchors_) {
+            if (!a.indirect) {
+                continue;
+            }
+            a.n_groups     = def_groups[a.ty];
+            a.ctx_blk_base = 4;
+            uint32_t nwait = 0;
+            for (const Signal sj : anchor_signals_[&a - anchors_.data()]) {
+                if (sj == Signal{ ~0u }) {
+                    continue;
+                }
+                const auto si = static_cast<uint32_t>(sj);
+                for (uint32_t e = 0; e < 3; ++e) {
+                    nwait += wait_slot_sta_[si][e] != no_wait_slot ? 1 : 0;
+                    nwait += wait_slot_dyn_[si][e] != no_wait_slot ? 2 : 0;
+                }
+            }
+            a.ctx_wait_base = a.ctx_blk_base + a.n_groups;
+            const auto [it, fresh] = def_ctx.try_emplace(a.ty, nullptr);
+            if (fresh) {
+                std::vector<llvm::Type*> f{ ptr, ptr, ptr, i32 };
+                f.insert(f.end(), a.n_groups, i32);
+                f.insert(f.end(), nwait, ptr);
+                it->second = llvm::StructType::create(
+                  ctx_, f, a.ty->getName().str() + ".ctx");
+            }
+            a.ctx_ty = it->second;
         }
     }
 
@@ -5061,17 +5123,14 @@ private:
             cur_block_epoch_ = static_cast<int64_t>(cur_seg_epoch_);
             llvm::Value* id  = b_.getInt32(cur_block_id_);
             if (sched_anchor_ != SignalSlot::no_anchor) {
+                Anchor&        a     = anchors_[sched_anchor_];
+                const uint32_t field = a.ctx_blk_base + group_def_ordinal_[sched_group_];
                 if (group_first_block_ < 0) {
                     group_first_block_ = static_cast<int64_t>(cur_block_id_);
-                    blk_base_sym_      = new llvm::GlobalVariable(
-                      llmod_, b_.getInt32Ty(), false, llvm::GlobalValue::InternalLinkage,
-                      b_.getInt32(0),
-                      "clotho.inst." + anchors_[sched_anchor_].name + ".blk.g" +
-                        std::to_string(sched_ordinal_));
-                    group_blk_bases_.emplace_back(blk_base_sym_, cur_block_id_);
+                    ctx_blk_fills_.emplace_back(sched_anchor_, field, cur_block_id_);
                 }
                 id = b_.CreateAdd(
-                  b_.CreateLoad(b_.getInt32Ty(), blk_base_sym_),
+                  ctx_field(a, field, b_.getInt32Ty()),
                   b_.getInt32(cur_block_id_ - static_cast<uint32_t>(group_first_block_)));
             }
             b_.CreateCall(nba_block_enqueue_fn_, { id });
@@ -5566,10 +5625,8 @@ private:
         if (slot == no_wait_slot || !def_relative_for(slots_[sig])) {
             return gv;
         }
-        const Anchor& a = anchors_[slots_[sig].anchor];
-        return b_.CreateLoad(llvm::PointerType::getUnqual(ctx_),
-                             b_.CreateInBoundsGEP(a.wait_sym->getValueType(), a.wait_sym,
-                                                  { b_.getInt32(0), b_.getInt32(slot) }));
+        Anchor& a = anchors_[slots_[sig].anchor];
+        return ctx_field(a, a.ctx_wait_base + slot, llvm::PointerType::getUnqual(ctx_));
     }
 
     void service_static_queue(Signal sig, uint32_t edge) {
@@ -10827,13 +10884,6 @@ private:
                 vcd_index_scope(top, next);
             }
         }
-        for (Anchor& a : anchors_) {
-            if (a.indirect && a.first_vcd >= 0) {
-                a.vcd_sym = new llvm::GlobalVariable(
-                  llmod_, b_.getInt32Ty(), false, llvm::GlobalValue::InternalLinkage, b_.getInt32(0),
-                  "clotho.inst." + a.name + ".vcd");
-            }
-        }
     }
 
     void vcd_index_scope(const InstanceScope& sc, uint32_t& next) {
@@ -10881,9 +10931,9 @@ private:
     llvm::Value* vcd_index_value(Signal sig, int32_t base) {
         const SignalSlot& s = slot_of(sig);
         if (s.anchor != SignalSlot::no_anchor && def_relative_for(s)) {
-            const Anchor& a = anchors_[s.anchor];
-            if (a.vcd_sym != nullptr) {
-                llvm::Value* b0 = b_.CreateLoad(b_.getInt32Ty(), a.vcd_sym);
+            Anchor& a = anchors_[s.anchor];
+            if (a.indirect && a.first_vcd >= 0) {
+                llvm::Value* b0 = ctx_field(a, 3, b_.getInt32Ty());
                 return b_.CreateAdd(b0, b_.getInt32(static_cast<uint32_t>(base - a.first_vcd)));
             }
         }
@@ -13891,6 +13941,14 @@ private:
     // Twin sets (process indices) recorded by report_dedup_stat under
     // CLOTHO_DEDUP_STAT=2, compared post-lowering by report_dedup_shapes.
     std::vector<std::vector<uint32_t>> shape_sets_;
+    // Per fusion group: owning scope anchor (single-scope reused-def groups
+    // only, else no_anchor) and def-local group ordinal. Built by
+    // build_instance_ctx_layout; the shareable-group identity.
+    std::vector<uint32_t> group_anchor_of_;
+    std::vector<uint32_t> group_def_ordinal_;
+    // Def-local signal table per anchor (slot.path's last element), kept from
+    // build_wait_queues for the ctx layout and block-signal translation.
+    std::vector<std::vector<Signal>> anchor_signals_;
 
     // VCD dirty set (meaningful iff design_uses_vcd_). vcd_index_[sig] is the
     // runtime dump-var index of a dumped scalar signal, or -1 when the signal is
@@ -13961,16 +14019,16 @@ private:
     llvm::Value*        sched_ptr_       = nullptr;
     // Deferred def-relative sched addressing chosen by lower_group (see
     // materialize_sched_ptr); no_anchor when the absolute constant is used.
+    // sched_group_ is the fusion-group index currently lowering (feeds the
+    // def-local blk-field ordinal in block_register).
     uint32_t sched_anchor_  = SignalSlot::no_anchor;
     uint32_t sched_ordinal_ = 0;
-    // Def-relative NBA block-id base of the current group (see lower_group /
-    // block_register): the i32 global holding the group's first block id
-    // (created at the group's first registration) and the first id itself
-    // (-1 until a block opens).
-    llvm::GlobalVariable* blk_base_sym_      = nullptr;
-    int64_t               group_first_block_ = -1;
-    // (base symbol, first block id) pairs main stores at startup.
-    std::vector<std::pair<llvm::GlobalVariable*, uint32_t>> group_blk_bases_;
+    uint32_t sched_group_   = 0;
+    // First NBA block id of the group currently lowering (-1 until a block
+    // opens); block_register keys its ctx-relative ids off it.
+    int64_t group_first_block_ = -1;
+    // (anchor, ctx field, first block id) triples main stores at startup.
+    std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> ctx_blk_fills_;
     // The shared timer callback (pushes a woken handle onto the active queue) and
     // the active/inactive queue globals, all built once per module. The inactive
     // queue holds processes parked on a zero delay (#0): drained into active at
@@ -14039,15 +14097,15 @@ private:
     // is padded past them to the definition maximum (see build_wait_queues).
     std::vector<std::array<uint32_t, 3>> wait_sta_true_;
     std::vector<std::array<uint8_t, 3>>  wait_sta_padded_;
-    // Def-local wait-table slots per (signal, edge): index into the owning
-    // instance's Anchor::wait_sym table, or ~0 when the signal's owner is not a
-    // reused definition (body-side code then uses the absolute queue global).
+    // Def-local wait-table slots per (signal, edge): ctx field ordinal (past
+    // ctx_wait_base) in the owning instance's context, or ~0 when the signal's
+    // owner is not a reused definition (body-side code then uses the absolute
+    // queue global).
     static constexpr uint32_t no_wait_slot = ~0u;
     std::vector<std::array<uint32_t, 3>> wait_slot_sta_;
     std::vector<std::array<uint32_t, 3>> wait_slot_dyn_;
     std::vector<std::array<uint32_t, 3>> wait_slot_len_;
-    // (table, slot, queue global) stores main emits at startup.
-    std::vector<std::tuple<llvm::GlobalVariable*, uint32_t, llvm::Constant*>> wait_table_fills_;
+
     std::vector<std::array<llvm::GlobalVariable*, 3>>  wait_dyn_gv_;
     std::vector<std::array<llvm::ArrayType*, 3>>       wait_dyn_ty_;
     std::vector<std::array<llvm::GlobalVariable*, 3>>  wait_dyn_len_gv_;
