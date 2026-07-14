@@ -146,10 +146,11 @@ TEST_CASE("unrestricted interface port") {
     CHECK(out == "data=7 valid=1\n");
 }
 
-// A continuous driver on an interface net from two modules is a genuine
-// multiple-driver conflict on shared storage; Clotho has no net resolution, so
-// it must fail loudly rather than silently pick one (the canonicalized driver
-// tracking sees both as drivers of the same underlying net).
+// Two modules driving one interface net is a genuine multiple-driver conflict
+// on shared storage (the canonicalized driver tracking sees both as drivers of
+// the same underlying net). Whole-net resolution exists (LRM 6.6.1), but the
+// drivers here live in different instance scopes (drv1 / drv2), which V1
+// resolution does not yet support, so it must still fail loudly.
 TEST_CASE("multiple continuous drivers on an interface net fail loudly") {
     const std::string diag = reject(R"(
         interface nbus; wire [7:0] d; endinterface

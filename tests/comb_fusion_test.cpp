@@ -174,7 +174,8 @@ endmodule
     check_all_lowerings(src, "1\n1\n");
 }
 
-// NOTE: multiple continuous drivers on one net (resolution to x) would be the
-// remaining fusion hazard, but clotho rejects multi-driver nets loudly at
-// lowering ("multiple drivers on net ... are not supported"), so a fused
-// group can never contain one. Add a pin here when net resolution lands.
+// NOTE: multiple continuous drivers on one net (resolution to x, LRM 6.6.1)
+// are not a fusion hazard: each driver stages into its own distinct slot
+// signal and a single WireRes resolver drives the net, so every process still
+// has exactly one write target. No fused group can contain two drivers of the
+// same storage — the shared-target hazard is structurally impossible.

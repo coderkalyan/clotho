@@ -1175,11 +1175,14 @@ TEST_CASE("a timing-control-free always warns but still lowers") {
 
 // -- Multiple continuous drivers on one net (LRM 6.6.1) --
 //
-// Clotho has no net resolution: overlapping continuous/structural drivers
-// must fail loudly instead of silently last-writer-winning (Table 6-2 says
-// conflicting wire drivers resolve to x).
+// Multi-driver net resolution (LRM 6.6.1, wire/tri, no strengths): whole-net
+// overlapping drivers resolve through per-driver slots + a WireRes resolver;
+// partial-select, concatenation-operand, and net-array-element drivers of a
+// resolved net are not yet supported and fail loudly (never silently
+// last-writer-win). Runtime resolution values are checked in
+// net_resolution_test.cpp against iverilog.
 
-TEST_CASE("two continuous assigns driving one net fail loudly") {
+TEST_CASE("two whole-net continuous assigns resolve") {
     const LowerResult r = lower_text(R"(
         module m;
             wire w;
@@ -1187,22 +1190,20 @@ TEST_CASE("two continuous assigns driving one net fail loudly") {
             assign w = 1'b1;
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("multiple drivers on net 'w'") != std::string::npos);
+    CHECK_MESSAGE(r.ok, r.diagnostics);
 }
 
-TEST_CASE("a net declaration assignment plus a continuous assign fails loudly") {
+TEST_CASE("a net declaration assignment plus a whole-net continuous assign resolve") {
     const LowerResult r = lower_text(R"(
         module m(input a);
             wire w = 1'b0;
             assign w = a;
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("multiple drivers on net 'w'") != std::string::npos);
+    CHECK_MESSAGE(r.ok, r.diagnostics);
 }
 
-TEST_CASE("an output port connection plus a continuous assign fails loudly") {
+TEST_CASE("an output port connection plus a whole-net continuous assign resolve") {
     const LowerResult r = lower_text(R"(
         module sub(output y);
             assign y = 1'b0;
@@ -1213,8 +1214,7 @@ TEST_CASE("an output port connection plus a continuous assign fails loudly") {
             assign w = 1'b1;
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("multiple drivers on net 'w'") != std::string::npos);
+    CHECK_MESSAGE(r.ok, r.diagnostics);
 }
 
 TEST_CASE("overlapping constant part-select drivers fail loudly") {
@@ -1226,7 +1226,7 @@ TEST_CASE("overlapping constant part-select drivers fail loudly") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("multiple drivers on net 'w'") != std::string::npos);
+    CHECK(r.diagnostics.find("partial-select driver of a multiply-driven net") != std::string::npos);
 }
 
 TEST_CASE("a concatenation lvalue operand overlapping another driver fails loudly") {
@@ -1238,7 +1238,7 @@ TEST_CASE("a concatenation lvalue operand overlapping another driver fails loudl
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("multiple drivers on net 'y'") != std::string::npos);
+    CHECK(r.diagnostics.find("concatenation driver of a multiply-driven net") != std::string::npos);
 }
 
 TEST_CASE("non-overlapping constant bit drivers of one net are accepted") {
@@ -1319,6 +1319,8 @@ TEST_CASE("disjoint bits of one net-array element are accepted") {
 }
 
 TEST_CASE("two drivers of the same net-array element fail loudly") {
+    // A whole-element driver of an array net is still a partial (select) driver
+    // of the net, so V1 resolution rejects it rather than silently winning.
     const LowerResult r = lower_text(R"(
         module m(input [7:0] a, input [7:0] b);
             wire [7:0] mem [0:3];
@@ -1327,7 +1329,7 @@ TEST_CASE("two drivers of the same net-array element fail loudly") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("multiple drivers on net 'mem'") != std::string::npos);
+    CHECK(r.diagnostics.find("partial-select driver of a multiply-driven net") != std::string::npos);
 }
 
 TEST_CASE("overlapping bit drivers of one net-array element fail loudly") {
@@ -1339,7 +1341,7 @@ TEST_CASE("overlapping bit drivers of one net-array element fail loudly") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("multiple drivers on net 'mem'") != std::string::npos);
+    CHECK(r.diagnostics.find("partial-select driver of a multiply-driven net") != std::string::npos);
 }
 
 TEST_CASE("a net with one continuous driver read procedurally is accepted") {

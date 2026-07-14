@@ -485,7 +485,15 @@ public:
     // and building the scope tree; Emit walks it again lowering processes. The
     // two passes traverse identically, so per-scope signal order (and thus the
     // backend's state layout) is unchanged from a single interleaved pass.
-    enum class Pass : uint8_t { Collect, Emit };
+    // Collect registers signals and builds the scope tree. Classify walks every
+    // continuous driver (assign / net init / gate output / port copy) to detect
+    // which nets gain multiple overlapping drivers (resolved_nets_), so Emit can
+    // route those drivers to per-driver slots before it stores. Emit lowers the
+    // behavioral members. All three traverse identically; only Collect creates
+    // signals, so per-scope signal order (and the backend state layout) is
+    // unchanged. A single-driver design does no work in Classify beyond the
+    // driver-region bookkeeping it already did in Emit before.
+    enum class Pass : uint8_t { Collect, Classify, Emit };
 
     // Flatten one elaborated instance into the module under `prefix` (empty for
     // the top, "<inst>." per level below). In Collect: open this instance's
@@ -553,7 +561,11 @@ public:
     void lower_top(const InstanceSymbol& top, std::string_view prefix) {
         top_elided_ = prefix.empty();
         lower_instance(top, prefix, Pass::Collect, nullptr);
+        // Classify reuses the scope tree Collect built (Emit has not yet moved
+        // it out); it only reads node pointers to walk children in order.
+        lower_instance(top, prefix, Pass::Classify, &top_scope_);
         lower_instance(top, prefix, Pass::Emit, &top_scope_);
+        emit_wire_resolvers();
         finalize_preinit();
         module_.add_top(std::move(top_scope_));
     }
@@ -615,10 +627,16 @@ private:
         // lower in Emit. `child_cursor` walks this scope's node.children in the
         // order Collect pushed them, so Emit hands each recursion its own node.
         const bool emit = pass == Pass::Emit;
+        // Continuous drivers (assign / net init / gate / port copy) run in both
+        // Classify (record driver regions, detect multi-driver nets) and Emit
+        // (store, routing resolved nets to slots); behavioral-only members
+        // (procedural blocks, variable initializers) run in Emit alone.
+        const bool driver_pass = pass != Pass::Collect;
+        cur_pass_               = pass;
         for (const Symbol& m : scope.members()) {
             switch (m.kind) {
                 case SymbolKind::ContinuousAssign:
-                    if (emit) lower_continuous_assign(m.as<ContinuousAssignSymbol>());
+                    if (driver_pass) lower_continuous_assign(m.as<ContinuousAssignSymbol>());
                     break;
                 case SymbolKind::ProceduralBlock:
                     if (emit) lower_procedural_block(m.as<ProceduralBlockSymbol>());
@@ -632,7 +650,7 @@ private:
                 case SymbolKind::Net:
                     // Storage was registered by collect_signals; a net declaration
                     // assignment (`wire w = expr`) is a continuous assignment.
-                    if (emit) lower_net_initializer(m.as<NetSymbol>());
+                    if (driver_pass) lower_net_initializer(m.as<NetSymbol>());
                     break;
                 case SymbolKind::Instance: {
                     const InstanceSymbol& child = m.as<InstanceSymbol>();
@@ -640,13 +658,14 @@ private:
                     // parent-side expression resolves against signals in this
                     // (parent) body. Recursion leaves prefix_ at the child level,
                     // so restore it before wiring.
-                    ir::InstanceScope* child_node = emit ? &node.children[child_cursor++] : nullptr;
+                    ir::InstanceScope* child_node =
+                      driver_pass ? &node.children[child_cursor++] : nullptr;
                     lower_instance(child, self_prefix + std::string(child.name) + ".", pass,
                                    child_node);
                     prefix_   = self_prefix;
                     scope_    = &scope;
                     time_mul_ = self_mul;
-                    if (emit) wire_ports(child);
+                    if (driver_pass) wire_ports(child);
                     break;
                 }
                 case SymbolKind::GenerateBlock: {
@@ -678,7 +697,7 @@ private:
                     break;
                 }
                 case SymbolKind::PrimitiveInstance:
-                    if (emit) lower_gate(m.as<PrimitiveInstanceSymbol>());
+                    if (driver_pass) lower_gate(m.as<PrimitiveInstanceSymbol>());
                     break;
                 case SymbolKind::InstanceArray: {
                     // An array of instances — gate primitives (LRM 28.3.6) or
@@ -764,7 +783,7 @@ private:
     void lower_instance_array(const InstanceArraySymbol& arr, const std::string& self_prefix,
                               const Scope& parent_scope, uint64_t self_mul, Pass pass,
                               ir::InstanceScope& node, size_t& child_cursor) {
-        const bool emit = pass == Pass::Emit;
+        const bool driver_pass = pass != Pass::Collect;
         for (const Symbol* elem : arr.elements) {
             switch (elem->kind) {
                 case SymbolKind::InstanceArray:
@@ -772,17 +791,18 @@ private:
                                         self_mul, pass, node, child_cursor);
                     break;
                 case SymbolKind::PrimitiveInstance:
-                    if (emit) lower_gate(elem->as<PrimitiveInstanceSymbol>());
+                    if (driver_pass) lower_gate(elem->as<PrimitiveInstanceSymbol>());
                     break;
                 case SymbolKind::Instance: {
                     const InstanceSymbol& child = elem->as<InstanceSymbol>();
-                    ir::InstanceScope* child_node = emit ? &node.children[child_cursor++] : nullptr;
+                    ir::InstanceScope*    child_node =
+                      driver_pass ? &node.children[child_cursor++] : nullptr;
                     lower_instance(child, self_prefix + instance_array_element_name(child) + ".",
                                    pass, child_node);
                     prefix_   = self_prefix;
                     scope_    = &parent_scope;
                     time_mul_ = self_mul;
-                    if (emit) wire_ports(child);
+                    if (driver_pass) wire_ports(child);
                     break;
                 }
                 default:
@@ -2063,6 +2083,7 @@ private:
     struct NetRegion {
         uint64_t elem_lo, elem_hi;  // linearized unpacked-element ordinals
         uint32_t bit_lo, bit_hi;    // packed bit range within one element
+        bool     operator==(const NetRegion&) const = default;
     };
 
     static constexpr NetRegion kWholeNet{ 0, UINT64_MAX, 0, UINT32_MAX };
@@ -2080,12 +2101,16 @@ private:
         if (sym.kind != SymbolKind::Net) {
             return;
         }
-        auto& regions = net_driven_[static_cast<uint32_t>(signal_of(sym))];
+        const auto net = static_cast<uint32_t>(signal_of(sym));
+        auto&      regions = net_driven_[net];
         for (const NetRegion& p : regions) {
             if (reg.elem_lo <= p.elem_hi && p.elem_lo <= reg.elem_hi &&
                 reg.bit_lo <= p.bit_hi && p.bit_lo <= reg.bit_hi) {
-                fail("multiple drivers on net '" + std::string(sym.name) +
-                     "' are not supported (no resolution)");
+                // A second driver overlaps an existing one: the net needs
+                // resolution (LRM 6.6.1). Emit routes every driver of a resolved
+                // net to its own slot and folds them through a WireRes resolver.
+                resolved_nets_.insert(net);
+                break;
             }
         }
         regions.push_back(reg);
@@ -2339,6 +2364,144 @@ private:
         }
     }
 
+    // -- Multi-driver net resolution (LRM 6.6.1, wire/tri, no strengths) --
+    //
+    // A net that Classify found to have >= 2 overlapping drivers is "resolved":
+    // Emit routes each of its drivers to a private full-width slot signal
+    // (alloc_driver_slot) instead of storing the net directly, and
+    // emit_wire_resolvers folds all the slots through WireRes into the net at the
+    // end of lowering. A single-driver net is never in resolved_nets_ and keeps
+    // the plain-store fast path untouched. V1 supports whole-net drivers only.
+
+    // Whether an lvalue is a whole-net reference (the entire net, no element /
+    // range / member select). A whole-net driver writes every bit of its slot,
+    // so V1 resolution needs no per-bit undriven handling. A select of any kind
+    // is a partial driver (deferred).
+    static bool is_whole_net_lvalue(const Expression& e) {
+        switch (e.kind) {
+            case ExpressionKind::NamedValue:
+            case ExpressionKind::HierarchicalValue:
+                return true;
+            case ExpressionKind::Conversion:
+                return is_whole_net_lvalue(e.as<ConversionExpression>().operand());
+            default:
+                return false;
+        }
+    }
+
+    // The resolved net an lvalue roots at, or nullopt when the net has a single
+    // driver (the common case) or the lvalue does not root at a net.
+    std::optional<ir::Signal> resolved_net_of(const Expression& lhs) {
+        const ValueSymbol* root = lvalue_root(lhs);
+        if (root == nullptr) {
+            return std::nullopt;
+        }
+        const ValueSymbol& sym = canonical_value_symbol(*root);
+        if (sym.kind != SymbolKind::Net) {
+            return std::nullopt;
+        }
+        const auto net = signal_of(sym);
+        if (!resolved_nets_.contains(static_cast<uint32_t>(net))) {
+            return std::nullopt;
+        }
+        return net;
+    }
+
+    // Allocate a fresh full-width driver slot for one driver of resolved `net`
+    // and register it (in the net's own scope) for the resolver to fold. Slots
+    // power up like any signal; a tri-state driver writes its own Z, and a
+    // driver that always writes the whole net leaves no undriven bits.
+    ir::Signal alloc_driver_slot(ir::Signal net, const slang::ast::Type& net_type, ir::SourceLoc l) {
+        const auto net_u = static_cast<uint32_t>(net);
+        const auto it    = resolved_scope_.find(net_u);
+        if (it != resolved_scope_.end() && it->second != cur_scope_id()) {
+            // The drivers of this net live in different instance scopes (e.g. a
+            // shared interface net driven from two modules): the slots would span
+            // scopes and the resolver could not address them uniformly.
+            // TODO: cross-scope multiple drivers (LRM 6.6.1) — the slots and
+            // resolver would need a shared home scope.
+            fail("multiple drivers of a net across different scopes are not supported");
+        }
+        auto& slots = resolved_slots_[net_u];
+        ir::SignalInfo info;
+        info.name = std::string(module_.signal(net).name) + "$drv" + std::to_string(slots.size());
+        info.type = lower_type(net_type);
+        info.dir  = ir::SignalInfo::Direction::Internal;
+        const ir::Signal slot = register_signal(std::move(info));
+        slots.push_back(slot);
+        resolved_scope_[static_cast<uint32_t>(net)] = cur_scope_id();
+        resolved_loc_[static_cast<uint32_t>(net)]   = l;
+        return slot;
+    }
+
+    // Reject a concatenation (or conversion-wrapped) lvalue any of whose operands
+    // drives a resolved net. Such an operand cannot route to a per-driver slot in
+    // V1 (a concat driver spans several nets at once), so storing it directly
+    // would race the resolver — fail loudly instead.
+    void reject_concat_resolved_driver(const Expression& lhs) {
+        switch (lhs.kind) {
+            case ExpressionKind::Concatenation:
+                for (const Expression* op : lhs.as<ConcatenationExpression>().operands()) {
+                    reject_concat_resolved_driver(*op);
+                }
+                return;
+            case ExpressionKind::Conversion:
+                reject_concat_resolved_driver(lhs.as<ConversionExpression>().operand());
+                return;
+            default:
+                if (resolved_net_of(lhs)) {
+                    // TODO: split a concatenation driver into per-net slot stores.
+                    fail("concatenation driver of a multiply-driven net is not supported");
+                }
+        }
+    }
+
+    // Emit one whole-net continuous-assign driver of a resolved net: stage the
+    // RHS into this driver's slot, sensitive to the RHS reads.
+    void emit_resolved_driver(ir::Signal net, const AssignmentExpression& a, const Expression& left,
+                              ir::Builder& b, ir::SourceLoc l) {
+        if (!is_whole_net_lvalue(left)) {
+            // TODO: partial-select drivers of a multiply-driven net (each slot
+            // would carry only its region, resolved per bit).
+            fail("partial-select driver of a multiply-driven net is not supported");
+        }
+        const ir::Ref    ty   = lower_type(*left.type);
+        const ir::Signal slot = alloc_driver_slot(net, *left.type, l);
+        b.binary(ir::Inst::Tag::Store, b.signal(slot, l),
+                 b.resize(lower_expr(a.right(), b), ty, l), l);
+        add_continuous_process(continuous_events(a), l, b);
+    }
+
+    // Fold every resolved net's driver slots through WireRes and store the
+    // resolved value into the net. One self-starting process per net, sensitive
+    // to all its slots; the net is written only here, so its readers wake on the
+    // resolved value. Runs once per top after Emit, when every driver has
+    // registered its slot.
+    void emit_wire_resolvers() {
+        for (const auto& [net_u, slots] : resolved_slots_) {
+            const ir::Signal    net = static_cast<ir::Signal>(net_u);
+            const ir::SourceLoc l   = resolved_loc_[net_u];
+            ir::Builder         b(module_.pool);
+            ir::Index           acc = b.unary(ir::Inst::Tag::Load, b.signal(slots[0], l), l);
+            for (size_t k = 1; k < slots.size(); ++k) {
+                const ir::Index next = b.unary(ir::Inst::Tag::Load, b.signal(slots[k], l), l);
+                acc                  = b.binary(ir::Inst::Tag::WireRes, acc, next, l);
+            }
+            b.binary(ir::Inst::Tag::Store, b.signal(net, l), acc, l);
+            std::vector<ir::WaitEvent> wait_events;
+            wait_events.reserve(slots.size());
+            for (const ir::Signal s : slots) {
+                wait_events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
+            }
+            module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
+                                             .wait_events = std::move(wait_events),
+                                             .self_start  = true,
+                                             .loc         = l,
+                                             .ir          = b.finish(),
+                                             .scope       = resolved_scope_[net_u] });
+        }
+    }
+
     // Reject an explicit non-default drive strength on a continuous assignment
     // or net declaration. Strengths only affect multi-driver resolution, which
     // Clotho lacks; an explicit (strong0, strong1) equals the default (LRM
@@ -2368,10 +2531,25 @@ private:
         if (e.kind != ExpressionKind::Assignment) {
             fail("malformed continuous assignment");
         }
-        record_net_driver(e.as<AssignmentExpression>().left());
+        const AssignmentExpression& a    = e.as<AssignmentExpression>();
+        const Expression&           left = a.left();
+        if (cur_pass_ == Pass::Classify) {
+            record_net_driver(left);
+            return;
+        }
 
         ir::Builder b(module_.pool);
-        lower_assign(e.as<AssignmentExpression>(), b);
+        if (const std::optional<ir::Signal> net = resolved_net_of(left)) {
+            // Multiply-driven net: this driver stages its value into its own
+            // slot; the resolver folds every driver's slot (emit_wire_resolvers).
+            emit_resolved_driver(*net, a, left, b, to_source_loc(sym.location));
+            return;
+        }
+        // A concatenation lvalue has no single root, so resolved_net_of misses
+        // it; reject it loudly if an operand drives a resolved net rather than
+        // silently storing past the resolver.
+        reject_concat_resolved_driver(left);
+        lower_assign(a, b);
 
         // A continuous assign is a process sensitive to the source elements of
         // its expression (LRM 4.9.1): every signal the RHS reads, plus any read
@@ -2428,12 +2606,20 @@ private:
         if (init == nullptr) {
             return;
         }
+        if (cur_pass_ == Pass::Classify) {
+            record_net_driver_whole(ns);
+            return;
+        }
+        const bool resolved = resolved_nets_.contains(static_cast<uint32_t>(signal_of(ns)));
         if (is_aggregate(ns.getType())) {
-            // TODO: continuous assignment to a whole unpacked struct net — the
+            if (resolved) {
+                // TODO: multi-driver resolution of an unpacked-aggregate net —
+                // WireRes folds packed planes only.
+                fail("multiple drivers on an aggregate net are not supported");
+            }
             // A whole unpacked-struct / aggregate net initializer is a whole-object
             // continuous copy (one process on the source's sensitivity), the same
             // as a bare `assign n = ...` on a struct.
-            record_net_driver_whole(ns);
             ir::Builder         ab(module_.pool);
             const ir::SourceLoc al = loc(*init);
             emit_agg_store(value_lvalue(ns, ab, al), lower_type(ns.getType()), *init,
@@ -2441,9 +2627,17 @@ private:
             add_continuous_process(continuous_events(*init), to_source_loc(ns.location), ab);
             return;
         }
-        record_net_driver_whole(ns);
         ir::Builder         b(module_.pool);
         const ir::SourceLoc l = loc(*init);
+        if (resolved) {
+            // A net-declaration assignment is a whole-net driver: stage the
+            // initializer into this driver's slot (emit_wire_resolvers folds it).
+            const ir::Signal slot = alloc_driver_slot(signal_of(ns), ns.getType(), l);
+            b.binary(ir::Inst::Tag::Store, b.signal(slot, l),
+                     b.resize(lower_expr(*init, b), lower_type(ns.getType()), l), l);
+            add_continuous_process(continuous_events(*init), to_source_loc(ns.location), b);
+            return;
+        }
         b.binary(ir::Inst::Tag::Store, value_lvalue(ns, b, l), lower_expr(*init, b), l);
         add_continuous_process(continuous_events(*init), to_source_loc(ns.location), b);
     }
@@ -2725,6 +2919,26 @@ private:
         const auto input_span  = n_output ? conns.subspan(conns.size() - 1) : conns.subspan(1);
         const auto output_span = n_output ? conns.subspan(0, conns.size() - 1) : conns.subspan(0, 1);
 
+        if (cur_pass_ == Pass::Classify) {
+            // Record each output terminal as a continuous driver so a gate that
+            // shares a net with another driver is detected (and rejected in Emit
+            // until gate outputs join resolution).
+            for (const Expression* out : output_span) {
+                if (out->kind == ExpressionKind::Assignment) {
+                    record_net_driver(out->as<AssignmentExpression>().left());
+                }
+            }
+            return;
+        }
+        for (const Expression* out : output_span) {
+            if (out->kind == ExpressionKind::Assignment &&
+                resolved_net_of(out->as<AssignmentExpression>().left())) {
+                // TODO: fold gate outputs into WireRes resolution (they already
+                // produce a 1-bit logic value, like a continuous assign).
+                fail("gate primitive driving a multiply-driven net is not supported");
+            }
+        }
+
         std::vector<GateInput> inputs;
         inputs.reserve(input_span.size());
         for (size_t i = 0; i < input_span.size(); ++i) {
@@ -2849,6 +3063,17 @@ private:
                 continue;
             }
 
+            if (cur_pass_ == Pass::Classify) {
+                // The connection is a continuous driver: an output drives the
+                // parent-side lvalue, an input drives the whole child net.
+                if (expr->kind == ExpressionKind::Assignment) {
+                    record_net_driver(expr->as<AssignmentExpression>().left());
+                } else {
+                    record_net_driver_whole(p.internalSymbol->as<ValueSymbol>());
+                }
+                continue;
+            }
+
             const ir::Signal           child_sig = signal_of(p.internalSymbol->as<ValueSymbol>());
             const ir::SourceLoc        l         = to_source_loc(p.location);
             ir::Builder                b(module_.pool);
@@ -2859,8 +3084,23 @@ private:
                 // placeholder for the port value, so read the child net directly and
                 // resize it to the target width. Wakes on the child net.
                 const AssignmentExpression& a = expr->as<AssignmentExpression>();
-                // The connection is a continuous driver of the parent-side net.
-                record_net_driver(a.left());
+                if (const std::optional<ir::Signal> net = resolved_net_of(a.left())) {
+                    // The parent net has multiple drivers: stage this child's
+                    // output into its own slot (the resolver folds them). A
+                    // partial or aggregate connection is not a whole-net driver.
+                    if (is_aggregate(*a.left().type) || !is_whole_net_lvalue(a.left())) {
+                        // TODO: partial / aggregate driver of a multiply-driven net.
+                        fail("partial or aggregate driver of a multiply-driven net is not supported");
+                    }
+                    const ir::Ref    ty   = lower_type(*a.left().type);
+                    const ir::Signal slot = alloc_driver_slot(*net, *a.left().type, l);
+                    const ir::Index  val  = b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l);
+                    b.binary(ir::Inst::Tag::Store, b.signal(slot, l),
+                             coerce(val, *a.right().type, ty, b, l), l);
+                    sens.push_back(ir::WaitEvent{ .signal = child_sig, .edge = ir::Edge::Any });
+                    add_continuous_process(std::move(sens), l, b);
+                    continue;
+                }
                 if (is_aggregate(*a.left().type)) {
                     // A whole unpacked-struct / aggregate port: the copy is a
                     // per-leaf (or memcpy) whole-object copy, not a scalar store.
@@ -2879,7 +3119,14 @@ private:
                 // Input: drive the child net from the source rvalue, resized to the
                 // port width; wakes on the source's reads. The copy is a continuous
                 // driver of the whole child-side net.
-                record_net_driver_whole(p.internalSymbol->as<ValueSymbol>());
+                if (resolved_nets_.contains(static_cast<uint32_t>(child_sig))) {
+                    // The child net is driven both by this input copy (parent
+                    // scope) and internally (child scope). Cross-scope resolution
+                    // is not yet supported: the driver slots would span two scopes.
+                    // TODO: cross-scope multi-driver resolution (input port + an
+                    // internal driver of the same net).
+                    fail("a net driven by both an input port and an internal driver is not supported");
+                }
                 const ir::Ref ty = lower_type(p.internalSymbol->as<ValueSymbol>().getType());
                 if (is_aggregate(p.internalSymbol->as<ValueSymbol>().getType())) {
                     // A whole unpacked-struct / aggregate input port: whole-object
@@ -9126,6 +9373,18 @@ private:
     // driven, checked for overlap by record_net_driver_region (NetRegion defined
     // in the net-driver-tracking section).
     ankerl::unordered_dense::map<uint32_t, std::vector<NetRegion>> net_driven_;
+    // Which lowering pass is running; the driver-producing members lower in both
+    // Classify (record driver regions) and Emit (store / route), and branch on
+    // this. Meaningful only inside lower_members and the driver functions.
+    Pass cur_pass_ = Pass::Emit;
+    // Net signals Classify found to have >= 2 overlapping continuous drivers, so
+    // Emit routes every driver to a slot and emit_wire_resolvers folds them.
+    ankerl::unordered_dense::set<uint32_t> resolved_nets_;
+    // Per resolved net: its per-driver slot signals (fold order), the scope id
+    // the resolver process is attributed to, and a representative source loc.
+    ankerl::unordered_dense::map<uint32_t, std::vector<ir::Signal>> resolved_slots_;
+    ankerl::unordered_dense::map<uint32_t, uint32_t>                resolved_scope_;
+    ankerl::unordered_dense::map<uint32_t, ir::SourceLoc>           resolved_loc_;
     // Hierarchical name prefix of the instance currently being lowered (e.g.
     // "u_alu.u_sub."); empty for the top. Prepended to every signal name created
     // while this instance's body is processed so flattened signals stay unique.
