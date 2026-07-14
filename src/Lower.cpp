@@ -1273,10 +1273,16 @@ private:
                 // Re-fetch each row: lowering an element expression can intern a
                 // new struct's field table, which invalidates a held
                 // struct_fields span (see InternPool::struct_fields).
-                const auto nfields = module_.pool.struct_fields(t.fields_id).size();
+                const auto     nfields = module_.pool.struct_fields(t.fields_id).size();
+                const uint32_t nelems  = static_cast<uint32_t>(elems.size());
+                // A replicated pattern (`'{N{...}}`) stores only its per-repeat
+                // item list in `elements()` (nelems < nfields) -- cycle through it
+                // field-by-field, same as the array case's `elems[k % n]`. A
+                // positional/structured pattern already has nelems == nfields, so
+                // the modulo is a no-op there.
                 for (uint32_t i = 0; i < nfields; ++i) {
                     const ir::Field f = module_.pool.struct_fields(t.fields_id)[i];
-                    emit_agg_store(b.member_select(lhs, i, type, l), f.type, *elems[i], tag, b, l);
+                    emit_agg_store(b.member_select(lhs, i, type, l), f.type, *elems[i % nelems], tag, b, l);
                 }
                 return;
             }

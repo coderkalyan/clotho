@@ -1069,3 +1069,37 @@ TEST_CASE("NBA to a narrow leaf under an array index uses the deferred record") 
     )";
     CHECK(run_capture(src) == "7 3c 0\n");
 }
+
+// Regression: a replicated assignment pattern ('{N{...}}) targeting an
+// unpacked struct stores only its per-repeat item list in slang's elements()
+// (nelems < the field count) -- emit_agg_store indexed elems[i] once per
+// field unconditionally, an out-of-bounds span read past a 1-element list for
+// a 3-field struct (SIGSEGV). Fixes sv-tests chapter-5/5.10-structure-replication.
+TEST_CASE("replicated assignment pattern into an unpacked struct decl initializer") {
+    constexpr std::string_view src = R"(
+        module m;
+            struct {int X,Y,Z;} XYZ = '{3{1}};
+            initial $display("%0d %0d %0d", XYZ.X, XYZ.Y, XYZ.Z);
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 1 1\n");
+}
+
+TEST_CASE("nested replicated patterns into a 2-D array of structs with an array field") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int a, b[4]; } ab_t;
+            int a, b, c;
+            initial begin
+                ab_t v1[1:0][2:0];
+                a = 10; b = 20; c = 30;
+                v1 = '{2{'{3{'{a,'{2{b,c}}}}}}};
+                $display("%0d %0d %0d %0d %0d",
+                         v1[0][0].a, v1[0][0].b[0], v1[0][0].b[1], v1[0][0].b[2], v1[0][0].b[3]);
+                $display("%0d %0d %0d %0d %0d",
+                         v1[1][2].a, v1[1][2].b[0], v1[1][2].b[1], v1[1][2].b[2], v1[1][2].b[3]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "10 20 30 20 30\n10 20 30 20 30\n");
+}
