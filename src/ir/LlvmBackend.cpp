@@ -472,10 +472,15 @@ struct Anchor {
     // True when the scope's definition state type is instantiated more than
     // once: def-relative code addresses through the instance context.
     bool indirect = false;
-    // Lowest process index owned by this scope (~0 when it owns none). An owned
-    // group's sched flag is addressed instance-base + (proc - first_proc), the
-    // def-local ordinal — identical slot, def-relative form (dedup prep).
+    // Lowest process index owned by this scope (~0 when it owns none).
     uint32_t first_proc = ~0u;
+    // This scope's own scheduled-flag array (@clotho.inst.<hier>.sched,
+    // [n_own x i32]) and its type; null when the scope owns no processes. An
+    // owned group's flag is `sched_gv + def-local dense ordinal` — a real
+    // symbol plus a def-content addend (relocatable), or ctx field 2 + the
+    // same ordinal in a shareable reused-definition body.
+    llvm::GlobalVariable* sched_gv = nullptr;
+    llvm::ArrayType*      sched_ty = nullptr;
     // This scope's NBA shadow: the per-def staging struct type (null when
     // the scope has no NBA shadow fields), its own global
     // (@clotho.inst.<hier>.shadow), and the opaque base-pointer global
@@ -496,7 +501,7 @@ struct Anchor {
     // parameter. Filled by main at startup. Layout:
     //   0             ptr  state base (the scope's storage)
     //   1             ptr  shadow sub-struct base (null when no NBA shadows)
-    //   2             ptr  &proc_sched[first_proc]
+    //   2             ptr  the scope's sched-flag array base (Anchor::sched_gv)
     //   3             i32  first_vcd
     //   ctx_blk_base  i32  first NBA block id, one per def-local single-scope
     //                      group ordinal (0 when the group registers none)
@@ -644,16 +649,54 @@ public:
         emit_dpi_exports();
     }
 
-    // Per-process "scheduled" flags, one i32 per process: clotho.proc_sched[k] is
-    // non-zero while process k is already queued to run this instant. Persistent
-    // (always-block) wait entries use it to avoid being woken more than once per
-    // instant when several of their sensitivity signals change together.
+    // Per-process "scheduled" flags, one i32 per process: non-zero while the
+    // process is already queued to run this instant. Persistent (always-block)
+    // wait entries use it to avoid being woken more than once per instant when
+    // several of their sensitivity signals change together. Flags live in one
+    // array per owning instance scope (@clotho.inst.<hier>.sched, indexed by a
+    // dense def-local ordinal — twin instances lower identical ordinals) plus
+    // a root @clotho.proc_sched for unowned (PreInit / package) processes.
     void build_sched_flags() {
-        const auto n   = std::max<size_t>(mod_.processes().size(), 1);
-        auto*      i32 = llvm::Type::getInt32Ty(ctx_);
-        sched_arr_ty_  = llvm::ArrayType::get(i32, n);
-        sched_gv_      = new llvm::GlobalVariable(env_.llmod, sched_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
-                                                  llvm::ConstantAggregateZero::get(sched_arr_ty_), "clotho.proc_sched");
+        const auto procs = mod_.processes();
+        auto*      i32   = llvm::Type::getInt32Ty(ctx_);
+        proc_sched_anchor_.assign(std::max<size_t>(procs.size(), 1), ~0u);
+        proc_sched_ord_.assign(std::max<size_t>(procs.size(), 1), 0);
+        std::vector<uint32_t> owned(anchors_.size(), 0);
+        uint32_t              n_root = 0;
+        for (uint32_t k = 0; k < procs.size(); ++k) {
+            const uint32_t sc = procs[k].scope;
+            if (sc != Process::no_scope && sc < anchor_of_scope_.size() &&
+                anchor_of_scope_[sc] != SignalSlot::no_anchor) {
+                const uint32_t aid    = anchor_of_scope_[sc];
+                proc_sched_anchor_[k] = aid;
+                proc_sched_ord_[k]    = owned[aid]++;
+            } else {
+                proc_sched_ord_[k] = n_root++;
+            }
+        }
+        for (uint32_t a = 0; a < anchors_.size(); ++a) {
+            if (owned[a] == 0) {
+                continue;
+            }
+            Anchor& an  = anchors_[a];
+            an.sched_ty = llvm::ArrayType::get(i32, owned[a]);
+            an.sched_gv = new llvm::GlobalVariable(env_.llmod, an.sched_ty, false,
+                                                   llvm::GlobalValue::InternalLinkage,
+                                                   llvm::ConstantAggregateZero::get(an.sched_ty),
+                                                   "clotho.inst." + an.name + ".sched");
+        }
+        sched_arr_ty_ = llvm::ArrayType::get(i32, std::max<uint32_t>(n_root, 1));
+        sched_gv_     = new llvm::GlobalVariable(env_.llmod, sched_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
+                                                 llvm::ConstantAggregateZero::get(sched_arr_ty_), "clotho.proc_sched");
+    }
+
+    // Constant pointer to process k's scheduled flag in its owner's array.
+    llvm::Constant* sched_flag_ptr(uint32_t k) {
+        const uint32_t aid  = proc_sched_anchor_[k];
+        auto*          base = aid != ~0u ? sym(anchors_[aid].sched_gv) : sym(sched_gv_);
+        auto*          ty   = aid != ~0u ? anchors_[aid].sched_ty : sched_arr_ty_;
+        return llvm::ConstantExpr::getInBoundsGetElementPtr(
+          ty, base, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(proc_sched_ord_[k]) });
     }
 
 private:
@@ -1996,13 +2039,9 @@ private:
         const uint32_t gaid = group_anchor_of_[sched_group_];
         if (gaid != SignalSlot::no_anchor) {
             sched_anchor_  = gaid;
-            sched_ordinal_ = proc_index - anchors_[gaid].first_proc;
+            sched_ordinal_ = proc_sched_ord_[proc_index];
         }
-        sched_ptr_ = sched_anchor_ != SignalSlot::no_anchor
-                       ? nullptr
-                       : llvm::ConstantExpr::getInBoundsGetElementPtr(
-                           sched_arr_ty_, sym(sched_gv_),
-                           llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(proc_index) });
+        sched_ptr_ = sched_anchor_ != SignalSlot::no_anchor ? nullptr : sched_flag_ptr(proc_index);
 
         // Same-eligibility NBA prep: the group's block registrations pass
         // (instance block base + group-local ordinal) instead of the absolute
@@ -3284,11 +3323,8 @@ private:
             if (a.shadow_ty != nullptr) {
                 b_.CreateStore(sym(a.shadow_gv), ctx_ptr(a, 1));
             }
-            if (a.first_proc != ~0u) {
-                b_.CreateStore(
-                  b_.CreateInBoundsGEP(sched_arr_ty_, sym(sched_gv_),
-                                       { b_.getInt32(0), b_.getInt32(a.first_proc) }),
-                  ctx_ptr(a, 2));
+            if (a.sched_gv != nullptr) {
+                b_.CreateStore(sym(a.sched_gv), ctx_ptr(a, 2));
             }
             if (a.first_vcd >= 0) {
                 b_.CreateStore(b_.getInt32(static_cast<uint32_t>(a.first_vcd)), ctx_ptr(a, 3));
@@ -6392,8 +6428,7 @@ private:
                 // overflow the nproc-sized active queue. The flag is cleared
                 // when the body reaches its wait-suspend (lower_process always-loop).
                 if (p.self_start) {
-                    llvm::Constant* flag = llvm::ConstantExpr::getInBoundsGetElementPtr(
-                      sched_arr_ty_, sym(sched_gv_), llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(k) });
+                    llvm::Constant* flag = sched_flag_ptr(k);
                     b_.CreateStore(b_.getInt32(1), flag);
                     emit_active_push(b_, hdl);
                 }
@@ -6419,8 +6454,7 @@ private:
                 continue;
             }
             subscribed[g]        = true;
-            llvm::Constant* flag = llvm::ConstantExpr::getInBoundsGetElementPtr(
-              sched_arr_ty_, sym(sched_gv_), llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(f) });
+            llvm::Constant* flag = sched_flag_ptr(f);
             for (const WaitEvent& w : group_events_[g]) {
                 emit_static_subscribe(w.signal, static_cast<uint32_t>(w.edge), hdls[g], flag);
             }
@@ -14422,7 +14456,11 @@ private:
     // trigger time and services the event's waiters. Indexed by signal handle;
     // null for a non-target. Built in build_delay_event_thunks.
     std::vector<llvm::Function*>                       event_delay_thunk_;
-    // Per-process scheduled flags (clotho.proc_sched), built once in run().
+    // Per-process scheduled-flag placement (build_sched_flags): owning anchor
+    // (~0 = root array) and dense def-local ordinal within that owner's array.
+    std::vector<uint32_t>               proc_sched_anchor_;
+    std::vector<uint32_t>               proc_sched_ord_;
+    // Root scheduled-flag array (clotho.proc_sched) for unowned processes.
     llvm::GlobalVariable*               sched_gv_     = nullptr;
     llvm::ArrayType*                    sched_arr_ty_ = nullptr;
 
