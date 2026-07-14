@@ -61,8 +61,8 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     // inspection mode).
     SimulationConfig jit_config = config;
     jit_config.optimize         = true;
-    auto mods                   = build_modules(m, *ctx, jit_config);
-    if (mods.empty()) {
+    auto built                  = build_modules(m, *ctx, jit_config);
+    if (built.modules.empty()) {
         return -1; // build_modules already reported the reason.
     }
     llvm::orc::ThreadSafeContext tsc(std::move(ctx));
@@ -345,7 +345,24 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
         }
     }
 
-    for (auto& mod : mods) {
+    // Integer-id marker symbols (@clotho.absid.*): each unit module's
+    // design-numbering immediates resolve against these absolute values at
+    // link time (see abs_id_const in LlvmBackend.cpp).
+    if (!built.abs_ids.empty()) {
+        llvm::orc::SymbolMap ids;
+        for (const auto& [key, value] : built.abs_ids) {
+            ids[(*jit)->mangleAndIntern("clotho.absid." + key)] = {
+                llvm::orc::ExecutorAddr(value),
+                llvm::JITSymbolFlags::Exported,
+            };
+        }
+        if (auto err = jd.define(llvm::orc::absoluteSymbols(std::move(ids)))) {
+            llvm::errs() << "jit: " << llvm::toString(std::move(err)) << "\n";
+            return -1;
+        }
+    }
+
+    for (auto& mod : built.modules) {
         if (auto err = (*jit)->addIRModule(llvm::orc::ThreadSafeModule(std::move(mod), tsc))) {
             llvm::errs() << "jit: " << llvm::toString(std::move(err)) << "\n";
             return -1;

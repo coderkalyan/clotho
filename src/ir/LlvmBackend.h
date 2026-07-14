@@ -24,16 +24,24 @@
 
 namespace clotho::ir {
 
-// Lower every process in `m` to llvm::Modules owned by `ctx`: element 0 is the
-// root module (state globals, scheduler machinery, functions, main), followed
-// by one module per elaborated-definition unit holding its single-scope
-// process groups (config.split; a single root module otherwise). Returns an
-// empty vector (and writes the reason to llvm::errs()) on backend error or if
-// any generated module fails verification. The caller owns the returned
-// modules and must keep `ctx` alive at least as long as them; the JIT links
-// the whole set into one dylib.
-std::vector<std::unique_ptr<llvm::Module>> build_modules(const Module& m, llvm::LLVMContext& ctx,
-                                                         const SimulationConfig& config = {});
+// The lowered design: modules[0] is the root module (state globals, scheduler
+// machinery, functions, main), followed by one module per elaborated-
+// definition unit holding its single-scope process groups (config.split; a
+// single root module otherwise). abs_ids lists the @clotho.absid.* integer-id
+// marker symbols the unit modules reference — the JIT must define each as an
+// absolute symbol with the given value before linking.
+struct BuiltDesign {
+    std::vector<std::unique_ptr<llvm::Module>>    modules;
+    std::vector<std::pair<std::string, uint64_t>> abs_ids;
+};
+
+// Lower every process in `m` to llvm::Modules owned by `ctx`. Returns empty
+// modules (and writes the reason to llvm::errs()) on backend error or if any
+// generated module fails verification. The caller owns the returned modules
+// and must keep `ctx` alive at least as long as them; the JIT links the whole
+// set into one dylib.
+BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx,
+                          const SimulationConfig& config = {});
 
 // Lower every process in `m` to an LLVM function and write textual LLVM IR to
 // `os`. Returns false (and writes the reason to llvm::errs()) if the generated

@@ -594,6 +594,15 @@ public:
         return std::move(unit_modules_);
     }
 
+    // (symbol suffix -> value) for every @clotho.absid.* marker the unit
+    // modules reference; the JIT defines them as absolute symbols before
+    // linking. Deterministic order (sorted) for reproducible emission.
+    std::vector<std::pair<std::string, uint64_t>> take_abs_ids() {
+        std::vector<std::pair<std::string, uint64_t>> out(abs_ids_.begin(), abs_ids_.end());
+        std::sort(out.begin(), out.end());
+        return out;
+    }
+
     void run() {
         build_state_types();
         emit_state_global(); // before any body: storage_ptr resolves through the anchors
@@ -750,6 +759,83 @@ private:
             it->second = decl;
         }
         return llvm::cast<llvm::GlobalVariable>(it->second);
+    }
+
+    // True while emission targets a definition-unit module (split mode);
+    // root-module code keeps plain immediates for the id families below.
+    bool unit_emission() const {
+        return env_ != root_env_.get();
+    }
+
+    // A design-numbering integer id as a link-time constant:
+    // trunc(ptrtoint @clotho.absid.<key>) + addend. The marker symbol is an
+    // external i8 whose *address value* the JIT defines as `value` via ORC
+    // absoluteSymbols (take_abs_ids / run_jit) — the id is patched into the
+    // immediate by relocation, so unit-module code bytes carry only the
+    // hierarchy-derived symbol name and a def-local addend, never the
+    // whole-design number. Zero runtime cost.
+    llvm::Value* abs_id_const(const std::string& key, uint32_t value, uint32_t addend) {
+        auto [it, inserted] = abs_ids_.try_emplace(key, value);
+        if (!inserted && it->second != value) {
+            throw BackendError{ "absolute id symbol '" + key + "' bound to two values" };
+        }
+        llvm::Constant* gv = env_->llmod.getOrInsertGlobal("clotho.absid." + key, b_.getInt8Ty());
+        llvm::Constant* id = llvm::ConstantExpr::getTrunc(
+          llvm::ConstantExpr::getPtrToInt(gv, b_.getInt64Ty()), b_.getInt32Ty());
+        return addend == 0 ? static_cast<llvm::Value*>(id) : b_.CreateAdd(id, b_.getInt32(addend));
+    }
+
+    // Whether `s`'s design-numbering ids should emit as absolute-symbol
+    // relocations in the current emission context: unit-module code only, and
+    // only for scope-owned signals (an unscoped signal referenced from a unit
+    // keeps the immediate — rare, costs only that unit's cache stability).
+    bool abs_id_eligible(const SignalSlot& s) const {
+        return config_.split && unit_emission() && s.anchor != SignalSlot::no_anchor;
+    }
+
+    // rt_nba_arr_* buffer index of an array-NBA signal, as an IR value.
+    llvm::Value* arr_id_value(Signal sig) {
+        const uint32_t    id = arr_idx(sig);
+        const SignalSlot& s  = slot_of(sig);
+        if (abs_id_eligible(s)) {
+            return abs_id_const("arr." + anchors_[s.anchor].name + ".s" + std::to_string(s.path.front()),
+                                id, 0);
+        }
+        return b_.getInt32(id);
+    }
+
+    // rt_nba_arr_* buffer index of an aggregate-NBA signal, as an IR value.
+    llvm::Value* agg_id_value(Signal sig) {
+        const uint32_t    id = agg_buf_idx(sig);
+        const SignalSlot& s  = slot_of(sig);
+        if (abs_id_eligible(s)) {
+            return abs_id_const("agg." + anchors_[s.anchor].name + ".s" + std::to_string(s.path.front()),
+                                id, 0);
+        }
+        return b_.getInt32(id);
+    }
+
+    // rt_intra_* record-buffer index of an intra-assignment target, as an IR value.
+    llvm::Value* intra_id_value(Signal sig) {
+        const uint32_t    id = intra_idx(sig);
+        const SignalSlot& s  = slot_of(sig);
+        if (abs_id_eligible(s)) {
+            return abs_id_const("intra." + anchors_[s.anchor].name + ".s" + std::to_string(s.path.front()),
+                                id, 0);
+        }
+        return b_.getInt32(id);
+    }
+
+    // Dense `<= @e` trigger id of (signal, edge), as an IR value.
+    llvm::Value* trigger_id_value(Signal sig, uint32_t edge) {
+        const auto        id = static_cast<uint32_t>(trigger_id(sig, edge));
+        const SignalSlot& s  = slot_of(sig);
+        if (abs_id_eligible(s)) {
+            return abs_id_const("trig." + anchors_[s.anchor].name + ".s" + std::to_string(s.path.front()) +
+                                  ".e" + std::to_string(edge),
+                                id, 0);
+        }
+        return b_.getInt32(id);
     }
 
     // The definition unit's env for an anchored scope, created (with its
@@ -3740,7 +3826,9 @@ private:
         group_anchor_of_.assign(groups_.size(), SignalSlot::no_anchor);
         group_def_ordinal_.assign(groups_.size(), ~0u);
         group_unit_anchor_.assign(groups_.size(), SignalSlot::no_anchor);
+        group_unit_ordinal_.assign(groups_.size(), ~0u);
         std::vector<uint32_t> scope_counter(anchors_.size(), 0);
+        std::vector<uint32_t> unit_counter(anchors_.size(), 0);
         for (uint32_t g = 0; g < groups_.size(); ++g) {
             const uint32_t sc   = all[groups_[g].front()].scope;
             bool           same = sc != Process::no_scope;
@@ -3754,7 +3842,8 @@ private:
             const uint32_t aid = anchor_of_scope_[sc];
             // Any single-scope group belongs to its definition's emission
             // unit (split mode), whether or not the definition is reused.
-            group_unit_anchor_[g] = aid;
+            group_unit_anchor_[g]  = aid;
+            group_unit_ordinal_[g] = unit_counter[aid]++;
             if (!anchors_[aid].indirect || anchors_[aid].first_proc == ~0u) {
                 continue;
             }
@@ -5500,6 +5589,18 @@ private:
                 id = b_.CreateAdd(
                   ctx_field(a, field, b_.getInt32Ty()),
                   b_.getInt32(cur_block_id_ - static_cast<uint32_t>(group_first_block_)));
+            } else if (config_.split && unit_emission()) {
+                // Unit-module group of a unique definition: the block id via an
+                // absolute symbol keyed by (instance, def-local group ordinal),
+                // group-local block ordinal as the addend.
+                const uint32_t ua = group_unit_anchor_[sched_group_];
+                if (group_first_block_ < 0) {
+                    group_first_block_ = static_cast<int64_t>(cur_block_id_);
+                }
+                id = abs_id_const("blk." + anchors_[ua].name + ".g" +
+                                    std::to_string(group_unit_ordinal_[sched_group_]),
+                                  static_cast<uint32_t>(group_first_block_),
+                                  cur_block_id_ - static_cast<uint32_t>(group_first_block_));
             }
             b_.CreateCall(sym(nba_block_enqueue_fn_), { id });
         }
@@ -5974,7 +6075,7 @@ private:
     void fire_event_trigger(Signal sig, uint32_t edge) {
         const int32_t tid = trigger_id(sig, edge);
         if (tid >= 0) {
-            b_.CreateCall(intra_event_fire_fn(), { b_.getInt32(static_cast<uint32_t>(tid)) });
+            b_.CreateCall(intra_event_fire_fn(), { trigger_id_value(sig, edge) });
         }
     }
 
@@ -8420,7 +8521,7 @@ private:
                 const Plane   rhs   = value_of(info.value);
                 llvm::Value*  count = must_of(value_of(info.count));
                 emit_intra_event_arm(lv, rhs, count,
-                                     static_cast<uint32_t>(trigger_id(info.trig, info.edge)));
+                                     trigger_id_value(info.trig, info.edge));
                 return;
             }
 
@@ -9924,7 +10025,7 @@ private:
         auto*             i8     = b_.getInt8Ty();
         auto*             rt     = agg_rec_ty(s);
         const auto        stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
-        llvm::Value* rec = b_.CreateCall(nba_arr_slot_fn(), { b_.getInt32(agg_buf_idx(lv.sig)), b_.getInt32(stride) });
+        llvm::Value* rec = b_.CreateCall(nba_arr_slot_fn(), { agg_id_value(lv.sig), b_.getInt32(stride) });
         b_.CreateAlignedStore(agg_slot_ptr(lv), b_.CreateStructGEP(rt, rec, 0), a1);
         const auto nbytes = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(lv.slot_ty));
         b_.CreateAlignedStore(b_.getInt32(nbytes), b_.CreateStructGEP(rt, rec, 1), a1);
@@ -10086,7 +10187,7 @@ private:
 
         llvm::StructType* rt     = arr_rec_ty(s);
         const uint32_t    stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
-        llvm::Value*      rec    = b_.CreateCall(nba_arr_slot_fn(), { b_.getInt32(arr_idx(lv.sig)), b_.getInt32(stride) });
+        llvm::Value*      rec    = b_.CreateCall(nba_arr_slot_fn(), { arr_id_value(lv.sig), b_.getInt32(stride) });
         b_.CreateAlignedStore(lv_mm_ptr(lv), b_.CreateStructGEP(rt, rec, 0), a1);
         b_.CreateAlignedStore(mm_val, b_.CreateStructGEP(rt, rec, 1), a1);
         if (s.has_z) {
@@ -10112,10 +10213,10 @@ private:
         const llvm::Align a1{ 1 }; // record lives in an unaligned pooled block
         llvm::StructType* rt     = intra_rec_ty(s);
         const uint32_t    stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
-        const uint32_t    idx    = intra_idx(lv.sig);
+        llvm::Value*      idxv   = intra_id_value(lv.sig);
 
-        llvm::Value* rec = b_.CreateCall(intra_alloc_fn(), { b_.getInt32(idx), b_.getInt32(stride) });
-        b_.CreateStore(b_.getInt32(idx), b_.CreateStructGEP(rt, rec, 2)); // idx routes the fire
+        llvm::Value* rec = b_.CreateCall(intra_alloc_fn(), { idxv, b_.getInt32(stride) });
+        b_.CreateStore(idxv, b_.CreateStructGEP(rt, rec, 2)); // idx routes the fire
 
         // Value planes: a whole-scalar target is signal-width (frontend Resize), so
         // no positioning is needed — store the planes directly.
@@ -10171,15 +10272,15 @@ private:
     // trigger edge fires (blocking store or NBA commit), rt_intra_event_fire counts
     // the record down and, at zero, moves it to the target ready list for the NBA
     // region (emit_intra_commit). Same value/plane layout as emit_intra_nba_arm.
-    void emit_intra_event_arm(const LValue& lv, Plane rhs, llvm::Value* count, uint32_t trig_id) {
+    void emit_intra_event_arm(const LValue& lv, Plane rhs, llvm::Value* count, llvm::Value* trig_id) {
         const SignalSlot& s      = slot_of(lv.sig);
         const llvm::Align a1{ 1 };
         llvm::StructType* rt     = intra_rec_ty(s);
         const uint32_t    stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
-        const uint32_t    idx    = intra_idx(lv.sig);
+        llvm::Value*      idxv   = intra_id_value(lv.sig);
 
-        llvm::Value* rec = b_.CreateCall(intra_alloc_fn(), { b_.getInt32(idx), b_.getInt32(stride) });
-        b_.CreateStore(b_.getInt32(idx), b_.CreateStructGEP(rt, rec, 2));
+        llvm::Value* rec = b_.CreateCall(intra_alloc_fn(), { idxv, b_.getInt32(stride) });
+        b_.CreateStore(idxv, b_.CreateStructGEP(rt, rec, 2));
         b_.CreateStore(cast(count, 32, false), b_.CreateStructGEP(rt, rec, 4)); // event countdown
 
         llvm::Value* mm_val;
@@ -10193,7 +10294,7 @@ private:
         if (s.has_z) {
             b_.CreateAlignedStore(rhs.z, b_.CreateStructGEP(rt, rec, 6), a1);
         }
-        b_.CreateCall(intra_event_register_fn(), { b_.getInt32(trig_id), rec });
+        b_.CreateCall(intra_event_register_fn(), { trig_id, rec });
     }
 
     // Commit intra-NBA signal `sig`'s fired records in the NBA region: store each
@@ -11307,6 +11408,11 @@ private:
                 llvm::Value* b0 = ctx_field(a, 3, b_.getInt32Ty());
                 return b_.CreateAdd(b0, b_.getInt32(static_cast<uint32_t>(base - a.first_vcd)));
             }
+        }
+        if (abs_id_eligible(s) && anchors_[s.anchor].first_vcd >= 0) {
+            Anchor& a = anchors_[s.anchor];
+            return abs_id_const("vcd." + a.name, static_cast<uint32_t>(a.first_vcd),
+                                static_cast<uint32_t>(base - a.first_vcd));
         }
         return b_.getInt32(static_cast<uint32_t>(base));
     }
@@ -14293,6 +14399,8 @@ private:
     std::vector<std::unique_ptr<ModuleEnv>>                       unit_envs_;
     std::vector<std::unique_ptr<llvm::Module>>                    unit_modules_;
     ankerl::unordered_dense::map<llvm::StructType*, ModuleEnv*>   unit_env_of_;
+    // Integer-id absolute symbols (abs_id_const): suffix -> value.
+    ankerl::unordered_dense::map<std::string, uint64_t>            abs_ids_;
     llvm::IRBuilder<>       b_;
     // The root `%clotho.state` struct: unscoped signals only (instance scopes
     // own their own state globals, see Anchor::state_gv).
@@ -14328,9 +14436,11 @@ private:
     std::vector<uint32_t> group_anchor_of_;
     std::vector<uint32_t> group_def_ordinal_;
     // Owning scope anchor of ANY single-scope group (unique or reused def),
-    // no_anchor for cross-instance / unscoped groups: the split-emission unit
-    // assignment (see unit_env / the lower_group loop in run()).
+    // no_anchor for cross-instance / unscoped groups, and the group's dense
+    // def-local ordinal among them: the split-emission unit assignment (see
+    // unit_env / the lower_group loop in run()) and the blk absolute-id key.
     std::vector<uint32_t> group_unit_anchor_;
+    std::vector<uint32_t> group_unit_ordinal_;
     // Def-local signal table per anchor (slot.path's last element), kept from
     // build_wait_queues for the ctx layout and block-signal translation.
     std::vector<std::vector<Signal>> anchor_signals_;
@@ -14679,8 +14789,8 @@ bool lower_coroutines(llvm::Module& m, bool o3) {
 
 } // namespace
 
-std::vector<std::unique_ptr<llvm::Module>> build_modules(const Module& m, llvm::LLVMContext& ctx,
-                                                         const SimulationConfig& config) {
+BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx,
+                          const SimulationConfig& config) {
     auto root = std::make_unique<llvm::Module>(m.name.empty() ? "clotho" : m.name, ctx);
 
     // Pin the modules to the host target's triple and DataLayout before any IR
@@ -14707,16 +14817,18 @@ std::vector<std::unique_ptr<llvm::Module>> build_modules(const Module& m, llvm::
         root->setDataLayout(*dl);
     }
 
-    std::vector<std::unique_ptr<llvm::Module>> mods;
+    BuiltDesign built;
     try {
         Backend be(m, ctx, *root, config);
         be.run();
-        mods = be.take_unit_modules();
+        built.modules = be.take_unit_modules();
+        built.abs_ids = be.take_abs_ids();
     } catch (const BackendError& e) {
         llvm::errs() << "llvm backend error: " << e.message << "\n";
         return {};
     }
-    mods.insert(mods.begin(), std::move(root));
+    built.modules.insert(built.modules.begin(), std::move(root));
+    auto& mods = built.modules;
 
     // Verify every freshly-built (pre-split) module. With optimize off, stop
     // here and hand back the raw modules (coro intrinsics intact).
@@ -14726,7 +14838,7 @@ std::vector<std::unique_ptr<llvm::Module>> build_modules(const Module& m, llvm::
         }
     }
     if (!config.optimize) {
-        return mods;
+        return built;
     }
     // Lower the coroutines per module and verify again — the second pass
     // guards against malformed coro lowering.
@@ -14739,16 +14851,16 @@ std::vector<std::unique_ptr<llvm::Module>> build_modules(const Module& m, llvm::
         }
     }
 
-    return mods;
+    return built;
 }
 
 bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config) {
     llvm::LLVMContext ctx;
-    auto              mods = build_modules(m, ctx, config);
-    if (mods.empty()) {
+    auto              built = build_modules(m, ctx, config);
+    if (built.modules.empty()) {
         return false;
     }
-    for (const auto& mod : mods) {
+    for (const auto& mod : built.modules) {
         mod->print(os, nullptr);
     }
     return true;
