@@ -83,6 +83,18 @@ struct SimulationConfig {
     // Off by default: the listener adds per-object bookkeeping and writes the
     // dump file. Run-only knob (build_module ignores it).
     bool perf_jitdump = false;
+    // Compile the split per-definition modules concurrently: each is migrated
+    // into its own LLVMContext (a bitcode round-trip; LLVMContext is not
+    // thread-safe, so this can't happen while modules still share one) and
+    // optimize_module + ORC codegen for independent modules run across a
+    // thread pool instead of one sequential loop. Semantics are identical
+    // either way (same per-module IR, same optimize_module/verify sequence).
+    // Disable for bisection / debugging, or when isolating a single-module
+    // compile-time regression. Run-only knob (build_module ignores it).
+    bool parallel_compile = true;
+    // Worker thread cap for parallel_compile; 0 = llvm::hardware_concurrency().
+    // Run-only knob (build_module ignores it).
+    unsigned compile_jobs = 0;
     // Shared libraries (`--dpi-lib <path>`, repeatable) searched to resolve
     // `import "DPI-C"` symbols at JIT link time. Each is added to the JIT
     // dylib as a DynamicLibrarySearchGenerator (see run_jit).

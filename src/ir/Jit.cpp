@@ -2,10 +2,15 @@
 
 #include <csetjmp>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
+#include <llvm/ADT/SmallVector.h>
+#include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/ExecutionEngine/JITEventListener.h>
 #include <llvm/ExecutionEngine/Orc/AbsoluteSymbols.h>
 #include <llvm/ExecutionEngine/Orc/Core.h>
@@ -18,10 +23,13 @@
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/Verifier.h>
 #include <llvm/Support/CodeGen.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/Threading.h>
+#include <llvm/Support/ThreadPool.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include "LlvmBackend.h"
@@ -53,19 +61,32 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     const auto t_llvm = std::chrono::steady_clock::now();
 
     // Each run owns its context: the design modules are built into it, then
-    // moved into ThreadSafeModules sharing one ThreadSafeContext the JIT takes
-    // over.
+    // (parallel_compile off, or a single module) moved into ThreadSafeModules
+    // sharing one ThreadSafeContext the JIT takes over — same as before. With
+    // parallel_compile on and >1 module, each unit is instead migrated into
+    // its own fresh LLVMContext below (a bitcode round-trip) so unrelated
+    // modules can be optimized and codegen'd concurrently: LLVMContext is not
+    // thread-safe, and ORC's ThreadSafeContext lock serializes any modules
+    // that still share one (docs/design/module-split.md).
     auto ctx = std::make_unique<llvm::LLVMContext>();
     // The JIT needs runnable code: coroutine lowering is mandatory regardless
     // of what the caller's config says (optimize=false is an emit_llvm
-    // inspection mode).
+    // inspection mode). Deferred (build_modules_unoptimized, not
+    // build_modules) so optimize_module can run per module below, after
+    // context migration when parallel.
     SimulationConfig jit_config = config;
     jit_config.optimize         = true;
-    auto built                  = build_modules(m, *ctx, jit_config);
+    auto built                  = build_modules_unoptimized(m, *ctx, jit_config);
     if (built.modules.empty()) {
-        return -1; // build_modules already reported the reason.
+        return -1; // build_modules_unoptimized already reported the reason.
     }
-    llvm::orc::ThreadSafeContext tsc(std::move(ctx));
+
+    // Parallel compile needs its own context per module to mean anything;
+    // a single-module build (e.g. --no-split) falls through to the plain
+    // sequential path unconditionally.
+    const bool     parallel = config.parallel_compile && built.modules.size() > 1;
+    const unsigned n_jobs =
+      parallel ? llvm::hardware_concurrency(config.compile_jobs).compute_thread_count() : 1;
 
     // Machine-code generation matches the IR tier: -O0/FastISel for tier 0
     // (the backend pipeline already did the cheap cleanup; codegen quality is
@@ -80,6 +101,14 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
 
     llvm::orc::LLJITBuilder builder;
     builder.setJITTargetMachineBuilder(std::move(*jtmb));
+    if (parallel) {
+        // Each unit module is migrated to its own LLVMContext below (bitcode
+        // round-trip), so ORC can materialize them concurrently: this makes
+        // LLJIT select ConcurrentIRCompiler (a fresh TargetMachine per
+        // compile call) and dispatch per-module codegen onto its own thread
+        // pool when lookup("main") transitively pulls in every unit.
+        builder.setNumCompileThreads(n_jobs);
+    }
 
     // Register the perf jitdump listener on the object-linking layer. The
     // default LLJIT layer is RTDyldObjectLinkingLayer; supply our own so we can
@@ -345,10 +374,80 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
         }
     }
 
-    for (auto& mod : built.modules) {
-        if (auto err = (*jit)->addIRModule(llvm::orc::ThreadSafeModule(std::move(mod), tsc))) {
-            llvm::errs() << "jit: " << llvm::toString(std::move(err)) << "\n";
+    if (parallel) {
+        // Serialize every module to bitcode while they still share `ctx` — a
+        // read-only traversal, no writes into the context's uniquing tables,
+        // so this stays single-threaded rather than risk concurrent reads of
+        // one LLVMContext. Then drop the shared modules/context: each buffer
+        // below is independently reparsed into its own fresh LLVMContext, so
+        // optimize_module + verify + addIRModule for different units run
+        // concurrently instead of serializing on one shared context's lock.
+        std::vector<llvm::SmallVector<char, 0>> bitcode(built.modules.size());
+        for (size_t i = 0; i < built.modules.size(); ++i) {
+            llvm::raw_svector_ostream os(bitcode[i]);
+            llvm::WriteBitcodeToFile(*built.modules[i], os);
+        }
+        built.modules.clear();
+        ctx.reset();
+
+        llvm::DefaultThreadPool pool(llvm::hardware_concurrency(config.compile_jobs));
+        std::mutex              err_mu;
+        std::string             first_err;
+        std::vector<std::shared_future<void>> tasks;
+        tasks.reserve(bitcode.size());
+        for (size_t i = 0; i < bitcode.size(); ++i) {
+            tasks.push_back(pool.async([&, i] {
+                auto                   mod_ctx = std::make_unique<llvm::LLVMContext>();
+                llvm::MemoryBufferRef  buf(llvm::StringRef(bitcode[i].data(), bitcode[i].size()),
+                                          "clotho.unit");
+                auto                   parsed = llvm::parseBitcodeFile(buf, *mod_ctx);
+                const auto             fail   = [&](std::string msg) {
+                    std::lock_guard<std::mutex> lock(err_mu);
+                    if (first_err.empty()) {
+                        first_err = std::move(msg);
+                    }
+                };
+                if (!parsed) {
+                    fail("jit: parallel module reload failed: " + llvm::toString(parsed.takeError()));
+                    return;
+                }
+                if (!optimize_module(**parsed, config.o3)) {
+                    fail("jit: parallel module optimize failed");
+                    return;
+                }
+                if (llvm::verifyModule(**parsed, &llvm::errs())) {
+                    fail("jit: parallel module failed verification after optimize");
+                    return;
+                }
+                llvm::orc::ThreadSafeContext mod_tsc(std::move(mod_ctx));
+                if (auto err = (*jit)->addIRModule(
+                      llvm::orc::ThreadSafeModule(std::move(*parsed), std::move(mod_tsc)))) {
+                    fail("jit: " + llvm::toString(std::move(err)));
+                }
+            }));
+        }
+        for (auto& t : tasks) {
+            t.wait();
+        }
+        if (!first_err.empty()) {
+            llvm::errs() << first_err << "\n";
             return -1;
+        }
+    } else {
+        llvm::orc::ThreadSafeContext tsc(std::move(ctx));
+        for (auto& mod : built.modules) {
+            if (!optimize_module(*mod, config.o3)) {
+                llvm::errs() << "jit: module optimize failed\n";
+                return -1;
+            }
+            if (llvm::verifyModule(*mod, &llvm::errs())) {
+                llvm::errs() << "jit: module failed verification after optimize\n";
+                return -1;
+            }
+            if (auto err = (*jit)->addIRModule(llvm::orc::ThreadSafeModule(std::move(mod), tsc))) {
+                llvm::errs() << "jit: " << llvm::toString(std::move(err)) << "\n";
+                return -1;
+            }
         }
     }
 
