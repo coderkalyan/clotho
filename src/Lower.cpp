@@ -1935,11 +1935,11 @@ private:
                         // Modeled net kinds: wire/tri (+ uwire, single-driver
                         // per slang's MultipleUWireDrivers pass) resolve to X on
                         // conflict; wand/triand and wor/trior carry wired-AND /
-                        // wired-OR resolution (net_resolve_tag). All z-default
-                        // when undriven.
-                        // TODO: tri0/tri1/trireg/supply0/supply1 carry pull /
-                        // charge semantics and non-z undriven defaults clotho
-                        // does not implement.
+                        // wired-OR resolution (net_resolve_tag); tri0/tri1 carry a
+                        // resistive pull to 0 / 1 (net_pull_value). All Z-default
+                        // when undriven, except tri0/tri1 which pull to 0 / 1.
+                        // TODO: trireg/supply0/supply1 carry charge / strength
+                        // semantics clotho does not implement.
                         switch (net.netType.netKind) {
                             case NetType::Wire:
                             case NetType::Tri:
@@ -1948,9 +1948,11 @@ private:
                             case NetType::TriAnd:
                             case NetType::WOr:
                             case NetType::TriOr:
+                            case NetType::Tri0:
+                            case NetType::Tri1:
                                 break;
                             default:
-                                fail("unsupported net type (only wire/tri/uwire/wand/wor are modeled)");
+                                fail("unsupported net type (only wire/tri/uwire/wand/wor/tri0/tri1 are modeled)");
                         }
                         if (net.getDelay() != nullptr) {
                             // TODO: net delay (`wire #5 w;`, LRM 28.16) — an
@@ -1982,7 +1984,18 @@ private:
                         fail("string module ports are not supported");
                     }
 
-                    sigmap_[&vs] = register_signal(std::move(info));
+                    const ir::Signal sig = register_signal(std::move(info));
+                    sigmap_[&vs]         = sig;
+                    if (m.kind == SymbolKind::Net) {
+                        // A tri0/tri1 net always needs a resolver so its pull can
+                        // fill undriven bits — even with zero or one driver. Record
+                        // it here (its home scope) so a driverless one still emits.
+                        if (const std::optional<int> pull =
+                              net_pull_value(m.as<NetSymbol>().netType.netKind)) {
+                            net_pull_[static_cast<uint32_t>(sig)] =
+                              PullInfo{ *pull, cur_scope_id(), to_source_loc(vs.location) };
+                        }
+                    }
                     break;
                 }
                 case SymbolKind::GenerateBlock: {
@@ -2090,7 +2103,22 @@ private:
             case NetType::TriOr:
                 return ir::Inst::Tag::WorRes;
             default:
+                // wire / tri / uwire, and tri0 / tri1 (whose drivers resolve as
+                // wire before the pull fills undriven bits, net_pull_value).
                 return ir::Inst::Tag::WireRes;
+        }
+    }
+
+    // The resistive-pull value of a tri0 / tri1 net (LRM 6.6.4), or nullopt for a
+    // net kind with no pull.
+    static std::optional<int> net_pull_value(NetType::NetKind kind) {
+        switch (kind) {
+            case NetType::Tri0:
+                return 0;
+            case NetType::Tri1:
+                return 1;
+            default:
+                return std::nullopt;
         }
     }
 
@@ -2119,20 +2147,26 @@ private:
         if (sym.kind != SymbolKind::Net) {
             return;
         }
-        const auto net = static_cast<uint32_t>(signal_of(sym));
-        auto&      regions = net_driven_[net];
+        const auto       net  = static_cast<uint32_t>(signal_of(sym));
+        const NetSymbol& nsym = sym.as<NetSymbol>();
+        // A tri0/tri1 net needs a resolver from its very first driver: a single
+        // tri-state driver still pulls to 0/1 whenever it is off. Other kinds
+        // resolve only once a second driver overlaps an existing one.
+        const bool has_pull = net_pull_value(nsym.netType.netKind).has_value();
+        auto&      regions  = net_driven_[net];
+        bool       resolve  = has_pull;
         for (const NetRegion& p : regions) {
             if (reg.elem_lo <= p.elem_hi && p.elem_lo <= reg.elem_hi &&
                 reg.bit_lo <= p.bit_hi && p.bit_lo <= reg.bit_hi) {
-                // A second driver overlaps an existing one: the net needs
-                // resolution (LRM 6.6). Emit routes every driver of a resolved
-                // net to its own slot and folds them through the net-kind's
-                // reducer (wire -> X on conflict, wand/wor -> wired-AND/OR).
-                if (resolved_nets_.insert(net).second) {
-                    net_resolve_op_[net] = net_resolve_tag(sym.as<NetSymbol>().netType.netKind);
-                }
+                // Emit routes every driver of a resolved net to its own slot and
+                // folds them through the net-kind's reducer (wire -> X on
+                // conflict, wand/wor -> wired-AND/OR), then applies any pull.
+                resolve = true;
                 break;
             }
+        }
+        if (resolve && resolved_nets_.insert(net).second) {
+            net_resolve_op_[net] = net_resolve_tag(nsym.netType.netKind);
         }
         regions.push_back(reg);
     }
@@ -2563,17 +2597,55 @@ private:
     // resolved value. Runs once per top after Emit, when every driver has
     // registered its slot.
     void emit_wire_resolvers() {
+        // Every net that needs a resolver: the ones with >= 2 (or, for tri0/tri1,
+        // >= 1) drivers, plus driverless tri0/tri1 nets that still pull to 0/1.
+        std::vector<uint32_t> nets;
+        nets.reserve(resolved_slots_.size() + net_pull_.size());
         for (const auto& [net_u, slots] : resolved_slots_) {
-            const ir::Signal    net = static_cast<ir::Signal>(net_u);
-            const ir::SourceLoc l   = resolved_loc_[net_u];
-            const ir::Inst::Tag op  = net_resolve_op_[net_u];
-            ir::Builder         b(module_.pool);
-            ir::Index           acc = b.unary(ir::Inst::Tag::Load, b.signal(slots[0], l), l);
-            for (size_t k = 1; k < slots.size(); ++k) {
-                const ir::Index next = b.unary(ir::Inst::Tag::Load, b.signal(slots[k], l), l);
-                acc                  = b.binary(op, acc, next, l);
+            nets.push_back(net_u);
+        }
+        for (const auto& [net_u, pull] : net_pull_) {
+            if (!resolved_slots_.contains(net_u)) {
+                nets.push_back(net_u);
+            }
+        }
+        std::sort(nets.begin(), nets.end()); // deterministic process order
+
+        for (const uint32_t net_u : nets) {
+            const ir::Signal net = static_cast<ir::Signal>(net_u);
+            const auto       si  = resolved_slots_.find(net_u);
+            const std::span<const ir::Signal> slots =
+              si != resolved_slots_.end() ? std::span<const ir::Signal>(si->second)
+                                          : std::span<const ir::Signal>();
+            const auto pi = net_pull_.find(net_u);
+
+            const ir::SourceLoc l = !slots.empty() ? resolved_loc_[net_u]
+                                    : pi != net_pull_.end() ? pi->second.loc
+                                                            : ir::SourceLoc{ 0 };
+            const uint32_t scope  = !slots.empty() ? resolved_scope_[net_u]
+                                    : pi != net_pull_.end() ? pi->second.scope
+                                                            : ir::Process::no_scope;
+            const ir::Inst::Tag op =
+              net_resolve_op_.contains(net_u) ? net_resolve_op_[net_u] : ir::Inst::Tag::WireRes;
+
+            ir::Builder b(module_.pool);
+            // Fold the driver slots (a driverless tri0/tri1 net seeds all-Z, so
+            // the pull sees only Z and fills the whole net with its pull value).
+            ir::Index acc;
+            if (slots.empty()) {
+                acc = b.constant(z_constant_ref(module_.pool.layout(module_.signal(net).type).width), l);
+            } else {
+                acc = b.unary(ir::Inst::Tag::Load, b.signal(slots[0], l), l);
+                for (size_t k = 1; k < slots.size(); ++k) {
+                    const ir::Index next = b.unary(ir::Inst::Tag::Load, b.signal(slots[k], l), l);
+                    acc                  = b.binary(op, acc, next, l);
+                }
+            }
+            if (pi != net_pull_.end()) {
+                acc = b.net_pull(acc, static_cast<uint32_t>(pi->second.value), l);
             }
             b.binary(ir::Inst::Tag::Store, b.signal(net, l), acc, l);
+
             std::vector<ir::WaitEvent> wait_events;
             wait_events.reserve(slots.size());
             for (const ir::Signal s : slots) {
@@ -2584,7 +2656,7 @@ private:
                                              .self_start  = true,
                                              .loc         = l,
                                              .ir          = b.finish(),
-                                             .scope       = resolved_scope_[net_u] });
+                                             .scope       = scope });
         }
     }
 
@@ -9475,6 +9547,14 @@ private:
     // Per resolved net: which reducer folds its slots (WireRes / WandRes /
     // WorRes), from the net kind (net_resolve_tag).
     ankerl::unordered_dense::map<uint32_t, ir::Inst::Tag>           net_resolve_op_;
+    // tri0 / tri1 nets: the resistive pull applied after the fold, and the home
+    // scope / loc for the resolver (so even a driverless net emits one).
+    struct PullInfo {
+        int          value;
+        uint32_t     scope;
+        ir::SourceLoc loc;
+    };
+    ankerl::unordered_dense::map<uint32_t, PullInfo> net_pull_;
     // Hierarchical name prefix of the instance currently being lowered (e.g.
     // "u_alu.u_sub."); empty for the top. Prepended to every signal name created
     // while this instance's body is processed so flattened signals stay unique.

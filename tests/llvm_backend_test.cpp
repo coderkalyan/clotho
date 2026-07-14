@@ -3176,11 +3176,11 @@ TEST_CASE("an unconnected child input port reads z inside the child") {
 }
 
 TEST_CASE("unmodeled net kinds fail loudly") {
-    // wire/tri/uwire/wand/wor are modeled; tri0/tri1/trireg/supply* carry pull
-    // or charge semantics and a non-z undriven default clotho does not implement.
+    // wire/tri/uwire/wand/wor/tri0/tri1 are modeled; trireg/supply* carry charge
+    // or strength semantics clotho does not implement.
     const LowerResult r = lower_text(R"(
         module m;
-            tri0 w;
+            trireg w;
         endmodule
     )");
     CHECK(!r.ok);

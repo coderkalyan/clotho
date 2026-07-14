@@ -263,6 +263,55 @@ TEST_CASE("wand/wor fold partial drivers per bit") {
     CHECK(out == "1110 0001\n");
 }
 
+TEST_CASE("tri0 pulls down, tri1 pulls up, drivers override the pull") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic ea, eb, va, vb;
+          tri0 t0;
+          tri1 t1;
+          assign t0 = ea ? va : 1'bz;
+          assign t0 = eb ? vb : 1'bz;
+          assign t1 = ea ? va : 1'bz;
+          assign t1 = eb ? vb : 1'bz;
+          initial begin
+            ea=0; eb=0; va=1; vb=0; #1; $display("%b %b", t0, t1); // no driver -> 0 1
+            ea=1;                   #1; $display("%b %b", t0, t1); // va=1     -> 1 1
+            va=0;                   #1; $display("%b %b", t0, t1); // va=0     -> 0 0
+            ea=1; eb=1; va=0; vb=1; #1; $display("%b %b", t0, t1); // 0 vs 1  -> x x
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "0 1\n1 1\n0 0\nx x\n");
+}
+
+TEST_CASE("a driverless tri0/tri1 net holds its pull value") {
+    const std::string out = run_capture(R"(
+        module top;
+          tri0 [3:0] a;
+          tri1 [3:0] b;
+          initial begin #1; $display("%b %b", a, b); $finish; end
+        endmodule
+    )");
+    CHECK(out == "0000 1111\n");
+}
+
+TEST_CASE("a partial driver on a tri0 vector pulls the undriven bits") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic en;
+          tri0 [3:0] bus;
+          assign bus[1:0] = en ? 2'b11 : 2'bz;
+          initial begin
+            en=0; #1; $display("%b", bus); // all pulled: 0000
+            en=1; #1; $display("%b", bus); // [1:0]=11 driven, [3:2] pulled: 0011
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "0000\n0011\n");
+}
+
 // -- Loud-failure guards for the shapes V2 does not resolve --
 
 TEST_CASE("an unpacked-array-element driver of a resolved net fails loudly") {
