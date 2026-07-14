@@ -4049,6 +4049,7 @@ private:
                 case Inst::Tag::Bor:
                 case Inst::Tag::Bxor:
                 case Inst::Tag::Bxnor:
+                case Inst::Tag::WireRes:
                 case Inst::Tag::Bnot:
                 case Inst::Tag::RedAnd:
                 case Inst::Tag::RedOr:
@@ -5067,6 +5068,7 @@ private:
                 case Inst::Tag::Bor:
                 case Inst::Tag::Bxor:
                 case Inst::Tag::Bxnor:
+                case Inst::Tag::WireRes:
                 case Inst::Tag::Bnot:
                 case Inst::Tag::RedAnd:
                 case Inst::Tag::RedOr:
@@ -7498,6 +7500,13 @@ private:
             case Inst::Tag::Srl:
             case Inst::Tag::Sra:
                 return type_of(p.binary.l);
+            case Inst::Tag::WireRes: {
+                // Wire resolution always yields a 4-state result at the operand
+                // (net) width — a driver conflict is X, an all-high-Z net is Z —
+                // even when the driver slots feeding it are 2-state.
+                const ValType lt = type_of(p.binary.l);
+                return { lt.width, true, false };
+            }
             case Inst::Tag::Bnot:
                 return type_of(p.unary);
             case Inst::Tag::StreamReverse:
@@ -8392,6 +8401,9 @@ private:
             case Inst::Tag::Bxor:
             case Inst::Tag::Bxnor:
                 set_value(i, lower_bitwise(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
+                return;
+            case Inst::Tag::WireRes:
+                set_value(i, lower_wire_res(value_of(p.binary.l), value_of(p.binary.r)));
                 return;
             case Inst::Tag::Bnot:
                 set_value(i, lower_bnot(value_of(p.unary)));
@@ -12635,6 +12647,36 @@ private:
         llvm::Value* xa = b_.CreateXor(a.mm, b_.CreateLShr(a.mm, w));
         llvm::Value* xb = b_.CreateXor(b.mm, b_.CreateLShr(b.mm, w));
         return b_.CreateTrunc(b_.CreateOr(xa, xb), int_ty(w));
+    }
+
+    // Strong wire/tri resolution of two drivers (LRM 6.6.1, no drive strengths):
+    // the per-bit lattice join z ⊑ {0,1} ⊑ x. A high-Z operand contributes
+    // nothing (identity); two active operands that agree keep the value; a
+    // 0-vs-1 (or any X) conflict resolves to X; both-Z resolves to Z. The X and
+    // Z encodings are must=0/may=1 with z=0 (X) or z=1 (Z), so a 2-state slot
+    // (z-elided to must==may, z==0) folds through this correctly. Associative
+    // and commutative, so K drivers fold left one pair at a time.
+    Plane lower_wire_res(Plane a, Plane b) {
+        llvm::Value* ma = must_of(a), *aa = may_of(a), *za = z_of(a);
+        llvm::Value* mb = must_of(b), *ab = may_of(b), *zb = z_of(b);
+        llvm::Value* nza = b_.CreateNot(za); // operand a actively drives (not Z)
+        llvm::Value* nzb = b_.CreateNot(zb);
+        // Per driver, gated by "actively driving": drives 1 (must), drives 0
+        // (~may), drives X (may & ~must). Reduce across the two operands.
+        llvm::Value* one  = b_.CreateOr(b_.CreateAnd(nza, ma), b_.CreateAnd(nzb, mb));
+        llvm::Value* zero = b_.CreateOr(b_.CreateAnd(nza, b_.CreateNot(aa)),
+                                        b_.CreateAnd(nzb, b_.CreateNot(ab)));
+        llvm::Value* xdr =
+          b_.CreateOr(b_.CreateAnd(nza, b_.CreateAnd(aa, b_.CreateNot(ma))),
+                      b_.CreateAnd(nzb, b_.CreateAnd(ab, b_.CreateNot(mb))));
+        llvm::Value* allz     = b_.CreateAnd(za, zb);
+        llvm::Value* conflict = b_.CreateOr(b_.CreateAnd(one, zero), xdr);
+        llvm::Value* rmust    = b_.CreateAnd(one, b_.CreateNot(conflict));
+        llvm::Value* rz       = allz;
+        // may = 1 for a resolved 1 (rmust), an X (conflict), or a Z (rz); only a
+        // resolved 0 has may = 0.
+        llvm::Value* rmay = b_.CreateOr(rmust, b_.CreateOr(conflict, rz));
+        return packed(rmust, rmay, rz);
     }
 
     // -- Real (floating point) helpers --

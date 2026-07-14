@@ -318,6 +318,14 @@ struct Analysis {
                     val_z[raw] = z_of(p.op_type.op);
                     break;
 
+                // Wire resolution can produce genuine Z (all drivers high-Z) or
+                // X (a driver conflict) regardless of the operand domains, so
+                // its result always may carry Z — this keeps the resolved net's
+                // Z plane alive through elision.
+                case Inst::Tag::WireRes:
+                    val_z[raw] = 1;
+                    break;
+
                 // Z-absorbing ops: their lowerings emit a zero z plane (a z
                 // input reads as X through the must/may planes).
                 case Inst::Tag::Add:

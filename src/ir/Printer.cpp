@@ -183,6 +183,8 @@ const char* tag_name(Inst::Tag tag) {
             return "bxor";
         case T::Bxnor:
             return "bxnor";
+        case T::WireRes:
+            return "wire_res";
         case T::Bnot:
             return "bnot";
         case T::RedAnd:

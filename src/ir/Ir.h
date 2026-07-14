@@ -908,6 +908,16 @@ struct Inst {
         // Bitwise invert ~ (payload: unary).
         Bnot,
 
+        // Strong wire/tri multi-driver resolution of two driver values (LRM
+        // 6.6.1, no drive strengths), the lattice join z ⊑ {0,1} ⊑ x: a
+        // high-Z operand contributes nothing (identity), two operands that
+        // agree keep the value, a 0-vs-1 (or any x) conflict is x, all-z is z.
+        // Associative + commutative, so K drivers fold left through this.
+        // Result is always 4-state at the operand width (payload: binary).
+        // Emitted only by the multi-driver-net resolver (Lower.cpp
+        // emit_wire_resolvers); single-driver nets never use it.
+        WireRes,
+
         // -- Reductions, e.g. &x (payload: unary) --
         RedAnd,
         RedOr,
@@ -1535,6 +1545,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Bor:
         case T::Bxor:
         case T::Bxnor:
+        case T::WireRes:
         case T::Sll:
         case T::Srl:
         case T::Sra:
