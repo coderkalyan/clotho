@@ -739,8 +739,13 @@ private:
             if (f->hasLocalLinkage()) {
                 f->setLinkage(llvm::GlobalValue::ExternalLinkage);
             }
-            it->second = llvm::Function::Create(f->getFunctionType(), llvm::GlobalValue::ExternalLinkage,
+            auto* decl = llvm::Function::Create(f->getFunctionType(), llvm::GlobalValue::ExternalLinkage,
                                                 f->getName(), env_->llmod);
+            // Everything links into one JIT dylib: mark the declaration
+            // dso_local so codegen keeps the direct (non-GOT, non-cached)
+            // addressing form it uses for local definitions.
+            decl->setDSOLocal(true);
+            it->second = decl;
         }
         return llvm::cast<llvm::Function>(it->second);
     }
@@ -756,6 +761,7 @@ private:
             auto* decl = new llvm::GlobalVariable(env_->llmod, g->getValueType(), g->isConstant(),
                                                   llvm::GlobalValue::ExternalLinkage, nullptr, g->getName());
             decl->setAlignment(g->getAlign());
+            decl->setDSOLocal(true);
             it->second = decl;
         }
         return llvm::cast<llvm::GlobalVariable>(it->second);
