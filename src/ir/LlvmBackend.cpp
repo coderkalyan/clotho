@@ -14935,6 +14935,8 @@ private:
     llvm::StructType* elem_ops_ty_ = nullptr;
 };
 
+} // namespace
+
 // Lower the coroutine intrinsics emitted for each process and clean up the
 // generated code (tier-0 pipeline: fast compile, no loop/GVN passes). CoroSplit
 // (with CoroEarly/CoroCleanup) is mandatory: without it the llvm.coro.*
@@ -14947,8 +14949,9 @@ private:
 // no sim-time win). no-verify-fixpoint: LLVM 22
 // errors if instcombine's single iteration does not converge on our
 // non-canonical IR. Returns false (reason on errs()) only if the pipeline
-// string is rejected.
-bool lower_coroutines(llvm::Module& m, bool o3) {
+// string is rejected. Exposed (not file-local) so Jit.cpp can run it per
+// module after a bitcode context migration (parallel compilation).
+bool optimize_module(llvm::Module& m, bool o3) {
     llvm::PassBuilder         pb;
     llvm::LoopAnalysisManager     lam;
     llvm::FunctionAnalysisManager fam;
@@ -14979,10 +14982,8 @@ bool lower_coroutines(llvm::Module& m, bool o3) {
     return true;
 }
 
-} // namespace
-
-BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx,
-                          const SimulationConfig& config) {
+BuiltDesign build_modules_unoptimized(const Module& m, llvm::LLVMContext& ctx,
+                                      const SimulationConfig& config) {
     auto root = std::make_unique<llvm::Module>(m.name.empty() ? "clotho" : m.name, ctx);
 
     // Pin the modules to the host target's triple and DataLayout before any IR
@@ -15019,29 +15020,38 @@ BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx,
         return {};
     }
     built.modules.insert(built.modules.begin(), std::move(root));
-    auto& mods = built.modules;
 
-    // Verify every freshly-built (pre-split) module. With optimize off, stop
-    // here and hand back the raw modules (coro intrinsics intact).
-    for (const auto& mod : mods) {
+    // Verify every freshly-built (pre-split) module. Coro intrinsics are still
+    // intact — the caller decides whether/how to run optimize_module (build_modules
+    // does so inline below; run_jit defers it to migrate each module into its own
+    // LLVMContext first, see Jit.cpp).
+    for (const auto& mod : built.modules) {
         if (llvm::verifyModule(*mod, &llvm::errs())) {
             return {};
         }
+    }
+    return built;
+}
+
+BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx,
+                          const SimulationConfig& config) {
+    auto built = build_modules_unoptimized(m, ctx, config);
+    if (built.modules.empty()) {
+        return {};
     }
     if (!config.optimize) {
         return built;
     }
     // Lower the coroutines per module and verify again — the second pass
     // guards against malformed coro lowering.
-    for (const auto& mod : mods) {
-        if (!lower_coroutines(*mod, config.o3)) {
+    for (const auto& mod : built.modules) {
+        if (!optimize_module(*mod, config.o3)) {
             return {};
         }
         if (llvm::verifyModule(*mod, &llvm::errs())) {
             return {};
         }
     }
-
     return built;
 }
 

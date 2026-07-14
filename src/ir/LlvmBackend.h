@@ -40,6 +40,23 @@ struct BuiltDesign {
 BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx,
                           const SimulationConfig& config = {});
 
+// Same construction + first-verification pass as build_modules, but returns
+// before running optimize_module (coro intrinsics intact regardless of
+// `config.optimize`) and before the second verify. run_jit uses this to
+// migrate each module into its own LLVMContext (a bitcode round-trip, see
+// Jit.cpp) before optimizing, so unrelated modules can be optimized/codegen'd
+// concurrently — LLVMContext is not thread-safe, so this can't happen while
+// modules still share `ctx`. build_modules itself is unchanged (single shared
+// context, sequential optimize_module loop) for emit_llvm / tests.
+BuiltDesign build_modules_unoptimized(const Module& m, llvm::LLVMContext& ctx,
+                                      const SimulationConfig& config = {});
+
+// Run Clotho's coroutine-lowering pipeline (Tier 0 or, under `o3`, LLVM's
+// default<O3>) on one module in place. Returns false (reason on errs()) only
+// if the pipeline string is rejected; see build_modules for the call sequence
+// (optimize_module then re-verify).
+bool optimize_module(llvm::Module& m, bool o3);
+
 // Lower every process in `m` to an LLVM function and write textual LLVM IR to
 // `os`. Returns false (and writes the reason to llvm::errs()) if the generated
 // module fails verification; on success the IR has already been printed to `os`.
