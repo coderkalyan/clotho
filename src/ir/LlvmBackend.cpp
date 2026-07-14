@@ -479,6 +479,8 @@ struct Anchor {
     uint32_t first_proc = ~0u;
     // Reused definitions only: pointer global holding &proc_sched[first_proc],
     // stored by main; a unique definition folds to the absolute constant.
+    // Created lazily by the first group that addresses through it, so a design
+    // whose eligible groups all fuse cross-instance emits no dead symbols.
     llvm::GlobalVariable* sched_sym = nullptr;
     // Lowest VCD dump-var index of the scope's own dumped signals (-1: none).
     // Touch sites address a dumped signal as vcd base + def-local offset.
@@ -1714,12 +1716,6 @@ private:
                 a.sym = new llvm::GlobalVariable(llmod_, ptr, false, llvm::GlobalValue::InternalLinkage,
                                                  llvm::ConstantPointerNull::get(ptr),
                                                  "clotho.inst." + a.name);
-                if (a.first_proc != ~0u) {
-                    a.sched_sym = new llvm::GlobalVariable(llmod_, ptr, false,
-                                                           llvm::GlobalValue::InternalLinkage,
-                                                           llvm::ConstantPointerNull::get(ptr),
-                                                           "clotho.inst." + a.name + ".sched");
-                }
                 continue;
             }
             std::vector<llvm::Constant*> idx;
@@ -1740,9 +1736,6 @@ private:
     // constants; a dead base load in a group that ends up registering no block
     // is swept by the tier-0 dce pass.
     void materialize_group_ctx() {
-        if (blk_base_sym_ != nullptr) {
-            blk_base_val_ = b_.CreateLoad(b_.getInt32Ty(), blk_base_sym_);
-        }
         if (sched_ptr_ != nullptr) {
             return;
         }
@@ -1842,8 +1835,14 @@ private:
             }
             if (same && sc < anchor_of_scope_.size() &&
                 anchor_of_scope_[sc] != SignalSlot::no_anchor) {
-                const Anchor& a = anchors_[anchor_of_scope_[sc]];
-                if (a.sched_sym != nullptr) {
+                Anchor& a = anchors_[anchor_of_scope_[sc]];
+                if (a.indirect && a.first_proc != ~0u) {
+                    if (a.sched_sym == nullptr) {
+                        auto* ptr   = llvm::PointerType::getUnqual(ctx_);
+                        a.sched_sym = new llvm::GlobalVariable(
+                          llmod_, ptr, false, llvm::GlobalValue::InternalLinkage,
+                          llvm::ConstantPointerNull::get(ptr), "clotho.inst." + a.name + ".sched");
+                    }
                     sched_anchor_  = anchor_of_scope_[sc];
                     sched_ordinal_ = proc_index - a.first_proc;
                 }
@@ -1859,17 +1858,12 @@ private:
         // (instance block base + group-local ordinal) instead of the absolute
         // block id — identical value (a group's blocks are id-contiguous by
         // construction: block_register only runs while its group lowers), in the
-        // def-relative form a shared body needs. main stores the base after
+        // def-relative form a shared body needs. The base symbol is created at
+        // the group's first registration (no dead symbol for a block-free
+        // group) and loaded per registration; main stores the base after
         // lowering, once the ids are known.
         blk_base_sym_      = nullptr;
-        blk_base_val_      = nullptr;
         group_first_block_ = -1;
-        if (sched_anchor_ != SignalSlot::no_anchor && nba_block_enqueue_fn_ != nullptr) {
-            blk_base_sym_ = new llvm::GlobalVariable(
-              llmod_, b_.getInt32Ty(), false, llvm::GlobalValue::InternalLinkage, b_.getInt32(0),
-              "clotho.inst." + anchors_[sched_anchor_].name + ".blk.g" +
-                std::to_string(sched_ordinal_));
-        }
 
         // Name a process by its index: @<module>.p<index>. Source-offset naming
         // would collide once the design has multiple instances of one module —
@@ -2706,7 +2700,6 @@ private:
         sched_ptr_ = b_.CreateAlloca(b_.getInt32Ty(), nullptr, "task_sched");
         sched_anchor_      = SignalSlot::no_anchor;
         blk_base_sym_      = nullptr;
-        blk_base_val_      = nullptr;
         group_first_block_ = -1;
 
         auto* trap_bb    = llvm::BasicBlock::Create(ctx_, "coro.trap", fn_);
@@ -4801,13 +4794,18 @@ private:
             block_commits_.push_back({});
             cur_block_epoch_ = static_cast<int64_t>(cur_seg_epoch_);
             llvm::Value* id  = b_.getInt32(cur_block_id_);
-            if (blk_base_val_ != nullptr) {
+            if (sched_anchor_ != SignalSlot::no_anchor) {
                 if (group_first_block_ < 0) {
                     group_first_block_ = static_cast<int64_t>(cur_block_id_);
+                    blk_base_sym_      = new llvm::GlobalVariable(
+                      llmod_, b_.getInt32Ty(), false, llvm::GlobalValue::InternalLinkage,
+                      b_.getInt32(0),
+                      "clotho.inst." + anchors_[sched_anchor_].name + ".blk.g" +
+                        std::to_string(sched_ordinal_));
                     group_blk_bases_.emplace_back(blk_base_sym_, cur_block_id_);
                 }
                 id = b_.CreateAdd(
-                  blk_base_val_,
+                  b_.CreateLoad(b_.getInt32Ty(), blk_base_sym_),
                   b_.getInt32(cur_block_id_ - static_cast<uint32_t>(group_first_block_)));
             }
             b_.CreateCall(nba_block_enqueue_fn_, { id });
@@ -13681,10 +13679,10 @@ private:
     uint32_t sched_anchor_  = SignalSlot::no_anchor;
     uint32_t sched_ordinal_ = 0;
     // Def-relative NBA block-id base of the current group (see lower_group /
-    // block_register): the i32 global holding the group's first block id, its
-    // entry-materialized load, and the first id itself (-1 until a block opens).
+    // block_register): the i32 global holding the group's first block id
+    // (created at the group's first registration) and the first id itself
+    // (-1 until a block opens).
     llvm::GlobalVariable* blk_base_sym_      = nullptr;
-    llvm::Value*          blk_base_val_      = nullptr;
     int64_t               group_first_block_ = -1;
     // (base symbol, first block id) pairs main stores at startup.
     std::vector<std::pair<llvm::GlobalVariable*, uint32_t>> group_blk_bases_;
