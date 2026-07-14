@@ -987,14 +987,6 @@ private:
                                                : static_cast<const Scope&>(ct.as<slang::ast::UnpackedStructType>());
             std::vector<ir::FieldRow> fields;
             for (const auto& f : body.membersOfType<slang::ast::FieldSymbol>()) {
-                if (!is_packed && f.getType().getCanonicalType().isUnpackedUnion()) {
-                    // Unpacked unions are not lowered (packed union member access
-                    // is also guarded). Every other member type — scalar, string,
-                    // real, unpacked array, nested unpacked struct, dynamic
-                    // array, queue — is backed by the recursive aggregate
-                    // storage model.
-                    fail("unpacked union member is not supported");
-                }
                 if (!is_packed && f.getType().getCanonicalType().isEvent()) {
                     // Same as the array-of-event guard above: the member would
                     // declare as an inert 1-bit placeholder with no trigger state.
@@ -1061,6 +1053,7 @@ private:
             t.kind      = ir::Type::Kind::Struct;
             t.is_signed = ct.isSigned();
             t.is_packed = true;
+            t.is_union  = true;
             t.element   = ct.isFourState() ? module_.pool.logic_type : module_.pool.bit_type;
             t.left      = ct.getBitWidth() - 1;
             t.right     = 0;
@@ -1072,12 +1065,57 @@ private:
             return ref;
         }
         if (ct.isUnpackedUnion()) {
-            // TODO: unpacked unions (LRM 7.3) need overlapping aggregate storage —
-            // a byte blob every member reinterprets — which the sequential-field
-            // agg_storage_ty mirror does not model. A separate change; guarded
-            // loud here (and at the member-access site) so an unpacked union never
-            // lowers by accident.
-            fail("unpacked union is not supported");
+            // An unpacked union (LRM 7.3) overlays members of possibly different
+            // sizes at the same storage. LRM 7.3 does not fix a bit-level overlay
+            // for the unpacked case (unlike the packed union of 7.3.1), so Clotho
+            // picks the natural, hardware/verilator-matching one: a single flat
+            // plane value sized to the widest member, every member overlaying the
+            // least-significant bits. This lowers identically to a packed union
+            // (Kind::Struct, is_packed, all field bit_offsets 0) — a member select
+            // is a low part-select, a narrower member write leaves the high bits
+            // untouched — and so reuses the whole packed value path (storage, NBA,
+            // VCD, change detection) with no aggregate machinery. Members are
+            // restricted to integral (packed) types: a real / string / unpacked
+            // aggregate member has no flat-bit overlay and is gated loud.
+            const auto& ut = ct.as<slang::ast::UnpackedUnionType>();
+            if (ut.isTagged) {
+                // TODO: tagged unions (LRM 7.3.2) carry a member tag; no plain overlay.
+                fail("tagged union is not supported");
+            }
+            if (const auto cached = struct_type_cache_.find(&ct); cached != struct_type_cache_.end()) {
+                return cached->second;
+            }
+
+            std::vector<ir::FieldRow> fields;
+            uint32_t                  max_width = 0;
+            bool                      four      = false;
+            for (const auto& f : static_cast<const Scope&>(ut).membersOfType<slang::ast::FieldSymbol>()) {
+                const slang::ast::Type& mt = f.getType().getCanonicalType();
+                if (!mt.isIntegral()) {
+                    // TODO: unpacked-union member that is not a flat bit-vector
+                    // (real / string / unpacked struct or array / dynamic array /
+                    // queue / class) — no defined bit-level overlay (LRM 7.3).
+                    fail("unpacked union member must be an integral type");
+                }
+                max_width = std::max<uint32_t>(max_width, mt.getBitWidth());
+                four |= mt.isFourState();
+                // Every member overlays the LSB (bit_offset 0).
+                fields.push_back({ f.name, lower_type(f.getType()), 0 });
+            }
+
+            ir::Type t;
+            t.kind      = ir::Type::Kind::Struct;
+            t.is_packed = true;
+            t.is_union  = true;
+            t.element   = four ? module_.pool.logic_type : module_.pool.bit_type;
+            t.left      = max_width - 1;
+            t.right     = 0;
+            t.fields_id = module_.pool.intern_struct_fields(std::move(fields));
+
+            const ir::Ref ref = module_.pool.put(ir::Item{ t });
+            struct_type_cache_.emplace(&ct, ref);
+
+            return ref;
         }
         if (ct.isEvent()) {
             // Named event (LRM 15.5): no data value. Modeled as a 1-bit logic
@@ -8476,18 +8514,15 @@ private:
             // TODO: non-field member access (interface modports, ...) — not lowered.
             fail("unsupported member access");
         }
-        if (ma.value().type->isUnpackedUnion()) {
-            // TODO: unpacked unions need overlapping aggregate storage (a byte
-            // blob every member reinterprets), which the sequential-field
-            // agg_storage_ty mirror does not model. A separate change.
-            fail("unpacked union member access is not supported");
-        }
-        // A packed union member sits at bit_offset 0 (all members overlay the LSB),
-        // so it flows to the packed part-select path below unchanged.
+        // A packed or unpacked union member sits at bit_offset 0 (all members
+        // overlay the LSB), so it flows to the flat part-select path below — an
+        // unpacked union lowers to the same flat plane value as a packed union
+        // (max member width / domain), just with possibly-different member widths.
         const ir::Index base = lower_lvalue(ma.value(), b);
         // An unpacked struct is an aggregate: the member is addressed by field
-        // index (MemberSelect -> struct GEP), not a bit range. A packed struct is
-        // a flat bit-vector, so the member is a constant part-select.
+        // index (MemberSelect -> struct GEP), not a bit range. A packed struct/union
+        // (and an unpacked union) is a flat bit-vector, so the member is a constant
+        // part-select.
         if (ma.value().type->getCanonicalType().isUnpackedStruct()) {
             return b.member_select(base, field->fieldIndex, lower_type(*ma.value().type), l);
         }

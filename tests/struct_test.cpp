@@ -245,15 +245,70 @@ TEST_CASE("tagged union is rejected loudly") {
     CHECK(r.diagnostics.find("tagged union is not supported") != std::string::npos);
 }
 
-TEST_CASE("unpacked union is rejected loudly") {
+TEST_CASE("unpacked union overlays members at the LSB (flat value, LRM 7.3)") {
+    // An unpacked union lowers to a flat plane value sized to the widest member,
+    // every member overlaying the low bits. A narrower member write leaves the
+    // high bits untouched. Byte-identical to verilator (iverilog has no unpacked
+    // union / struct support).
+    CHECK(run_capture(R"(
+        module m;
+            typedef union {
+                logic [31:0] word;
+                struct packed { logic [15:0] hi; logic [15:0] lo; } halves;
+                byte b;
+            } u_t;
+            u_t u;
+            initial begin
+                u.word = 32'hDEAD_BEEF;
+                $display("word=%h hi=%h lo=%h", u.word, u.halves.hi, u.halves.lo);
+                u.halves.hi = 16'h1234;
+                $display("word=%h", u.word);
+                u.b = 8'h77;
+                $display("word=%h b=%h", u.word, u.b);
+            end
+        endmodule
+    )") == "word=deadbeef hi=dead lo=beef\nword=1234beef\nword=1234be77 b=77\n");
+}
+
+TEST_CASE("unpacked union: whole-union copy and nesting in an unpacked struct") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef union { logic [31:0] w; logic [7:0] b; } u_t;
+            typedef struct { logic [7:0] tag; u_t payload; } wrap_t;
+            u_t u1, u2;
+            wrap_t wr;
+            initial begin
+                u1.w = 32'h10;
+                u2   = u1;
+                $display("u2.w=%h u2.b=%h", u2.w, u2.b);
+                wr.tag       = 8'hA5;
+                wr.payload.w = 32'h0000_FFFF;
+                $display("tag=%h w=%h b=%h", wr.tag, wr.payload.w, wr.payload.b);
+            end
+        endmodule
+    )") == "u2.w=00000010 u2.b=10\ntag=a5 w=0000ffff b=ff\n");
+}
+
+TEST_CASE("unpacked union member must be integral") {
     const LowerResult r = lower_text(R"(
         module m;
-            union { int a; byte b; } u;
-            initial u.a = 5;
+            union { logic [31:0] w; real r; } u;
+            initial u.w = 1;
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("unpacked union is not supported") != std::string::npos);
+    CHECK(r.diagnostics.find("unpacked union member must be an integral type") != std::string::npos);
+}
+
+TEST_CASE("tagged unpacked union is rejected loudly") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            union tagged { logic [7:0] a; logic [7:0] b; } u;
+            initial u.a = 8'hAB;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("tagged union is not supported") != std::string::npos);
 }
 
 TEST_CASE("blocking read and write of unpacked struct members") {

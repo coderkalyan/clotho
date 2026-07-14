@@ -132,9 +132,12 @@ struct Type {
     // Kind::Struct only: true for a packed struct/union (bit-vector value
     // semantics), false for unpacked (aggregate storage).
     bool is_packed = false;
-    // Explicit padding, always 0, so Type has unique object representations
-    // (its bytes hash / compare / serialize directly).
-    uint8_t reserved = 0;
+    // Kind::Struct only: true for a union (LRM 7.3) — every member overlays the
+    // same storage. A packed union shares the flat-bit-vector path (all field
+    // bit_offsets 0); an unpacked union is a byte blob sized to its largest
+    // member that a member select re-roots into. Zero for a struct/class, so
+    // Type stays padding-free (unique object representations).
+    bool is_union = false;
     // Element type, for PackedArray / UnpackedArray, and packed Struct (the
     // scalar - logic or bit - whose domain the whole packed value shares).
     Ref element = Ref::Invalid;
