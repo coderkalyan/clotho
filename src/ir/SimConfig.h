@@ -62,6 +62,14 @@ struct SimulationConfig {
     // literal post-lowering IR identity, so semantics are byte-identical
     // either way. Disable for bisection / debugging.
     bool dedup = true;
+    // Emit one llvm::Module per elaborated definition (unit = the definition
+    // state-struct identity) holding its single-scope process groups, plus a
+    // root module with everything else (state globals, scheduler machinery,
+    // functions/tasks, cross-instance groups, main). Prep for per-definition
+    // object caching; the JIT links the set into one dylib, so semantics are
+    // identical either way. Disable for bisection / debugging (one module,
+    // exactly the pre-split emission).
+    bool split = true;
     // Register LLVM's perf JITEventListener on the object-linking layer so the
     // JIT'd design's functions show up in `perf` with real symbols. Emits a
     // jitdump (`$JITDUMPDIR/jit-<pid>.dump`) consumed by `perf inject --jit`.

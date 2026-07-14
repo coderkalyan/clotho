@@ -583,9 +583,16 @@ public:
     Backend(const Module& mod, llvm::LLVMContext& ctx, llvm::Module& llmod, const SimulationConfig& config)
       : mod_(mod)
       , ctx_(ctx)
-      , env_{ llmod, {} }
+      , root_env_(std::make_unique<ModuleEnv>(llmod))
+      , env_(root_env_.get())
       , b_(ctx)
       , config_(config) {}
+
+    // Definition-unit modules created by the split emission (lower_group loop),
+    // in creation order. The caller links them alongside the root module.
+    std::vector<std::unique_ptr<llvm::Module>> take_unit_modules() {
+        return std::move(unit_modules_);
+    }
 
     void run() {
         build_state_types();
@@ -630,9 +637,13 @@ public:
         // continuous `assign`, whose RHS sensitivity is not yet inferred) still
         // runs its body just once — it does not re-trigger on input changes.
         std::vector<llvm::Function*> group_fns;
-        for (const std::vector<uint32_t>& g : groups_) {
-            group_fns.push_back(lower_group(g));
+        for (uint32_t g = 0; g < groups_.size(); ++g) {
+            const uint32_t ua = group_unit_anchor_[g];
+            env_ = config_.split && ua != SignalSlot::no_anchor ? &unit_env(anchors_[ua])
+                                                                : root_env_.get();
+            group_fns.push_back(lower_group(groups_[g]));
         }
+        env_ = root_env_.get();
         if (!shape_sets_.empty()) {
             report_dedup_shapes(group_fns);
         }
@@ -680,13 +691,13 @@ public:
             }
             Anchor& an  = anchors_[a];
             an.sched_ty = llvm::ArrayType::get(i32, owned[a]);
-            an.sched_gv = new llvm::GlobalVariable(env_.llmod, an.sched_ty, false,
+            an.sched_gv = new llvm::GlobalVariable(env_->llmod, an.sched_ty, false,
                                                    llvm::GlobalValue::InternalLinkage,
                                                    llvm::ConstantAggregateZero::get(an.sched_ty),
                                                    "clotho.inst." + an.name + ".sched");
         }
         sched_arr_ty_ = llvm::ArrayType::get(i32, std::max<uint32_t>(n_root, 1));
-        sched_gv_     = new llvm::GlobalVariable(env_.llmod, sched_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
+        sched_gv_     = new llvm::GlobalVariable(env_->llmod, sched_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
                                                  llvm::ConstantAggregateZero::get(sched_arr_ty_), "clotho.proc_sched");
     }
 
@@ -705,32 +716,60 @@ private:
     // Use a global (defined in whichever unit created it) as an operand in the
     // module currently being emitted. Identity while the definition is local —
     // always the case with one design-wide unit — otherwise a matching external
-    // declaration created once per (env, symbol) and memoized in env_.decls.
+    // declaration created once per (env, symbol) and memoized in env_->decls.
     // Every use of a cached GlobalVariable*/Function* member as an IR operand
     // must route through here so the per-definition split can relink it.
     llvm::Function* sym(llvm::Function* f) {
-        if (f->getParent() == &env_.llmod) {
+        if (f->getParent() == &env_->llmod) {
             return f;
         }
-        auto [it, inserted] = env_.decls.try_emplace(f, nullptr);
+        auto [it, inserted] = env_->decls.try_emplace(f, nullptr);
         if (inserted) {
+            // First cross-unit use: the definition must be visible to the JIT
+            // linker, so promote it out of local linkage.
+            if (f->hasLocalLinkage()) {
+                f->setLinkage(llvm::GlobalValue::ExternalLinkage);
+            }
             it->second = llvm::Function::Create(f->getFunctionType(), llvm::GlobalValue::ExternalLinkage,
-                                                f->getName(), env_.llmod);
+                                                f->getName(), env_->llmod);
         }
         return llvm::cast<llvm::Function>(it->second);
     }
     llvm::GlobalVariable* sym(llvm::GlobalVariable* g) {
-        if (g->getParent() == &env_.llmod) {
+        if (g->getParent() == &env_->llmod) {
             return g;
         }
-        auto [it, inserted] = env_.decls.try_emplace(g, nullptr);
+        auto [it, inserted] = env_->decls.try_emplace(g, nullptr);
         if (inserted) {
-            auto* decl = new llvm::GlobalVariable(env_.llmod, g->getValueType(), g->isConstant(),
+            if (g->hasLocalLinkage()) {
+                g->setLinkage(llvm::GlobalValue::ExternalLinkage);
+            }
+            auto* decl = new llvm::GlobalVariable(env_->llmod, g->getValueType(), g->isConstant(),
                                                   llvm::GlobalValue::ExternalLinkage, nullptr, g->getName());
             decl->setAlignment(g->getAlign());
             it->second = decl;
         }
         return llvm::cast<llvm::GlobalVariable>(it->second);
+    }
+
+    // The definition unit's env for an anchored scope, created (with its
+    // llvm::Module) on first use. Units are keyed by definition state-struct
+    // identity: twin instances of one definition land in one unit.
+    ModuleEnv& unit_env(const Anchor& a) {
+        auto [it, inserted] = unit_env_of_.try_emplace(a.ty, nullptr);
+        if (inserted) {
+            std::string name = a.ty->getName().str();
+            if (name.ends_with(".state")) {
+                name.resize(name.size() - 6);
+            }
+            auto m = std::make_unique<llvm::Module>("clotho.def." + name, ctx_);
+            m->setTargetTriple(root_env_->llmod.getTargetTriple());
+            m->setDataLayout(root_env_->llmod.getDataLayout());
+            unit_envs_.push_back(std::make_unique<ModuleEnv>(*m));
+            unit_modules_.push_back(std::move(m));
+            it->second = unit_envs_.back().get();
+        }
+        return *it->second;
     }
 
     // -- LLVM type helpers --
@@ -859,7 +898,7 @@ private:
 
     // Byte size of one element slot (the runtime stride).
     uint64_t dynarr_stride(const DynElem& e) {
-        return env_.llmod.getDataLayout().getTypeAllocSize(e.slot_ty);
+        return env_->llmod.getDataLayout().getTypeAllocSize(e.slot_ty);
     }
 
     // The rt_elem_ops mirror type:
@@ -903,8 +942,8 @@ private:
     // so no leaf table is ever emitted yet.
     llvm::Constant* elem_ops_global(Ref container_type) {
         const Type& at = std::get<Type>(mod_.pool.get(container_type));
-        if (const auto it = env_.elem_ops.find(static_cast<uint32_t>(at.element));
-            it != env_.elem_ops.end()) {
+        if (const auto it = env_->elem_ops.find(static_cast<uint32_t>(at.element));
+            it != env_->elem_ops.end()) {
             return it->second;
         }
         const DynElem e     = dynarr_elem(container_type);
@@ -917,17 +956,17 @@ private:
             kind  = et.kind == Type::Kind::DynArray ? 2 : 3;
             inner = elem_ops_global(at.element);
         }
-        auto* proto = new llvm::GlobalVariable(env_.llmod, e.slot_ty, /*isConstant=*/true,
+        auto* proto = new llvm::GlobalVariable(env_->llmod, e.slot_ty, /*isConstant=*/true,
                                                llvm::GlobalValue::InternalLinkage,
                                                elem_proto_const(e), "clotho.elem.proto");
         auto* init = llvm::ConstantStruct::get(
           elem_ops_ty(),
           { b_.getInt32(kind), b_.getInt32(0), b_.getInt64(dynarr_stride(e)), proto, inner,
             llvm::Constant::getNullValue(raw_ptr_ty()) });
-        auto* gv = new llvm::GlobalVariable(env_.llmod, elem_ops_ty(), /*isConstant=*/true,
+        auto* gv = new llvm::GlobalVariable(env_->llmod, elem_ops_ty(), /*isConstant=*/true,
                                             llvm::GlobalValue::InternalLinkage, init,
                                             "clotho.elem.ops");
-        env_.elem_ops.emplace(static_cast<uint32_t>(at.element), gv);
+        env_->elem_ops.emplace(static_cast<uint32_t>(at.element), gv);
         return gv;
     }
 
@@ -1158,8 +1197,8 @@ private:
     // trivially copyable (no heap-owning leaf), so its byte image is the value.
     void emit_agg_storage_copy(llvm::Value* dst, llvm::Value* src, Ref type) {
         llvm::Type* st = agg_storage_ty(type);
-        const auto  sz = env_.llmod.getDataLayout().getTypeAllocSize(st);
-        const auto  al = env_.llmod.getDataLayout().getABITypeAlign(st);
+        const auto  sz = env_->llmod.getDataLayout().getTypeAllocSize(st);
+        const auto  al = env_->llmod.getDataLayout().getABITypeAlign(st);
         b_.CreateMemCpy(dst, al, src, al, sz);
     }
 
@@ -1854,7 +1893,7 @@ private:
     llvm::GlobalVariable* anchor_shadow_base(Anchor& a) {
         if (a.shadow_base_gv == nullptr) {
             auto* ptr        = llvm::PointerType::getUnqual(ctx_);
-            a.shadow_base_gv = new llvm::GlobalVariable(env_.llmod, ptr, false,
+            a.shadow_base_gv = new llvm::GlobalVariable(env_->llmod, ptr, false,
                                                         llvm::GlobalValue::InternalLinkage,
                                                         llvm::ConstantPointerNull::get(ptr),
                                                         "clotho.inst." + a.name + ".shadow_base");
@@ -1872,14 +1911,14 @@ private:
     // (ensure_ctx), which main fills at startup before init_state and every
     // process.
     void emit_state_global() {
-        auto* state_gv = new llvm::GlobalVariable(env_.llmod, state_ty_, false,
+        auto* state_gv = new llvm::GlobalVariable(env_->llmod, state_ty_, false,
                                                   llvm::GlobalValue::InternalLinkage,
                                                   root_state_initializer(), "clotho.state");
         state_gv->setAlignment(llvm::Align(64));
         state_global_ = state_gv;
 
         for (Anchor& a : anchors_) {
-            a.state_gv = new llvm::GlobalVariable(env_.llmod, a.ty, false,
+            a.state_gv = new llvm::GlobalVariable(env_->llmod, a.ty, false,
                                                   llvm::GlobalValue::InternalLinkage,
                                                   scope_state_initializer(a),
                                                   "clotho.inst." + a.name + ".state");
@@ -1890,14 +1929,14 @@ private:
 
         for (Anchor& a : anchors_) {
             if (a.shadow_ty != nullptr) {
-                a.shadow_gv = new llvm::GlobalVariable(env_.llmod, a.shadow_ty, false,
+                a.shadow_gv = new llvm::GlobalVariable(env_->llmod, a.shadow_ty, false,
                                                        llvm::GlobalValue::InternalLinkage,
                                                        llvm::ConstantAggregateZero::get(a.shadow_ty),
                                                        "clotho.inst." + a.name + ".shadow");
             }
         }
         if (shadow_ty_ != nullptr) {
-            shadow_global_ = new llvm::GlobalVariable(env_.llmod, shadow_ty_, false,
+            shadow_global_ = new llvm::GlobalVariable(env_->llmod, shadow_ty_, false,
                                                       llvm::GlobalValue::InternalLinkage,
                                                       llvm::ConstantAggregateZero::get(shadow_ty_),
                                                       "clotho.nba.shadow");
@@ -1921,7 +1960,7 @@ private:
     // def-relatively materialize a global (and a fill in main).
     llvm::GlobalVariable* ensure_ctx(Anchor& a) {
         if (a.ctx_gv == nullptr) {
-            a.ctx_gv = new llvm::GlobalVariable(env_.llmod, a.ctx_ty, false,
+            a.ctx_gv = new llvm::GlobalVariable(env_->llmod, a.ctx_ty, false,
                                                 llvm::GlobalValue::InternalLinkage,
                                                 llvm::ConstantAggregateZero::get(a.ctx_ty),
                                                 "clotho.inst." + a.name + ".ctx");
@@ -1957,7 +1996,7 @@ private:
     llvm::GlobalVariable* shadow_base_gv() {
         if (shadow_base_gv_ == nullptr) {
             auto* ptr       = llvm::PointerType::getUnqual(ctx_);
-            shadow_base_gv_ = new llvm::GlobalVariable(env_.llmod, ptr, false, llvm::GlobalValue::InternalLinkage,
+            shadow_base_gv_ = new llvm::GlobalVariable(env_->llmod, ptr, false, llvm::GlobalValue::InternalLinkage,
                                                        llvm::ConstantPointerNull::get(ptr), "clotho.nba.shadow_base");
         }
         return sym(shadow_base_gv_);
@@ -2082,7 +2121,7 @@ private:
         if (thunk_group_[group_of_[proc_index]]) {
             auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
             auto* fnty   = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
-            fn_ = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name + ".thunk", env_.llmod);
+            fn_ = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name + ".thunk", env_->llmod);
             state_ = fn_->getArg(0);
             state_->setName("state");
             wheel_ = fn_->getArg(1);
@@ -2170,7 +2209,7 @@ private:
         // straight to the final suspend, exactly like the old plain function.
         auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
         auto* fnty   = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
-        fn_          = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name, env_.llmod);
+        fn_          = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name, env_->llmod);
         // Mark it pre-split so the CoroSplit pass picks it up.
         fn_->setPresplitCoroutine();
         state_ = fn_->getArg(0);
@@ -2426,7 +2465,7 @@ private:
             params.push_back(by_ptr ? ptr : dpi_c_llvm_ty(ct));
         }
         auto* fnty   = llvm::FunctionType::get(dpi_c_llvm_ty(f.dpi_ret_ctype), params, false);
-        auto  callee = env_.llmod.getOrInsertFunction(f.extern_name, fnty);
+        auto  callee = env_->llmod.getOrInsertFunction(f.extern_name, fnty);
         auto* fn     = llvm::dyn_cast<llvm::Function>(callee.getCallee());
         if (fn == nullptr) {
             throw BackendError{ "DPI import '" + f.extern_name +
@@ -2497,7 +2536,7 @@ private:
         }
         auto* fnty = llvm::FunctionType::get(rty, params, false);
         auto* fn   = llvm::Function::Create(fnty, llvm::Function::InternalLinkage,
-                                            mod_.name + ".fn." + f.name, env_.llmod);
+                                            mod_.name + ".fn." + f.name, env_->llmod);
         fn->addParamAttr(0, llvm::Attribute::NoAlias);
         return fn;
     }
@@ -2537,7 +2576,7 @@ private:
         params.push_back(ptr); // record { ptr parent }
         auto* fnty = llvm::FunctionType::get(ptr, params, false);
         auto* fn   = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage,
-                                            mod_.name + ".task." + f.name, env_.llmod);
+                                            mod_.name + ".task." + f.name, env_->llmod);
         fn->setPresplitCoroutine();
         fn->addParamAttr(0, llvm::Attribute::NoAlias);
         return fn;
@@ -3095,7 +3134,7 @@ private:
         }
         auto* ptr   = llvm::PointerType::getUnqual(ctx_);
         auto* fnty  = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
-        enqueue_fn_ = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, "clotho.enqueue_timer", env_.llmod);
+        enqueue_fn_ = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, "clotho.enqueue_timer", env_->llmod);
 
         llvm::IRBuilder<> tb(ctx_);
         tb.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", enqueue_fn_));
@@ -3284,20 +3323,20 @@ private:
         // $finish catch — a $finish longjmps back into rt_sim_run, which sits below
         // main's frame, so the heap state pointer and the wheel alloca stay live
         // and the final blocks still observe the settled design state.
-        auto* drain = llvm::Function::Create(subfnty, llvm::Function::InternalLinkage, "sim_drain", env_.llmod);
+        auto* drain = llvm::Function::Create(subfnty, llvm::Function::InternalLinkage, "sim_drain", env_->llmod);
         b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", drain));
         emit_active_run(drain->getArg(0), drain->getArg(1), procs);
         b_.CreateRetVoid();
 
         // sim_finals(state, wheel): run every `final` block once.
-        auto* finals = llvm::Function::Create(subfnty, llvm::Function::InternalLinkage, "sim_finals", env_.llmod);
+        auto* finals = llvm::Function::Create(subfnty, llvm::Function::InternalLinkage, "sim_finals", env_->llmod);
         b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", finals));
         emit_finals_run(finals->getArg(0), finals->getArg(1), procs);
         b_.CreateRetVoid();
 
         auto* i32  = llvm::Type::getInt32Ty(ctx_);
         auto* fnty = llvm::FunctionType::get(i32, false);
-        auto* main = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, "main", env_.llmod);
+        auto* main = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, "main", env_->llmod);
 
         auto* entry = llvm::BasicBlock::Create(ctx_, "entry", main);
         b_.SetInsertPoint(entry);
@@ -3618,14 +3657,14 @@ private:
                 // Never-triggered sentinel: UINT64_MAX never equals a real tick,
                 // so `.triggered` reads 0 until the first `-> e`.
                 event_trig_gv_[i] = new llvm::GlobalVariable(
-                  env_.llmod, i64, false, llvm::GlobalValue::InternalLinkage,
+                  env_->llmod, i64, false, llvm::GlobalValue::InternalLinkage,
                   llvm::ConstantInt::get(i64, ~uint64_t{ 0 }),
                   "clotho.event_trig." + sigs[i].name);
                 // Nonblocking-trigger pending flag (`->> e`), cleared in the NBA
                 // region. Allocated for every event; the NBA scan only visits the
                 // ones actually `->>`-triggered (nb_event_sigs_).
                 event_pending_gv_[i] = new llvm::GlobalVariable(
-                  env_.llmod, i8, false, llvm::GlobalValue::InternalLinkage,
+                  env_->llmod, i8, false, llvm::GlobalValue::InternalLinkage,
                   llvm::ConstantInt::get(i8, 0), "clotho.event_pending." + sigs[i].name);
             }
             for (uint32_t e = 0; e < 3; ++e) {
@@ -3635,17 +3674,17 @@ private:
                     wait_sta_ty_[i][e]  = arr;
                     wait_sta_cap_[i][e] = c.sta[i][e];
                     wait_sta_gv_[i][e]  = new llvm::GlobalVariable(
-                      env_.llmod, arr, false, llvm::GlobalValue::InternalLinkage,
+                      env_->llmod, arr, false, llvm::GlobalValue::InternalLinkage,
                       llvm::ConstantAggregateZero::get(arr), base + "sta." + edge_suffix(e));
                 }
                 if (c.dyn[i][e] > 0) {
                     auto* arr          = llvm::ArrayType::get(elem, c.dyn[i][e]);
                     wait_dyn_ty_[i][e] = arr;
                     wait_dyn_gv_[i][e] = new llvm::GlobalVariable(
-                      env_.llmod, arr, false, llvm::GlobalValue::InternalLinkage,
+                      env_->llmod, arr, false, llvm::GlobalValue::InternalLinkage,
                       llvm::ConstantAggregateZero::get(arr), base + "dyn." + edge_suffix(e));
                     wait_dyn_len_gv_[i][e] = new llvm::GlobalVariable(
-                      env_.llmod, i32, false, llvm::GlobalValue::InternalLinkage,
+                      env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
                       llvm::ConstantInt::get(i32, 0), base + "dyn." + edge_suffix(e) + ".len");
                 }
             }
@@ -3692,6 +3731,7 @@ private:
         const auto all = mod_.processes();
         group_anchor_of_.assign(groups_.size(), SignalSlot::no_anchor);
         group_def_ordinal_.assign(groups_.size(), ~0u);
+        group_unit_anchor_.assign(groups_.size(), SignalSlot::no_anchor);
         std::vector<uint32_t> scope_counter(anchors_.size(), 0);
         for (uint32_t g = 0; g < groups_.size(); ++g) {
             const uint32_t sc   = all[groups_[g].front()].scope;
@@ -3704,6 +3744,9 @@ private:
                 continue;
             }
             const uint32_t aid = anchor_of_scope_[sc];
+            // Any single-scope group belongs to its definition's emission
+            // unit (split mode), whether or not the definition is reused.
+            group_unit_anchor_[g] = aid;
             if (!anchors_[aid].indirect || anchors_[aid].first_proc == ~0u) {
                 continue;
             }
@@ -4556,7 +4599,7 @@ private:
     // undoing the compile-time win.
     llvm::Function* clone_with_ctx_param(llvm::Function* rep, llvm::GlobalVariable* ctx_gv) {
         auto* shared = llvm::Function::Create(rep->getFunctionType(), llvm::Function::InternalLinkage,
-                                              rep->getName() + ".shared", env_.llmod);
+                                              rep->getName() + ".shared", *rep->getParent());
         llvm::ValueToValueMapTy vmap;
         auto                    ni = shared->arg_begin();
         for (llvm::Argument& a : rep->args()) {
@@ -4672,7 +4715,7 @@ private:
             const Anchor& a = anchors_[group_anchor_of_[g]];
             pre[PreKey{ a.ctx_ty, bbs << 24 | insts << 40 }].push_back({ g, ctx });
         }
-        llvm::ModuleSlotTracker mst(&env_.llmod, /*ShouldInitializeAllMetadata=*/false);
+        llvm::ModuleSlotTracker mst(&env_->llmod, /*ShouldInitializeAllMetadata=*/false);
         ankerl::unordered_dense::map<std::string, std::vector<Cand>> buckets;
         for (auto& [pk, cs] : pre) {
             if (cs.size() < 2) {
@@ -5337,11 +5380,11 @@ private:
         auto* i64   = llvm::Type::getInt64Ty(ctx_);
         auto* i32t  = llvm::Type::getInt32Ty(ctx_);
         dom_cnt_ty_ = llvm::ArrayType::get(i64, std::max<uint32_t>(ngroups, 1));
-        dom_nfast_gv_ = new llvm::GlobalVariable(env_.llmod, dom_cnt_ty_, false, llvm::GlobalValue::ExternalLinkage,
+        dom_nfast_gv_ = new llvm::GlobalVariable(env_->llmod, dom_cnt_ty_, false, llvm::GlobalValue::ExternalLinkage,
                                                  llvm::ConstantAggregateZero::get(dom_cnt_ty_), "clotho.dom_nfast");
-        dom_ngen_gv_ = new llvm::GlobalVariable(env_.llmod, dom_cnt_ty_, false, llvm::GlobalValue::ExternalLinkage,
+        dom_ngen_gv_ = new llvm::GlobalVariable(env_->llmod, dom_cnt_ty_, false, llvm::GlobalValue::ExternalLinkage,
                                                 llvm::ConstantAggregateZero::get(dom_cnt_ty_), "clotho.dom_ngen");
-        new llvm::GlobalVariable(env_.llmod, i32t, true, llvm::GlobalValue::ExternalLinkage,
+        new llvm::GlobalVariable(env_->llmod, i32t, true, llvm::GlobalValue::ExternalLinkage,
                                  llvm::ConstantInt::get(i32t, ngroups), "clotho.dom_ngroups");
     }
 
@@ -5401,14 +5444,14 @@ private:
             metas.push_back(llvm::ConstantAggregateZero::get(nba_meta_ty_));
         }
         nba_meta_arr_ty_ = llvm::ArrayType::get(nba_meta_ty_, metas.size());
-        nba_meta_gv_     = new llvm::GlobalVariable(env_.llmod, nba_meta_arr_ty_, true, llvm::GlobalValue::InternalLinkage,
+        nba_meta_gv_     = new llvm::GlobalVariable(env_->llmod, nba_meta_arr_ty_, true, llvm::GlobalValue::InternalLinkage,
                                                     llvm::ConstantArray::get(nba_meta_arr_ty_, metas), "clotho.nba_meta");
 
         // Parallel dump-var index array (nba_id order), consumed by the commit loop
         // to mark committed signals dirty in the VCD dirty set.
         if (design_uses_vcd_ && !nba_vcd.empty()) {
             auto* ty    = llvm::ArrayType::get(i32, nba_vcd.size());
-            nba_vcd_gv_ = new llvm::GlobalVariable(env_.llmod, ty, true, llvm::GlobalValue::InternalLinkage,
+            nba_vcd_gv_ = new llvm::GlobalVariable(env_->llmod, ty, true, llvm::GlobalValue::InternalLinkage,
                                                    llvm::ConstantArray::get(ty, nba_vcd), "clotho.nba_vcd");
         }
 
@@ -5420,7 +5463,7 @@ private:
         if (any_block) {
             auto* fnty = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx_), { i32 }, false);
             nba_block_enqueue_fn_ =
-              llvm::Function::Create(fnty, llvm::Function::InternalLinkage, "clotho.nba_block_enqueue", env_.llmod);
+              llvm::Function::Create(fnty, llvm::Function::InternalLinkage, "clotho.nba_block_enqueue", env_->llmod);
         }
     }
 
@@ -5502,7 +5545,7 @@ private:
         auto* ptr    = llvm::PointerType::getUnqual(ctx_);
         auto* fnty   = llvm::FunctionType::get(voidty, { ptr }, false);
         auto* fn     = llvm::Function::Create(fnty, llvm::Function::InternalLinkage,
-                                              "clotho.nba.commit_blk" + std::to_string(id), env_.llmod);
+                                              "clotho.nba.commit_blk" + std::to_string(id), env_->llmod);
         block_commits_[id].fn = fn;
 
         // Save/restore the builder + current-state pointer: storage_ptr / shadow_ptr
@@ -5668,10 +5711,10 @@ private:
         // to null (empty chain).
         block_next_ty_ = llvm::ArrayType::get(ptr, n);
         block_next_gv_ = new llvm::GlobalVariable(
-          env_.llmod, block_next_ty_, false, llvm::GlobalValue::InternalLinkage,
+          env_->llmod, block_next_ty_, false, llvm::GlobalValue::InternalLinkage,
           llvm::ConstantArray::get(block_next_ty_, std::vector<llvm::Constant*>(n, block_not_queued())),
           "clotho.nba_block_next");
-        block_head_gv_ = new llvm::GlobalVariable(env_.llmod, ptr, false, llvm::GlobalValue::InternalLinkage,
+        block_head_gv_ = new llvm::GlobalVariable(env_->llmod, ptr, false, llvm::GlobalValue::InternalLinkage,
                                                   llvm::ConstantPointerNull::get(ptr), "clotho.nba_block_head");
 
         std::vector<llvm::Constant*> fns;
@@ -5683,7 +5726,7 @@ private:
             fns.push_back(llvm::ConstantPointerNull::get(ptr));
         }
         block_commit_fns_ty_ = llvm::ArrayType::get(ptr, fns.size());
-        block_commit_fns_gv_ = new llvm::GlobalVariable(env_.llmod, block_commit_fns_ty_, true,
+        block_commit_fns_gv_ = new llvm::GlobalVariable(env_->llmod, block_commit_fns_ty_, true,
                                                         llvm::GlobalValue::InternalLinkage,
                                                         llvm::ConstantArray::get(block_commit_fns_ty_, fns),
                                                         "clotho.nba_block_commit_fns");
@@ -5742,7 +5785,7 @@ private:
         llvm::Value*      mm_ptr = b_.CreateStructGEP(s.slot_ty, storage_ptr(s), 0);
         return b_.CreateAlignedLoad(
           int_ty(2 * s.width), mm_ptr,
-          env_.llmod.getDataLayout().getABITypeAlign(int_ty(2 * s.width)));
+          env_->llmod.getDataLayout().getABITypeAlign(int_ty(2 * s.width)));
     }
 
     // Load the packed must|may word of an lvalue's selected storage: the whole
@@ -5987,7 +6030,7 @@ private:
         for (const Signal sig : nb_delay_event_sigs_) {
             const auto i  = static_cast<uint32_t>(sig);
             auto*      fn = llvm::Function::Create(fnty, llvm::Function::InternalLinkage,
-                                                   "clotho.ev_delay." + mod_.signal(sig).name, env_.llmod);
+                                                   "clotho.ev_delay." + mod_.signal(sig).name, env_->llmod);
             event_delay_thunk_[i] = fn;
             b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn));
             emit_event_fire(sig, fn->getArg(1));         // ctx (arg 1) is the wheel
@@ -6128,13 +6171,13 @@ private:
         active_mask_   = static_cast<uint32_t>(cap - 1);
 
         queue_arr_ty_ = llvm::ArrayType::get(ptr_ty, cap);
-        active_gv_    = new llvm::GlobalVariable(env_.llmod, queue_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
+        active_gv_    = new llvm::GlobalVariable(env_->llmod, queue_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
                                                  llvm::ConstantAggregateZero::get(queue_arr_ty_), "clotho.active");
         // Ring indices: pop at head, push at tail, empty iff equal. Monotone
         // u32s (masked on access), so u32 wraparound is harmless.
-        active_head_gv_ = new llvm::GlobalVariable(env_.llmod, i32, false, llvm::GlobalValue::InternalLinkage,
+        active_head_gv_ = new llvm::GlobalVariable(env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
                                                    llvm::ConstantInt::get(i32, 0), "clotho.active_head");
-        active_tail_gv_ = new llvm::GlobalVariable(env_.llmod, i32, false, llvm::GlobalValue::InternalLinkage,
+        active_tail_gv_ = new llvm::GlobalVariable(env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
                                                    llvm::ConstantInt::get(i32, 0), "clotho.active_tail");
     }
 
@@ -6147,9 +6190,9 @@ private:
         }
         ensure_active_queue(); // queue_arr_ty_ is shared by both queues
         auto* i32    = llvm::Type::getInt32Ty(ctx_);
-        inactive_gv_ = new llvm::GlobalVariable(env_.llmod, queue_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
+        inactive_gv_ = new llvm::GlobalVariable(env_->llmod, queue_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
                                                 llvm::ConstantAggregateZero::get(queue_arr_ty_), "clotho.inactive");
-        inactive_top_gv_ = new llvm::GlobalVariable(env_.llmod, i32, false, llvm::GlobalValue::InternalLinkage,
+        inactive_top_gv_ = new llvm::GlobalVariable(env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
                                                     llvm::ConstantInt::get(i32, 0), "clotho.inactive_top");
     }
 
@@ -6700,7 +6743,7 @@ private:
     // Declare (or fetch) an llvm.coro.* intrinsic. `tys` supplies the overload
     // type for the few overloaded ones (e.g. coro.size -> i64).
     llvm::Function* coro_intr(llvm::Intrinsic::ID id, llvm::ArrayRef<llvm::Type*> tys = {}) {
-        return llvm::Intrinsic::getOrInsertDeclaration(&env_.llmod, id, tys);
+        return llvm::Intrinsic::getOrInsertDeclaration(&env_->llmod, id, tys);
     }
 
     // -- Runtime ABI (runtime/Runtime.h C ABI) --
@@ -6711,7 +6754,7 @@ private:
     // carries a comment only where the C signature is not obvious from it.
 
     llvm::FunctionCallee rt_fn(const char* name, llvm::Type* ret, llvm::ArrayRef<llvm::Type*> params) {
-        return env_.llmod.getOrInsertFunction(name, llvm::FunctionType::get(ret, params, false));
+        return env_->llmod.getOrInsertFunction(name, llvm::FunctionType::get(ret, params, false));
     }
     llvm::Type* raw_ptr_ty() {
         return llvm::PointerType::getUnqual(ctx_);
@@ -7829,16 +7872,16 @@ private:
     // The shared out-of-range string-element sink: a writable rt_string handle
     // that powers on owned-empty and is reset before every use (lv_string_ptr).
     llvm::Value* str_sink_global() {
-        if (env_.str_sink == nullptr) {
+        if (env_->str_sink == nullptr) {
             std::vector<uint8_t> bytes(sizeof(rt_string), 0);
             bytes[sizeof(rt_string) - 1] = static_cast<uint8_t>(rt_string_inline_cap);
             auto* init = llvm::ConstantStruct::get(
               str_slot_ty(), { llvm::ConstantDataArray::get(ctx_, bytes) });
-            env_.str_sink = new llvm::GlobalVariable(env_.llmod, str_slot_ty(), /*isConstant=*/false,
+            env_->str_sink = new llvm::GlobalVariable(env_->llmod, str_slot_ty(), /*isConstant=*/false,
                                                  llvm::GlobalValue::InternalLinkage, init,
                                                  "clotho.str.sink");
         }
-        return env_.str_sink;
+        return env_->str_sink;
     }
 
     // Whether an instruction produces a fresh string value that needs its own
@@ -8180,7 +8223,7 @@ private:
                 // a program cannot observe a free) — see docs/design/classes.md §7.
                 const Ref      class_ref = p.ref;
                 llvm::Type*    body_ty   = class_body_ty(class_ref);
-                const uint64_t size      = env_.llmod.getDataLayout().getTypeAllocSize(body_ty);
+                const uint64_t size      = env_->llmod.getDataLayout().getTypeAllocSize(body_ty);
                 llvm::Value*   body      = b_.CreateCall(alloc_fn(), { b_.getInt64(size) });
                 b_.CreateMemSet(body, b_.getInt8(0), b_.getInt64(size), llvm::MaybeAlign(64));
                 emit_class_body_init(class_ref, body);
@@ -8316,8 +8359,8 @@ private:
                     src = slv.base;
                     st  = ds.storage_ty;
                 }
-                const auto sz = env_.llmod.getDataLayout().getTypeAllocSize(st);
-                const auto al = env_.llmod.getDataLayout().getABITypeAlign(st);
+                const auto sz = env_->llmod.getDataLayout().getTypeAllocSize(st);
+                const auto al = env_->llmod.getDataLayout().getABITypeAlign(st);
                 // A blocking whole-object copy into a signal must wake its Any-edge
                 // readers (a continuous / port copy or a comb process feeds off the
                 // destination), but only when the bytes actually change — an
@@ -8798,7 +8841,7 @@ private:
                 auto*      blob_c  = llvm::ConstantDataArray::get(
                   ctx_, llvm::ArrayRef<uint8_t>(reinterpret_cast<const uint8_t*>(blob.data()), blob.size()));
                 auto make_gv = [&](llvm::Type* ty, llvm::Constant* init, const char* nm) {
-                    return new llvm::GlobalVariable(env_.llmod, ty, true, llvm::GlobalValue::InternalLinkage, init, nm);
+                    return new llvm::GlobalVariable(env_->llmod, ty, true, llvm::GlobalValue::InternalLinkage, init, nm);
                 };
                 llvm::Value* vg = make_gv(blob_c->getType(), blob_c, "clotho.enum.vals");
                 llvm::Value* ng = make_gv(ptr_arr, llvm::ConstantArray::get(ptr_arr, names), "clotho.enum.names");
@@ -9830,7 +9873,7 @@ private:
         }
         llvm::Type* slot = t.kind == Type::Kind::String ? static_cast<llvm::Type*>(str_slot_ty())
                                                         : agg_leaf_slot_ty(type);
-        return static_cast<uint32_t>(env_.llmod.getDataLayout().getTypeAllocSize(slot));
+        return static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(slot));
     }
 
     // Deferred aggregate-NBA record: { ptr dest_slot, i32 nbytes, [max x i8]
@@ -9872,15 +9915,15 @@ private:
         const llvm::Align a1{ 1 };
         auto*             i8     = b_.getInt8Ty();
         auto*             rt     = agg_rec_ty(s);
-        const auto        stride = static_cast<uint32_t>(env_.llmod.getDataLayout().getTypeAllocSize(rt));
+        const auto        stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
         llvm::Value* rec = b_.CreateCall(nba_arr_slot_fn(), { b_.getInt32(agg_buf_idx(lv.sig)), b_.getInt32(stride) });
         b_.CreateAlignedStore(agg_slot_ptr(lv), b_.CreateStructGEP(rt, rec, 0), a1);
-        const auto nbytes = static_cast<uint32_t>(env_.llmod.getDataLayout().getTypeAllocSize(lv.slot_ty));
+        const auto nbytes = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(lv.slot_ty));
         b_.CreateAlignedStore(b_.getInt32(nbytes), b_.CreateStructGEP(rt, rec, 1), a1);
 
         // Byte offset of the leaf slot's z field (4-state leaves only).
         const uint32_t zoff = (!lv.narrow && lv.has_z)
-                                ? static_cast<uint32_t>(env_.llmod.getDataLayout().getStructLayout(lv.slot_ty)->getElementOffset(1))
+                                ? static_cast<uint32_t>(env_->llmod.getDataLayout().getStructLayout(lv.slot_ty)->getElementOffset(1))
                                 : 0;
         // Write a plane value into the payload at the slot's field offset.
         auto put = [&](llvm::Value* region, llvm::Value* v, uint32_t off) {
@@ -9926,7 +9969,7 @@ private:
         const SignalSlot& s      = slot_of(sig);
         const uint32_t    idx    = agg_buf_idx(sig);
         auto*             rt     = agg_rec_ty(s);
-        const auto        stride = static_cast<uint32_t>(env_.llmod.getDataLayout().getTypeAllocSize(rt));
+        const auto        stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
         auto*             i8     = b_.getInt8Ty();
         llvm::Value*      base   = b_.CreateCall(nba_arr_base_fn(), { b_.getInt32(idx) });
         llvm::Value*      count  = b_.CreateCall(nba_arr_count_fn(), { b_.getInt32(idx) });
@@ -10034,7 +10077,7 @@ private:
         }
 
         llvm::StructType* rt     = arr_rec_ty(s);
-        const uint32_t    stride = static_cast<uint32_t>(env_.llmod.getDataLayout().getTypeAllocSize(rt));
+        const uint32_t    stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
         llvm::Value*      rec    = b_.CreateCall(nba_arr_slot_fn(), { b_.getInt32(arr_idx(lv.sig)), b_.getInt32(stride) });
         b_.CreateAlignedStore(lv_mm_ptr(lv), b_.CreateStructGEP(rt, rec, 0), a1);
         b_.CreateAlignedStore(mm_val, b_.CreateStructGEP(rt, rec, 1), a1);
@@ -10060,7 +10103,7 @@ private:
         const SignalSlot& s      = slot_of(lv.sig);
         const llvm::Align a1{ 1 }; // record lives in an unaligned pooled block
         llvm::StructType* rt     = intra_rec_ty(s);
-        const uint32_t    stride = static_cast<uint32_t>(env_.llmod.getDataLayout().getTypeAllocSize(rt));
+        const uint32_t    stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
         const uint32_t    idx    = intra_idx(lv.sig);
 
         llvm::Value* rec = b_.CreateCall(intra_alloc_fn(), { b_.getInt32(idx), b_.getInt32(stride) });
@@ -10124,7 +10167,7 @@ private:
         const SignalSlot& s      = slot_of(lv.sig);
         const llvm::Align a1{ 1 };
         llvm::StructType* rt     = intra_rec_ty(s);
-        const uint32_t    stride = static_cast<uint32_t>(env_.llmod.getDataLayout().getTypeAllocSize(rt));
+        const uint32_t    stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
         const uint32_t    idx    = intra_idx(lv.sig);
 
         llvm::Value* rec = b_.CreateCall(intra_alloc_fn(), { b_.getInt32(idx), b_.getInt32(stride) });
@@ -10228,13 +10271,13 @@ private:
         auto*             mmty   = int_ty(s.narrow ? W : 2 * W);
         auto*             zty    = int_ty(W);
         auto*             rt     = arr_rec_ty(s);
-        const uint32_t    stride = static_cast<uint32_t>(env_.llmod.getDataLayout().getTypeAllocSize(rt));
+        const uint32_t    stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
         const llvm::Align a1{ 1 };
         // The live element pointer arrives opaque from the record, but the design
         // state is rt_alloc'd (64-byte aligned) and array elements sit at naturally
         // aligned offsets, so each element word meets its ABI alignment.
-        const llvm::Align mm_al  = env_.llmod.getDataLayout().getABITypeAlign(mmty);
-        const llvm::Align z_al   = env_.llmod.getDataLayout().getABITypeAlign(zty);
+        const llvm::Align mm_al  = env_->llmod.getDataLayout().getABITypeAlign(mmty);
+        const llvm::Align z_al   = env_->llmod.getDataLayout().getABITypeAlign(zty);
 
         llvm::Value* n    = b_.CreateCall(nba_arr_count_fn(), { b_.getInt32(arr_idx(sig)) });
         llvm::Value* base = b_.CreateCall(nba_arr_base_fn(), { b_.getInt32(arr_idx(sig)) });
@@ -10610,7 +10653,7 @@ private:
         llvm::Value* fd   = cast(must_of(value_of(ir_->payload(i).unary)), 32, true);
         auto*        i32  = b_.getInt32Ty();
         auto*        fnty = llvm::FunctionType::get(i32, { i32 }, false);
-        llvm::Value* r    = b_.CreateCall(env_.llmod.getOrInsertFunction(fn, fnty), { fd });
+        llvm::Value* r    = b_.CreateCall(env_->llmod.getOrInsertFunction(fn, fnty), { fd });
         set_value(i, packed(r, r, zero(32)));
     }
 
@@ -10621,7 +10664,7 @@ private:
         llvm::Value* fd   = cast(must_of(value_of(p.r)), 32, true);
         auto*        i32  = b_.getInt32Ty();
         auto*        fnty = llvm::FunctionType::get(i32, { i32, i32 }, false);
-        llvm::Value* r = b_.CreateCall(env_.llmod.getOrInsertFunction("rt_ungetc", fnty), { c, fd });
+        llvm::Value* r = b_.CreateCall(env_->llmod.getOrInsertFunction("rt_ungetc", fnty), { c, fd });
         set_value(i, packed(r, r, zero(32)));
     }
 
@@ -10634,7 +10677,7 @@ private:
         llvm::Value* op   = cast(must_of(value_of(info.operation)), 32, true);
         auto*        i32  = b_.getInt32Ty();
         auto*        fnty = llvm::FunctionType::get(i32, { i32, i32, i32 }, false);
-        llvm::Value* r = b_.CreateCall(env_.llmod.getOrInsertFunction("rt_fseek", fnty), { fd, off, op });
+        llvm::Value* r = b_.CreateCall(env_->llmod.getOrInsertFunction("rt_fseek", fnty), { fd, off, op });
         set_value(i, packed(r, r, zero(32)));
     }
 
@@ -10643,7 +10686,7 @@ private:
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
         auto* fnty = llvm::FunctionType::get(i32, { ptr, ptr, i32, i32, i32 }, false);
-        return env_.llmod.getOrInsertFunction("rt_fgets", fnty);
+        return env_->llmod.getOrInsertFunction("rt_fgets", fnty);
     }
 
     // Lower a $fgets: hand the runtime the destination vector's plane pointers plus
@@ -10694,14 +10737,14 @@ private:
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
         auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, i32, ptr, i32, ptr, i32 }, false);
-        return env_.llmod.getOrInsertFunction("rt_sformat", fnty);
+        return env_->llmod.getOrInsertFunction("rt_sformat", fnty);
     }
 
     // void rt_sformat_str(rt_string* dst, const char* fmt, i32 argc, const rt_arg* argv)
     llvm::FunctionCallee sformat_str_fn() {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, b_.getInt32Ty(), ptr }, false);
-        return env_.llmod.getOrInsertFunction("rt_sformat_str", fnty);
+        return env_->llmod.getOrInsertFunction("rt_sformat_str", fnty);
     }
 
     // Lower a $sformat / $swrite: build the format-arg descriptor array and hand
@@ -10743,7 +10786,7 @@ private:
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
         auto* fnty = llvm::FunctionType::get(i32, { i32, ptr, ptr, i32, i32 }, false);
-        return env_.llmod.getOrInsertFunction("rt_ferror", fnty);
+        return env_->llmod.getOrInsertFunction("rt_ferror", fnty);
     }
 
     // Lower a $ferror: pass the descriptor plus the destination string's planes; the
@@ -10769,7 +10812,7 @@ private:
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
         auto* fnty = llvm::FunctionType::get(i32, { i32, ptr, i32, ptr }, false);
-        return env_.llmod.getOrInsertFunction("rt_fscanf", fnty);
+        return env_->llmod.getOrInsertFunction("rt_fscanf", fnty);
     }
 
     // i32 rt_sscanf(const char* buf, i32 len, const char* fmt, i32 argc, const rt_scan_arg* args)
@@ -10777,7 +10820,7 @@ private:
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
         auto* fnty = llvm::FunctionType::get(i32, { ptr, i32, ptr, i32, ptr }, false);
-        return env_.llmod.getOrInsertFunction("rt_sscanf", fnty);
+        return env_->llmod.getOrInsertFunction("rt_sscanf", fnty);
     }
 
     // Lower a $fscanf / $sscanf: build the rt_scan_arg[] descriptor array from the
@@ -10845,7 +10888,7 @@ private:
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
         auto* fnty = llvm::FunctionType::get(i32, { ptr, i32 }, false);
-        return env_.llmod.getOrInsertFunction("rt_test_plusargs", fnty);
+        return env_->llmod.getOrInsertFunction("rt_test_plusargs", fnty);
     }
 
     // Lower $test$plusargs(str): the query string is a compile-time literal
@@ -10864,7 +10907,7 @@ private:
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
         auto* fnty = llvm::FunctionType::get(i32, { ptr, i32, i32, ptr }, false);
-        return env_.llmod.getOrInsertFunction("rt_value_plusargs", fnty);
+        return env_->llmod.getOrInsertFunction("rt_value_plusargs", fnty);
     }
 
     // Lower $value$plusargs(user_string, var): build a single rt_scan_arg
@@ -10986,7 +11029,7 @@ private:
         llvm::Value* z_base =
           s.has_z ? b_.CreateInBoundsGEP(arr_ty, storage, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(1) })
                   : llvm::cast<llvm::Value>(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
-        const auto  stride = static_cast<uint32_t>(env_.llmod.getDataLayout().getTypeAllocSize(s.slot_ty));
+        const auto  stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(s.slot_ty));
         const Type& at     = std::get<Type>(mod_.pool.get(mod_.signal(info.mem).type));
 
         llvm::Value*   fd     = cast(must_of(value_of(fdi)), 32, true);
@@ -11066,7 +11109,7 @@ private:
         llvm::Value* z_base =
           s.has_z ? b_.CreateInBoundsGEP(arr_ty, storage, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(1) })
                   : llvm::cast<llvm::Value>(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
-        const auto stride = static_cast<uint32_t>(env_.llmod.getDataLayout().getTypeAllocSize(s.slot_ty));
+        const auto stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(s.slot_ty));
 
         const Type& at = std::get<Type>(mod_.pool.get(mod_.signal(info.target).type));
 
@@ -11129,7 +11172,7 @@ private:
     }
     // The runtime rt_vcd_active byte, non-zero only while VCD dumping is live.
     llvm::Constant* vcd_active_gv() {
-        return env_.llmod.getOrInsertGlobal("rt_vcd_active", b_.getInt8Ty());
+        return env_->llmod.getOrInsertGlobal("rt_vcd_active", b_.getInt8Ty());
     }
     // Emit a VCD touch call guarded by the runtime active flag, so a design that
     // compiles in $dumpvars (possibly plusarg-guarded) but is not dumping pays
@@ -11421,7 +11464,7 @@ private:
         llvm::Value* z_base =
           s.has_z ? b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), b_.getInt32(0), b_.getInt32(1) })
                   : llvm::cast<llvm::Value>(nullp);
-        const auto stride = static_cast<uint32_t>(env_.llmod.getDataLayout().getTypeAllocSize(s.slot_ty));
+        const auto stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(s.slot_ty));
         b_.CreateCall(vcd_array_fn(), { np, nlen, b_.getInt32(s.elem_count), b_.getInt32(s.width),
                                         b_.getInt32(flags), mm_base, z_base, b_.getInt32(stride),
                                         b_.getInt64(at.left), b_.getInt64(at.right) });
@@ -11953,7 +11996,7 @@ private:
         // reconstruction — so may-z elision (a `{ i2W }` slot with no z word) is
         // reflected in the has_z flag the marshal needs.
         llvm::StructType* slot   = lv.slot_ty;
-        const auto        stride = static_cast<uint32_t>(env_.llmod.getDataLayout().getTypeAllocSize(slot));
+        const auto        stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(slot));
         llvm::Value*      storage = lv.base; // whole `[N x slot]` storage pointer
 
         llvm::Value* data;
@@ -12169,7 +12212,7 @@ private:
             cparams.push_back(dpi_export_c_param_ty(ex.arg_ctypes[k], ex.arg_dirs[k]));
         }
         auto* fnty  = llvm::FunctionType::get(dpi_c_llvm_ty(ex.ret_ctype), cparams, false);
-        auto* thunk = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, ex.extern_name, env_.llmod);
+        auto* thunk = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, ex.extern_name, env_->llmod);
         b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", thunk));
 
         // Output / inout copy-back after the call: the (mm, z) plane cells the SV
@@ -12849,9 +12892,9 @@ private:
     llvm::Value* libm_call(const char* name, llvm::Value* x, llvm::Value* y = nullptr) {
         auto* dbl = b_.getDoubleTy();
         if (y != nullptr) {
-            return b_.CreateCall(env_.llmod.getOrInsertFunction(name, dbl, dbl, dbl), { x, y });
+            return b_.CreateCall(env_->llmod.getOrInsertFunction(name, dbl, dbl, dbl), { x, y });
         }
-        return b_.CreateCall(env_.llmod.getOrInsertFunction(name, dbl, dbl), { x });
+        return b_.CreateCall(env_->llmod.getOrInsertFunction(name, dbl, dbl), { x });
     }
 
     // rotl64(x, k) = (x << k) | (x >> (64 - k)).
@@ -14232,9 +14275,16 @@ private:
 
     const Module&           mod_;
     llvm::LLVMContext&      ctx_;
-    // The active compilation unit — all IR emission goes through it. One env
-    // over the whole design today; the per-definition split swaps it per unit.
-    ModuleEnv               env_;
+    // Root compilation unit (the module handed in by build_modules) and the
+    // active unit all IR emission goes through — swapped to a definition
+    // unit's env around each single-scope group's lowering, root otherwise.
+    std::unique_ptr<ModuleEnv> root_env_;
+    ModuleEnv*                 env_;
+    // Definition-unit envs and their modules, keyed by definition state-struct
+    // identity (one unit per elaborated definition content).
+    std::vector<std::unique_ptr<ModuleEnv>>                       unit_envs_;
+    std::vector<std::unique_ptr<llvm::Module>>                    unit_modules_;
+    ankerl::unordered_dense::map<llvm::StructType*, ModuleEnv*>   unit_env_of_;
     llvm::IRBuilder<>       b_;
     // The root `%clotho.state` struct: unscoped signals only (instance scopes
     // own their own state globals, see Anchor::state_gv).
@@ -14269,6 +14319,10 @@ private:
     // build_instance_ctx_layout; the shareable-group identity.
     std::vector<uint32_t> group_anchor_of_;
     std::vector<uint32_t> group_def_ordinal_;
+    // Owning scope anchor of ANY single-scope group (unique or reused def),
+    // no_anchor for cross-instance / unscoped groups: the split-emission unit
+    // assignment (see unit_env / the lower_group loop in run()).
+    std::vector<uint32_t> group_unit_anchor_;
     // Def-local signal table per anchor (slot.path's last element), kept from
     // build_wait_queues for the ctx layout and block-signal translation.
     std::vector<std::vector<Signal>> anchor_signals_;
@@ -14617,14 +14671,15 @@ bool lower_coroutines(llvm::Module& m, bool o3) {
 
 } // namespace
 
-std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& ctx,
-                                           const SimulationConfig& config) {
-    auto llmod = std::make_unique<llvm::Module>(m.name.empty() ? "clotho" : m.name, ctx);
+std::vector<std::unique_ptr<llvm::Module>> build_modules(const Module& m, llvm::LLVMContext& ctx,
+                                                         const SimulationConfig& config) {
+    auto root = std::make_unique<llvm::Module>(m.name.empty() ? "clotho" : m.name, ctx);
 
-    // Pin the module to the host target's triple and DataLayout before any IR is
-    // built: the state/frame struct layouts, the NBA meta table's baked byte
+    // Pin the modules to the host target's triple and DataLayout before any IR
+    // is built: the state/frame struct layouts, the NBA meta table's baked byte
     // offsets, and load/store alignments are all DataLayout-derived, so they
-    // must be computed against the layout codegen will actually use.
+    // must be computed against the layout codegen will actually use. Unit
+    // modules copy the root's triple/DataLayout at creation (unit_env).
     {
         static std::once_flag once;
         std::call_once(once, [] { llvm::InitializeNativeTarget(); });
@@ -14632,53 +14687,62 @@ std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& c
         if (!jtmb) {
             llvm::errs() << "llvm backend: cannot detect host target: "
                          << llvm::toString(jtmb.takeError()) << "\n";
-            return nullptr;
+            return {};
         }
         auto dl = jtmb->getDefaultDataLayoutForTarget();
         if (!dl) {
             llvm::errs() << "llvm backend: no host data layout: " << llvm::toString(dl.takeError())
                          << "\n";
-            return nullptr;
+            return {};
         }
-        llmod->setTargetTriple(jtmb->getTargetTriple());
-        llmod->setDataLayout(*dl);
+        root->setTargetTriple(jtmb->getTargetTriple());
+        root->setDataLayout(*dl);
     }
 
+    std::vector<std::unique_ptr<llvm::Module>> mods;
     try {
-        Backend(m, ctx, *llmod, config).run();
+        Backend be(m, ctx, *root, config);
+        be.run();
+        mods = be.take_unit_modules();
     } catch (const BackendError& e) {
         llvm::errs() << "llvm backend error: " << e.message << "\n";
-        return nullptr;
+        return {};
     }
+    mods.insert(mods.begin(), std::move(root));
 
-    // Verify the freshly-built (pre-split) module. With optimize off, stop here
-    // and hand back this raw module (coro intrinsics intact) for inspection.
-    if (llvm::verifyModule(*llmod, &llvm::errs())) {
-        return nullptr;
+    // Verify every freshly-built (pre-split) module. With optimize off, stop
+    // here and hand back the raw modules (coro intrinsics intact).
+    for (const auto& mod : mods) {
+        if (llvm::verifyModule(*mod, &llvm::errs())) {
+            return {};
+        }
     }
     if (!config.optimize) {
-        return llmod;
+        return mods;
     }
-    // Lower the coroutines and verify again — the second pass guards against
-    // malformed coro lowering.
-    if (!lower_coroutines(*llmod, config.o3)) {
-        return nullptr;
-    }
-    if (llvm::verifyModule(*llmod, &llvm::errs())) {
-        return nullptr;
+    // Lower the coroutines per module and verify again — the second pass
+    // guards against malformed coro lowering.
+    for (const auto& mod : mods) {
+        if (!lower_coroutines(*mod, config.o3)) {
+            return {};
+        }
+        if (llvm::verifyModule(*mod, &llvm::errs())) {
+            return {};
+        }
     }
 
-    return llmod;
+    return mods;
 }
 
 bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config) {
     llvm::LLVMContext ctx;
-    auto              llmod = build_module(m, ctx, config);
-    if (!llmod) {
+    auto              mods = build_modules(m, ctx, config);
+    if (mods.empty()) {
         return false;
     }
-
-    llmod->print(os, nullptr);
+    for (const auto& mod : mods) {
+        mod->print(os, nullptr);
+    }
     return true;
 }
 

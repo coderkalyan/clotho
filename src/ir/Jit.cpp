@@ -52,19 +52,20 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     // below, JIT codegen triggered by looking up main.
     const auto t_llvm = std::chrono::steady_clock::now();
 
-    // Each run owns its context: the design module is built into it, then both
-    // are moved into a ThreadSafeModule the JIT takes over.
+    // Each run owns its context: the design modules are built into it, then
+    // moved into ThreadSafeModules sharing one ThreadSafeContext the JIT takes
+    // over.
     auto ctx = std::make_unique<llvm::LLVMContext>();
     // The JIT needs runnable code: coroutine lowering is mandatory regardless
     // of what the caller's config says (optimize=false is an emit_llvm
     // inspection mode).
     SimulationConfig jit_config = config;
     jit_config.optimize         = true;
-    auto mod                    = build_module(m, *ctx, jit_config);
-    if (!mod) {
-        return -1; // build_module already reported the reason.
+    auto mods                   = build_modules(m, *ctx, jit_config);
+    if (mods.empty()) {
+        return -1; // build_modules already reported the reason.
     }
-    llvm::orc::ThreadSafeModule tsm(std::move(mod), std::move(ctx));
+    llvm::orc::ThreadSafeContext tsc(std::move(ctx));
 
     // Machine-code generation matches the IR tier: -O0/FastISel for tier 0
     // (the backend pipeline already did the cheap cleanup; codegen quality is
@@ -344,13 +345,16 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
         }
     }
 
-    if (auto err = (*jit)->addIRModule(std::move(tsm))) {
-        llvm::errs() << "jit: " << llvm::toString(std::move(err)) << "\n";
-        return -1;
+    for (auto& mod : mods) {
+        if (auto err = (*jit)->addIRModule(llvm::orc::ThreadSafeModule(std::move(mod), tsc))) {
+            llvm::errs() << "jit: " << llvm::toString(std::move(err)) << "\n";
+            return -1;
+        }
     }
 
-    // Looking up `main` materializes its module through the compile layer, i.e.
-    // eagerly compiles the whole design (one module, reachable from main).
+    // Looking up `main` materializes the root module through the compile
+    // layer; its references to the unit modules' group functions materialize
+    // those in turn, i.e. eagerly compiles the whole design.
     auto sym = (*jit)->lookup("main");
     if (!sym) {
         llvm::errs() << "jit: " << llvm::toString(sym.takeError()) << "\n";

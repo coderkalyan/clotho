@@ -13,6 +13,7 @@
 //   * Every SSA value is lowered as a (must|may, z) plane pair so X/Z propagate.
 
 #include <memory>
+#include <vector>
 
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -23,13 +24,16 @@
 
 namespace clotho::ir {
 
-// Lower every process in `m` to a fresh llvm::Module owned by `ctx`. Returns
-// nullptr (and writes the reason to llvm::errs()) on backend error or if the
-// generated module fails verification. The caller owns the returned module and
-// must keep `ctx` alive at least as long as it.
-//
-std::unique_ptr<llvm::Module> build_module(const Module& m, llvm::LLVMContext& ctx,
-                                           const SimulationConfig& config = {});
+// Lower every process in `m` to llvm::Modules owned by `ctx`: element 0 is the
+// root module (state globals, scheduler machinery, functions, main), followed
+// by one module per elaborated-definition unit holding its single-scope
+// process groups (config.split; a single root module otherwise). Returns an
+// empty vector (and writes the reason to llvm::errs()) on backend error or if
+// any generated module fails verification. The caller owns the returned
+// modules and must keep `ctx` alive at least as long as them; the JIT links
+// the whole set into one dylib.
+std::vector<std::unique_ptr<llvm::Module>> build_modules(const Module& m, llvm::LLVMContext& ctx,
+                                                         const SimulationConfig& config = {});
 
 // Lower every process in `m` to an LLVM function and write textual LLVM IR to
 // `os`. Returns false (and writes the reason to llvm::errs()) if the generated
