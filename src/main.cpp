@@ -53,6 +53,8 @@ int main(int argc, char** argv) {
             config.dedup = false;
         } else if (arg == "--no-split") {
             config.split = false;
+        } else if (arg == "--no-outline") {
+            config.outline = false;
         } else if (arg == "--domain-spec") {
             config.domain_spec = true;
         } else if (arg == "-O") {

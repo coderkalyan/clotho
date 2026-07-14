@@ -62,6 +62,13 @@ struct SimulationConfig {
     // literal post-lowering IR identity, so semantics are byte-identical
     // either way. Disable for bisection / debugging.
     bool dedup = true;
+    // Under `split`: lower a cross-instance fused thunk group as per-member
+    // functions emitted into each member's own definition unit plus a root
+    // dispatcher calling them in rank order, so the member code is
+    // per-definition cacheable (the merged form lives in the always-
+    // recompiled root). Costs one call per member per activation. Disable
+    // for bisection; no effect with split off.
+    bool outline = true;
     // Emit one llvm::Module per elaborated definition (unit = the definition
     // state-struct identity) holding its single-scope process groups, plus a
     // root module with everything else (state globals, scheduler machinery,

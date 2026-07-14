@@ -2222,6 +2222,84 @@ private:
         // CoroSplit). The sched-flag timeline matches the coroutine always-loop:
         // the flag is held set across the body and cleared at the end, so
         // same-instant re-triggers behave identically.
+        // Cross-instance fused thunk group under split emission: lower each
+        // member as its own plain function emitted into the member's OWN
+        // definition unit, plus a root-emitted dispatcher (named like the
+        // merged thunk, so seed/subscription/drain contracts are untouched)
+        // calling them in scheduled-rank order. The members become
+        // per-definition cacheable — the merged form parked the whole group's
+        // code in the always-recompiled root. Single-scope groups keep the
+        // merged body inside their unit (no call overhead); domain-spec
+        // groups keep the merged guarded form. Only the population that cannot
+        // otherwise leave root pays the per-member call.
+        // Member cap: a cross-module member call cannot be inlined, so the
+        // per-activation dispatch cost scales with member count — a 256-member
+        // comb group measured 3.7x sim outlined (combchain), while the real
+        // cross-instance populations on cores (2-7 member clocked groups) are
+        // wall-neutral. Groups past the cap keep the merged root body.
+        constexpr size_t outline_max_members = 16;
+        const uint32_t g_ = group_of_[proc_index];
+        if (config_.split && config_.outline && thunk_group_[g_] && !spec_group_[g_] &&
+            members.size() > 1 && members.size() <= outline_max_members &&
+            group_unit_anchor_[g_] == SignalSlot::no_anchor &&
+            std::any_of(members.begin(), members.end(),
+                        [&](uint32_t m) { return proc_sched_anchor_[m] != ~0u; })) {
+            auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
+            auto* fnty   = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
+
+            std::vector<llvm::Function*> member_fns;
+            member_fns.reserve(members.size());
+            for (const uint32_t m : members) {
+                const uint32_t aid = proc_sched_anchor_[m];
+                env_ = aid != ~0u ? &unit_env(anchors_[aid]) : root_env_.get();
+                const std::string mname =
+                  aid != ~0u ? "clotho.inst." + anchors_[aid].name + ".p" +
+                                 std::to_string(proc_sched_ord_[m])
+                             : mod_.name + ".p" + std::to_string(m);
+                fn_ = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, mname, env_->llmod);
+                state_ = fn_->getArg(0);
+                state_->setName("state");
+                wheel_ = fn_->getArg(1);
+                wheel_->setName("wheel");
+                fn_->addParamAttr(0, llvm::Attribute::NoAlias);
+                b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
+                // Member bodies never touch the sched flag (the dispatcher
+                // owns the timeline) and address absolutely (no ctx), but
+                // their NBA block ids need a member-scoped def-stable idval
+                // key: block_register keys on outline_anchor_/outline_ord_
+                // while these are set, with block ids member-contiguous
+                // (group_first_block_ reset per member).
+                outline_anchor_    = aid;
+                outline_ord_       = proc_sched_ord_[m];
+                group_first_block_ = -1;
+                select_member(m);
+                str_vals_.assign(ir_->inst_count(), nullptr);
+                build_str_temps();
+                build_dynarr_temps();
+                lower_region(ir_->root());
+                deinit_body_strings();
+                b_.CreateRetVoid();
+                member_fns.push_back(fn_);
+            }
+            outline_anchor_    = ~0u;
+            group_first_block_ = -1;
+
+            env_ = root_env_.get();
+            fn_  = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name + ".thunk", env_->llmod);
+            state_ = fn_->getArg(0);
+            state_->setName("state");
+            wheel_ = fn_->getArg(1);
+            wheel_->setName("wheel");
+            fn_->addParamAttr(0, llvm::Attribute::NoAlias);
+            b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
+            for (llvm::Function* mf : member_fns) {
+                b_.CreateCall(fnty, sym(mf), { state_, wheel_ });
+            }
+            b_.CreateStore(b_.getInt32(0), sched_ptr_); // re-arm: ready to be woken
+            b_.CreateRetVoid();
+            return fn_;
+        }
+
         if (thunk_group_[group_of_[proc_index]]) {
             auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
             auto* fnty   = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty, ptr_ty }, false);
@@ -5600,16 +5678,20 @@ private:
                   ctx_field(a, field, b_.getInt32Ty()),
                   b_.getInt32(cur_block_id_ - static_cast<uint32_t>(group_first_block_)));
             } else if (config_.split && unit_emission()) {
-                // Unit-module group of a unique definition: the block id via an
-                // absolute symbol keyed by (instance, def-local group ordinal),
-                // group-local block ordinal as the addend.
-                const uint32_t ua = group_unit_anchor_[sched_group_];
+                // Unit-module code of a unique definition: the block id via a
+                // root-defined value global keyed by (instance, def-local
+                // ordinal) — the owning group's, or the member's own when an
+                // outlined cross-instance member is lowering — with the
+                // group-/member-local block ordinal as the addend.
                 if (group_first_block_ < 0) {
                     group_first_block_ = static_cast<int64_t>(cur_block_id_);
                 }
-                id = abs_id_const("blk." + anchors_[ua].name + ".g" +
-                                    std::to_string(group_unit_ordinal_[sched_group_]),
-                                  static_cast<uint32_t>(group_first_block_),
+                const std::string key =
+                  outline_anchor_ != ~0u
+                    ? "blk." + anchors_[outline_anchor_].name + ".p" + std::to_string(outline_ord_)
+                    : "blk." + anchors_[group_unit_anchor_[sched_group_]].name + ".g" +
+                        std::to_string(group_unit_ordinal_[sched_group_]);
+                id = abs_id_const(key, static_cast<uint32_t>(group_first_block_),
                                   cur_block_id_ - static_cast<uint32_t>(group_first_block_));
             }
             b_.CreateCall(sym(nba_block_enqueue_fn_), { id });
@@ -14529,6 +14611,11 @@ private:
     uint32_t sched_anchor_  = SignalSlot::no_anchor;
     uint32_t sched_ordinal_ = 0;
     uint32_t sched_group_   = 0;
+    // Outlined cross-instance member currently lowering: its owning anchor
+    // (~0 = none / not outlining) and def-local process ordinal, the
+    // member-scoped idval key for its NBA blocks (see lower_group).
+    uint32_t outline_anchor_ = ~0u;
+    uint32_t outline_ord_    = 0;
     // First NBA block id of the group currently lowering (-1 until a block
     // opens); block_register keys its ctx-relative ids off it.
     int64_t group_first_block_ = -1;
