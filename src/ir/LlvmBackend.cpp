@@ -594,15 +594,6 @@ public:
         return std::move(unit_modules_);
     }
 
-    // (symbol suffix -> value) for every @clotho.absid.* marker the unit
-    // modules reference; the JIT defines them as absolute symbols before
-    // linking. Deterministic order (sorted) for reproducible emission.
-    std::vector<std::pair<std::string, uint64_t>> take_abs_ids() {
-        std::vector<std::pair<std::string, uint64_t>> out(abs_ids_.begin(), abs_ids_.end());
-        std::sort(out.begin(), out.end());
-        return out;
-    }
-
     void run() {
         build_state_types();
         emit_state_global(); // before any body: storage_ptr resolves through the anchors
@@ -773,29 +764,35 @@ private:
         return env_ != root_env_.get();
     }
 
-    // A design-numbering integer id as a link-time constant:
-    // trunc(ptrtoint @clotho.absid.<key>) + addend. The marker symbol is an
-    // external i8 whose *address value* the JIT defines as `value` via ORC
-    // absoluteSymbols (take_abs_ids / run_jit) — the id is patched into the
-    // immediate by relocation, so unit-module code bytes carry only the
-    // hierarchy-derived symbol name and a def-local addend, never the
-    // whole-design number. Zero runtime cost.
+    // A design-numbering integer id, referenced from unit-module code without
+    // baking the number: a load of a root-defined i32 value global
+    // (@clotho.idval.<key>), named by hierarchy + def-local ordinal, so the
+    // unit's bytes stay independent of whole-design numbering (root always
+    // recompiles and carries the value). Deliberately NOT an absolute-symbol
+    // relocation: a truncating-ptrtoint constant in operand position measured
+    // ~+3KB codegen per hot pico thunk -- SelectionDAG (the -O0 fallback for
+    // blocks FastISel misses) keeps the symbol address live across the whole
+    // function and spills it, costing more executed instructions per
+    // activation than this one L1-hot 4-byte load per site (llc A/B on the
+    // extracted thunk: constexpr 72248 B, instruction-form 72169 B, this load
+    // form 70992 B, literal floor 69298 B).
     llvm::Value* abs_id_const(const std::string& key, uint32_t value, uint32_t addend) {
-        auto [it, inserted] = abs_ids_.try_emplace(key, value);
-        if (!inserted && it->second != value) {
-            throw BackendError{ "absolute id symbol '" + key + "' bound to two values" };
+        std::string name = "clotho.idval." + key;
+        if (addend != 0) {
+            name += "+" + std::to_string(addend);
         }
-        llvm::Constant* gv = env_->llmod.getOrInsertGlobal("clotho.absid." + key, b_.getInt8Ty());
-        // The def-local addend and the -1 bias fold into the symbol reference
-        // as a byte GEP, so the whole id is ONE relocated immediate (a lone
-        // movabs at FastISel, no add). The +1 bias (run_jit registers
-        // value+1): an id of 0 would define the symbol at address null, which
-        // the RTDyld object layer (--perf-jitdump path) reports as
-        // unresolved.
-        llvm::Constant* off = llvm::ConstantExpr::getGetElementPtr(
-          b_.getInt8Ty(), gv, llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(addend - 1) });
-        return llvm::ConstantExpr::getTrunc(llvm::ConstantExpr::getPtrToInt(off, b_.getInt64Ty()),
-                                            b_.getInt32Ty());
+        auto [it, inserted] = idval_gvs_.try_emplace(name, nullptr);
+        if (inserted) {
+            auto* i32  = b_.getInt32Ty();
+            it->second = new llvm::GlobalVariable(root_env_->llmod, i32, /*isConstant=*/true,
+                                                  llvm::GlobalValue::InternalLinkage,
+                                                  llvm::ConstantInt::get(i32, value + addend), name);
+            it->second->setAlignment(llvm::Align(4));
+        } else if (llvm::cast<llvm::ConstantInt>(it->second->getInitializer())->getZExtValue() !=
+                   value + addend) {
+            throw BackendError{ "id value global '" + name + "' bound to two values" };
+        }
+        return b_.CreateLoad(b_.getInt32Ty(), sym(it->second));
     }
 
     // Whether `s`'s design-numbering ids should emit as absolute-symbol
@@ -14412,8 +14409,8 @@ private:
     std::vector<std::unique_ptr<ModuleEnv>>                       unit_envs_;
     std::vector<std::unique_ptr<llvm::Module>>                    unit_modules_;
     ankerl::unordered_dense::map<llvm::StructType*, ModuleEnv*>   unit_env_of_;
-    // Integer-id absolute symbols (abs_id_const): suffix -> value.
-    ankerl::unordered_dense::map<std::string, uint64_t>            abs_ids_;
+    // Root-defined integer-id value globals (abs_id_const): name -> global.
+    ankerl::unordered_dense::map<std::string, llvm::GlobalVariable*> idval_gvs_;
     llvm::IRBuilder<>       b_;
     // The root `%clotho.state` struct: unscoped signals only (instance scopes
     // own their own state globals, see Anchor::state_gv).
@@ -14835,7 +14832,6 @@ BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx,
         Backend be(m, ctx, *root, config);
         be.run();
         built.modules = be.take_unit_modules();
-        built.abs_ids = be.take_abs_ids();
     } catch (const BackendError& e) {
         llvm::errs() << "llvm backend error: " << e.message << "\n";
         return {};

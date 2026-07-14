@@ -27,12 +27,9 @@ namespace clotho::ir {
 // The lowered design: modules[0] is the root module (state globals, scheduler
 // machinery, functions, main), followed by one module per elaborated-
 // definition unit holding its single-scope process groups (config.split; a
-// single root module otherwise). abs_ids lists the @clotho.absid.* integer-id
-// marker symbols the unit modules reference — the JIT must define each as an
-// absolute symbol with the given value before linking.
+// single root module otherwise).
 struct BuiltDesign {
-    std::vector<std::unique_ptr<llvm::Module>>    modules;
-    std::vector<std::pair<std::string, uint64_t>> abs_ids;
+    std::vector<std::unique_ptr<llvm::Module>> modules;
 };
 
 // Lower every process in `m` to llvm::Modules owned by `ctx`. Returns empty

@@ -345,26 +345,6 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
         }
     }
 
-    // Integer-id marker symbols (@clotho.absid.*): each unit module's
-    // design-numbering immediates resolve against these absolute values at
-    // link time (see abs_id_const in LlvmBackend.cpp).
-    if (!built.abs_ids.empty()) {
-        llvm::orc::SymbolMap ids;
-        for (const auto& [key, value] : built.abs_ids) {
-            // +1 bias: a zero-valued id would sit at address null, which the
-            // RTDyld object layer treats as an unresolved symbol. The code
-            // side subtracts 1 in the relocation addend (abs_id_const).
-            ids[(*jit)->mangleAndIntern("clotho.absid." + key)] = {
-                llvm::orc::ExecutorAddr(value + 1),
-                llvm::JITSymbolFlags::Exported,
-            };
-        }
-        if (auto err = jd.define(llvm::orc::absoluteSymbols(std::move(ids)))) {
-            llvm::errs() << "jit: " << llvm::toString(std::move(err)) << "\n";
-            return -1;
-        }
-    }
-
     for (auto& mod : built.modules) {
         if (auto err = (*jit)->addIRModule(llvm::orc::ThreadSafeModule(std::move(mod), tsc))) {
             llvm::errs() << "jit: " << llvm::toString(std::move(err)) << "\n";
