@@ -1026,20 +1026,22 @@ TEST_CASE("unpacked struct / aggregate task argument is guarded") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("aggregate task argument") != std::string::npos);
+    CHECK(r.diagnostics.find("task argument is not supported") != std::string::npos);
 }
 
-TEST_CASE("whole unpacked struct as a $display rvalue is still guarded") {
-    // A general whole-struct rvalue (here a $display %p operand) has no flat
-    // value and no non-argument by-value path yet.
-    const LowerResult r = lower_text(R"(
+TEST_CASE("whole unpacked struct as a $display %p operand renders a pattern") {
+    // %p expands the struct at lower time into `'{field:val, ...}` (LRM 21.2.1.6);
+    // integral leaves render in hex with a `'h` tag (matches verilator).
+    CHECK(run_capture(R"(
         module m;
-            typedef struct { logic [7:0] a; } s_t;
+            typedef struct { logic [7:0] a; int b; } s_t;
             s_t x;
-            initial $display("%p", x);
+            initial begin
+                x.a = 8'hAB; x.b = 42;
+                $display("%p", x);
+            end
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
+    )") == "'{a:'hab, b:'h2a}\n");
 }
 
 TEST_CASE("chained continuous copy of a struct wakes downstream readers") {

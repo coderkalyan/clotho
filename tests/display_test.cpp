@@ -261,12 +261,12 @@ TEST_CASE("unsupported or invalid format specifiers are rejected") {
             endmodule
         )", "%v (net signal strength) is not supported");
     }
-    SUBCASE("%p assignment pattern") {
-        check_rejected(R"(
+    SUBCASE("%p of a scalar renders its decimal value") {
+        CHECK(run_capture(R"(
             module m;
                 initial $display("%p", 1);
             endmodule
-        )", "%p (assignment pattern) is not supported");
+        )") == "1\n");
     }
     SUBCASE("integral under a real specifier converts (LRM 6.12.1)") {
         CHECK(run_capture(R"(
@@ -420,5 +420,35 @@ TEST_CASE("display operands wider than 64 bits (LRM 21.2)") {
                 end
             endmodule
         )") == ":deadbeefcafebabe0123456789abcdef:\n");
+    }
+}
+
+TEST_CASE("%p renders unpacked aggregates as assignment patterns (LRM 21.2.1.6)") {
+    // `'{...}` with hex `'h` leaves and struct member names — matches verilator
+    // (the only working oracle; iverilog rejects %p on aggregates).
+    SUBCASE("fixed unpacked array") {
+        CHECK(run_capture(R"(
+            module m;
+                int arr [0:3];
+                int i;
+                initial begin
+                    for (i = 0; i < 4; i++) arr[i] = i * 10;
+                    $display("%p", arr);
+                end
+            endmodule
+        )") == "'{'h0, 'ha, 'h14, 'h1e}\n");
+    }
+    SUBCASE("nested array of struct, and interleaved specs") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { logic [7:0] a; int b; } s_t;
+                s_t sarr [0:1];
+                initial begin
+                    sarr[0].a = 8'h1; sarr[0].b = 1;
+                    sarr[1].a = 8'h2; sarr[1].b = 2;
+                    $display("x=%0d v=%p y=%0d", 7, sarr, 9);
+                end
+            endmodule
+        )") == "x=7 v='{'{a:'h1, b:'h1}, '{a:'h2, b:'h2}} y=9\n");
     }
 }

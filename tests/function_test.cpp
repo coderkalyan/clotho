@@ -426,3 +426,78 @@ TEST_CASE("?: evaluates one arm on a definite condition, both on x") {
     CHECK(run_capture(src) == "f(01)\nr=01\nf(10)\nr=10\n"
                               "f(01)\nf(10)\nr=xx\nf(11)\nf(11)\nr=11\n");
 }
+
+// ---------------------------------------------------------------------------
+// Whole unpacked arrays through the function/task ABI (LRM 13.4/13.5): by-value
+// arguments (value semantics), array return, and array frame locals. iverilog
+// rejects whole-array arguments; values cross-checked against verilator 5.048.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("unpacked array as a by-value function argument (value semantics)") {
+    // 2-state array (layout-direct) sums; a 4-state array is copied into a
+    // canonical temp and the callee's mutation of its formal does not escape.
+    CHECK(run_capture(R"(
+        module m;
+            function automatic int suma(input int a [0:3]);
+                int t; int i;
+                t = 0;
+                for (i = 0; i < 4; i++) t = t + a[i];
+                return t;
+            endfunction
+            function automatic int clobber(input logic [7:0] a [0:3]);
+                a[0] = 8'hFF;   // must not affect the caller
+                return a[1];
+            endfunction
+            int  q [0:3];
+            logic [7:0] lq [0:3];
+            int i, r1, r2;
+            initial begin
+                for (i = 0; i < 4; i++) begin q[i] = i + 1; lq[i] = 8'h10 + i; end
+                r1 = suma(q);
+                r2 = clobber(lq);
+                $display("%0d %0d %0h", r1, r2, lq[0]);
+            end
+        endmodule
+    )") == "10 17 10\n");
+}
+
+TEST_CASE("unpacked array returned by value from a function") {
+    CHECK(run_capture(R"(
+        typedef int intarr_t [0:3];
+        module m;
+            function automatic intarr_t scale2(input int a [0:3]);
+                intarr_t r; int i;
+                for (i = 0; i < 4; i++) r[i] = a[i] * 2;
+                return r;
+            endfunction
+            int q [0:3];
+            int o [0:3];
+            int i;
+            initial begin
+                for (i = 0; i < 4; i++) q[i] = i + 1;
+                o = scale2(q);
+                $display("%0d %0d %0d %0d", o[0], o[1], o[2], o[3]);
+            end
+        endmodule
+    )") == "2 4 6 8\n");
+}
+
+TEST_CASE("unpacked array as a function frame local") {
+    CHECK(run_capture(R"(
+        module m;
+            function automatic int rev_sum(input int n);
+                int tmp [0:3];
+                int i, s;
+                for (i = 0; i < 4; i++) tmp[i] = n + i;
+                s = 0;
+                for (i = 0; i < 4; i++) s = s + tmp[3 - i];
+                return s;
+            endfunction
+            int r;
+            initial begin
+                r = rev_sum(10);
+                $display("%0d", r);
+            end
+        endmodule
+    )") == "46\n");
+}
