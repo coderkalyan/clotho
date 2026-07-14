@@ -155,6 +155,54 @@ TEST_CASE("a single-driver net keeps the plain-store path") {
     CHECK(out == "1\n");
 }
 
+TEST_CASE("wand resolves wired-AND, wor resolves wired-OR") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic e0, e1;
+          logic v0, v1;
+          wand wa;
+          wor  wo;
+          assign wa = e0 ? v0 : 1'bz;
+          assign wa = e1 ? v1 : 1'bz;
+          assign wo = e0 ? v0 : 1'bz;
+          assign wo = e1 ? v1 : 1'bz;
+          initial begin
+            e0=0; e1=0; v0=0; v1=0; #1; $display("%b %b", wa, wo); // z z
+            e0=1; v0=1;             #1; $display("%b %b", wa, wo); // 1 1
+            v0=0;                   #1; $display("%b %b", wa, wo); // 0 0
+            e1=1; v0=0; v1=1;       #1; $display("%b %b", wa, wo); // 0 1
+            v0=1; v1=1;             #1; $display("%b %b", wa, wo); // 1 1
+            v0=1; v1=1'bx;          #1; $display("%b %b", wa, wo); // x 1
+            v0=0;                   #1; $display("%b %b", wa, wo); // 0 x
+            $finish;
+          end
+        endmodule
+    )");
+    // wand: 0 dominates, x otherwise, z identity. wor: 1 dominates.
+    CHECK(out == "z z\n1 1\n0 0\n0 1\n1 1\nx 1\n0 x\n");
+}
+
+TEST_CASE("triand/trior synonyms fold, single-driver wand takes the plain path") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic [3:0] a, b, c;
+          triand [3:0] ta;
+          trior  [3:0] to;
+          wand  sd;
+          assign ta = a; assign ta = b; assign ta = c;
+          assign to = a; assign to = b; assign to = c;
+          assign sd = a[0];
+          initial begin
+            a=4'b1100; b=4'b1010; c=4'b1111; #1; $display("%b %b %b", ta, to, sd);
+            a=4'b0011;                        #1; $display("%b %b %b", ta, to, sd);
+            $finish;
+          end
+        endmodule
+    )");
+    // ta = a&b&c, to = a|b|c, sd = a[0] (one driver, no fold).
+    CHECK(out == "1000 1111 0\n0010 1111 1\n");
+}
+
 // -- Loud-failure guards for the shapes V1 does not resolve --
 
 TEST_CASE("a partial-select driver of a resolved net fails loudly") {

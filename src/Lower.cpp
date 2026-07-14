@@ -1932,20 +1932,25 @@ private:
                     ir::SignalInfo info;
                     if (m.kind == SymbolKind::Net) {
                         const NetSymbol& net = m.as<NetSymbol>();
-                        // Only single-driver, z-defaulting net kinds are modeled.
-                        // uwire (LRM 6.6.7) is complete, not a partial stub: its
-                        // single-driver mandate is enforced by slang's analysis
-                        // pass (MultipleUWireDrivers), which runs before lowering.
-                        // TODO: wand/wor/tri0/tri1/trireg/supply0/supply1 carry
-                        // resolution, pull, or charge semantics (and different
-                        // undriven defaults) clotho does not implement.
+                        // Modeled net kinds: wire/tri (+ uwire, single-driver
+                        // per slang's MultipleUWireDrivers pass) resolve to X on
+                        // conflict; wand/triand and wor/trior carry wired-AND /
+                        // wired-OR resolution (net_resolve_tag). All z-default
+                        // when undriven.
+                        // TODO: tri0/tri1/trireg/supply0/supply1 carry pull /
+                        // charge semantics and non-z undriven defaults clotho
+                        // does not implement.
                         switch (net.netType.netKind) {
                             case NetType::Wire:
                             case NetType::Tri:
                             case NetType::UWire:
+                            case NetType::WAnd:
+                            case NetType::TriAnd:
+                            case NetType::WOr:
+                            case NetType::TriOr:
                                 break;
                             default:
-                                fail("unsupported net type (only wire/tri/uwire are modeled)");
+                                fail("unsupported net type (only wire/tri/uwire/wand/wor are modeled)");
                         }
                         if (net.getDelay() != nullptr) {
                             // TODO: net delay (`wire #5 w;`, LRM 28.16) — an
@@ -2062,19 +2067,32 @@ private:
 
     // -- Net driver tracking --
     //
-    // Clotho has no net resolution: every continuous driver is an independent
-    // process and the last write wins, instead of resolving conflicting values
-    // to x per LRM 6.6.1 Table 6-2. Until resolution exists, a net whose bits
-    // gain a second continuous/structural driver (continuous assign, output
-    // port connection, input port copy, net declaration assignment) must fail
-    // loudly. Procedural writes are not continuous drivers and are not tracked.
+    // Each net's driven regions are recorded so a second overlapping driver
+    // marks the net for resolution (resolved_nets_): Emit then routes every
+    // whole-net driver to a slot and folds them (see the resolution section).
     // Coverage is tracked as an unpacked-array element band crossed with a
-    // packed bit range, so genuinely disjoint drivers stay accepted: distinct
-    // constant elements (assign mem[0]=.., assign mem[1]=..) and disjoint bits
-    // (assign w[0]=.., assign w[1]=..). Anything not provably disjoint (a
-    // dynamic index, a whole-net/array driver) covers the whole net and so
-    // still conflicts with every other driver.
-    // TODO: multiple-driver net resolution (LRM 6.6.1); then delete this guard.
+    // packed bit range, so genuinely disjoint drivers stay single-driver:
+    // distinct constant elements (assign mem[0]=.., assign mem[1]=..) and
+    // disjoint bits (assign w[0]=.., assign w[1]=..) never mark the net
+    // resolved. Anything not provably disjoint (a dynamic index, a
+    // whole-net/array driver) covers the whole net and so overlaps every other
+    // driver. Procedural writes are not continuous drivers and are not tracked.
+
+    // The multi-driver reducer for a net kind: wire/tri/uwire resolve to X on a
+    // 0-vs-1 conflict; wand/triand fold wired-AND, wor/trior wired-OR (LRM 6.6).
+    // Other kinds never reach here (collect_scope_signals rejects them).
+    static ir::Inst::Tag net_resolve_tag(NetType::NetKind kind) {
+        switch (kind) {
+            case NetType::WAnd:
+            case NetType::TriAnd:
+                return ir::Inst::Tag::WandRes;
+            case NetType::WOr:
+            case NetType::TriOr:
+                return ir::Inst::Tag::WorRes;
+            default:
+                return ir::Inst::Tag::WireRes;
+        }
+    }
 
     // A driven region of a net: an unpacked-array element band crossed with a
     // packed bit range within one element. A packed (non-array) net uses the
@@ -2107,9 +2125,12 @@ private:
             if (reg.elem_lo <= p.elem_hi && p.elem_lo <= reg.elem_hi &&
                 reg.bit_lo <= p.bit_hi && p.bit_lo <= reg.bit_hi) {
                 // A second driver overlaps an existing one: the net needs
-                // resolution (LRM 6.6.1). Emit routes every driver of a resolved
-                // net to its own slot and folds them through a WireRes resolver.
-                resolved_nets_.insert(net);
+                // resolution (LRM 6.6). Emit routes every driver of a resolved
+                // net to its own slot and folds them through the net-kind's
+                // reducer (wire -> X on conflict, wand/wor -> wired-AND/OR).
+                if (resolved_nets_.insert(net).second) {
+                    net_resolve_op_[net] = net_resolve_tag(sym.as<NetSymbol>().netType.netKind);
+                }
                 break;
             }
         }
@@ -2481,11 +2502,12 @@ private:
         for (const auto& [net_u, slots] : resolved_slots_) {
             const ir::Signal    net = static_cast<ir::Signal>(net_u);
             const ir::SourceLoc l   = resolved_loc_[net_u];
+            const ir::Inst::Tag op  = net_resolve_op_[net_u];
             ir::Builder         b(module_.pool);
             ir::Index           acc = b.unary(ir::Inst::Tag::Load, b.signal(slots[0], l), l);
             for (size_t k = 1; k < slots.size(); ++k) {
                 const ir::Index next = b.unary(ir::Inst::Tag::Load, b.signal(slots[k], l), l);
-                acc                  = b.binary(ir::Inst::Tag::WireRes, acc, next, l);
+                acc                  = b.binary(op, acc, next, l);
             }
             b.binary(ir::Inst::Tag::Store, b.signal(net, l), acc, l);
             std::vector<ir::WaitEvent> wait_events;
@@ -9385,6 +9407,9 @@ private:
     ankerl::unordered_dense::map<uint32_t, std::vector<ir::Signal>> resolved_slots_;
     ankerl::unordered_dense::map<uint32_t, uint32_t>                resolved_scope_;
     ankerl::unordered_dense::map<uint32_t, ir::SourceLoc>           resolved_loc_;
+    // Per resolved net: which reducer folds its slots (WireRes / WandRes /
+    // WorRes), from the net kind (net_resolve_tag).
+    ankerl::unordered_dense::map<uint32_t, ir::Inst::Tag>           net_resolve_op_;
     // Hierarchical name prefix of the instance currently being lowered (e.g.
     // "u_alu.u_sub."); empty for the top. Prepended to every signal name created
     // while this instance's body is processed so flattened signals stay unique.
