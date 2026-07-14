@@ -9,6 +9,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -584,6 +585,9 @@ public:
         std::vector<llvm::Function*> group_fns;
         for (const std::vector<uint32_t>& g : groups_) {
             group_fns.push_back(lower_group(g));
+        }
+        if (!shape_sets_.empty()) {
+            report_dedup_shapes(group_fns);
         }
         // Blocks are discovered during the lowering above; size the block-commit
         // globals and emit the commit / enqueue functions now, before emit_main
@@ -3948,7 +3952,7 @@ private:
     // signal inside an extra record (Wait / StoreNbEvent / ReadMem / FreadMem /
     // EventTriggerNbDelayed) or a FunctionId (per-instance function copies)
     // hashes instance-specific — counted as blockers, not miscounted as twins.
-    void report_dedup_stat() const {
+    void report_dedup_stat() {
         struct Key {
             llvm::StructType* ty;
             uint64_t          hash;
@@ -3971,6 +3975,7 @@ private:
         uint64_t attributed = 0, eligible = 0, covered = 0, blocked_call = 0, blocked_extra_sig = 0,
                  blocked_xhier = 0;
         ankerl::unordered_dense::map<Key, uint32_t, KeyHash> twins;
+        std::vector<std::pair<uint32_t, Key>>                proc_keys;
         std::vector<uint8_t>                                 buf;
         for (const Process& p : all) {
             if (p.scope == Process::no_scope || p.scope >= anchor_of_scope_.size() ||
@@ -4040,8 +4045,10 @@ private:
             blocked_call += calls ? 1 : 0;
             blocked_extra_sig += extra_sig ? 1 : 0;
             blocked_xhier += xhier ? 1 : 0;
-            twins[Key{ home.ty,
-                       ankerl::unordered_dense::detail::wyhash::hash(buf.data(), buf.size()) }]++;
+            const Key key{ home.ty,
+                           ankerl::unordered_dense::detail::wyhash::hash(buf.data(), buf.size()) };
+            twins[key]++;
+            proc_keys.emplace_back(static_cast<uint32_t>(&p - all.data()), key);
         }
 
         uint64_t groups2 = 0;
@@ -4049,6 +4056,24 @@ private:
             if (n >= 2) {
                 ++groups2;
                 covered += n;
+            }
+        }
+        // Shape mode (CLOTHO_DEDUP_STAT=2): remember the twin sets so
+        // report_dedup_shapes can compare the lowered LLVM functions after the
+        // groups exist.
+        const char* mode = std::getenv("CLOTHO_DEDUP_STAT");
+        if (mode != nullptr && std::string_view(mode) == "2") {
+            ankerl::unordered_dense::map<Key, uint32_t, KeyHash> set_of;
+            for (const auto& [proc, key] : proc_keys) {
+                if (twins[key] < 2) {
+                    continue;
+                }
+                const auto [it, fresh] = set_of.try_emplace(
+                  key, static_cast<uint32_t>(shape_sets_.size()));
+                if (fresh) {
+                    shape_sets_.push_back({});
+                }
+                shape_sets_[it->second].push_back(proc);
             }
         }
         std::fprintf(stderr,
@@ -4061,6 +4086,92 @@ private:
                                    : 0.0,
                      (unsigned long long)blocked_call, (unsigned long long)blocked_extra_sig,
                      (unsigned long long)blocked_xhier);
+    }
+
+    // Shape-equality proof (CLOTHO_DEDUP_STAT=2): for every twin set the
+    // detector found, print each member's lowered LLVM function and compare
+    // them after normalizing the only legitimately instance-specific tokens —
+    // the function's own name and the @clotho.inst.* symbols (numbered by
+    // first occurrence per function, so two distinct symbols at one position
+    // versus one reused symbol still differ). A remaining mismatch is a
+    // per-instance bake the def-relative families missed; sharing must not
+    // proceed past a DIFF. Only singleton fusion groups compare — a fused
+    // function mixes members, so per-process comparison is meaningless there.
+    static std::string normalize_shape(llvm::Function* fn) {
+        std::string raw;
+        {
+            llvm::raw_string_ostream os(raw);
+            fn->print(os);
+        }
+        const auto ident = [](char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                   c == '_' || c == '.' || c == '$' || c == '-';
+        };
+        ankerl::unordered_dense::map<std::string, uint32_t> inst_ids;
+        std::string out;
+        out.reserve(raw.size());
+        size_t i = 0;
+        while (i < raw.size()) {
+            if (raw[i] != '@') {
+                out += raw[i++];
+                continue;
+            }
+            size_t j = i + 1;
+            while (j < raw.size() && ident(raw[j])) {
+                ++j;
+            }
+            const std::string tok = raw.substr(i, j - i);
+            if (tok.starts_with("@clotho.inst.")) {
+                const auto [it, fresh] =
+                  inst_ids.try_emplace(tok, static_cast<uint32_t>(inst_ids.size()));
+                out += "@INST" + std::to_string(it->second);
+            } else if (tok == "@" + fn->getName().str()) {
+                out += "@FN";
+            } else {
+                out += tok;
+            }
+            i = j;
+        }
+        return out;
+    }
+
+    void report_dedup_shapes(const std::vector<llvm::Function*>& group_fns) {
+        uint64_t ok = 0, differ = 0, skipped = 0;
+        for (size_t k = 0; k < shape_sets_.size(); ++k) {
+            const std::vector<uint32_t>& procs = shape_sets_[k];
+            bool singleton = true;
+            for (const uint32_t p : procs) {
+                singleton = singleton && groups_[group_of_[p]].size() == 1;
+            }
+            if (!singleton) {
+                ++skipped;
+                continue;
+            }
+            const std::string first = normalize_shape(group_fns[group_of_[procs.front()]]);
+            bool              same  = true;
+            for (size_t m = 1; m < procs.size() && same; ++m) {
+                const std::string other = normalize_shape(group_fns[group_of_[procs[m]]]);
+                if (other != first) {
+                    same = false;
+                    // First mismatching line, for diagnosis.
+                    std::istringstream a(first), b(other);
+                    std::string        la, lb;
+                    while (std::getline(a, la) && std::getline(b, lb)) {
+                        if (la != lb) {
+                            std::fprintf(stderr, "dedup-shape DIFF set %zu (procs %u vs %u):\n  - %s\n  + %s\n",
+                                         k, procs.front(), procs[m], la.c_str(), lb.c_str());
+                            break;
+                        }
+                    }
+                }
+            }
+            ok += same ? 1 : 0;
+            differ += same ? 0 : 1;
+        }
+        std::fprintf(stderr,
+                     "dedup-shape: %zu twin sets: %llu identical, %llu DIFFER, %llu skipped (fused)\n",
+                     shape_sets_.size(), (unsigned long long)ok, (unsigned long long)differ,
+                     (unsigned long long)skipped);
     }
 
     void report_comb_fuse_stat() const {
@@ -13606,6 +13717,9 @@ private:
     std::vector<Anchor> anchors_;
     // InstanceScope::id -> anchor index (no_anchor when the id is unknown).
     std::vector<uint32_t> anchor_of_scope_;
+    // Twin sets (process indices) recorded by report_dedup_stat under
+    // CLOTHO_DEDUP_STAT=2, compared post-lowering by report_dedup_shapes.
+    std::vector<std::vector<uint32_t>> shape_sets_;
 
     // VCD dirty set (meaningful iff design_uses_vcd_). vcd_index_[sig] is the
     // runtime dump-var index of a dumped scalar signal, or -1 when the signal is
