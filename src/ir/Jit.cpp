@@ -76,9 +76,13 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     // context migration when parallel.
     SimulationConfig jit_config = config;
     jit_config.optimize         = true;
-    auto built                  = build_modules_unoptimized(m, *ctx, jit_config);
+    const bool stat             = getenv("CLOTHO_PARALLEL_STAT") != nullptr;
+    auto       built            = build_modules_unoptimized(m, *ctx, jit_config);
     if (built.modules.empty()) {
         return -1; // build_modules_unoptimized already reported the reason.
+    }
+    if (stat) {
+        fprintf(stderr, "PARALLEL_STAT build_modules_unoptimized: %.1f ms\n", ms_since(t_llvm));
     }
 
     // Parallel compile needs its own context per module to mean anything;
@@ -382,6 +386,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
         // below is independently reparsed into its own fresh LLVMContext, so
         // optimize_module + verify + addIRModule for different units run
         // concurrently instead of serializing on one shared context's lock.
+        const auto t_serialize = std::chrono::steady_clock::now();
         std::vector<llvm::SmallVector<char, 0>> bitcode(built.modules.size());
         for (size_t i = 0; i < built.modules.size(); ++i) {
             llvm::raw_svector_ostream os(bitcode[i]);
@@ -389,6 +394,12 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
         }
         built.modules.clear();
         ctx.reset();
+        if (stat) {
+            fprintf(stderr, "PARALLEL_STAT serialize: %.1f ms\n", ms_since(t_serialize));
+        }
+
+        const auto          t_parallel = std::chrono::steady_clock::now();
+        std::vector<double> stat_ms(stat ? bitcode.size() : 0);
 
         llvm::DefaultThreadPool pool(llvm::hardware_concurrency(config.compile_jobs));
         std::mutex              err_mu;
@@ -397,6 +408,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
         tasks.reserve(bitcode.size());
         for (size_t i = 0; i < bitcode.size(); ++i) {
             tasks.push_back(pool.async([&, i] {
+                const auto              t0      = std::chrono::steady_clock::now();
                 auto                   mod_ctx = std::make_unique<llvm::LLVMContext>();
                 llvm::MemoryBufferRef  buf(llvm::StringRef(bitcode[i].data(), bitcode[i].size()),
                                           "clotho.unit");
@@ -424,10 +436,40 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
                       llvm::orc::ThreadSafeModule(std::move(*parsed), std::move(mod_tsc)))) {
                     fail("jit: " + llvm::toString(std::move(err)));
                 }
+                if (stat) {
+                    stat_ms[i] = ms_since(t0);
+                }
             }));
         }
         for (auto& t : tasks) {
             t.wait();
+        }
+        if (stat) {
+            fprintf(stderr, "PARALLEL_STAT parallel section wall: %.1f ms\n", ms_since(t_parallel));
+        }
+        if (stat) {
+            double sum = 0.0, max_ms = 0.0;
+            size_t max_i = 0;
+            for (size_t i = 0; i < stat_ms.size(); ++i) {
+                sum += stat_ms[i];
+                if (stat_ms[i] > max_ms) {
+                    max_ms = stat_ms[i];
+                    max_i  = i;
+                }
+            }
+            // max_ms is the longest single module's optimize+verify+addIRModule
+            // time — a hard wall-time floor no thread count can beat. sum/max_ms
+            // is the speedup ceiling (vs a hypothetical fully-serial run of just
+            // this phase); compare against the measured speedup to see how much
+            // headroom load imbalance (a few big modules dominating) is costing.
+            fprintf(stderr,
+                    "PARALLEL_STAT modules=%zu jobs=%u sum_ms=%.1f max_ms=%.1f (module %zu) "
+                    "ceiling=%.2fx\n",
+                    stat_ms.size(), n_jobs, sum, max_ms, max_i, sum / std::max(max_ms, 1e-6));
+            for (size_t i = 0; i < stat_ms.size(); ++i) {
+                fprintf(stderr, "  module %zu: %.1f ms (bitcode %zu B)\n", i, stat_ms[i],
+                        bitcode[i].size());
+            }
         }
         if (!first_err.empty()) {
             llvm::errs() << first_err << "\n";
@@ -454,10 +496,14 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     // Looking up `main` materializes the root module through the compile
     // layer; its references to the unit modules' group functions materialize
     // those in turn, i.e. eagerly compiles the whole design.
-    auto sym = (*jit)->lookup("main");
+    const auto t_lookup = std::chrono::steady_clock::now();
+    auto       sym      = (*jit)->lookup("main");
     if (!sym) {
         llvm::errs() << "jit: " << llvm::toString(sym.takeError()) << "\n";
         return -1;
+    }
+    if (stat) {
+        fprintf(stderr, "PARALLEL_STAT lookup(main) [ORC codegen]: %.1f ms\n", ms_since(t_lookup));
     }
 
     auto* fn = sym->toPtr<int (*)()>();
