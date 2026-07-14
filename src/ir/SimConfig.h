@@ -54,6 +54,14 @@ struct SimulationConfig {
     // prove clean. When off, none of the specialization machinery is emitted
     // (the design compiles exactly as without the feature).
     bool domain_spec = false;
+    // Share one compiled body across twin instances of a reused module
+    // definition: thunk groups whose lowered functions are identical modulo
+    // their instance-context symbol collapse to ONE shared body (ctx passed
+    // as a parameter) plus a two-instruction musttail stub per instance
+    // (see share_twin_groups in LlvmBackend.cpp). Sharing is gated on
+    // literal post-lowering IR identity, so semantics are byte-identical
+    // either way. Disable for bisection / debugging.
+    bool dedup = true;
     // Register LLVM's perf JITEventListener on the object-linking layer so the
     // JIT'd design's functions show up in `perf` with real symbols. Emits a
     // jitdump (`$JITDUMPDIR/jit-<pid>.dump`) consumed by `perf inject --jit`.

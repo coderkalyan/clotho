@@ -32,6 +32,7 @@
 #include <llvm/IR/Verifier.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/TargetSelect.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 
 #include "ir/InternPool.h"
 #include "ir/Ir.h"
@@ -602,6 +603,9 @@ public:
         }
         if (!shape_sets_.empty()) {
             report_dedup_shapes(group_fns);
+        }
+        if (config_.dedup && config_.thunk) {
+            share_twin_groups(group_fns);
         }
         // Blocks are discovered during the lowering above; size the block-commit
         // globals and emit the commit / enqueue functions now, before emit_main
@@ -4389,6 +4393,180 @@ private:
                      "dedup-shape: %zu twin sets: %llu identical, %llu DIFFER, %llu skipped (fused)\n",
                      shape_sets_.size(), (unsigned long long)ok, (unsigned long long)differ,
                      (unsigned long long)skipped);
+    }
+
+    // -- Module-instance body sharing (dedup V1) --
+
+    // The single @clotho.inst.* global a function references, or null when it
+    // references none, more than one, or one from a PHI operand (a shape the
+    // ctx-to-parameter rewrite below does not handle). Eligible bodies
+    // reference exactly their own instance context: every def-relative site
+    // routes through ctx_field and def_relative_for restricts that to the
+    // group's own anchor.
+    static llvm::GlobalVariable* only_inst_global(llvm::Function* fn) {
+        llvm::GlobalVariable* found = nullptr;
+        bool                  bad   = false;
+        auto scan = [&](auto&& self, llvm::Constant* c) -> void {
+            if (auto* gv = llvm::dyn_cast<llvm::GlobalVariable>(c)) {
+                if (gv->getName().starts_with("clotho.inst.")) {
+                    bad   = bad || (found != nullptr && found != gv);
+                    found = gv;
+                }
+                return;
+            }
+            if (llvm::isa<llvm::GlobalValue>(c)) {
+                return;
+            }
+            for (const llvm::Use& op : c->operands()) {
+                if (auto* oc = llvm::dyn_cast<llvm::Constant>(op)) {
+                    self(self, oc);
+                }
+            }
+        };
+        for (llvm::BasicBlock& bb : *fn) {
+            for (llvm::Instruction& in : bb) {
+                for (const llvm::Use& op : in.operands()) {
+                    auto* c = llvm::dyn_cast<llvm::Constant>(op);
+                    if (c == nullptr) {
+                        continue;
+                    }
+                    llvm::GlobalVariable* before = found;
+                    scan(scan, c);
+                    bad = bad || (llvm::isa<llvm::PHINode>(in) && found != before);
+                }
+            }
+        }
+        return bad ? nullptr : found;
+    }
+
+    static bool constant_uses(const llvm::Constant* c, const llvm::GlobalVariable* gv) {
+        if (c == gv) {
+            return true;
+        }
+        if (llvm::isa<llvm::GlobalValue>(c)) {
+            return false;
+        }
+        for (const llvm::Use& op : c->operands()) {
+            if (auto* oc = llvm::dyn_cast<llvm::Constant>(op); oc != nullptr && constant_uses(oc, gv)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Clone `rep` into the definition's shared body: same (ptr, ptr) -> void
+    // signature, with every constant reference to the rep instance's ctx
+    // global rewritten to the first parameter. noinline keeps ONE compiled
+    // copy — the inliner would otherwise re-expand the body into every stub,
+    // undoing the compile-time win.
+    llvm::Function* clone_with_ctx_param(llvm::Function* rep, llvm::GlobalVariable* ctx_gv) {
+        auto* shared = llvm::Function::Create(rep->getFunctionType(), llvm::Function::InternalLinkage,
+                                              rep->getName() + ".shared", llmod_);
+        llvm::ValueToValueMapTy vmap;
+        auto                    ni = shared->arg_begin();
+        for (llvm::Argument& a : rep->args()) {
+            vmap[&a] = &*ni;
+            ++ni;
+        }
+        llvm::SmallVector<llvm::ReturnInst*, 4> rets;
+        llvm::CloneFunctionInto(shared, rep, vmap, llvm::CloneFunctionChangeType::LocalChangesOnly, rets);
+        // After the clone: CloneFunctionInto copies the rep's attributes,
+        // which would reset these.
+        shared->setDSOLocal(true);
+        shared->addFnAttr(llvm::Attribute::NoInline);
+        llvm::Argument* ctx_arg = shared->getArg(0);
+        ctx_arg->setName("ictx");
+        for (llvm::BasicBlock& bb : *shared) {
+            for (llvm::Instruction& in : bb) {
+                for (unsigned i = 0; i < in.getNumOperands(); ++i) {
+                    llvm::Value* op = in.getOperand(i);
+                    if (op == ctx_gv) {
+                        in.setOperand(i, ctx_arg);
+                        continue;
+                    }
+                    auto* ce = llvm::dyn_cast<llvm::ConstantExpr>(op);
+                    if (ce == nullptr || !constant_uses(ce, ctx_gv)) {
+                        continue;
+                    }
+                    llvm::Instruction* repl = ce->getAsInstruction();
+                    repl->insertBefore(in.getIterator());
+                    for (unsigned k = 0; k < repl->getNumOperands(); ++k) {
+                        if (repl->getOperand(k) == ctx_gv) {
+                            repl->setOperand(k, ctx_arg);
+                        }
+                    }
+                    in.setOperand(i, repl);
+                }
+            }
+        }
+        return shared;
+    }
+
+    // Replace `fn`'s body with a musttail stub into the shared body, passing
+    // this instance's ctx global as the first argument (identical (ptr, ptr)
+    // prototypes, so the subscription/dispatch ABI is untouched).
+    void rewrite_to_stub(llvm::Function* fn, llvm::Function* shared, llvm::GlobalVariable* ctx_gv) {
+        fn->deleteBody();
+        llvm::IRBuilderBase::InsertPoint saved = b_.saveIP();
+        b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn));
+        auto* call = b_.CreateCall(shared->getFunctionType(), shared, { ctx_gv, fn->getArg(1) });
+        call->setTailCallKind(llvm::CallInst::TCK_MustTail);
+        b_.CreateRetVoid();
+        b_.restoreIP(saved);
+    }
+
+    // Share one compiled body across twin instances of a reused definition.
+    // Candidates: thunk groups attributed to a reused-definition instance
+    // (group_anchor_of_) whose lowered function leaves the state argument
+    // unused (thunk bodies address storage through the anchors) and
+    // references exactly its own instance-context global. Groups bucket by
+    // normalize_shape — literal IR identity modulo the function's own name
+    // and that one symbol — so the transformation applies only where it is
+    // provably exact; the canonical-hash detector (report_dedup_stat) is a
+    // statistic, not the gate. Each bucket of >= 2 keeps one shared body (a
+    // clone of the first member with the ctx global replaced by a parameter)
+    // and every member becomes a two-instruction musttail stub passing its
+    // own ctx. Per-member NBA blocks / commit functions / ctx fills, VCD
+    // indices, and wait machinery are untouched — members registered their
+    // own during lowering; only body code is shared. Runs before
+    // finalize_block_nba / emit_main (nothing reads group function bodies,
+    // only their addresses). Disabled by --no-dedup.
+    void share_twin_groups(const std::vector<llvm::Function*>& group_fns) {
+        struct Cand {
+            uint32_t              g;
+            llvm::GlobalVariable* ctx;
+        };
+        ankerl::unordered_dense::map<std::string, std::vector<Cand>> buckets;
+        for (uint32_t g = 0; g < groups_.size(); ++g) {
+            if (!thunk_group_[g] || group_anchor_of_[g] == SignalSlot::no_anchor) {
+                continue;
+            }
+            llvm::Function* fn = group_fns[g];
+            if (!fn->getArg(0)->use_empty()) {
+                continue;
+            }
+            llvm::GlobalVariable* ctx = only_inst_global(fn);
+            if (ctx == nullptr || ctx != anchors_[group_anchor_of_[g]].ctx_gv) {
+                continue;
+            }
+            buckets[normalize_shape(fn)].push_back({ g, ctx });
+        }
+        uint64_t sets = 0, members = 0;
+        for (auto& [shape, cs] : buckets) {
+            if (cs.size() < 2) {
+                continue;
+            }
+            ++sets;
+            members += cs.size();
+            llvm::Function* shared = clone_with_ctx_param(group_fns[cs.front().g], cs.front().ctx);
+            for (const Cand& c : cs) {
+                rewrite_to_stub(group_fns[c.g], shared, c.ctx);
+            }
+        }
+        if (std::getenv("CLOTHO_DEDUP_STAT") != nullptr) {
+            std::fprintf(stderr, "dedup-share: %llu bodies -> %llu shared\n",
+                         (unsigned long long)members, (unsigned long long)sets);
+        }
     }
 
     void report_comb_fuse_stat() const {

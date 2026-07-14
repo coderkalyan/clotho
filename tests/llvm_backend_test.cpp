@@ -1717,6 +1717,34 @@ TEST_CASE("nonblocking assignment across reused module instances") {
     CHECK(out == "ee ce b2 82 d3 a3\n");
 }
 
+// Body sharing across twin instances (share_twin_groups) must not change
+// behavior: the same reused-instance design runs byte-identically with
+// sharing disabled. Default config runs WITH sharing; the pinned expected
+// value above already covers that side.
+TEST_CASE("reused module instances: dedup off matches dedup on") {
+    const char* src = R"(
+        module leaf(input wire clk, input wire [7:0] d, output reg [7:0] q, output reg [7:0] r);
+            initial begin q = 8'h5a; r = 8'ha5; end
+            always @(posedge clk) begin q <= d + q; r <= q ^ d; end
+        endmodule
+        module top;
+            reg clk = 0; reg [7:0] d = 1;
+            wire [7:0] q0, r0, q1, r1, q2, r2;
+            leaf l0(clk, d, q0, r0);
+            leaf l1(clk, q0, q1, r1);
+            leaf l2(clk, r1, q2, r2);
+            initial begin
+                repeat (200) begin #5 clk = ~clk; d = d + 3; end
+                $display("%h %h %h %h %h %h", q0, r0, q1, r1, q2, r2);
+            end
+        endmodule
+    )";
+    const std::string on  = run_capture(src);
+    const std::string off = run_capture(src, { .dedup = false });
+    CHECK(on == "ee ce b2 82 d3 a3\n");
+    CHECK(off == on);
+}
+
 TEST_CASE("identically named signals in separate tops stay independent") {
     const std::string out = run_capture(R"(
         module a;
