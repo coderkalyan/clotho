@@ -8015,6 +8015,13 @@ private:
                              ir::SourceLoc l) {
         if (e.kind == ExpressionKind::RangeSelect) {
             const auto& rs = e.as<RangeSelectExpression>();
+            if (!is_queue(rs.value())) {
+                // TODO: slice of a dynamic array yields a queue (LRM 7.10.4); its
+                // source handle is an rt_dynarr, not the rt_queue that
+                // rt_queue_append_range walks. Guarded here because the assignment
+                // path reaches this before lower_range_select's own guard.
+                fail("slice of a dynamic array is not supported");
+            }
             if (rs.getSelectionKind() != RangeSelectionKind::Simple) {
                 // TODO: indexed part-select slice q[i +: n] of a queue (runtime
                 // base makes the first index non-constant, but the range op takes
@@ -8042,9 +8049,18 @@ private:
         for (const Expression* op : pieces) {
             if (is_queue(*op)) {
                 b.queue_append_range(dst, materialize_queue_rvalue(*op, b), lo0, hiEnd, qty, l);
-            } else {
-                b.queue_push(dst, lower_expr(*op, b), /*front=*/false, qty, l);
+                continue;
             }
+            if (is_dyn_array(*op) || op->type->getCanonicalType().isUnpackedArray()) {
+                // A dynamic-array / unpacked-array operand splices its elements
+                // (LRM 11.4.12), but rt_queue_append_range only walks an rt_queue
+                // source; the frontend would otherwise push the whole aggregate as
+                // one (garbage) scalar element.
+                fail("concatenation of a dynamic array / unpacked array into a queue "
+                     "is not supported");
+            }
+            // A single element operand.
+            b.queue_push(dst, lower_expr(*op, b), /*front=*/false, qty, l);
         }
     }
 
