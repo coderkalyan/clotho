@@ -7207,13 +7207,37 @@ private:
     // real leaves only (a string / handle leaf is guarded).
     void expand_p_arg(const Expression& arg, std::string& frag, std::vector<ir::Index>& args,
                       ir::Builder& b) {
-        const ir::Ref ty = lower_type(*arg.type);
-        if (!is_agg_abi_ref(ty)) {
+        const ir::Ref        ty = lower_type(*arg.type);
+        const ir::Type::Kind k  = std::get<ir::Type>(module_.pool.get(ty)).kind;
+        const bool container = k == ir::Type::Kind::Queue || k == ir::Type::Kind::DynArray;
+        if (!is_agg_abi_ref(ty) && !container) {
             frag += "%0d";
             args.push_back(lower_expr(arg, b));
             return;
         }
         expand_p_lvalue(lower_lvalue(unwrap_conversion(arg), b), ty, frag, args, b, loc(arg));
+    }
+
+    // Guard the element type of a `%p`'d queue / dynamic array: the runtime
+    // formatter renders integral (width <= 64), real, and string leaves; a
+    // wider or nested-aggregate element is a documented follow-up (a non-POD
+    // element is already rejected in lower_type).
+    void guard_container_p_element(ir::Ref elem) {
+        const ir::Type& e = std::get<ir::Type>(module_.pool.get(elem));
+        if (e.kind == ir::Type::Kind::String || module_.pool.is_float(elem)) {
+            return;
+        }
+        if (value_cat(elem) == ValueCat::scalar) {
+            if (module_.pool.layout(elem).width > 64) {
+                // TODO: %p of a queue / dynamic array element wider than 64 bits
+                // (the runtime plane extraction is single-word).
+                fail("%p of a queue / dynamic array element wider than 64 bits is not supported");
+            }
+            return;
+        }
+        // TODO: %p of a queue / dynamic array of nested aggregate / handle
+        // elements (needs recursive runtime rendering).
+        fail("%p of a queue / dynamic array with a nested aggregate element is not supported");
     }
 
     void expand_p_lvalue(ir::Index lv, ir::Ref ty, std::string& frag, std::vector<ir::Index>& args,
@@ -7254,10 +7278,17 @@ private:
             frag += "}";
             return;
         }
+        if (t.kind == ir::Type::Kind::Queue || t.kind == ir::Type::Kind::DynArray) {
+            // A queue / dynamic-array leaf renders at runtime over its live element
+            // count (LRM 21.2.1.6), spliced in as a `%s` string argument.
+            guard_container_p_element(t.element);
+            frag += "%s";
+            args.push_back(b.container_fmt_p(lv, ty, l));
+            return;
+        }
         if (value_cat(ty) != ValueCat::scalar) {
-            // TODO: %p of a string / dynamic-array / queue leaf (needs the element
-            // string / handle rendering path).
-            fail("%p of a string or heap-handle aggregate leaf is not supported");
+            // TODO: %p of a string leaf (needs the element string rendering path).
+            fail("%p of a string aggregate leaf is not supported");
         }
         // Integral leaves render in hex with a `'h` base tag; reals as %g (matching
         // verilator's %p leaf format).

@@ -564,6 +564,11 @@ Index Builder::sformatf(std::string_view fmt, std::span<const Index> args, Sourc
     return emit({ Inst::Tag::Sformatf, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
+Index Builder::container_fmt_p(Index handle, Ref container_type, SourceLoc loc) {
+    return emit({ Inst::Tag::ContainerFmtP, Inst::Payload{ .op_type = { handle, container_type } } },
+                loc);
+}
+
 Index Builder::ferror(Index dst, Index fd, SourceLoc loc) {
     return emit({ Inst::Tag::Ferror, Inst::Payload{ .binary = { dst, fd } } }, loc);
 }

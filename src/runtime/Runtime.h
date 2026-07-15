@@ -565,6 +565,15 @@ void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_elem_ops* ops)
 void rt_queue_append_range(rt_queue* dst, const rt_queue* src, const rt_elem_ops* ops,
                            uint64_t bound, int64_t lo, int64_t hi);
 
+// Render a queue (is_queue != 0) or dynamic array as `%p` text `'{e0, ...}`
+// (LRM 21.2.1.6) into `out`. `kind`: 0 integral, 1 real, 2 string element. An
+// integral slot is `must | (may << width)` plus an optional z plane at `z_off`
+// (a 2-state slot is the bare value); element `width` <= 64. The frontend
+// guards non-POD / wider elements.
+void rt_container_format_p(rt_string* out, const void* handle, int32_t is_queue, int32_t kind,
+                           uint32_t width, uint32_t is_signed, uint32_t four_state, uint32_t has_z,
+                           uint32_t z_off, uint64_t stride);
+
 // q.reverse() / q.sort() / q.rsort() (LRM 7.12.2). `kind` / `width` / `rev` match
 // the rt_dynarr_* ordering entry points; operates on the ring's logical order.
 void rt_queue_reverse(rt_queue* h, uint64_t stride);

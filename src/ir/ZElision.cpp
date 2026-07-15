@@ -554,6 +554,7 @@ struct Analysis {
                 case Inst::Tag::StrLower:
                 case Inst::Tag::StrSubstr:
                 case Inst::Tag::EnumName:
+                case Inst::Tag::ContainerFmtP:
                 case Inst::Tag::StrFromPacked:
                 case Inst::Tag::StrToPacked:
                 // atoi/atohex/atooct/atobin/atoreal parse a string's bytes into a

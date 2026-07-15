@@ -1449,6 +1449,79 @@ extern "C" void rt_queue_append_range(rt_queue* dst, const rt_queue* src,
     }
 }
 
+// Render a queue / dynamic array as `%p` assignment-pattern text `'{e0, ...}`
+// (LRM 21.2.1.6) into `out`. `kind`: 0 integral, 1 real, 2 string element. An
+// integral element slot is `must | (may << width)` (an i(2*width) word) plus an
+// optional z plane at `z_off`; a 2-state slot is the bare value word. Element
+// width is <= 64 (the frontend guards wider). Integral leaves reuse render_arg
+// under `'h%0h` (minimal hex) so the leaf format matches a fixed-array `%p`.
+extern "C" void rt_container_format_p(rt_string* out, const void* handle, int32_t is_queue,
+                                      int32_t kind, uint32_t width, uint32_t is_signed,
+                                      uint32_t four_state, uint32_t has_z, uint32_t z_off,
+                                      uint64_t stride) {
+    uint64_t       count = 0;
+    const uint8_t* base  = nullptr; // dynamic-array element base (linear)
+    const rt_queue* q    = nullptr; // queue handle (ring indexing)
+    if (is_queue != 0) {
+        q     = static_cast<const rt_queue*>(handle);
+        count = q->len;
+    } else {
+        const auto* a = static_cast<const rt_dynarr*>(handle);
+        count         = a->len;
+        base          = static_cast<const uint8_t*>(a->data);
+    }
+
+    clotho::FormatSpec spec{};
+    spec.ok        = true;
+    spec.conv      = 'h';
+    spec.has_width = true; // width 0 => minimal digits (the %0h form)
+
+    std::string s = "'{";
+    for (uint64_t i = 0; i < count; ++i) {
+        if (i != 0) {
+            s += ", ";
+        }
+        const uint8_t* slot = q != nullptr ? q_elem(q, stride, i) : base + i * stride;
+        if (kind == 2) {
+            const auto* es = reinterpret_cast<const rt_string*>(slot);
+            s += '"';
+            s.append(rt_string_data(es), static_cast<size_t>(rt_string_len(es)));
+            s += '"';
+            continue;
+        }
+        if (kind == 1) {
+            double dv = 0;
+            std::memcpy(&dv, slot, sizeof(double));
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%g", dv);
+            s += buf;
+            continue;
+        }
+        // Integral: extract the must / xz / z planes for render_arg.
+        const uint64_t maskW = width >= 64 ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << width) - 1);
+        uint64_t       must = 0, xz = 0, z = 0;
+        if (four_state != 0) {
+            unsigned __int128 f0 = 0;
+            std::memcpy(&f0, slot, static_cast<size_t>((2 * width + 7) / 8));
+            must = static_cast<uint64_t>(f0) & maskW;
+            const uint64_t may = static_cast<uint64_t>(f0 >> width) & maskW;
+            xz                 = must ^ may;
+            if (has_z != 0) {
+                std::memcpy(&z, slot + z_off, static_cast<size_t>((width + 7) / 8));
+                z &= maskW;
+            }
+        } else {
+            std::memcpy(&must, slot, static_cast<size_t>((width + 7) / 8));
+            must &= maskW;
+        }
+        s += "'h";
+        const rt_arg a{ width, is_signed != 0 ? 1u : 0u, &must, &xz, &z };
+        render_arg(s, a, spec);
+    }
+    s += '}';
+    rt_string_assign_bytes(out, s.data(), static_cast<uint64_t>(s.size()));
+}
+
 extern "C" void rt_queue_reverse(rt_queue* h, uint64_t stride) {
     if (h->len < 2) {
         return;

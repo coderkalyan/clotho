@@ -192,7 +192,7 @@ TEST_CASE("build a combinational process and query it") {
     CHECK(ir.tag(va) == Inst::Tag::Load);
     CHECK(ir.tag(r) == Inst::Tag::Band);
 
-    std::array<Index, 3> scratch{};
+    std::array<Index, 4> scratch{};
     CHECK(ir.operands(a, scratch).empty()); // signal is a leaf
 
     const auto load_ops = ir.operands(va, scratch);
@@ -231,7 +231,7 @@ TEST_CASE("structured cond carries then/else regions") {
     REQUIRE(ir.root().size() == 4);
     CHECK(ir.tag(ir.root()[3]) == Inst::Tag::Cond);
 
-    std::array<Index, 3> scratch{};
+    std::array<Index, 4> scratch{};
     const auto           cond_ops = ir.operands(cnd, scratch);
     REQUIRE(cond_ops.size() == 1); // only the condition; regions aren't operands
     CHECK(cond_ops[0] == vc);
@@ -254,7 +254,7 @@ TEST_CASE("case-equality comparisons are binary ops over two operands") {
     Ir ir = b.finish();
     CHECK(ir.tag(eq) == Inst::Tag::CasezEq);
 
-    std::array<Index, 3> scratch{};
+    std::array<Index, 4> scratch{};
     const auto           ops = ir.operands(eq, scratch);
     REQUIRE(ops.size() == 2);
     CHECK(ops[0] == sel);
@@ -276,7 +276,7 @@ TEST_CASE("select and concat expose their operands") {
 
     Ir ir = b.finish();
 
-    std::array<Index, 3> scratch{};
+    std::array<Index, 4> scratch{};
     const auto           mux_ops = ir.operands(m, scratch);
     REQUIRE(mux_ops.size() == 3); // condition + both arms
     CHECK(mux_ops[0] == c);
@@ -394,7 +394,7 @@ TEST_CASE("string instructions carry their operands and print") {
     Ir ir = b.finish();
 
     // Operand exposure: str_putc / str_substr surface op + their extra operands.
-    std::array<Index, 3> scratch{};
+    std::array<Index, 4> scratch{};
     const auto           putc_ops = ir.operands(Index{ 5 }, scratch);
     REQUIRE(putc_ops.size() == 3);
     CHECK(putc_ops[0] == s);
@@ -500,7 +500,7 @@ TEST_CASE("float tags round-trip through builder, payload_kind, and operands") {
     const auto info = ir.extra_data<RealMathBinaryInfo>(ir.payload(pw).op_extra.extra);
     CHECK(info.fn == static_cast<uint32_t>(RealMathOp::Pow));
 
-    std::array<Index, 3> scratch;
+    std::array<Index, 4> scratch;
     const auto           ops = ir.operands(pw, scratch);
     REQUIRE(ops.size() == 2);
     CHECK(ops[0] == x);
@@ -521,7 +521,7 @@ TEST_CASE("one-operand real math rides the op_imm payload") {
     CHECK(payload_kind(ir.tag(sq)) == Inst::PayloadKind::OpImm);
     CHECK(ir.payload(sq).op_imm.imm == static_cast<uint32_t>(RealMathOp::Sqrt));
 
-    std::array<Index, 3> scratch;
+    std::array<Index, 4> scratch;
     const auto           ops = ir.operands(sq, scratch);
     REQUIRE(ops.size() == 1);
     CHECK(ops[0] == x);

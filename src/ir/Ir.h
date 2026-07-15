@@ -1244,6 +1244,11 @@ struct Inst {
         // value equals the operand, or "" if none matches (LRM 6.19.2). Payload:
         // op_extra -> EnumNameInfo (the member table); op is the enum value.
         EnumName,
+        // %p of a queue / dynamic array -> new string value: the runtime renders
+        // '{e0, e1, ...} over the runtime element count (LRM 21.2.1.6). Payload:
+        // op_type — op is the handle lvalue, type the interned Queue / DynArray
+        // type (element format descriptor).
+        ContainerFmtP,
         // string'(packed) -> string: bytes MSB-first with 0x00 bytes dropped
         // (payload: unary — the packed value).
         StrFromPacked,
@@ -1708,6 +1713,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::QueuePopBack:
         case T::QueuePopFront:
         case T::QueueDeleteAll:
+        case T::ContainerFmtP:
         case T::DynArraySize:
         case T::DynArrayDelete:
         // Array ordering methods (LRM 7.12.2): op is the handle, type the

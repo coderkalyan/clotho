@@ -325,6 +325,8 @@ const char* tag_name(Inst::Tag tag) {
             return "str_substr";
         case T::EnumName:
             return "enum_name";
+        case T::ContainerFmtP:
+            return "container_fmt_p";
         case T::StrFromPacked:
             return "str_from_packed";
         case T::StrToPacked:

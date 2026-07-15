@@ -289,6 +289,10 @@ public:
     Index sformat(Index dst, std::string_view fmt, std::span<const Index> args, SourceLoc loc);
     // $sformatf: format `args` per `fmt`. Yields a new string value.
     Index sformatf(std::string_view fmt, std::span<const Index> args, SourceLoc loc);
+    // %p of a queue / dynamic array: render `'{e0, e1, ...}` over the runtime
+    // element count. `handle` is the container lvalue, `container_type` the
+    // interned Queue / DynArray type. Yields a new string value.
+    Index container_fmt_p(Index handle, Ref container_type, SourceLoc loc);
     // $ferror: write descriptor `fd`'s error message into the string lvalue `dst`.
     // Yields the error code.
     Index ferror(Index dst, Index fd, SourceLoc loc);

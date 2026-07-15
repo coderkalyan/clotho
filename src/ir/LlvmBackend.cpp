@@ -7362,6 +7362,14 @@ private:
                      { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(),
                        raw_ptr_ty(), raw_ptr_ty() });
     }
+    // void rt_container_format_p(rt_string* out, const void* handle, i32 is_queue,
+    //   i32 kind, i32 width, i32 is_signed, i32 four_state, i32 has_z, i32 z_off, i64 stride)
+    llvm::FunctionCallee container_fmt_p_fn() {
+        return rt_fn("rt_container_format_p", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(),
+                       b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(),
+                       b_.getInt64Ty() });
+    }
     llvm::FunctionCallee str_lower_fn() {
         return rt_fn("rt_string_tolower", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
@@ -8149,6 +8157,7 @@ private:
             case Inst::Tag::StrFromPacked:
             case Inst::Tag::Sformatf:
             case Inst::Tag::EnumName:
+            case Inst::Tag::ContainerFmtP:
                 return { 0, false, false, true };
             case Inst::Tag::StrToPacked:
                 return from_ref(p.op_type.type);
@@ -8307,6 +8316,7 @@ private:
             case Inst::Tag::StrFromPacked:
             case Inst::Tag::Sformatf:
             case Inst::Tag::EnumName:
+            case Inst::Tag::ContainerFmtP:
                 return true;
             case Inst::Tag::Constant:
             case Inst::Tag::Concat:
@@ -9362,6 +9372,35 @@ private:
                 b_.CreateAlignedStore(must_of(value_of(p.op_extra.op)), valbuf, llvm::Align(1));
                 b_.CreateCall(enum_name_fn(),
                               { str_of(i), valbuf, b_.getInt32(vbytes), b_.getInt32(count), vg, ng, lg });
+                return;
+            }
+            case Inst::Tag::ContainerFmtP: {
+                // %p of a queue / dynamic array: render at runtime over the live
+                // element count. Element format facts come from the container's
+                // DynElem; the result lands in this instruction's string temp.
+                const auto&   pt   = p.op_type;
+                const DynElem e    = dynarr_elem(pt.type);
+                const bool    is_q = std::get<Type>(mod_.pool.get(pt.type)).kind == Type::Kind::Queue;
+                uint32_t      kind = 0, width = 0, is_signed = 0, four = 0, has_z = 0, z_off = 0;
+                if (e.is_string) {
+                    kind = 2;
+                } else if (mod_.pool.is_float(e.elem_type)) {
+                    kind = 1;
+                } else {
+                    width     = e.width;
+                    four      = e.four_state ? 1u : 0u;
+                    has_z     = e.has_z ? 1u : 0u;
+                    is_signed = std::get<Type>(mod_.pool.get(e.elem_type)).is_signed ? 1u : 0u;
+                    if (e.has_z) {
+                        z_off = static_cast<uint32_t>(
+                          env_->llmod.getDataLayout().getStructLayout(e.slot_ty)->getElementOffset(1));
+                    }
+                }
+                b_.CreateCall(container_fmt_p_fn(),
+                              { str_of(i), lv_handle_ptr(lvalue_of(pt.op)), b_.getInt32(is_q ? 1 : 0),
+                                b_.getInt32(kind), b_.getInt32(width), b_.getInt32(is_signed),
+                                b_.getInt32(four), b_.getInt32(has_z), b_.getInt32(z_off),
+                                b_.getInt64(dynarr_stride(e)) });
                 return;
             }
             case Inst::Tag::StrFromPacked: {
