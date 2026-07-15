@@ -556,6 +556,15 @@ void rt_queue_delete_all(rt_queue* h, const rt_elem_ops* ops);
 // == 0 (value semantics, LRM §7.10). A no-op when dst == src.
 void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_elem_ops* ops);
 
+// Append `src`'s live elements at logical indices [lo, hi] (inclusive) onto
+// `dst`, respecting `bound`. Materializes a queue slice `q[a:b]` (LRM §7.10.4)
+// and the queue-typed operands of a concatenation `{q, e}` (a full-queue append
+// passes lo = 0, hi = INT64_MAX; the range is runtime-clamped to [0, len-1], and
+// lo > hi appends nothing). `dst` MUST NOT alias `src` — callers build into a
+// fresh temp handle, so a self-referential `q = {q, e}` is safe.
+void rt_queue_append_range(rt_queue* dst, const rt_queue* src, const rt_elem_ops* ops,
+                           uint64_t bound, int64_t lo, int64_t hi);
+
 // q.reverse() / q.sort() / q.rsort() (LRM 7.12.2). `kind` / `width` / `rev` match
 // the rt_dynarr_* ordering entry points; operates on the ring's logical order.
 void rt_queue_reverse(rt_queue* h, uint64_t stride);

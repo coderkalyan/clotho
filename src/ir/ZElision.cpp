@@ -287,6 +287,7 @@ struct Analysis {
                 case Inst::Tag::QueueDeleteIdx:
                 case Inst::Tag::QueueDeleteAll:
                 case Inst::Tag::QueueCopy:
+                case Inst::Tag::QueueAppendRange:
                     // size() is a definite int (no z); the rest are statements
                     // that write the handle, not a plane slot.
                     val_z[raw] = 0;

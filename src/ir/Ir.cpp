@@ -2,7 +2,7 @@
 
 namespace clotho::ir {
 
-std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) const {
+std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) const {
     const auto  tag = this->tag(inst);
     const auto& p   = payload(inst);
 
@@ -277,6 +277,16 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 3>& scratch) c
                 scratch[0]    = p.op_extra.op;
                 scratch[1]    = qa.arg;
                 return { scratch.data(), 2 };
+            }
+            // queue_append_range exposes the dst handle lvalue, the src handle
+            // lvalue, and the low / high index operands.
+            if (tag == Inst::Tag::QueueAppendRange) {
+                const auto qs = extra_data<QueueSliceInfo>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = qs.src;
+                scratch[2]    = qs.lo;
+                scratch[3]    = qs.hi;
+                return { scratch.data(), 4 };
             }
             // queue_insert exposes the handle lvalue, position, and element value.
             if (tag == Inst::Tag::QueueInsert) {

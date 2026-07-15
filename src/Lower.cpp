@@ -7948,29 +7948,80 @@ private:
         return b.assoc_select(base, lower_expr(es.selector(), b), aty, l);
     }
 
+    // Materialize a queue-typed rvalue into a handle lvalue Index. A plain queue
+    // variable / queue-returning call already has a handle lvalue and is returned
+    // as-is (no copy). A non-lvalue queue value — an assignment pattern '{...}, a
+    // concatenation {q, e}, or a slice q[a:b] (LRM 7.10.4) — is built element-wise
+    // into a fresh temp queue handle (cleared first, so a re-triggered process
+    // reuses the same slot) and that temp's lvalue is returned. The temp never
+    // aliases a source, so a self-referential `q = {q, e}` is safe.
+    ir::Index materialize_queue_rvalue(const Expression& expr, ir::Builder& b) {
+        const Expression&   e = unwrap_conversion(expr);
+        const ir::SourceLoc l = loc(e);
+        if (e.kind == ExpressionKind::NamedValue || e.kind == ExpressionKind::HierarchicalValue ||
+            e.kind == ExpressionKind::Call) {
+            return lower_lvalue(e, b);
+        }
+        const ir::Ref   qty = lower_type(*expr.type);
+        const ir::Index tmp = make_arg_temp(qty, b, l);
+        b.queue_delete(tmp, tmp, /*has_idx=*/false, qty, l);
+        append_queue_pieces(tmp, e, qty, b, l);
+        return tmp;
+    }
+
+    // Append the element pieces of a queue-valued rvalue `e` onto the dst handle:
+    // a slice (append the source's [a:b] range), or the operands of a
+    // concatenation / elements of an assignment pattern — each either a whole
+    // queue (spliced in via a full-range append) or a single element (pushed to
+    // the back). A queue-typed piece is itself materialized first (nested slice /
+    // concat).
+    void append_queue_pieces(ir::Index dst, const Expression& e, ir::Ref qty, ir::Builder& b,
+                             ir::SourceLoc l) {
+        if (e.kind == ExpressionKind::RangeSelect) {
+            const auto& rs = e.as<RangeSelectExpression>();
+            if (rs.getSelectionKind() != RangeSelectionKind::Simple) {
+                // TODO: indexed part-select slice q[i +: n] of a queue (runtime
+                // base makes the first index non-constant, but the range op takes
+                // runtime bounds already — only the width/direction plumbing is
+                // missing).
+                fail("indexed part-select slice of a queue is not supported");
+            }
+            const ir::Index src = materialize_queue_rvalue(rs.value(), b);
+            b.queue_append_range(dst, src, lower_expr(rs.left(), b), lower_expr(rs.right(), b), qty, l);
+            return;
+        }
+        const auto* pat = as_assignment_pattern(e);
+        if (pat == nullptr && e.kind != ExpressionKind::Concatenation) {
+            // TODO: other queue rvalue sources (an unpacked-array cast, a
+            // replication concat, etc.).
+            fail("queue assignment from this expression is not supported");
+        }
+        const std::span<const Expression* const> pieces =
+          pat != nullptr ? pat->elements() : e.as<ConcatenationExpression>().operands();
+        // A full-queue append: lo = 0, hi = INT64_MAX (runtime-clamped to len-1).
+        const ir::Ref   i64   = make_int_type(64, false, true);
+        const ir::Index lo0   = b.constant(module_.pool.put_int(i64, 0), l);
+        const ir::Index hiEnd = b.constant(
+          module_.pool.put_int(i64, static_cast<uint64_t>(INT64_MAX)), l);
+        for (const Expression* op : pieces) {
+            if (is_queue(*op)) {
+                b.queue_append_range(dst, materialize_queue_rvalue(*op, b), lo0, hiEnd, qty, l);
+            } else {
+                b.queue_push(dst, lower_expr(*op, b), /*front=*/false, qty, l);
+            }
+        }
+    }
+
     // Whole-queue assignment (LRM 7.10): `q = other` deep-copies the source
-    // handle. Element writes (`q[i] = x`) are ordinary Stores over an ElemSelect
-    // and do not reach here. Non-queue sources (concatenation / assignment
-    // pattern) are a documented follow-up.
+    // handle; a concatenation ({q, e}), assignment pattern ('{...}), or slice
+    // (q[a:b]) is materialized element-wise into a temp and then deep-copied in.
+    // Element writes (`q[i] = x`) are ordinary Stores over an ElemSelect and do
+    // not reach here.
     ir::Index lower_queue_assign(const AssignmentExpression& a, ir::Builder& b) {
         const ir::SourceLoc l   = loc(a);
         const ir::Index     dst = lower_lvalue(a.left(), b);
         const ir::Ref       qty = lower_type(*a.left().type);
-        // A plain queue variable or a queue-returning call is a handle copy (both
-        // have a handle lvalue). A queue-typed concatenation ({q, e}), assignment
-        // pattern ('{...}), or slice is a value expression, not an lvalue, and
-        // needs an element-wise build.
-        const bool src_is_var = is_queue(a.right()) &&
-                                (a.right().kind == ExpressionKind::NamedValue ||
-                                 a.right().kind == ExpressionKind::HierarchicalValue ||
-                                 a.right().kind == ExpressionKind::Call);
-        if (!src_is_var) {
-            // TODO: queue init from a concatenation ({q, e}), assignment pattern
-            // ('{...}), slice, or unpacked-array source — needs an element-wise
-            // build, not a handle copy (see docs/design/dynamic-arrays.md phase 4).
-            fail("queue assignment from a non-variable value is not supported");
-        }
-        b.queue_copy(dst, lower_lvalue(a.right(), b), qty, l);
+        b.queue_copy(dst, materialize_queue_rvalue(a.right(), b), qty, l);
         return dst;
     }
 
@@ -8961,11 +9012,17 @@ private:
     // `[off -: w]` (width constant, base a runtime value). Shared by the rvalue and
     // lvalue paths so a read and a write of the same shape lower identically.
     ir::Index lower_range_select(const RangeSelectExpression& rs, ir::Index base, ir::Builder& b, ir::SourceLoc l) {
-        if (is_queue(rs.value()) || is_dyn_array(rs.value())) {
-            // TODO: queue / dynamic-array slice `q[a:b]` (LRM 7.10.4) yields a new
-            // queue; needs an element-range copy into a fresh handle, not a packed
-            // part-select.
-            fail("slice of a queue / dynamic array is not supported");
+        if (is_queue(rs.value())) {
+            // A queue slice `q[a:b]` (LRM 7.10.4) yields a new queue: materialize
+            // the source range into a fresh temp handle (usable in any rvalue
+            // position — assignment RHS, method receiver, argument).
+            return materialize_queue_rvalue(rs, b);
+        }
+        if (is_dyn_array(rs.value())) {
+            // TODO: dynamic-array slice `a[a:b]` (LRM 7.10.4) also yields a queue;
+            // the source handle is an rt_dynarr, not an rt_queue, so it needs a
+            // dynarr-source variant of the element-range append.
+            fail("slice of a dynamic array is not supported");
         }
         if (is_unpacked_array(rs.value())) {
             // Fixed-size unpacked array slice (LRM 7.4.5 `busB = busA[7:6]`, "a

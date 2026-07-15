@@ -288,6 +288,21 @@ struct QueueInsertInfo {
     Ref queue_type;
 };
 
+// Extra payload for `queue_append_range`: append `src`'s live elements at
+// logical indices [lo, hi] (inclusive, i64 values; a full-queue append passes
+// lo = 0 and hi = a to-end sentinel) onto the dst handle, materializing a queue
+// slice `q[a:b]` (LRM 7.10.4) or a queue-typed concatenation operand. Both the
+// dst (op) and src are handle lvalues; the dst never aliases src.
+struct QueueSliceInfo {
+    // Source queue handle lvalue.
+    Index src;
+    // Low / high logical index operands (i64 values).
+    Index lo;
+    Index hi;
+    // The interned Queue type of the target.
+    Ref queue_type;
+};
+
 // Extra payload for the one-operand associative-array tags (AssocSelect,
 // AssocExists, AssocDeleteKey, AssocCopy, AssocFirst/Last/Next/Prev). `arg` is
 // the key value (select/exists/delete-key), the source handle lvalue (copy), or
@@ -744,6 +759,7 @@ static_assert(ExtraPayload<DynArrayArg>);
 static_assert(ExtraPayload<DynArrayNewInitInfo>);
 static_assert(ExtraPayload<QueueArg>);
 static_assert(ExtraPayload<QueueInsertInfo>);
+static_assert(ExtraPayload<QueueSliceInfo>);
 static_assert(ExtraPayload<AssocArg>);
 static_assert(ExtraPayload<ReadMemInfo>);
 static_assert(ExtraPayload<Regions>);
@@ -906,6 +922,10 @@ struct Inst {
         // payload: op_extra -> QueueArg, whose arg is the source handle
         // lvalue; op is the destination handle lvalue).
         QueueCopy,
+        // Append src[lo:hi] onto the dst handle (payload: op_extra ->
+        // QueueSliceInfo; op is the dst handle lvalue), materializing a queue
+        // slice or a queue-typed concatenation operand (LRM 7.10.4).
+        QueueAppendRange,
 
         // -- Array ordering methods on a handle lvalue (LRM 7.12.2) --
         // Each lowers to its rt_{dynarr,queue}_* runtime call; all carry only
@@ -1778,6 +1798,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::QueueInsert:
         case T::QueueDeleteIdx:
         case T::QueueCopy:
+        case T::QueueAppendRange:
         case T::AssocSelect:
         case T::AssocExists:
         case T::AssocDeleteKey:
@@ -1905,7 +1926,7 @@ public:
     // span cannot express: FDisplay omits its fd, Fscanf/Sscanf their source,
     // InsideSet its member operands. A pass needing every use of those tags
     // must read their info records directly.
-    std::span<const Index> operands(Index inst, std::array<Index, 3>& scratch) const;
+    std::span<const Index> operands(Index inst, std::array<Index, 4>& scratch) const;
 
 private:
     friend class Builder;

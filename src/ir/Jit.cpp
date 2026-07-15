@@ -234,6 +234,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_queue_delete_idx", &rt_queue_delete_idx);
     expose("rt_queue_delete_all", &rt_queue_delete_all);
     expose("rt_queue_assign", &rt_queue_assign);
+    expose("rt_queue_append_range", &rt_queue_append_range);
     expose("rt_queue_reverse", &rt_queue_reverse);
     expose("rt_queue_sort", &rt_queue_sort);
     expose("rt_queue_shuffle", &rt_queue_shuffle);

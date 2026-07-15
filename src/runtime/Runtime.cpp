@@ -1428,6 +1428,27 @@ extern "C" void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_ele
     dst->cap  = src->len;
 }
 
+extern "C" void rt_queue_append_range(rt_queue* dst, const rt_queue* src,
+                                      const rt_elem_ops* ops, uint64_t bound, int64_t lo,
+                                      int64_t hi) {
+    if (src->len == 0) {
+        return;
+    }
+    const int64_t last = static_cast<int64_t>(src->len) - 1;
+    if (lo < 0) {
+        lo = 0;
+    }
+    if (hi > last) {
+        hi = last;
+    }
+    // Each source element is deep-copied through the ordinary push path (which
+    // deinit/copy-constructs a managed element). dst never aliases src, so
+    // growing dst cannot relocate src's buffer mid-loop.
+    for (int64_t i = lo; i <= hi; ++i) {
+        rt_queue_push_back(dst, ops, bound, q_elem(src, ops->stride, static_cast<uint64_t>(i)));
+    }
+}
+
 extern "C" void rt_queue_reverse(rt_queue* h, uint64_t stride) {
     if (h->len < 2) {
         return;

@@ -7249,6 +7249,13 @@ private:
     llvm::FunctionCallee queue_assign_fn() {
         return rt_fn("rt_queue_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
+    // void rt_queue_append_range(rt_queue* dst, const rt_queue* src,
+    //                            const rt_elem_ops*, u64 bound, i64 lo, i64 hi)
+    llvm::FunctionCallee queue_append_range_fn() {
+        return rt_fn("rt_queue_append_range", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(),
+                       b_.getInt64Ty() });
+    }
     // void rt_queue_reverse(rt_queue*, i64 stride)  (LRM 7.12.2)
     llvm::FunctionCallee queue_reverse_fn() {
         return rt_fn("rt_queue_reverse", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
@@ -7977,6 +7984,7 @@ private:
             case Inst::Tag::QueueDeleteIdx:
             case Inst::Tag::QueueDeleteAll:
             case Inst::Tag::QueueCopy:
+            case Inst::Tag::QueueAppendRange:
                 // size() is a definite 2-state int; the rest are statements
                 // whose type is never queried.
                 return { 32, false, true };
@@ -8106,7 +8114,7 @@ private:
                 return { 1, true, false };
 
             case Inst::Tag::Concat: {
-                std::array<Index, 3> scratch;
+                std::array<Index, 4> scratch;
                 uint32_t             width = 0;
                 bool                 four  = false;
                 for (Index part : ir_->operands(i, scratch)) {
@@ -8930,6 +8938,9 @@ private:
             case Inst::Tag::QueueCopy:
                 lower_queue_copy(i);
                 return;
+            case Inst::Tag::QueueAppendRange:
+                lower_queue_append_range(i);
+                return;
 
             case Inst::Tag::DynArrayReverse:
                 lower_dyn_array_reverse(i);
@@ -9731,7 +9742,7 @@ private:
     // them to the runtime, which builds into this instruction's temp (alias-safe
     // even when the temp aliases a part).
     void lower_string_concat(Index i) {
-        std::array<Index, 3> scratch;
+        std::array<Index, 4> scratch;
         const auto           parts  = ir_->operands(i, scratch);
         const auto           n      = static_cast<uint32_t>(parts.size());
         auto*                arr_ty = llvm::ArrayType::get(llvm::PointerType::getUnqual(ctx_), n);
@@ -10131,6 +10142,18 @@ private:
         b_.CreateCall(queue_assign_fn(),
                       { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qa.arg)),
                         elem_ops_global(qa.queue_type) });
+    }
+
+    void lower_queue_append_range(Index i) {
+        const auto& p     = ir_->payload(i).op_extra;
+        const auto  qs    = ir_->extra_data<QueueSliceInfo>(p.extra);
+        llvm::Value* bound = b_.getInt64(std::get<Type>(mod_.pool.get(qs.queue_type)).left);
+        // Slice bounds are signed indices (`q[-1:2]` clamps low to 0); sign-extend.
+        llvm::Value* lo = cast(must_of(value_of(qs.lo)), 64, /*sign=*/true);
+        llvm::Value* hi = cast(must_of(value_of(qs.hi)), 64, /*sign=*/true);
+        b_.CreateCall(queue_append_range_fn(),
+                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qs.src)),
+                        elem_ops_global(qs.queue_type), bound, lo, hi });
     }
 
     // Queue ordering methods (LRM 7.12.2) — same shape as the dynarr variants
@@ -14767,7 +14790,7 @@ private:
 
     Plane lower_concat(Index i) {
         const uint32_t       w = type_of(i).width;
-        std::array<Index, 3> scratch;
+        std::array<Index, 4> scratch;
         const auto           parts = ir_->operands(i, scratch);
 
         // 2-state result: every part is 2-state (a concat is 4-state if any part

@@ -538,3 +538,88 @@ TEST_CASE("struct member queue of strings deep-copies; frame-local lifecycle") {
     )";
     CHECK(run_capture(src) == "1 aa bb | mut\nhi!\n");
 }
+
+// Assignment-pattern source `q = '{...}` builds the queue element-wise (LRM
+// 7.10). Verified against verilator (iverilog crashes on queues).
+TEST_CASE("queue assignment from an assignment pattern") {
+    constexpr std::string_view src = R"(
+        module m;
+            int q[$];
+            initial begin
+                q = '{10, 20, 30, 40};
+                $display("s=%0d %0d %0d %0d %0d", q.size(), q[0], q[1], q[2], q[3]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "s=4 10 20 30 40\n");
+}
+
+// Concatenation source `q = {a, e, b}` splices whole-queue operands and single
+// elements; a self-referential `q = {q, e}` is alias-safe (temp materialized
+// before the deep copy back). Verified against verilator.
+TEST_CASE("queue assignment from a concatenation") {
+    constexpr std::string_view src = R"(
+        module m;
+            int q[$], r[$];
+            initial begin
+                q = '{1, 2, 3};
+                r = {5, q, 6, q};
+                $display("r s=%0d %0d %0d %0d %0d %0d %0d %0d %0d",
+                         r.size(), r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
+                q = {q, 4};
+                $display("self s=%0d last=%0d", q.size(), q[$]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "r s=8 5 1 2 3 6 1 2 3\n"
+          "self s=4 last=4\n");
+}
+
+// A queue slice `q[a:b]` (LRM 7.10.4) yields a new queue. Bounds clamp to
+// [0, size-1]; a>b is empty. A self-slice `q = q[a:b]` is alias-safe. Verified
+// against verilator.
+TEST_CASE("queue slice") {
+    constexpr std::string_view src = R"(
+        module m;
+            int q[$], s[$];
+            initial begin
+                q = '{10, 20, 30, 40, 50};
+                s = q[1:3];
+                $display("mid s=%0d %0d %0d %0d", s.size(), s[0], s[1], s[2]);
+                s = q[-2:1];
+                $display("loclamp s=%0d %0d %0d", s.size(), s[0], s[1]);
+                s = q[3:100];
+                $display("hiclamp s=%0d %0d %0d", s.size(), s[0], s[1]);
+                s = q[3:1];
+                $display("empty s=%0d", s.size());
+                q = q[1:3];
+                $display("self s=%0d %0d %0d %0d", q.size(), q[0], q[1], q[2]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "mid s=3 20 30 40\n"
+          "loclamp s=2 10 20\n"
+          "hiclamp s=2 40 50\n"
+          "empty s=0\n"
+          "self s=3 20 30 40\n");
+}
+
+// A bounded queue built from a too-long concatenation keeps the first N+1
+// elements (LRM 7.10.4). No verilator oracle (it miscompiles bounded-queue
+// concat); hand-checked against the LRM.
+TEST_CASE("queue slice/concat into a bounded queue drops the tail") {
+    constexpr std::string_view src = R"(
+        module m;
+            int q[$];
+            int b3[$:3];
+            initial begin
+                q = '{1, 2, 3, 4, 5};
+                b3 = {q, q};
+                $display("s=%0d %0d %0d %0d %0d", b3.size(), b3[0], b3[1], b3[2], b3[3]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "s=4 1 2 3 4\n");
+}
