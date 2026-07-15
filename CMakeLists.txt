@@ -185,6 +185,7 @@ add_executable(clotho_test
   tests/unbased_test.cpp
   tests/preprocess_test.cpp
   tests/interface_test.cpp
+  tests/concat_select_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho doctest::doctest clotho_warnings)
 
