@@ -1025,15 +1025,16 @@ private:
             // (ankerl map + lazy sorted key index). The value element rides the
             // rt_elem_ops descriptor; keys reach the runtime as normalized
             // byte spans built in the backend (docs/design/dynamic-arrays.md
-            // §4a). Value element restricted to integral / real (a string /
-            // nested-container value needs the a[k] read/write to route a handle,
-            // a documented follow-up); keys of every kind are supported.
+            // §4a). Value element supports integral / real / string; the a[k]
+            // read/write routes the string handle through the OOB sink, matching
+            // the dynamic-array / queue string-element path. Keys of every kind
+            // are supported.
             const slang::ast::Type& et = aa->elementType.getCanonicalType();
-            if (!et.isIntegral() && !et.isFloating()) {
-                // TODO: associative array with a string / aggregate / nested
-                // variable-size value element.
+            if (!et.isIntegral() && !et.isFloating() && !et.isString()) {
+                // TODO: associative array with an aggregate (struct / array) or
+                // nested variable-size (queue / dynamic / assoc) value element.
                 fail("associative array value element type is not supported (only "
-                     "integral / real elements)");
+                     "integral / real / string elements)");
             }
             ir::Type t;
             t.kind    = ir::Type::Kind::Assoc;

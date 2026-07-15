@@ -692,11 +692,15 @@ TEST_CASE("an associative array lowers") {
     CHECK_MESSAGE(r.ok, r.diagnostics);
 }
 
-TEST_CASE("an associative array with a string value element fails loudly") {
+TEST_CASE("an associative array with a class-handle value element fails loudly") {
+    // Class handles as a value element are deliberately excluded (object lifetime
+    // / GC semantics). integral / real / string / aggregate / nested-container
+    // values are supported; a class value must still fail loudly.
     const LowerResult r = lower_text(R"(
+        class C; int x; endclass
         module top;
-            string a [int];
-            initial a[0] = "x";
+            C a [int];
+            initial a[0] = null;
         endmodule
     )");
     CHECK_FALSE(r.ok);
@@ -996,12 +1000,13 @@ TEST_CASE("a type parameter default sets an internal variable's width") {
 TEST_CASE("a type parameter bound to an unsupported type fails loudly") {
     // Binding a type parameter to a not-yet-lowered type must hit the same loud
     // guard as a direct declaration, not silently accept it. (`event`,
-    // `chandle`, and now `class` were prior examples here; all are lowered now —
+    // `chandle`, and `class` were prior examples here; all are lowered now —
     // named event LRM 15.5, chandle as a 2-state i64 handle LRM 6.14, class LRM 8.)
-    // An associative array with a string VALUE element is still guarded, so it
-    // stands in as the example.
+    // An associative array with a class-handle VALUE element is still guarded, so
+    // it stands in as the example.
     const LowerResult r = lower_text(R"(
-        typedef string AA[int];
+        class C; int x; endclass
+        typedef C AA[int];
         module m #(parameter type T = AA);
             T v;
         endmodule

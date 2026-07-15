@@ -234,3 +234,78 @@ TEST_CASE("assoc input argument is copy-in") {
     )";
     CHECK(run_capture(src) == "rc=3 a1=1 anum=2 a9ex=0\n");
 }
+
+// String value element (LRM 7.8 + Table 7-1): a[k] write deep-copies the string
+// into the entry; a read of an absent key returns "" (the string default) and
+// does NOT create the entry (num unchanged).
+TEST_CASE("assoc string value put/get, absent-read empty no create") {
+    constexpr std::string_view src = R"(
+        module m;
+            string a[int];
+            initial begin
+                a[5] = "hello";
+                a[2] = "world";
+                $display("num=%0d a5=%s a2=%s", a.num(), a[5], a[2]);
+                $display("miss=[%s] numafter=%0d", a[9], a.num());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "num=2 a5=hello a2=world\nmiss=[] numafter=2\n");
+}
+
+// Overwriting an existing key deep-copies the new string into the live entry
+// (no leak, count unchanged); delete removes it.
+TEST_CASE("assoc string value overwrite and delete") {
+    constexpr std::string_view src = R"(
+        module m;
+            string a[int];
+            initial begin
+                a[1] = "first";
+                a[1] = "second";
+                $display("num=%0d a1=%s", a.num(), a[1]);
+                a.delete(1);
+                $display("num=%0d ex1=%0d", a.num(), a.exists(1));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "num=1 a1=second\nnum=0 ex1=0\n");
+}
+
+// Both key and value are strings (LRM 7.8.1 string index), ascending-key foreach.
+TEST_CASE("assoc string key and string value, ascending foreach") {
+    constexpr std::string_view src = R"(
+        module m;
+            string a[string];
+            initial begin
+                a["bob"] = "dog";
+                a["amy"] = "cat";
+                a["cal"] = "fox";
+                foreach (a[k])
+                    $display("k=%s v=%s", k, a[k]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "k=amy v=cat\nk=bob v=dog\nk=cal v=fox\n");
+}
+
+// Whole-array deep-copy assignment (LRM 7.8): the copy is independent, and each
+// entry's string leaf is deep-copied — mutating the copy leaves the source
+// untouched.
+TEST_CASE("assoc string value deep-copy independence") {
+    constexpr std::string_view src = R"(
+        module m;
+            string a[int];
+            string b[int];
+            initial begin
+                a[1] = "x";
+                a[2] = "y";
+                b = a;
+                b[2] = "changed";
+                b[3] = "new";
+                $display("a2=%s anum=%0d", a[2], a.num());
+                $display("b2=%s b3=%s bnum=%0d", b[2], b[3], b.num());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a2=y anum=2\nb2=changed b3=new bnum=3\n");
+}

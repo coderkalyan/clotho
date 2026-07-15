@@ -339,6 +339,12 @@ struct LValue {
     llvm::Value*    assoc_key_ptr = nullptr;
     llvm::Value*    assoc_key_len = nullptr;
     llvm::Constant* assoc_ops     = nullptr;
+    // Value element kind for a managed (string / nested-container) assoc value.
+    // Set on the deferred lvalue; assoc_elem_lvalue lifts them onto the resolved
+    // element lvalue (is_string / is_handle) so the Load/Store dispatch routes a
+    // handle instead of a plane. Both false for an integral / real value.
+    bool assoc_val_string = false;
+    bool assoc_val_handle = false;
 };
 
 // A scalar / string leaf of an aggregate signal reachable by a STATIC path
@@ -8786,21 +8792,19 @@ private:
                 // the value element slot facts.
                 const auto    aa = ir_->extra_data<AssocArg>(p.op_extra.extra);
                 const DynElem e  = dynarr_elem(aa.assoc_type);
-                if (e.is_string || e.is_handle) {
-                    // TODO: managed (string / nested container) value elements in
-                    // an associative array (needs the a[k] read/write to route a
-                    // handle, not a plane). Keys of every kind are supported.
-                    throw BackendError{ "associative array with a string / nested-container "
-                                        "value element is not supported" };
-                }
                 const LValue     hlv = lvalue_of(p.op_extra.op);
                 auto [kptr, klen]    = normalize_assoc_key_value(aa.arg, aa.assoc_type);
                 LValue el;
-                el.is_assoc      = true;
-                el.assoc_handle  = lv_handle_ptr(hlv);
-                el.assoc_key_ptr = kptr;
-                el.assoc_key_len = klen;
-                el.assoc_ops     = elem_ops_global(aa.assoc_type);
+                el.is_assoc          = true;
+                el.assoc_handle      = lv_handle_ptr(hlv);
+                el.assoc_key_ptr     = kptr;
+                el.assoc_key_len     = klen;
+                el.assoc_ops         = elem_ops_global(aa.assoc_type);
+                el.assoc_val_string  = e.is_string;
+                el.assoc_val_handle  = e.is_handle;
+                // Managed value elements carry only the slot type (a string / a
+                // container handle); the plane facts below are meaningless for
+                // them and are lifted per-kind in assoc_elem_lvalue.
                 el.slot_ty       = e.slot_ty;
                 el.has_z         = e.has_z;
                 el.narrow        = e.narrow;
@@ -8879,6 +8883,19 @@ private:
                     set_str(i, lv_string_ptr(lv));
                     return;
                 }
+                if (lv.is_assoc && (lv.assoc_val_string || lv.assoc_val_handle)) {
+                    // Managed assoc value: resolve the slot (get_ptr; absent key ->
+                    // null, redirected to the owned-empty string sink so the read
+                    // yields "" / the container default) and route the handle load.
+                    const LValue el = assoc_elem_lvalue(lv, /*for_write=*/false);
+                    if (el.is_string) {
+                        set_str(i, lv_string_ptr(el));
+                        return;
+                    }
+                    // TODO: nested-container (queue / dynamic / assoc) value read.
+                    throw BackendError{ "associative array with a nested-container value "
+                                        "element read is not supported" };
+                }
                 const ValType t = type_of(i);
                 // An assoc read resolves the element via get_ptr (absent key ->
                 // element default through the dyn_inrange=false path, no entry
@@ -8912,6 +8929,20 @@ private:
                     // the frontend, so there is no wait queue to service.
                     b_.CreateCall(str_assign_fn(), { lv_string_ptr(lv), str_of(p.binary.r) });
                     return;
+                }
+                if (lv.is_assoc && (lv.assoc_val_string || lv.assoc_val_handle)) {
+                    // a[key] = <managed> (LRM 7.8): put_ptr creates + proto-inits
+                    // the entry (owned-empty string / null container), then the
+                    // value deep-copies into it. Assoc string stores never take the
+                    // forwarding path (that only fires for Signal / Local targets).
+                    const LValue el = assoc_elem_lvalue(lv, /*for_write=*/true);
+                    if (el.is_string) {
+                        b_.CreateCall(str_assign_fn(), { lv_string_ptr(el), str_of(p.binary.r) });
+                        return;
+                    }
+                    // TODO: nested-container (queue / dynamic / assoc) value write.
+                    throw BackendError{ "associative array with a nested-container value "
+                                        "element write is not supported" };
                 }
                 if (lv.is_assoc) {
                     // a[key] = v (LRM 7.8): put_ptr creates + proto-inits the
@@ -10484,6 +10515,26 @@ private:
     // (creates + proto-inits the entry).
     LValue assoc_elem_lvalue(const LValue& lv, bool for_write) {
         LValue el;
+        // Managed value elements (string / nested container): the resolved slot
+        // IS the handle. put_ptr proto-inits a fresh entry (owned-empty string /
+        // null container), so a write never sees null; a read of an absent key
+        // returns null, which the string sink redirect / handle default handles.
+        const bool managed = lv.assoc_val_string || lv.assoc_val_handle;
+        if (managed) {
+            el.is_string = lv.assoc_val_string;
+            el.is_handle = lv.assoc_val_handle;
+            el.slot_ty   = lv.slot_ty;
+            if (for_write) {
+                el.base = b_.CreateCall(
+                  assoc_put_ptr_fn(), { lv.assoc_handle, lv.assoc_ops, lv.assoc_key_ptr, lv.assoc_key_len });
+                return el;
+            }
+            llvm::Value* found = b_.CreateCall(
+              assoc_get_ptr_fn(), { lv.assoc_handle, lv.assoc_key_ptr, lv.assoc_key_len });
+            el.base        = found;
+            el.dyn_inrange = b_.CreateICmpNE(found, llvm::Constant::getNullValue(raw_ptr_ty()));
+            return el;
+        }
         el.slot_ty     = lv.slot_ty;
         el.has_z       = lv.has_z;
         el.narrow      = lv.narrow;
