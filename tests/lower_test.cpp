@@ -1444,14 +1444,16 @@ TEST_CASE("a matches pattern in an if condition lowers (LRM 12.6.2)") {
     CHECK_MESSAGE(r.ok, r.diagnostics);
 }
 
-TEST_CASE("a matches pattern in a conditional expression fails loudly") {
+TEST_CASE("a matches pattern in a conditional expression lowers (LRM 12.6.2)") {
+    // `expr matches pattern ? a : b` is supported (Phase 2); behavior (incl. the
+    // lazy single-evaluation path with a bound pattern var) is exercised in
+    // struct_test.cpp.
     const LowerResult r = lower_text(R"(
         module m(input [3:0] v, output y);
             assign y = v matches 4'd3 ? 1'b1 : 1'b0;
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("pattern matching in conditions") != std::string::npos);
+    CHECK_MESSAGE(r.ok, r.diagnostics);
 }
 
 // A compilation unit with no top-level module/interface/program instance

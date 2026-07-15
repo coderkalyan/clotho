@@ -345,6 +345,22 @@ TEST_CASE("tagged union: if/else matches with pattern-var binding (LRM 12.6.2)")
     )") == "match 7\nelse ok\n");
 }
 
+TEST_CASE("tagged union: ?: matches binds and single-evaluates the chosen arm") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef union tagged packed { void Invalid; int Valid; } opt_t;
+            function automatic int side(int x); $display("eval %0d", x); return x; endfunction
+            initial begin
+                opt_t u;
+                u = tagged Valid (5);
+                $display("r=%0d", u matches tagged Valid .n ? side(n) : side(99));
+                u = tagged Invalid;
+                $display("r=%0d", u matches tagged Valid .n ? side(n) : side(99));
+            end
+        endmodule
+    )") == "eval 5\nr=5\neval 99\nr=99\n");
+}
+
 TEST_CASE("pattern case: default, unpacked-union tag, and structure pattern (LRM 12.6)") {
     CHECK(run_capture(R"(
         module m;

@@ -8706,23 +8706,19 @@ private:
                     // Cond with a string temp).
                     fail("conditional operator (?:) over strings is not supported");
                 }
-                if (c.conditions.size() != 1) {
-                    fail("unsupported multi-condition ?:");
-                }
-                if (c.conditions[0].pattern != nullptr) {
-                    // TODO: `expr matches pattern ? a : b` (LRM 12.6.2) — same
-                    // gap as lower_conditional's pattern guard.
-                    fail("pattern matching in conditions is not supported");
-                }
+                // Condition (pattern-aware, incl. `&&&` filters) lowered once up
+                // front — LRM 11.4.11 single-evaluation — and shared by both
+                // dispatch paths. `x matches pat ? a : b` binds the pattern's
+                // variables here, so the arms below see them.
+                const ir::Index pred = lower_conditions(c.conditions, b, l);
                 // An arm whose evaluation is observable must not run unless
                 // chosen (LRM 11.4.11: a definite condition evaluates only its
                 // arm; an ambiguous one evaluates both and blends). Pure arms
                 // keep the branchless packed select — evaluating the unchosen
                 // arm is then unobservable.
                 if (has_observable_effect(c.left()) || has_observable_effect(c.right())) {
-                    return lower_lazy_conditional(c, b);
+                    return lower_lazy_conditional(c, pred, b);
                 }
-                const ir::Index pred = lower_predicate(*c.conditions[0].expr, b);
                 const ir::Index a    = lower_expr(c.left(), b);
                 const ir::Index bb   = lower_expr(c.right(), b);
                 return b.select(pred, a, bb, l);
@@ -9015,12 +9011,13 @@ private:
     // definite-true, its else branches on definite-false, and the innermost
     // else region re-lowers both arms eagerly. Case-equality on the 1-bit
     // predicate yields the definite branch bits.
-    ir::Index lower_lazy_conditional(const ConditionalExpression& c, ir::Builder& b) {
+    // `pred` is the already-lowered 1-bit condition (computed once by the caller,
+    // pattern-aware) — LRM 11.4.11 requires the condition to be evaluated once.
+    ir::Index lower_lazy_conditional(const ConditionalExpression& c, ir::Index pred, ir::Builder& b) {
         using T               = ir::Inst::Tag;
         const ir::SourceLoc l = loc(c);
         const ir::Ref       bit = make_int_type(1, true, false);
 
-        const ir::Index pred    = lower_predicate(*c.conditions[0].expr, b);
         const ir::Index one     = b.constant(module_.pool.put_int(bit, 1), l);
         const ir::Index zero    = b.constant(module_.pool.put_int(bit, 0), l);
         const ir::Index is_true = b.binary(T::CaseEq, pred, one, l);
@@ -9578,8 +9575,11 @@ private:
     // `expr matches pattern`. Pattern variables bound by an earlier condition are
     // visible to later conditions (the `&&&` filter form) and the guarded body,
     // so bindings are emitted left to right into the current region.
-    ir::Index lower_conditions(std::span<const ConditionalStatement::Condition> conds, ir::Builder& b,
-                               ir::SourceLoc l) {
+    // Templated over the Condition type: ConditionalStatement::Condition and
+    // ConditionalExpression::Condition are distinct nested structs with the same
+    // { expr, pattern } shape (the `if` and `?:` forms), so one body serves both.
+    template <typename Cond>
+    ir::Index lower_conditions(std::span<const Cond> conds, ir::Builder& b, ir::SourceLoc l) {
         ir::Index acc = ir::Index{};
         bool      have = false;
         for (const auto& cond : conds) {
