@@ -234,15 +234,81 @@ TEST_CASE("packed union x-propagates through overlaid members") {
     )") == "a=xxxx0011 h=xxxx l=0011\n");
 }
 
-TEST_CASE("tagged union is rejected loudly") {
-    const LowerResult r = lower_text(R"(
+TEST_CASE("packed tagged union: setter, member read, whole value (LRM 7.3.2)") {
+    CHECK(run_capture(R"(
         module m;
-            union tagged packed { logic [7:0] a; logic [7:0] b; } u;
-            initial u.a = 8'hAB;
+            typedef union tagged packed { void Invalid; int Valid; } opt_t;
+            opt_t a, b;
+            initial begin
+                a = tagged Valid (42);
+                b = tagged Invalid;
+                $display("%0d %b %b %b", a.Valid, a, b, a == b);
+                b = a;
+                $display("%0d %b", b.Valid, a == b);
+            end
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("tagged union is not supported") != std::string::npos);
+    )") == "42 100000000000000000000000000101010 000000000000000000000000000000000 0\n"
+           "42 1\n");
+}
+
+TEST_CASE("packed tagged union: direct member write sets the tag (LRM 7.3.2)") {
+    // Unlike a plain union, writing `u.Member` also sets the tag to that member's
+    // index (here Valid = index 1, so the high tag bit becomes 1).
+    CHECK(run_capture(R"(
+        module m;
+            typedef union tagged packed { void Invalid; int Valid; } opt_t;
+            opt_t a;
+            initial begin
+                a = tagged Invalid;
+                a.Valid = 7;
+                $display("%0d %b", a.Valid, a);
+            end
+        endmodule
+    )") == "7 100000000000000000000000000000111\n");
+}
+
+TEST_CASE("packed tagged union: narrow member gap is x for 4-state, run==param") {
+    // A member narrower than the widest leaves a gap between payload and tag. For
+    // a 4-state union that gap is x (the type's power-on default), matching
+    // slang's own const-eval — so a runtime setter and a folded parameter of the
+    // same expression produce identical bits.
+    CHECK(run_capture(R"(
+        module m;
+            typedef union tagged packed { logic [7:0] narrow; logic [31:0] wide; } u_t;
+            localparam u_t P = tagged narrow (8'hAB);
+            u_t x;
+            initial begin
+                x = tagged narrow (8'hAB);
+                $display("%b", x);
+                $display("%b", P);
+            end
+        endmodule
+    )") == "0xxxxxxxxxxxxxxxxxxxxxxxx10101011\n"
+           "0xxxxxxxxxxxxxxxxxxxxxxxx10101011\n");
+}
+
+TEST_CASE("unpacked tagged union: LSB overlay plus tag (LRM 7.3.2)") {
+    // An unpacked tagged union lowers to the same flat {synthesized-tag, payload}
+    // value; a narrow member sits in the low bits, a wider member read sees the
+    // low bits of whatever was last written. A direct narrow member write
+    // (`x.b`) touches only its own low bits, leaving the rest of the wider
+    // payload region untouched (so x.w keeps the high `deadbe` bytes from the
+    // prior wide write). iverilog and verilator have no tagged-union support;
+    // values are hand-checkable overlay.
+    CHECK(run_capture(R"(
+        module m;
+            typedef union tagged { void none; byte b; int w; } u_t;
+            u_t x;
+            initial begin
+                x = tagged b (8'hAB);
+                $display("%h %h", x.b, x.w);
+                x = tagged w (32'hDEADBEEF);
+                $display("%h %h", x.b, x.w);
+                x.b = 8'h5A;
+                $display("%h %h", x.b, x.w);
+            end
+        endmodule
+    )") == "ab 000000ab\nef deadbeef\n5a deadbe5a\n");
 }
 
 TEST_CASE("unpacked union overlays members at the LSB (flat value, LRM 7.3)") {
@@ -300,15 +366,18 @@ TEST_CASE("unpacked union member must be integral") {
     CHECK(r.diagnostics.find("unpacked union member must be an integral type") != std::string::npos);
 }
 
-TEST_CASE("tagged unpacked union is rejected loudly") {
+TEST_CASE("tagged union with a non-integral member is rejected loudly (Phase 3 gap)") {
+    // A non-integral member of an unpacked tagged union (here a `real` payload)
+    // has no flat-bit overlay — the P1 flat-value representation cannot hold it,
+    // so it fails loudly (docs/design/tagged-unions.md Phase 3).
     const LowerResult r = lower_text(R"(
         module m;
-            union tagged { logic [7:0] a; logic [7:0] b; } u;
-            initial u.a = 8'hAB;
+            union tagged { void none; real r; } u;
+            initial u = tagged r (1.5);
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("tagged union is not supported") != std::string::npos);
+    CHECK(r.diagnostics.find("unpacked union member must be an integral type") != std::string::npos);
 }
 
 TEST_CASE("blocking read and write of unpacked struct members") {

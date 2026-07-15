@@ -1,6 +1,7 @@
 #include "Lower.h"
 
 #include <algorithm>
+#include <bit>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -1115,19 +1116,20 @@ private:
             // reads/writes with no backend changes. Unpacked unions are a separate,
             // larger change (overlapping aggregate storage) and stay loud-failed.
             const auto& ut = ct.as<slang::ast::PackedUnionType>();
-            if (ut.isTagged) {
-                // TODO: tagged unions (LRM 7.3.2) carry a member tag and per-member
-                // validity — no flat bit-vector overlay. Not lowered.
-                fail("tagged union is not supported");
-            }
             if (const auto cached = struct_type_cache_.find(&ct); cached != struct_type_cache_.end()) {
                 return cached->second;
             }
 
+            // A tagged packed union (LRM 7.3.2) is still a flat bit-vector, just
+            // with the tag reserved in the high `tagBits` bits — slang's
+            // getBitWidth() already includes them, and every member payload
+            // still overlays the LSB (bit_offset 0), so the same flat path
+            // lowers it. The tag high bits are set by the `tagged` setter /
+            // member-write and tested by pattern matching (docs/design/
+            // tagged-unions.md); a `void` member has no payload and lowers to a
+            // void field placeholder that is never part-selected.
             std::vector<ir::FieldRow> fields;
             for (const auto& f : static_cast<const Scope&>(ut).membersOfType<slang::ast::FieldSymbol>()) {
-                // Every packed-union member overlays the LSB (bit_offset 0), so a
-                // narrower member is a low part-select of the union value.
                 fields.push_back({ f.name, lower_type(f.getType()), 0 });
             }
 
@@ -1160,23 +1162,30 @@ private:
             // restricted to integral (packed) types: a real / string / unpacked
             // aggregate member has no flat-bit overlay and is gated loud.
             const auto& ut = ct.as<slang::ast::UnpackedUnionType>();
-            if (ut.isTagged) {
-                // TODO: tagged unions (LRM 7.3.2) carry a member tag; no plain overlay.
-                fail("tagged union is not supported");
-            }
             if (const auto cached = struct_type_cache_.find(&ct); cached != struct_type_cache_.end()) {
                 return cached->second;
             }
 
             std::vector<ir::FieldRow> fields;
             uint32_t                  max_width = 0;
+            uint32_t                  nmembers  = 0;
             bool                      four      = false;
             for (const auto& f : static_cast<const Scope&>(ut).membersOfType<slang::ast::FieldSymbol>()) {
+                ++nmembers;
                 const slang::ast::Type& mt = f.getType().getCanonicalType();
+                if (mt.isVoid()) {
+                    // A tagged union (LRM 7.3.2) may carry a `void` member: no
+                    // payload, only a tag encoding. Lowered as a void field
+                    // placeholder that is never part-selected.
+                    fields.push_back({ f.name, module_.pool.void_type, 0 });
+                    continue;
+                }
                 if (!mt.isIntegral()) {
                     // TODO: unpacked-union member that is not a flat bit-vector
                     // (real / string / unpacked struct or array / dynamic array /
-                    // queue / class) — no defined bit-level overlay (LRM 7.3).
+                    // queue / class) — no defined bit-level overlay (LRM 7.3). For
+                    // a tagged union this is the Phase 3 gap (docs/design/
+                    // tagged-unions.md).
                     fail("unpacked union member must be an integral type");
                 }
                 max_width = std::max<uint32_t>(max_width, mt.getBitWidth());
@@ -1185,12 +1194,19 @@ private:
                 fields.push_back({ f.name, lower_type(f.getType()), 0 });
             }
 
+            // A tagged unpacked union reserves high tag bits, laid out above the
+            // widest member's payload — the same {tag, payload} bit layout a
+            // packed tagged union gets from slang, synthesized here since the
+            // unpacked union has no slang-dictated width. tagBits = ceil(log2 n).
+            const uint32_t tag_bits =
+              ut.isTagged && nmembers > 1 ? static_cast<uint32_t>(std::bit_width(nmembers - 1)) : 0;
+
             ir::Type t;
             t.kind      = ir::Type::Kind::Struct;
             t.is_packed = true;
             t.is_union  = true;
             t.element   = four ? module_.pool.logic_type : module_.pool.bit_type;
-            t.left      = max_width - 1;
+            t.left      = max_width + tag_bits - 1;
             t.right     = 0;
             t.fields_id = module_.pool.intern_struct_fields(std::move(fields));
 
@@ -7948,6 +7964,24 @@ private:
             store_concat(a.left().as<ConcatenationExpression>(), rhs, tag, b, loc(a));
             return rhs;
         }
+        if (a.left().kind == ExpressionKind::MemberAccess &&
+            a.left().as<MemberAccessExpression>().value().type->getCanonicalType().isTaggedUnion()) {
+            // Direct member write to a tagged union (LRM 7.3.2): store the payload
+            // to the member's low bits AND set the tag high bits to the member's
+            // index — unlike a plain union, whose member store leaves the rest
+            // untouched (docs/design/tagged-unions.md).
+            // TODO: a compound (`u.m += v`) or concat-embedded (`{u.m,..} = v`)
+            // member write reaches this point via lower_compound_assign /
+            // store_concat above and so does NOT update the tag. Correct when the
+            // member is already active (the common case); the tag is stale only
+            // when the prior tag differed, where the RMW already read an inactive
+            // member (undefined). Full tag-on-every-member-write is a Phase 2
+            // cleanup alongside pattern matching.
+            const auto& ma = a.left().as<MemberAccessExpression>();
+            b.binary(tag, lower_member_lvalue(ma, b, loc(a)), rhs, loc(a));
+            store_union_tag(ma.value(), ma.member.as<FieldSymbol>().fieldIndex, tag, b, loc(a));
+            return rhs;
+        }
         b.binary(tag, lower_lvalue(a.left(), b), rhs, loc(a));
         return rhs;
     }
@@ -8665,6 +8699,8 @@ private:
                 return lower_binary(expr.as<BinaryExpression>(), b);
             case ExpressionKind::Inside:
                 return lower_inside(expr.as<InsideExpression>(), b);
+            case ExpressionKind::TaggedUnion:
+                return lower_tagged_union_set(expr.as<slang::ast::TaggedUnionExpression>(), b);
             case ExpressionKind::ConditionalOp: {
                 const ConditionalExpression& c = expr.as<ConditionalExpression>();
                 if (is_string_expr(expr)) {
@@ -9372,6 +9408,85 @@ private:
         }
         const ir::Index off = lower_packed_offset(es.selector(), range, 0, b, l, w);
         return b.dyn_part_select(base, off, w, l);
+    }
+
+    // Number of high tag bits a tagged union (LRM 7.3.2) reserves. For a packed
+    // union slang computes it (`tagBits`); for an unpacked union Clotho
+    // synthesizes the same `ceil(log2 n)` layout. Zero for a non-tagged union or
+    // a single-member tagged union (no discriminant needed).
+    uint32_t union_tag_bits(const slang::ast::Type& ct) {
+        if (ct.isPackedUnion()) {
+            return ct.as<slang::ast::PackedUnionType>().tagBits;
+        }
+        const auto& ut = ct.as<slang::ast::UnpackedUnionType>();
+        if (!ut.isTagged) {
+            return 0;
+        }
+        uint32_t n = 0;
+        for (const auto& f : static_cast<const Scope&>(ut).membersOfType<slang::ast::FieldSymbol>()) {
+            (void)f;
+            ++n;
+        }
+        return n > 1 ? static_cast<uint32_t>(std::bit_width(n - 1)) : 0;
+    }
+
+    // Lower a `tagged Member (value)` union setter (LRM 7.3.2), the only
+    // expression that assigns a tagged union as a whole value. Builds the flat
+    // bit-vector `{tag, gap, payload}` MSB-to-LSB by concatenation: the member's
+    // `fieldIndex` in the high `tagBits` bits, the payload in the low bits, and
+    // the bits between (present only for a member narrower than the widest, or a
+    // `void` member with no payload) taking the union's power-on default — x for
+    // a 4-state union, 0 for 2-state. This mirrors slang's own const-eval
+    // (`type->getDefaultValue()` then overlay tag/payload), so a runtime setter
+    // and a folded parameter of the same expression produce identical bits
+    // (docs/design/tagged-unions.md).
+    ir::Index lower_tagged_union_set(const slang::ast::TaggedUnionExpression& tu, ir::Builder& b) {
+        const ir::SourceLoc     l    = loc(tu);
+        const slang::ast::Type& ct   = tu.type->getCanonicalType();
+        const auto              lay  = module_.pool.layout(lower_type(*tu.type));
+        const bool              four = lay.domain == ir::Domain::Four;
+        const uint32_t          tag_bits = union_tag_bits(ct);
+        const auto&             field    = tu.member.as<FieldSymbol>();
+        const uint32_t member_w = static_cast<uint32_t>(field.getType().getBitWidth());
+
+        std::vector<ir::Index> parts;
+        if (tag_bits != 0) {
+            parts.push_back(b.constant(
+              module_.pool.put_int(make_int_type(tag_bits, four, false), field.fieldIndex), l));
+        }
+        if (const uint32_t gap_w = lay.width - tag_bits - member_w; gap_w != 0) {
+            parts.push_back(b.constant(
+              four ? svint_to_ref(slang::SVInt::createFillX(gap_w, false),
+                                  make_int_type(gap_w, true, false))
+                   : module_.pool.put_int(make_int_type(gap_w, false, false), 0),
+              l));
+        }
+        if (member_w != 0) {
+            parts.push_back(
+              b.resize(lower_expr(*tu.valueExpr, b), make_int_type(member_w, four, false), l));
+        }
+        return b.concat(parts, l);
+    }
+
+    // Write the tag high bits of a tagged union to `idx` (a member's fieldIndex).
+    // A direct member write `u.m = e` (LRM 7.3.2) sets the payload AND the tag,
+    // unlike a plain union where a member store leaves the rest untouched. No-op
+    // for a union with no tag bits (single-member).
+    void store_union_tag(const Expression& union_expr, uint32_t idx, ir::Inst::Tag tag,
+                         ir::Builder& b, ir::SourceLoc l) {
+        const slang::ast::Type& ct       = union_expr.type->getCanonicalType();
+        const uint32_t          tag_bits = union_tag_bits(ct);
+        if (tag_bits == 0) {
+            return;
+        }
+        const ir::Ref   uty  = lower_type(*union_expr.type);
+        const auto      lay  = module_.pool.layout(uty);
+        const bool      four = lay.domain == ir::Domain::Four;
+        const ir::Index base = lower_lvalue(union_expr, b);
+        const ir::Index sel  = b.part_select(base, lay.width - 1, lay.width - tag_bits, l);
+        const ir::Index tagc =
+          b.constant(module_.pool.put_int(make_int_type(tag_bits, four, false), idx), l);
+        b.binary(tag, sel, tagc, l);
     }
 
     // Struct/union member select (LRM 7.2.1 / 7.3): a packed struct or union is
