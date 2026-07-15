@@ -5816,6 +5816,10 @@ private:
             lower_display(call, /*newline=*/false, b, rx);
             return;
         }
+        if (const char rx = display_radix(name, "$strobe")) {
+            lower_strobe(call, b, rx);
+            return;
+        }
         if (const char rx = display_radix(name, "$fdisplay")) {
             lower_fdisplay(call, /*newline=*/true, b, rx);
             return;
@@ -7485,6 +7489,30 @@ private:
         std::vector<ir::Index> args;
         build_format(call.arguments(), fmt, args, b, default_conv);
         b.display(fmt, newline, args, loc(call));
+    }
+
+    // Lower $strobe / $strobeb / $strobeo / $strobeh (LRM 21.2.2): unlike
+    // $display, the argument list is not evaluated here — it is compiled into
+    // a synthesized task (build_strobe_body) whose body evaluates it, run once
+    // at the Postponed region of the current time step (LRM: "That time is the
+    // end of the current simulation time, when all the simulation events have
+    // occurred for that simulation time, just before simulation time is
+    // advanced"). The call site just pends that task.
+    void lower_strobe(const CallExpression& call, ir::Builder& b, char default_conv) {
+        if (fn_ctx_ != nullptr && !fn_ctx_->is_task) {
+            // A function is a plain callable with no wheel pointer in its ABI
+            // (the same restriction as $time / $realtime, see lower_sysfunc)
+            // and no coroutine frame to ramp the deferred body's task-call
+            // record through.
+            // TODO: threading the wheel into the function ABI (the $time TODO
+            // in lower_sysfunc) would lift this too, but $strobe additionally
+            // needs a record slot to ramp its deferred body, which currently
+            // only exists on a coroutine (record_slot() anchors on
+            // coro_begin_) — a plain function has neither.
+            fail("$strobe inside a function is not supported (no wheel in the ABI)");
+        }
+        const ir::FunctionId fid = build_strobe_body(call.arguments(), default_conv, loc(call));
+        b.strobe_pend(fid, loc(call));
     }
 
     // Lower $fdisplay / $fwrite (LRM §21.3.3): the first argument is the
@@ -10159,6 +10187,49 @@ private:
                                                .is_task       = true,
                                                .is_fork_child = true,
                                                .ir            = b.finish() });
+        named_blocks_.swap(saved_blocks);
+        fn_ctx_ = saved;
+        return id;
+    }
+
+    // Lower a `$strobe` argument list (LRM 21.2.2) into a synthetic zero-formal
+    // deferred-print task: same shape as build_fork_child (a fresh, empty
+    // FnCtx; runs in the *parent's* scope context — scope_ / prefix_ /
+    // time_mul_ unchanged — so a reference to the caller's own module signals
+    // still resolves), but the body is a $display built from `args`, not a
+    // statement. The fresh, never-populated localmap is what makes this safe
+    // without a separate eligibility check: any argument referencing the
+    // caller's own automatic local, formal, or `this` misses that lookup
+    // (value_lvalue) and falls through to signal_of, which fails loudly on a
+    // symbol never registered as a persistent signal — storage the deferred
+    // body, resumed after the caller's own activation may have ended, cannot
+    // reach anyway. Returns the reserved FunctionId; the call site pends it.
+    ir::FunctionId build_strobe_body(std::span<const Expression* const> args, char default_conv,
+                                     ir::SourceLoc l) {
+        const ir::FunctionId id = module_.reserve_function();
+
+        FnCtx ctx;
+        ctx.name_prefix = "strobe.";
+        ctx.is_task     = true;
+        FnCtx* saved    = fn_ctx_;
+        fn_ctx_         = &ctx;
+        std::vector<std::string_view> saved_blocks;
+        saved_blocks.swap(named_blocks_);
+
+        ir::Builder             b(module_.pool);
+        std::string             fmt;
+        std::vector<ir::Index>  fargs;
+        build_format(args, fmt, fargs, b, default_conv);
+        b.display(fmt, /*newline=*/true, fargs, l);
+        b.ret_void(l);
+
+        module_.set_function(id, ir::Function{ .name        = "strobe",
+                                               .return_type = module_.pool.void_type,
+                                               .param_types = {},
+                                               .arg_dirs    = {},
+                                               .local_types = std::move(ctx.local_types),
+                                               .is_task     = true,
+                                               .ir          = b.finish() });
         named_blocks_.swap(saved_blocks);
         fn_ctx_ = saved;
         return id;

@@ -488,6 +488,13 @@ struct CaseViolInfo {
     uint32_t kind;
 };
 
+// Extra payload for `strobe_pend`: the deferred-print task to run at the end
+// of the current time step (see Inst::Tag::StrobePend).
+struct StrobePendInfo {
+    // The synthesized zero-formal task holding the format args + Display.
+    FunctionId func;
+};
+
 // Severity level of a `severity` instruction. Selects the diagnostic label the
 // runtime prints (LRM 20.10); Fatal is `$fatal` (the frontend follows the report
 // with a Finish carrying the finish number, so the report itself never
@@ -769,6 +776,7 @@ static_assert(ExtraPayload<SwitchInfo>);
 static_assert(ExtraPayload<DisplayInfo>);
 static_assert(ExtraPayload<FinishInfo>);
 static_assert(ExtraPayload<CaseViolInfo>);
+static_assert(ExtraPayload<StrobePendInfo>);
 static_assert(ExtraPayload<SeverityInfo>);
 static_assert(ExtraPayload<FseekInfo>);
 static_assert(ExtraPayload<RealMathBinaryInfo>);
@@ -1295,6 +1303,17 @@ struct Inst {
         // the descriptor operand (payload: fdisplay — op_extra whose op is the
         // descriptor and extra a DisplayInfo).
         FDisplay,
+        // $strobe / $strobeb / $strobeo / $strobeh (LRM 21.2.2): register the
+        // compiler-synthesized zero-formal task `func` (payload: extra ->
+        // StrobePendInfo) to run once in the Postponed region of the current
+        // time step, just before simulation time advances. `func`'s body holds
+        // the format args' evaluation (a Display), not this instruction — the
+        // whole point of $strobe is that evaluation itself is deferred to the
+        // end of the time step, not merely the print, so nothing here is
+        // re-evaluated later. A process containing this tag is forced to a
+        // coroutine (see is_simple_always) so its call site can ramp `func`'s
+        // coroutine frame through the task-call record ABI.
+        StrobePend,
         // Two-argument $fopen(name, mode): open a single file descriptor with
         // the C stdio mode string, -> 32-bit FD value (payload: binary — l is
         // the filename value, r the mode string; both packed-ASCII vectors the
@@ -1775,6 +1794,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Finish:
         case T::CaseViol:
         case T::TestPlusArgs:
+        case T::StrobePend:
             return K::Extra;
         case T::Fork:
             // Children are FunctionIds (not SSA operands), walked from ForkInfo;

@@ -627,6 +627,7 @@ public:
             report_comb_fuse_stat();
         }
         compute_domain_spec();   // after fusion (thunk_group_): reads spec_group_ in lower_group
+        design_uses_strobe_ = design_uses_strobe(); // gates the Postponed-region drain loop
         build_vcd_index();       // before build_nba_state: fills vcd_index_ / design_uses_vcd_
         build_wait_queues();
         build_instance_ctx_layout(); // after build_wait_queues: ctx sizes need wait slots
@@ -4414,6 +4415,16 @@ private:
                 case Inst::Tag::StoreNbDelay:
                 case Inst::Tag::StoreNbEvent:
                     return false;
+                // A $strobe call site ramps its deferred-print task through the
+                // task-call record ABI (lower_strobe_pend), which needs a real
+                // coroutine (record_slot() anchors on coro_begin_) — a thunk has
+                // neither. Forcing a coroutine here also keeps a $strobe-bearing
+                // process out of comb fusion (comb_fuse_verdict checks this
+                // first), which is required anyway: a spuriously re-run fused
+                // member would double-queue the print, an observable effect the
+                // fusion "as-if" argument does not allow.
+                case Inst::Tag::StrobePend:
+                    return false;
                 case Inst::Tag::Store: {
                     const LvalueRoot r = lvalue_root(p.ir, p.ir.payload(idx).binary.l);
                     if (p.ir.tag(r.root) != Inst::Tag::Signal) {
@@ -7072,6 +7083,31 @@ private:
         if (uses_vcd) {
             b_.CreateCall(vcd_flush_fn(), { b_.CreateCall(wheel_now_fn(), { wheel }) });
         }
+        // $strobe (LRM 21.2.2): drain every pending deferred-print handle queued
+        // this instant. Each was ramped — never resumed — at its call site
+        // (lower_strobe_pend); resuming it here, at the settled-instant point, is
+        // where the target body actually reads $time / signals and prints, giving
+        // exactly the Postponed-region timing the LRM specifies. A strobe body
+        // never suspends (is_simple_always forces its caller to a coroutine and
+        // the frontend rejects timing controls in a $strobe argument list), so
+        // one resume always runs it to completion.
+        if (design_uses_strobe_) {
+            auto* fn      = b_.GetInsertBlock()->getParent();
+            auto* pop_bb  = llvm::BasicBlock::Create(ctx_, "strobe.pop", fn);
+            auto* run_bb  = llvm::BasicBlock::Create(ctx_, "strobe.run", fn);
+            auto* done_bb = llvm::BasicBlock::Create(ctx_, "strobe.done", fn);
+            b_.CreateBr(pop_bb);
+            b_.SetInsertPoint(pop_bb);
+            llvm::Value* hdl = b_.CreateCall(strobe_pop_fn(), {});
+            b_.CreateCondBr(
+              b_.CreateICmpNE(hdl, llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_))),
+              run_bb, done_bb);
+            b_.SetInsertPoint(run_bb);
+            b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
+            b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
+            b_.CreateBr(pop_bb);
+            b_.SetInsertPoint(done_bb);
+        }
         // Advance one instant (firing any timers, which enqueue their handles) and
         // re-drain. rt_wheel_advance folds the pending-check into the tick — one ABI
         // crossing per timestep, no separate occupancy scan — and returns non-zero
@@ -8243,6 +8279,7 @@ private:
             case Inst::Tag::Fork:
             case Inst::Tag::Display:
             case Inst::Tag::FDisplay:
+            case Inst::Tag::StrobePend:
             case Inst::Tag::TimeFormat:
             case Inst::Tag::Finish:
             case Inst::Tag::CaseViol:
@@ -9523,6 +9560,10 @@ private:
 
             case Inst::Tag::FDisplay:
                 lower_fdisplay(i);
+                return;
+
+            case Inst::Tag::StrobePend:
+                lower_strobe_pend(i);
                 return;
 
             case Inst::Tag::TimeFormat:
@@ -11305,6 +11346,38 @@ private:
                       { units, prec, sfx_ptr, b_.getInt32(static_cast<uint32_t>(suffix.size())), width });
     }
 
+    // void rt_strobe_pend(ptr handle) — queue one $strobe invocation's ramped
+    // (not yet resumed) coroutine handle to run in the Postponed region of the
+    // current time step (LRM 21.2.2).
+    llvm::FunctionCallee strobe_pend_fn() {
+        return rt_fn("rt_strobe_pend", b_.getVoidTy(), { raw_ptr_ty() });
+    }
+    // ptr rt_strobe_pop(void) — pop and return the next queued handle (FIFO —
+    // same-instant $strobe calls print in call order), or null when empty.
+    llvm::FunctionCallee strobe_pop_fn() {
+        return rt_fn("rt_strobe_pop", raw_ptr_ty(), {});
+    }
+
+    // Lower a `strobe_pend`: ramp the target zero-formal deferred-print task
+    // (build_strobe_body / Lower.cpp) — ramp only, never resumed here — and hand
+    // its coroutine handle to the runtime's pending queue. The handle is resumed
+    // once, at the Postponed region of this time step (see the strobe drain loop
+    // in emit_active_run), which is where the target body actually evaluates its
+    // format args and prints: LRM 21.2.2 defers the evaluation itself, not just
+    // the print, so nothing about this call site's own state matters afterward.
+    // The record slot mirrors a normal task_call ramp (lower_task_call_inst) —
+    // the target task never suspends, so it never touches it, but the ramp ABI
+    // requires the parameter regardless.
+    void lower_strobe_pend(Index i) {
+        const auto      info = ir_->extra_data<StrobePendInfo>(ir_->payload(i).extra);
+        llvm::Function* cf   = sym(fn_decls_[static_cast<uint32_t>(info.func)]);
+
+        llvm::Value* record = record_slot();
+        b_.CreateStore(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)), record);
+        llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, { state_, wheel_, record });
+        b_.CreateCall(strobe_pend_fn(), { hdl });
+    }
+
     // void rt_finish(ptr banner, i64 now, i32 arg) — noreturn; prints the exit
     // banner (LRM Table 20-1) then exits the process. Kept separate from the
     // plain rt_fn helpers: the noreturn attribute must land on the declaration so
@@ -12011,6 +12084,29 @@ private:
                         return true;
                     default:
                         break;
+                }
+            }
+        }
+        return false;
+    }
+
+    // Any StrobePend instruction anywhere in the design (a process body, or a
+    // task body it calls — $strobe is legal in either, never in a plain
+    // function)? Scans functions too, unlike design_uses_vcd, since a
+    // $strobe call site can live inside a task.
+    bool design_uses_strobe() const {
+        for (const Process& p : mod_.processes()) {
+            for (uint32_t k = 0; k < p.ir.inst_count(); ++k) {
+                if (p.ir.tag(static_cast<Index>(k)) == Inst::Tag::StrobePend) {
+                    return true;
+                }
+            }
+        }
+        for (uint32_t i = 0; i < mod_.function_count(); ++i) {
+            const Ir& ir = mod_.function(static_cast<FunctionId>(i)).ir;
+            for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+                if (ir.tag(static_cast<Index>(k)) == Inst::Tag::StrobePend) {
+                    return true;
                 }
             }
         }
@@ -15229,6 +15325,10 @@ private:
     // array elements are always-scanned, not instrumented). nba_vcd_gv_ is a
     // parallel [n_nba x i32] of those indices, read in the NBA commit loop.
     bool                  design_uses_vcd_ = false;
+    // Any StrobePend instruction anywhere in the design? Gates the per-instant
+    // Postponed-region drain loop (emit_active_run), so a design with no
+    // $strobe pays nothing.
+    bool design_uses_strobe_ = false;
     std::vector<int32_t>  vcd_index_;
     llvm::GlobalVariable* nba_vcd_gv_ = nullptr;
 

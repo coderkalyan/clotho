@@ -51,10 +51,11 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
             // (the predicate lives inside the cond region, walked via region()).
             // finish / case_viol / test_plusargs carry only banner / query
             // bytes, no SSA operands. fork's children are FunctionIds, not
-            // operands.
+            // operands. strobe_pend's target is a FunctionId too, not an
+            // operand — the deferred body re-evaluates its own args.
             if (tag == Inst::Tag::Loop || tag == Inst::Tag::Finish ||
                 tag == Inst::Tag::CaseViol || tag == Inst::Tag::TestPlusArgs ||
-                tag == Inst::Tag::Fork) {
+                tag == Inst::Tag::Fork || tag == Inst::Tag::StrobePend) {
                 return {};
             }
             // concat: variadic operands live in the extra buffer.

@@ -270,6 +270,10 @@ public:
     // $fdisplay / $fwrite: like display, but `fd` selects the destination
     // descriptor (an MCD or FD value).
     Index fdisplay(Index fd, std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc);
+    // $strobe / $strobeb / $strobeo / $strobeh (LRM 21.2.2): register the
+    // zero-formal deferred-print task `func` to run once in the Postponed
+    // region of the current time step. A statement, never a value.
+    Index strobe_pend(FunctionId func, SourceLoc loc);
     // Two-argument $fopen: open `name` with the C stdio mode string `mode`,
     // yielding a 32-bit FD.
     Index fopen_fd(Index name, Index mode, SourceLoc loc);

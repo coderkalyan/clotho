@@ -144,6 +144,7 @@ add_executable(clotho_test
   tests/string_test.cpp
   tests/dpi_test.cpp
   tests/display_test.cpp
+  tests/strobe_test.cpp
   tests/loop_test.cpp
   tests/generate_test.cpp
   tests/instance_array_test.cpp
