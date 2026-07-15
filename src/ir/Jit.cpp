@@ -156,6 +156,8 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
         };
     };
     expose("rt_fwrite", &rt_fwrite);
+    expose("rt_strobe_pend", &rt_strobe_pend);
+    expose("rt_strobe_pop", &rt_strobe_pop);
     expose("rt_fopen_mcd", &rt_fopen_mcd);
     expose("rt_fopen_fd", &rt_fopen_fd);
     expose("rt_fclose", &rt_fclose);

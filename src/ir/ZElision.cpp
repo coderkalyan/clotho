@@ -510,6 +510,7 @@ struct Analysis {
                 case Inst::Tag::Fork:
                 case Inst::Tag::Display:
                 case Inst::Tag::FDisplay:
+                case Inst::Tag::StrobePend:
                 case Inst::Tag::TimeFormat:
                 case Inst::Tag::Finish:
                 case Inst::Tag::CaseViol:

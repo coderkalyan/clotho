@@ -520,6 +520,11 @@ Index Builder::fdisplay(Index fd, std::string_view fmt, bool newline, std::span<
                 loc);
 }
 
+Index Builder::strobe_pend(FunctionId func, SourceLoc loc) {
+    return emit({ Inst::Tag::StrobePend, pay(&Inst::Payload::extra, add_extra(StrobePendInfo{ func })) },
+                loc);
+}
+
 ExtraIndex Builder::display_info(std::string_view fmt, bool newline, std::span<const Index> args) {
     // Order in the extra buffer: format bytes, then the arg-index slice, then the
     // DisplayInfo record pointing at both. None of the three regions overlap.

@@ -2037,6 +2037,28 @@ extern "C" void rt_fwrite(int32_t desc, const char* fmt, uint32_t argc, const rt
     }
 }
 
+namespace {
+// FIFO queue of ramped-but-not-yet-resumed $strobe coroutine handles for the
+// current time step (LRM 21.2.2). One growable buffer reused across
+// instants: rt_strobe_pop advances a read cursor and only clears (never
+// deallocates) once fully drained, so steady-state $strobe use allocates once.
+std::vector<void*> g_strobe_queue;
+size_t             g_strobe_read = 0;
+} // namespace
+
+extern "C" void rt_strobe_pend(void* handle) {
+    g_strobe_queue.push_back(handle);
+}
+
+extern "C" void* rt_strobe_pop() {
+    if (g_strobe_read >= g_strobe_queue.size()) {
+        g_strobe_queue.clear();
+        g_strobe_read = 0;
+        return nullptr;
+    }
+    return g_strobe_queue[g_strobe_read++];
+}
+
 extern "C" int32_t rt_fopen_mcd(const char* name_buf, uint32_t name_len) {
     io_ensure_init();
     const std::string path = unpack_ascii(name_buf, name_len);

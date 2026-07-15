@@ -46,6 +46,25 @@ typedef struct rt_arg {
 // any trailing newline into `fmt`.
 void rt_fwrite(int32_t desc, const char* fmt, uint32_t argc, const rt_arg* argv);
 
+// -- $strobe (LRM 21.2.2) --
+//
+// $strobe defers both evaluating its arguments and printing them to the
+// Postponed region of the current time step, just before simulation time
+// advances — unlike $display, which does both immediately. The codegen ramps
+// (but never resumes) a per-call-site coroutine whose body holds the format
+// args' evaluation, and queues its handle here; the backend resumes each
+// queued handle once, at the settled-instant point (emit_active_run), which is
+// where the deferred evaluation actually happens.
+
+// Queue one $strobe invocation's ramped coroutine handle to run this instant's
+// Postponed region.
+void rt_strobe_pend(void* handle);
+
+// Pop and return the next queued handle in FIFO order (so same-instant
+// $strobe calls print in call order), or null once the queue is empty. Called
+// in a loop from the Postponed region.
+void* rt_strobe_pop(void);
+
 // -- $timeformat / %t --
 //
 // The %t format specifier renders a time argument (passed in design ticks, i.e.

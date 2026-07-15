@@ -357,6 +357,8 @@ const char* tag_name(Inst::Tag tag) {
             return "display";
         case T::FDisplay:
             return "fdisplay";
+        case T::StrobePend:
+            return "strobe_pend";
         case T::Finish:
             return "finish";
         case T::CaseViol:
@@ -678,6 +680,11 @@ private:
                     const auto info = ir_.extra_data<CaseViolInfo>(p.extra);
                     os_ << '"' << ir_.extra_bytes(info.banner, info.banner_len) << "\", "
                         << info.kind;
+                    break;
+                }
+                if (tag == Inst::Tag::StrobePend) {
+                    const auto info = ir_.extra_data<StrobePendInfo>(p.extra);
+                    os_ << "fn" << static_cast<uint32_t>(info.func);
                     break;
                 }
                 // concat: variadic operands.
