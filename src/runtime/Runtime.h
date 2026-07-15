@@ -556,6 +556,11 @@ void rt_queue_delete_all(rt_queue* h, const rt_elem_ops* ops);
 // == 0 (value semantics, LRM §7.10). A no-op when dst == src.
 void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_elem_ops* ops);
 
+// Move `src`'s buffer into `dst` (ownership transfer, LRM 7.10): destroy `dst`'s
+// elements + buffer, take `src`'s, leave `src` empty. The nonblocking-assignment
+// commit path (RHS deep-copied into `src` in the Active region). No-op if equal.
+void rt_queue_move(rt_queue* dst, rt_queue* src, const rt_elem_ops* ops);
+
 // Append `src`'s live elements at logical indices [lo, hi] (inclusive) onto
 // `dst`, respecting `bound`. Materializes a queue slice `q[a:b]` (LRM §7.10.4)
 // and the queue-typed operands of a concatenation `{q, e}` (a full-queue append

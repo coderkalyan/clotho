@@ -147,6 +147,9 @@ public:
     Index queue_delete(Index q, Index idx, bool has_idx, Ref queue_type, SourceLoc loc);
     // dst = src: deep copy of another queue (value semantics).
     Index queue_copy(Index dst, Index src, Ref queue_type, SourceLoc loc);
+    // dst <= src: nonblocking deep copy (staged in Active, moved into dst in the
+    // NBA region).
+    Index queue_copy_nb(Index dst, Index src, Ref queue_type, SourceLoc loc);
     // Append src[lo:hi] (inclusive, i64 values; full-queue append passes lo = 0,
     // hi = INT64_MAX) onto the dst handle — a queue slice / concatenation operand.
     Index queue_append_range(Index dst, Index src, Index lo, Index hi, Ref queue_type,

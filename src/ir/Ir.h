@@ -922,6 +922,11 @@ struct Inst {
         // payload: op_extra -> QueueArg, whose arg is the source handle
         // lvalue; op is the destination handle lvalue).
         QueueCopy,
+        // Nonblocking `dst <= src` deep copy (payload: op_extra -> QueueArg, arg
+        // is the source handle; op is the dst handle lvalue). Stages a deep copy
+        // of src in the Active region; the NBA region moves it into dst (LRM
+        // 7.10 / 10.4.2).
+        QueueCopyNb,
         // Append src[lo:hi] onto the dst handle (payload: op_extra ->
         // QueueSliceInfo; op is the dst handle lvalue), materializing a queue
         // slice or a queue-typed concatenation operand (LRM 7.10.4).
@@ -1804,6 +1809,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::QueueInsert:
         case T::QueueDeleteIdx:
         case T::QueueCopy:
+        case T::QueueCopyNb:
         case T::QueueAppendRange:
         case T::AssocSelect:
         case T::AssocExists:

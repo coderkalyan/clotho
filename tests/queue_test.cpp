@@ -706,3 +706,67 @@ TEST_CASE("struct-with-queue-member equality") {
     )";
     CHECK(run_capture(src) == "1\n0\n0\n");
 }
+
+// Whole-queue nonblocking assignment `q <= rhs` (LRM 10.4.2): the RHS is
+// deep-copied in the Active region and moved into the target in the NBA region,
+// so the update is not visible until after the current region. A later blocking
+// write is overwritten by the NBA commit (last write wins). Verified against
+// verilator on 2-state; string-element move exercises the managed-deinit path.
+TEST_CASE("nonblocking whole-queue assignment") {
+    constexpr std::string_view src = R"(
+        module m;
+            int q[$], r[$];
+            initial begin
+                q = '{1, 2, 3};
+                r <= q;
+                $display("imm=%0d", r.size());
+                #1;
+                $display("post=%0d %0d %0d %0d", r.size(), r[0], r[1], r[2]);
+                q = '{9, 8};
+                q <= '{5, 5, 5};
+                q.push_back(7);
+                $display("qimm=%0d", q.size());
+                #1;
+                $display("qpost=%0d %0d", q.size(), q[0]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "imm=0\n"
+          "post=3 1 2 3\n"
+          "qimm=3\n"
+          "qpost=3 5\n");
+}
+
+// A clocked queue register `q <= d` reads the sampled d each posedge (LRM
+// 10.4.2). Verified byte-identical to verilator; string elements move-commit
+// cleanly (the NBA move frees the target's prior strings).
+TEST_CASE("nonblocking whole-queue register and managed elements") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic clk = 0;
+            int q[$], d[$];
+            string s[$], t[$];
+            always #5 clk = ~clk;
+            initial begin
+                d = '{10};
+                @(posedge clk); #1;
+                $display("c1 %0d %0d", q.size(), q[0]);
+                d = '{20, 30};
+                @(posedge clk); #1;
+                $display("c2 %0d %0d %0d", q.size(), q[0], q[1]);
+                t = '{"x", "y", "z"};
+                s = '{"aa", "bb"};
+                t <= s;
+                #1;
+                $display("t %0d %s %s", t.size(), t[0], t[1]);
+                $finish;
+            end
+            always @(posedge clk) q <= d;
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "c1 1 10\n"
+          "c2 2 20 30\n"
+          "t 2 aa bb\n");
+}

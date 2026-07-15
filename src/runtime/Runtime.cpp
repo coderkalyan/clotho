@@ -1603,6 +1603,26 @@ extern "C" uint8_t rt_container_eq(const void* pa, const void* pb, int32_t is_qu
     return any_x ? 2 : 1;
 }
 
+// Move `src`'s buffer into `dst` (ownership transfer): destroy `dst`'s current
+// elements + buffer, take `src`'s, and leave `src` the empty queue. Used by the
+// nonblocking-assignment commit — the RHS was deep-copied into `src` in the
+// Active region, so the NBA region just hands that buffer to `dst` with no
+// second copy. A no-op when dst == src.
+extern "C" void rt_queue_move(rt_queue* dst, rt_queue* src, const rt_elem_ops* ops) {
+    if (dst == src) {
+        return;
+    }
+    rt_queue_delete_all(dst, ops);
+    dst->base = src->base;
+    dst->head = src->head;
+    dst->len  = src->len;
+    dst->cap  = src->cap;
+    src->base = nullptr;
+    src->head = 0;
+    src->len  = 0;
+    src->cap  = 0;
+}
+
 extern "C" void rt_queue_reverse(rt_queue* h, uint64_t stride) {
     if (h->len < 2) {
         return;

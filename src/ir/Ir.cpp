@@ -272,7 +272,8 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
             // The one-extra-operand queue ops expose the handle lvalue plus
             // their QueueArg operand (element value / position / copy source).
             if (tag == Inst::Tag::QueuePushBack || tag == Inst::Tag::QueuePushFront ||
-                tag == Inst::Tag::QueueDeleteIdx || tag == Inst::Tag::QueueCopy) {
+                tag == Inst::Tag::QueueDeleteIdx || tag == Inst::Tag::QueueCopy ||
+                tag == Inst::Tag::QueueCopyNb) {
                 const auto qa = extra_data<QueueArg>(p.op_extra.extra);
                 scratch[0]    = p.op_extra.op;
                 scratch[1]    = qa.arg;

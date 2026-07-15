@@ -7812,11 +7812,6 @@ private:
             return lower_dyn_array_assign(a, b);
         }
         if (is_queue(a.left())) {
-            if (a.isNonBlocking()) {
-                // TODO: nonblocking assignment to a queue (needs a handle-aware
-                // NBA staging path; the per-signal shadow is plane-shaped).
-                fail("nonblocking assignment to a queue is not supported");
-            }
             return lower_queue_assign(a, b);
         }
         if (is_assoc(a.left())) {
@@ -8125,7 +8120,15 @@ private:
         const ir::SourceLoc l   = loc(a);
         const ir::Index     dst = lower_lvalue(a.left(), b);
         const ir::Ref       qty = lower_type(*a.left().type);
-        b.queue_copy(dst, materialize_queue_rvalue(a.right(), b), qty, l);
+        const ir::Index     src = materialize_queue_rvalue(a.right(), b);
+        if (a.isNonBlocking()) {
+            // Whole-queue NBA: stage a deep copy now, move it into dst in the NBA
+            // region (LRM 10.4.2). The target is a module signal (task/process
+            // NBA is module-signal-only; function NBA is rejected above).
+            b.queue_copy_nb(dst, src, qty, l);
+            return dst;
+        }
+        b.queue_copy(dst, src, qty, l);
         return dst;
     }
 
