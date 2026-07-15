@@ -3110,6 +3110,29 @@ private:
     struct GateInput { ir::Signal sig = ir::Signal{0}; uint32_t bit = 0;
                        uint8_t const_code = 0; bool is_const = false; };
 
+    // A three-state gate (bufif/notif, LRM 28.6). `active_high` is the control
+    // level that enables the driver (1 for bufif1/notif1, 0 for bufif0/notif0);
+    // `invert` distinguishes notif (inverts the data) from bufif.
+    struct TriGate { bool active_high = false; bool invert = false; };
+
+    // Map a built-in three-state gate name to its TriGate; nullopt otherwise.
+    static std::optional<TriGate> tristate_gate_of(std::string_view name) {
+        if (name == "bufif1") {
+            return TriGate{ .active_high = true, .invert = false };
+        }
+        if (name == "bufif0") {
+            return TriGate{ .active_high = false, .invert = false };
+        }
+        if (name == "notif1") {
+            return TriGate{ .active_high = true, .invert = true };
+        }
+        if (name == "notif0") {
+            return TriGate{ .active_high = false, .invert = true };
+        }
+
+        return std::nullopt;
+    }
+
     // Map a built-in gate primitive name to its GateOp; nullopt for primitives
     // outside the supported set.
     static std::optional<GateOp> gate_op_of(std::string_view name) {
@@ -3338,12 +3361,12 @@ private:
     void lower_gate(const PrimitiveInstanceSymbol& gi) {
         const PrimitiveSymbol& prim = gi.primitiveType;
         const auto             op   = gate_op_of(prim.name);
+        const auto             tri  = tristate_gate_of(prim.name);
         const bool             supported_kind =
             prim.primitiveKind == PrimitiveSymbol::NInput || prim.primitiveKind == PrimitiveSymbol::NOutput;
-        if (!op || !supported_kind) {
-            // TODO: tri-state gates (bufif*/notif*), MOS / bidirectional
-            // switches, pullup/pulldown (need Z generation and driver strength
-            // resolution) and user-defined primitives.
+        if (!tri && (!op || !supported_kind)) {
+            // TODO: MOS / bidirectional switches, pullup/pulldown (need driver
+            // strength resolution) and user-defined primitives.
             fail("gate primitive '" + std::string(prim.name) + "' is not supported");
         }
         if (gi.getDelay() != nullptr) {
@@ -3365,7 +3388,8 @@ private:
 
         // NInput: terminal 0 is the output, the rest are inputs. NOutput (buf /
         // not): the last terminal is the input, the rest are outputs — one
-        // independent process per output terminal.
+        // independent process per output terminal. Fixed tri-state (bufif/notif):
+        // terminal 0 is the output, terminals 1..2 are the data and control inputs.
         const bool n_output    = prim.primitiveKind == PrimitiveSymbol::NOutput;
         const auto input_span  = n_output ? conns.subspan(conns.size() - 1) : conns.subspan(1);
         const auto output_span = n_output ? conns.subspan(0, conns.size() - 1) : conns.subspan(0, 1);
@@ -3394,10 +3418,20 @@ private:
             // a multiply-driven net, stage into a per-driver slot so the net's
             // resolver folds it against the other drivers, else store directly.
             const Expression& left = out->as<AssignmentExpression>().left();
+
+            // Fold the gate value into this output's own builder / process (a
+            // tri-state gate drives Z, so it never forces z to x like the
+            // combinational fold does).
+            ir::Builder                b(module_.pool);
+            std::vector<ir::WaitEvent> wait_events;
+            const ir::Index            val = tri
+                              ? gate_tristate_value(*tri, inputs[0], inputs[1], wait_events, b, loc)
+                              : gate_folded_value(*op, inputs, wait_events, b, loc);
+
             if (const std::optional<ir::Signal> net = resolved_net_of(left)) {
-                emit_gate_resolved_driver(*op, left, inputs, *net, loc);
+                emit_gate_resolved_driver(left, *net, val, std::move(wait_events), b, loc);
             } else {
-                emit_gate_as_process(*op, lower_gate_output(*out), inputs, loc);
+                emit_gate_as_process(lower_gate_output(*out), val, std::move(wait_events), b, loc);
             }
         }
     }
@@ -3414,6 +3448,37 @@ private:
                         b.constant(module_.pool.put_int(u32, bit), l), l);
     }
 
+    // Materialize one gate input terminal as its 1-bit logic value: a load of the
+    // input signal bit, or a folded constant. Pool VPI encoding: val=may,
+    // xz=may&~must (bytes: val-plane then xz-plane); an X const code is (val=1,
+    // xz=1) and Z already folded to X at input lowering (LRM Table 28-3).
+    ir::Index gate_input_value(const GateInput& in, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Ref logic1 = module_.pool.logic_type;
+        if (!in.is_const) {
+            return b.unary(ir::Inst::Tag::Load, gate_bit_lvalue(in.sig, in.bit, b, l), l);
+        }
+        switch (in.const_code & 3) {
+            case 0b00: return b.constant(module_.pool.put_int(logic1, 0), l);
+            case 0b11: return b.constant(module_.pool.put_int(logic1, 1), l);
+            default: {
+                const uint8_t xbytes[2] = {0x01, 0x01};
+                return b.constant(module_.pool.put_value(logic1, {xbytes, 2}), l);
+            }
+        }
+    }
+
+    // Collect the any-change sensitivity over a gate's unique non-const input
+    // signals into `wait_events`.
+    void collect_gate_sensitivity(std::span<const GateInput> inputs,
+                                  std::vector<ir::WaitEvent>& wait_events) {
+        ankerl::unordered_dense::set<uint32_t> seen;
+        for (const GateInput& in : inputs) {
+            if (!in.is_const && seen.insert(static_cast<uint32_t>(in.sig)).second) {
+                wait_events.push_back(ir::WaitEvent{ .signal = in.sig, .edge = ir::Edge::Any });
+            }
+        }
+    }
+
     // Fold the gate inputs with its binary operation into a 1-bit logic value and
     // collect the any-change sensitivity over the non-const input signals (into
     // `wait_events`). Shared by the direct-store path (emit_gate_as_process) and
@@ -3423,26 +3488,10 @@ private:
                                 ir::SourceLoc l) {
         const ir::Ref logic1 = module_.pool.logic_type;
 
-        // Intern a 1-bit logic constant from a gate const_code (must=bit0, may=bit1).
-        // Pool VPI encoding: val=may, xz=may&~must (bytes: val-plane then xz-plane).
-        auto make_gate_const = [&](uint8_t code) -> ir::Index {
-            switch (code & 3) {
-                case 0b00: return b.constant(module_.pool.put_int(logic1, 0), l);
-                case 0b11: return b.constant(module_.pool.put_int(logic1, 1), l);
-                default: {
-                    // X (and Z mapped to X, LRM Table 28-3): val=1, xz=1.
-                    const uint8_t xbytes[2] = {0x01, 0x01};
-                    return b.constant(module_.pool.put_value(logic1, {xbytes, 2}), l);
-                }
-            }
-        };
-
         std::optional<ir::Index> acc;
         const ir::Inst::Tag      fold = gate_fold_tag(op);
         for (const GateInput& in : inputs) {
-            ir::Index val = in.is_const
-                              ? make_gate_const(in.const_code)
-                              : b.unary(ir::Inst::Tag::Load, gate_bit_lvalue(in.sig, in.bit, b, l), l);
+            const ir::Index val = gate_input_value(in, b, l);
             acc = acc ? b.binary(fold, *acc, val, l) : val;
         }
         if (!acc) {
@@ -3463,34 +3512,60 @@ private:
             acc = b.binary(ir::Inst::Tag::Band, *acc, b.constant(module_.pool.put_int(logic1, 1), l), l);
         }
 
-        // Sensitivity: unique non-const input signals, any-change.
-        ankerl::unordered_dense::set<uint32_t> seen;
-        for (const GateInput& in : inputs) {
-            if (!in.is_const && seen.insert(static_cast<uint32_t>(in.sig)).second) {
-                wait_events.push_back(ir::WaitEvent{ .signal = in.sig, .edge = ir::Edge::Any });
-            }
-        }
+        collect_gate_sensitivity(inputs, wait_events);
         return b.resize(*acc, logic1, l);
     }
 
-    // Lower one gate output as a continuous-assign process: fold inputs with the
-    // gate operation, store to the output bit, subscribe to input signal changes.
-    void emit_gate_as_process(GateOp op, GateTerm output,
-                              std::span<const GateInput> inputs, ir::SourceLoc l) {
-        ir::Builder                b(module_.pool);
-        std::vector<ir::WaitEvent> wait_events;
-        const ir::Index            val = gate_folded_value(op, inputs, wait_events, b, l);
+    // Lower a three-state gate (bufif/notif, LRM 28.6, Table 28-5) to its 1-bit
+    // output value. When the control is at the active level the data passes (buf)
+    // or inverts (notif) to the output (a z data bit maps to X — Band-with-1 /
+    // Bnot both clear z); at the inactive level the output is high-Z; an x/z
+    // control yields X. The LRM's weak L/H results for an x/z control (0-or-z,
+    // 1-or-z) collapse to X here: Clotho has no strength model, matching iverilog
+    // on a plain wire.
+    ir::Index gate_tristate_value(TriGate tg, const GateInput& data, const GateInput& ctrl,
+                                  std::vector<ir::WaitEvent>& wait_events, ir::Builder& b,
+                                  ir::SourceLoc l) {
+        const ir::Ref   logic1 = module_.pool.logic_type;
+        const ir::Index one    = b.constant(module_.pool.put_int(logic1, 1), l);
+        const ir::Index zero   = b.constant(module_.pool.put_int(logic1, 0), l);
+        const uint8_t   xbytes[2] = {0x01, 0x01};
+        const ir::Index x_const = b.constant(module_.pool.put_value(logic1, {xbytes, 2}), l);
+        const ir::Index z_const = b.constant(z_constant_ref(1), l);
+
+        const ir::Index data_v = gate_input_value(data, b, l);
+        const ir::Index ctrl_v = gate_input_value(ctrl, b, l);
+        const ir::Index passed = tg.invert ? b.unary(ir::Inst::Tag::Bnot, data_v, l)
+                                           : b.binary(ir::Inst::Tag::Band, data_v, one, l);
+        // Definite (===) tests: control exactly at the active / inactive level.
+        const ir::Index active_lvl   = tg.active_high ? one : zero;
+        const ir::Index inactive_lvl = tg.active_high ? zero : one;
+        const ir::Index is_active    = b.binary(ir::Inst::Tag::CaseEq, ctrl_v, active_lvl, l);
+        const ir::Index is_inactive  = b.binary(ir::Inst::Tag::CaseEq, ctrl_v, inactive_lvl, l);
+        // active -> passed data; else inactive -> Z; else (control x/z) -> X.
+        const ir::Index inner  = b.select(is_inactive, z_const, x_const, l);
+        const ir::Index result = b.select(is_active, passed, inner, l);
+
+        collect_gate_sensitivity(std::array<GateInput, 2>{ data, ctrl }, wait_events);
+        return b.resize(result, logic1, l);
+    }
+
+    // Lower one gate output as a continuous-assign process: store the pre-folded
+    // 1-bit value `val` to the output bit, subscribing to `wait_events`.
+    void emit_gate_as_process(GateTerm output, ir::Index val,
+                              std::vector<ir::WaitEvent> wait_events, ir::Builder& b,
+                              ir::SourceLoc l) {
         b.binary(ir::Inst::Tag::Store, gate_bit_lvalue(output.sig, output.bit, b, l), val, l);
         add_continuous_process(std::move(wait_events), l, b);
     }
 
-    // Lower one gate output that drives a multiply-driven (resolved) net: fold the
-    // inputs like a normal gate, but stage the 1-bit result into this driver's own
-    // slot (whole net, or a constant sub-range with a Z background) so the net's
-    // resolver folds it against the other drivers — exactly like a resolved
-    // continuous assign (emit_resolved_driver). `left` is the output lvalue.
-    void emit_gate_resolved_driver(GateOp op, const Expression& left,
-                                   std::span<const GateInput> inputs, ir::Signal net,
+    // Lower one gate output that drives a multiply-driven (resolved) net: stage the
+    // pre-folded 1-bit value `val` into this driver's own slot (whole net, or a
+    // constant sub-range with a Z background) so the net's resolver folds it
+    // against the other drivers — exactly like a resolved continuous assign
+    // (emit_resolved_driver). `left` is the output lvalue.
+    void emit_gate_resolved_driver(const Expression& left, ir::Signal net, ir::Index val,
+                                   std::vector<ir::WaitEvent> wait_events, ir::Builder& b,
                                    ir::SourceLoc l) {
         if (!left.type->isFourState()) {
             // Mirrors lower_gate_output: a gate can drive X, which a 2-state slot
@@ -3498,12 +3573,9 @@ private:
             // policy (and build_driver_slot_value already rejects 2-state partials).
             fail("gate output on a 2-state net is not supported");
         }
-        ir::Builder                b(module_.pool);
-        std::vector<ir::WaitEvent> wait_events;
-        const ir::Index            folded = gate_folded_value(op, inputs, wait_events, b, l);
-        const ir::Index            val    = build_driver_slot_value(net, left, folded, b, l);
-        const ir::Signal           slot   = alloc_driver_slot(net, l);
-        b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
+        const ir::Index  slot_val = build_driver_slot_value(net, left, val, b, l);
+        const ir::Signal slot     = alloc_driver_slot(net, l);
+        b.binary(ir::Inst::Tag::Store, b.signal(slot, l), slot_val, l);
         add_continuous_process(std::move(wait_events), l, b);
     }
 

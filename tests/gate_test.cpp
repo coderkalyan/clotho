@@ -168,10 +168,10 @@ TEST_CASE("gates lower inside generate blocks and child instances") {
     CHECK(gate_procs >= 2);
 }
 
-TEST_CASE("tri-state and switch primitives are reported as unsupported") {
+TEST_CASE("switch and pull primitives are reported as unsupported") {
     // Terminals are nets: tran-family inout terminals reject variables in slang
-    // before clotho's own check would run.
-    for (const char* inst : { "bufif1 g(y, a, b);", "notif0 g(y, a, b);", "nmos g(y, a, b);",
+    // before clotho's own check would run. (bufif/notif are now supported.)
+    for (const char* inst : { "nmos g(y, a, b);", "pmos g(y, a, b);",
                               "pullup g(y);", "tran g(y, a);" }) {
         const LowerResult r = lower_text("module m;\n wire y;\n wire a, b;\n " + std::string(inst) + "\nendmodule");
         CHECK_FALSE(r.ok);
@@ -320,6 +320,58 @@ TEST_CASE("gate truth tables match LRM tables 28-3 / 28-4, including X") {
                  "11: 1 0 1 0 0 1 1 0\n"
                  "x0: 0 1 x x x x x x\n"
                  "x1: x x 1 0 x x x x\n");
+}
+
+TEST_CASE("three-state gate truth tables match LRM table 28-5, including X/Z") {
+    // Data d and control c sweep 0/1/x/z. The weak L/H results the LRM lists for
+    // an x/z control collapse to X (no strength model); every row matches
+    // iverilog on a plain wire.
+    const std::string out = run_capture(R"(
+        module top;
+            logic d, c;
+            wire b1, b0, n1, n0;
+            bufif1 g1(b1, d, c);
+            bufif0 g0(b0, d, c);
+            notif1 m1(n1, d, c);
+            notif0 m0(n0, d, c);
+            function logic bit4(int k);
+                case (k) 0: bit4 = 1'b0; 1: bit4 = 1'b1; 2: bit4 = 1'bx; default: bit4 = 1'bz; endcase
+            endfunction
+            initial begin
+                for (int di = 0; di < 4; di++) begin
+                    for (int ci = 0; ci < 4; ci++) begin
+                        d = bit4(di); c = bit4(ci); #1;
+                        $display("%b%b %b%b%b%b", d, c, b1, b0, n1, n0);
+                    end
+                end
+            end
+        endmodule
+    )");
+    CHECK(out == "00 z0z1\n01 0z1z\n0x xxxx\n0z xxxx\n"
+                 "10 z1z0\n11 1z0z\n1x xxxx\n1z xxxx\n"
+                 "x0 zxzx\nx1 xzxz\nxx xxxx\nxz xxxx\n"
+                 "z0 zxzx\nz1 xzxz\nzx xxxx\nzz xxxx\n");
+}
+
+TEST_CASE("a three-state bus resolves multiple bufif drivers") {
+    // Two bufif1 drivers onto one tri net: floats to Z when both disabled, passes
+    // the enabled driver, and conflicts to X (matches iverilog).
+    const std::string out = run_capture(R"(
+        module top;
+            logic a, b, ena, enb;
+            tri bus;
+            bufif1 d0(bus, a, ena);
+            bufif1 d1(bus, b, enb);
+            initial begin
+                a = 0; b = 1; ena = 0; enb = 0; #1 $display("%b", bus);
+                ena = 1;                         #1 $display("%b", bus);
+                ena = 0; enb = 1;                #1 $display("%b", bus);
+                ena = 1; enb = 1;                #1 $display("%b", bus);
+                a = 1;                           #1 $display("%b", bus);
+            end
+        endmodule
+    )");
+    CHECK(out == "z\n0\n1\nx\n1\n");
 }
 
 TEST_CASE("n-input gates fold over all inputs") {
