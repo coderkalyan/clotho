@@ -384,6 +384,36 @@ TEST_CASE("pattern case: default, unpacked-union tag, and structure pattern (LRM
     )") == "word 100\nyy=cd\nsok\n");
 }
 
+TEST_CASE("casez/casex pattern case wildcards the label bits (LRM 12.6.1)") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef union tagged packed { void none; logic [7:0] data; } u_t;
+            task automatic zc(u_t u);
+                casez (u) matches
+                    tagged data 8'b1zzz_zzzz : $display("high");
+                    tagged data 8'b0000_zzzz : $display("lo0");
+                    tagged none              : $display("none");
+                    default                  : $display("other");
+                endcase
+            endtask
+            task automatic xc(u_t u);
+                casex (u) matches
+                    tagged data 8'b1xxx_xxxx : $display("xhigh");
+                    default                  : $display("xother");
+                endcase
+            endtask
+            initial begin
+                zc(tagged data (8'hC3));  // 1100_0011 -> high
+                zc(tagged data (8'h05));  // 0000_0101 -> lo0
+                zc(tagged data (8'h35));  // 0011_0101 -> other
+                zc(tagged none);
+                xc(tagged data (8'hC3));  // 1... -> xhigh
+                xc(tagged data (8'h35));  // 0... -> xother
+            end
+        endmodule
+    )") == "high\nlo0\nother\nnone\nxhigh\nxother\n");
+}
+
 TEST_CASE("unpacked union overlays members at the LSB (flat value, LRM 7.3)") {
     // An unpacked union lowers to a flat plane value sized to the widest member,
     // every member overlaying the low bits. A narrower member write leaves the

@@ -9494,8 +9494,13 @@ private:
     // bits = resize, a field/tag at offset = Srl then resize), so this works for
     // packed structs and tagged unions but not an unpacked (aggregate) subject,
     // which is rejected loud. See docs/design/tagged-unions.md.
+    // `cmp` is the 2-bit comparison op the enclosing case keyword selects (LRM
+    // 12.6.1): CaseEq (`case` / `if` / `?:`, exact 4-state), CasezEq (`casez`,
+    // z wildcard), or CasexEq (`casex`, x/z wildcard). It governs every bit
+    // comparison the pattern generates — the tag compare and each Constant leaf.
     ir::Index lower_pattern(const slang::ast::Pattern& pat, ir::Index subject,
-                            const slang::ast::Type& sty, ir::Builder& b, ir::SourceLoc l) {
+                            const slang::ast::Type& sty, ir::Inst::Tag cmp, ir::Builder& b,
+                            ir::SourceLoc l) {
         using PK = slang::ast::PatternKind;
         switch (pat.kind) {
             case PK::Wildcard:
@@ -9510,13 +9515,13 @@ private:
                 return true_const(b, l);
             }
             case PK::Constant: {
-                // A constant expression: the subject matches when equal (4-state
-                // exact, `===`, matching a plain `case` selector; an x subject
-                // then simply fails to match).
+                // A constant expression: the subject matches when equal under the
+                // case keyword's comparison (exact `===` for `case`; z/x wildcarded
+                // for casez/casex). An x subject under `case` then fails to match.
                 const auto&     cp = pat.as<slang::ast::ConstantPattern>();
                 const ir::Ref   ty = lower_type(sty);
                 const ir::Index cv = b.resize(lower_expr(cp.expr, b), ty, l);
-                return b.binary(ir::Inst::Tag::CaseEq, subject, cv, l);
+                return b.binary(cmp, subject, cv, l);
             }
             case PK::Tagged: {
                 // `tagged Member [pat]` — the tag must equal the member's index,
@@ -9533,7 +9538,7 @@ private:
                     const ir::Index tagv = b.resize(b.binary(ir::Inst::Tag::Srl, subject, sh, l), tt, l);
                     const ir::Index idx  = b.constant(
                       module_.pool.put_int(tt, tp.member.fieldIndex), l);
-                    tag_pred = b.binary(ir::Inst::Tag::Eq, tagv, idx, l);
+                    tag_pred = b.binary(cmp, tagv, idx, l);
                 }
                 if (tp.valuePattern == nullptr) {
                     return tag_pred;  // void member: tag match is the whole test.
@@ -9541,7 +9546,7 @@ private:
                 const slang::ast::Type& mt = tp.member.getType();
                 const ir::Index payload    = b.resize(subject, lower_type(mt), l);
                 const ir::Index sub_pred =
-                  lower_pattern(*tp.valuePattern, payload, mt.getCanonicalType(), b, l);
+                  lower_pattern(*tp.valuePattern, payload, mt.getCanonicalType(), cmp, b, l);
                 return b.binary(ir::Inst::Tag::Land, tag_pred, sub_pred, l);
             }
             case PK::Structure: {
@@ -9561,12 +9566,25 @@ private:
                     const ir::Index fv =
                       b.resize(b.binary(ir::Inst::Tag::Srl, subject, sh, l), lower_type(ft), l);
                     acc = b.binary(ir::Inst::Tag::Land, acc,
-                                   lower_pattern(*fp.pattern, fv, ft.getCanonicalType(), b, l), l);
+                                   lower_pattern(*fp.pattern, fv, ft.getCanonicalType(), cmp, b, l), l);
                 }
                 return acc;
             }
             default:
                 fail("unsupported pattern");
+        }
+    }
+
+    // The bit-comparison op for a pattern-case keyword (LRM 12.6.1). `if` / `?:`
+    // matching is always exact (CaseEq) — no casez/casex form exists there.
+    static ir::Inst::Tag pattern_cmp(CaseStatementCondition cond) {
+        switch (cond) {
+            case CaseStatementCondition::WildcardJustZ:
+                return ir::Inst::Tag::CasezEq;
+            case CaseStatementCondition::WildcardXOrZ:
+                return ir::Inst::Tag::CasexEq;
+            default:
+                return ir::Inst::Tag::CaseEq;
         }
     }
 
@@ -9586,7 +9604,7 @@ private:
             ir::Index p;
             if (cond.pattern != nullptr) {
                 p = lower_pattern(*cond.pattern, lower_expr(*cond.expr, b),
-                                  cond.expr->type->getCanonicalType(), b, l);
+                                  cond.expr->type->getCanonicalType(), ir::Inst::Tag::CaseEq, b, l);
             } else {
                 p = lower_predicate(*cond.expr, b);
             }
@@ -9603,14 +9621,10 @@ private:
     // case is a follow-up (guarded in the dispatcher).
     void lower_pattern_case(const slang::ast::PatternCaseStatement& c, ir::Builder& b) {
         using Check = slang::ast::UniquePriorityCheck;
-        if (c.condition != CaseStatementCondition::Normal) {
-            // TODO: `casez`/`casex ... matches` (LRM 12.6.1: "The casez and casex
-            // keywords can be used instead of case ... wherever 2 bits are
-            // compared (whether they are tag bits or members), the casez form
-            // ignores z bits, and the casex form ignores both z and x bits.").
-            // Implementation: thread CasezEq/CasexEq (instead of Eq/CaseEq)
-            // through lower_pattern's tag compare and every Constant sub-pattern.
-            fail("wildcard (casez/casex) pattern case is not supported");
+        if (c.condition == CaseStatementCondition::Inside) {
+            // `case (x) matches inside` is not valid SV (matches and inside are
+            // mutually exclusive case forms); defend anyway.
+            fail("case ... matches inside is not supported");
         }
         if (is_aggregate(*c.expr.type)) {
             // TODO: pattern case over an unpacked (aggregate) subject — no flat
@@ -9632,7 +9646,8 @@ private:
     ir::Index lower_pattern_item_pred(const slang::ast::PatternCaseStatement& c,
                                       const slang::ast::PatternCaseStatement::ItemGroup& item,
                                       ir::Index subject, ir::Builder& b, ir::SourceLoc l) {
-        ir::Index pred = lower_pattern(*item.pattern, subject, c.expr.type->getCanonicalType(), b, l);
+        ir::Index pred = lower_pattern(*item.pattern, subject, c.expr.type->getCanonicalType(),
+                                       pattern_cmp(c.condition), b, l);
         if (item.filter != nullptr) {
             // `&&& filter` — evaluated after the pattern's bindings are in scope.
             pred = b.binary(ir::Inst::Tag::Land, pred, lower_predicate(*item.filter, b), l);
