@@ -1316,3 +1316,41 @@ TEST_CASE("case statement over type() with no match and no default is a no-op") 
     )";
     CHECK(run_capture(src) == "done\n");
 }
+
+TEST_CASE("priority pattern case: no match, no default reports a violation") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef union tagged packed { void Invalid; int Valid; } opt_t;
+            initial begin
+                opt_t u;
+                u = tagged Invalid;
+                priority case (u) matches
+                    tagged Valid .n : $display("valid %0d", n);
+                endcase
+                $display("done");
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).find("no condition is true") != std::string::npos);
+    // Nothing matched (Invalid), no default: only the trailing $display fires.
+    CHECK(run_capture(src) == "done\n");
+}
+
+TEST_CASE("unique pattern case: two matching items report an overlap") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef union tagged packed { void Invalid; int Valid; } opt_t;
+            initial begin
+                opt_t u;
+                u = tagged Valid (5);
+                unique case (u) matches
+                    tagged Valid .a : $display("a %0d", a);
+                    tagged Valid .b : $display("b %0d", b);
+                endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).find("not unique") != std::string::npos);
+    // First-match execution is unchanged: only the first Valid item runs.
+    CHECK(run_capture(src) == "a 5\n");
+}

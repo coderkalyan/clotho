@@ -9604,15 +9604,13 @@ private:
     void lower_pattern_case(const slang::ast::PatternCaseStatement& c, ir::Builder& b) {
         using Check = slang::ast::UniquePriorityCheck;
         if (c.condition != CaseStatementCondition::Normal) {
-            // TODO: casez/casex `matches` (wildcard subject bits) — needs the
-            // wildcard-compare key packing the plain case path uses.
+            // TODO: `casez`/`casex ... matches` (LRM 12.6.1: "The casez and casex
+            // keywords can be used instead of case ... wherever 2 bits are
+            // compared (whether they are tag bits or members), the casez form
+            // ignores z bits, and the casex form ignores both z and x bits.").
+            // Implementation: thread CasezEq/CasexEq (instead of Eq/CaseEq)
+            // through lower_pattern's tag compare and every Constant sub-pattern.
             fail("wildcard (casez/casex) pattern case is not supported");
-        }
-        if (c.check != Check::None) {
-            // TODO: unique/unique0/priority pattern case (overlap + no-match
-            // reporting over pattern predicates). Execution is first-match either
-            // way; only the violation reports are missing.
-            fail("unique / priority pattern case is not supported");
         }
         if (is_aggregate(*c.expr.type)) {
             // TODO: pattern case over an unpacked (aggregate) subject — no flat
@@ -9620,7 +9618,26 @@ private:
             fail("pattern case over an unpacked aggregate subject is not supported");
         }
         const ir::Index subject = lower_expr(c.expr, b);
-        lower_pattern_case_item(c, 0, subject, b);
+        if (c.check == Check::None) {
+            // Plain first-match: the lazy chain binds each item's pattern vars
+            // only when its item is reached.
+            lower_pattern_case_item(c, 0, subject, b);
+            return;
+        }
+        lower_pattern_case_checked(c, subject, b);
+    }
+
+    // Compute a pattern item's match predicate (tag/field tests) AND-ed with its
+    // optional `&&& filter`, binding the pattern's variables as a side effect.
+    ir::Index lower_pattern_item_pred(const slang::ast::PatternCaseStatement& c,
+                                      const slang::ast::PatternCaseStatement::ItemGroup& item,
+                                      ir::Index subject, ir::Builder& b, ir::SourceLoc l) {
+        ir::Index pred = lower_pattern(*item.pattern, subject, c.expr.type->getCanonicalType(), b, l);
+        if (item.filter != nullptr) {
+            // `&&& filter` — evaluated after the pattern's bindings are in scope.
+            pred = b.binary(ir::Inst::Tag::Land, pred, lower_predicate(*item.filter, b), l);
+        }
+        return pred;
     }
 
     void lower_pattern_case_item(const slang::ast::PatternCaseStatement& c, size_t k,
@@ -9632,16 +9649,10 @@ private:
             }
             return;
         }
-        const auto&     item = c.items[k];
-        ir::Index       pred =
-          lower_pattern(*item.pattern, subject, c.expr.type->getCanonicalType(), b, l);
-        if (item.filter != nullptr) {
-            // `&&& filter` — evaluated after the pattern's bindings are in scope.
-            pred = b.binary(ir::Inst::Tag::Land, pred, lower_predicate(*item.filter, b), l);
-        }
+        const ir::Index pred = lower_pattern_item_pred(c, c.items[k], subject, b, l);
 
         b.open_region();
-        lower_stmt(*item.stmt, b);
+        lower_stmt(*c.items[k].stmt, b);
         const ir::ExtraSlice then_region = b.close_region();
 
         b.open_region();
@@ -9649,6 +9660,59 @@ private:
         const ir::ExtraSlice else_region = b.close_region();
 
         b.cond(pred, then_region, else_region, l);
+    }
+
+    // unique / unique0 / priority pattern case (LRM 12.6 → 12.5.3): every item's
+    // predicate is evaluated once up front (the LRM permits any-order eager
+    // evaluation and requires continuing past the first match to detect overlap),
+    // then the temps drive the overlap check and the first-match dispatch —
+    // mirroring lower_case_unique over pattern items. Binding all items' pattern
+    // vars up front is harmless (pure sub-value extraction, each read only in its
+    // own arm).
+    void lower_pattern_case_checked(const slang::ast::PatternCaseStatement& c, ir::Index subject,
+                                    ir::Builder& b) {
+        using Check           = slang::ast::UniquePriorityCheck;
+        const ir::SourceLoc l = loc(c);
+        const std::string banner = banner_at(c.sourceRange.start());
+        const bool no_match_report =
+          (c.check == Check::Priority || c.check == Check::Unique) && c.defaultCase == nullptr;
+        const bool needs_overlap = c.check == Check::Unique || c.check == Check::Unique0;
+
+        std::vector<ir::Index> preds;
+        preds.reserve(c.items.size());
+        for (const auto& item : c.items) {
+            preds.push_back(lower_pattern_item_pred(c, item, subject, b, l));
+        }
+        if (needs_overlap) {
+            emit_overlap_check(preds, banner, l, b);
+        }
+        dispatch_pattern_preds(c, 0, preds, no_match_report, banner, l, b);
+    }
+
+    // First-match dispatch for a checked pattern case, reusing the precomputed
+    // predicates: item k's body runs when preds[k] is the first true one. The
+    // terminal runs the default, else emits the no-match report when requested
+    // (priority / unique with no default).
+    void dispatch_pattern_preds(const slang::ast::PatternCaseStatement& c, size_t k,
+                                const std::vector<ir::Index>& preds, bool no_match_report,
+                                const std::string& banner, ir::SourceLoc rloc, ir::Builder& b) {
+        if (k == c.items.size()) {
+            if (c.defaultCase != nullptr) {
+                lower_stmt(*c.defaultCase, b);
+            } else if (no_match_report) {
+                b.case_violation(banner, 0, rloc);
+            }
+            return;
+        }
+        b.open_region();
+        lower_stmt(*c.items[k].stmt, b);
+        const ir::ExtraSlice then_region = b.close_region();
+
+        b.open_region();
+        dispatch_pattern_preds(c, k + 1, preds, no_match_report, banner, rloc, b);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        b.cond(preds[k], then_region, else_region, rloc);
     }
 
     // Struct/union member select (LRM 7.2.1 / 7.3): a packed struct or union is
