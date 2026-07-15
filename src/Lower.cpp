@@ -30,6 +30,7 @@
 #include <slang/ast/expressions/Operator.h>
 #include <slang/ast/expressions/OperatorExpressions.h>
 #include <slang/ast/expressions/SelectExpressions.h>
+#include <slang/ast/Patterns.h>
 #include <slang/ast/statements/ConditionalStatements.h>
 #include <slang/ast/statements/LoopStatements.h>
 #include <slang/ast/statements/MiscStatements.h>
@@ -4156,6 +4157,9 @@ private:
             case StatementKind::Case:
                 lower_case(stmt.as<CaseStatement>(), b);
                 break;
+            case StatementKind::PatternCase:
+                lower_pattern_case(stmt.as<slang::ast::PatternCaseStatement>(), b);
+                break;
             case StatementKind::ForLoop:
                 lower_for(stmt.as<ForLoopStatement>(), b);
                 break;
@@ -4436,16 +4440,10 @@ private:
     // handles its own check), so non-priority ifs are unaffected.
     void lower_if_chain(const ConditionalStatement& c, bool report_no_match, const std::string& banner,
                         ir::SourceLoc rloc, ir::Builder& b) {
-        if (c.conditions.size() != 1) {
-            fail("unsupported multi-condition if");
-        }
-        if (c.conditions[0].pattern != nullptr) {
-            // TODO: `if (expr matches pattern)` (LRM 12.6.2) — the pattern must
-            // be matched and its variables bound; lowering the bare condition
-            // would silently ignore the pattern.
-            fail("pattern matching in conditions is not supported");
-        }
-        const ir::Index pred = lower_predicate(*c.conditions[0].expr, b);
+        // `if (expr matches pattern)` (LRM 12.6.2), including `&&&` filters, which
+        // slang models as additional conditions AND-ed together. The pattern's
+        // bound variables are emitted into this region so the then-body sees them.
+        const ir::Index pred = lower_conditions(c.conditions, b, loc(c));
 
         b.open_region();
         lower_stmt(c.ifTrue, b);
@@ -9487,6 +9485,170 @@ private:
         const ir::Index tagc =
           b.constant(module_.pool.put_int(make_int_type(tag_bits, four, false), idx), l);
         b.binary(tag, sel, tagc, l);
+    }
+
+    // Lower a pattern (LRM 12.6) against a subject rvalue `subject` of type `sty`,
+    // returning a 1-bit match predicate and, as a side effect, binding any
+    // `PatternVarSymbol`s the pattern introduces (storing the matched sub-value
+    // into the variable's slot). Bindings are emitted eagerly into the current
+    // region — a pattern variable is read only in the arm that the predicate
+    // guards, so an unconditional store of a pure sub-value is harmless. The
+    // subject is a flat rvalue: sub-values are extracted by shift/resize (low
+    // bits = resize, a field/tag at offset = Srl then resize), so this works for
+    // packed structs and tagged unions but not an unpacked (aggregate) subject,
+    // which is rejected loud. See docs/design/tagged-unions.md.
+    ir::Index lower_pattern(const slang::ast::Pattern& pat, ir::Index subject,
+                            const slang::ast::Type& sty, ir::Builder& b, ir::SourceLoc l) {
+        using PK = slang::ast::PatternKind;
+        switch (pat.kind) {
+            case PK::Wildcard:
+                return true_const(b, l);
+            case PK::Variable: {
+                // `.name` — bind the pattern variable to the whole subject.
+                const auto& var = pat.as<slang::ast::VariablePattern>().variable;
+                declare_storage(var, /*force_frame*/ true);
+                const ir::Index slot = value_lvalue(var, b, l);
+                b.binary(ir::Inst::Tag::Store, slot,
+                         b.resize(subject, lower_type(var.getType()), l), l);
+                return true_const(b, l);
+            }
+            case PK::Constant: {
+                // A constant expression: the subject matches when equal (4-state
+                // exact, `===`, matching a plain `case` selector; an x subject
+                // then simply fails to match).
+                const auto&     cp = pat.as<slang::ast::ConstantPattern>();
+                const ir::Ref   ty = lower_type(sty);
+                const ir::Index cv = b.resize(lower_expr(cp.expr, b), ty, l);
+                return b.binary(ir::Inst::Tag::CaseEq, subject, cv, l);
+            }
+            case PK::Tagged: {
+                // `tagged Member [pat]` — the tag must equal the member's index,
+                // then (if present) the nested pattern must match the payload.
+                const auto&    tp       = pat.as<slang::ast::TaggedPattern>();
+                const uint32_t tag_bits = union_tag_bits(sty);
+                ir::Index      tag_pred = true_const(b, l);
+                if (tag_bits != 0) {
+                    const auto     lay  = module_.pool.layout(lower_type(sty));
+                    const bool     four = lay.domain == ir::Domain::Four;
+                    const ir::Ref  tt   = make_int_type(tag_bits, four, false);
+                    const ir::Index sh  = b.constant(
+                      module_.pool.put_int(make_int_type(32, false, false), lay.width - tag_bits), l);
+                    const ir::Index tagv = b.resize(b.binary(ir::Inst::Tag::Srl, subject, sh, l), tt, l);
+                    const ir::Index idx  = b.constant(
+                      module_.pool.put_int(tt, tp.member.fieldIndex), l);
+                    tag_pred = b.binary(ir::Inst::Tag::Eq, tagv, idx, l);
+                }
+                if (tp.valuePattern == nullptr) {
+                    return tag_pred;  // void member: tag match is the whole test.
+                }
+                const slang::ast::Type& mt = tp.member.getType();
+                const ir::Index payload    = b.resize(subject, lower_type(mt), l);
+                const ir::Index sub_pred =
+                  lower_pattern(*tp.valuePattern, payload, mt.getCanonicalType(), b, l);
+                return b.binary(ir::Inst::Tag::Land, tag_pred, sub_pred, l);
+            }
+            case PK::Structure: {
+                // `'{field: pat, ...}` — every field's nested pattern must match.
+                if (sty.isUnpackedStruct()) {
+                    // TODO: structure pattern over an unpacked struct (aggregate
+                    // subject has no flat value to shift/extract from). Phase 2.1.
+                    fail("structure pattern over an unpacked struct is not supported");
+                }
+                const auto& sp  = pat.as<slang::ast::StructurePattern>();
+                ir::Index   acc = true_const(b, l);
+                for (const auto& fp : sp.patterns) {
+                    const slang::ast::Type& ft  = fp.field->getType();
+                    const ir::Index         sh  = b.constant(
+                      module_.pool.put_int(make_int_type(32, false, false),
+                                           static_cast<uint32_t>(fp.field->bitOffset)), l);
+                    const ir::Index fv =
+                      b.resize(b.binary(ir::Inst::Tag::Srl, subject, sh, l), lower_type(ft), l);
+                    acc = b.binary(ir::Inst::Tag::Land, acc,
+                                   lower_pattern(*fp.pattern, fv, ft.getCanonicalType(), b, l), l);
+                }
+                return acc;
+            }
+            default:
+                fail("unsupported pattern");
+        }
+    }
+
+    // AND-reduce the predicates of a cond_predicate's conditions (LRM 12.4 /
+    // 12.6): each condition is either a plain boolean expression or an
+    // `expr matches pattern`. Pattern variables bound by an earlier condition are
+    // visible to later conditions (the `&&&` filter form) and the guarded body,
+    // so bindings are emitted left to right into the current region.
+    ir::Index lower_conditions(std::span<const ConditionalStatement::Condition> conds, ir::Builder& b,
+                               ir::SourceLoc l) {
+        ir::Index acc = ir::Index{};
+        bool      have = false;
+        for (const auto& cond : conds) {
+            ir::Index p;
+            if (cond.pattern != nullptr) {
+                p = lower_pattern(*cond.pattern, lower_expr(*cond.expr, b),
+                                  cond.expr->type->getCanonicalType(), b, l);
+            } else {
+                p = lower_predicate(*cond.expr, b);
+            }
+            acc  = have ? b.binary(ir::Inst::Tag::Land, acc, p, l) : p;
+            have = true;
+        }
+        return acc;
+    }
+
+    // `case (expr) matches` (LRM 12.6): a first-match chain of pattern items,
+    // each an `item.pattern [ &&& filter ] : stmt`. Lowered as a nested if/else
+    // over the shared subject value (evaluated once), mirroring the plain-case
+    // priority chain. unique/priority overlap/no-match reporting for pattern
+    // case is a follow-up (guarded in the dispatcher).
+    void lower_pattern_case(const slang::ast::PatternCaseStatement& c, ir::Builder& b) {
+        using Check = slang::ast::UniquePriorityCheck;
+        if (c.condition != CaseStatementCondition::Normal) {
+            // TODO: casez/casex `matches` (wildcard subject bits) — needs the
+            // wildcard-compare key packing the plain case path uses.
+            fail("wildcard (casez/casex) pattern case is not supported");
+        }
+        if (c.check != Check::None) {
+            // TODO: unique/unique0/priority pattern case (overlap + no-match
+            // reporting over pattern predicates). Execution is first-match either
+            // way; only the violation reports are missing.
+            fail("unique / priority pattern case is not supported");
+        }
+        if (is_aggregate(*c.expr.type)) {
+            // TODO: pattern case over an unpacked (aggregate) subject — no flat
+            // value to extract sub-values from (Phase 2.1).
+            fail("pattern case over an unpacked aggregate subject is not supported");
+        }
+        const ir::Index subject = lower_expr(c.expr, b);
+        lower_pattern_case_item(c, 0, subject, b);
+    }
+
+    void lower_pattern_case_item(const slang::ast::PatternCaseStatement& c, size_t k,
+                                 ir::Index subject, ir::Builder& b) {
+        const ir::SourceLoc l = loc(c);
+        if (k == c.items.size()) {
+            if (c.defaultCase != nullptr) {
+                lower_stmt(*c.defaultCase, b);
+            }
+            return;
+        }
+        const auto&     item = c.items[k];
+        ir::Index       pred =
+          lower_pattern(*item.pattern, subject, c.expr.type->getCanonicalType(), b, l);
+        if (item.filter != nullptr) {
+            // `&&& filter` — evaluated after the pattern's bindings are in scope.
+            pred = b.binary(ir::Inst::Tag::Land, pred, lower_predicate(*item.filter, b), l);
+        }
+
+        b.open_region();
+        lower_stmt(*item.stmt, b);
+        const ir::ExtraSlice then_region = b.close_region();
+
+        b.open_region();
+        lower_pattern_case_item(c, k + 1, subject, b);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        b.cond(pred, then_region, else_region, l);
     }
 
     // Struct/union member select (LRM 7.2.1 / 7.3): a packed struct or union is

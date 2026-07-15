@@ -1430,7 +1430,10 @@ TEST_CASE("a net declaration delay fails loudly") {
 
 // -- `matches` pattern conditions (LRM 12.6.2) --
 
-TEST_CASE("a matches pattern in an if condition fails loudly") {
+TEST_CASE("a matches pattern in an if condition lowers (LRM 12.6.2)") {
+    // `if (v matches <pattern>)` is supported (Phase 2). Behavior — tagged/
+    // variable/structure patterns, `&&&` filters — is exercised end to end in
+    // struct_test.cpp; here just confirm the condition form elaborates.
     const LowerResult r = lower_text(R"(
         module m(input [3:0] v, output reg q);
             always @(*)
@@ -1438,8 +1441,7 @@ TEST_CASE("a matches pattern in an if condition fails loudly") {
                 else q = 1'b0;
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("pattern matching in conditions") != std::string::npos);
+    CHECK_MESSAGE(r.ok, r.diagnostics);
 }
 
 TEST_CASE("a matches pattern in a conditional expression fails loudly") {

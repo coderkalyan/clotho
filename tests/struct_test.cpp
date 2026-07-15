@@ -311,6 +311,63 @@ TEST_CASE("unpacked tagged union: LSB overlay plus tag (LRM 7.3.2)") {
     )") == "ab 000000ab\nef deadbeef\n5a deadbe5a\n");
 }
 
+TEST_CASE("tagged union pattern case: tag match, .var binding, filter (LRM 12.6)") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef union tagged packed { void Invalid; int Valid; } opt_t;
+            task automatic show(opt_t u);
+                case (u) matches
+                    tagged Invalid              : $display("invalid");
+                    tagged Valid .n &&& (n > 10): $display("big %0d", n);
+                    tagged Valid .n             : $display("small %0d", n);
+                endcase
+            endtask
+            initial begin
+                show(tagged Valid (42));
+                show(tagged Valid (3));
+                show(tagged Invalid);
+            end
+        endmodule
+    )") == "big 42\nsmall 3\ninvalid\n");
+}
+
+TEST_CASE("tagged union: if/else matches with pattern-var binding (LRM 12.6.2)") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef union tagged packed { void Invalid; int Valid; } opt_t;
+            opt_t a;
+            initial begin
+                a = tagged Valid (7);
+                if (a matches tagged Valid .n) $display("match %0d", n);
+                if (a matches tagged Invalid) $display("no"); else $display("else ok");
+            end
+        endmodule
+    )") == "match 7\nelse ok\n");
+}
+
+TEST_CASE("pattern case: default, unpacked-union tag, and structure pattern (LRM 12.6)") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef union tagged { void none; byte b; int w; } u_t;
+            typedef struct packed { logic [7:0] x; logic [7:0] y; } pt;
+            initial begin
+                u_t u;
+                pt p;
+                u = tagged w (100);
+                case (u) matches
+                    tagged none : $display("none");
+                    tagged b .c : $display("byte %0d", c);
+                    tagged w .d : $display("word %0d", d);
+                    default     : $display("def");
+                endcase
+                p = '{8'hAB, 8'hCD};
+                if (p matches '{x: 8'hAB, y: .yy}) $display("yy=%h", yy);
+                if (p matches '{x: .*, y: 8'h00}) $display("bad"); else $display("sok");
+            end
+        endmodule
+    )") == "word 100\nyy=cd\nsok\n");
+}
+
 TEST_CASE("unpacked union overlays members at the LSB (flat value, LRM 7.3)") {
     // An unpacked union lowers to a flat plane value sized to the widest member,
     // every member overlaying the low bits. A narrower member write leaves the
