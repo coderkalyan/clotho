@@ -1025,20 +1025,36 @@ private:
             // (ankerl map + lazy sorted key index). The value element rides the
             // rt_elem_ops descriptor; keys reach the runtime as normalized
             // byte spans built in the backend (docs/design/dynamic-arrays.md
-            // §4a). Value element supports integral / real / string; the a[k]
-            // read/write routes the string handle through the OOB sink, matching
-            // the dynamic-array / queue string-element path. Keys of every kind
+            // §4a). Value element supports integral / real / string and a
+            // trivially-copyable (POD-leaf) unpacked struct / fixed array; the
+            // a[k] read/write routes a string handle through the OOB sink and an
+            // aggregate value through its per-leaf select path. Keys of every kind
             // are supported.
             const slang::ast::Type& et = aa->elementType.getCanonicalType();
-            if (!et.isIntegral() && !et.isFloating() && !et.isString()) {
-                // TODO: associative array with an aggregate (struct / array) or
-                // nested variable-size (queue / dynamic / assoc) value element.
+            const ir::Ref           er = lower_type(aa->elementType);
+            bool ok = et.isIntegral() || et.isFloating() || et.isString();
+            if (!ok && is_agg_abi_ref(er)) {
+                if (is_trivially_copyable(er)) {
+                    ok = true;
+                } else {
+                    // TODO: an unpacked struct / array value with a string or
+                    // nested-container leaf needs the kind-4 rt_elem_ops leaf table
+                    // plus a per-leaf deep-copy a[k] path.
+                    fail("associative array value element that is an unpacked struct "
+                         "or array with a string or nested-container leaf is not "
+                         "supported");
+                }
+            }
+            if (!ok) {
+                // TODO: associative array with a nested variable-size (queue /
+                // dynamic / assoc) value element; class-handle values are excluded.
                 fail("associative array value element type is not supported (only "
-                     "integral / real / string elements)");
+                     "integral / real / string / trivially-copyable unpacked struct "
+                     "or array elements)");
             }
             ir::Type t;
             t.kind    = ir::Type::Kind::Assoc;
-            t.element = lower_type(aa->elementType);
+            t.element = er;
             if (aa->hasWildcardIndexType()) {
                 // Wildcard index (`[*]`): keys are unsigned integral of arbitrary
                 // size, normalized to a fixed 64-bit form. `fields_id` names a
@@ -2002,6 +2018,16 @@ private:
     // True if an expression's type is an associative array (LRM 7.8/7.9).
     static bool is_assoc(const slang::ast::Expression& e) {
         return e.type->getCanonicalType().as_if<slang::ast::AssociativeArrayType>() != nullptr;
+    }
+
+    // True if an expression is `a[k]` selecting an element out of an associative
+    // array. Such an element's backend storage is the recursive aggregate image
+    // in the map slot, which does not share a plain array signal's flat layout --
+    // so a whole-array memcpy (AggCopy) between the two is invalid; the copy must
+    // decompose per element (each element resolves the map slot and stores).
+    static bool is_assoc_element_select(const slang::ast::Expression& e) {
+        return e.kind == ExpressionKind::ElementSelect &&
+               is_assoc(e.as<slang::ast::ElementSelectExpression>().value());
     }
 
     // True if an expression is of the dynamic `string` type (LRM 6.16).
@@ -8016,7 +8042,8 @@ private:
             const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
             const bool          whole_lhs = is_whole_array_lvalue(a.left());
             if (!a.isNonBlocking() && whole_lhs && is_trivially_copyable(ty) &&
-                is_whole_array_lvalue(src)) {
+                is_whole_array_lvalue(src) && !is_assoc_element_select(a.left()) &&
+                !is_assoc_element_select(src)) {
                 b.agg_copy(lower_lvalue(a.left(), b), lower_lvalue(src, b), ty, loc(a));
                 return true_const(b, loc(a));
             }

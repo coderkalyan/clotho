@@ -309,3 +309,126 @@ TEST_CASE("assoc string value deep-copy independence") {
     )";
     CHECK(run_capture(src) == "a2=y anum=2\nb2=changed b3=new bnum=3\n");
 }
+
+// Unpacked-struct value element (LRM 7.8 + 7.2): member read/write per key, a
+// member write creates the entry, an absent-key member read returns the leaf
+// default (Table 7-1: 0 for a 2-state member) and does not create the entry.
+TEST_CASE("assoc unpacked-struct value member access") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int a; byte b; } pair;
+            pair t[int];
+            initial begin
+                t[1] = '{a:10, b:20};
+                t[2].a = 30;
+                t[2].b = 40;
+                $display("num=%0d a1=%0d b1=%0d", t.num(), t[1].a, t[1].b);
+                $display("a2=%0d b2=%0d", t[2].a, t[2].b);
+                $display("miss_a=%0d ex9=%0d num=%0d", t[9].a, t.exists(9), t.num());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "num=2 a1=10 b1=20\na2=30 b2=40\nmiss_a=0 ex9=0 num=2\n");
+}
+
+// A 4-state struct leaf reads x on an absent key (proto x-init image), a 2-state
+// leaf reads 0 -- the per-leaf power-on default the entry is created with.
+TEST_CASE("assoc unpacked-struct absent-key 4-state default") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { logic [7:0] x; int y; } t_t;
+            t_t t[int];
+            initial begin
+                t[1] = '{x:8'hab, y:5};
+                $display("x1=%h y1=%0d", t[1].x, t[1].y);
+                $display("xmiss=%h ymiss=%0d num=%0d", t[9].x, t[9].y, t.num());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "x1=ab y1=5\nxmiss=xx ymiss=0 num=1\n");
+}
+
+// Whole-struct read (s = a[k]) and write (a[k] = s) copy by value: mutating the
+// copy leaves the map entry untouched.
+TEST_CASE("assoc unpacked-struct whole-value read and write") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int a; byte b; } pair;
+            pair t[int];
+            pair s;
+            initial begin
+                t[1] = '{a:7, b:8};
+                s = t[1];
+                $display("sa=%0d sb=%0d", s.a, s.b);
+                t[2] = s;
+                s.a = 99;
+                $display("t2a=%0d t2b=%0d sa=%0d", t[2].a, t[2].b, s.a);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "sa=7 sb=8\nt2a=7 t2b=8 sa=99\n");
+}
+
+// Whole-struct equality (LRM 11.4.5 per-member reduction) over an assoc element,
+// including an absent key reading the all-default value.
+TEST_CASE("assoc unpacked-struct equality") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int a; byte b; } pair;
+            pair t[int];
+            pair s;
+            pair d;
+            pair z;
+            initial begin
+                t[1] = '{a:5, b:6};
+                s = '{a:5, b:6};
+                d = '{a:5, b:7};
+                z = '{a:0, b:0};
+                $display("eq=%0d ne=%0d misseq=%0d num=%0d",
+                         t[1] == s, t[1] == d, t[9] == z, t.num());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "eq=1 ne=0 misseq=1 num=1\n");
+}
+
+// Fixed unpacked-array value element: element access per key, whole-array read,
+// absent-key element default.
+TEST_CASE("assoc fixed-array value element") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef int trip [0:2];
+            trip t[int];
+            trip r;
+            initial begin
+                t[1] = '{10, 20, 30};
+                $display("num=%0d e0=%0d e1=%0d e2=%0d", t.num(), t[1][0], t[1][1], t[1][2]);
+                r = t[1];
+                $display("r0=%0d r2=%0d", r[0], r[2]);
+                $display("miss=%0d num=%0d", t[5][1], t.num());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "num=1 e0=10 e1=20 e2=30\nr0=10 r2=30\nmiss=0 num=1\n");
+}
+
+// Whole-array deep-copy of an aggregate-valued assoc: the copy is independent.
+TEST_CASE("assoc unpacked-struct deep-copy independence") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int a; byte b; } pair;
+            pair a[int];
+            pair b[int];
+            initial begin
+                a[1] = '{a:1, b:2};
+                a[2] = '{a:3, b:4};
+                b = a;
+                b[2].a = 88;
+                b[3] = '{a:5, b:6};
+                $display("a2a=%0d anum=%0d", a[2].a, a.num());
+                $display("b2a=%0d b3a=%0d bnum=%0d", b[2].a, b[3].a, b.num());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a2a=3 anum=2\nb2a=88 b3a=5 bnum=3\n");
+}

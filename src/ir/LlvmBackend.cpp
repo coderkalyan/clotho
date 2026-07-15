@@ -1008,7 +1008,13 @@ private:
         // meaningless for these.
         bool is_string = false;
         bool is_handle = false;
-        Ref  elem_type{};
+        // An aggregate (unpacked struct / fixed unpacked array) element. `agg_ty`
+        // is its recursive storage type; the slot holds the flat aggregate image.
+        // Only trivially-copyable (POD-leaf) aggregates reach here (frontend
+        // guard) -- a managed leaf would need the kind-4 rt_elem_ops leaf table.
+        bool        is_agg = false;
+        llvm::Type* agg_ty = nullptr;
+        Ref         elem_type{};
     };
     DynElem dynarr_elem(Ref array_type) {
         const Type& at = std::get<Type>(mod_.pool.get(array_type));
@@ -1020,9 +1026,17 @@ private:
             e.slot_ty   = str_slot_ty();
             return e;
         }
-        if (et.kind == Type::Kind::DynArray || et.kind == Type::Kind::Queue) {
+        if (et.kind == Type::Kind::DynArray || et.kind == Type::Kind::Queue ||
+            et.kind == Type::Kind::Assoc) {
             e.is_handle = true;
             e.slot_ty   = handle_slot_ty(at.element);
+            return e;
+        }
+        if (!is_leaf_type(at.element)) {
+            // Unpacked struct / fixed unpacked array value: the slot is the flat
+            // recursive aggregate image, addressed via the is_agg lvalue path.
+            e.is_agg = true;
+            e.agg_ty = agg_storage_ty(at.element);
             return e;
         }
         const Layout lay = mod_.pool.layout(at.element);
@@ -1036,7 +1050,7 @@ private:
 
     // Byte size of one element slot (the runtime stride).
     uint64_t dynarr_stride(const DynElem& e) {
-        return env_->llmod.getDataLayout().getTypeAllocSize(e.slot_ty);
+        return env_->llmod.getDataLayout().getTypeAllocSize(e.is_agg ? e.agg_ty : e.slot_ty);
     }
 
     // The %p / == runtime descriptor of a queue / dynamic-array container: the
@@ -1092,7 +1106,54 @@ private:
     // The element power-on byte image as a typed constant: X planes for a
     // 4-state scalar, zero for 2-state / real, the empty inline handle for a
     // string, the null handle for a nested container.
+    // Power-on constant for a POD (trivially-copyable) aggregate storage image:
+    // X planes for a 4-state scalar leaf, 0 for 2-state / real, recursively over
+    // the unpacked struct / array. Built against the exact `storage` LLVM type so
+    // the constant's type matches the target global / GEP source -- agg_storage_ty
+    // mints a fresh (structurally-equal but distinct) StructType per call, so the
+    // constant must reuse the caller's instance, not a new one. Only reached for a
+    // trivially-copyable aggregate (frontend guard), so no string / container leaf.
+    llvm::Constant* agg_proto_const(Ref type, llvm::Type* storage) {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            auto*                        arr = llvm::cast<llvm::ArrayType>(storage);
+            llvm::Constant*              e   = agg_proto_const(t.element, arr->getElementType());
+            std::vector<llvm::Constant*> elems(array_dim(t), e);
+            return llvm::ConstantArray::get(arr, elems);
+        }
+        if (t.kind == Type::Kind::Struct && !t.is_packed) {
+            auto*                        st = llvm::cast<llvm::StructType>(storage);
+            std::vector<llvm::Constant*> fields;
+            const auto                   flds = mod_.pool.struct_fields(t.fields_id);
+            for (uint32_t k = 0; k < flds.size(); ++k) {
+                fields.push_back(agg_proto_const(flds[k].type, st->getElementType(k)));
+            }
+            return llvm::ConstantStruct::get(st, fields);
+        }
+        const Layout   lay  = mod_.pool.layout(type);
+        const uint32_t w    = lay.width == 0 ? 1 : lay.width;
+        const bool     four = lay.domain == Domain::Four;
+        std::vector<llvm::Constant*> fields{ four ? x_mm(w) : zero(w) };
+        if (four) {
+            fields.push_back(zero(w));
+        }
+        return llvm::ConstantStruct::get(llvm::cast<llvm::StructType>(storage), fields);
+    }
+
+    // A read-only global holding a POD aggregate type's power-on image, for the
+    // absent-key default of a whole-aggregate associative-array read (`s = a[k]`
+    // with `k` absent yields the element default; LRM 7.8.6 + Table 7-1).
+    llvm::GlobalVariable* agg_proto_global(Ref type) {
+        llvm::Type* st = agg_storage_ty(type);
+        return new llvm::GlobalVariable(env_->llmod, st, /*isConstant=*/true,
+                                        llvm::GlobalValue::InternalLinkage,
+                                        agg_proto_const(type, st), "clotho.agg.proto");
+    }
+
     llvm::Constant* elem_proto_const(const DynElem& e) {
+        if (e.is_agg) {
+            return agg_proto_const(e.elem_type, e.agg_ty);
+        }
         if (e.is_string) {
             std::vector<uint8_t> bytes(sizeof(rt_string), 0);
             bytes[sizeof(rt_string) - 1] = static_cast<uint8_t>(rt_string_inline_cap);
@@ -1112,8 +1173,9 @@ private:
 
     // The constant rt_elem_ops descriptor for a container's element type,
     // memoized per element type Ref. Nested containers chain through `inner`
-    // (finite: type nesting is a DAG). Aggregate elements are frontend-guarded,
-    // so no leaf table is ever emitted yet.
+    // (finite: type nesting is a DAG). A trivially-copyable aggregate element is
+    // kind 0 (POD): memcpy copy over the proto image, no per-leaf lifecycle -- a
+    // managed-leaf aggregate (kind-4 leaf table) is frontend-guarded.
     llvm::Constant* elem_ops_global(Ref container_type) {
         const Type& at = std::get<Type>(mod_.pool.get(container_type));
         if (const auto it = env_->elem_ops.find(static_cast<uint32_t>(at.element));
@@ -1130,7 +1192,8 @@ private:
             kind  = et.kind == Type::Kind::DynArray ? 2 : 3;
             inner = elem_ops_global(at.element);
         }
-        auto* proto = new llvm::GlobalVariable(env_->llmod, e.slot_ty, /*isConstant=*/true,
+        llvm::Type* proto_ty = e.is_agg ? e.agg_ty : e.slot_ty;
+        auto* proto = new llvm::GlobalVariable(env_->llmod, proto_ty, /*isConstant=*/true,
                                                llvm::GlobalValue::InternalLinkage,
                                                elem_proto_const(e), "clotho.elem.proto");
         auto* init = llvm::ConstantStruct::get(
@@ -8802,6 +8865,17 @@ private:
                 el.assoc_ops         = elem_ops_global(aa.assoc_type);
                 el.assoc_val_string  = e.is_string;
                 el.assoc_val_handle  = e.is_handle;
+                if (e.is_agg) {
+                    // Aggregate value: a deferred is_agg lvalue. A following
+                    // MemberSelect / ElemSelect rides along (agg_member / agg_elem
+                    // only push the GEP path, never touch base); the base resolves
+                    // to the get_ptr / put_ptr'd slot at Load / Store time
+                    // (assoc_elem_lvalue). Leaf facts are filled by the descent.
+                    el.is_agg  = true;
+                    el.root_ty = e.agg_ty;
+                    set_lvalue(i, el);
+                    return;
+                }
                 // Managed value elements carry only the slot type (a string / a
                 // container handle); the plane facts below are meaningless for
                 // them and are lifted per-kind in assoc_elem_lvalue.
@@ -8947,8 +9021,16 @@ private:
                 if (lv.is_assoc) {
                     // a[key] = v (LRM 7.8): put_ptr creates + proto-inits the
                     // entry, then the value stores into it. Assoc elements are
-                    // guarded out of sensitivity lists, so no wait servicing.
-                    lower_store(assoc_elem_lvalue(lv, /*for_write=*/true), value_of(p.binary.r));
+                    // guarded out of sensitivity lists, so no wait servicing. An
+                    // aggregate leaf reached through a runtime element index into a
+                    // fixed-array member carries a bounds gate (dyn_inrange); an
+                    // out-of-range write is a no-op (LRM 7.4.5).
+                    const LValue el = assoc_elem_lvalue(lv, /*for_write=*/true);
+                    if (el.dyn_inrange != nullptr) {
+                        dyn_elem_store(el, value_of(p.binary.r));
+                    } else {
+                        lower_store(el, value_of(p.binary.r));
+                    }
                     return;
                 }
                 if (lv.dyn_inrange != nullptr) {
@@ -8994,9 +9076,23 @@ private:
                 // Whole-object blocking copy: one memcpy of the storage. The
                 // frontend emits this only for a trivially copyable object, so the byte
                 // image is the value (no heap-owning leaf to deep-copy).
-                const auto   info = ir_->extra_data<AggCopyInfo>(p.op_extra.extra);
-                const LValue dlv  = lvalue_of(p.op_extra.op);
-                const LValue slv  = lvalue_of(info.src);
+                const auto info = ir_->extra_data<AggCopyInfo>(p.op_extra.extra);
+                LValue     dlv  = lvalue_of(p.op_extra.op);
+                LValue     slv  = lvalue_of(info.src);
+                // A whole (trivially-copyable) aggregate value of an associative
+                // array: resolve the deferred slot to its map storage. The dst
+                // put_ptr creates the entry; the src get_ptr may miss, redirecting
+                // the copy source to the element x-init default (absent-key read).
+                llvm::Value* src_override = nullptr;
+                if (dlv.is_assoc) {
+                    dlv = assoc_elem_lvalue(dlv, /*for_write=*/true);
+                }
+                if (slv.is_assoc) {
+                    slv                  = assoc_elem_lvalue(slv, /*for_write=*/false);
+                    llvm::Value* slot    = agg_slot_ptr(slv);
+                    llvm::Value* proto   = agg_proto_global(info.type);
+                    src_override         = b_.CreateSelect(slv.dyn_inrange, slot, proto);
+                }
                 llvm::Value* dst;
                 llvm::Value* src;
                 llvm::Type*  st;
@@ -9004,7 +9100,7 @@ private:
                     // An aggregate (contains a struct) uses the recursive storage,
                     // which is deterministic by type — both sides share the layout.
                     dst = agg_slot_ptr(dlv);
-                    src = agg_slot_ptr(slv);
+                    src = src_override != nullptr ? src_override : agg_slot_ptr(slv);
                     st  = agg_storage_ty(info.type);
                 } else {
                     // A plain unpacked array: its slot layout is may-z-analysed per
@@ -10514,6 +10610,29 @@ private:
     // dyn_inrange=false default path, no entry created), put_ptr for a write
     // (creates + proto-inits the entry).
     LValue assoc_elem_lvalue(const LValue& lv, bool for_write) {
+        // Aggregate value (unpacked struct / fixed array): the resolved slot is
+        // the flat aggregate image. The is_agg lvalue (root_ty + agg_path + leaf
+        // facts) was built by the MemberSelect / ElemSelect descent; only the base
+        // is deferred. A read of an absent key finds no slot -- the found-check
+        // (ANDed with any array-bound gate from a runtime element index) drives
+        // dyn_elem_load to the per-leaf element default (Table 7-1), no entry
+        // created.
+        if (lv.is_agg) {
+            LValue el     = lv;
+            el.is_assoc   = false;
+            el.is_signal  = false;
+            if (for_write) {
+                el.base = b_.CreateCall(
+                  assoc_put_ptr_fn(), { lv.assoc_handle, lv.assoc_ops, lv.assoc_key_ptr, lv.assoc_key_len });
+                return el;
+            }
+            llvm::Value* found = b_.CreateCall(
+              assoc_get_ptr_fn(), { lv.assoc_handle, lv.assoc_key_ptr, lv.assoc_key_len });
+            llvm::Value* nonnull = b_.CreateICmpNE(found, llvm::Constant::getNullValue(raw_ptr_ty()));
+            el.base        = found;
+            el.dyn_inrange = lv.dyn_inrange != nullptr ? b_.CreateAnd(lv.dyn_inrange, nonnull) : nonnull;
+            return el;
+        }
         LValue el;
         // Managed value elements (string / nested container): the resolved slot
         // IS the handle. put_ptr proto-inits a fresh entry (owned-empty string /
@@ -10937,6 +11056,15 @@ private:
     // Pointer to the leaf SLOT an aggregate lvalue designates (its agg_path,
     // without the final mm/z field select).
     llvm::Value* agg_slot_ptr(const LValue& lv) {
+        if (lv.is_assoc) {
+            // Every supported aggregate-assoc access resolves the map slot (base)
+            // via assoc_elem_lvalue BEFORE reaching here. A deferred assoc lvalue
+            // arriving with is_assoc still set is a whole-aggregate use in an
+            // unhandled context (a by-value subroutine argument, a raw rvalue
+            // read) whose base is null -- fail loud rather than GEP null.
+            throw BackendError{ "whole unpacked struct / array value of an associative "
+                                "array in this context is not supported" };
+        }
         std::vector<llvm::Value*> idx;
         idx.reserve(lv.agg_path.size() + 1);
         idx.push_back(b_.getInt32(0));
@@ -14906,8 +15034,14 @@ private:
             return bit_plane(must, may);
         }
         const ValType vt = from_ref(type);
-        Plane         pa = lower_load(lhs);
-        Plane         pb = lower_load(rhs);
+        // A leaf reached through a deferred associative-array element (`a[k] == x`
+        // over an aggregate value) resolves its map slot here -- lower_agg_eq
+        // reads leaves inline, bypassing the Load dispatch. An absent key reads
+        // the leaf default (dyn_elem_load's out-of-range path).
+        Plane pa = lhs.is_assoc ? dyn_elem_load(assoc_elem_lvalue(lhs, /*for_write=*/false))
+                                : lower_load(lhs);
+        Plane pb = rhs.is_assoc ? dyn_elem_load(assoc_elem_lvalue(rhs, /*for_write=*/false))
+                                : lower_load(rhs);
         if (vt.is_real) {
             pa = real_plane(planes_to_real(pa, vt.width));
             pb = real_plane(planes_to_real(pb, vt.width));
