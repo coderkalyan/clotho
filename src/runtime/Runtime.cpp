@@ -1522,6 +1522,87 @@ extern "C" void rt_container_format_p(rt_string* out, const void* handle, int32_
     rt_string_assign_bytes(out, s.data(), static_cast<uint64_t>(s.size()));
 }
 
+// Logical equality (`==`) of two queues / dynamic arrays (LRM 11.2.2, 11.4.5).
+// Returns 0 (definitely unequal), 1 (definitely equal), 2 (ambiguous -> 1'bx).
+// Different sizes are a definite inequality (0, never x). Same size folds a
+// per-element 4-state compare: any definite element mismatch -> 0; else any
+// unknown bit -> x; else 1. Element params match rt_container_format_p; integral
+// width <= 64 (the frontend guards wider). `!=` is the caller's Lnot of this.
+extern "C" uint8_t rt_container_eq(const void* pa, const void* pb, int32_t is_queue, int32_t kind,
+                                   uint32_t width, uint32_t /*is_signed*/, uint32_t four_state,
+                                   uint32_t has_z, uint32_t z_off, uint64_t stride) {
+    uint64_t        na = 0, nb = 0;
+    const uint8_t*  ba = nullptr;
+    const uint8_t*  bb = nullptr;
+    const rt_queue* qa = nullptr;
+    const rt_queue* qb = nullptr;
+    if (is_queue != 0) {
+        qa = static_cast<const rt_queue*>(pa);
+        qb = static_cast<const rt_queue*>(pb);
+        na = qa->len;
+        nb = qb->len;
+    } else {
+        na = static_cast<const rt_dynarr*>(pa)->len;
+        nb = static_cast<const rt_dynarr*>(pb)->len;
+        ba = static_cast<const uint8_t*>(static_cast<const rt_dynarr*>(pa)->data);
+        bb = static_cast<const uint8_t*>(static_cast<const rt_dynarr*>(pb)->data);
+    }
+    if (na != nb) {
+        return 0;
+    }
+    const uint64_t maskW = width >= 64 ? ~uint64_t{ 0 } : ((uint64_t{ 1 } << width) - 1);
+    bool           any_x = false;
+    for (uint64_t i = 0; i < na; ++i) {
+        const uint8_t* sa = qa != nullptr ? q_elem(qa, stride, i) : ba + i * stride;
+        const uint8_t* sb = qb != nullptr ? q_elem(qb, stride, i) : bb + i * stride;
+        if (kind == 2) {
+            const auto* xa = reinterpret_cast<const rt_string*>(sa);
+            const auto* xb = reinterpret_cast<const rt_string*>(sb);
+            const uint64_t la = rt_string_len(xa);
+            if (la != rt_string_len(xb) ||
+                std::memcmp(rt_string_data(xa), rt_string_data(xb), static_cast<size_t>(la)) != 0) {
+                return 0;
+            }
+            continue;
+        }
+        if (kind == 1) {
+            double da = 0, db = 0;
+            std::memcpy(&da, sa, sizeof(double));
+            std::memcpy(&db, sb, sizeof(double));
+            if (da != db) {
+                return 0;
+            }
+            continue;
+        }
+        // Integral 4-state compare of the two element slots.
+        uint64_t must_a = 0, unk_a = 0, must_b = 0, unk_b = 0;
+        if (four_state != 0) {
+            unsigned __int128 fa = 0, fb = 0;
+            std::memcpy(&fa, sa, static_cast<size_t>((2 * width + 7) / 8));
+            std::memcpy(&fb, sb, static_cast<size_t>((2 * width + 7) / 8));
+            must_a = static_cast<uint64_t>(fa) & maskW;
+            must_b = static_cast<uint64_t>(fb) & maskW;
+            unk_a  = (must_a ^ (static_cast<uint64_t>(fa >> width) & maskW));
+            unk_b  = (must_b ^ (static_cast<uint64_t>(fb >> width) & maskW));
+            (void)has_z;
+            (void)z_off;
+        } else {
+            std::memcpy(&must_a, sa, static_cast<size_t>((width + 7) / 8));
+            std::memcpy(&must_b, sb, static_cast<size_t>((width + 7) / 8));
+            must_a &= maskW;
+            must_b &= maskW;
+        }
+        // A definite mismatch on any bit known in both operands settles it (0).
+        if (((must_a ^ must_b) & ~unk_a & ~unk_b) != 0) {
+            return 0;
+        }
+        if ((unk_a | unk_b) != 0) {
+            any_x = true;
+        }
+    }
+    return any_x ? 2 : 1;
+}
+
 extern "C" void rt_queue_reverse(rt_queue* h, uint64_t stride) {
     if (h->len < 2) {
         return;

@@ -1032,6 +1032,42 @@ private:
         return env_->llmod.getDataLayout().getTypeAllocSize(e.slot_ty);
     }
 
+    // The %p / == runtime descriptor of a queue / dynamic-array container: the
+    // element format facts (kind 0 int / 1 real / 2 string, plane layout) plus
+    // the container flavor. Shared by rt_container_format_p and rt_container_eq.
+    struct ContainerFmt {
+        int32_t  is_queue  = 0;
+        int32_t  kind      = 0;
+        uint32_t width     = 0;
+        uint32_t is_signed = 0;
+        uint32_t four      = 0;
+        uint32_t has_z     = 0;
+        uint32_t z_off     = 0;
+        uint64_t stride    = 0;
+    };
+    ContainerFmt container_fmt(Ref container_type) {
+        const DynElem e = dynarr_elem(container_type);
+        ContainerFmt  cf;
+        cf.is_queue =
+          std::get<Type>(mod_.pool.get(container_type)).kind == Type::Kind::Queue ? 1 : 0;
+        cf.stride = dynarr_stride(e);
+        if (e.is_string) {
+            cf.kind = 2;
+        } else if (mod_.pool.is_float(e.elem_type)) {
+            cf.kind = 1;
+        } else {
+            cf.width     = e.width;
+            cf.four      = e.four_state ? 1u : 0u;
+            cf.has_z     = e.has_z ? 1u : 0u;
+            cf.is_signed = std::get<Type>(mod_.pool.get(e.elem_type)).is_signed ? 1u : 0u;
+            if (e.has_z) {
+                cf.z_off = static_cast<uint32_t>(
+                  env_->llmod.getDataLayout().getStructLayout(e.slot_ty)->getElementOffset(1));
+            }
+        }
+        return cf;
+    }
+
     // The rt_elem_ops mirror type:
     // { i32 kind, i32 nleaves, i64 stride, ptr proto, ptr inner, ptr leaves }.
     // Must match the runtime struct exactly.
@@ -7370,6 +7406,14 @@ private:
                        b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(),
                        b_.getInt64Ty() });
     }
+    // i8 rt_container_eq(const void* a, const void* b, i32 is_queue, i32 kind, i32 width,
+    //   i32 is_signed, i32 four_state, i32 has_z, i32 z_off, i64 stride)
+    llvm::FunctionCallee container_eq_fn() {
+        return rt_fn("rt_container_eq", b_.getInt8Ty(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(),
+                       b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(),
+                       b_.getInt64Ty() });
+    }
     llvm::FunctionCallee str_lower_fn() {
         return rt_fn("rt_string_tolower", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
@@ -9376,31 +9420,14 @@ private:
             }
             case Inst::Tag::ContainerFmtP: {
                 // %p of a queue / dynamic array: render at runtime over the live
-                // element count. Element format facts come from the container's
-                // DynElem; the result lands in this instruction's string temp.
-                const auto&   pt   = p.op_type;
-                const DynElem e    = dynarr_elem(pt.type);
-                const bool    is_q = std::get<Type>(mod_.pool.get(pt.type)).kind == Type::Kind::Queue;
-                uint32_t      kind = 0, width = 0, is_signed = 0, four = 0, has_z = 0, z_off = 0;
-                if (e.is_string) {
-                    kind = 2;
-                } else if (mod_.pool.is_float(e.elem_type)) {
-                    kind = 1;
-                } else {
-                    width     = e.width;
-                    four      = e.four_state ? 1u : 0u;
-                    has_z     = e.has_z ? 1u : 0u;
-                    is_signed = std::get<Type>(mod_.pool.get(e.elem_type)).is_signed ? 1u : 0u;
-                    if (e.has_z) {
-                        z_off = static_cast<uint32_t>(
-                          env_->llmod.getDataLayout().getStructLayout(e.slot_ty)->getElementOffset(1));
-                    }
-                }
+                // element count; the result lands in this instruction's string temp.
+                const auto&        pt = p.op_type;
+                const ContainerFmt cf = container_fmt(pt.type);
                 b_.CreateCall(container_fmt_p_fn(),
-                              { str_of(i), lv_handle_ptr(lvalue_of(pt.op)), b_.getInt32(is_q ? 1 : 0),
-                                b_.getInt32(kind), b_.getInt32(width), b_.getInt32(is_signed),
-                                b_.getInt32(four), b_.getInt32(has_z), b_.getInt32(z_off),
-                                b_.getInt64(dynarr_stride(e)) });
+                              { str_of(i), lv_handle_ptr(lvalue_of(pt.op)), b_.getInt32(cf.is_queue),
+                                b_.getInt32(cf.kind), b_.getInt32(cf.width), b_.getInt32(cf.is_signed),
+                                b_.getInt32(cf.four), b_.getInt32(cf.has_z), b_.getInt32(cf.z_off),
+                                b_.getInt64(cf.stride) });
                 return;
             }
             case Inst::Tag::StrFromPacked: {
@@ -14557,6 +14584,22 @@ private:
             llvm::Value* c = b_.CreateCall(str_cmp_fn(), { lv_string_ptr(lhs), lv_string_ptr(rhs) });
             llvm::Value* bit = b_.CreateICmpEQ(c, b_.getInt32(0));
             return bit_plane(bit, bit);
+        }
+        if (t.kind == Type::Kind::Queue || t.kind == Type::Kind::DynArray) {
+            // A queue / dynamic-array leaf compares element-wise at runtime with
+            // §11.4.5 x-propagation; the runtime tristate (0 unequal, 1 equal,
+            // 2 ambiguous) maps to a 1-bit 4-state plane (may = ts != 0, must =
+            // ts == 1, so 2 -> must=0/may=1 = x).
+            const ContainerFmt cf = container_fmt(type);
+            llvm::Value*       ts =
+              b_.CreateCall(container_eq_fn(),
+                            { lv_handle_ptr(lhs), lv_handle_ptr(rhs), b_.getInt32(cf.is_queue),
+                              b_.getInt32(cf.kind), b_.getInt32(cf.width), b_.getInt32(cf.is_signed),
+                              b_.getInt32(cf.four), b_.getInt32(cf.has_z), b_.getInt32(cf.z_off),
+                              b_.getInt64(cf.stride) });
+            llvm::Value* may  = b_.CreateICmpNE(ts, b_.getInt8(0));
+            llvm::Value* must = b_.CreateICmpEQ(ts, b_.getInt8(1));
+            return bit_plane(must, may);
         }
         const ValType vt = from_ref(type);
         Plane         pa = lower_load(lhs);

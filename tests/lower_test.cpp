@@ -715,7 +715,9 @@ TEST_CASE("nonblocking whole-struct copy with a queue member fails loudly") {
     CHECK(r.diagnostics.find("queue / dynamic array member") != std::string::npos);
 }
 
-TEST_CASE("equality of a struct with a queue member fails loudly") {
+TEST_CASE("equality of a struct with a queue member lowers (element-wise walk)") {
+    // The AggEq leaf dispatch now reaches rt_container_eq for the queue member
+    // (runtime behavior pinned in queue_test.cpp); here just confirm it lowers.
     const LowerResult r = lower_text(R"(
         module top;
             typedef struct { int q[$]; int x; } t;
@@ -723,8 +725,7 @@ TEST_CASE("equality of a struct with a queue member fails loudly") {
             initial $display("%0d", a == b);
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("queue / dynamic array member") != std::string::npos);
+    CHECK(r.ok);
 }
 
 TEST_CASE("queue member assignment from a pattern builds the queue element-wise") {

@@ -1876,11 +1876,16 @@ private:
     // only a queue / dynamic-array leaf still needs the length+element compare.
     void guard_agg_eq_members(ir::Ref type) {
         const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        if (t.kind == ir::Type::Kind::Queue || t.kind == ir::Type::Kind::DynArray) {
+            // A queue / dynamic-array leaf compares element-wise at runtime
+            // (rt_container_eq); its element must be one the runtime handles.
+            guard_container_p_element(t.element);
+            return;
+        }
         if (value_cat(type) == ValueCat::handle) {
-            // TODO: equality of an aggregate with a queue / dynamic-array member
-            // needs a length compare plus an element-wise walk (LRM 7.5/7.10).
-            fail("equality of an aggregate with a queue / dynamic array member is "
-                 "not supported");
+            // TODO: equality of an aggregate with an associative-array / class
+            // member (no ordered element walk yet).
+            fail("equality of an aggregate with an associative-array member is not supported");
         }
         if (t.kind == ir::Type::Kind::UnpackedArray) {
             guard_agg_eq_members(t.element);
@@ -8868,7 +8873,12 @@ private:
         if ((bin.op == B::Equality || bin.op == B::Inequality) &&
             (is_unpacked_struct(*unwrap_conversion(bin.left()).type) ||
              unwrap_conversion(bin.left()).type->getCanonicalType().as_if<
-                 slang::ast::FixedSizeUnpackedArrayType>() != nullptr)) {
+                 slang::ast::FixedSizeUnpackedArrayType>() != nullptr ||
+             is_queue(unwrap_conversion(bin.left())) ||
+             is_dyn_array(unwrap_conversion(bin.left())))) {
+            // A whole queue / dynamic-array compare (LRM 11.2.2) also reduces to a
+            // per-element walk with §11.4.5 x-propagation; the AggEq expansion
+            // dispatches the handle leaf to the runtime element compare.
             const ir::SourceLoc l   = loc(bin);
             const ir::Index     acc = lower_struct_eq(unwrap_conversion(bin.left()),
                                                       unwrap_conversion(bin.right()), b, l);

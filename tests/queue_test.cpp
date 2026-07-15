@@ -657,3 +657,52 @@ TEST_CASE("%p of a queue") {
           "'{}\n"
           "'{a:'h1, q:'{'h4, 'h5}}\n");
 }
+
+// Whole-queue == / != (LRM 11.2.2, 11.4.5): different sizes are a definite 0;
+// same size folds a per-element compare with x-propagation for 4-state elements
+// (any definite mismatch -> 0, else x if any unknown, else 1). Verified against
+// verilator on 2-state/string; the 4-state x cases hand-derive to 11.4.5 (same
+// rule as a packed vector).
+TEST_CASE("queue equality with x-propagation") {
+    constexpr std::string_view src = R"(
+        module m;
+            int a[$], b[$];
+            logic [7:0] la[$], lb[$];
+            string sa[$], sb[$];
+            initial begin
+                a = '{1,2,3}; b = '{1,2,3};
+                $display("%b%b", (a==b), (a!=b));
+                b = '{1,2,4}; $display("%b", (a==b));
+                b = '{1,2};   $display("%b", (a==b));
+                la = '{8'h1, 8'h2}; lb = '{8'h1, 8'hxx};
+                $display("%b", (la==lb));
+                la = '{8'h1, 8'h9}; lb = '{8'h1, 8'hx3};
+                $display("%b", (la==lb));
+                sa = '{"hi","yo"}; sb = '{"hi","yo"}; $display("%b", (sa==sb));
+                sb = '{"hi","no"}; $display("%b", (sa==sb));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "10\n0\n0\nx\n0\n1\n0\n");
+}
+
+// == of an unpacked struct with a queue member walks the member element-wise
+// (the AggEq leaf dispatch reaches rt_container_eq). Verified against verilator.
+TEST_CASE("struct-with-queue-member equality") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int x; int q[$]; } t;
+            t s1, s2;
+            initial begin
+                s1.x = 1; s1.q = '{5,6};
+                s2.x = 1; s2.q = '{5,6};
+                $display("%b", (s1==s2));
+                s2.q = '{5,7};
+                $display("%b", (s1==s2));
+                s2.q = '{5,6}; s2.x = 2;
+                $display("%b", (s1==s2));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1\n0\n0\n");
+}
