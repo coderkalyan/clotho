@@ -345,6 +345,21 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
                     record_write(*op);
                 }
                 break;
+            case ExpressionKind::SimpleAssignmentPattern:
+            case ExpressionKind::StructuredAssignmentPattern:
+            case ExpressionKind::ReplicatedAssignmentPattern: {
+                // `'{a, b} = rhs` (LRM 10.9): each pattern member is a write
+                // target, same shape as a concatenation lvalue. Keyed/replicated
+                // are illegal as an lvalue (rejected at lowering) but are walked
+                // the same way here — sensitivity analysis is best-effort ahead
+                // of that guard.
+                const auto& pat =
+                    static_cast<const slang::ast::AssignmentPatternExpressionBase&>(lhs);
+                for (const Expression* op : pat.elements()) {
+                    record_write(*op);
+                }
+                break;
+            }
             case ExpressionKind::Conversion:
                 record_write(lhs.as<ConversionExpression>().operand());
                 break;
@@ -1807,6 +1822,17 @@ private:
             }
         }
         return false;
+    }
+
+    // A pattern/concatenation-lvalue element that is itself a variable_lvalue
+    // needing a type inferred from context (observed for a nested assignment
+    // pattern, e.g. the `'{a,b}` in `'{'{a,b}, c} = r`) arrives wrapped in an
+    // AssignmentExpression -- the same shape slang uses for a system-task
+    // output argument (see lower_lvalue's Assignment case) and an associative-
+    // array first/last/next/prev key argument (lower_assoc_method). Unwrap
+    // before dispatching on the element's own kind.
+    static const Expression& unwrap_lvalue_elem(const Expression& e) {
+        return e.kind == ExpressionKind::Assignment ? e.as<AssignmentExpression>().left() : e;
     }
 
     // Downcast to an assignment pattern (`'{...}`) base if the expression is one
@@ -7615,6 +7641,32 @@ private:
             // block with no per-object shadow (docs/design/classes.md §8).
             fail("nonblocking assignment to a class property is not supported");
         }
+        if (const auto* pat = as_assignment_pattern(a.left())) {
+            // `'{a, b, c} = rhs` (LRM 10.9): a positional assignment-pattern
+            // lvalue. Must be intercepted ahead of the is_aggregate /
+            // is_unpacked_array dispatch below -- a.left().type mirrors
+            // whatever aggregate/packed type slang assigned the pattern, which
+            // would otherwise misroute into the ordinary whole-object paths and
+            // hit lower_lvalue's default case (a pattern has no single address).
+            if (a.left().kind != ExpressionKind::SimpleAssignmentPattern) {
+                // "the positional notation shall be required" — a keyed or
+                // replicated pattern is illegal as an lvalue.
+                fail("keyed or replicated assignment pattern is not supported as an "
+                     "lvalue");
+            }
+            if (a.isCompound()) {
+                fail("compound assignment to an assignment-pattern lvalue is not "
+                     "legal SystemVerilog");
+            }
+            if (a.timingControl != nullptr) {
+                // TODO: intra-assignment timing control on a pattern lvalue.
+                fail("intra-assignment timing control on an assignment-pattern "
+                     "lvalue is not supported");
+            }
+            const ir::Inst::Tag tag =
+                a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
+            return lower_pattern_assign(*pat, a.right(), tag, b, loc(a));
+        }
         if (is_aggregate(*a.left().type)) {
             // Whole unpacked-struct assignment: decompose to per-member stores
             // (blocking or nonblocking). Each member commits independently, which
@@ -8220,10 +8272,21 @@ private:
     // so a nonblocking concat assignment keeps single-evaluation semantics.
     void store_concat(const ConcatenationExpression& cc, ir::Index rhs, ir::Inst::Tag tag,
                       ir::Builder& b, ir::SourceLoc l) {
-        const std::span<const Expression* const> ops = cc.operands();
-        uint32_t                                  offset = 0;
+        store_concat_ops(cc.operands(), rhs, tag, b, l);
+    }
+
+    // Shared slice-and-scatter loop for a packed concatenation lvalue (LRM
+    // §11.4.12) and a positional assignment-pattern lvalue over a packed
+    // right-hand side (LRM 10.9, see store_pattern below): the RHS's bits
+    // divide MSB-first by each operand's own width — for a packed struct or
+    // vector, field/element declaration order already equals concatenation
+    // order, so a pattern lvalue over one needs no separate structural walk.
+    // A nested concat or (positional-only) pattern operand recurses.
+    void store_concat_ops(std::span<const Expression* const> ops, ir::Index rhs, ir::Inst::Tag tag,
+                          ir::Builder& b, ir::SourceLoc l) {
+        uint32_t offset = 0;
         for (size_t k = ops.size(); k-- > 0;) {
-            const Expression& op = *ops[k];
+            const Expression& op = unwrap_lvalue_elem(*ops[k]);
             if (is_string_expr(op)) {
                 fail("string operand in an lvalue concatenation is not supported");
             }
@@ -8236,11 +8299,118 @@ private:
             const ir::Index val = b.resize(chunk, lower_type(*op.type), l);
             if (op.kind == ExpressionKind::Concatenation) {
                 store_concat(op.as<ConcatenationExpression>(), val, tag, b, l);
+            } else if (const auto* nested = as_assignment_pattern(op)) {
+                if (op.kind != ExpressionKind::SimpleAssignmentPattern) {
+                    fail("keyed or replicated assignment pattern is not supported as an "
+                         "lvalue");
+                }
+                store_concat_ops(nested->elements(), val, tag, b, l);
             } else {
                 b.binary(tag, lower_lvalue(op, b), val, l);
             }
             offset += op.type->getBitWidth();
         }
+    }
+
+    ir::Index lower_pattern_assign(const slang::ast::AssignmentPatternExpressionBase& pat,
+                                   const Expression& rhs_expr, ir::Inst::Tag tag, ir::Builder& b,
+                                   ir::SourceLoc l) {
+        if (is_queue(rhs_expr) || is_dyn_array(rhs_expr) || is_assoc(rhs_expr)) {
+            fail("assignment-pattern lvalue from a queue, dynamic array, or "
+                 "associative array right-hand value is not supported");
+        }
+        const ir::Ref rty = lower_type(*rhs_expr.type);
+        if (!is_agg_abi_ref(rty)) {
+            // Packed struct or plain bit vector: field/element order already
+            // equals concatenation order (see store_concat_ops above).
+            store_concat_ops(pat.elements(), lower_expr(rhs_expr, b), tag, b, l);
+            return true_const(b, l);
+        }
+        const Expression& src = unwrap_conversion(rhs_expr);
+        if (!is_struct_lvalue_shape(src)) {
+            // TODO: an aggregate-returning call / rvalue concatenation as the
+            // pattern-lvalue source — needs a caller temp the way the by-value
+            // call ABI already provides for other whole-aggregate consumers.
+            fail("assignment-pattern lvalue from a non-variable right-hand value is "
+                 "not supported");
+        }
+        store_pattern(pat, lower_lvalue(src, b), rty, tag, b, l);
+        return true_const(b, l);
+    }
+
+    // Distribute the elements of an unpacked aggregate rvalue (addressed by
+    // `rhs_addr`) across a positional assignment-pattern lvalue, one struct
+    // member / array element per pattern member (LRM 10.9). The right-hand
+    // element is addressed once per member (elem_select/member_select), not
+    // re-evaluated, so a nonblocking pattern assignment samples once.
+    void store_pattern(const slang::ast::AssignmentPatternExpressionBase& pat, ir::Index rhs_addr,
+                       ir::Ref rhs_ty, ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Type& rt    = std::get<ir::Type>(module_.pool.get(rhs_ty));
+        const auto      elems = pat.elements();
+        if (rt.kind == ir::Type::Kind::Struct) {
+            const auto fields = module_.pool.struct_fields(rt.fields_id);
+            if (elems.size() != fields.size()) {
+                fail("assignment-pattern lvalue element count does not match the "
+                     "right-hand struct's member count");
+            }
+            for (uint32_t i = 0; i < fields.size(); ++i) {
+                store_pattern_elem(unwrap_lvalue_elem(*elems[i]), b.member_select(rhs_addr, i, rhs_ty, l),
+                                   fields[i].type, tag, b, l);
+            }
+            return;
+        }
+        // UnpackedArray — the only other is_agg_abi_ref shape.
+        const uint32_t n = (rt.left >= rt.right ? rt.left - rt.right : rt.right - rt.left) + 1;
+        if (elems.size() != n) {
+            fail("assignment-pattern lvalue element count does not match the "
+                 "right-hand array's size");
+        }
+        for (uint32_t k = 0; k < n; ++k) {
+            const int32_t coord = rt.left <= rt.right ? static_cast<int32_t>(rt.left + k)
+                                                       : static_cast<int32_t>(rt.left - k);
+            const ir::Index idx = b.constant(
+                module_.pool.put_int(make_int_type(32, false, true),
+                                     static_cast<uint64_t>(static_cast<int64_t>(coord))),
+                l);
+            store_pattern_elem(unwrap_lvalue_elem(*elems[k]), b.elem_select(rhs_addr, idx, rhs_ty, l),
+                               rt.element, tag, b, l);
+        }
+    }
+
+    void store_pattern_elem(const Expression& member, ir::Index rhs_elem_addr, ir::Ref elem_ty,
+                            ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
+        if (const auto* nested = as_assignment_pattern(member)) {
+            if (member.kind != ExpressionKind::SimpleAssignmentPattern) {
+                fail("keyed or replicated assignment pattern is not supported as an "
+                     "lvalue");
+            }
+            store_pattern(*nested, rhs_elem_addr, elem_ty, tag, b, l);
+            return;
+        }
+        if (member.kind == ExpressionKind::Concatenation) {
+            store_concat(member.as<ConcatenationExpression>(),
+                        b.unary(ir::Inst::Tag::Load, rhs_elem_addr, l), tag, b, l);
+            return;
+        }
+        if (is_string_expr(member) || value_cat(elem_ty) == ValueCat::string ||
+            value_cat(elem_ty) == ValueCat::handle) {
+            // TODO: string / queue / dynamic-array / associative-array element in
+            // an assignment-pattern lvalue.
+            fail("string or queue/dynamic-array/associative-array element in an "
+                 "assignment-pattern lvalue is not supported");
+        }
+        if (is_agg_abi_ref(elem_ty)) {
+            const ir::Index dst = lower_lvalue(member, b);
+            if (tag == ir::Inst::Tag::Store && is_trivially_copyable(elem_ty)) {
+                b.agg_copy(dst, rhs_elem_addr, elem_ty, l);
+            } else {
+                emit_agg_copy(dst, rhs_elem_addr, elem_ty, tag, b, l);
+            }
+            return;
+        }
+        const ir::Index val = b.resize(b.unary(ir::Inst::Tag::Load, rhs_elem_addr, l),
+                                       lower_type(*member.type), l);
+        b.binary(tag, lower_lvalue(member, b), val, l);
     }
 
     // -- Expressions --

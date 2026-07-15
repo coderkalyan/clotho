@@ -43,6 +43,13 @@ std::string run_capture(std::string_view source) {
     return out;
 }
 
+// Lower and return the rendered diagnostics; ok must be false (a rejected design).
+std::string reject(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    CHECK_FALSE(r.ok);
+    return r.diagnostics;
+}
+
 } // namespace
 
 TEST_CASE("packed struct pattern: positional and keyed") {
@@ -304,4 +311,147 @@ TEST_CASE("nonblocking unpacked-array slice copy commits deferred") {
             end
         endmodule
     )") == "0 a1 a2 3\n");
+}
+
+TEST_CASE("assignment-pattern lvalue: bare positional destructure of a fixed array") {
+    CHECK(run_capture(R"(
+        module m;
+            int a, b, c, d;
+            int B [4];
+            initial begin
+                B = '{1, 2, 3, 4};
+                '{a, b, c, d} = B;
+                $display("%0d %0d %0d %0d", a, b, c, d);
+            end
+        endmodule
+    )") == "1 2 3 4\n");
+}
+
+TEST_CASE("assignment-pattern lvalue: typed pattern destructure") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef byte U [3];
+            U A;
+            byte x, y, z;
+            initial begin
+                A = '{10, 20, 30};
+                U'{x, y, z} = A;
+                $display("%0d %0d %0d", x, y, z);
+            end
+        endmodule
+    )") == "10 20 30\n");
+}
+
+TEST_CASE("assignment-pattern lvalue: packed struct right-hand side (bit-slice path)") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct packed { logic [7:0] hi; logic [7:0] lo; } pair_t;
+            pair_t p;
+            byte x, y;
+            initial begin
+                p = '{8'hAA, 8'hBB};
+                '{x, y} = p;
+                $display("%h %h", x, y);
+            end
+        endmodule
+    )") == "aa bb\n");
+}
+
+TEST_CASE("assignment-pattern lvalue: nested pattern over a struct-of-struct") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int x; int y; } pt_t;
+            typedef struct { pt_t p; int z; } rec_t;
+            rec_t r;
+            int a, b, c;
+            initial begin
+                r = '{'{1, 2}, 3};
+                '{'{a, b}, c} = r;
+                $display("%0d %0d %0d", a, b, c);
+            end
+        endmodule
+    )") == "1 2 3\n");
+}
+
+TEST_CASE("assignment-pattern lvalue: per-element width truncates like an ordinary assignment") {
+    CHECK(run_capture(R"(
+        module m;
+            byte a, b, c, d;
+            int B [4];
+            initial begin
+                B = '{257, 258, 259, 260};
+                '{a, b, c, d} = B;
+                $display("%0d %0d %0d %0d", a, b, c, d);
+            end
+        endmodule
+    )") == "1 2 3 4\n");
+}
+
+TEST_CASE("assignment-pattern lvalue: nonblocking commits deferred") {
+    CHECK(run_capture(R"(
+        module m;
+            int a, b;
+            int B [2];
+            logic clk = 0;
+            always #5 clk = ~clk;
+            always @(posedge clk) '{a, b} <= B;
+            initial begin
+                B = '{10, 20};
+                @(posedge clk); #1;
+                $display("%0d %0d", a, b);
+                $finish;
+            end
+        endmodule
+    )") == "10 20\n");
+}
+
+TEST_CASE("assignment-pattern lvalue: keyed pattern is rejected as an lvalue") {
+    // slang itself rejects a keyed pattern as an lvalue at binding time
+    // ("expression is not assignable"), ahead of Lower.cpp's own guard for
+    // the same rule (kept as defense in depth for any shape slang doesn't
+    // catch first).
+    CHECK_FALSE(reject(R"(
+        module m;
+            int a, b;
+            int B [2];
+            initial '{0: a, 1: b} = B;
+        endmodule
+    )").empty());
+}
+
+TEST_CASE("assignment-pattern lvalue: compound assignment is rejected") {
+    // Also caught by slang at binding time ("invalid operands to binary
+    // expression") ahead of Lower.cpp's own guard.
+    CHECK_FALSE(reject(R"(
+        module m;
+            int a, b;
+            int B [2];
+            initial '{a, b} += B;
+        endmodule
+    )").empty());
+}
+
+TEST_CASE("assignment-pattern lvalue: queue right-hand side is rejected") {
+    CHECK_FALSE(reject(R"(
+        module m;
+            int a, b, c;
+            int q [$];
+            initial begin
+                q = '{1, 2, 3};
+                '{a, b, c} = q;
+            end
+        endmodule
+    )").empty());
+}
+
+TEST_CASE("assignment-pattern lvalue: element count mismatch is rejected") {
+    // slang rejects this at binding time ("requires 4 elements but 3 were
+    // provided"), ahead of Lower.cpp's own guard (kept as defense in depth).
+    CHECK_FALSE(reject(R"(
+        module m;
+            int a, b, c;
+            int B [4];
+            initial '{a, b, c} = B;
+        endmodule
+    )").empty());
 }
