@@ -2536,6 +2536,19 @@ private:
             }
         }
 
+        // A packed concatenation / replication has no lvalue root to address, so
+        // a bit/part-select of it (`{a,b}[7:0]`, `{2{a}}[i]`) is spilled into a
+        // fresh temp cell for the runtime select to read — same shape as the
+        // elaboration-constant spill above. A fully-constant select folds
+        // upstream (try_lower_constant_select), so this is the runtime case only.
+        if ((base.kind == ExpressionKind::Concatenation ||
+             base.kind == ExpressionKind::Replication) &&
+            base.type->getCanonicalType().isIntegral()) {
+            const ir::Index tmp = make_arg_temp(lower_type(*base.type), b, l);
+            b.binary(ir::Inst::Tag::Store, tmp, lower_expr(base, b), l);
+            return tmp;
+        }
+
         return lower_lvalue(base, b);
     }
 
@@ -3588,6 +3601,15 @@ private:
                     // the recursive storage layout.
                     emit_port_agg_copy(lower_lvalue(a.left(), b), b.signal(child_sig, l),
                                        lower_type(*a.left().type), b, l);
+                } else if (a.left().kind == ExpressionKind::Concatenation) {
+                    // Output connected to a concatenation target `.o({a,b})`:
+                    // sample the child net once and scatter it MSB-first into the
+                    // operands, the same destructure as `{a,b} = x` (store_concat).
+                    reject_concat_resolved_driver(a.left());
+                    const ir::Ref   ty  = lower_type(*a.left().type);
+                    const ir::Index val = coerce(
+                      b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l), *a.right().type, ty, b, l);
+                    store_concat(a.left().as<ConcatenationExpression>(), val, ir::Inst::Tag::Store, b, l);
                 } else {
                     const ir::Ref   ty  = lower_type(*a.left().type);
                     const ir::Index val = b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l);
