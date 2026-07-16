@@ -109,11 +109,6 @@ void rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uin
 // unique0 overlap). Fires once per dynamic execution that detects the violation.
 void rt_case_violation(const char* banner, uint64_t now, int32_t kind);
 
-// Zero-delay oscillation guard: a single time instant activated more than the
-// delta-cycle limit of processes without the active queue draining. Prints a
-// FATAL diagnostic and ends the simulation (never returns).
-[[noreturn]] void rt_oscillation_abort(uint64_t now);
-
 // Report a severity system task ($info / $warning / $error / $fatal, LRM 20.10)
 // or an immediate-assertion default failure (LRM 16.3). Renders the $display-
 // style message (`fmt` + `argc` `argv`, empty for a bare `$error;`) and writes
@@ -847,6 +842,12 @@ void rt_wheel_deinit(rt_wheel* wheel);
 
 // Current tick. Starts at zero, advances only through rt_wheel_tick.
 uint64_t rt_wheel_now(const rt_wheel* wheel);
+
+// Zero-delay oscillation guard: a single time instant activated more than the
+// delta-cycle limit of processes without the active queue draining. Prints a
+// FATAL diagnostic and ends the simulation (never returns). Reads `now` from the
+// wheel itself, so the JIT'd drain loop passes only the wheel pointer.
+[[noreturn]] void rt_oscillation_abort(const rt_wheel* wheel);
 
 // Non-zero iff the wheel has any timer scheduled. The design's sim loop ticks
 // the wheel until this reports empty.

@@ -170,6 +170,25 @@ TEST_CASE("unassigned return path yields X") {
     CHECK(run_capture(src) == "55\nxx\n");
 }
 
+// LRM 13.4.2 distinction (matches iverilog): a static (non-automatic) function's
+// NAMED local persists across calls (the queue accumulates 1,2,3), while the
+// implicit return variable is fresh each call (`maybe` unwritten path yields X
+// above, not the prior call's value). A frame-Local return var gives the latter;
+// persisting it would leak the prior value on the unwritten path.
+TEST_CASE("static function: named local persists, return var is fresh") {
+    constexpr std::string_view src = R"(
+        module m;
+            function int q_accum();
+                int q[$];
+                q.push_back(1);
+                return q.size();
+            endfunction
+            initial $display("%0d %0d %0d", q_accum(), q_accum(), q_accum());
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 2 3\n");
+}
+
 // A void function called as a statement runs for its side effects.
 TEST_CASE("void function called as a statement") {
     constexpr std::string_view src = R"(

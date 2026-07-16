@@ -10116,12 +10116,6 @@ private:
         uint32_t ret_local     = 0;
         ir::Ref  ret_type      = ir::Ref::Invalid;
         bool     has_ret_local = false;
-        // A non-automatic (static-lifetime) function's return variable persists
-        // across calls (LRM 13.4.2): it gets a persistent module-signal, not a
-        // frame Local, so a queue built by successive calls accumulates. When set,
-        // ret_sig holds that signal and the return operand is its signal lvalue.
-        bool       ret_is_static = false;
-        ir::Signal ret_sig       = static_cast<ir::Signal>(0);
         // Name qualifier (e.g. "f.") prepended to a static local's signal name so
         // same-named statics in different functions stay distinct.
         std::string name_prefix;
@@ -10788,12 +10782,8 @@ private:
         return id;
     }
 
-    // The return variable's lvalue: a persistent signal for a static-lifetime
-    // (non-automatic) function, else the per-call frame Local.
+    // The return variable's lvalue: the per-call frame Local (fresh each call).
     ir::Index ret_var_ref(FnCtx& ctx, ir::SourceLoc l, ir::Builder& b) {
-        if (ctx.ret_is_static) {
-            return b.signal(ctx.ret_sig, l);
-        }
         return b.local(ctx.ret_local, ctx.ret_type, l);
     }
 
@@ -10848,16 +10838,14 @@ private:
             }
             ctx.has_ret_local = true;
             ctx.ret_type      = return_type;
-            if (sub.defaultLifetime == slang::ast::VariableLifetime::Static) {
-                // Static-lifetime return var: persistent signal storage (references
-                // in the body resolve to it via value_lvalue -> signal_of, since it
-                // is not placed in localmap), power-on-initialized once and never
-                // freed at body exit, so it accumulates across calls.
-                ctx.ret_is_static = true;
-                ctx.ret_sig       = declare_static_local(*sub.returnValVar);
-            } else {
-                ctx.ret_local = fn_local(*sub.returnValVar);
-            }
+            // The implicit return variable is fresh per call even for a static
+            // (non-automatic) function: an unassigned return path yields X (LRM
+            // 13.4.2 makes a static function's *named* locals persist, but iverilog
+            // resets the function-name return variable each call -- a scalar
+            // returns X, a handle returns an empty container). A frame Local gets
+            // exactly that (init_frame X-fills scalars / empties handles per call);
+            // persisting it would leak the prior call's value on the unwritten path.
+            ctx.ret_local = fn_local(*sub.returnValVar);
         }
 
         lower_stmt(sub.getBody(), b);

@@ -7013,7 +7013,7 @@ private:
             b_.CreateStore(n, sym(osc_count_gv_));
             b_.CreateCondBr(b_.CreateICmpUGT(n, b_.getInt64(kOscillationLimit)), osc_abort, osc_ok);
             b_.SetInsertPoint(osc_abort);
-            b_.CreateCall(oscillation_abort_fn(), { b_.CreateCall(wheel_now_fn(), { wheel }) });
+            b_.CreateCall(oscillation_abort_fn(), { wheel });
             b_.CreateUnreachable();
             b_.SetInsertPoint(osc_ok);
         }
@@ -7631,7 +7631,7 @@ private:
         return rt_fn("rt_wheel_deinit", b_.getVoidTy(), { raw_ptr_ty() });
     }
     llvm::FunctionCallee oscillation_abort_fn() {
-        return rt_fn("rt_oscillation_abort", b_.getVoidTy(), { b_.getInt64Ty() });
+        return rt_fn("rt_oscillation_abort", b_.getVoidTy(), { raw_ptr_ty() });
     }
 
     llvm::FunctionCallee wheel_now_fn() {

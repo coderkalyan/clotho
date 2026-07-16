@@ -2622,7 +2622,12 @@ extern "C" void rt_finish(const char* banner, uint64_t now, int32_t arg) {
     std::exit(0);
 }
 
-extern "C" void rt_oscillation_abort(uint64_t now) {
+extern "C" void rt_oscillation_abort(const rt_wheel* wheel) {
+    // Read `now` from the wheel here rather than materializing it in the JIT'd
+    // drain loop: this abort is a cold error path, and keeping rt_wheel_now out
+    // of the generated IR preserves the delay path's single-ABI-crossing shape
+    // (rt_wheel_schedule_rel only; see the drain-loop guard).
+    const uint64_t now = rt_wheel_now(wheel);
     // A single time step activated more than the delta-cycle limit of processes
     // without settling: a zero-delay oscillation the scheduler cannot converge
     // (e.g. two `always @*` blocks writing a shared variable each is sensitive
