@@ -420,6 +420,50 @@ TEST_CASE("&& and || evaluate the right operand on an x/z left") {
     CHECK(run_capture(src) == "f\nr=0\nf\nr=x\nf\nr=1\nf\nr=x\n");
 }
 
+TEST_CASE("-> short-circuits but <-> always evaluates its right operand") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic bit f(input bit x);
+                $display("f");
+                return x;
+            endfunction
+            bit a, r;
+            initial begin
+                a = 0;
+                r = a -> f(1); $display("r=%b", r); // false -> skip f, r=1
+                a = 1;
+                r = a -> f(0); $display("r=%b", r); // true -> call f, r=0
+                a = 1;
+                r = a <-> f(0); $display("r=%b", r); // <-> always calls f, r=0
+                a = 0;
+                r = a <-> f(0); $display("r=%b", r); // <-> always calls f, r=1
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "r=1\nf\nr=0\nf\nr=0\nf\nr=1\n");
+}
+
+// An x/z left operand is ambiguous for `->` too, so the right operand is
+// still evaluated (mirrors the &&/|| case above).
+TEST_CASE("-> evaluates the right operand on an x/z left") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic logic f(input logic x);
+                $display("f");
+                return x;
+            endfunction
+            logic a, r;
+            initial begin
+                a = 1'bx;
+                r = a -> f(1'b0); $display("r=%b", r);
+                r = a -> f(1'b1); $display("r=%b", r);
+            end
+        endmodule
+    )";
+    // x->0 = x (ambiguous: could be 0->0=1 or 1->0=0); x->1 = 1 (dominated).
+    CHECK(run_capture(src) == "f\nr=x\nf\nr=1\n");
+}
+
 // LRM 11.4.11: a definite ?: condition evaluates only the chosen arm; an
 // ambiguous (x/z) condition evaluates BOTH arms and blends them bit by bit
 // per Table 11-20. The side-effecting function makes evaluation observable.

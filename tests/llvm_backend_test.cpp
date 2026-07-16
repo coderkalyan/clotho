@@ -761,6 +761,28 @@ TEST_CASE("single-bit &&, ||, !, ~ agree with LRM Kleene semantics") {
     CHECK(run_capture(src) == "0011\nx100\n0x11\nxxxx\n0100\n");
 }
 
+// -> / <-> (LRM 11.4.7): a -> b == !a || b, a <-> b == (a->b) && (b->a).
+// Verified against iverilog -- no side effects here, so the short-circuit vs.
+// eager evaluation difference (see function_test.cpp) does not affect the
+// computed value, only whether a side effect runs.
+TEST_CASE("-> and <-> agree with LRM Kleene semantics") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a, b;
+            initial begin
+                a = 1'b0; b = 1'b0; $display("%b%b", a->b, a<->b);
+                a = 1'b0; b = 1'b1; $display("%b%b", a->b, a<->b);
+                a = 1'b1; b = 1'b0; $display("%b%b", a->b, a<->b);
+                a = 1'b1; b = 1'b1; $display("%b%b", a->b, a<->b);
+                a = 1'bx; b = 1'b1; $display("%b%b", a->b, a<->b);
+                a = 1'bx; b = 1'b0; $display("%b%b", a->b, a<->b);
+                a = 1'bx; b = 1'bx; $display("%b%b", a->b, a<->b);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "11\n10\n00\n11\n1x\nxx\nxx\n");
+}
+
 TEST_CASE("single-bit && lowers to a packed and (no truth reduction)") {
     const std::string ir = emit(R"(
         module m(input logic a, input logic b, output logic y); assign y = a && b; endmodule
@@ -2617,6 +2639,71 @@ TEST_CASE("$fgets reads a line right-justified") {
     std::remove(path);
 }
 
+TEST_CASE("$fgets into a string variable") {
+    const char* path = "clotho_fgets_str_test.txt";
+    write_file(path, "hello\nworld\n");
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, n;
+            string line;
+            initial begin
+                fd = $fopen(")") + path + R"(", "r");
+                n = $fgets(line, fd);
+                $display("%0d %s", n, line);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "6 hello\n\n");
+    std::remove(path);
+}
+
+// Unlike the packed-vector destination (capped at its declared width), a
+// string destination has no capacity limit: a line longer than any
+// reasonable fixed-width reg is still read in full.
+TEST_CASE("$fgets into a string variable is not width-capped") {
+    const char* path = "clotho_fgets_str_long_test.txt";
+    const std::string long_line(100, 'x');
+    write_file(path, long_line + "\n");
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, n;
+            string line;
+            initial begin
+                fd = $fopen(")") + path + R"(", "r");
+                n = $fgets(line, fd);
+                $display("%0d", n);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "101\n"); // 100 'x' + the newline
+    std::remove(path);
+}
+
+// $fgets into a string variable at EOF (nothing read) leaves the destination
+// unchanged and returns 0, mirroring the packed-vector destination's
+// behavior on a 0-byte read.
+TEST_CASE("$fgets into a string variable at EOF leaves it unchanged") {
+    const char* path = "clotho_fgets_str_eof_test.txt";
+    write_file(path, "");
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, n;
+            string line;
+            initial begin
+                line = "untouched";
+                fd = $fopen(")") + path + R"(", "r");
+                n = $fgets(line, fd);
+                $display("%0d %s", n, line);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "0 untouched\n");
+    std::remove(path);
+}
+
 // $fgetc returns bytes then -1 at EOF; $ungetc pushes a byte back for the next
 // read; $feof reports the end condition (LRM §21.3.4).
 TEST_CASE("$fgetc / $ungetc / $feof") {
@@ -2701,6 +2788,40 @@ TEST_CASE("$ferror on a clear stream returns 0") {
     )";
     CHECK(run_capture(src) == "0\n");
     std::remove(path);
+}
+
+TEST_CASE("$ferror into a string variable on a clear stream returns 0") {
+    const char* path = "clotho_ferror_str_test.txt";
+    const std::string src = std::string(R"(
+        module m;
+            integer fd, code;
+            string msg;
+            initial begin
+                fd = $fopen(")") + path + R"(", "w");
+                code = $ferror(fd, msg);
+                $display("%0d :%s:", code, msg);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "0 ::\n");
+    std::remove(path);
+}
+
+// An invalid descriptor (never opened) reports code -1 with a diagnostic
+// message, same as the packed-vector destination.
+TEST_CASE("$ferror into a string variable on an invalid descriptor") {
+    const std::string src = R"(
+        module m;
+            integer code;
+            string msg;
+            initial begin
+                code = $ferror(32'h8000_0063, msg);
+                $display("%0d %s", code, msg);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "-1 invalid file descriptor\n");
 }
 
 // $fscanf parses fields into integer lvalues and returns the conversion count.

@@ -2246,6 +2246,32 @@ extern "C" void rt_sformat_str(rt_string* dst, const char* fmt, uint32_t argc, c
     rt_string_assign_bytes(dst, out.data(), out.size());
 }
 
+extern "C" int32_t rt_fgets_str(rt_string* dst, int32_t fd) {
+    io_ensure_init();
+    std::FILE* f = fd_stream(fd);
+    if (f == nullptr) {
+        return 0;
+    }
+    // No fixed width to cap at (unlike rt_fgets's packed-vector capacity): read
+    // the whole line, stopping after a newline or at EOF.
+    std::string line;
+    for (;;) {
+        const int c = std::fgetc(f);
+        if (c == EOF) {
+            break;
+        }
+        line.push_back(static_cast<char>(c));
+        if (c == '\n') {
+            break;
+        }
+    }
+    if (line.empty()) {
+        return 0;
+    }
+    rt_string_assign_bytes(dst, line.data(), line.size());
+    return static_cast<int32_t>(line.size());
+}
+
 extern "C" int32_t rt_ferror(int32_t fd, uint8_t* mm, uint8_t* z, uint32_t width, uint32_t flags) {
     // $ferror (LRM §21.3.6): return the stream's error code and write the matching
     // message into `str`. C stdio has no per-stream error code, only an indicator,
@@ -2265,6 +2291,22 @@ extern "C" int32_t rt_ferror(int32_t fd, uint8_t* mm, uint8_t* z, uint32_t width
     }
     store_string_planes(mm, z, width, reinterpret_cast<const uint8_t*>(msg),
                         static_cast<uint32_t>(std::strlen(msg)), (flags & 1u) != 0);
+    return code;
+}
+
+extern "C" int32_t rt_ferror_str(int32_t fd, rt_string* dst) {
+    io_ensure_init();
+    std::FILE*  f    = fd_stream(fd);
+    int         code = 0;
+    const char* msg  = "";
+    if (f == nullptr) {
+        code = -1;
+        msg  = "invalid file descriptor";
+    } else if (std::ferror(f) != 0) {
+        code = errno;
+        msg  = std::strerror(errno);
+    }
+    rt_string_assign_bytes(dst, msg, std::strlen(msg));
     return code;
 }
 

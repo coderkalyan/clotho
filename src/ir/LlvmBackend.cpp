@@ -4647,6 +4647,8 @@ private:
                 case Inst::Tag::Land:
                 case Inst::Tag::Lor:
                 case Inst::Tag::Lnot:
+                case Inst::Tag::Limplies:
+                case Inst::Tag::Lequiv:
                 case Inst::Tag::Select:
                 case Inst::Tag::SelectLazy:
                 case Inst::Tag::Concat:
@@ -8332,6 +8334,8 @@ private:
             case Inst::Tag::Lnot:
             case Inst::Tag::AggEq:
             case Inst::Tag::InsideSet:
+            case Inst::Tag::Limplies:
+            case Inst::Tag::Lequiv:
                 return { 1, true, false };
 
             case Inst::Tag::Concat: {
@@ -9476,6 +9480,12 @@ private:
                 return;
             case Inst::Tag::Lnot:
                 set_value(i, lower_lnot(value_of(p.unary)));
+                return;
+            case Inst::Tag::Limplies:
+                set_value(i, lower_limplies(value_of(p.binary.l), value_of(p.binary.r)));
+                return;
+            case Inst::Tag::Lequiv:
+                set_value(i, lower_lequiv(value_of(p.binary.l), value_of(p.binary.r)));
                 return;
 
             case Inst::Tag::Select: {
@@ -11891,17 +11901,33 @@ private:
         return env_->llmod.getOrInsertFunction("rt_fgets", fnty);
     }
 
-    // Lower a $fgets: hand the runtime the destination vector's plane pointers plus
-    // its bit width and the descriptor. The runtime reads a line, stores it
-    // right-justified into the must|may plane, clears the z plane, and returns the
-    // character count.
+    // i32 rt_fgets_str(rt_string* dst, i32 fd)
+    llvm::FunctionCallee fgets_str_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(i32, { ptr, i32 }, false);
+        return env_->llmod.getOrInsertFunction("rt_fgets_str", fnty);
+    }
+
+    // Lower a $fgets: a string-object destination goes straight to the runtime's
+    // rt_string handle (no fixed width, no wait-queue plane snapshot -- mirrors
+    // lower_sformat's string branch). A packed-vector destination hands the
+    // runtime the plane pointers plus bit width and the descriptor; the runtime
+    // reads a line, stores it right-justified into the must|may plane, clears the
+    // z plane, and returns the character count.
     void lower_fgets(Index i) {
-        const Index dst                  = ir_->payload(i).binary.l;
+        const Index  dst = ir_->payload(i).binary.l;
+        llvm::Value* fd  = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, true);
+        const LValue& lv = lvalue_of(dst);
+        if (lv.is_string) {
+            llvm::Value* r = b_.CreateCall(fgets_str_fn(), { lv_string_ptr(lv), fd });
+            set_value(i, packed(r, r, zero(32)));
+            return;
+        }
         const auto [mm, z, width, flags] = string_dest(dst, "$fgets");
-        llvm::Value* fd                  = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, true);
-        const ServiceSnapshot old          = service_snapshot(lvalue_of(dst));
+        const ServiceSnapshot old          = service_snapshot(lv);
         llvm::Value* r = b_.CreateCall(fgets_fn(), { mm, z, b_.getInt32(width), fd, b_.getInt32(flags) });
-        service_after_write(lvalue_of(dst), old);
+        service_after_write(lv, old);
         set_value(i, packed(r, r, zero(32)));
     }
 
@@ -11913,7 +11939,9 @@ private:
     std::tuple<llvm::Value*, llvm::Value*, uint32_t, uint32_t> string_dest(Index dst, const char* who) {
         const LValue& lv = lvalue_of(dst);
         if (lv.is_string) {
-            // TODO: file write-back into a dynamic string object (rt_string).
+            // Every caller (fgets/ferror/sformat) checks lv.is_string and branches to
+            // its own rt_string-handle path before reaching here; this is defense in
+            // depth against a future caller doing otherwise.
             throw BackendError{ std::string(who) + " into a string object is not supported" };
         }
         if (lv.width != lv.store_width) {
@@ -11991,15 +12019,31 @@ private:
         return env_->llmod.getOrInsertFunction("rt_ferror", fnty);
     }
 
-    // Lower a $ferror: pass the descriptor plus the destination string's planes; the
-    // runtime writes the message and returns the error code.
+    // i32 rt_ferror_str(i32 fd, rt_string* dst)
+    llvm::FunctionCallee ferror_str_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* fnty = llvm::FunctionType::get(i32, { i32, ptr }, false);
+        return env_->llmod.getOrInsertFunction("rt_ferror_str", fnty);
+    }
+
+    // Lower a $ferror: a string-object destination goes straight to the runtime's
+    // rt_string handle (mirrors lower_fgets's string branch); a packed-vector
+    // destination passes the descriptor plus the destination's planes. Either way
+    // the runtime writes the message and returns the error code.
     void lower_ferror(Index i) {
-        const Index dst                  = ir_->payload(i).binary.l;
+        const Index   dst = ir_->payload(i).binary.l;
+        llvm::Value*  fd  = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, true);
+        const LValue& lv  = lvalue_of(dst);
+        if (lv.is_string) {
+            llvm::Value* r = b_.CreateCall(ferror_str_fn(), { fd, lv_string_ptr(lv) });
+            set_value(i, packed(r, r, zero(32)));
+            return;
+        }
         const auto [mm, z, width, flags] = string_dest(dst, "$ferror");
-        llvm::Value* fd                  = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, true);
-        const ServiceSnapshot old          = service_snapshot(lvalue_of(dst));
+        const ServiceSnapshot old          = service_snapshot(lv);
         llvm::Value* r = b_.CreateCall(ferror_fn(), { fd, mm, z, b_.getInt32(width), b_.getInt32(flags) });
-        service_after_write(lvalue_of(dst), old);
+        service_after_write(lv, old);
         set_value(i, packed(r, r, zero(32)));
     }
 
@@ -15266,6 +15310,41 @@ private:
         const Truth t = truth_of(a);
         // true -> 0, false -> 1, x -> x: must = was-false, may = not was-true.
         return bit_plane(t.f, b_.CreateNot(t.t));
+    }
+
+    // Logical implication a -> b (LRM 11.4.7). Reached only on the
+    // not-short-circuited path -- lower_short_circuit already skips lowering
+    // b entirely when a is definitely false (LRM 11.3.5), so by the time this
+    // runs both operands are real values needing only the combine. Direct
+    // truth table of (!a || b) without materializing an intermediate Lnot:
+    // definitely true when a is definitely false OR b is definitely true
+    // (either half of the OR is settled); definitely false only when a is
+    // definitely true AND b is definitely false; x otherwise.
+    Plane lower_limplies(Plane a, Plane b) {
+        a = to_four(a);
+        b = to_four(b);
+        const Truth ta = truth_of(a);
+        const Truth tb = truth_of(b);
+        llvm::Value* t = b_.CreateOr(ta.f, tb.t);
+        llvm::Value* f = b_.CreateAnd(ta.t, tb.f);
+        return bit_plane(t, b_.CreateNot(f));
+    }
+
+    // Logical equivalence a <-> b (LRM 11.4.7). Unlike && / || / ->, LRM
+    // 11.3.5 does not list <-> as short-circuiting, so the frontend always
+    // lowers both operands (lower_binary) before this runs. No domination
+    // shortcut exists either: definitely true when both operands share the
+    // same definite truth, definitely false when both are definite but
+    // differ, x whenever either operand is itself ambiguous (an ambiguous
+    // operand's two possible resolutions give different equivalence answers).
+    Plane lower_lequiv(Plane a, Plane b) {
+        a = to_four(a);
+        b = to_four(b);
+        const Truth ta = truth_of(a);
+        const Truth tb = truth_of(b);
+        llvm::Value* t = b_.CreateOr(b_.CreateAnd(ta.t, tb.t), b_.CreateAnd(ta.f, tb.f));
+        llvm::Value* f = b_.CreateOr(b_.CreateAnd(ta.t, tb.f), b_.CreateAnd(ta.f, tb.t));
+        return bit_plane(t, b_.CreateNot(f));
     }
 
     // -- Select: known condition selects (one packed select); unknown merges bitwise

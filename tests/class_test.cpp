@@ -222,3 +222,102 @@ TEST_CASE("class inheritance fails loudly") {
     )");
     CHECK(d.find("class inheritance is not supported") != std::string::npos);
 }
+
+// Two classes forward-referencing each other's handle type: A's field type B
+// is declared before B exists, and B's method takes an A argument before A's
+// body (only its header) is complete.
+TEST_CASE("forward typedef: two classes with mutual handle references") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef class B;
+            class A;
+                B b;
+                int x;
+                function new(); x = 1; endfunction
+                function void link(B other); b = other; endfunction
+                function int read_b(); return b.y; endfunction
+            endclass
+            class B;
+                A a;
+                int y;
+                function new(int yy); y = yy; endfunction
+            endclass
+            initial begin
+                A obj; B bobj;
+                obj = new(); bobj = new(42);
+                obj.link(bobj);
+                $display("%0d %0d %b", obj.x, obj.read_b(), obj.b == null);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 42 0\n");
+}
+
+// A three-way forward-reference cycle (A -> B -> C -> A), each needing only
+// the others' names, not their bodies, at declaration time.
+TEST_CASE("forward typedef: three-way mutual reference cycle") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef class B;
+            typedef class C;
+            class A; B b; int x; function new(); x = 1; endfunction endclass
+            class B; C c; int y; function new(); y = 2; endfunction endclass
+            class C; A a; int z; function new(); z = 3; endfunction endclass
+            initial begin
+                A obj;
+                obj = new();
+                $display("%0d", obj.x);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1\n");
+}
+
+// LRM 6.18: "legal to have a forward type declaration in the same scope,
+// either before or after the final type definition" -- a forward decl
+// trailing its own definition is a legal no-op.
+TEST_CASE("forward typedef: declaration after the definition is legal") {
+    constexpr std::string_view src = R"(
+        module m;
+            class D; int w; function new(); w = 7; endfunction endclass
+            typedef class D;
+            initial begin
+                D d;
+                d = new();
+                $display("%0d", d.w);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "7\n");
+}
+
+// LRM 6.18: "legal to have multiple forward type declarations for the same
+// type identifier in the same scope".
+TEST_CASE("forward typedef: duplicate forward declarations are legal") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef class E;
+            typedef class E;
+            class E; int v; function new(); v = 9; endfunction endclass
+            initial begin
+                E e;
+                e = new();
+                $display("%0d", e.v);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "9\n");
+}
+
+// LRM 6.18: "It shall be an error if the type_identifier does not resolve to
+// a data type" -- a forward decl with no matching definition anywhere in
+// scope is rejected (by slang, at bind time).
+TEST_CASE("forward typedef: an unresolved forward declaration is an error") {
+    const std::string d = fails(R"(
+        module m;
+            typedef class F;
+            initial $display("unreachable");
+        endmodule
+    )");
+    CHECK(d.find("forward typedef") != std::string::npos);
+}

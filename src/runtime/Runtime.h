@@ -203,10 +203,20 @@ void rt_sformat(uint8_t* mm, uint8_t* z, uint32_t width, const char* fmt, uint32
 struct rt_string;
 void rt_sformat_str(struct rt_string* dst, const char* fmt, uint32_t argc, const rt_arg* argv);
 
+// $fgets(str, fd) into a `string` destination: no fixed width, so the whole
+// line is read (stopping after a newline or at EOF) and assigned to `dst`.
+// -> the character count, or 0 on EOF / error, in which case `dst` is left
+// unchanged (matches rt_fgets's packed-vector behavior on a 0-byte read).
+int32_t rt_fgets_str(struct rt_string* dst, int32_t fd);
+
 // $ferror(fd, str) (LRM §21.3.6): write the descriptor's most recent error message
 // into the string variable at `mm` / `z` (`width` bits) and return its error code
 // (0 when the stream is clear). `flags` as rt_fgets.
 int32_t rt_ferror(int32_t fd, uint8_t* mm, uint8_t* z, uint32_t width, uint32_t flags);
+
+// $ferror(fd, str) into a `string` destination: same as rt_ferror, but always
+// assigns `dst` (even the empty message when the stream is clear).
+int32_t rt_ferror_str(int32_t fd, struct rt_string* dst);
 
 // One output destination of a $fscanf / $sscanf conversion: the must|may plane
 // pointer (2*`width` bits), the z plane pointer (`width` bits), and the width. The

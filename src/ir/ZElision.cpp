@@ -393,6 +393,8 @@ struct Analysis {
                 // logical reductions: z-absorbing.
                 case Inst::Tag::AggEq:
                 case Inst::Tag::InsideSet:
+                case Inst::Tag::Limplies:
+                case Inst::Tag::Lequiv:
                     break;
 
                 // Real ops absorb z too: a real value carries no z plane and

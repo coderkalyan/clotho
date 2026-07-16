@@ -168,9 +168,11 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_fseek", &rt_fseek);
     expose("rt_rewind", &rt_rewind);
     expose("rt_fgets", &rt_fgets);
+    expose("rt_fgets_str", &rt_fgets_str);
     expose("rt_sformat", &rt_sformat);
     expose("rt_sformat_str", &rt_sformat_str);
     expose("rt_ferror", &rt_ferror);
+    expose("rt_ferror_str", &rt_ferror_str);
     expose("rt_fscanf", &rt_fscanf);
     expose("rt_sscanf", &rt_sscanf);
     expose("rt_fread", &rt_fread);
