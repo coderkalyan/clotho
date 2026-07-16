@@ -868,6 +868,12 @@ struct Inst {
         // occurrences of the trigger edge, without blocking the process (payload:
         // op_extra -> StoreNbEventInfo; the op is the whole-signal lvalue).
         StoreNbEvent,
+        // Inertial continuous-assignment delay, `assign #d lhs = rhs` (LRM 10.3.3):
+        // arm/reschedule a detached epoch-stamped store of the freshly-evaluated rhs
+        // for `now + d`, cancelling any still-pending store that a change supersedes
+        // (pulse rejection). Reuses StoreNbDelayInfo {value, delay}; the op is the
+        // whole-signal lvalue.
+        StoreInertialDelay,
         // Whole-object blocking copy of one aggregate into another (payload:
         // op_extra -> AggCopyInfo). Lowered to llvm.memcpy of the storage; the
         // frontend emits it only for a string-free aggregate.
@@ -1831,6 +1837,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::Wait;
 
         case T::StoreNbDelay:
+        case T::StoreInertialDelay:
         case T::StoreNbEvent:
         case T::Select:
         case T::SelectLazy:

@@ -199,6 +199,8 @@ const char* tag_name(Inst::Tag tag) {
             return "assoc_prev";
         case T::StoreNbDelay:
             return "store_nb_delay";
+        case T::StoreInertialDelay:
+            return "store_inertial_delay";
         case T::StoreNbEvent:
             return "store_nb_event";
         case T::Add:

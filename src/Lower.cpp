@@ -3036,11 +3036,6 @@ private:
     // -- Processes --
 
     void lower_continuous_assign(const ContinuousAssignSymbol& sym) {
-        if (sym.getDelay() != nullptr) {
-            // `assign #N lhs = rhs;` — the net-delay is dropped today, so the
-            // update would land at the wrong time. Reject until the scheduler exists.
-            fail("continuous assignment delay (assign #N) is not supported");
-        }
         check_drive_strength(sym.getDriveStrength(), "a continuous assignment");
         const Expression& e = sym.getAssignment();
         if (e.kind != ExpressionKind::Assignment) {
@@ -3048,28 +3043,78 @@ private:
         }
         const AssignmentExpression& a    = e.as<AssignmentExpression>();
         const Expression&           left = a.left();
+
+        // `assign #d lhs = rhs;` carries an inertial net delay (LRM 10.3.3). Only a
+        // single `#d` DelayControl is lowered; a rise/fall/turn-off triple selects
+        // a per-transition delay Clotho has no representation for.
+        const TimingControl* delay = sym.getDelay();
+        if (delay != nullptr && delay->kind != TimingControlKind::Delay) {
+            // TODO: continuous-assign rise/fall/turn-off (vector-net transition)
+            // delays, LRM 10.3.3 / 28.16.
+            fail("continuous assignment rise/fall/turn-off delays (assign #(a,b,c)) are "
+                 "not supported");
+        }
+
         if (cur_pass_ == Pass::Classify) {
             record_net_driver(left);
             return;
         }
 
-        ir::Builder b(module_.pool);
+        ir::Builder         b(module_.pool);
+        const ir::SourceLoc l = to_source_loc(sym.location);
         if (const std::optional<ir::Signal> net = resolved_net_of(left)) {
+            if (delay != nullptr) {
+                // TODO: per-driver inertial delay before multi-driver net
+                // resolution (LRM 10.3.3) — the resolver folds every driver's slot
+                // with no per-driver timing.
+                fail("delay on a multiply-driven (resolved) net is not supported");
+            }
             // Multiply-driven net: this driver stages its value into its own
             // slot; the resolver folds every driver's slot (emit_wire_resolvers).
-            emit_resolved_driver(*net, a, left, b, to_source_loc(sym.location));
+            emit_resolved_driver(*net, a, left, b, l);
             return;
         }
         // A concatenation lvalue has no single root, so resolved_net_of misses
         // it; reject it loudly if an operand drives a resolved net rather than
         // silently storing past the resolver.
         reject_concat_resolved_driver(left);
+
+        if (delay != nullptr) {
+            // Only a whole integral scalar / packed net lvalue is lowered — the
+            // deferred record is monomorphized per whole signal (like `x <= #d`),
+            // so a select / concat / aggregate target has no record shape.
+            // TODO: inertial delay on a bit/part-select, concat, or aggregate net.
+            const bool whole_scalar =
+                (left.kind == ExpressionKind::NamedValue ||
+                 left.kind == ExpressionKind::HierarchicalValue) &&
+                left.type->isIntegral() && !left.type->isUnpackedArray() &&
+                !is_aggregate(*left.type);
+            if (!whole_scalar) {
+                fail("continuous assignment delay is only supported for a whole integral "
+                     "scalar target");
+            }
+            // The inertial decide compares both value planes as i64, so the net's
+            // mm plane must fit 64 bits (a 4-state net packs must|may, halving the
+            // usable width to 32).
+            // TODO: inertial delay on a net wider than 64 value bits.
+            const uint32_t width    = left.type->getBitWidth();
+            const uint32_t mm_width = left.type->isFourState() ? 2 * width : width;
+            if (mm_width > 64) {
+                fail("inertial delay on a net wider than 64 value bits is not supported");
+            }
+            const ir::Index rhs   = lower_expr(a.right(), b);
+            const ir::Index ticks = scaled_delay(delay->as<DelayControl>().expr, b);
+            b.store_inertial_delay(lower_lvalue(left, b), rhs, ticks, l);
+            add_continuous_process(continuous_events(e), l, b);
+            return;
+        }
+
         lower_assign(a, b);
 
         // A continuous assign is a process sensitive to the source elements of
         // its expression (LRM 4.9.1): every signal the RHS reads, plus any read
         // in an LHS selector (`assign mem[i] = x` is sensitive to i).
-        add_continuous_process(continuous_events(e), to_source_loc(sym.location), b);
+        add_continuous_process(continuous_events(e), l, b);
     }
 
     // The wait events of a continuous assignment: every signal its expression

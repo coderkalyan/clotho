@@ -58,6 +58,11 @@ public:
     // sample `value` now, store it to `lvalue` after `delay` ticks.
     Index store_nb_delay(Index lvalue, Index value, Index delay, SourceLoc loc);
 
+    // Inertial continuous-assignment delay `assign #delay lvalue = value` (LRM
+    // 10.3.3): arm a detached epoch-stamped store of `value` for `now + delay`,
+    // cancelling any pending store a change supersedes (pulse rejection).
+    Index store_inertial_delay(Index lvalue, Index value, Index delay, SourceLoc loc);
+
     // Nonblocking intra-assignment event `lvalue <= repeat(count) @(edge trig) value`
     // (LRM 9.4.5): sample `value` and `count` now, store to `lvalue` after `count`
     // occurrences of `trig`'s `edge`. `count` is a constant 1 for a plain `@e`.

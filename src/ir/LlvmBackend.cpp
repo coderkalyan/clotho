@@ -1937,17 +1937,24 @@ private:
         const auto sigs = mod_.signals();
         for (size_t k = 0; k < ir.inst_count(); ++k) {
             const auto idx = static_cast<Index>(k);
-            // A nonblocking intra-assignment delay (`x <= #d y`) targets a whole
-            // integral scalar (frontend-restricted). Its target is a real NBA
+            // A nonblocking intra-assignment delay (`x <= #d y`) or an inertial
+            // continuous-assignment delay (`assign #d x = y`, LRM 10.3.3) targets a
+            // whole integral scalar (frontend-restricted). Its target is a real NBA
             // target for wake purposes (gets nba_id + meta), but the value is held
             // in a deferred record on the wheel, not the shadow, so it is tracked
             // separately for the intra-commit loop.
-            if (ir.tag(idx) == Inst::Tag::StoreNbDelay) {
+            if (ir.tag(idx) == Inst::Tag::StoreNbDelay ||
+                ir.tag(idx) == Inst::Tag::StoreInertialDelay) {
                 const NbaTarget t = nba_target(ir, ir.payload(idx).op_extra.op);
                 slots_[static_cast<uint32_t>(t.sig)].nba = true;
                 if (std::find(intra_nba_sigs_.begin(), intra_nba_sigs_.end(), t.sig) ==
                     intra_nba_sigs_.end()) {
                     intra_nba_sigs_.push_back(t.sig);
+                }
+                if (ir.tag(idx) == Inst::Tag::StoreInertialDelay &&
+                    std::find(inertial_sigs_.begin(), inertial_sigs_.end(), t.sig) ==
+                      inertial_sigs_.end()) {
+                    inertial_sigs_.push_back(t.sig);
                 }
                 continue;
             }
@@ -4493,6 +4500,7 @@ private:
                 // spurious comb-fused run would arm a spurious store), routing it
                 // to a plain coroutine.
                 case Inst::Tag::StoreNbDelay:
+                case Inst::Tag::StoreInertialDelay:
                 case Inst::Tag::StoreNbEvent:
                     return false;
                 // A $strobe call site ramps its deferred-print task through the
@@ -4684,6 +4692,7 @@ private:
                 }
                 case Inst::Tag::StoreNb:
                 case Inst::Tag::StoreNbDelay:
+                case Inst::Tag::StoreInertialDelay:
                 case Inst::Tag::StoreNbEvent:
                     return CombFuse::NbaWrite;
                 case Inst::Tag::Call:
@@ -7235,7 +7244,25 @@ private:
         llvm::Value* ticked = b_.CreateCall(wheel_advance_fn(), { wheel, wheel });
         // Time advanced: a new instant begins, so reset the oscillation counter.
         b_.CreateStore(b_.getInt64(0), sym(osc_count_gv_));
-        b_.CreateCondBr(b_.CreateICmpNE(ticked, b_.getInt32(0)), check, wdone);
+        if (!inertial_sigs_.empty()) {
+            // Inertial continuous-assignment delay (LRM 10.3.3): a CA updates its net
+            // in the ACTIVE region, so a store that fired on this wheel tick must be
+            // visible to same-instant processes the tick also resumed. Commit those
+            // records here, ahead of the active drain, unlike a procedural `<= #d`
+            // (nonblocking) which the NBA region commits after the active drain. The
+            // NBA-region intra loop still runs (below), but only sees records armed
+            // during this instant's active region (a `#0` continuous assign), the
+            // wheel-fired ones already released here.
+            auto* post_tick = llvm::BasicBlock::Create(ctx_, "wheel.inertial", fn);
+            b_.CreateCondBr(b_.CreateICmpNE(ticked, b_.getInt32(0)), post_tick, wdone);
+            b_.SetInsertPoint(post_tick);
+            for (const Signal sig : inertial_sigs_) {
+                emit_intra_commit(sig);
+            }
+            b_.CreateBr(check);
+        } else {
+            b_.CreateCondBr(b_.CreateICmpNE(ticked, b_.getInt32(0)), check, wdone);
+        }
 
         b_.SetInsertPoint(wtick); // unreachable now; kept so block wiring stays valid
         b_.CreateBr(wdone);
@@ -7302,6 +7329,15 @@ private:
     llvm::FunctionCallee intra_cb_fn() {
         return rt_fn("rt_intra_cb", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
+    // Inertial continuous-assignment delay (rt_inertial_*, LRM 10.3.3).
+    llvm::FunctionCallee inertial_decide_fn() {
+        auto* i64 = b_.getInt64Ty();
+        return rt_fn("rt_inertial_decide", i64,
+                     { b_.getInt32Ty(), i64, i64, i64, i64 });
+    }
+    llvm::FunctionCallee inertial_cb_fn() {
+        return rt_fn("rt_inertial_cb", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
     llvm::FunctionCallee intra_ready_base_fn() {
         return rt_fn("rt_intra_ready_base", raw_ptr_ty(), { b_.getInt32Ty() });
     }
@@ -7325,11 +7361,13 @@ private:
     }
 
     // Per intra-NBA signal: dense id and the record StructType { ptr timer.next,
-    // ptr timer.on_expire, i32 idx, i32 seq, i32 count, iMM mm_val, [iW z_val] }.
-    // The rt_timer (fields 0-1) sits at offset 0 so the record base is the timer
-    // pointer handed to the wheel; the runtime reads `idx` (field 2) to route the
-    // fire and owns `seq` (field 3); `count` (field 4) is the `@e` event countdown
-    // (unused by `#d`). Value fields: mm=5, z=6.
+    // ptr timer.on_expire, i32 idx, i32 seq, i32 count, i64 epoch, iMM mm_val,
+    // [iW z_val] }. The rt_timer (fields 0-1) sits at offset 0 so the record base
+    // is the timer pointer handed to the wheel; the runtime reads `idx` (field 2)
+    // to route the fire and owns `seq` (field 3); `count` (field 4) is the `@e`
+    // event countdown (unused by `#d`); `epoch` (field 5) is the inertial
+    // continuous-assign deschedule stamp (unused by transport records). Value
+    // fields: mm=6, z=7. Layout mirrors rt_intra_rec (Runtime.h).
     uint32_t intra_idx(Signal sig) const {
         const auto it = std::find(intra_nba_sigs_.begin(), intra_nba_sigs_.end(), sig);
         return static_cast<uint32_t>(it - intra_nba_sigs_.begin());
@@ -7337,7 +7375,8 @@ private:
     llvm::StructType* intra_rec_ty(const SignalSlot& s) {
         auto*                    ptr = raw_ptr_ty();
         auto*                    i32 = b_.getInt32Ty();
-        std::vector<llvm::Type*> f   = { ptr, ptr, i32, i32, i32,
+        auto*                    i64 = b_.getInt64Ty();
+        std::vector<llvm::Type*> f   = { ptr, ptr, i32, i32, i32, i64,
                                          int_ty(s.narrow ? s.width : 2 * s.width) };
         if (s.has_z) {
             f.push_back(int_ty(s.width));
@@ -8400,6 +8439,7 @@ private:
             case Inst::Tag::Store:
             case Inst::Tag::StoreNb:
             case Inst::Tag::StoreNbDelay:
+            case Inst::Tag::StoreInertialDelay:
             case Inst::Tag::StoreNbEvent:
             case Inst::Tag::AggCopy:
             case Inst::Tag::Cond:
@@ -9162,6 +9202,20 @@ private:
                 const Plane   rhs   = value_of(info.value);
                 llvm::Value*  ticks = cast(must_of(value_of(info.delay)), 64, false);
                 emit_intra_nba_arm(lv, rhs, ticks);
+                return;
+            }
+
+            // Inertial continuous-assignment delay (`assign #d x = y`, LRM 10.3.3):
+            // evaluate the RHS now, ask the runtime whether to (re)arm a detached
+            // store — a change superseding a still-pending store cancels it (pulse
+            // rejection) — and arm it on the wheel for `now + d`. Commits in the NBA
+            // region of the fired instant (emit_intra_commit), like `x <= #d`.
+            case Inst::Tag::StoreInertialDelay: {
+                const auto    info  = ir_->extra_data<StoreNbDelayInfo>(p.op_extra.extra);
+                const LValue& lv    = lvalue_of(p.op_extra.op);
+                const Plane   rhs   = value_of(info.value);
+                llvm::Value*  ticks = cast(must_of(value_of(info.delay)), 64, false);
+                emit_inertial_arm(lv, rhs, ticks);
                 return;
             }
 
@@ -11298,9 +11352,9 @@ private:
             rhs    = to_four(rhs);
             mm_val = rhs.mm; // i2W: must | (may << W)
         }
-        b_.CreateAlignedStore(mm_val, b_.CreateStructGEP(rt, rec, 5), a1);
+        b_.CreateAlignedStore(mm_val, b_.CreateStructGEP(rt, rec, 6), a1);
         if (s.has_z) {
-            b_.CreateAlignedStore(rhs.z, b_.CreateStructGEP(rt, rec, 6), a1);
+            b_.CreateAlignedStore(rhs.z, b_.CreateStructGEP(rt, rec, 7), a1);
         }
 
         // Arm the wheel for `now + ticks`. A zero delay cannot arm the wheel
@@ -11337,6 +11391,97 @@ private:
         b_.SetInsertPoint(contb);
     }
 
+    // Arm (or reschedule) an inertial continuous-assignment delay (`assign #d x = y`,
+    // LRM 10.3.3). Evaluate the RHS now and ask rt_inertial_decide, comparing it to
+    // both the target net's current value and any still-pending scheduled value:
+    //   - equal to the pending value  -> keep the running timer (step b), arm nothing;
+    //   - equal to the current net    -> deschedule the pending store (step c), nothing;
+    //   - otherwise                   -> deschedule + arm a fresh epoch-stamped store
+    //                                     for `now + d` (steps a/d).
+    // A stale (descheduled) record still on the wheel is dropped when it fires
+    // (rt_inertial_cb), which is what rejects a pulse narrower than the delay. The
+    // committed record rides the same NBA-region commit as `x <= #d` (emit_intra_commit).
+    void emit_inertial_arm(const LValue& lv, Plane rhs, llvm::Value* ticks) {
+        const SignalSlot& s      = slot_of(lv.sig);
+        const llvm::Align a1{ 1 };
+        llvm::StructType* rt     = intra_rec_ty(s);
+        const uint32_t    stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
+        llvm::Value*      idxv   = intra_id_value(lv.sig);
+        auto*             i64    = b_.getInt64Ty();
+        const uint32_t    W      = s.width;
+        auto*             mmty   = int_ty(s.narrow ? W : 2 * W);
+        auto*             zty    = int_ty(W);
+
+        // Freshly-evaluated RHS planes, in the record's stored form (a whole-scalar
+        // target is signal-width via the frontend Resize, so no positioning).
+        llvm::Value* mm_val;
+        if (s.narrow) {
+            mm_val = must_of(rhs);
+        } else {
+            rhs    = to_four(rhs);
+            mm_val = rhs.mm; // i2W: must | (may << W)
+        }
+        llvm::Value* z_val = s.has_z ? rhs.z : nullptr;
+
+        // Current net value planes (the step-c "equals current LHS" compare). The
+        // mm/z fields have the same encoding as the record's, so the runtime's
+        // === compare on the i64-packed planes is exact.
+        llvm::Value* cur_mm = b_.CreateLoad(mmty, lv_mm_ptr(lv));
+        llvm::Value* cur_z  = s.has_z ? b_.CreateLoad(zty, lv_z_ptr(lv)) : nullptr;
+
+        auto to64 = [&](llvm::Value* v) -> llvm::Value* {
+            return v != nullptr ? b_.CreateZExt(v, i64) : b_.getInt64(0);
+        };
+        llvm::Value* ep = b_.CreateCall(
+          inertial_decide_fn(), { idxv, to64(mm_val), to64(z_val), to64(cur_mm), to64(cur_z) });
+
+        // ep == 0 -> arm nothing (kept timer / no change). Only the taken block
+        // reserves a record; a spurious alloc on the not-taken path would leak.
+        auto* armbb = llvm::BasicBlock::Create(ctx_, "inertial.arm", fn_);
+        auto* contb = llvm::BasicBlock::Create(ctx_, "inertial.done", fn_);
+        b_.CreateCondBr(b_.CreateICmpNE(ep, b_.getInt64(0)), armbb, contb);
+
+        b_.SetInsertPoint(armbb);
+        llvm::Value* rec = b_.CreateCall(intra_alloc_fn(), { idxv, b_.getInt32(stride) });
+        b_.CreateStore(idxv, b_.CreateStructGEP(rt, rec, 2)); // idx routes the fire
+        b_.CreateAlignedStore(ep, b_.CreateStructGEP(rt, rec, 5), a1); // deschedule stamp
+        b_.CreateAlignedStore(mm_val, b_.CreateStructGEP(rt, rec, 6), a1);
+        if (s.has_z) {
+            b_.CreateAlignedStore(z_val, b_.CreateStructGEP(rt, rec, 7), a1);
+        }
+
+        // Arm the wheel for `now + ticks` with rt_inertial_cb. A zero delay cannot
+        // arm the wheel, so its store lands in the current instant's NBA region via
+        // an immediate callback (the epoch guard passes — ep is the freshest stamp).
+        auto* nullp    = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
+        auto  schedule = [&] {
+            llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
+            b_.CreateCall(wheel_schedule_fn(),
+                          { wheel_, rec, b_.CreateAdd(now, ticks), inertial_cb_fn().getCallee() });
+        };
+        auto immediate = [&] { b_.CreateCall(inertial_cb_fn(), { rec, nullp }); };
+
+        if (auto* c = llvm::dyn_cast<llvm::ConstantInt>(ticks)) {
+            if (c->isZero()) {
+                immediate();
+            } else {
+                schedule();
+            }
+            b_.CreateBr(contb);
+        } else {
+            auto* zbb  = llvm::BasicBlock::Create(ctx_, "inertial.zero", fn_);
+            auto* nzbb = llvm::BasicBlock::Create(ctx_, "inertial.sched", fn_);
+            b_.CreateCondBr(b_.CreateICmpEQ(ticks, b_.getInt64(0)), zbb, nzbb);
+            b_.SetInsertPoint(zbb);
+            immediate();
+            b_.CreateBr(contb);
+            b_.SetInsertPoint(nzbb);
+            schedule();
+            b_.CreateBr(contb);
+        }
+        b_.SetInsertPoint(contb);
+    }
+
     // Arm a nonblocking intra-assignment event (`x <= @e y` / `repeat(N) @e`):
     // reserve a record, fill the sampled value planes and the countdown, and
     // register it on trigger `trig_id`. The process does not suspend. When the
@@ -11361,9 +11506,9 @@ private:
             rhs    = to_four(rhs);
             mm_val = rhs.mm;
         }
-        b_.CreateAlignedStore(mm_val, b_.CreateStructGEP(rt, rec, 5), a1);
+        b_.CreateAlignedStore(mm_val, b_.CreateStructGEP(rt, rec, 6), a1);
         if (s.has_z) {
-            b_.CreateAlignedStore(rhs.z, b_.CreateStructGEP(rt, rec, 6), a1);
+            b_.CreateAlignedStore(rhs.z, b_.CreateStructGEP(rt, rec, 7), a1);
         }
         b_.CreateCall(intra_event_register_fn(), { trig_id, rec });
     }
@@ -11412,9 +11557,9 @@ private:
 
         b_.SetInsertPoint(body);
         llvm::Value* recp = b_.CreateLoad(ptr, b_.CreateInBoundsGEP(ptr, base, i));
-        b_.CreateStore(b_.CreateAlignedLoad(mmty, b_.CreateStructGEP(rt, recp, 5), a1), live_mm);
+        b_.CreateStore(b_.CreateAlignedLoad(mmty, b_.CreateStructGEP(rt, recp, 6), a1), live_mm);
         if (s.has_z) {
-            b_.CreateStore(b_.CreateAlignedLoad(zty, b_.CreateStructGEP(rt, recp, 6), a1), live_z);
+            b_.CreateStore(b_.CreateAlignedLoad(zty, b_.CreateStructGEP(rt, recp, 7), a1), live_z);
         }
         i->addIncoming(b_.CreateAdd(i, b_.getInt32(1)), b_.GetInsertBlock());
         b_.CreateBr(head);
@@ -15981,6 +16126,14 @@ private:
     // the sampled value on the wheel until `now + d`, then the NBA region commits
     // it (emit_intra_commit). See docs/design/intra-assignment-timing.md.
     std::vector<Signal>     intra_nba_sigs_;
+
+    // The subset of intra_nba_sigs_ that are inertial continuous-assignment delay
+    // targets (`assign #d x = y`, StoreInertialDelay). Unlike a procedural `<= #d`
+    // (a nonblocking assign that commits in the NBA region), a continuous assign
+    // updates its net in the active region — visible to same-instant processes — so
+    // these commit in a pre-active phase after the wheel tick (emit_active_run),
+    // ahead of the active drain. See LRM 10.3.3.
+    std::vector<Signal>     inertial_sigs_;
 
     // Per (signal, edge): the dense trigger id if that signal+edge fires a
     // nonblocking `<= @e` deferred store (StoreNbEvent), else -1. A trigger

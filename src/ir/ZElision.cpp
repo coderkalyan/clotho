@@ -240,7 +240,8 @@ struct Analysis {
                 case Inst::Tag::StoreNb:
                     store_into(ir, fn, p.binary.l, z_of(p.binary.r) != 0);
                     break;
-                case Inst::Tag::StoreNbDelay: {
+                case Inst::Tag::StoreNbDelay:
+                case Inst::Tag::StoreInertialDelay: {
                     // The deferred store writes the target with the sampled value's
                     // z-ness (drives whether the target keeps a z plane).
                     const auto info = ir.extra_data<StoreNbDelayInfo>(p.op_extra.extra);

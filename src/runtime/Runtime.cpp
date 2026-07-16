@@ -1269,6 +1269,18 @@ std::vector<IntraSite> intra_sites; // indexed by dense intra-nba id
 uint32_t               intra_total = 0; // ready records across all sites
 uint32_t               intra_seq   = 0; // monotonic arm-order stamp
 
+// Per inertial continuous-assignment site (LRM 10.3.3): the current deschedule
+// epoch and the value currently scheduled to propagate. Indexed by the same dense
+// intra-nba id as intra_sites. `pending` records whether a store is in flight (so a
+// same-value change keeps its timer, LRM 10.3.3 step b).
+struct InertialState {
+    uint64_t epoch   = 0;
+    bool     pending = false;
+    uint64_t pmm     = 0; // pending value's packed mm plane
+    uint64_t pz      = 0; // pending value's packed z plane
+};
+std::vector<InertialState> inertial_states; // indexed by dense intra-nba id
+
 // Per trigger id (dense (trigger-signal, edge)): records armed on `x <= @e y`
 // waiting for that edge. Growable — an unbounded number can arm between two edges.
 std::vector<std::vector<void*>> intra_event_pending;
@@ -1940,6 +1952,43 @@ extern "C" void rt_intra_cb(rt_timer* timer, void* /*ctx*/) {
     intra_ready_push(reinterpret_cast<rt_intra_rec*>(timer));
 }
 
+extern "C" uint64_t rt_inertial_decide(uint32_t idx, uint64_t new_mm, uint64_t new_z,
+                                       uint64_t cur_mm, uint64_t cur_z) {
+    if (idx >= inertial_states.size()) {
+        inertial_states.resize(idx + 1);
+    }
+    InertialState& s = inertial_states[idx];
+    // LRM 10.3.3 step b: if the new RHS equals the value already scheduled to
+    // propagate, keep the existing timer running — do not reschedule.
+    if (s.pending && new_mm == s.pmm && new_z == s.pz) {
+        return 0;
+    }
+    // Any other change deschedules the pending store: bump the epoch so a stale
+    // record still on the wheel is dropped when it fires (rt_inertial_cb).
+    s.epoch++;
+    // LRM 10.3.3 step c: the new RHS already equals the current net value, so
+    // schedule nothing (and there is no longer a pending store).
+    if (new_mm == cur_mm && new_z == cur_z) {
+        s.pending = false;
+        return 0;
+    }
+    // LRM 10.3.3 step d: arm a fresh store; the caller stamps this epoch.
+    s.pending = true;
+    s.pmm     = new_mm;
+    s.pz      = new_z;
+    return s.epoch;
+}
+
+extern "C" void rt_inertial_cb(rt_timer* timer, void* /*ctx*/) {
+    auto* rec = reinterpret_cast<rt_intra_rec*>(timer);
+    if (rec->idx < inertial_states.size() && rec->epoch == inertial_states[rec->idx].epoch) {
+        intra_ready_push(rec); // still current -> commit this instant (pre-active for CA)
+        return;
+    }
+    // Descheduled by a later RHS change: reclaim the record unfired.
+    intra_sites[rec->idx].freelist.push_back(rec);
+}
+
 extern "C" void rt_intra_event_register(uint32_t trig_id, void* rec) {
     if (trig_id >= intra_event_pending.size()) {
         intra_event_pending.resize(trig_id + 1);
@@ -2000,6 +2049,10 @@ extern "C" void rt_intra_reset(void) {
     }
     for (std::vector<void*>& pend : intra_event_pending) {
         pend.clear();
+    }
+    // A fresh simulation has no pending inertial store and starts at epoch 0.
+    for (InertialState& s : inertial_states) {
+        s = {};
     }
     intra_total = 0;
     intra_seq   = 0;

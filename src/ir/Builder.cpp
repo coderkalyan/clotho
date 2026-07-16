@@ -87,6 +87,13 @@ Index Builder::store_nb_delay(Index lvalue, Index value, Index delay, SourceLoc 
     return emit({ Inst::Tag::StoreNbDelay, Inst::Payload{ .op_extra = { lvalue, extra } } }, loc);
 }
 
+Index Builder::store_inertial_delay(Index lvalue, Index value, Index delay, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(StoreNbDelayInfo{ value, delay });
+
+    return emit({ Inst::Tag::StoreInertialDelay, Inst::Payload{ .op_extra = { lvalue, extra } } },
+                loc);
+}
+
 Index Builder::store_nb_event(Index lvalue, Index value, Index count, Signal trig, uint32_t edge,
                               SourceLoc loc) {
     const ExtraIndex extra = add_extra(StoreNbEventInfo{ value, count, trig, edge });

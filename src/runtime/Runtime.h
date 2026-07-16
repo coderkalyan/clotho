@@ -911,6 +911,11 @@ typedef struct rt_intra_rec {
     uint32_t idx;
     uint32_t seq;
     uint32_t count;
+    // Deschedule epoch for an inertial continuous-assignment delay (LRM 10.3.3):
+    // the record fires only if its stamp still matches the site's current epoch,
+    // else it was cancelled by a later RHS change. Unused by transport (`#d` NBA)
+    // records.
+    uint64_t epoch;
 } rt_intra_rec;
 
 // Reserve a `stride`-byte record for site `idx` (from its freelist; allocates
@@ -939,6 +944,28 @@ void rt_intra_release(uint32_t idx);
 // Reclaim every record (including any left scheduled by a $finish mid-flight)
 // into its freelist and clear all ready lists. Called once at simulation start.
 void rt_intra_reset(void);
+
+// -- Inertial continuous-assignment delay (`assign #d lhs = rhs`, LRM 10.3.3) --
+//
+// On each RHS change the backend evaluates the new RHS and asks rt_inertial_decide
+// whether (and with what epoch) to arm a detached store. Inertial (pulse-rejecting)
+// semantics: a change that supersedes a still-pending store cancels it (epoch bump),
+// so a pulse narrower than the delay never propagates.
+
+// Decide the inertial action for site `idx` given the freshly-evaluated RHS planes
+// (`new_mm`/`new_z`) and the target net's current value planes (`cur_mm`/`cur_z`),
+// each packed into a 64-bit word (4-state: must | may<<W and the z plane; 2-state:
+// the value and 0). Returns 0 to arm nothing (either a store to the same value is
+// already pending — keep its timer — or the new value already equals the net), else
+// the non-zero epoch the caller must stamp on the armed record. A 4-state-exact
+// (`===`) compare on both planes.
+uint64_t rt_inertial_decide(uint32_t idx, uint64_t new_mm, uint64_t new_z, uint64_t cur_mm,
+                            uint64_t cur_z);
+
+// Wheel expiry callback for an inertial record: commit it (rt_intra ready list) only
+// if its stamped epoch still matches the site's current epoch, else it was cancelled
+// by a later RHS change — return it to the freelist unfired.
+void rt_inertial_cb(rt_timer* timer, void* ctx);
 
 // -- Event-triggered deferred stores (`x <= @e y` / `x <= repeat(N) @e y`) --
 //
