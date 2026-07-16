@@ -636,6 +636,13 @@ std::vector<bool> compute_undriven(const Module& m) {
                 case Inst::Tag::StoreNb:
                     mark_root(ir, p.binary.l);
                     break;
+                // An inertial delayed driver (`assign #d` / `and #d`, LRM 10.3.3 /
+                // 28.16) drives its net even before the first propagation commits, so
+                // the net powers up x (its driver's initial output), not undriven z —
+                // matching iverilog. The lvalue rides op_extra like the other stores.
+                case Inst::Tag::StoreInertialDelay:
+                    mark_root(ir, p.op_extra.op);
+                    break;
                 case Inst::Tag::ReadMem:
                     driven[static_cast<uint32_t>(ir.extra_data<ReadMemInfo>(p.op_extra.extra).target)] = true;
                     break;

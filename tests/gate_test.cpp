@@ -179,16 +179,52 @@ TEST_CASE("switch and pull primitives are reported as unsupported") {
     }
 }
 
-TEST_CASE("gate delays are reported as unsupported") {
+TEST_CASE("single-value gate delay is inertial (LRM 28.16)") {
+    // `and #3` schedules the output for now+3; a pulse narrower than the delay is
+    // rejected, and the net powers up x (its driver's initial output), not z.
+    // Byte-identical to iverilog.
+    const std::string out = run_capture(R"(
+        module m;
+            logic a, b; wire y;
+            and #3 (y, a, b);
+            initial begin
+                a=0; b=0;
+                #1 $display("y=%b", y);   // initial window: driver's x, not net z
+                a=1; b=1;
+                #4 $display("y=%b", y);   // t5: propagated 1
+                a=0;
+                #4 $display("y=%b", y);   // t9: propagated 0
+                a=1; #1 a=0;              // 1-wide pulse < 3 -> rejected
+                #4 $display("y=%b", y);   // still 0
+                $finish;
+            end
+        endmodule
+    )");
+    CHECK(out == "y=x\ny=1\ny=0\ny=0\n");
+}
+
+TEST_CASE("gate rise/fall/turn-off delay triples are reported as unsupported") {
     const LowerResult r = lower_text(R"(
         module m;
             wire y;
             reg a, b;
-            and #2 g(y, a, b);
+            and #(1,2) g(y, a, b);
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("gate delay") != std::string::npos);
+    CHECK(r.diagnostics.find("rise/fall/turn-off") != std::string::npos);
+}
+
+TEST_CASE("gate delay on a bit-addressed output is reported as unsupported") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            wire [3:0] y;
+            reg a, b;
+            and #2 g(y[1], a, b);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("whole scalar output") != std::string::npos);
 }
 
 TEST_CASE("non-default gate drive strengths are reported as unsupported") {

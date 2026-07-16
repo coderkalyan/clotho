@@ -3478,9 +3478,12 @@ private:
             // strength resolution) and user-defined primitives.
             fail("gate primitive '" + std::string(prim.name) + "' is not supported");
         }
-        if (gi.getDelay() != nullptr) {
-            // TODO: gate delays (rise/fall pairs, inertial semantics, LRM 28.16).
-            fail("gate delay is not supported");
+        const TimingControl* gate_delay = gi.getDelay();
+        if (gate_delay != nullptr && gate_delay->kind != TimingControlKind::Delay) {
+            // TODO: gate rise/fall/turn-off delay triples #(a,b,c) (LRM 28.16) —
+            // needs the per-transition delay selection Clotho has no representation
+            // for. A single #d delay is lowered below.
+            fail("gate rise/fall/turn-off delays (#(a,b,c)) are not supported");
         }
         const auto [s0, s1] = gi.getDriveStrength();
         if ((s0 && *s0 != DriveStrength::Strong) || (s1 && *s1 != DriveStrength::Strong)) {
@@ -3538,9 +3541,26 @@ private:
                               : gate_folded_value(*op, inputs, wait_events, b, loc);
 
             if (const std::optional<ir::Signal> net = resolved_net_of(left)) {
+                if (gate_delay != nullptr) {
+                    // TODO: gate delay on a multiply-driven (resolved) net — the
+                    // resolver folds every driver's slot with no per-driver timing
+                    // (mirrors the resolved continuous-assign delay gap, LRM 28.16).
+                    fail("gate delay on a multiply-driven (resolved) net is not supported");
+                }
                 emit_gate_resolved_driver(left, *net, val, std::move(wait_events), b, loc);
             } else {
-                emit_gate_as_process(lower_gate_output(*out), val, std::move(wait_events), b, loc);
+                const GateTerm output = lower_gate_output(*out);
+                if (gate_delay != nullptr &&
+                    module_.pool.layout(module_.signal(output.sig).type).width != 1) {
+                    // The inertial-delay store targets a whole signal; a gate driving
+                    // one bit of a wider vector (`and #d (v[i], ...)`) has no whole-
+                    // signal lvalue. TODO: bit-addressed gate output with a delay.
+                    fail("gate delay is only supported for a whole scalar output");
+                }
+                emit_gate_as_process(output, val, std::move(wait_events), b, loc,
+                                     gate_delay != nullptr
+                                         ? &gate_delay->as<DelayControl>().expr
+                                         : nullptr);
             }
         }
     }
@@ -3660,11 +3680,19 @@ private:
     }
 
     // Lower one gate output as a continuous-assign process: store the pre-folded
-    // 1-bit value `val` to the output bit, subscribing to `wait_events`.
+    // 1-bit value `val` to the output bit, subscribing to `wait_events`. A non-null
+    // `delay_expr` (`and #d (...)`, LRM 28.16) makes the store inertial — the same
+    // epoch-cancelled deferred record a delayed continuous assign uses (caller has
+    // already guarded a whole-scalar output).
     void emit_gate_as_process(GateTerm output, ir::Index val,
                               std::vector<ir::WaitEvent> wait_events, ir::Builder& b,
-                              ir::SourceLoc l) {
-        b.binary(ir::Inst::Tag::Store, gate_bit_lvalue(output.sig, output.bit, b, l), val, l);
+                              ir::SourceLoc l, const Expression* delay_expr = nullptr) {
+        const ir::Index lv = gate_bit_lvalue(output.sig, output.bit, b, l);
+        if (delay_expr != nullptr) {
+            b.store_inertial_delay(lv, val, scaled_delay(*delay_expr, b), l);
+        } else {
+            b.binary(ir::Inst::Tag::Store, lv, val, l);
+        }
         add_continuous_process(std::move(wait_events), l, b);
     }
 
