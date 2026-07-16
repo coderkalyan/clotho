@@ -157,6 +157,8 @@ const char* tag_name(Inst::Tag tag) {
             return "queue_copy";
         case T::QueueCopyNb:
             return "queue_copy_nb";
+        case T::QueueCopyDyn:
+            return "queue_copy_dynarr";
         case T::QueueAppendRange:
             return "queue_append_range";
         case T::DynArrayReverse:

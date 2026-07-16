@@ -6553,6 +6553,12 @@ private:
                                                    llvm::ConstantInt::get(i32, 0), "clotho.active_head");
         active_tail_gv_ = new llvm::GlobalVariable(env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
                                                    llvm::ConstantInt::get(i32, 0), "clotho.active_tail");
+        // Count of process activations at the current time instant. Reset when the
+        // wheel advances time; a runaway count means a zero-delay oscillation the
+        // scheduler cannot converge, caught in the drain loop (rt_oscillation_abort).
+        auto* i64      = llvm::Type::getInt64Ty(ctx_);
+        osc_count_gv_  = new llvm::GlobalVariable(env_->llmod, i64, false, llvm::GlobalValue::InternalLinkage,
+                                                  llvm::ConstantInt::get(i64, 0), "clotho.osc_count");
     }
 
     // The inactive queue: same shape and capacity as the active queue, holding
@@ -6753,6 +6759,14 @@ private:
     // handle onto the active queue rather than resuming inline. Control then loops
     // back to drain the queue, so a whole time-instant's worth of woken processes
     // runs together. Repeat until no timers remain.
+    // Max process activations at a single time instant before the drain is
+    // declared a non-converging zero-delay oscillation and aborted. Far above any
+    // real single-instant settle wave (clotho's largest benches settle in well
+    // under 500k activations per timestep — combchain ~400k), with a ~25x margin,
+    // so it never trips on legitimate designs; low enough to abort in a few
+    // seconds (before a typical test-harness timeout mistakes it for a hang).
+    static constexpr uint64_t kOscillationLimit = 10'000'000;
+
     void emit_active_run(llvm::Value* state, llvm::Value* wheel, const std::vector<llvm::Function*>& procs) {
         ensure_active_queue();
         auto* ptr_ty        = llvm::PointerType::getUnqual(ctx_);
@@ -6774,6 +6788,7 @@ private:
         // the drain.
         b_.CreateStore(b_.getInt32(0), sym(active_head_gv_));
         b_.CreateStore(b_.getInt32(0), sym(active_tail_gv_));
+        b_.CreateStore(b_.getInt64(0), sym(osc_count_gv_));
         const bool has_inactive = inactive_gv_ != nullptr; // some #0 was lowered
         if (has_inactive) {
             b_.CreateStore(b_.getInt32(0), sym(inactive_top_gv_));
@@ -6916,6 +6931,23 @@ private:
         b_.CreateCondBr(b_.CreateICmpNE(hd, tl), body, icheck);
 
         b_.SetInsertPoint(body);
+        // Zero-delay oscillation guard: count activations at the current instant
+        // (reset when the wheel advances). A design whose active queue never drains
+        // at one time step (two `always @*` writing a shared variable each is
+        // sensitive to, LRM 9.4.2.2) would hang forever; past the limit, abort loud.
+        // The limit is far above any real single-instant settle wave.
+        {
+            auto* osc_ok    = llvm::BasicBlock::Create(ctx_, "active.osc_ok", fn);
+            auto* osc_abort = llvm::BasicBlock::Create(ctx_, "active.osc_abort", fn);
+            auto* i64       = b_.getInt64Ty();
+            llvm::Value* n  = b_.CreateAdd(b_.CreateLoad(i64, sym(osc_count_gv_)), b_.getInt64(1));
+            b_.CreateStore(n, sym(osc_count_gv_));
+            b_.CreateCondBr(b_.CreateICmpUGT(n, b_.getInt64(kOscillationLimit)), osc_abort, osc_ok);
+            b_.SetInsertPoint(osc_abort);
+            b_.CreateCall(oscillation_abort_fn(), { b_.CreateCall(wheel_now_fn(), { wheel }) });
+            b_.CreateUnreachable();
+            b_.SetInsertPoint(osc_ok);
+        }
         b_.CreateStore(b_.CreateAdd(hd, b_.getInt32(1)), sym(active_head_gv_));
         llvm::Value* idx  = b_.CreateAnd(hd, b_.getInt32(active_mask_));
         llvm::Value* slot = b_.CreateInBoundsGEP(queue_arr_ty_, sym(active_gv_), { b_.getInt32(0), idx });
@@ -7130,6 +7162,8 @@ private:
         // wheel: coroutine-timer trampolines ignore it, but a detached `->> #d e`
         // on-expiry thunk reads the current time from it (build_delay_event_thunks).
         llvm::Value* ticked = b_.CreateCall(wheel_advance_fn(), { wheel, wheel });
+        // Time advanced: a new instant begins, so reset the oscillation counter.
+        b_.CreateStore(b_.getInt64(0), sym(osc_count_gv_));
         b_.CreateCondBr(b_.CreateICmpNE(ticked, b_.getInt32(0)), check, wdone);
 
         b_.SetInsertPoint(wtick); // unreachable now; kept so block wiring stays valid
@@ -7333,6 +7367,11 @@ private:
     }
     // void rt_queue_assign(rt_queue* dst, const rt_queue* src, i64 stride)
     // void rt_queue_assign(rt_queue*, const rt_queue*, const rt_elem_ops*)
+    llvm::FunctionCallee queue_assign_dynarr_fn() {
+        return rt_fn("rt_queue_assign_dynarr", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
+    }
+
     llvm::FunctionCallee queue_assign_fn() {
         return rt_fn("rt_queue_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
@@ -7522,6 +7561,10 @@ private:
     llvm::FunctionCallee wheel_deinit_fn() {
         return rt_fn("rt_wheel_deinit", b_.getVoidTy(), { raw_ptr_ty() });
     }
+    llvm::FunctionCallee oscillation_abort_fn() {
+        return rt_fn("rt_oscillation_abort", b_.getVoidTy(), { b_.getInt64Ty() });
+    }
+
     llvm::FunctionCallee wheel_now_fn() {
         return rt_fn("rt_wheel_now", b_.getInt64Ty(), { raw_ptr_ty() });
     }
@@ -8092,6 +8135,7 @@ private:
             case Inst::Tag::QueueDeleteAll:
             case Inst::Tag::QueueCopy:
             case Inst::Tag::QueueCopyNb:
+            case Inst::Tag::QueueCopyDyn:
             case Inst::Tag::QueueAppendRange:
                 // size() is a definite 2-state int; the rest are statements
                 // whose type is never queried.
@@ -9048,6 +9092,9 @@ private:
                 return;
             case Inst::Tag::QueueCopy:
                 lower_queue_copy(i);
+                return;
+            case Inst::Tag::QueueCopyDyn:
+                lower_queue_copy_dynarr(i);
                 return;
             case Inst::Tag::QueueCopyNb:
                 emit_queue_whole_nba(i);
@@ -10270,6 +10317,16 @@ private:
         const auto& p  = ir_->payload(i).op_extra;
         const auto  qa = ir_->extra_data<QueueArg>(p.extra);
         b_.CreateCall(queue_assign_fn(),
+                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qa.arg)),
+                        elem_ops_global(qa.queue_type) });
+    }
+
+    // q = d: deep copy a dynamic array (arg) into a queue (op). Source handle is
+    // an rt_dynarr, so this routes to rt_queue_assign_dynarr, not rt_queue_assign.
+    void lower_queue_copy_dynarr(Index i) {
+        const auto& p  = ir_->payload(i).op_extra;
+        const auto  qa = ir_->extra_data<QueueArg>(p.extra);
+        b_.CreateCall(queue_assign_dynarr_fn(),
                       { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qa.arg)),
                         elem_ops_global(qa.queue_type) });
     }
@@ -15078,6 +15135,11 @@ private:
             bool         first = true;
             for (Index part : parts) {
                 const uint32_t pw = type_of(part).width;
+                // Skip a zero-width part ({0{x}}): it contributes no bits and would
+                // make the next part shift by the full result width (poison).
+                if (pw == 0) {
+                    continue;
+                }
                 if (!first) {
                     acc = b_.CreateShl(acc, pw);
                 }
@@ -15098,7 +15160,12 @@ private:
         bool first = true;
         for (Index part : parts) {
             const uint32_t pw = type_of(part).width;
-            const Plane    pv = value_of(part);
+            // Skip a zero-width part ({0{x}}): it contributes no bits and would
+            // make the next part shift by the full result width (poison).
+            if (pw == 0) {
+                continue;
+            }
+            const Plane pv = value_of(part);
             if (!first) {
                 must = b_.CreateShl(must, pw);
                 may  = b_.CreateShl(may, pw);
@@ -15515,6 +15582,7 @@ private:
     llvm::GlobalVariable*               active_gv_         = nullptr;
     llvm::GlobalVariable*               active_head_gv_    = nullptr;
     llvm::GlobalVariable*               active_tail_gv_    = nullptr;
+    llvm::GlobalVariable*               osc_count_gv_      = nullptr;
     llvm::GlobalVariable*               inactive_gv_       = nullptr;
     llvm::GlobalVariable*               inactive_top_gv_   = nullptr;
     llvm::ArrayType*                    queue_arr_ty_      = nullptr;

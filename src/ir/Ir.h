@@ -935,6 +935,11 @@ struct Inst {
         // of src in the Active region; the NBA region moves it into dst (LRM
         // 7.10 / 10.4.2).
         QueueCopyNb,
+        // q = d: deep copy of a dynamic array into a queue (LRM 7.10; payload:
+        // op_extra -> QueueArg, whose arg is the SOURCE dynarray handle lvalue,
+        // op is the destination queue handle lvalue). Distinct from QueueCopy
+        // because the source is an rt_dynarr, not an rt_queue.
+        QueueCopyDyn,
         // Append src[lo:hi] onto the dst handle (payload: op_extra ->
         // QueueSliceInfo; op is the dst handle lvalue), materializing a queue
         // slice or a queue-typed concatenation operand (LRM 7.10.4).
@@ -1830,6 +1835,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::QueueDeleteIdx:
         case T::QueueCopy:
         case T::QueueCopyNb:
+        case T::QueueCopyDyn:
         case T::QueueAppendRange:
         case T::AssocSelect:
         case T::AssocExists:

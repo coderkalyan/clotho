@@ -275,6 +275,12 @@ Index Builder::queue_copy_nb(Index dst, Index src, Ref queue_type, SourceLoc loc
     return emit({ Inst::Tag::QueueCopyNb, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
 }
 
+Index Builder::queue_copy_dynarr(Index dst, Index src, Ref queue_type, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(QueueArg{ src, queue_type });
+
+    return emit({ Inst::Tag::QueueCopyDyn, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+}
+
 Index Builder::queue_append_range(Index dst, Index src, Index lo, Index hi, Ref queue_type,
                                   SourceLoc loc) {
     const ExtraIndex extra = add_extra(QueueSliceInfo{ src, lo, hi, queue_type });

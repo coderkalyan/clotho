@@ -485,6 +485,21 @@ bool has_observable_effect(const slang::ast::Expression& e) {
     return d.found;
 }
 
+// Detects whether an expression reads any symbol in a given set (used to find
+// frame-local / formal-argument references in an event operand).
+struct LocalRefDetector : ASTVisitor<LocalRefDetector, VisitFlags::AllGood> {
+    const ankerl::unordered_dense::map<const slang::ast::ValueSymbol*, uint32_t>* locals;
+    bool                                                                          found = false;
+
+    void check(const slang::ast::ValueSymbol& sym) {
+        if (locals->contains(&sym)) {
+            found = true;
+        }
+    }
+    void handle(const NamedValueExpression& nv) { check(nv.symbol); }
+    void handle(const HierarchicalValueExpression& hv) { check(hv.symbol); }
+};
+
 // Walks the elaborated AST of one top module into an ir::Module.
 class Lowerer {
 public:
@@ -4007,6 +4022,22 @@ private:
     // internal signal of the expression's type, driven by a self-starting
     // continuous process sensitive to the expression's reads (LRM 4.9.1).
     ir::Signal synth_event_net(const Expression& e) {
+        // A synthesized event net is a module-level continuous process with no
+        // frame. If the operand references a frame-local (a task/function formal
+        // or automatic var, e.g. `@(posedge ack[p])` with `p` a task argument),
+        // the lowered IR would embed a Tag::Local into a frameless process and
+        // SIGSEGV in the backend. Reject loudly until frame-local event operands
+        // are supported (would need the index value captured at wait time).
+        if (fn_ctx_ != nullptr) {
+            LocalRefDetector d;
+            d.locals = &fn_ctx_->localmap;
+            e.visit(d);
+            if (d.found) {
+                fail("event control on an expression that reads a local variable / "
+                     "formal argument (e.g. a variable bit-select `@(posedge ack[p])` "
+                     "inside a task) is not supported");
+            }
+        }
         const ir::Ref      ty  = lower_type(*e.type);
         const ir::Signal   tmp = declare_temp(ty, "event");
         const ir::SourceLoc l  = loc(e);
@@ -8287,6 +8318,27 @@ private:
         const ir::SourceLoc l   = loc(a);
         const ir::Index     dst = lower_lvalue(a.left(), b);
         const ir::Ref       qty = lower_type(*a.left().type);
+        // q = d: whole dynamic-array-into-queue copy (LRM 7.10). The source is an
+        // rt_dynarr handle, not an rt_queue, so it takes its own runtime path
+        // (feeding a dynarr handle to rt_queue_assign reads past the struct and
+        // runs away). An empty source clears the queue to size 0.
+        const Expression& rhs = unwrap_conversion(a.right());
+        if (is_dyn_array(rhs)) {
+            if (rhs.kind != ExpressionKind::NamedValue &&
+                rhs.kind != ExpressionKind::HierarchicalValue) {
+                // TODO: queue = <dynamic-array rvalue> where the source is not a
+                // plain variable (a call result, slice, etc.) — needs the source
+                // materialized into a temp dynarray handle first.
+                fail("queue assignment from this dynamic-array expression is not supported");
+            }
+            if (a.isNonBlocking()) {
+                // TODO: nonblocking q <= d whole copy from a dynamic array (needs
+                // a dynarr-source staging path in the NBA region).
+                fail("nonblocking queue assignment from a dynamic array is not supported");
+            }
+            b.queue_copy_dynarr(dst, lower_lvalue(rhs, b), qty, l);
+            return dst;
+        }
         const ir::Index     src = materialize_queue_rvalue(a.right(), b);
         if (a.isNonBlocking()) {
             // Whole-queue NBA: stage a deep copy now, move it into dst in the NBA
@@ -10036,6 +10088,12 @@ private:
         uint32_t ret_local     = 0;
         ir::Ref  ret_type      = ir::Ref::Invalid;
         bool     has_ret_local = false;
+        // A non-automatic (static-lifetime) function's return variable persists
+        // across calls (LRM 13.4.2): it gets a persistent module-signal, not a
+        // frame Local, so a queue built by successive calls accumulates. When set,
+        // ret_sig holds that signal and the return operand is its signal lvalue.
+        bool       ret_is_static = false;
+        ir::Signal ret_sig       = static_cast<ir::Signal>(0);
         // Name qualifier (e.g. "f.") prepended to a static local's signal name so
         // same-named statics in different functions stay distinct.
         std::string name_prefix;
@@ -10176,10 +10234,10 @@ private:
             // an aggregate / whole array / dynamic array yields its lvalue (copied
             // out by the backend), else the loaded value.
             if (is_agg_abi_ref(fn_ctx_->ret_type)) {
-                b.unary(ir::Inst::Tag::Ret, b.local(fn_ctx_->ret_local, fn_ctx_->ret_type, l), l);
+                b.unary(ir::Inst::Tag::Ret, ret_var_ref(*fn_ctx_, l, b), l);
                 return;
             }
-            const ir::Index rv = b.local(fn_ctx_->ret_local, fn_ctx_->ret_type, l);
+            const ir::Index rv = ret_var_ref(*fn_ctx_, l, b);
             b.unary(ir::Inst::Tag::Ret,
                     is_handle_ref(fn_ctx_->ret_type) ? rv : b.unary(ir::Inst::Tag::Load, rv, l), l);
         } else {
@@ -10702,6 +10760,15 @@ private:
         return id;
     }
 
+    // The return variable's lvalue: a persistent signal for a static-lifetime
+    // (non-automatic) function, else the per-call frame Local.
+    ir::Index ret_var_ref(FnCtx& ctx, ir::SourceLoc l, ir::Builder& b) {
+        if (ctx.ret_is_static) {
+            return b.signal(ctx.ret_sig, l);
+        }
+        return b.local(ctx.ret_local, ctx.ret_type, l);
+    }
+
     // Lower one function body into the reserved slot. (Ir has no default ctor and
     // is not assignable, so every field is built locally and the Function is
     // constructed once, at the end.)
@@ -10753,7 +10820,16 @@ private:
             }
             ctx.has_ret_local = true;
             ctx.ret_type      = return_type;
-            ctx.ret_local     = fn_local(*sub.returnValVar);
+            if (sub.defaultLifetime == slang::ast::VariableLifetime::Static) {
+                // Static-lifetime return var: persistent signal storage (references
+                // in the body resolve to it via value_lvalue -> signal_of, since it
+                // is not placed in localmap), power-on-initialized once and never
+                // freed at body exit, so it accumulates across calls.
+                ctx.ret_is_static = true;
+                ctx.ret_sig       = declare_static_local(*sub.returnValVar);
+            } else {
+                ctx.ret_local = fn_local(*sub.returnValVar);
+            }
         }
 
         lower_stmt(sub.getBody(), b);
@@ -10765,10 +10841,15 @@ private:
         if (is_void) {
             b.ret_void(el);
         } else if (is_agg_abi_type(sub.returnValVar->getType())) {
-            b.unary(ir::Inst::Tag::Ret, b.local(ctx.ret_local, ctx.ret_type, el), el);
+            b.unary(ir::Inst::Tag::Ret, ret_var_ref(ctx, el, b), el);
         } else {
-            const ir::Index rv = b.local(ctx.ret_local, ctx.ret_type, el);
-            b.unary(ir::Inst::Tag::Ret, b.unary(ir::Inst::Tag::Load, rv, el), el);
+            // A dynamic-array/queue/assoc result is returned as its handle lvalue
+            // (the backend deep-copies it out); mirrors the explicit-`return;` path
+            // in lower_return. Without this a queue return lowers to Ret(Load(handle)),
+            // an uninitialized-lvalue read that SIGSEGVs in emit_handle_assign.
+            const ir::Index rv = ret_var_ref(ctx, el, b);
+            b.unary(ir::Inst::Tag::Ret,
+                    is_handle_ref(ctx.ret_type) ? rv : b.unary(ir::Inst::Tag::Load, rv, el), el);
         }
 
         module_.set_function(id, ir::Function{ .name        = std::string(sub.name),

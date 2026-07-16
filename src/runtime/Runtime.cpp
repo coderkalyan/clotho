@@ -1428,6 +1428,33 @@ extern "C" void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_ele
     dst->cap  = src->len;
 }
 
+// Deep-copy a dynamic array into a queue (LRM 7.10 assignment compatibility):
+// `q = d`. The source is an rt_dynarr (contiguous {data,len}), NOT an rt_queue,
+// so it cannot go through rt_queue_assign, whose struct layout differs. An empty
+// source clears the queue to size 0.
+extern "C" void rt_queue_assign_dynarr(rt_queue* dst, const rt_dynarr* src,
+                                       const rt_elem_ops* ops) {
+    rt_queue_delete_all(dst, ops);
+    if (src->len == 0) {
+        return;
+    }
+    const uint64_t stride = ops->stride;
+    const auto*    sdata  = static_cast<const uint8_t*>(src->data);
+    auto* buf = static_cast<uint8_t*>(std::malloc(static_cast<size_t>(src->len * stride)));
+    if (ops->kind == rt_elem_pod) {
+        std::memcpy(buf, sdata, static_cast<size_t>(src->len * stride));
+    } else {
+        for (uint64_t i = 0; i < src->len; ++i) {
+            rt_elem_init(ops, buf + i * stride);
+            rt_elem_copy(ops, buf + i * stride, sdata + i * stride);
+        }
+    }
+    dst->base = buf;
+    dst->head = 0;
+    dst->len  = src->len;
+    dst->cap  = src->len;
+}
+
 extern "C" void rt_queue_append_range(rt_queue* dst, const rt_queue* src,
                                       const rt_elem_ops* ops, uint64_t bound, int64_t lo,
                                       int64_t hi) {
@@ -2593,6 +2620,26 @@ extern "C" void rt_finish(const char* banner, uint64_t now, int32_t arg) {
         std::longjmp(*finish_env, 1);
     }
     std::exit(0);
+}
+
+extern "C" void rt_oscillation_abort(uint64_t now) {
+    // A single time step activated more than the delta-cycle limit of processes
+    // without settling: a zero-delay oscillation the scheduler cannot converge
+    // (e.g. two `always @*` blocks writing a shared variable each is sensitive
+    // to). clotho's per-store wake semantics do not coalesce transient writes the
+    // way a net-change scheduler would, so such a design fails to converge.
+    // Terminate loudly instead of hanging (a diagnostic, not a design value).
+    std::fflush(stdout);
+    std::string line = "FATAL: simulation did not converge at ";
+    append_finish_time(line, now);
+    line += " (zero-delay oscillation: delta-cycle activation limit exceeded)\n";
+    std::fputs(line.c_str(), stderr);
+    std::fflush(stderr);
+    rt_vcd_close();
+    if (finish_env != nullptr) {
+        std::longjmp(*finish_env, 1);
+    }
+    std::exit(1);
 }
 
 extern "C" void rt_case_violation(const char* banner, uint64_t now, int32_t kind) {

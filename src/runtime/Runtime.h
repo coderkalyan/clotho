@@ -109,6 +109,11 @@ void rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uin
 // unique0 overlap). Fires once per dynamic execution that detects the violation.
 void rt_case_violation(const char* banner, uint64_t now, int32_t kind);
 
+// Zero-delay oscillation guard: a single time instant activated more than the
+// delta-cycle limit of processes without the active queue draining. Prints a
+// FATAL diagnostic and ends the simulation (never returns).
+[[noreturn]] void rt_oscillation_abort(uint64_t now);
+
 // Report a severity system task ($info / $warning / $error / $fatal, LRM 20.10)
 // or an immediate-assertion default failure (LRM 16.3). Renders the $display-
 // style message (`fmt` + `argc` `argv`, empty for a bare `$error;`) and writes
@@ -574,6 +579,7 @@ void rt_queue_delete_all(rt_queue* h, const rt_elem_ops* ops);
 // dst = src: deep copy `src`'s elements into `dst`, linearised so dst->head
 // == 0 (value semantics, LRM §7.10). A no-op when dst == src.
 void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_elem_ops* ops);
+void rt_queue_assign_dynarr(rt_queue* dst, const rt_dynarr* src, const rt_elem_ops* ops);
 
 // Move `src`'s buffer into `dst` (ownership transfer, LRM 7.10): destroy `dst`'s
 // elements + buffer, take `src`'s, leave `src` empty. The nonblocking-assignment
