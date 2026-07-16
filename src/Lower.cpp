@@ -664,6 +664,7 @@ private:
         const bool driver_pass = pass != Pass::Collect;
         cur_pass_               = pass;
         for (const Symbol& m : scope.members()) {
+            cur_loc_ = m.location;
             switch (m.kind) {
                 case SymbolKind::ContinuousAssign:
                     if (driver_pass) lower_continuous_assign(m.as<ContinuousAssignSymbol>());
@@ -886,7 +887,16 @@ private:
         return name;
     }
 
+    // Source location of the construct currently being lowered, tracked at the
+    // statement / expression / member-declaration dispatch boundaries so an
+    // unsupported-construct guard can point the user at the offending line
+    // without every one of the ~290 `fail` sites threading a location by hand.
+    slang::SourceLocation cur_loc_{};
+
     [[noreturn]] void fail(std::string msg) {
+        if (cur_loc_ && scope_ != nullptr) {
+            msg = banner_at(cur_loc_) + msg;
+        }
         throw LowerError{ std::move(msg) };
     }
 
@@ -2168,6 +2178,7 @@ private:
                 continue;
             }
             const auto& vs = m.as<VariableSymbol>();
+            cur_loc_       = vs.location;
 
             ir::SignalInfo info;
             info.name     = std::string(vs.name);
@@ -2208,6 +2219,7 @@ private:
                 case SymbolKind::Net:
                 case SymbolKind::Variable: {
                     const ValueSymbol& vs = m.as<ValueSymbol>();
+                    cur_loc_              = vs.location;
 
                     ir::SignalInfo info;
                     if (m.kind == SymbolKind::Net) {
@@ -4185,6 +4197,7 @@ private:
     // -- Statements --
 
     void lower_stmt(const Statement& stmt, ir::Builder& b) {
+        cur_loc_ = stmt.sourceRange.start();
         switch (stmt.kind) {
             case StatementKind::List:
                 for (const Statement* s : stmt.as<StatementList>().list) {
@@ -8680,6 +8693,7 @@ private:
 
     // Lower an expression as an rvalue, returning the SSA value index.
     ir::Index lower_expr(const Expression& expr, ir::Builder& b) {
+        cur_loc_              = expr.sourceRange.start();
         const ir::SourceLoc l = loc(expr);
         switch (expr.kind) {
             case ExpressionKind::IntegerLiteral:
