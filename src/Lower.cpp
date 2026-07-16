@@ -50,6 +50,7 @@
 #include <slang/ast/Scope.h>
 #include <slang/analysis/AnalysisManager.h>
 #include <slang/diagnostics/AnalysisDiags.h>
+#include <slang/diagnostics/DeclarationsDiags.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/diagnostics/LookupDiags.h>
 #include <slang/diagnostics/TextDiagnosticClient.h>
@@ -11450,6 +11451,12 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
         // silently favoring whichever declaration slang's lookup resolves to.
         engine.setSeverity(slang::diag::Redefinition, slang::DiagnosticSeverity::Error);
         engine.setSeverity(slang::diag::RedefinitionDifferentType, slang::DiagnosticSeverity::Error);
+        // An out-of-block member declaration (extern method / prototype) whose
+        // implementation is never found in the parent scope: slang defaults
+        // this to a warning and elaborates the design without the body. Clotho
+        // would then lower a call to a member with no lowered implementation,
+        // so promote to an error rather than silently accepting the gap.
+        engine.setSeverity(slang::diag::MemberImplNotFound, slang::DiagnosticSeverity::Error);
         for (const slang::Diagnostic& d : diags) {
             engine.issue(d);
         }
