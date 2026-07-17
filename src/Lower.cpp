@@ -1439,14 +1439,6 @@ private:
                 // TODO: virtual task dispatch (coroutine callee through the vtable).
                 fail("virtual task is not supported");
             }
-            const ir::Ref rt = lower_type(m.getReturnType());
-            if (is_agg_abi_ref(rt) || is_handle_ref(rt) ||
-                m.getReturnType().getCanonicalType().isString()) {
-                // TODO: virtual method returning an aggregate / string / container
-                // (the call-temp scanners do not yet cover CallVirtual).
-                fail("virtual method with an aggregate / string / container return "
-                     "is not supported");
-            }
             const auto& root = root_introducer(m);
             if (!virtual_slot_.contains(&root)) {
                 virtual_slot_[&root] = size++;

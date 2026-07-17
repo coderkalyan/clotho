@@ -421,6 +421,46 @@ TEST_CASE("class virtual dispatch: derived-introduced virtual, multi-slot") {
     CHECK(run_capture(src) == "2 20\n");
 }
 
+TEST_CASE("class virtual dispatch: string return") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Base;    virtual function string name(); return "base";    endfunction endclass
+            class Derived extends Base;
+                virtual function string name(); return "derived"; endfunction
+            endclass
+            initial begin
+                Base b;
+                Derived d = new();
+                b = new(); $display("%s", b.name());
+                b = d;     $display("%s", b.name());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "base\nderived\n");
+}
+
+TEST_CASE("class virtual dispatch: unpacked struct return") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int x; int y; } pt;
+            class Base;
+                virtual function pt origin(); pt p; p.x = 0; p.y = 0; return p; endfunction
+            endclass
+            class Shifted extends Base;
+                virtual function pt origin(); pt p; p.x = 10; p.y = 20; return p; endfunction
+            endclass
+            initial begin
+                Base    b;
+                Shifted s = new();
+                pt      r;
+                b = new(); r = b.origin(); $display("%0d %0d", r.x, r.y);
+                b = s;     r = b.origin(); $display("%0d %0d", r.x, r.y);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "0 0\n10 20\n");
+}
+
 // A virtual task needs coroutine dispatch through the vtable (deferred); it must
 // fail loudly rather than silently lower as a direct call.
 TEST_CASE("class virtual task fails loudly") {

@@ -2153,6 +2153,11 @@ private:
                 } else if (ir.tag(idx) == Inst::Tag::Call) {
                     const auto ci = ir.extra_data<CallInfo>(ir.payload(idx).extra);
                     mark(ir, ci.func, ci.args);
+                } else if (ir.tag(idx) == Inst::Tag::CallVirtual) {
+                    // A virtual call marshals args identically; the resolved method's
+                    // arg_dirs (shared by every override) drive the by-pointer set.
+                    const auto vci = ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra);
+                    mark(ir, vci.func, vci.args);
                 }
             }
         };
@@ -3100,6 +3105,9 @@ private:
             } else if (ir.tag(idx) == Inst::Tag::Call) {
                 const auto ci = ir.extra_data<CallInfo>(ir.payload(idx).extra);
                 mark_packed_args(ci.func, ci.args);
+            } else if (ir.tag(idx) == Inst::Tag::CallVirtual) {
+                const auto vci = ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra);
+                mark_packed_args(vci.func, vci.args);
             }
         }
         return out;
@@ -4735,6 +4743,7 @@ private:
                 case Inst::Tag::StoreNbEvent:
                     return CombFuse::NbaWrite;
                 case Inst::Tag::Call:
+                case Inst::Tag::CallVirtual:
                     return CombFuse::HasCall;
                 default:
                     return CombFuse::ImpureOp;
@@ -4859,7 +4868,8 @@ private:
                 } else {
                     put(&pl, sizeof(pl));
                 }
-                calls = calls || tag == Inst::Tag::Call || tag == Inst::Tag::TaskCall;
+                calls = calls || tag == Inst::Tag::Call || tag == Inst::Tag::CallVirtual ||
+                        tag == Inst::Tag::TaskCall;
                 extra_sig = extra_sig || tag == Inst::Tag::Wait || tag == Inst::Tag::StoreNbEvent ||
                             tag == Inst::Tag::ReadMem || tag == Inst::Tag::FreadMem ||
                             tag == Inst::Tag::EventTriggerNbDelayed;
@@ -8622,6 +8632,7 @@ private:
             case Inst::Tag::Concat:
             case Inst::Tag::Repl:
             case Inst::Tag::Call:
+            case Inst::Tag::CallVirtual:
             // A pop of a string-element queue relocates the element into the
             // instruction's own temp handle (lower_queue_pop).
             case Inst::Tag::QueuePopBack:
@@ -8673,6 +8684,14 @@ private:
     // deinit_body_strings at the body's exits. A concat consumed by an adjacent
     // forwarded store gets the store target's handle instead of a temp (never
     // init'd — the target already holds a live string).
+    // The callee's (statically-resolved) FunctionId for a Call or CallVirtual — its
+    // signature / return type, shared by every override of a virtual method.
+    FunctionId call_func_id(Index i) const {
+        return ir_->tag(i) == Inst::Tag::CallVirtual
+                   ? ir_->extra_data<VirtualCallInfo>(ir_->payload(i).extra).func
+                   : ir_->extra_data<CallInfo>(ir_->payload(i).extra).func;
+    }
+
     void build_str_temps() {
         str_temp_list_.clear();
         for (size_t k = 0; k < ir_->inst_count(); ++k) {
@@ -8706,11 +8725,10 @@ private:
         dynarr_ret_.assign(ir_->inst_count(), nullptr);
         for (size_t k = 0; k < ir_->inst_count(); ++k) {
             const auto i = static_cast<Index>(k);
-            if (ir_->tag(i) != Inst::Tag::Call) {
+            if (ir_->tag(i) != Inst::Tag::Call && ir_->tag(i) != Inst::Tag::CallVirtual) {
                 continue;
             }
-            const auto ci  = ir_->extra_data<CallInfo>(ir_->payload(i).extra);
-            const Ref  rty = mod_.function(ci.func).return_type;
+            const Ref rty = mod_.function(call_func_id(i)).return_type;
             if (!is_handle_type(rty)) {
                 continue;
             }
