@@ -505,17 +505,89 @@ TEST_CASE("abstract class: concrete virtual dispatch through the base") {
     CHECK(run_capture(src) == "25 1 26\n12 0 12\n");
 }
 
-// A pure virtual method (LRM 8.21) is a MethodPrototypeSymbol whose override link
-// slang does not populate; dispatch support is deferred and must fail loudly.
-TEST_CASE("class pure virtual method fails loudly") {
+TEST_CASE("pure virtual: dispatch through the abstract base, no args") {
+    constexpr std::string_view src = R"(
+        module m;
+            virtual class Shape;
+                pure virtual function int area();
+                virtual function int kind(); return 0; endfunction
+                function int describe(); return area() + kind(); endfunction
+            endclass
+            class Square extends Shape;
+                int s;
+                function new(int side); s = side; endfunction
+                virtual function int area(); return s * s; endfunction
+                virtual function int kind(); return 1; endfunction
+            endclass
+            class Circle extends Shape;
+                int r;
+                function new(int rad); r = rad; endfunction
+                virtual function int area(); return 3 * r * r; endfunction
+            endclass
+            initial begin
+                Shape  sh;
+                Square sq = new(5);
+                Circle ci = new(2);
+                sh = sq; $display("%0d %0d %0d", sh.area(), sh.kind(), sh.describe());
+                sh = ci; $display("%0d %0d %0d", sh.area(), sh.kind(), sh.describe());
+            end
+        endmodule
+    )";
+    // Square: area 25, kind 1, describe 26. Circle: area 12, kind inherited 0, describe 12.
+    CHECK(run_capture(src) == "25 1 26\n12 0 12\n");
+}
+
+TEST_CASE("pure virtual: dispatch with arguments") {
+    constexpr std::string_view src = R"(
+        module m;
+            virtual class Op;
+                pure virtual function int apply(int a, int b);
+                function int twice(int x); return apply(x, x); endfunction
+            endclass
+            class Add extends Op; virtual function int apply(int a, int b); return a + b; endfunction endclass
+            class Mul extends Op; virtual function int apply(int a, int b); return a * b; endfunction endclass
+            initial begin
+                Op  o;
+                Add a = new();
+                Mul mm = new();
+                o = a;  $display("%0d %0d", o.apply(3, 4), o.twice(5));
+                o = mm; $display("%0d %0d", o.apply(3, 4), o.twice(5));
+            end
+        endmodule
+    )";
+    // Add: 3+4=7, twice(5)=5+5=10. Mul: 3*4=12, twice(5)=5*5=25.
+    CHECK(run_capture(src) == "7 10\n12 25\n");
+}
+
+TEST_CASE("pure virtual: multi-level abstract, implicit override") {
+    constexpr std::string_view src = R"(
+        module m;
+            virtual class A; pure virtual function int v(); endclass
+            virtual class B extends A; virtual function int w(); return 100; endfunction endclass
+            class C extends B; function int v(); return 7; endfunction endclass
+            initial begin
+                A a;
+                B b;
+                C c = new();
+                a = c; $display("%0d", a.v());
+                b = c; $display("%0d %0d", b.v(), b.w());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "7\n7 100\n");
+}
+
+// A pure virtual returning a non-scalar needs the aggregate/handle return ABI in
+// the never-called signature stub (deferred); it must fail loudly.
+TEST_CASE("pure virtual with non-scalar return fails loudly") {
     const std::string d = fails(R"(
         module m;
-            virtual class Base; pure virtual function int f(); endclass
-            class Derived extends Base; function int f(); return 1; endfunction endclass
-            initial begin Derived d; d = new(); $display("%0d", d.f()); end
+            virtual class Base; pure virtual function string name(); endclass
+            class Derived extends Base; function string name(); return "d"; endfunction endclass
+            initial begin Derived dd; dd = new(); $display("%s", dd.name()); end
         endmodule
     )");
-    CHECK(d.find("pure virtual methods are not supported") != std::string::npos);
+    CHECK(d.find("pure virtual method with a non-scalar return is not supported") != std::string::npos);
 }
 
 // Two classes forward-referencing each other's handle type: A's field type B

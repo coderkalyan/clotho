@@ -1388,93 +1388,181 @@ private:
         return ref;
     }
 
-    // The base-most declaration of a virtual method (the class that first
-    // introduced its slot): follow the override chain to the root.
-    static const slang::ast::SubroutineSymbol& root_introducer(
-        const slang::ast::SubroutineSymbol& m) {
-        const slang::ast::SubroutineSymbol* r = &m;
-        while (r->getOverride() != nullptr) {
-            r = r->getOverride();
-        }
-        return *r;
-    }
-
     // True if `m` is a user-declared virtual method (LRM 8.20) — excludes slang's
     // built-in virtual `randomize` (MethodFlags::BuiltIn), not a dispatch target.
     static bool is_user_virtual(const slang::ast::SubroutineSymbol& m) {
         return m.isVirtual() && !m.flags.has(slang::ast::MethodFlags::BuiltIn);
     }
 
-    // Assign vtable slots and register the dispatch table of a class (LRM 8.20).
-    // Slots are numbered per hierarchy: a base's virtuals take slots 0..k-1, an
-    // override reuses its root introducer's slot, a new virtual appends. The
-    // concrete table maps each slot to the most-derived override visible in `clt`.
-    // A class with no virtual method in its hierarchy gets no table (and thus no
-    // object-body vtable header). Called from lower_class_type after the base is
-    // lowered, so base slot numbers already exist.
-    void compute_vtable(const slang::ast::ClassType& clt, ir::Ref class_ref) {
-        // A pure virtual method (LRM 8.21) is a MethodPrototypeSymbol (no body), not
-        // a SubroutineSymbol, and slang does not link a concrete override back to it
-        // via getOverride() — so the root-introducer slot identity below does not
-        // reach it. Guard loud until pure-virtual support (the prototype slot +
-        // bodiless stub) lands.
-        for (const auto& proto : clt.membersOfType<slang::ast::MethodPrototypeSymbol>()) {
-            if (proto.flags.has(slang::ast::MethodFlags::Pure)) {
-                // TODO: pure virtual methods (abstract-class dispatch slot).
-                fail("pure virtual methods are not supported");
+    // Canonical base class of `clt`, or null for a root class.
+    static const slang::ast::ClassType* base_class_of(const slang::ast::ClassType& clt) {
+        return clt.getBaseClass() != nullptr
+                   ? &clt.getBaseClass()->getCanonicalType().as<slang::ast::ClassType>()
+                   : nullptr;
+    }
+
+    // The pure-virtual prototype named `name` reachable in `clt`'s hierarchy (LRM
+    // 8.21), or null. Used to build a stub for an abstract class's un-overridden
+    // slot.
+    static const slang::ast::MethodPrototypeSymbol* find_pure_proto(
+        const slang::ast::ClassType& clt, std::string_view name) {
+        for (const slang::ast::ClassType* k = &clt; k != nullptr; k = base_class_of(*k)) {
+            for (const auto& p : k->membersOfType<slang::ast::MethodPrototypeSymbol>()) {
+                if (p.name == name && p.flags.has(slang::ast::MethodFlags::Pure)) {
+                    return &p;
+                }
             }
         }
-        const slang::ast::ClassType* base =
-            clt.getBaseClass() != nullptr
-                ? &clt.getBaseClass()->getCanonicalType().as<slang::ast::ClassType>()
-                : nullptr;
-        uint32_t size = base != nullptr ? class_vtable_size_[base] : 0;
-        // Assign a fresh slot to each newly-introduced virtual method (an override
-        // reuses the slot already assigned to its root introducer via the base).
-        for (const auto& m : clt.membersOfType<slang::ast::SubroutineSymbol>()) {
-            if (!is_user_virtual(m)) {
-                continue;
-            }
-            if (m.subroutineKind == slang::ast::SubroutineKind::Task) {
+        return nullptr;
+    }
+
+    // Assign vtable slots and register the dispatch table of a class (LRM 8.20/8.21).
+    // Slots are keyed by method NAME per hierarchy (a base's virtuals take slots
+    // 0..k-1; an override — including an implicit one, or the override of a pure
+    // prototype whose `getOverride()` slang leaves null — reuses the base slot of the
+    // same name; a newly-introduced virtual appends). Name-keying is what lets a pure
+    // virtual (a MethodPrototypeSymbol, invisible to membersOfType<SubroutineSymbol>)
+    // share a slot with its concrete overrides. The concrete table maps each slot to
+    // the most-derived body of that name; a pure slot never overridden (only in an
+    // abstract class) is filled by a prototype-built stub, which supplies the slot's
+    // signature but is never executed (an abstract class is never `new`'d, so its
+    // vtable is never materialized). Called after the base is lowered.
+    void compute_vtable(const slang::ast::ClassType& clt, ir::Ref class_ref) {
+        const slang::ast::ClassType* base = base_class_of(clt);
+        VtableSlots slots = base != nullptr ? class_vslot_[base] : VtableSlots{};
+        uint32_t    size  = static_cast<uint32_t>(slots.size());
+        const auto  introduce = [&](std::string_view name, slang::ast::SubroutineKind kind,
+                                    const slang::ast::Type& ret, bool is_pure) {
+            if (kind == slang::ast::SubroutineKind::Task) {
                 // TODO: virtual task dispatch (coroutine callee through the vtable).
                 fail("virtual task is not supported");
             }
-            const auto& root = root_introducer(m);
-            if (!virtual_slot_.contains(&root)) {
-                virtual_slot_[&root] = size++;
+            if (is_pure) {
+                // A pure slot's signature source is a stub (below); a non-scalar
+                // return would need the full aggregate/handle return ABI in that
+                // never-called stub. Guard until that is wired.
+                const ir::Ref rt = lower_type(ret);
+                if (is_agg_abi_ref(rt) || is_handle_ref(rt) || ret.getCanonicalType().isString()) {
+                    // TODO: pure virtual method with a non-scalar return.
+                    fail("pure virtual method with a non-scalar return is not supported");
+                }
+            }
+            if (!slots.contains(name)) {
+                slots.emplace(name, size++);
+            }
+        };
+        for (const auto& m : clt.membersOfType<slang::ast::SubroutineSymbol>()) {
+            if (is_user_virtual(m)) {
+                introduce(m.name, m.subroutineKind, m.getReturnType(), /*is_pure=*/false);
             }
         }
-        class_vtable_size_[&clt] = size;
+        for (const auto& p : clt.membersOfType<slang::ast::MethodPrototypeSymbol>()) {
+            if (p.isVirtual()) { // a pure (or extern) virtual prototype
+                introduce(p.name, p.subroutineKind, p.getReturnType(),
+                          p.flags.has(slang::ast::MethodFlags::Pure));
+            }
+        }
+        class_vslot_[&clt] = slots;
         if (size == 0) {
             return; // non-polymorphic: no vtable, no object-body header
         }
-        // Fill each slot with the most-derived override visible in `clt`: walk from
-        // `clt` up to the root, taking the first (most-derived) definition per slot.
+        // Fill each slot with the most-derived body of that name (an override is an
+        // override regardless of its own `virtual` keyword — match by name).
         std::vector<ir::FunctionId> table(size);
         std::vector<bool>           filled(size, false);
-        for (const slang::ast::ClassType* k = &clt; k != nullptr;
-             k = k->getBaseClass() != nullptr
-                     ? &k->getBaseClass()->getCanonicalType().as<slang::ast::ClassType>()
-                     : nullptr) {
+        for (const slang::ast::ClassType* k = &clt; k != nullptr; k = base_class_of(*k)) {
             for (const auto& m : k->membersOfType<slang::ast::SubroutineSymbol>()) {
-                if (!is_user_virtual(m)) {
+                const auto it = slots.find(m.name);
+                if (it == slots.end() || filled[it->second]) {
                     continue;
                 }
-                const uint32_t s = virtual_slot_.at(&root_introducer(m));
-                if (!filled[s]) {
-                    table[s]  = function_id(m);
-                    filled[s] = true;
-                }
+                table[it->second]  = function_id(m);
+                filled[it->second] = true;
             }
         }
-        for (bool f : filled) {
-            if (!f) {
-                // An unfilled slot means an un-overridden virtual (only possible via
-                // a pure virtual, not yet supported — guarded above).
-                fail("virtual method without an implementation is not supported");
+        // Un-overridden slots: a pure virtual in an abstract class. Fill with a
+        // prototype-built stub (the slot's signature source).
+        for (const auto& [name, s] : slots) {
+            if (filled[s]) {
+                continue;
             }
+            if (!clt.isAbstract) {
+                fail("concrete class has an unimplemented pure virtual method");
+            }
+            const auto* proto = find_pure_proto(clt, name);
+            if (proto == nullptr) {
+                fail("internal: pure virtual slot without a prototype");
+            }
+            table[s] = pure_stub_id(*proto);
         }
         module_.set_vtable(class_ref, std::move(table));
+    }
+
+    // The FunctionId of the never-executed stub for a pure virtual prototype (its
+    // signature source; see compute_vtable). Cached per prototype.
+    ir::FunctionId pure_stub_id(const slang::ast::MethodPrototypeSymbol& proto) {
+        const auto it = pure_stub_.find(&proto);
+        if (it != pure_stub_.end()) {
+            return it->second;
+        }
+        const ir::FunctionId id = module_.reserve_function();
+        pure_stub_[&proto] = id;
+        build_pure_stub(proto, id);
+        return id;
+    }
+
+    // Build a bodiless stub matching a pure virtual's signature (this + formals ->
+    // scalar return, LRM 8.21). The signature comes from the PROTOTYPE, not slang's
+    // degenerate associated subroutine (null thisVar / returnValVar, empty args). It
+    // returns X and is never called — it only supplies the CallVirtual FunctionType /
+    // result type for a dispatch resolved to the pure method on an abstract handle.
+    void build_pure_stub(const slang::ast::MethodPrototypeSymbol& proto, ir::FunctionId id) {
+        const auto& owner = proto.getParentScope()->asSymbol().as<slang::ast::ClassType>();
+        std::vector<ir::Ref>    param_types;
+        std::vector<ir::ArgDir> arg_dirs;
+        std::vector<ir::Ref>    local_types;
+        // `this` + each formal occupies a frame Local (index == param index), which
+        // the backend's emit_copyin copies the parameter into — mirroring
+        // build_function. The return Local follows.
+        param_types.push_back(lower_class_type(owner)); // `this`
+        arg_dirs.push_back(ir::ArgDir::In);
+        local_types.push_back(param_types.back());
+        for (const slang::ast::FormalArgumentSymbol* fa : proto.getArguments()) {
+            const ir::Ref pt = lower_type(fa->getType());
+            param_types.push_back(pt);
+            arg_dirs.push_back(to_arg_dir(fa->direction));
+            local_types.push_back(pt);
+        }
+        const bool    is_void     = proto.getReturnType().isVoid();
+        const ir::Ref return_type = is_void ? module_.pool.void_type : lower_type(proto.getReturnType());
+        ir::Builder         b(module_.pool);
+        const ir::SourceLoc el = to_source_loc(proto.location);
+        if (is_void) {
+            b.ret_void(el);
+        } else {
+            const uint32_t rl = static_cast<uint32_t>(local_types.size());
+            local_types.push_back(return_type);
+            const ir::Index rv = b.local(rl, return_type, el);
+            b.unary(ir::Inst::Tag::Ret, b.unary(ir::Inst::Tag::Load, rv, el), el);
+        }
+        module_.set_function(id, ir::Function{ .name        = std::string(proto.name) + ".pure",
+                                               .return_type = return_type,
+                                               .param_types = std::move(param_types),
+                                               .arg_dirs    = std::move(arg_dirs),
+                                               .local_types = std::move(local_types),
+                                               .ir          = b.finish() });
+    }
+
+    // The vtable slot of virtual method `sub` (LRM 8.20), looked up by name in the
+    // slot map of its declaring class (walk out to the enclosing ClassType — a pure
+    // method's degenerate subroutine nests under its prototype scope). The slot is
+    // identical across the hierarchy, so any class containing the name works.
+    uint32_t virtual_slot_of(const slang::ast::SubroutineSymbol& sub) {
+        const slang::ast::Scope* sc = sub.getParentScope();
+        while (sc != nullptr && sc->asSymbol().kind != slang::ast::SymbolKind::ClassType) {
+            sc = sc->asSymbol().getParentScope();
+        }
+        return class_vslot_.at(&sc->asSymbol().as<slang::ast::ClassType>()).at(sub.name);
     }
 
     // True if `call` is a `super.method(...)` call (LRM 8.20): a super call binds
@@ -11385,7 +11473,12 @@ private:
             lower_task_call(call, sub, b, this_val);
             return std::nullopt;
         }
-        const ir::FunctionId id = function_id(sub); // validates + lowers (lazily)
+        const bool is_virtual = this_val && is_user_virtual(sub) && !is_super_call(call);
+        // Resolve (and lazily lower) a direct callee up front — this also surfaces
+        // formal-side guards (e.g. ref-arg restrictions) before arg marshaling. A
+        // virtual call instead sources its callee from the vtable below, never
+        // function_id(sub), which would lower slang's degenerate pure subroutine.
+        const ir::FunctionId direct_id = is_virtual ? ir::FunctionId{} : function_id(sub);
 
         const auto formals = sub.getArguments();
         const auto actuals = call.arguments();
@@ -11402,17 +11495,20 @@ private:
         // (LRM 8.20), except a `super.method()` call, which binds statically to the
         // base method. The receiver's static class type selects the vtable layout.
         ir::Index c;
-        if (this_val && is_user_virtual(sub) && !is_super_call(call)) {
+        if (is_virtual) {
             // Receiver's static class type selects the vtable layout: an explicit
             // receiver (`obj.f()`) is call.thisClass(); a bare in-method call (`f()`)
-            // dispatches through the enclosing method's own `this`.
+            // dispatches through the enclosing method's own `this`. The signature
+            // source is the receiver's own vtable slot (a concrete override, or — for
+            // a pure method on an abstract handle — the prototype stub).
             const ir::Ref recv = call.thisClass() != nullptr
                                       ? lower_type(*call.thisClass()->type)
                                       : fn_ctx_->this_class;
-            const uint32_t slot = virtual_slot_.at(&root_introducer(sub));
-            c                   = b.call_virtual(id, slot, recv, args, l);
+            const uint32_t       slot = virtual_slot_of(sub);
+            const ir::FunctionId vf   = module_.vtable_for(recv)->slots[slot];
+            c                         = b.call_virtual(vf, slot, recv, args, l);
         } else {
-            c = b.call(id, args, l);
+            c = b.call(direct_id, args, l);
         }
         // Output / inout formals copy back to their actuals after the call (a
         // function is zero-time, so this is the same instant as the call).
@@ -11466,7 +11562,11 @@ private:
         if (call.thisClass() != nullptr) {
             return lower_expr(*call.thisClass(), b);
         }
-        if (sub.thisVar == nullptr) {
+        // A bare in-method call to an instance method uses the enclosing `this`. A
+        // pure virtual has a null thisVar (slang's degenerate rep) yet is still an
+        // instance method, so a virtual callee also takes this path (a free function
+        // has neither a thisVar nor virtualness).
+        if (sub.thisVar == nullptr && !is_user_virtual(sub)) {
             return std::nullopt;
         }
         if (fn_ctx_ == nullptr || !fn_ctx_->has_this) {
@@ -11777,12 +11877,15 @@ private:
     // Class property symbol -> its declaration-order field index in the owning
     // class's property table (used to lower a member access to a MemberSelect).
     ankerl::unordered_dense::map<const slang::ast::Symbol*, uint32_t> class_prop_index_;
-    // Virtual dispatch (LRM 8.20). virtual_slot_: a virtual method's root
-    // introducer -> its vtable slot (stable across the hierarchy). class_vtable_size_:
-    // a class -> its vtable size (slot count), so a derived class continues slot
-    // numbering after its base. Both filled by compute_vtable.
-    ankerl::unordered_dense::map<const slang::ast::SubroutineSymbol*, uint32_t> virtual_slot_;
-    ankerl::unordered_dense::map<const slang::ast::ClassType*, uint32_t>        class_vtable_size_;
+    // Virtual dispatch (LRM 8.20/8.21). class_vslot_: a polymorphic class -> its
+    // method NAME -> vtable slot map (inheriting the base's numbering, extended with
+    // the class's own virtuals). Name-keyed so a pure virtual (a
+    // MethodPrototypeSymbol) shares a slot with its concrete overrides. pure_stub_:
+    // a pure prototype -> the FunctionId of its never-executed signature stub. Both
+    // filled by compute_vtable / pure_stub_id.
+    using VtableSlots = ankerl::unordered_dense::map<std::string_view, uint32_t>;
+    ankerl::unordered_dense::map<const slang::ast::ClassType*, VtableSlots>            class_vslot_;
+    ankerl::unordered_dense::map<const slang::ast::MethodPrototypeSymbol*, ir::FunctionId> pure_stub_;
     // The shared Lowerer that owns package/$unit-scope subroutine bodies (see
     // set_globals / function_id). Null on the shared Lowerer itself and on any
     // Lowerer built without one (e.g. tests that lower a single module with no
