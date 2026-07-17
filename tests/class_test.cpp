@@ -364,18 +364,73 @@ TEST_CASE("class static property: no instance, const, local") {
     CHECK(run_capture(src) == "43 99 7\n");
 }
 
-// A virtual method needs dynamic dispatch (Phase 3, vtable); it must fail loudly,
-// not silently lower as a direct call. The implicit built-in
-// `randomize` virtual must NOT trip this guard.
-TEST_CASE("class virtual method fails loudly") {
+TEST_CASE("class virtual dispatch: override, inherit, internal call, super") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Animal;
+                virtual function int legs(); return 0; endfunction
+                function int describe(); return legs() + 1; endfunction
+                virtual function int noise(); return 1; endfunction
+            endclass
+            class Dog extends Animal;
+                virtual function int legs(); return 4; endfunction
+                virtual function int noise(); return 10 + super.noise(); endfunction
+            endclass
+            class Cat extends Animal;
+                function int legs(); return 40; endfunction
+            endclass
+            initial begin
+                Animal a;
+                Dog    d = new();
+                Cat    c = new();
+                a = d;
+                $display("%0d %0d %0d", a.legs(), a.describe(), a.noise());
+                a = c;
+                $display("%0d %0d %0d", a.legs(), a.describe(), a.noise());
+                a = new();
+                $display("%0d", a.legs());
+            end
+        endmodule
+    )";
+    // Dog: legs 4, describe legs()+1=5, noise 10+super(1)=11
+    // Cat: legs 40, describe 41, noise inherited Animal 1
+    // Animal: legs 0
+    CHECK(run_capture(src) == "4 5 11\n40 41 1\n0\n");
+}
+
+// A newly-introduced virtual method in a derived class (appended vtable slot),
+// dispatched through the derived-static handle, alongside an inherited slot.
+TEST_CASE("class virtual dispatch: derived-introduced virtual, multi-slot") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Base;
+                virtual function int a(); return 1; endfunction
+            endclass
+            class Mid extends Base;
+                virtual function int a(); return 2; endfunction
+                virtual function int b(); return 20; endfunction
+            endclass
+            initial begin
+                Base bh;
+                Mid  m = new();
+                bh = m;
+                $display("%0d %0d", bh.a(), m.b());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2 20\n");
+}
+
+// A virtual task needs coroutine dispatch through the vtable (deferred); it must
+// fail loudly rather than silently lower as a direct call.
+TEST_CASE("class virtual task fails loudly") {
     const std::string d = fails(R"(
         module m;
-            class Base; virtual function int f(); return 1; endfunction endclass
-            class Derived extends Base; function int f(); return 2; endfunction endclass
-            initial begin Derived d; d = new(); $display("%0d", d.f()); end
+            class Base; virtual task t(); #1; endtask endclass
+            initial begin Base b; b = new(); end
         endmodule
     )");
-    CHECK(d.find("virtual methods are not supported") != std::string::npos);
+    CHECK(d.find("virtual task is not supported") != std::string::npos);
 }
 
 // Two classes forward-referencing each other's handle type: A's field type B

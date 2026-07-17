@@ -453,6 +453,24 @@ struct Analysis {
                     val_z[raw] = cs.result_z;
                     break;
                 }
+                case Inst::Tag::CallVirtual: {
+                    // The concrete callee is chosen at run time (any override in the
+                    // hierarchy), so a single callee's FnState is not sound. Be
+                    // conservative: the result may carry z, and every out/inout/ref
+                    // actual may be written with z. (Over-marking only forgoes the
+                    // z-elision optimization, never correctness.)
+                    const VirtualCallInfo        vci    = ir.extra_data<VirtualCallInfo>(p.extra);
+                    const Function&              callee = m.function(vci.func);
+                    const std::span<const Index> args   = ir.region(vci.args);
+                    for (size_t k = 0; k < args.size(); ++k) {
+                        const ArgDir dir = callee.arg_dirs.empty() ? ArgDir::In : callee.arg_dirs[k];
+                        if (dir != ArgDir::In) {
+                            store_into(ir, fn, args[k], true);
+                        }
+                    }
+                    val_z[raw] = 1;
+                    break;
+                }
                 case Inst::Tag::TaskCall: {
                     const TaskCallInfo           ti     = ir.extra_data<TaskCallInfo>(p.extra);
                     const Function&              callee = m.function(ti.func);

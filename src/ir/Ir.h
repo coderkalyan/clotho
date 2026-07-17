@@ -357,6 +357,24 @@ struct TaskCallInfo {
     ExtraSlice args;
 };
 
+// Extra payload for `CallVirtual` (LRM 8.20): a dynamically-dispatched virtual
+// method call. Resolved via the object's vtable at run time rather than a static
+// FunctionId.
+struct VirtualCallInfo {
+    // The statically-resolved method (the one slang bound by the handle's static
+    // type). Every override shares its signature and return type (LRM 8.20), so it
+    // supplies both the indirect-call FunctionType and this call's result type; it
+    // is NOT the function actually called.
+    FunctionId func;
+    // Vtable slot index of the virtual method (stable across the whole hierarchy).
+    uint32_t   slot;
+    // Static class type of the receiver: gives the object-body layout (the vtable
+    // pointer sits at body field 0 of a polymorphic class).
+    Ref        class_ref;
+    // Argument value operands (this handle first, then the formals), like CallInfo.
+    ExtraSlice args;
+};
+
 // Join discipline of a fork block (LRM 9.3.2). V1 implements Join only.
 enum class ForkKind : uint32_t {
     Join,     // parent blocks until all children complete
@@ -752,6 +770,7 @@ struct EventDelayInfo {
 static_assert(ExtraPayload<ExtraSlice>);
 static_assert(ExtraPayload<CallInfo>);
 static_assert(ExtraPayload<TaskCallInfo>);
+static_assert(ExtraPayload<VirtualCallInfo>);
 static_assert(ExtraPayload<ForkInfo>);
 static_assert(ExtraPayload<Select>);
 static_assert(ExtraPayload<PartSelect>);
@@ -1203,6 +1222,11 @@ struct Inst {
         // Call a function (payload: extra -> CallInfo). The result is this
         // instruction's value (absent for a void function called as a statement).
         Call,
+        // Dynamically-dispatched virtual method call (payload: extra ->
+        // VirtualCallInfo, LRM 8.20). Loads the callee from the receiver object's
+        // vtable (indexed by slot) and calls it indirectly; otherwise identical to
+        // Call (same arg ABI, same result). Only for virtual FUNCTIONS in V1.
+        CallVirtual,
         // Enable a task (payload: extra -> TaskCallInfo). A statement, never a
         // value: it creates the task coroutine, drives it, and blocks the calling
         // coroutine until the task completes (LRM 13.3). Only legal inside a
@@ -1541,6 +1565,7 @@ struct Inst {
         OpExtra,
         Extra,
         Call,
+        CallVirtual,
         TaskCall,
         Display,
         // The op_extra member with a DisplayInfo record: op is the descriptor.
@@ -1790,6 +1815,8 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::Extra;
         case T::Call:
             return K::Call;
+        case T::CallVirtual:
+            return K::CallVirtual;
         case T::TaskCall:
             return K::TaskCall;
         case T::Display:

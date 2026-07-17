@@ -259,6 +259,13 @@ struct DpiExport {
     DpiCType              ret_ctype;
 };
 
+// A polymorphic class's virtual-dispatch table (LRM 8.20): slots[k] is the
+// FunctionId of the override occupying vtable slot k for this concrete class.
+struct Vtable {
+    Ref                     class_ref;
+    std::vector<FunctionId> slots;
+};
+
 class Module {
 public:
     // Shared intern pool backing every process's constant / type handles. Owned
@@ -345,6 +352,24 @@ public:
         return tops_;
     }
 
+    // Register the virtual-dispatch table of a polymorphic class (LRM 8.20):
+    // slots[k] is the FunctionId of the override occupying vtable slot k for this
+    // concrete class. Only polymorphic classes (those with a virtual method) get an
+    // entry; a class with no entry carries no vtable pointer in its object body.
+    void set_vtable(Ref class_ref, std::vector<FunctionId> slots) {
+        vtables_.push_back({ class_ref, std::move(slots) });
+    }
+
+    // The vtable for a class type, or null if the class is non-polymorphic.
+    const Vtable* vtable_for(Ref class_ref) const {
+        for (const Vtable& vt : vtables_) {
+            if (vt.class_ref == class_ref) {
+                return &vt;
+            }
+        }
+        return nullptr;
+    }
+
 private:
     // Signal table; index == Signal handle.
     std::vector<SignalInfo> signals_;
@@ -356,6 +381,8 @@ private:
     std::deque<Function> functions_;
     // Instance hierarchy, one scope tree per top-level module.
     std::vector<InstanceScope> tops_;
+    // Virtual-dispatch tables, one per polymorphic class (LRM 8.20).
+    std::vector<Vtable> vtables_;
     // Next InstanceScope::id (see alloc_scope_id).
     uint32_t next_scope_id_ = 0;
 };

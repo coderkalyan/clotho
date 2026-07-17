@@ -22,6 +22,13 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
             return index_slice(ci.args);
         }
 
+        case Inst::PayloadKind::CallVirtual: {
+            // call_virtual: its arguments (this handle + formals) are the SSA
+            // operands; the slot / class / signature-func are not.
+            const auto vci = extra_data<VirtualCallInfo>(p.extra);
+            return index_slice(vci.args);
+        }
+
         case Inst::PayloadKind::TaskCall: {
             // task_call: its per-formal operands (values and lvalue temps) are the
             // SSA operands; directions / the callee handle are not.

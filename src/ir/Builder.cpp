@@ -499,6 +499,14 @@ Index Builder::call(FunctionId func, std::span<const Index> args, SourceLoc loc)
     return emit({ Inst::Tag::Call, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
+Index Builder::call_virtual(FunctionId func, uint32_t slot, Ref class_ref,
+                            std::span<const Index> args, SourceLoc loc) {
+    const ExtraSlice slice = add_slice(args);
+    const ExtraIndex extra = add_extra(VirtualCallInfo{ func, slot, class_ref, slice });
+
+    return emit({ Inst::Tag::CallVirtual, pay(&Inst::Payload::extra, extra) }, loc);
+}
+
 Index Builder::task_call(FunctionId func, std::span<const Index> args, SourceLoc loc) {
     const ExtraSlice slice = add_slice(args);
     const ExtraIndex extra = add_extra(TaskCallInfo{ func, slice });

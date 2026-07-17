@@ -299,6 +299,8 @@ const char* tag_name(Inst::Tag tag) {
             return "ret_void";
         case T::Call:
             return "call";
+        case T::CallVirtual:
+            return "call_virtual";
         case T::TaskCall:
             return "task_call";
         case T::Fork:
@@ -652,6 +654,15 @@ private:
                 const auto ci = ir_.extra_data<CallInfo>(p.extra);
                 os_ << "fn" << static_cast<uint32_t>(ci.func);
                 for (Index a : ir_.region(ci.args)) {
+                    os_ << ", ";
+                    ref(a);
+                }
+                break;
+            }
+            case Inst::PayloadKind::CallVirtual: {
+                const auto vci = ir_.extra_data<VirtualCallInfo>(p.extra);
+                os_ << "vfn" << static_cast<uint32_t>(vci.func) << "@slot" << vci.slot;
+                for (Index a : ir_.region(vci.args)) {
                     os_ << ", ";
                     ref(a);
                 }

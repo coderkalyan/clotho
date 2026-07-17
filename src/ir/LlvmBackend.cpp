@@ -1424,6 +1424,15 @@ private:
     // body pointer's GEP source type (`HandleDeref` root_ty) and the MemberSelect
     // field GEPs share one identity. Distinct from `agg_storage_ty(classRef)`,
     // which yields the *handle* leaf slot (a class value is a handle, not a body).
+    // Number of leading LLVM fields reserved before a class's properties: 1 for a
+    // polymorphic class (a vtable pointer at field 0, LRM 8.20), else 0. A
+    // property's GEP index into the object body is its 0-based declaration index
+    // plus this offset; the struct_fields table and logical field path stay 0-based.
+    uint32_t class_header_words(Ref class_ref) const {
+        const Type& t = std::get<Type>(mod_.pool.get(class_ref));
+        return (t.kind == Type::Kind::Class && mod_.vtable_for(class_ref) != nullptr) ? 1u : 0u;
+    }
+
     llvm::StructType* class_body_ty(Ref class_ref) {
         const auto key = static_cast<uint32_t>(class_ref);
         if (const auto it = class_body_ty_.find(key); it != class_body_ty_.end()) {
@@ -1431,12 +1440,38 @@ private:
         }
         const Type&              t = std::get<Type>(mod_.pool.get(class_ref));
         std::vector<llvm::Type*> fields;
+        // A polymorphic class carries a vtable pointer at field 0 (prefix-consistent
+        // across the whole hierarchy, so an upcast reads it at the same offset).
+        if (class_header_words(class_ref) != 0) {
+            fields.push_back(raw_ptr_ty());
+        }
         for (const Field& f : mod_.pool.struct_fields(t.fields_id)) {
             fields.push_back(agg_storage_ty(f.type));
         }
         auto* st              = llvm::StructType::create(ctx_, fields, "clotho.class.body");
         class_body_ty_[key]   = st;
         return st;
+    }
+
+    // The vtable global for a polymorphic class: a constant array of function
+    // pointers, slot k = the override occupying slot k for this concrete class.
+    // One per class per module (deduped by name); referenced by ClassNew's header
+    // store and loaded at each virtual dispatch.
+    llvm::GlobalVariable* vtable_global(Ref class_ref) {
+        const std::string nm = "clotho.vtable." + std::to_string(static_cast<uint32_t>(class_ref));
+        if (auto* g = env_->llmod.getNamedGlobal(nm)) {
+            return g;
+        }
+        const Vtable* vt = mod_.vtable_for(class_ref);
+        std::vector<llvm::Constant*> entries;
+        entries.reserve(vt->slots.size());
+        for (const FunctionId fid : vt->slots) {
+            entries.push_back(sym(fn_decls_[static_cast<uint32_t>(fid)]));
+        }
+        auto* arrty = llvm::ArrayType::get(raw_ptr_ty(), entries.size());
+        auto* init  = llvm::ConstantArray::get(arrty, entries);
+        return new llvm::GlobalVariable(env_->llmod, arrty, /*isConstant=*/true,
+                                        llvm::GlobalValue::PrivateLinkage, init, nm);
     }
 
     // Power-on the properties of a freshly-allocated class object body (LRM 8.8):
@@ -1447,9 +1482,10 @@ private:
         const Type&               t       = std::get<Type>(mod_.pool.get(class_ref));
         llvm::Type*               root_ty = class_body_ty(class_ref);
         std::vector<llvm::Value*> path;
-        uint32_t                  f = 0;
+        const uint32_t            hdr = class_header_words(class_ref);
+        uint32_t                  f   = 0;
         for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
-            path.push_back(b_.getInt32(f++));
+            path.push_back(b_.getInt32(hdr + f++));
             emit_agg_init(fld.type, body_ptr, path, root_ty);
             path.pop_back();
         }
@@ -1551,7 +1587,10 @@ private:
     LValue agg_member(LValue lv, Ref struct_type, uint32_t field_index) {
         const Type& st = std::get<Type>(mod_.pool.get(struct_type));
         const Ref   mt = mod_.pool.struct_fields(st.fields_id)[field_index].type;
-        lv.agg_path.push_back(b_.getInt32(field_index));
+        // Skip a polymorphic class's vtable-pointer header (LLVM field 0); the
+        // logical field path stays 0-based (only signal-shadow leaf matching uses
+        // it, and class objects are heap, not signals).
+        lv.agg_path.push_back(b_.getInt32(field_index + class_header_words(struct_type)));
         lv.agg_field_path.push_back(field_index);
         lv.agg_leaf = is_leaf_type(mt);
         if (lv.agg_leaf) {
@@ -8132,6 +8171,9 @@ private:
                 return from_ref(p.local.type);
             case Inst::Tag::Call:
                 return from_ref(mod_.function(ir_->extra_data<CallInfo>(p.extra).func).return_type);
+            case Inst::Tag::CallVirtual:
+                // All overrides share the statically-resolved method's return type.
+                return from_ref(mod_.function(ir_->extra_data<VirtualCallInfo>(p.extra).func).return_type);
             case Inst::Tag::Resize:
                 return from_ref(p.op_type.type);
             case Inst::Tag::Signal: {
@@ -8968,6 +9010,13 @@ private:
                 llvm::Value*   body      = b_.CreateCall(alloc_fn(), { b_.getInt64(size) });
                 b_.CreateMemSet(body, b_.getInt8(0), b_.getInt64(size), llvm::MaybeAlign(64));
                 emit_class_body_init(class_ref, body);
+                // Install the vtable pointer at the object header (field 0) for a
+                // polymorphic class, so a later virtual dispatch resolves against the
+                // concrete type (LRM 8.20).
+                if (mod_.vtable_for(class_ref) != nullptr) {
+                    b_.CreateStore(vtable_global(class_ref),
+                                   b_.CreateStructGEP(class_body_ty(class_ref), body, 0));
+                }
                 set_value(i, two_val(b_.CreatePtrToInt(body, b_.getInt64Ty())));
                 return;
             }
@@ -10047,6 +10096,9 @@ private:
                 return;
             case Inst::Tag::RetVoid:
                 lower_ret_void();
+                return;
+            case Inst::Tag::CallVirtual:
+                lower_virtual_call_inst(i);
                 return;
             case Inst::Tag::Call:
                 lower_call_inst(i);
@@ -12976,13 +13028,42 @@ private:
     // z) plane pair (the frontend has resized each to its parameter width), then
     // unpack the returned struct into a Plane. A void callee yields no value.
     void lower_call_inst(Index i) {
-        const auto                ci = ir_->extra_data<CallInfo>(ir_->payload(i).extra);
-        const Function&           f  = mod_.function(ci.func);
+        const auto      ci = ir_->extra_data<CallInfo>(ir_->payload(i).extra);
+        const Function& f  = mod_.function(ci.func);
         if (f.is_dpi) {
             lower_dpi_call(i, ci, f);
             return;
         }
-        llvm::Function*           cf = sym(fn_decls_[static_cast<uint32_t>(ci.func)]);
+        llvm::Function* cf = sym(fn_decls_[static_cast<uint32_t>(ci.func)]);
+        lower_call_common(i, f, cf->getFunctionType(), cf, ci.args);
+    }
+
+    // Lower a virtual method call (LRM 8.20): resolve the callee from the receiver
+    // object's vtable, then share the direct-call marshaling. The receiver handle
+    // is the first argument operand; its object body holds the vtable pointer at
+    // field 0, and slot `vci.slot` selects the concrete override.
+    void lower_virtual_call_inst(Index i) {
+        const auto      vci  = ir_->extra_data<VirtualCallInfo>(ir_->payload(i).extra);
+        const Function& f    = mod_.function(vci.func); // signature shared by all overrides
+        llvm::FunctionType* fnty =
+            fn_decls_[static_cast<uint32_t>(vci.func)]->getFunctionType();
+        const std::span<const Index> args = ir_->region(vci.args);
+        // handle (arg 0) -> object body -> vtable pointer (body field 0) -> slot.
+        llvm::Value* body   = b_.CreateIntToPtr(must_of(value_of(args[0])), raw_ptr_ty());
+        llvm::Value* vptr   = b_.CreateLoad(
+            raw_ptr_ty(), b_.CreateStructGEP(class_body_ty(vci.class_ref), body, 0));
+        llvm::Value* slot   = b_.CreateGEP(raw_ptr_ty(), vptr, { b_.getInt32(vci.slot) });
+        llvm::Value* callee = b_.CreateLoad(raw_ptr_ty(), slot);
+        lower_call_common(i, f, fnty, callee, vci.args);
+    }
+
+    // Shared marshaling + result handling for a direct or a virtual method call
+    // (they differ only in how the callee is obtained). Passes the state pointer
+    // plus each argument as its (must|may, z) plane pair (the frontend has resized
+    // each to its parameter width), calls `callee` with `fnty`, and unpacks the
+    // returned struct into a Plane. A void callee yields no value.
+    void lower_call_common(Index i, const Function& f, llvm::FunctionType* fnty,
+                           llvm::Value* callee, ExtraSlice arg_slice) {
         std::vector<llvm::Value*> argv;
         argv.push_back(state_);
         // A ref actual that is a signal with waiters: the callee writes it live, so
@@ -12990,7 +13071,7 @@ private:
         // Snapshot each before the (atomic, zero-time) function call; service after.
         std::vector<std::pair<LValue, ServiceSnapshot>> ref_svc;
         size_t k = 0;
-        for (Index a : ir_->region(ci.args)) {
+        for (Index a : ir_->region(arg_slice)) {
             const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
             if (is_handle_type(f.param_types[k]) && dir != ArgDir::Ref) {
                 // A dynamic array / queue passes one handle pointer (the actual) in
@@ -13033,7 +13114,7 @@ private:
             auto*        st  = agg_storage_ty(f.return_type);
             llvm::Value* tmp = b_.CreateAlloca(st, nullptr, "call.agg.ret");
             argv.push_back(tmp);
-            b_.CreateCall(cf->getFunctionType(), cf, argv);
+            b_.CreateCall(fnty, callee, argv);
             LValue lv{};
             lv.base    = tmp;
             lv.root_ty = st;
@@ -13045,7 +13126,7 @@ private:
             // The callee assigns the result into this call's temp handle (the
             // trailing out-param); str_of(i) was pre-set by build_str_temps.
             argv.push_back(str_of(i));
-            b_.CreateCall(cf->getFunctionType(), cf, argv);
+            b_.CreateCall(fnty, callee, argv);
             for (auto& [lv, snap] : ref_svc) {
                 service_after_write(lv, snap);
             }
@@ -13062,13 +13143,13 @@ private:
             lv.slot_ty = handle_slot_ty(f.return_type);
             set_lvalue(i, lv);
             argv.push_back(temp);
-            b_.CreateCall(cf->getFunctionType(), cf, argv);
+            b_.CreateCall(fnty, callee, argv);
             for (auto& [lv2, snap] : ref_svc) {
                 service_after_write(lv2, snap);
             }
             return;
         }
-        llvm::Value* r = b_.CreateCall(cf->getFunctionType(), cf, argv);
+        llvm::Value* r = b_.CreateCall(fnty, callee, argv);
         for (auto& [lv, snap] : ref_svc) {
             service_after_write(lv, snap);
         }

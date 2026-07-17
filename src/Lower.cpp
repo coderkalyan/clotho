@@ -1321,19 +1321,6 @@ private:
             // TODO: parameterized classes (Phase 3).
             fail("parameterized classes are not supported");
         }
-        // A virtual method needs a vtable + dynamic dispatch (Phase 3); a
-        // non-virtual method statically binds (works). Guard the former loud so a
-        // `virtual` method is never silently lowered as a direct call.
-        for (const auto& method : clt.membersOfType<slang::ast::SubroutineSymbol>()) {
-            // slang synthesizes a built-in virtual `randomize` on every class
-            // (MethodFlags::BuiltIn); it is not a user dispatch target, so skip it.
-            // A user `virtual` method (or an implicit override of a virtual base
-            // method, isVirtual() via `overrides`) needs a vtable.
-            if (method.isVirtual() && !method.flags.has(slang::ast::MethodFlags::BuiltIn)) {
-                // TODO: virtual methods + dynamic dispatch (Phase 3, vtable header).
-                fail("virtual methods are not supported");
-            }
-        }
         // Intern-first: reserve the field slot and build the class Ref before
         // lowering the base or properties, so a self-handle resolves via the cache.
         const uint32_t fid = module_.pool.reserve_struct_fields();
@@ -1390,7 +1377,117 @@ private:
         }
         module_.pool.set_struct_fields(fid, std::move(fields));
 
+        // Virtual dispatch (LRM 8.20): assign vtable slots and build the concrete
+        // dispatch table for a polymorphic class (one with a virtual method in its
+        // hierarchy). Non-polymorphic classes get no vtable (no object-body header).
+        compute_vtable(clt, ref);
+
         return ref;
+    }
+
+    // The base-most declaration of a virtual method (the class that first
+    // introduced its slot): follow the override chain to the root.
+    static const slang::ast::SubroutineSymbol& root_introducer(
+        const slang::ast::SubroutineSymbol& m) {
+        const slang::ast::SubroutineSymbol* r = &m;
+        while (r->getOverride() != nullptr) {
+            r = r->getOverride();
+        }
+        return *r;
+    }
+
+    // True if `m` is a user-declared virtual method (LRM 8.20) — excludes slang's
+    // built-in virtual `randomize` (MethodFlags::BuiltIn), not a dispatch target.
+    static bool is_user_virtual(const slang::ast::SubroutineSymbol& m) {
+        return m.isVirtual() && !m.flags.has(slang::ast::MethodFlags::BuiltIn);
+    }
+
+    // Assign vtable slots and register the dispatch table of a class (LRM 8.20).
+    // Slots are numbered per hierarchy: a base's virtuals take slots 0..k-1, an
+    // override reuses its root introducer's slot, a new virtual appends. The
+    // concrete table maps each slot to the most-derived override visible in `clt`.
+    // A class with no virtual method in its hierarchy gets no table (and thus no
+    // object-body vtable header). Called from lower_class_type after the base is
+    // lowered, so base slot numbers already exist.
+    void compute_vtable(const slang::ast::ClassType& clt, ir::Ref class_ref) {
+        const slang::ast::ClassType* base =
+            clt.getBaseClass() != nullptr
+                ? &clt.getBaseClass()->getCanonicalType().as<slang::ast::ClassType>()
+                : nullptr;
+        uint32_t size = base != nullptr ? class_vtable_size_[base] : 0;
+        // Assign a fresh slot to each newly-introduced virtual method (an override
+        // reuses the slot already assigned to its root introducer via the base).
+        for (const auto& m : clt.membersOfType<slang::ast::SubroutineSymbol>()) {
+            if (!is_user_virtual(m)) {
+                continue;
+            }
+            if (m.subroutineKind == slang::ast::SubroutineKind::Task) {
+                // TODO: virtual task dispatch (coroutine callee through the vtable).
+                fail("virtual task is not supported");
+            }
+            const ir::Ref rt = lower_type(m.getReturnType());
+            if (is_agg_abi_ref(rt) || is_handle_ref(rt) ||
+                m.getReturnType().getCanonicalType().isString()) {
+                // TODO: virtual method returning an aggregate / string / container
+                // (the call-temp scanners do not yet cover CallVirtual).
+                fail("virtual method with an aggregate / string / container return "
+                     "is not supported");
+            }
+            const auto& root = root_introducer(m);
+            if (!virtual_slot_.contains(&root)) {
+                virtual_slot_[&root] = size++;
+            }
+        }
+        class_vtable_size_[&clt] = size;
+        if (size == 0) {
+            return; // non-polymorphic: no vtable, no object-body header
+        }
+        // Fill each slot with the most-derived override visible in `clt`: walk from
+        // `clt` up to the root, taking the first (most-derived) definition per slot.
+        std::vector<ir::FunctionId> table(size);
+        std::vector<bool>           filled(size, false);
+        for (const slang::ast::ClassType* k = &clt; k != nullptr;
+             k = k->getBaseClass() != nullptr
+                     ? &k->getBaseClass()->getCanonicalType().as<slang::ast::ClassType>()
+                     : nullptr) {
+            for (const auto& m : k->membersOfType<slang::ast::SubroutineSymbol>()) {
+                if (!is_user_virtual(m)) {
+                    continue;
+                }
+                const uint32_t s = virtual_slot_.at(&root_introducer(m));
+                if (!filled[s]) {
+                    table[s]  = function_id(m);
+                    filled[s] = true;
+                }
+            }
+        }
+        for (bool f : filled) {
+            if (!f) {
+                // A pure-virtual slot with no override (an abstract class is not yet
+                // supported, so this should not occur in V1).
+                fail("pure virtual method without an implementation is not supported");
+            }
+        }
+        module_.set_vtable(class_ref, std::move(table));
+    }
+
+    // True if `call` is a `super.method(...)` call (LRM 8.20): a super call binds
+    // STATICALLY to the base method, bypassing virtual dispatch. slang lowers it
+    // with a null `thisClass` (an implicit `this`), indistinguishable from a bare
+    // in-method call at the AST level, so detect it syntactically: the callee name
+    // is a scoped name whose left-most component is the `super` handle.
+    static bool is_super_call(const slang::ast::CallExpression& call) {
+        const slang::syntax::SyntaxNode* s = call.syntax;
+        if (s == nullptr) {
+            return false;
+        }
+        if (s->kind == slang::syntax::SyntaxKind::InvocationExpression) {
+            s = s->as<slang::syntax::InvocationExpressionSyntax>().left;
+        }
+        while (s != nullptr && s->kind == slang::syntax::SyntaxKind::ScopedName) {
+            s = s->as<slang::syntax::ScopedNameSyntax>().left;
+        }
+        return s != nullptr && s->kind == slang::syntax::SyntaxKind::SuperHandle;
     }
 
     // True if an expression's type is a fixed-size unpacked array (a memory).
@@ -11290,7 +11387,22 @@ private:
         if (this_val) {
             args.insert(args.begin(), *this_val);
         }
-        const ir::Index         c = b.call(id, args, l);
+        // A virtual method invoked through an object handle dispatches dynamically
+        // (LRM 8.20), except a `super.method()` call, which binds statically to the
+        // base method. The receiver's static class type selects the vtable layout.
+        ir::Index c;
+        if (this_val && is_user_virtual(sub) && !is_super_call(call)) {
+            // Receiver's static class type selects the vtable layout: an explicit
+            // receiver (`obj.f()`) is call.thisClass(); a bare in-method call (`f()`)
+            // dispatches through the enclosing method's own `this`.
+            const ir::Ref recv = call.thisClass() != nullptr
+                                      ? lower_type(*call.thisClass()->type)
+                                      : fn_ctx_->this_class;
+            const uint32_t slot = virtual_slot_.at(&root_introducer(sub));
+            c                   = b.call_virtual(id, slot, recv, args, l);
+        } else {
+            c = b.call(id, args, l);
+        }
         // Output / inout formals copy back to their actuals after the call (a
         // function is zero-time, so this is the same instant as the call).
         emit_call_copyouts(outs, b, l);
@@ -11654,6 +11766,12 @@ private:
     // Class property symbol -> its declaration-order field index in the owning
     // class's property table (used to lower a member access to a MemberSelect).
     ankerl::unordered_dense::map<const slang::ast::Symbol*, uint32_t> class_prop_index_;
+    // Virtual dispatch (LRM 8.20). virtual_slot_: a virtual method's root
+    // introducer -> its vtable slot (stable across the hierarchy). class_vtable_size_:
+    // a class -> its vtable size (slot count), so a derived class continues slot
+    // numbering after its base. Both filled by compute_vtable.
+    ankerl::unordered_dense::map<const slang::ast::SubroutineSymbol*, uint32_t> virtual_slot_;
+    ankerl::unordered_dense::map<const slang::ast::ClassType*, uint32_t>        class_vtable_size_;
     // The shared Lowerer that owns package/$unit-scope subroutine bodies (see
     // set_globals / function_id). Null on the shared Lowerer itself and on any
     // Lowerer built without one (e.g. tests that lower a single module with no

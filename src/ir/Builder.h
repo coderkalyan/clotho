@@ -263,6 +263,13 @@ public:
     // resized to its parameter type). The result is this instruction's value.
     Index call(FunctionId func, std::span<const Index> args, SourceLoc loc);
 
+    // Dynamically-dispatched virtual method call (LRM 8.20). `func` is the
+    // statically-resolved method (supplies the signature + result type); `slot` is
+    // its vtable slot; `class_ref` the receiver's static class type; `args` is the
+    // receiver handle followed by the formals (each resized to its parameter type).
+    Index call_virtual(FunctionId func, uint32_t slot, Ref class_ref,
+                       std::span<const Index> args, SourceLoc loc);
+
     // Enable task `func`. `args` has one operand per formal in order: an rvalue for
     // an input formal, an lvalue leaf (a caller temp) for an output / inout formal.
     // A statement, never a value; the caller blocks until the task completes.
