@@ -514,6 +514,14 @@ Index Builder::task_call(FunctionId func, std::span<const Index> args, SourceLoc
     return emit({ Inst::Tag::TaskCall, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
+Index Builder::task_call_virtual(FunctionId func, uint32_t slot, Ref class_ref,
+                                 std::span<const Index> args, SourceLoc loc) {
+    const ExtraSlice slice = add_slice(args);
+    const ExtraIndex extra = add_extra(VirtualCallInfo{ func, slot, class_ref, slice });
+
+    return emit({ Inst::Tag::TaskCallVirtual, pay(&Inst::Payload::extra, extra) }, loc);
+}
+
 Index Builder::fork(std::span<const FunctionId> children, ForkKind kind, SourceLoc loc) {
     // FunctionId is a u32 enum; store the child ids in the extra arena as raw u32s
     // (the same encoding add_slice uses for Index operands).

@@ -453,7 +453,8 @@ struct Analysis {
                     val_z[raw] = cs.result_z;
                     break;
                 }
-                case Inst::Tag::CallVirtual: {
+                case Inst::Tag::CallVirtual:
+                case Inst::Tag::TaskCallVirtual: {
                     // The concrete callee is chosen at run time (any override in the
                     // hierarchy), so a single callee's FnState is not sound. Be
                     // conservative: the result may carry z, and every out/inout/ref
@@ -669,6 +670,19 @@ std::vector<bool> compute_undriven(const Module& m) {
                     const TaskCallInfo ti     = ir.extra_data<TaskCallInfo>(p.extra);
                     const Function&    callee = m.function(ti.func);
                     const auto         args   = ir.region(ti.args);
+                    for (size_t a = 0; a < args.size(); ++a) {
+                        if (callee.arg_dirs[a] != ArgDir::In) {
+                            mark_root(ir, args[a]);
+                        }
+                    }
+                    break;
+                }
+                case Inst::Tag::TaskCallVirtual: {
+                    // Same copy-out as TaskCall; the resolved method's arg_dirs
+                    // (shared by every override) drive the out/inout actuals.
+                    const VirtualCallInfo vci    = ir.extra_data<VirtualCallInfo>(p.extra);
+                    const Function&       callee = m.function(vci.func);
+                    const auto            args   = ir.region(vci.args);
                     for (size_t a = 0; a < args.size(); ++a) {
                         if (callee.arg_dirs[a] != ArgDir::In) {
                             mark_root(ir, args[a]);

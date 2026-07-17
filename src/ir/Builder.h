@@ -270,6 +270,11 @@ public:
     Index call_virtual(FunctionId func, uint32_t slot, Ref class_ref,
                        std::span<const Index> args, SourceLoc loc);
 
+    // Dynamically-dispatched virtual TASK call (LRM 8.20) — the task (coroutine)
+    // ABI counterpart of call_virtual. Same operand shape.
+    Index task_call_virtual(FunctionId func, uint32_t slot, Ref class_ref,
+                            std::span<const Index> args, SourceLoc loc);
+
     // Enable task `func`. `args` has one operand per formal in order: an rvalue for
     // an input formal, an lvalue leaf (a caller temp) for an output / inout formal.
     // A statement, never a value; the caller blocks until the task completes.

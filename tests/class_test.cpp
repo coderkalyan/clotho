@@ -461,16 +461,41 @@ TEST_CASE("class virtual dispatch: unpacked struct return") {
     CHECK(run_capture(src) == "0 0\n10 20\n");
 }
 
-// A virtual task needs coroutine dispatch through the vtable (deferred); it must
-// fail loudly rather than silently lower as a direct call.
-TEST_CASE("class virtual task fails loudly") {
+TEST_CASE("class virtual task: dynamic dispatch, time-consuming") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Base;
+                virtual task run(); $display("base run"); endtask
+                virtual task step(int n); #(n) $display("base step %0t", $time); endtask
+                task go(); run(); step(5); endtask
+            endclass
+            class Der extends Base;
+                virtual task run(); $display("der run"); endtask
+                virtual task step(int n); #(n*2) $display("der step %0t", $time); endtask
+            endclass
+            initial begin
+                Base b;
+                Der  d = new();
+                b = new(); b.go();
+                b = d;     b.go();
+            end
+        endmodule
+    )";
+    // base go: run + #5 step (t=5). der go: dispatched run + #10 step (t=5+10=15).
+    CHECK(run_capture(src) == "base run\nbase step 5\nder run\nder step 15\n");
+}
+
+// Pure virtual task's abstract-class slot would need a coroutine-shaped stub
+// (deferred); it must fail loudly.
+TEST_CASE("class pure virtual task fails loudly") {
     const std::string d = fails(R"(
         module m;
-            class Base; virtual task t(); #1; endtask endclass
-            initial begin Base b; b = new(); end
+            virtual class Base; pure virtual task t(); endclass
+            class Der extends Base; task t(); #1; endtask endclass
+            initial begin Der x; x = new(); end
         endmodule
     )");
-    CHECK(d.find("virtual task is not supported") != std::string::npos);
+    CHECK(d.find("pure virtual task is not supported") != std::string::npos);
 }
 
 TEST_CASE("abstract class: concrete virtual dispatch through the base") {

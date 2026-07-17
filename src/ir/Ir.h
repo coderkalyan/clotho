@@ -1232,6 +1232,11 @@ struct Inst {
         // coroutine until the task completes (LRM 13.3). Only legal inside a
         // coroutine (a process or another task), never a plain function.
         TaskCall,
+        // Dynamically-dispatched virtual TASK call (payload: extra ->
+        // VirtualCallInfo, LRM 8.20). Loads the task ramp function from the receiver
+        // object's vtable and drives it over the task coroutine ABI; otherwise
+        // identical to TaskCall.
+        TaskCallVirtual,
         // Loop with a per-iteration condition; `for` / `while` / `forever` all
         // lower to this (payload: extra -> LoopInfo). The `for` init runs in the
         // enclosing region before this inst; `while` / `forever` have empty step.
@@ -1816,7 +1821,8 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Call:
             return K::Call;
         case T::CallVirtual:
-            return K::CallVirtual;
+        case T::TaskCallVirtual:
+            return K::CallVirtual; // both carry VirtualCallInfo
         case T::TaskCall:
             return K::TaskCall;
         case T::Display:

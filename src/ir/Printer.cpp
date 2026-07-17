@@ -303,6 +303,8 @@ const char* tag_name(Inst::Tag tag) {
             return "call_virtual";
         case T::TaskCall:
             return "task_call";
+        case T::TaskCallVirtual:
+            return "task_call_virtual";
         case T::Fork:
             return "fork";
         case T::Loop:

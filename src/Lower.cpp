@@ -1433,9 +1433,11 @@ private:
         uint32_t    size  = static_cast<uint32_t>(slots.size());
         const auto  introduce = [&](std::string_view name, slang::ast::SubroutineKind kind,
                                     const slang::ast::Type& ret, bool is_pure) {
-            if (kind == slang::ast::SubroutineKind::Task) {
-                // TODO: virtual task dispatch (coroutine callee through the vtable).
-                fail("virtual task is not supported");
+            if (kind == slang::ast::SubroutineKind::Task && is_pure) {
+                // A pure virtual task's abstract-class slot would need a task-shaped
+                // (coroutine) stub, not the function stub build_pure_stub emits.
+                // TODO: pure virtual task.
+                fail("pure virtual task is not supported");
             }
             if (is_pure) {
                 // A pure slot's signature source is a stub (below); a non-scalar
@@ -1558,11 +1560,34 @@ private:
     // method's degenerate subroutine nests under its prototype scope). The slot is
     // identical across the hierarchy, so any class containing the name works.
     uint32_t virtual_slot_of(const slang::ast::SubroutineSymbol& sub) {
+        return class_vslot_.at(&declaring_class(sub)).at(sub.name);
+    }
+
+    // The class scope that declares method `sub` (walk out past a pure method's
+    // prototype scope to the enclosing ClassType).
+    static const slang::ast::ClassType& declaring_class(const slang::ast::SubroutineSymbol& sub) {
         const slang::ast::Scope* sc = sub.getParentScope();
         while (sc != nullptr && sc->asSymbol().kind != slang::ast::SymbolKind::ClassType) {
             sc = sc->asSymbol().getParentScope();
         }
-        return class_vslot_.at(&sc->asSymbol().as<slang::ast::ClassType>()).at(sub.name);
+        return sc->asSymbol().as<slang::ast::ClassType>();
+    }
+
+    // The FunctionId whose signature + return type describe a virtual dispatch to
+    // `sub` (the CallVirtual/TaskCallVirtual `func`). A concrete method is its own
+    // signature; a pure method's degenerate subroutine cannot be lowered, so its
+    // prototype stub stands in. This is sourced here (not the receiver's vtable) so
+    // it is available even while the receiver class's own vtable is mid-computation
+    // — a virtual method whose body virtual-calls a sibling method of the same class.
+    ir::FunctionId virtual_sig_id(const slang::ast::SubroutineSymbol& sub) {
+        if (!sub.flags.has(slang::ast::MethodFlags::Pure)) {
+            return function_id(sub);
+        }
+        const auto* proto = find_pure_proto(declaring_class(sub), sub.name);
+        if (proto == nullptr) {
+            fail("internal: pure virtual call without a prototype");
+        }
+        return pure_stub_id(*proto);
     }
 
     // True if `call` is a `super.method(...)` call (LRM 8.20): a super call binds
@@ -11498,15 +11523,11 @@ private:
         if (is_virtual) {
             // Receiver's static class type selects the vtable layout: an explicit
             // receiver (`obj.f()`) is call.thisClass(); a bare in-method call (`f()`)
-            // dispatches through the enclosing method's own `this`. The signature
-            // source is the receiver's own vtable slot (a concrete override, or — for
-            // a pure method on an abstract handle — the prototype stub).
+            // dispatches through the enclosing method's own `this`.
             const ir::Ref recv = call.thisClass() != nullptr
                                       ? lower_type(*call.thisClass()->type)
                                       : fn_ctx_->this_class;
-            const uint32_t       slot = virtual_slot_of(sub);
-            const ir::FunctionId vf   = module_.vtable_for(recv)->slots[slot];
-            c                         = b.call_virtual(vf, slot, recv, args, l);
+            c = b.call_virtual(virtual_sig_id(sub), virtual_slot_of(sub), recv, args, l);
         } else {
             c = b.call(direct_id, args, l);
         }
@@ -11527,7 +11548,13 @@ private:
     // inout copy-backs, emit_call_copyouts applies them after the call.
     void lower_task_call(const CallExpression& call, const SubroutineSymbol& sub, ir::Builder& b,
                          std::optional<ir::Index> this_val = std::nullopt) {
-        const ir::FunctionId id      = function_id(sub); // validates + lowers (lazily)
+        // A virtual task invoked through a handle dispatches dynamically (LRM 8.20),
+        // like a virtual function but over the task (coroutine) ABI. A pure virtual
+        // task is guarded (compute_vtable), so a virtual-task callee always has a
+        // concrete signature — function_id(sub) is only skipped to mirror the
+        // function path's vtable sourcing.
+        const bool           is_virtual = this_val && is_user_virtual(sub) && !is_super_call(call);
+        const ir::FunctionId id      = is_virtual ? ir::FunctionId{} : function_id(sub);
         const auto           formals = sub.getArguments();
         const auto           actuals = call.arguments();
         if (formals.size() != actuals.size()) {
@@ -11549,7 +11576,14 @@ private:
         if (this_val) {
             args.insert(args.begin(), *this_val);
         }
-        b.task_call(id, args, l);
+        if (is_virtual) {
+            const ir::Ref recv = call.thisClass() != nullptr
+                                     ? lower_type(*call.thisClass()->type)
+                                     : fn_ctx_->this_class;
+            b.task_call_virtual(virtual_sig_id(sub), virtual_slot_of(sub), recv, args, l);
+        } else {
+            b.task_call(id, args, l);
+        }
         emit_call_copyouts(outs, b, l);
     }
 

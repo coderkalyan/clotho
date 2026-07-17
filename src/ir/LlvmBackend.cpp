@@ -2150,6 +2150,9 @@ private:
                 if (ir.tag(idx) == Inst::Tag::TaskCall) {
                     const auto ti = ir.extra_data<TaskCallInfo>(ir.payload(idx).extra);
                     mark(ir, ti.func, ti.args);
+                } else if (ir.tag(idx) == Inst::Tag::TaskCallVirtual) {
+                    const auto vci = ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra);
+                    mark(ir, vci.func, vci.args);
                 } else if (ir.tag(idx) == Inst::Tag::Call) {
                     const auto ci = ir.extra_data<CallInfo>(ir.payload(idx).extra);
                     mark(ir, ci.func, ci.args);
@@ -3102,6 +3105,9 @@ private:
             if (ir.tag(idx) == Inst::Tag::TaskCall) {
                 const auto ti = ir.extra_data<TaskCallInfo>(ir.payload(idx).extra);
                 mark_packed_args(ti.func, ti.args);
+            } else if (ir.tag(idx) == Inst::Tag::TaskCallVirtual) {
+                const auto vci = ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra);
+                mark_packed_args(vci.func, vci.args);
             } else if (ir.tag(idx) == Inst::Tag::Call) {
                 const auto ci = ir.extra_data<CallInfo>(ir.payload(idx).extra);
                 mark_packed_args(ci.func, ci.args);
@@ -4299,10 +4305,17 @@ private:
                         out.push_back(ir.payload(r.root).signal);
                     }
                 }
-                else if (ir.tag(idx) == Inst::Tag::TaskCall) {
-                    const auto      ti     = ir.extra_data<TaskCallInfo>(ir.payload(idx).extra);
-                    const Function& callee = mod_.function(ti.func);
-                    const auto      args   = ir.region(ti.args);
+                else if (ir.tag(idx) == Inst::Tag::TaskCall ||
+                         ir.tag(idx) == Inst::Tag::TaskCallVirtual) {
+                    const bool       virt = ir.tag(idx) == Inst::Tag::TaskCallVirtual;
+                    const FunctionId fid =
+                        virt ? ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra).func
+                             : ir.extra_data<TaskCallInfo>(ir.payload(idx).extra).func;
+                    const ExtraSlice as =
+                        virt ? ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra).args
+                             : ir.extra_data<TaskCallInfo>(ir.payload(idx).extra).args;
+                    const Function& callee = mod_.function(fid);
+                    const auto      args   = ir.region(as);
                     for (size_t a = 0; a < args.size(); ++a) {
                         if (callee.arg_dirs[a] == ArgDir::In) {
                             continue;
@@ -4312,7 +4325,7 @@ private:
                             out.push_back(ir.payload(r.root).signal);
                         }
                     }
-                    calls.push_back(ti.func);
+                    calls.push_back(fid);
                 }
             }
         };
@@ -4517,6 +4530,7 @@ private:
                 case Inst::Tag::Delay:
                 case Inst::Tag::Wait:
                 case Inst::Tag::TaskCall:
+                case Inst::Tag::TaskCallVirtual:
                 // A named-event trigger has a scheduling side effect (it wakes
                 // waiters) and `.triggered` reads per-event state outside the
                 // pure-function-of-signal-reads model that thunk elision and comb
@@ -4869,7 +4883,7 @@ private:
                     put(&pl, sizeof(pl));
                 }
                 calls = calls || tag == Inst::Tag::Call || tag == Inst::Tag::CallVirtual ||
-                        tag == Inst::Tag::TaskCall;
+                        tag == Inst::Tag::TaskCall || tag == Inst::Tag::TaskCallVirtual;
                 extra_sig = extra_sig || tag == Inst::Tag::Wait || tag == Inst::Tag::StoreNbEvent ||
                             tag == Inst::Tag::ReadMem || tag == Inst::Tag::FreadMem ||
                             tag == Inst::Tag::EventTriggerNbDelayed;
@@ -8518,6 +8532,7 @@ private:
             case Inst::Tag::Sformat:
             case Inst::Tag::ReadMem:
             case Inst::Tag::TaskCall:
+            case Inst::Tag::TaskCallVirtual:
             case Inst::Tag::DumpFile:
             case Inst::Tag::DumpVars:
             case Inst::Tag::DumpOff:
@@ -10122,6 +10137,7 @@ private:
                 lower_call_inst(i);
                 return;
             case Inst::Tag::TaskCall:
+            case Inst::Tag::TaskCallVirtual:
                 // A task call may suspend the caller (task with #delay / @event) and
                 // stages its own NBAs into the shared shadow; end the segment so the
                 // caller's pre/post-call NBAs never share a block with it.
@@ -13060,19 +13076,24 @@ private:
     // object's vtable, then share the direct-call marshaling. The receiver handle
     // is the first argument operand; its object body holds the vtable pointer at
     // field 0, and slot `vci.slot` selects the concrete override.
+    // Load the callee (function or task ramp) for a virtual dispatch from the
+    // receiver object's vtable: handle (arg 0) -> object body -> vtable pointer
+    // (body field 0) -> slot. Shared by virtual function and virtual task calls.
+    llvm::Value* load_vtable_callee(const VirtualCallInfo& vci) {
+        const std::span<const Index> args = ir_->region(vci.args);
+        llvm::Value* body = b_.CreateIntToPtr(must_of(value_of(args[0])), raw_ptr_ty());
+        llvm::Value* vptr = b_.CreateLoad(
+            raw_ptr_ty(), b_.CreateStructGEP(class_body_ty(vci.class_ref), body, 0));
+        llvm::Value* slot = b_.CreateGEP(raw_ptr_ty(), vptr, { b_.getInt32(vci.slot) });
+        return b_.CreateLoad(raw_ptr_ty(), slot);
+    }
+
     void lower_virtual_call_inst(Index i) {
         const auto      vci  = ir_->extra_data<VirtualCallInfo>(ir_->payload(i).extra);
         const Function& f    = mod_.function(vci.func); // signature shared by all overrides
         llvm::FunctionType* fnty =
             fn_decls_[static_cast<uint32_t>(vci.func)]->getFunctionType();
-        const std::span<const Index> args = ir_->region(vci.args);
-        // handle (arg 0) -> object body -> vtable pointer (body field 0) -> slot.
-        llvm::Value* body   = b_.CreateIntToPtr(must_of(value_of(args[0])), raw_ptr_ty());
-        llvm::Value* vptr   = b_.CreateLoad(
-            raw_ptr_ty(), b_.CreateStructGEP(class_body_ty(vci.class_ref), body, 0));
-        llvm::Value* slot   = b_.CreateGEP(raw_ptr_ty(), vptr, { b_.getInt32(vci.slot) });
-        llvm::Value* callee = b_.CreateLoad(raw_ptr_ty(), slot);
-        lower_call_common(i, f, fnty, callee, vci.args);
+        lower_call_common(i, f, fnty, load_vtable_callee(vci), vci.args);
     }
 
     // Shared marshaling + result handling for a direct or a virtual method call
@@ -13975,9 +13996,21 @@ private:
     // it. Only valid inside a coroutine — the frontend never emits a TaskCall in a
     // plain function.
     void lower_task_call_inst(Index i) {
-        const auto      ti = ir_->extra_data<TaskCallInfo>(ir_->payload(i).extra);
-        const Function& tf = mod_.function(ti.func);
-        llvm::Function* cf = sym(fn_decls_[static_cast<uint32_t>(ti.func)]);
+        // Direct (TaskCall) vs virtual (TaskCallVirtual) differ only in how the task
+        // ramp callee is obtained; a virtual task loads it from the receiver's vtable
+        // (the slot holds the task ramp pointer, like a function). The FunctionType
+        // comes from the resolved method's declared task signature (shared by every
+        // override).
+        const bool          virt = ir_->tag(i) == Inst::Tag::TaskCallVirtual;
+        const FunctionId    fid  = virt ? ir_->extra_data<VirtualCallInfo>(ir_->payload(i).extra).func
+                                        : ir_->extra_data<TaskCallInfo>(ir_->payload(i).extra).func;
+        const ExtraSlice    argslice = virt ? ir_->extra_data<VirtualCallInfo>(ir_->payload(i).extra).args
+                                            : ir_->extra_data<TaskCallInfo>(ir_->payload(i).extra).args;
+        const Function&     tf   = mod_.function(fid);
+        llvm::FunctionType* fnty = fn_decls_[static_cast<uint32_t>(fid)]->getFunctionType();
+        llvm::Value*        cf =
+            virt ? load_vtable_callee(ir_->extra_data<VirtualCallInfo>(ir_->payload(i).extra))
+                 : static_cast<llvm::Value*>(sym(fn_decls_[static_cast<uint32_t>(fid)]));
         auto*           ptr_ty = llvm::PointerType::getUnqual(ctx_);
         auto*           null   = llvm::ConstantPointerNull::get(ptr_ty);
 
@@ -13986,7 +14019,7 @@ private:
         b_.CreateStore(null, record);
 
         // Ramp arguments: state, wheel, per-formal planes / pointers, record.
-        const std::span<const Index> args = ir_->region(ti.args);
+        const std::span<const Index> args = ir_->region(argslice);
         std::vector<llvm::Value*>    argv;
         argv.push_back(state_);
         argv.push_back(wheel_);
@@ -14030,7 +14063,7 @@ private:
         }
         argv.push_back(record);
 
-        llvm::Value* task_hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
+        llvm::Value* task_hdl = b_.CreateCall(fnty, cf, argv);
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { task_hdl });
         llvm::Value* done = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_done), { task_hdl });
 
