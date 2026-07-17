@@ -232,3 +232,54 @@ TEST_CASE("$strobe of an automatic local is rejected") {
     )",
                    "cannot be traced");
 }
+
+TEST_CASE("$monitor prints once per change") {
+    CHECK(run_capture(R"(
+        module m;
+          integer a;
+          initial begin
+            a = 0;
+            $monitor("a=%0d", a);
+            #1 a = 1;
+            #1 a = 2;
+            #1 a = 2;   // no change -> no print
+            #1 a = 5;
+            #1 $finish;
+          end
+        endmodule
+    )") == "a=0\na=1\na=2\na=5\n");
+}
+
+// $monitoron/$monitoroff enable/disable (reon reprints current); a new $monitor
+// replaces the previous.
+TEST_CASE("$monitor on/off and replacement") {
+    CHECK(run_capture(R"(
+        module m;
+          integer a, b;
+          initial begin
+            a = 0; b = 0;
+            $monitor("mon1 a=%0d", a);
+            #1 a = 1;
+            #1 $monitoroff;
+            #1 a = 2;
+            #1 $monitoron;
+            #1 a = 3;
+            #1 $monitor("mon2 b=%0d", b);
+            #1 b = 7;
+            #1 a = 9;
+            #1 $finish;
+          end
+        endmodule
+    )") == "mon1 a=0\nmon1 a=1\nmon1 a=2\nmon1 a=3\nmon2 b=0\nmon2 b=7\n");
+}
+
+// $monitor inside a function has no wheel in the ABI; guard loud (like $strobe).
+TEST_CASE("$monitor in a function is rejected") {
+    check_rejected(R"(
+        module m;
+          function void f(); $monitor("x"); endfunction
+          initial f();
+        endmodule
+    )",
+                   "$monitor inside a function is not supported");
+}

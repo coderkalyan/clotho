@@ -371,6 +371,14 @@ const char* tag_name(Inst::Tag tag) {
             return "fdisplay";
         case T::StrobePend:
             return "strobe_pend";
+        case T::MonitorSet:
+            return "monitor_set";
+        case T::MonitorEmit:
+            return "monitor_emit";
+        case T::MonitorOn:
+            return "monitor_on";
+        case T::MonitorOff:
+            return "monitor_off";
         case T::Finish:
             return "finish";
         case T::CaseViol:

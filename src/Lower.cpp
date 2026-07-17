@@ -6344,7 +6344,23 @@ private:
             return;
         }
         if (const char rx = display_radix(name, "$strobe")) {
-            lower_strobe(call, b, rx);
+            lower_strobe(call, b, rx, /*fd_arg=*/false);
+            return;
+        }
+        if (const char rx = display_radix(name, "$fstrobe")) {
+            lower_strobe(call, b, rx, /*fd_arg=*/true);
+            return;
+        }
+        if (const char rx = display_radix(name, "$monitor")) {
+            lower_monitor(call, b, rx, /*fd_arg=*/false);
+            return;
+        }
+        if (const char rx = display_radix(name, "$fmonitor")) {
+            lower_monitor(call, b, rx, /*fd_arg=*/true);
+            return;
+        }
+        if (name == "$monitoron" || name == "$monitoroff") {
+            b.monitor_enable(name == "$monitoron", loc(call));
             return;
         }
         if (const char rx = display_radix(name, "$fdisplay")) {
@@ -8078,7 +8094,7 @@ private:
     // end of the current simulation time, when all the simulation events have
     // occurred for that simulation time, just before simulation time is
     // advanced"). The call site just pends that task.
-    void lower_strobe(const CallExpression& call, ir::Builder& b, char default_conv) {
+    void lower_strobe(const CallExpression& call, ir::Builder& b, char default_conv, bool fd_arg) {
         if (fn_ctx_ != nullptr && !fn_ctx_->is_task) {
             // A function is a plain callable with no wheel pointer in its ABI
             // (the same restriction as $time / $realtime, see lower_sysfunc)
@@ -8091,8 +8107,23 @@ private:
             // coro_begin_) — a plain function has neither.
             fail("$strobe inside a function is not supported (no wheel in the ABI)");
         }
-        const ir::FunctionId fid = build_strobe_body(call.arguments(), default_conv, loc(call));
+        const ir::FunctionId fid =
+            build_deferred_body(call.arguments(), default_conv, loc(call), fd_arg, /*monitor=*/false);
         b.strobe_pend(fid, loc(call));
+    }
+
+    // Lower $monitor / $monitorb/o/h and $fmonitor (LRM 21.2.2): register a single
+    // persistent monitor. Unlike $strobe (fire-once), the monitor body re-runs at
+    // the Postponed region of EVERY subsequent time step and prints only when its
+    // rendered output changed (runtime change-detection, rt_monitor_emit). A new
+    // $monitor replaces the previous; $monitoron/$monitoroff enable/disable.
+    void lower_monitor(const CallExpression& call, ir::Builder& b, char default_conv, bool fd_arg) {
+        if (fn_ctx_ != nullptr && !fn_ctx_->is_task) {
+            fail("$monitor inside a function is not supported (no wheel in the ABI)");
+        }
+        const ir::FunctionId fid =
+            build_deferred_body(call.arguments(), default_conv, loc(call), fd_arg, /*monitor=*/true);
+        b.monitor_set(fid, loc(call));
     }
 
     // Lower $fdisplay / $fwrite (LRM §21.3.3): the first argument is the
@@ -11267,26 +11298,49 @@ private:
     // symbol never registered as a persistent signal — storage the deferred
     // body, resumed after the caller's own activation may have ended, cannot
     // reach anyway. Returns the reserved FunctionId; the call site pends it.
-    ir::FunctionId build_strobe_body(std::span<const Expression* const> args, char default_conv,
-                                     ir::SourceLoc l) {
+    // Synthesize the deferred-print body task for $strobe / $fstrobe / $monitor /
+    // $fmonitor. The task is zero-formal: it evaluates the argument list at the
+    // Postponed region and prints it. `fd_arg` (for $f* forms) makes args[0] the
+    // destination descriptor and args[1..] the message; `monitor` routes the print
+    // through the change-detecting monitor emit (else a plain display/fdisplay).
+    ir::FunctionId build_deferred_body(std::span<const Expression* const> args, char default_conv,
+                                       ir::SourceLoc l, bool fd_arg, bool monitor) {
         const ir::FunctionId id = module_.reserve_function();
 
         FnCtx ctx;
-        ctx.name_prefix = "strobe.";
+        ctx.name_prefix = monitor ? "monitor." : "strobe.";
         ctx.is_task     = true;
         FnCtx* saved    = fn_ctx_;
         fn_ctx_         = &ctx;
         std::vector<std::string_view> saved_blocks;
         saved_blocks.swap(named_blocks_);
 
-        ir::Builder             b(module_.pool);
-        std::string             fmt;
-        std::vector<ir::Index>  fargs;
+        ir::Builder b(module_.pool);
+        // $display / $strobe target the standard-output MCD (descriptor 1); the $f*
+        // forms carry an explicit descriptor as the first argument.
+        ir::Index desc = b.constant(svint_to_ref(slang::SVInt(32, 1, true),
+                                                 make_int_type(32, false, true)),
+                                    l);
+        if (fd_arg) {
+            if (args.empty()) {
+                fail("$fstrobe / $fmonitor requires a file-descriptor argument");
+            }
+            desc = lower_expr(*args[0], b);
+            args = args.subspan(1);
+        }
+        std::string            fmt;
+        std::vector<ir::Index> fargs;
         build_format(args, fmt, fargs, b, default_conv);
-        b.display(fmt, /*newline=*/true, fargs, l);
+        if (monitor) {
+            b.monitor_emit(desc, fmt, fargs, l);
+        } else if (fd_arg) {
+            b.fdisplay(desc, fmt, /*newline=*/true, fargs, l);
+        } else {
+            b.display(fmt, /*newline=*/true, fargs, l);
+        }
         b.ret_void(l);
 
-        module_.set_function(id, ir::Function{ .name        = "strobe",
+        module_.set_function(id, ir::Function{ .name        = monitor ? "monitor" : "strobe",
                                                .return_type = module_.pool.void_type,
                                                .param_types = {},
                                                .arg_dirs    = {},

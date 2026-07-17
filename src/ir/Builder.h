@@ -297,6 +297,15 @@ public:
     // zero-formal deferred-print task `func` to run once in the Postponed
     // region of the current time step. A statement, never a value.
     Index strobe_pend(FunctionId func, SourceLoc loc);
+    // $monitor / $fmonitor (LRM 21.2.2): register `func` as the single active
+    // monitor body (replacing any prior one), enabled, running each subsequent
+    // time step in the Postponed region. A statement.
+    Index monitor_set(FunctionId func, SourceLoc loc);
+    // The change-detecting print inside a monitor body: render `fmt`+`args` and
+    // emit to `fd` only if the rendered output changed since the last emit.
+    Index monitor_emit(Index fd, std::string_view fmt, std::span<const Index> args, SourceLoc loc);
+    // $monitoron (on=true) / $monitoroff (on=false): enable / disable the monitor.
+    Index monitor_enable(bool on, SourceLoc loc);
     // Two-argument $fopen: open `name` with the C stdio mode string `mode`,
     // yielding a 32-bit FD.
     Index fopen_fd(Index name, Index mode, SourceLoc loc);

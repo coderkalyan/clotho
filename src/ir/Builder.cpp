@@ -554,6 +554,21 @@ Index Builder::strobe_pend(FunctionId func, SourceLoc loc) {
                 loc);
 }
 
+Index Builder::monitor_set(FunctionId func, SourceLoc loc) {
+    return emit({ Inst::Tag::MonitorSet, pay(&Inst::Payload::extra, add_extra(StrobePendInfo{ func })) },
+                loc);
+}
+
+Index Builder::monitor_emit(Index fd, std::string_view fmt, std::span<const Index> args, SourceLoc loc) {
+    return emit({ Inst::Tag::MonitorEmit,
+                  Inst::Payload{ .op_extra = { fd, display_info(fmt, /*newline=*/true, args) } } },
+                loc);
+}
+
+Index Builder::monitor_enable(bool on, SourceLoc loc) {
+    return emit({ on ? Inst::Tag::MonitorOn : Inst::Tag::MonitorOff, Inst::Payload{} }, loc);
+}
+
 ExtraIndex Builder::display_info(std::string_view fmt, bool newline, std::span<const Index> args) {
     // Order in the extra buffer: format bytes, then the arg-index slice, then the
     // DisplayInfo record pointing at both. None of the three regions overlap.

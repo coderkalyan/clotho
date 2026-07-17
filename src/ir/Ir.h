@@ -1372,6 +1372,19 @@ struct Inst {
         // coroutine (see is_simple_always) so its call site can ramp `func`'s
         // coroutine frame through the task-call record ABI.
         StrobePend,
+        // $monitor / $fmonitor (LRM 21.2.2): register the zero-formal monitor body
+        // `func` as the single active monitor (payload: extra -> StrobePendInfo).
+        // The backend stores its ramp function pointer; the Postponed-region drain
+        // runs it each subsequent time step. A new MonitorSet replaces the prior.
+        MonitorSet,
+        // The change-detecting print inside a monitor body (payload: op_extra — op
+        // is the destination descriptor, extra a DisplayInfo). Renders the format +
+        // args and emits to the descriptor only if the output changed since the
+        // last emit (rt_monitor_emit).
+        MonitorEmit,
+        // $monitoron / $monitoroff (payload: none): enable / disable the monitor.
+        MonitorOn,
+        MonitorOff,
         // Two-argument $fopen(name, mode): open a single file descriptor with
         // the C stdio mode string, -> 32-bit FD value (payload: binary — l is
         // the filename value, r the mode string; both packed-ASCII vectors the
@@ -1859,7 +1872,13 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::CaseViol:
         case T::TestPlusArgs:
         case T::StrobePend:
+        case T::MonitorSet:
             return K::Extra;
+        case T::MonitorEmit:
+            return K::FDisplay; // op = descriptor, extra = DisplayInfo
+        case T::MonitorOn:
+        case T::MonitorOff:
+            return K::None;
         case T::Fork:
             // Children are FunctionIds (not SSA operands), walked from ForkInfo;
             // the op has no top-level operands, so it rides the Extra path.

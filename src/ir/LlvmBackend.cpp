@@ -633,7 +633,8 @@ public:
             report_comb_fuse_stat();
         }
         compute_domain_spec();   // after fusion (thunk_group_): reads spec_group_ in lower_group
-        design_uses_strobe_ = design_uses_strobe(); // gates the Postponed-region drain loop
+        design_uses_strobe_  = design_uses_strobe(); // gates the Postponed-region drain loop
+        design_uses_monitor_ = design_uses_monitor();
         build_vcd_index();       // before build_nba_state: fills vcd_index_ / design_uses_vcd_
         build_wait_queues();
         build_instance_ctx_layout(); // after build_wait_queues: ctx sizes need wait slots
@@ -7298,6 +7299,33 @@ private:
             b_.CreateBr(pop_bb);
             b_.SetInsertPoint(done_bb);
         }
+        // $monitor (LRM 21.2.2): at every settled instant, if a monitor is
+        // registered and enabled, ramp its body here (in the Postponed region) and
+        // resume it. The body renders its argument list and prints only when the
+        // output changed since the last emit (rt_monitor_emit), giving the "print
+        // once per time step on any argument change" semantics. The body never
+        // suspends (timing controls in the arg list are rejected), so one resume
+        // runs it to completion. Ramping is indirect: rt_monitor_active_ramp yields
+        // the registered body's ramp function pointer (or null), which we call with
+        // the task ABI (state, wheel, record).
+        if (design_uses_monitor_) {
+            auto* fn      = b_.GetInsertBlock()->getParent();
+            auto* run_bb  = llvm::BasicBlock::Create(ctx_, "monitor.run", fn);
+            auto* cont_bb = llvm::BasicBlock::Create(ctx_, "monitor.cont", fn);
+            auto* ptr_ty  = llvm::PointerType::getUnqual(ctx_);
+            llvm::Value* ramp = b_.CreateCall(monitor_active_ramp_fn(), {});
+            b_.CreateCondBr(b_.CreateICmpNE(ramp, llvm::ConstantPointerNull::get(ptr_ty)),
+                            run_bb, cont_bb);
+            b_.SetInsertPoint(run_bb);
+            llvm::Value* record = b_.CreateAlloca(ptr_ty, nullptr, "monitor.record");
+            b_.CreateStore(llvm::ConstantPointerNull::get(ptr_ty), record);
+            auto* rampty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty, ptr_ty }, false);
+            llvm::Value* hdl = b_.CreateCall(rampty, ramp, { state, wheel, record });
+            b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
+            b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
+            b_.CreateBr(cont_bb);
+            b_.SetInsertPoint(cont_bb);
+        }
         // Advance one instant (firing any timers, which enqueue their handles) and
         // re-drain. rt_wheel_advance folds the pending-check into the tick — one ABI
         // crossing per timestep, no separate occupancy scan — and returns non-zero
@@ -8523,6 +8551,10 @@ private:
             case Inst::Tag::Display:
             case Inst::Tag::FDisplay:
             case Inst::Tag::StrobePend:
+            case Inst::Tag::MonitorSet:
+            case Inst::Tag::MonitorEmit:
+            case Inst::Tag::MonitorOn:
+            case Inst::Tag::MonitorOff:
             case Inst::Tag::TimeFormat:
             case Inst::Tag::Finish:
             case Inst::Tag::CaseViol:
@@ -9907,6 +9939,23 @@ private:
 
             case Inst::Tag::StrobePend:
                 lower_strobe_pend(i);
+                return;
+            case Inst::Tag::MonitorSet:
+                b_.CreateCall(monitor_set_fn(),
+                              { sym(fn_decls_[static_cast<uint32_t>(
+                                  ir_->extra_data<StrobePendInfo>(ir_->payload(i).extra).func)]) });
+                return;
+            case Inst::Tag::MonitorEmit: {
+                const auto& p = ir_->payload(i).op_extra;
+                emit_display_to(ir_->extra_data<DisplayInfo>(p.extra),
+                                cast(must_of(value_of(p.op)), 32, true), monitor_emit_fn());
+                return;
+            }
+            case Inst::Tag::MonitorOn:
+                b_.CreateCall(monitor_enable_fn(), { b_.getInt32(1) });
+                return;
+            case Inst::Tag::MonitorOff:
+                b_.CreateCall(monitor_enable_fn(), { b_.getInt32(0) });
                 return;
 
             case Inst::Tag::TimeFormat:
@@ -12724,6 +12773,27 @@ private:
         return false;
     }
 
+    // Any $monitor / $fmonitor registration in the design? Gates the per-instant
+    // Postponed-region monitor run (see emit_active_run).
+    bool design_uses_monitor() const {
+        for (const Process& p : mod_.processes()) {
+            for (uint32_t k = 0; k < p.ir.inst_count(); ++k) {
+                if (p.ir.tag(static_cast<Index>(k)) == Inst::Tag::MonitorSet) {
+                    return true;
+                }
+            }
+        }
+        for (uint32_t i = 0; i < mod_.function_count(); ++i) {
+            const Ir& ir = mod_.function(static_cast<FunctionId>(i)).ir;
+            for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+                if (ir.tag(static_cast<Index>(k)) == Inst::Tag::MonitorSet) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     // Assign each dumped scalar signal its runtime dump-var index, in the exact
     // order rt_vcd_var / rt_vcd_array register variables (the emit_vcd_var walk):
     // an unpacked array consumes elem_count indices (its always-scanned elements),
@@ -14195,15 +14265,42 @@ private:
     }
 
     void emit_display(const DisplayInfo& info, llvm::Value* desc) {
+        emit_display_to(info, desc, fwrite_fn());
+    }
+
+    // Render a DisplayInfo's format + args and call `sink` with the rt_fwrite-shaped
+    // (desc, fmt, argc, argv) tuple. `sink` is rt_fwrite for $display/$fdisplay, or
+    // rt_monitor_emit (same signature, but change-detecting) for a monitor body.
+    void emit_display_to(const DisplayInfo& info, llvm::Value* desc, llvm::FunctionCallee sink) {
         std::string fmt = ir_->extra_bytes(info.fmt, info.fmt_len);
         if (info.newline) {
             fmt += '\n';
         }
-
-        const std::span<const Index> args = ir_->region(info.args);
-        llvm::Value*                 arr  = build_rt_args(args, "$display / $write");
+        const std::span<const Index> args    = ir_->region(info.args);
+        llvm::Value*                 arr     = build_rt_args(args, "$display / $write");
         llvm::Value*                 fmt_ptr = b_.CreateGlobalString(fmt);
-        b_.CreateCall(fwrite_fn(), { desc, fmt_ptr, b_.getInt32(static_cast<uint32_t>(args.size())), arr });
+        b_.CreateCall(sink, { desc, fmt_ptr, b_.getInt32(static_cast<uint32_t>(args.size())), arr });
+    }
+
+    // rt_monitor_emit(i32 desc, ptr fmt, i32 argc, ptr argv) — like rt_fwrite but
+    // prints only when the rendered output differs from the last (LRM 21.2.2).
+    llvm::FunctionCallee monitor_emit_fn() {
+        auto* i32 = b_.getInt32Ty();
+        return rt_fn("rt_monitor_emit", b_.getVoidTy(), { i32, raw_ptr_ty(), i32, raw_ptr_ty() });
+    }
+    // rt_monitor_set(ptr ramp) — register the monitor body's ramp function pointer
+    // as the single active monitor (enabled, output-primed reset).
+    llvm::FunctionCallee monitor_set_fn() {
+        return rt_fn("rt_monitor_set", b_.getVoidTy(), { raw_ptr_ty() });
+    }
+    // rt_monitor_enable(i32 on) — $monitoron / $monitoroff.
+    llvm::FunctionCallee monitor_enable_fn() {
+        return rt_fn("rt_monitor_enable", b_.getVoidTy(), { b_.getInt32Ty() });
+    }
+    // ptr rt_monitor_active_ramp(void) — the registered ramp fn ptr if a monitor is
+    // active and enabled, else null (drives the Postponed-region per-instant run).
+    llvm::FunctionCallee monitor_active_ramp_fn() {
+        return rt_fn("rt_monitor_active_ramp", raw_ptr_ty(), {});
     }
 
     void store_field(llvm::StructType* sty, llvm::Value* elt, unsigned idx, llvm::Value* v) {
@@ -16036,7 +16133,8 @@ private:
     // Any StrobePend instruction anywhere in the design? Gates the per-instant
     // Postponed-region drain loop (emit_active_run), so a design with no
     // $strobe pays nothing.
-    bool design_uses_strobe_ = false;
+    bool design_uses_strobe_  = false;
+    bool design_uses_monitor_ = false;
     std::vector<int32_t>  vcd_index_;
     llvm::GlobalVariable* nba_vcd_gv_ = nullptr;
 

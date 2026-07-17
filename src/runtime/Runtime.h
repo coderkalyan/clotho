@@ -65,6 +65,19 @@ void rt_strobe_pend(void* handle);
 // in a loop from the Postponed region.
 void* rt_strobe_pop(void);
 
+// -- $monitor (LRM 21.2.2) --
+//
+// A single persistent monitor. rt_monitor_set registers its body's ramp function
+// pointer (replacing any prior one). Each settled instant the Postponed-region
+// drain queries rt_monitor_active_ramp and, if non-null, ramps + resumes that
+// body, which renders its arguments and calls rt_monitor_emit — which prints only
+// when the rendered output changed since the last emit. $monitoron/$monitoroff map
+// to rt_monitor_enable.
+void  rt_monitor_set(void* ramp);
+void  rt_monitor_enable(int32_t on);
+void* rt_monitor_active_ramp(void);
+void  rt_monitor_emit(int32_t desc, const char* fmt, uint32_t argc, const rt_arg* argv);
+
 // -- $timeformat / %t --
 //
 // The %t format specifier renders a time argument (passed in design ticks, i.e.

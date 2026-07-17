@@ -2097,24 +2097,80 @@ extern "C" int rt_wheel_advance(rt_wheel* wheel, void* ctx) {
     return unwrap(wheel)->advance(ctx) ? 1 : 0;
 }
 
-extern "C" void rt_fwrite(int32_t desc, const char* fmt, uint32_t argc, const rt_arg* argv) {
-    io_ensure_init();
-    // Write raw: `out` may contain '%' or '{}' that printf/std::print would treat
-    // as format syntax.
-    std::string out;
-    render(out, fmt, argc, argv);
+namespace {
+// Write already-rendered bytes to a descriptor: an FD's stream, or every set
+// channel of an MCD (LRM §21.3.4).
+void write_raw(int32_t desc, const std::string& out) {
     if ((desc & kFdBit) != 0) {
         if (std::FILE* f = fd_stream(desc)) {
             std::fwrite(out.data(), 1, out.size(), f);
         }
         return;
     }
-    // MCD: emit to every set channel (LRM §21.3.4 multichannel descriptor).
     for (int b = 0; b < 31; ++b) {
         if ((desc & (int32_t{ 1 } << b)) != 0 && mcd_channels[b] != nullptr) {
             std::fwrite(out.data(), 1, out.size(), mcd_channels[b]);
         }
     }
+}
+} // namespace
+
+extern "C" void rt_fwrite(int32_t desc, const char* fmt, uint32_t argc, const rt_arg* argv) {
+    io_ensure_init();
+    // Write raw: `out` may contain '%' or '{}' that printf/std::print would treat
+    // as format syntax.
+    std::string out;
+    render(out, fmt, argc, argv);
+    write_raw(desc, out);
+}
+
+namespace {
+// The single active $monitor (LRM 21.2.2): its body's ramp function pointer, the
+// enable flag, and the last rendered output for change detection. `primed` is
+// false until the first emit (or after a re-arm), forcing that first print.
+struct MonitorState {
+    void*       ramp    = nullptr;
+    bool        enabled = false;
+    bool        has     = false;
+    bool        primed  = false;
+    std::string last;
+};
+MonitorState g_monitor;
+} // namespace
+
+extern "C" void rt_monitor_set(void* ramp) {
+    g_monitor.ramp    = ramp;
+    g_monitor.enabled = true;
+    g_monitor.has     = true;
+    g_monitor.primed  = false; // print at the first settled instant
+    g_monitor.last.clear();
+}
+
+extern "C" void rt_monitor_enable(int32_t on) {
+    if (!g_monitor.has) {
+        return;
+    }
+    g_monitor.enabled = (on != 0);
+    if (on != 0) {
+        g_monitor.primed = false; // $monitoron reprints the current values
+        g_monitor.last.clear();
+    }
+}
+
+extern "C" void* rt_monitor_active_ramp() {
+    return (g_monitor.has && g_monitor.enabled) ? g_monitor.ramp : nullptr;
+}
+
+extern "C" void rt_monitor_emit(int32_t desc, const char* fmt, uint32_t argc, const rt_arg* argv) {
+    io_ensure_init();
+    std::string out;
+    render(out, fmt, argc, argv);
+    if (g_monitor.primed && out == g_monitor.last) {
+        return; // no argument changed this time step
+    }
+    g_monitor.primed = true;
+    g_monitor.last   = std::move(out);
+    write_raw(desc, g_monitor.last);
 }
 
 namespace {

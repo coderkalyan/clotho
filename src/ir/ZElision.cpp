@@ -534,6 +534,10 @@ struct Analysis {
                 case Inst::Tag::Display:
                 case Inst::Tag::FDisplay:
                 case Inst::Tag::StrobePend:
+                case Inst::Tag::MonitorSet:
+                case Inst::Tag::MonitorEmit:
+                case Inst::Tag::MonitorOn:
+                case Inst::Tag::MonitorOff:
                 case Inst::Tag::TimeFormat:
                 case Inst::Tag::Finish:
                 case Inst::Tag::CaseViol:
