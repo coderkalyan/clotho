@@ -1369,8 +1369,11 @@ private:
         }
         for (const auto& prop : clt.membersOfType<slang::ast::ClassPropertySymbol>()) {
             if (prop.lifetime == slang::ast::VariableLifetime::Static) {
-                // TODO: static class members (one shared slot, Phase 2).
-                fail("static class properties are not supported");
+                // A static property (LRM 8.9) is ONE slot shared across all
+                // instances, not part of the per-object body — it gets persistent
+                // module-signal storage (declare_static_prop), registered lazily on
+                // first access. Skip it here.
+                continue;
             }
             if (prop.randMode != slang::ast::RandMode::None) {
                 // TODO: rand / randc properties and randomize() (Phase 3).
@@ -10103,6 +10106,13 @@ private:
     // already works (the same shape a multi-dimensional packed select uses).
     ir::Index lower_member_lvalue(const MemberAccessExpression& ma, ir::Builder& b, ir::SourceLoc l) {
         if (const auto* prop = ma.member.as_if<slang::ast::ClassPropertySymbol>()) {
+            if (prop->lifetime == slang::ast::VariableLifetime::Static) {
+                // `obj.static_prop` (LRM 8.9): the shared slot, not the object body.
+                // Evaluate the object expression for any side effects (it may be a
+                // call), then discard it and address the shared signal.
+                (void)lower_expr(ma.value(), b);
+                return b.signal(declare_static_prop(*prop), l);
+            }
             // `obj.prop` (LRM 8.4): load the object handle (a value), then a
             // handle-deref + field select rooted at the object body. The base
             // handle is an rvalue (the pointer), not the slot's lvalue.
@@ -10335,6 +10345,49 @@ private:
         return sig;
     }
 
+    // A static class property (LRM 8.9): ONE slot shared across every instance of
+    // the class (and its derived classes), not part of the per-object body. Like a
+    // static function local — persistent module-signal storage, keyed by the
+    // property symbol, class-qualified name — but resolved wherever the property is
+    // referenced (`obj.p`, `C::p`, or a bare `p` in a method). Registered lazily on
+    // first access; its initializer (if any) runs once at time zero via the PreInit
+    // process (LRM 8.9.2), like a module-level static variable.
+    ir::Signal declare_static_prop(const slang::ast::ClassPropertySymbol& prop) {
+        const auto it = sigmap_.find(&prop);
+        if (it != sigmap_.end()) {
+            return it->second;
+        }
+        std::string cls;
+        if (const slang::ast::Scope* sc = prop.getParentScope()) {
+            cls = std::string(sc->asSymbol().name) + "::";
+        }
+        const ir::Ref pty = lower_type(prop.getType());
+        ir::SignalInfo info;
+        info.name            = prefix_ + cls + std::string(prop.name);
+        info.type            = pty;
+        info.dir             = ir::SignalInfo::Direction::Internal;
+        const ir::Signal sig = register_signal(std::move(info));
+        sigmap_[&prop]       = sig;
+
+        // Queue the initializer once (this is the first-access path). A non-scalar
+        // initializer is deferred loud — most static-property initializers are
+        // constants / parameters.
+        if (const Expression* init = prop.getInitializer()) {
+            if (is_aggregate(prop.getType()) || is_unpacked_container(prop.getType())) {
+                // TODO: aggregate static-property initializer (per-leaf PreInit store).
+                fail("aggregate static class property initializer is not supported");
+            }
+            if (!preinit_) {
+                preinit_.emplace(module_.pool);
+            }
+            ir::Builder&        pb = *preinit_;
+            const ir::SourceLoc il = loc(*init);
+            pb.binary(ir::Inst::Tag::Store, pb.signal(sig, il),
+                      coerce(lower_expr(*init, pb), *init->type, pty, pb, il), il);
+        }
+        return sig;
+    }
+
     // True if `vs` is a static-lifetime function local (persistent storage). A
     // loop control variable is always treated as per-call (force_frame), since its
     // value is reset by the loop initialization on every entry regardless.
@@ -10371,6 +10424,14 @@ private:
     // symbol is one of the current function's locals, else a module Signal (which
     // a function may also reference directly). signal_of fails loudly if unknown.
     ir::Index value_lvalue(const ValueSymbol& vs, ir::Builder& b, ir::SourceLoc l) {
+        // A static class property is shared storage (never a frame local or `this`
+        // member), whether referenced bare in a method, as `C::p`, or `p` in a
+        // static method. Resolve it to its shared signal before any frame/this path.
+        if (const auto* prop = vs.as_if<slang::ast::ClassPropertySymbol>()) {
+            if (prop->lifetime == slang::ast::VariableLifetime::Static) {
+                return b.signal(declare_static_prop(*prop), l);
+            }
+        }
         if (fn_ctx_ != nullptr) {
             const auto it = fn_ctx_->localmap.find(&vs);
             if (it != fn_ctx_->localmap.end()) {
@@ -11179,6 +11240,12 @@ private:
                                       handle, class_ref, b);
         }
         for (const auto& prop : clt.membersOfType<slang::ast::ClassPropertySymbol>()) {
+            // A static property is not per-object: it has one shared slot,
+            // initialized once at time zero in PreInit (declare_static_prop), not on
+            // every `new`.
+            if (prop.lifetime == slang::ast::VariableLifetime::Static) {
+                continue;
+            }
             const Expression* init = prop.getInitializer();
             if (init == nullptr) {
                 continue;

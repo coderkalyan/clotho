@@ -318,6 +318,52 @@ TEST_CASE("class inheritance: upcast shares the object") {
     CHECK(run_capture(src) == "10 10\n");
 }
 
+TEST_CASE("class static property: shared slot, inherited, all access forms") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Counter;
+                static int count = 0;
+                int id;
+                function new(); count = count + 1; id = count; endfunction
+                static function int get_count(); return count; endfunction
+            endclass
+            class Derived extends Counter;
+                int extra;
+            endclass
+            initial begin
+                Counter a = new();
+                Counter b = new();
+                Derived c = new();
+                Counter::count = Counter::count + 100;
+                $display("%0d %0d %0d %0d %0d %0d",
+                         a.id, b.id, c.id, a.count, Counter::count, Counter::get_count());
+            end
+        endmodule
+    )";
+    // ids 1 2 3 (shared, inherited); then count 3->103 read three ways
+    CHECK(run_capture(src) == "1 2 3 103 103 103\n");
+}
+
+// A static property of a class that is never instantiated still initializes once
+// (lazily, in PreInit); `local`/`static const` carry no runtime obligation.
+TEST_CASE("class static property: no instance, const, local") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Config;
+                static int limit = 42;
+                static const int MAX = 99;
+                local static int secret = 7;
+                static function int reveal(); return secret; endfunction
+            endclass
+            initial begin
+                Config::limit = Config::limit + 1;
+                $display("%0d %0d %0d", Config::limit, Config::MAX, Config::reveal());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "43 99 7\n");
+}
+
 // A virtual method needs dynamic dispatch (Phase 3, vtable); it must fail loudly,
 // not silently lower as a direct call. The implicit built-in
 // `randomize` virtual must NOT trip this guard.
