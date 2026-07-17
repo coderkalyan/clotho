@@ -615,6 +615,80 @@ TEST_CASE("pure virtual with non-scalar return fails loudly") {
     CHECK(d.find("pure virtual method with a non-scalar return is not supported") != std::string::npos);
 }
 
+TEST_CASE("parameterized class: type + value params, param-sized array") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Vec #(type T = int, int N = 4);
+                T   data[N];
+                function void set(int i, T v); data[i] = v; endfunction
+                function T    get(int i);       return data[i]; endfunction
+                function int  size();           return N; endfunction
+            endclass
+            initial begin
+                Vec#(int, 3)  vi = new();
+                Vec#(byte, 2) vb = new();
+                vi.set(0, 100); vi.set(1, 200);
+                vb.set(0, 8'sd5);
+                $display("%0d %0d %0d", vi.get(0), vi.get(1), vi.size());
+                $display("%0d %0d", vb.get(0), vb.size());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "100 200 3\n5 2\n");
+}
+
+// A derived class extending a specific specialization (`extends base#(5)`); the
+// value parameter flows into a member initializer.
+TEST_CASE("parameterized class: inheritance from a specialization") {
+    constexpr std::string_view src = R"(
+        module m;
+            class base_cls #(int b = 20); int a = b; endclass
+            class ext_cls #(int e = 25) extends base_cls #(5); int c = e; endclass
+            initial begin
+                ext_cls #(15) inst = new();
+                $display("%0d %0d", inst.a, inst.c);
+            end
+        endmodule
+    )";
+    // base#(5) -> a=5; ext#(15) -> c=15.
+    CHECK(run_capture(src) == "5 15\n");
+}
+
+// Each specialization has its own static storage (LRM 8.25): distinct
+// ClassPropertySymbols -> distinct signals. Read via `C#(N)::s`.
+TEST_CASE("parameterized class: per-specialization static members") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Counter #(int ID = 0);
+                static int count = 0;
+                function new(); count++; endfunction
+            endclass
+            initial begin
+                Counter#(1) a = new();
+                Counter#(1) b = new();
+                Counter#(2) c = new();
+                $display("%0d %0d", Counter#(1)::count, Counter#(2)::count);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2 1\n");
+}
+
+// A value parameter read through an instance (`obj.param`, LRM 8.5) and via scope
+// resolution (`C#(N)::param`) — both fold to the specialization's constant.
+TEST_CASE("parameterized class: value parameter access") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C #(int W = 8); int x = W; endclass
+            initial begin
+                C#(34) o = new();
+                $display("%0d %0d", o.W, C#(16)::W);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "34 16\n");
+}
+
 // Two classes forward-referencing each other's handle type: A's field type B
 // is declared before B exists, and B's method takes an A argument before A's
 // body (only its header) is complete.

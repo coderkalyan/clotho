@@ -1320,10 +1320,15 @@ private:
         // An abstract class (`virtual class`) is lowered normally (it can be a
         // handle type and a base); slang rejects a direct `new` on it (LRM 8.21),
         // and its pure-virtual slots are handled in compute_vtable.
-        if (clt.genericClass != nullptr) {
-            // TODO: parameterized classes (Phase 3).
-            fail("parameterized classes are not supported");
-        }
+        //
+        // A parameterized class (`class C #(...)`, LRM 8.25) needs no special
+        // handling: slang monomorphizes each `C#(args)` into a distinct, fully
+        // parameter-substituted ClassType (genericClass points back to the generic
+        // definition). Each specialization lowers here as an independent nominal
+        // class — distinct members, methods (own FunctionIds), and static storage
+        // (own ClassPropertySymbols → own signals), keyed per ClassType by
+        // class_type_cache_. So a `genericClass != nullptr` specialization is just a
+        // normal class from this point on.
         // Intern-first: reserve the field slot and build the class Ref before
         // lowering the base or properties, so a self-handle resolves via the cache.
         const uint32_t fid = module_.pool.reserve_struct_fields();
@@ -9331,6 +9336,13 @@ private:
                     return *c;
                 }
                 const MemberAccessExpression& ma = expr.as<MemberAccessExpression>();
+                if (const auto* param = ma.member.as_if<slang::ast::ParameterSymbol>()) {
+                    // A parameterized class's value parameter accessed via an instance
+                    // (`obj.param`, LRM 8.5): a compile-time constant of the
+                    // specialization, independent of the object. slang cannot fold
+                    // `obj.param` (obj is a runtime handle), so fold it here.
+                    return b.constant(lower_constant(param->getValue(), *ma.type), l);
+                }
                 const ir::Index v = b.unary(ir::Inst::Tag::Load, lower_member_lvalue(ma, b, l), l);
                 return narrow_to_declared(v, *ma.type, b, l);
             }
