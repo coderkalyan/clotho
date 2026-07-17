@@ -210,17 +210,126 @@ TEST_CASE("property power-on defaults by domain") {
     CHECK(run_capture(src) == "xx 0\n");
 }
 
-// Deferred Phase 2/3 features must fail loudly, not silently miscompile.
-// Inheritance is the representative guard.
-TEST_CASE("class inheritance fails loudly") {
-    const std::string d = fails(R"(
+// Inherited field + own field, an inherited method run on a derived object, and
+// a non-virtual override selected by the STATIC handle type (the reference test
+// distinguishing non-virtual binding from dispatch, docs/design/classes.md §10):
+// `bh` points at the derived object yet `bh.who()` calls Base::who.
+TEST_CASE("class inheritance: fields, inherited method, non-virtual override") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Base;
+                int a;
+                function new(int x); a = x; endfunction
+                function int f(); return a + 1; endfunction
+                function int who(); return 100; endfunction
+            endclass
+            class Derived extends Base;
+                int b;
+                function new(int x, int y); super.new(x); b = y; endfunction
+                function int who(); return 200; endfunction
+                function int sum(); return f() + b + super.who(); endfunction
+            endclass
+            initial begin
+                Derived d = new(5, 7);
+                Base    bh = d;
+                $display("%0d %0d %0d %0d %0d %0d %0d",
+                         d.a, d.b, d.f(), d.who(), bh.who(), d.sum(), bh.a);
+            end
+        endmodule
+    )";
+    // a=5 b=7 f=6 d.who=200 bh.who=100 sum=6+7+100=113 upcast a=5
+    CHECK(run_capture(src) == "5 7 6 200 100 113 5\n");
+}
+
+// Three-level chain with an implicit (constructor-less) middle class, chained
+// property defaults, and a constructor body that observes its own default
+// (A::new does a=a+1 over the default 11 -> 12). Exercises the implicit no-arg
+// base construction emitted at the constructor entry.
+TEST_CASE("class inheritance: multi-level chain, implicit ctor, chained defaults") {
+    constexpr std::string_view src = R"(
+        module m;
+            class A;
+                int a = 11;
+                function new(); a = a + 1; endfunction
+                function int ga(); return a; endfunction
+            endclass
+            class B extends A;
+                int b = 22;
+                function int gb(); return b; endfunction
+            endclass
+            class C extends B;
+                int c = 33;
+                function new(int z); super.new(); c = z; endfunction
+                function int total(); return ga() + gb() + c; endfunction
+            endclass
+            initial begin
+                C obj = new(99);
+                A up  = obj;
+                $display("%0d %0d %0d %0d %0d",
+                         obj.a, obj.b, obj.c, obj.total(), up.ga());
+            end
+        endmodule
+    )";
+    // a=12 b=22 c=99 total=12+22+99=133 up.ga()=12 (shared object via upcast)
+    CHECK(run_capture(src) == "12 22 99 133 12\n");
+}
+
+TEST_CASE("class inheritance: extends-args base constructor") {
+    constexpr std::string_view src = R"(
+        module m;
+            class A;
+                int a;
+                function new(int x); a = x * 10; endfunction
+                function int ga(); return a; endfunction
+            endclass
+            class B2 extends A(7);
+                int c = 5;
+            endclass
+            class B3 extends A(9);
+                int d;
+                function new(int q); d = q; endfunction
+            endclass
+            initial begin
+                B2 y = new();
+                B3 z = new(4);
+                $display("%0d %0d %0d %0d", y.ga(), y.c, z.ga(), z.d);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "70 5 90 4\n");
+}
+
+// Reference semantics survive an upcast: a write through the derived handle is
+// visible through a base handle to the same object (LRM 8.6 shared object).
+TEST_CASE("class inheritance: upcast shares the object") {
+    constexpr std::string_view src = R"(
         module m;
             class Base; int a; endclass
             class Derived extends Base; int b; endclass
-            initial begin Derived d; d = new(); d.b = 1; end
+            initial begin
+                Derived d = new();
+                Base    bh = d;
+                d.a = 9;
+                bh.a = bh.a + 1;
+                $display("%0d %0d", d.a, bh.a);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "10 10\n");
+}
+
+// A virtual method needs dynamic dispatch (Phase 3, vtable); it must fail loudly,
+// not silently lower as a direct call. The implicit built-in
+// `randomize` virtual must NOT trip this guard.
+TEST_CASE("class virtual method fails loudly") {
+    const std::string d = fails(R"(
+        module m;
+            class Base; virtual function int f(); return 1; endfunction endclass
+            class Derived extends Base; function int f(); return 2; endfunction endclass
+            initial begin Derived d; d = new(); $display("%0d", d.f()); end
         endmodule
     )");
-    CHECK(d.find("class inheritance is not supported") != std::string::npos);
+    CHECK(d.find("virtual methods are not supported") != std::string::npos);
 }
 
 // Two classes forward-referencing each other's handle type: A's field type B

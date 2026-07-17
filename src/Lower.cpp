@@ -1312,11 +1312,7 @@ private:
         if (const auto cached = class_type_cache_.find(&clt); cached != class_type_cache_.end()) {
             return cached->second;
         }
-        // Phase 2/3 features (docs/design/classes.md §2): guarded loud.
-        if (clt.getBaseClass() != nullptr) {
-            // TODO: single inheritance (`extends`), `super`, override (Phase 2).
-            fail("class inheritance is not supported");
-        }
+        // Phase 3 features (docs/design/classes.md §2): guarded loud.
         if (clt.isAbstract || clt.isInterface) {
             // TODO: virtual / interface classes and dynamic dispatch (Phase 3).
             fail("virtual / interface classes are not supported");
@@ -1325,17 +1321,52 @@ private:
             // TODO: parameterized classes (Phase 3).
             fail("parameterized classes are not supported");
         }
+        // A virtual method needs a vtable + dynamic dispatch (Phase 3); a
+        // non-virtual method statically binds (works). Guard the former loud so a
+        // `virtual` method is never silently lowered as a direct call.
+        for (const auto& method : clt.membersOfType<slang::ast::SubroutineSymbol>()) {
+            // slang synthesizes a built-in virtual `randomize` on every class
+            // (MethodFlags::BuiltIn); it is not a user dispatch target, so skip it.
+            // A user `virtual` method (or an implicit override of a virtual base
+            // method, isVirtual() via `overrides`) needs a vtable.
+            if (method.isVirtual() && !method.flags.has(slang::ast::MethodFlags::BuiltIn)) {
+                // TODO: virtual methods + dynamic dispatch (Phase 3, vtable header).
+                fail("virtual methods are not supported");
+            }
+        }
         // Intern-first: reserve the field slot and build the class Ref before
-        // lowering the properties, so a self-handle resolves via the cache.
+        // lowering the base or properties, so a self-handle resolves via the cache.
         const uint32_t fid = module_.pool.reserve_struct_fields();
         ir::Type       t;
         t.kind      = ir::Type::Kind::Class;
         t.fields_id = fid;
+        // Single inheritance (LRM 8.13): the object body lays the base's
+        // properties FIRST (prefix layout), so an upcast is the same pointer and an
+        // inherited property keeps its base-relative field index in every derived
+        // class. `element` records the base-class Ref (Invalid for a root class);
+        // the base is lowered first so its (already flattened) field table exists.
+        ir::Ref base_ref = ir::Ref::Invalid;
+        if (const slang::ast::Type* base = clt.getBaseClass()) {
+            base_ref = lower_class_type(base->getCanonicalType().as<slang::ast::ClassType>());
+        }
+        t.element         = base_ref;
         const ir::Ref ref = module_.pool.put(ir::Item{ t });
         class_type_cache_.emplace(&clt, ref);
 
         std::vector<ir::FieldRow> fields;
         uint32_t                  idx = 0;
+        // Copy the base's flattened property table as the prefix. The base's own
+        // base chain is already flattened into its table by this same recursion,
+        // so one level of copy suffices for arbitrary depth. Inherited props keep
+        // their base-relative index (already in class_prop_index_ from lowering the
+        // base), which prefix layout makes valid in this derived body too.
+        if (base_ref != ir::Ref::Invalid) {
+            const auto& bt = std::get<ir::Type>(module_.pool.get(base_ref));
+            for (const ir::Field& bf : module_.pool.struct_fields(bt.fields_id)) {
+                fields.push_back({ module_.pool.field_name(bf), bf.type, idx });
+                ++idx;
+            }
+        }
         for (const auto& prop : clt.membersOfType<slang::ast::ClassPropertySymbol>()) {
             if (prop.lifetime == slang::ast::VariableLifetime::Static) {
                 // TODO: static class members (one shared slot, Phase 2).
@@ -4389,6 +4420,16 @@ private:
                 } else if (e.kind == ExpressionKind::UnaryOp) {
                     // A bare `i++;` / `--i;` statement: bump and discard the value.
                     lower_unary(e.as<UnaryExpression>(), b);
+                } else if (e.kind == ExpressionKind::NewClass) {
+                    // A bare `super.new(...)` statement (LRM 8.15). Base construction
+                    // is emitted at the constructor's entry (build_function) from
+                    // getBaseConstructorCall(), which is order-equivalent (slang
+                    // requires super.new to be the first statement) and keeps the
+                    // extends-arg / ctor-formal scope right. The body statement is a
+                    // no-op marker.
+                    if (!e.as<slang::ast::NewClassExpression>().isSuperClass) {
+                        fail("unsupported expression statement");
+                    }
                 } else {
                     fail("unsupported expression statement");
                 }
@@ -10981,6 +11022,22 @@ private:
             ctx.ret_local = fn_local(*sub.returnValVar);
         }
 
+        // A constructor constructs its base part first (LRM 8.15), before the body:
+        // implicitly (no-arg), via `extends B(args)`, or via an explicit `super.new`
+        // (all three surface through getBaseConstructorCall()). Emit it here, in the
+        // constructor's own frame, where any base-arg that references a ctor formal
+        // is in scope. slang requires super.new to be the first statement, so
+        // entry-emission is order-equivalent; the body's super.new is a no-op.
+        if (sub.flags.has(slang::ast::MethodFlags::Constructor) && sub.thisVar != nullptr) {
+            const auto& clt = sub.thisVar->getType().getCanonicalType().as<slang::ast::ClassType>();
+            if (clt.getBaseClass() != nullptr) {
+                const ir::SourceLoc bl     = to_source_loc(sub.location);
+                const ir::Index     handle = b.unary(
+                    ir::Inst::Tag::Load, b.local(fn_ctx_->this_local, fn_ctx_->this_class, bl), bl);
+                emit_base_construction(clt, handle, b, bl);
+            }
+        }
+
         lower_stmt(sub.getBody(), b);
 
         // Fall-through return: yields the function variable (X if never assigned).
@@ -11018,34 +11075,92 @@ private:
     // and only the power-on defaults apply.
     ir::Index lower_new_class(const slang::ast::NewClassExpression& nc, ir::Builder& b) {
         const ir::SourceLoc l = loc(nc);
-        if (nc.isSuperClass) {
-            // TODO: super.new (chained base construction, Phase 2).
-            fail("super.new is not supported");
-        }
+        // super.new is handled at the constructor's entry (build_function) and
+        // no-op'd as a statement, so it never reaches here as an rvalue.
         const auto&     clt       = nc.type->getCanonicalType().as<slang::ast::ClassType>();
         const ir::Ref   class_ref = lower_type(*nc.type);
         const ir::Index handle    = b.class_new(class_ref, l);
         // Non-static property default initializers run at construction, in
-        // declaration order, BEFORE the constructor body (LRM 8.8). slang attaches
-        // them to the property (not the constructor body), and a class with no
-        // explicit constructor has no constructorCall at all, so apply them here.
+        // declaration order, BEFORE any constructor body (LRM 8.8). slang attaches
+        // them to the property (not the constructor body); apply the whole
+        // inheritance chain's defaults here, base-first, up front. Constructor
+        // bodies then run via emit_ctor_call.
         emit_class_property_inits(clt, handle, class_ref, b);
-        if (const Expression* ctor = nc.constructorCall()) {
-            const CallExpression&   cc   = ctor->as<CallExpression>();
-            const SubroutineSymbol& sub  = *std::get<0>(cc.subroutine);
-            const ir::FunctionId    id   = function_id(sub); // splices `this` as formal 0
-            const auto              formals = sub.getArguments();
-            const auto              actuals = cc.arguments();
-            if (formals.size() != actuals.size()) {
-                fail("constructor argument count mismatch");
-            }
-            std::vector<CopyOutArg> outs;
-            std::vector<ir::Index>  args = build_call_args(formals, actuals, outs, b, l);
-            args.insert(args.begin(), handle);
-            b.call(id, args, l); // the constructor is void
-            emit_call_copyouts(outs, b, l);
+        const SubroutineSymbol*            ctor = nullptr;
+        std::span<const Expression* const> actuals;
+        if (const Expression* cc = nc.constructorCall()) {
+            const CallExpression& call = cc->as<CallExpression>();
+            ctor                       = std::get<0>(call.subroutine);
+            actuals                    = call.arguments();
         }
+        emit_ctor_call(clt, ctor, actuals, handle, b, l);
         return handle;
+    }
+
+    // Run class `clt`'s constructor `ctor` (may be null) against object `handle`
+    // with the given actual argument expressions (LRM 8.7). A non-null ctor is
+    // called directly; its OWN base construction is emitted at its entry (implicit)
+    // or by its body's `super.new` — not here. A null ctor (the class declares no
+    // `new`) still constructs the class's base, since a ctor-less class contributes
+    // its base construction plus its property defaults (the latter already applied
+    // at allocation). Mutually recursive with emit_base_construction.
+    void emit_ctor_call(const slang::ast::ClassType& clt, const SubroutineSymbol* ctor,
+                        std::span<const Expression* const> actuals, ir::Index handle,
+                        ir::Builder& b, ir::SourceLoc l) {
+        if (ctor == nullptr) {
+            // No constructor: only the base part needs constructing. A ctor-less
+            // class cannot take constructor arguments.
+            emit_base_construction(clt, handle, b, l);
+            return;
+        }
+        const ir::FunctionId id      = function_id(*ctor); // splices `this` as formal 0
+        const auto           formals = ctor->getArguments();
+        if (formals.size() != actuals.size()) {
+            fail("constructor argument count mismatch");
+        }
+        std::vector<CopyOutArg> outs;
+        std::vector<ir::Index>  args = build_call_args(formals, actuals, outs, b, l);
+        args.insert(args.begin(), handle);
+        b.call(id, args, l); // the constructor is void
+        emit_call_copyouts(outs, b, l);
+    }
+
+    // Construct the base-class part of an object during class `clt`'s construction
+    // (LRM 8.15), for the IMPLICIT / `extends B(args)` cases — an explicit
+    // `super.new` handles itself via the statement path. Runs the base constructor
+    // against the same `handle`. Emitted either at a constructor's entry (where an
+    // `extends`-arg referencing a ctor formal is in scope) or from emit_ctor_call
+    // when recursing through a ctor-less class (whose base args are context-free).
+    void emit_base_construction(const slang::ast::ClassType& clt, ir::Index handle,
+                                ir::Builder& b, ir::SourceLoc l) {
+        const slang::ast::Type* base = clt.getBaseClass();
+        if (base == nullptr) {
+            return;
+        }
+        const auto&       base_clt  = base->getCanonicalType().as<slang::ast::ClassType>();
+        const Expression* base_call = clt.getBaseConstructorCall();
+        // Both an explicit `super.new(args)` (a NewClassExpression) and an
+        // `extends B(args)` clause (a CallExpression) carry the base constructor +
+        // actual args; extract the underlying call uniformly. The args may
+        // reference this constructor's formals (in scope at its entry).
+        if (base_call != nullptr) {
+            const CallExpression* cc = nullptr;
+            if (base_call->kind == ExpressionKind::NewClass) {
+                if (const Expression* inner =
+                        base_call->as<slang::ast::NewClassExpression>().constructorCall()) {
+                    cc = &inner->as<CallExpression>();
+                }
+            } else if (base_call->kind == ExpressionKind::Call) {
+                cc = &base_call->as<CallExpression>();
+            }
+            if (cc != nullptr) {
+                emit_ctor_call(base_clt, std::get<0>(cc->subroutine), cc->arguments(), handle, b, l);
+                return;
+            }
+            // `super.new()` to a ctor-less base: fall through to no-arg construction.
+        }
+        // Implicit no-arg base construction (base's own defaults applied already).
+        emit_ctor_call(base_clt, base_clt.getConstructor(), {}, handle, b, l);
     }
 
     // Apply a class's non-static property default initializers to a freshly-new'd
@@ -11055,6 +11170,14 @@ private:
     // signal_of — a documented V1 gap (most initializers are constants / params).
     void emit_class_property_inits(const slang::ast::ClassType& clt, ir::Index handle,
                                    ir::Ref class_ref, ir::Builder& b) {
+        // Base-class defaults first (LRM 8.8 / 8.13 declaration order runs the base
+        // part before the derived part). `class_ref` stays the *derived* (allocated)
+        // type so class_member_lvalue derefs the full body; an inherited property's
+        // prefix index (class_prop_index_) then addresses the right slot.
+        if (const slang::ast::Type* base = clt.getBaseClass()) {
+            emit_class_property_inits(base->getCanonicalType().as<slang::ast::ClassType>(),
+                                      handle, class_ref, b);
+        }
         for (const auto& prop : clt.membersOfType<slang::ast::ClassPropertySymbol>()) {
             const Expression* init = prop.getInitializer();
             if (init == nullptr) {
