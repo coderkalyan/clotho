@@ -557,12 +557,8 @@ TEST_CASE("a nested struct field's own default applies") {
     )") == "7 3\n");
 }
 
-// A static function-local with a struct field default is guarded loudly
-// (same "runs once, not per call" hazard as an explicit static-local
-// initializer): applying it per call would clobber a previous call's
-// mutations.
-TEST_CASE("a static local struct with a field default fails loudly") {
-    const LowerResult r = lower_text(R"(
+TEST_CASE("static local struct field default applies once") {
+    const std::string out = run_capture(R"(
         module m;
             typedef struct { int x = 5; } s_t;
             function automatic int f();
@@ -570,12 +566,10 @@ TEST_CASE("a static local struct with a field default fails loudly") {
                 s.x++;
                 return s.x;
             endfunction
-            initial $display("%0d", f());
+            initial $display("%0d %0d", f(), f());
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("static function local with a struct field-level default") !=
-          std::string::npos);
+    CHECK(out == "6 7\n");  // init once to 5, ++ each call -> 6, 7
 }
 
 // An array of a struct with field defaults, and no array initializer of its

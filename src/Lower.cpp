@@ -4994,13 +4994,23 @@ private:
     // control variable, which is per-call regardless of the function's lifetime.
     void lower_var_decl(const VariableSymbol& vs, ir::Builder& b, bool force_frame = false) {
         declare_storage(vs, force_frame);
+        if (is_static_local(vs, force_frame) &&
+            (vs.getInitializer() != nullptr || aggregate_has_field_defaults(vs.getType()))) {
+            // A static local's initializer (or struct field-level default) is
+            // evaluated ONCE before time zero (LRM 13.4.2), not on each call —
+            // register it in the run-once PreInit process, exactly like a
+            // module-level static variable (its storage is likewise a persistent
+            // signal, declare_static_local). A static initializer is a constant
+            // expression, so it needs no function frame; clear fn_ctx_ so a stray
+            // non-constant reference fails loudly rather than mis-resolving to a
+            // frame local.
+            FnCtx* saved = fn_ctx_;
+            fn_ctx_      = nullptr;
+            lower_var_initializer(vs);
+            fn_ctx_ = saved;
+            return;
+        }
         if (const Expression* init = vs.getInitializer()) {
-            if (is_static_local(vs, force_frame)) {
-                // A static local's initializer runs once at time zero, not on each
-                // call; modeling that needs a separate init pass. A static local
-                // without an initializer (default 0 / X at time zero) works.
-                fail("static function local with an initializer is not supported");
-            }
             const ir::SourceLoc l = loc(*init);
             if (is_aggregate(vs.getType()) || is_unpacked_container(vs.getType())) {
                 emit_struct_store(value_lvalue(vs, b, l), lower_type(vs.getType()), *init, ir::Inst::Tag::Store, b, l);
@@ -5009,13 +5019,7 @@ private:
             }
         } else if (aggregate_has_field_defaults(vs.getType())) {
             // No initializer of its own, but the struct type declares field-level
-            // defaults (LRM 7.2 / 8.8). Same "runs once, not per call" hazard as
-            // an explicit static-local initializer above: applying the defaults
-            // here would re-store them on every call, clobbering a previous
-            // call's mutations.
-            if (is_static_local(vs, force_frame)) {
-                fail("static function local with a struct field-level default initializer is not supported");
-            }
+            // defaults (LRM 7.2 / 8.8); apply them per call for a frame local.
             const ir::SourceLoc l = to_source_loc(vs.location);
             emit_var_field_defaults(vs, value_lvalue(vs, b, l), b, l);
         }

@@ -47,7 +47,7 @@ std::string run_capture(std::string_view source) {
 }
 
 // Lower and return the rendered diagnostics; ok must be false (a rejected design).
-std::string reject(std::string_view source) {
+[[maybe_unused]] std::string reject(std::string_view source) {
     const LowerResult r = lower_text(source);
     CHECK_FALSE(r.ok);
     return r.diagnostics;
@@ -305,21 +305,26 @@ TEST_CASE("static function local is per module instance") {
     CHECK(run_capture(src) == "1 2\n1 2\n");
 }
 
-// A static local with an initializer needs once-at-time-zero initialization,
-// which is not modeled; reject it rather than re-init on every call.
-TEST_CASE("static local with an initializer is rejected") {
+TEST_CASE("static local initializer runs once at time zero") {
     constexpr std::string_view src = R"(
         module m;
-            function int f();
-                static int c = 0;
+            function int counter();
+                static int c = 100;
                 c = c + 1;
                 return c;
             endfunction
-            int y;
-            initial y = f();
+            function automatic int fresh();
+                int a = 5;
+                a = a + 1;
+                return a;
+            endfunction
+            initial begin
+                $display("%0d %0d %0d", counter(), counter(), counter());
+                $display("%0d %0d", fresh(), fresh());
+            end
         endmodule
     )";
-    CHECK(reject(src).find("static function local with an initializer") != std::string::npos);
+    CHECK(run_capture(src) == "101 102 103\n6 6\n");
 }
 
 TEST_CASE("function output and inout arguments copy back") {
