@@ -189,3 +189,46 @@ TEST_CASE("enum methods are rejected") {
     )",
                    "non-constant step");
 }
+
+TEST_CASE("$cast: numeric and enum destinations") {
+    const std::string out = run_capture(R"(
+        module m;
+          typedef enum { A, B, C } E;  // 0,1,2
+          int a;
+          E e;
+          initial begin
+            a = 0; e = C;
+            $display("%0d %0d", $cast(a, 2.9 * 2.0), a);   // real->int: 1, a=6
+            $display("%0d %0d", $cast(e, 1), e);            // valid enum: 1, e=1
+            e = C;
+            $display("%0d %0d", $cast(e, 9), e);            // invalid: 0, e unchanged (2)
+          end
+        endmodule
+    )");
+    CHECK(out == "1 6\n1 1\n0 2\n");
+}
+
+// $cast as a task (bare statement) performs the assignment (numeric always
+// succeeds); the result is discarded.
+TEST_CASE("$cast: task form assigns") {
+    const std::string out = run_capture(R"(
+        module m;
+          int a;
+          initial begin a = 0; $cast(a, 2.1 * 3.7); $display("%0d", a); end
+        endmodule
+    )");
+    CHECK(out == "8\n");  // 2.1*3.7 = 7.77 -> rounds to 8
+}
+
+// A class-handle $cast (dynamic down-cast, Tier 2) needs a runtime type identity;
+// it must fail loudly, not silently mis-lower.
+TEST_CASE("$cast: class handle rejected") {
+    check_rejected(R"(
+        module m;
+          class Base; endclass
+          class Der extends Base; endclass
+          initial begin Base b; Der d; b = new(); if ($cast(d, b)) ; end
+        endmodule
+    )",
+                   "class handle is not supported");
+}

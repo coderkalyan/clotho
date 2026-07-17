@@ -6461,6 +6461,13 @@ private:
             b.dump_control(ir::Inst::Tag::DumpFlush, loc(call));
             return;
         }
+        if (name == "$cast") {
+            // Task form (LRM 6.24.2): performs the conditional assignment; the
+            // success result is discarded (the failed-cast runtime fatal is a
+            // documented follow-up — see lower_sysfunc). Shares the function logic.
+            (void)lower_sysfunc(call, b);
+            return;
+        }
         fail("unsupported system task '" + std::string(name) + "'");
     }
 
@@ -7266,6 +7273,52 @@ private:
                 fail("$typename expects exactly one argument");
             }
             return b.constant(string_value_ref(format_typename(*call.arguments()[0]->type)), l);
+        }
+
+        // $cast(dest, source) (LRM 6.24.2 / 8.16): a dynamic, run-time-checked cast.
+        // Returns 1 and assigns on success, else returns 0 and leaves dest unchanged.
+        // Tier 1: numeric and enum destinations (a class-handle down-cast needs a
+        // runtime type identity — Tier 2, guarded below). The task-form runtime
+        // fatal on a failed cast is a documented follow-up (only a bare-statement
+        // enum/class $cast that actually fails would observe it; the sv-tests and
+        // the common `if(!$cast(...))` function form do not).
+        if (name == "$cast") {
+            if (call.arguments().size() != 2) {
+                fail("$cast expects exactly two arguments");
+            }
+            const Expression&           dest_expr = *call.arguments()[0];
+            const Expression&           src_expr  = *call.arguments()[1];
+            const slang::ast::Type&     dt        = dest_expr.type->getCanonicalType();
+            if (dt.isClass() || dt.isCHandle()) {
+                // TODO: $cast of a class handle (dynamic down-cast) — needs a runtime
+                // per-object type identity (Tier 2).
+                fail("$cast of a class handle is not supported");
+            }
+            const ir::Ref   dest_ty = lower_type(*dest_expr.type);
+            const ir::Index dst     = lower_lvalue(dest_expr, b);
+            const ir::Index conv    = coerce(lower_expr(src_expr, b), *src_expr.type, dest_ty, b, l);
+            const ir::Ref   bit1    = make_int_type(1, false, false);
+            if (const auto* et = dt.as_if<slang::ast::EnumType>()) {
+                // Enum destination (LRM 6.19.3): succeed only if the value is a legal
+                // member. valid = OR over members of (conv === member).
+                ir::Index valid = b.constant(module_.pool.put_int(bit1, 0), l);
+                const ir::Index one = b.constant(module_.pool.put_int(bit1, 1), l);
+                for (const EnumMember& m : enum_members(*et)) {
+                    const ir::Index mc = b.constant(svint_to_ref(m.value, dest_ty), l);
+                    const ir::Index eq = b.binary(ir::Inst::Tag::CaseEq, conv, mc, l);
+                    valid              = b.select(eq, one, valid, l);
+                }
+                // Assign the value on success; keep the current dest on failure.
+                const ir::Index cur = b.unary(ir::Inst::Tag::Load, dst, l);
+                b.binary(ir::Inst::Tag::Store, dst, b.select(valid, conv, cur, l), l);
+                const ir::Ref   int_ty = lower_type(*call.type);
+                const ir::Index int1   = b.constant(svint_to_ref(slang::SVInt(32, 1, true), int_ty), l);
+                const ir::Index int0   = b.constant(svint_to_ref(slang::SVInt(32, 0, true), int_ty), l);
+                return b.select(valid, int1, int0, l);
+            }
+            // Numeric destination: a value cast always succeeds (LRM 6.24.2).
+            b.binary(ir::Inst::Tag::Store, dst, conv, l);
+            return b.constant(svint_to_ref(slang::SVInt(32, 1, true), lower_type(*call.type)), l);
         }
 
         // $fopen (LRM §21.3): one argument opens a multichannel descriptor (MCD)
