@@ -433,6 +433,51 @@ TEST_CASE("class virtual task fails loudly") {
     CHECK(d.find("virtual task is not supported") != std::string::npos);
 }
 
+TEST_CASE("abstract class: concrete virtual dispatch through the base") {
+    constexpr std::string_view src = R"(
+        module m;
+            virtual class Shape;
+                virtual function int area(); return 0; endfunction
+                virtual function int kind(); return 0; endfunction
+                function int describe(); return area() + kind(); endfunction
+            endclass
+            class Square extends Shape;
+                int s;
+                function new(int side); s = side; endfunction
+                virtual function int area(); return s * s; endfunction
+                virtual function int kind(); return 1; endfunction
+            endclass
+            class Circle extends Shape;
+                int r;
+                function new(int rad); r = rad; endfunction
+                virtual function int area(); return 3 * r * r; endfunction
+            endclass
+            initial begin
+                Shape  sh;
+                Square sq = new(5);
+                Circle ci = new(2);
+                sh = sq; $display("%0d %0d %0d", sh.area(), sh.kind(), sh.describe());
+                sh = ci; $display("%0d %0d %0d", sh.area(), sh.kind(), sh.describe());
+            end
+        endmodule
+    )";
+    // Square: area 25, kind 1, describe 26. Circle: area 12, kind inherited 0, describe 12.
+    CHECK(run_capture(src) == "25 1 26\n12 0 12\n");
+}
+
+// A pure virtual method (LRM 8.21) is a MethodPrototypeSymbol whose override link
+// slang does not populate; dispatch support is deferred and must fail loudly.
+TEST_CASE("class pure virtual method fails loudly") {
+    const std::string d = fails(R"(
+        module m;
+            virtual class Base; pure virtual function int f(); endclass
+            class Derived extends Base; function int f(); return 1; endfunction endclass
+            initial begin Derived d; d = new(); $display("%0d", d.f()); end
+        endmodule
+    )");
+    CHECK(d.find("pure virtual methods are not supported") != std::string::npos);
+}
+
 // Two classes forward-referencing each other's handle type: A's field type B
 // is declared before B exists, and B's method takes an A argument before A's
 // body (only its header) is complete.

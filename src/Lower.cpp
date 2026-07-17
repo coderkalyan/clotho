@@ -1313,10 +1313,13 @@ private:
             return cached->second;
         }
         // Phase 3 features (docs/design/classes.md §2): guarded loud.
-        if (clt.isAbstract || clt.isInterface) {
-            // TODO: virtual / interface classes and dynamic dispatch (Phase 3).
-            fail("virtual / interface classes are not supported");
+        if (clt.isInterface) {
+            // TODO: interface classes (`interface class` / `implements`) — M4.
+            fail("interface classes are not supported");
         }
+        // An abstract class (`virtual class`) is lowered normally (it can be a
+        // handle type and a base); slang rejects a direct `new` on it (LRM 8.21),
+        // and its pure-virtual slots are handled in compute_vtable.
         if (clt.genericClass != nullptr) {
             // TODO: parameterized classes (Phase 3).
             fail("parameterized classes are not supported");
@@ -1410,6 +1413,17 @@ private:
     // object-body vtable header). Called from lower_class_type after the base is
     // lowered, so base slot numbers already exist.
     void compute_vtable(const slang::ast::ClassType& clt, ir::Ref class_ref) {
+        // A pure virtual method (LRM 8.21) is a MethodPrototypeSymbol (no body), not
+        // a SubroutineSymbol, and slang does not link a concrete override back to it
+        // via getOverride() — so the root-introducer slot identity below does not
+        // reach it. Guard loud until pure-virtual support (the prototype slot +
+        // bodiless stub) lands.
+        for (const auto& proto : clt.membersOfType<slang::ast::MethodPrototypeSymbol>()) {
+            if (proto.flags.has(slang::ast::MethodFlags::Pure)) {
+                // TODO: pure virtual methods (abstract-class dispatch slot).
+                fail("pure virtual methods are not supported");
+            }
+        }
         const slang::ast::ClassType* base =
             clt.getBaseClass() != nullptr
                 ? &clt.getBaseClass()->getCanonicalType().as<slang::ast::ClassType>()
@@ -1463,9 +1477,9 @@ private:
         }
         for (bool f : filled) {
             if (!f) {
-                // A pure-virtual slot with no override (an abstract class is not yet
-                // supported, so this should not occur in V1).
-                fail("pure virtual method without an implementation is not supported");
+                // An unfilled slot means an un-overridden virtual (only possible via
+                // a pure virtual, not yet supported — guarded above).
+                fail("virtual method without an implementation is not supported");
             }
         }
         module_.set_vtable(class_ref, std::move(table));
@@ -11235,7 +11249,12 @@ private:
         const ir::SourceLoc l = loc(nc);
         // super.new is handled at the constructor's entry (build_function) and
         // no-op'd as a statement, so it never reaches here as an rvalue.
-        const auto&     clt       = nc.type->getCanonicalType().as<slang::ast::ClassType>();
+        const auto& clt = nc.type->getCanonicalType().as<slang::ast::ClassType>();
+        if (clt.isAbstract) {
+            // An abstract class cannot be instantiated (LRM 8.21). slang already
+            // rejects this; guard for defense in depth.
+            fail("cannot instantiate an abstract (virtual) class");
+        }
         const ir::Ref   class_ref = lower_type(*nc.type);
         const ir::Index handle    = b.class_new(class_ref, l);
         // Non-static property default initializers run at construction, in
