@@ -354,6 +354,7 @@ struct Analysis {
                 case Inst::Tag::WireRes:
                 case Inst::Tag::WandRes:
                 case Inst::Tag::WorRes:
+                case Inst::Tag::StrengthRes:
                     val_z[raw] = 1;
                     break;
 

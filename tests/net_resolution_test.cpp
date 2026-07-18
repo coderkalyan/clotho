@@ -336,6 +336,134 @@ TEST_CASE("gate primitives resolve as drivers of a multiply-driven net") {
     CHECK(out == "0\n1\nx\nx\n");
 }
 
+TEST_CASE("strong beats weak, either polarity") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic a, b;
+          wire  w;
+          assign (strong0, strong1) w = a;
+          assign (weak0,   weak1)   w = b;
+          initial begin
+            a=1'b1; b=1'b0; #1 $display("%b", w); // strong 1 vs weak 0 -> 1
+            a=1'b0; b=1'b1; #1 $display("%b", w); // strong 0 vs weak 1 -> 0
+            a=1'bz; b=1'b1; #1 $display("%b", w); // z vs weak 1 -> 1
+            a=1'bz; b=1'bz; #1 $display("%b", w); // nothing -> z
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "1\n0\n1\nz\n");
+}
+
+TEST_CASE("strength ladder: supply > strong > pull > weak") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic a, b;
+          wire  wp, ws;
+          assign (pull0,   pull1)   wp = a;   // pull 1
+          assign (strong0, strong1) wp = b;   // strong 0 -> strong wins
+          assign (supply0, supply1) ws = a;   // supply 1
+          assign (strong0, strong1) ws = b;   // strong 0 -> supply wins
+          initial begin
+            a=1'b1; b=1'b0; #1 $display("%b %b", wp, ws); // 0 1
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "0 1\n");
+}
+
+TEST_CASE("equal strength opposite drivers conflict to x") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic a, b;
+          wire  ws, ww;
+          assign (strong0, strong1) ws = a;
+          assign (strong0, strong1) ws = b;
+          assign (weak0,   weak1)   ww = a;
+          assign (weak0,   weak1)   ww = b;
+          initial begin
+            a=1'b1; b=1'b0; #1 $display("%b %b", ws, ww); // x x
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "x x\n");
+}
+
+TEST_CASE("per-bit strength resolution over a vector") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic [3:0] a, b;
+          wire  [3:0] w;
+          assign (strong0, strong1) w = a;
+          assign (weak0,   weak1)   w = b;
+          initial begin
+            a=4'b1100; b=4'b1010; #1 $display("%b", w); // strong per bit -> 1100
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "1100\n");
+}
+
+TEST_CASE("open-drain and open-source asymmetric strengths") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic a, b;
+          wire  od, os;
+          assign (strong0, highz1) od = a;   // open drain
+          assign (strong0, highz1) od = b;
+          assign (highz0, strong1) os = a;   // open source
+          assign (weak0,  weak1)   os = b;
+          initial begin
+            a=1'b0; b=1'b1; #1 $display("%b", od); // a drives 0, b floats -> 0
+            a=1'b1; b=1'b1; #1 $display("%b", od); // both float -> z
+            a=1'b1; b=1'b0; #1 $display("%b", os); // a strong 1 vs b weak 0 -> 1
+            a=1'b0; b=1'b0; #1 $display("%b", os); // a floats, b weak 0 -> 0
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "0\nz\n1\n0\n");
+}
+
+// A tri0/tri1 pull is a Pull-strength driver of 0/1, so it competes in the fold:
+// a Weak (< Pull) driver loses to it, a Strong (> Pull) driver beats it. This is
+// the corner a plain post-fold pull (fills Z only) gets wrong.
+TEST_CASE("tri0/tri1 pull competes on strength with explicit drivers") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic a;
+          tri0 t0w, t0s;
+          tri1 t1w, t1s;
+          assign (weak0,   weak1)   t0w = a;
+          assign (strong0, strong1) t0s = a;
+          assign (weak0,   weak1)   t1w = a;
+          assign (strong0, strong1) t1s = a;
+          initial begin
+            a=1'b1; #1 $display("%b%b%b%b", t0w, t0s, t1w, t1s); // 0 1 1 1
+            a=1'b0; #1 $display("%b%b%b%b", t0w, t0s, t1w, t1s); // 0 0 1 0
+            a=1'bz; #1 $display("%b%b%b%b", t0w, t0s, t1w, t1s); // 0 0 1 1
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "0111\n0010\n0011\n");
+}
+
+TEST_CASE("drive strengths on a wand net fail loudly") {
+    const LowerResult r = lower_text(R"(
+        module m(input a, input b);
+            wand w;
+            assign (weak0, weak1) w = a;
+            assign (weak0, weak1) w = b;
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("drive strengths on a wand/wor net") != std::string::npos);
+}
+
 // -- Loud-failure guards for the shapes V2 does not resolve --
 
 TEST_CASE("an unpacked-array-element driver of a resolved net fails loudly") {

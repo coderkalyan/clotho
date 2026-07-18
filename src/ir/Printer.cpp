@@ -229,6 +229,8 @@ const char* tag_name(Inst::Tag tag) {
             return "wand_res";
         case T::WorRes:
             return "wor_res";
+        case T::StrengthRes:
+            return "strength_res";
         case T::NetPull:
             return "net_pull";
         case T::Bnot:

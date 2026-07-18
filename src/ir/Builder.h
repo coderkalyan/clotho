@@ -85,6 +85,11 @@ public:
     // Resistive pull of a resolved tri0/tri1 net value: a still-Z bit becomes
     // `pull` (0 or 1), everything else is unchanged (LRM 6.6.4). Keeps op's width.
     Index net_pull(Index op, uint32_t pull, SourceLoc loc);
+    // Drive-strength multi-driver resolution: fold `slots` (driver values) by
+    // per-driver strength (`strengths`, packed strength0<<8 | strength1, parallel
+    // to slots) into one 4-state net value. See Inst::Tag::StrengthRes.
+    Index strength_res(std::span<const Index> slots, std::span<const uint16_t> strengths,
+                       SourceLoc loc);
     Index select(Index cond, Index a, Index b, SourceLoc loc);
     Index concat(std::span<const Index> parts, SourceLoc loc);
     Index part_select(Index base, uint32_t msb, uint32_t lsb, SourceLoc loc);
@@ -466,6 +471,18 @@ private:
         const auto start = static_cast<uint32_t>(extra_.size());
         for (Index i : indices) {
             extra_.push_back(static_cast<uint32_t>(i));
+        }
+        const auto end = static_cast<uint32_t>(extra_.size());
+
+        return { static_cast<ExtraIndex>(start), static_cast<ExtraIndex>(end) };
+    }
+
+    // Append a run of raw u32 words (e.g. packed strength constants) to the extra
+    // buffer; returns the slice. Unlike add_slice these are not SSA operands.
+    ExtraSlice add_u32_slice(std::span<const uint32_t> words) {
+        const auto start = static_cast<uint32_t>(extra_.size());
+        for (uint32_t w : words) {
+            extra_.push_back(w);
         }
         const auto end = static_cast<uint32_t>(extra_.size());
 

@@ -227,18 +227,16 @@ TEST_CASE("gate delay on a bit-addressed output is reported as unsupported") {
     CHECK(r.diagnostics.find("whole scalar output") != std::string::npos);
 }
 
-TEST_CASE("non-default gate drive strengths are reported as unsupported") {
-    const LowerResult r = lower_text(R"(
+TEST_CASE("gate drive strengths lower (resolution covered in net_resolution_test)") {
+    const LowerResult r = lower_ok(R"(
         module m;
             wire y;
             reg a, b;
             and (weak0, weak1) g(y, a, b);
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("drive strength") != std::string::npos);
+    CHECK(r.module->processes().size() == 1);
 
-    // The default strength written out explicitly is accepted.
     const LowerResult ok = lower_ok(R"(
         module m;
             wire y;

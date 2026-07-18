@@ -65,6 +65,12 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
                 tag == Inst::Tag::Fork || tag == Inst::Tag::StrobePend) {
                 return {};
             }
+            // strength_res: the driver slot values are the SSA operands; the
+            // parallel strength constants are not.
+            if (tag == Inst::Tag::StrengthRes) {
+                const auto info = extra_data<StrengthResInfo>(p.extra);
+                return index_slice(info.values);
+            }
             // concat: variadic operands live in the extra buffer.
             const auto slice = extra_data<ExtraSlice>(p.extra);
             return index_slice(slice);

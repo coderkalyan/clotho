@@ -2559,7 +2559,6 @@ private:
                             // today, so propagation would be instant.
                             fail("net delay is not supported");
                         }
-                        check_drive_strength(net.getDriveStrength(), "a net declaration");
                         info.is_net = true;
                     }
                     info.name     = prefix + std::string(vs.name);
@@ -3081,7 +3080,33 @@ private:
     // Allocate a fresh full-width slot for one driver of `net` (slot type == net
     // type, so a partial driver's slot still spans the whole net with z in its
     // undriven bits). Registered in the net's scope; cross-scope drivers fail.
-    ir::Signal alloc_driver_slot(ir::Signal net, ir::SourceLoc l) {
+    // Drive-strength level (LRM 28.11), ordered HighZ < Weak < Pull < Strong <
+    // Supply; a default (unspecified) driver is Strong. Only these definite drive
+    // strengths are modeled (charge strengths large/medium/small are trireg, not
+    // supported). A strength is a compile-time constant threaded to the resolver.
+    static uint8_t strength_level(const std::optional<slang::ast::DriveStrength>& s) {
+        if (!s.has_value()) {
+            return 3; // default Strong
+        }
+        switch (*s) {
+            case slang::ast::DriveStrength::Supply: return 4;
+            case slang::ast::DriveStrength::Strong: return 3;
+            case slang::ast::DriveStrength::Pull:   return 2;
+            case slang::ast::DriveStrength::Weak:   return 1;
+            case slang::ast::DriveStrength::HighZ:  return 0;
+        }
+        return 3;
+    }
+
+    // Pack a driver's (strength0, strength1) pair into one u16 for storage parallel
+    // to its slot; high byte = strength0 (0-value drive), low byte = strength1.
+    static uint16_t pack_strength(
+        const std::pair<std::optional<slang::ast::DriveStrength>,
+                        std::optional<slang::ast::DriveStrength>>& ds) {
+        return static_cast<uint16_t>((strength_level(ds.first) << 8) | strength_level(ds.second));
+    }
+
+    ir::Signal alloc_driver_slot(ir::Signal net, ir::SourceLoc l, uint16_t strength = 0x0303) {
         const auto net_u = static_cast<uint32_t>(net);
         const auto it    = resolved_scope_.find(net_u);
         if (it != resolved_scope_.end() && it->second != cur_scope_id()) {
@@ -3099,6 +3124,7 @@ private:
         info.dir  = ir::SignalInfo::Direction::Internal;
         const ir::Signal slot = register_signal(std::move(info));
         slots.push_back(slot);
+        resolved_strengths_[net_u].push_back(strength); // parallel to slots
         resolved_scope_[net_u] = cur_scope_id();
         resolved_loc_[net_u]   = l;
         return slot;
@@ -3107,6 +3133,21 @@ private:
     // An all-Z constant of `width` bits (VPI planes: val = 0, xz = 1 for every
     // bit). Used as the resolution identity in the undriven bits of a partial
     // driver's slot value.
+    // A definite (2-state, z-free) all-0 or all-1 constant of `width` bits, in the
+    // 4-state plane encoding. Used to inject a tri0/tri1 pull as a synthetic
+    // Pull-strength driver into the strength fold.
+    ir::Ref def_constant_ref(uint32_t width, bool one) {
+        const uint32_t       pb = (width + 7) / 8;
+        std::vector<uint8_t> bytes(2 * static_cast<size_t>(pb), 0); // xz plane = 0 (no z/x)
+        if (one) {
+            for (uint32_t bit = 0; bit < width; ++bit) {
+                bytes[bit / 8] |= static_cast<uint8_t>(1u << (bit % 8)); // val plane = 1
+            }
+        }
+        return module_.pool.put_value(make_int_type(width, /*is_four=*/true, /*is_signed=*/false),
+                                      bytes);
+    }
+
     ir::Ref z_constant_ref(uint32_t width) {
         const uint32_t      pb = (width + 7) / 8;
         std::vector<uint8_t> bytes(2 * static_cast<size_t>(pb), 0); // val plane = 0
@@ -3196,9 +3237,9 @@ private:
     // net, or a constant packed sub-range with a Z background) into this driver's
     // slot, sensitive to the RHS reads.
     void emit_resolved_driver(ir::Signal net, const AssignmentExpression& a, const Expression& left,
-                              ir::Builder& b, ir::SourceLoc l) {
+                              ir::Builder& b, ir::SourceLoc l, uint16_t strength = 0x0303) {
         const ir::Index val  = build_driver_slot_value(net, left, lower_expr(a.right(), b), b, l);
-        const ir::Signal slot = alloc_driver_slot(net, l);
+        const ir::Signal slot = alloc_driver_slot(net, l, strength);
         b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
         add_continuous_process(continuous_events(a), l, b);
     }
@@ -3240,12 +3281,50 @@ private:
             const ir::Inst::Tag op =
               net_resolve_op_.contains(net_u) ? net_resolve_op_[net_u] : ir::Inst::Tag::WireRes;
 
+            // A net resolves through the strength-weighted fold when any driver
+            // has a non-default (not Strong/Strong) drive strength; otherwise the
+            // cheaper strengthless pairwise fold (WireRes / WandRes / WorRes).
+            const auto  st_it = resolved_strengths_.find(net_u);
+            const std::span<const uint16_t> strengths =
+              st_it != resolved_strengths_.end() ? std::span<const uint16_t>(st_it->second)
+                                                 : std::span<const uint16_t>();
+            const bool has_strength =
+              std::any_of(strengths.begin(), strengths.end(), [](uint16_t s) { return s != 0x0303; });
+
+            const uint32_t net_w = module_.pool.layout(module_.signal(net).type).width;
+
             ir::Builder b(module_.pool);
             // Fold the driver slots (a driverless tri0/tri1 net seeds all-Z, so
             // the pull sees only Z and fills the whole net with its pull value).
             ir::Index acc;
+            bool      pull_injected = false;
             if (slots.empty()) {
-                acc = b.constant(z_constant_ref(module_.pool.layout(module_.signal(net).type).width), l);
+                acc = b.constant(z_constant_ref(net_w), l);
+            } else if (has_strength) {
+                if (op != ir::Inst::Tag::WireRes) {
+                    // Wired-AND / wired-OR nets combine drivers by value, not by
+                    // strength; mixing the two resolution models is not defined here.
+                    // TODO: drive strengths on wand/wor nets (LRM 6.6.1-6.6.3).
+                    fail("drive strengths on a wand/wor net are not supported");
+                }
+                std::vector<ir::Index>  slot_vals;
+                std::vector<uint16_t>   str_vec(strengths.begin(), strengths.end());
+                slot_vals.reserve(slots.size() + 1);
+                for (const ir::Signal s : slots) {
+                    slot_vals.push_back(b.unary(ir::Inst::Tag::Load, b.signal(s, l), l));
+                }
+                if (pi != net_pull_.end()) {
+                    // A tri0/tri1 pull is a Pull-strength driver of 0 / 1 (LRM 6.6.4),
+                    // so it must compete in the strength fold — a Weak (< Pull) driver
+                    // loses to it — not just fill leftover Z as net_pull does. Inject it
+                    // as a synthetic driver and skip the post-fold pull.
+                    const bool one = pi->second.value != 0;
+                    slot_vals.push_back(b.constant(def_constant_ref(net_w, one), l));
+                    str_vec.push_back(one ? static_cast<uint16_t>(2) /* (highz0, pull1) */
+                                          : static_cast<uint16_t>(2 << 8) /* (pull0, highz1) */);
+                    pull_injected = true;
+                }
+                acc = b.strength_res(slot_vals, str_vec, l);
             } else {
                 acc = b.unary(ir::Inst::Tag::Load, b.signal(slots[0], l), l);
                 for (size_t k = 1; k < slots.size(); ++k) {
@@ -3253,7 +3332,7 @@ private:
                     acc                  = b.binary(op, acc, next, l);
                 }
             }
-            if (pi != net_pull_.end()) {
+            if (pi != net_pull_.end() && !pull_injected) {
                 acc = b.net_pull(acc, static_cast<uint32_t>(pi->second.value), l);
             }
             b.binary(ir::Inst::Tag::Store, b.signal(net, l), acc, l);
@@ -3272,26 +3351,10 @@ private:
         }
     }
 
-    // Reject an explicit non-default drive strength on a continuous assignment
-    // or net declaration. Strengths only affect multi-driver resolution, which
-    // Clotho lacks; an explicit (strong0, strong1) equals the default (LRM
-    // 10.3.4) and stays accepted.
-    // TODO: strength-based resolution (LRM 6.6.1, 28.11-28.12).
-    void check_drive_strength(
-      const std::pair<std::optional<DriveStrength>, std::optional<DriveStrength>>& strength,
-      std::string_view what) {
-        const auto non_default = [](const std::optional<DriveStrength>& s) {
-            return s.has_value() && *s != DriveStrength::Strong;
-        };
-        if (non_default(strength.first) || non_default(strength.second)) {
-            fail("drive strength on " + std::string(what) + " is not supported");
-        }
-    }
-
     // -- Processes --
 
     void lower_continuous_assign(const ContinuousAssignSymbol& sym) {
-        check_drive_strength(sym.getDriveStrength(), "a continuous assignment");
+        const uint16_t strength = pack_strength(sym.getDriveStrength());
         const Expression& e = sym.getAssignment();
         if (e.kind != ExpressionKind::Assignment) {
             fail("malformed continuous assignment");
@@ -3326,7 +3389,7 @@ private:
             }
             // Multiply-driven net: this driver stages its value into its own
             // slot; the resolver folds every driver's slot (emit_wire_resolvers).
-            emit_resolved_driver(*net, a, left, b, l);
+            emit_resolved_driver(*net, a, left, b, l, strength);
             return;
         }
         // A concatenation lvalue has no single root, so resolved_net_of misses
@@ -3447,7 +3510,7 @@ private:
         if (resolved) {
             // A net-declaration assignment is a whole-net driver: stage the
             // initializer into this driver's slot (emit_wire_resolvers folds it).
-            const ir::Signal slot = alloc_driver_slot(signal_of(ns), l);
+            const ir::Signal slot = alloc_driver_slot(signal_of(ns), l, pack_strength(ns.getDriveStrength()));
             b.binary(ir::Inst::Tag::Store, b.signal(slot, l),
                      b.resize(lower_expr(*init, b), lower_type(ns.getType()), l), l);
             add_continuous_process(continuous_events(*init), to_source_loc(ns.location), b);
@@ -3740,12 +3803,7 @@ private:
             // for. A single #d delay is lowered below.
             fail("gate rise/fall/turn-off delays (#(a,b,c)) are not supported");
         }
-        const auto [s0, s1] = gi.getDriveStrength();
-        if ((s0 && *s0 != DriveStrength::Strong) || (s1 && *s1 != DriveStrength::Strong)) {
-            // TODO: drive strengths (needs multi-driver resolution). The default
-            // (strong0, strong1), written out explicitly, is accepted as-is.
-            fail("gate drive strength is not supported");
-        }
+        const uint16_t gate_strength = pack_strength(gi.getDriveStrength());
 
         const auto conns = gi.getPortConnections();
         if (conns.size() < 2) {
@@ -3802,7 +3860,8 @@ private:
                     // (mirrors the resolved continuous-assign delay gap, LRM 28.16).
                     fail("gate delay on a multiply-driven (resolved) net is not supported");
                 }
-                emit_gate_resolved_driver(left, *net, val, std::move(wait_events), b, loc);
+                emit_gate_resolved_driver(left, *net, val, std::move(wait_events), b, loc,
+                                          gate_strength);
             } else {
                 const GateTerm output = lower_gate_output(*out);
                 if (gate_delay != nullptr &&
@@ -3958,7 +4017,7 @@ private:
     // (emit_resolved_driver). `left` is the output lvalue.
     void emit_gate_resolved_driver(const Expression& left, ir::Signal net, ir::Index val,
                                    std::vector<ir::WaitEvent> wait_events, ir::Builder& b,
-                                   ir::SourceLoc l) {
+                                   ir::SourceLoc l, uint16_t strength = 0x0303) {
         if (!left.type->isFourState()) {
             // Mirrors lower_gate_output: a gate can drive X, which a 2-state slot
             // cannot hold. TODO: gate outputs on 2-state nets need an X-coercion
@@ -3966,7 +4025,7 @@ private:
             fail("gate output on a 2-state net is not supported");
         }
         const ir::Index  slot_val = build_driver_slot_value(net, left, val, b, l);
-        const ir::Signal slot     = alloc_driver_slot(net, l);
+        const ir::Signal slot     = alloc_driver_slot(net, l, strength);
         b.binary(ir::Inst::Tag::Store, b.signal(slot, l), slot_val, l);
         add_continuous_process(std::move(wait_events), l, b);
     }
@@ -11974,6 +12033,10 @@ private:
     // Per resolved net: its per-driver slot signals (fold order), the scope id
     // the resolver process is attributed to, and a representative source loc.
     ankerl::unordered_dense::map<uint32_t, std::vector<ir::Signal>> resolved_slots_;
+    // Per-net packed (strength0<<8 | strength1) for each driver slot, parallel to
+    // resolved_slots_. A net any of whose slots is non-default (not 0x0303 / strong)
+    // resolves through the strength-weighted StrengthRes fold instead of WireRes.
+    ankerl::unordered_dense::map<uint32_t, std::vector<uint16_t>> resolved_strengths_;
     ankerl::unordered_dense::map<uint32_t, uint32_t>                resolved_scope_;
     ankerl::unordered_dense::map<uint32_t, ir::SourceLoc>           resolved_loc_;
     // Per resolved net: which reducer folds its slots (WireRes / WandRes /

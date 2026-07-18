@@ -116,6 +116,17 @@ struct ExtraSlice {
     ExtraIndex end;
 };
 
+// Extra payload for `strength_res`: the driver slot values and a parallel run
+// of packed per-driver (strength0<<8 | strength1) constants (one u32 word per
+// driver, low 16 bits used). `values` are the SSA operands; `strengths` are
+// compile-time constants read directly by the backend fold.
+struct StrengthResInfo {
+    // The driver slot values, in driver order (the SSA operands).
+    ExtraSlice values;
+    // Packed (strength0<<8 | strength1) per driver, parallel to `values`.
+    ExtraSlice strengths;
+};
+
 // Extra payload for `select`: the two selected values (the condition is the op).
 struct Select {
     // Value chosen when the condition is true.
@@ -1053,6 +1064,16 @@ struct Inst {
         // associative + commutative, so K drivers fold left (payload: binary).
         WandRes,
         WorRes,
+        // Drive-strength wire/tri multi-driver resolution (LRM 6.6.1, 28.11):
+        // an N-ary fold (payload: extra -> StrengthResInfo, a slice of driver
+        // slot values plus a parallel slice of packed per-driver (strength0,
+        // strength1) constants). Per bit, the strongest side wins — stronger 0
+        // beats weaker 1 and vice versa; equal top strength on both sides is X;
+        // no driver (all Z) is Z. With every driver at the default Strong this
+        // degenerates to WireRes. Emitted only by emit_wire_resolvers when a net
+        // has any non-default drive strength; N operands, not pairwise, because
+        // the winner needs every driver's strength at once.
+        StrengthRes,
         // Resistive pull applied after a tri0/tri1 net's drivers are resolved
         // (LRM 6.6.4): a bit still Z (all drivers off) is pulled to the immediate
         // (0 for tri0, 1 for tri1); a definitely-driven or X bit is unchanged.
@@ -1829,6 +1850,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Repl:
             return K::Repl;
         case T::Concat:
+        case T::StrengthRes:
         case T::Loop:
             return K::Extra;
         case T::Call:

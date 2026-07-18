@@ -1376,25 +1376,22 @@ TEST_CASE("a net with one continuous driver read procedurally is accepted") {
     CHECK_MESSAGE(r.ok, r.diagnostics);
 }
 
-TEST_CASE("a non-default drive strength fails loudly") {
+TEST_CASE("drive strengths lower on continuous assigns and net declarations") {
     const LowerResult ra = lower_text(R"(
         module m(input a);
             wire w;
             assign (weak0, weak1) w = a;
         endmodule
     )");
-    CHECK_FALSE(ra.ok);
-    CHECK(ra.diagnostics.find("drive strength") != std::string::npos);
+    CHECK_MESSAGE(ra.ok, ra.diagnostics);
 
     const LowerResult rn = lower_text(R"(
         module m(input a);
             wire (pull0, pull1) w = a;
         endmodule
     )");
-    CHECK_FALSE(rn.ok);
-    CHECK(rn.diagnostics.find("drive strength") != std::string::npos);
+    CHECK_MESSAGE(rn.ok, rn.diagnostics);
 
-    // An explicit (strong0, strong1) equals the default (LRM 10.3.4): accepted.
     const LowerResult rs = lower_text(R"(
         module m(input a);
             wire w;

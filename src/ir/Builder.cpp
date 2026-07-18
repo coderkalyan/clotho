@@ -133,6 +133,16 @@ Index Builder::net_pull(Index op, uint32_t pull, SourceLoc loc) {
     return emit({ Inst::Tag::NetPull, Inst::Payload{ .op_imm = { op, pull } } }, loc);
 }
 
+Index Builder::strength_res(std::span<const Index> slots, std::span<const uint16_t> strengths,
+                            SourceLoc loc) {
+    std::vector<uint32_t> packed(strengths.begin(), strengths.end());
+    const StrengthResInfo info{ .values    = add_slice(slots),
+                                .strengths = add_u32_slice(packed) };
+    const ExtraIndex extra = add_extra(info);
+
+    return emit({ Inst::Tag::StrengthRes, pay(&Inst::Payload::extra, extra) }, loc);
+}
+
 Index Builder::select(Index cond, Index a, Index b, SourceLoc loc) {
     const ExtraIndex extra = add_extra(Select{ a, b });
 

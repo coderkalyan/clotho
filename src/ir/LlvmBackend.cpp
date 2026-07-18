@@ -4671,6 +4671,7 @@ private:
                 case Inst::Tag::WireRes:
                 case Inst::Tag::WandRes:
                 case Inst::Tag::WorRes:
+                case Inst::Tag::StrengthRes:
                 case Inst::Tag::Bnot:
                 case Inst::Tag::RedAnd:
                 case Inst::Tag::RedOr:
@@ -8397,6 +8398,13 @@ private:
                 const ValType lt = type_of(p.binary.l);
                 return { lt.width, true, false };
             }
+            case Inst::Tag::StrengthRes: {
+                // Strength resolution yields a 4-state net-width result, like
+                // WireRes; the width is the first driver slot's width.
+                const auto    info = ir_->extra_data<StrengthResInfo>(p.extra);
+                const ValType lt   = type_of(ir_->region(info.values)[0]);
+                return { lt.width, true, false };
+            }
             case Inst::Tag::Bnot:
                 return type_of(p.unary);
             case Inst::Tag::StreamReverse:
@@ -9493,6 +9501,9 @@ private:
             case Inst::Tag::WandRes:
             case Inst::Tag::WorRes:
                 set_value(i, lower_net_res(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
+                return;
+            case Inst::Tag::StrengthRes:
+                set_value(i, lower_strength_res(i));
                 return;
             case Inst::Tag::Bnot:
                 set_value(i, lower_bnot(value_of(p.unary)));
@@ -14469,6 +14480,64 @@ private:
                 throw BackendError{ "lower_net_res: not a resolution tag" };
         }
         return packed(rmust, rmay, rz);
+    }
+
+    // Drive-strength multi-driver resolution (LRM 6.6.1, 28.11). Strengths are
+    // compile-time constants, so the whole fold is per-strength-level bitmask
+    // arithmetic on the driver planes — no per-bit strength storage. Each driver
+    // contributes to the 0-side (bits it could drive to 0: value 0 or X, i.e.
+    // ~z & ~must) at its strength0 and to the 1-side (value 1 or X: ~z & may) at
+    // its strength1. Per level L, OR those contributions across all drivers whose
+    // strength equals L; then walk levels strongest -> weakest and take the first
+    // level (per bit) that drives anything: a lone side there wins its value, both
+    // sides at that same top level is X, no level at all is Z. At all-Strong this
+    // reduces exactly to WireRes.
+    Plane lower_strength_res(Index i) {
+        const Inst::Payload& p    = ir_->payload(i);
+        const auto           info = ir_->extra_data<StrengthResInfo>(p.extra);
+        const auto           vals = ir_->region(info.values);
+        const auto           raw  = ir_->extra_raw();
+        const auto           s_lo = static_cast<uint32_t>(info.strengths.start);
+
+        const uint32_t W = type_of(vals[0]).width;
+        // Per-level (1..4) OR of every driver's 0-side / 1-side contribution.
+        // Index 0 (HighZ) is unused — a HighZ-strength driver contributes nothing.
+        std::array<llvm::Value*, 5> a0{}, a1{};
+        for (int L = 0; L < 5; ++L) {
+            a0[L] = zero(W);
+            a1[L] = zero(W);
+        }
+        for (size_t k = 0; k < vals.size(); ++k) {
+            const Plane        pl  = value_of(vals[k]);
+            llvm::Value* const nz  = b_.CreateNot(z_of(pl)); // actively driving
+            llvm::Value* const d0  = b_.CreateAnd(nz, b_.CreateNot(must_of(pl)));
+            llvm::Value* const d1  = b_.CreateAnd(nz, may_of(pl));
+            const uint16_t     str = static_cast<uint16_t>(raw[s_lo + k]);
+            const uint8_t      s0  = static_cast<uint8_t>(str >> 8);
+            const uint8_t      s1  = static_cast<uint8_t>(str & 0xff);
+            if (s0 > 0) {
+                a0[s0] = b_.CreateOr(a0[s0], d0);
+            }
+            if (s1 > 0) {
+                a1[s1] = b_.CreateOr(a1[s1], d1);
+            }
+        }
+        llvm::Value* found = zero(W);
+        llvm::Value* r_is1 = zero(W);
+        llvm::Value* r_isx = zero(W);
+        for (int L = 4; L >= 1; --L) {
+            llvm::Value* const active = b_.CreateAnd(b_.CreateOr(a0[L], a1[L]), b_.CreateNot(found));
+            llvm::Value* const new1   = b_.CreateAnd(active, b_.CreateAnd(a1[L], b_.CreateNot(a0[L])));
+            llvm::Value* const newx   = b_.CreateAnd(active, b_.CreateAnd(a0[L], a1[L]));
+            r_is1 = b_.CreateOr(r_is1, new1);
+            r_isx = b_.CreateOr(r_isx, newx);
+            found = b_.CreateOr(found, active);
+        }
+        // Bits no driver reached stay Z; the rest are 1 / X / (implicitly) 0.
+        llvm::Value* const r_z   = b_.CreateNot(found);
+        llvm::Value* const rmust = r_is1;
+        llvm::Value* const rmay  = b_.CreateOr(r_is1, b_.CreateOr(r_isx, r_z));
+        return packed(rmust, rmay, r_z);
     }
 
     // Resistive pull of a resolved tri0/tri1 net (LRM 6.6.4): a still-Z bit
