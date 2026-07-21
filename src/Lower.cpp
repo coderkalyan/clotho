@@ -2549,9 +2549,12 @@ private:
                             case NetType::TriOr:
                             case NetType::Tri0:
                             case NetType::Tri1:
+                            case NetType::Supply0:
+                            case NetType::Supply1:
                                 break;
                             default:
-                                fail("unsupported net type (only wire/tri/uwire/wand/wor/tri0/tri1 are modeled)");
+                                fail("unsupported net type (only wire/tri/uwire/wand/wor/tri0/tri1/"
+                                     "supply0/supply1 are modeled)");
                         }
                         if (net.getDelay() != nullptr) {
                             // TODO: net delay (`wire #5 w;`, LRM 28.16) — an
@@ -2585,13 +2588,14 @@ private:
                     const ir::Signal sig = register_signal(std::move(info));
                     sigmap_[&vs]         = sig;
                     if (m.kind == SymbolKind::Net) {
-                        // A tri0/tri1 net always needs a resolver so its pull can
-                        // fill undriven bits — even with zero or one driver. Record
-                        // it here (its home scope) so a driverless one still emits.
-                        if (const std::optional<int> pull =
-                              net_pull_value(m.as<NetSymbol>().netType.netKind)) {
-                            net_pull_[static_cast<uint32_t>(sig)] =
-                              PullInfo{ *pull, cur_scope_id(), to_source_loc(vs.location) };
+                        // A tri0/tri1 / supply0/supply1 net always needs a resolver
+                        // so its pull can fill undriven bits — even with zero or one
+                        // driver. Record it here (its home scope) so a driverless one
+                        // still emits.
+                        const NetType::NetKind nk = m.as<NetSymbol>().netType.netKind;
+                        if (const std::optional<int> pull = net_pull_value(nk)) {
+                            net_pull_[static_cast<uint32_t>(sig)] = PullInfo{
+                              *pull, cur_scope_id(), to_source_loc(vs.location), net_pull_strength(nk) };
                         }
                     }
                     break;
@@ -2712,12 +2716,20 @@ private:
     static std::optional<int> net_pull_value(NetType::NetKind kind) {
         switch (kind) {
             case NetType::Tri0:
+            case NetType::Supply0:
                 return 0;
             case NetType::Tri1:
+            case NetType::Supply1:
                 return 1;
             default:
                 return std::nullopt;
         }
+    }
+
+    // Strength level of a net kind's built-in pull: Supply (4) for supply0/1,
+    // Pull (2) for tri0/1. Only meaningful when net_pull_value has a value.
+    static uint8_t net_pull_strength(NetType::NetKind kind) {
+        return (kind == NetType::Supply0 || kind == NetType::Supply1) ? 4 : 2;
     }
 
     // A driven region of a net: an unpacked-array element band crossed with a
@@ -3300,6 +3312,12 @@ private:
                                                  : std::span<const uint16_t>();
             const bool has_strength =
               std::any_of(strengths.begin(), strengths.end(), [](uint16_t s) { return s != 0x0303; });
+            // A Supply pull (supply0/supply1) must beat a Strong driver, so it always
+            // folds as a strength driver; a Pull pull (tri0/tri1) only when a real
+            // driver carries an explicit strength (else the strengthless NetPull is
+            // equivalent and cheaper).
+            const bool supply_pull = pi != net_pull_.end() && pi->second.strength >= 4;
+            const bool use_strength = has_strength || supply_pull;
 
             const uint32_t net_w = module_.pool.layout(module_.signal(net).type).width;
 
@@ -3310,7 +3328,7 @@ private:
             bool      pull_injected = false;
             if (slots.empty()) {
                 acc = b.constant(z_constant_ref(net_w), l);
-            } else if (has_strength) {
+            } else if (use_strength) {
                 if (op != ir::Inst::Tag::WireRes) {
                     // Wired-AND / wired-OR nets combine drivers by value, not by
                     // strength; mixing the two resolution models is not defined here.
@@ -3324,14 +3342,16 @@ private:
                     slot_vals.push_back(b.unary(ir::Inst::Tag::Load, b.signal(s, l), l));
                 }
                 if (pi != net_pull_.end()) {
-                    // A tri0/tri1 pull is a Pull-strength driver of 0 / 1 (LRM 6.6.4),
-                    // so it must compete in the strength fold — a Weak (< Pull) driver
-                    // loses to it — not just fill leftover Z as net_pull does. Inject it
-                    // as a synthetic driver and skip the post-fold pull.
-                    const bool one = pi->second.value != 0;
+                    // A tri0/tri1 (Pull) or supply0/supply1 (Supply) pull is a driver
+                    // of 0 / 1 at its strength, so it must compete in the strength
+                    // fold — a weaker driver loses to it — not just fill leftover Z as
+                    // net_pull does. Inject it as a synthetic driver and skip the
+                    // post-fold pull.
+                    const bool    one = pi->second.value != 0;
+                    const uint8_t str = pi->second.strength;
                     slot_vals.push_back(b.constant(def_constant_ref(net_w, one), l));
-                    str_vec.push_back(one ? static_cast<uint16_t>(2) /* (highz0, pull1) */
-                                          : static_cast<uint16_t>(2 << 8) /* (pull0, highz1) */);
+                    str_vec.push_back(one ? static_cast<uint16_t>(str)          // (highz0, strN)
+                                          : static_cast<uint16_t>(str << 8));    // (strN, highz1)
                     pull_injected = true;
                 }
                 acc = b.strength_res(slot_vals, str_vec, l);
@@ -12106,9 +12126,14 @@ private:
     // tri0 / tri1 nets: the resistive pull applied after the fold, and the home
     // scope / loc for the resolver (so even a driverless net emits one).
     struct PullInfo {
-        int          value;
-        uint32_t     scope;
+        int           value;
+        uint32_t      scope;
         ir::SourceLoc loc;
+        // Strength level of the pull (LRM 28.11): Pull (2) for tri0/tri1, Supply
+        // (4) for supply0/supply1. A Supply pull always folds as a strength driver
+        // (it must beat a Strong driver); a Pull pull only when some driver carries
+        // an explicit strength (else the cheaper strengthless NetPull suffices).
+        uint8_t strength;
     };
     ankerl::unordered_dense::map<uint32_t, PullInfo> net_pull_;
     // Hierarchical name prefix of the instance currently being lowered (e.g.

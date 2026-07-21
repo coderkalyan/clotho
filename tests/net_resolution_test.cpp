@@ -472,6 +472,25 @@ TEST_CASE("pullup and pulldown compete on strength") {
     CHECK(out == "10\n00\n11\n");
 }
 
+TEST_CASE("supply0/supply1 nets hold their value and beat strong drivers") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic d;
+          supply0 gnd;
+          supply1 vdd;
+          wire w;
+          assign (strong0, strong1) vdd = d;   // strong0 loses to supply1 -> 1
+          assign (supply0, supply1) w = 1'b0;  // supply0 vs...
+          assign (strong0, strong1) w = 1'b1;  // ...strong1 -> supply wins -> 0
+          initial begin
+            d = 1'b0; #1 $display("%b%b%b", gnd, vdd, w); // 0 1 0
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "010\n");
+}
+
 TEST_CASE("drive strengths on a wand net fail loudly") {
     const LowerResult r = lower_text(R"(
         module m(input a, input b);
