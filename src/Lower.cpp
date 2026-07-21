@@ -2776,6 +2776,16 @@ private:
         record_net_driver_region(sym, kWholeNet);
     }
 
+    // Force a net to resolve through a resolver process even with a single driver
+    // (a pullup/pulldown is a lone permanent driver whose value must still fold by
+    // strength against any other driver). Mirrors the tri0/tri1 has_pull path.
+    void force_net_resolved(ir::Signal net) {
+        const auto net_u = static_cast<uint32_t>(net);
+        if (resolved_nets_.insert(net_u).second) {
+            net_resolve_op_[net_u] = ir::Inst::Tag::WireRes;
+        }
+    }
+
     // The root value symbol of an lvalue select chain, or null for shapes with
     // no single named root.
     static const ValueSymbol* lvalue_root(const Expression& e) {
@@ -3785,15 +3795,66 @@ private:
         return *term;
     }
 
+    // A pullup (drives constant 1) / pulldown (drives constant 0) source (LRM
+    // 28.5): a lone permanent driver at pull strength (or an explicit strength),
+    // lowered as a strength driver slot on its output net so it folds against any
+    // real driver — a stronger driver wins, else the net holds the pull value.
+    void lower_pull_source(const PrimitiveInstanceSymbol& gi, bool up) {
+        const auto conns = gi.getPortConnections();
+        if (conns.empty() || conns[0] == nullptr) {
+            fail("malformed pullup/pulldown terminal");
+        }
+        // slang wraps the output terminal in an AssignmentExpression (lhs = source);
+        // the driven net is its left().
+        const Expression& out = conns[0]->kind == ExpressionKind::Assignment
+                                  ? conns[0]->as<AssignmentExpression>().left()
+                                  : *conns[0];
+        // A pull source has no single canonical net for a bit/part-select target.
+        if (out.kind != ExpressionKind::NamedValue && out.kind != ExpressionKind::HierarchicalValue) {
+            // TODO: pullup/pulldown on a bit/part-select or concat target.
+            fail("pullup/pulldown on a non-whole-net target is not supported");
+        }
+        const ValueSymbol& sym = canonical_value_symbol(out.as<ValueExpressionBase>().symbol);
+        if (sym.kind != SymbolKind::Net) {
+            fail("pullup/pulldown target must be a net");
+        }
+        if (cur_pass_ == Pass::Classify) {
+            record_net_driver_whole(sym);
+            force_net_resolved(signal_of(sym));
+            return;
+        }
+        if (cur_pass_ != Pass::Emit) {
+            return;
+        }
+        const ir::Signal    net = signal_of(sym);
+        const ir::SourceLoc l   = to_source_loc(gi.location);
+        const uint32_t      w   = module_.pool.layout(module_.signal(net).type).width;
+        // Default pull strength (LRM 28.11) is Pull; an explicit strength overrides
+        // the driven side. pullup drives only 1 (highz0), pulldown only 0 (highz1).
+        const auto [ds0, ds1] = gi.getDriveStrength();
+        const uint8_t  driven = up ? (ds1 ? strength_level(ds1) : uint8_t{ 2 })
+                                   : (ds0 ? strength_level(ds0) : uint8_t{ 2 });
+        const uint16_t strength = up ? static_cast<uint16_t>(driven)          // (highz0, drivenN)
+                                     : static_cast<uint16_t>(driven << 8);     // (drivenN, highz1)
+        ir::Builder      b(module_.pool);
+        const ir::Signal slot = alloc_driver_slot(net, l, strength);
+        b.binary(ir::Inst::Tag::Store, b.signal(slot, l), b.constant(def_constant_ref(w, up), l), l);
+        // A permanent source: self-starting, never re-evaluated (empty sensitivity).
+        add_continuous_process({}, l, b);
+    }
+
     void lower_gate(const PrimitiveInstanceSymbol& gi) {
         const PrimitiveSymbol& prim = gi.primitiveType;
+        if (prim.name == "pullup" || prim.name == "pulldown") {
+            lower_pull_source(gi, prim.name == "pullup");
+            return;
+        }
         const auto             op   = gate_op_of(prim.name);
         const auto             tri  = tristate_gate_of(prim.name);
         const bool             supported_kind =
             prim.primitiveKind == PrimitiveSymbol::NInput || prim.primitiveKind == PrimitiveSymbol::NOutput;
         if (!tri && (!op || !supported_kind)) {
-            // TODO: MOS / bidirectional switches, pullup/pulldown (need driver
-            // strength resolution) and user-defined primitives.
+            // TODO: MOS / bidirectional switches and user-defined primitives.
             fail("gate primitive '" + std::string(prim.name) + "' is not supported");
         }
         const TimingControl* gate_delay = gi.getDelay();

@@ -168,11 +168,11 @@ TEST_CASE("gates lower inside generate blocks and child instances") {
     CHECK(gate_procs >= 2);
 }
 
-TEST_CASE("switch and pull primitives are reported as unsupported") {
+TEST_CASE("MOS / bidirectional switch primitives are reported as unsupported") {
     // Terminals are nets: tran-family inout terminals reject variables in slang
-    // before clotho's own check would run. (bufif/notif are now supported.)
-    for (const char* inst : { "nmos g(y, a, b);", "pmos g(y, a, b);",
-                              "pullup g(y);", "tran g(y, a);" }) {
+    // before clotho's own check would run. (bufif/notif and pullup/pulldown are
+    // now supported.)
+    for (const char* inst : { "nmos g(y, a, b);", "pmos g(y, a, b);", "tran g(y, a);" }) {
         const LowerResult r = lower_text("module m;\n wire y;\n wire a, b;\n " + std::string(inst) + "\nendmodule");
         CHECK_FALSE(r.ok);
         CHECK_MESSAGE(r.diagnostics.find("is not supported") != std::string::npos, r.diagnostics, " for ", inst);

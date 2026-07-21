@@ -452,6 +452,26 @@ TEST_CASE("tri0/tri1 pull competes on strength with explicit drivers") {
     CHECK(out == "0111\n0010\n0011\n");
 }
 
+TEST_CASE("pullup and pulldown compete on strength") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic en, d;
+          wire wu, wd;
+          pullup   (wu);
+          pulldown (wd);
+          assign wu = en ? d : 1'bz;
+          assign wd = en ? d : 1'bz;
+          initial begin
+            en=0;      #1 $display("%b%b", wu, wd); // off: pull -> 1 0
+            en=1; d=0; #1 $display("%b%b", wu, wd); // strong 0 beats pullup, agrees pulldown -> 0 0
+            en=1; d=1; #1 $display("%b%b", wu, wd); // agrees pullup, strong 1 beats pulldown -> 1 1
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "10\n00\n11\n");
+}
+
 TEST_CASE("drive strengths on a wand net fail loudly") {
     const LowerResult r = lower_text(R"(
         module m(input a, input b);
