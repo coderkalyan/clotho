@@ -590,6 +590,10 @@ public:
         prefix_ = self_prefix;
         scope_  = &body;
         if (pass == Pass::Collect) {
+            // Alias this instance's inout/ref port internals to their parent
+            // connection signals BEFORE collect_signals registers them, so the
+            // shared storage is set up when the child body's signals are created.
+            build_inout_aliases(inst);
             collect_signals(body);
         }
         size_t child_cursor = 0;
@@ -2498,6 +2502,45 @@ private:
         }
     }
 
+    // For each inout/ref port of `inst`, alias the child-side internal symbol to
+    // the parent connection's signal (LRM 23.3.3): both sides share one storage,
+    // so no copy process is wired (wire_ports skips them). Phase 1 requires the
+    // parent connection to be a whole signal (a single canonical net/variable);
+    // a bit-select / part-select / concat connection has no single collapse target
+    // and is rejected loud. An unconnected inout leaves the child net standalone.
+    void build_inout_aliases(const InstanceSymbol& inst) {
+        for (const PortConnection* pc : inst.getPortConnections()) {
+            if (pc->port.kind != SymbolKind::Port) {
+                continue;
+            }
+            const PortSymbol& p = pc->port.as<PortSymbol>();
+            if (p.direction != slang::ast::ArgumentDirection::InOut &&
+                p.direction != slang::ast::ArgumentDirection::Ref) {
+                continue;
+            }
+            if (p.internalSymbol == nullptr) {
+                continue;
+            }
+            const Expression* expr = pc->getExpression();
+            if (expr == nullptr) {
+                continue; // unconnected inout/ref: the child net stands alone
+            }
+            // slang may wrap the connection in an AssignmentExpression; the shared
+            // net is the underlying value reference.
+            const Expression& conn =
+                expr->kind == ExpressionKind::Assignment ? expr->as<AssignmentExpression>().left()
+                                                         : *expr;
+            if (conn.kind != ExpressionKind::NamedValue &&
+                conn.kind != ExpressionKind::HierarchicalValue) {
+                // TODO: inout/ref port with a bit/part-select or concat connection
+                // (per-bit collapse or resolved-net partial-driver slots).
+                fail("inout/ref port with a non-whole-signal connection is not supported");
+            }
+            const ValueSymbol& parent = canonical_value_symbol(conn.as<ValueExpressionBase>().symbol);
+            inout_alias_[p.internalSymbol] = signal_of(parent);
+        }
+    }
+
     void collect_signals(const InstanceBodySymbol& body) {
         // First pass: record port directions by the symbol they back. Ports exist
         // only on the instance body, never inside a generate block.
@@ -2528,6 +2571,14 @@ private:
                     const ValueSymbol& vs = m.as<ValueSymbol>();
                     cur_loc_              = vs.location;
 
+                    // An inout/ref port internal aliased to its parent connection
+                    // (build_inout_aliases) shares that signal instead of getting
+                    // its own storage — the collapse that makes both sides one net.
+                    if (const auto ia = inout_alias_.find(&m); ia != inout_alias_.end()) {
+                        sigmap_[&vs] = ia->second;
+                        break;
+                    }
+
                     ir::SignalInfo info;
                     if (m.kind == SymbolKind::Net) {
                         const NetSymbol& net = m.as<NetSymbol>();
@@ -2535,10 +2586,10 @@ private:
                         // per slang's MultipleUWireDrivers pass) resolve to X on
                         // conflict; wand/triand and wor/trior carry wired-AND /
                         // wired-OR resolution (net_resolve_tag); tri0/tri1 carry a
-                        // resistive pull to 0 / 1 (net_pull_value). All Z-default
-                        // when undriven, except tri0/tri1 which pull to 0 / 1.
-                        // TODO: trireg/supply0/supply1 carry charge / strength
-                        // semantics clotho does not implement.
+                        // resistive pull to 0 / 1 (net_pull_value); supply0/supply1
+                        // carry a Supply-strength pull. All Z-default when undriven,
+                        // except tri0/tri1/supply0/supply1 which pull to 0 / 1.
+                        // TODO: trireg carries charge semantics clotho does not model.
                         switch (net.netType.netKind) {
                             case NetType::Wire:
                             case NetType::Tri:
@@ -4137,9 +4188,11 @@ private:
             const PortSymbol& p = pc->port.as<PortSymbol>();
             if (p.direction == slang::ast::ArgumentDirection::InOut ||
                 p.direction == slang::ast::ArgumentDirection::Ref) {
-                // TODO: inout / ref ports — bidirectional, needs net resolution
-                // (or net-collapsing) rather than a one-way copy.
-                fail("inout/ref port connections are not supported");
+                // inout / ref ports share storage via build_inout_aliases (the child
+                // internal net/var aliases the parent signal), so there is no
+                // one-way copy to wire here — both sides already reference one
+                // signal and any drivers fold through net resolution.
+                continue;
             }
             if (p.internalSymbol == nullptr) {
                 // TODO: a port with no internal net (e.g. an unnamed expression
@@ -12144,6 +12197,13 @@ private:
     const slang::ast::Scope* scope_ = nullptr;
     // Maps an elaborated value symbol to its module Signal handle.
     ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal> sigmap_;
+    // inout / ref port collapse (LRM 23.3.3): a child port's internal net/var
+    // symbol aliased to the parent connection's signal (shared storage, no copy
+    // process). Populated at Collect before the child's signals register, so
+    // collect_scope_signals maps the internal symbol to the parent signal instead
+    // of allocating fresh storage. Both sides then read/write one signal and
+    // multi-driver resolution folds competing drivers.
+    ankerl::unordered_dense::map<const Symbol*, ir::Signal> inout_alias_;
     // Continuous-driver coverage per net signal: the closed regions already
     // driven, checked for overlap by record_net_driver_region (NetRegion defined
     // in the net-driver-tracking section).

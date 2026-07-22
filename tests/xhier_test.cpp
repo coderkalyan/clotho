@@ -163,3 +163,57 @@ TEST_CASE("xhier: reference into a generate-loop block") {
     )");
     CHECK(out == "g0=2 g2=2\n");
 }
+
+TEST_CASE("inout port: child drives, parent (and a sibling) read") {
+    const std::string out = run_capture(R"(
+        module io4(inout wire [3:0] b);
+          assign b = 4'b1010;
+        endmodule
+        module rd(inout wire [3:0] b, output logic [3:0] o);
+          assign o = b;
+        endmodule
+        module top;
+          wire [3:0] w1, w2;
+          logic [3:0] o;
+          io4 u(w1);          // child drives w1 through its inout
+          assign w2 = 4'h5;   // parent drives w2
+          rd  r(w2, o);       // child reads w2 through its inout
+          initial #1 $display("%b %b", w1, o);
+        endmodule
+    )");
+    CHECK(out == "1010 0101\n");
+}
+
+// A bidirectional bus with drivers in two separate instance scopes is the
+// pre-existing cross-scope multi-driver limitation (not inout-specific), and a
+// bit-select / concat inout connection needs sub-signal aliasing the whole-signal
+// collapse cannot express. Both stay loud.
+TEST_CASE("cross-scope inout bus driver fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module tsdrv(inout wire bus, input drive, input val);
+          assign bus = drive ? val : 1'bz;
+        endmodule
+        module top;
+          wire bus;
+          logic d1, v1, d2, v2;
+          tsdrv a(bus, d1, v1);
+          tsdrv b(bus, d2, v2);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("across different scopes") != std::string::npos);
+}
+
+TEST_CASE("bit-select inout connection fails loudly") {
+    const LowerResult r = lower_text(R"(
+        module leaf(inout wire b);
+          assign b = 1'b1;
+        endmodule
+        module top;
+          wire [3:0] bus;
+          leaf u(bus[0]);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostics.find("non-whole-signal connection") != std::string::npos);
+}

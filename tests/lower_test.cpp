@@ -555,7 +555,7 @@ TEST_CASE("the same module instantiated twice gets distinct signal storage") {
     CHECK(names.contains("u1.y"));
 }
 
-TEST_CASE("an inout port connection fails loudly") {
+TEST_CASE("an inout port connection lowers (shared storage)") {
     const LowerResult r = lower_text(R"(
         module pass(inout a);
         endmodule
@@ -563,8 +563,7 @@ TEST_CASE("an inout port connection fails loudly") {
             pass u(.a(b));
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("inout") != std::string::npos);
+    CHECK_MESSAGE(r.ok, r.diagnostics);
 }
 
 TEST_CASE("whole unpacked array blocking assignment lowers (memcpy)") {
