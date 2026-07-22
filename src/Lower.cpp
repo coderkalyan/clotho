@@ -690,7 +690,10 @@ private:
                     if (driver_pass) lower_continuous_assign(m.as<ContinuousAssignSymbol>());
                     break;
                 case SymbolKind::ProceduralBlock:
-                    if (emit) lower_procedural_block(m.as<ProceduralBlockSymbol>());
+                    // Collect: register a hidden force_site signal per whole-var
+                    // `force` target so writers gate in Emit (LRM 10.6.2).
+                    if (pass == Pass::Collect) scan_force_targets(m.as<ProceduralBlockSymbol>().getBody());
+                    else if (emit) lower_procedural_block(m.as<ProceduralBlockSymbol>());
                     break;
                 case SymbolKind::Variable:
                     // Storage was registered by collect_signals; here only a
@@ -3512,8 +3515,9 @@ private:
 
         // A continuous assign is a process sensitive to the source elements of
         // its expression (LRM 4.9.1): every signal the RHS reads, plus any read
-        // in an LHS selector (`assign mem[i] = x` is sensitive to i).
-        add_continuous_process(continuous_events(e), l, b);
+        // in an LHS selector (`assign mem[i] = x` is sensitive to i). A forced
+        // variable's driver also wakes on force_site so release reverts to it.
+        add_continuous_process(with_force_wake(continuous_events(e), left), l, b);
     }
 
     // The wait events of a continuous assignment: every signal its expression
@@ -3552,6 +3556,271 @@ private:
                                          .loc         = l,
                                          .ir          = b.finish(),
                                          .scope       = cur_scope_id() });
+    }
+
+    // -- Procedural continuous assignment: force / release (LRM 10.6.2) --
+    //
+    // Phase 1: whole-scalar integral VARIABLES only. Each forceable variable
+    // carries a hidden 2-state i32 `force_site` signal (0 = not forced, else the
+    // compile-time id of the active textual force site). Ordinary procedural /
+    // continuous writes to the variable are gated `if (force_site === 0)`; a
+    // `force` sets the site and writes unconditionally, plus arms a continuous
+    // re-eval process that re-applies its RHS whenever the RHS changes (LRM's
+    // continuous relationship); `release` clears the site and the value holds. Per
+    // textual force site ids give last-force-wins: a superseded site's re-eval
+    // process sees `force_site !== its id` and stops writing. Nets, bit/part/
+    // element-selects, aggregates, and `assign`/`deassign` are guarded loud below.
+    struct ForceInfo {
+        ir::Signal site{ 0 };       // force_site, always allocated
+        uint32_t   next_site = 0;   // ids handed to textual force sites, 1-based
+        // Second override layer: the procedural continuous `assign` statement (LRM
+        // 10.6.1), priority below force and above ordinary procedural writes.
+        // Present only when the variable is an `assign` target somewhere.
+        bool       has_assign   = false;
+        ir::Signal assign_site{ 0 };
+        uint32_t   next_assign  = 0;
+    };
+    ankerl::unordered_dense::map<uint32_t, ForceInfo> forceable_;
+
+    // The whole-scalar integral variable an lvalue names, or null for any shape
+    // Phase 1 does not force (a net, a select, an aggregate, a non-integral type).
+    const ValueSymbol* force_target_var(const Expression& lhs) {
+        if (lhs.kind != ExpressionKind::NamedValue &&
+            lhs.kind != ExpressionKind::HierarchicalValue) {
+            return nullptr;
+        }
+        if (!lhs.type->getCanonicalType().isIntegral()) {
+            return nullptr;   // real / string / aggregate / unpacked
+        }
+        const ValueSymbol& sym = lhs.as<ValueExpressionBase>().symbol;
+        if (canonical_value_symbol(sym).kind == SymbolKind::Net) {
+            return nullptr;   // nets: Phase 1.5 (resolver-level override)
+        }
+        return &sym;
+    }
+
+    // The ForceInfo for a signal already registered forceable, or null.
+    ForceInfo* force_info_of(const ValueSymbol& sym) {
+        const auto sit = sigmap_.find(&canonical_value_symbol(sym));
+        if (sit == sigmap_.end()) {
+            return nullptr;
+        }
+        const auto fit = forceable_.find(static_cast<uint32_t>(sit->second));
+        return fit == forceable_.end() ? nullptr : &fit->second;
+    }
+
+    // Collect-pass scan: register the hidden per-target state signals for every
+    // whole-scalar-variable `force` / `assign` target in a procedural block, so
+    // ordinary writers lowered later in Emit see the target as forceable and gate.
+    void scan_force_targets(const Statement& body) {
+        struct Scan : ASTVisitor<Scan, VisitFlags::AllGood> {
+            Lowerer* self;
+            void handle(const ProceduralAssignStatement& s) {
+                if (s.assignment.kind == ExpressionKind::Assignment) {
+                    self->register_pca_target(s.assignment.as<AssignmentExpression>().left(),
+                                              s.isForce);
+                }
+                visitDefault(s);
+            }
+        };
+        Scan v;
+        v.self = this;
+        body.visit(v);
+    }
+
+    // A hidden 2-state i32 state signal (`force_site` / `assign_site`) that powers
+    // up to 0 (not-forced / not-assigned).
+    ir::Signal new_pca_state(const char* tag, const ValueSymbol& sym) {
+        ir::SignalInfo info;
+        info.name = prefix_ + tag + "." + std::string(sym.name) + "." + std::to_string(temp_id_++);
+        info.type = make_int_type(32, false, false);
+        return register_signal(std::move(info));
+    }
+
+    // Register a `force` (is_force) or procedural continuous `assign` (!is_force)
+    // target. force_site is allocated on first registration; assign_site is added
+    // when the variable is an `assign` target.
+    void register_pca_target(const Expression& lhs, bool is_force) {
+        const ValueSymbol* sym = force_target_var(lhs);
+        if (sym == nullptr) {
+            return;   // unsupported shape: guarded loud at statement lowering
+        }
+        const auto sit = sigmap_.find(&canonical_value_symbol(*sym));
+        if (sit == sigmap_.end()) {
+            return;   // not registered in this scope (hierarchical): guarded loud
+        }
+        const auto [it, inserted] = forceable_.try_emplace(static_cast<uint32_t>(sit->second));
+        ForceInfo& fi             = it->second;
+        if (inserted) {
+            fi.site = new_pca_state("$force_site", *sym);
+        }
+        if (!is_force && !fi.has_assign) {
+            fi.has_assign   = true;
+            fi.assign_site  = new_pca_state("$assign_site", *sym);
+        }
+    }
+
+    // A continuous driver (module-level `assign`) of a forced variable must also
+    // wake on `force_site` so that `release` (force_site -> 0) re-evaluates it and
+    // reverts the variable to the driver's current value (LRM 10.6.2 reestablish).
+    // Appends that wait event when `lhs`'s root is forceable; a no-op otherwise.
+    std::vector<ir::WaitEvent> with_force_wake(std::vector<ir::WaitEvent> ev,
+                                               const Expression&          lhs) {
+        if (const ValueSymbol* r = lvalue_root(lhs)) {
+            if (ForceInfo* fi = force_info_of(*r)) {
+                ev.push_back(ir::WaitEvent{ .signal = fi->site, .edge = ir::Edge::Any });
+            }
+        }
+        return ev;
+    }
+
+    // Constant of the force_site signal's type (2-state i32).
+    ir::Index site_const(uint32_t id, ir::Builder& b, ir::SourceLoc l) {
+        return b.constant(module_.pool.put_int(make_int_type(32, false, false), id), l);
+    }
+
+    // `force_site === id` (CaseEq never yields x; the site is 2-state anyway).
+    ir::Index site_is(ir::Signal site, uint32_t id, ir::Builder& b, ir::SourceLoc l) {
+        return b.binary(ir::Inst::Tag::CaseEq, b.unary(ir::Inst::Tag::Load, b.signal(site, l), l),
+                        site_const(id, b, l), l);
+    }
+
+    // `not forced` and, if an assign layer exists, `not assigned` — the predicate
+    // that lets an ordinary write / the assign-layer driver through. force > assign
+    // > ordinary (LRM 10.6): ordinary is gated on both, the assign driver on force.
+    ir::Index not_forced(const ForceInfo& fi, bool also_assign, ir::Builder& b, ir::SourceLoc l) {
+        ir::Index pred = site_is(fi.site, 0, b, l);
+        if (also_assign && fi.has_assign) {
+            pred = b.binary(ir::Inst::Tag::Land, pred, site_is(fi.assign_site, 0, b, l), l);
+        }
+        return pred;
+    }
+
+    // An ordinary blocking/nonblocking write to a forced/assigned variable:
+    // evaluate the RHS (side effects run regardless, LRM), then store only while
+    // neither a force nor an assign is active.
+    ir::Index gated_store(const AssignmentExpression& a, const ForceInfo& fi, ir::Builder& b) {
+        const ir::SourceLoc l   = loc(a);
+        const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
+        const ir::Index     rhs = lower_expr(a.right(), b);
+        const ir::Index     pred = not_forced(fi, /*also_assign=*/true, b, l);
+        b.open_region();
+        b.binary(tag, lower_lvalue(a.left(), b), rhs, l);
+        const ir::ExtraSlice then_r = b.close_region();
+        b.open_region();
+        const ir::ExtraSlice else_r = b.close_region();
+        b.cond(pred, then_r, else_r, l);
+        return rhs;
+    }
+
+    // Common target resolution for force / assign / release / deassign: the whole
+    // integral variable, with the shape and port guards. Fails loud on any shape
+    // Phase 1 does not handle. `verb` names the statement in the diagnostic.
+    const ValueSymbol* pca_target_var(const Expression& lhs, const char* verb) {
+        const ValueSymbol* sym = force_target_var(lhs);
+        if (sym == nullptr) {
+            fail(std::string(verb) + " is only supported on a whole integral variable "
+                 "(LRM 10.6); nets, selects, and aggregates are not yet supported");
+        }
+        if (module_.signals()[static_cast<uint32_t>(signal_of(*sym))].dir !=
+            ir::SignalInfo::Direction::Internal) {
+            // An input/inout-port variable is driven from outside via a port-copy
+            // continuous process that is not force_site-aware, so release/deassign
+            // could not reestablish the external driver (LRM 10.6). Internal vars
+            // and output ports (driven inside) are handled. TODO: port-copy drivers.
+            fail(std::string(verb) + " on an input or inout port variable is not supported");
+        }
+        return sym;
+    }
+
+    // Build a continuous re-eval process that stores `a.right()` into `v` while
+    // `pred_fn(rb)` holds, sensitive to the RHS reads plus `extra` wait events.
+    template <typename PredFn>
+    void add_pca_reeval(const AssignmentExpression& a, ir::Signal v, ir::SourceLoc l,
+                        std::vector<ir::WaitEvent> extra, PredFn pred_fn) {
+        ir::Builder     rb(module_.pool);
+        const ir::Index pred = pred_fn(rb);
+        rb.open_region();
+        rb.binary(ir::Inst::Tag::Store, rb.signal(v, l), lower_expr(a.right(), rb), l);
+        const ir::ExtraSlice then_r = rb.close_region();
+        rb.open_region();
+        const ir::ExtraSlice else_r = rb.close_region();
+        rb.cond(pred, then_r, else_r, l);
+        std::vector<ir::WaitEvent> ev = continuous_events(a.right());
+        ev.insert(ev.end(), extra.begin(), extra.end());
+        add_continuous_process(std::move(ev), l, rb);
+    }
+
+    void lower_proc_assign(const ProceduralAssignStatement& s, ir::Builder& b) {
+        if (s.assignment.kind != ExpressionKind::Assignment) {
+            fail("malformed force/assign statement");
+        }
+        const AssignmentExpression& a    = s.assignment.as<AssignmentExpression>();
+        const char*                 verb = s.isForce ? "force" : "procedural continuous assign";
+        const ValueSymbol*          sym  = pca_target_var(a.left(), verb);
+        ForceInfo*                  fip  = force_info_of(*sym);
+        if (fip == nullptr) {
+            // Registered by the Collect scan for every in-scope target; a miss means
+            // a hierarchical / cross-scope target the scan could not see.
+            fail(std::string(verb) + " on a hierarchical or cross-scope target is not supported");
+        }
+        ForceInfo&          fi = *fip;
+        const ir::SourceLoc l  = loc(s);
+        const ir::Signal    v  = signal_of(*sym);
+
+        if (s.isForce) {
+            // Force (LRM 10.6.2): highest priority. Apply now unconditionally, then
+            // track the RHS while this site stays the active force (last-force-wins).
+            const uint32_t id = ++fi.next_site;
+            b.binary(ir::Inst::Tag::Store, b.signal(fi.site, l), site_const(id, b, l), l);
+            b.binary(ir::Inst::Tag::Store, b.signal(v, l), lower_expr(a.right(), b), l);
+            add_pca_reeval(a, v, l, {},
+                           [&](ir::Builder& rb) { return site_is(fi.site, id, rb, l); });
+            return;
+        }
+
+        // Procedural continuous `assign` (LRM 10.6.1): overrides ordinary procedural
+        // writes, is itself overridden by force. assign_site was allocated by the
+        // scan. Apply now while not force-overridden, then track the RHS; the
+        // re-eval also wakes on force_site so `release` reestablishes this assign.
+        const uint32_t id = ++fi.next_assign;
+        b.binary(ir::Inst::Tag::Store, b.signal(fi.assign_site, l), site_const(id, b, l), l);
+        {
+            const ir::Index pred = not_forced(fi, /*also_assign=*/false, b, l);
+            b.open_region();
+            b.binary(ir::Inst::Tag::Store, b.signal(v, l), lower_expr(a.right(), b), l);
+            const ir::ExtraSlice then_r = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice else_r = b.close_region();
+            b.cond(pred, then_r, else_r, l);
+        }
+        add_pca_reeval(a, v, l, { ir::WaitEvent{ .signal = fi.site, .edge = ir::Edge::Any } },
+                       [&](ir::Builder& rb) {
+                           return rb.binary(ir::Inst::Tag::Land, site_is(fi.assign_site, id, rb, l),
+                                            not_forced(fi, /*also_assign=*/false, rb, l), l);
+                       });
+    }
+
+    void lower_proc_deassign(const ProceduralDeassignStatement& s, ir::Builder& b) {
+        const char*        verb = s.isRelease ? "release" : "deassign";
+        const ValueSymbol* sym  = pca_target_var(s.lvalue, verb);
+        ForceInfo*         fi   = force_info_of(*sym);
+        if (fi == nullptr) {
+            // release/deassign of a variable never forced/assigned is a legal no-op
+            // (LRM 10.6): no site state to clear, and the value already holds.
+            return;
+        }
+        const ir::SourceLoc l = loc(s);
+        if (s.isRelease) {
+            // Clear the force. If an assign layer is active, its force_site-sensitive
+            // re-eval process reestablishes it; otherwise the value holds (LRM
+            // 10.6.2). Clearing force_site services its wait queue and wakes both.
+            b.binary(ir::Inst::Tag::Store, b.signal(fi->site, l), site_const(0, b, l), l);
+        } else if (fi->has_assign) {
+            // deassign (LRM 10.6.1): end the procedural continuous assign; the value
+            // holds. A never-assigned variable is a no-op (no assign_site).
+            b.binary(ir::Inst::Tag::Store, b.signal(fi->assign_site, l), site_const(0, b, l), l);
+        }
     }
 
     // A net declaration assignment (`wire w = expr;`) is a continuous assignment
@@ -4901,6 +5170,12 @@ private:
                 break;
             case StatementKind::Wait:
                 lower_wait_stmt(stmt.as<WaitStatement>(), b);
+                break;
+            case StatementKind::ProceduralAssign:
+                lower_proc_assign(stmt.as<ProceduralAssignStatement>(), b);
+                break;
+            case StatementKind::ProceduralDeassign:
+                lower_proc_deassign(stmt.as<ProceduralDeassignStatement>(), b);
                 break;
             case StatementKind::Disable:
             case StatementKind::DisableFork:
@@ -8470,6 +8745,21 @@ private:
     // `y = (x = 5)`) can recover its value; the caller truncates to the LHS type.
     // Statement callers discard the return.
     ir::Index lower_assign(const AssignmentExpression& a, ir::Builder& b) {
+        // Gate ordinary writes to a forced variable (LRM 10.6.2). Only a whole-var
+        // write is gated in Phase 1; a select-write to a force target, or a
+        // compound update, is guarded loud.
+        if (const ValueSymbol* root = lvalue_root(a.left())) {
+            if (ForceInfo* fi = force_info_of(*root)) {
+                if (force_target_var(a.left()) == nullptr) {
+                    fail("assignment to a bit/part/element-select of a force-target "
+                         "variable is not supported (Phase 2)");
+                }
+                if (a.isCompound()) {
+                    fail("compound assignment to a force-target variable is not supported");
+                }
+                return gated_store(a, *fi, b);
+            }
+        }
         if (a.left().type->isEvent()) {
             // `e2 = e1` (merge) / `e = null` (LRM 15.5.5): event variables are
             // handles; assignment aliases the underlying sync object. Tier 2 —
