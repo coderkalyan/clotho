@@ -254,9 +254,64 @@ TEST_CASE("case on a real selector is rejected loudly") {
     )", "case on a real selector is not supported");
 }
 
-TEST_CASE("real delays are rejected loudly") {
-    expect_reject("module m; initial #1.5 $display(1); endmodule",
-                  "real (fractional) delay values are not supported");
+// Real (fractional) `#delay` (LRM 3.14 / 22.7): rounds to the module precision,
+// then advances the wheel on the finer grid. Golden values cross-checked against
+// iverilog 13 (1ns/1ps: constant and runtime real delays, a sub-precision delay
+// that rounds to zero, and a half-ps that rounds away from zero).
+TEST_CASE("real delays round to precision and advance time") {
+    const std::string out = run_capture(R"(
+        `timescale 1ns/1ps
+        module m;
+          real d;
+          initial begin
+            #1.5    $display("%0.4f", $realtime);
+            #0.25   $display("%0.4f", $realtime);
+            #1.005  $display("%0.4f", $realtime);
+            #0.0004 $display("%0.4f", $realtime);
+            d = 1.4995;
+            #(d)    $display("%0.4f", $realtime);
+          end
+        endmodule
+    )");
+    CHECK(out == "1.5000\n1.7500\n2.7550\n2.7550\n4.2550\n");
+}
+
+// A real delay on a continuous assign (LRM 10.3.3) and an intra-assignment
+// nonblocking delay (LRM 9.4.5) both round to precision and advance on the fine
+// grid. Cross-checked against iverilog 13.
+TEST_CASE("real delays on continuous and nonblocking assigns") {
+    const std::string out = run_capture(R"(
+        `timescale 1ns/1ps
+        module m;
+          logic [7:0] q; wire [7:0] w;
+          assign #2.5 w = q;
+          initial begin
+            q = 8'hAA;
+            q <= #1.5 8'h55;
+            #1.0 $display("q=%h @%0.4f", q, $realtime);
+            #1.0 $display("q=%h @%0.4f", q, $realtime);
+            #5   $display("w=%h @%0.4f", w, $realtime);
+          end
+        endmodule
+    )");
+    CHECK(out == "q=aa @1.0000\nq=55 @2.0000\nw=55 @7.0000\n");
+}
+
+// Only the module carrying a real delay drops to its precision (1ps); an
+// integer-only enclosing module keeps its coarse unit tick. Both times print
+// exactly, confirming cross-timescale scaling onto the shared wheel.
+TEST_CASE("real delay in a submodule, integer-only parent") {
+    const std::string out = run_capture(R"(
+        `timescale 1ns/1ps
+        module sub;
+          initial #1.5 $display("sub %0.4f", $realtime);
+        endmodule
+        module m;
+          sub s();
+          initial #3 $display("top %0.4f", $realtime);
+        endmodule
+    )");
+    CHECK(out == "sub 1.5000\ntop 3.0000\n");
 }
 
 TEST_CASE("%h of a real is rejected loudly") {

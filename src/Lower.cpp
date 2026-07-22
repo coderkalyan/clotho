@@ -141,25 +141,105 @@ uint64_t tsv_to_fs(slang::TimeScaleValue v) {
     return static_cast<uint64_t>(v.magnitude) * fs_per_unit;
 }
 
-// Wheel-tick size (fs) for an instance subtree: the smallest time *unit* across
-// the design, plus whether any design unit set a timescale explicitly. Mirrors
-// lower_instance's recursion over each scope's *effective* timescale (slang
-// resolves inheritance / the default); the caller treats the result as unitless
-// unless `any_explicit` is set, so a design with no directive keeps raw-tick time
-// (LRM §3.14.2.3).
+// True iff `tc` is a real-valued `#delay` (LRM 3.14): a plain DelayControl whose
+// amount expression is floating. Rise/fall/turn-off triples (Delay3) are rejected
+// at lowering regardless, so a real one there needs no tick handling.
+bool delay_is_real(const TimingControl* tc) {
+    return tc != nullptr && tc->kind == TimingControlKind::Delay &&
+           tc->as<DelayControl>().expr.type->isFloating();
+}
+
+// Walks a procedural block body for any real (`#1.5`-style) delay: a `#delay`
+// statement or an intra-assignment delay whose amount is floating. Existence-only
+// (stops mattering once `found` is set), so it never needs to descend further,
+// but a plain visitor is simplest.
+struct RealDelayFinder : slang::ast::ASTVisitor<RealDelayFinder, VisitFlags::AllGood> {
+    bool found = false;
+
+    void handle(const slang::ast::TimedStatement& s) {
+        if (delay_is_real(&s.timing)) {
+            found = true;
+        }
+        visitDefault(s);
+    }
+
+    void handle(const slang::ast::AssignmentExpression& a) {
+        if (delay_is_real(a.timingControl)) {
+            found = true;
+        }
+        visitDefault(a);
+    }
+};
+
+// True iff this scope (an instance body or one of its generate blocks — sharing
+// the enclosing instance's timescale) textually contains a real delay, in a
+// procedural block, an intra-assign, a continuous assign, a net declaration, or a
+// gate primitive. Nested instances are opaque: they carry their own timescale and
+// fold their own precision, so this stops at the instance boundary.
+bool scope_has_own_real_delay(const Scope& scope) {
+    for (const Symbol& m : scope.members()) {
+        switch (m.kind) {
+            case SymbolKind::ProceduralBlock: {
+                RealDelayFinder f;
+                m.as<ProceduralBlockSymbol>().getBody().visit(f);
+                if (f.found) {
+                    return true;
+                }
+                break;
+            }
+            case SymbolKind::ContinuousAssign:
+                if (delay_is_real(m.as<ContinuousAssignSymbol>().getDelay())) {
+                    return true;
+                }
+                break;
+            case SymbolKind::Net:
+                if (delay_is_real(m.as<NetSymbol>().getDelay())) {
+                    return true;
+                }
+                break;
+            case SymbolKind::PrimitiveInstance:
+                if (delay_is_real(m.as<PrimitiveInstanceSymbol>().getDelay())) {
+                    return true;
+                }
+                break;
+            case SymbolKind::GenerateBlock: {
+                const auto& gb = m.as<GenerateBlockSymbol>();
+                if (!gb.isUninstantiated && scope_has_own_real_delay(gb)) {
+                    return true;
+                }
+                break;
+            }
+            case SymbolKind::GenerateBlockArray:
+                for (const GenerateBlockSymbol* e : m.as<GenerateBlockArraySymbol>().entries) {
+                    if (!e->isUninstantiated && scope_has_own_real_delay(*e)) {
+                        return true;
+                    }
+                }
+                break;
+            default:
+                break;
+        }
+    }
+    return false;
+}
+
+// Wheel-tick size (fs) for an instance subtree: the GCD (== minimum, since all
+// timescale values are powers of ten) of every module's time *unit*, plus the
+// time *precision* of every module that contains a real delay. Also reports
+// whether any design unit set a timescale explicitly; the caller treats the
+// result as unitless unless `any_explicit` is set, so a design with no directive
+// keeps raw-tick time (LRM §3.14.2.3). Mirrors lower_instance's recursion over
+// each scope's *effective* timescale (slang resolves inheritance / the default).
 //
-// The tick is the minimum unit, NOT the minimum precision: with only integer
-// delays, every delay (constant or runtime `#expr`) is an exact multiple of its
-// module's unit, so no event can land finer than the smallest unit. Precision
-// matters only for rounding fractional (real) delays, which are unsupported.
-// Choosing the unit keeps deadline magnitudes near the timing wheel's
-// near-window (one revolution) instead of inflating them by unit/precision and
-// spilling every timer into the O(log n) overflow heap. Since all timescale
-// values are powers of ten, the minimum unit equals the GCD of all units, so it
-// also exactly represents every event time.
-// TODO: when `real` delays land, a fractional delay rounds to its module
-// precision, so the tick must drop to the minimum precision (or the GCD that
-// includes precisions) to stay exact.
+// Only a module with a real delay folds in its precision. With only integer
+// delays every event is an exact multiple of its module's unit, so the precision
+// terms never enter and the tick collapses to the minimum unit — identical to
+// pre-real-delay behavior, keeping deadline magnitudes near the wheel's near-
+// window (one revolution) instead of inflating them by unit/precision and
+// spilling every timer into the O(log n) overflow heap. A real delay rounds to
+// its module's precision (LRM 22.7), so folding that precision into the GCD makes
+// the tick divide every real event time exactly while penalizing only designs
+// (and only the modules) that actually use fractional delays.
 uint64_t design_tick_fs(const InstanceSymbol& inst, bool& any_explicit);
 
 // Smallest child time unit (fs) reachable from a scope, descending into nested
@@ -201,17 +281,25 @@ uint64_t scope_min_tick_fs(const Scope& scope, bool& any_explicit) {
 }
 
 uint64_t design_tick_fs(const InstanceSymbol& inst, bool& any_explicit) {
-    uint64_t min_fs = 0;
+    uint64_t   min_fs  = 0;
+    const auto consider = [&](uint64_t f) {
+        if (f != 0 && (min_fs == 0 || f < min_fs)) {
+            min_fs = f;
+        }
+    };
     if (inst.getDefinition().timeScale.has_value()) {
         any_explicit = true;
     }
     if (const auto ts = inst.body.getTimeScale()) {
-        min_fs = tsv_to_fs(ts->base);
+        consider(tsv_to_fs(ts->base));
+        // A real delay in this module rounds to its precision, so the tick must
+        // divide that precision. Only fold it when a real delay is actually
+        // present, so integer-only designs keep the coarser minimum-unit tick.
+        if (scope_has_own_real_delay(inst.body)) {
+            consider(tsv_to_fs(ts->precision));
+        }
     }
-    const uint64_t child = scope_min_tick_fs(inst.body, any_explicit);
-    if (child != 0 && (min_fs == 0 || child < min_fs)) {
-        min_fs = child;
-    }
+    consider(scope_min_tick_fs(inst.body, any_explicit));
 
     return min_fs;
 }
@@ -576,14 +664,17 @@ public:
         node_rel_.clear();
 
         // This instance's delay / $time multiplier: its time unit divided by the
-        // wheel tick (the design's finest precision). Both are powers of ten and
-        // the unit is never finer than the precision, so the ratio is an exact
-        // integer (LRM §3.14). Stays 1 in unitless mode. Saved here so the
-        // post-recursion restore below (with prefix_ / scope_) returns it to this
-        // level after a child runs.
+        // wheel tick. Both are powers of ten and the unit is never finer than the
+        // tick, so the ratio is an exact integer (LRM §3.14). `prec_over_tick_` is
+        // the same for the module's precision — the tick divides the precision of
+        // any module carrying a real delay (design_tick_fs folds it in), so a real
+        // delay rounds to precision then scales by this to ticks. Both stay 1 in
+        // unitless mode. Saved here so the post-recursion restore below (with
+        // prefix_ / scope_) returns them to this level after a child runs.
         if (tick_fs_ != 0) {
-            const auto ts = body.getTimeScale();
-            time_mul_     = ts ? tsv_to_fs(ts->base) / tick_fs_ : 1;
+            const auto ts   = body.getTimeScale();
+            time_mul_       = ts ? tsv_to_fs(ts->base) / tick_fs_ : 1;
+            prec_over_tick_ = ts ? tsv_to_fs(ts->precision) / tick_fs_ : 1;
         }
         const uint64_t self_mul = time_mul_;
 
@@ -714,11 +805,16 @@ private:
                     // so restore it before wiring.
                     ir::InstanceScope* child_node =
                       driver_pass ? &node.children[child_cursor++] : nullptr;
+                    // prec_over_tick_ is only changed by lower_instance and is the
+                    // enclosing value here (unchanged since entry / last restore),
+                    // so save it locally rather than threading a second param.
+                    const uint64_t self_prec = prec_over_tick_;
                     lower_instance(child, self_prefix + std::string(child.name) + ".", pass,
                                    child_node, child.name);
-                    prefix_   = self_prefix;
-                    scope_    = &scope;
-                    time_mul_ = self_mul;
+                    prefix_         = self_prefix;
+                    scope_          = &scope;
+                    time_mul_       = self_mul;
+                    prec_over_tick_ = self_prec;
                     if (driver_pass) wire_ports(child);
                     break;
                 }
@@ -870,11 +966,13 @@ private:
                     const InstanceSymbol& child = elem->as<InstanceSymbol>();
                     ir::InstanceScope*    child_node =
                       driver_pass ? &node.children[child_cursor++] : nullptr;
+                    const uint64_t self_prec = prec_over_tick_;
                     lower_instance(child, self_prefix + instance_array_element_name(child) + ".",
                                    pass, child_node, instance_array_element_name(child));
-                    prefix_   = self_prefix;
-                    scope_    = &parent_scope;
-                    time_mul_ = self_mul;
+                    prefix_         = self_prefix;
+                    scope_          = &parent_scope;
+                    time_mul_       = self_mul;
+                    prec_over_tick_ = self_prec;
                     if (driver_pass) wire_ports(child);
                     break;
                 }
@@ -7330,23 +7428,43 @@ private:
     // Lower a #delay amount, scaled from the module's time unit to wheel ticks.
     // The unit multiplier is a compile-time constant; widen to 64 bits and
     // multiply so a large unit (e.g. seconds against fs precision) cannot
-    // overflow the amount's declared width. No rounding is needed: an integer
-    // delay times the unit is always an exact multiple of the precision (LRM
-    // §3.14). Real (fractional) delays, which would round, are not yet supported.
+    // overflow the amount's declared width. An integer delay times the unit is
+    // always an exact multiple of the tick (LRM §3.14), so no rounding is needed.
     ir::Index scaled_delay(const Expression& amount, ir::Builder& b) {
-        // TODO: fractional (real) delays round to the time precision, which
-        // forces the wheel tick down to the smallest precision (LRM 22.7; see
-        // the design_tick_fs note).
+        const ir::SourceLoc l   = loc(amount);
+        const ir::Ref       u64 = make_int_type(64, false, false);
+
+        // Real (fractional) delay (LRM 3.14 / 22.7): round to this module's time
+        // precision, then scale to ticks. The wheel tick is the design-wide GCD of
+        // all units and every real-bearing module's precision (design_tick_fs), so
+        // unit/precision and precision/tick are both exact integers and the tick
+        // grid represents the rounded value exactly. Constant-fold below collapses
+        // a literal `#1.5` to a single tick constant; a runtime real delay costs
+        // one round (FtoI, half away from zero — LRM 6.12.1) and an integer
+        // multiply. time_mul_ == unit/precision * prec_over_tick_, so recover the
+        // unit/precision factor by division.
         if (amount.type->isFloating()) {
-            fail("real (fractional) delay values are not supported");
+            const ir::Index rv            = lower_expr(amount, b);
+            const uint64_t  unit_over_prec = prec_over_tick_ != 0 ? time_mul_ / prec_over_tick_ : 1;
+            ir::Index       scaled        = rv;
+            if (unit_over_prec > 1) {
+                const ir::Index m = b.constant(
+                  module_.pool.put_real(module_.pool.real_type, static_cast<double>(unit_over_prec)), l);
+                scaled = b.binary(ir::Inst::Tag::FMul, rv, m, l);
+            }
+            ir::Index ticks = b.float_cvt(ir::Inst::Tag::FtoI, scaled, u64, l);
+            if (prec_over_tick_ > 1) {
+                const ir::Index m = b.constant(module_.pool.put_int(u64, prec_over_tick_), l);
+                ticks             = b.binary(ir::Inst::Tag::Mul, ticks, m, l);
+            }
+            return ticks;
         }
+
         const ir::Index v = lower_expr(amount, b);
         if (time_mul_ <= 1) {
             return v;
         }
-        const ir::SourceLoc l   = loc(amount);
-        const ir::Ref       u64 = make_int_type(64, false, false);
-        const ir::Index     mul = b.constant(module_.pool.put_int(u64, time_mul_), l);
+        const ir::Index mul = b.constant(module_.pool.put_int(u64, time_mul_), l);
 
         return b.binary(ir::Inst::Tag::Mul, b.resize(v, u64, l), mul, l);
     }
@@ -12788,6 +12906,11 @@ private:
     // scaled up by this into ticks; $time is scaled (rounded) down by it. Always
     // 1 when unitless. Saved / restored around child-instance recursion.
     uint64_t time_mul_ = 1;
+    // Time-precision multiplier of the instance currently being lowered:
+    // precision_fs / tick_fs. A real delay rounds to this module's precision then
+    // scales up by this into ticks (time_mul_ == unit/precision * prec_over_tick_).
+    // Always 1 when unitless. Saved / restored around child-instance recursion.
+    uint64_t prec_over_tick_ = 1;
     // Monotonic counter naming hidden compiler temporaries (e.g. a repeat loop's
     // counter / bound) so their flattened signal names stay unique.
     uint32_t temp_id_ = 0;

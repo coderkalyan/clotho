@@ -248,14 +248,13 @@ TEST_CASE("$random with a seed argument lowers (threads the inout seed)") {
     CHECK(r.ok);
 }
 
-TEST_CASE("a real (fractional) delay is reported as unsupported") {
+TEST_CASE("a real (fractional) delay lowers (LRM 3.14 / 22.7)") {
     const LowerResult r = lower_text(R"(
         module m;
             initial #1.5 $display("x");
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("delay") != std::string::npos);
+    CHECK(r.ok);
 }
 
 // LRM 6.5 / 10.3.2: "shall be an error" for a variable driven by more than one
