@@ -3329,7 +3329,7 @@ private:
         // Every net that needs a resolver: the ones with >= 2 (or, for tri0/tri1,
         // >= 1) drivers, plus driverless tri0/tri1 nets that still pull to 0/1.
         std::vector<uint32_t> nets;
-        nets.reserve(resolved_slots_.size() + net_pull_.size() + force_nets_.size());
+        nets.reserve(resolved_slots_.size() + net_pull_.size() + net_force_sites_.size());
         for (const auto& [net_u, slots] : resolved_slots_) {
             nets.push_back(net_u);
         }
@@ -3341,7 +3341,7 @@ private:
         // A forced net needs a resolver to inject its override even when it is
         // otherwise single-driver or undriven (an undriven forced net reverts to z
         // on release).
-        for (const uint32_t net_u : force_nets_) {
+        for (const auto& [net_u, sites] : net_force_sites_) {
             if (!resolved_slots_.contains(net_u) && !net_pull_.contains(net_u)) {
                 nets.push_back(net_u);
             }
@@ -3427,29 +3427,40 @@ private:
             if (pi != net_pull_.end() && !pull_injected) {
                 acc = b.net_pull(acc, static_cast<uint32_t>(pi->second.value), l);
             }
-            // Net force override (LRM 10.6.2): while force_site != 0 the net takes
-            // force_val, else the resolved driver value. force_site / force_val are
-            // added to the sensitivity so a force apply and `release` both re-run.
-            const auto force_it = forceable_.find(net_u);
-            const bool forced   = force_it != forceable_.end() && force_it->second.is_net;
-            if (forced) {
-                const ForceInfo& fi     = force_it->second;
-                const ir::Index  active = site_is(fi.site, 0, b, l);   // force_site === 0
-                const ir::Index  fval   = b.unary(ir::Inst::Tag::Load, b.signal(fi.force_val, l), l);
-                acc                      = b.select(active, acc, fval, l);
-            }
+            // Store the resolved driver fold, then overlay every active force site
+            // (LRM 10.6.2). Net force writes the net storage in place at each site's
+            // range [lo, hi], so unforced bits keep the fold and z is preserved (a
+            // positioned store, not a bitwise mask). A released site (active === 0) is
+            // skipped, so re-running the resolver reverts those bits to the fold. Each
+            // site's active/val join the sensitivity so force apply and release re-run
+            // this process.
+            const auto fs_it = net_force_sites_.find(net_u);
+            const std::span<const NetForceSite> sites =
+              fs_it != net_force_sites_.end() ? std::span<const NetForceSite>(fs_it->second)
+                                              : std::span<const NetForceSite>();
             b.binary(ir::Inst::Tag::Store, b.signal(net, l), acc, l);
+            for (const NetForceSite& site : sites) {
+                const ir::Index net_lv =
+                    (site.lo == 0 && site.hi == net_w - 1)
+                        ? b.signal(net, l)
+                        : b.part_select(b.signal(net, l), site.hi, site.lo, l);
+                b.open_region();
+                b.binary(ir::Inst::Tag::Store, net_lv,
+                         b.unary(ir::Inst::Tag::Load, b.signal(site.val, l), l), l);
+                const ir::ExtraSlice then_r = b.close_region();
+                b.open_region();
+                const ir::ExtraSlice else_r = b.close_region();
+                b.cond(site_is(site.active, 1, b, l), then_r, else_r, l);
+            }
 
             std::vector<ir::WaitEvent> wait_events;
-            wait_events.reserve(slots.size() + 2);
+            wait_events.reserve(slots.size() + sites.size() * 2);
             for (const ir::Signal s : slots) {
                 wait_events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
             }
-            if (forced) {
-                wait_events.push_back(ir::WaitEvent{ .signal = force_it->second.site,
-                                                     .edge   = ir::Edge::Any });
-                wait_events.push_back(ir::WaitEvent{ .signal = force_it->second.force_val,
-                                                     .edge   = ir::Edge::Any });
+            for (const NetForceSite& site : sites) {
+                wait_events.push_back(ir::WaitEvent{ .signal = site.active, .edge = ir::Edge::Any });
+                wait_events.push_back(ir::WaitEvent{ .signal = site.val, .edge = ir::Edge::Any });
             }
             module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
                                              .wait_events = std::move(wait_events),
@@ -3604,16 +3615,26 @@ private:
         bool       has_assign   = false;
         ir::Signal assign_site{ 0 };
         uint32_t   next_assign  = 0;
-        // A net target (LRM 10.6.2): force overrides the net's resolution rather
-        // than gating writers. `force_val` holds the forced value; the net's
-        // resolver picks it while force_site != 0, else the driver fold.
-        bool       is_net = false;
-        ir::Signal force_val{ 0 };
     };
     ankerl::unordered_dense::map<uint32_t, ForceInfo> forceable_;
-    // Forceable net handles: nets whose resolver must inject the force override
-    // (and that need a resolver even when otherwise single-driver / undriven).
-    ankerl::unordered_dense::set<uint32_t> force_nets_;
+
+    // One `force` of a net (LRM 10.6.2), whole or a constant bit/part-select. A net
+    // has no procedural writers to gate; instead each force site contributes a
+    // range [lo, hi] whose bits the net's resolver overlays with `val` while
+    // `active` != 0 (emit_wire_resolvers). `val` is exactly range-wide. Per-site
+    // (not a single net force_val) so disjoint partial forces coexist and each
+    // releases independently.
+    struct NetForceSite {
+        ir::Signal active{ 0 };   // 2-state i32, 0 = inactive
+        ir::Signal val{ 0 };      // (hi - lo + 1)-wide forced value
+        uint32_t   lo = 0, hi = 0;
+    };
+    // Net handle -> its force sites (in registration order; the resolver blends
+    // them in that order, exact for disjoint ranges).
+    ankerl::unordered_dense::map<uint32_t, std::vector<NetForceSite>> net_force_sites_;
+    // A `force` statement -> (net handle, index into net_force_sites_) so the Emit
+    // lowering reuses the site the Collect scan created.
+    ankerl::unordered_dense::map<const void*, std::pair<uint32_t, uint32_t>> stmt_force_site_;
 
     // The whole-scalar force/release target an lvalue names (variable or net), or
     // null for a shape Phase 1 does not handle (a select, a concat, an aggregate, a
@@ -3655,16 +3676,15 @@ private:
         return fit == forceable_.end() ? nullptr : &fit->second;
     }
 
-    // Collect-pass scan: register the hidden per-target state signals for every
-    // whole-scalar-variable `force` / `assign` target in a procedural block, so
-    // ordinary writers lowered later in Emit see the target as forceable and gate.
+    // Collect-pass scan: register the hidden per-target state for every `force` /
+    // `assign` site in a procedural block, so writers/resolvers lowered later in
+    // Emit see the target as forceable.
     void scan_force_targets(const Statement& body) {
         struct Scan : ASTVisitor<Scan, VisitFlags::AllGood> {
             Lowerer* self;
             void handle(const ProceduralAssignStatement& s) {
                 if (s.assignment.kind == ExpressionKind::Assignment) {
-                    self->register_pca_target(s.assignment.as<AssignmentExpression>().left(),
-                                              s.isForce);
+                    self->register_pca_site(s);
                 }
                 visitDefault(s);
             }
@@ -3674,8 +3694,8 @@ private:
         body.visit(v);
     }
 
-    // A hidden 2-state i32 state signal (`force_site` / `assign_site`) that powers
-    // up to 0 (not-forced / not-assigned).
+    // A hidden 2-state i32 state signal (`force_site` / `assign_site` / net force
+    // `active`) that powers up to 0.
     ir::Signal new_pca_state(const char* tag, const ValueSymbol& sym) {
         ir::SignalInfo info;
         info.name = prefix_ + tag + "." + std::string(sym.name) + "." + std::to_string(temp_id_++);
@@ -3683,49 +3703,82 @@ private:
         return register_signal(std::move(info));
     }
 
-    // Register a `force` (is_force) or procedural continuous `assign` (!is_force)
+    // Route one force/assign statement to the variable or net registration path.
+    void register_pca_site(const ProceduralAssignStatement& s) {
+        const Expression&  lhs  = s.assignment.as<AssignmentExpression>().left();
+        const ValueSymbol* root = lvalue_root(lhs);
+        const bool is_net = root != nullptr && canonical_value_symbol(*root).kind == SymbolKind::Net;
+        if (is_net) {
+            if (s.isForce) {
+                register_net_force_site(s, lhs, *root);   // whole or const select
+            }
+            return;   // `assign` on a net is illegal (slang rejects)
+        }
+        register_pca_target(lhs, s.isForce);   // whole-scalar variable
+    }
+
+    // Register one net `force` site (whole net or a constant bit/part-select of it).
+    // Allocates the site's `active` + range-wide `val` signals and marks the net for
+    // resolution (emit_wire_resolvers overlays every active site). A dynamic /
+    // non-constant select, or a concat, is left unregistered and guarded at lowering.
+    void register_net_force_site(const ProceduralAssignStatement& s, const Expression& lhs,
+                                 const ValueSymbol& root) {
+        const auto sit = sigmap_.find(&canonical_value_symbol(root));
+        if (sit == sigmap_.end()) {
+            return;   // hierarchical / not-yet-collected: guarded loud
+        }
+        const auto     net_u = static_cast<uint32_t>(sit->second);
+        const uint32_t net_w = module_.pool.layout(module_.signal(sit->second).type).width;
+
+        uint32_t lo = 0, hi = net_w - 1;
+        if (lhs.kind != ExpressionKind::NamedValue && lhs.kind != ExpressionKind::HierarchicalValue) {
+            const auto r = packed_bit_range(lhs);
+            if (!r) {
+                return;   // dynamic / unsupported select: guarded loud at lowering
+            }
+            lo = r->first;
+            hi = r->second;
+        }
+        NetForceSite site;
+        site.active = new_pca_state("$force_active", root);
+        site.lo     = lo;
+        site.hi     = hi;
+        ir::SignalInfo vinfo;
+        vinfo.name = prefix_ + "$force_val." + std::string(root.name) + "." + std::to_string(temp_id_++);
+        vinfo.type = make_int_type(hi - lo + 1, /*four_state=*/true, /*is_signed=*/false);
+        site.val   = register_signal(std::move(vinfo));
+
+        auto&          sites = net_force_sites_[net_u];
+        const uint32_t idx   = static_cast<uint32_t>(sites.size());
+        sites.push_back(site);
+        stmt_force_site_[&s] = { net_u, idx };
+        if (resolved_nets_.insert(net_u).second) {
+            net_resolve_op_[net_u] =
+                net_resolve_tag(canonical_value_symbol(root).as<NetSymbol>().netType.netKind);
+        }
+    }
+
+    // Register a whole-scalar-VARIABLE `force` (is_force) or `assign` (!is_force)
     // target. force_site is allocated on first registration; assign_site is added
-    // when the variable is an `assign` target; a net force target additionally gets
-    // a force_val signal and is routed through a resolver (emit_wire_resolvers
-    // injects the override). `assign` on a net is illegal (slang rejects) and
-    // ignored here.
+    // when the variable is an `assign` target.
     void register_pca_target(const Expression& lhs, bool is_force) {
-        bool               is_net = false;
-        const ValueSymbol* sym    = force_target(lhs, &is_net);
-        if (sym == nullptr || (is_net && !is_force)) {
-            return;   // unsupported shape / assign-on-net: guarded or n/a
+        const ValueSymbol* sym = force_target_var(lhs);
+        if (sym == nullptr) {
+            return;   // unsupported shape (net handled elsewhere): guarded loud
         }
         const auto sit = sigmap_.find(&canonical_value_symbol(*sym));
         if (sit == sigmap_.end()) {
             return;   // not registered in this scope (hierarchical): guarded loud
         }
-        const auto v              = static_cast<uint32_t>(sit->second);
-        const auto [it, inserted] = forceable_.try_emplace(v);
+        const auto [it, inserted] = forceable_.try_emplace(static_cast<uint32_t>(sit->second));
         ForceInfo& fi             = it->second;
         if (inserted) {
-            fi.site   = new_pca_state("$force_site", *sym);
-            fi.is_net = is_net;
-            if (is_net) {
-                fi.force_val = new_force_val_signal(static_cast<ir::Signal>(v), *sym);
-                force_nets_.insert(v);
-                if (resolved_nets_.insert(v).second) {
-                    net_resolve_op_[v] = net_resolve_tag(
-                        canonical_value_symbol(*sym).as<NetSymbol>().netType.netKind);
-                }
-            }
+            fi.site = new_pca_state("$force_site", *sym);
         }
         if (!is_force && !fi.has_assign) {
             fi.has_assign  = true;
             fi.assign_site = new_pca_state("$assign_site", *sym);
         }
-    }
-
-    // A hidden signal of the net's own type, holding a net force override value.
-    ir::Signal new_force_val_signal(ir::Signal net, const ValueSymbol& sym) {
-        ir::SignalInfo info;
-        info.name = prefix_ + "$force_val." + std::string(sym.name) + "." + std::to_string(temp_id_++);
-        info.type = module_.signal(net).type;
-        return register_signal(std::move(info));
     }
 
     // A continuous driver (module-level `assign`) of a forced variable must also
@@ -3835,9 +3888,39 @@ private:
         if (s.isForce) {
             bool               is_net = false;
             const ValueSymbol* sym    = force_target(a.left(), &is_net);
-            if (sym == nullptr) {
-                fail("force is only supported on a whole integral variable or net "
-                     "(LRM 10.6.2); selects and aggregates are not yet supported");
+            if (sym == nullptr && !stmt_force_site_.contains(&s)) {
+                fail("force is only supported on a whole variable/net or a constant "
+                     "bit/part-select of a net (LRM 10.6.2); a select of a variable, "
+                     "a concatenation, and an aggregate are not yet supported");
+            }
+            if (is_net || stmt_force_site_.contains(&s)) {
+                // Net force (LRM 10.6.2), whole or a constant bit/part-select: set the
+                // site's `active` flag and range-wide `val`; the net's resolver
+                // overlays those bits while active, and reverts on release
+                // (emit_wire_resolvers). Track the RHS into `val` while active.
+                const auto it = stmt_force_site_.find(&s);
+                if (it == stmt_force_site_.end()) {
+                    fail("force on a dynamic or non-constant net bit/part-select is not "
+                         "supported (only a constant select, LRM 10.6.2)");
+                }
+                const auto [net_u, idx]  = it->second;
+                const NetForceSite& site = net_force_sites_[net_u][idx];
+                const auto          net  = static_cast<ir::Signal>(net_u);
+                const uint32_t net_w = module_.pool.layout(module_.signal(net).type).width;
+                const ir::Index rhs  = lower_expr(a.right(), b);
+                b.binary(ir::Inst::Tag::Store, b.signal(site.active, l), site_const(1, b, l), l);
+                b.binary(ir::Inst::Tag::Store, b.signal(site.val, l), rhs, l);
+                // Eager positioned apply so a same-instant read (`force n=v; if
+                // (n===v)`) sees it — the resolver would otherwise update n one delta
+                // later. The resolver re-affirms the same value when it runs.
+                const ir::Index net_lv =
+                    (site.lo == 0 && site.hi == net_w - 1)
+                        ? b.signal(net, l)
+                        : b.part_select(b.signal(net, l), site.hi, site.lo, l);
+                b.binary(ir::Inst::Tag::Store, net_lv, rhs, l);
+                add_pca_reeval(a, site.val, l, {},
+                               [&](ir::Builder& rb) { return site_is(site.active, 1, rb, l); });
+                return;
             }
             ForceInfo* fip = force_info_of(*sym);
             if (fip == nullptr) {
@@ -3847,31 +3930,14 @@ private:
                 fail("force on a target not elaborated before the force statement is "
                      "not supported (declare the instance before the forcing block)");
             }
-            ForceInfo&     fi = *fip;
-            const uint32_t id = ++fi.next_site;
-            if (is_net) {
-                // Net force (LRM 10.6.2): set force_val + force_site; the net's
-                // resolver injects `force_site != 0 ? force_val : <driver fold>`,
-                // and reverts on `release` (emit_wire_resolvers). Track the RHS into
-                // force_val while this site is the active force.
-                const ir::Signal net = signal_of(*sym);
-                const ir::Index  rhs = lower_expr(a.right(), b);
-                b.binary(ir::Inst::Tag::Store, b.signal(fi.site, l), site_const(id, b, l), l);
-                b.binary(ir::Inst::Tag::Store, b.signal(fi.force_val, l), rhs, l);
-                // Apply to the net eagerly too, so a same-instant read (`force n=v;
-                // if (n===v)`) sees it — the resolver would otherwise update n one
-                // delta later. The resolver re-affirms the same value when it runs.
-                b.binary(ir::Inst::Tag::Store, b.signal(net, l), rhs, l);
-                add_pca_reeval(a, fi.force_val, l, {},
-                               [&](ir::Builder& rb) { return site_is(fi.site, id, rb, l); });
-                return;
-            }
             if (is_externally_driven_port(*sym)) {
                 fail("force on an input or inout port variable is not supported");
             }
             // Variable force: highest priority. Apply now unconditionally, then track
             // the RHS while this site stays the active force (last-force-wins).
-            const ir::Signal v = signal_of(*sym);
+            ForceInfo&       fi = *fip;
+            const uint32_t   id = ++fi.next_site;
+            const ir::Signal v  = signal_of(*sym);
             b.binary(ir::Inst::Tag::Store, b.signal(fi.site, l), site_const(id, b, l), l);
             b.binary(ir::Inst::Tag::Store, b.signal(v, l), lower_expr(a.right(), b), l);
             add_pca_reeval(a, v, l, {},
@@ -3912,35 +3978,73 @@ private:
     }
 
     void lower_proc_deassign(const ProceduralDeassignStatement& s, ir::Builder& b) {
-        bool               is_net = false;
-        const ValueSymbol* sym    = force_target(s.lvalue, &is_net);
+        const Expression&   lv   = s.lvalue;
+        const ValueSymbol*  root = lvalue_root(lv);
+        const bool is_net = root != nullptr && canonical_value_symbol(*root).kind == SymbolKind::Net;
+        const ir::SourceLoc l    = loc(s);
+
+        if (is_net) {
+            if (!s.isRelease) {
+                fail("deassign of a net is not legal (deassign applies to a variable's "
+                     "procedural continuous assignment, LRM 10.6.1)");
+            }
+            release_net(lv, *root, b, l);
+            return;
+        }
+
+        // Variable release / deassign.
+        const ValueSymbol* sym = force_target_var(lv);
         if (sym == nullptr) {
             fail(std::string(s.isRelease ? "release" : "deassign") +
-                 " is only supported on a whole integral variable or net (LRM 10.6); "
-                 "selects and aggregates are not yet supported");
-        }
-        if (!s.isRelease && is_net) {
-            // `deassign` applies only to a variable's procedural continuous assign
-            // (LRM 10.6.1); slang rejects deassign of a net.
-            fail("deassign of a net is not legal");
+                 " is only supported on a whole variable/net or a constant bit/part-"
+                 "select of a net (LRM 10.6)");
         }
         ForceInfo* fi = force_info_of(*sym);
         if (fi == nullptr) {
-            // release/deassign of a signal never forced/assigned is a legal no-op
+            // release/deassign of a variable never forced/assigned is a legal no-op
             // (LRM 10.6): no site state to clear, and the value already holds.
             return;
         }
-        const ir::SourceLoc l = loc(s);
         if (s.isRelease) {
             // Clear the force. Storing force_site services its wait queue and wakes
-            // everything gated on it: a net's resolver reverts to the driver value
-            // immediately (LRM 10.6.2); a variable's active assign / continuous
-            // driver reestablishes, otherwise the value holds.
+            // everything gated on it: a variable's active assign / continuous driver
+            // reestablishes, otherwise the value holds (LRM 10.6.2).
             b.binary(ir::Inst::Tag::Store, b.signal(fi->site, l), site_const(0, b, l), l);
         } else if (fi->has_assign) {
             // deassign (LRM 10.6.1): end the procedural continuous assign; the value
             // holds. A never-assigned variable is a no-op (no assign_site).
             b.binary(ir::Inst::Tag::Store, b.signal(fi->assign_site, l), site_const(0, b, l), l);
+        }
+    }
+
+    // `release net` / `release net[hi:lo]` (LRM 10.6.2): clear every active force
+    // site of the net whose range is covered by the release range; the resolver
+    // reverts those bits to the driver value. Whole-net release covers all sites.
+    void release_net(const Expression& lv, const ValueSymbol& root, ir::Builder& b,
+                     ir::SourceLoc l) {
+        const auto sit = sigmap_.find(&canonical_value_symbol(root));
+        if (sit == sigmap_.end()) {
+            return;   // never registered (hierarchical): a release with no force is a no-op
+        }
+        const auto fs = net_force_sites_.find(static_cast<uint32_t>(sit->second));
+        if (fs == net_force_sites_.end()) {
+            return;   // net never forced: no-op
+        }
+        const uint32_t net_w = module_.pool.layout(module_.signal(sit->second).type).width;
+        uint32_t       rlo = 0, rhi = net_w - 1;
+        if (lv.kind != ExpressionKind::NamedValue && lv.kind != ExpressionKind::HierarchicalValue) {
+            const auto r = packed_bit_range(lv);
+            if (!r) {
+                fail("release of a dynamic or non-constant net bit/part-select is not "
+                     "supported (only a constant select, LRM 10.6.2)");
+            }
+            rlo = r->first;
+            rhi = r->second;
+        }
+        for (const NetForceSite& site : fs->second) {
+            if (site.lo >= rlo && site.hi <= rhi) {
+                b.binary(ir::Inst::Tag::Store, b.signal(site.active, l), site_const(0, b, l), l);
+            }
         }
     }
 

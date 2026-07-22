@@ -314,6 +314,28 @@ TEST_CASE("force: net force is visible in the same time step") {
     CHECK(run_capture_finish(src) == "v=zzzz\n");
 }
 
+// Constant bit/part-select force of a net (LRM 10.6.2): only the selected bits are
+// overridden; unforced bits keep the driver (z preserved), and a range `release`
+// reverts just those bits. Icarus ivtest force_release_wire_pv shape, byte-identical
+// to iverilog 13.
+TEST_CASE("force: net bit/part-select overlay, z-preserving, range release") {
+    constexpr std::string_view src = R"(
+        module m;
+            reg [3:0] in = 4'b0;
+            wire [3:0] bus = in;
+            initial begin
+                #1 force bus[0] = 1'b1;    #1 $display("%b", bus);
+                #1 force bus[3:2] = 2'b11; #1 $display("%b", bus);
+                in[1] = 1'bz;              #1 $display("%b", bus);
+                release bus[0];            #1 $display("%b", bus);
+                release bus[3:2];          #1 $display("%b", bus);
+                force bus[2:1] = 2'bx1;    #1 $display("%b", bus);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "0001\n1101\n11z1\n11z0\n00z0\n0x10\n");
+}
+
 // force / assign target an OUTPUT-port variable driven internally (an input/inout
 // port is the guarded case). sv-tests 10.6.1 / 10.6.2 shape.
 TEST_CASE("force: output-port variable is forceable") {
