@@ -222,16 +222,79 @@ TEST_CASE("assign: continuous tracking and last-wins") {
     CHECK(run_capture_finish(src) == "a=10\na=11\na=50\na=50\na=55\n");
 }
 
-// -- Loud guards (Phase 1 boundaries) --
-
-TEST_CASE("force on a net is rejected (Phase 1.5)") {
+TEST_CASE("force: net override of a gate driver, continuous, revert on release") {
     constexpr std::string_view src = R"(
-        module m; wire w; logic x;
-            initial begin force w = x; end
+        module m;
+            logic a, b, c;
+            wire e;
+            and (e, a, b, c);
+            initial begin
+                a = 1; b = 0; c = 1;
+                #1 $display("e=%b", e);
+                force e = (a | b | c);
+                #1 $display("e=%b", e);
+                release e;
+                #1 $display("e=%b", e);
+                $finish;
+            end
         endmodule)";
-    CHECK(lower_error(src).find("force is only supported on a whole integral variable") !=
-          std::string::npos);
+    CHECK(run_capture_finish(src) == "e=0\ne=1\ne=0\n");
 }
+
+TEST_CASE("force: net tracks RHS, reverts to assign driver on release") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] src, drv;
+            wire [7:0] y;
+            assign y = drv;
+            initial begin
+                drv = 8'd1; src = 8'd50;
+                #1 force y = src;
+                #1 $display("y=%0d", y);
+                src = 8'd77; #1 $display("y=%0d", y);
+                release y; #1 $display("y=%0d", y);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "y=50\ny=77\ny=1\n");
+}
+
+TEST_CASE("force: undriven net reverts to z on release") {
+    constexpr std::string_view src = R"(
+        module m;
+            wire [3:0] u;
+            initial begin
+                #1 $display("u=%b", u);
+                force u = 4'd5;
+                #1 $display("u=%0d", u);
+                release u;
+                #1 $display("u=%b", u);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "u=zzzz\nu=5\nu=zzzz\n");
+}
+
+TEST_CASE("force: resolved net override reverts to resolution on release") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic da, db;
+            wire w;
+            assign w = da;
+            assign w = db;
+            initial begin
+                da = 0; db = 0; #1 $display("w=%b", w);
+                force w = 1'b1; #1 $display("w=%b", w);
+                da = 1; db = 0; #1 $display("w=%b", w);
+                release w; #1 $display("w=%b", w);
+                db = 1; #1 $display("w=%b", w);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "w=0\nw=1\nw=1\nw=x\nw=1\n");
+}
+
+// -- Loud guards (Phase 1 boundaries) --
 
 TEST_CASE("select-write to a forced variable is rejected (Phase 2)") {
     constexpr std::string_view src = R"(

@@ -3329,12 +3329,20 @@ private:
         // Every net that needs a resolver: the ones with >= 2 (or, for tri0/tri1,
         // >= 1) drivers, plus driverless tri0/tri1 nets that still pull to 0/1.
         std::vector<uint32_t> nets;
-        nets.reserve(resolved_slots_.size() + net_pull_.size());
+        nets.reserve(resolved_slots_.size() + net_pull_.size() + force_nets_.size());
         for (const auto& [net_u, slots] : resolved_slots_) {
             nets.push_back(net_u);
         }
         for (const auto& [net_u, pull] : net_pull_) {
             if (!resolved_slots_.contains(net_u)) {
+                nets.push_back(net_u);
+            }
+        }
+        // A forced net needs a resolver to inject its override even when it is
+        // otherwise single-driver or undriven (an undriven forced net reverts to z
+        // on release).
+        for (const uint32_t net_u : force_nets_) {
+            if (!resolved_slots_.contains(net_u) && !net_pull_.contains(net_u)) {
                 nets.push_back(net_u);
             }
         }
@@ -3419,12 +3427,29 @@ private:
             if (pi != net_pull_.end() && !pull_injected) {
                 acc = b.net_pull(acc, static_cast<uint32_t>(pi->second.value), l);
             }
+            // Net force override (LRM 10.6.2): while force_site != 0 the net takes
+            // force_val, else the resolved driver value. force_site / force_val are
+            // added to the sensitivity so a force apply and `release` both re-run.
+            const auto force_it = forceable_.find(net_u);
+            const bool forced   = force_it != forceable_.end() && force_it->second.is_net;
+            if (forced) {
+                const ForceInfo& fi     = force_it->second;
+                const ir::Index  active = site_is(fi.site, 0, b, l);   // force_site === 0
+                const ir::Index  fval   = b.unary(ir::Inst::Tag::Load, b.signal(fi.force_val, l), l);
+                acc                      = b.select(active, acc, fval, l);
+            }
             b.binary(ir::Inst::Tag::Store, b.signal(net, l), acc, l);
 
             std::vector<ir::WaitEvent> wait_events;
-            wait_events.reserve(slots.size());
+            wait_events.reserve(slots.size() + 2);
             for (const ir::Signal s : slots) {
                 wait_events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
+            }
+            if (forced) {
+                wait_events.push_back(ir::WaitEvent{ .signal = force_it->second.site,
+                                                     .edge   = ir::Edge::Any });
+                wait_events.push_back(ir::WaitEvent{ .signal = force_it->second.force_val,
+                                                     .edge   = ir::Edge::Any });
             }
             module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
                                              .wait_events = std::move(wait_events),
@@ -3579,12 +3604,21 @@ private:
         bool       has_assign   = false;
         ir::Signal assign_site{ 0 };
         uint32_t   next_assign  = 0;
+        // A net target (LRM 10.6.2): force overrides the net's resolution rather
+        // than gating writers. `force_val` holds the forced value; the net's
+        // resolver picks it while force_site != 0, else the driver fold.
+        bool       is_net = false;
+        ir::Signal force_val{ 0 };
     };
     ankerl::unordered_dense::map<uint32_t, ForceInfo> forceable_;
+    // Forceable net handles: nets whose resolver must inject the force override
+    // (and that need a resolver even when otherwise single-driver / undriven).
+    ankerl::unordered_dense::set<uint32_t> force_nets_;
 
-    // The whole-scalar integral variable an lvalue names, or null for any shape
-    // Phase 1 does not force (a net, a select, an aggregate, a non-integral type).
-    const ValueSymbol* force_target_var(const Expression& lhs) {
+    // The whole-scalar integral force/release target an lvalue names (variable or
+    // net), or null for a shape Phase 1 does not handle (a select, a concat, an
+    // aggregate, a non-integral type). Sets `*is_net` when non-null.
+    const ValueSymbol* force_target(const Expression& lhs, bool* is_net) {
         if (lhs.kind != ExpressionKind::NamedValue &&
             lhs.kind != ExpressionKind::HierarchicalValue) {
             return nullptr;
@@ -3593,10 +3627,18 @@ private:
             return nullptr;   // real / string / aggregate / unpacked
         }
         const ValueSymbol& sym = lhs.as<ValueExpressionBase>().symbol;
-        if (canonical_value_symbol(sym).kind == SymbolKind::Net) {
-            return nullptr;   // nets: Phase 1.5 (resolver-level override)
+        if (is_net != nullptr) {
+            *is_net = canonical_value_symbol(sym).kind == SymbolKind::Net;
         }
         return &sym;
+    }
+
+    // The whole-scalar integral VARIABLE an lvalue names, or null for a net / any
+    // other shape. Used by the `assign` layer (variables only) and the gate.
+    const ValueSymbol* force_target_var(const Expression& lhs) {
+        bool               is_net = false;
+        const ValueSymbol* sym    = force_target(lhs, &is_net);
+        return (sym != nullptr && !is_net) ? sym : nullptr;
     }
 
     // The ForceInfo for a signal already registered forceable, or null.
@@ -3639,25 +3681,47 @@ private:
 
     // Register a `force` (is_force) or procedural continuous `assign` (!is_force)
     // target. force_site is allocated on first registration; assign_site is added
-    // when the variable is an `assign` target.
+    // when the variable is an `assign` target; a net force target additionally gets
+    // a force_val signal and is routed through a resolver (emit_wire_resolvers
+    // injects the override). `assign` on a net is illegal (slang rejects) and
+    // ignored here.
     void register_pca_target(const Expression& lhs, bool is_force) {
-        const ValueSymbol* sym = force_target_var(lhs);
-        if (sym == nullptr) {
-            return;   // unsupported shape: guarded loud at statement lowering
+        bool               is_net = false;
+        const ValueSymbol* sym    = force_target(lhs, &is_net);
+        if (sym == nullptr || (is_net && !is_force)) {
+            return;   // unsupported shape / assign-on-net: guarded or n/a
         }
         const auto sit = sigmap_.find(&canonical_value_symbol(*sym));
         if (sit == sigmap_.end()) {
             return;   // not registered in this scope (hierarchical): guarded loud
         }
-        const auto [it, inserted] = forceable_.try_emplace(static_cast<uint32_t>(sit->second));
+        const auto v              = static_cast<uint32_t>(sit->second);
+        const auto [it, inserted] = forceable_.try_emplace(v);
         ForceInfo& fi             = it->second;
         if (inserted) {
-            fi.site = new_pca_state("$force_site", *sym);
+            fi.site   = new_pca_state("$force_site", *sym);
+            fi.is_net = is_net;
+            if (is_net) {
+                fi.force_val = new_force_val_signal(static_cast<ir::Signal>(v), *sym);
+                force_nets_.insert(v);
+                if (resolved_nets_.insert(v).second) {
+                    net_resolve_op_[v] = net_resolve_tag(
+                        canonical_value_symbol(*sym).as<NetSymbol>().netType.netKind);
+                }
+            }
         }
         if (!is_force && !fi.has_assign) {
-            fi.has_assign   = true;
-            fi.assign_site  = new_pca_state("$assign_site", *sym);
+            fi.has_assign  = true;
+            fi.assign_site = new_pca_state("$assign_site", *sym);
         }
+    }
+
+    // A hidden signal of the net's own type, holding a net force override value.
+    ir::Signal new_force_val_signal(ir::Signal net, const ValueSymbol& sym) {
+        ir::SignalInfo info;
+        info.name = prefix_ + "$force_val." + std::string(sym.name) + "." + std::to_string(temp_id_++);
+        info.type = module_.signal(net).type;
+        return register_signal(std::move(info));
     }
 
     // A continuous driver (module-level `assign`) of a forced variable must also
@@ -3755,29 +3819,56 @@ private:
         if (s.assignment.kind != ExpressionKind::Assignment) {
             fail("malformed force/assign statement");
         }
-        const AssignmentExpression& a    = s.assignment.as<AssignmentExpression>();
-        const char*                 verb = s.isForce ? "force" : "procedural continuous assign";
-        const ValueSymbol*          sym  = pca_target_var(a.left(), verb);
-        ForceInfo*                  fip  = force_info_of(*sym);
-        if (fip == nullptr) {
-            // Registered by the Collect scan for every in-scope target; a miss means
-            // a hierarchical / cross-scope target the scan could not see.
-            fail(std::string(verb) + " on a hierarchical or cross-scope target is not supported");
-        }
-        ForceInfo&          fi = *fip;
-        const ir::SourceLoc l  = loc(s);
-        const ir::Signal    v  = signal_of(*sym);
+        const AssignmentExpression& a = s.assignment.as<AssignmentExpression>();
+        const ir::SourceLoc         l = loc(s);
 
         if (s.isForce) {
-            // Force (LRM 10.6.2): highest priority. Apply now unconditionally, then
-            // track the RHS while this site stays the active force (last-force-wins).
+            bool               is_net = false;
+            const ValueSymbol* sym    = force_target(a.left(), &is_net);
+            if (sym == nullptr) {
+                fail("force is only supported on a whole integral variable or net "
+                     "(LRM 10.6.2); selects and aggregates are not yet supported");
+            }
+            ForceInfo* fip = force_info_of(*sym);
+            if (fip == nullptr) {
+                fail("force on a hierarchical or cross-scope target is not supported");
+            }
+            ForceInfo&     fi = *fip;
             const uint32_t id = ++fi.next_site;
+            if (is_net) {
+                // Net force (LRM 10.6.2): set force_val + force_site; the net's
+                // resolver injects `force_site != 0 ? force_val : <driver fold>`,
+                // and reverts on `release` (emit_wire_resolvers). Track the RHS into
+                // force_val while this site is the active force.
+                b.binary(ir::Inst::Tag::Store, b.signal(fi.site, l), site_const(id, b, l), l);
+                b.binary(ir::Inst::Tag::Store, b.signal(fi.force_val, l), lower_expr(a.right(), b), l);
+                add_pca_reeval(a, fi.force_val, l, {},
+                               [&](ir::Builder& rb) { return site_is(fi.site, id, rb, l); });
+                return;
+            }
+            if (module_.signals()[static_cast<uint32_t>(signal_of(*sym))].dir !=
+                ir::SignalInfo::Direction::Internal) {
+                fail("force on an input or inout port variable is not supported");
+            }
+            // Variable force: highest priority. Apply now unconditionally, then track
+            // the RHS while this site stays the active force (last-force-wins).
+            const ir::Signal v = signal_of(*sym);
             b.binary(ir::Inst::Tag::Store, b.signal(fi.site, l), site_const(id, b, l), l);
             b.binary(ir::Inst::Tag::Store, b.signal(v, l), lower_expr(a.right(), b), l);
             add_pca_reeval(a, v, l, {},
                            [&](ir::Builder& rb) { return site_is(fi.site, id, rb, l); });
             return;
         }
+
+        // Procedural continuous `assign` (LRM 10.6.1) — variables only.
+        const ValueSymbol* sym = pca_target_var(a.left(), "procedural continuous assign");
+        ForceInfo*         fip = force_info_of(*sym);
+        if (fip == nullptr) {
+            fail("procedural continuous assign on a hierarchical or cross-scope target "
+                 "is not supported");
+        }
+        ForceInfo&       fi = *fip;
+        const ir::Signal v  = signal_of(*sym);
 
         // Procedural continuous `assign` (LRM 10.6.1): overrides ordinary procedural
         // writes, is itself overridden by force. assign_site was allocated by the
@@ -3802,19 +3893,30 @@ private:
     }
 
     void lower_proc_deassign(const ProceduralDeassignStatement& s, ir::Builder& b) {
-        const char*        verb = s.isRelease ? "release" : "deassign";
-        const ValueSymbol* sym  = pca_target_var(s.lvalue, verb);
-        ForceInfo*         fi   = force_info_of(*sym);
+        bool               is_net = false;
+        const ValueSymbol* sym    = force_target(s.lvalue, &is_net);
+        if (sym == nullptr) {
+            fail(std::string(s.isRelease ? "release" : "deassign") +
+                 " is only supported on a whole integral variable or net (LRM 10.6); "
+                 "selects and aggregates are not yet supported");
+        }
+        if (!s.isRelease && is_net) {
+            // `deassign` applies only to a variable's procedural continuous assign
+            // (LRM 10.6.1); slang rejects deassign of a net.
+            fail("deassign of a net is not legal");
+        }
+        ForceInfo* fi = force_info_of(*sym);
         if (fi == nullptr) {
-            // release/deassign of a variable never forced/assigned is a legal no-op
+            // release/deassign of a signal never forced/assigned is a legal no-op
             // (LRM 10.6): no site state to clear, and the value already holds.
             return;
         }
         const ir::SourceLoc l = loc(s);
         if (s.isRelease) {
-            // Clear the force. If an assign layer is active, its force_site-sensitive
-            // re-eval process reestablishes it; otherwise the value holds (LRM
-            // 10.6.2). Clearing force_site services its wait queue and wakes both.
+            // Clear the force. Storing force_site services its wait queue and wakes
+            // everything gated on it: a net's resolver reverts to the driver value
+            // immediately (LRM 10.6.2); a variable's active assign / continuous
+            // driver reestablishes, otherwise the value holds.
             b.binary(ir::Inst::Tag::Store, b.signal(fi->site, l), site_const(0, b, l), l);
         } else if (fi->has_assign) {
             // deassign (LRM 10.6.1): end the procedural continuous assign; the value
