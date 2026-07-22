@@ -441,3 +441,23 @@ TEST_CASE("fixed-size unpacked array decl initializer from a bare concatenation 
     )";
     CHECK(run_capture(src) == "4 5 3 1\n");
 }
+
+// A dynamic array assigned or new[]-initialized from an assignment-pattern
+// literal materializes element-wise (LRM 10.9 / 7.5) rather than copying a
+// handle. `new[N]('{...}')` sizes to N and fills the low elements. Self-checked
+// against iverilog (ivtest br_gh164c / sv_assign_pattern_part).
+TEST_CASE("dynamic array from an assignment-pattern literal") {
+    constexpr std::string_view src = R"(
+        module m;
+            int d[];
+            int e[];
+            initial begin
+                d = '{10, 20, 30};
+                e = new[4]('{1, 2, 3, 4});
+                $display("%0d %0d %0d %0d", d.size(), d[0], d[1], d[2]);
+                $display("%0d %0d %0d %0d %0d", e.size(), e[0], e[1], e[2], e[3]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "3 10 20 30\n4 1 2 3 4\n");
+}

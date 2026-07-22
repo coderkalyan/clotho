@@ -7918,7 +7918,13 @@ private:
                 // (LRM §21.2.1.2 Table 21-2), including a precision.
                 return conv;
             case 'v':
-                // TODO: %v needs net strength modeling (LRM §21.2.1.4).
+                // %v prints a per-bit strength descriptor (e.g. St0 / Pu1 / HiZ,
+                // LRM §21.2.1.4). It needs a runtime per-bit strength on the net —
+                // the 120-value strength model — which Clotho does not keep: drive
+                // strengths are resolved away at the resolver into a plain 4-state
+                // value. A Strong/HiZ approximation would be silently wrong (the
+                // conformance tests probe exactly the Pull/Weak prefixes), so %v
+                // stays loud until the strength model lands (docs/TODO.md).
                 fail("%v (net signal strength) is not supported");
             case 'p':
                 // %p renders an aggregate as an assignment pattern (LRM §21.2.1.6);
@@ -8734,10 +8740,25 @@ private:
         const ir::SourceLoc l   = loc(a);
         const ir::Index     dst = lower_lvalue(a.left(), b);
         const ir::Ref       aty = lower_type(*a.left().type);
+        // `d = '{e0, e1, ...}` (LRM 10.9): the source is an assignment-pattern
+        // literal, not another handle — materialize it element-wise rather than
+        // deep-copying a handle (emit_handle_literal_init allocates + stores).
+        if (as_assignment_pattern(a.right()) != nullptr) {
+            emit_agg_store(dst, aty, a.right(), ir::Inst::Tag::Store, b, l);
+            return dst;
+        }
         if (a.right().kind == ExpressionKind::NewArray) {
             const auto&     na   = a.right().as<slang::ast::NewArrayExpression>();
             const ir::Index size = lower_expr(na.sizeExpr(), b);
-            if (const Expression* init = na.initExpr()) {
+            const Expression* init = na.initExpr();
+            if (init != nullptr && as_assignment_pattern(*init) != nullptr) {
+                // `new[N]('{...}')`: allocate N default-filled, then store each
+                // pattern element at its position (a shorter pattern leaves the tail
+                // at the element default; a longer one is truncated to N). The init
+                // is a literal, not a copyable handle.
+                b.dyn_array_new(dst, size, dst, /*has_init*/ false, aty, l);
+                emit_dyn_pattern_fill(dst, aty, *as_assignment_pattern(*init), b, l);
+            } else if (init != nullptr) {
                 b.dyn_array_new(dst, size, lower_lvalue(*init, b), /*has_init*/ true, aty, l);
             } else {
                 b.dyn_array_new(dst, size, dst, /*has_init*/ false, aty, l);
@@ -8747,6 +8768,29 @@ private:
         // arr = other: deep copy the source handle (value semantics).
         b.dyn_array_copy(dst, lower_lvalue(a.right(), b), aty, l);
         return dst;
+    }
+
+    // Store each element of an assignment-pattern literal into an already-allocated
+    // dynamic array `dst` at its positional coordinate. Used for `new[N]('{...}')`
+    // where the array is sized to N and the pattern fills the low elements; a
+    // replicated pattern (`'{M{x}}`) expands its single stored copy M times.
+    void emit_dyn_pattern_fill(ir::Index dst, ir::Ref aty,
+                               const slang::ast::AssignmentPatternExpressionBase& pat, ir::Builder& b,
+                               ir::SourceLoc l) {
+        const ir::Type& t     = std::get<ir::Type>(module_.pool.get(aty));
+        const auto      elems = pat.elements();
+        const uint32_t  n     = static_cast<uint32_t>(elems.size());
+        const uint32_t  reps =
+            pat.kind == ExpressionKind::ReplicatedAssignmentPattern
+                ? static_cast<uint32_t>(
+                      const_uint(pat.as<ReplicatedAssignmentPatternExpression>().count()))
+                : 1;
+        for (uint32_t k = 0; k < n * reps; ++k) {
+            const ir::Index idx =
+                b.constant(module_.pool.put_int(make_int_type(32, false, true), k), l);
+            emit_agg_store(b.elem_select(dst, idx, aty, l), t.element, *elems[k % n],
+                           ir::Inst::Tag::Store, b, l);
+        }
     }
 
     // A dynamic-array built-in method used as an rvalue or statement (LRM 7.5).
