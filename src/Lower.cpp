@@ -3780,18 +3780,24 @@ private:
     // Common target resolution for force / assign / release / deassign: the whole
     // integral variable, with the shape and port guards. Fails loud on any shape
     // Phase 1 does not handle. `verb` names the statement in the diagnostic.
+    // An input/inout-port variable is driven from outside via a port-copy
+    // continuous process that is not force_site-aware, so release/deassign could
+    // not reestablish the external driver (LRM 10.6). Internal vars and output
+    // ports (driven inside, by a gated assign / procedural write) are handled.
+    // TODO: force-wake port-copy drivers to lift this.
+    bool is_externally_driven_port(const ValueSymbol& sym) {
+        const ir::SignalInfo::Direction dir =
+            module_.signals()[static_cast<uint32_t>(signal_of(sym))].dir;
+        return dir == ir::SignalInfo::Direction::Input || dir == ir::SignalInfo::Direction::Inout;
+    }
+
     const ValueSymbol* pca_target_var(const Expression& lhs, const char* verb) {
         const ValueSymbol* sym = force_target_var(lhs);
         if (sym == nullptr) {
             fail(std::string(verb) + " is only supported on a whole integral variable "
                  "(LRM 10.6); nets, selects, and aggregates are not yet supported");
         }
-        if (module_.signals()[static_cast<uint32_t>(signal_of(*sym))].dir !=
-            ir::SignalInfo::Direction::Internal) {
-            // An input/inout-port variable is driven from outside via a port-copy
-            // continuous process that is not force_site-aware, so release/deassign
-            // could not reestablish the external driver (LRM 10.6). Internal vars
-            // and output ports (driven inside) are handled. TODO: port-copy drivers.
+        if (is_externally_driven_port(*sym)) {
             fail(std::string(verb) + " on an input or inout port variable is not supported");
         }
         return sym;
@@ -3831,7 +3837,11 @@ private:
             }
             ForceInfo* fip = force_info_of(*sym);
             if (fip == nullptr) {
-                fail("force on a hierarchical or cross-scope target is not supported");
+                // The Collect scan registers every in-scope target; a cross-scope
+                // (hierarchical) target works when its instance was elaborated before
+                // the force was scanned, else it is not yet in sigmap here.
+                fail("force on a target not elaborated before the force statement is "
+                     "not supported (declare the instance before the forcing block)");
             }
             ForceInfo&     fi = *fip;
             const uint32_t id = ++fi.next_site;
@@ -3840,14 +3850,19 @@ private:
                 // resolver injects `force_site != 0 ? force_val : <driver fold>`,
                 // and reverts on `release` (emit_wire_resolvers). Track the RHS into
                 // force_val while this site is the active force.
+                const ir::Signal net = signal_of(*sym);
+                const ir::Index  rhs = lower_expr(a.right(), b);
                 b.binary(ir::Inst::Tag::Store, b.signal(fi.site, l), site_const(id, b, l), l);
-                b.binary(ir::Inst::Tag::Store, b.signal(fi.force_val, l), lower_expr(a.right(), b), l);
+                b.binary(ir::Inst::Tag::Store, b.signal(fi.force_val, l), rhs, l);
+                // Apply to the net eagerly too, so a same-instant read (`force n=v;
+                // if (n===v)`) sees it — the resolver would otherwise update n one
+                // delta later. The resolver re-affirms the same value when it runs.
+                b.binary(ir::Inst::Tag::Store, b.signal(net, l), rhs, l);
                 add_pca_reeval(a, fi.force_val, l, {},
                                [&](ir::Builder& rb) { return site_is(fi.site, id, rb, l); });
                 return;
             }
-            if (module_.signals()[static_cast<uint32_t>(signal_of(*sym))].dir !=
-                ir::SignalInfo::Direction::Internal) {
+            if (is_externally_driven_port(*sym)) {
                 fail("force on an input or inout port variable is not supported");
             }
             // Variable force: highest priority. Apply now unconditionally, then track

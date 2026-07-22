@@ -294,6 +294,44 @@ TEST_CASE("force: resolved net override reverts to resolution on release") {
     CHECK(run_capture_finish(src) == "w=0\nw=1\nw=1\nw=x\nw=1\n");
 }
 
+// A net force must be visible to a same-instant read (`force n = v; if (n===v)`),
+// not deferred one delta to the resolver. Icarus ivtest force1/force2 shape.
+// Matches iverilog 13.
+TEST_CASE("force: net force is visible in the same time step") {
+    constexpr std::string_view src = R"(
+        module m;
+            reg [3:0] drv = 4'b0101;
+            wire [3:0] val = drv;
+            initial begin
+                force val = 4'b1010;
+                if (val !== 4'b1010) $display("FAIL a");
+                force val = 4'bzzzz;
+                if (val !== 4'bzzzz) $display("FAIL b");
+                $display("v=%b", val);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "v=zzzz\n");
+}
+
+// force / assign target an OUTPUT-port variable driven internally (an input/inout
+// port is the guarded case). sv-tests 10.6.1 / 10.6.2 shape.
+TEST_CASE("force: output-port variable is forceable") {
+    constexpr std::string_view src = R"(
+        module m(output logic [7:0] q);
+            initial begin
+                q = 8'd1;
+                force q = 8'd42;
+                #1 $display("q=%0d", q);
+                release q;
+                #1 q = 8'd7;
+                $display("q=%0d", q);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "q=42\nq=7\n");
+}
+
 // -- Loud guards (Phase 1 boundaries) --
 
 TEST_CASE("select-write to a forced variable is rejected (Phase 2)") {
