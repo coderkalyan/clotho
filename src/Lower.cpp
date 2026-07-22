@@ -8537,18 +8537,20 @@ private:
             // scheduler infrastructure not present yet.
             if (a.isNonBlocking()) {
                 // Nonblocking form: sample now, do not block, commit after the
-                // timing via a detached scheduled store. Only a whole integral scalar
-                // target is lowered — the record is monomorphized per whole signal —
-                // so selects / concats / aggregates (needing the masked/array record
-                // path) fail loud, a documented follow-up
-                // (docs/design/intra-assignment-timing.md).
+                // timing via a detached scheduled store. Only a whole scalar target
+                // (integral or real) is lowered — the record is monomorphized per
+                // whole signal — so selects / concats / aggregates (needing the
+                // masked/array record path) fail loud, a documented follow-up
+                // (docs/design/intra-assignment-timing.md). A real rides its IEEE
+                // pattern through the same narrow record (intra_pack_mm).
                 const bool whole_scalar =
                     (a.left().kind == ExpressionKind::NamedValue ||
                      a.left().kind == ExpressionKind::HierarchicalValue) &&
-                    a.left().type->isIntegral() && !a.left().type->isUnpackedArray();
+                    (a.left().type->isIntegral() || a.left().type->isFloating()) &&
+                    !a.left().type->isUnpackedArray();
                 if (!whole_scalar) {
                     fail("nonblocking intra-assignment timing is only supported for a whole "
-                         "integral scalar target");
+                         "integral or real scalar target");
                 }
                 const TimingControl& tc = *a.timingControl;
                 if (tc.kind == TimingControlKind::Delay) {
@@ -8579,6 +8581,13 @@ private:
                 // Event / repeat-event form: `x <= @e y` / `x <= repeat(N) @e y`.
                 // Sample the value (and N) now; store after N occurrences of the
                 // trigger edge. Only a single (signal, edge) trigger is lowered.
+                if (a.left().type->isFloating()) {
+                    // TODO: real target on the event form of intra-assignment timing
+                    // (the delay form works via intra_pack_mm; the event arm/fire path
+                    // has a real-value gap).
+                    fail("nonblocking intra-assignment event timing on a real target is "
+                         "not supported");
+                }
                 const TimingControl* evt   = &tc;
                 ir::Index            count = ir::Index{};
                 if (tc.kind == TimingControlKind::RepeatedEvent) {

@@ -391,6 +391,23 @@ TEST_CASE("nonblocking intra-assignment multi-signal event trigger is rejected")
     CHECK(lower_error(src).find("multi-signal event trigger") != std::string::npos);
 }
 
+// A whole real / shortreal target rides the same narrow deferred record as an
+// integral scalar (the IEEE pattern via intra_pack_mm). Delay form only; the
+// event form on a real is still a documented gap. Checked vs iverilog.
+TEST_CASE("nonblocking intra-delay to a real target") {
+    constexpr std::string_view src = R"(
+        module m;
+            real r, q;
+            initial begin
+                r <= #2 1.5;
+                q <= #1 3.25;
+                #3 $display("r=%g q=%g", r, q);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "r=1.5 q=3.25\n");
+}
+
 // A non-whole-scalar target (bit/part-select, array element) needs the masked /
 // array record path (a documented follow-up) and must fail loudly.
 TEST_CASE("nonblocking intra-delay to a part-select target is rejected") {
@@ -399,7 +416,7 @@ TEST_CASE("nonblocking intra-delay to a part-select target is rejected") {
             logic [7:0] a;
             initial a[3:0] <= #5 4'd1;
         endmodule)";
-    CHECK(lower_error(src).find("whole integral scalar target") != std::string::npos);
+    CHECK(lower_error(src).find("whole integral or real scalar target") != std::string::npos);
 }
 
 // A string / whole-array target with intra-assignment timing is not yet lowered

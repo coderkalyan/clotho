@@ -11479,6 +11479,23 @@ private:
     // (monomorphized per width / z-ness), and schedule it on the wheel for
     // `now + ticks` with rt_intra_cb. The process does not suspend. The NBA region
     // of the fired instant commits the record (emit_intra_commit).
+    // Pack a freshly-sampled intra-assignment RHS into the deferred record's mm
+    // form for a whole-scalar target of slot `s`: a real rides as its IEEE-754 bit
+    // pattern in the narrow slot, a narrow 2-state target as its must plane, and a
+    // 4-state target as the packed must|may word. `rhs` may be widened in place
+    // (to_four); z is stored by the caller under s.has_z (a real / narrow slot has
+    // none). Shared by the delay (`<= #d`) and event (`<= @e`) arms.
+    llvm::Value* intra_pack_mm(const SignalSlot& s, Plane& rhs) {
+        if (rhs.fp != nullptr) {
+            return real_to_planes(fp_of(rhs)).mm;
+        }
+        if (s.narrow) {
+            return must_of(rhs);
+        }
+        rhs = to_four(rhs);
+        return rhs.mm;
+    }
+
     void emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks) {
         const SignalSlot& s      = slot_of(lv.sig);
         const llvm::Align a1{ 1 }; // record lives in an unaligned pooled block
@@ -11491,13 +11508,7 @@ private:
 
         // Value planes: a whole-scalar target is signal-width (frontend Resize), so
         // no positioning is needed — store the planes directly.
-        llvm::Value* mm_val;
-        if (s.narrow) {
-            mm_val = must_of(rhs);
-        } else {
-            rhs    = to_four(rhs);
-            mm_val = rhs.mm; // i2W: must | (may << W)
-        }
+        llvm::Value* mm_val = intra_pack_mm(s, rhs);
         b_.CreateAlignedStore(mm_val, b_.CreateStructGEP(rt, rec, 6), a1);
         if (s.has_z) {
             b_.CreateAlignedStore(rhs.z, b_.CreateStructGEP(rt, rec, 7), a1);
@@ -11645,13 +11656,7 @@ private:
         b_.CreateStore(idxv, b_.CreateStructGEP(rt, rec, 2));
         b_.CreateStore(cast(count, 32, false), b_.CreateStructGEP(rt, rec, 4)); // event countdown
 
-        llvm::Value* mm_val;
-        if (s.narrow) {
-            mm_val = must_of(rhs);
-        } else {
-            rhs    = to_four(rhs);
-            mm_val = rhs.mm;
-        }
+        llvm::Value* mm_val = intra_pack_mm(s, rhs);
         b_.CreateAlignedStore(mm_val, b_.CreateStructGEP(rt, rec, 6), a1);
         if (s.has_z) {
             b_.CreateAlignedStore(rhs.z, b_.CreateStructGEP(rt, rec, 7), a1);
