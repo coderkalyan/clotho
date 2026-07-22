@@ -3585,7 +3585,7 @@ private:
 
     // -- Procedural continuous assignment: force / release (LRM 10.6.2) --
     //
-    // Phase 1: whole-scalar integral VARIABLES only. Each forceable variable
+    // Whole-scalar variables (integral or real) and nets. Each forceable signal
     // carries a hidden 2-state i32 `force_site` signal (0 = not forced, else the
     // compile-time id of the active textual force site). Ordinary procedural /
     // continuous writes to the variable are gated `if (force_site === 0)`; a
@@ -3615,16 +3615,20 @@ private:
     // (and that need a resolver even when otherwise single-driver / undriven).
     ankerl::unordered_dense::set<uint32_t> force_nets_;
 
-    // The whole-scalar integral force/release target an lvalue names (variable or
-    // net), or null for a shape Phase 1 does not handle (a select, a concat, an
-    // aggregate, a non-integral type). Sets `*is_net` when non-null.
+    // The whole-scalar force/release target an lvalue names (variable or net), or
+    // null for a shape Phase 1 does not handle (a select, a concat, an aggregate, a
+    // string). Integral and real/shortreal scalars are handled — the force
+    // machinery is type-generic (the value store is a plain lower_expr + Store; the
+    // force_site state is always integral). A real net is illegal (slang rejects),
+    // so a real target is always a variable. Sets `*is_net` when non-null.
     const ValueSymbol* force_target(const Expression& lhs, bool* is_net) {
         if (lhs.kind != ExpressionKind::NamedValue &&
             lhs.kind != ExpressionKind::HierarchicalValue) {
             return nullptr;
         }
-        if (!lhs.type->getCanonicalType().isIntegral()) {
-            return nullptr;   // real / string / aggregate / unpacked
+        const slang::ast::Type& t = lhs.type->getCanonicalType();
+        if (!t.isIntegral() && !t.isFloating()) {
+            return nullptr;   // string / aggregate / unpacked / event / class
         }
         const ValueSymbol& sym = lhs.as<ValueExpressionBase>().symbol;
         if (is_net != nullptr) {
@@ -3633,8 +3637,8 @@ private:
         return &sym;
     }
 
-    // The whole-scalar integral VARIABLE an lvalue names, or null for a net / any
-    // other shape. Used by the `assign` layer (variables only) and the gate.
+    // The whole-scalar VARIABLE an lvalue names (integral or real), or null for a
+    // net / any other shape. Used by the `assign` layer (variables only) and the gate.
     const ValueSymbol* force_target_var(const Expression& lhs) {
         bool               is_net = false;
         const ValueSymbol* sym    = force_target(lhs, &is_net);

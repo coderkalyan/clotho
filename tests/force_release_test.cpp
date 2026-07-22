@@ -332,6 +332,37 @@ TEST_CASE("force: output-port variable is forceable") {
     CHECK(run_capture_finish(src) == "q=42\nq=7\n");
 }
 
+// force/release and assign/deassign on a real variable (LRM 10.6). The machinery
+// is type-generic; the value store is a plain real store. Icarus ivtest
+// real_force_rel / real_assign_deassign shape. Matches iverilog 13.
+TEST_CASE("force/assign: real variable") {
+    constexpr std::string_view src = R"(
+        module m;
+            real f;
+            reg d;
+            always @(d) assign f = 1.5;
+            initial begin
+                f = 0.0;
+                #1 $display("f=%g", f);
+                f = 2.0;
+                #1 $display("f=%g", f);
+                d = 0;                      // assign f = 1.5 activates
+                #1 f = 9.0;                 // suppressed by assign
+                #1 $display("f=%g", f);
+                force f = 7.25;
+                #1 f = 9.0;                 // suppressed by force
+                #1 $display("f=%g", f);
+                release f;                  // reverts to assign (1.5)
+                #1 $display("f=%g", f);
+                deassign f;                 // holds
+                #1 f = 3.0;
+                #1 $display("f=%g", f);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "f=0\nf=2\nf=1.5\nf=7.25\nf=1.5\nf=3\n");
+}
+
 // -- Loud guards (Phase 1 boundaries) --
 
 TEST_CASE("select-write to a forced variable is rejected (Phase 2)") {
