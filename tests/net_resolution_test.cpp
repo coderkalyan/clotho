@@ -227,6 +227,33 @@ TEST_CASE("overlapping partial-select drivers resolve per bit") {
     CHECK(out == "zzzzzzzz\nzz111111\n000000zz\n00xxxx11\n");
 }
 
+// Partial drivers of a multiply-driven net whose region is a multi-dimensional
+// packed element select (`t[1]`, a whole W-bit sub-vector) or a constant-base
+// indexed part-select (`a[base +: w]` / `a[base -: w]`) — net_region_of /
+// packed_bit_range resolve both to a static bit band. Cross-checked vs iverilog.
+TEST_CASE("multi-dim element and indexed part-select partial drivers resolve") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic ea, eb;
+          logic [7:0] va, vb;
+          wire [2:0][7:0] t;
+          assign t    = eb ? {vb,vb,vb} : 24'bz;  // whole-net driver
+          assign t[1] = ea ? va : 8'bz;           // multi-bit element select (k>0)
+          wire [3:0] a;
+          assign a[0+:2] = ea ? va[1:0] : 2'bz;   // indexed part-select (+:)
+          assign a[3-:2] = eb ? vb[1:0] : 2'bz;   // indexed part-select (-:)
+          initial begin
+            va = 8'hAA; vb = 8'h55;
+            ea=0; eb=1; #1; $display("%h %b", t, a);
+            ea=1; eb=0; #1; $display("%h %b", t, a);
+            ea=1; eb=1; #1; $display("%h %b", t, a);
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "555555 01zz\nzzaazz zz10\n55xx55 0110\n");
+}
+
 TEST_CASE("a whole-net driver and a partial-select driver resolve together") {
     const std::string out = run_capture(R"(
         module top;

@@ -3136,17 +3136,16 @@ private:
                 ++t;
                 continue;
             }
-            // Trailing packed select on the element. One constant bit/part/member
-            // select narrows; a second (or a non-constant) widens to the whole
-            // element (rare, stays a conservative reject within the element).
-            if (bit_set) {
-                bit_lo = 0;
-                bit_hi = UINT32_MAX;
-                continue;
-            }
+            // Trailing packed select(s) on the element. Constant selects compose:
+            // each narrows within the sub-vector the previous select isolated
+            // (`v[level][bit]` -> bit `level*W + i`), so the range accumulates
+            // relative to the current window base (bit_lo). A non-constant select
+            // cannot pin a static range and widens to the whole element (a
+            // conservative reject downstream via packed_const).
             if (const auto br = packed_bit_range(*step)) {
-                bit_lo = br->first;
-                bit_hi = br->second;
+                const uint32_t base_bit = bit_set ? bit_lo : 0;
+                bit_lo                  = base_bit + br->first;
+                bit_hi                  = base_bit + br->second;
             } else {
                 bit_lo = 0;
                 bit_hi = UINT32_MAX;
@@ -3165,31 +3164,54 @@ private:
         switch (step.kind) {
             case ExpressionKind::ElementSelect: {
                 const ElementSelectExpression& es = step.as<ElementSelectExpression>();
-                if (!es.value().type->isIntegral() || es.type->getBitWidth() != 1) {
+                // A constant element select of a packed vector (a 1-bit select) or
+                // of a multi-dimensional packed array (a whole W-bit sub-vector at
+                // stride W). `es.type` is the selected element's width — 1 for a
+                // bit select, W for a sub-vector — so ordinal * W is its low bit.
+                if (!es.value().type->isIntegral()) {
                     return std::nullopt;
                 }
                 if (const std::optional<int32_t> c = try_const_int(es.selector())) {
-                    const auto bit =
-                      static_cast<uint32_t>(packed_range_of(es.value()).translateIndex(*c));
-                    return std::make_pair(bit, bit);
+                    const auto w   = static_cast<uint32_t>(es.type->getBitWidth());
+                    const auto ord = static_cast<uint32_t>(packed_range_of(es.value()).translateIndex(*c));
+                    return std::make_pair(ord * w, ord * w + w - 1);
                 }
                 return std::nullopt;
             }
             case ExpressionKind::RangeSelect: {
                 const RangeSelectExpression& rs = step.as<RangeSelectExpression>();
-                if (!rs.value().type->isIntegral() ||
-                    rs.getSelectionKind() != RangeSelectionKind::Simple) {
+                if (!rs.value().type->isIntegral()) {
                     return std::nullopt;
                 }
-                const std::optional<int32_t> left  = try_const_int(rs.left());
-                const std::optional<int32_t> right = try_const_int(rs.right());
-                if (!left || !right) {
-                    return std::nullopt;
-                }
+                // Element bit width (W): >1 for a multi-dim packed array slice, 1
+                // for an ordinary vector. Bit offsets scale by W, mirroring
+                // lower_range_select.
+                const auto* pa = rs.value().type->getCanonicalType().as_if<slang::ast::PackedArrayType>();
+                const uint32_t w = pa != nullptr ? static_cast<uint32_t>(pa->elementType.getBitWidth()) : 1;
                 const slang::ConstantRange range = packed_range_of(rs.value());
-                const auto a = static_cast<uint32_t>(range.translateIndex(*left));
-                const auto b = static_cast<uint32_t>(range.translateIndex(*right));
-                return std::make_pair(std::min(a, b), std::max(a, b));
+                if (rs.getSelectionKind() == RangeSelectionKind::Simple) {
+                    const std::optional<int32_t> left  = try_const_int(rs.left());
+                    const std::optional<int32_t> right = try_const_int(rs.right());
+                    if (!left || !right) {
+                        return std::nullopt;
+                    }
+                    const auto a = static_cast<uint32_t>(range.translateIndex(*left)) * w;
+                    const auto b = static_cast<uint32_t>(range.translateIndex(*right)) * w;
+                    return std::make_pair(std::min(a, b), std::max(a, b) + w - 1);
+                }
+                // Indexed part-select (`+:` / `-:`, LRM 11.5.1) with a constant
+                // base is a static bit range: the base element's offset (biased by
+                // count-1 when the window extends away from the LSB end) scaled by
+                // W, spanning count*W bits. A non-constant base is not slot-able.
+                const std::optional<int32_t> base = try_const_int(rs.left());
+                if (!base) {
+                    return std::nullopt;
+                }
+                const auto    count = static_cast<uint32_t>(const_uint(rs.right()));
+                const bool    down  = rs.getSelectionKind() == RangeSelectionKind::IndexedDown;
+                const int32_t bias  = down == range.isDescending() ? static_cast<int32_t>(count) - 1 : 0;
+                const auto    lo    = static_cast<uint32_t>(range.translateIndex(*base) - bias) * w;
+                return std::make_pair(lo, lo + count * w - 1);
             }
             case ExpressionKind::MemberAccess: {
                 const MemberAccessExpression& ma    = step.as<MemberAccessExpression>();
