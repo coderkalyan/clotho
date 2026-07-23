@@ -8315,6 +8315,9 @@ private:
             case Inst::Tag::FreadMem:
                 // The file read / positioning / error / scan functions return i32.
                 return { 32, false, true };
+            case Inst::Tag::System:
+                // $system returns the raw system() int (a POSIX wait-status).
+                return { 32, false, true };
             case Inst::Tag::TestPlusArgs:
             case Inst::Tag::ValuePlusArgs:
                 // LRM §21.6: an always-known (never x/z) boolean 'int'.
@@ -9995,6 +9998,10 @@ private:
 
             case Inst::Tag::Fflush:
                 lower_fflush(i);
+                return;
+
+            case Inst::Tag::System:
+                lower_system(i);
                 return;
 
             case Inst::Tag::FopenFd:
@@ -11964,6 +11971,12 @@ private:
         return rt_fn("rt_fclose", b_.getVoidTy(), { b_.getInt32Ty() });
     }
 
+    // i32 rt_system(const char* cmd, i32 cmd_len, i32 cmd_fwd, i32 has_arg)
+    llvm::FunctionCallee system_fn() {
+        auto* i32 = b_.getInt32Ty();
+        return rt_fn("rt_system", i32, { raw_ptr_ty(), i32, i32, i32 });
+    }
+
     // void rt_timeformat_init(i64 tick_fs, i32 default_units)
     llvm::FunctionCallee timeformat_init_fn() {
         return rt_fn("rt_timeformat_init", b_.getVoidTy(), { b_.getInt64Ty(), b_.getInt32Ty() });
@@ -12149,6 +12162,21 @@ private:
         const AsciiArg n    = spill_ascii_arg(ir_->payload(i).unary, "fopen.name");
         llvm::Value*   desc = b_.CreateCall(fopen_mcd_fn(), { n.ptr, n.len, n.fwd });
         set_value(i, packed(desc, desc, zero(32)));
+    }
+
+    // Lower a $system: materialize the command string (packed-ASCII vector or
+    // dynamic string) and call rt_system. imm == 0 is the no-arg $system(),
+    // which passes has_arg = 0 so the runtime execs system(NULL); the command
+    // operand is then an (unused) empty-string constant. The compile-time gate
+    // (allow_system) is enforced in the frontend before this op is ever emitted;
+    // rt_system re-checks the access tier as a runtime backstop.
+    void lower_system(Index i) {
+        const auto&    p       = ir_->payload(i).op_imm;
+        const AsciiArg c       = spill_ascii_arg(p.op, "system.cmd");
+        llvm::Value*   has_arg = b_.getInt32(p.imm != 0 ? 1 : 0);
+        llvm::Value*   rc      = b_.CreateCall(system_fn(), { c.ptr, c.len, c.fwd, has_arg });
+        // The return is a plain known integer (no x/z): must == may, z == 0.
+        set_value(i, packed(rc, rc, zero(32)));
     }
 
     // Lower a $fclose: close the descriptor operand.

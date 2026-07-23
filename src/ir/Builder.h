@@ -318,6 +318,10 @@ public:
     Index fopen_mcd(Index name, SourceLoc loc);
     // $fclose: close the descriptor `handle`. No value.
     Index fclose(Index handle, SourceLoc loc);
+    // $system: run `cmd` as a shell command. `has_arg` is 1 for $system(cmd),
+    // 0 for the no-arg $system() (which execs the C system(NULL) probe); `cmd`
+    // is ignored when 0. Yields the raw i32 system() return.
+    Index system(Index cmd, uint32_t has_arg, SourceLoc loc);
     // $fseek(fd, offset, operation): seek the descriptor. Yields a 32-bit
     // integer (0 / -1). $fgetc / $feof / $ftell / $rewind ride the generic
     // unary() and $ungetc the generic binary() with their dedicated tags.

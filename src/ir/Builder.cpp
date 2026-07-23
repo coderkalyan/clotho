@@ -638,6 +638,10 @@ Index Builder::ferror(Index dst, Index fd, SourceLoc loc) {
     return emit({ Inst::Tag::Ferror, Inst::Payload{ .binary = { dst, fd } } }, loc);
 }
 
+Index Builder::system(Index cmd, uint32_t has_arg, SourceLoc loc) {
+    return emit({ Inst::Tag::System, Inst::Payload{ .op_imm = { cmd, has_arg } } }, loc);
+}
+
 Index Builder::fread_word(Index dst, Index fd, SourceLoc loc) {
     return emit({ Inst::Tag::FreadWord, Inst::Payload{ .binary = { dst, fd } } }, loc);
 }

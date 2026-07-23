@@ -1489,6 +1489,13 @@ struct Inst {
         // descriptor value; the no-argument form passes a constant 0, which the
         // runtime treats as "flush all"). LRM §21.3.6. Lowers to an rt_fflush call.
         Fflush,
+        // $system: run a shell command via the C system() (payload: op_imm — op
+        // is the command string value, imm the has-arg flag: 1 for $system(cmd),
+        // 0 for the no-arg $system() which passes NULL). -> i32, the raw system()
+        // return (a POSIX wait-status). LRM §20.17.1. Gated behind
+        // --allow-system (see SystemAccess); lowers to an rt_system call that
+        // itself re-checks the access tier as a backstop.
+        System,
         // $readmemh / $readmemb: load a hex/binary file into an unpacked-array
         // memory (payload: op_extra -> ReadMemInfo; op is the filename value). LRM
         // §21.4. Lowers to an rt_readmem call.
@@ -1874,6 +1881,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::RealMathUnary:
         case T::StreamReverse:
         case T::NetPull:
+        case T::System:
             return K::OpImm;
         case T::TimeFormat:
             return K::TimeFormat;

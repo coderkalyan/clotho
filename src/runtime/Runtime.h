@@ -174,6 +174,20 @@ int32_t rt_fopen_fd(const char* name_buf, uint32_t name_len, int32_t name_fwd, c
 // or the one FD). The preopened standard streams are never closed.
 void rt_fclose(int32_t desc);
 
+// Set the $system access tier (0 = off, 1 = const, 2 = full) before the design
+// runs. A host-side call, not exposed to the JIT. Governs the rt_system
+// backstop below.
+void rt_system_set_access(int32_t tier);
+
+// $system(cmd): run `cmd` as a shell command via the C system(), returning its
+// raw int (a POSIX wait-status) (LRM §20.17.1). `has_arg` == 0 is the no-arg
+// $system(), which calls system(NULL) (returns nonzero if a shell exists) and
+// ignores `cmd`. `cmd` may be a packed-ASCII vector (fwd 0) or a dynamic string
+// (fwd != 0), like $fopen. Aborts loudly if the access tier is off — a backstop
+// behind the compile-time --allow-system gate, which normally prevents this
+// call from being emitted at all.
+int32_t rt_system(const char* cmd_buf, uint32_t cmd_len, int32_t cmd_fwd, int32_t has_arg);
+
 // The file read / positioning functions require an FD (a stream), not an MCD.
 // Each maps directly onto its C stdio analog.
 

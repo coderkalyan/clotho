@@ -2249,6 +2249,33 @@ extern "C" void rt_fclose(int32_t desc) {
     }
 }
 
+// The $system access tier, set once by run_jit before the design runs
+// (0 = off, 1 = const, 2 = full). Default off so a JIT that somehow reaches
+// rt_system without run_jit having enabled it is refused, not run.
+int g_system_access = 0;
+
+extern "C" void rt_system_set_access(int32_t tier) {
+    g_system_access = tier;
+}
+
+extern "C" int32_t rt_system(const char* cmd_buf, uint32_t cmd_len, int32_t cmd_fwd,
+                             int32_t has_arg) {
+    // Runtime backstop behind the compile-time --allow-system gate. The frontend
+    // refuses to emit this call unless the operator opted in, so reaching here
+    // with the tier off means the gate was bypassed — abort loudly rather than
+    // run a shell command.
+    if (g_system_access == 0) {
+        format_fatal("$system reached with shell execution disabled (--allow-system)");
+    }
+    if (has_arg == 0) {
+        // No-arg $system(): probe for a shell (system(NULL) -> nonzero if one
+        // exists). LRM §20.17.1.
+        return std::system(nullptr);
+    }
+    const std::string cmd = read_ascii_arg(cmd_buf, cmd_len, cmd_fwd);
+    return std::system(cmd.c_str());
+}
+
 extern "C" int32_t rt_fgetc(int32_t fd) {
     io_ensure_init();
     std::FILE* f = fd_stream(fd);

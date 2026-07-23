@@ -16,6 +16,7 @@
 #include <string_view>
 
 #include "ir/Module.h"
+#include "ir/SimConfig.h"
 #include "ir/Timing.h"
 
 namespace clotho {
@@ -30,15 +31,21 @@ struct LowerResult {
     bool ok = false;
 };
 
+// The $system access tier is threaded through every entry point so the
+// compile-time gate can refuse (or constant-check) a shell-exec task. Defaults
+// to Off — $system is a hard error unless the caller opts in.
+
 // Lower one SystemVerilog source file at `path`. If `timings` is non-null, the
 // front-end and analysis phase durations are accumulated into it.
-LowerResult lower_file(std::string_view path, Timings* timings = nullptr);
+LowerResult lower_file(std::string_view path, Timings* timings = nullptr,
+                       ir::SystemAccess allow_system = ir::SystemAccess::Off);
 
 // Lower several source files compiled together into one design. Paths are
 // parsed in order and added to a single Compilation before elaboration. No
 // preprocessor options; for command-line defines/include-dirs/library flags use
 // `lower_sources`.
-LowerResult lower_files(std::span<const std::string_view> paths, Timings* timings = nullptr);
+LowerResult lower_files(std::span<const std::string_view> paths, Timings* timings = nullptr,
+                        ir::SystemAccess allow_system = ir::SystemAccess::Off);
 
 // Lower a design described by slang command-line arguments (source files plus
 // `-D`/`+define+`, `-I`/`+incdir+`, `-f` command files, `-y`/`-v` libraries,
@@ -47,10 +54,12 @@ LowerResult lower_files(std::span<const std::string_view> paths, Timings* timing
 // single-unit: `` `define `` macros and `$unit` declarations span files). This
 // is the entry the CLI uses; `args` must exclude Clotho's own options and
 // runtime plusargs.
-LowerResult lower_sources(std::span<const std::string_view> args, Timings* timings = nullptr);
+LowerResult lower_sources(std::span<const std::string_view> args, Timings* timings = nullptr,
+                          ir::SystemAccess allow_system = ir::SystemAccess::Off);
 
 // Lower a SystemVerilog source fragment held in memory. If `timings` is non-null,
 // the front-end and analysis phase durations are accumulated into it.
-LowerResult lower_text(std::string_view source, Timings* timings = nullptr);
+LowerResult lower_text(std::string_view source, Timings* timings = nullptr,
+                       ir::SystemAccess allow_system = ir::SystemAccess::Off);
 
 } // namespace clotho

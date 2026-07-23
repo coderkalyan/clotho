@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -7,6 +8,23 @@
 // entry points. Grows as new optimizations and simulation modes land.
 
 namespace clotho::ir {
+
+// Access tier for the $system shell-exec task (LRM §20.17.1). $system runs an
+// arbitrary shell command, so it is refused by default and gated behind an
+// explicit `--allow-system=<tier>` operator opt-in. The enum values are stable
+// (passed to the runtime backstop rt_system_set_access as an int32_t).
+enum class SystemAccess : uint8_t {
+    // Default: any $system in the source is a hard compile error; no exec code
+    // is emitted at all.
+    Off = 0,
+    // $system allowed only when its command string constant-folds at
+    // elaboration (so the command cannot depend on any runtime input). A
+    // non-constant command string is a compile error.
+    Const = 1,
+    // $system allowed with a runtime-computed command string. Full trust in the
+    // design and all of its runtime inputs.
+    Full = 2,
+};
 
 struct SimulationConfig {
     // Run the coroutine-lowering pipeline (CoroSplit et al.), required to
@@ -99,6 +117,11 @@ struct SimulationConfig {
     // `import "DPI-C"` symbols at JIT link time. Each is added to the JIT
     // dylib as a DynamicLibrarySearchGenerator (see run_jit).
     std::vector<std::string> dpi_libs;
+    // Access tier for the $system shell-exec task (`--allow-system=const|full`).
+    // Off by default: $system is refused at compile time and no exec code is
+    // emitted. This is a security boundary, not an optimization knob — running a
+    // shell command is arbitrary code execution, gated on an explicit opt-in.
+    SystemAccess allow_system = SystemAccess::Off;
 };
 
 } // namespace clotho::ir

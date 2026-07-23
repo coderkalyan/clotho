@@ -606,6 +606,9 @@ struct Analysis {
                 // target ($*scanf, which can parse z digits, seeds above). A
                 // never-z target's z word is elided and the runtime is handed a
                 // null z pointer.
+                // $system's result is an always-known i32 status; it writes no
+                // signal and seeds no z.
+                case Inst::Tag::System:
                 case Inst::Tag::FopenFd:
                 case Inst::Tag::FopenMcd:
                 case Inst::Tag::Fclose:

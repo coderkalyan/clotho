@@ -15,7 +15,7 @@
 // then JIT-compile and run it (default), or emit the process IR / LLVM IR for
 // debugging. All compiler logic lives in libclotho / libclotho_ir.
 //
-// Usage: clotho [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] [--no-thunk] [--no-dedup] [--domain-spec] [-O] [--perf-jitdump] [--no-parallel-compile] [--jobs=<N>] [-o <out>] [-D<macro>] [-I<dir>] [+define+...] [+incdir+...] [-f <cmd.f>] [--top <mod>] <file.sv>... [+plusarg...]
+// Usage: clotho [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] [--no-thunk] [--no-dedup] [--domain-spec] [--allow-system=const|full] [-O] [--perf-jitdump] [--no-parallel-compile] [--jobs=<N>] [-o <out>] [-D<macro>] [-I<dir>] [+define+...] [+incdir+...] [-f <cmd.f>] [--top <mod>] <file.sv>... [+plusarg...]
 // Multiple source files are compiled together into one design (shared name
 // space, LRM 3.12), parsed in the order given.
 // `llvm` emits the backend's raw IR before the coroutine-lowering pipeline runs
@@ -58,6 +58,27 @@ int main(int argc, char** argv) {
             config.outline = false;
         } else if (arg == "--domain-spec") {
             config.domain_spec = true;
+        } else if (arg.starts_with("--allow-system")) {
+            // Enable the $system shell-exec task (LRM §20.17.1), off by default.
+            // A security boundary: running a shell command is arbitrary code
+            // execution, so the tier must be given explicitly. `=const` allows
+            // only constant-folding command strings; `=full` allows a
+            // runtime-computed command.
+            if (arg == "--allow-system=const") {
+                config.allow_system = clotho::ir::SystemAccess::Const;
+            } else if (arg == "--allow-system=full") {
+                config.allow_system = clotho::ir::SystemAccess::Full;
+            } else {
+                std::println(stderr,
+                             "error: --allow-system requires a tier: "
+                             "--allow-system=const or --allow-system=full");
+                return 2;
+            }
+            std::println(stderr,
+                         "warning: $system shell command execution enabled "
+                         "(--allow-system={})",
+                         config.allow_system == clotho::ir::SystemAccess::Const ? "const"
+                                                                                : "full");
         } else if (arg == "-O") {
             config.o3 = true;
         } else if (arg == "--perf-jitdump") {
@@ -87,7 +108,7 @@ int main(int argc, char** argv) {
 
     if (slang_args.empty() || (emit != "run" && emit != "ir" && emit != "llvm" && emit != "opt")) {
         std::println(stderr,
-                     "usage: {} [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] [--no-thunk] [--no-dedup] [--domain-spec] [-O] [--perf-jitdump] [--no-parallel-compile] [--jobs=<N>] [-o <out>] [--dpi-lib <lib.o|lib.so>] [-D<macro>] [-I<dir>] [+define+...] [+incdir+...] [-f <cmd.f>] [--top <mod>] <file.sv>... [+plusarg...]",
+                     "usage: {} [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] [--no-thunk] [--no-dedup] [--domain-spec] [--allow-system=const|full] [-O] [--perf-jitdump] [--no-parallel-compile] [--jobs=<N>] [-o <out>] [--dpi-lib <lib.o|lib.so>] [-D<macro>] [-I<dir>] [+define+...] [+incdir+...] [-f <cmd.f>] [--top <mod>] <file.sv>... [+plusarg...]",
                      argv[0]);
         return 2;
     }
@@ -113,7 +134,7 @@ int main(int argc, char** argv) {
         std::println(stderr, "  {:<16}{:>12.3f}", "total", total);
     };
 
-    const clotho::LowerResult result = clotho::lower_sources(slang_args, tp);
+    const clotho::LowerResult result = clotho::lower_sources(slang_args, tp, config.allow_system);
     if (!result.diagnostics.empty()) {
         std::print(stderr, "{}", result.diagnostics);
     }

@@ -393,6 +393,8 @@ const char* tag_name(Inst::Tag tag) {
             return "continue";
         case T::Fflush:
             return "fflush";
+        case T::System:
+            return "system";
         case T::FopenFd:
             return "fopen_fd";
         case T::FopenMcd:

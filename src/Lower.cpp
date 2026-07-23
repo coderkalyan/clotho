@@ -594,9 +594,11 @@ class Lowerer {
 public:
     // `tick_fs` is the femtoseconds-per-wheel-tick (design-wide smallest time
     // unit), or 0 when no design unit set a timescale (unitless ticks).
-    Lowerer(ir::Module& module, uint64_t tick_fs)
+    Lowerer(ir::Module& module, uint64_t tick_fs,
+            ir::SystemAccess allow_system = ir::SystemAccess::Off)
       : module_(module)
-      , tick_fs_(tick_fs) {}
+      , tick_fs_(tick_fs)
+      , allow_system_(allow_system) {}
 
     // Lowering runs the instance hierarchy twice. Signal registration must
     // precede body lowering across the *whole* design, not just up the tree:
@@ -7093,6 +7095,44 @@ private:
 
     // -- System tasks --
 
+    // Lower a $system shell-exec call (LRM §20.17.1), returning the i32 result
+    // (the raw system() return). Shared by the task-statement and function-call
+    // forms. Gated by allow_system_: Off refuses it at compile time (no exec
+    // code is emitted); Const requires the command to constant-fold at
+    // elaboration — which proves it cannot depend on any runtime input, since
+    // plusargs / file contents / $random are not constant-evaluable; Full allows
+    // a runtime-computed command. Default-off is a deliberate, security-motivated
+    // deviation from LRM compliance.
+    ir::Index lower_system_call(const CallExpression& call, ir::Builder& b) {
+        const ir::SourceLoc l    = loc(call);
+        const auto          args = call.arguments();
+        if (args.size() > 1) {
+            fail("$system expects at most one argument (a command string)");
+        }
+        if (allow_system_ == ir::SystemAccess::Off) {
+            fail("$system requires --allow-system=const or --allow-system=full "
+                 "(shell command execution is disabled by default)");
+        }
+        if (args.empty()) {
+            // No-arg $system(): exec system(NULL). The command operand is an
+            // unused empty-byte constant (has_arg = 0 tells the runtime to pass
+            // NULL).
+            const ir::Index empty =
+              b.constant(module_.pool.put_int(make_int_type(8, false, false), 0), l);
+            return b.system(empty, /*has_arg=*/0, l);
+        }
+        const Expression& cmd = *args[0];
+        if (allow_system_ == ir::SystemAccess::Const) {
+            slang::ast::ASTContext  actx(*scope_, slang::ast::LookupLocation::max);
+            slang::ast::EvalContext ectx(actx);
+            if (cmd.eval(ectx).bad()) {
+                fail("$system with --allow-system=const requires a constant command "
+                     "string; use --allow-system=full for a runtime-computed command");
+            }
+        }
+        return b.system(lower_string_arg(cmd, b), /*has_arg=*/1, l);
+    }
+
     void lower_call(const CallExpression& call, ir::Builder& b) {
         if (!call.isSystemCall()) {
             // A user subroutine invoked as a statement: a function (void, or a
@@ -7189,6 +7229,11 @@ private:
             // used in statement position: lower for the side effect (file
             // position, write-back) and drop the result.
             lower_sysfunc(call, b);
+            return;
+        }
+        if (name == "$system") {
+            // Task form: run the command, discard the return value.
+            lower_system_call(call, b);
             return;
         }
         if (name == "$finish" || name == "$stop") {
@@ -8162,6 +8207,11 @@ private:
                 return b.fopen_fd(fname, lower_string_arg(*args[1], b), l);
             }
             return b.fopen_mcd(fname, l);
+        }
+
+        // $system (LRM §20.17.1) in expression position: return its i32 result.
+        if (name == "$system") {
+            return lower_system_call(call, b);
         }
 
         // $fgetc / $ungetc / $feof / $ftell / $fseek / $rewind (LRM §21.3): file
@@ -12898,6 +12948,10 @@ private:
     std::vector<std::string_view> named_blocks_;
     // Femtoseconds per wheel tick (design-wide smallest time unit); 0 == unitless.
     uint64_t tick_fs_ = 0;
+    // $system shell-exec access tier (LRM §20.17.1). Off rejects $system at
+    // compile time; Const requires a constant-folding command string; Full
+    // allows a runtime-computed command. See lower_call / the $system branch.
+    ir::SystemAccess allow_system_ = ir::SystemAccess::Off;
     // Time-unit multiplier of the instance currently being lowered: a delay is
     // scaled up by this into ticks; $time is scaled (rounded) down by it. Always
     // 1 when unitless. Saved / restored around child-instance recursion.
@@ -12960,7 +13014,8 @@ private:
     std::optional<ir::Builder> preinit_;
 };
 
-LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
+LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings,
+                              ir::SystemAccess allow_system) {
     LowerResult result;
 
     // Front end: getAllDiagnostics forces full elaboration; getRoot resolves the
@@ -13104,12 +13159,12 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
         return result;
     }
     try {
-        Lowerer globals(*module, tick_fs);
+        Lowerer globals(*module, tick_fs, allow_system);
         globals.lower_globals(comp, root);
 
         for (const InstanceSymbol* top : root.topInstances) {
             const std::string prefix = single ? std::string() : std::string(top->name) + ".";
-            Lowerer lw(*module, tick_fs);
+            Lowerer lw(*module, tick_fs, allow_system);
             lw.seed_signals(globals.sigmap());
             lw.set_globals(&globals);
             lw.lower_top(*top, prefix);
@@ -13136,7 +13191,8 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings) {
 
 } // namespace
 
-LowerResult lower_files(std::span<const std::string_view> paths, Timings* timings) {
+LowerResult lower_files(std::span<const std::string_view> paths, Timings* timings,
+                        ir::SystemAccess allow_system) {
     const auto t_parse = std::chrono::steady_clock::now();
 
     // One SourceManager shared across every tree so the Compilation's
@@ -13158,14 +13214,15 @@ LowerResult lower_files(std::span<const std::string_view> paths, Timings* timing
         timings->frontend_ms += ms_since(t_parse);
     }
 
-    return lower_compilation(comp, timings);
+    return lower_compilation(comp, timings, allow_system);
 }
 
-LowerResult lower_file(std::string_view path, Timings* timings) {
-    return lower_files({&path, 1}, timings);
+LowerResult lower_file(std::string_view path, Timings* timings, ir::SystemAccess allow_system) {
+    return lower_files({&path, 1}, timings, allow_system);
 }
 
-LowerResult lower_sources(std::span<const std::string_view> args, Timings* timings) {
+LowerResult lower_sources(std::span<const std::string_view> args, Timings* timings,
+                          ir::SystemAccess allow_system) {
     const auto t_parse = std::chrono::steady_clock::now();
 
     // slang's Driver owns arg parsing, source loading (incl. `-f` command files,
@@ -13209,10 +13266,10 @@ LowerResult lower_sources(std::span<const std::string_view> args, Timings* timin
         timings->frontend_ms += ms_since(t_parse);
     }
 
-    return lower_compilation(*comp, timings);
+    return lower_compilation(*comp, timings, allow_system);
 }
 
-LowerResult lower_text(std::string_view source, Timings* timings) {
+LowerResult lower_text(std::string_view source, Timings* timings, ir::SystemAccess allow_system) {
     const auto t_parse = std::chrono::steady_clock::now();
     slang::ast::Compilation comp;
     comp.addSyntaxTree(slang::syntax::SyntaxTree::fromText(source));
@@ -13220,7 +13277,7 @@ LowerResult lower_text(std::string_view source, Timings* timings) {
         timings->frontend_ms += ms_since(t_parse);
     }
 
-    return lower_compilation(comp, timings);
+    return lower_compilation(comp, timings, allow_system);
 }
 
 } // namespace clotho

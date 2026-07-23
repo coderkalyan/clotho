@@ -164,6 +164,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_monitor_emit", &rt_monitor_emit);
     expose("rt_fopen_mcd", &rt_fopen_mcd);
     expose("rt_fopen_fd", &rt_fopen_fd);
+    expose("rt_system", &rt_system);
     expose("rt_fclose", &rt_fclose);
     expose("rt_fgetc", &rt_fgetc);
     expose("rt_ungetc", &rt_ungetc);
@@ -550,6 +551,11 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
         pa_lens.push_back(static_cast<uint32_t>(pa.size()));
     }
     rt_plusargs_init(pa_ptrs.data(), pa_lens.data(), static_cast<uint32_t>(pa_ptrs.size()));
+
+    // Arm the $system access tier for the runtime backstop (rt_system). The
+    // compile-time gate in lowering is primary; this mirrors the operator's
+    // opt-in into the runtime so a bypassed gate still refuses to exec.
+    rt_system_set_access(static_cast<int32_t>(config.allow_system));
 
     // Simulation phase: run the compiled design. A $finish longjmps back here
     // (rt_finish is noreturn to the design) so the embedding process survives;
