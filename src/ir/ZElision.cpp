@@ -714,6 +714,255 @@ std::vector<bool> compute_undriven(const Module& m) {
     return driven;
 }
 
+// The constant driven bit range of a packed lvalue select chain. `whole` marks a
+// dynamic / unpacked / whole-storage store whose driven bits cannot be pinned
+// (the caller marks every bit driven). Composes nested constant packed selects:
+// each PartSelect adds its `lsb` to the accumulated window, a constant BitSelect
+// pins one bit. Mirrors the frontend's net_region_of / packed_bit_range.
+namespace {
+struct DriveRange {
+    Index    root;
+    bool     whole = true;
+    uint32_t lo    = 0;
+    uint32_t hi    = 0;
+};
+
+// Value of a definite integral constant, or nullopt if not a constant or if it
+// carries x/z (an ambiguous index cannot pin a bit).
+std::optional<uint64_t> const_index(const Module& m, const Ir& ir, Index c) {
+    if (ir.tag(c) != Inst::Tag::Constant) {
+        return std::nullopt;
+    }
+    const Ref                      ref = ir.payload(c).ref;
+    const Value&                   v   = std::get<Value>(m.pool.get(ref));
+    const Layout                   lay = m.pool.layout(v.type);
+    const std::span<const uint8_t> bytes = m.pool.bytes(ref);
+    const uint32_t                 pb    = plane_bytes(lay.width);
+    if (lay.domain == Domain::Four) {
+        // A definite index has an all-zero xz plane.
+        for (uint32_t k = 0; k < pb; ++k) {
+            if (bytes[pb + k] != 0) {
+                return std::nullopt;
+            }
+        }
+    }
+    uint64_t val = 0;
+    for (uint32_t k = 0; k < pb && k < 8; ++k) {
+        val |= static_cast<uint64_t>(bytes[k]) << (8 * k);
+    }
+    return val;
+}
+
+DriveRange drive_range(const Module& m, const Ir& ir, Index lv) {
+    uint32_t lo = 0, hi = 0;
+    bool     have = false, dyn = false;
+    for (;;) {
+        switch (ir.tag(lv)) {
+            case Inst::Tag::PartSelect: {
+                const PartSelect ps = ir.extra_data<PartSelect>(ir.payload(lv).op_extra.extra);
+                if (!have) {
+                    lo   = ps.lsb;
+                    hi   = ps.msb;
+                    have = true;
+                } else {
+                    lo += ps.lsb;
+                    hi += ps.lsb;
+                }
+                lv = ir.payload(lv).op_extra.op;
+                break;
+            }
+            case Inst::Tag::BitSelect: {
+                const std::optional<uint64_t> b = const_index(m, ir, ir.payload(lv).binary.r);
+                if (!b) {
+                    dyn = true;
+                } else if (!have) {
+                    lo   = static_cast<uint32_t>(*b);
+                    hi   = lo;
+                    have = true;
+                } else {
+                    lo += static_cast<uint32_t>(*b);
+                    hi += static_cast<uint32_t>(*b);
+                }
+                lv = ir.payload(lv).binary.l;
+                break;
+            }
+            case Inst::Tag::DynPartSelect:
+            case Inst::Tag::ElemSelect:
+            case Inst::Tag::ArrSlice:
+            case Inst::Tag::MemberSelect:
+                // Runtime-offset packed slice, or an unpacked-array/struct element:
+                // the driven bits cannot be pinned in the flat plane.
+                dyn = true;
+                lv  = ir.payload(lv).op_extra.op;
+                break;
+            default:
+                return { lv, dyn || !have, lo, hi };
+        }
+    }
+}
+} // namespace
+
+std::vector<std::vector<uint64_t>> compute_partial_undriven(const Module& m) {
+    const size_t          n = m.signals().size();
+    std::vector<uint32_t> width(n, 0);
+    std::vector<bool>     candidate(n, false);
+    for (uint32_t i = 0; i < n; ++i) {
+        const SignalInfo& s = m.signals()[i];
+        if (!s.is_net || s.force_agg) {
+            continue;
+        }
+        const Type& t = std::get<Type>(m.pool.get(s.type));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            continue; // per-element storage; whole-signal power-on (a follow-up)
+        }
+        const Layout lay = m.pool.layout(s.type);
+        if (lay.domain != Domain::Four || lay.width == 0) {
+            continue; // 2-state has no z plane
+        }
+        candidate[i]  = true;
+        width[i]      = lay.width;
+    }
+
+    std::vector<std::vector<uint64_t>> driven(n); // per-signal driven-bit words
+    std::vector<bool>                  touched(n, false);
+    std::vector<bool>                  whole(n, false); // a whole / dynamic store
+    const auto set_range = [&](uint32_t sig, uint32_t a, uint32_t b) {
+        const uint32_t words = (width[sig] + 63) / 64;
+        if (driven[sig].empty()) {
+            driven[sig].assign(words, 0);
+        }
+        const uint32_t lo = std::min(a, b);
+        const uint32_t hi = std::min(std::max(a, b), width[sig] - 1);
+        for (uint32_t bit = lo; bit <= hi; ++bit) {
+            driven[sig][bit / 64] |= 1ull << (bit % 64);
+        }
+    };
+    const auto mark = [&](const Ir& ir, Index lv) {
+        const DriveRange dr = drive_range(m, ir, lv);
+        if (ir.tag(dr.root) != Inst::Tag::Signal) {
+            return;
+        }
+        const auto sig = static_cast<uint32_t>(ir.payload(dr.root).signal);
+        if (!candidate[sig]) {
+            return;
+        }
+        touched[sig] = true;
+        if (dr.whole) {
+            whole[sig] = true;
+        } else {
+            set_range(sig, dr.lo, dr.hi);
+        }
+    };
+    // A whole-storage write (ReadMem / task out-copy) marks every bit driven; a
+    // Store / StoreNb (blocking or nonblocking continuous / procedural driver)
+    // pins its range. Mirrors compute_undriven's driver set.
+    const auto mark_whole_root = [&](const Ir& ir, Index lv) {
+        const Index root = lvalue_root(ir, lv).root;
+        if (ir.tag(root) == Inst::Tag::Signal) {
+            const auto sig = static_cast<uint32_t>(ir.payload(root).signal);
+            if (candidate[sig]) {
+                touched[sig] = true;
+                whole[sig]   = true;
+            }
+        }
+    };
+    const auto scan = [&](const Ir& ir) {
+        for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+            const Index          i = static_cast<Index>(k);
+            const Inst::Payload& p = ir.payload(i);
+            switch (ir.tag(i)) {
+                case Inst::Tag::Store:
+                case Inst::Tag::StoreNb:
+                    mark(ir, p.binary.l);
+                    break;
+                case Inst::Tag::StoreInertialDelay:
+                    mark(ir, p.op_extra.op);
+                    break;
+                default:
+                    break;
+            }
+        }
+    };
+    const auto mark_sig_whole = [&](uint32_t sig) {
+        if (candidate[sig]) {
+            touched[sig] = true;
+            whole[sig]   = true;
+        }
+    };
+    // Whole-signal drivers compute_undriven also counts: $readmem (target is a
+    // bare Signal) and a task out/inout copy-out. A net written any of these ways
+    // has every bit driven, so it must never receive a partial-undriven mask.
+    const auto scan_whole = [&](const Ir& ir) {
+        for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+            const Index          i = static_cast<Index>(k);
+            const Inst::Payload& p = ir.payload(i);
+            switch (ir.tag(i)) {
+                case Inst::Tag::ReadMem:
+                    mark_sig_whole(
+                      static_cast<uint32_t>(ir.extra_data<ReadMemInfo>(p.op_extra.extra).target));
+                    break;
+                case Inst::Tag::TaskCall: {
+                    const TaskCallInfo ti     = ir.extra_data<TaskCallInfo>(p.extra);
+                    const Function&    callee = m.function(ti.func);
+                    const auto         args   = ir.region(ti.args);
+                    for (size_t a = 0; a < args.size(); ++a) {
+                        if (callee.arg_dirs[a] != ArgDir::In) {
+                            mark_whole_root(ir, args[a]);
+                        }
+                    }
+                    break;
+                }
+                case Inst::Tag::TaskCallVirtual: {
+                    const VirtualCallInfo vci    = ir.extra_data<VirtualCallInfo>(p.extra);
+                    const Function&       callee = m.function(vci.func);
+                    const auto            args   = ir.region(vci.args);
+                    for (size_t a = 0; a < args.size(); ++a) {
+                        if (callee.arg_dirs[a] != ArgDir::In) {
+                            mark_whole_root(ir, args[a]);
+                        }
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+    };
+    for (const Process& p : m.processes()) {
+        scan(p.ir);
+        scan_whole(p.ir);
+    }
+    for (uint32_t f = 0; f < m.function_count(); ++f) {
+        const Ir& ir = m.function(static_cast<FunctionId>(f)).ir;
+        scan(ir);
+        scan_whole(ir);
+    }
+
+    std::vector<std::vector<uint64_t>> out(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        // A partial net: touched, some bits driven, but not all (and not marked
+        // whole). Fully-undriven (untouched) stays on compute_undriven; whole /
+        // fully-driven has no undriven bits.
+        if (!candidate[i] || !touched[i] || whole[i] || driven[i].empty()) {
+            continue;
+        }
+        const uint32_t         w     = width[i];
+        const uint32_t         words = (w + 63) / 64;
+        std::vector<uint64_t>  un(words, 0);
+        bool                   any = false;
+        for (uint32_t bit = 0; bit < w; ++bit) {
+            if ((driven[i][bit / 64] & (1ull << (bit % 64))) == 0) {
+                un[bit / 64] |= 1ull << (bit % 64);
+                any = true;
+            }
+        }
+        if (any) {
+            out[i] = std::move(un);
+        }
+    }
+    return out;
+}
+
 std::vector<bool> compute_may_z(const Module& m) {
     Analysis a{ .m = m };
     a.sig_z.assign(m.signals().size(), 0);

@@ -543,3 +543,25 @@ TEST_CASE("an unpacked-array-element driver of a resolved net fails loudly") {
     CHECK_FALSE(r.ok);
     CHECK(r.diagnostics.find("unpacked-array or unpacked-struct multiply-driven net") != std::string::npos);
 }
+
+// A partially-driven net (continuous assigns to disjoint constant sub-ranges —
+// each bit has a single driver, so the net is NOT multiply-driven / resolved)
+// powers its UNDRIVEN bits to z, not x: compute_partial_undriven refines the
+// whole-signal undriven analysis per bit. Covers a 1-D vector, a multi-dim
+// packed element, and a nested `v[i][bit]` select. Cross-checked vs iverilog.
+TEST_CASE("undriven bits of a partially-driven net power on z, not x") {
+    const std::string out = run_capture(R"(
+        module top;
+          wire [7:0] w;
+          assign w[1:0] = 2'h3;
+          assign w[5:4] = 2'h2;          // bits 3:2, 7:6 undriven -> z
+          wire [1:0][7:0] v;
+          assign v[0][0] = 1'b1;
+          assign v[0][3] = 1'b1;         // v[0] other bits, v[1] whole -> z
+          initial begin
+            #1; $display("%b %b %b", w, v[0], v[1]);
+          end
+        endmodule
+    )");
+    CHECK(out == "zz10zz11 zzzz1zz1 zzzzzzzz\n");
+}

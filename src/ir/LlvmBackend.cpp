@@ -396,6 +396,12 @@ struct SignalSlot {
     // Powers up as z rather than x: an undriven 4-state net (LRM 6.6). Implies
     // has_z (undriven nets are a may-z seed).
     bool init_z = false;
+    // Per-bit power-on z mask for a PARTIALLY-driven packed 4-state net: bit set
+    // == undriven == powers on z (its driven bits keep the x default, overwritten
+    // by their self-start driver at t0). Empty unless the net is partially driven
+    // (compute_partial_undriven); the z-plane initializer uses it in place of the
+    // whole-signal init_z / zero. Implies has_z.
+    std::vector<uint64_t> undriven_mask;
     // Leaf element is real / shortreal: the slot stores the IEEE-754 bit
     // pattern in a 2-state word (has_z is false, four_state is false).
     bool is_real = false;
@@ -912,6 +918,18 @@ private:
     // the high W bits set. Also the must|may half of all-Z.
     llvm::ConstantInt* x_mm(uint32_t width) const {
         return llvm::ConstantInt::get(ctx_, llvm::APInt::getHighBitsSet(2 * width, width));
+    }
+
+    // The power-on z-plane constant of a 4-state slot: all-z for a fully undriven
+    // net (init_z), the per-bit undriven mask for a partially-driven net, else 0.
+    llvm::ConstantInt* init_z_plane(const SignalSlot& s) const {
+        if (s.init_z) {
+            return ones(s.width);
+        }
+        if (!s.undriven_mask.empty()) {
+            return llvm::ConstantInt::get(ctx_, llvm::APInt(s.width, s.undriven_mask));
+        }
+        return zero(s.width);
     }
 
     // Cast an integer value to width `to` (zero/sign extend or truncate).
@@ -1690,8 +1708,10 @@ private:
           config_.z_elision ? compute_may_z(mod_) : std::vector<bool>(sigs.size(), true);
         const std::vector<bool> ptr_arg = ptr_arg_signals();
         // Semantics, not optimization: computed regardless of config_.z_elision.
-        // An undriven 4-state net powers up z (LRM 6.6); everything else x / 0.
-        const std::vector<bool> undriven = compute_undriven(mod_);
+        // An undriven 4-state net powers up z (LRM 6.6); everything else x / 0. A
+        // partially-driven packed net powers its undriven bits z per this mask.
+        const std::vector<bool>                  undriven = compute_undriven(mod_);
+        const std::vector<std::vector<uint64_t>> partial_undriven = compute_partial_undriven(mod_);
 
         for (uint32_t i = 0; i < sigs.size(); ++i) {
             const Layout lay = mod_.pool.layout(sigs[i].type);
@@ -1762,7 +1782,13 @@ private:
             // below (pool layout gives Domain::Two for floats).
             slot.is_real     = mod_.pool.is_float(leaf_type(sigs[i].type));
             slot.init_z      = undriven[i] && sigs[i].is_net && slot.four_state;
-            slot.has_z       = may_z[i] || ptr_arg[i] || slot.init_z;
+            // A partially-driven packed net: its undriven bits power on z. Only set
+            // for a 4-state, non-array net (compute_partial_undriven's candidate
+            // set matches). Fully-undriven takes init_z; fully-driven has no mask.
+            if (!slot.init_z && slot.four_state && !slot.is_array && !partial_undriven[i].empty()) {
+                slot.undriven_mask = partial_undriven[i];
+            }
+            slot.has_z       = may_z[i] || ptr_arg[i] || slot.init_z || !slot.undriven_mask.empty();
             // A 2-state signal drops the packed must|may word for a genuine iW slot
             // (or `[N x { iW }]` memory). The only requirement is never-z: a 2-state
             // value carries no z, and has_z is forced only by a task out/inout target
@@ -8059,7 +8085,7 @@ private:
           s.narrow ? zero(s.width) : (s.four_state ? x_mm(s.width) : zero(2 * s.width));
         std::vector<llvm::Constant*> fields{ mm };
         if (s.has_z) {
-            fields.push_back(s.init_z ? ones(s.width) : zero(s.width));
+            fields.push_back(init_z_plane(s));
         }
         return llvm::ConstantStruct::get(s.slot_ty, fields);
     }
