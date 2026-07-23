@@ -493,14 +493,10 @@ struct rt_elem_ops {
     const rt_elem_leaf* leaves;  // rt_elem_aggregate only
 };
 
-// Construct an element in raw storage (the proto byte image: X planes, empty
-// string handle, null container handles).
-void rt_elem_init(const rt_elem_ops* o, void* p);
-// Destroy an element's owned heap (recursively). No-op for POD.
-void rt_elem_deinit(const rt_elem_ops* o, void* p);
-// Deep-copy one element over another; both constructed (dst's owned buffers
-// are reused / released per leaf, never leaked).
-void rt_elem_copy(const rt_elem_ops* o, void* dst, const void* src);
+// NOTE: the element lifecycle helpers (init / deinit / copy over an
+// rt_elem_ops descriptor) are internal to Runtime.cpp — the backend inlines
+// the element ops at call sites and never calls them, so they have internal
+// linkage and no declaration here.
 
 // -- SystemVerilog dynamic arrays --
 //

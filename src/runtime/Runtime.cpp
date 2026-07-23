@@ -926,12 +926,15 @@ extern "C" void rt_nba_arr_reset(void) {
 //
 // Generic recursion over the element descriptor. POD short-circuits to raw
 // byte moves, so the descriptor adds no cost to the plane-scalar fast paths.
+// Internal to the runtime — the backend inlines the element ops at call sites
+// and never emits a call to these, so they carry no C linkage.
+namespace {
 
-extern "C" void rt_elem_init(const rt_elem_ops* o, void* p) {
+void rt_elem_init(const rt_elem_ops* o, void* p) {
     std::memcpy(p, o->proto, static_cast<size_t>(o->stride));
 }
 
-extern "C" void rt_elem_deinit(const rt_elem_ops* o, void* p) {
+void rt_elem_deinit(const rt_elem_ops* o, void* p) {
     switch (o->kind) {
         case rt_elem_pod:
             return;
@@ -955,7 +958,7 @@ extern "C" void rt_elem_deinit(const rt_elem_ops* o, void* p) {
     }
 }
 
-extern "C" void rt_elem_copy(const rt_elem_ops* o, void* dst, const void* src) {
+void rt_elem_copy(const rt_elem_ops* o, void* dst, const void* src) {
     switch (o->kind) {
         case rt_elem_pod:
             std::memcpy(dst, src, static_cast<size_t>(o->stride));
@@ -1000,8 +1003,6 @@ extern "C" void rt_elem_copy(const rt_elem_ops* o, void* dst, const void* src) {
             return;
     }
 }
-
-namespace {
 
 // Whether elements need per-element construction / destruction (anything but
 // raw bytes).
@@ -1720,31 +1721,19 @@ namespace {
 // Unsigned lexicographic order (shorter-is-less on a prefix) — the order the
 // backend's normalization is built to make equal to each key kind's LRM order.
 struct AssocKeyLess {
-    bool operator()(const std::string* a, const std::string* b) const {
-        const size_t n = a->size() < b->size() ? a->size() : b->size();
-        const int    c = std::memcmp(a->data(), b->data(), n);
+    static bool less(std::string_view a, std::string_view b) {
+        const size_t n = a.size() < b.size() ? a.size() : b.size();
+        const int    c = std::memcmp(a.data(), b.data(), n);
         if (c != 0) {
             return c < 0;
         }
-        return a->size() < b->size();
+        return a.size() < b.size();
     }
-    // Heterogeneous compares against a bare key span, for lower/upper_bound.
-    bool operator()(const std::string* a, std::string_view b) const {
-        const size_t n = a->size() < b.size() ? a->size() : b.size();
-        const int    c = std::memcmp(a->data(), b.data(), n);
-        if (c != 0) {
-            return c < 0;
-        }
-        return a->size() < b.size();
-    }
-    bool operator()(std::string_view a, const std::string* b) const {
-        const size_t n = a.size() < b->size() ? a.size() : b->size();
-        const int    c = std::memcmp(a.data(), b->data(), n);
-        if (c != 0) {
-            return c < 0;
-        }
-        return a.size() < b->size();
-    }
+    // The typed overloads (both pointer, plus the heterogeneous span forms for
+    // lower/upper_bound) all reduce to the same span compare.
+    bool operator()(const std::string* a, const std::string* b) const { return less(*a, *b); }
+    bool operator()(const std::string* a, std::string_view b) const { return less(*a, b); }
+    bool operator()(std::string_view a, const std::string* b) const { return less(a, *b); }
 };
 
 struct AssocMap {
