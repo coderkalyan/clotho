@@ -183,3 +183,25 @@ TEST_CASE("instance array elements behave as independently wired instances") {
     )";
     CHECK(run_capture(src) == "1010\n");
 }
+
+// A whole unpacked array passed as a module port actual (input and output):
+// wire_ports copies the whole array via emit_port_agg_copy (a memcpy for a
+// plain, trivially-copyable array) rather than the scalar-store path, which
+// only handled a single element. Cross-checked vs iverilog.
+TEST_CASE("whole unpacked array as an input and output module port") {
+    constexpr std::string_view src = R"(
+        module ram(input logic [7:0] wv[0:1], output logic [7:0] rv[0:1]);
+            assign rv[0] = wv[0] + 8'd1;
+            assign rv[1] = wv[1] + 8'd2;
+        endmodule
+        module m;
+            logic [7:0] wv[0:1], rv[0:1];
+            ram u(.wv(wv), .rv(rv));
+            initial begin
+                wv[0] = 8'h10; wv[1] = 8'h20;
+                #1; $display("rv0=%h rv1=%h", rv[0], rv[1]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "rv0=11 rv1=22\n");
+}

@@ -1726,6 +1726,10 @@ private:
         return e.type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() != nullptr;
     }
 
+    static bool is_unpacked_array_type(const slang::ast::Type& t) {
+        return t.getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() != nullptr;
+    }
+
     // True if a type is an unpacked struct (aggregate storage; whole-object ops
     // decompose field-wise, distinct from a packed struct's flat bit-vector).
     static bool is_unpacked_struct(const slang::ast::Type& t) {
@@ -4867,11 +4871,12 @@ private:
                     add_continuous_process(std::move(sens), l, b);
                     continue;
                 }
-                if (is_aggregate(*a.left().type)) {
-                    // A whole unpacked-struct / aggregate port: the copy is a
-                    // per-leaf (or memcpy) whole-object copy, not a scalar store.
-                    // Port types are equivalent (LRM 23.3.3), so both sides share
-                    // the recursive storage layout.
+                if (is_aggregate(*a.left().type) || is_unpacked_array_type(*a.left().type)) {
+                    // A whole unpacked-struct / unpacked-array / aggregate port: the
+                    // copy is a per-leaf (or memcpy) whole-object copy, not a scalar
+                    // store. Port types are equivalent (LRM 23.3.3), so both sides
+                    // share the recursive storage layout (a plain unpacked array is
+                    // trivially copyable, so emit_port_agg_copy memcpy's it).
                     emit_port_agg_copy(lower_lvalue(a.left(), b), b.signal(child_sig, l),
                                        lower_type(*a.left().type), b, l);
                 } else if (a.left().kind == ExpressionKind::Concatenation) {
@@ -4902,15 +4907,17 @@ private:
                     // internal driver of the same net).
                     fail("a net driven by both an input port and an internal driver is not supported");
                 }
-                const ir::Ref ty = lower_type(p.internalSymbol->as<ValueSymbol>().getType());
-                if (is_aggregate(p.internalSymbol->as<ValueSymbol>().getType())) {
-                    // A whole unpacked-struct / aggregate input port: whole-object
-                    // copy of the source into the child net.
+                const slang::ast::Type& itype = p.internalSymbol->as<ValueSymbol>().getType();
+                const ir::Ref           ty    = lower_type(itype);
+                if (is_aggregate(itype) || is_unpacked_array_type(itype)) {
+                    // A whole unpacked-struct / unpacked-array / aggregate input
+                    // port: whole-object copy of the source into the child net (a
+                    // plain unpacked array memcpy's via emit_port_agg_copy).
                     const Expression& src = unwrap_conversion(*expr);
                     if (!is_struct_lvalue_shape(src)) {
                         // TODO: an aggregate port driven by a `'{...}` pattern / call
                         // (needs a materialized temp, like an aggregate call actual).
-                        fail("aggregate port connection must be a variable");
+                        fail("aggregate/array port connection must be a variable");
                     }
                     emit_port_agg_copy(b.signal(child_sig, l), lower_lvalue(src, b), ty, b, l);
                 } else {
