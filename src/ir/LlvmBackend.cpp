@@ -11948,13 +11948,15 @@ private:
 
     // i32 rt_fopen_mcd(const char* name, i32 name_len)
     llvm::FunctionCallee fopen_mcd_fn() {
-        return rt_fn("rt_fopen_mcd", b_.getInt32Ty(), { raw_ptr_ty(), b_.getInt32Ty() });
+        auto* i32 = b_.getInt32Ty();
+        return rt_fn("rt_fopen_mcd", i32, { raw_ptr_ty(), i32, i32 });
     }
 
-    // i32 rt_fopen_fd(const char* name, i32 name_len, const char* mode, i32 mode_len)
+    // i32 rt_fopen_fd(const char* name, i32 name_len, i32 name_fwd,
+    //                 const char* mode, i32 mode_len, i32 mode_fwd)
     llvm::FunctionCallee fopen_fd_fn() {
         auto* i32 = b_.getInt32Ty();
-        return rt_fn("rt_fopen_fd", i32, { raw_ptr_ty(), i32, raw_ptr_ty(), i32 });
+        return rt_fn("rt_fopen_fd", i32, { raw_ptr_ty(), i32, i32, raw_ptr_ty(), i32, i32 });
     }
 
     // void rt_fclose(i32 desc)
@@ -12129,22 +12131,23 @@ private:
         b_.CreateCall(fflush_fn(), { desc });
     }
 
-    // Lower a two-argument $fopen: spill the filename and mode to stack byte
-    // buffers and call the FD opener; the result is the descriptor.
+    // Lower a two-argument $fopen: materialize the filename and mode (each a packed
+    // vector or a dynamic string) and call the FD opener; the result is the
+    // descriptor.
     void lower_fopen_fd(Index i) {
-        const auto& p                   = ir_->payload(i).binary;
-        const auto [name_ptr, name_len] = spill_ascii(p.l, "fopen.name");
-        const auto [mode_ptr, mode_len] = spill_ascii(p.r, "fopen.mode");
-        llvm::Value* desc               = b_.CreateCall(
-          fopen_fd_fn(), { name_ptr, b_.getInt32(name_len), mode_ptr, b_.getInt32(mode_len) });
+        const auto& p    = ir_->payload(i).binary;
+        const AsciiArg n = spill_ascii_arg(p.l, "fopen.name");
+        const AsciiArg m = spill_ascii_arg(p.r, "fopen.mode");
+        llvm::Value*   desc =
+          b_.CreateCall(fopen_fd_fn(), { n.ptr, n.len, n.fwd, m.ptr, m.len, m.fwd });
         // The descriptor is a plain known integer (no x/z): must == may, z == 0.
         set_value(i, packed(desc, desc, zero(32)));
     }
 
-    // Lower a one-argument $fopen: spill the filename and open a fresh MCD.
+    // Lower a one-argument $fopen: materialize the filename and open a fresh MCD.
     void lower_fopen_mcd(Index i) {
-        const auto [name_ptr, name_len] = spill_ascii(ir_->payload(i).unary, "fopen.name");
-        llvm::Value* desc = b_.CreateCall(fopen_mcd_fn(), { name_ptr, b_.getInt32(name_len) });
+        const AsciiArg n    = spill_ascii_arg(ir_->payload(i).unary, "fopen.name");
+        llvm::Value*   desc = b_.CreateCall(fopen_mcd_fn(), { n.ptr, n.len, n.fwd });
         set_value(i, packed(desc, desc, zero(32)));
     }
 
@@ -12357,11 +12360,12 @@ private:
         return env_->llmod.getOrInsertFunction("rt_fscanf", fnty);
     }
 
-    // i32 rt_sscanf(const char* buf, i32 len, const char* fmt, i32 argc, const rt_scan_arg* args)
+    // i32 rt_sscanf(const char* buf, i32 len, i32 fwd, const char* fmt, i32 argc,
+    //               const rt_scan_arg* args)
     llvm::FunctionCallee sscanf_fn() {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
-        auto* fnty = llvm::FunctionType::get(i32, { ptr, i32, ptr, i32, ptr }, false);
+        auto* fnty = llvm::FunctionType::get(i32, { ptr, i32, i32, ptr, i32, ptr }, false);
         return env_->llmod.getOrInsertFunction("rt_sscanf", fnty);
     }
 
@@ -12411,8 +12415,8 @@ private:
         llvm::Value* fmt_ptr = b_.CreateGlobalString(fmt);
         llvm::Value* r       = nullptr;
         if (ir_->tag(i) == Inst::Tag::Sscanf) {
-            const auto [buf, len] = spill_ascii(info.source, "sscanf.buf");
-            r = b_.CreateCall(sscanf_fn(), { buf, b_.getInt32(len), fmt_ptr, b_.getInt32(n), arr });
+            const AsciiArg s = spill_ascii_arg(info.source, "sscanf.buf");
+            r = b_.CreateCall(sscanf_fn(), { s.ptr, s.len, s.fwd, fmt_ptr, b_.getInt32(n), arr });
         } else {
             llvm::Value* fd = cast(must_of(value_of(info.source)), 32, true);
             r               = b_.CreateCall(fscanf_fn(), { fd, fmt_ptr, b_.getInt32(n), arr });
@@ -12500,6 +12504,27 @@ private:
         llvm::Value*   buf   = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(bytes), name);
         b_.CreateAlignedStore(must_of(value_of(v)), buf, llvm::Align(1));
         return { buf, bytes };
+    }
+
+    // A filename / source ASCII argument as a runtime { ptr, len, forward } triple.
+    // A dynamic string is read straight from its rt_string handle in natural byte
+    // order (forward = 1); a packed-ASCII vector spills its must-bits little-endian
+    // (forward = 0, byte 0 = last char). Same split as $readmem / $dumpfile; the
+    // runtime's read_ascii_arg reverses only the packed form.
+    struct AsciiArg {
+        llvm::Value* ptr;
+        llvm::Value* len;
+        llvm::Value* fwd;
+    };
+    AsciiArg spill_ascii_arg(Index v, const char* name) {
+        if (type_of(v).is_string) {
+            llvm::Value* h = str_of(v);
+            return { b_.CreateCall(str_data_fn(), { h }),
+                     b_.CreateTrunc(b_.CreateCall(str_len_fn(), { h }), b_.getInt32Ty()),
+                     b_.getInt32(1) };
+        }
+        const auto [ptr, len] = spill_ascii(v, name);
+        return { ptr, b_.getInt32(len), b_.getInt32(0) };
     }
 
     // void rt_readmem(const char* path, i32 path_len, i8* mm_base, i8* z_base,

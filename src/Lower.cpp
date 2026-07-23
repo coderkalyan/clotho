@@ -7469,21 +7469,17 @@ private:
         return b.binary(ir::Inst::Tag::Mul, b.resize(v, u64, l), mul, l);
     }
 
-    // Lower a string-valued system-task argument (a $fopen filename / mode) to a
-    // packed-ASCII vector value. slang types these arguments as the dynamic
-    // `string` type, wrapping a string literal in a conversion Clotho has no
-    // representation for; strip those conversions to recover the packed byte
-    // vector the runtime expects (byte 0 = last character). A genuine dynamic
-    // string value has no packed form and is rejected.
+    // Lower a string-valued system-task argument (a $fopen filename / mode, a
+    // $sscanf source). slang types these as the dynamic `string` type, wrapping a
+    // string literal in a string conversion; strip those conversions to recover
+    // the packed byte vector (byte 0 = last character) whenever the underlying
+    // value is packed. A genuine dynamic-string value is lowered to its rt_string
+    // handle — the backend (spill_ascii_arg / $readmem / $dumpfile) reads its
+    // bytes in natural order via rt_string_data/len, so both forms are accepted.
     ir::Index lower_string_arg(const Expression& expr, ir::Builder& b) {
         const Expression* e = &expr;
         while (e->kind == ExpressionKind::Conversion && e->type->getCanonicalType().isString()) {
             e = &e->as<ConversionExpression>().operand();
-        }
-        if (e->type->getCanonicalType().isString()) {
-            // TODO: a dynamic-string variable / expression as a filename or mode
-            // needs runtime string support, which Clotho lacks.
-            fail("$fopen with a dynamic-string argument is not supported");
         }
         return lower_expr(*e, b);
     }

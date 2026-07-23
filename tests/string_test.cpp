@@ -763,3 +763,32 @@ TEST_CASE("$sformatf formats into a string value") {
         endmodule
     )") == "[v=42 h=ab s=hi] len=14\n");
 }
+
+// A dynamic `string` value is accepted as a $fopen filename / mode and a $sscanf
+// source (LRM 21.3/21.4 allow a string-typed expression). The backend reads its
+// rt_string bytes in natural order (spill_ascii_arg forward=1), so the filename
+// is not byte-reversed like a packed vector. Round-trips through a real file.
+TEST_CASE("dynamic-string $fopen filename/mode and $sscanf source") {
+    const std::string out = run_capture(R"(
+        module m;
+            integer fd, rc;
+            string  fname, mode, line;
+            int     a, b;
+            initial begin
+                fname = "/tmp/clotho_dynstr_fopen_test.txt";
+                mode  = "w";
+                fd = $fopen(fname, mode);
+                $fwrite(fd, "12 34\n");
+                $fclose(fd);
+                fd = $fopen(fname, "r");          // dynamic name, literal mode
+                rc = $fscanf(fd, "%d %d", a, b);
+                $fclose(fd);
+                $display("file rc=%0d a=%0d b=%0d", rc, a, b);
+                line = "77 88";
+                rc = $sscanf(line, "%d %d", a, b); // dynamic-string source
+                $display("sscanf rc=%0d a=%0d b=%0d", rc, a, b);
+            end
+        endmodule
+    )");
+    CHECK(out == "file rc=2 a=12 b=34\nsscanf rc=2 a=77 b=88\n");
+}

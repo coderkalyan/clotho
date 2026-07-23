@@ -159,14 +159,16 @@ void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*), void (*fi
 // $fopen returns 0 on failure (or when no MCD channel is free).
 
 // $fopen(name): open `name` for writing and return a fresh MCD, or 0 on failure.
-// `name_buf`/`name_len` carry the path as a packed-ASCII vector (as $readmem).
-int32_t rt_fopen_mcd(const char* name_buf, uint32_t name_len);
+// `name_buf`/`name_len` carry the path; `name_fwd` != 0 marks natural byte order
+// (a dynamic string), 0 a reversed packed-ASCII vector (as $readmem / $dumpfile).
+int32_t rt_fopen_mcd(const char* name_buf, uint32_t name_len, int32_t name_fwd);
 
 // $fopen(name, mode): open `name` with C stdio mode string `mode` and return a
-// fresh FD, or 0 on failure. Both strings are packed-ASCII vectors; `mode` is
-// passed straight to fopen, so SV mode strings ("r", "w", "a", "r+b", ...) map
-// directly.
-int32_t rt_fopen_fd(const char* name_buf, uint32_t name_len, const char* mode_buf, uint32_t mode_len);
+// fresh FD, or 0 on failure. Each of name / mode may be a packed-ASCII vector
+// (fwd 0) or a dynamic string (fwd != 0, natural order); `mode` is passed
+// straight to fopen, so SV mode strings ("r", "w", "a", "r+b", ...) map directly.
+int32_t rt_fopen_fd(const char* name_buf, uint32_t name_len, int32_t name_fwd, const char* mode_buf,
+                    uint32_t mode_len, int32_t mode_fwd);
 
 // $fclose(desc): close every stream the descriptor names (all set MCD channels,
 // or the one FD). The preopened standard streams are never closed.
@@ -250,9 +252,10 @@ typedef struct rt_scan_arg {
 // stored conversions, or -1 if the input is exhausted before the first.
 int32_t rt_fscanf(int32_t fd, const char* fmt, uint32_t argc, const rt_scan_arg* args);
 
-// $sscanf(str, fmt, args): as rt_fscanf, but the source is the packed-ASCII vector
-// at `buf` (`len` bytes).
-int32_t rt_sscanf(const char* buf, uint32_t len, const char* fmt, uint32_t argc, const rt_scan_arg* args);
+// $sscanf(str, fmt, args): as rt_fscanf, but the source is at `buf` (`len` bytes):
+// `fwd` != 0 for a dynamic string (natural order), 0 for a packed-ASCII vector.
+int32_t rt_sscanf(const char* buf, uint32_t len, int32_t fwd, const char* fmt, uint32_t argc,
+                  const rt_scan_arg* args);
 
 // $fread(target, fd[, start[, count]]) (LRM §21.3.4): read raw bytes from `fd` into
 // a memory (or a scalar, `count` == 1), MSB-first per element. The destination

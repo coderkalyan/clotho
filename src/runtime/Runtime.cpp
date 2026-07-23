@@ -546,6 +546,14 @@ std::string unpack_ascii(const char* buf, uint32_t len) {
     return s;
 }
 
+// A filename / source ASCII argument, from either representation. A dynamic
+// string (`forward` != 0) is already natural byte order and exact length; a
+// packed-ASCII vector is little-endian (byte 0 = last char) and reverses via
+// unpack_ascii. Mirrors the $readmem / $dumpfile split (rt_readmem / vcd_open).
+std::string read_ascii_arg(const char* buf, uint32_t len, int32_t forward) {
+    return forward != 0 ? std::string(buf, len) : unpack_ascii(buf, len);
+}
+
 // Resolve a single-stream FD to its FILE*, or nullptr if out of range / closed.
 std::FILE* fd_stream(int32_t desc) {
     const uint32_t idx = static_cast<uint32_t>(desc & ~kFdBit);
@@ -2195,9 +2203,9 @@ extern "C" void* rt_strobe_pop() {
     return g_strobe_queue[g_strobe_read++];
 }
 
-extern "C" int32_t rt_fopen_mcd(const char* name_buf, uint32_t name_len) {
+extern "C" int32_t rt_fopen_mcd(const char* name_buf, uint32_t name_len, int32_t name_fwd) {
     io_ensure_init();
-    const std::string path = unpack_ascii(name_buf, name_len);
+    const std::string path = read_ascii_arg(name_buf, name_len, name_fwd);
     // Claim the lowest free channel; bit 0 is the reserved standard output.
     for (int b = 1; b < 31; ++b) {
         if (mcd_channels[b] == nullptr) {
@@ -2212,11 +2220,11 @@ extern "C" int32_t rt_fopen_mcd(const char* name_buf, uint32_t name_len) {
     return 0; // all 30 channels in use
 }
 
-extern "C" int32_t
-rt_fopen_fd(const char* name_buf, uint32_t name_len, const char* mode_buf, uint32_t mode_len) {
+extern "C" int32_t rt_fopen_fd(const char* name_buf, uint32_t name_len, int32_t name_fwd,
+                               const char* mode_buf, uint32_t mode_len, int32_t mode_fwd) {
     io_ensure_init();
-    const std::string path = unpack_ascii(name_buf, name_len);
-    const std::string mode = unpack_ascii(mode_buf, mode_len);
+    const std::string path = read_ascii_arg(name_buf, name_len, name_fwd);
+    const std::string mode = read_ascii_arg(mode_buf, mode_len, mode_fwd);
     std::FILE*        f    = std::fopen(path.c_str(), mode.c_str());
     if (f == nullptr) {
         return 0;
@@ -2669,10 +2677,11 @@ extern "C" int32_t rt_fscanf(int32_t fd, const char* fmt, uint32_t argc, const r
     return scan_run(src, fmt, argc, args);
 }
 
-extern "C" int32_t
-rt_sscanf(const char* buf, uint32_t len, const char* fmt, uint32_t argc, const rt_scan_arg* args) {
-    // The source is a packed-ASCII vector; reconstruct the string, then scan it.
-    const std::string s = unpack_ascii(buf, len);
+extern "C" int32_t rt_sscanf(const char* buf, uint32_t len, int32_t fwd, const char* fmt,
+                             uint32_t argc, const rt_scan_arg* args) {
+    // The source is a packed-ASCII vector (reversed) or a dynamic string (fwd,
+    // natural order); reconstruct the string, then scan it.
+    const std::string s = read_ascii_arg(buf, len, fwd);
     ScanSource        src;
     src.buf = reinterpret_cast<const uint8_t*>(s.data());
     src.len = s.size();
