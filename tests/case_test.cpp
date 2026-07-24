@@ -588,6 +588,39 @@ TEST_CASE("priority case: no match, no default reports a violation") {
     CHECK(run_capture(src).empty());
 }
 
+// LRM 12.4.2 / 12.5.3 defer the violation report to the Observed region
+// (LRM 4.4.2.4), not the Active region where the case executes. A clocked
+// design exercises the drain-loop Observed flush (emit_active_run) rather than
+// the time-0 initial-block path: two posedge instants each hit a no-match
+// priority case, so each settled instant emits one report stamped with that
+// instant's time (t=5, t=15), before the design finishes at t=25.
+TEST_CASE("priority case: Observed-region report is stamped with the settled instant") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic       clk = 0;
+            logic [1:0] sel = 2'b11;
+            int         cnt = 0;
+            always #5 clk = ~clk;
+            always @(posedge clk) begin
+                priority case (sel)
+                    2'b00: ;
+                    2'b01: ;
+                endcase
+                sel <= sel - 1;      // 11 (viol), 10 (viol), 01 (match)
+                cnt <= cnt + 1;
+                if (cnt == 2) $finish;
+            end
+        endmodule
+    )";
+    const std::string err = run_capture_stderr(src);
+    // One report per violating settle pass (no maturation yet).
+    CHECK(count_occ(err, "no condition is true") == 2);
+    // Each report carries the time of its own instant, proving the deferral
+    // fires at the settled instant (drain-loop Observed flush), not at t=0.
+    CHECK(err.find("time 5 ") != std::string::npos);
+    CHECK(err.find("time 15 ") != std::string::npos);
+}
+
 // A matching item suppresses the report (the priority assertion holds).
 TEST_CASE("priority case: a matching item reports nothing") {
     constexpr std::string_view src = R"(

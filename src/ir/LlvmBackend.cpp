@@ -639,8 +639,9 @@ public:
             report_comb_fuse_stat();
         }
         compute_domain_spec();   // after fusion (thunk_group_): reads spec_group_ in lower_group
-        design_uses_strobe_  = design_uses_strobe(); // gates the Postponed-region drain loop
-        design_uses_monitor_ = design_uses_monitor();
+        design_uses_strobe_   = design_uses_strobe(); // gates the Postponed-region drain loop
+        design_uses_monitor_  = design_uses_monitor();
+        design_uses_observed_ = design_uses_observed(); // gates the Observed-region flush
         build_vcd_index();       // before build_nba_state: fills vcd_index_ / design_uses_vcd_
         build_wait_queues();
         build_instance_ctx_layout(); // after build_wait_queues: ctx sizes need wait slots
@@ -7310,10 +7311,19 @@ private:
             b_.CreateBr(check);
         }
 
-        // Queue empty: this instant has fully settled. Sample the VCD dump at the
-        // current time (the postponed region, LRM §21.7) before the wheel advances,
-        // so each variable's final settled value is recorded once per instant.
+        // Queue empty: this instant has fully settled.
         b_.SetInsertPoint(wcheck);
+        // Observed region (LRM 4.4.2.4): emit every report queued while the
+        // Active/NBA regions settled this instant — currently unique/priority
+        // case violations (LRM 12.4.2 / 12.5.3). Runs before the Postponed region
+        // below, per the LRM region order. rt_observed_flush no-ops when nothing
+        // is queued, so this one call per settled instant is cheap.
+        if (design_uses_observed_) {
+            b_.CreateCall(observed_flush_fn(), {});
+        }
+        // Postponed region (LRM §21.7): sample the VCD dump at the current time
+        // before the wheel advances, so each variable's final settled value is
+        // recorded once per instant.
         if (uses_vcd) {
             b_.CreateCall(vcd_flush_fn(), { b_.CreateCall(wheel_now_fn(), { wheel }) });
         }
@@ -10120,8 +10130,9 @@ private:
                 return;
 
             case Inst::Tag::CaseViol:
-                // priority-case violation: rt_case_violation warns and returns
-                // (non-fatal), so the region continues normally after it.
+                // unique/priority case violation: the report is queued for the
+                // Observed region (rt_observed_case_violation), not emitted here,
+                // so the Active region continues normally after it.
                 lower_case_viol(i);
                 return;
 
@@ -12208,25 +12219,34 @@ private:
                       { b_.CreateGlobalString(banner), now, b_.getInt32(info.arg) });
     }
 
-    // void rt_case_violation(ptr banner, i64 now, i32 kind) — warns and returns
-    // (non-fatal). kind selects the message (0 = no match, 1 = overlap).
-    llvm::FunctionCallee case_violation_fn() {
-        return rt_fn("rt_case_violation", b_.getVoidTy(),
+    // void rt_observed_case_violation(ptr banner, i64 now, i32 kind) — queues the
+    // report for the Observed region (rt_observed_flush emits it). kind selects
+    // the message (0 = no match, 1 = overlap).
+    llvm::FunctionCallee observed_case_violation_fn() {
+        return rt_fn("rt_observed_case_violation", b_.getVoidTy(),
                      { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty() });
     }
 
+    // void rt_observed_flush() — emit + clear every Observed-region report queued
+    // this instant.
+    llvm::FunctionCallee observed_flush_fn() {
+        return rt_fn("rt_observed_flush", b_.getVoidTy(), {});
+    }
+
     // Lower a unique/priority case violation report: pass the compile-time banner
-    // prefix, the current simulation time, and the message kind; the runtime
-    // warns and returns, so the region continues. The wheel fallback mirrors
-    // lower_finish: a case inside a pure function has no wheel and reports
-    // time 0 (same TODO as $finish).
+    // prefix, the simulation time of the violation, and the message kind. The
+    // runtime queues it (LRM 12.4.2 / 12.5.3 defer reporting to the Observed
+    // region) rather than emitting here in the Active region,
+    // so the region continues normally. The wheel fallback mirrors lower_finish:
+    // a case inside a pure function has no wheel and reports time 0 (same TODO
+    // as $finish).
     void lower_case_viol(Index i) {
         const auto        info   = ir_->extra_data<CaseViolInfo>(ir_->payload(i).extra);
         const std::string banner = ir_->extra_bytes(info.banner, info.banner_len);
         llvm::Value*      now = has_wheel()
                                   ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
                                   : static_cast<llvm::Value*>(b_.getInt64(0));
-        b_.CreateCall(case_violation_fn(),
+        b_.CreateCall(observed_case_violation_fn(),
                       { b_.CreateGlobalString(banner), now, b_.getInt32(info.kind) });
     }
 
@@ -12972,6 +12992,29 @@ private:
             const Ir& ir = mod_.function(static_cast<FunctionId>(i)).ir;
             for (uint32_t k = 0; k < ir.inst_count(); ++k) {
                 if (ir.tag(static_cast<Index>(k)) == Inst::Tag::StrobePend) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // Any Observed-region report source in the design? Gates the per-instant
+    // Observed-region flush (see emit_active_run). Currently a unique/priority
+    // case violation (CaseViol); deferred immediate assertions will extend this.
+    // CaseViol can live in a task body a process calls, so scan functions too.
+    bool design_uses_observed() const {
+        for (const Process& p : mod_.processes()) {
+            for (uint32_t k = 0; k < p.ir.inst_count(); ++k) {
+                if (p.ir.tag(static_cast<Index>(k)) == Inst::Tag::CaseViol) {
+                    return true;
+                }
+            }
+        }
+        for (uint32_t i = 0; i < mod_.function_count(); ++i) {
+            const Ir& ir = mod_.function(static_cast<FunctionId>(i)).ir;
+            for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+                if (ir.tag(static_cast<Index>(k)) == Inst::Tag::CaseViol) {
                     return true;
                 }
             }
@@ -16401,8 +16444,9 @@ private:
     // Any StrobePend instruction anywhere in the design? Gates the per-instant
     // Postponed-region drain loop (emit_active_run), so a design with no
     // $strobe pays nothing.
-    bool design_uses_strobe_  = false;
-    bool design_uses_monitor_ = false;
+    bool design_uses_strobe_   = false;
+    bool design_uses_monitor_  = false;
+    bool design_uses_observed_ = false;
     std::vector<int32_t>  vcd_index_;
     llvm::GlobalVariable* nba_vcd_gv_ = nullptr;
 

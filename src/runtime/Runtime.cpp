@@ -2764,6 +2764,7 @@ extern "C" void rt_finish_host(void* env) {
 }
 
 extern "C" void rt_finish(const char* banner, uint64_t now, int32_t arg) {
+    rt_observed_flush();
     if (arg >= 1) {
         std::fflush(stdout);
         std::string line = banner;
@@ -2823,15 +2824,47 @@ extern "C" void rt_oscillation_abort(const rt_wheel* wheel) {
     std::exit(1);
 }
 
-extern "C" void rt_case_violation(const char* banner, uint64_t now, int32_t kind) {
+// ---- Observed region (LRM 4.4.2.4) deferred reports ----
+//
+// A report produced while the Active/NBA regions settle an instant is not
+// emitted at its point of execution; it is queued here and flushed in the
+// Observed region once the instant settles (rt_observed_flush, called from the
+// sim loop between the NBA-settle and Postponed regions). This moves
+// unique/priority violation reporting to the region LRM 12.4.2 / 12.5.3 specify
+// (previously emitted immediately in the Active region).
+//
+// Step 1 carries only the record — no maturation/flush-on-re-execution yet, so
+// a statement that violates transiently on multiple settle passes still queues
+// one report per pass. Deferred immediate assertions (LRM 16.4) will add the
+// per-instance maturation that gives glitch immunity, reusing this queue.
+namespace {
+struct ObservedCaseViol {
+    const char* banner; // compile-time "<file>:<line>: " prefix, static lifetime
+    uint64_t    now;    // instant the violation occurred (== Observed flush time)
+    int32_t     kind;   // 0 = no match, 1 = overlap
+};
+std::vector<ObservedCaseViol> g_observed_case;
+} // namespace
+
+extern "C" void rt_observed_case_violation(const char* banner, uint64_t now, int32_t kind) {
+    g_observed_case.push_back({ banner, now, kind });
+}
+
+extern "C" void rt_observed_flush() {
+    if (g_observed_case.empty()) {
+        return;
+    }
     std::fflush(stdout);
-    std::string line = banner;
-    line += kind == 0 ? "no condition is true in the unique/priority if/case at time "
-                      : "if/case statement is not unique (overlapping items) at time ";
-    append_finish_time(line, now);
-    line += '\n';
-    std::fputs(line.c_str(), stderr);
+    for (const ObservedCaseViol& r : g_observed_case) {
+        std::string line = r.banner;
+        line += r.kind == 0 ? "no condition is true in the unique/priority if/case at time "
+                            : "if/case statement is not unique (overlapping items) at time ";
+        append_finish_time(line, r.now);
+        line += '\n';
+        std::fputs(line.c_str(), stderr);
+    }
     std::fflush(stderr);
+    g_observed_case.clear();
 }
 
 extern "C" void rt_severity(int32_t level, const char* banner, const char* fmt, uint32_t argc,

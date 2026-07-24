@@ -1474,8 +1474,8 @@ struct Inst {
         // identically apart from the banner's task name.
         Finish,
         // unique/priority violation report (payload: extra -> CaseViolInfo).
-        // LRM 12.5.3 / 12.4.2. Non-fatal — lowers to an rt_case_violation call
-        // that warns and returns.
+        // LRM 12.5.3 / 12.4.2. Non-fatal — lowers to an rt_observed_case_violation
+        // call that queues the report for the Observed region (LRM 4.4.2.4).
         CaseViol,
         // Severity system task report ($info / $warning / $error / $fatal, LRM
         // 20.10) or the default failure of an immediate assertion (LRM 16.3),

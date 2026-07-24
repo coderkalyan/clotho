@@ -1050,8 +1050,8 @@ private:
     }
 
     // Compile-time "<file>:<line>: " banner prefix at a source location. The
-    // runtime appends the descriptive message and the simulation time
-    // (rt_case_violation).
+    // runtime appends the descriptive message and the simulation time (e.g.
+    // rt_finish, rt_severity, the Observed-region case-violation report).
     std::string banner_at(slang::SourceLocation sl) const {
         const slang::SourceManager* sm = scope_->getCompilation().getSourceManager();
         return std::string(sm->getFileName(sl)) + ":" +

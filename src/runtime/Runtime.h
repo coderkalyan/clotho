@@ -113,14 +113,21 @@ void rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uin
 // content but not the stream).
 [[noreturn]] void rt_finish(const char* banner, uint64_t now, int32_t arg);
 
-// Report a unique/priority case (LRM 12.5.3) or if (LRM 12.4.2) violation.
-// Prints a warning banner
-// to stderr and returns — non-fatal, the simulation continues. `banner` is the
-// compile-time "<file>:<line>: " prefix; `now` is the current simulation time in
-// design ticks. `kind` selects the message: 0 = no case item matched (priority
+// Queue a unique/priority case violation report for the Observed region (LRM
+// 12.4.2 / 12.5.3, 4.4.2.4). The report is not emitted at the point of
+// execution (the Active region) but recorded and flushed by rt_observed_flush
+// once the instant settles. `banner` is the compile-time "<file>:<line>: "
+// prefix (static lifetime); `now` is the simulation time of the violation, in
+// design ticks; `kind` selects the message: 0 = no case item matched (priority
 // or unique, no default), 1 = more than one case item matched (unique /
-// unique0 overlap). Fires once per dynamic execution that detects the violation.
-void rt_case_violation(const char* banner, uint64_t now, int32_t kind);
+// unique0 overlap).
+void rt_observed_case_violation(const char* banner, uint64_t now, int32_t kind);
+
+// Emit and clear every Observed-region report queued this instant. Called by
+// the sim loop at the settled point (between the NBA-settle and Postponed
+// regions) and by rt_finish (a $finish ends the step before that point). A
+// no-op when nothing is queued.
+void rt_observed_flush(void);
 
 // Report a severity system task ($info / $warning / $error / $fatal, LRM 20.10)
 // or an immediate-assertion default failure (LRM 16.3). Renders the $display-
