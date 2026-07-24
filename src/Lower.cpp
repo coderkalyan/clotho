@@ -2385,11 +2385,14 @@ private:
         return *cur;
     }
 
-    // Whether an expression is an lvalue-shaped struct reference (a member-by-member
-    // copy source): a named variable or a select landing on one.
+    // Whether an expression is an lvalue-shaped struct/array reference (a member-
+    // by-member or whole-object copy source): a named variable, a select landing
+    // on one, or an interface-modport member (a HierarchicalValue that
+    // canonical_value_symbol resolves to the interface's own storage).
     static bool is_struct_lvalue_shape(const Expression& e) {
         switch (e.kind) {
             case ExpressionKind::NamedValue:
+            case ExpressionKind::HierarchicalValue:
             case ExpressionKind::MemberAccess:
             case ExpressionKind::ElementSelect:
                 return true;
