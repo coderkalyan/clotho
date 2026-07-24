@@ -1909,8 +1909,21 @@ private:
     // follow-up), so nesting is struct-through-struct here.
     void emit_agg_store(ir::Index lhs, ir::Ref type, const Expression& rhs,
                         ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
-        const ir::Type& t   = std::get<ir::Type>(module_.pool.get(type));
-        const auto*     pat = as_assignment_pattern(rhs);
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        // A packed plane leaf — a packed vector or packed struct, including one
+        // that is the element of an unpacked array recursed into here (`arr <=
+        // '{default: 0}` over an array of packed structs). It is a flat plane
+        // value, so lower the whole rhs — a `'{...}` pattern, a value, or an
+        // lvalue — as that value and store it, rather than decomposing field-by-
+        // field (the struct branch below is for UNPACKED structs only). slang
+        // types the pattern as the packed target, so lower_expr yields its flat
+        // bits. Only ValueCat::scalar: a handle (queue / dynamic array) or string
+        // leaf keeps its own copy path below.
+        if (value_cat(type) == ValueCat::scalar) {
+            b.binary(tag, lhs, lower_expr(rhs, b), l);
+            return;
+        }
+        const auto* pat = as_assignment_pattern(rhs);
         // A bare `{...}` concatenation literal targeting a queue / dynamic array /
         // fixed unpacked array is an unpacked-array concatenation (LRM 11.4.14),
         // not a packed bit-concat — slang already resolved the expression's own
@@ -1977,6 +1990,7 @@ private:
             return;
         }
         if (is_leaf_ref(type)) {
+            // A string leaf (a scalar plane leaf already returned at the top).
             b.binary(tag, lhs, lower_expr(rhs, b), l);
             return;
         }
