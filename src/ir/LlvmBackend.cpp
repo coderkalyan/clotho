@@ -2133,11 +2133,11 @@ private:
         for (const Process& p : mod_.processes()) {
             nba_classify_ir(p.ir);
         }
+        // Scan every subroutine body: a nonblocking assignment to a module signal is
+        // legal in both a task and a function (LRM 13.4.4), and either stages into the
+        // signal's shadow. A subroutine with no NBA records nothing.
         for (uint32_t i = 0; i < mod_.function_count(); ++i) {
-            const Function& f = mod_.function(static_cast<FunctionId>(i));
-            if (f.is_task) {
-                nba_classify_ir(f.ir);
-            }
+            nba_classify_ir(mod_.function(static_cast<FunctionId>(i)).ir);
         }
         n_nba_          = 0;
         const auto sigs = mod_.signals();

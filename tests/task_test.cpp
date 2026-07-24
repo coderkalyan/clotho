@@ -479,17 +479,45 @@ TEST_CASE("nonblocking assignment to a module signal in a task defers") {
     CHECK(run_capture(src) == "a q=10 seen=10\nb q=99\n");
 }
 
-TEST_CASE("nonblocking assignment in a function is rejected") {
+TEST_CASE("nonblocking assignment to a module signal in a function defers") {
     constexpr std::string_view src = R"(
         module m;
-            logic x;
-            function void f;
-                x <= 1;
+            logic [7:0] q, mem [0:3];
+            function automatic void f(input logic [7:0] v);
+                q <= v;
+                mem[1] <= v + 8'd1;
             endfunction
-            initial f();
+            initial begin
+                q = 8'd0; mem[1] = 8'd0;
+                f(8'd5);
+                $display("t0 q=%0d mem1=%0d", q, mem[1]);
+                #1 $display("t1 q=%0d mem1=%0d", q, mem[1]);
+            end
         endmodule
     )";
-    CHECK(reject(src).find("nonblocking assignment in a function") != std::string::npos);
+    CHECK(run_capture(src) == "t0 q=0 mem1=0\nt1 q=5 mem1=6\n");
+}
+
+TEST_CASE("nonblocking assignment from a function is per-instance") {
+    constexpr std::string_view src = R"(
+        module sub(input logic clk);
+            logic [7:0] q;
+            function automatic void bump(input logic [7:0] v); q <= v; endfunction
+            initial q = 0;
+            always @(posedge clk) bump(q + 8'd1);
+        endmodule
+        module m;
+            logic clk = 0;
+            sub a(clk); sub b(clk);
+            always #1 clk = ~clk;
+            initial begin
+                repeat (6) @(posedge clk);
+                #1 $display("a.q=%0d b.q=%0d", a.q, b.q);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a.q=6 b.q=6\n");
 }
 
 TEST_CASE("nonblocking assignment to a task output argument is rejected") {
@@ -502,7 +530,7 @@ TEST_CASE("nonblocking assignment to a task output argument is rejected") {
             initial t(r);
         endmodule
     )";
-    CHECK(reject(src).find("task-local variable") != std::string::npos);
+    CHECK(reject(src).find("subroutine-local variable") != std::string::npos);
 }
 
 // A nonblocking write to an unpacked-array element from a task defers through the

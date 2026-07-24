@@ -9118,43 +9118,43 @@ private:
         return b.binary(ir::Inst::Tag::Mul, w, mul, l);
     }
 
-    // Reject the one nonblocking-assignment target a task cannot stage: a frame
-    // local or formal argument (both live in localmap). These have no module-signal
-    // storage, and nba_target in the backend only walks to a Signal root, so there
-    // is no shadow to defer the write into. A module signal, static local, or
-    // unpacked-array element is fine: nba_classify walks task bodies, so a signal
-    // gets shadow storage and an array element defers through the global runtime
-    // queue exactly as it does from a process.
-    void check_task_nba_target(const Expression& lhs) {
+    // Reject the one nonblocking-assignment target a subroutine (task or function)
+    // cannot stage: a frame local or formal argument (both live in localmap). These
+    // have no module-signal storage, and nba_target in the backend only walks to a
+    // Signal root, so there is no shadow to defer the write into. A module signal,
+    // static local, or unpacked-array element is fine: nba_classify walks subroutine
+    // bodies, so a signal gets shadow storage and an array element defers through the
+    // global runtime queue exactly as it does from a process.
+    void check_subroutine_nba_target(const Expression& lhs) {
         switch (lhs.kind) {
             case ExpressionKind::Concatenation:
                 for (const Expression* op : lhs.as<ConcatenationExpression>().operands()) {
-                    check_task_nba_target(*op);
+                    check_subroutine_nba_target(*op);
                 }
                 return;
             case ExpressionKind::Conversion:
-                check_task_nba_target(lhs.as<ConversionExpression>().operand());
+                check_subroutine_nba_target(lhs.as<ConversionExpression>().operand());
                 return;
             case ExpressionKind::ElementSelect:
-                check_task_nba_target(lhs.as<ElementSelectExpression>().value());
+                check_subroutine_nba_target(lhs.as<ElementSelectExpression>().value());
                 return;
             case ExpressionKind::RangeSelect:
-                check_task_nba_target(lhs.as<RangeSelectExpression>().value());
+                check_subroutine_nba_target(lhs.as<RangeSelectExpression>().value());
                 return;
             case ExpressionKind::MemberAccess:
-                check_task_nba_target(lhs.as<MemberAccessExpression>().value());
+                check_subroutine_nba_target(lhs.as<MemberAccessExpression>().value());
                 return;
             case ExpressionKind::NamedValue: {
                 const ValueSymbol& vs = lhs.as<NamedValueExpression>().symbol;
                 if (fn_ctx_->localmap.contains(&vs)) {
-                    // TODO: nonblocking assignment to a task local / formal argument.
-                    fail("nonblocking assignment to a task-local variable is not supported");
+                    // TODO: nonblocking assignment to a subroutine local / formal argument.
+                    fail("nonblocking assignment to a subroutine-local variable is not supported");
                 }
                 return;
             }
             default:
-                // TODO: an unrecognized nonblocking lvalue shape inside a task.
-                fail("unsupported nonblocking-assignment target in a task");
+                // TODO: an unrecognized nonblocking lvalue shape inside a subroutine.
+                fail("unsupported nonblocking-assignment target in a subroutine");
         }
     }
 
@@ -9349,17 +9349,15 @@ private:
             return rhs;
         }
         if (a.isNonBlocking() && fn_ctx_ != nullptr) {
-            if (!fn_ctx_->is_task) {
-                // A function consumes no simulation time, so a nonblocking
-                // assignment in one has no deferred update region to commit into.
-                // TODO: nonblocking assignment inside a function.
-                fail("nonblocking assignment in a function is not supported");
-            }
-            // A task runs in its caller's time step; an NBA stages into the target
-            // signal's shadow and commits in that instant's NBA region (the
-            // backend's nba_classify scans task bodies). Only module-signal targets
-            // have that shadow, so reject the rest.
-            check_task_nba_target(a.left());
+            // A subroutine (task or function) runs in its caller's time step; an NBA
+            // stages into the target signal's shadow and commits in that instant's
+            // NBA region (the backend's nba_classify scans subroutine bodies). A
+            // function is legal here per LRM 13.4.4 ("nonblocking assignments ...
+            // shall be allowed inside a function") — it schedules the update and
+            // returns immediately, no time consumed. slang rejects the one illegal
+            // case upstream (a module-signal NBA from a constant function). Only
+            // module-signal targets have a shadow, so reject the rest.
+            check_subroutine_nba_target(a.left());
         }
         if (is_dyn_array(a.left())) {
             if (a.isNonBlocking()) {
