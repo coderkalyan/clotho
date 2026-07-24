@@ -205,3 +205,50 @@ TEST_CASE("whole unpacked array as an input and output module port") {
     )";
     CHECK(run_capture(src) == "rv0=11 rv1=22\n");
 }
+
+// A whole unpacked sub-array (a constant multi-dim element-select `arr[i][j]`)
+// passed as a module port actual, in both directions. The AggCopy addresses the
+// sub-array at its flat leaf offset (carried in elem_idx) with the copy type's
+// element count, not the whole signal's — the rsd D$ `dataArrayByteWE[i][way]`
+// port shape. Cross-checked vs verilator.
+TEST_CASE("whole unpacked sub-array (arr[i][j]) as a module port, in and out") {
+    constexpr std::string_view src = R"(
+        module child(input logic [7:0] wi [0:1], output logic [7:0] ro [0:1]);
+            assign ro[0] = wi[0] + 8'd1;
+            assign ro[1] = wi[1] + 8'd2;
+        endmodule
+        module m;
+            logic [7:0] big [0:3][0:1];
+            logic [7:0] out [0:3][0:1];
+            child c0(.wi(big[0]), .ro(out[0]));
+            child c2(.wi(big[2]), .ro(out[2]));
+            initial begin
+                big[0][0]=8'h10; big[0][1]=8'h20; big[2][0]=8'h30; big[2][1]=8'h40;
+                #1; $display("%h %h %h %h", out[0][0], out[0][1], out[2][0], out[2][1]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "11 22 31 42\n");
+}
+
+// A whole-array copy between two same-typed arrays whose z-elided slot layouts
+// differ only in the z word's presence: the dest is may-z (assigned z elsewhere),
+// this source is proven never-z. memcpy strides differ, so the copy is
+// element-wise (mm word + a zero-filled dest z). `d = s` copies s wholesale, so
+// the prior z in d[0] is overwritten (hand-verified; iverilog / 2-state verilator
+// do not cleanly run a z-bearing whole-array copy).
+TEST_CASE("whole-array copy between a may-z and a never-z array") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [15:0] d [0:2];
+            logic [15:0] s [0:2];
+            initial begin
+                s[0]=16'h1111; s[1]=16'h2222; s[2]=16'h3333;
+                d[0]=16'hzzzz;
+                d = s;
+                #1 $display("%h %h %h", d[0], d[1], d[2]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1111 2222 3333\n");
+}

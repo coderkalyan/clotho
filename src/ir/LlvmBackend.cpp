@@ -8173,6 +8173,79 @@ private:
         b_.SetInsertPoint(done);
     }
 
+    // Element-wise whole-(sub-)array copy for two plain (non-struct) 4-state
+    // unpacked arrays of the SAME element width whose z-elided slots differ only in
+    // the z word's presence (the dest is may-z, the source proven never-z, or vice
+    // versa). A memcpy is invalid (element strides differ); the mm plane is an
+    // identical i(2W) in both, so loop over `count` elements copying each mm word
+    // and, into a z-capable dest, its z word (0 when the source is never-z).
+    // `d_base` / `s_base` point at the first copied element (already offset for a
+    // sub-array). `service` wakes the dest's Any-edge readers on any change.
+    void emit_array_zdiff_copy(llvm::Value* d_base, llvm::Value* s_base, const SignalSlot& ds,
+                               const SignalSlot& ss, uint32_t count, Signal dsig, bool service) {
+        if (!ds.four_state || !ss.four_state || ds.narrow || ss.narrow || ds.width != ss.width) {
+            throw BackendError{ "whole-array copy between arrays of differing "
+                                "storage layout is not supported" };
+        }
+        auto* dst_arr = llvm::ArrayType::get(ds.slot_ty, count);
+        auto* src_arr = llvm::ArrayType::get(ss.slot_ty, count);
+        auto* mm_ty   = int_ty(2 * ds.width);
+        auto* z_ty    = int_ty(ds.width);
+        auto* i32     = b_.getInt32Ty();
+
+        llvm::AllocaInst* changed = nullptr;
+        if (service) {
+            changed = entry_alloca(b_.getInt1Ty(), "acopy.changed");
+            b_.CreateStore(b_.getFalse(), changed);
+        }
+        auto* fn    = b_.GetInsertBlock()->getParent();
+        auto* head  = llvm::BasicBlock::Create(ctx_, "acopy.head", fn);
+        auto* body  = llvm::BasicBlock::Create(ctx_, "acopy.body", fn);
+        auto* done  = llvm::BasicBlock::Create(ctx_, "acopy.done", fn);
+        auto* entry = b_.GetInsertBlock();
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(head);
+        auto* idx = b_.CreatePHI(i32, 2);
+        idx->addIncoming(b_.getInt32(0), entry);
+        b_.CreateCondBr(b_.CreateICmpULT(idx, b_.getInt32(count)), body, done);
+
+        b_.SetInsertPoint(body);
+        auto* d_mm_ptr = b_.CreateInBoundsGEP(dst_arr, d_base, { b_.getInt32(0), idx, b_.getInt32(0) });
+        auto* s_mm     = b_.CreateLoad(
+          mm_ty, b_.CreateInBoundsGEP(src_arr, s_base, { b_.getInt32(0), idx, b_.getInt32(0) }));
+        llvm::Value* s_z =
+          ss.has_z ? static_cast<llvm::Value*>(b_.CreateLoad(
+                       z_ty, b_.CreateInBoundsGEP(src_arr, s_base, { b_.getInt32(0), idx, b_.getInt32(1) })))
+                   : zero(ds.width);
+        llvm::Value* d_z_ptr =
+          ds.has_z ? b_.CreateInBoundsGEP(dst_arr, d_base, { b_.getInt32(0), idx, b_.getInt32(1) }) : nullptr;
+        if (service) {
+            llvm::Value* diff = b_.CreateICmpNE(b_.CreateLoad(mm_ty, d_mm_ptr), s_mm);
+            if (d_z_ptr != nullptr) {
+                diff = b_.CreateOr(diff, b_.CreateICmpNE(b_.CreateLoad(z_ty, d_z_ptr), s_z));
+            }
+            b_.CreateStore(b_.CreateOr(b_.CreateLoad(b_.getInt1Ty(), changed), diff), changed);
+        }
+        b_.CreateStore(s_mm, d_mm_ptr);
+        if (d_z_ptr != nullptr) {
+            b_.CreateStore(s_z, d_z_ptr);
+        }
+        idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), body);
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(done);
+        if (service) {
+            auto* svc  = llvm::BasicBlock::Create(ctx_, "acopy.svc", fn);
+            auto* cont = llvm::BasicBlock::Create(ctx_, "acopy.cont", fn);
+            b_.CreateCondBr(b_.CreateLoad(b_.getInt1Ty(), changed), svc, cont);
+            b_.SetInsertPoint(svc);
+            service_any_waiters(dsig);
+            b_.CreateBr(cont);
+            b_.SetInsertPoint(cont);
+        }
+    }
+
     // Pointer to a state field at a runtime byte offset (the NBA commit loop
     // reads its offsets from the meta table, erasing the field types). Offsets
     // are DataLayout field offsets, so accesses stay naturally aligned even
@@ -9314,20 +9387,42 @@ private:
                     src = src_override != nullptr ? src_override : agg_slot_ptr(slv);
                     st  = agg_storage_ty(info.type);
                 } else {
-                    // A plain unpacked array: its slot layout is may-z-analysed per
-                    // signal, so a memcpy is byte-valid only when both arrays landed
-                    // on the same layout (the common never-z / matching case). A
-                    // may-z mismatch (one array assigned z, the other not) would
-                    // differ in the z plane; reject it rather than miscopy.
-                    const SignalSlot& ds = slot_of(dlv.sig);
-                    const SignalSlot& ss = slot_of(slv.sig);
-                    if (ds.storage_ty != ss.storage_ty) {
-                        throw BackendError{ "whole-array copy between arrays of differing "
-                                            "storage layout is not supported" };
+                    // A plain unpacked array. The per-element slot layout is may-z-
+                    // analysed per signal, but a copy couples the two signals' z
+                    // through this very store, so their element slots match; a
+                    // genuine per-element mismatch is rejected rather than miscopied.
+                    // The copy count comes from the copy TYPE, not the whole signal:
+                    // a multi-dim element-select (`arr[i][j]`) addresses a SUB-array,
+                    // whose flat leaf offset is carried in elem_idx (base still
+                    // points at the whole `[N x slot]` storage) and applied here.
+                    const SignalSlot& ds    = slot_of(dlv.sig);
+                    const SignalSlot& ss    = slot_of(slv.sig);
+                    const uint32_t    count = array_leaf_count(info.type);
+                    // A multi-dim element-select (`arr[i][j]`) addresses a SUB-array;
+                    // its flat leaf offset rides elem_idx (the base still points at
+                    // the whole `[N x slot]` storage), applied here.
+                    llvm::Value* d_base =
+                      dlv.elem_idx != nullptr
+                        ? b_.CreateInBoundsGEP(ds.storage_ty, dlv.base, { b_.getInt32(0), dlv.elem_idx })
+                        : dlv.base;
+                    llvm::Value* s_base =
+                      slv.elem_idx != nullptr
+                        ? b_.CreateInBoundsGEP(ss.storage_ty, slv.base, { b_.getInt32(0), slv.elem_idx })
+                        : slv.base;
+                    if (ds.slot_ty != ss.slot_ty) {
+                        // z-elision gave the two same-typed arrays different per-
+                        // element layouts (the dest is may-z from other writes, this
+                        // source proven never-z, so their z-word presence differs).
+                        // The mm plane is an identical i(2W); copy element-wise,
+                        // filling the dest z (0 when the source is never-z).
+                        emit_array_zdiff_copy(d_base, s_base, ds, ss, count, dlv.sig,
+                                              !lowering_preinit_ && dlv.is_signal &&
+                                                signal_has_waiters(dlv.sig));
+                        return;
                     }
-                    dst = dlv.base;
-                    src = slv.base;
-                    st  = ds.storage_ty;
+                    dst = d_base;
+                    src = s_base;
+                    st  = llvm::ArrayType::get(ds.slot_ty, count);
                 }
                 const auto sz = env_->llmod.getDataLayout().getTypeAllocSize(st);
                 const auto al = env_->llmod.getDataLayout().getABITypeAlign(st);
