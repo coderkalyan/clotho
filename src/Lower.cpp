@@ -12361,11 +12361,11 @@ private:
         // and copied into its Local by the backend's aggregate copy-in.
         for (const FormalArgumentSymbol* fa : sub.getArguments()) {
             if (is_agg_abi_type(fa->getType()) && fa->direction != slang::ast::ArgumentDirection::Ref) {
-                if (fa->direction != slang::ast::ArgumentDirection::In) {
-                    // TODO: aggregate / whole-array output / inout function arg
-                    // (copy-out through the pointer at each return).
-                    fail("aggregate output / inout function argument is not supported");
-                }
+                // An aggregate output / inout formal (LRM 13.5): the backend copies
+                // the frame Local back through the passed pointer at each return. A
+                // struct-bearing actual passes its own storage pointer directly; a
+                // plain array actual passes a canonical caller temp that
+                // build_call_args copies back into the actual after the call.
                 if (!is_trivially_copyable(lower_type(fa->getType()))) {
                     // TODO: by-value copy of a string-containing aggregate (needs a
                     // per-leaf deep copy of the storage, not a memcpy).
@@ -12714,6 +12714,11 @@ private:
         const Expression*       actual;
         ir::Ref                 actual_ty;
         const slang::ast::Type* formal_ty;
+        // A whole-array output / inout formal passed via a canonical temp: the
+        // copy-back is a layout-converting element-wise emit_agg_copy (temp ->
+        // actual), not a scalar plane store. `agg_ty` is the temp's aggregate type.
+        bool    is_agg = false;
+        ir::Ref agg_ty = ir::Ref::Invalid;
     };
 
     // Build the call-argument operands for a user function / task (LRM 13.5): an
@@ -12745,13 +12750,19 @@ private:
             const ir::Ref pty = lower_type(formals[i]->getType());
             if (contains_struct_ref(pty)) {
                 // A struct-bearing aggregate actual passes by pointer (its lvalue);
-                // its storage is already the canonical aggregate mirror. Only In
-                // reaches here: the callee guards aggregate output / inout, and
-                // aggregate task arguments are guarded before build_call_args.
+                // its storage is already the canonical aggregate mirror, so the same
+                // pointer serves an In copy-in and an output / inout copy-out (the
+                // callee writes the frame Local back through it at return — no
+                // caller temp or CopyOutArg). slang wraps an output / inout actual
+                // in an AssignmentExpression; unwrap to the bound lvalue.
                 if (!is_trivially_copyable(pty)) {
                     fail("by-value pass of a string-containing aggregate is not supported");
                 }
-                const Expression& src = unwrap_conversion(*actuals[i]);
+                const Expression* actual = actuals[i];
+                if (actual->kind == ExpressionKind::Assignment) {
+                    actual = &actual->as<AssignmentExpression>().left();
+                }
+                const Expression& src = unwrap_conversion(*actual);
                 if (!is_struct_lvalue_shape(src)) {
                     // TODO: a `'{...}` / call aggregate actual — materialize a temp.
                     fail("aggregate argument must be a variable");
@@ -12760,19 +12771,20 @@ private:
                 continue;
             }
             if (is_agg_abi_ref(pty)) {
-                // A plain (flat-stored) fixed unpacked array In actual. A flat
-                // module array may be may-z-narrowed (z-elided) smaller than the
-                // callee's canonical aggregate formal, so materialize a canonical
-                // aggregate temp and copy the actual into it element-wise
-                // (layout-converting), then pass the temp by pointer.
-                if (dir != slang::ast::ArgumentDirection::In) {
-                    // TODO: output / inout whole-array function argument (copy-out).
-                    fail("output / inout whole-array function argument is not supported");
-                }
+                // A plain (flat-stored) fixed unpacked array actual. A flat module
+                // array may be may-z-narrowed (z-elided) smaller than the callee's
+                // canonical aggregate formal, so materialize a canonical aggregate
+                // temp and pass it by pointer: copy the actual into it element-wise
+                // (layout-converting) for In / Inout, and copy the callee-written
+                // temp back into the actual after the call for Out / Inout.
                 if (!is_trivially_copyable(pty)) {
                     fail("by-value pass of a string- or handle-element array is not supported");
                 }
-                const Expression& src = unwrap_conversion(*actuals[i]);
+                const Expression* actual = actuals[i];
+                if (actual->kind == ExpressionKind::Assignment) {
+                    actual = &actual->as<AssignmentExpression>().left();
+                }
+                const Expression& src = unwrap_conversion(*actual);
                 const bool array_lvalue =
                     is_struct_lvalue_shape(src) ||
                     (src.kind == ExpressionKind::RangeSelect && is_unpacked_array(src));
@@ -12782,7 +12794,12 @@ private:
                     fail("whole-array argument must be a variable or slice");
                 }
                 const ir::Index temp = make_canonical_agg_temp(pty, b, l);
-                emit_agg_copy(temp, lower_lvalue(src, b), pty, ir::Inst::Tag::Store, b, l);
+                if (dir != slang::ast::ArgumentDirection::Out) {
+                    emit_agg_copy(temp, lower_lvalue(src, b), pty, ir::Inst::Tag::Store, b, l);
+                }
+                if (dir != slang::ast::ArgumentDirection::In) {
+                    outs.push_back(CopyOutArg{ temp, &src, pty, actual->type, /*is_agg=*/true, pty });
+                }
                 args.push_back(temp);
                 continue;
             }
@@ -12834,7 +12851,14 @@ private:
     void emit_call_copyouts(const std::vector<CopyOutArg>& outs, ir::Builder& b, ir::SourceLoc l) {
         for (const CopyOutArg& oc : outs) {
             const ir::Index dst = lower_lvalue(*oc.actual, b);
-            const ir::Index tv  = b.unary(ir::Inst::Tag::Load, oc.temp, l);
+            if (oc.is_agg) {
+                // A whole-array output / inout: copy the callee-written temp back
+                // into the actual element-wise (layout-converting), the reverse of
+                // the copy-in above.
+                emit_agg_copy(dst, oc.temp, oc.agg_ty, ir::Inst::Tag::Store, b, l);
+                continue;
+            }
+            const ir::Index tv = b.unary(ir::Inst::Tag::Load, oc.temp, l);
             b.binary(ir::Inst::Tag::Store, dst, coerce(tv, *oc.formal_ty, oc.actual_ty, b, l), l);
         }
     }

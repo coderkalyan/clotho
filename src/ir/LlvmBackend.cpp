@@ -2987,16 +2987,17 @@ private:
                 params.push_back(ptr); // &actual (rt_dynarr* / rt_queue*)
                 continue;
             }
-            if (dir == ArgDir::Out || dir == ArgDir::Inout) {
+            if ((dir == ArgDir::Out || dir == ArgDir::Inout) && !is_agg_abi(pt)) {
                 params.push_back(ptr); // &caller_temp.mm
                 params.push_back(ptr); // &caller_temp.z (copy-out at each return)
                 continue;
             }
             if (is_string_type(pt) || is_agg_abi(pt)) {
-                // A string handle or an aggregate's storage passes by pointer (In
-                // only — the frontend guards aggregate out/inout formals); the
-                // callee copy-in gives value semantics. (A dynamic array is
-                // handled above, one pointer in every direction.)
+                // A string handle (In only — the frontend guards out/inout string
+                // formals) or an aggregate's storage passes by ONE pointer in every
+                // direction: In copies in through it, a struct-bearing out / inout
+                // formal copies the frame Local back out through it (the same actual
+                // pointer). (A dynamic array is handled above, one pointer too.)
                 params.push_back(ptr);
                 continue;
             }
@@ -3346,6 +3347,12 @@ private:
             if (!is_agg_abi(f.param_types[k])) {
                 continue;
             }
+            // An output formal is written by the body, not seeded from the caller
+            // (LRM 13.5): copy in only input / inout. Its frame Local starts at the
+            // init_frame default until the body assigns it.
+            if (f.arg_dirs[k] == ArgDir::Out) {
+                continue;
+            }
             emit_agg_storage_copy(b_.CreateStructGEP(frame_ty_, frame_, k),
                                   fn_->getArg(param_llvm_index_[k]), f.param_types[k]);
         }
@@ -3577,6 +3584,15 @@ private:
                 continue;
             }
             const uint32_t base = param_llvm_index_[k];
+            // A struct-bearing aggregate output / inout formal: copy the frame
+            // Local's storage back through the actual's pointer (the reverse of
+            // emit_fn_agg_copyin). Only struct-bearing aggregates reach here — a
+            // plain-array output / inout formal is guarded at the frontend.
+            if (is_agg_abi(f.param_types[k])) {
+                emit_agg_storage_copy(fn_->getArg(base),
+                                      b_.CreateStructGEP(frame_ty_, frame_, k), f.param_types[k]);
+                continue;
+            }
             // A dynamic-array / queue output / inout formal deep-copies its frame
             // handle back into the caller's handle (the single passed pointer).
             if (is_handle_type(f.param_types[k])) {
@@ -13290,16 +13306,20 @@ private:
                 if (!is_handle_type(f.param_types[k])) {
                     ref_svc.emplace_back(lv, service_snapshot(lv));
                 }
-            } else if (dir == ArgDir::Out || dir == ArgDir::Inout) {
-                // An output / inout temp: pass pointers to its mm and z planes; the
-                // callee copies out through them (the caller copies the temp back to
-                // the actual after the call — frontend emit_call_copyouts).
+            } else if ((dir == ArgDir::Out || dir == ArgDir::Inout) &&
+                       !is_agg_abi(f.param_types[k])) {
+                // An output / inout scalar temp: pass pointers to its mm and z
+                // planes; the callee copies out through them (the caller copies the
+                // temp back to the actual after the call — frontend
+                // emit_call_copyouts).
                 const LValue& lv = lvalue_of(a);
                 argv.push_back(lv_mm_ptr(lv));
                 argv.push_back(lv_z_ptr(lv));
             } else if (is_agg_abi(f.param_types[k])) {
-                // An aggregate actual passes its storage pointer (the frontend
-                // emitted it as an lvalue); the callee copies it in.
+                // An aggregate actual passes its storage pointer, one per formal in
+                // every direction (the frontend emitted it as an lvalue): In copies
+                // it in, a struct-bearing out / inout copies the frame Local back
+                // out through the same pointer.
                 argv.push_back(agg_slot_ptr(lvalue_of(a)));
             } else if (is_string_type(f.param_types[k])) {
                 argv.push_back(str_of(a));
