@@ -2159,13 +2159,16 @@ private:
 
     // Whether an expression is a whole unpacked-array lvalue (a named array, or a
     // member / element that is itself a whole array) — the source of a whole-array
-    // memcpy copy, as opposed to a slice / element / pattern.
+    // memcpy copy, as opposed to a slice / element / pattern. A HierarchicalValue
+    // names an array reached through an interface modport (`iface.arr`), which
+    // canonical_value_symbol resolves to the interface's own storage.
     static bool is_whole_array_lvalue(const Expression& e) {
         if (e.type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() == nullptr) {
             return false;
         }
         switch (e.kind) {
             case ExpressionKind::NamedValue:
+            case ExpressionKind::HierarchicalValue:
             case ExpressionKind::MemberAccess:
             case ExpressionKind::ElementSelect:
                 return true;
