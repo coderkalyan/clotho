@@ -541,7 +541,10 @@ enum class Severity : uint32_t {
 // the runtime completes with the message. `fmt` / `fmt_len` are the packed
 // $display-style format bytes; `args` the value operands its specifiers consume
 // (both empty for a bare `$error;` or a default assertion failure). `level` is
-// the ir::Severity label.
+// the ir::Severity label. `defer` selects the scheduling region for a deferred
+// immediate assertion action (LRM 16.4): 0 = immediate (the report/action runs
+// where it is lowered), 1 = observed deferred (`assert #0`, matures + fires in
+// the Observed region), 2 = final deferred (`assert final`, Postponed region).
 struct SeverityInfo {
     // First extra word of the packed banner-prefix bytes.
     ExtraIndex banner;
@@ -553,6 +556,8 @@ struct SeverityInfo {
     uint32_t fmt_len;
     // ir::Severity label.
     uint32_t level;
+    // Deferral region: 0 immediate, 1 observed (#0), 2 final. See LRM 16.4.
+    uint32_t defer;
     // Value operands consumed by the format specifiers.
     ExtraSlice args;
 };

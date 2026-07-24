@@ -642,6 +642,7 @@ public:
         design_uses_strobe_   = design_uses_strobe(); // gates the Postponed-region drain loop
         design_uses_monitor_  = design_uses_monitor();
         design_uses_observed_ = design_uses_observed(); // gates the Observed-region flush
+        design_uses_defer_    = design_uses_defer();     // gates the deferred-assertion flushes
         build_vcd_index();       // before build_nba_state: fills vcd_index_ / design_uses_vcd_
         build_wait_queues();
         build_instance_ctx_layout(); // after build_wait_queues: ctx sizes need wait slots
@@ -2475,6 +2476,23 @@ private:
         }
         sched_ptr_ = sched_anchor_ != SignalSlot::no_anchor ? nullptr : sched_flag_ptr(proc_index);
 
+        // Deferred immediate assertion (LRM 16.4): a group carrying one gets a
+        // per-process generation counter, bumped at each activation, that tags
+        // its queued reports so a superseded activation's reports are dropped at
+        // maturation (the flush of LRM 16.4.2). Such a group is a forced coroutine
+        // singleton (is_simple_always is false for a deferred Severity), so the
+        // generation is a plain per-group global; a reused (multi-instance)
+        // definition would need a per-instance counter (Phase 2), so guard it.
+        cur_defer_group_ = -1;
+        if (std::any_of(members.begin(), members.end(),
+                        [&](uint32_t m) { return process_has_deferred_severity(all[m]); })) {
+            if (gaid != SignalSlot::no_anchor && anchors_[gaid].indirect) {
+                throw BackendError{ "deferred immediate assertion in a module instantiated more "
+                                    "than once is not supported (Phase 1)" };
+            }
+            cur_defer_group_ = static_cast<int32_t>(sched_group_);
+        }
+
         // Same-eligibility NBA prep: the group's block registrations pass
         // (instance block base + group-local ordinal) instead of the absolute
         // block id — identical value (a group's blocks are id-contiguous by
@@ -2815,6 +2833,7 @@ private:
             auto* loop_bb = llvm::BasicBlock::Create(ctx_, "always.loop", fn_);
             b_.CreateBr(loop_bb);
             b_.SetInsertPoint(loop_bb);
+            emit_defer_gen_bump(); // activation start = deferred-assertion flush point
             for (size_t i = 0; i < members.size(); ++i) {
                 select_member(members[i]);
                 str_vals_   = member_strs[i];
@@ -2829,6 +2848,7 @@ private:
             b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "always.exit", fn_));
         } else {
             // Never fused: a non-always (or sensitivity-less) group is a singleton.
+            emit_defer_gen_bump(); // single-shot body: one activation, one flush point
             select_member(proc_index);
             str_vals_   = member_strs.front();
             dynarr_ret_ = member_dynarr.front();
@@ -4618,6 +4638,18 @@ private:
                 // fusion "as-if" argument does not allow.
                 case Inst::Tag::StrobePend:
                     return false;
+                // A deferred immediate assertion (LRM 16.4) queues its report on
+                // the owning process's deferred queue and flushes it at each
+                // activation. Force a coroutine so the flush (generation bump)
+                // has one activation-start site (the always-loop top), and keep
+                // it out of thunk/fused groups whose activation model differs.
+                case Inst::Tag::Severity: {
+                    const auto info = p.ir.extra_data<SeverityInfo>(p.ir.payload(idx).extra);
+                    if (info.defer != 0) {
+                        return false;
+                    }
+                    break;
+                }
                 case Inst::Tag::Store: {
                     const LvalueRoot r = lvalue_root(p.ir, p.ir.payload(idx).binary.l);
                     if (p.ir.tag(r.root) != Inst::Tag::Signal) {
@@ -7314,16 +7346,24 @@ private:
         // Queue empty: this instant has fully settled.
         b_.SetInsertPoint(wcheck);
         // Observed region (LRM 4.4.2.4): emit every report queued while the
-        // Active/NBA regions settled this instant — currently unique/priority
-        // case violations (LRM 12.4.2 / 12.5.3). Runs before the Postponed region
-        // below, per the LRM region order. rt_observed_flush no-ops when nothing
-        // is queued, so this one call per settled instant is cheap.
+        // Active/NBA regions settled this instant — unique/priority case
+        // violations (LRM 12.4.2 / 12.5.3) and observed (`#0`) deferred assertion
+        // reports (LRM 16.4). Runs before the Postponed region below, per the LRM
+        // region order. The flushes no-op when nothing is queued, so these calls
+        // per settled instant are cheap.
         if (design_uses_observed_) {
             b_.CreateCall(observed_flush_fn(), {});
         }
-        // Postponed region (LRM §21.7): sample the VCD dump at the current time
-        // before the wheel advances, so each variable's final settled value is
-        // recorded once per instant.
+        if (design_uses_defer_) {
+            b_.CreateCall(defer_flush_observed_fn(), {});
+        }
+        // Postponed region (LRM §21.7): final (`assert final`) deferred assertion
+        // reports mature here (LRM 16.4), and the VCD dump samples the current
+        // time before the wheel advances, so each variable's final settled value
+        // is recorded once per instant.
+        if (design_uses_defer_) {
+            b_.CreateCall(defer_flush_final_fn(), {});
+        }
         if (uses_vcd) {
             b_.CreateCall(vcd_flush_fn(), { b_.CreateCall(wheel_now_fn(), { wheel }) });
         }
@@ -12270,9 +12310,48 @@ private:
 
         const std::span<const Index> args = ir_->region(info.args);
         llvm::Value*                 arr  = build_rt_args(args, "severity task");
-        b_.CreateCall(severity_fn(), { b_.getInt32(static_cast<int32_t>(info.level)),
-                                       b_.CreateGlobalString(banner), b_.CreateGlobalString(fmt),
-                                       b_.getInt32(static_cast<uint32_t>(args.size())), arr });
+        if (info.defer == 0) {
+            b_.CreateCall(severity_fn(), { b_.getInt32(static_cast<int32_t>(info.level)),
+                                           b_.CreateGlobalString(banner), b_.CreateGlobalString(fmt),
+                                           b_.getInt32(static_cast<uint32_t>(args.size())), arr });
+            return;
+        }
+        // Deferred immediate assertion action (LRM 16.4): queue the rendered
+        // report tagged with the process's current generation. The generation
+        // pointer is this group's counter (defer_gen_ptr) — always set when a
+        // deferred Severity lowers, since is_simple_always forces the group to a
+        // coroutine and lower_group set cur_defer_group_. defer == 2 selects the
+        // Postponed (final) maturation, defer == 1 the Observed (`#0`).
+        llvm::Value* gen = defer_gen_ptr();
+        auto*        i64 = b_.getInt64Ty();
+        llvm::Value* gen_val =
+          gen != nullptr ? b_.CreateLoad(i64, gen)
+                         : static_cast<llvm::Value*>(b_.getInt64(0));
+        llvm::Value* gen_arg =
+          gen != nullptr ? gen
+                         : static_cast<llvm::Value*>(
+                             llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
+        b_.CreateCall(defer_report_fn(),
+                      { b_.getInt32(static_cast<int32_t>(info.level)),
+                        b_.getInt64(info.defer == 2 ? 1 : 0), gen_arg, gen_val,
+                        b_.CreateGlobalString(banner), b_.CreateGlobalString(fmt),
+                        b_.getInt32(static_cast<uint32_t>(args.size())), arr });
+    }
+
+    // void rt_defer_report(i32 level, i64 is_final, ptr gen, i64 gen_val, ptr
+    // banner, ptr fmt, i32 argc, ptr argv) — queue a deferred assertion report.
+    llvm::FunctionCallee defer_report_fn() {
+        return rt_fn("rt_defer_report", b_.getVoidTy(),
+                     { b_.getInt32Ty(), b_.getInt64Ty(), raw_ptr_ty(), b_.getInt64Ty(),
+                       raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
+    }
+    // void rt_defer_flush_observed() / rt_defer_flush_final() — mature the queued
+    // observed (#0) / final deferred reports.
+    llvm::FunctionCallee defer_flush_observed_fn() {
+        return rt_fn("rt_defer_flush_observed", b_.getVoidTy(), {});
+    }
+    llvm::FunctionCallee defer_flush_final_fn() {
+        return rt_fn("rt_defer_flush_final", b_.getVoidTy(), {});
     }
 
     // Whether wheel_ points at a live timing wheel: true in a process or task
@@ -13020,6 +13099,67 @@ private:
             }
         }
         return false;
+    }
+
+    // Does this process body carry a deferred immediate assertion, i.e. a
+    // Severity node with a non-zero `defer` (LRM 16.4)? A deferred assertion in a
+    // called function/task is rejected in the frontend, so a process scan covers
+    // every case the backend must handle.
+    bool process_has_deferred_severity(const Process& p) const {
+        for (uint32_t k = 0; k < p.ir.inst_count(); ++k) {
+            const auto idx = static_cast<Index>(k);
+            if (p.ir.tag(idx) != Inst::Tag::Severity) {
+                continue;
+            }
+            if (p.ir.extra_data<SeverityInfo>(p.ir.payload(idx).extra).defer != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Any deferred immediate assertion (LRM 16.4) in the design? Gates the
+    // Observed / Postponed deferred-report flushes in emit_active_run.
+    bool design_uses_defer() const {
+        for (const Process& p : mod_.processes()) {
+            if (process_has_deferred_severity(p)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // The current group's deferred-assertion generation counter (lazily created
+    // in the group's own module), or null when the group carries no deferred
+    // assertion. Bumped once per activation and read at each deferred report to
+    // tag it; see lower_group / emit_defer_gen_bump / lower_severity.
+    llvm::Value* defer_gen_ptr() {
+        if (cur_defer_group_ < 0) {
+            return nullptr;
+        }
+        const auto g = static_cast<size_t>(cur_defer_group_);
+        if (defer_gen_gv_.size() <= g) {
+            defer_gen_gv_.resize(g + 1, nullptr);
+        }
+        if (defer_gen_gv_[g] == nullptr) {
+            defer_gen_gv_[g] = new llvm::GlobalVariable(
+              env_->llmod, b_.getInt64Ty(), false, llvm::GlobalValue::InternalLinkage,
+              b_.getInt64(0), "clotho.defer.gen." + std::to_string(g));
+        }
+        return defer_gen_gv_[g];
+    }
+
+    // Bump the current group's deferred-assertion generation at an activation
+    // start (LRM 16.4.2 flush point): reports queued by an earlier activation now
+    // carry a stale generation and are dropped at maturation. A no-op for a group
+    // without deferred assertions.
+    void emit_defer_gen_bump() {
+        llvm::Value* gen = defer_gen_ptr();
+        if (gen == nullptr) {
+            return;
+        }
+        auto* i64 = b_.getInt64Ty();
+        b_.CreateStore(b_.CreateAdd(b_.CreateLoad(i64, gen), b_.getInt64(1)), gen);
     }
 
     // Any $monitor / $fmonitor registration in the design? Gates the per-instant
@@ -16447,6 +16587,11 @@ private:
     bool design_uses_strobe_   = false;
     bool design_uses_monitor_  = false;
     bool design_uses_observed_ = false;
+    bool design_uses_defer_    = false;
+    // Current group's deferred-assertion generation-counter group id (-1 = none);
+    // set per group in lower_group. Per-group generation globals, created lazily.
+    int32_t                            cur_defer_group_ = -1;
+    std::vector<llvm::GlobalVariable*> defer_gen_gv_;
     std::vector<int32_t>  vcd_index_;
     llvm::GlobalVariable* nba_vcd_gv_ = nullptr;
 

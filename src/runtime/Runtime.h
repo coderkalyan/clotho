@@ -138,6 +138,21 @@ void rt_observed_flush(void);
 // termination is a separate rt_finish the caller emits after this report.
 void rt_severity(int32_t level, const char* banner, const char* fmt, uint32_t argc, const rt_arg* argv);
 
+// Queue a deferred immediate assertion report (LRM 16.4) for maturation in the
+// Observed (`is_final` == 0) or Postponed (`is_final` != 0) region. The message
+// is rendered now (arguments sampled at the Active-region execution point);
+// `level` is the ir::Severity label, `banner` the "<file>:<line>: " prefix.
+// `gen` is the owning process's generation-counter address and `gen_val` its
+// value at queue time: at maturation the report fires only if `*gen` still
+// equals `gen_val`, i.e. the process has not re-activated (flushed) since.
+void rt_defer_report(int32_t level, uint64_t is_final, const void* gen, uint64_t gen_val,
+                     const char* banner, const char* fmt, uint32_t argc, const rt_arg* argv);
+
+// Mature and clear the queued observed / final deferred assertion reports.
+// Called by the sim loop at the Observed / Postponed points, and by rt_finish.
+void rt_defer_flush_observed(void);
+void rt_defer_flush_final(void);
+
 // Install (or clear, with null) the setjmp target rt_finish longjmps to, so a
 // $finish ends only the simulation, not the embedding process (the test binary
 // runs many simulations). The jump abandons live coroutine frames — acceptable,

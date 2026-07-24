@@ -5647,12 +5647,97 @@ private:
     // condition, or emit the default failure report (error severity) when there
     // is none. `cover` has no fail action — a false condition does nothing; its
     // coverage count/report is deliberately unimplemented.
+    // Emit one deferred assertion action (LRM 16.4): a single severity system
+    // task ($error / $warning / $info), or the default $error when `action` is
+    // null on a failing assert/assume. The report is rendered as a Severity node
+    // with `defer` set (1 = observed `#0`, 2 = final), so the backend queues it
+    // for the Observed / Postponed region; its arguments are lowered here and so
+    // sampled at the Active-region execution point (LRM 16.4.1). Action shapes
+    // Phase 1 does not defer are rejected loudly.
+    void emit_deferred_action(const Statement* action, uint32_t defer_mode, bool is_fail,
+                              slang::SourceLocation site, ir::Builder& b) {
+        // A bare `assert #0 (e)` carries an empty action for the pass branch; a
+        // missing branch is null. Either way there is no explicit action.
+        const bool no_action =
+          action == nullptr || action->kind == slang::ast::StatementKind::Empty;
+        if (no_action) {
+            // Only the fail branch of assert/assume has a default report; a
+            // missing pass action (or cover) emits nothing.
+            if (is_fail) {
+                b.severity(static_cast<uint32_t>(ir::Severity::Error), banner_at(site),
+                           "assertion failed", {}, to_source_loc(site), defer_mode);
+            }
+            return;
+        }
+        const auto* es   = action->as_if<slang::ast::ExpressionStatement>();
+        const auto* call = es != nullptr ? es->expr.as_if<CallExpression>() : nullptr;
+        if (call == nullptr || !call->isSystemCall()) {
+            // TODO: deferred action blocks that are a user task / void-function
+            // call (LRM 16.4 allows any single subroutine) need a generic
+            // deferred-call ABI (sample args now, invoke at maturation).
+            fail("deferred assertion action block must be a single severity system "
+                 "task ($error / $warning / $info) — Phase 1");
+        }
+        const std::string_view nm = call->getSubroutineName();
+        ir::Severity           sev;
+        if (nm == "$error") {
+            sev = ir::Severity::Error;
+        } else if (nm == "$warning") {
+            sev = ir::Severity::Warning;
+        } else if (nm == "$info") {
+            sev = ir::Severity::Info;
+        } else {
+            // TODO: $fatal (terminates — needs the deferred $finish), and
+            // $display / $write (stdout, no label) as deferred actions.
+            fail("deferred assertion action '" + std::string(nm) +
+                 "' is not supported (only $error / $warning / $info) — Phase 1");
+        }
+        std::string            fmt;
+        std::vector<ir::Index> args;
+        build_format(call->arguments(), fmt, args, b);
+        b.severity(static_cast<uint32_t>(sev), banner_at(call->sourceRange.start()), fmt, args,
+                   loc(*call), defer_mode);
+    }
+
+    // Deferred immediate assertion (LRM 16.4): `assert/assume/cover #0` (observed,
+    // matures in the Observed region) or `... final` (matures in the Postponed
+    // region). The expression is evaluated here (Active region, as for a simple
+    // immediate assertion); only the action is deferred. The backend's per-process
+    // generation flush gives the glitch suppression (LRM 16.4.2). Phase 1 restricts
+    // the action to a severity report and requires the assertion to sit directly in
+    // a process body (a deferred assertion inside a function/task needs the caller
+    // process's generation threaded through the call ABI).
+    void lower_deferred_assertion(const ImmediateAssertionStatement& a, ir::Builder& b) {
+        using AK = slang::ast::AssertionKind;
+        if (fn_ctx_ != nullptr) {
+            // TODO: thread the calling process's deferred-assertion generation
+            // through the function/task ABI (LRM 16.4.1 short-circuit example).
+            fail("deferred assertion inside a function / task is not supported — Phase 1");
+        }
+        const bool is_cover = a.assertionKind == AK::CoverProperty;
+        if (a.assertionKind != AK::Assert && a.assertionKind != AK::Assume && !is_cover) {
+            fail("only deferred assert / assume / cover are supported");
+        }
+        const uint32_t  defer_mode = a.isFinal ? 2u : 1u;
+        const ir::Index pred       = lower_predicate(a.cond, b);
+
+        b.open_region();
+        emit_deferred_action(a.ifTrue, defer_mode, /*is_fail=*/false, a.sourceRange.start(), b);
+        const ir::ExtraSlice then_region = b.close_region();
+
+        b.open_region();
+        if (!is_cover) {
+            emit_deferred_action(a.ifFalse, defer_mode, /*is_fail=*/true, a.sourceRange.start(), b);
+        }
+        const ir::ExtraSlice else_region = b.close_region();
+
+        b.cond(pred, then_region, else_region, loc(a));
+    }
+
     void lower_immediate_assertion(const ImmediateAssertionStatement& a, ir::Builder& b) {
         if (a.isDeferred || a.isFinal) {
-            // TODO: deferred (assert #0) and final immediate assertions defer the
-            // check/report to the Observed/Reactive region, scheduling Clotho
-            // lacks.
-            fail("deferred / final immediate assertions are not supported");
+            lower_deferred_assertion(a, b);
+            return;
         }
         using AK              = slang::ast::AssertionKind;
         const bool is_cover   = a.assertionKind == AK::CoverProperty;

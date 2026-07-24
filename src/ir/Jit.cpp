@@ -186,6 +186,9 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_finish", &rt_finish);
     expose("rt_observed_case_violation", &rt_observed_case_violation);
     expose("rt_observed_flush", &rt_observed_flush);
+    expose("rt_defer_report", &rt_defer_report);
+    expose("rt_defer_flush_observed", &rt_defer_flush_observed);
+    expose("rt_defer_flush_final", &rt_defer_flush_final);
     expose("rt_oscillation_abort", &rt_oscillation_abort);
     expose("rt_queue_assign_dynarr", &rt_queue_assign_dynarr);
     expose("rt_severity", &rt_severity);

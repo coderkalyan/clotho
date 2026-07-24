@@ -2888,6 +2888,78 @@ extern "C" void rt_severity(int32_t level, const char* banner, const char* fmt, 
     std::fflush(stderr);
 }
 
+// ---- Deferred immediate assertion reports (LRM 16.4) ----
+//
+// A deferred assertion's action (a single severity system task, or the default
+// $error) is rendered here when the assertion executes in the Active region —
+// its arguments are sampled at that instant (LRM 16.4.1) — but its emission is
+// delayed: an observed (`#0`) report matures + fires in the Observed region, a
+// final report in the Postponed region. Each queued report is tagged with a
+// per-process generation counter address and the counter's value at queue time.
+// The owning process bumps its generation at every activation (a flush point,
+// LRM 16.4.2), so a report left over from a superseded activation has a stale
+// generation and is dropped at maturation instead of firing — this is the
+// glitch suppression the construct exists for. All same-mode reports leave the
+// queue at their maturation region regardless (fired if current, dropped if
+// stale), so the queue never carries a report across time steps.
+namespace {
+struct DeferReport {
+    std::string     line;     // fully rendered "<LABEL>: <banner><message>\n"
+    const uint64_t* gen;      // owning process's generation counter
+    uint64_t        gen_val;  // generation at queue time
+    bool            is_final; // final (Postponed) vs observed (#0, Observed)
+};
+std::vector<DeferReport> g_defer;
+} // namespace
+
+extern "C" void rt_defer_report(int32_t level, uint64_t is_final, const void* gen, uint64_t gen_val,
+                                const char* banner, const char* fmt, uint32_t argc,
+                                const rt_arg* argv) {
+    static const char* const labels[] = { "INFO", "WARNING", "ERROR", "FATAL" };
+    io_ensure_init();
+    std::string line = labels[level >= 0 && level < 4 ? level : 2];
+    line += ": ";
+    line += banner;
+    render(line, fmt, argc, argv);
+    line += '\n';
+    g_defer.push_back(
+      { std::move(line), static_cast<const uint64_t*>(gen), gen_val, is_final != 0 });
+}
+
+// Mature the queued reports of one mode: fire those whose process generation is
+// still current (not superseded by a later activation) and drop the rest; every
+// same-mode report leaves the queue. `final_pass` selects final vs observed.
+static void defer_mature(bool final_pass) {
+    if (g_defer.empty()) {
+        return;
+    }
+    std::fflush(stdout);
+    std::vector<DeferReport> keep;
+    bool                     wrote = false;
+    for (DeferReport& r : g_defer) {
+        if (r.is_final != final_pass) {
+            keep.push_back(std::move(r));
+            continue;
+        }
+        if (r.gen == nullptr || *r.gen == r.gen_val) {
+            std::fputs(r.line.c_str(), stderr);
+            wrote = true;
+        }
+    }
+    g_defer.swap(keep);
+    if (wrote) {
+        std::fflush(stderr);
+    }
+}
+
+extern "C" void rt_defer_flush_observed() {
+    defer_mature(/*final_pass=*/false);
+}
+
+extern "C" void rt_defer_flush_final() {
+    defer_mature(/*final_pass=*/true);
+}
+
 extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*),
                            void (*finals)(void*, void*)) {
     // Run the simulation, then the `final` blocks (LRM 9.2.3), so the finals see

@@ -78,6 +78,14 @@ bool contains(std::string_view hay, std::string_view needle) {
     return hay.find(needle) != std::string_view::npos;
 }
 
+size_t count_occ(std::string_view hay, std::string_view needle) {
+    size_t n = 0;
+    for (size_t p = hay.find(needle); p != std::string_view::npos; p = hay.find(needle, p + needle.size())) {
+        n++;
+    }
+    return n;
+}
+
 } // namespace
 
 // -- Severity system tasks (LRM 20.10) --
@@ -182,11 +190,12 @@ TEST_CASE("assert condition truth follows if-semantics (any bit set is true)") {
 
 // -- Guards: unimplemented forms fail loudly (never silently miscompiled) --
 
-TEST_CASE("deferred and final immediate assertions are rejected") {
-    CHECK(contains(reject("module m; initial assert #0 (1);\nendmodule"),
-                   "deferred / final immediate assertions are not supported"));
-    CHECK(contains(reject("module m; initial assert final (1);\nendmodule"),
-                   "deferred / final immediate assertions are not supported"));
+// Deferred / final immediate assertions (LRM 16.4) are now supported; see the
+// dedicated deferred-assertion section at the end of this file. A passing one in
+// an initial block lowers cleanly and reports nothing.
+TEST_CASE("deferred and final immediate assertions lower and pass silently") {
+    CHECK(run_capture("module m; initial assert #0 (1);\nendmodule").err.empty());
+    CHECK(run_capture("module m; initial assert final (1);\nendmodule").err.empty());
 }
 
 // -- Immediate cover (LRM 16.3): pass action on true, nothing on false --
@@ -218,4 +227,121 @@ TEST_CASE("bare immediate cover with no action is a no-op") {
                                    "end endmodule");
     CHECK(contains(c.out, "done"));
     CHECK(c.err.empty());
+}
+
+// -- Deferred immediate assertions (LRM 16.4) --
+
+// A deferred assertion's report matures in the Observed region, but a design
+// with no glitch reports it just like a simple immediate assertion. The default
+// failure ($error) fires with the "assertion failed" message. $finish sits in a
+// separate process at a later instant so the report matures naturally (a $finish
+// in the same instant preempts maturation and discards the report — see below).
+TEST_CASE("deferred #0 assertion: default failure report matures and fires") {
+    const Captured c = run_capture("module m;\n"
+                                   "  logic clk = 0; logic [7:0] x = 3;\n"
+                                   "  always #5 clk = ~clk;\n"
+                                   "  always @(posedge clk) a1: assert #0 (x == 0);\n"
+                                   "  initial #7 $finish;\n"
+                                   "endmodule");
+    CHECK(contains(c.err, "ERROR: "));
+    CHECK(contains(c.err, "assertion failed"));
+}
+
+TEST_CASE("deferred #0 assertion: else action with sampled arguments") {
+    const Captured c = run_capture("module m;\n"
+                                   "  logic clk = 0; logic [7:0] x = 42;\n"
+                                   "  always #5 clk = ~clk;\n"
+                                   "  always @(posedge clk) a1: assert #0 (x == 0) else $error(\"bad x=%0d\", x);\n"
+                                   "  initial #7 $finish;\n"
+                                   "endmodule");
+    CHECK(contains(c.err, "bad x=42"));
+}
+
+TEST_CASE("deferred #0 assertion: a same-instant $finish discards the pending report") {
+    const Captured c = run_capture("module m;\n"
+                                   "  logic clk = 0; logic [7:0] x = 5;\n"
+                                   "  always #5 clk = ~clk;\n"
+                                   "  always @(posedge clk) begin\n"
+                                   "    a1: assert #0 (x == 0) else $error(\"discarded x=%0d\", x);\n"
+                                   "    $finish;\n"
+                                   "  end\n"
+                                   "endmodule");
+    CHECK_FALSE(contains(c.err, "discarded"));
+}
+
+// The point of the construct: a transient combinational failure that the block
+// settles away from within the same time step is flushed and never reported,
+// while a simple immediate assertion in the same block reports the glitch. The
+// `#0` between the two writes forces the always_comb to activate twice at t=10:
+// first a=1,b=0 (mismatch), then a=1,b=1 (match). LRM 16.4.2 flush on the second
+// activation drops the deferred report; the immediate one already fired.
+TEST_CASE("deferred #0 assertion: glitch is flushed, immediate is not") {
+    const Captured c = run_capture("module m;\n"
+                                   "  logic a = 0, b = 0;\n"
+                                   "  always_comb begin\n"
+                                   "    chk: assert #0 (a == b) else $error(\"defer a=%0d b=%0d\", a, b);\n"
+                                   "    imm: assert (a == b) else $error(\"imm a=%0d b=%0d\", a, b);\n"
+                                   "  end\n"
+                                   "  initial begin\n"
+                                   "    #10 a = 1;\n"
+                                   "    #0  b = 1;\n"
+                                   "    #10 $finish;\n"
+                                   "  end\n"
+                                   "endmodule");
+    // The glitch really happened: the immediate assertion caught the transient.
+    CHECK(contains(c.err, "imm a=1 b=0"));
+    // The deferred assertion suppressed it (flushed by the second activation).
+    CHECK(count_occ(c.err, "defer a=") == 0);
+}
+
+// `assert final` matures in the Postponed region; with no Reactive-region
+// re-trigger in Clotho it reports the settled result, like `#0` here.
+TEST_CASE("deferred final assertion: report matures in the Postponed region") {
+    const Captured c = run_capture("module m;\n"
+                                   "  logic clk = 0; logic [7:0] x = 9;\n"
+                                   "  always #5 clk = ~clk;\n"
+                                   "  always @(posedge clk) af: assert final (x == 0) else $error(\"final bad x=%0d\", x);\n"
+                                   "  initial #7 $finish;\n"
+                                   "endmodule");
+    CHECK(contains(c.err, "final bad x=9"));
+}
+
+// A passing deferred assertion reports nothing.
+TEST_CASE("deferred #0 assertion: a passing check reports nothing") {
+    const Captured c = run_capture("module m;\n"
+                                   "  logic clk = 0; logic [7:0] x = 0;\n"
+                                   "  always #5 clk = ~clk;\n"
+                                   "  always @(posedge clk) begin\n"
+                                   "    a1: assert #0 (x == 0) else $error(\"should not fire\");\n"
+                                   "    $finish;\n"
+                                   "  end\n"
+                                   "endmodule");
+    // Only the $finish banner reaches stderr; the passing assertion adds nothing.
+    CHECK_FALSE(contains(c.err, "should not fire"));
+    CHECK_FALSE(contains(c.err, "ERROR: "));
+}
+
+// Phase 1 guards: a deferred action that is not a severity report, or a deferred
+// assertion inside a function, is rejected loudly.
+TEST_CASE("deferred assertion: unsupported action / context rejected") {
+    // $display action (stdout, not a severity task) — Phase 2.
+    CHECK(contains(reject("module m; initial begin\n"
+                          "  a1: assert #0 (0) else $display(\"x\");\n"
+                          "end endmodule"),
+                   "deferred assertion action"));
+    // $fatal action (terminates) — Phase 2.
+    CHECK(contains(reject("module m; initial begin\n"
+                          "  a1: assert #0 (0) else $fatal(1);\n"
+                          "end endmodule"),
+                   "deferred assertion action"));
+    // Deferred assertion inside a function — Phase 2 (generation threading).
+    CHECK(contains(reject("module m;\n"
+                          "  function int f(int v);\n"
+                          "    p: assert #0 (v > 0);\n"
+                          "    return v;\n"
+                          "  endfunction\n"
+                          "  int y;\n"
+                          "  initial y = f(3);\n"
+                          "endmodule"),
+                   "deferred assertion inside a function"));
 }

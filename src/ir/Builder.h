@@ -367,7 +367,7 @@ public:
     // the $display-style message (both empty for a bare `$error;`). Non-fatal,
     // renders and returns; $fatal's termination is a following finish().
     Index severity(uint32_t level, std::string_view banner, std::string_view fmt,
-                   std::span<const Index> args, SourceLoc loc);
+                   std::span<const Index> args, SourceLoc loc, uint32_t defer = 0);
     // $fflush: flush the descriptor `handle`'s output buffers. The no-argument
     // form passes a constant 0 (the runtime flushes every open stream).
     Index fflush(Index handle, SourceLoc loc);
