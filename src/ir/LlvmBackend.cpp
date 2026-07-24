@@ -2480,16 +2480,14 @@ private:
         // per-process generation counter, bumped at each activation, that tags
         // its queued reports so a superseded activation's reports are dropped at
         // maturation (the flush of LRM 16.4.2). Such a group is a forced coroutine
-        // singleton (is_simple_always is false for a deferred Severity), so the
-        // generation is a plain per-group global; a reused (multi-instance)
-        // definition would need a per-instance counter (Phase 2), so guard it.
+        // (is_simple_always is false for a deferred Severity) and coroutines are
+        // never shared across instances (only thunk groups dedup), so every
+        // instance of a reused definition is its own group with its own gen
+        // global keyed by the per-instance group id — per-instance correct with
+        // no extra machinery. The counter is a plain per-group global.
         cur_defer_group_ = -1;
         if (std::any_of(members.begin(), members.end(),
                         [&](uint32_t m) { return process_has_deferred_severity(all[m]); })) {
-            if (gaid != SignalSlot::no_anchor && anchors_[gaid].indirect) {
-                throw BackendError{ "deferred immediate assertion in a module instantiated more "
-                                    "than once is not supported (Phase 1)" };
-            }
             cur_defer_group_ = static_cast<int32_t>(sched_group_);
         }
 

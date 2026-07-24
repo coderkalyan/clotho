@@ -321,6 +321,26 @@ TEST_CASE("deferred #0 assertion: a passing check reports nothing") {
     CHECK_FALSE(contains(c.err, "ERROR: "));
 }
 
+// Each instance of a module with a deferred assertion gets its own per-process
+// generation counter (Clotho flattens instances into distinct processes, and
+// coroutines are never deduplicated), so the flush is per-instance: all three
+// instances report their own failing value, none flushed by another's activation.
+TEST_CASE("deferred #0 assertion: per-instance flush across module instances") {
+    const Captured c = run_capture("module chk(input logic clk, input logic [7:0] v);\n"
+                                   "  always @(posedge clk) a: assert #0 (v == 0) else $error(\"inst v=%0d\", v);\n"
+                                   "endmodule\n"
+                                   "module top;\n"
+                                   "  logic clk = 0; logic [7:0] p = 1, q = 2, r = 3;\n"
+                                   "  chk c1(clk, p); chk c2(clk, q); chk c3(clk, r);\n"
+                                   "  always #5 clk = ~clk;\n"
+                                   "  initial #7 $finish;\n"
+                                   "endmodule");
+    CHECK(contains(c.err, "inst v=1"));
+    CHECK(contains(c.err, "inst v=2"));
+    CHECK(contains(c.err, "inst v=3"));
+    CHECK_EQ(count_occ(c.err, "inst v="), 3u);
+}
+
 // Phase 1 guards: a deferred action that is not a severity report, or a deferred
 // assertion inside a function, is rejected loudly.
 TEST_CASE("deferred assertion: unsupported action / context rejected") {
