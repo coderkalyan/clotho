@@ -223,7 +223,10 @@ jobs:
           set -eu
           exe=build/clotho_test
           if [ -f "$exe.exe" ]; then exe="$exe.exe"; fi
-          "$exe"
+          # --duration names each case as it runs, so a hard crash (which prints
+          # no doctest summary at all) still identifies itself; --order-by=file
+          # keeps the sequence comparable across platforms.
+          "$exe" --duration=true --order-by=file
 
       # End-to-end proof the JIT actually executes on this host, independent of
       # the doctest harness: parse, lower, compile, run.
