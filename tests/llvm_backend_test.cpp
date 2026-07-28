@@ -1170,6 +1170,28 @@ TEST_CASE("$stop prints its own banner") {
     CHECK(err == "source:3: $stop called at 0 s\n");
 }
 
+// Level 2 appends the resource line (LRM Table 20-1). The numbers are host
+// state, so only the shape is pinned — but the shape is what carries the unit
+// normalization: getrusage reports ru_maxrss in kilobytes on Linux and bytes on
+// the BSDs (macOS), and Windows has no getrusage at all, so an unnormalized
+// read would silently misreport by 1024x on one host family and not build on
+// another.
+TEST_CASE("$finish(2) appends a memory and CPU-time line") {
+    constexpr std::string_view src = R"(
+        module m;
+            initial $finish(2);
+        endmodule
+    )";
+    const std::string err = run_capture_stderr(src);
+    CHECK(err.starts_with("source:3: $finish called at 0 s\n  Memory: "));
+    CHECK(err.find(" KB  CPU time: ") != std::string::npos);
+    CHECK(err.ends_with(" seconds\n"));
+    // A live process has a nonzero peak resident set on every supported host;
+    // a zero here means the query failed rather than that memory was free.
+    const size_t mem = err.find("Memory: ") + 8;
+    CHECK(std::stoull(err.substr(mem)) > 0);
+}
+
 // Level 0 prints nothing (LRM Table 20-1).
 TEST_CASE("$finish(0) prints no banner") {
     constexpr std::string_view src = R"(

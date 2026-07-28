@@ -4046,15 +4046,22 @@ extern "C" void rt_string_to_packed(const rt_string* s, uint8_t* out, uint32_t w
     }
 }
 
+// Coroutine frames may be over-aligned (16-byte plane spills) and malloc
+// guarantees only 16, so allocate with an explicit alignment. Aligned operator
+// new rather than C11 aligned_alloc: the latter is absent from the MSVC runtime
+// (which offers only the non-interchangeable _aligned_malloc/_aligned_free
+// pair). The nothrow form matters — this is called from JIT'd code across a C
+// ABI with no unwind tables, so a thrown bad_alloc could not propagate.
+namespace {
+constexpr std::align_val_t frame_align{64};
+}
+
 extern "C" void* rt_alloc(uint64_t size) {
-    // Coroutine frames may be over-aligned (16-byte plane spills); glibc
-    // malloc guarantees only 16, so align generously. aligned_alloc requires
-    // the size to be a multiple of the alignment.
-    return std::aligned_alloc(64, (size + 63) / 64 * 64);
+    return ::operator new(static_cast<size_t>(size), frame_align, std::nothrow);
 }
 
 extern "C" void rt_free(void* p) {
-    std::free(p);
+    ::operator delete(p, frame_align);
 }
 
 // -- Value-change dump (VCD, LRM §21.7; design in docs/VCD.md) --
