@@ -9,6 +9,7 @@
 
 #include "Lower.h"
 #include "PosixIo.h"
+#include "Subprocess.h"
 #include "ir/Jit.h"
 
 using namespace clotho;
@@ -24,7 +25,7 @@ struct ScratchDir {
     fs::path root;
     ScratchDir()
       : root(fs::temp_directory_path() /
-             fs::path("clotho_pp_" + std::to_string(::getpid()))) {
+             fs::path(test::detail::unique_stem())) {
         std::error_code ec;
         fs::remove_all(root, ec);
         fs::create_directories(root);
