@@ -49,10 +49,17 @@ jobs:
             {"name": "windows-arm64", "runner": "windows-11-arm", "arch": "aarch64", "experimental": true}
           ]
           JSON
+          # A `ci/`-prefixed branch opts into the full matrix on every push.
+          # GitHub only offers workflow_dispatch for workflows that already
+          # exist on the default branch, so without this there is no way to
+          # exercise the expensive platforms while iterating on CI itself.
           case "${{ github.event_name }}:${{ inputs.scope }}" in
             workflow_dispatch:linux-only) full=0 ;;
             workflow_dispatch:*|schedule:*) full=1 ;;
-            *) [ "${{ github.ref }}" = refs/heads/main ] && full=1 || full=0 ;;
+            *) case "${{ github.ref }}" in
+                 refs/heads/main|refs/heads/ci/*) full=1 ;;
+                 *) full=0 ;;
+               esac ;;
           esac
           if [ "$full" = 1 ]; then
             echo "matrix=$(jq -c . all.json)" >> "$GITHUB_OUTPUT"
