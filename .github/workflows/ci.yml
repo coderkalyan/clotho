@@ -160,9 +160,10 @@ jobs:
           msystem: ${{ matrix.msystem }}
           update: true
           # pacboy's `:p` suffix picks the environment's package prefix, so one
-          # list serves both CLANG64 and CLANGARM64.
+          # list serves both CLANG64 and CLANGARM64. Python is slang's — its
+          # CMakeLists requires an interpreter for its generated sources.
           pacboy: >-
-            llvm:p clang:p cmake:p ninja:p ccache:p
+            llvm:p clang:p cmake:p ninja:p ccache:p python:p
 
       # -- caches -----------------------------------------------------------
       # slang is pinned to a SHA, so FetchContent does a full (non-shallow)
