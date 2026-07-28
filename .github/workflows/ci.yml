@@ -158,13 +158,20 @@ jobs:
           tar -xf llvm.tar.xz -C C:\llvm --strip-components=1
           choco install ninja -y --no-progress
           # The Windows tarball ships no libLLVM dylib, so clotho links the
-          # component static libraries, and LLVMDebugInfoPDB's exported target
-          # hard-codes an absolute path to the DIA SDK's diaguids.lib as it
-          # existed on LLVM's own build machine. Report what this image actually
-          # has so a mismatch is diagnosable rather than a bare ninja error.
-          Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse `
-            -Filter diaguids.lib -ErrorAction SilentlyContinue |
-            ForEach-Object { Write-Host "diaguids: $($_.FullName)" }
+          # component static libraries — and LLVMDebugInfoPDB's exported target
+          # hard-codes the absolute path to the DIA SDK's diaguids.lib as it
+          # existed on LLVM's own build machine, under ".../Visual Studio/2022".
+          # This image ships Visual Studio 18, so that path does not exist and
+          # the link fails on a missing input. Alias the versioned directory
+          # rather than patch LLVM's exported CMake targets.
+          $baked = "C:\Program Files\Microsoft Visual Studio\2022"
+          $here  = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Directory |
+                   Where-Object { Test-Path "$($_.FullName)\Enterprise\DIA SDK" } |
+                   Select-Object -First 1
+          if ($here -and -not (Test-Path $baked)) {
+            Write-Host "aliasing $baked -> $($here.FullName) for the DIA SDK"
+            New-Item -ItemType Junction -Path $baked -Target $here.FullName | Out-Null
+          }
           "LLVM_DIR=C:/llvm/lib/cmake/llvm" | Out-File -Append $env:GITHUB_ENV
           "CC=C:/llvm/bin/clang-cl.exe"     | Out-File -Append $env:GITHUB_ENV
           "CXX=C:/llvm/bin/clang-cl.exe"    | Out-File -Append $env:GITHUB_ENV
