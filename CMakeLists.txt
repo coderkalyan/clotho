@@ -88,6 +88,16 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(slang)
 
+if(WIN32)
+  # slang pins its own build to C++20 while clotho is C++23. That is normally
+  # harmless, but expected-lite (which backs slang's nonstd::expected) forwards
+  # to std::expected exactly when <expected> is available — C++23 on the MSVC
+  # STL. So slang compiles SyntaxTree::fromFile returning its own expected type
+  # while clotho calls one returning std::expected, and the link fails on the
+  # mangled mismatch. Build slang at clotho's standard so both agree.
+  set_target_properties(slang_slang PROPERTIES CXX_STANDARD 23)
+endif()
+
 # Header-only: SOURCE_SUBDIR none skips doctest's own CMakeLists (its
 # cmake_minimum_required predates CMake 4) and just populates the source.
 FetchContent_Declare(
@@ -125,6 +135,24 @@ if(WIN32)
   # $finish(2)'s resource line has no getrusage here; it reads peak working set
   # through GetProcessMemoryInfo (psapi).
   target_link_libraries(clotho_runtime PRIVATE psapi)
+
+  # The runtime's wide arithmetic is `unsigned __int128`, whose division lowers
+  # to compiler-rt's __udivti3 / __umodti3. The MSVC CRT has no such routines
+  # and clang-cl does not link compiler-rt's builtins by default, so name the
+  # archive that ships alongside the compiler.
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    get_filename_component(clotho_llvm_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    file(GLOB clotho_crt_builtins
+         "${clotho_llvm_bin}/../lib/clang/*/lib/windows/clang_rt.builtins-*.lib")
+    if(clotho_crt_builtins)
+      list(GET clotho_crt_builtins 0 clotho_crt_builtin)
+      message(STATUS "compiler-rt builtins: ${clotho_crt_builtin}")
+      target_link_libraries(clotho_runtime PUBLIC "${clotho_crt_builtin}")
+    else()
+      message(WARNING "compiler-rt builtins not found under ${clotho_llvm_bin}/../lib/clang; "
+                      "128-bit arithmetic will not link")
+    endif()
+  endif()
 endif()
 # Always optimize the runtime, even in a Debug build. It is stable native code
 # the JIT'd design calls into on every event; at -O0 its trivial leaf functions
