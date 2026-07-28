@@ -81,6 +81,12 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    # Per-step `shell:` cannot see the matrix context; the job-level default
+    # can. Windows runs every step inside the MSYS2 environment, everything
+    # else in plain bash.
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
     steps:
       - uses: actions/checkout@v4
 
@@ -178,7 +184,6 @@ jobs:
 
       # -- build and test ---------------------------------------------------
       - name: Configure
-        shell: ${{ matrix.shell }}
         run: |
           set -eux
           # Deliberately not a bash array: the macOS runners' /bin/bash is 3.2,
@@ -193,11 +198,9 @@ jobs:
             $launcher
 
       - name: Build
-        shell: ${{ matrix.shell }}
         run: cmake --build build --target clotho_test clotho_cli
 
       - name: Test
-        shell: ${{ matrix.shell }}
         run: |
           set -eu
           exe=build/clotho_test
@@ -210,7 +213,6 @@ jobs:
       # End-to-end proof the JIT actually executes on this host, independent of
       # the doctest harness: parse, lower, compile, run.
       - name: Smoke test the CLI
-        shell: ${{ matrix.shell }}
         run: |
           set -eux
           exe=build/clotho
@@ -221,5 +223,4 @@ jobs:
 
       - name: ccache statistics
         if: always()
-        shell: ${{ matrix.shell }}
         run: ccache --show-stats
