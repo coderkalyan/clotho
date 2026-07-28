@@ -72,8 +72,8 @@ set(CMAKE_DISABLE_FIND_PACKAGE_fmt ON)
 
 if(WIN32)
   # slang defaults to mimalloc, whose malloc/free/realloc/_msize overrides
-  # collide with the MSVC CRT's own at link time (lld-link reports every one as
-  # a duplicate symbol). It is an allocator speedup, not a dependency of any
+  # collide with the Windows CRT's own at link time (lld-link reports every one
+  # as a duplicate symbol). It is an allocator speedup, not a dependency of any
   # slang API clotho uses.
   set(SLANG_USE_MIMALLOC OFF CACHE BOOL "" FORCE)
 endif()
@@ -139,8 +139,9 @@ if(WIN32)
   # The runtime's wide arithmetic is `unsigned __int128`, whose division lowers
   # to compiler-rt's __udivti3 / __umodti3. The MSVC CRT has no such routines
   # and clang-cl does not link compiler-rt's builtins by default, so name the
-  # archive that ships alongside the compiler.
-  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  # archive that ships alongside the compiler. A MinGW-w64 clang links its own
+  # builtins and needs none of this.
+  if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     get_filename_component(clotho_llvm_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
     file(GLOB clotho_crt_builtins
          "${clotho_llvm_bin}/../lib/clang/*/lib/windows/clang_rt.builtins-*.lib")

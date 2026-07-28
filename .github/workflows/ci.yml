@@ -44,12 +44,12 @@ jobs:
           set -euo pipefail
           cat > all.json <<'JSON'
           [
-            {"name": "linux-x64",     "runner": "ubuntu-24.04"},
-            {"name": "linux-arm64",   "runner": "ubuntu-24.04-arm"},
-            {"name": "macos-arm64",   "runner": "macos-15"},
-            {"name": "macos-x64",     "runner": "macos-15-intel"},
-            {"name": "windows-x64",   "runner": "windows-2025",  "arch": "x86_64",  "experimental": true},
-            {"name": "windows-arm64", "runner": "windows-11-arm", "arch": "aarch64", "experimental": true}
+            {"name": "linux-x64",     "runner": "ubuntu-24.04",    "shell": "bash"},
+            {"name": "linux-arm64",   "runner": "ubuntu-24.04-arm", "shell": "bash"},
+            {"name": "macos-arm64",   "runner": "macos-15",        "shell": "bash"},
+            {"name": "macos-x64",     "runner": "macos-15-intel",  "shell": "bash"},
+            {"name": "windows-x64",   "runner": "windows-2025",   "msystem": "CLANG64",    "shell": "msys2 {0}", "experimental": true},
+            {"name": "windows-arm64", "runner": "windows-11-arm",  "msystem": "CLANGARM64", "shell": "msys2 {0}", "experimental": true}
           ]
           JSON
           # A `ci/`-prefixed branch opts into the full matrix on every push.
@@ -138,48 +138,25 @@ jobs:
           # Homebrew's, which has the symbol, so turn them off.
           echo "CXXFLAGS=-D_LIBCPP_DISABLE_AVAILABILITY" >> "$GITHUB_ENV"
 
-      - name: Set up MSVC environment (Windows)
+      # MSYS2's CLANG64/CLANGARM64 environments package LLVM 22.1.8 — the exact
+      # pin — as a MinGW-w64/UCRT build, so Windows uses clang with libc++ and
+      # no MSVC ABI, CRT or STL anywhere. That is not only a toolchain
+      # preference: against the MSVC-ABI release tarball this build also had to
+      # work around a DIA SDK path baked into LLVM's exported targets, an
+      # expected-lite/std::expected divergence in the MSVC STL, mimalloc
+      # colliding with the CRT's allocator symbols, compiler-rt's builtins not
+      # being linked, and an import library clobbering a static archive of the
+      # same name. None of those exist here.
+      - name: Set up MSYS2 and LLVM (Windows)
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: msys2/setup-msys2@v2
         with:
-          arch: ${{ matrix.name == 'windows-arm64' && 'arm64' || 'x64' }}
-
-      - name: Install LLVM and toolchain (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          # No package manager ships LLVM dev libraries usable from MSVC, so
-          # take the official release tarball. Not cached: ~3.5 GB extracted
-          # would evict everything else from the 10 GB repo cache budget.
-          $tag = "llvmorg-$env:LLVM_RELEASE"
-          $asset = "clang+llvm-$env:LLVM_RELEASE-$($env:MATRIX_ARCH)-pc-windows-msvc.tar.xz"
-          $url = "https://github.com/llvm/llvm-project/releases/download/$tag/$asset"
-          Write-Host "downloading $url"
-          curl.exe -fsSL -o llvm.tar.xz $url
-          New-Item -ItemType Directory -Force -Path C:\llvm | Out-Null
-          tar -xf llvm.tar.xz -C C:\llvm --strip-components=1
-          choco install ninja -y --no-progress
-          # The Windows tarball ships no libLLVM dylib, so clotho links the
-          # component static libraries — and LLVMDebugInfoPDB's exported target
-          # hard-codes the absolute path to the DIA SDK's diaguids.lib as it
-          # existed on LLVM's own build machine, under ".../Visual Studio/2022".
-          # This image ships Visual Studio 18, so that path does not exist and
-          # the link fails on a missing input. Alias the versioned directory
-          # rather than patch LLVM's exported CMake targets.
-          $baked = "C:\Program Files\Microsoft Visual Studio\2022"
-          $here  = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Directory |
-                   Where-Object { Test-Path "$($_.FullName)\Enterprise\DIA SDK" } |
-                   Select-Object -First 1
-          if ($here -and -not (Test-Path $baked)) {
-            Write-Host "aliasing $baked -> $($here.FullName) for the DIA SDK"
-            New-Item -ItemType Junction -Path $baked -Target $here.FullName | Out-Null
-          }
-          "LLVM_DIR=C:/llvm/lib/cmake/llvm" | Out-File -Append $env:GITHUB_ENV
-          "CC=C:/llvm/bin/clang-cl.exe"     | Out-File -Append $env:GITHUB_ENV
-          "CXX=C:/llvm/bin/clang-cl.exe"    | Out-File -Append $env:GITHUB_ENV
-        env:
-          MATRIX_ARCH: ${{ matrix.arch }}
+          msystem: ${{ matrix.msystem }}
+          update: true
+          # pacboy's `:p` suffix picks the environment's package prefix, so one
+          # list serves both CLANG64 and CLANGARM64.
+          pacboy: >-
+            llvm:p clang:p cmake:p ninja:p ccache:p
 
       # -- caches -----------------------------------------------------------
       # slang is pinned to a SHA, so FetchContent does a full (non-shallow)
@@ -193,7 +170,6 @@ jobs:
           key: deps-${{ matrix.name }}-${{ hashFiles('CMakeLists.txt') }}
 
       - name: Cache ccache
-        if: runner.os != 'Windows'
         uses: actions/cache@v4
         with:
           path: ${{ env.CCACHE_DIR }}
@@ -202,7 +178,7 @@ jobs:
 
       # -- build and test ---------------------------------------------------
       - name: Configure
-        shell: bash
+        shell: ${{ matrix.shell }}
         run: |
           set -eux
           # Deliberately not a bash array: the macOS runners' /bin/bash is 3.2,
@@ -217,11 +193,11 @@ jobs:
             $launcher
 
       - name: Build
-        shell: bash
+        shell: ${{ matrix.shell }}
         run: cmake --build build --target clotho_test clotho_cli
 
       - name: Test
-        shell: bash
+        shell: ${{ matrix.shell }}
         run: |
           set -eu
           exe=build/clotho_test
@@ -234,7 +210,7 @@ jobs:
       # End-to-end proof the JIT actually executes on this host, independent of
       # the doctest harness: parse, lower, compile, run.
       - name: Smoke test the CLI
-        shell: bash
+        shell: ${{ matrix.shell }}
         run: |
           set -eux
           exe=build/clotho
@@ -244,6 +220,6 @@ jobs:
           [ "$out" = "Hello, world!" ]
 
       - name: ccache statistics
-        if: always() && runner.os != 'Windows'
-        shell: bash
+        if: always()
+        shell: ${{ matrix.shell }}
         run: ccache --show-stats
