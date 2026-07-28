@@ -4,10 +4,10 @@
 #include <string_view>
 
 #include "Lower.h"
+#include "PosixIo.h"
 #include "ir/Jit.h"
 
 #include <cstdio>
-#include <unistd.h>
 
 using namespace clotho;
 

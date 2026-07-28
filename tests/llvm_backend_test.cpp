@@ -9,11 +9,10 @@
 #include <string>
 #include <string_view>
 
-#include <unistd.h>
-
 #include <llvm/Support/raw_ostream.h>
 
 #include "Lower.h"
+#include "PosixIo.h"
 #include "ir/Builder.h"
 #include "ir/Jit.h"
 #include "ir/LlvmBackend.h"

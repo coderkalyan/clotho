@@ -12,8 +12,7 @@
 #include <string_view>
 #include <vector>
 
-#include <unistd.h>
-
+#include "PosixIo.h"
 #include "runtime/Runtime.h"
 #include "runtime/svdpi.h"
 

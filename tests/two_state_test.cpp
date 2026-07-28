@@ -4,11 +4,11 @@
 #include <string_view>
 
 #include "Lower.h"
+#include "PosixIo.h"
 #include "ir/Jit.h"
 #include "ir/LlvmBackend.h"
 
 #include <cstdio>
-#include <unistd.h>
 
 #include <llvm/Support/raw_ostream.h>
 

@@ -4,9 +4,8 @@
 #include <string>
 #include <string_view>
 
-#include <unistd.h>
-
 #include "Lower.h"
+#include "PosixIo.h"
 #include "ir/Jit.h"
 #include "runtime/svdpi.h"
 

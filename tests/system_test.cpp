@@ -4,12 +4,12 @@
 #include <string_view>
 
 #include "Lower.h"
+#include "PosixIo.h"
 #include "ir/Jit.h"
 #include "ir/SimConfig.h"
 
 #include <cstdio>
 #include <string>
-#include <unistd.h>
 
 // $system shell-exec task (LRM §20.17.1). Clotho takes a deliberate, security-
 // motivated exception to LRM compliance here: $system is refused by default and
