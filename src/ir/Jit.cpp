@@ -36,6 +36,12 @@
 #include "runtime/Runtime.h"
 #include "runtime/svdpi.h"
 
+#if defined(__MINGW32__)
+// libgcc's stack-probe helper. Declared here only to take its address; the
+// calling convention is private to the compiler, so it is never called from C++.
+extern "C" void ___chkstk_ms(void);
+#endif
+
 namespace clotho::ir {
 
 namespace {
@@ -358,6 +364,20 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("memcpy", &std::memcpy);
     expose("memmove", &std::memmove);
     expose("memcmp", &std::memcmp);
+#if defined(__MINGW32__)
+    // Two symbols a MinGW target emits that live in the static CRT and libgcc,
+    // where the process-symbol generator below cannot see them:
+    //
+    //   __main        — the static-constructor hook LLVM plants at the top of
+    //                   any function literally named `main`, which is what the
+    //                   design's entry point is called. A JIT'd module has no
+    //                   C++ constructors to run, and calling the host's would
+    //                   re-enter its global init, so bind a no-op.
+    //   ___chkstk_ms  — the stack-probe helper for frames larger than a page.
+    //                   Process bodies with wide state hit this readily.
+    expose("__main", +[] {});
+    expose("___chkstk_ms", &___chkstk_ms);
+#endif
     if (auto err = jd.define(llvm::orc::absoluteSymbols(std::move(rt_syms)))) {
         llvm::errs() << "jit: " << llvm::toString(std::move(err)) << "\n";
         return -1;
