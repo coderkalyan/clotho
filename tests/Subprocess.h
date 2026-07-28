@@ -84,7 +84,14 @@ inline std::string run_design_subprocess(std::string_view source) {
 
     std::fflush(stdout);
     const int rc = std::system(cmd.c_str());
-    static_cast<void>(rc); // The design's own output is the assertion, not its status.
+    // The design's own output is the assertion, not its exit status — a design
+    // that ends in $finish(1) is expected to exit nonzero. But a spawn that
+    // never ran (no shell, or a fork that failed under memory pressure) yields
+    // empty output and would otherwise surface as an unhelpful text diff.
+    if (rc == -1 || rc == 127) {
+        std::fprintf(stderr, "run_design_subprocess: could not spawn '%s' (rc %d)\n",
+                     cmd.c_str(), rc);
+    }
 
     std::string text = detail::read_file(out);
     std::error_code ec;

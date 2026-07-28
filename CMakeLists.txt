@@ -70,6 +70,14 @@ endif()
 # pinned source build so every host resolves fmt identically.
 set(CMAKE_DISABLE_FIND_PACKAGE_fmt ON)
 
+if(WIN32)
+  # slang defaults to mimalloc, whose malloc/free/realloc/_msize overrides
+  # collide with the MSVC CRT's own at link time (lld-link reports every one as
+  # a duplicate symbol). It is an allocator speedup, not a dependency of any
+  # slang API clotho uses.
+  set(SLANG_USE_MIMALLOC OFF CACHE BOOL "" FORCE)
+endif()
+
 FetchContent_Declare(
   slang
   GIT_REPOSITORY https://github.com/MikePopoloski/slang.git

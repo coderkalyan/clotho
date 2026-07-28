@@ -1,15 +1,17 @@
 #include <doctest/doctest.h>
 
+#include <filesystem>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 #include "Lower.h"
 #include "PosixIo.h"
+#include "Subprocess.h"
 #include "ir/Jit.h"
 #include "ir/SimConfig.h"
 
 #include <cstdio>
-#include <string>
 
 // $system shell-exec task (LRM §20.17.1). Clotho takes a deliberate, security-
 // motivated exception to LRM compliance here: $system is refused by default and
@@ -121,16 +123,26 @@ TEST_CASE("$system no-arg form probes for a shell") {
 }
 
 TEST_CASE("$system task form runs the command for its side effect") {
-    // Touch a unique marker file, then confirm it was created. Exercises the
+    // Create a unique marker file, then confirm it exists. Exercises the
     // task-statement path (return value discarded) and a real exec side effect.
-    const std::string marker =
-      "/tmp/clotho_system_test_" + std::to_string(getpid()) + ".marker";
-    std::remove(marker.c_str());
+    // The command is the one thing here that cannot be written portably — the
+    // point of $system is to hand a line to whatever shell the host has.
+    const std::filesystem::path marker =
+      std::filesystem::temp_directory_path() / (test::detail::unique_stem() + ".marker");
+    std::error_code ec;
+    std::filesystem::remove(marker, ec);
 
-    const std::string src = "module m; initial begin $system(\"touch " + marker +
-                            "\"); $finish; end endmodule";
+    // generic_string(), not string(): a Windows path's backslashes would be
+    // escape sequences inside the SystemVerilog string literal below.
+#if defined(_WIN32)
+    const std::string cmd = "type nul > " + marker.generic_string();
+#else
+    const std::string cmd = "touch '" + marker.generic_string() + "'";
+#endif
+    const std::string src =
+      "module m; initial begin $system(\"" + cmd + "\"); $finish; end endmodule";
     run_capture(src, ir::SystemAccess::Full);
 
-    CHECK(access(marker.c_str(), F_OK) == 0);
-    std::remove(marker.c_str());
+    CHECK(std::filesystem::exists(marker));
+    std::filesystem::remove(marker, ec);
 }
