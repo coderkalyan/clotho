@@ -5,6 +5,9 @@ name: CI
 # every platform runs on main, nightly, and on demand.
 on:
   push:
+    # A documentation-only push should not spend six platforms' worth of
+    # minutes. GitHub skips the run only when every changed path matches.
+    paths-ignore: ["docs/**", "**/*.md"]
   pull_request:
   schedule:
     - cron: "0 7 * * *"
