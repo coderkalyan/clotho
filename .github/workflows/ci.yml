@@ -1,0 +1,211 @@
+name: CI
+
+# Tiered by trigger, because GitHub bills macOS at 10x and Windows at 2x the
+# Linux minute rate. Feature-branch pushes get the cheap Linux x64 job only;
+# every platform runs on main, nightly, and on demand.
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Platforms to run
+        type: choice
+        options: [all, linux-only]
+        default: all
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # apt.llvm.org / Homebrew track the major; the Windows tarball is pinned to an
+  # exact patch. Clotho's CMakeLists hard-requires major 22.
+  LLVM_MAJOR: "22"
+  LLVM_RELEASE: "22.1.8"
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 1G
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > all.json <<'JSON'
+          [
+            {"name": "linux-x64",     "runner": "ubuntu-24.04"},
+            {"name": "linux-arm64",   "runner": "ubuntu-24.04-arm"},
+            {"name": "macos-arm64",   "runner": "macos-15"},
+            {"name": "macos-x64",     "runner": "macos-15-intel"},
+            {"name": "windows-x64",   "runner": "windows-2025",  "arch": "x86_64",  "experimental": true},
+            {"name": "windows-arm64", "runner": "windows-11-arm", "arch": "aarch64", "experimental": true}
+          ]
+          JSON
+          case "${{ github.event_name }}:${{ inputs.scope }}" in
+            workflow_dispatch:linux-only) full=0 ;;
+            workflow_dispatch:*|schedule:*) full=1 ;;
+            *) [ "${{ github.ref }}" = refs/heads/main ] && full=1 || full=0 ;;
+          esac
+          if [ "$full" = 1 ]; then
+            echo "matrix=$(jq -c . all.json)" >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix=$(jq -c '[.[0]]' all.json)" >> "$GITHUB_OUTPUT"
+          fi
+          echo "full tier: $full"
+
+  build:
+    name: ${{ matrix.name }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    # Windows has never been built; it is wired up for signal, not as a gate.
+    continue-on-error: ${{ matrix.experimental == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # -- toolchain --------------------------------------------------------
+      # LLVM is never built here: a source build is tens of minutes and the
+      # pin moves at most twice a year. Each platform takes the cheapest
+      # prebuilt that ships the CMake package and the dev libraries.
+      - name: Install LLVM and toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          . /etc/os-release
+          echo "deb http://apt.llvm.org/$VERSION_CODENAME/ llvm-toolchain-$VERSION_CODENAME-$LLVM_MAJOR main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          # g++-14, not the distro-default 13: <print> landed in GCC 14's
+          # libstdc++ and src/main.cpp uses it. The -dev packages are what
+          # LLVM's exported CMake targets link against.
+          sudo apt-get install -y --no-install-recommends \
+            llvm-$LLVM_MAJOR-dev g++-14 ninja-build ccache \
+            zlib1g-dev libzstd-dev libxml2-dev libncurses-dev libedit-dev
+          echo "LLVM_DIR=/usr/lib/llvm-$LLVM_MAJOR/lib/cmake/llvm" >> "$GITHUB_ENV"
+          echo "CC=gcc-14"   >> "$GITHUB_ENV"
+          echo "CXX=g++-14"  >> "$GITHUB_ENV"
+
+      - name: Install LLVM and toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euxo pipefail
+          # llvm@22 is currently an alias of the `llvm` formula and becomes a
+          # real versioned formula once 23 ships; fall back while it is an alias
+          # only in name.
+          brew install ninja ccache
+          brew install llvm@$LLVM_MAJOR || brew install llvm
+          prefix=$(brew --prefix llvm@$LLVM_MAJOR 2>/dev/null || brew --prefix llvm)
+          "$prefix/bin/clang++" --version
+          echo "LLVM_DIR=$prefix/lib/cmake/llvm" >> "$GITHUB_ENV"
+          echo "CC=$prefix/bin/clang"    >> "$GITHUB_ENV"
+          echo "CXX=$prefix/bin/clang++" >> "$GITHUB_ENV"
+          # Use Homebrew LLVM's own libc++, not the SDK's: Apple's ships <print>
+          # behind availability guards that reject a low deployment target.
+          # CMake seeds CMAKE_EXE_LINKER_FLAGS from LDFLAGS at first configure.
+          echo "LDFLAGS=-L$prefix/lib/c++ -L$prefix/lib/unwind -lunwind -Wl,-rpath,$prefix/lib/c++" \
+            >> "$GITHUB_ENV"
+
+      - name: Set up MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.name == 'windows-arm64' && 'arm64' || 'x64' }}
+
+      - name: Install LLVM and toolchain (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # No package manager ships LLVM dev libraries usable from MSVC, so
+          # take the official release tarball. Not cached: ~3.5 GB extracted
+          # would evict everything else from the 10 GB repo cache budget.
+          $tag = "llvmorg-$env:LLVM_RELEASE"
+          $asset = "clang+llvm-$env:LLVM_RELEASE-$($env:MATRIX_ARCH)-pc-windows-msvc.tar.xz"
+          $url = "https://github.com/llvm/llvm-project/releases/download/$tag/$asset"
+          Write-Host "downloading $url"
+          curl.exe -fsSL -o llvm.tar.xz $url
+          New-Item -ItemType Directory -Force -Path C:\llvm | Out-Null
+          tar -xf llvm.tar.xz -C C:\llvm --strip-components=1
+          choco install ninja -y --no-progress
+          "LLVM_DIR=C:/llvm/lib/cmake/llvm" | Out-File -Append $env:GITHUB_ENV
+          "CC=C:/llvm/bin/clang-cl.exe"     | Out-File -Append $env:GITHUB_ENV
+          "CXX=C:/llvm/bin/clang-cl.exe"    | Out-File -Append $env:GITHUB_ENV
+        env:
+          MATRIX_ARCH: ${{ matrix.arch }}
+
+      # -- caches -----------------------------------------------------------
+      # slang is pinned to a SHA, so FetchContent does a full (non-shallow)
+      # clone of it every run. Cache the populated sources, keyed on the pins.
+      - name: Cache fetched dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/_deps/*-src
+            build/_deps/*-subbuild
+          key: deps-${{ matrix.name }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Cache ccache
+        if: runner.os != 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ matrix.name }}-${{ github.sha }}
+          restore-keys: ccache-${{ matrix.name }}-
+
+      # -- build and test ---------------------------------------------------
+      - name: Configure
+        shell: bash
+        run: |
+          set -eux
+          # Deliberately not a bash array: the macOS runners' /bin/bash is 3.2,
+          # where expanding an empty array under `set -u` is an error.
+          launcher=
+          if command -v ccache > /dev/null; then
+            launcher="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          fi
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
+            $launcher
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --target clotho_test clotho_cli
+
+      - name: Test
+        shell: bash
+        run: |
+          set -eu
+          exe=build/clotho_test
+          if [ -f "$exe.exe" ]; then exe="$exe.exe"; fi
+          "$exe"
+
+      # End-to-end proof the JIT actually executes on this host, independent of
+      # the doctest harness: parse, lower, compile, run.
+      - name: Smoke test the CLI
+        shell: bash
+        run: |
+          set -eux
+          exe=build/clotho
+          if [ -f "$exe.exe" ]; then exe="$exe.exe"; fi
+          out=$("$exe" examples/initial.v)
+          echo "$out"
+          [ "$out" = "Hello, world!" ]
+
+      - name: ccache statistics
+        if: always() && runner.os != 'Windows'
+        shell: bash
+        run: ccache --show-stats
