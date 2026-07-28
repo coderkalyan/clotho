@@ -36,9 +36,10 @@
 #include "runtime/Runtime.h"
 #include "runtime/svdpi.h"
 
-#if defined(__MINGW32__)
-// libgcc's stack-probe helper. Declared here only to take its address; the
-// calling convention is private to the compiler, so it is never called from C++.
+#if defined(__MINGW32__) && defined(__x86_64__)
+// libgcc's stack-probe helper, x86_64-only — AArch64 Windows has no such
+// symbol. Declared here only to take its address; the calling convention is
+// private to the compiler, so it is never called from C++.
 extern "C" void ___chkstk_ms(void);
 #endif
 
@@ -373,10 +374,13 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     //                   design's entry point is called. A JIT'd module has no
     //                   C++ constructors to run, and calling the host's would
     //                   re-enter its global init, so bind a no-op.
-    //   ___chkstk_ms  — the stack-probe helper for frames larger than a page.
-    //                   Process bodies with wide state hit this readily.
+    //   ___chkstk_ms  — the stack-probe helper for frames larger than a page,
+    //                   which process bodies with wide state reach readily.
+    //                   x86_64 only; AArch64 Windows has no such symbol.
     expose("__main", +[] {});
+#if defined(__x86_64__)
     expose("___chkstk_ms", &___chkstk_ms);
+#endif
 #endif
     if (auto err = jd.define(llvm::orc::absoluteSymbols(std::move(rt_syms)))) {
         llvm::errs() << "jit: " << llvm::toString(std::move(err)) << "\n";
