@@ -70,6 +70,19 @@ endif()
 # pinned source build so every host resolves fmt identically.
 set(CMAKE_DISABLE_FIND_PACKAGE_fmt ON)
 
+if(WIN32 AND NOT MSVC)
+  # $finish longjmps out of the middle of a simulation, back to the setjmp in
+  # run_jit, deliberately abandoning the JIT'd coroutine frames it jumps over.
+  # Windows' longjmp is SEH-based: it *unwinds*, which needs valid unwind data
+  # for every frame in between, and JIT'd code registers none — so the unwind
+  # aborts the process instead of returning to the host. mingw-w64 selects the
+  # plain non-unwinding `_setjmp(buf, NULL)` when this is defined, which is the
+  # semantics clotho wants (and what glibc and Darwin already give it). Applied
+  # as a compile definition rather than a #define so it precedes every
+  # transitive <setjmp.h>.
+  add_compile_definitions(__USE_MINGW_SETJMP_NON_APP_CONTEXT)
+endif()
+
 if(WIN32)
   # slang defaults to mimalloc, whose malloc/free/realloc/_msize overrides
   # collide with the Windows CRT's own at link time (lld-link reports every one
