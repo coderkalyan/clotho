@@ -196,6 +196,15 @@ target_link_libraries(clotho PRIVATE clotho_warnings)
 # Thin build driver.
 add_executable(clotho_cli src/main.cpp)
 set_target_properties(clotho_cli PROPERTIES OUTPUT_NAME clotho)
+if(WIN32)
+  # The `clotho` static library archives to clotho.lib, and this executable is
+  # named clotho — so the import library the linker writes beside clotho.exe
+  # takes the same path and clobbers the archive. The next link then resolves
+  # nothing from it (clotho_test fails on exactly the frontend's symbols, while
+  # clotho_ir's resolve). Give the archive its own name; nothing outside the
+  # build refers to it.
+  set_target_properties(clotho PROPERTIES ARCHIVE_OUTPUT_NAME clotho_frontend)
+endif()
 target_link_libraries(clotho_cli PRIVATE clotho clotho_warnings)
 
 # Single doctest executable aggregating every tests/*.cpp.
