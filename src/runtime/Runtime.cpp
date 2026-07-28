@@ -5,6 +5,7 @@
 #include <bit>
 #include <cerrno>
 #include <charconv>
+#include <cinttypes>
 #include <condition_variable>
 #include <csetjmp>
 #include <cstddef>
@@ -21,7 +22,14 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <psapi.h>
+#else
 #include <sys/resource.h>
+#endif
 
 #include <ankerl/unordered_dense.h>
 
@@ -2757,6 +2765,47 @@ void append_finish_time(std::string& out, uint64_t now) {
     }
 }
 
+// Peak resident set (in kilobytes) and total process CPU time, for the
+// $finish(2) resource line. Normalizing the unit here matters: getrusage
+// reports ru_maxrss in kilobytes on Linux but in *bytes* on the BSDs (macOS
+// included), so reading the field raw would overstate macOS by 1024x. Windows
+// has no getrusage at all and goes through the Win32 equivalents.
+struct FinishStats {
+    uint64_t peak_rss_kb;
+    double   cpu_seconds;
+};
+
+FinishStats finish_stats() {
+#if defined(_WIN32)
+    // FILETIME counts 100-nanosecond ticks; the creation/exit pair is unused.
+    FILETIME creation = {}, exited = {}, kernel = {}, user = {};
+    double   cpu = 0.0;
+    if (GetProcessTimes(GetCurrentProcess(), &creation, &exited, &kernel, &user)) {
+        const auto ticks = [](const FILETIME& ft) {
+            return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+        };
+        cpu = static_cast<double>(ticks(kernel) + ticks(user)) / 1e7;
+    }
+    PROCESS_MEMORY_COUNTERS pmc = {};
+    uint64_t                rss_kb = 0;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        rss_kb = static_cast<uint64_t>(pmc.PeakWorkingSetSize) / 1024;
+    }
+    return {rss_kb, cpu};
+#else
+    rusage ru = {};
+    getrusage(RUSAGE_SELF, &ru);
+    const double cpu = static_cast<double>(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) +
+                       static_cast<double>(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
+#if defined(__APPLE__)
+    const uint64_t rss_kb = static_cast<uint64_t>(ru.ru_maxrss) / 1024;
+#else
+    const uint64_t rss_kb = static_cast<uint64_t>(ru.ru_maxrss);
+#endif
+    return {rss_kb, cpu};
+#endif
+}
+
 } // namespace
 
 extern "C" void rt_finish_host(void* env) {
@@ -2771,13 +2820,11 @@ extern "C" void rt_finish(const char* banner, uint64_t now, int32_t arg) {
         line += " called at ";
         append_finish_time(line, now);
         if (arg >= 2) {
-            rusage ru;
-            getrusage(RUSAGE_SELF, &ru);
-            const double cpu = static_cast<double>(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) +
-                               static_cast<double>(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
-            char stats[128];
-            std::snprintf(stats, sizeof(stats), "\n  Memory: %ld KB  CPU time: %.3f seconds",
-                          ru.ru_maxrss, cpu);
+            const FinishStats st = finish_stats();
+            char              stats[128];
+            std::snprintf(stats, sizeof(stats),
+                          "\n  Memory: %" PRIu64 " KB  CPU time: %.3f seconds", st.peak_rss_kb,
+                          st.cpu_seconds);
             line += stats;
         }
         line += '\n';

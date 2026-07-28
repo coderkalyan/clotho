@@ -11,21 +11,36 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
 
-# Warnings apply to clotho targets only, not fetched dependencies.
+# Warnings apply to clotho targets only, not fetched dependencies. The flags are
+# GCC/Clang spelling; a cl-style driver (MSVC, or clang-cl) takes the /-forms.
+# Note clotho cannot be built by MSVC proper regardless — the runtime's wide
+# arithmetic uses `unsigned __int128`, which only GCC and Clang provide — so the
+# cl-style branch exists for clang-cl.
 add_library(clotho_warnings INTERFACE)
-target_compile_options(clotho_warnings INTERFACE
-  -Wall -Wextra
-  # Omitted aggregate members value-initialize; flagging them fights the
-  # designated-initializer style used throughout.
-  -Wno-missing-field-initializers
-  # The IR layer's correctness story for adding ops rests on exhaustive
-  # switches over Inst::Tag in several consumers; a silently non-exhaustive
-  # switch is a miscompile factory, so promote it to an error.
-  -Werror=switch
-)
+if(MSVC)
+  target_compile_options(clotho_warnings INTERFACE
+    /W4
+    # See the -Werror=switch rationale below.
+    /we4062
+  )
+else()
+  target_compile_options(clotho_warnings INTERFACE
+    -Wall -Wextra
+    # Omitted aggregate members value-initialize; flagging them fights the
+    # designated-initializer style used throughout.
+    -Wno-missing-field-initializers
+    # The IR layer's correctness story for adding ops rests on exhaustive
+    # switches over Inst::Tag in several consumers; a silently non-exhaustive
+    # switch is a miscompile factory, so promote it to an error.
+    -Werror=switch
+  )
+endif()
 
 option(CLOTHO_SANITIZE "Build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
 if(CLOTHO_SANITIZE)
+  if(MSVC)
+    message(FATAL_ERROR "CLOTHO_SANITIZE requires a GCC/Clang driver")
+  endif()
   add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
   add_link_options(-fsanitize=address,undefined)
 endif()
@@ -45,6 +60,15 @@ if(TARGET LLVM)
 else()
   llvm_map_components_to_libnames(LLVM_LIBS core support orcjit jitlink native bitwriter bitreader)
 endif()
+
+# slang declares fmt with `FIND_PACKAGE_ARGS 12.1`, so FetchContent silently
+# prefers a system fmt over the pinned 12.1.0 it would otherwise fetch. That
+# makes the build depend on whatever the host distro ships: a host fmt that is
+# ABI- or API-divergent from the pin breaks the slang build outright (Arch's
+# 12.1.0 does — `fmt::format` is not visible through the headers slang
+# includes), and it silently varies the toolchain across CI platforms. Force the
+# pinned source build so every host resolves fmt identically.
+set(CMAKE_DISABLE_FIND_PACKAGE_fmt ON)
 
 FetchContent_Declare(
   slang
@@ -89,6 +113,11 @@ target_include_directories(clotho_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src
 # associative-array storage (LRM 7.8/7.9). This adds only its include dir, not a
 # link dependency, keeping the runtime otherwise dependency-free.
 target_link_libraries(clotho_runtime PRIVATE clotho_warnings unordered_dense::unordered_dense)
+if(WIN32)
+  # $finish(2)'s resource line has no getrusage here; it reads peak working set
+  # through GetProcessMemoryInfo (psapi).
+  target_link_libraries(clotho_runtime PRIVATE psapi)
+endif()
 # Always optimize the runtime, even in a Debug build. It is stable native code
 # the JIT'd design calls into on every event; at -O0 its trivial leaf functions
 # (unwrap, WheelImpl accessors) stop inlining and the timing wheel reads as pure
@@ -97,7 +126,10 @@ target_link_libraries(clotho_runtime PRIVATE clotho_warnings unordered_dense::un
 # there (asserts stay live — NDEBUG is not forced, so the runtime keeps its
 # safety checks). Release / RelWithDebInfo already optimize; the genex leaves
 # them untouched.
-target_compile_options(clotho_runtime PRIVATE $<$<CONFIG:Debug>:-O3>)
+target_compile_options(clotho_runtime PRIVATE
+  $<$<AND:$<CONFIG:Debug>,$<NOT:$<BOOL:${MSVC}>>>:-O3>
+  $<$<AND:$<CONFIG:Debug>,$<BOOL:${MSVC}>>:/O2>
+)
 
 # Backend IR + passes. Target-agnostic, no slang dependency: handles the bulk
 # of compiler logic short of the slang -> IR translation layer.
