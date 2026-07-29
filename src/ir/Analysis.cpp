@@ -776,12 +776,12 @@ struct ValueSweep {
         for (uint32_t raw = 0; raw < ir.inst_count(); ++raw) {
             const Index          i = static_cast<Index>(raw);
             const Inst::Payload& p = ir.payload(i);
-            // NOTE: the may-x default is applied per arm, NOT here. Ir::operands is
-            // not merely incomplete for some tags -- it is UNSAFE: it decodes any
-            // Extra payload as an ExtraSlice, so on a tag whose extra record is
-            // something else (MonitorSet carries a StrobePendInfo) it fabricates an
-            // out-of-bounds span. Only the arms below that genuinely have SSA value
-            // operands call operand_x.
+            // NOTE: the may-x default is applied per arm, NOT here, because the
+            // x/z rule differs per tag -- so only the arms whose result is the
+            // OR of their operands call operand_x. This is a semantic split, not
+            // a safety one: Ir::operands is sound for every tag (it used to
+            // decode any Extra payload as an ExtraSlice, fabricating a span on
+            // tags like MonitorSet whose record is a StrobePendInfo).
 
             switch (ir.tag(i)) {
                 case Inst::Tag::Constant:

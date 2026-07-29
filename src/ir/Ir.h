@@ -128,8 +128,8 @@ enum class DistOp : uint32_t {
 // non-deterministic across identical runs (a hazard for hashing and future
 // serialization); has_unique_object_representations rejects it at compile time.
 template<class T>
-concept ExtraPayload = std::is_trivially_copyable_v<T> && (sizeof(T) % sizeof(uint32_t) == 0) &&
-                       std::has_unique_object_representations_v<T>;
+concept ExtraPayload =
+  std::is_trivially_copyable_v<T> && (sizeof(T) % sizeof(uint32_t) == 0) && std::has_unique_object_representations_v<T>;
 
 // Half-open range [start, end) of u32 words in the extra buffer. Doubles as a
 // region: a run of instruction indices in nested-execution order.
@@ -173,11 +173,11 @@ struct StoreNbDelayInfo {
 // waits on. The whole-signal lvalue is the enclosing op_extra `op`.
 struct StoreNbEventInfo {
     // Value stored when the trigger fires (sampled in the current instant).
-    Index    value;
+    Index value;
     // Number of trigger occurrences to wait for (sampled now); 1 for plain `@e`.
-    Index    count;
+    Index count;
     // Trigger signal whose edge fires the store.
-    Signal   trig;
+    Signal trig;
     // Edge to trigger on (ir::Edge value).
     uint32_t edge;
 };
@@ -402,10 +402,10 @@ struct VirtualCallInfo {
     // is NOT the function actually called.
     FunctionId func;
     // Vtable slot index of the virtual method (stable across the whole hierarchy).
-    uint32_t   slot;
+    uint32_t slot;
     // Static class type of the receiver: gives the object-body layout (the vtable
     // pointer sits at body field 0 of a polymorphic class).
-    Ref        class_ref;
+    Ref class_ref;
     // Argument value operands (this handle first, then the formals), like CallInfo.
     ExtraSlice args;
 };
@@ -1999,6 +1999,75 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
     return K::None;
 }
 
+// How Ir::operands() reads the SSA operands of a PayloadKind::Extra tag.
+//
+// PayloadKind says which union member a tag activates, but every Extra tag
+// activates the same one (`extra`) while pointing at a different record, so it
+// cannot say how to decode that record. This table supplies the missing half.
+// Guessing is unsound: an ExtraSlice is a {start, end} pair, so decoding a
+// record that is not one yields a span over unrelated words -- either far out
+// of bounds (FinishInfo's {banner, banner_len} with len < banner wraps to a
+// huge count) or, worse, quietly in bounds and meaningless (ForkInfo's
+// children are FunctionIds, LoopInfo's cond is a region).
+enum class ExtraOperandShape : uint8_t {
+    // Not an Extra-payload tag; operands come from the payload member instead.
+    // Never observed for a real Extra tag -- see the static_assert below.
+    NotExtra,
+    // The record holds no SSA operands: regions, FunctionIds, packed bytes or
+    // constants only.
+    None,
+    // `extra` is a bare ExtraSlice that is itself the operand run.
+    SliceIsOperands,
+    // `extra` is a StrengthResInfo whose `values` slice is the operand run.
+    StrengthResValues,
+};
+
+// Constexpr for the same reason as payload_kind(): operand walks inline it.
+constexpr ExtraOperandShape extra_operand_shape(Inst::Tag tag) {
+    using T = Inst::Tag;
+    using S = ExtraOperandShape;
+    switch (tag) {
+        case T::Concat:
+            return S::SliceIsOperands;
+        case T::StrengthRes:
+            return S::StrengthResValues;
+        // loop: the predicate and regions are not top-level operands (the
+        // predicate is defined inside the cond region, walked via region()).
+        case T::Loop:
+        // fork: the children are FunctionIds, not operands.
+        case T::Fork:
+        // strobe_pend / monitor_set: the target is a FunctionId; the deferred
+        // body re-evaluates its own args.
+        case T::StrobePend:
+        case T::MonitorSet:
+        // finish / case_viol / test_plusargs: banner / query bytes only.
+        case T::Finish:
+        case T::CaseViol:
+        case T::TestPlusArgs:
+            return S::None;
+        default:
+            return S::NotExtra;
+    }
+}
+
+// A new Extra tag must be classified above. The default arm is deliberately
+// safe rather than exhaustive -- listing all 200-odd non-Extra tags would just
+// restate payload_kind() -- so this is what turns forgetting one into a build
+// break instead of a fabricated operand span. Values outside the enum answer
+// None from payload_kind() and so pass vacuously.
+constexpr bool extra_operand_shapes_total() {
+    for (unsigned v = 0; v <= 0xFF; ++v) {
+        const auto tag = static_cast<Inst::Tag>(v);
+        if (payload_kind(tag) == Inst::PayloadKind::Extra && extra_operand_shape(tag) == ExtraOperandShape::NotExtra) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static_assert(extra_operand_shapes_total(), "every PayloadKind::Extra tag needs an extra_operand_shape() case");
+
 // Immutable, finished process IR: a structure of arrays (parallel tag / payload
 // / location columns indexed by Index) plus a flat extra side-table. The body
 // is the root region. Constructed by Builder::finish(); default construction
@@ -2090,13 +2159,25 @@ public:
     // Fill `scratch` with the SSA operands of an instruction and return a view
     // of them. Fixed-arity ops use the scratch buffer; variadic ops (concat)
     // return a view straight into the extra buffer. Region bodies are not
-    // operands — walk them via region().
+    // operands — walk them via region(), and note that a value a region
+    // designates as its result (LoopInfo::pred, SelectLazy::then_val /
+    // else_val) is defined inside that region, so it is not a top-level
+    // operand either.
     //
-    // NOTE: not exhaustive for the variadic system tasks — a tag whose args are
-    // an extra slice can also carry a scalar operand outside it, which one
-    // span cannot express: FDisplay omits its fd, Fscanf/Sscanf their source,
-    // InsideSet its member operands. A pass needing every use of those tags
-    // must read their info records directly.
+    // Total over every tag, and sound for every tag: each index returned is a
+    // real operand of `inst`, so it is in bounds for this body and was created
+    // before `inst`. Extra-payload tags decode via extra_operand_shape(), which
+    // a new tag must be added to or the build breaks; the result is never a
+    // span reinterpreted from the wrong record.
+    //
+    // NOTE: sound but not exhaustive for six tags — a tag whose args are an
+    // extra slice can also carry a scalar operand outside it, and one span
+    // cannot express both. FDisplay and MonitorEmit omit their descriptor,
+    // Fscanf/Sscanf their source, Sformat its destination lvalue, and InsideSet
+    // its member and range operands. Widening the span would mean copying the
+    // args out of the extra buffer, which is the cost this zero-copy view
+    // exists to avoid; a pass needing every use of those tags must read their
+    // info records directly.
     std::span<const Index> operands(Index inst, std::array<Index, 4>& scratch) const;
 
 private:

@@ -178,6 +178,7 @@ enable_testing()
 add_executable(clotho_test
   tests/test_main.cpp
   tests/ir_test.cpp
+  tests/operands_test.cpp
   tests/sourcemap_test.cpp
   tests/lower_test.cpp
   tests/case_test.cpp

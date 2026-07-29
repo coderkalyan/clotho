@@ -53,28 +53,29 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
             scratch[1] = p.binary.r;
             return { scratch.data(), 2 };
 
-        case Inst::PayloadKind::Extra: {
-            // loop: its predicate and regions are not top-level SSA operands
-            // (the predicate lives inside the cond region, walked via region()).
-            // finish / case_viol / test_plusargs carry only banner / query
-            // bytes, no SSA operands. fork's children are FunctionIds, not
-            // operands. strobe_pend's target is a FunctionId too, not an
-            // operand — the deferred body re-evaluates its own args.
-            if (tag == Inst::Tag::Loop || tag == Inst::Tag::Finish ||
-                tag == Inst::Tag::CaseViol || tag == Inst::Tag::TestPlusArgs ||
-                tag == Inst::Tag::Fork || tag == Inst::Tag::StrobePend) {
-                return {};
+        case Inst::PayloadKind::Extra:
+            // Which record `extra` points at is tag-dependent, so the shape
+            // table decides; an unclassified tag yields no operands rather than
+            // a span decoded from the wrong record.
+            switch (extra_operand_shape(tag)) {
+                case ExtraOperandShape::None:
+                    return {};
+                case ExtraOperandShape::StrengthResValues: {
+                    // strength_res: the driver slot values are the SSA operands;
+                    // the parallel strength constants are not.
+                    const auto info = extra_data<StrengthResInfo>(p.extra);
+                    return index_slice(info.values);
+                }
+                case ExtraOperandShape::SliceIsOperands: {
+                    // concat: variadic operands live in the extra buffer.
+                    const auto slice = extra_data<ExtraSlice>(p.extra);
+                    return index_slice(slice);
+                }
+                case ExtraOperandShape::NotExtra:
+                    break;
             }
-            // strength_res: the driver slot values are the SSA operands; the
-            // parallel strength constants are not.
-            if (tag == Inst::Tag::StrengthRes) {
-                const auto info = extra_data<StrengthResInfo>(p.extra);
-                return index_slice(info.values);
-            }
-            // concat: variadic operands live in the extra buffer.
-            const auto slice = extra_data<ExtraSlice>(p.extra);
-            return index_slice(slice);
-        }
+
+            return {};
 
         case Inst::PayloadKind::Display: {
             // display: the value args are an index slice in the DisplayInfo record;
@@ -138,9 +139,9 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
             // operands).
             if (tag == Inst::Tag::Select) {
                 const auto select = extra_data<Select>(p.op_extra.extra);
-                scratch[0]     = p.op_extra.op;
-                scratch[1]     = select.a;
-                scratch[2]     = select.b;
+                scratch[0]        = p.op_extra.op;
+                scratch[1]        = select.a;
+                scratch[2]        = select.b;
                 return { scratch.data(), 3 };
             }
             // elem_select exposes its base and the index value (the index is read
@@ -287,8 +288,8 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
             // The one-extra-operand queue ops expose the handle lvalue plus
             // their QueueArg operand (element value / position / copy source).
             if (tag == Inst::Tag::QueuePushBack || tag == Inst::Tag::QueuePushFront ||
-                tag == Inst::Tag::QueueDeleteIdx || tag == Inst::Tag::QueueCopy ||
-                tag == Inst::Tag::QueueCopyNb || tag == Inst::Tag::QueueCopyDyn) {
+                tag == Inst::Tag::QueueDeleteIdx || tag == Inst::Tag::QueueCopy || tag == Inst::Tag::QueueCopyNb ||
+                tag == Inst::Tag::QueueCopyDyn) {
                 const auto qa = extra_data<QueueArg>(p.op_extra.extra);
                 scratch[0]    = p.op_extra.op;
                 scratch[1]    = qa.arg;
@@ -315,9 +316,8 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
             // The one-extra-operand associative-array ops expose the handle
             // lvalue plus their AssocArg operand (key value / key lvalue / copy
             // source).
-            if (tag == Inst::Tag::AssocSelect || tag == Inst::Tag::AssocExists ||
-                tag == Inst::Tag::AssocDeleteKey || tag == Inst::Tag::AssocCopy ||
-                tag == Inst::Tag::AssocFirst || tag == Inst::Tag::AssocLast ||
+            if (tag == Inst::Tag::AssocSelect || tag == Inst::Tag::AssocExists || tag == Inst::Tag::AssocDeleteKey ||
+                tag == Inst::Tag::AssocCopy || tag == Inst::Tag::AssocFirst || tag == Inst::Tag::AssocLast ||
                 tag == Inst::Tag::AssocNext || tag == Inst::Tag::AssocPrev) {
                 const auto aa = extra_data<AssocArg>(p.op_extra.extra);
                 scratch[0]    = p.op_extra.op;
