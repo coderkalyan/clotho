@@ -7,7 +7,7 @@
 // Model (see LlvmBackend.cpp for the full rationale):
 //   * One shared state struct holds a slot per module signal: a packed must|may
 //     word plus a z word — the z word elided when the may-z analysis
-//     (ZElision.h) proves the signal never carries z.
+//     (Analysis.h) proves the signal never carries z.
 //   * Each process becomes a switched-resume coroutine `ptr <name>(ptr state)`;
 //     Load/Store address fields of that struct.
 //   * Every SSA value is lowered as a (must|may, z) plane pair so X/Z propagate.

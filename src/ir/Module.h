@@ -46,7 +46,7 @@ struct SignalInfo {
     Direction dir = Direction::Internal;
     // A net (wire/tri/uwire), as opposed to a variable. An undriven 4-state net
     // defaults to z (LRM 6.6); an undriven variable defaults to x. Also the
-    // seed condition for the may-z analysis (ZElision.h).
+    // seed condition for the may-z analysis (Analysis.h).
     bool is_net = false;
     // A named event (LRM 15.5), modeled as a synthetic 1-bit signal that owns
     // wait queues but carries no data value: `-> e` services its Any-edge queue

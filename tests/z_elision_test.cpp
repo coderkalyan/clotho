@@ -3,7 +3,7 @@
 #include <string_view>
 
 #include "Lower.h"
-#include "ir/ZElision.h"
+#include "ir/Analysis.h"
 
 using namespace clotho;
 
@@ -34,7 +34,7 @@ Analyzed analyze(std::string_view source) {
     Analyzed a{ .lowered = lower_text(source), .may_z = {} };
     REQUIRE_MESSAGE(a.lowered.ok, a.lowered.diagnostic_text());
     REQUIRE(a.lowered.module != nullptr);
-    a.may_z = ir::compute_may_z(*a.lowered.module);
+    a.may_z = ir::analyze(*a.lowered.module).may_z;
 
     return a;
 }

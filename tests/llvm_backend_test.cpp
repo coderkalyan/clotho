@@ -3172,7 +3172,7 @@ TEST_CASE("$readmem with z digits into a 2-state memory reads 0 and spares neigh
 }
 
 // %h accepts z / ? digits (LRM Table 21-7); the scan target must keep its z
-// plane under z elision (the Scanf seed in compute_may_z), and a 2-state
+// plane under z elision (the Scanf seed in the may-z analysis), and a 2-state
 // target drops the z digits to 0 (LRM 6.3.1).
 TEST_CASE("$sscanf z digits survive z elision; a 2-state target reads 0") {
     constexpr std::string_view src = R"(

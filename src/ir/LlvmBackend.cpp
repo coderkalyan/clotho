@@ -36,9 +36,9 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 
+#include "ir/Analysis.h"
 #include "ir/InternPool.h"
 #include "ir/Ir.h"
-#include "ir/ZElision.h"
 #include "runtime/Runtime.h"
 
 // LLVM backend rationale.
@@ -55,7 +55,7 @@
 // cleared by the logic ops (their result is never Z).
 // To reconstruct canonical 4-state when needed: xz = must ^ may, val = must.
 //
-// Z elision. compute_may_z (ZElision.cpp) proves most signals can never carry a
+// Z elision. The may-z analysis (Analysis.h) proves most signals can never carry a
 // z bit; a proven never-z signal stores no z word in its slot (see slot_type)
 // and its loads materialize a constant-zero z plane instead. SSA values,
 // function ABIs, and frame locals keep their z plane regardless — the zero
@@ -628,6 +628,10 @@ public:
     }
 
     void run() {
+        // Whole-design facts, computed once and shared by every stage below
+        // (Analysis.h). Must precede build_state_types, which reads the may-z /
+        // undriven / ptr-arg bits while laying out signal slots.
+        facts_ = analyze(mod_);
         build_state_types();
         emit_state_global(); // before any body: storage_ptr resolves through the anchors
         if (std::getenv("CLOTHO_DEDUP_STAT") != nullptr) {
@@ -639,10 +643,10 @@ public:
             report_comb_fuse_stat();
         }
         compute_domain_spec();   // after fusion (thunk_group_): reads spec_group_ in lower_group
-        design_uses_strobe_   = design_uses_strobe(); // gates the Postponed-region drain loop
-        design_uses_monitor_  = design_uses_monitor();
-        design_uses_observed_ = design_uses_observed(); // gates the Observed-region flush
-        design_uses_defer_    = design_uses_defer();     // gates the deferred-assertion flushes
+        design_uses_strobe_   = facts_.uses.strobe;   // gates the Postponed-region drain loop
+        design_uses_monitor_  = facts_.uses.monitor;
+        design_uses_observed_ = facts_.uses.observed; // gates the Observed-region flush
+        design_uses_defer_    = facts_.uses.defer;    // gates the deferred-assertion flushes
         build_vcd_index();       // before build_nba_state: fills vcd_index_ / design_uses_vcd_
         build_wait_queues();
         build_instance_ctx_layout(); // after build_wait_queues: ctx sizes need wait slots
@@ -1707,13 +1711,13 @@ private:
         // and that behavior is preserved — ordinary 2-state signals are never-z
         // through the analysis anyway.
         const std::vector<bool> may_z =
-          config_.z_elision ? compute_may_z(mod_) : std::vector<bool>(sigs.size(), true);
-        const std::vector<bool> ptr_arg = ptr_arg_signals();
+          config_.z_elision ? facts_.may_z : std::vector<bool>(sigs.size(), true);
+        const std::vector<bool>& ptr_arg = facts_.ptr_arg;
         // Semantics, not optimization: computed regardless of config_.z_elision.
         // An undriven 4-state net powers up z (LRM 6.6); everything else x / 0. A
         // partially-driven packed net powers its undriven bits z per this mask.
-        const std::vector<bool>                  undriven = compute_undriven(mod_);
-        const std::vector<std::vector<uint64_t>> partial_undriven = compute_partial_undriven(mod_);
+        const std::vector<bool>& undriven = facts_.undriven;
+
 
         for (uint32_t i = 0; i < sigs.size(); ++i) {
             const Layout lay = mod_.pool.layout(sigs[i].type);
@@ -1785,10 +1789,11 @@ private:
             slot.is_real     = mod_.pool.is_float(leaf_type(sigs[i].type));
             slot.init_z      = undriven[i] && sigs[i].is_net && slot.four_state;
             // A partially-driven packed net: its undriven bits power on z. Only set
-            // for a 4-state, non-array net (compute_partial_undriven's candidate
-            // set matches). Fully-undriven takes init_z; fully-driven has no mask.
-            if (!slot.init_z && slot.four_state && !slot.is_array && !partial_undriven[i].empty()) {
-                slot.undriven_mask = partial_undriven[i];
+            // for a 4-state, non-array net (the analysis's candidate set matches).
+            // Fully-undriven takes init_z; fully-driven has no mask.
+            const std::span<const uint64_t> pmask = facts_.undriven_mask(static_cast<Signal>(i));
+            if (!slot.init_z && slot.four_state && !slot.is_array && !pmask.empty()) {
+                slot.undriven_mask.assign(pmask.begin(), pmask.end());
             }
             slot.has_z       = may_z[i] || ptr_arg[i] || slot.init_z || !slot.undriven_mask.empty();
             // A 2-state signal drops the packed must|may word for a genuine iW slot
@@ -2158,49 +2163,6 @@ private:
     // separate from compute_may_z. (An alternative — a caller-stack z scratch word
     // for elided targets — is sound but adds a second mechanism for a rare
     // construct.)
-    std::vector<bool> ptr_arg_signals() const {
-        std::vector<bool> out(mod_.signals().size(), false);
-        const auto        mark = [&](const Ir& ir, FunctionId fid, ExtraSlice argslice) {
-            const Function& callee = mod_.function(fid);
-            const auto      args   = ir.region(argslice);
-            for (size_t a = 0; a < args.size(); ++a) {
-                if (callee.arg_dirs.empty() || callee.arg_dirs[a] == ArgDir::In) {
-                    continue;
-                }
-                const Index root = lvalue_root(ir, args[a]).root;
-                if (ir.tag(root) == Inst::Tag::Signal) {
-                    out[static_cast<uint32_t>(ir.payload(root).signal)] = true;
-                }
-            }
-        };
-        const auto scan = [&](const Ir& ir) {
-            for (size_t k = 0; k < ir.inst_count(); ++k) {
-                const auto idx = static_cast<Index>(k);
-                if (ir.tag(idx) == Inst::Tag::TaskCall) {
-                    const auto ti = ir.extra_data<TaskCallInfo>(ir.payload(idx).extra);
-                    mark(ir, ti.func, ti.args);
-                } else if (ir.tag(idx) == Inst::Tag::TaskCallVirtual) {
-                    const auto vci = ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra);
-                    mark(ir, vci.func, vci.args);
-                } else if (ir.tag(idx) == Inst::Tag::Call) {
-                    const auto ci = ir.extra_data<CallInfo>(ir.payload(idx).extra);
-                    mark(ir, ci.func, ci.args);
-                } else if (ir.tag(idx) == Inst::Tag::CallVirtual) {
-                    // A virtual call marshals args identically; the resolved method's
-                    // arg_dirs (shared by every override) drive the by-pointer set.
-                    const auto vci = ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra);
-                    mark(ir, vci.func, vci.args);
-                }
-            }
-        };
-        for (const Process& p : mod_.processes()) {
-            scan(p.ir);
-        }
-        for (uint32_t i = 0; i < mod_.function_count(); ++i) {
-            scan(mod_.function(static_cast<FunctionId>(i)).ir);
-        }
-        return out;
-    }
 
     const SignalSlot& slot_of(Signal s) const {
         return slots_[static_cast<uint32_t>(s)];
@@ -2487,7 +2449,7 @@ private:
         // no extra machinery. The counter is a plain per-group global.
         cur_defer_group_ = -1;
         if (std::any_of(members.begin(), members.end(),
-                        [&](uint32_t m) { return process_has_deferred_severity(all[m]); })) {
+                        [&](uint32_t m) { return facts_.processes[m].deferred_severity; })) {
             cur_defer_group_ = static_cast<int32_t>(sched_group_);
         }
 
@@ -4358,39 +4320,6 @@ private:
         // Blocking-written signals of one IR body: Store roots plus out/inout
         // TaskCall actuals (copy-out writes the actual in the caller). Roots
         // that are not signals (function locals / formals) are skipped.
-        const auto body_writes = [&](const Ir& ir, std::vector<Signal>& out, std::vector<FunctionId>& calls) {
-            for (size_t k = 0; k < ir.inst_count(); ++k) {
-                const auto idx = static_cast<Index>(k);
-                if (ir.tag(idx) == Inst::Tag::Store) {
-                    const LvalueRoot r = lvalue_root(ir, ir.payload(idx).binary.l);
-                    if (ir.tag(r.root) == Inst::Tag::Signal) {
-                        out.push_back(ir.payload(r.root).signal);
-                    }
-                }
-                else if (ir.tag(idx) == Inst::Tag::TaskCall ||
-                         ir.tag(idx) == Inst::Tag::TaskCallVirtual) {
-                    const bool       virt = ir.tag(idx) == Inst::Tag::TaskCallVirtual;
-                    const FunctionId fid =
-                        virt ? ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra).func
-                             : ir.extra_data<TaskCallInfo>(ir.payload(idx).extra).func;
-                    const ExtraSlice as =
-                        virt ? ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra).args
-                             : ir.extra_data<TaskCallInfo>(ir.payload(idx).extra).args;
-                    const Function& callee = mod_.function(fid);
-                    const auto      args   = ir.region(as);
-                    for (size_t a = 0; a < args.size(); ++a) {
-                        if (callee.arg_dirs[a] == ArgDir::In) {
-                            continue;
-                        }
-                        const LvalueRoot r = lvalue_root(ir, args[a]);
-                        if (ir.tag(r.root) == Inst::Tag::Signal) {
-                            out.push_back(ir.payload(r.root).signal);
-                        }
-                    }
-                    calls.push_back(fid);
-                }
-            }
-        };
 
         // Per-function write sets, closed transitively over calls (memoized
         // DFS; an in-progress callee — recursion — contributes what it has so
@@ -4403,9 +4332,9 @@ private:
                 return;
             }
             fn_state[f] = 1;
-            std::vector<FunctionId> calls;
-            body_writes(mod_.function(static_cast<FunctionId>(f)).ir, fn_writes[f], calls);
-            for (const FunctionId c : calls) {
+            const BodyFacts& bf = facts_.functions[f];
+            fn_writes[f].insert(fn_writes[f].end(), bf.writes.begin(), bf.writes.end());
+            for (const FunctionId c : bf.calls) {
                 self(static_cast<uint32_t>(c));
                 const auto& cw = fn_writes[static_cast<uint32_t>(c)];
                 fn_writes[f].insert(fn_writes[f].end(), cw.begin(), cw.end());
@@ -4429,10 +4358,8 @@ private:
         std::vector<std::vector<uint32_t>>& adj = wake_adj_;
         std::vector<uint32_t>               stamp(nprocs, UINT32_MAX);
         for (uint32_t k = 0; k < nprocs; ++k) {
-            std::vector<Signal>     writes;
-            std::vector<FunctionId> calls;
-            body_writes(all[k].ir, writes, calls);
-            for (const FunctionId c : calls) {
+            std::vector<Signal> writes = facts_.processes[k].body.writes;
+            for (const FunctionId c : facts_.processes[k].body.calls) {
                 close_fn(static_cast<uint32_t>(c));
                 const auto& cw = fn_writes[static_cast<uint32_t>(c)];
                 writes.insert(writes.end(), cw.begin(), cw.end());
@@ -4582,93 +4509,6 @@ private:
         return false;
     }
 
-    bool is_simple_always(const Process& p) const {
-        if (p.activation != Activation::Always || p.wait_events.empty()) {
-            return false;
-        }
-        for (size_t k = 0; k < p.ir.inst_count(); ++k) {
-            const auto idx = static_cast<Index>(k);
-            switch (p.ir.tag(idx)) {
-                case Inst::Tag::Delay:
-                case Inst::Tag::Wait:
-                case Inst::Tag::TaskCall:
-                case Inst::Tag::TaskCallVirtual:
-                // A named-event trigger has a scheduling side effect (it wakes
-                // waiters) and `.triggered` reads per-event state outside the
-                // pure-function-of-signal-reads model that thunk elision and comb
-                // fusion assume, so keep an event-touching process a coroutine.
-                case Inst::Tag::EventTrigger:
-                case Inst::Tag::EventTriggerNb:
-                case Inst::Tag::EventTriggerNbDelayed:
-                case Inst::Tag::EventTriggered:
-                case Inst::Tag::Fork:
-                    return false;
-                // The $urandom family keeps its per-process RNG state in the
-                // coroutine frame (LRM §18.13 thread stability), so a thunk (no
-                // frame) cannot host it — force a coroutine. $random / $dist_*
-                // carry their state in an explicit seed variable or the global
-                // stream, so they stay thunk/fusion eligible.
-                case Inst::Tag::Urandom:
-                case Inst::Tag::UrandomSeeded:
-                case Inst::Tag::UrandomRange:
-                    return false;
-                // An array shuffle draws from the frame RNG (same reason as the
-                // $urandom family); other dynarr/queue ops carry no frame state
-                // and stay thunk-eligible, so only Shuffle disqualifies.
-                case Inst::Tag::DynArrayShuffle:
-                case Inst::Tag::QueueShuffle:
-                    return false;
-                // A deferred store (`x <= #d y` / `x <= @e y`) arms a record with an
-                // observable future effect; keep it out of thunk/fused groups (a
-                // spurious comb-fused run would arm a spurious store), routing it
-                // to a plain coroutine.
-                case Inst::Tag::StoreNbDelay:
-                case Inst::Tag::StoreInertialDelay:
-                case Inst::Tag::StoreNbEvent:
-                    return false;
-                // A $strobe call site ramps its deferred-print task through the
-                // task-call record ABI (lower_strobe_pend), which needs a real
-                // coroutine (record_slot() anchors on coro_begin_) — a thunk has
-                // neither. Forcing a coroutine here also keeps a $strobe-bearing
-                // process out of comb fusion (comb_fuse_verdict checks this
-                // first), which is required anyway: a spuriously re-run fused
-                // member would double-queue the print, an observable effect the
-                // fusion "as-if" argument does not allow.
-                case Inst::Tag::StrobePend:
-                    return false;
-                // A deferred immediate assertion (LRM 16.4) queues its report on
-                // the owning process's deferred queue and flushes it at each
-                // activation. Force a coroutine so the flush (generation bump)
-                // has one activation-start site (the always-loop top), and keep
-                // it out of thunk/fused groups whose activation model differs.
-                case Inst::Tag::Severity: {
-                    const auto info = p.ir.extra_data<SeverityInfo>(p.ir.payload(idx).extra);
-                    if (info.defer != 0) {
-                        return false;
-                    }
-                    break;
-                }
-                case Inst::Tag::Store: {
-                    const LvalueRoot r = lvalue_root(p.ir, p.ir.payload(idx).binary.l);
-                    if (p.ir.tag(r.root) != Inst::Tag::Signal) {
-                        break;
-                    }
-                    // Membership in the raw wait list is identical to membership
-                    // in the deduped canonical set.
-                    const auto sig = static_cast<uint32_t>(p.ir.payload(r.root).signal);
-                    for (const WaitEvent& w : p.wait_events) {
-                        if (static_cast<uint32_t>(w.signal) == sig) {
-                            return false;
-                        }
-                    }
-                    break;
-                }
-                default:
-                    break;
-            }
-        }
-        return true;
-    }
 
     // Comb-fusion eligibility (analysis only — grouping lands with the comb
     // fusion phase). A member of a union-sensitivity fused group can be run
@@ -4680,182 +4520,7 @@ private:
     // downstream can tell the run happened. The verdict enumerates exactly the
     // conditions that argument needs; purity is a whitelist, so a new IR tag
     // defaults to ineligible.
-    enum class CombFuse : uint8_t {
-        Eligible,
-        // Fails is_simple_always: suspension point, task call, self-sens
-        // write, or not an Always with a static sensitivity.
-        NotSimpleAlways,
-        // Sensitivity has a posedge/negedge entry. Comb fusion is level-only;
-        // edge-triggered members belong to V1 identical-sens fusion.
-        EdgeSensitive,
-        // Body op with an observable effect or non-deterministic value
-        // ($display, file I/O, $random, $time, string ops, ...).
-        ImpureOp,
-        // Function call: purity closure over callees not implemented yet.
-        HasCall,
-        // Nonblocking store: commits in the NBA region, outside the group's
-        // execution, which breaks the internal-signal subscription reasoning.
-        NbaWrite,
-        // Store whose root is a string or unpacked array: those store paths'
-        // change detection is not verified, so the no-change argument does
-        // not (yet) cover them.
-        UnsupportedWrite,
-        // Reads a signal absent from the sensitivity list: a spurious run
-        // would observe a value the unfused schedule never samples (e.g.
-        // explicit `@(a)` reading `b`).
-        ReadOutsideSens,
-        // Count of verdicts, for histogram sizing.
-        Count,
-    };
 
-    CombFuse comb_fuse_verdict(const Process& p) const {
-        if (!is_simple_always(p)) {
-            return CombFuse::NotSimpleAlways;
-        }
-        for (const WaitEvent& w : p.wait_events) {
-            if (w.edge != Edge::Any) {
-                return CombFuse::EdgeSensitive;
-            }
-        }
-        std::vector<uint32_t> reads;
-        for (size_t k = 0; k < p.ir.inst_count(); ++k) {
-            const auto idx = static_cast<Index>(k);
-            switch (p.ir.tag(idx)) {
-                // Pure value and control ops: no effect beyond their result.
-                case Inst::Tag::Constant:
-                case Inst::Tag::Arg:
-                case Inst::Tag::Signal:
-                case Inst::Tag::Local:
-                case Inst::Tag::BitSelect:
-                case Inst::Tag::PartSelect:
-                case Inst::Tag::DynPartSelect:
-                case Inst::Tag::ElemSelect:
-                case Inst::Tag::ArrSlice:
-                case Inst::Tag::Add:
-                case Inst::Tag::Sub:
-                case Inst::Tag::Mul:
-                case Inst::Tag::Div:
-                case Inst::Tag::Mod:
-                case Inst::Tag::Pow:
-                case Inst::Tag::Band:
-                case Inst::Tag::Bor:
-                case Inst::Tag::Bxor:
-                case Inst::Tag::Bxnor:
-                case Inst::Tag::WireRes:
-                case Inst::Tag::WandRes:
-                case Inst::Tag::WorRes:
-                case Inst::Tag::StrengthRes:
-                case Inst::Tag::Bnot:
-                case Inst::Tag::RedAnd:
-                case Inst::Tag::RedOr:
-                case Inst::Tag::RedXor:
-                case Inst::Tag::Ctz:
-                case Inst::Tag::Clz:
-                case Inst::Tag::CountBits:
-                case Inst::Tag::OneHot:
-                case Inst::Tag::OneHot0:
-                case Inst::Tag::IsUnknown:
-                case Inst::Tag::Sll:
-                case Inst::Tag::Srl:
-                case Inst::Tag::Sra:
-                case Inst::Tag::Eq:
-                case Inst::Tag::Ne:
-                case Inst::Tag::Lt:
-                case Inst::Tag::Le:
-                case Inst::Tag::Gt:
-                case Inst::Tag::Ge:
-                case Inst::Tag::CaseEq:
-                case Inst::Tag::CasezEq:
-                case Inst::Tag::CasexEq:
-                case Inst::Tag::WildEq:
-                case Inst::Tag::InsideSet:
-                case Inst::Tag::FAdd:
-                case Inst::Tag::FSub:
-                case Inst::Tag::FMul:
-                case Inst::Tag::FDiv:
-                case Inst::Tag::FPow:
-                case Inst::Tag::FNeg:
-                case Inst::Tag::FEq:
-                case Inst::Tag::FNe:
-                case Inst::Tag::FLt:
-                case Inst::Tag::FLe:
-                case Inst::Tag::FGt:
-                case Inst::Tag::FGe:
-                case Inst::Tag::ItoF:
-                case Inst::Tag::FtoI:
-                case Inst::Tag::FtoITrunc:
-                case Inst::Tag::FBitcast:
-                case Inst::Tag::FResize:
-                case Inst::Tag::RealMathUnary:
-                case Inst::Tag::RealMathBinary:
-                case Inst::Tag::Land:
-                case Inst::Tag::Lor:
-                case Inst::Tag::Lnot:
-                case Inst::Tag::Limplies:
-                case Inst::Tag::Lequiv:
-                case Inst::Tag::Select:
-                case Inst::Tag::SelectLazy:
-                case Inst::Tag::Concat:
-                case Inst::Tag::Repl:
-                case Inst::Tag::StreamReverse:
-                case Inst::Tag::NetPull:
-                case Inst::Tag::Resize:
-                case Inst::Tag::Cond:
-                case Inst::Tag::Switch:
-                case Inst::Tag::Loop:
-                case Inst::Tag::Break:
-                case Inst::Tag::Continue:
-                case Inst::Tag::Clog2:
-                    break;
-                case Inst::Tag::Load: {
-                    const LvalueRoot r = lvalue_root(p.ir, p.ir.payload(idx).unary);
-                    if (p.ir.tag(r.root) == Inst::Tag::Signal) {
-                        reads.push_back(static_cast<uint32_t>(p.ir.payload(r.root).signal));
-                    }
-                    break;
-                }
-                case Inst::Tag::Store: {
-                    const LvalueRoot r = lvalue_root(p.ir, p.ir.payload(idx).binary.l);
-                    if (p.ir.tag(r.root) != Inst::Tag::Signal) {
-                        break;
-                    }
-                    const auto  sig = static_cast<uint32_t>(p.ir.payload(r.root).signal);
-                    const auto& ty  = std::get<Type>(mod_.pool.get(mod_.signals()[sig].type));
-                    if (ty.kind == Type::Kind::String || ty.kind == Type::Kind::UnpackedArray) {
-                        return CombFuse::UnsupportedWrite;
-                    }
-                    break;
-                }
-                case Inst::Tag::StoreNb:
-                case Inst::Tag::StoreNbDelay:
-                case Inst::Tag::StoreInertialDelay:
-                case Inst::Tag::StoreNbEvent:
-                    return CombFuse::NbaWrite;
-                case Inst::Tag::Call:
-                case Inst::Tag::CallVirtual:
-                    return CombFuse::HasCall;
-                default:
-                    return CombFuse::ImpureOp;
-            }
-        }
-        // Every read signal must be in the sensitivity list, else a spurious
-        // run observes state the unfused schedule never samples. Verified here
-        // rather than trusting the frontend's inference: explicit lists and
-        // any inference gap fail mechanically.
-        for (const uint32_t s : reads) {
-            bool in_sens = false;
-            for (const WaitEvent& w : p.wait_events) {
-                if (static_cast<uint32_t>(w.signal) == s) {
-                    in_sens = true;
-                    break;
-                }
-            }
-            if (!in_sens) {
-                return CombFuse::ReadOutsideSens;
-            }
-        }
-        return CombFuse::Eligible;
-    }
 
     // Comb-fusion coverage probe: verdict histogram over Always processes plus
     // the count V1 fusion left in singleton groups (the comb-fusion
@@ -5332,7 +4997,7 @@ private:
                 continue;
             }
             ++always;
-            const CombFuse v = comb_fuse_verdict(all[k]);
+            const CombFuse v = facts_.processes[k].comb_fuse;
             counts[static_cast<size_t>(v)]++;
             if (v == CombFuse::Eligible && groups_[group_of_[k]].size() == 1) {
                 ++singleton_eligible;
@@ -5417,7 +5082,7 @@ private:
         std::map<std::pair<std::vector<std::pair<uint32_t, uint32_t>>, bool>, uint32_t> by_key;
         for (uint32_t k = 0; k < nprocs; ++k) {
             const Process& p = all[k];
-            if (config_.fuse && is_simple_always(p)) {
+            if (config_.fuse && facts_.processes[k].simple_always) {
                 const auto key = std::make_pair(canonical(p.wait_events), p.self_start);
                 const auto it  = by_key.find(key);
                 if (it != by_key.end() && groups_[it->second].size() < group_cap) {
@@ -5451,7 +5116,8 @@ private:
                     continue;
                 }
                 const uint32_t k = g.front();
-                if (scc_nontrivial_[k] == 0 && comb_fuse_verdict(all[k]) == CombFuse::Eligible) {
+                if (scc_nontrivial_[k] == 0 &&
+                    facts_.processes[k].comb_fuse == CombFuse::Eligible) {
                     cand[k] = 1;
                 }
             }
@@ -5599,7 +5265,7 @@ private:
         thunk_group_.assign(groups_.size(), false);
         if (config_.thunk) {
             for (uint32_t g = 0; g < groups_.size(); ++g) {
-                thunk_group_[g] = is_simple_always(all[groups_[g].front()]);
+                thunk_group_[g] = facts_.processes[groups_[g].front()].simple_always;
             }
         }
     }
@@ -13057,75 +12723,19 @@ private:
     // task body it calls — $strobe is legal in either, never in a plain
     // function)? Scans functions too, unlike design_uses_vcd, since a
     // $strobe call site can live inside a task.
-    bool design_uses_strobe() const {
-        for (const Process& p : mod_.processes()) {
-            for (uint32_t k = 0; k < p.ir.inst_count(); ++k) {
-                if (p.ir.tag(static_cast<Index>(k)) == Inst::Tag::StrobePend) {
-                    return true;
-                }
-            }
-        }
-        for (uint32_t i = 0; i < mod_.function_count(); ++i) {
-            const Ir& ir = mod_.function(static_cast<FunctionId>(i)).ir;
-            for (uint32_t k = 0; k < ir.inst_count(); ++k) {
-                if (ir.tag(static_cast<Index>(k)) == Inst::Tag::StrobePend) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
 
     // Any Observed-region report source in the design? Gates the per-instant
     // Observed-region flush (see emit_active_run). Currently a unique/priority
     // case violation (CaseViol); deferred immediate assertions will extend this.
     // CaseViol can live in a task body a process calls, so scan functions too.
-    bool design_uses_observed() const {
-        for (const Process& p : mod_.processes()) {
-            for (uint32_t k = 0; k < p.ir.inst_count(); ++k) {
-                if (p.ir.tag(static_cast<Index>(k)) == Inst::Tag::CaseViol) {
-                    return true;
-                }
-            }
-        }
-        for (uint32_t i = 0; i < mod_.function_count(); ++i) {
-            const Ir& ir = mod_.function(static_cast<FunctionId>(i)).ir;
-            for (uint32_t k = 0; k < ir.inst_count(); ++k) {
-                if (ir.tag(static_cast<Index>(k)) == Inst::Tag::CaseViol) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
 
     // Does this process body carry a deferred immediate assertion, i.e. a
     // Severity node with a non-zero `defer` (LRM 16.4)? A deferred assertion in a
     // called function/task is rejected in the frontend, so a process scan covers
     // every case the backend must handle.
-    bool process_has_deferred_severity(const Process& p) const {
-        for (uint32_t k = 0; k < p.ir.inst_count(); ++k) {
-            const auto idx = static_cast<Index>(k);
-            if (p.ir.tag(idx) != Inst::Tag::Severity) {
-                continue;
-            }
-            if (p.ir.extra_data<SeverityInfo>(p.ir.payload(idx).extra).defer != 0) {
-                return true;
-            }
-        }
-        return false;
-    }
 
     // Any deferred immediate assertion (LRM 16.4) in the design? Gates the
     // Observed / Postponed deferred-report flushes in emit_active_run.
-    bool design_uses_defer() const {
-        for (const Process& p : mod_.processes()) {
-            if (process_has_deferred_severity(p)) {
-                return true;
-            }
-        }
-        return false;
-    }
 
     // The current group's deferred-assertion generation counter (lazily created
     // in the group's own module), or null when the group carries no deferred
@@ -13162,24 +12772,6 @@ private:
 
     // Any $monitor / $fmonitor registration in the design? Gates the per-instant
     // Postponed-region monitor run (see emit_active_run).
-    bool design_uses_monitor() const {
-        for (const Process& p : mod_.processes()) {
-            for (uint32_t k = 0; k < p.ir.inst_count(); ++k) {
-                if (p.ir.tag(static_cast<Index>(k)) == Inst::Tag::MonitorSet) {
-                    return true;
-                }
-            }
-        }
-        for (uint32_t i = 0; i < mod_.function_count(); ++i) {
-            const Ir& ir = mod_.function(static_cast<FunctionId>(i)).ir;
-            for (uint32_t k = 0; k < ir.inst_count(); ++k) {
-                if (ir.tag(static_cast<Index>(k)) == Inst::Tag::MonitorSet) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
 
     // Assign each dumped scalar signal its runtime dump-var index, in the exact
     // order rt_vcd_var / rt_vcd_array register variables (the emit_vcd_var walk):
@@ -16582,6 +16174,10 @@ private:
     // Any StrobePend instruction anywhere in the design? Gates the per-instant
     // Postponed-region drain loop (emit_active_run), so a design with no
     // $strobe pays nothing.
+    // Whole-design analysis results (Analysis.h), computed once at the top of
+    // run() and read by every stage. Replaces what used to be a dozen private
+    // analyses recomputed across several walks of the instruction arrays.
+    DesignFacts facts_;
     bool design_uses_strobe_   = false;
     bool design_uses_monitor_  = false;
     bool design_uses_observed_ = false;

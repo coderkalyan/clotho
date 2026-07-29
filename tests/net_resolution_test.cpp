@@ -546,7 +546,7 @@ TEST_CASE("an unpacked-array-element driver of a resolved net fails loudly") {
 
 // A partially-driven net (continuous assigns to disjoint constant sub-ranges —
 // each bit has a single driver, so the net is NOT multiply-driven / resolved)
-// powers its UNDRIVEN bits to z, not x: compute_partial_undriven refines the
+// powers its UNDRIVEN bits to z, not x: the partial-undriven mask refines the
 // whole-signal undriven analysis per bit. Covers a 1-D vector, a multi-dim
 // packed element, and a nested `v[i][bit]` select. Cross-checked vs iverilog.
 TEST_CASE("undriven bits of a partially-driven net power on z, not x") {

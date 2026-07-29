@@ -110,7 +110,7 @@ add_library(clotho_ir_core STATIC
   src/ir/Ir.cpp
   src/ir/Builder.cpp
   src/ir/Printer.cpp
-  src/ir/ZElision.cpp
+  src/ir/Analysis.cpp
 )
 target_include_directories(clotho_ir_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(clotho_ir_core PUBLIC unordered_dense::unordered_dense)
@@ -170,6 +170,7 @@ add_executable(clotho_test
   tests/instance_array_test.cpp
   tests/packed_range_test.cpp
   tests/z_elision_test.cpp
+  tests/analysis_test.cpp
   tests/gate_test.cpp
   tests/net_resolution_test.cpp
   tests/llvm_backend_test.cpp
