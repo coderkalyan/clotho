@@ -1,6 +1,5 @@
 #include "Jit.h"
 
-#include <csetjmp>
 #include <cstring>
 #include <future>
 #include <memory>
@@ -190,7 +189,6 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_fread", &rt_fread);
     expose("rt_timeformat_init", &rt_timeformat_init);
     expose("rt_timeformat_set", &rt_timeformat_set);
-    expose("rt_finish", &rt_finish);
     expose("rt_observed_case_violation", &rt_observed_case_violation);
     expose("rt_observed_flush", &rt_observed_flush);
     expose("rt_defer_report", &rt_defer_report);
@@ -591,19 +589,11 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     // opt-in into the runtime so a bypassed gate still refuses to exec.
     rt_system_set_access(static_cast<int32_t>(config.allow_system));
 
-    // Simulation phase: run the compiled design. A $finish longjmps back here
-    // (rt_finish is noreturn to the design) so the embedding process survives;
-    // the sim's live coroutine frames are abandoned, which is fine — it is over.
-    const auto   t_sim = std::chrono::steady_clock::now();
-    std::jmp_buf finish_env;
-    // Volatile: an auto variable modified between setjmp and longjmp is
-    // otherwise indeterminate after the jump.
-    volatile int rc = 0;
-    if (setjmp(finish_env) == 0) {
-        rt_finish_host(&finish_env);
-        rc = fn();
-    }
-    rt_finish_host(nullptr);
+    // Simulation phase: run the compiled design. A $finish no longer unwinds
+    // anything here — it returns through the design's own frames and the drain
+    // loop stops — so this is an ordinary call.
+    const auto t_sim = std::chrono::steady_clock::now();
+    const int  rc    = fn();
     if (timings != nullptr) {
         timings->sim_ms += ms_since(t_sim);
     }

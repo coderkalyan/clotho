@@ -638,6 +638,7 @@ public:
         if (std::getenv("CLOTHO_COMB_FUSE_STAT") != nullptr) {
             report_comb_fuse_stat();
         }
+        may_finish_ = compute_may_finish(); // before any body: lower_call reads it
         if (std::getenv("CLOTHO_FINISH_STAT") != nullptr) {
             report_finish_stat();
         }
@@ -3855,7 +3856,7 @@ private:
 
         // sim_drain(state, wheel): seed every non-final process and run the event
         // loop to quiescence. Split out of main so rt_sim_run can wrap it in the
-        // $finish catch — a $finish longjmps back into rt_sim_run, which sits below
+        // finals — a $finish stops the drain, which returns into rt_sim_run below
         // main's frame, so the heap state pointer and the wheel alloca stay live
         // and the final blocks still observe the settled design state.
         auto* drain = llvm::Function::Create(subfnty, llvm::Function::InternalLinkage, "sim_drain", env_->llmod);
@@ -3963,9 +3964,9 @@ private:
         // paths (natural drain, $finish) return here with `state` still live.
         b_.CreateCall(sim_run_fn(), { state, wheel, drain, finals });
 
-        // Release heap owned by string signals. Runs on both exit paths now (the
-        // $finish catch returns here); a $finish inside a final block still
-        // longjmps past this, its heap reclaimed at process exit.
+        // Release heap owned by string signals. Reached on every exit path: the
+        // drain returns whether it ran out of work or a $finish stopped it, and a
+        // $finish inside a final block returns through that block's epilogue.
         for (const SignalSlot& s : slots_) {
             if (s.is_string) {
                 emit_string_slot_op(s, str_deinit_fn());
@@ -5347,6 +5348,75 @@ private:
     // by-pointer argument scan resolves them; an override that finishes where
     // its prototype does not would be missed, so treat the virtual figure as a
     // lower bound.
+    // Scan one body for a Finish, collecting its callees on the way.
+    static bool scan_finish(const Ir& ir, std::vector<FunctionId>* out) {
+        bool finishes = false;
+        for (size_t k = 0; k < ir.inst_count(); ++k) {
+            const auto idx = static_cast<Index>(k);
+            switch (ir.tag(idx)) {
+                case Inst::Tag::Finish:
+                    finishes = true;
+                    break;
+                case Inst::Tag::Call:
+                    if (out != nullptr) {
+                        out->push_back(ir.extra_data<CallInfo>(ir.payload(idx).extra).func);
+                    }
+                    break;
+                case Inst::Tag::TaskCall:
+                    if (out != nullptr) {
+                        out->push_back(ir.extra_data<TaskCallInfo>(ir.payload(idx).extra).func);
+                    }
+                    break;
+                case Inst::Tag::CallVirtual:
+                case Inst::Tag::TaskCallVirtual:
+                    if (out != nullptr) {
+                        out->push_back(ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra).func);
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+        return finishes;
+    }
+
+    // Which subroutines can reach a $finish, directly or through a callee. A call
+    // to one of these needs a post-call test of rt_finishing so the caller can
+    // leave too; every other call site is untouched. `direct_out`, when given,
+    // receives the un-closed seeds (the stat report distinguishes them).
+    std::vector<uint8_t> compute_may_finish(std::vector<uint8_t>* direct_out = nullptr) const {
+        const auto                           nf = static_cast<uint32_t>(mod_.function_count());
+        std::vector<uint8_t>                 direct(nf, 0);
+        std::vector<std::vector<FunctionId>> callees(nf);
+        for (uint32_t f = 0; f < nf; ++f) {
+            direct[f] = scan_finish(mod_.function(static_cast<FunctionId>(f)).ir, &callees[f]) ? 1 : 0;
+        }
+        // Memoized DFS, the same shape as the per-function write-set closure. A
+        // cycle contributes what the in-progress callee has so far; a recursive
+        // subroutine that finishes is still caught by its own seed.
+        std::vector<uint8_t> may(direct);
+        std::vector<uint8_t> state(nf, 0); // 0 new, 1 visiting, 2 done
+        const auto           close = [&](this const auto& self, uint32_t f) -> void {
+            if (state[f] != 0) {
+                return;
+            }
+            state[f] = 1;
+            for (const FunctionId c : callees[f]) {
+                const auto ci = static_cast<uint32_t>(c);
+                self(ci);
+                may[f] = static_cast<uint8_t>(may[f] | may[ci]);
+            }
+            state[f] = 2;
+        };
+        for (uint32_t f = 0; f < nf; ++f) {
+            close(f);
+        }
+        if (direct_out != nullptr) {
+            *direct_out = std::move(direct);
+        }
+        return may;
+    }
+
     void report_finish_stat() const {
         const auto nf = static_cast<uint32_t>(mod_.function_count());
 
@@ -12361,18 +12431,6 @@ private:
         b_.CreateCall(strobe_pend_fn(), { hdl });
     }
 
-    // void rt_finish(ptr banner, i64 now, i32 arg) — noreturn; prints the exit
-    // banner (LRM Table 20-1) then exits the process. Kept separate from the
-    // plain rt_fn helpers: the noreturn attribute must land on the declaration so
-    // the optimizer prunes the dead tail after a $finish.
-    llvm::FunctionCallee finish_fn() {
-        auto fn = rt_fn("rt_finish", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty() });
-        if (auto* f = llvm::dyn_cast<llvm::Function>(fn.getCallee())) {
-            f->setDoesNotReturn();
-        }
-        return fn;
-    }
-
     // void rt_finish_coop(ptr banner, i64 now, i32 arg) — the cooperative form.
     // Deliberately NOT noreturn: it prints the banner, sets rt_finishing, and
     // returns so the caller can leave through its own epilogue and free its
@@ -12380,6 +12438,69 @@ private:
     llvm::FunctionCallee finish_coop_fn() {
         return rt_fn("rt_finish_coop", b_.getVoidTy(),
                      { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty() });
+    }
+
+    // Leave the body being lowered the way a $finish must: through its own
+    // epilogue, so its frame is released and its resumer sees an ordinary
+    // completion. One shape per kind of body.
+    void emit_finish_exit() {
+        if (cur_fn_ == nullptr) {
+            if (hdl_ != nullptr) {
+                // Process coroutine: the final suspend, exactly as running off the
+                // end of the body does, so the resumer destroys the frame once.
+                b_.CreateBr(coro_final_bb_);
+            } else {
+                // Thunk-elided process: a plain void body.
+                deinit_body_strings();
+                b_.CreateRetVoid();
+            }
+            return;
+        }
+        if (cur_is_task_) {
+            // Task: the same epilogue an explicit `return` takes.
+            b_.CreateBr(task_epilogue_bb_);
+            return;
+        }
+        // Function: no shared epilogue, so return here. The result is dead — the
+        // caller tests rt_finishing and leaves without reading it — so a poison
+        // value is the honest thing to hand back.
+        deinit_body_strings();
+        if (fn_->getReturnType()->isVoidTy()) {
+            b_.CreateRetVoid();
+        } else {
+            b_.CreateRet(llvm::PoisonValue::get(fn_->getReturnType()));
+        }
+    }
+
+    // After a call that could have reached a $finish, leave if it did. Emitted
+    // only for callees the may-finish closure marks, which is no call at all in
+    // most designs (docs/design/cooperative-finish.md).
+    void emit_finish_check(bool callee_may_finish) {
+        if (!callee_may_finish) {
+            return;
+        }
+        auto* leave = llvm::BasicBlock::Create(ctx_, "finish.leave", fn_);
+        auto* go    = llvm::BasicBlock::Create(ctx_, "finish.cont", fn_);
+        b_.CreateCondBr(
+          b_.CreateICmpNE(b_.CreateLoad(b_.getInt8Ty(), finishing_gv()), b_.getInt8(0)), leave, go);
+        b_.SetInsertPoint(leave);
+        emit_finish_exit();
+        b_.SetInsertPoint(go);
+    }
+
+    // Does a call to `id` need the post-call test?
+    bool callee_may_finish(FunctionId id) const {
+        const auto k = static_cast<uint32_t>(id);
+        return k < may_finish_.size() && may_finish_[k] != 0;
+    }
+
+    // A virtual call resolves at run time, so the statically named target is not
+    // the whole answer — an override could finish where its prototype does not.
+    // Treat any virtual call as may-finish whenever the design has a may-finish
+    // subroutine at all: sound, and the sets are small enough that the
+    // over-approximation costs nothing measurable.
+    bool virtual_call_may_finish() const {
+        return std::any_of(may_finish_.begin(), may_finish_.end(), [](uint8_t v) { return v != 0; });
     }
 
     // Lower a $finish / $stop: pass the runtime the compile-time banner prefix,
@@ -12404,17 +12525,9 @@ private:
                                   : static_cast<llvm::Value*>(b_.getInt64(0));
         llvm::Value* args[] = { b_.CreateGlobalString(banner), now, b_.getInt32(info.arg) };
 
-        // Inside a process body the finish is cooperative: the runtime reports and
-        // returns, and control leaves through this body's own epilogue, so the
-        // frame is freed instead of jumped over. A subroutine body still takes the
-        // longjmp form — phase 2 of docs/design/cooperative-finish.md threads the
-        // rt_finishing test back through callers, which is what a cooperative
-        // return from a callee requires.
-        if (cur_fn_ != nullptr) {
-            b_.CreateCall(finish_fn(), args);
-            return;
-        }
-
+        // The runtime reports and returns; control leaves through this body's own
+        // epilogue, so every frame between here and the drain loop is released by
+        // its owner rather than jumped over.
         b_.CreateCall(finish_coop_fn(), args);
         // End the current settle wave from here: emptying the active ring means
         // the drain's existing head != tail test falls through to its finished
@@ -12424,17 +12537,7 @@ private:
             b_.CreateStore(b_.CreateLoad(b_.getInt32Ty(), sym(active_tail_gv_)),
                            sym(active_head_gv_));
         }
-        if (hdl_ != nullptr) {
-            // Coroutine: leave through the final suspend, exactly as a process
-            // that ran off the end of its body does, so the resumer destroys the
-            // frame once and the string temps are released on the way.
-            b_.CreateBr(coro_final_bb_);
-        } else {
-            // Thunk-elided process: a plain void body, with the same per-call
-            // string cleanup its normal epilogue does.
-            deinit_body_strings();
-            b_.CreateRetVoid();
-        }
+        emit_finish_exit();
         // The rest of the region is dead (LRM 20.2 ends the simulation here) but
         // still gets lowered, so park it in a block with no predecessors — the
         // same pruning the noreturn attribute used to buy.
@@ -13742,6 +13845,7 @@ private:
         }
         llvm::Function* cf = sym(fn_decls_[static_cast<uint32_t>(ci.func)]);
         lower_call_common(i, f, cf->getFunctionType(), cf, ci.args);
+        emit_finish_check(callee_may_finish(ci.func));
     }
 
     // Lower a virtual method call (LRM 8.20): resolve the callee from the receiver
@@ -13766,6 +13870,7 @@ private:
         llvm::FunctionType* fnty =
             fn_decls_[static_cast<uint32_t>(vci.func)]->getFunctionType();
         lower_call_common(i, f, fnty, load_vtable_callee(vci), vci.args);
+        emit_finish_check(virtual_call_may_finish());
     }
 
     // Shared marshaling + result handling for a direct or a virtual method call
@@ -14766,6 +14871,7 @@ private:
         for (auto& [lv, snap] : ref_svc) {
             service_after_write(lv, snap);
         }
+        emit_finish_check(virt ? virtual_call_may_finish() : callee_may_finish(fid));
     }
 
     // Build the runtime rt_arg[] descriptor array shared by every $display-family
@@ -16864,6 +16970,8 @@ private:
     llvm::BasicBlock*   coro_cleanup_bb_ = nullptr;
     llvm::BasicBlock*   coro_final_bb_   = nullptr;
     std::optional<bool> design_has_finish_;
+    // Per-subroutine may-finish closure; see compute_may_finish.
+    std::vector<uint8_t> may_finish_;
     llvm::BasicBlock*   coro_ret_bb_     = nullptr;
     // The current coroutine's scheduled flag: &clotho.proc_sched[this process] for
     // a process (a Constant GEP), or a frame-resident i32 alloca for a task.

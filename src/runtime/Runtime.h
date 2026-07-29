@@ -101,9 +101,9 @@ void rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uin
 // suspending simulation and $finish as exiting to the OS; it mandates no
 // interactive mode. Clotho has no mechanism to resume a suspended run, so a
 // suspend that can never resume is observationally identical to exit, and $stop
-// is treated identically to $finish. Never returns to the caller: control
-// transfers to the host installed by rt_finish_host (run_jit), or the process
-// exits when no host is installed.
+// is treated identically to $finish. Returns to its caller, which is a JIT'd
+// body that then leaves through its own epilogue; the drain loop stops when it
+// sees rt_finishing.
 //
 // Before exiting it prints the exit banner per LRM Table 20-1, selected by
 // `arg` (0/1/2): 0 prints nothing, 1 prints "<banner> called at <time>", 2 adds
@@ -111,15 +111,11 @@ void rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uin
 // prefix; `now` is the current simulation time in design ticks. The banner goes
 // to stderr (a simulator diagnostic, not design output; the LRM fixes its
 // content but not the stream).
-[[noreturn]] void rt_finish(const char* banner, uint64_t now, int32_t arg);
-
-// The cooperative form of the same task: prints the banner, sets rt_finishing,
-// and RETURNS, leaving it to the caller to unwind. A JIT'd process body calls
-// this and branches straight to its coroutine epilogue, so the frame is freed
-// rather than jumped over -- see docs/design/cooperative-finish.md for why the
-// longjmp form cannot survive on Windows (its longjmp unwinds, and JIT'd frames
-// carry no unwind data) and corrupts the heap elsewhere. Sites that cannot yet
-// unwind cooperatively keep calling rt_finish above.
+// Prints the banner, sets rt_finishing, and RETURNS: the JIT'd body that called
+// it leaves through its own epilogue, so every frame down to the drain loop is
+// released by its owner. It used to longjmp instead, which cannot work on
+// Windows (longjmp there unwinds, and JIT'd frames carry no unwind data) and
+// corrupted the heap elsewhere -- docs/design/cooperative-finish.md.
 void rt_finish_coop(const char* banner, uint64_t now, int32_t arg);
 
 // Non-zero once a $finish / $stop has been taken. The JIT loads this after
@@ -167,18 +163,9 @@ void rt_defer_report(int32_t level, uint64_t is_final, const void* gen, uint64_t
 void rt_defer_flush_observed(void);
 void rt_defer_flush_final(void);
 
-// Install (or clear, with null) the setjmp target rt_finish longjmps to, so a
-// $finish ends only the simulation, not the embedding process (the test binary
-// runs many simulations). The jump abandons live coroutine frames — acceptable,
-// the simulation is over. `env` points at a std::jmp_buf.
-void rt_finish_host(void* env);
-
-// Drive one simulation: run `drain` (the event loop) under a $finish catch, then
-// run `finals` (the `final` blocks, LRM 9.2.3). A $finish during the drain
-// longjmps to this frame's own catch, so the finals still execute with the
-// design state (owned by main, which called this) live. `state` and `wheel` are
-// forwarded verbatim to both callbacks. Returns after the finals complete (or a
-// final block's own $finish transfers to the outer host / exits).
+// Drive one simulation: run `drain` (the event loop), then `finals` (the
+// `final` blocks, LRM 9.2.3). `drain` returns normally whether it ran out of
+// work or a $finish stopped it, so the finals run on both paths.
 void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*), void (*finals)(void*, void*));
 
 // -- File I/O (LRM 1800-2023 §21.3) --
@@ -414,7 +401,7 @@ void rt_vcd_all(void);
 void rt_vcd_dumpflush(void);
 
 // Final flush of the in-progress instant + output buffer, then close the file.
-// Called on normal simulation end and on the $finish longjmp path.
+// Called on normal simulation end and when a $finish stops the drain.
 void rt_vcd_close(void);
 
 int32_t rt_random(void);

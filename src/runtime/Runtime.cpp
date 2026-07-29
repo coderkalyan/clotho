@@ -2732,8 +2732,6 @@ namespace {
 
 // Where rt_finish returns control: the run_jit frame that started the
 // simulation, or null when the design runs standalone.
-std::jmp_buf* finish_env = nullptr;
-
 // Append the simulation time `now` (in design ticks) as "<value> <unit>",
 // reduced to the largest SI unit that divides it evenly (fs / ps / ns / us / ms
 // / s). A unitless design (tick_fs == 0) prints the raw tick count. Used only by
@@ -2808,17 +2806,12 @@ FinishStats finish_stats() {
 
 } // namespace
 
-extern "C" void rt_finish_host(void* env) {
-    finish_env = static_cast<std::jmp_buf*>(env);
-}
-
-extern "C" unsigned char rt_finishing = 0;
+unsigned char rt_finishing = 0;
 
 namespace {
 
 // Everything a $finish does before control leaves: the Observed drain, the
-// banner, and closing the dump. Shared by the longjmp form and the cooperative
-// one, which differ only in how they leave.
+// banner, and closing the dump.
 void finish_report(const char* banner, uint64_t now, int32_t arg) {
     rt_observed_flush();
     if (arg >= 1) {
@@ -2839,36 +2832,19 @@ void finish_report(const char* banner, uint64_t now, int32_t arg) {
         std::fflush(stderr);
     }
     // Flush and close the VCD while the design's stack (state + wheel the engine
-    // points at) is still live — the longjmp below unwinds it, so the sim loop's
-    // own close at wheel-drain is never reached on this path. A no-op when no dump
-    // is open.
+    // points at) is still live: the drain stops before its own close at
+    // wheel-drain. A no-op when no dump is open.
     rt_vcd_close();
 }
 
 } // namespace
 
-extern "C" void rt_finish(const char* banner, uint64_t now, int32_t arg) {
-    finish_report(banner, now, arg);
-    rt_finishing = 1;
-    // Jump back to the host that started the run when one is installed — this
-    // form is declared noreturn, so returning is not an option. Otherwise exit;
-    // std::exit runs atexit handlers and flushes C stdio, so any buffered
-    // $display output is committed before the process leaves.
-    if (finish_env != nullptr) {
-        std::longjmp(*finish_env, 1);
-    }
-    std::exit(0);
-}
-
 extern "C" void rt_finish_coop(const char* banner, uint64_t now, int32_t arg) {
     finish_report(banner, now, arg);
     rt_finishing = 1;
-    // Returns. The caller — a JIT'd process body — branches to its coroutine
-    // epilogue, and the drain loop sees rt_finishing and stops. When no host is
-    // installed there is nothing to return to, so keep the old exit behavior.
-    if (finish_env == nullptr) {
-        std::exit(0);
-    }
+    // Returns. The caller is a JIT'd body, which leaves through its own
+    // epilogue; each frame between here and the drain loop is released by its
+    // owner, and the drain sees rt_finishing and stops.
 }
 
 extern "C" void rt_oscillation_abort(const rt_wheel* wheel) {
@@ -2891,9 +2867,10 @@ extern "C" void rt_oscillation_abort(const rt_wheel* wheel) {
     std::fflush(stderr);
     rt_vcd_close();
     rt_finishing = 1;
-    if (finish_env != nullptr) {
-        std::longjmp(*finish_env, 1);
-    }
+    // A non-converging design cannot be handed back to the host mid-instant --
+    // there is no settled state to return -- so this one path still ends the
+    // process. std::exit, not a longjmp: it is portable, and it keeps the
+    // nonzero status that distinguishes a hang from a clean run.
     std::exit(1);
 }
 
@@ -3036,20 +3013,10 @@ extern "C" void rt_defer_flush_final() {
 extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*),
                            void (*finals)(void*, void*)) {
     // Run the simulation, then the `final` blocks (LRM 9.2.3), so the finals see
-    // the settled design state on BOTH exit paths. The natural drain returns from
-    // `drain`; a $finish inside it longjmps out of the abandoned coroutine frames
-    // back to the local catch below — main's state/wheel allocas stay live because
-    // main sits beneath this frame. Either way, control reaches the finals.
+    // the settled design state on BOTH exit paths. `drain` now returns normally
+    // whether it ran out of work or a $finish stopped it, so there is one path.
     rt_finishing = 0; // a prior run in this process may have set it
-    std::jmp_buf  local;
-    std::jmp_buf* prev = finish_env; // outer host catch (run_jit), restored below
-    if (setjmp(local) == 0) {
-        finish_env = &local;
-        drain(state, wheel);
-    }
-    // Restore the outer catch before the finals so a $finish in a final block
-    // exits cleanly (to the host / process exit) rather than re-entering here.
-    finish_env = prev;
+    drain(state, wheel);
     finals(state, wheel);
 }
 
