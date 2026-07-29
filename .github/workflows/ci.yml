@@ -222,22 +222,30 @@ jobs:
           echo "$out"
           [ "$out" = "Hello, world!" ]
 
-      # windows-arm64 halts after 338 cases, always immediately before
-      # gate_test's "single-value gate delay is inertial". Run that one case on
-      # its own to tell a trigger apart from accumulated state: if it crashes
-      # alone the design is the cause, if it passes alone something earlier in
-      # the suite set it up. There is no Windows host to attach a debugger to.
-      - name: Isolate the windows-arm64 halt (diagnostic)
+      # windows-arm64 segfaults on gate_test's "single-value gate delay is
+      # inertial" even when that case runs alone, so the design triggers it
+      # rather than state left by earlier tests. Narrow it further: `assign #N`
+      # (the same inertial machinery) and undelayed gates both pass in the
+      # suite, so the suspect is specifically a gate WITH a delay. Drive the CLI
+      # so each variant is its own process and one crash cannot hide the rest.
+      - name: Bisect the windows-arm64 gate-delay crash (diagnostic)
         if: always() && runner.os == 'Windows'
         continue-on-error: true
         run: |
           set -u
-          exe=build/clotho_test
+          exe=build/clotho
           if [ -f "$exe.exe" ]; then exe="$exe.exe"; fi
-          echo "--- the suspect case alone ---"
-          "$exe" --duration=true -tc="single-value gate delay is inertial*"; echo "exit=$?"
-          echo "--- its whole file alone ---"
-          "$exe" --duration=true -sf="*gate_test.cpp"; echo "exit=$?"
+          mkdir -p probe
+          printf '%s\n' 'module m; logic a, b; wire y; and (y, a, b);' 'initial begin a=0; b=0; #1 a=1; b=1; #1 $display("y=%b", y); $finish; end' 'endmodule' > probe/a_gate_plain.sv
+          printf '%s\n' 'module m; logic a, b; wire y; assign #3 y = a & b;' 'initial begin a=0; b=0; #1 a=1; b=1; #5 $display("y=%b", y); $finish; end' 'endmodule' > probe/b_assign_delay.sv
+          printf '%s\n' 'module m; logic a, b; wire y; and #3 (y, a, b);' 'initial begin a=0; b=0; #1 a=1; b=1; #5 $display("y=%b", y); $finish; end' 'endmodule' > probe/c_gate_delay.sv
+          printf '%s\n' 'module m; logic a; wire y; buf #3 (y, a);' 'initial begin a=0; #1 a=1; #5 $display("y=%b", y); $finish; end' 'endmodule' > probe/d_buf_delay.sv
+          printf '%s\n' 'module m; logic a, b; wire y; and #3 (y, a, b);' 'initial begin a=0; b=0; #1 a=1; b=1; #5 $display("y=%b", y); end' 'endmodule' > probe/e_gate_delay_nofinish.sv
+          printf '%s\n' 'module m; logic a, b; wire y; and #3 (y, a, b);' 'initial begin a=0; b=0; $finish; end' 'endmodule' > probe/f_gate_delay_noprop.sv
+          for f in probe/*.sv; do
+            echo "--- $f"
+            "$exe" "$f" || echo "  EXIT=$?"
+          done
 
       - name: ccache statistics
         if: always()
