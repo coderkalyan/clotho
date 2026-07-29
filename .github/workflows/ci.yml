@@ -48,7 +48,7 @@ jobs:
             {"name": "linux-arm64",   "runner": "ubuntu-24.04-arm", "shell": "bash"},
             {"name": "macos-arm64",   "runner": "macos-15",        "shell": "bash"},
             {"name": "macos-x64",     "runner": "macos-15-intel",  "shell": "bash"},
-            {"name": "windows-x64",   "runner": "windows-2025",   "msystem": "CLANG64",    "shell": "msys2 {0}", "experimental": true},
+            {"name": "windows-x64",   "runner": "windows-2025",   "msystem": "CLANG64",    "shell": "msys2 {0}"},
             {"name": "windows-arm64", "runner": "windows-11-arm",  "msystem": "CLANGARM64", "shell": "msys2 {0}", "experimental": true}
           ]
           JSON
@@ -75,7 +75,8 @@ jobs:
     name: ${{ matrix.name }}
     needs: plan
     runs-on: ${{ matrix.runner }}
-    # Windows has never been built; it is wired up for signal, not as a gate.
+    # windows-arm64 is still the only target with known failures, so it alone
+    # stays advisory; every other target gates.
     continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
@@ -221,34 +222,6 @@ jobs:
           out=$("$exe" examples/initial.v)
           echo "$out"
           [ "$out" = "Hello, world!" ]
-
-      # windows-arm64 segfaults on gate_test's "single-value gate delay is
-      # inertial" even when that case runs alone, so the design triggers it
-      # rather than state left by earlier tests. Narrow it further: `assign #N`
-      # (the same inertial machinery) and undelayed gates both pass in the
-      # suite, so the suspect is specifically a gate WITH a delay. Drive the CLI
-      # so each variant is its own process and one crash cannot hide the rest.
-      - name: Bisect the windows-arm64 gate-delay crash (diagnostic)
-        if: always() && runner.os == 'Windows'
-        continue-on-error: true
-        run: |
-          set -u
-          exe=build/clotho
-          if [ -f "$exe.exe" ]; then exe="$exe.exe"; fi
-          mkdir -p probe
-          printf '%s\n' 'module m; logic a, b; wire y; and (y, a, b);' 'initial begin a=0; b=0; #1 a=1; b=1; #1 $display("y=%b", y); $finish; end' 'endmodule' > probe/a_gate_plain.sv
-          printf '%s\n' 'module m; logic a, b; wire y; assign #3 y = a & b;' 'initial begin a=0; b=0; #1 a=1; b=1; #5 $display("y=%b", y); $finish; end' 'endmodule' > probe/b_assign_delay.sv
-          printf '%s\n' 'module m; logic a, b; wire y; and #3 (y, a, b);' 'initial begin a=0; b=0; #1 a=1; b=1; #5 $display("y=%b", y); $finish; end' 'endmodule' > probe/c_gate_delay.sv
-          printf '%s\n' 'module m; logic a; wire y; buf #3 (y, a);' 'initial begin a=0; #1 a=1; #5 $display("y=%b", y); $finish; end' 'endmodule' > probe/d_buf_delay.sv
-          printf '%s\n' 'module m; logic a, b; wire y; and #3 (y, a, b);' 'initial begin a=0; b=0; #1 a=1; b=1; #5 $display("y=%b", y); end' 'endmodule' > probe/e_gate_delay_nofinish.sv
-          printf '%s\n' 'module m; logic a, b; wire y; and #3 (y, a, b);' 'initial begin a=0; b=0; $finish; end' 'endmodule' > probe/f_gate_delay_noprop.sv
-          printf '%s\n' 'module m; logic a, b; wire y; assign #0 y = a & b;' 'initial begin a=0; b=0; #1 a=1; b=1; #5 $display("y=%b", y); $finish; end' 'endmodule' > probe/g_assign_zero_delay.sv
-          printf '%s\n' 'module m; logic a, b; logic y;' 'always @* y <= #3 (a & b);' 'initial begin a=0; b=0; #1 a=1; b=1; #5 $display("y=%b", y); $finish; end' 'endmodule' > probe/h_nba_intra_delay.sv
-          printf '%s\n' 'module m; logic a, b; wire y; assign #100 y = a & b;' 'initial begin a=0; b=0; #1 a=1; b=1; #2 $finish; end' 'endmodule' > probe/i_assign_armed_never_fires.sv
-          for f in probe/*.sv; do
-            echo "--- $f"
-            "$exe" "$f" || echo "  EXIT=$?"
-          done
 
       - name: ccache statistics
         if: always()
