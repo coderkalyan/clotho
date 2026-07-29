@@ -222,6 +222,23 @@ jobs:
           echo "$out"
           [ "$out" = "Hello, world!" ]
 
+      # windows-arm64 halts after 338 cases, always immediately before
+      # gate_test's "single-value gate delay is inertial". Run that one case on
+      # its own to tell a trigger apart from accumulated state: if it crashes
+      # alone the design is the cause, if it passes alone something earlier in
+      # the suite set it up. There is no Windows host to attach a debugger to.
+      - name: Isolate the windows-arm64 halt (diagnostic)
+        if: always() && runner.os == 'Windows'
+        continue-on-error: true
+        run: |
+          set -u
+          exe=build/clotho_test
+          if [ -f "$exe.exe" ]; then exe="$exe.exe"; fi
+          echo "--- the suspect case alone ---"
+          "$exe" --duration=true -tc="single-value gate delay is inertial*"; echo "exit=$?"
+          echo "--- its whole file alone ---"
+          "$exe" --duration=true -sf="*gate_test.cpp"; echo "exit=$?"
+
       - name: ccache statistics
         if: always()
         run: ccache --show-stats

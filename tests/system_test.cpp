@@ -100,17 +100,30 @@ TEST_CASE("$system full tier accepts a runtime-computed command") {
 // -- Semantics --------------------------------------------------------------
 
 TEST_CASE("$system function form returns the raw system() status") {
-    // LRM §20.17.1: the function form returns the C system() return, a POSIX
-    // wait-status. "exit 3" -> WEXITSTATUS 3, encoded as 3<<8 = 768; "exit 0"
-    // -> 0. The value follows directly from the C system() the LRM defers to;
-    // iverilog 13 has no $system support (neither task nor function form), so it
-    // is not an oracle here.
+    // LRM §20.17.1: the function form returns "the return value of the call to
+    // system()" -- the LRM defers to the C library, and that value's ENCODING is
+    // platform-defined. POSIX yields a wait status, so "exit 3" is WEXITSTATUS 3
+    // encoded as 3<<8 = 768; the Windows CRT yields the exit code itself, 3.
+    // Clotho passes the int through untouched on both, which is the LRM-literal
+    // behavior -- so the expectation, not the runtime, is
+    // what varies here. iverilog 13 has no $system support (neither task nor
+    // function form), so it is not an oracle either way.
     const std::string out = run_capture(
       "module m; initial begin int a, b;"
       " a = $system(\"exit 3\"); b = $system(\"exit 0\");"
       " $display(\"%0d %0d\", a, b); $finish; end endmodule",
       ir::SystemAccess::Full);
+#if defined(_WIN32)
+    CHECK(out == "3 0\n");
+#else
     CHECK(out == "768 0\n");
+#endif
+    // The portable part, and the only property a design should depend on: a
+    // failing command is nonzero, a succeeding one is zero.
+    int a = -1, b = -1;
+    REQUIRE(std::sscanf(out.c_str(), "%d %d", &a, &b) == 2);
+    CHECK(a != 0);
+    CHECK(b == 0);
 }
 
 TEST_CASE("$system no-arg form probes for a shell") {
