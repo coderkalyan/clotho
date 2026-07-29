@@ -1,11 +1,13 @@
 #include <doctest/doctest.h>
 
 #include <cstdio>
+#include <filesystem>
 #include <string>
 #include <string_view>
 
 #include "Lower.h"
 #include "PosixIo.h"
+#include "Subprocess.h"
 #include "ir/Jit.h"
 
 using namespace clotho;
@@ -768,13 +770,18 @@ TEST_CASE("$sformatf formats into a string value") {
 // rt_string bytes in natural order (spill_ascii_arg forward=1), so the filename
 // is not byte-reversed like a packed vector. Round-trips through a real file.
 TEST_CASE("dynamic-string $fopen filename/mode and $sscanf source") {
-    const std::string out = run_capture(R"(
+    // generic_string(): the path is spliced into a SystemVerilog string literal,
+    // where a Windows path's backslashes would read as escapes.
+    const std::string fpath =
+      (std::filesystem::temp_directory_path() / (clotho::test::detail::unique_stem() + ".txt"))
+        .generic_string();
+    const std::string out = run_capture(std::string(R"(
         module m;
             integer fd, rc;
             string  fname, mode, line;
             int     a, b;
             initial begin
-                fname = "/tmp/clotho_dynstr_fopen_test.txt";
+                fname = ")") + fpath + R"(";
                 mode  = "w";
                 fd = $fopen(fname, mode);
                 $fwrite(fd, "12 34\n");

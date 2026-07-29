@@ -35,11 +35,25 @@
 #include "runtime/Runtime.h"
 #include "runtime/svdpi.h"
 
-#if defined(__MINGW32__) && defined(__x86_64__)
+#if defined(__MINGW32__)
+// The 128-bit arithmetic helpers the backend emits for wide (>64-bit) operands.
+// A dynamically linked host finds these through libgcc_s in the process symbol
+// table, but the MinGW toolchain links libgcc statically -- and clotho's own
+// native code never divides a 128-bit integer, so the objects defining them are
+// not pulled in at all and there is nothing to export. Naming them here forces
+// the link and gives the JIT something to bind to.
+extern "C" {
+__int128          __divti3(__int128, __int128);
+__int128          __modti3(__int128, __int128);
+unsigned __int128 __udivti3(unsigned __int128, unsigned __int128);
+unsigned __int128 __umodti3(unsigned __int128, unsigned __int128);
+}
+#if defined(__x86_64__)
 // libgcc's stack-probe helper, x86_64-only — AArch64 Windows has no such
 // symbol. Declared here only to take its address; the calling convention is
 // private to the compiler, so it is never called from C++.
 extern "C" void ___chkstk_ms(void);
+#endif
 #endif
 
 namespace clotho::ir {
@@ -382,6 +396,10 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     //                   which process bodies with wide state reach readily.
     //                   x86_64 only; AArch64 Windows has no such symbol.
     expose("__main", +[] {});
+    expose("__divti3", &__divti3);
+    expose("__modti3", &__modti3);
+    expose("__udivti3", &__udivti3);
+    expose("__umodti3", &__umodti3);
 #if defined(__x86_64__)
     expose("___chkstk_ms", &___chkstk_ms);
 #endif

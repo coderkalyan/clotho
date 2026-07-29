@@ -2313,8 +2313,10 @@ TEST_CASE("net declaration assignment is continuous") {
 }
 
 // Write `text` to `path` for a $readmem test, replacing any existing file.
+// Binary: a text-mode stream rewrites \n as \r\n on Windows, and these fixtures
+// are compared byte-for-byte against what the design reads back.
 void write_file(const char* path, std::string_view text) {
-    std::FILE* f = std::fopen(path, "w");
+    std::FILE* f = std::fopen(path, "wb");
     REQUIRE(f != nullptr);
     std::fwrite(text.data(), 1, text.size(), f);
     std::fclose(f);

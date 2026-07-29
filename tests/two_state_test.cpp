@@ -377,7 +377,9 @@ TEST_CASE("scalar $fread into a narrow 2-state slot does not overrun (canary)") 
 TEST_CASE("$fgets into a narrow 2-state slot does not overrun (canary)") {
     const char* path = "clotho_fgets_narrow_test.txt";
     {
-        std::FILE* f = std::fopen(path, "w");
+        // Binary: text mode would write "hi\r\n" on Windows, and this canary
+        // checks the exact bytes $fgets deposits.
+        std::FILE* f = std::fopen(path, "wb");
         REQUIRE(f != nullptr);
         std::fputs("hi\n", f);
         std::fclose(f);
