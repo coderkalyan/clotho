@@ -479,6 +479,37 @@ TEST_CASE("one-hot: no definite-1 bit hits default") {
     CHECK(run_capture(src) == "def\n");
 }
 
+TEST_CASE("a vector condition with a definite 1 bit is definitely true") {
+    // The three neighbouring truth-of-X tests all use 1-bit conditions, so none
+    // pins the definite-1-dominates direction on a multi-bit vector. A reduction
+    // written as "any bit unknown -> X" passes all of them, yet would classify
+    // every partially-unknown vector condition as X-controlled.
+    //
+    // LRM 11.4.7 gives a true / false / "ambiguous truth value" trichotomy, and
+    // 11.4.9 Table 11-17 (reduction OR) decides which bucket applies: row 1 is
+    // all ones, so one definite-1 bit forces a definite 1. Hence 4'b010x is
+    // unambiguously true despite the x, and only 4'b000x is ambiguous.
+    //
+    // Note the published rule disagrees: Sutherland 2005 and Standard Gotchas
+    // 2006 6.10 both require that no bit be x/z for the condition to be true,
+    // 6.10 using 4'b010z as its worked example. That is not the LRM's rule;
+    // iverilog agrees with the expectation below on every line.
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] v;
+            initial begin
+                v = 4'b010x;
+                if (v) $display("t"); else $display("f");
+                v = 4'b010z;
+                if (v) $display("t"); else $display("f");
+                v = 4'b000x;
+                if (v) $display("t"); else $display("f");
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "t\nt\nf\n");
+}
+
 TEST_CASE("one-hot with a gap in indices masks unselected bits") {
     // Only bits 0 and 3 are arms; bit 1 is set but has no arm -> must not
     // shadow. Here bit 3 set, bit 1 set -> arm for bit 3 (ascending: lowest
@@ -582,7 +613,7 @@ TEST_CASE("priority case: no match, no default reports a violation") {
             end
         endmodule
     )";
-    const std::string err = run_capture_stderr(src);
+    const std::string          err = run_capture_stderr(src);
     CHECK(err.find("no condition is true") != std::string::npos);
     // Design output is unchanged: nothing matched, so no $display fired.
     CHECK(run_capture(src).empty());
@@ -612,7 +643,7 @@ TEST_CASE("priority case: Observed-region report is stamped with the settled ins
             end
         endmodule
     )";
-    const std::string err = run_capture_stderr(src);
+    const std::string          err = run_capture_stderr(src);
     // One report per violating settle pass (no maturation yet).
     CHECK(count_occ(err, "no condition is true") == 2);
     // Each report carries the time of its own instant, proving the deferral
@@ -704,7 +735,7 @@ TEST_CASE("unique case: no match, no default reports a no-match violation") {
             end
         endmodule
     )";
-    const std::string err = run_capture_stderr(src);
+    const std::string          err = run_capture_stderr(src);
     CHECK(err.find("no condition is true") != std::string::npos);
     CHECK(err.find("not unique") == std::string::npos);
 }
@@ -739,7 +770,7 @@ TEST_CASE("unique casez: overlapping items report and run the first match") {
         endmodule
     )";
     CHECK(run_capture_stderr(src).find("not unique") != std::string::npos);
-    CHECK(run_capture(src) == "hi\n");  // first match wins despite the violation
+    CHECK(run_capture(src) == "hi\n"); // first match wins despite the violation
 }
 
 // unique0 reports overlap too (only its no-match check differs from unique).
@@ -791,7 +822,7 @@ TEST_CASE("unique case: duplicate constant label reports an overlap") {
         endmodule
     )";
     CHECK(run_capture_stderr(src).find("not unique") != std::string::npos);
-    CHECK(run_capture(src) == "x\n");  // first match still runs
+    CHECK(run_capture(src) == "x\n"); // first match still runs
 }
 
 // A default suppresses the no-match report for unique (default always matches),
@@ -840,7 +871,7 @@ TEST_CASE("priority if: no true condition, no else reports a violation") {
         endmodule
     )";
     CHECK(run_capture_stderr(src).find("no condition is true") != std::string::npos);
-    CHECK(run_capture(src).empty());  // nothing matched, so no branch ran
+    CHECK(run_capture(src).empty()); // nothing matched, so no branch ran
 }
 
 // A matching condition suppresses the report and runs that arm (first match).
@@ -921,7 +952,7 @@ TEST_CASE("unique if: overlapping conditions report and run the first") {
         endmodule
     )";
     CHECK(run_capture_stderr(src).find("not unique") != std::string::npos);
-    CHECK(run_capture(src) == "lo\n");  // first true arm wins despite the violation
+    CHECK(run_capture(src) == "lo\n"); // first true arm wins despite the violation
 }
 
 // Exactly one condition true: no violation.
@@ -950,7 +981,7 @@ TEST_CASE("unique if: no true condition, no else reports a no-match") {
             end
         endmodule
     )";
-    const std::string err = run_capture_stderr(src);
+    const std::string          err = run_capture_stderr(src);
     CHECK(err.find("no condition is true") != std::string::npos);
     CHECK(err.find("not unique") == std::string::npos);
 }
@@ -1018,8 +1049,7 @@ TEST_CASE("case inside: LRM 12.5.4 worked example") {
             end
         endmodule
     )";
-    CHECK(run_capture(src) ==
-          "task2\ntask1\ntask2\ntask1\ntask2\ntask2\ntask2\ntask2\n");
+    CHECK(run_capture(src) == "task2\ntask1\ntask2\ntask1\ntask2\ntask2\ntask2\ntask2\n");
     CHECK(run_capture_stderr(src).empty());
 }
 
