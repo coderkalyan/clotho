@@ -3010,6 +3010,28 @@ extern "C" void rt_defer_flush_final() {
     defer_mature(/*final_pass=*/true);
 }
 
+// Return the process-global simulation state to its power-on condition. Called
+// at the end of every run, so the next simulation in this process starts clean.
+//
+// This matters because several of these outlive the JIT session that created
+// their contents: g_monitor.ramp is a function pointer INTO the JIT'd code, and
+// g_strobe_queue holds coroutine handles. run_jit destroys the LLJIT when it
+// returns, so anything left here dangles, and the next simulation's Postponed
+// drain would call or resume it. Only a host that runs more than one simulation
+// per process can observe that -- the CLI runs exactly one -- but clotho_test
+// runs it a thousand times over.
+namespace {
+void sim_teardown() {
+    g_monitor = MonitorState{};
+    g_strobe_queue.clear();
+    g_strobe_read = 0;
+    g_observed_case.clear();
+    g_defer.clear();
+    rt_nba_arr_reset();
+    rt_intra_reset();
+}
+} // namespace
+
 extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*),
                            void (*finals)(void*, void*)) {
     // Run the simulation, then the `final` blocks (LRM 9.2.3), so the finals see
@@ -3018,6 +3040,7 @@ extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*)
     rt_finishing = 0; // a prior run in this process may have set it
     drain(state, wheel);
     finals(state, wheel);
+    sim_teardown();
 }
 
 extern "C" void rt_fflush(int32_t desc) {
