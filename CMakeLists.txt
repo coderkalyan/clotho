@@ -46,6 +46,30 @@ else()
   llvm_map_components_to_libnames(LLVM_LIBS core support orcjit jitlink native bitwriter bitreader)
 endif()
 
+# fmt, pinned here rather than left to slang. slang declares fmt with
+# `FIND_PACKAGE_ARGS 12.1`, which makes FetchContent prefer ANY system fmt >= 12.1
+# over the 12.1.0 it pins -- so the build silently tracks whatever the OS ships.
+# That broke: fmt 12.2.0 made `fmt/core.h` stop including `format.h` unless
+# FMT_DEPRECATED_HEAVY_CORE is defined, and slang's sources still include
+# <fmt/core.h> while calling fmt::format. A system fmt upgrade therefore turned a
+# clean build into a wall of "'format' is not a member of 'fmt'".
+#
+# FetchContent honors the FIRST declaration of a name, so declaring fmt before
+# MakeAvailable(slang) wins over slang's. Deliberately no FIND_PACKAGE_ARGS: the
+# point is to stop consulting the system copy at all, which makes the build
+# reproducible for the one transitive dependency that was still floating free
+# (slang, doctest and unordered_dense are all SHA-pinned below).
+#
+# Only DECLARED here, not made available: slang's external/CMakeLists.txt forces
+# it static and sets FMT_SYSTEM_HEADERS around its own MakeAvailable, and that
+# setup should stay slang's business.
+FetchContent_Declare(
+  fmt
+  GIT_REPOSITORY https://github.com/fmtlib/fmt.git
+  GIT_TAG        407c905e45ad75fc29bf0f9bb7c5c2fd3475976f # 12.1.0, the version slang pins
+  GIT_SHALLOW    ON
+)
+
 FetchContent_Declare(
   slang
   GIT_REPOSITORY https://github.com/MikePopoloski/slang.git
