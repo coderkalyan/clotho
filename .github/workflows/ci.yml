@@ -242,6 +242,9 @@ jobs:
           printf '%s\n' 'module m; logic a; wire y; buf #3 (y, a);' 'initial begin a=0; #1 a=1; #5 $display("y=%b", y); $finish; end' 'endmodule' > probe/d_buf_delay.sv
           printf '%s\n' 'module m; logic a, b; wire y; and #3 (y, a, b);' 'initial begin a=0; b=0; #1 a=1; b=1; #5 $display("y=%b", y); end' 'endmodule' > probe/e_gate_delay_nofinish.sv
           printf '%s\n' 'module m; logic a, b; wire y; and #3 (y, a, b);' 'initial begin a=0; b=0; $finish; end' 'endmodule' > probe/f_gate_delay_noprop.sv
+          printf '%s\n' 'module m; logic a, b; wire y; assign #0 y = a & b;' 'initial begin a=0; b=0; #1 a=1; b=1; #5 $display("y=%b", y); $finish; end' 'endmodule' > probe/g_assign_zero_delay.sv
+          printf '%s\n' 'module m; logic a, b; logic y;' 'always @* y <= #3 (a & b);' 'initial begin a=0; b=0; #1 a=1; b=1; #5 $display("y=%b", y); $finish; end' 'endmodule' > probe/h_nba_intra_delay.sv
+          printf '%s\n' 'module m; logic a, b; wire y; assign #100 y = a & b;' 'initial begin a=0; b=0; #1 a=1; b=1; #2 $finish; end' 'endmodule' > probe/i_assign_armed_never_fires.sv
           for f in probe/*.sv; do
             echo "--- $f"
             "$exe" "$f" || echo "  EXIT=$?"
