@@ -3664,6 +3664,45 @@ private:
     // handle from the awaiter and pushes it onto the active queue. The scheduler
     // resumes it (with everything else woken at the same instant) when it next
     // drains the queue. Built once per module.
+    // A JIT-local forwarder for a native wheel-expiry callback.
+    //
+    // The wheel stores an expiry callback in the timer node and calls it when the
+    // timer fires, so the address has to be materialized into memory. Doing that
+    // for a *runtime* symbol is a different relocation from calling one (address
+    // materialization rather than a branch), and JITLink gets it wrong on
+    // AArch64 COFF: the stored pointer is bad and the process dies the instant
+    // the timer fires. Every design using `assign #d`, a gate delay, or `<= #d`
+    // segfaulted on windows-arm64 for this reason, while process #delay and
+    // delayed event triggers -- whose callbacks are JIT-emitted functions --
+    // were fine on the same host.
+    //
+    // Forwarding through a JIT-local function puts every wheel callback on that
+    // same working footing: the address materialized into the timer is a local
+    // symbol, and reaching the runtime is an ordinary call.
+    llvm::Function* native_cb_trampoline(const char* name, llvm::FunctionCallee target,
+                                         llvm::Function*& cache) {
+        if (cache != nullptr) {
+            return sym(cache);
+        }
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
+        cache      = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, name, env_->llmod);
+
+        llvm::IRBuilder<> tb(ctx_);
+        tb.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", cache));
+        tb.CreateCall(target, { cache->getArg(0), cache->getArg(1) });
+        tb.CreateRetVoid();
+        return sym(cache);
+    }
+
+    llvm::Function* intra_cb_trampoline() {
+        return native_cb_trampoline("clotho.intra_cb", intra_cb_fn(), intra_cb_tramp_);
+    }
+
+    llvm::Function* inertial_cb_trampoline() {
+        return native_cb_trampoline("clotho.inertial_cb", inertial_cb_fn(), inertial_cb_tramp_);
+    }
+
     llvm::Function* enqueue_trampoline() {
         if (enqueue_fn_ != nullptr) {
             return sym(enqueue_fn_);
@@ -11926,7 +11965,7 @@ private:
         auto  schedule  = [&] {
             llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
             b_.CreateCall(wheel_schedule_fn(),
-                          { wheel_, rec, b_.CreateAdd(now, ticks), intra_cb_fn().getCallee() });
+                          { wheel_, rec, b_.CreateAdd(now, ticks), intra_cb_trampoline() });
         };
         auto immediate = [&] { b_.CreateCall(intra_cb_fn(), { rec, nullp }); };
 
@@ -12017,7 +12056,7 @@ private:
         auto  schedule = [&] {
             llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
             b_.CreateCall(wheel_schedule_fn(),
-                          { wheel_, rec, b_.CreateAdd(now, ticks), inertial_cb_fn().getCallee() });
+                          { wheel_, rec, b_.CreateAdd(now, ticks), inertial_cb_trampoline() });
         };
         auto immediate = [&] { b_.CreateCall(inertial_cb_fn(), { rec, nullp }); };
 
@@ -16998,6 +17037,10 @@ private:
     // queue holds processes parked on a zero delay (#0): drained into active at
     // the same instant, after active settles but before NBA.
     llvm::Function*                     enqueue_fn_        = nullptr;
+    // JIT-local forwarders for the two native wheel-expiry callbacks; see
+    // native_cb_trampoline.
+    llvm::Function*                     intra_cb_tramp_    = nullptr;
+    llvm::Function*                     inertial_cb_tramp_ = nullptr;
     llvm::GlobalVariable*               active_gv_         = nullptr;
     llvm::GlobalVariable*               active_head_gv_    = nullptr;
     llvm::GlobalVariable*               active_tail_gv_    = nullptr;
