@@ -2812,7 +2812,14 @@ extern "C" void rt_finish_host(void* env) {
     finish_env = static_cast<std::jmp_buf*>(env);
 }
 
-extern "C" void rt_finish(const char* banner, uint64_t now, int32_t arg) {
+extern "C" unsigned char rt_finishing = 0;
+
+namespace {
+
+// Everything a $finish does before control leaves: the Observed drain, the
+// banner, and closing the dump. Shared by the longjmp form and the cooperative
+// one, which differ only in how they leave.
+void finish_report(const char* banner, uint64_t now, int32_t arg) {
     rt_observed_flush();
     if (arg >= 1) {
         std::fflush(stdout);
@@ -2836,14 +2843,32 @@ extern "C" void rt_finish(const char* banner, uint64_t now, int32_t arg) {
     // own close at wheel-drain is never reached on this path. A no-op when no dump
     // is open.
     rt_vcd_close();
-    // Jump back to the host that started the run when one is installed — the
-    // codegen relies on rt_finish being noreturn, so returning normally is not an
-    // option. Otherwise exit; std::exit runs atexit handlers and flushes C stdio,
-    // so any buffered $display output is committed before the process leaves.
+}
+
+} // namespace
+
+extern "C" void rt_finish(const char* banner, uint64_t now, int32_t arg) {
+    finish_report(banner, now, arg);
+    rt_finishing = 1;
+    // Jump back to the host that started the run when one is installed — this
+    // form is declared noreturn, so returning is not an option. Otherwise exit;
+    // std::exit runs atexit handlers and flushes C stdio, so any buffered
+    // $display output is committed before the process leaves.
     if (finish_env != nullptr) {
         std::longjmp(*finish_env, 1);
     }
     std::exit(0);
+}
+
+extern "C" void rt_finish_coop(const char* banner, uint64_t now, int32_t arg) {
+    finish_report(banner, now, arg);
+    rt_finishing = 1;
+    // Returns. The caller — a JIT'd process body — branches to its coroutine
+    // epilogue, and the drain loop sees rt_finishing and stops. When no host is
+    // installed there is nothing to return to, so keep the old exit behavior.
+    if (finish_env == nullptr) {
+        std::exit(0);
+    }
 }
 
 extern "C" void rt_oscillation_abort(const rt_wheel* wheel) {
@@ -2865,6 +2890,7 @@ extern "C" void rt_oscillation_abort(const rt_wheel* wheel) {
     std::fputs(line.c_str(), stderr);
     std::fflush(stderr);
     rt_vcd_close();
+    rt_finishing = 1;
     if (finish_env != nullptr) {
         std::longjmp(*finish_env, 1);
     }
@@ -3014,6 +3040,7 @@ extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*)
     // `drain`; a $finish inside it longjmps out of the abandoned coroutine frames
     // back to the local catch below — main's state/wheel allocas stay live because
     // main sits beneath this frame. Either way, control reaches the finals.
+    rt_finishing = 0; // a prior run in this process may have set it
     std::jmp_buf  local;
     std::jmp_buf* prev = finish_env; // outer host catch (run_jit), restored below
     if (setjmp(local) == 0) {

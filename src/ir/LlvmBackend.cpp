@@ -2779,6 +2779,12 @@ private:
         auto* free_bb     = llvm::BasicBlock::Create(ctx_, "coro.free", fn_);
         coro_cleanup_bb_  = llvm::BasicBlock::Create(ctx_, "coro.cleanup", fn_);
         coro_ret_bb_      = llvm::BasicBlock::Create(ctx_, "coro.ret", fn_);
+        // Created up front, not at the end of the body, because a cooperative
+        // $finish branches here too (lower_finish): the process must reach its
+        // FINAL SUSPEND so the resumer's coro.done sees it and destroys the frame
+        // once. Branching to coro.cleanup instead would free the frame underneath
+        // the drain loop, which then reads it — a use-after-free.
+        coro_final_bb_    = llvm::BasicBlock::Create(ctx_, "coro.final", fn_);
 
         b_.SetInsertPoint(coro_cleanup_bb_);
         auto* freed = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_free), { id, hdl_ });
@@ -2859,12 +2865,11 @@ private:
         // Final suspend: the default edge returns the (now-done) handle to the
         // resumer, which destroys it; case 1 is the destroy re-entry; resuming a
         // finished coroutine (case 0) is undefined, so trap.
-        auto* final_bb = llvm::BasicBlock::Create(ctx_, "coro.final", fn_);
-        b_.CreateBr(final_bb);
-        b_.SetInsertPoint(final_bb);
+        b_.CreateBr(coro_final_bb_);
+        b_.SetInsertPoint(coro_final_bb_);
         // A completing process releases its string temporaries. (An always loop
-        // never reaches here — its temps persist, bounded and capacity-reused; a
-        // $finish longjmps out and the heap is reclaimed at process exit.)
+        // reaches here only by finishing — otherwise its temps persist, bounded
+        // and capacity-reused.)
         deinit_body_strings();
         auto* res = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { none, b_.getTrue() });
         auto* sw  = b_.CreateSwitch(res, coro_ret_bb_, 2);
@@ -7262,7 +7267,26 @@ private:
         b_.SetInsertPoint(check);
         llvm::Value* hd = b_.CreateLoad(i32, sym(active_head_gv_));
         llvm::Value* tl = b_.CreateLoad(i32, sym(active_tail_gv_));
-        b_.CreateCondBr(b_.CreateICmpNE(hd, tl), body, icheck);
+        // The $finish test sits on the queue-EMPTY edge, not after each resume: a
+        // cooperative finish empties the active queue itself (lower_finish), so
+        // the wave it was in ends on the next trip round this test and control
+        // arrives here. That keeps the per-activation path free of it — worth
+        // caring about because sim_drain is codegen'd at -O0/FastISel, where a
+        // load and a branch on the hot path measured +2.2% on picorv32.
+        // Skipping straight to wdone also leaves any staged NBAs uncommitted,
+        // which is what the longjmp did.
+        // A design with no $finish anywhere cannot set the flag, so it gets the
+        // plain edge and pays nothing at all.
+        if (design_has_finish()) {
+            auto* fincheck = llvm::BasicBlock::Create(ctx_, "active.finished", fn);
+            b_.CreateCondBr(b_.CreateICmpNE(hd, tl), body, fincheck);
+            b_.SetInsertPoint(fincheck);
+            b_.CreateCondBr(
+              b_.CreateICmpNE(b_.CreateLoad(b_.getInt8Ty(), finishing_gv()), b_.getInt8(0)), wdone,
+              icheck);
+        } else {
+            b_.CreateCondBr(b_.CreateICmpNE(hd, tl), body, icheck);
+        }
 
         b_.SetInsertPoint(body);
         // Zero-delay oscillation guard: count activations at the current instant
@@ -12349,6 +12373,15 @@ private:
         return fn;
     }
 
+    // void rt_finish_coop(ptr banner, i64 now, i32 arg) — the cooperative form.
+    // Deliberately NOT noreturn: it prints the banner, sets rt_finishing, and
+    // returns so the caller can leave through its own epilogue and free its
+    // frame (docs/design/cooperative-finish.md).
+    llvm::FunctionCallee finish_coop_fn() {
+        return rt_fn("rt_finish_coop", b_.getVoidTy(),
+                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty() });
+    }
+
     // Lower a $finish / $stop: pass the runtime the compile-time banner prefix,
     // the current simulation time, and the diagnostic level, then it prints the
     // banner and exits. The call never returns, so the rest of the region is dead
@@ -12369,8 +12402,44 @@ private:
         llvm::Value*      now = has_wheel()
                                   ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
                                   : static_cast<llvm::Value*>(b_.getInt64(0));
-        b_.CreateCall(finish_fn(),
-                      { b_.CreateGlobalString(banner), now, b_.getInt32(info.arg) });
+        llvm::Value* args[] = { b_.CreateGlobalString(banner), now, b_.getInt32(info.arg) };
+
+        // Inside a process body the finish is cooperative: the runtime reports and
+        // returns, and control leaves through this body's own epilogue, so the
+        // frame is freed instead of jumped over. A subroutine body still takes the
+        // longjmp form — phase 2 of docs/design/cooperative-finish.md threads the
+        // rt_finishing test back through callers, which is what a cooperative
+        // return from a callee requires.
+        if (cur_fn_ != nullptr) {
+            b_.CreateCall(finish_fn(), args);
+            return;
+        }
+
+        b_.CreateCall(finish_coop_fn(), args);
+        // End the current settle wave from here: emptying the active ring means
+        // the drain's existing head != tail test falls through to its finished
+        // edge, so no queued process runs after the $finish and the hot path
+        // needs no test of its own.
+        if (active_head_gv_ != nullptr) {
+            b_.CreateStore(b_.CreateLoad(b_.getInt32Ty(), sym(active_tail_gv_)),
+                           sym(active_head_gv_));
+        }
+        if (hdl_ != nullptr) {
+            // Coroutine: leave through the final suspend, exactly as a process
+            // that ran off the end of its body does, so the resumer destroys the
+            // frame once and the string temps are released on the way.
+            b_.CreateBr(coro_final_bb_);
+        } else {
+            // Thunk-elided process: a plain void body, with the same per-call
+            // string cleanup its normal epilogue does.
+            deinit_body_strings();
+            b_.CreateRetVoid();
+        }
+        // The rest of the region is dead (LRM 20.2 ends the simulation here) but
+        // still gets lowered, so park it in a block with no predecessors — the
+        // same pruning the noreturn attribute used to buy.
+        auto* dead = llvm::BasicBlock::Create(ctx_, "finish.dead", fn_);
+        b_.SetInsertPoint(dead);
     }
 
     // void rt_observed_case_violation(ptr banner, i64 now, i32 kind) — queues the
@@ -13115,6 +13184,36 @@ private:
     llvm::FunctionCallee vcd_touch_fn() {
         return rt_fn("rt_vcd_touch", b_.getVoidTy(), { b_.getInt32Ty() });
     }
+    // Does any process or subroutine in the design contain a $finish / $stop?
+    // Gates the drain loop's finished test; memoized, since emit_active_run asks
+    // once per unit module.
+    bool design_has_finish() {
+        if (!design_has_finish_.has_value()) {
+            const auto scan = [](const Ir& ir) {
+                for (size_t k = 0; k < ir.inst_count(); ++k) {
+                    if (ir.tag(static_cast<Index>(k)) == Inst::Tag::Finish) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            bool found = false;
+            for (const Process& p : mod_.processes()) {
+                found = found || scan(p.ir);
+            }
+            for (uint32_t f = 0; f < mod_.function_count() && !found; ++f) {
+                found = found || scan(mod_.function(static_cast<FunctionId>(f)).ir);
+            }
+            design_has_finish_ = found;
+        }
+        return *design_has_finish_;
+    }
+
+    // The runtime rt_finishing byte, set once a $finish / $stop has been taken.
+    llvm::Constant* finishing_gv() {
+        return env_->llmod.getOrInsertGlobal("rt_finishing", b_.getInt8Ty());
+    }
+
     // The runtime rt_vcd_active byte, non-zero only while VCD dumping is live.
     llvm::Constant* vcd_active_gv() {
         return env_->llmod.getOrInsertGlobal("rt_vcd_active", b_.getInt8Ty());
@@ -16763,6 +16862,8 @@ private:
     // (one per process, hoisted to coro.begin so a loop of element NBAs does not
     // grow the stack). Layout: [16]mm_val [16]mm_mask [8]z_val [8]z_mask.
     llvm::BasicBlock*   coro_cleanup_bb_ = nullptr;
+    llvm::BasicBlock*   coro_final_bb_   = nullptr;
+    std::optional<bool> design_has_finish_;
     llvm::BasicBlock*   coro_ret_bb_     = nullptr;
     // The current coroutine's scheduled flag: &clotho.proc_sched[this process] for
     // a process (a Constant GEP), or a frame-resident i32 alloca for a task.

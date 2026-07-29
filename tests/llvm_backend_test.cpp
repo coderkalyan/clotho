@@ -1108,7 +1108,7 @@ TEST_CASE("always @(posedge clk) sensitivity hoisting is unchanged") {
     CHECK(run_capture(src) == "tick 1 at 5\ntick 2 at 15\n");
 }
 
-TEST_CASE("$finish lowers to an rt_finish call with the default level 1") {
+TEST_CASE("$finish in a process lowers to a cooperative rt_finish_coop call") {
     constexpr std::string_view src = R"(
         module m;
             initial begin
@@ -1119,9 +1119,15 @@ TEST_CASE("$finish lowers to an rt_finish call with the default level 1") {
     )";
     const std::string          ir  = emit(src);
 
-    // rt_finish(banner_ptr, now, level); omitted argument defaults to level 1.
-    CHECK(ir.find("@rt_finish(") != std::string::npos);
+    // rt_finish_coop(banner_ptr, now, level); omitted argument defaults to 1.
+    // A process body takes the cooperative form, which returns so the body can
+    // leave through its own epilogue (docs/design/cooperative-finish.md); the
+    // noreturn rt_finish is for sites that cannot yet unwind that way.
+    CHECK(ir.find("@rt_finish_coop(") != std::string::npos);
     CHECK(ir.find(", i32 1)") != std::string::npos);
+    // ...and only that form: the noreturn rt_finish must not appear, or the
+    // body would jump out over its own frame instead of returning through it.
+    CHECK(ir.find("@rt_finish(") == std::string::npos);
 }
 
 TEST_CASE("$stop lowers identically to $finish") {
@@ -1132,7 +1138,7 @@ TEST_CASE("$stop lowers identically to $finish") {
     )";
     const std::string          ir  = emit(src);
 
-    CHECK(ir.find("@rt_finish(") != std::string::npos);
+    CHECK(ir.find("@rt_finish_coop(") != std::string::npos);
 }
 
 TEST_CASE("$finish with a diagnostic-level argument passes the level through") {
@@ -1143,8 +1149,8 @@ TEST_CASE("$finish with a diagnostic-level argument passes the level through") {
     )";
     const std::string          ir  = emit(src);
 
-    // The 0/1/2 level reaches rt_finish as the third argument (here 2).
-    CHECK(ir.find("@rt_finish(") != std::string::npos);
+    // The 0/1/2 level reaches the runtime as the third argument (here 2).
+    CHECK(ir.find("@rt_finish_coop(") != std::string::npos);
     CHECK(ir.find(", i32 2)") != std::string::npos);
 }
 

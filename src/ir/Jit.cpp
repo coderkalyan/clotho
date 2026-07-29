@@ -222,10 +222,16 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_vcd_start", &rt_vcd_start);
     expose("rt_vcd_touch", &rt_vcd_touch);
     expose("rt_vcd_touch_range", &rt_vcd_touch_range);
+    expose("rt_finish_coop", &rt_finish_coop);
     // rt_vcd_active is a data symbol (the VCD-active flag the JIT loads to gate
     // touch calls), so it is exposed without the Callable flag.
     rt_syms[(*jit)->mangleAndIntern("rt_vcd_active")] = {
         llvm::orc::ExecutorAddr::fromPtr(&rt_vcd_active),
+        llvm::JITSymbolFlags::Exported,
+    };
+    // Likewise rt_finishing: the drain loop loads it after a resume to leave.
+    rt_syms[(*jit)->mangleAndIntern("rt_finishing")] = {
+        llvm::orc::ExecutorAddr::fromPtr(&rt_finishing),
         llvm::JITSymbolFlags::Exported,
     };
     expose("rt_vcd_flush", &rt_vcd_flush);

@@ -113,6 +113,20 @@ void rt_timeformat_set(int32_t units, int32_t precision, const char* suffix, uin
 // content but not the stream).
 [[noreturn]] void rt_finish(const char* banner, uint64_t now, int32_t arg);
 
+// The cooperative form of the same task: prints the banner, sets rt_finishing,
+// and RETURNS, leaving it to the caller to unwind. A JIT'd process body calls
+// this and branches straight to its coroutine epilogue, so the frame is freed
+// rather than jumped over -- see docs/design/cooperative-finish.md for why the
+// longjmp form cannot survive on Windows (its longjmp unwinds, and JIT'd frames
+// carry no unwind data) and corrupts the heap elsewhere. Sites that cannot yet
+// unwind cooperatively keep calling rt_finish above.
+void rt_finish_coop(const char* banner, uint64_t now, int32_t arg);
+
+// Non-zero once a $finish / $stop has been taken. The JIT loads this after
+// resuming a process to leave the drain loop, the same way it loads
+// rt_vcd_active to gate a touch.
+extern unsigned char rt_finishing;
+
 // Queue a unique/priority case violation report for the Observed region (LRM
 // 12.4.2 / 12.5.3, 4.4.2.4). The report is not emitted at the point of
 // execution (the Active region) but recorded and flushed by rt_observed_flush
