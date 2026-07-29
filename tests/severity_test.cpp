@@ -37,7 +37,7 @@ std::string drain(std::FILE* f) {
 
 Captured run_capture(std::string_view source) {
     const LowerResult r = lower_text(source);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     std::FILE* out_tmp = std::tmpfile();
@@ -71,7 +71,7 @@ Captured run_capture(std::string_view source) {
 std::string reject(std::string_view source) {
     const LowerResult r = lower_text(source);
     CHECK_FALSE(r.ok);
-    return r.diagnostics;
+    return r.diagnostic_text();
 }
 
 bool contains(std::string_view hay, std::string_view needle) {

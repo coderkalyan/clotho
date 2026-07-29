@@ -23,7 +23,7 @@ namespace {
 // JIT-run a module and capture stdout (mirrors display_test.cpp).
 std::string run_capture(std::string_view source) {
     const LowerResult r = lower_text(source);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     std::FILE* tmp = std::tmpfile();
@@ -466,7 +466,7 @@ TEST_CASE("unpacked union member must be integral") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("unpacked union member must be an integral type") != std::string::npos);
+    CHECK(r.diagnostic_text().find("unpacked union member must be an integral type") != std::string::npos);
 }
 
 TEST_CASE("tagged union with a non-integral member is rejected loudly (Phase 3 gap)") {
@@ -480,7 +480,7 @@ TEST_CASE("tagged union with a non-integral member is rejected loudly (Phase 3 g
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("unpacked union member must be an integral type") != std::string::npos);
+    CHECK(r.diagnostic_text().find("unpacked union member must be an integral type") != std::string::npos);
 }
 
 TEST_CASE("blocking read and write of unpacked struct members") {
@@ -585,7 +585,7 @@ TEST_CASE("an array of a struct with field defaults fails loudly") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("array of a struct with field-level default initializers") !=
+    CHECK(r.diagnostic_text().find("array of a struct with field-level default initializers") !=
           std::string::npos);
 }
 
@@ -1192,7 +1192,7 @@ TEST_CASE("unpacked struct / aggregate task argument is guarded") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("task argument is not supported") != std::string::npos);
+    CHECK(r.diagnostic_text().find("task argument is not supported") != std::string::npos);
 }
 
 TEST_CASE("whole unpacked struct as a $display %p operand renders a pattern") {

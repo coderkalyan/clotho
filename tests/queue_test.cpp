@@ -20,7 +20,7 @@ namespace {
 // element for the oracle and a separate 2-state check for the LRM default.
 std::string run_capture(std::string_view source) {
     const LowerResult r = lower_text(source);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     std::FILE* tmp = std::tmpfile();

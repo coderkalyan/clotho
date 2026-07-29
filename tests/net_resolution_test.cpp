@@ -21,7 +21,7 @@ namespace {
 
 LowerResult lower_ok(std::string_view src) {
     LowerResult r = lower_text(src);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
     return r;
 }
@@ -527,7 +527,7 @@ TEST_CASE("drive strengths on a wand net fail loudly") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("drive strengths on a wand/wor net") != std::string::npos);
+    CHECK(r.diagnostic_text().find("drive strengths on a wand/wor net") != std::string::npos);
 }
 
 // -- Loud-failure guards for the shapes V2 does not resolve --
@@ -541,7 +541,7 @@ TEST_CASE("an unpacked-array-element driver of a resolved net fails loudly") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("unpacked-array or unpacked-struct multiply-driven net") != std::string::npos);
+    CHECK(r.diagnostic_text().find("unpacked-array or unpacked-struct multiply-driven net") != std::string::npos);
 }
 
 // A partially-driven net (continuous assigns to disjoint constant sub-ranges —

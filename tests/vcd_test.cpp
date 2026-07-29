@@ -33,7 +33,7 @@ std::string run_vcd(std::string source) {
     source.replace(tok, std::string_view("OUT.vcd").size(), path);
 
     const LowerResult r = lower_text(source);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     std::fflush(stdout);

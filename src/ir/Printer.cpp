@@ -989,7 +989,15 @@ const char* direction_name(SignalInfo::Direction dir) {
 
 } // namespace
 
-void print_module(const Module& m, std::ostream& os) {
+void print_module(const Module& m, std::ostream& os, const LocResolver& resolve) {
+    // Appends " at <file:line:col>" when a resolver is set and the location is
+    // real. Compiler-synthesized entities carry SourceLoc{0} and print nothing.
+    const auto at = [&](SourceLoc l) {
+        if (resolve && l != SourceLoc{ 0 }) {
+            os << " at " << resolve(l);
+        }
+    };
+
     os << "module " << m.name << "\n";
 
     const auto signals = m.signals();
@@ -997,7 +1005,9 @@ void print_module(const Module& m, std::ostream& os) {
         const SignalInfo& s = signals[i];
         os << "  s" << i << ": ";
         render_type(m.pool, s.type, os);
-        os << " " << s.name << " (" << direction_name(s.dir) << ")\n";
+        os << " " << s.name << " (" << direction_name(s.dir) << ")";
+        at(s.loc);
+        os << "\n";
     }
 
     const auto processes = m.processes();
@@ -1032,6 +1042,7 @@ void print_module(const Module& m, std::ostream& os) {
             }
             os << "s" << static_cast<uint32_t>(w.signal);
         }
+        at(p.span.start);
         os << "\n";
         print(p.ir, os);
     }

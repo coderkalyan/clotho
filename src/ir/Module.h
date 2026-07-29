@@ -34,6 +34,12 @@ struct SignalInfo {
 
     // Declared name.
     std::string name;
+    // Location of the declaration's name token, for "go to declaration" and for
+    // attributing a diagnostic to the signal. A bare SourceLoc, not a SourceSpan:
+    // a large design has a signal per bit-ish, so 8 bytes here is a real cost and
+    // an extent buys nothing a declaration lookup needs. SourceLoc{0} for a
+    // compiler-synthesized signal (a driver slot, a synthesized event net).
+    SourceLoc loc = SourceLoc{ 0 };
     // Interned type in the module's pool.
     Ref type = Ref::Invalid;
     // Direction relative to the module boundary.
@@ -134,9 +140,13 @@ struct Process {
     // false: it runs only when a wait event fires. Only meaningful with a non-empty
     // wait list (a sensitivity-less process already runs once via the seed loop).
     bool self_start = false;
-    // Location of the AST construct that produced this process (the continuous
-    // assign, always block, ...).
-    SourceLoc loc = SourceLoc{ 0 };
+    // Full source extent of the AST construct that produced this process (the
+    // continuous assign, always block, ...). A span rather than a point because
+    // this is what an editor highlights and what an inferred-hardware hint
+    // attaches to; processes number in the thousands, so the extra 8 bytes are
+    // free. Empty for a compiler-synthesized process (a wire resolver, a port
+    // copy, the PreInit initializer pass).
+    SourceSpan span;
     // The lowered process body.
     Ir ir;
     // Scope id (InstanceScope::id) of the instance whose definition declared
@@ -242,6 +252,9 @@ struct Function {
     // LogicVec/...); DpiCType::Void for a non-OpenArray argument. Parallel to
     // dpi_arg_ctypes; only populated when is_dpi.
     std::vector<DpiCType> dpi_arg_elem_ctypes;
+    // Full source extent of the subroutine declaration. Empty for a
+    // compiler-synthesized body (a $strobe/$monitor thunk, a fork child).
+    SourceSpan span;
     // The lowered body.
     Ir ir;
 };

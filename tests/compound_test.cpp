@@ -16,7 +16,7 @@ namespace {
 // JIT-run a module's initial blocks and return everything it wrote to stdout.
 std::string run_capture(std::string_view source) {
     const LowerResult r = lower_text(source);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     std::FILE* tmp = std::tmpfile();
@@ -151,8 +151,8 @@ TEST_CASE("compound assignment to a concatenation is rejected") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK_MESSAGE(r.diagnostics.find("compound assignment to a concatenation") != std::string::npos,
-                  r.diagnostics);
+    CHECK_MESSAGE(r.diagnostic_text().find("compound assignment to a concatenation") != std::string::npos,
+                  r.diagnostic_text());
 }
 
 TEST_CASE("compound assignment to a string element is rejected") {
@@ -163,8 +163,8 @@ TEST_CASE("compound assignment to a string element is rejected") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK_MESSAGE(r.diagnostics.find("compound assignment to a string") != std::string::npos,
-                  r.diagnostics);
+    CHECK_MESSAGE(r.diagnostic_text().find("compound assignment to a string") != std::string::npos,
+                  r.diagnostic_text());
 }
 
 // An assignment used as an rvalue yields the LHS after the store, truncated to

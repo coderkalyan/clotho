@@ -22,7 +22,7 @@ namespace {
 
 std::string run_capture(std::string_view source) {
     const LowerResult r = lower_text(source);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     std::FILE* tmp = std::tmpfile();
@@ -88,7 +88,7 @@ TEST_CASE("two continuous assigns driving one uwire fail loudly") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("'uwire' net 'w' cannot have multiple drivers") !=
+    CHECK(r.diagnostic_text().find("'uwire' net 'w' cannot have multiple drivers") !=
           std::string::npos);
 }
 
@@ -100,7 +100,7 @@ TEST_CASE("a uwire net-decl assignment plus a continuous assign fail loudly") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("'uwire' net 'w' cannot have multiple drivers") !=
+    CHECK(r.diagnostic_text().find("'uwire' net 'w' cannot have multiple drivers") !=
           std::string::npos);
 }
 

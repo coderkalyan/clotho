@@ -32,7 +32,7 @@ struct Analyzed {
 
 Analyzed analyze(std::string_view source) {
     Analyzed a{ .lowered = lower_text(source), .may_z = {} };
-    REQUIRE_MESSAGE(a.lowered.ok, a.lowered.diagnostics);
+    REQUIRE_MESSAGE(a.lowered.ok, a.lowered.diagnostic_text());
     REQUIRE(a.lowered.module != nullptr);
     a.may_z = ir::compute_may_z(*a.lowered.module);
 

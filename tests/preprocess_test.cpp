@@ -48,7 +48,7 @@ struct ScratchDir {
 std::string run_args(const std::vector<std::string>& args) {
     std::vector<std::string_view> views(args.begin(), args.end());
     const LowerResult             r = lower_sources(views);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     std::FILE* tmp = std::tmpfile();

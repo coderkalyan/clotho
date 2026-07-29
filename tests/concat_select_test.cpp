@@ -22,7 +22,7 @@ namespace {
 
 LowerResult lower_ok(std::string_view src) {
     LowerResult r = lower_text(src);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
     return r;
 }

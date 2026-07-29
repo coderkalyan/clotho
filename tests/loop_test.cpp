@@ -31,7 +31,7 @@ std::string slurp(std::FILE* f) {
 // observable behavior.
 std::string run_capture(std::string_view source) {
     const LowerResult r = lower_text(source);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     std::FILE* tmp = std::tmpfile();
@@ -60,7 +60,7 @@ std::string run_capture(std::string_view source) {
 // `always` — that only stops at $finish.
 std::string run_capture_finish(std::string_view source) {
     const LowerResult r = lower_text(source);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     std::FILE* tmp = std::tmpfile();
@@ -121,7 +121,7 @@ TEST_CASE("for loop lowers to a Loop instruction") {
             initial for (int i = 0; i < 3; i = i + 1) $display("%0d", i);
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(any_process_has_tag(*r.module, ir::Inst::Tag::Loop));
 }
 
@@ -281,7 +281,7 @@ TEST_CASE("forever loop lowers to a Loop instruction") {
             initial forever begin n = n + 1; #1; end
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(any_process_has_tag(*r.module, ir::Inst::Tag::Loop));
 }
 
@@ -305,7 +305,7 @@ TEST_CASE("repeat loop lowers to a Loop") {
             initial repeat (3) $display("x");
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(any_process_has_tag(*r.module, ir::Inst::Tag::Loop));
 }
 
@@ -434,7 +434,7 @@ TEST_CASE("sensitivity-less always lowers to a Loop") {
             always #5 clk = ~clk;
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(any_process_has_tag(*r.module, ir::Inst::Tag::Loop));
 }
 
@@ -474,7 +474,7 @@ TEST_CASE("do-while lowers to a Loop instruction") {
             initial begin i = 0; do i = i + 1; while (i < 3); end
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(any_process_has_tag(*r.module, ir::Inst::Tag::Loop));
 }
 
@@ -647,7 +647,7 @@ TEST_CASE("foreach lowers to a Loop instruction") {
             initial foreach (a[i, j]) $display("%0d %0d", i, j);
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(any_process_has_tag(*r.module, ir::Inst::Tag::Loop));
 }
 
@@ -760,5 +760,5 @@ TEST_CASE("foreach over an associative array lowers") {
             initial foreach (assoc[i]) $display("%0d", i);
         endmodule
     )");
-    CHECK_MESSAGE(r.ok, r.diagnostics);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
 }

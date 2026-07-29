@@ -32,7 +32,7 @@ std::string slurp(std::FILE* f) {
 // $finish, so this (not a plain drain) is the right harness.
 std::string run_capture_finish(std::string_view source) {
     const LowerResult r = lower_text(source);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     std::FILE* tmp = std::tmpfile();
@@ -58,7 +58,7 @@ std::string run_capture_finish(std::string_view source) {
 
 std::string lower_error(std::string_view source) {
     const LowerResult r = lower_text(source);
-    return r.ok ? std::string{} : r.diagnostics;
+    return r.ok ? std::string{} : r.diagnostic_text();
 }
 
 } // namespace

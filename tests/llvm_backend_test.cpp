@@ -68,7 +68,7 @@ std::string emit_raw(std::string_view source, ir::SimulationConfig config = { .o
 // --no-thunk) and assert byte-identical output.
 std::string run_capture(std::string_view source, ir::SimulationConfig config = {}) {
     const LowerResult r = lower_text(source);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     std::FILE* tmp = std::tmpfile();
@@ -101,7 +101,7 @@ std::string run_capture(std::string_view source, ir::SimulationConfig config = {
 // routed to stderr, not the design's stdout.
 std::string run_capture_stderr(std::string_view source) {
     const LowerResult r = lower_text(source);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     std::FILE* tmp = std::tmpfile();
@@ -1701,7 +1701,7 @@ TEST_CASE("wide arithmetic libcalls resolve and run in the JIT") {
 TEST_CASE("signed power lowers to valid IR") {
     const LowerResult r =
       lower_text(R"(module m; initial begin int a, b, c; a = 2; b = 3; c = a ** b; end endmodule)");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
     std::string              text;
     llvm::raw_string_ostream os(text);
@@ -3268,7 +3268,7 @@ TEST_CASE("--no-z-elision keeps every slot's z word") {
         endmodule
     )";
     const LowerResult r = lower_text(src);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     std::string              text;
     llvm::raw_string_ostream os(text);
     REQUIRE(ir::emit_llvm(*r.module, os, { .optimize = false, .z_elision = false }));
@@ -3320,7 +3320,7 @@ TEST_CASE("unmodeled net kinds fail loudly") {
         endmodule
     )");
     CHECK(!r.ok);
-    CHECK(r.diagnostics.find("unsupported net type") != std::string::npos);
+    CHECK(r.diagnostic_text().find("unsupported net type") != std::string::npos);
 }
 
 // The frontend cannot produce string IR yet, so build a module by hand: a
@@ -3586,7 +3586,7 @@ TEST_CASE("real arithmetic, rounding, and truncation") {
     // FNeg keeps sign: -(2.5) rounds to -3.
     display_int(b, ftoi(b.unary(ir::Inst::Tag::FNeg, real(2.5), kLoc)));
 
-    m.add_process(ir::Process{ ir::Activation::Initial, {}, false, kLoc, b.finish() });
+    m.add_process(ir::Process{ .activation = ir::Activation::Initial, .span = { kLoc, kLoc }, .ir = b.finish() });
     CHECK(run_module(m) == "3\n3\n-2\n-15\n123\n1\n-3\n");
 }
 
@@ -3609,7 +3609,7 @@ TEST_CASE("real compares are definite and NaN-correct") {
     show(b.binary(ir::Inst::Tag::FGe, real(1.5), real(2.5), kLoc)); // 0
     show(b.binary(ir::Inst::Tag::FEq, real(0.0), real(-0.0), kLoc)); // 1: +0.0 == -0.0
 
-    m.add_process(ir::Process{ ir::Activation::Initial, {}, false, kLoc, b.finish() });
+    m.add_process(ir::Process{ .activation = ir::Activation::Initial, .span = { kLoc, kLoc }, .ir = b.finish() });
     CHECK(run_module(m) == "0\n1\n1\n0\n1\n");
 }
 
@@ -3634,13 +3634,15 @@ TEST_CASE("real mux: definite select and the ambiguous-condition rule") {
     display_int(b, ftoi(b.select(cx, real(3.0), real(3.0), kLoc))); // 3
     display_int(b, ftoi(b.select(cx, real(3.0), real(5.0), kLoc))); // 0
 
-    m.add_process(ir::Process{ ir::Activation::Initial, {}, false, kLoc, b.finish() });
+    m.add_process(ir::Process{ .activation = ir::Activation::Initial, .span = { kLoc, kLoc }, .ir = b.finish() });
     CHECK(run_module(m) == "3\n5\n3\n0\n");
 }
 
 TEST_CASE("real signal storage round-trips, defaults to 0.0, and wakes waiters") {
     ir::Module      m;
-    const ir::Signal r = m.add_signal(ir::SignalInfo{ "r", m.pool.real_type, ir::SignalInfo::Direction::Internal });
+    const ir::Signal r = m.add_signal(ir::SignalInfo{ .name = "r",
+                                                      .type = m.pool.real_type,
+                                                      .dir  = ir::SignalInfo::Direction::Internal });
     const ir::Ref    i32 = int_type(m.pool);
 
     // Watcher: @(r) $display("%0d", FtoI(r)).
@@ -3650,7 +3652,7 @@ TEST_CASE("real signal storage round-trips, defaults to 0.0, and wakes waiters")
         const ir::Index load = b.unary(ir::Inst::Tag::Load, sig, kLoc);
         display_int(b, b.float_cvt(ir::Inst::Tag::FtoI, load, i32, kLoc));
         m.add_process(
-          ir::Process{ ir::Activation::Always, { { r, ir::Edge::Any } }, false, kLoc, b.finish() });
+          ir::Process{ .activation = ir::Activation::Always, .wait_events = { { r, ir::Edge::Any } }, .span = { kLoc, kLoc }, .ir = b.finish() });
     }
 
     // Driver: default is 0.0 (2-state zero pattern), then blocking-store 2.25,
@@ -3663,7 +3665,7 @@ TEST_CASE("real signal storage round-trips, defaults to 0.0, and wakes waiters")
         display_int(b, b.float_cvt(ir::Inst::Tag::FtoI, ld0, i32, kLoc)); // 0 (default 0.0)
         b.binary(ir::Inst::Tag::Store, sig, real(2.25), kLoc);            // wakes watcher: 2
         b.binary(ir::Inst::Tag::StoreNb, sig, real(4.5), kLoc);           // commits later: 5 (4.5 rounds)
-        m.add_process(ir::Process{ ir::Activation::Initial, {}, false, kLoc, b.finish() });
+        m.add_process(ir::Process{ .activation = ir::Activation::Initial, .span = { kLoc, kLoc }, .ir = b.finish() });
     }
 
     CHECK(run_module(m) == "0\n2\n5\n");
@@ -3699,7 +3701,7 @@ TEST_CASE("real bitcasts and integral conversions") {
     const ir::Index rr  = b.float_cvt(ir::Inst::Tag::FResize, sr, m.pool.real_type, kLoc);
     display_int(b, b.float_cvt(ir::Inst::Tag::FtoI, rr, i32, kLoc)); // 4 (3.5 rounds away from zero)
 
-    m.add_process(ir::Process{ ir::Activation::Initial, {}, false, kLoc, b.finish() });
+    m.add_process(ir::Process{ .activation = ir::Activation::Initial, .span = { kLoc, kLoc }, .ir = b.finish() });
     CHECK(run_module(m) == "4607182418800017408\n1\n10\n4\n");
 }
 
@@ -3732,7 +3734,7 @@ TEST_CASE("real math ops lower to intrinsics and libm calls") {
     show(m1(ir::RealMathOp::Asinh, real(0.0)));                 // 0
     show(m1(ir::RealMathOp::Acosh, real(1.0)));                 // 0
 
-    m.add_process(ir::Process{ ir::Activation::Initial, {}, false, kLoc, b.finish() });
+    m.add_process(ir::Process{ .activation = ir::Activation::Initial, .span = { kLoc, kLoc }, .ir = b.finish() });
     CHECK(run_module(m) == "3\n2\n3\n1024\n1\n0\n3\n5\n0\n0\n0\n0\n");
 }
 
@@ -3749,7 +3751,7 @@ TEST_CASE("real display marshals through rt_fwrite with %g / %f") {
     const std::array<ir::Index, 1> args2{ sr };
     b.display("%g", true, args2, kLoc);
 
-    m.add_process(ir::Process{ ir::Activation::Initial, {}, false, kLoc, b.finish() });
+    m.add_process(ir::Process{ .activation = ir::Activation::Initial, .span = { kLoc, kLoc }, .ir = b.finish() });
     CHECK(run_module(m) == "3.6 0.250000\n1.5\n");
 }
 

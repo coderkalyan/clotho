@@ -24,4 +24,8 @@ slang::SourceLocation to_slang_location(ir::SourceLoc loc) {
     return slang::SourceLocation(slang::BufferID(buffer, ""), offset);
 }
 
+ir::SourceSpan to_source_span(slang::SourceRange range) {
+    return ir::SourceSpan{ to_source_loc(range.start()), to_source_loc(range.end()) };
+}
+
 } // namespace clotho

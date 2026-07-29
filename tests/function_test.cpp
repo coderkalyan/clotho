@@ -18,7 +18,7 @@ namespace {
 // so the captured text is the observable behavior (mirrors case_test.cpp).
 std::string run_capture(std::string_view source) {
     const LowerResult r = lower_text(source);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     std::FILE* tmp = std::tmpfile();
@@ -50,7 +50,7 @@ std::string run_capture(std::string_view source) {
 [[maybe_unused]] std::string reject(std::string_view source) {
     const LowerResult r = lower_text(source);
     CHECK_FALSE(r.ok);
-    return r.diagnostics;
+    return r.diagnostic_text();
 }
 
 } // namespace

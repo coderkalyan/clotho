@@ -71,10 +71,15 @@ namespace {
 
 using namespace slang::ast;
 
-// Raised when lowering meets a construct outside the proof-of-concept's scope.
-// Caught at the top level and turned into a diagnostic.
+// Raised when lowering meets a construct Clotho does not implement. Caught at the
+// top level and turned into a Diagnostic.
+//
+// The location travels as a span, not as text prepended to `message`: a
+// structured consumer needs the range, and a renderer can add the "file:line:col:"
+// prefix itself. `message` is therefore the bare complaint, with no location in it.
 struct LowerError {
-    std::string message;
+    std::string    message;
+    ir::SourceSpan span;
 };
 
 // Resolve an interface modport-port proxy to the interface instance's own
@@ -777,7 +782,7 @@ private:
         const bool driver_pass = pass != Pass::Collect;
         cur_pass_               = pass;
         for (const Symbol& m : scope.members()) {
-            cur_loc_ = m.location;
+            cur_range_ = slang::SourceRange{ m.location, m.location };
             switch (m.kind) {
                 case SymbolKind::ContinuousAssign:
                     if (driver_pass) lower_continuous_assign(m.as<ContinuousAssignSymbol>());
@@ -1019,17 +1024,20 @@ private:
         return name;
     }
 
-    // Source location of the construct currently being lowered, tracked at the
+    // Source extent of the construct currently being lowered, tracked at the
     // statement / expression / member-declaration dispatch boundaries so an
-    // unsupported-construct guard can point the user at the offending line
+    // unsupported-construct guard can point the user at the offending construct
     // without every one of the ~290 `fail` sites threading a location by hand.
-    slang::SourceLocation cur_loc_{};
+    // A range rather than a point so a diagnostic can highlight the whole
+    // construct; `cur_loc()` is the start, for the runtime banner helpers.
+    slang::SourceRange cur_range_{};
+
+    [[nodiscard]] slang::SourceLocation cur_loc() const {
+        return cur_range_.start();
+    }
 
     [[noreturn]] void fail(std::string msg) {
-        if (cur_loc_ && scope_ != nullptr) {
-            msg = banner_at(cur_loc_) + msg;
-        }
-        throw LowerError{ std::move(msg) };
+        throw LowerError{ std::move(msg), to_source_span(cur_range_) };
     }
 
     ir::SourceLoc loc(const Expression& e) const {
@@ -1037,6 +1045,18 @@ private:
     }
     ir::SourceLoc loc(const Statement& s) const {
         return to_source_loc(s.sourceRange.start());
+    }
+
+    // Full source extent of a symbol's declaring syntax, or a degenerate span at
+    // its name location when it has none (a compiler-synthesized symbol). This is
+    // what gives a process or a subroutine a real extent rather than a point.
+    static ir::SourceSpan span_of(const Symbol& sym) {
+        if (const slang::syntax::SyntaxNode* syn = sym.getSyntax(); syn != nullptr) {
+            return to_source_span(syn->sourceRange());
+        }
+        const ir::SourceLoc l = to_source_loc(sym.location);
+
+        return ir::SourceSpan{ l, l };
     }
 
     // The compile-time banner prefix "<file>:<line>: <task>" for a $finish /
@@ -1664,6 +1684,7 @@ private:
                                                .param_types = std::move(param_types),
                                                .arg_dirs    = std::move(arg_dirs),
                                                .local_types = std::move(local_types),
+                                               .span        = span_of(proto),
                                                .ir          = b.finish() });
     }
 
@@ -2616,10 +2637,11 @@ private:
                 continue;
             }
             const auto& vs = m.as<VariableSymbol>();
-            cur_loc_       = vs.location;
+            cur_range_       = slang::SourceRange{ vs.location, vs.location };
 
             ir::SignalInfo info;
             info.name     = std::string(vs.name);
+            info.loc      = to_source_loc(vs.location);
             info.type     = lower_type(vs.getType());
             info.is_event = vs.getType().isEvent();
             info.dir      = ir::SignalInfo::Direction::Internal;
@@ -2696,7 +2718,7 @@ private:
                 case SymbolKind::Net:
                 case SymbolKind::Variable: {
                     const ValueSymbol& vs = m.as<ValueSymbol>();
-                    cur_loc_              = vs.location;
+                    cur_range_              = slang::SourceRange{ vs.location, vs.location };
 
                     // An inout/ref port internal aliased to its parent connection
                     // (build_inout_aliases) shares that signal instead of getting
@@ -2743,6 +2765,7 @@ private:
                         info.is_net = true;
                     }
                     info.name     = prefix + std::string(vs.name);
+                    info.loc      = to_source_loc(vs.location);
                     info.type     = lower_type(vs.getType());
                     info.is_event = vs.getType().isEvent();
                     info.dir      = ir::SignalInfo::Direction::Internal;
@@ -2849,6 +2872,7 @@ private:
 
         ir::SignalInfo info;
         info.name = prefix_ + std::string(vs.name);
+        info.loc  = to_source_loc(vs.location);
         info.type = lower_type(vs.getType());
         info.dir  = ir::SignalInfo::Direction::Internal;
 
@@ -3611,7 +3635,7 @@ private:
             module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
                                              .wait_events = std::move(wait_events),
                                              .self_start  = true,
-                                             .loc         = l,
+                                             .span        = ir::SourceSpan{ l, l },
                                              .ir          = b.finish(),
                                              .scope       = scope });
         }
@@ -3735,7 +3759,7 @@ private:
         module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
                                          .wait_events = std::move(wait_events),
                                          .self_start  = true,
-                                         .loc         = l,
+                                         .span        = ir::SourceSpan{ l, l },
                                          .ir          = b.finish(),
                                          .scope       = cur_scope_id() });
     }
@@ -4476,7 +4500,7 @@ private:
         module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
                                          .wait_events = std::move(wait_events),
                                          .self_start  = true,
-                                         .loc         = l,
+                                         .span        = ir::SourceSpan{ l, l },
                                          .ir          = b.finish(),
                                          .scope       = cur_scope_id() });
 
@@ -5077,7 +5101,7 @@ private:
         module_.add_process(ir::Process{ .activation  = activation,
                                          .wait_events = std::move(wait_events),
                                          .self_start  = self_start,
-                                         .loc         = to_source_loc(sym.location),
+                                         .span        = span_of(sym),
                                          .ir          = std::move(body_ir),
                                          .scope       = cur_scope_id() });
     }
@@ -5429,7 +5453,7 @@ private:
     // -- Statements --
 
     void lower_stmt(const Statement& stmt, ir::Builder& b) {
-        cur_loc_ = stmt.sourceRange.start();
+        cur_range_ = stmt.sourceRange;
         switch (stmt.kind) {
             case StatementKind::List:
                 for (const Statement* s : stmt.as<StatementList>().list) {
@@ -10266,7 +10290,7 @@ private:
 
     // Lower an expression as an rvalue, returning the SSA value index.
     ir::Index lower_expr(const Expression& expr, ir::Builder& b) {
-        cur_loc_              = expr.sourceRange.start();
+        cur_range_              = expr.sourceRange;
         const ir::SourceLoc l = loc(expr);
         switch (expr.kind) {
             case ExpressionKind::IntegerLiteral:
@@ -11710,6 +11734,7 @@ private:
         }
         ir::SignalInfo info;
         info.name = prefix_ + fn_ctx_->name_prefix + std::string(vs.name);
+        info.loc  = to_source_loc(vs.location);
         info.type = lower_type(vs.getType());
         info.dir  = ir::SignalInfo::Direction::Internal;
         const ir::Signal sig = register_signal(std::move(info));
@@ -11737,6 +11762,7 @@ private:
         const ir::Ref pty = lower_type(prop.getType());
         ir::SignalInfo info;
         info.name            = prefix_ + cls + std::string(prop.name);
+        info.loc             = to_source_loc(prop.location);
         info.type            = pty;
         info.dir             = ir::SignalInfo::Direction::Internal;
         const ir::Signal sig = register_signal(std::move(info));
@@ -12062,6 +12088,7 @@ private:
                                                .dpi_arg_ctypes = std::move(arg_cts),
                                                .dpi_ret_ctype  = ret_ct,
                                                .dpi_arg_elem_ctypes = std::move(arg_elem_cts),
+                                               .span           = span_of(sub),
                                                .ir             = b.finish() });
     }
 
@@ -12305,6 +12332,7 @@ private:
                                                .arg_dirs    = std::move(arg_dirs),
                                                .local_types = std::move(ctx.local_types),
                                                .is_task     = true,
+                                               .span        = span_of(sub),
                                                .ir          = b.finish() });
         named_blocks_.swap(saved_blocks);
         fn_ctx_ = saved;
@@ -12520,6 +12548,7 @@ private:
                                                .param_types = std::move(param_types),
                                                .arg_dirs    = std::move(arg_dirs),
                                                .local_types = std::move(ctx.local_types),
+                                               .span        = span_of(sub),
                                                .ir          = b.finish() });
         named_blocks_.swap(saved_blocks);
         fn_ctx_ = saved;
@@ -13170,9 +13199,62 @@ private:
     std::optional<ir::Builder> preinit_;
 };
 
-LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings,
-                              ir::SystemAccess allow_system) {
+// Map slang's severity scale onto Clotho's. slang's Ignored never reaches here (an
+// ignored diagnostic is not reported at all) and its Fatal collapses onto Error:
+// Clotho has no "stop the world" tier, since a lowering guard that cannot continue
+// throws instead.
+Severity to_severity(slang::DiagnosticSeverity s) {
+    switch (s) {
+        case slang::DiagnosticSeverity::Ignored:
+        case slang::DiagnosticSeverity::Note:
+            return Severity::Note;
+        case slang::DiagnosticSeverity::Warning:
+            return Severity::Warning;
+        case slang::DiagnosticSeverity::Error:
+        case slang::DiagnosticSeverity::Fatal:
+            return Severity::Error;
+    }
+
+    return Severity::Error;
+}
+
+// Normalize a slang diagnostic (and its note chain) into Clotho's shape. The
+// caller attaches `rendered` — slang's own pretty text — separately, because that
+// only exists once the engine has actually issued the item.
+Diagnostic from_slang(const slang::DiagnosticEngine& engine, const slang::Diagnostic& d) {
+    Diagnostic out;
+    out.origin   = DiagnosticOrigin::Frontend;
+    out.severity = to_severity(engine.getSeverity(d.code, d.location));
+    out.code     = std::string(engine.getOptionName(d.code));
+    out.message  = engine.formatMessage(d);
+    // Prefer the primary highlighted range; fall back to a point at the reported
+    // location for a diagnostic that carries no range.
+    if (d.ranges.empty()) {
+        const ir::SourceLoc at = to_source_loc(d.location);
+        out.span               = ir::SourceSpan{ at, at };
+    } else {
+        out.span = to_source_span(d.ranges.front());
+    }
+    for (const slang::Diagnostic& note : d.notes) {
+        Diagnostic n = from_slang(engine, note);
+        // A note's own mapped severity is not meaningful — it is context for its
+        // parent, so it always presents as a note.
+        n.severity = Severity::Note;
+        out.notes.push_back(std::move(n));
+    }
+
+    return out;
+}
+
+LowerResult lower_compilation(slang::ast::Compilation& comp, std::shared_ptr<SourceContext> ctx,
+                              Timings* timings, ir::SystemAccess allow_system) {
     LowerResult result;
+    // Attached first so EVERY return path below carries it: `sources` is documented
+    // as never null, and there are a dozen early returns.
+    if (ctx->empty()) {
+        ctx->borrow_source_manager(comp.getSourceManager());
+    }
+    result.sources = std::move(ctx);
 
     // Front end: getAllDiagnostics forces full elaboration; getRoot resolves the
     // design hierarchy. Both are slang work.
@@ -13216,8 +13298,21 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings,
         // would then lower a call to a member with no lowered implementation,
         // so promote to an error rather than silently accepting the gap.
         engine.setSeverity(slang::diag::MemberImplNotFound, slang::DiagnosticSeverity::Error);
-        for (const slang::Diagnostic& d : diags) {
+        // Issue each diagnostic on its own so the text client's buffer holds
+        // exactly one item's pretty rendering (snippet + caret) when we harvest it.
+        // A diagnostic mapped to Ignored produces no report, hence the empty check.
+        const auto harvest = [&](const slang::Diagnostic& d) {
+            client->clear();
             engine.issue(d);
+            if (client->empty()) {
+                return;
+            }
+            Diagnostic out = from_slang(engine, d);
+            out.rendered   = client->getString();
+            result.diagnostics.push_back(std::move(out));
+        };
+        for (const slang::Diagnostic& d : diags) {
+            harvest(d);
         }
         // Post-elaboration analysis (dataflow): inferred-latch/comb checks,
         // blocking-task-in-comb errors, and multi-driver checks (9.2.2.2). Only
@@ -13228,11 +13323,12 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings,
             comp.freeze();
             slang::analysis::AnalysisManager analysis;
             analysis.analyze(comp);
-            engine.issue(analysis.getDiagnostics());
+            for (const slang::Diagnostic& d : analysis.getDiagnostics()) {
+                harvest(d);
+            }
             comp.unfreeze();
         }
-        result.diagnostics = client->getString();
-        has_error          = engine.getNumErrors() > 0;
+        has_error = engine.getNumErrors() > 0;
     }
     if (has_error) {
         if (timings != nullptr) {
@@ -13311,7 +13407,11 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings,
         // A context export runs in a specific instance's scope (svScope, LRM
         // 35.5.3); with several tops there is no single design-state root to bind
         // the thunk to. Deferred with the rest of svScope.
-        result.diagnostics += "error: DPI export in a multi-top design is not supported\n";
+        result.diagnostics.push_back(
+          Diagnostic{ .severity = Severity::Error,
+                      .origin   = DiagnosticOrigin::Rejected,
+                      .code     = "multi-top-dpi-export",
+                      .message  = "DPI export in a multi-top design is not supported" });
         return result;
     }
     try {
@@ -13332,7 +13432,11 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, Timings* timings,
             }
         }
     } catch (const LowerError& e) {
-        result.diagnostics += "error: " + e.message + "\n";
+        result.diagnostics.push_back(Diagnostic{ .severity = Severity::Error,
+                                                 .origin   = DiagnosticOrigin::Unsupported,
+                                                 .code     = "unsupported-construct",
+                                                 .message  = e.message,
+                                                 .span     = e.span });
         return result;
     }
     if (timings != nullptr) {
@@ -13351,17 +13455,31 @@ LowerResult lower_files(std::span<const std::string_view> paths, Timings* timing
                         ir::SystemAccess allow_system) {
     const auto t_parse = std::chrono::steady_clock::now();
 
-    // One SourceManager shared across every tree so the Compilation's
-    // diagnostics resolve file/line locations for all files. It
-    // outlives every tree and the compilation use below.
-    slang::SourceManager    sm;
+    // One SourceManager shared across every tree so the Compilation's diagnostics
+    // resolve file/line locations for all files. It is heap-allocated
+    // and handed to the SourceContext so it OUTLIVES this call: an ir::SourceLoc is
+    // only decodable against the manager that minted it, and this used to be a
+    // stack local, which is why locations were unresolvable after lowering.
+    auto                  ctx = std::make_shared<SourceContext>();
+    auto                  sm  = std::make_unique<slang::SourceManager>();
+    slang::SourceManager& sm_ref = *sm;
+    ctx->adopt_source_manager(std::move(sm));
+
+    // `comp` stays on the stack: it holds the syntax trees, which reference the
+    // manager, so it must die BEFORE the context that owns the manager. Returning
+    // from this function destroys it first, which is the order we need.
     slang::ast::Compilation comp;
     for (const std::string_view path : paths) {
-        auto tree = slang::syntax::SyntaxTree::fromFile(path, sm);
+        auto tree = slang::syntax::SyntaxTree::fromFile(path, sm_ref);
         if (!tree) {
             LowerResult result;
-            result.diagnostics = "error: cannot read '" + std::string(path) +
-                                 "': " + std::string(tree.error().second) + "\n";
+            result.sources = ctx;
+            result.diagnostics.push_back(
+              Diagnostic{ .severity = Severity::Error,
+                          .origin   = DiagnosticOrigin::Driver,
+                          .code     = "cannot-read-source",
+                          .message  = "cannot read '" + std::string(path) +
+                                     "': " + std::string(tree.error().second) });
             return result;
         }
         comp.addSyntaxTree(*tree);
@@ -13370,7 +13488,7 @@ LowerResult lower_files(std::span<const std::string_view> paths, Timings* timing
         timings->frontend_ms += ms_since(t_parse);
     }
 
-    return lower_compilation(comp, timings, allow_system);
+    return lower_compilation(comp, std::move(ctx), timings, allow_system);
 }
 
 LowerResult lower_file(std::string_view path, Timings* timings, ir::SystemAccess allow_system) {
@@ -13384,11 +13502,13 @@ LowerResult lower_sources(std::span<const std::string_view> args, Timings* timin
     // slang's Driver owns arg parsing, source loading (incl. `-f` command files,
     // `-y`/`-v` libraries, globbing), the SourceManager, and the option Bag; we
     // consume the Compilation it produces and keep Clotho's own diagnostic
-    // rendering in lower_compilation. The Driver must outlive the
-    // Compilation, so it lives for the whole call; the lowered ir::Module holds
-    // no slang pointers, so it may outlive both.
-    slang::driver::Driver driver;
-    driver.addStandardArgs();
+    // rendering in lower_compilation. Both the Driver (which owns
+    // the SourceManager) and the Compilation are handed to the SourceContext so
+    // locations stay resolvable after this call returns.
+    auto                   ctx    = std::make_shared<SourceContext>();
+    auto                   driver = std::make_unique<slang::driver::Driver>();
+    slang::driver::Driver& dr     = *driver;
+    dr.addStandardArgs();
 
     // Driver's parseCommandLine treats argv[0] as the program name and needs
     // null-terminated C strings; copy the views and prepend a placeholder.
@@ -13401,39 +13521,62 @@ LowerResult lower_sources(std::span<const std::string_view> args, Timings* timin
     }
 
     LowerResult result;
-    if (!driver.parseCommandLine(static_cast<int>(argv.size()), argv.data()) ||
-        !driver.processOptions()) {
+    if (!dr.parseCommandLine(static_cast<int>(argv.size()), argv.data()) || !dr.processOptions()) {
         // Driver prints the specific CLI / missing-file errors to stderr itself.
-        result.diagnostics = "error: command-line or source-loading error\n";
+        ctx->adopt_driver(std::move(driver));
+        result.sources = ctx;
+        result.diagnostics.push_back(Diagnostic{ .severity = Severity::Error,
+                                                 .origin   = DiagnosticOrigin::Driver,
+                                                 .code     = "bad-command-line",
+                                                 .message = "command-line or source-loading error" });
         return result;
     }
 
     // Merge every source file into one compilation unit so `` `define `` macros
     // and `$unit` declarations are shared across files (LRM 3.12). Set before
     // parseAllSources, which is where the SourceLoader consumes it.
-    driver.options.singleUnit = true;
-    if (!driver.parseAllSources()) {
-        result.diagnostics = "error: failed to parse one or more source files\n";
+    dr.options.singleUnit = true;
+    if (!dr.parseAllSources()) {
+        ctx->adopt_driver(std::move(driver));
+        result.sources = ctx;
+        result.diagnostics.push_back(Diagnostic{ .severity = Severity::Error,
+                                                 .origin   = DiagnosticOrigin::Driver,
+                                                 .code     = "parse-failed",
+                                                 .message = "failed to parse one or more source files" });
         return result;
     }
 
-    std::unique_ptr<slang::ast::Compilation> comp = driver.createCompilation();
+    std::unique_ptr<slang::ast::Compilation> comp = dr.createCompilation();
+    slang::ast::Compilation&                 cr   = *comp;
+    // Order matters: the context destroys the Compilation before the Driver, and
+    // the Driver (hence its SourceManager) last. adopt_driver also points the
+    // context's resolver at the Driver's manager.
+    ctx->adopt_driver(std::move(driver));
+    ctx->adopt_compilation(std::move(comp));
     if (timings != nullptr) {
         timings->frontend_ms += ms_since(t_parse);
     }
 
-    return lower_compilation(*comp, timings, allow_system);
+    return lower_compilation(cr, std::move(ctx), timings, allow_system);
 }
 
 LowerResult lower_text(std::string_view source, Timings* timings, ir::SystemAccess allow_system) {
     const auto t_parse = std::chrono::steady_clock::now();
-    slang::ast::Compilation comp;
-    comp.addSyntaxTree(slang::syntax::SyntaxTree::fromText(source));
+
+    // `SyntaxTree::fromText` uses slang's process-wide default SourceManager, so
+    // there is nothing to own here — the context borrows it. The Compilation is
+    // still adopted so its syntax trees outlive the call alongside it.
+    auto                     ctx  = std::make_shared<SourceContext>();
+    auto                     comp = std::make_unique<slang::ast::Compilation>();
+    slang::ast::Compilation& cr   = *comp;
+    cr.addSyntaxTree(slang::syntax::SyntaxTree::fromText(source));
+    ctx->borrow_source_manager(cr.getSourceManager());
+    ctx->adopt_compilation(std::move(comp));
     if (timings != nullptr) {
         timings->frontend_ms += ms_since(t_parse);
     }
 
-    return lower_compilation(comp, timings, allow_system);
+    return lower_compilation(cr, std::move(ctx), timings, allow_system);
 }
 
 } // namespace clotho

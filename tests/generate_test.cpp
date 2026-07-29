@@ -19,7 +19,7 @@ namespace {
 // by a single initial block after a settling #1 delay.
 std::string run_capture(std::string_view source) {
     const LowerResult r = lower_text(source);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     std::FILE* tmp = std::tmpfile();
@@ -90,7 +90,7 @@ TEST_CASE("for-generate flattens each entry under a subscripted prefix") {
             endgenerate
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const std::set<std::string> names = signal_names(*r.module);
     CHECK(names.contains("g[0].x"));
@@ -234,7 +234,7 @@ TEST_CASE("a module instance inside a for-generate flattens under the block") {
             endgenerate
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const std::set<std::string> names = signal_names(*r.module);
     CHECK(names.contains("g[0].u.a"));
@@ -260,7 +260,7 @@ TEST_CASE("an instance array inside a generate block flattens under both prefixe
             endgenerate
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const std::set<std::string> names = signal_names(*r.module);
     for (int i = 0; i < 4; i++) {

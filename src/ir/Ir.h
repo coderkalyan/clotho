@@ -41,7 +41,31 @@ enum class Index : uint32_t {};
 // Offset into the flat u32 extra side-table.
 enum class ExtraIndex : uint32_t {};
 // Opaque, frontend-defined per-instruction source location (no reserved values).
+// A point, not an extent: the instruction column is one of the hottest arrays in
+// the compiler, so it stays 8 bytes per instruction. Constructs a report or an
+// editor points AT carry a SourceSpan instead (see below).
 enum class SourceLoc : uint64_t {};
+
+// Source extent of one construct: [start, end], both inclusive-of-the-token-start
+// in the frontend's encoding. `end == start` means only a point is known — a
+// compiler-synthesized construct, or a diagnostic reported at a bare location.
+//
+// Deliberately NOT stored per instruction. It is attached to the construct-level
+// entities that span-based tooling actually addresses (a process, a function, a
+// diagnostic), where the count is thousands rather than millions and 16 bytes is
+// free. Signals get a bare SourceLoc instead: there can be a million of them and
+// "go to declaration" only needs a point.
+struct SourceSpan {
+    SourceLoc start{ 0 };
+    SourceLoc end{ 0 };
+
+    // True when the span carries any location at all. SourceLoc{0} is the
+    // frontend's "no location" value (buffer id 0 is slang's invalid buffer).
+    [[nodiscard]] bool valid() const {
+        return start != SourceLoc{ 0 };
+    }
+};
+
 // Opaque handle to a module signal (net / variable / port). Resolved by the
 // enclosing module; the process IR never interprets it.
 enum class Signal : uint32_t {};

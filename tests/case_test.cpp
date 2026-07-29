@@ -18,7 +18,7 @@ namespace {
 // branch with $display, so the captured text is the observable behavior.
 std::string run_capture(std::string_view source) {
     const LowerResult r = lower_text(source);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     std::FILE* tmp = std::tmpfile();
@@ -527,7 +527,7 @@ namespace {
 // design output), so the captured text is the observable violation behavior.
 std::string run_capture_stderr(std::string_view source) {
     const LowerResult r = lower_text(source);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     std::FILE* tmp = std::tmpfile();
@@ -1161,7 +1161,7 @@ TEST_CASE("case inside: unbounded range bound is reported as unsupported") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("unbounded") != std::string::npos);
+    CHECK(r.diagnostic_text().find("unbounded") != std::string::npos);
 }
 
 // -- Recursive switch segmentation (find_switch_run) --

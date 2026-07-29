@@ -20,7 +20,7 @@ namespace {
 // Lower and require success, returning the module.
 LowerResult lower_ok(std::string_view src) {
     LowerResult r = lower_text(src);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     return r;
@@ -175,7 +175,7 @@ TEST_CASE("MOS / bidirectional switch primitives are reported as unsupported") {
     for (const char* inst : { "nmos g(y, a, b);", "pmos g(y, a, b);", "tran g(y, a);" }) {
         const LowerResult r = lower_text("module m;\n wire y;\n wire a, b;\n " + std::string(inst) + "\nendmodule");
         CHECK_FALSE(r.ok);
-        CHECK_MESSAGE(r.diagnostics.find("is not supported") != std::string::npos, r.diagnostics, " for ", inst);
+        CHECK_MESSAGE(r.diagnostic_text().find("is not supported") != std::string::npos, r.diagnostic_text(), " for ", inst);
     }
 }
 
@@ -212,7 +212,7 @@ TEST_CASE("gate rise/fall/turn-off delay triples are reported as unsupported") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("rise/fall/turn-off") != std::string::npos);
+    CHECK(r.diagnostic_text().find("rise/fall/turn-off") != std::string::npos);
 }
 
 TEST_CASE("gate delay on a bit-addressed output is reported as unsupported") {
@@ -224,7 +224,7 @@ TEST_CASE("gate delay on a bit-addressed output is reported as unsupported") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("whole scalar output") != std::string::npos);
+    CHECK(r.diagnostic_text().find("whole scalar output") != std::string::npos);
 }
 
 TEST_CASE("gate drive strengths lower (resolution covered in net_resolution_test)") {
@@ -263,7 +263,7 @@ TEST_CASE("user-defined primitives are reported as unsupported") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("is not supported") != std::string::npos);
+    CHECK(r.diagnostic_text().find("is not supported") != std::string::npos);
 }
 
 TEST_CASE("unsupported gate output lvalues are rejected") {
@@ -276,7 +276,7 @@ TEST_CASE("unsupported gate output lvalues are rejected") {
         endmodule
     )");
     CHECK_FALSE(r1.ok);
-    CHECK(r1.diagnostics.find("gate output") != std::string::npos);
+    CHECK(r1.diagnostic_text().find("gate output") != std::string::npos);
 
     // 2-state output net: a gate can drive X, which the slot cannot hold.
     const LowerResult r2 = lower_text(R"(
@@ -287,7 +287,7 @@ TEST_CASE("unsupported gate output lvalues are rejected") {
         endmodule
     )");
     CHECK_FALSE(r2.ok);
-    CHECK(r2.diagnostics.find("2-state") != std::string::npos);
+    CHECK(r2.diagnostic_text().find("2-state") != std::string::npos);
 }
 
 // Module instance arrays (LRM 23.3.6) share InstanceArraySymbol with gate
@@ -304,7 +304,7 @@ TEST_CASE("module instance arrays lower one instance per element") {
             sub u[1:0](a, y);
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     std::set<std::string> names;
     for (const ir::SignalInfo& s : r.module->signals()) {

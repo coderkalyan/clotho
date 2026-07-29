@@ -17,7 +17,7 @@ namespace {
 // JIT-run a module and capture everything it writes to stdout.
 std::string run_capture(std::string_view source) {
     const LowerResult r = lower_text(source);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     std::FILE* tmp = std::tmpfile();
@@ -87,7 +87,7 @@ TEST_CASE("descending instance array elements flatten under <name>[<index>]") {
             inv u[2:0](.a(g_in), .y(o));
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const std::set<std::string> names = signal_names(*r.module);
     CHECK(names.contains("u[0].a"));
@@ -112,7 +112,7 @@ TEST_CASE("ascending instance array keeps declared indices in element names") {
             inv u[0:2](.a(g_in), .y(o));
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const std::set<std::string> names = signal_names(*r.module);
     CHECK(names.contains("u[0].a"));
@@ -133,7 +133,7 @@ TEST_CASE("non-zero-based instance array range keeps declared bounds in names") 
             inv u[5:2](.a(g_in), .y(o));
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const std::set<std::string> names = signal_names(*r.module);
     CHECK(names.contains("u[5].a"));
@@ -157,7 +157,7 @@ TEST_CASE("multidimensional instance array flattens each leaf with all indices")
             inv u[1:0][1:0](.a(g_in));
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const std::set<std::string> names = signal_names(*r.module);
     CHECK(names.contains("u[0][0].a"));

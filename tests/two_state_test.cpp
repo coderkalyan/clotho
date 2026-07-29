@@ -21,7 +21,7 @@ namespace {
 // free to rewrite or constant-fold.
 std::string emit(std::string_view source) {
     const LowerResult result = lower_text(source);
-    REQUIRE_MESSAGE(result.ok, result.diagnostics);
+    REQUIRE_MESSAGE(result.ok, result.diagnostic_text());
     REQUIRE(result.module != nullptr);
     std::string              text;
     llvm::raw_string_ostream os(text);
@@ -31,7 +31,7 @@ std::string emit(std::string_view source) {
 
 std::string run_capture(std::string_view source) {
     const LowerResult r = lower_text(source);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     std::FILE* tmp = std::tmpfile();

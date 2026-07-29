@@ -92,7 +92,7 @@ const ir::Process* find_level_process(const ir::Module& m) {
 TEST_CASE("lowering the registered ALU produces a module") {
     const LowerResult r = lower_text(kAlu);
 
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     const ir::Module& m = *r.module;
@@ -151,7 +151,7 @@ TEST_CASE("constant case lowers to a switch") {
         2'd1: x = 2'b01;
         default: x = 2'b11;
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const ir::Process* p = find_level_process(*r.module);
     REQUIRE(p != nullptr);
@@ -167,7 +167,7 @@ TEST_CASE("non-constant case label uses the case-equality cond chain") {
     // and lowering falls back to the if-else chain; a grouped item ORs its
     // comparisons.
     const LowerResult r = lower_case_module("case", "x, 2'd1: x = 2'b01; default: x = 2'b00;");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const ir::Process* p = find_level_process(*r.module);
     REQUIRE(p != nullptr);
@@ -181,17 +181,17 @@ TEST_CASE("non-constant case label uses the case-equality cond chain") {
 
 TEST_CASE("casez / casex select the wildcard comparison") {
     const LowerResult rz = lower_case_module("casez", "2'b1?: x = 2'b01; default: x = 2'b00;");
-    REQUIRE_MESSAGE(rz.ok, rz.diagnostics);
+    REQUIRE_MESSAGE(rz.ok, rz.diagnostic_text());
     CHECK(has_tag(find_level_process(*rz.module)->ir, ir::Inst::Tag::CasezEq));
 
     const LowerResult rx = lower_case_module("casex", "2'b1x: x = 2'b01; default: x = 2'b00;");
-    REQUIRE_MESSAGE(rx.ok, rx.diagnostics);
+    REQUIRE_MESSAGE(rx.ok, rx.diagnostic_text());
     CHECK(has_tag(find_level_process(*rx.module)->ir, ir::Inst::Tag::CasexEq));
 }
 
 TEST_CASE("grouped constant labels share one switch arm") {
     const LowerResult r = lower_case_module("case", "2'd0, 2'd1: x = 2'b01; default: x = 2'b00;");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     const ir::Process* p = find_level_process(*r.module);
     REQUIRE(p != nullptr);
     // Both keys map to one arm body; no OR-of-comparisons chain.
@@ -205,7 +205,7 @@ TEST_CASE("$time lowers to a SimTime instruction") {
             initial $display("%0d", $time);
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     bool found = false;
     for (const ir::Process& p : r.module->processes()) {
@@ -271,7 +271,7 @@ TEST_CASE("mixing continuous and procedural assignment to a variable is an error
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("cannot mix continuous and procedural assignments") != std::string::npos);
+    CHECK(r.diagnostic_text().find("cannot mix continuous and procedural assignments") != std::string::npos);
 }
 
 TEST_CASE("multiple continuous assignments to a variable is an error") {
@@ -283,7 +283,7 @@ TEST_CASE("multiple continuous assignments to a variable is an error") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("cannot have multiple continuous assignments") != std::string::npos);
+    CHECK(r.diagnostic_text().find("cannot have multiple continuous assignments") != std::string::npos);
 }
 
 // slang also defaults a same-scope name redefinition to a warning and
@@ -297,7 +297,7 @@ TEST_CASE("redefining a name in the same scope is an error") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("redefinition of") != std::string::npos);
+    CHECK(r.diagnostic_text().find("redefinition of") != std::string::npos);
 }
 
 TEST_CASE("$timeformat with a non-literal suffix is reported as unsupported") {
@@ -310,7 +310,7 @@ TEST_CASE("$timeformat with a non-literal suffix is reported as unsupported") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("suffix must be a string literal") != std::string::npos);
+    CHECK(r.diagnostic_text().find("suffix must be a string literal") != std::string::npos);
 }
 
 // A `final` block lowers to a run-once end-of-sim process (LRM 9.2.3), scheduled
@@ -349,7 +349,7 @@ TEST_CASE("always_comb infers its sensitivity from the RHS reads") {
                 y = sel ? a : b;
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const ir::Process* p = find_level_process(*r.module);
     REQUIRE(p != nullptr);
@@ -364,7 +364,7 @@ TEST_CASE("always @(*) infers the same sensitivity as always_comb") {
                 y = a & b;
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const ir::Process* p = find_level_process(*r.module);
     REQUIRE(p != nullptr);
@@ -378,7 +378,7 @@ TEST_CASE("always_latch infers sensitivity the same way as always_comb") {
                 if (g) q = d;
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const ir::Process* p = find_level_process(*r.module);
     REQUIRE(p != nullptr);
@@ -396,7 +396,7 @@ TEST_CASE("an intermediate that is written then read is not in the sensitivity l
             end
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const ir::Process* p = find_level_process(*r.module);
     REQUIRE(p != nullptr);
@@ -413,7 +413,7 @@ TEST_CASE("an index expression on the write target is a read") {
             end
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const ir::Process* p = find_level_process(*r.module);
     REQUIRE(p != nullptr);
@@ -461,7 +461,7 @@ constexpr std::string_view kHier = R"(
 
 TEST_CASE("instantiation flattens the child under a hierarchical prefix") {
     const LowerResult r = lower_text(kHier);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const ir::Module& m = *r.module;
     CHECK(m.name == "top");
@@ -503,7 +503,7 @@ TEST_CASE("lower_files compiles a design split across two files into one design"
 
     const std::array<std::string_view, 2> paths{ top.path.native(), child.path.native() };
     const LowerResult                     r = lower_files(paths);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(r.module->name == "top");
     CHECK(signal_names(*r.module) == std::set<std::string>{ "g", "o", "w", "u_inv.a", "u_inv.y" });
 }
@@ -512,7 +512,7 @@ TEST_CASE("lower_files reports a missing file loudly") {
     const std::array<std::string_view, 1> paths{ "/no/such/clotho/file.sv" };
     const LowerResult                     r = lower_files(paths);
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("cannot read") != std::string::npos);
+    CHECK(r.diagnostic_text().find("cannot read") != std::string::npos);
 }
 
 TEST_CASE("an input port connection copies into the child with the expression's sensitivity") {
@@ -526,7 +526,7 @@ TEST_CASE("an input port connection copies into the child with the expression's 
             assign o = w;
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     // The copy driving u.a re-evaluates on x and z (the connection expression's reads).
     const ir::Process* copy = find_process(*r.module, [&](const ir::Process& p) {
@@ -545,7 +545,7 @@ TEST_CASE("the same module instantiated twice gets distinct signal storage") {
             inv u1(.a(g), .y(o[1]));
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const std::set<std::string> names = signal_names(*r.module);
     CHECK(names.contains("u0.a"));
@@ -562,7 +562,7 @@ TEST_CASE("an inout port connection lowers (shared storage)") {
             pass u(.a(b));
         endmodule
     )");
-    CHECK_MESSAGE(r.ok, r.diagnostics);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
 }
 
 TEST_CASE("whole unpacked array blocking assignment lowers (memcpy)") {
@@ -641,7 +641,7 @@ TEST_CASE("a fixed-size unpacked array slice lowers in each context") {
             endmodule
         )");
         CHECK_FALSE(r.ok);
-        CHECK(r.diagnostics.find("indexed part-select slice of an unpacked array") !=
+        CHECK(r.diagnostic_text().find("indexed part-select slice of an unpacked array") !=
               std::string::npos);
     }
 }
@@ -687,7 +687,7 @@ TEST_CASE("an associative array lowers") {
             initial a["x"] = 1;
         endmodule
     )");
-    CHECK_MESSAGE(r.ok, r.diagnostics);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
 }
 
 TEST_CASE("an associative array with a class-handle value element fails loudly") {
@@ -702,7 +702,7 @@ TEST_CASE("an associative array with a class-handle value element fails loudly")
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("value element") != std::string::npos);
+    CHECK(r.diagnostic_text().find("value element") != std::string::npos);
 }
 
 TEST_CASE("nonblocking whole-struct copy with a queue member fails loudly") {
@@ -714,7 +714,7 @@ TEST_CASE("nonblocking whole-struct copy with a queue member fails loudly") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("queue / dynamic array member") != std::string::npos);
+    CHECK(r.diagnostic_text().find("queue / dynamic array member") != std::string::npos);
 }
 
 TEST_CASE("equality of a struct with a queue member lowers (element-wise walk)") {
@@ -750,7 +750,7 @@ TEST_CASE("an event struct member fails loudly") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("event struct member") != std::string::npos);
+    CHECK(r.diagnostic_text().find("event struct member") != std::string::npos);
 }
 
 TEST_CASE("an unpacked array of events fails loudly") {
@@ -761,7 +761,7 @@ TEST_CASE("an unpacked array of events fails loudly") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("unpacked array of events") != std::string::npos);
+    CHECK(r.diagnostic_text().find("unpacked array of events") != std::string::npos);
 }
 
 TEST_CASE("an event class property fails loudly") {
@@ -773,7 +773,7 @@ TEST_CASE("an event class property fails loudly") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("event class property") != std::string::npos);
+    CHECK(r.diagnostic_text().find("event class property") != std::string::npos);
 }
 
 TEST_CASE("a packed struct declares and carries its field table") {
@@ -788,7 +788,7 @@ TEST_CASE("a packed struct declares and carries its field table") {
             initial y = x;
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     const ir::Module& m = *r.module;
@@ -841,7 +841,7 @@ TEST_CASE("nested instances chain their hierarchical prefixes") {
             mid u_mid(.mi(g), .mo(o));
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const std::set<std::string> names = signal_names(*r.module);
     // The grandchild's nets carry the full path through both instance levels.
@@ -859,7 +859,7 @@ TEST_CASE("a continuous assign infers sensitivity from its RHS reads") {
             assign y = sel ? a : b;
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const ir::Process* p = find_level_process(*r.module);
     REQUIRE(p != nullptr);
@@ -872,7 +872,7 @@ TEST_CASE("a continuous assign with combinational feedback stays sensitive to th
             assign y = a & y;
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const ir::Process* p = find_level_process(*r.module);
     REQUIRE(p != nullptr);
@@ -887,7 +887,7 @@ TEST_CASE("a continuous assign with a constant RHS has an empty wait list") {
             assign y = 4'b0;
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const ir::Process* p = find_level_process(*r.module);
     REQUIRE(p != nullptr);
@@ -903,7 +903,7 @@ TEST_CASE("a parameter sets a signal width and drives a replication count") {
             assign o = {W{1'b1}};
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(signal_width(*r.module, "o") == 4);
 }
 
@@ -917,7 +917,7 @@ TEST_CASE("a #() override specializes each instance's width independently") {
             m #(.W(8)) u1(.o(b));
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(signal_width(*r.module, "u0.o") == 3);
     CHECK(signal_width(*r.module, "u1.o") == 8);
 }
@@ -928,7 +928,7 @@ TEST_CASE("a parameter referenced in an rvalue folds to a constant, not a signal
             assign y = a + W;
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     // W is a compile-time constant: the assign is sensitive only to `a`.
     const ir::Process* p = find_level_process(*r.module);
     REQUIRE(p != nullptr);
@@ -942,7 +942,7 @@ TEST_CASE("a localparam derived from a parameter resolves its width") {
             assign o = {D{1'b0}};
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(signal_width(*r.module, "o") == 8);
 }
 
@@ -952,7 +952,7 @@ TEST_CASE("a parameter expression in a part-select bound folds") {
             assign o = a[W-1:W-2];
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(signal_width(*r.module, "o") == 2);
 }
 
@@ -964,7 +964,7 @@ TEST_CASE("a type parameter default sets a port width") {
             assign o = 8'hFF;
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(signal_width(*r.module, "o") == 8);
 }
 
@@ -978,7 +978,7 @@ TEST_CASE("a #() type override specializes each instance's width independently")
             m #(.T(logic [15:0])) u1(.o(b));
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(signal_width(*r.module, "u0.o") == 3);
     CHECK(signal_width(*r.module, "u1.o") == 16);
 }
@@ -991,7 +991,7 @@ TEST_CASE("a type parameter default sets an internal variable's width") {
             assign o = v;
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(signal_width(*r.module, "v") == 4);
 }
 
@@ -1010,7 +1010,7 @@ TEST_CASE("a type parameter bound to an unsupported type fails loudly") {
         endmodule
     )");
     CHECK(!r.ok);
-    CHECK(r.diagnostics.find("value element") != std::string::npos);
+    CHECK(r.diagnostic_text().find("value element") != std::string::npos);
 }
 
 TEST_CASE("a class type parameter lowers as a handle") {
@@ -1022,7 +1022,7 @@ TEST_CASE("a class type parameter lowers as a handle") {
             T v;
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 }
 
 TEST_CASE("a type parameter flows into a function argument and return type") {
@@ -1034,7 +1034,7 @@ TEST_CASE("a type parameter flows into a function argument and return type") {
             assign o = f(a);
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(signal_width(*r.module, "a") == 8);
     CHECK(signal_width(*r.module, "o") == 8);
 }
@@ -1055,7 +1055,7 @@ TEST_CASE("a task body neither adds to nor subtracts from always_comb sensitivit
             end
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const ir::Process* p = find_level_process(*r.module);
     REQUIRE(p != nullptr);
@@ -1077,7 +1077,7 @@ TEST_CASE("a task-body write does not subtract a block-level read") {
             end
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const ir::Process* p = find_level_process(*r.module);
     REQUIRE(p != nullptr);
@@ -1099,7 +1099,7 @@ TEST_CASE("always @* keeps an intermediate that is both read and written") {
             end
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
     const ir::Process* p = find_level_process(*r.module);
     REQUIRE(p != nullptr);
@@ -1117,7 +1117,7 @@ TEST_CASE("always @* is sensitive to function arguments, not function contents")
             always @* y = f(a);
         endmodule
     )");
-    REQUIRE_MESSAGE(star.ok, star.diagnostics);
+    REQUIRE_MESSAGE(star.ok, star.diagnostic_text());
     const ir::Process* sp = find_level_process(*star.module);
     REQUIRE(sp != nullptr);
     CHECK(sensitivity_names(*star.module, *sp) == std::set<std::string>{ "a" });
@@ -1130,7 +1130,7 @@ TEST_CASE("always @* is sensitive to function arguments, not function contents")
             always_comb y = f(a);
         endmodule
     )");
-    REQUIRE_MESSAGE(comb.ok, comb.diagnostics);
+    REQUIRE_MESSAGE(comb.ok, comb.diagnostic_text());
     const ir::Process* cp = find_level_process(*comb.module);
     REQUIRE(cp != nullptr);
     CHECK(sensitivity_names(*comb.module, *cp) == std::set<std::string>{ "a", "g" });
@@ -1145,8 +1145,8 @@ TEST_CASE("an always_comb that infers a latch warns but still lowers") {
                 if (en) q = d;
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
-    CHECK(r.diagnostics.find("latch inferred") != std::string::npos);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    CHECK(r.diagnostic_text().find("latch inferred") != std::string::npos);
 }
 
 TEST_CASE("a blocking task called from always_comb is rejected") {
@@ -1161,7 +1161,7 @@ TEST_CASE("a blocking task called from always_comb is rejected") {
         endmodule
     )");
     CHECK(!r.ok);
-    CHECK(r.diagnostics.find("blocking timing control") != std::string::npos);
+    CHECK(r.diagnostic_text().find("blocking timing control") != std::string::npos);
 }
 
 TEST_CASE("a variable driven by always_comb and another process warns") {
@@ -1171,8 +1171,8 @@ TEST_CASE("a variable driven by always_comb and another process warns") {
             initial y = 1'b1;
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
-    CHECK(r.diagnostics.find("cannot be written to by any other process") != std::string::npos);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    CHECK(r.diagnostic_text().find("cannot be written to by any other process") != std::string::npos);
 }
 
 TEST_CASE("a timing-control-free always warns but still lowers") {
@@ -1185,8 +1185,8 @@ TEST_CASE("a timing-control-free always warns but still lowers") {
             always a = ~a;
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
-    CHECK(r.diagnostics.find("does not advance time") != std::string::npos);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    CHECK(r.diagnostic_text().find("does not advance time") != std::string::npos);
 }
 
 // -- Multiple continuous drivers on one net (LRM 6.6) --
@@ -1208,7 +1208,7 @@ TEST_CASE("two whole-net continuous assigns resolve") {
             assign w = 1'b1;
         endmodule
     )");
-    CHECK_MESSAGE(r.ok, r.diagnostics);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
 }
 
 TEST_CASE("a net declaration assignment plus a whole-net continuous assign resolve") {
@@ -1218,7 +1218,7 @@ TEST_CASE("a net declaration assignment plus a whole-net continuous assign resol
             assign w = a;
         endmodule
     )");
-    CHECK_MESSAGE(r.ok, r.diagnostics);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
 }
 
 TEST_CASE("an output port connection plus a whole-net continuous assign resolve") {
@@ -1232,7 +1232,7 @@ TEST_CASE("an output port connection plus a whole-net continuous assign resolve"
             assign w = 1'b1;
         endmodule
     )");
-    CHECK_MESSAGE(r.ok, r.diagnostics);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
 }
 
 TEST_CASE("overlapping constant part-select drivers resolve") {
@@ -1243,7 +1243,7 @@ TEST_CASE("overlapping constant part-select drivers resolve") {
             assign w[6:2] = b;
         endmodule
     )");
-    CHECK_MESSAGE(r.ok, r.diagnostics);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
 }
 
 TEST_CASE("a concatenation lvalue operand overlapping another driver fails loudly") {
@@ -1255,7 +1255,7 @@ TEST_CASE("a concatenation lvalue operand overlapping another driver fails loudl
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("concatenation driver of a multiply-driven net") != std::string::npos);
+    CHECK(r.diagnostic_text().find("concatenation driver of a multiply-driven net") != std::string::npos);
 }
 
 TEST_CASE("non-overlapping constant bit drivers of one net are accepted") {
@@ -1267,7 +1267,7 @@ TEST_CASE("non-overlapping constant bit drivers of one net are accepted") {
             assign y = w;
         endmodule
     )");
-    CHECK_MESSAGE(r.ok, r.diagnostics);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
 }
 
 TEST_CASE("non-overlapping constant part-select drivers are accepted") {
@@ -1279,7 +1279,7 @@ TEST_CASE("non-overlapping constant part-select drivers are accepted") {
             assign y = w;
         endmodule
     )");
-    CHECK_MESSAGE(r.ok, r.diagnostics);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
 }
 
 // -- Unpacked net arrays driven one element at a time (LRM 6.6.1) --
@@ -1297,7 +1297,7 @@ TEST_CASE("distinct constant elements of an unpacked net array are accepted") {
             assign mem[2] = a ^ b;
         endmodule
     )");
-    CHECK_MESSAGE(r.ok, r.diagnostics);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
 }
 
 TEST_CASE("distinct elements of a scalar unpacked net array are accepted") {
@@ -1308,7 +1308,7 @@ TEST_CASE("distinct elements of a scalar unpacked net array are accepted") {
             assign w[1] = b;
         endmodule
     )");
-    CHECK_MESSAGE(r.ok, r.diagnostics);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
 }
 
 TEST_CASE("distinct elements of a multidimensional net array are accepted") {
@@ -1321,7 +1321,7 @@ TEST_CASE("distinct elements of a multidimensional net array are accepted") {
             assign mem[1][1] = d;
         endmodule
     )");
-    CHECK_MESSAGE(r.ok, r.diagnostics);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
 }
 
 TEST_CASE("disjoint bits of one net-array element are accepted") {
@@ -1332,7 +1332,7 @@ TEST_CASE("disjoint bits of one net-array element are accepted") {
             assign mem[0][7:4] = b;
         endmodule
     )");
-    CHECK_MESSAGE(r.ok, r.diagnostics);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
 }
 
 TEST_CASE("two drivers of the same net-array element fail loudly") {
@@ -1346,7 +1346,7 @@ TEST_CASE("two drivers of the same net-array element fail loudly") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("unpacked-array or unpacked-struct multiply-driven net") != std::string::npos);
+    CHECK(r.diagnostic_text().find("unpacked-array or unpacked-struct multiply-driven net") != std::string::npos);
 }
 
 TEST_CASE("overlapping bit drivers of one net-array element fail loudly") {
@@ -1358,7 +1358,7 @@ TEST_CASE("overlapping bit drivers of one net-array element fail loudly") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("unpacked-array or unpacked-struct multiply-driven net") != std::string::npos);
+    CHECK(r.diagnostic_text().find("unpacked-array or unpacked-struct multiply-driven net") != std::string::npos);
 }
 
 TEST_CASE("a net with one continuous driver read procedurally is accepted") {
@@ -1371,7 +1371,7 @@ TEST_CASE("a net with one continuous driver read procedurally is accepted") {
             always @(w) q = w;
         endmodule
     )");
-    CHECK_MESSAGE(r.ok, r.diagnostics);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
 }
 
 TEST_CASE("drive strengths lower on continuous assigns and net declarations") {
@@ -1381,14 +1381,14 @@ TEST_CASE("drive strengths lower on continuous assigns and net declarations") {
             assign (weak0, weak1) w = a;
         endmodule
     )");
-    CHECK_MESSAGE(ra.ok, ra.diagnostics);
+    CHECK_MESSAGE(ra.ok, ra.diagnostic_text());
 
     const LowerResult rn = lower_text(R"(
         module m(input a);
             wire (pull0, pull1) w = a;
         endmodule
     )");
-    CHECK_MESSAGE(rn.ok, rn.diagnostics);
+    CHECK_MESSAGE(rn.ok, rn.diagnostic_text());
 
     const LowerResult rs = lower_text(R"(
         module m(input a);
@@ -1396,7 +1396,7 @@ TEST_CASE("drive strengths lower on continuous assigns and net declarations") {
             assign (strong0, strong1) w = a;
         endmodule
     )");
-    CHECK_MESSAGE(rs.ok, rs.diagnostics);
+    CHECK_MESSAGE(rs.ok, rs.diagnostic_text());
 }
 
 // -- Net delay (LRM 28.16) --
@@ -1408,7 +1408,7 @@ TEST_CASE("a net declaration delay fails loudly") {
         endmodule
     )");
     CHECK_FALSE(ri.ok);
-    CHECK(ri.diagnostics.find("net delay") != std::string::npos);
+    CHECK(ri.diagnostic_text().find("net delay") != std::string::npos);
 
     const LowerResult rd = lower_text(R"(
         module m(input a);
@@ -1417,7 +1417,7 @@ TEST_CASE("a net declaration delay fails loudly") {
         endmodule
     )");
     CHECK_FALSE(rd.ok);
-    CHECK(rd.diagnostics.find("net delay") != std::string::npos);
+    CHECK(rd.diagnostic_text().find("net delay") != std::string::npos);
 
     // No delay: a plain net declaration assignment still lowers.
     const LowerResult rp = lower_text(R"(
@@ -1425,7 +1425,7 @@ TEST_CASE("a net declaration delay fails loudly") {
             wire w = a;
         endmodule
     )");
-    CHECK_MESSAGE(rp.ok, rp.diagnostics);
+    CHECK_MESSAGE(rp.ok, rp.diagnostic_text());
 }
 
 // -- `matches` pattern conditions (LRM 12.6.2) --
@@ -1441,7 +1441,7 @@ TEST_CASE("a matches pattern in an if condition lowers (LRM 12.6.2)") {
                 else q = 1'b0;
         endmodule
     )");
-    CHECK_MESSAGE(r.ok, r.diagnostics);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
 }
 
 TEST_CASE("a matches pattern in a conditional expression lowers (LRM 12.6.2)") {
@@ -1453,7 +1453,7 @@ TEST_CASE("a matches pattern in a conditional expression lowers (LRM 12.6.2)") {
             assign y = v matches 4'd3 ? 1'b1 : 1'b0;
         endmodule
     )");
-    CHECK_MESSAGE(r.ok, r.diagnostics);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
 }
 
 // A compilation unit with no top-level module/interface/program instance
@@ -1467,14 +1467,14 @@ TEST_CASE("a package-only source with no module compiles successfully") {
             function int double_w(); return W * 2; endfunction
         endpackage
     )");
-    CHECK_MESSAGE(r.ok, r.diagnostics);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(r.module != nullptr);
 }
 
 // Same for a bare $unit-scope declaration with no module at all.
 TEST_CASE("a source with only a $unit-scope declaration compiles successfully") {
     const LowerResult r = lower_text("parameter int W = 8;");
-    CHECK_MESSAGE(r.ok, r.diagnostics);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(r.module != nullptr);
 }
 
@@ -1499,7 +1499,7 @@ TEST_CASE("bit-stream cast of a dynamic array to a packed type fails loudly") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("bit-stream cast") != std::string::npos);
+    CHECK(r.diagnostic_text().find("bit-stream cast") != std::string::npos);
 }
 
 TEST_CASE("bit-stream cast of a dynamic-array-returning call fails loudly") {
@@ -1517,5 +1517,5 @@ TEST_CASE("bit-stream cast of a dynamic-array-returning call fails loudly") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostics.find("bit-stream cast") != std::string::npos);
+    CHECK(r.diagnostic_text().find("bit-stream cast") != std::string::npos);
 }

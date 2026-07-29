@@ -18,7 +18,7 @@ namespace {
 // comb-fusion work cannot silently change any of them.
 std::string run_capture(std::string_view source, ir::SimulationConfig config = {}) {
     const LowerResult r = lower_text(source);
-    REQUIRE_MESSAGE(r.ok, r.diagnostics);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
     std::FILE* tmp = std::tmpfile();

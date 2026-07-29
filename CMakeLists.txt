@@ -99,36 +99,55 @@ target_link_libraries(clotho_runtime PRIVATE clotho_warnings unordered_dense::un
 # them untouched.
 target_compile_options(clotho_runtime PRIVATE $<$<CONFIG:Debug>:-O3>)
 
-# Backend IR + passes. Target-agnostic, no slang dependency: handles the bulk
-# of compiler logic short of the slang -> IR translation layer.
-add_library(clotho_ir STATIC
+# IR core: the frozen process IR, its builder, intern pool, printer and
+# whole-design analyses. Free of LLVM, slang AND the runtime at source level —
+# this is the layer a non-JIT consumer (a synthesis emitter, a language server)
+# links against without dragging a code generator in. Keeping it a distinct
+# target is load bearing, not cosmetic: it makes the build fail if an analysis
+# ever reaches for LLVM.
+add_library(clotho_ir_core STATIC
   src/ir/InternPool.cpp
   src/ir/Ir.cpp
   src/ir/Builder.cpp
   src/ir/Printer.cpp
   src/ir/ZElision.cpp
+)
+target_include_directories(clotho_ir_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(clotho_ir_core PUBLIC unordered_dense::unordered_dense)
+target_link_libraries(clotho_ir_core PRIVATE clotho_warnings)
+
+# Simulation code generator: process IR -> LLVM IR -> ORC JIT. The only part of
+# the IR layer that needs LLVM, so the only part that links it — and the only
+# part that needs the runtime's C ABI layouts (rt_string, rt_queue, ...).
+add_library(clotho_ir STATIC
   src/ir/LlvmBackend.cpp
   src/ir/Jit.cpp
 )
 target_include_directories(clotho_ir PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${LLVM_INCLUDE_DIRS})
 target_compile_definitions(clotho_ir PUBLIC ${LLVM_DEFINITIONS})
-target_link_libraries(clotho_ir PUBLIC unordered_dense::unordered_dense clotho_runtime ${LLVM_LIBS})
+target_link_libraries(clotho_ir PUBLIC clotho_ir_core clotho_runtime ${LLVM_LIBS})
 target_link_libraries(clotho_ir PRIVATE clotho_warnings)
 
-# Front-end: the slang -> IR translation. Pulls in slang and the IR;
-# consumers get both transitively.
+# Front-end: the slang -> IR translation, plus source-location plumbing and
+# structured diagnostics. Needs slang and the IR core but NOT the code
+# generator, so it links clotho_ir_core rather than clotho_ir. A consumer that
+# only wants "source text -> ir::Module + diagnostics" (check mode, a language
+# server) links this and never pulls LLVM in.
 add_library(clotho STATIC
+  src/Diagnostic.cpp
+  src/SourceContext.cpp
   src/SourceMap.cpp
   src/Lower.cpp
 )
 target_include_directories(clotho PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(clotho PUBLIC clotho_ir slang::slang)
+target_link_libraries(clotho PUBLIC clotho_ir_core slang::slang)
 target_link_libraries(clotho PRIVATE clotho_warnings)
 
-# Thin build driver.
+# Thin build driver. Needs the code generator explicitly now that `clotho` no
+# longer re-exports it.
 add_executable(clotho_cli src/main.cpp)
 set_target_properties(clotho_cli PROPERTIES OUTPUT_NAME clotho)
-target_link_libraries(clotho_cli PRIVATE clotho clotho_warnings)
+target_link_libraries(clotho_cli PRIVATE clotho clotho_ir clotho_warnings)
 
 # Single doctest executable aggregating every tests/*.cpp.
 enable_testing()
@@ -190,7 +209,7 @@ add_executable(clotho_test
   tests/force_release_test.cpp
   tests/system_test.cpp
 )
-target_link_libraries(clotho_test PRIVATE clotho doctest::doctest clotho_warnings)
+target_link_libraries(clotho_test PRIVATE clotho clotho_ir doctest::doctest clotho_warnings)
 
 # Export the test executable's dynamic symbols so DPI-C imports defined in the
 # test TUs (extern "C") resolve through the JIT's process-symbol generator

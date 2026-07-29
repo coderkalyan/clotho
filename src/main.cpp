@@ -136,7 +136,7 @@ int main(int argc, char** argv) {
 
     const clotho::LowerResult result = clotho::lower_sources(slang_args, tp, config.allow_system);
     if (!result.diagnostics.empty()) {
-        std::print(stderr, "{}", result.diagnostics);
+        std::print(stderr, "{}", result.diagnostic_text());
     }
     if (!result.ok) {
         return 1;
@@ -149,7 +149,12 @@ int main(int argc, char** argv) {
     }
 
     if (emit == "ir") {
-        clotho::ir::print_module(*result.module, std::cout);
+        // Locations are resolvable now that lowering hands back the SourceManager,
+        // so annotate the dump — an IR dump you cannot map back to source is much
+        // less useful for debugging a lowering problem.
+        clotho::ir::print_module(*result.module, std::cout, [&](clotho::ir::SourceLoc l) {
+            return result.sources->render(l);
+        });
         report();
         return 0;
     }
