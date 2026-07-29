@@ -287,6 +287,14 @@ target_link_libraries(clotho_test PRIVATE clotho doctest::doctest clotho_warning
 # test TUs (extern "C") resolve through the JIT's process-symbol generator
 # (dlsym(RTLD_DEFAULT)), the same path libc/libm DPI imports already use.
 set_target_properties(clotho_test PROPERTIES ENABLE_EXPORTS ON)
+if(WIN32 AND NOT MSVC)
+  # ENABLE_EXPORTS alone exports nothing from a PE executable -- there is no
+  # equivalent of -rdynamic, and the linker only exports what is explicitly
+  # marked. The MinGW linker will export the lot when asked, which is what the
+  # JIT's process-symbol lookup needs to find the DPI-C imports the test TUs
+  # define.
+  target_link_options(clotho_test PRIVATE -Wl,--export-all-symbols)
+endif()
 
 # Register each doctest case as its own CTest test for parallelism and
 # per-case reporting.

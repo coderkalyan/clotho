@@ -2206,7 +2206,7 @@ extern "C" int32_t rt_fopen_mcd(const char* name_buf, uint32_t name_len, int32_t
     // Claim the lowest free channel; bit 0 is the reserved standard output.
     for (int b = 1; b < 31; ++b) {
         if (mcd_channels[b] == nullptr) {
-            std::FILE* f = std::fopen(path.c_str(), "w");
+            std::FILE* f = std::fopen(path.c_str(), "wb");
             if (f == nullptr) {
                 return 0;
             }
@@ -2221,8 +2221,17 @@ extern "C" int32_t rt_fopen_fd(const char* name_buf, uint32_t name_len, int32_t 
                                const char* mode_buf, uint32_t mode_len, int32_t mode_fwd) {
     io_ensure_init();
     const std::string path = read_ascii_arg(name_buf, name_len, name_fwd);
-    const std::string mode = read_ascii_arg(mode_buf, mode_len, mode_fwd);
-    std::FILE*        f    = std::fopen(path.c_str(), mode.c_str());
+    std::string mode = read_ascii_arg(mode_buf, mode_len, mode_fwd);
+    // Always binary. SystemVerilog file I/O is byte-oriented -- $fwrite emits the
+    // bytes the format produced -- so a host that rewrites \n as \r\n on the way
+    // out (Windows text mode) would make a design's output platform-dependent,
+    // and $fgetc/$fread would see bytes the file does not contain. The VCD writer
+    // and $readmem already open binary; this makes $fopen agree. A no-op on
+    // POSIX, where the two modes are identical.
+    if (mode.find('b') == std::string::npos) {
+        mode += 'b';
+    }
+    std::FILE* f = std::fopen(path.c_str(), mode.c_str());
     if (f == nullptr) {
         return 0;
     }

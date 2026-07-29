@@ -8,6 +8,10 @@
 #include <string>
 #include <system_error>
 
+#if defined(_WIN32)
+#include <fcntl.h>
+#endif
+
 #include "Lower.h"
 #include "Subprocess.h"
 #include "ir/Jit.h"
@@ -20,6 +24,12 @@ namespace {
 // through lower_file so the buffer is named "source", matching what the same
 // design produces in-process.
 int run_design(const char* path) {
+#if defined(_WIN32)
+    // cmd.exe's `>` redirect hands this process a text-mode stdout, which
+    // rewrites every \n as \r\n -- so the captured output would not match what
+    // the design actually printed. Put it back to binary.
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
     const std::string         text = clotho::test::detail::read_file(path);
     const clotho::LowerResult r    = clotho::lower_text(text);
     if (!r.ok || r.module == nullptr) {
