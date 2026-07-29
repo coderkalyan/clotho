@@ -638,6 +638,9 @@ public:
         if (std::getenv("CLOTHO_COMB_FUSE_STAT") != nullptr) {
             report_comb_fuse_stat();
         }
+        if (std::getenv("CLOTHO_FINISH_STAT") != nullptr) {
+            report_finish_stat();
+        }
         compute_domain_spec();   // after fusion (thunk_group_): reads spec_group_ in lower_group
         design_uses_strobe_   = design_uses_strobe(); // gates the Postponed-region drain loop
         design_uses_monitor_  = design_uses_monitor();
@@ -5320,6 +5323,119 @@ private:
                          "rewrite %lld ms)\n",
                          (unsigned long long)members, (unsigned long long)sets,
                          (unsigned long long)eligible, (long long)ms(t1 - t0), (long long)ms(t2 - t1));
+        }
+    }
+
+    // May-finish closure (CLOTHO_FINISH_STAT), measurement only.
+    //
+    // Sizing study for the cooperative-$finish migration
+    // (docs/design/cooperative-finish.md). Replacing rt_finish's longjmp with an
+    // ordinary return means a call that can reach a $finish must be followed by
+    // a test of the finishing flag, so the caller can return too. That test is
+    // the whole cost of the scheme in designs that never finish, and it is only
+    // needed at call sites whose callee can actually reach a $finish — which is
+    // what this counts.
+    //
+    // A subroutine is may-finish if its own body contains a Finish ($finish,
+    // $stop, or the finish $fatal appends) or if it calls a may-finish callee.
+    // Virtual calls take the statically named target, matching how the
+    // by-pointer argument scan resolves them; an override that finishes where
+    // its prototype does not would be missed, so treat the virtual figure as a
+    // lower bound.
+    void report_finish_stat() const {
+        const auto nf = static_cast<uint32_t>(mod_.function_count());
+
+        // Direct seeds, plus each body's callee list, in one pass.
+        std::vector<uint8_t>                 direct(nf, 0);
+        std::vector<std::vector<FunctionId>> callees(nf);
+        const auto scan = [](const Ir& ir, std::vector<FunctionId>* out) {
+            bool finishes = false;
+            for (size_t k = 0; k < ir.inst_count(); ++k) {
+                const auto idx = static_cast<Index>(k);
+                switch (ir.tag(idx)) {
+                    case Inst::Tag::Finish:
+                        finishes = true;
+                        break;
+                    case Inst::Tag::Call:
+                        if (out != nullptr) {
+                            out->push_back(ir.extra_data<CallInfo>(ir.payload(idx).extra).func);
+                        }
+                        break;
+                    case Inst::Tag::TaskCall:
+                        if (out != nullptr) {
+                            out->push_back(ir.extra_data<TaskCallInfo>(ir.payload(idx).extra).func);
+                        }
+                        break;
+                    case Inst::Tag::CallVirtual:
+                    case Inst::Tag::TaskCallVirtual:
+                        if (out != nullptr) {
+                            out->push_back(
+                              ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra).func);
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            }
+            return finishes;
+        };
+        for (uint32_t f = 0; f < nf; ++f) {
+            direct[f] = scan(mod_.function(static_cast<FunctionId>(f)).ir, &callees[f]) ? 1 : 0;
+        }
+
+        // Memoized DFS, same shape as the per-function write-set closure. A cycle
+        // (recursion) contributes what the in-progress callee has so far; a
+        // recursive subroutine that finishes is still caught by its own seed.
+        std::vector<uint8_t> may(direct);
+        std::vector<uint8_t> state(nf, 0); // 0 new, 1 visiting, 2 done
+        const auto close = [&](this const auto& self, uint32_t f) -> void {
+            if (state[f] != 0) {
+                return;
+            }
+            state[f] = 1;
+            for (const FunctionId c : callees[f]) {
+                const auto ci = static_cast<uint32_t>(c);
+                self(ci);
+                may[f] = static_cast<uint8_t>(may[f] | may[ci]);
+            }
+            state[f] = 2;
+        };
+        for (uint32_t f = 0; f < nf; ++f) {
+            close(f);
+        }
+
+        // The population that matters: call sites needing a post-call test.
+        uint64_t   sites = 0, proc_direct = 0, fn_direct = 0, fn_may = 0;
+        const auto count_sites = [&](const Ir& ir) {
+            std::vector<FunctionId> cs;
+            scan(ir, &cs);
+            for (const FunctionId c : cs) {
+                sites += may[static_cast<uint32_t>(c)] != 0 ? 1 : 0;
+            }
+        };
+        for (const Process& p : mod_.processes()) {
+            proc_direct += scan(p.ir, nullptr) ? 1 : 0;
+            count_sites(p.ir);
+        }
+        for (uint32_t f = 0; f < nf; ++f) {
+            fn_direct += direct[f];
+            fn_may += may[f];
+            count_sites(mod_.function(static_cast<FunctionId>(f)).ir);
+        }
+
+        fprintf(stderr,
+                "FINISH_STAT processes=%zu (with $finish: %llu)  subroutines=%u "
+                "(direct: %llu, may-finish: %llu)  instrumented call sites=%llu\n",
+                mod_.processes().size(), static_cast<unsigned long long>(proc_direct), nf,
+                static_cast<unsigned long long>(fn_direct),
+                static_cast<unsigned long long>(fn_may),
+                static_cast<unsigned long long>(sites));
+        for (uint32_t f = 0; f < nf; ++f) {
+            if (may[f] != 0) {
+                const Function& fn = mod_.function(static_cast<FunctionId>(f));
+                fprintf(stderr, "FINISH_STAT   may-finish %s %s%s\n", fn.is_task ? "task" : "function",
+                        fn.name.c_str(), direct[f] != 0 ? " (direct)" : " (via a callee)");
+            }
         }
     }
 
