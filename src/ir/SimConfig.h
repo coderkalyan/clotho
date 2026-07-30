@@ -125,8 +125,8 @@ struct SimulationConfig {
     // compile-time regression. Run-only knob (build_module ignores it).
     bool parallel_compile = true;
     // Worker threads for parallel_compile; 0 = llvm::hardware_concurrency().
-    // Set by `--jobs`, which also forwards the count to slang's parser.
-    // Run-only knob (build_module ignores it).
+    // Taken from slang's `-j/--threads`, so one option sizes both its parser and
+    // this pool. Run-only knob (build_module ignores it).
     unsigned compile_jobs = 0;
     // Shared libraries (`--dpi-lib <path>`, repeatable) searched to resolve
     // `import "DPI-C"` symbols at JIT link time. Each is added to the JIT

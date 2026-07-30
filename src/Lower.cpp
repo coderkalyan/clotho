@@ -61,7 +61,6 @@
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/text/SourceManager.h>
 #include <slang/util/SmallVector.h>
-#include <slang/util/VersionInfo.h>
 
 #include "SourceMap.h"
 #include "ir/Builder.h"
@@ -13849,33 +13848,22 @@ LowerResult lower_file(std::string_view path, Timings* timings, ir::SystemAccess
     return lower_files({ &path, 1 }, timings, allow_system);
 }
 
-LowerResult lower_sources(std::span<const std::string_view> args, Timings* timings, ir::SystemAccess allow_system) {
+LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver, Timings* timings,
+                         ir::SystemAccess allow_system) {
     const auto t_parse = std::chrono::steady_clock::now();
 
-    // slang's Driver owns arg parsing, source loading (incl. `-f` command files,
-    // `-y`/`-v` libraries, globbing), the SourceManager, and the option Bag; we
-    // consume the Compilation it produces and keep Clotho's own diagnostic
-    // rendering in lower_compilation. Both the Driver (which owns
-    // the SourceManager) and the Compilation are handed to the SourceContext so
+    // The Driver owns source loading (incl. `-f` command files, `-y`/`-v`
+    // libraries, globbing), the SourceManager, and the option Bag; we consume the
+    // Compilation it produces and keep Clotho's own diagnostic rendering in
+    // lower_compilation. Both the Driver (which owns the
+    // SourceManager) and the Compilation are handed to the SourceContext so
     // locations stay resolvable after this call returns.
-    auto                   ctx    = std::make_shared<SourceContext>();
-    auto                   driver = std::make_unique<slang::driver::Driver>();
-    slang::driver::Driver& dr     = *driver;
-    dr.addStandardArgs();
-
-    // Driver's parseCommandLine treats argv[0] as the program name and needs
-    // null-terminated C strings; copy the views and prepend a placeholder.
-    std::vector<std::string> owned(args.begin(), args.end());
-    std::vector<const char*> argv;
-    argv.reserve(owned.size() + 1);
-    argv.push_back("clotho");
-    for (const std::string& a : owned) {
-        argv.push_back(a.c_str());
-    }
+    auto                   ctx = std::make_shared<SourceContext>();
+    slang::driver::Driver& dr  = *driver;
 
     LowerResult result;
-    if (!dr.parseCommandLine(static_cast<int>(argv.size()), argv.data()) || !dr.processOptions()) {
-        // Driver prints the specific CLI / missing-file errors to stderr itself.
+    if (!dr.processOptions()) {
+        // The Driver prints the specific option / missing-file errors itself.
         ctx->adopt_driver(std::move(driver));
         result.sources = ctx;
         result.diagnostics.push_back(Diagnostic{ .severity = Severity::Error,
@@ -13913,6 +13901,37 @@ LowerResult lower_sources(std::span<const std::string_view> args, Timings* timin
     return lower_compilation(cr, std::move(ctx), timings, allow_system);
 }
 
+LowerResult lower_sources(std::span<const std::string_view> args, Timings* timings, ir::SystemAccess allow_system) {
+    auto                   driver = std::make_unique<slang::driver::Driver>();
+    slang::driver::Driver& dr     = *driver;
+    dr.addStandardArgs();
+
+    // Driver's parseCommandLine treats argv[0] as the program name and needs
+    // null-terminated C strings; copy the views and prepend a placeholder.
+    std::vector<std::string> owned(args.begin(), args.end());
+    std::vector<const char*> argv;
+    argv.reserve(owned.size() + 1);
+    argv.push_back("clotho");
+    for (const std::string& a : owned) {
+        argv.push_back(a.c_str());
+    }
+
+    if (!dr.parseCommandLine(static_cast<int>(argv.size()), argv.data())) {
+        // The Driver prints the specific CLI errors itself; report the failure the
+        // same way lower_driver reports a bad option set.
+        auto        ctx = std::make_shared<SourceContext>();
+        LowerResult result;
+        ctx->adopt_driver(std::move(driver));
+        result.sources = ctx;
+        result.diagnostics.push_back(Diagnostic{ .severity = Severity::Error,
+                                                 .origin   = DiagnosticOrigin::Driver,
+                                                 .code     = "bad-command-line",
+                                                 .message  = "command-line or source-loading error" });
+        return result;
+    }
+    return lower_driver(std::move(driver), timings, allow_system);
+}
+
 LowerResult lower_text(std::string_view source, Timings* timings, ir::SystemAccess allow_system) {
     const auto t_parse = std::chrono::steady_clock::now();
 
@@ -13930,20 +13949,6 @@ LowerResult lower_text(std::string_view source, Timings* timings, ir::SystemAcce
     }
 
     return lower_compilation(cr, std::move(ctx), timings, allow_system);
-}
-
-std::string slang_option_help() {
-    // Same construction lower_sources uses, so the help lists exactly the
-    // options the forwarding path accepts. addStandardArgs does NOT register
-    // -h/--help/--version (each slang tool adds its own), which is why clotho
-    // handles those itself.
-    slang::driver::Driver dr;
-    dr.addStandardArgs();
-    return dr.cmdLine.getHelpText("slang options, forwarded verbatim by clotho");
-}
-
-std::string slang_version() {
-    return std::string(slang::VersionInfo::getVersionString());
 }
 
 } // namespace clotho

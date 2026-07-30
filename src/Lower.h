@@ -65,29 +65,28 @@ LowerResult lower_files(std::span<const std::string_view> paths,
 
 // Lower a design described by slang command-line arguments (source files plus
 // `-D`/`+define+`, `-I`/`+incdir+`, `-f` command files, `-y`/`-v` libraries,
-// `--top`, `--timescale`, `--std`, ...). Args are handed to slang's
-// `driver::Driver`; every file is merged into one compilation unit (LRM 3.12,
-// single-unit: `` `define `` macros and `$unit` declarations span files). This
-// is the entry the CLI uses; `args` must exclude Clotho's own options and
-// runtime plusargs.
+// `--top`, `--timescale`, `--std`, ...). Builds a `driver::Driver`, parses the
+// args with it, and lowers the result; every file is merged into one compilation
+// unit (LRM 3.12, single-unit: `` `define `` macros and `$unit` declarations span
+// files). `args` must exclude runtime plusargs, which slang would reject.
 LowerResult lower_sources(std::span<const std::string_view> args,
                           Timings*                          timings      = nullptr,
                           ir::SystemAccess                  allow_system = ir::SystemAccess::Off);
+
+// Lower a design from a Driver the caller built and already parsed with
+// `parseCommandLine`. This is the entry the CLI uses: `clotho` registers its own
+// options on the Driver's `CommandLine`, so one parser and one `--help` cover
+// both tools' options and neither has to forward to the other. Takes ownership —
+// the returned `sources` keeps the Driver (hence its SourceManager) alive so a
+// `SourceLoc` stays resolvable.
+LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
+                         Timings*                               timings      = nullptr,
+                         ir::SystemAccess                       allow_system = ir::SystemAccess::Off);
 
 // Lower a SystemVerilog source fragment held in memory. If `timings` is non-null,
 // the front-end and analysis phase durations are accumulated into it.
 LowerResult lower_text(std::string_view source,
                        Timings*         timings      = nullptr,
                        ir::SystemAccess allow_system = ir::SystemAccess::Off);
-
-// slang's own command-line options: everything `lower_sources` forwards to the
-// Driver (`-D`, `-I`, `-y`, `-v`, `-f`, `--top`, `-G`, `--timescale`, `--std`,
-// `-W`, `--error-limit`, `-j`, ...). Rendered from the same registry the
-// forwarding path parses with, so it cannot drift from what is accepted.
-// Backs `clotho --help-slang`.
-std::string slang_option_help();
-
-// The slang version Clotho is linked against, for `clotho --version`.
-std::string slang_version();
 
 } // namespace clotho

@@ -91,12 +91,13 @@ void register_options(slang::CommandLine& cl, Options& o) {
            slang::CommandLineFlags::FilePath);
     cl.add("--time", o.time, "Report per-phase wall-clock timings to stderr");
     cl.add("-O", o.o3, "Optimize hard: LLVM default<O3> plus aggressive machine codegen");
-    cl.add("--stat", o.stats, "Report a backend statistic (repeatable, comma-separated)",
-           "<dedup|dedup-sets|comb-fuse|finish|parallel>", slang::CommandLineFlags::CommaList);
+    cl.add("--stat", o.stats, "Report a backend statistic: dedup, dedup-sets, comb-fuse, finish or parallel "
+                              "(repeatable, comma-separated)",
+           "<name>", slang::CommandLineFlags::CommaList);
     cl.add("--allow-system", o.allow_system,
            "Permit the $system shell task, refused by default: 'const' allows only a "
            "constant-folding command string, 'full' allows any",
-           "<const|full>");
+           "<tier>");
     cl.add("--dpi-lib", o.dpi_libs,
            "[run] DPI-C library to resolve 'import \"DPI-C\"' against: a .o/.a is JIT-linked "
            "(import and export), a .so is dlopen'd (import only)",
@@ -350,7 +351,8 @@ int main(int argc, char** argv) {
         } else if (tier == "full") {
             config.allow_system = SystemAccess::Full;
         } else {
-            return usage_error(std::format("unknown --allow-system tier '{}'; expected const or full", tier));
+            return usage_error(std::format(
+              "unknown --allow-system tier '{}'; write --allow-system=const or --allow-system=full", tier));
         }
         std::println(stderr, "clotho: warning: $system shell execution enabled (--allow-system={})", tier);
     }
