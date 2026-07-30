@@ -43,7 +43,7 @@ using clotho::ir::SimulationConfig;
 using clotho::ir::Stat;
 using clotho::ir::SystemAccess;
 
-enum class Command : uint8_t { Build, Run };
+enum class Command : uint8_t { Build, Run, Check };
 
 // What `build` writes.
 enum class Emit : uint8_t {
@@ -70,7 +70,12 @@ enum class Opt : uint8_t {
 
 // Which commands accept an option. Anything::Any is also accepted before a
 // command is given (`clotho --help`).
-enum Scope : uint8_t { kBuild = 1u << 0, kRun = 1u << 1, kAny = kBuild | kRun };
+enum Scope : uint8_t {
+    kBuild = 1u << 0,
+    kRun   = 1u << 1,
+    kCheck = 1u << 2,
+    kAny   = kBuild | kRun | kCheck,
+};
 
 struct OptSpec {
     Opt              id;
@@ -89,16 +94,37 @@ constexpr OptSpec kOptions[] = {
     { Opt::Out, "-o", "--output", "<file>", kBuild, "write the artifact to <file> ('-' is stdout, the default)" },
     { Opt::Time, "--time", "", "", kAny, "report per-phase wall-clock timings to stderr" },
     { Opt::O3, "-O", "", "", kAny, "optimize hard: LLVM default<O3> plus aggressive machine codegen" },
-    { Opt::Stat, "--stat", "", "<list>", kAny,
+    { Opt::Stat,
+      "--stat",
+      "",
+      "<list>",
+      kAny,
       "report backend statistics: dedup, dedup-sets, comb-fuse, finish, parallel" },
-    { Opt::AllowSystem, "--allow-system", "", "<tier>", kAny,
+    { Opt::AllowSystem,
+      "--allow-system",
+      "",
+      "<tier>",
+      kAny,
       "permit the $system shell task: const (constant commands only) or full" },
-    { Opt::DpiLib, "--dpi-lib", "", "<path>", kRun,
+    { Opt::DpiLib,
+      "--dpi-lib",
+      "",
+      "<path>",
+      kRun,
       "DPI-C library: .o/.a is JIT-linked (import and export), .so is dlopen'd (import); repeatable" },
     { Opt::Jobs, "--jobs", "-j", "<n>", kAny, "worker threads for parsing and compilation (0 = host concurrency)" },
-    { Opt::PerfJitdump, "--perf-jitdump", "", "", kRun,
+    { Opt::PerfJitdump,
+      "--perf-jitdump",
+      "",
+      "",
+      kRun,
       "write a perf jitdump ($JITDUMPDIR) so JIT'd code symbolizes in perf" },
-    { Opt::SlangArg, "--slang-arg", "", "<text>", kAny, "forward <text> to slang verbatim (for +args clotho would eat)" },
+    { Opt::SlangArg,
+      "--slang-arg",
+      "",
+      "<text>",
+      kAny,
+      "forward <text> to slang verbatim (for +args clotho would eat)" },
     { Opt::Help, "--help", "-h", "", kAny, "show this help" },
     { Opt::Version, "--version", "", "", kAny, "show clotho, LLVM and slang versions" },
     { Opt::HelpSlang, "--help-slang", "", "", kAny, "show slang's options, all of which clotho forwards" },
@@ -127,6 +153,7 @@ void print_help() {
     std::println("commands:");
     std::println("  build   compile the design and write the requested artifact");
     std::println("  run     compile the design and simulate it");
+    std::println("  check   analyse the design and report diagnostics, writing nothing");
     const auto group = [](std::string_view title, uint8_t scope, bool exact) {
         std::println("");
         std::println("{}", title);
@@ -146,7 +173,7 @@ void print_help() {
             std::println("  {:<24}{}", flag, spec.help);
         }
     };
-    group("options (build and run):", kAny, false);
+    group("options (all commands):", kAny, false);
     group("options (build only):", kBuild, true);
     group("options (run only):", kRun, true);
     std::println("");
@@ -235,7 +262,7 @@ bool write_artifact(const clotho::LowerResult& result, const Args& args, clotho:
 int main(int argc, char** argv) {
     Args args;
     if (argc < 2) {
-        return usage_error("no command; expected 'build' or 'run'");
+        return usage_error("no command; expected 'build', 'run' or 'check'");
     }
 
     // A global option may stand alone, without a command: `clotho --help`.
@@ -245,6 +272,8 @@ int main(int argc, char** argv) {
             args.command = Command::Build;
         } else if (first == "run") {
             args.command = Command::Run;
+        } else if (first == "check") {
+            args.command = Command::Check;
         } else if (first == "-h" || first == "--help") {
             print_help();
             return 0;
@@ -255,11 +284,11 @@ int main(int argc, char** argv) {
             std::print("{}", clotho::slang_option_help());
             return 0;
         } else {
-            return usage_error(std::format("unknown command '{}'; expected 'build' or 'run'", first));
+            return usage_error(std::format("unknown command '{}'; expected 'build', 'run' or 'check'", first));
         }
     }
     const std::string_view command_name = argv[1];
-    const uint8_t          scope        = args.command == Command::Build ? kBuild : kRun;
+    const uint8_t scope = args.command == Command::Build ? kBuild : args.command == Command::Run ? kRun : kCheck;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg = argv[i];
@@ -278,8 +307,8 @@ int main(int argc, char** argv) {
             continue;
         }
         if ((spec->scope & scope) == 0) {
-            return usage_error(std::format("{} applies to '{}', not '{}'", spec->name,
-                                           spec->scope == kBuild ? "build" : "run", command_name));
+            const std::string_view owner = spec->scope == kBuild ? "build" : spec->scope == kRun ? "run" : "check";
+            return usage_error(std::format("{} applies to '{}', not '{}'", spec->name, owner, command_name));
         }
 
         // Operand: `--name=value`, or the next argv entry.
@@ -401,6 +430,24 @@ int main(int argc, char** argv) {
     const clotho::LowerResult result = clotho::lower_sources(args.slang, tp, args.config.allow_system);
     if (!result.diagnostics.empty()) {
         std::print(stderr, "{}", result.diagnostic_text());
+    }
+
+    // `check`: the diagnostics ARE the artifact. Deliberately ahead of the `ok`
+    // gate below -- a design with a member that failed to lower is exactly what
+    // this command is for, since an editor buffer is broken most of the time and
+    // every other finding in the file is still wanted. Exit status keys on
+    // whether anything reached Error, so warnings alone leave it clean and this
+    // works as a CLI linter.
+    //
+    // Analysis-derived findings beyond the frontend's own (X-dependence, the rest
+    // of the mismatch classes) surface here as they land; the case-pragma checks
+    // already do. Nothing runs DesignFacts yet because nothing consumes it for
+    // diagnostics.
+    if (args.command == Command::Check) {
+        if (args.time) {
+            report_timings(timings, args.command);
+        }
+        return clotho::has_error(result.diagnostics) ? 1 : 0;
     }
 
     // An IR dump is analysis, not execution, so it tolerates a poisoned module:
