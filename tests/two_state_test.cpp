@@ -25,7 +25,7 @@ std::string emit(std::string_view source) {
     REQUIRE(result.module != nullptr);
     std::string              text;
     llvm::raw_string_ostream os(text);
-    REQUIRE(ir::emit_llvm(*result.module, os, { .optimize = false }));
+    REQUIRE(ir::emit_llvm(*result.module, os, { .lower_coro = false }));
     return text;
 }
 

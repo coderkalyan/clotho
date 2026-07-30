@@ -26,14 +26,42 @@ enum class SystemAccess : uint8_t {
     Full = 2,
 };
 
+// Backend statistics selected by `--stat=<list>`, as a bitmask in
+// `SimulationConfig::stats`. Diagnosis only: each one prints a report to stderr
+// and changes nothing about the emitted code.
+enum class Stat : uint32_t {
+    // Twin-group dedup: how many groups collapsed onto a shared body, and the
+    // time the comparison took (see share_twin_groups).
+    Dedup = 1u << 0,
+    // Dedup, plus the member sets behind each identity key.
+    DedupSets = 1u << 1,
+    // Comb-fusion eligibility histogram and the groups that formed.
+    CombFuse = 1u << 2,
+    // Which processes may reach $finish (drives the cooperative-finish path).
+    Finish = 1u << 3,
+    // Parallel compile: per-module optimize time, the serial sum, and the
+    // speedup ceiling. `run` only.
+    Parallel = 1u << 4,
+};
+
+[[nodiscard]] inline bool stat_on(uint32_t stats, Stat s) {
+    return (stats & static_cast<uint32_t>(s)) != 0;
+}
+
 struct SimulationConfig {
     // Run the coroutine-lowering pipeline (CoroSplit et al.), required to
     // produce runnable code — run_jit forces it on. False emits the raw
-    // pre-split module (llvm.coro.* intrinsics intact) for manual review.
-    bool optimize = true;
+    // pre-split module (llvm.coro.* intrinsics intact) for manual review
+    // (`build --emit=llvm-raw`).
+    bool lower_coro = true;
     // Drop the z word from the state slot of signals the may-z analysis
-    // (Analysis.h) proves never carry z. Disable for bisection / debugging;
-    // semantics are identical either way.
+    // (Analysis.h) proves never carry z. Semantics are identical either way.
+    //
+    // This and the feature gates below (`fuse`, `comb_fuse`, `thunk`, `dedup`,
+    // `outline`, `split`, `parallel_compile`) exist for differential testing:
+    // an as-if optimization must produce byte-identical output with the gate
+    // off, which is what the tests A/B. They are deliberately NOT on the CLI —
+    // an operator has no reason to reach for one.
     bool z_elision = true;
     // Opt-in aggressive tier: replace the tier-0 coroutine pipeline with
     // LLVM's default<O3> module pipeline (which includes the coro passes) and
@@ -96,7 +124,8 @@ struct SimulationConfig {
     // Disable for bisection / debugging, or when isolating a single-module
     // compile-time regression. Run-only knob (build_module ignores it).
     bool parallel_compile = true;
-    // Worker thread cap for parallel_compile; 0 = llvm::hardware_concurrency().
+    // Worker threads for parallel_compile; 0 = llvm::hardware_concurrency().
+    // Set by `--jobs`, which also forwards the count to slang's parser.
     // Run-only knob (build_module ignores it).
     unsigned compile_jobs = 0;
     // Shared libraries (`--dpi-lib <path>`, repeatable) searched to resolve
@@ -108,6 +137,9 @@ struct SimulationConfig {
     // emitted. This is a security boundary, not an optimization knob — running a
     // shell command is arbitrary code execution, gated on an explicit opt-in.
     SystemAccess allow_system = SystemAccess::Off;
+    // Statistics to report (`--stat=<list>`): a mask of `Stat` bits, tested
+    // with stat_on. Zero reports nothing.
+    uint32_t stats = 0;
 };
 
 } // namespace clotho::ir

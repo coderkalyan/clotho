@@ -242,6 +242,23 @@ endif()
 # clotho_ir itself — it is the consumer that actually emits and JITs.
 target_link_libraries(clotho_cli PRIVATE clotho clotho_ir clotho_warnings)
 
+# `clotho --version`. The git hash is resolved at configure time; a source tree
+# without git (a release tarball) reports "unknown" rather than failing.
+execute_process(
+  COMMAND git rev-parse --short HEAD
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  OUTPUT_VARIABLE CLOTHO_GIT_HASH
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET
+)
+if(NOT CLOTHO_GIT_HASH)
+  set(CLOTHO_GIT_HASH "unknown")
+endif()
+target_compile_definitions(clotho_cli PRIVATE
+  CLOTHO_GIT_HASH="${CLOTHO_GIT_HASH}"
+  CLOTHO_LLVM_VERSION="${LLVM_PACKAGE_VERSION}"
+)
+
 # Single doctest executable aggregating every tests/*.cpp.
 enable_testing()
 add_executable(clotho_test

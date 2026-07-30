@@ -142,14 +142,14 @@ def measure_clotho(case, clotho, runs):
     args = case["clotho"].get("args", [])
     regex = case.get("check", {}).get("stdout_regex")
 
-    sanity_run([str(clotho), *args, *files], cwd, regex, f"{name}/clotho")
+    sanity_run([str(clotho), "run", *args, *files], cwd, regex, f"{name}/clotho")
 
     # One hyperfine invocation yields both the warm wall clock and, via the
     # appended --time stderr, per-run compile/sim splits.
     splits = cwd / "splits.txt"
     splits.unlink(missing_ok=True)
     q = shlex.quote
-    cmd = f"{q(str(clotho))} --time {' '.join(map(q, args + files))} 2>>splits.txt"
+    cmd = f"{q(str(clotho))} run --time {' '.join(map(q, args + files))} 2>>splits.txt"
     print(f"[{name}] clotho wall + split ({runs} runs, 1 warmup)")
     wall = hyperfine(cmd, cwd, runs, warmup=1)
 

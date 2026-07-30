@@ -80,4 +80,14 @@ LowerResult lower_text(std::string_view source,
                        Timings*         timings      = nullptr,
                        ir::SystemAccess allow_system = ir::SystemAccess::Off);
 
+// slang's own command-line options: everything `lower_sources` forwards to the
+// Driver (`-D`, `-I`, `-y`, `-v`, `-f`, `--top`, `-G`, `--timescale`, `--std`,
+// `-W`, `--error-limit`, `-j`, ...). Rendered from the same registry the
+// forwarding path parses with, so it cannot drift from what is accepted.
+// Backs `clotho --help-slang`.
+std::string slang_option_help();
+
+// The slang version Clotho is linked against, for `clotho --version`.
+std::string slang_version();
+
 } // namespace clotho

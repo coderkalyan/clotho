@@ -60,6 +60,7 @@
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/text/SourceManager.h>
 #include <slang/util/SmallVector.h>
+#include <slang/util/VersionInfo.h>
 
 #include "SourceMap.h"
 #include "ir/Builder.h"
@@ -13742,6 +13743,20 @@ LowerResult lower_text(std::string_view source, Timings* timings, ir::SystemAcce
     }
 
     return lower_compilation(cr, std::move(ctx), timings, allow_system);
+}
+
+std::string slang_option_help() {
+    // Same construction lower_sources uses, so the help lists exactly the
+    // options the forwarding path accepts. addStandardArgs does NOT register
+    // -h/--help/--version (each slang tool adds its own), which is why clotho
+    // handles those itself.
+    slang::driver::Driver dr;
+    dr.addStandardArgs();
+    return dr.cmdLine.getHelpText("slang options, forwarded verbatim by clotho");
+}
+
+std::string slang_version() {
+    return std::string(slang::VersionInfo::getVersionString());
 }
 
 } // namespace clotho

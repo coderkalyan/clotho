@@ -50,14 +50,14 @@ std::string emit(std::string_view source, ir::SimulationConfig config) {
 // Emit without the optimization pipeline: for assertions on the backend's own
 // emission structure (block labels, typed GEPs), which the pipeline is free to
 // rewrite.
-std::string emit_raw(std::string_view source, ir::SimulationConfig config = { .optimize = false }) {
+std::string emit_raw(std::string_view source, ir::SimulationConfig config = { .lower_coro = false }) {
     const LowerResult result = lower_text(source);
     REQUIRE(result.ok);
     REQUIRE(result.module != nullptr);
 
     std::string              text;
     llvm::raw_string_ostream os(text);
-    config.optimize = false;
+    config.lower_coro = false;
     REQUIRE(ir::emit_llvm(*result.module, os, config));
     return text;
 }
@@ -3300,7 +3300,7 @@ TEST_CASE("--no-z-elision keeps every slot's z word") {
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     std::string              text;
     llvm::raw_string_ostream os(text);
-    REQUIRE(ir::emit_llvm(*r.module, os, { .optimize = false, .z_elision = false }));
+    REQUIRE(ir::emit_llvm(*r.module, os, { .lower_coro = false, .z_elision = false }));
     CHECK(text.find("%bit.4 = type { i8, i4 }") != std::string::npos);
     CHECK(text.find(".nz.") == std::string::npos);
 }

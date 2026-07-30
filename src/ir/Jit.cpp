@@ -90,13 +90,13 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     // that still share one (docs/design/module-split.md).
     auto ctx = std::make_unique<llvm::LLVMContext>();
     // The JIT needs runnable code: coroutine lowering is mandatory regardless
-    // of what the caller's config says (optimize=false is an emit_llvm
+    // of what the caller's config says (lower_coro=false is an emit_llvm
     // inspection mode). Deferred (build_modules_unoptimized, not
     // build_modules) so optimize_module can run per module below, after
     // context migration when parallel.
     SimulationConfig jit_config = config;
-    jit_config.optimize         = true;
-    const bool stat             = getenv("CLOTHO_PARALLEL_STAT") != nullptr;
+    jit_config.lower_coro       = true;
+    const bool stat             = stat_on(config.stats, Stat::Parallel);
     auto       built            = build_modules_unoptimized(m, *ctx, jit_config);
     if (built.modules.empty()) {
         return -1; // build_modules_unoptimized already reported the reason.

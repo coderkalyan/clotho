@@ -634,16 +634,16 @@ public:
         facts_ = analyze(mod_);
         build_state_types();
         emit_state_global(); // before any body: storage_ptr resolves through the anchors
-        if (std::getenv("CLOTHO_DEDUP_STAT") != nullptr) {
+        if (stat_on(config_.stats, Stat::Dedup)) {
             report_dedup_stat();
         }
         compute_subscription_order();
         compute_fusion_groups(); // before build_wait_queues: bucket capacities count group subscriptions
-        if (std::getenv("CLOTHO_COMB_FUSE_STAT") != nullptr) {
+        if (stat_on(config_.stats, Stat::CombFuse)) {
             report_comb_fuse_stat();
         }
         may_finish_ = compute_may_finish(); // before any body: lower_call reads it
-        if (std::getenv("CLOTHO_FINISH_STAT") != nullptr) {
+        if (stat_on(config_.stats, Stat::Finish)) {
             report_finish_stat();
         }
         design_uses_strobe_   = facts_.uses.strobe;   // gates the Postponed-region drain loop
@@ -4523,9 +4523,9 @@ private:
 
     // Comb-fusion coverage probe: verdict histogram over Always processes plus
     // the count V1 fusion left in singleton groups (the comb-fusion
-    // opportunity). Measurement only, printed when CLOTHO_COMB_FUSE_STAT is
-    // set; the grouping itself is not landed.
-    // Module-deduplication detector (CLOTHO_DEDUP_STAT): canonicalize each
+    // opportunity). Measurement only, printed under `--stat=comb-fuse`; the
+    // grouping itself is not landed.
+    // Module-deduplication detector (`--stat=dedup`): canonicalize each
     // attributed process body to definition-relative form and report how many
     // bodies across instances of reused definitions are byte-identical — the
     // shareable population one compiled body per definition would cover, and
@@ -4648,11 +4648,10 @@ private:
                 covered += n;
             }
         }
-        // Shape mode (CLOTHO_DEDUP_STAT=2): remember the twin sets so
+        // Shape mode (`--stat=dedup-sets`): remember the twin sets so
         // report_dedup_shapes can compare the lowered LLVM functions after the
         // groups exist.
-        const char* mode = std::getenv("CLOTHO_DEDUP_STAT");
-        if (mode != nullptr && std::string_view(mode) == "2") {
+        if (stat_on(config_.stats, Stat::DedupSets)) {
             ankerl::unordered_dense::map<Key, uint32_t, KeyHash> set_of;
             for (const auto& [proc, key] : proc_keys) {
                 if (twins[key] < 2) {
@@ -4678,7 +4677,7 @@ private:
                      (unsigned long long)blocked_xhier);
     }
 
-    // Shape-equality proof (CLOTHO_DEDUP_STAT=2): for every twin set the
+    // Shape-equality proof (`--stat=dedup-sets`): for every twin set the
     // detector found, print each member's lowered LLVM function and compare
     // them after normalizing the only legitimately instance-specific tokens —
     // the function's own name and the @clotho.inst.* symbols (numbered by
@@ -4974,7 +4973,7 @@ private:
                 rewrite_to_stub(group_fns[c.g], shared, c.ctx);
             }
         }
-        if (std::getenv("CLOTHO_DEDUP_STAT") != nullptr) {
+        if (stat_on(config_.stats, Stat::Dedup)) {
             const auto t2 = std::chrono::steady_clock::now();
             const auto ms = [](auto d) {
                 return std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
@@ -4987,7 +4986,7 @@ private:
         }
     }
 
-    // May-finish closure (CLOTHO_FINISH_STAT), measurement only.
+    // May-finish closure (`--stat=finish`), measurement only.
     //
     // Sizing study for the cooperative-$finish migration
     // (docs/design/cooperative-finish.md). Replacing rt_finish's longjmp with an
@@ -16082,7 +16081,7 @@ private:
     // InstanceScope::id -> anchor index (no_anchor when the id is unknown).
     std::vector<uint32_t> anchor_of_scope_;
     // Twin sets (process indices) recorded by report_dedup_stat under
-    // CLOTHO_DEDUP_STAT=2, compared post-lowering by report_dedup_shapes.
+    // `--stat=dedup-sets`, compared post-lowering by report_dedup_shapes.
     std::vector<std::vector<uint32_t>> shape_sets_;
     // Per fusion group: owning scope anchor (single-scope reused-def groups
     // only, else no_anchor) and def-local group ordinal. Built by
@@ -16228,7 +16227,7 @@ private:
     std::vector<std::vector<uint32_t>>  wake_adj_;
     std::vector<uint8_t>                scc_nontrivial_;
     // Sizes of the groups the comb-fusion pass formed (measurement only, for
-    // the CLOTHO_COMB_FUSE_STAT probe).
+    // the `--stat=comb-fuse` probe).
     std::vector<uint32_t>               comb_group_sizes_;
     // Fusion groups (compute_fusion_groups): each group lowers to one
     // coroutine. groups_[g] lists member process indices in scheduled-rank
@@ -16528,7 +16527,7 @@ BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx,
     if (built.modules.empty()) {
         return {};
     }
-    if (!config.optimize) {
+    if (!config.lower_coro) {
         return built;
     }
     // Lower the coroutines per module and verify again — the second pass
@@ -16544,7 +16543,8 @@ BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx,
     return built;
 }
 
-bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config) {
+bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config, Timings* timings) {
+    const auto        t_llvm = std::chrono::steady_clock::now();
     llvm::LLVMContext ctx;
     auto              built = build_modules(m, ctx, config);
     if (built.modules.empty()) {
@@ -16552,6 +16552,9 @@ bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& c
     }
     for (const auto& mod : built.modules) {
         mod->print(os, nullptr);
+    }
+    if (timings != nullptr) {
+        timings->llvm_ms += ms_since(t_llvm);
     }
     return true;
 }

@@ -1,3 +1,6 @@
+#include <charconv>
+#include <cstdint>
+#include <fstream>
 #include <iostream>
 #include <print>
 #include <string>
@@ -11,185 +14,421 @@
 #include "ir/LlvmBackend.h"
 #include "ir/Printer.h"
 
-// Thin driver: take a SystemVerilog file, run it through the lowering pipeline,
-// then JIT-compile and run it (default), or emit the process IR / LLVM IR for
-// debugging. All compiler logic lives in libclotho / libclotho_ir.
+// Thin driver over libclotho / libclotho_ir: take SystemVerilog sources, run
+// them through the lowering pipeline, then either write the compiled artifact
+// (`build`) or JIT-compile and simulate it (`run`). Every compiler decision
+// lives in the libraries; this file is argument handling and reporting.
 //
-// Usage: clotho [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] [--no-thunk]
-// [--no-dedup] [--allow-system=const|full] [-O] [--perf-jitdump] [--no-parallel-compile] [--jobs=<N>]
-// [-o <out>] [-D<macro>] [-I<dir>] [+define+...] [+incdir+...] [-f <cmd.f>] [--top <mod>] <file.sv>... [+plusarg...]
-// Multiple source files are compiled together into one design (shared name
-// space, LRM 3.12), parsed in the order given.
-// `llvm` emits the backend's raw IR before the coroutine-lowering pipeline runs
-// (coro intrinsics intact) — for manual review; `opt` emits it after the passes.
-// `--no-z-elision` keeps every signal slot's z word (bisection / debug).
-int main(int argc, char** argv) {
-    std::string_view              emit = "run";
-    std::string_view              out;
-    std::vector<std::string_view> slang_args;
-    std::vector<std::string_view> plusargs;
-    bool                          time = false;
-    clotho::ir::SimulationConfig  config;
+//   clotho build [options] <source>...             emit an artifact, no execution
+//   clotho run   [options] <source>... [+arg...]   compile, then simulate
+//
+// Argv is split three ways: Clotho's own options (kOptions below), runtime
+// plusargs (LRM 21.6, `run` only, read by $test$plusargs / $value$plusargs),
+// and everything else — source files plus slang's preprocessor / library /
+// elaboration flags (`-D`, `-I`, `-y`, `-v`, `-f`, `--top`, `-G`, `--std`,
+// `--timescale`, ...) — forwarded verbatim to slang's Driver (`--help-slang`
+// lists them). slang rejects an unregistered `+arg`, so plusargs are peeled off
+// here; the `+` forms slang itself owns (`+define+`, `+incdir+`, `+libext+`)
+// are forwarded, and `--slang-arg` forces through anything else.
+//
+// Sources always share one compilation unit (LRM 3.12): `` `define `` macros
+// and `$unit` declarations span files, parsed in the order given.
+//
+// Exit status: 0 success; 1 compile / emission / JIT failure; 2 usage error;
+// under `run`, otherwise the simulated design's own status.
 
-    // Argv is split three ways: Clotho's own knobs (handled here), runtime
-    // plusargs (LRM §21.6, consumed by the simulation), and everything else —
-    // source files and slang's preprocessor/library/elaboration flags (`-D`,
-    // `-I`, `+define+`, `+incdir+`, `-f`, `-y`, `-v`, `--top`, `--std`,
-    // `--timescale`, ...) — forwarded verbatim to slang's Driver. slang rejects
-    // an unregistered `+arg`, so runtime plusargs must be peeled off here rather
-    // than handed to the Driver.
-    for (int i = 1; i < argc; ++i) {
-        const std::string_view arg = argv[i];
-        if (arg.starts_with("--emit=")) {
-            emit = arg.substr(7);
-        } else if (arg == "--time") {
-            time = true;
-        } else if (arg == "--no-z-elision") {
-            config.z_elision = false;
-        } else if (arg == "--no-fuse") {
-            config.fuse = false;
-        } else if (arg == "--no-comb-fuse") {
-            config.comb_fuse = false;
-        } else if (arg == "--no-thunk") {
-            config.thunk = false;
-        } else if (arg == "--no-dedup") {
-            config.dedup = false;
-        } else if (arg == "--no-split") {
-            config.split = false;
-        } else if (arg == "--no-outline") {
-            config.outline = false;
-        } else if (arg.starts_with("--allow-system")) {
-            // Enable the $system shell-exec task (LRM §20.17.1), off by default.
-            // A security boundary: running a shell command is arbitrary code
-            // execution, so the tier must be given explicitly. `=const` allows
-            // only constant-folding command strings; `=full` allows a
-            // runtime-computed command.
-            if (arg == "--allow-system=const") {
-                config.allow_system = clotho::ir::SystemAccess::Const;
-            } else if (arg == "--allow-system=full") {
-                config.allow_system = clotho::ir::SystemAccess::Full;
-            } else {
-                std::println(stderr,
-                             "error: --allow-system requires a tier: "
-                             "--allow-system=const or --allow-system=full");
-                return 2;
+namespace {
+
+using clotho::ir::SimulationConfig;
+using clotho::ir::Stat;
+using clotho::ir::SystemAccess;
+
+enum class Command : uint8_t { Build, Run };
+
+// What `build` writes.
+enum class Emit : uint8_t {
+    Ir,      // Clotho process IR
+    Llvm,    // LLVM IR after the coroutine-lowering pipeline (the default)
+    LlvmRaw, // LLVM IR straight from the backend, llvm.coro.* intact
+};
+
+enum class Opt : uint8_t {
+    Emit,
+    Out,
+    Time,
+    O3,
+    Stat,
+    AllowSystem,
+    DpiLib,
+    Jobs,
+    PerfJitdump,
+    SlangArg,
+    Help,
+    Version,
+    HelpSlang,
+};
+
+// Which commands accept an option. Anything::Any is also accepted before a
+// command is given (`clotho --help`).
+enum Scope : uint8_t { kBuild = 1u << 0, kRun = 1u << 1, kAny = kBuild | kRun };
+
+struct OptSpec {
+    Opt              id;
+    std::string_view name;
+    std::string_view alias;   // "" when there is none
+    std::string_view operand; // "" for a flag; else the operand's display name
+    uint8_t          scope;
+    std::string_view help;
+};
+
+// The single source of truth for the option surface: parsing resolves a token
+// through this table, and --help is printed from it, so a flag cannot exist
+// without being documented (or be documented without existing).
+constexpr OptSpec kOptions[] = {
+    { Opt::Emit, "--emit", "", "<target>", kBuild, "artifact to write: llvm (default), llvm-raw, ir" },
+    { Opt::Out, "-o", "--output", "<file>", kBuild, "write the artifact to <file> ('-' is stdout, the default)" },
+    { Opt::Time, "--time", "", "", kAny, "report per-phase wall-clock timings to stderr" },
+    { Opt::O3, "-O", "", "", kAny, "optimize hard: LLVM default<O3> plus aggressive machine codegen" },
+    { Opt::Stat, "--stat", "", "<list>", kAny,
+      "report backend statistics: dedup, dedup-sets, comb-fuse, finish, parallel" },
+    { Opt::AllowSystem, "--allow-system", "", "<tier>", kAny,
+      "permit the $system shell task: const (constant commands only) or full" },
+    { Opt::DpiLib, "--dpi-lib", "", "<path>", kRun,
+      "DPI-C library: .o/.a is JIT-linked (import and export), .so is dlopen'd (import); repeatable" },
+    { Opt::Jobs, "--jobs", "-j", "<n>", kAny, "worker threads for parsing and compilation (0 = host concurrency)" },
+    { Opt::PerfJitdump, "--perf-jitdump", "", "", kRun,
+      "write a perf jitdump ($JITDUMPDIR) so JIT'd code symbolizes in perf" },
+    { Opt::SlangArg, "--slang-arg", "", "<text>", kAny, "forward <text> to slang verbatim (for +args clotho would eat)" },
+    { Opt::Help, "--help", "-h", "", kAny, "show this help" },
+    { Opt::Version, "--version", "", "", kAny, "show clotho, LLVM and slang versions" },
+    { Opt::HelpSlang, "--help-slang", "", "", kAny, "show slang's options, all of which clotho forwards" },
+};
+
+const OptSpec* find_option(std::string_view arg) {
+    for (const OptSpec& spec : kOptions) {
+        // `--name`, `--name=value`, and the alias in both forms.
+        for (const std::string_view name : { spec.name, spec.alias }) {
+            if (name.empty()) {
+                continue;
             }
-            std::println(stderr,
-                         "warning: $system shell command execution enabled "
-                         "(--allow-system={})",
-                         config.allow_system == clotho::ir::SystemAccess::Const ? "const" : "full");
-        } else if (arg == "-O") {
-            config.o3 = true;
-        } else if (arg == "--perf-jitdump") {
-            config.perf_jitdump = true;
-        } else if (arg == "--no-parallel-compile") {
-            config.parallel_compile = false;
-        } else if (arg.starts_with("--jobs=")) {
-            config.compile_jobs = static_cast<unsigned>(std::stoul(std::string(arg.substr(7))));
-        } else if (arg == "-o" && i + 1 < argc) {
-            out = argv[++i];
-        } else if (arg == "--dpi-lib" && i + 1 < argc) {
-            // A DPI-C library (LRM 35), repeatable. A `.o`/`.a` is JIT-linked
-            // (import AND export); a `.so` is dlopen'd (import only). See run_jit.
-            config.dpi_libs.push_back(argv[++i]);
-        } else if (arg.starts_with("+") && !arg.starts_with("+define+") && !arg.starts_with("+incdir+")) {
-            // A plusarg (LRM §21.6): made available to $test$plusargs /
-            // $value$plusargs, in order, with the leading `+` stripped. The
-            // `+define+` / `+incdir+` preprocessor forms are slang's, not
-            // plusargs, so they fall through to the Driver.
-            plusargs.push_back(arg.substr(1));
-        } else {
-            // Source file or a slang Driver argument.
-            slang_args.push_back(arg);
+            if (arg == name || (arg.starts_with(name) && arg.size() > name.size() && arg[name.size()] == '=')) {
+                return &spec;
+            }
         }
     }
+    return nullptr;
+}
 
-    if (slang_args.empty() || (emit != "run" && emit != "ir" && emit != "llvm" && emit != "opt" && emit != "check")) {
-        std::println(stderr,
-                     "usage: {} [--emit=run|ir|llvm|opt|check] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] "
-                     "[--no-thunk] [--no-dedup] [--allow-system=const|full] [-O] [--perf-jitdump] "
-                     "[--no-parallel-compile] [--jobs=<N>] [-o <out>] [--dpi-lib <lib.o|lib.so>] [-D<macro>] [-I<dir>] "
-                     "[+define+...] [+incdir+...] [-f <cmd.f>] [--top <mod>] <file.sv>... [+plusarg...]",
-                     argv[0]);
-        return 2;
-    }
-
-    // Phase timings reported to stderr when --time is set (stdout stays clean for
-    // the design's own output).
-    clotho::Timings  timings;
-    clotho::Timings* tp     = time ? &timings : nullptr;
-    const auto       report = [&] {
-        if (!time) {
-            return;
+void print_help() {
+    std::println("clotho — SystemVerilog simulator (JIT)");
+    std::println("");
+    std::println("usage: clotho <command> [options] <source>... [+plusarg...]");
+    std::println("");
+    std::println("commands:");
+    std::println("  build   compile the design and write the requested artifact");
+    std::println("  run     compile the design and simulate it");
+    const auto group = [](std::string_view title, uint8_t scope, bool exact) {
+        std::println("");
+        std::println("{}", title);
+        for (const OptSpec& spec : kOptions) {
+            if (exact ? spec.scope != scope : spec.scope != kAny) {
+                continue;
+            }
+            std::string flag(spec.name);
+            if (!spec.alias.empty()) {
+                flag += ", ";
+                flag += spec.alias;
+            }
+            if (!spec.operand.empty()) {
+                flag += ' ';
+                flag += spec.operand;
+            }
+            std::println("  {:<24}{}", flag, spec.help);
         }
-        std::println(stderr, "timings (ms):");
-        std::println(stderr, "  {:<16}{:>12.3f}", "frontend (slang)", timings.frontend_ms);
-        std::println(stderr, "  {:<16}{:>12.3f}", "analysis (ir)", timings.analysis_ms);
-        // llvm compile and simulation are only measured on the run path.
-        if (emit == "run") {
-            std::println(stderr, "  {:<16}{:>12.3f}", "llvm compile", timings.llvm_ms);
-            std::println(stderr, "  {:<16}{:>12.3f}", "simulation", timings.sim_ms);
-        }
-        const double total = timings.frontend_ms + timings.analysis_ms + timings.llvm_ms + timings.sim_ms;
-        std::println(stderr, "  {:<16}{:>12.3f}", "total", total);
     };
+    group("options (build and run):", kAny, false);
+    group("options (build only):", kBuild, true);
+    group("options (run only):", kRun, true);
+    std::println("");
+    std::println("Every other option goes to slang's driver (-D, -I, -y, -v, -f, --top, -G,");
+    std::println("--timescale, --std, -W, --error-limit, ...); see --help-slang. Sources always");
+    std::println("share one compilation unit (LRM 3.12).");
+}
 
-    const clotho::LowerResult result = clotho::lower_sources(slang_args, tp, config.allow_system);
+void print_version() {
+    std::println("clotho {}", CLOTHO_GIT_HASH);
+    std::println("LLVM {}", CLOTHO_LLVM_VERSION);
+    std::println("slang {}", clotho::slang_version());
+}
+
+int usage_error(std::string_view message) {
+    std::println(stderr, "clotho: {}", message);
+    std::println(stderr, "try 'clotho --help'");
+    return 2;
+}
+
+// A `+` token slang owns (it registers `+define`, `+incdir` and `+libext`);
+// anything else starting with `+` is a runtime plusarg.
+bool is_slang_plusarg(std::string_view arg) {
+    return arg.starts_with("+define+") || arg.starts_with("+incdir+") || arg.starts_with("+libext+");
+}
+
+struct Args {
+    Command                       command = Command::Run;
+    Emit                          emit    = Emit::Llvm;
+    std::string_view              out     = "-";
+    std::vector<std::string_view> slang;    // source files + slang driver options
+    std::vector<std::string_view> plusargs; // LRM 21.6, `+` stripped
+    bool                          time = false;
+    SimulationConfig              config;
+};
+
+// Phase timings go to stderr so stdout stays exactly the design's own output.
+void report_timings(const clotho::Timings& t, Command command) {
+    std::println(stderr, "timings (ms):");
+    std::println(stderr, "  {:<16}{:>12.3f}", "frontend (slang)", t.frontend_ms);
+    std::println(stderr, "  {:<16}{:>12.3f}", "analysis (ir)", t.analysis_ms);
+    if (t.llvm_ms > 0.0) {
+        std::println(stderr, "  {:<16}{:>12.3f}", "llvm compile", t.llvm_ms);
+    }
+    if (command == Command::Run) {
+        std::println(stderr, "  {:<16}{:>12.3f}", "simulation", t.sim_ms);
+    }
+    const double total = t.frontend_ms + t.analysis_ms + t.llvm_ms + t.sim_ms;
+    std::println(stderr, "  {:<16}{:>12.3f}", "total", total);
+}
+
+// `build`: write the requested artifact. `-o -` (the default) means stdout.
+bool write_artifact(const clotho::LowerResult& result, const Args& args, clotho::Timings* timings) {
+    const bool to_stdout = args.out == "-";
+    if (args.emit == Emit::Ir) {
+        // Locations are resolvable because lowering hands back the SourceManager;
+        // an IR dump you cannot map to source is much less useful when debugging
+        // a lowering problem.
+        const auto resolve = [&](clotho::ir::SourceLoc l) { return result.sources->render(l); };
+        if (to_stdout) {
+            clotho::ir::print_module(*result.module, std::cout, resolve);
+            return true;
+        }
+        std::ofstream os(std::string(args.out));
+        if (!os) {
+            std::println(stderr, "clotho: cannot open '{}'", args.out);
+            return false;
+        }
+        clotho::ir::print_module(*result.module, os, resolve);
+        return true;
+    }
+    if (to_stdout) {
+        return clotho::ir::emit_llvm(*result.module, llvm::outs(), args.config, timings);
+    }
+    std::error_code      ec;
+    llvm::raw_fd_ostream os(args.out, ec);
+    if (ec) {
+        std::println(stderr, "clotho: cannot open '{}': {}", args.out, ec.message());
+        return false;
+    }
+    return clotho::ir::emit_llvm(*result.module, os, args.config, timings);
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    Args args;
+    if (argc < 2) {
+        return usage_error("no command; expected 'build' or 'run'");
+    }
+
+    // A global option may stand alone, without a command: `clotho --help`.
+    {
+        const std::string_view first = argv[1];
+        if (first == "build") {
+            args.command = Command::Build;
+        } else if (first == "run") {
+            args.command = Command::Run;
+        } else if (first == "-h" || first == "--help") {
+            print_help();
+            return 0;
+        } else if (first == "--version") {
+            print_version();
+            return 0;
+        } else if (first == "--help-slang") {
+            std::print("{}", clotho::slang_option_help());
+            return 0;
+        } else {
+            return usage_error(std::format("unknown command '{}'; expected 'build' or 'run'", first));
+        }
+    }
+    const std::string_view command_name = argv[1];
+    const uint8_t          scope        = args.command == Command::Build ? kBuild : kRun;
+
+    for (int i = 2; i < argc; ++i) {
+        const std::string_view arg = argv[i];
+
+        if (arg.starts_with("+") && !is_slang_plusarg(arg)) {
+            if (args.command != Command::Run) {
+                return usage_error(std::format("plusarg '{}' applies to 'run', not '{}'", arg, command_name));
+            }
+            args.plusargs.emplace_back(arg.substr(1));
+            continue;
+        }
+
+        const OptSpec* spec = arg.starts_with("-") ? find_option(arg) : nullptr;
+        if (spec == nullptr) {
+            args.slang.push_back(arg); // source file or slang driver option
+            continue;
+        }
+        if ((spec->scope & scope) == 0) {
+            return usage_error(std::format("{} applies to '{}', not '{}'", spec->name,
+                                           spec->scope == kBuild ? "build" : "run", command_name));
+        }
+
+        // Operand: `--name=value`, or the next argv entry.
+        std::string_view value;
+        if (!spec->operand.empty()) {
+            const size_t eq = arg.find('=');
+            if (eq != std::string_view::npos) {
+                value = arg.substr(eq + 1);
+            } else if (i + 1 < argc) {
+                value = argv[++i];
+            }
+            if (value.empty()) {
+                return usage_error(std::format("{} needs an operand: {} {}", spec->name, spec->name, spec->operand));
+            }
+        }
+
+        switch (spec->id) {
+            case Opt::Emit:
+                if (value == "llvm") {
+                    args.emit = Emit::Llvm;
+                } else if (value == "llvm-raw") {
+                    args.emit = Emit::LlvmRaw;
+                } else if (value == "ir") {
+                    args.emit = Emit::Ir;
+                } else {
+                    return usage_error(std::format("unknown --emit target '{}'; expected llvm, llvm-raw or ir", value));
+                }
+                break;
+            case Opt::Out:
+                args.out = value;
+                break;
+            case Opt::Time:
+                args.time = true;
+                break;
+            case Opt::O3:
+                args.config.o3 = true;
+                break;
+            case Opt::Stat:
+                // Comma-separated list, so one --stat covers a whole session.
+                for (size_t pos = 0; pos <= value.size();) {
+                    const size_t           end  = std::min(value.find(',', pos), value.size());
+                    const std::string_view name = value.substr(pos, end - pos);
+                    pos                         = end + 1;
+                    if (name == "dedup") {
+                        args.config.stats |= static_cast<uint32_t>(Stat::Dedup);
+                    } else if (name == "dedup-sets") {
+                        args.config.stats |= static_cast<uint32_t>(Stat::DedupSets);
+                    } else if (name == "comb-fuse") {
+                        args.config.stats |= static_cast<uint32_t>(Stat::CombFuse);
+                    } else if (name == "finish") {
+                        args.config.stats |= static_cast<uint32_t>(Stat::Finish);
+                    } else if (name == "parallel") {
+                        args.config.stats |= static_cast<uint32_t>(Stat::Parallel);
+                    } else {
+                        return usage_error(std::format("unknown --stat '{}'; expected dedup, dedup-sets, "
+                                                       "comb-fuse, finish or parallel",
+                                                       name));
+                    }
+                }
+                break;
+            case Opt::AllowSystem:
+                // $system runs a shell command: arbitrary code execution, so the
+                // tier is an explicit operator grant, never a default (LRM 20.17.1).
+                if (value == "const") {
+                    args.config.allow_system = SystemAccess::Const;
+                } else if (value == "full") {
+                    args.config.allow_system = SystemAccess::Full;
+                } else {
+                    return usage_error(std::format(
+                      "unknown --allow-system tier '{}'; write --allow-system=const or --allow-system=full", value));
+                }
+                std::println(stderr, "clotho: warning: $system shell execution enabled (--allow-system={})", value);
+                break;
+            case Opt::DpiLib:
+                args.config.dpi_libs.emplace_back(value);
+                break;
+            case Opt::Jobs: {
+                unsigned   jobs = 0;
+                const auto end  = value.data() + value.size();
+                const auto res  = std::from_chars(value.data(), end, jobs);
+                if (res.ec != std::errc{} || res.ptr != end) {
+                    return usage_error(std::format("--jobs needs a thread count, got '{}'", value));
+                }
+                // One knob for the whole tool: Clotho's compile pool, and slang's
+                // parser through its own -j (a later flag wins there, so an
+                // explicit slang -j still overrides this).
+                args.config.compile_jobs = jobs;
+                args.slang.emplace_back("-j");
+                args.slang.push_back(value);
+                break;
+            }
+            case Opt::PerfJitdump:
+                args.config.perf_jitdump = true;
+                break;
+            case Opt::SlangArg:
+                args.slang.push_back(value);
+                break;
+            case Opt::Help:
+                print_help();
+                return 0;
+            case Opt::Version:
+                print_version();
+                return 0;
+            case Opt::HelpSlang:
+                std::print("{}", clotho::slang_option_help());
+                return 0;
+        }
+    }
+
+    if (args.slang.empty()) {
+        return usage_error("no source files");
+    }
+    // llvm-raw is the pre-pipeline dump; every other path needs runnable shape.
+    args.config.lower_coro = args.emit != Emit::LlvmRaw;
+
+    clotho::Timings        timings;
+    clotho::Timings* const tp = args.time ? &timings : nullptr;
+
+    const clotho::LowerResult result = clotho::lower_sources(args.slang, tp, args.config.allow_system);
     if (!result.diagnostics.empty()) {
         std::print(stderr, "{}", result.diagnostic_text());
     }
-    // check: report what the frontend found and stop. No codegen, and
-    // deliberately BEFORE the `ok` gate -- a module with a failed member is
-    // exactly what this mode is for, since an editor buffer is broken most of the
-    // time and every other diagnostic in the file is still wanted. Exit status
-    // keys on whether anything reached Error, so it works as a CLI linter.
-    //
-    // Analysis-derived findings (X-dependence, mismatch classes) are S5's and
-    // will surface here; today the frontend and slang are the only sources, so
-    // there is nothing to run DesignFacts for yet.
-    if (emit == "check") {
-        report();
-        return clotho::has_error(result.diagnostics) ? 1 : 0;
-    }
 
-    // ir: a debug dump is analysis, not execution, so it tolerates a poisoned
-    // module too -- when a guard fires, seeing what DID lower is the whole point.
-    // Exit status still reports the failure, and the diagnostics are already on
-    // stderr above, so a partial dump cannot be mistaken for a whole design.
-    if (emit == "ir" && result.module != nullptr) {
-        // Locations are resolvable now that lowering hands back the SourceManager,
-        // so annotate the dump — an IR dump you cannot map back to source is much
-        // less useful for debugging a lowering problem.
-        clotho::ir::print_module(
-          *result.module, std::cout, [&](clotho::ir::SourceLoc l) { return result.sources->render(l); });
-        report();
-        return result.ok ? 0 : 1;
+    // An IR dump is analysis, not execution, so it tolerates a poisoned module:
+    // when a lowering guard fires, seeing what DID lower is the whole point. The
+    // diagnostics are already on stderr and the exit status still reports the
+    // failure, so a partial dump cannot be mistaken for a whole design.
+    if (args.command == Command::Build && args.emit == Emit::Ir && result.module != nullptr) {
+        const bool ok = write_artifact(result, args, tp);
+        if (args.time) {
+            report_timings(timings, args.command);
+        }
+        return ok && result.ok ? 0 : 1;
     }
-
     if (!result.ok) {
         return 1;
     }
 
-    if (emit == "run") {
-        const int rc = clotho::ir::run_jit(*result.module, tp, config, plusargs);
-        report();
-        return rc;
-    }
-
-    // emit == "llvm" (raw backend output) or "opt" (after the coroutine passes).
-    config.optimize = emit == "opt";
-    bool ok         = false;
-    if (out.empty()) {
-        ok = clotho::ir::emit_llvm(*result.module, llvm::outs(), config);
+    int status = 0;
+    if (args.command == Command::Run) {
+        const int rc = clotho::ir::run_jit(*result.module, tp, args.config, args.plusargs);
+        // run_jit returns a negative sentinel on setup failure; the design's own
+        // status passes through unchanged.
+        status = rc < 0 ? 1 : rc;
     } else {
-        std::error_code      ec;
-        llvm::raw_fd_ostream os(out, ec);
-        if (ec) {
-            std::println(stderr, "cannot open '{}': {}", out, ec.message());
-            return 1;
-        }
-        ok = clotho::ir::emit_llvm(*result.module, os, config);
+        status = write_artifact(result, args, tp) ? 0 : 1;
     }
-    report();
-    return ok ? 0 : 1;
+    if (args.time) {
+        report_timings(timings, args.command);
+    }
+    return status;
 }

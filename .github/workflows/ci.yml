@@ -219,7 +219,7 @@ jobs:
           set -eux
           exe=build/clotho
           if [ -f "$exe.exe" ]; then exe="$exe.exe"; fi
-          out=$("$exe" examples/initial.v)
+          out=$("$exe" run examples/initial.v)
           echo "$out"
           [ "$out" = "Hello, world!" ]
 

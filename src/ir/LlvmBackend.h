@@ -21,6 +21,7 @@
 
 #include "Module.h"
 #include "SimConfig.h"
+#include "Timing.h"
 
 namespace clotho::ir {
 
@@ -42,7 +43,7 @@ BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx,
 
 // Same construction + first-verification pass as build_modules, but returns
 // before running optimize_module (coro intrinsics intact regardless of
-// `config.optimize`) and before the second verify. run_jit uses this to
+// `config.lower_coro`) and before the second verify. run_jit uses this to
 // migrate each module into its own LLVMContext (a bitcode round-trip, see
 // Jit.cpp) before optimizing, so unrelated modules can be optimized/codegen'd
 // concurrently — LLVMContext is not thread-safe, so this can't happen while
@@ -60,7 +61,9 @@ bool optimize_module(llvm::Module& m, bool o3);
 // Lower every process in `m` to an LLVM function and write textual LLVM IR to
 // `os`. Returns false (and writes the reason to llvm::errs()) if the generated
 // module fails verification; on success the IR has already been printed to `os`.
-// `config` is forwarded to build_module.
-bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config = {});
+// `config` is forwarded to build_module. If `timings` is non-null, the IR
+// generation + pipeline duration is accumulated into its `llvm_ms`.
+bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config = {},
+               Timings* timings = nullptr);
 
 } // namespace clotho::ir
