@@ -13606,7 +13606,8 @@ Diagnostic from_slang(const slang::DiagnosticEngine& engine, const slang::Diagno
 // value: the selector arrives with the second one, and adding Synth is then an
 // enumerator, an arm below, and one parameter -- not surgery on this function.
 void apply_severity_policy(slang::DiagnosticEngine& engine, DiagnosticPolicy policy) {
-    // ---- Floor: Clotho's representation limits. Invariant across policies. ----
+    // ---- Invariant across policies: representation limits, one compliance
+    // ---- reading, and one noise judgment. None of these vary by semantics. ----
 
     // LRM 6.5 / 10.3.2 both use normative "shall be an error" for a variable
     // driven by more than one continuous assignment, or by a mix of continuous
@@ -13632,6 +13633,19 @@ void apply_severity_policy(slang::DiagnosticEngine& engine, DiagnosticPolicy pol
     // faithfully (see lower_procedural_block). A compliance decision, not a
     // preference, so it does not vary by policy.
     engine.setSeverity(slang::diag::AlwaysWithoutTimingControl, slang::DiagnosticSeverity::Warning);
+
+    // The unused-parameter pair, silenced. CheckUnused is on for every run, and
+    // on real parameterised RTL this one finding drowns the rest: measured on
+    // hazard3, 718 of 722 unused findings are unused parameters, against three
+    // genuinely dead nets/variables. That is not a defect rate -- threading a
+    // config parameter set through every module and using the subset each needs
+    // IS the idiom -- so the check reports a pattern rather than a problem, at a
+    // volume that buries the three findings that matter. Not a semantic question,
+    // hence here rather than in the policy below. Re-enable per design with
+    // `-Wunused-parameter`, which reaches slang's engine through the forwarded
+    // driver options.
+    engine.setSeverity(slang::diag::UnusedParameter, slang::DiagnosticSeverity::Ignored);
+    engine.setSeverity(slang::diag::UnusedPackageParameter, slang::DiagnosticSeverity::Ignored);
 
     // ---- Policy: what the chosen semantics judges differently. ----
 
@@ -13688,12 +13702,20 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
         }
         // Post-elaboration analysis (dataflow): inferred-latch/comb checks,
         // blocking-task-in-comb errors, and multi-driver checks (9.2.2.2). Only
-        // run on an error-free design — analysis assumes a valid AST. Default
-        // AnalysisOptions deliberately leave the lint-style CheckUnused /
-        // CheckShadow passes off and match strict LRM driver rules.
+        // run on an error-free design — analysis assumes a valid AST.
+        //
+        // CheckUnused / CheckShadow are on unconditionally, as warnings. They are
+        // deliberately NOT gated on the command or the severity policy: an unused
+        // signal is unused whether you are simulating or synthesising, so it is
+        // not a semantic question, and a finding that only appears under `lint`
+        // is a finding most runs never see. Both are cheap -- the analysis walk
+        // already happens for the dataflow checks above. The unused-PARAMETER
+        // pair is silenced in apply_severity_policy; see the reason there.
         if (engine.getNumErrors() == 0) {
             comp.freeze();
-            slang::analysis::AnalysisManager analysis;
+            slang::analysis::AnalysisOptions aopts;
+            aopts.flags = slang::analysis::AnalysisFlags::CheckUnused | slang::analysis::AnalysisFlags::CheckShadow;
+            slang::analysis::AnalysisManager analysis(aopts);
             analysis.analyze(comp);
             for (const slang::Diagnostic& d : analysis.getDiagnostics()) {
                 harvest(d);

@@ -101,9 +101,18 @@ module m;
 endmodule
 )");
     REQUIRE_FALSE(r.ok);
-    REQUIRE(r.diagnostics.size() == 1);
 
-    const Diagnostic& d = r.diagnostics.front();
+    // Selected by code, not by position or count: the design also draws an
+    // unused-variable warning, and a test of the lowering guard's diagnostic has
+    // no business asserting how many OTHER diagnostics the design produces.
+    const Diagnostic* found = nullptr;
+    for (const Diagnostic& item : r.diagnostics) {
+        if (item.code == "unsupported-construct") {
+            found = &item;
+        }
+    }
+    REQUIRE(found != nullptr);
+    const Diagnostic& d = *found;
     CHECK(d.severity == Severity::Error);
     CHECK(d.origin == DiagnosticOrigin::Unsupported);
     CHECK(d.code == "unsupported-construct");
