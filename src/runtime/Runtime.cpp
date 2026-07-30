@@ -27,12 +27,14 @@
 #define NOMINMAX
 #include <windows.h>
 #include <psapi.h>
+#include <io.h>
 #else
 #include <sys/resource.h>
+#include <unistd.h>
 #endif
 
 #include <ankerl/unordered_dense.h>
-#include <fmt/format.h>
+#include <fmt/color.h>
 
 #include "Format.h"
 #include "Wheel.h"
@@ -2966,6 +2968,31 @@ constexpr uint32_t bounds_report_cap = 8;
 // constant carries no alignment guarantee.
 ankerl::unordered_dense::map<uint64_t, uint32_t> g_bounds_hits;
 
+// Whether a sanitizer report may use colour: a terminal that is not `dumb`,
+// with NO_COLOR unset (https://no-color.org). Escape codes in a redirected log
+// or a test's captured stderr are corruption, not decoration. Resolved once;
+// the answer cannot change while the process runs.
+bool diag_color() {
+    static const bool on = []
+    {
+#if defined(_WIN32)
+        const bool tty = _isatty(_fileno(stderr)) != 0;
+#else
+        const bool tty = isatty(fileno(stderr)) != 0;
+#endif
+        const char* term = std::getenv("TERM");
+        return tty && std::getenv("NO_COLOR") == nullptr &&
+               (term == nullptr || std::strcmp(term, "dumb") != 0);
+    }();
+    return on;
+}
+
+// `s` when colour is on, plain otherwise. fmt emits no escape at all for a
+// default-constructed style, so one call site serves both.
+fmt::text_style styled(fmt::text_style s) {
+    return diag_color() ? s : fmt::text_style{};
+}
+
 } // namespace
 
 extern "C" void rt_bounds_report(const char* where, const char* name, int32_t index, int32_t left,
@@ -2983,14 +3010,38 @@ extern "C" void rt_bounds_report(const char* where, const char* name, int32_t in
     // $display text is committed before the warning interleaves.
     io_ensure_init();
     std::fflush(stdout);
+
+    // Laid out like a modern compiler diagnostic: what went wrong, then where,
+    // then the context that does not fit in either. The array's name and the
+    // simulation time are notes rather than headline because the location
+    // already pins the access, down to the column of the index expression.
+    const fmt::text_style label = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::yellow));
+    const fmt::text_style head  = styled(fmt::emphasis::bold);
+    const fmt::text_style loc   = styled(fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style tag   = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style body  = styled(fmt::emphasis::faint);
+
     std::string when;
     append_finish_time(when, now);
+    // Each styled run stops short of the newline: fmt closes a style after
+    // everything it formatted, and a reset that lands past the line break
+    // leaves the style live across it.
+    fmt::print(stderr, label, "warning:");
     // An x/z index is out of range by LRM Table 7-1 with no numeric value to
     // report, so it prints as what it is rather than as its must-plane bits.
-    fmt::print(stderr, "WARNING: bounds: {}: {} '{}[{}]' is outside its declared bounds [{}:{}], at {}{}\n",
-               where, write ? "write to" : "read of", name,
-               unknown ? std::string("x") : std::to_string(index), left, right, when,
-               hits == bounds_report_cap ? " (further reports from this access suppressed)" : "");
+    fmt::print(stderr, head, " index out of bounds: index {}, range [{}:{}]",
+               unknown ? std::string("x") : std::to_string(index), left, right);
+    fmt::print(stderr, "\n");
+    fmt::print(stderr, loc, "{}", where);
+    fmt::print(stderr, "\n");
+    fmt::print(stderr, tag, "  note:");
+    fmt::print(stderr, body, " {} '{}' at {}", write ? "write to" : "read of", name, when);
+    fmt::print(stderr, "\n");
+    if (hits == bounds_report_cap) {
+        fmt::print(stderr, tag, "  note:");
+        fmt::print(stderr, body, " further reports from this access are suppressed");
+        fmt::print(stderr, "\n");
+    }
     std::fflush(stderr);
 }
 
