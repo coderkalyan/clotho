@@ -79,45 +79,58 @@ struct Options {
     std::optional<bool>        perf_jitdump;
 };
 
+// Wording rule for everything a user reads: say what the option does for the
+// design being simulated, not how Clotho implements it. An option that exists
+// only for working on Clotho itself says so ("for working on clotho"), which is
+// the one place implementation vocabulary belongs.
+//
 // Registered before Driver::addStandardArgs so these head the --help listing.
 // A `[build]` / `[run]` tag in a description marks a command-specific option;
 // check_scope enforces it after parsing.
 void register_options(slang::CommandLine& cl, Options& o) {
-    cl.add("-h,--help", o.help, "Display available options");
-    cl.add("--version", o.version, "Display clotho, LLVM and slang versions and exit");
-    cl.add("--emit", o.emit, "[build] Artifact to write: llvm (default), llvm-raw (pre-coroutine-pipeline), ir",
+    cl.add("-h,--help", o.help, "Show this help and exit");
+    cl.add("--version", o.version, "Show version information and exit");
+    cl.add("--emit", o.emit,
+           "[build] What to write: llvm (LLVM IR for the design, the default), ir (Clotho's own "
+           "intermediate form), llvm-raw (LLVM IR before the coroutine passes; for working on clotho)",
            "<target>");
-    cl.add("-o,--output", o.out, "[build] Write the artifact here; '-' is stdout, the default", "<file>",
+    cl.add("-o,--output", o.out, "[build] Write the output to this file instead of stdout", "<file>",
            slang::CommandLineFlags::FilePath);
-    cl.add("--time", o.time, "Report per-phase wall-clock timings to stderr");
-    cl.add("-O", o.o3, "Optimize hard: LLVM default<O3> plus aggressive machine codegen");
-    cl.add("--stat", o.stats, "Report a backend statistic: dedup, dedup-sets, comb-fuse, finish or parallel "
-                              "(repeatable, comma-separated)",
+    cl.add("--time", o.time, "Print how long each stage took: reading the source, compiling, simulating");
+    cl.add("-O", o.o3, "Compile the design more thoroughly: slower to start up, faster to simulate");
+    cl.add("--stat", o.stats,
+           "Print a compiler statistic while building, for working on clotho: dedup, dedup-sets, "
+           "comb-fuse, finish or parallel (repeatable, comma-separated)",
            "<name>", slang::CommandLineFlags::CommaList);
     cl.add("--allow-system", o.allow_system,
-           "Permit the $system shell task, refused by default: 'const' allows only a "
-           "constant-folding command string, 'full' allows any",
+           "Let the design run shell commands through $system, refused by default: 'const' allows "
+           "only commands written literally in the source, 'full' allows any command the design "
+           "builds while it runs",
            "<tier>");
     cl.add("--dpi-lib", o.dpi_libs,
-           "[run] DPI-C library to resolve 'import \"DPI-C\"' against: a .o/.a is JIT-linked "
-           "(import and export), a .so is dlopen'd (import only)",
+           "[run] Library holding the C functions this design imports through DPI-C. Give a .o or .a "
+           "if C also calls back into the design; a .so is enough for imports alone",
            "<path>", slang::CommandLineFlags::FilePath);
     cl.add("--perf-jitdump", o.perf_jitdump,
-           "[run] Write a perf jitdump ($JITDUMPDIR) so JIT'd code symbolizes in perf");
+           "[run] Let `perf` see names for the design's compiled code (writes a jitdump under "
+           "$JITDUMPDIR); for profiling clotho");
 }
 
 constexpr std::string_view kOverview =
-  "clotho — SystemVerilog simulator (JIT)\n"
+  "clotho — a SystemVerilog simulator\n"
   "\n"
   "commands:\n"
-  "  build   compile the design and write the requested artifact\n"
+  "  build   compile the design and write the generated code, without running it\n"
   "  run     compile the design and simulate it\n"
-  "  lint    analyse the design and report diagnostics, writing nothing\n"
+  "  lint    check the design and report problems, without compiling or running it\n"
   "\n"
-  "clotho's options are listed first below, then slang's; there is one parser and\n"
-  "one namespace. A [build] or [run] tag marks an option only that command takes.\n"
-  "A '+arg' that is not a slang '+' option is a runtime plusarg (LRM 21.6, run\n"
-  "only); '--' ends plusarg interpretation and passes the rest to slang as given.";
+  "Clotho's own options come first below, then the source-reading options it shares\n"
+  "with slang, the SystemVerilog front end it is built on. A [build] or [run] tag\n"
+  "marks an option only that command accepts.\n"
+  "\n"
+  "An argument starting with '+' that is not an option goes to the design itself,\n"
+  "for $test$plusargs and $value$plusargs to read while it runs (LRM 21.6). Use\n"
+  "'--' to stop that and pass everything after it through as written.";
 
 int usage_error(std::string_view message) {
     std::println(stderr, "clotho: {}", message);
@@ -170,18 +183,22 @@ bool check_scope(const Options& o, Command command, int& status) {
 }
 
 // Phase timings go to stderr so stdout stays exactly the design's own output.
+// Labels name what the stage does for the user's design, not the component that
+// does it: "read source" is slang parse + elaborate, "analyze" is the lowering to
+// Clotho's own form, "compile" is LLVM code generation. tests/perf/perf.py
+// scrapes these, so a rename lands there too.
 void report_timings(const clotho::Timings& t, Command command) {
     std::println(stderr, "timings (ms):");
-    std::println(stderr, "  {:<16}{:>12.3f}", "frontend (slang)", t.frontend_ms);
-    std::println(stderr, "  {:<16}{:>12.3f}", "analysis (ir)", t.analysis_ms);
+    std::println(stderr, "  {:<12}{:>12.3f}", "read source", t.frontend_ms);
+    std::println(stderr, "  {:<12}{:>12.3f}", "analyze", t.analysis_ms);
     if (t.llvm_ms > 0.0) {
-        std::println(stderr, "  {:<16}{:>12.3f}", "llvm compile", t.llvm_ms);
+        std::println(stderr, "  {:<12}{:>12.3f}", "compile", t.llvm_ms);
     }
     if (command == Command::Run) {
-        std::println(stderr, "  {:<16}{:>12.3f}", "simulation", t.sim_ms);
+        std::println(stderr, "  {:<12}{:>12.3f}", "simulate", t.sim_ms);
     }
     const double total = t.frontend_ms + t.analysis_ms + t.llvm_ms + t.sim_ms;
-    std::println(stderr, "  {:<16}{:>12.3f}", "total", total);
+    std::println(stderr, "  {:<12}{:>12.3f}", "total", total);
 }
 
 // `build`: write the requested artifact. `-o -` (the default) means stdout.
@@ -354,7 +371,9 @@ int main(int argc, char** argv) {
             return usage_error(std::format(
               "unknown --allow-system tier '{}'; write --allow-system=const or --allow-system=full", tier));
         }
-        std::println(stderr, "clotho: warning: $system shell execution enabled (--allow-system={})", tier);
+        std::println(stderr, "clotho: warning: this design may run shell commands ($system enabled with "
+                             "--allow-system={})",
+                     tier);
     }
 
     const bool             want_time = options.time == true;

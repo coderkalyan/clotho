@@ -37,11 +37,13 @@ TOOLS_LOCAL_PATH = HERE / "tools.local.json"
 DEFAULT_RUNS = 5
 SANITY_TIMEOUT_S = 900
 
+# Anchored to the label column of clotho's `--time` block so a stray "compile"
+# elsewhere on stderr cannot be scraped as a timing.
 PHASE_RES = {
-    "frontend_ms": re.compile(r"frontend \(slang\)\s+([0-9.]+)"),
-    "analysis_ms": re.compile(r"analysis \(ir\)\s+([0-9.]+)"),
-    "llvm_ms": re.compile(r"llvm compile\s+([0-9.]+)"),
-    "sim_ms": re.compile(r"simulation\s+([0-9.]+)"),
+    "frontend_ms": re.compile(r"^  read source\s+([0-9.]+)", re.M),
+    "analysis_ms": re.compile(r"^  analyze\s+([0-9.]+)", re.M),
+    "llvm_ms": re.compile(r"^  compile\s+([0-9.]+)", re.M),
+    "sim_ms": re.compile(r"^  simulate\s+([0-9.]+)", re.M),
 }
 
 # Gated metrics: any statistically significant regression fails compare.

@@ -24,9 +24,9 @@ All subcommands take `--runs N` (default 5) and `--cases NAME...`; `run` and
   number is the **minimum** — run-time noise is one-sided (log-normal-ish), so
   min is the best estimator of the true cost.
 - One hyperfine invocation per case measures the warm-cache wall clock; the
-  command appends `--time` stderr to `splits.txt`, giving per-run
-  frontend/analysis/llvm-compile/simulation splits from the same runs.
-  `compile_ms` = frontend + analysis + llvm compile.
+  command appends `--time` stderr to `splits.txt`, giving the per-run
+  read-source / analyze / compile / simulate splits from the same runs.
+  `compile_ms` = read source + analyze + compile (everything before simulation).
 - Each case is sanity-run once before timing (exit 0 + `check.stdout_regex`
   match); a broken sim is never benchmarked.
 
