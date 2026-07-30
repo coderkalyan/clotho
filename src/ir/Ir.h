@@ -2068,6 +2068,86 @@ constexpr bool extra_operand_shapes_total() {
 
 static_assert(extra_operand_shapes_total(), "every PayloadKind::Extra tag needs an extra_operand_shape() case");
 
+// Operands a tag carries that `Ir::operands` cannot put in its single span.
+//
+// operands() returns one `std::span`, so a tag whose variadic run lives in the
+// extra buffer cannot also expose a scalar that lives elsewhere -- the two are
+// not contiguous and copying the run out is the cost the zero-copy view exists
+// to avoid. Six tags are in that position. This table names what each one keeps
+// back, and `Ir::for_each_operand` visits it, so a walk that must see every use
+// (def-use, liveness, DCE) has a total interface while the span stays fast.
+enum class ExtraOperandTail : uint8_t {
+    // operands() is already total for this tag.
+    None,
+    // + payload.op_extra.op: the file descriptor of fdisplay / monitor_emit,
+    // whose variadic value args occupy the span.
+    Descriptor,
+    // + SformatInfo::dst: $sformat's destination lvalue. An lvalue IS an
+    // operand by this codebase's convention -- Store's lhs, AggCopy's op/src
+    // and every queue handle are all reported.
+    SformatDst,
+    // + ScanfInfo::source: the string or descriptor being scanned. The span
+    // holds the output lvalues.
+    ScanfSource,
+    // + InsideSetInfo::values and ::ranges: `inside`'s member and [lo:hi]
+    // range operands, two slices, neither of which is the span (which holds
+    // only the selector, payload.op_extra.op).
+    InsideSetMembers,
+};
+
+// Constexpr for the same reason as extra_operand_shape(): operand walks inline
+// it. Same fail-closed shape too -- a short case list plus a default, with the
+// static_assert below turning a missed tag into a build break.
+constexpr ExtraOperandTail extra_operand_tail(Inst::Tag tag) {
+    using T = Inst::Tag;
+    using E = ExtraOperandTail;
+    switch (tag) {
+        case T::FDisplay:
+        case T::MonitorEmit:
+            return E::Descriptor;
+        case T::Sformat:
+            return E::SformatDst;
+        case T::Fscanf:
+        case T::Sscanf:
+            return E::ScanfSource;
+        case T::InsideSet:
+            return E::InsideSetMembers;
+        default:
+            return E::None;
+    }
+}
+
+// Three of the four tails are implied by the payload kind, so they can be
+// checked as a biconditional: a new tag on PayloadKind::FDisplay / Sformat /
+// Scanf fails the build until it is classified, and a tag wrongly given one of
+// those tails fails too. InsideSetMembers is tag-specific (InsideSet shares
+// PayloadKind::OpExtra with ~40 others), so it gets the one-way check.
+constexpr bool extra_operand_tails_total() {
+    for (unsigned v = 0; v <= 0xFF; ++v) {
+        const auto tag  = static_cast<Inst::Tag>(v);
+        const auto tail = extra_operand_tail(tag);
+        const auto kind = payload_kind(tag);
+
+        if ((kind == Inst::PayloadKind::FDisplay) != (tail == ExtraOperandTail::Descriptor)) {
+            return false;
+        }
+        if ((kind == Inst::PayloadKind::Sformat) != (tail == ExtraOperandTail::SformatDst)) {
+            return false;
+        }
+        if ((kind == Inst::PayloadKind::Scanf) != (tail == ExtraOperandTail::ScanfSource)) {
+            return false;
+        }
+        if (tail == ExtraOperandTail::InsideSetMembers && tag != Inst::Tag::InsideSet) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static_assert(extra_operand_tails_total(),
+              "a tag on PayloadKind::FDisplay / Sformat / Scanf needs its extra_operand_tail() case");
+
 // Immutable, finished process IR: a structure of arrays (parallel tag / payload
 // / location columns indexed by Index) plus a flat extra side-table. The body
 // is the root region. Constructed by Builder::finish(); default construction
@@ -2170,15 +2250,56 @@ public:
     // a new tag must be added to or the build breaks; the result is never a
     // span reinterpreted from the wrong record.
     //
-    // NOTE: sound but not exhaustive for six tags — a tag whose args are an
-    // extra slice can also carry a scalar operand outside it, and one span
-    // cannot express both. FDisplay and MonitorEmit omit their descriptor,
-    // Fscanf/Sscanf their source, Sformat its destination lvalue, and InsideSet
-    // its member and range operands. Widening the span would mean copying the
-    // args out of the extra buffer, which is the cost this zero-copy view
-    // exists to avoid; a pass needing every use of those tags must read their
-    // info records directly.
+    // NOT exhaustive for the six tags extra_operand_tail() names: a tag whose
+    // args are an extra slice can also carry a scalar operand outside it, and
+    // one span cannot express both without copying the run out of the extra
+    // buffer — the cost this zero-copy view exists to avoid. That is a
+    // deliberate contract, not a gap: this returns the *span-expressible*
+    // operands, and `for_each_operand` below is the total walk. A pass that
+    // must see every use (def-use, liveness, DCE) MUST use that one.
     std::span<const Index> operands(Index inst, std::array<Index, 4>& scratch) const;
+
+    // Visit every SSA operand of `inst` exactly once, in operand order.
+    //
+    // Total AND exhaustive, where operands() is only total: it yields the span
+    // then whatever extra_operand_tail() says that tag holds back. Callback
+    // rather than a span because the two runs are not contiguous, so no single
+    // view can cover them and a buffer big enough for a variadic run would have
+    // to allocate. This costs nothing extra for the ~205 tags with no tail.
+    //
+    // Region bodies are still not operands (see operands() above).
+    template<typename Fn>
+    void for_each_operand(Index inst, Fn&& fn) const {
+        std::array<Index, 4> scratch{};
+        for (const Index op : operands(inst, scratch)) {
+            fn(op);
+        }
+
+        const Inst::Payload& p = payload(inst);
+        switch (extra_operand_tail(tag(inst))) {
+            case ExtraOperandTail::None:
+                return;
+            case ExtraOperandTail::Descriptor:
+                fn(p.op_extra.op);
+                return;
+            case ExtraOperandTail::SformatDst:
+                fn(extra_data<SformatInfo>(p.extra).dst);
+                return;
+            case ExtraOperandTail::ScanfSource:
+                fn(extra_data<ScanfInfo>(p.extra).source);
+                return;
+            case ExtraOperandTail::InsideSetMembers: {
+                const auto info = extra_data<InsideSetInfo>(p.op_extra.extra);
+                for (const Index op : index_slice(info.values)) {
+                    fn(op);
+                }
+                for (const Index op : index_slice(info.ranges)) {
+                    fn(op);
+                }
+                return;
+            }
+        }
+    }
 
 private:
     friend class Builder;

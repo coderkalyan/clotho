@@ -1,3 +1,6 @@
+#include <algorithm>
+#include <vector>
+
 #include <doctest/doctest.h>
 
 #include <array>
@@ -207,6 +210,85 @@ void check_body(const ir::Ir& ir, std::string_view design, std::string_view body
                             raw,
                             " which does not precede it");
         }
+
+        // The total walk gets the same treatment, plus the two properties that
+        // relate it to the span: it must be a superset, and it must actually
+        // deliver a tail where the classifier claims one. Without the second
+        // check a for_each_operand that silently forgot its switch would pass
+        // everything else here.
+        std::vector<ir::Index> all;
+        ir.for_each_operand(i, [&](ir::Index op) { all.push_back(op); });
+
+        REQUIRE_MESSAGE(all.size() <= n + 2,
+                        design,
+                        "/",
+                        body,
+                        ": tag ",
+                        tag,
+                        " at %",
+                        k,
+                        " walked ",
+                        all.size(),
+                        " operands but the body only has ",
+                        n,
+                        " instructions");
+
+        for (const ir::Index op : all) {
+            const auto raw = static_cast<uint32_t>(op);
+            REQUIRE_MESSAGE(raw < n,
+                            design,
+                            "/",
+                            body,
+                            ": tag ",
+                            tag,
+                            " at %",
+                            k,
+                            " walked out-of-bounds operand %",
+                            raw,
+                            " (body has ",
+                            n,
+                            " instructions)");
+            REQUIRE_MESSAGE(raw < k,
+                            design,
+                            "/",
+                            body,
+                            ": tag ",
+                            tag,
+                            " at %",
+                            k,
+                            " walked operand %",
+                            raw,
+                            " which does not precede it");
+        }
+
+        for (const ir::Index op : ops) {
+            REQUIRE_MESSAGE(std::find(all.begin(), all.end(), op) != all.end(),
+                            design,
+                            "/",
+                            body,
+                            ": tag ",
+                            tag,
+                            " at %",
+                            k,
+                            ": operands() returned %",
+                            static_cast<uint32_t>(op),
+                            " which for_each_operand does not walk");
+        }
+
+        const bool has_tail = ir::extra_operand_tail(ir.tag(i)) != ir::ExtraOperandTail::None;
+        REQUIRE_MESSAGE(has_tail == (all.size() > ops.size()),
+                        design,
+                        "/",
+                        body,
+                        ": tag ",
+                        tag,
+                        " at %",
+                        k,
+                        ": classifier says tail=",
+                        has_tail,
+                        " but the walk added ",
+                        all.size() - ops.size(),
+                        " operands");
     }
 }
 
@@ -337,6 +419,88 @@ TEST_CASE("monitor_set exposes no operands") {
             }
             found = true;
             CHECK(p.ir.operands(i, scratch).empty());
+        }
+    }
+    CHECK(found);
+}
+
+// The tail table's own drift check, mirroring the shape one above. Three of the
+// four tails are implied by PayloadKind, so they are biconditional: a new tag
+// added to any of those kinds fails here until classified, and a tag wrongly
+// given one of those tails fails too.
+TEST_CASE("extra_operand_tail classifies exactly the tags whose operands overflow one span") {
+    CHECK(ir::extra_operand_tails_total());
+
+    using K = ir::Inst::PayloadKind;
+    using E = ir::ExtraOperandTail;
+    for (unsigned v = 0; v <= 0xFF; ++v) {
+        const auto tag  = static_cast<ir::Inst::Tag>(v);
+        const auto tail = ir::extra_operand_tail(tag);
+        CHECK((ir::payload_kind(tag) == K::FDisplay) == (tail == E::Descriptor));
+        CHECK((ir::payload_kind(tag) == K::Sformat) == (tail == E::SformatDst));
+        CHECK((ir::payload_kind(tag) == K::Scanf) == (tail == E::ScanfSource));
+        if (tail == E::InsideSetMembers) {
+            CHECK(tag == ir::Inst::Tag::InsideSet);
+        }
+    }
+}
+
+// Exactly six tags, named. The count is the claim the header comment makes, so
+// pin it: a seventh appearing means someone widened a record without extending
+// the walk, and one disappearing means the walk got a capability nobody noticed.
+TEST_CASE("exactly six tags hold operands back from the span") {
+    std::set<ir::Inst::Tag> tailed;
+    for (unsigned v = 0; v <= 0xFF; ++v) {
+        const auto tag = static_cast<ir::Inst::Tag>(v);
+        if (ir::extra_operand_tail(tag) != ir::ExtraOperandTail::None) {
+            tailed.insert(tag);
+        }
+    }
+
+    const std::set<ir::Inst::Tag> expected = { ir::Inst::Tag::FDisplay, ir::Inst::Tag::MonitorEmit,
+                                               ir::Inst::Tag::Fscanf,   ir::Inst::Tag::Sscanf,
+                                               ir::Inst::Tag::Sformat,  ir::Inst::Tag::InsideSet };
+    CHECK(tailed == expected);
+}
+
+// InsideSet is the tag whose tail carries the most: two whole slices, where the
+// span holds only the selector. The corresponding precision claim -- that a
+// definite `inside` now proves definite -- lives in analysis_test.cpp, which
+// owns the DesignFacts helpers.
+TEST_CASE("inside walks its selector, members and range endpoints") {
+    constexpr std::string_view src = R"(
+        module m;
+          logic [3:0] sel;
+          logic       hit;
+          initial begin
+            sel = 4'd3;
+            hit = sel inside {4'd1, 4'd3, [4'd8:4'd9]};
+            $display("%b", hit);
+          end
+        endmodule
+    )";
+
+    const LowerResult r = lower_text(src);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(r.module != nullptr);
+
+    bool found = false;
+    for (const ir::Process& p : r.module->processes()) {
+        const ir::Ir& ir = p.ir;
+        for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+            const auto i = static_cast<ir::Index>(k);
+            if (ir.tag(i) != ir::Inst::Tag::InsideSet) {
+                continue;
+            }
+            found = true;
+
+            std::array<ir::Index, 4> scratch;
+            // The span is the selector alone.
+            CHECK(ir.operands(i, scratch).size() == 1);
+            // Two members plus a two-endpoint range, so four more.
+            size_t walked = 0;
+            ir.for_each_operand(i, [&](ir::Index) { ++walked; });
+            CHECK(walked == 5);
         }
     }
     CHECK(found);

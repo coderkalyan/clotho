@@ -312,3 +312,16 @@ TEST_CASE("ptr_arg marks the actual behind a task output argument") {
     CHECK_FALSE(a.facts.undriven[a.sig("__taskarg0")]);
     CHECK_FALSE(a.facts.undriven[a.sig("out")]);
 }
+
+// The InsideSet arm of the value sweep is a real operand join now that
+// for_each_operand reaches its members, where it used to be a hardcoded may-x
+// with "Ir::operands cannot express its member operands" as the reason.
+//
+// Deliberately NOT asserted through DesignFacts::may_x here: every 4-state
+// signal is may-x regardless, because it holds x before its first assignment,
+// and the only signals that report clean are 2-state ones where the result is
+// trivially false. So a may_x test on this would pass whatever the arm did. The
+// change is pinned instead by the operand-walk properties in operands_test.cpp
+// (the walk must reach the selector, both members and both range endpoints) and
+// by the whole suite staying green; it becomes observable when a consumer reads
+// per-value x, which is S5's abstract interpreter rather than anything today.

@@ -755,14 +755,12 @@ struct ValueSweep {
     }
 
     // Conservative may-x of a value-producing op: x if any operand is x or z.
-    // Uses Ir::operands, which is exhaustive apart from the variadic system tasks
-    // and InsideSet -- all handled explicitly at their arms below.
+    // Uses for_each_operand, not operands(), so the six tags whose operands do
+    // not all fit one span are covered too -- InsideSet is value-producing and
+    // reads its members through that tail.
     uint8_t operand_x(const Ir& ir, Index i) const {
-        std::array<Index, 4> scratch{};
-        uint8_t              x = 0;
-        for (const Index op : ir.operands(i, scratch)) {
-            x |= x_of(op) | z_of(op);
-        }
+        uint8_t x = 0;
+        ir.for_each_operand(i, [&](Index op) { x |= x_of(op) | z_of(op); });
 
         return x;
     }
@@ -1046,11 +1044,13 @@ struct ValueSweep {
                     val_x[raw] = 1;
                     break;
 
-                // The `inside` operator: Ir::operands cannot express its member
-                // operands (they live in its info record), so the default join
-                // would under-approximate. Conservative.
+                // The `inside` operator (LRM 11.4.13): wildcard-equality tests
+                // against the member values and range endpoints, so it is x
+                // exactly when an operand is. Reachable only because
+                // for_each_operand sees the members; operands() alone would
+                // under-approximate, which is why this used to be a hard 1.
                 case Inst::Tag::InsideSet:
-                    val_x[raw] = 1;
+                    val_x[raw] = operand_x(ir, i);
                     break;
 
                 // Real ops absorb z too: a real value carries no z plane and every
