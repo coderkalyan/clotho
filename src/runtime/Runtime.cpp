@@ -32,6 +32,7 @@
 #endif
 
 #include <ankerl/unordered_dense.h>
+#include <fmt/format.h>
 
 #include "Format.h"
 #include "Wheel.h"
@@ -2944,6 +2945,52 @@ extern "C" void rt_severity(int32_t level, const char* banner, const char* fmt, 
     render(line, fmt, argc, argv);
     line += '\n';
     std::fputs(line.c_str(), stderr);
+    std::fflush(stderr);
+}
+
+// ---- --sanitize=bounds reports ----
+
+namespace {
+
+// Reports emitted per access site before the site goes quiet. An out-of-range
+// index in an always block re-fires on every activation, and an unbounded
+// stream of identical lines buries both the first report and the design's own
+// output. Not configurable yet; a --sanitize option for it can come when
+// something needs it.
+constexpr uint32_t bounds_report_cap = 8;
+
+// Reports already emitted, keyed by access site: the emitted "<file>:<line>:
+// <col>" string's address (one per instrumented access, stable for the run)
+// with the read/write direction folded in, so a read and a write on the same
+// line are counted apart. Scaled rather than bit-packed because a string
+// constant carries no alignment guarantee.
+ankerl::unordered_dense::map<uint64_t, uint32_t> g_bounds_hits;
+
+} // namespace
+
+extern "C" void rt_bounds_report(const char* where, const char* name, int32_t index, int32_t left,
+                                 int32_t right, uint32_t flags, uint64_t now) {
+    const bool     write   = (flags & 1u) != 0;
+    const bool     unknown = (flags & 2u) != 0;
+    const uint64_t site    = reinterpret_cast<uint64_t>(where) * 2 + (write ? 1 : 0);
+    uint32_t&      hits    = g_bounds_hits[site];
+    if (hits >= bounds_report_cap) {
+        return;
+    }
+    ++hits;
+    // A simulator diagnostic, not design output, so it goes to stderr like the
+    // severity and case-violation reports; flush stdout first so buffered
+    // $display text is committed before the warning interleaves.
+    io_ensure_init();
+    std::fflush(stdout);
+    std::string when;
+    append_finish_time(when, now);
+    // An x/z index is out of range by LRM Table 7-1 with no numeric value to
+    // report, so it prints as what it is rather than as its must-plane bits.
+    fmt::print(stderr, "WARNING: bounds: {}: {} '{}[{}]' is outside its declared bounds [{}:{}], at {}{}\n",
+               where, write ? "write to" : "read of", name,
+               unknown ? std::string("x") : std::to_string(index), left, right, when,
+               hits == bounds_report_cap ? " (further reports from this access suppressed)" : "");
     std::fflush(stderr);
 }
 

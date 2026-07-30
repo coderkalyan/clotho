@@ -21,8 +21,10 @@ namespace clotho::ir {
 // compile and simulation phase durations are recorded into it. `config` is
 // forwarded to build_module. `plusargs` are the command-line arguments that
 // followed a leading `+` (LRM §21.6), in source order, with the `+` itself
-// stripped; made available to $test$plusargs / $value$plusargs.
+// stripped; made available to $test$plusargs / $value$plusargs. `resolve`
+// renders the source locations a sanitizer bakes into its reports; without it
+// they read "<unknown>".
 int run_jit(const Module& m, Timings* timings = nullptr, const SimulationConfig& config = {},
-           std::span<const std::string_view> plusargs = {});
+           std::span<const std::string_view> plusargs = {}, const LocResolver& resolve = {});
 
 } // namespace clotho::ir

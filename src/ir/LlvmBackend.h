@@ -37,9 +37,11 @@ struct BuiltDesign {
 // modules (and writes the reason to llvm::errs()) on backend error or if any
 // generated module fails verification. The caller owns the returned modules
 // and must keep `ctx` alive at least as long as them; the JIT links the whole
-// set into one dylib.
+// set into one dylib. `resolve` renders the source locations a sanitizer bakes
+// into its reports (in practice `SourceContext::render`); without it they read
+// "<unknown>", which is what a caller with no SourceContext gets.
 BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx,
-                          const SimulationConfig& config = {});
+                          const SimulationConfig& config = {}, const LocResolver& resolve = {});
 
 // Same construction + first-verification pass as build_modules, but returns
 // before running optimize_module (coro intrinsics intact regardless of
@@ -50,7 +52,8 @@ BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx,
 // modules still share `ctx`. build_modules itself is unchanged (single shared
 // context, sequential optimize_module loop) for emit_llvm / tests.
 BuiltDesign build_modules_unoptimized(const Module& m, llvm::LLVMContext& ctx,
-                                      const SimulationConfig& config = {});
+                                      const SimulationConfig& config = {},
+                                      const LocResolver&      resolve = {});
 
 // Run Clotho's coroutine-lowering pipeline (Tier 0 or, under `o3`, LLVM's
 // default<O3>) on one module in place. Returns false (reason on errs()) only
@@ -64,6 +67,6 @@ bool optimize_module(llvm::Module& m, bool o3);
 // `config` is forwarded to build_module. If `timings` is non-null, the IR
 // generation + pipeline duration is accumulated into its `llvm_ms`.
 bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config = {},
-               Timings* timings = nullptr);
+               Timings* timings = nullptr, const LocResolver& resolve = {});
 
 } // namespace clotho::ir

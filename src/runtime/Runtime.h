@@ -163,6 +163,28 @@ void rt_defer_report(int32_t level, uint64_t is_final, const void* gen, uint64_t
 void rt_defer_flush_observed(void);
 void rt_defer_flush_final(void);
 
+// Report an unpacked-array element access whose index missed the array's
+// declared bounds, found by `--sanitize=bounds`. Not an LRM event: the access
+// itself still behaves exactly as LRM 7.4.6 / 11.5.1 says (an out-of-range read
+// yields the element default, an out-of-range write is dropped), and this only
+// makes that silent outcome audible. Non-fatal — it prints and returns, so the
+// design keeps running with unchanged semantics.
+//
+// `where` is the compile-time "<file>:<line>:<col>" of the access and `name`
+// the array's hierarchical name; both are static-lifetime strings emitted with
+// the code. `index` is the index as the design wrote it, in the array's own
+// declared coordinates, and [`left`:`right`] are the declared bounds, so a
+// below-the-low-bound index reads as the negative it is. `flags` is a mask:
+// bit 0 set = write, clear = read; bit 1 set = the index carried x/z bits, in
+// which case `index` means nothing and is reported as x. `now` is the
+// simulation time in design ticks.
+//
+// Repeats are capped per access site: a bad index inside an always block
+// re-fires on every activation, and the first reports carry all the
+// information the rest would bury.
+void rt_bounds_report(const char* where, const char* name, int32_t index, int32_t left,
+                      int32_t right, uint32_t flags, uint64_t now);
+
 // Drive one simulation: run `drain` (the event loop), then `finals` (the
 // `final` blocks, LRM 9.2.3). `drain` returns normally whether it ran out of
 // work or a $finish stopped it, so the finals run on both paths.

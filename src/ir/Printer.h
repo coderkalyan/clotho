@@ -6,7 +6,6 @@
 // block for their nested bodies. Intended for tests and human inspection only;
 // the format is not stable and not parsed back.
 
-#include <functional>
 #include <ostream>
 #include <string>
 
@@ -14,16 +13,6 @@
 #include "Module.h"
 
 namespace clotho::ir {
-
-// Optional hook turning a SourceLoc into display text.
-//
-// The IR core cannot decode a SourceLoc itself: the (buffer, offset) mapping lives
-// in the slang-aware frontend, and keeping this library free of slang is the point
-// of the clotho_ir_core / clotho split. So a caller that wants located output
-// passes a resolver (in practice `SourceContext::render`). Default-constructed
-// means "print no locations", which is what tests want — golden IR text must not
-// depend on file paths.
-using LocResolver = std::function<std::string(SourceLoc)>;
 
 // Render the whole IR (root region, descending into nested regions) to `os`.
 void print(const Ir& ir, std::ostream& os);

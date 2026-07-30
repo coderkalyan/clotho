@@ -26,6 +26,7 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -65,6 +66,16 @@ struct SourceSpan {
         return start != SourceLoc{ 0 };
     }
 };
+
+// Optional hook turning a SourceLoc into display text.
+//
+// The IR core cannot decode a SourceLoc itself: the (buffer, offset) mapping
+// lives in the slang-aware frontend, and keeping this library free of slang is
+// the point of the clotho_ir_core / clotho split. So a caller that wants
+// located output passes a resolver (in practice `SourceContext::render`).
+// Default-constructed means "no locations available", which is what tests want
+// -- golden IR text must not depend on file paths.
+using LocResolver = std::function<std::string(SourceLoc)>;
 
 // Opaque handle to a module signal (net / variable / port). Resolved by the
 // enclosing module; the process IR never interprets it.

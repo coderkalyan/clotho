@@ -254,6 +254,28 @@ constexpr code bxnor4(code a, code b) {
 constexpr uint32_t BXNOR1_LUT = build_lut(bxnor4);
 static_assert(BXNOR1_LUT == EQ1_LUT, "1-bit xnor must equal 1-bit ==");
 
+// One pending `--sanitize=bounds` check: an unpacked-array dimension whose
+// runtime index the backend could not prove inside the declared bounds.
+// Recorded where the element lvalue is built -- the only place that knows the
+// array's identity and bounds -- and reported where the access finally
+// happens, which is the only place that knows whether it is a read or a write.
+struct BoundsCheck {
+    // i1: this dimension's index landed inside the declared bounds. Literally
+    // the predicate the LRM behaviour is built from, so the report can never
+    // disagree with what the access then does.
+    llvm::Value* inrange = nullptr;
+    // i32: the index as the design wrote it, in declared-range coordinates.
+    llvm::Value* index = nullptr;
+    // i1: the index carried x/z bits, which makes `index` meaningless.
+    llvm::Value* unknown = nullptr;
+    // ptr: static "<file>:<line>:<col>" and array-name strings for the report.
+    llvm::Value* where = nullptr;
+    llvm::Value* name  = nullptr;
+    // The declared bounds [left:right], as written.
+    int32_t left  = 0;
+    int32_t right = 0;
+};
+
 // A resolved assignment target: a `{ i(2W) must|may, iW z }` slot somewhere in
 // typed storage (the module state struct for a signal, or the per-call frame
 // struct for a function local) plus a bit offset / width selecting part of it.
@@ -325,6 +347,12 @@ struct LValue {
     // of range and a write is suppressed out of range, so the heap buffer is
     // never accessed past its length.
     llvm::Value* dyn_inrange = nullptr;
+    // Pending `--sanitize=bounds` reports, one per runtime array index taken on
+    // the way to this element. Always empty unless the sanitizer is on, so an
+    // unsanitized build emits byte-identical code. Drained by the load / store
+    // lowering into rt_bounds_report calls; purely a report channel, the LRM's
+    // own out-of-range behaviour stays driven by `dyn_inrange` above.
+    std::vector<BoundsCheck> bounds_checks;
     // An associative-array element target (LRM 7.8/7.9). Unlike dyn/queue the
     // element pointer is not yet resolved: the get_ptr (read) vs put_ptr (write)
     // choice depends on Load/Store context, so it is deferred. `assoc_handle` is
@@ -613,13 +641,15 @@ struct ModuleEnv {
 // are reset each time).
 class Backend {
 public:
-    Backend(const Module& mod, llvm::LLVMContext& ctx, llvm::Module& llmod, const SimulationConfig& config)
+    Backend(const Module& mod, llvm::LLVMContext& ctx, llvm::Module& llmod, const SimulationConfig& config,
+            const LocResolver& resolve)
       : mod_(mod)
       , ctx_(ctx)
       , root_env_(std::make_unique<ModuleEnv>(llmod))
       , env_(root_env_.get())
       , b_(ctx)
-      , config_(config) {}
+      , config_(config)
+      , resolve_(resolve) {}
 
     // Definition-unit modules created by the split emission (lower_group loop),
     // in creation order. The caller links them alongside the root module.
@@ -8635,6 +8665,25 @@ private:
                     b_.CreateAnd(b_.CreateICmpULT(norm, b_.getInt32(count)), b_.CreateNot(any_unknown(idxp)));
                 lv.dyn_inrange = lv.dyn_inrange != nullptr ? b_.CreateAnd(lv.dyn_inrange, inrange)
                                                            : inrange;
+                if (sanitizer_on(config_.sanitizers, Sanitizer::Bounds)) {
+                    // --sanitize=bounds: keep this dimension's verdict, the index
+                    // the design wrote, and who was indexed. Not reported here --
+                    // a select is not yet a read or a write, and the direction is
+                    // half the report. The strings are materialized once per site
+                    // and their addresses key the runtime's per-site repeat cap.
+                    lv.bounds_checks.push_back(BoundsCheck{
+                      .inrange = inrange,
+                      .index   = idx,
+                      .unknown = any_unknown(idxp),
+                      .where   = b_.CreateGlobalString(loc_text(i), "bounds.at"),
+                      // A local / formal array has no name in the backend (frame
+                      // slots carry none), so it reports as what it is.
+                      .name  = b_.CreateGlobalString(
+                        lv.is_signal ? mod_.signal(lv.sig).name : std::string("<local>"), "bounds.of"),
+                      .left  = static_cast<int32_t>(at.left),
+                      .right = static_cast<int32_t>(at.right),
+                    });
+                }
                 if (lv.is_agg) {
                     // Recursive storage is one ArrayType per dimension (not
                     // flattened): push a nested-GEP index step. A runtime element
@@ -10084,6 +10133,7 @@ private:
     // the same Plane shape lower_load would (narrow -> two_val; else { i2W, iW }),
     // so the caller's real / domain handling is unchanged.
     Plane dyn_elem_load(const LValue& lv) {
+        emit_bounds_reports(lv, /*is_write=*/false);
         auto* fn    = b_.GetInsertBlock()->getParent();
         auto* inbb  = llvm::BasicBlock::Create(ctx_, "dyn.load.in", fn);
         auto* defbb = llvm::BasicBlock::Create(ctx_, "dyn.load.def", fn);
@@ -10093,6 +10143,7 @@ private:
         b_.SetInsertPoint(inbb);
         LValue clean       = lv;
         clean.dyn_inrange  = nullptr;
+        clean.bounds_checks.clear();
         const Plane vin    = lower_load(clean);
         auto*       inend  = b_.GetInsertBlock();
         b_.CreateBr(cont);
@@ -10120,6 +10171,7 @@ private:
     // its wait-queue servicing run only when the index is in [0, len); an
     // out-of-range write is a no-op.
     void dyn_elem_store(const LValue& lv, Plane rhs) {
+        emit_bounds_reports(lv, /*is_write=*/true);
         auto* fn   = b_.GetInsertBlock()->getParent();
         auto* dobb = llvm::BasicBlock::Create(ctx_, "dyn.store.do", fn);
         auto* cont = llvm::BasicBlock::Create(ctx_, "dyn.store.cont", fn);
@@ -10128,6 +10180,7 @@ private:
         b_.SetInsertPoint(dobb);
         LValue clean              = lv;
         clean.dyn_inrange         = nullptr;
+        clean.bounds_checks.clear();
         const ServiceSnapshot old = service_snapshot(clean);
         lower_store(clean, rhs);
         service_after_write(clean, old);
@@ -11104,6 +11157,7 @@ private:
             // staged at all -- lv_mm_ptr(lv) below would otherwise compute an
             // out-of-bounds destination pointer that the NBA region later
             // dereferences unconditionally when replaying the record.
+            emit_bounds_reports(lv, /*is_write=*/true);
             auto* fn   = b_.GetInsertBlock()->getParent();
             auto* dobb = llvm::BasicBlock::Create(ctx_, "arrnba.do", fn);
             auto* cont = llvm::BasicBlock::Create(ctx_, "arrnba.cont", fn);
@@ -11112,6 +11166,7 @@ private:
             b_.SetInsertPoint(dobb);
             LValue clean      = lv;
             clean.dyn_inrange = nullptr;
+            clean.bounds_checks.clear();
             emit_array_nba(clean, rhs);
             b_.CreateBr(cont);
 
@@ -11852,6 +11907,58 @@ private:
                                   : static_cast<llvm::Value*>(b_.getInt64(0));
         b_.CreateCall(observed_case_violation_fn(),
                       { b_.CreateGlobalString(banner), now, b_.getInt32(info.kind) });
+    }
+
+    // "<file>:<line>:<col>" for an instruction, for a sanitizer report baked
+    // into the emitted code. A caller with no SourceContext (the tests) leaves
+    // the resolver empty and gets "<unknown>" rather than a blank, so a report
+    // is never silently unattributed.
+    std::string loc_text(Index i) const {
+        return resolve_ ? resolve_(ir_->loc(i)) : std::string("<unknown>");
+    }
+
+    // void rt_bounds_report(ptr where, ptr name, i32 index, i32 left, i32 right,
+    //                       i32 flags, i64 now) — writes one warning to stderr
+    // and returns; see Runtime.h for the flag bits.
+    llvm::FunctionCallee bounds_report_fn() {
+        auto* i32 = b_.getInt32Ty();
+        return rt_fn("rt_bounds_report", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32, i32, b_.getInt64Ty() });
+    }
+
+    // Drain `lv`'s pending --sanitize=bounds checks: one branch each on the
+    // in-range predicate the access itself already uses, into a cold block that
+    // reports and falls through. Emitted BEFORE the access, so the report fires
+    // whether or not the LRM then lets the access proceed (an out-of-range read
+    // still yields the element default, an out-of-range write is still dropped).
+    // No check exists unless the sanitizer is on, so this is a no-op otherwise
+    // and the emitted code is unchanged. The wheel fallback mirrors
+    // lower_case_viol: an access inside a pure function has no wheel and
+    // reports time 0.
+    void emit_bounds_reports(const LValue& lv, bool is_write) {
+        if (lv.bounds_checks.empty()) {
+            return;
+        }
+        auto* fn = b_.GetInsertBlock()->getParent();
+        for (const BoundsCheck& bc : lv.bounds_checks) {
+            auto* bad  = llvm::BasicBlock::Create(ctx_, "bounds.bad", fn);
+            auto* cont = llvm::BasicBlock::Create(ctx_, "bounds.ok", fn);
+            b_.CreateCondBr(bc.inrange, cont, bad);
+
+            b_.SetInsertPoint(bad);
+            // bit 0 = write, bit 1 = the index carried x/z.
+            llvm::Value* flags = b_.CreateOr(
+              b_.getInt32(is_write ? 1 : 0),
+              b_.CreateShl(b_.CreateZExt(bc.unknown, b_.getInt32Ty()), b_.getInt32(1)));
+            llvm::Value* now = has_wheel()
+                                 ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
+                                 : static_cast<llvm::Value*>(b_.getInt64(0));
+            b_.CreateCall(bounds_report_fn(), { bc.where, bc.name, bc.index, b_.getInt32(bc.left),
+                                                b_.getInt32(bc.right), flags, now });
+            b_.CreateBr(cont);
+
+            b_.SetInsertPoint(cont);
+        }
     }
 
     // void rt_severity(i32 level, ptr banner, ptr fmt, i32 argc, ptr argv) —
@@ -16138,6 +16245,9 @@ private:
     bool                    lowering_preinit_ = false;
     // Compile/simulation knobs (z elision, ...); see SimConfig.h.
     SimulationConfig        config_;
+    // Renders a SourceLoc for a sanitizer report baked into the emitted code.
+    // Empty for a caller with no SourceContext (the tests); see loc_text.
+    const LocResolver&      resolve_;
     llvm::Value*            frame_       = nullptr;
     std::vector<FrameSlot>  frame_slots_;
     // Per-ref-formal actual pointer, indexed by Local index; null for non-ref
@@ -16471,7 +16581,7 @@ bool optimize_module(llvm::Module& m, bool o3) {
 }
 
 BuiltDesign build_modules_unoptimized(const Module& m, llvm::LLVMContext& ctx,
-                                      const SimulationConfig& config) {
+                                      const SimulationConfig& config, const LocResolver& resolve) {
     auto root = std::make_unique<llvm::Module>(m.name.empty() ? "clotho" : m.name, ctx);
 
     // Pin the modules to the host target's triple and DataLayout before any IR
@@ -16500,7 +16610,7 @@ BuiltDesign build_modules_unoptimized(const Module& m, llvm::LLVMContext& ctx,
 
     BuiltDesign built;
     try {
-        Backend be(m, ctx, *root, config);
+        Backend be(m, ctx, *root, config, resolve);
         be.run();
         built.modules = be.take_unit_modules();
     } catch (const BackendError& e) {
@@ -16521,9 +16631,9 @@ BuiltDesign build_modules_unoptimized(const Module& m, llvm::LLVMContext& ctx,
     return built;
 }
 
-BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx,
-                          const SimulationConfig& config) {
-    auto built = build_modules_unoptimized(m, ctx, config);
+BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx, const SimulationConfig& config,
+                          const LocResolver& resolve) {
+    auto built = build_modules_unoptimized(m, ctx, config, resolve);
     if (built.modules.empty()) {
         return {};
     }
@@ -16543,10 +16653,11 @@ BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx,
     return built;
 }
 
-bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config, Timings* timings) {
+bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config,
+               Timings* timings, const LocResolver& resolve) {
     const auto        t_llvm = std::chrono::steady_clock::now();
     llvm::LLVMContext ctx;
-    auto              built = build_modules(m, ctx, config);
+    auto              built = build_modules(m, ctx, config, resolve);
     if (built.modules.empty()) {
         return false;
     }

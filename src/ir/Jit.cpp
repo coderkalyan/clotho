@@ -73,7 +73,7 @@ void ensure_native_target() {
 } // namespace
 
 int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
-           std::span<const std::string_view> plusargs) {
+           std::span<const std::string_view> plusargs, const LocResolver& resolve) {
     ensure_native_target();
 
     // LLVM compile phase: build the module (IR gen + coroutine/opt passes), then
@@ -97,7 +97,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     SimulationConfig jit_config = config;
     jit_config.lower_coro       = true;
     const bool stat             = stat_on(config.stats, Stat::Parallel);
-    auto       built            = build_modules_unoptimized(m, *ctx, jit_config);
+    auto       built            = build_modules_unoptimized(m, *ctx, jit_config, resolve);
     if (built.modules.empty()) {
         return -1; // build_modules_unoptimized already reported the reason.
     }
@@ -211,6 +211,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_oscillation_abort", &rt_oscillation_abort);
     expose("rt_queue_assign_dynarr", &rt_queue_assign_dynarr);
     expose("rt_severity", &rt_severity);
+    expose("rt_bounds_report", &rt_bounds_report);
     expose("rt_sim_run", &rt_sim_run);
     expose("rt_fflush", &rt_fflush);
     expose("rt_readmem", &rt_readmem);

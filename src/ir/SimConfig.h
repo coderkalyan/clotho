@@ -60,9 +60,20 @@ enum class Sanitizer : uint32_t {
     XProv = 1u << 0,
     // Report an array index that misses its declared bounds. The LRM makes
     // this silent (7.4.6 / 11.5.1: an out-of-range read yields the element
-    // default, an out-of-range write is dropped), and the backend already
-    // computes the predicate that decides it -- `dyn_inrange` on the lvalue.
-    // The check is that predicate, reported instead of discarded.
+    // default, an out-of-range write is dropped, and Table 7-1 counts an x/z
+    // index as out of range), and the backend already computes the predicate
+    // that decides it -- `dyn_inrange` on the lvalue. The check IS that
+    // predicate, reported through rt_bounds_report instead of discarded, so it
+    // cannot disagree with what the access then does.
+    //
+    // Covers fixed-size unpacked-array element access today: blocking read,
+    // blocking write, and nonblocking write. Still to come -- string elements
+    // (they bypass the shared element load/store), aggregate-leaf nonblocking
+    // writes, whole-object copies, and packed bit/part selects, which are
+    // bounded by `range_mask` rather than `dyn_inrange`. Dynamic arrays and
+    // queues share `dyn_inrange` but are deliberately NOT reported: their
+    // bound is a runtime length, not a declared range, and an absent
+    // associative-array key is legal lookup, not a bug.
     Bounds = 1u << 1,
 };
 

@@ -212,11 +212,12 @@ void report_timings(const clotho::Timings& t, Command command) {
 bool write_artifact(const clotho::LowerResult& result, Emit emit, std::string_view out,
                     const SimulationConfig& config, clotho::Timings* timings) {
     const bool to_stdout = out == "-";
+    // Locations are resolvable because lowering hands back the SourceManager. An
+    // IR dump you cannot map to source is much less useful when debugging a
+    // lowering problem, and a sanitizer report with no file:line is barely a
+    // report at all.
+    const auto resolve = [&](clotho::ir::SourceLoc l) { return result.sources->render(l); };
     if (emit == Emit::Ir) {
-        // Locations are resolvable because lowering hands back the SourceManager;
-        // an IR dump you cannot map to source is much less useful when debugging
-        // a lowering problem.
-        const auto resolve = [&](clotho::ir::SourceLoc l) { return result.sources->render(l); };
         if (to_stdout) {
             clotho::ir::print_module(*result.module, std::cout, resolve);
             return true;
@@ -230,7 +231,7 @@ bool write_artifact(const clotho::LowerResult& result, Emit emit, std::string_vi
         return true;
     }
     if (to_stdout) {
-        return clotho::ir::emit_llvm(*result.module, llvm::outs(), config, timings);
+        return clotho::ir::emit_llvm(*result.module, llvm::outs(), config, timings, resolve);
     }
     std::error_code      ec;
     llvm::raw_fd_ostream os(out, ec);
@@ -238,7 +239,7 @@ bool write_artifact(const clotho::LowerResult& result, Emit emit, std::string_vi
         std::println(stderr, "clotho: cannot open '{}': {}", out, ec.message());
         return false;
     }
-    return clotho::ir::emit_llvm(*result.module, os, config, timings);
+    return clotho::ir::emit_llvm(*result.module, os, config, timings, resolve);
 }
 
 } // namespace
@@ -366,11 +367,12 @@ int main(int argc, char** argv) {
                                            name));
         }
     }
-    // TODO(xsan): both bits are parsed and carried in SimulationConfig, but no
-    // backend pass reads either yet, so `--sanitize` is currently accepted and
-    // instruments nothing. Unguarded on purpose while the sanitizers are built
-    // out incrementally (the project's partial-feature exception); the guard
-    // disappears as each check lands, not the TODO.
+    // TODO(xsan): `xprov` is parsed and carried in SimulationConfig, but no
+    // backend pass reads that bit yet, so `--sanitize=xprov` is accepted and
+    // instruments nothing. Unguarded on purpose while xsan is built out
+    // incrementally (the project's partial-feature exception); the guard
+    // disappears when the instrumentation lands, not the TODO. `bounds` is
+    // live (SimConfig.h names what it does and does not cover yet).
     for (const std::string& name : options.sanitizers) {
         if (name == "bounds") {
             config.sanitizers |= static_cast<uint32_t>(Sanitizer::Bounds);
@@ -445,7 +447,8 @@ int main(int argc, char** argv) {
     }
 
     if (command == Command::Run) {
-        const int rc = clotho::ir::run_jit(*result.module, tp, config, plusargs);
+        const auto resolve = [&](clotho::ir::SourceLoc l) { return result.sources->render(l); };
+        const int  rc      = clotho::ir::run_jit(*result.module, tp, config, plusargs, resolve);
         // run_jit returns a negative sentinel on setup failure; the design's own
         // status passes through unchanged.
         status = rc < 0 ? 1 : rc;

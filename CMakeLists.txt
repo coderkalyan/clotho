@@ -131,8 +131,8 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(unordered_dense)
 
-# Simulation runtime: native support routines the JIT'd design calls into.
-# Deliberately depends on nothing (no LLVM, no slang) — plain native code. The
+# Simulation runtime: native support routines the JIT'd design calls into. No
+# LLVM and no slang — plain native code, so it stays linkable on its own. The
 # timing wheel is part of this surface: the runtime exposes it behind a C ABI.
 add_library(clotho_runtime STATIC
   src/runtime/Runtime.cpp
@@ -140,10 +140,13 @@ add_library(clotho_runtime STATIC
   src/Wheel.cpp
 )
 target_include_directories(clotho_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-# unordered_dense is header-only (INTERFACE): the runtime uses ankerl's map for
-# associative-array storage (LRM 7.8/7.9). This adds only its include dir, not a
-# link dependency, keeping the runtime otherwise dependency-free.
-target_link_libraries(clotho_runtime PRIVATE clotho_warnings unordered_dense::unordered_dense)
+# unordered_dense is header-only (INTERFACE), so it adds only an include dir:
+# the runtime uses ankerl's map for associative-array storage (LRM 7.8/7.9) and
+# for sanitizer per-site bookkeeping. fmt is a real link edge, for diagnostic
+# formatting (rt_bounds_report); it arrives with slang's FetchContent, so it is
+# already in every clotho link.
+target_link_libraries(clotho_runtime PRIVATE clotho_warnings unordered_dense::unordered_dense
+                                             fmt::fmt)
 if(WIN32)
   # $finish(2)'s resource line has no getrusage here; it reads peak working set
   # through GetProcessMemoryInfo (psapi).
