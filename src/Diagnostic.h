@@ -56,6 +56,13 @@ enum class DiagnosticOrigin : uint8_t {
     // Clotho refuses the construct on purpose (a security gate, an unsupported
     // combination), as opposed to not having got to it yet.
     Rejected,
+    // A finding from Clotho's own analysis rather than a limitation of it: the
+    // code is legal, implemented, and simulates -- Clotho has just proved
+    // something about it the author probably did not intend. Distinct from
+    // Frontend because the severity policy for these differs sharply by
+    // consumer: a synthesis mode wants a mismatch risk to be an error, a linter
+    // a warning, and a simulation run does not care at all.
+    Analysis,
     // Something outside the design: an unreadable file, a bad command line.
     Driver,
 };

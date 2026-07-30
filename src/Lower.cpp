@@ -36,6 +36,7 @@
 #include <slang/ast/statements/ConditionalStatements.h>
 #include <slang/ast/statements/LoopStatements.h>
 #include <slang/ast/statements/MiscStatements.h>
+#include <slang/ast/symbols/AttributeSymbol.h>
 #include <slang/ast/symbols/BlockSymbols.h>
 #include <slang/ast/symbols/ClassSymbols.h>
 #include <slang/ast/symbols/CompilationUnitSymbols.h>
@@ -1077,6 +1078,23 @@ private:
 
     [[nodiscard]] slang::SourceLocation cur_loc() const {
         return cur_range_.start();
+    }
+
+    // Record a non-fatal finding. Shares the channel `recover` fills, so a
+    // consumer sees analysis findings and recovered failures in walk order,
+    // interleaved as encountered rather than sorted into two groups.
+    //
+    // Severity is fixed at the call site for now. The three severity policies of
+    // design §3.4 (simulation / synthesis / lint) are the mechanism that will
+    // re-rank these per consumer, and `DiagnosticOrigin::Analysis` is the field
+    // they will key on -- a mismatch risk should be an error in a synthesis run
+    // and a warning in a linter, without touching Clotho's own hard limits.
+    void report(Severity sev, std::string code, std::string msg, ir::SourceSpan span) {
+        diags_.push_back(Diagnostic{ .severity = sev,
+                                     .origin   = DiagnosticOrigin::Analysis,
+                                     .code     = std::move(code),
+                                     .message  = std::move(msg),
+                                     .span     = span });
     }
 
     [[noreturn]] void fail(std::string msg) {
@@ -6529,6 +6547,174 @@ private:
         bool     four;
     };
 
+    // `(* full_case *)` / `(* parallel_case *)`: a designer claim about the case
+    // that Clotho can test, because it has the item values and the LRM's matching
+    // rules in hand.
+    //
+    // These pragmas exist only to tell a synthesiser something the simulator
+    // cannot see, which is exactly why they cause RTL-vs-netlist mismatch, and
+    // Cummings' sharpest observation about them is that the divergence tracks the
+    // optimisation benefit: "The full_case and parallel_case directives are
+    // always most dangerous when they work!" So a lie here is a real defect, not
+    // a style opinion, and it is silent in simulation, this simulator included.
+    //
+    // Deliberately checked against a 2-state fullness rule rather than the
+    // simulation one: a full_case claim speaks about the hardware, where x and z are
+    // not values, so only 2-state values count toward covering the selector and an
+    // item's x/z bits count for nothing. So an item carrying x/z
+    // contributes NOTHING to coverage under `case`, which is what makes an
+    // all-x default no help to fullness.
+    //
+    // Only ever reports what it can prove. A non-constant item, an
+    // undecidably-wide selector or `case ... inside` all yield silence, never a
+    // guess -- the whole value of this check is that a finding is trustworthy.
+    void check_case_pragmas(const CaseStatement& c) {
+        if (scope_ == nullptr) {
+            return;
+        }
+        // Attribute lookup first: almost no case carries these, and bailing here
+        // keeps the coverage expansion off the common path entirely.
+        bool want_full     = false;
+        bool want_parallel = false;
+        for (const slang::ast::AttributeSymbol* a : scope_->getCompilation().getAttributes(c)) {
+            // An attribute with no value means 1 (LRM 5.12), so `(* full_case *)`
+            // and `(* full_case = 1 *)` are the same claim -- and `= 0` withdraws
+            // it, which must not be reported against.
+            if (!a->getValue().isTrue()) {
+                continue;
+            }
+            if (a->name == "full_case") {
+                want_full = true;
+            } else if (a->name == "parallel_case") {
+                want_parallel = true;
+            }
+        }
+        if (!want_full && !want_parallel) {
+            return;
+        }
+        // `inside` matching admits ranges and set membership, whose coverage is a
+        // different computation; not attempted rather than approximated.
+        if (c.condition == CaseStatementCondition::Inside) {
+            return;
+        }
+        if (!c.expr.type->isIntegral()) {
+            return;
+        }
+        uint32_t width = c.expr.type->getBitWidth();
+        for (const CaseStatement::ItemGroup& item : c.items) {
+            for (const Expression* e : item.expressions) {
+                if (!e->type->isIntegral()) {
+                    return;
+                }
+                width = std::max(width, e->type->getBitWidth());
+            }
+        }
+        // The value space is enumerated directly, so cap it. 16 bits is 65536
+        // patterns, which covers the selectors these pragmas actually appear on
+        // (state registers, one-hot vectors, opcode fields); a wider one is
+        // reported on by nothing rather than approximated.
+        constexpr uint32_t max_width = 16;
+        if (width == 0 || width > max_width) {
+            return;
+        }
+        const size_t space = size_t{ 1 } << width;
+
+        // Per value: how many items match it. Saturated at 2 -- the only
+        // questions are "none" (not full) and "more than one" (not parallel).
+        std::vector<uint8_t>    hits(space, 0);
+        slang::ast::ASTContext  actx(*scope_, slang::ast::LookupLocation::max);
+        slang::ast::EvalContext ectx(actx);
+
+        for (const CaseStatement::ItemGroup& item : c.items) {
+            for (const Expression* e : item.expressions) {
+                const slang::ConstantValue cv = e->eval(ectx);
+                if (cv.bad() || !cv.isInteger()) {
+                    return; // Not decidable; say nothing.
+                }
+                const slang::SVInt v = cv.integer().resize(width);
+                // Which bit positions this label leaves free. casez treats z (and
+                // `?`) as don't-care, casex treats x as well; plain case treats
+                // neither -- and an x/z bit there makes the label unmatchable by
+                // the 2-state rule, so it covers nothing.
+                std::vector<uint32_t> wild;
+                bool                  dead = false;
+                for (uint32_t bit = 0; bit < width; ++bit) {
+                    const slang::logic_t l = v[static_cast<int32_t>(bit)];
+                    if (!l.isUnknown()) {
+                        continue;
+                    }
+                    const bool is_z = l.value == slang::logic_t::z.value;
+                    switch (c.condition) {
+                        case CaseStatementCondition::WildcardXOrZ:
+                            wild.push_back(bit);
+                            break;
+                        case CaseStatementCondition::WildcardJustZ:
+                            if (is_z) {
+                                wild.push_back(bit);
+                            } else {
+                                dead = true;
+                            }
+                            break;
+                        default:
+                            dead = true;
+                            break;
+                    }
+                }
+                if (dead) {
+                    continue;
+                }
+                // Base pattern with every wildcard bit cleared, then every
+                // assignment of the wildcards enumerated over it.
+                size_t base = 0;
+                for (uint32_t bit = 0; bit < width; ++bit) {
+                    const slang::logic_t l = v[static_cast<int32_t>(bit)];
+                    if (!l.isUnknown() && l.value != 0) {
+                        base |= size_t{ 1 } << bit;
+                    }
+                }
+                const size_t combos = size_t{ 1 } << wild.size();
+                for (size_t k = 0; k < combos; ++k) {
+                    size_t value = base;
+                    for (size_t w = 0; w < wild.size(); ++w) {
+                        if ((k >> w) & 1U) {
+                            value |= size_t{ 1 } << wild[w];
+                        }
+                    }
+                    if (hits[value] < 2) {
+                        ++hits[value];
+                    }
+                }
+            }
+        }
+
+        size_t uncovered  = 0;
+        size_t overlapped = 0;
+        for (const uint8_t h : hits) {
+            uncovered += h == 0 ? 1 : 0;
+            overlapped += h > 1 ? 1 : 0;
+        }
+
+        // A default arm makes the case full by construction, so `full_case` is
+        // merely redundant there rather than untrue -- nothing to report.
+        if (want_full && c.defaultCase == nullptr && uncovered != 0) {
+            report(Severity::Warning,
+                   "full-case-not-full",
+                   "(* full_case *) on a case that is not full: " + std::to_string(uncovered) + " of " +
+                     std::to_string(space) +
+                     " selector values match no item, so synthesis may implement them as don't-care while "
+                     "simulation holds the previous value",
+                   to_source_span(c.sourceRange));
+        }
+        if (want_parallel && overlapped != 0) {
+            report(Severity::Warning,
+                   "parallel-case-overlap",
+                   "(* parallel_case *) on a case with overlapping items: " + std::to_string(overlapped) +
+                     " selector values match more than one item, so synthesis may drop the priority "
+                     "simulation gives them",
+                   to_source_span(c.sourceRange));
+        }
+    }
+
     // The width/state/signedness all case_expressions are compared at: the
     // longest of the selector and every item label, four-state if any operand is,
     // signed only if all are (IEEE 1800-2023 12.5).
@@ -7138,6 +7324,7 @@ private:
             lower_case_inside(c, b);
             return;
         }
+        check_case_pragmas(c);
         ir::Inst::Tag cmp;
         switch (c.condition) {
             case CaseStatementCondition::Normal:
