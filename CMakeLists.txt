@@ -11,21 +11,36 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
 
-# Warnings apply to clotho targets only, not fetched dependencies.
+# Warnings apply to clotho targets only, not fetched dependencies. The flags are
+# GCC/Clang spelling; a cl-style driver (MSVC, or clang-cl) takes the /-forms.
+# Note clotho cannot be built by MSVC proper regardless — the runtime's wide
+# arithmetic uses `unsigned __int128`, which only GCC and Clang provide — so the
+# cl-style branch exists for clang-cl.
 add_library(clotho_warnings INTERFACE)
-target_compile_options(clotho_warnings INTERFACE
-  -Wall -Wextra
-  # Omitted aggregate members value-initialize; flagging them fights the
-  # designated-initializer style used throughout.
-  -Wno-missing-field-initializers
-  # The IR layer's correctness story for adding ops rests on exhaustive
-  # switches over Inst::Tag in several consumers; a silently non-exhaustive
-  # switch is a miscompile factory, so promote it to an error.
-  -Werror=switch
-)
+if(MSVC)
+  target_compile_options(clotho_warnings INTERFACE
+    /W4
+    # See the -Werror=switch rationale below.
+    /we4062
+  )
+else()
+  target_compile_options(clotho_warnings INTERFACE
+    -Wall -Wextra
+    # Omitted aggregate members value-initialize; flagging them fights the
+    # designated-initializer style used throughout.
+    -Wno-missing-field-initializers
+    # The IR layer's correctness story for adding ops rests on exhaustive
+    # switches over Inst::Tag in several consumers; a silently non-exhaustive
+    # switch is a miscompile factory, so promote it to an error.
+    -Werror=switch
+  )
+endif()
 
 option(CLOTHO_SANITIZE "Build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
 if(CLOTHO_SANITIZE)
+  if(MSVC)
+    message(FATAL_ERROR "CLOTHO_SANITIZE requires a GCC/Clang driver")
+  endif()
   add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
   add_link_options(-fsanitize=address,undefined)
 endif()
@@ -46,29 +61,35 @@ else()
   llvm_map_components_to_libnames(LLVM_LIBS core support orcjit jitlink native bitwriter bitreader)
 endif()
 
-# fmt, pinned here rather than left to slang. slang declares fmt with
-# `FIND_PACKAGE_ARGS 12.1`, which makes FetchContent prefer ANY system fmt >= 12.1
-# over the 12.1.0 it pins -- so the build silently tracks whatever the OS ships.
-# That broke: fmt 12.2.0 made `fmt/core.h` stop including `format.h` unless
-# FMT_DEPRECATED_HEAVY_CORE is defined, and slang's sources still include
-# <fmt/core.h> while calling fmt::format. A system fmt upgrade therefore turned a
-# clean build into a wall of "'format' is not a member of 'fmt'".
-#
-# FetchContent honors the FIRST declaration of a name, so declaring fmt before
-# MakeAvailable(slang) wins over slang's. Deliberately no FIND_PACKAGE_ARGS: the
-# point is to stop consulting the system copy at all, which makes the build
-# reproducible for the one transitive dependency that was still floating free
-# (slang, doctest and unordered_dense are all SHA-pinned below).
-#
-# Only DECLARED here, not made available: slang's external/CMakeLists.txt forces
-# it static and sets FMT_SYSTEM_HEADERS around its own MakeAvailable, and that
-# setup should stay slang's business.
-FetchContent_Declare(
-  fmt
-  GIT_REPOSITORY https://github.com/fmtlib/fmt.git
-  GIT_TAG        407c905e45ad75fc29bf0f9bb7c5c2fd3475976f # 12.1.0, the version slang pins
-  GIT_SHALLOW    ON
-)
+# slang declares fmt with `FIND_PACKAGE_ARGS 12.1`, so FetchContent silently
+# prefers a system fmt over the pinned 12.1.0 it would otherwise fetch. That
+# makes the build depend on whatever the host distro ships: a host fmt that is
+# ABI- or API-divergent from the pin breaks the slang build outright (Arch's
+# 12.1.0 does — `fmt::format` is not visible through the headers slang
+# includes), and it silently varies the toolchain across CI platforms. Force the
+# pinned source build so every host resolves fmt identically.
+set(CMAKE_DISABLE_FIND_PACKAGE_fmt ON)
+
+if(WIN32 AND NOT MSVC)
+  # $finish longjmps out of the middle of a simulation, back to the setjmp in
+  # run_jit, deliberately abandoning the JIT'd coroutine frames it jumps over.
+  # Windows' longjmp is SEH-based: it *unwinds*, which needs valid unwind data
+  # for every frame in between, and JIT'd code registers none — so the unwind
+  # aborts the process instead of returning to the host. mingw-w64 selects the
+  # plain non-unwinding `_setjmp(buf, NULL)` when this is defined, which is the
+  # semantics clotho wants (and what glibc and Darwin already give it). Applied
+  # as a compile definition rather than a #define so it precedes every
+  # transitive <setjmp.h>.
+  add_compile_definitions(__USE_MINGW_SETJMP_NON_APP_CONTEXT)
+endif()
+
+if(WIN32)
+  # slang defaults to mimalloc, whose malloc/free/realloc/_msize overrides
+  # collide with the Windows CRT's own at link time (lld-link reports every one
+  # as a duplicate symbol). It is an allocator speedup, not a dependency of any
+  # slang API clotho uses.
+  set(SLANG_USE_MIMALLOC OFF CACHE BOOL "" FORCE)
+endif()
 
 FetchContent_Declare(
   slang
@@ -79,6 +100,16 @@ FetchContent_Declare(
   GIT_TAG        6933832c97c39976890e5f12b69245f061d60a9a # v10.0-360-g6933832c9
 )
 FetchContent_MakeAvailable(slang)
+
+if(WIN32)
+  # slang pins its own build to C++20 while clotho is C++23. That is normally
+  # harmless, but expected-lite (which backs slang's nonstd::expected) forwards
+  # to std::expected exactly when <expected> is available — C++23 on the MSVC
+  # STL. So slang compiles SyntaxTree::fromFile returning its own expected type
+  # while clotho calls one returning std::expected, and the link fails on the
+  # mangled mismatch. Build slang at clotho's standard so both agree.
+  set_target_properties(slang_slang PROPERTIES CXX_STANDARD 23)
+endif()
 
 # Header-only: SOURCE_SUBDIR none skips doctest's own CMakeLists (its
 # cmake_minimum_required predates CMake 4) and just populates the source.
@@ -113,6 +144,30 @@ target_include_directories(clotho_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src
 # associative-array storage (LRM 7.8/7.9). This adds only its include dir, not a
 # link dependency, keeping the runtime otherwise dependency-free.
 target_link_libraries(clotho_runtime PRIVATE clotho_warnings unordered_dense::unordered_dense)
+if(WIN32)
+  # $finish(2)'s resource line has no getrusage here; it reads peak working set
+  # through GetProcessMemoryInfo (psapi).
+  target_link_libraries(clotho_runtime PRIVATE psapi)
+
+  # The runtime's wide arithmetic is `unsigned __int128`, whose division lowers
+  # to compiler-rt's __udivti3 / __umodti3. The MSVC CRT has no such routines
+  # and clang-cl does not link compiler-rt's builtins by default, so name the
+  # archive that ships alongside the compiler. A MinGW-w64 clang links its own
+  # builtins and needs none of this.
+  if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    get_filename_component(clotho_llvm_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    file(GLOB clotho_crt_builtins
+         "${clotho_llvm_bin}/../lib/clang/*/lib/windows/clang_rt.builtins-*.lib")
+    if(clotho_crt_builtins)
+      list(GET clotho_crt_builtins 0 clotho_crt_builtin)
+      message(STATUS "compiler-rt builtins: ${clotho_crt_builtin}")
+      target_link_libraries(clotho_runtime PUBLIC "${clotho_crt_builtin}")
+    else()
+      message(WARNING "compiler-rt builtins not found under ${clotho_llvm_bin}/../lib/clang; "
+                      "128-bit arithmetic will not link")
+    endif()
+  endif()
+endif()
 # Always optimize the runtime, even in a Debug build. It is stable native code
 # the JIT'd design calls into on every event; at -O0 its trivial leaf functions
 # (unwrap, WheelImpl accessors) stop inlining and the timing wheel reads as pure
@@ -121,7 +176,10 @@ target_link_libraries(clotho_runtime PRIVATE clotho_warnings unordered_dense::un
 # there (asserts stay live — NDEBUG is not forced, so the runtime keeps its
 # safety checks). Release / RelWithDebInfo already optimize; the genex leaves
 # them untouched.
-target_compile_options(clotho_runtime PRIVATE $<$<CONFIG:Debug>:-O3>)
+target_compile_options(clotho_runtime PRIVATE
+  $<$<AND:$<CONFIG:Debug>,$<NOT:$<BOOL:${MSVC}>>>:-O3>
+  $<$<AND:$<CONFIG:Debug>,$<BOOL:${MSVC}>>:/O2>
+)
 
 # IR core: the frozen process IR, its builder, intern pool, printer and
 # whole-design analyses. Free of LLVM, slang AND the runtime at source level —
@@ -171,6 +229,17 @@ target_link_libraries(clotho PRIVATE clotho_warnings)
 # longer re-exports it.
 add_executable(clotho_cli src/main.cpp)
 set_target_properties(clotho_cli PROPERTIES OUTPUT_NAME clotho)
+if(WIN32)
+  # The `clotho` static library archives to clotho.lib, and this executable is
+  # named clotho — so the import library the linker writes beside clotho.exe
+  # takes the same path and clobbers the archive. The next link then resolves
+  # nothing from it (clotho_test fails on exactly the frontend's symbols, while
+  # clotho_ir's resolve). Give the archive its own name; nothing outside the
+  # build refers to it.
+  set_target_properties(clotho PROPERTIES ARCHIVE_OUTPUT_NAME clotho_frontend)
+endif()
+# `clotho` links clotho_ir_core, NOT the code generator, so the CLI names
+# clotho_ir itself — it is the consumer that actually emits and JITs.
 target_link_libraries(clotho_cli PRIVATE clotho clotho_ir clotho_warnings)
 
 # Single doctest executable aggregating every tests/*.cpp.
@@ -241,6 +310,14 @@ target_link_libraries(clotho_test PRIVATE clotho clotho_ir doctest::doctest clot
 # test TUs (extern "C") resolve through the JIT's process-symbol generator
 # (dlsym(RTLD_DEFAULT)), the same path libc/libm DPI imports already use.
 set_target_properties(clotho_test PROPERTIES ENABLE_EXPORTS ON)
+if(WIN32 AND NOT MSVC)
+  # ENABLE_EXPORTS alone exports nothing from a PE executable -- there is no
+  # equivalent of -rdynamic, and the linker only exports what is explicitly
+  # marked. The MinGW linker will export the lot when asked, which is what the
+  # JIT's process-symbol lookup needs to find the DPI-C imports the test TUs
+  # define.
+  target_link_options(clotho_test PRIVATE -Wl,--export-all-symbols)
+endif()
 
 # Register each doctest case as its own CTest test for parallelism and
 # per-case reporting.

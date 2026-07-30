@@ -9,11 +9,10 @@
 #include <string>
 #include <string_view>
 
-#include <unistd.h>
-
 #include <llvm/Support/raw_ostream.h>
 
 #include "Lower.h"
+#include "PosixIo.h"
 #include "ir/Builder.h"
 #include "ir/Jit.h"
 #include "ir/LlvmBackend.h"
@@ -1109,7 +1108,7 @@ TEST_CASE("always @(posedge clk) sensitivity hoisting is unchanged") {
     CHECK(run_capture(src) == "tick 1 at 5\ntick 2 at 15\n");
 }
 
-TEST_CASE("$finish lowers to an rt_finish call with the default level 1") {
+TEST_CASE("$finish in a process lowers to a cooperative rt_finish_coop call") {
     constexpr std::string_view src = R"(
         module m;
             initial begin
@@ -1120,9 +1119,15 @@ TEST_CASE("$finish lowers to an rt_finish call with the default level 1") {
     )";
     const std::string          ir  = emit(src);
 
-    // rt_finish(banner_ptr, now, level); omitted argument defaults to level 1.
-    CHECK(ir.find("@rt_finish(") != std::string::npos);
+    // rt_finish_coop(banner_ptr, now, level); omitted argument defaults to 1.
+    // A process body takes the cooperative form, which returns so the body can
+    // leave through its own epilogue (docs/design/cooperative-finish.md); the
+    // noreturn rt_finish is for sites that cannot yet unwind that way.
+    CHECK(ir.find("@rt_finish_coop(") != std::string::npos);
     CHECK(ir.find(", i32 1)") != std::string::npos);
+    // ...and only that form: the noreturn rt_finish must not appear, or the
+    // body would jump out over its own frame instead of returning through it.
+    CHECK(ir.find("@rt_finish(") == std::string::npos);
 }
 
 TEST_CASE("$stop lowers identically to $finish") {
@@ -1133,7 +1138,7 @@ TEST_CASE("$stop lowers identically to $finish") {
     )";
     const std::string          ir  = emit(src);
 
-    CHECK(ir.find("@rt_finish(") != std::string::npos);
+    CHECK(ir.find("@rt_finish_coop(") != std::string::npos);
 }
 
 TEST_CASE("$finish with a diagnostic-level argument passes the level through") {
@@ -1144,8 +1149,8 @@ TEST_CASE("$finish with a diagnostic-level argument passes the level through") {
     )";
     const std::string          ir  = emit(src);
 
-    // The 0/1/2 level reaches rt_finish as the third argument (here 2).
-    CHECK(ir.find("@rt_finish(") != std::string::npos);
+    // The 0/1/2 level reaches the runtime as the third argument (here 2).
+    CHECK(ir.find("@rt_finish_coop(") != std::string::npos);
     CHECK(ir.find(", i32 2)") != std::string::npos);
 }
 
@@ -1168,6 +1173,28 @@ TEST_CASE("$stop prints its own banner") {
     )";
     const std::string err = run_capture_stderr(src);
     CHECK(err == "source:3: $stop called at 0 s\n");
+}
+
+// Level 2 appends the resource line (LRM Table 20-1). The numbers are host
+// state, so only the shape is pinned — but the shape is what carries the unit
+// normalization: getrusage reports ru_maxrss in kilobytes on Linux and bytes on
+// the BSDs (macOS), and Windows has no getrusage at all, so an unnormalized
+// read would silently misreport by 1024x on one host family and not build on
+// another.
+TEST_CASE("$finish(2) appends a memory and CPU-time line") {
+    constexpr std::string_view src = R"(
+        module m;
+            initial $finish(2);
+        endmodule
+    )";
+    const std::string err = run_capture_stderr(src);
+    CHECK(err.starts_with("source:3: $finish called at 0 s\n  Memory: "));
+    CHECK(err.find(" KB  CPU time: ") != std::string::npos);
+    CHECK(err.ends_with(" seconds\n"));
+    // A live process has a nonzero peak resident set on every supported host;
+    // a zero here means the query failed rather than that memory was free.
+    const size_t mem = err.find("Memory: ") + 8;
+    CHECK(std::stoull(err.substr(mem)) > 0);
 }
 
 // Level 0 prints nothing (LRM Table 20-1).
@@ -2286,8 +2313,10 @@ TEST_CASE("net declaration assignment is continuous") {
 }
 
 // Write `text` to `path` for a $readmem test, replacing any existing file.
+// Binary: a text-mode stream rewrites \n as \r\n on Windows, and these fixtures
+// are compared byte-for-byte against what the design reads back.
 void write_file(const char* path, std::string_view text) {
-    std::FILE* f = std::fopen(path, "w");
+    std::FILE* f = std::fopen(path, "wb");
     REQUIRE(f != nullptr);
     std::fwrite(text.data(), 1, text.size(), f);
     std::fclose(f);

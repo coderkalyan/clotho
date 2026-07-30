@@ -501,7 +501,10 @@ TEST_CASE("lower_files compiles a design split across two files into one design"
         endmodule
     )");
 
-    const std::array<std::string_view, 2> paths{ top.path.native(), child.path.native() };
+    // .string(), not .native(): path::string_type is wstring on Windows.
+    const std::string                     top_path{ top.path.string() };
+    const std::string                     child_path{ child.path.string() };
+    const std::array<std::string_view, 2> paths{ top_path, child_path };
     const LowerResult                     r = lower_files(paths);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(r.module->name == "top");

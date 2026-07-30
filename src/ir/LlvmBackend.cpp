@@ -642,6 +642,10 @@ public:
         if (std::getenv("CLOTHO_COMB_FUSE_STAT") != nullptr) {
             report_comb_fuse_stat();
         }
+        may_finish_ = compute_may_finish(); // before any body: lower_call reads it
+        if (std::getenv("CLOTHO_FINISH_STAT") != nullptr) {
+            report_finish_stat();
+        }
         compute_domain_spec();   // after fusion (thunk_group_): reads spec_group_ in lower_group
         design_uses_strobe_   = facts_.uses.strobe;   // gates the Postponed-region drain loop
         design_uses_monitor_  = facts_.uses.monitor;
@@ -2738,6 +2742,12 @@ private:
         auto* free_bb     = llvm::BasicBlock::Create(ctx_, "coro.free", fn_);
         coro_cleanup_bb_  = llvm::BasicBlock::Create(ctx_, "coro.cleanup", fn_);
         coro_ret_bb_      = llvm::BasicBlock::Create(ctx_, "coro.ret", fn_);
+        // Created up front, not at the end of the body, because a cooperative
+        // $finish branches here too (lower_finish): the process must reach its
+        // FINAL SUSPEND so the resumer's coro.done sees it and destroys the frame
+        // once. Branching to coro.cleanup instead would free the frame underneath
+        // the drain loop, which then reads it — a use-after-free.
+        coro_final_bb_    = llvm::BasicBlock::Create(ctx_, "coro.final", fn_);
 
         b_.SetInsertPoint(coro_cleanup_bb_);
         auto* freed = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_free), { id, hdl_ });
@@ -2818,12 +2828,11 @@ private:
         // Final suspend: the default edge returns the (now-done) handle to the
         // resumer, which destroys it; case 1 is the destroy re-entry; resuming a
         // finished coroutine (case 0) is undefined, so trap.
-        auto* final_bb = llvm::BasicBlock::Create(ctx_, "coro.final", fn_);
-        b_.CreateBr(final_bb);
-        b_.SetInsertPoint(final_bb);
+        b_.CreateBr(coro_final_bb_);
+        b_.SetInsertPoint(coro_final_bb_);
         // A completing process releases its string temporaries. (An always loop
-        // never reaches here — its temps persist, bounded and capacity-reused; a
-        // $finish longjmps out and the heap is reclaimed at process exit.)
+        // reaches here only by finishing — otherwise its temps persist, bounded
+        // and capacity-reused.)
         deinit_body_strings();
         auto* res = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { none, b_.getTrue() });
         auto* sw  = b_.CreateSwitch(res, coro_ret_bb_, 2);
@@ -3617,6 +3626,45 @@ private:
     // handle from the awaiter and pushes it onto the active queue. The scheduler
     // resumes it (with everything else woken at the same instant) when it next
     // drains the queue. Built once per module.
+    // A JIT-local forwarder for a native wheel-expiry callback.
+    //
+    // The wheel stores an expiry callback in the timer node and calls it when the
+    // timer fires, so the address has to be materialized into memory. Doing that
+    // for a *runtime* symbol is a different relocation from calling one (address
+    // materialization rather than a branch), and JITLink gets it wrong on
+    // AArch64 COFF: the stored pointer is bad and the process dies the instant
+    // the timer fires. Every design using `assign #d`, a gate delay, or `<= #d`
+    // segfaulted on windows-arm64 for this reason, while process #delay and
+    // delayed event triggers -- whose callbacks are JIT-emitted functions --
+    // were fine on the same host.
+    //
+    // Forwarding through a JIT-local function puts every wheel callback on that
+    // same working footing: the address materialized into the timer is a local
+    // symbol, and reaching the runtime is an ordinary call.
+    llvm::Function* native_cb_trampoline(const char* name, llvm::FunctionCallee target,
+                                         llvm::Function*& cache) {
+        if (cache != nullptr) {
+            return sym(cache);
+        }
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
+        cache      = llvm::Function::Create(fnty, llvm::Function::InternalLinkage, name, env_->llmod);
+
+        llvm::IRBuilder<> tb(ctx_);
+        tb.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", cache));
+        tb.CreateCall(target, { cache->getArg(0), cache->getArg(1) });
+        tb.CreateRetVoid();
+        return sym(cache);
+    }
+
+    llvm::Function* intra_cb_trampoline() {
+        return native_cb_trampoline("clotho.intra_cb", intra_cb_fn(), intra_cb_tramp_);
+    }
+
+    llvm::Function* inertial_cb_trampoline() {
+        return native_cb_trampoline("clotho.inertial_cb", inertial_cb_fn(), inertial_cb_tramp_);
+    }
+
     llvm::Function* enqueue_trampoline() {
         if (enqueue_fn_ != nullptr) {
             return sym(enqueue_fn_);
@@ -3809,7 +3857,7 @@ private:
 
         // sim_drain(state, wheel): seed every non-final process and run the event
         // loop to quiescence. Split out of main so rt_sim_run can wrap it in the
-        // $finish catch — a $finish longjmps back into rt_sim_run, which sits below
+        // finals — a $finish stops the drain, which returns into rt_sim_run below
         // main's frame, so the heap state pointer and the wheel alloca stay live
         // and the final blocks still observe the settled design state.
         auto* drain = llvm::Function::Create(subfnty, llvm::Function::InternalLinkage, "sim_drain", env_->llmod);
@@ -3917,9 +3965,9 @@ private:
         // paths (natural drain, $finish) return here with `state` still live.
         b_.CreateCall(sim_run_fn(), { state, wheel, drain, finals });
 
-        // Release heap owned by string signals. Runs on both exit paths now (the
-        // $finish catch returns here); a $finish inside a final block still
-        // longjmps past this, its heap reclaimed at process exit.
+        // Release heap owned by string signals. Reached on every exit path: the
+        // drain returns whether it ran out of work or a $finish stopped it, and a
+        // $finish inside a final block returns through that block's epilogue.
         for (const SignalSlot& s : slots_) {
             if (s.is_string) {
                 emit_string_slot_op(s, str_deinit_fn());
@@ -4985,6 +5033,188 @@ private:
                          "rewrite %lld ms)\n",
                          (unsigned long long)members, (unsigned long long)sets,
                          (unsigned long long)eligible, (long long)ms(t1 - t0), (long long)ms(t2 - t1));
+        }
+    }
+
+    // May-finish closure (CLOTHO_FINISH_STAT), measurement only.
+    //
+    // Sizing study for the cooperative-$finish migration
+    // (docs/design/cooperative-finish.md). Replacing rt_finish's longjmp with an
+    // ordinary return means a call that can reach a $finish must be followed by
+    // a test of the finishing flag, so the caller can return too. That test is
+    // the whole cost of the scheme in designs that never finish, and it is only
+    // needed at call sites whose callee can actually reach a $finish — which is
+    // what this counts.
+    //
+    // A subroutine is may-finish if its own body contains a Finish ($finish,
+    // $stop, or the finish $fatal appends) or if it calls a may-finish callee.
+    // Virtual calls take the statically named target, matching how the
+    // by-pointer argument scan resolves them; an override that finishes where
+    // its prototype does not would be missed, so treat the virtual figure as a
+    // lower bound.
+    // Scan one body for a Finish, collecting its callees on the way.
+    static bool scan_finish(const Ir& ir, std::vector<FunctionId>* out) {
+        bool finishes = false;
+        for (size_t k = 0; k < ir.inst_count(); ++k) {
+            const auto idx = static_cast<Index>(k);
+            switch (ir.tag(idx)) {
+                case Inst::Tag::Finish:
+                    finishes = true;
+                    break;
+                case Inst::Tag::Call:
+                    if (out != nullptr) {
+                        out->push_back(ir.extra_data<CallInfo>(ir.payload(idx).extra).func);
+                    }
+                    break;
+                case Inst::Tag::TaskCall:
+                    if (out != nullptr) {
+                        out->push_back(ir.extra_data<TaskCallInfo>(ir.payload(idx).extra).func);
+                    }
+                    break;
+                case Inst::Tag::CallVirtual:
+                case Inst::Tag::TaskCallVirtual:
+                    if (out != nullptr) {
+                        out->push_back(ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra).func);
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+        return finishes;
+    }
+
+    // Which subroutines can reach a $finish, directly or through a callee. A call
+    // to one of these needs a post-call test of rt_finishing so the caller can
+    // leave too; every other call site is untouched. `direct_out`, when given,
+    // receives the un-closed seeds (the stat report distinguishes them).
+    std::vector<uint8_t> compute_may_finish(std::vector<uint8_t>* direct_out = nullptr) const {
+        const auto                           nf = static_cast<uint32_t>(mod_.function_count());
+        std::vector<uint8_t>                 direct(nf, 0);
+        std::vector<std::vector<FunctionId>> callees(nf);
+        for (uint32_t f = 0; f < nf; ++f) {
+            direct[f] = scan_finish(mod_.function(static_cast<FunctionId>(f)).ir, &callees[f]) ? 1 : 0;
+        }
+        // Memoized DFS, the same shape as the per-function write-set closure. A
+        // cycle contributes what the in-progress callee has so far; a recursive
+        // subroutine that finishes is still caught by its own seed.
+        std::vector<uint8_t> may(direct);
+        std::vector<uint8_t> state(nf, 0); // 0 new, 1 visiting, 2 done
+        const auto           close = [&](this const auto& self, uint32_t f) -> void {
+            if (state[f] != 0) {
+                return;
+            }
+            state[f] = 1;
+            for (const FunctionId c : callees[f]) {
+                const auto ci = static_cast<uint32_t>(c);
+                self(ci);
+                may[f] = static_cast<uint8_t>(may[f] | may[ci]);
+            }
+            state[f] = 2;
+        };
+        for (uint32_t f = 0; f < nf; ++f) {
+            close(f);
+        }
+        if (direct_out != nullptr) {
+            *direct_out = std::move(direct);
+        }
+        return may;
+    }
+
+    void report_finish_stat() const {
+        const auto nf = static_cast<uint32_t>(mod_.function_count());
+
+        // Direct seeds, plus each body's callee list, in one pass.
+        std::vector<uint8_t>                 direct(nf, 0);
+        std::vector<std::vector<FunctionId>> callees(nf);
+        const auto scan = [](const Ir& ir, std::vector<FunctionId>* out) {
+            bool finishes = false;
+            for (size_t k = 0; k < ir.inst_count(); ++k) {
+                const auto idx = static_cast<Index>(k);
+                switch (ir.tag(idx)) {
+                    case Inst::Tag::Finish:
+                        finishes = true;
+                        break;
+                    case Inst::Tag::Call:
+                        if (out != nullptr) {
+                            out->push_back(ir.extra_data<CallInfo>(ir.payload(idx).extra).func);
+                        }
+                        break;
+                    case Inst::Tag::TaskCall:
+                        if (out != nullptr) {
+                            out->push_back(ir.extra_data<TaskCallInfo>(ir.payload(idx).extra).func);
+                        }
+                        break;
+                    case Inst::Tag::CallVirtual:
+                    case Inst::Tag::TaskCallVirtual:
+                        if (out != nullptr) {
+                            out->push_back(
+                              ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra).func);
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            }
+            return finishes;
+        };
+        for (uint32_t f = 0; f < nf; ++f) {
+            direct[f] = scan(mod_.function(static_cast<FunctionId>(f)).ir, &callees[f]) ? 1 : 0;
+        }
+
+        // Memoized DFS, same shape as the per-function write-set closure. A cycle
+        // (recursion) contributes what the in-progress callee has so far; a
+        // recursive subroutine that finishes is still caught by its own seed.
+        std::vector<uint8_t> may(direct);
+        std::vector<uint8_t> state(nf, 0); // 0 new, 1 visiting, 2 done
+        const auto close = [&](this const auto& self, uint32_t f) -> void {
+            if (state[f] != 0) {
+                return;
+            }
+            state[f] = 1;
+            for (const FunctionId c : callees[f]) {
+                const auto ci = static_cast<uint32_t>(c);
+                self(ci);
+                may[f] = static_cast<uint8_t>(may[f] | may[ci]);
+            }
+            state[f] = 2;
+        };
+        for (uint32_t f = 0; f < nf; ++f) {
+            close(f);
+        }
+
+        // The population that matters: call sites needing a post-call test.
+        uint64_t   sites = 0, proc_direct = 0, fn_direct = 0, fn_may = 0;
+        const auto count_sites = [&](const Ir& ir) {
+            std::vector<FunctionId> cs;
+            scan(ir, &cs);
+            for (const FunctionId c : cs) {
+                sites += may[static_cast<uint32_t>(c)] != 0 ? 1 : 0;
+            }
+        };
+        for (const Process& p : mod_.processes()) {
+            proc_direct += scan(p.ir, nullptr) ? 1 : 0;
+            count_sites(p.ir);
+        }
+        for (uint32_t f = 0; f < nf; ++f) {
+            fn_direct += direct[f];
+            fn_may += may[f];
+            count_sites(mod_.function(static_cast<FunctionId>(f)).ir);
+        }
+
+        fprintf(stderr,
+                "FINISH_STAT processes=%zu (with $finish: %llu)  subroutines=%u "
+                "(direct: %llu, may-finish: %llu)  instrumented call sites=%llu\n",
+                mod_.processes().size(), static_cast<unsigned long long>(proc_direct), nf,
+                static_cast<unsigned long long>(fn_direct),
+                static_cast<unsigned long long>(fn_may),
+                static_cast<unsigned long long>(sites));
+        for (uint32_t f = 0; f < nf; ++f) {
+            if (may[f] != 0) {
+                const Function& fn = mod_.function(static_cast<FunctionId>(f));
+                fprintf(stderr, "FINISH_STAT   may-finish %s %s%s\n", fn.is_task ? "task" : "function",
+                        fn.name.c_str(), direct[f] != 0 ? " (direct)" : " (via a callee)");
+            }
         }
     }
 
@@ -6812,7 +7042,26 @@ private:
         b_.SetInsertPoint(check);
         llvm::Value* hd = b_.CreateLoad(i32, sym(active_head_gv_));
         llvm::Value* tl = b_.CreateLoad(i32, sym(active_tail_gv_));
-        b_.CreateCondBr(b_.CreateICmpNE(hd, tl), body, icheck);
+        // The $finish test sits on the queue-EMPTY edge, not after each resume: a
+        // cooperative finish empties the active queue itself (lower_finish), so
+        // the wave it was in ends on the next trip round this test and control
+        // arrives here. That keeps the per-activation path free of it — worth
+        // caring about because sim_drain is codegen'd at -O0/FastISel, where a
+        // load and a branch on the hot path measured +2.2% on picorv32.
+        // Skipping straight to wdone also leaves any staged NBAs uncommitted,
+        // which is what the longjmp did.
+        // A design with no $finish anywhere cannot set the flag, so it gets the
+        // plain edge and pays nothing at all.
+        if (design_has_finish()) {
+            auto* fincheck = llvm::BasicBlock::Create(ctx_, "active.finished", fn);
+            b_.CreateCondBr(b_.CreateICmpNE(hd, tl), body, fincheck);
+            b_.SetInsertPoint(fincheck);
+            b_.CreateCondBr(
+              b_.CreateICmpNE(b_.CreateLoad(b_.getInt8Ty(), finishing_gv()), b_.getInt8(0)), wdone,
+              icheck);
+        } else {
+            b_.CreateCondBr(b_.CreateICmpNE(hd, tl), body, icheck);
+        }
 
         b_.SetInsertPoint(body);
         // Zero-delay oscillation guard: count activations at the current instant
@@ -11382,7 +11631,7 @@ private:
         auto  schedule  = [&] {
             llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
             b_.CreateCall(wheel_schedule_fn(),
-                          { wheel_, rec, b_.CreateAdd(now, ticks), intra_cb_fn().getCallee() });
+                          { wheel_, rec, b_.CreateAdd(now, ticks), intra_cb_trampoline() });
         };
         auto immediate = [&] { b_.CreateCall(intra_cb_fn(), { rec, nullp }); };
 
@@ -11473,7 +11722,7 @@ private:
         auto  schedule = [&] {
             llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
             b_.CreateCall(wheel_schedule_fn(),
-                          { wheel_, rec, b_.CreateAdd(now, ticks), inertial_cb_fn().getCallee() });
+                          { wheel_, rec, b_.CreateAdd(now, ticks), inertial_cb_trampoline() });
         };
         auto immediate = [&] { b_.CreateCall(inertial_cb_fn(), { rec, nullp }); };
 
@@ -11887,16 +12136,76 @@ private:
         b_.CreateCall(strobe_pend_fn(), { hdl });
     }
 
-    // void rt_finish(ptr banner, i64 now, i32 arg) — noreturn; prints the exit
-    // banner (LRM Table 20-1) then exits the process. Kept separate from the
-    // plain rt_fn helpers: the noreturn attribute must land on the declaration so
-    // the optimizer prunes the dead tail after a $finish.
-    llvm::FunctionCallee finish_fn() {
-        auto fn = rt_fn("rt_finish", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty() });
-        if (auto* f = llvm::dyn_cast<llvm::Function>(fn.getCallee())) {
-            f->setDoesNotReturn();
+    // void rt_finish_coop(ptr banner, i64 now, i32 arg) — the cooperative form.
+    // Deliberately NOT noreturn: it prints the banner, sets rt_finishing, and
+    // returns so the caller can leave through its own epilogue and free its
+    // frame (docs/design/cooperative-finish.md).
+    llvm::FunctionCallee finish_coop_fn() {
+        return rt_fn("rt_finish_coop", b_.getVoidTy(),
+                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty() });
+    }
+
+    // Leave the body being lowered the way a $finish must: through its own
+    // epilogue, so its frame is released and its resumer sees an ordinary
+    // completion. One shape per kind of body.
+    void emit_finish_exit() {
+        if (cur_fn_ == nullptr) {
+            if (hdl_ != nullptr) {
+                // Process coroutine: the final suspend, exactly as running off the
+                // end of the body does, so the resumer destroys the frame once.
+                b_.CreateBr(coro_final_bb_);
+            } else {
+                // Thunk-elided process: a plain void body.
+                deinit_body_strings();
+                b_.CreateRetVoid();
+            }
+            return;
         }
-        return fn;
+        if (cur_is_task_) {
+            // Task: the same epilogue an explicit `return` takes.
+            b_.CreateBr(task_epilogue_bb_);
+            return;
+        }
+        // Function: no shared epilogue, so return here. The result is dead — the
+        // caller tests rt_finishing and leaves without reading it — so a poison
+        // value is the honest thing to hand back.
+        deinit_body_strings();
+        if (fn_->getReturnType()->isVoidTy()) {
+            b_.CreateRetVoid();
+        } else {
+            b_.CreateRet(llvm::PoisonValue::get(fn_->getReturnType()));
+        }
+    }
+
+    // After a call that could have reached a $finish, leave if it did. Emitted
+    // only for callees the may-finish closure marks, which is no call at all in
+    // most designs (docs/design/cooperative-finish.md).
+    void emit_finish_check(bool callee_may_finish) {
+        if (!callee_may_finish) {
+            return;
+        }
+        auto* leave = llvm::BasicBlock::Create(ctx_, "finish.leave", fn_);
+        auto* go    = llvm::BasicBlock::Create(ctx_, "finish.cont", fn_);
+        b_.CreateCondBr(
+          b_.CreateICmpNE(b_.CreateLoad(b_.getInt8Ty(), finishing_gv()), b_.getInt8(0)), leave, go);
+        b_.SetInsertPoint(leave);
+        emit_finish_exit();
+        b_.SetInsertPoint(go);
+    }
+
+    // Does a call to `id` need the post-call test?
+    bool callee_may_finish(FunctionId id) const {
+        const auto k = static_cast<uint32_t>(id);
+        return k < may_finish_.size() && may_finish_[k] != 0;
+    }
+
+    // A virtual call resolves at run time, so the statically named target is not
+    // the whole answer — an override could finish where its prototype does not.
+    // Treat any virtual call as may-finish whenever the design has a may-finish
+    // subroutine at all: sound, and the sets are small enough that the
+    // over-approximation costs nothing measurable.
+    bool virtual_call_may_finish() const {
+        return std::any_of(may_finish_.begin(), may_finish_.end(), [](uint8_t v) { return v != 0; });
     }
 
     // Lower a $finish / $stop: pass the runtime the compile-time banner prefix,
@@ -11919,8 +12228,26 @@ private:
         llvm::Value*      now = has_wheel()
                                   ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
                                   : static_cast<llvm::Value*>(b_.getInt64(0));
-        b_.CreateCall(finish_fn(),
-                      { b_.CreateGlobalString(banner), now, b_.getInt32(info.arg) });
+        llvm::Value* args[] = { b_.CreateGlobalString(banner), now, b_.getInt32(info.arg) };
+
+        // The runtime reports and returns; control leaves through this body's own
+        // epilogue, so every frame between here and the drain loop is released by
+        // its owner rather than jumped over.
+        b_.CreateCall(finish_coop_fn(), args);
+        // End the current settle wave from here: emptying the active ring means
+        // the drain's existing head != tail test falls through to its finished
+        // edge, so no queued process runs after the $finish and the hot path
+        // needs no test of its own.
+        if (active_head_gv_ != nullptr) {
+            b_.CreateStore(b_.CreateLoad(b_.getInt32Ty(), sym(active_tail_gv_)),
+                           sym(active_head_gv_));
+        }
+        emit_finish_exit();
+        // The rest of the region is dead (LRM 20.2 ends the simulation here) but
+        // still gets lowered, so park it in a block with no predecessors — the
+        // same pruning the noreturn attribute used to buy.
+        auto* dead = llvm::BasicBlock::Create(ctx_, "finish.dead", fn_);
+        b_.SetInsertPoint(dead);
     }
 
     // void rt_observed_case_violation(ptr banner, i64 now, i32 kind) — queues the
@@ -12665,6 +12992,36 @@ private:
     llvm::FunctionCallee vcd_touch_fn() {
         return rt_fn("rt_vcd_touch", b_.getVoidTy(), { b_.getInt32Ty() });
     }
+    // Does any process or subroutine in the design contain a $finish / $stop?
+    // Gates the drain loop's finished test; memoized, since emit_active_run asks
+    // once per unit module.
+    bool design_has_finish() {
+        if (!design_has_finish_.has_value()) {
+            const auto scan = [](const Ir& ir) {
+                for (size_t k = 0; k < ir.inst_count(); ++k) {
+                    if (ir.tag(static_cast<Index>(k)) == Inst::Tag::Finish) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            bool found = false;
+            for (const Process& p : mod_.processes()) {
+                found = found || scan(p.ir);
+            }
+            for (uint32_t f = 0; f < mod_.function_count() && !found; ++f) {
+                found = found || scan(mod_.function(static_cast<FunctionId>(f)).ir);
+            }
+            design_has_finish_ = found;
+        }
+        return *design_has_finish_;
+    }
+
+    // The runtime rt_finishing byte, set once a $finish / $stop has been taken.
+    llvm::Constant* finishing_gv() {
+        return env_->llmod.getOrInsertGlobal("rt_finishing", b_.getInt8Ty());
+    }
+
     // The runtime rt_vcd_active byte, non-zero only while VCD dumping is live.
     llvm::Constant* vcd_active_gv() {
         return env_->llmod.getOrInsertGlobal("rt_vcd_active", b_.getInt8Ty());
@@ -13119,6 +13476,7 @@ private:
         }
         llvm::Function* cf = sym(fn_decls_[static_cast<uint32_t>(ci.func)]);
         lower_call_common(i, f, cf->getFunctionType(), cf, ci.args);
+        emit_finish_check(callee_may_finish(ci.func));
     }
 
     // Lower a virtual method call (LRM 8.20): resolve the callee from the receiver
@@ -13143,6 +13501,7 @@ private:
         llvm::FunctionType* fnty =
             fn_decls_[static_cast<uint32_t>(vci.func)]->getFunctionType();
         lower_call_common(i, f, fnty, load_vtable_callee(vci), vci.args);
+        emit_finish_check(virtual_call_may_finish());
     }
 
     // Shared marshaling + result handling for a direct or a virtual method call
@@ -14143,6 +14502,7 @@ private:
         for (auto& [lv, snap] : ref_svc) {
             service_after_write(lv, snap);
         }
+        emit_finish_check(virt ? virtual_call_may_finish() : callee_may_finish(fid));
     }
 
     // Build the runtime rt_arg[] descriptor array shared by every $display-family
@@ -16243,6 +16603,10 @@ private:
     // (one per process, hoisted to coro.begin so a loop of element NBAs does not
     // grow the stack). Layout: [16]mm_val [16]mm_mask [8]z_val [8]z_mask.
     llvm::BasicBlock*   coro_cleanup_bb_ = nullptr;
+    llvm::BasicBlock*   coro_final_bb_   = nullptr;
+    std::optional<bool> design_has_finish_;
+    // Per-subroutine may-finish closure; see compute_may_finish.
+    std::vector<uint8_t> may_finish_;
     llvm::BasicBlock*   coro_ret_bb_     = nullptr;
     // The current coroutine's scheduled flag: &clotho.proc_sched[this process] for
     // a process (a Constant GEP), or a frame-resident i32 alloca for a task.
@@ -16269,6 +16633,10 @@ private:
     // queue holds processes parked on a zero delay (#0): drained into active at
     // the same instant, after active settles but before NBA.
     llvm::Function*                     enqueue_fn_        = nullptr;
+    // JIT-local forwarders for the two native wheel-expiry callbacks; see
+    // native_cb_trampoline.
+    llvm::Function*                     intra_cb_tramp_    = nullptr;
+    llvm::Function*                     inertial_cb_tramp_ = nullptr;
     llvm::GlobalVariable*               active_gv_         = nullptr;
     llvm::GlobalVariable*               active_head_gv_    = nullptr;
     llvm::GlobalVariable*               active_tail_gv_    = nullptr;

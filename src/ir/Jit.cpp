@@ -1,6 +1,5 @@
 #include "Jit.h"
 
-#include <csetjmp>
 #include <cstring>
 #include <future>
 #include <memory>
@@ -35,6 +34,27 @@
 #include "LlvmBackend.h"
 #include "runtime/Runtime.h"
 #include "runtime/svdpi.h"
+
+#if defined(__MINGW32__)
+// The 128-bit arithmetic helpers the backend emits for wide (>64-bit) operands.
+// A dynamically linked host finds these through libgcc_s in the process symbol
+// table, but the MinGW toolchain links libgcc statically -- and clotho's own
+// native code never divides a 128-bit integer, so the objects defining them are
+// not pulled in at all and there is nothing to export. Naming them here forces
+// the link and gives the JIT something to bind to.
+extern "C" {
+__int128          __divti3(__int128, __int128);
+__int128          __modti3(__int128, __int128);
+unsigned __int128 __udivti3(unsigned __int128, unsigned __int128);
+unsigned __int128 __umodti3(unsigned __int128, unsigned __int128);
+}
+#if defined(__x86_64__)
+// libgcc's stack-probe helper, x86_64-only — AArch64 Windows has no such
+// symbol. Declared here only to take its address; the calling convention is
+// private to the compiler, so it is never called from C++.
+extern "C" void ___chkstk_ms(void);
+#endif
+#endif
 
 namespace clotho::ir {
 
@@ -183,7 +203,6 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_fread", &rt_fread);
     expose("rt_timeformat_init", &rt_timeformat_init);
     expose("rt_timeformat_set", &rt_timeformat_set);
-    expose("rt_finish", &rt_finish);
     expose("rt_observed_case_violation", &rt_observed_case_violation);
     expose("rt_observed_flush", &rt_observed_flush);
     expose("rt_defer_report", &rt_defer_report);
@@ -215,10 +234,16 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_vcd_start", &rt_vcd_start);
     expose("rt_vcd_touch", &rt_vcd_touch);
     expose("rt_vcd_touch_range", &rt_vcd_touch_range);
+    expose("rt_finish_coop", &rt_finish_coop);
     // rt_vcd_active is a data symbol (the VCD-active flag the JIT loads to gate
     // touch calls), so it is exposed without the Callable flag.
     rt_syms[(*jit)->mangleAndIntern("rt_vcd_active")] = {
         llvm::orc::ExecutorAddr::fromPtr(&rt_vcd_active),
+        llvm::JITSymbolFlags::Exported,
+    };
+    // Likewise rt_finishing: the drain loop loads it after a resume to leave.
+    rt_syms[(*jit)->mangleAndIntern("rt_finishing")] = {
+        llvm::orc::ExecutorAddr::fromPtr(&rt_finishing),
         llvm::JITSymbolFlags::Exported,
     };
     expose("rt_vcd_flush", &rt_vcd_flush);
@@ -358,6 +383,27 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("memcpy", &std::memcpy);
     expose("memmove", &std::memmove);
     expose("memcmp", &std::memcmp);
+#if defined(__MINGW32__)
+    // Two symbols a MinGW target emits that live in the static CRT and libgcc,
+    // where the process-symbol generator below cannot see them:
+    //
+    //   __main        — the static-constructor hook LLVM plants at the top of
+    //                   any function literally named `main`, which is what the
+    //                   design's entry point is called. A JIT'd module has no
+    //                   C++ constructors to run, and calling the host's would
+    //                   re-enter its global init, so bind a no-op.
+    //   ___chkstk_ms  — the stack-probe helper for frames larger than a page,
+    //                   which process bodies with wide state reach readily.
+    //                   x86_64 only; AArch64 Windows has no such symbol.
+    expose("__main", +[] {});
+    expose("__divti3", &__divti3);
+    expose("__modti3", &__modti3);
+    expose("__udivti3", &__udivti3);
+    expose("__umodti3", &__umodti3);
+#if defined(__x86_64__)
+    expose("___chkstk_ms", &___chkstk_ms);
+#endif
+#endif
     if (auto err = jd.define(llvm::orc::absoluteSymbols(std::move(rt_syms)))) {
         llvm::errs() << "jit: " << llvm::toString(std::move(err)) << "\n";
         return -1;
@@ -561,19 +607,11 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     // opt-in into the runtime so a bypassed gate still refuses to exec.
     rt_system_set_access(static_cast<int32_t>(config.allow_system));
 
-    // Simulation phase: run the compiled design. A $finish longjmps back here
-    // (rt_finish is noreturn to the design) so the embedding process survives;
-    // the sim's live coroutine frames are abandoned, which is fine — it is over.
-    const auto   t_sim = std::chrono::steady_clock::now();
-    std::jmp_buf finish_env;
-    // Volatile: an auto variable modified between setjmp and longjmp is
-    // otherwise indeterminate after the jump.
-    volatile int rc = 0;
-    if (setjmp(finish_env) == 0) {
-        rt_finish_host(&finish_env);
-        rc = fn();
-    }
-    rt_finish_host(nullptr);
+    // Simulation phase: run the compiled design. A $finish no longer unwinds
+    // anything here — it returns through the design's own frames and the drain
+    // loop stops — so this is an ordinary call.
+    const auto t_sim = std::chrono::steady_clock::now();
+    const int  rc    = fn();
     if (timings != nullptr) {
         timings->sim_ms += ms_since(t_sim);
     }

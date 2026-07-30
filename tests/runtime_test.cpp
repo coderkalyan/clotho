@@ -7,13 +7,14 @@
 #include <cstring>
 #include <deque>
 #include <initializer_list>
+#include <filesystem>
 #include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include <unistd.h>
-
+#include "PosixIo.h"
+#include "Subprocess.h"
 #include "runtime/Runtime.h"
 #include "runtime/svdpi.h"
 
@@ -108,8 +109,10 @@ TEST_CASE("rt_wheel_tick on an idle runtime wheel is a no-op") {
 TEST_CASE("rt_readmem with a null z_base loads values without touching z memory") {
     // Two adjacent 8-bit elements, mm word (2 bytes) each, no z word: stride 2.
     // A z write through a null-z layout would clobber the next element's mm word.
-    char path[] = "/tmp/clotho_rt_readmem_noz.hex";
-    std::FILE* f = std::fopen(path, "w");
+    const std::string path_s =
+      (std::filesystem::temp_directory_path() / (clotho::test::detail::unique_stem() + ".hex")).string();
+    const char* path = path_s.c_str();
+    std::FILE*  f    = std::fopen(path, "wb");
     REQUIRE(f != nullptr);
     std::fputs("a5 3c\n", f);
     std::fclose(f);

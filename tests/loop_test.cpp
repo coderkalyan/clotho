@@ -4,10 +4,9 @@
 #include <string>
 #include <string_view>
 
-#include <sys/wait.h>
-#include <unistd.h>
-
 #include "Lower.h"
+#include "PosixIo.h"
+#include "Subprocess.h"
 #include "ir/Jit.h"
 
 using namespace clotho;
@@ -53,38 +52,17 @@ std::string run_capture(std::string_view source) {
     return out;
 }
 
-// JIT-run a design that ends via $finish and return its stdout. $finish calls
-// std::exit, which would tear down the whole test runner, so the simulation runs
-// in a forked child writing to a temp file; the parent waits and reads it. Use
-// this (not run_capture) for any free-running process — e.g. a clock-generating
-// `always` — that only stops at $finish.
+// JIT-run a design that ends via $finish and return its stdout. The simulation
+// gets a process of its own (Subprocess.h explains why $finish cannot share
+// the runner's); lowering here as well is what reports a broken source.
+// Use this, not run_capture, for any free-running process — e.g. a
+// clock-generating `always` — that only stops at $finish.
 std::string run_capture_finish(std::string_view source) {
     const LowerResult r = lower_text(source);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
-    std::FILE* tmp = std::tmpfile();
-    REQUIRE(tmp != nullptr);
-    std::fflush(stdout);
-
-    const pid_t pid = fork();
-    REQUIRE(pid >= 0);
-    if (pid == 0) {
-        // Child: run with stdout pointed at the temp file. $finish's std::exit(0)
-        // ends the child here; _exit covers a design that drains without $finish.
-        dup2(fileno(tmp), fileno(stdout));
-        ir::run_jit(*r.module);
-        std::fflush(stdout);
-        _exit(0);
-    }
-
-    int wstatus = 0;
-    REQUIRE(waitpid(pid, &wstatus, 0) == pid);
-
-    std::string out = slurp(tmp);
-    std::fclose(tmp);
-
-    return out;
+    return test::run_design_subprocess(source);
 }
 
 // Does the IR of any process contain at least one instruction with the tag?

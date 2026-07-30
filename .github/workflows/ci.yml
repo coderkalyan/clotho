@@ -1,0 +1,228 @@
+name: CI
+
+# Tiered by trigger, because GitHub bills macOS at 10x and Windows at 2x the
+# Linux minute rate. Feature-branch pushes get the cheap Linux x64 job only;
+# every platform runs on main, nightly, and on demand.
+on:
+  push:
+    # A documentation-only push should not spend six platforms' worth of
+    # minutes. GitHub skips the run only when every changed path matches.
+    paths-ignore: ["docs/**", "**/*.md"]
+  pull_request:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Platforms to run
+        type: choice
+        options: [all, linux-only]
+        default: all
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # apt.llvm.org / Homebrew track the major; the Windows tarball is pinned to an
+  # exact patch. Clotho's CMakeLists hard-requires major 22.
+  LLVM_MAJOR: "22"
+  LLVM_RELEASE: "22.1.8"
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 1G
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > all.json <<'JSON'
+          [
+            {"name": "linux-x64",     "runner": "ubuntu-24.04",    "shell": "bash"},
+            {"name": "linux-arm64",   "runner": "ubuntu-24.04-arm", "shell": "bash"},
+            {"name": "macos-arm64",   "runner": "macos-15",        "shell": "bash"},
+            {"name": "macos-x64",     "runner": "macos-15-intel",  "shell": "bash"},
+            {"name": "windows-x64",   "runner": "windows-2025",   "msystem": "CLANG64",    "shell": "msys2 {0}"},
+            {"name": "windows-arm64", "runner": "windows-11-arm",  "msystem": "CLANGARM64", "shell": "msys2 {0}", "experimental": true}
+          ]
+          JSON
+          # A `ci/`-prefixed branch opts into the full matrix on every push.
+          # GitHub only offers workflow_dispatch for workflows that already
+          # exist on the default branch, so without this there is no way to
+          # exercise the expensive platforms while iterating on CI itself.
+          case "${{ github.event_name }}:${{ inputs.scope }}" in
+            workflow_dispatch:linux-only) full=0 ;;
+            workflow_dispatch:*|schedule:*) full=1 ;;
+            *) case "${{ github.ref }}" in
+                 refs/heads/main|refs/heads/ci/*) full=1 ;;
+                 *) full=0 ;;
+               esac ;;
+          esac
+          if [ "$full" = 1 ]; then
+            echo "matrix=$(jq -c . all.json)" >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix=$(jq -c '[.[0]]' all.json)" >> "$GITHUB_OUTPUT"
+          fi
+          echo "full tier: $full"
+
+  build:
+    name: ${{ matrix.name }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    # windows-arm64 is still the only target with known failures, so it alone
+    # stays advisory; every other target gates.
+    continue-on-error: ${{ matrix.experimental == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    # Per-step `shell:` cannot see the matrix context; the job-level default
+    # can. Windows runs every step inside the MSYS2 environment, everything
+    # else in plain bash.
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # -- toolchain --------------------------------------------------------
+      # LLVM is never built here: a source build is tens of minutes and the
+      # pin moves at most twice a year. Each platform takes the cheapest
+      # prebuilt that ships the CMake package and the dev libraries.
+      - name: Install LLVM and toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          . /etc/os-release
+          echo "deb http://apt.llvm.org/$VERSION_CODENAME/ llvm-toolchain-$VERSION_CODENAME-$LLVM_MAJOR main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          # clang, not GCC. Ubuntu 24.04 caps out at GCC 14, which rejects the
+          # implicit capture of an enclosing-class member inside a deducing-this
+          # lambda (LlvmBackend.cpp's close_fn) — a GCC 14 defect fixed in 15,
+          # and 15 is not available on any GitHub-hosted image. libstdc++-14-dev
+          # supplies <print>, which src/main.cpp uses and GCC 13's does not have.
+          # The -dev packages are what LLVM's exported CMake targets link
+          # against.
+          sudo apt-get install -y --no-install-recommends \
+            llvm-$LLVM_MAJOR-dev clang-$LLVM_MAJOR libstdc++-14-dev ninja-build ccache \
+            zlib1g-dev libzstd-dev libxml2-dev libncurses-dev libedit-dev
+          echo "LLVM_DIR=/usr/lib/llvm-$LLVM_MAJOR/lib/cmake/llvm" >> "$GITHUB_ENV"
+          echo "CC=clang-$LLVM_MAJOR"    >> "$GITHUB_ENV"
+          echo "CXX=clang++-$LLVM_MAJOR" >> "$GITHUB_ENV"
+
+      - name: Install LLVM and toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euxo pipefail
+          # llvm@22 is currently an alias of the `llvm` formula and becomes a
+          # real versioned formula once 23 ships; fall back while it is an alias
+          # only in name.
+          brew install ninja ccache
+          brew install llvm@$LLVM_MAJOR || brew install llvm
+          prefix=$(brew --prefix llvm@$LLVM_MAJOR 2>/dev/null || brew --prefix llvm)
+          "$prefix/bin/clang++" --version
+          echo "LLVM_DIR=$prefix/lib/cmake/llvm" >> "$GITHUB_ENV"
+          echo "CC=$prefix/bin/clang"    >> "$GITHUB_ENV"
+          echo "CXX=$prefix/bin/clang++" >> "$GITHUB_ENV"
+          # Link Homebrew LLVM's own libc++, not the SDK's. CMake seeds
+          # CMAKE_EXE_LINKER_FLAGS from LDFLAGS and CMAKE_CXX_FLAGS from
+          # CXXFLAGS at first configure.
+          echo "LDFLAGS=-L$prefix/lib/c++ -L$prefix/lib/unwind -lunwind -Wl,-rpath,$prefix/lib/c++" \
+            >> "$GITHUB_ENV"
+          # libc++'s headers annotate anything whose implementation lives in the
+          # shared library with the macOS version that first shipped it, and
+          # floating-point std::from_chars (Runtime.cpp's real parsing) is marked
+          # macOS 26. Those annotations describe Apple's system libc++; we link
+          # Homebrew's, which has the symbol, so turn them off.
+          echo "CXXFLAGS=-D_LIBCPP_DISABLE_AVAILABILITY" >> "$GITHUB_ENV"
+
+      # MSYS2's CLANG64/CLANGARM64 environments package LLVM 22.1.8 — the exact
+      # pin — as a MinGW-w64/UCRT build, so Windows uses clang with libc++ and
+      # no MSVC ABI, CRT or STL anywhere. That is not only a toolchain
+      # preference: against the MSVC-ABI release tarball this build also had to
+      # work around a DIA SDK path baked into LLVM's exported targets, an
+      # expected-lite/std::expected divergence in the MSVC STL, mimalloc
+      # colliding with the CRT's allocator symbols, compiler-rt's builtins not
+      # being linked, and an import library clobbering a static archive of the
+      # same name. None of those exist here.
+      - name: Set up MSYS2 and LLVM (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          # pacboy's `:p` suffix picks the environment's package prefix, so one
+          # list serves both CLANG64 and CLANGARM64. Python is slang's — its
+          # CMakeLists requires an interpreter for its generated sources.
+          pacboy: >-
+            llvm:p clang:p cmake:p ninja:p ccache:p python:p
+
+      # -- caches -----------------------------------------------------------
+      # slang is pinned to a SHA, so FetchContent does a full (non-shallow)
+      # clone of it every run. Cache the populated sources, keyed on the pins.
+      - name: Cache fetched dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/_deps/*-src
+            build/_deps/*-subbuild
+          key: deps-${{ matrix.name }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ matrix.name }}-${{ github.sha }}
+          restore-keys: ccache-${{ matrix.name }}-
+
+      # -- build and test ---------------------------------------------------
+      - name: Configure
+        run: |
+          set -eux
+          # Deliberately not a bash array: the macOS runners' /bin/bash is 3.2,
+          # where expanding an empty array under `set -u` is an error.
+          launcher=
+          if command -v ccache > /dev/null; then
+            launcher="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          fi
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
+            $launcher
+
+      - name: Build
+        run: cmake --build build --target clotho_test clotho_cli
+
+      - name: Test
+        run: |
+          set -eu
+          exe=build/clotho_test
+          if [ -f "$exe.exe" ]; then exe="$exe.exe"; fi
+          # --duration names each case as it runs, so a hard crash (which prints
+          # no doctest summary at all) still identifies itself; --order-by=file
+          # keeps the sequence comparable across platforms.
+          "$exe" --duration=true --order-by=file
+
+      # End-to-end proof the JIT actually executes on this host, independent of
+      # the doctest harness: parse, lower, compile, run.
+      - name: Smoke test the CLI
+        run: |
+          set -eux
+          exe=build/clotho
+          if [ -f "$exe.exe" ]; then exe="$exe.exe"; fi
+          out=$("$exe" examples/initial.v)
+          echo "$out"
+          [ "$out" = "Hello, world!" ]
+
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats

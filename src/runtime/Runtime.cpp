@@ -5,6 +5,7 @@
 #include <bit>
 #include <cerrno>
 #include <charconv>
+#include <cinttypes>
 #include <condition_variable>
 #include <csetjmp>
 #include <cstddef>
@@ -21,7 +22,14 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <psapi.h>
+#else
 #include <sys/resource.h>
+#endif
 
 #include <ankerl/unordered_dense.h>
 
@@ -2198,7 +2206,7 @@ extern "C" int32_t rt_fopen_mcd(const char* name_buf, uint32_t name_len, int32_t
     // Claim the lowest free channel; bit 0 is the reserved standard output.
     for (int b = 1; b < 31; ++b) {
         if (mcd_channels[b] == nullptr) {
-            std::FILE* f = std::fopen(path.c_str(), "w");
+            std::FILE* f = std::fopen(path.c_str(), "wb");
             if (f == nullptr) {
                 return 0;
             }
@@ -2213,8 +2221,17 @@ extern "C" int32_t rt_fopen_fd(const char* name_buf, uint32_t name_len, int32_t 
                                const char* mode_buf, uint32_t mode_len, int32_t mode_fwd) {
     io_ensure_init();
     const std::string path = read_ascii_arg(name_buf, name_len, name_fwd);
-    const std::string mode = read_ascii_arg(mode_buf, mode_len, mode_fwd);
-    std::FILE*        f    = std::fopen(path.c_str(), mode.c_str());
+    std::string mode = read_ascii_arg(mode_buf, mode_len, mode_fwd);
+    // Always binary. SystemVerilog file I/O is byte-oriented -- $fwrite emits the
+    // bytes the format produced -- so a host that rewrites \n as \r\n on the way
+    // out (Windows text mode) would make a design's output platform-dependent,
+    // and $fgetc/$fread would see bytes the file does not contain. The VCD writer
+    // and $readmem already open binary; this makes $fopen agree. A no-op on
+    // POSIX, where the two modes are identical.
+    if (mode.find('b') == std::string::npos) {
+        mode += 'b';
+    }
+    std::FILE* f = std::fopen(path.c_str(), mode.c_str());
     if (f == nullptr) {
         return 0;
     }
@@ -2724,8 +2741,6 @@ namespace {
 
 // Where rt_finish returns control: the run_jit frame that started the
 // simulation, or null when the design runs standalone.
-std::jmp_buf* finish_env = nullptr;
-
 // Append the simulation time `now` (in design ticks) as "<value> <unit>",
 // reduced to the largest SI unit that divides it evenly (fs / ps / ns / us / ms
 // / s). A unitless design (tick_fs == 0) prints the raw tick count. Used only by
@@ -2757,13 +2772,56 @@ void append_finish_time(std::string& out, uint64_t now) {
     }
 }
 
-} // namespace
+// Peak resident set (in kilobytes) and total process CPU time, for the
+// $finish(2) resource line. Normalizing the unit here matters: getrusage
+// reports ru_maxrss in kilobytes on Linux but in *bytes* on the BSDs (macOS
+// included), so reading the field raw would overstate macOS by 1024x. Windows
+// has no getrusage at all and goes through the Win32 equivalents.
+struct FinishStats {
+    uint64_t peak_rss_kb;
+    double   cpu_seconds;
+};
 
-extern "C" void rt_finish_host(void* env) {
-    finish_env = static_cast<std::jmp_buf*>(env);
+FinishStats finish_stats() {
+#if defined(_WIN32)
+    // FILETIME counts 100-nanosecond ticks; the creation/exit pair is unused.
+    FILETIME creation = {}, exited = {}, kernel = {}, user = {};
+    double   cpu = 0.0;
+    if (GetProcessTimes(GetCurrentProcess(), &creation, &exited, &kernel, &user)) {
+        const auto ticks = [](const FILETIME& ft) {
+            return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+        };
+        cpu = static_cast<double>(ticks(kernel) + ticks(user)) / 1e7;
+    }
+    PROCESS_MEMORY_COUNTERS pmc = {};
+    uint64_t                rss_kb = 0;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        rss_kb = static_cast<uint64_t>(pmc.PeakWorkingSetSize) / 1024;
+    }
+    return {rss_kb, cpu};
+#else
+    rusage ru = {};
+    getrusage(RUSAGE_SELF, &ru);
+    const double cpu = static_cast<double>(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) +
+                       static_cast<double>(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
+#if defined(__APPLE__)
+    const uint64_t rss_kb = static_cast<uint64_t>(ru.ru_maxrss) / 1024;
+#else
+    const uint64_t rss_kb = static_cast<uint64_t>(ru.ru_maxrss);
+#endif
+    return {rss_kb, cpu};
+#endif
 }
 
-extern "C" void rt_finish(const char* banner, uint64_t now, int32_t arg) {
+} // namespace
+
+unsigned char rt_finishing = 0;
+
+namespace {
+
+// Everything a $finish does before control leaves: the Observed drain, the
+// banner, and closing the dump.
+void finish_report(const char* banner, uint64_t now, int32_t arg) {
     rt_observed_flush();
     if (arg >= 1) {
         std::fflush(stdout);
@@ -2771,13 +2829,11 @@ extern "C" void rt_finish(const char* banner, uint64_t now, int32_t arg) {
         line += " called at ";
         append_finish_time(line, now);
         if (arg >= 2) {
-            rusage ru;
-            getrusage(RUSAGE_SELF, &ru);
-            const double cpu = static_cast<double>(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) +
-                               static_cast<double>(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
-            char stats[128];
-            std::snprintf(stats, sizeof(stats), "\n  Memory: %ld KB  CPU time: %.3f seconds",
-                          ru.ru_maxrss, cpu);
+            const FinishStats st = finish_stats();
+            char              stats[128];
+            std::snprintf(stats, sizeof(stats),
+                          "\n  Memory: %" PRIu64 " KB  CPU time: %.3f seconds", st.peak_rss_kb,
+                          st.cpu_seconds);
             line += stats;
         }
         line += '\n';
@@ -2785,18 +2841,19 @@ extern "C" void rt_finish(const char* banner, uint64_t now, int32_t arg) {
         std::fflush(stderr);
     }
     // Flush and close the VCD while the design's stack (state + wheel the engine
-    // points at) is still live — the longjmp below unwinds it, so the sim loop's
-    // own close at wheel-drain is never reached on this path. A no-op when no dump
-    // is open.
+    // points at) is still live: the drain stops before its own close at
+    // wheel-drain. A no-op when no dump is open.
     rt_vcd_close();
-    // Jump back to the host that started the run when one is installed — the
-    // codegen relies on rt_finish being noreturn, so returning normally is not an
-    // option. Otherwise exit; std::exit runs atexit handlers and flushes C stdio,
-    // so any buffered $display output is committed before the process leaves.
-    if (finish_env != nullptr) {
-        std::longjmp(*finish_env, 1);
-    }
-    std::exit(0);
+}
+
+} // namespace
+
+extern "C" void rt_finish_coop(const char* banner, uint64_t now, int32_t arg) {
+    finish_report(banner, now, arg);
+    rt_finishing = 1;
+    // Returns. The caller is a JIT'd body, which leaves through its own
+    // epilogue; each frame between here and the drain loop is released by its
+    // owner, and the drain sees rt_finishing and stops.
 }
 
 extern "C" void rt_oscillation_abort(const rt_wheel* wheel) {
@@ -2818,9 +2875,11 @@ extern "C" void rt_oscillation_abort(const rt_wheel* wheel) {
     std::fputs(line.c_str(), stderr);
     std::fflush(stderr);
     rt_vcd_close();
-    if (finish_env != nullptr) {
-        std::longjmp(*finish_env, 1);
-    }
+    rt_finishing = 1;
+    // A non-converging design cannot be handed back to the host mid-instant --
+    // there is no settled state to return -- so this one path still ends the
+    // process. std::exit, not a longjmp: it is portable, and it keeps the
+    // nonzero status that distinguishes a hang from a clean run.
     std::exit(1);
 }
 
@@ -2960,23 +3019,37 @@ extern "C" void rt_defer_flush_final() {
     defer_mature(/*final_pass=*/true);
 }
 
+// Return the process-global simulation state to its power-on condition. Called
+// at the end of every run, so the next simulation in this process starts clean.
+//
+// This matters because several of these outlive the JIT session that created
+// their contents: g_monitor.ramp is a function pointer INTO the JIT'd code, and
+// g_strobe_queue holds coroutine handles. run_jit destroys the LLJIT when it
+// returns, so anything left here dangles, and the next simulation's Postponed
+// drain would call or resume it. Only a host that runs more than one simulation
+// per process can observe that -- the CLI runs exactly one -- but clotho_test
+// runs it a thousand times over.
+namespace {
+void sim_teardown() {
+    g_monitor = MonitorState{};
+    g_strobe_queue.clear();
+    g_strobe_read = 0;
+    g_observed_case.clear();
+    g_defer.clear();
+    rt_nba_arr_reset();
+    rt_intra_reset();
+}
+} // namespace
+
 extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*),
                            void (*finals)(void*, void*)) {
     // Run the simulation, then the `final` blocks (LRM 9.2.3), so the finals see
-    // the settled design state on BOTH exit paths. The natural drain returns from
-    // `drain`; a $finish inside it longjmps out of the abandoned coroutine frames
-    // back to the local catch below — main's state/wheel allocas stay live because
-    // main sits beneath this frame. Either way, control reaches the finals.
-    std::jmp_buf  local;
-    std::jmp_buf* prev = finish_env; // outer host catch (run_jit), restored below
-    if (setjmp(local) == 0) {
-        finish_env = &local;
-        drain(state, wheel);
-    }
-    // Restore the outer catch before the finals so a $finish in a final block
-    // exits cleanly (to the host / process exit) rather than re-entering here.
-    finish_env = prev;
+    // the settled design state on BOTH exit paths. `drain` now returns normally
+    // whether it ran out of work or a $finish stopped it, so there is one path.
+    rt_finishing = 0; // a prior run in this process may have set it
+    drain(state, wheel);
     finals(state, wheel);
+    sim_teardown();
 }
 
 extern "C" void rt_fflush(int32_t desc) {
@@ -3999,15 +4072,22 @@ extern "C" void rt_string_to_packed(const rt_string* s, uint8_t* out, uint32_t w
     }
 }
 
+// Coroutine frames may be over-aligned (16-byte plane spills) and malloc
+// guarantees only 16, so allocate with an explicit alignment. Aligned operator
+// new rather than C11 aligned_alloc: the latter is absent from the MSVC runtime
+// (which offers only the non-interchangeable _aligned_malloc/_aligned_free
+// pair). The nothrow form matters — this is called from JIT'd code across a C
+// ABI with no unwind tables, so a thrown bad_alloc could not propagate.
+namespace {
+constexpr std::align_val_t frame_align{64};
+}
+
 extern "C" void* rt_alloc(uint64_t size) {
-    // Coroutine frames may be over-aligned (16-byte plane spills); glibc
-    // malloc guarantees only 16, so align generously. aligned_alloc requires
-    // the size to be a multiple of the alignment.
-    return std::aligned_alloc(64, (size + 63) / 64 * 64);
+    return ::operator new(static_cast<size_t>(size), frame_align, std::nothrow);
 }
 
 extern "C" void rt_free(void* p) {
-    std::free(p);
+    ::operator delete(p, frame_align);
 }
 
 // -- Value-change dump (VCD, LRM §21.7; design in docs/VCD.md) --

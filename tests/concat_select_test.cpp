@@ -11,9 +11,8 @@
 #include <string>
 #include <string_view>
 
-#include <unistd.h>
-
 #include "Lower.h"
+#include "PosixIo.h"
 #include "ir/Jit.h"
 
 using namespace clotho;

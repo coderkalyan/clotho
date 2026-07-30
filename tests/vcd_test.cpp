@@ -1,15 +1,15 @@
 #include <doctest/doctest.h>
 
-#include <atomic>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <string_view>
 
-#include <unistd.h>
-
 #include "Lower.h"
+#include "PosixIo.h"
+#include "Subprocess.h"
 #include "ir/Jit.h"
 
 using namespace clotho;
@@ -19,8 +19,10 @@ namespace {
 // A fresh dump path per run so cases (which ctest may run in parallel processes)
 // never collide.
 std::string unique_path() {
-    static std::atomic<int> counter{ 0 };
-    return "/tmp/clotho_vcd_" + std::to_string(getpid()) + "_" + std::to_string(counter++) + ".vcd";
+    // generic_string(): the result is spliced into a $dumpfile() string
+    // literal, where a Windows path's backslashes would read as escapes.
+    return (std::filesystem::temp_directory_path() / (test::detail::unique_stem() + ".vcd"))
+      .generic_string();
 }
 
 // JIT-run a design and return the VCD it wrote. The source must open its dump with

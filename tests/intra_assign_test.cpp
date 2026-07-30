@@ -1,58 +1,25 @@
 #include <doctest/doctest.h>
 
-#include <cstdio>
 #include <string>
 #include <string_view>
 
-#include <sys/wait.h>
-#include <unistd.h>
-
 #include "Lower.h"
+#include "Subprocess.h"
 #include "ir/Jit.h"
 
 using namespace clotho;
 
 namespace {
 
-// Read the whole of a temp file into a string.
-std::string slurp(std::FILE* f) {
-    std::rewind(f);
-    std::string out;
-    char        buf[256];
-    size_t      n;
-    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
-        out.append(buf, n);
-    }
-    return out;
-}
-
-// JIT-run a design that ends via $finish and return its stdout. $finish calls
-// std::exit, so the simulation runs in a forked child writing to a temp file
-// (mirrors wait_test.cpp).
+// JIT-run a design that ends via $finish and return its stdout. The simulation
+// gets a process of its own (Subprocess.h explains why $finish cannot share
+// the runner's); lowering here as well is what reports a broken source.
 std::string run_capture_finish(std::string_view source) {
     const LowerResult r = lower_text(source);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
-    std::FILE* tmp = std::tmpfile();
-    REQUIRE(tmp != nullptr);
-    std::fflush(stdout);
-
-    const pid_t pid = fork();
-    REQUIRE(pid >= 0);
-    if (pid == 0) {
-        dup2(fileno(tmp), fileno(stdout));
-        ir::run_jit(*r.module);
-        std::fflush(stdout);
-        _exit(0);
-    }
-
-    int wstatus = 0;
-    REQUIRE(waitpid(pid, &wstatus, 0) == pid);
-
-    std::string out = slurp(tmp);
-    std::fclose(tmp);
-    return out;
+    return test::run_design_subprocess(source);
 }
 
 std::string lower_error(std::string_view source) {

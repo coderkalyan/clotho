@@ -1930,7 +1930,15 @@ private:
     // follow-up), so nesting is struct-through-struct here.
     void emit_agg_store(ir::Index lhs, ir::Ref type, const Expression& rhs,
                         ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
-        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        // By value, not by reference: InternPool::get hands back a reference into
+        // its items_ vector, and interning anything (a constant index below, or a
+        // type while lowering an element expression) push_backs onto that vector
+        // and can reallocate it. Holding a reference across such a call is a
+        // use-after-free -- ASan caught exactly that here, reading t.left/t.right
+        // after the loop's put_int reallocated the pool. Type is a ~20-byte POD,
+        // so the copy is free. Same reasoning as the struct_fields span re-fetch
+        // below.
+        const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
         // A packed plane leaf — a packed vector or packed struct, including one
         // that is the element of an unpacked array recursed into here (`arr <=
         // '{default: 0}` over an array of packed structs). It is a flat plane
@@ -2102,7 +2110,7 @@ private:
     // whole-array copy is guarded (element-wise deferral is a follow-up).
     void emit_agg_copy(ir::Index lhs, ir::Index rhs, ir::Ref type, ir::Inst::Tag tag,
                        ir::Builder& b, ir::SourceLoc l) {
-        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
         if (t.kind == ir::Type::Kind::UnpackedArray) {
             // A nonblocking copy decomposes to per-element StoreNb: each element
             // write into the array rides the backend's deferred array-NBA queue.
@@ -2151,7 +2159,7 @@ private:
     // handle-shaped source is supported (variable / member / element).
     void emit_handle_member_copy(ir::Index lhs, const Expression& rhs, ir::Ref type,
                                  ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
-        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
         if (tag != ir::Inst::Tag::Store) {
             // TODO: nonblocking copy of a queue / dynamic-array member.
             fail("nonblocking assignment to an aggregate with a queue / dynamic "
@@ -2223,7 +2231,7 @@ private:
         aggregate, // unpacked struct / fixed unpacked array: decomposes per leaf
     };
     ValueCat value_cat(ir::Ref type) const {
-        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
         switch (t.kind) {
             case ir::Type::Kind::String:
                 return ValueCat::string;
@@ -2248,7 +2256,7 @@ private:
     // Whether an interned IR type contains an unpacked struct at any nesting depth
     // (backed by the recursive aggregate model; passed / returned by pointer).
     bool contains_struct_ref(ir::Ref type) const {
-        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
         if (t.kind == ir::Type::Kind::UnpackedArray) {
             return contains_struct_ref(t.element);
         }
@@ -2260,7 +2268,7 @@ private:
     // unpacked struct (mirrors the backend is_agg_abi). Broader than
     // contains_struct_ref, which is false for a plain scalar-element array.
     bool is_agg_abi_ref(ir::Ref type) const {
-        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
         return t.kind == ir::Type::Kind::UnpackedArray ||
                (t.kind == ir::Type::Kind::Struct && !t.is_packed);
     }
@@ -2282,7 +2290,7 @@ private:
             case ValueCat::scalar:
                 return true;
             case ValueCat::aggregate: {
-                const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+                const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
                 if (t.kind == ir::Type::Kind::UnpackedArray) {
                     return is_trivially_copyable(t.element);
                 }
@@ -2374,7 +2382,7 @@ private:
     // not cover. An unpacked-array member is walked element-wise (supported);
     // only a queue / dynamic-array leaf still needs the length+element compare.
     void guard_agg_eq_members(ir::Ref type) {
-        const ir::Type& t = std::get<ir::Type>(module_.pool.get(type));
+        const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
         if (t.kind == ir::Type::Kind::Queue || t.kind == ir::Type::Kind::DynArray) {
             // A queue / dynamic-array leaf compares element-wise at runtime
             // (rt_container_eq); its element must be one the runtime handles.
@@ -2455,7 +2463,7 @@ private:
     // True if an interned IR type is the string type, or an unpacked array whose
     // leaf element is.
     bool is_string_ref(ir::Ref ty) const {
-        const ir::Type& t = std::get<ir::Type>(module_.pool.get(ty));
+        const ir::Type t = std::get<ir::Type>(module_.pool.get(ty));
         if (t.kind == ir::Type::Kind::UnpackedArray) {
             return is_string_ref(t.element);
         }
@@ -8879,7 +8887,7 @@ private:
     // wider or nested-aggregate element is a documented follow-up (a non-POD
     // element is already rejected in lower_type).
     void guard_container_p_element(ir::Ref elem) {
-        const ir::Type& e = std::get<ir::Type>(module_.pool.get(elem));
+        const ir::Type e = std::get<ir::Type>(module_.pool.get(elem));
         if (e.kind == ir::Type::Kind::String || module_.pool.is_float(elem)) {
             return;
         }
@@ -8898,7 +8906,7 @@ private:
 
     void expand_p_lvalue(ir::Index lv, ir::Ref ty, std::string& frag, std::vector<ir::Index>& args,
                          ir::Builder& b, ir::SourceLoc l) {
-        const ir::Type& t = std::get<ir::Type>(module_.pool.get(ty));
+        const ir::Type t = std::get<ir::Type>(module_.pool.get(ty));
         if (t.kind == ir::Type::Kind::UnpackedArray) {
             frag += "'{";
             const uint32_t n = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
@@ -9674,7 +9682,7 @@ private:
     void emit_dyn_pattern_fill(ir::Index dst, ir::Ref aty,
                                const slang::ast::AssignmentPatternExpressionBase& pat, ir::Builder& b,
                                ir::SourceLoc l) {
-        const ir::Type& t     = std::get<ir::Type>(module_.pool.get(aty));
+        const ir::Type t     = std::get<ir::Type>(module_.pool.get(aty));
         const auto      elems = pat.elements();
         const uint32_t  n     = static_cast<uint32_t>(elems.size());
         const uint32_t  reps =
@@ -10112,7 +10120,7 @@ private:
     // re-evaluated, so a nonblocking pattern assignment samples once.
     void store_pattern(const slang::ast::AssignmentPatternExpressionBase& pat, ir::Index rhs_addr,
                        ir::Ref rhs_ty, ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
-        const ir::Type& rt    = std::get<ir::Type>(module_.pool.get(rhs_ty));
+        const ir::Type rt    = std::get<ir::Type>(module_.pool.get(rhs_ty));
         const auto      elems = pat.elements();
         if (rt.kind == ir::Type::Kind::Struct) {
             const auto fields = module_.pool.struct_fields(rt.fields_id);
@@ -10198,7 +10206,7 @@ private:
     // order, first element/field at the MSB, per LRM 11.4.14.2 / 7.2.1). The
     // element / field bit widths sum to $bits of the aggregate.
     ir::Index serialize_agg_lvalue(ir::Index lv, ir::Ref ty, ir::Builder& b, ir::SourceLoc l) {
-        const ir::Type& t = std::get<ir::Type>(module_.pool.get(ty));
+        const ir::Type t = std::get<ir::Type>(module_.pool.get(ty));
         std::vector<ir::Index> parts;
         if (t.kind == ir::Type::Kind::UnpackedArray) {
             const uint32_t n = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;

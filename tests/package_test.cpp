@@ -7,10 +7,10 @@
 #include <string_view>
 
 #include "Lower.h"
+#include "PosixIo.h"
 #include "ir/Jit.h"
 
 #include <cstdio>
-#include <unistd.h>
 
 using namespace clotho;
 
@@ -209,7 +209,10 @@ TEST_CASE("package shared across files and across multiple importing modules") {
         endmodule
     )");
 
-    const std::array<std::string_view, 2> paths{ pkg_file.path.native(), top_file.path.native() };
+    // .string(), not .native(): path::string_type is wstring on Windows.
+    const std::string                     pkg_path{ pkg_file.path.string() };
+    const std::string                     top_path{ top_file.path.string() };
+    const std::array<std::string_view, 2> paths{ pkg_path, top_path };
     const LowerResult                     r = lower_files(paths);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
