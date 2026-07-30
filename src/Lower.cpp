@@ -13586,6 +13586,67 @@ Diagnostic from_slang(const slang::DiagnosticEngine& engine, const slang::Diagno
     return out;
 }
 
+// Map slang's default severities onto Clotho's, in two clearly separate parts.
+//
+// THE FLOOR comes first and is not policy. Each promotion here exists because
+// Clotho's own representation cannot express the alternative, so relaxing one
+// would not produce a more permissive mode -- it would produce a miscompile that
+// silently drops a driver, a declaration or a method body. No policy may move
+// these, which is precisely why they are not reachable from the enum.
+//
+// THE POLICY follows, and holds only what genuinely differs by semantics. Today
+// that is the inferred-latch / inferred-comb pair: legal and faithfully
+// simulatable, so a warning under Sim, and the thing a synthesis run most wants
+// to fail on. `AlwaysWithoutTimingControl` looks like it belongs there but does
+// not -- downgrading it is Clotho's reading of LRM 9.2.2.1 (a deadlock, not an
+// error) backed by lowering the construct faithfully, so it holds under every
+// semantics.
+//
+// `policy` is passed rather than threaded from the CLI because there is one
+// value: the selector arrives with the second one, and adding Synth is then an
+// enumerator, an arm below, and one parameter -- not surgery on this function.
+void apply_severity_policy(slang::DiagnosticEngine& engine, DiagnosticPolicy policy) {
+    // ---- Floor: Clotho's representation limits. Invariant across policies. ----
+
+    // LRM 6.5 / 10.3.2 both use normative "shall be an error" for a variable
+    // driven by more than one continuous assignment, or by a mix of continuous
+    // and procedural assignments -- slang defaults these to warnings. Clotho's
+    // signal model has one driver per variable slot with no multi-driver
+    // resolution, so keeping the default severity would mean one of the
+    // conflicting drivers is silently dropped instead of the design rejected.
+    engine.setSeverity(slang::diag::MixedVarAssigns, slang::DiagnosticSeverity::Error);
+    engine.setSeverity(slang::diag::MultipleContAssigns, slang::DiagnosticSeverity::Error);
+    // A name redeclared in the same scope: slang also defaults this to a warning
+    // and silently keeps one declaration. Clotho's symbol table has no "last one
+    // wins" rule, so promote rather than silently favoring whichever declaration
+    // slang's lookup resolves to.
+    engine.setSeverity(slang::diag::Redefinition, slang::DiagnosticSeverity::Error);
+    engine.setSeverity(slang::diag::RedefinitionDifferentType, slang::DiagnosticSeverity::Error);
+    // An out-of-block member declaration (extern method / prototype) whose
+    // implementation is never found in the parent scope: slang defaults this to a
+    // warning and elaborates the design without the body. Clotho would then lower
+    // a call to a member with no lowered implementation.
+    engine.setSeverity(slang::diag::MemberImplNotFound, slang::DiagnosticSeverity::Error);
+    // slang rejects a timing-control-free `always` as a hard error, but LRM
+    // 9.2.2.1 only describes it as a simulation deadlock, and Clotho lowers it
+    // faithfully (see lower_procedural_block). A compliance decision, not a
+    // preference, so it does not vary by policy.
+    engine.setSeverity(slang::diag::AlwaysWithoutTimingControl, slang::DiagnosticSeverity::Warning);
+
+    // ---- Policy: what the chosen semantics judges differently. ----
+
+    switch (policy) {
+        case DiagnosticPolicy::Sim:
+            // LRM 9.2.2.2 / 9.2.2.3 recommend tools warn when a comb / latch
+            // procedure's behavior does not match its declared kind. slang keeps
+            // both in its off-by-default "extra" group, so enable them -- as
+            // warnings, because an inferred latch simulates exactly as written.
+            engine.setSeverity(slang::diag::InferredLatch, slang::DiagnosticSeverity::Warning);
+            engine.setSeverity(slang::diag::InferredComb, slang::DiagnosticSeverity::Warning);
+            break;
+    }
+}
+
 LowerResult lower_compilation(slang::ast::Compilation&       comp,
                               std::shared_ptr<SourceContext> ctx,
                               Timings*                       timings,
@@ -13608,37 +13669,7 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
         slang::DiagnosticEngine engine(*sm);
         auto                    client = std::make_shared<slang::TextDiagnosticClient>();
         engine.addClient(client);
-        // LRM 9.2.2.2 / 9.2.2.3 recommend tools warn when a comb / latch
-        // procedure's behavior does not match its declared kind. slang keeps
-        // both diagnostics in its off-by-default "extra" group, so enable them.
-        engine.setSeverity(slang::diag::InferredLatch, slang::DiagnosticSeverity::Warning);
-        engine.setSeverity(slang::diag::InferredComb, slang::DiagnosticSeverity::Warning);
-        // slang rejects a timing-control-free `always` as a hard error, but the
-        // LRM (9.2.2.1) only describes it as a simulation deadlock: clotho
-        // deliberately lowers it faithfully (see lower_procedural_block), so
-        // downgrade to a warning.
-        engine.setSeverity(slang::diag::AlwaysWithoutTimingControl, slang::DiagnosticSeverity::Warning);
-        // LRM 6.5 / 10.3.2 both use normative "shall be an error" for a
-        // variable driven by more than one continuous assignment, or by a mix
-        // of continuous and procedural assignments -- slang defaults these to
-        // warnings. Clotho's signal model has one driver per variable slot
-        // with no multi-driver resolution, so silently keeping the default
-        // severity would mean one of the conflicting drivers is silently
-        // dropped instead of the design being rejected.
-        engine.setSeverity(slang::diag::MixedVarAssigns, slang::DiagnosticSeverity::Error);
-        engine.setSeverity(slang::diag::MultipleContAssigns, slang::DiagnosticSeverity::Error);
-        // A name redeclared in the same scope: slang also defaults this to a
-        // warning and silently keeps one declaration. Clotho's symbol table
-        // has no "last one wins" rule, so promote to an error rather than
-        // silently favoring whichever declaration slang's lookup resolves to.
-        engine.setSeverity(slang::diag::Redefinition, slang::DiagnosticSeverity::Error);
-        engine.setSeverity(slang::diag::RedefinitionDifferentType, slang::DiagnosticSeverity::Error);
-        // An out-of-block member declaration (extern method / prototype) whose
-        // implementation is never found in the parent scope: slang defaults
-        // this to a warning and elaborates the design without the body. Clotho
-        // would then lower a call to a member with no lowered implementation,
-        // so promote to an error rather than silently accepting the gap.
-        engine.setSeverity(slang::diag::MemberImplNotFound, slang::DiagnosticSeverity::Error);
+        apply_severity_policy(engine, DiagnosticPolicy::Sim);
         // Issue each diagnostic on its own so the text client's buffer holds
         // exactly one item's pretty rendering (snippet + caret) when we harvest it.
         // A diagnostic mapped to Ignored produces no report, hence the empty check.
@@ -13848,8 +13879,9 @@ LowerResult lower_file(std::string_view path, Timings* timings, ir::SystemAccess
     return lower_files({ &path, 1 }, timings, allow_system);
 }
 
-LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver, Timings* timings,
-                         ir::SystemAccess allow_system) {
+LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
+                         Timings*                               timings,
+                         ir::SystemAccess                       allow_system) {
     const auto t_parse = std::chrono::steady_clock::now();
 
     // The Driver owns source loading (incl. `-f` command files, `-y`/`-v`

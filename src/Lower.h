@@ -23,6 +23,26 @@
 
 namespace clotho {
 
+// Which semantics a run judges the design under.
+//
+// A different axis from the command. `lint` names the activity -- analyse and
+// report, write nothing -- and this names what the analysis is measured against,
+// so `clotho lint --policy=synth` is the combination that asks "would a
+// synthesiser object to this?" without a synthesiser in the loop. Calling the
+// severity set a "lint policy" would conflate the two and leave the interesting
+// question (under which semantics?) unanswered.
+//
+// Only what genuinely differs by semantics belongs here. Clotho's own hard
+// limits -- the promotions it makes because its signal model or symbol table
+// cannot represent the alternative -- are NOT policy and must hold under every
+// value; see apply_severity_policy for the split. A policy able to relax those
+// would generate miscompiles, not options.
+enum class DiagnosticPolicy : uint8_t {
+    // IEEE 1800 simulation semantics. The default, and the only value `run` can
+    // meaningfully use: anything it rejects is something Clotho cannot simulate.
+    Sim,
+};
+
 struct LowerResult {
     // The lowered module, or null if lowering failed.
     std::unique_ptr<ir::Module> module;
