@@ -66,8 +66,7 @@ public:
     // Nonblocking intra-assignment event `lvalue <= repeat(count) @(edge trig) value`
     // (LRM 9.4.5): sample `value` and `count` now, store to `lvalue` after `count`
     // occurrences of `trig`'s `edge`. `count` is a constant 1 for a plain `@e`.
-    Index store_nb_event(Index lvalue, Index value, Index count, Signal trig, uint32_t edge,
-                         SourceLoc loc);
+    Index store_nb_event(Index lvalue, Index value, Index count, Signal trig, uint32_t edge, SourceLoc loc);
 
     // -- Irregular shapes --
     Index resize(Index op, Ref type, SourceLoc loc);
@@ -88,8 +87,7 @@ public:
     // Drive-strength multi-driver resolution: fold `slots` (driver values) by
     // per-driver strength (`strengths`, packed strength0<<8 | strength1, parallel
     // to slots) into one 4-state net value. See Inst::Tag::StrengthRes.
-    Index strength_res(std::span<const Index> slots, std::span<const uint16_t> strengths,
-                       SourceLoc loc);
+    Index strength_res(std::span<const Index> slots, std::span<const uint16_t> strengths, SourceLoc loc);
     Index select(Index cond, Index a, Index b, SourceLoc loc);
     Index concat(std::span<const Index> parts, SourceLoc loc);
     Index part_select(Index base, uint32_t msb, uint32_t lsb, SourceLoc loc);
@@ -165,8 +163,7 @@ public:
     Index queue_copy_dynarr(Index dst, Index src, Ref queue_type, SourceLoc loc);
     // Append src[lo:hi] (inclusive, i64 values; full-queue append passes lo = 0,
     // hi = INT64_MAX) onto the dst handle — a queue slice / concatenation operand.
-    Index queue_append_range(Index dst, Index src, Index lo, Index hi, Ref queue_type,
-                             SourceLoc loc);
+    Index queue_append_range(Index dst, Index src, Index lo, Index hi, Ref queue_type, SourceLoc loc);
     // q.reverse() (LRM 7.12.2): reverse element order in place.
     Index queue_reverse(Index q, Ref queue_type, SourceLoc loc);
     // q.sort() (`reversed` false) / q.rsort() (`reversed` true): value order.
@@ -194,8 +191,7 @@ public:
     Index assoc_traverse(Index a, Index key, AssocStep which, Ref assoc_type, SourceLoc loc);
     // `unlikely` hints that the condition is rarely true (e.g. a violation
     // check), so the backend biases branch weights toward the else path.
-    Index cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc,
-               bool unlikely = false);
+    Index cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc, bool unlikely = false);
     // One arm of a `switch`: the constant case-value keys that select it and the
     // arm's already-closed body region. Several keys share one body for a grouped
     // case item. See Builder::switch_.
@@ -212,14 +208,22 @@ public:
     // 2-state bit; the then-branch (pred 1) yields `then_val`, the else-branch
     // yields `else_val`. The two values must share a width; the backend merges
     // them with a PHI. See ir::SelectLazy.
-    Index select_lazy(Index pred, ExtraSlice then_region, Index then_val, ExtraSlice else_region, Index else_val,
-                 SourceLoc loc);
+    Index select_lazy(Index      pred,
+                      ExtraSlice then_region,
+                      Index      then_val,
+                      ExtraSlice else_region,
+                      Index      else_val,
+                      SourceLoc  loc);
     // for / while / forever / do-while. `cond_region` recomputes `pred` each
     // iteration; `step_region` is the per-iteration update (empty for
     // while / forever). `bottom_test` runs the body before the first test
     // (do-while).
-    Index loop(ExtraSlice cond_region, Index pred, ExtraSlice body_region, ExtraSlice step_region,
-               bool bottom_test, SourceLoc loc);
+    Index loop(ExtraSlice cond_region,
+               Index      pred,
+               ExtraSlice body_region,
+               ExtraSlice step_region,
+               bool       bottom_test,
+               SourceLoc  loc);
     // break / continue: jump out of / to the next iteration of the innermost loop.
     Index break_(SourceLoc loc);
     Index continue_(SourceLoc loc);
@@ -254,8 +258,7 @@ public:
     // (wildcard-equality tests), `ranges` back-to-back [lo, hi] operand pairs.
     // All must already be resized to the selector type. Yields a 1-bit 4-state
     // value.
-    Index inside_set(Index sel, std::span<const Index> values, std::span<const Index> ranges,
-                     SourceLoc loc);
+    Index inside_set(Index sel, std::span<const Index> values, std::span<const Index> ranges, SourceLoc loc);
 
     // -- Timing --
     // Event wait `@(a or posedge b ...)`: suspend until ANY listed (signal, edge)
@@ -272,13 +275,11 @@ public:
     // statically-resolved method (supplies the signature + result type); `slot` is
     // its vtable slot; `class_ref` the receiver's static class type; `args` is the
     // receiver handle followed by the formals (each resized to its parameter type).
-    Index call_virtual(FunctionId func, uint32_t slot, Ref class_ref,
-                       std::span<const Index> args, SourceLoc loc);
+    Index call_virtual(FunctionId func, uint32_t slot, Ref class_ref, std::span<const Index> args, SourceLoc loc);
 
     // Dynamically-dispatched virtual TASK call (LRM 8.20) — the task (coroutine)
     // ABI counterpart of call_virtual. Same operand shape.
-    Index task_call_virtual(FunctionId func, uint32_t slot, Ref class_ref,
-                            std::span<const Index> args, SourceLoc loc);
+    Index task_call_virtual(FunctionId func, uint32_t slot, Ref class_ref, std::span<const Index> args, SourceLoc loc);
 
     // Enable task `func`. `args` has one operand per formal in order: an rvalue for
     // an input formal, an lvalue leaf (a caller temp) for an output / inout formal.
@@ -350,8 +351,7 @@ public:
     Index fread_word(Index dst, Index fd, SourceLoc loc);
     // $fread(mem, fd[, start[, count]]): read raw bytes from `fd` into the memory
     // signal `mem`. Yields the byte count.
-    Index fread_mem(Index fd, Signal mem, Index start, Index count, bool has_start, bool has_count,
-                    SourceLoc loc);
+    Index fread_mem(Index fd, Signal mem, Index start, Index count, bool has_start, bool has_count, SourceLoc loc);
     // $finish / $stop: end the simulation and exit. `banner` is the compile-time
     // prefix "<file>:<line>: <task>"; `arg` is the diagnostic level (0/1/2, LRM
     // Table 20-1). No SSA operands.
@@ -366,16 +366,26 @@ public:
     // label; `banner` the compile-time prefix "<file>:<line>: "; `fmt` + `args`
     // the $display-style message (both empty for a bare `$error;`). Non-fatal,
     // renders and returns; $fatal's termination is a following finish().
-    Index severity(uint32_t level, std::string_view banner, std::string_view fmt,
-                   std::span<const Index> args, SourceLoc loc, uint32_t defer = 0);
+    Index severity(uint32_t               level,
+                   std::string_view       banner,
+                   std::string_view       fmt,
+                   std::span<const Index> args,
+                   SourceLoc              loc,
+                   uint32_t               defer = 0);
     // $fflush: flush the descriptor `handle`'s output buffers. The no-argument
     // form passes a constant 0 (the runtime flushes every open stream).
     Index fflush(Index handle, SourceLoc loc);
     // $readmemh / $readmemb: load a file into the memory signal `target`. `filename`
     // is the path value; `start` / `finish` are optional address bounds (pass any
     // Index when the matching has_* is false). `hex` selects hex vs binary.
-    Index read_mem(Signal target, Index filename, Index start, Index finish, bool hex, bool has_start,
-                   bool has_finish, SourceLoc loc);
+    Index read_mem(Signal    target,
+                   Index     filename,
+                   Index     start,
+                   Index     finish,
+                   bool      hex,
+                   bool      has_start,
+                   bool      has_finish,
+                   SourceLoc loc);
     // $timeformat: set the %t format. `units`, `precision`, and `min_width` are
     // already-lowered value operands; `suffix` is a literal string appended after
     // the formatted number.
@@ -424,6 +434,41 @@ public:
     void open_region();
     // End the current region and return its instruction slice.
     ExtraSlice close_region();
+
+    // -- Partial-emission rollback --
+    // A record of every growable column's length, for discarding a self-contained
+    // run of emission that turned out to be unusable.
+    //
+    // This exists for error recovery in the frontend. A lowering guard throws from
+    // arbitrary depth, and most of the time that abandons a Builder local to one
+    // process, so the partial emission dies with it. But declaration and static
+    // class property initializers all share ONE pre-init Builder across every
+    // member of a scope, so a guard tripping inside one would otherwise leave its
+    // half-emitted instructions -- and, worse, any region it opened -- in a
+    // builder that later members keep writing to. `finish()` treats whatever
+    // remains in `scratch_` as the root region, so an unclosed region is not a
+    // crash: it silently absorbs its contents into the body. Rolling back is what
+    // keeps that from happening.
+    struct Mark {
+        uint32_t insts;
+        uint32_t extra;
+        uint32_t scratch;
+        uint32_t regions;
+    };
+
+    [[nodiscard]] Mark mark() const {
+        return { static_cast<uint32_t>(tags_.size()),
+                 static_cast<uint32_t>(extra_.size()),
+                 static_cast<uint32_t>(scratch_.size()),
+                 static_cast<uint32_t>(region_starts_.size()) };
+    }
+
+    // Discard everything emitted since `m`. Sound only when the discarded run is
+    // self-contained -- no instruction at or after `m.insts` may be referenced
+    // from before it, which holds for an abandoned member because its result was
+    // never handed to anything earlier. Callers outside that situation have no
+    // business here.
+    void rollback(Mark m);
 
     // Freeze the built state into an Ir, sealing the root region. The builder is
     // spent afterwards.

@@ -1,3 +1,5 @@
+#include <cassert>
+
 #include "Builder.h"
 
 namespace clotho::ir {
@@ -38,6 +40,28 @@ ExtraSlice Builder::close_region() {
     scratch_.resize(start);
 
     return slice;
+}
+
+void Builder::rollback(Mark m) {
+    // Regions nest within one member's emission, so an abandoned run can only
+    // have left regions OPEN, never closed one that was open at the mark. If that
+    // is violated the mark is not a prefix of the current state and truncating
+    // would splice unrelated instructions into a live region.
+    assert(region_starts_.size() >= m.regions);
+    assert(tags_.size() >= m.insts);
+    assert(extra_.size() >= m.extra);
+    assert(scratch_.size() >= m.scratch);
+    // The instruction columns are parallel, so a mark taken from one is a mark
+    // for all three.
+    assert(payloads_.size() == tags_.size());
+    assert(locs_.size() == tags_.size());
+
+    region_starts_.resize(m.regions);
+    tags_.resize(m.insts);
+    payloads_.resize(m.insts);
+    locs_.resize(m.insts);
+    extra_.resize(m.extra);
+    scratch_.resize(m.scratch);
 }
 
 Index Builder::constant(Ref value, SourceLoc loc) {
@@ -90,12 +114,10 @@ Index Builder::store_nb_delay(Index lvalue, Index value, Index delay, SourceLoc 
 Index Builder::store_inertial_delay(Index lvalue, Index value, Index delay, SourceLoc loc) {
     const ExtraIndex extra = add_extra(StoreNbDelayInfo{ value, delay });
 
-    return emit({ Inst::Tag::StoreInertialDelay, Inst::Payload{ .op_extra = { lvalue, extra } } },
-                loc);
+    return emit({ Inst::Tag::StoreInertialDelay, Inst::Payload{ .op_extra = { lvalue, extra } } }, loc);
 }
 
-Index Builder::store_nb_event(Index lvalue, Index value, Index count, Signal trig, uint32_t edge,
-                              SourceLoc loc) {
+Index Builder::store_nb_event(Index lvalue, Index value, Index count, Signal trig, uint32_t edge, SourceLoc loc) {
     const ExtraIndex extra = add_extra(StoreNbEventInfo{ value, count, trig, edge });
 
     return emit({ Inst::Tag::StoreNbEvent, Inst::Payload{ .op_extra = { lvalue, extra } } }, loc);
@@ -113,12 +135,9 @@ Index Builder::real_math(RealMathOp op, std::span<const Index> args, SourceLoc l
     if (args.size() == 2) {
         const ExtraIndex extra = add_extra(RealMathBinaryInfo{ args[1], static_cast<uint32_t>(op) });
 
-        return emit({ Inst::Tag::RealMathBinary, Inst::Payload{ .op_extra = { args[0], extra } } },
-                    loc);
+        return emit({ Inst::Tag::RealMathBinary, Inst::Payload{ .op_extra = { args[0], extra } } }, loc);
     }
-    return emit({ Inst::Tag::RealMathUnary,
-                  Inst::Payload{ .op_imm = { args[0], static_cast<uint32_t>(op) } } },
-                loc);
+    return emit({ Inst::Tag::RealMathUnary, Inst::Payload{ .op_imm = { args[0], static_cast<uint32_t>(op) } } }, loc);
 }
 
 Index Builder::repl(Index value, uint32_t count, SourceLoc loc) {
@@ -133,12 +152,10 @@ Index Builder::net_pull(Index op, uint32_t pull, SourceLoc loc) {
     return emit({ Inst::Tag::NetPull, Inst::Payload{ .op_imm = { op, pull } } }, loc);
 }
 
-Index Builder::strength_res(std::span<const Index> slots, std::span<const uint16_t> strengths,
-                            SourceLoc loc) {
+Index Builder::strength_res(std::span<const Index> slots, std::span<const uint16_t> strengths, SourceLoc loc) {
     std::vector<uint32_t> packed(strengths.begin(), strengths.end());
-    const StrengthResInfo info{ .values    = add_slice(slots),
-                                .strengths = add_u32_slice(packed) };
-    const ExtraIndex extra = add_extra(info);
+    const StrengthResInfo info{ .values = add_slice(slots), .strengths = add_u32_slice(packed) };
+    const ExtraIndex      extra = add_extra(info);
 
     return emit({ Inst::Tag::StrengthRes, pay(&Inst::Payload::extra, extra) }, loc);
 }
@@ -210,8 +227,7 @@ Index Builder::dyn_array_new(Index arr, Index size, Index init, bool has_init, R
     if (has_init) {
         const ExtraIndex extra = add_extra(DynArrayNewInitInfo{ size, init, array_type });
 
-        return emit({ Inst::Tag::DynArrayNewInit, Inst::Payload{ .op_extra = { arr, extra } } },
-                    loc);
+        return emit({ Inst::Tag::DynArrayNewInit, Inst::Payload{ .op_extra = { arr, extra } } }, loc);
     }
     const ExtraIndex extra = add_extra(DynArrayArg{ size, array_type });
 
@@ -223,8 +239,7 @@ Index Builder::dyn_array_size(Index arr, Ref array_type, SourceLoc loc) {
 }
 
 Index Builder::dyn_array_delete(Index arr, Ref array_type, SourceLoc loc) {
-    return emit({ Inst::Tag::DynArrayDelete, Inst::Payload{ .op_type = { arr, array_type } } },
-                loc);
+    return emit({ Inst::Tag::DynArrayDelete, Inst::Payload{ .op_type = { arr, array_type } } }, loc);
 }
 
 Index Builder::dyn_array_copy(Index dst, Index src, Ref array_type, SourceLoc loc) {
@@ -253,15 +268,14 @@ Index Builder::queue_size(Index q, Ref queue_type, SourceLoc loc) {
 Index Builder::queue_push(Index q, Index elem, bool front, Ref queue_type, SourceLoc loc) {
     const ExtraIndex extra = add_extra(QueueArg{ elem, queue_type });
 
-    return emit({ front ? Inst::Tag::QueuePushFront : Inst::Tag::QueuePushBack,
-                  Inst::Payload{ .op_extra = { q, extra } } },
-                loc);
+    return emit(
+      { front ? Inst::Tag::QueuePushFront : Inst::Tag::QueuePushBack, Inst::Payload{ .op_extra = { q, extra } } }, loc);
 }
 
 Index Builder::queue_pop(Index q, bool front, Ref queue_type, SourceLoc loc) {
-    return emit({ front ? Inst::Tag::QueuePopFront : Inst::Tag::QueuePopBack,
-                  Inst::Payload{ .op_type = { q, queue_type } } },
-                loc);
+    return emit(
+      { front ? Inst::Tag::QueuePopFront : Inst::Tag::QueuePopBack, Inst::Payload{ .op_type = { q, queue_type } } },
+      loc);
 }
 
 Index Builder::queue_insert(Index q, Index idx, Index elem, Ref queue_type, SourceLoc loc) {
@@ -272,8 +286,7 @@ Index Builder::queue_insert(Index q, Index idx, Index elem, Ref queue_type, Sour
 
 Index Builder::queue_delete(Index q, Index idx, bool has_idx, Ref queue_type, SourceLoc loc) {
     if (!has_idx) {
-        return emit({ Inst::Tag::QueueDeleteAll, Inst::Payload{ .op_type = { q, queue_type } } },
-                    loc);
+        return emit({ Inst::Tag::QueueDeleteAll, Inst::Payload{ .op_type = { q, queue_type } } }, loc);
     }
     const ExtraIndex extra = add_extra(QueueArg{ idx, queue_type });
 
@@ -298,8 +311,7 @@ Index Builder::queue_copy_dynarr(Index dst, Index src, Ref queue_type, SourceLoc
     return emit({ Inst::Tag::QueueCopyDyn, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
 }
 
-Index Builder::queue_append_range(Index dst, Index src, Index lo, Index hi, Ref queue_type,
-                                  SourceLoc loc) {
+Index Builder::queue_append_range(Index dst, Index src, Index lo, Index hi, Ref queue_type, SourceLoc loc) {
     const ExtraIndex extra = add_extra(QueueSliceInfo{ src, lo, hi, queue_type });
 
     return emit({ Inst::Tag::QueueAppendRange, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
@@ -336,8 +348,7 @@ Index Builder::assoc_exists(Index a, Index key, Ref assoc_type, SourceLoc loc) {
 
 Index Builder::assoc_delete(Index a, Index key, bool has_key, Ref assoc_type, SourceLoc loc) {
     if (!has_key) {
-        return emit({ Inst::Tag::AssocDeleteAll, Inst::Payload{ .op_type = { a, assoc_type } } },
-                    loc);
+        return emit({ Inst::Tag::AssocDeleteAll, Inst::Payload{ .op_type = { a, assoc_type } } }, loc);
     }
     const ExtraIndex extra = add_extra(AssocArg{ key, assoc_type });
 
@@ -353,25 +364,31 @@ Index Builder::assoc_copy(Index dst, Index src, Ref assoc_type, SourceLoc loc) {
 Index Builder::assoc_traverse(Index a, Index key, AssocStep which, Ref assoc_type, SourceLoc loc) {
     Inst::Tag tag = Inst::Tag::AssocFirst;
     switch (which) {
-        case AssocStep::First: tag = Inst::Tag::AssocFirst; break;
-        case AssocStep::Last:  tag = Inst::Tag::AssocLast; break;
-        case AssocStep::Next:  tag = Inst::Tag::AssocNext; break;
-        case AssocStep::Prev:  tag = Inst::Tag::AssocPrev; break;
+        case AssocStep::First:
+            tag = Inst::Tag::AssocFirst;
+            break;
+        case AssocStep::Last:
+            tag = Inst::Tag::AssocLast;
+            break;
+        case AssocStep::Next:
+            tag = Inst::Tag::AssocNext;
+            break;
+        case AssocStep::Prev:
+            tag = Inst::Tag::AssocPrev;
+            break;
     }
     const ExtraIndex extra = add_extra(AssocArg{ key, assoc_type });
 
     return emit({ tag, Inst::Payload{ .op_extra = { a, extra } } }, loc);
 }
 
-Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc,
-                    bool unlikely) {
+Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_region, SourceLoc loc, bool unlikely) {
     const ExtraIndex extra = add_extra(Regions{ then_region, else_region, unlikely ? 1u : 0u });
 
     return emit({ Inst::Tag::Cond, Inst::Payload{ .op_extra = { condition, extra } } }, loc);
 }
 
-Index Builder::switch_(Index selector, std::span<const SwitchArmBuild> arms, ExtraSlice default_region,
-                       SourceLoc loc) {
+Index Builder::switch_(Index selector, std::span<const SwitchArmBuild> arms, ExtraSlice default_region, SourceLoc loc) {
     // Lay the arm records after their keys so every ExtraSlice is an absolute
     // offset: each arm's keys (u64 -> two words) first, then the SwitchArm
     // records contiguously, then the SwitchInfo referencing the record run.
@@ -393,23 +410,29 @@ Index Builder::switch_(Index selector, std::span<const SwitchArmBuild> arms, Ext
     }
     const auto arms_end = static_cast<ExtraIndex>(extra_.size());
 
-    const ExtraIndex extra =
-      add_extra(SwitchInfo{ ExtraSlice{ arms_start, arms_end }, default_region });
+    const ExtraIndex extra = add_extra(SwitchInfo{ ExtraSlice{ arms_start, arms_end }, default_region });
 
     return emit({ Inst::Tag::Switch, Inst::Payload{ .op_extra = { selector, extra } } }, loc);
 }
 
-Index Builder::select_lazy(Index pred, ExtraSlice then_region, Index then_val, ExtraSlice else_region, Index else_val,
-                      SourceLoc loc) {
+Index Builder::select_lazy(Index      pred,
+                           ExtraSlice then_region,
+                           Index      then_val,
+                           ExtraSlice else_region,
+                           Index      else_val,
+                           SourceLoc  loc) {
     const ExtraIndex extra = add_extra(SelectLazy{ then_region, then_val, else_region, else_val });
 
     return emit({ Inst::Tag::SelectLazy, Inst::Payload{ .op_extra = { pred, extra } } }, loc);
 }
 
-Index Builder::loop(ExtraSlice cond_region, Index pred, ExtraSlice body_region, ExtraSlice step_region,
-                    bool bottom_test, SourceLoc loc) {
-    const ExtraIndex extra =
-      add_extra(LoopInfo{ cond_region, pred, body_region, step_region, bottom_test ? 1u : 0u });
+Index Builder::loop(ExtraSlice cond_region,
+                    Index      pred,
+                    ExtraSlice body_region,
+                    ExtraSlice step_region,
+                    bool       bottom_test,
+                    SourceLoc  loc) {
+    const ExtraIndex extra = add_extra(LoopInfo{ cond_region, pred, body_region, step_region, bottom_test ? 1u : 0u });
 
     return emit({ Inst::Tag::Loop, pay(&Inst::Payload::extra, extra) }, loc);
 }
@@ -478,8 +501,7 @@ Index Builder::count_bits(Index op, uint32_t mask, SourceLoc loc) {
     return emit({ Inst::Tag::CountBits, Inst::Payload{ .op_extra = { op, extra } } }, loc);
 }
 
-Index Builder::inside_set(Index sel, std::span<const Index> values, std::span<const Index> ranges,
-                          SourceLoc loc) {
+Index Builder::inside_set(Index sel, std::span<const Index> values, std::span<const Index> ranges, SourceLoc loc) {
     const ExtraSlice vals  = add_slice(values);
     const ExtraSlice rngs  = add_slice(ranges);
     const ExtraIndex extra = add_extra(InsideSetInfo{ vals, rngs });
@@ -495,9 +517,9 @@ Index Builder::wait(std::span<const WaitEdge> events, SourceLoc loc) {
         const auto       words = std::bit_cast<std::array<uint32_t, n>>(e);
         extra_.insert(extra_.end(), words.begin(), words.end());
     }
-    const auto       end  = static_cast<uint32_t>(extra_.size());
-    const ExtraIndex info = add_extra(
-      WaitInfo{ ExtraSlice{ static_cast<ExtraIndex>(start), static_cast<ExtraIndex>(end) } });
+    const auto       end = static_cast<uint32_t>(extra_.size());
+    const ExtraIndex info =
+      add_extra(WaitInfo{ ExtraSlice{ static_cast<ExtraIndex>(start), static_cast<ExtraIndex>(end) } });
 
     return emit({ Inst::Tag::Wait, pay(&Inst::Payload::extra, info) }, loc);
 }
@@ -509,8 +531,7 @@ Index Builder::call(FunctionId func, std::span<const Index> args, SourceLoc loc)
     return emit({ Inst::Tag::Call, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
-Index Builder::call_virtual(FunctionId func, uint32_t slot, Ref class_ref,
-                            std::span<const Index> args, SourceLoc loc) {
+Index Builder::call_virtual(FunctionId func, uint32_t slot, Ref class_ref, std::span<const Index> args, SourceLoc loc) {
     const ExtraSlice slice = add_slice(args);
     const ExtraIndex extra = add_extra(VirtualCallInfo{ func, slot, class_ref, slice });
 
@@ -524,8 +545,11 @@ Index Builder::task_call(FunctionId func, std::span<const Index> args, SourceLoc
     return emit({ Inst::Tag::TaskCall, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
-Index Builder::task_call_virtual(FunctionId func, uint32_t slot, Ref class_ref,
-                                 std::span<const Index> args, SourceLoc loc) {
+Index Builder::task_call_virtual(FunctionId             func,
+                                 uint32_t               slot,
+                                 Ref                    class_ref,
+                                 std::span<const Index> args,
+                                 SourceLoc              loc) {
     const ExtraSlice slice = add_slice(args);
     const ExtraIndex extra = add_extra(VirtualCallInfo{ func, slot, class_ref, slice });
 
@@ -547,32 +571,25 @@ Index Builder::fork(std::span<const FunctionId> children, ForkKind kind, SourceL
 
 Index Builder::display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc) {
     // $display / $write: no descriptor operand; the backend targets standard output.
-    return emit({ Inst::Tag::Display, pay(&Inst::Payload::extra, display_info(fmt, newline, args)) },
-                loc);
+    return emit({ Inst::Tag::Display, pay(&Inst::Payload::extra, display_info(fmt, newline, args)) }, loc);
 }
 
-Index Builder::fdisplay(Index fd, std::string_view fmt, bool newline, std::span<const Index> args,
-                        SourceLoc loc) {
+Index Builder::fdisplay(Index fd, std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc) {
     // $fdisplay / $fwrite: `fd` selects the destination descriptor.
-    return emit({ Inst::Tag::FDisplay,
-                  Inst::Payload{ .op_extra = { fd, display_info(fmt, newline, args) } } },
-                loc);
+    return emit({ Inst::Tag::FDisplay, Inst::Payload{ .op_extra = { fd, display_info(fmt, newline, args) } } }, loc);
 }
 
 Index Builder::strobe_pend(FunctionId func, SourceLoc loc) {
-    return emit({ Inst::Tag::StrobePend, pay(&Inst::Payload::extra, add_extra(StrobePendInfo{ func })) },
-                loc);
+    return emit({ Inst::Tag::StrobePend, pay(&Inst::Payload::extra, add_extra(StrobePendInfo{ func })) }, loc);
 }
 
 Index Builder::monitor_set(FunctionId func, SourceLoc loc) {
-    return emit({ Inst::Tag::MonitorSet, pay(&Inst::Payload::extra, add_extra(StrobePendInfo{ func })) },
-                loc);
+    return emit({ Inst::Tag::MonitorSet, pay(&Inst::Payload::extra, add_extra(StrobePendInfo{ func })) }, loc);
 }
 
 Index Builder::monitor_emit(Index fd, std::string_view fmt, std::span<const Index> args, SourceLoc loc) {
-    return emit({ Inst::Tag::MonitorEmit,
-                  Inst::Payload{ .op_extra = { fd, display_info(fmt, /*newline=*/true, args) } } },
-                loc);
+    return emit(
+      { Inst::Tag::MonitorEmit, Inst::Payload{ .op_extra = { fd, display_info(fmt, /*newline=*/true, args) } } }, loc);
 }
 
 Index Builder::monitor_enable(bool on, SourceLoc loc) {
@@ -585,8 +602,7 @@ ExtraIndex Builder::display_info(std::string_view fmt, bool newline, std::span<c
     const ExtraIndex fmt_at = add_bytes(fmt);
     const ExtraSlice slice  = add_slice(args);
 
-    return add_extra(
-      DisplayInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), newline ? 1u : 0u, slice });
+    return add_extra(DisplayInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), newline ? 1u : 0u, slice });
 }
 
 Index Builder::fopen_fd(Index name, Index mode, SourceLoc loc) {
@@ -616,7 +632,7 @@ Index Builder::sformat(Index dst, std::string_view fmt, std::span<const Index> a
     // SformatInfo record pointing at both.
     const ExtraIndex fmt_at = add_bytes(fmt);
     const ExtraSlice slice  = add_slice(args);
-    const ExtraIndex extra = add_extra(SformatInfo{ dst, fmt_at, static_cast<uint32_t>(fmt.size()), slice });
+    const ExtraIndex extra  = add_extra(SformatInfo{ dst, fmt_at, static_cast<uint32_t>(fmt.size()), slice });
 
     return emit({ Inst::Tag::Sformat, pay(&Inst::Payload::extra, extra) }, loc);
 }
@@ -630,8 +646,7 @@ Index Builder::sformatf(std::string_view fmt, std::span<const Index> args, Sourc
 }
 
 Index Builder::container_fmt_p(Index handle, Ref container_type, SourceLoc loc) {
-    return emit({ Inst::Tag::ContainerFmtP, Inst::Payload{ .op_type = { handle, container_type } } },
-                loc);
+    return emit({ Inst::Tag::ContainerFmtP, Inst::Payload{ .op_type = { handle, container_type } } }, loc);
 }
 
 Index Builder::ferror(Index dst, Index fd, SourceLoc loc) {
@@ -646,52 +661,58 @@ Index Builder::fread_word(Index dst, Index fd, SourceLoc loc) {
     return emit({ Inst::Tag::FreadWord, Inst::Payload{ .binary = { dst, fd } } }, loc);
 }
 
-Index Builder::fread_mem(Index fd, Signal mem, Index start, Index count, bool has_start, bool has_count,
+Index Builder::fread_mem(Index     fd,
+                         Signal    mem,
+                         Index     start,
+                         Index     count,
+                         bool      has_start,
+                         bool      has_count,
                          SourceLoc loc) {
-    const ExtraIndex extra =
-      add_extra(FreadMemInfo{ mem, start, count, has_start ? 1u : 0u, has_count ? 1u : 0u });
+    const ExtraIndex extra = add_extra(FreadMemInfo{ mem, start, count, has_start ? 1u : 0u, has_count ? 1u : 0u });
 
     return emit({ Inst::Tag::FreadMem, Inst::Payload{ .op_extra = { fd, extra } } }, loc);
 }
 
-Index Builder::scanf(Index source, bool is_string, std::string_view fmt, std::span<const Index> args,
-                     SourceLoc loc) {
+Index Builder::scanf(Index source, bool is_string, std::string_view fmt, std::span<const Index> args, SourceLoc loc) {
     // Order in the extra buffer: format bytes, then the output-lvalue slice, then
     // the ScanfInfo record pointing at both.
     const ExtraIndex fmt_at = add_bytes(fmt);
     const ExtraSlice slice  = add_slice(args);
-    const ExtraIndex extra =
-      add_extra(ScanfInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), source, slice });
+    const ExtraIndex extra  = add_extra(ScanfInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), source, slice });
 
-    return emit({ is_string ? Inst::Tag::Sscanf : Inst::Tag::Fscanf,
-                  pay(&Inst::Payload::extra, extra) },
-                loc);
+    return emit({ is_string ? Inst::Tag::Sscanf : Inst::Tag::Fscanf, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
 Index Builder::finish(std::string_view banner, uint32_t arg, SourceLoc loc) {
     const ExtraIndex banner_at = add_bytes(banner);
-    const ExtraIndex extra =
-      add_extra(FinishInfo{ banner_at, static_cast<uint32_t>(banner.size()), arg });
+    const ExtraIndex extra     = add_extra(FinishInfo{ banner_at, static_cast<uint32_t>(banner.size()), arg });
     return emit({ Inst::Tag::Finish, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
 Index Builder::case_violation(std::string_view banner, uint32_t kind, SourceLoc loc) {
     const ExtraIndex banner_at = add_bytes(banner);
-    const ExtraIndex extra =
-      add_extra(CaseViolInfo{ banner_at, static_cast<uint32_t>(banner.size()), kind });
+    const ExtraIndex extra     = add_extra(CaseViolInfo{ banner_at, static_cast<uint32_t>(banner.size()), kind });
     return emit({ Inst::Tag::CaseViol, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
-Index Builder::severity(uint32_t level, std::string_view banner, std::string_view fmt,
-                        std::span<const Index> args, SourceLoc loc, uint32_t defer) {
+Index Builder::severity(uint32_t               level,
+                        std::string_view       banner,
+                        std::string_view       fmt,
+                        std::span<const Index> args,
+                        SourceLoc              loc,
+                        uint32_t               defer) {
     // Order in the extra buffer: banner bytes, format bytes, then the arg-index
     // slice, then the SeverityInfo record pointing at all three.
     const ExtraIndex banner_at = add_bytes(banner);
     const ExtraIndex fmt_at    = add_bytes(fmt);
     const ExtraSlice slice     = add_slice(args);
-    const ExtraIndex extra     = add_extra(SeverityInfo{
-      banner_at, static_cast<uint32_t>(banner.size()), fmt_at, static_cast<uint32_t>(fmt.size()),
-      level, defer, slice });
+    const ExtraIndex extra     = add_extra(SeverityInfo{ banner_at,
+                                                         static_cast<uint32_t>(banner.size()),
+                                                         fmt_at,
+                                                         static_cast<uint32_t>(fmt.size()),
+                                                         level,
+                                                         defer,
+                                                         slice });
     return emit({ Inst::Tag::Severity, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
@@ -699,10 +720,16 @@ Index Builder::fflush(Index handle, SourceLoc loc) {
     return emit({ Inst::Tag::Fflush, pay(&Inst::Payload::unary, handle) }, loc);
 }
 
-Index Builder::read_mem(Signal target, Index filename, Index start, Index finish, bool hex, bool has_start,
-                        bool has_finish, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(
-      ReadMemInfo{ target, start, finish, hex ? 1u : 0u, has_start ? 1u : 0u, has_finish ? 1u : 0u });
+Index Builder::read_mem(Signal    target,
+                        Index     filename,
+                        Index     start,
+                        Index     finish,
+                        bool      hex,
+                        bool      has_start,
+                        bool      has_finish,
+                        SourceLoc loc) {
+    const ExtraIndex extra =
+      add_extra(ReadMemInfo{ target, start, finish, hex ? 1u : 0u, has_start ? 1u : 0u, has_finish ? 1u : 0u });
 
     return emit({ Inst::Tag::ReadMem, Inst::Payload{ .op_extra = { filename, extra } } }, loc);
 }
@@ -711,8 +738,8 @@ Index Builder::timeformat(Index units, Index precision, std::string_view suffix,
     // Order in the extra buffer: suffix bytes, then the TimeFormatInfo record
     // pointing at them. The three operands are plain SSA indices in the record.
     const ExtraIndex suffix_at = add_bytes(suffix);
-    const ExtraIndex extra     = add_extra(
-      TimeFormatInfo{ units, precision, min_width, suffix_at, static_cast<uint32_t>(suffix.size()) });
+    const ExtraIndex extra =
+      add_extra(TimeFormatInfo{ units, precision, min_width, suffix_at, static_cast<uint32_t>(suffix.size()) });
 
     return emit({ Inst::Tag::TimeFormat, pay(&Inst::Payload::extra, extra) }, loc);
 }
@@ -739,10 +766,8 @@ Index Builder::random(SourceLoc loc) {
 
 Index Builder::dist_call(DistOp op, std::span<const Index> args, SourceLoc loc) {
     if (args.size() == 3) {
-        const ExtraIndex extra =
-          add_extra(DistBinaryInfo{ args[1], args[2], static_cast<uint32_t>(op) });
-        return emit({ Inst::Tag::DistBinary, Inst::Payload{ .op_extra = { args[0], extra } } },
-                    loc);
+        const ExtraIndex extra = add_extra(DistBinaryInfo{ args[1], args[2], static_cast<uint32_t>(op) });
+        return emit({ Inst::Tag::DistBinary, Inst::Payload{ .op_extra = { args[0], extra } } }, loc);
     }
     const ExtraIndex extra = add_extra(DistUnaryInfo{ args[1], static_cast<uint32_t>(op) });
     return emit({ Inst::Tag::DistUnary, Inst::Payload{ .op_extra = { args[0], extra } } }, loc);
@@ -768,8 +793,8 @@ Index Builder::test_plusargs(std::string_view str, SourceLoc loc) {
 
 Index Builder::value_plusargs(Index dst, std::string_view prefix, char conv, SourceLoc loc) {
     const ExtraIndex prefix_at = add_bytes(prefix);
-    const ExtraIndex extra     = add_extra(
-      ValuePlusArgsInfo{ prefix_at, static_cast<uint32_t>(prefix.size()), static_cast<uint32_t>(conv) });
+    const ExtraIndex extra =
+      add_extra(ValuePlusArgsInfo{ prefix_at, static_cast<uint32_t>(prefix.size()), static_cast<uint32_t>(conv) });
     return emit({ Inst::Tag::ValuePlusArgs, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
 }
 

@@ -6,19 +6,22 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <utility>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <ankerl/unordered_dense.h>
 
+#include <slang/analysis/AnalysisManager.h>
 #include <slang/ast/ASTContext.h>
 #include <slang/ast/ASTVisitor.h>
 #include <slang/ast/Compilation.h>
 #include <slang/ast/EvalContext.h>
 #include <slang/ast/Expression.h>
+#include <slang/ast/Patterns.h>
+#include <slang/ast/Scope.h>
 #include <slang/ast/SemanticFacts.h>
 #include <slang/ast/Statement.h>
 #include <slang/ast/TimingControl.h>
@@ -30,7 +33,6 @@
 #include <slang/ast/expressions/Operator.h>
 #include <slang/ast/expressions/OperatorExpressions.h>
 #include <slang/ast/expressions/SelectExpressions.h>
-#include <slang/ast/Patterns.h>
 #include <slang/ast/statements/ConditionalStatements.h>
 #include <slang/ast/statements/LoopStatements.h>
 #include <slang/ast/statements/MiscStatements.h>
@@ -47,8 +49,6 @@
 #include <slang/ast/types/AllTypes.h>
 #include <slang/ast/types/NetType.h>
 #include <slang/ast/types/Type.h>
-#include <slang/ast/Scope.h>
-#include <slang/analysis/AnalysisManager.h>
 #include <slang/diagnostics/AnalysisDiags.h>
 #include <slang/diagnostics/DeclarationsDiags.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
@@ -105,8 +105,7 @@ const ValueSymbol& canonical_value_symbol(const ValueSymbol& sym) {
             // shares storage, so follow it; a structural expression
             // (part-select / concat) maps to a bit sub-range with no single
             // canonical symbol and is rejected loudly in signal_of.
-            if (conn->kind == ExpressionKind::NamedValue ||
-                conn->kind == ExpressionKind::HierarchicalValue) {
+            if (conn->kind == ExpressionKind::NamedValue || conn->kind == ExpressionKind::HierarchicalValue) {
                 next = &conn->as<ValueExpressionBase>().symbol;
             }
         }
@@ -150,8 +149,7 @@ uint64_t tsv_to_fs(slang::TimeScaleValue v) {
 // amount expression is floating. Rise/fall/turn-off triples (Delay3) are rejected
 // at lowering regardless, so a real one there needs no tick handling.
 bool delay_is_real(const TimingControl* tc) {
-    return tc != nullptr && tc->kind == TimingControlKind::Delay &&
-           tc->as<DelayControl>().expr.type->isFloating();
+    return tc != nullptr && tc->kind == TimingControlKind::Delay && tc->as<DelayControl>().expr.type->isFloating();
 }
 
 // Walks a procedural block body for any real (`#1.5`-style) delay: a `#delay`
@@ -252,7 +250,7 @@ uint64_t design_tick_fs(const InstanceSymbol& inst, bool& any_explicit);
 // enclosing instance's timescale but may instantiate further modules).
 // Uninstantiated generate branches contribute nothing.
 uint64_t scope_min_tick_fs(const Scope& scope, bool& any_explicit) {
-    uint64_t   min_fs = 0;
+    uint64_t   min_fs   = 0;
     const auto consider = [&](uint64_t child) {
         if (child != 0 && (min_fs == 0 || child < min_fs)) {
             min_fs = child;
@@ -286,7 +284,7 @@ uint64_t scope_min_tick_fs(const Scope& scope, bool& any_explicit) {
 }
 
 uint64_t design_tick_fs(const InstanceSymbol& inst, bool& any_explicit) {
-    uint64_t   min_fs  = 0;
+    uint64_t   min_fs   = 0;
     const auto consider = [&](uint64_t f) {
         if (f != 0 && (min_fs == 0 || f < min_fs)) {
             min_fs = f;
@@ -388,14 +386,16 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
 
     const SigMap&                          sigmap;
     SensitivityMode                        mode;
-    std::vector<ir::Signal>                reads;    // in first-seen order
-    ankerl::unordered_dense::set<uint32_t> seen;     // dedup for `reads`
-    ankerl::unordered_dense::set<uint32_t> written;  // assignment targets / locals
+    std::vector<ir::Signal>                reads;   // in first-seen order
+    ankerl::unordered_dense::set<uint32_t> seen;    // dedup for `reads`
+    ankerl::unordered_dense::set<uint32_t> written; // assignment targets / locals
     // User functions already descended into, so a function called from several
     // sites (or a recursive one) is walked at most once.
     ankerl::unordered_dense::set<const SubroutineSymbol*> entered;
 
-    SensitivityCollector(const SigMap& m, SensitivityMode mode) : sigmap(m), mode(mode) {}
+    SensitivityCollector(const SigMap& m, SensitivityMode mode)
+      : sigmap(m)
+      , mode(mode) {}
 
     void record_read(const ValueSymbol& sym) {
         const auto it = sigmap.find(&canonical_value_symbol(sym));
@@ -449,8 +449,7 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
                 // are illegal as an lvalue (rejected at lowering) but are walked
                 // the same way here — sensitivity analysis is best-effort ahead
                 // of that guard.
-                const auto& pat =
-                    static_cast<const slang::ast::AssignmentPatternExpressionBase&>(lhs);
+                const auto& pat = static_cast<const slang::ast::AssignmentPatternExpressionBase&>(lhs);
                 for (const Expression* op : pat.elements()) {
                     record_write(*op);
                 }
@@ -467,11 +466,15 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
         }
     }
 
-    void handle(const NamedValueExpression& nv) { record_read(nv.symbol); }
+    void handle(const NamedValueExpression& nv) {
+        record_read(nv.symbol);
+    }
 
     // A hierarchical read (`@* … = top.u1.sig`, LRM 23.6) makes the process
     // sensitive to the target instance's signal, same as a local read.
-    void handle(const HierarchicalValueExpression& hv) { record_read(hv.symbol); }
+    void handle(const HierarchicalValueExpression& hv) {
+        record_read(hv.symbol);
+    }
 
     void handle(const AssignmentExpression& a) {
         a.right().visit(*this); // RHS: pure reads
@@ -487,7 +490,9 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     // expression carry no sensitivity (9.2.2.2.1 (c), 9.4.2.2): skip the timing
     // control and walk only the controlled statement. Reachable only from
     // `always @*` (Comb procedures reject timing controls at elaboration).
-    void handle(const TimedStatement& t) { t.stmt.visit(*this); }
+    void handle(const TimedStatement& t) {
+        t.stmt.visit(*this);
+    }
 
     // A `fork` block's children are independent concurrent processes (LRM 9.3.2)
     // with their own sensitivity — their reads never wake the parent process, so
@@ -541,8 +546,7 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
             return;
         }
         const SubroutineSymbol* sub = std::get<0>(c.subroutine);
-        if (sub != nullptr && sub->subroutineKind == SubroutineKind::Function &&
-            entered.insert(sub).second) {
+        if (sub != nullptr && sub->subroutineKind == SubroutineKind::Function && entered.insert(sub).second) {
             sub->getBody().visit(*this);
         }
     }
@@ -557,8 +561,12 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
 struct EffectDetector : ASTVisitor<EffectDetector, VisitFlags::AllGood> {
     bool found = false;
 
-    void handle(const CallExpression&) { found = true; }
-    void handle(const AssignmentExpression&) { found = true; }
+    void handle(const CallExpression&) {
+        found = true;
+    }
+    void handle(const AssignmentExpression&) {
+        found = true;
+    }
     void handle(const UnaryExpression& u) {
         switch (u.op) {
             case UnaryOperator::Preincrement:
@@ -590,8 +598,12 @@ struct LocalRefDetector : ASTVisitor<LocalRefDetector, VisitFlags::AllGood> {
             found = true;
         }
     }
-    void handle(const NamedValueExpression& nv) { check(nv.symbol); }
-    void handle(const HierarchicalValueExpression& hv) { check(hv.symbol); }
+    void handle(const NamedValueExpression& nv) {
+        check(nv.symbol);
+    }
+    void handle(const HierarchicalValueExpression& hv) {
+        check(hv.symbol);
+    }
 };
 
 // Walks the elaborated AST of one top module into an ir::Module.
@@ -599,8 +611,7 @@ class Lowerer {
 public:
     // `tick_fs` is the femtoseconds-per-wheel-tick (design-wide smallest time
     // unit), or 0 when no design unit set a timescale (unitless ticks).
-    Lowerer(ir::Module& module, uint64_t tick_fs,
-            ir::SystemAccess allow_system = ir::SystemAccess::Off)
+    Lowerer(ir::Module& module, uint64_t tick_fs, ir::SystemAccess allow_system = ir::SystemAccess::Off)
       : module_(module)
       , tick_fs_(tick_fs)
       , allow_system_(allow_system) {}
@@ -630,8 +641,11 @@ public:
     // and recurse. Repeated instantiations disambiguate for free — slang gives
     // each instance distinct ValueSymbols, so sigmap_ (keyed by symbol) maps
     // each to its own signal.
-    void lower_instance(const InstanceSymbol& inst, std::string_view prefix, Pass pass,
-                        ir::InstanceScope* node, std::string_view leaf_name) {
+    void lower_instance(const InstanceSymbol& inst,
+                        std::string_view      prefix,
+                        Pass                  pass,
+                        ir::InstanceScope*    node,
+                        std::string_view      leaf_name) {
         if (prefix.empty() && pass == Pass::Collect) {
             module_.name = std::string(inst.name);
         }
@@ -758,6 +772,15 @@ public:
         globals_ = g;
     }
 
+    // Diagnostics for members this Lowerer recovered past, and whether it did so
+    // at all. Drained by lower_compilation once the walk finishes.
+    [[nodiscard]] std::span<const Diagnostic> recovered_diags() const {
+        return diags_;
+    }
+    [[nodiscard]] bool poisoned() const {
+        return poisoned_;
+    }
+
 private:
     // Lower the non-signal members of a scope (an instance body or a generate
     // block) into processes: continuous assigns, procedural blocks, child
@@ -765,8 +788,12 @@ private:
     // hierarchical name prefix of `scope`; `self_mul` is the enclosing instance's
     // time multiplier, restored after a child instance recurses. Signals are
     // already registered by collect_signals, which walked the same generate tree.
-    void lower_members(const Scope& scope, const std::string& self_prefix, uint64_t self_mul,
-                       Pass pass, ir::InstanceScope& node, size_t& child_cursor) {
+    void lower_members(const Scope&       scope,
+                       const std::string& self_prefix,
+                       uint64_t           self_mul,
+                       Pass               pass,
+                       ir::InstanceScope& node,
+                       size_t&            child_cursor) {
         // prefix_ / scope_ hold this level's values on entry to each iteration:
         // set by the caller and restored after any case that descends and changes
         // them, so signal-creating process lowering always sees this level. In
@@ -780,29 +807,34 @@ private:
         // (store, routing resolved nets to slots); behavioral-only members
         // (procedural blocks, variable initializers) run in Emit alone.
         const bool driver_pass = pass != Pass::Collect;
-        cur_pass_               = pass;
+        cur_pass_              = pass;
         for (const Symbol& m : scope.members()) {
             cur_range_ = slang::SourceRange{ m.location, m.location };
             switch (m.kind) {
                 case SymbolKind::ContinuousAssign:
-                    if (driver_pass) lower_continuous_assign(m.as<ContinuousAssignSymbol>());
+                    if (driver_pass)
+                        recover([&] { lower_continuous_assign(m.as<ContinuousAssignSymbol>()); });
                     break;
                 case SymbolKind::ProceduralBlock:
                     // Collect: register a hidden force_site signal per whole-var
                     // `force` target so writers gate in Emit (LRM 10.6.2).
-                    if (pass == Pass::Collect) scan_force_targets(m.as<ProceduralBlockSymbol>().getBody());
-                    else if (emit) lower_procedural_block(m.as<ProceduralBlockSymbol>());
+                    if (pass == Pass::Collect)
+                        scan_force_targets(m.as<ProceduralBlockSymbol>().getBody());
+                    else if (emit)
+                        recover([&] { lower_procedural_block(m.as<ProceduralBlockSymbol>()); });
                     break;
                 case SymbolKind::Variable:
                     // Storage was registered by collect_signals; here only a
                     // declaration initializer (LRM 6.8) needs lowering, into the
                     // pre-init process.
-                    if (emit) lower_var_initializer(m.as<VariableSymbol>());
+                    if (emit)
+                        recover([&] { lower_var_initializer(m.as<VariableSymbol>()); });
                     break;
                 case SymbolKind::Net:
                     // Storage was registered by collect_signals; a net declaration
                     // assignment (`wire w = expr`) is a continuous assignment.
-                    if (driver_pass) lower_net_initializer(m.as<NetSymbol>());
+                    if (driver_pass)
+                        recover([&] { lower_net_initializer(m.as<NetSymbol>()); });
                     break;
                 case SymbolKind::Instance: {
                     const InstanceSymbol& child = m.as<InstanceSymbol>();
@@ -810,19 +842,18 @@ private:
                     // parent-side expression resolves against signals in this
                     // (parent) body. Recursion leaves prefix_ at the child level,
                     // so restore it before wiring.
-                    ir::InstanceScope* child_node =
-                      driver_pass ? &node.children[child_cursor++] : nullptr;
+                    ir::InstanceScope* child_node = driver_pass ? &node.children[child_cursor++] : nullptr;
                     // prec_over_tick_ is only changed by lower_instance and is the
                     // enclosing value here (unchanged since entry / last restore),
                     // so save it locally rather than threading a second param.
                     const uint64_t self_prec = prec_over_tick_;
-                    lower_instance(child, self_prefix + std::string(child.name) + ".", pass,
-                                   child_node, child.name);
+                    lower_instance(child, self_prefix + std::string(child.name) + ".", pass, child_node, child.name);
                     prefix_         = self_prefix;
                     scope_          = &scope;
                     time_mul_       = self_mul;
                     prec_over_tick_ = self_prec;
-                    if (driver_pass) wire_ports(child);
+                    if (driver_pass)
+                        wire_ports(child);
                     break;
                 }
                 case SymbolKind::GenerateBlock: {
@@ -837,8 +868,8 @@ private:
                         // lower_instance / lower_generate_block).
                         const std::string saved_node_rel = node_rel_;
                         node_rel_ += std::string(gb.getExternalName()) + ".";
-                        lower_generate_block(gb, self_prefix + gb.getExternalName() + ".", self_mul,
-                                             pass, node, child_cursor);
+                        lower_generate_block(
+                          gb, self_prefix + gb.getExternalName() + ".", self_mul, pass, node, child_cursor);
                         node_rel_ = saved_node_rel;
                         prefix_   = self_prefix;
                         scope_    = &scope;
@@ -855,8 +886,8 @@ private:
                         }
                         const std::string saved_node_rel = node_rel_;
                         node_rel_ += gen_entry_name(ga, *e) + ".";
-                        lower_generate_block(*e, self_prefix + gen_entry_name(ga, *e) + ".",
-                                             self_mul, pass, node, child_cursor);
+                        lower_generate_block(
+                          *e, self_prefix + gen_entry_name(ga, *e) + ".", self_mul, pass, node, child_cursor);
                         node_rel_ = saved_node_rel;
                     }
                     prefix_ = self_prefix;
@@ -864,7 +895,8 @@ private:
                     break;
                 }
                 case SymbolKind::PrimitiveInstance:
-                    if (driver_pass) lower_gate(m.as<PrimitiveInstanceSymbol>());
+                    if (driver_pass)
+                        recover([&] { lower_gate(m.as<PrimitiveInstanceSymbol>()); });
                     break;
                 case SymbolKind::InstanceArray: {
                     // An array of instances — gate primitives (LRM 28.3.6) or
@@ -872,8 +904,8 @@ private:
                     // elaborated one leaf symbol per element with per-instance
                     // bit-sliced connections, so this only needs to walk to
                     // the leaves and lower each like its scalar counterpart.
-                    lower_instance_array(m.as<InstanceArraySymbol>(), self_prefix, scope, self_mul,
-                                         pass, node, child_cursor);
+                    lower_instance_array(
+                      m.as<InstanceArraySymbol>(), self_prefix, scope, self_mul, pass, node, child_cursor);
                     prefix_   = self_prefix;
                     scope_    = &scope;
                     time_mul_ = self_mul;
@@ -935,9 +967,12 @@ private:
     // Lower one generate block's members under `block_prefix`. Genvar values are
     // implicit localparams in the block scope, so const folding and parameter
     // reads resolve them once scope_ points at the block.
-    void lower_generate_block(const GenerateBlockSymbol& block, const std::string& block_prefix,
-                              uint64_t self_mul, Pass pass, ir::InstanceScope& node,
-                              size_t& child_cursor) {
+    void lower_generate_block(const GenerateBlockSymbol& block,
+                              const std::string&         block_prefix,
+                              uint64_t                   self_mul,
+                              Pass                       pass,
+                              ir::InstanceScope&         node,
+                              size_t&                    child_cursor) {
         // A generate block gets no scope node of its own: its signals fold into
         // the enclosing instance's scope (with prefixed names), and any instances
         // it contains become children of that instance's node. So `node` /
@@ -956,31 +991,39 @@ private:
     // A module/interface leaf flattens under <array>[<index>], mirroring
     // generate-loop arrays (gen_entry_name); a gate leaf needs no hierarchy
     // bookkeeping of its own.
-    void lower_instance_array(const InstanceArraySymbol& arr, const std::string& self_prefix,
-                              const Scope& parent_scope, uint64_t self_mul, Pass pass,
-                              ir::InstanceScope& node, size_t& child_cursor) {
+    void lower_instance_array(const InstanceArraySymbol& arr,
+                              const std::string&         self_prefix,
+                              const Scope&               parent_scope,
+                              uint64_t                   self_mul,
+                              Pass                       pass,
+                              ir::InstanceScope&         node,
+                              size_t&                    child_cursor) {
         const bool driver_pass = pass != Pass::Collect;
         for (const Symbol* elem : arr.elements) {
             switch (elem->kind) {
                 case SymbolKind::InstanceArray:
-                    lower_instance_array(elem->as<InstanceArraySymbol>(), self_prefix, parent_scope,
-                                        self_mul, pass, node, child_cursor);
+                    lower_instance_array(
+                      elem->as<InstanceArraySymbol>(), self_prefix, parent_scope, self_mul, pass, node, child_cursor);
                     break;
                 case SymbolKind::PrimitiveInstance:
-                    if (driver_pass) lower_gate(elem->as<PrimitiveInstanceSymbol>());
+                    if (driver_pass)
+                        lower_gate(elem->as<PrimitiveInstanceSymbol>());
                     break;
                 case SymbolKind::Instance: {
-                    const InstanceSymbol& child = elem->as<InstanceSymbol>();
-                    ir::InstanceScope*    child_node =
-                      driver_pass ? &node.children[child_cursor++] : nullptr;
-                    const uint64_t self_prec = prec_over_tick_;
-                    lower_instance(child, self_prefix + instance_array_element_name(child) + ".",
-                                   pass, child_node, instance_array_element_name(child));
+                    const InstanceSymbol& child      = elem->as<InstanceSymbol>();
+                    ir::InstanceScope*    child_node = driver_pass ? &node.children[child_cursor++] : nullptr;
+                    const uint64_t        self_prec  = prec_over_tick_;
+                    lower_instance(child,
+                                   self_prefix + instance_array_element_name(child) + ".",
+                                   pass,
+                                   child_node,
+                                   instance_array_element_name(child));
                     prefix_         = self_prefix;
                     scope_          = &parent_scope;
                     time_mul_       = self_mul;
                     prec_over_tick_ = self_prec;
-                    if (driver_pass) wire_ports(child);
+                    if (driver_pass)
+                        wire_ports(child);
                     break;
                 }
                 default:
@@ -998,7 +1041,7 @@ private:
     // bound recovers the source-code index regardless of whether that
     // dimension's range counts up or down.
     static std::string instance_array_element_name(const InstanceSymbol& elem) {
-        std::string name(elem.getArrayName());
+        std::string                                 name(elem.getArrayName());
         slang::SmallVector<slang::ConstantRange, 4> dims;
         elem.getArrayDimensions(dims);
         SLANG_ASSERT(dims.size() == elem.arrayPath.size());
@@ -1013,8 +1056,7 @@ private:
     // Hierarchical-path segment for one loop-generate entry: <array>[<index>].
     // The entry's own name is empty; the genvar value (its arrayIndex) supplies
     // the subscript.
-    static std::string gen_entry_name(const GenerateBlockArraySymbol& array,
-                                      const GenerateBlockSymbol&      entry) {
+    static std::string gen_entry_name(const GenerateBlockArraySymbol& array, const GenerateBlockSymbol& entry) {
         std::string name = array.getExternalName();
         if (entry.arrayIndex != nullptr) {
             name += '[';
@@ -1038,6 +1080,60 @@ private:
 
     [[noreturn]] void fail(std::string msg) {
         throw LowerError{ std::move(msg), to_source_span(cur_range_) };
+    }
+
+    // Run one behavioural member's lowering, and on a guard failure record the
+    // diagnostic and carry on with the next member instead of abandoning the
+    // whole design. This is what turns "one error per invocation" into "every
+    // error in the file", which is the difference between a compiler and an
+    // editor backend.
+    //
+    // Safe here, and NOT safe in general, for three specific reasons:
+    //
+    //  * No walk state to restore. `prefix_`, `scope_`, `cur_pass_` and
+    //    `prec_over_tick_` are written only by the structural cases
+    //    (lower_instance / lower_generate_block / the Instance arm), never by a
+    //    behavioural member, and `cur_range_` is reset at the top of every
+    //    iteration of the member loop. So an abandoned member leaves the walk
+    //    exactly where it was.
+    //
+    //  * No partial process. A procedural block, continuous assign or gate
+    //    builds into an `ir::Builder` local to its own lowering function and
+    //    appends the process only at the very end, so a throw discards the
+    //    partial body wholesale.
+    //
+    //  * Except for `preinit_`, which every declaration initializer and every
+    //    lazily-emitted static class property initializer SHARES across the
+    //    scope. That one is rolled back explicitly, because leaving a
+    //    half-emitted expression in it would at best emit dead instructions and
+    //    at worst leave a region open — and Builder::finish() folds an unclosed
+    //    region silently into the root body rather than complaining.
+    //
+    // Structural members are deliberately excluded by the caller: they recurse
+    // and advance `child_cursor`, so recovering mid-recursion would misalign the
+    // InstanceScope tree and mis-attribute every later member. That is silently
+    // wrong analysis, strictly worse than the hard failure they keep.
+    template<typename Fn>
+    void recover(Fn&& fn) {
+        const bool                             had_preinit = preinit_.has_value();
+        const std::optional<ir::Builder::Mark> pre = had_preinit ? std::optional{ preinit_->mark() } : std::nullopt;
+        try {
+            fn();
+        } catch (const LowerError& e) {
+            if (had_preinit) {
+                preinit_->rollback(*pre);
+            } else if (preinit_.has_value()) {
+                // The member created it and then failed, so everything in it is
+                // that member's partial emission.
+                preinit_.reset();
+            }
+            diags_.push_back(Diagnostic{ .severity = Severity::Error,
+                                         .origin   = DiagnosticOrigin::Unsupported,
+                                         .code     = "unsupported-construct",
+                                         .message  = e.message,
+                                         .span     = e.span });
+            poisoned_ = true;
+        }
     }
 
     ir::SourceLoc loc(const Expression& e) const {
@@ -1065,8 +1161,8 @@ private:
     std::string finish_banner(const Expression& call, std::string_view task) const {
         const slang::SourceManager* sm = scope_->getCompilation().getSourceManager();
         const slang::SourceLocation sl = call.sourceRange.start();
-        return std::string(sm->getFileName(sl)) + ":" +
-               std::to_string(sm->getLineNumber(sl)) + ": " + std::string(task);
+        return std::string(sm->getFileName(sl)) + ":" + std::to_string(sm->getLineNumber(sl)) + ": " +
+               std::string(task);
     }
 
     // Compile-time "<file>:<line>: " banner prefix at a source location. The
@@ -1074,12 +1170,13 @@ private:
     // rt_finish, rt_severity, the Observed-region case-violation report).
     std::string banner_at(slang::SourceLocation sl) const {
         const slang::SourceManager* sm = scope_->getCompilation().getSourceManager();
-        return std::string(sm->getFileName(sl)) + ":" +
-               std::to_string(sm->getLineNumber(sl)) + ": ";
+        return std::string(sm->getFileName(sl)) + ":" + std::to_string(sm->getLineNumber(sl)) + ": ";
     }
 
     // Banner for a unique/priority case or if violation, located at the statement.
-    std::string case_banner(const CaseStatement& c) const { return banner_at(c.sourceRange.start()); }
+    std::string case_banner(const CaseStatement& c) const {
+        return banner_at(c.sourceRange.start());
+    }
 
     // -- Types --
 
@@ -1169,7 +1266,7 @@ private:
             // are supported.
             const slang::ast::Type& et = aa->elementType.getCanonicalType();
             const ir::Ref           er = lower_type(aa->elementType);
-            bool ok = et.isIntegral() || et.isFloating() || et.isString();
+            bool                    ok = et.isIntegral() || et.isFloating() || et.isString();
             if (!ok && is_agg_abi_ref(er)) {
                 if (is_trivially_copyable(er)) {
                     ok = true;
@@ -1259,8 +1356,8 @@ private:
                 // Packed member: `bitOffset` is the field's bit position. Unpacked
                 // member: addressed by declaration index (`fieldIndex`), no flat
                 // offset — store the index so the field table is self-describing.
-                fields.push_back({ f.name, lower_type(f.getType()),
-                                   is_packed ? static_cast<uint32_t>(f.bitOffset) : f.fieldIndex });
+                fields.push_back(
+                  { f.name, lower_type(f.getType()), is_packed ? static_cast<uint32_t>(f.bitOffset) : f.fieldIndex });
             }
 
             ir::Type t;
@@ -1273,9 +1370,8 @@ private:
             // bounds are meaningless — each member's domain lives in its own
             // field-table type, so no flattened whole-struct domain exists; the
             // element stays void so no consumer can mistake it for one.
-            t.element   = is_packed
-                            ? (ct.isFourState() ? module_.pool.logic_type : module_.pool.bit_type)
-                            : module_.pool.void_type;
+            t.element =
+              is_packed ? (ct.isFourState() ? module_.pool.logic_type : module_.pool.bit_type) : module_.pool.void_type;
             t.left      = is_packed ? ct.getBitWidth() - 1 : 0;
             t.right     = 0;
             t.fields_id = module_.pool.intern_struct_fields(std::move(fields));
@@ -1528,16 +1624,15 @@ private:
 
     // Canonical base class of `clt`, or null for a root class.
     static const slang::ast::ClassType* base_class_of(const slang::ast::ClassType& clt) {
-        return clt.getBaseClass() != nullptr
-                   ? &clt.getBaseClass()->getCanonicalType().as<slang::ast::ClassType>()
-                   : nullptr;
+        return clt.getBaseClass() != nullptr ? &clt.getBaseClass()->getCanonicalType().as<slang::ast::ClassType>()
+                                             : nullptr;
     }
 
     // The pure-virtual prototype named `name` reachable in `clt`'s hierarchy (LRM
     // 8.21), or null. Used to build a stub for an abstract class's un-overridden
     // slot.
-    static const slang::ast::MethodPrototypeSymbol* find_pure_proto(
-        const slang::ast::ClassType& clt, std::string_view name) {
+    static const slang::ast::MethodPrototypeSymbol* find_pure_proto(const slang::ast::ClassType& clt,
+                                                                    std::string_view             name) {
         for (const slang::ast::ClassType* k = &clt; k != nullptr; k = base_class_of(*k)) {
             for (const auto& p : k->membersOfType<slang::ast::MethodPrototypeSymbol>()) {
                 if (p.name == name && p.flags.has(slang::ast::MethodFlags::Pure)) {
@@ -1560,31 +1655,31 @@ private:
     // signature but is never executed (an abstract class is never `new`'d, so its
     // vtable is never materialized). Called after the base is lowered.
     void compute_vtable(const slang::ast::ClassType& clt, ir::Ref class_ref) {
-        const slang::ast::ClassType* base = base_class_of(clt);
-        VtableSlots slots = base != nullptr ? class_vslot_[base] : VtableSlots{};
-        uint32_t    size  = static_cast<uint32_t>(slots.size());
-        const auto  introduce = [&](std::string_view name, slang::ast::SubroutineKind kind,
-                                    const slang::ast::Type& ret, bool is_pure) {
-            if (kind == slang::ast::SubroutineKind::Task && is_pure) {
-                // A pure virtual task's abstract-class slot would need a task-shaped
-                // (coroutine) stub, not the function stub build_pure_stub emits.
-                // TODO: pure virtual task.
-                fail("pure virtual task is not supported");
-            }
-            if (is_pure) {
-                // A pure slot's signature source is a stub (below); a non-scalar
-                // return would need the full aggregate/handle return ABI in that
-                // never-called stub. Guard until that is wired.
-                const ir::Ref rt = lower_type(ret);
-                if (is_agg_abi_ref(rt) || is_handle_ref(rt) || ret.getCanonicalType().isString()) {
-                    // TODO: pure virtual method with a non-scalar return.
-                    fail("pure virtual method with a non-scalar return is not supported");
-                }
-            }
-            if (!slots.contains(name)) {
-                slots.emplace(name, size++);
-            }
-        };
+        const slang::ast::ClassType* base  = base_class_of(clt);
+        VtableSlots                  slots = base != nullptr ? class_vslot_[base] : VtableSlots{};
+        uint32_t                     size  = static_cast<uint32_t>(slots.size());
+        const auto                   introduce =
+          [&](std::string_view name, slang::ast::SubroutineKind kind, const slang::ast::Type& ret, bool is_pure) {
+              if (kind == slang::ast::SubroutineKind::Task && is_pure) {
+                  // A pure virtual task's abstract-class slot would need a task-shaped
+                  // (coroutine) stub, not the function stub build_pure_stub emits.
+                  // TODO: pure virtual task.
+                  fail("pure virtual task is not supported");
+              }
+              if (is_pure) {
+                  // A pure slot's signature source is a stub (below); a non-scalar
+                  // return would need the full aggregate/handle return ABI in that
+                  // never-called stub. Guard until that is wired.
+                  const ir::Ref rt = lower_type(ret);
+                  if (is_agg_abi_ref(rt) || is_handle_ref(rt) || ret.getCanonicalType().isString()) {
+                      // TODO: pure virtual method with a non-scalar return.
+                      fail("pure virtual method with a non-scalar return is not supported");
+                  }
+              }
+              if (!slots.contains(name)) {
+                  slots.emplace(name, size++);
+              }
+          };
         for (const auto& m : clt.membersOfType<slang::ast::SubroutineSymbol>()) {
             if (is_user_virtual(m)) {
                 introduce(m.name, m.subroutineKind, m.getReturnType(), /*is_pure=*/false);
@@ -1592,8 +1687,7 @@ private:
         }
         for (const auto& p : clt.membersOfType<slang::ast::MethodPrototypeSymbol>()) {
             if (p.isVirtual()) { // a pure (or extern) virtual prototype
-                introduce(p.name, p.subroutineKind, p.getReturnType(),
-                          p.flags.has(slang::ast::MethodFlags::Pure));
+                introduce(p.name, p.subroutineKind, p.getReturnType(), p.flags.has(slang::ast::MethodFlags::Pure));
             }
         }
         class_vslot_[&clt] = slots;
@@ -1640,7 +1734,7 @@ private:
             return it->second;
         }
         const ir::FunctionId id = module_.reserve_function();
-        pure_stub_[&proto] = id;
+        pure_stub_[&proto]      = id;
         build_pure_stub(proto, id);
         return id;
     }
@@ -1651,7 +1745,7 @@ private:
     // returns X and is never called — it only supplies the CallVirtual FunctionType /
     // result type for a dispatch resolved to the pure method on an abstract handle.
     void build_pure_stub(const slang::ast::MethodPrototypeSymbol& proto, ir::FunctionId id) {
-        const auto& owner = proto.getParentScope()->asSymbol().as<slang::ast::ClassType>();
+        const auto&             owner = proto.getParentScope()->asSymbol().as<slang::ast::ClassType>();
         std::vector<ir::Ref>    param_types;
         std::vector<ir::ArgDir> arg_dirs;
         std::vector<ir::Ref>    local_types;
@@ -1667,8 +1761,8 @@ private:
             arg_dirs.push_back(to_arg_dir(fa->direction));
             local_types.push_back(pt);
         }
-        const bool    is_void     = proto.getReturnType().isVoid();
-        const ir::Ref return_type = is_void ? module_.pool.void_type : lower_type(proto.getReturnType());
+        const bool          is_void     = proto.getReturnType().isVoid();
+        const ir::Ref       return_type = is_void ? module_.pool.void_type : lower_type(proto.getReturnType());
         ir::Builder         b(module_.pool);
         const ir::SourceLoc el = to_source_loc(proto.location);
         if (is_void) {
@@ -1679,13 +1773,14 @@ private:
             const ir::Index rv = b.local(rl, return_type, el);
             b.unary(ir::Inst::Tag::Ret, b.unary(ir::Inst::Tag::Load, rv, el), el);
         }
-        module_.set_function(id, ir::Function{ .name        = std::string(proto.name) + ".pure",
-                                               .return_type = return_type,
-                                               .param_types = std::move(param_types),
-                                               .arg_dirs    = std::move(arg_dirs),
-                                               .local_types = std::move(local_types),
-                                               .span        = span_of(proto),
-                                               .ir          = b.finish() });
+        module_.set_function(id,
+                             ir::Function{ .name        = std::string(proto.name) + ".pure",
+                                           .return_type = return_type,
+                                           .param_types = std::move(param_types),
+                                           .arg_dirs    = std::move(arg_dirs),
+                                           .local_types = std::move(local_types),
+                                           .span        = span_of(proto),
+                                           .ir          = b.finish() });
     }
 
     // The vtable slot of virtual method `sub` (LRM 8.20), looked up by name in the
@@ -1763,8 +1858,7 @@ private:
     // plain array is by-pointer at the ABI but flat in module storage.
     static bool is_agg_abi_type(const slang::ast::Type& t) {
         const slang::ast::Type& ct = t.getCanonicalType();
-        return ct.isUnpackedStruct() ||
-               ct.as_if<slang::ast::FixedSizeUnpackedArrayType>() != nullptr;
+        return ct.isUnpackedStruct() || ct.as_if<slang::ast::FixedSizeUnpackedArrayType>() != nullptr;
     }
 
     // True if a type contains an unpacked struct at any nesting depth (a bare
@@ -1781,8 +1875,7 @@ private:
             // recursive aggregate model (its cells are heap handles needing
             // per-cell lifecycle), mirroring the backend's needs_agg_storage.
             const slang::ast::Type& et = arr->elementType.getCanonicalType();
-            if (et.as_if<slang::ast::QueueType>() != nullptr ||
-                et.as_if<slang::ast::DynamicArrayType>() != nullptr) {
+            if (et.as_if<slang::ast::QueueType>() != nullptr || et.as_if<slang::ast::DynamicArrayType>() != nullptr) {
                 return true;
             }
             return is_aggregate(arr->elementType);
@@ -1800,8 +1893,7 @@ private:
     static bool is_unpacked_container(const slang::ast::Type& t) {
         const slang::ast::Type& ct = t.getCanonicalType();
         return ct.as_if<slang::ast::FixedSizeUnpackedArrayType>() != nullptr ||
-               ct.as_if<slang::ast::DynamicArrayType>() != nullptr ||
-               ct.as_if<slang::ast::QueueType>() != nullptr;
+               ct.as_if<slang::ast::DynamicArrayType>() != nullptr || ct.as_if<slang::ast::QueueType>() != nullptr;
     }
 
     // Store a whole unpacked struct: one blocking store per member (the aggregate
@@ -1811,8 +1903,12 @@ private:
     // in declaration order and type-converted by slang) or another struct lvalue
     // (member-by-member copy). Members are scalar (nested unpacked struct members
     // are guarded at lower_type), so each store is a plain scalar store.
-    void emit_struct_store(ir::Index lhs_base, ir::Ref sty, const Expression& rhs,
-                           ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
+    void emit_struct_store(ir::Index         lhs_base,
+                           ir::Ref           sty,
+                           const Expression& rhs,
+                           ir::Inst::Tag     tag,
+                           ir::Builder&      b,
+                           ir::SourceLoc     l) {
         emit_agg_store(lhs_base, sty, rhs, tag, b, l);
     }
 
@@ -1839,10 +1935,13 @@ private:
     // scalar. `sv_type` is the same struct as `sty`'s interned Kind::Struct
     // (needed alongside it: field initializer expressions and their real
     // types live on the slang AST, not the IR field table).
-    void emit_struct_field_defaults(ir::Index lhs, ir::Ref sty, const slang::ast::Type& sv_type,
-                                    ir::Builder& b, ir::SourceLoc l) {
-        const auto& ct = sv_type.getCanonicalType().as<slang::ast::UnpackedStructType>();
-        uint32_t idx = 0;
+    void emit_struct_field_defaults(ir::Index               lhs,
+                                    ir::Ref                 sty,
+                                    const slang::ast::Type& sv_type,
+                                    ir::Builder&            b,
+                                    ir::SourceLoc           l) {
+        const auto& ct  = sv_type.getCanonicalType().as<slang::ast::UnpackedStructType>();
+        uint32_t    idx = 0;
         for (const auto& f : ct.membersOfType<slang::ast::FieldSymbol>()) {
             if (const Expression* init = f.getInitializer()) {
                 const ir::Index fld_lv = b.member_select(lhs, idx, sty, l);
@@ -1850,12 +1949,11 @@ private:
                 if (f.getType().getCanonicalType().isString()) {
                     b.binary(ir::Inst::Tag::Store, fld_lv, rhs, l);
                 } else {
-                    b.binary(ir::Inst::Tag::Store, fld_lv,
-                             coerce(rhs, *init->type, lower_type(f.getType()), b, l), l);
+                    b.binary(ir::Inst::Tag::Store, fld_lv, coerce(rhs, *init->type, lower_type(f.getType()), b, l), l);
                 }
             } else if (struct_has_field_defaults(f.getType())) {
-                emit_struct_field_defaults(b.member_select(lhs, idx, sty, l), lower_type(f.getType()),
-                                           f.getType(), b, l);
+                emit_struct_field_defaults(
+                  b.member_select(lhs, idx, sty, l), lower_type(f.getType()), f.getType(), b, l);
             }
             ++idx;
         }
@@ -1903,18 +2001,20 @@ private:
     // remaining (rightmost) elements, a longer string's excess tail is
     // dropped. Unlike a `string`-typed object, an array element is not
     // string-terminated, so an embedded NUL byte is kept, not stripped.
-    void emit_string_literal_array_store(ir::Index lhs, ir::Ref type, const ir::Type& t,
-                                         std::string_view text, ir::Inst::Tag tag, ir::Builder& b,
-                                         ir::SourceLoc l) {
-        const uint32_t array_len =
-            (t.left > t.right ? t.left - t.right : t.right - t.left) + 1;
+    void emit_string_literal_array_store(ir::Index        lhs,
+                                         ir::Ref          type,
+                                         const ir::Type&  t,
+                                         std::string_view text,
+                                         ir::Inst::Tag    tag,
+                                         ir::Builder&     b,
+                                         ir::SourceLoc    l) {
+        const uint32_t array_len = (t.left > t.right ? t.left - t.right : t.right - t.left) + 1;
         for (uint32_t k = 0; k < array_len; ++k) {
-            const int32_t coord = t.left <= t.right ? static_cast<int32_t>(t.left + k)
-                                                     : static_cast<int32_t>(t.left - k);
+            const int32_t coord =
+              t.left <= t.right ? static_cast<int32_t>(t.left + k) : static_cast<int32_t>(t.left - k);
             const uint8_t   byte_val = k < text.size() ? static_cast<uint8_t>(text[k]) : 0;
             const ir::Index idx      = b.constant(
-              module_.pool.put_int(make_int_type(32, false, true),
-                                    static_cast<uint64_t>(static_cast<int64_t>(coord))),
+              module_.pool.put_int(make_int_type(32, false, true), static_cast<uint64_t>(static_cast<int64_t>(coord))),
               l);
             const ir::Index val = b.constant(module_.pool.put_int(t.element, byte_val), l);
             b.binary(tag, b.elem_select(lhs, idx, type, l), val, l);
@@ -1928,8 +2028,12 @@ private:
     // samples each leaf's RHS now and commits per-leaf, which is whole-object NBA
     // semantics. Array-typed members are guarded (element-wise unroll is a
     // follow-up), so nesting is struct-through-struct here.
-    void emit_agg_store(ir::Index lhs, ir::Ref type, const Expression& rhs,
-                        ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
+    void emit_agg_store(ir::Index         lhs,
+                        ir::Ref           type,
+                        const Expression& rhs,
+                        ir::Inst::Tag     tag,
+                        ir::Builder&      b,
+                        ir::SourceLoc     l) {
         // By value, not by reference: InternPool::get hands back a reference into
         // its items_ vector, and interning anything (a constant index below, or a
         // type while lowering an element expression) push_backs onto that vector
@@ -1959,15 +2063,13 @@ private:
         // type to the unpacked target, so it is positional like a `'{...}`
         // pattern and only differs in the element-span accessor.
         const bool is_concat_literal =
-            pat == nullptr && rhs.kind == ExpressionKind::Concatenation && rhs.type->isUnpackedArray();
+          pat == nullptr && rhs.kind == ExpressionKind::Concatenation && rhs.type->isUnpackedArray();
         if (pat != nullptr || is_concat_literal) {
-            const auto elems =
-                pat != nullptr ? pat->elements() : rhs.as<ConcatenationExpression>().operands();
+            const auto     elems = pat != nullptr ? pat->elements() : rhs.as<ConcatenationExpression>().operands();
             const uint32_t reps =
-                pat != nullptr && rhs.kind == ExpressionKind::ReplicatedAssignmentPattern
-                    ? static_cast<uint32_t>(
-                          const_uint(rhs.as<ReplicatedAssignmentPatternExpression>().count()))
-                    : 1;
+              pat != nullptr && rhs.kind == ExpressionKind::ReplicatedAssignmentPattern
+                ? static_cast<uint32_t>(const_uint(rhs.as<ReplicatedAssignmentPatternExpression>().count()))
+                : 1;
             if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
                 if (pat == nullptr) {
                     fail("unpacked concatenation literal into a struct is not supported");
@@ -1994,13 +2096,12 @@ private:
                 const uint32_t lo    = std::min(t.left, t.right);
                 for (uint32_t k = 0; k < n * reps; ++k) {
                     const int32_t coord =
-                        keyed ? static_cast<int32_t>(lo + k)
-                              : (t.left <= t.right ? static_cast<int32_t>(t.left + k)
-                                                   : static_cast<int32_t>(t.left - k));
+                      keyed ? static_cast<int32_t>(lo + k)
+                            : (t.left <= t.right ? static_cast<int32_t>(t.left + k) : static_cast<int32_t>(t.left - k));
                     const ir::Index idx =
-                        b.constant(module_.pool.put_int(make_int_type(32, false, true),
-                                                        static_cast<uint64_t>(static_cast<int64_t>(coord))),
-                                   l);
+                      b.constant(module_.pool.put_int(make_int_type(32, false, true),
+                                                      static_cast<uint64_t>(static_cast<int64_t>(coord))),
+                                 l);
                     emit_agg_store(b.elem_select(lhs, idx, type, l), t.element, *elems[k % n], tag, b, l);
                 }
                 return;
@@ -2075,9 +2176,14 @@ private:
     // push_back. `reps` is the `'{N{...}}` replicated-pattern multiplier (1 for
     // a positional/keyed pattern or a bare concatenation, which has no repeat
     // form of its own).
-    void emit_handle_literal_init(ir::Index lhs, ir::Ref type, const ir::Type& t,
-                                  std::span<const Expression* const> elems, uint32_t reps,
-                                  ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
+    void emit_handle_literal_init(ir::Index                          lhs,
+                                  ir::Ref                            type,
+                                  const ir::Type&                    t,
+                                  std::span<const Expression* const> elems,
+                                  uint32_t                           reps,
+                                  ir::Inst::Tag                      tag,
+                                  ir::Builder&                       b,
+                                  ir::SourceLoc                      l) {
         if (tag != ir::Inst::Tag::Store) {
             // TODO: nonblocking '{...}/concatenation literal into a queue or
             // dynamic array (needs a handle-aware NBA staging path — same gap as
@@ -2087,14 +2193,11 @@ private:
         const uint32_t n     = static_cast<uint32_t>(elems.size());
         const uint32_t count = n * reps;
         if (t.kind == ir::Type::Kind::DynArray) {
-            const ir::Index size =
-                b.constant(module_.pool.put_int(make_int_type(32, false, false), count), l);
+            const ir::Index size = b.constant(module_.pool.put_int(make_int_type(32, false, false), count), l);
             b.dyn_array_new(lhs, size, lhs, /*has_init*/ false, type, l);
             for (uint32_t k = 0; k < count; ++k) {
-                const ir::Index idx =
-                    b.constant(module_.pool.put_int(make_int_type(32, false, true), k), l);
-                b.binary(ir::Inst::Tag::Store, b.elem_select(lhs, idx, type, l),
-                        lower_expr(*elems[k % n], b), l);
+                const ir::Index idx = b.constant(module_.pool.put_int(make_int_type(32, false, true), k), l);
+                b.binary(ir::Inst::Tag::Store, b.elem_select(lhs, idx, type, l), lower_expr(*elems[k % n], b), l);
             }
             return;
         }
@@ -2108,30 +2211,28 @@ private:
     // recursing structs and (for a blocking copy) unrolling arrays. Reached only
     // for a string-containing aggregate or a nonblocking copy; a nonblocking
     // whole-array copy is guarded (element-wise deferral is a follow-up).
-    void emit_agg_copy(ir::Index lhs, ir::Index rhs, ir::Ref type, ir::Inst::Tag tag,
-                       ir::Builder& b, ir::SourceLoc l) {
+    void emit_agg_copy(ir::Index lhs, ir::Index rhs, ir::Ref type, ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
         const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
         if (t.kind == ir::Type::Kind::UnpackedArray) {
             // A nonblocking copy decomposes to per-element StoreNb: each element
             // write into the array rides the backend's deferred array-NBA queue.
             const uint32_t n = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
             for (uint32_t e = 0; e < n; ++e) {
-                const int32_t   coord = t.left <= t.right ? static_cast<int32_t>(t.left + e)
-                                                          : static_cast<int32_t>(t.left - e);
+                const int32_t coord =
+                  t.left <= t.right ? static_cast<int32_t>(t.left + e) : static_cast<int32_t>(t.left - e);
                 const ir::Index idx =
                   b.constant(module_.pool.put_int(make_int_type(32, false, true),
                                                   static_cast<uint64_t>(static_cast<int64_t>(coord))),
                              l);
-                emit_agg_copy(b.elem_select(lhs, idx, type, l), b.elem_select(rhs, idx, type, l),
-                              t.element, tag, b, l);
+                emit_agg_copy(b.elem_select(lhs, idx, type, l), b.elem_select(rhs, idx, type, l), t.element, tag, b, l);
             }
             return;
         }
         if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
             const auto fields = module_.pool.struct_fields(t.fields_id);
             for (uint32_t i = 0; i < fields.size(); ++i) {
-                emit_agg_copy(b.member_select(lhs, i, type, l), b.member_select(rhs, i, type, l),
-                              fields[i].type, tag, b, l);
+                emit_agg_copy(
+                  b.member_select(lhs, i, type, l), b.member_select(rhs, i, type, l), fields[i].type, tag, b, l);
             }
             return;
         }
@@ -2157,8 +2258,12 @@ private:
     // Deep-copy into a queue / dynamic-array member of an aggregate from an
     // aggregate-store RHS element: the member's slot in the RHS lvalue. Only a
     // handle-shaped source is supported (variable / member / element).
-    void emit_handle_member_copy(ir::Index lhs, const Expression& rhs, ir::Ref type,
-                                 ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
+    void emit_handle_member_copy(ir::Index         lhs,
+                                 const Expression& rhs,
+                                 ir::Ref           type,
+                                 ir::Inst::Tag     tag,
+                                 ir::Builder&      b,
+                                 ir::SourceLoc     l) {
         const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
         if (tag != ir::Inst::Tag::Store) {
             // TODO: nonblocking copy of a queue / dynamic-array member.
@@ -2167,10 +2272,8 @@ private:
         }
         const Expression& src = unwrap_conversion(rhs);
         const bool        src_is_handle_lvalue =
-            src.kind == ExpressionKind::NamedValue ||
-            src.kind == ExpressionKind::HierarchicalValue ||
-            src.kind == ExpressionKind::MemberAccess ||
-            src.kind == ExpressionKind::ElementSelect;
+          src.kind == ExpressionKind::NamedValue || src.kind == ExpressionKind::HierarchicalValue ||
+          src.kind == ExpressionKind::MemberAccess || src.kind == ExpressionKind::ElementSelect;
         if (!src_is_handle_lvalue) {
             // TODO: queue / dynamic-array member init from a '{...} pattern or
             // concatenation needs an element-wise build (dynamic-arrays doc
@@ -2269,8 +2372,7 @@ private:
     // contains_struct_ref, which is false for a plain scalar-element array.
     bool is_agg_abi_ref(ir::Ref type) const {
         const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
-        return t.kind == ir::Type::Kind::UnpackedArray ||
-               (t.kind == ir::Type::Kind::Struct && !t.is_packed);
+        return t.kind == ir::Type::Kind::UnpackedArray || (t.kind == ir::Type::Kind::Struct && !t.is_packed);
     }
 
     // Whether a whole-object copy of the type may be a single memcpy of its
@@ -2331,24 +2433,22 @@ private:
     }
 
     ir::Index lower_packed_pattern(const Expression& expr, ir::Builder& b) {
-        const ir::SourceLoc l   = loc(expr);
-        const auto*         pat = as_assignment_pattern(expr);
-        const auto          es  = pat->elements();
+        const ir::SourceLoc    l   = loc(expr);
+        const auto*            pat = as_assignment_pattern(expr);
+        const auto             es  = pat->elements();
         std::vector<ir::Index> parts;
         parts.reserve(es.size());
         for (const Expression* e : es) {
             parts.push_back(lower_expr(*e, b));
         }
-        if (expr.kind == ExpressionKind::StructuredAssignmentPattern &&
-            expr.type->isPackedArray()) {
+        if (expr.kind == ExpressionKind::StructuredAssignmentPattern && expr.type->isPackedArray()) {
             const slang::ConstantRange r = expr.type->getFixedRange();
             if (r.left > r.right) {
                 std::reverse(parts.begin(), parts.end());
             }
         }
         if (expr.kind == ExpressionKind::ReplicatedAssignmentPattern) {
-            const uint64_t count =
-                const_uint(expr.as<ReplicatedAssignmentPatternExpression>().count());
+            const uint64_t count = const_uint(expr.as<ReplicatedAssignmentPatternExpression>().count());
             return b.repl(b.concat(parts, l), static_cast<uint32_t>(count), l);
         }
         return b.concat(parts, l);
@@ -2360,15 +2460,13 @@ private:
     // X-propagation). Both operands must be aggregate lvalues (a '{...} pattern
     // compare is a follow-up); a heap-owning leaf (string is handled; queue /
     // dynamic array is guarded) is rejected.
-    ir::Index lower_struct_eq(const Expression& lhs, const Expression& rhs, ir::Builder& b,
-                              ir::SourceLoc l) {
+    ir::Index lower_struct_eq(const Expression& lhs, const Expression& rhs, ir::Builder& b, ir::SourceLoc l) {
         const Expression& le = unwrap_conversion(lhs);
         const Expression& re = unwrap_conversion(rhs);
         // An aggregate lvalue: a variable / member / element, or a fixed
         // unpacked-array slice (an ArrSlice lvalue), on either side.
         const auto agg_eq_operand = [](const Expression& e) {
-            return is_struct_lvalue_shape(e) ||
-                   (e.kind == ExpressionKind::RangeSelect && is_unpacked_array(e));
+            return is_struct_lvalue_shape(e) || (e.kind == ExpressionKind::RangeSelect && is_unpacked_array(e));
         };
         if (!agg_eq_operand(le) || !agg_eq_operand(re)) {
             fail("unpacked aggregate equality is only supported between aggregate variables");
@@ -2451,8 +2549,7 @@ private:
     // so a whole-array memcpy (AggCopy) between the two is invalid; the copy must
     // decompose per element (each element resolves the map slot and stores).
     static bool is_assoc_element_select(const slang::ast::Expression& e) {
-        return e.kind == ExpressionKind::ElementSelect &&
-               is_assoc(e.as<slang::ast::ElementSelectExpression>().value());
+        return e.kind == ExpressionKind::ElementSelect && is_assoc(e.as<slang::ast::ElementSelectExpression>().value());
     }
 
     // True if an expression is of the dynamic `string` type (LRM 6.16).
@@ -2480,16 +2577,14 @@ private:
     // subroutine ABI.
     bool is_handle_ref(ir::Ref ty) const {
         const ir::Type::Kind k = std::get<ir::Type>(module_.pool.get(ty)).kind;
-        return k == ir::Type::Kind::DynArray || k == ir::Type::Kind::Queue ||
-               k == ir::Type::Kind::Assoc;
+        return k == ir::Type::Kind::DynArray || k == ir::Type::Kind::Queue || k == ir::Type::Kind::Assoc;
     }
 
     // True if an expression is a dynamic array, queue, or associative array (a
     // heap handle).
     static bool is_handle_expr(const slang::ast::Expression& e) {
         const slang::ast::Type& ct = e.type->getCanonicalType();
-        return ct.as_if<slang::ast::DynamicArrayType>() != nullptr ||
-               ct.as_if<slang::ast::QueueType>() != nullptr ||
+        return ct.as_if<slang::ast::DynamicArrayType>() != nullptr || ct.as_if<slang::ast::QueueType>() != nullptr ||
                ct.as_if<slang::ast::AssociativeArrayType>() != nullptr;
     }
 
@@ -2504,9 +2599,8 @@ private:
                 stripped += c;
             }
         }
-        return module_.pool.put_value(
-          module_.pool.string_type,
-          { reinterpret_cast<const uint8_t*>(stripped.data()), stripped.size() });
+        return module_.pool.put_value(module_.pool.string_type,
+                                      { reinterpret_cast<const uint8_t*>(stripped.data()), stripped.size() });
     }
 
     // Intern a packed integer type of the given width / state / signedness.
@@ -2645,7 +2739,7 @@ private:
                 continue;
             }
             const auto& vs = m.as<VariableSymbol>();
-            cur_range_       = slang::SourceRange{ vs.location, vs.location };
+            cur_range_     = slang::SourceRange{ vs.location, vs.location };
 
             ir::SignalInfo info;
             info.name     = std::string(vs.name);
@@ -2685,15 +2779,13 @@ private:
             // slang may wrap the connection in an AssignmentExpression; the shared
             // net is the underlying value reference.
             const Expression& conn =
-                expr->kind == ExpressionKind::Assignment ? expr->as<AssignmentExpression>().left()
-                                                         : *expr;
-            if (conn.kind != ExpressionKind::NamedValue &&
-                conn.kind != ExpressionKind::HierarchicalValue) {
+              expr->kind == ExpressionKind::Assignment ? expr->as<AssignmentExpression>().left() : *expr;
+            if (conn.kind != ExpressionKind::NamedValue && conn.kind != ExpressionKind::HierarchicalValue) {
                 // TODO: inout/ref port with a bit/part-select or concat connection
                 // (per-bit collapse or resolved-net partial-driver slots).
                 fail("inout/ref port with a non-whole-signal connection is not supported");
             }
-            const ValueSymbol& parent = canonical_value_symbol(conn.as<ValueExpressionBase>().symbol);
+            const ValueSymbol& parent      = canonical_value_symbol(conn.as<ValueExpressionBase>().symbol);
             inout_alias_[p.internalSymbol] = signal_of(parent);
         }
     }
@@ -2719,14 +2811,15 @@ private:
     // block's name in the path). `port_dir`, present only for an instance body,
     // tags port-backed signals with their direction; generate-block signals are
     // always internal. Child instances are handled by lower_instance, not here.
-    void collect_scope_signals(const Scope& scope, const std::string& prefix,
+    void collect_scope_signals(const Scope&                                                                  scope,
+                               const std::string&                                                            prefix,
                                const ankerl::unordered_dense::map<const Symbol*, ir::SignalInfo::Direction>* port_dir) {
         for (const Symbol& m : scope.members()) {
             switch (m.kind) {
                 case SymbolKind::Net:
                 case SymbolKind::Variable: {
                     const ValueSymbol& vs = m.as<ValueSymbol>();
-                    cur_range_              = slang::SourceRange{ vs.location, vs.location };
+                    cur_range_            = slang::SourceRange{ vs.location, vs.location };
 
                     // An inout/ref port internal aliased to its parent connection
                     // (build_inout_aliases) shares that signal instead of getting
@@ -2803,8 +2896,8 @@ private:
                         // still emits.
                         const NetType::NetKind nk = m.as<NetSymbol>().netType.netKind;
                         if (const std::optional<int> pull = net_pull_value(nk)) {
-                            net_pull_[static_cast<uint32_t>(sig)] = PullInfo{
-                              *pull, cur_scope_id(), to_source_loc(vs.location), net_pull_strength(nk) };
+                            net_pull_[static_cast<uint32_t>(sig)] =
+                              PullInfo{ *pull, cur_scope_id(), to_source_loc(vs.location), net_pull_strength(nk) };
                         }
                     }
                     break;
@@ -2819,7 +2912,8 @@ private:
                 case SymbolKind::GenerateBlockArray:
                     for (const GenerateBlockSymbol* e : m.as<GenerateBlockArraySymbol>().entries) {
                         if (!e->isUninstantiated) {
-                            collect_scope_signals(*e, prefix + gen_entry_name(m.as<GenerateBlockArraySymbol>(), *e) + ".", nullptr);
+                            collect_scope_signals(
+                              *e, prefix + gen_entry_name(m.as<GenerateBlockArraySymbol>(), *e) + ".", nullptr);
                         }
                     }
                     break;
@@ -2947,8 +3041,8 @@ private:
     // single element band [0, 0]; a whole-element or whole-net driver uses the
     // full bit range [0, UINT32_MAX].
     struct NetRegion {
-        uint64_t elem_lo, elem_hi;  // linearized unpacked-element ordinals
-        uint32_t bit_lo, bit_hi;    // packed bit range within one element
+        uint64_t elem_lo, elem_hi; // linearized unpacked-element ordinals
+        uint32_t bit_lo, bit_hi;   // packed bit range within one element
         bool     operator==(const NetRegion&) const = default;
     };
 
@@ -2976,8 +3070,8 @@ private:
         auto&      regions  = net_driven_[net];
         bool       resolve  = has_pull;
         for (const NetRegion& p : regions) {
-            if (reg.elem_lo <= p.elem_hi && p.elem_lo <= reg.elem_hi &&
-                reg.bit_lo <= p.bit_hi && p.bit_lo <= reg.bit_hi) {
+            if (reg.elem_lo <= p.elem_hi && p.elem_lo <= reg.elem_hi && reg.bit_lo <= p.bit_hi &&
+                p.bit_lo <= reg.bit_hi) {
                 // Emit routes every driver of a resolved net to its own slot and
                 // folds them through the net-kind's reducer (wire -> X on
                 // conflict, wand/wor -> wired-AND/OR), then applies any pull.
@@ -3049,8 +3143,7 @@ private:
     // backed (normal path) or when the select itself is not constant — e.g. a
     // runtime index into a constant array, which stays an unsupported gap
     // rather than a hard eval failure here.
-    std::optional<ir::Index> try_lower_constant_select(const Expression& expr, ir::Builder& b,
-                                                       ir::SourceLoc l) {
+    std::optional<ir::Index> try_lower_constant_select(const Expression& expr, ir::Builder& b, ir::SourceLoc l) {
         const ValueSymbol* root = lvalue_root(expr);
         if (root == nullptr || !is_elaboration_constant(*root)) {
             return std::nullopt;
@@ -3074,8 +3167,7 @@ private:
     // try_lower_constant_select, so this path is the runtime-index case only.
     ir::Index select_base_lvalue(const Expression& base, ir::Builder& b, ir::SourceLoc l) {
         const ValueSymbol* root = lvalue_root(base);
-        if (root != nullptr && is_elaboration_constant(*root) &&
-            base.type->getCanonicalType().isIntegral()) {
+        if (root != nullptr && is_elaboration_constant(*root) && base.type->getCanonicalType().isIntegral()) {
             slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
             slang::ast::EvalContext    ectx(actx);
             const slang::ConstantValue cv = base.eval(ectx);
@@ -3091,8 +3183,7 @@ private:
         // fresh temp cell for the runtime select to read — same shape as the
         // elaboration-constant spill above. A fully-constant select folds
         // upstream (try_lower_constant_select), so this is the runtime case only.
-        if ((base.kind == ExpressionKind::Concatenation ||
-             base.kind == ExpressionKind::Replication) &&
+        if ((base.kind == ExpressionKind::Concatenation || base.kind == ExpressionKind::Replication) &&
             base.type->getCanonicalType().isIntegral()) {
             const ir::Index tmp = make_arg_temp(lower_type(*base.type), b, l);
             b.binary(ir::Inst::Tag::Store, tmp, lower_expr(base, b), l);
@@ -3158,7 +3249,7 @@ private:
 
         // Unpacked dimensions of the net, outermost first.
         slang::SmallVector<slang::ConstantRange, 4> dims;
-        const slang::ast::Type* et = &root.getType().getCanonicalType();
+        const slang::ast::Type*                     et = &root.getType().getCanonicalType();
         while (const auto* arr = et->as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
             dims.push_back(arr->range);
             et = &arr->elementType.getCanonicalType();
@@ -3174,7 +3265,7 @@ private:
         }
 
         uint64_t base    = 0;
-        size_t   t       = 0;  // unpacked dims consumed so far
+        size_t   t       = 0; // unpacked dims consumed so far
         uint32_t bit_lo  = 0;
         uint32_t bit_hi  = UINT32_MAX;
         bool     bit_set = false;
@@ -3183,8 +3274,7 @@ private:
                 if (step->kind != ExpressionKind::ElementSelect) {
                     return kWholeNet;
                 }
-                const std::optional<int32_t> c =
-                  try_const_int(step->as<ElementSelectExpression>().selector());
+                const std::optional<int32_t> c = try_const_int(step->as<ElementSelectExpression>().selector());
                 if (!c) {
                     return kWholeNet;
                 }
@@ -3242,8 +3332,8 @@ private:
                 // Element bit width (W): >1 for a multi-dim packed array slice, 1
                 // for an ordinary vector. Bit offsets scale by W, mirroring
                 // lower_range_select.
-                const auto* pa = rs.value().type->getCanonicalType().as_if<slang::ast::PackedArrayType>();
-                const uint32_t w = pa != nullptr ? static_cast<uint32_t>(pa->elementType.getBitWidth()) : 1;
+                const auto*    pa = rs.value().type->getCanonicalType().as_if<slang::ast::PackedArrayType>();
+                const uint32_t w  = pa != nullptr ? static_cast<uint32_t>(pa->elementType.getBitWidth()) : 1;
                 const slang::ConstantRange range = packed_range_of(rs.value());
                 if (rs.getSelectionKind() == RangeSelectionKind::Simple) {
                     const std::optional<int32_t> left  = try_const_int(rs.left());
@@ -3343,11 +3433,16 @@ private:
             return 3; // default Strong
         }
         switch (*s) {
-            case slang::ast::DriveStrength::Supply: return 4;
-            case slang::ast::DriveStrength::Strong: return 3;
-            case slang::ast::DriveStrength::Pull:   return 2;
-            case slang::ast::DriveStrength::Weak:   return 1;
-            case slang::ast::DriveStrength::HighZ:  return 0;
+            case slang::ast::DriveStrength::Supply:
+                return 4;
+            case slang::ast::DriveStrength::Strong:
+                return 3;
+            case slang::ast::DriveStrength::Pull:
+                return 2;
+            case slang::ast::DriveStrength::Weak:
+                return 1;
+            case slang::ast::DriveStrength::HighZ:
+                return 0;
         }
         return 3;
     }
@@ -3355,8 +3450,7 @@ private:
     // Pack a driver's (strength0, strength1) pair into one u16 for storage parallel
     // to its slot; high byte = strength0 (0-value drive), low byte = strength1.
     static uint16_t pack_strength(
-        const std::pair<std::optional<slang::ast::DriveStrength>,
-                        std::optional<slang::ast::DriveStrength>>& ds) {
+      const std::pair<std::optional<slang::ast::DriveStrength>, std::optional<slang::ast::DriveStrength>>& ds) {
         return static_cast<uint16_t>((strength_level(ds.first) << 8) | strength_level(ds.second));
     }
 
@@ -3371,11 +3465,11 @@ private:
             // resolver would need a shared home scope.
             fail("multiple drivers of a net across different scopes are not supported");
         }
-        auto& slots = resolved_slots_[net_u];
+        auto&          slots = resolved_slots_[net_u];
         ir::SignalInfo info;
-        info.name = std::string(module_.signal(net).name) + "$drv" + std::to_string(slots.size());
-        info.type = module_.signal(net).type;
-        info.dir  = ir::SignalInfo::Direction::Internal;
+        info.name             = std::string(module_.signal(net).name) + "$drv" + std::to_string(slots.size());
+        info.type             = module_.signal(net).type;
+        info.dir              = ir::SignalInfo::Direction::Internal;
         const ir::Signal slot = register_signal(std::move(info));
         slots.push_back(slot);
         resolved_strengths_[net_u].push_back(strength); // parallel to slots
@@ -3398,18 +3492,16 @@ private:
                 bytes[bit / 8] |= static_cast<uint8_t>(1u << (bit % 8)); // val plane = 1
             }
         }
-        return module_.pool.put_value(make_int_type(width, /*is_four=*/true, /*is_signed=*/false),
-                                      bytes);
+        return module_.pool.put_value(make_int_type(width, /*is_four=*/true, /*is_signed=*/false), bytes);
     }
 
     ir::Ref z_constant_ref(uint32_t width) {
-        const uint32_t      pb = (width + 7) / 8;
+        const uint32_t       pb = (width + 7) / 8;
         std::vector<uint8_t> bytes(2 * static_cast<size_t>(pb), 0); // val plane = 0
         for (uint32_t bit = 0; bit < width; ++bit) {
             bytes[pb + bit / 8] |= static_cast<uint8_t>(1u << (bit % 8)); // xz plane = 1 (Z)
         }
-        return module_.pool.put_value(make_int_type(width, /*is_four=*/true, /*is_signed=*/false),
-                                      bytes);
+        return module_.pool.put_value(make_int_type(width, /*is_four=*/true, /*is_signed=*/false), bytes);
     }
 
     // The full-width value one driver stages into its slot: for a whole-net
@@ -3419,8 +3511,11 @@ private:
     // only across the drivers that actually reach it. `driven` is the already-
     // lowered right-hand value. Shapes V2 cannot slot (dynamic index, unpacked
     // element, or a 2-state net that cannot hold the Z background) fail loudly.
-    ir::Index build_driver_slot_value(ir::Signal net, const Expression& left, ir::Index driven,
-                                      ir::Builder& b, ir::SourceLoc l) {
+    ir::Index build_driver_slot_value(ir::Signal        net,
+                                      const Expression& left,
+                                      ir::Index         driven,
+                                      ir::Builder&      b,
+                                      ir::SourceLoc     l) {
         const ValueSymbol* root = lvalue_root(left);
         if (root != nullptr && !root->getType().getCanonicalType().isIntegral()) {
             // A packed vector or packed struct is integral and folds directly;
@@ -3437,9 +3532,8 @@ private:
         // A constant packed sub-range: one element band [0,0], a bounded bit
         // range strictly inside the net. Anything else (dynamic index, unpacked-
         // array element, whole-net via select) is not a slot-able partial.
-        const bool packed_const = reg.elem_lo == 0 && reg.elem_hi == 0 &&
-                                  reg.bit_hi != UINT32_MAX && reg.bit_lo <= reg.bit_hi &&
-                                  reg.bit_hi < net_w;
+        const bool packed_const = reg.elem_lo == 0 && reg.elem_hi == 0 && reg.bit_hi != UINT32_MAX &&
+                                  reg.bit_lo <= reg.bit_hi && reg.bit_hi < net_w;
         if (!packed_const) {
             // TODO: dynamic-index / unpacked-array-element partial drivers (a
             // runtime-varying region needs a per-activation Z refill or a
@@ -3451,8 +3545,8 @@ private:
             // partial driver cannot leave an identity background.
             fail("partial driver of a 2-state multiply-driven net is not supported");
         }
-        const uint32_t region_w = reg.bit_hi - reg.bit_lo + 1;
-        const ir::Index rhs = b.resize(driven, make_int_type(region_w, true, false), l);
+        const uint32_t  region_w = reg.bit_hi - reg.bit_lo + 1;
+        const ir::Index rhs      = b.resize(driven, make_int_type(region_w, true, false), l);
         // Concatenation is MSB-first: { Z above the range, the value, Z below }.
         std::vector<ir::Index> parts;
         if (reg.bit_hi < net_w - 1) {
@@ -3490,9 +3584,13 @@ private:
     // Emit one continuous-assign driver of a resolved net: stage its value (whole
     // net, or a constant packed sub-range with a Z background) into this driver's
     // slot, sensitive to the RHS reads.
-    void emit_resolved_driver(ir::Signal net, const AssignmentExpression& a, const Expression& left,
-                              ir::Builder& b, ir::SourceLoc l, uint16_t strength = 0x0303) {
-        const ir::Index val  = build_driver_slot_value(net, left, lower_expr(a.right(), b), b, l);
+    void emit_resolved_driver(ir::Signal                  net,
+                              const AssignmentExpression& a,
+                              const Expression&           left,
+                              ir::Builder&                b,
+                              ir::SourceLoc               l,
+                              uint16_t                    strength = 0x0303) {
+        const ir::Index  val  = build_driver_slot_value(net, left, lower_expr(a.right(), b), b, l);
         const ir::Signal slot = alloc_driver_slot(net, l, strength);
         b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
         add_continuous_process(continuous_events(a), l, b);
@@ -3527,36 +3625,34 @@ private:
         std::sort(nets.begin(), nets.end()); // deterministic process order
 
         for (const uint32_t net_u : nets) {
-            const ir::Signal net = static_cast<ir::Signal>(net_u);
-            const auto       si  = resolved_slots_.find(net_u);
+            const ir::Signal                  net = static_cast<ir::Signal>(net_u);
+            const auto                        si  = resolved_slots_.find(net_u);
             const std::span<const ir::Signal> slots =
-              si != resolved_slots_.end() ? std::span<const ir::Signal>(si->second)
-                                          : std::span<const ir::Signal>();
+              si != resolved_slots_.end() ? std::span<const ir::Signal>(si->second) : std::span<const ir::Signal>();
             const auto pi = net_pull_.find(net_u);
 
-            const ir::SourceLoc l = !slots.empty() ? resolved_loc_[net_u]
-                                    : pi != net_pull_.end() ? pi->second.loc
-                                                            : ir::SourceLoc{ 0 };
-            const uint32_t scope  = !slots.empty() ? resolved_scope_[net_u]
-                                    : pi != net_pull_.end() ? pi->second.scope
-                                                            : ir::Process::no_scope;
-            const ir::Inst::Tag op =
-              net_resolve_op_.contains(net_u) ? net_resolve_op_[net_u] : ir::Inst::Tag::WireRes;
+            const ir::SourceLoc l     = !slots.empty()          ? resolved_loc_[net_u]
+                                        : pi != net_pull_.end() ? pi->second.loc
+                                                                : ir::SourceLoc{ 0 };
+            const uint32_t      scope = !slots.empty()          ? resolved_scope_[net_u]
+                                        : pi != net_pull_.end() ? pi->second.scope
+                                                                : ir::Process::no_scope;
+            const ir::Inst::Tag op = net_resolve_op_.contains(net_u) ? net_resolve_op_[net_u] : ir::Inst::Tag::WireRes;
 
             // A net resolves through the strength-weighted fold when any driver
             // has a non-default (not Strong/Strong) drive strength; otherwise the
             // cheaper strengthless pairwise fold (WireRes / WandRes / WorRes).
-            const auto  st_it = resolved_strengths_.find(net_u);
-            const std::span<const uint16_t> strengths =
-              st_it != resolved_strengths_.end() ? std::span<const uint16_t>(st_it->second)
-                                                 : std::span<const uint16_t>();
-            const bool has_strength =
+            const auto                      st_it     = resolved_strengths_.find(net_u);
+            const std::span<const uint16_t> strengths = st_it != resolved_strengths_.end()
+                                                          ? std::span<const uint16_t>(st_it->second)
+                                                          : std::span<const uint16_t>();
+            const bool                      has_strength =
               std::any_of(strengths.begin(), strengths.end(), [](uint16_t s) { return s != 0x0303; });
             // A Supply pull (supply0/supply1) must beat a Strong driver, so it always
             // folds as a strength driver; a Pull pull (tri0/tri1) only when a real
             // driver carries an explicit strength (else the strengthless NetPull is
             // equivalent and cheaper).
-            const bool supply_pull = pi != net_pull_.end() && pi->second.strength >= 4;
+            const bool supply_pull  = pi != net_pull_.end() && pi->second.strength >= 4;
             const bool use_strength = has_strength || supply_pull;
 
             const uint32_t net_w = module_.pool.layout(module_.signal(net).type).width;
@@ -3575,8 +3671,8 @@ private:
                     // TODO: drive strengths on wand/wor nets (LRM 6.6.1-6.6.3).
                     fail("drive strengths on a wand/wor net are not supported");
                 }
-                std::vector<ir::Index>  slot_vals;
-                std::vector<uint16_t>   str_vec(strengths.begin(), strengths.end());
+                std::vector<ir::Index> slot_vals;
+                std::vector<uint16_t>  str_vec(strengths.begin(), strengths.end());
                 slot_vals.reserve(slots.size() + 1);
                 for (const ir::Signal s : slots) {
                     slot_vals.push_back(b.unary(ir::Inst::Tag::Load, b.signal(s, l), l));
@@ -3590,8 +3686,8 @@ private:
                     const bool    one = pi->second.value != 0;
                     const uint8_t str = pi->second.strength;
                     slot_vals.push_back(b.constant(def_constant_ref(net_w, one), l));
-                    str_vec.push_back(one ? static_cast<uint16_t>(str)          // (highz0, strN)
-                                          : static_cast<uint16_t>(str << 8));    // (strN, highz1)
+                    str_vec.push_back(one ? static_cast<uint16_t>(str)        // (highz0, strN)
+                                          : static_cast<uint16_t>(str << 8)); // (strN, highz1)
                     pull_injected = true;
                 }
                 acc = b.strength_res(slot_vals, str_vec, l);
@@ -3612,19 +3708,17 @@ private:
             // skipped, so re-running the resolver reverts those bits to the fold. Each
             // site's active/val join the sensitivity so force apply and release re-run
             // this process.
-            const auto fs_it = net_force_sites_.find(net_u);
-            const std::span<const NetForceSite> sites =
-              fs_it != net_force_sites_.end() ? std::span<const NetForceSite>(fs_it->second)
-                                              : std::span<const NetForceSite>();
+            const auto                          fs_it = net_force_sites_.find(net_u);
+            const std::span<const NetForceSite> sites = fs_it != net_force_sites_.end()
+                                                          ? std::span<const NetForceSite>(fs_it->second)
+                                                          : std::span<const NetForceSite>();
             b.binary(ir::Inst::Tag::Store, b.signal(net, l), acc, l);
             for (const NetForceSite& site : sites) {
-                const ir::Index net_lv =
-                    (site.lo == 0 && site.hi == net_w - 1)
-                        ? b.signal(net, l)
-                        : b.part_select(b.signal(net, l), site.hi, site.lo, l);
+                const ir::Index net_lv = (site.lo == 0 && site.hi == net_w - 1)
+                                           ? b.signal(net, l)
+                                           : b.part_select(b.signal(net, l), site.hi, site.lo, l);
                 b.open_region();
-                b.binary(ir::Inst::Tag::Store, net_lv,
-                         b.unary(ir::Inst::Tag::Load, b.signal(site.val, l), l), l);
+                b.binary(ir::Inst::Tag::Store, net_lv, b.unary(ir::Inst::Tag::Load, b.signal(site.val, l), l), l);
                 const ir::ExtraSlice then_r = b.close_region();
                 b.open_region();
                 const ir::ExtraSlice else_r = b.close_region();
@@ -3652,8 +3746,8 @@ private:
     // -- Processes --
 
     void lower_continuous_assign(const ContinuousAssignSymbol& sym) {
-        const uint16_t strength = pack_strength(sym.getDriveStrength());
-        const Expression& e = sym.getAssignment();
+        const uint16_t    strength = pack_strength(sym.getDriveStrength());
+        const Expression& e        = sym.getAssignment();
         if (e.kind != ExpressionKind::Assignment) {
             fail("malformed continuous assignment");
         }
@@ -3701,10 +3795,8 @@ private:
             // so a select / concat / aggregate target has no record shape.
             // TODO: inertial delay on a bit/part-select, concat, or aggregate net.
             const bool whole_scalar =
-                (left.kind == ExpressionKind::NamedValue ||
-                 left.kind == ExpressionKind::HierarchicalValue) &&
-                left.type->isIntegral() && !left.type->isUnpackedArray() &&
-                !is_aggregate(*left.type);
+              (left.kind == ExpressionKind::NamedValue || left.kind == ExpressionKind::HierarchicalValue) &&
+              left.type->isIntegral() && !left.type->isUnpackedArray() && !is_aggregate(*left.type);
             if (!whole_scalar) {
                 fail("continuous assignment delay is only supported for a whole integral "
                      "scalar target");
@@ -3785,14 +3877,14 @@ private:
     // process sees `force_site !== its id` and stops writing. Nets, bit/part/
     // element-selects, aggregates, and `assign`/`deassign` are guarded loud below.
     struct ForceInfo {
-        ir::Signal site{ 0 };       // force_site, always allocated
-        uint32_t   next_site = 0;   // ids handed to textual force sites, 1-based
+        ir::Signal site{ 0 };     // force_site, always allocated
+        uint32_t   next_site = 0; // ids handed to textual force sites, 1-based
         // Second override layer: the procedural continuous `assign` statement (LRM
         // 10.6.1), priority below force and above ordinary procedural writes.
         // Present only when the variable is an `assign` target somewhere.
-        bool       has_assign   = false;
+        bool       has_assign = false;
         ir::Signal assign_site{ 0 };
-        uint32_t   next_assign  = 0;
+        uint32_t   next_assign = 0;
     };
     ankerl::unordered_dense::map<uint32_t, ForceInfo> forceable_;
 
@@ -3803,8 +3895,8 @@ private:
     // (not a single net force_val) so disjoint partial forces coexist and each
     // releases independently.
     struct NetForceSite {
-        ir::Signal active{ 0 };   // 2-state i32, 0 = inactive
-        ir::Signal val{ 0 };      // (hi - lo + 1)-wide forced value
+        ir::Signal active{ 0 }; // 2-state i32, 0 = inactive
+        ir::Signal val{ 0 };    // (hi - lo + 1)-wide forced value
         uint32_t   lo = 0, hi = 0;
     };
     // Net handle -> its force sites (in registration order; the resolver blends
@@ -3821,13 +3913,12 @@ private:
     // force_site state is always integral). A real net is illegal (slang rejects),
     // so a real target is always a variable. Sets `*is_net` when non-null.
     const ValueSymbol* force_target(const Expression& lhs, bool* is_net) {
-        if (lhs.kind != ExpressionKind::NamedValue &&
-            lhs.kind != ExpressionKind::HierarchicalValue) {
+        if (lhs.kind != ExpressionKind::NamedValue && lhs.kind != ExpressionKind::HierarchicalValue) {
             return nullptr;
         }
         const slang::ast::Type& t = lhs.type->getCanonicalType();
         if (!t.isIntegral() && !t.isFloating()) {
-            return nullptr;   // string / aggregate / unpacked / event / class
+            return nullptr; // string / aggregate / unpacked / event / class
         }
         const ValueSymbol& sym = lhs.as<ValueExpressionBase>().symbol;
         if (is_net != nullptr) {
@@ -3860,7 +3951,7 @@ private:
     void scan_force_targets(const Statement& body) {
         struct Scan : ASTVisitor<Scan, VisitFlags::AllGood> {
             Lowerer* self;
-            void handle(const ProceduralAssignStatement& s) {
+            void     handle(const ProceduralAssignStatement& s) {
                 if (s.assignment.kind == ExpressionKind::Assignment) {
                     self->register_pca_site(s);
                 }
@@ -3883,27 +3974,26 @@ private:
 
     // Route one force/assign statement to the variable or net registration path.
     void register_pca_site(const ProceduralAssignStatement& s) {
-        const Expression&  lhs  = s.assignment.as<AssignmentExpression>().left();
-        const ValueSymbol* root = lvalue_root(lhs);
-        const bool is_net = root != nullptr && canonical_value_symbol(*root).kind == SymbolKind::Net;
+        const Expression&  lhs    = s.assignment.as<AssignmentExpression>().left();
+        const ValueSymbol* root   = lvalue_root(lhs);
+        const bool         is_net = root != nullptr && canonical_value_symbol(*root).kind == SymbolKind::Net;
         if (is_net) {
             if (s.isForce) {
-                register_net_force_site(s, lhs, *root);   // whole or const select
+                register_net_force_site(s, lhs, *root); // whole or const select
             }
-            return;   // `assign` on a net is illegal (slang rejects)
+            return; // `assign` on a net is illegal (slang rejects)
         }
-        register_pca_target(lhs, s.isForce);   // whole-scalar variable
+        register_pca_target(lhs, s.isForce); // whole-scalar variable
     }
 
     // Register one net `force` site (whole net or a constant bit/part-select of it).
     // Allocates the site's `active` + range-wide `val` signals and marks the net for
     // resolution (emit_wire_resolvers overlays every active site). A dynamic /
     // non-constant select, or a concat, is left unregistered and guarded at lowering.
-    void register_net_force_site(const ProceduralAssignStatement& s, const Expression& lhs,
-                                 const ValueSymbol& root) {
+    void register_net_force_site(const ProceduralAssignStatement& s, const Expression& lhs, const ValueSymbol& root) {
         const auto sit = sigmap_.find(&canonical_value_symbol(root));
         if (sit == sigmap_.end()) {
-            return;   // hierarchical / not-yet-collected: guarded loud
+            return; // hierarchical / not-yet-collected: guarded loud
         }
         const auto     net_u = static_cast<uint32_t>(sit->second);
         const uint32_t net_w = module_.pool.layout(module_.signal(sit->second).type).width;
@@ -3912,7 +4002,7 @@ private:
         if (lhs.kind != ExpressionKind::NamedValue && lhs.kind != ExpressionKind::HierarchicalValue) {
             const auto r = packed_bit_range(lhs);
             if (!r) {
-                return;   // dynamic / unsupported select: guarded loud at lowering
+                return; // dynamic / unsupported select: guarded loud at lowering
             }
             lo = r->first;
             hi = r->second;
@@ -3931,8 +4021,7 @@ private:
         sites.push_back(site);
         stmt_force_site_[&s] = { net_u, idx };
         if (resolved_nets_.insert(net_u).second) {
-            net_resolve_op_[net_u] =
-                net_resolve_tag(canonical_value_symbol(root).as<NetSymbol>().netType.netKind);
+            net_resolve_op_[net_u] = net_resolve_tag(canonical_value_symbol(root).as<NetSymbol>().netType.netKind);
         }
     }
 
@@ -3942,11 +4031,11 @@ private:
     void register_pca_target(const Expression& lhs, bool is_force) {
         const ValueSymbol* sym = force_target_var(lhs);
         if (sym == nullptr) {
-            return;   // unsupported shape (net handled elsewhere): guarded loud
+            return; // unsupported shape (net handled elsewhere): guarded loud
         }
         const auto sit = sigmap_.find(&canonical_value_symbol(*sym));
         if (sit == sigmap_.end()) {
-            return;   // not registered in this scope (hierarchical): guarded loud
+            return; // not registered in this scope (hierarchical): guarded loud
         }
         const auto [it, inserted] = forceable_.try_emplace(static_cast<uint32_t>(sit->second));
         ForceInfo& fi             = it->second;
@@ -3963,8 +4052,7 @@ private:
     // wake on `force_site` so that `release` (force_site -> 0) re-evaluates it and
     // reverts the variable to the driver's current value (LRM 10.6.2 reestablish).
     // Appends that wait event when `lhs`'s root is forceable; a no-op otherwise.
-    std::vector<ir::WaitEvent> with_force_wake(std::vector<ir::WaitEvent> ev,
-                                               const Expression&          lhs) {
+    std::vector<ir::WaitEvent> with_force_wake(std::vector<ir::WaitEvent> ev, const Expression& lhs) {
         if (const ValueSymbol* r = lvalue_root(lhs)) {
             if (ForceInfo* fi = force_info_of(*r)) {
                 ev.push_back(ir::WaitEvent{ .signal = fi->site, .edge = ir::Edge::Any });
@@ -3980,8 +4068,8 @@ private:
 
     // `force_site === id` (CaseEq never yields x; the site is 2-state anyway).
     ir::Index site_is(ir::Signal site, uint32_t id, ir::Builder& b, ir::SourceLoc l) {
-        return b.binary(ir::Inst::Tag::CaseEq, b.unary(ir::Inst::Tag::Load, b.signal(site, l), l),
-                        site_const(id, b, l), l);
+        return b.binary(
+          ir::Inst::Tag::CaseEq, b.unary(ir::Inst::Tag::Load, b.signal(site, l), l), site_const(id, b, l), l);
     }
 
     // `not forced` and, if an assign layer exists, `not assigned` — the predicate
@@ -3999,9 +4087,9 @@ private:
     // evaluate the RHS (side effects run regardless, LRM), then store only while
     // neither a force nor an assign is active.
     ir::Index gated_store(const AssignmentExpression& a, const ForceInfo& fi, ir::Builder& b) {
-        const ir::SourceLoc l   = loc(a);
-        const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
-        const ir::Index     rhs = lower_expr(a.right(), b);
+        const ir::SourceLoc l    = loc(a);
+        const ir::Inst::Tag tag  = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
+        const ir::Index     rhs  = lower_expr(a.right(), b);
         const ir::Index     pred = not_forced(fi, /*also_assign=*/true, b, l);
         b.open_region();
         b.binary(tag, lower_lvalue(a.left(), b), rhs, l);
@@ -4021,8 +4109,7 @@ private:
     // ports (driven inside, by a gated assign / procedural write) are handled.
     // TODO: force-wake port-copy drivers to lift this.
     bool is_externally_driven_port(const ValueSymbol& sym) {
-        const ir::SignalInfo::Direction dir =
-            module_.signals()[static_cast<uint32_t>(signal_of(sym))].dir;
+        const ir::SignalInfo::Direction dir = module_.signals()[static_cast<uint32_t>(signal_of(sym))].dir;
         return dir == ir::SignalInfo::Direction::Input || dir == ir::SignalInfo::Direction::Inout;
     }
 
@@ -4030,7 +4117,7 @@ private:
         const ValueSymbol* sym = force_target_var(lhs);
         if (sym == nullptr) {
             fail(std::string(verb) + " is only supported on a whole integral variable "
-                 "(LRM 10.6); nets, selects, and aggregates are not yet supported");
+                                     "(LRM 10.6); nets, selects, and aggregates are not yet supported");
         }
         if (is_externally_driven_port(*sym)) {
             fail(std::string(verb) + " on an input or inout port variable is not supported");
@@ -4040,9 +4127,12 @@ private:
 
     // Build a continuous re-eval process that stores `a.right()` into `v` while
     // `pred_fn(rb)` holds, sensitive to the RHS reads plus `extra` wait events.
-    template <typename PredFn>
-    void add_pca_reeval(const AssignmentExpression& a, ir::Signal v, ir::SourceLoc l,
-                        std::vector<ir::WaitEvent> extra, PredFn pred_fn) {
+    template<typename PredFn>
+    void add_pca_reeval(const AssignmentExpression& a,
+                        ir::Signal                  v,
+                        ir::SourceLoc               l,
+                        std::vector<ir::WaitEvent>  extra,
+                        PredFn                      pred_fn) {
         ir::Builder     rb(module_.pool);
         const ir::Index pred = pred_fn(rb);
         rb.open_region();
@@ -4081,23 +4171,21 @@ private:
                     fail("force on a dynamic or non-constant net bit/part-select is not "
                          "supported (only a constant select, LRM 10.6.2)");
                 }
-                const auto [net_u, idx]  = it->second;
-                const NetForceSite& site = net_force_sites_[net_u][idx];
-                const auto          net  = static_cast<ir::Signal>(net_u);
-                const uint32_t net_w = module_.pool.layout(module_.signal(net).type).width;
-                const ir::Index rhs  = lower_expr(a.right(), b);
+                const auto [net_u, idx]   = it->second;
+                const NetForceSite& site  = net_force_sites_[net_u][idx];
+                const auto          net   = static_cast<ir::Signal>(net_u);
+                const uint32_t      net_w = module_.pool.layout(module_.signal(net).type).width;
+                const ir::Index     rhs   = lower_expr(a.right(), b);
                 b.binary(ir::Inst::Tag::Store, b.signal(site.active, l), site_const(1, b, l), l);
                 b.binary(ir::Inst::Tag::Store, b.signal(site.val, l), rhs, l);
                 // Eager positioned apply so a same-instant read (`force n=v; if
                 // (n===v)`) sees it — the resolver would otherwise update n one delta
                 // later. The resolver re-affirms the same value when it runs.
-                const ir::Index net_lv =
-                    (site.lo == 0 && site.hi == net_w - 1)
-                        ? b.signal(net, l)
-                        : b.part_select(b.signal(net, l), site.hi, site.lo, l);
+                const ir::Index net_lv = (site.lo == 0 && site.hi == net_w - 1)
+                                           ? b.signal(net, l)
+                                           : b.part_select(b.signal(net, l), site.hi, site.lo, l);
                 b.binary(ir::Inst::Tag::Store, net_lv, rhs, l);
-                add_pca_reeval(a, site.val, l, {},
-                               [&](ir::Builder& rb) { return site_is(site.active, 1, rb, l); });
+                add_pca_reeval(a, site.val, l, {}, [&](ir::Builder& rb) { return site_is(site.active, 1, rb, l); });
                 return;
             }
             ForceInfo* fip = force_info_of(*sym);
@@ -4118,8 +4206,7 @@ private:
             const ir::Signal v  = signal_of(*sym);
             b.binary(ir::Inst::Tag::Store, b.signal(fi.site, l), site_const(id, b, l), l);
             b.binary(ir::Inst::Tag::Store, b.signal(v, l), lower_expr(a.right(), b), l);
-            add_pca_reeval(a, v, l, {},
-                           [&](ir::Builder& rb) { return site_is(fi.site, id, rb, l); });
+            add_pca_reeval(a, v, l, {}, [&](ir::Builder& rb) { return site_is(fi.site, id, rb, l); });
             return;
         }
 
@@ -4148,18 +4235,17 @@ private:
             const ir::ExtraSlice else_r = b.close_region();
             b.cond(pred, then_r, else_r, l);
         }
-        add_pca_reeval(a, v, l, { ir::WaitEvent{ .signal = fi.site, .edge = ir::Edge::Any } },
-                       [&](ir::Builder& rb) {
-                           return rb.binary(ir::Inst::Tag::Land, site_is(fi.assign_site, id, rb, l),
-                                            not_forced(fi, /*also_assign=*/false, rb, l), l);
-                       });
+        add_pca_reeval(a, v, l, { ir::WaitEvent{ .signal = fi.site, .edge = ir::Edge::Any } }, [&](ir::Builder& rb) {
+            return rb.binary(
+              ir::Inst::Tag::Land, site_is(fi.assign_site, id, rb, l), not_forced(fi, /*also_assign=*/false, rb, l), l);
+        });
     }
 
     void lower_proc_deassign(const ProceduralDeassignStatement& s, ir::Builder& b) {
-        const Expression&   lv   = s.lvalue;
-        const ValueSymbol*  root = lvalue_root(lv);
-        const bool is_net = root != nullptr && canonical_value_symbol(*root).kind == SymbolKind::Net;
-        const ir::SourceLoc l    = loc(s);
+        const Expression&   lv     = s.lvalue;
+        const ValueSymbol*  root   = lvalue_root(lv);
+        const bool          is_net = root != nullptr && canonical_value_symbol(*root).kind == SymbolKind::Net;
+        const ir::SourceLoc l      = loc(s);
 
         if (is_net) {
             if (!s.isRelease) {
@@ -4198,15 +4284,14 @@ private:
     // `release net` / `release net[hi:lo]` (LRM 10.6.2): clear every active force
     // site of the net whose range is covered by the release range; the resolver
     // reverts those bits to the driver value. Whole-net release covers all sites.
-    void release_net(const Expression& lv, const ValueSymbol& root, ir::Builder& b,
-                     ir::SourceLoc l) {
+    void release_net(const Expression& lv, const ValueSymbol& root, ir::Builder& b, ir::SourceLoc l) {
         const auto sit = sigmap_.find(&canonical_value_symbol(root));
         if (sit == sigmap_.end()) {
-            return;   // never registered (hierarchical): a release with no force is a no-op
+            return; // never registered (hierarchical): a release with no force is a no-op
         }
         const auto fs = net_force_sites_.find(static_cast<uint32_t>(sit->second));
         if (fs == net_force_sites_.end()) {
-            return;   // net never forced: no-op
+            return; // net never forced: no-op
         }
         const uint32_t net_w = module_.pool.layout(module_.signal(sit->second).type).width;
         uint32_t       rlo = 0, rhi = net_w - 1;
@@ -4253,8 +4338,7 @@ private:
             // as a bare `assign n = ...` on a struct.
             ir::Builder         ab(module_.pool);
             const ir::SourceLoc al = loc(*init);
-            emit_agg_store(value_lvalue(ns, ab, al), lower_type(ns.getType()), *init,
-                           ir::Inst::Tag::Store, ab, al);
+            emit_agg_store(value_lvalue(ns, ab, al), lower_type(ns.getType()), *init, ir::Inst::Tag::Store, ab, al);
             add_continuous_process(continuous_events(*init), to_source_loc(ns.location), ab);
             return;
         }
@@ -4264,8 +4348,8 @@ private:
             // A net-declaration assignment is a whole-net driver: stage the
             // initializer into this driver's slot (emit_wire_resolvers folds it).
             const ir::Signal slot = alloc_driver_slot(signal_of(ns), l, pack_strength(ns.getDriveStrength()));
-            b.binary(ir::Inst::Tag::Store, b.signal(slot, l),
-                     b.resize(lower_expr(*init, b), lower_type(ns.getType()), l), l);
+            b.binary(
+              ir::Inst::Tag::Store, b.signal(slot, l), b.resize(lower_expr(*init, b), lower_type(ns.getType()), l), l);
             add_continuous_process(continuous_events(*init), to_source_loc(ns.location), b);
             return;
         }
@@ -4286,14 +4370,24 @@ private:
 
     // Local gate types — not stored in the module; only used during lowering.
     enum class GateOp : uint8_t { And, Nand, Or, Nor, Xor, Xnor, Buf, Not };
-    struct GateTerm  { ir::Signal sig = ir::Signal{0}; uint32_t bit = 0; };
-    struct GateInput { ir::Signal sig = ir::Signal{0}; uint32_t bit = 0;
-                       uint8_t const_code = 0; bool is_const = false; };
+    struct GateTerm {
+        ir::Signal sig = ir::Signal{ 0 };
+        uint32_t   bit = 0;
+    };
+    struct GateInput {
+        ir::Signal sig        = ir::Signal{ 0 };
+        uint32_t   bit        = 0;
+        uint8_t    const_code = 0;
+        bool       is_const   = false;
+    };
 
     // A three-state gate (bufif/notif, LRM 28.6). `active_high` is the control
     // level that enables the driver (1 for bufif1/notif1, 0 for bufif0/notif0);
     // `invert` distinguishes notif (inverts the data) from bufif.
-    struct TriGate { bool active_high = false; bool invert = false; };
+    struct TriGate {
+        bool active_high = false;
+        bool invert      = false;
+    };
 
     // Map a built-in three-state gate name to its TriGate; nullopt otherwise.
     static std::optional<TriGate> tristate_gate_of(std::string_view name) {
@@ -4348,20 +4442,22 @@ private:
     static ir::Inst::Tag gate_fold_tag(GateOp op) {
         switch (op) {
             case GateOp::And:
-            case GateOp::Nand: return ir::Inst::Tag::Band;
+            case GateOp::Nand:
+                return ir::Inst::Tag::Band;
             case GateOp::Or:
             case GateOp::Nor:
             case GateOp::Buf:
-            case GateOp::Not:  return ir::Inst::Tag::Bor;
+            case GateOp::Not:
+                return ir::Inst::Tag::Bor;
             case GateOp::Xor:
-            case GateOp::Xnor: return ir::Inst::Tag::Bxor;
+            case GateOp::Xnor:
+                return ir::Inst::Tag::Bxor;
         }
         __builtin_unreachable();
     }
 
     static bool gate_inverted(GateOp op) {
-        return op == GateOp::Nand || op == GateOp::Nor ||
-               op == GateOp::Not  || op == GateOp::Xnor;
+        return op == GateOp::Nand || op == GateOp::Nor || op == GateOp::Not || op == GateOp::Xnor;
     }
 
     // Strip conversion wrappers whose operand is still a packed integral value.
@@ -4490,8 +4586,8 @@ private:
         // to the expression's reads, evaluated at time zero like any continuous
         // assign (mirrors lower_continuous_assign).
         ir::SignalInfo info;
-        info.name = prefix_ + "$gate" + std::to_string(temp_id_++) + "." + std::string(inst_name) + ".in" +
-                    std::to_string(input_index);
+        info.name            = prefix_ + "$gate" + std::to_string(temp_id_++) + "." + std::string(inst_name) + ".in" +
+                               std::to_string(input_index);
         info.type            = module_.pool.logic_type;
         const ir::Signal tmp = module_.add_signal(std::move(info));
 
@@ -4549,9 +4645,8 @@ private:
         }
         // slang wraps the output terminal in an AssignmentExpression (lhs = source);
         // the driven net is its left().
-        const Expression& out = conns[0]->kind == ExpressionKind::Assignment
-                                  ? conns[0]->as<AssignmentExpression>().left()
-                                  : *conns[0];
+        const Expression& out =
+          conns[0]->kind == ExpressionKind::Assignment ? conns[0]->as<AssignmentExpression>().left() : *conns[0];
         // A pull source has no single canonical net for a bit/part-select target.
         if (out.kind != ExpressionKind::NamedValue && out.kind != ExpressionKind::HierarchicalValue) {
             // TODO: pullup/pulldown on a bit/part-select or concat target.
@@ -4575,10 +4670,10 @@ private:
         // Default pull strength (LRM 28.11) is Pull; an explicit strength overrides
         // the driven side. pullup drives only 1 (highz0), pulldown only 0 (highz1).
         const auto [ds0, ds1] = gi.getDriveStrength();
-        const uint8_t  driven = up ? (ds1 ? strength_level(ds1) : uint8_t{ 2 })
-                                   : (ds0 ? strength_level(ds0) : uint8_t{ 2 });
-        const uint16_t strength = up ? static_cast<uint16_t>(driven)          // (highz0, drivenN)
-                                     : static_cast<uint16_t>(driven << 8);     // (drivenN, highz1)
+        const uint8_t driven =
+          up ? (ds1 ? strength_level(ds1) : uint8_t{ 2 }) : (ds0 ? strength_level(ds0) : uint8_t{ 2 });
+        const uint16_t   strength = up ? static_cast<uint16_t>(driven)       // (highz0, drivenN)
+                                       : static_cast<uint16_t>(driven << 8); // (drivenN, highz1)
         ir::Builder      b(module_.pool);
         const ir::Signal slot = alloc_driver_slot(net, l, strength);
         b.binary(ir::Inst::Tag::Store, b.signal(slot, l), b.constant(def_constant_ref(w, up), l), l);
@@ -4592,10 +4687,10 @@ private:
             lower_pull_source(gi, prim.name == "pullup");
             return;
         }
-        const auto             op   = gate_op_of(prim.name);
-        const auto             tri  = tristate_gate_of(prim.name);
-        const bool             supported_kind =
-            prim.primitiveKind == PrimitiveSymbol::NInput || prim.primitiveKind == PrimitiveSymbol::NOutput;
+        const auto op  = gate_op_of(prim.name);
+        const auto tri = tristate_gate_of(prim.name);
+        const bool supported_kind =
+          prim.primitiveKind == PrimitiveSymbol::NInput || prim.primitiveKind == PrimitiveSymbol::NOutput;
         if (!tri && (!op || !supported_kind)) {
             // TODO: MOS / bidirectional switches and user-defined primitives.
             fail("gate primitive '" + std::string(prim.name) + "' is not supported");
@@ -4653,9 +4748,8 @@ private:
             // combinational fold does).
             ir::Builder                b(module_.pool);
             std::vector<ir::WaitEvent> wait_events;
-            const ir::Index            val = tri
-                              ? gate_tristate_value(*tri, inputs[0], inputs[1], wait_events, b, loc)
-                              : gate_folded_value(*op, inputs, wait_events, b, loc);
+            const ir::Index            val = tri ? gate_tristate_value(*tri, inputs[0], inputs[1], wait_events, b, loc)
+                                                 : gate_folded_value(*op, inputs, wait_events, b, loc);
 
             if (const std::optional<ir::Signal> net = resolved_net_of(left)) {
                 if (gate_delay != nullptr) {
@@ -4664,21 +4758,21 @@ private:
                     // (mirrors the resolved continuous-assign delay gap, LRM 28.16).
                     fail("gate delay on a multiply-driven (resolved) net is not supported");
                 }
-                emit_gate_resolved_driver(left, *net, val, std::move(wait_events), b, loc,
-                                          gate_strength);
+                emit_gate_resolved_driver(left, *net, val, std::move(wait_events), b, loc, gate_strength);
             } else {
                 const GateTerm output = lower_gate_output(*out);
-                if (gate_delay != nullptr &&
-                    module_.pool.layout(module_.signal(output.sig).type).width != 1) {
+                if (gate_delay != nullptr && module_.pool.layout(module_.signal(output.sig).type).width != 1) {
                     // The inertial-delay store targets a whole signal; a gate driving
                     // one bit of a wider vector (`and #d (v[i], ...)`) has no whole-
                     // signal lvalue. TODO: bit-addressed gate output with a delay.
                     fail("gate delay is only supported for a whole scalar output");
                 }
-                emit_gate_as_process(output, val, std::move(wait_events), b, loc,
-                                     gate_delay != nullptr
-                                         ? &gate_delay->as<DelayControl>().expr
-                                         : nullptr);
+                emit_gate_as_process(output,
+                                     val,
+                                     std::move(wait_events),
+                                     b,
+                                     loc,
+                                     gate_delay != nullptr ? &gate_delay->as<DelayControl>().expr : nullptr);
             }
         }
     }
@@ -4691,8 +4785,7 @@ private:
             return s;
         }
         const ir::Ref u32 = make_int_type(32, false, false);
-        return b.binary(ir::Inst::Tag::BitSelect, s,
-                        b.constant(module_.pool.put_int(u32, bit), l), l);
+        return b.binary(ir::Inst::Tag::BitSelect, s, b.constant(module_.pool.put_int(u32, bit), l), l);
     }
 
     // Materialize one gate input terminal as its 1-bit logic value: a load of the
@@ -4705,19 +4798,20 @@ private:
             return b.unary(ir::Inst::Tag::Load, gate_bit_lvalue(in.sig, in.bit, b, l), l);
         }
         switch (in.const_code & 3) {
-            case 0b00: return b.constant(module_.pool.put_int(logic1, 0), l);
-            case 0b11: return b.constant(module_.pool.put_int(logic1, 1), l);
+            case 0b00:
+                return b.constant(module_.pool.put_int(logic1, 0), l);
+            case 0b11:
+                return b.constant(module_.pool.put_int(logic1, 1), l);
             default: {
-                const uint8_t xbytes[2] = {0x01, 0x01};
-                return b.constant(module_.pool.put_value(logic1, {xbytes, 2}), l);
+                const uint8_t xbytes[2] = { 0x01, 0x01 };
+                return b.constant(module_.pool.put_value(logic1, { xbytes, 2 }), l);
             }
         }
     }
 
     // Collect the any-change sensitivity over a gate's unique non-const input
     // signals into `wait_events`.
-    void collect_gate_sensitivity(std::span<const GateInput> inputs,
-                                  std::vector<ir::WaitEvent>& wait_events) {
+    void collect_gate_sensitivity(std::span<const GateInput> inputs, std::vector<ir::WaitEvent>& wait_events) {
         ankerl::unordered_dense::set<uint32_t> seen;
         for (const GateInput& in : inputs) {
             if (!in.is_const && seen.insert(static_cast<uint32_t>(in.sig)).second) {
@@ -4730,21 +4824,23 @@ private:
     // collect the any-change sensitivity over the non-const input signals (into
     // `wait_events`). Shared by the direct-store path (emit_gate_as_process) and
     // the resolved-net driver path (emit_gate_resolved_driver).
-    ir::Index gate_folded_value(GateOp op, std::span<const GateInput> inputs,
-                                std::vector<ir::WaitEvent>& wait_events, ir::Builder& b,
-                                ir::SourceLoc l) {
+    ir::Index gate_folded_value(GateOp                      op,
+                                std::span<const GateInput>  inputs,
+                                std::vector<ir::WaitEvent>& wait_events,
+                                ir::Builder&                b,
+                                ir::SourceLoc               l) {
         const ir::Ref logic1 = module_.pool.logic_type;
 
         std::optional<ir::Index> acc;
         const ir::Inst::Tag      fold = gate_fold_tag(op);
         for (const GateInput& in : inputs) {
             const ir::Index val = gate_input_value(in, b, l);
-            acc = acc ? b.binary(fold, *acc, val, l) : val;
+            acc                 = acc ? b.binary(fold, *acc, val, l) : val;
         }
         if (!acc) {
             // 0-input degenerate gate: output X.
-            const uint8_t xbytes[2] = {0x01, 0x01};
-            acc = b.constant(module_.pool.put_value(logic1, {xbytes, 2}), l);
+            const uint8_t xbytes[2] = { 0x01, 0x01 };
+            acc                     = b.constant(module_.pool.put_value(logic1, { xbytes, 2 }), l);
         }
         if (gate_inverted(op)) {
             acc = b.unary(ir::Inst::Tag::Bnot, *acc, l);
@@ -4770,20 +4866,23 @@ private:
     // control yields X. The LRM's weak L/H results for an x/z control (0-or-z,
     // 1-or-z) collapse to X here: Clotho has no strength model, matching iverilog
     // on a plain wire.
-    ir::Index gate_tristate_value(TriGate tg, const GateInput& data, const GateInput& ctrl,
-                                  std::vector<ir::WaitEvent>& wait_events, ir::Builder& b,
-                                  ir::SourceLoc l) {
-        const ir::Ref   logic1 = module_.pool.logic_type;
-        const ir::Index one    = b.constant(module_.pool.put_int(logic1, 1), l);
-        const ir::Index zero   = b.constant(module_.pool.put_int(logic1, 0), l);
-        const uint8_t   xbytes[2] = {0x01, 0x01};
-        const ir::Index x_const = b.constant(module_.pool.put_value(logic1, {xbytes, 2}), l);
-        const ir::Index z_const = b.constant(z_constant_ref(1), l);
+    ir::Index gate_tristate_value(TriGate                     tg,
+                                  const GateInput&            data,
+                                  const GateInput&            ctrl,
+                                  std::vector<ir::WaitEvent>& wait_events,
+                                  ir::Builder&                b,
+                                  ir::SourceLoc               l) {
+        const ir::Ref   logic1    = module_.pool.logic_type;
+        const ir::Index one       = b.constant(module_.pool.put_int(logic1, 1), l);
+        const ir::Index zero      = b.constant(module_.pool.put_int(logic1, 0), l);
+        const uint8_t   xbytes[2] = { 0x01, 0x01 };
+        const ir::Index x_const   = b.constant(module_.pool.put_value(logic1, { xbytes, 2 }), l);
+        const ir::Index z_const   = b.constant(z_constant_ref(1), l);
 
         const ir::Index data_v = gate_input_value(data, b, l);
         const ir::Index ctrl_v = gate_input_value(ctrl, b, l);
-        const ir::Index passed = tg.invert ? b.unary(ir::Inst::Tag::Bnot, data_v, l)
-                                           : b.binary(ir::Inst::Tag::Band, data_v, one, l);
+        const ir::Index passed =
+          tg.invert ? b.unary(ir::Inst::Tag::Bnot, data_v, l) : b.binary(ir::Inst::Tag::Band, data_v, one, l);
         // Definite (===) tests: control exactly at the active / inactive level.
         const ir::Index active_lvl   = tg.active_high ? one : zero;
         const ir::Index inactive_lvl = tg.active_high ? zero : one;
@@ -4802,9 +4901,12 @@ private:
     // `delay_expr` (`and #d (...)`, LRM 28.16) makes the store inertial — the same
     // epoch-cancelled deferred record a delayed continuous assign uses (caller has
     // already guarded a whole-scalar output).
-    void emit_gate_as_process(GateTerm output, ir::Index val,
-                              std::vector<ir::WaitEvent> wait_events, ir::Builder& b,
-                              ir::SourceLoc l, const Expression* delay_expr = nullptr) {
+    void emit_gate_as_process(GateTerm                   output,
+                              ir::Index                  val,
+                              std::vector<ir::WaitEvent> wait_events,
+                              ir::Builder&               b,
+                              ir::SourceLoc              l,
+                              const Expression*          delay_expr = nullptr) {
         const ir::Index lv = gate_bit_lvalue(output.sig, output.bit, b, l);
         if (delay_expr != nullptr) {
             b.store_inertial_delay(lv, val, scaled_delay(*delay_expr, b), l);
@@ -4819,9 +4921,13 @@ private:
     // constant sub-range with a Z background) so the net's resolver folds it
     // against the other drivers — exactly like a resolved continuous assign
     // (emit_resolved_driver). `left` is the output lvalue.
-    void emit_gate_resolved_driver(const Expression& left, ir::Signal net, ir::Index val,
-                                   std::vector<ir::WaitEvent> wait_events, ir::Builder& b,
-                                   ir::SourceLoc l, uint16_t strength = 0x0303) {
+    void emit_gate_resolved_driver(const Expression&          left,
+                                   ir::Signal                 net,
+                                   ir::Index                  val,
+                                   std::vector<ir::WaitEvent> wait_events,
+                                   ir::Builder&               b,
+                                   ir::SourceLoc              l,
+                                   uint16_t                   strength = 0x0303) {
         if (!left.type->isFourState()) {
             // Mirrors lower_gate_output: a gate can drive X, which a 2-state slot
             // cannot hold. TODO: gate outputs on 2-state nets need an X-coercion
@@ -4913,9 +5019,9 @@ private:
                         // TODO: aggregate driver of a multiply-driven net.
                         fail("aggregate driver of a multiply-driven net is not supported");
                     }
-                    const ir::Ref   ty        = lower_type(*a.left().type);
-                    const ir::Index child_val = coerce(
-                      b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l), *a.right().type, ty, b, l);
+                    const ir::Ref   ty = lower_type(*a.left().type);
+                    const ir::Index child_val =
+                      coerce(b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l), *a.right().type, ty, b, l);
                     const ir::Index  val  = build_driver_slot_value(*net, a.left(), child_val, b, l);
                     const ir::Signal slot = alloc_driver_slot(*net, l);
                     b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
@@ -4929,22 +5035,22 @@ private:
                     // store. Port types are equivalent (LRM 23.3.3), so both sides
                     // share the recursive storage layout (a plain unpacked array is
                     // trivially copyable, so emit_port_agg_copy memcpy's it).
-                    emit_port_agg_copy(lower_lvalue(a.left(), b), b.signal(child_sig, l),
-                                       lower_type(*a.left().type), b, l);
+                    emit_port_agg_copy(
+                      lower_lvalue(a.left(), b), b.signal(child_sig, l), lower_type(*a.left().type), b, l);
                 } else if (a.left().kind == ExpressionKind::Concatenation) {
                     // Output connected to a concatenation target `.o({a,b})`:
                     // sample the child net once and scatter it MSB-first into the
                     // operands, the same destructure as `{a,b} = x` (store_concat).
                     reject_concat_resolved_driver(a.left());
-                    const ir::Ref   ty  = lower_type(*a.left().type);
-                    const ir::Index val = coerce(
-                      b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l), *a.right().type, ty, b, l);
+                    const ir::Ref   ty = lower_type(*a.left().type);
+                    const ir::Index val =
+                      coerce(b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l), *a.right().type, ty, b, l);
                     store_concat(a.left().as<ConcatenationExpression>(), val, ir::Inst::Tag::Store, b, l);
                 } else {
                     const ir::Ref   ty  = lower_type(*a.left().type);
                     const ir::Index val = b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l);
-                    b.binary(ir::Inst::Tag::Store, lower_lvalue(a.left(), b),
-                             coerce(val, *a.right().type, ty, b, l), l);
+                    b.binary(
+                      ir::Inst::Tag::Store, lower_lvalue(a.left(), b), coerce(val, *a.right().type, ty, b, l), l);
                 }
                 sens.push_back(ir::WaitEvent{ .signal = child_sig, .edge = ir::Edge::Any });
             } else {
@@ -4973,8 +5079,10 @@ private:
                     }
                     emit_port_agg_copy(b.signal(child_sig, l), lower_lvalue(src, b), ty, b, l);
                 } else {
-                    b.binary(ir::Inst::Tag::Store, b.signal(child_sig, l),
-                             coerce(lower_expr(*expr, b), *expr->type, ty, b, l), l);
+                    b.binary(ir::Inst::Tag::Store,
+                             b.signal(child_sig, l),
+                             coerce(lower_expr(*expr, b), *expr->type, ty, b, l),
+                             l);
                 }
                 collect_expr_reads(*expr, sens);
             }
@@ -5037,9 +5145,9 @@ private:
         // minus its writes (9.2.2.2.1, legal because of the single-writer rule).
         // `always @*` carries an ImplicitEvent timing wrapping the body, inferred
         // under the subtly different 9.4.2.2 rules (see SensitivityMode).
-        const bool comb = sym.procedureKind == ProceduralBlockKind::AlwaysComb ||
-                          sym.procedureKind == ProceduralBlockKind::AlwaysLatch;
-        bool       infer = comb;
+        const bool comb =
+          sym.procedureKind == ProceduralBlockKind::AlwaysComb || sym.procedureKind == ProceduralBlockKind::AlwaysLatch;
+        bool infer = comb;
 
         // A top-level event control on an `always` is the process's sensitivity
         // list: collect its wait events here and lower the statement underneath.
@@ -5091,8 +5199,8 @@ private:
         // they settle from declaration-initialized values. An `always @*` or an
         // explicit `@(...)` list is a plain sensitivity list that runs only when a
         // listed signal changes, matching Verilog, so it is left non-self-starting.
-        const bool self_start = sym.procedureKind == ProceduralBlockKind::AlwaysComb ||
-                                sym.procedureKind == ProceduralBlockKind::AlwaysLatch;
+        const bool self_start =
+          sym.procedureKind == ProceduralBlockKind::AlwaysComb || sym.procedureKind == ProceduralBlockKind::AlwaysLatch;
         ir::Ir body_ir = b.finish();
         // A `final` block is zero-time (LRM 9.2.3): it must not suspend. slang
         // rejects a time-consuming statement in a `final` at elaboration, so this
@@ -5153,8 +5261,10 @@ private:
     // guard seen (last wins; the multi-event validity check is on n_events) and
     // counts source SignalEvents so the caller can reject an unrepresentable
     // guarded list.
-    void collect_wait_events_impl(const TimingControl& tc, std::vector<ir::WaitEvent>& out,
-                                  const Expression*& iff, uint32_t& n_events) {
+    void collect_wait_events_impl(const TimingControl&        tc,
+                                  std::vector<ir::WaitEvent>& out,
+                                  const Expression*&          iff,
+                                  uint32_t&                   n_events) {
         switch (tc.kind) {
             case TimingControlKind::SignalEvent: {
                 const SignalEventControl& ev = tc.as<SignalEventControl>();
@@ -5192,8 +5302,7 @@ private:
     // anywhere stays sensitive even if also written — LRM 9.4.2.2's example
     // makes `tmp1 = a & b; y = tmp1;` sensitive to tmp1, which another process
     // may legally write (@* permits multiple drivers).
-    void collect_inferred_sensitivity(const Statement& body, SensitivityMode mode,
-                                      std::vector<ir::WaitEvent>& out) {
+    void collect_inferred_sensitivity(const Statement& body, SensitivityMode mode, std::vector<ir::WaitEvent>& out) {
         SensitivityCollector c(sigmap_, mode);
         body.visit(c);
         for (const ir::Signal s : c.reads) {
@@ -5271,9 +5380,9 @@ private:
                      "inside a task) is not supported");
             }
         }
-        const ir::Ref      ty  = lower_type(*e.type);
-        const ir::Signal   tmp = declare_temp(ty, "event");
-        const ir::SourceLoc l  = loc(e);
+        const ir::Ref       ty  = lower_type(*e.type);
+        const ir::Signal    tmp = declare_temp(ty, "event");
+        const ir::SourceLoc l   = loc(e);
 
         ir::Builder b(module_.pool);
         b.binary(ir::Inst::Tag::Store, b.signal(tmp, l), b.resize(lower_expr(e, b), ty, l), l);
@@ -5305,8 +5414,7 @@ private:
     // Lower `if (guard) body` as an entire process body: the `iff` qualifier on a
     // top-level sensitivity list (LRM 9.4.2.3). The guard predicate is evaluated
     // in the body's own scope, so it sees the event-time values.
-    void emit_guarded_body(const Statement& body, const Expression& guard, ir::Builder& b,
-                           ir::SourceLoc l) {
+    void emit_guarded_body(const Statement& body, const Expression& guard, ir::Builder& b, ir::SourceLoc l) {
         const ir::Index c = lower_predicate(guard, b);
         b.open_region();
         lower_stmt(body, b);
@@ -5319,8 +5427,10 @@ private:
     // Lower an intra-body `@(ev iff C)` (LRM 9.4.2.3): re-wait until the edge
     // fires with the guard true at event time, `forever { @(ev); if (C) break; }`.
     // The guard is re-tested on every wake, so a fire with C false parks again.
-    void emit_guarded_wait(const std::vector<ir::WaitEdge>& edges, const Expression& guard,
-                           ir::Builder& b, ir::SourceLoc l) {
+    void emit_guarded_wait(const std::vector<ir::WaitEdge>& edges,
+                           const Expression&                guard,
+                           ir::Builder&                     b,
+                           ir::SourceLoc                    l) {
         b.open_region();
         const ir::Index      lpred = true_const(b, l);
         const ir::ExtraSlice lcond = b.close_region();
@@ -5371,15 +5481,13 @@ private:
                 const ir::Ref    ty      = lower_type(*rec.expr.type);
                 const ir::Signal bound   = declare_temp(ty, "repeat_bound");
                 const ir::Signal counter = declare_temp(ty, "repeat_count");
-                b.binary(ir::Inst::Tag::Store, b.signal(bound, l),
-                         b.resize(lower_expr(rec.expr, b), ty, l), l);
-                b.binary(ir::Inst::Tag::Store, b.signal(counter, l),
-                         b.constant(module_.pool.put_int(ty, 0), l), l);
+                b.binary(ir::Inst::Tag::Store, b.signal(bound, l), b.resize(lower_expr(rec.expr, b), ty, l), l);
+                b.binary(ir::Inst::Tag::Store, b.signal(counter, l), b.constant(module_.pool.put_int(ty, 0), l), l);
 
                 b.open_region();
-                const ir::Index cur  = b.unary(ir::Inst::Tag::Load, b.signal(counter, l), l);
-                const ir::Index lim  = b.unary(ir::Inst::Tag::Load, b.signal(bound, l), l);
-                const ir::Index pred = b.binary(ir::Inst::Tag::Lt, cur, lim, l);
+                const ir::Index      cur  = b.unary(ir::Inst::Tag::Load, b.signal(counter, l), l);
+                const ir::Index      lim  = b.unary(ir::Inst::Tag::Load, b.signal(bound, l), l);
+                const ir::Index      pred = b.binary(ir::Inst::Tag::Lt, cur, lim, l);
                 const ir::ExtraSlice cond = b.close_region();
 
                 b.open_region();
@@ -5387,10 +5495,9 @@ private:
                 const ir::ExtraSlice body = b.close_region();
 
                 b.open_region();
-                const ir::Index sc   = b.unary(ir::Inst::Tag::Load, b.signal(counter, l), l);
-                const ir::Index one  = b.constant(module_.pool.put_int(ty, 1), l);
-                b.binary(ir::Inst::Tag::Store, b.signal(counter, l),
-                         b.binary(ir::Inst::Tag::Add, sc, one, l), l);
+                const ir::Index sc  = b.unary(ir::Inst::Tag::Load, b.signal(counter, l), l);
+                const ir::Index one = b.constant(module_.pool.put_int(ty, 1), l);
+                b.binary(ir::Inst::Tag::Store, b.signal(counter, l), b.binary(ir::Inst::Tag::Add, sc, one, l), l);
                 const ir::ExtraSlice step = b.close_region();
 
                 b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
@@ -5686,18 +5793,24 @@ private:
     // for the Observed / Postponed region; its arguments are lowered here and so
     // sampled at the Active-region execution point (LRM 16.4.1). Action shapes
     // Phase 1 does not defer are rejected loudly.
-    void emit_deferred_action(const Statement* action, uint32_t defer_mode, bool is_fail,
-                              slang::SourceLocation site, ir::Builder& b) {
+    void emit_deferred_action(const Statement*      action,
+                              uint32_t              defer_mode,
+                              bool                  is_fail,
+                              slang::SourceLocation site,
+                              ir::Builder&          b) {
         // A bare `assert #0 (e)` carries an empty action for the pass branch; a
         // missing branch is null. Either way there is no explicit action.
-        const bool no_action =
-          action == nullptr || action->kind == slang::ast::StatementKind::Empty;
+        const bool no_action = action == nullptr || action->kind == slang::ast::StatementKind::Empty;
         if (no_action) {
             // Only the fail branch of assert/assume has a default report; a
             // missing pass action (or cover) emits nothing.
             if (is_fail) {
-                b.severity(static_cast<uint32_t>(ir::Severity::Error), banner_at(site),
-                           "assertion failed", {}, to_source_loc(site), defer_mode);
+                b.severity(static_cast<uint32_t>(ir::Severity::Error),
+                           banner_at(site),
+                           "assertion failed",
+                           {},
+                           to_source_loc(site),
+                           defer_mode);
             }
             return;
         }
@@ -5727,8 +5840,7 @@ private:
         std::string            fmt;
         std::vector<ir::Index> args;
         build_format(call->arguments(), fmt, args, b);
-        b.severity(static_cast<uint32_t>(sev), banner_at(call->sourceRange.start()), fmt, args,
-                   loc(*call), defer_mode);
+        b.severity(static_cast<uint32_t>(sev), banner_at(call->sourceRange.start()), fmt, args, loc(*call), defer_mode);
     }
 
     // Deferred immediate assertion (LRM 16.4): `assert/assume/cover #0` (observed,
@@ -5771,8 +5883,8 @@ private:
             lower_deferred_assertion(a, b);
             return;
         }
-        using AK              = slang::ast::AssertionKind;
-        const bool is_cover   = a.assertionKind == AK::CoverProperty;
+        using AK            = slang::ast::AssertionKind;
+        const bool is_cover = a.assertionKind == AK::CoverProperty;
         if (a.assertionKind != AK::Assert && a.assertionKind != AK::Assume && !is_cover) {
             // TODO: immediate restrict / expect (LRM 16.3) need a property engine;
             // concurrent cover (CoverSequence) needs SVA.
@@ -5794,7 +5906,10 @@ private:
                 lower_stmt(*a.ifFalse, b);
             } else {
                 b.severity(static_cast<uint32_t>(ir::Severity::Error),
-                           banner_at(a.sourceRange.start()), "assertion failed", {}, loc(a));
+                           banner_at(a.sourceRange.start()),
+                           "assertion failed",
+                           {},
+                           loc(a));
             }
         }
         const ir::ExtraSlice else_region = b.close_region();
@@ -5816,8 +5931,8 @@ private:
         // priority (or the plain None case, which sets no flag): the lazy chain
         // with a no-match report threaded to its terminal.
         const bool report_no_match = c.check == Check::Priority && !chain_has_final_else(c);
-        lower_if_chain(c, report_no_match, report_no_match ? banner_at(c.sourceRange.start()) : std::string{},
-                       loc(c), b);
+        lower_if_chain(
+          c, report_no_match, report_no_match ? banner_at(c.sourceRange.start()) : std::string{}, loc(c), b);
     }
 
     // One arm of a collected if / else-if chain: the condition and the statement
@@ -5840,9 +5955,9 @@ private:
         // at a null ifFalse (no final else) or a non-continuation statement (a
         // plain else body, a begin-end block, or a nested new-series if) — that
         // trailing statement becomes the final else.
-        std::vector<IfArm> arms;
-        const Statement*   final_else = nullptr;
-        const ConditionalStatement* cur = &c;
+        std::vector<IfArm>          arms;
+        const Statement*            final_else = nullptr;
+        const ConditionalStatement* cur        = &c;
         for (;;) {
             if (cur->conditions.size() != 1) {
                 fail("unsupported multi-condition if");
@@ -5863,9 +5978,9 @@ private:
         }
 
         // unique reports a no-match (no arm true, no final else); unique0 does not.
-        const bool no_match_report = c.check == Check::Unique && final_else == nullptr;
-        const std::string   banner = banner_at(c.sourceRange.start());
-        const ir::SourceLoc rloc   = loc(c);
+        const bool          no_match_report = c.check == Check::Unique && final_else == nullptr;
+        const std::string   banner          = banner_at(c.sourceRange.start());
+        const ir::SourceLoc rloc            = loc(c);
 
         std::vector<ir::Index> preds;
         preds.reserve(arms.size());
@@ -5881,14 +5996,18 @@ private:
     // predicate temps: arm k's body runs when preds[k] is the first true one. The
     // terminal (no arm true) runs the final else, else emits the no-match report
     // when requested (unique, no final else).
-    void dispatch_if_arms(const std::vector<IfArm>& arms, size_t k, const std::vector<ir::Index>& preds,
-                          const Statement* final_else, bool no_match_report, const std::string& banner,
-                          ir::SourceLoc rloc, ir::Builder& b) {
+    void dispatch_if_arms(const std::vector<IfArm>&     arms,
+                          size_t                        k,
+                          const std::vector<ir::Index>& preds,
+                          const Statement*              final_else,
+                          bool                          no_match_report,
+                          const std::string&            banner,
+                          ir::SourceLoc                 rloc,
+                          ir::Builder&                  b) {
         if (k == arms.size()) {
             if (final_else != nullptr) {
                 lower_stmt(*final_else, b);
-            }
-            else if (no_match_report) {
+            } else if (no_match_report) {
                 b.case_violation(banner, 0, rloc);
             }
             return;
@@ -5910,8 +6029,11 @@ private:
     // report at the chain's `rloc`. With the flag clear this is exactly the plain
     // nested-cond lowering (the nested ifFalse re-enters lower_conditional, which
     // handles its own check), so non-priority ifs are unaffected.
-    void lower_if_chain(const ConditionalStatement& c, bool report_no_match, const std::string& banner,
-                        ir::SourceLoc rloc, ir::Builder& b) {
+    void lower_if_chain(const ConditionalStatement& c,
+                        bool                        report_no_match,
+                        const std::string&          banner,
+                        ir::SourceLoc               rloc,
+                        ir::Builder&                b) {
         // `if (expr matches pattern)` (LRM 12.6.2), including `&&&` filters, which
         // slang models as additional conditions AND-ed together. The pattern's
         // bound variables are emitted into this region so the then-body sees them.
@@ -5924,16 +6046,13 @@ private:
         b.open_region();
         if (c.ifFalse != nullptr) {
             const auto* nested = c.ifFalse->as_if<ConditionalStatement>();
-            if (report_no_match && nested != nullptr &&
-                nested->check == slang::ast::UniquePriorityCheck::None) {
+            if (report_no_match && nested != nullptr && nested->check == slang::ast::UniquePriorityCheck::None) {
                 // Continue the same priority series, carrying the flag to its end.
                 lower_if_chain(*nested, report_no_match, banner, rloc, b);
-            }
-            else {
+            } else {
                 lower_stmt(*c.ifFalse, b);
             }
-        }
-        else if (report_no_match) {
+        } else if (report_no_match) {
             b.case_violation(banner, 0, rloc);
         }
         const ir::ExtraSlice else_region = b.close_region();
@@ -6023,8 +6142,7 @@ private:
         if (!preinit_) {
             return;
         }
-        module_.add_process(
-          ir::Process{ .activation = ir::Activation::PreInit, .ir = preinit_->finish() });
+        module_.add_process(ir::Process{ .activation = ir::Activation::PreInit, .ir = preinit_->finish() });
         preinit_.reset();
     }
 
@@ -6044,8 +6162,7 @@ private:
         }
 
         b.open_region();
-        const ir::Index pred =
-          f.stopExpr != nullptr ? lower_loop_cond(*f.stopExpr, b) : true_const(b, loc(f));
+        const ir::Index      pred = f.stopExpr != nullptr ? lower_loop_cond(*f.stopExpr, b) : true_const(b, loc(f));
         const ir::ExtraSlice cond = b.close_region();
 
         b.open_region();
@@ -6064,7 +6181,7 @@ private:
     // while-loop: a for-loop with no init and no step.
     void lower_while(const WhileLoopStatement& w, ir::Builder& b) {
         b.open_region();
-        const ir::Index     pred = lower_loop_cond(w.cond, b);
+        const ir::Index      pred = lower_loop_cond(w.cond, b);
         const ir::ExtraSlice cond = b.close_region();
 
         b.open_region();
@@ -6165,25 +6282,24 @@ private:
     // and an X/Z count yields zero iterations (the Lt predicate is non-definite-1,
     // which the backend's definite-1 loop rule treats as exit).
     void lower_repeat(const RepeatLoopStatement& r, ir::Builder& b) {
-        const ir::SourceLoc l   = loc(r);
+        const ir::SourceLoc l = loc(r);
         if (r.count.type->isFloating()) {
             // LRM 12.7.2: a real repeat count would round; not yet lowered.
             fail("repeat with a real count is not supported");
         }
-        const ir::Ref       ty  = lower_type(*r.count.type);
+        const ir::Ref ty = lower_type(*r.count.type);
 
         // Hidden bound holds the once-evaluated count; hidden counter starts at 0.
         // Both live in the enclosing region, like a for-loop's init.
         const ir::Signal bound   = declare_temp(ty, "repeat_bound");
         const ir::Signal counter = declare_temp(ty, "repeat_count");
         b.binary(ir::Inst::Tag::Store, b.signal(bound, l), b.resize(lower_expr(r.count, b), ty, l), l);
-        b.binary(ir::Inst::Tag::Store, b.signal(counter, l),
-                 b.constant(module_.pool.put_int(ty, 0), l), l);
+        b.binary(ir::Inst::Tag::Store, b.signal(counter, l), b.constant(module_.pool.put_int(ty, 0), l), l);
 
         b.open_region();
-        const ir::Index cur  = b.unary(ir::Inst::Tag::Load, b.signal(counter, l), l);
-        const ir::Index lim  = b.unary(ir::Inst::Tag::Load, b.signal(bound, l), l);
-        const ir::Index pred = b.binary(ir::Inst::Tag::Lt, cur, lim, l);
+        const ir::Index      cur  = b.unary(ir::Inst::Tag::Load, b.signal(counter, l), l);
+        const ir::Index      lim  = b.unary(ir::Inst::Tag::Load, b.signal(bound, l), l);
+        const ir::Index      pred = b.binary(ir::Inst::Tag::Lt, cur, lim, l);
         const ir::ExtraSlice cond = b.close_region();
 
         b.open_region();
@@ -6241,14 +6357,12 @@ private:
                 return;
             }
             if (is_dyn_array(f.arrayRef)) {
-                const ir::Index len =
-                  b.dyn_array_size(lower_lvalue(f.arrayRef, b), lower_type(*f.arrayRef.type), l);
+                const ir::Index len = b.dyn_array_size(lower_lvalue(f.arrayRef, b), lower_type(*f.arrayRef.type), l);
                 lower_foreach_runtime_dim(f, dim, ty, iter_lv, len, b, l);
                 return;
             }
             if (is_queue(f.arrayRef)) {
-                const ir::Index len =
-                  b.queue_size(lower_lvalue(f.arrayRef, b), lower_type(*f.arrayRef.type), l);
+                const ir::Index len = b.queue_size(lower_lvalue(f.arrayRef, b), lower_type(*f.arrayRef.type), l);
                 lower_foreach_runtime_dim(f, dim, ty, iter_lv, len, b, l);
                 return;
             }
@@ -6266,14 +6380,15 @@ private:
         // nothing to snapshot.
         const slang::ConstantRange r         = *d.range;
         const bool                 ascending = r.left <= r.right;
-        b.binary(ir::Inst::Tag::Store, iter_lv,
+        b.binary(ir::Inst::Tag::Store,
+                 iter_lv,
                  b.constant(module_.pool.put_int(ty, static_cast<uint64_t>(static_cast<uint32_t>(r.left))), l),
                  l);
 
         b.open_region();
         const ir::Index cur = b.unary(ir::Inst::Tag::Load, iter_lv, l);
-        const ir::Index lim = b.constant(
-          module_.pool.put_int(ty, static_cast<uint64_t>(static_cast<uint32_t>(r.right))), l);
+        const ir::Index lim =
+          b.constant(module_.pool.put_int(ty, static_cast<uint64_t>(static_cast<uint32_t>(r.right))), l);
         const ir::Index      pred = b.binary(ascending ? ir::Inst::Tag::Le : ir::Inst::Tag::Ge, cur, lim, l);
         const ir::ExtraSlice cond = b.close_region();
 
@@ -6284,8 +6399,7 @@ private:
         b.open_region();
         const ir::Index step_cur = b.unary(ir::Inst::Tag::Load, iter_lv, l);
         const ir::Index one      = b.constant(module_.pool.put_int(ty, 1), l);
-        const ir::Index next =
-          b.binary(ascending ? ir::Inst::Tag::Add : ir::Inst::Tag::Sub, step_cur, one, l);
+        const ir::Index next     = b.binary(ascending ? ir::Inst::Tag::Add : ir::Inst::Tag::Sub, step_cur, one, l);
         b.binary(ir::Inst::Tag::Store, iter_lv, next, l);
         const ir::ExtraSlice step = b.close_region();
 
@@ -6298,8 +6412,13 @@ private:
     // resizing the container mid-loop is undefined behavior per the LRM (same
     // clause), so one read is enough. 0-based, matching StrGetc / element
     // addressing.
-    void lower_foreach_runtime_dim(const ForeachLoopStatement& f, size_t dim, ir::Ref ty,
-                                   ir::Index iter_lv, ir::Index len, ir::Builder& b, ir::SourceLoc l) {
+    void lower_foreach_runtime_dim(const ForeachLoopStatement& f,
+                                   size_t                      dim,
+                                   ir::Ref                     ty,
+                                   ir::Index                   iter_lv,
+                                   ir::Index                   len,
+                                   ir::Builder&                b,
+                                   ir::SourceLoc               l) {
         const ir::Signal bound = declare_temp(ty, "foreach_bound");
         b.binary(ir::Inst::Tag::Store, b.signal(bound, l), b.resize(len, ty, l), l);
         b.binary(ir::Inst::Tag::Store, iter_lv, b.constant(module_.pool.put_int(ty, 0), l), l);
@@ -6327,15 +6446,19 @@ private:
     // keys in ascending order, binding the loop variable `iter_lv` to each key.
     // `first(iter_lv)` seeds the min key; `next(iter_lv)` advances to the
     // successor. Each returns 1 while a key remains, 0 at the end.
-    void lower_foreach_assoc_dim(const ForeachLoopStatement& f, size_t dim, ir::Ref /*ty*/,
-                                 ir::Index iter_lv, ir::Builder& b, ir::SourceLoc l) {
+    void lower_foreach_assoc_dim(const ForeachLoopStatement& f,
+                                 size_t                      dim,
+                                 ir::Ref /*ty*/,
+                                 ir::Index     iter_lv,
+                                 ir::Builder&  b,
+                                 ir::SourceLoc l) {
         const ir::Ref    bit1 = make_int_type(1, false, false);
         const ir::Ref    aty  = lower_type(*f.arrayRef.type);
         const ir::Signal ok   = declare_temp(bit1, "foreach_ok");
         using Step            = ir::Builder::AssocStep;
-        b.binary(ir::Inst::Tag::Store, b.signal(ok, l),
-                 b.resize(b.assoc_traverse(lower_lvalue(f.arrayRef, b), iter_lv, Step::First, aty, l),
-                          bit1, l),
+        b.binary(ir::Inst::Tag::Store,
+                 b.signal(ok, l),
+                 b.resize(b.assoc_traverse(lower_lvalue(f.arrayRef, b), iter_lv, Step::First, aty, l), bit1, l),
                  l);
 
         b.open_region();
@@ -6347,9 +6470,9 @@ private:
         const ir::ExtraSlice body = b.close_region();
 
         b.open_region();
-        b.binary(ir::Inst::Tag::Store, b.signal(ok, l),
-                 b.resize(b.assoc_traverse(lower_lvalue(f.arrayRef, b), iter_lv, Step::Next, aty, l),
-                          bit1, l),
+        b.binary(ir::Inst::Tag::Store,
+                 b.signal(ok, l),
+                 b.resize(b.assoc_traverse(lower_lvalue(f.arrayRef, b), iter_lv, Step::Next, aty, l), bit1, l),
                  l);
         const ir::ExtraSlice step = b.close_region();
 
@@ -6422,9 +6545,9 @@ private:
                 }
             }
         }
-        uint32_t width  = c.expr.type->getBitWidth();
-        bool     four   = c.expr.type->isFourState();
-        bool     signd  = c.expr.type->isSigned();
+        uint32_t width = c.expr.type->getBitWidth();
+        bool     four  = c.expr.type->isFourState();
+        bool     signd = c.expr.type->isSigned();
         for (const CaseStatement::ItemGroup& item : c.items) {
             for (const Expression* e : item.expressions) {
                 width = std::max(width, e->type->getBitWidth());
@@ -6515,11 +6638,10 @@ private:
     // case_item is matched when the inside operation returns 1'b1 for any of
     // its members). No dedup: 11.4.13 explicitly allows repeated/overlapping
     // members, so unlike case_dedup nothing is ever dropped here.
-    ir::Index lower_inside_item_pred(const CaseStatement::ItemGroup& item, ir::Index sel, ir::Ref ty,
-                                     ir::Builder& b) {
+    ir::Index lower_inside_item_pred(const CaseStatement::ItemGroup& item, ir::Index sel, ir::Ref ty, ir::Builder& b) {
         ir::Index pred = lower_inside_label_pred(*item.expressions[0], sel, ty, b);
         for (size_t j = 1; j < item.expressions.size(); j++) {
-            const Expression* e = item.expressions[j];
+            const Expression* e   = item.expressions[j];
             const ir::Index   one = lower_inside_label_pred(*e, sel, ty, b);
             pred                  = b.binary(ir::Inst::Tag::Lor, pred, one, loc(*e));
         }
@@ -6534,15 +6656,20 @@ private:
     // items, mirroring lower_case_item -- but first tries find_switch_run at
     // every step, so a run of plain clean-constant singular labels between
     // range items still jump-tables instead of chaining one at a time.
-    void lower_case_inside_item(const CaseStatement& c, size_t k, ir::Index sel, ir::Ref ty,
-                                uint32_t width, uint32_t key_width,
+    void lower_case_inside_item(const CaseStatement&                  c,
+                                size_t                                k,
+                                ir::Index                             sel,
+                                ir::Ref                               ty,
+                                uint32_t                              width,
+                                uint32_t                              key_width,
                                 const std::vector<std::vector<char>>& keep,
-                                const slang::ast::ASTContext& astCtx, bool report_viol, ir::Builder& b) {
+                                const slang::ast::ASTContext&         astCtx,
+                                bool                                  report_viol,
+                                ir::Builder&                          b) {
         if (k == c.items.size()) {
             if (c.defaultCase != nullptr) {
                 lower_stmt(*c.defaultCase, b);
-            }
-            else if (report_viol) {
+            } else if (report_viol) {
                 b.case_violation(case_banner(c), 0, loc(c));
             }
             return;
@@ -6550,14 +6677,12 @@ private:
 
         if (std::optional<SwitchRun> run = find_switch_run(c, k, width, key_width, &keep, astCtx)) {
             if (run->arms.empty()) {
-                lower_case_inside_item(c, k + run->len, sel, ty, width, key_width, keep, astCtx,
-                                       report_viol, b);
+                lower_case_inside_item(c, k + run->len, sel, ty, width, key_width, keep, astCtx, report_viol, b);
                 return;
             }
             const std::vector<ir::Builder::SwitchArmBuild> arms = lower_switch_arm_bodies(run->arms, b);
             b.open_region();
-            lower_case_inside_item(c, k + run->len, sel, ty, width, key_width, keep, astCtx,
-                                   report_viol, b);
+            lower_case_inside_item(c, k + run->len, sel, ty, width, key_width, keep, astCtx, report_viol, b);
             const ir::ExtraSlice default_region = b.close_region();
             b.switch_(sel, arms, default_region, loc(c.expr));
             return;
@@ -6579,9 +6704,14 @@ private:
     // Eager overlap-checked lowering for unique/unique0 `case ... inside`
     // (mirrors lower_case_unique): every item's predicate is computed once up
     // front and shared by emit_overlap_check and dispatch_preds.
-    void lower_case_inside_unique(const CaseStatement& c, ir::Index sel, ir::Ref ty, uint32_t width,
-                                  uint32_t key_width, const slang::ast::ASTContext& astCtx,
-                                  bool no_match_report, ir::Builder& b) {
+    void lower_case_inside_unique(const CaseStatement&          c,
+                                  ir::Index                     sel,
+                                  ir::Ref                       ty,
+                                  uint32_t                      width,
+                                  uint32_t                      key_width,
+                                  const slang::ast::ASTContext& astCtx,
+                                  bool                          no_match_report,
+                                  ir::Builder&                  b) {
         std::vector<ir::Index> preds;
         preds.reserve(c.items.size());
         for (const CaseStatement::ItemGroup& item : c.items) {
@@ -6602,11 +6732,11 @@ private:
           (c.check == Check::Priority || c.check == Check::Unique) && c.defaultCase == nullptr;
         const bool needs_overlap = c.check == Check::Unique || c.check == Check::Unique0;
 
-        const CaseCompareType   ct        = common_inside_type(c);
-        const ir::Ref           ty        = ct.ty;
-        const uint32_t          key_width = ct.four ? 2 * ct.width : ct.width;
-        const ir::Index         sel       = b.resize(lower_expr(c.expr, b), ty, loc(c.expr));
-        slang::ast::ASTContext  astCtx(*scope_, slang::ast::LookupLocation::max);
+        const CaseCompareType  ct        = common_inside_type(c);
+        const ir::Ref          ty        = ct.ty;
+        const uint32_t         key_width = ct.four ? 2 * ct.width : ct.width;
+        const ir::Index        sel       = b.resize(lower_expr(c.expr, b), ty, loc(c.expr));
+        slang::ast::ASTContext astCtx(*scope_, slang::ast::LookupLocation::max);
 
         if (needs_overlap) {
             lower_case_inside_unique(c, sel, ty, ct.width, key_width, astCtx, no_match_report, b);
@@ -6647,7 +6777,8 @@ private:
     // either).
     //
     // Returns keep[k][j] = whether item k's label j survives.
-    std::vector<std::vector<char>> case_dedup(const CaseStatement& c, uint32_t width,
+    std::vector<std::vector<char>> case_dedup(const CaseStatement&          c,
+                                              uint32_t                      width,
                                               const slang::ast::ASTContext& astCtx) {
         std::vector<std::vector<char>> keep(c.items.size());
         for (size_t k = 0; k < c.items.size(); k++) {
@@ -6684,8 +6815,7 @@ private:
                 }
                 if (dup) {
                     keep[k][j] = 0;
-                }
-                else {
+                } else {
                     seen_const.push_back(std::move(v));
                 }
             }
@@ -6758,23 +6888,24 @@ private:
     // in it deduped away, e.g. a run of items that all repeat an earlier
     // item's constant) -- callers must skip switch emission and recurse
     // directly at k + len in that case.
-    std::optional<SwitchRun> find_switch_run(const CaseStatement& c, size_t k, uint32_t width,
-                                             uint32_t key_width,
+    std::optional<SwitchRun> find_switch_run(const CaseStatement&                  c,
+                                             size_t                                k,
+                                             uint32_t                              width,
+                                             uint32_t                              key_width,
                                              const std::vector<std::vector<char>>* keep,
-                                             const slang::ast::ASTContext& astCtx) {
+                                             const slang::ast::ASTContext&         astCtx) {
         if (key_width == 0 || key_width > 64 ||
-            (c.condition != CaseStatementCondition::Normal &&
-             c.condition != CaseStatementCondition::Inside)) {
+            (c.condition != CaseStatementCondition::Normal && c.condition != CaseStatementCondition::Inside)) {
             return std::nullopt;
         }
 
         std::vector<SwitchArmPlan>             arms;
-        ankerl::unordered_dense::set<uint64_t> local_seen;  // only used when keep == nullptr.
+        ankerl::unordered_dense::set<uint64_t> local_seen; // only used when keep == nullptr.
         size_t                                 i = k;
         for (; i < c.items.size(); i++) {
             const CaseStatement::ItemGroup& item = c.items[i];
             std::vector<uint64_t>           keys;
-            bool                             eligible = true;
+            bool                            eligible = true;
             for (size_t j = 0; j < item.expressions.size(); j++) {
                 const Expression* e = item.expressions[j];
                 if (e->kind == ExpressionKind::ValueRange) {
@@ -6782,7 +6913,7 @@ private:
                     break;
                 }
                 if (keep != nullptr && !(*keep)[i][j]) {
-                    continue;  // already proven dead by the whole-statement case_dedup.
+                    continue; // already proven dead by the whole-statement case_dedup.
                 }
                 slang::ast::EvalContext    ev(astCtx);
                 const slang::ConstantValue cv = e->eval(ev);
@@ -6802,8 +6933,7 @@ private:
                 if (keep != nullptr) {
                     // case_dedup already guarantees this key is unique statement-wide.
                     keys.push_back(*u);
-                }
-                else if (local_seen.insert(*u).second) {
+                } else if (local_seen.insert(*u).second) {
                     keys.push_back(*u);
                 }
             }
@@ -6823,8 +6953,8 @@ private:
     // Lower a switch run's surviving arms to region-backed SwitchArmBuilds,
     // shared by every chain flavor (Normal/casex/casez, case-inside,
     // unique/unique0 dispatch) that consumes a find_switch_run result.
-    std::vector<ir::Builder::SwitchArmBuild> lower_switch_arm_bodies(
-      const std::vector<SwitchArmPlan>& plan, ir::Builder& b) {
+    std::vector<ir::Builder::SwitchArmBuild> lower_switch_arm_bodies(const std::vector<SwitchArmPlan>& plan,
+                                                                     ir::Builder&                      b) {
         std::vector<ir::Builder::SwitchArmBuild> arms;
         arms.reserve(plan.size());
         for (const SwitchArmPlan& ap : plan) {
@@ -6841,7 +6971,7 @@ private:
     // (highest-bit priority) over Ctz (lowest-bit).
     struct OneHotPlan {
         const Expression*                                  base;
-        std::vector<std::pair<uint64_t, const Statement*>> arms;  // (IR bit, body)
+        std::vector<std::pair<uint64_t, const Statement*>> arms; // (IR bit, body)
         bool                                               descending;
         uint32_t                                           base_width;
     };
@@ -6865,8 +6995,7 @@ private:
     // A cheap gather re-packing the selected bits into source order (bit k =
     // base[i_k]) before Ctz would restore it; deferred (O(N) ops/eval, rare).
     std::optional<OneHotPlan> build_onehot_plan(const CaseStatement& c) {
-        if (c.condition != CaseStatementCondition::Normal ||
-            c.check != slang::ast::UniquePriorityCheck::None) {
+        if (c.condition != CaseStatementCondition::Normal || c.check != slang::ast::UniquePriorityCheck::None) {
             return std::nullopt;
         }
         // Selector must be exactly the 1-bit constant 1.
@@ -6886,7 +7015,7 @@ private:
         std::vector<std::pair<uint64_t, const Statement*>> arms;
         for (const CaseStatement::ItemGroup& item : c.items) {
             if (item.expressions.size() != 1) {
-                return std::nullopt;  // grouped labels: fallback (see TODO(repack)).
+                return std::nullopt; // grouped labels: fallback (see TODO(repack)).
             }
             const Expression& e = *item.expressions[0];
             if (e.kind != ExpressionKind::ElementSelect) {
@@ -6904,9 +7033,8 @@ private:
                 if (base_width == 0 || !es.value().type->isIntegral()) {
                     return std::nullopt;
                 }
-            }
-            else if (&sym != base_sym) {
-                return std::nullopt;  // arms must share one base signal.
+            } else if (&sym != base_sym) {
+                return std::nullopt; // arms must share one base signal.
             }
             if (!e.type->isIntegral() || e.type->getBitWidth() != 1) {
                 return std::nullopt;
@@ -6932,7 +7060,7 @@ private:
             descending = descending && arms[k].first < arms[k - 1].first;
         }
         if (!ascending && !descending) {
-            return std::nullopt;  // see TODO(unique) / TODO(repack).
+            return std::nullopt; // see TODO(unique) / TODO(repack).
         }
         return OneHotPlan{ base_expr, std::move(arms), !ascending, base_width };
     }
@@ -6948,12 +7076,10 @@ private:
             for (const std::pair<uint64_t, const Statement*>& arm : plan.arms) {
                 mask |= one.shl(static_cast<uint32_t>(arm.first));
             }
-            const ir::Index mcst =
-              b.constant(svint_to_ref(mask, lower_type(*plan.base->type)), loc(*plan.base));
-            selector = b.binary(ir::Inst::Tag::Band, base_val, mcst, loc(*plan.base));
+            const ir::Index mcst = b.constant(svint_to_ref(mask, lower_type(*plan.base->type)), loc(*plan.base));
+            selector             = b.binary(ir::Inst::Tag::Band, base_val, mcst, loc(*plan.base));
         }
-        const ir::Index key =
-          b.unary(plan.descending ? ir::Inst::Tag::Clz : ir::Inst::Tag::Ctz, selector, loc(c.expr));
+        const ir::Index key = b.unary(plan.descending ? ir::Inst::Tag::Clz : ir::Inst::Tag::Ctz, selector, loc(c.expr));
 
         std::vector<std::vector<uint64_t>>       keystore;
         std::vector<ir::Builder::SwitchArmBuild> arms;
@@ -6984,8 +7110,7 @@ private:
             // `c.expr`'s own (possibly Conversion-wrapped) ExpressionKind directly,
             // so a plain `case (type(x))` selector -- wrapped here just like any
             // other case selector -- would silently fail its TypeReference check.
-            const slang::ast::Type& sel_ty =
-                unwrap_conversion(c.expr).as<TypeReferenceExpression>().targetType;
+            const slang::ast::Type& sel_ty = unwrap_conversion(c.expr).as<TypeReferenceExpression>().targetType;
             for (const auto& group : c.items) {
                 for (const Expression* item : group.expressions) {
                     const Expression& ue = unwrap_conversion(*item);
@@ -7024,7 +7149,7 @@ private:
                 cmp = ir::Inst::Tag::CasexEq;
                 break;
             default:
-                fail("unsupported case condition");  // unreachable: Inside handled above.
+                fail("unsupported case condition"); // unreachable: Inside handled above.
         }
         // unique / unique0 / priority (c.check) add the LRM 12.5.3 violation
         // checks; first-match execution is conforming for all of them.
@@ -7080,9 +7205,15 @@ private:
     // (kind 1). The check is marked unlikely so the report stays off the hot
     // path. First-match dispatch and the no-match report (unique only) reuse the
     // temps and match the plain-case semantics exactly.
-    void lower_case_unique(const CaseStatement& c, ir::Index sel, ir::Inst::Tag cmp, ir::Ref ty,
-                           uint32_t width, uint32_t key_width, const slang::ast::ASTContext& astCtx,
-                           bool no_match_report, ir::Builder& b) {
+    void lower_case_unique(const CaseStatement&          c,
+                           ir::Index                     sel,
+                           ir::Inst::Tag                 cmp,
+                           ir::Ref                       ty,
+                           uint32_t                      width,
+                           uint32_t                      key_width,
+                           const slang::ast::ASTContext& astCtx,
+                           bool                          no_match_report,
+                           ir::Builder&                  b) {
         const size_t           n = c.items.size();
         std::vector<ir::Index> preds;
         preds.reserve(n);
@@ -7110,8 +7241,10 @@ private:
     // violation when more than one matched. The predicates are definite 2-state
     // (=== / a reduced if-condition never yields x), so the zero-extended 32-bit
     // sum is exact for any realistic arm count. Shared by the case and if paths.
-    void emit_overlap_check(const std::vector<ir::Index>& preds, const std::string& banner,
-                            ir::SourceLoc rloc, ir::Builder& b) {
+    void emit_overlap_check(const std::vector<ir::Index>& preds,
+                            const std::string&            banner,
+                            ir::SourceLoc                 rloc,
+                            ir::Builder&                  b) {
         const ir::Ref sumty = make_int_type(32, false, false);
         ir::Index     sum   = b.resize(preds[0], sumty, rloc);
         for (size_t k = 1; k < preds.size(); k++) {
@@ -7142,21 +7275,25 @@ private:
     // dropped duplicate there would be a swallowed overlap violation) -- the
     // overlap itself is still reported by the separate, already-computed
     // `preds` sum regardless of which items a run's switch absorbs.
-    void dispatch_preds(const CaseStatement& c, size_t k, ir::Index sel, uint32_t width,
-                        uint32_t key_width, const slang::ast::ASTContext& astCtx,
-                        const std::vector<ir::Index>& preds, bool no_match_report, ir::Builder& b) {
+    void dispatch_preds(const CaseStatement&          c,
+                        size_t                        k,
+                        ir::Index                     sel,
+                        uint32_t                      width,
+                        uint32_t                      key_width,
+                        const slang::ast::ASTContext& astCtx,
+                        const std::vector<ir::Index>& preds,
+                        bool                          no_match_report,
+                        ir::Builder&                  b) {
         if (k == c.items.size()) {
             if (c.defaultCase != nullptr) {
                 lower_stmt(*c.defaultCase, b);
-            }
-            else if (no_match_report) {
+            } else if (no_match_report) {
                 b.case_violation(case_banner(c), 0, loc(c));
             }
             return;
         }
 
-        if (std::optional<SwitchRun> run =
-              find_switch_run(c, k, width, key_width, /*keep=*/nullptr, astCtx)) {
+        if (std::optional<SwitchRun> run = find_switch_run(c, k, width, key_width, /*keep=*/nullptr, astCtx)) {
             if (run->arms.empty()) {
                 dispatch_preds(c, k + run->len, sel, width, key_width, astCtx, preds, no_match_report, b);
                 return;
@@ -7197,15 +7334,21 @@ private:
     // sub-range), with a non-constant/x-z-bearing item (or, for casex/casez,
     // any item at all -- see find_switch_run) falling through to the predicate
     // test below and recursing at k+1 as before.
-    void lower_case_item(const CaseStatement& c, size_t k, ir::Index sel, ir::Inst::Tag cmp, ir::Ref ty,
-                         uint32_t width, uint32_t key_width,
+    void lower_case_item(const CaseStatement&                  c,
+                         size_t                                k,
+                         ir::Index                             sel,
+                         ir::Inst::Tag                         cmp,
+                         ir::Ref                               ty,
+                         uint32_t                              width,
+                         uint32_t                              key_width,
                          const std::vector<std::vector<char>>& keep,
-                         const slang::ast::ASTContext& astCtx, bool report_viol, ir::Builder& b) {
+                         const slang::ast::ASTContext&         astCtx,
+                         bool                                  report_viol,
+                         ir::Builder&                          b) {
         if (k == c.items.size()) {
             if (c.defaultCase != nullptr) {
                 lower_stmt(*c.defaultCase, b);
-            }
-            else if (report_viol) {
+            } else if (report_viol) {
                 b.case_violation(case_banner(c), 0, loc(c));
             }
             return;
@@ -7213,8 +7356,7 @@ private:
 
         if (std::optional<SwitchRun> run = find_switch_run(c, k, width, key_width, &keep, astCtx)) {
             if (run->arms.empty()) {
-                lower_case_item(c, k + run->len, sel, cmp, ty, width, key_width, keep, astCtx,
-                                report_viol, b);
+                lower_case_item(c, k + run->len, sel, cmp, ty, width, key_width, keep, astCtx, report_viol, b);
                 return;
             }
             const std::vector<ir::Builder::SwitchArmBuild> arms = lower_switch_arm_bodies(run->arms, b);
@@ -7283,8 +7425,7 @@ private:
             // No-arg $system(): exec system(NULL). The command operand is an
             // unused empty-byte constant (has_arg = 0 tells the runtime to pass
             // NULL).
-            const ir::Index empty =
-              b.constant(module_.pool.put_int(make_int_type(8, false, false), 0), l);
+            const ir::Index empty = b.constant(module_.pool.put_int(make_int_type(8, false, false), 0), l);
             return b.system(empty, /*has_arg=*/0, l);
         }
         const Expression& cmd = *args[0];
@@ -7310,29 +7451,25 @@ private:
         const std::string_view name = call.getSubroutineName();
         // A string method used as a statement (s.putc(i, c); the others are
         // legal-but-pointless): lower for its effect, discard the value.
-        if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
-            is_string_expr(*call.arguments()[0])) {
+        if (!name.empty() && name[0] != '$' && !call.arguments().empty() && is_string_expr(*call.arguments()[0])) {
             lower_string_method(name, call, b);
             return;
         }
         // A dynamic-array method as a statement (arr.delete(); arr.size() is
         // legal-but-pointless): lower for effect, discard the value.
-        if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
-            is_dyn_array(*call.arguments()[0])) {
+        if (!name.empty() && name[0] != '$' && !call.arguments().empty() && is_dyn_array(*call.arguments()[0])) {
             lower_dyn_array_method(name, call, b, loc(call));
             return;
         }
         // A queue method as a statement (push/pop/insert/delete): lower for
         // effect, discard any returned element.
-        if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
-            is_queue(*call.arguments()[0])) {
+        if (!name.empty() && name[0] != '$' && !call.arguments().empty() && is_queue(*call.arguments()[0])) {
             lower_queue_method(name, call, b, loc(call));
             return;
         }
         // An associative-array method as a statement (delete; first/next/... are
         // legal-but-pointless without their return): lower for effect.
-        if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
-            is_assoc(*call.arguments()[0])) {
+        if (!name.empty() && name[0] != '$' && !call.arguments().empty() && is_assoc(*call.arguments()[0])) {
             lower_assoc_method(name, call, b, loc(call));
             return;
         }
@@ -7387,10 +7524,9 @@ private:
             b.fclose(lower_expr(*call.arguments()[0], b), loc(call));
             return;
         }
-        if (name == "$fgets" || name == "$fgetc" || name == "$ungetc" || name == "$feof" ||
-            name == "$ftell" || name == "$fseek" || name == "$rewind" || name == "$ferror" ||
-            name == "$fscanf" || name == "$sscanf" || name == "$fread" ||
-            name == "$test$plusargs" || name == "$value$plusargs") {
+        if (name == "$fgets" || name == "$fgetc" || name == "$ungetc" || name == "$feof" || name == "$ftell" ||
+            name == "$fseek" || name == "$rewind" || name == "$ferror" || name == "$fscanf" || name == "$sscanf" ||
+            name == "$fread" || name == "$test$plusargs" || name == "$value$plusargs") {
             // File read / positioning / error / scan functions, and plusargs,
             // used in statement position: lower for the side effect (file
             // position, write-back) and drop the result.
@@ -7507,7 +7643,7 @@ private:
                 fail("$dumpvars with a nonzero level is not supported (whole-design dump only)");
             }
             if (args.size() > 1) {
-                const auto tops = scope_->getCompilation().getRoot().topInstances;
+                const auto                             tops = scope_->getCompilation().getRoot().topInstances;
                 std::vector<const slang::ast::Symbol*> listed;
                 for (size_t k = 1; k < args.size(); ++k) {
                     const auto* as = args[k]->as_if<slang::ast::ArbitrarySymbolExpression>();
@@ -7569,10 +7705,10 @@ private:
             // TODO: a sliced memory target (mem[a:b]) or a multidimensional slice.
             fail("$readmem target must be a whole unpacked-array memory");
         }
-        const ir::Signal target   = signal_of(vsb->symbol);
-        const ir::Index  filename = lower_expr(*args[0], b);
-        ir::Index        start    = filename; // placeholder; unused unless has_start
-        ir::Index        finish   = filename;
+        const ir::Signal target     = signal_of(vsb->symbol);
+        const ir::Index  filename   = lower_expr(*args[0], b);
+        ir::Index        start      = filename; // placeholder; unused unless has_start
+        ir::Index        finish     = filename;
         const bool       has_start  = args.size() >= 3;
         const bool       has_finish = args.size() >= 4;
         if (has_start) {
@@ -7655,12 +7791,12 @@ private:
         // multiply. time_mul_ == unit/precision * prec_over_tick_, so recover the
         // unit/precision factor by division.
         if (amount.type->isFloating()) {
-            const ir::Index rv            = lower_expr(amount, b);
+            const ir::Index rv             = lower_expr(amount, b);
             const uint64_t  unit_over_prec = prec_over_tick_ != 0 ? time_mul_ / prec_over_tick_ : 1;
-            ir::Index       scaled        = rv;
+            ir::Index       scaled         = rv;
             if (unit_over_prec > 1) {
-                const ir::Index m = b.constant(
-                  module_.pool.put_real(module_.pool.real_type, static_cast<double>(unit_over_prec)), l);
+                const ir::Index m =
+                  b.constant(module_.pool.put_real(module_.pool.real_type, static_cast<double>(unit_over_prec)), l);
                 scaled = b.binary(ir::Inst::Tag::FMul, rv, m, l);
             }
             ir::Index ticks = b.float_cvt(ir::Inst::Tag::FtoI, scaled, u64, l);
@@ -7767,7 +7903,7 @@ private:
                  std::to_string(out_args.size()) + " output argument(s)");
         }
         // The source lowers as a value (FD) or a packed string ($sscanf).
-        const ir::Index source = is_sscanf ? lower_string_arg(*args[0], b) : lower_expr(*args[0], b);
+        const ir::Index        source = is_sscanf ? lower_string_arg(*args[0], b) : lower_expr(*args[0], b);
         std::vector<ir::Index> outs;
         outs.reserve(out_args.size());
         for (const Expression* a : out_args) {
@@ -7794,8 +7930,11 @@ private:
     }
 
     // Lower an enum method (LRM 6.19.2-6.19.5). The receiver is arguments()[0].
-    ir::Index lower_enum_method(std::string_view name, const slang::ast::EnumType& et,
-                                const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
+    ir::Index lower_enum_method(std::string_view            name,
+                                const slang::ast::EnumType& et,
+                                const CallExpression&       call,
+                                ir::Builder&                b,
+                                ir::SourceLoc               l) {
         const std::vector<EnumMember> members = enum_members(et);
         const ir::Ref                 base_ty = lower_type(et);
 
@@ -7817,18 +7956,18 @@ private:
         if (name == "name") {
             // Each member value becomes its must-plane bytes ((width+7)/8), so a
             // base wider than 64 bits round-trips; the runtime byte-compares.
-            const uint32_t width  = et.bitWidth;
-            const uint32_t vbytes = (width + 7) / 8;
-            const uint32_t words  = (width + 63) / 64;
+            const uint32_t                        width  = et.bitWidth;
+            const uint32_t                        vbytes = (width + 7) / 8;
+            const uint32_t                        words  = (width + 63) / 64;
             std::vector<std::vector<uint8_t>>     valbufs;
             std::vector<ir::Builder::EnumNameRow> rows;
             valbufs.reserve(members.size());
             rows.reserve(members.size());
             for (const EnumMember& m : members) {
-                const slang::SVInt& v      = m.value;
-                const uint64_t*     raw    = v.getRawPtr();
-                const bool          unk    = v.hasUnknown();
-                const uint32_t      vwords = (static_cast<uint32_t>(v.getBitWidth()) + 63) / 64;
+                const slang::SVInt&   v      = m.value;
+                const uint64_t*       raw    = v.getRawPtr();
+                const bool            unk    = v.hasUnknown();
+                const uint32_t        vwords = (static_cast<uint32_t>(v.getBitWidth()) + 63) / 64;
                 std::vector<uint64_t> vplane(std::max(words, vwords), 0);
                 for (uint32_t i = 0; i < vwords; ++i) {
                     // VPI aval (must plane): value bits, with unknown bits cleared.
@@ -7868,18 +8007,14 @@ private:
             const ir::Index recv = lower_expr(*call.arguments()[0], b);
             // Default (no member matched): X of the base type (2-state base cannot
             // hold X, so it degrades to 0 via svint_to_ref's must plane).
-            ir::Index res = b.constant(
-              svint_to_ref(et.isFourState ? slang::SVInt::createFillX(et.bitWidth, et.isSigned)
-                                          : slang::SVInt(et.bitWidth, 0, et.isSigned),
-                           base_ty),
-              l);
+            ir::Index res = b.constant(svint_to_ref(et.isFourState ? slang::SVInt::createFillX(et.bitWidth, et.isSigned)
+                                                                   : slang::SVInt(et.bitWidth, 0, et.isSigned),
+                                                    base_ty),
+                                       l);
             for (size_t i = members.size(); i-- > 0;) {
-                const ir::Index memberc =
-                  b.constant(svint_to_ref(members[i].value, base_ty), l);
+                const ir::Index memberc = b.constant(svint_to_ref(members[i].value, base_ty), l);
                 const ir::Index targetc = b.constant(
-                  svint_to_ref(members[static_cast<size_t>(wrap(static_cast<int64_t>(i) + delta))].value,
-                               base_ty),
-                  l);
+                  svint_to_ref(members[static_cast<size_t>(wrap(static_cast<int64_t>(i) + delta))].value, base_ty), l);
                 const ir::Index eq = b.binary(ir::Inst::Tag::CaseEq, recv, memberc, l);
                 res                = b.select(eq, targetc, res, l);
             }
@@ -7905,13 +8040,13 @@ private:
 
         if (const auto* st = t.as_if<slang::ast::ScalarType>()) {
             // Predefined 1-bit types; default unsigned.
-            const char* base = st->scalarKind == slang::ast::ScalarType::Bit    ? "bit"
+            const char* base = st->scalarKind == slang::ast::ScalarType::Bit   ? "bit"
                                : st->scalarKind == slang::ast::ScalarType::Reg ? "reg"
-                                                                                : "logic";
+                                                                               : "logic";
             return base + signing(*st, false);
         }
         if (const auto* it = t.as_if<slang::ast::PredefinedIntegerType>()) {
-            using K = slang::ast::PredefinedIntegerType::Kind;
+            using K          = slang::ast::PredefinedIntegerType::Kind;
             const char* base = it->integerKind == K::Int        ? "int"
                                : it->integerKind == K::Byte     ? "byte"
                                : it->integerKind == K::ShortInt ? "shortint"
@@ -7934,9 +8069,9 @@ private:
                 // A packed array of enum / struct — unsupported base.
                 fail("$typename of this packed type is not supported");
             }
-            const char* name = base->scalarKind == slang::ast::ScalarType::Bit    ? "bit"
+            const char* name = base->scalarKind == slang::ast::ScalarType::Bit   ? "bit"
                                : base->scalarKind == slang::ast::ScalarType::Reg ? "reg"
-                                                                                  : "logic";
+                                                                                 : "logic";
             return name + signing(*pa, false) + dims;
         }
         if (const auto* ua = t.as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
@@ -7946,7 +8081,7 @@ private:
         }
         if (t.isFloating()) {
             const auto& ft = t.as<slang::ast::FloatingType>();
-            return ft.floatKind == slang::ast::FloatingType::ShortReal ? "shortreal"
+            return ft.floatKind == slang::ast::FloatingType::ShortReal  ? "shortreal"
                    : ft.floatKind == slang::ast::FloatingType::RealTime ? "realtime"
                                                                         : "real";
         }
@@ -7982,8 +8117,10 @@ private:
     // Runtime lowering for the utility bit-query functions (LRM 20.9; $bits on a
     // dynamic string per 20.6.2) when the operand is not constant. A constant
     // operand folds in slang and never reaches here.
-    ir::Index lower_bit_query(std::string_view name, const CallExpression& call, ir::Builder& b,
-                              const ir::SourceLoc l) {
+    ir::Index lower_bit_query(std::string_view      name,
+                              const CallExpression& call,
+                              ir::Builder&          b,
+                              const ir::SourceLoc   l) {
         const auto    args = call.arguments();
         const ir::Ref i32  = make_int_type(32, false, true);
 
@@ -8037,29 +8174,25 @@ private:
 
         // String built-in methods (s.len(), s.substr(i,j), ...) arrive as system
         // calls whose receiver is arguments()[0]; their names carry no '$'.
-        if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
-            is_string_expr(*call.arguments()[0])) {
+        if (!name.empty() && name[0] != '$' && !call.arguments().empty() && is_string_expr(*call.arguments()[0])) {
             return lower_string_method(name, call, b);
         }
 
         // Dynamic-array built-in methods (arr.size(), LRM 7.5) arrive the same
         // way, with the array as arguments()[0].
-        if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
-            is_dyn_array(*call.arguments()[0])) {
+        if (!name.empty() && name[0] != '$' && !call.arguments().empty() && is_dyn_array(*call.arguments()[0])) {
             return lower_dyn_array_method(name, call, b, l);
         }
 
         // Queue built-in methods (q.size(), q.pop_front(), LRM 7.10.2) arrive the
         // same way, with the queue as arguments()[0].
-        if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
-            is_queue(*call.arguments()[0])) {
+        if (!name.empty() && name[0] != '$' && !call.arguments().empty() && is_queue(*call.arguments()[0])) {
             return lower_queue_method(name, call, b, l);
         }
 
         // Associative-array built-in methods (a.num(), a.exists(k), a.first(k),
         // LRM 7.9) arrive the same way, with the assoc as arguments()[0].
-        if (!name.empty() && name[0] != '$' && !call.arguments().empty() &&
-            is_assoc(*call.arguments()[0])) {
+        if (!name.empty() && name[0] != '$' && !call.arguments().empty() && is_assoc(*call.arguments()[0])) {
             return lower_assoc_method(name, call, b, l);
         }
 
@@ -8077,8 +8210,7 @@ private:
             return b.event_triggered(event_signal(*ev), l);
         }
 
-        if (fn_ctx_ != nullptr && !fn_ctx_->is_task &&
-            (name == "$time" || name == "$stime" || name == "$realtime")) {
+        if (fn_ctx_ != nullptr && !fn_ctx_->is_task && (name == "$time" || name == "$stime" || name == "$realtime")) {
             // A function is a plain callable with no wheel pointer in its ABI, so
             // it cannot read the simulation clock. Reject rather than emit a
             // SimTime that would dereference a stale wheel. A task is a coroutine
@@ -8104,8 +8236,7 @@ private:
         // placeholder shape slang uses for output ports. $random's seed is a
         // plain value arg. Reach the underlying seed lvalue in both cases.
         const auto seed_lvalue_expr = [](const Expression& a) -> const Expression& {
-            const Expression& inner =
-              a.kind == ExpressionKind::Assignment ? a.as<AssignmentExpression>().left() : a;
+            const Expression& inner = a.kind == ExpressionKind::Assignment ? a.as<AssignmentExpression>().left() : a;
             return unwrap_conversion(inner);
         };
 
@@ -8116,8 +8247,8 @@ private:
             const ir::Ref   i32s    = make_int_type(32, false, true);
             const ir::Index sh32    = b.constant(module_.pool.put_int(make_int_type(64, false, false), 32u), l);
             const ir::Index seed_lv = lower_lvalue(seed_lvalue_expr(seed_arg), b);
-            b.binary(ir::Inst::Tag::Store, seed_lv,
-                     b.resize(b.binary(ir::Inst::Tag::Srl, packed, sh32, l), i32s, l), l);
+            b.binary(
+              ir::Inst::Tag::Store, seed_lv, b.resize(b.binary(ir::Inst::Tag::Srl, packed, sh32, l), i32s, l), l);
             return b.resize(packed, i32s, l);
         };
 
@@ -8130,10 +8261,10 @@ private:
             if (call.arguments().empty()) {
                 return b.random(l);
             }
-            const Expression& seed_arg = *call.arguments()[0];
-            const ir::Ref     i32s     = make_int_type(32, false, true);
-            const ir::Index   lo = b.constant(module_.pool.put_int(i32s, 0x80000000ull), l);
-            const ir::Index   hi = b.constant(module_.pool.put_int(i32s, 0x7fffffffull), l);
+            const Expression&              seed_arg = *call.arguments()[0];
+            const ir::Ref                  i32s     = make_int_type(32, false, true);
+            const ir::Index                lo       = b.constant(module_.pool.put_int(i32s, 0x80000000ull), l);
+            const ir::Index                hi       = b.constant(module_.pool.put_int(i32s, 0x7fffffffull), l);
             const std::array<ir::Index, 3> args{ lower_expr(seed_lvalue_expr(seed_arg), b), lo, hi };
             return seed_writeback(seed_arg, b.dist_call(ir::DistOp::Uniform, args, l));
         }
@@ -8148,12 +8279,9 @@ private:
             size_t      nparam;
         };
         static constexpr DistSpec kDists[] = {
-            { "$dist_uniform", ir::DistOp::Uniform, 2 },
-            { "$dist_normal", ir::DistOp::Normal, 2 },
-            { "$dist_exponential", ir::DistOp::Exponential, 1 },
-            { "$dist_poisson", ir::DistOp::Poisson, 1 },
-            { "$dist_chi_square", ir::DistOp::ChiSquare, 1 },
-            { "$dist_t", ir::DistOp::StudentT, 1 },
+            { "$dist_uniform", ir::DistOp::Uniform, 2 },         { "$dist_normal", ir::DistOp::Normal, 2 },
+            { "$dist_exponential", ir::DistOp::Exponential, 1 }, { "$dist_poisson", ir::DistOp::Poisson, 1 },
+            { "$dist_chi_square", ir::DistOp::ChiSquare, 1 },    { "$dist_t", ir::DistOp::StudentT, 1 },
             { "$dist_erlang", ir::DistOp::Erlang, 2 },
         };
         for (const DistSpec& d : kDists) {
@@ -8162,8 +8290,7 @@ private:
             }
             const auto argv = call.arguments();
             if (argv.size() != d.nparam + 1) {
-                fail(std::string(d.nm) + " requires a seed and " + std::to_string(d.nparam) +
-                     " parameter(s)");
+                fail(std::string(d.nm) + " requires a seed and " + std::to_string(d.nparam) + " parameter(s)");
             }
             std::vector<ir::Index> args;
             args.reserve(argv.size());
@@ -8200,9 +8327,9 @@ private:
                 fail("$urandom_range requires one or two arguments (maxval [, minval])");
             }
             const ir::Index maxv = lower_expr(*argv[0], b);
-            const ir::Index minv =
-              argv.size() == 2 ? lower_expr(*argv[1], b)
-                               : b.constant(module_.pool.put_int(make_int_type(32, false, false), 0), l);
+            const ir::Index minv = argv.size() == 2
+                                     ? lower_expr(*argv[1], b)
+                                     : b.constant(module_.pool.put_int(make_int_type(32, false, false), 0), l);
             return b.urandom_range(maxv, minv, l);
         }
 
@@ -8268,12 +8395,12 @@ private:
             }
             const Expression& arr = *call.arguments()[0];
             if (is_dyn_array(arr)) {
-                return b.resize(b.dyn_array_size(lower_lvalue(arr, b), lower_type(*arr.type), l),
-                                lower_type(*call.type), l);
+                return b.resize(
+                  b.dyn_array_size(lower_lvalue(arr, b), lower_type(*arr.type), l), lower_type(*call.type), l);
             }
             if (is_queue(arr)) {
-                return b.resize(b.queue_size(lower_lvalue(arr, b), lower_type(*arr.type), l),
-                                lower_type(*call.type), l);
+                return b.resize(
+                  b.queue_size(lower_lvalue(arr, b), lower_type(*arr.type), l), lower_type(*call.type), l);
             }
             // TODO: $size(coll, dim) on a multidimensional dynamic collection.
             fail("$size of this operand is not supported");
@@ -8288,8 +8415,8 @@ private:
         // result is only possible for a dynamically-sized operand, which Clotho
         // does not lower for these queries yet ($size has its own runtime path
         // above).
-        if (name == "$dimensions" || name == "$unpacked_dimensions" || name == "$left" ||
-            name == "$right" || name == "$low" || name == "$high" || name == "$increment") {
+        if (name == "$dimensions" || name == "$unpacked_dimensions" || name == "$left" || name == "$right" ||
+            name == "$low" || name == "$high" || name == "$increment") {
             slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
             slang::ast::EvalContext    ectx(actx);
             const slang::ConstantValue cv = call.eval(ectx);
@@ -8324,9 +8451,9 @@ private:
             if (call.arguments().size() != 2) {
                 fail("$cast expects exactly two arguments");
             }
-            const Expression&           dest_expr = *call.arguments()[0];
-            const Expression&           src_expr  = *call.arguments()[1];
-            const slang::ast::Type&     dt        = dest_expr.type->getCanonicalType();
+            const Expression&       dest_expr = *call.arguments()[0];
+            const Expression&       src_expr  = *call.arguments()[1];
+            const slang::ast::Type& dt        = dest_expr.type->getCanonicalType();
             if (dt.isClass() || dt.isCHandle()) {
                 // TODO: $cast of a class handle (dynamic down-cast) — needs a runtime
                 // per-object type identity (Tier 2).
@@ -8339,8 +8466,8 @@ private:
             if (const auto* et = dt.as_if<slang::ast::EnumType>()) {
                 // Enum destination (LRM 6.19.3): succeed only if the value is a legal
                 // member. valid = OR over members of (conv === member).
-                ir::Index valid = b.constant(module_.pool.put_int(bit1, 0), l);
-                const ir::Index one = b.constant(module_.pool.put_int(bit1, 1), l);
+                ir::Index       valid = b.constant(module_.pool.put_int(bit1, 0), l);
+                const ir::Index one   = b.constant(module_.pool.put_int(bit1, 1), l);
                 for (const EnumMember& m : enum_members(*et)) {
                     const ir::Index mc = b.constant(svint_to_ref(m.value, dest_ty), l);
                     const ir::Index eq = b.binary(ir::Inst::Tag::CaseEq, conv, mc, l);
@@ -8384,8 +8511,8 @@ private:
         // read / positioning functions, each returning a 32-bit integer. Operands
         // (a descriptor, plus a character or offset) are plain integer rvalues in
         // call order.
-        if (name == "$fgetc" || name == "$feof" || name == "$ftell" || name == "$rewind" ||
-            name == "$ungetc" || name == "$fseek") {
+        if (name == "$fgetc" || name == "$feof" || name == "$ftell" || name == "$rewind" || name == "$ungetc" ||
+            name == "$fseek") {
             ir::Inst::Tag tag;
             size_t        want;
             if (name == "$fgetc") {
@@ -8495,7 +8622,7 @@ private:
                 fail("$value$plusargs user_string must be a string literal");
             }
             const std::string_view us  = e->as<StringLiteral>().getValue();
-            const size_t            pct = us.rfind('%');
+            const size_t           pct = us.rfind('%');
             if (pct == std::string_view::npos) {
                 fail("$value$plusargs user_string must end in a %conversion");
             }
@@ -8506,8 +8633,7 @@ private:
             if (i >= us.size() || i + 1 != us.size()) {
                 fail("$value$plusargs user_string must end in a %[0-9]*<conv>");
             }
-            const char conv =
-              static_cast<char>(std::tolower(static_cast<unsigned char>(us[i])));
+            const char conv = static_cast<char>(std::tolower(static_cast<unsigned char>(us[i])));
             switch (conv) {
                 case 'd':
                 case 'o':
@@ -8617,8 +8743,8 @@ private:
                 if (name != fname) {
                     continue;
                 }
-                const bool two = op == ir::RealMathOp::Pow || op == ir::RealMathOp::Atan2 ||
-                                 op == ir::RealMathOp::Hypot;
+                const bool two =
+                  op == ir::RealMathOp::Pow || op == ir::RealMathOp::Atan2 || op == ir::RealMathOp::Hypot;
                 const auto args = call.arguments();
                 if (args.size() != (two ? 2u : 1u)) {
                     fail(std::string(name) + " expects " + (two ? "two arguments" : "one argument"));
@@ -8819,8 +8945,7 @@ private:
                 }
                 break;
             default:
-                fail(std::string("undefined format specifier '%") + spec.conv +
-                     "' (LRM 21.2.1.1)");
+                fail(std::string("undefined format specifier '%") + spec.conv + "' (LRM 21.2.1.1)");
         }
         if (spec.has_prec) {
             fail("a format precision is only defined for real specifiers (%e / %f / %g)");
@@ -8869,11 +8994,10 @@ private:
     // per-leaf value args. A scalar renders as its decimal value; a fixed unpacked
     // array / unpacked struct renders `'{e0, e1, ...}` recursively. Integral and
     // real leaves only (a string / handle leaf is guarded).
-    void expand_p_arg(const Expression& arg, std::string& frag, std::vector<ir::Index>& args,
-                      ir::Builder& b) {
-        const ir::Ref        ty = lower_type(*arg.type);
-        const ir::Type::Kind k  = std::get<ir::Type>(module_.pool.get(ty)).kind;
-        const bool container = k == ir::Type::Kind::Queue || k == ir::Type::Kind::DynArray;
+    void expand_p_arg(const Expression& arg, std::string& frag, std::vector<ir::Index>& args, ir::Builder& b) {
+        const ir::Ref        ty        = lower_type(*arg.type);
+        const ir::Type::Kind k         = std::get<ir::Type>(module_.pool.get(ty)).kind;
+        const bool           container = k == ir::Type::Kind::Queue || k == ir::Type::Kind::DynArray;
         if (!is_agg_abi_ref(ty) && !container) {
             frag += "%0d";
             args.push_back(lower_expr(arg, b));
@@ -8904,8 +9028,12 @@ private:
         fail("%p of a queue / dynamic array with a nested aggregate element is not supported");
     }
 
-    void expand_p_lvalue(ir::Index lv, ir::Ref ty, std::string& frag, std::vector<ir::Index>& args,
-                         ir::Builder& b, ir::SourceLoc l) {
+    void expand_p_lvalue(ir::Index               lv,
+                         ir::Ref                 ty,
+                         std::string&            frag,
+                         std::vector<ir::Index>& args,
+                         ir::Builder&            b,
+                         ir::SourceLoc           l) {
         const ir::Type t = std::get<ir::Type>(module_.pool.get(ty));
         if (t.kind == ir::Type::Kind::UnpackedArray) {
             frag += "'{";
@@ -8914,12 +9042,12 @@ private:
                 if (k != 0) {
                     frag += ", ";
                 }
-                const int32_t coord = t.left <= t.right ? static_cast<int32_t>(t.left + k)
-                                                        : static_cast<int32_t>(t.left - k);
-                const ir::Index idx = b.constant(
-                    module_.pool.put_int(make_int_type(32, false, true),
-                                         static_cast<uint64_t>(static_cast<int64_t>(coord))),
-                    l);
+                const int32_t coord =
+                  t.left <= t.right ? static_cast<int32_t>(t.left + k) : static_cast<int32_t>(t.left - k);
+                const ir::Index idx =
+                  b.constant(module_.pool.put_int(make_int_type(32, false, true),
+                                                  static_cast<uint64_t>(static_cast<int64_t>(coord))),
+                             l);
                 expand_p_lvalue(b.elem_select(lv, idx, ty, l), t.element, frag, args, b, l);
             }
             frag += "}";
@@ -8960,8 +9088,11 @@ private:
         args.push_back(b.unary(ir::Inst::Tag::Load, lv, l));
     }
 
-    void build_format(std::span<const Expression* const> format_args, std::string& fmt,
-                      std::vector<ir::Index>& args, ir::Builder& b, char default_conv = 'd') {
+    void build_format(std::span<const Expression* const> format_args,
+                      std::string&                       fmt,
+                      std::vector<ir::Index>&            args,
+                      ir::Builder&                       b,
+                      char                               default_conv = 'd') {
         // Conversion chars (lowercase) of specifiers seen but not yet matched to
         // a value arg, in order (FIFO). Needed so a `%t` argument can be scaled
         // to ticks and a string object checked against %s.
@@ -9021,7 +9152,7 @@ private:
                     fail("a string argument to $display/$write requires %s");
                 }
                 const ir::SourceLoc al = loc(*arg);
-                const bool real_conv =
+                const bool          real_conv =
                   conv == 'e' || conv == 'E' || conv == 'f' || conv == 'F' || conv == 'g' || conv == 'G';
                 ir::Index v = lower_expr(*arg, b);
                 if (fl && !real_conv) {
@@ -9075,9 +9206,11 @@ private:
     // Lower $display / $write: format the arguments and write to standard output.
     // Build the $display-style message from `msg_args` and emit a severity report
     // (LRM 20.10 / 16.3) at `level`. Non-terminating; $fatal adds a finish after.
-    void emit_severity(ir::Severity level, const std::string& banner,
-                       std::span<const Expression* const> msg_args, const CallExpression& call,
-                       ir::Builder& b) {
+    void emit_severity(ir::Severity                       level,
+                       const std::string&                 banner,
+                       std::span<const Expression* const> msg_args,
+                       const CallExpression&              call,
+                       ir::Builder&                       b) {
         std::string            fmt;
         std::vector<ir::Index> args;
         build_format(msg_args, fmt, args, b);
@@ -9141,7 +9274,7 @@ private:
             fail("$strobe inside a function is not supported (no wheel in the ABI)");
         }
         const ir::FunctionId fid =
-            build_deferred_body(call.arguments(), default_conv, loc(call), fd_arg, /*monitor=*/false);
+          build_deferred_body(call.arguments(), default_conv, loc(call), fd_arg, /*monitor=*/false);
         b.strobe_pend(fid, loc(call));
     }
 
@@ -9155,7 +9288,7 @@ private:
             fail("$monitor inside a function is not supported (no wheel in the ABI)");
         }
         const ir::FunctionId fid =
-            build_deferred_body(call.arguments(), default_conv, loc(call), fd_arg, /*monitor=*/true);
+          build_deferred_body(call.arguments(), default_conv, loc(call), fd_arg, /*monitor=*/true);
         b.monitor_set(fid, loc(call));
     }
 
@@ -9166,7 +9299,7 @@ private:
         if (args_in.empty()) {
             fail("$fdisplay / $fwrite requires a file-descriptor argument");
         }
-        const ir::Index       fd = lower_expr(*args_in[0], b);
+        const ir::Index        fd = lower_expr(*args_in[0], b);
         std::string            fmt;
         std::vector<ir::Index> args;
         build_format(args_in.subspan(1), fmt, args, b, default_conv);
@@ -9177,8 +9310,7 @@ private:
     // $write and store the result into the destination string lvalue (the first
     // argument). $sformat's format (its second argument) must be a string literal;
     // $swrite takes $write-style interleaved literals and values.
-    void lower_sformat(const CallExpression& call, bool is_sformat, ir::Builder& b,
-                       char default_conv = 'd') {
+    void lower_sformat(const CallExpression& call, bool is_sformat, ir::Builder& b, char default_conv = 'd') {
         const auto args = call.arguments();
         if (args.empty()) {
             fail("$sformat / $swrite requires a destination string argument");
@@ -9350,8 +9482,7 @@ private:
                 fail("intra-assignment timing control on an assignment-pattern "
                      "lvalue is not supported");
             }
-            const ir::Inst::Tag tag =
-                a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
+            const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
             return lower_pattern_assign(*pat, a.right(), tag, b, loc(a));
         }
         if (is_aggregate(*a.left().type)) {
@@ -9389,10 +9520,8 @@ private:
                 // (docs/design/intra-assignment-timing.md). A real rides its IEEE
                 // pattern through the same narrow record (intra_pack_mm).
                 const bool whole_scalar =
-                    (a.left().kind == ExpressionKind::NamedValue ||
-                     a.left().kind == ExpressionKind::HierarchicalValue) &&
-                    (a.left().type->isIntegral() || a.left().type->isFloating()) &&
-                    !a.left().type->isUnpackedArray();
+                  (a.left().kind == ExpressionKind::NamedValue || a.left().kind == ExpressionKind::HierarchicalValue) &&
+                  (a.left().type->isIntegral() || a.left().type->isFloating()) && !a.left().type->isUnpackedArray();
                 if (!whole_scalar) {
                     fail("nonblocking intra-assignment timing is only supported for a whole "
                          "integral or real scalar target");
@@ -9461,14 +9590,17 @@ private:
                     fail("nonblocking intra-assignment multi-signal event trigger is not supported");
                 }
                 const ir::Index val = lower_expr(a.right(), b);
-                b.store_nb_event(lower_lvalue(a.left(), b), val, count, events[0].signal,
-                                 static_cast<uint32_t>(events[0].edge), loc(a));
+                b.store_nb_event(lower_lvalue(a.left(), b),
+                                 val,
+                                 count,
+                                 events[0].signal,
+                                 static_cast<uint32_t>(events[0].edge),
+                                 loc(a));
                 return val;
             }
             const bool string_lhs =
-                is_string_expr(a.left()) ||
-                (a.left().kind == ExpressionKind::ElementSelect &&
-                 is_string_expr(a.left().as<ElementSelectExpression>().value()));
+              is_string_expr(a.left()) || (a.left().kind == ExpressionKind::ElementSelect &&
+                                           is_string_expr(a.left().as<ElementSelectExpression>().value()));
             if (string_lhs || is_unpacked_array(a.left())) {
                 // TODO: intra-assignment timing on a string / whole-array target —
                 // the string/array store paths evaluate the LHS before the RHS, so
@@ -9478,8 +9610,7 @@ private:
             const ir::Index rhs = lower_expr(a.right(), b);
             lower_intra_timing(*a.timingControl, b, loc(a));
             if (a.left().kind == ExpressionKind::Concatenation) {
-                store_concat(a.left().as<ConcatenationExpression>(), rhs, ir::Inst::Tag::Store, b,
-                             loc(a));
+                store_concat(a.left().as<ConcatenationExpression>(), rhs, ir::Inst::Tag::Store, b, loc(a));
                 return rhs;
             }
             b.binary(ir::Inst::Tag::Store, lower_lvalue(a.left(), b), rhs, loc(a));
@@ -9524,13 +9655,12 @@ private:
             // into an array element rides the backend's deferred array-NBA queue
             // (nba_classify_ir) for the NBA case. A string array (heap-owning
             // elements) is still unsupported.
-            const ir::Ref       ty  = lower_type(*a.left().type);
-            const Expression&   src = unwrap_conversion(a.right());
-            const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
+            const ir::Ref       ty        = lower_type(*a.left().type);
+            const Expression&   src       = unwrap_conversion(a.right());
+            const ir::Inst::Tag tag       = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
             const bool          whole_lhs = is_whole_array_lvalue(a.left());
-            if (!a.isNonBlocking() && whole_lhs && is_trivially_copyable(ty) &&
-                is_whole_array_lvalue(src) && !is_assoc_element_select(a.left()) &&
-                !is_assoc_element_select(src)) {
+            if (!a.isNonBlocking() && whole_lhs && is_trivially_copyable(ty) && is_whole_array_lvalue(src) &&
+                !is_assoc_element_select(a.left()) && !is_assoc_element_select(src)) {
                 b.agg_copy(lower_lvalue(a.left(), b), lower_lvalue(src, b), ty, loc(a));
                 return true_const(b, loc(a));
             }
@@ -9564,8 +9694,7 @@ private:
                 // compatible with the canonical result — the same layout hazard the
                 // by-value argument path handles). Blocking and nonblocking both
                 // decompose per element.
-                const std::optional<ir::Index> cv =
-                    lower_user_call(src.as<CallExpression>(), b);
+                const std::optional<ir::Index> cv = lower_user_call(src.as<CallExpression>(), b);
                 if (!cv) {
                     fail("whole-array assignment from a void call");
                 }
@@ -9653,8 +9782,8 @@ private:
             return dst;
         }
         if (a.right().kind == ExpressionKind::NewArray) {
-            const auto&     na   = a.right().as<slang::ast::NewArrayExpression>();
-            const ir::Index size = lower_expr(na.sizeExpr(), b);
+            const auto&       na   = a.right().as<slang::ast::NewArrayExpression>();
+            const ir::Index   size = lower_expr(na.sizeExpr(), b);
             const Expression* init = na.initExpr();
             if (init != nullptr && as_assignment_pattern(*init) != nullptr) {
                 // `new[N]('{...}')`: allocate N default-filled, then store each
@@ -9679,29 +9808,30 @@ private:
     // dynamic array `dst` at its positional coordinate. Used for `new[N]('{...}')`
     // where the array is sized to N and the pattern fills the low elements; a
     // replicated pattern (`'{M{x}}`) expands its single stored copy M times.
-    void emit_dyn_pattern_fill(ir::Index dst, ir::Ref aty,
-                               const slang::ast::AssignmentPatternExpressionBase& pat, ir::Builder& b,
-                               ir::SourceLoc l) {
+    void emit_dyn_pattern_fill(ir::Index                                          dst,
+                               ir::Ref                                            aty,
+                               const slang::ast::AssignmentPatternExpressionBase& pat,
+                               ir::Builder&                                       b,
+                               ir::SourceLoc                                      l) {
         const ir::Type t     = std::get<ir::Type>(module_.pool.get(aty));
-        const auto      elems = pat.elements();
-        const uint32_t  n     = static_cast<uint32_t>(elems.size());
-        const uint32_t  reps =
-            pat.kind == ExpressionKind::ReplicatedAssignmentPattern
-                ? static_cast<uint32_t>(
-                      const_uint(pat.as<ReplicatedAssignmentPatternExpression>().count()))
-                : 1;
+        const auto     elems = pat.elements();
+        const uint32_t n     = static_cast<uint32_t>(elems.size());
+        const uint32_t reps =
+          pat.kind == ExpressionKind::ReplicatedAssignmentPattern
+            ? static_cast<uint32_t>(const_uint(pat.as<ReplicatedAssignmentPatternExpression>().count()))
+            : 1;
         for (uint32_t k = 0; k < n * reps; ++k) {
-            const ir::Index idx =
-                b.constant(module_.pool.put_int(make_int_type(32, false, true), k), l);
-            emit_agg_store(b.elem_select(dst, idx, aty, l), t.element, *elems[k % n],
-                           ir::Inst::Tag::Store, b, l);
+            const ir::Index idx = b.constant(module_.pool.put_int(make_int_type(32, false, true), k), l);
+            emit_agg_store(b.elem_select(dst, idx, aty, l), t.element, *elems[k % n], ir::Inst::Tag::Store, b, l);
         }
     }
 
     // A dynamic-array built-in method used as an rvalue or statement (LRM 7.5).
     // The receiver arrives as arguments()[0], like a string method.
-    ir::Index lower_dyn_array_method(std::string_view name, const CallExpression& call, ir::Builder& b,
-                                     ir::SourceLoc l) {
+    ir::Index lower_dyn_array_method(std::string_view      name,
+                                     const CallExpression& call,
+                                     ir::Builder&          b,
+                                     ir::SourceLoc         l) {
         const ir::Index arr = lower_lvalue(*call.arguments()[0], b);
         const ir::Ref   aty = lower_type(*call.arguments()[0]->type);
         if (name == "size") {
@@ -9748,11 +9878,9 @@ private:
         }
         const slang::ast::Type* et = call.arguments()[0]->type->getArrayElementType();
         const slang::ast::Type& ec = et->getCanonicalType();
-        const bool ok = ec.isFloating() ||
-                        (ec.isIntegral() && !ec.isFourState() && ec.getBitWidth() <= 64);
+        const bool ok = ec.isFloating() || (ec.isIntegral() && !ec.isFourState() && ec.getBitWidth() <= 64);
         if (!ok) {
-            fail("'" + std::string(name) +
-                 "' is only supported for a 2-state integral (width <= 64) or real element");
+            fail("'" + std::string(name) + "' is only supported for a 2-state integral (width <= 64) or real element");
         }
     }
 
@@ -9760,14 +9888,12 @@ private:
     // over the handle lvalue `base`. Handles the queue `$` selector (q[$] is the
     // last element, index size-1; size-1 == -1 selects the OOB default on an
     // empty queue).
-    ir::Index var_elem_select(const ElementSelectExpression& es, ir::Index base, ir::Builder& b,
-                              ir::SourceLoc l) {
+    ir::Index var_elem_select(const ElementSelectExpression& es, ir::Index base, ir::Builder& b, ir::SourceLoc l) {
         const ir::Ref arr_ty = lower_type(*es.value().type);
         if (is_queue(es.value()) && es.selector().type->isUnbounded()) {
             const ir::Ref   i32  = make_int_type(32, false, true);
             const ir::Index size = b.queue_size(base, arr_ty, l);
-            const ir::Index idx =
-              b.binary(ir::Inst::Tag::Sub, size, b.constant(module_.pool.put_int(i32, 1), l), l);
+            const ir::Index idx  = b.binary(ir::Inst::Tag::Sub, size, b.constant(module_.pool.put_int(i32, 1), l), l);
             return b.elem_select(base, idx, arr_ty, l);
         }
         return b.elem_select(base, lower_expr(es.selector(), b), arr_ty, l);
@@ -9776,8 +9902,7 @@ private:
     // Element address for an associative array (LRM 7.8): `a[key]` over the
     // handle lvalue `base`. The key is lowered as an ordinary value expression;
     // the backend normalizes it and resolves get_ptr (read) / put_ptr (write).
-    ir::Index var_assoc_select(const ElementSelectExpression& es, ir::Index base, ir::Builder& b,
-                               ir::SourceLoc l) {
+    ir::Index var_assoc_select(const ElementSelectExpression& es, ir::Index base, ir::Builder& b, ir::SourceLoc l) {
         const ir::Ref aty = lower_type(*es.value().type);
         return b.assoc_select(base, lower_expr(es.selector(), b), aty, l);
     }
@@ -9809,8 +9934,7 @@ private:
     // queue (spliced in via a full-range append) or a single element (pushed to
     // the back). A queue-typed piece is itself materialized first (nested slice /
     // concat).
-    void append_queue_pieces(ir::Index dst, const Expression& e, ir::Ref qty, ir::Builder& b,
-                             ir::SourceLoc l) {
+    void append_queue_pieces(ir::Index dst, const Expression& e, ir::Ref qty, ir::Builder& b, ir::SourceLoc l) {
         if (e.kind == ExpressionKind::RangeSelect) {
             const auto& rs = e.as<RangeSelectExpression>();
             if (!is_queue(rs.value())) {
@@ -9842,8 +9966,7 @@ private:
         // A full-queue append: lo = 0, hi = INT64_MAX (runtime-clamped to len-1).
         const ir::Ref   i64   = make_int_type(64, false, true);
         const ir::Index lo0   = b.constant(module_.pool.put_int(i64, 0), l);
-        const ir::Index hiEnd = b.constant(
-          module_.pool.put_int(i64, static_cast<uint64_t>(INT64_MAX)), l);
+        const ir::Index hiEnd = b.constant(module_.pool.put_int(i64, static_cast<uint64_t>(INT64_MAX)), l);
         for (const Expression* op : pieces) {
             if (is_queue(*op)) {
                 b.queue_append_range(dst, materialize_queue_rvalue(*op, b), lo0, hiEnd, qty, l);
@@ -9877,8 +10000,7 @@ private:
         // runs away). An empty source clears the queue to size 0.
         const Expression& rhs = unwrap_conversion(a.right());
         if (is_dyn_array(rhs)) {
-            if (rhs.kind != ExpressionKind::NamedValue &&
-                rhs.kind != ExpressionKind::HierarchicalValue) {
+            if (rhs.kind != ExpressionKind::NamedValue && rhs.kind != ExpressionKind::HierarchicalValue) {
                 // TODO: queue = <dynamic-array rvalue> where the source is not a
                 // plain variable (a call result, slice, etc.) — needs the source
                 // materialized into a temp dynarray handle first.
@@ -9892,7 +10014,7 @@ private:
             b.queue_copy_dynarr(dst, lower_lvalue(rhs, b), qty, l);
             return dst;
         }
-        const ir::Index     src = materialize_queue_rvalue(a.right(), b);
+        const ir::Index src = materialize_queue_rvalue(a.right(), b);
         if (a.isNonBlocking()) {
             // Whole-queue NBA: stage a deep copy now, move it into dst in the NBA
             // region (LRM 10.4.2). The target is a module signal (task/process
@@ -9910,13 +10032,12 @@ private:
     // returning call source is a handle copy; an assignment-pattern source is a
     // documented follow-up.
     ir::Index lower_assoc_assign(const AssignmentExpression& a, ir::Builder& b) {
-        const ir::SourceLoc l   = loc(a);
-        const ir::Index     dst = lower_lvalue(a.left(), b);
-        const ir::Ref       aty = lower_type(*a.left().type);
-        const bool          src_is_var =
-          is_assoc(a.right()) && (a.right().kind == ExpressionKind::NamedValue ||
-                                  a.right().kind == ExpressionKind::HierarchicalValue ||
-                                  a.right().kind == ExpressionKind::Call);
+        const ir::SourceLoc l          = loc(a);
+        const ir::Index     dst        = lower_lvalue(a.left(), b);
+        const ir::Ref       aty        = lower_type(*a.left().type);
+        const bool          src_is_var = is_assoc(a.right()) && (a.right().kind == ExpressionKind::NamedValue ||
+                                                                 a.right().kind == ExpressionKind::HierarchicalValue ||
+                                                                 a.right().kind == ExpressionKind::Call);
         if (!src_is_var) {
             // TODO: associative-array init from an assignment pattern ('{...}).
             fail("associative array assignment from a non-variable value is not supported");
@@ -9927,8 +10048,7 @@ private:
 
     // A queue built-in method used as an rvalue or statement (LRM 7.10.2). The
     // receiver arrives as arguments()[0], like a string / dynamic-array method.
-    ir::Index lower_queue_method(std::string_view name, const CallExpression& call, ir::Builder& b,
-                                 ir::SourceLoc l) {
+    ir::Index lower_queue_method(std::string_view name, const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
         const auto&     args = call.arguments();
         const ir::Index q    = lower_lvalue(*args[0], b);
         const ir::Ref   qty  = lower_type(*args[0]->type);
@@ -9972,8 +10092,7 @@ private:
     // value expressions (normalized in the backend); first/last/next/prev take
     // their key argument by ref (an lvalue output), which slang may wrap in an
     // AssignmentExpression.
-    ir::Index lower_assoc_method(std::string_view name, const CallExpression& call, ir::Builder& b,
-                                 ir::SourceLoc l) {
+    ir::Index lower_assoc_method(std::string_view name, const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
         const auto&     args = call.arguments();
         const ir::Index a    = lower_lvalue(*args[0], b);
         const ir::Ref   aty  = lower_type(*args[0]->type);
@@ -9981,8 +10100,7 @@ private:
             return b.resize(b.assoc_num(a, aty, l), lower_type(*call.type), l);
         }
         if (name == "exists") {
-            return b.resize(b.assoc_exists(a, lower_expr(*args[1], b), aty, l),
-                            lower_type(*call.type), l);
+            return b.resize(b.assoc_exists(a, lower_expr(*args[1], b), aty, l), lower_type(*call.type), l);
         }
         if (name == "delete") {
             // a.delete() clears all; a.delete(k) removes one entry.
@@ -10023,9 +10141,8 @@ private:
             // scatter the result.
             fail("compound assignment to a concatenation is not supported");
         }
-        if (is_string_expr(a.left()) ||
-            (a.left().kind == ExpressionKind::ElementSelect &&
-             is_string_expr(a.left().as<ElementSelectExpression>().value()))) {
+        if (is_string_expr(a.left()) || (a.left().kind == ExpressionKind::ElementSelect &&
+                                         is_string_expr(a.left().as<ElementSelectExpression>().value()))) {
             // TODO: compound assignment to a string / string element (the lvalue
             // path below is packed-only; a string char write uses str_putc).
             fail("compound assignment to a string is not supported");
@@ -10045,8 +10162,11 @@ private:
     // is `rhs >> offset` truncated to the operand width via resize (the upper bits
     // are discarded by the narrowing store). The RHS is sampled once by the caller,
     // so a nonblocking concat assignment keeps single-evaluation semantics.
-    void store_concat(const ConcatenationExpression& cc, ir::Index rhs, ir::Inst::Tag tag,
-                      ir::Builder& b, ir::SourceLoc l) {
+    void store_concat(const ConcatenationExpression& cc,
+                      ir::Index                      rhs,
+                      ir::Inst::Tag                  tag,
+                      ir::Builder&                   b,
+                      ir::SourceLoc                  l) {
         store_concat_ops(cc.operands(), rhs, tag, b, l);
     }
 
@@ -10057,8 +10177,11 @@ private:
     // vector, field/element declaration order already equals concatenation
     // order, so a pattern lvalue over one needs no separate structural walk.
     // A nested concat or (positional-only) pattern operand recurses.
-    void store_concat_ops(std::span<const Expression* const> ops, ir::Index rhs, ir::Inst::Tag tag,
-                          ir::Builder& b, ir::SourceLoc l) {
+    void store_concat_ops(std::span<const Expression* const> ops,
+                          ir::Index                          rhs,
+                          ir::Inst::Tag                      tag,
+                          ir::Builder&                       b,
+                          ir::SourceLoc                      l) {
         uint32_t offset = 0;
         for (size_t k = ops.size(); k-- > 0;) {
             const Expression& op = unwrap_lvalue_elem(*ops[k]);
@@ -10067,9 +10190,8 @@ private:
             }
             ir::Index chunk = rhs;
             if (offset != 0) {
-                const ir::Index sh =
-                    b.constant(module_.pool.put_int(make_int_type(32, false, false), offset), l);
-                chunk = b.binary(ir::Inst::Tag::Srl, rhs, sh, l);
+                const ir::Index sh = b.constant(module_.pool.put_int(make_int_type(32, false, false), offset), l);
+                chunk              = b.binary(ir::Inst::Tag::Srl, rhs, sh, l);
             }
             const ir::Index val = b.resize(chunk, lower_type(*op.type), l);
             if (op.kind == ExpressionKind::Concatenation) {
@@ -10088,8 +10210,10 @@ private:
     }
 
     ir::Index lower_pattern_assign(const slang::ast::AssignmentPatternExpressionBase& pat,
-                                   const Expression& rhs_expr, ir::Inst::Tag tag, ir::Builder& b,
-                                   ir::SourceLoc l) {
+                                   const Expression&                                  rhs_expr,
+                                   ir::Inst::Tag                                      tag,
+                                   ir::Builder&                                       b,
+                                   ir::SourceLoc                                      l) {
         if (is_queue(rhs_expr) || is_dyn_array(rhs_expr) || is_assoc(rhs_expr)) {
             fail("assignment-pattern lvalue from a queue, dynamic array, or "
                  "associative array right-hand value is not supported");
@@ -10118,10 +10242,14 @@ private:
     // member / array element per pattern member (LRM 10.9). The right-hand
     // element is addressed once per member (elem_select/member_select), not
     // re-evaluated, so a nonblocking pattern assignment samples once.
-    void store_pattern(const slang::ast::AssignmentPatternExpressionBase& pat, ir::Index rhs_addr,
-                       ir::Ref rhs_ty, ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
+    void store_pattern(const slang::ast::AssignmentPatternExpressionBase& pat,
+                       ir::Index                                          rhs_addr,
+                       ir::Ref                                            rhs_ty,
+                       ir::Inst::Tag                                      tag,
+                       ir::Builder&                                       b,
+                       ir::SourceLoc                                      l) {
         const ir::Type rt    = std::get<ir::Type>(module_.pool.get(rhs_ty));
-        const auto      elems = pat.elements();
+        const auto     elems = pat.elements();
         if (rt.kind == ir::Type::Kind::Struct) {
             const auto fields = module_.pool.struct_fields(rt.fields_id);
             if (elems.size() != fields.size()) {
@@ -10129,8 +10257,8 @@ private:
                      "right-hand struct's member count");
             }
             for (uint32_t i = 0; i < fields.size(); ++i) {
-                store_pattern_elem(unwrap_lvalue_elem(*elems[i]), b.member_select(rhs_addr, i, rhs_ty, l),
-                                   fields[i].type, tag, b, l);
+                store_pattern_elem(
+                  unwrap_lvalue_elem(*elems[i]), b.member_select(rhs_addr, i, rhs_ty, l), fields[i].type, tag, b, l);
             }
             return;
         }
@@ -10141,19 +10269,22 @@ private:
                  "right-hand array's size");
         }
         for (uint32_t k = 0; k < n; ++k) {
-            const int32_t coord = rt.left <= rt.right ? static_cast<int32_t>(rt.left + k)
-                                                       : static_cast<int32_t>(rt.left - k);
+            const int32_t coord =
+              rt.left <= rt.right ? static_cast<int32_t>(rt.left + k) : static_cast<int32_t>(rt.left - k);
             const ir::Index idx = b.constant(
-                module_.pool.put_int(make_int_type(32, false, true),
-                                     static_cast<uint64_t>(static_cast<int64_t>(coord))),
-                l);
-            store_pattern_elem(unwrap_lvalue_elem(*elems[k]), b.elem_select(rhs_addr, idx, rhs_ty, l),
-                               rt.element, tag, b, l);
+              module_.pool.put_int(make_int_type(32, false, true), static_cast<uint64_t>(static_cast<int64_t>(coord))),
+              l);
+            store_pattern_elem(
+              unwrap_lvalue_elem(*elems[k]), b.elem_select(rhs_addr, idx, rhs_ty, l), rt.element, tag, b, l);
         }
     }
 
-    void store_pattern_elem(const Expression& member, ir::Index rhs_elem_addr, ir::Ref elem_ty,
-                            ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
+    void store_pattern_elem(const Expression& member,
+                            ir::Index         rhs_elem_addr,
+                            ir::Ref           elem_ty,
+                            ir::Inst::Tag     tag,
+                            ir::Builder&      b,
+                            ir::SourceLoc     l) {
         if (const auto* nested = as_assignment_pattern(member)) {
             if (member.kind != ExpressionKind::SimpleAssignmentPattern) {
                 fail("keyed or replicated assignment pattern is not supported as an "
@@ -10163,8 +10294,8 @@ private:
             return;
         }
         if (member.kind == ExpressionKind::Concatenation) {
-            store_concat(member.as<ConcatenationExpression>(),
-                        b.unary(ir::Inst::Tag::Load, rhs_elem_addr, l), tag, b, l);
+            store_concat(
+              member.as<ConcatenationExpression>(), b.unary(ir::Inst::Tag::Load, rhs_elem_addr, l), tag, b, l);
             return;
         }
         if (is_string_expr(member) || value_cat(elem_ty) == ValueCat::string ||
@@ -10183,8 +10314,7 @@ private:
             }
             return;
         }
-        const ir::Index val = b.resize(b.unary(ir::Inst::Tag::Load, rhs_elem_addr, l),
-                                       lower_type(*member.type), l);
+        const ir::Index val = b.resize(b.unary(ir::Inst::Tag::Load, rhs_elem_addr, l), lower_type(*member.type), l);
         b.binary(tag, lower_lvalue(member, b), val, l);
     }
 
@@ -10206,17 +10336,17 @@ private:
     // order, first element/field at the MSB, per LRM 11.4.14.2 / 7.2.1). The
     // element / field bit widths sum to $bits of the aggregate.
     ir::Index serialize_agg_lvalue(ir::Index lv, ir::Ref ty, ir::Builder& b, ir::SourceLoc l) {
-        const ir::Type t = std::get<ir::Type>(module_.pool.get(ty));
+        const ir::Type         t = std::get<ir::Type>(module_.pool.get(ty));
         std::vector<ir::Index> parts;
         if (t.kind == ir::Type::Kind::UnpackedArray) {
             const uint32_t n = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
             for (uint32_t k = 0; k < n; ++k) {
-                const int32_t coord = t.left <= t.right ? static_cast<int32_t>(t.left + k)
-                                                        : static_cast<int32_t>(t.left - k);
-                const ir::Index idx = b.constant(
-                    module_.pool.put_int(make_int_type(32, false, true),
-                                         static_cast<uint64_t>(static_cast<int64_t>(coord))),
-                    l);
+                const int32_t coord =
+                  t.left <= t.right ? static_cast<int32_t>(t.left + k) : static_cast<int32_t>(t.left - k);
+                const ir::Index idx =
+                  b.constant(module_.pool.put_int(make_int_type(32, false, true),
+                                                  static_cast<uint64_t>(static_cast<int64_t>(coord))),
+                             l);
                 parts.push_back(serialize_agg_lvalue(b.elem_select(lv, idx, ty, l), t.element, b, l));
             }
         } else if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
@@ -10236,7 +10366,9 @@ private:
     }
 
     ir::Index lower_streaming_concat(const StreamingConcatenationExpression& sc,
-                                     ir::Ref target_ty, ir::Builder& b, ir::SourceLoc l) {
+                                     ir::Ref                                 target_ty,
+                                     ir::Builder&                            b,
+                                     ir::SourceLoc                           l) {
         if (!sc.isFixedSize()) {
             fail("streaming concatenation with dynamically-sized operands is not supported");
         }
@@ -10249,21 +10381,20 @@ private:
         // Build the generic stream: concatenate operands left-to-right.
         // A nested streaming concat has void type (slang creates it with getVoidType()),
         // so detect it and supply the concrete target type derived from bitstream width.
-        const bool is_four_outer = module_.pool.layout(target_ty).domain == ir::Domain::Four;
+        const bool             is_four_outer = module_.pool.layout(target_ty).domain == ir::Domain::Four;
         std::vector<ir::Index> parts;
         for (const auto& stream : sc.streams()) {
             const Expression& operand = *stream.operand;
             if (operand.kind == ExpressionKind::Streaming) {
-                const auto& inner = operand.as<StreamingConcatenationExpression>();
-                const ir::Ref inner_ty = make_int_type(
-                    static_cast<uint32_t>(inner.getBitstreamWidth()), is_four_outer, false);
+                const auto&   inner = operand.as<StreamingConcatenationExpression>();
+                const ir::Ref inner_ty =
+                  make_int_type(static_cast<uint32_t>(inner.getBitstreamWidth()), is_four_outer, false);
                 parts.push_back(lower_streaming_concat(inner, inner_ty, b, l));
             } else if (is_agg_bitstream_operand(operand)) {
                 // A whole unpacked array / struct operand serializes to its leaf
                 // bit-concatenation (LRM 11.4.14); it has no flat load.
                 parts.push_back(
-                    serialize_agg_lvalue(lower_lvalue(unwrap_conversion(operand), b),
-                                         lower_type(*operand.type), b, l));
+                  serialize_agg_lvalue(lower_lvalue(unwrap_conversion(operand), b), lower_type(*operand.type), b, l));
             } else {
                 parts.push_back(lower_expr(operand, b));
             }
@@ -10285,12 +10416,12 @@ private:
         // on the right, i.e. stream occupies the MSBs of the result).
         const uint32_t target_w = module_.pool.layout(target_ty).width;
         if (target_w > static_cast<uint32_t>(W)) {
-            const uint32_t pad       = target_w - static_cast<uint32_t>(W);
-            const bool     is_four   = module_.pool.layout(target_ty).domain == ir::Domain::Four;
-            const ir::Ref  pad_ty    = make_int_type(pad, is_four, false);
-            const ir::Index zero_pad = b.constant(module_.pool.put_int(pad_ty, 0), l);
-            std::vector<ir::Index> widened = {raw, zero_pad};
-            raw = b.concat(widened, l);
+            const uint32_t         pad      = target_w - static_cast<uint32_t>(W);
+            const bool             is_four  = module_.pool.layout(target_ty).domain == ir::Domain::Four;
+            const ir::Ref          pad_ty   = make_int_type(pad, is_four, false);
+            const ir::Index        zero_pad = b.constant(module_.pool.put_int(pad_ty, 0), l);
+            std::vector<ir::Index> widened  = { raw, zero_pad };
+            raw                             = b.concat(widened, l);
         }
 
         return b.resize(raw, target_ty, l);
@@ -10298,7 +10429,7 @@ private:
 
     // Lower an expression as an rvalue, returning the SSA value index.
     ir::Index lower_expr(const Expression& expr, ir::Builder& b) {
-        cur_range_              = expr.sourceRange;
+        cur_range_            = expr.sourceRange;
         const ir::SourceLoc l = loc(expr);
         switch (expr.kind) {
             case ExpressionKind::IntegerLiteral:
@@ -10316,18 +10447,16 @@ private:
                 // type and getValue() returns the SVInt sized+filled per the
                 // table (setAllOnes / createFillX / createFillZ).
                 return b.constant(
-                    svint_to_ref(expr.as<UnbasedUnsizedIntegerLiteral>().getValue(), lower_type(*expr.type)), l);
+                  svint_to_ref(expr.as<UnbasedUnsizedIntegerLiteral>().getValue(), lower_type(*expr.type)), l);
             case ExpressionKind::RealLiteral:
                 // An IEEE-754 double (LRM 5.7.2); a shortreal literal arrives as
                 // a cast around this, handled by the Conversion case.
-                return b.constant(module_.pool.put_real(lower_type(*expr.type), expr.as<RealLiteral>().getValue()),
-                                  l);
+                return b.constant(module_.pool.put_real(lower_type(*expr.type), expr.as<RealLiteral>().getValue()), l);
             case ExpressionKind::TimeLiteral:
                 // A realtime value slang has already scaled to the scope's time
                 // unit (LRM 5.8); precision rounding applies only in delay
                 // contexts, which reject reals for now.
-                return b.constant(module_.pool.put_real(lower_type(*expr.type), expr.as<TimeLiteral>().getValue()),
-                                  l);
+                return b.constant(module_.pool.put_real(lower_type(*expr.type), expr.as<TimeLiteral>().getValue()), l);
             case ExpressionKind::StringLiteral: {
                 // In a string-typed context the literal is a string constant with
                 // its \0 bytes dropped (LRM 6.16).
@@ -10338,8 +10467,8 @@ private:
                 // (LRM 5.9); as an integral rvalue it is that packed value. slang
                 // folds it to an SVInt of the literal's 8*N-bit type; the
                 // surrounding conversion resizes it to the assignment context.
-                slang::ast::ASTContext  actx(*scope_, slang::ast::LookupLocation::max);
-                slang::ast::EvalContext ectx(actx);
+                slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+                slang::ast::EvalContext    ectx(actx);
                 const slang::ConstantValue cv = expr.eval(ectx);
                 if (!cv.isInteger()) {
                     fail("non-integral string literal");
@@ -10432,8 +10561,8 @@ private:
                 if (has_observable_effect(c.left()) || has_observable_effect(c.right())) {
                     return lower_lazy_conditional(c, pred, b);
                 }
-                const ir::Index a    = lower_expr(c.left(), b);
-                const ir::Index bb   = lower_expr(c.right(), b);
+                const ir::Index a  = lower_expr(c.left(), b);
+                const ir::Index bb = lower_expr(c.right(), b);
                 return b.select(pred, a, bb, l);
             }
             case ExpressionKind::Concatenation: {
@@ -10461,11 +10590,10 @@ private:
                 }
                 const ir::Index base = select_base_lvalue(es.value(), b, l);
                 const ir::Index sel =
-                    is_assoc(es.value()) ? var_assoc_select(es, base, b, l)
-                    : is_unpacked_array(es.value()) || is_dyn_array(es.value()) ||
-                          is_queue(es.value())
-                      ? var_elem_select(es, base, b, l)
-                      : lower_packed_element_lvalue(es, base, b, l);
+                  is_assoc(es.value()) ? var_assoc_select(es, base, b, l)
+                  : is_unpacked_array(es.value()) || is_dyn_array(es.value()) || is_queue(es.value())
+                    ? var_elem_select(es, base, b, l)
+                    : lower_packed_element_lvalue(es, base, b, l);
                 const ir::Index v = b.unary(ir::Inst::Tag::Load, sel, l);
                 // See narrow_to_declared / the MemberAccess case below: a
                 // no-op except when `es` selects into a struct field
@@ -10475,7 +10603,7 @@ private:
                 return narrow_to_declared(v, *expr.type, b, l);
             }
             case ExpressionKind::RangeSelect: {
-                const RangeSelectExpression& rs   = expr.as<RangeSelectExpression>();
+                const RangeSelectExpression& rs = expr.as<RangeSelectExpression>();
                 if (auto c = try_lower_constant_select(expr, b, l)) {
                     return *c;
                 }
@@ -10487,8 +10615,8 @@ private:
                     // array ABI (same follow-up as a whole-array read).
                     fail("whole unpacked array read is not supported");
                 }
-                const ir::Index              base = select_base_lvalue(rs.value(), b, l);
-                const ir::Index v = b.unary(ir::Inst::Tag::Load, lower_range_select(rs, base, b, l), l);
+                const ir::Index base = select_base_lvalue(rs.value(), b, l);
+                const ir::Index v    = b.unary(ir::Inst::Tag::Load, lower_range_select(rs, base, b, l), l);
                 // See narrow_to_declared (e.g. `x.b[7:4]`).
                 return narrow_to_declared(v, *expr.type, b, l);
             }
@@ -10535,8 +10663,7 @@ private:
                     // anything else is the runtime integral -> string cast
                     // (bytes MSB-first, zero bytes removed, LRM 6.16).
                     if (cv.operand().kind == ExpressionKind::StringLiteral) {
-                        return b.constant(
-                          string_value_ref(cv.operand().as<StringLiteral>().getValue()), l);
+                        return b.constant(string_value_ref(cv.operand().as<StringLiteral>().getValue()), l);
                     }
                     if (!cv.operand().type->isIntegral()) {
                         fail("unsupported conversion to string");
@@ -10553,8 +10680,7 @@ private:
                 }
                 if (cv.conversionKind == ConversionKind::StreamingConcat) {
                     return lower_streaming_concat(
-                        cv.operand().as<StreamingConcatenationExpression>(),
-                        lower_type(*expr.type), b, l);
+                      cv.operand().as<StreamingConcatenationExpression>(), lower_type(*expr.type), b, l);
                 }
                 if (is_handle_expr(cv.operand()) && !expr.type->getCanonicalType().isUnpackedArray()) {
                     // TODO: bit-stream cast from a dynamic array / queue to a
@@ -10606,17 +10732,16 @@ private:
         // Handled before lowering the operand as an rvalue so the lvalue's
         // selectors are not evaluated twice. Pre returns the new value, post the
         // old; slang has already resolved the operand's width/type.
-        if (u.op == U::Preincrement || u.op == U::Postincrement ||
-            u.op == U::Predecrement || u.op == U::Postdecrement) {
-            const bool inc = u.op == U::Preincrement || u.op == U::Postincrement;
-            const bool pre = u.op == U::Preincrement || u.op == U::Predecrement;
+        if (u.op == U::Preincrement || u.op == U::Postincrement || u.op == U::Predecrement ||
+            u.op == U::Postdecrement) {
+            const bool      inc = u.op == U::Preincrement || u.op == U::Postincrement;
+            const bool      pre = u.op == U::Preincrement || u.op == U::Predecrement;
             const ir::Index lv  = lower_lvalue(u.operand(), b);
             const ir::Index cur = b.unary(T::Load, lv, l);
             if (u.operand().type->isFloating()) {
                 // ++ / -- on a real add / subtract 1.0 (LRM 11.4.2).
-                const ir::Index one =
-                  b.constant(module_.pool.put_real(lower_type(*u.operand().type), 1.0), l);
-                const ir::Index nv = b.binary(inc ? T::FAdd : T::FSub, cur, one, l);
+                const ir::Index one = b.constant(module_.pool.put_real(lower_type(*u.operand().type), 1.0), l);
+                const ir::Index nv  = b.binary(inc ? T::FAdd : T::FSub, cur, one, l);
                 b.binary(T::Store, lv, nv, l);
                 return pre ? nv : cur;
             }
@@ -10684,10 +10809,10 @@ private:
     // left is ambiguous, so the right operand is still evaluated and the full
     // 3-valued Land/Lor/Limplies computes the merged result.
     ir::Index lower_short_circuit(const BinaryExpression& bin, ir::Builder& b) {
-        using T = ir::Inst::Tag;
-        using B = slang::ast::BinaryOperator;
+        using T                 = ir::Inst::Tag;
+        using B                 = slang::ast::BinaryOperator;
         const ir::SourceLoc l   = loc(bin);
-        const ir::Ref        bit = make_int_type(1, true, false);
+        const ir::Ref       bit = make_int_type(1, true, false);
 
         // A real operand reduces to its own definite truth bit (!= 0.0, reals
         // carry no x/z) before the integer machinery below (LRM 11.4.7).
@@ -10703,10 +10828,9 @@ private:
         // `||` skips when the left is logically true (its reduction is a definite
         // 1). Case-equality (===) yields a definite bit even for an x/z left, so
         // the backend can branch on it directly.
-        const ir::Ref lhs_ty = bin.left().type->isFloating() ? bit : lower_type(*bin.left().type);
-        const bool    skip_on_false =
-          bin.op == B::LogicalAnd || bin.op == B::LogicalImplication;
-        ir::Index pred;
+        const ir::Ref lhs_ty        = bin.left().type->isFloating() ? bit : lower_type(*bin.left().type);
+        const bool    skip_on_false = bin.op == B::LogicalAnd || bin.op == B::LogicalImplication;
+        ir::Index     pred;
         if (skip_on_false) {
             const ir::Index zero = b.constant(module_.pool.put_int(lhs_ty, 0), l);
             pred                 = b.unary(T::Lnot, b.binary(T::CaseEq, lhs, zero, l), l);
@@ -10764,8 +10888,8 @@ private:
     // `pred` is the already-lowered 1-bit condition (computed once by the caller,
     // pattern-aware) — LRM 11.4.11 requires the condition to be evaluated once.
     ir::Index lower_lazy_conditional(const ConditionalExpression& c, ir::Index pred, ir::Builder& b) {
-        using T               = ir::Inst::Tag;
-        const ir::SourceLoc l = loc(c);
+        using T                 = ir::Inst::Tag;
+        const ir::SourceLoc l   = loc(c);
         const ir::Ref       bit = make_int_type(1, true, false);
 
         const ir::Index one     = b.constant(module_.pool.put_int(bit, 1), l);
@@ -10835,24 +10959,20 @@ private:
                 // Each real operand reduces to its own truth value (!= 0.0,
                 // definite); an integral operand keeps its planes and the
                 // backend's Land/Lor X rules apply to it alone.
-                const ir::Index lp = bin.left().type->isFloating()
-                                       ? b.binary(T::FNe, lhs, real_zero(bin.left(), b, l), l)
-                                       : lhs;
-                const ir::Index rp = bin.right().type->isFloating()
-                                       ? b.binary(T::FNe, rhs, real_zero(bin.right(), b, l), l)
-                                       : rhs;
+                const ir::Index lp =
+                  bin.left().type->isFloating() ? b.binary(T::FNe, lhs, real_zero(bin.left(), b, l), l) : lhs;
+                const ir::Index rp =
+                  bin.right().type->isFloating() ? b.binary(T::FNe, rhs, real_zero(bin.right(), b, l), l) : rhs;
                 return b.binary(bin.op == B::LogicalAnd ? T::Land : T::Lor, lp, rp, l);
             }
             case B::LogicalEquivalence: {
                 // Real operand reduction mirrors LogicalAnd/LogicalOr above.
                 // <-> does not short-circuit (LRM 11.3.5), so lhs/rhs here are
                 // already the eagerly lowered operands lower_binary passed in.
-                const ir::Index lp = bin.left().type->isFloating()
-                                       ? b.binary(T::FNe, lhs, real_zero(bin.left(), b, l), l)
-                                       : lhs;
-                const ir::Index rp = bin.right().type->isFloating()
-                                       ? b.binary(T::FNe, rhs, real_zero(bin.right(), b, l), l)
-                                       : rhs;
+                const ir::Index lp =
+                  bin.left().type->isFloating() ? b.binary(T::FNe, lhs, real_zero(bin.left(), b, l), l) : lhs;
+                const ir::Index rp =
+                  bin.right().type->isFloating() ? b.binary(T::FNe, rhs, real_zero(bin.right(), b, l), l) : rhs;
                 return b.binary(T::Lequiv, lp, rp, l);
             }
             default:
@@ -10873,8 +10993,7 @@ private:
         // ?: as short-circuiting; <-> "shall be evaluated exactly once" per
         // operand, so it falls through to the eager path below like any other
         // binary op (see the LogicalEquivalence case further down).
-        if (bin.op == B::LogicalAnd || bin.op == B::LogicalOr ||
-            bin.op == B::LogicalImplication) {
+        if (bin.op == B::LogicalAnd || bin.op == B::LogicalOr || bin.op == B::LogicalImplication) {
             return lower_short_circuit(bin, b);
         }
 
@@ -10886,21 +11005,18 @@ private:
         // Conversion, so the aggregate type is on the unwrapped operand.
         if ((bin.op == B::Equality || bin.op == B::Inequality) &&
             (is_unpacked_struct(*unwrap_conversion(bin.left()).type) ||
-             unwrap_conversion(bin.left()).type->getCanonicalType().as_if<
-                 slang::ast::FixedSizeUnpackedArrayType>() != nullptr ||
-             is_queue(unwrap_conversion(bin.left())) ||
-             is_dyn_array(unwrap_conversion(bin.left())))) {
+             unwrap_conversion(bin.left()).type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() !=
+               nullptr ||
+             is_queue(unwrap_conversion(bin.left())) || is_dyn_array(unwrap_conversion(bin.left())))) {
             // A whole queue / dynamic-array compare (LRM 11.2.2) also reduces to a
             // per-element walk with §11.4.5 x-propagation; the AggEq expansion
             // dispatches the handle leaf to the runtime element compare.
-            const ir::SourceLoc l   = loc(bin);
-            const ir::Index     acc = lower_struct_eq(unwrap_conversion(bin.left()),
-                                                      unwrap_conversion(bin.right()), b, l);
+            const ir::SourceLoc l = loc(bin);
+            const ir::Index acc = lower_struct_eq(unwrap_conversion(bin.left()), unwrap_conversion(bin.right()), b, l);
             return bin.op == B::Equality ? acc : b.unary(ir::Inst::Tag::Lnot, acc, l);
         }
 
-        if (bin.left().kind == ExpressionKind::TypeReference ||
-            bin.right().kind == ExpressionKind::TypeReference) {
+        if (bin.left().kind == ExpressionKind::TypeReference || bin.right().kind == ExpressionKind::TypeReference) {
             // type(a) == type(b) (LRM 6.23): a type reference is a compile-time
             // marker, not a value -- slang restricts this expression kind to
             // exactly this position (an equality/case-equality comparison with
@@ -10908,15 +11024,14 @@ private:
             // (handled separately in lower_case), so both operands are
             // guaranteed TypeReference here; mirrors slang's own constant fold
             // in BinaryExpression::evalImpl.
-            if (bin.left().kind != ExpressionKind::TypeReference ||
-                bin.right().kind != ExpressionKind::TypeReference ||
+            if (bin.left().kind != ExpressionKind::TypeReference || bin.right().kind != ExpressionKind::TypeReference ||
                 (bin.op != B::Equality && bin.op != B::Inequality && bin.op != B::CaseEquality &&
                  bin.op != B::CaseInequality)) {
                 fail("type() is only supported in an equality comparison with another type()");
             }
             const bool matches = bin.left().as<TypeReferenceExpression>().targetType.isMatching(
-                bin.right().as<TypeReferenceExpression>().targetType);
-            const bool result  = (bin.op == B::Equality || bin.op == B::CaseEquality) ? matches : !matches;
+              bin.right().as<TypeReferenceExpression>().targetType);
+            const bool result = (bin.op == B::Equality || bin.op == B::CaseEquality) ? matches : !matches;
             return b.constant(module_.pool.put_int(make_int_type(1, false, false), result ? 1 : 0), loc(bin));
         }
 
@@ -11106,22 +11221,21 @@ private:
                 fail("expected constant unpacked-array slice bounds");
             }
             const slang::ConstantRange base_range =
-                rs.value().type->getCanonicalType().as<slang::ast::FixedSizeUnpackedArrayType>().range;
+              rs.value().type->getCanonicalType().as<slang::ast::FixedSizeUnpackedArrayType>().range;
             // Storage position of the slice's first element (its left bound) in
             // the base array: coordinate `left` maps to position 0 at the base's
             // own left bound (the backend's element normalization), for either
             // endianness.
-            const uint32_t first_pos =
-                base_range.left <= base_range.right
-                    ? static_cast<uint32_t>(*lo - base_range.left)
-                    : static_cast<uint32_t>(base_range.left - *lo);
+            const uint32_t first_pos = base_range.left <= base_range.right
+                                         ? static_cast<uint32_t>(*lo - base_range.left)
+                                         : static_cast<uint32_t>(base_range.left - *lo);
             return b.arr_slice(base, lower_type(*rs.type), first_pos, l);
         }
         // A range select on a multi-dim packed array picks whole W-wide elements
         // (LRM 7.4.6): both bounds and the width scale by the element width W.
         // W is 1 for an ordinary vector, leaving the bit-select math unchanged.
-        const auto* pa = rs.value().type->getCanonicalType().as_if<slang::ast::PackedArrayType>();
-        const uint32_t w = pa != nullptr ? static_cast<uint32_t>(pa->elementType.getBitWidth()) : 1;
+        const auto*                pa    = rs.value().type->getCanonicalType().as_if<slang::ast::PackedArrayType>();
+        const uint32_t             w     = pa != nullptr ? static_cast<uint32_t>(pa->elementType.getBitWidth()) : 1;
         const slang::ConstantRange range = packed_range_of(rs.value());
         if (rs.getSelectionKind() == RangeSelectionKind::Simple) {
             const std::optional<int32_t> left  = try_const_int(rs.left());
@@ -11146,10 +11260,10 @@ private:
         // out-of-range or X/Z base is bounds-checked in the backend per LRM
         // 11.5.1 (out-of-range read -> X, write -> no-op; a fully-out-of-range
         // W-wide window fills X / no-ops as a whole).
-        const auto    count = static_cast<uint32_t>(const_uint(rs.right()));
-        const bool    down  = rs.getSelectionKind() == RangeSelectionKind::IndexedDown;
-        const int32_t bias  = down == range.isDescending() ? static_cast<int32_t>(count) - 1 : 0;
-        const ir::Index off = lower_packed_offset(rs.left(), range, bias, b, l, w);
+        const auto      count = static_cast<uint32_t>(const_uint(rs.right()));
+        const bool      down  = rs.getSelectionKind() == RangeSelectionKind::IndexedDown;
+        const int32_t   bias  = down == range.isDescending() ? static_cast<int32_t>(count) - 1 : 0;
+        const ir::Index off   = lower_packed_offset(rs.left(), range, bias, b, l, w);
         return b.dyn_part_select(base, off, count * w, l);
     }
 
@@ -11160,8 +11274,10 @@ private:
     // bit is the normalized element offset scaled by W. Nested selects compose
     // for free: the result type slang assigns to `a[i]` carries the inner range,
     // which a further select indexes the same way (part-select-of-part-select).
-    ir::Index lower_packed_element_lvalue(const ElementSelectExpression& es, ir::Index base,
-                                          ir::Builder& b, ir::SourceLoc l) {
+    ir::Index lower_packed_element_lvalue(const ElementSelectExpression& es,
+                                          ir::Index                      base,
+                                          ir::Builder&                   b,
+                                          ir::SourceLoc                  l) {
         const auto w = static_cast<uint32_t>(es.type->getBitWidth());
         if (w == 1) {
             return b.binary(ir::Inst::Tag::BitSelect, base, packed_bit_index(es, b, l), l);
@@ -11206,29 +11322,27 @@ private:
     // and a folded parameter of the same expression produce identical bits
     // (docs/design/tagged-unions.md).
     ir::Index lower_tagged_union_set(const slang::ast::TaggedUnionExpression& tu, ir::Builder& b) {
-        const ir::SourceLoc     l    = loc(tu);
-        const slang::ast::Type& ct   = tu.type->getCanonicalType();
-        const auto              lay  = module_.pool.layout(lower_type(*tu.type));
-        const bool              four = lay.domain == ir::Domain::Four;
+        const ir::SourceLoc     l        = loc(tu);
+        const slang::ast::Type& ct       = tu.type->getCanonicalType();
+        const auto              lay      = module_.pool.layout(lower_type(*tu.type));
+        const bool              four     = lay.domain == ir::Domain::Four;
         const uint32_t          tag_bits = union_tag_bits(ct);
         const auto&             field    = tu.member.as<FieldSymbol>();
-        const uint32_t member_w = static_cast<uint32_t>(field.getType().getBitWidth());
+        const uint32_t          member_w = static_cast<uint32_t>(field.getType().getBitWidth());
 
         std::vector<ir::Index> parts;
         if (tag_bits != 0) {
-            parts.push_back(b.constant(
-              module_.pool.put_int(make_int_type(tag_bits, four, false), field.fieldIndex), l));
+            parts.push_back(
+              b.constant(module_.pool.put_int(make_int_type(tag_bits, four, false), field.fieldIndex), l));
         }
         if (const uint32_t gap_w = lay.width - tag_bits - member_w; gap_w != 0) {
-            parts.push_back(b.constant(
-              four ? svint_to_ref(slang::SVInt::createFillX(gap_w, false),
-                                  make_int_type(gap_w, true, false))
-                   : module_.pool.put_int(make_int_type(gap_w, false, false), 0),
-              l));
+            parts.push_back(
+              b.constant(four ? svint_to_ref(slang::SVInt::createFillX(gap_w, false), make_int_type(gap_w, true, false))
+                              : module_.pool.put_int(make_int_type(gap_w, false, false), 0),
+                         l));
         }
         if (member_w != 0) {
-            parts.push_back(
-              b.resize(lower_expr(*tu.valueExpr, b), make_int_type(member_w, four, false), l));
+            parts.push_back(b.resize(lower_expr(*tu.valueExpr, b), make_int_type(member_w, four, false), l));
         }
         return b.concat(parts, l);
     }
@@ -11237,8 +11351,11 @@ private:
     // A direct member write `u.m = e` (LRM 7.3.2) sets the payload AND the tag,
     // unlike a plain union where a member store leaves the rest untouched. No-op
     // for a union with no tag bits (single-member).
-    void store_union_tag(const Expression& union_expr, uint32_t idx, ir::Inst::Tag tag,
-                         ir::Builder& b, ir::SourceLoc l) {
+    void store_union_tag(const Expression& union_expr,
+                         uint32_t          idx,
+                         ir::Inst::Tag     tag,
+                         ir::Builder&      b,
+                         ir::SourceLoc     l) {
         const slang::ast::Type& ct       = union_expr.type->getCanonicalType();
         const uint32_t          tag_bits = union_tag_bits(ct);
         if (tag_bits == 0) {
@@ -11249,8 +11366,7 @@ private:
         const bool      four = lay.domain == ir::Domain::Four;
         const ir::Index base = lower_lvalue(union_expr, b);
         const ir::Index sel  = b.part_select(base, lay.width - 1, lay.width - tag_bits, l);
-        const ir::Index tagc =
-          b.constant(module_.pool.put_int(make_int_type(tag_bits, four, false), idx), l);
+        const ir::Index tagc = b.constant(module_.pool.put_int(make_int_type(tag_bits, four, false), idx), l);
         b.binary(tag, sel, tagc, l);
     }
 
@@ -11268,9 +11384,12 @@ private:
     // 12.6.1): CaseEq (`case` / `if` / `?:`, exact 4-state), CasezEq (`casez`,
     // z wildcard), or CasexEq (`casex`, x/z wildcard). It governs every bit
     // comparison the pattern generates — the tag compare and each Constant leaf.
-    ir::Index lower_pattern(const slang::ast::Pattern& pat, ir::Index subject,
-                            const slang::ast::Type& sty, ir::Inst::Tag cmp, ir::Builder& b,
-                            ir::SourceLoc l) {
+    ir::Index lower_pattern(const slang::ast::Pattern& pat,
+                            ir::Index                  subject,
+                            const slang::ast::Type&    sty,
+                            ir::Inst::Tag              cmp,
+                            ir::Builder&               b,
+                            ir::SourceLoc              l) {
         using PK = slang::ast::PatternKind;
         switch (pat.kind) {
             case PK::Wildcard:
@@ -11280,8 +11399,7 @@ private:
                 const auto& var = pat.as<slang::ast::VariablePattern>().variable;
                 declare_storage(var, /*force_frame*/ true);
                 const ir::Index slot = value_lvalue(var, b, l);
-                b.binary(ir::Inst::Tag::Store, slot,
-                         b.resize(subject, lower_type(var.getType()), l), l);
+                b.binary(ir::Inst::Tag::Store, slot, b.resize(subject, lower_type(var.getType()), l), l);
                 return true_const(b, l);
             }
             case PK::Constant: {
@@ -11300,23 +11418,21 @@ private:
                 const uint32_t tag_bits = union_tag_bits(sty);
                 ir::Index      tag_pred = true_const(b, l);
                 if (tag_bits != 0) {
-                    const auto     lay  = module_.pool.layout(lower_type(sty));
-                    const bool     four = lay.domain == ir::Domain::Four;
-                    const ir::Ref  tt   = make_int_type(tag_bits, four, false);
-                    const ir::Index sh  = b.constant(
-                      module_.pool.put_int(make_int_type(32, false, false), lay.width - tag_bits), l);
+                    const auto      lay  = module_.pool.layout(lower_type(sty));
+                    const bool      four = lay.domain == ir::Domain::Four;
+                    const ir::Ref   tt   = make_int_type(tag_bits, four, false);
+                    const ir::Index sh =
+                      b.constant(module_.pool.put_int(make_int_type(32, false, false), lay.width - tag_bits), l);
                     const ir::Index tagv = b.resize(b.binary(ir::Inst::Tag::Srl, subject, sh, l), tt, l);
-                    const ir::Index idx  = b.constant(
-                      module_.pool.put_int(tt, tp.member.fieldIndex), l);
-                    tag_pred = b.binary(cmp, tagv, idx, l);
+                    const ir::Index idx  = b.constant(module_.pool.put_int(tt, tp.member.fieldIndex), l);
+                    tag_pred             = b.binary(cmp, tagv, idx, l);
                 }
                 if (tp.valuePattern == nullptr) {
-                    return tag_pred;  // void member: tag match is the whole test.
+                    return tag_pred; // void member: tag match is the whole test.
                 }
-                const slang::ast::Type& mt = tp.member.getType();
-                const ir::Index payload    = b.resize(subject, lower_type(mt), l);
-                const ir::Index sub_pred =
-                  lower_pattern(*tp.valuePattern, payload, mt.getCanonicalType(), cmp, b, l);
+                const slang::ast::Type& mt      = tp.member.getType();
+                const ir::Index         payload = b.resize(subject, lower_type(mt), l);
+                const ir::Index sub_pred = lower_pattern(*tp.valuePattern, payload, mt.getCanonicalType(), cmp, b, l);
                 return b.binary(ir::Inst::Tag::Land, tag_pred, sub_pred, l);
             }
             case PK::Structure: {
@@ -11329,14 +11445,13 @@ private:
                 const auto& sp  = pat.as<slang::ast::StructurePattern>();
                 ir::Index   acc = true_const(b, l);
                 for (const auto& fp : sp.patterns) {
-                    const slang::ast::Type& ft  = fp.field->getType();
-                    const ir::Index         sh  = b.constant(
-                      module_.pool.put_int(make_int_type(32, false, false),
-                                           static_cast<uint32_t>(fp.field->bitOffset)), l);
-                    const ir::Index fv =
-                      b.resize(b.binary(ir::Inst::Tag::Srl, subject, sh, l), lower_type(ft), l);
-                    acc = b.binary(ir::Inst::Tag::Land, acc,
-                                   lower_pattern(*fp.pattern, fv, ft.getCanonicalType(), cmp, b, l), l);
+                    const slang::ast::Type& ft = fp.field->getType();
+                    const ir::Index         sh = b.constant(
+                      module_.pool.put_int(make_int_type(32, false, false), static_cast<uint32_t>(fp.field->bitOffset)),
+                      l);
+                    const ir::Index fv = b.resize(b.binary(ir::Inst::Tag::Srl, subject, sh, l), lower_type(ft), l);
+                    acc                = b.binary(
+                      ir::Inst::Tag::Land, acc, lower_pattern(*fp.pattern, fv, ft.getCanonicalType(), cmp, b, l), l);
                 }
                 return acc;
             }
@@ -11366,15 +11481,19 @@ private:
     // Templated over the Condition type: ConditionalStatement::Condition and
     // ConditionalExpression::Condition are distinct nested structs with the same
     // { expr, pattern } shape (the `if` and `?:` forms), so one body serves both.
-    template <typename Cond>
+    template<typename Cond>
     ir::Index lower_conditions(std::span<const Cond> conds, ir::Builder& b, ir::SourceLoc l) {
-        ir::Index acc = ir::Index{};
+        ir::Index acc  = ir::Index{};
         bool      have = false;
         for (const auto& cond : conds) {
             ir::Index p;
             if (cond.pattern != nullptr) {
-                p = lower_pattern(*cond.pattern, lower_expr(*cond.expr, b),
-                                  cond.expr->type->getCanonicalType(), ir::Inst::Tag::CaseEq, b, l);
+                p = lower_pattern(*cond.pattern,
+                                  lower_expr(*cond.expr, b),
+                                  cond.expr->type->getCanonicalType(),
+                                  ir::Inst::Tag::CaseEq,
+                                  b,
+                                  l);
             } else {
                 p = lower_predicate(*cond.expr, b);
             }
@@ -11413,11 +11532,13 @@ private:
 
     // Compute a pattern item's match predicate (tag/field tests) AND-ed with its
     // optional `&&& filter`, binding the pattern's variables as a side effect.
-    ir::Index lower_pattern_item_pred(const slang::ast::PatternCaseStatement& c,
+    ir::Index lower_pattern_item_pred(const slang::ast::PatternCaseStatement&            c,
                                       const slang::ast::PatternCaseStatement::ItemGroup& item,
-                                      ir::Index subject, ir::Builder& b, ir::SourceLoc l) {
-        ir::Index pred = lower_pattern(*item.pattern, subject, c.expr.type->getCanonicalType(),
-                                       pattern_cmp(c.condition), b, l);
+                                      ir::Index                                          subject,
+                                      ir::Builder&                                       b,
+                                      ir::SourceLoc                                      l) {
+        ir::Index pred =
+          lower_pattern(*item.pattern, subject, c.expr.type->getCanonicalType(), pattern_cmp(c.condition), b, l);
         if (item.filter != nullptr) {
             // `&&& filter` — evaluated after the pattern's bindings are in scope.
             pred = b.binary(ir::Inst::Tag::Land, pred, lower_predicate(*item.filter, b), l);
@@ -11425,8 +11546,10 @@ private:
         return pred;
     }
 
-    void lower_pattern_case_item(const slang::ast::PatternCaseStatement& c, size_t k,
-                                 ir::Index subject, ir::Builder& b) {
+    void lower_pattern_case_item(const slang::ast::PatternCaseStatement& c,
+                                 size_t                                  k,
+                                 ir::Index                               subject,
+                                 ir::Builder&                            b) {
         const ir::SourceLoc l = loc(c);
         if (k == c.items.size()) {
             if (c.defaultCase != nullptr) {
@@ -11454,12 +11577,11 @@ private:
     // mirroring lower_case_unique over pattern items. Binding all items' pattern
     // vars up front is harmless (pure sub-value extraction, each read only in its
     // own arm).
-    void lower_pattern_case_checked(const slang::ast::PatternCaseStatement& c, ir::Index subject,
-                                    ir::Builder& b) {
-        using Check           = slang::ast::UniquePriorityCheck;
-        const ir::SourceLoc l = loc(c);
-        const std::string banner = banner_at(c.sourceRange.start());
-        const bool no_match_report =
+    void lower_pattern_case_checked(const slang::ast::PatternCaseStatement& c, ir::Index subject, ir::Builder& b) {
+        using Check                = slang::ast::UniquePriorityCheck;
+        const ir::SourceLoc l      = loc(c);
+        const std::string   banner = banner_at(c.sourceRange.start());
+        const bool          no_match_report =
           (c.check == Check::Priority || c.check == Check::Unique) && c.defaultCase == nullptr;
         const bool needs_overlap = c.check == Check::Unique || c.check == Check::Unique0;
 
@@ -11478,9 +11600,13 @@ private:
     // predicates: item k's body runs when preds[k] is the first true one. The
     // terminal runs the default, else emits the no-match report when requested
     // (priority / unique with no default).
-    void dispatch_pattern_preds(const slang::ast::PatternCaseStatement& c, size_t k,
-                                const std::vector<ir::Index>& preds, bool no_match_report,
-                                const std::string& banner, ir::SourceLoc rloc, ir::Builder& b) {
+    void dispatch_pattern_preds(const slang::ast::PatternCaseStatement& c,
+                                size_t                                  k,
+                                const std::vector<ir::Index>&           preds,
+                                bool                                    no_match_report,
+                                const std::string&                      banner,
+                                ir::SourceLoc                           rloc,
+                                ir::Builder&                            b) {
         if (k == c.items.size()) {
             if (c.defaultCase != nullptr) {
                 lower_stmt(*c.defaultCase, b);
@@ -11602,8 +11728,8 @@ private:
     // Folded with slang against the current instance scope so parameterized
     // widths, replication counts and part-select bounds resolve to a value.
     uint64_t const_uint(const Expression& e) {
-        slang::ast::ASTContext  astCtx(*scope_, slang::ast::LookupLocation::max);
-        slang::ast::EvalContext evalCtx(astCtx);
+        slang::ast::ASTContext     astCtx(*scope_, slang::ast::LookupLocation::max);
+        slang::ast::EvalContext    evalCtx(astCtx);
         const slang::ConstantValue cv = e.eval(evalCtx);
         if (!cv.isInteger()) {
             fail("expected a constant integer");
@@ -11614,8 +11740,8 @@ private:
     // Constant-fold an integer expression against the current scope; nullopt
     // when it is non-constant (a runtime index) or holds X/Z bits.
     std::optional<int32_t> try_const_int(const Expression& e) {
-        slang::ast::ASTContext  astCtx(*scope_, slang::ast::LookupLocation::max);
-        slang::ast::EvalContext evalCtx(astCtx);
+        slang::ast::ASTContext     astCtx(*scope_, slang::ast::LookupLocation::max);
+        slang::ast::EvalContext    evalCtx(astCtx);
         const slang::ConstantValue cv = e.eval(evalCtx);
         if (!cv.isInteger()) {
             return std::nullopt;
@@ -11649,8 +11775,12 @@ private:
     // value. The stride multiply is built in `off_ty` so it shares the offset's
     // domain (a 4-state offset is physically wider than a 2-state constant, so a
     // mismatched-domain Mul operand would be an invalid instruction).
-    ir::Index lower_packed_offset(const Expression& idx, slang::ConstantRange range, int32_t bias,
-                                  ir::Builder& b, ir::SourceLoc l, uint32_t stride = 1) {
+    ir::Index lower_packed_offset(const Expression&    idx,
+                                  slang::ConstantRange range,
+                                  int32_t              bias,
+                                  ir::Builder&         b,
+                                  ir::SourceLoc        l,
+                                  uint32_t             stride = 1) {
         if (const std::optional<int32_t> c = try_const_int(idx)) {
             const auto off = static_cast<uint32_t>((range.translateIndex(*c) - bias) * static_cast<int32_t>(stride));
             return b.constant(module_.pool.put_int(make_int_type(32, false, false), off), l);
@@ -11660,20 +11790,22 @@ private:
         ir::Index       off;
         if (range.isDescending()) {
             const int32_t sub = range.right + bias; // off = idx - right - bias
-            off = sub == 0 ? v
-                           : b.binary(ir::Inst::Tag::Sub, v,
-                                      b.constant(module_.pool.put_int(off_ty, static_cast<uint32_t>(sub)), l), l);
+            off =
+              sub == 0
+                ? v
+                : b.binary(
+                    ir::Inst::Tag::Sub, v, b.constant(module_.pool.put_int(off_ty, static_cast<uint32_t>(sub)), l), l);
         } else {
             // Big-endian: off = (right - bias) - idx.
             off = b.binary(ir::Inst::Tag::Sub,
                            b.constant(module_.pool.put_int(off_ty, static_cast<uint32_t>(range.right - bias)), l),
-                           v, l);
+                           v,
+                           l);
         }
         if (stride == 1) {
             return off;
         }
-        return b.binary(ir::Inst::Tag::Mul, off,
-                        b.constant(module_.pool.put_int(off_ty, stride), l), l);
+        return b.binary(ir::Inst::Tag::Mul, off, b.constant(module_.pool.put_int(off_ty, stride), l), l);
     }
 
     // Normalized bit offset for a 1-bit element select on a packed value.
@@ -11741,10 +11873,10 @@ private:
             return it->second;
         }
         ir::SignalInfo info;
-        info.name = prefix_ + fn_ctx_->name_prefix + std::string(vs.name);
-        info.loc  = to_source_loc(vs.location);
-        info.type = lower_type(vs.getType());
-        info.dir  = ir::SignalInfo::Direction::Internal;
+        info.name            = prefix_ + fn_ctx_->name_prefix + std::string(vs.name);
+        info.loc             = to_source_loc(vs.location);
+        info.type            = lower_type(vs.getType());
+        info.dir             = ir::SignalInfo::Direction::Internal;
         const ir::Signal sig = register_signal(std::move(info));
         sigmap_[&vs]         = sig;
 
@@ -11767,7 +11899,7 @@ private:
         if (const slang::ast::Scope* sc = prop.getParentScope()) {
             cls = std::string(sc->asSymbol().name) + "::";
         }
-        const ir::Ref pty = lower_type(prop.getType());
+        const ir::Ref  pty = lower_type(prop.getType());
         ir::SignalInfo info;
         info.name            = prefix_ + cls + std::string(prop.name);
         info.loc             = to_source_loc(prop.location);
@@ -11789,8 +11921,8 @@ private:
             }
             ir::Builder&        pb = *preinit_;
             const ir::SourceLoc il = loc(*init);
-            pb.binary(ir::Inst::Tag::Store, pb.signal(sig, il),
-                      coerce(lower_expr(*init, pb), *init->type, pty, pb, il), il);
+            pb.binary(
+              ir::Inst::Tag::Store, pb.signal(sig, il), coerce(lower_expr(*init, pb), *init->type, pty, pb, il), il);
         }
         return sig;
     }
@@ -11848,8 +11980,8 @@ private:
                 if (const auto* prop = vs.as_if<slang::ast::ClassPropertySymbol>()) {
                     // A bare property reference inside a method (implicit `this`):
                     // load the `this` handle (Local 0) and select the property.
-                    const ir::Index handle = b.unary(
-                      ir::Inst::Tag::Load, b.local(fn_ctx_->this_local, fn_ctx_->this_class, l), l);
+                    const ir::Index handle =
+                      b.unary(ir::Inst::Tag::Load, b.local(fn_ctx_->this_local, fn_ctx_->this_class, l), l);
                     return class_member_lvalue(handle, *prop, fn_ctx_->this_class, b, l);
                 }
             }
@@ -11889,9 +12021,7 @@ private:
             // A string result needs no width resize (slang already converted).
             const ir::Index v = lower_expr(*r.expr, b);
             b.unary(ir::Inst::Tag::Ret,
-                    is_string_ref(fn_ctx_->ret_type)
-                      ? v
-                      : coerce(v, *r.expr->type, fn_ctx_->ret_type, b, l),
+                    is_string_ref(fn_ctx_->ret_type) ? v : coerce(v, *r.expr->type, fn_ctx_->ret_type, b, l),
                     l);
         } else if (fn_ctx_->has_ret_local) {
             // `return;` in a non-void function yields the current function-var value:
@@ -11902,8 +12032,7 @@ private:
                 return;
             }
             const ir::Index rv = ret_var_ref(*fn_ctx_, l, b);
-            b.unary(ir::Inst::Tag::Ret,
-                    is_handle_ref(fn_ctx_->ret_type) ? rv : b.unary(ir::Inst::Tag::Load, rv, l), l);
+            b.unary(ir::Inst::Tag::Ret, is_handle_ref(fn_ctx_->ret_type) ? rv : b.unary(ir::Inst::Tag::Load, rv, l), l);
         } else {
             b.ret_void(l);
         }
@@ -12029,14 +12158,12 @@ private:
             // Open array (LRM 35.5.6.2): an unsized `[]` formal arrives as an
             // svOpenArrayHandle. The element's own DpiCType is recorded separately;
             // the bounds/storage come from the actual at each call.
-            if (const auto* oa =
-                    fa->getType().getCanonicalType().as_if<slang::ast::DPIOpenArrayType>()) {
+            if (const auto* oa = fa->getType().getCanonicalType().as_if<slang::ast::DPIOpenArrayType>()) {
                 // input / output / inout all supported: the C reads (input/inout) and
                 // writes (output/inout) elements through svGet/PutArrElem. The backend
                 // marshals in before the call and back out after (or, for a named-
                 // scalar zero-copy element, the C writes the design array directly).
-                build_dpi_open_array_arg(*oa, to_arg_dir(fa->direction), param_types,
-                                         arg_dirs, arg_cts, arg_elem_cts);
+                build_dpi_open_array_arg(*oa, to_arg_dir(fa->direction), param_types, arg_dirs, arg_cts, arg_elem_cts);
                 continue;
             }
             const auto c = dpi_ctype(fa->getType());
@@ -12085,19 +12212,20 @@ private:
         // early-returns for a DPI import — so they are phantom slots.
         std::vector<ir::Ref> local_types = param_types;
 
-        module_.set_function(id, ir::Function{ .name           = std::string(sub.name),
-                                               .return_type    = ret_ty,
-                                               .param_types    = std::move(param_types),
-                                               .arg_dirs       = std::move(arg_dirs),
-                                               .local_types    = std::move(local_types),
-                                               .is_dpi         = true,
-                                               .is_pure        = sub.flags.has(MethodFlags::Pure),
-                                               .extern_name    = std::move(cid),
-                                               .dpi_arg_ctypes = std::move(arg_cts),
-                                               .dpi_ret_ctype  = ret_ct,
-                                               .dpi_arg_elem_ctypes = std::move(arg_elem_cts),
-                                               .span           = span_of(sub),
-                                               .ir             = b.finish() });
+        module_.set_function(id,
+                             ir::Function{ .name                = std::string(sub.name),
+                                           .return_type         = ret_ty,
+                                           .param_types         = std::move(param_types),
+                                           .arg_dirs            = std::move(arg_dirs),
+                                           .local_types         = std::move(local_types),
+                                           .is_dpi              = true,
+                                           .is_pure             = sub.flags.has(MethodFlags::Pure),
+                                           .extern_name         = std::move(cid),
+                                           .dpi_arg_ctypes      = std::move(arg_cts),
+                                           .dpi_ret_ctype       = ret_ct,
+                                           .dpi_arg_elem_ctypes = std::move(arg_elem_cts),
+                                           .span                = span_of(sub),
+                                           .ir                  = b.finish() });
     }
 
     // Classify a 1-D DPI open-array formal (LRM 35.5.6.2). Records DpiCType::OpenArray
@@ -12106,11 +12234,12 @@ private:
     // type at each call, but the whole-function scans want a benign non-handle Ref).
     // 1-D, with a marshalable element (named scalar / packed bit / packed logic), in
     // any direction; everything else loud-fails.
-    void build_dpi_open_array_arg(const slang::ast::DPIOpenArrayType& oa, ir::ArgDir dir,
-                                  std::vector<ir::Ref>&      param_types,
-                                  std::vector<ir::ArgDir>&   arg_dirs,
-                                  std::vector<ir::DpiCType>& arg_cts,
-                                  std::vector<ir::DpiCType>& arg_elem_cts) {
+    void build_dpi_open_array_arg(const slang::ast::DPIOpenArrayType& oa,
+                                  ir::ArgDir                          dir,
+                                  std::vector<ir::Ref>&               param_types,
+                                  std::vector<ir::ArgDir>&            arg_dirs,
+                                  std::vector<ir::DpiCType>&          arg_cts,
+                                  std::vector<ir::DpiCType>&          arg_elem_cts) {
         const slang::ast::Type& elem = oa.elementType.getCanonicalType();
         if (elem.isUnpackedArray() || elem.getCanonicalType().as_if<slang::ast::DPIOpenArrayType>()) {
             // TODO: multi-dimensional open array (element itself an array). Deferred —
@@ -12123,9 +12252,8 @@ private:
         // bit/logic vectors (marshalled via rt_dpi_pack_arr_*). Scalar bit/logic, real,
         // string, chandle elements are deferred (docs/design/dpi-c.md).
         const bool ok = ec.has_value() &&
-                        (*ec == ir::DpiCType::Byte || *ec == ir::DpiCType::Shortint ||
-                         *ec == ir::DpiCType::Int || *ec == ir::DpiCType::Longint ||
-                         *ec == ir::DpiCType::BitVec || *ec == ir::DpiCType::LogicVec);
+                        (*ec == ir::DpiCType::Byte || *ec == ir::DpiCType::Shortint || *ec == ir::DpiCType::Int ||
+                         *ec == ir::DpiCType::Longint || *ec == ir::DpiCType::BitVec || *ec == ir::DpiCType::LogicVec);
         if (!ok) {
             fail("DPI open-array element type is not supported (byte/shortint/int/"
                  "longint or packed bit/logic vector only)");
@@ -12159,8 +12287,8 @@ public:
             ir::DpiCType ret_ct = ir::DpiCType::Void;
             if (!sub.getReturnType().isVoid()) {
                 const auto c = dpi_ctype(sub.getReturnType());
-                if (!c.has_value() || *c == ir::DpiCType::BitVec ||
-                    *c == ir::DpiCType::LogicVec || *c == ir::DpiCType::String) {
+                if (!c.has_value() || *c == ir::DpiCType::BitVec || *c == ir::DpiCType::LogicVec ||
+                    *c == ir::DpiCType::String) {
                     // slang rejects a packed-array return; a string return is deferred
                     // (the returned char* would dangle past the thunk).
                     fail("DPI export return type is not supported "
@@ -12179,8 +12307,7 @@ public:
                     fail("DPI export argument type is not supported "
                          "(open-array / unpacked aggregate)");
                 }
-                if (*c == ir::DpiCType::String &&
-                    fa->direction != slang::ast::ArgumentDirection::In) {
+                if (*c == ir::DpiCType::String && fa->direction != slang::ast::ArgumentDirection::In) {
                     // TODO: output / inout string (unbounded C-written char*).
                     fail("DPI export output/inout string arguments are not supported");
                 }
@@ -12188,8 +12315,8 @@ public:
                 arg_dirs.push_back(to_arg_dir(fa->direction));
             }
             const ir::FunctionId id = function_id(sub); // force-lower the SV function
-            module_.dpi_exports.push_back(ir::DpiExport{
-              id, std::string(ex.cIdentifier), std::move(arg_cts), std::move(arg_dirs), ret_ct });
+            module_.dpi_exports.push_back(
+              ir::DpiExport{ id, std::string(ex.cIdentifier), std::move(arg_cts), std::move(arg_dirs), ret_ct });
         }
     }
 
@@ -12231,8 +12358,7 @@ private:
                 }
                 continue;
             }
-            if (dir != slang::ast::ArgumentDirection::In &&
-                fa->getType().getCanonicalType().isString()) {
+            if (dir != slang::ast::ArgumentDirection::In && fa->getType().getCanonicalType().isString()) {
                 // TODO: output / inout string formals (the copy-out path passes
                 // plane pointers, not string handles).
                 fail("output/inout string arguments are not supported");
@@ -12272,7 +12398,8 @@ private:
     // free subroutine (thisVar == nullptr) is a no-op. `this` is an In pointer passed
     // by value (reference semantics): it must NOT take the aggregate copy-in, and
     // does not — a class handle is a scalar i64, routed through the scalar-arg ABI.
-    void splice_this(const SubroutineSymbol& sub, std::vector<ir::Ref>& param_types,
+    void splice_this(const SubroutineSymbol&  sub,
+                     std::vector<ir::Ref>&    param_types,
                      std::vector<ir::ArgDir>& arg_dirs) {
         if (sub.thisVar == nullptr) {
             return;
@@ -12290,8 +12417,11 @@ private:
     // dereference the handle to the object body, then a MemberSelect on the
     // property's field index. Shared by member access (`obj.prop`) and a bare
     // property reference inside a method (rooted at `this`).
-    ir::Index class_member_lvalue(ir::Index handle_val, const slang::ast::Symbol& prop,
-                                  ir::Ref class_ref, ir::Builder& b, ir::SourceLoc l) {
+    ir::Index class_member_lvalue(ir::Index                 handle_val,
+                                  const slang::ast::Symbol& prop,
+                                  ir::Ref                   class_ref,
+                                  ir::Builder&              b,
+                                  ir::SourceLoc             l) {
         const ir::Index body = b.handle_deref(handle_val, class_ref, l);
         return b.member_select(body, class_prop_index_.at(&prop), class_ref, l);
     }
@@ -12310,8 +12440,8 @@ private:
         fn_ctx_         = &ctx;
         std::vector<std::string_view> saved_blocks;
         saved_blocks.swap(named_blocks_);
-        ir::Builder          b(module_.pool);
-        std::vector<ir::Ref> param_types;
+        ir::Builder             b(module_.pool);
+        std::vector<ir::Ref>    param_types;
         std::vector<ir::ArgDir> arg_dirs;
 
         // A class method (LRM 8.11): splice the implicit `this` handle as formal 0,
@@ -12334,14 +12464,15 @@ private:
         const ir::SourceLoc el = to_source_loc(sub.location);
         b.ret_void(el);
 
-        module_.set_function(id, ir::Function{ .name        = std::string(sub.name),
-                                               .return_type = module_.pool.void_type,
-                                               .param_types = std::move(param_types),
-                                               .arg_dirs    = std::move(arg_dirs),
-                                               .local_types = std::move(ctx.local_types),
-                                               .is_task     = true,
-                                               .span        = span_of(sub),
-                                               .ir          = b.finish() });
+        module_.set_function(id,
+                             ir::Function{ .name        = std::string(sub.name),
+                                           .return_type = module_.pool.void_type,
+                                           .param_types = std::move(param_types),
+                                           .arg_dirs    = std::move(arg_dirs),
+                                           .local_types = std::move(ctx.local_types),
+                                           .is_task     = true,
+                                           .span        = span_of(sub),
+                                           .ir          = b.finish() });
         named_blocks_.swap(saved_blocks);
         fn_ctx_ = saved;
     }
@@ -12370,14 +12501,15 @@ private:
         const ir::SourceLoc el = loc(body);
         b.ret_void(el);
 
-        module_.set_function(id, ir::Function{ .name          = "fork.child",
-                                               .return_type   = module_.pool.void_type,
-                                               .param_types   = {},
-                                               .arg_dirs      = {},
-                                               .local_types   = std::move(ctx.local_types),
-                                               .is_task       = true,
-                                               .is_fork_child = true,
-                                               .ir            = b.finish() });
+        module_.set_function(id,
+                             ir::Function{ .name          = "fork.child",
+                                           .return_type   = module_.pool.void_type,
+                                           .param_types   = {},
+                                           .arg_dirs      = {},
+                                           .local_types   = std::move(ctx.local_types),
+                                           .is_task       = true,
+                                           .is_fork_child = true,
+                                           .ir            = b.finish() });
         named_blocks_.swap(saved_blocks);
         fn_ctx_ = saved;
         return id;
@@ -12400,8 +12532,11 @@ private:
     // Postponed region and prints it. `fd_arg` (for $f* forms) makes args[0] the
     // destination descriptor and args[1..] the message; `monitor` routes the print
     // through the change-detecting monitor emit (else a plain display/fdisplay).
-    ir::FunctionId build_deferred_body(std::span<const Expression* const> args, char default_conv,
-                                       ir::SourceLoc l, bool fd_arg, bool monitor) {
+    ir::FunctionId build_deferred_body(std::span<const Expression* const> args,
+                                       char                               default_conv,
+                                       ir::SourceLoc                      l,
+                                       bool                               fd_arg,
+                                       bool                               monitor) {
         const ir::FunctionId id = module_.reserve_function();
 
         FnCtx ctx;
@@ -12415,9 +12550,7 @@ private:
         ir::Builder b(module_.pool);
         // $display / $strobe target the standard-output MCD (descriptor 1); the $f*
         // forms carry an explicit descriptor as the first argument.
-        ir::Index desc = b.constant(svint_to_ref(slang::SVInt(32, 1, true),
-                                                 make_int_type(32, false, true)),
-                                    l);
+        ir::Index desc = b.constant(svint_to_ref(slang::SVInt(32, 1, true), make_int_type(32, false, true)), l);
         if (fd_arg) {
             if (args.empty()) {
                 fail("$fstrobe / $fmonitor requires a file-descriptor argument");
@@ -12437,13 +12570,14 @@ private:
         }
         b.ret_void(l);
 
-        module_.set_function(id, ir::Function{ .name        = monitor ? "monitor" : "strobe",
-                                               .return_type = module_.pool.void_type,
-                                               .param_types = {},
-                                               .arg_dirs    = {},
-                                               .local_types = std::move(ctx.local_types),
-                                               .is_task     = true,
-                                               .ir          = b.finish() });
+        module_.set_function(id,
+                             ir::Function{ .name        = monitor ? "monitor" : "strobe",
+                                           .return_type = module_.pool.void_type,
+                                           .param_types = {},
+                                           .arg_dirs    = {},
+                                           .local_types = std::move(ctx.local_types),
+                                           .is_task     = true,
+                                           .ir          = b.finish() });
         named_blocks_.swap(saved_blocks);
         fn_ctx_ = saved;
         return id;
@@ -12461,14 +12595,14 @@ private:
         const bool    is_void     = sub.returnValVar == nullptr;
         const ir::Ref return_type = is_void ? module_.pool.void_type : lower_type(sub.returnValVar->getType());
 
-        FnCtx            ctx;
-        ctx.name_prefix        = std::string(sub.name) + ".";
-        FnCtx*           saved = fn_ctx_;
-        fn_ctx_                = &ctx;
+        FnCtx ctx;
+        ctx.name_prefix = std::string(sub.name) + ".";
+        FnCtx* saved    = fn_ctx_;
+        fn_ctx_         = &ctx;
         std::vector<std::string_view> saved_blocks;
         saved_blocks.swap(named_blocks_);
-        ir::Builder      b(module_.pool);
-        std::vector<ir::Ref> param_types;
+        ir::Builder             b(module_.pool);
+        std::vector<ir::Ref>    param_types;
         std::vector<ir::ArgDir> arg_dirs;
 
         // A class method (LRM 8.11): splice the implicit `this` handle as formal 0.
@@ -12524,9 +12658,9 @@ private:
         if (sub.flags.has(slang::ast::MethodFlags::Constructor) && sub.thisVar != nullptr) {
             const auto& clt = sub.thisVar->getType().getCanonicalType().as<slang::ast::ClassType>();
             if (clt.getBaseClass() != nullptr) {
-                const ir::SourceLoc bl     = to_source_loc(sub.location);
-                const ir::Index     handle = b.unary(
-                    ir::Inst::Tag::Load, b.local(fn_ctx_->this_local, fn_ctx_->this_class, bl), bl);
+                const ir::SourceLoc bl = to_source_loc(sub.location);
+                const ir::Index     handle =
+                  b.unary(ir::Inst::Tag::Load, b.local(fn_ctx_->this_local, fn_ctx_->this_class, bl), bl);
                 emit_base_construction(clt, handle, b, bl);
             }
         }
@@ -12547,17 +12681,17 @@ private:
             // in lower_return. Without this a queue return lowers to Ret(Load(handle)),
             // an uninitialized-lvalue read that SIGSEGVs in emit_handle_assign.
             const ir::Index rv = ret_var_ref(ctx, el, b);
-            b.unary(ir::Inst::Tag::Ret,
-                    is_handle_ref(ctx.ret_type) ? rv : b.unary(ir::Inst::Tag::Load, rv, el), el);
+            b.unary(ir::Inst::Tag::Ret, is_handle_ref(ctx.ret_type) ? rv : b.unary(ir::Inst::Tag::Load, rv, el), el);
         }
 
-        module_.set_function(id, ir::Function{ .name        = std::string(sub.name),
-                                               .return_type = return_type,
-                                               .param_types = std::move(param_types),
-                                               .arg_dirs    = std::move(arg_dirs),
-                                               .local_types = std::move(ctx.local_types),
-                                               .span        = span_of(sub),
-                                               .ir          = b.finish() });
+        module_.set_function(id,
+                             ir::Function{ .name        = std::string(sub.name),
+                                           .return_type = return_type,
+                                           .param_types = std::move(param_types),
+                                           .arg_dirs    = std::move(arg_dirs),
+                                           .local_types = std::move(ctx.local_types),
+                                           .span        = span_of(sub),
+                                           .ir          = b.finish() });
         named_blocks_.swap(saved_blocks);
         fn_ctx_ = saved;
     }
@@ -12603,9 +12737,12 @@ private:
     // `new`) still constructs the class's base, since a ctor-less class contributes
     // its base construction plus its property defaults (the latter already applied
     // at allocation). Mutually recursive with emit_base_construction.
-    void emit_ctor_call(const slang::ast::ClassType& clt, const SubroutineSymbol* ctor,
-                        std::span<const Expression* const> actuals, ir::Index handle,
-                        ir::Builder& b, ir::SourceLoc l) {
+    void emit_ctor_call(const slang::ast::ClassType&       clt,
+                        const SubroutineSymbol*            ctor,
+                        std::span<const Expression* const> actuals,
+                        ir::Index                          handle,
+                        ir::Builder&                       b,
+                        ir::SourceLoc                      l) {
         if (ctor == nullptr) {
             // No constructor: only the base part needs constructing. A ctor-less
             // class cannot take constructor arguments.
@@ -12630,8 +12767,7 @@ private:
     // against the same `handle`. Emitted either at a constructor's entry (where an
     // `extends`-arg referencing a ctor formal is in scope) or from emit_ctor_call
     // when recursing through a ctor-less class (whose base args are context-free).
-    void emit_base_construction(const slang::ast::ClassType& clt, ir::Index handle,
-                                ir::Builder& b, ir::SourceLoc l) {
+    void emit_base_construction(const slang::ast::ClassType& clt, ir::Index handle, ir::Builder& b, ir::SourceLoc l) {
         const slang::ast::Type* base = clt.getBaseClass();
         if (base == nullptr) {
             return;
@@ -12645,8 +12781,7 @@ private:
         if (base_call != nullptr) {
             const CallExpression* cc = nullptr;
             if (base_call->kind == ExpressionKind::NewClass) {
-                if (const Expression* inner =
-                        base_call->as<slang::ast::NewClassExpression>().constructorCall()) {
+                if (const Expression* inner = base_call->as<slang::ast::NewClassExpression>().constructorCall()) {
                     cc = &inner->as<CallExpression>();
                 }
             } else if (base_call->kind == ExpressionKind::Call) {
@@ -12667,15 +12802,16 @@ private:
     // declaration order. Lowered in the enclosing context (the `new` site), so an
     // initializer that references `this` or another property fails loudly via
     // signal_of — a documented V1 gap (most initializers are constants / params).
-    void emit_class_property_inits(const slang::ast::ClassType& clt, ir::Index handle,
-                                   ir::Ref class_ref, ir::Builder& b) {
+    void emit_class_property_inits(const slang::ast::ClassType& clt,
+                                   ir::Index                    handle,
+                                   ir::Ref                      class_ref,
+                                   ir::Builder&                 b) {
         // Base-class defaults first (LRM 8.8 / 8.13 declaration order runs the base
         // part before the derived part). `class_ref` stays the *derived* (allocated)
         // type so class_member_lvalue derefs the full body; an inherited property's
         // prefix index (class_prop_index_) then addresses the right slot.
         if (const slang::ast::Type* base = clt.getBaseClass()) {
-            emit_class_property_inits(base->getCanonicalType().as<slang::ast::ClassType>(),
-                                      handle, class_ref, b);
+            emit_class_property_inits(base->getCanonicalType().as<slang::ast::ClassType>(), handle, class_ref, b);
         }
         for (const auto& prop : clt.membersOfType<slang::ast::ClassPropertySymbol>()) {
             // A static property is not per-object: it has one shared slot,
@@ -12693,8 +12829,10 @@ private:
             if (prop.getType().getCanonicalType().isString()) {
                 b.binary(ir::Inst::Tag::Store, lv, lower_expr(*init, b), il);
             } else {
-                b.binary(ir::Inst::Tag::Store, lv,
-                         coerce(lower_expr(*init, b), *init->type, lower_type(prop.getType()), b, il), il);
+                b.binary(ir::Inst::Tag::Store,
+                         lv,
+                         coerce(lower_expr(*init, b), *init->type, lower_type(prop.getType()), b, il),
+                         il);
             }
         }
     }
@@ -12741,9 +12879,8 @@ private:
             // Receiver's static class type selects the vtable layout: an explicit
             // receiver (`obj.f()`) is call.thisClass(); a bare in-method call (`f()`)
             // dispatches through the enclosing method's own `this`.
-            const ir::Ref recv = call.thisClass() != nullptr
-                                      ? lower_type(*call.thisClass()->type)
-                                      : fn_ctx_->this_class;
+            const ir::Ref recv =
+              call.thisClass() != nullptr ? lower_type(*call.thisClass()->type) : fn_ctx_->this_class;
             c = b.call_virtual(virtual_sig_id(sub), virtual_slot_of(sub), recv, args, l);
         } else {
             c = b.call(direct_id, args, l);
@@ -12763,7 +12900,9 @@ private:
     // blocks the caller until it completes. Argument passing (13.5) is shared with
     // function calls: build_call_args prepares each operand and records output /
     // inout copy-backs, emit_call_copyouts applies them after the call.
-    void lower_task_call(const CallExpression& call, const SubroutineSymbol& sub, ir::Builder& b,
+    void lower_task_call(const CallExpression&    call,
+                         const SubroutineSymbol&  sub,
+                         ir::Builder&             b,
                          std::optional<ir::Index> this_val = std::nullopt) {
         // A virtual task invoked through a handle dispatches dynamically (LRM 8.20),
         // like a virtual function but over the task (coroutine) ABI. A pure virtual
@@ -12771,9 +12910,9 @@ private:
         // concrete signature — function_id(sub) is only skipped to mirror the
         // function path's vtable sourcing.
         const bool           is_virtual = this_val && is_user_virtual(sub) && !is_super_call(call);
-        const ir::FunctionId id      = is_virtual ? ir::FunctionId{} : function_id(sub);
-        const auto           formals = sub.getArguments();
-        const auto           actuals = call.arguments();
+        const ir::FunctionId id         = is_virtual ? ir::FunctionId{} : function_id(sub);
+        const auto           formals    = sub.getArguments();
+        const auto           actuals    = call.arguments();
         if (formals.size() != actuals.size()) {
             fail("task argument count mismatch");
         }
@@ -12794,9 +12933,8 @@ private:
             args.insert(args.begin(), *this_val);
         }
         if (is_virtual) {
-            const ir::Ref recv = call.thisClass() != nullptr
-                                     ? lower_type(*call.thisClass()->type)
-                                     : fn_ctx_->this_class;
+            const ir::Ref recv =
+              call.thisClass() != nullptr ? lower_type(*call.thisClass()->type) : fn_ctx_->this_class;
             b.task_call_virtual(virtual_sig_id(sub), virtual_slot_of(sub), recv, args, l);
         } else {
             b.task_call(id, args, l);
@@ -12808,8 +12946,9 @@ private:
     // explicit receiver (`obj.method()`) is call.thisClass(); a bare in-method call
     // (`method()`) uses the enclosing method's `this` Local. Returns nullopt for a
     // free subroutine (no thisVar).
-    std::optional<ir::Index> resolve_method_this(const CallExpression& call,
-                                                 const SubroutineSymbol& sub, ir::Builder& b) {
+    std::optional<ir::Index> resolve_method_this(const CallExpression&   call,
+                                                 const SubroutineSymbol& sub,
+                                                 ir::Builder&            b) {
         if (call.thisClass() != nullptr) {
             return lower_expr(*call.thisClass(), b);
         }
@@ -12824,8 +12963,7 @@ private:
             fail("class method call without an object handle is not supported");
         }
         const ir::SourceLoc l = loc(call);
-        return b.unary(ir::Inst::Tag::Load,
-                       b.local(fn_ctx_->this_local, fn_ctx_->this_class, l), l);
+        return b.unary(ir::Inst::Tag::Load, b.local(fn_ctx_->this_local, fn_ctx_->this_class, l), l);
     }
 
     // One output / inout argument's copy-back record: the caller temp holding the
@@ -12850,9 +12988,10 @@ private:
     // `outs` for copy-out after the call. Shared by function and task calls — the
     // copy-in / copy-out semantics are identical and delicate to correctness.
     std::vector<ir::Index> build_call_args(std::span<const FormalArgumentSymbol* const> formals,
-                                           std::span<const Expression* const> actuals,
-                                           std::vector<CopyOutArg>& outs, ir::Builder& b,
-                                           ir::SourceLoc l) {
+                                           std::span<const Expression* const>           actuals,
+                                           std::vector<CopyOutArg>&                     outs,
+                                           ir::Builder&                                 b,
+                                           ir::SourceLoc                                l) {
         std::vector<ir::Index> args;
         args.reserve(formals.size());
         for (size_t i = 0; i < formals.size(); ++i) {
@@ -12907,9 +13046,8 @@ private:
                     actual = &actual->as<AssignmentExpression>().left();
                 }
                 const Expression& src = unwrap_conversion(*actual);
-                const bool array_lvalue =
-                    is_struct_lvalue_shape(src) ||
-                    (src.kind == ExpressionKind::RangeSelect && is_unpacked_array(src));
+                const bool        array_lvalue =
+                  is_struct_lvalue_shape(src) || (src.kind == ExpressionKind::RangeSelect && is_unpacked_array(src));
                 if (!array_lvalue) {
                     // TODO: a `'{...}` / call array actual — build the temp from the
                     // pattern / call result directly.
@@ -12945,9 +13083,8 @@ private:
             if (dir == slang::ast::ArgumentDirection::In) {
                 // A string actual passes as-is (no width to resize to); the callee's
                 // copy-in gives value semantics.
-                args.push_back(is_string_ref(pty)
-                                 ? lower_expr(*actuals[i], b)
-                                 : coerce(lower_expr(*actuals[i], b), *actuals[i]->type, pty, b, l));
+                args.push_back(is_string_ref(pty) ? lower_expr(*actuals[i], b)
+                                                  : coerce(lower_expr(*actuals[i], b), *actuals[i]->type, pty, b, l));
                 continue;
             }
             // slang models an output / inout actual as an AssignmentExpression whose
@@ -13103,11 +13240,11 @@ private:
     // resolved_slots_. A net any of whose slots is non-default (not 0x0303 / strong)
     // resolves through the strength-weighted StrengthRes fold instead of WireRes.
     ankerl::unordered_dense::map<uint32_t, std::vector<uint16_t>> resolved_strengths_;
-    ankerl::unordered_dense::map<uint32_t, uint32_t>                resolved_scope_;
-    ankerl::unordered_dense::map<uint32_t, ir::SourceLoc>           resolved_loc_;
+    ankerl::unordered_dense::map<uint32_t, uint32_t>              resolved_scope_;
+    ankerl::unordered_dense::map<uint32_t, ir::SourceLoc>         resolved_loc_;
     // Per resolved net: which reducer folds its slots (WireRes / WandRes /
     // WorRes), from the net kind (net_resolve_tag).
-    ankerl::unordered_dense::map<uint32_t, ir::Inst::Tag>           net_resolve_op_;
+    ankerl::unordered_dense::map<uint32_t, ir::Inst::Tag> net_resolve_op_;
     // tri0 / tri1 nets: the resistive pull applied after the fold, and the home
     // scope / loc for the resolver (so even a driverless net emits one).
     struct PullInfo {
@@ -13184,7 +13321,7 @@ private:
     // a pure prototype -> the FunctionId of its never-executed signature stub. Both
     // filled by compute_vtable / pure_stub_id.
     using VtableSlots = ankerl::unordered_dense::map<std::string_view, uint32_t>;
-    ankerl::unordered_dense::map<const slang::ast::ClassType*, VtableSlots>            class_vslot_;
+    ankerl::unordered_dense::map<const slang::ast::ClassType*, VtableSlots>                class_vslot_;
     ankerl::unordered_dense::map<const slang::ast::MethodPrototypeSymbol*, ir::FunctionId> pure_stub_;
     // The shared Lowerer that owns package/$unit-scope subroutine bodies (see
     // set_globals / function_id). Null on the shared Lowerer itself and on any
@@ -13205,6 +13342,14 @@ private:
     // whole instance hierarchy into one run-once pre-init process, finalized at the
     // end of the top instance. Lazily engaged: absent when no initializer exists.
     std::optional<ir::Builder> preinit_;
+    // Diagnostics from members that failed and were recovered past, in the order
+    // the walk hit them. Drained by lower_compilation.
+    std::vector<Diagnostic> diags_;
+    // Set once any member was abandoned. The module is still returned -- it is
+    // analysable, and that is what --emit=check wants -- but it is missing
+    // behaviour, so it MUST NOT reach codegen. lower_compilation turns this into
+    // LowerResult::ok == false, which is the gate.
+    bool poisoned_ = false;
 };
 
 // Map slang's severity scale onto Clotho's. slang's Ignored never reaches here (an
@@ -13254,8 +13399,10 @@ Diagnostic from_slang(const slang::DiagnosticEngine& engine, const slang::Diagno
     return out;
 }
 
-LowerResult lower_compilation(slang::ast::Compilation& comp, std::shared_ptr<SourceContext> ctx,
-                              Timings* timings, ir::SystemAccess allow_system) {
+LowerResult lower_compilation(slang::ast::Compilation&       comp,
+                              std::shared_ptr<SourceContext> ctx,
+                              Timings*                       timings,
+                              ir::SystemAccess               allow_system) {
     LowerResult result;
     // Attached first so EVERY return path below carries it: `sources` is documented
     // as never null, and there are a dozen early returns.
@@ -13283,8 +13430,7 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, std::shared_ptr<Sou
         // LRM (9.2.2.1) only describes it as a simulation deadlock: clotho
         // deliberately lowers it faithfully (see lower_procedural_block), so
         // downgrade to a warning.
-        engine.setSeverity(slang::diag::AlwaysWithoutTimingControl,
-                           slang::DiagnosticSeverity::Warning);
+        engine.setSeverity(slang::diag::AlwaysWithoutTimingControl, slang::DiagnosticSeverity::Warning);
         // LRM 6.5 / 10.3.2 both use normative "shall be an error" for a
         // variable driven by more than one continuous assignment, or by a mix
         // of continuous and procedural assignments -- slang defaults these to
@@ -13415,20 +13561,20 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, std::shared_ptr<Sou
         // A context export runs in a specific instance's scope (svScope, LRM
         // 35.5.3); with several tops there is no single design-state root to bind
         // the thunk to. Deferred with the rest of svScope.
-        result.diagnostics.push_back(
-          Diagnostic{ .severity = Severity::Error,
-                      .origin   = DiagnosticOrigin::Rejected,
-                      .code     = "multi-top-dpi-export",
-                      .message  = "DPI export in a multi-top design is not supported" });
+        result.diagnostics.push_back(Diagnostic{ .severity = Severity::Error,
+                                                 .origin   = DiagnosticOrigin::Rejected,
+                                                 .code     = "multi-top-dpi-export",
+                                                 .message  = "DPI export in a multi-top design is not supported" });
         return result;
     }
+    bool poisoned = false;
     try {
         Lowerer globals(*module, tick_fs, allow_system);
         globals.lower_globals(comp, root);
 
         for (const InstanceSymbol* top : root.topInstances) {
             const std::string prefix = single ? std::string() : std::string(top->name) + ".";
-            Lowerer lw(*module, tick_fs, allow_system);
+            Lowerer           lw(*module, tick_fs, allow_system);
             lw.seed_signals(globals.sigmap());
             lw.set_globals(&globals);
             lw.lower_top(*top, prefix);
@@ -13438,8 +13584,17 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, std::shared_ptr<Sou
             if (single) {
                 lw.collect_dpi_exports(comp);
             }
+            const std::span<const Diagnostic> recovered = lw.recovered_diags();
+            result.diagnostics.insert(result.diagnostics.end(), recovered.begin(), recovered.end());
+            poisoned = poisoned || lw.poisoned();
         }
+        const std::span<const Diagnostic> global_diags = globals.recovered_diags();
+        result.diagnostics.insert(result.diagnostics.end(), global_diags.begin(), global_diags.end());
+        poisoned = poisoned || globals.poisoned();
     } catch (const LowerError& e) {
+        // A structural failure (an instance, generate block or instance array),
+        // which the member walk deliberately does not recover from because
+        // continuing would misalign the scope tree. No module is produced.
         result.diagnostics.push_back(Diagnostic{ .severity = Severity::Error,
                                                  .origin   = DiagnosticOrigin::Unsupported,
                                                  .code     = "unsupported-construct",
@@ -13451,16 +13606,20 @@ LowerResult lower_compilation(slang::ast::Compilation& comp, std::shared_ptr<Sou
         timings->analysis_ms += ms_since(t_an);
     }
 
+    // The module is handed back even when poisoned: it is missing the behaviour of
+    // every member that failed, so it must never be simulated or emitted, but it
+    // IS analysable and that is exactly what --emit=check consumes. `ok` is the
+    // gate, and it is the only thing standing between a poisoned module and
+    // codegen — see main.cpp and run_design.
     result.module = std::move(module);
-    result.ok     = true;
+    result.ok     = !poisoned;
 
     return result;
 }
 
 } // namespace
 
-LowerResult lower_files(std::span<const std::string_view> paths, Timings* timings,
-                        ir::SystemAccess allow_system) {
+LowerResult lower_files(std::span<const std::string_view> paths, Timings* timings, ir::SystemAccess allow_system) {
     const auto t_parse = std::chrono::steady_clock::now();
 
     // One SourceManager shared across every tree so the Compilation's diagnostics
@@ -13468,8 +13627,8 @@ LowerResult lower_files(std::span<const std::string_view> paths, Timings* timing
     // and handed to the SourceContext so it OUTLIVES this call: an ir::SourceLoc is
     // only decodable against the manager that minted it, and this used to be a
     // stack local, which is why locations were unresolvable after lowering.
-    auto                  ctx = std::make_shared<SourceContext>();
-    auto                  sm  = std::make_unique<slang::SourceManager>();
+    auto                  ctx    = std::make_shared<SourceContext>();
+    auto                  sm     = std::make_unique<slang::SourceManager>();
     slang::SourceManager& sm_ref = *sm;
     ctx->adopt_source_manager(std::move(sm));
 
@@ -13486,8 +13645,7 @@ LowerResult lower_files(std::span<const std::string_view> paths, Timings* timing
               Diagnostic{ .severity = Severity::Error,
                           .origin   = DiagnosticOrigin::Driver,
                           .code     = "cannot-read-source",
-                          .message  = "cannot read '" + std::string(path) +
-                                     "': " + std::string(tree.error().second) });
+                          .message  = "cannot read '" + std::string(path) + "': " + std::string(tree.error().second) });
             return result;
         }
         comp.addSyntaxTree(*tree);
@@ -13500,11 +13658,10 @@ LowerResult lower_files(std::span<const std::string_view> paths, Timings* timing
 }
 
 LowerResult lower_file(std::string_view path, Timings* timings, ir::SystemAccess allow_system) {
-    return lower_files({&path, 1}, timings, allow_system);
+    return lower_files({ &path, 1 }, timings, allow_system);
 }
 
-LowerResult lower_sources(std::span<const std::string_view> args, Timings* timings,
-                          ir::SystemAccess allow_system) {
+LowerResult lower_sources(std::span<const std::string_view> args, Timings* timings, ir::SystemAccess allow_system) {
     const auto t_parse = std::chrono::steady_clock::now();
 
     // slang's Driver owns arg parsing, source loading (incl. `-f` command files,
@@ -13536,7 +13693,7 @@ LowerResult lower_sources(std::span<const std::string_view> args, Timings* timin
         result.diagnostics.push_back(Diagnostic{ .severity = Severity::Error,
                                                  .origin   = DiagnosticOrigin::Driver,
                                                  .code     = "bad-command-line",
-                                                 .message = "command-line or source-loading error" });
+                                                 .message  = "command-line or source-loading error" });
         return result;
     }
 
@@ -13550,7 +13707,7 @@ LowerResult lower_sources(std::span<const std::string_view> args, Timings* timin
         result.diagnostics.push_back(Diagnostic{ .severity = Severity::Error,
                                                  .origin   = DiagnosticOrigin::Driver,
                                                  .code     = "parse-failed",
-                                                 .message = "failed to parse one or more source files" });
+                                                 .message  = "failed to parse one or more source files" });
         return result;
     }
 

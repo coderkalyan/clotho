@@ -265,6 +265,7 @@ add_executable(clotho_test
   tests/packed_range_test.cpp
   tests/z_elision_test.cpp
   tests/analysis_test.cpp
+  tests/recovery_test.cpp
   tests/gate_test.cpp
   tests/net_resolution_test.cpp
   tests/llvm_backend_test.cpp

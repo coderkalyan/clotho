@@ -15,7 +15,9 @@
 // then JIT-compile and run it (default), or emit the process IR / LLVM IR for
 // debugging. All compiler logic lives in libclotho / libclotho_ir.
 //
-// Usage: clotho [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] [--no-thunk] [--no-dedup] [--domain-spec] [--allow-system=const|full] [-O] [--perf-jitdump] [--no-parallel-compile] [--jobs=<N>] [-o <out>] [-D<macro>] [-I<dir>] [+define+...] [+incdir+...] [-f <cmd.f>] [--top <mod>] <file.sv>... [+plusarg...]
+// Usage: clotho [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] [--no-thunk]
+// [--no-dedup] [--domain-spec] [--allow-system=const|full] [-O] [--perf-jitdump] [--no-parallel-compile] [--jobs=<N>]
+// [-o <out>] [-D<macro>] [-I<dir>] [+define+...] [+incdir+...] [-f <cmd.f>] [--top <mod>] <file.sv>... [+plusarg...]
 // Multiple source files are compiled together into one design (shared name
 // space, LRM 3.12), parsed in the order given.
 // `llvm` emits the backend's raw IR before the coroutine-lowering pipeline runs
@@ -77,8 +79,7 @@ int main(int argc, char** argv) {
             std::println(stderr,
                          "warning: $system shell command execution enabled "
                          "(--allow-system={})",
-                         config.allow_system == clotho::ir::SystemAccess::Const ? "const"
-                                                                                : "full");
+                         config.allow_system == clotho::ir::SystemAccess::Const ? "const" : "full");
         } else if (arg == "-O") {
             config.o3 = true;
         } else if (arg == "--perf-jitdump") {
@@ -93,8 +94,7 @@ int main(int argc, char** argv) {
             // A DPI-C library (LRM 35), repeatable. A `.o`/`.a` is JIT-linked
             // (import AND export); a `.so` is dlopen'd (import only). See run_jit.
             config.dpi_libs.push_back(argv[++i]);
-        } else if (arg.starts_with("+") && !arg.starts_with("+define+") &&
-                   !arg.starts_with("+incdir+")) {
+        } else if (arg.starts_with("+") && !arg.starts_with("+define+") && !arg.starts_with("+incdir+")) {
             // A plusarg (LRM §21.6): made available to $test$plusargs /
             // $value$plusargs, in order, with the leading `+` stripped. The
             // `+define+` / `+incdir+` preprocessor forms are slang's, not
@@ -106,9 +106,12 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (slang_args.empty() || (emit != "run" && emit != "ir" && emit != "llvm" && emit != "opt")) {
+    if (slang_args.empty() || (emit != "run" && emit != "ir" && emit != "llvm" && emit != "opt" && emit != "check")) {
         std::println(stderr,
-                     "usage: {} [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] [--no-thunk] [--no-dedup] [--domain-spec] [--allow-system=const|full] [-O] [--perf-jitdump] [--no-parallel-compile] [--jobs=<N>] [-o <out>] [--dpi-lib <lib.o|lib.so>] [-D<macro>] [-I<dir>] [+define+...] [+incdir+...] [-f <cmd.f>] [--top <mod>] <file.sv>... [+plusarg...]",
+                     "usage: {} [--emit=run|ir|llvm|opt|check] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] "
+                     "[--no-thunk] [--no-dedup] [--domain-spec] [--allow-system=const|full] [-O] [--perf-jitdump] "
+                     "[--no-parallel-compile] [--jobs=<N>] [-o <out>] [--dpi-lib <lib.o|lib.so>] [-D<macro>] [-I<dir>] "
+                     "[+define+...] [+incdir+...] [-f <cmd.f>] [--top <mod>] <file.sv>... [+plusarg...]",
                      argv[0]);
         return 2;
     }
@@ -116,7 +119,7 @@ int main(int argc, char** argv) {
     // Phase timings reported to stderr when --time is set (stdout stays clean for
     // the design's own output).
     clotho::Timings  timings;
-    clotho::Timings* tp = time ? &timings : nullptr;
+    clotho::Timings* tp     = time ? &timings : nullptr;
     const auto       report = [&] {
         if (!time) {
             return;
@@ -129,8 +132,7 @@ int main(int argc, char** argv) {
             std::println(stderr, "  {:<16}{:>12.3f}", "llvm compile", timings.llvm_ms);
             std::println(stderr, "  {:<16}{:>12.3f}", "simulation", timings.sim_ms);
         }
-        const double total =
-          timings.frontend_ms + timings.analysis_ms + timings.llvm_ms + timings.sim_ms;
+        const double total = timings.frontend_ms + timings.analysis_ms + timings.llvm_ms + timings.sim_ms;
         std::println(stderr, "  {:<16}{:>12.3f}", "total", total);
     };
 
@@ -138,6 +140,34 @@ int main(int argc, char** argv) {
     if (!result.diagnostics.empty()) {
         std::print(stderr, "{}", result.diagnostic_text());
     }
+    // check: report what the frontend found and stop. No codegen, and
+    // deliberately BEFORE the `ok` gate -- a module with a failed member is
+    // exactly what this mode is for, since an editor buffer is broken most of the
+    // time and every other diagnostic in the file is still wanted. Exit status
+    // keys on whether anything reached Error, so it works as a CLI linter.
+    //
+    // Analysis-derived findings (X-dependence, mismatch classes) are S5's and
+    // will surface here; today the frontend and slang are the only sources, so
+    // there is nothing to run DesignFacts for yet.
+    if (emit == "check") {
+        report();
+        return clotho::has_error(result.diagnostics) ? 1 : 0;
+    }
+
+    // ir: a debug dump is analysis, not execution, so it tolerates a poisoned
+    // module too -- when a guard fires, seeing what DID lower is the whole point.
+    // Exit status still reports the failure, and the diagnostics are already on
+    // stderr above, so a partial dump cannot be mistaken for a whole design.
+    if (emit == "ir" && result.module != nullptr) {
+        // Locations are resolvable now that lowering hands back the SourceManager,
+        // so annotate the dump — an IR dump you cannot map back to source is much
+        // less useful for debugging a lowering problem.
+        clotho::ir::print_module(
+          *result.module, std::cout, [&](clotho::ir::SourceLoc l) { return result.sources->render(l); });
+        report();
+        return result.ok ? 0 : 1;
+    }
+
     if (!result.ok) {
         return 1;
     }
@@ -146,17 +176,6 @@ int main(int argc, char** argv) {
         const int rc = clotho::ir::run_jit(*result.module, tp, config, plusargs);
         report();
         return rc;
-    }
-
-    if (emit == "ir") {
-        // Locations are resolvable now that lowering hands back the SourceManager,
-        // so annotate the dump — an IR dump you cannot map back to source is much
-        // less useful for debugging a lowering problem.
-        clotho::ir::print_module(*result.module, std::cout, [&](clotho::ir::SourceLoc l) {
-            return result.sources->render(l);
-        });
-        report();
-        return 0;
     }
 
     // emit == "llvm" (raw backend output) or "opt" (after the coroutine passes).
