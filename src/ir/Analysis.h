@@ -25,9 +25,9 @@
 //
 // What is deliberately NOT here. Analyses whose *products* are backend index
 // spaces rather than facts: `nba_classify_ir` (membership order in its vectors
-// IS the deferred-record ABI), subscription ordering, fusion grouping, dedup
-// hashing, and domain-spec eligibility. Those stay with the code generator that
-// owns their meaning. This module supplies their ingredients.
+// IS the deferred-record ABI), subscription ordering, fusion grouping, and
+// dedup hashing. Those stay with the code generator that owns their meaning.
+// This module supplies their ingredients.
 
 #include <cstdint>
 #include <span>

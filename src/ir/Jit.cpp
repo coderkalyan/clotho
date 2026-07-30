@@ -615,28 +615,6 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     if (timings != nullptr) {
         timings->sim_ms += ms_since(t_sim);
     }
-    // CLOTHO_DOM_DEBUG: dump the domain-specialization dispatch counts the
-    // backend exported (see compute_domain_spec) — per-group fast vs generic
-    // reader-side dispatches. Pairs with the backend's compile-time stderr
-    // dump of the read sets.
-    if (getenv("CLOTHO_DOM_DEBUG") != nullptr) {
-        const auto addr = [&](const char* name) -> void* {
-            auto s = (*jit)->lookup(name);
-            return s ? s->toPtr<void*>() : nullptr;
-        };
-        const auto* ng    = static_cast<const uint32_t*>(addr("clotho.dom_ngroups"));
-        const auto* nfast = static_cast<const uint64_t*>(addr("clotho.dom_nfast"));
-        const auto* ngen  = static_cast<const uint64_t*>(addr("clotho.dom_ngen"));
-        if (ng && nfast && ngen) {
-            for (uint32_t g = 0; g < *ng; ++g) {
-                if (nfast[g] + ngen[g] > 0) {
-                    fprintf(stderr, "DOM run g=%u fast=%llu gen=%llu\n", g,
-                            static_cast<unsigned long long>(nfast[g]),
-                            static_cast<unsigned long long>(ngen[g]));
-                }
-            }
-        }
-    }
     return rc;
 }
 

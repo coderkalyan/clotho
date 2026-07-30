@@ -270,7 +270,6 @@ add_executable(clotho_test
   tests/net_resolution_test.cpp
   tests/llvm_backend_test.cpp
   tests/two_state_test.cpp
-  tests/domain_spec_test.cpp
   tests/real_test.cpp
   tests/wheel_test.cpp
   tests/runtime_test.cpp

@@ -16,7 +16,7 @@
 // debugging. All compiler logic lives in libclotho / libclotho_ir.
 //
 // Usage: clotho [--emit=run|ir|llvm|opt] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] [--no-thunk]
-// [--no-dedup] [--domain-spec] [--allow-system=const|full] [-O] [--perf-jitdump] [--no-parallel-compile] [--jobs=<N>]
+// [--no-dedup] [--allow-system=const|full] [-O] [--perf-jitdump] [--no-parallel-compile] [--jobs=<N>]
 // [-o <out>] [-D<macro>] [-I<dir>] [+define+...] [+incdir+...] [-f <cmd.f>] [--top <mod>] <file.sv>... [+plusarg...]
 // Multiple source files are compiled together into one design (shared name
 // space, LRM 3.12), parsed in the order given.
@@ -58,8 +58,6 @@ int main(int argc, char** argv) {
             config.split = false;
         } else if (arg == "--no-outline") {
             config.outline = false;
-        } else if (arg == "--domain-spec") {
-            config.domain_spec = true;
         } else if (arg.starts_with("--allow-system")) {
             // Enable the $system shell-exec task (LRM §20.17.1), off by default.
             // A security boundary: running a shell command is arbitrary code
@@ -109,7 +107,7 @@ int main(int argc, char** argv) {
     if (slang_args.empty() || (emit != "run" && emit != "ir" && emit != "llvm" && emit != "opt" && emit != "check")) {
         std::println(stderr,
                      "usage: {} [--emit=run|ir|llvm|opt|check] [--time] [--no-z-elision] [--no-fuse] [--no-comb-fuse] "
-                     "[--no-thunk] [--no-dedup] [--domain-spec] [--allow-system=const|full] [-O] [--perf-jitdump] "
+                     "[--no-thunk] [--no-dedup] [--allow-system=const|full] [-O] [--perf-jitdump] "
                      "[--no-parallel-compile] [--jobs=<N>] [-o <out>] [--dpi-lib <lib.o|lib.so>] [-D<macro>] [-I<dir>] "
                      "[+define+...] [+incdir+...] [-f <cmd.f>] [--top <mod>] <file.sv>... [+plusarg...]",
                      argv[0]);
