@@ -268,12 +268,10 @@ struct BoundsCheck {
     llvm::Value* index = nullptr;
     // i1: the index carried x/z bits, which makes `index` meaningless.
     llvm::Value* unknown = nullptr;
-    // ptr: static "<file>:<line>:<col>" and array-name strings for the report.
-    llvm::Value* where = nullptr;
-    llvm::Value* name  = nullptr;
-    // The declared bounds [left:right], as written.
-    int32_t left  = 0;
-    int32_t right = 0;
+    // ptr: the site's constant rt_bounds_site record (file, source line, array
+    // name, declared bounds). Everything compile-time about the access lives
+    // there, so only the runtime values travel as call arguments.
+    llvm::Constant* site = nullptr;
 };
 
 // A resolved assignment target: a `{ i(2W) must|may, iW z }` slot somewhere in
@@ -8666,22 +8664,20 @@ private:
                 lv.dyn_inrange = lv.dyn_inrange != nullptr ? b_.CreateAnd(lv.dyn_inrange, inrange)
                                                            : inrange;
                 if (sanitizer_on(config_.sanitizers, Sanitizer::Bounds)) {
-                    // --sanitize=bounds: keep this dimension's verdict, the index
-                    // the design wrote, and who was indexed. Not reported here --
-                    // a select is not yet a read or a write, and the direction is
-                    // half the report. The strings are materialized once per site
-                    // and their addresses key the runtime's per-site repeat cap.
+                    // --sanitize=bounds: keep this dimension's verdict and the
+                    // index the design wrote, against a record of who was indexed
+                    // and where. Not reported here -- a select is not yet a read
+                    // or a write, and the direction is half the report.
+                    //
+                    // A local / formal array has no name in the backend (frame
+                    // slots carry none), so it reports as what it is.
                     lv.bounds_checks.push_back(BoundsCheck{
                       .inrange = inrange,
                       .index   = idx,
                       .unknown = any_unknown(idxp),
-                      .where   = b_.CreateGlobalString(loc_text(i), "bounds.at"),
-                      // A local / formal array has no name in the backend (frame
-                      // slots carry none), so it reports as what it is.
-                      .name  = b_.CreateGlobalString(
-                        lv.is_signal ? mod_.signal(lv.sig).name : std::string("<local>"), "bounds.of"),
-                      .left  = static_cast<int32_t>(at.left),
-                      .right = static_cast<int32_t>(at.right),
+                      .site    = bounds_site_global(
+                        loc_text(i), lv.is_signal ? mod_.signal(lv.sig).name : std::string("<local>"),
+                        static_cast<int32_t>(at.left), static_cast<int32_t>(at.right)),
                     });
                 }
                 if (lv.is_agg) {
@@ -11909,21 +11905,47 @@ private:
                       { b_.CreateGlobalString(banner), now, b_.getInt32(info.kind) });
     }
 
-    // "<file>:<line>:<col>" for an instruction, for a sanitizer report baked
-    // into the emitted code. A caller with no SourceContext (the tests) leaves
-    // the resolver empty and gets "<unknown>" rather than a blank, so a report
-    // is never silently unattributed.
-    std::string loc_text(Index i) const {
-        return resolve_ ? resolve_(ir_->loc(i)) : std::string("<unknown>");
+    // Where an instruction came from, for a sanitizer report baked into the
+    // emitted code. A caller with no SourceContext (the tests) leaves the
+    // resolver empty and gets "<unknown>" with no snippet, rather than a blank,
+    // so a report is never silently unattributed.
+    SourceText loc_text(Index i) const {
+        return resolve_ ? resolve_(ir_->loc(i)) : SourceText{ .where = "<unknown>" };
     }
 
-    // void rt_bounds_report(ptr where, ptr name, i32 index, i32 left, i32 right,
-    //                       i32 flags, i64 now) — writes one warning to stderr
-    // and returns; see Runtime.h for the flag bits.
+    // The rt_bounds_site record (Runtime.h): { ptr where, ptr line, ptr name,
+    // i32 line_no, i32 column, i32 left, i32 right }. Field order and types
+    // mirror the C struct exactly, so the two change together.
+    llvm::StructType* bounds_site_ty() {
+        auto* i32 = b_.getInt32Ty();
+        auto* ptr = raw_ptr_ty();
+        return llvm::StructType::get(ctx_, { ptr, ptr, ptr, i32, i32, i32, i32 });
+    }
+
+    // One constant rt_bounds_site per instrumented access. Everything the report
+    // knows at compile time lives here instead of in the argument list, which
+    // keeps the call to the four values that are genuinely dynamic.
+    llvm::Constant* bounds_site_global(const SourceText& at, const std::string& name, int32_t left,
+                                       int32_t right) {
+        auto*       i32 = b_.getInt32Ty();
+        auto* const rec = bounds_site_ty();
+        auto*       init =
+          llvm::ConstantStruct::get(rec, { b_.CreateGlobalString(at.where, "bounds.at"),
+                                           b_.CreateGlobalString(at.line, "bounds.src"),
+                                           b_.CreateGlobalString(name, "bounds.of"),
+                                           llvm::ConstantInt::get(i32, at.line_no),
+                                           llvm::ConstantInt::get(i32, at.column),
+                                           llvm::ConstantInt::get(i32, static_cast<uint32_t>(left)),
+                                           llvm::ConstantInt::get(i32, static_cast<uint32_t>(right)) });
+        return new llvm::GlobalVariable(env_->llmod, rec, /*isConstant=*/true,
+                                        llvm::GlobalValue::PrivateLinkage, init, "clotho.bounds.site");
+    }
+
+    // void rt_bounds_report(ptr site, i32 index, i32 flags, i64 now) — writes one
+    // warning to stderr and returns; see Runtime.h for the flag bits.
     llvm::FunctionCallee bounds_report_fn() {
         auto* i32 = b_.getInt32Ty();
-        return rt_fn("rt_bounds_report", b_.getVoidTy(),
-                     { raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32, i32, b_.getInt64Ty() });
+        return rt_fn("rt_bounds_report", b_.getVoidTy(), { raw_ptr_ty(), i32, i32, b_.getInt64Ty() });
     }
 
     // Drain `lv`'s pending --sanitize=bounds checks: one branch each on the
@@ -11953,8 +11975,7 @@ private:
             llvm::Value* now = has_wheel()
                                  ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
                                  : static_cast<llvm::Value*>(b_.getInt64(0));
-            b_.CreateCall(bounds_report_fn(), { bc.where, bc.name, bc.index, b_.getInt32(bc.left),
-                                                b_.getInt32(bc.right), flags, now });
+            b_.CreateCall(bounds_report_fn(), { bc.site, bc.index, flags, now });
             b_.CreateBr(cont);
 
             b_.SetInsertPoint(cont);

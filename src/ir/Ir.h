@@ -67,15 +67,29 @@ struct SourceSpan {
     }
 };
 
-// Optional hook turning a SourceLoc into display text.
+// What a resolver can say about a SourceLoc: enough to print a location, and
+// enough to draw the snippet-and-caret block under it.
+struct SourceText {
+    // "<file>:<line>:<col>", or "<unknown>" when the location cannot be
+    // resolved.
+    std::string where;
+    // The source line the location sits on, verbatim and without its newline.
+    // Empty when unavailable, which callers must tolerate.
+    std::string line;
+    // 1-based line and column within the file; 0 when unknown.
+    uint32_t line_no = 0;
+    uint32_t column  = 0;
+};
+
+// Optional hook turning a SourceLoc into the above.
 //
 // The IR core cannot decode a SourceLoc itself: the (buffer, offset) mapping
 // lives in the slang-aware frontend, and keeping this library free of slang is
 // the point of the clotho_ir_core / clotho split. So a caller that wants
-// located output passes a resolver (in practice `SourceContext::render`).
-// Default-constructed means "no locations available", which is what tests want
-// -- golden IR text must not depend on file paths.
-using LocResolver = std::function<std::string(SourceLoc)>;
+// located output passes a resolver (in practice one built over
+// `SourceContext`). Default-constructed means "no locations available", which
+// is what tests want -- golden IR text must not depend on file paths.
+using LocResolver = std::function<SourceText(SourceLoc)>;
 
 // Opaque handle to a module signal (net / variable / port). Resolved by the
 // enclosing module; the process IR never interprets it.

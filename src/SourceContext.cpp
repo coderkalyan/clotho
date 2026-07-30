@@ -86,4 +86,21 @@ std::string SourceContext::render_file_line(ir::SourceLoc loc) const {
     return pos.file + ":" + std::to_string(pos.line);
 }
 
+std::string SourceContext::line_text(ir::SourceLoc loc) const {
+    if (sm_ == nullptr || loc == ir::SourceLoc{ 0 }) {
+        return {};
+    }
+
+    const slang::SourceLocation sl = to_slang_location(loc);
+    // Same membership guard as resolve: a handle from a different manager would
+    // index a buffer this one does not own.
+    if (!sl.valid() || !sm_->isFileLoc(sl)) {
+        return {};
+    }
+
+    // slang already trims the trailing newline. The view points into the
+    // manager's buffer, so it is copied out rather than handed back.
+    return std::string(sm_->getSourceLine(sl));
+}
+
 } // namespace clotho

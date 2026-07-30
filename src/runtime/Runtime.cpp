@@ -2995,12 +2995,12 @@ fmt::text_style styled(fmt::text_style s) {
 
 } // namespace
 
-extern "C" void rt_bounds_report(const char* where, const char* name, int32_t index, int32_t left,
-                                 int32_t right, uint32_t flags, uint64_t now) {
+extern "C" void rt_bounds_report(const rt_bounds_site* site, int32_t index, uint32_t flags,
+                                 uint64_t now) {
     const bool     write   = (flags & 1u) != 0;
     const bool     unknown = (flags & 2u) != 0;
-    const uint64_t site    = reinterpret_cast<uint64_t>(where) * 2 + (write ? 1 : 0);
-    uint32_t&      hits    = g_bounds_hits[site];
+    const uint64_t key     = reinterpret_cast<uint64_t>(site) * 2 + (write ? 1 : 0);
+    uint32_t&      hits    = g_bounds_hits[key];
     if (hits >= bounds_report_cap) {
         return;
     }
@@ -3011,15 +3011,16 @@ extern "C" void rt_bounds_report(const char* where, const char* name, int32_t in
     io_ensure_init();
     std::fflush(stdout);
 
-    // Laid out like a modern compiler diagnostic: what went wrong, then where,
-    // then the context that does not fit in either. The array's name and the
-    // simulation time are notes rather than headline because the location
-    // already pins the access, down to the column of the index expression.
+    // Laid out like a modern compiler diagnostic: what went wrong, where, the
+    // offending line with a caret under the access, then the context that fits
+    // in none of those. The array's name and the simulation time are notes
+    // rather than headline because the snippet already shows the access.
     const fmt::text_style label = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::yellow));
     const fmt::text_style head  = styled(fmt::emphasis::bold);
     const fmt::text_style loc   = styled(fmt::fg(fmt::terminal_color::cyan));
     const fmt::text_style tag   = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::cyan));
     const fmt::text_style body  = styled(fmt::emphasis::faint);
+    const fmt::text_style caret = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::yellow));
 
     std::string when;
     append_finish_time(when, now);
@@ -3030,12 +3031,31 @@ extern "C" void rt_bounds_report(const char* where, const char* name, int32_t in
     // An x/z index is out of range by LRM Table 7-1 with no numeric value to
     // report, so it prints as what it is rather than as its must-plane bits.
     fmt::print(stderr, head, " index out of bounds: index {}, range [{}:{}]",
-               unknown ? std::string("x") : std::to_string(index), left, right);
+               unknown ? std::string("x") : std::to_string(index), site->left, site->right);
     fmt::print(stderr, "\n");
-    fmt::print(stderr, loc, "{}", where);
+    fmt::print(stderr, loc, "{}", site->where);
     fmt::print(stderr, "\n");
+    if (site->line != nullptr && site->line[0] != '\0') {
+        // A tab is one column to slang, so it must occupy one column here too or
+        // the caret drifts. Rendering it as a single space keeps the arithmetic
+        // exact at the cost of the source's own indentation width.
+        std::string text = site->line;
+        std::replace(text.begin(), text.end(), '\t', ' ');
+        const std::string number = std::to_string(site->line_no);
+        const std::string gutter(number.size(), ' ');
+        fmt::print(stderr, loc, "{} |", number);
+        fmt::print(stderr, " {}", text);
+        fmt::print(stderr, "\n");
+        if (site->column > 0 && static_cast<size_t>(site->column) <= text.size() + 1) {
+            fmt::print(stderr, loc, "{} |", gutter);
+            // The text line puts one space after the bar, so column N sits N+1
+            // characters past it -- pad to that width and the caret lands on it.
+            fmt::print(stderr, caret, "{:>{}}", "^", site->column + 1);
+            fmt::print(stderr, "\n");
+        }
+    }
     fmt::print(stderr, tag, "  note:");
-    fmt::print(stderr, body, " {} '{}' at {}", write ? "write to" : "read of", name, when);
+    fmt::print(stderr, body, " {} '{}' at {}", write ? "write to" : "read of", site->name, when);
     fmt::print(stderr, "\n");
     if (hits == bounds_report_cap) {
         fmt::print(stderr, tag, "  note:");

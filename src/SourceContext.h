@@ -70,6 +70,11 @@ public:
     // banners, where a column would be noise.
     [[nodiscard]] std::string render_file_line(ir::SourceLoc loc) const;
 
+    // The source line the location sits on, verbatim and without its newline;
+    // empty when unresolvable. Paired with `SourcePosition::column` this is
+    // enough to draw the snippet-and-caret block a compiler diagnostic shows.
+    [[nodiscard]] std::string line_text(ir::SourceLoc loc) const;
+
     // True when nothing was ever adopted, so every resolve fails. A default
     // context is empty; this lets a consumer skip location work entirely.
     [[nodiscard]] bool empty() const;

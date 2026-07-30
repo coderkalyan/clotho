@@ -163,6 +163,32 @@ void rt_defer_report(int32_t level, uint64_t is_final, const void* gen, uint64_t
 void rt_defer_flush_observed(void);
 void rt_defer_flush_final(void);
 
+// One instrumented array access, emitted by the backend as a constant global
+// beside the code that reports it. Everything here is compile-time; only the
+// index, the direction and the time travel as arguments. Its address is stable
+// for the run, so it also keys the per-site repeat cap.
+//
+// Field order and types are the emitted LLVM struct's, so the two must change
+// together: { ptr, ptr, ptr, i32, i32, i32, i32 }.
+typedef struct rt_bounds_site {
+    // "<file>:<line>:<col>" of the access, or "<unknown>".
+    const char* where;
+    // The source line the access sits on, verbatim and without its newline, for
+    // the snippet under the message. Empty when the source is unavailable, in
+    // which case no snippet is drawn.
+    const char* line;
+    // The array's hierarchical name, or "<local>" for a frame local (the
+    // backend has no name for one).
+    const char* name;
+    // 1-based line and column of the access within `line`; the caret sits under
+    // `column`. 0 when unknown.
+    int32_t line_no;
+    int32_t column;
+    // The array's declared bounds [left:right], as written.
+    int32_t left;
+    int32_t right;
+} rt_bounds_site;
+
 // Report an unpacked-array element access whose index missed the array's
 // declared bounds, found by `--sanitize=bounds`. Not an LRM event: the access
 // itself still behaves exactly as LRM 7.4.6 / 11.5.1 says (an out-of-range read
@@ -170,20 +196,16 @@ void rt_defer_flush_final(void);
 // makes that silent outcome audible. Non-fatal — it prints and returns, so the
 // design keeps running with unchanged semantics.
 //
-// `where` is the compile-time "<file>:<line>:<col>" of the access and `name`
-// the array's hierarchical name; both are static-lifetime strings emitted with
-// the code. `index` is the index as the design wrote it, in the array's own
-// declared coordinates, and [`left`:`right`] are the declared bounds, so a
-// below-the-low-bound index reads as the negative it is. `flags` is a mask:
-// bit 0 set = write, clear = read; bit 1 set = the index carried x/z bits, in
-// which case `index` means nothing and is reported as x. `now` is the
-// simulation time in design ticks.
+// `index` is the index as the design wrote it, in the array's own declared
+// coordinates, so a below-the-low-bound index reads as the negative it is.
+// `flags` is a mask: bit 0 set = write, clear = read; bit 1 set = the index
+// carried x/z bits, in which case `index` means nothing and is reported as x.
+// `now` is the simulation time in design ticks.
 //
-// Repeats are capped per access site: a bad index inside an always block
-// re-fires on every activation, and the first reports carry all the
-// information the rest would bury.
-void rt_bounds_report(const char* where, const char* name, int32_t index, int32_t left,
-                      int32_t right, uint32_t flags, uint64_t now);
+// Repeats are capped per site: a bad index inside an always block re-fires on
+// every activation, and the first reports carry all the information the rest
+// would bury.
+void rt_bounds_report(const rt_bounds_site* site, int32_t index, uint32_t flags, uint64_t now);
 
 // Drive one simulation: run `drain` (the event loop), then `finals` (the
 // `final` blocks, LRM 9.2.3). `drain` returns normally whether it ran out of

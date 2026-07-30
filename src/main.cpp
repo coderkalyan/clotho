@@ -208,6 +208,22 @@ void report_timings(const clotho::Timings& t, Command command) {
     std::println(stderr, "  {:<12}{:>12.3f}", "total", total);
 }
 
+// Decodes an instruction's source location for whoever needs one: the IR dump's
+// headers, and the snippet a sanitizer bakes into its report. Everything comes
+// from the SourceManager lowering hands back, so it stays valid for as long as
+// `result` does.
+clotho::ir::LocResolver loc_resolver(const clotho::LowerResult& result) {
+    return [&result](clotho::ir::SourceLoc l) {
+        const clotho::SourcePosition pos = result.sources->resolve(l);
+        return clotho::ir::SourceText{
+            .where   = result.sources->render(l),
+            .line    = result.sources->line_text(l),
+            .line_no = pos.line,
+            .column  = pos.column,
+        };
+    };
+}
+
 // `build`: write the requested artifact. `-o -` (the default) means stdout.
 bool write_artifact(const clotho::LowerResult& result, Emit emit, std::string_view out,
                     const SimulationConfig& config, clotho::Timings* timings) {
@@ -216,7 +232,7 @@ bool write_artifact(const clotho::LowerResult& result, Emit emit, std::string_vi
     // IR dump you cannot map to source is much less useful when debugging a
     // lowering problem, and a sanitizer report with no file:line is barely a
     // report at all.
-    const auto resolve = [&](clotho::ir::SourceLoc l) { return result.sources->render(l); };
+    const auto resolve = loc_resolver(result);
     if (emit == Emit::Ir) {
         if (to_stdout) {
             clotho::ir::print_module(*result.module, std::cout, resolve);
@@ -447,7 +463,7 @@ int main(int argc, char** argv) {
     }
 
     if (command == Command::Run) {
-        const auto resolve = [&](clotho::ir::SourceLoc l) { return result.sources->render(l); };
+        const auto resolve = loc_resolver(result);
         const int  rc      = clotho::ir::run_jit(*result.module, tp, config, plusargs, resolve);
         // run_jit returns a negative sentinel on setup failure; the design's own
         // status passes through unchanged.
