@@ -105,9 +105,9 @@ void register_options(slang::CommandLine& cl, Options& o) {
            "comb-fuse, finish or parallel (repeatable, comma-separated)",
            "<name>", slang::CommandLineFlags::CommaList);
     cl.add("--sanitize", o.sanitizers,
-           "Check the design for a class of bug while it runs, reporting when one happens: xprov "
-           "(where an x value decided something, and what made it x). Costs simulation time "
-           "(repeatable, comma-separated)",
+           "Check the design for a class of bug while it runs, reporting when one happens: bounds "
+           "(an array index outside the array), xprov (where an x value decided something, and what "
+           "made it x). Costs simulation time (repeatable, comma-separated)",
            "<check>", slang::CommandLineFlags::CommaList);
     cl.add("--allow-system", o.allow_system,
            "Let the design run shell commands through $system, refused by default: 'const' allows "
@@ -366,16 +366,18 @@ int main(int argc, char** argv) {
                                            name));
         }
     }
-    // TODO(xsan): the mask is parsed and carried in SimulationConfig, but no
-    // backend pass reads it yet, so `--sanitize=xprov` is currently accepted
-    // and instruments nothing. Unguarded on purpose while xsan is being built
+    // TODO(xsan): both bits are parsed and carried in SimulationConfig, but no
+    // backend pass reads either yet, so `--sanitize` is currently accepted and
+    // instruments nothing. Unguarded on purpose while the sanitizers are built
     // out incrementally (the project's partial-feature exception); the guard
-    // disappears when the instrumentation lands, not the TODO.
+    // disappears as each check lands, not the TODO.
     for (const std::string& name : options.sanitizers) {
-        if (name == "xprov") {
+        if (name == "bounds") {
+            config.sanitizers |= static_cast<uint32_t>(Sanitizer::Bounds);
+        } else if (name == "xprov") {
             config.sanitizers |= static_cast<uint32_t>(Sanitizer::XProv);
         } else {
-            return usage_error(std::format("unknown --sanitize check '{}'; expected xprov", name));
+            return usage_error(std::format("unknown --sanitize check '{}'; expected bounds or xprov", name));
         }
     }
     if (options.allow_system.has_value()) {

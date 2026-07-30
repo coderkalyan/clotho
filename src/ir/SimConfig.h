@@ -58,6 +58,12 @@ enum class Sanitizer : uint32_t {
     // decides something the design cannot recover from, and report the chain
     // of assignments that produced it. See docs/design/x-semantics.md.
     XProv = 1u << 0,
+    // Report an array index that misses its declared bounds. The LRM makes
+    // this silent (7.4.6 / 11.5.1: an out-of-range read yields the element
+    // default, an out-of-range write is dropped), and the backend already
+    // computes the predicate that decides it -- `dyn_inrange` on the lvalue.
+    // The check is that predicate, reported instead of discarded.
+    Bounds = 1u << 1,
 };
 
 [[nodiscard]] inline bool sanitizer_on(uint32_t sanitizers, Sanitizer s) {
