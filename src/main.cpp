@@ -51,6 +51,7 @@
 
 namespace {
 
+using clotho::ir::Sanitizer;
 using clotho::ir::SimulationConfig;
 using clotho::ir::Stat;
 using clotho::ir::SystemAccess;
@@ -74,6 +75,7 @@ struct Options {
     std::optional<bool>        time;
     std::optional<bool>        o3;
     std::vector<std::string>   stats;
+    std::vector<std::string>   sanitizers;
     std::optional<std::string> allow_system;
     std::vector<std::string>   dpi_libs;
     std::optional<bool>        perf_jitdump;
@@ -102,6 +104,11 @@ void register_options(slang::CommandLine& cl, Options& o) {
            "Print a compiler statistic while building, for working on clotho: dedup, dedup-sets, "
            "comb-fuse, finish or parallel (repeatable, comma-separated)",
            "<name>", slang::CommandLineFlags::CommaList);
+    cl.add("--sanitize", o.sanitizers,
+           "Check the design for a class of bug while it runs, reporting when one happens: xprov "
+           "(where an x value decided something, and what made it x). Costs simulation time "
+           "(repeatable, comma-separated)",
+           "<check>", slang::CommandLineFlags::CommaList);
     cl.add("--allow-system", o.allow_system,
            "Let the design run shell commands through $system, refused by default: 'const' allows "
            "only commands written literally in the source, 'full' allows any command the design "
@@ -357,6 +364,18 @@ int main(int argc, char** argv) {
             return usage_error(std::format("unknown --stat '{}'; expected dedup, dedup-sets, comb-fuse, "
                                            "finish or parallel",
                                            name));
+        }
+    }
+    // TODO(xsan): the mask is parsed and carried in SimulationConfig, but no
+    // backend pass reads it yet, so `--sanitize=xprov` is currently accepted
+    // and instruments nothing. Unguarded on purpose while xsan is being built
+    // out incrementally (the project's partial-feature exception); the guard
+    // disappears when the instrumentation lands, not the TODO.
+    for (const std::string& name : options.sanitizers) {
+        if (name == "xprov") {
+            config.sanitizers |= static_cast<uint32_t>(Sanitizer::XProv);
+        } else {
+            return usage_error(std::format("unknown --sanitize check '{}'; expected xprov", name));
         }
     }
     if (options.allow_system.has_value()) {

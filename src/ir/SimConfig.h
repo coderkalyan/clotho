@@ -48,6 +48,22 @@ enum class Stat : uint32_t {
     return (stats & static_cast<uint32_t>(s)) != 0;
 }
 
+// Dynamic checks selected by `--sanitize=<list>`, as a bitmask in
+// `SimulationConfig::sanitizers`. A sanitizer is not a `Stat`: it changes the
+// emitted code (instrumentation, and a runtime report when a check trips) but
+// never the design's own semantics, so a sanitized run computes exactly what
+// an unsanitized one does.
+enum class Sanitizer : uint32_t {
+    // xsan, the x-provenance sanitizer: flag the point where an x/z value
+    // decides something the design cannot recover from, and report the chain
+    // of assignments that produced it. See docs/design/x-semantics.md.
+    XProv = 1u << 0,
+};
+
+[[nodiscard]] inline bool sanitizer_on(uint32_t sanitizers, Sanitizer s) {
+    return (sanitizers & static_cast<uint32_t>(s)) != 0;
+}
+
 struct SimulationConfig {
     // Run the coroutine-lowering pipeline (CoroSplit et al.), required to
     // produce runnable code — run_jit forces it on. False emits the raw
@@ -140,6 +156,10 @@ struct SimulationConfig {
     // Statistics to report (`--stat=<list>`): a mask of `Stat` bits, tested
     // with stat_on. Zero reports nothing.
     uint32_t stats = 0;
+    // Dynamic checks to instrument (`--sanitize=<list>`): a mask of
+    // `Sanitizer` bits, tested with sanitizer_on. Zero instruments nothing,
+    // which is the default — a sanitizer costs code size and simulation time.
+    uint32_t sanitizers = 0;
 };
 
 } // namespace clotho::ir
