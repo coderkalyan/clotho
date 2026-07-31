@@ -175,9 +175,12 @@ typedef enum rt_bounds_what {
     RT_BOUNDS_PART = 2,
     // Character index into a string (LRM 6.16.2 / 6.16.3).
     RT_BOUNDS_CHAR = 3,
-    // Index argument of a queue method: insert / delete / a pop from empty
-    // (LRM 7.10.2.2 - 7.10.2.5).
+    // Index argument of a queue method: insert / delete
+    // (LRM 7.10.2.2 - 7.10.2.3).
     RT_BOUNDS_QUEUE_OP = 4,
+    // pop_front / pop_back on an empty queue (LRM 7.10.2.4 - 7.10.2.5). No
+    // index and no bound: the report is the fact itself.
+    RT_BOUNDS_EMPTY_POP = 5,
 } rt_bounds_what;
 
 // One instrumented access, emitted by the backend as a constant global beside

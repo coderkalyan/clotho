@@ -72,8 +72,8 @@ enum class Sanitizer : uint32_t {
     // (fixed-size against its declared range, dynamic array and queue against
     // their current size), string elements of an array, packed bit-selects and
     // indexed part-selects (which report separately when only part of the
-    // selection fell outside, LRM 11.5.1), string character indices, and the
-    // index argument of queue insert / delete.
+    // selection fell outside, LRM 11.5.1), string character indices, the index
+    // argument of queue insert / delete, and a pop from an empty queue.
     //
     // Deliberately NOT reported: an absent associative-array key. LRM 7.8.6
     // does mandate a warning there, but 7.9.11 suppresses it for an array

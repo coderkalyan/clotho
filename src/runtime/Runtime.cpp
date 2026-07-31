@@ -3040,18 +3040,25 @@ extern "C" void rt_bounds_report(const rt_bounds_site* site, int64_t index, int6
                                             : "part select out of bounds"; break;
         case RT_BOUNDS_CHAR: noun = "string index out of bounds"; break;
         case RT_BOUNDS_QUEUE_OP: noun = "queue index out of bounds"; break;
+        case RT_BOUNDS_EMPTY_POP: noun = "pop from an empty queue"; break;
         default: break;
     }
-    const std::string idx   = unknown ? std::string("x") : std::to_string(index);
-    const std::string subj  = site->what == RT_BOUNDS_PART
-                                ? fmt::format("index {} +: {}", idx, site->width)
-                                : fmt::format("index {}", idx);
-    const char*       unit  = site->what == RT_BOUNDS_CHAR ? "length"
-                            : (site->what == RT_BOUNDS_BIT || site->what == RT_BOUNDS_PART) ? "width"
-                                                                                            : "size";
-    const std::string bound = extent >= 0 ? fmt::format("{} {}", unit, extent)
-                                          : fmt::format("range [{}:{}]", site->left, site->right);
-    fmt::print(stderr, head, " {}: {}, {}", noun, subj, bound);
+    if (site->what == RT_BOUNDS_EMPTY_POP) {
+        // No index and no bound to name: the headline is the whole finding.
+        fmt::print(stderr, head, " {}", noun);
+    } else {
+        const std::string idx   = unknown ? std::string("x") : std::to_string(index);
+        const std::string subj  = site->what == RT_BOUNDS_PART
+                                    ? fmt::format("index {} +: {}", idx, site->width)
+                                    : fmt::format("index {}", idx);
+        const char*       unit  = site->what == RT_BOUNDS_CHAR ? "length"
+                                : (site->what == RT_BOUNDS_BIT || site->what == RT_BOUNDS_PART)
+                                  ? "width"
+                                  : "size";
+        const std::string bound = extent >= 0 ? fmt::format("{} {}", unit, extent)
+                                              : fmt::format("range [{}:{}]", site->left, site->right);
+        fmt::print(stderr, head, " {}: {}, {}", noun, subj, bound);
+    }
     fmt::print(stderr, "\n");
     fmt::print(stderr, loc, "{}", site->where);
     fmt::print(stderr, "\n");

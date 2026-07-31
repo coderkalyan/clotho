@@ -10349,9 +10349,12 @@ private:
     }
 
     void lower_queue_pop(Index i, bool front) {
-        const auto&   p   = ir_->payload(i).op_type;
-        const DynElem e   = dynarr_elem(p.type);
-        llvm::Value*  ops = elem_ops_global(p.type);
+        const auto&   p      = ir_->payload(i).op_type;
+        const DynElem e      = dynarr_elem(p.type);
+        llvm::Value*  ops    = elem_ops_global(p.type);
+        const LValue& qlv    = lvalue_of(p.op);
+        llvm::Value*  handle = lv_handle_ptr(qlv);
+        emit_empty_pop_bounds_check(i, handle, qlv);
         if (e.is_string) {
             // The result handle is this instruction's string temp
             // (produces_string_temp). Reset it to the owned-empty state, then
@@ -10360,14 +10363,14 @@ private:
             llvm::Value* out = str_of(i);
             b_.CreateCall(str_deinit_fn(), { out });
             b_.CreateCall(str_init_fn(), { out });
-            b_.CreateCall(queue_pop_fn(front), { lv_handle_ptr(lvalue_of(p.op)), ops, out });
+            b_.CreateCall(queue_pop_fn(front), { handle, ops, out });
             return;
         }
         auto* scratch = entry_alloca(e.slot_ty, "q.elem");
         // Pre-fill with the default: the runtime leaves an empty-queue pop
         // untouched, so the load below then reads the element default.
         b_.CreateStore(elem_default_const(e), scratch);
-        b_.CreateCall(queue_pop_fn(front), { lv_handle_ptr(lvalue_of(p.op)), ops, scratch });
+        b_.CreateCall(queue_pop_fn(front), { handle, ops, scratch });
         Plane         v = lower_load(elem_scratch_lvalue(scratch, e));
         const ValType t = type_of(i);
         if (t.is_real) {
@@ -11997,7 +12000,14 @@ private:
     }
 
     // The rt_bounds_what enum (Runtime.h), which picks the report's wording.
-    enum class BoundsWhat : int32_t { Element = 0, Bit = 1, Part = 2, Char = 3, QueueOp = 4 };
+    enum class BoundsWhat : int32_t {
+        Element  = 0,
+        Bit      = 1,
+        Part     = 2,
+        Char     = 3,
+        QueueOp  = 4,
+        EmptyPop = 5,
+    };
 
     // The rt_bounds_site record (Runtime.h): { ptr where, ptr line, ptr name,
     // i32 line_no, i32 column, i32 what, i32 left, i32 right, i32 width }.
@@ -12142,6 +12152,26 @@ private:
                                                         BoundsWhat::QueueOp, 0, 0),
                            },
                            /*is_write=*/true);
+    }
+
+    // pop_front / pop_back on an empty queue (LRM 7.10.2.4 - 7.10.2.5: the
+    // result is the Table 7-1 element default, the queue is untouched, and the
+    // clause explicitly permits a warning). No index to report -- the finding
+    // is that the queue had nothing in it.
+    void emit_empty_pop_bounds_check(Index at, llvm::Value* handle, const LValue& named) {
+        if (!sanitizer_on(config_.sanitizers, Sanitizer::Bounds)) {
+            return;
+        }
+        llvm::Value* len = b_.CreateLoad(b_.getInt64Ty(),
+                                         b_.CreateStructGEP(queue_slot_ty(), handle, 2));
+        emit_bounds_report(BoundsCheck{
+                             .inrange = b_.CreateICmpNE(len, b_.getInt64(0)),
+                             .index   = b_.getInt64(0),
+                             .extent  = len,
+                             .site    = bounds_site_global(loc_text(at), bounds_name(named),
+                                                           BoundsWhat::EmptyPop, 0, 0),
+                           },
+                           /*is_write=*/false);
     }
 
     // One --sanitize=bounds check: a branch on the in-range predicate the access
