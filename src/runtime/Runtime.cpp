@@ -2995,10 +2995,11 @@ fmt::text_style styled(fmt::text_style s) {
 
 } // namespace
 
-extern "C" void rt_bounds_report(const rt_bounds_site* site, int32_t index, uint32_t flags,
-                                 uint64_t now) {
+extern "C" void rt_bounds_report(const rt_bounds_site* site, int64_t index, int64_t extent,
+                                 uint32_t flags, uint64_t now) {
     const bool     write   = (flags & 1u) != 0;
     const bool     unknown = (flags & 2u) != 0;
+    const bool     partial = (flags & 4u) != 0;
     const uint64_t key     = reinterpret_cast<uint64_t>(site) * 2 + (write ? 1 : 0);
     uint32_t&      hits    = g_bounds_hits[key];
     if (hits >= bounds_report_cap) {
@@ -3028,10 +3029,29 @@ extern "C" void rt_bounds_report(const rt_bounds_site* site, int32_t index, uint
     // everything it formatted, and a reset that lands past the line break
     // leaves the style live across it.
     fmt::print(stderr, label, "warning:");
-    // An x/z index is out of range by LRM Table 7-1 with no numeric value to
+    // What was indexed, and how it was bounded. A runtime-sized object reports
+    // the size it actually had; a declared one reports the range as written.
+    // An x/z index is invalid by LRM 7.4.5 / Table 7-1 with no numeric value to
     // report, so it prints as what it is rather than as its must-plane bits.
-    fmt::print(stderr, head, " index out of bounds: index {}, range [{}:{}]",
-               unknown ? std::string("x") : std::to_string(index), site->left, site->right);
+    const char* noun = "index out of bounds";
+    switch (site->what) {
+        case RT_BOUNDS_BIT: noun = "bit select out of bounds"; break;
+        case RT_BOUNDS_PART: noun = partial ? "part select partly out of bounds"
+                                            : "part select out of bounds"; break;
+        case RT_BOUNDS_CHAR: noun = "string index out of bounds"; break;
+        case RT_BOUNDS_QUEUE_OP: noun = "queue index out of bounds"; break;
+        default: break;
+    }
+    const std::string idx   = unknown ? std::string("x") : std::to_string(index);
+    const std::string subj  = site->what == RT_BOUNDS_PART
+                                ? fmt::format("index {} +: {}", idx, site->width)
+                                : fmt::format("index {}", idx);
+    const char*       unit  = site->what == RT_BOUNDS_CHAR ? "length"
+                            : (site->what == RT_BOUNDS_BIT || site->what == RT_BOUNDS_PART) ? "width"
+                                                                                            : "size";
+    const std::string bound = extent >= 0 ? fmt::format("{} {}", unit, extent)
+                                          : fmt::format("range [{}:{}]", site->left, site->right);
+    fmt::print(stderr, head, " {}: {}, {}", noun, subj, bound);
     fmt::print(stderr, "\n");
     fmt::print(stderr, loc, "{}", site->where);
     fmt::print(stderr, "\n");

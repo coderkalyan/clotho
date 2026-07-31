@@ -58,22 +58,28 @@ enum class Sanitizer : uint32_t {
     // decides something the design cannot recover from, and report the chain
     // of assignments that produced it. See docs/design/x-semantics.md.
     XProv = 1u << 0,
-    // Report an array index that misses its declared bounds. The LRM makes
-    // this silent (7.4.6 / 11.5.1: an out-of-range read yields the element
-    // default, an out-of-range write is dropped, and Table 7-1 counts an x/z
-    // index as out of range), and the backend already computes the predicate
-    // that decides it -- `dyn_inrange` on the lvalue. The check IS that
-    // predicate, reported through rt_bounds_report instead of discarded, so it
-    // cannot disagree with what the access then does.
+    // Report an index that misses the bounds of what it indexes. The LRM makes
+    // this silent almost everywhere (7.4.5 + Table 7-1: an out-of-range read
+    // yields the element default, an out-of-range write performs no operation,
+    // and an x/z index is invalid exactly like one past the end; 11.5.1 for a
+    // packed select; 6.16.2/6.16.3 for a string character), while explicitly
+    // permitting the diagnostic. Wherever the backend already computes the
+    // predicate that decides the outcome, the check IS that predicate reported
+    // through rt_bounds_report instead of discarded, so it cannot disagree with
+    // what the access then does.
     //
-    // Covers fixed-size unpacked-array element access today: blocking read,
-    // blocking write, and nonblocking write. Still to come -- string elements
-    // (they bypass the shared element load/store), aggregate-leaf nonblocking
-    // writes, whole-object copies, and packed bit/part selects, which are
-    // bounded by `range_mask` rather than `dyn_inrange`. Dynamic arrays and
-    // queues share `dyn_inrange` but are deliberately NOT reported: their
-    // bound is a runtime length, not a declared range, and an absent
-    // associative-array key is legal lookup, not a bug.
+    // Covers, for read and write alike: unpacked-array elements of every kind
+    // (fixed-size against its declared range, dynamic array and queue against
+    // their current size), string elements of an array, packed bit-selects and
+    // indexed part-selects (which report separately when only part of the
+    // selection fell outside, LRM 11.5.1), string character indices, and the
+    // index argument of queue insert / delete.
+    //
+    // Deliberately NOT reported: an absent associative-array key. LRM 7.8.6
+    // does mandate a warning there, but 7.9.11 suppresses it for an array
+    // declared with a `default:`, and 7.8.7 makes a read-modify-write allocate
+    // before the read -- neither of which clotho models yet, so reporting now
+    // would be a false-positive machine. It wants its own check, not this one.
     Bounds = 1u << 1,
 };
 

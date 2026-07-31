@@ -254,23 +254,34 @@ constexpr code bxnor4(code a, code b) {
 constexpr uint32_t BXNOR1_LUT = build_lut(bxnor4);
 static_assert(BXNOR1_LUT == EQ1_LUT, "1-bit xnor must equal 1-bit ==");
 
-// One pending `--sanitize=bounds` check: an unpacked-array dimension whose
-// runtime index the backend could not prove inside the declared bounds.
-// Recorded where the element lvalue is built -- the only place that knows the
-// array's identity and bounds -- and reported where the access finally
-// happens, which is the only place that knows whether it is a read or a write.
+// One pending `--sanitize=bounds` check: an index the backend could not prove
+// inside the bounds of what it indexes. Recorded where the access is built --
+// the only place that knows the container's identity and bounds -- and reported
+// where the access finally happens, which is the only place that knows whether
+// it is a read or a write. An access whose direction is known at the point it
+// is built (a string putc, a queue method) skips the LValue and reports on the
+// spot through emit_bounds_report.
 struct BoundsCheck {
-    // i1: this dimension's index landed inside the declared bounds. Literally
-    // the predicate the LRM behaviour is built from, so the report can never
-    // disagree with what the access then does.
+    // i1: the index landed inside the bounds. Literally the predicate the LRM
+    // behaviour is built from wherever one already exists, so the report can
+    // never disagree with what the access then does.
     llvm::Value* inrange = nullptr;
-    // i32: the index as the design wrote it, in declared-range coordinates.
+    // i64: the index as the design wrote it, in the container's own coordinates
+    // and extended with the index expression's own signedness.
     llvm::Value* index = nullptr;
-    // i1: the index carried x/z bits, which makes `index` meaningless.
+    // i1: the index carried x/z bits, which makes `index` meaningless. Null
+    // where the index cannot be unknown (a 2-state expression).
     llvm::Value* unknown = nullptr;
-    // ptr: the site's constant rt_bounds_site record (file, source line, array
-    // name, declared bounds). Everything compile-time about the access lives
-    // there, so only the runtime values travel as call arguments.
+    // i64: the container's size at the moment of the access, for one bounded by
+    // a runtime length (dynamic array, queue, string). Null for a declared
+    // range, which lives in the site record instead.
+    llvm::Value* extent = nullptr;
+    // i1: only part of an indexed part-select fell outside (LRM 11.5.1 keeps the
+    // in-range bits). Null for an all-or-nothing access.
+    llvm::Value* partial = nullptr;
+    // ptr: the site's constant rt_bounds_site record (file, source line, name,
+    // index kind, declared bounds). Everything compile-time about the access
+    // lives there, so only the runtime values travel as call arguments.
     llvm::Constant* site = nullptr;
 };
 
@@ -8504,7 +8515,8 @@ private:
                 llvm::Value*       idx    = cast(must_of(idxp), 32, false);
                 lv.bit_off = lv.bit_off != nullptr ? b_.CreateAdd(lv.bit_off, idx) : idx;
                 lv.width   = 1;
-                set_select_bounds(lv, cbase, cwidth, 1, any_unknown(idxp));
+                const SelectVerdict sv = set_select_bounds(lv, cbase, cwidth, 1, any_unknown(idxp));
+                add_select_bounds_check(lv, i, p.binary.r, sv, BoundsWhat::Bit, cwidth, 1);
                 set_lvalue(i, lv);
                 return;
             }
@@ -8531,7 +8543,9 @@ private:
                 llvm::Value*       off    = cast(must_of(offp), 32, false);
                 lv.bit_off = lv.bit_off != nullptr ? b_.CreateAdd(lv.bit_off, off) : off;
                 lv.width   = dps.width;
-                set_select_bounds(lv, cbase, cwidth, dps.width, any_unknown(offp));
+                const SelectVerdict sv =
+                  set_select_bounds(lv, cbase, cwidth, dps.width, any_unknown(offp));
+                add_select_bounds_check(lv, i, dps.offset, sv, BoundsWhat::Part, cwidth, dps.width);
                 set_lvalue(i, lv);
                 return;
             }
@@ -8559,35 +8573,46 @@ private:
                       raw_ptr_ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 0));
                     llvm::Value* len = b_.CreateLoad(
                       b_.getInt64Ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 1));
-                    llvm::Value* idx64 = cast(must_of(value_of(es.index)), 64, false);
+                    // LRM 7.4.5 covers "an unpacked array of any kind": an x/z
+                    // index is invalid exactly like one past the end, so the
+                    // unknown term belongs in the gate and not only in the report.
+                    const Plane  idxp    = value_of(es.index);
+                    llvm::Value* idx64   = cast(must_of(idxp), 64, false);
+                    llvm::Value* unknown = any_unknown(idxp);
+                    llvm::Value* inrange =
+                      b_.CreateAnd(b_.CreateICmpULT(idx64, len), b_.CreateNot(unknown));
                     if (e.is_string) {
                         // String element: an rt_string handle slot in the heap
                         // buffer. Bounds ride lv_string_ptr's sink redirect.
                         LValue sel;
-                        sel.base        = dataptr;
-                        sel.is_string   = true;
-                        sel.slot_ty     = e.slot_ty;
-                        sel.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
-                        sel.elem_idx    = cast(idx64, 32, false);
-                        sel.is_signal   = lv.is_signal;
-                        sel.sig         = lv.sig;
-                        sel.dyn_inrange = b_.CreateICmpULT(idx64, len);
+                        sel.base          = dataptr;
+                        sel.is_string     = true;
+                        sel.slot_ty       = e.slot_ty;
+                        sel.array_ty      = llvm::ArrayType::get(e.slot_ty, 0);
+                        sel.elem_idx      = cast(idx64, 32, false);
+                        sel.is_signal     = lv.is_signal;
+                        sel.sig           = lv.sig;
+                        sel.dyn_inrange   = inrange;
+                        sel.bounds_checks = lv.bounds_checks;
+                        add_elem_bounds_check(sel, i, lv, es.index, inrange, unknown, len);
                         set_lvalue(i, sel);
                         return;
                     }
                     LValue       el;
-                    el.base        = dataptr;
-                    el.slot_ty     = e.slot_ty;
-                    el.has_z       = e.has_z;
-                    el.narrow      = e.narrow;
-                    el.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
-                    el.elem_idx    = cast(idx64, 32, false);
-                    el.store_width = e.width;
-                    el.bit_off     = b_.getInt32(0);
-                    el.width       = e.width;
-                    el.is_signal   = lv.is_signal;
-                    el.sig         = lv.sig;
-                    el.dyn_inrange = b_.CreateICmpULT(idx64, len);
+                    el.base          = dataptr;
+                    el.slot_ty       = e.slot_ty;
+                    el.has_z         = e.has_z;
+                    el.narrow        = e.narrow;
+                    el.array_ty      = llvm::ArrayType::get(e.slot_ty, 0);
+                    el.elem_idx      = cast(idx64, 32, false);
+                    el.store_width   = e.width;
+                    el.bit_off       = b_.getInt32(0);
+                    el.width         = e.width;
+                    el.is_signal     = lv.is_signal;
+                    el.sig           = lv.sig;
+                    el.dyn_inrange   = inrange;
+                    el.bounds_checks = lv.bounds_checks;
+                    add_elem_bounds_check(el, i, lv, es.index, inrange, unknown, len);
                     set_lvalue(i, el);
                     return;
                 }
@@ -8609,36 +8634,46 @@ private:
                       b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 2));
                     llvm::Value* cap = b_.CreateLoad(
                       b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 3));
-                    llvm::Value* idx64 = cast(must_of(value_of(es.index)), 64, false);
+                    // An x/z index is invalid for an unpacked array of any kind
+                    // (LRM 7.4.5), so it gates the access, not just the report.
+                    const Plane  idxp    = value_of(es.index);
+                    llvm::Value* idx64   = cast(must_of(idxp), 64, false);
+                    llvm::Value* unknown = any_unknown(idxp);
+                    llvm::Value* inrange =
+                      b_.CreateAnd(b_.CreateICmpULT(idx64, len), b_.CreateNot(unknown));
                     llvm::Value* safe_cap =
                       b_.CreateSelect(b_.CreateICmpEQ(cap, b_.getInt64(0)), b_.getInt64(1), cap);
                     llvm::Value* phys = b_.CreateURem(b_.CreateAdd(head, idx64), safe_cap);
                     if (e.is_string) {
                         LValue sel;
-                        sel.base        = baseptr;
-                        sel.is_string   = true;
-                        sel.slot_ty     = e.slot_ty;
-                        sel.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
-                        sel.elem_idx    = cast(phys, 32, false);
-                        sel.is_signal   = lv.is_signal;
-                        sel.sig         = lv.sig;
-                        sel.dyn_inrange = b_.CreateICmpULT(idx64, len);
+                        sel.base          = baseptr;
+                        sel.is_string     = true;
+                        sel.slot_ty       = e.slot_ty;
+                        sel.array_ty      = llvm::ArrayType::get(e.slot_ty, 0);
+                        sel.elem_idx      = cast(phys, 32, false);
+                        sel.is_signal     = lv.is_signal;
+                        sel.sig           = lv.sig;
+                        sel.dyn_inrange   = inrange;
+                        sel.bounds_checks = lv.bounds_checks;
+                        add_elem_bounds_check(sel, i, lv, es.index, inrange, unknown, len);
                         set_lvalue(i, sel);
                         return;
                     }
                     LValue       el;
-                    el.base        = baseptr;
-                    el.slot_ty     = e.slot_ty;
-                    el.has_z       = e.has_z;
-                    el.narrow      = e.narrow;
-                    el.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
-                    el.elem_idx    = cast(phys, 32, false);
-                    el.store_width = e.width;
-                    el.bit_off     = b_.getInt32(0);
-                    el.width       = e.width;
-                    el.is_signal   = lv.is_signal;
-                    el.sig         = lv.sig;
-                    el.dyn_inrange = b_.CreateICmpULT(idx64, len);
+                    el.base          = baseptr;
+                    el.slot_ty       = e.slot_ty;
+                    el.has_z         = e.has_z;
+                    el.narrow        = e.narrow;
+                    el.array_ty      = llvm::ArrayType::get(e.slot_ty, 0);
+                    el.elem_idx      = cast(phys, 32, false);
+                    el.store_width   = e.width;
+                    el.bit_off       = b_.getInt32(0);
+                    el.width         = e.width;
+                    el.is_signal     = lv.is_signal;
+                    el.sig           = lv.sig;
+                    el.dyn_inrange   = inrange;
+                    el.bounds_checks = lv.bounds_checks;
+                    add_elem_bounds_check(el, i, lv, es.index, inrange, unknown, len);
                     set_lvalue(i, el);
                     return;
                 }
@@ -8663,23 +8698,8 @@ private:
                     b_.CreateAnd(b_.CreateICmpULT(norm, b_.getInt32(count)), b_.CreateNot(any_unknown(idxp)));
                 lv.dyn_inrange = lv.dyn_inrange != nullptr ? b_.CreateAnd(lv.dyn_inrange, inrange)
                                                            : inrange;
-                if (sanitizer_on(config_.sanitizers, Sanitizer::Bounds)) {
-                    // --sanitize=bounds: keep this dimension's verdict and the
-                    // index the design wrote, against a record of who was indexed
-                    // and where. Not reported here -- a select is not yet a read
-                    // or a write, and the direction is half the report.
-                    //
-                    // A local / formal array has no name in the backend (frame
-                    // slots carry none), so it reports as what it is.
-                    lv.bounds_checks.push_back(BoundsCheck{
-                      .inrange = inrange,
-                      .index   = idx,
-                      .unknown = any_unknown(idxp),
-                      .site    = bounds_site_global(
-                        loc_text(i), lv.is_signal ? mod_.signal(lv.sig).name : std::string("<local>"),
-                        static_cast<int32_t>(at.left), static_cast<int32_t>(at.right)),
-                    });
-                }
+                add_elem_bounds_check(lv, i, lv, es.index, inrange, any_unknown(idxp), nullptr,
+                                      static_cast<int32_t>(at.left), static_cast<int32_t>(at.right));
                 if (lv.is_agg) {
                     // Recursive storage is one ArrayType per dimension (not
                     // flattened): push a nested-GEP index step. A runtime element
@@ -8809,6 +8829,7 @@ private:
 
             case Inst::Tag::Load: {
                 const LValue& lv = lvalue_of(p.unary);
+                emit_bounds_reports(lv, /*is_write=*/false);
                 if (lv.is_handle) {
                     // Defense in depth: a queue / dynamic-array handle has no
                     // plane value; every legal consumer goes through the
@@ -8855,6 +8876,7 @@ private:
                 // is woken. Snapshot the old value first so the transition can be
                 // detected from old -> new.
                 const LValue& lv      = lvalue_of(p.binary.l);
+                emit_bounds_reports(lv, /*is_write=*/true);
                 if (lv.is_handle) {
                     throw BackendError{ "plane store to a queue / dynamic-array handle" };
                 }
@@ -8918,6 +8940,7 @@ private:
             // live and services wait queues only after every active process has run.
             case Inst::Tag::StoreNb: {
                 const LValue& lv  = lvalue_of(p.binary.l);
+                emit_bounds_reports(lv, /*is_write=*/true);
                 Plane         rhs = value_of(p.binary.r);
                 if (type_of(p.binary.r).is_real) {
                     rhs = real_to_planes(fp_of(rhs));
@@ -9447,9 +9470,11 @@ private:
                 return;
             }
             case Inst::Tag::StrGetc: {
+                llvm::Value* str = str_of(p.binary.l);
                 llvm::Value* idx =
                   cast(must_of(value_of(p.binary.r)), 32, type_of(p.binary.r).is_signed);
-                llvm::Value* c = b_.CreateCall(str_getc_fn(), { str_of(p.binary.l), idx });
+                emit_string_bounds_check(i, str, p.binary.r, "<string>", /*is_write=*/false);
+                llvm::Value* c = b_.CreateCall(str_getc_fn(), { str, idx });
                 llvm::Value* v = b_.CreateTrunc(c, int_ty(8));
                 set_value(i, packed(v, v, zero(8)));
                 return;
@@ -9457,10 +9482,13 @@ private:
             case Inst::Tag::StrPutc: {
                 const auto    sp = ir_->extra_data<StrPutcInfo>(p.op_extra.extra);
                 const LValue& lv = lvalue_of(p.op_extra.op);
+                emit_bounds_reports(lv, /*is_write=*/true);
+                llvm::Value*  str = lv_string_ptr(lv);
                 llvm::Value*  idx =
                   cast(must_of(value_of(sp.index)), 32, type_of(sp.index).is_signed);
                 llvm::Value* ch = cast(must_of(value_of(sp.ch)), 32, false);
-                b_.CreateCall(str_putc_fn(), { lv_string_ptr(lv), idx, ch });
+                emit_string_bounds_check(i, str, sp.index, bounds_name(lv), /*is_write=*/true);
+                b_.CreateCall(str_putc_fn(), { str, idx, ch });
                 return;
             }
             case Inst::Tag::StrAtoi:
@@ -10129,7 +10157,6 @@ private:
     // the same Plane shape lower_load would (narrow -> two_val; else { i2W, iW }),
     // so the caller's real / domain handling is unchanged.
     Plane dyn_elem_load(const LValue& lv) {
-        emit_bounds_reports(lv, /*is_write=*/false);
         auto* fn    = b_.GetInsertBlock()->getParent();
         auto* inbb  = llvm::BasicBlock::Create(ctx_, "dyn.load.in", fn);
         auto* defbb = llvm::BasicBlock::Create(ctx_, "dyn.load.def", fn);
@@ -10167,7 +10194,6 @@ private:
     // its wait-queue servicing run only when the index is in [0, len); an
     // out-of-range write is a no-op.
     void dyn_elem_store(const LValue& lv, Plane rhs) {
-        emit_bounds_reports(lv, /*is_write=*/true);
         auto* fn   = b_.GetInsertBlock()->getParent();
         auto* dobb = llvm::BasicBlock::Create(ctx_, "dyn.store.do", fn);
         auto* cont = llvm::BasicBlock::Create(ctx_, "dyn.store.cont", fn);
@@ -10357,22 +10383,27 @@ private:
         llvm::Value*  ops   = elem_ops_global(qi.queue_type);
         llvm::Value*  idx   = cast(must_of(value_of(qi.idx)), 64, false);
         llvm::Value*  bound = b_.getInt64(std::get<Type>(mod_.pool.get(qi.queue_type)).left);
+        const LValue& qlv   = lvalue_of(p.op);
+        llvm::Value*  handle = lv_handle_ptr(qlv);
+        // Inserting AT the size is an append, so the legal range is [0, size].
+        emit_queue_bounds_check(i, handle, qi.idx, qlv, /*allow_append=*/true);
         if (e.is_string) {
-            b_.CreateCall(queue_insert_fn(),
-                          { lv_handle_ptr(lvalue_of(p.op)), ops, bound, idx, str_of(qi.val) });
+            b_.CreateCall(queue_insert_fn(), { handle, ops, bound, idx, str_of(qi.val) });
             return;
         }
         auto* scratch = entry_alloca(e.slot_ty, "q.elem");
         lower_store(elem_scratch_lvalue(scratch, e), value_of(qi.val));
-        b_.CreateCall(queue_insert_fn(), { lv_handle_ptr(lvalue_of(p.op)), ops, bound, idx, scratch });
+        b_.CreateCall(queue_insert_fn(), { handle, ops, bound, idx, scratch });
     }
 
     void lower_queue_delete_idx(Index i) {
-        const auto&  p   = ir_->payload(i).op_extra;
-        const auto   qa  = ir_->extra_data<QueueArg>(p.extra);
-        llvm::Value* idx = cast(must_of(value_of(qa.arg)), 64, false);
-        b_.CreateCall(queue_delete_idx_fn(),
-                      { lv_handle_ptr(lvalue_of(p.op)), elem_ops_global(qa.queue_type), idx });
+        const auto&   p      = ir_->payload(i).op_extra;
+        const auto    qa     = ir_->extra_data<QueueArg>(p.extra);
+        llvm::Value*  idx    = cast(must_of(value_of(qa.arg)), 64, false);
+        const LValue& qlv    = lvalue_of(p.op);
+        llvm::Value*  handle = lv_handle_ptr(qlv);
+        emit_queue_bounds_check(i, handle, qa.arg, qlv, /*allow_append=*/false);
+        b_.CreateCall(queue_delete_idx_fn(), { handle, elem_ops_global(qa.queue_type), idx });
     }
 
     void lower_queue_delete_all(Index i) {
@@ -11020,6 +11051,30 @@ private:
     // layout. The NBA region replays it by memcpy (later write to the same leaf
     // wins). Whole-leaf only — a partial leaf write is guarded in the frontend.
     void emit_agg_nba(const LValue& lv, Plane rhs) {
+        if (lv.dyn_inrange != nullptr) {
+            // An aggregate leaf under a variable array index outside the
+            // declared bound (LRM 7.4.5: the write performs no operation), so
+            // no record is staged at all. Without this, agg_slot_ptr below GEPs
+            // past the array and the NBA region memcpys through that pointer
+            // unconditionally when it replays the record -- `arr[9].f <= v` on
+            // an `arr[0:3]` corrupts state, and a wild index segfaults.
+            // emit_array_nba guards its own path the same way; this one was
+            // missed.
+            auto* fn   = b_.GetInsertBlock()->getParent();
+            auto* dobb = llvm::BasicBlock::Create(ctx_, "aggnba.do", fn);
+            auto* cont = llvm::BasicBlock::Create(ctx_, "aggnba.cont", fn);
+            b_.CreateCondBr(lv.dyn_inrange, dobb, cont);
+
+            b_.SetInsertPoint(dobb);
+            LValue clean      = lv;
+            clean.dyn_inrange = nullptr;
+            clean.bounds_checks.clear();
+            emit_agg_nba(clean, rhs);
+            b_.CreateBr(cont);
+
+            b_.SetInsertPoint(cont);
+            return;
+        }
         const SignalSlot& s      = slot_of(lv.sig);
         const uint32_t    W      = lv.store_width;
         const llvm::Align a1{ 1 };
@@ -11153,7 +11208,6 @@ private:
             // staged at all -- lv_mm_ptr(lv) below would otherwise compute an
             // out-of-bounds destination pointer that the NBA region later
             // dereferences unconditionally when replaying the record.
-            emit_bounds_reports(lv, /*is_write=*/true);
             auto* fn   = b_.GetInsertBlock()->getParent();
             auto* dobb = llvm::BasicBlock::Create(ctx_, "arrnba.do", fn);
             auto* cont = llvm::BasicBlock::Create(ctx_, "arrnba.cont", fn);
@@ -11610,22 +11664,43 @@ private:
     llvm::Value* smin(llvm::Value* a, llvm::Value* b) { return b_.CreateSelect(b_.CreateICmpSLT(a, b), a, b); }
     llvm::Value* smax(llvm::Value* a, llvm::Value* b) { return b_.CreateSelect(b_.CreateICmpSGT(a, b), a, b); }
 
+    // How much of a dynamic bit/part select landed inside its container. Both
+    // are i1; `partial` is only ever true for a part-select wide enough to
+    // straddle the boundary (LRM 11.5.1 keeps the in-range bits of one).
+    struct SelectVerdict {
+        llvm::Value* fully   = nullptr;
+        llvm::Value* partial = nullptr;
+    };
+
     // Set `lv.range_mask` for a dynamic bit/part select, per LRM 11.5.1. The
     // select covers storage bits [lv.bit_off, lv.bit_off + selw); the in-range
     // bits are that range clamped to the container [cbase, cbase + cwidth) (the
     // whole slot for a direct select, the inner select's span for a nested one).
     // An x/z index (`idx_unknown`) makes every bit out of range.
-    void set_select_bounds(LValue& lv, llvm::Value* cbase, uint32_t cwidth, uint32_t selw,
-                           llvm::Value* idx_unknown) {
+    //
+    // Returns the verdict --sanitize=bounds reports on. It is read off the
+    // UNCLAMPED offsets rather than by counting mask bits, so it is three
+    // compares and cannot disagree with the mask the access then uses.
+    SelectVerdict set_select_bounds(LValue& lv, llvm::Value* cbase, uint32_t cwidth, uint32_t selw,
+                                    llvm::Value* idx_unknown) {
         const uint32_t sw    = lv.store_width;
         auto*          i64t  = int_ty(64);
         llvm::Value*   base  = b_.CreateSExt(cbase, i64t);
         llvm::Value*   end   = b_.CreateAdd(base, llvm::ConstantInt::get(i64t, cwidth));
         llvm::Value*   off   = b_.CreateSExt(lv.bit_off, i64t);
+        llvm::Value*   top   = b_.CreateAdd(off, llvm::ConstantInt::get(i64t, selw));
         llvm::Value*   lo    = smax(smin(off, end), base);
-        llvm::Value*   hi    = smax(smin(b_.CreateAdd(off, llvm::ConstantInt::get(i64t, selw)), end), base);
+        llvm::Value*   hi    = smax(smin(top, end), base);
         llvm::Value*   mask  = range_bits(sw, b_.CreateTrunc(lo, int_ty(32)), b_.CreateTrunc(hi, int_ty(32)));
         lv.range_mask        = b_.CreateSelect(idx_unknown, zero(sw), mask);
+
+        SelectVerdict v;
+        v.fully = b_.CreateAnd(b_.CreateAnd(b_.CreateICmpSGE(off, base), b_.CreateICmpSLE(top, end)),
+                               b_.CreateNot(idx_unknown));
+        v.partial =
+          selw == 1 ? nullptr
+                    : b_.CreateAnd(b_.CreateNot(v.fully), b_.CreateICmpNE(lv.range_mask, zero(sw)));
+        return v;
     }
 
     // Storage-width write mask for a partial store: the range-restricted mask for
@@ -11913,20 +11988,33 @@ private:
         return resolve_ ? resolve_(ir_->loc(i)) : SourceText{ .where = "<unknown>" };
     }
 
+    // The index value a report shows: the design's own, widened to i64 with the
+    // index expression's own signedness. The bounds checks themselves lean on
+    // unsigned wrap to catch a negative index in one compare; a report that
+    // reused that value would print 4294967295 where the design wrote -1.
+    llvm::Value* bounds_index(Index idx_expr) {
+        return cast(must_of(value_of(idx_expr)), 64, type_of(idx_expr).is_signed);
+    }
+
+    // The rt_bounds_what enum (Runtime.h), which picks the report's wording.
+    enum class BoundsWhat : int32_t { Element = 0, Bit = 1, Part = 2, Char = 3, QueueOp = 4 };
+
     // The rt_bounds_site record (Runtime.h): { ptr where, ptr line, ptr name,
-    // i32 line_no, i32 column, i32 left, i32 right }. Field order and types
-    // mirror the C struct exactly, so the two change together.
+    // i32 line_no, i32 column, i32 what, i32 left, i32 right, i32 width }.
+    // Field order and types mirror the C struct exactly, so the two change
+    // together.
     llvm::StructType* bounds_site_ty() {
         auto* i32 = b_.getInt32Ty();
         auto* ptr = raw_ptr_ty();
-        return llvm::StructType::get(ctx_, { ptr, ptr, ptr, i32, i32, i32, i32 });
+        return llvm::StructType::get(ctx_, { ptr, ptr, ptr, i32, i32, i32, i32, i32, i32 });
     }
 
     // One constant rt_bounds_site per instrumented access. Everything the report
     // knows at compile time lives here instead of in the argument list, which
-    // keeps the call to the four values that are genuinely dynamic.
-    llvm::Constant* bounds_site_global(const SourceText& at, const std::string& name, int32_t left,
-                                       int32_t right) {
+    // keeps the call to the values that are genuinely dynamic. `left`/`right`
+    // are ignored by the runtime when the check passes an extent instead.
+    llvm::Constant* bounds_site_global(const SourceText& at, const std::string& name, BoundsWhat what,
+                                       int32_t left, int32_t right, int32_t width = 1) {
         auto*       i32 = b_.getInt32Ty();
         auto* const rec = bounds_site_ty();
         auto*       init =
@@ -11935,50 +12023,168 @@ private:
                                            b_.CreateGlobalString(name, "bounds.of"),
                                            llvm::ConstantInt::get(i32, at.line_no),
                                            llvm::ConstantInt::get(i32, at.column),
+                                           llvm::ConstantInt::get(i32, static_cast<int32_t>(what)),
                                            llvm::ConstantInt::get(i32, static_cast<uint32_t>(left)),
-                                           llvm::ConstantInt::get(i32, static_cast<uint32_t>(right)) });
+                                           llvm::ConstantInt::get(i32, static_cast<uint32_t>(right)),
+                                           llvm::ConstantInt::get(i32, static_cast<uint32_t>(width)) });
         return new llvm::GlobalVariable(env_->llmod, rec, /*isConstant=*/true,
                                         llvm::GlobalValue::PrivateLinkage, init, "clotho.bounds.site");
     }
 
-    // void rt_bounds_report(ptr site, i32 index, i32 flags, i64 now) — writes one
-    // warning to stderr and returns; see Runtime.h for the flag bits.
-    llvm::FunctionCallee bounds_report_fn() {
-        auto* i32 = b_.getInt32Ty();
-        return rt_fn("rt_bounds_report", b_.getVoidTy(), { raw_ptr_ty(), i32, i32, b_.getInt64Ty() });
+    // The name to report for whatever `lv` addresses. A local / formal has none
+    // in the backend (frame slots carry no name), so it says what it is.
+    std::string bounds_name(const LValue& lv) const {
+        return lv.is_signal ? mod_.signal(lv.sig).name : std::string("<local>");
     }
 
-    // Drain `lv`'s pending --sanitize=bounds checks: one branch each on the
-    // in-range predicate the access itself already uses, into a cold block that
-    // reports and falls through. Emitted BEFORE the access, so the report fires
-    // whether or not the LRM then lets the access proceed (an out-of-range read
-    // still yields the element default, an out-of-range write is still dropped).
-    // No check exists unless the sanitizer is on, so this is a no-op otherwise
-    // and the emitted code is unchanged. The wheel fallback mirrors
-    // lower_case_viol: an access inside a pure function has no wheel and
-    // reports time 0.
-    void emit_bounds_reports(const LValue& lv, bool is_write) {
-        if (lv.bounds_checks.empty()) {
+    // void rt_bounds_report(ptr site, i64 index, i64 extent, i32 flags, i64 now)
+    // — writes one warning to stderr and returns; see Runtime.h for the flag
+    // bits and the extent convention.
+    llvm::FunctionCallee bounds_report_fn() {
+        auto* i64 = b_.getInt64Ty();
+        return rt_fn("rt_bounds_report", b_.getVoidTy(),
+                     { raw_ptr_ty(), i64, i64, b_.getInt32Ty(), i64 });
+    }
+
+    // Record an array-element check on `target` (the lvalue the select produces)
+    // for later reporting. `named` is the lvalue that knows what was indexed --
+    // the same as `target` for an in-place fixed-array select, the base lvalue
+    // for a dynamic array or queue whose element lvalue is built fresh. Pass
+    // `extent` for a runtime-sized container, or null plus the declared
+    // `left`/`right` for one bounded by its declaration.
+    //
+    // Reported at the access rather than here: a select is not yet a read or a
+    // write, and the direction is half the report.
+    void add_elem_bounds_check(LValue& target, Index at, const LValue& named, Index idx_expr,
+                               llvm::Value* inrange, llvm::Value* unknown, llvm::Value* extent,
+                               int32_t left = 0, int32_t right = 0) {
+        if (!sanitizer_on(config_.sanitizers, Sanitizer::Bounds)) {
             return;
         }
-        auto* fn = b_.GetInsertBlock()->getParent();
+        target.bounds_checks.push_back(BoundsCheck{
+          .inrange = inrange,
+          .index   = bounds_index(idx_expr),
+          .unknown = unknown,
+          .extent  = extent,
+          .site    = bounds_site_global(loc_text(at), bounds_name(named), BoundsWhat::Element, left,
+                                        right),
+        });
+    }
+
+    // Record a packed bit / part-select check (LRM 11.5.1). Unlike an array
+    // element, the index the backend sees is the frontend's LSB-relative bit
+    // position (lower_packed_offset normalized it against the declared range),
+    // so the report names the container by WIDTH rather than by a declared
+    // [msb:lsb] it cannot reconstruct. For the usual `[N-1:0]` declaration the
+    // two coincide.
+    // TODO(xsan): carry the declared range on the select records so a
+    // `logic [15:8]` vector reports the index the design actually wrote.
+    void add_select_bounds_check(LValue& target, Index at, Index off_expr, const SelectVerdict& v,
+                                 BoundsWhat what, uint32_t container_width, uint32_t sel_width) {
+        if (!sanitizer_on(config_.sanitizers, Sanitizer::Bounds)) {
+            return;
+        }
+        target.bounds_checks.push_back(BoundsCheck{
+          .inrange = v.fully,
+          .index   = bounds_index(off_expr),
+          .unknown = any_unknown(value_of(off_expr)),
+          .extent  = b_.getInt64(container_width),
+          .partial = v.partial,
+          .site    = bounds_site_global(loc_text(at), bounds_name(target), what, 0, 0,
+                                        static_cast<int32_t>(sel_width)),
+        });
+    }
+
+    // A string character index (LRM 6.16.2 / 6.16.3). The bound lives only
+    // inside rt_string_getc / rt_string_putc, which silently return 0 / do
+    // nothing, so unlike every other site this one materializes its own
+    // predicate: a length load and two compares, emitted only under the
+    // sanitizer. Reported on the spot -- getc is a read and putc a write, with
+    // no lvalue to carry the check to.
+    void emit_string_bounds_check(Index at, llvm::Value* str, Index idx_expr, const std::string& name,
+                                  bool is_write) {
+        if (!sanitizer_on(config_.sanitizers, Sanitizer::Bounds)) {
+            return;
+        }
+        llvm::Value* len   = b_.CreateCall(str_len_fn(), { str });
+        llvm::Value* index = bounds_index(idx_expr);
+        emit_bounds_report(BoundsCheck{
+                             .inrange = b_.CreateAnd(b_.CreateICmpSGE(index, b_.getInt64(0)),
+                                                     b_.CreateICmpSLT(index, len)),
+                             .index   = index,
+                             .unknown = any_unknown(value_of(idx_expr)),
+                             .extent  = len,
+                             .site = bounds_site_global(loc_text(at), name, BoundsWhat::Char, 0, 0),
+                           },
+                           is_write);
+    }
+
+    // The index argument of a queue method (LRM 7.10.2.2 - 7.10.2.5). Same
+    // shape as a string index: the bound is enforced inside the runtime, so the
+    // check loads the queue's length itself. `limit` is the largest legal index
+    // -- `len` for insert, whose index may equal the size (an append), `len - 1`
+    // for delete.
+    void emit_queue_bounds_check(Index at, llvm::Value* handle, Index idx_expr, const LValue& named,
+                                 bool allow_append) {
+        if (!sanitizer_on(config_.sanitizers, Sanitizer::Bounds)) {
+            return;
+        }
+        llvm::Value* len   = b_.CreateLoad(b_.getInt64Ty(),
+                                           b_.CreateStructGEP(queue_slot_ty(), handle, 2));
+        llvm::Value* index = bounds_index(idx_expr);
+        llvm::Value* hi    = allow_append ? b_.CreateICmpSLE(index, len) : b_.CreateICmpSLT(index, len);
+        emit_bounds_report(BoundsCheck{
+                             .inrange = b_.CreateAnd(b_.CreateICmpSGE(index, b_.getInt64(0)), hi),
+                             .index   = index,
+                             .unknown = any_unknown(value_of(idx_expr)),
+                             .extent  = len,
+                             .site = bounds_site_global(loc_text(at), bounds_name(named),
+                                                        BoundsWhat::QueueOp, 0, 0),
+                           },
+                           /*is_write=*/true);
+    }
+
+    // One --sanitize=bounds check: a branch on the in-range predicate the access
+    // itself uses, into a cold block that reports and falls through. Emitted
+    // BEFORE the access, so the report fires whether or not the LRM then lets
+    // the access proceed (an out-of-range read still yields the element
+    // default, an out-of-range write is still dropped). The wheel fallback
+    // mirrors lower_case_viol: an access inside a pure function has no wheel
+    // and reports time 0.
+    void emit_bounds_report(const BoundsCheck& bc, bool is_write) {
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* bad  = llvm::BasicBlock::Create(ctx_, "bounds.bad", fn);
+        auto* cont = llvm::BasicBlock::Create(ctx_, "bounds.ok", fn);
+        b_.CreateCondBr(bc.inrange, cont, bad);
+
+        b_.SetInsertPoint(bad);
+        auto* const  i32   = b_.getInt32Ty();
+        // bit 0 = write, bit 1 = the index carried x/z, bit 2 = a part-select
+        // that kept its in-range bits.
+        llvm::Value* flags = b_.getInt32(is_write ? 1 : 0);
+        if (bc.unknown != nullptr) {
+            flags = b_.CreateOr(flags, b_.CreateShl(b_.CreateZExt(bc.unknown, i32), b_.getInt32(1)));
+        }
+        if (bc.partial != nullptr) {
+            flags = b_.CreateOr(flags, b_.CreateShl(b_.CreateZExt(bc.partial, i32), b_.getInt32(2)));
+        }
+        // -1 marks "bounded by the declared range in the site record".
+        llvm::Value* extent = bc.extent != nullptr ? bc.extent : b_.getInt64(-1);
+        llvm::Value* now    = has_wheel()
+                                ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
+                                : static_cast<llvm::Value*>(b_.getInt64(0));
+        b_.CreateCall(bounds_report_fn(), { bc.site, bc.index, extent, flags, now });
+        b_.CreateBr(cont);
+
+        b_.SetInsertPoint(cont);
+    }
+
+    // Drain every check `lv` accumulated on the way to this access. No check
+    // exists unless the sanitizer is on, so this is a no-op otherwise and the
+    // emitted code is unchanged.
+    void emit_bounds_reports(const LValue& lv, bool is_write) {
         for (const BoundsCheck& bc : lv.bounds_checks) {
-            auto* bad  = llvm::BasicBlock::Create(ctx_, "bounds.bad", fn);
-            auto* cont = llvm::BasicBlock::Create(ctx_, "bounds.ok", fn);
-            b_.CreateCondBr(bc.inrange, cont, bad);
-
-            b_.SetInsertPoint(bad);
-            // bit 0 = write, bit 1 = the index carried x/z.
-            llvm::Value* flags = b_.CreateOr(
-              b_.getInt32(is_write ? 1 : 0),
-              b_.CreateShl(b_.CreateZExt(bc.unknown, b_.getInt32Ty()), b_.getInt32(1)));
-            llvm::Value* now = has_wheel()
-                                 ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
-                                 : static_cast<llvm::Value*>(b_.getInt64(0));
-            b_.CreateCall(bounds_report_fn(), { bc.site, bc.index, flags, now });
-            b_.CreateBr(cont);
-
-            b_.SetInsertPoint(cont);
+            emit_bounds_report(bc, is_write);
         }
     }
 

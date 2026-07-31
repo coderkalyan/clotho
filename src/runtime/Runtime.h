@@ -163,13 +163,30 @@ void rt_defer_report(int32_t level, uint64_t is_final, const void* gen, uint64_t
 void rt_defer_flush_observed(void);
 void rt_defer_flush_final(void);
 
-// One instrumented array access, emitted by the backend as a constant global
-// beside the code that reports it. Everything here is compile-time; only the
-// index, the direction and the time travel as arguments. Its address is stable
-// for the run, so it also keys the per-site repeat cap.
+// What kind of indexing an instrumented access performs. Selects the wording of
+// the report and nothing else; the check is the same shape in every case.
+typedef enum rt_bounds_what {
+    // Element index into an unpacked array of any kind (LRM 7.4.5).
+    RT_BOUNDS_ELEMENT = 0,
+    // Single-bit select of a packed vector (LRM 11.5.1).
+    RT_BOUNDS_BIT = 1,
+    // Indexed part-select `[i +: w]` / `[i -: w]` of a packed vector, which can
+    // straddle the boundary and be only partially out of range (LRM 11.5.1).
+    RT_BOUNDS_PART = 2,
+    // Character index into a string (LRM 6.16.2 / 6.16.3).
+    RT_BOUNDS_CHAR = 3,
+    // Index argument of a queue method: insert / delete / a pop from empty
+    // (LRM 7.10.2.2 - 7.10.2.5).
+    RT_BOUNDS_QUEUE_OP = 4,
+} rt_bounds_what;
+
+// One instrumented access, emitted by the backend as a constant global beside
+// the code that reports it. Everything here is compile-time; the index, the
+// runtime extent, the direction and the time travel as arguments. Its address
+// is stable for the run, so it also keys the per-site repeat cap.
 //
 // Field order and types are the emitted LLVM struct's, so the two must change
-// together: { ptr, ptr, ptr, i32, i32, i32, i32 }.
+// together: { ptr, ptr, ptr, i32, i32, i32, i32, i32, i32 }.
 typedef struct rt_bounds_site {
     // "<file>:<line>:<col>" of the access, or "<unknown>".
     const char* where;
@@ -177,35 +194,46 @@ typedef struct rt_bounds_site {
     // the snippet under the message. Empty when the source is unavailable, in
     // which case no snippet is drawn.
     const char* line;
-    // The array's hierarchical name, or "<local>" for a frame local (the
-    // backend has no name for one).
+    // What was indexed: an array's hierarchical name, or "<local>" for a frame
+    // local (the backend has no name for one).
     const char* name;
     // 1-based line and column of the access within `line`; the caret sits under
     // `column`. 0 when unknown.
     int32_t line_no;
     int32_t column;
-    // The array's declared bounds [left:right], as written.
+    // An rt_bounds_what.
+    int32_t what;
+    // The declared bounds [left:right], as written. Meaningful only when the
+    // report carries no runtime extent (see `extent` on rt_bounds_report): a
+    // dynamic array, queue or string is bounded by its current size instead.
     int32_t left;
     int32_t right;
+    // Selected width, for RT_BOUNDS_PART; 1 everywhere else.
+    int32_t width;
 } rt_bounds_site;
 
-// Report an unpacked-array element access whose index missed the array's
-// declared bounds, found by `--sanitize=bounds`. Not an LRM event: the access
-// itself still behaves exactly as LRM 7.4.6 / 11.5.1 says (an out-of-range read
-// yields the element default, an out-of-range write is dropped), and this only
-// makes that silent outcome audible. Non-fatal — it prints and returns, so the
-// design keeps running with unchanged semantics.
+// Report an access whose index missed the bounds of what it indexed, found by
+// `--sanitize=bounds`. Not an LRM event: the access still behaves exactly as
+// the LRM says (7.4.5 / Table 7-1 for an array element, 11.5.1 for a packed
+// select, 6.16.2-6.16.3 for a string character), and this only makes that
+// silent outcome audible. Non-fatal — it prints and returns, so the design
+// keeps running with unchanged semantics.
 //
-// `index` is the index as the design wrote it, in the array's own declared
-// coordinates, so a below-the-low-bound index reads as the negative it is.
+// `index` is the index as the design wrote it, in the indexed object's own
+// coordinates and with its own signedness, so an index below the low bound
+// reads as the negative it is. `extent` is the current size of a runtime-sized
+// object (dynamic array, queue, string) and the bound is then [0, extent);
+// pass -1 for a statically bounded one, whose bounds are in the site record.
 // `flags` is a mask: bit 0 set = write, clear = read; bit 1 set = the index
-// carried x/z bits, in which case `index` means nothing and is reported as x.
-// `now` is the simulation time in design ticks.
+// carried x/z bits, in which case `index` means nothing and is reported as x;
+// bit 2 set = only part of a part-select fell outside. `now` is the simulation
+// time in design ticks.
 //
 // Repeats are capped per site: a bad index inside an always block re-fires on
 // every activation, and the first reports carry all the information the rest
 // would bury.
-void rt_bounds_report(const rt_bounds_site* site, int32_t index, uint32_t flags, uint64_t now);
+void rt_bounds_report(const rt_bounds_site* site, int64_t index, int64_t extent, uint32_t flags,
+                      uint64_t now);
 
 // Drive one simulation: run `drain` (the event loop), then `finals` (the
 // `final` blocks, LRM 9.2.3). `drain` returns normally whether it ran out of
