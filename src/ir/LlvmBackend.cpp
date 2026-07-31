@@ -2422,6 +2422,17 @@ private:
         }
         return b_.CreateStructGEP(lv.slot_ty, lv.base, field);
     }
+    // The power-on image of one leaf slot: what an out-of-range read of it must
+    // yield (LRM 7.4.5 / Table 7-1 -- x for a 4-state element, 0 for 2-state).
+    llvm::Constant* slot_default_const(llvm::StructType* slot_ty, uint32_t width, bool narrow,
+                                       bool has_z) {
+        std::vector<llvm::Constant*> fields{ narrow ? zero(width) : x_mm(width) };
+        if (has_z) {
+            fields.push_back(zero(width));
+        }
+        return llvm::ConstantStruct::get(slot_ty, fields);
+    }
+
     // Pointer to a ref actual's slot, passed to the callee as the aliased storage.
     // A whole scalar is its slot pointer; an unpacked-array element is `&array[idx]`
     // (its element slot). The selection must be a whole element — the callee GEPs it
@@ -2433,11 +2444,30 @@ private:
         if (!whole) {
             throw BackendError{ "ref actual must be a whole variable or unpacked-array element" };
         }
-        if (lv.array_ty != nullptr) {
-            llvm::Value* idx = lv.elem_idx != nullptr ? lv.elem_idx : b_.getInt32(0);
-            return b_.CreateInBoundsGEP(lv.array_ty, lv.base, { b_.getInt32(0), idx });
+        if (lv.array_ty == nullptr) {
+            return lv.base;
         }
-        return lv.base;
+        llvm::Value* idx = lv.elem_idx != nullptr ? lv.elem_idx : b_.getInt32(0);
+        llvm::Value* ptr = b_.CreateInBoundsGEP(lv.array_ty, lv.base, { b_.getInt32(0), idx });
+        if (lv.dyn_inrange == nullptr) {
+            return ptr;
+        }
+        // A `ref` formal aliases storage for the whole call, so an out-of-range
+        // element index cannot simply be dropped the way a store can -- the
+        // callee would hold a live pointer past the array and read and write
+        // through it. Redirect to a discard slot, freshly reset to the element
+        // default: the callee's reads see what LRM 7.4.5 / Table 7-1 say an
+        // invalid element read yields, and its writes go nowhere, which is the
+        // no-operation the same clause requires. Mirrors lv_string_ptr's sink
+        // redirect for an out-of-range string element.
+        //
+        // The clause does not spell out `ref` binding to an invalid element, so
+        // this is the reading of it that keeps both halves of 7.4.5 true; the
+        // alternative (aliasing real storage) is memory corruption.
+        auto* sink = entry_alloca(lv.slot_ty, "ref.sink");
+        b_.CreateStore(slot_default_const(lv.slot_ty, lv.store_width, lv.narrow, lv.has_z), sink);
+        emit_bounds_reports(lv, /*is_write=*/true);
+        return b_.CreateSelect(lv.dyn_inrange, ptr, sink);
     }
 
     llvm::Value* lv_mm_ptr(const LValue& lv) {
@@ -7765,6 +7795,109 @@ private:
         b_.SetInsertPoint(done);
     }
 
+    // `&array[elem_idx]` for a flat (non-aggregate) unpacked-array element
+    // lvalue, or the base when the whole storage is addressed.
+    llvm::Value* flat_elem_ptr(const LValue& lv) {
+        if (lv.elem_idx == nullptr) {
+            return lv.base;
+        }
+        return b_.CreateInBoundsGEP(slot_of(lv.sig).storage_ty, lv.base,
+                                    { b_.getInt32(0), lv.elem_idx });
+    }
+
+    // A read-only image of what an out-of-range whole-object read must yield
+    // (LRM 7.4.5 / Table 7-1), laid out exactly like the source it stands in
+    // for. An aggregate source shares the type-derived recursive storage, so
+    // agg_proto_global serves; a flat array's per-element slot is z-elided per
+    // SIGNAL, so its image has to be built against that signal's slot type.
+    llvm::Constant* agg_copy_proto(Ref type, const LValue& slv) {
+        if (slv.is_agg) {
+            return agg_proto_global(type);
+        }
+        const SignalSlot& ss   = slot_of(slv.sig);
+        auto*             arr  = llvm::ArrayType::get(ss.slot_ty, array_leaf_count(type));
+        llvm::Constant*   leaf = slot_default_const(ss.slot_ty, ss.width, ss.narrow, ss.has_z);
+        auto*             init = llvm::ConstantArray::get(
+          arr, std::vector<llvm::Constant*>(arr->getNumElements(), leaf));
+        return new llvm::GlobalVariable(env_->llmod, arr, /*isConstant=*/true,
+                                        llvm::GlobalValue::InternalLinkage, init,
+                                        "clotho.arr.proto");
+    }
+
+    // The whole-object copy itself, once both ends are known good: one memcpy of
+    // the storage, or an element-wise pass when z-elision left the two arrays
+    // different per-element layouts. Split out of the AggCopy case so an
+    // out-of-range destination can skip all of it (LRM 7.4.5: the write performs
+    // no operation) without the gate having to thread through every exit.
+    void emit_agg_copy(const AggCopyInfo& info, const LValue& dlv, const LValue& slv,
+                       llvm::Value* src_override) {
+        llvm::Value* dst;
+        llvm::Value* src;
+        llvm::Type*  st;
+        if (dlv.is_agg) {
+            // An aggregate (contains a struct) uses the recursive storage,
+            // which is deterministic by type — both sides share the layout.
+            dst = agg_slot_ptr(dlv);
+            src = src_override != nullptr ? src_override : agg_slot_ptr(slv);
+            st  = agg_storage_ty(info.type);
+        } else {
+            // A plain unpacked array. The per-element slot layout is may-z-
+            // analysed per signal, but a copy couples the two signals' z
+            // through this very store, so their element slots match; a
+            // genuine per-element mismatch is rejected rather than miscopied.
+            // The copy count comes from the copy TYPE, not the whole signal:
+            // a multi-dim element-select (`arr[i][j]`) addresses a SUB-array,
+            // whose flat leaf offset is carried in elem_idx (base still
+            // points at the whole `[N x slot]` storage) and applied here.
+            const SignalSlot& ds    = slot_of(dlv.sig);
+            const SignalSlot& ss    = slot_of(slv.sig);
+            const uint32_t    count = array_leaf_count(info.type);
+            llvm::Value*      d_base = flat_elem_ptr(dlv);
+            llvm::Value*      s_base = src_override != nullptr ? src_override : flat_elem_ptr(slv);
+            if (ds.slot_ty != ss.slot_ty) {
+                // z-elision gave the two same-typed arrays different per-
+                // element layouts (the dest is may-z from other writes, this
+                // source proven never-z, so their z-word presence differs).
+                // The mm plane is an identical i(2W); copy element-wise,
+                // filling the dest z (0 when the source is never-z).
+                emit_array_zdiff_copy(d_base, s_base, ds, ss, count, dlv.sig,
+                                      !lowering_preinit_ && dlv.is_signal &&
+                                        signal_has_waiters(dlv.sig));
+                return;
+            }
+            dst = d_base;
+            src = s_base;
+            st  = llvm::ArrayType::get(ds.slot_ty, count);
+        }
+        const auto sz = env_->llmod.getDataLayout().getTypeAllocSize(st);
+        const auto al = env_->llmod.getDataLayout().getABITypeAlign(st);
+        // A blocking whole-object copy into a signal must wake its Any-edge
+        // readers (a continuous / port copy or a comb process feeds off the
+        // destination), but only when the bytes actually change — an
+        // unconditional wake would never settle a feedback delta wave. Detect
+        // the change with a memcmp of old dest vs new source *before* the copy.
+        const bool service = !lowering_preinit_ && dlv.is_signal &&
+                             signal_has_waiters(dlv.sig);
+        llvm::Value* changed = nullptr;
+        if (service) {
+            auto cmp = rt_fn("memcmp", b_.getInt32Ty(),
+                             { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+            changed   = b_.CreateICmpNE(
+              b_.CreateCall(cmp, { dst, src, b_.getInt64(sz) }), b_.getInt32(0));
+        }
+        b_.CreateMemCpy(dst, al, src, al, sz);
+        if (service) {
+            auto* fn   = b_.GetInsertBlock()->getParent();
+            auto* svc  = llvm::BasicBlock::Create(ctx_, "aggcopy.svc", fn);
+            auto* cont = llvm::BasicBlock::Create(ctx_, "aggcopy.cont", fn);
+            b_.CreateCondBr(changed, svc, cont);
+            b_.SetInsertPoint(svc);
+            service_any_waiters(dlv.sig);
+            b_.CreateBr(cont);
+            b_.SetInsertPoint(cont);
+        }
+    }
+
     // Element-wise whole-(sub-)array copy for two plain (non-struct) 4-state
     // unpacked arrays of the SAME element width whose z-elided slots differ only in
     // the z word's presence (the dest is may-z, the source proven never-z, or vice
@@ -8967,6 +9100,8 @@ private:
                 const auto info = ir_->extra_data<AggCopyInfo>(p.op_extra.extra);
                 LValue     dlv  = lvalue_of(p.op_extra.op);
                 LValue     slv  = lvalue_of(info.src);
+                emit_bounds_reports(dlv, /*is_write=*/true);
+                emit_bounds_reports(slv, /*is_write=*/false);
                 // A whole (trivially-copyable) aggregate value of an associative
                 // array: resolve the deferred slot to its map storage. The dst
                 // put_ptr creates the entry; the src get_ptr may miss, redirecting
@@ -8981,80 +9116,38 @@ private:
                     llvm::Value* proto   = agg_proto_global(info.type);
                     src_override         = b_.CreateSelect(slv.dyn_inrange, slot, proto);
                 }
-                llvm::Value* dst;
-                llvm::Value* src;
-                llvm::Type*  st;
-                if (dlv.is_agg) {
-                    // An aggregate (contains a struct) uses the recursive storage,
-                    // which is deterministic by type — both sides share the layout.
-                    dst = agg_slot_ptr(dlv);
-                    src = src_override != nullptr ? src_override : agg_slot_ptr(slv);
-                    st  = agg_storage_ty(info.type);
-                } else {
-                    // A plain unpacked array. The per-element slot layout is may-z-
-                    // analysed per signal, but a copy couples the two signals' z
-                    // through this very store, so their element slots match; a
-                    // genuine per-element mismatch is rejected rather than miscopied.
-                    // The copy count comes from the copy TYPE, not the whole signal:
-                    // a multi-dim element-select (`arr[i][j]`) addresses a SUB-array,
-                    // whose flat leaf offset is carried in elem_idx (base still
-                    // points at the whole `[N x slot]` storage) and applied here.
-                    const SignalSlot& ds    = slot_of(dlv.sig);
-                    const SignalSlot& ss    = slot_of(slv.sig);
-                    const uint32_t    count = array_leaf_count(info.type);
-                    // A multi-dim element-select (`arr[i][j]`) addresses a SUB-array;
-                    // its flat leaf offset rides elem_idx (the base still points at
-                    // the whole `[N x slot]` storage), applied here.
-                    llvm::Value* d_base =
-                      dlv.elem_idx != nullptr
-                        ? b_.CreateInBoundsGEP(ds.storage_ty, dlv.base, { b_.getInt32(0), dlv.elem_idx })
-                        : dlv.base;
-                    llvm::Value* s_base =
-                      slv.elem_idx != nullptr
-                        ? b_.CreateInBoundsGEP(ss.storage_ty, slv.base, { b_.getInt32(0), slv.elem_idx })
-                        : slv.base;
-                    if (ds.slot_ty != ss.slot_ty) {
-                        // z-elision gave the two same-typed arrays different per-
-                        // element layouts (the dest is may-z from other writes, this
-                        // source proven never-z, so their z-word presence differs).
-                        // The mm plane is an identical i(2W); copy element-wise,
-                        // filling the dest z (0 when the source is never-z).
-                        emit_array_zdiff_copy(d_base, s_base, ds, ss, count, dlv.sig,
-                                              !lowering_preinit_ && dlv.is_signal &&
-                                                signal_has_waiters(dlv.sig));
-                        return;
-                    }
-                    dst = d_base;
-                    src = s_base;
-                    st  = llvm::ArrayType::get(ds.slot_ty, count);
+                // A variable element index on either side (`dst = arr[i]`,
+                // `arr[i] = src`) can miss the array. LRM 7.4.5: reading an
+                // invalid element yields the Table 7-1 image of its type, and
+                // writing one performs no operation. Both sides used to be GEPed
+                // and memcpy'd regardless, which walks off the array -- a wild
+                // index segfaults.
+                //
+                // Source: substitute the type's power-on image, exactly as the
+                // absent-key case above already does. Destination: skip the copy
+                // outright, which also has to cover the zdiff and wait-service
+                // paths below, so it gates the whole body.
+                if (src_override == nullptr && slv.dyn_inrange != nullptr) {
+                    llvm::Value* slot = slv.is_agg ? agg_slot_ptr(slv) : flat_elem_ptr(slv);
+                    src_override      = b_.CreateSelect(slv.dyn_inrange, slot,
+                                                        agg_copy_proto(info.type, slv));
+                    slv.elem_idx      = nullptr; // the override is the whole source
                 }
-                const auto sz = env_->llmod.getDataLayout().getTypeAllocSize(st);
-                const auto al = env_->llmod.getDataLayout().getABITypeAlign(st);
-                // A blocking whole-object copy into a signal must wake its Any-edge
-                // readers (a continuous / port copy or a comb process feeds off the
-                // destination), but only when the bytes actually change — an
-                // unconditional wake would never settle a feedback delta wave. Detect
-                // the change with a memcmp of old dest vs new source *before* the copy.
-                const bool service = !lowering_preinit_ && dlv.is_signal &&
-                                     signal_has_waiters(dlv.sig);
-                llvm::Value* changed = nullptr;
-                if (service) {
-                    auto cmp = rt_fn("memcmp", b_.getInt32Ty(),
-                                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
-                    changed   = b_.CreateICmpNE(
-                      b_.CreateCall(cmp, { dst, src, b_.getInt64(sz) }), b_.getInt32(0));
-                }
-                b_.CreateMemCpy(dst, al, src, al, sz);
-                if (service) {
+                if (dlv.dyn_inrange != nullptr) {
                     auto* fn   = b_.GetInsertBlock()->getParent();
-                    auto* svc  = llvm::BasicBlock::Create(ctx_, "aggcopy.svc", fn);
+                    auto* dobb = llvm::BasicBlock::Create(ctx_, "aggcopy.do", fn);
                     auto* cont = llvm::BasicBlock::Create(ctx_, "aggcopy.cont", fn);
-                    b_.CreateCondBr(changed, svc, cont);
-                    b_.SetInsertPoint(svc);
-                    service_any_waiters(dlv.sig);
+                    b_.CreateCondBr(dlv.dyn_inrange, dobb, cont);
+                    b_.SetInsertPoint(dobb);
+                    LValue clean      = dlv;
+                    clean.dyn_inrange = nullptr;
+                    clean.bounds_checks.clear();
+                    emit_agg_copy(info, clean, slv, src_override);
                     b_.CreateBr(cont);
                     b_.SetInsertPoint(cont);
+                    return;
                 }
+                emit_agg_copy(info, dlv, slv, src_override);
                 return;
             }
 
