@@ -1161,6 +1161,16 @@ private:
         return to_source_loc(s.sourceRange.start());
     }
 
+    // Lower an index expression, recording its full source extent alongside the
+    // usual point. An index is the one operand a diagnostic wants to UNDERLINE
+    // rather than point at -- `--sanitize=bounds` highlights the whole index the
+    // user wrote -- and the extent is sparse in the IR, so only these get one.
+    ir::Index lower_index(const Expression& e, ir::Builder& b) {
+        const ir::Index i = lower_expr(e, b);
+        b.set_end(i, to_source_loc(e.sourceRange.end()));
+        return i;
+    }
+
     // Full source extent of a symbol's declaring syntax, or a degenerate span at
     // its name location when it has none (a compiler-synthesized symbol). This is
     // what gives a process or a subroutine a real extent rather than a point.
@@ -8973,7 +8983,7 @@ private:
             return b.unary(T::StrLen, recv(), l);
         }
         if (name == "getc" && args.size() == 2) {
-            return b.binary(T::StrGetc, recv(), lower_expr(*args[1], b), l);
+            return b.binary(T::StrGetc, recv(), lower_index(*args[1], b), l);
         }
         if (name == "toupper") {
             return b.unary(T::StrUpper, recv(), l);
@@ -8995,7 +9005,7 @@ private:
         }
         if (name == "putc" && args.size() == 3) {
             const ir::Index str = lower_lvalue(*args[0], b);
-            const ir::Index idx = lower_expr(*args[1], b);
+            const ir::Index idx = lower_index(*args[1], b);
             return b.str_putc(str, idx, lower_expr(*args[2], b), l);
         }
         if (name == "atoi") {
@@ -9904,7 +9914,7 @@ private:
             }
             const ElementSelectExpression& es  = a.left().as<ElementSelectExpression>();
             const ir::Index                str = lower_lvalue(es.value(), b);
-            const ir::Index                idx = lower_expr(es.selector(), b);
+            const ir::Index                idx = lower_index(es.selector(), b);
             const ir::Index                chr = lower_expr(a.right(), b);
             b.str_putc(str, idx, chr, loc(a));
             return chr;
@@ -10083,7 +10093,12 @@ private:
             const ir::Index idx  = b.binary(ir::Inst::Tag::Sub, size, b.constant(module_.pool.put_int(i32, 1), l), l);
             return b.elem_select(base, idx, arr_ty, l);
         }
-        return b.elem_select(base, lower_expr(es.selector(), b), arr_ty, l);
+        const ir::Index sel = b.elem_select(base, lower_index(es.selector(), b), arr_ty, l);
+        // The select carries the extent of what was indexed, so a bounds report
+        // can underline `grid[a]` under the `[b]` of `grid[a][b]` rather than
+        // guess the width from the array's name.
+        b.set_end(sel, to_source_loc(es.value().sourceRange.end()));
+        return sel;
     }
 
     // Element address for an associative array (LRM 7.8): `a[key]` over the
@@ -10249,12 +10264,12 @@ private:
             return b.queue_pop(q, name == "pop_front", qty, l);
         }
         if (name == "insert") {
-            return b.queue_insert(q, lower_expr(*args[1], b), lower_expr(*args[2], b), qty, l);
+            return b.queue_insert(q, lower_index(*args[1], b), lower_expr(*args[2], b), qty, l);
         }
         if (name == "delete") {
             // q.delete() clears all; q.delete(i) removes one element.
             if (args.size() > 1) {
-                return b.queue_delete(q, lower_expr(*args[1], b), /*has_idx*/ true, qty, l);
+                return b.queue_delete(q, lower_index(*args[1], b), /*has_idx*/ true, qty, l);
             }
             return b.queue_delete(q, q, /*has_idx*/ false, qty, l);
         }
@@ -10770,7 +10785,7 @@ private:
                     // s[i] reads the byte at i, 0 when out of range — identical to
                     // getc (LRM 6.16.3).
                     const ir::Index str = b.unary(ir::Inst::Tag::Load, lower_lvalue(es.value(), b), l);
-                    return b.binary(ir::Inst::Tag::StrGetc, str, lower_expr(es.selector(), b), l);
+                    return b.binary(ir::Inst::Tag::StrGetc, str, lower_index(es.selector(), b), l);
                 }
                 if (auto c = try_lower_constant_select(expr, b, l)) {
                     return *c;
@@ -11995,10 +12010,14 @@ private:
                            v,
                            il);
         }
-        if (stride == 1) {
-            return off;
-        }
-        return b.binary(ir::Inst::Tag::Mul, off, b.constant(module_.pool.put_int(off_ty, stride), il), il);
+        // The extent goes on whatever instruction the backend will report, which
+        // is the offset's final value.
+        const ir::Index result =
+          stride == 1 ? off
+                      : b.binary(ir::Inst::Tag::Mul, off,
+                                 b.constant(module_.pool.put_int(off_ty, stride), il), il);
+        b.set_end(result, to_source_loc(idx.sourceRange.end()));
+        return result;
     }
 
     // Normalized bit offset for a 1-bit element select on a packed value.

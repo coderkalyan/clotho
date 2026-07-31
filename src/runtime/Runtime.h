@@ -195,7 +195,7 @@ typedef enum rt_bounds_what {
 // apart by which array is named, not by the index.
 //
 // Field order and types are the emitted LLVM struct's, so the two must change
-// together: { ptr, ptr, ptr, i32, i32, i32, i32, i32, i32, i32, i32 }.
+// together: { ptr, ptr, ptr, i32 x10 }.
 typedef struct rt_bounds_site {
     // "<file>:<line>:<col>" of the index expression, or "<unknown>".
     const char* where;
@@ -206,17 +206,21 @@ typedef struct rt_bounds_site {
     // What was indexed: an array's hierarchical name, or "<local>" for a frame
     // local (the backend has no name for one).
     const char* name;
-    // 1-based line and column of the index expression within `line`; the caret
-    // sits under `column`. 0 when unknown.
+    // 1-based line and column of the index expression within `line`, and one
+    // past its last column, so the carets span [column, end_column). 0 when
+    // unknown; an end at or below the start means no recorded extent and draws
+    // a single caret.
     int32_t line_no;
     int32_t column;
-    // 1-based line and column of the indexed expression. Underlined on the
+    int32_t end_column;
+    // The same three for the expression being indexed. Underlined on the
     // snippet only when `acc_line_no` equals `line_no` -- an index split across
-    // lines from the array it indexes gets the caret alone. 0 when unknown, and
-    // for a site with no index of its own (an empty-queue pop), where the two
-    // positions are the same thing.
+    // lines from the array it indexes gets the carets alone. All 0 for a site
+    // with no index of its own (an empty-queue pop), where the two positions
+    // are the same thing.
     int32_t acc_line_no;
     int32_t acc_column;
+    int32_t acc_end_column;
     // An rt_bounds_what.
     int32_t what;
     // The declared bounds [left:right], as written. Meaningful only when the

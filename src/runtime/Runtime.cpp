@@ -3073,33 +3073,44 @@ extern "C" void rt_bounds_report(const rt_bounds_site* site, int64_t index, int6
         fmt::print(stderr, loc, "{} |", number);
         fmt::print(stderr, " {}", text);
         fmt::print(stderr, "\n");
-        // The marker row: `^` under the index expression, `---` under the array
-        // it indexes when both landed on this line. Built as one padded string
-        // so the two cannot fight over spacing. The text row puts a space after
-        // the bar, so source column N is offset N in the row.
+        // The marker row: `^^^` under the index expression, `---` under the
+        // array it indexes when both landed on this line. Built as one padded
+        // string so the two cannot fight over spacing. The text row puts a space
+        // after the bar, so source column N is offset N in the row.
         std::string marks;
         const auto  place = [&](int32_t col, size_t n, char ch) {
             if (col <= 0 || static_cast<size_t>(col) > text.size() + 1) {
                 return;
             }
             const size_t at = static_cast<size_t>(col);
+            n               = std::min(n, text.size() + 1 - static_cast<size_t>(col));
             if (marks.size() < at + n) {
                 marks.resize(at + n, ' ');
             }
             marks.replace(at, n, n, ch);
         };
+        // Width of a recorded [col, end) extent; 1 when nothing was recorded.
+        const auto width = [](int32_t col, int32_t end) -> size_t {
+            return end > col ? static_cast<size_t>(end - col) : 1;
+        };
         if (site->acc_line_no == site->line_no) {
-            // Underline the array's name only where the source really spells it
-            // there -- a hierarchical `name` is not what the statement wrote, and
-            // the leaf may be renamed by a `` `define ``. Otherwise one tick.
-            const char*       dot  = std::strrchr(site->name, '.');
-            const std::string leaf = dot != nullptr ? dot + 1 : site->name;
-            const size_t      at   = static_cast<size_t>(site->acc_column) - 1;
-            const bool        spelt = site->acc_column > 0 && at + leaf.size() <= text.size() &&
-                               text.compare(at, leaf.size(), leaf) == 0;
-            place(site->acc_column, spelt ? leaf.size() : 1, '-');
+            size_t n = width(site->acc_column, site->acc_end_column);
+            if (n == 1) {
+                // No extent recorded for the indexed expression. Fall back to
+                // its name, and only where the source really spells it at that
+                // column -- a hierarchical `name` is not what the statement
+                // wrote, and the leaf may be renamed by a `` `define ``.
+                const char*       dot  = std::strrchr(site->name, '.');
+                const std::string leaf = dot != nullptr ? dot + 1 : site->name;
+                const size_t      at   = static_cast<size_t>(site->acc_column) - 1;
+                if (site->acc_column > 0 && at + leaf.size() <= text.size() &&
+                    text.compare(at, leaf.size(), leaf) == 0) {
+                    n = leaf.size();
+                }
+            }
+            place(site->acc_column, n, '-');
         }
-        place(site->column, 1, '^');
+        place(site->column, width(site->column, site->end_column), '^');
         if (!marks.empty()) {
             fmt::print(stderr, loc, "{} |", gutter);
             fmt::print(stderr, caret, "{}", marks);

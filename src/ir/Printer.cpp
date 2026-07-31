@@ -994,7 +994,7 @@ void print_module(const Module& m, std::ostream& os, const LocResolver& resolve)
     // real. Compiler-synthesized entities carry SourceLoc{0} and print nothing.
     const auto at = [&](SourceLoc l) {
         if (resolve && l != SourceLoc{ 0 }) {
-            os << " at " << resolve(l).where;
+            os << " at " << resolve(SourceSpan{ l, SourceLoc{ 0 } }).where;
         }
     };
 

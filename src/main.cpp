@@ -208,18 +208,22 @@ void report_timings(const clotho::Timings& t, Command command) {
     std::println(stderr, "  {:<12}{:>12.3f}", "total", total);
 }
 
-// Decodes an instruction's source location for whoever needs one: the IR dump's
-// headers, and the snippet a sanitizer bakes into its report. Everything comes
-// from the SourceManager lowering hands back, so it stays valid for as long as
-// `result` does.
+// Decodes a source extent for whoever needs one: the IR dump's headers, and the
+// snippet a sanitizer bakes into its report. Everything comes from the
+// SourceManager lowering hands back, so it stays valid for as long as `result`
+// does.
 clotho::ir::LocResolver loc_resolver(const clotho::LowerResult& result) {
-    return [&result](clotho::ir::SourceLoc l) {
-        const clotho::SourcePosition pos = result.sources->resolve(l);
+    return [&result](clotho::ir::SourceSpan span) {
+        const clotho::SourcePosition pos = result.sources->resolve(span.start);
+        // The underline needs an end on the SAME line to have a width; a span
+        // that runs onto the next line degrades to a bare caret.
+        const clotho::SourcePosition end = result.sources->resolve(span.end);
         return clotho::ir::SourceText{
-            .where   = result.sources->render(l),
-            .line    = result.sources->line_text(l),
-            .line_no = pos.line,
-            .column  = pos.column,
+            .where      = result.sources->render(span.start),
+            .line       = result.sources->line_text(span.start),
+            .line_no    = pos.line,
+            .column     = pos.column,
+            .end_column = end.valid && end.line == pos.line ? end.column : pos.column,
         };
     };
 }

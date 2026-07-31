@@ -12081,7 +12081,12 @@ private:
     // resolver empty and gets "<unknown>" with no snippet, rather than a blank,
     // so a report is never silently unattributed.
     SourceText loc_text(Index i) const {
-        return resolve_ ? resolve_(ir_->loc(i)) : SourceText{ .where = "<unknown>" };
+        if (!resolve_) {
+            return SourceText{ .where = "<unknown>" };
+        }
+        // `end` is SourceLoc{0} unless the frontend recorded an extent, which
+        // the resolver reads as "no width -- a bare caret".
+        return resolve_(SourceSpan{ ir_->loc(i), ir_->end(i) });
     }
 
     // The index value a report shows: the design's own, widened to i64 with the
@@ -12103,13 +12108,14 @@ private:
     };
 
     // The rt_bounds_site record (Runtime.h): { ptr where, ptr line, ptr name,
-    // i32 line_no, i32 column, i32 acc_line_no, i32 acc_column, i32 what,
-    // i32 left, i32 right, i32 width }. Field order and types mirror the C
-    // struct exactly, so the two change together.
+    // i32 line_no, i32 column, i32 end_column, i32 acc_line_no, i32 acc_column,
+    // i32 acc_end_column, i32 what, i32 left, i32 right, i32 width }. Field
+    // order and types mirror the C struct exactly, so the two change together.
     llvm::StructType* bounds_site_ty() {
         auto* i32 = b_.getInt32Ty();
         auto* ptr = raw_ptr_ty();
-        return llvm::StructType::get(ctx_, { ptr, ptr, ptr, i32, i32, i32, i32, i32, i32, i32, i32 });
+        return llvm::StructType::get(
+          ctx_, { ptr, ptr, ptr, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32 });
     }
 
     // One constant rt_bounds_site per instrumented access. Everything the report
@@ -12135,8 +12141,10 @@ private:
                                            b_.CreateGlobalString(name, "bounds.of"),
                                            llvm::ConstantInt::get(i32, idx.line_no),
                                            llvm::ConstantInt::get(i32, idx.column),
+                                           llvm::ConstantInt::get(i32, idx.end_column),
                                            llvm::ConstantInt::get(i32, same ? acc.line_no : 0),
                                            llvm::ConstantInt::get(i32, same ? acc.column : 0),
+                                           llvm::ConstantInt::get(i32, same ? acc.end_column : 0),
                                            llvm::ConstantInt::get(i32, static_cast<int32_t>(what)),
                                            llvm::ConstantInt::get(i32, static_cast<uint32_t>(left)),
                                            llvm::ConstantInt::get(i32, static_cast<uint32_t>(right)),

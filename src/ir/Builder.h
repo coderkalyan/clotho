@@ -470,6 +470,14 @@ public:
     // business here.
     void rollback(Mark m);
 
+    // Record the exclusive end of the source construct `i` came from, so a
+    // diagnostic can underline it rather than point at its first character.
+    // Sparse — see Ir::end. Recording one for an instruction that is shared
+    // (a folded constant) only widens an underline, never misdirects it.
+    void set_end(Index i, SourceLoc end) {
+        ends_.emplace(static_cast<uint32_t>(i), end);
+    }
+
     // Freeze the built state into an Ir, sealing the root region. The builder is
     // spent afterwards.
     Ir finish();
@@ -544,6 +552,8 @@ private:
     std::vector<Inst::Tag>     tags_;
     std::vector<Inst::Payload> payloads_;
     std::vector<SourceLoc>     locs_;
+    // Sparse construct ends, keyed by instruction index; see set_end.
+    ankerl::unordered_dense::map<uint32_t, SourceLoc> ends_;
     // Flat u32 side-table under construction.
     std::vector<uint32_t> extra_;
     // Instruction indices of all open regions, innermost segment last.

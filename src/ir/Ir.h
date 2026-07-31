@@ -67,21 +67,27 @@ struct SourceSpan {
     }
 };
 
-// What a resolver can say about a SourceLoc: enough to print a location, and
-// enough to draw the snippet-and-caret block under it.
+// What a resolver can say about a source construct: enough to print a location,
+// and enough to draw the snippet-and-underline block under it.
 struct SourceText {
     // "<file>:<line>:<col>", or "<unknown>" when the location cannot be
     // resolved.
     std::string where;
-    // The source line the location sits on, verbatim and without its newline.
-    // Empty when unavailable, which callers must tolerate.
+    // The source line the construct starts on, verbatim and without its
+    // newline. Empty when unavailable, which callers must tolerate.
     std::string line;
-    // 1-based line and column within the file; 0 when unknown.
+    // 1-based line and column of the construct's first character; 0 when
+    // unknown.
     uint32_t line_no = 0;
     uint32_t column  = 0;
+    // 1-based column one past the construct's last character, so the underline
+    // spans [column, end_column). Equals `column` when no extent was recorded
+    // or the construct runs onto another line — draw a single caret then.
+    uint32_t end_column = 0;
 };
 
-// Optional hook turning a SourceLoc into the above.
+// Optional hook turning a source extent into the above. The span's `end` is
+// SourceLoc{0} for a construct recorded as a bare point.
 //
 // The IR core cannot decode a SourceLoc itself: the (buffer, offset) mapping
 // lives in the slang-aware frontend, and keeping this library free of slang is
@@ -89,7 +95,7 @@ struct SourceText {
 // located output passes a resolver (in practice one built over
 // `SourceContext`). Default-constructed means "no locations available", which
 // is what tests want -- golden IR text must not depend on file paths.
-using LocResolver = std::function<SourceText(SourceLoc)>;
+using LocResolver = std::function<SourceText(SourceSpan)>;
 
 // Opaque handle to a module signal (net / variable / port). Resolved by the
 // enclosing module; the process IR never interprets it.
@@ -2193,6 +2199,17 @@ public:
         return tags_.size();
     }
 
+    // End of the source construct an instruction came from, exclusive, or
+    // SourceLoc{0} when unrecorded. Sparse on purpose: a 16-byte SourceSpan per
+    // instruction is exactly what the note on SourceSpan rules out, and only a
+    // diagnostic that UNDERLINES a construct rather than pointing at it needs
+    // more than `loc`. The frontend records one for index expressions, so a
+    // bounds report can highlight the whole index the user wrote.
+    SourceLoc end(Index i) const {
+        const auto it = ends_.find(static_cast<uint32_t>(i));
+        return it == ends_.end() ? SourceLoc{ 0 } : it->second;
+    }
+
     Inst::Tag tag(Index i) const {
         return tags_[static_cast<uint32_t>(i)];
     }
@@ -2345,16 +2362,18 @@ private:
     }
 
     // Constructed atomically by Builder::finish().
-    Ir(const InternPool&          pool,
-       std::vector<Inst::Tag>     tags,
-       std::vector<Inst::Payload> payloads,
-       std::vector<SourceLoc>     locs,
-       std::vector<uint32_t>      extra,
-       ExtraSlice                 root)
+    Ir(const InternPool&                                   pool,
+       std::vector<Inst::Tag>                              tags,
+       std::vector<Inst::Payload>                          payloads,
+       std::vector<SourceLoc>                              locs,
+       ankerl::unordered_dense::map<uint32_t, SourceLoc>   ends,
+       std::vector<uint32_t>                               extra,
+       ExtraSlice                                          root)
       : pool_(&pool)
       , tags_(std::move(tags))
       , payloads_(std::move(payloads))
       , locs_(std::move(locs))
+      , ends_(std::move(ends))
       , extra_(std::move(extra))
       , root_(root) {}
 
@@ -2366,6 +2385,9 @@ private:
     Array<Inst::Payload> payloads_;
     // Per-instruction opaque source locations, parallel to tags_.
     Array<SourceLoc> locs_;
+    // Construct ends, keyed by instruction index; see `end`. Empty unless the
+    // frontend recorded an extent, which it does only for index expressions.
+    ankerl::unordered_dense::map<uint32_t, SourceLoc> ends_;
     // Flat u32 side-table for region bodies, operand slices, and extra structs.
     Array<uint32_t> extra_;
     // Top-level region: the process body (empty when default-constructed).
