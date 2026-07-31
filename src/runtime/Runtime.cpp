@@ -3073,11 +3073,36 @@ extern "C" void rt_bounds_report(const rt_bounds_site* site, int64_t index, int6
         fmt::print(stderr, loc, "{} |", number);
         fmt::print(stderr, " {}", text);
         fmt::print(stderr, "\n");
-        if (site->column > 0 && static_cast<size_t>(site->column) <= text.size() + 1) {
+        // The marker row: `^` under the index expression, `---` under the array
+        // it indexes when both landed on this line. Built as one padded string
+        // so the two cannot fight over spacing. The text row puts a space after
+        // the bar, so source column N is offset N in the row.
+        std::string marks;
+        const auto  place = [&](int32_t col, size_t n, char ch) {
+            if (col <= 0 || static_cast<size_t>(col) > text.size() + 1) {
+                return;
+            }
+            const size_t at = static_cast<size_t>(col);
+            if (marks.size() < at + n) {
+                marks.resize(at + n, ' ');
+            }
+            marks.replace(at, n, n, ch);
+        };
+        if (site->acc_line_no == site->line_no) {
+            // Underline the array's name only where the source really spells it
+            // there -- a hierarchical `name` is not what the statement wrote, and
+            // the leaf may be renamed by a `` `define ``. Otherwise one tick.
+            const char*       dot  = std::strrchr(site->name, '.');
+            const std::string leaf = dot != nullptr ? dot + 1 : site->name;
+            const size_t      at   = static_cast<size_t>(site->acc_column) - 1;
+            const bool        spelt = site->acc_column > 0 && at + leaf.size() <= text.size() &&
+                               text.compare(at, leaf.size(), leaf) == 0;
+            place(site->acc_column, spelt ? leaf.size() : 1, '-');
+        }
+        place(site->column, 1, '^');
+        if (!marks.empty()) {
             fmt::print(stderr, loc, "{} |", gutter);
-            // The text line puts one space after the bar, so column N sits N+1
-            // characters past it -- pad to that width and the caret lands on it.
-            fmt::print(stderr, caret, "{:>{}}", "^", site->column + 1);
+            fmt::print(stderr, caret, "{}", marks);
             fmt::print(stderr, "\n");
         }
     }

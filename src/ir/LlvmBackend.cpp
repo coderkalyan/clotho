@@ -12103,29 +12103,40 @@ private:
     };
 
     // The rt_bounds_site record (Runtime.h): { ptr where, ptr line, ptr name,
-    // i32 line_no, i32 column, i32 what, i32 left, i32 right, i32 width }.
-    // Field order and types mirror the C struct exactly, so the two change
-    // together.
+    // i32 line_no, i32 column, i32 acc_line_no, i32 acc_column, i32 what,
+    // i32 left, i32 right, i32 width }. Field order and types mirror the C
+    // struct exactly, so the two change together.
     llvm::StructType* bounds_site_ty() {
         auto* i32 = b_.getInt32Ty();
         auto* ptr = raw_ptr_ty();
-        return llvm::StructType::get(ctx_, { ptr, ptr, ptr, i32, i32, i32, i32, i32, i32 });
+        return llvm::StructType::get(ctx_, { ptr, ptr, ptr, i32, i32, i32, i32, i32, i32, i32, i32 });
     }
 
     // One constant rt_bounds_site per instrumented access. Everything the report
     // knows at compile time lives here instead of in the argument list, which
     // keeps the call to the values that are genuinely dynamic. `left`/`right`
     // are ignored by the runtime when the check passes an extent instead.
-    llvm::Constant* bounds_site_global(const SourceText& at, const std::string& name, BoundsWhat what,
-                                       int32_t left, int32_t right, int32_t width = 1) {
+    //
+    // `idx` locates the index expression and drives the message's location line
+    // and caret; `acc` locates the expression being indexed, underlined beside
+    // it. Pass the same SourceText for both where there is no separate index
+    // (an empty-queue pop).
+    llvm::Constant* bounds_site_global(const SourceText& idx, const SourceText& acc,
+                                       const std::string& name, BoundsWhat what, int32_t left,
+                                       int32_t right, int32_t width = 1) {
         auto*       i32 = b_.getInt32Ty();
         auto* const rec = bounds_site_ty();
+        // The snippet is the index's line, so an access position on some other
+        // line has no column to underline there.
+        const bool  same = acc.line_no == idx.line_no;
         auto*       init =
-          llvm::ConstantStruct::get(rec, { b_.CreateGlobalString(at.where, "bounds.at"),
-                                           b_.CreateGlobalString(at.line, "bounds.src"),
+          llvm::ConstantStruct::get(rec, { b_.CreateGlobalString(idx.where, "bounds.at"),
+                                           b_.CreateGlobalString(idx.line, "bounds.src"),
                                            b_.CreateGlobalString(name, "bounds.of"),
-                                           llvm::ConstantInt::get(i32, at.line_no),
-                                           llvm::ConstantInt::get(i32, at.column),
+                                           llvm::ConstantInt::get(i32, idx.line_no),
+                                           llvm::ConstantInt::get(i32, idx.column),
+                                           llvm::ConstantInt::get(i32, same ? acc.line_no : 0),
+                                           llvm::ConstantInt::get(i32, same ? acc.column : 0),
                                            llvm::ConstantInt::get(i32, static_cast<int32_t>(what)),
                                            llvm::ConstantInt::get(i32, static_cast<uint32_t>(left)),
                                            llvm::ConstantInt::get(i32, static_cast<uint32_t>(right)),
@@ -12169,8 +12180,8 @@ private:
           .index   = bounds_index(idx_expr),
           .unknown = unknown,
           .extent  = extent,
-          .site    = bounds_site_global(loc_text(at), bounds_name(named), BoundsWhat::Element, left,
-                                        right),
+          .site    = bounds_site_global(loc_text(idx_expr), loc_text(at), bounds_name(named),
+                                        BoundsWhat::Element, left, right),
         });
     }
 
@@ -12193,8 +12204,8 @@ private:
           .unknown = any_unknown(value_of(off_expr)),
           .extent  = b_.getInt64(container_width),
           .partial = v.partial,
-          .site    = bounds_site_global(loc_text(at), bounds_name(target), what, 0, 0,
-                                        static_cast<int32_t>(sel_width)),
+          .site    = bounds_site_global(loc_text(off_expr), loc_text(at), bounds_name(target), what,
+                                        0, 0, static_cast<int32_t>(sel_width)),
         });
     }
 
@@ -12217,7 +12228,8 @@ private:
                              .index   = index,
                              .unknown = any_unknown(value_of(idx_expr)),
                              .extent  = len,
-                             .site = bounds_site_global(loc_text(at), name, BoundsWhat::Char, 0, 0),
+                             .site = bounds_site_global(loc_text(idx_expr), loc_text(at), name,
+                                                        BoundsWhat::Char, 0, 0),
                            },
                            is_write);
     }
@@ -12241,8 +12253,8 @@ private:
                              .index   = index,
                              .unknown = any_unknown(value_of(idx_expr)),
                              .extent  = len,
-                             .site = bounds_site_global(loc_text(at), bounds_name(named),
-                                                        BoundsWhat::QueueOp, 0, 0),
+                             .site = bounds_site_global(loc_text(idx_expr), loc_text(at),
+                                                        bounds_name(named), BoundsWhat::QueueOp, 0, 0),
                            },
                            /*is_write=*/true);
     }
@@ -12261,8 +12273,9 @@ private:
                              .inrange = b_.CreateICmpNE(len, b_.getInt64(0)),
                              .index   = b_.getInt64(0),
                              .extent  = len,
-                             .site    = bounds_site_global(loc_text(at), bounds_name(named),
-                                                           BoundsWhat::EmptyPop, 0, 0),
+                             .site    = bounds_site_global(loc_text(at), loc_text(at),
+                                                           bounds_name(named), BoundsWhat::EmptyPop,
+                                                           0, 0),
                            },
                            /*is_write=*/false);
     }

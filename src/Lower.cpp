@@ -11972,27 +11972,33 @@ private:
             const auto off = static_cast<uint32_t>((range.translateIndex(*c) - bias) * static_cast<int32_t>(stride));
             return b.constant(module_.pool.put_int(make_int_type(32, false, false), off), l);
         }
-        const ir::Ref   off_ty = make_int_type(32, idx.type->isFourState(), idx.type->isSigned());
-        const ir::Index v      = b.resize(lower_expr(idx, b), off_ty, l);
-        ir::Index       off;
+        // The normalization arithmetic is attributed to the index expression, not
+        // to the select `l` sits on: this offset IS the index as far as everything
+        // downstream can see, so a diagnostic that points at it (--sanitize=bounds
+        // puts its caret here) must point at what the user wrote inside the
+        // brackets rather than at the vector being indexed.
+        const ir::SourceLoc il     = loc(idx);
+        const ir::Ref       off_ty = make_int_type(32, idx.type->isFourState(), idx.type->isSigned());
+        const ir::Index     v      = b.resize(lower_expr(idx, b), off_ty, il);
+        ir::Index           off;
         if (range.isDescending()) {
             const int32_t sub = range.right + bias; // off = idx - right - bias
             off =
               sub == 0
                 ? v
                 : b.binary(
-                    ir::Inst::Tag::Sub, v, b.constant(module_.pool.put_int(off_ty, static_cast<uint32_t>(sub)), l), l);
+                    ir::Inst::Tag::Sub, v, b.constant(module_.pool.put_int(off_ty, static_cast<uint32_t>(sub)), il), il);
         } else {
             // Big-endian: off = (right - bias) - idx.
             off = b.binary(ir::Inst::Tag::Sub,
-                           b.constant(module_.pool.put_int(off_ty, static_cast<uint32_t>(range.right - bias)), l),
+                           b.constant(module_.pool.put_int(off_ty, static_cast<uint32_t>(range.right - bias)), il),
                            v,
-                           l);
+                           il);
         }
         if (stride == 1) {
             return off;
         }
-        return b.binary(ir::Inst::Tag::Mul, off, b.constant(module_.pool.put_int(off_ty, stride), l), l);
+        return b.binary(ir::Inst::Tag::Mul, off, b.constant(module_.pool.put_int(off_ty, stride), il), il);
     }
 
     // Normalized bit offset for a 1-bit element select on a packed value.

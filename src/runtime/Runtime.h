@@ -188,22 +188,35 @@ typedef enum rt_bounds_what {
 // runtime extent, the direction and the time travel as arguments. Its address
 // is stable for the run, so it also keys the per-site repeat cap.
 //
+// It carries TWO positions. The index expression is the primary one -- it is
+// the thing that holds the wrong value, so it gets the location line and the
+// caret. The indexed expression is secondary, underlined on the same snippet
+// line when it shares it, because `q[i]` and `mem[i]` in one statement are told
+// apart by which array is named, not by the index.
+//
 // Field order and types are the emitted LLVM struct's, so the two must change
-// together: { ptr, ptr, ptr, i32, i32, i32, i32, i32, i32 }.
+// together: { ptr, ptr, ptr, i32, i32, i32, i32, i32, i32, i32, i32 }.
 typedef struct rt_bounds_site {
-    // "<file>:<line>:<col>" of the access, or "<unknown>".
+    // "<file>:<line>:<col>" of the index expression, or "<unknown>".
     const char* where;
-    // The source line the access sits on, verbatim and without its newline, for
-    // the snippet under the message. Empty when the source is unavailable, in
-    // which case no snippet is drawn.
+    // The source line the index expression sits on, verbatim and without its
+    // newline, for the snippet under the message. Empty when the source is
+    // unavailable, in which case no snippet is drawn.
     const char* line;
     // What was indexed: an array's hierarchical name, or "<local>" for a frame
     // local (the backend has no name for one).
     const char* name;
-    // 1-based line and column of the access within `line`; the caret sits under
-    // `column`. 0 when unknown.
+    // 1-based line and column of the index expression within `line`; the caret
+    // sits under `column`. 0 when unknown.
     int32_t line_no;
     int32_t column;
+    // 1-based line and column of the indexed expression. Underlined on the
+    // snippet only when `acc_line_no` equals `line_no` -- an index split across
+    // lines from the array it indexes gets the caret alone. 0 when unknown, and
+    // for a site with no index of its own (an empty-queue pop), where the two
+    // positions are the same thing.
+    int32_t acc_line_no;
+    int32_t acc_column;
     // An rt_bounds_what.
     int32_t what;
     // The declared bounds [left:right], as written. Meaningful only when the
