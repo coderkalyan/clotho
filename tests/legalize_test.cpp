@@ -832,3 +832,157 @@ TEST_CASE("an async load is reported, with the conditions available") {
     REQUIRE(e->decomp.async.size() == 1);
     CHECK(e->decomp.async[0].entries.size() == 2);
 }
+
+// --- M6: coverage ---------------------------------------------------------
+//
+// A `Switch` only ever carries fully-defined, deduplicated keys -- the frontend
+// routes casez / casex / unknown keys down the cond-chain path instead. So there
+// are no wildcards to expand and no overlaps to subtract, and fullness is an
+// O(arms) count with no allocation, exact at any width the frontend can state.
+// That sidesteps both failure modes the design doc catalogues: yosys's
+// BitPatternPool is exponential in wildcard density, and direct enumeration has a
+// hard width ceiling.
+
+TEST_CASE("a fully enumerated case without a default is combinational") {
+    const Run   t = run(R"(
+        module m(input [1:0] s2, input [7:0] a, input [7:0] b, output reg [7:0] q);
+          always @* case (s2)
+            2'd0: q = a;
+            2'd1: q = b;
+            2'd2: q = 8'h00;
+            2'd3: q = 8'hFF;
+          endcase
+        endmodule
+    )");
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::Comb);
+    CHECK_FALSE(e->has_hold);
+}
+
+// One key short. This is the case the analysis must NOT round up: 3 of 4 values
+// covered leaves a real path that assigns nothing.
+TEST_CASE("a case missing one value is a latch") {
+    const Run   t = run(R"(
+        module m(input [1:0] s2, input [7:0] a, input [7:0] b, output reg [7:0] q);
+          always @* case (s2)
+            2'd0: q = a;
+            2'd1: q = b;
+            2'd2: q = 8'h00;
+          endcase
+        endmodule
+    )");
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::Latch);
+}
+
+// Several keys on one arm count individually.
+TEST_CASE("multiple keys per arm are counted") {
+    const Run   t = run(R"(
+        module m(input [1:0] s2, input [7:0] a, output reg [7:0] q);
+          always @* case (s2)
+            2'd0, 2'd1: q = a;
+            2'd2, 2'd3: q = 8'h00;
+          endcase
+        endmodule
+    )");
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::Comb);
+}
+
+// Completeness is per signal, not per case: `r` is assigned on only one arm.
+TEST_CASE("a full case still latches a signal it does not always assign") {
+    const Run   t  = run(R"(
+        module m(input [1:0] s2, input [7:0] a, output reg [7:0] q, output reg [7:0] r);
+          always @* case (s2)
+            2'd0: begin q = a; r = a; end
+            2'd1: q = 8'h01;
+            2'd2: q = 8'h02;
+            2'd3: q = 8'h03;
+          endcase
+        endmodule
+    )");
+    const auto* eq = t.find("q");
+    const auto* er = t.find("r");
+    REQUIRE(eq != nullptr);
+    REQUIRE(er != nullptr);
+    CHECK(eq->kind == legalize::StorageKind::Comb);
+    CHECK(er->kind == legalize::StorageKind::Latch);
+}
+
+// A full case under a clock removes the enable rather than the latch.
+TEST_CASE("a full case in a clocked block leaves no enable") {
+    const Run   t = run(R"(
+        module m(input clk, input [1:0] s2, input [7:0] a, output reg [7:0] q);
+          always @(posedge clk) case (s2)
+            2'd0: q <= a;
+            2'd1: q <= 8'h01;
+            2'd2: q <= 8'h02;
+            2'd3: q <= 8'h03;
+          endcase
+        endmodule
+    )");
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::Flop);
+    CHECK(e->decomp.always_enabled);
+}
+
+// casez never reaches a Switch -- the frontend lowers wildcards to a cond chain --
+// so coverage is not even asked, and an unmatched selector holds. This is the
+// behaviour that makes the counting rule safe: it is never handed a wildcard.
+TEST_CASE("a casez without a default is a latch, not a coverage question") {
+    const Run   t = run(R"(
+        module m(input [1:0] s2, input [7:0] a, output reg [7:0] q);
+          always @* casez (s2)
+            2'b0?: q = a;
+            2'b1?: q = 8'h00;
+          endcase
+        endmodule
+    )");
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::Latch);
+}
+
+// The divergence coverage exposes. `case` matches with ===, so a 4-state selector
+// holding x matches no arm and the signal holds -- while a synthesiser, which has
+// no x, sees a complete mux. One source, two behaviours, and the analysis names it
+// rather than silently picking a side.
+TEST_CASE("a full case over a four-state selector reports the x divergence") {
+    const Run   t = run(R"(
+        module m(input [1:0] s2, input [7:0] a, output reg [7:0] q);
+          always @* case (s2)
+            2'd0: q = a;
+            2'd1: q = 8'h01;
+            2'd2: q = 8'h02;
+            2'd3: q = 8'h03;
+          endcase
+        endmodule
+    )");
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::Comb);
+    CHECK(t.has(legalize::Finding::FullCaseXSelector));
+}
+
+// A two-state selector has no such divergence, so no note.
+TEST_CASE("a full case over a two-state selector reports nothing") {
+    const Run   t = run(R"(
+        module m(input [7:0] a, output reg [7:0] q);
+          bit [1:0] s2;
+          always @* case (s2)
+            2'd0: q = a;
+            2'd1: q = 8'h01;
+            2'd2: q = 8'h02;
+            2'd3: q = 8'h03;
+          endcase
+        endmodule
+    )");
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::Comb);
+    CHECK_FALSE(t.has(legalize::Finding::FullCaseXSelector));
+}

@@ -56,6 +56,10 @@ struct Atom {
     AtomKind  kind = AtomKind::CondTrue;
     // For SwitchArm, the arm's key slice; unused otherwise.
     ir::ExtraSlice keys{};
+    // Selector value width, for switch atoms only. Carried because a consumer that
+    // renders the keys must size them: an unsized literal re-lowers against a
+    // 32-bit selector, and a case that was full over 2 bits stops being full.
+    uint32_t sel_width = 0;
 };
 
 struct GuardNode {
@@ -99,6 +103,12 @@ enum class Finding : uint16_t {
     // async entries, which is where the answer actually is -- yosys blames the
     // sensitivity list instead, which is not where the problem is.
     AsyncLoad,
+    // A case with no default enumerates every value of a FOUR-STATE selector.
+    // Synthesis reads that as complete, and legalization agrees -- but `case`
+    // matches with ===, so in simulation an x/z selector matches no arm and the
+    // signal holds. Combinational for the synthesiser, a latch for the simulator,
+    // from one source. Exactly the class of mismatch this analysis exists to name.
+    FullCaseXSelector,
 };
 
 struct Note {
@@ -129,6 +139,12 @@ enum class StorageKind : uint8_t {
     // No standard primitive does this; it is reported, not built. (yosys invents
     // $aldff and warns; YosysHQ advise against it.)
     AsyncLoad,
+    // A case with no default enumerates every value of a FOUR-STATE selector.
+    // Synthesis reads that as complete, and legalization agrees -- but `case`
+    // matches with ===, so in simulation an x/z selector matches no arm and the
+    // signal holds. Combinational for the synthesiser, a latch for the simulator,
+    // from one source. Exactly the class of mismatch this analysis exists to name.
+    FullCaseXSelector,
     // The process was rejected, or no clock could be identified.
     Unclassified,
 };

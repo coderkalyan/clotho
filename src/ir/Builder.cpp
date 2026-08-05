@@ -25,8 +25,8 @@ Ir Builder::finish() {
     // Whatever remains in scratch_ is the root region.
     const ExtraSlice root = add_slice(scratch_);
 
-    return Ir(pool_, std::move(tags_), std::move(payloads_), std::move(locs_), std::move(ends_),
-              std::move(extra_), root);
+    return Ir(
+      pool_, std::move(tags_), std::move(payloads_), std::move(locs_), std::move(ends_), std::move(extra_), root);
 }
 
 void Builder::open_region() {
@@ -392,7 +392,12 @@ Index Builder::cond(Index condition, ExtraSlice then_region, ExtraSlice else_reg
     return emit({ Inst::Tag::Cond, Inst::Payload{ .op_extra = { condition, extra } } }, loc);
 }
 
-Index Builder::switch_(Index selector, std::span<const SwitchArmBuild> arms, ExtraSlice default_region, SourceLoc loc) {
+Index Builder::switch_(Index                           selector,
+                       std::span<const SwitchArmBuild> arms,
+                       ExtraSlice                      default_region,
+                       uint32_t                        sel_width,
+                       uint32_t                        sel_four,
+                       SourceLoc                       loc) {
     // Lay the arm records after their keys so every ExtraSlice is an absolute
     // offset: each arm's keys (u64 -> two words) first, then the SwitchArm
     // records contiguously, then the SwitchInfo referencing the record run.
@@ -414,7 +419,8 @@ Index Builder::switch_(Index selector, std::span<const SwitchArmBuild> arms, Ext
     }
     const auto arms_end = static_cast<ExtraIndex>(extra_.size());
 
-    const ExtraIndex extra = add_extra(SwitchInfo{ ExtraSlice{ arms_start, arms_end }, default_region });
+    const ExtraIndex extra =
+      add_extra(SwitchInfo{ ExtraSlice{ arms_start, arms_end }, default_region, sel_width, sel_four });
 
     return emit({ Inst::Tag::Switch, Inst::Payload{ .op_extra = { selector, extra } } }, loc);
 }

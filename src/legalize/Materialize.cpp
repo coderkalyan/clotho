@@ -480,7 +480,17 @@ void emit_tree(std::ostringstream&   os,
                     const uint64_t     key = static_cast<uint64_t>(raw[k]) | (static_cast<uint64_t>(raw[k + 1]) << 32);
                     std::ostringstream hex;
                     hex << std::hex << key;
-                    os << (k == 0 ? "" : ", ") << "'h" << hex.str();
+                    // SIZED to the selector. An unsized `'h0` re-lowers against a
+                    // 32-bit selector type, so a case that was full over 2 bits
+                    // stops being full and its signal reads as a latch. Width 0
+                    // means the frontend declined to state one (the one-hot path),
+                    // and `0'h0` is not legal source, so leave those unsized.
+                    const uint32_t w = probe.path[depth].sel_width;
+                    os << (k == 0 ? "" : ", ");
+                    if (w != 0) {
+                        os << w;
+                    }
+                    os << "'h" << hex.str();
                 }
                 os << ": begin\n";
                 std::vector<Item> arm;

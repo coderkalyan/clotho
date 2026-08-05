@@ -8,13 +8,51 @@ namespace clotho::legalize {
 
 namespace {
 
-// The arms of a switch, decoded from the flat extra run.
-std::vector<ir::SwitchArm> arms_of(const ir::Ir& ir, const ir::SwitchInfo& info) {
+// Is a defaultless case FULL -- do its arms cover every selector value?
+//
+// Counting, not materialising. yosys's BitPatternPool is exponential in wildcard
+// density and OOMs at W=32 with two open bugs since 2022; direct enumeration has a
+// hard ceiling. Neither is needed here, because a `Switch` only ever carries
+// fully-defined, deduplicated keys -- the frontend routes casez / casex / unknown
+// keys down the cond-chain path instead (find_switch_run rejects hasUnknown). So
+// there are no wildcards to expand and no overlaps to subtract: fullness is
+// `distinct keys == 2^width`, an O(arms) count with no allocation, exact at any
+// width the frontend can state.
+//
+// Uses the selector's VALUE width, not the key encoding: a 4-state key packs value
+// and unknown bits into 2*width, which is not the space fullness asks about.
+//
+// Declines rather than guesses when the width is unknown (0) or 64 -- 2^64 does not
+// fit, and no case enumerates it anyway.
+bool case_is_full(const ir::Ir& ir, const ir::SwitchInfo& info, std::span<const ir::SwitchArm> arms) {
+    if (info.sel_width == 0 || info.sel_width >= 64) {
+        return false;
+    }
+    uint64_t count = 0;
+    for (const ir::SwitchArm& a : arms) {
+        // Two u32 words per key.
+        count += ir.region(a.keys).size() / 2;
+        if (count > (uint64_t{ 1 } << info.sel_width)) {
+            break;
+        }
+    }
+
+    return count == (uint64_t{ 1 } << info.sel_width);
+}
+
+// The arms of a switch, as a view over the flat extra run.
+//
+// A span, not a vector: coverage made must_assign descend into defaultless cases
+// that used to short-circuit, so this is now called on every arm of every case on
+// every walk, and a heap allocation per call showed up immediately on hazard3. The
+// records are contiguous by construction (Builder::switch_ lays keys first, then
+// the record run), so no copy is needed.
+std::span<const ir::SwitchArm> arms_of(const ir::Ir& ir, const ir::SwitchInfo& info) {
     const std::span<const ir::Index> raw    = ir.region(info.arms);
     constexpr size_t                 stride = sizeof(ir::SwitchArm) / sizeof(uint32_t);
     const auto*                      base   = reinterpret_cast<const ir::SwitchArm*>(raw.data());
 
-    return { base, base + raw.size() / stride };
+    return { base, raw.size() / stride };
 }
 
 // Is this function synthesizable as an OPERATOR?
@@ -272,13 +310,27 @@ private:
                 case ir::Inst::Tag::Switch: {
                     const auto                       info = ir.extra_data<ir::SwitchInfo>(ir.payload(i).op_extra.extra);
                     const std::span<const ir::Index> dflt = ir.region(info.default_);
-                    if (dflt.empty()) {
-                        break; // no default: a path that assigns nothing
+                    const std::span<const ir::SwitchArm> all = arms_of(ir, info);
+                    // A defaultless case whose arms cover the selector is complete:
+                    // the "missing default" path does not exist. Without this every
+                    // fully-enumerated case reads as a latch.
+                    if (dflt.empty() && !case_is_full(ir, info, all)) {
+                        break; // no default, not full: a path that assigns nothing
                     }
-                    SigSet common = must_assign(ir, dflt, eval);
-                    for (const ir::SwitchArm& a : arms_of(ir, info)) {
-                        const SigSet mine = must_assign(ir, ir.region(a.body), eval);
-                        SigSet       next;
+                    SigSet common;
+                    bool   first = true;
+                    if (!dflt.empty()) {
+                        common = must_assign(ir, dflt, eval);
+                        first  = false;
+                    }
+                    for (const ir::SwitchArm& a : all) {
+                        SigSet mine = must_assign(ir, ir.region(a.body), eval);
+                        if (first) {
+                            common = std::move(mine);
+                            first  = false;
+                            continue;
+                        }
+                        SigSet next;
                         for (const uint32_t s : common) {
                             if (mine.contains(s)) {
                                 next.insert(s);
@@ -340,15 +392,25 @@ private:
                 }
 
                 case ir::Inst::Tag::Switch: {
-                    const auto                       info = ir.extra_data<ir::SwitchInfo>(ir.payload(i).op_extra.extra);
-                    const ir::Index                  sel  = ir.payload(i).op_extra.op;
-                    const std::vector<ir::SwitchArm> arms = arms_of(ir, info);
-                    const std::span<const ir::Index> dflt = ir.region(info.default_);
+                    const auto      info = ir.extra_data<ir::SwitchInfo>(ir.payload(i).op_extra.extra);
+                    const ir::Index sel  = ir.payload(i).op_extra.op;
+                    const std::span<const ir::SwitchArm> arms = arms_of(ir, info);
+                    const std::span<const ir::Index>     dflt = ir.region(info.default_);
+
+                    // Complete for the synthesiser, a latch for the simulator, from
+                    // one source. Reported here rather than silently resolved either
+                    // way, because which reading is right depends on whether the
+                    // selector can actually be x -- which this analysis cannot know
+                    // and the designer can.
+                    if (dflt.empty() && info.sel_four != 0 && case_is_full(ir, info, arms)) {
+                        notes_.push_back(
+                          { Finding::FullCaseXSelector, proc_, ir::Signal{}, {}, ir::Inst::Tag::Switch });
+                    }
 
                     for (const ir::SwitchArm& a : arms) {
-                        walk(ir, ir.region(a.body), push(guard, { sel, AtomKind::SwitchArm, a.keys }));
+                        walk(ir, ir.region(a.body), push(guard, { sel, AtomKind::SwitchArm, a.keys, info.sel_width }));
                     }
-                    walk(ir, dflt, push(guard, { sel, AtomKind::SwitchDefault, {} }));
+                    walk(ir, dflt, push(guard, { sel, AtomKind::SwitchDefault, {}, info.sel_width }));
                     break;
                 }
 

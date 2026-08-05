@@ -525,6 +525,19 @@ struct SwitchInfo {
     ExtraSlice arms;
     // Default region, run when no key matches (empty when the case had none).
     ExtraSlice default_;
+    // Selector VALUE width, 1..64, or 0 when the frontend cannot state one and
+    // coverage must decline.
+    //
+    // Not the key-encoding width: a 4-state selector's key packs value and unknown
+    // bits into 2*width, which is not the space fullness is asking about. Recorded
+    // because coverage cannot recover it -- keys are bare u64 and the IR has no
+    // type query for an instruction's result.
+    uint32_t sel_width;
+    // Non-zero when the selector is 4-state. A fully enumerated case is then
+    // complete for SYNTHESIS but not for simulation: `case` matches with ===, so an
+    // x/z selector matches no arm and the signal holds. Legalization takes the
+    // synthesis reading and reports the divergence.
+    uint32_t sel_four;
 };
 
 // Extra payload for `display` / `fdisplay`: a $display / $write / $fdisplay /
@@ -2362,13 +2375,13 @@ private:
     }
 
     // Constructed atomically by Builder::finish().
-    Ir(const InternPool&                                   pool,
-       std::vector<Inst::Tag>                              tags,
-       std::vector<Inst::Payload>                          payloads,
-       std::vector<SourceLoc>                              locs,
-       ankerl::unordered_dense::map<uint32_t, SourceLoc>   ends,
-       std::vector<uint32_t>                               extra,
-       ExtraSlice                                          root)
+    Ir(const InternPool&                                 pool,
+       std::vector<Inst::Tag>                            tags,
+       std::vector<Inst::Payload>                        payloads,
+       std::vector<SourceLoc>                            locs,
+       ankerl::unordered_dense::map<uint32_t, SourceLoc> ends,
+       std::vector<uint32_t>                             extra,
+       ExtraSlice                                        root)
       : pool_(&pool)
       , tags_(std::move(tags))
       , payloads_(std::move(payloads))
