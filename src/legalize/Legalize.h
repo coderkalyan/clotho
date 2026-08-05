@@ -70,6 +70,11 @@ struct GuardedStore {
     ir::Index value       = ir::Index{}; // the RHS cone
     ir::Index store       = ir::Index{}; // the originating instruction, for spans
     bool      nonblocking = false;
+    // Written inside a loop, so this store happens once per iteration. The guard
+    // does not say that -- a loop adds no atom -- and a consumer that renders or
+    // counts assignments has to know. Materialize refuses such a signal rather
+    // than emitting the body once and silently dropping the iteration.
+    bool in_loop = false;
 };
 
 // -- Findings ------------------------------------------------------------------

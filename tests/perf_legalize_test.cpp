@@ -10,6 +10,7 @@
 
 #include "Lower.h"
 #include "legalize/Legalize.h"
+#include "legalize/Materialize.h"
 
 using namespace clotho;
 
@@ -143,5 +144,157 @@ TEST_CASE("PERF legalize real designs" * doctest::skip()) {
     }
     if (measured == 0) {
         MESSAGE("no fetched designs; nothing measured");
+    }
+}
+
+namespace {
+
+// Classification per signal, for signals that are comparable across a round trip.
+//
+// A signal written by two processes has two classifications, so collapsing by name
+// compares arbitrary pairs -- an unsound comparison that produced phantom
+// divergences until it was noticed. Only single-writer signals are compared, and
+// loop-written ones are excluded because materialize emits a loop body once
+// without its iteration (GuardedStore::in_loop marks them).
+struct Classified {
+    std::map<std::string, std::pair<int, bool>> by_name;
+    size_t                                      looped = 0;
+    size_t                                      multi  = 0;
+};
+
+Classified classify(const ir::Module& m, const legalize::Result& r, bool drop_looped) {
+    std::map<std::string, int> writers;
+    for (const legalize::ProcessResult& p : r.processes) {
+        for (const legalize::SignalStores& e : p.signals) {
+            ++writers[m.signal(e.signal).name];
+        }
+    }
+
+    Classified out;
+    for (const legalize::ProcessResult& p : r.processes) {
+        for (const legalize::SignalStores& e : p.signals) {
+            const std::string& n = m.signal(e.signal).name;
+            if (writers[n] != 1) {
+                ++out.multi;
+                continue;
+            }
+            bool looped = false;
+            for (const legalize::GuardedStore& st : e.stores) {
+                looped = looped || st.in_loop;
+            }
+            if (looped && drop_looped) {
+                ++out.looped;
+                continue;
+            }
+            out.by_name[n] = { static_cast<int>(e.kind), e.async_reset };
+        }
+    }
+
+    return out;
+}
+
+std::string mangled(std::string_view name) {
+    std::string out;
+    for (const char c : name) {
+        out += (c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) ? c : '_';
+    }
+
+    return out;
+}
+
+} // namespace
+
+// The round trip that matters: render a whole CPU, re-lower the rendered source,
+// re-classify, and require every comparable signal to land the same way.
+//
+// The 28-case corpus round trip cannot catch what this does. Everything below was
+// found by running it, and each was a real unfaithfulness in the renderer rather
+// than a limit of the analysis:
+//
+//   * partial writes rendered as whole ones (`q[i] = x` as `q = x`), turning every
+//     bit-reversal loop's target from a latch into combinational logic;
+//   * `casez` patterns rendered as exact constants, because 4-state literals
+//     collapsed to `'x` and threw the wildcards away -- every predecode signal in
+//     hazard3 lost its arms and re-read as a latch;
+//   * `case` arms dropped entirely, destroying the completeness a default provides;
+//   * dynamic part-selects and element selects unhandled.
+TEST_CASE("PERF materialize round-trips real designs" * doctest::skip()) {
+    const char* const           env = std::getenv("CLOTHO_PERF_CASES");
+    const std::filesystem::path root =
+      env != nullptr ? std::filesystem::path(env) : std::filesystem::path(CLOTHO_TEST_DIR) / "perf/cases";
+
+    for (const std::string_view nm : { "picorv32", "hazard3" }) {
+        CAPTURE(nm);
+        const std::filesystem::path dir = root / nm / "src";
+        if (!std::filesystem::is_directory(dir)) {
+            MESSAGE(nm, ": sources absent; run its fetch.sh");
+            continue;
+        }
+        std::vector<std::string> owned;
+        for (const auto& e : std::filesystem::directory_iterator(dir)) {
+            const auto x = e.path().extension();
+            if ((x == ".v" || x == ".sv") && !is_testbench(e.path())) {
+                owned.push_back(e.path().string());
+            }
+        }
+        std::sort(owned.begin(), owned.end());
+        const std::vector<std::string_view> paths(owned.begin(), owned.end());
+        const LowerResult                   r = lower_files(paths);
+        REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+
+        const legalize::Result before = legalize::run(*r.module, nullptr, { .keep_guards = true });
+        const std::string      text   = legalize::materialize(*r.module, before);
+        CHECK(text.find("unrenderable") == std::string::npos);
+
+        const LowerResult again = lower_text(text);
+        REQUIRE_MESSAGE(again.ok, again.diagnostic_text());
+        const legalize::Result after = legalize::run(*again.module, nullptr);
+
+        const Classified b = classify(*r.module, before, /*drop_looped=*/true);
+        const Classified a = classify(*again.module, after, /*drop_looped=*/false);
+
+        size_t match = 0;
+        size_t diff  = 0;
+        size_t gone  = 0;
+        for (const auto& [name, want] : b.by_name) {
+            const auto it = a.by_name.find(mangled(name));
+            if (it == a.by_name.end()) {
+                ++gone;
+                continue;
+            }
+            if (it->second == want) {
+                ++match;
+                continue;
+            }
+            if (diff < 6) {
+                MESSAGE("    DIFF ",
+                        name,
+                        ": kind ",
+                        want.first,
+                        "->",
+                        it->second.first,
+                        " arst ",
+                        static_cast<int>(want.second),
+                        "->",
+                        static_cast<int>(it->second.second));
+            }
+            ++diff;
+        }
+        MESSAGE(nm,
+                ": compared ",
+                b.by_name.size(),
+                " match ",
+                match,
+                " differ ",
+                diff,
+                " absent ",
+                gone,
+                " (excluded ",
+                b.looped,
+                " loop-written, ",
+                b.multi,
+                " multi-writer)");
+        CHECK(diff == 0);
+        CHECK(gone == 0);
     }
 }

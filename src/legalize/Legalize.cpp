@@ -312,7 +312,8 @@ private:
                         break; // a frame local: not module storage, not our unit
                     }
                     const ir::Signal s = ir.payload(lv.root).signal;
-                    slot(s).stores.push_back({ guard, ir.payload(i).binary.r, i, tag == ir::Inst::Tag::StoreNb });
+                    slot(s).stores.push_back(
+                      { guard, ir.payload(i).binary.r, i, tag == ir::Inst::Tag::StoreNb, in_loop_ });
                     break;
                 }
 
@@ -359,9 +360,12 @@ private:
                 // unrolled iteration inherits the loop's path condition.
                 case ir::Inst::Tag::Loop: {
                     const auto info = ir.extra_data<ir::LoopInfo>(ir.payload(i).extra);
+                    const bool was  = in_loop_;
+                    in_loop_        = true;
                     walk(ir, ir.region(info.cond), guard);
                     walk(ir, ir.region(info.body), guard);
                     walk(ir, ir.region(info.step), guard);
+                    in_loop_ = was;
                     break;
                 }
 
@@ -436,7 +440,8 @@ private:
     uint32_t                proc_;
     std::vector<GuardNode>& guards_;
     std::vector<Note>&      notes_;
-    ir::Eval*               eval_ = nullptr;
+    bool                    in_loop_ = false;
+    ir::Eval*               eval_    = nullptr;
     FnLegality&             fns_;
     ProcessResult           result_{};
 };
