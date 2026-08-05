@@ -489,3 +489,169 @@ TEST_CASE("materialize emits a nested tree, not a flat guarded list") {
     REQUIRE(again.processes[0].signals.size() == 1);
     CHECK(again.processes[0].signals[0].kind == legalize::StorageKind::Comb);
 }
+
+// --- function synthesis ---------------------------------------------------
+//
+// A pure function is an OPERATOR: its internal branching decides its return value
+// and nothing else, so from the caller's side a call is an ordinary value-producing
+// opcode. Nothing is inlined and no IR is rewritten -- the whole feature is
+// deciding whether that operator exists. Which makes the rejection rules the
+// substance, so each one gets a test that fails if the rule is inverted.
+
+TEST_CASE("a call to a pure function is synthesizable") {
+    const Run t = run(R"(
+        module m(input [3:0] a, input [3:0] b, output reg [7:0] q);
+          function [7:0] mix; input [3:0] x; input [3:0] y;
+            mix = {x, y};
+          endfunction
+          always @* q = mix(a, b);
+        endmodule
+    )");
+    CHECK(t.all_synthesizable());
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::Comb);
+}
+
+// Control flow inside the callee is a value question, not a statement question:
+// the caller's guarded list is unchanged and q is still combinational.
+TEST_CASE("a function with internal branching is still an operator") {
+    const Run t = run(R"(
+        module m(input [3:0] a, input [3:0] b, input s, output reg [7:0] q);
+          function [7:0] mix; input [3:0] x; input [3:0] y;
+          begin
+            if (s) mix = {x, y}; else mix = {y, x};
+          end
+          endfunction
+          always @* q = mix(a, b);
+        endmodule
+    )");
+    CHECK(t.all_synthesizable());
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::Comb);
+    // One store, not two: the branch is inside the value, not the process.
+    CHECK(e->stores.size() == 1);
+}
+
+TEST_CASE("a function calling another function is an operator") {
+    const Run t = run(R"(
+        module m(input [3:0] a, output reg [7:0] q);
+          function [3:0] inc; input [3:0] x; inc = x + 4'd1; endfunction
+          function [7:0] dbl; input [3:0] x; dbl = {inc(x), inc(x)}; endfunction
+          always @* q = dbl(a);
+        endmodule
+    )");
+    CHECK(t.all_synthesizable());
+}
+
+// Every rejection below is a real hardware reason, not a gap in the walk.
+
+// Suspension is a property of the BODY, not of the `task` keyword: Delay and Wait
+// are ungated opcodes, so this is rejected without any rule that mentions tasks.
+TEST_CASE("a subroutine that suspends is not an operator") {
+    const Run t = run(R"(
+        module m(input [3:0] a, output reg [7:0] q);
+          task slow; input [3:0] x; begin #5; end endtask
+          always @* begin q = {4'h0, a}; slow(a); end
+        endmodule
+    )");
+    CHECK_FALSE(t.all_synthesizable());
+    CHECK(t.has(legalize::Finding::Call));
+}
+
+// The converse, and the reason the rule turns on the body. picorv32's `assert
+// directive expands to a call to an empty task; rejecting on the keyword threw
+// away four processes over a subroutine that does nothing.
+TEST_CASE("a task that writes nothing and cannot suspend is a legal no-op") {
+    const Run t = run(R"(
+        module m(input [3:0] a, output reg [7:0] q);
+          task empty_statement; begin end endtask
+          always @* begin empty_statement; q = {4'h0, a}; end
+        endmodule
+    )");
+    CHECK(t.all_synthesizable());
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::Comb);
+    // The call contributes nothing: one store, from the one assignment.
+    CHECK(e->stores.size() == 1);
+}
+
+// A task that DOES write a module signal needs its writes attributed to the
+// caller's guards, which needs operand identity across two Irs -- guards and store
+// values are bare ir::Index today. Rejected rather than half-modelled.
+TEST_CASE("a task that writes a module signal is rejected") {
+    const Run t = run(R"(
+        module m(input [3:0] a, input en, output reg [7:0] q);
+          task setq; input [3:0] x; begin q = {4'h0, x}; end endtask
+          always @* begin q = 8'h00; if (en) setq(a); end
+        endmodule
+    )");
+    CHECK_FALSE(t.all_synthesizable());
+}
+
+// An output formal writes the CALLER's storage, so the call is a statement with
+// effects rather than a value.
+TEST_CASE("a function with an output argument is not an operator") {
+    const Run t = run(R"(
+        module m(input [3:0] a, output reg [7:0] q);
+          function [3:0] two; input [3:0] x; output [3:0] o; begin o = x; two = x; end endfunction
+          reg [3:0] side;
+          always @* begin q = 8'h00; q[3:0] = two(a, side); end
+        endmodule
+    )");
+    CHECK_FALSE(t.all_synthesizable());
+}
+
+// Writing a module signal from a function is legal Verilog and is a side effect;
+// an operator does not have one.
+TEST_CASE("a function that writes a module signal is not an operator") {
+    const Run t = run(R"(
+        module m(input [3:0] a, output reg [7:0] q, output reg flag);
+          function [7:0] peek; input [3:0] x; begin flag = 1'b1; peek = {4'h0, x}; end endfunction
+          always @* q = peek(a);
+        endmodule
+    )");
+    CHECK_FALSE(t.all_synthesizable());
+}
+
+// Recursion has no bounded hardware form. The memo marks a function "deciding"
+// while it is being decided, so reaching it again is the cycle.
+TEST_CASE("a recursive function is not an operator") {
+    const Run t = run(R"(
+        module m(input [3:0] a, output reg [7:0] q);
+          function automatic [7:0] fact; input [3:0] x;
+            fact = (x == 4'd0) ? 8'd1 : fact(x - 4'd1);
+          endfunction
+          always @* q = fact(a);
+        endmodule
+    )");
+    CHECK_FALSE(t.all_synthesizable());
+}
+
+// The gate is recursive: an unsynthesizable opcode anywhere in the callee's body
+// rejects the caller, not just one in the caller's own body.
+TEST_CASE("an unsynthesizable opcode inside a callee rejects the caller") {
+    const Run t = run(R"(
+        module m(input [3:0] a, output reg [7:0] q);
+          function [7:0] noisy; input [3:0] x; begin $display("x"); noisy = {4'h0, x}; end endfunction
+          always @* q = noisy(a);
+        endmodule
+    )");
+    CHECK_FALSE(t.all_synthesizable());
+}
+
+// A ternary's branch values live in REGIONS, so a call hidden in one is only
+// reached if the gate descends. Without that this process is legalized as
+// something it is not -- a silent accept, which is the one failure mode the
+// design does not tolerate.
+TEST_CASE("a call inside a ternary branch is still gated") {
+    const Run t = run(R"(
+        module m(input [3:0] a, input s, output reg [7:0] q);
+          function [7:0] noisy; input [3:0] x; begin $display("x"); noisy = {4'h0, x}; end endfunction
+          always @* q = s ? noisy(a) : 8'h00;
+        endmodule
+    )");
+    CHECK_FALSE(t.all_synthesizable());
+}

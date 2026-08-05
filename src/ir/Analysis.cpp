@@ -152,6 +152,8 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::MemberSelect:
         case Inst::Tag::AggCopy:
         case Inst::Tag::AggEq:
+        case Inst::Tag::Ret:
+        case Inst::Tag::RetVoid:
             return hw;
 
         // -- Everything else: simulation-only, not hardware. --
@@ -192,8 +194,6 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::AssocLast:
         case Inst::Tag::AssocNext:
         case Inst::Tag::AssocPrev:
-        case Inst::Tag::Ret:
-        case Inst::Tag::RetVoid:
         case Inst::Tag::Call:
         case Inst::Tag::CallVirtual:
         case Inst::Tag::StrLen:

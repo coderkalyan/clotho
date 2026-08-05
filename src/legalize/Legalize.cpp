@@ -8,6 +8,155 @@ namespace clotho::legalize {
 
 namespace {
 
+// The arms of a switch, decoded from the flat extra run.
+std::vector<ir::SwitchArm> arms_of(const ir::Ir& ir, const ir::SwitchInfo& info) {
+    const std::span<const ir::Index> raw    = ir.region(info.arms);
+    constexpr size_t                 stride = sizeof(ir::SwitchArm) / sizeof(uint32_t);
+    const auto*                      base   = reinterpret_cast<const ir::SwitchArm*>(raw.data());
+
+    return { base, base + raw.size() / stride };
+}
+
+// Is this function synthesizable as an OPERATOR?
+//
+// A pure function's internal branching decides its return VALUE and nothing else:
+// it never changes the caller's statement structure, so from the caller's side a
+// call is an ordinary value-producing opcode like `add`. That is why nothing is
+// inlined here and no IR is rewritten -- the whole of "function synthesis" is
+// deciding whether this operator exists.
+//
+// It has to be contextual rather than a TagInfo bit, because `call` is legal or
+// not depending entirely on who is being called.
+class FnLegality {
+public:
+    explicit FnLegality(const ir::Module& m)
+      : m_(m) {}
+
+    // Memoised and cycle-safe: a function reached while it is still being decided
+    // is recursive, and recursion has no bounded hardware form.
+    bool ok(ir::FunctionId id) {
+        const auto key = static_cast<uint32_t>(id);
+        const auto it  = memo_.find(key);
+        if (it != memo_.end()) {
+            return it->second == State::Ok;
+        }
+        memo_[key]        = State::Deciding;
+        const bool result = decide(id);
+        memo_[key]        = result ? State::Ok : State::Bad;
+
+        return result;
+    }
+
+private:
+    enum class State : uint8_t { Deciding, Ok, Bad };
+
+    bool decide(ir::FunctionId id) {
+        const ir::Function& f = m_.function(id);
+        // A DPI call leaves the design and a fork child is a process; neither has
+        // a hardware form.
+        //
+        // `is_task` is deliberately NOT checked. Suspension is a property of the
+        // BODY -- `Delay` and `Wait` are ungated opcodes, so body_ok rejects a task
+        // that can suspend without being told that tasks suspend. A task that
+        // writes only its own frame and cannot suspend is a no-op, and its call is
+        // legal precisely because it does nothing. picorv32's `empty_statement`,
+        // the shim its `assert directive expands to, is exactly that. Rejecting on
+        // the declaration keyword would have thrown away four processes over a
+        // subroutine whose body is empty.
+        if (f.is_dpi || f.is_fork_child) {
+            return false;
+        }
+        // An output / inout / ref formal writes the CALLER's storage, so the call
+        // is a statement with effects rather than a value. Rejected for now.
+        for (const ir::ArgDir d : f.arg_dirs) {
+            if (d != ir::ArgDir::In) {
+                return false;
+            }
+        }
+
+        return body_ok(f.ir, f.ir.root());
+    }
+
+    bool body_ok(const ir::Ir& ir, std::span<const ir::Index> body) {
+        for (const ir::Index i : body) {
+            const ir::Inst::Tag tag = ir.tag(i);
+            switch (tag) {
+                case ir::Inst::Tag::Store:
+                case ir::Inst::Tag::StoreNb: {
+                    // Writing a module signal from a function is legal Verilog and
+                    // is a side effect, which an operator does not have. Writes to
+                    // the frame (formals, the return variable, temporaries) are
+                    // exactly what a function body is made of.
+                    const ir::LvalueRoot lv = ir::lvalue_root(ir, ir.payload(i).binary.l);
+                    if (ir.tag(lv.root) == ir::Inst::Tag::Signal) {
+                        return false;
+                    }
+                    break;
+                }
+                case ir::Inst::Tag::Call: {
+                    const auto info = ir.extra_data<ir::CallInfo>(ir.payload(i).extra);
+                    const auto key  = static_cast<uint32_t>(info.func);
+                    const auto seen = memo_.find(key);
+                    if (seen != memo_.end() && seen->second == State::Deciding) {
+                        return false; // recursion
+                    }
+                    if (!ok(info.func)) {
+                        return false;
+                    }
+                    break;
+                }
+                case ir::Inst::Tag::Cond: {
+                    const auto r = ir.extra_data<ir::Regions>(ir.payload(i).op_extra.extra);
+                    if (!body_ok(ir, ir.region(r.then_)) || !body_ok(ir, ir.region(r.else_))) {
+                        return false;
+                    }
+                    break;
+                }
+                case ir::Inst::Tag::Switch: {
+                    const auto info = ir.extra_data<ir::SwitchInfo>(ir.payload(i).op_extra.extra);
+                    if (!body_ok(ir, ir.region(info.default_))) {
+                        return false;
+                    }
+                    for (const ir::SwitchArm& a : arms_of(ir, info)) {
+                        if (!body_ok(ir, ir.region(a.body))) {
+                            return false;
+                        }
+                    }
+                    break;
+                }
+                case ir::Inst::Tag::Loop: {
+                    const auto info = ir.extra_data<ir::LoopInfo>(ir.payload(i).extra);
+                    if (!body_ok(ir, ir.region(info.cond)) || !body_ok(ir, ir.region(info.body)) ||
+                        !body_ok(ir, ir.region(info.step))) {
+                        return false;
+                    }
+                    break;
+                }
+                // A lazy select's branch VALUES live in regions, so a ternary is a
+                // region-bearing op even though it produces a value. `f = c ? 1 :
+                // f(x-1)` hides its recursive call in here.
+                case ir::Inst::Tag::SelectLazy: {
+                    const auto sl = ir.extra_data<ir::SelectLazy>(ir.payload(i).op_extra.extra);
+                    if (!body_ok(ir, ir.region(sl.then_)) || !body_ok(ir, ir.region(sl.else_))) {
+                        return false;
+                    }
+                    break;
+                }
+                default:
+                    if (!ir::tag_info(tag).synthesizable) {
+                        return false;
+                    }
+                    break;
+            }
+        }
+
+        return true;
+    }
+
+    const ir::Module&                             m_;
+    ankerl::unordered_dense::map<uint32_t, State> memo_;
+};
+
 // Per-process state for one walk. `guards_` grows monotonically and is handed to
 // the Result only when the caller asked to keep it.
 class Walker {
@@ -16,11 +165,16 @@ public:
     // folds under the pin descends only into the taken arm -- which is exactly
     // §4A.5's "pin the trigger and fold", and it makes must_assign report
     // completeness in the PINNED world rather than the general one.
-    Walker(uint32_t proc_index, std::vector<GuardNode>& guards, std::vector<Note>& notes, ir::Eval* eval)
+    Walker(uint32_t                proc_index,
+           std::vector<GuardNode>& guards,
+           std::vector<Note>&      notes,
+           ir::Eval*               eval,
+           FnLegality&             fns)
       : proc_(proc_index)
       , guards_(guards)
       , notes_(notes)
-      , eval_(eval) {}
+      , eval_(eval)
+      , fns_(fns) {}
 
     ProcessResult run(const ir::Ir& ir) {
         walk(ir, ir.root(), GuardId::None);
@@ -58,15 +212,6 @@ private:
     void reject(Finding f, ir::Inst::Tag tag, ir::SourceSpan span) {
         result_.synthesizable = false;
         notes_.push_back({ f, proc_, ir::Signal{}, span, tag });
-    }
-
-    // The arms of a switch, decoded from the flat extra run.
-    static std::vector<ir::SwitchArm> arms_of(const ir::Ir& ir, const ir::SwitchInfo& info) {
-        const std::span<const ir::Index> raw    = ir.region(info.arms);
-        constexpr size_t                 stride = sizeof(ir::SwitchArm) / sizeof(uint32_t);
-        const auto*                      base   = reinterpret_cast<const ir::SwitchArm*>(raw.data());
-
-        return { base, base + raw.size() / stride };
     }
 
     using SigSet = ankerl::unordered_dense::set<uint32_t>;
@@ -220,6 +365,43 @@ private:
                     break;
                 }
 
+                // Same hole on the process side, and here it matters more: without
+                // this, `q = s ? noisy(a) : 0` never has `noisy` checked and the
+                // process is legalized as something it is not. Value regions carry
+                // no guard -- the branch is inside the value, not the statement.
+                case ir::Inst::Tag::SelectLazy: {
+                    const auto sl = ir.extra_data<ir::SelectLazy>(ir.payload(i).op_extra.extra);
+                    walk(ir, ir.region(sl.then_), guard);
+                    walk(ir, ir.region(sl.else_), guard);
+                    break;
+                }
+
+                // A task call is a statement, not a value. It is legal on the same
+                // terms: the callee must write no module signal, so the call has no
+                // observable effect and contributes nothing to the guarded list.
+                // (A task that DOES write module signals needs its writes attributed
+                // to the caller's guards, which needs operand identity across two
+                // Irs -- guards and store values are bare ir::Index today. Rejected
+                // until that exists.)
+                case ir::Inst::Tag::TaskCall: {
+                    const auto info = ir.extra_data<ir::TaskCallInfo>(ir.payload(i).extra);
+                    if (!fns_.ok(info.func)) {
+                        reject(Finding::Call, ir::Inst::Tag::TaskCall, {});
+                    }
+                    break;
+                }
+
+                // A call is legal exactly when the callee is an operator. The
+                // value is then produced like any other opcode's -- nothing is
+                // inlined, and the caller's statement structure is untouched.
+                case ir::Inst::Tag::Call: {
+                    const auto info = ir.extra_data<ir::CallInfo>(ir.payload(i).extra);
+                    if (!fns_.ok(info.func)) {
+                        reject(Finding::Call, ir::Inst::Tag::Call, {});
+                    }
+                    break;
+                }
+
                 default: {
                     // The legality gate. `synthesizable` defaults to false in
                     // TagInfo, so an unclassified opcode rejects its process rather
@@ -255,6 +437,7 @@ private:
     std::vector<GuardNode>& guards_;
     std::vector<Note>&      notes_;
     ir::Eval*               eval_ = nullptr;
+    FnLegality&             fns_;
     ProcessResult           result_{};
 };
 
@@ -383,6 +566,7 @@ Result run(const ir::Module& module, const ir::DesignFacts* /*facts*/, Options o
     Result result;
     result.processes.reserve(module.processes().size());
 
+    FnLegality             fns(module);
     std::vector<GuardNode> guards;
     for (size_t k = 0; k < module.processes().size(); ++k) {
         const ir::Process& proc = module.processes()[k];
@@ -391,9 +575,32 @@ Result run(const ir::Module& module, const ir::DesignFacts* /*facts*/, Options o
         // Guards are always built: classification needs them to find the clock.
         // They are only HANDED BACK when the caller asked.
         const size_t                     arena_base = guards.size();
-        Walker                           w(static_cast<uint32_t>(k), guards, result.notes, nullptr);
+        Walker                           w(static_cast<uint32_t>(k), guards, result.notes, nullptr, fns);
         ProcessResult                    pr       = w.run(ir);
         const std::vector<ir::WaitEvent> triggers = edge_triggers(proc);
+
+        // Pin each trigger asserted and re-walk, ONCE per trigger.
+        //
+        // The residue depends on the trigger, not on the signal, so doing this
+        // inside the per-signal loop below would re-walk the whole process S x T
+        // times -- which is exactly the O(S^2) shape that costs yosys's proc_mux
+        // 18.3 s on this design. Measured: hoisting it took hazard3 from 3.8 ms
+        // back to ~1 ms once functions made its big CSR process classifiable.
+        //
+        // A posedge pins 1 and a negedge pins 0; that is the whole of polarity
+        // handling, and a mismatched condition simply folds the other way (4A.1).
+        std::vector<ProcessResult> residues;
+        residues.reserve(triggers.size());
+        if (pr.synthesizable) {
+            for (const ir::WaitEvent& t : triggers) {
+                const uint64_t         asserted = t.edge == ir::Edge::Negative ? 0u : 1u;
+                ir::Eval               ev(module, ir, t.signal, asserted);
+                std::vector<GuardNode> scratch;
+                std::vector<Note>      ignored;
+                Walker                 pw(static_cast<uint32_t>(k), scratch, ignored, &ev, fns);
+                residues.push_back(pw.run(ir));
+            }
+        }
 
         for (SignalStores& e : pr.signals) {
             if (!pr.synthesizable) {
@@ -422,21 +629,11 @@ Result run(const ir::Module& module, const ir::DesignFacts* /*facts*/, Options o
             e.kind  = StorageKind::Flop;
             e.clock = free_triggers[0].signal;
 
-            // Pin each non-clock trigger asserted and re-walk. A posedge pins 1, a
-            // negedge pins 0 -- that is the whole of polarity handling, and a
-            // mismatched condition simply folds the other way (§4A.1).
-            for (const ir::WaitEvent& t : triggers) {
-                if (t.signal == e.clock) {
+            for (size_t ti = 0; ti < triggers.size(); ++ti) {
+                if (triggers[ti].signal == e.clock) {
                     continue;
                 }
-                const uint64_t         asserted = t.edge == ir::Edge::Negative ? 0u : 1u;
-                ir::Eval               ev(module, ir, t.signal, asserted);
-                std::vector<GuardNode> scratch;
-                std::vector<Note>      ignored;
-                Walker                 pw(static_cast<uint32_t>(k), scratch, ignored, &ev);
-                const ProcessResult    residue = pw.run(ir);
-
-                for (const SignalStores& rs : residue.signals) {
+                for (const SignalStores& rs : residues[ti].signals) {
                     if (rs.signal != e.signal || rs.stores.empty()) {
                         continue;
                     }
