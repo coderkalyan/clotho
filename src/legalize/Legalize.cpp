@@ -207,17 +207,21 @@ public:
            std::vector<GuardNode>& guards,
            std::vector<Note>&      notes,
            ir::Eval*               eval,
-           FnLegality&             fns)
+           FnLegality&             fns,
+           bool                    honour_full,
+           bool                    honour_parallel)
       : proc_(proc_index)
       , guards_(guards)
       , notes_(notes)
       , eval_(eval)
-      , fns_(fns) {}
+      , fns_(fns)
+      , honour_full_(honour_full)
+      , honour_parallel_(honour_parallel) {}
 
     ProcessResult run(const ir::Ir& ir) {
         walk(ir, ir.root(), GuardId::None);
         // Held == assigned somewhere, but not on every path.
-        const SigSet always = must_assign(ir, ir.root(), eval_);
+        const SigSet always = must_assign(ir, ir.root(), eval_, honour_full_);
         for (SignalStores& s : result_.signals) {
             s.has_hold = !always.contains(static_cast<uint32_t>(s.signal));
         }
@@ -229,6 +233,11 @@ public:
     }
 
 private:
+    // The parallel claim, only when the caller asked for it to be honoured.
+    [[nodiscard]] uint32_t options_parallel(const ir::SwitchInfo& info) const {
+        return honour_parallel_ && (info.pragmas & 2u) != 0 ? 1u : 0u;
+    }
+
     // Append an atom, returning the extended guard. O(1), and prefixes are shared.
     GuardId push(GuardId parent, Atom atom) {
         guards_.push_back({ parent, atom });
@@ -267,7 +276,7 @@ private:
     // labels happen to cover the selector; proving that is coverage analysis (M6),
     // and until then an uncovered case reads as a hold, which is the safe
     // direction.
-    static SigSet must_assign(const ir::Ir& ir, std::span<const ir::Index> body, ir::Eval* eval) {
+    static SigSet must_assign(const ir::Ir& ir, std::span<const ir::Index> body, ir::Eval* eval, bool honour_full) {
         SigSet out;
         for (const ir::Index i : body) {
             switch (ir.tag(i)) {
@@ -289,18 +298,18 @@ private:
                     if (eval != nullptr) {
                         const ir::Tri t = eval->truth(pred);
                         if (t == ir::Tri::True) {
-                            const SigSet only = must_assign(ir, ir.region(r.then_), eval);
+                            const SigSet only = must_assign(ir, ir.region(r.then_), eval, honour_full);
                             out.insert(only.begin(), only.end());
                             break;
                         }
                         if (t == ir::Tri::False) {
-                            const SigSet only = must_assign(ir, ir.region(r.else_), eval);
+                            const SigSet only = must_assign(ir, ir.region(r.else_), eval, honour_full);
                             out.insert(only.begin(), only.end());
                             break;
                         }
                     }
-                    const SigSet t2 = must_assign(ir, ir.region(r.then_), eval);
-                    for (const uint32_t s : must_assign(ir, ir.region(r.else_), eval)) {
+                    const SigSet t2 = must_assign(ir, ir.region(r.then_), eval, honour_full);
+                    for (const uint32_t s : must_assign(ir, ir.region(r.else_), eval, honour_full)) {
                         if (t2.contains(s)) {
                             out.insert(s);
                         }
@@ -314,17 +323,30 @@ private:
                     // A defaultless case whose arms cover the selector is complete:
                     // the "missing default" path does not exist. Without this every
                     // fully-enumerated case reads as a latch.
-                    if (dflt.empty() && !case_is_full(ir, info, all)) {
+                    // Complete when the arms cover the selector, or when the
+                    // designer declared the case full and the caller asked for that
+                    // reading. The base slot is the analysis's to fill, which is
+                    // exactly why the pragma can still take effect here -- yosys
+                    // cannot do this in its legalizer because its lowering has
+                    // already committed to a hold (§8).
+                    // `full_case` says no other selector value occurs, so the
+                    // default region is UNREACHABLE and is excluded from the
+                    // intersection whether or not it exists. That matters for
+                    // `unique case`, whose default is not empty: it holds the
+                    // violation report the keyword implies, which assigns nothing
+                    // and would otherwise read as a hold.
+                    const bool declared_full = honour_full && (info.pragmas & 1u) != 0;
+                    if (dflt.empty() && !declared_full && !case_is_full(ir, info, all)) {
                         break; // no default, not full: a path that assigns nothing
                     }
                     SigSet common;
                     bool   first = true;
-                    if (!dflt.empty()) {
-                        common = must_assign(ir, dflt, eval);
+                    if (!dflt.empty() && !declared_full) {
+                        common = must_assign(ir, dflt, eval, honour_full);
                         first  = false;
                     }
                     for (const ir::SwitchArm& a : all) {
-                        SigSet mine = must_assign(ir, ir.region(a.body), eval);
+                        SigSet mine = must_assign(ir, ir.region(a.body), eval, honour_full);
                         if (first) {
                             common = std::move(mine);
                             first  = false;
@@ -402,15 +424,28 @@ private:
                     // way, because which reading is right depends on whether the
                     // selector can actually be x -- which this analysis cannot know
                     // and the designer can.
+                    // Reported when the claim is what removes the hold: the arms do
+                    // not cover the selector and the default assigns nothing. A
+                    // `priority case` with a real default is complete anyway, and
+                    // noting it would be noise.
+                    if (honour_full_ && (info.pragmas & 1u) != 0 && !case_is_full(ir, info, arms) &&
+                        must_assign(ir, dflt, nullptr, honour_full_).empty()) {
+                        notes_.push_back(
+                          { Finding::FullCasePragmaUnsound, proc_, ir::Signal{}, {}, ir::Inst::Tag::Switch });
+                    }
                     if (dflt.empty() && info.sel_four != 0 && case_is_full(ir, info, arms)) {
                         notes_.push_back(
                           { Finding::FullCaseXSelector, proc_, ir::Signal{}, {}, ir::Inst::Tag::Switch });
                     }
 
                     for (const ir::SwitchArm& a : arms) {
-                        walk(ir, ir.region(a.body), push(guard, { sel, AtomKind::SwitchArm, a.keys, info.sel_width }));
+                        walk(ir,
+                             ir.region(a.body),
+                             push(guard, { sel, AtomKind::SwitchArm, a.keys, info.sel_width, options_parallel(info) }));
                     }
-                    walk(ir, dflt, push(guard, { sel, AtomKind::SwitchDefault, {}, info.sel_width }));
+                    walk(ir,
+                         dflt,
+                         push(guard, { sel, AtomKind::SwitchDefault, {}, info.sel_width, options_parallel(info) }));
                     break;
                 }
 
@@ -502,8 +537,10 @@ private:
     uint32_t                proc_;
     std::vector<GuardNode>& guards_;
     std::vector<Note>&      notes_;
-    bool                    in_loop_ = false;
-    ir::Eval*               eval_    = nullptr;
+    bool                    honour_full_     = false;
+    bool                    honour_parallel_ = false;
+    bool                    in_loop_         = false;
+    ir::Eval*               eval_            = nullptr;
     FnLegality&             fns_;
     ProcessResult           result_{};
 };
@@ -642,7 +679,13 @@ Result run(const ir::Module& module, const ir::DesignFacts* /*facts*/, Options o
         // Guards are always built: classification needs them to find the clock.
         // They are only HANDED BACK when the caller asked.
         const size_t                     arena_base = guards.size();
-        Walker                           w(static_cast<uint32_t>(k), guards, result.notes, nullptr, fns);
+        Walker                           w(static_cast<uint32_t>(k),
+                                           guards,
+                                           result.notes,
+                                           nullptr,
+                                           fns,
+                                           options.honour_full_case,
+                                           options.honour_parallel_case);
         ProcessResult                    pr       = w.run(ir);
         const std::vector<ir::WaitEvent> triggers = edge_triggers(proc);
 
@@ -668,7 +711,13 @@ Result run(const ir::Module& module, const ir::DesignFacts* /*facts*/, Options o
             for (const ir::WaitEvent& t : triggers) {
                 const uint64_t asserted = t.edge == ir::Edge::Negative ? 0u : 1u;
                 ir::Eval       ev(module, ir, t.signal, asserted);
-                Walker         pw(static_cast<uint32_t>(k), guards, ignored, &ev, fns);
+                Walker         pw(static_cast<uint32_t>(k),
+                                  guards,
+                                  ignored,
+                                  &ev,
+                                  fns,
+                                  options.honour_full_case,
+                                  options.honour_parallel_case);
                 residues.push_back(pw.run(ir));
             }
         }
@@ -795,7 +844,13 @@ Result run(const ir::Module& module, const ir::DesignFacts* /*facts*/, Options o
                     }
                     std::vector<Note> ignored;
                     ir::Eval          ev(module, ir, off);
-                    Walker            pw(static_cast<uint32_t>(k), guards, ignored, &ev, fns);
+                    Walker            pw(static_cast<uint32_t>(k),
+                                         guards,
+                                         ignored,
+                                         &ev,
+                                         fns,
+                                         options.honour_full_case,
+                                         options.honour_parallel_case);
                     hit = sync_by_clock.emplace(key, pw.run(ir)).first;
                 }
                 for (const SignalStores& b : hit->second.signals) {

@@ -397,6 +397,7 @@ Index Builder::switch_(Index                           selector,
                        ExtraSlice                      default_region,
                        uint32_t                        sel_width,
                        uint32_t                        sel_four,
+                       uint32_t                        pragmas,
                        SourceLoc                       loc) {
     // Lay the arm records after their keys so every ExtraSlice is an absolute
     // offset: each arm's keys (u64 -> two words) first, then the SwitchArm
@@ -420,7 +421,7 @@ Index Builder::switch_(Index                           selector,
     const auto arms_end = static_cast<ExtraIndex>(extra_.size());
 
     const ExtraIndex extra =
-      add_extra(SwitchInfo{ ExtraSlice{ arms_start, arms_end }, default_region, sel_width, sel_four });
+      add_extra(SwitchInfo{ ExtraSlice{ arms_start, arms_end }, default_region, sel_width, sel_four, pragmas });
 
     return emit({ Inst::Tag::Switch, Inst::Payload{ .op_extra = { selector, extra } } }, loc);
 }

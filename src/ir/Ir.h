@@ -538,6 +538,14 @@ struct SwitchInfo {
     // x/z selector matches no arm and the signal holds. Legalization takes the
     // synthesis reading and reports the divergence.
     uint32_t sel_four;
+    // Case pragmas the source carried: bit 0 `full_case`, bit 1 `parallel_case`.
+    // `unique`/`priority`/`unique0` map onto the same two bits.
+    //
+    // Recorded rather than acted on at lowering time. yosys's load-bearing
+    // full_case handling lives in its FRONTEND, so its legalizer cannot undo a hold
+    // the lowering already committed to; §8 makes the base slot a property of the
+    // analysis precisely so that cannot happen here.
+    uint32_t pragmas;
 };
 
 // Extra payload for `display` / `fdisplay`: a $display / $write / $fdisplay /

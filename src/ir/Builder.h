@@ -208,6 +208,7 @@ public:
                   ExtraSlice                      default_region,
                   uint32_t                        sel_width,
                   uint32_t                        sel_four,
+                  uint32_t                        pragmas,
                   SourceLoc                       loc);
     // Value-producing short-circuit conditional (&&/||). `pred` is a definite
     // 2-state bit; the then-branch (pred 1) yields `then_val`, the else-branch

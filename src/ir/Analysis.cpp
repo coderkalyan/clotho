@@ -154,6 +154,13 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::AggEq:
         case Inst::Tag::Ret:
         case Inst::Tag::RetVoid:
+        // The violation report `unique` / `priority` / `unique0` imply. Unlike
+        // $display, this is not user-written I/O: it is the language's own
+        // simulation-time assertion about a case, with no hardware of its own, and
+        // its SYNTHESIS meaning is the full_case / parallel_case pair the pragma
+        // already carries. Rejecting it would refuse every `unique case` in a
+        // modern design over a check synthesis is defined to ignore.
+        case Inst::Tag::CaseViol:
             return hw;
 
         // -- Everything else: simulation-only, not hardware. --
@@ -243,7 +250,6 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::FreadMem:
         case Inst::Tag::TimeFormat:
         case Inst::Tag::Finish:
-        case Inst::Tag::CaseViol:
         case Inst::Tag::Severity:
         case Inst::Tag::Fflush:
         case Inst::Tag::System:

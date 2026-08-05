@@ -6577,6 +6577,36 @@ private:
     // Only ever reports what it can prove. A non-constant item, an
     // undecidably-wide selector or `case ... inside` all yield silence, never a
     // guess -- the whole value of this check is that a finding is trustworthy.
+    // The case pragmas as bits, for the IR: bit 0 full_case, bit 1 parallel_case.
+    // An attribute with no value means 1 (LRM 5.12), and `= 0` withdraws the claim.
+    uint32_t case_pragma_bits(const CaseStatement& c) const {
+        if (scope_ == nullptr) {
+            return 0;
+        }
+        // `unique` / `priority` / `unique0` are the same two claims spelled as
+        // keywords, and yosys's parser and sv2v map them this way.
+        using Check   = slang::ast::UniquePriorityCheck;
+        uint32_t bits = 0;
+        if (c.check == Check::Priority || c.check == Check::Unique) {
+            bits |= 1u; // full_case
+        }
+        if (c.check == Check::Unique0 || c.check == Check::Unique) {
+            bits |= 2u; // parallel_case
+        }
+        for (const slang::ast::AttributeSymbol* a : scope_->getCompilation().getAttributes(c)) {
+            if (!a->getValue().isTrue()) {
+                continue;
+            }
+            if (a->name == "full_case") {
+                bits |= 1u;
+            } else if (a->name == "parallel_case") {
+                bits |= 2u;
+            }
+        }
+
+        return bits;
+    }
+
     void check_case_pragmas(const CaseStatement& c) {
         if (scope_ == nullptr) {
             return;
@@ -6882,7 +6912,7 @@ private:
             const ir::ExtraSlice default_region = b.close_region();
             // four-state is exactly `key_width != width`: the key encoding doubles
             // only for a 4-state selector.
-            b.switch_(sel, arms, default_region, width, key_width != width ? 1u : 0u, loc(c.expr));
+            b.switch_(sel, arms, default_region, width, key_width != width ? 1u : 0u, case_pragma_bits(c), loc(c.expr));
             return;
         }
 
@@ -7299,7 +7329,7 @@ private:
         // so its value space is not the thing fullness is asking about. A one-hot
         // case is full only if the selector is provably one-hot, which the switch
         // alone cannot say. Decline rather than answer the wrong question.
-        b.switch_(key, arms, default_region, /*sel_width=*/0, /*sel_four=*/0, loc(c.expr));
+        b.switch_(key, arms, default_region, /*sel_width=*/0, /*sel_four=*/0, case_pragma_bits(c), loc(c.expr));
     }
 
     void lower_case(const CaseStatement& c, ir::Builder& b) {
@@ -7507,7 +7537,7 @@ private:
             const ir::ExtraSlice default_region = b.close_region();
             // four-state is exactly `key_width != width`: the key encoding doubles
             // only for a 4-state selector.
-            b.switch_(sel, arms, default_region, width, key_width != width ? 1u : 0u, loc(c.expr));
+            b.switch_(sel, arms, default_region, width, key_width != width ? 1u : 0u, case_pragma_bits(c), loc(c.expr));
             return;
         }
 
@@ -7570,7 +7600,7 @@ private:
             const ir::ExtraSlice default_region = b.close_region();
             // four-state is exactly `key_width != width`: the key encoding doubles
             // only for a 4-state selector.
-            b.switch_(sel, arms, default_region, width, key_width != width ? 1u : 0u, loc(c.expr));
+            b.switch_(sel, arms, default_region, width, key_width != width ? 1u : 0u, case_pragma_bits(c), loc(c.expr));
             return;
         }
 

@@ -60,6 +60,14 @@ struct Atom {
     // renders the keys must size them: an unsized literal re-lowers against a
     // 32-bit selector, and a case that was full over 2 bits stops being full.
     uint32_t sel_width = 0;
+    // Non-zero when the case declared `parallel_case` (or `unique` / `unique0`),
+    // meaning a consumer may build a one-hot mux instead of a priority chain.
+    //
+    // For a case that lowered to a `switch` this is only ever a restatement: the
+    // frontend deduplicates keys, so the arms are disjoint by construction and the
+    // list was never really ordered. It carries information only on the cond-chain
+    // path, where casez patterns genuinely can overlap.
+    uint32_t parallel = 0;
 };
 
 struct GuardNode {
@@ -109,6 +117,12 @@ enum class Finding : uint16_t {
     // signal holds. Combinational for the synthesiser, a latch for the simulator,
     // from one source. Exactly the class of mismatch this analysis exists to name.
     FullCaseXSelector,
+    // `full_case` was honoured and the case is NOT full. The signal is treated as
+    // complete on the designer's word; simulation will hold the previous value on
+    // an uncovered selector and synthesis will not. This is the pragma's whole
+    // risk, and it is reported at the point it is relied upon rather than as a
+    // lint aside.
+    FullCasePragmaUnsound,
 };
 
 struct Note {
@@ -139,12 +153,6 @@ enum class StorageKind : uint8_t {
     // No standard primitive does this; it is reported, not built. (yosys invents
     // $aldff and warns; YosysHQ advise against it.)
     AsyncLoad,
-    // A case with no default enumerates every value of a FOUR-STATE selector.
-    // Synthesis reads that as complete, and legalization agrees -- but `case`
-    // matches with ===, so in simulation an x/z selector matches no arm and the
-    // signal holds. Combinational for the synthesiser, a latch for the simulator,
-    // from one source. Exactly the class of mismatch this analysis exists to name.
-    FullCaseXSelector,
     // The process was rejected, or no clock could be identified.
     Unclassified,
 };
@@ -229,6 +237,19 @@ struct ProcessResult {
 };
 
 struct Options {
+    // Honour `(* full_case *)` (and `unique` / `priority`): a defaultless case the
+    // designer declared full is treated as complete even when its arms do not
+    // cover the selector.
+    //
+    // Off by default, because the LRM says the signal holds and Clotho's default
+    // must be the LRM. Turning it on is asking for the SYNTHESIS reading, and any
+    // place the claim is load-bearing but false is reported rather than absorbed.
+    bool honour_full_case = false;
+    // Honour `(* parallel_case *)` (and `unique` / `unique0`). Recorded for
+    // consumers that want a one-hot mux instead of a priority chain. For a case
+    // that lowered to a `switch` this changes nothing and cannot: the frontend
+    // deduplicates keys, so the arms are disjoint by construction.
+    bool honour_parallel_case = false;
     // Retain the guard arena. Consumers that only want classification do not pay
     // for it; Materialize does.
     bool keep_guards = false;

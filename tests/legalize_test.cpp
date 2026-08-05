@@ -986,3 +986,148 @@ TEST_CASE("a full case over a two-state selector reports nothing") {
     CHECK(e->kind == legalize::StorageKind::Comb);
     CHECK_FALSE(t.has(legalize::Finding::FullCaseXSelector));
 }
+
+// --- M7: full_case / parallel_case ----------------------------------------
+
+namespace {
+
+bool has_finding(const legalize::Result& r, legalize::Finding f) {
+    for (const legalize::Note& n : r.notes) {
+        if (n.kind == f) {
+            return true;
+        }
+    }
+    return false;
+}
+
+legalize::Result run_with(const LowerResult& r, legalize::Options o) {
+    return legalize::run(*r.module, nullptr, o);
+}
+
+// By name, not by index: `unique` lowers a violation-report process alongside the
+// logic, so process 0 is not necessarily the one that writes q.
+const legalize::SignalStores* q_of(const LowerResult& r, const legalize::Result& res) {
+    for (const legalize::ProcessResult& p : res.processes) {
+        for (const legalize::SignalStores& e : p.signals) {
+            if (r.module->signal(e.signal).name == "q") {
+                return &e;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+constexpr std::string_view kThreeOfFour = R"(
+    module m(input [1:0] s2, input [7:0] a, output reg [7:0] q);
+      always @* (* full_case *) case (s2)
+        2'd0: q = a;
+        2'd1: q = 8'h01;
+        2'd2: q = 8'h02;
+      endcase
+    endmodule
+)";
+
+} // namespace
+
+// Off by default: the LRM says an uncovered selector holds, and that has to be
+// Clotho's default answer whatever the source claims.
+TEST_CASE("full_case is ignored unless asked for") {
+    const LowerResult r = lower_text(kThreeOfFour);
+    REQUIRE(r.ok);
+    const legalize::Result res = run_with(r, {});
+    REQUIRE(res.processes.size() == 1);
+    REQUIRE(res.processes[0].signals.size() == 1);
+    CHECK(res.processes[0].signals[0].kind == legalize::StorageKind::Latch);
+    CHECK_FALSE(has_finding(res, legalize::Finding::FullCasePragmaUnsound));
+}
+
+// Asked for: the base slot becomes don't-care instead of hold, so no latch. This
+// is the whole of §8's `full_case`, and it works here only because the base is a
+// property of the analysis -- yosys must do it in its frontend, since its lowering
+// has already committed to a hold by the time its legalizer runs.
+TEST_CASE("full_case honoured removes the latch") {
+    const LowerResult r = lower_text(kThreeOfFour);
+    REQUIRE(r.ok);
+    const legalize::Result res = run_with(r, { .honour_full_case = true });
+    REQUIRE(res.processes.size() == 1);
+    REQUIRE(res.processes[0].signals.size() == 1);
+    CHECK(res.processes[0].signals[0].kind == legalize::StorageKind::Comb);
+}
+
+// And the risk is named where it is taken. 3 of 4 values covered means simulation
+// holds on `2'd3` while synthesis does not -- reported at the point the claim is
+// relied upon, not as a lint aside somewhere else.
+TEST_CASE("an unsound full_case is reported when honoured") {
+    const LowerResult r = lower_text(kThreeOfFour);
+    REQUIRE(r.ok);
+    const legalize::Result res = run_with(r, { .honour_full_case = true });
+    CHECK(has_finding(res, legalize::Finding::FullCasePragmaUnsound));
+}
+
+// A full_case that is actually full is a redundant claim, not a risk.
+TEST_CASE("a truthful full_case is not reported") {
+    const LowerResult r = lower_text(R"(
+        module m(input [1:0] s2, input [7:0] a, output reg [7:0] q);
+          always @* (* full_case *) case (s2)
+            2'd0: q = a;
+            2'd1: q = 8'h01;
+            2'd2: q = 8'h02;
+            2'd3: q = 8'h03;
+          endcase
+        endmodule
+    )");
+    REQUIRE(r.ok);
+    const legalize::Result res = run_with(r, { .honour_full_case = true });
+    CHECK(res.processes[0].signals[0].kind == legalize::StorageKind::Comb);
+    CHECK_FALSE(has_finding(res, legalize::Finding::FullCasePragmaUnsound));
+}
+
+// `unique` maps onto full_case + parallel_case, so it removes the latch too.
+TEST_CASE("unique behaves as full_case for completeness") {
+    const LowerResult r = lower_text(R"(
+        module m(input [1:0] s2, input [7:0] a, output reg [7:0] q);
+          always @* unique case (s2)
+            2'd0: q = a;
+            2'd1: q = 8'h01;
+            2'd2: q = 8'h02;
+          endcase
+        endmodule
+    )");
+    REQUIRE(r.ok);
+    const legalize::Result off = run_with(r, {});
+    const legalize::Result on  = run_with(r, { .honour_full_case = true });
+    const auto*            a   = q_of(r, off);
+    const auto*            b   = q_of(r, on);
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    CHECK(a->kind == legalize::StorageKind::Latch);
+    CHECK(b->kind == legalize::StorageKind::Comb);
+}
+
+// parallel_case on a switch is a restatement, and provably so: the frontend
+// deduplicates keys, so the arms are disjoint whether or not anyone says it. The
+// claim is carried for consumers that want a one-hot mux, and it changes no verdict.
+TEST_CASE("parallel_case changes nothing for a switch") {
+    const LowerResult r = lower_text(R"(
+        module m(input [1:0] s2, input [7:0] a, output reg [7:0] q);
+          always @* (* parallel_case *) case (s2)
+            2'd0: q = a;
+            2'd1: q = 8'h01;
+            2'd2: q = 8'h02;
+            2'd3: q = 8'h03;
+          endcase
+        endmodule
+    )");
+    REQUIRE(r.ok);
+    const legalize::Result off = run_with(r, { .keep_guards = true });
+    const legalize::Result on  = run_with(r, { .honour_parallel_case = true, .keep_guards = true });
+    CHECK(off.processes[0].signals[0].kind == on.processes[0].signals[0].kind);
+    CHECK(off.processes[0].signals[0].stores.size() == on.processes[0].signals[0].stores.size());
+    // Carried where a consumer can see it.
+    bool saw_parallel = false;
+    for (const legalize::GuardNode& g : on.guards) {
+        saw_parallel = saw_parallel || g.atom.parallel != 0;
+    }
+    CHECK(saw_parallel);
+}
