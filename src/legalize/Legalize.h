@@ -123,6 +123,13 @@ enum class Finding : uint16_t {
     // risk, and it is reported at the point it is relied upon rather than as a
     // lint aside.
     FullCasePragmaUnsound,
+    // A `break` / `continue` whose reach this analysis cannot turn into a guard
+    // term. The simple forms are exact -- a bare jump kills the rest of the body,
+    // and `if (p) break;` guards everything after it with `!p` -- but a jump buried
+    // under further structure needs sv2v's jump VARIABLE, which is state this
+    // analysis will not invent. Reported instead of recording a guard that is too
+    // weak.
+    UnmodelledJump,
 };
 
 struct Note {

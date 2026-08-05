@@ -8,6 +8,75 @@ namespace clotho::legalize {
 
 namespace {
 
+// How a region leaves its enclosing loop iteration.
+//
+// Deliberately does NOT descend into a nested Loop: a `break` in there belongs to
+// that loop, not this one.
+enum class Jumps : uint8_t {
+    // No jump: control reaches the end.
+    None,
+    // Every path jumps, so nothing after this region runs.
+    Always,
+    // Some path jumps. Turning this into a guard term needs sv2v's jump variable,
+    // which is state; reported rather than approximated.
+    Maybe,
+};
+
+std::span<const ir::SwitchArm> arms_of(const ir::Ir& ir, const ir::SwitchInfo& info);
+Jumps                          region_jumps(const ir::Ir& ir, std::span<const ir::Index> body);
+
+Jumps combine_arms(Jumps a, Jumps b) {
+    if (a == Jumps::Always && b == Jumps::Always) {
+        return Jumps::Always;
+    }
+    if (a == Jumps::None && b == Jumps::None) {
+        return Jumps::None;
+    }
+
+    return Jumps::Maybe;
+}
+
+Jumps region_jumps(const ir::Ir& ir, std::span<const ir::Index> body) {
+    Jumps out = Jumps::None;
+    for (const ir::Index i : body) {
+        switch (ir.tag(i)) {
+            case ir::Inst::Tag::Break:
+            case ir::Inst::Tag::Continue:
+                return Jumps::Always; // the rest of this region is unreachable
+            case ir::Inst::Tag::Cond: {
+                const auto  r = ir.extra_data<ir::Regions>(ir.payload(i).op_extra.extra);
+                const Jumps both =
+                  combine_arms(region_jumps(ir, ir.region(r.then_)), region_jumps(ir, ir.region(r.else_)));
+                if (both == Jumps::Always) {
+                    return Jumps::Always;
+                }
+                if (both == Jumps::Maybe) {
+                    out = Jumps::Maybe;
+                }
+                break;
+            }
+            case ir::Inst::Tag::Switch: {
+                const auto info = ir.extra_data<ir::SwitchInfo>(ir.payload(i).op_extra.extra);
+                Jumps      acc  = region_jumps(ir, ir.region(info.default_));
+                for (const ir::SwitchArm& a : arms_of(ir, info)) {
+                    acc = combine_arms(acc, region_jumps(ir, ir.region(a.body)));
+                }
+                if (acc == Jumps::Always) {
+                    return Jumps::Always;
+                }
+                if (acc == Jumps::Maybe) {
+                    out = Jumps::Maybe;
+                }
+                break;
+            }
+            default:
+                break; // a nested Loop's jumps are its own
+        }
+    }
+
+    return out;
+}
+
 // Is a defaultless case FULL -- do its arms cover every selector value?
 //
 // Counting, not materialising. yosys's BitPatternPool is exponential in wildcard
@@ -238,6 +307,32 @@ private:
         return honour_parallel_ && (info.pragmas & 2u) != 0 ? 1u : 0u;
     }
 
+    // Both arms of a `cond`, with the pin folding one away when it resolves.
+    // Factored out because the jump path above walks the same statement before
+    // narrowing the guard for whatever follows it.
+    void walk_cond(const ir::Ir& ir, ir::Index i, GuardId guard) {
+        const auto                       r         = ir.extra_data<ir::Regions>(ir.payload(i).op_extra.extra);
+        const ir::Index                  pred      = ir.payload(i).op_extra.op;
+        const std::span<const ir::Index> then_body = ir.region(r.then_);
+        const std::span<const ir::Index> else_body = ir.region(r.else_);
+
+        if (eval_ != nullptr) {
+            const ir::Tri t = eval_->truth(pred);
+            if (t == ir::Tri::True) {
+                walk(ir, then_body, guard);
+
+                return;
+            }
+            if (t == ir::Tri::False) {
+                walk(ir, else_body, guard);
+
+                return;
+            }
+        }
+        walk(ir, then_body, push(guard, { pred, AtomKind::CondTrue, {} }));
+        walk(ir, else_body, push(guard, { pred, AtomKind::CondFalse, {} }));
+    }
+
     // Append an atom, returning the extended guard. O(1), and prefixes are shared.
     GuardId push(GuardId parent, Atom atom) {
         guards_.push_back({ parent, atom });
@@ -374,9 +469,44 @@ private:
         return out;
     }
 
+    // `guard` is taken by value and NARROWS as the body is walked: a jump makes
+    // everything after it conditional on not having jumped. That is sv2v's jump
+    // variable expressed as a guard term, which is all it ever was for the shapes
+    // that do not need real state -- §5.3 predicted exactly this.
     void walk(const ir::Ir& ir, std::span<const ir::Index> body, GuardId guard) {
         for (const ir::Index i : body) {
             const ir::Inst::Tag tag = ir.tag(i);
+            // A bare jump: nothing after it in this body runs, at all.
+            if (tag == ir::Inst::Tag::Break || tag == ir::Inst::Tag::Continue) {
+                return;
+            }
+            // `if (p) break;` -- everything after is guarded by !p. The mirrored
+            // form guards by p. Both arms jumping kills the rest outright. Anything
+            // subtler needs a jump variable, which is state this analysis will not
+            // invent, so it is reported rather than under-guarded.
+            if (tag == ir::Inst::Tag::Cond) {
+                const auto  r  = ir.extra_data<ir::Regions>(ir.payload(i).op_extra.extra);
+                const Jumps jt = region_jumps(ir, ir.region(r.then_));
+                const Jumps je = region_jumps(ir, ir.region(r.else_));
+                if (jt != Jumps::None || je != Jumps::None) {
+                    const ir::Index pred = ir.payload(i).op_extra.op;
+                    walk_cond(ir, i, guard);
+                    if (jt == Jumps::Always && je == Jumps::Always) {
+                        return;
+                    }
+                    if (jt == Jumps::Always && je == Jumps::None) {
+                        guard = push(guard, { pred, AtomKind::CondFalse, {}, 0, 0 });
+                        continue;
+                    }
+                    if (je == Jumps::Always && jt == Jumps::None) {
+                        guard = push(guard, { pred, AtomKind::CondTrue, {}, 0, 0 });
+                        continue;
+                    }
+                    reject(Finding::UnmodelledJump, tag, {});
+
+                    return;
+                }
+            }
             switch (tag) {
                 case ir::Inst::Tag::Store:
                 case ir::Inst::Tag::StoreNb: {
@@ -391,27 +521,9 @@ private:
                     break;
                 }
 
-                case ir::Inst::Tag::Cond: {
-                    const auto                       r    = ir.extra_data<ir::Regions>(ir.payload(i).op_extra.extra);
-                    const ir::Index                  pred = ir.payload(i).op_extra.op;
-                    const std::span<const ir::Index> then_body = ir.region(r.then_);
-                    const std::span<const ir::Index> else_body = ir.region(r.else_);
-
-                    if (eval_ != nullptr) {
-                        const ir::Tri t = eval_->truth(pred);
-                        if (t == ir::Tri::True) {
-                            walk(ir, then_body, guard);
-                            break;
-                        }
-                        if (t == ir::Tri::False) {
-                            walk(ir, else_body, guard);
-                            break;
-                        }
-                    }
-                    walk(ir, then_body, push(guard, { pred, AtomKind::CondTrue, {} }));
-                    walk(ir, else_body, push(guard, { pred, AtomKind::CondFalse, {} }));
+                case ir::Inst::Tag::Cond:
+                    walk_cond(ir, i, guard);
                     break;
-                }
 
                 case ir::Inst::Tag::Switch: {
                     const auto      info = ir.extra_data<ir::SwitchInfo>(ir.payload(i).op_extra.extra);

@@ -1131,3 +1131,92 @@ TEST_CASE("parallel_case changes nothing for a switch") {
     }
     CHECK(saw_parallel);
 }
+
+// --- jump statements ------------------------------------------------------
+//
+// §5.3 takes sv2v's encoding, whose whole content for the shapes that matter is
+// that a jump makes everything after it conditional. sv2v needs a jump VARIABLE
+// because it rewrites to Verilog and has nowhere else to put the state; an analysis
+// producing guarded lists can put it in the guard, which is what these do.
+//
+// Before this, a store after a `break` recorded an EMPTY guard -- the analysis said
+// it always ran, when it only runs while no break has fired.
+
+namespace {
+
+// Guard depth of the nth store to `name`.
+size_t guard_depth(const Run& t, std::string_view name, size_t nth) {
+    const legalize::SignalStores* e = t.find(name);
+    REQUIRE(e != nullptr);
+    REQUIRE(e->stores.size() > nth);
+    size_t d = 0;
+    for (legalize::GuardId g = e->stores[nth].guard; g != legalize::GuardId::None;
+         g                   = t.result.guards[static_cast<uint32_t>(g)].parent) {
+        ++d;
+    }
+
+    return d;
+}
+
+} // namespace
+
+TEST_CASE("a store after a conditional break is guarded by not having jumped") {
+    const Run t = run(R"(
+        module m(input [3:0] n, output reg [7:0] q);
+          integer i;
+          always @* begin
+            q = 8'h00;
+            for (i = 0; i < 4; i = i + 1) begin
+              if (i == n) break;
+              q = 8'hFF;
+            end
+          end
+        endmodule
+    )",
+                      { .keep_guards = true });
+    CHECK(t.all_synthesizable());
+    // Store 0 is the unconditional `q = 0` before the loop; store 1 is inside the
+    // loop after the break and must carry the `!(i == n)` term.
+    CHECK(guard_depth(t, "q", 0) == 0);
+    CHECK(guard_depth(t, "q", 1) == 1);
+}
+
+TEST_CASE("nothing after a bare break is recorded at all") {
+    const Run   t = run(R"(
+        module m(input [3:0] n, output reg [7:0] q);
+          integer i;
+          always @* begin
+            q = 8'h00;
+            for (i = 0; i < 4; i = i + 1) begin
+              break;
+              q = 8'hFF;
+            end
+          end
+        endmodule
+    )",
+                        { .keep_guards = true });
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->stores.size() == 1); // only the assignment before the loop
+}
+
+// A jump this cannot turn into a guard term is reported, not under-guarded. The
+// honest failure: sv2v would need its jump variable here, which is state, and this
+// analysis does not invent state.
+TEST_CASE("a jump too deep to guard is reported") {
+    const Run t = run(R"(
+        module m(input [3:0] n, input e2, output reg [7:0] q);
+          integer i;
+          always @* begin
+            q = 8'h00;
+            for (i = 0; i < 4; i = i + 1) begin
+              if (i == n) begin if (e2) break; end
+              q = 8'hFF;
+            end
+          end
+        endmodule
+    )",
+                      { .keep_guards = true });
+    CHECK_FALSE(t.all_synthesizable());
+    CHECK(t.has(legalize::Finding::UnmodelledJump));
+}
