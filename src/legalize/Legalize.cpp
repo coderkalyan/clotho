@@ -594,15 +594,19 @@ Result run(const ir::Module& module, const ir::DesignFacts* /*facts*/, Options o
         //
         // A posedge pins 1 and a negedge pins 0; that is the whole of polarity
         // handling, and a mismatched condition simply folds the other way (4A.1).
+        // The residues share the caller's guard arena rather than a scratch one, so
+        // the conditions they hand to Decomp stay addressable. They are truncated
+        // with everything else when the caller did not ask to keep guards.
         std::vector<ProcessResult> residues;
         residues.reserve(triggers.size());
+        ankerl::unordered_dense::map<uint32_t, ProcessResult> sync_by_clock;
+
         if (pr.synthesizable) {
+            std::vector<Note> ignored;
             for (const ir::WaitEvent& t : triggers) {
-                const uint64_t         asserted = t.edge == ir::Edge::Negative ? 0u : 1u;
-                ir::Eval               ev(module, ir, t.signal, asserted);
-                std::vector<GuardNode> scratch;
-                std::vector<Note>      ignored;
-                Walker                 pw(static_cast<uint32_t>(k), scratch, ignored, &ev, fns);
+                const uint64_t asserted = t.edge == ir::Edge::Negative ? 0u : 1u;
+                ir::Eval       ev(module, ir, t.signal, asserted);
+                Walker         pw(static_cast<uint32_t>(k), guards, ignored, &ev, fns);
                 residues.push_back(pw.run(ir));
             }
         }
@@ -613,7 +617,13 @@ Result run(const ir::Module& module, const ir::DesignFacts* /*facts*/, Options o
                 continue;
             }
             if (triggers.empty()) {
-                e.kind = e.has_hold ? StorageKind::Latch : StorageKind::Comb;
+                e.kind                  = e.has_hold ? StorageKind::Latch : StorageKind::Comb;
+                e.decomp.always_enabled = !e.has_hold;
+                // A level-sensitive signal has no clock and no async list; its
+                // whole description is the value it takes, split the same way.
+                for (const GuardedStore& st : e.stores) {
+                    (is_constant(ir, st.value) ? e.decomp.sync : e.decomp.next).push_back({ st.guard, st.value });
+                }
                 continue;
             }
 
@@ -631,8 +641,11 @@ Result run(const ir::Module& module, const ir::DesignFacts* /*facts*/, Options o
                   { Finding::AmbiguousClock, static_cast<uint32_t>(k), e.signal, proc.span, ir::Inst::Tag::Constant });
                 continue;
             }
-            e.kind  = StorageKind::Flop;
-            e.clock = free_triggers[0].signal;
+            e.kind                  = StorageKind::Flop;
+            e.clock                 = free_triggers[0].signal;
+            e.decomp.clock          = free_triggers[0].signal;
+            e.decomp.clock_edge     = free_triggers[0].edge;
+            e.decomp.always_enabled = !e.has_hold;
 
             for (size_t ti = 0; ti < triggers.size(); ++ti) {
                 if (triggers[ti].signal == e.clock) {
@@ -660,7 +673,78 @@ Result run(const ir::Module& module, const ir::DesignFacts* /*facts*/, Options o
                         e.async_reset = true;
                     } else {
                         e.kind = StorageKind::AsyncLoad;
+                        result.notes.push_back({ Finding::AsyncLoad,
+                                                 static_cast<uint32_t>(k),
+                                                 e.signal,
+                                                 proc.span,
+                                                 ir::Inst::Tag::Constant });
                     }
+                }
+            }
+
+            // The async groups: the residue, verbatim. Recorded for every non-clock
+            // trigger that assigns this signal, including the ones that turned out
+            // to be loads rather than resets -- the description is the product, and
+            // whether one primitive holds it is the target tool's problem.
+            for (size_t ti = 0; ti < triggers.size(); ++ti) {
+                if (triggers[ti].signal == e.clock) {
+                    continue;
+                }
+                AsyncGroup g{ triggers[ti].signal, triggers[ti].edge, {} };
+                for (const SignalStores& rs : residues[ti].signals) {
+                    if (rs.signal != e.signal) {
+                        continue;
+                    }
+                    for (const GuardedStore& st : rs.stores) {
+                        g.entries.push_back({ st.guard, st.value });
+                    }
+                }
+                if (!g.entries.empty()) {
+                    e.decomp.async.push_back(std::move(g));
+                }
+            }
+
+            // The synchronous body is what runs with EVERY async trigger
+            // deasserted. One pin cannot express two of them, which is why
+            // ir::Eval grew a multi-pin form.
+            //
+            // Memoised on the clock, NOT computed per signal: the pin set depends
+            // only on which trigger is the clock, and a process almost always has
+            // one. Doing this per signal is the same O(S x T) re-walk that costs
+            // yosys's proc_mux 18.3 s -- it cost hazard3 2.4 ms here before the
+            // measurement caught it, against 0.95 ms memoised.
+            const SignalStores* sync_for = nullptr;
+            if (triggers.size() == 1) {
+                // The only trigger is the clock: the base walk IS the sync body.
+                for (const SignalStores& b : pr.signals) {
+                    if (b.signal == e.signal) {
+                        sync_for = &b;
+                    }
+                }
+            } else {
+                const auto key = static_cast<uint32_t>(e.clock);
+                auto       hit = sync_by_clock.find(key);
+                if (hit == sync_by_clock.end()) {
+                    std::vector<ir::Pin> off;
+                    for (const ir::WaitEvent& t : triggers) {
+                        if (t.signal != e.clock) {
+                            off.push_back({ t.signal, t.edge == ir::Edge::Negative ? 1u : 0u });
+                        }
+                    }
+                    std::vector<Note> ignored;
+                    ir::Eval          ev(module, ir, off);
+                    Walker            pw(static_cast<uint32_t>(k), guards, ignored, &ev, fns);
+                    hit = sync_by_clock.emplace(key, pw.run(ir)).first;
+                }
+                for (const SignalStores& b : hit->second.signals) {
+                    if (b.signal == e.signal) {
+                        sync_for = &b;
+                    }
+                }
+            }
+            if (sync_for != nullptr) {
+                for (const GuardedStore& st : sync_for->stores) {
+                    (is_constant(ir, st.value) ? e.decomp.sync : e.decomp.next).push_back({ st.guard, st.value });
                 }
             }
         }

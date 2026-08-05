@@ -92,6 +92,13 @@ enum class Finding : uint16_t {
     Fork,
     // No trigger is free of the guards, or more than one is: no identifiable clock.
     AmbiguousClock,
+    // A non-clock trigger drives this signal to a value that is not a constant.
+    // No standard primitive gates a reset pin or loads a computed value on an
+    // asynchronous edge, so this is reported rather than built. The note names the
+    // SIGNAL and the process; the guard that made it conditional is in the decomp's
+    // async entries, which is where the answer actually is -- yosys blames the
+    // sensitivity list instead, which is not where the problem is.
+    AsyncLoad,
 };
 
 struct Note {
@@ -126,6 +133,59 @@ enum class StorageKind : uint8_t {
     Unclassified,
 };
 
+// One (condition, value) row of a decomposition.
+//
+// `value` is an IR value rather than an interned constant. The design sketch said
+// `Ref`, but that cannot hold an async LOAD, whose value is a cone by definition --
+// and constness is already answerable with the value in hand, so one shape covers
+// reset, conditional reset and load instead of three.
+struct Entry {
+    // The path under which this value is written. GuardId::None is unconditional.
+    // Only meaningful when the result was produced with Options::keep_guards, the
+    // same contract GuardedStore::guard carries.
+    GuardId   condition = GuardId::None;
+    ir::Index value     = ir::Index{};
+};
+
+// What one non-clock trigger does to a signal.
+//
+// A LIST, not a single (trigger, value): pinning `arst` in
+// `if (arst) q<=0; else if (srst) q<=8'hAA; else q<=d;` leaves
+// `q <= srst ? 8'hAA : 8'h00` -- loaded asynchronously, because the block fires on
+// arst's edge and srst's branch is what executes. Realizing it needs CLR on
+// `arst && !srst` and SET on `arst && srst`. A (trigger, value) pair cannot express
+// that, because the condition involves `srst`, which is not a trigger.
+//
+// Entries are verbatim from the residue, in program order: the LAST whose
+// condition holds is the one that applies, exactly as the source means.
+struct AsyncGroup {
+    ir::Signal         trigger = ir::Signal{};
+    ir::Edge           edge    = ir::Edge::Any;
+    std::vector<Entry> entries;
+};
+
+// The hardware one written signal implies, past its kind.
+struct Decomp {
+    // Edge-triggered only.
+    ir::Signal clock      = ir::Signal{};
+    ir::Edge   clock_edge = ir::Edge::Any;
+
+    // One group per non-clock trigger, in sensitivity-list order.
+    std::vector<AsyncGroup> async;
+
+    // The synchronous body: what runs with every async trigger deasserted, split
+    // by whether the value is a constant. `sync` is the synchronous reset (several
+    // rows when the reset value is itself conditional); `next` is the next-state
+    // cone. Both in program order, last match wins.
+    std::vector<Entry> sync;
+    std::vector<Entry> next;
+
+    // Enable is the negation of hold. When false, the enabling condition is the
+    // disjunction of the entries' conditions -- which the caller can form, and
+    // legalize deliberately does not, because building it would mean creating IR.
+    bool always_enabled = true;
+};
+
 struct SignalStores {
     ir::Signal                signal = ir::Signal{};
     std::vector<GuardedStore> stores;
@@ -139,6 +199,9 @@ struct SignalStores {
     ir::Signal clock = ir::Signal{};
     // True when some non-clock trigger drives this signal to a constant.
     bool async_reset = false;
+
+    // The full description. Empty for an Unclassified signal.
+    Decomp decomp;
 };
 
 struct ProcessResult {

@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <array>
 #include <optional>
 #include <string>
@@ -36,6 +37,12 @@ struct Run {
     }
 
     // The stores for `name` in the first process that writes it.
+    // The IR of the first process that has one. Every design here has one
+    // interesting process.
+    [[nodiscard]] const ir::Ir& ir() const {
+        return mod().processes().front().ir;
+    }
+
     [[nodiscard]] const legalize::SignalStores* find(std::string_view name) const {
         const ir::Signal s = sig(name);
         for (const legalize::ProcessResult& p : result.processes) {
@@ -654,4 +661,174 @@ TEST_CASE("a call inside a ternary branch is still gated") {
         endmodule
     )");
     CHECK_FALSE(t.all_synthesizable());
+}
+
+// --- M5: decomposition ----------------------------------------------------
+
+namespace {
+
+// Constant behind a store's value, seeing through the width cast, or nullopt.
+std::optional<uint64_t> const_bits(const ir::Module& m, const ir::Ir& ir, ir::Index v) {
+    ir::Index i = v;
+    while (ir.tag(i) == ir::Inst::Tag::Resize) {
+        i = ir.payload(i).unary;
+    }
+    if (ir.tag(i) != ir::Inst::Tag::Constant) {
+        return std::nullopt;
+    }
+    const auto&  val    = std::get<ir::Value>(m.pool.get(ir.payload(i).ref));
+    const auto   bytes  = m.pool.bytes(ir.payload(i).ref);
+    const auto   planes = static_cast<size_t>(m.pool.layout(val.type).domain);
+    const size_t plane  = planes ? bytes.size() / planes : bytes.size();
+    uint64_t     out    = 0;
+    for (size_t k = 0; k < plane && k < 8; ++k) {
+        out |= static_cast<uint64_t>(bytes[k]) << (8 * k);
+    }
+
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("a plain flop decomposes to a clock and a next-state cone") {
+    const Run   t = run(wrap("always @(posedge clk) q <= a;"));
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->decomp.clock == e->clock);
+    CHECK(e->decomp.clock_edge == ir::Edge::Positive);
+    CHECK(e->decomp.async.empty());
+    CHECK(e->decomp.sync.empty());
+    CHECK(e->decomp.next.size() == 1);
+    CHECK(e->decomp.always_enabled);
+}
+
+TEST_CASE("an async reset decomposes to one async entry and a separate next state") {
+    const Run   t = run(wrap("always @(posedge clk or posedge rst) if (rst) q <= 8'h00; else q <= a;"));
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    REQUIRE(e->decomp.async.size() == 1);
+    CHECK(e->decomp.async[0].trigger == t.sig("rst"));
+    CHECK(e->decomp.async[0].edge == ir::Edge::Positive);
+    // Pinning rst collapses the else arm away, so the reset is the whole residue.
+    REQUIRE(e->decomp.async[0].entries.size() == 1);
+    CHECK(const_bits(t.mod(), t.ir(), e->decomp.async[0].entries[0].value) == 0u);
+    // The synchronous side keeps only the data path.
+    CHECK(e->decomp.sync.empty());
+    CHECK(e->decomp.next.size() == 1);
+}
+
+// The case that forces the pair-list shape (4A.10). The block fires on arst's edge
+// and srst's branch is what executes, so 8'hAA is loaded ASYNCHRONOUSLY. A
+// (trigger, value) pair cannot hold this, because the condition involves srst,
+// which is not a trigger.
+TEST_CASE("arst tested first keeps srst on the synchronous side") {
+    const Run   t = run(R"(
+        module m(input clk, input arst, input srst, input [7:0] d, output reg [7:0] q);
+          always @(posedge clk or posedge arst)
+            if (arst) q <= 8'h00; else if (srst) q <= 8'hAA; else q <= d;
+        endmodule
+    )");
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    REQUIRE(e->decomp.async.size() == 1);
+    // arst pinned leaves `q <= 0` only -- arst is the outermost test here.
+    REQUIRE(e->decomp.async[0].entries.size() == 1);
+    CHECK(const_bits(t.mod(), t.ir(), e->decomp.async[0].entries[0].value) == 0x00u);
+    // srst is synchronous in this spelling, so it lands in sync, not async.
+    CHECK(e->decomp.sync.size() == 1);
+    CHECK(const_bits(t.mod(), t.ir(), e->decomp.sync[0].value) == 0xAAu);
+    CHECK(e->decomp.next.size() == 1);
+}
+
+// The other ordering, which is the one that makes the shape necessary: with srst
+// tested first, BOTH constants are reached under arst's edge.
+TEST_CASE("srst tested before arst puts both constants in the async list") {
+    const Run   t = run(R"(
+        module m(input clk, input arst, input srst, input [7:0] d, output reg [7:0] q);
+          always @(posedge clk or posedge arst)
+            if (srst) q <= 8'hAA; else if (arst) q <= 8'h00; else q <= d;
+        endmodule
+    )");
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    REQUIRE(e->decomp.async.size() == 1);
+    CHECK(e->decomp.async[0].entries.size() == 2);
+    // The exact multiset matters: OR-ing them together could not tell {0x00, 0xAA}
+    // apart from {0xAA, 0xAA}, and it is precisely the presence of BOTH under one
+    // trigger that a (trigger, value) pair could not have represented.
+    std::vector<uint64_t> vals;
+    for (const legalize::Entry& en : e->decomp.async[0].entries) {
+        const std::optional<uint64_t> c = const_bits(t.mod(), t.ir(), en.value);
+        REQUIRE(c.has_value());
+        vals.push_back(*c);
+    }
+    std::sort(vals.begin(), vals.end());
+    CHECK(vals == std::vector<uint64_t>{ 0x00u, 0xAAu });
+}
+
+// 4A.10's collapse case: both spellings assign the same constant, so the residue
+// is one value and it is an ordinary async reset. yosys hard-errors on this one.
+TEST_CASE("a reset reachable two ways collapses to a plain async reset") {
+    const Run   t = run(R"(
+        module m(input clk, input arst, input srst, input [7:0] d, output reg [7:0] q);
+          always @(posedge clk or posedge arst)
+            if (srst) q <= 8'h00; else if (arst) q <= 8'h00; else q <= d;
+        endmodule
+    )");
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::Flop);
+    CHECK(e->async_reset);
+    REQUIRE(e->decomp.async.size() == 1);
+    for (const legalize::Entry& en : e->decomp.async[0].entries) {
+        CHECK(const_bits(t.mod(), t.ir(), en.value) == 0x00u);
+    }
+}
+
+TEST_CASE("a clock enable shows up as not-always-enabled") {
+    const Run   t = run(wrap("always @(posedge clk) if (en) q <= a;"));
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK_FALSE(e->decomp.always_enabled);
+    CHECK(e->decomp.next.size() == 1);
+}
+
+TEST_CASE("two async resets give two groups") {
+    const Run   t = run(R"(
+        module m(input clk, input r1, input r2, input [7:0] d, output reg [7:0] q);
+          always @(posedge clk or posedge r1 or posedge r2)
+            if (r1) q <= 8'h00; else if (r2) q <= 8'hFF; else q <= d;
+        endmodule
+    )");
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->decomp.async.size() == 2);
+    CHECK(e->decomp.next.size() == 1);
+}
+
+TEST_CASE("a combinational signal decomposes without a clock") {
+    const Run   t = run(wrap("always @* q = a;"));
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->decomp.async.empty());
+    CHECK(e->decomp.clock == ir::Signal{});
+    CHECK(e->decomp.next.size() == 1);
+    CHECK(e->decomp.always_enabled);
+}
+
+// R22's acceptance: the verdict was already right in M3, but a rejection is only
+// useful if it says what is wrong. The note names the signal, and the conditions
+// that made the value non-constant are in the async entries -- yosys reports
+// "multiple edge sensitive events", pointing at the sensitivity list, where
+// nothing is wrong.
+TEST_CASE("an async load is reported, with the conditions available") {
+    const Run   t = run(wrap("always @(posedge clk or posedge rst) if (rst && en) q <= 8'h00; else q <= a;"));
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::AsyncLoad);
+    CHECK(t.has(legalize::Finding::AsyncLoad));
+    // Two values survive pinning rst -- the constant under `en`, and `a` when `en`
+    // is low. That second one is the whole problem, and it is in the data.
+    REQUIRE(e->decomp.async.size() == 1);
+    CHECK(e->decomp.async[0].entries.size() == 2);
 }

@@ -26,6 +26,7 @@
 //    right most of the time.
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 #include "Ir.h"
@@ -63,12 +64,23 @@ struct EvalValue {
 // weaker "no bit may be x" reading two published sources give.
 enum class Tri : uint8_t { False, True, Unknown };
 
+// One signal held at a value for the duration of an evaluation.
+struct Pin {
+    Signal   signal;
+    uint64_t bits;
+};
+
 class Eval {
 public:
     // Pin `pinned` to `pinned_bits` for the whole evaluation. Pass
     // `Signal(~0u)` to pin nothing, which is still useful: it folds the constant
     // sub-expressions of a cone.
     Eval(const Module& module, const Ir& ir, Signal pinned, uint64_t pinned_bits);
+
+    // Several pins at once. Needed to recover the SYNCHRONOUS body of a process
+    // with more than one asynchronous reset: that body is what runs with every
+    // async trigger deasserted, and one pin cannot express two.
+    Eval(const Module& module, const Ir& ir, std::span<const Pin> pins);
 
     // Value of an instruction's result. Memoized; repeated queries are free.
     [[nodiscard]] EvalValue value(Index i);
@@ -84,8 +96,7 @@ private:
 
     const Module&          module_;
     const Ir&              ir_;
-    Signal                 pinned_;
-    uint64_t               pinned_bits_;
+    std::vector<Pin>       pins_;
     std::vector<EvalValue> memo_;
     std::vector<uint8_t>   done_;
 };

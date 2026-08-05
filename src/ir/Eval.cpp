@@ -67,8 +67,14 @@ EvalValue from_tri(Tri t) {
 Eval::Eval(const Module& module, const Ir& ir, Signal pinned, uint64_t pinned_bits)
   : module_(module)
   , ir_(ir)
-  , pinned_(pinned)
-  , pinned_bits_(pinned_bits)
+  , pins_{ Pin{ pinned, pinned_bits } }
+  , memo_(ir.inst_count())
+  , done_(ir.inst_count(), 0) {}
+
+Eval::Eval(const Module& module, const Ir& ir, std::span<const Pin> pins)
+  : module_(module)
+  , ir_(ir)
+  , pins_(pins.begin(), pins.end())
   , memo_(ir.inst_count())
   , done_(ir.inst_count(), 0) {}
 
@@ -136,11 +142,18 @@ EvalValue Eval::compute(Index i) {
             }
             const Signal s   = ir_.payload(src).signal;
             const Layout lay = module_.pool.layout(module_.signal(s).type);
-            if (s != pinned_ || lay.width == 0 || lay.width > 64) {
+            if (lay.width == 0 || lay.width > 64) {
                 return EvalValue::unknown(lay.width);
             }
+            // Linear over the pins: there is one for the clock at most, plus one
+            // per async trigger, so the list is two or three entries.
+            for (const Pin& p : pins_) {
+                if (p.signal == s) {
+                    return EvalValue::known(p.bits, lay.width);
+                }
+            }
 
-            return EvalValue::known(pinned_bits_, lay.width);
+            return EvalValue::unknown(lay.width);
         }
 
         case Inst::Tag::Bnot: {
