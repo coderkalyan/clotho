@@ -1029,6 +1029,9 @@ void print_module(const Module& m, std::ostream& os, const LocResolver& resolve)
             case Activation::Initial:
                 os << "initial";
                 break;
+            case Activation::Reactive:
+                os << "reactive";
+                break;
             case Activation::Always:
                 os << "always";
                 break;

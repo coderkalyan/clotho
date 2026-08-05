@@ -617,8 +617,6 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
     // Why a construct cannot appear in reactive code. Every rejection names one,
     // because "not supported" alone does not tell the reader which region is
     // missing and therefore what would have to be built.
-    static constexpr std::string_view kReNba =
-      "it would have to commit in the Re-NBA region (LRM 4.4.2.8), which clotho has not built";
     static constexpr std::string_view kWrongRegion =
       "every path that would wake it -- the timer wheel, a static subscription, a join "
       "record -- pushes onto the Active ring, so the body would resume in the wrong region";
@@ -730,12 +728,13 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
     }
 
     void handle(const AssignmentExpression& a) {
-        if (a.isNonBlocking()) {
-            reject("a nonblocking assignment", kReNba);
-        } else if (a.timingControl != nullptr) {
-            // Even `= #0`: the relaxation above is for a bare `#0` statement, whose
-            // suspension the Re-Inactive batch is built to catch. An intra-assign
-            // delay suspends inside the assignment's own record instead.
+        // A plain `x <= y` is fine: LRM 4.4.2.8 gives the reactive region set its
+        // own update region, and the backend commits it there (re_nba.commit).
+        // An intra-assignment delay is not, even `= #0` -- the bare-`#0`
+        // relaxation above is for a statement whose suspension the Re-Inactive
+        // batch catches, whereas this one suspends inside the assignment's own
+        // record.
+        if (a.timingControl != nullptr) {
             reject("an intra-assignment delay", kWrongRegion);
         }
         visitDefault(a);
@@ -807,6 +806,26 @@ public:
         const std::string         self_prefix(prefix);
         const InstanceBodySymbol& body = inst.body;
 
+        // A program (LRM 24) elaborates exactly like a module -- same scope, same
+        // signals, same subroutines -- and differs only in how its procedures are
+        // scheduled: an `initial` runs in the Reactive region, not the Active one.
+        // So the whole instance path is reused and only this flag is threaded
+        // through, read by lower_procedural_block.
+        //
+        // slang already enforces most of 24.3 for us: an `always` procedure, a
+        // nested program declaration and a member of an anonymous program are all
+        // rejected as "member not allowed in program declaration", and
+        // instantiating a program inside a program is rejected outright.
+        const bool is_program = inst.getDefinition().definitionKind == slang::ast::DefinitionKind::Program;
+        if (is_program && !inst.getPortConnections().empty()) {
+            // TODO: program ports. They would elaborate through wire_ports like a
+            // module's, but a program's ports carry the clocking-block/skew
+            // semantics of LRM 24.3 that nothing here implements, and an unchecked
+            // port copy is an Active-region process feeding Reactive code. Refused
+            // rather than silently given module semantics.
+            fail("a `program` with ports is not supported (LRM 24.3)");
+        }
+
         // Collect builds the scope node; Emit reuses the node Collect built.
         // A parent's children vector only grows during Collect (before this
         // child pops), so stacked pointers stay stable across that recursion;
@@ -864,7 +883,12 @@ public:
             collect_signals(body);
         }
         size_t child_cursor = 0;
+        // Restored after the walk: a program's members lower under the flag, and
+        // the module that instantiates it must not inherit it.
+        const bool saved_in_program = in_program_;
+        in_program_                 = is_program;
         lower_members(body, self_prefix, self_mul, pass, *self, child_cursor);
+        in_program_ = saved_in_program;
 
         node_rel_ = saved_node_rel;
         scope_stack_.pop_back();
@@ -5339,7 +5363,11 @@ private:
         const Expression*          iff_guard = nullptr;
 
         if (sym.procedureKind == ProceduralBlockKind::Initial) {
-            activation = ir::Activation::Initial;
+            // LRM 24.3: a program's `initial` procedures execute in the Reactive
+            // region, so every print they make lands after the Active-region work
+            // of the same time slot. Same one-shot process either way -- only the
+            // ring the backend seeds it onto differs.
+            activation = in_program_ ? ir::Activation::Reactive : ir::Activation::Initial;
         } else if (sym.procedureKind == ProceduralBlockKind::Final) {
             // A `final` block runs once at simulation end (LRM 9.2.3). The backend
             // runs it, sensitivity-less, on both exit paths after every other
@@ -6244,12 +6272,12 @@ private:
 
     // An action block is pended into the Reactive region as a thunk (LRM 4.4.2.5)
     // and the drain resumes it exactly once. That makes zero-time-ness a
-    // correctness requirement rather than a style rule: a nonblocking assignment
-    // scheduled from Reactive would need Re-NBA (LRM 4.4.2.8) to commit in, and
-    // anything that suspends would resume through a wake path that pushes onto
-    // the Active ring. A bare `#0` is the one suspension that is fine: LRM 4.4.2.7
-    // parks it in Re-Inactive and promotes it back into Reactive at the same
-    // instant, which the backend implements.
+    // correctness requirement rather than a style rule: anything that suspends
+    // would resume through a wake path that pushes onto the Active ring. Two
+    // suspension-free cases the region set does handle are allowed through -- a
+    // nonblocking assignment, which commits in Re-NBA (LRM 4.4.2.8), and a bare
+    // `#0`, which LRM 4.4.2.7 parks in Re-Inactive and promotes back into
+    // Reactive at the same instant.
     //
     // Whitelisted, not blacklisted. A statement kind not positively known to be
     // zero-time is refused -- the project forbids silently accepting a construct
@@ -6261,9 +6289,6 @@ private:
         checker.scope = scope_;
         action.visit(checker);
         if (!checker.reason.empty()) {
-            // TODO: lifting the nonblocking-assignment case needs Re-NBA, which
-            // needs the NBA commit machinery factored out of the Active drain
-            // first (concurrent-assertions.md 3.5).
             fail(checker.reason);
         }
     }
@@ -14692,6 +14717,10 @@ private:
     // True when flattened paths omit the single top instance's name (the
     // single-top case); %m and $printtimescale re-prepend module_.name.
     bool top_elided_ = false;
+    // True while lowering the members of a `program` instance (LRM 24), so an
+    // `initial` inside one becomes a Reactive process. Saved/restored per
+    // instance in lower_instance.
+    bool in_program_ = false;
     // Names of the named begin blocks enclosing the statement currently being
     // lowered, outermost first; they extend the %m hierarchical name (LRM
     // §21.2.1.5). Saved/cleared around subroutine body lowering: a body is

@@ -339,6 +339,7 @@ add_executable(clotho_test
   tests/operands_test.cpp
   tests/sourcemap_test.cpp
   tests/lower_test.cpp
+  tests/program_test.cpp
   tests/case_test.cpp
   tests/function_test.cpp
   tests/task_test.cpp

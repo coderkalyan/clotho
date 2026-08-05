@@ -263,6 +263,21 @@ bool has_tag(const ir::Process& p, ir::Inst::Tag want) {
     return false;
 }
 
+// The same, across every lowered function. An action block is a synthetic
+// zero-formal task rather than a process, so its body is not reachable through
+// monitor_process.
+bool any_function_has_tag(const ir::Module& m, ir::Inst::Tag want) {
+    for (size_t k = 0; k < m.function_count(); k++) {
+        const ir::Ir& ir = m.function(static_cast<ir::FunctionId>(k)).ir;
+        for (size_t i = 0; i < ir.inst_count(); i++) {
+            if (ir.tag(static_cast<ir::Index>(i)) == want) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 TEST_CASE("a nonoverlapping implication emits a monitor process and its state") {
@@ -504,16 +519,28 @@ endmodule
 )", "explicit clocking event");
 }
 
-TEST_CASE("a nonblocking assignment in an action block is refused, naming Re-NBA") {
-    // The action is pended into Reactive as a thunk, so an NBA scheduled from it
-    // would have to commit in the Re-NBA region (LRM 4.4.2.8), which clotho has
-    // not built.
-    refuses(R"(
+TEST_CASE("a nonblocking assignment in an action block lowers, for Re-NBA to commit") {
+    // LRM 4.4.2.8 gives the reactive region set its own update region, so this is
+    // legal rather than refused: the store stages like any other nonblocking
+    // assignment and the backend's re_nba.commit applies it after the Reactive
+    // and Re-Inactive regions settle, still inside this time slot.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
 module t;
   bit clk, a, b, flag;
   ap: assert property (@(posedge clk) a |=> b) else flag <= 1;
 endmodule
-)", "Re-NBA");
+)", r);
+    REQUIRE(r.ok);
+
+    // The action block lowers to a synthetic zero-formal task rather than a
+    // process, so the store has to be looked for among the functions. Checking it
+    // survived lowering is the point: dropping it silently is the failure this
+    // guards, now that no refusal stands in the way.
+    CHECK(any_function_has_tag(m, ir::Inst::Tag::StoreNb));
+    // Still pended into Reactive -- the region it commits from is what changed,
+    // not the region it runs in.
+    CHECK(has_tag(monitor_process(m), ir::Inst::Tag::ReactivePend));
 }
 
 TEST_CASE("a nonzero delay in an action block is refused, but a #0 is not") {

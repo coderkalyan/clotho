@@ -690,14 +690,16 @@ public:
         design_uses_observed_ = facts_.uses.observed; // gates the Observed-region flush
         design_uses_defer_    = facts_.uses.defer;    // gates the deferred-assertion flushes
         // The reactive region set (LRM 4.4.2.5 - 4.4.2.7): wanted when there is
-        // pass/fail code to schedule, or a process in Observed that could schedule
-        // some. Everything it costs sits behind this one flag.
-        design_uses_reactive_ = facts_.uses.reactive || has_observed();
+        // pass/fail code to schedule, a process in Observed that could schedule
+        // some, or a program block, whose `initial` procedures run in Reactive
+        // (LRM 24.3). Everything it costs sits behind this one flag.
+        design_uses_reactive_ = facts_.uses.reactive || has_observed() || has_program();
         if (design_uses_reactive_) {
             // Before any body lowers: the classification decides which region a #0
             // inside reactive code parks in, and both queues have to exist ahead of
             // lower_finish, which empties whichever of them were created.
             build_reactive_fns();
+            build_program_fns();
             ensure_reactive_queue();
             if (reactive_has_delay_) {
                 ensure_re_inactive_queue();
@@ -1774,7 +1776,6 @@ private:
         // partially-driven packed net powers its undriven bits z per this mask.
         const std::vector<bool>& undriven = facts_.undriven;
 
-
         for (uint32_t i = 0; i < sigs.size(); ++i) {
             const Layout lay = mod_.pool.layout(sigs[i].type);
             const Type&  ty  = std::get<Type>(mod_.pool.get(sigs[i].type));
@@ -2724,6 +2725,9 @@ private:
         // activation, because the property is "this store generates no event".
         silent_stores_ = proc.activation == Activation::PreInit ||
                          proc.activation == Activation::Preponed;
+        // A program block's `initial` (LRM 24.3). Drives the region-restoring
+        // resume in emit_suspend and the 24.6 implicit finish below.
+        in_program_body_ = proc.activation == Activation::Reactive;
 
         auto* none     = llvm::ConstantTokenNone::get(ctx_);
         auto* null     = llvm::ConstantPointerNull::get(ptr_ty);
@@ -2866,7 +2870,45 @@ private:
 
         // Final suspend: the default edge returns the (now-done) handle to the
         // resumer, which destroys it; case 1 is the destroy re-entry; resuming a
-        // finished coroutine (case 0) is undefined, so trap.
+        // finished coroutine (case 0) is undefined, so trap. The LRM 24.6 check
+        // below runs first, on the fallthrough from the body.
+        //
+        // LRM 24.6: when every program `initial` has completed, the simulation
+        // ends on its own, without waiting for the modules. Counted down here, at
+        // the natural end of the body -- an explicit $finish branches straight to
+        // coro_final_bb_ and skips this, having already ended things itself.
+        if (in_program_body_) {
+            auto*        i32  = b_.getInt32Ty();
+            auto*        live = program_live_ptr();
+            llvm::Value* n    = b_.CreateSub(b_.CreateLoad(i32, live), b_.getInt32(1));
+            b_.CreateStore(n, live);
+            auto* last = llvm::BasicBlock::Create(ctx_, "program.last", fn_);
+            auto* more = llvm::BasicBlock::Create(ctx_, "program.more", fn_);
+            b_.CreateCondBr(b_.CreateICmpEQ(n, b_.getInt32(0)), last, more);
+
+            b_.SetInsertPoint(last);
+            // Same cooperative stop $finish takes (lower_finish): report, then
+            // empty the rings so nothing else queued at this instant runs. The
+            // body still leaves through its own final suspend, so its frame is
+            // released by the resumer exactly as on a normal completion.
+            llvm::Value* now = has_wheel()
+                                 ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
+                                 : static_cast<llvm::Value*>(b_.getInt64(0));
+            b_.CreateCall(finish_coop_fn(),
+                          { b_.CreateGlobalString("implicit $finish from program"), now, b_.getInt32(0) });
+            if (active_head_gv_ != nullptr) {
+                b_.CreateStore(b_.CreateLoad(i32, sym(active_tail_gv_)), sym(active_head_gv_));
+            }
+            if (reactive_head_gv_ != nullptr) {
+                b_.CreateStore(b_.CreateLoad(i32, sym(reactive_tail_gv_)), sym(reactive_head_gv_));
+            }
+            if (re_inactive_top_gv_ != nullptr) {
+                b_.CreateStore(b_.getInt32(0), sym(re_inactive_top_gv_));
+            }
+            b_.CreateBr(more);
+            b_.SetInsertPoint(more);
+        }
+
         b_.CreateBr(coro_final_bb_);
         b_.SetInsertPoint(coro_final_bb_);
         // A completing process releases its string temporaries. (An always loop
@@ -2880,6 +2922,7 @@ private:
 
         b_.SetInsertPoint(trap_bb);
         b_.CreateUnreachable();
+        in_program_body_ = false;
         return fn_;
     }
 
@@ -3322,6 +3365,7 @@ private:
         ir_ = &f.ir;
         cur_fn_           = &f;
         in_reactive_body_ = is_reactive_fn(id);
+        in_program_fn_    = is_program_fn(id);
         cur_is_task_      = false;
         param_llvm_index_ = param_indices(f);
         build_frame_layout(f);
@@ -3365,6 +3409,7 @@ private:
 
         cur_fn_ = nullptr;
         in_reactive_body_ = false;
+        in_program_fn_    = false;
         frame_  = nullptr;
     }
 
@@ -3402,6 +3447,7 @@ private:
         ir_               = &f.ir;
         cur_fn_           = &f;
         in_reactive_body_ = is_reactive_fn(id);
+        in_program_fn_    = is_program_fn(id);
         cur_is_task_      = true;
         param_llvm_index_ = param_indices(f);
         build_frame_layout(f);
@@ -3546,6 +3592,7 @@ private:
 
         cur_fn_           = nullptr;
         in_reactive_body_ = false;
+        in_program_fn_    = false;
         cur_is_task_      = false;
         frame_            = nullptr;
         task_epilogue_bb_ = nullptr;
@@ -3730,7 +3777,7 @@ private:
     // returns control to the resumer (coro.ret), case 0 resumes in the new block,
     // case 1 is a destroy while suspended. Shared by every suspend site (#delay,
     // #0, event wait).
-    void emit_suspend(const char* label) {
+    void emit_suspend_raw(const char* label) {
         auto* save   = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_save), { hdl_ });
         auto* susp   = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { save, b_.getFalse() });
         auto* resume = llvm::BasicBlock::Create(ctx_, label, fn_);
@@ -3738,6 +3785,38 @@ private:
         sw->addCase(b_.getInt8(0), resume);
         sw->addCase(b_.getInt8(1), coro_cleanup_bb_);
         b_.SetInsertPoint(resume);
+    }
+
+    // Suspend, and come back in the region the body belongs to.
+    //
+    // Whoever wakes a sleeper pushes it onto the ACTIVE ring: a wheel timer, an
+    // event scan, the inactive promote. None of them knows the region their
+    // sleeper belongs to, and teaching all of them would put a branch on the
+    // hot wake path of every design. A program `initial` (LRM 24.3) has to
+    // resume in Reactive instead, so it does the correction itself -- it wakes
+    // in Active, immediately re-queues onto the reactive ring and suspends
+    // again, and the reactive drain of the SAME time slot runs the body. The
+    // extra resume does nothing observable, which is why the region order still
+    // reads Active-then-Reactive from the design's point of view.
+    //
+    // This is what makes a program initial able to suspend at all: unlike an
+    // assertion action block (a zero-time thunk with no frame), it is a real
+    // process, so `@`, `wait` and a nonzero `#delay` all work and come back in
+    // the right region.
+    void emit_suspend(const char* label) {
+        if (in_program_fn_) {
+            // TODO: a task called from a program block. The trampoline below
+            // would push the TASK's handle onto the reactive ring, not the
+            // calling process's, which is untested. Refused rather than resumed
+            // in the wrong region behind the user's back.
+            throw BackendError{ "suspending inside a task called from a `program` block is not "
+                                "supported: it would resume in the Active region" };
+        }
+        emit_suspend_raw(label);
+        if (in_program_body_) {
+            emit_reactive_push(b_, hdl_);
+            emit_suspend_raw("program.reactive");
+        }
     }
 
     // Lower a #delay, then suspend; execution continues in a fresh resume block.
@@ -3954,6 +4033,19 @@ private:
         return false;
     }
 
+    // Whether any process is a program block's `initial` (LRM 24.3). Those run in
+    // the Reactive region, so their presence alone means the design needs the
+    // reactive region set even with no concurrent assertion anywhere. A design
+    // with no program pays nothing, exactly like has_observed.
+    bool has_program() const {
+        for (const Process& p : mod_.processes()) {
+            if (p.activation == Activation::Reactive) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Run every Observed process once (LRM 4.4.2.5), at the settled point where
     // the Active / Inactive / NBA set has drained. This is where a concurrent
     // assertion steps its automaton; the pass/fail code a verdict calls for is
@@ -3983,6 +4075,59 @@ private:
     bool is_reactive_fn(FunctionId id) const {
         const auto k = static_cast<uint32_t>(id);
         return k < reactive_fns_.size() && reactive_fns_[k];
+    }
+
+    // Subroutines reachable from a program block's `initial` (LRM 24.3). A
+    // program body restores the Reactive region itself on every resume
+    // (emit_suspend), but a task it calls is a coroutine of its own whose handle
+    // that trampoline would push -- unverified, so a suspend inside one is
+    // rejected loud rather than silently resumed in the Active region. A function
+    // cannot suspend at all (LRM 13.4.4 bars timing controls in one), so in
+    // practice this only ever bites a task.
+    void build_program_fns() {
+        const size_t nfn = mod_.function_count();
+        program_fns_.assign(nfn, false);
+        program_proc_count_ = 0;
+
+        std::vector<FunctionId> work;
+        for (const Process& p : mod_.processes()) {
+            if (p.activation == Activation::Reactive) {
+                // One process per group: a sensitivity-less body is never fused
+                // (see lower_group), so this also counts the emitted bodies, which
+                // is what the 24.6 countdown needs.
+                ++program_proc_count_;
+                collect_callees(p.ir, work);
+            }
+        }
+        while (!work.empty()) {
+            const auto f = static_cast<uint32_t>(work.back());
+            work.pop_back();
+            if (program_fns_[f]) {
+                continue;
+            }
+            program_fns_[f] = true;
+            collect_callees(mod_.function(static_cast<FunctionId>(f)).ir, work);
+        }
+    }
+
+    // Whether `id` is reachable from a program block (build_program_fns).
+    bool is_program_fn(FunctionId id) const {
+        const auto k = static_cast<uint32_t>(id);
+        return k < program_fns_.size() && program_fns_[k];
+    }
+
+    // The LRM 24.6 live-program counter: how many program `initial` procedures
+    // have not yet completed. Created on first use, so a design with no program
+    // never emits it.
+    llvm::Constant* program_live_ptr() {
+        if (program_live_gv_ == nullptr) {
+            auto* i32        = llvm::Type::getInt32Ty(ctx_);
+            program_live_gv_ = new llvm::GlobalVariable(env_->llmod, i32, false,
+                                                        llvm::GlobalValue::InternalLinkage,
+                                                        llvm::ConstantInt::get(i32, program_proc_count_),
+                                                        "clotho.program_live");
+        }
+        return sym(program_live_gv_);
     }
 
     // Every function this body enables or calls, appended to `work`. Virtual
@@ -4091,22 +4236,32 @@ private:
     void reject_unsupported_reactive(const std::string& where, const Ir& ir, bool shared) {
         for (uint32_t k = 0; k < ir.inst_count(); ++k) {
             switch (ir.tag(static_cast<Index>(k))) {
-                case Inst::Tag::StoreNb:
                 case Inst::Tag::StoreNbDelay:
                 case Inst::Tag::StoreNbEvent:
                 case Inst::Tag::StoreInertialDelay:
+                    // TODO: a plain `x <= y` commits in Re-NBA (re_nba.commit in
+                    // emit_active_run), but these three carry their own timing. The
+                    // suspension lives inside the assignment's own record and the
+                    // wake that releases it pushes onto the active ring, so the
+                    // store would come back in the wrong region set. Needs that
+                    // wake parameterized over a destination region, as Wait/Fork
+                    // below do.
+                    throw BackendError{ "a delayed or event-controlled nonblocking assignment in "
+                                        "reactive code (the action block of a concurrent assertion, "
+                                        "here in '" +
+                                        where + "') is not supported" };
                 case Inst::Tag::EventTriggerNb:
                 case Inst::Tag::EventTriggerNbDelayed:
-                    // TODO: Re-NBA (LRM 4.4.2.8). A nonblocking assignment made from
-                    // reactive code has to commit in the Re-NBA region, which does
-                    // not exist: the NBA commit machinery is welded into
-                    // emit_active_run's nba.commit block and must be factored out
-                    // before a second copy can run after Reactive. Staging it into
-                    // the ordinary NBA region instead would commit a full time step
-                    // late, so this fails rather than mis-schedules.
-                    throw BackendError{ "a nonblocking assignment in reactive code (the action block "
-                                        "of a concurrent assertion, here in '" +
-                                        where + "') needs the Re-NBA region, which is not implemented" };
+                    // TODO: the region machinery for this already exists --
+                    // re_nba.commit fires a pending `->> e`, and the reactive drain
+                    // re-settles the active set afterwards, so its waiters run in
+                    // this time slot. What is missing is a frontend decision:
+                    // ReactiveSafetyChecker refuses every event trigger in an action
+                    // block, `->` and `->>` alike, and lifting just the nonblocking
+                    // one belongs with that change rather than here.
+                    throw BackendError{ "a nonblocking event trigger in reactive code (the action "
+                                        "block of a concurrent assertion, here in '" +
+                                        where + "') is not supported" };
                 case Inst::Tag::Wait:
                 case Inst::Tag::Fork:
                     // TODO: reactive code that blocks on an event or forks has to be
@@ -4152,12 +4307,14 @@ private:
                 case Inst::Tag::StoreInertialDelay:
                 case Inst::Tag::EventTriggerNb:
                 case Inst::Tag::EventTriggerNbDelayed:
-                    // TODO: Re-NBA (LRM 4.4.2.8), as in reject_unsupported_reactive.
-                    // The NBA region has already run when Observed executes, so this
-                    // would not commit until the next time step.
+                    // TODO: Re-NBA exists now and, running after Observed, would in
+                    // fact catch this. It is still refused because LRM 4.4.2.8
+                    // scopes that update region to nonblocking assignments made
+                    // from the REACTIVE region set, and an Observed process is not
+                    // in it; committing one there would be clotho inventing a
+                    // schedule the LRM does not give. Refused rather than guessed.
                     throw BackendError{ "a nonblocking assignment in an Observed-region process "
-                                        "(property evaluation, LRM 4.4.2.5) needs the Re-NBA region, "
-                                        "which is not implemented" };
+                                        "(property evaluation, LRM 4.4.2.5) is not supported" };
                 default:
                     break;
             }
@@ -4877,7 +5034,6 @@ private:
         return false;
     }
 
-
     // Comb-fusion eligibility (analysis only — grouping lands with the comb
     // fusion phase). A member of a union-sensitivity fused group can be run
     // when its own trigger did NOT fire. Such a spurious run is unobservable —
@@ -4888,7 +5044,6 @@ private:
     // downstream can tell the run happened. The verdict enumerates exactly the
     // conditions that argument needs; purity is a whitelist, so a new IR tag
     // defaults to ineligible.
-
 
     // Comb-fusion coverage probe: verdict histogram over Always processes plus
     // the count V1 fusion left in singleton groups (the comb-fusion
@@ -6747,6 +6902,10 @@ private:
     // running it is reactive code (LRM 4.4.2.7): a suspended action block has to
     // come back in Reactive, not Active, or the rest of the region order is wrong.
     void emit_zero_delay_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
+        if (in_program_body_) {
+            throw BackendError{ "a #0 delay inside a `program` block is not supported: it would resume "
+                                "through the Inactive region rather than Re-Inactive" };
+        }
         if (in_reactive_body_) {
             emit_re_inactive_push(b, handle);
         } else {
@@ -6924,6 +7083,128 @@ private:
     // seconds (before a typical test-harness timeout mistakes it for a hang).
     static constexpr uint64_t kOscillationLimit = 10'000'000;
 
+    // Whether any nonblocking update is staged: the block-commit chain head, the
+    // shared array / aggregate / queue record buffers, the intra-assignment
+    // record pools, and each `->> e` pending flag.
+    //
+    // Every one of these is CONSUMED by emit_nba_commit, so this test re-arms:
+    // asking it again later in the same instant reports only what was staged
+    // since the last commit. That is what lets the Re-NBA region reuse both
+    // halves after the NBA region has already run and cleared them.
+    llvm::Value* emit_nba_any_staged() {
+        auto*        ptr_ty = llvm::PointerType::getUnqual(ctx_);
+        llvm::Value* any    = b_.getFalse();
+        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !queue_nba_sigs_.empty()) {
+            // rt_nba_arr_any is the total across the shared array + aggregate +
+            // queue buffers.
+            any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateCall(nba_arr_any_fn(), {}), b_.getInt32(0)));
+        }
+        if (!block_commits_.empty()) {
+            any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateLoad(ptr_ty, sym(block_head_gv_)),
+                                                   llvm::ConstantPointerNull::get(ptr_ty)));
+        }
+        if (!intra_nba_sigs_.empty()) {
+            any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateCall(intra_any_fn(), {}), b_.getInt32(0)));
+        }
+        for (const Signal sig : nb_event_sigs_) {
+            // A pending `->> e` this instant.
+            llvm::Value* pend = b_.CreateLoad(b_.getInt8Ty(), sym(event_pending_gv_[static_cast<uint32_t>(sig)]));
+            any = b_.CreateOr(any, b_.CreateICmpNE(pend, b_.getInt8(0)));
+        }
+        return any;
+    }
+
+    // Commit every staged nonblocking update at the builder's insert point. The
+    // emitted code is left unterminated, so the caller supplies the branch: the
+    // NBA region loops back to the active drain, the Re-NBA region to the
+    // reactive one.
+    //
+    // Position-independent by construction -- every block this creates hangs off
+    // b_.GetInsertBlock()->getParent(), as do the four commit helpers it calls --
+    // which is what makes a second copy after the Reactive region possible.
+    void emit_nba_commit(llvm::Value* state, llvm::Value* wheel) {
+        auto*      ptr_ty   = llvm::PointerType::getUnqual(ctx_);
+        const bool uses_vcd = design_uses_vcd();
+        // Block-commit scalar NBAs: call the head block's commit function; it
+        // musttail-chains through every pending block and returns here.
+        if (!block_commits_.empty()) {
+            auto*        cfn    = b_.GetInsertBlock()->getParent();
+            auto*        run    = llvm::BasicBlock::Create(ctx_, "nblk.run", cfn);
+            auto*        after  = llvm::BasicBlock::Create(ctx_, "nblk.after", cfn);
+            llvm::Value* h      = b_.CreateLoad(ptr_ty, sym(block_head_gv_));
+            b_.CreateCondBr(b_.CreateICmpNE(h, llvm::ConstantPointerNull::get(ptr_ty)), run, after);
+            b_.SetInsertPoint(run);
+            b_.CreateStore(llvm::ConstantPointerNull::get(ptr_ty), sym(block_head_gv_)); // empty chain for next instant
+            auto* cty = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty }, false);
+            b_.CreateCall(cty, h, { state });
+            b_.CreateBr(after);
+            b_.SetInsertPoint(after);
+        }
+        // Deferred writes through a runtime array index: replay each array's
+        // typed records and each aggregate's memcpy records (both from the
+        // shared rt_nba_arr_* buffers), waking Any-edge readers, then reset.
+        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !queue_nba_sigs_.empty()) {
+            for (const Signal sig : array_nba_sigs_) {
+                emit_array_commit(sig, state);
+            }
+            for (const Signal sig : agg_nba_sigs_) {
+                emit_agg_array_commit(sig, state);
+            }
+            for (const Signal sig : queue_nba_sigs_) {
+                emit_queue_whole_commit(sig);
+            }
+            // VCD: touch each dumped array that took an NBA write this instant,
+            // so the flush scans its elements only on write instants (not every
+            // instant). The runtime queue has no per-element index, so touch the
+            // whole element range; the flush diff still emits only what changed.
+            if (uses_vcd) {
+                for (const Signal sig : array_nba_sigs_) {
+                    if (vcd_index_[static_cast<uint32_t>(sig)] < 0) {
+                        continue;
+                    }
+                    auto* fn     = b_.GetInsertBlock()->getParent();
+                    auto* svc    = llvm::BasicBlock::Create(ctx_, "vcd.arr.svc", fn);
+                    auto* nextbb = llvm::BasicBlock::Create(ctx_, "vcd.arr.next", fn);
+                    // Nonzero record count == the array took writes this instant
+                    // (records are not reset until nba_arr_reset below).
+                    auto* dirty  = b_.CreateCall(nba_arr_count_fn(), { b_.getInt32(arr_idx(sig)) });
+                    b_.CreateCondBr(b_.CreateICmpNE(dirty, b_.getInt32(0)), svc, nextbb);
+                    b_.SetInsertPoint(svc);
+                    vcd_touch_array(sig);
+                    b_.CreateBr(nextbb);
+                    b_.SetInsertPoint(nextbb);
+                }
+            }
+            b_.CreateCall(nba_arr_reset_fn(), {});
+        }
+        // Deferred nonblocking intra-assignment stores that fired this instant:
+        // each site commits its ready records (last fire wins), wakes readers,
+        // and returns the records to its pool.
+        if (!intra_nba_sigs_.empty()) {
+            for (const Signal sig : intra_nba_sigs_) {
+                emit_intra_commit(sig);
+            }
+        }
+        // Nonblocking event triggers (`->> e`, LRM 15.5.4): for each pending
+        // event, stamp the trigger time and wake its Any-edge waiters, then
+        // clear the flag. Done in the NBA region so the wake lands after this
+        // instant's nonblocking updates; the caller's loop-back then drains the
+        // woken waiters.
+        for (const Signal sig : nb_event_sigs_) {
+            const auto   i    = static_cast<uint32_t>(sig);
+            auto*        cfn  = b_.GetInsertBlock()->getParent();
+            auto*        fire = llvm::BasicBlock::Create(ctx_, "nbev.fire", cfn);
+            auto*        skip = llvm::BasicBlock::Create(ctx_, "nbev.skip", cfn);
+            llvm::Value* pend = b_.CreateLoad(b_.getInt8Ty(), sym(event_pending_gv_[i]));
+            b_.CreateCondBr(b_.CreateICmpNE(pend, b_.getInt8(0)), fire, skip);
+            b_.SetInsertPoint(fire);
+            b_.CreateStore(b_.getInt8(0), sym(event_pending_gv_[i]));
+            emit_event_fire(sig, wheel); // stamp now + service Any static/dynamic queues
+            b_.CreateBr(skip);
+            b_.SetInsertPoint(skip);
+        }
+    }
+
     void emit_active_run(llvm::Value* state, llvm::Value* wheel, const std::vector<llvm::Function*>& procs) {
         ensure_active_queue();
         auto* ptr_ty        = llvm::PointerType::getUnqual(ctx_);
@@ -7043,6 +7324,11 @@ private:
                     b_.CreateStore(b_.getInt32(1), flag);
                     emit_active_push(b_, hdl);
                 }
+            } else if (p.activation == Activation::Reactive) {
+                // A program `initial` (LRM 24.3) starts in the Reactive region, so
+                // it is seeded onto the reactive ring instead of the active one.
+                // Its body keeps itself there across every suspend (emit_suspend).
+                emit_reactive_push(b_, hdl);
             } else {
                 emit_active_push(b_, hdl);
             }
@@ -7219,105 +7505,11 @@ private:
             // queue's length; if so, commit them and loop back to drain the processes
             // the commits just woke.
             b_.SetInsertPoint(ncheck);
-            llvm::Value* any = b_.getFalse();
-            if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !queue_nba_sigs_.empty()) {
-                // rt_nba_arr_any is the total across the shared array + aggregate +
-                // queue buffers.
-                any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateCall(nba_arr_any_fn(), {}), b_.getInt32(0)));
-            }
-            if (!block_commits_.empty()) {
-                any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateLoad(ptr_ty, sym(block_head_gv_)),
-                                                       llvm::ConstantPointerNull::get(ptr_ty)));
-            }
-            if (!intra_nba_sigs_.empty()) {
-                any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateCall(intra_any_fn(), {}), b_.getInt32(0)));
-            }
-            for (const Signal sig : nb_event_sigs_) {
-                // A pending `->> e` this instant.
-                llvm::Value* pend = b_.CreateLoad(b_.getInt8Ty(), sym(event_pending_gv_[static_cast<uint32_t>(sig)]));
-                any = b_.CreateOr(any, b_.CreateICmpNE(pend, b_.getInt8(0)));
-            }
+            llvm::Value* any = emit_nba_any_staged();
             b_.CreateCondBr(any, ncommit, wcheck);
 
             b_.SetInsertPoint(ncommit);
-            // Block-commit scalar NBAs: call the head block's commit function; it
-            // musttail-chains through every pending block and returns here.
-            if (!block_commits_.empty()) {
-                auto*        cfn    = b_.GetInsertBlock()->getParent();
-                auto*        run    = llvm::BasicBlock::Create(ctx_, "nblk.run", cfn);
-                auto*        after  = llvm::BasicBlock::Create(ctx_, "nblk.after", cfn);
-                llvm::Value* h      = b_.CreateLoad(ptr_ty, sym(block_head_gv_));
-                b_.CreateCondBr(b_.CreateICmpNE(h, llvm::ConstantPointerNull::get(ptr_ty)), run, after);
-                b_.SetInsertPoint(run);
-                b_.CreateStore(llvm::ConstantPointerNull::get(ptr_ty), sym(block_head_gv_)); // empty chain for next instant
-                auto* cty = llvm::FunctionType::get(b_.getVoidTy(), { ptr_ty }, false);
-                b_.CreateCall(cty, h, { state });
-                b_.CreateBr(after);
-                b_.SetInsertPoint(after);
-            }
-            // Deferred writes through a runtime array index: replay each array's
-            // typed records and each aggregate's memcpy records (both from the
-            // shared rt_nba_arr_* buffers), waking Any-edge readers, then reset.
-            if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !queue_nba_sigs_.empty()) {
-                for (const Signal sig : array_nba_sigs_) {
-                    emit_array_commit(sig, state);
-                }
-                for (const Signal sig : agg_nba_sigs_) {
-                    emit_agg_array_commit(sig, state);
-                }
-                for (const Signal sig : queue_nba_sigs_) {
-                    emit_queue_whole_commit(sig);
-                }
-                // VCD: touch each dumped array that took an NBA write this instant,
-                // so the flush scans its elements only on write instants (not every
-                // instant). The runtime queue has no per-element index, so touch the
-                // whole element range; the flush diff still emits only what changed.
-                if (uses_vcd) {
-                    for (const Signal sig : array_nba_sigs_) {
-                        if (vcd_index_[static_cast<uint32_t>(sig)] < 0) {
-                            continue;
-                        }
-                        auto* fn     = b_.GetInsertBlock()->getParent();
-                        auto* svc    = llvm::BasicBlock::Create(ctx_, "vcd.arr.svc", fn);
-                        auto* nextbb = llvm::BasicBlock::Create(ctx_, "vcd.arr.next", fn);
-                        // Nonzero record count == the array took writes this instant
-                        // (records are not reset until nba_arr_reset below).
-                        auto* dirty  = b_.CreateCall(nba_arr_count_fn(), { b_.getInt32(arr_idx(sig)) });
-                        b_.CreateCondBr(b_.CreateICmpNE(dirty, b_.getInt32(0)), svc, nextbb);
-                        b_.SetInsertPoint(svc);
-                        vcd_touch_array(sig);
-                        b_.CreateBr(nextbb);
-                        b_.SetInsertPoint(nextbb);
-                    }
-                }
-                b_.CreateCall(nba_arr_reset_fn(), {});
-            }
-            // Deferred nonblocking intra-assignment stores that fired this instant:
-            // each site commits its ready records (last fire wins), wakes readers,
-            // and returns the records to its pool.
-            if (!intra_nba_sigs_.empty()) {
-                for (const Signal sig : intra_nba_sigs_) {
-                    emit_intra_commit(sig);
-                }
-            }
-            // Nonblocking event triggers (`->> e`, LRM 15.5.4): for each pending
-            // event, stamp the trigger time and wake its Any-edge waiters, then
-            // clear the flag. Done in the NBA region so the wake lands after this
-            // instant's nonblocking updates; the loop-back to `check` then drains
-            // the woken waiters.
-            for (const Signal sig : nb_event_sigs_) {
-                const auto   i    = static_cast<uint32_t>(sig);
-                auto*        cfn  = b_.GetInsertBlock()->getParent();
-                auto*        fire = llvm::BasicBlock::Create(ctx_, "nbev.fire", cfn);
-                auto*        skip = llvm::BasicBlock::Create(ctx_, "nbev.skip", cfn);
-                llvm::Value* pend = b_.CreateLoad(b_.getInt8Ty(), sym(event_pending_gv_[i]));
-                b_.CreateCondBr(b_.CreateICmpNE(pend, b_.getInt8(0)), fire, skip);
-                b_.SetInsertPoint(fire);
-                b_.CreateStore(b_.getInt8(0), sym(event_pending_gv_[i]));
-                emit_event_fire(sig, wheel); // stamp now + service Any static/dynamic queues
-                b_.CreateBr(skip);
-                b_.SetInsertPoint(skip);
-            }
+            emit_nba_commit(state, wheel);
             b_.CreateBr(check);
         }
 
@@ -7372,10 +7564,17 @@ private:
             auto* rcont     = llvm::BasicBlock::Create(ctx_, "reactive.cont", fn);
             auto* rdone     = llvm::BasicBlock::Create(ctx_, "reactive.done", fn);
             const bool has_re_inactive = re_inactive_gv_ != nullptr; // some #0 in reactive code
+            // Re-NBA (LRM 4.4.2.8), the reactive region set's dual of the NBA
+            // region. Gated on has_nba exactly as nba.check/nba.commit are: a
+            // design that stages no nonblocking updates emits none of it.
+            auto* rncheck   = has_nba ? llvm::BasicBlock::Create(ctx_, "re_nba.check", fn) : rdone;
+            auto* rncommit  = has_nba ? llvm::BasicBlock::Create(ctx_, "re_nba.commit", fn) : nullptr;
             auto* ripromote = has_re_inactive
               ? llvm::BasicBlock::Create(ctx_, "re_inactive.promote", fn) : nullptr;
+            // Falls through to Re-NBA, not straight to done: the batch settling is
+            // what makes the update region the next non-empty one.
             auto* richeck   = has_re_inactive
-              ? llvm::BasicBlock::Create(ctx_, "re_inactive.check", fn) : rdone;
+              ? llvm::BasicBlock::Create(ctx_, "re_inactive.check", fn) : rncheck;
             b_.CreateBr(rcheck);
 
             b_.SetInsertPoint(rcheck);
@@ -7450,7 +7649,7 @@ private:
                 // copy into the front of it -- the inactive.promote shape exactly.
                 b_.SetInsertPoint(richeck);
                 llvm::Value* rn = b_.CreateLoad(i32, sym(re_inactive_top_gv_));
-                b_.CreateCondBr(b_.CreateICmpNE(rn, b_.getInt32(0)), ripromote, rdone);
+                b_.CreateCondBr(b_.CreateICmpNE(rn, b_.getInt32(0)), ripromote, rncheck);
 
                 auto* rphead = llvm::BasicBlock::Create(ctx_, "re_inactive.copy", fn);
                 auto* rpbody = llvm::BasicBlock::Create(ctx_, "re_inactive.copy.body", fn);
@@ -7477,7 +7676,46 @@ private:
                 b_.CreateBr(rcheck);
             }
 
+            if (has_nba) {
+                // Re-NBA (LRM 4.4.2.8). Both reactive queues have settled here, so
+                // anything still staged was staged BY reactive code: the NBA region
+                // ran and drained long before the Observed region pended any of
+                // this. Commit it and re-drain the reactive ring at the SAME
+                // instant -- the Re-Inactive -> Reactive loop one region up, with
+                // the update region in place of the batch.
+                //
+                // Sharing the active region's staging state is safe because the
+                // commit CONSUMES it: the block chain head is nulled before the
+                // chain runs, rt_nba_arr_reset empties the array / aggregate /
+                // queue records, each intra site returns its records to its pool,
+                // and every `->> e` flag is cleared as it fires. So this second
+                // commit of the instant sees only what reactive code staged after
+                // the first, and can neither re-apply an active-region update nor
+                // drop a reactive one.
+                b_.SetInsertPoint(rncheck);
+                b_.CreateCondBr(emit_nba_any_staged(), rncommit, rdone);
+
+                b_.SetInsertPoint(rncommit);
+                emit_nba_commit(state, wheel);
+                b_.CreateBr(rcheck);
+            }
+
             b_.SetInsertPoint(rdone);
+            // LRM 4.4.2's outer loop: the reactive region set can put work back
+            // into the active one -- a Re-NBA commit services wait queues onto the
+            // active ring, and an action block's blocking store does the same --
+            // and the time slot is only over once BOTH sets are empty. Re-settle
+            // instead of falling through, or a process woken from Reactive would
+            // not run until the wheel had advanced, a full time step late.
+            //
+            // Terminates for the same reason the Observed re-settle above does:
+            // every trip through here is counted by the active drain's
+            // oscillation guard, which aborts a design that never converges.
+            auto*        rsettled = llvm::BasicBlock::Create(ctx_, "reactive.settled", fn);
+            llvm::Value* rahd     = b_.CreateLoad(i32, sym(active_head_gv_));
+            llvm::Value* ratl     = b_.CreateLoad(i32, sym(active_tail_gv_));
+            b_.CreateCondBr(b_.CreateICmpNE(rahd, ratl), check, rsettled);
+            b_.SetInsertPoint(rsettled);
         }
         // Postponed region (LRM §21.7): final (`assert final`) deferred assertion
         // reports mature here (LRM 16.4), and the VCD dump samples the current
@@ -11556,7 +11794,6 @@ private:
             block_register(lv.sig, site_const_mask(lv, s), /*dynamic=*/false);
         }
     }
-
 
     // Deferred-buffer index for an aggregate NBA signal: the aggregate buffers
     // follow the array buffers in the shared runtime index space (rt_nba_arr_*).
@@ -17214,6 +17451,20 @@ private:
     // batch can ever be pushed. Decides eagerly, so lower_finish always sees the
     // queue it has to empty, whatever order the bodies lower in.
     bool reactive_has_delay_ = false;
+    // Functions reachable from a program block's `initial`, indexed by FunctionId
+    // (build_program_fns). A suspend inside one is rejected: see the comment there.
+    std::vector<bool> program_fns_;
+    // Whether the body currently lowering is a program block's `initial`. Drives
+    // the region-restoring resume in emit_suspend and the LRM 24.6 implicit
+    // finish; false for everything else, so no other design pays for either.
+    bool in_program_body_ = false;
+    // Whether the body currently lowering is a subroutine a program can reach.
+    bool in_program_fn_ = false;
+    // Number of program `initial` processes, i.e. the initial value of the live
+    // counter the LRM 24.6 implicit finish counts down. Zero when the design has
+    // no program at all, which is what elides the whole mechanism.
+    uint32_t program_proc_count_ = 0;
+    llvm::GlobalVariable* program_live_gv_ = nullptr;
     // Current group's deferred-assertion generation-counter group id (-1 = none);
     // set per group in lower_group. Per-group generation globals, created lazily.
     int32_t                            cur_defer_group_ = -1;

@@ -126,6 +126,15 @@ enum class Activation : uint8_t {
     Observed,
     // Runs once at time zero, then completes (an `initial` block).
     Initial,
+    // An `initial` procedure of a `program` block (LRM 24.3): a one-shot process
+    // like Initial, but seeded onto the reactive ring instead of the active one,
+    // so its body runs in the Reactive region of the time slot rather than the
+    // Active one. That is the whole difference -- a program initial is an
+    // ordinary process with a coroutine frame, not a zero-time thunk, so it may
+    // suspend on `@`, `wait` or a `#delay` and resume. The backend restores the
+    // region on each resume (emit_suspend), because a waker pushes onto the
+    // active ring without knowing the region its sleeper belongs to.
+    Reactive,
     // Re-armed after each run and rerun whenever one of its wait events fires
     // (an `always` block or a continuous `assign`).
     Always,
