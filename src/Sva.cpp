@@ -163,20 +163,44 @@ public:
                 return reject("multiclock sequences are not supported yet", &expr);
             case AssertionExprKind::Binary: {
                 const auto& binary = expr.as<slang::ast::BinaryAssertionExpr>();
-                const bool is_or = binary.op == BinaryAssertionOperator::Or;
-                const bool is_intersect = binary.op == BinaryAssertionOperator::Intersect;
-                if (!is_or && !is_intersect) {
-                    // TODO: and (length-independent conjunction), throughout,
-                    // within (LRM 16.9) -- libsva has no tag for any of them,
-                    // and `throughout` cannot be desugared because its LRM
-                    // definition goes through `[*0:$]`, an empty match.
-                    return reject("this sequence operator is not supported yet", &expr);
+                // `throughout` is the one sequence-layer operator whose left
+                // operand is a boolean rather than a sequence, so it does not
+                // share the shape below.
+                if (binary.op == BinaryAssertionOperator::Throughout) {
+                    return throughout(binary, expr);
+                }
+                // The other four take the same two sequences in the same order,
+                // so the operator only selects which builder runs.
+                decltype(&sva_seq_or) build = nullptr;
+                switch (binary.op) {
+                    case BinaryAssertionOperator::Or:
+                        build = sva_seq_or;
+                        break;
+                    case BinaryAssertionOperator::And:
+                        build = sva_seq_and;
+                        break;
+                    case BinaryAssertionOperator::Intersect:
+                        build = sva_seq_intersect;
+                        break;
+                    case BinaryAssertionOperator::Within:
+                        // `a within b` puts a inside b, so the left operand is
+                        // the inner one. libsva builds this from tags it already
+                        // has rather than as an operator of its own.
+                        build = sva_seq_within;
+                        break;
+                    default:
+                        // Every sequence-layer binary operator of LRM 16.9 is
+                        // handled above, so what lands here is a property-layer
+                        // one that reached a sequence position through
+                        // property()'s fall-through -- `until`, `implies`, or an
+                        // implication nested where a sequence belongs.
+                        return reject("this sequence operator is not supported yet", &expr);
                 }
                 // Both operands are sequences, so this recurses through
-                // sequence() and never through property(): `or` and `intersect`
-                // are sequence-layer operators, and the identically spelled
-                // property-layer `or` is a different node slang builds only
-                // where a property is allowed.
+                // sequence() and never through property(): these are
+                // sequence-layer operators, and the identically spelled
+                // property-layer `and` and `or` are different nodes slang builds
+                // only where a property is allowed.
                 const auto lhs = sequence(binary.left);
                 if (!lhs) {
                     return std::nullopt;
@@ -186,9 +210,7 @@ public:
                     return std::nullopt;
                 }
                 sva_node node = 0;
-                const sva_status status = is_or ? sva_seq_or(&ir_, *lhs, *rhs, &node)
-                                                : sva_seq_intersect(&ir_, *lhs, *rhs, &node);
-                if (status != SVA_OK) {
+                if (build(&ir_, *lhs, *rhs, &node) != SVA_OK) {
                     return reject("out of memory building an assertion sequence", &expr);
                 }
                 return node;
@@ -197,6 +219,43 @@ public:
                 // TODO: first_match (LRM 16.9) -- libsva has no tag for it.
                 return reject("this sequence operator is not supported yet", &expr);
         }
+    }
+
+    // `exp throughout seq` (LRM 16.9). The left operand is a BOOLEAN and not a
+    // sequence -- it is a condition on every cycle the match spans, conjoined
+    // into each state of the right operand's automaton -- and sva_seq_throughout
+    // asserts that rather than reporting it. slang types the operand as an
+    // AssertionExpr all the same, so it is unwrapped back to its Expression and
+    // lowered through boolean(), which is also what puts it in negation normal
+    // form.
+    std::optional<sva_node> throughout(const slang::ast::BinaryAssertionExpr& binary,
+                                       const AssertionExpr& blame) {
+        // Three shapes are not a boolean: a node that is not Simple at all, a
+        // Simple carrying a repetition, and an instance whose body is a
+        // sequence. slang refuses all three itself (ThroughoutLhsInvalid) and
+        // that is the diagnostic a user normally sees, so this is the backstop
+        // that keeps a wrong shape away from a builder which aborts on one.
+        const auto* simple = binary.left.kind == AssertionExprKind::Simple
+                                 ? &binary.left.as<slang::ast::SimpleAssertionExpr>()
+                                 : nullptr;
+        if (simple == nullptr || simple->repetition || as_instance(simple->expr) != nullptr) {
+            return reject("the left operand of `throughout` must be a boolean expression, "
+                          "not a sequence",
+                          &blame);
+        }
+        const auto guard = boolean(simple->expr, false, &blame);
+        if (!guard) {
+            return std::nullopt;
+        }
+        const auto seq = sequence(binary.right);
+        if (!seq) {
+            return std::nullopt;
+        }
+        sva_node node = 0;
+        if (sva_seq_throughout(&ir_, *guard, *seq, &node) != SVA_OK) {
+            return reject("out of memory building an assertion sequence", &blame);
+        }
+        return node;
     }
 
     // `a ##[lo:hi] b ##[lo2:hi2] c ...`. libsva's seq_delay is binary and
@@ -551,6 +610,51 @@ uint32_t read_root(const sva_ir* ir, sva_node node, Result& out) {
     return static_cast<uint32_t>(out.nodes.size() - 1);
 }
 
+// Peel the wrappers that do not change which operator is outermost: an explicit
+// strength, and a named sequence or property, whose body slang has already
+// expanded in place.
+const AssertionExpr& outermost(const AssertionExpr& expr) {
+    if (expr.kind == AssertionExprKind::StrongWeak) {
+        return outermost(expr.as<slang::ast::StrongWeakAssertionExpr>().expr);
+    }
+    if (expr.kind == AssertionExprKind::Simple) {
+        const auto& simple = expr.as<slang::ast::SimpleAssertionExpr>();
+        if (!simple.repetition) {
+            if (const auto* inst = Lowering::as_instance(simple.expr)) {
+                return outermost(inst->body);
+            }
+        }
+    }
+    return expr;
+}
+
+// Whether the consequent of `property` is a sequence `and` at its top level.
+//
+// An `and` runs to the later of its two ends, so it is bounded only when BOTH
+// operands are, while an `intersect` in the same place is bounded as soon as
+// either one is -- an intersection's ends coincide, so the bounded side bounds
+// the pair. That asymmetry is the whole reason `req |=> (ack ##[1:$] done) and
+// rdy` is refused where the same shape under `intersect` is accepted, and no
+// user guesses it from "no bounded longest match" alone.
+//
+// Only a top-level `and` earns the explanation, because there its bound IS the
+// obligation's. Deeper, whatever encloses it sets the bound and naming `and`
+// would point at the wrong operator.
+bool consequent_is_and(const AssertionExpr& property) {
+    const AssertionExpr& top = outermost(property);
+    if (top.kind != AssertionExprKind::Binary) {
+        return false;
+    }
+    const auto& binary = top.as<slang::ast::BinaryAssertionExpr>();
+    if (binary.op != BinaryAssertionOperator::OverlappedImplication &&
+        binary.op != BinaryAssertionOperator::NonOverlappedImplication) {
+        return false;
+    }
+    const AssertionExpr& consequent = outermost(binary.right);
+    return consequent.kind == AssertionExprKind::Binary &&
+           consequent.as<slang::ast::BinaryAssertionExpr>().op == BinaryAssertionOperator::And;
+}
+
 } // namespace
 
 bool available() {
@@ -604,6 +708,13 @@ Result lower(const Request& request) {
             case SVA_ERROR_UNBOUNDED_OBLIGATION:
                 out.error = "the consequent has no bounded longest match, so the number "
                             "of concurrent obligations is unbounded";
+                if (consequent_is_and(*request.property)) {
+                    // The one shape whose rule a user cannot infer from the
+                    // sentence above; see consequent_is_and.
+                    out.error += ": an `and` matches to the later of its two ends, so BOTH "
+                                 "operands need a bounded match -- unlike `intersect`, whose "
+                                 "ends coincide, where one bounded operand bounds the pair";
+                }
                 break;
             case SVA_ERROR_UNSUPPORTED_CONSEQUENT:
                 out.error = "the consequent of an implication is itself an implication";

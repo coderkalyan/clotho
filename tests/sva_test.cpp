@@ -617,7 +617,7 @@ TEST_CASE("sequence operators libsva has no tag for are refused") {
     refuses(R"(
 module t;
   bit clk, a, b, c;
-  ap: assert property (@(posedge clk) (a ##1 b) and (a ##1 c));
+  ap: assert property (@(posedge clk) first_match(a ##[1:2] b) |=> c);
 endmodule
 )", "not supported yet");
 }
@@ -1380,28 +1380,145 @@ endmodule
 )", "no bounded longest match");
 }
 
-TEST_CASE("sequence operators libsva still has no tag for keep their refusal") {
-    // The Binary arm handles `or` and `intersect` and must not have swallowed
-    // the rest: each of these still has to name itself as unsupported rather
-    // than lower to something that merely resembles it.
-    refuses(R"(
+TEST_CASE("throughout lowers its left operand as a boolean, not a sequence") {
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
 module t;
-  bit clk, a, b, c;
-  ap: assert property (@(posedge clk) (a ##1 b) within (c ##1 c ##1 c));
+  bit clk, a, en, b, c;
+  ap: assert property (@(posedge clk) a |=> (en throughout (b ##1 c)));
 endmodule
-)", "not supported yet");
+)", r);
+    REQUIRE(r.ok);
+    REQUIRE(m.monitors.size() == 1);
+    // `en` is conjoined into every state of the right operand's automaton
+    // rather than matching alongside it, so it costs no state and no cycle:
+    // the span is the two cycles of `b ##1 c` alone. Lowering it through
+    // sequence() instead would have added both.
+    CHECK(m.monitors[0].obligation.state_count == 2);
+    CHECK(m.monitors[0].depth == 2);
+}
 
-    refuses(R"(
+TEST_CASE("sequence and spans to the later of its two ends") {
+    // `depth` is the obligation's longest match, so an `and` over operands of
+    // different lengths shows directly which end the pair takes.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
 module t;
-  bit clk, a, b, c;
-  ap: assert property (@(posedge clk) (a throughout (b ##1 c)) |=> c);
+  bit clk, a, b, c, d;
+  ap: assert property (@(posedge clk) a |=> ((b ##1 c) and d));
 endmodule
-)", "not supported yet");
+)", r);
+    REQUIRE(r.ok);
+    REQUIRE(m.monitors.size() == 1);
+    CHECK(m.monitors[0].depth == 2);
 
+    LowerResult       longer;
+    const ir::Module& n = lower_for_monitor(R"(
+module t;
+  bit clk, a, b, c, d, e;
+  ap: assert property (@(posedge clk) a |=> ((b ##1 c ##1 e) and d));
+endmodule
+)", longer);
+    REQUIRE(longer.ok);
+    REQUIRE(n.monitors.size() == 1);
+    // Three cycles against one: the pair takes the longer side. tests/sva/
+    // diff_and.sv holds the other half of this, that the trailing cycles are
+    // really waited for and not merely counted.
+    CHECK(n.monitors[0].depth == 3);
+}
+
+TEST_CASE("within lowers to its padded intersection") {
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, a, b, c, d, e;
+  ap: assert property (@(posedge clk) a |=> ((b ##1 c) within (d ##3 e)));
+endmodule
+)", r);
+    REQUIRE(r.ok);
+    REQUIRE(m.monitors.size() == 1);
+    // libsva builds `(true ##[0:$] inner ##[0:$] true) intersect outer`. The
+    // padding is unbounded on both sides, so it is the intersection that bounds
+    // the pair, at outer's four cycles.
+    CHECK(m.monitors[0].depth == 4);
+}
+
+TEST_CASE("the left operand of throughout must be a boolean") {
+    // sva_seq_throughout takes a BOOLEAN node there and asserts it rather than
+    // reporting it, so a sequence must never reach the builder. slang refuses
+    // every spelling itself (ThroughoutLhsInvalid), which is the diagnostic a
+    // user sees; clotho's own guard behind it is unreachable through source
+    // today. This pins that SOMETHING refuses each of them before a node exists.
     refuses(R"(
 module t;
   bit clk, a, b, c;
-  ap: assert property (@(posedge clk) first_match(a ##[1:2] b) |=> c);
+  ap: assert property (@(posedge clk) ((a ##1 b) throughout (c ##1 c)) |=> c);
 endmodule
-)", "not supported yet");
+)", "must be a simple expression");
+
+    // A repetition makes the operand a sequence too...
+    refuses(R"(
+module t;
+  bit clk, a, b, c;
+  ap: assert property (@(posedge clk) (a[*2] throughout (b ##1 c)) |=> c);
+endmodule
+)", "must be a simple expression");
+
+    // ...and so does a named sequence, which is the other way a compound
+    // operand could reach the builder now that named sequences expand inline.
+    refuses(R"(
+module t;
+  bit clk, a, b, c;
+  sequence s;
+    a ##1 b;
+  endsequence
+  ap: assert property (@(posedge clk) (s throughout (b ##1 c)) |=> c);
+endmodule
+)", "must be a simple expression");
+}
+
+TEST_CASE("an unbounded and in a consequent names the and/intersect asymmetry") {
+    // Identical operands under the two operators, so only the operator differs.
+    //
+    // `and` runs to the later of its two ends, so ONE unbounded operand leaves
+    // the pair unbounded and the obligation untrackable. A user told only "no
+    // bounded longest match" would not guess that is the whole problem, so the
+    // refusal spells the rule out.
+    const LowerResult bad = lower_text(R"(
+module t;
+  bit clk, req, ack, done, rdy, go;
+  ap: assert property (@(posedge clk) req |=> ((ack ##[1:$] done) and (rdy ##[1:2] go)));
+endmodule
+)");
+    CHECK_FALSE(bad.ok);
+    const std::string text = bad.diagnostic_text();
+    CHECK(text.find("no bounded longest match") != std::string::npos);
+    CHECK_MESSAGE(text.find("BOTH operands need a bounded match") != std::string::npos,
+                  "the and/intersect asymmetry is unguessable, so it has to be named: ", text);
+
+    // The other half, and the reason the message has to name it: an
+    // intersection's ends COINCIDE, so the bounded operand bounds the pair and
+    // the very same shape is accepted.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, req, ack, done, rdy, go;
+  ap: assert property (@(posedge clk) req |=> ((ack ##[1:$] done) intersect (rdy ##[1:2] go)));
+endmodule
+)", r);
+    REQUIRE(r.ok);
+    REQUIRE(m.monitors.size() == 1);
+    // Three cycles, from the bounded side alone.
+    CHECK(m.monitors[0].depth == 3);
+
+    // ...and nothing else picked up the explanation on the way past: an
+    // unbounded consequent with no `and` in it keeps the plain refusal.
+    const LowerResult plain = lower_text(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> b[->2]);
+endmodule
+)");
+    CHECK_FALSE(plain.ok);
+    CHECK(plain.diagnostic_text().find("BOTH operands") == std::string::npos);
 }
