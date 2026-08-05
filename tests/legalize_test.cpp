@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <array>
 #include <string>
 #include <string_view>
 
@@ -305,4 +306,90 @@ TEST_CASE("a rejected process leaves its signals unclassified") {
     const auto* e = t.find("q");
     REQUIRE(e != nullptr);
     CHECK(e->kind == legalize::StorageKind::Unclassified);
+}
+
+// --- M3: the reset corpus -------------------------------------------------
+//
+// 28 cases run against yosys 0.67+92 (proc; opt_expr; opt_dff; opt_clean), whose
+// verdict is recorded per row. An empty `yosys` field means yosys HARD-ERRORED on
+// input Clotho classifies -- six of the twenty-eight:
+//
+//   R04  reset nested under an enable      R24  the same under always_ff
+//   R13  `if (rst || rst2)`                R25  partial reset
+//   R19  reset nested in the reset arm     R25c partial reset outside the branch
+//
+// yosys needs the reset test to be the sole outermost switch; pin-and-fold does
+// not care where it sits, which is the entire reason for the design. On the
+// twenty-two yosys does accept, Clotho agrees on every one.
+
+namespace {
+
+struct ResetCase {
+    std::string_view      file;
+    legalize::StorageKind kind;
+    bool                  async_reset;
+    // What yosys built, for the record. Empty means yosys rejected the input.
+    std::string_view yosys;
+};
+
+// Every row's `kind`/`async_reset` is what Clotho must produce. Where `yosys` is
+// empty, yosys hard-errored on input Clotho accepts.
+constexpr ResetCase kResetCases[] = {
+    { "R01_classic_negedge", legalize::StorageKind::Flop, true, "$adff" },
+    { "R02_classic_posedge", legalize::StorageKind::Flop, true, "$adff" },
+    { "R03_polarity_mismatch", legalize::StorageKind::AsyncLoad, false, "$aldff" },
+    { "R04_rst_under_en", legalize::StorageKind::Flop, true, "" },
+    { "R05_en_under_rst", legalize::StorageKind::Flop, true, "$adffe" },
+    { "R06_two_arst_same", legalize::StorageKind::Flop, true, "$adff" },
+    { "R07_two_arst_diff", legalize::StorageKind::Flop, true, "$dffsr" },
+    { "R08_set_and_reset", legalize::StorageKind::Flop, true, "$dffsr" },
+    { "R09_nonconst_rstval", legalize::StorageKind::AsyncLoad, false, "$aldff" },
+    { "R11_reset_to_x", legalize::StorageKind::Flop, true, "$adff" },
+    { "R13_ord_reset", legalize::StorageKind::Flop, true, "" },
+    { "R14_self_assign_rst", legalize::StorageKind::Flop, false, "$dffe" },
+    { "R15_rst_as_data", legalize::StorageKind::Flop, true, "$adff" },
+    { "R16_sync_only", legalize::StorageKind::Flop, false, "$sdff" },
+    { "R17_sync_and_async", legalize::StorageKind::Flop, true, "$adff" },
+    { "R20_concat_rstval", legalize::StorageKind::Flop, true, "$adff" },
+    { "R23_derived_wire_rst", legalize::StorageKind::Flop, true, "$adff" },
+    { "R26_tilde_not", legalize::StorageKind::Flop, true, "$adff" },
+    { "R27_param_rstval", legalize::StorageKind::Flop, true, "$adff" },
+    { "R28_two_sigs_diff_rv", legalize::StorageKind::Flop, true, "$adff" },
+    { "R29_inv_mismatch", legalize::StorageKind::AsyncLoad, false, "$aldff" },
+    { "R30_rst_then_en_seq", legalize::StorageKind::Flop, true, "$adffe" },
+    { "R19_nested_in_rstarm", legalize::StorageKind::Flop, true, "" },
+    // Pinning rst leaves `if (en) q<=0; else q<=a`, so the edge DOES assign -- with
+    // a mux value. AsyncLoad describes that; yosys rejects it by complaining about
+    // the sensitivity list, which is not where the problem is.
+    { "R22_rst_expr", legalize::StorageKind::AsyncLoad, false, "" },
+    { "R24_alwaysff_under_en", legalize::StorageKind::Flop, true, "" },
+    { "R25_partial_reset", legalize::StorageKind::Flop, true, "" },
+    { "R25b_partial_inside_else", legalize::StorageKind::Flop, true, "$adff" },
+    { "R25c_partial_outside", legalize::StorageKind::Flop, true, "" },
+};
+
+} // namespace
+
+TEST_CASE("the reset corpus classifies") {
+    for (const ResetCase& c : kResetCases) {
+        CAPTURE(c.file);
+        const std::string path = std::string(CLOTHO_TEST_DIR) + "/legalize/reset/" + std::string(c.file) + ".sv";
+        const std::array<std::string_view, 1> paths{ path };
+        const LowerResult                     lowered = lower_files(paths);
+        REQUIRE(lowered.ok);
+        const legalize::Result r = legalize::run(*lowered.module, nullptr);
+        REQUIRE(r.processes.size() >= 1);
+
+        const legalize::SignalStores* q = nullptr;
+        for (const legalize::ProcessResult& p : r.processes) {
+            for (const legalize::SignalStores& e : p.signals) {
+                if (lowered.module->signal(e.signal).name == "q") {
+                    q = &e;
+                }
+            }
+        }
+        REQUIRE(q != nullptr);
+        CHECK(q->kind == c.kind);
+        CHECK(q->async_reset == c.async_reset);
+    }
 }

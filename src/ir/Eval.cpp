@@ -240,9 +240,12 @@ EvalValue Eval::compute(Index i) {
             return { a.bits & mask, mask & m, to.width };
         }
 
-        // Short-circuit `&&` / `||`. Only the taken arm is evaluated, so a known
-        // predicate lets the whole thing fold; an unknown one cannot, because the
-        // arms may disagree.
+        // Short-circuit `&&` / `||`. A known predicate takes its arm; an unknown
+        // one still folds when both arms AGREE, which is the same absorption Bor
+        // and Lor do one level down. `rst || rst2` with rst2 pinned is exactly
+        // this: the taken arm computes `rst | 1` and the other is the literal 1,
+        // so the result is 1 without knowing rst. Without it the classic
+        // multi-reset idiom cannot be folded at all.
         case Inst::Tag::SelectLazy: {
             const auto info = ir_.extra_data<SelectLazy>(p.op_extra.extra);
             switch (truth_of(value(p.op_extra.op))) {
@@ -252,6 +255,14 @@ EvalValue Eval::compute(Index i) {
                     return value(info.else_val);
                 case Tri::Unknown:
                     break;
+            }
+            const EvalValue t = value(info.then_val);
+            const EvalValue e = value(info.else_val);
+            // Only the truth matters to every consumer of a lazy select, so
+            // agreement is compared on the 1-bit verdict rather than the bits.
+            const Tri tt = truth_of(t);
+            if (tt != Tri::Unknown && tt == truth_of(e)) {
+                return tt == Tri::True ? EvalValue::known(1, 1) : EvalValue::known(0, 1);
             }
 
             return EvalValue::unknown(1);

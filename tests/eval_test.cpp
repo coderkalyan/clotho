@@ -161,3 +161,21 @@ TEST_CASE("a value the evaluator cannot see is unknown, not wrong") {
     CHECK(pinned_truth(d, "rst", 1) == ir::Tri::Unknown);
     CHECK(pinned_truth(d, "rst", 0) == ir::Tri::Unknown);
 }
+
+// `rst || rst2` short-circuits into a select_lazy whose arms live in REGIONS. With
+// rst2 pinned the taken arm computes `rst | 1` and the other is the literal 1, so
+// the result is 1 without knowing rst. The bor/lor absorption above is not enough:
+// it never runs, because the operands are behind the lazy select. R13 in the reset
+// corpus is exactly this shape and cannot be classified without it.
+TEST_CASE("a lazy select folds when both arms agree") {
+    const Design d = lower(R"(
+        module m(input clk, input rst, input rst2, input [7:0] a, output reg [7:0] q);
+          always @(posedge clk or posedge rst or posedge rst2)
+            if (rst || rst2) q <= 8'h00; else q <= a;
+        endmodule
+    )");
+    // Either reset pinned proves the guard, though neither appears alone in the
+    // arm that computes it.
+    CHECK(pinned_truth(d, "rst2", 1) == ir::Tri::True);
+    CHECK(pinned_truth(d, "rst", 1) == ir::Tri::True);
+}

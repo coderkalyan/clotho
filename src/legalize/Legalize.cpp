@@ -275,8 +275,33 @@ bool is_constant(const ir::Ir& ir, ir::Index value) {
     while (ir.tag(v) == ir::Inst::Tag::Resize) {
         v = ir.payload(v).unary;
     }
+    // A concatenation of constants is a constant: `{4'ha, 4'h5}` is an ordinary
+    // reset value, and the corpus has one.
+    if (ir.tag(v) == ir::Inst::Tag::Concat) {
+        bool all = true;
+        ir.for_each_operand(v, [&](ir::Index op) { all = all && is_constant(ir, op); });
+
+        return all;
+    }
 
     return ir.tag(v) == ir::Inst::Tag::Constant;
+}
+
+// Does `value` read exactly the signal being assigned? `if (rst) q <= q` does not
+// reset anything: the edge assigns q its own value, so q is a plain flop whose
+// clock enable excludes the reset. Reporting it as an async load of q by q would
+// be true and useless.
+bool is_self(const ir::Ir& ir, ir::Index value, ir::Signal target) {
+    ir::Index v = value;
+    while (ir.tag(v) == ir::Inst::Tag::Resize) {
+        v = ir.payload(v).unary;
+    }
+    if (ir.tag(v) != ir::Inst::Tag::Load) {
+        return false;
+    }
+    const ir::Index src = ir.payload(v).unary;
+
+    return ir.tag(src) == ir::Inst::Tag::Signal && ir.payload(src).signal == target;
 }
 
 // The edge triggers of a process, if any. A level-sensitive list yields none,
@@ -304,6 +329,26 @@ bool cone_reads(const ir::Ir& ir, ir::Index root, ir::Signal t, ankerl::unordere
     }
     if (ir.tag(root) == ir::Inst::Tag::Signal && ir.payload(root).signal == t) {
         return true;
+    }
+    // A lazy select holds its branch values in REGIONS, and regions are not
+    // operands. `if (rst || rst2)` short-circuits into one of these, so without
+    // this the second reset is invisible in the guard and counts as a free
+    // trigger -- which made the clock ambiguous and classified nothing.
+    if (ir.tag(root) == ir::Inst::Tag::SelectLazy) {
+        const auto sl = ir.extra_data<ir::SelectLazy>(ir.payload(root).op_extra.extra);
+        for (const ir::Index i : ir.region(sl.then_)) {
+            if (cone_reads(ir, i, t, seen)) {
+                return true;
+            }
+        }
+        for (const ir::Index i : ir.region(sl.else_)) {
+            if (cone_reads(ir, i, t, seen)) {
+                return true;
+            }
+        }
+        if (cone_reads(ir, sl.then_val, t, seen) || cone_reads(ir, sl.else_val, t, seen)) {
+            return true;
+        }
     }
 
     bool found = false;
@@ -398,8 +443,13 @@ Result run(const ir::Module& module, const ir::DesignFacts* /*facts*/, Options o
                     // Every surviving store constant, and the signal assigned on
                     // every path: an async reset. Non-constant: an async load.
                     bool all_const = true;
+                    bool all_self  = true;
                     for (const GuardedStore& st : rs.stores) {
                         all_const = all_const && is_constant(ir, st.value);
+                        all_self  = all_self && is_self(ir, st.value, rs.signal);
+                    }
+                    if (all_self) {
+                        continue; // the edge does not change this signal
                     }
                     if (rs.has_hold) {
                         continue; // the trigger does not settle this signal

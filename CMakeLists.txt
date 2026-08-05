@@ -339,6 +339,10 @@ add_executable(clotho_test
   tests/system_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho clotho_ir clotho_legalize doctest::doctest clotho_warnings)
+# The reset corpus is 28 readable .sv files rather than embedded strings: they are
+# a reference to be read and extended, and they are the same files run against
+# yosys.
+target_compile_definitions(clotho_test PRIVATE CLOTHO_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests")
 
 # Export the test executable's dynamic symbols so DPI-C imports defined in the
 # test TUs (extern "C") resolve through the JIT's process-symbol generator
