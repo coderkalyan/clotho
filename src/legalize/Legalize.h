@@ -103,6 +103,24 @@ struct Note {
 // Every assignment to one signal within one process, in program order. Program
 // order is priority order for the mux fold: the LAST matching assignment wins, so
 // the tree is built from the end backwards.
+// What one written signal becomes. M3 settles the KIND; the full decomposition
+// (async list, sync reset, enable, next-state cone) is M5.
+enum class StorageKind : uint8_t {
+    // Level-sensitive and assigned on every path.
+    Comb,
+    // Level-sensitive and NOT assigned on every path: it holds.
+    Latch,
+    // Edge-triggered. `async_reset` says whether a non-clock trigger drives it to
+    // a constant.
+    Flop,
+    // Edge-triggered, but a non-clock trigger drives it to a NON-constant value.
+    // No standard primitive does this; it is reported, not built. (yosys invents
+    // $aldff and warns; YosysHQ advise against it.)
+    AsyncLoad,
+    // The process was rejected, or no clock could be identified.
+    Unclassified,
+};
+
 struct SignalStores {
     ir::Signal                signal = ir::Signal{};
     std::vector<GuardedStore> stores;
@@ -110,6 +128,12 @@ struct SignalStores {
     // latch inference and it is structural -- an `if` with no `else` leaves an
     // empty region, and that region is right there in the IR.
     bool has_hold = false;
+
+    StorageKind kind = StorageKind::Unclassified;
+    // The trigger that appears in no guard. Valid when kind is Flop or AsyncLoad.
+    ir::Signal clock = ir::Signal{};
+    // True when some non-clock trigger drives this signal to a constant.
+    bool async_reset = false;
 };
 
 struct ProcessResult {

@@ -74,7 +74,7 @@ Run run(std::string_view src, legalize::Options o = {}) {
 
 std::string wrap(std::string_view body) {
     std::string s = "module m(input clk, input rst, input en, input sel, input [1:0] s2,\n"
-                    "         input [7:0] a, input [7:0] b, output reg [7:0] q, output reg [7:0] r);\n  ";
+                    "         input rst_n, input [7:0] a, input [7:0] b, output reg [7:0] q, output reg [7:0] r);\n  ";
     s += body;
     s += "\nendmodule\n";
     return s;
@@ -212,4 +212,97 @@ TEST_CASE("a rejected process still reports the stores it understood") {
 TEST_CASE("arithmetic, selects and comparisons are synthesizable") {
     const Run t = run(wrap("always @* q = ((a + b) & 8'h0F) | (a[3:0] > b[3:0] ? 8'h80 : 8'h00);"));
     CHECK(t.all_synthesizable());
+}
+
+// --- M3: classification ---------------------------------------------------
+
+TEST_CASE("a clocked block with no reset is a flop") {
+    const Run   t = run(wrap("always @(posedge clk) q <= a;"));
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::Flop);
+    CHECK_FALSE(e->async_reset);
+}
+
+TEST_CASE("an async reset is a flop with a constant residue") {
+    const Run   t = run(wrap("always @(posedge clk or posedge rst) if (rst) q <= 8'h00; else q <= a;"));
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::Flop);
+    CHECK(e->async_reset);
+}
+
+TEST_CASE("an active-low async reset classifies the same way") {
+    const Run   t = run(wrap("always @(posedge clk or negedge rst_n) if (!rst_n) q <= 8'h00; else q <= a;"));
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::Flop);
+    CHECK(e->async_reset);
+}
+
+// R04 from the reset corpus: the reset test is NOT the sole outermost switch.
+// yosys hard-errors on this shape because its peeler requires the reset to be
+// outermost; pin-and-fold does not care where it sits, because pinning rst makes
+// both arms of `en` assign the same constant.
+TEST_CASE("a reset nested under an enable still classifies") {
+    const Run   t = run(wrap("always @(posedge clk or posedge rst)\n"
+                             "  if (en) begin if (rst) q <= 8'h00; else q <= a; end\n"
+                             "  else if (rst) q <= 8'h00; else q <= b;"));
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::Flop);
+    CHECK(e->async_reset);
+}
+
+// A reset that only fires when an enable is high is not a reset: with `en` low the
+// rst edge assigns nothing and the signal holds. No primitive gates a reset pin,
+// so this must NOT be promoted -- the conservative direction.
+TEST_CASE("a reset that only fires under an enable is not a reset") {
+    const Run t = run(wrap("always @(posedge clk or posedge rst) if (en) begin if (rst) q <= 8'h00; else q <= a; end"));
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK_FALSE(e->async_reset);
+}
+
+// R09: a non-constant on the async edge is a load, not a reset. No standard
+// primitive does this, so it is reported rather than built.
+TEST_CASE("a non-constant async value is an async load") {
+    const Run   t = run(R"(
+        module m(input clk, input rst, input [7:0] a, input [7:0] iv, output reg [7:0] q);
+          always @(posedge clk or posedge rst) if (rst) q <= iv; else q <= a;
+        endmodule
+    )");
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::AsyncLoad);
+}
+
+// R22: `if (rst && en)` is not implied by the posedge rst trigger -- with en low
+// the block still fires on rst and assigns a. Rejected, and the residue says why.
+TEST_CASE("a reset guarded by an unrelated enable is not a reset") {
+    const Run   t = run(wrap("always @(posedge clk or posedge rst) if (rst && en) q <= 8'h00; else q <= a;"));
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK_FALSE(e->async_reset);
+}
+
+TEST_CASE("a level-sensitive complete block is combinational") {
+    const Run   t = run(wrap("always @* q = a;"));
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::Comb);
+}
+
+TEST_CASE("a level-sensitive incomplete block is a latch") {
+    const Run   t = run(wrap("always @* if (en) q = a;"));
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::Latch);
+}
+
+TEST_CASE("a rejected process leaves its signals unclassified") {
+    const Run   t = run(wrap("always @(posedge clk) begin q <= a; $display(\"x\"); end"));
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::Unclassified);
 }
