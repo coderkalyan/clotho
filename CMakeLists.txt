@@ -301,6 +301,7 @@ add_executable(clotho_test
   tests/case_pragma_test.cpp
   tests/eval_test.cpp
   tests/legalize_test.cpp
+  tests/perf_legalize_test.cpp
   tests/gate_test.cpp
   tests/net_resolution_test.cpp
   tests/llvm_backend_test.cpp
