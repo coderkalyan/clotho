@@ -373,6 +373,8 @@ const char* tag_name(Inst::Tag tag) {
             return "fdisplay";
         case T::StrobePend:
             return "strobe_pend";
+        case T::ReactivePend:
+            return "reactive_pend";
         case T::MonitorSet:
             return "monitor_set";
         case T::MonitorEmit:
@@ -715,7 +717,7 @@ private:
                         << info.kind;
                     break;
                 }
-                if (tag == Inst::Tag::StrobePend) {
+                if (tag == Inst::Tag::StrobePend || tag == Inst::Tag::ReactivePend) {
                     const auto info = ir_.extra_data<StrobePendInfo>(p.extra);
                     os_ << "fn" << static_cast<uint32_t>(info.func);
                     break;
@@ -1020,6 +1022,9 @@ void print_module(const Module& m, std::ostream& os, const LocResolver& resolve)
                 break;
             case Activation::Preponed:
                 os << "preponed";
+                break;
+            case Activation::Observed:
+                os << "observed";
                 break;
             case Activation::Initial:
                 os << "initial";

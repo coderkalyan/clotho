@@ -107,6 +107,23 @@ enum class Activation : uint8_t {
     // in the previous Postponed region -- this is that, done where clotho can
     // observe it, and it touches no design net.
     Preponed,
+    // Runs at each settled point of a time step -- after the Active / Inactive /
+    // NBA set has drained, before the Reactive region (LRM 4.4.2.5 Observed).
+    // Only compiler-synthesized: the region exists "for evaluation of property
+    // expressions when they are triggered", which is where a concurrent
+    // assertion's monitor steps its automaton. Pass/fail code is NOT run here --
+    // 4.4.2.5 requires it to be scheduled into the Reactive region of the same
+    // time slot, which is what Inst::Tag::ReactivePend does.
+    //
+    // Emitted like Preponed and for the same reason: the backend runs it
+    // explicitly (emit_observed_run), so it is filtered out of the seed and
+    // subscribe loops and its wait_events are never consulted. A body detects
+    // its own clocking event from the values Preponed sampled, per LRM 16.5.
+    //
+    // Unlike Preponed, its stores are ordinary design writes that generate
+    // events, so an Observed body can wake an Active process; the drain returns
+    // to the active region when that happens (see emit_active_run).
+    Observed,
     // Runs once at time zero, then completes (an `initial` block).
     Initial,
     // Re-armed after each run and rerun whenever one of its wait events fires

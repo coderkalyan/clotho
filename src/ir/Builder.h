@@ -303,6 +303,11 @@ public:
     // zero-formal deferred-print task `func` to run once in the Postponed
     // region of the current time step. A statement, never a value.
     Index strobe_pend(FunctionId func, SourceLoc loc);
+    // Schedule `func`, a zero-formal action-block task, into the Reactive region
+    // of the current time slot (LRM 4.4.2.5). Emitted from an Observed-region
+    // body, which evaluates the property but may not run its pass/fail code
+    // itself. A statement, never a value.
+    Index reactive_pend(FunctionId func, SourceLoc loc);
     // $monitor / $fmonitor (LRM 21.2.2): register `func` as the single active
     // monitor body (replacing any prior one), enabled, running each subsequent
     // time step in the Postponed region. A statement.

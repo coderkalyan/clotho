@@ -228,12 +228,13 @@ size_t activation_count(const ir::Module& m, ir::Activation want) {
     return n;
 }
 
-// The one Always process a monitor contributes. A design that is nothing but an
-// assertion has no other: no continuous assign, no always block, no port copy.
+// The one Observed process a monitor contributes. A design that is nothing but
+// an assertion has no other: nothing else clotho emits runs in Observed, so the
+// region holds exactly the monitors.
 const ir::Process& monitor_process(const ir::Module& m) {
     const ir::Process* found = nullptr;
     for (const ir::Process& p : m.processes()) {
-        if (p.activation == ir::Activation::Always) {
+        if (p.activation == ir::Activation::Observed) {
             REQUIRE(found == nullptr);
             found = &p;
         }
@@ -271,8 +272,10 @@ TEST_CASE("a nonoverlapping implication emits a monitor process and its state") 
 
     REQUIRE(m.monitors.size() == 1);
     const ir::Process& p = monitor_process(m);
-    // One cycle is one clock edge, and nothing else may step the monitor -- not
-    // even time zero, which is why it does not self-start.
+    // One cycle is one clock edge. An Observed process is resumed once per time
+    // slot rather than woken by an event, so the wait list records which event
+    // delimits the cycle while the body detects the edge itself; nothing else may
+    // step the monitor -- not even time zero, which is why it does not self-start.
     REQUIRE(p.wait_events.size() == 1);
     CHECK(p.wait_events[0].signal == m.monitors[0].clock);
     CHECK(p.wait_events[0].edge == ir::Edge::Positive);
@@ -348,7 +351,7 @@ endmodule
     // Named by position in the monitor table, so two assertions cannot collide.
     CHECK(find_signal(m, "sva.0.pend0") != nullptr);
     CHECK(find_signal(m, "sva.1.pend0") != nullptr);
-    CHECK(activation_count(m, ir::Activation::Always) == 2);
+    CHECK(activation_count(m, ir::Activation::Observed) == 2);
     // Both assertions sample the same two variables, and a shadow is shared.
     size_t shadows = 0;
     for (const ir::SignalInfo& s : m.signals()) {
@@ -392,11 +395,11 @@ endmodule
 )", cov);
     CHECK(cov.ok);
 
-    // A cover has no failure verdict (LRM 16.12.6): it tallies matches and emits
-    // no report at all.
+    // A cover has no failure verdict (LRM 16.12.6): it tallies matches, and with
+    // no action block it schedules nothing into the Reactive region at all.
     CHECK(find_signal(cm, "sva.0.cov") != nullptr);
     CHECK(state_width(cm, "sva.0.cov") == 32);
-    CHECK_FALSE(has_tag(monitor_process(cm), ir::Inst::Tag::Severity));
+    CHECK_FALSE(has_tag(monitor_process(cm), ir::Inst::Tag::ReactivePend));
 
     LowerResult       as;
     const ir::Module& am = lower_for_monitor(R"(
@@ -407,7 +410,52 @@ endmodule
 )", as);
     CHECK(as.ok);
     CHECK(find_signal(am, "sva.0.cov") == nullptr);
-    CHECK(has_tag(monitor_process(am), ir::Inst::Tag::Severity));
+    // The default failure report is the implicit fail action (LRM 16.14.1), so it
+    // takes the same route as a written one: pended into Reactive, never inline.
+    CHECK(has_tag(monitor_process(am), ir::Inst::Tag::ReactivePend));
+    CHECK_FALSE(has_tag(monitor_process(am), ir::Inst::Tag::Severity));
+}
+
+TEST_CASE("an assertion action block becomes reactive-region code") {
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> b) else $error("custom fail msg");
+endmodule
+)", r);
+    CHECK(r.ok);
+
+    // LRM 4.4.2.5: a property is evaluated in Observed and the pass / fail code it
+    // triggers is scheduled into Reactive. The monitor is the Observed half.
+    const ir::Process& p = monitor_process(m);
+    CHECK(p.activation == ir::Activation::Observed);
+
+    // Still one step per clock edge, but the edge is now detected against the
+    // monitor's own one-slot clock history rather than by a sensitivity list.
+    CHECK(state_width(m, "sva.0.clk") == 1);
+
+    // The action is scheduled, never run inline: its $error lives in the
+    // synthesized task, so the monitor body itself reports nothing.
+    CHECK(has_tag(p, ir::Inst::Tag::ReactivePend));
+    CHECK_FALSE(has_tag(p, ir::Inst::Tag::Severity));
+}
+
+TEST_CASE("a cover property runs its pass action on a match") {
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, a, b;
+  cp: cover property (@(posedge clk) a ##1 b) $display("hit");
+endmodule
+)", r);
+    CHECK(r.ok);
+
+    // A cover's action block is its match action (LRM 16.12.6). It still tallies,
+    // and the action is pended exactly like an assert's -- which is what orders
+    // the print after the same edge's Active-region output instead of racing it.
+    CHECK(find_signal(m, "sva.0.cov") != nullptr);
+    CHECK(has_tag(monitor_process(m), ir::Inst::Tag::ReactivePend));
 }
 
 // -- Loud refusals ----------------------------------------------------------
@@ -456,13 +504,58 @@ endmodule
 )", "explicit clocking event");
 }
 
-TEST_CASE("an action block is refused until the Reactive region exists") {
+TEST_CASE("a nonblocking assignment in an action block is refused, naming Re-NBA") {
+    // The action is pended into Reactive as a thunk, so an NBA scheduled from it
+    // would have to commit in the Re-NBA region (LRM 4.4.2.8), which clotho has
+    // not built.
+    refuses(R"(
+module t;
+  bit clk, a, b, flag;
+  ap: assert property (@(posedge clk) a |=> b) else flag <= 1;
+endmodule
+)", "Re-NBA");
+}
+
+TEST_CASE("a nonzero delay in an action block is refused, but a #0 is not") {
+    // Reactive code may suspend only where a reactive region can resume it. LRM
+    // 4.4.2.7 gives `#0` Re-Inactive, which promotes back into Reactive at the
+    // same instant; `#5` would come back through the wheel, which pushes onto the
+    // Active ring. So the gate is on the amount being zero, not on it being a
+    // delay -- the two must not be conflated.
     refuses(R"(
 module t;
   bit clk, a, b;
-  ap: assert property (@(posedge clk) a |=> b) else $error("boom");
+  ap: assert property (@(posedge clk) a |=> b) else #5 $error("late");
 endmodule
-)", "action blocks are not supported");
+)", "a nonzero delay in an assertion action block");
+
+    // A run-time amount is refused for the same reason: it is not provably zero.
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  int d;
+  ap: assert property (@(posedge clk) a |=> b) else #d $error("late");
+endmodule
+)", "a nonzero delay in an assertion action block");
+
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> b) else #0 $error("late");
+endmodule
+)", r);
+    CHECK(r.ok);
+    CHECK(has_tag(monitor_process(m), ir::Inst::Tag::ReactivePend));
+}
+
+TEST_CASE("an event control in an action block is refused") {
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> b) else @(posedge clk) $error("late");
+endmodule
+)", "an event control in an assertion action block");
 }
 
 TEST_CASE("property operators libsva has no tag for are refused") {

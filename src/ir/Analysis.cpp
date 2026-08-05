@@ -132,8 +132,10 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::StoreNbDelay:
         case Inst::Tag::StoreInertialDelay:
         case Inst::Tag::StoreNbEvent:
-        // $strobe's pending record is likewise anchored on the coroutine.
+        // $strobe's pending record is likewise anchored on the coroutine, and a
+        // reactive pend ramps its action block through that same record ABI.
         case Inst::Tag::StrobePend:
+        case Inst::Tag::ReactivePend:
             return blocks;
 
         // -- Everything else: neither pure nor thunk-blocking. --
@@ -556,6 +558,9 @@ struct Structural {
                 }
                 case Inst::Tag::StrobePend:
                     uses.strobe = true;
+                    break;
+                case Inst::Tag::ReactivePend:
+                    uses.reactive = true;
                     break;
                 case Inst::Tag::MonitorSet:
                     uses.monitor = true;
@@ -1235,6 +1240,7 @@ struct ValueSweep {
                 case Inst::Tag::Display:
                 case Inst::Tag::FDisplay:
                 case Inst::Tag::StrobePend:
+                case Inst::Tag::ReactivePend:
                 case Inst::Tag::MonitorSet:
                 case Inst::Tag::MonitorEmit:
                 case Inst::Tag::MonitorOn:

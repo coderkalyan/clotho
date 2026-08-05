@@ -587,6 +587,10 @@ Index Builder::strobe_pend(FunctionId func, SourceLoc loc) {
     return emit({ Inst::Tag::StrobePend, pay(&Inst::Payload::extra, add_extra(StrobePendInfo{ func })) }, loc);
 }
 
+Index Builder::reactive_pend(FunctionId func, SourceLoc loc) {
+    return emit({ Inst::Tag::ReactivePend, pay(&Inst::Payload::extra, add_extra(StrobePendInfo{ func })) }, loc);
+}
+
 Index Builder::monitor_set(FunctionId func, SourceLoc loc) {
     return emit({ Inst::Tag::MonitorSet, pay(&Inst::Payload::extra, add_extra(StrobePendInfo{ func })) }, loc);
 }

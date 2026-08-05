@@ -572,10 +572,14 @@ struct CaseViolInfo {
     uint32_t kind;
 };
 
-// Extra payload for `strobe_pend`: the deferred-print task to run at the end
-// of the current time step (see Inst::Tag::StrobePend).
+// Extra payload naming a compiler-synthesized zero-formal task that some
+// instruction defers into a later region: the print body of `strobe_pend`
+// (Postponed) and `monitor_set` (LRM 21.2.2), and the action block of
+// `reactive_pend` (Reactive, LRM 4.4.2.5). One FunctionId with one meaning, so
+// the three share a payload rather than declare identical structs.
 struct StrobePendInfo {
-    // The synthesized zero-formal task holding the format args + Display.
+    // The synthesized zero-formal task: a $strobe / $monitor format-args body,
+    // or a concurrent assertion's action block.
     FunctionId func;
 };
 
@@ -1453,6 +1457,19 @@ struct Inst {
         // coroutine (see is_simple_always) so its call site can ramp `func`'s
         // coroutine frame through the task-call record ABI.
         StrobePend,
+        // Schedule the compiler-synthesized zero-formal task `func` (payload:
+        // extra -> StrobePendInfo) into the Reactive region of the current time
+        // slot. LRM 4.4.2.5: "During property evaluation, pass/fail code shall
+        // be scheduled in the Reactive region of the current time slot" -- so
+        // this is how an Observed-region monitor hands the action block of its
+        // verdict (LRM 4.4.2.6) to the one region allowed to run it.
+        //
+        // `func` is ramped per execution, never once: an assertion can fail on
+        // any number of clock ticks and each failure needs its own frame. A
+        // process containing this tag is forced to a coroutine (see
+        // is_simple_always) so its call site can ramp `func` through the
+        // task-call record ABI, exactly as StrobePend is.
+        ReactivePend,
         // $monitor / $fmonitor (LRM 21.2.2): register the zero-formal monitor body
         // `func` as the single active monitor (payload: extra -> StrobePendInfo).
         // The backend stores its ramp function pointer; the Postponed-region drain
@@ -1962,6 +1979,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::CaseViol:
         case T::TestPlusArgs:
         case T::StrobePend:
+        case T::ReactivePend:
         case T::MonitorSet:
             return K::Extra;
         case T::MonitorEmit:
@@ -2067,9 +2085,10 @@ constexpr ExtraOperandShape extra_operand_shape(Inst::Tag tag) {
         case T::Loop:
         // fork: the children are FunctionIds, not operands.
         case T::Fork:
-        // strobe_pend / monitor_set: the target is a FunctionId; the deferred
-        // body re-evaluates its own args.
+        // strobe_pend / monitor_set / reactive_pend: the target is a FunctionId;
+        // the deferred body re-evaluates its own args.
         case T::StrobePend:
+        case T::ReactivePend:
         case T::MonitorSet:
         // finish / case_viol / test_plusargs: banner / query bytes only.
         case T::Finish:

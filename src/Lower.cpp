@@ -609,6 +609,158 @@ struct LocalRefDetector : ASTVisitor<LocalRefDetector, VisitFlags::AllGood> {
     }
 };
 
+// Detects everything an assertion action block may not contain, for
+// Lowerer::require_reactive_safe. File scope rather than a local struct: the
+// statement whitelist below has to be a member template, and a local class may
+// not have one ([temp.mem]).
+struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::AllGood> {
+    // Why a construct cannot appear in reactive code. Every rejection names one,
+    // because "not supported" alone does not tell the reader which region is
+    // missing and therefore what would have to be built.
+    static constexpr std::string_view kReNba =
+      "it would have to commit in the Re-NBA region (LRM 4.4.2.8), which clotho has not built";
+    static constexpr std::string_view kWrongRegion =
+      "every path that would wake it -- the timer wheel, a static subscription, a join "
+      "record -- pushes onto the Active ring, so the body would resume in the wrong region";
+
+    // The enclosing scope, for constant-folding a delay amount.
+    const Scope* scope = nullptr;
+    // The first offending construct, empty while the walk stays clean.
+    std::string reason;
+
+    void reject(std::string_view what, std::string_view why) {
+        if (reason.empty()) {
+            reason = std::string(what)
+                     .append(" in an assertion action block is not supported: ")
+                     .append(why);
+        }
+    }
+
+    // True for a `#0` whose amount folds to a literal zero. LRM 4.4.2.7 makes that
+    // legal in reactive code: it parks in Re-Inactive and is promoted back into
+    // Reactive at the same instant, so it consumes no time and stays in the region
+    // set the action block belongs to. Gated on the amount being zero rather than
+    // on the construct being a delay, so `#5` and a run-time amount still fail --
+    // both would resume through the wheel, which pushes onto the Active ring.
+    bool is_zero_delay(const TimingControl& tc) const {
+        if (tc.kind != TimingControlKind::Delay) {
+            return false;
+        }
+        slang::ast::ASTContext     actx(*scope, slang::ast::LookupLocation::max);
+        slang::ast::EvalContext    ectx(actx);
+        const slang::ConstantValue cv = tc.as<DelayControl>().expr.eval(ectx);
+        if (!cv.isInteger()) {
+            return false;
+        }
+        const auto v = cv.integer().as<uint64_t>();
+
+        return v.has_value() && *v == 0;
+    }
+
+    // Templated on the concrete leaf type rather than taking a plain
+    // `const Statement&`: slang's visitDefault only descends from a final class,
+    // so a base-typed parameter could not continue the walk.
+    template<std::derived_from<Statement> T>
+    void handle(const T& s) {
+        switch (s.kind) {
+            // Zero-time and side-effect-local: control flow, blocking assignment,
+            // and the display / severity calls an action block is written with.
+            case StatementKind::Empty:
+            case StatementKind::List:
+            case StatementKind::Conditional:
+            case StatementKind::Case:
+            case StatementKind::PatternCase:
+            case StatementKind::ExpressionStatement:
+            case StatementKind::VariableDeclaration:
+            case StatementKind::Break:
+            case StatementKind::Continue:
+            case StatementKind::ForLoop:
+            case StatementKind::RepeatLoop:
+            case StatementKind::ForeachLoop:
+            case StatementKind::WhileLoop:
+            case StatementKind::DoWhileLoop:
+            case StatementKind::ProceduralAssign:
+            case StatementKind::ProceduralDeassign:
+                break;
+            case StatementKind::Block:
+                // A `fork` spawns processes that outlive the thunk.
+                if (s.template as<BlockStatement>().blockKind != StatementBlockKind::Sequential) {
+                    reject("a fork", kWrongRegion);
+                }
+                break;
+            case StatementKind::ImmediateAssertion:
+                if (s.template as<ImmediateAssertionStatement>().isDeferred) {
+                    reject("a deferred immediate assertion",
+                           "it matures in the Observed region, which reactive code is already "
+                           "past, so the report would never be flushed");
+                }
+                break;
+            case StatementKind::Timed: {
+                const TimingControl& tc = s.template as<TimedStatement>().timing;
+                if (tc.kind != TimingControlKind::Delay) {
+                    reject("an event control", kWrongRegion);
+                } else if (!is_zero_delay(tc)) {
+                    reject("a nonzero delay", kWrongRegion);
+                }
+                break;
+            }
+            case StatementKind::Wait:
+            case StatementKind::WaitOrder:
+            case StatementKind::WaitFork:
+                reject("a wait", kWrongRegion);
+                break;
+            case StatementKind::ForeverLoop:
+                reject("a forever loop",
+                       "it never returns, and a reactive body is resumed once and must run to "
+                       "completion");
+                break;
+            case StatementKind::EventTrigger:
+                reject("an event trigger", kWrongRegion);
+                break;
+            case StatementKind::Disable:
+            case StatementKind::DisableFork:
+                reject("a disable", kWrongRegion);
+                break;
+            default:
+                reject("this statement",
+                       "clotho cannot prove it is zero-time, and reactive code must be");
+                break;
+        }
+        visitDefault(s);
+    }
+
+    void handle(const AssignmentExpression& a) {
+        if (a.isNonBlocking()) {
+            reject("a nonblocking assignment", kReNba);
+        } else if (a.timingControl != nullptr) {
+            // Even `= #0`: the relaxation above is for a bare `#0` statement, whose
+            // suspension the Re-Inactive batch is built to catch. An intra-assign
+            // delay suspends inside the assignment's own record instead.
+            reject("an intra-assignment delay", kWrongRegion);
+        }
+        visitDefault(a);
+    }
+
+    void handle(const CallExpression& c) {
+        // A system task ($display / $error / ...) is zero-time by construction. A
+        // user task is not -- it may hold a delay, and clotho does not trace the
+        // body to find out. A user *function* needs no check at all: LRM 13.4.4
+        // forbids a timing control in one, so calling it cannot consume time.
+        if (c.subroutine.index() == 0 &&
+            std::get<0>(c.subroutine)->subroutineKind == SubroutineKind::Task) {
+            reject("a task call",
+                   "clotho does not trace the body, so it cannot prove the call consumes no "
+                   "time");
+        }
+        // Arguments only, rather than visitDefault: a call's other child nodes are
+        // the `with` constraint block of a randomize(), which is declarative and
+        // holds no statement this walk has anything to say about.
+        for (const Expression* arg : c.arguments()) {
+            arg->visit(*this);
+        }
+    }
+};
+
 // Walks the elaborated AST of one top module into an ir::Module.
 class Lowerer {
 public:
@@ -5984,17 +6136,24 @@ private:
                 fail("only concurrent assert / assume / cover property are supported");
         }
 
-        // Action blocks run in the Reactive region (LRM 4.4.2.6), which clotho does
-        // not have yet. The trailing `;` of an action-less assertion binds as an
-        // Empty statement rather than as nothing, so an empty action is no action
-        // -- slang draws the same distinction in its own `restrict` check.
-        // TODO: assertion action blocks need the Reactive region; until then only
-        // the default failure report is available.
+        // Action blocks run in the Reactive region (LRM 4.4.2.6). The monitor
+        // itself is an Observed process, and LRM 4.4.2.5 is explicit that a
+        // property evaluated in Observed schedules its pass/fail code into
+        // Reactive -- so each action becomes a zero-formal task that the verdict
+        // pends (build_action_body / emit_action_pends). The trailing `;` of an
+        // action-less assertion binds as an Empty statement rather than as
+        // nothing, so an empty action is no action -- slang draws the same
+        // distinction in its own `restrict` check.
         const auto is_action = [](const Statement* action) {
             return action != nullptr && action->kind != StatementKind::Empty;
         };
-        if (is_action(a.ifTrue) || is_action(a.ifFalse)) {
-            fail("assertion action blocks are not supported yet");
+        const AssertionActions actions{ .pass = is_action(a.ifTrue) ? a.ifTrue : nullptr,
+                                        .fail = is_action(a.ifFalse) ? a.ifFalse : nullptr };
+        if (actions.pass != nullptr) {
+            require_reactive_safe(*actions.pass);
+        }
+        if (actions.fail != nullptr) {
+            require_reactive_safe(*actions.fail);
         }
 
         // Peel the clocking wrapper. A property with no clocking event would need
@@ -6070,8 +6229,108 @@ private:
         // so `monitor.roots` stays empty: it indexes instructions of a body the
         // monitor would own, and there is none -- the roots are ordinary values
         // inside the process emitted here.
-        emit_monitor(lowered, monitor, static_cast<uint32_t>(module_.monitors.size()));
+        emit_monitor(lowered, monitor, static_cast<uint32_t>(module_.monitors.size()), actions);
         module_.monitors.push_back(std::move(monitor));
+    }
+
+    // The action blocks of one concurrent assertion (LRM 16.14), as slang
+    // statements. Either may be absent. An absent fail action still reports: the
+    // default failure message is the implicit fail action, so it takes the same
+    // Reactive-region path rather than being emitted inline in the monitor.
+    struct AssertionActions {
+        const Statement* pass = nullptr;
+        const Statement* fail = nullptr;
+    };
+
+    // An action block is pended into the Reactive region as a thunk (LRM 4.4.2.5)
+    // and the drain resumes it exactly once. That makes zero-time-ness a
+    // correctness requirement rather than a style rule: a nonblocking assignment
+    // scheduled from Reactive would need Re-NBA (LRM 4.4.2.8) to commit in, and
+    // anything that suspends would resume through a wake path that pushes onto
+    // the Active ring. A bare `#0` is the one suspension that is fine: LRM 4.4.2.7
+    // parks it in Re-Inactive and promotes it back into Reactive at the same
+    // instant, which the backend implements.
+    //
+    // Whitelisted, not blacklisted. A statement kind not positively known to be
+    // zero-time is refused -- the project forbids silently accepting a construct
+    // that is not correctly lowered, and "the walker did not recognize it" is no
+    // evidence that it is safe.
+    void require_reactive_safe(const Statement& action) {
+        ReactiveSafetyChecker checker;
+        // Needed to constant-fold a delay amount, to tell `#0` from `#5`.
+        checker.scope = scope_;
+        action.visit(checker);
+        if (!checker.reason.empty()) {
+            // TODO: lifting the nonblocking-assignment case needs Re-NBA, which
+            // needs the NBA commit machinery factored out of the Active drain
+            // first (concurrent-assertions.md 3.5).
+            fail(checker.reason);
+        }
+    }
+
+    // Lower one action block into a synthetic zero-formal task, the same shape as
+    // build_fork_child: a fresh, empty FnCtx, run in the *parent's* scope context
+    // (scope_ / prefix_ / time_mul_ unchanged) so the body's references to the
+    // enclosing module's signals still resolve. It takes no formals because there
+    // is nothing to pass -- the verdict that pends it is the whole input.
+    ir::FunctionId build_action_body(const Statement& body, std::string_view name) {
+        const ir::FunctionId id = module_.reserve_function();
+
+        FnCtx ctx;
+        ctx.name_prefix = std::string(name) + ".";
+        ctx.is_task     = true;
+        FnCtx* saved    = fn_ctx_;
+        fn_ctx_         = &ctx;
+        std::vector<std::string_view> saved_blocks;
+        saved_blocks.swap(named_blocks_);
+
+        ir::Builder b(module_.pool);
+        lower_stmt(body, b);
+        const ir::SourceLoc el = loc(body);
+        b.ret_void(el);
+
+        module_.set_function(id,
+                             ir::Function{ .name        = std::string(name),
+                                           .return_type = module_.pool.void_type,
+                                           .param_types = {},
+                                           .arg_dirs    = {},
+                                           .local_types = std::move(ctx.local_types),
+                                           .is_task     = true,
+                                           .ir          = b.finish() });
+        named_blocks_.swap(saved_blocks);
+        fn_ctx_ = saved;
+        return id;
+    }
+
+    // The default failure report, as the same kind of zero-formal task an explicit
+    // `else` becomes. An assertion with no action block still has a fail action --
+    // this is it -- so both take one path into the Reactive region and the report
+    // keeps its LRM 4.4.2.6 ordering against a user-written one.
+    //
+    // The severity is immediate (defer = 0) where the inline report used to be
+    // deferred. Deferring bought glitch suppression (LRM 16.4.2) against a monitor
+    // that could step several times in one time slot; an Observed process runs
+    // exactly once per slot, so there is no second evaluation left to glitch
+    // against, and a deferred report queued from Reactive would be flushing into
+    // an Observed queue this slot has already drained.
+    ir::FunctionId build_default_fail_body(const ir::AssertionMonitor& mon) {
+        const ir::FunctionId id = module_.reserve_function();
+        const ir::SourceLoc  l  = mon.span.start;
+
+        ir::Builder b(module_.pool);
+        b.severity(
+          static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
+        b.ret_void(l);
+
+        module_.set_function(id,
+                             ir::Function{ .name        = "sva.fail",
+                                           .return_type = module_.pool.void_type,
+                                           .param_types = {},
+                                           .arg_dirs    = {},
+                                           .local_types = {},
+                                           .is_task     = true,
+                                           .ir          = b.finish() });
+        return id;
     }
 
     // -- The monitor step, as ordinary IR ------------------------------------
@@ -6105,6 +6364,11 @@ private:
         ir::Signal occupied{ 0 };
         // Match tally, for `cover property`.
         ir::Signal covered{ 0 };
+        // The clock's value at the previous Observed evaluation. An Observed
+        // process is resumed once per time slot rather than woken by a net event,
+        // so the monitor detects its own clocking edge and needs one slot of
+        // clock history to do it.
+        ir::Signal clkprev{ 0 };
     };
 
     // A hidden monitor state signal, powering up to 0. Two-state throughout: a
@@ -6146,6 +6410,7 @@ private:
             // its signedness from the target type).
             st.covered = new_monitor_state(base + "cov", mask_type(32), l);
         }
+        st.clkprev = new_monitor_state(base + "clk", mask_type(1), l);
 
         return st;
     }
@@ -6217,18 +6482,28 @@ private:
         return mask_any(b.binary(ir::Inst::Tag::Band, mask, slot_mask(bit, width, b, l), l), b, l);
     }
 
-    // Store `value`, or zero when the assertion is disabled. LRM 16.15's reset is
-    // emitted_step's early return; as a select on every store it needs no branch
-    // and keeps the step straight-line.
+    // Store `value`, or hold, or reset. Three outcomes rather than two, because
+    // the monitor runs every time slot now that it lives in Observed: no clocking
+    // edge is not a cycle at all, so the state keeps what it holds; an edge with
+    // the assertion disabled is LRM 16.15's reset (emitted_step's early return);
+    // an edge with it enabled is the step. Selects rather than branches, so the
+    // step stays straight-line.
+    //
+    // `active` already has the edge folded into it, so whenever the outer select
+    // takes `value` the inner one is testing the enable alone.
     void store_gated(ir::Signal    sig,
                      ir::Index     value,
                      ir::Index     active,
+                     ir::Index     edge,
                      uint32_t      width,
                      ir::Builder&  b,
                      ir::SourceLoc l) {
         b.binary(ir::Inst::Tag::Store,
                  b.signal(sig, l),
-                 b.select(active, value, zero_mask(width, b, l), l),
+                 b.select(edge,
+                          b.select(active, value, zero_mask(width, b, l), l),
+                          load_signal(sig, b, l),
+                          l),
                  l);
     }
 
@@ -6419,7 +6694,10 @@ private:
     // libsva's own reference. Two things are expressed differently because a code
     // generator has no run-time loop: a reset is a select on every store rather
     // than an early return, and the free-slot search is unrolled.
-    void emit_monitor(const sva::Result& lowered, const ir::AssertionMonitor& mon, uint32_t id) {
+    void emit_monitor(const sva::Result&          lowered,
+                      const ir::AssertionMonitor& mon,
+                      uint32_t                    id,
+                      const AssertionActions&     act) {
         switch (mon.kind) {
             case ir::AssertionKind::Assert:
             case ir::AssertionKind::Assume:
@@ -6440,6 +6718,20 @@ private:
         const ir::SourceLoc l  = mon.span.start;
         ir::Builder         b(module_.pool);
 
+        // The action blocks, as zero-formal tasks the verdicts below pend into the
+        // Reactive region. A cover has only a match action (LRM 16.12.6, and slang
+        // rejects `cover ... else`); an assert / assume always has a fail action,
+        // because with no `else` the default report is the implicit one.
+        std::optional<ir::FunctionId> pass_body;
+        std::optional<ir::FunctionId> fail_body;
+        if (act.pass != nullptr) {
+            pass_body = build_action_body(*act.pass, "sva.pass");
+        }
+        if (mon.kind != ir::AssertionKind::Cover) {
+            fail_body = act.fail != nullptr ? build_action_body(*act.fail, "sva.fail")
+                                            : build_default_fail_body(mon);
+        }
+
         // Roots, one definite bit each. Every one reads the Preponed shadows of
         // the variables it names except the disable-iff condition, which LRM 16.15
         // deliberately does not sample (concurrent-assertions.md 5.4).
@@ -6448,7 +6740,27 @@ private:
         for (uint32_t r = 0; r < lowered.root_index.size(); ++r) {
             roots.push_back(eval_root(lowered, lowered.root_index[r], r != mon.reset_root, b, l));
         }
-        const ir::Index active = bit_not(roots[mon.reset_root], b, l);
+        // The disable condition (LRM 16.15), and the clocking edge. The monitor
+        // runs in the Observed region, which resumes every process it holds once
+        // per time slot rather than subscribing them to net events (LlvmBackend's
+        // emit_observed_run), so the edge is detected here instead of by a
+        // sensitivity list: this slot's clock against the value it held at the
+        // previous slot's Observed point. Taking it at the settled point is what
+        // makes the monitor step once per cycle however many deltas the clock's
+        // own driver needed to settle.
+        const ir::Index clk_now =
+          b.resize(load_signal(mon.clock, b, l), module_.pool.bit_type, l);
+        const ir::Index clk_was = load_signal(st.clkprev, b, l);
+        const ir::Index edge =
+          mon.edge == ir::Edge::Positive
+            ? b.binary(ir::Inst::Tag::Band, clk_now, bit_not(clk_was, b, l), l)
+            : b.binary(ir::Inst::Tag::Band, clk_was, bit_not(clk_now, b, l), l);
+        // Ungated by the disable condition: clock history has to keep advancing
+        // while the assertion is disabled, or re-enabling would see a stale edge.
+        b.binary(ir::Inst::Tag::Store, b.signal(st.clkprev, l), clk_now, l);
+
+        const ir::Index active =
+          b.binary(ir::Inst::Tag::Band, bit_not(roots[mon.reset_root], b, l), edge, l);
 
         const uint32_t  obl   = mon.obligation.state_count;
         const ir::Index sat_o = automaton_satisfy(mon, mon.obligation, roots, b, l);
@@ -6467,7 +6779,7 @@ private:
             const ir::Index done = b.binary(
               ir::Inst::Tag::Band, next, b.constant(mask_const(mon.trigger.last, trig), l), l);
             fires = mask_any(done, b, l);
-            store_gated(st.trigger, next, active, trig, b, l);
+            store_gated(st.trigger, next, active, edge, trig, b, l);
         }
 
         // Advance every occupied slot. An unoccupied slot already holds 0 (a match
@@ -6513,7 +6825,7 @@ private:
         }
 
         if (mon.has_trigger) {
-            store_gated(st.fired, fires, active, 1, b, l);
+            store_gated(st.fired, fires, active, edge, 1, b, l);
         }
 
         // Verdicts. Seeding before taking them is not incidental: under `|->` a
@@ -6545,9 +6857,9 @@ private:
             remaining  = b.binary(ir::Inst::Tag::Bor, remaining, still, l);
         }
 
-        store_gated(st.occupied, remaining, active, mon.depth, b, l);
+        store_gated(st.occupied, remaining, active, edge, mon.depth, b, l);
         for (uint32_t k = 0; k < mon.depth; ++k) {
-            store_gated(st.pending[k], pending[k], active, obl, b, l);
+            store_gated(st.pending[k], pending[k], active, edge, obl, b, l);
         }
 
         if (mon.kind == ir::AssertionKind::Cover) {
@@ -6557,13 +6869,23 @@ private:
             for (uint32_t k = 0; k < mon.depth; ++k) {
                 count = b.binary(ir::Inst::Tag::Add, count, b.resize(matched[k], mask_type(32), l), l);
             }
-            store_gated(st.covered, count, active, 32, b, l);
+            store_gated(st.covered, count, active, edge, 32, b, l);
         } else {
-            emit_monitor_reports(mon, failed, active, b, l);
+            emit_action_pends(failed, *fail_body, active, /*unlikely=*/true, b, l);
+        }
+        if (pass_body.has_value()) {
+            // A cover's action block runs on a match (LRM 16.12.6) and an assert's
+            // pass action on a pass (LRM 16.14.6) -- the same verdict bit either
+            // way, so the same pend.
+            emit_action_pends(matched, *pass_body, active, /*unlikely=*/false, b, l);
         }
 
         module_.add_process(
-          ir::Process{ .activation  = ir::Activation::Always,
+          ir::Process{ .activation = ir::Activation::Observed,
+                       // Not a subscription: an Observed process is resumed once
+                       // per time slot, never woken by a net event. Kept as the
+                       // record of which event delimits this monitor's cycle --
+                       // it is what the edge detection above is derived from.
                        .wait_events = { ir::WaitEvent{ .signal = mon.clock, .edge = mon.edge } },
                        .self_start  = false,
                        .span        = mon.span,
@@ -6571,31 +6893,33 @@ private:
                        .scope       = cur_scope_id() });
 
         if (mon.strength == ir::AssertionStrength::Strong) {
-            emit_monitor_finish(mon, st);
+            emit_monitor_finish(mon, st, act);
         }
     }
 
-    // One report per failing attempt: two attempts can fail in the same cycle and
-    // each is its own assertion failure. Deferred (defer = 1) so it matures in the
-    // Observed region through the existing deferred-immediate path, which is also
-    // what gives it the per-generation glitch suppression of LRM 16.4.2.
-    void emit_monitor_reports(const ir::AssertionMonitor&   mon,
-                              const std::vector<ir::Index>& failed,
-                              ir::Index                     active,
-                              ir::Builder&                  b,
-                              ir::SourceLoc                 l) {
-        for (const ir::Index bad : failed) {
-            const ir::Index report = b.binary(ir::Inst::Tag::Band, active, bad, l);
+    // One pend per verdict bit: two attempts can resolve in the same cycle and
+    // each is its own action-block execution (LRM 16.14.1). The body is scheduled
+    // into the Reactive region rather than run here, because this monitor is an
+    // Observed process and LRM 4.4.2.5 puts an assertion's pass/fail code in
+    // Reactive -- which is also what orders a report after the same edge's Active
+    // region $display, rather than racing it.
+    void emit_action_pends(const std::vector<ir::Index>& verdict,
+                           ir::FunctionId                body,
+                           ir::Index                     active,
+                           bool                          unlikely,
+                           ir::Builder&                  b,
+                           ir::SourceLoc                 l) {
+        for (const ir::Index bit : verdict) {
+            const ir::Index take = b.binary(ir::Inst::Tag::Band, active, bit, l);
 
             b.open_region();
-            b.severity(
-              static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 1);
+            b.reactive_pend(body, l);
             const ir::ExtraSlice then_region = b.close_region();
 
             b.open_region();
             const ir::ExtraSlice else_region = b.close_region();
 
-            b.cond(report, then_region, else_region, l, /*unlikely=*/true);
+            b.cond(take, then_region, else_region, l, unlikely);
         }
     }
 
@@ -6603,8 +6927,15 @@ private:
     // never completed holds, so it reports nothing; a strong one is a failure. The
     // state teardown emitted_finish also does is dropped: a Final process runs
     // after every other process has settled and nothing reads the state again.
-    // Not deferred -- there is no later region left for a report to mature in.
-    void emit_monitor_finish(const ir::AssertionMonitor& mon, const MonitorState& st) {
+    //
+    // The fail action runs here too, but lowered inline rather than pended: Final
+    // is past the last time slot's Reactive drain, so a pend would queue a body
+    // that nothing will ever resume -- exactly the silent drop the project forbids.
+    // Inlining is sound precisely because require_reactive_safe proved the action
+    // zero-time, so it needs no coroutine of its own.
+    void emit_monitor_finish(const ir::AssertionMonitor& mon,
+                             const MonitorState&         st,
+                             const AssertionActions&     act) {
         const ir::SourceLoc l = mon.span.start;
         ir::Builder         b(module_.pool);
 
@@ -6613,8 +6944,12 @@ private:
             const ir::Index held = mask_bit(occupied, k, mon.depth, b, l);
 
             b.open_region();
-            b.severity(
-              static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
+            if (act.fail != nullptr) {
+                lower_stmt(*act.fail, b);
+            } else {
+                b.severity(
+                  static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
+            }
             const ir::ExtraSlice then_region = b.close_region();
 
             b.open_region();

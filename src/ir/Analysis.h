@@ -148,6 +148,9 @@ struct DesignUses {
     bool strobe   = false; // StrobePend, in processes or functions
     bool monitor  = false; // MonitorSet, in processes or functions
     bool observed = false; // CaseViol, in processes or functions
+    // ReactivePend, in processes or functions. Gates the reactive region set --
+    // its queues, its drain blocks, and the Observed run that feeds it.
+    bool reactive = false;
     // Severity with defer set. PROCESSES ONLY, unlike its three siblings: a
     // deferred assertion inside a called function or task is rejected in the
     // frontend, so a process scan already covers every case.
