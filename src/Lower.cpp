@@ -35,6 +35,7 @@
 #include <slang/ast/expressions/SelectExpressions.h>
 #include <slang/ast/statements/ConditionalStatements.h>
 #include <slang/ast/statements/LoopStatements.h>
+#include <slang/ast/expressions/AssertionExpr.h>
 #include <slang/ast/statements/MiscStatements.h>
 #include <slang/ast/symbols/AttributeSymbol.h>
 #include <slang/ast/symbols/BlockSymbols.h>
@@ -63,6 +64,7 @@
 #include <slang/util/SmallVector.h>
 
 #include "SourceMap.h"
+#include "Sva.h"
 #include "ir/Builder.h"
 #include "runtime/Format.h"
 
@@ -5718,6 +5720,10 @@ private:
             case StatementKind::ProceduralDeassign:
                 lower_proc_deassign(stmt.as<ProceduralDeassignStatement>(), b);
                 break;
+            case StatementKind::ConcurrentAssertion:
+                lower_concurrent_assertion(stmt.as<slang::ast::ConcurrentAssertionStatement>(),
+                                           b);
+                break;
             case StatementKind::Disable:
             case StatementKind::DisableFork:
                 // TODO: disable — unwinding a suspended task coroutine and clearing
@@ -5904,6 +5910,132 @@ private:
         const ir::ExtraSlice else_region = b.close_region();
 
         b.cond(pred, then_region, else_region, loc(a));
+    }
+
+    // -- Concurrent assertions (LRM 16) --------------------------------------
+    //
+    // `assert property (@(posedge clk) disable iff (rst) a |=> b);`
+    //
+    // slang hands the whole thing over as one bound AssertionExpr with the
+    // clocking event outermost and the disable condition just inside it (see
+    // AssertionExpr::bind), so both wrappers are peeled here before the temporal
+    // part goes to libsva. A module-item assertion arrives the same way: slang
+    // wraps it in a ProceduralBlockSymbol(Always, isFromAssertion), so it reaches
+    // this through lower_procedural_block -> lower_forever -> lower_stmt.
+    //
+    // What comes back is an ir::AssertionMonitor: two automata over interned
+    // guard cubes, plus the obligation tracking a property needs. See
+    // docs/design/concurrent-assertions.md.
+    void lower_concurrent_assertion(const slang::ast::ConcurrentAssertionStatement& a,
+                                    ir::Builder&) {
+        using AK = slang::ast::AssertionKind;
+        using AEK = slang::ast::AssertionExprKind;
+
+        ir::AssertionKind kind;
+        switch (a.assertionKind) {
+            case AK::Assert:
+                kind = ir::AssertionKind::Assert;
+                break;
+            case AK::Assume:
+                kind = ir::AssertionKind::Assume;
+                break;
+            case AK::CoverProperty:
+                kind = ir::AssertionKind::Cover;
+                break;
+            default:
+                // TODO: concurrent `restrict` is formal-only, `expect` is a
+                // blocking statement needing the reactive region set, and
+                // `cover sequence` counts matches rather than attempts
+                // (LRM 16.5, 16.17).
+                fail("only concurrent assert / assume / cover property are supported");
+        }
+
+        // Action blocks run in the Reactive region (LRM 4.4.2.6), which clotho does
+        // not have yet. The trailing `;` of an action-less assertion binds as an
+        // Empty statement rather than as nothing, so an empty action is no action
+        // -- slang draws the same distinction in its own `restrict` check.
+        // TODO: assertion action blocks need the Reactive region; until then only
+        // the default failure report is available.
+        const auto is_action = [](const Statement* action) {
+            return action != nullptr && action->kind != StatementKind::Empty;
+        };
+        if (is_action(a.ifTrue) || is_action(a.ifFalse)) {
+            fail("assertion action blocks are not supported yet");
+        }
+
+        // Peel the clocking wrapper. A property with no clocking event would need
+        // LRM 16.14.6 inference from the enclosing procedure.
+        const slang::ast::AssertionExpr* body = &a.propertySpec;
+        const TimingControl* clocking = nullptr;
+        if (body->kind == AEK::Clocking) {
+            const auto& wrapper = body->as<slang::ast::ClockingAssertionExpr>();
+            clocking = &wrapper.clocking;
+            body = &wrapper.expr;
+        }
+        if (clocking == nullptr) {
+            // TODO: inferred clocking (LRM 16.14.6) -- slang already computes it
+            // via AnalyzedProcedure::getInferredClock(), which clotho does not
+            // read yet.
+            fail("a concurrent assertion needs an explicit clocking event");
+        }
+        if (clocking->kind != TimingControlKind::SignalEvent) {
+            // TODO: multiclock assertions (LRM 16.13).
+            fail("only a single-signal clocking event is supported");
+        }
+        const auto& event = clocking->as<SignalEventControl>();
+        if (event.iffCondition != nullptr) {
+            // TODO: `@(posedge clk iff cond)` as an assertion clock.
+            fail("an `iff` qualifier on an assertion clock is not supported");
+        }
+        if (event.edge != slang::ast::EdgeKind::PosEdge &&
+            event.edge != slang::ast::EdgeKind::NegEdge) {
+            // A level-sensitive or both-edge assertion clock does not delimit
+            // cycles the way the automaton assumes.
+            // TODO: `edge` and level-sensitive assertion clocks.
+            fail("an assertion clock must be a posedge or a negedge");
+        }
+
+        // Peel the disable condition. LRM 16.15: it is deliberately NOT sampled,
+        // so it is evaluated from live values while every other root reads the
+        // sampled shadow.
+        const Expression* disable = nullptr;
+        if (body->kind == AEK::DisableIff) {
+            const auto& wrapper = body->as<slang::ast::DisableIffAssertionExpr>();
+            disable = &wrapper.condition;
+            body = &wrapper.expr;
+        }
+
+        const sva::Request request{
+            .property = body,
+            .disable = disable,
+            .kind = kind,
+        };
+        sva::Result lowered = sva::lower(request);
+        if (!lowered.ok) {
+            // A libsva rejection is a property of the source, so it is reported
+            // against the offending sub-expression when one is named.
+            slang::SourceRange where = a.sourceRange;
+            if (lowered.blame != nullptr && lowered.blame->syntax != nullptr) {
+                where = lowered.blame->syntax->sourceRange();
+            }
+            cur_range_ = where;
+            fail(std::move(lowered.error));
+        }
+
+        ir::AssertionMonitor& monitor = lowered.monitor;
+        monitor.clock = event_signal(event.expr);
+        monitor.edge = event.edge == slang::ast::EdgeKind::PosEdge ? ir::Edge::Positive
+                                                                  : ir::Edge::Negative;
+        monitor.span = to_source_span(a.sourceRange);
+        monitor.banner = banner_at(a.sourceRange.start());
+
+        // TODO: the monitor is lowered but not yet emitted -- the sampled shadow
+        // pass, the Observed-region monitor process, and the automaton step
+        // codegen are the remaining phases (concurrent-assertions.md 10). Until
+        // they land, accepting the assertion silently would violate the project's rules, so
+        // the tables are recorded for the tests and the construct still fails.
+        module_.monitors.push_back(std::move(monitor));
+        fail("concurrent assertions are lowered but not yet code-generated");
     }
 
     void lower_immediate_assertion(const ImmediateAssertionStatement& a, ir::Builder& b) {

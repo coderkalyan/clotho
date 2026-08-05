@@ -156,6 +156,102 @@ struct Process {
     uint32_t scope = no_scope;
 };
 
+
+// -- Concurrent assertions (LRM 16) ------------------------------------------
+//
+// A compiled concurrent assertion, as plain data. The front-end builds an SVA IR
+// through libsva's C API, lowers it to a monitor, and copies the tables out into
+// this; the backend reads only this. libsva therefore links into the front-end
+// alone -- nothing here depends on it, and no libsva code runs in a simulated
+// process. See docs/design/concurrent-assertions.md.
+//
+// Every mask below is a bit set over automaton states, least-significant bit of
+// word zero first, `words` words per row. The backend materializes a row as one
+// arbitrary-precision LLVM constant, so `words` is a transport detail rather than
+// a codegen one.
+
+// What to do with a verdict. Mirrors libsva's sva_kind, checked at the boundary.
+enum class AssertionKind : uint8_t { Assert, Assume, Cover, Restrict };
+
+// What a still-pending attempt does when the trace ends (LRM 16.12.2).
+enum class AssertionStrength : uint8_t { Weak, Strong };
+
+// One conjunct of a guard: an index into AssertionMonitor::roots, possibly
+// complemented. Clotho's own lowering never sets `negated` -- SVA booleans are
+// three-valued, so negation lives in the atom (concurrent-assertions.md 5.3) --
+// but the field is what libsva reports, so it is carried faithfully.
+struct AssertionLiteral {
+    uint32_t root = 0;
+    bool negated = false;
+};
+
+// A guard cube: the conjunction of literals[start .. start + len). An empty cube
+// is `true`.
+struct AssertionCube {
+    uint32_t start = 0;
+    uint32_t len = 0;
+};
+
+// One automaton: a Glushkov position automaton. One state per letter occurrence,
+// no epsilon transitions, and homogeneous -- every transition entering a state
+// carries the same guard, so a guard belongs to the state rather than to an edge.
+struct AssertionAutomaton {
+    uint32_t state_count = 0;
+    // Words per state mask: (state_count + 63) / 64.
+    uint32_t words = 0;
+    // Guard index per state, into AssertionMonitor::cubes.
+    std::vector<uint32_t> guard_of;
+    // state_count * words: the states enterable one cycle after each state.
+    std::vector<uint64_t> follow;
+    // States a match may begin in, and states that complete one. `words` each.
+    std::vector<uint64_t> first;
+    std::vector<uint64_t> last;
+    // cubes.size() * words: per guard, the mask of states carrying it. Lets the
+    // satisfied-state mask fold over guards instead of gathering per state.
+    std::vector<uint64_t> guard_states;
+};
+
+struct AssertionMonitor {
+    // The directive's source-level label, for a report. Empty when unlabelled.
+    std::string label;
+    AssertionKind kind = AssertionKind::Assert;
+    AssertionStrength strength = AssertionStrength::Weak;
+
+    // What steps the monitor: one clock edge is one cycle.
+    Signal clock{ 0 };
+    Edge edge = Edge::Positive;
+
+    // Boolean expressions evaluated once per cycle, one bit each, in this order.
+    // Each is a root instruction in `body` producing a 1-bit value.
+    std::vector<Index> roots;
+    // Interned guard cubes over `roots`. Cube 0 is empty (always holds) and cube
+    // 1 is the reserved unsatisfiable one.
+    std::vector<AssertionCube> cubes;
+    std::vector<AssertionLiteral> literals;
+    // Index into `roots` of the disable-iff condition. Always a real root: an
+    // assertion that never disables carries a constant false, which folds away.
+    uint32_t reset_root = 0;
+
+    // The antecedent of an implication. `has_trigger` false means the property is
+    // a bare sequence and an attempt starts every cycle.
+    bool has_trigger = false;
+    // Whether an attempt starts on the trigger's last cycle (|->) or the cycle
+    // after (|=>). Meaningless without a trigger.
+    bool overlap = false;
+    AssertionAutomaton trigger;
+
+    // The property's sequence. One attempt per seeding.
+    AssertionAutomaton obligation;
+    // Attempts that can be pending at once -- the obligation's longest match, so
+    // the number of state vectors the backend allocates.
+    uint32_t depth = 1;
+
+    // Full extent of the assert/cover statement, for the failure report.
+    SourceSpan span;
+    // Precomputed "<file>:<line>: " prefix, so the backend stays slang-free.
+    std::string banner;
+};
+
 // Direction of a subroutine formal argument (LRM 13.5). Out / Inout copy the
 // formal back to the caller at completion (tasks only for now). Ref binds the
 // formal to the actual's live storage — no copy either way; the callee reads and
@@ -286,6 +382,9 @@ public:
     InternPool pool;
     // DPI-C exports (LRM 35.5): SV functions exposed as C-callable thunks.
     std::vector<DpiExport> dpi_exports;
+    // Compiled concurrent assertions (LRM 16). Indexed by the monitor id a
+    // process body refers to; see AssertionMonitor.
+    std::vector<AssertionMonitor> monitors;
     // The top instance's name, used as the DPI svScope name (LRM 35.5.3). For a
     // multi-top design it is the first top's name (multi-top DPI export is
     // guarded; a multi-top context import's scope is an edge case).

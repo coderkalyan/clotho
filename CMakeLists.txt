@@ -131,6 +131,63 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(unordered_dense)
 
+# libsva: the concurrent-assertion temporal engine — a Zig static library plus a
+# C header (https://github.com/coderkalyan/libsva). It builds the SVA IR, lowers
+# it to automata, and hands back tables; see docs/design/concurrent-assertions.md.
+#
+# This is the first dependency clotho builds with an external tool rather than
+# fetching sources for CMake to compile, so it does not follow the FetchContent
+# pattern above. It is also a FRONT-END-ONLY dependency: the IR is built,
+# lowered, and discarded during lowering, and no libsva code runs in a simulated
+# process, so only the `clotho` target links it.
+option(CLOTHO_SVA "Concurrent-assertion support (requires Zig and libsva)" ON)
+set(CLOTHO_LIBSVA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libsva"
+    CACHE PATH "libsva source tree, built in place with `zig build`")
+
+if(CLOTHO_SVA)
+  find_program(ZIG_EXECUTABLE zig REQUIRED DOC "Zig 0.16+, used to build libsva")
+  if(NOT EXISTS "${CLOTHO_LIBSVA_DIR}/build.zig")
+    message(FATAL_ERROR
+      "CLOTHO_SVA is ON but no libsva at ${CLOTHO_LIBSVA_DIR}.\n"
+      "Point -DCLOTHO_LIBSVA_DIR=<path> at a checkout, or configure with "
+      "-DCLOTHO_SVA=OFF to build without concurrent assertions.")
+  endif()
+
+  # Keep libsva's assertions live in every clotho build type. They enforce the IR
+  # contract (operand layers, range well-formedness, dense atoms), and a violation
+  # is a clotho bug that must abort rather than lower to a wrong monitor — so
+  # ReleaseFast is deliberately never selected here.
+  if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(_libsva_optimize Debug)
+  else()
+    set(_libsva_optimize ReleaseSafe)
+  endif()
+
+  set(_libsva_prefix ${CMAKE_CURRENT_BINARY_DIR}/libsva)
+  set(_libsva_lib ${_libsva_prefix}/lib/libsva.a)
+  set(_libsva_include ${_libsva_prefix}/include)
+  file(GLOB _libsva_sources "${CLOTHO_LIBSVA_DIR}/src/*.zig")
+
+  add_custom_command(
+    OUTPUT ${_libsva_lib} ${_libsva_include}/sva.h
+    COMMAND ${ZIG_EXECUTABLE} build --prefix ${_libsva_prefix}
+            -Doptimize=${_libsva_optimize}
+    WORKING_DIRECTORY ${CLOTHO_LIBSVA_DIR}
+    DEPENDS ${_libsva_sources} ${CLOTHO_LIBSVA_DIR}/build.zig
+            ${CLOTHO_LIBSVA_DIR}/include/sva.h
+    COMMENT "Building libsva (${_libsva_optimize}) with zig"
+    VERBATIM
+  )
+  add_custom_target(libsva_build DEPENDS ${_libsva_lib})
+
+  # The header is generated, so its directory must exist at configure time for
+  # INTERFACE_INCLUDE_DIRECTORIES to validate.
+  file(MAKE_DIRECTORY ${_libsva_include})
+  add_library(libsva INTERFACE)
+  target_link_libraries(libsva INTERFACE ${_libsva_lib})
+  target_include_directories(libsva SYSTEM INTERFACE ${_libsva_include})
+endif()
+
 # Simulation runtime: native support routines the JIT'd design calls into. No
 # LLVM and no slang — plain native code, so it stays linkable on its own. The
 # timing wheel is part of this surface: the runtime exposes it behind a C ABI.
@@ -223,10 +280,21 @@ add_library(clotho STATIC
   src/SourceContext.cpp
   src/SourceMap.cpp
   src/Lower.cpp
+  src/Sva.cpp
 )
 target_include_directories(clotho PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(clotho PUBLIC clotho_ir_core slang::slang)
 target_link_libraries(clotho PRIVATE clotho_warnings)
+
+# Concurrent assertions: the front-end builds an SVA IR through libsva's C API,
+# lowers it to a monitor, and reads the tables back into ir::AssertionMonitor. The
+# dependency stops here — clotho_ir consumes only that POD, and nothing links
+# libsva into the runtime or the JIT.
+if(CLOTHO_SVA)
+  add_dependencies(clotho libsva_build)
+  target_link_libraries(clotho PRIVATE libsva)
+  target_compile_definitions(clotho PRIVATE CLOTHO_HAVE_SVA=1)
+endif()
 
 # Thin build driver. Needs the code generator explicitly now that `clotho` no
 # longer re-exports it.
@@ -266,6 +334,7 @@ target_compile_definitions(clotho_cli PRIVATE
 enable_testing()
 add_executable(clotho_test
   tests/test_main.cpp
+  tests/sva_test.cpp
   tests/ir_test.cpp
   tests/operands_test.cpp
   tests/sourcemap_test.cpp
