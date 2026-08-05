@@ -205,6 +205,16 @@ target_link_libraries(clotho_ir_core PRIVATE clotho_warnings)
 # Simulation code generator: process IR -> LLVM IR -> ORC JIT. The only part of
 # the IR layer that needs LLVM, so the only part that links it — and the only
 # part that needs the runtime's C ABI layouts (rt_string, rt_queue, ...).
+# Process legalization: what hardware each always-block implies. A peer of
+# clotho_ir, not a layer inside clotho_ir_core -- the simulator never consumes it,
+# so `clotho run` should not link it. Same rule as ir_core: no LLVM, no slang.
+add_library(clotho_legalize STATIC
+  src/legalize/Legalize.cpp
+)
+target_include_directories(clotho_legalize PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(clotho_legalize PUBLIC clotho_ir_core)
+target_link_libraries(clotho_legalize PRIVATE clotho_warnings)
+
 add_library(clotho_ir STATIC
   src/ir/LlvmBackend.cpp
   src/ir/Jit.cpp
@@ -289,6 +299,7 @@ add_executable(clotho_test
   tests/recovery_test.cpp
   tests/case_pragma_test.cpp
   tests/eval_test.cpp
+  tests/legalize_test.cpp
   tests/gate_test.cpp
   tests/net_resolution_test.cpp
   tests/llvm_backend_test.cpp
@@ -327,7 +338,7 @@ add_executable(clotho_test
   tests/force_release_test.cpp
   tests/system_test.cpp
 )
-target_link_libraries(clotho_test PRIVATE clotho clotho_ir doctest::doctest clotho_warnings)
+target_link_libraries(clotho_test PRIVATE clotho clotho_ir clotho_legalize doctest::doctest clotho_warnings)
 
 # Export the test executable's dynamic symbols so DPI-C imports defined in the
 # test TUs (extern "C") resolve through the JIT's process-symbol generator

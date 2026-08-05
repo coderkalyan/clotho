@@ -15,10 +15,13 @@ TagInfo tag_info(Inst::Tag tag) {
     constexpr TagInfo none{};
     constexpr TagInfo pure{ .pure = true };
     constexpr TagInfo blocks{ .blocks_thunk = true };
+    // `synth` is pure + maps to hardware, the common case for dataflow ops.
+    // `hw` is synthesizable but not pure (the stores).
+    constexpr TagInfo synth{ .pure = true, .synthesizable = true };
+    constexpr TagInfo hw{ .synthesizable = true };
 
     switch (tag) {
-        // -- Pure value and control ops: no effect beyond their result, and
-        // deterministic, so a spurious re-execution is unobservable. --
+        // -- Pure AND synthesizable: ordinary hardware dataflow. --
         case Inst::Tag::Constant:
         case Inst::Tag::Arg:
         case Inst::Tag::Signal:
@@ -41,7 +44,6 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::WireRes:
         case Inst::Tag::WandRes:
         case Inst::Tag::WorRes:
-        case Inst::Tag::StrengthRes:
         case Inst::Tag::Bnot:
         case Inst::Tag::RedAnd:
         case Inst::Tag::RedOr:
@@ -51,7 +53,6 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::CountBits:
         case Inst::Tag::OneHot:
         case Inst::Tag::OneHot0:
-        case Inst::Tag::IsUnknown:
         case Inst::Tag::Sll:
         case Inst::Tag::Srl:
         case Inst::Tag::Sra:
@@ -66,6 +67,30 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::CasexEq:
         case Inst::Tag::WildEq:
         case Inst::Tag::InsideSet:
+        case Inst::Tag::Land:
+        case Inst::Tag::Lor:
+        case Inst::Tag::Lnot:
+        case Inst::Tag::Limplies:
+        case Inst::Tag::Lequiv:
+        case Inst::Tag::Select:
+        case Inst::Tag::SelectLazy:
+        case Inst::Tag::Concat:
+        case Inst::Tag::Repl:
+        case Inst::Tag::StreamReverse:
+        case Inst::Tag::Resize:
+        case Inst::Tag::Cond:
+        case Inst::Tag::Switch:
+        case Inst::Tag::Loop:
+        case Inst::Tag::Break:
+        case Inst::Tag::Continue:
+        case Inst::Tag::Clog2:
+            return synth;
+
+        // -- Pure but NOT hardware: real/float math has no bit-level meaning
+        // here, $isunknown is an X query synthesis has no answer for, and
+        // strength / pull resolution is not target-independent. --
+        case Inst::Tag::StrengthRes:
+        case Inst::Tag::IsUnknown:
         case Inst::Tag::FAdd:
         case Inst::Tag::FSub:
         case Inst::Tag::FMul:
@@ -85,24 +110,7 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::FResize:
         case Inst::Tag::RealMathUnary:
         case Inst::Tag::RealMathBinary:
-        case Inst::Tag::Land:
-        case Inst::Tag::Lor:
-        case Inst::Tag::Lnot:
-        case Inst::Tag::Limplies:
-        case Inst::Tag::Lequiv:
-        case Inst::Tag::Select:
-        case Inst::Tag::SelectLazy:
-        case Inst::Tag::Concat:
-        case Inst::Tag::Repl:
-        case Inst::Tag::StreamReverse:
         case Inst::Tag::NetPull:
-        case Inst::Tag::Resize:
-        case Inst::Tag::Cond:
-        case Inst::Tag::Switch:
-        case Inst::Tag::Loop:
-        case Inst::Tag::Break:
-        case Inst::Tag::Continue:
-        case Inst::Tag::Clog2:
             return pure;
 
         // -- Unconditionally blocks thunk elision. --
@@ -136,17 +144,21 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::StrobePend:
             return blocks;
 
-        // -- Everything else: neither pure nor thunk-blocking. --
+        // -- Synthesizable but not pure: the assignments, and the aggregate
+        // accessors they assign through. --
+        case Inst::Tag::Load:
+        case Inst::Tag::Store:
+        case Inst::Tag::StoreNb:
+        case Inst::Tag::MemberSelect:
+        case Inst::Tag::AggCopy:
+        case Inst::Tag::AggEq:
+            return hw;
+
+        // -- Everything else: simulation-only, not hardware. --
         // Note the two polarities differ deliberately (see TagInfo): landing here
         // makes an op ineligible for fusion (fail safe) but still thunk-eligible.
         case Inst::Tag::ClassNew:
         case Inst::Tag::HandleDeref:
-        case Inst::Tag::MemberSelect:
-        case Inst::Tag::Load:
-        case Inst::Tag::Store:
-        case Inst::Tag::StoreNb:
-        case Inst::Tag::AggCopy:
-        case Inst::Tag::AggEq:
         case Inst::Tag::DynArrayNew:
         case Inst::Tag::DynArrayNewInit:
         case Inst::Tag::DynArraySize:
