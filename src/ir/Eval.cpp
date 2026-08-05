@@ -240,6 +240,29 @@ EvalValue Eval::compute(Index i) {
             return { a.bits & mask, mask & m, to.width };
         }
 
+        // The eager ternary. Same rule as the lazy select below, and it needs to
+        // be here because a `?:` written in a reset guard is ordinary source --
+        // and because materialize() renders a lazy select AS a ternary, so
+        // without this a rendered design classifies differently from the one it
+        // was rendered from.
+        case Inst::Tag::Select: {
+            const auto info = ir_.extra_data<Select>(p.op_extra.extra);
+            switch (truth_of(value(p.op_extra.op))) {
+                case Tri::True:
+                    return value(info.a);
+                case Tri::False:
+                    return value(info.b);
+                case Tri::Unknown:
+                    break;
+            }
+            const Tri ta = truth_of(value(info.a));
+            if (ta != Tri::Unknown && ta == truth_of(value(info.b))) {
+                return ta == Tri::True ? EvalValue::known(1, 1) : EvalValue::known(0, 1);
+            }
+
+            return EvalValue::unknown(1);
+        }
+
         // Short-circuit `&&` / `||`. A known predicate takes its arm; an unknown
         // one still folds when both arms AGREE, which is the same absorption Bor
         // and Lor do one level down. `rst || rst2` with rst2 pinned is exactly

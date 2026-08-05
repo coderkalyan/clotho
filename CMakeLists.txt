@@ -210,6 +210,7 @@ target_link_libraries(clotho_ir_core PRIVATE clotho_warnings)
 # so `clotho run` should not link it. Same rule as ir_core: no LLVM, no slang.
 add_library(clotho_legalize STATIC
   src/legalize/Legalize.cpp
+  src/legalize/Materialize.cpp
 )
 target_include_directories(clotho_legalize PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(clotho_legalize PUBLIC clotho_ir_core)

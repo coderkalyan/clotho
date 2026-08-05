@@ -1,12 +1,15 @@
 #include <doctest/doctest.h>
 
 #include <array>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "Lower.h"
 #include "ir/Analysis.h"
 #include "legalize/Legalize.h"
+#include "legalize/Materialize.h"
 
 using namespace clotho;
 
@@ -392,4 +395,97 @@ TEST_CASE("the reset corpus classifies") {
         CHECK(q->kind == c.kind);
         CHECK(q->async_reset == c.async_reset);
     }
+}
+
+// --- M4: materialize ------------------------------------------------------
+
+namespace {
+
+// Classification of signal `q`, or nullopt when the design has none.
+std::optional<std::pair<legalize::StorageKind, bool>> classify_q(const LowerResult&      lowered,
+                                                                 const legalize::Result& r) {
+    for (const legalize::ProcessResult& p : r.processes) {
+        for (const legalize::SignalStores& e : p.signals) {
+            const std::string& n = lowered.module->signal(e.signal).name;
+            if (n == "q" || n.ends_with(".q")) {
+                return std::pair{ e.kind, e.async_reset };
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
+} // namespace
+
+// The acceptance for M4. Rendering a legalized design must produce source that
+// re-lowers to the SAME classification -- if it did not, the rendered mux tree
+// would not be the hardware the analysis claimed, and every downstream consumer
+// (the SV writer, the mismatch tool, the LSP's inlay hints) would inherit the lie.
+//
+// Run over the whole reset corpus rather than a sample, because the fill-in rule
+// is asymmetric: a combinational base is spelled 'x and a holding base is spelled
+// by omission, so both directions have to survive the round trip.
+TEST_CASE("materializing a design round-trips to the same classification") {
+    for (const ResetCase& c : kResetCases) {
+        CAPTURE(c.file);
+        const std::string path = std::string(CLOTHO_TEST_DIR) + "/legalize/reset/" + std::string(c.file) + ".sv";
+        const std::array<std::string_view, 1> paths{ path };
+        const LowerResult                     lowered = lower_files(paths);
+        REQUIRE(lowered.ok);
+
+        const legalize::Result before = legalize::run(*lowered.module, nullptr, { .keep_guards = true });
+        const std::string      text   = legalize::materialize(*lowered.module, before);
+        CAPTURE(text);
+        // Anything the renderer could not spell would silently weaken the test.
+        REQUIRE(text.find("unrenderable") == std::string::npos);
+
+        const LowerResult again = lower_text(text);
+        REQUIRE_MESSAGE(again.ok, again.diagnostic_text());
+        const legalize::Result after = legalize::run(*again.module, nullptr);
+
+        const auto a = classify_q(lowered, before);
+        const auto b = classify_q(again, after);
+        REQUIRE(a.has_value());
+        REQUIRE(b.has_value());
+        CHECK(a->first == b->first);
+        CHECK(a->second == b->second);
+    }
+}
+
+// What materializing actually contributes: the arm the source left implicit is
+// written out. The two cases are not symmetric, and the asymmetry is forced.
+TEST_CASE("a missing arm is filled in, differently for a flop and a latch") {
+    // A clock enable. `else q <= q` is an ordinary feedback mux -- legal, and it
+    // is what the hardware already was.
+    const LowerResult flop = lower_text(wrap("always @(posedge clk) if (en) q <= a;"));
+    REQUIRE(flop.ok);
+    const legalize::Result fr = legalize::run(*flop.module, nullptr, { .keep_guards = true });
+    const std::string      ft = legalize::materialize(*flop.module, fr);
+    CHECK(ft.find("q <= q; // hold") != std::string::npos);
+
+    // The same text in a level-sensitive block would be a combinational loop, so
+    // the hold can only be described, never spelled.
+    const LowerResult latch = lower_text(wrap("always @* if (en) q = a;"));
+    REQUIRE(latch.ok);
+    const legalize::Result lr = legalize::run(*latch.module, nullptr, { .keep_guards = true });
+    const std::string      lt = legalize::materialize(*latch.module, lr);
+    CHECK(lt.find("holds: latch") != std::string::npos);
+    CHECK(lt.find("q = q") == std::string::npos);
+}
+
+// Nesting is what carries completeness. A flattened `if (g) q<=a; if (!g) q<=b;`
+// loses the fact that the two arms are exhaustive, and every signal re-lowers as
+// held -- which is how the first version of this broke every reset in the corpus.
+TEST_CASE("materialize emits a nested tree, not a flat guarded list") {
+    const LowerResult r = lower_text(wrap("always @* if (en) q = a; else q = b;"));
+    REQUIRE(r.ok);
+    const legalize::Result res  = legalize::run(*r.module, nullptr, { .keep_guards = true });
+    const std::string      text = legalize::materialize(*r.module, res);
+    CHECK(text.find("end else begin") != std::string::npos);
+
+    const legalize::Result again = legalize::run(*lower_text(text).module, nullptr);
+    REQUIRE(again.processes.size() == 1);
+    REQUIRE(again.processes[0].signals.size() == 1);
+    CHECK(again.processes[0].signals[0].kind == legalize::StorageKind::Comb);
 }
