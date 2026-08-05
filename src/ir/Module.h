@@ -94,6 +94,19 @@ enum class Activation : uint8_t {
     // variable declaration initializers (LRM 6.8). Its stores set state without
     // generating events, so no process observes an edge from initialization.
     PreInit,
+    // Runs once per time step, before any process body of that step (LRM 4.4.2.1
+    // Preponed). Only compiler-synthesized: it captures the sampled values a
+    // concurrent assertion reads, because LRM 16.5 defines an assertion over the
+    // values a variable held before the step's updates. The backend emits it as a
+    // thunk called from sim_drain's post-tick block and once from emit_main, so
+    // "before any body" holds at time zero too.
+    //
+    // Its stores set state without generating events, like PreInit: a shadow is
+    // compiler-internal and nothing may wake on it. LRM 4.4.2.9 forbids value
+    // changes once Postponed is reached, and sampling is equivalent to sampling
+    // in the previous Postponed region -- this is that, done where clotho can
+    // observe it, and it touches no design net.
+    Preponed,
     // Runs once at time zero, then completes (an `initial` block).
     Initial,
     // Re-armed after each run and rerun whenever one of its wait events fires

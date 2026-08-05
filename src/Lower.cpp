@@ -732,6 +732,7 @@ public:
         lower_instance(top, prefix, Pass::Emit, &top_scope_, top.name);
         emit_wire_resolvers();
         finalize_preinit();
+        finalize_sva_sampling();
         module_.add_top(std::move(top_scope_));
     }
 
@@ -5147,7 +5148,40 @@ private:
         }
     }
 
+    // The statement inside any sequential-block / single-statement-list wrappers.
+    // A labelled statement (`ap: assert property ...`) is a StatementBlockSymbol,
+    // so its statement arrives one or two layers down rather than bare.
+    static const Statement& unwrap_blocks(const Statement& stmt) {
+        const Statement* inner = &stmt;
+        for (;;) {
+            if (inner->kind == StatementKind::Block &&
+                inner->as<BlockStatement>().blockKind == StatementBlockKind::Sequential) {
+                inner = &inner->as<BlockStatement>().body;
+            } else if (inner->kind == StatementKind::List &&
+                       inner->as<StatementList>().list.size() == 1) {
+                inner = inner->as<StatementList>().list[0];
+            } else {
+                return *inner;
+            }
+        }
+    }
+
     void lower_procedural_block(const ProceduralBlockSymbol& sym) {
+        // A module-item concurrent assertion is not a process of its own. slang
+        // wraps it in ProceduralBlockSymbol(Always, isFromAssertion) purely to
+        // give it somewhere to live (BlockSymbols.cpp), and lowering the statement
+        // emits the monitor's clocked process instead. This wrapper must not also
+        // become one: an `always` with no sensitivity is a forever loop, and one
+        // whose body emitted nothing spins at time zero. A module-item IMMEDIATE
+        // assertion gets the same wrapper and genuinely needs the process, so this
+        // keys on the statement rather than on isFromAssertion alone.
+        const Statement& item = unwrap_blocks(sym.getBody());
+        if (sym.isFromAssertion && item.kind == StatementKind::ConcurrentAssertion) {
+            ir::Builder b(module_.pool);
+            lower_concurrent_assertion(item.as<slang::ast::ConcurrentAssertionStatement>(), b);
+            return;
+        }
+
         ir::Activation             activation = ir::Activation::Always;
         std::vector<ir::WaitEvent> wait_events;
         const Expression*          iff_guard = nullptr;
@@ -6029,13 +6063,570 @@ private:
         monitor.span = to_source_span(a.sourceRange);
         monitor.banner = banner_at(a.sourceRange.start());
 
-        // TODO: the monitor is lowered but not yet emitted -- the sampled shadow
-        // pass, the Observed-region monitor process, and the automaton step
-        // codegen are the remaining phases (concurrent-assertions.md 10). Until
-        // they land, accepting the assertion silently would violate the project's rules, so
-        // the tables are recorded for the tests and the construct still fails.
+        // Shadow every variable the assertion samples, before anything reads one.
+        sva_sample_roots(lowered);
+
+        // The step is emitted from here as ordinary IR (see the section below),
+        // so `monitor.roots` stays empty: it indexes instructions of a body the
+        // monitor would own, and there is none -- the roots are ordinary values
+        // inside the process emitted here.
+        emit_monitor(lowered, monitor, static_cast<uint32_t>(module_.monitors.size()));
         module_.monitors.push_back(std::move(monitor));
-        fail("concurrent assertions are lowered but not yet code-generated");
+    }
+
+    // -- The monitor step, as ordinary IR ------------------------------------
+    //
+    // libsva's per-cycle protocol (../libsva/src/Monitor.zig:27-47, with a
+    // compiling reference implementation at ../libsva/test/backend.c) walks the
+    // live states of an automaton. A code generator cannot: there is no run-time
+    // state set to iterate, only constants. Every fold below is therefore
+    // transposed onto something that IS compile-time -- the states, or the
+    // interned guards -- so that each contributes a constant mask selected by one
+    // bit. That transposition is the whole of concurrent-assertions.md 7.2.
+    //
+    // A mask over N automaton states is one `bit [N-1:0]` value. Clotho's values
+    // are arbitrary-precision, so AssertionAutomaton::words is a transport detail
+    // of libsva's C API and a row collapses to a single constant here.
+
+    // The hidden state one monitor carries between cycles. All 2-state, so all
+    // power up to 0 -- no attempt pending, no trigger in flight.
+    struct MonitorState {
+        // Trigger state mask. Only with an antecedent.
+        ir::Signal trigger{ 0 };
+        // Whether the trigger matched last cycle, for `|=>`. Only with one.
+        ir::Signal fired{ 0 };
+        // One obligation attempt per slot, `depth` of them.
+        std::vector<ir::Signal> pending;
+        // Which slots hold a live attempt. NOT derivable from `pending != 0`: an
+        // attempt seeded into a cycle whose first letter does not hold is empty
+        // immediately, and that is a FAILURE rather than an absent attempt.
+        // Deriving occupancy from emptiness loses every such failure -- measured,
+        // see ../libsva/test/backend.c:405-411.
+        ir::Signal occupied{ 0 };
+        // Match tally, for `cover property`.
+        ir::Signal covered{ 0 };
+    };
+
+    // A hidden monitor state signal, powering up to 0. Two-state throughout: a
+    // state mask is a set, never a design value, so it has no x/z to carry.
+    ir::Signal new_monitor_state(std::string name, ir::Ref type, ir::SourceLoc l) {
+        ir::SignalInfo info;
+        info.name = prefix_ + std::move(name);
+        info.loc  = l;
+        info.type = type;
+        info.dir  = ir::SignalInfo::Direction::Internal;
+
+        return register_signal(std::move(info));
+    }
+
+    ir::Ref mask_type(uint32_t width) {
+        return make_int_type(width, /*is_four=*/false, /*is_signed=*/false);
+    }
+
+    // `id` indexes the module's monitor table, so two assertions in one instance
+    // get distinct names.
+    MonitorState alloc_monitor_state(const ir::AssertionMonitor& mon, uint32_t id) {
+        const std::string   base = "sva." + std::to_string(id) + ".";
+        const ir::SourceLoc l    = mon.span.start;
+
+        MonitorState st;
+        if (mon.has_trigger) {
+            st.trigger = new_monitor_state(base + "trig", mask_type(mon.trigger.state_count), l);
+            st.fired   = new_monitor_state(base + "fired", mask_type(1), l);
+        }
+        st.pending.reserve(mon.depth);
+        for (uint32_t k = 0; k < mon.depth; ++k) {
+            st.pending.push_back(new_monitor_state(
+              base + "pend" + std::to_string(k), mask_type(mon.obligation.state_count), l));
+        }
+        st.occupied = new_monitor_state(base + "occ", mask_type(mon.depth), l);
+        if (mon.kind == ir::AssertionKind::Cover) {
+            // Unsigned: a tally is never negative, and widening the 1-bit match
+            // flag into a signed target would sign-extend it to -1 (a Resize takes
+            // its signedness from the target type).
+            st.covered = new_monitor_state(base + "cov", mask_type(32), l);
+        }
+
+        return st;
+    }
+
+    static bool row_is_zero(std::span<const uint64_t> row) {
+        for (const uint64_t word : row) {
+            if (word != 0) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    // Row `index` of a `words`-per-row bit-set table.
+    static std::span<const uint64_t> table_row(const std::vector<uint64_t>& table,
+                                               uint32_t                     index,
+                                               uint32_t                     words) {
+        return { table.data() + static_cast<size_t>(index) * words, words };
+    }
+
+    // One bit-set row as a single `bit [states-1:0]` constant. The tables arrive
+    // as 64-bit words because that is libsva's C transport; a clotho value is
+    // arbitrary-precision, so the row is one constant and never a word array.
+    ir::Ref mask_const(std::span<const uint64_t> row, uint32_t states) {
+        const ir::Ref ty = mask_type(states);
+        if (states <= 64) {
+            return module_.pool.put_int(ty, row.empty() ? 0 : row[0]);
+        }
+        // Two-state, so one plane, and both sides are little-endian words.
+        std::vector<uint8_t> bytes(ir::plane_bytes(states), 0);
+        std::memcpy(bytes.data(),
+                    row.data(),
+                    std::min<size_t>(bytes.size(), row.size() * sizeof(uint64_t)));
+
+        return module_.pool.put_value(ty, bytes);
+    }
+
+    ir::Index zero_mask(uint32_t width, ir::Builder& b, ir::SourceLoc l) {
+        return b.constant(mask_const({}, width), l);
+    }
+
+    ir::Index slot_mask(uint32_t bit, uint32_t width, ir::Builder& b, ir::SourceLoc l) {
+        std::vector<uint64_t> row((width + 63) / 64, 0);
+        row[bit / 64] = uint64_t{ 1 } << (bit % 64);
+
+        return b.constant(mask_const(row, width), l);
+    }
+
+    ir::Index load_signal(ir::Signal sig, ir::Builder& b, ir::SourceLoc l) {
+        return b.unary(ir::Inst::Tag::Load, b.signal(sig, l), l);
+    }
+
+    // Complement of a definite 2-state bit. Not Lnot: these bits are already
+    // collapsed to 0/1, so there is no unknown left for Lnot to propagate.
+    ir::Index bit_not(ir::Index v, ir::Builder& b, ir::SourceLoc l) {
+        return b.binary(ir::Inst::Tag::Bxor, v, true_const(b, l), l);
+    }
+
+    // `mask != 0`, as a definite bit.
+    ir::Index mask_any(ir::Index mask, ir::Builder& b, ir::SourceLoc l) {
+        return b.unary(ir::Inst::Tag::RedOr, mask, l);
+    }
+
+    // Bit `bit` of a `width`-bit two-state mask, as a definite 1-bit value. Tested
+    // rather than selected: Inst::Tag::BitSelect addresses storage and needs an
+    // lvalue base, and every mask here is a computed value.
+    ir::Index mask_bit(ir::Index mask, uint32_t bit, uint32_t width, ir::Builder& b, ir::SourceLoc l) {
+        return mask_any(b.binary(ir::Inst::Tag::Band, mask, slot_mask(bit, width, b, l), l), b, l);
+    }
+
+    // Store `value`, or zero when the assertion is disabled. LRM 16.15's reset is
+    // emitted_step's early return; as a select on every store it needs no branch
+    // and keeps the step straight-line.
+    void store_gated(ir::Signal    sig,
+                     ir::Index     value,
+                     ir::Index     active,
+                     uint32_t      width,
+                     ir::Builder&  b,
+                     ir::SourceLoc l) {
+        b.binary(ir::Inst::Tag::Store,
+                 b.signal(sig, l),
+                 b.select(active, value, zero_mask(width, b, l), l),
+                 l);
+    }
+
+    // `advance`, transposed. libsva walks the live states and ORs in each one's
+    // follow row; there is no run-time state set here, so this folds over every
+    // state instead and selects that state's constant row by its own liveness
+    // bit. A state with no successors contributes nothing and drops out at
+    // compile time. See concurrent-assertions.md 7.2.
+    ir::Index automaton_advance(const ir::AssertionAutomaton& au,
+                                ir::Index                     current,
+                                ir::Index                     satisfied,
+                                ir::Builder&                  b,
+                                ir::SourceLoc                 l) {
+        const uint32_t  states = au.state_count;
+        const ir::Index zero   = zero_mask(states, b, l);
+
+        ir::Index next = zero;
+        bool      any  = false;
+        for (uint32_t s = 0; s < states; ++s) {
+            const std::span<const uint64_t> row = table_row(au.follow, s, au.words);
+            if (row_is_zero(row)) {
+                continue;
+            }
+            const ir::Index taken =
+              b.select(mask_bit(current, s, states, b, l), b.constant(mask_const(row, states), l), zero, l);
+            next = any ? b.binary(ir::Inst::Tag::Bor, next, taken, l) : taken;
+            any  = true;
+        }
+
+        return b.binary(ir::Inst::Tag::Band, next, satisfied, l);
+    }
+
+    // `satisfy`: the states whose guard holds under this cycle's root valuation.
+    // Folds over guards rather than gathering per state -- that is what
+    // guard_states is for. A cube is a compile-time literal list, so a guard's
+    // contribution is a constant mask selected by a chain of ANDs over the root
+    // bits. The reserved unsatisfiable cube carries no surviving state, so its
+    // mask is zero and it folds away here along with every other unused guard.
+    ir::Index automaton_satisfy(const ir::AssertionMonitor&   mon,
+                                const ir::AssertionAutomaton& au,
+                                std::span<const ir::Index>    roots,
+                                ir::Builder&                  b,
+                                ir::SourceLoc                 l) {
+        const uint32_t  states = au.state_count;
+        const ir::Index zero   = zero_mask(states, b, l);
+
+        ir::Index sat = zero;
+        bool      any = false;
+        for (uint32_t g = 0; g < mon.cubes.size(); ++g) {
+            const std::span<const uint64_t> row = table_row(au.guard_states, g, au.words);
+            if (row_is_zero(row)) {
+                continue;
+            }
+            const ir::Index          carriers = b.constant(mask_const(row, states), l);
+            const ir::AssertionCube& cube     = mon.cubes[g];
+
+            ir::Index holds{};
+            bool      conjoined = false;
+            for (uint32_t i = 0; i < cube.len; ++i) {
+                const ir::AssertionLiteral& lit = mon.literals[cube.start + i];
+                ir::Index                   bit = roots[lit.root];
+                if (lit.negated) {
+                    bit = bit_not(bit, b, l);
+                }
+                holds     = conjoined ? b.binary(ir::Inst::Tag::Band, holds, bit, l) : bit;
+                conjoined = true;
+            }
+            // The empty cube is `true`, so its carriers are satisfied outright.
+            const ir::Index add = conjoined ? b.select(holds, carriers, zero, l) : carriers;
+            sat                 = any ? b.binary(ir::Inst::Tag::Bor, sat, add, l) : add;
+            any                 = true;
+        }
+
+        return sat;
+    }
+
+    // Redirects assertion-expression operands to their Preponed shadows for the
+    // extent of one atom. Scoped rather than a bare flag because lower_predicate
+    // can fail() out of the middle of an expression.
+    struct SampledScope {
+        Lowerer& owner;
+        bool     saved;
+
+        SampledScope(Lowerer& lowerer, bool sampled)
+          : owner(lowerer)
+          , saved(lowerer.sva_sampled_) {
+            owner.sva_sampled_ = sampled;
+        }
+        ~SampledScope() {
+            owner.sva_sampled_ = saved;
+        }
+        SampledScope(const SampledScope&)            = delete;
+        SampledScope& operator=(const SampledScope&) = delete;
+    };
+
+    // A call in a sampled assertion expression would read live state: sampling
+    // captures the variables an expression names (LRM 16.6), and clotho does not
+    // trace a subroutine body to add what that body reads to the shadow set.
+    // TODO: trace called bodies so their reads are sampled too, which is also what
+    // LRM 16.6's side-effect-freedom rule needs checking against
+    // (concurrent-assertions.md 4).
+    void reject_unsampled_call(const Expression& expr) {
+        struct Finder : ASTVisitor<Finder, VisitFlags::AllGood> {
+            bool found = false;
+
+            void handle(const CallExpression&) {
+                found = true;
+            }
+        };
+        Finder finder;
+        expr.visit(finder);
+        if (finder.found) {
+            fail("a function call in a concurrent assertion expression is not "
+                 "supported: what it reads would not be sampled");
+        }
+    }
+
+    // One atom as a definite 1-bit value. LRM 16.6 evaluates an SVA boolean at
+    // full width and then interprets it exactly as an `if` condition, so this is
+    // lower_predicate plus the unknown-is-false collapse.
+    ir::Index eval_atom(const sva::Atom& atom, bool sampled, ir::Builder& b) {
+        const ir::SourceLoc l = loc(*atom.expr);
+        if (sampled) {
+            reject_unsampled_call(*atom.expr);
+        }
+
+        ir::Index value{};
+        {
+            const SampledScope scope(*this, sampled);
+            value = lower_predicate(*atom.expr, b);
+        }
+        if (atom.negated) {
+            // Negation normal form puts `!` on the leaf, so the atom is the
+            // negation of its own expression. Lnot of the reduced bit is exactly
+            // SystemVerilog's `!`: true only when every bit is definitely 0, x
+            // when the operand is unknown and no bit is definitely 1.
+            value = b.unary(ir::Inst::Tag::Lnot, value, l);
+        }
+
+        // LRM 16.6: x and z are false. A 4-state -> 2-state resize is that
+        // collapse (LRM 6.3.1 drops x/z to 0), and it also makes the bit definite,
+        // which every select below needs -- an x condition would bitwise-merge its
+        // arms rather than choose one.
+        return b.resize(value, module_.pool.bit_type, l);
+    }
+
+    // One boolean root as a definite 1-bit value, from the flat forest libsva
+    // handed back. Operands always point backwards, so a plain recursive walk
+    // terminates; a shared subterm costs a second evaluation, never a wrong one.
+    ir::Index eval_root(const sva::Result& lowered,
+                        uint32_t           node,
+                        bool               sampled,
+                        ir::Builder&       b,
+                        ir::SourceLoc      l) {
+        using Op                          = sva::Result::RootNode::Op;
+        const sva::Result::RootNode& item = lowered.nodes[node];
+        switch (item.op) {
+            case Op::Const:
+                return item.lhs != 0 ? true_const(b, l) : zero_mask(1, b, l);
+            case Op::Atom:
+                return eval_atom(lowered.atoms[item.lhs], sampled, b);
+            case Op::And:
+                return b.binary(ir::Inst::Tag::Band,
+                                eval_root(lowered, item.lhs, sampled, b, l),
+                                eval_root(lowered, item.rhs, sampled, b, l),
+                                l);
+            case Op::Or:
+                return b.binary(ir::Inst::Tag::Bor,
+                                eval_root(lowered, item.lhs, sampled, b, l),
+                                eval_root(lowered, item.rhs, sampled, b, l),
+                                l);
+            case Op::Not:
+                // Unreachable from clotho's own lowering: an SVA boolean is
+                // three-valued, so `!` does not commute with the unknown-is-false
+                // collapse and negation is pushed into the atom instead (Sva.cpp's
+                // boolean(), concurrent-assertions.md 5.3). Complementing the
+                // already-collapsed bit here would make `!a` true under x.
+                // TODO: reachable only if libsva ever synthesizes a bnot of its
+                // own; that needs the mutually-exclusive atom pair of 5.3.
+                fail("internal: a negated assertion boolean reached code generation");
+        }
+        fail("internal: unknown assertion boolean node");
+    }
+
+    // One monitor: the hidden state it owns, plus the process that steps it once
+    // per clock edge. The order below is emitted_step's
+    // (../libsva/test/backend.c:147-201), which is differential-tested against
+    // libsva's own reference. Two things are expressed differently because a code
+    // generator has no run-time loop: a reset is a select on every store rather
+    // than an early return, and the free-slot search is unrolled.
+    void emit_monitor(const sva::Result& lowered, const ir::AssertionMonitor& mon, uint32_t id) {
+        switch (mon.kind) {
+            case ir::AssertionKind::Assert:
+            case ir::AssertionKind::Assume:
+            case ir::AssertionKind::Cover:
+                break;
+            case ir::AssertionKind::Restrict:
+                // TODO: `restrict` is a formal-only directive with no simulation
+                // verdict. lower_concurrent_assertion refuses it before here.
+                fail("concurrent restrict is not supported");
+        }
+        if (mon.depth == 0 || mon.obligation.state_count == 0 ||
+            (mon.has_trigger && mon.trigger.state_count == 0) ||
+            mon.reset_root >= lowered.root_index.size()) {
+            fail("internal: a concurrent assertion lowered to an empty automaton");
+        }
+
+        const MonitorState  st = alloc_monitor_state(mon, id);
+        const ir::SourceLoc l  = mon.span.start;
+        ir::Builder         b(module_.pool);
+
+        // Roots, one definite bit each. Every one reads the Preponed shadows of
+        // the variables it names except the disable-iff condition, which LRM 16.15
+        // deliberately does not sample (concurrent-assertions.md 5.4).
+        std::vector<ir::Index> roots;
+        roots.reserve(lowered.root_index.size());
+        for (uint32_t r = 0; r < lowered.root_index.size(); ++r) {
+            roots.push_back(eval_root(lowered, lowered.root_index[r], r != mon.reset_root, b, l));
+        }
+        const ir::Index active = bit_not(roots[mon.reset_root], b, l);
+
+        const uint32_t  obl   = mon.obligation.state_count;
+        const ir::Index sat_o = automaton_satisfy(mon, mon.obligation, roots, b, l);
+
+        // The trigger. An attempt starts every cycle, so its first-state mask is
+        // folded in unconditionally; `fires` is this cycle's antecedent match.
+        ir::Index fires = zero_mask(1, b, l);
+        if (mon.has_trigger) {
+            const uint32_t  trig  = mon.trigger.state_count;
+            const ir::Index sat_t = automaton_satisfy(mon, mon.trigger, roots, b, l);
+            const ir::Index start = b.binary(
+              ir::Inst::Tag::Band, b.constant(mask_const(mon.trigger.first, trig), l), sat_t, l);
+            const ir::Index stepped =
+              automaton_advance(mon.trigger, load_signal(st.trigger, b, l), sat_t, b, l);
+            const ir::Index next = b.binary(ir::Inst::Tag::Bor, stepped, start, l);
+            const ir::Index done = b.binary(
+              ir::Inst::Tag::Band, next, b.constant(mask_const(mon.trigger.last, trig), l), l);
+            fires = mask_any(done, b, l);
+            store_gated(st.trigger, next, active, trig, b, l);
+        }
+
+        // Advance every occupied slot. An unoccupied slot already holds 0 (a match
+        // zeroes it, and a failure only fires once it is empty), so the guard is
+        // belt-and-braces -- but it is what keeps that an invariant rather than an
+        // assumption, and emitted_step has it.
+        const ir::Index        occupied = load_signal(st.occupied, b, l);
+        std::vector<ir::Index> pending(mon.depth);
+        for (uint32_t k = 0; k < mon.depth; ++k) {
+            const ir::Index current = load_signal(st.pending[k], b, l);
+            const ir::Index stepped = automaton_advance(mon.obligation, current, sat_o, b, l);
+            pending[k] = b.select(mask_bit(occupied, k, mon.depth, b, l), stepped, current, l);
+        }
+
+        // Seed. `|->` seeds on the trigger's own last cycle, `|=>` on the cycle
+        // after (so it reads last cycle's `fired`), and a bare sequence starts an
+        // attempt every cycle.
+        ir::Index seeding = true_const(b, l);
+        if (mon.has_trigger) {
+            seeding = mon.overlap ? fires : load_signal(st.fired, b, l);
+        }
+        const ir::Index seed = b.binary(
+          ir::Inst::Tag::Band, b.constant(mask_const(mon.obligation.first, obl), l), sat_o, l);
+
+        // The first free slot, unrolled: depth is a compile-time constant, so there
+        // is no run-time search to make. A slot is always free -- depth is the
+        // obligation's longest match, so an attempt holds its slot for at most
+        // depth cycles and the verdicts below free it in the last of them, leaving
+        // at most depth - 1 alive when this runs.
+        ir::Index live      = occupied;
+        ir::Index all_taken = true_const(b, l);
+        for (uint32_t k = 0; k < mon.depth; ++k) {
+            const ir::Index busy = mask_bit(occupied, k, mon.depth, b, l);
+            const ir::Index free_here =
+              b.binary(ir::Inst::Tag::Band, all_taken, bit_not(busy, b, l), l);
+            const ir::Index pick = b.binary(ir::Inst::Tag::Band, seeding, free_here, l);
+            const ir::Index claim =
+              b.select(pick, slot_mask(k, mon.depth, b, l), zero_mask(mon.depth, b, l), l);
+
+            pending[k] = b.select(pick, seed, pending[k], l);
+            live       = b.binary(ir::Inst::Tag::Bor, live, claim, l);
+            all_taken  = b.binary(ir::Inst::Tag::Band, all_taken, busy, l);
+        }
+
+        if (mon.has_trigger) {
+            store_gated(st.fired, fires, active, 1, b, l);
+        }
+
+        // Verdicts. Seeding before taking them is not incidental: under `|->` a
+        // one-cycle consequent has to be able to discharge in the very cycle it was
+        // created (../libsva/test/backend.c:187-188).
+        const ir::Index        last = b.constant(mask_const(mon.obligation.last, obl), l);
+        std::vector<ir::Index> matched(mon.depth);
+        std::vector<ir::Index> failed(mon.depth);
+        ir::Index              remaining = zero_mask(mon.depth, b, l);
+        for (uint32_t k = 0; k < mon.depth; ++k) {
+            const ir::Index held = mask_bit(live, k, mon.depth, b, l);
+            const ir::Index done = mask_any(b.binary(ir::Inst::Tag::Band, pending[k], last, l), b, l);
+            const ir::Index empty = bit_not(mask_any(pending[k], b, l), b, l);
+
+            matched[k] = b.binary(ir::Inst::Tag::Band, held, done, l);
+            failed[k]  = b.binary(ir::Inst::Tag::Band,
+                                 held,
+                                 b.binary(ir::Inst::Tag::Band, bit_not(done, b, l), empty, l),
+                                 l);
+
+            // Either verdict frees the slot; only a match has a vector left to
+            // clear, since a failure is what an empty vector means.
+            const ir::Index resolved = b.binary(ir::Inst::Tag::Bor, matched[k], failed[k], l);
+            const ir::Index keep = b.binary(ir::Inst::Tag::Band, held, bit_not(resolved, b, l), l);
+            const ir::Index still =
+              b.select(keep, slot_mask(k, mon.depth, b, l), zero_mask(mon.depth, b, l), l);
+
+            pending[k] = b.select(matched[k], zero_mask(obl, b, l), pending[k], l);
+            remaining  = b.binary(ir::Inst::Tag::Bor, remaining, still, l);
+        }
+
+        store_gated(st.occupied, remaining, active, mon.depth, b, l);
+        for (uint32_t k = 0; k < mon.depth; ++k) {
+            store_gated(st.pending[k], pending[k], active, obl, b, l);
+        }
+
+        if (mon.kind == ir::AssertionKind::Cover) {
+            // A cover counts matches and never reports (LRM 16.12.6). More than one
+            // attempt can complete in a cycle, so this is a sum and not a flag.
+            ir::Index count = load_signal(st.covered, b, l);
+            for (uint32_t k = 0; k < mon.depth; ++k) {
+                count = b.binary(ir::Inst::Tag::Add, count, b.resize(matched[k], mask_type(32), l), l);
+            }
+            store_gated(st.covered, count, active, 32, b, l);
+        } else {
+            emit_monitor_reports(mon, failed, active, b, l);
+        }
+
+        module_.add_process(
+          ir::Process{ .activation  = ir::Activation::Always,
+                       .wait_events = { ir::WaitEvent{ .signal = mon.clock, .edge = mon.edge } },
+                       .self_start  = false,
+                       .span        = mon.span,
+                       .ir          = b.finish(),
+                       .scope       = cur_scope_id() });
+
+        if (mon.strength == ir::AssertionStrength::Strong) {
+            emit_monitor_finish(mon, st);
+        }
+    }
+
+    // One report per failing attempt: two attempts can fail in the same cycle and
+    // each is its own assertion failure. Deferred (defer = 1) so it matures in the
+    // Observed region through the existing deferred-immediate path, which is also
+    // what gives it the per-generation glitch suppression of LRM 16.4.2.
+    void emit_monitor_reports(const ir::AssertionMonitor&   mon,
+                              const std::vector<ir::Index>& failed,
+                              ir::Index                     active,
+                              ir::Builder&                  b,
+                              ir::SourceLoc                 l) {
+        for (const ir::Index bad : failed) {
+            const ir::Index report = b.binary(ir::Inst::Tag::Band, active, bad, l);
+
+            b.open_region();
+            b.severity(
+              static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 1);
+            const ir::ExtraSlice then_region = b.close_region();
+
+            b.open_region();
+            const ir::ExtraSlice else_region = b.close_region();
+
+            b.cond(report, then_region, else_region, l, /*unlikely=*/true);
+        }
+    }
+
+    // End of trace (LRM 16.12.2), libsva's emitted_finish. A weak attempt that
+    // never completed holds, so it reports nothing; a strong one is a failure. The
+    // state teardown emitted_finish also does is dropped: a Final process runs
+    // after every other process has settled and nothing reads the state again.
+    // Not deferred -- there is no later region left for a report to mature in.
+    void emit_monitor_finish(const ir::AssertionMonitor& mon, const MonitorState& st) {
+        const ir::SourceLoc l = mon.span.start;
+        ir::Builder         b(module_.pool);
+
+        const ir::Index occupied = load_signal(st.occupied, b, l);
+        for (uint32_t k = 0; k < mon.depth; ++k) {
+            const ir::Index held = mask_bit(occupied, k, mon.depth, b, l);
+
+            b.open_region();
+            b.severity(
+              static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
+            const ir::ExtraSlice then_region = b.close_region();
+
+            b.open_region();
+            const ir::ExtraSlice else_region = b.close_region();
+
+            b.cond(held, then_region, else_region, l, /*unlikely=*/true);
+        }
+
+        module_.add_process(ir::Process{ .activation = ir::Activation::Final,
+                                         .span       = mon.span,
+                                         .ir         = b.finish(),
+                                         .scope      = cur_scope_id() });
     }
 
     void lower_immediate_assertion(const ImmediateAssertionStatement& a, ir::Builder& b) {
@@ -6304,6 +6895,147 @@ private:
         }
         module_.add_process(ir::Process{ .activation = ir::Activation::PreInit, .ir = preinit_->finish() });
         preinit_.reset();
+    }
+
+    // -- Concurrent assertion sampling (LRM 16.5, 4.4.2.1) --
+    //
+    // An assertion expression reads SAMPLED values, and what is sampled is the
+    // VARIABLE, not the expression: LRM 16.6 has an operand captured before the
+    // expression is evaluated, so a capture is a plain copy with no operator in
+    // it. One shadow per variable, shared by every assertion mentioning it and
+    // copied by the single Preponed process finalize_sva_sampling emits.
+    //
+    // The shadow keeps the live signal's exact type -- full width, full 4-state.
+    // Narrowing it to the one bit a boolean root needs would move operators into
+    // the sampling region and read everything but the base live: `mem[i]` sampled
+    // as a bit would resolve `i` at sample time rather than at evaluation time.
+    // See docs/design/concurrent-assertions.md 4.
+    ir::Signal sva_shadow_of(ir::Signal live) {
+        const auto key = static_cast<uint32_t>(live);
+        if (const auto it = sva_shadows_.find(key); it != sva_shadows_.end()) {
+            return it->second;
+        }
+
+        // A shadow is per-instance state, so it belongs to the scope declaring the
+        // variable -- which must be the scope lowering the assertion, because the
+        // monitor process that reads the shadow is addressed through one scope
+        // anchor and cannot reach across instances (the constraint
+        // register_resolved_slot already enforces on a net driven from two scopes).
+        // TODO: sample a variable declared outside the asserting instance (a
+        // hierarchical reference, or a package / $unit variable). Needs the shadow
+        // and its copy placed in the declaring scope and read across the boundary.
+        if (scope_stack_.empty() ||
+            std::ranges::find(scope_stack_.back()->signals, live) == scope_stack_.back()->signals.end()) {
+            fail("a concurrent assertion may only sample variables of the instance "
+                 "that declares it; a hierarchical or package reference is not "
+                 "supported");
+        }
+
+        const ir::SignalInfo& live_info = module_.signal(live);
+        // The copy is one whole-signal Load feeding one whole-signal Store, so the
+        // type must have a flat plane value. LRM 16.6 explicitly contemplates
+        // sampling an element of a dynamic array / queue / associative array, and
+        // an unpacked aggregate would need a per-leaf copy.
+        // TODO: sample an aggregate / container variable leaf-wise.
+        if (live_info.is_event || value_cat(live_info.type) != ValueCat::scalar) {
+            fail("a concurrent assertion may only sample a variable with a packed "
+                 "value; a string, an event, an unpacked aggregate, and a dynamic "
+                 "array / queue / associative array are not supported");
+        }
+
+        ir::SignalInfo info;
+        info.name = "sva.shadow." + live_info.name;
+        info.loc  = live_info.loc;
+        info.type = live_info.type;
+        // Left a variable (is_net stays false): nothing drives a shadow but the
+        // sampling process, so it must neither take a net's undriven-z power-up nor
+        // join net resolution.
+
+        const ir::Signal shadow = register_signal(std::move(info));
+        sva_shadows_.emplace(key, shadow);
+        sva_shadow_pairs_.emplace_back(live, shadow);
+
+        return shadow;
+    }
+
+    // Register a shadow for every variable the assertion's boolean roots read.
+    // The reset root is skipped: LRM 16.15 evaluates `disable iff` from live
+    // values, so a variable appearing only there needs no shadow and must not pay
+    // for one. Atom lowering resolves a read through sva_shadow_of as well, so
+    // this pass is not what makes a shadow exist -- it fixes the copy order to the
+    // source's atom order rather than to the order the monitor happens to emit in.
+    void sva_sample_roots(const sva::Result& lowered) {
+        ankerl::unordered_dense::set<uint32_t> atoms;
+        ankerl::unordered_dense::set<uint32_t> seen;
+        std::vector<uint32_t>                  work;
+        for (uint32_t r = 0; r < lowered.root_index.size(); r++) {
+            if (r != lowered.monitor.reset_root) {
+                work.push_back(lowered.root_index[r]);
+            }
+        }
+        // Operands point backwards but may be shared, so a plain DFS would revisit
+        // a common subterm once per parent.
+        while (!work.empty()) {
+            const uint32_t at = work.back();
+            work.pop_back();
+            if (!seen.insert(at).second) {
+                continue;
+            }
+            const sva::Result::RootNode& n = lowered.nodes[at];
+            switch (n.op) {
+                case sva::Result::RootNode::Op::Atom:
+                    atoms.insert(n.lhs);
+                    break;
+                case sva::Result::RootNode::Op::Const:
+                    break;
+                case sva::Result::RootNode::Op::Not:
+                    work.push_back(n.lhs);
+                    break;
+                case sva::Result::RootNode::Op::And:
+                case sva::Result::RootNode::Op::Or:
+                    work.push_back(n.lhs);
+                    work.push_back(n.rhs);
+                    break;
+            }
+        }
+
+        // Walked in atom order, so the shadow set is a function of the source
+        // rather than of the traversal. A boolean leaf is an ordinary expression:
+        // its operands are the variables sampled, and a function-internal read is
+        // not an operand of it (the same rule continuous_events applies).
+        for (uint32_t i = 0; i < lowered.atoms.size(); i++) {
+            if (!atoms.contains(i) || lowered.atoms[i].expr == nullptr) {
+                continue;
+            }
+            SensitivityCollector c(sigmap_, SensitivityMode::ImplicitEvent);
+            lowered.atoms[i].expr->visit(c);
+            for (const ir::Signal s : c.reads) {
+                sva_shadow_of(s);
+            }
+        }
+    }
+
+    // Emit the Preponed copy of every sampled variable as one synthesized process
+    // (LRM 4.4.2.1: the sample is taken before any body of the time step runs, and
+    // is equivalent to sampling the previous Postponed region). One process for the
+    // whole top, like the PreInit pass: the copies are independent whole-signal
+    // stores, so their order carries no meaning and one dispatch per step beats one
+    // per scope. A design with no concurrent assertion registers no shadow and so
+    // gets no process and no state at all.
+    void finalize_sva_sampling() {
+        if (sva_shadow_pairs_.empty()) {
+            return;
+        }
+        ir::Builder b(module_.pool);
+        for (const auto& [live, shadow] : sva_shadow_pairs_) {
+            const ir::SourceLoc l = module_.signal(shadow).loc;
+            b.binary(ir::Inst::Tag::Store,
+                     b.signal(shadow, l),
+                     b.unary(ir::Inst::Tag::Load, b.signal(live, l), l),
+                     l);
+        }
+        module_.add_process(ir::Process{ .activation = ir::Activation::Preponed, .ir = b.finish() });
+        sva_shadow_pairs_.clear();
     }
 
     // for-loop. The initialization runs once in the enclosing region; the
@@ -12307,6 +13039,16 @@ private:
     // symbol is one of the current function's locals, else a module Signal (which
     // a function may also reference directly). signal_of fails loudly if unknown.
     ir::Index value_lvalue(const ValueSymbol& vs, ir::Builder& b, ir::SourceLoc l) {
+        if (sva_sampled_) {
+            // Inside a sampled assertion atom (LRM 16.5): an assertion expression
+            // reads the value each variable held before this time step's updates,
+            // so every operand resolves to its Preponed shadow rather than the live
+            // slot. signal_of is the only path taken here -- an assertion is never
+            // lowered inside a function, so a frame local cannot reach this, and a
+            // `this`-relative property fails loudly there rather than silently
+            // reading live state.
+            return b.signal(sva_shadow_of(signal_of(vs)), l);
+        }
         // A static class property is shared storage (never a frame local or `this`
         // member), whether referenced bare in a method, as `C::p`, or `p` in a
         // static method. Resolve it to its shared signal before any frame/this path.
@@ -13686,6 +14428,14 @@ private:
     // whole instance hierarchy into one run-once pre-init process, finalized at the
     // end of the top instance. Lazily engaged: absent when no initializer exists.
     std::optional<ir::Builder> preinit_;
+    // Live signal -> its Preponed shadow. LRM 16.5: assertion expressions read
+    // sampled values, and what is sampled is the VARIABLE, not the expression.
+    ankerl::unordered_dense::map<uint32_t, ir::Signal> sva_shadows_;
+    // In creation order, so the sampling process copies them deterministically.
+    std::vector<std::pair<ir::Signal, ir::Signal>> sva_shadow_pairs_;
+    // Set while lowering one sampled assertion atom, so value_lvalue resolves
+    // through sva_shadow_of. Scoped by SampledScope, never assigned bare.
+    bool sva_sampled_ = false;
     // Diagnostics from members that failed and were recovered past, in the order
     // the walk hit them. Drained by lower_compilation.
     std::vector<Diagnostic> diags_;

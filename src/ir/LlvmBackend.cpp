@@ -2659,7 +2659,7 @@ private:
             record_           = nullptr;
             fork_record_      = nullptr;
             cur_is_task_      = false;
-            lowering_preinit_ = false;
+            silent_stores_ = false;
             hdl_              = nullptr;
             auto* entry_bb = llvm::BasicBlock::Create(ctx_, "entry", fn_);
             b_.SetInsertPoint(entry_bb);
@@ -2704,7 +2704,12 @@ private:
         record_           = nullptr;
         fork_record_      = nullptr;
         cur_is_task_      = false;
-        lowering_preinit_ = proc.activation == Activation::PreInit;
+        // PreInit applies declaration initializers and Preponed captures sampled
+        // values; neither is a design-visible write, so neither may wake a
+        // process. Everything downstream keys on this rather than on the
+        // activation, because the property is "this store generates no event".
+        silent_stores_ = proc.activation == Activation::PreInit ||
+                         proc.activation == Activation::Preponed;
 
         auto* none     = llvm::ConstantTokenNone::get(ctx_);
         auto* null     = llvm::ConstantPointerNull::get(ptr_ty);
@@ -3856,6 +3861,39 @@ private:
         const auto all  = mod_.processes();
         for (uint32_t g = 0; g < procs.size(); ++g) {
             if (all[groups_[g].front()].activation != Activation::Final) {
+                continue;
+            }
+            llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
+            b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
+            b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
+        }
+    }
+
+    // Whether the design has anything to sample. A design with no concurrent
+    // assertions must pay nothing for this region existing.
+    bool has_preponed() const {
+        for (const Process& p : mod_.processes()) {
+            if (p.activation == Activation::Preponed) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Run every Preponed process once (LRM 4.4.2.1). Called at the top of a new
+    // time step -- after the wheel has fired its timers, which only enqueues
+    // handles, and before any body of that step executes -- and once from
+    // emit_main so time zero is sampled too.
+    //
+    // A Preponed body has no timing, so one resume runs it to completion, and its
+    // stores generate no events (silent_stores_), so nothing wakes on a shadow.
+    void emit_preponed_run(llvm::Value* state, llvm::Value* wheel,
+                           const std::vector<llvm::Function*>& procs) {
+        auto* ptr_ty    = llvm::PointerType::getUnqual(ctx_);
+        auto* proc_fnty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
+        const auto all  = mod_.processes();
+        for (uint32_t g = 0; g < procs.size(); ++g) {
+            if (all[groups_[g].front()].activation != Activation::Preponed) {
                 continue;
             }
             llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
@@ -5972,7 +6010,7 @@ private:
     // signal without waiters, or a PreInit store (variable declaration initializers
     // generate no events).
     ServiceSnapshot service_snapshot(const LValue& lv) {
-        const bool service = !lowering_preinit_ && lv.is_signal && signal_has_waiters(lv.sig);
+        const bool service = !silent_stores_ && lv.is_signal && signal_has_waiters(lv.sig);
         if (!service) {
             return {};
         }
@@ -6594,6 +6632,14 @@ private:
             b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
         }
 
+        // Time zero has no preceding wheel tick, so its Preponed sample happens
+        // here rather than in the post-tick block. After PreInit, so a sample sees
+        // declaration initializers; before the seed loop, so it precedes every
+        // body of the first step. This is also the default sampled value LRM
+        // 16.5.1 wants for a value-change function called at or before the first
+        // clocking event.
+        emit_preponed_run(state, wheel, procs);
+
         // One handle per fusion group; a group's activation facts come from its
         // first member (identical across fused members by the group key).
         std::vector<llvm::Value*> hdls(procs.size(), nullptr);
@@ -6602,6 +6648,9 @@ private:
             const Process& p = all[k];
             if (p.activation == Activation::PreInit) {
                 continue; // already run above
+            }
+            if (p.activation == Activation::Preponed) {
+                continue; // run once per timestep from the post-tick block
             }
             if (p.activation == Activation::Final) {
                 continue; // deferred to emit_finals_run at end of simulation
@@ -7000,7 +7049,13 @@ private:
         llvm::Value* ticked = b_.CreateCall(wheel_advance_fn(), { wheel, wheel });
         // Time advanced: a new instant begins, so reset the oscillation counter.
         b_.CreateStore(b_.getInt64(0), sym(osc_count_gv_));
-        if (!inertial_sigs_.empty()) {
+        const bool preponed = has_preponed();
+        if (preponed || !inertial_sigs_.empty()) {
+            // Preponed (LRM 4.4.2.1) and inertial continuous-assignment delay
+            // (LRM 10.3.3) both belong at the top of a new time step, ahead of the
+            // active drain, and in that order: sampling precedes every update of
+            // the step it names, including a CA release.
+            //
             // Inertial continuous-assignment delay (LRM 10.3.3): a CA updates its net
             // in the ACTIVE region, so a store that fired on this wheel tick must be
             // visible to same-instant processes the tick also resumed. Commit those
@@ -7009,9 +7064,12 @@ private:
             // NBA-region intra loop still runs (below), but only sees records armed
             // during this instant's active region (a `#0` continuous assign), the
             // wheel-fired ones already released here.
-            auto* post_tick = llvm::BasicBlock::Create(ctx_, "wheel.inertial", fn);
+            auto* post_tick = llvm::BasicBlock::Create(ctx_, "wheel.posttick", fn);
             b_.CreateCondBr(b_.CreateICmpNE(ticked, b_.getInt32(0)), post_tick, wdone);
             b_.SetInsertPoint(post_tick);
+            if (preponed) {
+                emit_preponed_run(state, wheel, procs);
+            }
             for (const Signal sig : inertial_sigs_) {
                 emit_intra_commit(sig);
             }
@@ -7861,7 +7919,7 @@ private:
                 // The mm plane is an identical i(2W); copy element-wise,
                 // filling the dest z (0 when the source is never-z).
                 emit_array_zdiff_copy(d_base, s_base, ds, ss, count, dlv.sig,
-                                      !lowering_preinit_ && dlv.is_signal &&
+                                      !silent_stores_ && dlv.is_signal &&
                                         signal_has_waiters(dlv.sig));
                 return;
             }
@@ -7876,7 +7934,7 @@ private:
         // destination), but only when the bytes actually change — an
         // unconditional wake would never settle a feedback delta wave. Detect
         // the change with a memcmp of old dest vs new source *before* the copy.
-        const bool service = !lowering_preinit_ && dlv.is_signal &&
+        const bool service = !silent_stores_ && dlv.is_signal &&
                              signal_has_waiters(dlv.sig);
         llvm::Value* changed = nullptr;
         if (service) {
@@ -12918,7 +12976,7 @@ private:
         // A whole-array write has no per-element edge facts; wake the memory's
         // Any-edge readers when any byte landed, mirroring the deferred
         // array-NBA commit (rt_nba_arr_dirty -> service_any_waiters).
-        if (!lowering_preinit_ && signal_has_waiters(info.mem)) {
+        if (!silent_stores_ && signal_has_waiters(info.mem)) {
             auto* fn   = b_.GetInsertBlock()->getParent();
             auto* svc  = llvm::BasicBlock::Create(ctx_, "fread.svc", fn);
             auto* cont = llvm::BasicBlock::Create(ctx_, "fread.cont", fn);
@@ -12928,7 +12986,7 @@ private:
             b_.CreateBr(cont);
             b_.SetInsertPoint(cont);
         }
-        if (!lowering_preinit_) {
+        if (!silent_stores_) {
             vcd_touch_array(info.mem);   // bulk write: mark the array for the dump
         }
         set_value(i, packed(r, r, zero(32)));
@@ -12998,7 +13056,7 @@ private:
                       { path, path_len, mm_base, z_base, b_.getInt32(stride),
                         b_.getInt32(s.elem_count), b_.getInt32(s.width), b_.getInt64(at.left),
                         b_.getInt64(at.right), start, finish, b_.getInt32(flags) });
-        if (!lowering_preinit_) {
+        if (!silent_stores_) {
             vcd_touch_array(info.target);   // bulk write: mark the array for the dump
         }
         // TODO: $readmem services no wait queues — a process already waiting on
@@ -13271,7 +13329,7 @@ private:
     // a non-dumped signal or a PreInit store (before $dumpvars, subsumed by the
     // initial dump).
     void vcd_touch_lvalue(const LValue& lv) {
-        if (!design_uses_vcd_ || lowering_preinit_ || !lv.is_signal) {
+        if (!design_uses_vcd_ || silent_stores_ || !lv.is_signal) {
             return;
         }
         const int32_t base = vcd_index_[static_cast<uint32_t>(lv.sig)];
@@ -16613,7 +16671,7 @@ private:
     std::vector<uint32_t> param_llvm_index_;
     // Set while lowering a PreInit process: its stores apply variable declaration
     // initializers and must generate no events, so wait-queue servicing is skipped.
-    bool                    lowering_preinit_ = false;
+    bool                    silent_stores_ = false;
     // Compile/simulation knobs (z elision, ...); see SimConfig.h.
     SimulationConfig        config_;
     // Renders a SourceLoc for a sanitizer report baked into the emitted code.

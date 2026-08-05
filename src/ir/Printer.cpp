@@ -1018,6 +1018,9 @@ void print_module(const Module& m, std::ostream& os, const LocResolver& resolve)
             case Activation::PreInit:
                 os << "preinit";
                 break;
+            case Activation::Preponed:
+                os << "preponed";
+                break;
             case Activation::Initial:
                 os << "initial";
                 break;
