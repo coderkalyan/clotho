@@ -510,13 +510,32 @@ endmodule
 )", "itself an implication");
 }
 
-TEST_CASE("an assertion with no clocking event is refused") {
+TEST_CASE("an assertion with no clocking event and nothing to infer from is refused") {
+    // An `initial` with no timing control offers 16.14.6 no candidate event, and
+    // there is no default clocking block, so the assertion has no clock at all.
+    // slang's own analysis is what catches this one -- clotho's guard sits behind
+    // it as a backstop -- but the requirement is only that it stay loud, so the
+    // needle is the wording both share.
     refuses(R"(
 module t;
   bit clk, a, b;
   initial ap: assert property (a |=> b);
 endmodule
-)", "explicit clocking event");
+)", "clocking event");
+
+    // Same, with the clock present but disqualified: LRM 16.14.6 only infers an
+    // event whose terms appear nowhere else in the procedure, and here `clk` is
+    // also read into `seen`. Nothing is inferable, so this must not quietly pick
+    // `clk` anyway.
+    refuses(R"(
+module t;
+  bit clk, a, b, seen;
+  always @(posedge clk) begin
+    seen <= clk;
+    assert property (a |=> b);
+  end
+endmodule
+)", "clocking event");
 }
 
 TEST_CASE("a nonblocking assignment in an action block lowers, for Re-NBA to commit") {
@@ -625,6 +644,362 @@ module t;
   ap: assert property (@(posedge clk) f(a) |=> b);
 endmodule
 )", "function call in a concurrent assertion expression");
+}
+
+// -- Inferred clocking (LRM 16.14.6) ----------------------------------------
+//
+// A property with no clocking event of its own takes the one from the procedure
+// it sits in. slang's analysis pass does the inference; these check that clotho
+// reads it and that what reaches the monitor is the enclosing procedure's clock
+// -- both the signal and the edge, since defaulting the edge to posedge would
+// pass a signal-only check while silently halving the sample rate.
+// tests/sva/diff_inferclk.sv is the differential half of this.
+
+TEST_CASE("an assertion in a clocked procedure infers that procedure's clock") {
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, a, b;
+  always @(posedge clk) assert property (a |=> b);
+endmodule
+)", r);
+    REQUIRE(r.ok);
+    REQUIRE(m.monitors.size() == 1);
+
+    const ir::AssertionMonitor& mon = m.monitors[0];
+    CHECK(m.signal(mon.clock).name == "clk");
+    CHECK(mon.edge == ir::Edge::Positive);
+    // The inferred clock is not the only signal in scope, so the check above
+    // would also pass by accident if the monitor were stepped by nothing at all.
+    CHECK(mon.has_trigger);
+    CHECK_FALSE(mon.overlap);
+}
+
+TEST_CASE("an inferred clock carries the procedure's edge, not a default") {
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, gate, a, b;
+  always @(posedge gate) assert property (a |-> b);
+  always @(negedge clk) assert property (a |=> b);
+endmodule
+)", r);
+    REQUIRE(r.ok);
+    REQUIRE(m.monitors.size() == 2);
+
+    // Two procedures, two different clocks and two different edges: each monitor
+    // must take its own, so neither the signal nor the edge can be coming from a
+    // single design-wide guess.
+    CHECK(m.signal(m.monitors[0].clock).name == "gate");
+    CHECK(m.monitors[0].edge == ir::Edge::Positive);
+    CHECK(m.signal(m.monitors[1].clock).name == "clk");
+    CHECK(m.monitors[1].edge == ir::Edge::Negative);
+}
+
+TEST_CASE("a reset flop infers the clock and not the reset") {
+    // The pervasive testbench shape. Two events are in the list, and 16.14.6
+    // picks the one whose terms the body does not otherwise read: the body tests
+    // `rst_n`, so `negedge rst_n` is disqualified and `posedge clk` is left. This
+    // is the case a "just take the procedure's timing control" shortcut gets
+    // wrong, because the timing control here is the whole two-event list.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, rst_n, a, b;
+  int unsigned n;
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) n <= 0;
+    else n <= n + 1;
+    assert property (a |=> b);
+  end
+endmodule
+)", r);
+    REQUIRE(r.ok);
+    REQUIRE(m.monitors.size() == 1);
+    CHECK(m.signal(m.monitors[0].clock).name == "clk");
+    CHECK(m.monitors[0].edge == ir::Edge::Positive);
+}
+
+TEST_CASE("each duplicated instance body gets its own inferred clock") {
+    // slang analyses one instance body and skips every exact duplicate of it
+    // (InstanceSymbol::getCanonicalBody), while clotho lowers each instance's own
+    // body. An AST-keyed inference table misses the duplicates outright, and
+    // would name the analysed instance's clock signal if it did not. Two
+    // instances on two different clocks pin both halves.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module sub(input bit clk, input bit a, input bit b);
+  always @(posedge clk) assert property (a |=> b);
+endmodule
+module t;
+  bit ck0, ck1, a, b;
+  sub u0(ck0, a, b);
+  sub u1(ck1, a, b);
+endmodule
+)", r);
+    REQUIRE(r.ok);
+    REQUIRE(m.monitors.size() == 2);
+    CHECK(m.signal(m.monitors[0].clock).name == "u0.clk");
+    CHECK(m.signal(m.monitors[1].clock).name == "u1.clk");
+}
+
+TEST_CASE("an inferred clock clotho cannot place in the procedure is refused") {
+    // slang infers a clock here -- the `@(posedge clk)` the loop blocks on -- but
+    // it is not one of the events the procedure waits on, so clotho has no
+    // instance-local TimingControl to resolve it to. Refused, rather than
+    // substituting whatever event control happens to be at hand.
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  always begin
+    @(posedge clk);
+    assert property (a |=> b);
+  end
+endmodule
+)", "not one the enclosing procedure waits on");
+}
+
+TEST_CASE("an inferred clock and an explicit one lower identically") {
+    // The clocking event is peeled to the same TimingControl either way, so the
+    // monitor's whole shape -- not just its clock -- must be indistinguishable.
+    LowerResult       inferred_r;
+    const ir::Module& inferred = lower_for_monitor(R"(
+module t;
+  bit clk, a, b;
+  always @(posedge clk) assert property (a |=> b);
+endmodule
+)", inferred_r);
+    LowerResult       explicit_r;
+    const ir::Module& expl = lower_for_monitor(implication, explicit_r);
+    REQUIRE(inferred_r.ok);
+    REQUIRE(explicit_r.ok);
+    REQUIRE(inferred.monitors.size() == 1);
+    REQUIRE(expl.monitors.size() == 1);
+
+    const ir::AssertionMonitor& i = inferred.monitors[0];
+    const ir::AssertionMonitor& e = expl.monitors[0];
+    CHECK(inferred.signal(i.clock).name == expl.signal(e.clock).name);
+    CHECK(i.edge == e.edge);
+    CHECK(i.kind == e.kind);
+    CHECK(i.strength == e.strength);
+    CHECK(i.has_trigger == e.has_trigger);
+    CHECK(i.overlap == e.overlap);
+    CHECK(i.depth == e.depth);
+    CHECK(i.trigger.state_count == e.trigger.state_count);
+    CHECK(i.obligation.state_count == e.obligation.state_count);
+    CHECK(i.cubes.size() == e.cubes.size());
+}
+
+TEST_CASE("a default clocking block still refuses, ahead of any inference") {
+    // The other half of 16.14.6: with no candidate event in the procedure, the
+    // scope's `default clocking` supplies one (LRM 14.12) and slang hands it back
+    // through the same channel as a procedural inference. Clotho cannot lower a
+    // clocking block at all yet, so the member walk refuses the design before the
+    // assertion is reached -- which is the right order. This pins that it is the
+    // clocking block being refused and not the assertion being silently
+    // mis-clocked; it flips to a positive test when clocking blocks land.
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  default clocking cb @(posedge clk); endclocking
+  initial assert property (a |=> b);
+endmodule
+)", "kind=ClockingBlock");
+}
+
+// -- Named sequences, properties and lets (LRM 16.8, 16.12) -----------------
+//
+// slang expands an instance eagerly, so the contract clotho has to keep is that
+// instantiation is *transparent*: a named sequence or property must lower to
+// exactly the monitor its hand-expanded form does. Comparing the two whole
+// automata is a stronger check than any single field, and it is the one that
+// catches lowering an instance at the wrong layer.
+
+namespace {
+
+void same_automaton(const ir::AssertionAutomaton& got, const ir::AssertionAutomaton& want) {
+    CHECK(got.state_count == want.state_count);
+    CHECK(got.words == want.words);
+    CHECK(got.guard_of == want.guard_of);
+    CHECK(got.follow == want.follow);
+    CHECK(got.first == want.first);
+    CHECK(got.last == want.last);
+    CHECK(got.guard_states == want.guard_states);
+}
+
+// Lowers both sources and checks the two monitors are the same automaton.
+void lowers_like(std::string_view named, std::string_view expanded) {
+    LowerResult named_r;
+    LowerResult expanded_r;
+    const ir::Module& a = lower_for_monitor(named, named_r);
+    const ir::Module& b = lower_for_monitor(expanded, expanded_r);
+    CHECK_MESSAGE(named_r.ok, named_r.diagnostic_text());
+    CHECK_MESSAGE(expanded_r.ok, expanded_r.diagnostic_text());
+    REQUIRE(a.monitors.size() == 1);
+    REQUIRE(b.monitors.size() == 1);
+
+    CHECK(a.monitors[0].has_trigger == b.monitors[0].has_trigger);
+    CHECK(a.monitors[0].overlap == b.monitors[0].overlap);
+    CHECK(a.monitors[0].strength == b.monitors[0].strength);
+    CHECK(a.monitors[0].depth == b.monitors[0].depth);
+    CHECK(a.monitors[0].cubes.size() == b.monitors[0].cubes.size());
+    same_automaton(a.monitors[0].trigger, b.monitors[0].trigger);
+    same_automaton(a.monitors[0].obligation, b.monitors[0].obligation);
+}
+
+} // namespace
+
+TEST_CASE("a named sequence with formal arguments lowers as if written inline") {
+    // Two different actuals through the same declaration, so this fails if the
+    // body were shared rather than expanded per use.
+    lowers_like(R"(
+module t;
+  bit clk, a, b, c;
+  sequence ab(x, y);
+    x ##1 y;
+  endsequence
+  ap: assert property (@(posedge clk) ab(a, b) |-> c);
+endmodule
+)", R"(
+module t;
+  bit clk, a, b, c;
+  ap: assert property (@(posedge clk) (a ##1 b) |-> c);
+endmodule
+)");
+}
+
+TEST_CASE("a named property lowers at the property layer, not the sequence one") {
+    // The body is an implication, so it has to be handed to prop_implies. Routed
+    // through the sequence layer instead it would reject, and a property node
+    // reaching prop_sequence would trip libsva's operand-layer assertion.
+    lowers_like(R"(
+module t;
+  bit clk, a, b;
+  property p(x, y);
+    x |=> y;
+  endproperty
+  ap: assert property (@(posedge clk) p(a, b));
+endmodule
+)", R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> b);
+endmodule
+)");
+}
+
+TEST_CASE("a named sequence nests inside another named declaration") {
+    lowers_like(R"(
+module t;
+  bit clk, a, b, c;
+  sequence ab(x, y);
+    x ##1 y;
+  endsequence
+  property leads_to(x, y, z);
+    ab(x, y) |=> z;
+  endproperty
+  ap: assert property (@(posedge clk) leads_to(a, b, c));
+endmodule
+)", R"(
+module t;
+  bit clk, a, b, c;
+  ap: assert property (@(posedge clk) (a ##1 b) |=> c);
+endmodule
+)");
+}
+
+TEST_CASE("a let expands into the boolean layer with no assertion machinery") {
+    // slang expands a let call straight to the substituted Expression rather
+    // than to an AssertionInstanceExpression, so a let inside an assertion is
+    // already an ordinary boolean by the time the walker sees it.
+    lowers_like(R"(
+module t;
+  bit clk, a, b, c;
+  let both(x, y) = x && y;
+  ap: assert property (@(posedge clk) both(a, b) |=> c);
+endmodule
+)", R"(
+module t;
+  bit clk, a, b, c;
+  ap: assert property (@(posedge clk) (a && b) |=> c);
+endmodule
+)");
+}
+
+TEST_CASE("an uninstantiated sequence / property / let declaration emits nothing") {
+    // A declaration is a template: it has no behavior of its own, so skipping it
+    // in the module-member walk is the whole of its lowering.
+    LowerResult r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, a, b;
+  sequence unused_seq(x, y);
+    x ##1 y;
+  endsequence
+  property unused_prop(x, y);
+    unused_seq(x, y) |=> y;
+  endproperty
+  let unused_let(x, y) = x && y;
+  initial #1 $finish;
+endmodule
+)", r);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
+    CHECK(m.monitors.empty());
+    // No sampling shadow and no Preponed sampler either: nothing here is
+    // assertion machinery, because nothing was instantiated.
+    for (const ir::SignalInfo& s : m.signals()) {
+        CHECK_FALSE(s.name.starts_with("sva."));
+    }
+    for (const ir::Process& p : m.processes()) {
+        CHECK(p.activation != ir::Activation::Preponed);
+        CHECK(p.activation != ir::Activation::Observed);
+    }
+}
+
+TEST_CASE("a sequence with a local variable is refused") {
+    // LRM 16.10 local variables are per-attempt storage, and libsva's automaton
+    // is a plain state set with no data to attach a register file to. Refused at
+    // the instance rather than deeper, so the message names the real cause.
+    refuses(R"(
+module t;
+  bit clk, a, b, c;
+  sequence s;
+    int v;
+    (a, v = 1) ##1 (b && v == 1);
+  endsequence
+  ap: assert property (@(posedge clk) s |=> c);
+endmodule
+)", "local variables in a sequence or property");
+}
+
+TEST_CASE("a recursive property is refused") {
+    // LRM 16.12.4. `|=>` supplies the time advance that makes the recursion
+    // legal, so slang accepts this and hands back an instance whose body is a
+    // placeholder -- which is why the check is on the flag, not on the body.
+    refuses(R"(
+module t;
+  bit clk, a;
+  property p(x);
+    x |=> p(x);
+  endproperty
+  ap: assert property (@(posedge clk) p(a));
+endmodule
+)", "recursive property");
+}
+
+TEST_CASE("a disable iff inside a named property is refused, not silently dropped") {
+    // Only a `disable iff` at the top of the assertion is peeled into the
+    // request. LRM 16.12 also allows one at the top of a property declaration,
+    // where it would have to be hoisted back out through the instantiation.
+    refuses(R"(
+module t;
+  bit clk, rst, a, b;
+  property p;
+    disable iff (rst) a |=> b;
+  endproperty
+  ap: assert property (@(posedge clk) p);
+endmodule
+)", "disable iff");
 }
 
 // -- Sampling (LRM 16.5, 4.4.2.1) -------------------------------------------
@@ -816,4 +1191,217 @@ module t;
   ap: assert property (@(posedge clk) (s == "x") |=> (s != "x"));
 endmodule
 )", "may only sample a variable with a packed value");
+}
+
+// -- Sequence repetition and combinators (LRM 16.9) --------------------------
+//
+// libsva ASSERTS its repetition preconditions rather than reporting them, so a
+// shape that slips past the frontend aborts the compiler instead of producing a
+// diagnostic. Several of the guards below are unreachable today because slang
+// refuses the same shape first; they are still tested, because what must never
+// happen is the operand pair reaching sva_seq_repeat, and each test records
+// which layer is actually doing the refusing.
+
+TEST_CASE("consecutive repetition lowers to one obligation state per cycle") {
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> b[*2]);
+endmodule
+)", r);
+    REQUIRE(r.ok);
+    REQUIRE(m.monitors.size() == 1);
+    const ir::AssertionMonitor& mon = m.monitors[0];
+
+    CHECK(mon.has_trigger);
+    // Glushkov gives one state per letter OCCURRENCE, and `b[*2]` is two
+    // occurrences of the same letter rather than one state visited twice.
+    CHECK(mon.obligation.state_count == 2);
+    // Two cycles of longest match is two attempts that can be pending at once.
+    CHECK(mon.depth == 2);
+}
+
+TEST_CASE("a bounded repetition range lowers, and an unbounded one does not") {
+    LowerResult r;
+    lower_for_monitor(R"(
+module t;
+  bit clk, a, b, c;
+  ap: assert property (@(posedge clk) a |=> b[*1:3] ##1 c);
+endmodule
+)", r);
+    CHECK(r.ok);
+
+    // `[*1:$]` in a consequent has no bounded longest match, so the number of
+    // concurrent obligations is unbounded. This is sva_lower reporting, not a
+    // frontend guard -- the IR is perfectly well formed.
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> b[*1:$]);
+endmodule
+)", "no bounded longest match");
+}
+
+TEST_CASE("sequence or lowers to the union of both branches") {
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, a, b, c;
+  ap: assert property (@(posedge clk) a |=> (b ##1 c) or (c ##1 b));
+endmodule
+)", r);
+    REQUIRE(r.ok);
+    REQUIRE(m.monitors.size() == 1);
+    // A disjunction is the disjoint union of the two fragments, so two letters
+    // per branch is four states: `or` does not merge the shared alphabet.
+    CHECK(m.monitors[0].obligation.state_count == 4);
+}
+
+TEST_CASE("sequence intersect lowers over both operands") {
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, a, b, c;
+  ap: assert property (@(posedge clk) a |=> (b ##1 c) intersect (b[*2]));
+endmodule
+)", r);
+    REQUIRE(r.ok);
+    REQUIRE(m.monitors.size() == 1);
+    // Both operands span the same two cycles, so the obligation's longest match
+    // is two cycles -- intersect constrains the span, it does not extend it.
+    CHECK(m.monitors[0].depth == 2);
+}
+
+TEST_CASE("goto and non-consecutive repetition lower in an antecedent") {
+    // The trigger side is existential, so an unbounded match is free there.
+    LowerResult r;
+    lower_for_monitor(R"(
+module t;
+  bit clk, b, c, rst;
+  ap: assert property (@(posedge clk) (rst ##1 b[->2]) |=> c);
+endmodule
+)", r);
+    CHECK(r.ok);
+
+    lower_for_monitor(R"(
+module t;
+  bit clk, b, c, rst;
+  ap: assert property (@(posedge clk) (rst ##1 b[=2]) |=> c);
+endmodule
+)", r);
+    CHECK(r.ok);
+}
+
+TEST_CASE("a repetition with a zero lower bound is refused") {
+    // libsva's seqRepeat asserts `lo >= 1`: the IR has no empty match, and
+    // removing one is a rewrite of whatever ENCLOSES the repetition, not of the
+    // repetition itself. The LRM only bans an empty-admitting sequence in a few
+    // positions, so slang passes both of these through and clotho's guard is
+    // the only thing standing between them and an aborted compiler.
+    refuses(R"(
+module t;
+  bit clk, a, c;
+  ap: assert property (@(posedge clk) a[*0:2] |=> c);
+endmodule
+)", "zero lower bound admits the empty sequence");
+
+    // Reached through a concatenation rather than directly as an antecedent.
+    refuses(R"(
+module t;
+  bit clk, a, b, c;
+  ap: assert property (@(posedge clk) (a[*0:2] ##1 b) |=> c);
+endmodule
+)", "zero lower bound admits the empty sequence");
+
+    // `[=0:n]` and `[->0]` are the same assertion for the other two flavors.
+    refuses(R"(
+module t;
+  bit clk, b, c, rst;
+  ap: assert property (@(posedge clk) (rst ##1 b[=0:2]) |=> c);
+endmodule
+)", "zero lower bound admits the empty sequence");
+}
+
+TEST_CASE("a reversed repetition range never reaches libsva") {
+    // libsva's seqRepeat asserts `lo <= hi`. slang rejects the reversed range
+    // while binding, so clotho's own guard is unreachable through source today;
+    // this pins the fact that SOMETHING refuses it before the builder runs.
+    refuses(R"(
+module t;
+  bit clk, a, c;
+  ap: assert property (@(posedge clk) a[*3:1] |=> c);
+endmodule
+)", "greater than specified maximum");
+}
+
+TEST_CASE("goto repetition over a compound sequence never reaches libsva") {
+    // seqRepeat asserts a seq_boolean operand for goto and non-consecutive
+    // repetition: both are defined by the cycles in which the operand does NOT
+    // hold, which needs its negation, and "not necessarily back to back" has no
+    // reading for an operand whose own matches can overlap. slang refuses the
+    // shape outright (SeqInstanceRepetition), for a parenthesized sequence...
+    refuses(R"(
+module t;
+  bit clk, a, b, c;
+  ap: assert property (@(posedge clk) (a ##1 b)[->2] |=> c);
+endmodule
+)", "non-consecutive or go-to repetition");
+
+    // ...and for a named one, which is the other way a compound operand could
+    // reach sva_seq_repeat now that named sequences expand inline.
+    refuses(R"(
+module t;
+  bit clk, a, b, c;
+  sequence s;
+    a ##1 b;
+  endsequence
+  ap: assert property (@(posedge clk) s[=2] |=> c);
+endmodule
+)", "non-consecutive or go-to repetition");
+}
+
+TEST_CASE("a goto repetition in a consequent is refused") {
+    // Legal SystemVerilog, and a well formed IR -- but `b[->2]` has no bounded
+    // longest match, so the obligations it can leave pending are unbounded.
+    // sva_lower reports this one; it is not a frontend guard.
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> b[->2]);
+endmodule
+)", "no bounded longest match");
+
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> b[=2]);
+endmodule
+)", "no bounded longest match");
+}
+
+TEST_CASE("sequence operators libsva still has no tag for keep their refusal") {
+    // The Binary arm handles `or` and `intersect` and must not have swallowed
+    // the rest: each of these still has to name itself as unsupported rather
+    // than lower to something that merely resembles it.
+    refuses(R"(
+module t;
+  bit clk, a, b, c;
+  ap: assert property (@(posedge clk) (a ##1 b) within (c ##1 c ##1 c));
+endmodule
+)", "not supported yet");
+
+    refuses(R"(
+module t;
+  bit clk, a, b, c;
+  ap: assert property (@(posedge clk) (a throughout (b ##1 c)) |=> c);
+endmodule
+)", "not supported yet");
+
+    refuses(R"(
+module t;
+  bit clk, a, b, c;
+  ap: assert property (@(posedge clk) first_match(a ##[1:2] b) |=> c);
+endmodule
+)", "not supported yet");
 }

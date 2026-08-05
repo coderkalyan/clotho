@@ -9,6 +9,7 @@
 #include <slang/ast/expressions/MiscExpressions.h>
 #include <slang/ast/expressions/OperatorExpressions.h>
 #include <slang/ast/symbols/ValueSymbol.h>
+#include <slang/ast/types/Type.h>
 
 #include <ankerl/unordered_dense.h>
 
@@ -20,6 +21,7 @@ namespace {
 
 using slang::ast::AssertionExpr;
 using slang::ast::AssertionExprKind;
+using slang::ast::AssertionInstanceExpression;
 using slang::ast::BinaryAssertionOperator;
 using slang::ast::Expression;
 using slang::ast::ExpressionKind;
@@ -99,21 +101,24 @@ public:
         switch (expr.kind) {
             case AssertionExprKind::Simple: {
                 const auto& simple = expr.as<slang::ast::SimpleAssertionExpr>();
-                if (simple.repetition) {
-                    // TODO: sequence repetition [*] / [=] / [->] (LRM 16.9.2)
-                    // needs the range translated and the goto/nonconsecutive
-                    // operand checked against libsva's seq_boolean requirement.
-                    return reject("sequence repetition is not supported yet", &expr);
-                }
-                // A named sequence or property instance arrives as an
-                // AssertionInstanceExpression nested here; its body is already
-                // expanded, but binding local variables is not modelled.
-                if (simple.expr.kind == ExpressionKind::AssertionInstance) {
-                    // TODO: named sequence / property instantiation (LRM 16.8,
-                    // 16.12) -- walk AssertionInstanceExpression::body once
-                    // local variables are rejected explicitly.
-                    return reject("named sequences and properties are not supported yet",
-                                  &expr);
+                // A named sequence use, or a formal argument bound to one,
+                // arrives as an AssertionInstanceExpression nested here. slang
+                // expands it eagerly -- `body` already has the actual arguments
+                // substituted (MiscExpressions.h:235) -- so an instantiation is
+                // a recursion into that body, not a substitution pass. This is
+                // checked before the repetition below, because the operand of a
+                // repetition over an instance is the instance's body, not a
+                // boolean, and `boolean()` would silently make an atom of it.
+                if (const auto* inst = as_instance(simple.expr)) {
+                    if (!instance_supported(*inst, expr)) {
+                        return std::nullopt;
+                    }
+                    const auto body = sequence(inst->body);
+                    if (!body || !simple.repetition) {
+                        return body;
+                    }
+                    return repeat(*simple.repetition, *body, is_boolean_sequence(inst->body),
+                                  expr);
                 }
                 const auto guard = boolean(simple.expr, false, &expr);
                 if (!guard) {
@@ -123,17 +128,73 @@ public:
                 if (sva_seq_boolean(&ir_, *guard, &node) != SVA_OK) {
                     return reject("out of memory building an assertion sequence", &expr);
                 }
+                if (simple.repetition) {
+                    // The operand is the seq_boolean just built, which is the
+                    // shape goto and non-consecutive repetition require.
+                    return repeat(*simple.repetition, node, true, expr);
+                }
                 return node;
             }
             case AssertionExprKind::SequenceConcat:
                 return concat(expr.as<slang::ast::SequenceConcatExpr>(), expr);
+            case AssertionExprKind::SequenceWithMatch: {
+                // `(seq)[*n]`. slang only builds this node for a parenthesized
+                // sequence that carries a repetition or match items; a plain
+                // `(seq)` is the inner expression itself.
+                const auto& with = expr.as<slang::ast::SequenceWithMatchExpr>();
+                if (!with.matchItems.empty()) {
+                    // TODO: local variables and match items (LRM 16.10) -- the
+                    // assignments would have to run on a match, and libsva's
+                    // automaton carries no per-attempt data.
+                    return reject("sequence match items are not supported yet", &expr);
+                }
+                const auto seq = sequence(with.expr);
+                if (!seq) {
+                    return std::nullopt;
+                }
+                if (!with.repetition) {
+                    return seq;
+                }
+                return repeat(*with.repetition, *seq, is_boolean_sequence(with.expr), expr);
+            }
             case AssertionExprKind::Clocking:
                 // A nested clocking event is a multiclock sequence.
                 // TODO: multiclock sequences (LRM 16.13).
                 return reject("multiclock sequences are not supported yet", &expr);
+            case AssertionExprKind::Binary: {
+                const auto& binary = expr.as<slang::ast::BinaryAssertionExpr>();
+                const bool is_or = binary.op == BinaryAssertionOperator::Or;
+                const bool is_intersect = binary.op == BinaryAssertionOperator::Intersect;
+                if (!is_or && !is_intersect) {
+                    // TODO: and (length-independent conjunction), throughout,
+                    // within (LRM 16.9) -- libsva has no tag for any of them,
+                    // and `throughout` cannot be desugared because its LRM
+                    // definition goes through `[*0:$]`, an empty match.
+                    return reject("this sequence operator is not supported yet", &expr);
+                }
+                // Both operands are sequences, so this recurses through
+                // sequence() and never through property(): `or` and `intersect`
+                // are sequence-layer operators, and the identically spelled
+                // property-layer `or` is a different node slang builds only
+                // where a property is allowed.
+                const auto lhs = sequence(binary.left);
+                if (!lhs) {
+                    return std::nullopt;
+                }
+                const auto rhs = sequence(binary.right);
+                if (!rhs) {
+                    return std::nullopt;
+                }
+                sva_node node = 0;
+                const sva_status status = is_or ? sva_seq_or(&ir_, *lhs, *rhs, &node)
+                                                : sva_seq_intersect(&ir_, *lhs, *rhs, &node);
+                if (status != SVA_OK) {
+                    return reject("out of memory building an assertion sequence", &expr);
+                }
+                return node;
+            }
             default:
-                // TODO: or / and / intersect / throughout / within /
-                // first_match / with-match-items (LRM 16.9).
+                // TODO: first_match (LRM 16.9) -- libsva has no tag for it.
                 return reject("this sequence operator is not supported yet", &expr);
         }
     }
@@ -180,6 +241,124 @@ public:
         return acc;
     }
 
+    // `seq[*lo:hi]`, `b[->lo:hi]` and `b[=lo:hi]` (LRM 16.9.2). libsva asserts
+    // its preconditions rather than reporting them, so each one is a refusal
+    // here: by the time a node exists it is too late. See
+    // concurrent-assertions.md 9.1.
+    std::optional<sva_node> repeat(const slang::ast::SequenceRepetition& repetition,
+                                   sva_node operand, bool operand_is_boolean,
+                                   const AssertionExpr& blame) {
+        sva_repeat kind = SVA_REPEAT_CONSECUTIVE;
+        switch (repetition.kind) {
+            case slang::ast::SequenceRepetition::Consecutive:
+                kind = SVA_REPEAT_CONSECUTIVE;
+                break;
+            case slang::ast::SequenceRepetition::GoTo:
+                kind = SVA_REPEAT_GOTO;
+                break;
+            case slang::ast::SequenceRepetition::Nonconsecutive:
+                kind = SVA_REPEAT_NONCONSECUTIVE;
+                break;
+        }
+
+        const uint32_t lo = repetition.range.min;
+        const uint32_t hi = repetition.range.max ? *repetition.range.max : SVA_UNBOUNDED;
+        if (lo == 0) {
+            // `[*0:n]` admits the empty match, which libsva has no node for:
+            // eliminating it is a rewrite of whatever *encloses* the repetition,
+            // not of the repetition. slang agrees -- checkNondegeneracy() reports
+            // AdmitsEmpty -- and refuses the shapes the LRM itself bans, so what
+            // reaches here is a legal one clotho cannot yet expand.
+            return reject("a repetition with a zero lower bound admits the empty "
+                          "sequence, which is not supported yet",
+                          &blame);
+        }
+        if (lo > hi) {
+            return reject("repetition range lower bound exceeds its upper bound", &blame);
+        }
+        if (kind != SVA_REPEAT_CONSECUTIVE && !operand_is_boolean) {
+            // Goto and non-consecutive repetition are defined by the cycles in
+            // which the operand does *not* hold, which needs its negation, and
+            // "not necessarily back to back" has no reading for an operand whose
+            // own matches can overlap.
+            return reject("goto and non-consecutive repetition of a compound sequence "
+                          "is not supported",
+                          &blame);
+        }
+        sva_node node = 0;
+        if (sva_seq_repeat(&ir_, kind, operand, lo, hi, &node) != SVA_OK) {
+            return reject("out of memory building an assertion repetition", &blame);
+        }
+        return node;
+    }
+
+    // Whether this sequence lowers to a single libsva seq_boolean, which is what
+    // goto and non-consecutive repetition require of their operand. The question
+    // is asked of slang's tree because libsva aborts on a wrong answer instead of
+    // returning one.
+    static bool is_boolean_sequence(const AssertionExpr& expr) {
+        if (expr.kind != AssertionExprKind::Simple) {
+            return false;
+        }
+        const auto& simple = expr.as<slang::ast::SimpleAssertionExpr>();
+        if (simple.repetition) {
+            // A repeated boolean is a sequence, not a boolean.
+            return false;
+        }
+        if (const auto* inst = as_instance(simple.expr)) {
+            // An instance is whatever its expanded body is.
+            return is_boolean_sequence(inst->body);
+        }
+        return true;
+    }
+
+    // -- Named sequences and properties (LRM 16.8, 16.12) --------------------
+
+    // An instance of a named sequence or property, or of a formal argument bound
+    // to one. Null for anything else, so a caller can fall through to its
+    // ordinary handling.
+    //
+    // A `let` never arrives here: slang expands a let call straight to the
+    // substituted Expression (MiscExpressions.cpp:1023-1025) instead of wrapping
+    // it, so a let inside an assertion lowers through the ordinary boolean path
+    // with no special case at all.
+    static const AssertionInstanceExpression* as_instance(const Expression& expr) {
+        if (expr.kind != ExpressionKind::AssertionInstance) {
+            return nullptr;
+        }
+        return &expr.as<AssertionInstanceExpression>();
+    }
+
+    // Which layer an instance's body sits in. slang types a sequence instance
+    // `sequence` and a property instance `property`, and does the same for an
+    // untyped formal argument bound to one (MiscExpressions.cpp:1310-1325), so
+    // the type is the discriminator and the symbol kind is not.
+    static bool is_property_instance(const AssertionInstanceExpression& inst) {
+        return inst.type->getCanonicalType().kind == slang::ast::SymbolKind::PropertyType;
+    }
+
+    // The two instance shapes clotho refuses. Both are decided before the body
+    // is walked, because for a recursive one the body slang hands back is an
+    // InvalidAssertionExpr placeholder rather than the declaration
+    // (MiscExpressions.cpp:878-884), and walking it would blame the wrong thing.
+    bool instance_supported(const AssertionInstanceExpression& inst,
+                            const AssertionExpr& blame) {
+        if (!inst.localVars.empty()) {
+            // TODO: local variables in a sequence or property (LRM 16.10) --
+            // every attempt in flight would carry its own copy, and libsva's
+            // automaton is a plain state set with no data to attach one to.
+            reject("local variables in a sequence or property are not supported yet", &blame);
+            return false;
+        }
+        if (inst.isRecursiveProperty) {
+            // TODO: recursive properties (LRM 16.12.4) -- an unbounded unrolling
+            // that no finite automaton represents.
+            reject("a recursive property is not supported yet", &blame);
+            return false;
+        }
+        return true;
+    }
+
     // -- Property layer ------------------------------------------------------
 
     std::optional<sva_node> property(const AssertionExpr& expr,
@@ -192,6 +371,32 @@ public:
                                                                               : SVA_WEAK;
                 return property(sw.expr, inner);
             }
+            case AssertionExprKind::Simple: {
+                // A named property use. Its body is a property, so it has to be
+                // lowered at this layer: routing it through the sequence tail
+                // below would hand prop_sequence a property operand, and libsva
+                // asserts on operand layer rather than reporting it. A sequence
+                // instance deliberately falls through instead, because "a
+                // sequence used as a property" is exactly what that tail does.
+                const auto& simple = expr.as<slang::ast::SimpleAssertionExpr>();
+                const auto* inst = simple.repetition ? nullptr : as_instance(simple.expr);
+                if (inst == nullptr || !is_property_instance(*inst)) {
+                    break;
+                }
+                if (!instance_supported(*inst, expr)) {
+                    return std::nullopt;
+                }
+                return property(inst->body, strength);
+            }
+            case AssertionExprKind::DisableIff:
+                // Only a `disable iff` at the top of the assertion is peeled, by
+                // lower_concurrent_assertion, which is the only place that can
+                // put one in the sva::Request. LRM 16.12 also allows it at the
+                // top of a `property` declaration, where reaching the request
+                // means hoisting it back out through the instantiation.
+                // TODO: `disable iff` inside a named property declaration.
+                return reject("a `disable iff` inside a named property is not supported yet",
+                              &expr);
             case AssertionExprKind::Binary: {
                 const auto& binary = expr.as<slang::ast::BinaryAssertionExpr>();
                 const bool overlap = binary.op == BinaryAssertionOperator::OverlappedImplication;

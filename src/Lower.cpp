@@ -10,11 +10,14 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <ankerl/unordered_dense.h>
 
 #include <slang/analysis/AnalysisManager.h>
+#include <slang/analysis/AnalyzedAssertion.h>
+#include <slang/analysis/AnalyzedProcedure.h>
 #include <slang/ast/ASTContext.h>
 #include <slang/ast/ASTVisitor.h>
 #include <slang/ast/Compilation.h>
@@ -760,6 +763,30 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
     }
 };
 
+// The verdict of LRM 16.14.6 clock inference, per concurrent assertion: which
+// event control slang picked as the assertion's clock. Both sides are SYNTAX
+// nodes, not AST nodes, and that is the whole point of the table.
+//
+// slang analyses an instance body once and skips every instance whose body is an
+// exact duplicate of it (InstanceSymbol::getCanonicalBody), while clotho lowers
+// each instance's own body -- distinct Statement and ValueSymbol objects per
+// instance. So an AST-keyed table would miss for every duplicate, and its AST
+// *values* would name the canonical instance's `clk` rather than this one's. The
+// syntax is shared by construction, so keying and answering in syntax makes the
+// verdict transferable, and the Lowerer re-resolves it against the procedure it
+// is actually lowering (see lower_concurrent_assertion).
+//
+// A null value means "two elaborations of this same source disagreed": the
+// verdict is then unusable and the assertion is refused rather than guessed at.
+//
+// Filled by lower_compilation from the analysis pass that already runs for the
+// dataflow diagnostics, and read rather than recomputed: inference is a
+// whole-procedure dataflow question -- 16.14.6 requires that no term of the
+// candidate event appear anywhere else in the procedure -- so the
+// statement-local walk a Lowerer does cannot answer it.
+using InferredClockMap =
+    ankerl::unordered_dense::map<const slang::syntax::SyntaxNode*, const slang::syntax::SyntaxNode*>;
+
 // Walks the elaborated AST of one top module into an ir::Module.
 class Lowerer {
 public:
@@ -952,6 +979,14 @@ public:
         globals_ = g;
     }
 
+    // Point this Lowerer at the inference verdicts the analysis pass produced
+    // (LRM 16.14.6). Null when the pass did not run -- lowering then only accepts
+    // an explicit clocking event, which is a refusal rather than a wrong answer.
+    // `clocks` must outlive every call made through this Lowerer.
+    void set_inferred_clocks(const InferredClockMap* clocks) {
+        inferred_clocks_ = clocks;
+    }
+
     // Diagnostics for members this Lowerer recovered past, and whether it did so
     // at all. Drained by lower_compilation once the walk finishes.
     [[nodiscard]] std::span<const Diagnostic> recovered_diags() const {
@@ -1134,6 +1169,24 @@ private:
                 case SymbolKind::ElabSystemTask:
                 case SymbolKind::Specparam:
                 case SymbolKind::DefParam:
+                // A named `sequence` / `property` declaration is a template, not
+                // a member with behavior of its own: nothing elaborates until it
+                // is instantiated, and slang expands the body with the actual
+                // arguments substituted at each use
+                // (AssertionInstanceExpression::body), which src/Sva.cpp recurses
+                // into. The declaration's own scope holds only formal argument
+                // and local variable symbols, and collect_scope_signals descends
+                // only into generate blocks, so there is no storage to register
+                // for it either.
+                case SymbolKind::Sequence:
+                case SymbolKind::Property:
+                // A `let` is the same kind of template, and an even simpler one:
+                // slang expands a let call straight to the substituted
+                // Expression rather than wrapping it in an
+                // AssertionInstanceExpression (MiscExpressions.cpp:1023-1025), so
+                // every use is already an ordinary expression by the time clotho
+                // sees it, inside an assertion or out of one.
+                case SymbolKind::LetDecl:
                     break;
                 default:
                     // Anything else (gate primitives, specify blocks, checkers,
@@ -5343,6 +5396,15 @@ private:
     }
 
     void lower_procedural_block(const ProceduralBlockSymbol& sym) {
+        // A concurrent assertion in this body may need the procedure's own event
+        // control as its inferred clock (LRM 16.14.6), so publish it for
+        // lower_concurrent_assertion. Cleared first, and set below only where the
+        // control is actually peeled: a module-item assertion (the early return
+        // just below) and an `initial` have no enclosing event control to inherit.
+        // Procedural blocks do not nest, so this needs no save/restore -- the next
+        // block clears it on entry.
+        proc_timing_ = nullptr;
+
         // A module-item concurrent assertion is not a process of its own. slang
         // wraps it in ProceduralBlockSymbol(Always, isFromAssertion) purely to
         // give it somewhere to live (BlockSymbols.cpp), and lowering the statement
@@ -5407,6 +5469,7 @@ private:
             } else if (is_event_control(timed.timing)) {
                 iff_guard = collect_wait_events(timed.timing, wait_events);
                 body      = &timed.stmt;
+                proc_timing_ = &timed.timing;
             }
         }
 
@@ -6126,6 +6189,34 @@ private:
         b.cond(pred, then_region, else_region, loc(a));
     }
 
+    // The event inside `local` that came from the syntax node `want`, or null if
+    // there is none. `local` is the event control of the procedure being lowered,
+    // so the result is an AST node of THIS instance -- which is the whole reason
+    // the inference verdict travels as syntax (see InferredClockMap).
+    //
+    // An event list is searched one level down: `always @(posedge clk or negedge
+    // rst_n)` is the ordinary reset-flop shape, and 16.14.6 infers the one event
+    // whose terms the body does not otherwise read -- usually `clk`, because the
+    // body tests `rst_n`. There is no deeper nesting to search: an event list
+    // cannot contain another.
+    static const TimingControl* local_event_with_syntax(const TimingControl*      local,
+                                                        const slang::syntax::SyntaxNode* want) {
+        if (local == nullptr || want == nullptr) {
+            return nullptr;
+        }
+        if (local->syntax == want) {
+            return local;
+        }
+        if (local->kind == TimingControlKind::EventList) {
+            for (const TimingControl* event : local->as<slang::ast::EventListControl>().events) {
+                if (event->syntax == want) {
+                    return event;
+                }
+            }
+        }
+        return nullptr;
+    }
+
     // -- Concurrent assertions (LRM 16) --------------------------------------
     //
     // `assert property (@(posedge clk) disable iff (rst) a |=> b);`
@@ -6184,20 +6275,50 @@ private:
             require_reactive_safe(*actions.fail);
         }
 
-        // Peel the clocking wrapper. A property with no clocking event would need
-        // LRM 16.14.6 inference from the enclosing procedure.
+        // Peel the clocking wrapper. With no wrapper the clock is inferred from
+        // the enclosing procedure (LRM 16.14.6): the analysis pass already decided
+        // WHICH event control that is, and inferred_clocks_ carries that verdict
+        // as a syntax node. Turning it back into a TimingControl is done here
+        // rather than there, against `proc_timing_` -- the event control of the
+        // procedure this Lowerer is lowering right now -- because the analysis
+        // sees one instance body per group of duplicates and its AST would name
+        // the wrong instance's clock signal (see InferredClockMap).
+        //
+        // Once resolved, an inferred clock is a TimingControl exactly like an
+        // explicit one, so everything below is unchanged by where it came from.
         const slang::ast::AssertionExpr* body = &a.propertySpec;
         const TimingControl* clocking = nullptr;
+        bool inference_untranslated = false;
         if (body->kind == AEK::Clocking) {
             const auto& wrapper = body->as<slang::ast::ClockingAssertionExpr>();
             clocking = &wrapper.clocking;
             body = &wrapper.expr;
+        } else if (inferred_clocks_ != nullptr && a.syntax != nullptr) {
+            const auto it = inferred_clocks_->find(a.syntax);
+            if (it != inferred_clocks_->end() && it->second != nullptr) {
+                clocking = local_event_with_syntax(proc_timing_, it->second);
+                inference_untranslated = clocking == nullptr;
+            }
+        }
+        if (clocking == nullptr && inference_untranslated) {
+            // slang inferred a clock that is not one of the events this procedure
+            // waits on: a `default clocking` block, a `$inferred_clock` expansion,
+            // or an event control buried in the body rather than leading it. Each
+            // needs its own resolution path, and picking the procedure's event
+            // control anyway would silently clock the assertion on the wrong edge.
+            // TODO: default/global clocking (LRM 14.12) as an inferred assertion
+            // clock; it is blocked behind clocking-block support generally.
+            fail("the clocking event inferred for this assertion is not one the "
+                 "enclosing procedure waits on");
         }
         if (clocking == nullptr) {
-            // TODO: inferred clocking (LRM 16.14.6) -- slang already computes it
-            // via AnalyzedProcedure::getInferredClock(), which clotho does not
-            // read yet.
-            fail("a concurrent assertion needs an explicit clocking event");
+            // Unreachable for a well-formed design: slang's own analysis rejects
+            // an assertion with neither an explicit nor an inferable clock
+            // (diag::AssertionNoClock), and lowering never runs on a design that
+            // errored. It still fails loudly rather than guessing, because the
+            // table is only as complete as the analysis pass that filled it.
+            fail("a concurrent assertion needs a clocking event, and none could be "
+                 "inferred from its context");
         }
         if (clocking->kind != TimingControlKind::SignalEvent) {
             // TODO: multiclock assertions (LRM 16.13).
@@ -14778,6 +14899,13 @@ private:
     // Lowerer built without one (e.g. tests that lower a single module with no
     // packages in play).
     Lowerer* globals_ = nullptr;
+    // Inference verdicts for concurrent assertions (see set_inferred_clocks).
+    // Null when nothing populated it.
+    const InferredClockMap* inferred_clocks_ = nullptr;
+    // The event control of the procedure currently being lowered, or null when it
+    // has none. Set by lower_procedural_block; read by lower_concurrent_assertion
+    // to resolve an inferred clock inside the instance being lowered.
+    const TimingControl* proc_timing_ = nullptr;
     // The function currently being lowered, or null when lowering a process. Drives
     // local-vs-signal name resolution and `return` handling.
     FnCtx* fn_ctx_ = nullptr;
@@ -14950,6 +15078,13 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
     const slang::Diagnostics&   diags     = comp.getAllDiagnostics();
     const slang::SourceManager* sm        = comp.getSourceManager();
     bool                        has_error = false;
+    // The analysis pass runs inside the diagnostics block below, but one thing it
+    // produces -- the LRM 16.14.6 clock inference verdicts -- is read much later,
+    // by the assertion lowering, so the table it fills is declared out here. The
+    // AnalysisManager itself is NOT: the table holds only syntax nodes, which the
+    // SyntaxTree owns, so nothing in it outlives the manager's arena and the
+    // analysis results are still freed as soon as their diagnostics are harvested.
+    InferredClockMap inferred_clocks;
     if (sm != nullptr) {
         slang::DiagnosticEngine engine(*sm);
         auto                    client = std::make_shared<slang::TextDiagnosticClient>();
@@ -14987,6 +15122,34 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
             slang::analysis::AnalysisOptions aopts;
             aopts.flags = slang::analysis::AnalysisFlags::CheckUnused | slang::analysis::AnalysisFlags::CheckShadow;
             slang::analysis::AnalysisManager analysis(aopts);
+            // Clock inference (LRM 16.14.6) runs as a side effect of analysing
+            // each assertion, and its result is reachable only through the
+            // AnalyzedAssertion slang builds for it -- so it is captured as the
+            // pass runs rather than queried afterwards, which would mean
+            // rediscovering each assertion's containing symbol to key the lookup.
+            // A listener may be called concurrently, but only when the manager was
+            // given a thread pool; this one was not, so every callback lands on
+            // this thread and the map needs no lock.
+            //
+            // Both sides are recorded as syntax, and the manager's own AST is not
+            // retained: see InferredClockMap for why an AST-keyed table would be
+            // both incomplete and wrong across duplicated instance bodies. Two
+            // elaborations of one source that disagree poison the entry (null), so
+            // the ambiguity surfaces as a refusal instead of a coin flip.
+            analysis.addListener([&](const slang::analysis::AnalyzedAssertion& aa) {
+                const auto* stmt = std::get_if<const ConcurrentAssertionStatement*>(&aa.astNode);
+                if (stmt == nullptr || (*stmt)->syntax == nullptr || aa.procedure == nullptr) {
+                    return;
+                }
+                const TimingControl* clk = aa.procedure->getInferredClock();
+                if (clk == nullptr || clk->syntax == nullptr) {
+                    return;
+                }
+                const auto [slot, fresh] = inferred_clocks.try_emplace((*stmt)->syntax, clk->syntax);
+                if (!fresh && slot->second != clk->syntax) {
+                    slot->second = nullptr;
+                }
+            });
             analysis.analyze(comp);
             for (const slang::Diagnostic& d : analysis.getDiagnostics()) {
                 harvest(d);
@@ -15088,6 +15251,7 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
             Lowerer           lw(*module, tick_fs, allow_system);
             lw.seed_signals(globals.sigmap());
             lw.set_globals(&globals);
+            lw.set_inferred_clocks(&inferred_clocks);
             lw.lower_top(*top, prefix);
             // Exported functions (single-top only, guarded above) resolve in this
             // top's scope — module-scope functions via `lw`, $unit/package via the
