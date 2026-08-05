@@ -215,8 +215,45 @@ public:
                 }
                 return node;
             }
+            case AssertionExprKind::FirstMatch: {
+                const auto& first = expr.as<slang::ast::FirstMatchAssertionExpr>();
+                if (!first.matchItems.empty()) {
+                    // TODO: local variables and match items (LRM 16.10) -- the
+                    // assignments would have to run on a match, and libsva's
+                    // automaton carries no per-attempt data.
+                    return reject("sequence match items are not supported yet", &expr);
+                }
+                const auto seq = sequence(first.seq);
+                if (!seq) {
+                    return std::nullopt;
+                }
+                sva_node node = 0;
+                // The one builder here whose failure is not always exhaustion:
+                // first_match keeps only the shortest match from each start, so
+                // whether a match survives depends on the others, which is not a
+                // language operation libsva can do by combining automata. It
+                // determinises the operand instead, and that subset construction
+                // is the one in this IR whose state count can be exponential in
+                // its operand's -- so SVA_ERROR_STATE_LIMIT is a reachable,
+                // user-visible outcome and gets the sentence sva_lower uses for
+                // it rather than a misleading complaint about memory.
+                const sva_status status = sva_seq_first_match(&ir_, *seq, &node);
+                if (status == SVA_ERROR_STATE_LIMIT) {
+                    return reject("`first_match` needs more automaton states than the "
+                                  "limit allows, because it determinises its operand",
+                                  &expr);
+                }
+                if (status != SVA_OK) {
+                    return reject("out of memory building an assertion sequence", &expr);
+                }
+                return node;
+            }
             default:
-                // TODO: first_match (LRM 16.9) -- libsva has no tag for it.
+                // Every sequence-layer operator of LRM 16.9 is handled above.
+                // What lands here is a property-layer node that reached a
+                // sequence position -- `not`/`nexttime`/`always`/`eventually`
+                // (Unary), `strong`/`weak` (StrongWeak), `accept_on` and its
+                // family (Abort), and the case / if-else property forms.
                 return reject("this sequence operator is not supported yet", &expr);
         }
     }

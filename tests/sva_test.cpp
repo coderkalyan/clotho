@@ -613,13 +613,74 @@ endmodule
 )", "not supported yet");
 }
 
-TEST_CASE("sequence operators libsva has no tag for are refused") {
-    refuses(R"(
+TEST_CASE("first_match determinises its operand, in the position where it counts") {
+    // `first_match` was the last sequence-layer operator of LRM 16.9 without a
+    // libsva tag, so there is no longer a "no tag" case at the sequence layer to
+    // test -- the property layer keeps its own, above.
+    //
+    // The ANTECEDENT is deliberate, and should survive whoever edits this. In a
+    // consequent, or as a bare top-level sequence property, `first_match` cannot
+    // change a verdict at all: a sequence property holds the moment its sequence
+    // completes a match, and the earliest match is exactly the one `first_match`
+    // keeps. Only an antecedent, where every match seeds its OWN obligation,
+    // makes the suppression observable. See concurrent-assertions.md 9.2.
+    //
+    // What is checked here is that the operand's automaton was really rebuilt.
+    // libsva lowers `first_match` by DETERMINISING its operand rather than by
+    // combining automata, because whether a match survives depends on whether a
+    // shorter one covers the same cycles. So a lowering that quietly dropped the
+    // operator -- the one mutant a consequent-position test cannot catch -- would
+    // leave the trigger automaton identical to the bare operand's. It must not be.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
 module t;
   bit clk, a, b, c;
   ap: assert property (@(posedge clk) first_match(a ##[1:2] b) |=> c);
 endmodule
-)", "not supported yet");
+)", r);
+    REQUIRE(r.ok);
+    REQUIRE(m.monitors.size() == 1);
+    REQUIRE(m.monitors[0].has_trigger);
+
+    LowerResult       plain_r;
+    const ir::Module& plain = lower_for_monitor(R"(
+module t;
+  bit clk, a, b, c;
+  ap: assert property (@(posedge clk) (a ##[1:2] b) |=> c);
+endmodule
+)", plain_r);
+    REQUIRE(plain_r.ok);
+    REQUIRE(plain.monitors.size() == 1);
+
+    // The subset construction over `a ##[1:2] b` costs a state: the two matches
+    // that the bare operand keeps apart have to be told apart by the automaton
+    // itself before the longer one can be dropped.
+    CHECK(m.monitors[0].trigger.state_count > plain.monitors[0].trigger.state_count);
+    // tests/sva/diff_firstmatch.sv is the behavioural half: the same antecedent
+    // on a trace where suppression removes three obligations, giving 4 reports
+    // where the operator-free design reports 7.
+}
+
+TEST_CASE("first_match with match items is refused") {
+    // Match items assign to local variables on a match (LRM 16.10), and libsva's
+    // automaton is a plain state set with no per-attempt data to assign into.
+    refuses(R"(
+module t;
+  bit clk, a, b, c;
+  ap: assert property (@(posedge clk) first_match(a ##[1:2] b, $display("m")) |=> c);
+endmodule
+)", "sequence match items are not supported yet");
+
+    // The same property without the match item lowers, so the refusal above is
+    // attributable to the match item and not to the operator around it.
+    LowerResult r;
+    lower_for_monitor(R"(
+module t;
+  bit clk, a, b, c;
+  ap: assert property (@(posedge clk) first_match(a ##[1:2] b) |=> c);
+endmodule
+)", r);
+    CHECK(r.ok);
 }
 
 TEST_CASE("a multiclock assertion is refused") {
