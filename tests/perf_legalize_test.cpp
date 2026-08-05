@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <string>
@@ -105,7 +106,13 @@ Coverage measure(const std::filesystem::path& dir) {
 // Skipped by default because this RTL is fetched (each case's fetch.sh), not
 // tracked.
 TEST_CASE("PERF legalize real designs" * doctest::skip()) {
-    const std::filesystem::path       root     = std::filesystem::path(CLOTHO_TEST_DIR) / "perf/cases";
+    // CLOTHO_PERF_CASES points at a checkout that has already fetched this RTL, so
+    // running against another tree needs no symlink into this one. (Making that
+    // symlink, then cleaning it up with `rm -rf tests/perf`, is how I briefly
+    // deleted the tracked perf harness.)
+    const char* const           env = std::getenv("CLOTHO_PERF_CASES");
+    const std::filesystem::path root =
+      env != nullptr ? std::filesystem::path(env) : std::filesystem::path(CLOTHO_TEST_DIR) / "perf/cases";
     static constexpr std::string_view kCases[] = { "picorv32", "hazard3", "coremark_cv32e40p" };
 
     size_t measured = 0;
