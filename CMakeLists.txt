@@ -196,6 +196,7 @@ add_library(clotho_ir_core STATIC
   src/ir/Builder.cpp
   src/ir/Printer.cpp
   src/ir/Analysis.cpp
+  src/ir/Eval.cpp
 )
 target_include_directories(clotho_ir_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(clotho_ir_core PUBLIC unordered_dense::unordered_dense)
@@ -287,6 +288,7 @@ add_executable(clotho_test
   tests/analysis_test.cpp
   tests/recovery_test.cpp
   tests/case_pragma_test.cpp
+  tests/eval_test.cpp
   tests/gate_test.cpp
   tests/net_resolution_test.cpp
   tests/llvm_backend_test.cpp
