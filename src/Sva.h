@@ -21,6 +21,7 @@
 namespace slang::ast {
 class AssertionExpr;
 class Expression;
+class TimingControl;
 } // namespace slang::ast
 
 namespace clotho::sva {
@@ -44,11 +45,16 @@ struct Atom {
 
 // What the front-end asks for.
 struct Request {
-    // The bound property expression, with the clocking and disable-iff wrappers
-    // already peeled off by the caller.
+    // The bound property expression, with a clocking wrapper at its top and the
+    // disable-iff wrapper already peeled off by the caller.
     const slang::ast::AssertionExpr* property = nullptr;
     // The disable-iff condition, or null when the assertion never disables.
     const slang::ast::Expression* disable = nullptr;
+    // The assertion's clocking event. A clock written inside a named sequence or
+    // property stays in the tree (LRM 16.13.1 lets it flow out to the whole
+    // assertion, but only the caller can decide it did), so the walk needs to
+    // know which event it may skip. Every other one is a multiclock refusal.
+    const slang::ast::TimingControl* clock = nullptr;
     ir::AssertionKind kind = ir::AssertionKind::Assert;
 };
 

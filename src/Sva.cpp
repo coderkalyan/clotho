@@ -5,6 +5,7 @@
 #include <sva.h>
 
 #include <slang/ast/Expression.h>
+#include <slang/ast/TimingControl.h>
 #include <slang/ast/expressions/AssertionExpr.h>
 #include <slang/ast/expressions/MiscExpressions.h>
 #include <slang/ast/expressions/OperatorExpressions.h>
@@ -31,7 +32,7 @@ using slang::ast::ExpressionKind;
 // that produced it.
 class Lowering {
 public:
-    explicit Lowering(Result& out) : out_(out) {
+    Lowering(Result& out, const slang::ast::TimingControl* clock) : out_(out), clock_(clock) {
         sva_ir_init(&ir_);
     }
     ~Lowering() {
@@ -157,10 +158,14 @@ public:
                 }
                 return repeat(*with.repetition, *seq, is_boolean_sequence(with.expr), expr);
             }
-            case AssertionExprKind::Clocking:
-                // A nested clocking event is a multiclock sequence.
-                // TODO: multiclock sequences (LRM 16.13).
-                return reject("multiclock sequences are not supported yet", &expr);
+            case AssertionExprKind::Clocking: {
+                const auto& wrapper = expr.as<slang::ast::ClockingAssertionExpr>();
+                if (!is_assertion_clock(wrapper)) {
+                    // TODO: multiclock sequences (LRM 16.13).
+                    return reject("multiclock sequences are not supported yet", &expr);
+                }
+                return sequence(wrapper.expr);
+            }
             case AssertionExprKind::Binary: {
                 const auto& binary = expr.as<slang::ast::BinaryAssertionExpr>();
                 // `throughout` is the one sequence-layer operator whose left
@@ -455,6 +460,27 @@ public:
         return true;
     }
 
+    // -- Clock flow (LRM 16.13.1) --------------------------------------------
+
+    // Whether this nested clocking event is the one that became the assertion's
+    // clock. A named sequence or property may declare its own event, and 16.13.1
+    // flows it out over the whole assertion when it is the only one there; the
+    // caller made that call and passed the event back as Request::clock, so the
+    // node here is that same event written where the user wrote it, and walking
+    // through it is exactly what the hoist means.
+    //
+    // Equivalence and not identity, because the same declaration instantiated
+    // twice is one clock written twice: slang expands each use into its own
+    // bound tree, so two uses of `sequence s; @(posedge clk) a ##1 b; endsequence`
+    // arrive as two distinct TimingControl objects naming the same event.
+    //
+    // Anything that does not match is a genuinely second clock, and this is the
+    // one place that decides so -- the caller's choice is only ever safe because
+    // every Clocking node in the tree passes through here.
+    bool is_assertion_clock(const slang::ast::ClockingAssertionExpr& wrapper) const {
+        return clock_ != nullptr && wrapper.clocking.isEquivalentTo(*clock_);
+    }
+
     // -- Property layer ------------------------------------------------------
 
     std::optional<sva_node> property(const AssertionExpr& expr,
@@ -483,6 +509,18 @@ public:
                     return std::nullopt;
                 }
                 return property(inst->body, strength);
+            }
+            case AssertionExprKind::Clocking: {
+                // `property p; @(posedge clk) a |=> b; endproperty`. The event
+                // has to be stepped over at THIS layer: falling through to the
+                // sequence tail would take the implication under it into
+                // sequence(), where an implication is not an operator at all.
+                const auto& wrapper = expr.as<slang::ast::ClockingAssertionExpr>();
+                if (!is_assertion_clock(wrapper)) {
+                    // TODO: multiclock properties (LRM 16.13).
+                    return reject("multiclock sequences are not supported yet", &expr);
+                }
+                return property(wrapper.expr, strength);
             }
             case AssertionExprKind::DisableIff:
                 // Only a `disable iff` at the top of the assertion is peeled, by
@@ -583,6 +621,10 @@ public:
 private:
     sva_ir ir_{};
     Result& out_;
+    // The assertion's clocking event, so a nested one written where the user
+    // wrote it can be told from a second clock. Never null in practice; the
+    // caller has already refused an assertion with no clock at all.
+    const slang::ast::TimingControl* clock_ = nullptr;
     ankerl::unordered_dense::map<std::pair<const void*, bool>, uint32_t> atoms_;
 };
 
@@ -700,7 +742,7 @@ bool available() {
 
 Result lower(const Request& request) {
     Result out;
-    Lowering lowering(out);
+    Lowering lowering(out, request.clock);
 
     const auto property = lowering.property(*request.property);
     if (!property) {

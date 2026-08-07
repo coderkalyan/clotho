@@ -934,6 +934,8 @@ public:
         lower_instance(top, prefix, Pass::Classify, &top_scope_, top.name);
         lower_instance(top, prefix, Pass::Emit, &top_scope_, top.name);
         emit_wire_resolvers();
+        // Before finalize_preinit, which closes the process the seeds go into.
+        finalize_sva_history();
         finalize_preinit();
         finalize_sva_sampling();
         module_.add_top(std::move(top_scope_));
@@ -6217,6 +6219,75 @@ private:
         return nullptr;
     }
 
+    // The first clocking event written *inside* a property or sequence body
+    // (LRM 16.13.1, clock flow). A declaration may carry its own clock --
+    //
+    //     sequence s; @(posedge clk) a ##1 b; endsequence
+    //     assert property (s);
+    //
+    // -- which puts the only clocking event the assertion has below the
+    // AssertionInstanceExpression, where peeling the top of `propertySpec`
+    // cannot see it.
+    //
+    // Hoisting one event out of the body is sound only because sva::lower
+    // compares every Clocking node it walks against the event chosen here and
+    // refuses any that is not structurally equivalent to it (Sva.cpp,
+    // AssertionExprKind::Clocking). Two consequences follow. A body carrying two
+    // different events still lands on the multiclock rejection, whichever of
+    // them this picks. And a body carrying one event is uniformly clocked by it,
+    // because every position with no event of its own inherits one from its
+    // context, and the only two candidates -- this event and the assertion's --
+    // are then the same event. The same sequence instantiated twice is one event
+    // for the same reason: the comparison asks for equivalence, not identity.
+    //
+    // The walk descends exactly where sva::lower descends, and no further.
+    // Over-collecting is the dangerous direction: an event lifted out of a
+    // subtree the lowering never walks would clock the assertion with nothing
+    // downstream left to check it against.
+    static const TimingControl* body_clock(const AssertionExpr& expr) {
+        using AEK = slang::ast::AssertionExprKind;
+        switch (expr.kind) {
+            case AEK::Clocking:
+                return &expr.as<ClockingAssertionExpr>().clocking;
+            case AEK::Simple: {
+                // A named sequence or property use; slang hands back a `body`
+                // that already has the actual arguments substituted.
+                const auto& simple = expr.as<SimpleAssertionExpr>();
+                if (simple.expr.kind != ExpressionKind::AssertionInstance) {
+                    return nullptr;
+                }
+                return body_clock(simple.expr.as<AssertionInstanceExpression>().body);
+            }
+            case AEK::SequenceConcat: {
+                for (const auto& element : expr.as<SequenceConcatExpr>().elements) {
+                    if (const TimingControl* clocking = body_clock(*element.sequence)) {
+                        return clocking;
+                    }
+                }
+                return nullptr;
+            }
+            case AEK::SequenceWithMatch:
+                return body_clock(expr.as<SequenceWithMatchExpr>().expr);
+            case AEK::Binary: {
+                const auto& binary = expr.as<BinaryAssertionExpr>();
+                const TimingControl* left = body_clock(binary.left);
+                return left != nullptr ? left : body_clock(binary.right);
+            }
+            case AEK::FirstMatch:
+                return body_clock(expr.as<FirstMatchAssertionExpr>().seq);
+            case AEK::StrongWeak:
+                return body_clock(expr.as<StrongWeakAssertionExpr>().expr);
+            case AEK::DisableIff:
+                return body_clock(expr.as<DisableIffAssertionExpr>().expr);
+            default:
+                // Unary, Abort, Conditional, Case and Invalid: sva::lower refuses
+                // each of them without walking an operand, so a clocking event
+                // underneath one could never be checked against the choice made
+                // here. Not descending keeps that impossible rather than unlikely.
+                return nullptr;
+        }
+    }
+
     // -- Concurrent assertions (LRM 16) --------------------------------------
     //
     // `assert property (@(posedge clk) disable iff (rst) a |=> b);`
@@ -6275,8 +6346,11 @@ private:
             require_reactive_safe(*actions.fail);
         }
 
-        // Peel the clocking wrapper. With no wrapper the clock is inferred from
-        // the enclosing procedure (LRM 16.14.6): the analysis pass already decided
+        // Resolve the clocking event, in the order LRM 16.13/16.14.6 imply. An
+        // explicit event at the top of the assertion wins. Failing that, one
+        // written inside the property or sequence body flows out to the whole
+        // assertion (16.13.1; see body_clock). Failing both, it is inferred from
+        // the enclosing procedure (16.14.6): the analysis pass already decided
         // WHICH event control that is, and inferred_clocks_ carries that verdict
         // as a syntax node. Turning it back into a TimingControl is done here
         // rather than there, against `proc_timing_` -- the event control of the
@@ -6284,8 +6358,11 @@ private:
         // sees one instance body per group of duplicates and its AST would name
         // the wrong instance's clock signal (see InferredClockMap).
         //
-        // Once resolved, an inferred clock is a TimingControl exactly like an
-        // explicit one, so everything below is unchanged by where it came from.
+        // Once resolved, an inferred or hoisted clock is a TimingControl exactly
+        // like an explicit one, so everything below is unchanged by where it came
+        // from. The one thing that is not: a clock hoisted out of the body leaves
+        // its ClockingAssertionExpr in place, so sva::lower is told which event
+        // became the assertion's and skips exactly that one.
         const slang::ast::AssertionExpr* body = &a.propertySpec;
         const TimingControl* clocking = nullptr;
         bool inference_untranslated = false;
@@ -6293,7 +6370,8 @@ private:
             const auto& wrapper = body->as<slang::ast::ClockingAssertionExpr>();
             clocking = &wrapper.clocking;
             body = &wrapper.expr;
-        } else if (inferred_clocks_ != nullptr && a.syntax != nullptr) {
+        } else if ((clocking = body_clock(*body)) == nullptr && inferred_clocks_ != nullptr &&
+                   a.syntax != nullptr) {
             const auto it = inferred_clocks_->find(a.syntax);
             if (it != inferred_clocks_->end() && it->second != nullptr) {
                 clocking = local_event_with_syntax(proc_timing_, it->second);
@@ -6350,6 +6428,7 @@ private:
         const sva::Request request{
             .property = body,
             .disable = disable,
+            .clock = clocking,
             .kind = kind,
         };
         sva::Result lowered = sva::lower(request);
@@ -6745,9 +6824,288 @@ private:
         SampledScope& operator=(const SampledScope&) = delete;
     };
 
+    // The $past history of one monitor: per sampled variable, a ring of that
+    // variable's earlier sampled values.
+    //
+    // LRM 16.9.3 measures history in CLOCK TICKS -- a value change function
+    // compares the sampled value against the one "from the most recent strictly
+    // prior time step in which the clocking event occurred" -- while the Preponed
+    // shadow is rewritten every TIME STEP. So the ring cannot live in the
+    // sampling process, which has no idea where the ticks are; it is shifted by
+    // the monitor, which runs per tick and already detects its own edge.
+    //
+    // Per MONITOR rather than per variable, which is correctness and not
+    // convenience: $past(v) under `@(posedge a)` and under `@(posedge b)` name
+    // different values, so a single shared ring per variable could answer at most
+    // one of them. It also makes the read/shift order self-evident, because both
+    // end up in one straight-line process body.
+    struct SvaHistory {
+        // Live signal -> its ring. ring[k] holds the shadow from k + 1 ticks ago,
+        // so $past(v, n) reads ring[n - 1] and the ring's LENGTH is the depth.
+        // Entries are created on demand, so it ends up as the largest n the source
+        // asks for over this variable -- a compile-time constant, because a
+        // non-constant n is refused before an entry is ever requested.
+        ankerl::unordered_dense::map<uint32_t, std::vector<ir::Signal>> rings;
+        // Live signals in first-use order, so the emitted shift is a function of
+        // the source rather than of a hash order.
+        std::vector<ir::Signal> order;
+        // Name prefix for the ring signals, and the location to blame them on.
+        std::string   base;
+        ir::SourceLoc loc;
+    };
+
+    // Publishes the monitor's rings for the extent of its root evaluation. Scoped
+    // for the same reason SampledScope is: eval_atom can fail() out of the middle
+    // of an expression.
+    struct HistoryScope {
+        Lowerer&    owner;
+        SvaHistory* saved;
+
+        HistoryScope(Lowerer& lowerer, SvaHistory* hist)
+          : owner(lowerer)
+          , saved(lowerer.sva_history_) {
+            owner.sva_history_ = hist;
+        }
+        ~HistoryScope() {
+            owner.sva_history_ = saved;
+        }
+        HistoryScope(const HistoryScope&)            = delete;
+        HistoryScope& operator=(const HistoryScope&) = delete;
+    };
+
+    // The sampled value functions of LRM 16.9.3. $past is the primitive; every
+    // other one is a ring entry plus a comparison.
+    static bool is_sampled_value_fn(std::string_view name) {
+        return name == "$past" || name == "$sampled" || name == "$rose" || name == "$fell" ||
+               name == "$stable" || name == "$changed";
+    }
+
+    ir::Signal sva_history_slot(ir::Signal live, uint32_t n) {
+        SvaHistory& hist = *sva_history_;
+
+        const auto [it, fresh] = hist.rings.try_emplace(static_cast<uint32_t>(live));
+        if (fresh) {
+            hist.order.push_back(live);
+        }
+        std::vector<ir::Signal>& ring = it->second;
+
+        while (ring.size() < n) {
+            // Re-read the live info every round: register_signal can reallocate
+            // the signal table, so a reference hoisted out of the loop would
+            // dangle after the first entry.
+            ir::SignalInfo info;
+            info.name =
+              hist.base + "past." + module_.signal(live).name + "." + std::to_string(ring.size());
+            info.loc  = hist.loc;
+            info.type = module_.signal(live).type;
+            const ir::Signal entry = register_signal(std::move(info));
+            ring.push_back(entry);
+            sva_history_seeds_.emplace_back(live, entry);
+        }
+
+        return ring[n - 1];
+    }
+
+    // Store on a clocking edge, hold otherwise. store_gated's sibling for state
+    // that must survive `disable iff` rather than be reset by it.
+    void store_on_edge(ir::Signal sig, ir::Index value, ir::Index edge, ir::Builder& b, ir::SourceLoc l) {
+        b.binary(ir::Inst::Tag::Store,
+                 b.signal(sig, l),
+                 b.select(edge, value, load_signal(sig, b, l), l),
+                 l);
+    }
+
+    // Advance every ring by one clock tick. Emitted at the very END of the monitor
+    // body, and that placement is the whole correctness argument:
+    //
+    //  * The roots above have ALREADY READ the rings, so every read this cycle saw
+    //    the PRE-shift contents -- $past(v) is the shadow from the previous tick,
+    //    not this one. Shifting before evaluation would make ring[0] this tick's
+    //    own shadow and leave every function here off by exactly one tick.
+    //  * Within the shift, entries are copied in DESCENDING order so each is read
+    //    before it is overwritten; stores in a process body are blocking, so an
+    //    ascending copy would smear ring[0] through the whole ring.
+    //
+    // Gated on `edge` alone and deliberately NOT on `active`: LRM 16.9.3 counts
+    // "the most recent strictly prior time step in which the clocking event
+    // occurred", which a `disable iff` does not stop -- the same reason the
+    // clkprev store is ungated. A time step with no clocking edge holds every
+    // entry unchanged, and THAT is what makes this history per tick rather than
+    // per time step.
+    void emit_history_shift(const SvaHistory& hist, ir::Index edge, ir::Builder& b, ir::SourceLoc l) {
+        for (const ir::Signal live : hist.order) {
+            const std::vector<ir::Signal>& ring = hist.rings.at(static_cast<uint32_t>(live));
+            for (size_t k = ring.size(); k-- > 1;) {
+                store_on_edge(ring[k], load_signal(ring[k - 1], b, l), edge, b, l);
+            }
+            store_on_edge(ring[0], load_signal(sva_shadow_of(live), b, l), edge, b, l);
+        }
+    }
+
+    // "Definitely 1" / "definitely 0" of a value, each as a definite bit. A
+    // 4-state -> 2-state resize is LRM 6.3.1's collapse (x/z drop to 0), so it
+    // answers "definitely 1"; SystemVerilog's `!` is true only when every bit is
+    // definitely 0, so the same collapse over Lnot answers "definitely 0".
+    ir::Index def_one(ir::Index v, ir::Builder& b, ir::SourceLoc l) {
+        return b.resize(v, module_.pool.bit_type, l);
+    }
+    ir::Index def_zero(ir::Index v, ir::Builder& b, ir::SourceLoc l) {
+        return b.resize(b.unary(ir::Inst::Tag::Lnot, v, l), module_.pool.bit_type, l);
+    }
+
+    // $rose / $fell (LRM 16.9.3): did the bit move UP (resp. DOWN) the 4-state
+    // edge order 0 < x/z < 1? Not a plain 0 -> 1 test -- x -> 1 IS a rise -- and
+    // this is the same lattice the backend applies to @(posedge) in
+    // emit_edge_facts (src/ir/LlvmBackend.cpp), reused rather than reinvented so
+    // that an assertion edge and a procedural edge can never disagree.
+    //
+    // emit_edge_facts computes a rise as `!old_must && new_may && (!old_may ||
+    // new_must)` over the must/may planes. With must = "definitely 1" and !may =
+    // "definitely 0" that is exactly the form below, and the fall case is its
+    // mirror image with the two ends of the order swapped.
+    ir::Index edge_step(ir::Index old_v, ir::Index new_v, bool rising, ir::Builder& b, ir::SourceLoc l) {
+        // `hi` is the end of the order being moved TOWARDS, `lo` the one moved
+        // away from: a rise travels towards 1, a fall towards 0.
+        const auto hi = [&](ir::Index v) { return rising ? def_one(v, b, l) : def_zero(v, b, l); };
+        const auto lo = [&](ir::Index v) { return rising ? def_zero(v, b, l) : def_one(v, b, l); };
+
+        // Moved iff the old value was not already at the far end, the new one is
+        // not at the near end, and at least one of the two is definite -- that
+        // last conjunct is what excludes x -> x, the only remaining pair whose
+        // endpoints are indistinguishable.
+        return b.binary(
+          ir::Inst::Tag::Band,
+          b.binary(ir::Inst::Tag::Band, bit_not(hi(old_v), b, l), bit_not(lo(new_v), b, l), l),
+          b.binary(ir::Inst::Tag::Bor, lo(old_v), hi(new_v), l),
+          l);
+    }
+
+    // One sampled value function (LRM 16.9.3). All six read SAMPLED values, so
+    // every one is built from the Preponed shadow and the per-tick history ring
+    // and none of them touches live state.
+    ir::Index lower_sampled_value(std::string_view      name,
+                                  const CallExpression& call,
+                                  ir::Builder&          b,
+                                  ir::SourceLoc         l) {
+        if (sva_history_ == nullptr) {
+            // LRM 16.9.3 also allows these in some procedural contexts, but
+            // nothing samples there: with no clocking event there is no tick for
+            // history to advance on, and no shadow to compare against.
+            // TODO: sampled value functions outside a concurrent assertion, which
+            // need a clock from `default clocking` (LRM 14.12) and a sampling
+            // process keyed to it.
+            fail(std::string(name) + " is only supported inside a concurrent assertion expression");
+        }
+        if (!sva_sampled_) {
+            // The one unsampled root is `disable iff`, which LRM 16.15
+            // deliberately evaluates from live values -- so there is no sampled
+            // value underneath it for these to be built from.
+            // TODO: sampled value functions in a `disable iff` condition.
+            fail(std::string(name) +
+                 " is not supported in a `disable iff` condition, which LRM 16.15 does not sample");
+        }
+
+        const auto args = call.arguments();
+
+        // slang has already checked the argument counts and that a clocking
+        // argument sits in the one position each function allows
+        // (NonConstFuncs.cpp), so what is left here is refusing the shapes clotho
+        // cannot honour yet.
+        const bool   is_past   = name == "$past";
+        const size_t clock_arg = is_past ? 3 : 1;
+        if (args.size() > clock_arg && args[clock_arg]->kind == ExpressionKind::ClockingEvent) {
+            // An explicit clocking argument gives the function its own tick
+            // stream, independent of the assertion's: a second ring shifted by a
+            // second edge, in a process that does not exist.
+            // TODO: an explicit clocking argument on a sampled value function.
+            fail("an explicit clocking argument on " + std::string(name) + " is not supported");
+        }
+
+        uint32_t ticks = 1;
+        if (is_past) {
+            if (args.size() > 2 && args[2]->kind != ExpressionKind::EmptyArgument) {
+                // A gating expression lets history advance only on the ticks where
+                // it holds, so the ring would need a per-tick enable folded into
+                // the shift.
+                // TODO: $past's gating expression (LRM 16.9.3).
+                fail("a gating expression on $past is not supported");
+            }
+            if (args.size() > 1 && args[1]->kind != ExpressionKind::EmptyArgument) {
+                const std::optional<int32_t> n = try_const_int(*args[1]);
+                if (!n.has_value() || *n < 1) {
+                    // The ring is sized at compile time, so the tick count has to
+                    // be one too. slang diagnoses a constant below 1 on its own;
+                    // the non-constant case it leaves alone, and this catches both.
+                    fail("the number of ticks on $past must be a positive constant");
+                }
+                ticks = static_cast<uint32_t>(*n);
+            }
+        }
+
+        // The operand has to be a plain variable. Sampling is keyed by variable --
+        // LRM 16.6 captures operands, not expressions -- so the shadow and the ring
+        // are both per-signal, and an expression has nothing to hang history on.
+        // The width guard is what makes the unwrap safe: only a width-preserving
+        // wrapper leaves the shadow's value interchangeable with the call's.
+        const Expression& operand = unwrap_conversions(*args[0]);
+        const bool        plain =
+          operand.kind == ExpressionKind::NamedValue &&
+          operand.type->getCanonicalType().getBitWidth() ==
+            args[0]->type->getCanonicalType().getBitWidth() &&
+          operand.as<NamedValueExpression>().symbol.kind != SymbolKind::Parameter &&
+          sigmap_.contains(&operand.as<NamedValueExpression>().symbol);
+        if (!plain) {
+            // TODO: a sampled value function over an expression, which needs a
+            // history entry per EXPRESSION, evaluated at the tick it belongs to
+            // rather than resolved back to a variable.
+            fail(std::string(name) + " is only supported on a plain variable reference");
+        }
+        const ir::Signal live   = signal_of(operand.as<NamedValueExpression>().symbol);
+        const ir::Signal shadow = sva_shadow_of(live);
+
+        // $sampled is the shadow itself: the value this variable had when the
+        // current tick was sampled. No history, so deliberately no ring entry --
+        // asking for one would deepen a ring that nothing shifts on its behalf.
+        if (name == "$sampled") {
+            return load_signal(shadow, b, l);
+        }
+        if (is_past) {
+            return load_signal(sva_history_slot(live, ticks), b, l);
+        }
+
+        // Every value change function compares this tick's sample against the
+        // previous tick's, so they all need ring[0] and nothing deeper.
+        const ir::Index now  = load_signal(shadow, b, l);
+        const ir::Index then = load_signal(sva_history_slot(live, 1), b, l);
+
+        if (name == "$stable" || name == "$changed") {
+            // Case equality over the WHOLE value: LRM 16.9.3 asks whether the
+            // sampled value changed, and an x bit that becomes a 1 is a change like
+            // any other. `===` is the comparison that sees all four states and
+            // still yields a definite bit.
+            const ir::Index same = b.binary(ir::Inst::Tag::CaseEq, now, then, l);
+            return name == "$stable" ? same : bit_not(same, b, l);
+        }
+
+        // $rose / $fell are LSB-only (LRM 16.9.3), so a multi-bit operand is
+        // truncated to bit 0 -- as 4-state, because the edge order below needs to
+        // tell x apart from 0 and 1.
+        return edge_step(b.resize(then, module_.pool.logic_type, l),
+                         b.resize(now, module_.pool.logic_type, l),
+                         name == "$rose",
+                         b,
+                         l);
+    }
+
     // A call in a sampled assertion expression would read live state: sampling
     // captures the variables an expression names (LRM 16.6), and clotho does not
     // trace a subroutine body to add what that body reads to the shadow set.
+    //
+    // The sampled value functions are the exception, and not a grudging one: they
+    // are DEFINED over sampled values, and lower_sampled_value builds each from the
+    // shadow and the history ring without reading live state at all. Their own
+    // operand must be a plain variable reference -- rejected there when it is not
+    // -- so declining to descend loses no call this would otherwise have caught.
     // TODO: trace called bodies so their reads are sampled too, which is also what
     // LRM 16.6's side-effect-freedom rule needs checking against
     // (concurrent-assertions.md 4).
@@ -6755,7 +7113,10 @@ private:
         struct Finder : ASTVisitor<Finder, VisitFlags::AllGood> {
             bool found = false;
 
-            void handle(const CallExpression&) {
+            void handle(const CallExpression& call) {
+                if (call.isSystemCall() && is_sampled_value_fn(call.getSubroutineName())) {
+                    return;
+                }
                 found = true;
             }
         };
@@ -6878,13 +7239,21 @@ private:
                                             : build_default_fail_body(mon);
         }
 
+        // The $past rings this monitor needs, filled in on demand while the roots
+        // below are evaluated: a sampled value function reaches them through
+        // sva_history_, and nothing else creates one.
+        SvaHistory hist{ .base = "sva." + std::to_string(id) + ".", .loc = l };
+
         // Roots, one definite bit each. Every one reads the Preponed shadows of
         // the variables it names except the disable-iff condition, which LRM 16.15
         // deliberately does not sample (concurrent-assertions.md 5.4).
         std::vector<ir::Index> roots;
         roots.reserve(lowered.root_index.size());
-        for (uint32_t r = 0; r < lowered.root_index.size(); ++r) {
-            roots.push_back(eval_root(lowered, lowered.root_index[r], r != mon.reset_root, b, l));
+        {
+            const HistoryScope history(*this, &hist);
+            for (uint32_t r = 0; r < lowered.root_index.size(); ++r) {
+                roots.push_back(eval_root(lowered, lowered.root_index[r], r != mon.reset_root, b, l));
+            }
         }
         // The disable condition (LRM 16.15), and the clocking edge. The monitor
         // runs in the Observed region, which resumes every process it holds once
@@ -7025,6 +7394,11 @@ private:
             // way, so the same pend.
             emit_action_pends(matched, *pass_body, active, /*unlikely=*/false, b, l);
         }
+
+        // Last in the body, after every root above has read the pre-shift rings.
+        // See emit_history_shift: this ordering is what makes $past(v) the
+        // previous tick's sample rather than this one's.
+        emit_history_shift(hist, edge, b, l);
 
         module_.add_process(
           ir::Process{ .activation = ir::Activation::Observed,
@@ -7376,6 +7750,36 @@ private:
         }
         module_.add_process(ir::Process{ .activation = ir::Activation::PreInit, .ir = preinit_->finish() });
         preinit_.reset();
+    }
+
+    // Seed every $past ring entry with its variable's time-zero value, appended
+    // to the declaration initializers so it runs in the same PreInit process,
+    // after them.
+    //
+    // The ordering is what makes the value right, and all of it is already fixed:
+    // PreInit applies declaration initializers, and the backend takes the initial
+    // Preponed sample AFTER PreInit (LlvmBackend's emit_main), so reading the LIVE
+    // variable here yields exactly what that first sample will capture. Appending
+    // rather than prepending matters for the same reason -- a seed emitted before
+    // `logic [3:0] v = 4'd7` would copy the power-up X instead of the 7.
+    //
+    // Called before finalize_preinit, which is what closes the process.
+    void finalize_sva_history() {
+        if (sva_history_seeds_.empty()) {
+            return;
+        }
+        if (!preinit_) {
+            preinit_.emplace(module_.pool);
+        }
+        ir::Builder& b = *preinit_;
+        for (const auto& [live, entry] : sva_history_seeds_) {
+            const ir::SourceLoc l = module_.signal(entry).loc;
+            b.binary(ir::Inst::Tag::Store,
+                     b.signal(entry, l),
+                     b.unary(ir::Inst::Tag::Load, b.signal(live, l), l),
+                     l);
+        }
+        sva_history_seeds_.clear();
     }
 
     // -- Concurrent assertion sampling (LRM 16.5, 4.4.2.1) --
@@ -9713,6 +10117,13 @@ private:
         }
         const std::string_view name = call.getSubroutineName();
         const ir::SourceLoc    l    = loc(call);
+
+        // Sampled value functions (LRM 16.9.3). Dispatched ahead of everything
+        // else because they are the one family that must NOT lower their operand
+        // as an ordinary expression: each reads a shadow or a history ring.
+        if (is_sampled_value_fn(name)) {
+            return lower_sampled_value(name, call, b, l);
+        }
 
         // String built-in methods (s.len(), s.substr(i,j), ...) arrive as system
         // calls whose receiver is arguments()[0]; their names carry no '$'.
@@ -14928,6 +15339,15 @@ private:
     // Set while lowering one sampled assertion atom, so value_lvalue resolves
     // through sva_shadow_of. Scoped by SampledScope, never assigned bare.
     bool sva_sampled_ = false;
+    // The $past history rings of the monitor being emitted right now, or null
+    // outside one. Non-null is what makes a sampled value function legal at all:
+    // LRM 16.9.3 defines history per CLOCK TICK, so these functions only mean
+    // something where a clocking event delimits cycles. Scoped by HistoryScope.
+    SvaHistory* sva_history_ = nullptr;
+    // Every history ring entry paired with the variable it shadows, in creation
+    // order, so finalize_sva_history can seed each with that variable's
+    // time-zero value.
+    std::vector<std::pair<ir::Signal, ir::Signal>> sva_history_seeds_;
     // Diagnostics from members that failed and were recovered past, in the order
     // the walk hit them. Drained by lower_compilation.
     std::vector<Diagnostic> diags_;

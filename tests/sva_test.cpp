@@ -8,10 +8,13 @@
 
 #include <doctest/doctest.h>
 
+#include <cstdio>
 #include <string>
 #include <string_view>
 
 #include "Lower.h"
+#include "PosixIo.h"
+#include "ir/Jit.h"
 #include "ir/Module.h"
 
 using namespace clotho;
@@ -690,6 +693,146 @@ module t;
   ap: assert property (@(posedge clk) a |=> @(posedge fast) b);
 endmodule
 )", "not supported yet");
+}
+
+// -- A clock declared inside a sequence or property (LRM 16.13.1) -----------
+//
+// `sequence s; @(posedge clk) a ##1 b; endsequence` puts the assertion's only
+// clocking event below the instantiation, where peeling the top of the property
+// spec cannot see it. Clock flow carries it out over the whole assertion, and
+// the nested event is then stepped over rather than treated as a second clock.
+// tests/sva/diff_seqclock.sv is the differential half of this.
+
+TEST_CASE("a sequence carrying its own clock clocks the assertion that uses it") {
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, gate, a, b, c;
+  sequence sab;
+    @(negedge clk) a ##1 b;
+  endsequence
+  property pbc;
+    @(negedge clk) b |=> c;
+  endproperty
+  ap: assert property (sab);
+  bp: assert property (sab |=> @(negedge clk) c);
+  cp: assert property (pbc);
+endmodule
+)", r);
+    REQUIRE(r.ok);
+    REQUIRE(m.monitors.size() == 3);
+
+    // The edge matters as much as the signal: a resolver that found `clk` but
+    // defaulted the edge would halve the sample rate and still look right here.
+    // `gate` is in scope and unused, so nothing can be arriving from a
+    // design-wide guess either.
+    //
+    // `bp` is also where equivalence earns its keep. A clock does not flow from
+    // an antecedent into a consequent (16.13.1 hands the consequent the clock
+    // from outside the operator, and there is none), so the consequent spells
+    // the event a second time -- two separately bound TimingControl objects
+    // that a pointer comparison would call two clocks.
+    for (const ir::AssertionMonitor& mon : m.monitors) {
+        CHECK(m.signal(mon.clock).name == "clk");
+        CHECK(mon.edge == ir::Edge::Negative);
+    }
+    // The bare sequence is a sequence property; the other two are implications,
+    // so the nested event was stepped over at both layers.
+    CHECK_FALSE(m.monitors[0].has_trigger);
+    CHECK(m.monitors[1].has_trigger);
+    CHECK(m.monitors[2].has_trigger);
+}
+
+TEST_CASE("a clock in the body beats one inferred from the procedure") {
+    // 16.14.6 inference is the last resort, not the first: the procedure offers
+    // `posedge gate` and the sequence declares `negedge clk`, and the declared
+    // one is the assertion's.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, gate, a, b;
+  sequence sab;
+    @(negedge clk) a ##1 b;
+  endsequence
+  always @(posedge gate) assert property (sab);
+endmodule
+)", r);
+    REQUIRE(r.ok);
+    REQUIRE(m.monitors.size() == 1);
+    CHECK(m.signal(m.monitors[0].clock).name == "clk");
+    CHECK(m.monitors[0].edge == ir::Edge::Negative);
+}
+
+TEST_CASE("one sequence used twice is one clock, not two") {
+    // Two uses of one declaration, which slang happens to bind to a single
+    // shared TimingControl -- so this does not pin equivalence-over-identity the
+    // way `bp` above does. What it pins is that the resolver's choice survives
+    // being met twice on the way down, instead of the second encounter reading
+    // as a second clock.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, a, b;
+  sequence sab;
+    @(posedge clk) a ##1 b;
+  endsequence
+  ap: assert property (sab ##1 sab);
+endmodule
+)", r);
+    REQUIRE(r.ok);
+    REQUIRE(m.monitors.size() == 1);
+    CHECK(m.signal(m.monitors[0].clock).name == "clk");
+    CHECK(m.monitors[0].edge == ir::Edge::Positive);
+}
+
+TEST_CASE("two different clocks reached through named declarations are refused") {
+    // The clock hoist must not turn a genuinely multiclocked assertion into a
+    // single-clocked one by picking whichever event it happened to find first.
+    refuses(R"(
+module t;
+  bit clk, fast, a, b;
+  sequence slow;
+    @(posedge clk) a ##1 b;
+  endsequence
+  sequence quick;
+    @(posedge fast) b ##1 a;
+  endsequence
+  ap: assert property (slow ##1 quick);
+endmodule
+)", "multiclock");
+}
+
+TEST_CASE("an explicit clock on the assertion wins over one in the body") {
+    // Precedence is observable through the conflict it creates. The assertion
+    // says posedge and the sequence says negedge; because the assertion's is the
+    // one chosen, the sequence's is a second clock and the whole thing is
+    // refused. Had the body's won, this would have lowered on negedge.
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  sequence sab;
+    @(negedge clk) a ##1 b;
+  endsequence
+  ap: assert property (@(posedge clk) sab);
+endmodule
+)", "multiclock");
+
+    // And when the two agree, the nested one is stepped over rather than
+    // refused for being nested at all.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, a, b;
+  sequence sab;
+    @(posedge clk) a ##1 b;
+  endsequence
+  ap: assert property (@(posedge clk) sab);
+endmodule
+)", r);
+    REQUIRE(r.ok);
+    REQUIRE(m.monitors.size() == 1);
+    CHECK(m.signal(m.monitors[0].clock).name == "clk");
+    CHECK(m.monitors[0].edge == ir::Edge::Positive);
 }
 
 TEST_CASE("a function call in an assertion expression is refused") {
@@ -1582,4 +1725,539 @@ endmodule
 )");
     CHECK_FALSE(plain.ok);
     CHECK(plain.diagnostic_text().find("BOTH operands") == std::string::npos);
+}
+
+namespace {
+
+// JIT-run a design and capture stdout AND stderr into one stream, in the order
+// they were written (mirrors program_test.cpp's helper, which needs stdout
+// alone).
+//
+// Both are needed, interleaved: $display goes to stdout and an assertion's
+// default report to stderr, and it is their ORDER that attributes a report to a
+// clock tick. Both are switched to unbuffered for the duration, because a stdout
+// redirected to a file is fully buffered by default and would otherwise flush
+// after every report rather than between them.
+std::string sva_run_capture(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(r.module != nullptr);
+
+    std::FILE* tmp = std::tmpfile();
+    REQUIRE(tmp != nullptr);
+
+    std::fflush(stdout);
+    std::fflush(stderr);
+    const int saved_out = dup(fileno(stdout));
+    const int saved_err = dup(fileno(stderr));
+    dup2(fileno(tmp), fileno(stdout));
+    dup2(fileno(tmp), fileno(stderr));
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+
+    ir::run_jit(*r.module);
+
+    std::fflush(stdout);
+    std::fflush(stderr);
+    dup2(saved_out, fileno(stdout));
+    dup2(saved_err, fileno(stderr));
+    close(saved_out);
+    close(saved_err);
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+
+    std::rewind(tmp);
+    std::string out;
+    char        buf[256];
+    size_t      n;
+    while ((n = std::fread(buf, 1, sizeof(buf), tmp)) > 0) {
+        out.append(buf, n);
+    }
+    std::fclose(tmp);
+    return out;
+}
+
+std::string report_times(std::string_view source) {
+    const std::string out = sva_run_capture(source);
+    std::string       times;
+    std::string       tick;
+
+    size_t pos = 0;
+    while (pos < out.size()) {
+        const size_t eol  = out.find('\n', pos);
+        const auto   line = std::string_view(out).substr(
+          pos, (eol == std::string::npos ? out.size() : eol) - pos);
+
+        if (line.starts_with("[")) {
+            const size_t close = line.find(']');
+            if (close != std::string_view::npos) {
+                tick = std::string(line.substr(1, close - 1));
+            }
+        } else if (line.find("assertion failed") != std::string_view::npos) {
+            times += times.empty() ? "" : " ";
+            times += tick;
+        }
+
+        if (eol == std::string::npos) {
+            break;
+        }
+        pos = eol + 1;
+    }
+    return times;
+}
+
+// How many history ring entries the module holds for `live`. Ring signals are
+// named `sva.<monitor>.past.<variable>.<index>`.
+size_t ring_count(const ir::Module& m, std::string_view live) {
+    const std::string needle = ".past." + std::string(live) + ".";
+    size_t            n      = 0;
+    for (const ir::SignalInfo& s : m.signals()) {
+        n += s.name.find(needle) != std::string::npos ? 1 : 0;
+    }
+    return n;
+}
+
+} // namespace
+
+TEST_CASE("history advances per clock tick, not per time step") {
+    // THE case. `noise` toggles every 3 with the clock at every 5, so most time
+    // steps carry no clocking edge -- and the sample taken at those steps must
+    // never reach the ring.
+    //
+    // v is 0 before t=5, 1 from t=5, 2 from t=15. Sampling at a step captures the
+    // value the previous step ended with, so the per-TICK samples are t5=0, t15=1,
+    // t25=2, t35=2 and `$past(v) != v` fails only where a sample repeats its
+    // predecessor: the first tick (2-state default 0 against a sample of 0) and
+    // t=35 (2 against 2).
+    //
+    // Shift per time step instead and $past(v) at t=15 becomes the sample from
+    // t=12, which is already 1, so the tick reports; likewise t=25 from t=24.
+    // That mutation therefore reads `5 15 25 35`, and this is the check that
+    // separates them.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit noise = 0;
+  always #3 noise = ~noise;
+  bit [3:0] v = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) $past(v) != v);
+  initial begin
+    @(posedge clk); v <= 1;
+    @(posedge clk); v <= 2;
+    @(posedge clk);
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)") == "5 35");
+}
+
+TEST_CASE("the ring is read before it is shifted, so $past is the previous tick") {
+    // The off-by-one guard. Shifting ahead of the roots instead of after them
+    // would make ring[0] this tick's own shadow, so `$past(v) != v` would be false
+    // at every tick and the report set would be every tick rather than two of
+    // them. Same trace as above without the extra time steps, so the two failure
+    // modes stay distinguishable.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit [3:0] v = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) $past(v) != v);
+  initial begin
+    @(posedge clk); v <= 1;
+    @(posedge clk); v <= 2;
+    @(posedge clk);
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)") == "5 35");
+}
+
+TEST_CASE("$past(v, n) reads n ticks back") {
+    // Samples per tick are t5=0, t15=1, t25=2, t35=1, t45=5, t55=5, so two ticks
+    // back repeats the current sample at t=35 (1 against 1) and, at the first
+    // tick, compares the 2-state default 0 against a sample of 0.
+    //
+    // The neighbours are deliberately different sets: reading ring[0] instead
+    // would report `5 55`, and ring[2] would report `5` alone. Nothing here
+    // survives an off-by-one in the slot index.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit [3:0] v = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) $past(v, 2) != v);
+  initial begin
+    @(posedge clk); v <= 1;
+    @(posedge clk); v <= 2;
+    @(posedge clk); v <= 1;
+    @(posedge clk); v <= 5;
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)") == "5 35");
+}
+
+TEST_CASE("a deep ring shifts without smearing one entry through the rest") {
+    // Depth 3, because depth 2 cannot tell a correct shift from a broken one: the
+    // copy loop runs a single iteration there, so ascending and descending order
+    // agree. Only from three entries up does copying in the wrong direction
+    // overwrite ring[1] before ring[2] reads it, which would leave every entry
+    // above the first holding the same value.
+    //
+    // Samples are t5=0, t15=1, t25=2, t35=3, t45=1, t55=9, so three ticks back
+    // repeats the current sample at t=45 (1 against 1), and at t=5 the seed of 0
+    // meets a sample of 0. Copy the ring upwards instead and $past(v, 3) at t=45
+    // becomes 2 rather than 1, which passes, leaving "5" alone.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit [3:0] v = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) $past(v, 3) != v);
+  initial begin
+    @(posedge clk); v <= 1;
+    @(posedge clk); v <= 2;
+    @(posedge clk); v <= 3;
+    @(posedge clk); v <= 1;
+    @(posedge clk); v <= 9;
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)") == "5 45");
+}
+
+TEST_CASE("a ring is as deep as the largest $past over that variable") {
+    // Depth is a compile-time constant: the largest n any use asks for, with the
+    // entries shared rather than one ring per call site.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk;
+  bit [3:0] v;
+  bit       b;
+  ap: assert property (@(posedge clk) $past(v) != v && $past(v, 3) != v && $past(b) != b);
+endmodule
+)", r);
+
+    CHECK(ring_count(m, "v") == 3);
+    CHECK(ring_count(m, "b") == 1);
+}
+
+TEST_CASE("$sampled buys no ring entry") {
+    // $sampled is the shadow, not history, so it must not deepen a ring that
+    // nothing shifts on its behalf.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk;
+  bit [3:0] v;
+  ap: assert property (@(posedge clk) $sampled(v) == v);
+endmodule
+)", r);
+
+    CHECK(has_shadow(m, "v"));
+    CHECK(ring_count(m, "v") == 0);
+}
+
+TEST_CASE("a ring entry keeps the live variable's whole type") {
+    // Same rule as the shadow: a collapsed bit could answer neither $past(bus, 2)
+    // nor a whole-value $stable.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk;
+  logic [7:0] v;
+  ap: assert property (@(posedge clk) $past(v) != v);
+endmodule
+)", r);
+
+    const ir::SignalInfo* live = nullptr;
+    const ir::SignalInfo* ring = nullptr;
+    for (const ir::SignalInfo& s : m.signals()) {
+        if (s.name == "v") {
+            live = &s;
+        } else if (s.name.find(".past.v.0") != std::string::npos) {
+            ring = &s;
+        }
+    }
+    REQUIRE(live != nullptr);
+    REQUIRE(ring != nullptr);
+    CHECK(ring->type == live->type);
+}
+
+TEST_CASE("$stable and $changed compare the whole sampled value") {
+    // Not the LSB: v changes 4'b0001 -> 4'b1001 between the second and third
+    // ticks, which only a whole-value comparison sees.
+    //
+    // Samples are t5=0, t15=1, t25=9, t35=9. $changed therefore holds at t=15 and
+    // t=25 and not at t=5 (default 0 against 0) or t=35, so asserting $changed
+    // reports at 5 and 35.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit [3:0] v = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) $changed(v));
+  initial begin
+    @(posedge clk); v <= 4'b0001;
+    @(posedge clk); v <= 4'b1001;
+    @(posedge clk);
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)") == "5 35");
+
+    // $stable is the exact complement, so the same trace inverts the report set.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit [3:0] v = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) $stable(v));
+  initial begin
+    @(posedge clk); v <= 4'b0001;
+    @(posedge clk); v <= 4'b1001;
+    @(posedge clk);
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)") == "15 25");
+}
+
+TEST_CASE("$rose and $fell read the LSB, not the whole value") {
+    // v goes 0 -> 4'b0010 -> 4'b0011 -> 4'b0010. Bit 0 therefore rises once, at
+    // the tick that samples 4'b0011, even though the value changes at every tick.
+    //
+    // Samples: t5=0, t15=2, t25=3, t35=2. $rose holds only at t=25, so asserting
+    // it reports at 5, 15 and 35.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit [3:0] v = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) $rose(v));
+  initial begin
+    @(posedge clk); v <= 4'b0010;
+    @(posedge clk); v <= 4'b0011;
+    @(posedge clk); v <= 4'b0010;
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)") == "5 15 35");
+
+    // $fell on the same trace holds only where bit 0 goes back down, at t=35.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit [3:0] v = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) $fell(v));
+  initial begin
+    @(posedge clk); v <= 4'b0010;
+    @(posedge clk); v <= 4'b0011;
+    @(posedge clk); v <= 4'b0010;
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)") == "5 15 25");
+}
+
+TEST_CASE("a transition out of x is an edge, per the 4-state edge order") {
+    // LRM 16.9.3 puts $rose on the same 0 < x/z < 1 order the simulator uses for
+    // @(posedge), so x -> 1 IS a rise and 1 -> x is not. v is 4-state and starts
+    // at x, so the tick that samples 1 rises out of the unknown.
+    //
+    // Samples: t5=x, t15=1, t25=1. $rose holds only at t=15 -- t=5 compares the X
+    // default against x, which is no movement at all.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  logic v;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) $rose(v));
+  initial begin
+    @(posedge clk); v <= 1;
+    @(posedge clk);
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)") == "5 25");
+}
+
+TEST_CASE("$sampled is this tick's value and never history") {
+    // $sampled(v) == v is a tautology inside an assertion, because both sides are
+    // the same shadow. It reports at every tick if $sampled ever resolves to a
+    // ring entry, and at none if it stays the shadow.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit [3:0] v = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) $sampled(v) == v);
+  initial begin
+    @(posedge clk); v <= 1;
+    @(posedge clk); v <= 2;
+    @(posedge clk); $finish;
+  end
+endmodule
+)").empty());
+}
+
+TEST_CASE("history keeps advancing while the assertion is disabled") {
+    // LRM 16.9.3 counts ticks on which the clocking event occurred, and a
+    // `disable iff` does not stop the clock. The ring is therefore gated on the
+    // edge alone, exactly like the monitor's own clkprev.
+    //
+    // Samples are t5=0, t15=1, t25=2, t35=2, and rst is live high only for the
+    // t=25 tick. With the ring shifting through the disabled tick, $past at t=35
+    // is the t=25 sample of 2, so `$past(v) != v` is false and t=35 reports.
+    // Freeze the ring while disabled instead and $past at t=35 would still be the
+    // t=15 sample of 1, which differs from 2, so the t=35 report would disappear
+    // and this would read "5" alone.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit [3:0] v = 0;
+  bit rst = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) disable iff (rst) $past(v) != v);
+  initial begin
+    @(posedge clk);
+    v <= 1;
+    @(posedge clk);
+    v <= 2;
+    @(posedge clk); rst <= 1;
+    @(posedge clk); rst <= 0;
+    @(posedge clk); $finish;
+  end
+endmodule
+)") == "5 35");
+}
+
+TEST_CASE("a ring entry is seeded with the variable's time-zero value") {
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  logic [3:0] v = 4'd7;
+  initial #2 v = 4'd3;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) $past(v, 2) == 4'd7);
+  initial begin
+    @(posedge clk); v <= 4'd1;
+    @(posedge clk); v <= 4'd2;
+    @(posedge clk);
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)") == "25 35");
+}
+
+// -- Sampled value function refusals ----------------------------------------
+
+TEST_CASE("a gating expression on $past is refused") {
+    refuses(R"(
+module t;
+  bit clk, a, g, b;
+  ap: assert property (@(posedge clk) $past(a, 1, g) |=> b);
+endmodule
+)", "gating expression on $past");
+}
+
+TEST_CASE("a non-constant tick count on $past is refused") {
+    // The ring is sized at compile time, so the count has to be constant. slang
+    // binds the argument in a constant context and so refuses this one before
+    // lowering sees it; clotho keeps its own guard behind that, because the ring
+    // depth is clotho's invariant and not slang's to maintain.
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  int n;
+  ap: assert property (@(posedge clk) $past(a, n) |=> b);
+endmodule
+)", "non-constant");
+}
+
+TEST_CASE("a tick count below one on $past is refused") {
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) $past(a, 0) |=> b);
+endmodule
+)", "greater than or equal to 1");
+}
+
+TEST_CASE("an explicit clocking argument on a sampled value function is refused") {
+    // A clocking argument gives the function its own tick stream, independent of
+    // the assertion's: a second ring shifted by a second edge.
+    refuses(R"(
+module t;
+  bit clk, clk2, a, b;
+  ap: assert property (@(posedge clk) $rose(a, @(posedge clk2)) |=> b);
+endmodule
+)", "explicit clocking argument");
+
+    refuses(R"(
+module t;
+  bit clk, clk2, a, b;
+  ap: assert property (@(posedge clk) $past(a, 1, , @(posedge clk2)) |=> b);
+endmodule
+)", "explicit clocking argument");
+}
+
+TEST_CASE("a sampled value function over an expression is refused") {
+    // The shadow and the ring are both keyed by variable (LRM 16.6 captures
+    // operands, not expressions), so there is nothing to hang an expression's
+    // history on.
+    refuses(R"(
+module t;
+  bit clk, a, b, c;
+  ap: assert property (@(posedge clk) $rose(a && b) |=> c);
+endmodule
+)", "plain variable reference");
+}
+
+TEST_CASE("a sampled value function outside an assertion is refused") {
+    // Legal in procedural code per LRM 16.9.3, but nothing samples there: no
+    // clocking event means no tick for history to advance on.
+    refuses(R"(
+module t;
+  bit clk, a;
+  always @(posedge clk) if ($rose(a)) $display("edge");
+endmodule
+)", "only supported inside a concurrent assertion expression");
+}
+
+TEST_CASE("a sampled value function in a disable iff condition is refused") {
+    // LRM 16.15 evaluates the disable condition from LIVE values, so there is no
+    // sampled value underneath it for these to be built from.
+    refuses(R"(
+module t;
+  bit clk, a, b, rst;
+  ap: assert property (@(posedge clk) disable iff ($rose(rst)) a |=> b);
+endmodule
+)", "disable iff");
 }
