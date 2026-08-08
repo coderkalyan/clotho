@@ -103,10 +103,18 @@ void put_hex(std::string& out, uint64_t v) {
 // sites: the caller records the length, emits, and truncates if `ok()` went false.
 class Renderer {
 public:
-    Renderer(const ir::Module& m, const std::vector<std::string>& sig_names, const std::vector<std::string>& fn_names)
+    Renderer(const ir::Module&               m,
+             const std::vector<std::string>& sig_names,
+             const std::vector<std::string>& fn_names,
+             Target                          target)
       : m_(m)
       , sig_(sig_names)
-      , fn_(fn_names) {}
+      , fn_(fn_names)
+      , target_(target) {}
+
+    [[nodiscard]] Target target() const {
+        return target_;
+    }
 
     // Emit `i` at precedence context `prec`; parenthesise only if it binds looser.
     void emit(std::string& out, const ir::Ir& ir, ir::Index i, int prec = kLowest) {
@@ -201,6 +209,9 @@ public:
             case ir::Inst::Tag::CasezEq:
             case ir::Inst::Tag::CasexEq:
             case ir::Inst::Tag::WildEq:
+                if (target_ == Target::V2005) {
+                    return wild_2005(out, ir, p, prec);
+                }
                 return binary(out, " ==? ", kEq, ir, p, prec);
             case ir::Inst::Tag::Band:
                 return binary(out, " & ", kBand, ir, p, prec);
@@ -355,6 +366,63 @@ private:
         }
     }
 
+    // Wildcard equality for Verilog-2005, which has no `==?`.
+    //
+    // A casez pattern is a constant whose z bits ARE the mask, so `a ==? pat` is
+    // exactly `(a & known) === (pat & known)`. Both literals are emitted directly.
+    // A non-constant right side has no mask to extract and is declined rather than
+    // approximated.
+    void wild_2005(std::string& out, const ir::Ir& ir, const ir::Inst::Payload& p, int prec) {
+        ir::Index rhs = p.binary.r;
+        while (ir.tag(rhs) == ir::Inst::Tag::Resize) {
+            rhs = ir.payload(rhs).unary;
+        }
+        if (ir.tag(rhs) != ir::Inst::Tag::Constant) {
+            decline(ir::Inst::Tag::CasezEq);
+            return;
+        }
+        const auto&    v      = std::get<ir::Value>(ir.pool().get(ir.payload(rhs).ref));
+        const auto     all    = ir.pool().bytes(ir.payload(rhs).ref);
+        const auto     layout = ir.pool().layout(v.type);
+        const auto     planes = static_cast<size_t>(layout.domain);
+        const size_t   plane  = planes != 0 ? all.size() / planes : all.size();
+        const uint32_t w      = layout.width;
+        if (w == 0 || w > 64 || plane == 0) {
+            decline(ir::Inst::Tag::CasezEq);
+            return;
+        }
+        uint64_t value = 0;
+        uint64_t known = 0;
+        for (uint32_t k = 0; k < w; ++k) {
+            const uint64_t bit = uint64_t{ 1 } << k;
+            const bool     xz  = planes > 1 && ((all[plane + k / 8] >> (k % 8)) & 1u) != 0;
+            if (!xz) {
+                known |= bit;
+                if (((all[k / 8] >> (k % 8)) & 1u) != 0) {
+                    value |= bit;
+                }
+            }
+        }
+
+        const bool paren = kEq < prec;
+        if (paren) {
+            out += '(';
+        }
+        out += '(';
+        emit(out, ir, p.binary.l, kBand);
+        out += " & ";
+        put_uint(out, w);
+        out += "'h";
+        put_hex(out, known);
+        out += ") === ";
+        put_uint(out, w);
+        out += "'h";
+        put_hex(out, value & known);
+        if (paren) {
+            out += ')';
+        }
+    }
+
     // A sized literal.
     //
     // Four-state constants render in BINARY with per-bit x / z, not as `'x`. A casez
@@ -415,6 +483,7 @@ private:
     const ir::Module&               m_;
     const std::vector<std::string>& sig_;
     const std::vector<std::string>& fn_;
+    Target                          target_  = Target::SV2017;
     ir::Inst::Tag                   blocker_ = ir::Inst::Tag::Constant;
     bool                            ok_      = true;
 };
@@ -704,13 +773,16 @@ bool emit_stmts(std::string& os, Renderer& render, const ir::Ir& ir, std::span<c
                 os += "return;\n";
                 break;
 
+            // 2005 has no jump statements at all -- sv2v exists partly to remove
+            // them -- so the target decides whether these can be spelled.
             case ir::Inst::Tag::Break:
-                indent(os, ind);
-                os += "break;\n";
-                break;
             case ir::Inst::Tag::Continue:
+                if (render.target() == Target::V2005) {
+                    render.decline(ir.tag(i));
+                    return false;
+                }
                 indent(os, ind);
-                os += "continue;\n";
+                os += ir.tag(i) == ir::Inst::Tag::Break ? "break;\n" : "continue;\n";
                 break;
 
             case ir::Inst::Tag::Cond: {
@@ -873,7 +945,7 @@ std::optional<std::string> emit_fn(const ir::Module& m, Renderer& render, ir::Fu
     if (is_task) {
         os += "  task automatic ";
     } else {
-        os += "  function automatic logic [";
+        os += render.target() == Target::V2005 ? "  function automatic [" : "  function automatic logic [";
         put_uint(os, width(f.return_type) - 1);
         os += ":0] ";
     }
@@ -883,14 +955,14 @@ std::optional<std::string> emit_fn(const ir::Module& m, Renderer& render, ir::Fu
         if (a != 0) {
             os += ", ";
         }
-        os += "input logic [";
+        os += render.target() == Target::V2005 ? "input [" : "input logic [";
         put_uint(os, width(f.param_types[a]) - 1);
         os += ":0] l";
         put_uint(os, a);
     }
     os += ");\n";
     for (size_t l = f.param_types.size(); l < f.local_types.size(); ++l) {
-        os += "    logic [";
+        os += render.target() == Target::V2005 ? "    reg [" : "    logic [";
         put_uint(os, width(f.local_types[l]) - 1);
         os += ":0] l";
         put_uint(os, l);
@@ -906,13 +978,13 @@ std::optional<std::string> emit_fn(const ir::Module& m, Renderer& render, ir::Fu
 
 } // namespace
 
-std::string materialize(const ir::Module& module, const Result* result, MaterializeOptions options) {
+std::string materialize(const ir::Module& module, const Result* result, SynthConfig cfg) {
     std::string os;
     // Grown by doubling, a 3.4 MB result copies several megabytes of text for
     // nothing. The estimate only has to be the right order: signals dominate the
     // declarations and processes dominate the body.
     os.reserve(4096 + 64 * module.signals().size() + 512 * module.processes().size());
-    const std::string_view name    = options.name.empty() ? std::string_view("m") : options.name;
+    const std::string_view name    = cfg.name.empty() ? std::string_view("m") : cfg.name;
     const auto             signals = module.signals();
 
     std::vector<std::string> raw_sigs;
@@ -927,8 +999,23 @@ std::string materialize(const ir::Module& module, const Result* result, Material
     }
     const std::vector<std::string> sig_names = unique_names(raw_sigs);
     const std::vector<std::string> fn_names  = unique_names(raw_fns);
-    Renderer                       render(module, sig_names, fn_names);
+    Renderer                       render(module, sig_names, fn_names, cfg.target);
     std::vector<Atom>              pool; // flat guard paths, reused per signal
+
+    // Which signals any process writes -- the reg/wire question for the 2005 target.
+    std::vector<bool> written(signals.size(), false);
+    for (const ir::Process& proc : module.processes()) {
+        for (uint32_t i = 0; i < proc.ir.inst_count(); ++i) {
+            const auto ix = static_cast<ir::Index>(i);
+            if (proc.ir.tag(ix) != ir::Inst::Tag::Store && proc.ir.tag(ix) != ir::Inst::Tag::StoreNb) {
+                continue;
+            }
+            const ir::LvalueRoot lv = ir::lvalue_root(proc.ir, proc.ir.payload(ix).binary.l);
+            if (proc.ir.tag(lv.root) == ir::Inst::Tag::Signal) {
+                written[static_cast<uint32_t>(proc.ir.payload(lv.root).signal)] = true;
+            }
+        }
+    }
 
     // No ports. A flattened whole-design render has no meaningful port boundary --
     // an inner module's `input` is driven by its parent, so emitting it as a
@@ -940,7 +1027,10 @@ std::string materialize(const ir::Module& module, const Result* result, Material
     os += ";\n";
     for (size_t i = 0; i < signals.size(); ++i) {
         const uint32_t w = module.pool.layout(signals[i].type).width;
-        os += "  logic ";
+        // 2005 has no `logic`: a procedurally assigned signal is a reg, anything
+        // else is a wire. Every continuous assign lowered to a process, so "written
+        // by some process" is the whole test.
+        os += cfg.target == Target::V2005 ? (written[i] ? "  reg " : "  wire ") : "  logic ";
         if (w > 1) {
             os += '[';
             put_uint(os, w - 1);

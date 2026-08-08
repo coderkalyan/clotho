@@ -11,6 +11,11 @@
 #include "ir/Analysis.h"
 #include "legalize/Legalize.h"
 #include "legalize/Materialize.h"
+#include <slang/ast/Compilation.h>
+#include <slang/diagnostics/DiagnosticEngine.h>
+#include <slang/parsing/Lexer.h>
+#include <slang/syntax/SyntaxTree.h>
+#include <slang/util/Bag.h>
 
 using namespace clotho;
 
@@ -1294,5 +1299,90 @@ TEST_CASE("the structural path round-trips to the same classification") {
         REQUIRE(b.has_value());
         CHECK(a->first == b->first);
         CHECK(a->second == b->second);
+    }
+}
+
+// --- W3: SynthConfig and the Verilog-2005 target ---------------------------
+
+namespace {
+
+// Parse `text` as IEEE 1364-2005 and return its errors. Slang carries the language
+// version in both the lexer and the compilation, so 2005 compliance is a fact this
+// test establishes rather than a claim the writer makes.
+std::string errors_as_2005(std::string_view text) {
+    slang::Bag                   options;
+    slang::parsing::LexerOptions lex;
+    lex.languageVersion = slang::LanguageVersion::v1364_2005;
+    options.set(lex);
+    slang::ast::CompilationOptions copts;
+    copts.languageVersion = slang::LanguageVersion::v1364_2005;
+    options.set(copts);
+
+    slang::ast::Compilation comp(options);
+    comp.addSyntaxTree(slang::syntax::SyntaxTree::fromText(text, options, "emitted"));
+
+    std::string out;
+    for (const slang::Diagnostic& d : comp.getAllDiagnostics()) {
+        if (d.isError()) {
+            out += slang::DiagnosticEngine::reportAll(*comp.getSourceManager(), std::span(&d, 1));
+        }
+    }
+
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("the 2005 target emits reg and wire, never logic") {
+    const LowerResult r = lower_text(wrap("always @(posedge clk) q <= a;"));
+    REQUIRE(r.ok);
+    const legalize::Result res  = legalize::run(*r.module, nullptr, { .keep_guards = true });
+    const std::string      text = legalize::materialize(*r.module, &res, { .target = legalize::Target::V2005 });
+    CHECK(text.find("logic") == std::string::npos);
+    CHECK(text.find("reg [7:0] q;") != std::string::npos);
+    // Never written by any process, so a wire.
+    CHECK(text.find("wire clk;") != std::string::npos);
+    CHECK(errors_as_2005(text).empty());
+}
+
+// A casez pattern is a constant whose z bits are the mask, so `==?` expands exactly.
+TEST_CASE("the 2005 target expands wildcard equality") {
+    const LowerResult r = lower_text(R"(
+        module m(input [3:0] s, input [7:0] a, output reg [7:0] q);
+          always @* casez (s)
+            4'b1???: q = a;
+            default: q = 8'h00;
+          endcase
+        endmodule
+    )");
+    REQUIRE(r.ok);
+    const legalize::Result res = legalize::run(*r.module, nullptr, { .keep_guards = true });
+
+    const std::string sv = legalize::materialize(*r.module, &res, { .target = legalize::Target::SV2017 });
+    CHECK(sv.find("==?") != std::string::npos);
+
+    const std::string v05 = legalize::materialize(*r.module, &res, { .target = legalize::Target::V2005 });
+    CHECK(v05.find("==?") == std::string::npos);
+    CHECK(v05.find("===") != std::string::npos);
+    CHECK(errors_as_2005(v05).empty());
+}
+
+// The whole corpus, and both renderers, must produce parseable 2005.
+TEST_CASE("the reset corpus emits valid Verilog-2005") {
+    for (const ResetCase& c : kResetCases) {
+        CAPTURE(c.file);
+        const std::string path = std::string(CLOTHO_TEST_DIR) + "/legalize/reset/" + std::string(c.file) + ".sv";
+        const std::array<std::string_view, 1> paths{ path };
+        const LowerResult                     lowered = lower_files(paths);
+        REQUIRE(lowered.ok);
+        const legalize::Result res = legalize::run(*lowered.module, nullptr, { .keep_guards = true });
+
+        const std::string legalized =
+          legalize::materialize(*lowered.module, &res, { .target = legalize::Target::V2005 });
+        CHECK(errors_as_2005(legalized).empty());
+
+        const std::string plain =
+          legalize::materialize(*lowered.module, nullptr, { .target = legalize::Target::V2005 });
+        CHECK(errors_as_2005(plain).empty());
     }
 }

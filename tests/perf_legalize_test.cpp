@@ -8,6 +8,10 @@
 #include <string>
 #include <vector>
 
+#include <slang/ast/Compilation.h>
+#include <slang/syntax/SyntaxTree.h>
+#include <slang/util/Bag.h>
+
 #include "Lower.h"
 #include "legalize/Legalize.h"
 #include "legalize/Materialize.h"
@@ -193,6 +197,26 @@ Classified classify(const ir::Module& m, const legalize::Result& r, bool drop_lo
     return out;
 }
 
+// Does `text` parse and elaborate as IEEE 1364-2005?
+size_t errors_as_2005(std::string_view text) {
+    slang::Bag                   options;
+    slang::parsing::LexerOptions lex;
+    lex.languageVersion = slang::LanguageVersion::v1364_2005;
+    options.set(lex);
+    slang::ast::CompilationOptions copts;
+    copts.languageVersion = slang::LanguageVersion::v1364_2005;
+    options.set(copts);
+
+    slang::ast::Compilation comp(options);
+    comp.addSyntaxTree(slang::syntax::SyntaxTree::fromText(text, options, "emitted"));
+    size_t n = 0;
+    for (const slang::Diagnostic& d : comp.getAllDiagnostics()) {
+        n += static_cast<size_t>(d.isError());
+    }
+
+    return n;
+}
+
 std::string mangled(std::string_view name) {
     std::string out;
     for (const char c : name) {
@@ -274,6 +298,18 @@ TEST_CASE("PERF materialize round-trips real designs" * doctest::skip()) {
             MESSAGE(nm, " structural: compared ", pb.by_name.size(), " match ", pm, " differ ", pd, " absent ", pg);
             CHECK(pd == 0);
             CHECK(pg == 0);
+        }
+
+        // Verilog-2005 out of both renderers, on a whole CPU. Establishes the
+        // target rather than asserting it.
+        {
+            const size_t le =
+              errors_as_2005(legalize::materialize(*r.module, &before, { .target = legalize::Target::V2005 }));
+            const size_t se =
+              errors_as_2005(legalize::materialize(*r.module, nullptr, { .target = legalize::Target::V2005 }));
+            MESSAGE(nm, " 2005: legalized errors ", le, ", structural errors ", se);
+            CHECK(le == 0);
+            CHECK(se == 0);
         }
 
         const std::string text = legalize::materialize(*r.module, &before);

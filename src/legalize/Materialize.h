@@ -8,10 +8,6 @@
 // spells that description as source, so an always-block can be read as the
 // hardware it implies rather than as the statements that imply it.
 //
-// `full_case` / `parallel_case` are NOT honoured here: the pragma data is M7 and
-// does not exist yet, and a style option that silently did nothing would be worse
-// than its absence.
-//
 // The base slot is the interesting part. A guarded list has an implicit value
 // for "no guard matched", and what belongs there is exactly the classification:
 //
@@ -34,14 +30,10 @@
 #include <string>
 
 #include "Legalize.h"
+#include "SynthConfig.h"
 #include "ir/Module.h"
 
 namespace clotho::legalize {
-
-struct MaterializeOptions {
-    // Module name to emit. Empty renders `m`.
-    std::string_view name;
-};
 
 // Render `module` as SystemVerilog.
 //
@@ -55,8 +47,6 @@ struct MaterializeOptions {
 // A process the analysis rejected, or one using an expression this renderer does
 // not cover, is emitted as a comment naming the reason rather than as source
 // that would silently mean something else.
-[[nodiscard]] std::string materialize(const ir::Module&  module,
-                                      const Result*      result  = nullptr,
-                                      MaterializeOptions options = {});
+[[nodiscard]] std::string materialize(const ir::Module& module, const Result* result = nullptr, SynthConfig cfg = {});
 
 } // namespace clotho::legalize
