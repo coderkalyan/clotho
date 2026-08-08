@@ -1416,6 +1416,58 @@ void emit_process(std::string&                    os,
     os += "  end\n";
 }
 
+// Every emitted name, computed ONCE.
+//
+// The sidecar's whole value is that `original -> emitted` is true, so it cannot
+// recompute names alongside the writer and hope they agree. Both call this.
+EmittedNames emitted_names(const ir::Module& module, SynthConfig cfg) {
+    EmittedNames out;
+    const auto   signals = module.signals();
+
+    std::vector<std::string> raw_fns;
+    raw_fns.reserve(module.function_count());
+    for (size_t i = 0; i < module.function_count(); ++i) {
+        raw_fns.push_back(module.function(static_cast<ir::FunctionId>(i)).name);
+    }
+    out.fn = unique_names(raw_fns);
+
+    if (cfg.hierarchy == Hierarchy::Instances) {
+        ScopeNames sn;
+        sn.sig.assign(signals.size(), std::string{});
+        for (const ir::InstanceScope& t : module.tops()) {
+            collect_scope_names(module, t, {}, sn);
+        }
+        out.sig = std::move(sn.sig);
+        out.mod = std::move(sn.mod);
+        out.scope.assign(out.mod.size(), std::string{});
+        // The full instance path, which is the key downstream keys on.
+        const auto walk = [&](auto&& self, const ir::InstanceScope& sc, const std::string& pre) -> void {
+            const std::string here = pre.empty() ? sc.name : pre + "." + sc.name;
+            if (out.scope.size() <= sc.id) {
+                out.scope.resize(sc.id + 1);
+            }
+            out.scope[sc.id] = here;
+            for (const ir::InstanceScope& ch : sc.children) {
+                self(self, ch, here);
+            }
+        };
+        for (const ir::InstanceScope& t : module.tops()) {
+            walk(walk, t, {});
+        }
+
+        return out;
+    }
+
+    std::vector<std::string> raw_sigs;
+    raw_sigs.reserve(signals.size());
+    for (const ir::SignalInfo& s : signals) {
+        raw_sigs.push_back(s.name);
+    }
+    out.sig = unique_names(raw_sigs);
+
+    return out;
+}
+
 std::string materialize(const ir::Module& module, const Result* result, SynthConfig cfg) {
     std::string os;
     // Grown by doubling, a 3.4 MB result copies several megabytes of text for
@@ -1425,20 +1477,11 @@ std::string materialize(const ir::Module& module, const Result* result, SynthCon
     const std::string_view name    = cfg.name.empty() ? std::string_view("m") : cfg.name;
     const auto             signals = module.signals();
 
-    std::vector<std::string> raw_sigs;
-    raw_sigs.reserve(signals.size());
-    for (const ir::SignalInfo& s : signals) {
-        raw_sigs.push_back(s.name);
-    }
-    std::vector<std::string> raw_fns;
-    raw_fns.reserve(module.function_count());
-    for (size_t i = 0; i < module.function_count(); ++i) {
-        raw_fns.push_back(module.function(static_cast<ir::FunctionId>(i)).name);
-    }
-    std::vector<std::string>       sig_names = unique_names(raw_sigs);
-    const std::vector<std::string> fn_names  = unique_names(raw_fns);
-    Renderer                       render(module, sig_names, fn_names, cfg.target);
-    std::vector<Atom>              pool; // flat guard paths, reused per signal
+    const EmittedNames              names_all = emitted_names(module, cfg);
+    const std::vector<std::string>& sig_names = names_all.sig;
+    const std::vector<std::string>& fn_names  = names_all.fn;
+    Renderer                        render(module, sig_names, fn_names, cfg.target);
+    std::vector<Atom>               pool; // flat guard paths, reused per signal
 
     // Which signals any process writes -- the reg/wire question for the 2005 target.
     std::vector<bool> written(signals.size(), false);
@@ -1460,10 +1503,8 @@ std::string materialize(const ir::Module& module, const Result* result, SynthCon
     // the file reads bottom-up; SystemVerilog does not require it, but a reader does.
     if (cfg.hierarchy == Hierarchy::Instances) {
         ScopeNames names;
-        names.sig.assign(signals.size(), std::string{});
-        for (const ir::InstanceScope& t : module.tops()) {
-            collect_scope_names(module, t, {}, names);
-        }
+        names.sig = names_all.sig;
+        names.mod = names_all.mod;
         Renderer          hr(module, names.sig, fn_names, cfg.target);
         std::vector<Atom> hpool;
         for (const ir::InstanceScope& t : module.tops()) {
@@ -1509,6 +1550,191 @@ std::string materialize(const ir::Module& module, const Result* result, SynthCon
         emit_process(os, module, result, k, sig_names, cfg, render, pool);
     }
     os += "endmodule\n";
+
+    return os;
+}
+
+namespace {
+
+void json_str(std::string& os, std::string_view v) {
+    os += '"';
+    for (const char c : v) {
+        switch (c) {
+            case '"':
+                os += "\\\"";
+                break;
+            case '\\':
+                os += "\\\\";
+                break;
+            case '\n':
+                os += "\\n";
+                break;
+            default:
+                os += c;
+        }
+    }
+    os += '"';
+}
+
+void json_field(std::string& os, std::string_view k, std::string_view v, bool comma = true) {
+    json_str(os, k);
+    os += ':';
+    json_str(os, v);
+    if (comma) {
+        os += ',';
+    }
+}
+
+std::string_view kind_name(StorageKind k) {
+    switch (k) {
+        case StorageKind::Comb:
+            return "comb";
+        case StorageKind::Latch:
+            return "latch";
+        case StorageKind::Flop:
+            return "flop";
+        case StorageKind::AsyncLoad:
+            return "async_load";
+        case StorageKind::Unclassified:
+            return "unclassified";
+    }
+
+    return "unclassified";
+}
+
+std::string_view finding_name(Finding f) {
+    switch (f) {
+        case Finding::UnsynthesizableOp:
+            return "unsynthesizable_op";
+        case Finding::Suspends:
+            return "suspends";
+        case Finding::Call:
+            return "call";
+        case Finding::Fork:
+            return "fork";
+        case Finding::AmbiguousClock:
+            return "ambiguous_clock";
+        case Finding::AsyncLoad:
+            return "async_load";
+        case Finding::FullCaseXSelector:
+            return "full_case_x_selector";
+        case Finding::FullCasePragmaUnsound:
+            return "full_case_pragma_unsound";
+        case Finding::UnmodelledJump:
+            return "unmodelled_jump";
+    }
+
+    return "unknown";
+}
+
+} // namespace
+
+std::string sidecar(const ir::Module& module, const Result* result, SynthConfig cfg) {
+    const EmittedNames names   = emitted_names(module, cfg);
+    const auto         signals = module.signals();
+
+    // Which scope each signal belongs to, so the map can carry the instance path.
+    std::vector<uint32_t> scope_of(signals.size(), ~0u);
+    const auto            walk = [&](auto&& self, const ir::InstanceScope& sc) -> void {
+        for (const ir::Signal g : sc.signals) {
+            scope_of[static_cast<uint32_t>(g)] = sc.id;
+        }
+        for (const ir::InstanceScope& ch : sc.children) {
+            self(self, ch);
+        }
+    };
+    for (const ir::InstanceScope& t : module.tops()) {
+        walk(walk, t);
+    }
+
+    // Classification by signal, when there is one.
+    std::vector<const SignalStores*> cls(signals.size(), nullptr);
+    if (result != nullptr) {
+        for (const ProcessResult& pr : result->processes) {
+            for (const SignalStores& e : pr.signals) {
+                cls[static_cast<uint32_t>(e.signal)] = &e;
+            }
+        }
+    }
+
+    std::string os;
+    os.reserve(256 + 128 * signals.size());
+    os += "{\"version\":1,";
+    json_field(os, "hierarchy", cfg.hierarchy == Hierarchy::Instances ? "instances" : "flat");
+    json_field(os, "target", cfg.target == Target::V2005 ? "v2005" : "sv2017");
+
+    os += "\"instances\":[";
+    for (size_t i = 0, n = 0; i < names.scope.size(); ++i) {
+        if (names.scope[i].empty()) {
+            continue;
+        }
+        os += n++ != 0 ? ",{" : "{";
+        json_field(os, "path", names.scope[i]);
+        json_str(os, "module");
+        os += ':';
+        json_str(os, i < names.mod.size() ? names.mod[i] : std::string_view{});
+        os += '}';
+    }
+    os += "],\"signals\":[";
+
+    for (size_t i = 0, n = 0; i < signals.size(); ++i) {
+        os += n++ != 0 ? ",{" : "{";
+        // The original hierarchical path, and what it became. Bidirectional: the
+        // emitted name is unique within its scope, the path is unique globally.
+        json_field(os, "path", signals[i].name);
+        json_field(os, "emitted", names.sig[i]);
+        const uint32_t sc = scope_of[i];
+        if (sc != ~0u && sc < names.scope.size()) {
+            json_field(os, "scope", names.scope[sc]);
+        }
+        const SignalStores* e = cls[i];
+        if (e == nullptr) {
+            os.pop_back(); // trailing comma
+            os += '}';
+            continue;
+        }
+        json_field(os, "kind", kind_name(e->kind));
+        if (e->kind == StorageKind::Flop || e->kind == StorageKind::AsyncLoad) {
+            json_field(os, "clock", module.signal(e->decomp.clock).name);
+            json_field(os, "clock_edge", e->decomp.clock_edge == ir::Edge::Negative ? "negedge" : "posedge");
+            os += "\"async\":[";
+            for (size_t g = 0; g < e->decomp.async.size(); ++g) {
+                const AsyncGroup& ag = e->decomp.async[g];
+                os += g != 0 ? ",{" : "{";
+                json_field(os, "trigger", module.signal(ag.trigger).name);
+                json_field(os, "edge", ag.edge == ir::Edge::Negative ? "negedge" : "posedge");
+                os += "\"entries\":";
+                put_uint(os, ag.entries.size());
+                os += '}';
+            }
+            os += "],";
+            os += "\"async_reset\":";
+            os += e->async_reset ? "true," : "false,";
+        }
+        os += "\"always_enabled\":";
+        os += e->decomp.always_enabled ? "true" : "false";
+        os += '}';
+    }
+    os += ']';
+
+    if (result != nullptr) {
+        os += ",\"findings\":[";
+        for (size_t i = 0; i < result->notes.size(); ++i) {
+            const Note& nt = result->notes[i];
+            os += i != 0 ? ",{" : "{";
+            json_field(os, "kind", finding_name(nt.kind));
+            os += "\"process\":";
+            put_uint(os, nt.process);
+            const auto sg = static_cast<uint32_t>(nt.signal);
+            if (sg < signals.size()) {
+                os += ',';
+                json_field(os, "signal", signals[sg].name, /*comma=*/false);
+            }
+            os += '}';
+        }
+        os += ']';
+    }
+    os += "}\n";
 
     return os;
 }

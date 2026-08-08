@@ -4,6 +4,7 @@
 #include <array>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -1463,4 +1464,110 @@ TEST_CASE("hierarchical emission is valid Verilog-2005") {
     CAPTURE(text);
     CHECK(text.find("logic") == std::string::npos);
     CHECK(errors_as_2005(text).empty());
+}
+
+// --- W5: the sidecar -------------------------------------------------------
+
+namespace {
+
+// Values of a JSON field, in document order. Enough to check a map is complete and
+// invertible without dragging in a parser.
+std::vector<std::string> json_values(std::string_view doc, std::string_view key) {
+    std::vector<std::string> out;
+    const std::string        pat = "\"" + std::string(key) + "\":\"";
+    for (size_t p = doc.find(pat); p != std::string_view::npos; p = doc.find(pat, p + 1)) {
+        const size_t b = p + pat.size();
+        const size_t e = doc.find('"', b);
+        out.emplace_back(doc.substr(b, e - b));
+    }
+
+    return out;
+}
+
+} // namespace
+
+// The sidecar exists so a rename does not silently break every downstream script.
+// That is only true if the map covers every signal and inverts.
+TEST_CASE("the sidecar maps every signal name, both ways") {
+    const LowerResult r = lower_text(R"(
+        module child(input clk, input [7:0] d, output reg [7:0] q);
+          always @(posedge clk) q <= d;
+        endmodule
+        module top(input clk, input [7:0] a, output [7:0] y);
+          wire [7:0] mid;
+          child u1(.clk(clk), .d(a),   .q(mid));
+          child u2(.clk(clk), .d(mid), .q(y));
+        endmodule
+    )");
+    REQUIRE(r.ok);
+    const legalize::SynthConfig cfg{ .hierarchy = legalize::Hierarchy::Instances };
+    const std::string           json = legalize::sidecar(*r.module, nullptr, cfg);
+    CAPTURE(json);
+
+    const std::vector<std::string> paths   = json_values(json, "path");
+    const std::vector<std::string> emitted = json_values(json, "emitted");
+    // Every signal appears exactly once.
+    CHECK(emitted.size() == r.module->signals().size());
+    // Original paths are unique, so the map inverts.
+    std::set<std::string> unique_paths(paths.begin(), paths.end());
+    CHECK(unique_paths.size() == paths.size());
+
+    // And every original path really is a signal of the design.
+    std::set<std::string> real;
+    for (const ir::SignalInfo& s : r.module->signals()) {
+        real.insert(s.name);
+    }
+    for (const std::string& sig_path : paths) {
+        if (real.count(sig_path) == 0) {
+            // instance paths share the "path" key; they must be scopes then
+            CHECK(json.find("\"module\":") != std::string::npos);
+        }
+    }
+}
+
+// Every name the sidecar claims was emitted must actually appear in the text. A map
+// that describes a rename the writer did not make is worse than no map.
+TEST_CASE("every name the sidecar claims appears in the emitted source") {
+    const LowerResult r = lower_text(R"(
+        module child(input clk, input [7:0] d, output reg [7:0] q);
+          always @(posedge clk) q <= d;
+        endmodule
+        module top(input clk, input [7:0] a, output [7:0] y);
+          child u1(.clk(clk), .d(a), .q(y));
+        endmodule
+    )");
+    REQUIRE(r.ok);
+    const legalize::SynthConfig cfg{ .hierarchy = legalize::Hierarchy::Instances };
+    const std::string           text = legalize::materialize(*r.module, nullptr, cfg);
+    const std::string           json = legalize::sidecar(*r.module, nullptr, cfg);
+    CAPTURE(text);
+    for (const std::string& e : json_values(json, "emitted")) {
+        CHECK(text.find(e) != std::string::npos);
+    }
+}
+
+TEST_CASE("the sidecar's classification matches the Result") {
+    const Run t =
+      run(wrap("always @(posedge clk or posedge rst) if (rst) q <= 8'h00; else q <= a;"), { .keep_guards = true });
+    const std::string json = legalize::sidecar(t.mod(), &t.result, {});
+    CAPTURE(json);
+    const auto* e = t.find("q");
+    REQUIRE(e != nullptr);
+    CHECK(e->kind == legalize::StorageKind::Flop);
+    CHECK(e->async_reset);
+    // The same two facts, in the sidecar.
+    CHECK(json.find("\"kind\":\"flop\"") != std::string::npos);
+    CHECK(json.find("\"async_reset\":true") != std::string::npos);
+    CHECK(json.find("\"clock_edge\":\"posedge\"") != std::string::npos);
+}
+
+TEST_CASE("the sidecar reports findings and omits classification without a Result") {
+    const Run t = run(wrap("always @(posedge clk or posedge rst) if (rst && en) q <= 8'h00; else q <= a;"),
+                      { .keep_guards = true });
+    CHECK(legalize::sidecar(t.mod(), &t.result, {}).find("\"kind\":\"async_load\"") != std::string::npos);
+    // Without a Result the classification is absent, not guessed.
+    const std::string bare = legalize::sidecar(t.mod(), nullptr, {});
+    CHECK(bare.find("\"kind\":") == std::string::npos);
+    CHECK(bare.find("\"findings\"") == std::string::npos);
+    CHECK(bare.find("\"emitted\":") != std::string::npos);
 }

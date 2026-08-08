@@ -28,12 +28,24 @@
 // analysis depends on it.
 
 #include <string>
+#include <vector>
 
 #include "Legalize.h"
 #include "SynthConfig.h"
 #include "ir/Module.h"
 
 namespace clotho::legalize {
+
+// The names the writer actually emitted, indexed by handle.
+//
+// Produced by the same call the writer uses, which is the only way the sidecar's
+// `original -> emitted` map can be true rather than a second guess at it.
+struct EmittedNames {
+    std::vector<std::string> sig;   // by ir::Signal
+    std::vector<std::string> fn;    // by ir::FunctionId
+    std::vector<std::string> mod;   // by scope id; empty when Hierarchy::Flat
+    std::vector<std::string> scope; // by scope id: the full instance path
+};
 
 // Render `module` as SystemVerilog.
 //
@@ -47,6 +59,20 @@ namespace clotho::legalize {
 // A process the analysis rejected, or one using an expression this renderer does
 // not cover, is emitted as a comment naming the reason rather than as source
 // that would silently mean something else.
+// The JSON sidecar: everything the emitted SystemVerilog cannot carry.
+//
+// Two things downstream needs and the text cannot hold. The NAME MAP, because
+// normalization renames and every SDC constraint, physical script and area report
+// keys on the original hierarchical path -- an emitter that renames without a map
+// is unusable in a real flow (7.3). And the CLASSIFICATION, because "this signal is
+// a flop on posedge clk with an async reset" is the analysis's product, not a
+// property of the source text.
+//
+// `result` may be null; the classification section is then omitted rather than
+// guessed. Names come from the same computation the writer uses, so the map is true
+// by construction rather than by agreement.
+[[nodiscard]] std::string sidecar(const ir::Module& module, const Result* result = nullptr, SynthConfig cfg = {});
+
 [[nodiscard]] std::string materialize(const ir::Module& module, const Result* result = nullptr, SynthConfig cfg = {});
 
 } // namespace clotho::legalize
