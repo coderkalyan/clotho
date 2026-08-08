@@ -299,6 +299,15 @@ public:
     [[nodiscard]] ir::Inst::Tag blocker() const {
         return blocker_;
     }
+    // Record a decline made by the statement printer rather than the expression
+    // printer, so the emitted comment names something.
+    void emit_task_name(std::string& out, ir::FunctionId f) {
+        out += fn_[static_cast<uint32_t>(f)];
+    }
+    void decline(ir::Inst::Tag t) {
+        blocker_ = t;
+        ok_      = false;
+    }
 
 private:
     void unary(std::string& out, const char* op, const ir::Ir& ir, ir::Index a, int prec) {
@@ -643,7 +652,26 @@ void emit_tree(std::string&          os,
 // list to rebuild because the region tree IS the statement tree. Assignments land
 // on frame slots, `ret` becomes `return`, and nothing here can touch a module
 // signal -- FnLegality already refused any function that does.
-bool emit_fn_body(std::string& os, Renderer& render, const ir::Ir& ir, std::span<const ir::Index> body, int ind) {
+// The arms of a switch, as a view over the flat extra run. Contiguous by
+// construction (Builder::switch_ lays keys first, then the record run).
+std::span<const ir::SwitchArm> arms_of(const ir::Ir& ir, const ir::SwitchInfo& info) {
+    const std::span<const ir::Index> raw    = ir.region(info.arms);
+    constexpr size_t                 stride = sizeof(ir::SwitchArm) / sizeof(uint32_t);
+    const auto*                      base   = reinterpret_cast<const ir::SwitchArm*>(raw.data());
+
+    return { base, raw.size() / stride };
+}
+
+// Print a region tree as statements, verbatim.
+//
+// This is the 1:1 path, and it needs no analysis at all: the region tree ALREADY IS
+// the statement tree, so `cond` prints as if/else, `switch` as case, `loop` as while
+// and stores as assignments. It is strictly simpler than the legalized renderer,
+// which has to rebuild a tree out of guarded lists first.
+//
+// Used for function bodies (which never had an analysis) and, when no Result is
+// supplied, for processes.
+bool emit_stmts(std::string& os, Renderer& render, const ir::Ir& ir, std::span<const ir::Index> body, int ind) {
     for (const ir::Index i : body) {
         const ir::Inst::Payload& p = ir.payload(i);
         switch (ir.tag(i)) {
@@ -651,7 +679,9 @@ bool emit_fn_body(std::string& os, Renderer& render, const ir::Ir& ir, std::span
             case ir::Inst::Tag::StoreNb: {
                 indent(os, ind);
                 render.emit(os, ir, p.binary.l, kPrimary);
-                os += " = ";
+                // The assignment kind is the opcode's, not the context's: a process
+                // may mix blocking and nonblocking, and a function only ever blocks.
+                os += ir.tag(i) == ir::Inst::Tag::StoreNb ? " <= " : " = ";
                 render.emit(os, ir, p.binary.r, kLowest);
                 os += ";\n";
                 if (!render.ok()) {
@@ -673,37 +703,152 @@ bool emit_fn_body(std::string& os, Renderer& render, const ir::Ir& ir, std::span
                 indent(os, ind);
                 os += "return;\n";
                 break;
+
+            case ir::Inst::Tag::Break:
+                indent(os, ind);
+                os += "break;\n";
+                break;
+            case ir::Inst::Tag::Continue:
+                indent(os, ind);
+                os += "continue;\n";
+                break;
+
             case ir::Inst::Tag::Cond: {
-                const auto r = ir.extra_data<ir::Regions>(p.op_extra.extra);
+                const auto                       r     = ir.extra_data<ir::Regions>(p.op_extra.extra);
+                const std::span<const ir::Index> then_ = ir.region(r.then_);
+                const std::span<const ir::Index> else_ = ir.region(r.else_);
                 indent(os, ind);
                 os += "if (";
                 render.emit(os, ir, p.op_extra.op, kLowest);
                 os += ") begin\n";
-                if (!render.ok()) {
-                    return false;
-                }
-                if (!emit_fn_body(os, render, ir, ir.region(r.then_), ind + 1)) {
+                if (!render.ok() || !emit_stmts(os, render, ir, then_, ind + 1)) {
                     return false;
                 }
                 indent(os, ind);
+                // An absent else stays absent. This is the 1:1 path: filling the arm
+                // in is the legalized renderer's job and would change what the
+                // source means here.
+                if (else_.empty()) {
+                    os += "end\n";
+                    break;
+                }
                 os += "end else begin\n";
-                if (!emit_fn_body(os, render, ir, ir.region(r.else_), ind + 1)) {
+                if (!emit_stmts(os, render, ir, else_, ind + 1)) {
                     return false;
                 }
                 indent(os, ind);
                 os += "end\n";
                 break;
             }
+
+            case ir::Inst::Tag::Switch: {
+                const auto info = ir.extra_data<ir::SwitchInfo>(p.op_extra.extra);
+                indent(os, ind);
+                os += "case (";
+                render.emit(os, ir, p.op_extra.op, kLowest);
+                os += ")\n";
+                if (!render.ok()) {
+                    return false;
+                }
+                for (const ir::SwitchArm& a : arms_of(ir, info)) {
+                    const std::span<const ir::Index> keys = ir.region(a.keys);
+                    indent(os, ind + 1);
+                    for (size_t k = 0; k + 1 < keys.size(); k += 2) {
+                        if (k != 0) {
+                            os += ", ";
+                        }
+                        // Sized to the selector, or unsized when the frontend
+                        // declined to state a width (the one-hot lowering): `0'h0`
+                        // is not legal source.
+                        if (info.sel_width != 0) {
+                            put_uint(os, info.sel_width);
+                        }
+                        os += "'h";
+                        put_hex(os, static_cast<uint64_t>(keys[k]) | (static_cast<uint64_t>(keys[k + 1]) << 32));
+                    }
+                    os += ": begin\n";
+                    if (!emit_stmts(os, render, ir, ir.region(a.body), ind + 2)) {
+                        return false;
+                    }
+                    indent(os, ind + 1);
+                    os += "end\n";
+                }
+                const std::span<const ir::Index> dflt = ir.region(info.default_);
+                if (!dflt.empty()) {
+                    indent(os, ind + 1);
+                    os += "default: begin\n";
+                    if (!emit_stmts(os, render, ir, dflt, ind + 2)) {
+                        return false;
+                    }
+                    indent(os, ind + 1);
+                    os += "end\n";
+                }
+                indent(os, ind);
+                os += "endcase\n";
+                break;
+            }
+
+            case ir::Inst::Tag::Loop: {
+                const auto info = ir.extra_data<ir::LoopInfo>(p.extra);
+                // The predicate is computed by the cond region. When that region is
+                // only value ops the whole test is one expression and this prints as
+                // a `while`; a cond region that ASSIGNS cannot be spelled that way,
+                // and is declined rather than approximated.
+                for (const ir::Index c : ir.region(info.cond)) {
+                    const ir::Inst::Tag t = ir.tag(c);
+                    if (t == ir::Inst::Tag::Store || t == ir::Inst::Tag::StoreNb) {
+                        render.decline(ir::Inst::Tag::Loop);
+                        return false;
+                    }
+                }
+                if (info.bottom_test != 0) {
+                    render.decline(ir::Inst::Tag::Loop); // do-while: not 2005, and rare
+                    return false;
+                }
+                indent(os, ind);
+                os += "while (";
+                render.emit(os, ir, info.pred, kLowest);
+                os += ") begin\n";
+                if (!render.ok() || !emit_stmts(os, render, ir, ir.region(info.body), ind + 1)) {
+                    return false;
+                }
+                // The step runs at the end of every iteration, which is what `for`
+                // hides and `while` has to spell.
+                if (!emit_stmts(os, render, ir, ir.region(info.step), ind + 1)) {
+                    return false;
+                }
+                indent(os, ind);
+                os += "end\n";
+                break;
+            }
+
             // A lazy select's regions feed its branch values, which are rendered
             // inline as a ternary; they need no statement of their own.
             case ir::Inst::Tag::SelectLazy:
                 break;
+
+            // A function call is a VALUE that happens to sit at statement level in
+            // the instruction stream; whoever consumes it renders it inline. It is
+            // only reachable here because a call's legality is contextual, so the
+            // static tag table marks it unsynthesizable and the default arm below
+            // would decline it.
+            case ir::Inst::Tag::Call:
+                break;
+
+            // A task call is a statement. FnLegality only admits a task that writes
+            // no module signal, so the call is a no-op -- but it is emitted anyway,
+            // because this path claims to be 1:1 and dropping a statement is not.
+            case ir::Inst::Tag::TaskCall: {
+                const auto info = ir.extra_data<ir::TaskCallInfo>(p.extra);
+                indent(os, ind);
+                render.emit_task_name(os, info.func);
+                os += ";\n";
+                break;
+            }
             default:
-                // Pure value instructions are rendered inline by their users. A
-                // loop or a case inside a function is not covered yet, and saying
-                // so beats emitting source that means something else.
-                if (!ir::tag_info(ir.tag(i)).synthesizable || ir.tag(i) == ir::Inst::Tag::Loop ||
-                    ir.tag(i) == ir::Inst::Tag::Switch) {
+                // Pure value instructions are rendered inline by their users.
+                if (!ir::tag_info(ir.tag(i)).synthesizable) {
+                    render.decline(ir.tag(i));
                     return false;
                 }
                 break;
@@ -718,15 +863,20 @@ bool emit_fn_body(std::string& os, Renderer& render, const ir::Ir& ir, std::span
 // renderer needs no notion of which frame it is in.
 std::optional<std::string> emit_fn(const ir::Module& m, Renderer& render, ir::FunctionId id, std::string_view name) {
     const ir::Function& f = m.function(id);
-    if (f.is_task || f.return_type == ir::Ref::Invalid) {
-        return std::nullopt; // a legal task is a no-op; there is no call to render
+    std::string         os;
+    const auto          width = [&](ir::Ref t) { return m.pool.layout(t).width; };
+    // A task has no return type, so it declares as a task. Both take their formals
+    // the same way, and both name frame slots `l<i>`. Tasks are emitted rather than
+    // skipped because the 1:1 path calls them, and a call to a task that was never
+    // declared does not re-lower.
+    const bool is_task = f.is_task || f.return_type == ir::Ref::Invalid;
+    if (is_task) {
+        os += "  task automatic ";
+    } else {
+        os += "  function automatic logic [";
+        put_uint(os, width(f.return_type) - 1);
+        os += ":0] ";
     }
-
-    std::string os;
-    const auto  width = [&](ir::Ref t) { return m.pool.layout(t).width; };
-    os += "  function automatic logic [";
-    put_uint(os, width(f.return_type) - 1);
-    os += ":0] ";
     os += name;
     os += '(';
     for (size_t a = 0; a < f.param_types.size(); ++a) {
@@ -746,17 +896,17 @@ std::optional<std::string> emit_fn(const ir::Module& m, Renderer& render, ir::Fu
         put_uint(os, l);
         os += ";\n";
     }
-    if (!emit_fn_body(os, render, f.ir, f.ir.root(), 2)) {
+    if (!emit_stmts(os, render, f.ir, f.ir.root(), 2)) {
         return std::nullopt;
     }
-    os += "  endfunction\n";
+    os += is_task ? "  endtask\n" : "  endfunction\n";
 
     return os;
 }
 
 } // namespace
 
-std::string materialize(const ir::Module& module, const Result& result, MaterializeOptions options) {
+std::string materialize(const ir::Module& module, const Result* result, MaterializeOptions options) {
     std::string os;
     // Grown by doubling, a 3.4 MB result copies several megabytes of text for
     // nothing. The estimate only has to be the right order: signals dominate the
@@ -809,16 +959,16 @@ std::string materialize(const ir::Module& module, const Result& result, Material
         }
     }
 
-    for (size_t k = 0; k < result.processes.size(); ++k) {
-        const ProcessResult& pr   = result.processes[k];
+    for (size_t k = 0; k < module.processes().size(); ++k) {
+        const ProcessResult* pr   = result != nullptr ? &result->processes[k] : nullptr;
         const ir::Process&   proc = module.processes()[k];
-        if (!pr.synthesizable) {
+        if (pr != nullptr && !pr->synthesizable) {
             os += "  // process ";
             put_uint(os, k);
             os += ": not synthesizable\n";
             continue;
         }
-        if (pr.signals.empty()) {
+        if (pr != nullptr && pr->signals.empty()) {
             continue;
         }
 
@@ -848,7 +998,24 @@ std::string materialize(const ir::Module& module, const Result& result, Material
         }
         os += ") begin\n";
 
-        for (const SignalStores& e : pr.signals) {
+        // No Result: print the region tree and stop. Nothing is inferred, no arm is
+        // filled in, and the output means exactly what the input meant.
+        if (pr == nullptr) {
+            const size_t mark = os.size();
+            render.clear();
+            if (!emit_stmts(os, render, proc.ir, proc.ir.root(), 2) || !render.ok()) {
+                os.resize(mark);
+                os += "    // process ";
+                put_uint(os, k);
+                os += ": not renderable (opcode ";
+                put_uint(os, static_cast<uint32_t>(render.blocker()));
+                os += ")\n";
+            }
+            os += "  end\n";
+            continue;
+        }
+
+        for (const SignalStores& e : pr->signals) {
             const std::string_view sig  = sig_names[static_cast<uint32_t>(e.signal)];
             const bool             nb   = !e.stores.empty() && e.stores.front().nonblocking;
             const bool             edge = e.kind == StorageKind::Flop || e.kind == StorageKind::AsyncLoad;
@@ -877,7 +1044,7 @@ std::string materialize(const ir::Module& module, const Result& result, Material
             pool.clear();
             for (const GuardedStore& st : e.stores) {
                 const auto off = static_cast<uint32_t>(pool.size());
-                guard_atoms(result.guards, st.guard, pool);
+                guard_atoms(result->guards, st.guard, pool);
                 items.push_back(
                   { off, static_cast<uint32_t>(pool.size() - off), st.value, proc.ir.payload(st.store).binary.l });
             }

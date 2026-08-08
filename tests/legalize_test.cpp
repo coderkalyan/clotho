@@ -442,7 +442,7 @@ TEST_CASE("materializing a design round-trips to the same classification") {
         REQUIRE(lowered.ok);
 
         const legalize::Result before = legalize::run(*lowered.module, nullptr, { .keep_guards = true });
-        const std::string      text   = legalize::materialize(*lowered.module, before);
+        const std::string      text   = legalize::materialize(*lowered.module, &before);
         CAPTURE(text);
         // Anything the renderer could not spell would silently weaken the test.
         REQUIRE(text.find("unrenderable") == std::string::npos);
@@ -468,7 +468,7 @@ TEST_CASE("a missing arm is filled in, differently for a flop and a latch") {
     const LowerResult flop = lower_text(wrap("always @(posedge clk) if (en) q <= a;"));
     REQUIRE(flop.ok);
     const legalize::Result fr = legalize::run(*flop.module, nullptr, { .keep_guards = true });
-    const std::string      ft = legalize::materialize(*flop.module, fr);
+    const std::string      ft = legalize::materialize(*flop.module, &fr);
     CHECK(ft.find("q <= q; // hold") != std::string::npos);
 
     // The same text in a level-sensitive block would be a combinational loop, so
@@ -476,7 +476,7 @@ TEST_CASE("a missing arm is filled in, differently for a flop and a latch") {
     const LowerResult latch = lower_text(wrap("always @* if (en) q = a;"));
     REQUIRE(latch.ok);
     const legalize::Result lr = legalize::run(*latch.module, nullptr, { .keep_guards = true });
-    const std::string      lt = legalize::materialize(*latch.module, lr);
+    const std::string      lt = legalize::materialize(*latch.module, &lr);
     CHECK(lt.find("holds: latch") != std::string::npos);
     CHECK(lt.find("q = q") == std::string::npos);
 }
@@ -488,7 +488,7 @@ TEST_CASE("materialize emits a nested tree, not a flat guarded list") {
     const LowerResult r = lower_text(wrap("always @* if (en) q = a; else q = b;"));
     REQUIRE(r.ok);
     const legalize::Result res  = legalize::run(*r.module, nullptr, { .keep_guards = true });
-    const std::string      text = legalize::materialize(*r.module, res);
+    const std::string      text = legalize::materialize(*r.module, &res);
     CHECK(text.find("end else begin") != std::string::npos);
 
     const legalize::Result again = legalize::run(*lower_text(text).module, nullptr);
@@ -1219,4 +1219,80 @@ TEST_CASE("a jump too deep to guard is reported") {
                       { .keep_guards = true });
     CHECK_FALSE(t.all_synthesizable());
     CHECK(t.has(legalize::Finding::UnmodelledJump));
+}
+
+// --- W2: the 1:1 structural path ------------------------------------------
+//
+// With no Result, materialize prints the region tree and infers nothing. It is the
+// simpler of the two renderers, because the region tree already IS the statement
+// tree -- there is no guarded list to rebuild.
+
+TEST_CASE("without a Result an absent else stays absent") {
+    const LowerResult r = lower_text(wrap("always @* if (en) q = a;"));
+    REQUIRE(r.ok);
+    const std::string text = legalize::materialize(*r.module, nullptr);
+    // The legalized renderer describes the hold; the 1:1 renderer must not, because
+    // the source did not say it.
+    CHECK(text.find("holds: latch") == std::string::npos);
+    CHECK(text.find("end else begin") == std::string::npos);
+    CHECK(text.find("if (") != std::string::npos);
+}
+
+TEST_CASE("without a Result a flop keeps its nonblocking assignment") {
+    const LowerResult r = lower_text(wrap("always @(posedge clk) if (en) q <= a;"));
+    REQUIRE(r.ok);
+    const std::string text = legalize::materialize(*r.module, nullptr);
+    CHECK(text.find("<=") != std::string::npos);
+    CHECK(text.find("// hold") == std::string::npos);
+}
+
+TEST_CASE("the structural path renders case and loop") {
+    const LowerResult r = lower_text(R"(
+        module m(input [1:0] s2, input [7:0] a, output reg [7:0] q, output reg [7:0] r);
+          integer i;
+          always @* begin
+            case (s2)
+              2'd0: q = a;
+              2'd1: q = 8'h01;
+              default: q = 8'h00;
+            endcase
+            for (i = 0; i < 4; i = i + 1) r[i] = a[i];
+          end
+        endmodule
+    )");
+    REQUIRE(r.ok);
+    const std::string text = legalize::materialize(*r.module, nullptr);
+    CHECK(text.find("case (") != std::string::npos);
+    CHECK(text.find("default: begin") != std::string::npos);
+    CHECK(text.find("while (") != std::string::npos);
+    CHECK(text.find("not renderable") == std::string::npos);
+}
+
+// The equivalence that matters: the structural rendering must re-lower to a design
+// that legalizes the same way the ORIGINAL did. If it did not, "1:1" would be a
+// claim rather than a property.
+TEST_CASE("the structural path round-trips to the same classification") {
+    for (const ResetCase& c : kResetCases) {
+        CAPTURE(c.file);
+        const std::string path = std::string(CLOTHO_TEST_DIR) + "/legalize/reset/" + std::string(c.file) + ".sv";
+        const std::array<std::string_view, 1> paths{ path };
+        const LowerResult                     lowered = lower_files(paths);
+        REQUIRE(lowered.ok);
+
+        const std::string text = legalize::materialize(*lowered.module, nullptr);
+        CAPTURE(text);
+        REQUIRE(text.find("not renderable") == std::string::npos);
+
+        const LowerResult again = lower_text(text);
+        REQUIRE_MESSAGE(again.ok, again.diagnostic_text());
+
+        const legalize::Result before = legalize::run(*lowered.module, nullptr);
+        const legalize::Result after  = legalize::run(*again.module, nullptr);
+        const auto             a      = classify_q(lowered, before);
+        const auto             b      = classify_q(again, after);
+        REQUIRE(a.has_value());
+        REQUIRE(b.has_value());
+        CHECK(a->first == b->first);
+        CHECK(a->second == b->second);
+    }
 }

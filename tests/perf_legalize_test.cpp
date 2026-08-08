@@ -243,7 +243,40 @@ TEST_CASE("PERF materialize round-trips real designs" * doctest::skip()) {
         REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
 
         const legalize::Result before = legalize::run(*r.module, nullptr, { .keep_guards = true });
-        const std::string      text   = legalize::materialize(*r.module, before);
+
+        // The 1:1 path first: no Result, nothing inferred, region tree printed as
+        // statements. It has to reach the same classification as the original, or
+        // "structural translation" would be a claim rather than a property.
+        {
+            const std::string plain = legalize::materialize(*r.module, nullptr);
+            CHECK(plain.find("not renderable") == std::string::npos);
+            const LowerResult reparsed = lower_text(plain);
+            REQUIRE_MESSAGE(reparsed.ok, reparsed.diagnostic_text());
+            const legalize::Result pr = legalize::run(*reparsed.module, nullptr);
+            const Classified       pb = classify(*r.module, before, /*drop_looped=*/true);
+            const Classified       pa = classify(*reparsed.module, pr, /*drop_looped=*/false);
+            size_t                 pm = 0;
+            size_t                 pd = 0;
+            size_t                 pg = 0;
+            for (const auto& [name, want] : pb.by_name) {
+                const auto it = pa.by_name.find(mangled(name));
+                if (it == pa.by_name.end()) {
+                    ++pg;
+                } else if (it->second == want) {
+                    ++pm;
+                } else {
+                    if (pd < 4) {
+                        MESSAGE("    STRUCT DIFF ", name, ": ", want.first, "->", it->second.first);
+                    }
+                    ++pd;
+                }
+            }
+            MESSAGE(nm, " structural: compared ", pb.by_name.size(), " match ", pm, " differ ", pd, " absent ", pg);
+            CHECK(pd == 0);
+            CHECK(pg == 0);
+        }
+
+        const std::string text = legalize::materialize(*r.module, &before);
         CHECK(text.find("unrenderable") == std::string::npos);
 
         const LowerResult again = lower_text(text);

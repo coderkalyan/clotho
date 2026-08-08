@@ -43,12 +43,20 @@ struct MaterializeOptions {
     std::string_view name;
 };
 
-// Render `result` as SystemVerilog. `result` MUST have been produced with
-// Options::keep_guards, since the guards are the mux tree.
+// Render `module` as SystemVerilog.
+//
+// `result` is OPTIONAL. Given one (produced with Options::keep_guards, since the
+// guards are the mux tree), each written signal is rendered from its guarded list
+// and the implicit arms are filled in. Given nullptr, this is a 1:1 structural
+// translation: the region tree is printed as statements, an absent `else` stays
+// absent, and nothing is inferred. The second path is the simpler of the two --
+// there is no tree to rebuild, because the region tree already is one.
 //
 // A process the analysis rejected, or one using an expression this renderer does
 // not cover, is emitted as a comment naming the reason rather than as source
 // that would silently mean something else.
-[[nodiscard]] std::string materialize(const ir::Module& module, const Result& result, MaterializeOptions options = {});
+[[nodiscard]] std::string materialize(const ir::Module&  module,
+                                      const Result*      result  = nullptr,
+                                      MaterializeOptions options = {});
 
 } // namespace clotho::legalize
