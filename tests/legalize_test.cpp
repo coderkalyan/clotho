@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -1385,4 +1386,81 @@ TEST_CASE("the reset corpus emits valid Verilog-2005") {
           legalize::materialize(*lowered.module, nullptr, { .target = legalize::Target::V2005 });
         CHECK(errors_as_2005(plain).empty());
     }
+}
+
+// --- W4: hierarchical emission --------------------------------------------
+
+namespace {
+
+// `instance.path -> leaf signal names`, which is what a downstream flow keys on.
+void scope_paths(const ir::Module&                                m,
+                 const ir::InstanceScope&                         sc,
+                 std::string                                      prefix,
+                 std::map<std::string, std::vector<std::string>>& out) {
+    const std::string         here = prefix.empty() ? sc.name : prefix + "." + sc.name;
+    std::vector<std::string>& sigs = out[here];
+    for (const ir::Signal g : sc.signals) {
+        const std::string& n   = m.signal(g).name;
+        const size_t       dot = n.rfind('.');
+        sigs.push_back(dot == std::string::npos ? n : n.substr(dot + 1));
+    }
+    std::sort(sigs.begin(), sigs.end());
+    for (const ir::InstanceScope& ch : sc.children) {
+        scope_paths(m, ch, here, out);
+    }
+}
+
+std::map<std::string, std::vector<std::string>> paths_of(const ir::Module& m) {
+    std::map<std::string, std::vector<std::string>> out;
+    for (const ir::InstanceScope& t : m.tops()) {
+        scope_paths(m, t, {}, out);
+    }
+
+    return out;
+}
+
+} // namespace
+
+// The point of hierarchical emission, and the §7.3 requirement: a flat render calls
+// the signal `top_u1_q` and every constraint that referenced `u1.q` stops matching.
+// Per scope the leaf is what the source wrote, so the names survive.
+TEST_CASE("hierarchical emission preserves the instance tree and signal names") {
+    const LowerResult r = lower_text(R"(
+        module child(input clk, input [7:0] d, output reg [7:0] q);
+          always @(posedge clk) q <= d;
+        endmodule
+        module top(input clk, input [7:0] a, output [7:0] y);
+          wire [7:0] mid;
+          child u1(.clk(clk), .d(a),   .q(mid));
+          child u2(.clk(clk), .d(mid), .q(y));
+        endmodule
+    )");
+    REQUIRE(r.ok);
+    const std::string text = legalize::materialize(*r.module, nullptr, { .hierarchy = legalize::Hierarchy::Instances });
+    CAPTURE(text);
+
+    // The port copies became a port map, not eight stray always blocks.
+    CHECK(text.find(".clk(clk)") != std::string::npos);
+    CHECK(text.find(".q(mid)") != std::string::npos);
+
+    const LowerResult again = lower_text(text);
+    REQUIRE_MESSAGE(again.ok, again.diagnostic_text());
+    CHECK(paths_of(*r.module) == paths_of(*again.module));
+}
+
+TEST_CASE("hierarchical emission is valid Verilog-2005") {
+    const LowerResult r = lower_text(R"(
+        module child(input clk, input [7:0] d, output reg [7:0] q);
+          always @(posedge clk) q <= d;
+        endmodule
+        module top(input clk, input [7:0] a, output [7:0] y);
+          child u1(.clk(clk), .d(a), .q(y));
+        endmodule
+    )");
+    REQUIRE(r.ok);
+    const std::string text = legalize::materialize(
+      *r.module, nullptr, { .target = legalize::Target::V2005, .hierarchy = legalize::Hierarchy::Instances });
+    CAPTURE(text);
+    CHECK(text.find("logic") == std::string::npos);
+    CHECK(errors_as_2005(text).empty());
 }

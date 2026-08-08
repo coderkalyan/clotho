@@ -1,6 +1,7 @@
 #include "Materialize.h"
 
 #include <algorithm>
+#include <cctype>
 
 #include <ankerl/unordered_dense.h>
 #include <optional>
@@ -731,6 +732,67 @@ std::span<const ir::SwitchArm> arms_of(const ir::Ir& ir, const ir::SwitchInfo& i
     return { base, raw.size() / stride };
 }
 
+// --- hierarchical emission -------------------------------------------------
+
+// One connection on an instantiation: the child's port and whatever the parent
+// wired to it.
+struct PortConn {
+    ir::Signal    port{};       // the child-scope signal that is the formal
+    ir::Index     actual{};     // an expression in the parent, or the lvalue it drives
+    const ir::Ir* ir = nullptr; // the copy process's IR, which `actual` indexes
+};
+
+// A process reduced to a single unguarded signal-to-signal copy, which is how the
+// frontend represents a port connection: `u1.d = a` for an input, `mid = u1.q` for
+// an output. Recognising these is what turns a flattened design back into a
+// hierarchy -- there is no port map in the IR, only these.
+struct Copy {
+    bool       valid = false;
+    ir::Index  lhs{}; // the store's lvalue expression
+    ir::Index  rhs{}; // the store's value expression
+    ir::Signal lhs_sig{};
+    ir::Signal rhs_sig{};
+    bool       rhs_is_signal = false;
+};
+
+Copy as_copy(const ir::Ir& ir) {
+    Copy      c;
+    ir::Index store{};
+    size_t    stores = 0;
+    for (uint32_t i = 0; i < ir.inst_count(); ++i) {
+        const auto ix = static_cast<ir::Index>(i);
+        const auto t  = ir.tag(ix);
+        if (t == ir::Inst::Tag::Store || t == ir::Inst::Tag::StoreNb) {
+            ++stores;
+            store = ix;
+        } else if (t == ir::Inst::Tag::Cond || t == ir::Inst::Tag::Switch || t == ir::Inst::Tag::Loop) {
+            return c; // guarded: not a plain connection
+        }
+    }
+    if (stores != 1) {
+        return c;
+    }
+    const ir::LvalueRoot lv = ir::lvalue_root(ir, ir.payload(store).binary.l);
+    if (ir.tag(lv.root) != ir::Inst::Tag::Signal) {
+        return c;
+    }
+    c.lhs     = ir.payload(store).binary.l;
+    c.rhs     = ir.payload(store).binary.r;
+    c.lhs_sig = ir.payload(lv.root).signal;
+
+    ir::Index r = c.rhs;
+    while (ir.tag(r) == ir::Inst::Tag::Resize || ir.tag(r) == ir::Inst::Tag::Load) {
+        r = ir.payload(r).unary;
+    }
+    if (ir.tag(r) == ir::Inst::Tag::Signal) {
+        c.rhs_is_signal = true;
+        c.rhs_sig       = ir.payload(r).signal;
+    }
+    c.valid = true;
+
+    return c;
+}
+
 // Print a region tree as statements, verbatim.
 //
 // This is the 1:1 path, and it needs no analysis at all: the region tree ALREADY IS
@@ -978,6 +1040,382 @@ std::optional<std::string> emit_fn(const ir::Module& m, Renderer& render, ir::Fu
 
 } // namespace
 
+void emit_process(std::string&                    os,
+                  const ir::Module&               module,
+                  const Result*                   result,
+                  size_t                          k,
+                  const std::vector<std::string>& sig_names,
+                  SynthConfig                     cfg,
+                  Renderer&                       render,
+                  std::vector<Atom>&              pool);
+
+// Names inside one module: the LEAF, not the flattened path.
+//
+// This is the point of hierarchical emission. A flat render calls the signal
+// `hazard3_cpu_1port_core_alu_op_a_rev`, and every SDC constraint, physical script
+// and area report that referenced `core.alu.op_a_rev` stops matching. Per scope the
+// leaf is what the source wrote, so the names come back exactly -- except where two
+// signals in one scope genuinely share a leaf (unrolled loop variables do), which
+// takes an index suffix.
+// A name as an identifier, escaped when it is not a legal simple one.
+//
+// Clotho folds a generate block into the instance's NAME, so hazard3 has instances
+// literally called `fast_branchcmp.branchcmp_u`. Mangling the dot to an underscore
+// renames the instance and breaks every constraint that referenced it; Verilog's
+// escaped identifier carries the name through untouched, trailing space and all.
+// It does not restore the generate STRUCTURE -- that is folded away at lowering and
+// is frontend work -- but it does keep the path.
+std::string ident(std::string_view name) {
+    bool simple = name.size() > 0 && (name[0] == '_' || std::isalpha(static_cast<unsigned char>(name[0])) != 0);
+    for (const char c : name) {
+        simple = simple && (c == '_' || c == '$' || std::isalnum(static_cast<unsigned char>(c)) != 0);
+    }
+    if (simple) {
+        return std::string(name);
+    }
+
+    return "\\" + std::string(name) + " ";
+}
+
+std::string leaf_of(std::string_view name) {
+    const size_t dot = name.rfind('.');
+
+    return std::string(dot == std::string_view::npos ? name : name.substr(dot + 1));
+}
+
+struct ScopeNames {
+    // Per-signal emitted name, indexed by ir::Signal.
+    std::vector<std::string> sig;
+    // Per-scope emitted module name, indexed by scope id.
+    std::vector<std::string> mod;
+};
+
+void collect_scope_names(const ir::Module& m, const ir::InstanceScope& sc, std::string_view path, ScopeNames& out) {
+    // The module NAME is per-instance and synthetic, so it stays mangled; the
+    // instance name is what downstream keys on and is emitted verbatim below.
+    std::string mine = path.empty() ? mangle(sc.name) : std::string(path) + "__" + mangle(sc.name);
+    if (out.mod.size() <= sc.id) {
+        out.mod.resize(sc.id + 1);
+    }
+    out.mod[sc.id] = mine;
+
+    ankerl::unordered_dense::set<std::string> taken;
+    for (const ir::Signal g : sc.signals) {
+        std::string n = ident(leaf_of(m.signal(g).name));
+        if (!taken.insert(n).second) {
+            n += "__" + std::to_string(static_cast<uint32_t>(g));
+            taken.insert(n);
+        }
+        out.sig[static_cast<uint32_t>(g)] = std::move(n);
+    }
+    for (const ir::InstanceScope& ch : sc.children) {
+        collect_scope_names(m, ch, mine, out);
+    }
+}
+
+void emit_module_body(std::string&                    os,
+                      const ir::Module&               m,
+                      const Result*                   result,
+                      const ir::InstanceScope&        sc,
+                      const ScopeNames&               names,
+                      const std::vector<std::string>& fn_names,
+                      const std::vector<bool>&        written,
+                      SynthConfig                     cfg,
+                      Renderer&                       render,
+                      std::vector<Atom>&              pool) {
+    const auto fn_name_of = [&](size_t f) -> std::string_view { return fn_names[f]; };
+    // Child scope ids, for deciding whether a copy crosses into an instance.
+    ankerl::unordered_dense::map<uint32_t, const ir::InstanceScope*> child_of_signal;
+    for (const ir::InstanceScope& ch : sc.children) {
+        for (const ir::Signal g : ch.signals) {
+            child_of_signal[static_cast<uint32_t>(g)] = &ch;
+        }
+    }
+
+    // Split this scope's processes into port connections and real logic.
+    ankerl::unordered_dense::map<uint32_t, std::vector<PortConn>> conns;
+    std::vector<size_t>                                           logic;
+    for (size_t k = 0; k < m.processes().size(); ++k) {
+        const ir::Process& proc = m.processes()[k];
+        if (proc.scope != sc.id) {
+            continue;
+        }
+        const Copy c = as_copy(proc.ir);
+        if (c.valid) {
+            const auto lhs_child = child_of_signal.find(static_cast<uint32_t>(c.lhs_sig));
+            if (lhs_child != child_of_signal.end()) {
+                // parent expression drives a child input
+                conns[lhs_child->second->id].push_back({ c.lhs_sig, c.rhs, &proc.ir });
+                continue;
+            }
+            if (c.rhs_is_signal) {
+                const auto rhs_child = child_of_signal.find(static_cast<uint32_t>(c.rhs_sig));
+                if (rhs_child != child_of_signal.end()) {
+                    // child output drives a parent lvalue
+                    conns[rhs_child->second->id].push_back({ c.rhs_sig, c.lhs, &proc.ir });
+                    continue;
+                }
+            }
+        }
+        logic.push_back(k);
+    }
+
+    // Header: this scope's own ports, in declaration order.
+    os += "module ";
+    os += names.mod[sc.id];
+    bool any_port = false;
+    for (const ir::Signal g : sc.signals) {
+        if (m.signal(g).dir == ir::SignalInfo::Direction::Internal) {
+            continue;
+        }
+        os += any_port ? ", " : "(";
+        any_port         = true;
+        const auto     d = m.signal(g).dir;
+        const uint32_t w = m.pool.layout(m.signal(g).type).width;
+        os += d == ir::SignalInfo::Direction::Input    ? "input "
+              : d == ir::SignalInfo::Direction::Output ? "output "
+                                                       : "inout ";
+        // 2005 has no `logic`, and a port assigned procedurally must be declared
+        // `reg` -- a bare `output` defaults to a wire and cannot be driven from an
+        // always block.
+        if (cfg.target == Target::V2005) {
+            if (d != ir::SignalInfo::Direction::Input && written[static_cast<uint32_t>(g)]) {
+                os += "reg ";
+            }
+        } else {
+            os += "logic ";
+        }
+        if (w > 1) {
+            os += '[';
+            put_uint(os, w - 1);
+            os += ":0] ";
+        }
+        os += names.sig[static_cast<uint32_t>(g)];
+    }
+    os += any_port ? ");\n" : ";\n";
+
+    for (const ir::Signal g : sc.signals) {
+        if (m.signal(g).dir != ir::SignalInfo::Direction::Internal) {
+            continue;
+        }
+        const uint32_t w = m.pool.layout(m.signal(g).type).width;
+        os += cfg.target == Target::V2005 ? "  reg " : "  logic ";
+        if (w > 1) {
+            os += '[';
+            put_uint(os, w - 1);
+            os += ":0] ";
+        }
+        os += names.sig[static_cast<uint32_t>(g)];
+        os += ";\n";
+    }
+
+    // Child instantiations, with the port map put back together.
+    for (const ir::InstanceScope& ch : sc.children) {
+        os += "  ";
+        os += names.mod[ch.id];
+        os += ' ';
+        os += ident(ch.name);
+        os += " (";
+        bool       first = true;
+        const auto it    = conns.find(ch.id);
+        if (it != conns.end()) {
+            for (const PortConn& pc : it->second) {
+                if (!first) {
+                    os += ", ";
+                }
+                first = false;
+                os += '.';
+                os += names.sig[static_cast<uint32_t>(pc.port)];
+                os += '(';
+                render.emit(os, *pc.ir, pc.actual, kLowest);
+                os += ')';
+            }
+        }
+        os += ");\n";
+    }
+    // Functions this scope actually calls. The IR has one design-wide table, so a
+    // module gets only the operators its own processes reach -- emitting all of
+    // them everywhere would be correct and unreadable.
+    ankerl::unordered_dense::set<uint32_t> called;
+    for (const size_t k : logic) {
+        const ir::Ir& pir = m.processes()[k].ir;
+        for (uint32_t i = 0; i < pir.inst_count(); ++i) {
+            const auto ix = static_cast<ir::Index>(i);
+            if (pir.tag(ix) == ir::Inst::Tag::Call) {
+                called.insert(static_cast<uint32_t>(pir.extra_data<ir::CallInfo>(pir.payload(ix).extra).func));
+            } else if (pir.tag(ix) == ir::Inst::Tag::TaskCall) {
+                called.insert(static_cast<uint32_t>(pir.extra_data<ir::TaskCallInfo>(pir.payload(ix).extra).func));
+            }
+        }
+    }
+    // A called function may itself call others.
+    for (bool grew = true; grew;) {
+        grew = false;
+        for (const uint32_t f : std::vector<uint32_t>(called.begin(), called.end())) {
+            const ir::Ir& fir = m.function(static_cast<ir::FunctionId>(f)).ir;
+            for (uint32_t i = 0; i < fir.inst_count(); ++i) {
+                const auto ix = static_cast<ir::Index>(i);
+                if (fir.tag(ix) != ir::Inst::Tag::Call) {
+                    continue;
+                }
+                grew = called.insert(static_cast<uint32_t>(fir.extra_data<ir::CallInfo>(fir.payload(ix).extra).func))
+                         .second ||
+                       grew;
+            }
+        }
+    }
+    for (size_t f = 0; f < m.function_count(); ++f) {
+        if (!called.contains(static_cast<uint32_t>(f))) {
+            continue;
+        }
+        if (const std::optional<std::string> text = emit_fn(m, render, static_cast<ir::FunctionId>(f), fn_name_of(f))) {
+            os += *text;
+        }
+    }
+
+    for (const size_t k : logic) {
+        emit_process(os, m, result, k, names.sig, cfg, render, pool);
+    }
+    os += "endmodule\n\n";
+}
+
+// Children first, then the parent.
+void emit_scope_tree(std::string&                    os,
+                     const ir::Module&               m,
+                     const Result*                   result,
+                     const ir::InstanceScope&        sc,
+                     const ScopeNames&               names,
+                     const std::vector<std::string>& fn_names,
+                     const std::vector<bool>&        written,
+                     SynthConfig                     cfg,
+                     Renderer&                       render,
+                     std::vector<Atom>&              pool) {
+    for (const ir::InstanceScope& ch : sc.children) {
+        emit_scope_tree(os, m, result, ch, names, fn_names, written, cfg, render, pool);
+    }
+    emit_module_body(os, m, result, sc, names, fn_names, written, cfg, render, pool);
+}
+
+// Emit one process: its sensitivity list and body.
+//
+// Shared by the flat and hierarchical writers, and by both renderers -- the
+// difference is only which statement source is walked, the region tree or the
+// guarded lists.
+void emit_process(std::string&                    os,
+                  const ir::Module&               module,
+                  const Result*                   result,
+                  size_t                          k,
+                  const std::vector<std::string>& sig_names,
+                  SynthConfig                     cfg,
+                  Renderer&                       render,
+                  std::vector<Atom>&              pool) {
+    const ProcessResult* pr   = result != nullptr ? &result->processes[k] : nullptr;
+    const ir::Process&   proc = module.processes()[k];
+    if (pr != nullptr && !pr->synthesizable) {
+        os += "  // process ";
+        put_uint(os, k);
+        os += ": not synthesizable\n";
+        return;
+    }
+    if (pr != nullptr && pr->signals.empty()) {
+        return;
+    }
+
+    // The sensitivity list is the process's own; materializing does not
+    // change WHEN a block runs, only what it says while running.
+    os += "  always @(";
+    bool sep = false;
+    for (const ir::WaitEvent& w : proc.wait_events) {
+        if (sep) {
+            os += " or ";
+        }
+        switch (w.edge) {
+            case ir::Edge::Positive:
+                os += "posedge ";
+                break;
+            case ir::Edge::Negative:
+                os += "negedge ";
+                break;
+            case ir::Edge::Any:
+                break;
+        }
+        os += sig_names[static_cast<uint32_t>(w.signal)];
+        sep = true;
+    }
+    if (!sep) {
+        os += '*';
+    }
+    os += ") begin\n";
+
+    // No Result: print the region tree and stop. Nothing is inferred, no arm is
+    // filled in, and the output means exactly what the input meant.
+    if (pr == nullptr) {
+        const size_t mark = os.size();
+        render.clear();
+        if (!emit_stmts(os, render, proc.ir, proc.ir.root(), 2) || !render.ok()) {
+            os.resize(mark);
+            os += "    // process ";
+            put_uint(os, k);
+            os += ": not renderable (opcode ";
+            put_uint(os, static_cast<uint32_t>(render.blocker()));
+            os += ")\n";
+        }
+        os += "  end\n";
+        return;
+    }
+
+    for (const SignalStores& e : pr->signals) {
+        const std::string_view sig  = sig_names[static_cast<uint32_t>(e.signal)];
+        const bool             nb   = !e.stores.empty() && e.stores.front().nonblocking;
+        const bool             edge = e.kind == StorageKind::Flop || e.kind == StorageKind::AsyncLoad;
+
+        // A store inside a loop happens once per iteration, and the guard does
+        // not record that -- a loop adds no atom. Rendering the body once would
+        // silently drop the iteration, which turns hazard3's bit-reversal and
+        // shift loops into plain combinational assignments.
+        bool looped = false;
+        for (const GuardedStore& st : e.stores) {
+            looped = looped || st.in_loop;
+        }
+        if (looped) {
+            // Not skipped: these signals are written by more than one process,
+            // so omitting them here leaves a partially-driven design that reads
+            // WORSE than an approximate one. The body is emitted once, the
+            // caveat is inline, and `GuardedStore::in_loop` lets a consumer
+            // exclude the signal rather than trust it.
+            os += "    // ";
+            os += sig;
+            os += ": loop body below is emitted once; iteration not rendered\n";
+        }
+
+        std::vector<Item> items;
+        items.reserve(e.stores.size());
+        pool.clear();
+        for (const GuardedStore& st : e.stores) {
+            const auto off = static_cast<uint32_t>(pool.size());
+            guard_atoms(result->guards, st.guard, pool);
+            items.push_back(
+              { off, static_cast<uint32_t>(pool.size() - off), st.value, proc.ir.payload(st.store).binary.l });
+        }
+        const size_t mark = os.size();
+        render.clear();
+        emit_tree(os, render, proc.ir, pool, items, 0, 2, { sig, nb ? "<=" : "=", edge });
+        if (!render.ok()) {
+            // Roll the buffer back and say so, rather than leave half a
+            // statement behind. This is the whole failure path now: no optional
+            // threaded through forty call sites, just a length and a truncate.
+            os.resize(mark);
+            os += "    // ";
+            os += sig;
+            os += ": unrenderable operand (opcode ";
+            put_uint(os, static_cast<uint32_t>(render.blocker()));
+            os += ")\n";
+            continue;
+        }
+    }
+    os += "  end\n";
+}
+
 std::string materialize(const ir::Module& module, const Result* result, SynthConfig cfg) {
     std::string os;
     // Grown by doubling, a 3.4 MB result copies several megabytes of text for
@@ -997,7 +1435,7 @@ std::string materialize(const ir::Module& module, const Result* result, SynthCon
     for (size_t i = 0; i < module.function_count(); ++i) {
         raw_fns.push_back(module.function(static_cast<ir::FunctionId>(i)).name);
     }
-    const std::vector<std::string> sig_names = unique_names(raw_sigs);
+    std::vector<std::string>       sig_names = unique_names(raw_sigs);
     const std::vector<std::string> fn_names  = unique_names(raw_fns);
     Renderer                       render(module, sig_names, fn_names, cfg.target);
     std::vector<Atom>              pool; // flat guard paths, reused per signal
@@ -1015,6 +1453,24 @@ std::string materialize(const ir::Module& module, const Result* result, SynthCon
                 written[static_cast<uint32_t>(proc.ir.payload(lv.root).signal)] = true;
             }
         }
+    }
+
+    // Hierarchical: one module per instance, names exactly as written, port maps
+    // rebuilt from the copy processes. Children are emitted before their parents so
+    // the file reads bottom-up; SystemVerilog does not require it, but a reader does.
+    if (cfg.hierarchy == Hierarchy::Instances) {
+        ScopeNames names;
+        names.sig.assign(signals.size(), std::string{});
+        for (const ir::InstanceScope& t : module.tops()) {
+            collect_scope_names(module, t, {}, names);
+        }
+        Renderer          hr(module, names.sig, fn_names, cfg.target);
+        std::vector<Atom> hpool;
+        for (const ir::InstanceScope& t : module.tops()) {
+            emit_scope_tree(os, module, result, t, names, fn_names, written, cfg, hr, hpool);
+        }
+
+        return os;
     }
 
     // No ports. A flattened whole-design render has no meaningful port boundary --
@@ -1050,111 +1506,7 @@ std::string materialize(const ir::Module& module, const Result* result, SynthCon
     }
 
     for (size_t k = 0; k < module.processes().size(); ++k) {
-        const ProcessResult* pr   = result != nullptr ? &result->processes[k] : nullptr;
-        const ir::Process&   proc = module.processes()[k];
-        if (pr != nullptr && !pr->synthesizable) {
-            os += "  // process ";
-            put_uint(os, k);
-            os += ": not synthesizable\n";
-            continue;
-        }
-        if (pr != nullptr && pr->signals.empty()) {
-            continue;
-        }
-
-        // The sensitivity list is the process's own; materializing does not
-        // change WHEN a block runs, only what it says while running.
-        os += "  always @(";
-        bool sep = false;
-        for (const ir::WaitEvent& w : proc.wait_events) {
-            if (sep) {
-                os += " or ";
-            }
-            switch (w.edge) {
-                case ir::Edge::Positive:
-                    os += "posedge ";
-                    break;
-                case ir::Edge::Negative:
-                    os += "negedge ";
-                    break;
-                case ir::Edge::Any:
-                    break;
-            }
-            os += sig_names[static_cast<uint32_t>(w.signal)];
-            sep = true;
-        }
-        if (!sep) {
-            os += '*';
-        }
-        os += ") begin\n";
-
-        // No Result: print the region tree and stop. Nothing is inferred, no arm is
-        // filled in, and the output means exactly what the input meant.
-        if (pr == nullptr) {
-            const size_t mark = os.size();
-            render.clear();
-            if (!emit_stmts(os, render, proc.ir, proc.ir.root(), 2) || !render.ok()) {
-                os.resize(mark);
-                os += "    // process ";
-                put_uint(os, k);
-                os += ": not renderable (opcode ";
-                put_uint(os, static_cast<uint32_t>(render.blocker()));
-                os += ")\n";
-            }
-            os += "  end\n";
-            continue;
-        }
-
-        for (const SignalStores& e : pr->signals) {
-            const std::string_view sig  = sig_names[static_cast<uint32_t>(e.signal)];
-            const bool             nb   = !e.stores.empty() && e.stores.front().nonblocking;
-            const bool             edge = e.kind == StorageKind::Flop || e.kind == StorageKind::AsyncLoad;
-
-            // A store inside a loop happens once per iteration, and the guard does
-            // not record that -- a loop adds no atom. Rendering the body once would
-            // silently drop the iteration, which turns hazard3's bit-reversal and
-            // shift loops into plain combinational assignments.
-            bool looped = false;
-            for (const GuardedStore& st : e.stores) {
-                looped = looped || st.in_loop;
-            }
-            if (looped) {
-                // Not skipped: these signals are written by more than one process,
-                // so omitting them here leaves a partially-driven design that reads
-                // WORSE than an approximate one. The body is emitted once, the
-                // caveat is inline, and `GuardedStore::in_loop` lets a consumer
-                // exclude the signal rather than trust it.
-                os += "    // ";
-                os += sig;
-                os += ": loop body below is emitted once; iteration not rendered\n";
-            }
-
-            std::vector<Item> items;
-            items.reserve(e.stores.size());
-            pool.clear();
-            for (const GuardedStore& st : e.stores) {
-                const auto off = static_cast<uint32_t>(pool.size());
-                guard_atoms(result->guards, st.guard, pool);
-                items.push_back(
-                  { off, static_cast<uint32_t>(pool.size() - off), st.value, proc.ir.payload(st.store).binary.l });
-            }
-            const size_t mark = os.size();
-            render.clear();
-            emit_tree(os, render, proc.ir, pool, items, 0, 2, { sig, nb ? "<=" : "=", edge });
-            if (!render.ok()) {
-                // Roll the buffer back and say so, rather than leave half a
-                // statement behind. This is the whole failure path now: no optional
-                // threaded through forty call sites, just a length and a truncate.
-                os.resize(mark);
-                os += "    // ";
-                os += sig;
-                os += ": unrenderable operand (opcode ";
-                put_uint(os, static_cast<uint32_t>(render.blocker()));
-                os += ")\n";
-                continue;
-            }
-        }
-        os += "  end\n";
+        emit_process(os, module, result, k, sig_names, cfg, render, pool);
     }
     os += "endmodule\n";
 

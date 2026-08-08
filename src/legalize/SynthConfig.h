@@ -25,6 +25,12 @@ enum class Hierarchy : uint8_t {
     // One module, hierarchical paths mangled into identifiers. Fast, correct, and
     // unable to carry a constraint file -- the test oracle rather than the product.
     Flat,
+    // One module per instance, port maps reconstructed from the copy processes the
+    // frontend leaves behind, instance and signal names exactly as written. What a
+    // downstream flow can actually consume, because SDC and physical scripts key on
+    // hierarchical paths. Definitions are per-instance until they are deduplicated
+    // by content, so a module instantiated twice is emitted twice.
+    Instances,
 };
 
 struct SynthConfig {
