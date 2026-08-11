@@ -7135,12 +7135,16 @@ private:
         const ir::SourceLoc l = loc(*atom.expr);
         if (sampled) {
             reject_unsampled_call(*atom.expr);
+            if (atom.match != nullptr) {
+                reject_unsampled_call(*atom.match);
+            }
         }
 
         ir::Index value{};
         {
             const SampledScope scope(*this, sampled);
-            value = lower_predicate(*atom.expr, b);
+            value = atom.match != nullptr ? eval_case_match(atom, b, l)
+                                          : lower_predicate(*atom.expr, b);
         }
         if (atom.negated) {
             // Negation normal form puts `!` on the leaf, so the atom is the
@@ -7155,6 +7159,38 @@ private:
         // which every select below needs -- an x condition would bitwise-merge its
         // arms rather than choose one.
         return b.resize(value, module_.pool.bit_type, l);
+    }
+
+    // `expr === match` for a `case` property item guard (LRM 16.12.17), which is
+    // the one atom shape carrying two expressions instead of one.
+    //
+    // CaseEq and not Eq because 16.12.17 defers to the 12.5 matching rules, which
+    // compare bit for bit and are x/z-sensitive -- the same comparison clotho's
+    // own `case` statement lowering picks for CaseStatementCondition::Normal.
+    //
+    // The widening is clotho's to do: slang binds the case expression and each
+    // item label as separate self-determined expressions and inserts no conversion
+    // between them (CaseAssertionExpr::fromSyntax), so a label narrower than the
+    // selector would otherwise compare short. The rule is common_case_type's --
+    // widest operand, 4-state if either is, signed only if both are.
+    ir::Index eval_case_match(const sva::Atom& atom, ir::Builder& b, ir::SourceLoc l) {
+        const slang::ast::Type& sel   = *atom.expr->type;
+        const slang::ast::Type& label = *atom.match->type;
+        if (sel.isFloating() || label.isFloating()) {
+            // As common_case_type: 12.5 matches with === semantics, which Table
+            // 11-1 leaves undefined for reals.
+            fail("a case property with a real selector or item label is not supported");
+        }
+        if (!sel.isIntegral() || !label.isIntegral()) {
+            fail("a case property over a non-integral selector or item label is not supported");
+        }
+        const ir::Ref ty = make_int_type(std::max(sel.getBitWidth(), label.getBitWidth()),
+                                         sel.isFourState() || label.isFourState(),
+                                         sel.isSigned() && label.isSigned());
+        return b.binary(ir::Inst::Tag::CaseEq,
+                        b.resize(lower_expr(*atom.expr, b), ty, l),
+                        b.resize(lower_expr(*atom.match, b), ty, l),
+                        l);
     }
 
     // One boolean root as a definite 1-bit value, from the flat forest libsva
@@ -7894,6 +7930,10 @@ private:
             }
             SensitivityCollector c(sigmap_, SensitivityMode::ImplicitEvent);
             lowered.atoms[i].expr->visit(c);
+            if (lowered.atoms[i].match != nullptr) {
+                // A `case` property guard reads both sides of its comparison.
+                lowered.atoms[i].match->visit(c);
+            }
             for (const ir::Signal s : c.reads) {
                 sva_shadow_of(s);
             }

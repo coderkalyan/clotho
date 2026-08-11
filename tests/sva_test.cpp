@@ -2261,3 +2261,339 @@ module t;
 endmodule
 )", "disable iff");
 }
+
+// -- The bounded property operators (LRM 16.12) ------------------------------
+//
+// `nexttime`, bounded `always` / `eventually`, `#-#` / `#=#`, property-level
+// `and` / `or`, and the `if` / `case` guarded selection forms. The temporal
+// semantics are libsva's and are checked differentially in tests/sva/diff_*.sv;
+// what these pin is the wiring -- which builder each spelling reaches, which
+// range it passes, and which strength it forces -- plus that every shape still
+// out of reach is refused rather than quietly mislowered.
+
+namespace {
+
+// The single monitor in a lowered module, for the shape checks below.
+const ir::AssertionMonitor& only_monitor(const ir::Module& m) {
+    REQUIRE(m.monitors.size() == 1);
+    return m.monitors[0];
+}
+
+// One assertion body, wrapped in the smallest module that gives it a clock.
+std::string one_assertion(std::string_view decls, std::string_view body) {
+    return std::string("module t;\n  bit clk;\n  ") + std::string(decls) +
+           "\n  ap: assert property (@(posedge clk) " + std::string(body) + ");\nendmodule\n";
+}
+
+} // namespace
+
+TEST_CASE("nexttime[n] shifts its operand by exactly n cycles") {
+    // `nexttime[n] p` is `##n p` at the property layer, so the obligation grows one
+    // filler state per cycle skipped ahead of the operand's own. n = 1 and n = 2
+    // differ by exactly that one state, which is what says the range reached
+    // sva_prop_shift rather than being rounded to a constant.
+    LowerResult r1;
+    const uint32_t one =
+        only_monitor(lower_for_monitor(one_assertion("bit a;", "nexttime [1] a"), r1))
+            .obligation.state_count;
+    REQUIRE(r1.ok);
+
+    LowerResult r2;
+    const uint32_t two =
+        only_monitor(lower_for_monitor(one_assertion("bit a;", "nexttime [2] a"), r2))
+            .obligation.state_count;
+    REQUIRE(r2.ok);
+
+    CHECK(two == one + 1);
+}
+
+TEST_CASE("a bare nexttime is nexttime[1] and not nexttime[0]") {
+    // LRM 16.12.10: the unranged form advances one cycle. Reading the absent range
+    // as zero would make it the operand itself, which is the one wrong answer that
+    // still lowers.
+    LowerResult bare;
+    const ir::AssertionMonitor& b =
+        only_monitor(lower_for_monitor(one_assertion("bit a;", "nexttime a"), bare));
+    REQUIRE(bare.ok);
+
+    LowerResult ranged;
+    const ir::AssertionMonitor& one =
+        only_monitor(lower_for_monitor(one_assertion("bit a;", "nexttime [1] a"), ranged));
+    REQUIRE(ranged.ok);
+
+    CHECK(b.obligation.state_count == one.obligation.state_count);
+    CHECK(b.depth == one.depth);
+    // And not the bare operand, which would be a single state.
+    CHECK(b.obligation.state_count > 1);
+}
+
+TEST_CASE("always [m:n] reads its range conjunctively and eventually disjunctively") {
+    // The same range under the two operators: `always` obliges the operand at EVERY
+    // offset and `eventually` at ONE of them, so only the conjunctive form pays for
+    // the offsets whose copies of the operand are live at once. With a body whose
+    // match length varies the two separate sharply -- libsva's own measurement --
+    // and what that pins here is that `always` reached SVA_SHIFT_EVERY.
+    LowerResult ra;
+    const uint32_t every =
+        only_monitor(
+            lower_for_monitor(one_assertion("bit a, b;", "always [1:3] (a ##[1:2] b)"), ra))
+            .obligation.state_count;
+    REQUIRE(ra.ok);
+
+    LowerResult re;
+    const uint32_t some =
+        only_monitor(
+            lower_for_monitor(one_assertion("bit a, b;", "eventually [1:3] (a ##[1:2] b)"), re))
+            .obligation.state_count;
+    REQUIRE(re.ok);
+
+    CHECK(every > some);
+}
+
+TEST_CASE("the strong property operators force a strong subtree and the weak ones do not") {
+    // LRM 16.12.15: the `s_` forms require the clock to tick enough times, which
+    // libsva encodes as the strength of the prop_seq leaf. That is the whole
+    // observable difference between diff_strongprop.sv and diff_nexttime.sv, and it
+    // is set by the operator's own spelling -- `strong`/`weak` wrap sequences, not
+    // properties, so nothing above it can override it.
+    struct Case {
+        std::string_view op;
+        ir::AssertionStrength want;
+    };
+    for (const Case c : { Case{ "nexttime [1]", ir::AssertionStrength::Weak },
+                          Case{ "s_nexttime [1]", ir::AssertionStrength::Strong },
+                          Case{ "always [1:2]", ir::AssertionStrength::Weak },
+                          Case{ "s_always [1:2]", ir::AssertionStrength::Strong },
+                          Case{ "eventually [1:2]", ir::AssertionStrength::Weak },
+                          Case{ "s_eventually [1:2]", ir::AssertionStrength::Strong } }) {
+        LowerResult r;
+        const ir::Module& m =
+            lower_for_monitor(one_assertion("bit a;", std::string(c.op) + " a"), r);
+        CHECK_MESSAGE(r.ok, c.op);
+        if (r.ok) {
+            CHECK_MESSAGE(only_monitor(m).strength == c.want, c.op);
+        }
+    }
+}
+
+TEST_CASE("a followed-by never becomes a trigger, unlike the implication it mirrors") {
+    // LRM 16.12.9 defines `s #-# p` as `not (s |-> not p)`. Negating the
+    // implication turns its universal over antecedent matches into an existential,
+    // so the antecedent joins the OBLIGATION instead of becoming a trigger. That is
+    // the structural difference from `|->`, whose antecedent does.
+    LowerResult fb;
+    const ir::AssertionMonitor& followed =
+        only_monitor(lower_for_monitor(one_assertion("bit a, b;", "a #-# b"), fb));
+    REQUIRE(fb.ok);
+    CHECK_FALSE(followed.has_trigger);
+
+    LowerResult impl;
+    const ir::AssertionMonitor& implies =
+        only_monitor(lower_for_monitor(one_assertion("bit a, b;", "a |-> b"), impl));
+    REQUIRE(impl.ok);
+    CHECK(implies.has_trigger);
+}
+
+TEST_CASE("the non-overlapping followed-by starts its consequent a cycle later") {
+    // `#=#` against `#-#`: one more cycle between the antecedent's match and the
+    // consequent, which is one more state in the obligation.
+    LowerResult ro;
+    const uint32_t overlap =
+        only_monitor(lower_for_monitor(one_assertion("bit a, b;", "a #-# b"), ro))
+            .obligation.state_count;
+    REQUIRE(ro.ok);
+
+    LowerResult rn;
+    const uint32_t nonoverlap =
+        only_monitor(lower_for_monitor(one_assertion("bit a, b;", "a #=# b"), rn))
+            .obligation.state_count;
+    REQUIRE(rn.ok);
+
+    CHECK(nonoverlap == overlap + 1);
+}
+
+TEST_CASE("property-level and/or is reached only when an operand is a property") {
+    // LRM 16.9 and 16.12 spell `and`/`or` with the same token and slang builds one
+    // node kind for both, so the operands decide the layer, not the operator. Two
+    // sequences must still take the sequence-layer builder; a property operand on
+    // either side switches to sva_prop_junction.
+    LowerResult seq;
+    const ir::Module& sm = lower_for_monitor(
+        one_assertion("bit a, b, c, d;", "(a ##1 b) and (c ##1 d)"), seq);
+    REQUIRE(seq.ok);
+    CHECK_FALSE(only_monitor(sm).has_trigger);
+
+    LowerResult prop;
+    const ir::Module& pm =
+        lower_for_monitor(one_assertion("bit a, b;", "(nexttime [1] a) and b"), prop);
+    REQUIRE(prop.ok);
+    CHECK_FALSE(only_monitor(pm).has_trigger);
+
+    LowerResult disj;
+    lower_for_monitor(one_assertion("bit a, b;", "(nexttime [1] a) or b"), disj);
+    CHECK(disj.ok);
+}
+
+TEST_CASE("an if property desugars to a disjunction of followed-bys, not of implications") {
+    // The distinction that makes the desugaring correct: a followed-by whose
+    // antecedent never matches FAILS, so the untaken branch contributes nothing and
+    // the taken one alone decides the verdict. With implications there, the untaken
+    // branch would hold vacuously and the disjunction would always pass -- a
+    // monitor that can never report. diff_propif.sv pins that behaviourally; this
+    // pins that the shape carries no trigger, which a disjunction of implications
+    // could not manage either.
+    LowerResult r;
+    const ir::Module& m =
+        lower_for_monitor(one_assertion("bit c, a, b;", "if (c) a else b"), r);
+    REQUIRE(r.ok);
+    CHECK_FALSE(only_monitor(m).has_trigger);
+}
+
+TEST_CASE("an if property with no else holds when the condition is false") {
+    // LRM 16.12.16 makes the missing `else` the TRUE property rather than an
+    // absence, so the form lowers with one arm written and must not become a
+    // monitor that fails whenever the condition is low. diff_propif.sv's `ifn`
+    // holds the behavioural half.
+    LowerResult r;
+    lower_for_monitor(one_assertion("bit c, a;", "if (c) a"), r);
+    CHECK(r.ok);
+}
+
+TEST_CASE("a case property compares against each item label and honours the default") {
+    // LRM 16.12.17. The comparison has no Expression of its own in the AST -- slang
+    // binds the case expression and every label separately -- so each guard is an
+    // atom carrying BOTH halves, which is the one atom shape with two expressions.
+    LowerResult plain;
+    lower_for_monitor(
+        one_assertion("bit x, y; bit [1:0] sel;", "case (sel) 2'd0: x; 2'd1: y; endcase"),
+        plain);
+    CHECK(plain.ok);
+
+    LowerResult defaulted;
+    lower_for_monitor(one_assertion("bit x, y; bit [1:0] sel;",
+                                    "case (sel) 2'd0: x; 2'd1: y; default: 1'b0; endcase"),
+                      defaulted);
+    CHECK(defaulted.ok);
+
+    // Every guard is an atom over (sel, label) in both polarities, so a two-item
+    // case has strictly more atoms than its two arms.
+    if (plain.ok) {
+        CHECK(only_monitor(*plain.module).cubes.size() > 2);
+    }
+}
+
+TEST_CASE("a case property item with several labels matches any of them") {
+    // `2'd0, 2'd1: x;` is one arm guarded by a disjunction of two comparisons, and
+    // its miss is the conjunction of the two negated ones.
+    LowerResult r;
+    lower_for_monitor(one_assertion("bit x, y; bit [1:0] sel;",
+                                    "case (sel) 2'd0, 2'd1: x; default: y; endcase"),
+                      r);
+    CHECK(r.ok);
+}
+
+// -- The refusals the property layer keeps ----------------------------------
+
+TEST_CASE("an unbounded always is refused, naming the operator") {
+    // Phase 3 work: the obligation has no bounded length, so the number of attempts
+    // pending at once is unbounded and no fixed pool tracks them. libsva refuses it
+    // too, but only from sva_lower and with a message about the obligation; clotho
+    // names the operator the user wrote.
+    refuses(one_assertion("bit a;", "always a"), "an unbounded `always`");
+}
+
+TEST_CASE("an unbounded s_eventually is refused, naming the operator") {
+    refuses(one_assertion("bit a;", "s_eventually a"), "an unbounded `eventually`");
+}
+
+TEST_CASE("a property range with an open upper bound is refused") {
+    // `always [2:$]` is the unbounded form written as a range, so it lands in the
+    // same refusal rather than reaching sva_prop_shift with SVA_UNBOUNDED.
+    refuses(one_assertion("bit a;", "always [2:$] a"), "unbounded");
+}
+
+TEST_CASE("the not property operator is refused") {
+    // Phase 4: a complement needs the operand determinised and it swaps the
+    // weak/strong disposition.
+    refuses(one_assertion("bit a;", "not a"), "`not` property operator");
+}
+
+TEST_CASE("the implies and iff property operators are refused") {
+    // Both reduce to `not` plus `or`, so they land with `not` in phase 4. `implies`
+    // here is the property operator of LRM 16.12.6 and not `|->`.
+    refuses(one_assertion("bit a, b;", "a implies b"), "`implies` and `iff`");
+    refuses(one_assertion("bit a, b;", "a iff b"), "`implies` and `iff`");
+}
+
+TEST_CASE("the until family is refused as an unbounded obligation") {
+    for (const std::string_view op : { "until", "s_until", "until_with", "s_until_with" }) {
+        const LowerResult r =
+            lower_text(one_assertion("bit a, b;", std::string("a ") + std::string(op) + " b"));
+        CHECK_FALSE_MESSAGE(r.ok, op);
+        CHECK_MESSAGE(r.diagnostic_text().find("`until`") != std::string::npos,
+                      r.diagnostic_text());
+    }
+}
+
+TEST_CASE("a junction of operands with different strength is refused") {
+    // libsva reports SVA_ERROR_MIXED_STRENGTH: the pair is pending until both sides
+    // resolve, and one weak with one strong side has no single end-of-trace
+    // disposition. clotho checks first so the message names the operator.
+    refuses(one_assertion("bit a, b, c;", "strong(a ##1 b) and weak(c ##1 a)"),
+            "different strength");
+}
+
+TEST_CASE("a junction over an implication is refused, naming the operand") {
+    // A monitor has one trigger and a junction keeps neither side's, so an operand
+    // that raises an obligation of its own has nowhere to put its antecedent.
+    refuses(one_assertion("bit a, b, c;", "(a |=> b) and (nexttime [1] c)"),
+            "an operand of a property `and`/`or` is an implication");
+}
+
+TEST_CASE("a followed-by whose consequent is an implication is refused") {
+    // The antecedent is fused onto the consequent's automaton, so the consequent's
+    // states do not survive as a block and a second trigger has nowhere to go.
+    refuses(one_assertion("bit a, b, c;", "a #-# (b |=> c)"), "consequent of a followed-by");
+}
+
+TEST_CASE("a ranged eventually over an implication is refused but a ranged always is not") {
+    // A shift over an implication moves onto the ANTECEDENT, and a DISJUNCTIVE range
+    // does not survive that move: each disjunct would hold vacuously on its own and
+    // one trigger cannot say so. The conjunctive `always` form does survive it, so
+    // that one must still lower -- which is what keeps this from being a blanket
+    // refusal of shifts over implications.
+    refuses(one_assertion("bit a, b;", "eventually [1:2] (a |=> b)"), "over an implication");
+
+    LowerResult ok;
+    lower_for_monitor(one_assertion("bit a, b;", "always [1:2] (a |=> b)"), ok);
+    CHECK(ok.ok);
+
+    // A single-offset shift is not a range at all, so it survives too.
+    LowerResult single;
+    lower_for_monitor(one_assertion("bit a, b;", "nexttime [2] (a |=> b)"), single);
+    CHECK(single.ok);
+}
+
+TEST_CASE("a branch of an if or case property that is an implication is refused") {
+    refuses(one_assertion("bit c, a, b;", "if (c) (a |=> b)"), "branch of an `if` or `case`");
+    refuses(one_assertion("bit a, b; bit [1:0] sel;",
+                          "case (sel) 2'd0: (a |=> b); default: a; endcase"),
+            "branch of an `if` or `case`");
+}
+
+TEST_CASE("the abort operators are refused until the monitor carries an abort table") {
+    // Phase 2. libsva builds and lowers all four, but the abort table it produces
+    // (sva_monitor_abort_*) has nowhere to go yet: ir::AssertionMonitor carries no
+    // abort list and the emitted step has no arm for one, so building the node here
+    // would DROP the operator -- turning a discharge or a failure into silence,
+    // which the project forbids. See docs/design/sva-property-layer.md phase 2 for
+    // the second blocker, which is libsva's own.
+    for (const std::string_view op :
+         { "accept_on", "reject_on", "sync_accept_on", "sync_reject_on" }) {
+        const LowerResult r = lower_text(
+            one_assertion("bit a, b, c;", std::string(op) + " (c) (a |=> b)"));
+        CHECK_FALSE_MESSAGE(r.ok, op);
+        CHECK_MESSAGE(r.diagnostic_text().find("`accept_on` / `reject_on`") != std::string::npos,
+                      r.diagnostic_text());
+    }
+}

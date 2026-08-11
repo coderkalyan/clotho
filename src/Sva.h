@@ -38,7 +38,14 @@ bool available();
 // concurrent-assertions.md 5.3.
 struct Atom {
     const slang::ast::Expression* expr = nullptr;
-    // True when `expr` should be evaluated negated. NNF means the caller builds
+    // Non-null only for a `case` property item guard (LRM 16.12.16), where the
+    // atom is `expr === match` rather than `expr` read as a condition. slang
+    // binds the case expression and each item label as separate expressions and
+    // never builds the comparison between them, so there is no single Expression
+    // to point at and the pair has to travel. `===` and not `==` because 16.12.16
+    // defers to the 12.5 case rules, which compare x and z bit for bit.
+    const slang::ast::Expression* match = nullptr;
+    // True when the atom should be evaluated negated. NNF means the caller builds
     // the negation itself; this records which so the caller can emit it.
     bool negated = false;
 };
