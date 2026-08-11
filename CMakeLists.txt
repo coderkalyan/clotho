@@ -29,12 +29,14 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # The full matrix, since the three build types mean different things per target:
 #
 #   toplevel          frontend                  clotho_runtime
-#   Debug             Debug      (-O0 -g)       RelWithDebInfo (-O2 -g -DNDEBUG)
+#   Debug             Debug      (-O0 -g)       -O2 -g  (optimized, asserts ON)
 #   RelWithDebInfo    RelWithDebInfo            RelWithDebInfo
 #   Release           Release, stripped         Release, stripped
 #
 # Debug is for iterating on the compiler, so only the frontend is unoptimized; the
-# runtime is not part of that loop and -O0 there would distort every profile.
+# runtime is not part of that loop and -O0 there would distort every profile. What
+# Debug does guarantee everywhere is that NDEBUG is unset, so every assert() is live
+# in both columns.
 #
 # Neither column covers the JIT-compiled DESIGN: its optimization level is a
 # run-time decision (`-O` on the command line), and LLVM is prebuilt and linked, so
@@ -237,14 +239,17 @@ endif()
 # timing wheel reads as pure call overhead -- every simulation slows and every
 # `perf` profile lies about where the time went.
 #
-# So Debug gets -O2 -g -DNDEBUG here: optimized, still walkable in a debugger, and
-# with NDEBUG matching what RelWithDebInfo means. Release and RelWithDebInfo already
-# supply the right flags for this target, so the genex leaves them alone.
+# So Debug gets -O2 -g here: optimized like RelWithDebInfo and still walkable in a
+# debugger. It deliberately stops short of RelWithDebInfo's NDEBUG -- the reason to
+# optimize this target is that -O0 distorts profiles and slows simulation, and
+# neither argument says anything about disabling checks. Debug is precisely where
+# you want Wheel.cpp's `deadline must be in the future` to fire, since scheduling an
+# event into the past is the bug it exists to catch. Release and RelWithDebInfo
+# already supply the right flags, so the genex leaves them alone.
 target_compile_options(clotho_runtime PRIVATE
   $<$<AND:$<CONFIG:Debug>,$<NOT:$<BOOL:${MSVC}>>>:-O2>
   $<$<AND:$<CONFIG:Debug>,$<BOOL:${MSVC}>>:/O2>
 )
-target_compile_definitions(clotho_runtime PRIVATE $<$<CONFIG:Debug>:NDEBUG>)
 
 # IR core: the frozen process IR, its builder, intern pool, printer and
 # whole-design analyses. Free of LLVM, slang AND the runtime at source level —
