@@ -26,10 +26,19 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # frontend frames that have not been inlined away. Both are real; `-DCMAKE_BUILD_TYPE=Debug`
 # is the right call when working on the compiler itself rather than on latency.
 #
-# Two things this is NOT about, because they are decided elsewhere and are easy to
-# conflate with it: clotho_runtime is pinned to -O3 in every configuration (see the
-# comment on that target), and the optimization level of the JIT-compiled DESIGN is
-# the `-O` command-line flag, independent of how clotho itself was built.
+# The full matrix, since the three build types mean different things per target:
+#
+#   toplevel          frontend                  clotho_runtime
+#   Debug             Debug      (-O0 -g)       RelWithDebInfo (-O2 -g -DNDEBUG)
+#   RelWithDebInfo    RelWithDebInfo            RelWithDebInfo
+#   Release           Release, stripped         Release, stripped
+#
+# Debug is for iterating on the compiler, so only the frontend is unoptimized; the
+# runtime is not part of that loop and -O0 there would distort every profile.
+#
+# Neither column covers the JIT-compiled DESIGN: its optimization level is a
+# run-time decision (`-O` on the command line), and LLVM is prebuilt and linked, so
+# it sits at whatever level it was packaged with regardless of any of this.
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   message(STATUS "No CMAKE_BUILD_TYPE set; defaulting to RelWithDebInfo")
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
@@ -40,6 +49,17 @@ endif()
 # Note clotho cannot be built by MSVC proper regardless — the runtime's wide
 # arithmetic uses `unsigned __int128`, which only GCC and Clang provide — so the
 # cl-style branch exists for clang-cl.
+# Release ships stripped: CMake's Release already omits -g, and this drops the
+# symbol table too. Profiling or debugging clotho itself is what RelWithDebInfo is
+# for -- and it is the default, so reaching for it costs nothing.
+#
+# This is the host binary only. The JIT'd design's optimization level is a run-time
+# decision (`-O` on the command line), and LLVM is a prebuilt library at whatever
+# level it was packaged with; neither is affected by any of this.
+if(NOT MSVC)
+  add_link_options($<$<CONFIG:Release>:-s>)
+endif()
+
 add_library(clotho_warnings INTERFACE)
 if(MSVC)
   target_compile_options(clotho_warnings INTERFACE
@@ -209,18 +229,22 @@ if(WIN32)
     endif()
   endif()
 endif()
-# Always optimize the runtime, even in a Debug build. It is stable native code
-# the JIT'd design calls into on every event; at -O0 its trivial leaf functions
-# (unwrap, WheelImpl accessors) stop inlining and the timing wheel reads as pure
-# call overhead — distorting `perf` profiles and slowing every simulation. Debug
-# is for iterating on the compiler, not the runtime, so pin this target to -O2
-# there (asserts stay live — NDEBUG is not forced, so the runtime keeps its
-# safety checks). Release / RelWithDebInfo already optimize; the genex leaves
-# them untouched.
+# A Debug build builds the runtime as RelWithDebInfo, not as Debug.
+#
+# Debug exists for fast iteration on the COMPILER. The runtime is not part of that
+# loop: it is stable native code the JIT'd design calls into on every event, and at
+# -O0 its trivial leaf functions (unwrap, WheelImpl accessors) stop inlining, so the
+# timing wheel reads as pure call overhead -- every simulation slows and every
+# `perf` profile lies about where the time went.
+#
+# So Debug gets -O2 -g -DNDEBUG here: optimized, still walkable in a debugger, and
+# with NDEBUG matching what RelWithDebInfo means. Release and RelWithDebInfo already
+# supply the right flags for this target, so the genex leaves them alone.
 target_compile_options(clotho_runtime PRIVATE
-  $<$<AND:$<CONFIG:Debug>,$<NOT:$<BOOL:${MSVC}>>>:-O3>
+  $<$<AND:$<CONFIG:Debug>,$<NOT:$<BOOL:${MSVC}>>>:-O2>
   $<$<AND:$<CONFIG:Debug>,$<BOOL:${MSVC}>>:/O2>
 )
+target_compile_definitions(clotho_runtime PRIVATE $<$<CONFIG:Debug>:NDEBUG>)
 
 # IR core: the frozen process IR, its builder, intern pool, printer and
 # whole-design analyses. Free of LLVM, slang AND the runtime at source level —
