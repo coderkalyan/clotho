@@ -6,9 +6,45 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# CMake's own default is an EMPTY build type: no -O, no -g, no NDEBUG. That is
+# slower than Debug and less debuggable than RelWithDebInfo, and it is silently not
+# what anyone meant, so pick one and say which.
+#
+# Debug, because a bare `cmake` is someone about to work on clotho, and Debug is the
+# build for that: every assert() live, frames that have not been inlined away, and
+# unfinished work (the `synth` command) reachable without extra flags.
+#
+# The full matrix, since the three types mean different things per target:
+#
+#   toplevel          frontend                  clotho_runtime
+#   Debug             Debug      (-O0 -g)       -O2 -g  (optimized, asserts ON)
+#   RelWithDebInfo    RelWithDebInfo            RelWithDebInfo
+#   Release           Release, stripped         Release, stripped
+#
+# Debug is for iterating on the compiler, so only the frontend is unoptimized; the
+# runtime is not part of that loop and -O0 there would distort every profile. What
+# Debug guarantees everywhere is that NDEBUG is unset, so every assert() is live in
+# both columns.
+#
+# The cost of that default, measured on hazard3 (21 files, 1418 processes):
+#
+#   full test suite         17.7 s -> 19.7 s   (1.1x)
+#   clotho lint             0.146 s -> 0.521 s (3.6x)
+#   clotho build --emit=ir  0.107 s -> 0.425 s (4.0x)
+#
+# The suite barely moves because it is LLVM-bound, and LLVM is a prebuilt shared
+# library at its own optimization level -- how clotho is compiled does not touch it.
+# The frontend alone is 3.6-4x slower, which is the number to remember when working
+# on `lint` latency or the language server: pass -DCMAKE_BUILD_TYPE=RelWithDebInfo
+# for that, and for any performance measurement. CI and tests/perf/perf.py already
+# pin Release explicitly, so neither is affected by this default.
+#
+# Not covered by any of the above, and easy to conflate with it: the JIT-compiled
+# DESIGN's optimization level is a run-time decision (`-O` on the command line), and
+# LLVM is prebuilt and linked at whatever level it was packaged with.
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-  message(STATUS "No CMAKE_BUILD_TYPE set; defaulting to RelWithDebInfo")
-  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+  message(STATUS "No CMAKE_BUILD_TYPE set; defaulting to Debug")
+  set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 endif()
 
 # Warnings apply to clotho targets only, not fetched dependencies. The flags are
@@ -16,6 +52,17 @@ endif()
 # Note clotho cannot be built by MSVC proper regardless — the runtime's wide
 # arithmetic uses `unsigned __int128`, which only GCC and Clang provide — so the
 # cl-style branch exists for clang-cl.
+# Release ships stripped: CMake's Release already omits -g, and this drops the
+# symbol table too. Profiling or debugging clotho itself is what RelWithDebInfo is
+# for -- and it is the default, so reaching for it costs nothing.
+#
+# This is the host binary only. The JIT'd design's optimization level is a run-time
+# decision (`-O` on the command line), and LLVM is a prebuilt library at whatever
+# level it was packaged with; neither is affected by any of this.
+if(NOT MSVC)
+  add_link_options($<$<CONFIG:Release>:-s>)
+endif()
+
 add_library(clotho_warnings INTERFACE)
 if(MSVC)
   target_compile_options(clotho_warnings INTERFACE
@@ -37,6 +84,20 @@ else()
 endif()
 
 option(CLOTHO_SANITIZE "Build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
+
+# The `synth` command is not finished, so only a Debug build carries it. Debug is
+# the default, so it is reachable by default -- and neither shipped configuration
+# offers a command that is not ready.
+#
+# Only the CLI wiring is conditional. clotho_legalize is always built and always
+# linked into clotho_test, so the analysis and the writer are covered by the full
+# suite in every configuration -- what the others skip is argument plumbing.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set(CLOTHO_SYNTH_DEFAULT ON)
+else()
+  set(CLOTHO_SYNTH_DEFAULT OFF)
+endif()
+option(CLOTHO_SYNTH "Expose the unfinished `synth` command in the CLI" ${CLOTHO_SYNTH_DEFAULT})
 if(CLOTHO_SANITIZE)
   if(MSVC)
     message(FATAL_ERROR "CLOTHO_SANITIZE requires a GCC/Clang driver")
@@ -228,16 +289,23 @@ if(WIN32)
     endif()
   endif()
 endif()
-# Always optimize the runtime, even in a Debug build. It is stable native code
-# the JIT'd design calls into on every event; at -O0 its trivial leaf functions
-# (unwrap, WheelImpl accessors) stop inlining and the timing wheel reads as pure
-# call overhead — distorting `perf` profiles and slowing every simulation. Debug
-# is for iterating on the compiler, not the runtime, so pin this target to -O2
-# there (asserts stay live — NDEBUG is not forced, so the runtime keeps its
-# safety checks). Release / RelWithDebInfo already optimize; the genex leaves
-# them untouched.
+# A Debug build builds the runtime as RelWithDebInfo, not as Debug.
+#
+# Debug exists for fast iteration on the COMPILER. The runtime is not part of that
+# loop: it is stable native code the JIT'd design calls into on every event, and at
+# -O0 its trivial leaf functions (unwrap, WheelImpl accessors) stop inlining, so the
+# timing wheel reads as pure call overhead -- every simulation slows and every
+# `perf` profile lies about where the time went.
+#
+# So Debug gets -O2 -g here: optimized like RelWithDebInfo and still walkable in a
+# debugger. It deliberately stops short of RelWithDebInfo's NDEBUG -- the reason to
+# optimize this target is that -O0 distorts profiles and slows simulation, and
+# neither argument says anything about disabling checks. Debug is precisely where
+# you want Wheel.cpp's `deadline must be in the future` to fire, since scheduling an
+# event into the past is the bug it exists to catch. Release and RelWithDebInfo
+# already supply the right flags, so the genex leaves them alone.
 target_compile_options(clotho_runtime PRIVATE
-  $<$<AND:$<CONFIG:Debug>,$<NOT:$<BOOL:${MSVC}>>>:-O3>
+  $<$<AND:$<CONFIG:Debug>,$<NOT:$<BOOL:${MSVC}>>>:-O2>
   $<$<AND:$<CONFIG:Debug>,$<BOOL:${MSVC}>>:/O2>
 )
 
@@ -253,6 +321,7 @@ add_library(clotho_ir_core STATIC
   src/ir/Builder.cpp
   src/ir/Printer.cpp
   src/ir/Analysis.cpp
+  src/ir/Eval.cpp
 )
 target_include_directories(clotho_ir_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(clotho_ir_core PUBLIC unordered_dense::unordered_dense)
@@ -261,11 +330,37 @@ target_link_libraries(clotho_ir_core PRIVATE clotho_warnings)
 # Simulation code generator: process IR -> LLVM IR -> ORC JIT. The only part of
 # the IR layer that needs LLVM, so the only part that links it — and the only
 # part that needs the runtime's C ABI layouts (rt_string, rt_queue, ...).
+# Process legalization: what hardware each always-block implies. A peer of
+# clotho_ir, not a layer inside clotho_ir_core -- the simulator never consumes it,
+# so `clotho run` should not link it. Same rule as ir_core: no LLVM, no slang.
+add_library(clotho_legalize STATIC
+  src/legalize/Legalize.cpp
+  src/legalize/Materialize.cpp
+)
+target_include_directories(clotho_legalize PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(clotho_legalize PUBLIC clotho_ir_core)
+target_link_libraries(clotho_legalize PRIVATE clotho_warnings)
+
 add_library(clotho_ir STATIC
   src/ir/LlvmBackend.cpp
   src/ir/Jit.cpp
 )
 target_include_directories(clotho_ir PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${LLVM_INCLUDE_DIRS})
+# A machine with ROCm installed has a second LLVM under /opt/rocm, and
+# find_package picks it over the system one. That copy is built without RTTI, so
+# LlvmBackend.cpp emits references to `typeinfo for llvm::CallbackVH` that nothing
+# provides -- and the only symptom is an inscrutable link failure two minutes into
+# the build, long after configure said everything was fine.
+#
+# Fail here instead, naming the fix. Clotho needs RTTI: LlvmBackend derives from
+# LLVM types whose typeinfo has to come from the LLVM libraries.
+if(DEFINED LLVM_ENABLE_RTTI AND NOT LLVM_ENABLE_RTTI)
+  message(FATAL_ERROR
+    "the LLVM found at ${LLVM_DIR} was built without RTTI, which cannot link clotho_ir.\n"
+    "  Point at an RTTI-enabled LLVM, e.g.:\n"
+    "    cmake -S . -B build -DLLVM_DIR=/usr/lib/cmake/llvm")
+endif()
+
 target_compile_definitions(clotho_ir PUBLIC ${LLVM_DEFINITIONS})
 target_link_libraries(clotho_ir PUBLIC clotho_ir_core clotho_runtime ${LLVM_LIBS})
 target_link_libraries(clotho_ir PRIVATE clotho_warnings)
@@ -311,7 +406,14 @@ if(WIN32)
 endif()
 # `clotho` links clotho_ir_core, NOT the code generator, so the CLI names
 # clotho_ir itself — it is the consumer that actually emits and JITs.
-target_link_libraries(clotho_cli PRIVATE clotho clotho_ir clotho_warnings)
+if(CLOTHO_SYNTH)
+  target_link_libraries(clotho_cli PRIVATE clotho clotho_ir clotho_legalize clotho_warnings)
+  target_compile_definitions(clotho_cli PRIVATE CLOTHO_SYNTH)
+else()
+  # Without the command there is nothing to link, which restores exactly the
+  # property S0 established: the shipped simulator contains no legalization.
+  target_link_libraries(clotho_cli PRIVATE clotho clotho_ir clotho_warnings)
+endif()
 
 # `clotho --version`. The git hash is resolved at configure time; a source tree
 # without git (a release tarball) reports "unknown" rather than failing.
@@ -357,6 +459,9 @@ add_executable(clotho_test
   tests/analysis_test.cpp
   tests/recovery_test.cpp
   tests/case_pragma_test.cpp
+  tests/eval_test.cpp
+  tests/legalize_test.cpp
+  tests/perf_legalize_test.cpp
   tests/gate_test.cpp
   tests/net_resolution_test.cpp
   tests/llvm_backend_test.cpp
@@ -395,7 +500,11 @@ add_executable(clotho_test
   tests/force_release_test.cpp
   tests/system_test.cpp
 )
-target_link_libraries(clotho_test PRIVATE clotho clotho_ir doctest::doctest clotho_warnings)
+target_link_libraries(clotho_test PRIVATE clotho clotho_ir clotho_legalize doctest::doctest clotho_warnings)
+# The reset corpus is 28 readable .sv files rather than embedded strings: they are
+# a reference to be read and extended, and they are the same files run against
+# yosys.
+target_compile_definitions(clotho_test PRIVATE CLOTHO_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests")
 
 # Export the test executable's dynamic symbols so DPI-C imports defined in the
 # test TUs (extern "C") resolve through the JIT's process-symbol generator

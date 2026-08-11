@@ -17,6 +17,10 @@
 #include "ir/Jit.h"
 #include "ir/LlvmBackend.h"
 #include "ir/Printer.h"
+#ifdef CLOTHO_SYNTH
+#include "legalize/Legalize.h"
+#include "legalize/Materialize.h"
+#endif
 
 // Thin driver over libclotho / libclotho_ir: take SystemVerilog sources, run
 // them through the lowering pipeline, then write the compiled artifact
@@ -56,7 +60,7 @@ using clotho::ir::SimulationConfig;
 using clotho::ir::Stat;
 using clotho::ir::SystemAccess;
 
-enum class Command : uint8_t { Build, Run, Lint };
+enum class Command : uint8_t { Build, Run, Lint, Synth };
 
 // What `build` writes.
 enum class Emit : uint8_t {
@@ -79,6 +83,12 @@ struct Options {
     std::optional<std::string> allow_system;
     std::vector<std::string>   dpi_libs;
     std::optional<bool>        perf_jitdump;
+    std::optional<std::string> sidecar;
+    std::optional<std::string> target;
+    std::optional<std::string> hierarchy;
+    std::optional<bool>        no_legalize;
+    std::optional<bool>        full_case;
+    std::optional<bool>        parallel_case;
 };
 
 // Wording rule for everything a user reads: say what the option does for the
@@ -92,33 +102,75 @@ struct Options {
 void register_options(slang::CommandLine& cl, Options& o) {
     cl.add("-h,--help", o.help, "Show this help and exit");
     cl.add("--version", o.version, "Show version information and exit");
-    cl.add("--emit", o.emit,
+    cl.add("--emit",
+           o.emit,
            "[build] What to write: llvm (LLVM IR for the design, the default), ir (Clotho's own "
            "intermediate form), llvm-raw (LLVM IR before the coroutine passes; for working on clotho)",
            "<target>");
-    cl.add("-o,--output", o.out, "[build] Write the output to this file instead of stdout", "<file>",
+    cl.add("-o,--output",
+           o.out,
+           "[build] Write the output to this file instead of stdout",
+           "<file>",
            slang::CommandLineFlags::FilePath);
     cl.add("--time", o.time, "Print how long each stage took: reading the source, compiling, simulating");
     cl.add("-O", o.o3, "Compile the design more thoroughly: slower to start up, faster to simulate");
-    cl.add("--stat", o.stats,
+    cl.add("--stat",
+           o.stats,
            "Print a compiler statistic while building, for working on clotho: dedup, dedup-sets, "
            "comb-fuse, finish or parallel (repeatable, comma-separated)",
-           "<name>", slang::CommandLineFlags::CommaList);
-    cl.add("--sanitize", o.sanitizers,
+           "<name>",
+           slang::CommandLineFlags::CommaList);
+    cl.add("--sanitize",
+           o.sanitizers,
            "Check the design for a class of bug while it runs, reporting when one happens: bounds "
            "(an array index outside the array), xprov (where an x value decided something, and what "
            "made it x). Costs simulation time (repeatable, comma-separated)",
-           "<check>", slang::CommandLineFlags::CommaList);
-    cl.add("--allow-system", o.allow_system,
+           "<check>",
+           slang::CommandLineFlags::CommaList);
+    cl.add("--allow-system",
+           o.allow_system,
            "Let the design run shell commands through $system, refused by default: 'const' allows "
            "only commands written literally in the source, 'full' allows any command the design "
            "builds while it runs",
            "<tier>");
-    cl.add("--dpi-lib", o.dpi_libs,
+    cl.add("--dpi-lib",
+           o.dpi_libs,
            "[run] Library holding the C functions this design imports through DPI-C. Give a .o or .a "
            "if C also calls back into the design; a .so is enough for imports alone",
-           "<path>", slang::CommandLineFlags::FilePath);
-    cl.add("--perf-jitdump", o.perf_jitdump,
+           "<path>",
+           slang::CommandLineFlags::FilePath);
+#ifdef CLOTHO_SYNTH
+    cl.add("--sidecar",
+           o.sidecar,
+           "[synth] Also write the JSON sidecar here: what the SystemVerilog cannot carry -- the "
+           "original-to-emitted name map every constraint file depends on, and each signal's inferred "
+           "storage, clock and reset",
+           "<path>",
+           slang::CommandLineFlags::FilePath);
+    cl.add("--target",
+           o.target,
+           "[synth] Which language to write: '2005' for IEEE 1364-2005, 'sv' for IEEE 1800 (default)",
+           "<lang>");
+    cl.add("--hierarchy",
+           o.hierarchy,
+           "[synth] How much of the instance tree to keep: 'instances' writes one module per instance "
+           "with names as written (default), 'flat' writes one module with paths mangled into names",
+           "<mode>");
+    cl.add("--no-legalize",
+           o.no_legalize,
+           "[synth] Translate the design as written instead of writing out the hardware it implies: no "
+           "mux trees rebuilt, no implicit branch filled in");
+    cl.add("--full-case",
+           o.full_case,
+           "[synth] Believe `full_case` and `unique`: a case the design says is complete stops inferring "
+           "a latch. Reported wherever the claim is what removed the latch, since simulation will still "
+           "hold the old value");
+    cl.add("--parallel-case",
+           o.parallel_case,
+           "[synth] Believe `parallel_case` and `unique0`: the arms are treated as mutually exclusive");
+#endif
+    cl.add("--perf-jitdump",
+           o.perf_jitdump,
            "[run] Let `perf` see names for the design's compiled code (writes a jitdump under "
            "$JITDUMPDIR); for profiling clotho");
 }
@@ -130,14 +182,32 @@ constexpr std::string_view kOverview =
   "  build   compile the design and write the generated code, without running it\n"
   "  run     compile the design and simulate it\n"
   "  lint    check the design and report problems, without compiling or running it\n"
+#ifdef CLOTHO_SYNTH
+  "  synth   write the design back out as synthesizable SystemVerilog\n"
+#endif
   "\n"
   "Clotho's own options come first below, then the source-reading options it shares\n"
+#ifdef CLOTHO_SYNTH
+  "with slang, the SystemVerilog front end it is built on. A [build], [run] or\n"
+  "[synth] tag marks an option only that command accepts.\n"
+#else
   "with slang, the SystemVerilog front end it is built on. A [build] or [run] tag\n"
   "marks an option only that command accepts.\n"
+#endif
   "\n"
   "An argument starting with '+' that is not an option goes to the design itself,\n"
   "for $test$plusargs and $value$plusargs to read while it runs (LRM 21.6). Use\n"
   "'--' to stop that and pass everything after it through as written.";
+
+// The commands this build actually has. `synth` is compiled out of a Release
+// build, and a usage message that offers a command the binary will then reject is
+// worse than one that never mentions it.
+constexpr std::string_view kCommandList =
+#ifdef CLOTHO_SYNTH
+  "'build', 'run', 'lint' or 'synth'";
+#else
+  "'build', 'run' or 'lint'";
+#endif
 
 int usage_error(std::string_view message) {
     std::println(stderr, "clotho: {}", message);
@@ -161,6 +231,8 @@ std::string_view command_name(Command command) {
             return "run";
         case Command::Lint:
             return "lint";
+        case Command::Synth:
+            return "synth";
     }
     return "";
 }
@@ -168,19 +240,28 @@ std::string_view command_name(Command command) {
 // A command-specific option used under another command is an error, not a
 // silently ignored no-op (never silently accept).
 bool check_scope(const Options& o, Command command, int& status) {
+    // `-o` names the artifact, and two commands produce one, so ownership is a set
+    // rather than a single command.
     struct Check {
         bool             given;
         std::string_view name;
         Command          owner;
+        Command          also = Command::Build;
     };
     const Check checks[] = {
         { o.emit.has_value(), "--emit", Command::Build },
-        { o.out.has_value(), "-o", Command::Build },
+        { o.out.has_value(), "-o", Command::Build, Command::Synth },
         { !o.dpi_libs.empty(), "--dpi-lib", Command::Run },
         { o.perf_jitdump.has_value(), "--perf-jitdump", Command::Run },
+        { o.sidecar.has_value(), "--sidecar", Command::Synth, Command::Synth },
+        { o.target.has_value(), "--target", Command::Synth, Command::Synth },
+        { o.hierarchy.has_value(), "--hierarchy", Command::Synth, Command::Synth },
+        { o.no_legalize.has_value(), "--no-legalize", Command::Synth, Command::Synth },
+        { o.full_case.has_value(), "--full-case", Command::Synth, Command::Synth },
+        { o.parallel_case.has_value(), "--parallel-case", Command::Synth, Command::Synth },
     };
     for (const Check& c : checks) {
-        if (c.given && c.owner != command) {
+        if (c.given && c.owner != command && c.also != command) {
             status = usage_error(
               std::format("{} applies to '{}', not '{}'", c.name, command_name(c.owner), command_name(command)));
             return false;
@@ -229,8 +310,26 @@ clotho::ir::LocResolver loc_resolver(const clotho::LowerResult& result) {
 }
 
 // `build`: write the requested artifact. `-o -` (the default) means stdout.
-bool write_artifact(const clotho::LowerResult& result, Emit emit, std::string_view out,
-                    const SimulationConfig& config, clotho::Timings* timings) {
+// Write `text` to `out`, or to stdout for "-".
+bool write_text(std::string_view out, const std::string& text) {
+    if (out == "-") {
+        std::cout << text;
+        return true;
+    }
+    std::ofstream os{ std::string(out) };
+    if (!os) {
+        std::println(stderr, "clotho: cannot open '{}'", out);
+        return false;
+    }
+    os << text;
+    return true;
+}
+
+bool write_artifact(const clotho::LowerResult& result,
+                    Emit                       emit,
+                    std::string_view           out,
+                    const SimulationConfig&    config,
+                    clotho::Timings*           timings) {
     const bool to_stdout = out == "-";
     // Locations are resolvable because lowering hands back the SourceManager. An
     // IR dump you cannot map to source is much less useful when debugging a
@@ -273,7 +372,7 @@ int main(int argc, char** argv) {
     driver->addStandardArgs();
     cmd_line.setProgramName("clotho <command>");
 
-    const auto print_help = [&] { std::print("{}", cmd_line.getHelpText(kOverview)); };
+    const auto print_help    = [&] { std::print("{}", cmd_line.getHelpText(kOverview)); };
     const auto print_version = [] {
         std::println("clotho {}", CLOTHO_GIT_HASH);
         std::println("LLVM {}", CLOTHO_LLVM_VERSION);
@@ -281,7 +380,7 @@ int main(int argc, char** argv) {
     };
 
     if (argc < 2) {
-        return usage_error("no command; expected 'build', 'run' or 'lint'");
+        return usage_error(std::format("no command; expected {}", kCommandList));
     }
     Command command = Command::Run;
     {
@@ -292,6 +391,10 @@ int main(int argc, char** argv) {
             command = Command::Run;
         } else if (first == "lint") {
             command = Command::Lint;
+#ifdef CLOTHO_SYNTH
+        } else if (first == "synth") {
+            command = Command::Synth;
+#endif
         } else if (first == "-h" || first == "--help") {
             // Help and version stand alone, with no command.
             print_help();
@@ -300,7 +403,7 @@ int main(int argc, char** argv) {
             print_version();
             return 0;
         } else {
-            return usage_error(std::format("unknown command '{}'; expected 'build', 'run' or 'lint'", first));
+            return usage_error(std::format("unknown command '{}'; expected {}", first, kCommandList));
         }
     }
 
@@ -317,8 +420,7 @@ int main(int argc, char** argv) {
         }
         if (!verbatim && arg.starts_with("+") && !is_slang_plusarg(arg)) {
             if (command != Command::Run) {
-                return usage_error(
-                  std::format("plusarg '{}' applies to 'run', not '{}'", arg, command_name(command)));
+                return usage_error(std::format("plusarg '{}' applies to 'run', not '{}'", arg, command_name(command)));
             }
             plusargs.emplace_back(arg.substr(1));
             continue;
@@ -411,11 +513,12 @@ int main(int argc, char** argv) {
         } else if (tier == "full") {
             config.allow_system = SystemAccess::Full;
         } else {
-            return usage_error(std::format(
-              "unknown --allow-system tier '{}'; write --allow-system=const or --allow-system=full", tier));
+            return usage_error(
+              std::format("unknown --allow-system tier '{}'; write --allow-system=const or --allow-system=full", tier));
         }
-        std::println(stderr, "clotho: warning: this design may run shell commands ($system enabled with "
-                             "--allow-system={})",
+        std::println(stderr,
+                     "clotho: warning: this design may run shell commands ($system enabled with "
+                     "--allow-system={})",
                      tier);
     }
 
@@ -465,6 +568,53 @@ int main(int argc, char** argv) {
     if (!result.ok) {
         return 1;
     }
+
+#ifdef CLOTHO_SYNTH
+    if (command == Command::Synth) {
+        clotho::legalize::SynthConfig cfg;
+        if (options.target.has_value()) {
+            if (*options.target == "2005") {
+                cfg.target = clotho::legalize::Target::V2005;
+            } else if (*options.target != "sv") {
+                return usage_error(std::format("unknown --target '{}'; expected 2005 or sv", *options.target));
+            }
+        }
+        if (options.hierarchy.has_value()) {
+            if (*options.hierarchy == "flat") {
+                cfg.hierarchy = clotho::legalize::Hierarchy::Flat;
+            } else if (*options.hierarchy != "instances") {
+                return usage_error(
+                  std::format("unknown --hierarchy '{}'; expected flat or instances", *options.hierarchy));
+            }
+        }
+
+        // Without legalization this is a straight translation of what the design
+        // says. With it, each written signal is rebuilt from its guarded list and
+        // the branches the source left implicit are written out.
+        const bool                      legalize = options.no_legalize != true;
+        clotho::legalize::Result        res;
+        const clotho::legalize::Result* resp = nullptr;
+        if (legalize) {
+            res  = clotho::legalize::run(*result.module,
+                                         nullptr,
+                                         { .honour_full_case     = options.full_case == true,
+                                           .honour_parallel_case = options.parallel_case == true,
+                                           .keep_guards          = true });
+            resp = &res;
+        }
+        if (!write_text(out, clotho::legalize::materialize(*result.module, resp, cfg))) {
+            return 1;
+        }
+        if (options.sidecar.has_value() &&
+            !write_text(*options.sidecar, clotho::legalize::sidecar(*result.module, resp, cfg))) {
+            return 1;
+        }
+        if (want_time) {
+            report_timings(timings, command);
+        }
+        return 0;
+    }
+#endif
 
     if (command == Command::Run) {
         const auto resolve = loc_resolver(result);

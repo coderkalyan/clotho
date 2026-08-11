@@ -62,6 +62,21 @@ struct TagInfo {
     // a correctness bug, while thunk elision is a shape restriction whose
     // violations are enumerable. Do not merge them.
     bool blocks_thunk = false;
+
+    // Maps to hardware. This is the process-legalization WHITELIST and it defaults
+    // to false, so an unclassified opcode makes its process unsynthesizable rather
+    // than silently legalizing into the wrong thing -- the same fail-safe polarity
+    // as `pure`, and for the same reason.
+    //
+    // Deliberately NOT the inverse of anything else here. A float op is `pure` and
+    // not synthesizable; `Store` is neither pure nor thunk-blocking and IS
+    // synthesizable. Three independent questions, three fields.
+    //
+    // "Synthesizable" here is per-opcode and structural only. Shape restrictions
+    // that depend on operands rather than the opcode -- a loop whose bound is not
+    // static, a call that cannot be inlined -- are the legalizer's job, not this
+    // table's.
+    bool synthesizable = false;
 };
 
 // Exhaustive over Inst::Tag: a new opcode fails to compile here (-Werror=switch)

@@ -8616,6 +8616,36 @@ private:
     // Only ever reports what it can prove. A non-constant item, an
     // undecidably-wide selector or `case ... inside` all yield silence, never a
     // guess -- the whole value of this check is that a finding is trustworthy.
+    // The case pragmas as bits, for the IR: bit 0 full_case, bit 1 parallel_case.
+    // An attribute with no value means 1 (LRM 5.12), and `= 0` withdraws the claim.
+    uint32_t case_pragma_bits(const CaseStatement& c) const {
+        if (scope_ == nullptr) {
+            return 0;
+        }
+        // `unique` / `priority` / `unique0` are the same two claims spelled as
+        // keywords, and yosys's parser and sv2v map them this way.
+        using Check   = slang::ast::UniquePriorityCheck;
+        uint32_t bits = 0;
+        if (c.check == Check::Priority || c.check == Check::Unique) {
+            bits |= 1u; // full_case
+        }
+        if (c.check == Check::Unique0 || c.check == Check::Unique) {
+            bits |= 2u; // parallel_case
+        }
+        for (const slang::ast::AttributeSymbol* a : scope_->getCompilation().getAttributes(c)) {
+            if (!a->getValue().isTrue()) {
+                continue;
+            }
+            if (a->name == "full_case") {
+                bits |= 1u;
+            } else if (a->name == "parallel_case") {
+                bits |= 2u;
+            }
+        }
+
+        return bits;
+    }
+
     void check_case_pragmas(const CaseStatement& c) {
         if (scope_ == nullptr) {
             return;
@@ -8919,7 +8949,9 @@ private:
             b.open_region();
             lower_case_inside_item(c, k + run->len, sel, ty, width, key_width, keep, astCtx, report_viol, b);
             const ir::ExtraSlice default_region = b.close_region();
-            b.switch_(sel, arms, default_region, loc(c.expr));
+            // four-state is exactly `key_width != width`: the key encoding doubles
+            // only for a 4-state selector.
+            b.switch_(sel, arms, default_region, width, key_width != width ? 1u : 0u, case_pragma_bits(c), loc(c.expr));
             return;
         }
 
@@ -9332,7 +9364,11 @@ private:
             lower_stmt(*c.defaultCase, b);
         }
         const ir::ExtraSlice default_region = b.close_region();
-        b.switch_(key, arms, default_region, loc(c.expr));
+        // key_width 0: the key here is a bit INDEX from ctz/clz, not the selector,
+        // so its value space is not the thing fullness is asking about. A one-hot
+        // case is full only if the selector is provably one-hot, which the switch
+        // alone cannot say. Decline rather than answer the wrong question.
+        b.switch_(key, arms, default_region, /*sel_width=*/0, /*sel_four=*/0, case_pragma_bits(c), loc(c.expr));
     }
 
     void lower_case(const CaseStatement& c, ir::Builder& b) {
@@ -9538,7 +9574,9 @@ private:
             b.open_region();
             dispatch_preds(c, k + run->len, sel, width, key_width, astCtx, preds, no_match_report, b);
             const ir::ExtraSlice default_region = b.close_region();
-            b.switch_(sel, arms, default_region, loc(c.expr));
+            // four-state is exactly `key_width != width`: the key encoding doubles
+            // only for a 4-state selector.
+            b.switch_(sel, arms, default_region, width, key_width != width ? 1u : 0u, case_pragma_bits(c), loc(c.expr));
             return;
         }
 
@@ -9599,7 +9637,9 @@ private:
             b.open_region();
             lower_case_item(c, k + run->len, sel, cmp, ty, width, key_width, keep, astCtx, report_viol, b);
             const ir::ExtraSlice default_region = b.close_region();
-            b.switch_(sel, arms, default_region, loc(c.expr));
+            // four-state is exactly `key_width != width`: the key encoding doubles
+            // only for a 4-state selector.
+            b.switch_(sel, arms, default_region, width, key_width != width ? 1u : 0u, case_pragma_bits(c), loc(c.expr));
             return;
         }
 
@@ -14044,11 +14084,11 @@ private:
         ir::Index           off;
         if (range.isDescending()) {
             const int32_t sub = range.right + bias; // off = idx - right - bias
-            off =
-              sub == 0
-                ? v
-                : b.binary(
-                    ir::Inst::Tag::Sub, v, b.constant(module_.pool.put_int(off_ty, static_cast<uint32_t>(sub)), il), il);
+            off = sub == 0 ? v
+                           : b.binary(ir::Inst::Tag::Sub,
+                                      v,
+                                      b.constant(module_.pool.put_int(off_ty, static_cast<uint32_t>(sub)), il),
+                                      il);
         } else {
             // Big-endian: off = (right - bias) - idx.
             off = b.binary(ir::Inst::Tag::Sub,
@@ -14060,8 +14100,7 @@ private:
         // is the offset's final value.
         const ir::Index result =
           stride == 1 ? off
-                      : b.binary(ir::Inst::Tag::Mul, off,
-                                 b.constant(module_.pool.put_int(off_ty, stride), il), il);
+                      : b.binary(ir::Inst::Tag::Mul, off, b.constant(module_.pool.put_int(off_ty, stride), il), il);
         b.set_end(result, to_source_loc(idx.sourceRange.end()));
         return result;
     }

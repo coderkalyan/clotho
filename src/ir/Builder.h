@@ -203,7 +203,13 @@ public:
     // is the value the backend packs into the match key; `arms` map key sets to
     // bodies; `default_region` runs on no match (pass an empty region when the
     // case had no default). See ir::SwitchInfo.
-    Index switch_(Index selector, std::span<const SwitchArmBuild> arms, ExtraSlice default_region, SourceLoc loc);
+    Index switch_(Index                           selector,
+                  std::span<const SwitchArmBuild> arms,
+                  ExtraSlice                      default_region,
+                  uint32_t                        sel_width,
+                  uint32_t                        sel_four,
+                  uint32_t                        pragmas,
+                  SourceLoc                       loc);
     // Value-producing short-circuit conditional (&&/||). `pred` is a definite
     // 2-state bit; the then-branch (pred 1) yields `then_val`, the else-branch
     // yields `else_val`. The two values must share a width; the backend merges
