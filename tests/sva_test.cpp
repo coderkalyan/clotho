@@ -2849,3 +2849,265 @@ endmodule
     // outer accept overrides it; innermost-wins would read `25`.
     CHECK(reports("#22 x = 1; y = 1;") == "");
 }
+
+// How many times `needle` occurs in `hay`. The pass/cover cases below turn on a
+// report happening ONCE rather than merely happening.
+static size_t count_of(std::string_view hay, std::string_view needle) {
+    size_t n = 0;
+    for (size_t at = hay.find(needle); at != std::string_view::npos;
+         at = hay.find(needle, at + needle.size())) {
+        ++n;
+    }
+
+    return n;
+}
+
+TEST_CASE("a twice-matching attempt reports only its first failing obligation") {
+    // The repro for the per-attempt rule, in miniature. `a ##[1:2] b` matches at tick 2 and
+    // again at tick 3 from the single `a` at tick 1, seeding obligations that
+    // check `ok` at ticks 3 and 4. Both fail, and the attempt reports once.
+    //
+    // Reporting per obligation reads `35 45`.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, ok = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) (a ##[1:2] b) |=> ok);
+  initial begin
+    @(posedge clk);            // tick0
+    a <= 1;
+    @(posedge clk);            // tick1: a high
+    a <= 0; b <= 1;
+    @(posedge clk);            // tick2: the ##1 match ends
+    @(posedge clk);            // tick3: the ##2 match ends; obligation 1 FAILS
+    b <= 0;
+    @(posedge clk);            // tick4: obligation 2 would fail here
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)") == "35");
+}
+
+TEST_CASE("a failed attempt does not report a later obligation's pass") {
+    // The same shape with `ok` high at tick 4, so the attempt's SECOND obligation
+    // passes after its first has already failed. A failure resolves the attempt,
+    // so the pass is not the attempt's and no action block runs for it.
+    //
+    // Per-obligation verdicts print MM-PASS here.
+    const std::string out = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, ok = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) (a ##[1:2] b) |=> ok) $display("[%0t] MM-PASS", $time);
+  initial begin
+    @(posedge clk);            // tick0
+    a <= 1;
+    @(posedge clk);            // tick1
+    a <= 0; b <= 1;
+    @(posedge clk);            // tick2: the ##1 match ends
+    @(posedge clk);            // tick3: the ##2 match ends; obligation 1 FAILS
+    b <= 0; ok <= 1;
+    @(posedge clk);            // tick4: obligation 2 sees ok=1
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)");
+    CHECK(count_of(out, "MM-PASS") == 0);
+    CHECK(count_of(out, "assertion failed") == 1);
+}
+
+TEST_CASE("an attempt passes at its last obligation, not its first") {
+    // Both obligations pass, so the attempt does too -- once, and in the cycle the
+    // LATER one resolves. This is the case that rules out plain report coalescing:
+    // suppressing all but the first report would put the pass at 35.
+    const std::string out = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, ok = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) (a ##[1:2] b) |=> ok) $display("[%0t] MM-PASS", $time);
+  initial begin
+    @(posedge clk);            // tick0
+    a <= 1;
+    @(posedge clk);            // tick1
+    a <= 0; b <= 1; ok <= 1;
+    @(posedge clk);            // tick2: the ##1 match ends
+    @(posedge clk);            // tick3: the ##2 match ends; obligation 1 passes
+    b <= 0;
+    @(posedge clk);            // tick4: obligation 2 passes -> the attempt passes
+    ok <= 0;
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)");
+    CHECK(count_of(out, "MM-PASS") == 1);
+    CHECK(out.find("[45] MM-PASS") != std::string::npos);
+    CHECK(count_of(out, "assertion failed") == 0);
+}
+
+TEST_CASE("an attempt whose second obligation fails reports only that failure") {
+    // Obligation 1 passes at tick 3 and obligation 2 fails at tick 4. The pass was
+    // never the attempt's -- an obligation was still owed -- so the only report is
+    // the failure, and it is at the LATER cycle.
+    //
+    // Per-obligation verdicts print MM-PASS at 35 as well as failing at 45.
+    const std::string out = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, ok = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) (a ##[1:2] b) |=> ok) $display("[%0t] MM-PASS", $time);
+  initial begin
+    @(posedge clk);            // tick0
+    a <= 1;
+    @(posedge clk);            // tick1
+    a <= 0; b <= 1; ok <= 1;
+    @(posedge clk);            // tick2: the ##1 match ends
+    @(posedge clk);            // tick3: the ##2 match ends; obligation 1 passes
+    b <= 0; ok <= 0;
+    @(posedge clk);            // tick4: obligation 2 FAILS
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)");
+    CHECK(count_of(out, "MM-PASS") == 0);
+    CHECK(count_of(out, "assertion failed") == 1);
+    CHECK(out.find("[45]\n") != std::string::npos);
+}
+
+TEST_CASE("an attempt's pass waits for its antecedent window to close") {
+    // Only ONE obligation here: `b` is high at tick 2 alone, so `a ##[1:3] b`
+    // matches once and the obligation passes at tick 3. The attempt still cannot
+    // pass there -- its ##2 and ##3 threads are alive and could seed another
+    // obligation -- so the verdict lands at tick 4, when the last of them dies.
+    //
+    // Reporting the pass where the obligation resolved puts it at 35.
+    const std::string out = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, ok = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) (a ##[1:3] b) |=> ok) $display("[%0t] MM-PASS", $time);
+  initial begin
+    @(posedge clk);            // tick0
+    a <= 1;
+    @(posedge clk);            // tick1
+    a <= 0; b <= 1; ok <= 1;
+    @(posedge clk);            // tick2: the only match ends here
+    b <= 0;
+    @(posedge clk);            // tick3: the obligation passes; no ##2 match
+    ok <= 0;
+    @(posedge clk);            // tick4: no ##3 match -- the window closes
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)");
+    CHECK(count_of(out, "MM-PASS") == 1);
+    CHECK(out.find("[45] MM-PASS") != std::string::npos);
+}
+
+TEST_CASE("a cover of an implication counts a twice-matching attempt once") {
+    // A cover counts attempts, not obligations (LRM 16.12.6), so an antecedent matching twice with both consequents
+    // holding is ONE hit -- in the cycle the attempt settles.
+    //
+    // Counting per obligation hits twice, at 35 and 45.
+    const std::string out = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, ok = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ci: cover property (@(posedge clk) (a ##[1:2] b) |=> ok) $display("[%0t] CI-HIT", $time);
+  initial begin
+    @(posedge clk);            // tick0
+    a <= 1;
+    @(posedge clk);            // tick1
+    a <= 0; b <= 1; ok <= 1;
+    @(posedge clk);            // tick2: the ##1 match ends
+    @(posedge clk);            // tick3: the ##2 match ends; obligation 1 passes
+    b <= 0;
+    @(posedge clk);            // tick4: obligation 2 passes
+    ok <= 0;
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)");
+    CHECK(count_of(out, "CI-HIT") == 1);
+    CHECK(out.find("[45] CI-HIT") != std::string::npos);
+}
+
+TEST_CASE("a cover does not count an attempt one of whose obligations failed") {
+    // The same cover with the second consequent low. The attempt does not pass, so
+    // it is not covered at all -- the earlier obligation's match is not a hit of
+    // its own. This is the half of the cover rule that a per-obligation tally gets
+    // wrong in the other direction, hitting once at 35.
+    const std::string out = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, ok = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ci: cover property (@(posedge clk) (a ##[1:2] b) |=> ok) $display("[%0t] CI-HIT", $time);
+  initial begin
+    @(posedge clk);            // tick0
+    a <= 1;
+    @(posedge clk);            // tick1
+    a <= 0; b <= 1; ok <= 1;
+    @(posedge clk);            // tick2: the ##1 match ends
+    @(posedge clk);            // tick3: the ##2 match ends; obligation 1 passes
+    b <= 0; ok <= 0;
+    @(posedge clk);            // tick4: obligation 2 FAILS
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)");
+    CHECK(count_of(out, "CI-HIT") == 0);
+}
+
+TEST_CASE("two attempts of one assertion each keep their own verdict") {
+    // The guard on the other side of the grouping: `a` is high at ticks 1 and 2, so
+    // two DISTINCT attempts each match `a ##1 b` once and each fail, one cycle
+    // apart. Grouping keyed on anything coarser than the attempt -- an
+    // assertion-wide "already reported" flag, or an id ring too small to keep two
+    // live attempts apart -- swallows the second.
+    //
+    // This one holds before the fix as well as after; it is here to fail if the
+    // per-attempt machinery ever over-merges, which is the failure mode the rest of
+    // these cases cannot see.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, ok = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) (a ##1 b) |=> ok);
+  initial begin
+    @(posedge clk);            // tick0
+    a <= 1;
+    @(posedge clk);            // tick1: attempt A starts
+    b <= 1;
+    @(posedge clk);            // tick2: a still high -> attempt B starts; A matches
+    a <= 0;
+    @(posedge clk);            // tick3: B matches; A's obligation FAILS
+    b <= 0;
+    @(posedge clk);            // tick4: B's obligation FAILS
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)") == "35 45");
+}

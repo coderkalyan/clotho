@@ -6587,6 +6587,21 @@ private:
         // Deriving occupancy from emptiness loses every such failure -- measured,
         // see ../libsva/test/backend.c:405-411.
         ir::Signal occupied{ 0 };
+        // Per-attempt grouping, `attempt_ring_size` bits wide
+        // and all absent when that is 0. `tid[s]` is the set of attempts whose
+        // antecedent threads sit in trigger state `s`, one bit per live attempt;
+        // `oid[k]` is the attempt that seeded obligation slot `k`; `firedid`
+        // carries a `|=>` match's attempt over to the cycle it seeds in; `idnow`
+        // is the rotating one-hot id the attempt starting this cycle takes.
+        std::vector<ir::Signal> tid;
+        std::vector<ir::Signal> oid;
+        ir::Signal              firedid{ 0 };
+        ir::Signal              idnow{ 0 };
+        // Attempts every obligation of which has passed so far, still waiting for
+        // the attempt to be unable to raise another one. A pass is only the
+        // attempt's once nothing of it is left running, and that can be a later
+        // cycle than the one its last obligation matched in.
+        ir::Signal              passing{ 0 };
         // Match tally, for `cover property`.
         ir::Signal covered{ 0 };
         // One per ASYNCHRONOUS abort, empty entry for a `sync_` one: whether its
@@ -6638,6 +6653,24 @@ private:
               base + "pend" + std::to_string(k), mask_type(mon.obligation.state_count), l));
         }
         st.occupied = new_monitor_state(base + "occ", mask_type(mon.depth), l);
+
+        // The attempt-id ring, only when the antecedent can match twice in one
+        // attempt and its longest match is bounded (attempt_ring_size).
+        if (const uint32_t ring = attempt_ring_size(mon); ring != 0) {
+            st.tid.reserve(mon.trigger.state_count);
+            for (uint32_t s = 0; s < mon.trigger.state_count; ++s) {
+                st.tid.push_back(
+                  new_monitor_state(base + "tid" + std::to_string(s), mask_type(ring), l));
+            }
+            st.oid.reserve(mon.depth);
+            for (uint32_t k = 0; k < mon.depth; ++k) {
+                st.oid.push_back(
+                  new_monitor_state(base + "oid" + std::to_string(k), mask_type(ring), l));
+            }
+            st.firedid = new_monitor_state(base + "fid", mask_type(ring), l);
+            st.idnow   = new_monitor_state(base + "idn", mask_type(ring), l);
+            st.passing = new_monitor_state(base + "pass", mask_type(ring), l);
+        }
         if (mon.kind == ir::AssertionKind::Cover) {
             // Unsigned: a tally is never negative, and widening the 1-bit match
             // flag into a signed target would sign-extend it to -1 (a Resize takes
@@ -6684,6 +6717,94 @@ private:
         }
 
         return false;
+    }
+
+    // The longest match of an automaton in cycles, or nullopt when it has none.
+    // A Glushkov automaton has one state per letter occurrence and no epsilon
+    // edges, so a match of length n visits exactly n states: the longest match is
+    // the longest first -> last path, and a cycle on the way to a `last` state
+    // means a match can end arbitrarily late (`b[=2]`, `a ##[1:$] b`).
+    //
+    // Relaxation rather than a DFS: `best[s]` is the longest path from `s` to a
+    // last state, and a round that still improves after `state_count` of them can
+    // only be walking a cycle. libsva caps state counts, so the cubic worst case
+    // never bites.
+    static std::optional<uint32_t> automaton_max_length(const ir::AssertionAutomaton& au) {
+        const uint32_t n      = au.state_count;
+        const auto     in_row = [](std::span<const uint64_t> row, uint32_t s) {
+            return s / 64 < row.size() && (row[s / 64] & (uint64_t{ 1 } << (s % 64))) != 0;
+        };
+
+        std::vector<uint32_t> best(n, 0); // 0 = cannot reach a last state at all
+        for (uint32_t round = 0; round <= n; ++round) {
+            bool changed = false;
+            for (uint32_t s = 0; s < n; ++s) {
+                uint32_t                        cand = in_row(au.last, s) ? 1 : 0;
+                const std::span<const uint64_t> row  = table_row(au.follow, s, au.words);
+                for (uint32_t t = 0; t < n; ++t) {
+                    if (in_row(row, t) && best[t] != 0) {
+                        cand = std::max(cand, best[t] + 1);
+                    }
+                }
+                if (cand > best[s]) {
+                    best[s] = cand;
+                    changed = true;
+                }
+            }
+            if (!changed) {
+                break;
+            }
+            if (round == n) {
+                return std::nullopt; // still growing after n rounds: a cycle
+            }
+        }
+
+        uint32_t longest = 0;
+        for (uint32_t s = 0; s < n; ++s) {
+            if (in_row(au.first, s)) {
+                longest = std::max(longest, best[s]);
+            }
+        }
+
+        return longest;
+    }
+
+    // Width of the attempt-id ring, or 0 when the monitor needs no per-attempt
+    // grouping because every obligation is already an attempt of its own.
+    //
+    // LRM 16.12.1 starts an attempt every tick, and a ranged antecedent can match
+    // more than once within ONE attempt, each match seeding its own obligation.
+    // Such an attempt gets a SINGLE verdict: it
+    // fails at its first failing obligation and passes only once every one of them
+    // has passed. Telling those obligations apart needs the attempt behind them,
+    // so every antecedent thread carries a one-hot attempt id.
+    //
+    // Two shapes need none of it, and both keep exactly the pre-existing state and
+    // code. Without a trigger an attempt seeds one obligation and no more. With a
+    // single-cycle antecedent (longest match 1) a thread dies in the cycle it
+    // matches, so an attempt cannot match twice -- `req |=> ack`, the common
+    // shape.
+    //
+    // TODO: an antecedent whose longest match is UNBOUNDED (`b[=2]`, `b[->2]`,
+    // `a ##[1:$] b`) cannot size the ring, so its attempts stay ungrouped and it
+    // keeps reporting per obligation -- the residue of the one-verdict rule. Closing it
+    // needs the trigger tracked per attempt over a dynamic thread list rather than
+    // a fixed ring, which is the same wall libsva records in the
+    // `UnsupportedAbortScope` TODO (../libsva/src/Glushkov.zig).
+    static uint32_t attempt_ring_size(const ir::AssertionMonitor& mon) {
+        if (!mon.has_trigger) {
+            return 0;
+        }
+        const std::optional<uint32_t> reach = automaton_max_length(mon.trigger);
+        if (!reach.has_value() || *reach <= 1) {
+            return 0;
+        }
+
+        // An attempt is finished at most `reach + depth` cycles after it starts:
+        // its last antecedent match ends by cycle `reach - 1`, `|=>` seeds one
+        // cycle after that, and the obligation resolves within `depth`. One more
+        // than that never hands a live attempt's id to a new one.
+        return *reach + mon.depth + 1;
     }
 
     // Whether this root is evaluated from LIVE values rather than from the
@@ -6777,6 +6898,23 @@ private:
     // lvalue base, and every mask here is a computed value.
     ir::Index mask_bit(ir::Index mask, uint32_t bit, uint32_t width, ir::Builder& b, ir::SourceLoc l) {
         return mask_any(b.binary(ir::Inst::Tag::Band, mask, slot_mask(bit, width, b, l), l), b, l);
+    }
+
+    // A `width`-bit unsigned constant. Only ever used for small shift amounts, so
+    // the low word is the whole value.
+    ir::Index int_const(uint64_t v, uint32_t width, ir::Builder& b, ir::SourceLoc l) {
+        const std::array<uint64_t, 1> row{ v };
+
+        return b.constant(mask_const(row, width), l);
+    }
+
+    // One step of the one-hot attempt-id ring: rotate left by one, so the bit
+    // walking off the top comes back in at the bottom.
+    ir::Index rotl1(ir::Index v, uint32_t width, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Index up   = b.binary(ir::Inst::Tag::Sll, v, int_const(1, width, b, l), l);
+        const ir::Index over = b.binary(ir::Inst::Tag::Srl, v, int_const(width - 1, width, b, l), l);
+
+        return b.binary(ir::Inst::Tag::Bor, up, over, l);
     }
 
     // Store `value`, or hold, or reset. Three outcomes rather than two, because
@@ -7413,21 +7551,81 @@ private:
         const uint32_t  obl   = mon.obligation.state_count;
         const ir::Index sat_o = automaton_satisfy(mon, mon.obligation, roots, b, l);
 
+        // Per-attempt grouping. Width 0 switches it off and
+        // every `group` branch below folds away, leaving the per-obligation path.
+        const uint32_t ring  = attempt_ring_size(mon);
+        const bool     group = ring != 0;
+
+        // This cycle's attempt id: one bit rotating through the ring, so an id is
+        // handed out again only long after its attempt finished. The signal powers
+        // up to 0, which is no attempt at all, so the first one takes bit 0.
+        ir::Index id_now;
+        if (group) {
+            const ir::Index held = load_signal(st.idnow, b, l);
+            id_now = b.select(mask_any(held, b, l), held, slot_mask(0, ring, b, l), l);
+            store_gated(st.idnow, rotl1(id_now, ring, b, l), active, edge, ring, b, l);
+        }
+
         // The trigger. An attempt starts every cycle, so its first-state mask is
         // folded in unconditionally; `fires` is this cycle's antecedent match.
-        ir::Index fires = zero_mask(1, b, l);
+        //
+        // `trig_next` and `tid_next` outlive the block: a failing obligation
+        // resolves its whole attempt, which means killing that attempt's remaining
+        // antecedent threads too, and that cannot be known until the verdicts.
+        ir::Index              fires = zero_mask(1, b, l);
+        ir::Index              trig_next;
+        ir::Index              fired_ids;
+        std::vector<ir::Index> tid_next;
         if (mon.has_trigger) {
             const uint32_t  trig  = mon.trigger.state_count;
             const ir::Index sat_t = automaton_satisfy(mon, mon.trigger, roots, b, l);
+            const ir::Index cur_t = load_signal(st.trigger, b, l);
             const ir::Index start = b.binary(
               ir::Inst::Tag::Band, b.constant(mask_const(mon.trigger.first, trig), l), sat_t, l);
-            const ir::Index stepped =
-              automaton_advance(mon.trigger, load_signal(st.trigger, b, l), sat_t, b, l);
+            const ir::Index stepped = automaton_advance(mon.trigger, cur_t, sat_t, b, l);
             const ir::Index next = b.binary(ir::Inst::Tag::Bor, stepped, start, l);
             const ir::Index done = b.binary(
               ir::Inst::Tag::Band, next, b.constant(mask_const(mon.trigger.last, trig), l), l);
-            fires = mask_any(done, b, l);
-            store_gated(st.trigger, next, active, edge, trig, b, l);
+            fires     = mask_any(done, b, l);
+            trig_next = next;
+
+            if (group) {
+                // Carry the attempt ids along the same edges the mask just took:
+                // state `s` inherits every attempt sitting in a predecessor that
+                // was live last cycle, and a first-state also takes the attempt
+                // starting now. Two attempts meeting in one state is not a
+                // conflict -- the state simply holds both bits, and both go on
+                // matching. Gating by `next` drops the ones whose guard failed.
+                tid_next.resize(trig);
+                fired_ids = zero_mask(ring, b, l);
+                for (uint32_t s = 0; s < trig; ++s) {
+                    ir::Index acc = zero_mask(ring, b, l);
+                    for (uint32_t p = 0; p < trig; ++p) {
+                        const std::span<const uint64_t> row =
+                          table_row(mon.trigger.follow, p, mon.trigger.words);
+                        if ((row[s / 64] & (uint64_t{ 1 } << (s % 64))) == 0) {
+                            continue;
+                        }
+                        acc = b.binary(ir::Inst::Tag::Bor,
+                                       acc,
+                                       b.select(mask_bit(cur_t, p, trig, b, l),
+                                                load_signal(st.tid[p], b, l),
+                                                zero_mask(ring, b, l),
+                                                l),
+                                       l);
+                    }
+                    if ((mon.trigger.first[s / 64] & (uint64_t{ 1 } << (s % 64))) != 0) {
+                        acc = b.binary(ir::Inst::Tag::Bor, acc, id_now, l);
+                    }
+                    tid_next[s] = b.select(
+                      mask_bit(next, s, trig, b, l), acc, zero_mask(ring, b, l), l);
+
+                    // Whose antecedent completed a match this cycle.
+                    if ((mon.trigger.last[s / 64] & (uint64_t{ 1 } << (s % 64))) != 0) {
+                        fired_ids = b.binary(ir::Inst::Tag::Bor, fired_ids, tid_next[s], l);
+                    }
+                }
+            }
         }
 
         // An abort whose scope reaches the antecedent resolves at MATCH time --
@@ -7520,6 +7718,22 @@ private:
         const ir::Index seed = b.binary(
           ir::Inst::Tag::Band, b.constant(mask_const(mon.obligation.first, obl), l), sat_o, l);
 
+        // Which attempt owns the obligation seeded this cycle. `|->` seeds from
+        // this cycle's match and `|=>` from last cycle's, so the id rides the same
+        // one-cycle carry `fired` does.
+        //
+        // A trigger-covering abort cannot interfere: libsva admits one only over
+        // an antecedent whose every match is a single cycle, which is exactly the
+        // shape attempt_ring_size leaves ungrouped.
+        ir::Index seed_ids;
+        if (group) {
+            seed_ids = mon.overlap ? fired_ids : load_signal(st.firedid, b, l);
+        }
+        std::vector<ir::Index> oid_next(group ? mon.depth : 0);
+        for (uint32_t k = 0; group && k < mon.depth; ++k) {
+            oid_next[k] = load_signal(st.oid[k], b, l);
+        }
+
         // The first free slot, unrolled: depth is a compile-time constant, so there
         // is no run-time search to make. A slot is always free -- depth is the
         // obligation's longest match, so an attempt holds its slot for at most
@@ -7544,6 +7758,9 @@ private:
               b.select(pick, slot_mask(k, mon.depth, b, l), zero_mask(mon.depth, b, l), l);
 
             pending[k] = b.select(pick, seed, pending[k], l);
+            if (group) {
+                oid_next[k] = b.select(pick, seed_ids, oid_next[k], l);
+            }
             live       = b.binary(ir::Inst::Tag::Bor, live, claim, l);
             all_taken  = b.binary(ir::Inst::Tag::Band, all_taken, busy, l);
             for (uint32_t i = 0; i < mon.aborts.size(); ++i) {
@@ -7551,10 +7768,6 @@ private:
                     armed[i][k] = b.binary(ir::Inst::Tag::Bor, armed[i][k], pick, l);
                 }
             }
-        }
-
-        if (mon.has_trigger) {
-            store_gated(st.fired, fires, active, edge, 1, b, l);
         }
 
         // Aborts resolve an attempt early. After seeding, so one firing in the
@@ -7655,6 +7868,141 @@ private:
             failed.push_back(*trigger_failed);
         }
 
+        // Per-attempt resolution. An attempt is ONE verdict over
+        // every obligation its antecedent matches seeded: it fails at the first of
+        // them to fail, and passes only once all of them have passed and it can
+        // match no more. Ungrouped, each obligation is an attempt of its own and
+        // these stay exactly `failed` and `matched`.
+        std::vector<ir::Index> report_fail = failed;
+        std::vector<ir::Index> report_pass = matched;
+        if (group) {
+            const uint32_t  trig = mon.trigger.state_count;
+            const ir::Index none = zero_mask(ring, b, l);
+            const auto      owns = [&](ir::Index id, ir::Index set) {
+                return mask_any(b.binary(ir::Inst::Tag::Band, id, set, l), b, l);
+            };
+
+            // The attempts a failing obligation resolves this cycle.
+            ir::Index failed_ids = none;
+            for (uint32_t k = 0; k < mon.depth; ++k) {
+                failed_ids = b.binary(
+                  ir::Inst::Tag::Bor, failed_ids, b.select(failed[k], oid_next[k], none, l), l);
+            }
+            const ir::Index survives = b.unary(ir::Inst::Tag::Bnot, failed_ids, l);
+
+            // A failed attempt is finished. Its other obligations are abandoned --
+            // a later one passing is not a pass of the attempt -- and so are the
+            // antecedent threads that would have seeded more.
+            for (uint32_t k = 0; k < mon.depth; ++k) {
+                const ir::Index doomed = owns(oid_next[k], failed_ids);
+                matched[k] = b.binary(ir::Inst::Tag::Band, matched[k], bit_not(doomed, b, l), l);
+                pending[k] = b.select(doomed, zero_mask(obl, b, l), pending[k], l);
+                remaining  = b.select(doomed,
+                                     b.binary(ir::Inst::Tag::Band,
+                                              remaining,
+                                              b.unary(ir::Inst::Tag::Bnot,
+                                                      slot_mask(k, mon.depth, b, l),
+                                                      l),
+                                              l),
+                                     remaining,
+                                     l);
+            }
+            fired_ids      = b.binary(ir::Inst::Tag::Band, fired_ids, survives, l);
+            ir::Index kept = zero_mask(trig, b, l);
+            for (uint32_t s = 0; s < trig; ++s) {
+                tid_next[s] = b.binary(ir::Inst::Tag::Band, tid_next[s], survives, l);
+                kept        = b.binary(ir::Inst::Tag::Bor,
+                                kept,
+                                b.select(mask_any(tid_next[s], b, l),
+                                         slot_mask(s, trig, b, l),
+                                         zero_mask(trig, b, l),
+                                         l),
+                                l);
+            }
+            trig_next = b.binary(ir::Inst::Tag::Band, trig_next, kept, l);
+
+            // What can still give an attempt a verdict after this cycle: an
+            // antecedent thread of it still running, an obligation of it still
+            // pending, or a match of it that seeds one next cycle. A pass waits for
+            // all three to be clear, which is what makes a twice-matching attempt
+            // report at its LATER obligation instead of its first.
+            ir::Index live_ids = none;
+            for (const ir::Index in_state : tid_next) {
+                live_ids = b.binary(ir::Inst::Tag::Bor, live_ids, in_state, l);
+            }
+            if (!mon.overlap) {
+                live_ids = b.binary(ir::Inst::Tag::Bor, live_ids, fired_ids, l);
+            }
+            for (uint32_t k = 0; k < mon.depth; ++k) {
+                live_ids = b.binary(
+                  ir::Inst::Tag::Bor,
+                  live_ids,
+                  b.select(mask_bit(remaining, k, mon.depth, b, l), oid_next[k], none, l),
+                  l);
+            }
+
+            // One FAIL report per attempt, however many of its obligations fail in
+            // this single cycle. A failure resolves the attempt on the spot, so it
+            // never waits.
+            ir::Index fclaim = none;
+            for (uint32_t k = 0; k < mon.depth; ++k) {
+                report_fail[k] = b.binary(
+                  ir::Inst::Tag::Band, failed[k], bit_not(owns(oid_next[k], fclaim), b, l), l);
+                fclaim = b.binary(
+                  ir::Inst::Tag::Bor, fclaim, b.select(report_fail[k], oid_next[k], none, l), l);
+            }
+
+            // A pass is the attempt's only once nothing of it is left running, so
+            // it is carried in `passing` rather than reported where it matched, and
+            // fires in the cycle the attempt goes quiet. That is what defers a
+            // twice-matching attempt's pass to its LATER obligation -- and to a
+            // cycle later still when the antecedent could have matched again and
+            // did not.
+            ir::Index matched_ids = none;
+            for (uint32_t k = 0; k < mon.depth; ++k) {
+                matched_ids = b.binary(
+                  ir::Inst::Tag::Bor, matched_ids, b.select(matched[k], oid_next[k], none, l), l);
+            }
+            const ir::Index waiting =
+              b.binary(ir::Inst::Tag::Band,
+                       b.binary(ir::Inst::Tag::Bor, load_signal(st.passing, b, l), matched_ids, l),
+                       survives,
+                       l);
+            const ir::Index settle = b.binary(
+              ir::Inst::Tag::Band, waiting, b.unary(ir::Inst::Tag::Bnot, live_ids, l), l);
+
+            // One verdict bit per attempt id now, not per slot: a settling pass may
+            // belong to an attempt whose slot was freed cycles ago.
+            report_pass.assign(ring, none);
+            for (uint32_t i = 0; i < ring; ++i) {
+                report_pass[i] = mask_bit(settle, i, ring, b, l);
+            }
+
+            for (uint32_t k = 0; k < mon.depth; ++k) {
+                store_gated(st.oid[k], oid_next[k], active, edge, ring, b, l);
+            }
+            for (uint32_t s = 0; s < trig; ++s) {
+                store_gated(st.tid[s], tid_next[s], active, edge, ring, b, l);
+            }
+            store_gated(st.firedid, fired_ids, active, edge, ring, b, l);
+            store_gated(st.passing,
+                        b.binary(ir::Inst::Tag::Band, waiting, live_ids, l),
+                        active,
+                        edge,
+                        ring,
+                        b,
+                        l);
+        }
+
+        // The antecedent's own state, stored down here because a failing
+        // obligation may just have killed the threads of the attempt it came from.
+        if (mon.has_trigger) {
+            store_gated(
+              st.trigger, trig_next, active, edge, mon.trigger.state_count, b, l);
+            store_gated(
+              st.fired, group ? mask_any(fired_ids, b, l) : fires, active, edge, 1, b, l);
+        }
+
         store_gated(st.occupied, remaining, active, edge, mon.depth, b, l);
         for (uint32_t k = 0; k < mon.depth; ++k) {
             store_gated(st.pending[k], pending[k], active, edge, obl, b, l);
@@ -7663,21 +8011,24 @@ private:
         if (mon.kind == ir::AssertionKind::Cover) {
             // A cover counts matches and never reports (LRM 16.12.6). More than one
             // attempt can complete in a cycle, so this is a sum and not a flag. Over
-            // `matched` rather than the slots, because an accept discharging a
-            // trigger-covering attempt is a match with no slot behind it.
+            // the verdict bits rather than the slots, because an accept discharging
+            // a trigger-covering attempt is a match with no slot behind it.
+            //
+            // Per ATTEMPT, not per obligation: a twice-matching antecedent is one
+            // cover hit, and none at all when one of its obligations failed. That is the per-attempt rule.
             ir::Index count = load_signal(st.covered, b, l);
-            for (const ir::Index bit : matched) {
+            for (const ir::Index bit : report_pass) {
                 count = b.binary(ir::Inst::Tag::Add, count, b.resize(bit, mask_type(32), l), l);
             }
             store_gated(st.covered, count, active, edge, 32, b, l);
         } else {
-            emit_action_pends(failed, *fail_body, active, /*unlikely=*/true, b, l);
+            emit_action_pends(report_fail, *fail_body, active, /*unlikely=*/true, b, l);
         }
         if (pass_body.has_value()) {
             // A cover's action block runs on a match (LRM 16.12.6) and an assert's
             // pass action on a pass (LRM 16.14.6) -- the same verdict bit either
             // way, so the same pend.
-            emit_action_pends(matched, *pass_body, active, /*unlikely=*/false, b, l);
+            emit_action_pends(report_pass, *pass_body, active, /*unlikely=*/false, b, l);
         }
 
         // Last in the body, after every root above has read the pre-shift rings.
@@ -7745,8 +8096,24 @@ private:
         ir::Builder         b(module_.pool);
 
         const ir::Index occupied = load_signal(st.occupied, b, l);
+
+        // One report per ATTEMPT here too. A strong attempt
+        // still pending at the end of the trace owes ONE failure however many
+        // obligations of it are unresolved, so slots sharing an attempt id
+        // collapse -- the same grouping the per-cycle verdicts do, and reachable
+        // by the same shape: a ranged antecedent that matched twice near the end.
+        const uint32_t ring    = attempt_ring_size(mon);
+        ir::Index      claimed = ring != 0 ? zero_mask(ring, b, l) : ir::Index{};
         for (uint32_t k = 0; k < mon.depth; ++k) {
-            const ir::Index held = mask_bit(occupied, k, mon.depth, b, l);
+            ir::Index held = mask_bit(occupied, k, mon.depth, b, l);
+            if (ring != 0) {
+                const ir::Index id  = load_signal(st.oid[k], b, l);
+                const ir::Index dup =
+                  mask_any(b.binary(ir::Inst::Tag::Band, id, claimed, l), b, l);
+                held    = b.binary(ir::Inst::Tag::Band, held, bit_not(dup, b, l), l);
+                claimed = b.binary(
+                  ir::Inst::Tag::Bor, claimed, b.select(held, id, zero_mask(ring, b, l), l), l);
+            }
 
             b.open_region();
             if (act.fail != nullptr) {
