@@ -10,23 +10,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # slower than Debug and less debuggable than RelWithDebInfo, and it is silently not
 # what anyone meant, so pick one and say which.
 #
-# RelWithDebInfo rather than Debug, measured on hazard3 (21 files, 1418 processes):
+# Debug, because a bare `cmake` is someone about to work on clotho, and Debug is the
+# build for that: every assert() live, frames that have not been inlined away, and
+# unfinished work (the `synth` command) reachable without extra flags.
 #
-#   full test suite      17.7 s -> 19.7 s   (1.1x)
-#   clotho lint          0.146 s -> 0.521 s (3.6x)
-#   clotho build --emit=ir  0.107 s -> 0.425 s (4.0x)
-#
-# The suite barely moves because it is LLVM-bound, and LLVM is a prebuilt shared
-# library at its own optimization level -- how clotho is compiled does not touch it.
-# The frontend alone is 3.6-4x slower at -O0, and that is the number that matters:
-# `lint` is the CLI linter and the basis of the language server, where the workload
-# is re-analysing a file on every keystroke. 146 ms is interactive and 521 ms is not.
-#
-# What Debug buys in exchange is live asserts (RelWithDebInfo defines NDEBUG) and
-# frontend frames that have not been inlined away. Both are real; `-DCMAKE_BUILD_TYPE=Debug`
-# is the right call when working on the compiler itself rather than on latency.
-#
-# The full matrix, since the three build types mean different things per target:
+# The full matrix, since the three types mean different things per target:
 #
 #   toplevel          frontend                  clotho_runtime
 #   Debug             Debug      (-O0 -g)       -O2 -g  (optimized, asserts ON)
@@ -35,15 +23,28 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 #
 # Debug is for iterating on the compiler, so only the frontend is unoptimized; the
 # runtime is not part of that loop and -O0 there would distort every profile. What
-# Debug does guarantee everywhere is that NDEBUG is unset, so every assert() is live
-# in both columns.
+# Debug guarantees everywhere is that NDEBUG is unset, so every assert() is live in
+# both columns.
 #
-# Neither column covers the JIT-compiled DESIGN: its optimization level is a
-# run-time decision (`-O` on the command line), and LLVM is prebuilt and linked, so
-# it sits at whatever level it was packaged with regardless of any of this.
+# The cost of that default, measured on hazard3 (21 files, 1418 processes):
+#
+#   full test suite         17.7 s -> 19.7 s   (1.1x)
+#   clotho lint             0.146 s -> 0.521 s (3.6x)
+#   clotho build --emit=ir  0.107 s -> 0.425 s (4.0x)
+#
+# The suite barely moves because it is LLVM-bound, and LLVM is a prebuilt shared
+# library at its own optimization level -- how clotho is compiled does not touch it.
+# The frontend alone is 3.6-4x slower, which is the number to remember when working
+# on `lint` latency or the language server: pass -DCMAKE_BUILD_TYPE=RelWithDebInfo
+# for that, and for any performance measurement. CI and tests/perf/perf.py already
+# pin Release explicitly, so neither is affected by this default.
+#
+# Not covered by any of the above, and easy to conflate with it: the JIT-compiled
+# DESIGN's optimization level is a run-time decision (`-O` on the command line), and
+# LLVM is prebuilt and linked at whatever level it was packaged with.
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-  message(STATUS "No CMAKE_BUILD_TYPE set; defaulting to RelWithDebInfo")
-  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+  message(STATUS "No CMAKE_BUILD_TYPE set; defaulting to Debug")
+  set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 endif()
 
 # Warnings apply to clotho targets only, not fetched dependencies. The flags are
@@ -84,17 +85,17 @@ endif()
 
 option(CLOTHO_SANITIZE "Build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
 
-# The `synth` command is not finished, so a Release build does not carry it. Every
-# other build type does, because the default here is RelWithDebInfo and hiding the
-# command from ordinary development would mean nobody runs it.
+# The `synth` command is not finished, so only a Debug build carries it. Debug is
+# the default, so it is reachable by default -- and neither shipped configuration
+# offers a command that is not ready.
 #
 # Only the CLI wiring is conditional. clotho_legalize is always built and always
 # linked into clotho_test, so the analysis and the writer are covered by the full
-# suite in every configuration -- what a Release build skips is argument plumbing.
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-  set(CLOTHO_SYNTH_DEFAULT OFF)
-else()
+# suite in every configuration -- what the others skip is argument plumbing.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   set(CLOTHO_SYNTH_DEFAULT ON)
+else()
+  set(CLOTHO_SYNTH_DEFAULT OFF)
 endif()
 option(CLOTHO_SYNTH "Expose the unfinished `synth` command in the CLI" ${CLOTHO_SYNTH_DEFAULT})
 if(CLOTHO_SANITIZE)
