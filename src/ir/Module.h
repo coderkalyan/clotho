@@ -250,6 +250,40 @@ struct AssertionAutomaton {
     std::vector<uint64_t> guard_states;
 };
 
+// What an abort does to the attempts it covers, once its condition holds. The
+// distinction a monitor-wide reset does not draw: a reset ABANDONS an attempt
+// and leaves no verdict at all, while an accept DISCHARGES it, which is a pass
+// an assert's action block and a cover's tally both count.
+enum class AssertionAbortEffect : uint8_t { Accept, Reject };
+
+// One `accept_on` / `reject_on` and their `sync_` forms (LRM 16.12.7), scoped to
+// part of the property rather than to the whole monitor the way `disable iff`
+// is. Mirrors libsva's sva_monitor_abort_* read-out.
+struct AssertionAbort {
+    // Index into AssertionMonitor::roots of the abort condition.
+    uint32_t root = 0;
+    AssertionAbortEffect effect = AssertionAbortEffect::Reject;
+    // Whether the condition wants the Preponed sample. The `sync_` forms do; the
+    // plain ones read live values, the same mechanism `disable iff` uses.
+    bool sampled = false;
+    // Whether firing settles the whole attempt, or only clears the states in
+    // `mask` and leaves the rest of it running -- a reject under a disjunction
+    // kills its own disjunct and no more.
+    bool resolves_attempt = true;
+    // Whether the abort's scope reaches the antecedent, i.e. it sits ABOVE an
+    // implication rather than below one. Then it also covers the cycles an
+    // attempt spends matching its antecedent, before any obligation exists, and
+    // an antecedent match ending a cycle the condition holds in resolves with
+    // the abort's verdict instead of seeding one. Always false without a
+    // trigger.
+    bool covers_trigger = false;
+    // The obligation states the abort guards, `obligation.words` of them. An
+    // abort is armed for a pending attempt exactly when that attempt can reach a
+    // state in here, which is what confines it to the cycles the property
+    // beneath it is really being evaluated in.
+    std::vector<uint64_t> mask;
+};
+
 struct AssertionMonitor {
     // The directive's source-level label, for a report. Empty when unlabelled.
     std::string label;
@@ -270,6 +304,12 @@ struct AssertionMonitor {
     // Index into `roots` of the disable-iff condition. Always a real root: an
     // assertion that never disables carries a constant false, which folds away.
     uint32_t reset_root = 0;
+    // The aborts scoped to part of the property, in the order libsva lowers
+    // them: INNERMOST first, because lowering appends outward. Where two of them
+    // fire on one attempt in the same cycle the OUTERMOST wins, so a consumer
+    // scans this list backwards -- `accept_on(a) (reject_on(b) p)` with both high
+    // holds, per LRM 16.12.7. Empty for a property with none, the common case.
+    std::vector<AssertionAbort> aborts;
 
     // The antecedent of an implication. `has_trigger` false means the property is
     // a bare sequence and an attempt starts every cycle.

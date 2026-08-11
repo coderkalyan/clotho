@@ -6589,6 +6589,15 @@ private:
         ir::Signal occupied{ 0 };
         // Match tally, for `cover property`.
         ir::Signal covered{ 0 };
+        // One per ASYNCHRONOUS abort, empty entry for a `sync_` one: whether its
+        // condition has been seen high since the last clocking edge. An
+        // asynchronous abort is read live and LRM 16.12.7 evaluates it at the
+        // granularity of the simulation time step, so it can go high and fall
+        // again strictly BETWEEN two ticks (`abx` in tests/sva/diff_abort.sv) --
+        // which the step would otherwise never see, because the monitor runs
+        // every time slot but only acts on an edge. Latching makes the condition
+        // a property of the whole cycle rather than of its final instant.
+        std::vector<ir::Signal> abort_seen;
         // The clock's value at the previous Observed evaluation. An Observed
         // process is resumed once per time slot rather than woken by a net event,
         // so the monitor detects its own clocking edge and needs one slot of
@@ -6635,6 +6644,15 @@ private:
             // its signedness from the target type).
             st.covered = new_monitor_state(base + "cov", mask_type(32), l);
         }
+        st.abort_seen.resize(mon.aborts.size());
+        for (uint32_t i = 0; i < mon.aborts.size(); ++i) {
+            // A `sync_` abort reads the Preponed sample at the edge and has
+            // nothing to remember between ticks, so it gets no latch.
+            if (!mon.aborts[i].sampled) {
+                st.abort_seen[i] =
+                  new_monitor_state(base + "abrt" + std::to_string(i), mask_type(1), l);
+            }
+        }
         st.clkprev = new_monitor_state(base + "clk", mask_type(1), l);
 
         return st;
@@ -6655,6 +6673,60 @@ private:
                                                uint32_t                     index,
                                                uint32_t                     words) {
         return { table.data() + static_cast<size_t>(index) * words, words };
+    }
+
+    // Whether two bit-set rows share a member.
+    static bool rows_intersect(std::span<const uint64_t> a, std::span<const uint64_t> b) {
+        for (size_t w = 0; w < a.size() && w < b.size(); ++w) {
+            if ((a[w] & b[w]) != 0) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Whether this root is evaluated from LIVE values rather than from the
+    // Preponed shadows. Two things read live, and they are the same mechanism at
+    // two scopes: the `disable iff` condition, which LRM 16.15 deliberately does
+    // not sample, and the condition of an asynchronous abort, which LRM 16.12.7
+    // evaluates "at the granularity of the simulation time step like disable
+    // iff". The `sync_` abort forms sample like everything else.
+    static bool root_reads_live(const ir::AssertionMonitor& mon, uint32_t root) {
+        if (root == mon.reset_root) {
+            return true;
+        }
+        for (const ir::AssertionAbort& abort : mon.aborts) {
+            if (!abort.sampled && abort.root == root) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // The obligation states from which the abort's scope is one step away, as a
+    // compile-time row. libsva's reference arms an abort for an attempt when
+    // advancing that attempt's live set with every guard satisfied would land
+    // inside the abort's mask (../libsva/test/backend.c:194-204) -- the states it
+    // COULD reach, not the ones it ends up in, because an abort covers both the
+    // cycle its subtree is entered in and the cycle its last thread dies in, and
+    // the live set has the subtree empty in both.
+    //
+    // That test transposes: `advance(cur, ~0)` is just the union of the follow
+    // rows of `cur`'s members, so it meets the mask exactly when `cur` holds some
+    // state whose follow row does -- one AND against a constant instead of a
+    // whole advance per attempt.
+    static std::vector<uint64_t> abort_arming_row(const ir::AssertionAutomaton& au,
+                                                  const ir::AssertionAbort&     abort) {
+        std::vector<uint64_t> row(au.words, 0);
+        for (uint32_t s = 0; s < au.state_count; ++s) {
+            if (rows_intersect(table_row(au.follow, s, au.words), abort.mask)) {
+                row[s / 64] |= uint64_t{ 1 } << (s % 64);
+            }
+        }
+
+        return row;
     }
 
     // One bit-set row as a single `bit [states-1:0]` constant. The tables arrive
@@ -6997,12 +7069,15 @@ private:
             fail(std::string(name) + " is only supported inside a concurrent assertion expression");
         }
         if (!sva_sampled_) {
-            // The one unsampled root is `disable iff`, which LRM 16.15
-            // deliberately evaluates from live values -- so there is no sampled
-            // value underneath it for these to be built from.
-            // TODO: sampled value functions in a `disable iff` condition.
+            // The unsampled roots are the `disable iff` condition, which LRM 16.15
+            // deliberately evaluates from live values, and an asynchronous abort's
+            // condition, which LRM 16.12.7 puts on the same footing -- so there is
+            // no sampled value underneath either for these to be built from.
+            // TODO: sampled value functions in a `disable iff` or asynchronous
+            // `accept_on` / `reject_on` condition.
             fail(std::string(name) +
-                 " is not supported in a `disable iff` condition, which LRM 16.15 does not sample");
+                 " is not supported in a `disable iff` or asynchronous `accept_on` / "
+                 "`reject_on` condition, which are evaluated from live values");
         }
 
         const auto args = call.arguments();
@@ -7281,14 +7356,17 @@ private:
         SvaHistory hist{ .base = "sva." + std::to_string(id) + ".", .loc = l };
 
         // Roots, one definite bit each. Every one reads the Preponed shadows of
-        // the variables it names except the disable-iff condition, which LRM 16.15
-        // deliberately does not sample (concurrent-assertions.md 5.4).
+        // the variables it names except the ones root_reads_live names: the
+        // disable-iff condition, which LRM 16.15 deliberately does not sample
+        // (concurrent-assertions.md 5.4), and an asynchronous abort's condition,
+        // which is the same rule scoped to one property.
         std::vector<ir::Index> roots;
         roots.reserve(lowered.root_index.size());
         {
             const HistoryScope history(*this, &hist);
             for (uint32_t r = 0; r < lowered.root_index.size(); ++r) {
-                roots.push_back(eval_root(lowered, lowered.root_index[r], r != mon.reset_root, b, l));
+                roots.push_back(
+                  eval_root(lowered, lowered.root_index[r], !root_reads_live(mon, r), b, l));
             }
         }
         // The disable condition (LRM 16.15), and the clocking edge. The monitor
@@ -7313,6 +7391,25 @@ private:
         const ir::Index active =
           b.binary(ir::Inst::Tag::Band, bit_not(roots[mon.reset_root], b, l), edge, l);
 
+        std::vector<ir::Index> abort_cond(mon.aborts.size());
+        for (uint32_t i = 0; i < mon.aborts.size(); ++i) {
+            const ir::Index now = roots[mon.aborts[i].root];
+            if (mon.aborts[i].sampled) {
+                abort_cond[i] = now;
+                continue;
+            }
+            abort_cond[i] =
+              b.binary(ir::Inst::Tag::Bor, load_signal(st.abort_seen[i], b, l), now, l);
+            // Consumed and cleared at every edge, enabled or not -- the window
+            // belongs to the cycle, and a cycle the assertion is disabled for
+            // discards it along with everything else. So the condition is tested
+            // over (previous edge, this edge], with no gap and no double count.
+            b.binary(ir::Inst::Tag::Store,
+                     b.signal(st.abort_seen[i], l),
+                     b.select(edge, zero_mask(1, b, l), abort_cond[i], l),
+                     l);
+        }
+
         const uint32_t  obl   = mon.obligation.state_count;
         const ir::Index sat_o = automaton_satisfy(mon, mon.obligation, roots, b, l);
 
@@ -7333,6 +7430,66 @@ private:
             store_gated(st.trigger, next, active, edge, trig, b, l);
         }
 
+        // An abort whose scope reaches the antecedent resolves at MATCH time --
+        // the cycle the antecedent match ENDS, which for `|=>` is the cycle
+        // BEFORE the obligation would be seeded. Reading the condition at seed
+        // time instead would look at it one cycle late and lose the report
+        // (diff_abort.sv's t=75 is exactly that cycle). So the match is consumed
+        // here: it takes the abort's verdict and `fires` is forced low, which
+        // suppresses the seed for both forms at once -- `|->` reads `fires`
+        // directly and `|=>` reads it through `st.fired`.
+        //
+        // The attempt that has ALREADY been seeded is not this case: it is an
+        // ordinary pending attempt, armed through the mask below because the
+        // scope overlaps the obligation's first states. That is what discharges
+        // `aa` at t=45, and there is no double count because the two are
+        // mutually exclusive -- when this branch fires nothing is seeded.
+        //
+        // Nothing clears the trigger's own live threads, and it is worth saying
+        // why rather than leaving it to be noticed: it would matter only if a
+        // thread could still be part-way through the antecedent when the
+        // condition fires, and libsva refuses that shape outright
+        // (SVA_ERROR_UNSUPPORTED_ABORT_SCOPE) because those attempts each owe a
+        // verdict that a union-tracked trigger cannot count. Every antecedent
+        // that reaches here matches in one cycle, so there is never a thread to
+        // kill. Lift that restriction and clearing the vector is the first thing
+        // this needs.
+        std::optional<ir::Index> trigger_matched;
+        std::optional<ir::Index> trigger_failed;
+        if (mon.has_trigger) {
+            // Backwards: outermost last in the list, and an outer abort beats an
+            // inner verdict landing in the same cycle (LRM 16.12.7).
+            ir::Index claimed = zero_mask(1, b, l);
+            for (uint32_t i = static_cast<uint32_t>(mon.aborts.size()); i-- > 0;) {
+                if (!mon.aborts[i].covers_trigger) {
+                    continue;
+                }
+                const ir::Index fire =
+                  b.binary(ir::Inst::Tag::Band,
+                           b.binary(ir::Inst::Tag::Band, fires, abort_cond[i], l),
+                           bit_not(claimed, b, l),
+                           l);
+                std::optional<ir::Index>& into =
+                  mon.aborts[i].effect == ir::AssertionAbortEffect::Accept ? trigger_matched
+                                                                          : trigger_failed;
+                into = into.has_value() ? b.binary(ir::Inst::Tag::Bor, *into, fire, l) : fire;
+                claimed = b.binary(ir::Inst::Tag::Bor, claimed, abort_cond[i], l);
+            }
+            if (trigger_matched.has_value() || trigger_failed.has_value()) {
+                fires = b.binary(ir::Inst::Tag::Band, fires, bit_not(claimed, b, l), l);
+            }
+        }
+
+        // Which slots each abort is armed for, taken from the live sets BEFORE
+        // they advance -- see abort_arming_row for why that is the right instant.
+        std::vector<ir::Index> arming(mon.aborts.size());
+        for (uint32_t i = 0; i < mon.aborts.size(); ++i) {
+            arming[i] =
+              b.constant(mask_const(abort_arming_row(mon.obligation, mon.aborts[i]), obl), l);
+        }
+        std::vector<std::vector<ir::Index>> armed(mon.aborts.size(),
+                                                  std::vector<ir::Index>(mon.depth));
+
         // Advance every occupied slot. An unoccupied slot already holds 0 (a match
         // zeroes it, and a failure only fires once it is empty), so the guard is
         // belt-and-braces -- but it is what keeps that an invariant rather than an
@@ -7341,8 +7498,16 @@ private:
         std::vector<ir::Index> pending(mon.depth);
         for (uint32_t k = 0; k < mon.depth; ++k) {
             const ir::Index current = load_signal(st.pending[k], b, l);
+            const ir::Index busy    = mask_bit(occupied, k, mon.depth, b, l);
+            for (uint32_t i = 0; i < mon.aborts.size(); ++i) {
+                armed[i][k] = b.binary(
+                  ir::Inst::Tag::Band,
+                  busy,
+                  mask_any(b.binary(ir::Inst::Tag::Band, current, arming[i], l), b, l),
+                  l);
+            }
             const ir::Index stepped = automaton_advance(mon.obligation, current, sat_o, b, l);
-            pending[k] = b.select(mask_bit(occupied, k, mon.depth, b, l), stepped, current, l);
+            pending[k]              = b.select(busy, stepped, current, l);
         }
 
         // Seed. `|->` seeds on the trigger's own last cycle, `|=>` on the cycle
@@ -7360,6 +7525,14 @@ private:
         // obligation's longest match, so an attempt holds its slot for at most
         // depth cycles and the verdicts below free it in the last of them, leaving
         // at most depth - 1 alive when this runs.
+        //
+        // A freshly seeded attempt is armed for any abort whose scope overlaps the
+        // states it starts in, so an abort firing in the cycle an attempt starts
+        // applies to that attempt.
+        std::vector<bool> arms_on_seed(mon.aborts.size());
+        for (uint32_t i = 0; i < mon.aborts.size(); ++i) {
+            arms_on_seed[i] = rows_intersect(mon.obligation.first, mon.aborts[i].mask);
+        }
         ir::Index live      = occupied;
         ir::Index all_taken = true_const(b, l);
         for (uint32_t k = 0; k < mon.depth; ++k) {
@@ -7373,10 +7546,68 @@ private:
             pending[k] = b.select(pick, seed, pending[k], l);
             live       = b.binary(ir::Inst::Tag::Bor, live, claim, l);
             all_taken  = b.binary(ir::Inst::Tag::Band, all_taken, busy, l);
+            for (uint32_t i = 0; i < mon.aborts.size(); ++i) {
+                if (arms_on_seed[i]) {
+                    armed[i][k] = b.binary(ir::Inst::Tag::Bor, armed[i][k], pick, l);
+                }
+            }
         }
 
         if (mon.has_trigger) {
             store_gated(st.fired, fires, active, edge, 1, b, l);
+        }
+
+        // Aborts resolve an attempt early. After seeding, so one firing in the
+        // cycle an attempt starts applies to that attempt, and before the verdicts
+        // below, because resolving early is the whole point
+        // (../libsva/test/backend.c:229-247). Three outcomes, and they are not the
+        // monitor-wide reset's: a reject FAILS the attempt now, an accept
+        // DISCHARGES it -- a pass, which an `else`-less assert reports nothing for
+        // but a pass action block and a cover's tally both see -- and an abort
+        // that does not resolve the whole attempt just clears its own states and
+        // leaves the rest running, which is a reject under a disjunction killing
+        // its own disjunct and no more. A reset does none of the three: it
+        // abandons the attempt and leaves no verdict at all.
+        //
+        // `held` is threaded rather than re-read so that a slot an abort has taken
+        // is out of play for every later abort and for the verdicts, the way
+        // clearing `occupied` does it in the reference. Backwards over the list
+        // again: outermost wins.
+        std::vector<ir::Index>                held(mon.depth);
+        std::vector<std::optional<ir::Index>> aborted_match(mon.depth);
+        std::vector<std::optional<ir::Index>> aborted_fail(mon.depth);
+        for (uint32_t k = 0; k < mon.depth; ++k) {
+            held[k] = mask_bit(live, k, mon.depth, b, l);
+        }
+        for (uint32_t i = static_cast<uint32_t>(mon.aborts.size()); i-- > 0;) {
+            const ir::AssertionAbort& abort = mon.aborts[i];
+            // The states this abort does NOT name, for the partial clear.
+            std::vector<uint64_t> spared(mon.obligation.words, 0);
+            for (uint32_t s = 0; s < obl; ++s) {
+                if ((abort.mask[s / 64] & (uint64_t{ 1 } << (s % 64))) == 0) {
+                    spared[s / 64] |= uint64_t{ 1 } << (s % 64);
+                }
+            }
+            const ir::Index keep_states = b.constant(mask_const(spared, obl), l);
+
+            for (uint32_t k = 0; k < mon.depth; ++k) {
+                const ir::Index fire =
+                  b.binary(ir::Inst::Tag::Band,
+                           b.binary(ir::Inst::Tag::Band, abort_cond[i], armed[i][k], l),
+                           held[k],
+                           l);
+                if (!abort.resolves_attempt) {
+                    pending[k] = b.select(
+                      fire, b.binary(ir::Inst::Tag::Band, pending[k], keep_states, l), pending[k], l);
+                    continue;
+                }
+                std::optional<ir::Index>& into =
+                  abort.effect == ir::AssertionAbortEffect::Accept ? aborted_match[k]
+                                                                   : aborted_fail[k];
+                into       = into.has_value() ? b.binary(ir::Inst::Tag::Bor, *into, fire, l) : fire;
+                pending[k] = b.select(fire, zero_mask(obl, b, l), pending[k], l);
+                held[k]    = b.binary(ir::Inst::Tag::Band, held[k], bit_not(fire, b, l), l);
+            }
         }
 
         // Verdicts. Seeding before taking them is not incidental: under `|->` a
@@ -7387,25 +7618,41 @@ private:
         std::vector<ir::Index> failed(mon.depth);
         ir::Index              remaining = zero_mask(mon.depth, b, l);
         for (uint32_t k = 0; k < mon.depth; ++k) {
-            const ir::Index held = mask_bit(live, k, mon.depth, b, l);
             const ir::Index done = mask_any(b.binary(ir::Inst::Tag::Band, pending[k], last, l), b, l);
             const ir::Index empty = bit_not(mask_any(pending[k], b, l), b, l);
 
-            matched[k] = b.binary(ir::Inst::Tag::Band, held, done, l);
+            matched[k] = b.binary(ir::Inst::Tag::Band, held[k], done, l);
             failed[k]  = b.binary(ir::Inst::Tag::Band,
-                                 held,
+                                 held[k],
                                  b.binary(ir::Inst::Tag::Band, bit_not(done, b, l), empty, l),
                                  l);
 
             // Either verdict frees the slot; only a match has a vector left to
             // clear, since a failure is what an empty vector means.
             const ir::Index resolved = b.binary(ir::Inst::Tag::Bor, matched[k], failed[k], l);
-            const ir::Index keep = b.binary(ir::Inst::Tag::Band, held, bit_not(resolved, b, l), l);
+            const ir::Index keep = b.binary(ir::Inst::Tag::Band, held[k], bit_not(resolved, b, l), l);
             const ir::Index still =
               b.select(keep, slot_mask(k, mon.depth, b, l), zero_mask(mon.depth, b, l), l);
 
             pending[k] = b.select(matched[k], zero_mask(obl, b, l), pending[k], l);
             remaining  = b.binary(ir::Inst::Tag::Bor, remaining, still, l);
+
+            // An abort's verdict is the attempt's verdict, so it joins the slot's
+            // own -- after `remaining`, which an aborted slot is already out of.
+            if (aborted_match[k].has_value()) {
+                matched[k] = b.binary(ir::Inst::Tag::Bor, matched[k], *aborted_match[k], l);
+            }
+            if (aborted_fail[k].has_value()) {
+                failed[k] = b.binary(ir::Inst::Tag::Bor, failed[k], *aborted_fail[k], l);
+            }
+        }
+        // A trigger-covering abort's verdict belongs to an attempt that never
+        // reached a slot, so it rides alongside the per-slot ones.
+        if (trigger_matched.has_value()) {
+            matched.push_back(*trigger_matched);
+        }
+        if (trigger_failed.has_value()) {
+            failed.push_back(*trigger_failed);
         }
 
         store_gated(st.occupied, remaining, active, edge, mon.depth, b, l);
@@ -7415,10 +7662,12 @@ private:
 
         if (mon.kind == ir::AssertionKind::Cover) {
             // A cover counts matches and never reports (LRM 16.12.6). More than one
-            // attempt can complete in a cycle, so this is a sum and not a flag.
+            // attempt can complete in a cycle, so this is a sum and not a flag. Over
+            // `matched` rather than the slots, because an accept discharging a
+            // trigger-covering attempt is a match with no slot behind it.
             ir::Index count = load_signal(st.covered, b, l);
-            for (uint32_t k = 0; k < mon.depth; ++k) {
-                count = b.binary(ir::Inst::Tag::Add, count, b.resize(matched[k], mask_type(32), l), l);
+            for (const ir::Index bit : matched) {
+                count = b.binary(ir::Inst::Tag::Add, count, b.resize(bit, mask_type(32), l), l);
             }
             store_gated(st.covered, count, active, edge, 32, b, l);
         } else {
@@ -7880,17 +8129,18 @@ private:
     }
 
     // Register a shadow for every variable the assertion's boolean roots read.
-    // The reset root is skipped: LRM 16.15 evaluates `disable iff` from live
-    // values, so a variable appearing only there needs no shadow and must not pay
-    // for one. Atom lowering resolves a read through sva_shadow_of as well, so
-    // this pass is not what makes a shadow exist -- it fixes the copy order to the
-    // source's atom order rather than to the order the monitor happens to emit in.
+    // The roots root_reads_live names are skipped -- `disable iff` and the
+    // asynchronous aborts read live values, so a variable appearing only there
+    // needs no shadow and must not pay for one. Atom lowering resolves a read
+    // through sva_shadow_of as well, so this pass is not what makes a shadow
+    // exist -- it fixes the copy order to the source's atom order rather than to
+    // the order the monitor happens to emit in.
     void sva_sample_roots(const sva::Result& lowered) {
         ankerl::unordered_dense::set<uint32_t> atoms;
         ankerl::unordered_dense::set<uint32_t> seen;
         std::vector<uint32_t>                  work;
         for (uint32_t r = 0; r < lowered.root_index.size(); r++) {
-            if (r != lowered.monitor.reset_root) {
+            if (!root_reads_live(lowered.monitor, r)) {
                 work.push_back(lowered.root_index[r]);
             }
         }

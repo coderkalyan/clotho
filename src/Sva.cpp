@@ -591,16 +591,7 @@ public:
             case AssertionExprKind::Case:
                 return case_select(expr.as<slang::ast::CaseAssertionExpr>(), strength, expr);
             case AssertionExprKind::Abort:
-                // TODO: `accept_on` / `reject_on` and their `sync_` forms
-                // (LRM 16.12.14) -- phase 2 of docs/design/sva-property-layer.md.
-                // libsva builds and lowers these, but the abort table it produces
-                // (sva_monitor_abort_*) has nowhere to go: ir::AssertionMonitor
-                // carries no abort list and the emitted step has no arm for one,
-                // so building the node here would DROP the operator and turn a
-                // discharge or a failure into silence.
-                return reject("the `accept_on` / `reject_on` property operators are not "
-                              "supported yet",
-                              &expr);
+                return abort_on(expr.as<slang::ast::AbortAssertionExpr>(), strength, expr);
             default:
                 break;
         }
@@ -989,6 +980,42 @@ public:
             return reject("out of memory building an assertion property", &blame);
         }
         return node;
+    }
+
+    // `accept_on` / `reject_on` and their `sync_` forms (LRM 16.12.7), all four
+    // one node kind with `action` and `isSync` picking between them.
+    //
+    // Unlike a junction or a followed-by, this one does NOT refuse a
+    // trigger-carrying operand: an abort above an implication is the shape
+    // essentially every real use writes, and pushing it below is not an
+    // equivalent rewrite -- below the implication the abort only arms once the
+    // consequent starts, so it misses the attempt's own cycle. libsva carries the
+    // scope instead (sva_monitor_abort_covers_trigger) and refuses the residue it
+    // cannot get right, a trigger whose antecedent takes more than one cycle,
+    // with SVA_ERROR_UNSUPPORTED_ABORT_SCOPE.
+    std::optional<sva_node> abort_on(const slang::ast::AbortAssertionExpr& node,
+                                     sva_strength strength, const AssertionExpr& blame) {
+        const bool accept = node.action == slang::ast::AbortAssertionExpr::Accept;
+        // The plain forms read the condition from live values and the `sync_`
+        // ones from the Preponed sample, which is what the kind tells libsva --
+        // it cannot check that the caller honours it, so the split is made here
+        // and nowhere else.
+        const sva_abort kind = accept ? (node.isSync ? SVA_ABORT_SYNC_ACCEPT : SVA_ABORT_ACCEPT)
+                                      : (node.isSync ? SVA_ABORT_SYNC_REJECT : SVA_ABORT_REJECT);
+
+        const auto cond = boolean(node.condition, false, &blame);
+        if (!cond) {
+            return std::nullopt;
+        }
+        const auto operand = property(node.expr, strength);
+        if (!operand) {
+            return std::nullopt;
+        }
+        sva_node out = 0;
+        if (sva_prop_abort(&ir_, kind, *cond, *operand, &out) != SVA_OK) {
+            return reject("out of memory building an assertion property", &blame);
+        }
+        return out;
     }
 
     // -- Guarded selection (LRM 16.12.16-16.12.17) ---------------------------
@@ -1431,10 +1458,22 @@ Result lower(const Request& request) {
                             "strength, so the pair has no single end-of-trace disposition";
                 break;
             case SVA_ERROR_UNSUPPORTED_ABORT_SCOPE:
+                // Two shapes share this code. The second is the residue of the
+                // abort-above-an-implication support: with a multi-cycle
+                // antecedent, several attempts can sit part-way through it when
+                // the condition fires, each owing its own verdict, and the
+                // trigger is their union rather than a per-attempt ring -- so
+                // the count cannot be recovered. A one-cycle antecedent has no
+                // partial match to lose and is exact.
+                // TODO: a multi-cycle antecedent under an abort needs the
+                // trigger tracked per attempt; see phase 2 of
+                // docs/design/sva-property-layer.md.
                 out.error = "an `accept_on` / `reject_on` sits below an operator that "
                             "renumbers its operand's states -- a property `and`, an "
                             "`always [m:n]` or a followed-by -- so the states the abort "
-                            "names cannot be carried through";
+                            "names cannot be carried through, or it covers an implication "
+                            "whose antecedent takes more than one cycle to match, whose "
+                            "part-matched attempts cannot be told apart";
                 break;
             case SVA_ERROR_STATE_LIMIT:
                 out.error = "the assertion needs more automaton states than the limit allows";
@@ -1482,6 +1521,24 @@ Result lower(const Request& request) {
     read_automaton(&monitor, sva_monitor_obligation(&monitor), built.obligation);
     if (built.has_trigger) {
         read_automaton(&monitor, sva_monitor_trigger(&monitor), built.trigger);
+    }
+
+    // The scoped aborts. After the obligation, whose `words` sizes each mask.
+    const uint32_t aborts = sva_monitor_abort_count(&monitor);
+    built.aborts.reserve(aborts);
+    for (uint32_t i = 0; i < aborts; i++) {
+        // Never an SVA_ABORT_SYNC_* value here -- whether the condition is
+        // sampled is reported separately, so the effect is just the verdict.
+        const bool accept = sva_monitor_abort_effect(&monitor, i) == SVA_ABORT_ACCEPT;
+        const uint64_t* mask = sva_monitor_abort_mask(&monitor, i);
+        built.aborts.push_back(ir::AssertionAbort{
+            .root = sva_monitor_abort_root(&monitor, i),
+            .effect = accept ? ir::AssertionAbortEffect::Accept : ir::AssertionAbortEffect::Reject,
+            .sampled = sva_monitor_abort_sampled(&monitor, i),
+            .resolves_attempt = sva_monitor_abort_resolves_attempt(&monitor, i),
+            .covers_trigger = sva_monitor_abort_covers_trigger(&monitor, i),
+            .mask = std::vector<uint64_t>(mask, mask + built.obligation.words),
+        });
     }
 
     // Root expressions, in the monitor's order. The caller emits one 1-bit

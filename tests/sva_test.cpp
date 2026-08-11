@@ -2581,19 +2581,271 @@ TEST_CASE("a branch of an if or case property that is an implication is refused"
             "branch of an `if` or `case`");
 }
 
-TEST_CASE("the abort operators are refused until the monitor carries an abort table") {
-    // Phase 2. libsva builds and lowers all four, but the abort table it produces
-    // (sva_monitor_abort_*) has nowhere to go yet: ir::AssertionMonitor carries no
-    // abort list and the emitted step has no arm for one, so building the node here
-    // would DROP the operator -- turning a discharge or a failure into silence,
-    // which the project forbids. See docs/design/sva-property-layer.md phase 2 for
-    // the second blocker, which is libsva's own.
-    for (const std::string_view op :
-         { "accept_on", "reject_on", "sync_accept_on", "sync_reject_on" }) {
-        const LowerResult r = lower_text(
-            one_assertion("bit a, b, c;", std::string(op) + " (c) (a |=> b)"));
-        CHECK_FALSE_MESSAGE(r.ok, op);
-        CHECK_MESSAGE(r.diagnostic_text().find("`accept_on` / `reject_on`") != std::string::npos,
-                      r.diagnostic_text());
+TEST_CASE("all four abort operators lower, carrying effect and sampling") {
+    struct Case {
+        std::string_view         op;
+        ir::AssertionAbortEffect effect;
+        bool                     sampled;
+    };
+    for (const Case& c : { Case{ "accept_on", ir::AssertionAbortEffect::Accept, false },
+                           Case{ "reject_on", ir::AssertionAbortEffect::Reject, false },
+                           Case{ "sync_accept_on", ir::AssertionAbortEffect::Accept, true },
+                           Case{ "sync_reject_on", ir::AssertionAbortEffect::Reject, true } }) {
+        LowerResult       r;
+        const ir::Module& m = lower_for_monitor(
+          one_assertion("bit a, b, c;", std::string(c.op) + " (c) (a |=> b)"), r);
+        REQUIRE_MESSAGE(r.ok, c.op);
+
+        const ir::AssertionMonitor& mon = only_monitor(m);
+        REQUIRE_MESSAGE(mon.aborts.size() == 1, c.op);
+        CHECK_MESSAGE(mon.aborts[0].effect == c.effect, c.op);
+        // The `sync_` pair reads the Preponed sample; the plain pair is evaluated
+        // at the granularity of the simulation time step and reads live, which is
+        // the rule `disable iff` already follows.
+        CHECK_MESSAGE(mon.aborts[0].sampled == c.sampled, c.op);
+        // Above the implication, so the scope reaches the antecedent, and it
+        // settles the whole attempt rather than clearing part of it.
+        CHECK_MESSAGE(mon.aborts[0].covers_trigger, c.op);
+        CHECK_MESSAGE(mon.aborts[0].resolves_attempt, c.op);
     }
+}
+
+TEST_CASE("an abort below an implication does not cover the trigger") {
+    // The distinction the whole construction turns on, and the reason clotho must
+    // not rewrite one shape into the other: above the implication the abort covers
+    // the attempt's own cycle, below it the abort only arms once the consequent
+    // starts. Different properties, so the flag has to separate them.
+    LowerResult                 above;
+    const ir::AssertionMonitor& hi = only_monitor(
+      lower_for_monitor(one_assertion("bit a, b, c;", "accept_on (c) (a |=> b)"), above));
+    REQUIRE(above.ok);
+    REQUIRE(hi.aborts.size() == 1);
+    CHECK(hi.aborts[0].covers_trigger);
+
+    LowerResult                 below;
+    const ir::AssertionMonitor& lo = only_monitor(
+      lower_for_monitor(one_assertion("bit a, b, c;", "a |=> accept_on (c) b"), below));
+    REQUIRE(below.ok);
+    REQUIRE(lo.aborts.size() == 1);
+    CHECK_FALSE(lo.aborts[0].covers_trigger);
+}
+
+TEST_CASE("the monitor reads a plain abort condition live and a sync one sampled") {
+    LowerResult       async;
+    const ir::Module& am = lower_for_monitor(
+      one_assertion("bit a, b, c;", "accept_on (c) (a |=> b)"), async);
+    REQUIRE(async.ok);
+
+    const ir::Process& ap = monitor_process(am);
+    CHECK(touches(am, ap, "sva.shadow.a"));
+    // LRM 16.12.7 puts the plain forms on `disable iff`'s footing, so the
+    // condition is read live and pays for no shadow. The latch beside it is what
+    // lets a pulse between two ticks still be seen.
+    CHECK(touches(am, ap, "c"));
+    CHECK_FALSE(touches(am, ap, "sva.shadow.c"));
+    CHECK(find_signal(am, "sva.0.abrt0") != nullptr);
+
+    LowerResult       sync;
+    const ir::Module& sm = lower_for_monitor(
+      one_assertion("bit a, b, c;", "sync_accept_on (c) (a |=> b)"), sync);
+    REQUIRE(sync.ok);
+
+    const ir::Process& sp = monitor_process(sm);
+    CHECK(touches(sm, sp, "sva.shadow.c"));
+    // Nothing to remember between ticks, so no latch.
+    CHECK(find_signal(sm, "sva.0.abrt0") == nullptr);
+}
+
+TEST_CASE("an accept discharges an attempt where a reset abandons it") {
+    // The distinction `disable iff` does not draw, and the reason an abort needs a
+    // table of its own rather than reusing the reset root. Same trace, same
+    // condition, same underlying property, and the pending attempt is resolved in
+    // both -- but an accept resolves it to a PASS an action block sees, while a
+    // reset leaves no verdict at all.
+    //
+    // `c` rises strictly after tick 1 and is still high at tick 2, so the attempt
+    // tick 1's antecedent match seeds into tick 2 is what both wrappers act on.
+    const std::string out = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, c = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ac: assert property (@(posedge clk) accept_on (c) (a |=> b)) $display("ACCEPT-PASS");
+  rs: assert property (@(posedge clk) disable iff (c) a |=> b) $display("RESET-PASS");
+  initial begin
+    @(posedge clk);            // cyc0
+    a <= 1;
+    @(posedge clk);            // cyc1: a high, seeds an obligation into cyc2
+    a <= 0;
+    @(posedge clk);            // cyc2: b low, so the attempt would fail here
+    @(posedge clk);
+    $finish;
+  end
+  initial begin
+    #22 c = 1;                 // after tick 1 (15), before tick 2 (25)
+    #10 c = 0;                 // t=32
+  end
+endmodule
+)");
+    CHECK(out.find("ACCEPT-PASS") != std::string::npos);
+    CHECK(out.find("RESET-PASS") == std::string::npos);
+    // Neither reports: the accept discharged the attempt and the reset threw it
+    // away, so the failure `b` would otherwise have caused is gone from both. That
+    // is what makes the pass action the only thing separating them.
+    CHECK(out.find("assertion failed") == std::string::npos);
+}
+
+TEST_CASE("a reject fails a covered attempt that would otherwise have passed") {
+    // The mask path: the attempt is already seeded when the condition fires. `b` is
+    // high at tick 2, so the attempt matches there and an unaborted monitor reports
+    // nothing at all -- the reject turns that pass into a failure, which is the only
+    // way to show the operator doing something an ordinary failure could not.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 1, c = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) reject_on (c) (a |=> b));
+  initial begin
+    @(posedge clk);            // cyc0
+    a <= 1;
+    @(posedge clk);            // cyc1: a high, seeds into cyc2
+    a <= 0;
+    @(posedge clk);            // cyc2: b high, so this attempt matches -- but c is high
+    @(posedge clk);
+    $finish;
+  end
+  initial begin
+    #22 c = 1;                 // after tick 1 (15), before tick 2 (25)
+    #6  c = 0;                 // t=28
+  end
+endmodule
+)") == "25");
+}
+
+TEST_CASE("an abort covering a trigger resolves the attempt in its own start cycle") {
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 1, c = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) reject_on (c) (a |=> b));
+  initial begin
+    @(posedge clk);            // cyc0
+    a <= 1;
+    @(posedge clk);            // cyc1: a high AND c high, so it is rejected here
+    a <= 0;
+    @(posedge clk);            // cyc2: b high, so it would otherwise have passed
+    @(posedge clk);
+    $finish;
+  end
+  initial begin
+    #12 c = 1;                 // between tick 0 (5) and tick 1 (15)
+    #6  c = 0;                 // t=18
+  end
+endmodule
+)") == "15");
+}
+
+TEST_CASE("only the synchronous abort forms miss a pulse between two ticks") {
+    // The async/sync split, and the one place the two accept forms differ. `c`
+    // pulses strictly between ticks 1 and 2, so BOTH ticks sample it low: the
+    // synchronous form cannot see it and the failure at tick 2 stands, while the
+    // asynchronous form is evaluated at every simulation time step (LRM 16.12.7)
+    // and discharges its attempt.
+    //
+    // One report, from `sa` alone. Sample the plain form too and both report,
+    // giving `25 25`; read the `sync_` form live and neither does.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, c = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  aa: assert property (@(posedge clk) accept_on      (c) (a |=> b));
+  sa: assert property (@(posedge clk) sync_accept_on (c) (a |=> b));
+  initial begin
+    @(posedge clk);            // cyc0
+    a <= 1;
+    @(posedge clk);            // cyc1: a high, seeds into cyc2
+    a <= 0;
+    @(posedge clk);            // cyc2: b low, so the attempt fails unless discharged
+    @(posedge clk);
+    $finish;
+  end
+  initial begin
+    #18 c = 1;                 // strictly between tick 1 (15) and tick 2 (25)
+    #4  c = 0;                 // t=22
+  end
+endmodule
+)") == "25");
+}
+
+TEST_CASE("an abort over an implication with a multi-cycle antecedent is refused") {
+    // The residue of abort-above-an-implication support, and it stays loud rather
+    // than under-reporting. With a one-cycle antecedent, an antecedent match ending
+    // this cycle is exactly this cycle's one attempt. With a longer one, several
+    // attempts can be part-way through the antecedent when the condition fires;
+    // each owes its own verdict, and the trigger automaton is their union rather
+    // than a per-attempt ring, so the count cannot be recovered.
+    refuses(one_assertion("bit a, b, c, d;", "accept_on (c) ((a ##1 d) |=> b)"),
+            "more than one cycle");
+    refuses(one_assertion("bit a, b, c, d;", "reject_on (c) ((a ##1 d) |=> b)"),
+            "more than one cycle");
+
+    // A one-cycle antecedent is exact, and stays supported.
+    LowerResult ok;
+    lower_for_monitor(one_assertion("bit a, b, c;", "accept_on (c) (a |=> b)"), ok);
+    CHECK(ok.ok);
+}
+
+TEST_CASE("where two aborts fire on one attempt, the outermost wins") {
+    // LRM 16.12.14: the outer accept makes the overall evaluation TRUE, whatever
+    // the inner reject would have said. Outermost is LAST in the monitor's abort
+    // list, because lowering appends outward, so the step scans that list
+    // backwards -- scanning it forwards lets the innermost take the attempt and
+    // turns this pass into a failure. libsva had exactly that bug in both its own
+    // step and its reference backend; this is the third implementation of the
+    // rule, so it gets its own check rather than relying on theirs.
+    //
+    // Both aborts sit BELOW the implication, so this is the mask path: one
+    // seeded attempt, two aborts armed on it. `b` is high, so the attempt matches
+    // on its own and every report below is the aborts' doing.
+    const auto reports = [](std::string_view drive) {
+        return report_times(std::string(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 1, x = 0, y = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) a |=> accept_on (x) (reject_on (y) b));
+  initial begin
+    @(posedge clk);            // cyc0
+    a <= 1;
+    @(posedge clk);            // cyc1: seeds into cyc2
+    a <= 0;
+    @(posedge clk);            // cyc2: the attempt resolves here
+    @(posedge clk);
+    $finish;
+  end
+  initial begin )") + std::string(drive) + R"( end
+endmodule
+)");
+    };
+
+    // Neither condition: the attempt matches on `b`, so nothing is reported and
+    // the two cases below are both departures from a silent baseline.
+    CHECK(reports("") == "");
+    // The inner reject alone turns that match into a failure, which is what makes
+    // the last case a genuine precedence test rather than a reject that never
+    // fired.
+    CHECK(reports("#22 y = 1;") == "25");
+    // The outer accept alone discharges it.
+    CHECK(reports("#22 x = 1;") == "");
+    // Both, on the same stimulus that reports when only the reject is high. The
+    // outer accept overrides it; innermost-wins would read `25`.
+    CHECK(reports("#22 x = 1; y = 1;") == "");
 }
