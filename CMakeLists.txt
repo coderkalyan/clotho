@@ -111,7 +111,13 @@ include(FetchContent)
 # System LLVM. Used by the backend for native codegen. This install ships LLVM
 # as a single shared library, so prefer the `LLVM` imported target; fall back
 # to per-component static libs if only those are present.
-find_package(LLVM REQUIRED CONFIG)
+# NO_SYSTEM_ENVIRONMENT_PATH: do not infer LLVM's location from PATH.
+#
+# CMake otherwise searches the parent of every PATH entry, so a machine with ROCm
+# installed (/opt/rocm/bin on PATH) finds /opt/rocm/llvm before the system LLVM.
+# That copy is built without RTTI and cannot link clotho_ir. Which LLVM to use is
+# not something PATH should decide -- pass -DLLVM_DIR=... to choose deliberately.
+find_package(LLVM REQUIRED CONFIG NO_SYSTEM_ENVIRONMENT_PATH)
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION} at ${LLVM_DIR}")
 if(NOT LLVM_VERSION_MAJOR EQUAL 22)
   message(FATAL_ERROR "Clotho requires LLVM 22, found ${LLVM_PACKAGE_VERSION}")
