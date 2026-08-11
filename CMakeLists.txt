@@ -37,6 +37,20 @@ else()
 endif()
 
 option(CLOTHO_SANITIZE "Build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
+
+# The `synth` command is not finished, so a Release build does not carry it. Every
+# other build type does, because the default here is RelWithDebInfo and hiding the
+# command from ordinary development would mean nobody runs it.
+#
+# Only the CLI wiring is conditional. clotho_legalize is always built and always
+# linked into clotho_test, so the analysis and the writer are covered by the full
+# suite in every configuration -- what a Release build skips is argument plumbing.
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+  set(CLOTHO_SYNTH_DEFAULT OFF)
+else()
+  set(CLOTHO_SYNTH_DEFAULT ON)
+endif()
+option(CLOTHO_SYNTH "Expose the unfinished `synth` command in the CLI" ${CLOTHO_SYNTH_DEFAULT})
 if(CLOTHO_SANITIZE)
   if(MSVC)
     message(FATAL_ERROR "CLOTHO_SANITIZE requires a GCC/Clang driver")
@@ -255,7 +269,14 @@ if(WIN32)
 endif()
 # `clotho` links clotho_ir_core, NOT the code generator, so the CLI names
 # clotho_ir itself — it is the consumer that actually emits and JITs.
-target_link_libraries(clotho_cli PRIVATE clotho clotho_ir clotho_legalize clotho_warnings)
+if(CLOTHO_SYNTH)
+  target_link_libraries(clotho_cli PRIVATE clotho clotho_ir clotho_legalize clotho_warnings)
+  target_compile_definitions(clotho_cli PRIVATE CLOTHO_SYNTH)
+else()
+  # Without the command there is nothing to link, which restores exactly the
+  # property S0 established: the shipped simulator contains no legalization.
+  target_link_libraries(clotho_cli PRIVATE clotho clotho_ir clotho_warnings)
+endif()
 
 # `clotho --version`. The git hash is resolved at configure time; a source tree
 # without git (a release tarball) reports "unknown" rather than failing.

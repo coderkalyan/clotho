@@ -17,8 +17,10 @@
 #include "ir/Jit.h"
 #include "ir/LlvmBackend.h"
 #include "ir/Printer.h"
+#ifdef CLOTHO_SYNTH
 #include "legalize/Legalize.h"
 #include "legalize/Materialize.h"
+#endif
 
 // Thin driver over libclotho / libclotho_ir: take SystemVerilog sources, run
 // them through the lowering pipeline, then write the compiled artifact
@@ -137,6 +139,7 @@ void register_options(slang::CommandLine& cl, Options& o) {
            "if C also calls back into the design; a .so is enough for imports alone",
            "<path>",
            slang::CommandLineFlags::FilePath);
+#ifdef CLOTHO_SYNTH
     cl.add("--sidecar",
            o.sidecar,
            "[synth] Also write the JSON sidecar here: what the SystemVerilog cannot carry -- the "
@@ -165,6 +168,7 @@ void register_options(slang::CommandLine& cl, Options& o) {
     cl.add("--parallel-case",
            o.parallel_case,
            "[synth] Believe `parallel_case` and `unique0`: the arms are treated as mutually exclusive");
+#endif
     cl.add("--perf-jitdump",
            o.perf_jitdump,
            "[run] Let `perf` see names for the design's compiled code (writes a jitdump under "
@@ -178,15 +182,32 @@ constexpr std::string_view kOverview =
   "  build   compile the design and write the generated code, without running it\n"
   "  run     compile the design and simulate it\n"
   "  lint    check the design and report problems, without compiling or running it\n"
+#ifdef CLOTHO_SYNTH
   "  synth   write the design back out as synthesizable SystemVerilog\n"
+#endif
   "\n"
   "Clotho's own options come first below, then the source-reading options it shares\n"
+#ifdef CLOTHO_SYNTH
   "with slang, the SystemVerilog front end it is built on. A [build], [run] or\n"
   "[synth] tag marks an option only that command accepts.\n"
+#else
+  "with slang, the SystemVerilog front end it is built on. A [build] or [run] tag\n"
+  "marks an option only that command accepts.\n"
+#endif
   "\n"
   "An argument starting with '+' that is not an option goes to the design itself,\n"
   "for $test$plusargs and $value$plusargs to read while it runs (LRM 21.6). Use\n"
   "'--' to stop that and pass everything after it through as written.";
+
+// The commands this build actually has. `synth` is compiled out of a Release
+// build, and a usage message that offers a command the binary will then reject is
+// worse than one that never mentions it.
+constexpr std::string_view kCommandList =
+#ifdef CLOTHO_SYNTH
+  "'build', 'run', 'lint' or 'synth'";
+#else
+  "'build', 'run' or 'lint'";
+#endif
 
 int usage_error(std::string_view message) {
     std::println(stderr, "clotho: {}", message);
@@ -359,7 +380,7 @@ int main(int argc, char** argv) {
     };
 
     if (argc < 2) {
-        return usage_error("no command; expected 'build', 'run', 'lint' or 'synth'");
+        return usage_error(std::format("no command; expected {}", kCommandList));
     }
     Command command = Command::Run;
     {
@@ -370,8 +391,10 @@ int main(int argc, char** argv) {
             command = Command::Run;
         } else if (first == "lint") {
             command = Command::Lint;
+#ifdef CLOTHO_SYNTH
         } else if (first == "synth") {
             command = Command::Synth;
+#endif
         } else if (first == "-h" || first == "--help") {
             // Help and version stand alone, with no command.
             print_help();
@@ -380,7 +403,7 @@ int main(int argc, char** argv) {
             print_version();
             return 0;
         } else {
-            return usage_error(std::format("unknown command '{}'; expected 'build', 'run', 'lint' or 'synth'", first));
+            return usage_error(std::format("unknown command '{}'; expected {}", first, kCommandList));
         }
     }
 
@@ -546,6 +569,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+#ifdef CLOTHO_SYNTH
     if (command == Command::Synth) {
         clotho::legalize::SynthConfig cfg;
         if (options.target.has_value()) {
@@ -590,6 +614,7 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
+#endif
 
     if (command == Command::Run) {
         const auto resolve = loc_resolver(result);
