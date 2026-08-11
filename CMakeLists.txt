@@ -255,7 +255,7 @@ if(WIN32)
 endif()
 # `clotho` links clotho_ir_core, NOT the code generator, so the CLI names
 # clotho_ir itself — it is the consumer that actually emits and JITs.
-target_link_libraries(clotho_cli PRIVATE clotho clotho_ir clotho_warnings)
+target_link_libraries(clotho_cli PRIVATE clotho clotho_ir clotho_legalize clotho_warnings)
 
 # `clotho --version`. The git hash is resolved at configure time; a source tree
 # without git (a release tarball) reports "unknown" rather than failing.

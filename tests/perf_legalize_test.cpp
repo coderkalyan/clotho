@@ -272,7 +272,10 @@ TEST_CASE("PERF materialize round-trips real designs" * doctest::skip()) {
         // statements. It has to reach the same classification as the original, or
         // "structural translation" would be a claim rather than a property.
         {
-            const std::string plain = legalize::materialize(*r.module, nullptr);
+            // Flat explicitly: this comparison keys on the flat name mangling, and
+            // flat is the oracle the hierarchical mode is checked against separately.
+            const std::string plain =
+              legalize::materialize(*r.module, nullptr, { .hierarchy = legalize::Hierarchy::Flat });
             CHECK(plain.find("not renderable") == std::string::npos);
             const LowerResult reparsed = lower_text(plain);
             REQUIRE_MESSAGE(reparsed.ok, reparsed.diagnostic_text());
@@ -312,7 +315,7 @@ TEST_CASE("PERF materialize round-trips real designs" * doctest::skip()) {
             CHECK(se == 0);
         }
 
-        const std::string text = legalize::materialize(*r.module, &before);
+        const std::string text = legalize::materialize(*r.module, &before, { .hierarchy = legalize::Hierarchy::Flat });
         CHECK(text.find("unrenderable") == std::string::npos);
 
         const LowerResult again = lower_text(text);

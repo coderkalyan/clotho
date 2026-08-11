@@ -1338,8 +1338,11 @@ std::string errors_as_2005(std::string_view text) {
 TEST_CASE("the 2005 target emits reg and wire, never logic") {
     const LowerResult r = lower_text(wrap("always @(posedge clk) q <= a;"));
     REQUIRE(r.ok);
-    const legalize::Result res  = legalize::run(*r.module, nullptr, { .keep_guards = true });
-    const std::string      text = legalize::materialize(*r.module, &res, { .target = legalize::Target::V2005 });
+    const legalize::Result res = legalize::run(*r.module, nullptr, { .keep_guards = true });
+    // Flat explicitly: this is about DECLARATION keywords, and hierarchical mode
+    // turns these same signals into ports, where the rule differs.
+    const std::string text = legalize::materialize(
+      *r.module, &res, { .target = legalize::Target::V2005, .hierarchy = legalize::Hierarchy::Flat });
     CHECK(text.find("logic") == std::string::npos);
     CHECK(text.find("reg [7:0] q;") != std::string::npos);
     // Never written by any process, so a wire.

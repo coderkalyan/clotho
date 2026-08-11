@@ -35,7 +35,7 @@ enum class Hierarchy : uint8_t {
 
 struct SynthConfig {
     Target    target    = Target::SV2017;
-    Hierarchy hierarchy = Hierarchy::Flat;
+    Hierarchy hierarchy = Hierarchy::Instances;
 
     // Rebuild each written signal's mux tree from its guarded list and write out
     // the arms the source left implicit. Requires a Result; without one the writer
