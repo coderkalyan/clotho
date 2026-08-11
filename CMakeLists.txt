@@ -6,6 +6,30 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# CMake's own default is an EMPTY build type: no -O, no -g, no NDEBUG. That is
+# slower than Debug and less debuggable than RelWithDebInfo, and it is silently not
+# what anyone meant, so pick one and say which.
+#
+# RelWithDebInfo rather than Debug, measured on hazard3 (21 files, 1418 processes):
+#
+#   full test suite      17.7 s -> 19.7 s   (1.1x)
+#   clotho lint          0.146 s -> 0.521 s (3.6x)
+#   clotho build --emit=ir  0.107 s -> 0.425 s (4.0x)
+#
+# The suite barely moves because it is LLVM-bound, and LLVM is a prebuilt shared
+# library at its own optimization level -- how clotho is compiled does not touch it.
+# The frontend alone is 3.6-4x slower at -O0, and that is the number that matters:
+# `lint` is the CLI linter and the basis of the language server, where the workload
+# is re-analysing a file on every keystroke. 146 ms is interactive and 521 ms is not.
+#
+# What Debug buys in exchange is live asserts (RelWithDebInfo defines NDEBUG) and
+# frontend frames that have not been inlined away. Both are real; `-DCMAKE_BUILD_TYPE=Debug`
+# is the right call when working on the compiler itself rather than on latency.
+#
+# Two things this is NOT about, because they are decided elsewhere and are easy to
+# conflate with it: clotho_runtime is pinned to -O3 in every configuration (see the
+# comment on that target), and the optimization level of the JIT-compiled DESIGN is
+# the `-O` command-line flag, independent of how clotho itself was built.
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   message(STATUS "No CMAKE_BUILD_TYPE set; defaulting to RelWithDebInfo")
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
@@ -235,6 +259,21 @@ add_library(clotho_ir STATIC
   src/ir/Jit.cpp
 )
 target_include_directories(clotho_ir PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${LLVM_INCLUDE_DIRS})
+# A machine with ROCm installed has a second LLVM under /opt/rocm, and
+# find_package picks it over the system one. That copy is built without RTTI, so
+# LlvmBackend.cpp emits references to `typeinfo for llvm::CallbackVH` that nothing
+# provides -- and the only symptom is an inscrutable link failure two minutes into
+# the build, long after configure said everything was fine.
+#
+# Fail here instead, naming the fix. Clotho needs RTTI: LlvmBackend derives from
+# LLVM types whose typeinfo has to come from the LLVM libraries.
+if(DEFINED LLVM_ENABLE_RTTI AND NOT LLVM_ENABLE_RTTI)
+  message(FATAL_ERROR
+    "the LLVM found at ${LLVM_DIR} was built without RTTI, which cannot link clotho_ir.\n"
+    "  Point at an RTTI-enabled LLVM, e.g.:\n"
+    "    cmake -S . -B build -DLLVM_DIR=/usr/lib/cmake/llvm")
+endif()
+
 target_compile_definitions(clotho_ir PUBLIC ${LLVM_DEFINITIONS})
 target_link_libraries(clotho_ir PUBLIC clotho_ir_core clotho_runtime ${LLVM_LIBS})
 target_link_libraries(clotho_ir PRIVATE clotho_warnings)
