@@ -2851,7 +2851,7 @@ private:
         if (t.kind == ir::Type::Kind::Queue || t.kind == ir::Type::Kind::DynArray) {
             // A queue / dynamic-array leaf compares element-wise at runtime
             // (rt_container_eq); its element must be one the runtime handles.
-            guard_container_p_element(t.element);
+            guard_container_p_element(t.element, /*sty=*/nullptr);
             return;
         }
         if (value_cat(type) == ValueCat::handle) {
@@ -4459,7 +4459,7 @@ private:
         const ir::Index     rhs  = lower_expr(a.right(), b);
         const ir::Index     pred = not_forced(fi, /*also_assign=*/true, b, l);
         b.open_region();
-        b.binary(tag, lower_lvalue(a.left(), b), rhs, l);
+        b.binary(tag, lower_lvalue(a.left(), b, /*is_write=*/true), rhs, l);
         const ir::ExtraSlice then_r = b.close_region();
         b.open_region();
         const ir::ExtraSlice else_r = b.close_region();
@@ -9022,11 +9022,13 @@ private:
           c, report_no_match, report_no_match ? banner_at(c.sourceRange.start()) : std::string{}, loc(c), b);
     }
 
-    // One arm of a collected if / else-if chain: the condition and the statement
-    // it guards.
+    // One arm of a collected if / else-if chain: the arm's cond_predicate and the
+    // statement it guards. The predicate is a span because `&&&` makes a
+    // cond_predicate a list of AND-ed conditions, each either a plain boolean
+    // expression or an `expr matches pattern` (LRM 12.4 / 12.6.2).
     struct IfArm {
-        const Expression* cond;
-        const Statement*  body;
+        std::span<const ConditionalStatement::Condition> conds;
+        const Statement*                                 body;
     };
 
     // Eager lowering for unique / unique0 `if` (LRM 12.4.2). The else-if spine is
@@ -9046,13 +9048,7 @@ private:
         const Statement*            final_else = nullptr;
         const ConditionalStatement* cur        = &c;
         for (;;) {
-            if (cur->conditions.size() != 1) {
-                fail("unsupported multi-condition if");
-            }
-            if (cur->conditions[0].pattern != nullptr) {
-                fail("pattern matching in conditions is not supported");
-            }
-            arms.push_back({ &*cur->conditions[0].expr, &cur->ifTrue });
+            arms.push_back({ cur->conditions, &cur->ifTrue });
             if (cur->ifFalse == nullptr) {
                 break;
             }
@@ -9072,7 +9068,14 @@ private:
         std::vector<ir::Index> preds;
         preds.reserve(arms.size());
         for (const IfArm& arm : arms) {
-            preds.push_back(lower_predicate(*arm.cond, b));
+            // Every arm's cond_predicate is evaluated once, up front — including any
+            // pattern bindings and `&&&` filters. LRM 12.4.2 permits any-order eager
+            // evaluation for unique/unique0 (overlap detection requires continuing
+            // past the first true condition), and binding a non-selected arm's
+            // pattern variables is harmless: each is a pure sub-value extraction read
+            // only inside the arm its own predicate guards. Same discipline as
+            // lower_pattern_case_checked.
+            preds.push_back(lower_conditions(arm.conds, b, loc(*arm.conds.front().expr)));
         }
 
         emit_overlap_check(preds, banner, rloc, b);
@@ -11447,6 +11450,43 @@ private:
         return members;
     }
 
+    // An enum's name table for `enum_name`: each member's value as its must-plane
+    // bytes plus its source name. The value buffers must outlive the builder call,
+    // so they travel with the rows; `valbufs` is reserved up front so the spans in
+    // `rows` never dangle behind a reallocation.
+    struct EnumNameTable {
+        std::vector<std::vector<uint8_t>>     valbufs;
+        std::vector<ir::Builder::EnumNameRow> rows;
+    };
+
+    EnumNameTable enum_name_table(const slang::ast::EnumType& et) {
+        // Each member value becomes its must-plane bytes ((width+7)/8), so a base
+        // wider than 64 bits round-trips; the runtime byte-compares.
+        const std::vector<EnumMember> members = enum_members(et);
+        const uint32_t                width   = et.bitWidth;
+        const uint32_t                vbytes  = (width + 7) / 8;
+        const uint32_t                words   = (width + 63) / 64;
+        EnumNameTable                 tbl;
+        tbl.valbufs.reserve(members.size());
+        tbl.rows.reserve(members.size());
+        for (const EnumMember& m : members) {
+            const slang::SVInt&   v      = m.value;
+            const uint64_t*       raw    = v.getRawPtr();
+            const bool            unk    = v.hasUnknown();
+            const uint32_t        vwords = (static_cast<uint32_t>(v.getBitWidth()) + 63) / 64;
+            std::vector<uint64_t> vplane(std::max(words, vwords), 0);
+            for (uint32_t i = 0; i < vwords; ++i) {
+                // VPI aval (must plane): value bits, with unknown bits cleared.
+                vplane[i] = unk ? (raw[i] ^ raw[vwords + i]) : raw[i];
+            }
+            std::vector<uint8_t> vb(vbytes, 0);
+            std::memcpy(vb.data(), vplane.data(), vbytes);
+            tbl.valbufs.push_back(std::move(vb));
+            tbl.rows.push_back({ std::span<const uint8_t>(tbl.valbufs.back()), m.name });
+        }
+        return tbl;
+    }
+
     // Lower an enum method (LRM 6.19.2-6.19.5). The receiver is arguments()[0].
     ir::Index lower_enum_method(std::string_view            name,
                                 const slang::ast::EnumType& et,
@@ -11472,31 +11512,11 @@ private:
         // the value is not a member. Delegated to a runtime scan of a per-type
         // member table (a string result rules out a frontend select).
         if (name == "name") {
-            // Each member value becomes its must-plane bytes ((width+7)/8), so a
-            // base wider than 64 bits round-trips; the runtime byte-compares.
-            const uint32_t                        width  = et.bitWidth;
-            const uint32_t                        vbytes = (width + 7) / 8;
-            const uint32_t                        words  = (width + 63) / 64;
-            std::vector<std::vector<uint8_t>>     valbufs;
-            std::vector<ir::Builder::EnumNameRow> rows;
-            valbufs.reserve(members.size());
-            rows.reserve(members.size());
-            for (const EnumMember& m : members) {
-                const slang::SVInt&   v      = m.value;
-                const uint64_t*       raw    = v.getRawPtr();
-                const bool            unk    = v.hasUnknown();
-                const uint32_t        vwords = (static_cast<uint32_t>(v.getBitWidth()) + 63) / 64;
-                std::vector<uint64_t> vplane(std::max(words, vwords), 0);
-                for (uint32_t i = 0; i < vwords; ++i) {
-                    // VPI aval (must plane): value bits, with unknown bits cleared.
-                    vplane[i] = unk ? (raw[i] ^ raw[vwords + i]) : raw[i];
-                }
-                std::vector<uint8_t> vb(vbytes, 0);
-                std::memcpy(vb.data(), vplane.data(), vbytes);
-                valbufs.push_back(std::move(vb));
-                rows.push_back({ std::span<const uint8_t>(valbufs.back()), m.name });
-            }
-            return b.enum_name(lower_expr(*call.arguments()[0], b), rows, l);
+            // `.name()` yields "" for a non-member value (LRM 6.19.2), so no
+            // format fallback — that is `%p`'s rule, not this method's.
+            const EnumNameTable tbl = enum_name_table(et);
+            return b.enum_name(lower_expr(*call.arguments()[0], b), tbl.rows,
+                               /*fmt_fallback=*/false, l);
         }
 
         // next(N)/prev(N) (LRM 6.19.5): the Nth member after/before the current
@@ -12527,26 +12547,49 @@ private:
     }
 
     // Expand a %p operand (LRM §21.2.1.6) into assignment-pattern text plus its
-    // per-leaf value args. A scalar renders as its decimal value; a fixed unpacked
-    // array / unpacked struct renders `'{e0, e1, ...}` recursively. Integral and
-    // real leaves only (a string / handle leaf is guarded).
+    // per-leaf value args. An unpacked array / struct renders `'{e0, e1, ...}`
+    // recursively; the clause's four named singular cases (tagged union, plain
+    // union, packed struct, enum) render through expand_p_packed; anything else is
+    // an integral / real leaf. The slang type is threaded alongside the lowered one
+    // because taggedness, member names, and enum membership live only in the AST —
+    // `ir::Type` keeps a tagged union indistinguishable from a plain packed union
+    // by design (docs/design/tagged-unions.md).
     void expand_p_arg(const Expression& arg, std::string& frag, std::vector<ir::Index>& args, ir::Builder& b) {
-        const ir::Ref        ty        = lower_type(*arg.type);
-        const ir::Type::Kind k         = std::get<ir::Type>(module_.pool.get(ty)).kind;
-        const bool           container = k == ir::Type::Kind::Queue || k == ir::Type::Kind::DynArray;
+        const ir::Ref           ty        = lower_type(*arg.type);
+        const ir::Type::Kind    k         = std::get<ir::Type>(module_.pool.get(ty)).kind;
+        const bool              container = k == ir::Type::Kind::Queue || k == ir::Type::Kind::DynArray;
+        const slang::ast::Type& sty       = *arg.type;
+        const ir::SourceLoc     l         = loc(arg);
         if (!is_agg_abi_ref(ty) && !container) {
+            // A singular operand: take it as an rvalue, so an arbitrary expression
+            // (a call, a concat) works and not just an addressable variable.
+            if (expand_p_packed(lower_expr(arg, b), sty, frag, args, b, l)) {
+                return;
+            }
             frag += "%0d";
             args.push_back(lower_expr(arg, b));
             return;
         }
-        expand_p_lvalue(lower_lvalue(unwrap_conversion(arg), b), ty, frag, args, b, loc(arg));
+        expand_p_lvalue(lower_lvalue(unwrap_conversion(arg), b), ty, &sty, frag, args, b, l);
     }
 
     // Guard the element type of a `%p`'d queue / dynamic array: the runtime
     // formatter renders integral (width <= 64), real, and string leaves; a
     // wider or nested-aggregate element is a documented follow-up (a non-POD
     // element is already rejected in lower_type).
-    void guard_container_p_element(ir::Ref elem) {
+    // A tagged-union element is refused rather than rendered flat: the runtime
+    // container descriptor carries no member names, so it could only print the raw
+    // bit-vector where LRM 21.2.1.6 requires `tag:value`. `sty` is the container's
+    // slang type when known.
+    void guard_container_p_element(ir::Ref elem, const slang::ast::Type* sty) {
+        if (sty != nullptr) {
+            const slang::ast::Type* et = sty->getCanonicalType().getArrayElementType();
+            if (et != nullptr && et->isTaggedUnion()) {
+                // TODO: %p of a queue / dynamic array of tagged unions (needs the
+                // per-member name table threaded into rt_container_format_p).
+                fail("%p of a queue / dynamic array of tagged unions is not supported");
+            }
+        }
         const ir::Type e = std::get<ir::Type>(module_.pool.get(elem));
         if (e.kind == ir::Type::Kind::String || module_.pool.is_float(elem)) {
             return;
@@ -12564,14 +12607,136 @@ private:
         fail("%p of a queue / dynamic array with a nested aggregate element is not supported");
     }
 
+    // The Scope side of a union type, whose members carry the names and payload
+    // widths `%p` and the LRM 11.9 check need. Type itself does not derive Scope, so
+    // the cast goes through the concrete union type.
+    static const Scope& union_scope(const slang::ast::Type& ct) {
+        return ct.isPackedUnion() ? static_cast<const Scope&>(ct.as<slang::ast::PackedUnionType>())
+                                  : static_cast<const Scope&>(ct.as<slang::ast::UnpackedUnionType>());
+    }
+
+    // Bits [lsb, lsb+width(fty)) of the packed rvalue `v`, as a value of type
+    // `fty`. Used to walk a packed struct / union member without needing an lvalue,
+    // so a `%p` operand may be any expression and not just an addressable variable.
+    ir::Index packed_slice(ir::Index v, uint32_t lsb, ir::Ref fty, ir::Builder& b, ir::SourceLoc l) {
+        ir::Index x = v;
+        if (lsb != 0) {
+            const ir::Index sh = b.constant(module_.pool.put_int(make_int_type(32, false, false), lsb), l);
+            x                  = b.binary(ir::Inst::Tag::Srl, v, sh, l);
+        }
+        return b.resize(x, fty, l);
+    }
+
+    // Render a singular (packed) operand under `%p` from its rvalue, for the four
+    // cases LRM 21.2.1.6 names explicitly. Returns false for anything else, which
+    // the caller renders as an ordinary integral / real leaf.
+    bool expand_p_packed(ir::Index               v,
+                         const slang::ast::Type& sty,
+                         std::string&            frag,
+                         std::vector<ir::Index>& args,
+                         ir::Builder&            b,
+                         ir::SourceLoc           l) {
+        const slang::ast::Type& ct = sty.getCanonicalType();
+        if (ct.isTaggedUnion()) {
+            // "In the case of a tagged union, it shall print "tag:value" along with
+            // the currently valid element." Which member that is only the run-time
+            // tag knows, so this is the one %p shape that renders in the runtime
+            // rather than expanding to literal text here.
+            std::vector<ir::Builder::TaggedFmtRow> rows;
+            for (const auto& f : union_scope(ct).membersOfType<FieldSymbol>()) {
+                const slang::ast::Type& mt = f.getType();
+                rows.push_back(
+                  { f.name, mt.isVoid() ? 0u : static_cast<uint32_t>(mt.getBitWidth()) });
+            }
+            frag += "%s";
+            args.push_back(b.tagged_fmt_p(v, module_.pool.layout(lower_type(sty)).width,
+                                          union_tag_bits(ct), rows, l));
+            return true;
+        }
+        if (ct.isPackedUnion() || ct.isUnpackedUnion()) {
+            // "For unions, only the first declared elements shall be printed." Every
+            // member overlays the LSBs, so the first one is the low bits of the flat
+            // value. (An unpacked union lands here too: Clotho gives it the same flat
+            // representation.)
+            for (const auto& f : union_scope(ct).membersOfType<FieldSymbol>()) {
+                const slang::ast::Type& mt = f.getType();
+                frag += "'{";
+                frag += f.name;
+                frag += ':';
+                expand_p_scalar(packed_slice(v, 0, lower_type(mt), b, l), mt, frag, args, b, l);
+                frag += "}";
+                return true;
+            }
+            return false; // a member-less union cannot occur, but do not assume it
+        }
+        if (ct.isStruct()) {
+            // "A packed structure data type shall print its value as an assignment
+            // pattern with named elements. Each element shall be printed under one of
+            // these rules" — so a nested packed struct / union / enum member recurses.
+            // (Only the packed form reaches here; an unpacked struct is an aggregate
+            // and took the lvalue path.)
+            frag += "'{";
+            bool first = true;
+            for (const auto& f : static_cast<const Scope&>(ct.as<slang::ast::PackedStructType>())
+                                   .membersOfType<FieldSymbol>()) {
+                if (!first) {
+                    frag += ", ";
+                }
+                first                      = false;
+                const slang::ast::Type& mt = f.getType();
+                frag += f.name;
+                frag += ':';
+                expand_p_scalar(packed_slice(v, static_cast<uint32_t>(f.bitOffset), lower_type(mt), b, l),
+                                mt, frag, args, b, l);
+            }
+            frag += "}";
+            return true;
+        }
+        if (ct.isEnum()) {
+            // "An enumerated data type shall print its value as an enumeration name
+            // if the value is valid for that type. Otherwise the value shall print
+            // according to the base type of the enumeration" — the fallback the
+            // runtime applies when no member matches.
+            frag += "%s";
+            const EnumNameTable tbl = enum_name_table(ct.as<slang::ast::EnumType>());
+            args.push_back(b.enum_name(v, tbl.rows, /*fmt_fallback=*/true, l));
+            return true;
+        }
+        return false;
+    }
+
+    // A `%p` element that is already an rvalue: one of the four named singular
+    // cases, else the ordinary integral / real leaf.
+    void expand_p_scalar(ir::Index               v,
+                         const slang::ast::Type& sty,
+                         std::string&            frag,
+                         std::vector<ir::Index>& args,
+                         ir::Builder&            b,
+                         ir::SourceLoc           l) {
+        if (expand_p_packed(v, sty, frag, args, b, l)) {
+            return;
+        }
+        frag += module_.pool.is_float(lower_type(sty)) ? "%g" : "'h%0h";
+        args.push_back(v);
+    }
+
+    // `sty`, when non-null, is the slang type matching `ty`; it is threaded down so
+    // a nested tagged union / packed struct / plain union / enum leaf can be
+    // rendered per LRM 21.2.1.6 (none of which `ir::Type` can distinguish). Null
+    // only where the slang type is genuinely unavailable, which falls back to the
+    // plain integral leaf.
     void expand_p_lvalue(ir::Index               lv,
                          ir::Ref                 ty,
+                         const slang::ast::Type* sty,
                          std::string&            frag,
                          std::vector<ir::Index>& args,
                          ir::Builder&            b,
                          ir::SourceLoc           l) {
         const ir::Type t = std::get<ir::Type>(module_.pool.get(ty));
         if (t.kind == ir::Type::Kind::UnpackedArray) {
+            const slang::ast::Type* est =
+              sty != nullptr ? &sty->getCanonicalType().as<slang::ast::FixedSizeUnpackedArrayType>().elementType
+                             : nullptr;
             frag += "'{";
             const uint32_t n = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
             for (uint32_t k = 0; k < n; ++k) {
@@ -12584,24 +12749,35 @@ private:
                   b.constant(module_.pool.put_int(make_int_type(32, false, true),
                                                   static_cast<uint64_t>(static_cast<int64_t>(coord))),
                              l);
-                expand_p_lvalue(b.elem_select(lv, idx, ty, l), t.element, frag, args, b, l);
+                expand_p_lvalue(b.elem_select(lv, idx, ty, l), t.element, est, frag, args, b, l);
             }
             frag += "}";
             return;
         }
         if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
-            // `'{field:val, ...}` — the member names are emitted (matching the
-            // available %p oracle, verilator; the LRM leaves the exact layout
-            // implementation-defined).
+            // `'{field:val, ...}` — LRM 21.2.1.6 requires the member names for an
+            // unpacked struct ("an assignment pattern with named elements"); the leaf
+            // radix and white space it leaves implementation-defined.
             frag += "'{";
             const auto fields = module_.pool.struct_fields(t.fields_id);
+            // Field order is declaration order on both sides, so the slang members
+            // line up with the lowered field table index for index.
+            std::vector<const slang::ast::Type*> mts;
+            if (sty != nullptr) {
+                for (const auto& f : static_cast<const Scope&>(
+                       sty->getCanonicalType().as<slang::ast::UnpackedStructType>())
+                                       .membersOfType<FieldSymbol>()) {
+                    mts.push_back(&f.getType());
+                }
+            }
             for (uint32_t i = 0; i < fields.size(); ++i) {
                 if (i != 0) {
                     frag += ", ";
                 }
                 frag += module_.pool.field_name(fields[i]);
                 frag += ':';
-                expand_p_lvalue(b.member_select(lv, i, ty, l), fields[i].type, frag, args, b, l);
+                expand_p_lvalue(b.member_select(lv, i, ty, l), fields[i].type,
+                                i < mts.size() ? mts[i] : nullptr, frag, args, b, l);
             }
             frag += "}";
             return;
@@ -12609,7 +12785,7 @@ private:
         if (t.kind == ir::Type::Kind::Queue || t.kind == ir::Type::Kind::DynArray) {
             // A queue / dynamic-array leaf renders at runtime over its live element
             // count (LRM 21.2.1.6), spliced in as a `%s` string argument.
-            guard_container_p_element(t.element);
+            guard_container_p_element(t.element, sty);
             frag += "%s";
             args.push_back(b.container_fmt_p(lv, ty, l));
             return;
@@ -12618,10 +12794,38 @@ private:
             // TODO: %p of a string leaf (needs the element string rendering path).
             fail("%p of a string aggregate leaf is not supported");
         }
-        // Integral leaves render in hex with a `'h` base tag; reals as %g (matching
-        // verilator's %p leaf format).
+        // A singular leaf. With the slang type in hand this may still be one of LRM
+        // 21.2.1.6's named cases (a nested tagged union, packed struct, plain union,
+        // or enum); otherwise it is an integral / real leaf.
+        const ir::Index v = b.unary(ir::Inst::Tag::Load, lv, l);
+        if (sty != nullptr) {
+            expand_p_scalar(v, *sty, frag, args, b, l);
+            return;
+        }
         frag += module_.pool.is_float(ty) ? "%g" : "'h%0h";
-        args.push_back(b.unary(ir::Inst::Tag::Load, lv, l));
+        args.push_back(v);
+    }
+
+    // Offset of the first `%p` in `fmt` that is a real conversion, skipping any
+    // `%%` escape. `%%p` is a literal percent followed by the letter p, so its
+    // `%p` substring must not be spliced over — doing so both corrupts the escape
+    // and leaves the actual specifier behind for the runtime formatter to reject.
+    // Fragments already spliced for earlier `%p` args never contain a bare `%p`,
+    // so scanning from the start always lands on the pending one.
+    static size_t find_p_spec(std::string_view fmt) {
+        for (size_t i = 0; i + 1 < fmt.size(); ++i) {
+            if (fmt[i] != '%') {
+                continue;
+            }
+            if (fmt[i + 1] == '%') {
+                ++i; // consume the escape, so its second % cannot start a match
+                continue;
+            }
+            if (fmt[i + 1] == 'p') {
+                return i;
+            }
+        }
+        return std::string::npos;
     }
 
     void build_format(std::span<const Expression* const> format_args,
@@ -12676,8 +12880,7 @@ private:
                     // spliced specs appear, so positional matching stays correct.
                     std::string frag;
                     expand_p_arg(*arg, frag, args, b);
-                    const size_t pos = fmt.find("%p");
-                    if (pos != std::string::npos) {
+                    if (const size_t pos = find_p_spec(fmt); pos != std::string::npos) {
                         fmt.replace(pos, 2, frag);
                     }
                     continue;
@@ -13079,13 +13282,14 @@ private:
                         const auto v = cv.integer().as<uint64_t>();
                         if (v && *v == 0) {
                             const ir::Index val0 = lower_expr(a.right(), b);
-                            b.binary(ir::Inst::Tag::StoreNb, lower_lvalue(a.left(), b), val0, loc(a));
+                            b.binary(ir::Inst::Tag::StoreNb, lower_lvalue(a.left(), b, /*is_write=*/true), val0,
+                                     loc(a));
                             return val0;
                         }
                     }
                     const ir::Index val   = lower_expr(a.right(), b);
                     const ir::Index delay = scaled_delay(delay_expr, b);
-                    b.store_nb_delay(lower_lvalue(a.left(), b), val, delay, loc(a));
+                    b.store_nb_delay(lower_lvalue(a.left(), b, /*is_write=*/true), val, delay, loc(a));
                     return val;
                 }
                 // Event / repeat-event form: `x <= @e y` / `x <= repeat(N) @e y`.
@@ -13126,7 +13330,7 @@ private:
                     fail("nonblocking intra-assignment multi-signal event trigger is not supported");
                 }
                 const ir::Index val = lower_expr(a.right(), b);
-                b.store_nb_event(lower_lvalue(a.left(), b),
+                b.store_nb_event(lower_lvalue(a.left(), b, /*is_write=*/true),
                                  val,
                                  count,
                                  events[0].signal,
@@ -13149,7 +13353,7 @@ private:
                 store_concat(a.left().as<ConcatenationExpression>(), rhs, ir::Inst::Tag::Store, b, loc(a));
                 return rhs;
             }
-            b.binary(ir::Inst::Tag::Store, lower_lvalue(a.left(), b), rhs, loc(a));
+            b.binary(ir::Inst::Tag::Store, lower_lvalue(a.left(), b, /*is_write=*/true), rhs, loc(a));
             return rhs;
         }
         if (a.isNonBlocking() && fn_ctx_ != nullptr) {
@@ -13280,25 +13484,11 @@ private:
             store_concat(a.left().as<ConcatenationExpression>(), rhs, tag, b, loc(a));
             return rhs;
         }
-        if (a.left().kind == ExpressionKind::MemberAccess &&
-            a.left().as<MemberAccessExpression>().value().type->getCanonicalType().isTaggedUnion()) {
-            // Direct member write to a tagged union (LRM 7.3.2): store the payload
-            // to the member's low bits AND set the tag high bits to the member's
-            // index — unlike a plain union, whose member store leaves the rest
-            // untouched (docs/design/tagged-unions.md).
-            // TODO: a compound (`u.m += v`) or concat-embedded (`{u.m,..} = v`)
-            // member write reaches this point via lower_compound_assign /
-            // store_concat above and so does NOT update the tag. Correct when the
-            // member is already active (the common case); the tag is stale only
-            // when the prior tag differed, where the RMW already read an inactive
-            // member (undefined). Full tag-on-every-member-write is a Phase 2
-            // cleanup alongside pattern matching.
-            const auto& ma = a.left().as<MemberAccessExpression>();
-            b.binary(tag, lower_member_lvalue(ma, b, loc(a)), rhs, loc(a));
-            store_union_tag(ma.value(), ma.member.as<FieldSymbol>().fieldIndex, tag, b, loc(a));
-            return rhs;
-        }
-        b.binary(tag, lower_lvalue(a.left(), b), rhs, loc(a));
+        // A tagged-union member write needs no special case: LRM 11.9 forbids it
+        // from moving the tag (only a whole-value `tagged` expression does that), so
+        // it is an ordinary narrowing store over the member's part-select, guarded
+        // against the current tag inside lower_member_lvalue.
+        b.binary(tag, lower_lvalue(a.left(), b, /*is_write=*/true), rhs, loc(a));
         return rhs;
     }
 
@@ -13688,7 +13878,9 @@ private:
             // path below is packed-only; a string char write uses str_putc).
             fail("compound assignment to a string is not supported");
         }
-        const ir::Index                lv    = lower_lvalue(a.left(), b);
+        // A compound assignment reads then writes the same member, so one guard
+        // covers both; the write wording is the more specific of the two.
+        const ir::Index                lv    = lower_lvalue(a.left(), b, /*is_write=*/true);
         const std::optional<ir::Index> saved = compound_lv_;
         compound_lv_                         = lv;
         const ir::Index rhs                  = lower_expr(a.right(), b);
@@ -13744,7 +13936,7 @@ private:
                 }
                 store_concat_ops(nested->elements(), val, tag, b, l);
             } else {
-                b.binary(tag, lower_lvalue(op, b), val, l);
+                b.binary(tag, lower_lvalue(op, b, /*is_write=*/true), val, l);
             }
             offset += op.type->getBitWidth();
         }
@@ -14888,27 +15080,54 @@ private:
         return b.concat(parts, l);
     }
 
-    // Write the tag high bits of a tagged union to `idx` (a member's fieldIndex).
-    // A direct member write `u.m = e` (LRM 7.3.2) sets the payload AND the tag,
-    // unlike a plain union where a member store leaves the rest untouched. No-op
-    // for a union with no tag bits (single-member).
-    void store_union_tag(const Expression& union_expr,
-                         uint32_t          idx,
-                         ir::Inst::Tag     tag,
-                         ir::Builder&      b,
-                         ir::SourceLoc     l) {
-        const slang::ast::Type& ct       = union_expr.type->getCanonicalType();
-        const uint32_t          tag_bits = union_tag_bits(ct);
+    // Guard one tagged-union member access against the union's current tag (LRM
+    // 11.9): "Members of tagged unions can be read or assigned using the usual dot
+    // notation. Such accesses are completely type-checked, i.e., the value read or
+    // assigned shall be consistent with the current tag. In general, this can
+    // require a run-time check. An attempt to read or assign a value whose type is
+    // inconsistent with the tag results in a run-time error."
+    //
+    // So a member write does NOT retag: LRM 7.3.2 says "the tag and value can only
+    // be updated together consistently using a statically type-checked tagged union
+    // expression", and 11.9's own example calls `i1.Add = '{19, 4, 3};` legal "only
+    // if the instruction variable i1 currently has tag Add". The whole-value
+    // `tagged` setter (lower_tagged_union_set) remains the only way the tag moves.
+    //
+    // `base` is the union's already-computed lvalue, so nothing is re-evaluated.
+    // Emits nothing when no tag value can disagree: a plain (untagged) union, or a
+    // single-member tagged union, whose one member is always the active one.
+    void check_union_tag(const MemberAccessExpression& ma,
+                         const FieldSymbol&            field,
+                         ir::Index                     base,
+                         bool                          is_write,
+                         ir::Builder&                  b,
+                         ir::SourceLoc                 l) {
+        const slang::ast::Type& ct = ma.value().type->getCanonicalType();
+        if (!ct.isTaggedUnion()) {
+            return;
+        }
+        const uint32_t tag_bits = union_tag_bits(ct);
         if (tag_bits == 0) {
             return;
         }
-        const ir::Ref   uty  = lower_type(*union_expr.type);
-        const auto      lay  = module_.pool.layout(uty);
-        const bool      four = lay.domain == ir::Domain::Four;
-        const ir::Index base = lower_lvalue(union_expr, b);
-        const ir::Index sel  = b.part_select(base, lay.width - 1, lay.width - tag_bits, l);
-        const ir::Index tagc = b.constant(module_.pool.put_int(make_int_type(tag_bits, four, false), idx), l);
-        b.binary(tag, sel, tagc, l);
+        const auto lay = module_.pool.layout(lower_type(*ma.value().type));
+        // The tag is the high `tag_bits` of the flat value; read it off the same
+        // lvalue the member select is about to use.
+        const ir::Index tagv =
+          b.unary(ir::Inst::Tag::Load, b.part_select(base, lay.width - 1, lay.width - tag_bits, l), l);
+
+        // Member names in tag order (a field's tag value IS its fieldIndex), so the
+        // report can name whichever tag the union turns out to hold. Both union types
+        // derive Scope, but Type itself does not, so the cast goes through the
+        // concrete type.
+        const Scope& sc = ct.isPackedUnion()
+                            ? static_cast<const Scope&>(ct.as<slang::ast::PackedUnionType>())
+                            : static_cast<const Scope&>(ct.as<slang::ast::UnpackedUnionType>());
+        std::vector<std::string_view> names;
+        for (const auto& f : sc.membersOfType<FieldSymbol>()) {
+            names.push_back(f.name);
+        }
+        b.tagged_check(tagv, field.fieldIndex, is_write, field.name, names, l);
     }
 
     // Lower a pattern (LRM 12.6) against a subject rvalue `subject` of type `sty`,
@@ -15176,7 +15395,10 @@ private:
     // struct member access (`x.outer.inner`) composes for free: the base
     // lvalue is itself a part-select, and part-select-of-a-part-select
     // already works (the same shape a multi-dimensional packed select uses).
-    ir::Index lower_member_lvalue(const MemberAccessExpression& ma, ir::Builder& b, ir::SourceLoc l) {
+    // `is_write` only selects the wording of the LRM 11.9 diagnostic (see
+    // check_union_tag); the guard itself is identical for a read and a write.
+    ir::Index lower_member_lvalue(const MemberAccessExpression& ma, ir::Builder& b, ir::SourceLoc l,
+                                  bool is_write = false) {
         if (const auto* prop = ma.member.as_if<slang::ast::ClassPropertySymbol>()) {
             if (prop->lifetime == slang::ast::VariableLifetime::Static) {
                 // `obj.static_prop` (LRM 8.9): the shared slot, not the object body.
@@ -15202,6 +15424,10 @@ private:
         // unpacked union lowers to the same flat plane value as a packed union
         // (max member width / domain), just with possibly-different member widths.
         const ir::Index base = lower_lvalue(ma.value(), b);
+        // Every tagged-union member access — read, write, ref argument, force,
+        // $fread target — funnels through here, so this is the one place the LRM
+        // 11.9 tag check has to be planted.
+        check_union_tag(ma, *field, base, is_write, b, l);
         // An unpacked struct is an aggregate: the member is addressed by field
         // index (MemberSelect -> struct GEP), not a bit range. A packed struct/union
         // (and an unpacked union) is a flat bit-vector, so the member is a constant
@@ -15215,7 +15441,7 @@ private:
     }
 
     // Lower an expression as an lvalue, returning the lvalue index (no Load).
-    ir::Index lower_lvalue(const Expression& expr, ir::Builder& b) {
+    ir::Index lower_lvalue(const Expression& expr, ir::Builder& b, bool is_write = false) {
         const ir::SourceLoc l = loc(expr);
         switch (expr.kind) {
             case ExpressionKind::Assignment:
@@ -15247,7 +15473,7 @@ private:
                 return lower_range_select(rs, base, b, l);
             }
             case ExpressionKind::MemberAccess:
-                return lower_member_lvalue(expr.as<MemberAccessExpression>(), b, l);
+                return lower_member_lvalue(expr.as<MemberAccessExpression>(), b, l, is_write);
             case ExpressionKind::Call:
                 // A dynamic-array / queue-returning call is an lvalue: its result
                 // handle (allocated by the backend) is read by an assignment /

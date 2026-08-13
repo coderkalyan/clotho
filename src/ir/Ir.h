@@ -820,6 +820,60 @@ struct EnumNameEntry {
 struct EnumNameInfo {
     // The member rows, as back-to-back EnumNameEntry records.
     ExtraSlice entries;
+    // 1 when a value matching no member renders as a `'h<hex>` leaf rather than ""
+    // — LRM 21.2.1.6's rule for `%p` of an enum, against LRM 6.19.2's "" for
+    // `.name()`.
+    uint32_t fmt_fallback;
+};
+
+// One member of a tagged union's name table, in tag order (its slang
+// `fieldIndex`), so a report can name the tag a union actually holds.
+struct TaggedNameEntry {
+    // First extra word of the packed name bytes.
+    ExtraIndex name_at;
+    // Name length in bytes.
+    uint32_t name_len;
+};
+
+// Extra payload for `tagged_check`: everything the LRM 11.9 diagnostic needs
+// about one guarded tagged-union member access. All of it is compile-time; only
+// the tag value itself arrives as the instruction's operand.
+struct TaggedCheckInfo {
+    // fieldIndex of the accessed member — the one tag value this access is
+    // consistent with (LRM 11.9).
+    uint32_t expected;
+    // 1 for an assignment, 0 for a read. LRM 11.9 makes both an error and the
+    // report names which one happened.
+    uint32_t is_write;
+    // Packed name bytes of the accessed member.
+    ExtraIndex name_at;
+    uint32_t   name_len;
+    // Every member name in tag order, as back-to-back TaggedNameEntry records.
+    ExtraSlice names;
+};
+
+// One member of a tagged union's `%p` format table, in tag order.
+struct TaggedFmtEntry {
+    // First extra word of the packed member name bytes.
+    ExtraIndex name_at;
+    // Name length in bytes.
+    uint32_t name_len;
+    // The member's own payload width in bits, which is what LRM 21.2.1.6 prints
+    // ("the currently valid element") rather than the union's full payload region.
+    // Zero for a `void` member, whose tag prints with no `:value` at all.
+    uint32_t width;
+};
+
+// Extra payload for `tagged_fmt_p`: what the runtime needs to render a tagged
+// union as LRM 21.2.1.6's `tag:value`. The active member is only known at run
+// time, so unlike a struct this cannot be expanded to literal text at lower time.
+struct TaggedFmtInfo {
+    // Total width of the flat {tag, gap, payload} value.
+    uint32_t width;
+    // High discriminant bits; 0 for a single-member tagged union.
+    uint32_t tag_bits;
+    // One entry per member, in tag order, as back-to-back TaggedFmtEntry records.
+    ExtraSlice members;
 };
 
 // Which 4-state bit values a CountBits op tallies (LRM 20.9 $countbits control
@@ -908,6 +962,10 @@ static_assert(ExtraPayload<StrPutcInfo>);
 static_assert(ExtraPayload<StrSubstrInfo>);
 static_assert(ExtraPayload<EnumNameEntry>);
 static_assert(ExtraPayload<EnumNameInfo>);
+static_assert(ExtraPayload<TaggedNameEntry>);
+static_assert(ExtraPayload<TaggedCheckInfo>);
+static_assert(ExtraPayload<TaggedFmtEntry>);
+static_assert(ExtraPayload<TaggedFmtInfo>);
 static_assert(ExtraPayload<CountBitsInfo>);
 static_assert(ExtraPayload<TestPlusArgsInfo>);
 static_assert(ExtraPayload<ValuePlusArgsInfo>);
@@ -1421,6 +1479,20 @@ struct Inst {
         // op_type — op is the handle lvalue, type the interned Queue / DynArray
         // type (element format descriptor).
         ContainerFmtP,
+        // Guard one tagged-union member access against the union's current tag
+        // (LRM 11.9: "An attempt to read or assign a value whose type is
+        // inconsistent with the tag results in a run-time error"). Yields no
+        // value; it either falls through or ends the run. Payload: op_extra ->
+        // TaggedCheckInfo; op is the extracted tag value, whose 4-state compare
+        // against TaggedCheckInfo::expected decides. An x/z tag (LRM 11.9: an
+        // uninitialized tagged union is undefined "includ[ing] the tag bits")
+        // matches nothing and so reports.
+        TaggedCheck,
+        // %p of a tagged union -> new string value: the runtime picks the member the
+        // tag selects and renders LRM 21.2.1.6's `tag:value` (a void member prints
+        // its tag alone). Payload: op_extra -> TaggedFmtInfo; op is the flat union
+        // value.
+        TaggedFmtP,
         // string'(packed) -> string: bytes MSB-first with 0x00 bytes dropped
         // (payload: unary — the packed value).
         StrFromPacked,
@@ -2064,6 +2136,8 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::StrPutc:
         case T::StrSubstr:
         case T::EnumName:
+        case T::TaggedCheck:
+        case T::TaggedFmtP:
         case T::CountBits:
         case T::ValuePlusArgs:
         case T::EventTriggerNbDelayed:

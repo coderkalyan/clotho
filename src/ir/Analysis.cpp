@@ -163,6 +163,12 @@ TagInfo tag_info(Inst::Tag tag) {
         // already carries. Rejecting it would refuse every `unique case` in a
         // modern design over a check synthesis is defined to ignore.
         case Inst::Tag::CaseViol:
+        // The LRM 11.9 tagged-union tag check. Same reasoning as CaseViol: it is
+        // the language's own simulation-time assertion about an access, carries no
+        // hardware of its own, and the access it guards (a part-select) is plain
+        // dataflow. Treating it as unsynthesizable would refuse every tagged union
+        // in a synthesizable design over a check synthesis simply ignores.
+        case Inst::Tag::TaggedCheck:
             return hw;
 
         // -- Everything else: simulation-only, not hardware. --
@@ -209,6 +215,7 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::StrGetc:
         case Inst::Tag::StrPutc:
         case Inst::Tag::StrCmp:
+        case Inst::Tag::TaggedFmtP:
         case Inst::Tag::StrICmp:
         case Inst::Tag::StrUpper:
         case Inst::Tag::StrLower:
@@ -1266,6 +1273,7 @@ struct ValueSweep {
                 case Inst::Tag::TimeFormat:
                 case Inst::Tag::Finish:
                 case Inst::Tag::CaseViol:
+                case Inst::Tag::TaggedCheck:
                 case Inst::Tag::Severity:
                 case Inst::Tag::Fflush:
                 case Inst::Tag::SimTime:
@@ -1291,6 +1299,7 @@ struct ValueSweep {
                 case Inst::Tag::StrPutc:
                 case Inst::Tag::StrCmp:
                 case Inst::Tag::StrICmp:
+                case Inst::Tag::TaggedFmtP:
                 case Inst::Tag::StrUpper:
                 case Inst::Tag::StrLower:
                 case Inst::Tag::StrSubstr:

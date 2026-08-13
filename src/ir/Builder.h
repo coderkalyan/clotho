@@ -250,8 +250,37 @@ public:
     };
     // e.name(): a new string value naming the enum member whose value equals
     // `val`. `members` is the value/source-name table in declaration order; the
-    // runtime byte-compares `val`'s must plane against each row.
-    Index enum_name(Index val, std::span<const EnumNameRow> members, SourceLoc loc);
+    // runtime byte-compares `val`'s must plane against each row. With
+    // `fmt_fallback` set, a value matching no member renders as a `'h<hex>` leaf
+    // instead of "" — LRM 21.2.1.6's rule for `%p` of an enum, as against LRM
+    // 6.19.2's "" for `.name()`.
+    Index enum_name(Index val, std::span<const EnumNameRow> members, bool fmt_fallback, SourceLoc loc);
+    // Guard a tagged-union member access against the union's current tag (LRM
+    // 11.9). `tag` is the extracted tag value, `expected` the accessed member's
+    // fieldIndex, `is_write` true for an assignment, `member` the accessed
+    // member's name, and `names` every member name in tag order (so the report
+    // can name the tag actually held). Yields no value: the access either falls
+    // through or the run ends.
+    Index tagged_check(Index                             tag,
+                       uint32_t                          expected,
+                       bool                              is_write,
+                       std::string_view                  member,
+                       std::span<const std::string_view> names,
+                       SourceLoc                         loc);
+    // One member of the tagged_fmt_p table: its source name and its own payload
+    // width in bits (0 for a `void` member).
+    struct TaggedFmtRow {
+        std::string_view name;
+        uint32_t         width;
+    };
+    // %p of a tagged union (LRM 21.2.1.6): a new string value holding
+    // `tag:value` for whichever member `value`'s tag selects. `width` is the flat
+    // value's total width and `tag_bits` its high discriminant bits.
+    Index tagged_fmt_p(Index                          value,
+                       uint32_t                       width,
+                       uint32_t                       tag_bits,
+                       std::span<const TaggedFmtRow>  members,
+                       SourceLoc                      loc);
     // Packed cast of a string to target packed type `type`.
     Index str_to_packed(Index str, Ref type, SourceLoc loc);
 

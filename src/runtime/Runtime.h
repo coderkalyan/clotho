@@ -286,6 +286,48 @@ typedef struct rt_null_site {
 // diagnostic and ends the simulation with a nonzero status. Never returns.
 [[noreturn]] void rt_null_handle(const rt_null_site* site, uint64_t now);
 
+// -- Tagged-union member access inconsistent with the current tag (LRM 11.9) --
+
+// The site of one guarded tagged-union member access, emitted by the backend as
+// a constant global beside the guard. Everything except the tag the union
+// actually held is compile-time. Field order and types mirror the LLVM struct
+// the backend builds: { ptr, ptr, i32 x3, ptr, ptr, ptr, i32, i32 }.
+typedef struct rt_tagged_site {
+    // "<file>:<line>:<col>" of the member access, or "<unknown>".
+    const char* where;
+    // The source line that access starts on, verbatim and without its newline.
+    // Empty when unavailable.
+    const char* line;
+    // 1-based line and column of the access's first character; 0 when unknown.
+    int32_t line_no;
+    int32_t column;
+    // 1-based column one past its last character, so the caret spans
+    // [column, end_column). Equals `column` when no extent was recorded.
+    int32_t end_column;
+    // Name of the member the design reached for.
+    const char* member;
+    // Every member name, indexed by tag value, so the report can name the tag the
+    // union actually holds.
+    const char* const* names;
+    // Length of each entry of `names`, same order.
+    const uint32_t* name_lens;
+    // Number of entries in `names` / `name_lens`.
+    uint32_t count;
+    // 1 when the access was an assignment, 0 for a read.
+    uint32_t is_write;
+} rt_tagged_site;
+
+// Reading or assigning a tagged-union member that the current tag does not
+// select. LRM 11.9: "Members of tagged unions can be read or assigned using the
+// usual dot notation. Such accesses are completely type-checked ... An attempt to
+// read or assign a value whose type is inconsistent with the tag results in a
+// run-time error." `tag` is the value the tag held; `tag_unknown` is 1 when it
+// carried x/z (LRM 11.9 leaves an uninitialized tagged union's tag bits
+// undefined), in which case `tag` is meaningless. Prints a located diagnostic and
+// ends the simulation with a nonzero status. Never returns.
+[[noreturn]] void rt_tagged_access(const rt_tagged_site* site, uint64_t tag, uint32_t tag_unknown,
+                                   uint64_t now);
+
 // -- Checked heap allocation --
 //
 // Every heap buffer a design's containers need (dynamic arrays, queues, strings)
@@ -898,6 +940,18 @@ void rt_container_format_p(rt_string* out, const void* handle, int32_t is_queue,
                            uint32_t width, uint32_t is_signed, uint32_t four_state, uint32_t has_z,
                            uint32_t z_off, uint64_t stride, const rt_alloc_site* site);
 
+// Render a tagged union as `%p` assignment-pattern text (LRM 21.2.1.6: "In the
+// case of a tagged union, it shall print "tag:value" along with the currently
+// valid element") into `out`. `v` carries the whole flat {tag, gap, payload}
+// value's planes; `width` is its total width and `tag_bits` its high discriminant
+// bits. `names` / `name_lens` / `widths` are the per-member table in tag order,
+// where a width of 0 marks a `void` member, printed as its tag with no `:value`.
+// A tag that is x/z or names no member has no valid element to print, so the whole
+// flat value renders as one `'h<hex>` leaf instead.
+void rt_tagged_format_p(rt_string* out, const rt_arg* v, uint32_t width, uint32_t tag_bits,
+                        uint32_t count, const char* const* names, const uint32_t* name_lens,
+                        const uint32_t* widths, const rt_alloc_site* site);
+
 // Logical `==` of two queues / dynamic arrays (LRM 11.4.5): 0 unequal, 1 equal,
 // 2 ambiguous (1'bx). Params mirror rt_container_format_p; `!=` is the caller's
 // negation. Different sizes are a definite inequality.
@@ -1046,10 +1100,13 @@ void rt_string_tolower(rt_string* dst, const rt_string* src, const rt_alloc_site
 // none matches (LRM §6.19.2 e.name()). `val` is the operand's must-plane bytes
 // (`vbytes` = (width+7)/8) and `values` is the `count` member values packed
 // contiguously (`vbytes` each); `names` / `lens` are the parallel name table.
-// Byte-compared, so a base wider than 64 bits works. `site` locates the name()
-// call for an allocation-failure report.
+// Byte-compared, so a base wider than 64 bits works. With `fmt_fallback` set, a
+// value matching no member instead renders as a `'h<hex>` leaf of `width` bits —
+// LRM §21.2.1.6's rule for `%p` of an enum, against §6.19.2's "" for `.name()`.
+// `site` locates the name() call for an allocation-failure report.
 void rt_enum_name(rt_string* dst, const uint8_t* val, uint32_t vbytes, uint32_t count, const uint8_t* values,
-                  const char* const* names, const uint32_t* lens, const rt_alloc_site* site);
+                  const char* const* names, const uint32_t* lens, uint32_t width, uint32_t fmt_fallback,
+                  const rt_alloc_site* site);
 
 // s[i] = c ($.putc()): a no-op when i is out of range or (c & 0xff) == 0 — a
 // string never contains a 0 byte (LRM §6.16.2).

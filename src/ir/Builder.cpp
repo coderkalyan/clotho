@@ -476,7 +476,8 @@ Index Builder::str_to_packed(Index str, Ref type, SourceLoc loc) {
     return emit({ Inst::Tag::StrToPacked, Inst::Payload{ .op_type = { str, type } } }, loc);
 }
 
-Index Builder::enum_name(Index val, std::span<const EnumNameRow> members, SourceLoc loc) {
+Index Builder::enum_name(Index val, std::span<const EnumNameRow> members, bool fmt_fallback,
+                         SourceLoc loc) {
     // Pack each member's value + name bytes first, remembering where they landed,
     // then pack the entry records contiguously so they form one ExtraSlice. The
     // byte payloads and the records share the extra buffer but never overlap.
@@ -501,9 +502,64 @@ Index Builder::enum_name(Index val, std::span<const EnumNameRow> members, Source
     }
     const auto end = static_cast<ExtraIndex>(extra_.size());
 
-    const ExtraIndex extra = add_extra(EnumNameInfo{ ExtraSlice{ start, end } });
+    const ExtraIndex extra =
+      add_extra(EnumNameInfo{ ExtraSlice{ start, end }, fmt_fallback ? 1u : 0u });
 
     return emit({ Inst::Tag::EnumName, Inst::Payload{ .op_extra = { val, extra } } }, loc);
+}
+
+Index Builder::tagged_check(Index                             tag,
+                            uint32_t                          expected,
+                            bool                              is_write,
+                            std::string_view                  member,
+                            std::span<const std::string_view> names,
+                            SourceLoc                         loc) {
+    // Same two-pass shape as enum_name: pack every name's bytes first, then the
+    // fixed-size records, so the records form one contiguous ExtraSlice.
+    const ExtraIndex member_at = add_bytes(member);
+
+    std::vector<std::pair<ExtraIndex, uint32_t>> packed;
+    packed.reserve(names.size());
+    for (const std::string_view n : names) {
+        packed.emplace_back(add_bytes(n), static_cast<uint32_t>(n.size()));
+    }
+
+    const auto start = static_cast<ExtraIndex>(extra_.size());
+    for (const auto& [at, len] : packed) {
+        add_extra(TaggedNameEntry{ at, len });
+    }
+    const auto end = static_cast<ExtraIndex>(extra_.size());
+
+    const ExtraIndex extra = add_extra(TaggedCheckInfo{ expected,
+                                                        is_write ? 1u : 0u,
+                                                        member_at,
+                                                        static_cast<uint32_t>(member.size()),
+                                                        ExtraSlice{ start, end } });
+
+    return emit({ Inst::Tag::TaggedCheck, Inst::Payload{ .op_extra = { tag, extra } } }, loc);
+}
+
+Index Builder::tagged_fmt_p(Index                         value,
+                            uint32_t                      width,
+                            uint32_t                      tag_bits,
+                            std::span<const TaggedFmtRow> members,
+                            SourceLoc                     loc) {
+    // Names first, then the fixed-size records, so the records form one slice.
+    std::vector<std::pair<ExtraIndex, uint32_t>> packed;
+    packed.reserve(members.size());
+    for (const TaggedFmtRow& m : members) {
+        packed.emplace_back(add_bytes(m.name), static_cast<uint32_t>(m.name.size()));
+    }
+
+    const auto start = static_cast<ExtraIndex>(extra_.size());
+    for (size_t k = 0; k < members.size(); ++k) {
+        add_extra(TaggedFmtEntry{ packed[k].first, packed[k].second, members[k].width });
+    }
+    const auto end = static_cast<ExtraIndex>(extra_.size());
+
+    const ExtraIndex extra = add_extra(TaggedFmtInfo{ width, tag_bits, ExtraSlice{ start, end } });
+
+    return emit({ Inst::Tag::TaggedFmtP, Inst::Payload{ .op_extra = { value, extra } } }, loc);
 }
 
 Index Builder::count_bits(Index op, uint32_t mask, SourceLoc loc) {

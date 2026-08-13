@@ -213,6 +213,8 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_severity", &rt_severity);
     expose("rt_bounds_report", &rt_bounds_report);
     expose("rt_null_handle", &rt_null_handle);
+    expose("rt_tagged_access", &rt_tagged_access);
+    expose("rt_tagged_format_p", &rt_tagged_format_p);
     expose("rt_alloc_checked", &rt_alloc_checked);
     expose("rt_alloc_elems_checked", &rt_alloc_elems_checked);
     expose("rt_alloc_elems_size", &rt_alloc_elems_size);

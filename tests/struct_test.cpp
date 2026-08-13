@@ -6,6 +6,7 @@
 
 #include "Lower.h"
 #include "PosixIo.h"
+#include "Subprocess.h"
 #include "ir/Jit.h"
 
 using namespace clotho;
@@ -250,22 +251,6 @@ TEST_CASE("packed tagged union: setter, member read, whole value (LRM 7.3.2)") {
            "42 1\n");
 }
 
-TEST_CASE("packed tagged union: direct member write sets the tag (LRM 7.3.2)") {
-    // Unlike a plain union, writing `u.Member` also sets the tag to that member's
-    // index (here Valid = index 1, so the high tag bit becomes 1).
-    CHECK(run_capture(R"(
-        module m;
-            typedef union tagged packed { void Invalid; int Valid; } opt_t;
-            opt_t a;
-            initial begin
-                a = tagged Invalid;
-                a.Valid = 7;
-                $display("%0d %b", a.Valid, a);
-            end
-        endmodule
-    )") == "7 100000000000000000000000000000111\n");
-}
-
 TEST_CASE("packed tagged union: narrow member gap is x for 4-state, run==param") {
     // A member narrower than the widest leaves a gap between payload and tag. For
     // a 4-state union that gap is x (the type's power-on default), matching
@@ -286,28 +271,123 @@ TEST_CASE("packed tagged union: narrow member gap is x for 4-state, run==param")
            "0xxxxxxxxxxxxxxxxxxxxxxxx10101011\n");
 }
 
-TEST_CASE("unpacked tagged union: LSB overlay plus tag (LRM 7.3.2)") {
+TEST_CASE("tagged union: a member write does not retag; it checks the tag (LRM 11.9)") {
+    const std::string src = "module m;\n"
+                            "    typedef union tagged packed { void Invalid; int Valid; } opt_t;\n"
+                            "    opt_t a;\n"
+                            "    initial begin\n"
+                            "        a = tagged Invalid;\n"
+                            "        $display(\"before\");\n"
+                            "        a.Valid = 7;\n"
+                            "        $display(\"after\");\n"
+                            "    end\n"
+                            "endmodule\n";
+
+    const test::DesignRun run = test::run_design_captured(src);
+
+    // The store never happens, and nothing after it runs.
+    CHECK(run.out == "before\n");
+    CHECK(test::design_exit_code(run) != 0);
+    CHECK(run.err.find("fatal: assignment to tagged-union member `Valid`") != std::string::npos);
+    CHECK(run.err.find("the tag selects `Invalid`") != std::string::npos);
+    CHECK(run.err.find("source:7:9") != std::string::npos);
+    CHECK(run.err.find("7 |         a.Valid = 7;\n") != std::string::npos);
+}
+
+TEST_CASE("tagged union: writing the member the tag already selects is fine") {
+    // The other side of LRM 11.9: a member write is legal exactly while its own tag
+    // is current, and it updates only the payload.
+    CHECK(run_capture(R"(
+        module m;
+            typedef union tagged packed { void Invalid; int Valid; } opt_t;
+            opt_t a;
+            initial begin
+                a = tagged Valid (5);
+                a.Valid = 7;
+                a.Valid += 1;
+                $display("%0d %b", a.Valid, a);
+            end
+        endmodule
+    )") == "8 100000000000000000000000000001000\n");
+}
+
+TEST_CASE("tagged union: reading a member the tag does not select is a fatal (LRM 11.9)") {
+    const std::string src = "module m;\n"
+                            "    typedef union tagged packed { void Invalid; int Valid; } opt_t;\n"
+                            "    opt_t a;\n"
+                            "    initial begin\n"
+                            "        a = tagged Invalid;\n"
+                            "        $display(\"%0d\", a.Valid);\n"
+                            "    end\n"
+                            "endmodule\n";
+
+    const test::DesignRun run = test::run_design_captured(src);
+
+    CHECK(run.out.empty());
+    CHECK(test::design_exit_code(run) != 0);
+    CHECK(run.err.find("fatal: read of tagged-union member `Valid`") != std::string::npos);
+    CHECK(run.err.find("(LRM 11.9)") != std::string::npos);
+}
+
+TEST_CASE("tagged union: a compound or concat member write is checked too (LRM 11.9)") {
+    // Both reach the member lvalue through paths that used to skip the tag entirely
+    // (lower_compound_assign / store_concat), so both silently wrote a payload under
+    // a stale tag before the guard moved into lower_member_lvalue.
+    const std::string compound = "module m;\n"
+                                 "    typedef union tagged packed { void Invalid; int Valid; } opt_t;\n"
+                                 "    opt_t a;\n"
+                                 "    initial begin a = tagged Invalid; a.Valid += 1; end\n"
+                                 "endmodule\n";
+    const test::DesignRun cr = test::run_design_captured(compound);
+    CHECK(test::design_exit_code(cr) != 0);
+    CHECK(cr.err.find("fatal: assignment to tagged-union member `Valid`") != std::string::npos);
+
+    const std::string concat = "module m;\n"
+                               "    typedef union tagged packed { void Invalid; int Valid; } opt_t;\n"
+                               "    opt_t a;\n"
+                               "    logic z;\n"
+                               "    initial begin a = tagged Invalid; {a.Valid, z} = 33'h1234; end\n"
+                               "endmodule\n";
+    const test::DesignRun kr = test::run_design_captured(concat);
+    CHECK(test::design_exit_code(kr) != 0);
+    CHECK(kr.err.find("fatal: assignment to tagged-union member `Valid`") != std::string::npos);
+}
+
+TEST_CASE("tagged union: an x tag selects no member and names itself as undefined") {
+    // LRM 11.9: "An uninitialized variable of tagged union type shall be undefined.
+    // This includes the tag bits." An x tag equals no member's index, so any member
+    // access reports — and the report cannot name a member for it.
+    const std::string src = "module m;\n"
+                            "    typedef union tagged packed { void Invalid; logic [31:0] Valid; } opt_t;\n"
+                            "    opt_t a;\n"
+                            "    initial $display(\"%0d\", a.Valid);\n"
+                            "endmodule\n";
+
+    const test::DesignRun run = test::run_design_captured(src);
+    CHECK(test::design_exit_code(run) != 0);
+    CHECK(run.err.find("the tag selects undefined (x)") != std::string::npos);
+}
+
+TEST_CASE("unpacked tagged union: LSB overlay under the synthesized tag (LRM 7.3.2)") {
     // An unpacked tagged union lowers to the same flat {synthesized-tag, payload}
-    // value; a narrow member sits in the low bits, a wider member read sees the
-    // low bits of whatever was last written. A direct narrow member write
-    // (`x.b`) touches only its own low bits, leaving the rest of the wider
-    // payload region untouched (so x.w keeps the high `deadbe` bytes from the
-    // prior wide write). iverilog and verilator have no tagged-union support;
-    // values are hand-checkable overlay.
+    // value, so a member read is the low payload bits. Only the member the tag
+    // selects may be read (LRM 11.9), so this walks the tag along with the reads
+    // rather than reading one member through another's tag. iverilog and verilator
+    // have no tagged-union support; values are hand-checkable overlay.
     CHECK(run_capture(R"(
         module m;
             typedef union tagged { void none; byte b; int w; } u_t;
             u_t x;
             initial begin
                 x = tagged b (8'hAB);
-                $display("%h %h", x.b, x.w);
+                $display("%h", x.b);
                 x = tagged w (32'hDEADBEEF);
-                $display("%h %h", x.b, x.w);
-                x.b = 8'h5A;
-                $display("%h %h", x.b, x.w);
+                $display("%h", x.w);
+                x.w = 32'h0000005A;
+                $display("%h", x.w);
             end
         endmodule
-    )") == "ab 000000ab\nef deadbeef\n5a deadbe5a\n");
+    )") == "ab\ndeadbeef\n0000005a\n");
 }
 
 TEST_CASE("tagged union pattern case: tag match, .var binding, filter (LRM 12.6)") {
@@ -480,6 +560,165 @@ TEST_CASE("tagged union with a non-integral member is rejected loudly (Phase 3 g
     )");
     CHECK_FALSE(r.ok);
     CHECK(r.diagnostic_text().find("unpacked union member must be an integral type") != std::string::npos);
+}
+
+TEST_CASE("%p of a tagged union prints tag:value (LRM 21.2.1.6)") {
+    // LRM 21.2.1.6: "For unions, only the first declared elements shall be printed.
+    // In the case of a tagged union, it shall print "tag:value" along with the
+    // currently valid element." Which member that is only the run-time tag knows,
+    // so this is the one %p shape rendered in the runtime. A `void` member has no
+    // element, so its tag prints alone. The payload renders at the MEMBER's own
+    // width, not the union's payload region, so the gap bits never leak in.
+    CHECK(run_capture(R"(
+        module m;
+            typedef union tagged packed { void Invalid; int Valid; } opt_t;
+            typedef union tagged { void none; byte b; int w; } up_t;
+            opt_t a, i;
+            up_t  u;
+            initial begin
+                a = tagged Valid (42);
+                i = tagged Invalid;
+                $display("%p %p", a, i);
+                u = tagged b (8'hAB);
+                $display("%p", u);
+                u = tagged w (32'hDEADBEEF);
+                $display("%p", u);
+                u = tagged none;
+                $display("%p", u);
+            end
+        endmodule
+    )") == "Valid:'h2a Invalid\nb:'hab\nw:'hdeadbeef\nnone\n");
+}
+
+TEST_CASE("%p of a tagged union whose tag is x falls back to the flat value") {
+    // An uninitialized tagged union has undefined tag bits (LRM 11.9), so no member
+    // is valid and there is no `tag:value` to print. LRM 21.2.1.6 does not cover
+    // that, so the whole flat value renders as one integral leaf — showing the x
+    // digits rather than inventing a member name.
+    CHECK(run_capture(R"(
+        module m;
+            typedef union tagged packed { void Invalid; logic [15:0] Valid; } opt_t;
+            opt_t a;
+            initial $display("%p", a);
+        endmodule
+    )") == "'hxxxxx\n");
+}
+
+TEST_CASE("%p of a nested tagged union / packed struct / enum (LRM 21.2.1.6)") {
+    // Each element of an aggregate is printed under the clause's per-element rules,
+    // so a tagged union, a packed struct, and an enum nested inside an unpacked
+    // struct each render in their own form rather than as a bare integer. This is
+    // what needs the slang type threaded through the %p expansion: `ir::Type` cannot
+    // tell a tagged union from a plain packed union.
+    CHECK(run_capture(R"(
+        module m;
+            typedef union tagged packed { void Invalid; int Valid; } opt_t;
+            typedef enum logic [1:0] { RED, GREEN } c_t;
+            typedef struct packed { byte hi; byte lo; } ps_t;
+            typedef struct { opt_t o; c_t c; ps_t p; int n; } outer_t;
+            opt_t arr [0:1];
+            outer_t x;
+            initial begin
+                x.o = tagged Valid (7);
+                x.c = GREEN;
+                x.p = '{8'h11, 8'h22};
+                x.n = 5;
+                $display("%p", x);
+                arr[0] = tagged Valid (1);
+                arr[1] = tagged Invalid;
+                $display("%p", arr);
+            end
+        endmodule
+    )") == "'{o:Valid:'h7, c:GREEN, p:'{hi:'h11, lo:'h22}, n:'h5}\n"
+           "'{Valid:'h1, Invalid}\n");
+}
+
+TEST_CASE("%p of a packed struct, a plain union, and an enum (LRM 21.2.1.6)") {
+    // Three more `shall` clauses that the aggregate-ABI dispatch used to miss, all
+    // rendering as a bare decimal before: "A packed structure data type shall print
+    // its value as an assignment pattern with named elements", "For unions, only the
+    // first declared elements shall be printed", and "An enumerated data type shall
+    // print its value as an enumeration name if the value is valid for that type.
+    // Otherwise the value shall print according to the base type".
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct packed { byte a; byte b; } ps_t;
+            typedef union packed { byte a; byte b; } pu_t;
+            typedef enum logic [1:0] { RED, GREEN, BLUE } c_t;
+            ps_t s;
+            pu_t u;
+            c_t  c;
+            initial begin
+                s = '{8'hAB, 8'h2A};
+                u.a = 8'hAB;
+                $display("%p %p", s, u);
+                c = GREEN;
+                $display("%p", c);
+                c = c_t'(2'd3);
+                $display("%p", c);
+            end
+        endmodule
+    )") == "'{a:'hab, b:'h2a} '{a:'hab}\nGREEN\n'h3\n");
+}
+
+TEST_CASE("an escaped %%p does not consume the %p splice") {
+    // build_format substitutes the expansion at the first `%p` in the format text;
+    // scanning has to skip a `%%` escape, or `%%p` swallows the splice and leaves
+    // the real specifier for the runtime formatter to reject.
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int x; } s_t;
+            s_t a, c;
+            initial begin
+                a = '{1};
+                c = '{2};
+                $display("%%p [%p] and [%p] 100%%", a, c);
+            end
+        endmodule
+    )") == "%p ['{x:'h1}] and ['{x:'h2}] 100%\n");
+}
+
+TEST_CASE("unique / unique0 if accepts a pattern condition (LRM 12.4.2 + 12.6.2)") {
+    // A pattern is a cond_predicate (LRM 12.6.2) and unique_priority attaches to
+    // `if (cond_predicate)` (12.4.2), so `unique if (x matches p)` is legal SV. It
+    // used to fail loudly because lower_unique_if collected a bare Expression per
+    // arm instead of the arm's condition list; a `&&&` filter failed even earlier,
+    // since it makes the cond_predicate multi-condition.
+    CHECK(run_capture(R"(
+        module m;
+            typedef union tagged packed { void Invalid; int Valid; } opt_t;
+            opt_t a;
+            initial begin
+                a = tagged Valid (5);
+                unique if (a matches tagged Valid .n) $display("v %0d", n);
+                else $display("inv");
+                a = tagged Invalid;
+                unique0 if (a matches tagged Valid .m) $display("v %0d", m);
+                else $display("inv");
+                a = tagged Valid (5);
+                unique if (a matches tagged Valid .p &&& (p > 10)) $display("big %0d", p);
+                else if (a matches tagged Valid .q &&& (q <= 10)) $display("small %0d", q);
+                else $display("none");
+            end
+        endmodule
+    )") == "v 5\ninv\nsmall 5\n");
+}
+
+TEST_CASE("%p of a queue of tagged unions is rejected loudly") {
+    // The runtime container descriptor carries no member-name table, so it could
+    // only print the raw bit-vector where LRM 21.2.1.6 requires `tag:value`.
+    const LowerResult r = lower_text(R"(
+        module m;
+            typedef union tagged packed { void Invalid; int Valid; } opt_t;
+            opt_t q[$];
+            initial begin
+                q.push_back(tagged Valid (1));
+                $display("%p", q);
+            end
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostic_text().find("%p of a queue / dynamic array of tagged unions") != std::string::npos);
 }
 
 TEST_CASE("blocking read and write of unpacked struct members") {

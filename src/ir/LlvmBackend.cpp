@@ -8178,11 +8178,12 @@ private:
     }
     // void rt_enum_name(rt_string* dst, const u8* val, u32 vbytes, u32 count,
     //                   const u8* values, const char* const* names, const u32* lens,
-    //                   const rt_alloc_site*)
+    //                   u32 width, u32 fmt_fallback, const rt_alloc_site*)
     llvm::FunctionCallee enum_name_fn() {
+        auto* i32 = b_.getInt32Ty();
         return rt_fn("rt_enum_name", b_.getVoidTy(),
-                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(),
-                       raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
+                     { raw_ptr_ty(), raw_ptr_ty(), i32, i32, raw_ptr_ty(), raw_ptr_ty(),
+                       raw_ptr_ty(), i32, i32, raw_ptr_ty() });
     }
     // void rt_container_format_p(rt_string* out, const void* handle, i32 is_queue,
     //   i32 kind, i32 width, i32 is_signed, i32 four_state, i32 has_z, i32 z_off, i64 stride,
@@ -8192,6 +8193,15 @@ private:
                      { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(),
                        b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(),
                        b_.getInt64Ty(), raw_ptr_ty() });
+    }
+    // void rt_tagged_format_p(rt_string* dst, const rt_arg* v, u32 width, u32 tag_bits,
+    //                         u32 count, const char* const* names, const u32* name_lens,
+    //                         const u32* widths, const rt_alloc_site*)
+    llvm::FunctionCallee tagged_fmt_p_fn() {
+        auto* i32 = b_.getInt32Ty();
+        return rt_fn("rt_tagged_format_p", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32, raw_ptr_ty(), raw_ptr_ty(),
+                       raw_ptr_ty(), raw_ptr_ty() });
     }
     // i8 rt_container_eq(const void* a, const void* b, i32 is_queue, i32 kind, i32 width,
     //   i32 is_signed, i32 four_state, i32 has_z, i32 z_off, i64 stride)
@@ -9171,6 +9181,7 @@ private:
             case Inst::Tag::Sformatf:
             case Inst::Tag::EnumName:
             case Inst::Tag::ContainerFmtP:
+            case Inst::Tag::TaggedFmtP:
                 return { 0, false, false, true };
             case Inst::Tag::StrToPacked:
                 return from_ref(p.op_type.type);
@@ -9222,6 +9233,7 @@ private:
             case Inst::Tag::TimeFormat:
             case Inst::Tag::Finish:
             case Inst::Tag::CaseViol:
+            case Inst::Tag::TaggedCheck:
             case Inst::Tag::Severity:
             case Inst::Tag::Fflush:
             case Inst::Tag::Fclose:
@@ -9339,6 +9351,7 @@ private:
             case Inst::Tag::Sformatf:
             case Inst::Tag::EnumName:
             case Inst::Tag::ContainerFmtP:
+            case Inst::Tag::TaggedFmtP:
                 return true;
             case Inst::Tag::Constant:
             case Inst::Tag::Concat:
@@ -10526,6 +10539,8 @@ private:
                 b_.CreateAlignedStore(must_of(value_of(p.op_extra.op)), valbuf, llvm::Align(1));
                 b_.CreateCall(enum_name_fn(), { str_of(i), valbuf, b_.getInt32(vbytes),
                                                 b_.getInt32(count), vg, ng, lg,
+                                                b_.getInt32(type_of(p.op_extra.op).width),
+                                                b_.getInt32(info.fmt_fallback),
                                                 alloc_site_global(loc_text(i), "string") });
                 return;
             }
@@ -10539,6 +10554,48 @@ private:
                                 b_.getInt32(cf.kind), b_.getInt32(cf.width), b_.getInt32(cf.is_signed),
                                 b_.getInt32(cf.four), b_.getInt32(cf.has_z), b_.getInt32(cf.z_off),
                                 b_.getInt64(cf.stride),
+                                alloc_site_global(loc_text(i), "string") });
+                return;
+            }
+            case Inst::Tag::TaggedFmtP: {
+                // %p of a tagged union: only the run-time tag says which member is
+                // valid, so unlike a struct this cannot be expanded to literal text
+                // at lower time. Marshal the flat value through the ordinary rt_arg
+                // path (planes of any width) and let the runtime pick the member.
+                const auto  info = ir_->extra_data<TaggedFmtInfo>(p.op_extra.extra);
+                const Index val  = p.op_extra.op;
+                llvm::Value* const arr = build_rt_args({ &val, 1 }, "%p of a tagged union");
+
+                constexpr uint32_t stride = sizeof(TaggedFmtEntry) / sizeof(uint32_t);
+                llvm::Type* const  i32    = b_.getInt32Ty();
+                std::vector<llvm::Constant*> names, lens, widths;
+                for (uint32_t w = static_cast<uint32_t>(info.members.start);
+                     w < static_cast<uint32_t>(info.members.end); w += stride) {
+                    const auto e = ir_->extra_data<TaggedFmtEntry>(static_cast<ExtraIndex>(w));
+                    names.push_back(b_.CreateGlobalString(ir_->extra_bytes(e.name_at, e.name_len)));
+                    lens.push_back(llvm::ConstantInt::get(i32, e.name_len));
+                    widths.push_back(llvm::ConstantInt::get(i32, e.width));
+                }
+                const auto count = static_cast<uint32_t>(names.size());
+
+                auto* const nty = llvm::ArrayType::get(raw_ptr_ty(), count);
+                auto* const uty = llvm::ArrayType::get(i32, count);
+                auto* const ng  = new llvm::GlobalVariable(env_->llmod, nty, /*isConstant=*/true,
+                                                           llvm::GlobalValue::PrivateLinkage,
+                                                           llvm::ConstantArray::get(nty, names),
+                                                           "clotho.tagfmt.names");
+                auto* const lg  = new llvm::GlobalVariable(env_->llmod, uty, /*isConstant=*/true,
+                                                           llvm::GlobalValue::PrivateLinkage,
+                                                           llvm::ConstantArray::get(uty, lens),
+                                                           "clotho.tagfmt.lens");
+                auto* const wg  = new llvm::GlobalVariable(env_->llmod, uty, /*isConstant=*/true,
+                                                           llvm::GlobalValue::PrivateLinkage,
+                                                           llvm::ConstantArray::get(uty, widths),
+                                                           "clotho.tagfmt.widths");
+
+                b_.CreateCall(tagged_fmt_p_fn(),
+                              { str_of(i), arr, b_.getInt32(info.width), b_.getInt32(info.tag_bits),
+                                b_.getInt32(count), ng, lg, wg,
                                 alloc_site_global(loc_text(i), "string") });
                 return;
             }
@@ -10677,6 +10734,12 @@ private:
                 // Observed region (rt_observed_case_violation), not emitted here,
                 // so the Active region continues normally after it.
                 lower_case_viol(i);
+                return;
+
+            case Inst::Tag::TaggedCheck:
+                // Tagged-union member access guard (LRM 11.9): falls through when
+                // the tag selects the accessed member, otherwise ends the run.
+                lower_tagged_check(i);
                 return;
 
             case Inst::Tag::Severity:
@@ -13315,6 +13378,109 @@ private:
         b_.CreateUnreachable();
 
         b_.SetInsertPoint(cont);
+    }
+
+    // The rt_tagged_site record (Runtime.h): { ptr where, ptr line, i32 line_no,
+    // i32 column, i32 end_column, ptr member, ptr names, ptr name_lens, i32 count,
+    // i32 is_write }. Field order and types mirror the C struct exactly, so the two
+    // change together.
+    llvm::StructType* tagged_site_ty() {
+        auto* i32 = b_.getInt32Ty();
+        return llvm::StructType::get(ctx_, { raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32,
+                                             raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), i32, i32 });
+    }
+
+    // void rt_tagged_access(ptr site, i64 tag, i32 tag_unknown, i64 now) — prints
+    // the located fatal and ends the simulation; never returns (see Runtime.h).
+    llvm::FunctionCallee tagged_access_fn() {
+        return rt_fn("rt_tagged_access", b_.getVoidTy(),
+                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt64Ty() });
+    }
+
+    // Guard one tagged-union member access against the union's current tag (LRM
+    // 11.9). Cost on the hot path is one equality compare against the member's tag
+    // constant (plus, for a 4-state union, one must-vs-may compare that rejects an
+    // x/z tag) and a not-taken branch, weighted so the cold block sinks out of
+    // line; where the same tag value reaches two accesses unchanged, CSE folds the
+    // second compare away. The wheel fallback mirrors lower_case_viol: an access
+    // inside a pure function has no wheel and reports time 0.
+    void lower_tagged_check(Index i) {
+        const auto& p    = ir_->payload(i);
+        const auto  info = ir_->extra_data<TaggedCheckInfo>(p.op_extra.extra);
+        const Plane pl   = value_of(p.op_extra.op);
+        llvm::Value* const must = must_of(pl);
+        llvm::Value* const may  = may_of(pl);
+
+        // A tag bit that is x or z has must != may, and LRM 11.9 leaves an
+        // uninitialized tagged union's tag bits undefined — such a tag selects no
+        // member, so it must report rather than compare equal to one.
+        llvm::Value* const defined = b_.CreateICmpEQ(must, may);
+        llvm::Value* const hit =
+          b_.CreateICmpEQ(must, llvm::ConstantInt::get(must->getType(), info.expected));
+        llvm::Value* const ok = b_.CreateAnd(defined, hit);
+
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* bad  = llvm::BasicBlock::Create(ctx_, "tagged.mismatch", fn);
+        auto* cont = llvm::BasicBlock::Create(ctx_, "tagged.ok", fn);
+        auto* br   = b_.CreateCondBr(ok, cont, bad);
+        br->setMetadata(llvm::LLVMContext::MD_prof,
+                        llvm::MDBuilder(ctx_).createBranchWeights(1u << 20, 1));
+
+        b_.SetInsertPoint(bad);
+        llvm::Value* now  = has_wheel()
+                              ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
+                              : static_cast<llvm::Value*>(b_.getInt64(0));
+        auto*        call = b_.CreateCall(
+          tagged_access_fn(),
+          { tagged_site_global(loc_text(i), info),
+            b_.CreateZExt(must, b_.getInt64Ty()),
+            b_.CreateZExt(b_.CreateNot(defined), b_.getInt32Ty()), now });
+        call->addFnAttr(llvm::Attribute::NoReturn);
+        call->addFnAttr(llvm::Attribute::Cold);
+        b_.CreateUnreachable();
+
+        b_.SetInsertPoint(cont);
+    }
+
+    // One constant rt_tagged_site per guarded access, plus the member-name table
+    // the report indexes by the tag actually held.
+    llvm::Constant* tagged_site_global(const SourceText& at, const TaggedCheckInfo& info) {
+        auto* const i32 = b_.getInt32Ty();
+        auto* const rec = tagged_site_ty();
+
+        constexpr uint32_t stride = sizeof(TaggedNameEntry) / sizeof(uint32_t);
+        std::vector<llvm::Constant*> names, lens;
+        for (uint32_t w = static_cast<uint32_t>(info.names.start);
+             w < static_cast<uint32_t>(info.names.end); w += stride) {
+            const auto e = ir_->extra_data<TaggedNameEntry>(static_cast<ExtraIndex>(w));
+            names.push_back(b_.CreateGlobalString(ir_->extra_bytes(e.name_at, e.name_len)));
+            lens.push_back(llvm::ConstantInt::get(i32, e.name_len));
+        }
+        const auto count = static_cast<uint32_t>(names.size());
+
+        auto* const nty = llvm::ArrayType::get(raw_ptr_ty(), count);
+        auto* const lty = llvm::ArrayType::get(i32, count);
+        auto* const ng  = new llvm::GlobalVariable(env_->llmod, nty, /*isConstant=*/true,
+                                                   llvm::GlobalValue::PrivateLinkage,
+                                                   llvm::ConstantArray::get(nty, names),
+                                                   "clotho.tagged.names");
+        auto* const lg  = new llvm::GlobalVariable(env_->llmod, lty, /*isConstant=*/true,
+                                                   llvm::GlobalValue::PrivateLinkage,
+                                                   llvm::ConstantArray::get(lty, lens),
+                                                   "clotho.tagged.lens");
+
+        auto* init = llvm::ConstantStruct::get(
+          rec, { b_.CreateGlobalString(at.where, "tagged.at"),
+                 b_.CreateGlobalString(at.line, "tagged.src"),
+                 llvm::ConstantInt::get(i32, at.line_no), llvm::ConstantInt::get(i32, at.column),
+                 llvm::ConstantInt::get(i32, at.end_column),
+                 b_.CreateGlobalString(ir_->extra_bytes(info.name_at, info.name_len),
+                                       "tagged.member"),
+                 ng, lg, llvm::ConstantInt::get(i32, count),
+                 llvm::ConstantInt::get(i32, info.is_write) });
+        return new llvm::GlobalVariable(env_->llmod, rec, /*isConstant=*/true,
+                                        llvm::GlobalValue::PrivateLinkage, init,
+                                        "clotho.tagged.site");
     }
 
     // The rt_alloc_site record (Runtime.h): { ptr where, ptr line, ptr what,

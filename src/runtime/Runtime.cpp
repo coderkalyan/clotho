@@ -1630,6 +1630,85 @@ extern "C" void rt_container_format_p(rt_string* out, const void* handle, int32_
     rt_string_assign_bytes(out, s.data(), static_cast<uint64_t>(s.size()), site);
 }
 
+namespace {
+
+// The `n` bits (n <= 64) of a little-endian 64-bit plane starting at bit `lo`.
+// A null plane (a 2-state value carries no xz / z) reads as all zero.
+uint64_t plane_bits(const uint64_t* p, uint32_t lo, uint32_t n) {
+    if (p == nullptr || n == 0) {
+        return 0;
+    }
+    const uint32_t w0  = lo / 64;
+    const uint32_t off = lo % 64;
+    uint64_t       r   = p[w0] >> off;
+    if (off != 0 && off + n > 64) {
+        r |= p[w0 + 1] << (64 - off);
+    }
+    return n == 64 ? r : r & ((uint64_t{ 1 } << n) - 1);
+}
+
+// Copy the low `w` bits of `src` into `dst` (plane_words(w) words), zero-extended
+// above `w`. render_arg requires that zero extension: it clips only the top word,
+// so handing it the union's full-width plane under a narrower member width would
+// leak the gap and tag bits into the rendered leaf.
+void copy_low_bits(std::vector<uint64_t>& dst, const uint64_t* src, uint32_t w) {
+    const uint32_t words = plane_words(w);
+    dst.assign(words, 0);
+    if (src == nullptr) {
+        return;
+    }
+    for (uint32_t k = 0; k < words; ++k) {
+        dst[k] = src[k];
+    }
+    if (w % 64 != 0) {
+        dst[words - 1] &= (uint64_t{ 1 } << (w % 64)) - 1;
+    }
+}
+
+} // namespace
+
+extern "C" void rt_tagged_format_p(rt_string* out, const rt_arg* v, uint32_t width,
+                                   uint32_t tag_bits, uint32_t count, const char* const* names,
+                                   const uint32_t* name_lens, const uint32_t* widths,
+                                   const rt_alloc_site* site) {
+    clotho::FormatSpec spec{};
+    spec.ok        = true;
+    spec.conv      = 'h';
+    spec.has_width = true; // width 0 => minimal digits (the %0h form)
+
+    // A single-member tagged union reserves no tag bits, so its one member is
+    // always the selected one.
+    const uint64_t tag   = tag_bits == 0 ? 0 : plane_bits(v->val, width - tag_bits, tag_bits);
+    const uint64_t tag_x = tag_bits == 0 ? 0 : plane_bits(v->xz, width - tag_bits, tag_bits);
+
+    std::string s;
+    if (tag_x != 0 || tag >= count) {
+        // No member is valid, so there is no `tag:value` to print. Fall back to the
+        // ordinary integral leaf over the whole flat value, which shows the x digits
+        // for an uninitialized union rather than inventing a member name.
+        std::vector<uint64_t> mv, mx, mz;
+        copy_low_bits(mv, v->val, width);
+        copy_low_bits(mx, v->xz, width);
+        copy_low_bits(mz, v->z, width);
+        s += "'h";
+        const rt_arg a{ width, 0, mv.data(), mx.data(), mz.data() };
+        render_arg(s, a, spec);
+    } else {
+        s.append(names[tag], static_cast<size_t>(name_lens[tag]));
+        if (const uint32_t mw = widths[tag]; mw != 0) {
+            // A void member (width 0) has no element to print, only its tag.
+            std::vector<uint64_t> mv, mx, mz;
+            copy_low_bits(mv, v->val, mw);
+            copy_low_bits(mx, v->xz, mw);
+            copy_low_bits(mz, v->z, mw);
+            s += ":'h";
+            const rt_arg a{ mw, 0, mv.data(), mx.data(), mz.data() };
+            render_arg(s, a, spec);
+        }
+    }
+    rt_string_assign_bytes(out, s.data(), static_cast<uint64_t>(s.size()), site);
+}
+
 // Logical equality (`==`) of two queues / dynamic arrays (LRM 11.2.2, 11.4.5).
 // Returns 0 (definitely unequal), 1 (definitely equal), 2 (ambiguous -> 1'bx).
 // Different sizes are a definite inequality (0, never x). Same size folds a
@@ -3264,6 +3343,74 @@ extern "C" void rt_null_handle(const rt_null_site* site, uint64_t now) {
     std::exit(1);
 }
 
+extern "C" void rt_tagged_access(const rt_tagged_site* site, uint64_t tag, uint32_t tag_unknown,
+                                 uint64_t now) {
+    // Reached only from the guard the backend plants ahead of every tagged-union
+    // member read and member assignment. LRM 11.9 makes such an access "completely
+    // type-checked" and says an inconsistent one "results in a run-time error";
+    // the untrapped alternative is reinterpreting one member's bits as another's,
+    // exactly what LRM 7.3.2 says a tagged union exists to prevent. Same layout as
+    // the null-handle fatal.
+    io_ensure_init();
+    std::fflush(stdout);
+
+    const fmt::text_style label = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::red));
+    const fmt::text_style head  = styled(fmt::emphasis::bold);
+    const fmt::text_style loc   = styled(fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style tag_s = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style body  = styled(fmt::emphasis::faint);
+    const fmt::text_style caret = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::red));
+
+    // The tag names itself only when it is defined and in range; an x/z tag (an
+    // uninitialized tagged union, LRM 11.9) or a value past the member table
+    // names no member at all.
+    std::string held;
+    if (tag_unknown != 0) {
+        held = "undefined (x)";
+    } else if (tag < site->count) {
+        held = fmt::format("`{}`", std::string_view(site->names[tag], site->name_lens[tag]));
+    } else {
+        held = fmt::format("no member (tag {})", tag);
+    }
+
+    std::string when;
+    append_finish_time(when, now);
+    const char* const verb = site->is_write != 0 ? "assignment to" : "read of";
+    // Each styled run stops short of the newline: fmt closes a style after
+    // everything it formatted, and a reset that lands past the line break leaves
+    // the style live across it.
+    fmt::print(stderr, label, "fatal:");
+    fmt::print(stderr, head, " {} tagged-union member `{}`, which the current tag does not select",
+               verb, site->member);
+    fmt::print(stderr, "\n");
+    fmt::print(stderr, loc, "{}", site->where);
+    fmt::print(stderr, "\n");
+    if (site->line != nullptr && site->line[0] != '\0') {
+        const std::string text = snippet_text(site->line);
+        print_snippet(text, site->line_no,
+                      { SnippetMark{ site->column, mark_width(site->column, site->end_column),
+                                     '^' } },
+                      loc, caret);
+    }
+    fmt::print(stderr, tag_s, "  note:");
+    fmt::print(stderr, body, " the tag selects {} at {}", held, when);
+    fmt::print(stderr, "\n");
+    fmt::print(stderr, tag_s, "  note:");
+    fmt::print(stderr, body, " a tagged union's tag and value change only together, through a whole-value "
+                             "`tagged` expression -- assign `tagged {} (...)` before reaching this member "
+                             "(LRM 11.9)",
+               site->member);
+    fmt::print(stderr, "\n");
+    std::fflush(stderr);
+
+    rt_vcd_close();
+    rt_finishing = 1;
+    // Same reasoning as rt_null_handle: there is no defined state to hand back to
+    // the host mid-instant, and std::exit keeps the nonzero status that
+    // distinguishes this from a clean run.
+    std::exit(1);
+}
+
 // ---- Checked heap allocation ----
 
 namespace {
@@ -4358,12 +4505,33 @@ extern "C" void rt_string_substr(rt_string* dst, const rt_string* src, int32_t i
 
 extern "C" void rt_enum_name(rt_string* dst, const uint8_t* val, uint32_t vbytes, uint32_t count,
                              const uint8_t* values, const char* const* names, const uint32_t* lens,
-                             const rt_alloc_site* site) {
+                             uint32_t width, uint32_t fmt_fallback, const rt_alloc_site* site) {
     for (uint32_t k = 0; k < count; ++k) {
         if (std::memcmp(val, values + static_cast<size_t>(k) * vbytes, vbytes) == 0) {
             str_assign(dst, names[k], lens[k], site);
             return;
         }
+    }
+    if (fmt_fallback != 0) {
+        // LRM 21.2.1.6: "Otherwise the value shall print according to the base type
+        // of the enumeration" — under %p that is the ordinary integral leaf. Only the
+        // must plane reaches here, so an x/z-valued enum prints its must bits.
+        clotho::FormatSpec spec{};
+        spec.ok        = true;
+        spec.conv      = 'h';
+        spec.has_width = true; // width 0 => minimal digits (the %0h form)
+
+        // render_arg reads all three planes, so the unknown planes are materialized
+        // as zeros rather than left null.
+        const uint32_t        words = plane_words(width != 0 ? width : 1);
+        std::vector<uint64_t> mv(words, 0);
+        const std::vector<uint64_t> zero(words, 0);
+        std::memcpy(mv.data(), val, std::min<size_t>(vbytes, words * sizeof(uint64_t)));
+        std::string  s = "'h";
+        const rt_arg a{ width, 0, mv.data(), zero.data(), zero.data() };
+        render_arg(s, a, spec);
+        str_assign(dst, s.data(), static_cast<uint64_t>(s.size()), site);
+        return;
     }
     str_assign(dst, nullptr, 0, site); // No member matched: empty string (LRM 6.19.2).
 }
