@@ -6671,6 +6671,7 @@ private:
         const auto   i   = static_cast<uint32_t>(sig);
         llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel });
         b_.CreateStore(now, sym(event_trig_gv_[i]));
+        vcd_touch_event(sig);
         const auto any = static_cast<uint32_t>(Edge::Any);
         if (wait_sta_gv_[i][any] != nullptr) {
             service_static_queue(sig, any);
@@ -14348,6 +14349,22 @@ private:
         }
     }
 
+    // Emit an rt_vcd_touch for a dumped named event. Called from emit_event_fire,
+    // the one place every trigger form converges (`-> e` in a process body, the
+    // NBA-region service of `->> e`, and the `->> #d e` expiry thunk), so the dump
+    // sees an occurrence however it was produced.
+    void vcd_touch_event(Signal sig) {
+        if (!design_uses_vcd_) {
+            return;
+        }
+        const int32_t base = vcd_index_[static_cast<uint32_t>(sig)];
+        if (base >= 0) {
+            emit_guarded_vcd_touch(vcd_touch_fn(), [&] {
+                return llvm::SmallVector<llvm::Value*, 2>{ vcd_index_value(sig, base) };
+            });
+        }
+    }
+
     // $dumpfile: record the output path. A string-object filename is read straight
     // from its rt_string handle (natural byte order, forward=1); otherwise the
     // value is a packed-ASCII vector whose must-bits spill to a byte buffer
@@ -14418,32 +14435,39 @@ private:
     // Register one dumped signal: leaf name, width/flags, and live plane pointers.
     // An unpacked array expands to one $var per element (rt_vcd_array); a real /
     // shortreal carries RT_VCD_FLAG_REAL and dumps as `$var real` (the runtime
-    // formats the slot's IEEE-754 bit pattern as a decimal). A whole-design dump
+    // formats the slot's IEEE-754 bit pattern as a decimal); a named event carries
+    // RT_VCD_FLAG_EVENT and dumps as `$var event` (see below). A whole-design dump
     // must represent every declared signal, so an unrepresentable one (string,
-    // event, multidimensional array) loud-fails rather than being silently
-    // omitted; an unnamed compiler temporary is not a declared
-    // variable and is skipped.
+    // multidimensional array) loud-fails rather than being silently omitted; an unnamed compiler temporary is not a declared variable and is
+    // skipped.
     void emit_vcd_var(Signal sig) {
         const SignalInfo& info = mod_.signal(sig);
         if (info.name.empty()) {
             return;
         }
+        std::string leaf = info.name;
+        if (const auto pos = leaf.rfind('.'); pos != std::string::npos) {
+            leaf = leaf.substr(pos + 1);
+        }
+        auto* nullp = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
         if (info.is_event) {
-            // A named event (LRM 15.5) has no dumpable value; its 1-bit placeholder
-            // slot is never written. A whole-design dump must represent every
-            // declared signal, so loud-fail rather than emit a phantom wire.
-            throw BackendError{ "VCD dump of event '" + info.name + "' is not supported" };
+            // A named event (LRM 15.5) has no value -- its 1-bit placeholder slot
+            // is never written -- so what the dump carries is occurrences. The
+            // runtime watches the event's last-trigger tick (clotho.event_trig,
+            // stamped by emit_event_fire for every trigger form) and emits `1<id>`
+            // at each instant that stamp moves.
+            llvm::Value* np   = b_.CreateGlobalString(leaf, "vcd.var");
+            llvm::Value* nlen = b_.getInt32(static_cast<uint32_t>(leaf.size()));
+            b_.CreateCall(vcd_var_fn(), { np, nlen, b_.getInt32(1), b_.getInt32(16),
+                                          sym(event_trig_gv_[static_cast<uint32_t>(sig)]), nullp });
+            return;
         }
         const SignalSlot& s = slot_of(sig);
         if (s.is_string) {
             throw BackendError{ "VCD dump of string signal '" + info.name + "' is not supported" };
         }
-        std::string leaf = info.name;
-        if (const auto pos = leaf.rfind('.'); pos != std::string::npos) {
-            leaf = leaf.substr(pos + 1);
-        }
-        auto*          nullp = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
-        // Flag bits mirror RT_VCD_FLAG_* (Runtime.h): four-state, net, narrow, real.
+        // Flag bits mirror RT_VCD_FLAG_* (Runtime.h): four-state, net, narrow,
+        // real; the event bit is set on the branch above.
         const uint32_t flags = (s.four_state ? 1u : 0u) | (info.is_net ? 2u : 0u) | (s.narrow ? 4u : 0u)
                              | (s.is_real ? 8u : 0u);
         llvm::Value*   np    = b_.CreateGlobalString(leaf, "vcd.var");

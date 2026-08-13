@@ -601,3 +601,143 @@ TEST_CASE("vcd: $dumplimit(0) leaves the dump uncapped") {
     CHECK(!contains(vcd, "$comment"));
     CHECK(contains(body_of(vcd), "#495\n"));
 }
+
+TEST_CASE("vcd: a named event declares $var event and pulses at each trigger") {
+    // An event has occurrences, not a value: the declaration is `$var event 1`,
+    // and each trigger instant carries the bare pulse `1<id>` with no complement.
+    const std::string src = R"(
+        module top;
+          event e;
+          reg [1:0] r;
+          initial begin
+            $dumpfile("OUT.vcd");
+            $dumpvars;
+            r = 2'b10;
+            #5 -> e;
+            #5 -> e;
+            r = 2'b01;
+            #5 $finish;
+          end
+        endmodule
+    )";
+    const std::string vcd  = run_vcd(src);
+    const std::string body = body_of(vcd);
+    CHECK(contains(vcd, "$var event 1 ! e $end"));
+    // #0 states r only -- an event has no power-on value to dump, so the initial
+    // $dumpvars must not pulse it.
+    CHECK(body == "#0\nb10 \"\n#5\n1!\n#10\n1!\nb1 \"\n");
+}
+
+TEST_CASE("vcd: every trigger form reaches the dump, once per instant") {
+    // `-> e` (blocking), `->> e` (NBA region) and `->> #d e` (delayed) all converge
+    // on the same stamp-and-service path, so all three must pulse; two triggers of
+    // one event in a single instant collapse to the one pulse VCD can express.
+    const std::string src = R"(
+        module top;
+          event a, b, c;
+          initial begin
+            $dumpfile("OUT.vcd");
+            $dumpvars;
+            #5 ->> a;
+            #5 ->> #3 b;
+            #10 -> c; -> c;
+            #5 $finish;
+          end
+        endmodule
+    )";
+    const std::string body = body_of(run_vcd(src));
+    // a at #5, b at #10+3, c once at #20. Verified against iverilog 13, which
+    // writes the same three pulses at the same three instants.
+    CHECK(body == "#5\n1!\n#13\n1\"\n#20\n1#\n");
+}
+
+TEST_CASE("vcd: a forced dump does not invent an event trigger") {
+    // $dumpall / $dumpon re-state current values, and an event has none. A trigger
+    // missed while dumping was off must not surface as a pulse at the $dumpon
+    // instant either -- that would report an occurrence at a time it did not occur.
+    // (iverilog gets both of these wrong: it pulses every event at time 0, at
+    // $dumpall, and again at $dumpon.)
+    const std::string src = R"(
+        module top;
+          event e;
+          reg r;
+          initial begin
+            $dumpfile("OUT.vcd");
+            $dumpvars;
+            r = 0;
+            #5 $dumpall;
+            #5 $dumpoff;
+            #2 -> e;
+            #3 $dumpon;
+            #5 -> e;
+            #5 $finish;
+          end
+        endmodule
+    )";
+    const std::string body = body_of(run_vcd(src));
+    // #0 r=0; #5 $dumpall re-states r alone; #10 the $dumpoff checkpoint makes r
+    // unknown (the event is skipped, it has nothing to make unknown); #15 $dumpon
+    // re-states r; #20 the real trigger.
+    CHECK(body == "#0\n0\"\n#5\n0\"\n#10\nx\"\n#15\n0\"\n#20\n1!\n");
+}
+
+TEST_CASE("vcd: an event triggering at the dumpvars instant still pulses") {
+    // The never-triggered sentinel is UINT64_MAX, so a trigger at tick 0 is a real
+    // change against it -- the initial dump must carry the pulse rather than lose
+    // it to the shadow starting at zero.
+    const std::string src = R"(
+        module top;
+          event e;
+          initial begin
+            $dumpfile("OUT.vcd");
+            $dumpvars;
+            -> e;
+            #5 $finish;
+          end
+        endmodule
+    )";
+    const std::string body = body_of(run_vcd(src));
+    CHECK(body == "#0\n1!\n");
+}
+
+TEST_CASE("vcd: events in submodules dump in their own scope") {
+    const std::string src = R"(
+        module sub;
+          event se;
+          initial #7 -> se;
+        endmodule
+        module top;
+          event e;
+          sub u();
+          initial begin
+            $dumpfile("OUT.vcd");
+            $dumpvars;
+            #5 -> e;
+            #10 $finish;
+          end
+        endmodule
+    )";
+    const std::string vcd = run_vcd(src);
+    CHECK(contains(vcd, "$scope module top $end\n$var event 1 ! e $end\n$scope module u $end\n"
+                        "$var event 1 \" se $end\n$upscope $end\n$upscope $end\n"));
+    CHECK(body_of(vcd) == "#5\n1!\n#7\n1\"\n");
+}
+
+TEST_CASE("vcd: a checkpoint with nothing to checkpoint writes no time marker") {
+    // $dumpoff makes every dumped variable unknown, but an event has no value to
+    // make unknown. When events are all there is, the checkpoint must write
+    // nothing at all rather than a bare `#tick` with no changes under it.
+    const std::string src = R"(
+        module top;
+          event e;
+          initial begin
+            $dumpfile("OUT.vcd");
+            $dumpvars;
+            #5 -> e;
+            #5 $dumpoff;
+            #5 $finish;
+          end
+        endmodule
+    )";
+    CHECK(body_of(run_vcd(src)) == "#5\n1!\n");
+}

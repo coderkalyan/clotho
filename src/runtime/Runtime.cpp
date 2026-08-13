@@ -4600,6 +4600,10 @@ struct VcdVar {
     // real / shortreal: the value word is an IEEE-754 bit pattern, dumped as
     // `r<decimal>` rather than as bits (LRM §21.7.2.1 vector_value_change).
     bool           is_real     = false;
+    // named event (LRM 15.5): no value, only occurrences. `mm` points at the
+    // event's 64-bit last-trigger tick, so the ordinary shadow diff detects a
+    // trigger, and the emitted change is the bare pulse `1<id>`.
+    bool           is_event    = false;
     bool           seen        = false;   // shadow valid (a value has been dumped)
     // Shadow of the last dumped *raw* slot: mm_bytes of the mm field, then z_bytes
     // of the z field. The diff is a memcmp of these against the live slot; the
@@ -4848,7 +4852,8 @@ void vcd_emit_real(const VcdVar& v, const uint64_t* must, const uint64_t* may) {
 // little-endian words). Scalars print the value char then the id; vectors print
 // `b<bits> <id>` with the LRM §21.7.2.1 asymmetric leading-bit compression
 // (leftmost printed digit sets the reader's left-extension: 0->0, x->x, z->z, but
-// 1->0, so a 1-MSB cannot be compressed). A real prints `r<decimal> <id>`.
+// 1->0, so a 1-MSB cannot be compressed). A real prints `r<decimal> <id>`, and a
+// named event the bare pulse `1<id>`.
 void vcd_emit(const VcdVar& v, const uint64_t* must, const uint64_t* may, const uint64_t* z) {
     const auto bitc = [&](uint32_t i) -> char {
         const uint64_t m = 1ull << (i & 63);
@@ -4863,6 +4868,16 @@ void vcd_emit(const VcdVar& v, const uint64_t* must, const uint64_t* may, const 
     };
     if (v.is_real) {
         vcd_emit_real(v, must, may);
+        return;
+    }
+    if (v.is_event) {
+        // An event occurrence has no value and no complement: VCD writes `1<id>`
+        // at the instant it triggers and nothing at any other instant. Repeated
+        // triggers within one instant collapse into this single pulse, which is
+        // all the format can express (LRM §21.7.2.1 declares the `event` var
+        // type; iverilog writes the same line).
+        vcd_put('1');
+        vcd_puts(v.suffix);
         return;
     }
     // One capacity check for the whole line: 'b' + up to width digits + suffix. Then
@@ -5181,15 +5196,29 @@ static void vcd_register(std::string_view ref, uint32_t width, uint32_t flags, c
     v.four_state = (flags & RT_VCD_FLAG_FOUR_STATE) != 0;
     v.narrow     = (flags & RT_VCD_FLAG_NARROW) != 0;
     v.is_real    = (flags & RT_VCD_FLAG_REAL) != 0;
+    v.is_event   = (flags & RT_VCD_FLAG_EVENT) != 0;
     v.idcode     = vcd_idcode(g_vcd.next_id++);
     v.mm_bytes   = v.narrow ? (width + 7) / 8 : (2 * width + 7) / 8;
     v.z_bytes    = z != nullptr ? (width + 7) / 8 : 0;
-    v.shadow.assign(static_cast<size_t>(v.mm_bytes) + v.z_bytes, 0);
+    if (v.is_event) {
+        // `mm` is the event's 64-bit last-trigger tick, not a value slot: diff all
+        // eight bytes, and seed the shadow with the same never-triggered sentinel
+        // the design state holds, so a trigger at tick 0 still reads as a change.
+        // `seen` starts true for the same reason -- there is no power-on value to
+        // dump, only occurrences.
+        v.mm_bytes = sizeof(uint64_t);
+        v.z_bytes  = 0;
+        v.seen     = true;
+        v.shadow.assign(v.mm_bytes, 0xFF);
+    } else {
+        v.shadow.assign(static_cast<size_t>(v.mm_bytes) + v.z_bytes, 0);
+    }
     v.suffix     = width == 1 ? v.idcode + "\n" : " " + v.idcode + "\n";
     if (v.nwords > g_vcd.max_nwords) {
         g_vcd.max_nwords = v.nwords;
     }
     const char* vtype = v.is_real                          ? "real"
+                        : v.is_event                       ? "event"
                         : (flags & RT_VCD_FLAG_NET) != 0   ? "wire"
                                                            : "reg";
     vcd_puts("$var ");
@@ -5306,10 +5335,18 @@ extern "C" void rt_vcd_flush(uint64_t tick) {
     uint64_t* const scan  = g_vcd.scratch.data();
     const uint32_t  nvars = static_cast<uint32_t>(g_vcd.vars.size());
     if (g_vcd.pending_off) {
-        // $dumpoff checkpoint: mark every variable all-x at this instant.
+        // $dumpoff checkpoint: mark every variable all-x at this instant. An event
+        // is skipped -- it has no value to make unknown, and `1<id>` here would
+        // read as a trigger that never happened.
+        const size_t cmark = g_vcd.recbuf.size();
         vcd_rec_time(tick);
+        bool checkpointed = false;
         for (uint32_t i = 0; i < nvars; ++i) {
-            VcdVar&        v  = g_vcd.vars[i];
+            VcdVar& v = g_vcd.vars[i];
+            if (v.is_event) {
+                g_vcd.epoch[i] = 0;
+                continue;
+            }
             const uint32_t nw = v.nwords;
             std::memset(scan, 0, static_cast<size_t>(3) * nw * 8);   // must = 0, z = 0
             for (uint32_t k = 0; k < nw; ++k) {
@@ -5317,10 +5354,16 @@ extern "C" void rt_vcd_flush(uint64_t tick) {
             }
             scan[2 * nw - 1] &= vcd_topmask(v.width);
             vcd_rec_change(i, scan, nw);
+            checkpointed = true;
             // The shadow (raw slot) is left stale: $dumpon re-arms a full dump
             // (force_all), which re-emits every variable and rewrites the shadow.
             v.seen         = true;
             g_vcd.epoch[i] = 0;
+        }
+        if (!checkpointed) {
+            // Nothing to make unknown (a design whose only dumped variables are
+            // events): drop the marker rather than write a bare `#tick`.
+            g_vcd.recbuf.resize(cmark);
         }
         g_vcd.pending_off = false;
         g_vcd.active      = false;
@@ -5341,7 +5384,22 @@ extern "C" void rt_vcd_flush(uint64_t tick) {
     bool any = false;
     if (g_vcd.force_all) {
         for (uint32_t i = 0; i < nvars; ++i) {
-            g_vcd.epoch[i] = 0;
+            const bool touched = g_vcd.epoch[i] != 0;
+            g_vcd.epoch[i]     = 0;
+            VcdVar& v          = g_vcd.vars[i];
+            if (v.is_event) {
+                // A forced dump ($dumpvars / $dumpall / $dumpon) states current
+                // values, and an event has none -- it is emitted only when it
+                // actually triggers. So pulse only if it triggered this instant,
+                // and otherwise resync the shadow, which keeps a trigger that
+                // happened while dumping was off from surfacing as a pulse here.
+                if (touched) {
+                    any |= vcd_scan_var(i, false);
+                } else {
+                    std::memcpy(v.shadow.data(), v.mm, v.mm_bytes);
+                }
+                continue;
+            }
             any |= vcd_scan_var(i, true);
         }
     } else {

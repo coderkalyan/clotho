@@ -543,11 +543,15 @@ void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8
 // rt_vcd_var flags: bit 0 four-state (has x/z), bit 1 net (`wire` vs `reg` var),
 // bit 2 narrow (a 2-state `{ iW }` slot: read the single iW word as the value,
 // with must == may and no z plane), bit 3 real (the value word is an IEEE-754 bit
-// pattern -- `$var real`, dumped as `r<decimal>`; width 64 double / 32 shortreal).
+// pattern -- `$var real`, dumped as `r<decimal>`; width 64 double / 32 shortreal),
+// bit 4 event (`$var event 1`, dumped as the bare pulse `1<id>` at each trigger;
+// `mm` points at the event's 64-bit last-trigger tick rather than a value slot,
+// and `z` is null).
 #define RT_VCD_FLAG_FOUR_STATE 1u
 #define RT_VCD_FLAG_NET        2u
 #define RT_VCD_FLAG_NARROW     4u
 #define RT_VCD_FLAG_REAL       8u
+#define RT_VCD_FLAG_EVENT      16u
 
 // $dumpfile: record the output path. When `forward` is 0 the path is a right-
 // justified packed-ASCII vector (byte 0 = last character), as the backend spills a
