@@ -431,3 +431,173 @@ TEST_CASE("vcd: $dumpvars(0, top) matches the bare whole-design form") {
     )";
     CHECK(body_of(run_vcd(bare)) == body_of(run_vcd(scoped)));
 }
+
+TEST_CASE("vcd: dump opened from a task traces the whole run") {
+    // $dumpfile / $dumpvars are legal in a task a process calls. The design-wide
+    // "does this design dump?" scan used to look at process bodies only, so the
+    // per-instant flush was never emitted and the file held just the final
+    // instant. Compare against the same setup written inline.
+    const std::string in_task = R"(
+        module top;
+          reg [3:0] count = 0;
+          always #5 count = count + 1;
+          task automatic open_dump;
+            $dumpfile("OUT.vcd");
+            $dumpvars(0, top);
+          endtask
+          initial begin
+            open_dump();
+            #18 $finish;
+          end
+        endmodule
+    )";
+    const std::string inline_ = R"(
+        module top;
+          reg [3:0] count = 0;
+          always #5 count = count + 1;
+          initial begin
+            $dumpfile("OUT.vcd");
+            $dumpvars(0, top);
+            #18 $finish;
+          end
+        endmodule
+    )";
+    const std::string body = body_of(run_vcd(in_task));
+    CHECK(body == body_of(run_vcd(inline_)));
+    CHECK(body == "#0\nb0 !\n#5\nb1 !\n#10\nb10 !\n#15\nb11 !\n");
+}
+
+TEST_CASE("vcd: reals dump as $var real with decimal values") {
+    // A real/shortreal has no bit representation in the file: it declares as
+    // `$var real` and each change is `r<decimal> <id>` (LRM §21.7.2.1). The
+    // decimals are the shortest round-tripping form, so 1/3 keeps all 16 digits a
+    // double needs and -0.125 stays exact.
+    const std::string src = R"(
+        module top;
+          real r;
+          shortreal s;
+          initial begin
+            $dumpfile("OUT.vcd");
+            $dumpvars;
+            r = 1.5;
+            s = 2.5;
+            #5 r = -0.125;
+            #5 r = 1.0 / 3.0;
+            #5 $finish;
+          end
+        endmodule
+    )";
+    const std::string vcd = run_vcd(src);
+    // The size field is meaningless for a real, and is 64 for both widths.
+    CHECK(contains(vcd, "$var real 64 ! r $end"));
+    CHECK(contains(vcd, "$var real 64 \" s $end"));
+    CHECK(body_of(vcd)
+          == "#0\nr1.5 !\nr2.5 \"\n"
+             "#5\nr-0.125 !\n"
+             "#10\nr0.3333333333333333 !\n");
+}
+
+TEST_CASE("vcd: a real powers on at zero and checkpoints as NaN under $dumpoff") {
+    // A real has no x, so the all-x $dumpoff checkpoint has no bit pattern to
+    // write; NaN is the value it cannot otherwise hold (and iverilog's spelling).
+    const std::string src = R"(
+        module top;
+          real r;
+          initial begin
+            $dumpfile("OUT.vcd");
+            $dumpvars;
+            #5 r = 1.5;
+            #5 $dumpoff;
+            #5 $dumpon;
+            #5 $finish;
+          end
+        endmodule
+    )";
+    CHECK(body_of(run_vcd(src)) == "#0\nr0 !\n#5\nr1.5 !\n#10\nrNaN !\n#15\nr1.5 !\n");
+}
+
+TEST_CASE("vcd: real memories and nonblocking real targets are dumped per change") {
+    // Reals ride the ordinary dumped-signal paths: one $var per array element, and
+    // the NBA commit touch marks a real target dirty like any other scalar.
+    const std::string src = R"(
+        module top;
+          reg clk = 0;
+          real mem [0:1];
+          real q;
+          always #5 clk = ~clk;
+          always @(posedge clk) q <= 2.5;
+          initial begin
+            $dumpfile("OUT.vcd");
+            $dumpvars;
+            mem[0] = 0.5;
+            mem[1] = -1.0;
+            #8 $finish;
+          end
+        endmodule
+    )";
+    const std::string vcd = run_vcd(src);
+    CHECK(contains(vcd, "$var real 64 \" mem[0] $end"));
+    CHECK(contains(vcd, "$var real 64 # mem[1] $end"));
+    CHECK(body_of(vcd) == "#0\n0!\nr0.5 \"\nr-1 #\nr0 $\n#5\n1!\nr2.5 $\n");
+}
+
+TEST_CASE("vcd: $dumplimit stops the dump at an instant boundary and says so") {
+    // LRM §21.7.1.5: dumping stops when the file reaches the limit and a comment
+    // records it. The cap is tested at instant boundaries, so the file holds whole
+    // instants only -- byte-identical to the uncapped dump up to the cut. Once cut,
+    // nothing resumes it: the trailing $dumpon / $dumpall add nothing.
+    const std::string capped_src = R"(
+        module top;
+          reg [7:0] a = 0;
+          always #5 a = a + 1;
+          initial begin
+            $dumpfile("OUT.vcd");
+            $dumplimit(300);
+            $dumpvars;
+            #500 $dumpon;
+            #5 $dumpall;
+            #5 $finish;
+          end
+        endmodule
+    )";
+    const std::string uncapped_src = R"(
+        module top;
+          reg [7:0] a = 0;
+          always #5 a = a + 1;
+          initial begin
+            $dumpfile("OUT.vcd");
+            $dumpvars;
+            #500 $dumpon;
+            #5 $dumpall;
+            #5 $finish;
+          end
+        endmodule
+    )";
+    const std::string capped   = run_vcd(capped_src);
+    const std::string uncapped = run_vcd(uncapped_src);
+
+    const std::string_view note = "$comment Dump file limit (300 bytes) reached. $end\n";
+    REQUIRE(capped.ends_with(note));
+    const std::string kept = capped.substr(0, capped.size() - note.size());
+    CHECK(uncapped.starts_with(kept));      // whole instants, identical content
+    CHECK(kept.size() >= 300);              // cut at the first boundary past the cap
+    CHECK(kept.size() < uncapped.size());   // and the run really was truncated
+}
+
+TEST_CASE("vcd: $dumplimit(0) leaves the dump uncapped") {
+    const std::string src = R"(
+        module top;
+          reg [7:0] a = 0;
+          always #5 a = a + 1;
+          initial begin
+            $dumpfile("OUT.vcd");
+            $dumplimit(0);
+            $dumpvars;
+            #500 $finish;
+          end
+        endmodule
+    )";
+    const std::string vcd = run_vcd(src);
+    CHECK(!contains(vcd, "$comment"));
+    CHECK(contains(body_of(vcd), "#495\n"));
+}

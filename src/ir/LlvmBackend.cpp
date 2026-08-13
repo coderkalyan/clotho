@@ -1335,13 +1335,22 @@ private:
     }
     // Deep-copy one handle into another (value semantics), picking the runtime
     // function and element descriptor from the type.
+    //
+    // Emitted for subroutine copy-in / copy-out and return copy-out. Those are ABI
+    // plumbing at the call boundary rather than a lowered instruction, so no Index
+    // is in scope and the allocation reports its location as "<unknown>".
     void emit_handle_assign(llvm::Value* dst, llvm::Value* src, Ref type) {
+        const SourceText at{ .where = "<unknown>" };
         if (is_assoc_type(type)) {
-            b_.CreateCall(assoc_assign_fn(), { dst, src, elem_ops_global(type) });
+            b_.CreateCall(
+              assoc_assign_fn(),
+              { dst, src, elem_ops_global(type), alloc_site_global(at, "associative array") });
             return;
         }
-        b_.CreateCall(is_queue_type(type) ? queue_assign_fn() : dynarr_assign_fn(),
-                      { dst, src, elem_ops_global(type) });
+        const bool q = is_queue_type(type);
+        b_.CreateCall(q ? queue_assign_fn() : dynarr_assign_fn(),
+                      { dst, src, elem_ops_global(type),
+                        alloc_site_global(at, q ? "queue" : "dynamic array") });
     }
     // Destroy a handle's elements and free its storage (reset to empty).
     void emit_handle_delete(llvm::Value* handle, Ref type) {
@@ -3640,9 +3649,13 @@ private:
             if (f.arg_dirs[k] == ArgDir::In) {
                 if (is_string_type(f.param_types[k])) {
                     // Deep copy the caller's handle into the frame local (value
-                    // semantics; the frame slot was init'd by init_frame).
+                    // semantics; the frame slot was init'd by init_frame). Prologue
+                    // copy-in is ABI plumbing with no Index in scope, so the
+                    // allocation reports its location as "<unknown>".
                     b_.CreateCall(str_assign_fn(),
-                                  { b_.CreateStructGEP(frame_ty_, frame_, k), fn_->getArg(base) });
+                                  { b_.CreateStructGEP(frame_ty_, frame_, k), fn_->getArg(base),
+                                    alloc_site_global(SourceText{ .where = "<unknown>" },
+                                                      "string") });
                     continue;
                 }
                 lower_store(local_lvalue(k), Plane{ fn_->getArg(base), fn_->getArg(base + 1) });
@@ -7964,15 +7977,17 @@ private:
     // where noted.
     // -- Dynamic array runtime (rt_dynarr_*, LRM 7.5) --
     // void rt_dynarr_new(rt_dynarr*, i64 stride, i64 n, const void* proto)
-    // void rt_dynarr_new(rt_dynarr*, const rt_elem_ops*, u64 n)
+    // void rt_dynarr_new(rt_dynarr*, const rt_elem_ops*, i64 n, const rt_alloc_site*)
     llvm::FunctionCallee dynarr_new_fn() {
-        return rt_fn("rt_dynarr_new", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+        return rt_fn("rt_dynarr_new", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
     }
     // void rt_dynarr_new_copy(rt_dynarr*, i64 stride, i64 n, const void* proto, const rt_dynarr* src)
-    // void rt_dynarr_new_copy(rt_dynarr*, const rt_elem_ops*, u64 n, const rt_dynarr* src)
+    // void rt_dynarr_new_copy(rt_dynarr*, const rt_elem_ops*, i64 n, const rt_dynarr* src,
+    //                         const rt_alloc_site*)
     llvm::FunctionCallee dynarr_new_copy_fn() {
         return rt_fn("rt_dynarr_new_copy", b_.getVoidTy(),
-                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
     // void rt_dynarr_delete(rt_dynarr*)
     // void rt_dynarr_delete(rt_dynarr*, const rt_elem_ops*)
@@ -7980,9 +7995,10 @@ private:
         return rt_fn("rt_dynarr_delete", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
     // void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, i64 stride)
-    // void rt_dynarr_assign(rt_dynarr*, const rt_dynarr*, const rt_elem_ops*)
+    // void rt_dynarr_assign(rt_dynarr*, const rt_dynarr*, const rt_elem_ops*, const rt_alloc_site*)
     llvm::FunctionCallee dynarr_assign_fn() {
-        return rt_fn("rt_dynarr_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
+        return rt_fn("rt_dynarr_assign", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
     // void rt_dynarr_reverse(rt_dynarr*, i64 stride)  (LRM 7.12.2)
     llvm::FunctionCallee dynarr_reverse_fn() {
@@ -8000,10 +8016,11 @@ private:
 
     // -- Queue runtime (rt_queue_*, LRM 7.10) --
     // void rt_queue_push_{back,front}(rt_queue*, i64 stride, i64 bound, const void* elem)
-    // void rt_queue_push_{back,front}(rt_queue*, const rt_elem_ops*, u64 bound, const void* elem)
+    // void rt_queue_push_{back,front}(rt_queue*, const rt_elem_ops*, u64 bound, const void* elem,
+    //                                 const rt_alloc_site*)
     llvm::FunctionCallee queue_push_fn(bool front) {
         return rt_fn(front ? "rt_queue_push_front" : "rt_queue_push_back", b_.getVoidTy(),
-                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
     // void rt_queue_pop_{back,front}(rt_queue*, i64 stride, void* out)
     // void rt_queue_pop_{back,front}(rt_queue*, const rt_elem_ops*, void* out)
@@ -8012,10 +8029,12 @@ private:
                      { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
     // void rt_queue_insert(rt_queue*, i64 stride, i64 bound, i64 i, const void* elem)
-    // void rt_queue_insert(rt_queue*, const rt_elem_ops*, u64 bound, u64 i, const void* elem)
+    // void rt_queue_insert(rt_queue*, const rt_elem_ops*, u64 bound, u64 i, const void* elem,
+    //                      const rt_alloc_site*)
     llvm::FunctionCallee queue_insert_fn() {
         return rt_fn("rt_queue_insert", b_.getVoidTy(),
-                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), raw_ptr_ty() });
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), raw_ptr_ty(),
+                       raw_ptr_ty() });
     }
     // void rt_queue_delete_idx(rt_queue*, i64 stride, i64 i)
     // void rt_queue_delete_idx(rt_queue*, const rt_elem_ops*, u64 i)
@@ -8028,26 +8047,29 @@ private:
     llvm::FunctionCallee queue_delete_all_fn() {
         return rt_fn("rt_queue_delete_all", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
-    // void rt_queue_assign(rt_queue* dst, const rt_queue* src, i64 stride)
-    // void rt_queue_assign(rt_queue*, const rt_queue*, const rt_elem_ops*)
+    // void rt_queue_assign_dynarr(rt_queue*, const rt_dynarr*, const rt_elem_ops*,
+    //                             const rt_alloc_site*)
     llvm::FunctionCallee queue_assign_dynarr_fn() {
         return rt_fn("rt_queue_assign_dynarr", b_.getVoidTy(),
-                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
+                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
 
+    // void rt_queue_assign(rt_queue*, const rt_queue*, const rt_elem_ops*, const rt_alloc_site*)
     llvm::FunctionCallee queue_assign_fn() {
-        return rt_fn("rt_queue_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
+        return rt_fn("rt_queue_assign", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
     // void rt_queue_move(rt_queue* dst, rt_queue* src, const rt_elem_ops*)
     llvm::FunctionCallee queue_move_fn() {
         return rt_fn("rt_queue_move", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
     // void rt_queue_append_range(rt_queue* dst, const rt_queue* src,
-    //                            const rt_elem_ops*, u64 bound, i64 lo, i64 hi)
+    //                            const rt_elem_ops*, u64 bound, i64 lo, i64 hi,
+    //                            const rt_alloc_site*)
     llvm::FunctionCallee queue_append_range_fn() {
         return rt_fn("rt_queue_append_range", b_.getVoidTy(),
                      { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(),
-                       b_.getInt64Ty() });
+                       b_.getInt64Ty(), raw_ptr_ty() });
     }
     // void rt_queue_reverse(rt_queue*, i64 stride)  (LRM 7.12.2)
     llvm::FunctionCallee queue_reverse_fn() {
@@ -8071,10 +8093,11 @@ private:
         return rt_fn("rt_assoc_get_ptr", raw_ptr_ty(),
                      { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
     }
-    // void* rt_assoc_put_ptr(rt_assoc*, const rt_elem_ops*, const u8* kptr, u32 klen)
+    // void* rt_assoc_put_ptr(rt_assoc*, const rt_elem_ops*, const u8* kptr, u32 klen,
+    //                        const rt_alloc_site*)
     llvm::FunctionCallee assoc_put_ptr_fn() {
         return rt_fn("rt_assoc_put_ptr", raw_ptr_ty(),
-                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
     }
     // i32 rt_assoc_exists(rt_assoc*, const u8* kptr, u32 klen)
     llvm::FunctionCallee assoc_exists_fn() {
@@ -8104,9 +8127,11 @@ private:
         return rt_fn(prev ? "rt_assoc_prev" : "rt_assoc_next", b_.getInt32Ty(),
                      { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
-    // void rt_assoc_assign(rt_assoc* dst, const rt_assoc* src, const rt_elem_ops*)
+    // void rt_assoc_assign(rt_assoc* dst, const rt_assoc* src, const rt_elem_ops*,
+    //                      const rt_alloc_site*)
     llvm::FunctionCallee assoc_assign_fn() {
-        return rt_fn("rt_assoc_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
+        return rt_fn("rt_assoc_assign", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
 
     llvm::FunctionCallee str_init_fn() {
@@ -8116,12 +8141,12 @@ private:
         return rt_fn("rt_string_deinit", b_.getVoidTy(), { raw_ptr_ty() });
     }
     llvm::FunctionCallee str_assign_fn() {
-        return rt_fn("rt_string_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+        return rt_fn("rt_string_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
-    // void rt_string_assign_bytes(rt_string*, const char* bytes, i64 len)
+    // void rt_string_assign_bytes(rt_string*, const char* bytes, i64 len, const rt_alloc_site*)
     llvm::FunctionCallee str_assign_bytes_fn() {
         return rt_fn("rt_string_assign_bytes", b_.getVoidTy(),
-                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
     }
     llvm::FunctionCallee str_len_fn() {
         return rt_fn("rt_string_len", b_.getInt64Ty(), { raw_ptr_ty() });
@@ -8130,10 +8155,12 @@ private:
         return rt_fn("rt_string_data", raw_ptr_ty(), { raw_ptr_ty() });
     }
     llvm::FunctionCallee str_concat_fn() {
-        return rt_fn("rt_string_concat", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+        return rt_fn("rt_string_concat", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
     }
     llvm::FunctionCallee str_repl_fn() {
-        return rt_fn("rt_string_repl", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+        return rt_fn("rt_string_repl", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
     }
     llvm::FunctionCallee str_cmp_fn() {
         return rt_fn("rt_string_cmp", b_.getInt32Ty(), { raw_ptr_ty(), raw_ptr_ty() });
@@ -8143,25 +8170,27 @@ private:
     }
     llvm::FunctionCallee str_substr_fn() {
         return rt_fn("rt_string_substr", b_.getVoidTy(),
-                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() });
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty() });
     }
     llvm::FunctionCallee str_upper_fn() {
-        return rt_fn("rt_string_toupper", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+        return rt_fn("rt_string_toupper", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
     // void rt_enum_name(rt_string* dst, const u8* val, u32 vbytes, u32 count,
-    //                   const u8* values, const char* const* names, const u32* lens)
+    //                   const u8* values, const char* const* names, const u32* lens,
+    //                   const rt_alloc_site*)
     llvm::FunctionCallee enum_name_fn() {
         return rt_fn("rt_enum_name", b_.getVoidTy(),
                      { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(),
-                       raw_ptr_ty(), raw_ptr_ty() });
+                       raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
     // void rt_container_format_p(rt_string* out, const void* handle, i32 is_queue,
-    //   i32 kind, i32 width, i32 is_signed, i32 four_state, i32 has_z, i32 z_off, i64 stride)
+    //   i32 kind, i32 width, i32 is_signed, i32 four_state, i32 has_z, i32 z_off, i64 stride,
+    //   const rt_alloc_site*)
     llvm::FunctionCallee container_fmt_p_fn() {
         return rt_fn("rt_container_format_p", b_.getVoidTy(),
                      { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(),
                        b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(),
-                       b_.getInt64Ty() });
+                       b_.getInt64Ty(), raw_ptr_ty() });
     }
     // i8 rt_container_eq(const void* a, const void* b, i32 is_queue, i32 kind, i32 width,
     //   i32 is_signed, i32 four_state, i32 has_z, i32 z_off, i64 stride)
@@ -8172,7 +8201,7 @@ private:
                        b_.getInt64Ty() });
     }
     llvm::FunctionCallee str_lower_fn() {
-        return rt_fn("rt_string_tolower", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+        return rt_fn("rt_string_tolower", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
     llvm::FunctionCallee str_putc_fn() {
         return rt_fn("rt_string_putc", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() });
@@ -8181,7 +8210,8 @@ private:
         return rt_fn("rt_string_getc", b_.getInt32Ty(), { raw_ptr_ty(), b_.getInt32Ty() });
     }
     llvm::FunctionCallee str_from_packed_fn() {
-        return rt_fn("rt_string_from_packed", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+        return rt_fn("rt_string_from_packed", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
     }
     llvm::FunctionCallee str_to_packed_fn() {
         return rt_fn("rt_string_to_packed", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
@@ -8202,19 +8232,20 @@ private:
         return rt_fn("rt_string_atoreal", b_.getDoubleTy(), { raw_ptr_ty() });
     }
     llvm::FunctionCallee str_itoa_fn() {
-        return rt_fn("rt_string_itoa", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() });
+        return rt_fn("rt_string_itoa", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
     }
     llvm::FunctionCallee str_hextoa_fn() {
-        return rt_fn("rt_string_hextoa", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() });
+        return rt_fn("rt_string_hextoa", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
     }
     llvm::FunctionCallee str_octtoa_fn() {
-        return rt_fn("rt_string_octtoa", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() });
+        return rt_fn("rt_string_octtoa", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
     }
     llvm::FunctionCallee str_bintoa_fn() {
-        return rt_fn("rt_string_bintoa", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() });
+        return rt_fn("rt_string_bintoa", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
     }
     llvm::FunctionCallee str_realtoa_fn() {
-        return rt_fn("rt_string_realtoa", b_.getVoidTy(), { raw_ptr_ty(), b_.getDoubleTy() });
+        return rt_fn("rt_string_realtoa", b_.getVoidTy(),
+                     { raw_ptr_ty(), b_.getDoubleTy(), raw_ptr_ty() });
     }
 
     // Timing wheel (rt_wheel_*); the ptr parameter is the rt_wheel.
@@ -9199,6 +9230,7 @@ private:
             case Inst::Tag::TaskCallVirtual:
             case Inst::Tag::DumpFile:
             case Inst::Tag::DumpVars:
+            case Inst::Tag::DumpLimit:
             case Inst::Tag::DumpOff:
             case Inst::Tag::DumpOn:
             case Inst::Tag::DumpAll:
@@ -9749,6 +9781,13 @@ private:
                 // object (reference semantics), unlike a value struct addressed
                 // inline. A following MemberSelect addresses a property.
                 llvm::Value* handle = must_of(value_of(p.op_type.op));
+                // A handle straight out of ClassNew is the address rt_alloc just
+                // returned, so the property default-initializer stores every
+                // `new` emits need no guard -- and rt_alloc carries no nonnull
+                // attribute for the optimizer to fold one away with.
+                if (ir_->tag(p.op_type.op) != Inst::Tag::ClassNew) {
+                    emit_null_handle_check(handle, i);
+                }
                 LValue       lv{};
                 lv.base      = b_.CreateIntToPtr(handle, raw_ptr_ty());
                 lv.root_ty   = class_body_ty(p.op_type.type);
@@ -9819,7 +9858,8 @@ private:
                     }
                     // Deep copy. Strings are guarded out of sensitivity lists in
                     // the frontend, so there is no wait queue to service.
-                    b_.CreateCall(str_assign_fn(), { lv_string_ptr(lv), str_of(p.binary.r) });
+                    b_.CreateCall(str_assign_fn(), { lv_string_ptr(lv), str_of(p.binary.r),
+                                                     alloc_site_global(loc_text(i), "string") });
                     return;
                 }
                 if (lv.is_assoc && (lv.assoc_val_string || lv.assoc_val_handle)) {
@@ -9829,7 +9869,8 @@ private:
                     // forwarding path (that only fires for Signal / Local targets).
                     const LValue el = assoc_elem_lvalue(lv, /*for_write=*/true);
                     if (el.is_string) {
-                        b_.CreateCall(str_assign_fn(), { lv_string_ptr(el), str_of(p.binary.r) });
+                        b_.CreateCall(str_assign_fn(), { lv_string_ptr(el), str_of(p.binary.r),
+                                                         alloc_site_global(loc_text(i), "string") });
                         return;
                     }
                     // TODO: nested-container (queue / dynamic / assoc) value write.
@@ -10323,8 +10364,9 @@ private:
                 return;
             case Inst::Tag::Repl:
                 if (type_of(i).is_string) {
-                    b_.CreateCall(str_repl_fn(),
-                                  { str_of(i), str_of(p.repl.value), b_.getInt64(p.repl.count) });
+                    b_.CreateCall(str_repl_fn(), { str_of(i), str_of(p.repl.value),
+                                                   b_.getInt64(p.repl.count),
+                                                   alloc_site_global(loc_text(i), "string") });
                     return;
                 }
                 set_value(i, lower_repl(value_of(p.repl.value), type_of(p.repl.value).width, p.repl.count));
@@ -10414,13 +10456,15 @@ private:
                 const LValue& lv = lvalue_of(p.binary.l);
                 llvm::Value*  v =
                   cast(must_of(value_of(p.binary.r)), 32, type_of(p.binary.r).is_signed);
-                b_.CreateCall(fn, { lv_string_ptr(lv), v });
+                b_.CreateCall(
+                  fn, { lv_string_ptr(lv), v, alloc_site_global(loc_text(i), "string") });
                 return;
             }
             case Inst::Tag::StrRealtoa: {
                 const LValue& lv = lvalue_of(p.binary.l);
                 llvm::Value*  v  = fp_of(value_of(p.binary.r));
-                b_.CreateCall(str_realtoa_fn(), { lv_string_ptr(lv), v });
+                b_.CreateCall(str_realtoa_fn(), { lv_string_ptr(lv), v,
+                                                  alloc_site_global(loc_text(i), "string") });
                 return;
             }
             case Inst::Tag::StrCmp:
@@ -10433,14 +10477,16 @@ private:
             case Inst::Tag::StrUpper:
             case Inst::Tag::StrLower: {
                 auto fn = ir_->tag(i) == Inst::Tag::StrUpper ? str_upper_fn() : str_lower_fn();
-                b_.CreateCall(fn, { str_of(i), str_of(p.unary) });
+                b_.CreateCall(
+                  fn, { str_of(i), str_of(p.unary), alloc_site_global(loc_text(i), "string") });
                 return;
             }
             case Inst::Tag::StrSubstr: {
                 const auto   ss = ir_->extra_data<StrSubstrInfo>(p.op_extra.extra);
                 llvm::Value* si = cast(must_of(value_of(ss.i)), 32, type_of(ss.i).is_signed);
                 llvm::Value* sj = cast(must_of(value_of(ss.j)), 32, type_of(ss.j).is_signed);
-                b_.CreateCall(str_substr_fn(), { str_of(i), str_of(p.op_extra.op), si, sj });
+                b_.CreateCall(str_substr_fn(), { str_of(i), str_of(p.op_extra.op), si, sj,
+                                                 alloc_site_global(loc_text(i), "string") });
                 return;
             }
             case Inst::Tag::EnumName: {
@@ -10477,8 +10523,9 @@ private:
                 const uint32_t spill  = plane_bytes(type_of(p.op_extra.op).width);
                 llvm::Value*   valbuf = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(spill), "enum.val");
                 b_.CreateAlignedStore(must_of(value_of(p.op_extra.op)), valbuf, llvm::Align(1));
-                b_.CreateCall(enum_name_fn(),
-                              { str_of(i), valbuf, b_.getInt32(vbytes), b_.getInt32(count), vg, ng, lg });
+                b_.CreateCall(enum_name_fn(), { str_of(i), valbuf, b_.getInt32(vbytes),
+                                                b_.getInt32(count), vg, ng, lg,
+                                                alloc_site_global(loc_text(i), "string") });
                 return;
             }
             case Inst::Tag::ContainerFmtP: {
@@ -10490,7 +10537,8 @@ private:
                               { str_of(i), lv_handle_ptr(lvalue_of(pt.op)), b_.getInt32(cf.is_queue),
                                 b_.getInt32(cf.kind), b_.getInt32(cf.width), b_.getInt32(cf.is_signed),
                                 b_.getInt32(cf.four), b_.getInt32(cf.has_z), b_.getInt32(cf.z_off),
-                                b_.getInt64(cf.stride) });
+                                b_.getInt64(cf.stride),
+                                alloc_site_global(loc_text(i), "string") });
                 return;
             }
             case Inst::Tag::StrFromPacked: {
@@ -10501,7 +10549,8 @@ private:
                 const uint32_t pb  = plane_bytes(t.width);
                 llvm::Value*   buf = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(pb), "str.pack");
                 b_.CreateAlignedStore(must_of(value_of(p.unary)), buf, llvm::Align(1));
-                b_.CreateCall(str_from_packed_fn(), { str_of(i), buf, b_.getInt32(t.width) });
+                b_.CreateCall(str_from_packed_fn(), { str_of(i), buf, b_.getInt32(t.width),
+                                                      alloc_site_global(loc_text(i), "string") });
                 return;
             }
             case Inst::Tag::StrToPacked: {
@@ -10725,6 +10774,10 @@ private:
                 lower_dump_vars();
                 return;
 
+            case Inst::Tag::DumpLimit:
+                lower_dump_limit(i);
+                return;
+
             case Inst::Tag::DumpOff:
             case Inst::Tag::DumpOn:
             case Inst::Tag::DumpAll:
@@ -10897,7 +10950,8 @@ private:
         const std::span<const uint8_t> bytes = mod_.pool.bytes(ref);
         llvm::Value*                   glob  = b_.CreateGlobalString(
           llvm::StringRef(reinterpret_cast<const char*>(bytes.data()), bytes.size()), "str.lit");
-        b_.CreateCall(str_assign_bytes_fn(), { str_of(i), glob, b_.getInt64(bytes.size()) });
+        b_.CreateCall(str_assign_bytes_fn(), { str_of(i), glob, b_.getInt64(bytes.size()),
+                                               alloc_site_global(loc_text(i), "string") });
     }
 
     // String concatenation: gather the part handles into a stack array and hand
@@ -10913,7 +10967,8 @@ private:
             b_.CreateStore(str_of(parts[k]),
                            b_.CreateInBoundsGEP(arr_ty, arr, { b_.getInt32(0), b_.getInt32(k) }));
         }
-        b_.CreateCall(str_concat_fn(), { str_of(i), arr, b_.getInt32(n) });
+        b_.CreateCall(str_concat_fn(), { str_of(i), arr, b_.getInt32(n),
+                                         alloc_site_global(loc_text(i), "string") });
     }
 
     // A string comparison operator: rt_string_cmp then a native compare against
@@ -11114,19 +11169,26 @@ private:
         const auto&   p  = ir_->payload(i).op_extra;
         const auto    da = ir_->extra_data<DynArrayArg>(p.extra);
         const DynElem e  = dynarr_elem(da.array_type);
-        llvm::Value*  n  = cast(must_of(value_of(da.arg)), 64, false);
-        b_.CreateCall(dynarr_new_fn(),
-                      { lv_handle_ptr(lvalue_of(p.op)), elem_ops_global(da.array_type), n });
+        // A signed count sign-extends so the runtime sees the negative the design
+        // actually wrote and can reject it (LRM 7.5.1); zero-extending would turn
+        // `new[-1]` on a 32-bit int into a 4294967295-element request. An unsigned
+        // count still zero-extends.
+        llvm::Value* n = cast(must_of(value_of(da.arg)), 64, type_of(da.arg).is_signed);
+        b_.CreateCall(dynarr_new_fn(), { lv_handle_ptr(lvalue_of(p.op)),
+                                         elem_ops_global(da.array_type), n,
+                                         alloc_site_global(loc_text(i), "dynamic array") });
     }
 
     void lower_dyn_array_new_init(Index i) {
         const auto&   p  = ir_->payload(i).op_extra;
         const auto    da = ir_->extra_data<DynArrayNewInitInfo>(p.extra);
         const DynElem e  = dynarr_elem(da.array_type);
-        llvm::Value*  n  = cast(must_of(value_of(da.size)), 64, false);
+        // Sign-extend a signed count, as in lower_dyn_array_new.
+        llvm::Value* n = cast(must_of(value_of(da.size)), 64, type_of(da.size).is_signed);
         b_.CreateCall(dynarr_new_copy_fn(),
                       { lv_handle_ptr(lvalue_of(p.op)), elem_ops_global(da.array_type), n,
-                        lv_handle_ptr(lvalue_of(da.src)) });
+                        lv_handle_ptr(lvalue_of(da.src)),
+                        alloc_site_global(loc_text(i), "dynamic array") });
     }
 
     void lower_dyn_array_size(Index i) {
@@ -11141,7 +11203,8 @@ private:
         const auto  da = ir_->extra_data<DynArrayArg>(p.extra);
         b_.CreateCall(dynarr_assign_fn(),
                       { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(da.arg)),
-                        elem_ops_global(da.array_type) });
+                        elem_ops_global(da.array_type),
+                        alloc_site_global(loc_text(i), "dynamic array") });
     }
 
     // Array ordering methods (LRM 7.12.2). Each carries only the handle lvalue +
@@ -11234,12 +11297,14 @@ private:
             // A string value is already an rt_string handle pointer; the runtime
             // deep-copies it into the new slot, so it is passed directly.
             b_.CreateCall(queue_push_fn(front),
-                          { lv_handle_ptr(lvalue_of(p.op)), ops, bound, str_of(qa.arg) });
+                          { lv_handle_ptr(lvalue_of(p.op)), ops, bound, str_of(qa.arg),
+                            alloc_site_global(loc_text(i), "queue") });
             return;
         }
         auto* scratch = entry_alloca(e.slot_ty, "q.elem");
         lower_store(elem_scratch_lvalue(scratch, e), value_of(qa.arg));
-        b_.CreateCall(queue_push_fn(front), { lv_handle_ptr(lvalue_of(p.op)), ops, bound, scratch });
+        b_.CreateCall(queue_push_fn(front), { lv_handle_ptr(lvalue_of(p.op)), ops, bound, scratch,
+                                              alloc_site_global(loc_text(i), "queue") });
     }
 
     void lower_queue_pop(Index i, bool front) {
@@ -11285,12 +11350,14 @@ private:
         // Inserting AT the size is an append, so the legal range is [0, size].
         emit_queue_bounds_check(i, handle, qi.idx, qlv, /*allow_append=*/true);
         if (e.is_string) {
-            b_.CreateCall(queue_insert_fn(), { handle, ops, bound, idx, str_of(qi.val) });
+            b_.CreateCall(queue_insert_fn(), { handle, ops, bound, idx, str_of(qi.val),
+                                               alloc_site_global(loc_text(i), "queue") });
             return;
         }
         auto* scratch = entry_alloca(e.slot_ty, "q.elem");
         lower_store(elem_scratch_lvalue(scratch, e), value_of(qi.val));
-        b_.CreateCall(queue_insert_fn(), { handle, ops, bound, idx, scratch });
+        b_.CreateCall(queue_insert_fn(),
+                      { handle, ops, bound, idx, scratch, alloc_site_global(loc_text(i), "queue") });
     }
 
     void lower_queue_delete_idx(Index i) {
@@ -11313,7 +11380,7 @@ private:
         const auto  qa = ir_->extra_data<QueueArg>(p.extra);
         b_.CreateCall(queue_assign_fn(),
                       { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qa.arg)),
-                        elem_ops_global(qa.queue_type) });
+                        elem_ops_global(qa.queue_type), alloc_site_global(loc_text(i), "queue") });
     }
 
     // q = d: deep copy a dynamic array (arg) into a queue (op). Source handle is
@@ -11323,7 +11390,7 @@ private:
         const auto  qa = ir_->extra_data<QueueArg>(p.extra);
         b_.CreateCall(queue_assign_dynarr_fn(),
                       { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qa.arg)),
-                        elem_ops_global(qa.queue_type) });
+                        elem_ops_global(qa.queue_type), alloc_site_global(loc_text(i), "queue") });
     }
 
     void lower_queue_append_range(Index i) {
@@ -11335,7 +11402,8 @@ private:
         llvm::Value* hi = cast(must_of(value_of(qs.hi)), 64, /*sign=*/true);
         b_.CreateCall(queue_append_range_fn(),
                       { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qs.src)),
-                        elem_ops_global(qs.queue_type), bound, lo, hi });
+                        elem_ops_global(qs.queue_type), bound, lo, hi,
+                        alloc_site_global(loc_text(i), "queue") });
     }
 
     // Queue ordering methods (LRM 7.12.2) — same shape as the dynarr variants
@@ -11447,11 +11515,12 @@ private:
     // Write a key span (kptr / klen) back into the key-variable lvalue (foreach /
     // first / next readout): inverse of the normalization above.
     void denormalize_assoc_key(llvm::Value* kptr, llvm::Value* klen, Ref assoc_type,
-                               const LValue& key_lv) {
+                               const LValue& key_lv, Index at) {
         const AssocKeyInfo info = assoc_key_info(assoc_type);
         if (info.is_string) {
-            b_.CreateCall(str_assign_bytes_fn(),
-                          { lv_string_ptr(key_lv), kptr, cast(klen, 64, false) });
+            b_.CreateCall(str_assign_bytes_fn(), { lv_string_ptr(key_lv), kptr,
+                                                   cast(klen, 64, false),
+                                                   alloc_site_global(loc_text(at), "string") });
             return;
         }
         const uint32_t nbytes = (info.W + 7) / 8;
@@ -11477,7 +11546,12 @@ private:
     // element lvalue over the heap slot: get_ptr for a read (absent -> the
     // dyn_inrange=false default path, no entry created), put_ptr for a write
     // (creates + proto-inits the entry).
+    //
+    // The resolver is shared with lower_agg_eq, which recurses over aggregate
+    // leaves without an Index, so no instruction location reaches here and an
+    // entry-creating allocation reports "<unknown>".
     LValue assoc_elem_lvalue(const LValue& lv, bool for_write) {
+        const SourceText at{ .where = "<unknown>" };
         // Aggregate value (unpacked struct / fixed array): the resolved slot is
         // the flat aggregate image. The is_agg lvalue (root_ty + agg_path + leaf
         // facts) was built by the MemberSelect / ElemSelect descent; only the base
@@ -11490,8 +11564,10 @@ private:
             el.is_assoc   = false;
             el.is_signal  = false;
             if (for_write) {
-                el.base = b_.CreateCall(
-                  assoc_put_ptr_fn(), { lv.assoc_handle, lv.assoc_ops, lv.assoc_key_ptr, lv.assoc_key_len });
+                el.base = b_.CreateCall(assoc_put_ptr_fn(),
+                                        { lv.assoc_handle, lv.assoc_ops, lv.assoc_key_ptr,
+                                          lv.assoc_key_len,
+                                          alloc_site_global(at, "associative array") });
                 return el;
             }
             llvm::Value* found = b_.CreateCall(
@@ -11512,8 +11588,10 @@ private:
             el.is_handle = lv.assoc_val_handle;
             el.slot_ty   = lv.slot_ty;
             if (for_write) {
-                el.base = b_.CreateCall(
-                  assoc_put_ptr_fn(), { lv.assoc_handle, lv.assoc_ops, lv.assoc_key_ptr, lv.assoc_key_len });
+                el.base = b_.CreateCall(assoc_put_ptr_fn(),
+                                        { lv.assoc_handle, lv.assoc_ops, lv.assoc_key_ptr,
+                                          lv.assoc_key_len,
+                                          alloc_site_global(at, "associative array") });
                 return el;
             }
             llvm::Value* found = b_.CreateCall(
@@ -11531,8 +11609,10 @@ private:
         el.bit_off     = b_.getInt32(0);
         el.width       = lv.width;
         if (for_write) {
-            el.base = b_.CreateCall(
-              assoc_put_ptr_fn(), { lv.assoc_handle, lv.assoc_ops, lv.assoc_key_ptr, lv.assoc_key_len });
+            el.base = b_.CreateCall(assoc_put_ptr_fn(),
+                                    { lv.assoc_handle, lv.assoc_ops, lv.assoc_key_ptr,
+                                      lv.assoc_key_len,
+                                      alloc_site_global(at, "associative array") });
             return el;
         }
         llvm::Value* found = b_.CreateCall(
@@ -11575,7 +11655,8 @@ private:
         const auto  aa = ir_->extra_data<AssocArg>(p.extra);
         b_.CreateCall(assoc_assign_fn(),
                       { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(aa.arg)),
-                        elem_ops_global(aa.assoc_type) });
+                        elem_ops_global(aa.assoc_type),
+                        alloc_site_global(loc_text(i), "associative array") });
     }
 
     // first / last / next / prev (LRM 7.9.3/7.9.4): write the ordered key into
@@ -11603,7 +11684,7 @@ private:
         b_.CreateCondBr(got, dobb, cont);
         b_.SetInsertPoint(dobb);
         denormalize_assoc_key(b_.CreateLoad(raw_ptr_ty(), outptr),
-                              b_.CreateLoad(b_.getInt32Ty(), outlen), aa.assoc_type, key_lv);
+                              b_.CreateLoad(b_.getInt32Ty(), outlen), aa.assoc_type, key_lv, i);
         b_.CreateBr(cont);
         b_.SetInsertPoint(cont);
         set_value(i, two_val(cast(status, 32, false)));
@@ -11835,8 +11916,9 @@ private:
         // The staged rt_queue starts at record field 1 (an aligned {i64 x4}).
         llvm::Value* staged = b_.CreateStructGEP(rt, rec, 1);
         b_.CreateMemSet(staged, b_.getInt8(0), b_.getInt64(4 * 8), llvm::MaybeAlign{ 1 });
-        b_.CreateCall(queue_assign_fn(),
-                      { staged, lv_handle_ptr(lvalue_of(qa.arg)), elem_ops_global(qa.queue_type) });
+        b_.CreateCall(queue_assign_fn(), { staged, lv_handle_ptr(lvalue_of(qa.arg)),
+                                           elem_ops_global(qa.queue_type),
+                                           alloc_site_global(loc_text(i), "queue") });
     }
 
     // Replay a queue's deferred whole-NBA records: move each staged buffer into
@@ -12169,7 +12251,7 @@ private:
     // none). Shared by the delay (`<= #d`) and event (`<= @e`) arms.
     llvm::Value* intra_pack_mm(const SignalSlot& s, Plane& rhs) {
         if (rhs.fp != nullptr) {
-            return real_to_planes(fp_of(rhs)).mm;
+            rhs = real_to_planes(fp_of(rhs));
         }
         if (s.narrow) {
             return must_of(rhs);
@@ -13177,6 +13259,89 @@ private:
         }
     }
 
+    // The rt_null_site record (Runtime.h): { ptr where, ptr line, i32 line_no,
+    // i32 column, i32 end_column }. Field order and types mirror the C struct
+    // exactly, so the two change together.
+    llvm::StructType* null_site_ty() {
+        auto* i32 = b_.getInt32Ty();
+        return llvm::StructType::get(ctx_, { raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32 });
+    }
+
+    // One constant rt_null_site per guarded dereference. Everything the fatal
+    // knows is compile-time, so only the simulation time travels as an argument.
+    llvm::Constant* null_site_global(const SourceText& at) {
+        auto* const i32  = b_.getInt32Ty();
+        auto* const rec  = null_site_ty();
+        auto*       init = llvm::ConstantStruct::get(
+          rec, { b_.CreateGlobalString(at.where, "null.at"),
+                 b_.CreateGlobalString(at.line, "null.src"),
+                 llvm::ConstantInt::get(i32, at.line_no), llvm::ConstantInt::get(i32, at.column),
+                 llvm::ConstantInt::get(i32, at.end_column) });
+        return new llvm::GlobalVariable(env_->llmod, rec, /*isConstant=*/true,
+                                        llvm::GlobalValue::PrivateLinkage, init,
+                                        "clotho.null.site");
+    }
+
+    // void rt_null_handle(ptr site, i64 now) — prints the located fatal and ends
+    // the simulation; never returns (see Runtime.h).
+    llvm::FunctionCallee null_handle_fn() {
+        return rt_fn("rt_null_handle", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
+    }
+
+    // Guard a class-handle dereference against null (LRM 8.4). The handle is raw
+    // pointer bits, so an unguarded inttoptr hands the property GEP address zero
+    // and the design dies in a segfault that names nothing; this turns it into a
+    // located fatal instead. Cost on the hot path is one compare against zero and
+    // a not-taken branch, weighted so the cold block sinks out of line; where the
+    // same handle value reaches two derefs unchanged, CSE folds the second
+    // compare away. The wheel fallback mirrors lower_case_viol: a dereference
+    // inside a pure function has no wheel and reports time 0.
+    void emit_null_handle_check(llvm::Value* handle, Index at) {
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* bad  = llvm::BasicBlock::Create(ctx_, "null.deref", fn);
+        auto* cont = llvm::BasicBlock::Create(ctx_, "deref.ok", fn);
+        auto* br   = b_.CreateCondBr(b_.CreateICmpEQ(handle, b_.getInt64(0)), bad, cont);
+        br->setMetadata(llvm::LLVMContext::MD_prof,
+                        llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
+
+        b_.SetInsertPoint(bad);
+        llvm::Value* now  = has_wheel()
+                              ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
+                              : static_cast<llvm::Value*>(b_.getInt64(0));
+        auto*        call = b_.CreateCall(null_handle_fn(), { null_site_global(loc_text(at)), now });
+        call->addFnAttr(llvm::Attribute::NoReturn);
+        call->addFnAttr(llvm::Attribute::Cold);
+        b_.CreateUnreachable();
+
+        b_.SetInsertPoint(cont);
+    }
+
+    // The rt_alloc_site record (Runtime.h): { ptr where, ptr line, ptr what,
+    // i32 line_no, i32 column, i32 end_column }. Field order and types mirror
+    // the C struct exactly, so the two change together.
+    llvm::StructType* alloc_site_ty() {
+        auto* i32 = b_.getInt32Ty();
+        return llvm::StructType::get(ctx_,
+                                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32 });
+    }
+
+    // One constant rt_alloc_site per allocating call. Everything the fatal knows
+    // is compile-time, so only the simulation time travels as an argument.
+    // `what` is the diagnostic noun naming the container being grown.
+    llvm::Constant* alloc_site_global(const SourceText& at, std::string_view what) {
+        auto* const i32  = b_.getInt32Ty();
+        auto* const rec  = alloc_site_ty();
+        auto*       init = llvm::ConstantStruct::get(
+          rec, { b_.CreateGlobalString(at.where, "alloc.at"),
+                 b_.CreateGlobalString(at.line, "alloc.src"),
+                 b_.CreateGlobalString(what, "alloc.what"),
+                 llvm::ConstantInt::get(i32, at.line_no), llvm::ConstantInt::get(i32, at.column),
+                 llvm::ConstantInt::get(i32, at.end_column) });
+        return new llvm::GlobalVariable(env_->llmod, rec, /*isConstant=*/true,
+                                        llvm::GlobalValue::PrivateLinkage, init,
+                                        "clotho.alloc.site");
+    }
+
     // void rt_severity(i32 level, ptr banner, ptr fmt, i32 argc, ptr argv) —
     // renders the message and writes the labelled diagnostic to stderr, then
     // returns (non-fatal).
@@ -13351,11 +13516,11 @@ private:
         return env_->llmod.getOrInsertFunction("rt_fgets", fnty);
     }
 
-    // i32 rt_fgets_str(rt_string* dst, i32 fd)
+    // i32 rt_fgets_str(rt_string* dst, i32 fd, const rt_alloc_site*)
     llvm::FunctionCallee fgets_str_fn() {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
-        auto* fnty = llvm::FunctionType::get(i32, { ptr, i32 }, false);
+        auto* fnty = llvm::FunctionType::get(i32, { ptr, i32, ptr }, false);
         return env_->llmod.getOrInsertFunction("rt_fgets_str", fnty);
     }
 
@@ -13370,7 +13535,8 @@ private:
         llvm::Value* fd  = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, true);
         const LValue& lv = lvalue_of(dst);
         if (lv.is_string) {
-            llvm::Value* r = b_.CreateCall(fgets_str_fn(), { lv_string_ptr(lv), fd });
+            llvm::Value* r = b_.CreateCall(
+              fgets_str_fn(), { lv_string_ptr(lv), fd, alloc_site_global(loc_text(i), "string") });
             set_value(i, packed(r, r, zero(32)));
             return;
         }
@@ -13420,10 +13586,12 @@ private:
         return env_->llmod.getOrInsertFunction("rt_sformat", fnty);
     }
 
-    // void rt_sformat_str(rt_string* dst, const char* fmt, i32 argc, const rt_arg* argv)
+    // void rt_sformat_str(rt_string* dst, const char* fmt, i32 argc, const rt_arg* argv,
+    //                     const rt_alloc_site*)
     llvm::FunctionCallee sformat_str_fn() {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, b_.getInt32Ty(), ptr }, false);
+        auto* fnty =
+          llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, b_.getInt32Ty(), ptr, ptr }, false);
         return env_->llmod.getOrInsertFunction("rt_sformat_str", fnty);
     }
 
@@ -13440,7 +13608,8 @@ private:
         llvm::Value*                 argc    = b_.getInt32(static_cast<uint32_t>(args.size()));
         const LValue&                lv      = lvalue_of(info.dst);
         if (lv.is_string) {
-            b_.CreateCall(sformat_str_fn(), { lv_string_ptr(lv), fmt_ptr, argc, arr });
+            b_.CreateCall(sformat_str_fn(), { lv_string_ptr(lv), fmt_ptr, argc, arr,
+                                              alloc_site_global(loc_text(i), "string") });
             return;
         }
         const auto [mm, z, width, flags] = string_dest(info.dst, "$sformat / $swrite");
@@ -13458,7 +13627,8 @@ private:
         llvm::Value*                 arr  = build_rt_args(args, "$sformatf");
         b_.CreateCall(sformat_str_fn(),
                       { str_of(i), b_.CreateGlobalString(fmt),
-                        b_.getInt32(static_cast<uint32_t>(args.size())), arr });
+                        b_.getInt32(static_cast<uint32_t>(args.size())), arr,
+                        alloc_site_global(loc_text(i), "string") });
     }
 
     // i32 rt_ferror(i32 fd, i8* mm, i8* z, i32 width, i32 flags)
@@ -13469,11 +13639,11 @@ private:
         return env_->llmod.getOrInsertFunction("rt_ferror", fnty);
     }
 
-    // i32 rt_ferror_str(i32 fd, rt_string* dst)
+    // i32 rt_ferror_str(i32 fd, rt_string* dst, const rt_alloc_site*)
     llvm::FunctionCallee ferror_str_fn() {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
-        auto* fnty = llvm::FunctionType::get(i32, { i32, ptr }, false);
+        auto* fnty = llvm::FunctionType::get(i32, { i32, ptr, ptr }, false);
         return env_->llmod.getOrInsertFunction("rt_ferror_str", fnty);
     }
 
@@ -13486,7 +13656,8 @@ private:
         llvm::Value*  fd  = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, true);
         const LValue& lv  = lvalue_of(dst);
         if (lv.is_string) {
-            llvm::Value* r = b_.CreateCall(ferror_str_fn(), { fd, lv_string_ptr(lv) });
+            llvm::Value* r = b_.CreateCall(
+              ferror_str_fn(), { fd, lv_string_ptr(lv), alloc_site_global(loc_text(i), "string") });
             set_value(i, packed(r, r, zero(32)));
             return;
         }
@@ -13885,6 +14056,9 @@ private:
     llvm::FunctionCallee vcd_start_fn() {
         return rt_fn("rt_vcd_start", b_.getVoidTy(), {});
     }
+    llvm::FunctionCallee vcd_limit_fn() {
+        return rt_fn("rt_vcd_limit", b_.getVoidTy(), { b_.getInt64Ty() });
+    }
     llvm::FunctionCallee vcd_touch_fn() {
         return rt_fn("rt_vcd_touch", b_.getVoidTy(), { b_.getInt32Ty() });
     }
@@ -13952,13 +14126,17 @@ private:
 
     // Any Dump* instruction anywhere in the design? Gates the per-instant flush and
     // the close at the end of the sim loop, so a design with no dump task pays
-    // nothing.
+    // nothing. A $dumpfile / $dumpvars call site can live in a task body a process
+    // calls, so scan function bodies too (like design_has_finish) -- scanning only
+    // processes left the flush unemitted and silently produced a VCD holding just
+    // the final instant.
     bool design_uses_vcd() const {
-        for (const Process& p : mod_.processes()) {
-            for (uint32_t k = 0; k < p.ir.inst_count(); ++k) {
-                switch (p.ir.tag(static_cast<Index>(k))) {
+        const auto scan = [](const Ir& ir) {
+            for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+                switch (ir.tag(static_cast<Index>(k))) {
                     case Inst::Tag::DumpFile:
                     case Inst::Tag::DumpVars:
+                    case Inst::Tag::DumpLimit:
                     case Inst::Tag::DumpOff:
                     case Inst::Tag::DumpOn:
                     case Inst::Tag::DumpAll:
@@ -13968,14 +14146,24 @@ private:
                         break;
                 }
             }
+            return false;
+        };
+        for (const Process& p : mod_.processes()) {
+            if (scan(p.ir)) {
+                return true;
+            }
+        }
+        for (uint32_t f = 0; f < mod_.function_count(); ++f) {
+            if (scan(mod_.function(static_cast<FunctionId>(f)).ir)) {
+                return true;
+            }
         }
         return false;
     }
 
     // Any StrobePend instruction anywhere in the design (a process body, or a
     // task body it calls — $strobe is legal in either, never in a plain
-    // function)? Scans functions too, unlike design_uses_vcd, since a
-    // $strobe call site can live inside a task.
+    // function)? Scans functions too.
 
     // Any Observed-region report source in the design? Gates the per-instant
     // Observed-region flush (see emit_active_run). Currently a unique/priority
@@ -14184,6 +14372,13 @@ private:
         b_.CreateCall(vcd_open_fn(), { path, len, b_.getInt32(fwd) });
     }
 
+    // $dumplimit(n): cap the dump at `n` bytes. The count is a plain integral
+    // value; its known bits are widened to the runtime's 64-bit byte count.
+    void lower_dump_limit(Index i) {
+        const Index n = ir_->payload(i).unary;
+        b_.CreateCall(vcd_limit_fn(), { cast(must_of(value_of(n)), 64, false) });
+    }
+
     // $dumpvars (whole-design form): walk the design scope tree, registering every
     // dumpable signal with the runtime, then arm the dump.
     void lower_dump_vars() {
@@ -14221,11 +14416,13 @@ private:
     }
 
     // Register one dumped signal: leaf name, width/flags, and live plane pointers.
-    // An unpacked array expands to one $var per element (rt_vcd_array). A
-    // whole-design dump must represent every declared signal, so an unrepresentable
-    // one (string, element wider than 64 bits, multidimensional array) loud-fails
-    // rather than being silently omitted; an unnamed compiler temporary
-    // is not a declared variable and is skipped.
+    // An unpacked array expands to one $var per element (rt_vcd_array); a real /
+    // shortreal carries RT_VCD_FLAG_REAL and dumps as `$var real` (the runtime
+    // formats the slot's IEEE-754 bit pattern as a decimal). A whole-design dump
+    // must represent every declared signal, so an unrepresentable one (string,
+    // event, multidimensional array) loud-fails rather than being silently
+    // omitted; an unnamed compiler temporary is not a declared
+    // variable and is skipped.
     void emit_vcd_var(Signal sig) {
         const SignalInfo& info = mod_.signal(sig);
         if (info.name.empty()) {
@@ -14246,7 +14443,9 @@ private:
             leaf = leaf.substr(pos + 1);
         }
         auto*          nullp = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
-        const uint32_t flags = (s.four_state ? 1u : 0u) | (info.is_net ? 2u : 0u) | (s.narrow ? 4u : 0u);
+        // Flag bits mirror RT_VCD_FLAG_* (Runtime.h): four-state, net, narrow, real.
+        const uint32_t flags = (s.four_state ? 1u : 0u) | (info.is_net ? 2u : 0u) | (s.narrow ? 4u : 0u)
+                             | (s.is_real ? 8u : 0u);
         llvm::Value*   np    = b_.CreateGlobalString(leaf, "vcd.var");
         llvm::Value*   nlen  = b_.getInt32(static_cast<uint32_t>(leaf.size()));
 
@@ -14323,8 +14522,8 @@ private:
         if (is_string_type(cur_fn_->return_type)) {
             // Copy the result out through the trailing out-param handle BEFORE
             // releasing the body's strings (the value may be one of them).
-            b_.CreateCall(str_assign_fn(),
-                          { fn_->getArg(fn_->arg_size() - 1), str_of(value) });
+            b_.CreateCall(str_assign_fn(), { fn_->getArg(fn_->arg_size() - 1), str_of(value),
+                                             alloc_site_global(loc_text(value), "string") });
             deinit_body_strings();
             b_.CreateRetVoid();
             return;
@@ -14382,9 +14581,14 @@ private:
     // Load the callee (function or task ramp) for a virtual dispatch from the
     // receiver object's vtable: handle (arg 0) -> object body -> vtable pointer
     // (body field 0) -> slot. Shared by virtual function and virtual task calls.
-    llvm::Value* load_vtable_callee(const VirtualCallInfo& vci) {
-        const std::span<const Index> args = ir_->region(vci.args);
-        llvm::Value* body = b_.CreateIntToPtr(must_of(value_of(args[0])), raw_ptr_ty());
+    // The receiver takes the same null guard a property access does: LRM 8.4 puts
+    // a virtual method reached through a null handle in exactly the class of
+    // illegal accesses, and the vtable load is the first thing that would fault.
+    llvm::Value* load_vtable_callee(const VirtualCallInfo& vci, Index at) {
+        const std::span<const Index> args   = ir_->region(vci.args);
+        llvm::Value*                 handle = must_of(value_of(args[0]));
+        emit_null_handle_check(handle, at);
+        llvm::Value* body = b_.CreateIntToPtr(handle, raw_ptr_ty());
         llvm::Value* vptr = b_.CreateLoad(
             raw_ptr_ty(), b_.CreateStructGEP(class_body_ty(vci.class_ref), body, 0));
         llvm::Value* slot = b_.CreateGEP(raw_ptr_ty(), vptr, { b_.getInt32(vci.slot) });
@@ -14396,7 +14600,7 @@ private:
         const Function& f    = mod_.function(vci.func); // signature shared by all overrides
         llvm::FunctionType* fnty =
             fn_decls_[static_cast<uint32_t>(vci.func)]->getFunctionType();
-        lower_call_common(i, f, fnty, load_vtable_callee(vci), vci.args);
+        lower_call_common(i, f, fnty, load_vtable_callee(vci, i), vci.args);
         emit_finish_check(virtual_call_may_finish());
     }
 
@@ -14524,10 +14728,11 @@ private:
         auto* p = raw_ptr_ty();
         return rt_fn("rt_dpi_unpack_logicvec", b_.getVoidTy(), { p, b_.getInt32Ty(), p, p, p });
     }
-    // void rt_dpi_str_out(rt_string* dst, const char* p) — copy a returned C string.
+    // void rt_dpi_str_out(rt_string* dst, const char* p, const rt_alloc_site*) — copy a
+    // returned C string.
     llvm::FunctionCallee dpi_str_out_fn() {
         auto* p = raw_ptr_ty();
-        return rt_fn("rt_dpi_str_out", b_.getVoidTy(), { p, p });
+        return rt_fn("rt_dpi_str_out", b_.getVoidTy(), { p, p, p });
     }
 
     // Spill an iW plane into a fresh entry-block buffer of `nchunks` 32-bit words
@@ -14997,7 +15202,8 @@ private:
         if (f.dpi_ret_ctype == DpiCType::String) {
             // The C returns a NUL-terminated char*; copy it into this call's result
             // handle (str_of(i), alloc'd by build_str_temps). C keeps ownership.
-            b_.CreateCall(dpi_str_out_fn(), { str_of(i), r });
+            b_.CreateCall(dpi_str_out_fn(),
+                          { str_of(i), r, alloc_site_global(loc_text(i), "string") });
         } else if (f.dpi_ret_ctype != DpiCType::Void) {
             set_value(i, dpi_c_to_plane(f.dpi_ret_ctype, r));
         }
@@ -15085,7 +15291,12 @@ private:
             if (ct == DpiCType::String) { // input only (guarded)
                 auto* h = entry_alloca(str_slot_ty(), "dpi.exp.str");
                 b_.CreateCall(str_init_fn(), { h });
-                b_.CreateCall(dpi_str_out_fn(), { h, cparam }); // h = the C const char*
+                // h receives a copy of the C const char*. The export thunk is
+                // emitted per exported subroutine rather than from a lowered
+                // instruction, so no Index locates this copy.
+                b_.CreateCall(dpi_str_out_fn(),
+                              { h, cparam,
+                                alloc_site_global(SourceText{ .where = "<unknown>" }, "string") });
                 argv.push_back(h);
                 str_temps.push_back(h);
             } else if (dir == ArgDir::In) {
@@ -15317,7 +15528,7 @@ private:
         const Function&     tf   = mod_.function(fid);
         llvm::FunctionType* fnty = fn_decls_[static_cast<uint32_t>(fid)]->getFunctionType();
         llvm::Value*        cf =
-            virt ? load_vtable_callee(ir_->extra_data<VirtualCallInfo>(ir_->payload(i).extra))
+            virt ? load_vtable_callee(ir_->extra_data<VirtualCallInfo>(ir_->payload(i).extra), i)
                  : static_cast<llvm::Value*>(sym(fn_decls_[static_cast<uint32_t>(fid)]));
         auto*           ptr_ty = llvm::PointerType::getUnqual(ctx_);
         auto*           null   = llvm::ConstantPointerNull::get(ptr_ty);

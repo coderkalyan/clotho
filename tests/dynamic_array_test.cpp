@@ -5,6 +5,7 @@
 #include <string_view>
 
 #include "Lower.h"
+#include "Subprocess.h"
 #include "PosixIo.h"
 #include "ir/Jit.h"
 
@@ -459,4 +460,125 @@ TEST_CASE("dynamic array from an assignment-pattern literal") {
         endmodule
     )";
     CHECK(run_capture(src) == "3 10 20 30\n4 1 2 3 4\n");
+}
+
+// LRM 7.5.1 sizes a dynamic array with an `int`, and gives no meaning to a
+// negative one. The count used to cross the runtime ABI zero-extended, so
+// `new[-1]` asked for 4294967295 elements and the element-count-times-stride
+// product then wrapped: a small buffer the constructor loop immediately ran off
+// the end of. The count is signed at the ABI now, so the runtime sees the
+// negative the design wrote and refuses it with a located fatal. Out of process
+// because the fatal exits.
+TEST_CASE("new[] with a negative size is a located fatal") {
+    constexpr std::string_view src = "module m;\n"
+                                     "    int arr[];\n"
+                                     "    int n;\n"
+                                     "    initial begin\n"
+                                     "        n = -1;\n"
+                                     "        arr = new[n];\n"
+                                     "        $display(\"unreachable\");\n"
+                                     "    end\n"
+                                     "endmodule\n";
+
+    const test::DesignRun run = test::run_design_captured(src);
+
+    CHECK(run.out.empty());
+    CHECK(test::design_exit_code(run) != 0);
+    CHECK(run.err.find("invalid negative size for this dynamic array: -1") != std::string::npos);
+    // The site record is what makes the report point at the design rather than
+    // at the runtime.
+    CHECK(run.err.find("source:6:9") != std::string::npos);
+    CHECK(run.err.find("6 |         arr = new[n];\n") != std::string::npos);
+}
+
+// The same all-ones bit pattern that is -1 in a signed `int` is 4294967295 in an
+// unsigned `bit [31:0]`, and must reach the runtime zero-extended.
+//
+// The element is a megabit wide so the request is 4 PiB: past the address space
+// of any host, so the answer is a refusal naming the byte count rather than
+// something whose outcome varies per machine. That byte count IS the assertion —
+// 4294967295 * 1 MiB is reachable only from a zero-extended count, where a
+// sign-extended one would have tripped the negative check.
+//
+// The size matters for a second reason: an oversized request Linux happens to
+// grant (its default overcommit heuristic is lenient) used to be filled element
+// by element, which paged in the whole array and got the test runner — and
+// whatever else the machine was doing — killed by the OOM killer. A zero-image
+// element is calloc'd now, so even a granted request costs nothing until it is
+// written. Keep both properties when touching this test.
+//
+// `allocator_may_return_null=1` for the same reason as the refused-allocation
+// case below: AddressSanitizer's allocator aborts on a request this size before
+// the runtime's own null check can report it. A build without ASAN ignores it.
+TEST_CASE("new[] with an unsigned count is not read as negative") {
+    constexpr std::string_view src = "module m;\n"
+                                     "    bit [8388607:0] arr[];\n"
+                                     "    bit [31:0] n;\n"
+                                     "    initial begin\n"
+                                     "        n = 32'hFFFF_FFFF;\n"
+                                     "        arr = new[n];\n"
+                                     "        $display(\"allocated\");\n"
+                                     "    end\n"
+                                     "endmodule\n";
+
+    const test::DesignRun run =
+      test::run_design_captured(src, "ASAN_OPTIONS=detect_leaks=0:allocator_may_return_null=1 ");
+
+    CHECK(run.err.find("negative size") == std::string::npos);
+    if (run.err.find("out of memory") != std::string::npos) {
+        CHECK(run.err.find("the system refused 4503599626321920 bytes") != std::string::npos);
+    } else {
+        // A host whose address space could hold the mapping: nothing is touched,
+        // so it succeeds and the count is proven by the array existing at all.
+        CHECK(run.out.find("allocated") != std::string::npos);
+    }
+}
+
+// The element count times the element stride is a checked multiply. Wrapped, it
+// sized a buffer from the low 64 bits of the product and the constructor loop
+// then wrote `n` elements into it.
+TEST_CASE("new[] whose element count times stride overflows is a located fatal") {
+    constexpr std::string_view src = "module m;\n"
+                                     "    longint unsigned big[];\n"
+                                     "    longint unsigned n;\n"
+                                     "    initial begin\n"
+                                     "        n = 64'h4000_0000_0000_0001;\n"
+                                     "        big = new[n];\n"
+                                     "        $display(\"unreachable\");\n"
+                                     "    end\n"
+                                     "endmodule\n";
+
+    const test::DesignRun run = test::run_design_captured(src);
+
+    CHECK(test::design_exit_code(run) != 0);
+    CHECK(run.err.find("size for this dynamic array overflows") != std::string::npos);
+    CHECK(run.err.find("source:6:9") != std::string::npos);
+}
+
+// A size the machine cannot satisfy is a diagnosed failure, not a null buffer
+// the caller writes through. 1 EiB of `int` is past the address space of any
+// host — 400 GB, what this asked for before, is not: x86-64 maps 128 TiB, Linux
+// grants the mapping, and the array then filled itself page by page until the
+// OOM killer took the test runner down with it. It stays well inside size_t, so
+// it still exercises the malloc-returned-null arm rather than the overflow arm.
+// The child needs `allocator_may_return_null=1` because AddressSanitizer's
+// allocator otherwise aborts on an oversized request before the runtime's own
+// null check can run; a build without ASAN ignores the variable.
+TEST_CASE("an allocation the system refuses is a located fatal") {
+    constexpr std::string_view src = "module m;\n"
+                                     "    int a[];\n"
+                                     "    longint unsigned n;\n"
+                                     "    initial begin\n"
+                                     "        n = 64'd300_000_000_000_000_000;\n"
+                                     "        a = new[n];\n"
+                                     "        $display(\"unreachable\");\n"
+                                     "    end\n"
+                                     "endmodule\n";
+
+    const test::DesignRun run =
+      test::run_design_captured(src, "ASAN_OPTIONS=detect_leaks=0:allocator_may_return_null=1 ");
+
+    CHECK(test::design_exit_code(run) != 0);
+    CHECK(run.err.find("out of memory for this dynamic array") != std::string::npos);
+    CHECK(run.err.find("source:6:9") != std::string::npos);
 }

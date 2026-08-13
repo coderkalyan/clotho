@@ -63,7 +63,7 @@ bool is_edge_triggered(const ir::Process& p) {
 }
 
 // First process matching `pred`, or null.
-template <class Pred>
+template<class Pred>
 const ir::Process* find_process(const ir::Module& m, Pred pred) {
     for (const ir::Process& p : m.processes()) {
         if (pred(p)) {
@@ -82,9 +82,8 @@ const ir::Process* find_edge_process(const ir::Module& m) {
 // First level-sensitive process: an always-activated process with no edge wait
 // events (a continuous assign or a @(*) / level-sensitive always block).
 const ir::Process* find_level_process(const ir::Module& m) {
-    return find_process(m, [](const ir::Process& p) {
-        return p.activation == ir::Activation::Always && !is_edge_triggered(p);
-    });
+    return find_process(
+      m, [](const ir::Process& p) { return p.activation == ir::Activation::Always && !is_edge_triggered(p); });
 }
 
 } // namespace
@@ -644,8 +643,7 @@ TEST_CASE("a fixed-size unpacked array slice lowers in each context") {
             endmodule
         )");
         CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("indexed part-select slice of an unpacked array") !=
-              std::string::npos);
+        CHECK(r.diagnostic_text().find("indexed part-select slice of an unpacked array") != std::string::npos);
     }
 }
 
@@ -1521,4 +1519,96 @@ TEST_CASE("bit-stream cast of a dynamic-array-returning call fails loudly") {
     )");
     CHECK_FALSE(r.ok);
     CHECK(r.diagnostic_text().find("bit-stream cast") != std::string::npos);
+}
+
+// -- lower_buffer: the language server's entry point ------------------------
+
+TEST_CASE("lower_buffer attributes diagnostics to the name it was given") {
+    const LowerResult r = lower_buffer("/work/latchy.sv", R"(
+        module latchy(input en, input d, output logic q);
+            always_comb begin
+                if (en) q = d;
+            end
+        endmodule
+    )");
+
+    REQUIRE(r.diagnostics.size() >= 1);
+    const SourcePosition pos = r.sources->resolve(r.diagnostics[0].span.start);
+    CHECK(pos.valid);
+    CHECK(r.sources->full_path(r.diagnostics[0].span.start) == "/work/latchy.sv");
+    CHECK(r.diagnostic_text().find("latch inferred") != std::string::npos);
+}
+
+TEST_CASE("lower_buffer analyses a file whose dependencies are absent") {
+    // The editor case: one file of a design, opened on its own. Without lint
+    // mode this reports `unknown module` per instance and analyses nothing.
+    const LowerResult r = lower_buffer("/work/parent.sv", R"(
+        module parent(input en, input d, output logic q, output logic [3:0] y);
+            child u (.y(y));
+            always_comb begin
+                if (en) q = d;
+            end
+        endmodule
+    )");
+
+    CHECK(r.diagnostic_text().find("unknown module") == std::string::npos);
+    // And the rest of the module is still analysed, which is the point.
+    CHECK(r.diagnostic_text().find("latch inferred") != std::string::npos);
+}
+
+TEST_CASE("lower_buffer owns its source manager, so revisions do not collide") {
+    // Same path twice, which is every keystroke. slang's SourceManager is
+    // append-only and assignBuffer throws on a path it has already seen, so
+    // this only works because each call builds its own manager -- the same
+    // property that makes the entry point reentrant, unlike lower_text.
+    constexpr std::string_view kFirst  = "module a; logic q; always_comb if (1) q = 0; endmodule";
+    constexpr std::string_view kSecond = "\n\nmodule a; logic q; always_comb if (1) q = 0; endmodule";
+
+    const LowerResult first  = lower_buffer("/work/a.sv", kFirst);
+    const LowerResult second = lower_buffer("/work/a.sv", kSecond);
+
+    REQUIRE(!first.diagnostics.empty());
+    REQUIRE(!second.diagnostics.empty());
+
+    // The older result stays resolvable after the newer one exists: its context
+    // owns the manager its locations were minted against, so an in-flight
+    // analysis cannot be invalidated by the next keystroke.
+    const SourcePosition old_pos = first.sources->resolve(first.diagnostics[0].span.start);
+    const SourcePosition new_pos = second.sources->resolve(second.diagnostics[0].span.start);
+    CHECK(old_pos.valid);
+    CHECK(new_pos.valid);
+    CHECK(first.sources->full_path(first.diagnostics[0].span.start) == "/work/a.sv");
+    CHECK(second.sources->full_path(second.diagnostics[0].span.start) == "/work/a.sv");
+    // Two blank lines were prepended, and only the newer context knows that.
+    CHECK(new_pos.line == old_pos.line + 2);
+}
+
+TEST_CASE("lower_buffer keeps use-based findings but drops driver-based ones") {
+    // The split matters because a buffer is compiled without the rest of its
+    // design. slang binds an absent submodule's port connections as ordinary
+    // expressions, so a net wired to one reads as USED -- sound, the connection
+    // is a use -- but never as DRIVEN, because nothing says which port is an
+    // output. Reporting the second family would invent a problem per connection
+    // (measured: 108 of them on hazard3_core.v opened alone).
+    SUBCASE("a net driven only by an absent module is not reported undriven") {
+        const LowerResult r = lower_buffer("/work/parent.sv", R"(
+            module parent(output logic [3:0] y);
+                logic [3:0] internal;
+                child u (.o(internal));
+                assign y = internal;
+            endmodule
+        )");
+        CHECK(r.diagnostic_text().find("never driven") == std::string::npos);
+        CHECK(r.diagnostic_text().find("is never assigned") == std::string::npos);
+    }
+
+    SUBCASE("a net nothing ever reads is still reported unused") {
+        // No instances at all, so nothing about this file is partial.
+        const LowerResult r = lower_buffer("/work/test.sv", R"(
+            module test ();
+                wire [2:0] foo = 4'b0000;
+            endmodule
+        )");
+        CHECK(r.diagnostic_text().find("unused net 'foo'") != std::string::npos);
+    }
 }

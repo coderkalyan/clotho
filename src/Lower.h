@@ -109,4 +109,41 @@ LowerResult lower_text(std::string_view source,
                        Timings*         timings      = nullptr,
                        ir::SystemAccess allow_system = ir::SystemAccess::Off);
 
+// Lower an editor's in-memory buffer, named `path` so its diagnostics can be
+// attributed back to the file the client has open.
+//
+// Three things distinguish this from `lower_text`, and all three exist for the
+// language server:
+//
+//   * The buffer is assigned to a SourceManager this call OWNS, not to slang's
+//     process-wide static one. `lower_text` borrows the static manager, so every
+//     keystroke would leak a buffer for the process lifetime and two concurrent
+//     calls would race -- it is the one lowering path that is not reentrant.
+//   * The buffer carries `path`, so a diagnostic resolves to the client's file
+//     rather than to the literal name "source".
+//   * Unknown modules are ignored during elaboration. An open buffer is
+//     normally one file of a design whose other files are not present, and
+//     without this a file that instantiates anything reports `unknown module`
+//     per instance. NOT `CompilationFlags::LintMode`, which sounds like the
+//     flag for this and is not: it marks every scope uninstantiated and so
+//     deletes the whole unused-signal family. See lower_compilation's
+//     `partial` argument for what a partial design does suppress, and why the
+//     line falls where it does.
+//
+// Consequence: findings that need the instantiating context (port width
+// mismatches across a boundary, parameter-dependent widths) do not appear, and
+// parameters take their declared defaults -- so an answer from this entry point
+// describes the module in isolation, not the module as the design instantiates
+// it.
+LowerResult lower_buffer(std::string_view path,
+                         std::string_view text,
+                         Timings*         timings      = nullptr,
+                         ir::SystemAccess allow_system = ir::SystemAccess::Off);
+
+// Decode a source extent for whoever needs one: the IR dump's headers, and the
+// snippet a runtime diagnostic bakes into its report. Everything comes from the
+// SourceManager lowering handed back, so the returned resolver borrows `result`
+// and stays valid for exactly as long as it does.
+ir::LocResolver loc_resolver(const LowerResult& result);
+
 } // namespace clotho

@@ -1,0 +1,9 @@
+# Copy to terraform.tfvars and fill in. Token is NOT here — export it:
+#   export LATITUDESH_AUTH_TOKEN=...
+# terraform.tfvars is gitignored (see cloud/.gitignore).
+
+project     = "proj_XXXXXXXX"
+plan        = "c3-large-x86"        # a quiet single-socket x86 plan in stock at `site`
+site        = "ASH"                 # ASH CHI FRA TYO4 ... (where the plan is available)
+ssh_key_ids = ["ssh_XXXXXXXX"]      # create via `latitudesh_ssh_key` or the dashboard
+# operating_system / hostname have defaults (see variables.tf).

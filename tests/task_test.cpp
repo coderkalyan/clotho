@@ -573,3 +573,57 @@ TEST_CASE("a task with a 64-bit input formal does not overflow its frame") {
     )");
     CHECK(out == "42\n");
 }
+
+// LRM 3.14.2.3: a delay inside a subroutine is expressed in the time units of
+// the scope that DECLARES the subroutine, never the one that calls it. The body
+// is lowered once and shared by every call site, so scaling it by the caller
+// would leave at most one caller correct -- here the package task's `#5` is 5 ns
+// even though the only caller measures time in microseconds. `$time` read in the
+// body follows the same scope, and the caller's own `$time` still reports in the
+// caller's units (5 ns rounds to 0 us). Cross-checked against Icarus Verilog.
+TEST_CASE("a package task's delay and $time use the declaring scope's timescale") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ns
+        package p;
+            task automatic w5; #5; $display("task %0d", $time); endtask
+        endpackage
+        `timescale 1us/1ns
+        module m;
+            import p::*;
+            initial begin w5(); $display("caller %0d", $time); end
+        endmodule
+    )");
+    CHECK(out == "task 5\ncaller 0\n");
+}
+
+// The same package task called from two modules with different timescales. Both
+// wake at the same absolute instant (5 ns), and each caller reports it in its
+// own units -- 0 in microseconds, 5000 in picoseconds. This is the case the
+// caller-scaled lowering could not express at all.
+TEST_CASE("one package task serves callers of different timescales") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ns
+        package p;
+            task automatic w5; #5; endtask
+        endpackage
+        `timescale 1us/1ns
+        module mu; import p::*; initial begin w5(); $display("us %0d", $time); end endmodule
+        `timescale 1ps/1ps
+        module mp; import p::*; initial begin w5(); $display("ps %0d", $time); end endmodule
+    )");
+    CHECK(out.find("us 0\n") != std::string::npos);
+    CHECK(out.find("ps 5000\n") != std::string::npos);
+}
+
+// A real delay rounds to the precision of the scope that declares the code
+// running it (LRM 22.7). Inside a task that is the task's own scope, so the
+// wheel tick has to divide that precision -- the tick computation reads
+// subroutine bodies for real delays, not just procedural blocks. #1.5 in a
+// 1ns/1ps module is 1500 ps, and $time in that module rounds it to 2 ns.
+TEST_CASE("a real delay inside a task rounds to the declaring scope's precision") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ps
+        module m;
+            task automatic w; #1.5; endtask
+            initial begin w(); $display("%0d %0t", $time, $time); end
+        endmodule
+    )");
+    CHECK(out == "2 2000\n");
+}

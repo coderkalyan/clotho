@@ -37,7 +37,11 @@ int run_design(const char* path) {
         return 1;
     }
 
-    return clotho::ir::run_jit(*r.module);
+    // Same resolver the CLI installs, so a runtime diagnostic emitted here
+    // carries the file position and source snippet a real run would show —
+    // which is the whole payload of a test that asserts on one.
+    return clotho::ir::run_jit(*r.module, /*timings=*/nullptr, /*config=*/{}, /*plusargs=*/{},
+                               clotho::loc_resolver(r));
 }
 
 } // namespace

@@ -1,0 +1,9 @@
+# secrets + state — never commit
+terraform/.terraform/
+terraform/*.tfstate*
+terraform/terraform.tfvars
+*.token
+latitude.token
+# built artifacts + pulled results
+out/clotho-*
+reports/

@@ -57,6 +57,11 @@ enum class Sanitizer : uint32_t {
     // xsan, the x-provenance sanitizer: flag the point where an x/z value
     // decides something the design cannot recover from, and report the chain
     // of assignments that produced it. See docs/design/x-semantics.md.
+    //
+    // No backend pass reads this bit yet. The bit and everything behind it are
+    // unconditional, but `--sanitize=xprov` reaches them only in a Debug build
+    // (CMakeLists CLOTHO_XSAN) — a shipped binary rejects the name rather than
+    // accept a check that silently instruments nothing.
     XProv = 1u << 0,
     // Report an index that misses the bounds of what it indexes. The LRM makes
     // this silent almost everywhere (7.4.5 + Table 7-1: an out-of-range read

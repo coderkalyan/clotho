@@ -288,6 +288,12 @@ struct AssertionMonitor {
     // The directive's source-level label, for a report. Empty when unlabelled.
     std::string label;
     AssertionKind kind = AssertionKind::Assert;
+    // `cover sequence` rather than `cover property` (LRM 16.12.6). The two lower
+    // to the identical automaton and libsva has one SVA_COVER for both, so this
+    // rides alongside `kind` instead of inside it: all it selects is the tally,
+    // sequence MATCHES against attempts that succeeded. False for every other
+    // kind.
+    bool cover_matches = false;
     AssertionStrength strength = AssertionStrength::Weak;
 
     // What steps the monitor: one clock edge is one cycle.

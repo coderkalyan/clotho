@@ -740,3 +740,104 @@ TEST_CASE("foreach over an associative array lowers") {
     )");
     CHECK_MESSAGE(r.ok, r.diagnostic_text());
 }
+
+// A loop's hidden counter and bound are per-ACTIVATION cells, not module state.
+// Inside a subroutine they are frame Locals, so a recursive call gets its own:
+// three levels of `repeat (3)` run 3 + 9 + 27 == 39 body iterations. Backed by a
+// shared module signal, the inner call's counter clobbered the outer's and the
+// whole nest collapsed to 5. Cross-checked against Icarus Verilog.
+TEST_CASE("a repeat counter is per-activation, so recursion nests correctly") {
+    const std::string out = run_capture(R"(
+        module m;
+            int total;
+            task automatic count(int depth);
+                repeat (3) begin
+                    total = total + 1;
+                    if (depth > 0) count(depth - 1);
+                end
+            endtask
+            initial begin total = 0; count(2); $display("%0d", total); end
+        endmodule
+    )");
+    CHECK(out == "39\n");
+}
+
+// The same task suspended in two concurrent activations. Each `repeat` count
+// has to survive its own activation's suspends without the other's writes
+// reaching it -- one shared cell made the shorter loop's exit end both.
+TEST_CASE("concurrent activations of one task keep separate repeat counters") {
+    const std::string out = run_capture_finish(R"(
+        module m;
+            int a, b;
+            task automatic spin(input int n, output int got);
+                int k;
+                k = 0;
+                repeat (n) begin #1; k = k + 1; end
+                got = k;
+            endtask
+            initial begin
+                fork spin(3, a); spin(5, b); join
+                $display("%0d %0d", a, b);
+                $finish;
+            end
+        endmodule
+    )");
+    CHECK(out == "3 5\n");
+}
+
+// foreach snapshots its bound in the same kind of cell, so it nests too.
+TEST_CASE("a foreach bound is per-activation, so recursion nests correctly") {
+    const std::string out = run_capture(R"(
+        module m;
+            int total;
+            task automatic walk(input int depth);
+                int arr[];
+                arr = new[3];
+                foreach (arr[i]) begin
+                    total = total + 1;
+                    if (depth > 0) walk(depth - 1);
+                end
+            endtask
+            initial begin total = 0; walk(2); $display("%0d", total); end
+        endmodule
+    )");
+    CHECK(out == "39\n");
+}
+
+// `lhs = repeat (n) @e rhs` (LRM 9.4.5) counts trigger occurrences in a cell of
+// its own, so two activations waiting on the same edge resume at their own
+// counts rather than whichever finished first.
+TEST_CASE("an intra-assignment repeat count is per-activation") {
+    const std::string out = run_capture_finish(R"(
+        module m;
+            reg clk = 0;
+            int x, y, v;
+            always #1 clk = ~clk;
+            task automatic grab(input int n, output int t);
+                v = repeat (n) @(posedge clk) 7;
+                t = $time;
+            endtask
+            initial begin
+                fork grab(1, x); grab(3, y); join
+                $display("%0d %0d", x, y);
+                $finish;
+            end
+        endmodule
+    )");
+    CHECK(out == "1 5\n");
+}
+
+// A process has no frame, so its loop cells stay module signals and the emitted
+// IR is unchanged: the loop below is the only one in the design whose counter
+// needs storage, and it still resolves through a Signal, not a Local.
+TEST_CASE("a process-level repeat still uses module-signal storage") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            int s;
+            initial repeat (4) s = s + 1;
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    CHECK(any_process_has_tag(*r.module, ir::Inst::Tag::Signal));
+    CHECK_FALSE(any_process_has_tag(*r.module, ir::Inst::Tag::Local));
+}

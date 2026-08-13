@@ -28,6 +28,7 @@
 #include <slang/ast/SemanticFacts.h>
 #include <slang/ast/Statement.h>
 #include <slang/ast/TimingControl.h>
+#include <slang/ast/expressions/AssertionExpr.h>
 #include <slang/ast/expressions/AssignmentExpressions.h>
 #include <slang/ast/expressions/CallExpression.h>
 #include <slang/ast/expressions/ConversionExpression.h>
@@ -38,7 +39,6 @@
 #include <slang/ast/expressions/SelectExpressions.h>
 #include <slang/ast/statements/ConditionalStatements.h>
 #include <slang/ast/statements/LoopStatements.h>
-#include <slang/ast/expressions/AssertionExpr.h>
 #include <slang/ast/statements/MiscStatements.h>
 #include <slang/ast/symbols/AttributeSymbol.h>
 #include <slang/ast/symbols/BlockSymbols.h>
@@ -180,11 +180,26 @@ struct RealDelayFinder : slang::ast::ASTVisitor<RealDelayFinder, VisitFlags::All
     }
 };
 
+// True iff a subroutine's own body holds a real delay. A bodyless subroutine (a
+// DPI import, an extern prototype, slang's built-in `std` methods) has no
+// statement to bind, so it is skipped rather than forced.
+bool subroutine_has_real_delay(const SubroutineSymbol& sub) {
+    if (sub.flags.has(MethodFlags::DPIImport) || sub.flags.has(MethodFlags::Pure) || sub.getSyntax() == nullptr) {
+        return false;
+    }
+    RealDelayFinder f;
+    sub.getBody().visit(f);
+    return f.found;
+}
+
 // True iff this scope (an instance body or one of its generate blocks — sharing
-// the enclosing instance's timescale) textually contains a real delay, in a
-// procedural block, an intra-assign, a continuous assign, a net declaration, or a
-// gate primitive. Nested instances are opaque: they carry their own timescale and
-// fold their own precision, so this stops at the instance boundary.
+// the enclosing instance's timescale — or a package / `$unit` compilation unit)
+// textually contains a real delay, in a procedural block, a subroutine body, an
+// intra-assign, a continuous assign, a net declaration, or a gate primitive.
+// Nested instances are opaque: they carry their own timescale and fold their own
+// precision, so this stops at the instance boundary. A subroutine counts here
+// because its delays are scaled by the scope that DECLARES it (LRM 3.14.2.3), so
+// the rounding they need is this scope's precision, not any caller's.
 bool scope_has_own_real_delay(const Scope& scope) {
     for (const Symbol& m : scope.members()) {
         switch (m.kind) {
@@ -208,6 +223,18 @@ bool scope_has_own_real_delay(const Scope& scope) {
                 break;
             case SymbolKind::PrimitiveInstance:
                 if (delay_is_real(m.as<PrimitiveInstanceSymbol>().getDelay())) {
+                    return true;
+                }
+                break;
+            case SymbolKind::Subroutine:
+                if (subroutine_has_real_delay(m.as<SubroutineSymbol>())) {
+                    return true;
+                }
+                break;
+            case SymbolKind::ClassType:
+                // A class method is a subroutine of the class scope, which
+                // inherits this scope's timescale.
+                if (scope_has_own_real_delay(m.as<slang::ast::ClassType>())) {
                     return true;
                 }
                 break;
@@ -331,6 +358,48 @@ uint64_t design_min_precision_fs(const InstanceSymbol& inst) {
     }
 
     return min_fs;
+}
+
+// True iff a package / `$unit` scope declares anything whose body can carry
+// time: a subroutine, or a class (whose methods are subroutines).
+bool scope_declares_subroutine(const Scope& scope) {
+    for (const Symbol& m : scope.members()) {
+        switch (m.kind) {
+            case SymbolKind::Subroutine:
+            case SymbolKind::GenericClassDef:
+                return true;
+            case SymbolKind::ClassType:
+                if (scope_declares_subroutine(m.as<slang::ast::ClassType>())) {
+                    return true;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+    return false;
+}
+
+// Wheel-tick contribution of a package or `$unit` compilation unit. Such a scope
+// sits outside the instance tree, so design_tick_fs never sees it -- yet a
+// subroutine declared there scales its delays and its $time reads by THIS
+// scope's timescale, not the caller's (LRM 3.14.2.3), so the tick has to divide
+// that unit or the delay cannot be represented at all. Folds the same two terms
+// a module does: the unit, plus the precision when a real delay is present.
+//
+// Gated on the scope actually declaring a subroutine. A package of types,
+// parameters and variables reaches simulation without ever scaling a time value,
+// and folding its (possibly much finer) unit would shrink the tick -- and with
+// it the default %t unit -- for nothing.
+uint64_t global_scope_tick_fs(const Scope& scope, bool& any_explicit) {
+    const auto ts = scope.getTimeScale();
+    if (!ts || !scope_declares_subroutine(scope)) {
+        return 0;
+    }
+    any_explicit        = true;
+    const uint64_t unit = tsv_to_fs(ts->base);
+    const uint64_t prec = tsv_to_fs(ts->precision);
+    return scope_has_own_real_delay(scope) && prec < unit ? prec : unit;
 }
 
 // Time-unit exponent (10^n seconds) of a power-of-ten femtosecond magnitude. A
@@ -631,9 +700,7 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
 
     void reject(std::string_view what, std::string_view why) {
         if (reason.empty()) {
-            reason = std::string(what)
-                     .append(" in an assertion action block is not supported: ")
-                     .append(why);
+            reason = std::string(what).append(" in an assertion action block is not supported: ").append(why);
         }
     }
 
@@ -723,8 +790,7 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
                 reject("a disable", kWrongRegion);
                 break;
             default:
-                reject("this statement",
-                       "clotho cannot prove it is zero-time, and reactive code must be");
+                reject("this statement", "clotho cannot prove it is zero-time, and reactive code must be");
                 break;
         }
         visitDefault(s);
@@ -748,8 +814,7 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
         // user task is not -- it may hold a delay, and clotho does not trace the
         // body to find out. A user *function* needs no check at all: LRM 13.4.4
         // forbids a timing control in one, so calling it cannot consume time.
-        if (c.subroutine.index() == 0 &&
-            std::get<0>(c.subroutine)->subroutineKind == SubroutineKind::Task) {
+        if (c.subroutine.index() == 0 && std::get<0>(c.subroutine)->subroutineKind == SubroutineKind::Task) {
             reject("a task call",
                    "clotho does not trace the body, so it cannot prove the call consumes no "
                    "time");
@@ -785,7 +850,7 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
 // candidate event appear anywhere else in the procedure -- so the
 // statement-local walk a Lowerer does cannot answer it.
 using InferredClockMap =
-    ankerl::unordered_dense::map<const slang::syntax::SyntaxNode*, const slang::syntax::SyntaxNode*>;
+  ankerl::unordered_dense::map<const slang::syntax::SyntaxNode*, const slang::syntax::SyntaxNode*>;
 
 // Walks the elaborated AST of one top module into an ir::Module.
 class Lowerer {
@@ -894,9 +959,7 @@ public:
         // unitless mode. Saved here so the post-recursion restore below (with
         // prefix_ / scope_) returns them to this level after a child runs.
         if (tick_fs_ != 0) {
-            const auto ts   = body.getTimeScale();
-            time_mul_       = ts ? tsv_to_fs(ts->base) / tick_fs_ : 1;
-            prec_over_tick_ = ts ? tsv_to_fs(ts->precision) / tick_fs_ : 1;
+            apply_time_scale(body);
         }
         const uint64_t self_mul = time_mul_;
 
@@ -929,6 +992,13 @@ public:
     void lower_top(const InstanceSymbol& top, std::string_view prefix) {
         top_elided_ = prefix.empty();
         lower_instance(top, prefix, Pass::Collect, nullptr, top.name);
+        // Between the passes: Collect has just enumerated every assertion and
+        // said whether the design calls an LRM 20.12 control task, and the
+        // scope tree it built is now frozen, so the control state can be
+        // allocated into the right scope. Emit needs it to already exist --
+        // both the monitors that read it and the tasks that write it lower
+        // there, in an order neither can depend on.
+        alloc_assert_control();
         // Classify reuses the scope tree Collect built (Emit has not yet moved
         // it out); it only reads node pointers to walk children in order.
         lower_instance(top, prefix, Pass::Classify, &top_scope_, top.name);
@@ -1034,10 +1104,13 @@ private:
                     break;
                 case SymbolKind::ProceduralBlock:
                     // Collect: register a hidden force_site signal per whole-var
-                    // `force` target so writers gate in Emit (LRM 10.6.2).
-                    if (pass == Pass::Collect)
+                    // `force` target so writers gate in Emit (LRM 10.6.2), and
+                    // enumerate the concurrent assertions / control tasks the
+                    // block holds (LRM 20.12, see scan_assert_control).
+                    if (pass == Pass::Collect) {
                         scan_force_targets(m.as<ProceduralBlockSymbol>().getBody());
-                    else if (emit)
+                        scan_assert_control(m.as<ProceduralBlockSymbol>());
+                    } else if (emit)
                         recover([&] { lower_procedural_block(m.as<ProceduralBlockSymbol>()); });
                     break;
                 case SymbolKind::Variable:
@@ -1189,6 +1262,22 @@ private:
                 // every use is already an ordinary expression by the time clotho
                 // sees it, inside an assertion or out of one.
                 case SymbolKind::LetDecl:
+                    break;
+                // An instance of a module the compilation was told to tolerate
+                // not having (CompilationFlags::IgnoreUnknownModules, which the
+                // language server's buffer entry point sets so that one file of
+                // a design can be analysed on its own). slang deliberately
+                // reports nothing for it, so refusing here would restate "the
+                // rest of your design is not open" as "clotho does not
+                // implement this" -- a false claim, and the loudest kind.
+                //
+                // Without that flag an unknown module is a genuine error slang
+                // has already reported, and anything reaching here is a
+                // construct clotho really does not handle, so it still fails.
+                case SymbolKind::UninstantiatedDef:
+                    if (!scope.getCompilation().hasFlag(slang::ast::CompilationFlags::IgnoreUnknownModules)) {
+                        fail("unsupported module member kind=" + std::string(toString(m.kind)));
+                    }
                     break;
                 default:
                     // Anything else (gate primitives, specify blocks, checkers,
@@ -1796,6 +1885,22 @@ private:
     ir::Ref lower_class_type(const slang::ast::ClassType& clt) {
         if (const auto cached = class_type_cache_.find(&clt); cached != class_type_cache_.end()) {
             return cached->second;
+        }
+        // `semaphore` (LRM 15.3), `mailbox #(T)` (LRM 15.4), `process` (LRM 9.7)
+        // and `std::weak_reference` (LRM 8.30) are built-in classes slang
+        // synthesizes into the `std` package. Slang builds their *signatures* only
+        // -- every method is a bodyless prototype whose semantics the simulator is
+        // expected to supply -- so lowering one walks into a method with no
+        // statements and no formals to bind, and used to die on an out-of-range
+        // formal index instead of saying anything. Each needs a real runtime: a key
+        // count plus a wait queue for a semaphore, a bounded FIFO with blocking
+        // put/get/peek for a mailbox, per-process control for `process`.
+        //
+        // TODO: built-in std classes (semaphore / mailbox / process /
+        // weak_reference) -- need the runtime support described above.
+        if (const slang::ast::Scope* parent = clt.getParentScope();
+            parent != nullptr && parent->asSymbol().kind == SymbolKind::Package && parent->asSymbol().name == "std") {
+            fail("the built-in '" + std::string(clt.name) + "' class is not supported");
         }
         // Phase 3 features (docs/design/classes.md §2): guarded loud.
         if (clt.isInterface) {
@@ -5388,8 +5493,7 @@ private:
             if (inner->kind == StatementKind::Block &&
                 inner->as<BlockStatement>().blockKind == StatementBlockKind::Sequential) {
                 inner = &inner->as<BlockStatement>().body;
-            } else if (inner->kind == StatementKind::List &&
-                       inner->as<StatementList>().list.size() == 1) {
+            } else if (inner->kind == StatementKind::List && inner->as<StatementList>().list.size() == 1) {
                 inner = inner->as<StatementList>().list[0];
             } else {
                 return *inner;
@@ -5469,8 +5573,8 @@ private:
                 infer = true;
                 body  = &timed.stmt;
             } else if (is_event_control(timed.timing)) {
-                iff_guard = collect_wait_events(timed.timing, wait_events);
-                body      = &timed.stmt;
+                iff_guard    = collect_wait_events(timed.timing, wait_events);
+                body         = &timed.stmt;
                 proc_timing_ = &timed.timing;
             }
         }
@@ -5788,14 +5892,14 @@ private:
                     fail("repeat with a real count is not supported");
                 }
                 const ir::Ref    ty      = lower_type(*rec.expr.type);
-                const ir::Signal bound   = declare_temp(ty, "repeat_bound");
-                const ir::Signal counter = declare_temp(ty, "repeat_count");
-                b.binary(ir::Inst::Tag::Store, b.signal(bound, l), b.resize(lower_expr(rec.expr, b), ty, l), l);
-                b.binary(ir::Inst::Tag::Store, b.signal(counter, l), b.constant(module_.pool.put_int(ty, 0), l), l);
+                const TempCell bound   = make_temp_cell(ty, "repeat_bound");
+                const TempCell counter = make_temp_cell(ty, "repeat_count");
+                b.binary(ir::Inst::Tag::Store, bound.lv(b, l), b.resize(lower_expr(rec.expr, b), ty, l), l);
+                b.binary(ir::Inst::Tag::Store, counter.lv(b, l), b.constant(module_.pool.put_int(ty, 0), l), l);
 
                 b.open_region();
-                const ir::Index      cur  = b.unary(ir::Inst::Tag::Load, b.signal(counter, l), l);
-                const ir::Index      lim  = b.unary(ir::Inst::Tag::Load, b.signal(bound, l), l);
+                const ir::Index      cur  = b.unary(ir::Inst::Tag::Load, counter.lv(b, l), l);
+                const ir::Index      lim  = b.unary(ir::Inst::Tag::Load, bound.lv(b, l), l);
                 const ir::Index      pred = b.binary(ir::Inst::Tag::Lt, cur, lim, l);
                 const ir::ExtraSlice cond = b.close_region();
 
@@ -5804,9 +5908,9 @@ private:
                 const ir::ExtraSlice body = b.close_region();
 
                 b.open_region();
-                const ir::Index sc  = b.unary(ir::Inst::Tag::Load, b.signal(counter, l), l);
+                const ir::Index sc  = b.unary(ir::Inst::Tag::Load, counter.lv(b, l), l);
                 const ir::Index one = b.constant(module_.pool.put_int(ty, 1), l);
-                b.binary(ir::Inst::Tag::Store, b.signal(counter, l), b.binary(ir::Inst::Tag::Add, sc, one, l), l);
+                b.binary(ir::Inst::Tag::Store, counter.lv(b, l), b.binary(ir::Inst::Tag::Add, sc, one, l), l);
                 const ir::ExtraSlice step = b.close_region();
 
                 b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
@@ -5867,6 +5971,27 @@ private:
             return nullptr;
         }
         return call.arguments()[0];
+    }
+
+    // The OTHER `.triggered`. On a named sequence rather than an event, slang
+    // models `s.triggered` and `s.matched` the same way -- a system method with
+    // the sequence instance as arguments()[0] -- but they are a different feature
+    // entirely: each reports on the attempts of THAT sequence, which would have to
+    // be compiled to an automaton of its own and stepped beside the property
+    // reading it. Returns the method name, or empty when the call is neither.
+    //
+    // Kept as one predicate because both refusal sites want the name in the
+    // message: an assertion expression reaches reject_unsampled_call, and
+    // everywhere else reaches lower_sysfunc.
+    static std::string_view sequence_method(const CallExpression& call) {
+        const std::string_view name = call.getSubroutineName();
+        if (!call.isSystemCall() || (name != "triggered" && name != "matched")) {
+            return {};
+        }
+        if (call.arguments().empty() || !call.arguments()[0]->type->isSequenceType()) {
+            return {};
+        }
+        return name;
     }
 
     // NOTE: `wait(...)` is lowered by the general `lower_wait_stmt` below (from
@@ -6000,8 +6125,7 @@ private:
                 lower_proc_deassign(stmt.as<ProceduralDeassignStatement>(), b);
                 break;
             case StatementKind::ConcurrentAssertion:
-                lower_concurrent_assertion(stmt.as<slang::ast::ConcurrentAssertionStatement>(),
-                                           b);
+                lower_concurrent_assertion(stmt.as<slang::ast::ConcurrentAssertionStatement>(), b);
                 break;
             case StatementKind::Disable:
             case StatementKind::DisableFork:
@@ -6201,7 +6325,7 @@ private:
     // whose terms the body does not otherwise read -- usually `clk`, because the
     // body tests `rst_n`. There is no deeper nesting to search: an event list
     // cannot contain another.
-    static const TimingControl* local_event_with_syntax(const TimingControl*      local,
+    static const TimingControl* local_event_with_syntax(const TimingControl*             local,
                                                         const slang::syntax::SyntaxNode* want) {
         if (local == nullptr || want == nullptr) {
             return nullptr;
@@ -6269,8 +6393,8 @@ private:
             case AEK::SequenceWithMatch:
                 return body_clock(expr.as<SequenceWithMatchExpr>().expr);
             case AEK::Binary: {
-                const auto& binary = expr.as<BinaryAssertionExpr>();
-                const TimingControl* left = body_clock(binary.left);
+                const auto&          binary = expr.as<BinaryAssertionExpr>();
+                const TimingControl* left   = body_clock(binary.left);
                 return left != nullptr ? left : body_clock(binary.right);
             }
             case AEK::FirstMatch:
@@ -6288,6 +6412,582 @@ private:
         }
     }
 
+    // The `disable iff` condition to hoist out of the body, or null.
+    //
+    // LRM 16.12 attaches the clause to a property_expr to yield a property_spec,
+    // and a named property's declaration body IS a property_spec -- so `property
+    // p; @(posedge clk) disable iff (rst) a |=> b; endproperty` carries a reset
+    // that belongs to every assertion instantiating p. slang substitutes the
+    // actuals into the body it hands back, so the condition arrives already in the
+    // instantiation's terms and can be lifted verbatim.
+    //
+    // The soundness constraint is body_clock's, and so is the shape of the walk:
+    // descend exactly where sva::lower descends, and no further. Over-collecting
+    // is again the dangerous direction, and here it is worse than a missed
+    // cross-check -- a `disable iff` under `and` or `until` would reset ONE
+    // operand, and lifting it out would silently widen it to the whole assertion.
+    // Not descending leaves that node where it is for sva::lower's DisableIff arm,
+    // which refuses every clause it was not told about.
+    //
+    // Three kinds are walked and each is a step sva::lower's property() takes: a
+    // Simple that is a property instance, into the substituted body; the Clocking
+    // wrapper the declaration may carry above the clause; and the clause itself.
+    // That is also the shape slang polices with diag::NestedDisableIff
+    // (SimpleAssertionExpr::fromSyntax), so a clause reached this way is one slang
+    // has already ruled legal where it stands.
+    static const Expression* body_disable(const AssertionExpr& expr) {
+        using AEK = slang::ast::AssertionExprKind;
+        switch (expr.kind) {
+            case AEK::DisableIff:
+                return &expr.as<DisableIffAssertionExpr>().condition;
+            case AEK::Clocking:
+                return body_disable(expr.as<ClockingAssertionExpr>().expr);
+            case AEK::Simple: {
+                const auto& simple = expr.as<SimpleAssertionExpr>();
+                if (simple.expr.kind != ExpressionKind::AssertionInstance) {
+                    return nullptr;
+                }
+                return body_disable(simple.expr.as<AssertionInstanceExpression>().body);
+            }
+            default:
+                return nullptr;
+        }
+    }
+
+    // -- Assertion control (LRM 20.12) ---------------------------------------
+    //
+    // `$assertoff` and its family name assertions Emit has not reached yet: a
+    // `$assertoff(0, sub)` in the top's initial block covers monitors from an
+    // instance whose members lower later in the very same pass, and
+    // Module::monitors only fills in as Emit goes. So the addressing table
+    // cannot be built from the monitor registry. Collect builds it instead --
+    // that walk already visits every procedural block to find `force` targets
+    // (scan_force_targets), so enumerating the assertions rides along for free,
+    // and it settles the one question that has to be answered before any
+    // monitor state is allocated: whether this design calls a control task at
+    // all. A design that calls none allocates nothing here and emits exactly
+    // the signals it emitted before any of this existed.
+    //
+    // What a control task writes is PER-ASSERTION state and not a global flag,
+    // because 20.12 addresses assertions individually: `$asserton` on one scope
+    // must not undo an `$assertoff` aimed at another.
+
+    // The control state of one assertion: five 1-bit signals, all in NEGATIVE
+    // logic, so every one of them powers up to 0 and 0 IS the LRM's power-up
+    // state -- checking, reporting, unlocked. An active-high enable would have
+    // to be preset to 1, and the monitor's own state deliberately has no
+    // initializer machinery behind it ("All 2-state, so all power up to 0").
+    struct MonitorControl {
+        // Stop SEEDING new attempts (control types Off and Kill). This gates
+        // the seed and nothing else: 20.12 is explicit that attempts already
+        // executing are unaffected, so the advance, the verdicts, the state
+        // stores and the reports must never read it.
+        ir::Signal off{ 0 };
+        // Abandon everything in flight (Kill). Held as a REQUEST rather than as
+        // a level: the task runs in an arbitrary time slot and the monitor acts
+        // only at its own clocking edge, so the request has to survive until
+        // that edge -- where it joins `disable iff` in the reset term and is
+        // cleared. Same latch, and for the same reason, as
+        // MonitorState::abort_seen. Reusing the reset is what makes a kill
+        // exactly the abandonment LRM 16.15 already specifies, rather than a
+        // second clear that could drift from it.
+        ir::Signal kill{ 0 };
+        // Pass / fail action suppression (PassOn, PassOff, FailOn, FailOff).
+        // Separate bits from `off` because they gate the ACTION BLOCK alone:
+        // the automaton has already stepped by the time they are read, so a
+        // suppressed report leaves a cover tally advancing behind it.
+        ir::Signal poff{ 0 };
+        ir::Signal foff{ 0 };
+        // Lock / Unlock: while set, no control task may change any of the four
+        // above. Every control write is therefore a select on this bit, and the
+        // bit itself is the one thing written unconditionally -- Unlock has to
+        // be able to escape a lock it is standing inside.
+        ir::Signal lock{ 0 };
+    };
+
+    // One concurrent assertion, as the Collect walk found it.
+    struct AssertSite {
+        // Identity, for the Emit-side lookup. Two instances of one module get
+        // their own InstanceBodySymbol and therefore their own bound Statement,
+        // so `stmt` alone would do; the scope is carried anyway because it is
+        // what a wrong answer here would silently alias, and it costs 4 bytes.
+        const slang::ast::ConcurrentAssertionStatement* stmt  = nullptr;
+        uint32_t                                        scope = ir::Process::no_scope;
+        // Which directive it is, for $assertcontrol's directive_type filter
+        // (LRM Table 20-7). Read from the AST because the monitor that would
+        // otherwise carry it does not exist yet.
+        slang::ast::AssertionKind kind = slang::ast::AssertionKind::Assert;
+        // The procedural block the assertion sits in, and the innermost named
+        // block between the two. Together they answer "does this target name
+        // this assertion": a label makes a StatementBlockSymbol, which is what
+        // `$assertoff(0, top.ap)` resolves to, and containment in a generate or
+        // named block is found by walking up from the procedural block.
+        const Symbol* owner = nullptr;
+        const Symbol* label = nullptr;
+        // Where the control state is allocated: the instance's signal-name
+        // prefix, and a location to hang the hidden signals off.
+        std::string    prefix;
+        ir::SourceLoc  loc{};
+        MonitorControl ctl;
+    };
+
+    // LRM Table 20-5's control_type codes. The nine named tasks are DEFINED by
+    // 20.12 as $assertcontrol with one of these and a fixed assertion_type of
+    // 15, so they lower through the same path rather than duplicating it.
+    enum class AssertCtl : int32_t {
+        Lock         = 1,
+        Unlock       = 2,
+        On           = 3,
+        Off          = 4,
+        Kill         = 5,
+        PassOn       = 6,
+        PassOff      = 7,
+        FailOn       = 8,
+        FailOff      = 9,
+        NonvacuousOn = 10,
+        VacuousOff   = 11,
+    };
+
+    // The control code one of the nine named tasks stands for (LRM 20.12's
+    // equivalence table), or 0 for a name that is not one of them.
+    static int32_t named_control_code(std::string_view name) {
+        if (name == "$asserton") {
+            return static_cast<int32_t>(AssertCtl::On);
+        }
+        if (name == "$assertoff") {
+            return static_cast<int32_t>(AssertCtl::Off);
+        }
+        if (name == "$assertkill") {
+            return static_cast<int32_t>(AssertCtl::Kill);
+        }
+        if (name == "$assertpasson") {
+            return static_cast<int32_t>(AssertCtl::PassOn);
+        }
+        if (name == "$assertpassoff") {
+            return static_cast<int32_t>(AssertCtl::PassOff);
+        }
+        if (name == "$assertfailon") {
+            return static_cast<int32_t>(AssertCtl::FailOn);
+        }
+        if (name == "$assertfailoff") {
+            return static_cast<int32_t>(AssertCtl::FailOff);
+        }
+        if (name == "$assertnonvacuouson") {
+            return static_cast<int32_t>(AssertCtl::NonvacuousOn);
+        }
+        if (name == "$assertvacuousoff") {
+            return static_cast<int32_t>(AssertCtl::VacuousOff);
+        }
+
+        return 0;
+    }
+
+    static bool is_assert_control_task(std::string_view name) {
+        return name == "$assertcontrol" || named_control_code(name) != 0;
+    }
+
+    // Collect-pass scan of one procedural block: enumerate the concurrent
+    // assertions in it, and notice whether it calls a control task. Both
+    // answers must exist before Emit allocates any monitor state, and this is
+    // the walk that already visits every block.
+    //
+    // Calls into user subroutines are followed, because `task off(); $assertoff;
+    // endtask` is an ordinary way to write this and the call graph Emit lowers
+    // is the same one. What a static call cannot reach -- a class method
+    // arrived at only through a virtual dispatch -- is caught by the loud
+    // refusal in lower_assert_control rather than silently losing the control.
+    void scan_assert_control(const ProceduralBlockSymbol& blk) {
+        struct Scan : ASTVisitor<Scan, VisitFlags::AllGood> {
+            Lowerer*                                   self;
+            const Symbol*                              owner = nullptr;
+            const Symbol*                              label = nullptr;
+            ankerl::unordered_dense::set<const Symbol*> entered;
+
+            void handle(const slang::ast::BlockStatement& s) {
+                const Symbol* saved = label;
+                if (s.blockSymbol != nullptr) {
+                    label = s.blockSymbol;
+                }
+                visitDefault(s);
+                label = saved;
+            }
+            void handle(const slang::ast::ConcurrentAssertionStatement& s) {
+                self->record_assert_site(s, owner, label);
+                visitDefault(s);
+            }
+            void handle(const ImmediateAssertionStatement& s) {
+                // Only whether one EXISTS: an immediate assertion is in the
+                // default assertion_type set, and lower_assert_control refuses
+                // rather than silently leaving it uncontrolled.
+                self->immediate_assertion_seen_ = true;
+                visitDefault(s);
+            }
+            void handle(const CallExpression& c) {
+                if (c.subroutine.index() == 0) {
+                    const SubroutineSymbol* sub = std::get<0>(c.subroutine);
+                    // `entered` is recursion protection, not memoization: a
+                    // subroutine reached twice has nothing new to say.
+                    if (sub != nullptr && entered.insert(sub).second) {
+                        sub->getBody().visit(*this);
+                    }
+                } else if (is_assert_control_task(c.getSubroutineName())) {
+                    self->assert_control_used_ = true;
+                }
+                visitDefault(c);
+            }
+        };
+        Scan v;
+        v.self  = this;
+        v.owner = &blk;
+        blk.getBody().visit(v);
+    }
+
+    void record_assert_site(const slang::ast::ConcurrentAssertionStatement& s,
+                            const Symbol*                                  owner,
+                            const Symbol*                                  label) {
+        site_of_[&s].push_back(static_cast<uint32_t>(sites_.size()));
+        sites_.push_back(AssertSite{ .stmt   = &s,
+                                     .scope  = cur_scope_id(),
+                                     .kind   = s.assertionKind,
+                                     .owner  = owner,
+                                     .label  = label,
+                                     .prefix = prefix_,
+                                     .loc    = to_source_loc(s.sourceRange.start()) });
+    }
+
+    // The scope node with `id` under `root`. Walked once per assertion while
+    // control state is allocated, so the linear search costs nothing measurable
+    // and saves Collect from maintaining a parallel index as the tree grows.
+    static ir::InstanceScope* find_scope_node(ir::InstanceScope& root, uint32_t id) {
+        if (root.id == id) {
+            return &root;
+        }
+        for (ir::InstanceScope& child : root.children) {
+            if (ir::InstanceScope* hit = find_scope_node(child, id); hit != nullptr) {
+                return hit;
+            }
+        }
+
+        return nullptr;
+    }
+
+    // Allocate every assertion's control state, between Collect and Classify.
+    // Collect has just finished, so the scope tree is complete and frozen -- a
+    // node pointer taken DURING Collect would not have been, because a parent's
+    // children vector reallocates as its later siblings are pushed. Nothing
+    // runs at all unless Collect saw a control task, which is what leaves a
+    // design without one emitting the signals it always did.
+    void alloc_assert_control() {
+        if (!assert_control_used_) {
+            return;
+        }
+        const std::string saved_prefix = prefix_;
+        for (uint32_t i = 0; i < sites_.size(); ++i) {
+            AssertSite&        site = sites_[i];
+            ir::InstanceScope* node = find_scope_node(top_scope_, site.scope);
+            if (node == nullptr) {
+                fail("internal: an assertion was enumerated outside the scope tree");
+            }
+            // Named by position in this table rather than by monitor id: the
+            // monitor has no id yet (Emit hands those out), and an assertion
+            // that later refuses to lower would leave a hole in that numbering.
+            const std::string base = "sva.ctl" + std::to_string(i) + ".";
+            scope_stack_.push_back(node);
+            prefix_       = site.prefix;
+            site.ctl.off  = new_monitor_state(base + "off", mask_type(1), site.loc);
+            site.ctl.kill = new_monitor_state(base + "kill", mask_type(1), site.loc);
+            site.ctl.poff = new_monitor_state(base + "poff", mask_type(1), site.loc);
+            site.ctl.foff = new_monitor_state(base + "foff", mask_type(1), site.loc);
+            site.ctl.lock = new_monitor_state(base + "lock", mask_type(1), site.loc);
+            scope_stack_.pop_back();
+        }
+        prefix_ = saved_prefix;
+    }
+
+    // The control state of the assertion about to be lowered, or null when this
+    // design calls no control task.
+    const MonitorControl* control_for(const slang::ast::ConcurrentAssertionStatement& a) {
+        if (!assert_control_used_) {
+            return nullptr;
+        }
+        if (const auto it = site_of_.find(&a); it != site_of_.end()) {
+            for (const uint32_t i : it->second) {
+                if (sites_[i].scope == cur_scope_id()) {
+                    return &sites_[i].ctl;
+                }
+            }
+        }
+        // Collect walks the same procedural blocks Emit lowers, so a miss means
+        // the two disagree about what a block contains -- and the assertion
+        // would silently ignore every control task aimed at it.
+        fail("internal: this concurrent assertion was not enumerated for assertion control");
+    }
+
+    // At what hierarchy depth `target` names this assertion: 1 for the instance
+    // the assertion sits in, 2 for that instance's parent, and so on; 0 for a
+    // target that is nowhere above it. This is $dumpvars' `levels` counting
+    // (LRM 21.7.1.3), which 20.12 adopts by reference.
+    static uint32_t control_depth(const AssertSite& site, const Symbol& target) {
+        // A label, or a named block the assertion sits in, is inside the
+        // assertion's own instance, so it is depth 1.
+        if (site.label == &target) {
+            return 1;
+        }
+        uint32_t     depth = 1;
+        const Scope* scope = site.owner->getParentScope();
+        while (scope != nullptr) {
+            const Symbol& sym = scope->asSymbol();
+            if (&sym == &target) {
+                return depth;
+            }
+            if (sym.kind != SymbolKind::InstanceBody) {
+                scope = sym.getParentScope();
+                continue;
+            }
+            // Leaving an instance is what a level counts. The target names the
+            // InstanceSymbol rather than the body slang hangs the members off,
+            // so the comparison steps across that pair.
+            const InstanceSymbol* parent = sym.as<InstanceBodySymbol>().parentInstance;
+            if (parent == nullptr) {
+                return 0;
+            }
+            if (parent == &target) {
+                return depth;
+            }
+            ++depth;
+            scope = parent->getParentScope();
+        }
+
+        return 0;
+    }
+
+    // Whether any listed target names this assertion within `levels` of
+    // hierarchy. 0 means the target scope and every level below it; N means N
+    // levels starting at the target.
+    static bool targets_cover(const AssertSite& site, const std::vector<const Symbol*>& targets, int32_t levels) {
+        for (const Symbol* target : targets) {
+            const uint32_t depth = control_depth(site, *target);
+            if (depth != 0 && (levels == 0 || depth <= static_cast<uint32_t>(levels))) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // LRM Table 20-7. `restrict` deliberately has no bit: it is a formal-only
+    // directive with no simulation verdict, and 20.12 gives no directive_type
+    // that selects one, so a control task never reaches it.
+    static int32_t directive_bit(slang::ast::AssertionKind kind) {
+        switch (kind) {
+            case slang::ast::AssertionKind::Assert:
+                return 1;
+            case slang::ast::AssertionKind::CoverProperty:
+            case slang::ast::AssertionKind::CoverSequence:
+                return 2;
+            case slang::ast::AssertionKind::Assume:
+                return 4;
+            default:
+                return 0;
+        }
+    }
+
+    // One of an assertion control task's integer arguments, constant-folded. A
+    // non-constant one is refused rather than lowered: these arguments do not
+    // feed the emitted code, they DECIDE it -- which of five bits are written,
+    // in which assertions, over how much of the hierarchy. A run-time value
+    // means a run-time dispatch over every assertion in scope, which is a
+    // different mechanism rather than a wider version of this one.
+    int32_t const_control_arg(const Expression& e, const char* what) {
+        const std::optional<int32_t> value = try_const_int(e);
+        if (!value.has_value()) {
+            // TODO: non-constant assertion control arguments (LRM 20.12).
+            fail("the " + std::string(what) +
+                 " argument of an assertion control task must be a constant; only the "
+                 "constant-argument subset of LRM 20.12 is supported");
+        }
+
+        return *value;
+    }
+
+    // A 1-bit control signal, written unconditionally.
+    void store_control_bit(ir::Signal sig, bool set, ir::Builder& b, ir::SourceLoc l) {
+        b.binary(ir::Inst::Tag::Store, b.signal(sig, l), set ? true_const(b, l) : zero_mask(1, b, l), l);
+    }
+
+    // The same, but holding its current value while the assertion is locked
+    // (LRM 20.12 Lock). A select, never a branch: this is straight-line code in
+    // whatever process the task was written in.
+    void store_control_locked(const MonitorControl& ctl, ir::Signal sig, bool set, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Index want = set ? true_const(b, l) : zero_mask(1, b, l);
+        b.binary(ir::Inst::Tag::Store,
+                 b.signal(sig, l),
+                 b.select(load_signal(ctl.lock, b, l), load_signal(sig, b, l), want, l),
+                 l);
+    }
+
+    // One control task's effect on one assertion.
+    void emit_control_write(const MonitorControl& ctl, AssertCtl code, ir::Builder& b, ir::SourceLoc l) {
+        switch (code) {
+            case AssertCtl::Lock:
+                store_control_bit(ctl.lock, true, b, l);
+                return;
+            case AssertCtl::Unlock:
+                store_control_bit(ctl.lock, false, b, l);
+                return;
+            case AssertCtl::On:
+                store_control_locked(ctl, ctl.off, false, b, l);
+                return;
+            case AssertCtl::Off:
+                store_control_locked(ctl, ctl.off, true, b, l);
+                return;
+            case AssertCtl::Kill:
+                // Kill is Off plus an abandonment of what is already running,
+                // and stays off until a subsequent On.
+                store_control_locked(ctl, ctl.off, true, b, l);
+                store_control_locked(ctl, ctl.kill, true, b, l);
+                return;
+            case AssertCtl::PassOn:
+                store_control_locked(ctl, ctl.poff, false, b, l);
+                return;
+            case AssertCtl::PassOff:
+                store_control_locked(ctl, ctl.poff, true, b, l);
+                return;
+            case AssertCtl::FailOn:
+                store_control_locked(ctl, ctl.foff, false, b, l);
+                return;
+            case AssertCtl::FailOff:
+                store_control_locked(ctl, ctl.foff, true, b, l);
+                return;
+            case AssertCtl::NonvacuousOn:
+                // "Enable the pass action on NONVACUOUS success." Every pass a
+                // monitor here reports is nonvacuous: report_pass is built out
+                // of obligations that completed (emit_monitor's `matched`), and
+                // an attempt whose antecedent never matched produces no verdict
+                // bit at all rather than a vacuous one. The nonvacuous half is
+                // therefore the whole of it, and this is exactly PassOn.
+                store_control_locked(ctl, ctl.poff, false, b, l);
+                return;
+            case AssertCtl::VacuousOff:
+                // "Stop the pass action on VACUOUS success" -- already the
+                // behaviour, and not a gap: by the paragraph above no vacuous
+                // success ever reaches an action block here, so there is nothing
+                // to switch off and no bit worth carrying for it. Writing
+                // PassOff instead would suppress the nonvacuous passes the LRM
+                // is explicit about keeping.
+                return;
+        }
+    }
+
+    // $asserton / $assertoff / $assertkill, the four action tasks,
+    // $assertnonvacuouson / $assertvacuousoff, and $assertcontrol (LRM 20.12).
+    //
+    // slang binds all ten through one AssertControlTask (its SystemTasks.cpp):
+    // it has already checked the arity and resolved every trailing argument to
+    // a scope or an assertion instance, rejecting anything else. So what
+    // arrives here is a control code, the filters, and a target list that is
+    // already a list of symbols.
+    void lower_assert_control(std::string_view name, const CallExpression& call, ir::Builder& b) {
+        const auto args = call.arguments();
+        const bool full = name == "$assertcontrol";
+
+        // LRM 20.12's defaults: every assertion type and every directive type.
+        // The nine named tasks are defined as $assertcontrol(code, 15, 7,
+        // levels, list) -- 15 rather than 31 because none of them affects an
+        // `expect`, which is the bit 31 adds.
+        int32_t code   = full ? 0 : named_control_code(name);
+        int32_t atype  = full ? 31 : 15;
+        int32_t dtype  = 7;
+        int32_t levels = 0;
+        size_t  first  = full ? 4 : 1;
+        if (full) {
+            code = const_control_arg(*args[0], "control_type");
+            if (args.size() > 1) {
+                atype = const_control_arg(*args[1], "assertion_type");
+            }
+            if (args.size() > 2) {
+                dtype = const_control_arg(*args[2], "directive_type");
+            }
+            if (args.size() > 3) {
+                levels = const_control_arg(*args[3], "levels");
+            }
+        } else if (!args.empty()) {
+            levels = const_control_arg(*args[0], "levels");
+        }
+
+        if (code < static_cast<int32_t>(AssertCtl::Lock) || code > static_cast<int32_t>(AssertCtl::VacuousOff)) {
+            fail("'" + std::string(name) + "' control_type " + std::to_string(code) +
+                 " is not one of LRM Table 20-5's codes 1..11");
+        }
+        if (levels < 0) {
+            fail("'" + std::string(name) + "' levels must not be negative");
+        }
+        if ((dtype & ~int32_t{ 7 }) != 0) {
+            fail("'" + std::string(name) + "' directive_type " + std::to_string(dtype) +
+                 " has bits LRM Table 20-7 does not define (1 assert, 2 cover, 4 assume)");
+        }
+        if ((atype & (32 | 64 | 128)) != 0) {
+            // TODO: assertion control over unique / unique0 / priority violation
+            // reporting (LRM Table 20-6, bits 32/64/128). Those are not
+            // assertions with state of their own -- the check is emitted inline
+            // at the `if` / `case` -- so gating them is a different mechanism.
+            fail("'" + std::string(name) + "' over unique/unique0/priority violation checks is not supported");
+        }
+        if ((atype & (2 | 4 | 8 | 16)) != 0 && immediate_assertion_seen_) {
+            // TODO: assertion control over immediate, deferred and `expect`
+            // assertions (LRM Table 20-6, bits 2/4/8/16). They lower inline into
+            // the process that holds them, with no per-assertion state for a
+            // control task to write, so an enable would have to be threaded
+            // through lower_immediate_assertion instead.
+            fail("'" + std::string(name) +
+                 "' over immediate assertions is not supported; select concurrent assertions alone with "
+                 "$assertcontrol(<control_type>, 1, ...)");
+        }
+
+        std::vector<const Symbol*> targets;
+        targets.reserve(args.size() - std::min(first, args.size()));
+        for (size_t k = first; k < args.size(); ++k) {
+            const auto* as = args[k]->as_if<slang::ast::ArbitrarySymbolExpression>();
+            if (as == nullptr) {
+                fail("'" + std::string(name) + "' trailing arguments must name a scope or an assertion");
+            }
+            targets.push_back(as->symbol.get());
+        }
+
+        if ((atype & 1) == 0) {
+            // Every type this task selects is one the guards above already
+            // proved absent from the design, so it names no assertion. Not a
+            // silent drop: there is nothing here to control.
+            return;
+        }
+        if (!assert_control_used_) {
+            // Collect decides whether any control state exists, and it reaches a
+            // task only through a procedural block or a call it can resolve
+            // statically. One arriving here unannounced was reached some other
+            // way, and there is nothing allocated for it to write.
+            // TODO: assertion control from a class method reached only through a
+            // virtual dispatch, or from any body scan_assert_control cannot
+            // follow a call into.
+            fail("'" + std::string(name) +
+                 "' in this position is not supported: the control state of its target assertions is allocated "
+                 "from the declaration walk, which never reached this call");
+        }
+
+        const ir::SourceLoc l = loc(call);
+        for (const AssertSite& site : sites_) {
+            if ((directive_bit(site.kind) & dtype) == 0) {
+                continue;
+            }
+            // An empty list is the whole design (LRM 20.12: `$assertcontrol(OFF)`
+            // uses the default values of every other argument), and then `levels`
+            // has no scope to count from and does not apply.
+            if (!targets.empty() && !targets_cover(site, targets, levels)) {
+                continue;
+            }
+            emit_control_write(site.ctl, static_cast<AssertCtl>(code), b, l);
+        }
+    }
+
     // -- Concurrent assertions (LRM 16) --------------------------------------
     //
     // `assert property (@(posedge clk) disable iff (rst) a |=> b);`
@@ -6302,9 +7002,8 @@ private:
     // What comes back is an ir::AssertionMonitor: two automata over interned
     // guard cubes, plus the obligation tracking a property needs. See
     // docs/design/concurrent-assertions.md.
-    void lower_concurrent_assertion(const slang::ast::ConcurrentAssertionStatement& a,
-                                    ir::Builder&) {
-        using AK = slang::ast::AssertionKind;
+    void lower_concurrent_assertion(const slang::ast::ConcurrentAssertionStatement& a, ir::Builder&) {
+        using AK  = slang::ast::AssertionKind;
         using AEK = slang::ast::AssertionExprKind;
 
         ir::AssertionKind kind;
@@ -6316,15 +7015,34 @@ private:
                 kind = ir::AssertionKind::Assume;
                 break;
             case AK::CoverProperty:
+            case AK::CoverSequence:
                 kind = ir::AssertionKind::Cover;
                 break;
+            case AK::Restrict:
+                // Accepted, lowered, and then deliberately silent. `restrict`
+                // constrains the input space a FORMAL tool may explore; LRM 16.12
+                // gives it no simulation verdict at all, and slang enforces that
+                // by rejecting an action block on one. Lowering it anyway is not
+                // pointless: the property is bound, its roots are sampled, and a
+                // shape libsva cannot handle is still refused here rather than
+                // waved through. What emit_monitor then skips is the verdict, the
+                // report and the action pend -- see the switch there.
+                kind = ir::AssertionKind::Restrict;
+                break;
             default:
-                // TODO: concurrent `restrict` is formal-only, `expect` is a
-                // blocking statement needing the reactive region set, and
-                // `cover sequence` counts matches rather than attempts
-                // (LRM 16.5, 16.17).
-                fail("only concurrent assert / assume / cover property are supported");
+                // `expect` by elimination: slang's AssertionKind has six members
+                // and the five above are handled.
+                // TODO: `expect` (LRM 16.17) suspends the enclosing process until
+                // the property completes, so it needs a blocking wait driven from
+                // the reactive region set -- a scheduler change rather than a
+                // lowering one.
+                fail("concurrent expect is not supported");
         }
+        // `cover sequence` counts every MATCH of the sequence where `cover
+        // property` counts the attempts that succeeded (LRM 16.12.6). Same
+        // automaton, same SVA_COVER to libsva, so the distinction is carried
+        // beside the kind and read only by the tally.
+        const bool cover_matches = a.assertionKind == AK::CoverSequence;
 
         // Action blocks run in the Reactive region (LRM 4.4.2.6). The monitor
         // itself is an Observed process, and LRM 4.4.2.5 is explicit that a
@@ -6363,18 +7081,17 @@ private:
         // from. The one thing that is not: a clock hoisted out of the body leaves
         // its ClockingAssertionExpr in place, so sva::lower is told which event
         // became the assertion's and skips exactly that one.
-        const slang::ast::AssertionExpr* body = &a.propertySpec;
-        const TimingControl* clocking = nullptr;
-        bool inference_untranslated = false;
+        const slang::ast::AssertionExpr* body                   = &a.propertySpec;
+        const TimingControl*             clocking               = nullptr;
+        bool                             inference_untranslated = false;
         if (body->kind == AEK::Clocking) {
             const auto& wrapper = body->as<slang::ast::ClockingAssertionExpr>();
-            clocking = &wrapper.clocking;
-            body = &wrapper.expr;
-        } else if ((clocking = body_clock(*body)) == nullptr && inferred_clocks_ != nullptr &&
-                   a.syntax != nullptr) {
+            clocking            = &wrapper.clocking;
+            body                = &wrapper.expr;
+        } else if ((clocking = body_clock(*body)) == nullptr && inferred_clocks_ != nullptr && a.syntax != nullptr) {
             const auto it = inferred_clocks_->find(a.syntax);
             if (it != inferred_clocks_->end() && it->second != nullptr) {
-                clocking = local_event_with_syntax(proc_timing_, it->second);
+                clocking               = local_event_with_syntax(proc_timing_, it->second);
                 inference_untranslated = clocking == nullptr;
             }
         }
@@ -6407,8 +7124,7 @@ private:
             // TODO: `@(posedge clk iff cond)` as an assertion clock.
             fail("an `iff` qualifier on an assertion clock is not supported");
         }
-        if (event.edge != slang::ast::EdgeKind::PosEdge &&
-            event.edge != slang::ast::EdgeKind::NegEdge) {
+        if (event.edge != slang::ast::EdgeKind::PosEdge && event.edge != slang::ast::EdgeKind::NegEdge) {
             // A level-sensitive or both-edge assertion clock does not delimit
             // cycles the way the automaton assumes.
             // TODO: `edge` and level-sensitive assertion clocks.
@@ -6418,18 +7134,38 @@ private:
         // Peel the disable condition. LRM 16.15: it is deliberately NOT sampled,
         // so it is evaluated from live values while every other root reads the
         // sampled shadow.
+        //
+        // Two places may carry one, and LRM 16.12 makes them mutually exclusive:
+        // "Nesting of disable iff clauses, explicitly or through property
+        // instantiations, is not allowed". So there is no precedence to define and
+        // none is invented here -- an assertion carrying its own clause while the
+        // property it instantiates carries another is illegal, slang has already
+        // diagnosed it (diag::NestedDisableIff), and clotho refuses the pair
+        // rather than picking a winner. A reset condition is not something to
+        // guess at, and either choice would be a semantics clotho made up.
+        //
+        // The declaration's clause is left standing in the tree exactly like a
+        // hoisted clock, so sva::lower is told which node became the assertion's
+        // reset and steps over that one alone.
         const Expression* disable = nullptr;
         if (body->kind == AEK::DisableIff) {
             const auto& wrapper = body->as<slang::ast::DisableIffAssertionExpr>();
-            disable = &wrapper.condition;
-            body = &wrapper.expr;
+            disable             = &wrapper.condition;
+            body                = &wrapper.expr;
+        }
+        if (const Expression* declared = body_disable(*body); declared != nullptr) {
+            if (disable != nullptr) {
+                fail("an assertion and the named property it instantiates cannot both carry a "
+                     "`disable iff`");
+            }
+            disable = declared;
         }
 
         const sva::Request request{
             .property = body,
-            .disable = disable,
-            .clock = clocking,
-            .kind = kind,
+            .disable  = disable,
+            .clock    = clocking,
+            .kind     = kind,
         };
         sva::Result lowered = sva::lower(request);
         if (!lowered.ok) {
@@ -6444,11 +7180,13 @@ private:
         }
 
         ir::AssertionMonitor& monitor = lowered.monitor;
-        monitor.clock = event_signal(event.expr);
-        monitor.edge = event.edge == slang::ast::EdgeKind::PosEdge ? ir::Edge::Positive
-                                                                  : ir::Edge::Negative;
-        monitor.span = to_source_span(a.sourceRange);
+        monitor.clock                 = event_signal(event.expr);
+        monitor.edge   = event.edge == slang::ast::EdgeKind::PosEdge ? ir::Edge::Positive : ir::Edge::Negative;
+        monitor.span   = to_source_span(a.sourceRange);
         monitor.banner = banner_at(a.sourceRange.start());
+        // Not round-tripped through libsva, which has one cover kind: the tally
+        // is clotho's own choice and this is where the choice is recorded.
+        monitor.cover_matches = cover_matches;
 
         // Shadow every variable the assertion samples, before anything reads one.
         sva_sample_roots(lowered);
@@ -6457,7 +7195,7 @@ private:
         // so `monitor.roots` stays empty: it indexes instructions of a body the
         // monitor would own, and there is none -- the roots are ordinary values
         // inside the process emitted here.
-        emit_monitor(lowered, monitor, static_cast<uint32_t>(module_.monitors.size()), actions);
+        emit_monitor(lowered, monitor, static_cast<uint32_t>(module_.monitors.size()), actions, control_for(a));
         module_.monitors.push_back(std::move(monitor));
     }
 
@@ -6543,8 +7281,7 @@ private:
         const ir::SourceLoc  l  = mon.span.start;
 
         ir::Builder b(module_.pool);
-        b.severity(
-          static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
+        b.severity(static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
         b.ret_void(l);
 
         module_.set_function(id,
@@ -6601,7 +7338,7 @@ private:
         // the attempt to be unable to raise another one. A pass is only the
         // attempt's once nothing of it is left running, and that can be a later
         // cycle than the one its last obligation matched in.
-        ir::Signal              passing{ 0 };
+        ir::Signal passing{ 0 };
         // Match tally, for `cover property`.
         ir::Signal covered{ 0 };
         // One per ASYNCHRONOUS abort, empty entry for a `sync_` one: whether its
@@ -6618,6 +7355,12 @@ private:
         // so the monitor detects its own clocking edge and needs one slot of
         // clock history to do it.
         ir::Signal clkprev{ 0 };
+        // LRM 20.12 assertion control, or null when the design calls no control
+        // task. Not allocated here like the rest: a control task can name an
+        // assertion whose monitor Emit has not built yet, so the signals are
+        // laid down before Emit starts and this only points at them
+        // (alloc_assert_control).
+        const MonitorControl* ctl = nullptr;
     };
 
     // A hidden monitor state signal, powering up to 0. Two-state throughout: a
@@ -6637,20 +7380,23 @@ private:
     }
 
     // `id` indexes the module's monitor table, so two assertions in one instance
-    // get distinct names.
-    MonitorState alloc_monitor_state(const ir::AssertionMonitor& mon, uint32_t id) {
+    // get distinct names. `ctl` is the assertion's LRM 20.12 control state,
+    // already allocated before this pass began (see alloc_assert_control), or
+    // null in a design that controls nothing.
+    MonitorState alloc_monitor_state(const ir::AssertionMonitor& mon, uint32_t id, const MonitorControl* ctl) {
         const std::string   base = "sva." + std::to_string(id) + ".";
         const ir::SourceLoc l    = mon.span.start;
 
         MonitorState st;
+        st.ctl = ctl;
         if (mon.has_trigger) {
             st.trigger = new_monitor_state(base + "trig", mask_type(mon.trigger.state_count), l);
             st.fired   = new_monitor_state(base + "fired", mask_type(1), l);
         }
         st.pending.reserve(mon.depth);
         for (uint32_t k = 0; k < mon.depth; ++k) {
-            st.pending.push_back(new_monitor_state(
-              base + "pend" + std::to_string(k), mask_type(mon.obligation.state_count), l));
+            st.pending.push_back(
+              new_monitor_state(base + "pend" + std::to_string(k), mask_type(mon.obligation.state_count), l));
         }
         st.occupied = new_monitor_state(base + "occ", mask_type(mon.depth), l);
 
@@ -6659,13 +7405,11 @@ private:
         if (const uint32_t ring = attempt_ring_size(mon); ring != 0) {
             st.tid.reserve(mon.trigger.state_count);
             for (uint32_t s = 0; s < mon.trigger.state_count; ++s) {
-                st.tid.push_back(
-                  new_monitor_state(base + "tid" + std::to_string(s), mask_type(ring), l));
+                st.tid.push_back(new_monitor_state(base + "tid" + std::to_string(s), mask_type(ring), l));
             }
             st.oid.reserve(mon.depth);
             for (uint32_t k = 0; k < mon.depth; ++k) {
-                st.oid.push_back(
-                  new_monitor_state(base + "oid" + std::to_string(k), mask_type(ring), l));
+                st.oid.push_back(new_monitor_state(base + "oid" + std::to_string(k), mask_type(ring), l));
             }
             st.firedid = new_monitor_state(base + "fid", mask_type(ring), l);
             st.idnow   = new_monitor_state(base + "idn", mask_type(ring), l);
@@ -6682,8 +7426,7 @@ private:
             // A `sync_` abort reads the Preponed sample at the edge and has
             // nothing to remember between ticks, so it gets no latch.
             if (!mon.aborts[i].sampled) {
-                st.abort_seen[i] =
-                  new_monitor_state(base + "abrt" + std::to_string(i), mask_type(1), l);
+                st.abort_seen[i] = new_monitor_state(base + "abrt" + std::to_string(i), mask_type(1), l);
             }
         }
         st.clkprev = new_monitor_state(base + "clk", mask_type(1), l);
@@ -6702,9 +7445,7 @@ private:
     }
 
     // Row `index` of a `words`-per-row bit-set table.
-    static std::span<const uint64_t> table_row(const std::vector<uint64_t>& table,
-                                               uint32_t                     index,
-                                               uint32_t                     words) {
+    static std::span<const uint64_t> table_row(const std::vector<uint64_t>& table, uint32_t index, uint32_t words) {
         return { table.data() + static_cast<size_t>(index) * words, words };
     }
 
@@ -6838,8 +7579,7 @@ private:
     // rows of `cur`'s members, so it meets the mask exactly when `cur` holds some
     // state whose follow row does -- one AND against a constant instead of a
     // whole advance per attempt.
-    static std::vector<uint64_t> abort_arming_row(const ir::AssertionAutomaton& au,
-                                                  const ir::AssertionAbort&     abort) {
+    static std::vector<uint64_t> abort_arming_row(const ir::AssertionAutomaton& au, const ir::AssertionAbort& abort) {
         std::vector<uint64_t> row(au.words, 0);
         for (uint32_t s = 0; s < au.state_count; ++s) {
             if (rows_intersect(table_row(au.follow, s, au.words), abort.mask)) {
@@ -6860,9 +7600,7 @@ private:
         }
         // Two-state, so one plane, and both sides are little-endian words.
         std::vector<uint8_t> bytes(ir::plane_bytes(states), 0);
-        std::memcpy(bytes.data(),
-                    row.data(),
-                    std::min<size_t>(bytes.size(), row.size() * sizeof(uint64_t)));
+        std::memcpy(bytes.data(), row.data(), std::min<size_t>(bytes.size(), row.size() * sizeof(uint64_t)));
 
         return module_.pool.put_value(ty, bytes);
     }
@@ -6935,10 +7673,7 @@ private:
                      ir::SourceLoc l) {
         b.binary(ir::Inst::Tag::Store,
                  b.signal(sig, l),
-                 b.select(edge,
-                          b.select(active, value, zero_mask(width, b, l), l),
-                          load_signal(sig, b, l),
-                          l),
+                 b.select(edge, b.select(active, value, zero_mask(width, b, l), l), load_signal(sig, b, l), l),
                  l);
     }
 
@@ -7050,15 +7785,30 @@ private:
     // one of them. It also makes the read/shift order self-evident, because both
     // end up in one straight-line process body.
     struct SvaHistory {
-        // Live signal -> its ring. ring[k] holds the shadow from k + 1 ticks ago,
-        // so $past(v, n) reads ring[n - 1] and the ring's LENGTH is the depth.
-        // Entries are created on demand, so it ends up as the largest n the source
-        // asks for over this variable -- a compile-time constant, because a
-        // non-constant n is refused before an entry is ever requested.
-        ankerl::unordered_dense::map<uint32_t, std::vector<ir::Signal>> rings;
-        // Live signals in first-use order, so the emitted shift is a function of
-        // the source rather than of a hash order.
-        std::vector<ir::Signal> order;
+        // One ring of earlier sampled values: entries[k] is the sample from k + 1
+        // ADVANCES of this ring ago, so $past(v, n, ...) reads entries[n - 1] and
+        // the length is the depth. Entries are created on demand, so it ends up as
+        // the largest n the source asks of this ring -- a compile-time constant,
+        // because a non-constant n is refused before one is ever requested.
+        struct Ring {
+            ir::Signal live{};
+            // The $past gating expression deciding which ticks this ring advances
+            // on (LRM 16.9.3), or null for the ungated ring. Part of the ring's
+            // identity rather than a decoration on it: $past(v) and $past(v, 1, g)
+            // count different ticks, so one ring per variable could answer at most
+            // one of them.
+            const Expression* gate = nullptr;
+            // `gate` as a definite bit, evaluated once where the ring is created
+            // and read again by the shift at the end of the body. Left zero and
+            // unread on an ungated ring.
+            ir::Index               gate_value{};
+            std::vector<ir::Signal> entries;
+        };
+        // In first-use order, so the emitted shift is a function of the source
+        // rather than of a hash order. Found by a linear scan: a monitor holds as
+        // many rings as the (variable, gate) pairs its sampled value functions
+        // name, which is a handful.
+        std::vector<Ring> rings;
         // Name prefix for the ring signals, and the location to blame them on.
         std::string   base;
         ir::SourceLoc loc;
@@ -7086,43 +7836,58 @@ private:
     // The sampled value functions of LRM 16.9.3. $past is the primitive; every
     // other one is a ring entry plus a comparison.
     static bool is_sampled_value_fn(std::string_view name) {
-        return name == "$past" || name == "$sampled" || name == "$rose" || name == "$fell" ||
-               name == "$stable" || name == "$changed";
+        return name == "$past" || name == "$sampled" || name == "$rose" || name == "$fell" || name == "$stable" ||
+               name == "$changed";
     }
 
-    ir::Signal sva_history_slot(ir::Signal live, uint32_t n) {
+    ir::Signal sva_history_slot(ir::Signal live, const Expression* gate, uint32_t n, ir::Builder& b) {
         SvaHistory& hist = *sva_history_;
 
-        const auto [it, fresh] = hist.rings.try_emplace(static_cast<uint32_t>(live));
-        if (fresh) {
-            hist.order.push_back(live);
+        size_t at = hist.rings.size();
+        for (size_t i = 0; i < hist.rings.size(); i++) {
+            if (hist.rings[i].live == live && hist.rings[i].gate == gate) {
+                at = i;
+                break;
+            }
         }
-        std::vector<ir::Signal>& ring = it->second;
+        if (at == hist.rings.size()) {
+            // Evaluated BEFORE the ring is appended, and `at` taken after: a gate
+            // is an ordinary assertion boolean and may hold a $past of its own, so
+            // evaluating one can append rings, and a half-built entry is exactly
+            // what that growth would move.
+            const ir::Index gate_value =
+              gate != nullptr ? eval_atom(sva::Atom{ .expr = gate }, true, b) : ir::Index{};
+            at = hist.rings.size();
+            hist.rings.push_back(SvaHistory::Ring{ .live = live, .gate = gate, .gate_value = gate_value });
+        }
+        std::vector<ir::Signal>& entries = hist.rings[at].entries;
 
-        while (ring.size() < n) {
+        while (entries.size() < n) {
             // Re-read the live info every round: register_signal can reallocate
             // the signal table, so a reference hoisted out of the loop would
             // dangle after the first entry.
+            //
+            // A gated ring is a second one over the same variable, so its name
+            // carries which; an ungated ring keeps the name every monitor without
+            // a gate already emits.
             ir::SignalInfo info;
-            info.name =
-              hist.base + "past." + module_.signal(live).name + "." + std::to_string(ring.size());
+            info.name = hist.base + "past." + module_.signal(live).name +
+                        (gate != nullptr ? ".gate" + std::to_string(at) : std::string()) + "." +
+                        std::to_string(entries.size());
             info.loc  = hist.loc;
             info.type = module_.signal(live).type;
             const ir::Signal entry = register_signal(std::move(info));
-            ring.push_back(entry);
+            entries.push_back(entry);
             sva_history_seeds_.emplace_back(live, entry);
         }
 
-        return ring[n - 1];
+        return entries[n - 1];
     }
 
-    // Store on a clocking edge, hold otherwise. store_gated's sibling for state
+    // Store when `when` holds, hold otherwise. store_gated's sibling for state
     // that must survive `disable iff` rather than be reset by it.
-    void store_on_edge(ir::Signal sig, ir::Index value, ir::Index edge, ir::Builder& b, ir::SourceLoc l) {
-        b.binary(ir::Inst::Tag::Store,
-                 b.signal(sig, l),
-                 b.select(edge, value, load_signal(sig, b, l), l),
-                 l);
+    void store_when(ir::Signal sig, ir::Index value, ir::Index when, ir::Builder& b, ir::SourceLoc l) {
+        b.binary(ir::Inst::Tag::Store, b.signal(sig, l), b.select(when, value, load_signal(sig, b, l), l), l);
     }
 
     // Advance every ring by one clock tick. Emitted at the very END of the monitor
@@ -7142,13 +7907,22 @@ private:
     // clkprev store is ungated. A time step with no clocking edge holds every
     // entry unchanged, and THAT is what makes this history per tick rather than
     // per time step.
+    //
+    // A ring carrying a $past gating expression advances on a SUBSET of those
+    // ticks, because 16.9.3 counts the prior steps in which `ev iff gate` occurred
+    // rather than the ones in which `ev` did. The gate therefore narrows the
+    // condition that ring's stores select on and touches nothing else: the read
+    // side is unchanged, and an entry the gate holds back keeps the value it
+    // already had. Folded into the select rather than branched around, so the step
+    // stays straight-line like the rest of it.
     void emit_history_shift(const SvaHistory& hist, ir::Index edge, ir::Builder& b, ir::SourceLoc l) {
-        for (const ir::Signal live : hist.order) {
-            const std::vector<ir::Signal>& ring = hist.rings.at(static_cast<uint32_t>(live));
-            for (size_t k = ring.size(); k-- > 1;) {
-                store_on_edge(ring[k], load_signal(ring[k - 1], b, l), edge, b, l);
+        for (const SvaHistory::Ring& ring : hist.rings) {
+            const ir::Index tick =
+              ring.gate != nullptr ? b.binary(ir::Inst::Tag::Band, edge, ring.gate_value, l) : edge;
+            for (size_t k = ring.entries.size(); k-- > 1;) {
+                store_when(ring.entries[k], load_signal(ring.entries[k - 1], b, l), tick, b, l);
             }
-            store_on_edge(ring[0], load_signal(sva_shadow_of(live), b, l), edge, b, l);
+            store_when(ring.entries[0], load_signal(sva_shadow_of(ring.live), b, l), tick, b, l);
         }
     }
 
@@ -7183,20 +7957,16 @@ private:
         // not at the near end, and at least one of the two is definite -- that
         // last conjunct is what excludes x -> x, the only remaining pair whose
         // endpoints are indistinguishable.
-        return b.binary(
-          ir::Inst::Tag::Band,
-          b.binary(ir::Inst::Tag::Band, bit_not(hi(old_v), b, l), bit_not(lo(new_v), b, l), l),
-          b.binary(ir::Inst::Tag::Bor, lo(old_v), hi(new_v), l),
-          l);
+        return b.binary(ir::Inst::Tag::Band,
+                        b.binary(ir::Inst::Tag::Band, bit_not(hi(old_v), b, l), bit_not(lo(new_v), b, l), l),
+                        b.binary(ir::Inst::Tag::Bor, lo(old_v), hi(new_v), l),
+                        l);
     }
 
     // One sampled value function (LRM 16.9.3). All six read SAMPLED values, so
     // every one is built from the Preponed shadow and the per-tick history ring
     // and none of them touches live state.
-    ir::Index lower_sampled_value(std::string_view      name,
-                                  const CallExpression& call,
-                                  ir::Builder&          b,
-                                  ir::SourceLoc         l) {
+    ir::Index lower_sampled_value(std::string_view name, const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
         if (sva_history_ == nullptr) {
             // LRM 16.9.3 also allows these in some procedural contexts, but
             // nothing samples there: with no clocking event there is no tick for
@@ -7213,9 +7983,8 @@ private:
             // no sampled value underneath either for these to be built from.
             // TODO: sampled value functions in a `disable iff` or asynchronous
             // `accept_on` / `reject_on` condition.
-            fail(std::string(name) +
-                 " is not supported in a `disable iff` or asynchronous `accept_on` / "
-                 "`reject_on` condition, which are evaluated from live values");
+            fail(std::string(name) + " is not supported in a `disable iff` or asynchronous `accept_on` / "
+                                     "`reject_on` condition, which are evaluated from live values");
         }
 
         const auto args = call.arguments();
@@ -7234,14 +8003,16 @@ private:
             fail("an explicit clocking argument on " + std::string(name) + " is not supported");
         }
 
-        uint32_t ticks = 1;
+        uint32_t          ticks = 1;
+        const Expression* gate  = nullptr;
         if (is_past) {
             if (args.size() > 2 && args[2]->kind != ExpressionKind::EmptyArgument) {
-                // A gating expression lets history advance only on the ticks where
-                // it holds, so the ring would need a per-tick enable folded into
-                // the shift.
-                // TODO: $past's gating expression (LRM 16.9.3).
-                fail("a gating expression on $past is not supported");
+                // LRM 16.9.3 reads $past(v, n, g) at "the kth strictly prior time
+                // step in which the event ev iff g occurred", so the gate does not
+                // pick a value out of the history -- it decides which ticks the
+                // history counts at all. Carried down to the ring rather than
+                // applied here, because it is the SHIFT that has to skip a tick.
+                gate = args[2];
             }
             if (args.size() > 1 && args[1]->kind != ExpressionKind::EmptyArgument) {
                 const std::optional<int32_t> n = try_const_int(*args[1]);
@@ -7263,8 +8034,7 @@ private:
         const Expression& operand = unwrap_conversions(*args[0]);
         const bool        plain =
           operand.kind == ExpressionKind::NamedValue &&
-          operand.type->getCanonicalType().getBitWidth() ==
-            args[0]->type->getCanonicalType().getBitWidth() &&
+          operand.type->getCanonicalType().getBitWidth() == args[0]->type->getCanonicalType().getBitWidth() &&
           operand.as<NamedValueExpression>().symbol.kind != SymbolKind::Parameter &&
           sigmap_.contains(&operand.as<NamedValueExpression>().symbol);
         if (!plain) {
@@ -7283,13 +8053,14 @@ private:
             return load_signal(shadow, b, l);
         }
         if (is_past) {
-            return load_signal(sva_history_slot(live, ticks), b, l);
+            return load_signal(sva_history_slot(live, gate, ticks, b), b, l);
         }
 
         // Every value change function compares this tick's sample against the
-        // previous tick's, so they all need ring[0] and nothing deeper.
+        // previous tick's, so they all need entry 0 of the ungated ring and
+        // nothing deeper: LRM 16.9.3 gives a gating argument to $past alone.
         const ir::Index now  = load_signal(shadow, b, l);
-        const ir::Index then = load_signal(sva_history_slot(live, 1), b, l);
+        const ir::Index then = load_signal(sva_history_slot(live, nullptr, 1, b), b, l);
 
         if (name == "$stable" || name == "$changed") {
             // Case equality over the WHOLE value: LRM 16.9.3 asks whether the
@@ -7303,11 +8074,8 @@ private:
         // $rose / $fell are LSB-only (LRM 16.9.3), so a multi-bit operand is
         // truncated to bit 0 -- as 4-state, because the edge order below needs to
         // tell x apart from 0 and 1.
-        return edge_step(b.resize(then, module_.pool.logic_type, l),
-                         b.resize(now, module_.pool.logic_type, l),
-                         name == "$rose",
-                         b,
-                         l);
+        return edge_step(
+          b.resize(then, module_.pool.logic_type, l), b.resize(now, module_.pool.logic_type, l), name == "$rose", b, l);
     }
 
     // A call in a sampled assertion expression would read live state: sampling
@@ -7322,19 +8090,33 @@ private:
     // TODO: trace called bodies so their reads are sampled too, which is also what
     // LRM 16.6's side-effect-freedom rule needs checking against
     // (concurrent-assertions.md 4).
+    //
+    // A sequence method reaches here too, and is called out by name: `.triggered`
+    // is a call syntactically, but "what it reads would not be sampled" describes
+    // nothing about it (concurrent-assertions.md 9.3).
     void reject_unsampled_call(const Expression& expr) {
         struct Finder : ASTVisitor<Finder, VisitFlags::AllGood> {
-            bool found = false;
+            bool                  found  = false;
+            const CallExpression* method = nullptr;
 
             void handle(const CallExpression& call) {
                 if (call.isSystemCall() && is_sampled_value_fn(call.getSubroutineName())) {
                     return;
+                }
+                if (method == nullptr && !sequence_method(call).empty()) {
+                    method = &call;
                 }
                 found = true;
             }
         };
         Finder finder;
         expr.visit(finder);
+        if (finder.method != nullptr) {
+            // TODO: sequence methods (concurrent-assertions.md 9.3). Each needs
+            // the named sequence stepped as an automaton of its own, whose match
+            // this cycle becomes a root of the property reading it.
+            fail("`." + std::string(sequence_method(*finder.method)) + "` on a named sequence is not supported");
+        }
         if (finder.found) {
             fail("a function call in a concurrent assertion expression is not "
                  "supported: what it reads would not be sampled");
@@ -7356,8 +8138,7 @@ private:
         ir::Index value{};
         {
             const SampledScope scope(*this, sampled);
-            value = atom.match != nullptr ? eval_case_match(atom, b, l)
-                                          : lower_predicate(*atom.expr, b);
+            value = atom.match != nullptr ? eval_case_match(atom, b, l) : lower_predicate(*atom.expr, b);
         }
         if (atom.negated) {
             // Negation normal form puts `!` on the leaf, so the atom is the
@@ -7409,11 +8190,7 @@ private:
     // One boolean root as a definite 1-bit value, from the flat forest libsva
     // handed back. Operands always point backwards, so a plain recursive walk
     // terminates; a shared subterm costs a second evaluation, never a wrong one.
-    ir::Index eval_root(const sva::Result& lowered,
-                        uint32_t           node,
-                        bool               sampled,
-                        ir::Builder&       b,
-                        ir::SourceLoc      l) {
+    ir::Index eval_root(const sva::Result& lowered, uint32_t node, bool sampled, ir::Builder& b, ir::SourceLoc l) {
         using Op                          = sva::Result::RootNode::Op;
         const sva::Result::RootNode& item = lowered.nodes[node];
         switch (item.op) {
@@ -7453,39 +8230,49 @@ private:
     void emit_monitor(const sva::Result&          lowered,
                       const ir::AssertionMonitor& mon,
                       uint32_t                    id,
-                      const AssertionActions&     act) {
+                      const AssertionActions&     act,
+                      const MonitorControl*       ctl) {
+        // Does this directive say anything? `restrict` is the one that does not,
+        // and that is the whole of its simulation semantics: LRM 16.12 defines it
+        // as a constraint on the input space a FORMAL tool may explore and gives
+        // it no verdict, which is why slang rejects an action block on one. So it
+        // is lowered exactly like an assert -- the property is bound, its roots
+        // are sampled, and a shape libsva cannot handle is still refused -- and
+        // then reports nothing, pends nothing and tallies nothing. This is the one
+        // place the subsystem accepts a construct and deliberately does nothing
+        // with it; everywhere else that would be the silent drop the project
+        // forbids.
+        bool verdicts = false;
         switch (mon.kind) {
             case ir::AssertionKind::Assert:
             case ir::AssertionKind::Assume:
-            case ir::AssertionKind::Cover:
+                verdicts = true;
                 break;
+            case ir::AssertionKind::Cover:
             case ir::AssertionKind::Restrict:
-                // TODO: `restrict` is a formal-only directive with no simulation
-                // verdict. lower_concurrent_assertion refuses it before here.
-                fail("concurrent restrict is not supported");
+                break;
         }
-        if (mon.depth == 0 || mon.obligation.state_count == 0 ||
-            (mon.has_trigger && mon.trigger.state_count == 0) ||
+        if (mon.depth == 0 || mon.obligation.state_count == 0 || (mon.has_trigger && mon.trigger.state_count == 0) ||
             mon.reset_root >= lowered.root_index.size()) {
             fail("internal: a concurrent assertion lowered to an empty automaton");
         }
 
-        const MonitorState  st = alloc_monitor_state(mon, id);
+        const MonitorState  st = alloc_monitor_state(mon, id, ctl);
         const ir::SourceLoc l  = mon.span.start;
         ir::Builder         b(module_.pool);
 
         // The action blocks, as zero-formal tasks the verdicts below pend into the
         // Reactive region. A cover has only a match action (LRM 16.12.6, and slang
         // rejects `cover ... else`); an assert / assume always has a fail action,
-        // because with no `else` the default report is the implicit one.
+        // because with no `else` the default report is the implicit one. A restrict
+        // has neither: no verdict, so nothing to hang a body on.
         std::optional<ir::FunctionId> pass_body;
         std::optional<ir::FunctionId> fail_body;
         if (act.pass != nullptr) {
             pass_body = build_action_body(*act.pass, "sva.pass");
         }
-        if (mon.kind != ir::AssertionKind::Cover) {
-            fail_body = act.fail != nullptr ? build_action_body(*act.fail, "sva.fail")
-                                            : build_default_fail_body(mon);
+        if (verdicts) {
+            fail_body = act.fail != nullptr ? build_action_body(*act.fail, "sva.fail") : build_default_fail_body(mon);
         }
 
         // The $past rings this monitor needs, filled in on demand while the roots
@@ -7503,8 +8290,7 @@ private:
         {
             const HistoryScope history(*this, &hist);
             for (uint32_t r = 0; r < lowered.root_index.size(); ++r) {
-                roots.push_back(
-                  eval_root(lowered, lowered.root_index[r], !root_reads_live(mon, r), b, l));
+                roots.push_back(eval_root(lowered, lowered.root_index[r], !root_reads_live(mon, r), b, l));
             }
         }
         // The disable condition (LRM 16.15), and the clocking edge. The monitor
@@ -7515,19 +8301,34 @@ private:
         // previous slot's Observed point. Taking it at the settled point is what
         // makes the monitor step once per cycle however many deltas the clock's
         // own driver needed to settle.
-        const ir::Index clk_now =
-          b.resize(load_signal(mon.clock, b, l), module_.pool.bit_type, l);
+        const ir::Index clk_now = b.resize(load_signal(mon.clock, b, l), module_.pool.bit_type, l);
         const ir::Index clk_was = load_signal(st.clkprev, b, l);
-        const ir::Index edge =
-          mon.edge == ir::Edge::Positive
-            ? b.binary(ir::Inst::Tag::Band, clk_now, bit_not(clk_was, b, l), l)
-            : b.binary(ir::Inst::Tag::Band, clk_was, bit_not(clk_now, b, l), l);
+        const ir::Index edge    = mon.edge == ir::Edge::Positive
+                                    ? b.binary(ir::Inst::Tag::Band, clk_now, bit_not(clk_was, b, l), l)
+                                    : b.binary(ir::Inst::Tag::Band, clk_was, bit_not(clk_now, b, l), l);
         // Ungated by the disable condition: clock history has to keep advancing
         // while the assertion is disabled, or re-enabling would see a stale edge.
         b.binary(ir::Inst::Tag::Store, b.signal(st.clkprev, l), clk_now, l);
 
-        const ir::Index active =
-          b.binary(ir::Inst::Tag::Band, bit_not(roots[mon.reset_root], b, l), edge, l);
+        // $assertkill (LRM 20.12) abandons every attempt in flight, which is
+        // precisely what LRM 16.15's reset already does -- so the request joins
+        // the disable condition rather than clearing anything of its own, and
+        // the two can never drift apart. It arrives as a latch because the task
+        // runs in an arbitrary time slot while this is the only code that acts
+        // on one: held until an edge, consumed by that edge, cleared by the same
+        // one, so a request kills exactly one cycle. The clear is deliberately
+        // ungated by anything but the edge, for the reason the abort latches
+        // below are: a request must not survive the cycle it was served in.
+        ir::Index disabled = roots[mon.reset_root];
+        if (st.ctl != nullptr) {
+            const ir::Index killed = load_signal(st.ctl->kill, b, l);
+            disabled               = b.binary(ir::Inst::Tag::Bor, disabled, killed, l);
+            b.binary(ir::Inst::Tag::Store,
+                     b.signal(st.ctl->kill, l),
+                     b.select(edge, zero_mask(1, b, l), killed, l),
+                     l);
+        }
+        const ir::Index active = b.binary(ir::Inst::Tag::Band, bit_not(disabled, b, l), edge, l);
 
         std::vector<ir::Index> abort_cond(mon.aborts.size());
         for (uint32_t i = 0; i < mon.aborts.size(); ++i) {
@@ -7536,8 +8337,7 @@ private:
                 abort_cond[i] = now;
                 continue;
             }
-            abort_cond[i] =
-              b.binary(ir::Inst::Tag::Bor, load_signal(st.abort_seen[i], b, l), now, l);
+            abort_cond[i] = b.binary(ir::Inst::Tag::Bor, load_signal(st.abort_seen[i], b, l), now, l);
             // Consumed and cleared at every edge, enabled or not -- the window
             // belongs to the cycle, and a cycle the assertion is disabled for
             // discards it along with everything else. So the condition is tested
@@ -7562,7 +8362,7 @@ private:
         ir::Index id_now;
         if (group) {
             const ir::Index held = load_signal(st.idnow, b, l);
-            id_now = b.select(mask_any(held, b, l), held, slot_mask(0, ring, b, l), l);
+            id_now               = b.select(mask_any(held, b, l), held, slot_mask(0, ring, b, l), l);
             store_gated(st.idnow, rotl1(id_now, ring, b, l), active, edge, ring, b, l);
         }
 
@@ -7580,12 +8380,21 @@ private:
             const uint32_t  trig  = mon.trigger.state_count;
             const ir::Index sat_t = automaton_satisfy(mon, mon.trigger, roots, b, l);
             const ir::Index cur_t = load_signal(st.trigger, b, l);
-            const ir::Index start = b.binary(
-              ir::Inst::Tag::Band, b.constant(mask_const(mon.trigger.first, trig), l), sat_t, l);
+            ir::Index start =
+              b.binary(ir::Inst::Tag::Band, b.constant(mask_const(mon.trigger.first, trig), l), sat_t, l);
+            if (st.ctl != nullptr) {
+                // $assertoff stops attempts STARTING and lets the ones already
+                // executing finish (LRM 20.12). For an implication an attempt
+                // starts when its ANTECEDENT does, so the gate belongs on the
+                // first states injected here and nowhere downstream: `stepped`
+                // carries threads already part-way through a match, and the seed
+                // below is one of those threads reaching its obligation.
+                start = b.select(load_signal(st.ctl->off, b, l), zero_mask(trig, b, l), start, l);
+            }
             const ir::Index stepped = automaton_advance(mon.trigger, cur_t, sat_t, b, l);
-            const ir::Index next = b.binary(ir::Inst::Tag::Bor, stepped, start, l);
-            const ir::Index done = b.binary(
-              ir::Inst::Tag::Band, next, b.constant(mask_const(mon.trigger.last, trig), l), l);
+            const ir::Index next    = b.binary(ir::Inst::Tag::Bor, stepped, start, l);
+            const ir::Index done =
+              b.binary(ir::Inst::Tag::Band, next, b.constant(mask_const(mon.trigger.last, trig), l), l);
             fires     = mask_any(done, b, l);
             trig_next = next;
 
@@ -7601,24 +8410,21 @@ private:
                 for (uint32_t s = 0; s < trig; ++s) {
                     ir::Index acc = zero_mask(ring, b, l);
                     for (uint32_t p = 0; p < trig; ++p) {
-                        const std::span<const uint64_t> row =
-                          table_row(mon.trigger.follow, p, mon.trigger.words);
+                        const std::span<const uint64_t> row = table_row(mon.trigger.follow, p, mon.trigger.words);
                         if ((row[s / 64] & (uint64_t{ 1 } << (s % 64))) == 0) {
                             continue;
                         }
-                        acc = b.binary(ir::Inst::Tag::Bor,
-                                       acc,
-                                       b.select(mask_bit(cur_t, p, trig, b, l),
-                                                load_signal(st.tid[p], b, l),
-                                                zero_mask(ring, b, l),
-                                                l),
-                                       l);
+                        acc = b.binary(
+                          ir::Inst::Tag::Bor,
+                          acc,
+                          b.select(
+                            mask_bit(cur_t, p, trig, b, l), load_signal(st.tid[p], b, l), zero_mask(ring, b, l), l),
+                          l);
                     }
                     if ((mon.trigger.first[s / 64] & (uint64_t{ 1 } << (s % 64))) != 0) {
                         acc = b.binary(ir::Inst::Tag::Bor, acc, id_now, l);
                     }
-                    tid_next[s] = b.select(
-                      mask_bit(next, s, trig, b, l), acc, zero_mask(ring, b, l), l);
+                    tid_next[s] = b.select(mask_bit(next, s, trig, b, l), acc, zero_mask(ring, b, l), l);
 
                     // Whose antecedent completed a match this cycle.
                     if ((mon.trigger.last[s / 64] & (uint64_t{ 1 } << (s % 64))) != 0) {
@@ -7662,15 +8468,13 @@ private:
                 if (!mon.aborts[i].covers_trigger) {
                     continue;
                 }
-                const ir::Index fire =
-                  b.binary(ir::Inst::Tag::Band,
-                           b.binary(ir::Inst::Tag::Band, fires, abort_cond[i], l),
-                           bit_not(claimed, b, l),
-                           l);
+                const ir::Index           fire = b.binary(ir::Inst::Tag::Band,
+                                                          b.binary(ir::Inst::Tag::Band, fires, abort_cond[i], l),
+                                                          bit_not(claimed, b, l),
+                                                          l);
                 std::optional<ir::Index>& into =
-                  mon.aborts[i].effect == ir::AssertionAbortEffect::Accept ? trigger_matched
-                                                                          : trigger_failed;
-                into = into.has_value() ? b.binary(ir::Inst::Tag::Bor, *into, fire, l) : fire;
+                  mon.aborts[i].effect == ir::AssertionAbortEffect::Accept ? trigger_matched : trigger_failed;
+                into    = into.has_value() ? b.binary(ir::Inst::Tag::Bor, *into, fire, l) : fire;
                 claimed = b.binary(ir::Inst::Tag::Bor, claimed, abort_cond[i], l);
             }
             if (trigger_matched.has_value() || trigger_failed.has_value()) {
@@ -7682,11 +8486,9 @@ private:
         // they advance -- see abort_arming_row for why that is the right instant.
         std::vector<ir::Index> arming(mon.aborts.size());
         for (uint32_t i = 0; i < mon.aborts.size(); ++i) {
-            arming[i] =
-              b.constant(mask_const(abort_arming_row(mon.obligation, mon.aborts[i]), obl), l);
+            arming[i] = b.constant(mask_const(abort_arming_row(mon.obligation, mon.aborts[i]), obl), l);
         }
-        std::vector<std::vector<ir::Index>> armed(mon.aborts.size(),
-                                                  std::vector<ir::Index>(mon.depth));
+        std::vector<std::vector<ir::Index>> armed(mon.aborts.size(), std::vector<ir::Index>(mon.depth));
 
         // Advance every occupied slot. An unoccupied slot already holds 0 (a match
         // zeroes it, and a failure only fires once it is empty), so the guard is
@@ -7699,10 +8501,7 @@ private:
             const ir::Index busy    = mask_bit(occupied, k, mon.depth, b, l);
             for (uint32_t i = 0; i < mon.aborts.size(); ++i) {
                 armed[i][k] = b.binary(
-                  ir::Inst::Tag::Band,
-                  busy,
-                  mask_any(b.binary(ir::Inst::Tag::Band, current, arming[i], l), b, l),
-                  l);
+                  ir::Inst::Tag::Band, busy, mask_any(b.binary(ir::Inst::Tag::Band, current, arming[i], l), b, l), l);
             }
             const ir::Index stepped = automaton_advance(mon.obligation, current, sat_o, b, l);
             pending[k]              = b.select(busy, stepped, current, l);
@@ -7714,9 +8513,16 @@ private:
         ir::Index seeding = true_const(b, l);
         if (mon.has_trigger) {
             seeding = mon.overlap ? fires : load_signal(st.fired, b, l);
+        } else if (st.ctl != nullptr) {
+            // With no antecedent an attempt starts every cycle, so the seed IS
+            // the start and takes the same $assertoff gate the trigger's first
+            // states take above. With an antecedent it must NOT: seeding is then
+            // an attempt already in flight reaching its obligation, and LRM
+            // 20.12 lets that one run to its verdict.
+            seeding = bit_not(load_signal(st.ctl->off, b, l), b, l);
         }
-        const ir::Index seed = b.binary(
-          ir::Inst::Tag::Band, b.constant(mask_const(mon.obligation.first, obl), l), sat_o, l);
+        const ir::Index seed =
+          b.binary(ir::Inst::Tag::Band, b.constant(mask_const(mon.obligation.first, obl), l), sat_o, l);
 
         // Which attempt owns the obligation seeded this cycle. `|->` seeds from
         // this cycle's match and `|=>` from last cycle's, so the id rides the same
@@ -7750,19 +8556,17 @@ private:
         ir::Index live      = occupied;
         ir::Index all_taken = true_const(b, l);
         for (uint32_t k = 0; k < mon.depth; ++k) {
-            const ir::Index busy = mask_bit(occupied, k, mon.depth, b, l);
-            const ir::Index free_here =
-              b.binary(ir::Inst::Tag::Band, all_taken, bit_not(busy, b, l), l);
-            const ir::Index pick = b.binary(ir::Inst::Tag::Band, seeding, free_here, l);
-            const ir::Index claim =
-              b.select(pick, slot_mask(k, mon.depth, b, l), zero_mask(mon.depth, b, l), l);
+            const ir::Index busy      = mask_bit(occupied, k, mon.depth, b, l);
+            const ir::Index free_here = b.binary(ir::Inst::Tag::Band, all_taken, bit_not(busy, b, l), l);
+            const ir::Index pick      = b.binary(ir::Inst::Tag::Band, seeding, free_here, l);
+            const ir::Index claim     = b.select(pick, slot_mask(k, mon.depth, b, l), zero_mask(mon.depth, b, l), l);
 
             pending[k] = b.select(pick, seed, pending[k], l);
             if (group) {
                 oid_next[k] = b.select(pick, seed_ids, oid_next[k], l);
             }
-            live       = b.binary(ir::Inst::Tag::Bor, live, claim, l);
-            all_taken  = b.binary(ir::Inst::Tag::Band, all_taken, busy, l);
+            live      = b.binary(ir::Inst::Tag::Bor, live, claim, l);
+            all_taken = b.binary(ir::Inst::Tag::Band, all_taken, busy, l);
             for (uint32_t i = 0; i < mon.aborts.size(); ++i) {
                 if (arms_on_seed[i]) {
                     armed[i][k] = b.binary(ir::Inst::Tag::Bor, armed[i][k], pick, l);
@@ -7804,19 +8608,15 @@ private:
             const ir::Index keep_states = b.constant(mask_const(spared, obl), l);
 
             for (uint32_t k = 0; k < mon.depth; ++k) {
-                const ir::Index fire =
-                  b.binary(ir::Inst::Tag::Band,
-                           b.binary(ir::Inst::Tag::Band, abort_cond[i], armed[i][k], l),
-                           held[k],
-                           l);
+                const ir::Index fire = b.binary(
+                  ir::Inst::Tag::Band, b.binary(ir::Inst::Tag::Band, abort_cond[i], armed[i][k], l), held[k], l);
                 if (!abort.resolves_attempt) {
-                    pending[k] = b.select(
-                      fire, b.binary(ir::Inst::Tag::Band, pending[k], keep_states, l), pending[k], l);
+                    pending[k] =
+                      b.select(fire, b.binary(ir::Inst::Tag::Band, pending[k], keep_states, l), pending[k], l);
                     continue;
                 }
                 std::optional<ir::Index>& into =
-                  abort.effect == ir::AssertionAbortEffect::Accept ? aborted_match[k]
-                                                                   : aborted_fail[k];
+                  abort.effect == ir::AssertionAbortEffect::Accept ? aborted_match[k] : aborted_fail[k];
                 into       = into.has_value() ? b.binary(ir::Inst::Tag::Bor, *into, fire, l) : fire;
                 pending[k] = b.select(fire, zero_mask(obl, b, l), pending[k], l);
                 held[k]    = b.binary(ir::Inst::Tag::Band, held[k], bit_not(fire, b, l), l);
@@ -7831,21 +8631,18 @@ private:
         std::vector<ir::Index> failed(mon.depth);
         ir::Index              remaining = zero_mask(mon.depth, b, l);
         for (uint32_t k = 0; k < mon.depth; ++k) {
-            const ir::Index done = mask_any(b.binary(ir::Inst::Tag::Band, pending[k], last, l), b, l);
+            const ir::Index done  = mask_any(b.binary(ir::Inst::Tag::Band, pending[k], last, l), b, l);
             const ir::Index empty = bit_not(mask_any(pending[k], b, l), b, l);
 
             matched[k] = b.binary(ir::Inst::Tag::Band, held[k], done, l);
-            failed[k]  = b.binary(ir::Inst::Tag::Band,
-                                 held[k],
-                                 b.binary(ir::Inst::Tag::Band, bit_not(done, b, l), empty, l),
-                                 l);
+            failed[k] =
+              b.binary(ir::Inst::Tag::Band, held[k], b.binary(ir::Inst::Tag::Band, bit_not(done, b, l), empty, l), l);
 
             // Either verdict frees the slot; only a match has a vector left to
             // clear, since a failure is what an empty vector means.
             const ir::Index resolved = b.binary(ir::Inst::Tag::Bor, matched[k], failed[k], l);
-            const ir::Index keep = b.binary(ir::Inst::Tag::Band, held[k], bit_not(resolved, b, l), l);
-            const ir::Index still =
-              b.select(keep, slot_mask(k, mon.depth, b, l), zero_mask(mon.depth, b, l), l);
+            const ir::Index keep     = b.binary(ir::Inst::Tag::Band, held[k], bit_not(resolved, b, l), l);
+            const ir::Index still    = b.select(keep, slot_mask(k, mon.depth, b, l), zero_mask(mon.depth, b, l), l);
 
             pending[k] = b.select(matched[k], zero_mask(obl, b, l), pending[k], l);
             remaining  = b.binary(ir::Inst::Tag::Bor, remaining, still, l);
@@ -7868,6 +8665,16 @@ private:
             failed.push_back(*trigger_failed);
         }
 
+        // `cover sequence` counts MATCHES, and the grouping below is about to fold
+        // those into one verdict per attempt and drop the ones belonging to an
+        // attempt that later failed. Its tally and its match action read this copy,
+        // taken before any of that; `cover property` keeps reading `report_pass`
+        // and is unchanged. Empty, and no copy made, for every other directive.
+        std::vector<ir::Index> seq_matched;
+        if (mon.cover_matches) {
+            seq_matched = matched;
+        }
+
         // Per-attempt resolution. An attempt is ONE verdict over
         // every obligation its antecedent matches seeded: it fails at the first of
         // them to fail, and passes only once all of them have passed and it can
@@ -7885,8 +8692,7 @@ private:
             // The attempts a failing obligation resolves this cycle.
             ir::Index failed_ids = none;
             for (uint32_t k = 0; k < mon.depth; ++k) {
-                failed_ids = b.binary(
-                  ir::Inst::Tag::Bor, failed_ids, b.select(failed[k], oid_next[k], none, l), l);
+                failed_ids = b.binary(ir::Inst::Tag::Bor, failed_ids, b.select(failed[k], oid_next[k], none, l), l);
             }
             const ir::Index survives = b.unary(ir::Inst::Tag::Bnot, failed_ids, l);
 
@@ -7895,29 +8701,24 @@ private:
             // antecedent threads that would have seeded more.
             for (uint32_t k = 0; k < mon.depth; ++k) {
                 const ir::Index doomed = owns(oid_next[k], failed_ids);
-                matched[k] = b.binary(ir::Inst::Tag::Band, matched[k], bit_not(doomed, b, l), l);
-                pending[k] = b.select(doomed, zero_mask(obl, b, l), pending[k], l);
-                remaining  = b.select(doomed,
-                                     b.binary(ir::Inst::Tag::Band,
-                                              remaining,
-                                              b.unary(ir::Inst::Tag::Bnot,
-                                                      slot_mask(k, mon.depth, b, l),
-                                                      l),
-                                              l),
-                                     remaining,
-                                     l);
+                matched[k]             = b.binary(ir::Inst::Tag::Band, matched[k], bit_not(doomed, b, l), l);
+                pending[k]             = b.select(doomed, zero_mask(obl, b, l), pending[k], l);
+                remaining              = b.select(
+                  doomed,
+                  b.binary(
+                    ir::Inst::Tag::Band, remaining, b.unary(ir::Inst::Tag::Bnot, slot_mask(k, mon.depth, b, l), l), l),
+                  remaining,
+                  l);
             }
             fired_ids      = b.binary(ir::Inst::Tag::Band, fired_ids, survives, l);
             ir::Index kept = zero_mask(trig, b, l);
             for (uint32_t s = 0; s < trig; ++s) {
                 tid_next[s] = b.binary(ir::Inst::Tag::Band, tid_next[s], survives, l);
-                kept        = b.binary(ir::Inst::Tag::Bor,
-                                kept,
-                                b.select(mask_any(tid_next[s], b, l),
-                                         slot_mask(s, trig, b, l),
-                                         zero_mask(trig, b, l),
-                                         l),
-                                l);
+                kept =
+                  b.binary(ir::Inst::Tag::Bor,
+                           kept,
+                           b.select(mask_any(tid_next[s], b, l), slot_mask(s, trig, b, l), zero_mask(trig, b, l), l),
+                           l);
             }
             trig_next = b.binary(ir::Inst::Tag::Band, trig_next, kept, l);
 
@@ -7934,11 +8735,10 @@ private:
                 live_ids = b.binary(ir::Inst::Tag::Bor, live_ids, fired_ids, l);
             }
             for (uint32_t k = 0; k < mon.depth; ++k) {
-                live_ids = b.binary(
-                  ir::Inst::Tag::Bor,
-                  live_ids,
-                  b.select(mask_bit(remaining, k, mon.depth, b, l), oid_next[k], none, l),
-                  l);
+                live_ids = b.binary(ir::Inst::Tag::Bor,
+                                    live_ids,
+                                    b.select(mask_bit(remaining, k, mon.depth, b, l), oid_next[k], none, l),
+                                    l);
             }
 
             // One FAIL report per attempt, however many of its obligations fail in
@@ -7946,10 +8746,8 @@ private:
             // never waits.
             ir::Index fclaim = none;
             for (uint32_t k = 0; k < mon.depth; ++k) {
-                report_fail[k] = b.binary(
-                  ir::Inst::Tag::Band, failed[k], bit_not(owns(oid_next[k], fclaim), b, l), l);
-                fclaim = b.binary(
-                  ir::Inst::Tag::Bor, fclaim, b.select(report_fail[k], oid_next[k], none, l), l);
+                report_fail[k] = b.binary(ir::Inst::Tag::Band, failed[k], bit_not(owns(oid_next[k], fclaim), b, l), l);
+                fclaim = b.binary(ir::Inst::Tag::Bor, fclaim, b.select(report_fail[k], oid_next[k], none, l), l);
             }
 
             // A pass is the attempt's only once nothing of it is left running, so
@@ -7960,16 +8758,15 @@ private:
             // did not.
             ir::Index matched_ids = none;
             for (uint32_t k = 0; k < mon.depth; ++k) {
-                matched_ids = b.binary(
-                  ir::Inst::Tag::Bor, matched_ids, b.select(matched[k], oid_next[k], none, l), l);
+                matched_ids = b.binary(ir::Inst::Tag::Bor, matched_ids, b.select(matched[k], oid_next[k], none, l), l);
             }
             const ir::Index waiting =
               b.binary(ir::Inst::Tag::Band,
                        b.binary(ir::Inst::Tag::Bor, load_signal(st.passing, b, l), matched_ids, l),
                        survives,
                        l);
-            const ir::Index settle = b.binary(
-              ir::Inst::Tag::Band, waiting, b.unary(ir::Inst::Tag::Bnot, live_ids, l), l);
+            const ir::Index settle =
+              b.binary(ir::Inst::Tag::Band, waiting, b.unary(ir::Inst::Tag::Bnot, live_ids, l), l);
 
             // One verdict bit per attempt id now, not per slot: a settling pass may
             // belong to an attempt whose slot was freed cycles ago.
@@ -7985,22 +8782,14 @@ private:
                 store_gated(st.tid[s], tid_next[s], active, edge, ring, b, l);
             }
             store_gated(st.firedid, fired_ids, active, edge, ring, b, l);
-            store_gated(st.passing,
-                        b.binary(ir::Inst::Tag::Band, waiting, live_ids, l),
-                        active,
-                        edge,
-                        ring,
-                        b,
-                        l);
+            store_gated(st.passing, b.binary(ir::Inst::Tag::Band, waiting, live_ids, l), active, edge, ring, b, l);
         }
 
         // The antecedent's own state, stored down here because a failing
         // obligation may just have killed the threads of the attempt it came from.
         if (mon.has_trigger) {
-            store_gated(
-              st.trigger, trig_next, active, edge, mon.trigger.state_count, b, l);
-            store_gated(
-              st.fired, group ? mask_any(fired_ids, b, l) : fires, active, edge, 1, b, l);
+            store_gated(st.trigger, trig_next, active, edge, mon.trigger.state_count, b, l);
+            store_gated(st.fired, group ? mask_any(fired_ids, b, l) : fires, active, edge, 1, b, l);
         }
 
         store_gated(st.occupied, remaining, active, edge, mon.depth, b, l);
@@ -8008,27 +8797,48 @@ private:
             store_gated(st.pending[k], pending[k], active, edge, obl, b, l);
         }
 
+        // What a cover counts, and what its match action runs on. `cover property`
+        // counts the ATTEMPTS that succeeded, so it reads the grouped verdict bits;
+        // `cover sequence` counts MATCHES of the sequence, so it reads the per-slot
+        // ones from before the grouping. The two coincide unless the antecedent can
+        // match twice in one attempt, which is exactly the case grouping exists for.
+        const std::vector<ir::Index>& hits = mon.cover_matches ? seq_matched : report_pass;
+
         if (mon.kind == ir::AssertionKind::Cover) {
             // A cover counts matches and never reports (LRM 16.12.6). More than one
             // attempt can complete in a cycle, so this is a sum and not a flag. Over
             // the verdict bits rather than the slots, because an accept discharging
             // a trigger-covering attempt is a match with no slot behind it.
             //
-            // Per ATTEMPT, not per obligation: a twice-matching antecedent is one
-            // cover hit, and none at all when one of its obligations failed. That is the per-attempt rule.
+            // Per ATTEMPT, not per obligation, for `cover property`: a twice-matching
+            // antecedent is one cover hit, and none at all when one of its obligations
+            // failed. That is the per-attempt rule.
             ir::Index count = load_signal(st.covered, b, l);
-            for (const ir::Index bit : report_pass) {
+            for (const ir::Index bit : hits) {
                 count = b.binary(ir::Inst::Tag::Add, count, b.resize(bit, mask_type(32), l), l);
             }
             store_gated(st.covered, count, active, edge, 32, b, l);
-        } else {
-            emit_action_pends(report_fail, *fail_body, active, /*unlikely=*/true, b, l);
+        } else if (verdicts) {
+            emit_action_pends(report_fail,
+                              *fail_body,
+                              active,
+                              /*unlikely=*/true,
+                              st.ctl != nullptr ? &st.ctl->foff : nullptr,
+                              b,
+                              l);
         }
         if (pass_body.has_value()) {
             // A cover's action block runs on a match (LRM 16.12.6) and an assert's
             // pass action on a pass (LRM 16.14.6) -- the same verdict bit either
-            // way, so the same pend.
-            emit_action_pends(report_pass, *pass_body, active, /*unlikely=*/false, b, l);
+            // way, so the same pend. A restrict never gets here: slang rejects an
+            // action block on one.
+            emit_action_pends(hits,
+                              *pass_body,
+                              active,
+                              /*unlikely=*/false,
+                              st.ctl != nullptr ? &st.ctl->poff : nullptr,
+                              b,
+                              l);
         }
 
         // Last in the body, after every root above has read the pre-shift rings.
@@ -8036,19 +8846,22 @@ private:
         // previous tick's sample rather than this one's.
         emit_history_shift(hist, edge, b, l);
 
-        module_.add_process(
-          ir::Process{ .activation = ir::Activation::Observed,
-                       // Not a subscription: an Observed process is resumed once
-                       // per time slot, never woken by a net event. Kept as the
-                       // record of which event delimits this monitor's cycle --
-                       // it is what the edge detection above is derived from.
-                       .wait_events = { ir::WaitEvent{ .signal = mon.clock, .edge = mon.edge } },
-                       .self_start  = false,
-                       .span        = mon.span,
-                       .ir          = b.finish(),
-                       .scope       = cur_scope_id() });
+        module_.add_process(ir::Process{ .activation = ir::Activation::Observed,
+                                         // Not a subscription: an Observed process is resumed once
+                                         // per time slot, never woken by a net event. Kept as the
+                                         // record of which event delimits this monitor's cycle --
+                                         // it is what the edge detection above is derived from.
+                                         .wait_events = { ir::WaitEvent{ .signal = mon.clock, .edge = mon.edge } },
+                                         .self_start  = false,
+                                         .span        = mon.span,
+                                         .ir          = b.finish(),
+                                         .scope       = cur_scope_id() });
 
-        if (mon.strength == ir::AssertionStrength::Strong) {
+        // A restrict is silent at the end of the trace too, for the same reason it
+        // is silent during one: it has no verdict to drain. The kind is tested
+        // rather than `verdicts` because a strong COVER's end-of-trace behaviour is
+        // a separate question this change does not touch.
+        if (mon.strength == ir::AssertionStrength::Strong && mon.kind != ir::AssertionKind::Restrict) {
             emit_monitor_finish(mon, st, act);
         }
     }
@@ -8059,14 +8872,29 @@ private:
     // Observed process and LRM 4.4.2.5 puts an assertion's pass/fail code in
     // Reactive -- which is also what orders a report after the same edge's Active
     // region $display, rather than racing it.
+    //
+    // `filter` is the assertion's LRM 20.12 pass/fail action suppression bit, or
+    // null in a design that controls nothing. It gates the PEND and nothing
+    // else, which is the whole of what 20.12 asks for: the automaton has
+    // already stepped, every state store is upstream of this, and a cover's
+    // tally is counted before it -- so an assertion whose reports are switched
+    // off is still running, and still says so through everything but the
+    // report. Gating `active` instead would freeze the monitor, which is what
+    // $assertoff means and emphatically not what $assertfailoff does.
     void emit_action_pends(const std::vector<ir::Index>& verdict,
                            ir::FunctionId                body,
                            ir::Index                     active,
                            bool                          unlikely,
+                           const ir::Signal*             filter,
                            ir::Builder&                  b,
                            ir::SourceLoc                 l) {
+        // Hoisted: one load however many verdict bits share the filter.
+        const ir::Index allow = filter != nullptr ? bit_not(load_signal(*filter, b, l), b, l) : ir::Index{};
         for (const ir::Index bit : verdict) {
-            const ir::Index take = b.binary(ir::Inst::Tag::Band, active, bit, l);
+            ir::Index take = b.binary(ir::Inst::Tag::Band, active, bit, l);
+            if (filter != nullptr) {
+                take = b.binary(ir::Inst::Tag::Band, take, allow, l);
+            }
 
             b.open_region();
             b.reactive_pend(body, l);
@@ -8089,13 +8917,16 @@ private:
     // that nothing will ever resume -- exactly the silent drop the project forbids.
     // Inlining is sound precisely because require_reactive_safe proved the action
     // zero-time, so it needs no coroutine of its own.
-    void emit_monitor_finish(const ir::AssertionMonitor& mon,
-                             const MonitorState&         st,
-                             const AssertionActions&     act) {
+    void emit_monitor_finish(const ir::AssertionMonitor& mon, const MonitorState& st, const AssertionActions& act) {
         const ir::SourceLoc l = mon.span.start;
         ir::Builder         b(module_.pool);
 
         const ir::Index occupied = load_signal(st.occupied, b, l);
+        // The end-of-trace failure is a fail action like any other, so LRM
+        // 20.12's FailOff suppresses it too. Hoisted out of the slot loop: one
+        // load serves every attempt still pending.
+        const ir::Index fail_ok =
+          st.ctl != nullptr ? bit_not(load_signal(st.ctl->foff, b, l), b, l) : ir::Index{};
 
         // One report per ATTEMPT here too. A strong attempt
         // still pending at the end of the trace owes ONE failure however many
@@ -8106,21 +8937,21 @@ private:
         ir::Index      claimed = ring != 0 ? zero_mask(ring, b, l) : ir::Index{};
         for (uint32_t k = 0; k < mon.depth; ++k) {
             ir::Index held = mask_bit(occupied, k, mon.depth, b, l);
+            if (st.ctl != nullptr) {
+                held = b.binary(ir::Inst::Tag::Band, held, fail_ok, l);
+            }
             if (ring != 0) {
                 const ir::Index id  = load_signal(st.oid[k], b, l);
-                const ir::Index dup =
-                  mask_any(b.binary(ir::Inst::Tag::Band, id, claimed, l), b, l);
-                held    = b.binary(ir::Inst::Tag::Band, held, bit_not(dup, b, l), l);
-                claimed = b.binary(
-                  ir::Inst::Tag::Bor, claimed, b.select(held, id, zero_mask(ring, b, l), l), l);
+                const ir::Index dup = mask_any(b.binary(ir::Inst::Tag::Band, id, claimed, l), b, l);
+                held                = b.binary(ir::Inst::Tag::Band, held, bit_not(dup, b, l), l);
+                claimed = b.binary(ir::Inst::Tag::Bor, claimed, b.select(held, id, zero_mask(ring, b, l), l), l);
             }
 
             b.open_region();
             if (act.fail != nullptr) {
                 lower_stmt(*act.fail, b);
             } else {
-                b.severity(
-                  static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
+                b.severity(static_cast<uint32_t>(ir::Severity::Error), mon.banner, "assertion failed", {}, l, 0);
             }
             const ir::ExtraSlice then_region = b.close_region();
 
@@ -8130,10 +8961,8 @@ private:
             b.cond(held, then_region, else_region, l, /*unlikely=*/true);
         }
 
-        module_.add_process(ir::Process{ .activation = ir::Activation::Final,
-                                         .span       = mon.span,
-                                         .ir         = b.finish(),
-                                         .scope      = cur_scope_id() });
+        module_.add_process(ir::Process{
+          .activation = ir::Activation::Final, .span = mon.span, .ir = b.finish(), .scope = cur_scope_id() });
     }
 
     void lower_immediate_assertion(const ImmediateAssertionStatement& a, ir::Builder& b) {
@@ -8426,10 +9255,7 @@ private:
         ir::Builder& b = *preinit_;
         for (const auto& [live, entry] : sva_history_seeds_) {
             const ir::SourceLoc l = module_.signal(entry).loc;
-            b.binary(ir::Inst::Tag::Store,
-                     b.signal(entry, l),
-                     b.unary(ir::Inst::Tag::Load, b.signal(live, l), l),
-                     l);
+            b.binary(ir::Inst::Tag::Store, b.signal(entry, l), b.unary(ir::Inst::Tag::Load, b.signal(live, l), l), l);
         }
         sva_history_seeds_.clear();
     }
@@ -8571,10 +9397,7 @@ private:
         ir::Builder b(module_.pool);
         for (const auto& [live, shadow] : sva_shadow_pairs_) {
             const ir::SourceLoc l = module_.signal(shadow).loc;
-            b.binary(ir::Inst::Tag::Store,
-                     b.signal(shadow, l),
-                     b.unary(ir::Inst::Tag::Load, b.signal(live, l), l),
-                     l);
+            b.binary(ir::Inst::Tag::Store, b.signal(shadow, l), b.unary(ir::Inst::Tag::Load, b.signal(live, l), l), l);
         }
         module_.add_process(ir::Process{ .activation = ir::Activation::Preponed, .ir = b.finish() });
         sva_shadow_pairs_.clear();
@@ -8724,15 +9547,17 @@ private:
         const ir::Ref ty = lower_type(*r.count.type);
 
         // Hidden bound holds the once-evaluated count; hidden counter starts at 0.
-        // Both live in the enclosing region, like a for-loop's init.
-        const ir::Signal bound   = declare_temp(ty, "repeat_bound");
-        const ir::Signal counter = declare_temp(ty, "repeat_count");
-        b.binary(ir::Inst::Tag::Store, b.signal(bound, l), b.resize(lower_expr(r.count, b), ty, l), l);
-        b.binary(ir::Inst::Tag::Store, b.signal(counter, l), b.constant(module_.pool.put_int(ty, 0), l), l);
+        // Both live in the enclosing region, like a for-loop's init, and both are
+        // per-activation cells (a frame Local inside a subroutine) so a recursive
+        // or concurrently-invoked task keeps its own count.
+        const TempCell bound   = make_temp_cell(ty, "repeat_bound");
+        const TempCell counter = make_temp_cell(ty, "repeat_count");
+        b.binary(ir::Inst::Tag::Store, bound.lv(b, l), b.resize(lower_expr(r.count, b), ty, l), l);
+        b.binary(ir::Inst::Tag::Store, counter.lv(b, l), b.constant(module_.pool.put_int(ty, 0), l), l);
 
         b.open_region();
-        const ir::Index      cur  = b.unary(ir::Inst::Tag::Load, b.signal(counter, l), l);
-        const ir::Index      lim  = b.unary(ir::Inst::Tag::Load, b.signal(bound, l), l);
+        const ir::Index      cur  = b.unary(ir::Inst::Tag::Load, counter.lv(b, l), l);
+        const ir::Index      lim  = b.unary(ir::Inst::Tag::Load, bound.lv(b, l), l);
         const ir::Index      pred = b.binary(ir::Inst::Tag::Lt, cur, lim, l);
         const ir::ExtraSlice cond = b.close_region();
 
@@ -8741,10 +9566,10 @@ private:
         const ir::ExtraSlice body = b.close_region();
 
         b.open_region();
-        const ir::Index step_cur = b.unary(ir::Inst::Tag::Load, b.signal(counter, l), l);
+        const ir::Index step_cur = b.unary(ir::Inst::Tag::Load, counter.lv(b, l), l);
         const ir::Index one      = b.constant(module_.pool.put_int(ty, 1), l);
         const ir::Index next     = b.binary(ir::Inst::Tag::Add, step_cur, one, l);
-        b.binary(ir::Inst::Tag::Store, b.signal(counter, l), next, l);
+        b.binary(ir::Inst::Tag::Store, counter.lv(b, l), next, l);
         const ir::ExtraSlice step = b.close_region();
 
         b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
@@ -8853,13 +9678,13 @@ private:
                                    ir::Index                   len,
                                    ir::Builder&                b,
                                    ir::SourceLoc               l) {
-        const ir::Signal bound = declare_temp(ty, "foreach_bound");
-        b.binary(ir::Inst::Tag::Store, b.signal(bound, l), b.resize(len, ty, l), l);
+        const TempCell bound = make_temp_cell(ty, "foreach_bound");
+        b.binary(ir::Inst::Tag::Store, bound.lv(b, l), b.resize(len, ty, l), l);
         b.binary(ir::Inst::Tag::Store, iter_lv, b.constant(module_.pool.put_int(ty, 0), l), l);
 
         b.open_region();
         const ir::Index      cur  = b.unary(ir::Inst::Tag::Load, iter_lv, l);
-        const ir::Index      lim  = b.unary(ir::Inst::Tag::Load, b.signal(bound, l), l);
+        const ir::Index      lim  = b.unary(ir::Inst::Tag::Load, bound.lv(b, l), l);
         const ir::Index      pred = b.binary(ir::Inst::Tag::Lt, cur, lim, l);
         const ir::ExtraSlice cond = b.close_region();
 
@@ -8888,15 +9713,15 @@ private:
                                  ir::SourceLoc l) {
         const ir::Ref    bit1 = make_int_type(1, false, false);
         const ir::Ref    aty  = lower_type(*f.arrayRef.type);
-        const ir::Signal ok   = declare_temp(bit1, "foreach_ok");
+        const TempCell   ok   = make_temp_cell(bit1, "foreach_ok");
         using Step            = ir::Builder::AssocStep;
         b.binary(ir::Inst::Tag::Store,
-                 b.signal(ok, l),
+                 ok.lv(b, l),
                  b.resize(b.assoc_traverse(lower_lvalue(f.arrayRef, b), iter_lv, Step::First, aty, l), bit1, l),
                  l);
 
         b.open_region();
-        const ir::Index      pred = b.unary(ir::Inst::Tag::Load, b.signal(ok, l), l);
+        const ir::Index      pred = b.unary(ir::Inst::Tag::Load, ok.lv(b, l), l);
         const ir::ExtraSlice cond = b.close_region();
 
         b.open_region();
@@ -8905,7 +9730,7 @@ private:
 
         b.open_region();
         b.binary(ir::Inst::Tag::Store,
-                 b.signal(ok, l),
+                 ok.lv(b, l),
                  b.resize(b.assoc_traverse(lower_lvalue(f.arrayRef, b), iter_lv, Step::Next, aty, l), bit1, l),
                  l);
         const ir::ExtraSlice step = b.close_region();
@@ -8913,16 +9738,52 @@ private:
         b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
     }
 
-    // Register a hidden compiler temporary as backing signal storage. Unlike
-    // declare_local there is no source ValueSymbol, so the name is synthesized.
+    // Storage for a hidden compiler temporary: a loop counter, a once-evaluated
+    // bound, an iteration flag. Nothing in the source names one and nothing
+    // outside the construct that made it can read it, so its only requirement is
+    // one cell per *activation*.
     //
-    // TODO: Back compiler temporaries (and SV automatic locals) with a
-    // process-local storage class on the coroutine frame (an alloca) rather than
-    // a module-global signal. The signal model gives static lifetime, pollutes
-    // the signal table, and runs wait-queue machinery a loop-private counter does
-    // not need. Correct today because processes are single-activation and the
-    // counter is reinitialized at each loop entry, but wrong for true automatic
-    // lifetime and future reentrant/recursive activations. See declare_local NOTE.
+    // A descriptor rather than a ready-made lvalue Index because a loop's cond /
+    // body / step are three separate instruction regions and each needs its own
+    // leaf; `lv` re-emits one wherever it is wanted.
+    struct TempCell {
+        ir::Ref    type     = ir::Ref::Invalid;
+        bool       is_local = false;
+        uint32_t   local    = 0;
+        ir::Signal sig{};
+
+        ir::Index lv(ir::Builder& b, ir::SourceLoc l) const {
+            return is_local ? b.local(local, type, l) : b.signal(sig, l);
+        }
+    };
+
+    // Allocate one. Inside anything with a frame -- a task, a function, a fork
+    // child, an action block -- it is a frame Local, which is what makes a
+    // `repeat` correct in an automatic subroutine: recursive and concurrent
+    // activations each get their own counter. Module-signal storage gave every
+    // activation one shared cell, so a recursive `repeat (3)` two levels deep ran
+    // 5 iterations instead of 39, and two forked calls to the same task clobbered
+    // each other's count. A process has no frame and is single-activation, so
+    // there the cell stays a module Signal and the emitted code is unchanged.
+    TempCell make_temp_cell(ir::Ref type, std::string_view role) {
+        if (fn_ctx_ != nullptr) {
+            const auto idx = static_cast<uint32_t>(fn_ctx_->local_types.size());
+            fn_ctx_->local_types.push_back(type);
+            return TempCell{ .type = type, .is_local = true, .local = idx };
+        }
+        ir::SignalInfo info;
+        info.name = prefix_ + "__" + std::string(role) + std::to_string(temp_id_++);
+        info.type = type;
+        info.dir  = ir::SignalInfo::Direction::Internal;
+
+        return TempCell{ .type = type, .sig = register_signal(std::move(info)) };
+    }
+
+    // Register a hidden temporary that must be real module-signal storage rather
+    // than a frame cell: a synthesized event net (synth_event_net) is the target
+    // of its own continuous process and carries a wait queue, neither of which a
+    // frame Local has. Unlike declare_local there is no source ValueSymbol, so
+    // the name is synthesized.
     ir::Signal declare_temp(ir::Ref type, std::string_view role) {
         ir::SignalInfo info;
         info.name = prefix_ + "__" + std::string(role) + std::to_string(temp_id_++);
@@ -10262,11 +11123,25 @@ private:
             b.dump_control(ir::Inst::Tag::DumpFlush, loc(call));
             return;
         }
+        if (name == "$dumplimit") {
+            // $dumplimit(n) (LRM §21.7.1.5): cap the dump file at n bytes.
+            if (call.arguments().size() != 1) {
+                fail("$dumplimit requires one byte-count argument");
+            }
+            b.dump_limit(lower_expr(*call.arguments()[0], b), loc(call));
+            return;
+        }
         if (name == "$cast") {
             // Task form (LRM 6.24.2): performs the conditional assignment; the
             // success result is discarded (the failed-cast runtime fatal is a
             // documented follow-up — see lower_sysfunc). Shares the function logic.
             (void)lower_sysfunc(call, b);
+            return;
+        }
+        if (is_assert_control_task(name)) {
+            // LRM 20.12. slang registers all ten names on one AssertControlTask,
+            // so the arity and the shape of every argument are already checked.
+            lower_assert_control(name, call, b);
             return;
         }
         fail("unsupported system task '" + std::string(name) + "'");
@@ -10858,6 +11733,17 @@ private:
         // `e.triggered` (LRM 15.5.3): 1-bit "triggered this time step" property.
         if (const Expression* ev = triggered_event(call)) {
             return b.event_triggered(event_signal(*ev), l);
+        }
+
+        // `<sequence>.triggered` (see sequence_method): the same spelling on a
+        // sequence instead of an event, and a different feature. Refused here by
+        // name, because "unsupported system function 'triggered'" below would send
+        // the reader looking for a missing built-in rather than a missing feature.
+        // `.matched` cannot reach this point -- slang rejects it outside an
+        // assertion expression -- but it is named the same way where it can.
+        // TODO: sequence methods (concurrent-assertions.md 9.3).
+        if (const std::string_view method = sequence_method(call); !method.empty()) {
+            fail("`." + std::string(method) + "` on a named sequence is not supported");
         }
 
         if (fn_ctx_ != nullptr && !fn_ctx_->is_task && (name == "$time" || name == "$stime" || name == "$realtime")) {
@@ -14303,7 +15189,8 @@ private:
             // handle-deref + field select rooted at the object body. The base
             // handle is an rvalue (the pointer), not the slot's lvalue.
             const ir::Index handle = lower_expr(ma.value(), b);
-            return class_member_lvalue(handle, *prop, lower_type(*ma.value().type), b, l);
+            return class_member_lvalue(
+              handle, *prop, lower_type(*ma.value().type), b, l, to_source_span(ma.value().sourceRange));
         }
         const auto* field = ma.member.as_if<FieldSymbol>();
         if (field == nullptr) {
@@ -14995,6 +15882,20 @@ public:
     }
 
 private:
+    // Point the delay / $time multipliers at `scope`'s effective timescale. A
+    // `#5` written there means 5 of that scope's time units (LRM 3.14.2), so the
+    // unit multiplier is unit/tick; a real delay first rounds to the scope's
+    // precision, hence precision/tick. Both ratios are exact integers: the tick
+    // is the design-wide GCD of every unit and of every precision that a real
+    // delay rounds to (design_tick_fs / global_scope_tick_fs), and every
+    // timescale value is a power of ten. Callers guard on tick_fs_ != 0; unitless
+    // mode leaves both at 1 and scales nothing.
+    void apply_time_scale(const Scope& scope) {
+        const auto ts   = scope.getTimeScale();
+        time_mul_       = ts ? tsv_to_fs(ts->base) / tick_fs_ : 1;
+        prec_over_tick_ = ts ? tsv_to_fs(ts->precision) / tick_fs_ : 1;
+    }
+
     ir::FunctionId function_id(const SubroutineSymbol& sub) {
         if (globals_ != nullptr && this != globals_ && is_global_subroutine(sub)) {
             const Scope* saved_scope = globals_->scope_;
@@ -15041,11 +15942,28 @@ private:
 
         const ir::FunctionId id = module_.reserve_function();
         fnmap_[&sub]            = id;
+        // A delay written inside a subroutine is in the time units of the scope
+        // that DECLARES it, not the one that calls it (LRM 3.14.2.3) -- and the
+        // same for a $time read in its body. The body is lowered once and shared
+        // by every call site (fnmap_ above), so this is not merely more correct
+        // but the only self-consistent choice: scaled by the caller, at most one
+        // caller could ever be right. Scope::getTimeScale walks out to the
+        // enclosing module / package / compilation unit, so a class method picks
+        // up its declaring unit's scale too.
+        const uint64_t saved_mul  = time_mul_;
+        const uint64_t saved_prec = prec_over_tick_;
+        if (tick_fs_ != 0) {
+            if (const Scope* decl = sub.getParentScope()) {
+                apply_time_scale(*decl);
+            }
+        }
         if (is_task) {
             build_task(sub, id);
         } else {
             build_function(sub, id);
         }
+        time_mul_       = saved_mul;
+        prec_over_tick_ = saved_prec;
 
         return id;
     }
@@ -15091,12 +16009,22 @@ private:
     // dereference the handle to the object body, then a MemberSelect on the
     // property's field index. Shared by member access (`obj.prop`) and a bare
     // property reference inside a method (rooted at `this`).
+    //
+    // `handle_span` locates the object expression itself when the source spells
+    // one out. The backend's null-handle guard underlines it, so pointing at
+    // `obj` rather than at the whole `obj.prop` is what makes the fatal name the
+    // handle that was null. An implicit `this` has no such span; the diagnostic
+    // then falls back to `l` (the property reference).
     ir::Index class_member_lvalue(ir::Index                 handle_val,
                                   const slang::ast::Symbol& prop,
                                   ir::Ref                   class_ref,
                                   ir::Builder&              b,
-                                  ir::SourceLoc             l) {
-        const ir::Index body = b.handle_deref(handle_val, class_ref, l);
+                                  ir::SourceLoc             l,
+                                  ir::SourceSpan            handle_span = {}) {
+        const ir::Index body = b.handle_deref(handle_val, class_ref, handle_span.valid() ? handle_span.start : l);
+        if (handle_span.end != ir::SourceLoc{ 0 }) {
+            b.set_end(body, handle_span.end);
+        }
         return b.member_select(body, class_prop_index_.at(&prop), class_ref, l);
     }
 
@@ -15904,6 +16832,24 @@ private:
     // Classify (record driver regions) and Emit (store / route), and branch on
     // this. Meaningful only inside lower_members and the driver functions.
     Pass cur_pass_ = Pass::Emit;
+    // -- Assertion control (LRM 20.12), all filled by the Collect walk --
+    //
+    // Every concurrent assertion in this top, in the order Collect met them.
+    // Populated whether or not the design controls anything, because whether it
+    // does is only known once the whole walk has run; alloc_assert_control is
+    // what turns the table into signals, and only then.
+    std::vector<AssertSite> sites_;
+    // Assertion statement -> indices into sites_. A vector because one bound
+    // Statement could in principle serve two instances; the entry that matches
+    // cur_scope_id() is this instance's.
+    ankerl::unordered_dense::map<const slang::ast::ConcurrentAssertionStatement*, std::vector<uint32_t>> site_of_;
+    // Whether any control task was seen. False means no control state exists,
+    // and every monitor emits exactly what it emitted before 20.12 support.
+    bool assert_control_used_ = false;
+    // Whether the design contains an immediate / deferred assertion. A control
+    // task selecting those types refuses rather than silently leaving them
+    // running (see lower_assert_control).
+    bool immediate_assertion_seen_ = false;
     // Net signals Classify found to have >= 2 overlapping continuous drivers, so
     // Emit routes every driver to a slot and emit_wire_resolvers folds them.
     ankerl::unordered_dense::set<uint32_t> resolved_nets_;
@@ -15960,17 +16906,21 @@ private:
     // compile time; Const requires a constant-folding command string; Full
     // allows a runtime-computed command. See lower_call / the $system branch.
     ir::SystemAccess allow_system_ = ir::SystemAccess::Off;
-    // Time-unit multiplier of the instance currently being lowered: a delay is
-    // scaled up by this into ticks; $time is scaled (rounded) down by it. Always
-    // 1 when unitless. Saved / restored around child-instance recursion.
+    // Time-unit multiplier of the scope whose code is currently being lowered: a
+    // delay is scaled up by this into ticks; $time is scaled (rounded) down by
+    // it. Always 1 when unitless. Saved / restored around child-instance
+    // recursion and around a subroutine body, whose scope is the one that
+    // DECLARES it rather than the instance that calls it (LRM 3.14.2.3).
     uint64_t time_mul_ = 1;
-    // Time-precision multiplier of the instance currently being lowered:
-    // precision_fs / tick_fs. A real delay rounds to this module's precision then
-    // scales up by this into ticks (time_mul_ == unit/precision * prec_over_tick_).
-    // Always 1 when unitless. Saved / restored around child-instance recursion.
+    // Time-precision multiplier of that same scope: precision_fs / tick_fs. A
+    // real delay rounds to the scope's precision then scales up by this into
+    // ticks (time_mul_ == unit/precision * prec_over_tick_). Always 1 when
+    // unitless. Saved / restored alongside time_mul_.
     uint64_t prec_over_tick_ = 1;
-    // Monotonic counter naming hidden compiler temporaries (e.g. a repeat loop's
-    // counter / bound) so their flattened signal names stay unique.
+    // Monotonic counter naming hidden compiler temporaries backed by a module
+    // signal (a synthesized event net, a force site, a gate input, and the loop
+    // cells of a process, which has no frame to put them in) so their flattened
+    // signal names stay unique.
     uint32_t temp_id_ = 0;
     // Subroutine -> its lowered FunctionId, so each function is lowered once and
     // shared across call sites (and a recursive call resolves its own id).
@@ -16120,7 +17070,22 @@ Diagnostic from_slang(const slang::DiagnosticEngine& engine, const slang::Diagno
 // `policy` is passed rather than threaded from the CLI because there is one
 // value: the selector arrives with the second one, and adding Synth is then an
 // enumerator, an arm below, and one parameter -- not surgery on this function.
-void apply_severity_policy(slang::DiagnosticEngine& engine, DiagnosticPolicy policy) {
+// `partial` says the compilation is known to be missing modules it instantiates,
+// which makes one specific family of findings unsound; see below.
+//
+// NOT here, and deliberately: a width warning for an explicitly-sized literal
+// whose declared width differs from the assignment target but whose VALUE still
+// fits. `wire [2:0] foo = 4'b0000;` is silent in clotho and a WIDTHTRUNC in
+// verilator. slang recomputes the right-hand width with constants sized to the
+// minimum needed to represent them (ConversionExpression.cpp:729-737), so the
+// 4-bit literal has an effective width of 1 and nothing fires. A precise check
+// is available -- `IntegerLiteral::isDeclaredUnsized` separates `4'b0000` from
+// the `logic [3:0] a = 1;` idiom slang's comment is protecting, and verilator
+// stays quiet on the unsized form too -- and it was still declined: no
+// information is lost by the conversion, and one fewer place where clotho and
+// slang disagree about what the same source means is worth more than the
+// finding. Revisit only with evidence of a real bug it would have caught.
+void apply_severity_policy(slang::DiagnosticEngine& engine, DiagnosticPolicy policy, bool partial) {
     // ---- Invariant across policies: representation limits, one compliance
     // ---- reading, and one noise judgment. None of these vary by semantics. ----
 
@@ -16162,6 +17127,28 @@ void apply_severity_policy(slang::DiagnosticEngine& engine, DiagnosticPolicy pol
     engine.setSeverity(slang::diag::UnusedParameter, slang::DiagnosticSeverity::Ignored);
     engine.setSeverity(slang::diag::UnusedPackageParameter, slang::DiagnosticSeverity::Ignored);
 
+    // ---- A partial design: one buffer, its dependencies absent. ----
+    //
+    // With CompilationFlags::IgnoreUnknownModules the instances of absent
+    // modules survive as UninstantiatedDefSymbol, and slang binds their port
+    // connections as ordinary expressions. So a net wired to a missing
+    // submodule reads as USED -- which is sound, the connection really is a use
+    // -- but never as DRIVEN, because nothing tells slang which of those ports
+    // is an output.
+    //
+    // That splits the unused family cleanly in two, and only one half survives.
+    // Measured on hazard3_core.v opened alone: 98 undriven-net and 10
+    // undriven-port, every one of them an artifact of the other 20 files not
+    // being open, against zero false unused-net. Reporting them would be the
+    // server inventing 108 problems; the cost of silencing them is a genuinely
+    // undriven net in a self-contained file going unreported, which is the
+    // right direction to err (§7 of docs/design/lsp.md).
+    if (partial) {
+        engine.setSeverity(slang::diag::UndrivenNet, slang::DiagnosticSeverity::Ignored);
+        engine.setSeverity(slang::diag::UndrivenPort, slang::DiagnosticSeverity::Ignored);
+        engine.setSeverity(slang::diag::UnassignedVariable, slang::DiagnosticSeverity::Ignored);
+    }
+
     // ---- Policy: what the chosen semantics judges differently. ----
 
     switch (policy) {
@@ -16179,7 +17166,8 @@ void apply_severity_policy(slang::DiagnosticEngine& engine, DiagnosticPolicy pol
 LowerResult lower_compilation(slang::ast::Compilation&       comp,
                               std::shared_ptr<SourceContext> ctx,
                               Timings*                       timings,
-                              ir::SystemAccess               allow_system) {
+                              ir::SystemAccess               allow_system,
+                              bool                           partial = false) {
     LowerResult result;
     // Attached first so EVERY return path below carries it: `sources` is documented
     // as never null, and there are a dozen early returns.
@@ -16205,7 +17193,7 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
         slang::DiagnosticEngine engine(*sm);
         auto                    client = std::make_shared<slang::TextDiagnosticClient>();
         engine.addClient(client);
-        apply_severity_policy(engine, DiagnosticPolicy::Sim);
+        apply_severity_policy(engine, DiagnosticPolicy::Sim, partial);
         // Issue each diagnostic on its own so the text client's buffer holds
         // exactly one item's pretty rendering (snippet + caret) when we harvest it.
         // A diagnostic mapped to Ignored produces no report, hence the empty check.
@@ -16320,6 +17308,27 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
         if (mp != 0 && (min_prec_fs == 0 || mp < min_prec_fs)) {
             min_prec_fs = mp;
         }
+    }
+    // Packages and `$unit` sit outside the instance tree but declare subroutines
+    // the design calls, and those bodies scale by their OWN timescale, so their
+    // units join the GCD too (global_scope_tick_fs).
+    const auto fold_global = [&](const Scope& scope) {
+        const uint64_t p = global_scope_tick_fs(scope, any_explicit);
+        if (p != 0 && (prec_fs == 0 || p < prec_fs)) {
+            prec_fs = p;
+        }
+        if (const auto ts = scope.getTimeScale(); ts && scope_declares_subroutine(scope)) {
+            const uint64_t mp = tsv_to_fs(ts->precision);
+            if (min_prec_fs == 0 || mp < min_prec_fs) {
+                min_prec_fs = mp;
+            }
+        }
+    };
+    for (const PackageSymbol* pkg : comp.getPackages()) {
+        fold_global(*pkg);
+    }
+    for (const CompilationUnitSymbol* unit : root.compilationUnits) {
+        fold_global(*unit);
     }
     const uint64_t tick_fs = any_explicit ? prec_fs : 0;
 
@@ -16554,6 +17563,65 @@ LowerResult lower_text(std::string_view source, Timings* timings, ir::SystemAcce
     }
 
     return lower_compilation(cr, std::move(ctx), timings, allow_system);
+}
+
+LowerResult lower_buffer(std::string_view path,
+                         std::string_view text,
+                         Timings*         timings,
+                         ir::SystemAccess allow_system) {
+    const auto t_parse = std::chrono::steady_clock::now();
+
+    // A manager per call, owned by the context. slang's SourceManager is
+    // append-only -- assignBuffer throws on a path it has already seen and there
+    // is no removeBuffer -- so a manager reused across revisions would either
+    // throw on the second keystroke or grow without bound. Rebuilding it costs
+    // the file cache, which is worth nothing here: there is exactly one buffer.
+    auto  sm     = std::make_unique<slang::SourceManager>();
+    auto  buffer = sm->assignText(path, text);
+    auto  ctx    = std::make_shared<SourceContext>();
+    auto& sm_ref = *sm;
+
+    // IgnoreUnknownModules only. NOT CompilationFlags::LintMode, despite the
+    // name and despite it looking like the flag for exactly this: LintMode
+    // makes Scope::isUninstantiated() return true for EVERY scope
+    // (slang Scope.cpp:150-153), and slang skips diagnostics in uninstantiated
+    // code -- which silently deletes the whole unused/unassigned family, the
+    // findings an editor most wants. Measured: with LintMode, `wire [2:0] foo`
+    // assigned and never read reported nothing at all.
+    slang::ast::CompilationOptions copts;
+    copts.flags |= slang::ast::CompilationFlags::IgnoreUnknownModules;
+    slang::Bag options;
+    options.set(copts);
+
+    auto                     comp = std::make_unique<slang::ast::Compilation>(options);
+    slang::ast::Compilation& cr   = *comp;
+    cr.addSyntaxTree(slang::syntax::SyntaxTree::fromBuffer(buffer, sm_ref, options));
+
+    // Manager first, then the compilation: the context destroys them in reverse
+    // declaration order, and the syntax trees point into the manager's buffers.
+    ctx->adopt_source_manager(std::move(sm));
+    ctx->adopt_compilation(std::move(comp));
+    if (timings != nullptr) {
+        timings->frontend_ms += ms_since(t_parse);
+    }
+
+    return lower_compilation(cr, std::move(ctx), timings, allow_system, /*partial=*/true);
+}
+
+ir::LocResolver loc_resolver(const LowerResult& result) {
+    return [&result](ir::SourceSpan span) {
+        const SourcePosition pos = result.sources->resolve(span.start);
+        // The underline needs an end on the SAME line to have a width; a span
+        // that runs onto the next line degrades to a bare caret.
+        const SourcePosition end = result.sources->resolve(span.end);
+        return ir::SourceText{
+            .where      = result.sources->render(span.start),
+            .line       = result.sources->line_text(span.start),
+            .line_no    = pos.line,
+            .column     = pos.column,
+            .end_column = end.valid && end.line == pos.line ? end.column : pos.column,
+        };
+    };
 }
 
 } // namespace clotho

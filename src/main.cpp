@@ -17,6 +17,8 @@
 #include "ir/Jit.h"
 #include "ir/LlvmBackend.h"
 #include "ir/Printer.h"
+#include "dap/Dap.h"
+#include "lsp/Lsp.h"
 #ifdef CLOTHO_SYNTH
 #include "legalize/Legalize.h"
 #include "legalize/Materialize.h"
@@ -31,6 +33,8 @@
 //   clotho build [options] <source>...             emit an artifact, no execution
 //   clotho run   [options] <source>... [+arg...]   compile, then simulate
 //   clotho lint  [options] <source>...             diagnostics only
+//   clotho lsp                                     serve an editor over stdio
+//   clotho dap                                     debug a design for an editor
 //
 // One parser, one namespace, one --help: Clotho's options are registered on the
 // slang Driver's own CommandLine (register_options below, before
@@ -60,7 +64,7 @@ using clotho::ir::SimulationConfig;
 using clotho::ir::Stat;
 using clotho::ir::SystemAccess;
 
-enum class Command : uint8_t { Build, Run, Lint, Synth };
+enum class Command : uint8_t { Build, Run, Lint, Synth, Lsp, Dap };
 
 // What `build` writes.
 enum class Emit : uint8_t {
@@ -90,6 +94,17 @@ struct Options {
     std::optional<bool>        full_case;
     std::optional<bool>        parallel_case;
 };
+
+// The `--sanitize` checks this build actually has. `xprov` is compiled out of a
+// Release build (CMakeLists CLOTHO_XSAN): it is parsed and carried in
+// SimulationConfig but no backend pass reads the bit yet, and a check that
+// silently reports nothing is worse than one the binary says it does not know.
+constexpr std::string_view kSanitizeList =
+#ifdef CLOTHO_XSAN
+  "bounds or xprov";
+#else
+  "bounds";
+#endif
 
 // Wording rule for everything a user reads: say what the option does for the
 // design being simulated, not how Clotho implements it. An option that exists
@@ -123,8 +138,11 @@ void register_options(slang::CommandLine& cl, Options& o) {
     cl.add("--sanitize",
            o.sanitizers,
            "Check the design for a class of bug while it runs, reporting when one happens: bounds "
-           "(an array index outside the array), xprov (where an x value decided something, and what "
-           "made it x). Costs simulation time (repeatable, comma-separated)",
+           "(an array index outside the array)"
+#ifdef CLOTHO_XSAN
+           ", xprov (where an x value decided something, and what made it x)"
+#endif
+           ". Costs simulation time (repeatable, comma-separated)",
            "<check>",
            slang::CommandLineFlags::CommaList);
     cl.add("--allow-system",
@@ -182,6 +200,8 @@ constexpr std::string_view kOverview =
   "  build   compile the design and write the generated code, without running it\n"
   "  run     compile the design and simulate it\n"
   "  lint    check the design and report problems, without compiling or running it\n"
+  "  lsp     serve the Language Server Protocol over stdin/stdout, for an editor\n"
+  "  dap     serve the Debug Adapter Protocol over stdin/stdout, to debug a design\n"
 #ifdef CLOTHO_SYNTH
   "  synth   write the design back out as synthesizable SystemVerilog\n"
 #endif
@@ -204,9 +224,9 @@ constexpr std::string_view kOverview =
 // worse than one that never mentions it.
 constexpr std::string_view kCommandList =
 #ifdef CLOTHO_SYNTH
-  "'build', 'run', 'lint' or 'synth'";
+  "'build', 'run', 'lint', 'synth', 'lsp' or 'dap'";
 #else
-  "'build', 'run' or 'lint'";
+  "'build', 'run', 'lint', 'lsp' or 'dap'";
 #endif
 
 int usage_error(std::string_view message) {
@@ -233,6 +253,10 @@ std::string_view command_name(Command command) {
             return "lint";
         case Command::Synth:
             return "synth";
+        case Command::Lsp:
+            return "lsp";
+        case Command::Dap:
+            return "dap";
     }
     return "";
 }
@@ -289,25 +313,6 @@ void report_timings(const clotho::Timings& t, Command command) {
     std::println(stderr, "  {:<12}{:>12.3f}", "total", total);
 }
 
-// Decodes a source extent for whoever needs one: the IR dump's headers, and the
-// snippet a sanitizer bakes into its report. Everything comes from the
-// SourceManager lowering hands back, so it stays valid for as long as `result`
-// does.
-clotho::ir::LocResolver loc_resolver(const clotho::LowerResult& result) {
-    return [&result](clotho::ir::SourceSpan span) {
-        const clotho::SourcePosition pos = result.sources->resolve(span.start);
-        // The underline needs an end on the SAME line to have a width; a span
-        // that runs onto the next line degrades to a bare caret.
-        const clotho::SourcePosition end = result.sources->resolve(span.end);
-        return clotho::ir::SourceText{
-            .where      = result.sources->render(span.start),
-            .line       = result.sources->line_text(span.start),
-            .line_no    = pos.line,
-            .column     = pos.column,
-            .end_column = end.valid && end.line == pos.line ? end.column : pos.column,
-        };
-    };
-}
 
 // `build`: write the requested artifact. `-o -` (the default) means stdout.
 // Write `text` to `out`, or to stdout for "-".
@@ -335,7 +340,7 @@ bool write_artifact(const clotho::LowerResult& result,
     // IR dump you cannot map to source is much less useful when debugging a
     // lowering problem, and a sanitizer report with no file:line is barely a
     // report at all.
-    const auto resolve = loc_resolver(result);
+    const auto resolve = clotho::loc_resolver(result);
     if (emit == Emit::Ir) {
         if (to_stdout) {
             clotho::ir::print_module(*result.module, std::cout, resolve);
@@ -391,6 +396,10 @@ int main(int argc, char** argv) {
             command = Command::Run;
         } else if (first == "lint") {
             command = Command::Lint;
+        } else if (first == "lsp") {
+            command = Command::Lsp;
+        } else if (first == "dap") {
+            command = Command::Dap;
 #ifdef CLOTHO_SYNTH
         } else if (first == "synth") {
             command = Command::Synth;
@@ -405,6 +414,34 @@ int main(int argc, char** argv) {
         } else {
             return usage_error(std::format("unknown command '{}'; expected {}", first, kCommandList));
         }
+    }
+
+    // Neither server takes a design on the command line. For `lsp` an editor
+    // supplies the file set and this build has no workspace configuration to
+    // express it with; for `dap` the design arrives in the launch request's
+    // `args`, which are this command line's own `run` arguments passed through
+    // to the design process verbatim (docs/design/dap.md 4.4). Accepting
+    // -D / -y / -f here and ignoring them would be exactly the silent
+    // acceptance the project forbids, so they are refused until they mean
+    // something.
+    if (command == Command::Lsp || command == Command::Dap) {
+        for (int i = 2; i < argc; ++i) {
+            const std::string_view arg = argv[i];
+            if (arg == "-h" || arg == "--help") {
+                print_help();
+                return 0;
+            }
+            if (arg == "--version") {
+                print_version();
+                return 0;
+            }
+            return usage_error(
+              std::format("'{}' takes no arguments, got '{}'", command_name(command), arg));
+        }
+        if (command == Command::Dap) {
+            clotho::dap::serve(CLOTHO_GIT_HASH, argv[0]);
+        }
+        clotho::lsp::serve(CLOTHO_GIT_HASH);
     }
 
     // Peel runtime plusargs; everything else goes to the Driver verbatim. argv
@@ -490,18 +527,22 @@ int main(int argc, char** argv) {
         }
     }
     // TODO(xsan): `xprov` is parsed and carried in SimulationConfig, but no
-    // backend pass reads that bit yet, so `--sanitize=xprov` is accepted and
-    // instruments nothing. Unguarded on purpose while xsan is built out
-    // incrementally (the project's partial-feature exception); the guard
-    // disappears when the instrumentation lands, not the TODO. `bounds` is
+    // backend pass reads that bit yet, so it instruments nothing. That is
+    // the project's partial-feature exception, and it holds only where the operator
+    // cannot mistake a silent check for a clean design -- so a Debug build offers
+    // it (CLOTHO_XSAN) and the shipped ones reject the name outright. Both the
+    // gate and this TODO disappear when the instrumentation lands. `bounds` is
     // live (SimConfig.h names what it does and does not cover yet).
     for (const std::string& name : options.sanitizers) {
         if (name == "bounds") {
             config.sanitizers |= static_cast<uint32_t>(Sanitizer::Bounds);
+#ifdef CLOTHO_XSAN
         } else if (name == "xprov") {
             config.sanitizers |= static_cast<uint32_t>(Sanitizer::XProv);
+#endif
         } else {
-            return usage_error(std::format("unknown --sanitize check '{}'; expected bounds or xprov", name));
+            return usage_error(
+              std::format("unknown --sanitize check '{}'; expected {}", name, kSanitizeList));
         }
     }
     if (options.allow_system.has_value()) {
@@ -617,7 +658,7 @@ int main(int argc, char** argv) {
 #endif
 
     if (command == Command::Run) {
-        const auto resolve = loc_resolver(result);
+        const auto resolve = clotho::loc_resolver(result);
         const int  rc      = clotho::ir::run_jit(*result.module, tp, config, plusargs, resolve);
         // run_jit returns a negative sentinel on setup failure; the design's own
         // status passes through unchanged.

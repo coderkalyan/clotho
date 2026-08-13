@@ -255,6 +255,119 @@ typedef struct rt_bounds_site {
 void rt_bounds_report(const rt_bounds_site* site, int64_t index, int64_t extent, uint32_t flags,
                       uint64_t now);
 
+// -- Null class-handle dereference (LRM 8.4) --
+
+// The site of one guarded class-handle use — a property dereference or a virtual
+// dispatch — emitted by the backend as a constant global beside the guard.
+// Nothing about a null handle is dynamic except the simulation time, so the whole
+// record is compile-time. Field order and types mirror the LLVM struct the
+// backend builds: { ptr, ptr, i32 x3 }.
+typedef struct rt_null_site {
+    // "<file>:<line>:<col>" of the handle expression, or "<unknown>" when the
+    // location cannot be resolved.
+    const char* where;
+    // The source line that expression starts on, verbatim and without its
+    // newline. Empty when unavailable.
+    const char* line;
+    // 1-based line and column of the expression's first character; 0 when
+    // unknown.
+    int32_t line_no;
+    int32_t column;
+    // 1-based column one past its last character, so the caret spans
+    // [column, end_column). Equals `column` when no extent was recorded.
+    int32_t end_column;
+} rt_null_site;
+
+// Reaching a non-static property, or dispatching a virtual method, through a
+// class handle that holds no object. LRM 8.4 calls such an access illegal,
+// leaves its result indeterminate, and lets an implementation issue an error;
+// the only other outcome available here is a load from address zero, which
+// faults with nothing attributing it to the design. So this prints a located
+// diagnostic and ends the simulation with a nonzero status. Never returns.
+[[noreturn]] void rt_null_handle(const rt_null_site* site, uint64_t now);
+
+// -- Checked heap allocation --
+//
+// Every heap buffer a design's containers need (dynamic arrays, queues, strings)
+// comes from rt_alloc_checked. Three failures used to be silent: a size computed
+// by wrapping multiplication (an element count times a stride), a `new[n]` whose
+// n arrived zero-extended so a negative count became a huge one, and a malloc
+// that simply returned null. All three produced a small-or-null buffer the
+// caller then wrote past. They are now diagnosed at the point of allocation.
+
+// Where an allocation came from, emitted by the backend as a constant global
+// beside the call it guards. Everything here is compile-time; only the size and
+// the simulation time are dynamic. Field order and types mirror the LLVM struct
+// the backend builds: { ptr, ptr, ptr, i32, i32, i32 }.
+typedef struct rt_alloc_site {
+    // "<file>:<line>:<col>" of the statement that allocates, or "<unknown>".
+    const char* where;
+    // The source line it sits on, verbatim and without its newline. Empty when
+    // unavailable.
+    const char* line;
+    // What is being allocated, as the diagnostic's noun: "dynamic array",
+    // "queue", "string", ... Never null.
+    const char* what;
+    // 1-based line and column of the statement; 0 when unknown.
+    int32_t line_no;
+    int32_t column;
+    // 1-based column one past its last character, so the caret spans
+    // [column, end_column). Equals `column` when no extent was recorded.
+    int32_t end_column;
+} rt_alloc_site;
+
+// The runtime's one heap allocation. Returns `size` bytes, null for a zero-byte
+// request (every caller treats null-and-empty as "no buffer"), and never returns
+// on failure: an allocation the system refuses ends the simulation with a
+// located fatal rather than handing back a null the caller would write through.
+// `now` is the simulation time in design ticks, for the report only.
+//
+// There is deliberately no byte ceiling beyond what size_t can express: a design
+// that legitimately wants a huge array should get it if the machine has it.
+void* rt_alloc_checked(uint64_t size, const rt_alloc_site* site, uint64_t now);
+
+// `count` elements of `stride` bytes as a byte total, formed with a checked
+// multiply -- an element count that overflows size_t is reported as the overflow
+// it is, instead of wrapping to a small number the caller then sizes a buffer
+// from and writes `count` elements into. Never returns on overflow. Split out
+// from rt_alloc_elems_checked for the caller that needs the total before it
+// knows whether it will allocate at all (a short string builds in stack
+// scratch).
+uint64_t rt_alloc_elems_size(uint64_t count, uint64_t stride, const rt_alloc_site* site,
+                             uint64_t now);
+
+// `count` elements of `stride` bytes: rt_alloc_elems_size then rt_alloc_checked.
+void* rt_alloc_elems_checked(uint64_t count, uint64_t stride, const rt_alloc_site* site,
+                             uint64_t now);
+
+// `count` ZEROED elements of `stride` bytes: the same checked multiply and the
+// same located fatal as rt_alloc_elems_checked, but calloc rather than malloc.
+// For a large request the allocator serves calloc from a fresh anonymous
+// mapping, whose pages are already zero and materialize on first touch -- so a
+// design that asks for a big array of zero-initialized elements pays for the
+// pages it writes rather than for all of them. Writing the zeros eagerly is
+// what turns an oversized request the kernel happened to grant into an
+// out-of-memory kill of the whole process instead of a diagnosed refusal.
+void* rt_zalloc_elems_checked(uint64_t count, uint64_t stride, const rt_alloc_site* site,
+                              uint64_t now);
+
+// `new[n]` with a negative n. LRM 7.5.1 gives a dynamic array a size of type
+// int, and no meaning to a negative one; clotho refuses rather than reinterpret
+// the bits as a 4-billion-element request. Never returns.
+//
+// The count crosses the ABI as int64_t, so a design writing a 64-bit UNSIGNED
+// count of 2^63 or more lands here too and is reported as the negative those
+// bits spell. Both are refused, only the wording differs, and the smallest such
+// request is eight exabytes of elements -- not worth a second ABI bit to tell
+// apart. Every narrower unsigned count zero-extends and is unambiguous.
+[[noreturn]] void rt_alloc_negative(int64_t n, const rt_alloc_site* site, uint64_t now);
+
+// Simulation time for a cold diagnostic path, in design ticks. Reads the wheel
+// rt_sim_run is currently driving, so an allocation failure can report a time
+// without every allocating entry point carrying one across the ABI. Zero outside
+// a run (a constant-folding or teardown allocation has no meaningful time).
+uint64_t rt_diag_now(void);
+
 // Drive one simulation: run `drain` (the event loop), then `finals` (the
 // `final` blocks, LRM 9.2.3). `drain` returns normally whether it ran out of
 // work or a $finish stopped it, so the finals run on both paths.
@@ -343,15 +456,18 @@ void rt_sformat(uint8_t* mm, uint8_t* z, uint32_t width, const char* fmt, uint32
                 uint32_t flags);
 
 // $sformatf / $sformat into a string-object destination: format as rt_fwrite
-// and assign the result to the rt_string at `dst` (declared below).
+// and assign the result to the rt_string at `dst` (declared below). `site`
+// locates the format call for an allocation-failure report.
 struct rt_string;
-void rt_sformat_str(struct rt_string* dst, const char* fmt, uint32_t argc, const rt_arg* argv);
+void rt_sformat_str(struct rt_string* dst, const char* fmt, uint32_t argc, const rt_arg* argv,
+                    const rt_alloc_site* site);
 
 // $fgets(str, fd) into a `string` destination: no fixed width, so the whole
 // line is read (stopping after a newline or at EOF) and assigned to `dst`.
 // -> the character count, or 0 on EOF / error, in which case `dst` is left
 // unchanged (matches rt_fgets's packed-vector behavior on a 0-byte read).
-int32_t rt_fgets_str(struct rt_string* dst, int32_t fd);
+// `site` locates the read for an allocation-failure report.
+int32_t rt_fgets_str(struct rt_string* dst, int32_t fd, const rt_alloc_site* site);
 
 // $ferror(fd, str) (LRM §21.3.6): write the descriptor's most recent error message
 // into the string variable at `mm` / `z` (`width` bits) and return its error code
@@ -359,8 +475,9 @@ int32_t rt_fgets_str(struct rt_string* dst, int32_t fd);
 int32_t rt_ferror(int32_t fd, uint8_t* mm, uint8_t* z, uint32_t width, uint32_t flags);
 
 // $ferror(fd, str) into a `string` destination: same as rt_ferror, but always
-// assigns `dst` (even the empty message when the stream is clear).
-int32_t rt_ferror_str(int32_t fd, struct rt_string* dst);
+// assigns `dst` (even the empty message when the stream is clear). `site`
+// locates the call for an allocation-failure report.
+int32_t rt_ferror_str(int32_t fd, struct rt_string* dst, const rt_alloc_site* site);
 
 // One output destination of a $fscanf / $sscanf conversion: the must|may plane
 // pointer (2*`width` bits), the z plane pointer (`width` bits), and the width. The
@@ -425,10 +542,12 @@ void rt_readmem(const char* path_buf, uint32_t path_len, uint8_t* mm_base, uint8
 
 // rt_vcd_var flags: bit 0 four-state (has x/z), bit 1 net (`wire` vs `reg` var),
 // bit 2 narrow (a 2-state `{ iW }` slot: read the single iW word as the value,
-// with must == may and no z plane).
+// with must == may and no z plane), bit 3 real (the value word is an IEEE-754 bit
+// pattern -- `$var real`, dumped as `r<decimal>`; width 64 double / 32 shortreal).
 #define RT_VCD_FLAG_FOUR_STATE 1u
 #define RT_VCD_FLAG_NET        2u
 #define RT_VCD_FLAG_NARROW     4u
+#define RT_VCD_FLAG_REAL       8u
 
 // $dumpfile: record the output path. When `forward` is 0 the path is a right-
 // justified packed-ASCII vector (byte 0 = last character), as the backend spills a
@@ -445,9 +564,10 @@ void rt_vcd_scope(const char* name, uint32_t name_len);
 void rt_vcd_upscope(void);
 
 // Register one dumped variable: `name` its leaf reference, `width` its bit width
-// (1..64 in phase 0), `flags` per RT_VCD_FLAG_*, `mm` its packed must|may plane
-// pointer, `z` its z plane pointer (null for a never-z / narrow slot). Writes the
-// $var line and adds the variable to the scan table.
+// (any width; wider than 64 bits travels as multiple words), `flags` per
+// RT_VCD_FLAG_*, `mm` its packed must|may plane pointer, `z` its z plane pointer
+// (null for a never-z / narrow slot). Writes the $var line and adds the variable
+// to the scan table.
 void rt_vcd_var(const char* name, uint32_t name_len, uint32_t width, uint32_t flags, const uint8_t* mm,
                 const uint8_t* z);
 
@@ -483,14 +603,21 @@ void rt_vcd_touch_range(uint32_t base, uint32_t count);
 // active. Also services a pending $dumpoff / $dumpall / $dumpon at this instant.
 void rt_vcd_flush(uint64_t tick);
 
-// $dumpoff / $dumpon / $dumpall / $dumpflush (LRM §21.7.4-7). off/on/all only set
-// a deferred flag serviced by the next rt_vcd_flush, so rt_vcd_flush stays the
+// $dumpoff / $dumpon / $dumpall / $dumpflush (LRM §21.7.1.3-6). off/on/all only
+// set a deferred flag serviced by the next rt_vcd_flush, so rt_vcd_flush stays the
 // sole writer and the change lands at the correct instant; dumpflush drains the
 // output buffer to disk immediately.
 void rt_vcd_off(void);
 void rt_vcd_on(void);
 void rt_vcd_all(void);
 void rt_vcd_dumpflush(void);
+
+// $dumplimit (LRM §21.7.1.5): stop dumping once the file reaches `bytes` bytes.
+// 0 means unlimited. May be called before or after $dumpvars. The writer checks
+// the count at instant boundaries, so the file never ends mid-instant: it holds
+// the last whole instant that fit plus a `$comment` recording the cutoff, and
+// dumping stays off for the rest of the run ($dumpon / $dumpall do not resume).
+void rt_vcd_limit(uint64_t bytes);
 
 // Final flush of the in-progress instant + output buffer, then close the file.
 // Called on normal simulation end and when a $finish stops the drain.
@@ -643,21 +770,28 @@ typedef struct rt_dynarr {
 } rt_dynarr;
 
 // arr = new[n]: (re)allocate `h` to `n` elements, constructing each from the
-// descriptor's proto. Destroys the prior elements and frees the buffer.
-void rt_dynarr_new(rt_dynarr* h, const rt_elem_ops* ops, uint64_t n);
+// descriptor's proto. Destroys the prior elements and frees the buffer. `n` is
+// signed because LRM §7.5.1 gives the size expression a signed type; a negative
+// `n` is a fatal rather than the huge unsigned request its bits would name.
+// `site` is where the `new[]` sits in the source, for the failure report.
+void rt_dynarr_new(rt_dynarr* h, const rt_elem_ops* ops, int64_t n, const rt_alloc_site* site);
 
 // arr = new[n](src): like rt_dynarr_new, but the low min(n, src->len) elements
 // are first deep-copied from `src`; any remaining take the proto (LRM §7.5.1).
-// `src` may alias `h` (a self-resize).
-void rt_dynarr_new_copy(rt_dynarr* h, const rt_elem_ops* ops, uint64_t n, const rt_dynarr* src);
+// `src` may alias `h` (a self-resize). `n` is signed and a negative one is a
+// fatal, and `site` locates the allocation, both as for rt_dynarr_new.
+void rt_dynarr_new_copy(rt_dynarr* h, const rt_elem_ops* ops, int64_t n, const rt_dynarr* src,
+                        const rt_alloc_site* site);
 
 // arr.delete(): destroy every element, free the buffer, reset to the empty
 // array. Idempotent.
 void rt_dynarr_delete(rt_dynarr* h, const rt_elem_ops* ops);
 
 // dst = src: deep copy `src`'s elements into `dst` (value semantics, LRM
-// §7.5). A no-op when dst == src.
-void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, const rt_elem_ops* ops);
+// §7.5). A no-op when dst == src. `site` is the assignment's source location,
+// for the report if the copy cannot be allocated.
+void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, const rt_elem_ops* ops,
+                      const rt_alloc_site* site);
 
 // -- Array ordering methods (LRM 7.12.2) --
 //
@@ -700,9 +834,12 @@ typedef struct rt_queue {
 // push drops the element at the opposite end.
 //
 // q.push_back(e) / q.push_front(e): append `elem` (a `stride`-byte element slot)
-// to the tail / head, growing the ring as needed.
-void rt_queue_push_back(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, const void* elem);
-void rt_queue_push_front(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, const void* elem);
+// to the tail / head, growing the ring as needed. `site` is the push's source
+// location, for the report if the ring cannot be grown.
+void rt_queue_push_back(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, const void* elem,
+                        const rt_alloc_site* site);
+void rt_queue_push_front(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, const void* elem,
+                         const rt_alloc_site* site);
 
 // q.pop_back() / q.pop_front(): remove the tail / head element and RELOCATE it
 // into `out` (a raw element slot whose prior contents must be unconstructed or
@@ -712,8 +849,10 @@ void rt_queue_pop_back(rt_queue* h, const rt_elem_ops* ops, void* out);
 void rt_queue_pop_front(rt_queue* h, const rt_elem_ops* ops, void* out);
 
 // q.insert(i, e): insert `elem` before position `i` (0 <= i <= len); out-of-range
-// `i` is ignored. Honours the bound like a push.
-void rt_queue_insert(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, uint64_t i, const void* elem);
+// `i` is ignored. Honours the bound like a push. `site` locates the insert for
+// an allocation-failure report.
+void rt_queue_insert(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, uint64_t i,
+                     const void* elem, const rt_alloc_site* site);
 
 // q.delete(i): remove the element at position `i` (0 <= i < len); out-of-range
 // `i` is ignored.
@@ -723,9 +862,12 @@ void rt_queue_delete_idx(rt_queue* h, const rt_elem_ops* ops, uint64_t i);
 void rt_queue_delete_all(rt_queue* h, const rt_elem_ops* ops);
 
 // dst = src: deep copy `src`'s elements into `dst`, linearised so dst->head
-// == 0 (value semantics, LRM §7.10). A no-op when dst == src.
-void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_elem_ops* ops);
-void rt_queue_assign_dynarr(rt_queue* dst, const rt_dynarr* src, const rt_elem_ops* ops);
+// == 0 (value semantics, LRM §7.10). A no-op when dst == src. `site` is the
+// assignment's source location, for the report if the copy cannot be allocated.
+void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_elem_ops* ops,
+                     const rt_alloc_site* site);
+void rt_queue_assign_dynarr(rt_queue* dst, const rt_dynarr* src, const rt_elem_ops* ops,
+                            const rt_alloc_site* site);
 
 // Move `src`'s buffer into `dst` (ownership transfer, LRM 7.10): destroy `dst`'s
 // elements + buffer, take `src`'s, leave `src` empty. The nonblocking-assignment
@@ -737,18 +879,20 @@ void rt_queue_move(rt_queue* dst, rt_queue* src, const rt_elem_ops* ops);
 // and the queue-typed operands of a concatenation `{q, e}` (a full-queue append
 // passes lo = 0, hi = INT64_MAX; the range is runtime-clamped to [0, len-1], and
 // lo > hi appends nothing). `dst` MUST NOT alias `src` — callers build into a
-// fresh temp handle, so a self-referential `q = {q, e}` is safe.
+// fresh temp handle, so a self-referential `q = {q, e}` is safe. `site` locates
+// the slice or concatenation for an allocation-failure report.
 void rt_queue_append_range(rt_queue* dst, const rt_queue* src, const rt_elem_ops* ops,
-                           uint64_t bound, int64_t lo, int64_t hi);
+                           uint64_t bound, int64_t lo, int64_t hi, const rt_alloc_site* site);
 
 // Render a queue (is_queue != 0) or dynamic array as `%p` text `'{e0, ...}`
 // (LRM 21.2.1.6) into `out`. `kind`: 0 integral, 1 real, 2 string element. An
 // integral slot is `must | (may << width)` plus an optional z plane at `z_off`
 // (a 2-state slot is the bare value); element `width` <= 64. The frontend
-// guards non-POD / wider elements.
+// guards non-POD / wider elements. `site` locates the format for an
+// allocation-failure report.
 void rt_container_format_p(rt_string* out, const void* handle, int32_t is_queue, int32_t kind,
                            uint32_t width, uint32_t is_signed, uint32_t four_state, uint32_t has_z,
-                           uint32_t z_off, uint64_t stride);
+                           uint32_t z_off, uint64_t stride, const rt_alloc_site* site);
 
 // Logical `==` of two queues / dynamic arrays (LRM 11.4.5): 0 unequal, 1 equal,
 // 2 ambiguous (1'bx). Params mirror rt_container_format_p; `!=` is the caller's
@@ -785,7 +929,9 @@ void* rt_assoc_get_ptr(rt_assoc* h, const uint8_t* kptr, uint32_t klen);
 
 // a[key] write: pointer to the element slot for `key`, creating (and proto-
 // initializing) the entry if absent (LRM 7.8). Valid until the next mutation.
-void* rt_assoc_put_ptr(rt_assoc* h, const rt_elem_ops* ops, const uint8_t* kptr, uint32_t klen);
+// `site` locates the write for an allocation-failure report.
+void* rt_assoc_put_ptr(rt_assoc* h, const rt_elem_ops* ops, const uint8_t* kptr, uint32_t klen,
+                       const rt_alloc_site* site);
 
 // a.exists(key) -> 0/1 (LRM 7.9.1).
 int rt_assoc_exists(rt_assoc* h, const uint8_t* kptr, uint32_t klen);
@@ -816,8 +962,9 @@ int rt_assoc_prev(rt_assoc* h, const uint8_t* cur_ptr, uint32_t cur_len, const u
                   uint32_t* out_len);
 
 // dst = src: deep copy `src`'s entries into `dst` (value semantics, LRM §7.9).
-// A no-op when dst == src.
-void rt_assoc_assign(rt_assoc* dst, const rt_assoc* src, const rt_elem_ops* ops);
+// A no-op when dst == src. `site` locates the assignment for an
+// allocation-failure report.
+void rt_assoc_assign(rt_assoc* dst, const rt_assoc* src, const rt_elem_ops* ops, const rt_alloc_site* site);
 
 // -- SystemVerilog string objects --
 //
@@ -847,12 +994,14 @@ void rt_string_init(rt_string* s);
 // storage; `s` is left as a valid empty string, so deinit is idempotent.
 void rt_string_deinit(rt_string* s);
 
-// dst = src (deep copy). dst == src is a no-op.
-void rt_string_assign(rt_string* dst, const rt_string* src);
+// dst = src (deep copy). dst == src is a no-op. `site` locates the assignment
+// for an allocation-failure report.
+void rt_string_assign(rt_string* dst, const rt_string* src, const rt_alloc_site* site);
 
 // dst = the `n` bytes at `p`. `p` is a raw byte sequence, not NUL-terminated;
-// it may alias dst's own buffer.
-void rt_string_assign_bytes(rt_string* dst, const char* p, uint64_t n);
+// it may alias dst's own buffer. `site` locates the assignment for an
+// allocation-failure report.
+void rt_string_assign_bytes(rt_string* dst, const char* p, uint64_t n, const rt_alloc_site* site);
 
 // Length in bytes ($.len()). The empty string has length 0.
 uint64_t rt_string_len(const rt_string* s);
@@ -865,10 +1014,12 @@ const char* rt_string_data(const rt_string* s);
 // dst = parts[0] .. parts[n-1] concatenated. dst may appear among the parts
 // (a = {a, b}); when its first occurrence is parts[0] the call appends in
 // place with amortized growth, so repeated a = {a, chunk} is linear overall.
-void rt_string_concat(rt_string* dst, const rt_string* const* parts, uint32_t n);
+// `site` locates the concatenation for an allocation-failure report.
+void rt_string_concat(rt_string* dst, const rt_string* const* parts, uint32_t n, const rt_alloc_site* site);
 
 // dst = src repeated `count` times ({count{src}}); count == 0 yields "".
-void rt_string_repl(rt_string* dst, const rt_string* src, uint64_t count);
+// `site` locates the replication for an allocation-failure report.
+void rt_string_repl(rt_string* dst, const rt_string* src, uint64_t count, const rt_alloc_site* site);
 
 // Lexicographic comparison in strcmp order over (bytes, then length): returns
 // < 0, 0, or > 0. The LRM (§6.16.9) specifies only the sign.
@@ -878,20 +1029,23 @@ int32_t rt_string_cmp(const rt_string* a, const rt_string* b);
 int32_t rt_string_icmp(const rt_string* a, const rt_string* b);
 
 // dst = src.substr(i, j): the bytes at positions i..j inclusive, or "" when the
-// range is invalid (i < 0, j < i, or j >= len; LRM §6.16.8).
-void rt_string_substr(rt_string* dst, const rt_string* src, int32_t i, int32_t j);
+// range is invalid (i < 0, j < i, or j >= len; LRM §6.16.8). `site` locates the
+// substr call for an allocation-failure report.
+void rt_string_substr(rt_string* dst, const rt_string* src, int32_t i, int32_t j, const rt_alloc_site* site);
 
-// dst = src with ASCII letters upper/lowercased. dst may alias src.
-void rt_string_toupper(rt_string* dst, const rt_string* src);
-void rt_string_tolower(rt_string* dst, const rt_string* src);
+// dst = src with ASCII letters upper/lowercased. dst may alias src. `site`
+// locates the call for an allocation-failure report.
+void rt_string_toupper(rt_string* dst, const rt_string* src, const rt_alloc_site* site);
+void rt_string_tolower(rt_string* dst, const rt_string* src, const rt_alloc_site* site);
 
 // dst = the source name of the enum member whose value equals `val`, or "" if
 // none matches (LRM §6.19.2 e.name()). `val` is the operand's must-plane bytes
 // (`vbytes` = (width+7)/8) and `values` is the `count` member values packed
 // contiguously (`vbytes` each); `names` / `lens` are the parallel name table.
-// Byte-compared, so a base wider than 64 bits works.
+// Byte-compared, so a base wider than 64 bits works. `site` locates the name()
+// call for an allocation-failure report.
 void rt_enum_name(rt_string* dst, const uint8_t* val, uint32_t vbytes, uint32_t count, const uint8_t* values,
-                  const char* const* names, const uint32_t* lens);
+                  const char* const* names, const uint32_t* lens, const rt_alloc_site* site);
 
 // s[i] = c ($.putc()): a no-op when i is out of range or (c & 0xff) == 0 — a
 // string never contains a 0 byte (LRM §6.16.2).
@@ -904,8 +1058,9 @@ uint32_t rt_string_getc(const rt_string* s, int32_t i);
 // plane_bytes(width_bits) long. Bytes are taken most-significant first and
 // every 0x00 byte is dropped (LRM §6.16: the integral value converts as a
 // string literal, and literal conversion removes \0 characters). X/Z bits are
-// read as 0 — the caller passes the val plane only.
-void rt_string_from_packed(rt_string* dst, const uint8_t* val, uint32_t width_bits);
+// read as 0 — the caller passes the val plane only. `site` locates the cast for
+// an allocation-failure report.
+void rt_string_from_packed(rt_string* dst, const uint8_t* val, uint32_t width_bits, const rt_alloc_site* site);
 
 // Packed-integral cast of a string: writes the little-endian val plane of the
 // result into `out`, which is plane_bytes(width_bits) long. Characters pack
@@ -933,15 +1088,16 @@ double rt_string_atoreal(const rt_string* s);
 // dst = sign + magnitude of `i` in the given base, lowercase digits (LRM
 // §6.16.11-6.16.14; inverse of atoi/atohex/atooct/atobin). `i`'s x/z bits are
 // read as 0 by the caller before this call, the same must-plane convention as
-// StrFromPacked.
-void rt_string_itoa(rt_string* dst, int32_t i);
-void rt_string_hextoa(rt_string* dst, int32_t i);
-void rt_string_octtoa(rt_string* dst, int32_t i);
-void rt_string_bintoa(rt_string* dst, int32_t i);
+// StrFromPacked. `site` locates the conversion for an allocation-failure report.
+void rt_string_itoa(rt_string* dst, int32_t i, const rt_alloc_site* site);
+void rt_string_hextoa(rt_string* dst, int32_t i, const rt_alloc_site* site);
+void rt_string_octtoa(rt_string* dst, int32_t i, const rt_alloc_site* site);
+void rt_string_bintoa(rt_string* dst, int32_t i, const rt_alloc_site* site);
 
 // dst = ASCII representation of r at full round-trip precision (LRM
-// §6.16.15; inverse of atoreal).
-void rt_string_realtoa(rt_string* dst, double r);
+// §6.16.15; inverse of atoreal). `site` locates the conversion for an
+// allocation-failure report.
+void rt_string_realtoa(rt_string* dst, double r, const rt_alloc_site* site);
 
 // -- Coroutine frame allocation --
 //
@@ -1143,8 +1299,9 @@ void rt_dpi_unpack_logicvec(const uint32_t* in, uint32_t nchunks, uint32_t* must
 // Copy a NUL-terminated C string into an SV string handle — the copy-out for a
 // DPI import that returns `string` (LRM 35.5.6). The C retains ownership of `p`;
 // a null `p` yields the empty string. (An SV string argument passed to C needs no
-// helper — rt_string_data() is already a valid C `const char*`.)
-void rt_dpi_str_out(rt_string* dst, const char* p);
+// helper — rt_string_data() is already a valid C `const char*`.) `site` locates
+// the DPI return for an allocation-failure report.
+void rt_dpi_str_out(rt_string* dst, const char* p, const rt_alloc_site* site);
 
 // Register the single DPI scope (LRM 35.5.3) for the svScope API — the design's
 // hierarchical name. Called once from main when the design uses DPI; also resets

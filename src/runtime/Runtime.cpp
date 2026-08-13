@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cerrno>
 #include <charconv>
@@ -775,7 +776,7 @@ char* str_data(rt_string* s) {
 // Core write path: s = the n bytes at p. p may alias s's own buffer (memmove on
 // the in-place paths; on the grow path the new buffer is filled before the old
 // one is freed).
-void str_assign(rt_string* s, const char* p, uint64_t n) {
+void str_assign(rt_string* s, const char* p, uint64_t n, const rt_alloc_site* site) {
     if (!str_is_heap(s)) {
         if (n <= str_inline_cap) {
             if (n != 0) {
@@ -785,7 +786,7 @@ void str_assign(rt_string* s, const char* p, uint64_t n) {
             s->storage[31] = static_cast<unsigned char>(str_inline_cap - n);
             return;
         }
-        char* buf = static_cast<char*>(std::malloc(n + 1));
+        char* buf = static_cast<char*>(rt_alloc_checked(n + 1, site, rt_diag_now()));
         std::memcpy(buf, p, n);
         buf[n] = 0;
         str_set_heap(s, StrHeap{ buf, n, n });
@@ -803,7 +804,7 @@ void str_assign(rt_string* s, const char* p, uint64_t n) {
     }
     // Geometric growth so repeated append-style reassignment amortizes.
     const uint64_t cap = h.cap * 2 > n ? h.cap * 2 : n;
-    char*          buf = static_cast<char*>(std::malloc(cap + 1));
+    char*          buf = static_cast<char*>(rt_alloc_checked(cap + 1, site, rt_diag_now()));
     std::memcpy(buf, p, n);
     buf[n] = 0;
     std::free(h.ptr);
@@ -813,13 +814,13 @@ void str_assign(rt_string* s, const char* p, uint64_t n) {
 // Grow s's buffer to hold at least n bytes, preserving contents and length.
 // The handle stays valid across the grow, so aliased readers of s (same handle
 // pointer) keep seeing the current bytes.
-void str_reserve(rt_string* s, uint64_t n) {
+void str_reserve(rt_string* s, uint64_t n, const rt_alloc_site* site) {
     if (!str_is_heap(s)) {
         if (n <= str_inline_cap) {
             return;
         }
         const uint64_t len = str_inline_cap - s->storage[31];
-        char*          buf = static_cast<char*>(std::malloc(n + 1));
+        char*          buf = static_cast<char*>(rt_alloc_checked(n + 1, site, rt_diag_now()));
         std::memcpy(buf, s->storage, len);
         buf[len] = 0; // preserve the NUL at byte[len] in the new buffer
         str_set_heap(s, StrHeap{ buf, len, n });
@@ -831,7 +832,7 @@ void str_reserve(rt_string* s, uint64_t n) {
     }
     // Geometric growth so repeated append-style reassignment amortizes.
     const uint64_t cap = h.cap * 2 > n ? h.cap * 2 : n;
-    char*          buf = static_cast<char*>(std::malloc(cap + 1));
+    char*          buf = static_cast<char*>(rt_alloc_checked(cap + 1, site, rt_diag_now()));
     std::memcpy(buf, h.ptr, h.len);
     buf[h.len] = 0;
     std::free(h.ptr);
@@ -866,8 +867,9 @@ struct StrScratch {
     char  stack[256];
     char* buf;
 
-    explicit StrScratch(uint64_t n) {
-        buf = n <= sizeof(stack) ? stack : static_cast<char*>(std::malloc(n));
+    explicit StrScratch(uint64_t n, const rt_alloc_site* site) {
+        buf = n <= sizeof(stack) ? stack
+                                 : static_cast<char*>(rt_alloc_checked(n, site, rt_diag_now()));
     }
     ~StrScratch() {
         if (buf != stack) {
@@ -969,21 +971,22 @@ void rt_elem_deinit(const rt_elem_ops* o, void* p) {
     }
 }
 
-void rt_elem_copy(const rt_elem_ops* o, void* dst, const void* src) {
+void rt_elem_copy(const rt_elem_ops* o, void* dst, const void* src, const rt_alloc_site* site) {
     switch (o->kind) {
         case rt_elem_pod:
             std::memcpy(dst, src, static_cast<size_t>(o->stride));
             return;
         case rt_elem_string:
-            rt_string_assign(static_cast<rt_string*>(dst), static_cast<const rt_string*>(src));
+            rt_string_assign(static_cast<rt_string*>(dst), static_cast<const rt_string*>(src),
+                             site);
             return;
         case rt_elem_dynarr:
             rt_dynarr_assign(static_cast<rt_dynarr*>(dst), static_cast<const rt_dynarr*>(src),
-                             o->inner);
+                             o->inner, site);
             return;
         case rt_elem_queue:
             rt_queue_assign(static_cast<rt_queue*>(dst), static_cast<const rt_queue*>(src),
-                            o->inner);
+                            o->inner, site);
             return;
         case rt_elem_aggregate:
             // Deep-assign every heap leaf (dst's owned buffers are reused per
@@ -992,7 +995,7 @@ void rt_elem_copy(const rt_elem_ops* o, void* dst, const void* src) {
             for (uint32_t i = 0; i < o->nleaves; ++i) {
                 rt_elem_copy(o->leaves[i].ops,
                              static_cast<uint8_t*>(dst) + o->leaves[i].offset,
-                             static_cast<const uint8_t*>(src) + o->leaves[i].offset);
+                             static_cast<const uint8_t*>(src) + o->leaves[i].offset, site);
             }
             {
                 uint64_t pos = 0;
@@ -1021,51 +1024,91 @@ bool elem_managed(const rt_elem_ops* o) {
     return o->kind != rt_elem_pod;
 }
 
+// Whether an element's power-on image is all zero bytes. True of every 2-state
+// element; false of a 4-state one (its x image sets the may plane) and of a
+// string (an empty inline string records its remaining capacity). A zero image
+// is precisely what calloc returns, so a caller filling `count` of them can
+// allocate zeroed instead and skip the fill -- which for a large array means
+// the pages arrive on first touch rather than all at once.
+bool proto_is_zero(const rt_elem_ops* o) {
+    const auto* p = static_cast<const uint8_t*>(o->proto);
+    for (uint64_t i = 0; i < o->stride; ++i) {
+        if (p[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 // -- Dynamic arrays (LRM 7.5) --
 
-extern "C" void rt_dynarr_new(rt_dynarr* h, const rt_elem_ops* ops, uint64_t n) {
+extern "C" void rt_dynarr_new(rt_dynarr* h, const rt_elem_ops* ops, int64_t n,
+                              const rt_alloc_site* site) {
+    if (n < 0) {
+        rt_alloc_negative(n, site, rt_diag_now());
+    }
     rt_dynarr_delete(h, ops);
     if (n == 0) {
         return;
     }
+    const uint64_t count  = static_cast<uint64_t>(n);
     const uint64_t stride = ops->stride;
-    auto* buf = static_cast<uint8_t*>(std::malloc(static_cast<size_t>(n * stride)));
-    for (uint64_t i = 0; i < n; ++i) {
+    // Scanning the prototype costs `stride` bytes against a fill of
+    // `count * stride`, so it is worth it for every array but a singleton.
+    if (count > 1 && proto_is_zero(ops)) {
+        h->data = rt_zalloc_elems_checked(count, stride, site, rt_diag_now());
+        h->len  = count;
+        return;
+    }
+    auto* buf = static_cast<uint8_t*>(rt_alloc_elems_checked(count, stride, site, rt_diag_now()));
+    for (uint64_t i = 0; i < count; ++i) {
         std::memcpy(buf + i * stride, ops->proto, static_cast<size_t>(stride));
     }
     h->data = buf;
-    h->len  = n;
+    h->len  = count;
 }
 
-extern "C" void rt_dynarr_new_copy(rt_dynarr* h, const rt_elem_ops* ops, uint64_t n,
-                                   const rt_dynarr* src) {
+extern "C" void rt_dynarr_new_copy(rt_dynarr* h, const rt_elem_ops* ops, int64_t n,
+                                   const rt_dynarr* src, const rt_alloc_site* site) {
+    if (n < 0) {
+        rt_alloc_negative(n, site, rt_diag_now());
+    }
     // Build the new buffer before destroying `h`'s old one: a self-resize
     // (`a = new[n](a)`) aliases src == h, so the old elements must stay live
     // through the deep copy.
+    const uint64_t count  = static_cast<uint64_t>(n);
     const uint64_t stride = ops->stride;
-    const uint64_t copy   = src->len < n ? src->len : n;
-    auto*          buf  = n == 0 ? nullptr : static_cast<uint8_t*>(std::malloc(static_cast<size_t>(n * stride)));
+    const uint64_t copy   = src->len < count ? src->len : count;
+    // A grow-resize of plain elements fills the tail with the prototype; when
+    // that image is zero the allocator can supply it, which for a large grow is
+    // the difference between touching every new page and touching none.
+    const bool zeroed = !elem_managed(ops) && count > copy + 1 && proto_is_zero(ops);
+    uint8_t* buf = static_cast<uint8_t*>(
+        zeroed ? rt_zalloc_elems_checked(count, stride, site, rt_diag_now())
+               : rt_alloc_elems_checked(count, stride, site, rt_diag_now()));
     if (!elem_managed(ops)) {
         if (copy != 0) {
             std::memcpy(buf, src->data, static_cast<size_t>(copy * stride));
         }
-        for (uint64_t i = copy; i < n; ++i) {
-            std::memcpy(buf + i * stride, ops->proto, static_cast<size_t>(stride));
+        if (!zeroed) {
+            for (uint64_t i = copy; i < count; ++i) {
+                std::memcpy(buf + i * stride, ops->proto, static_cast<size_t>(stride));
+            }
         }
     } else {
         const auto* sdata = static_cast<const uint8_t*>(src->data);
-        for (uint64_t i = 0; i < n; ++i) {
+        for (uint64_t i = 0; i < count; ++i) {
             rt_elem_init(ops, buf + i * stride);
             if (i < copy) {
-                rt_elem_copy(ops, buf + i * stride, sdata + i * stride);
+                rt_elem_copy(ops, buf + i * stride, sdata + i * stride, site);
             }
         }
     }
     rt_dynarr_delete(h, ops);
     h->data = buf;
-    h->len  = n;
+    h->len  = count;
 }
 
 extern "C" void rt_dynarr_delete(rt_dynarr* h, const rt_elem_ops* ops) {
@@ -1080,7 +1123,8 @@ extern "C" void rt_dynarr_delete(rt_dynarr* h, const rt_elem_ops* ops) {
     h->len  = 0;
 }
 
-extern "C" void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, const rt_elem_ops* ops) {
+extern "C" void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, const rt_elem_ops* ops,
+                                 const rt_alloc_site* site) {
     if (dst == src) {
         return;
     }
@@ -1089,14 +1133,15 @@ extern "C" void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, const rt_
         return;
     }
     const uint64_t stride = ops->stride;
-    auto* buf = static_cast<uint8_t*>(std::malloc(static_cast<size_t>(src->len * stride)));
+    auto* buf = static_cast<uint8_t*>(
+        rt_alloc_elems_checked(src->len, stride, site, rt_diag_now()));
     if (!elem_managed(ops)) {
         std::memcpy(buf, src->data, static_cast<size_t>(src->len * stride));
     } else {
         const auto* sdata = static_cast<const uint8_t*>(src->data);
         for (uint64_t i = 0; i < src->len; ++i) {
             rt_elem_init(ops, buf + i * stride);
-            rt_elem_copy(ops, buf + i * stride, sdata + i * stride);
+            rt_elem_copy(ops, buf + i * stride, sdata + i * stride, site);
         }
     }
     dst->data = buf;
@@ -1252,7 +1297,7 @@ uint8_t* q_elem(const rt_queue* h, uint64_t stride, uint64_t i) {
 // Ensure capacity for at least `need` elements, relocating the live elements to
 // a contiguous head == 0 layout when a larger buffer is allocated. Geometric
 // growth keeps repeated push amortised O(1).
-void q_reserve(rt_queue* h, uint64_t stride, uint64_t need) {
+void q_reserve(rt_queue* h, uint64_t stride, uint64_t need, const rt_alloc_site* site) {
     if (need <= h->cap) {
         return;
     }
@@ -1260,7 +1305,7 @@ void q_reserve(rt_queue* h, uint64_t stride, uint64_t need) {
     if (newcap < need) {
         newcap = need;
     }
-    auto* buf = static_cast<uint8_t*>(std::malloc(static_cast<size_t>(newcap * stride)));
+    auto* buf = static_cast<uint8_t*>(rt_alloc_elems_checked(newcap, stride, site, rt_diag_now()));
     for (uint64_t i = 0; i < h->len; ++i) {
         std::memcpy(buf + i * stride, q_elem(h, stride, i), static_cast<size_t>(stride));
     }
@@ -1335,31 +1380,31 @@ static void q_apply_bound_ops(rt_queue* h, const rt_elem_ops* ops, uint64_t boun
 }
 
 extern "C" void rt_queue_push_back(rt_queue* h, const rt_elem_ops* ops, uint64_t bound,
-                                   const void* elem) {
+                                   const void* elem, const rt_alloc_site* site) {
     const uint64_t stride = ops->stride;
-    q_reserve(h, stride, h->len + 1);
+    q_reserve(h, stride, h->len + 1, site);
     void* slot = q_elem(h, stride, h->len);
     if (ops->kind == rt_elem_pod) {
         std::memcpy(slot, elem, static_cast<size_t>(stride));
     } else {
         rt_elem_init(ops, slot);
-        rt_elem_copy(ops, slot, elem);
+        rt_elem_copy(ops, slot, elem, site);
     }
     h->len += 1;
     q_apply_bound_ops(h, ops, bound);
 }
 
 extern "C" void rt_queue_push_front(rt_queue* h, const rt_elem_ops* ops, uint64_t bound,
-                                    const void* elem) {
+                                    const void* elem, const rt_alloc_site* site) {
     const uint64_t stride = ops->stride;
-    q_reserve(h, stride, h->len + 1);
+    q_reserve(h, stride, h->len + 1, site);
     h->head = (h->head + h->cap - 1) % h->cap;
     void* slot = q_elem(h, stride, 0);
     if (ops->kind == rt_elem_pod) {
         std::memcpy(slot, elem, static_cast<size_t>(stride));
     } else {
         rt_elem_init(ops, slot);
-        rt_elem_copy(ops, slot, elem);
+        rt_elem_copy(ops, slot, elem, site);
     }
     h->len += 1;
     q_apply_bound_ops(h, ops, bound);
@@ -1385,12 +1430,12 @@ extern "C" void rt_queue_pop_front(rt_queue* h, const rt_elem_ops* ops, void* ou
 }
 
 extern "C" void rt_queue_insert(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, uint64_t i,
-                                const void* elem) {
+                                const void* elem, const rt_alloc_site* site) {
     if (i > h->len) {
         return;
     }
     const uint64_t stride = ops->stride;
-    q_reserve(h, stride, h->len + 1);
+    q_reserve(h, stride, h->len + 1, site);
     // Shift [i, len) up by one to open a slot at i (relocation, raw memcpy).
     for (uint64_t j = h->len; j > i; --j) {
         std::memcpy(q_elem(h, stride, j), q_elem(h, stride, j - 1), static_cast<size_t>(stride));
@@ -1400,7 +1445,7 @@ extern "C" void rt_queue_insert(rt_queue* h, const rt_elem_ops* ops, uint64_t bo
         std::memcpy(slot, elem, static_cast<size_t>(stride));
     } else {
         rt_elem_init(ops, slot);
-        rt_elem_copy(ops, slot, elem);
+        rt_elem_copy(ops, slot, elem, site);
     }
     h->len += 1;
     q_apply_bound_ops(h, ops, bound);
@@ -1434,7 +1479,8 @@ extern "C" void rt_queue_delete_all(rt_queue* h, const rt_elem_ops* ops) {
     h->cap  = 0;
 }
 
-extern "C" void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_elem_ops* ops) {
+extern "C" void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_elem_ops* ops,
+                                const rt_alloc_site* site) {
     if (dst == src) {
         return;
     }
@@ -1443,7 +1489,8 @@ extern "C" void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_ele
         return;
     }
     const uint64_t stride = ops->stride;
-    auto* buf = static_cast<uint8_t*>(std::malloc(static_cast<size_t>(src->len * stride)));
+    auto* buf = static_cast<uint8_t*>(
+        rt_alloc_elems_checked(src->len, stride, site, rt_diag_now()));
     if (ops->kind == rt_elem_pod) {
         for (uint64_t i = 0; i < src->len; ++i) {
             std::memcpy(buf + i * stride, q_elem(src, stride, i), static_cast<size_t>(stride));
@@ -1451,7 +1498,7 @@ extern "C" void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_ele
     } else {
         for (uint64_t i = 0; i < src->len; ++i) {
             rt_elem_init(ops, buf + i * stride);
-            rt_elem_copy(ops, buf + i * stride, q_elem(src, stride, i));
+            rt_elem_copy(ops, buf + i * stride, q_elem(src, stride, i), site);
         }
     }
     dst->base = buf;
@@ -1465,20 +1512,21 @@ extern "C" void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_ele
 // so it cannot go through rt_queue_assign, whose struct layout differs. An empty
 // source clears the queue to size 0.
 extern "C" void rt_queue_assign_dynarr(rt_queue* dst, const rt_dynarr* src,
-                                       const rt_elem_ops* ops) {
+                                       const rt_elem_ops* ops, const rt_alloc_site* site) {
     rt_queue_delete_all(dst, ops);
     if (src->len == 0) {
         return;
     }
     const uint64_t stride = ops->stride;
     const auto*    sdata  = static_cast<const uint8_t*>(src->data);
-    auto* buf = static_cast<uint8_t*>(std::malloc(static_cast<size_t>(src->len * stride)));
+    auto* buf = static_cast<uint8_t*>(
+        rt_alloc_elems_checked(src->len, stride, site, rt_diag_now()));
     if (ops->kind == rt_elem_pod) {
         std::memcpy(buf, sdata, static_cast<size_t>(src->len * stride));
     } else {
         for (uint64_t i = 0; i < src->len; ++i) {
             rt_elem_init(ops, buf + i * stride);
-            rt_elem_copy(ops, buf + i * stride, sdata + i * stride);
+            rt_elem_copy(ops, buf + i * stride, sdata + i * stride, site);
         }
     }
     dst->base = buf;
@@ -1489,7 +1537,7 @@ extern "C" void rt_queue_assign_dynarr(rt_queue* dst, const rt_dynarr* src,
 
 extern "C" void rt_queue_append_range(rt_queue* dst, const rt_queue* src,
                                       const rt_elem_ops* ops, uint64_t bound, int64_t lo,
-                                      int64_t hi) {
+                                      int64_t hi, const rt_alloc_site* site) {
     if (src->len == 0) {
         return;
     }
@@ -1504,7 +1552,8 @@ extern "C" void rt_queue_append_range(rt_queue* dst, const rt_queue* src,
     // deinit/copy-constructs a managed element). dst never aliases src, so
     // growing dst cannot relocate src's buffer mid-loop.
     for (int64_t i = lo; i <= hi; ++i) {
-        rt_queue_push_back(dst, ops, bound, q_elem(src, ops->stride, static_cast<uint64_t>(i)));
+        rt_queue_push_back(dst, ops, bound, q_elem(src, ops->stride, static_cast<uint64_t>(i)),
+                           site);
     }
 }
 
@@ -1517,7 +1566,7 @@ extern "C" void rt_queue_append_range(rt_queue* dst, const rt_queue* src,
 extern "C" void rt_container_format_p(rt_string* out, const void* handle, int32_t is_queue,
                                       int32_t kind, uint32_t width, uint32_t is_signed,
                                       uint32_t four_state, uint32_t has_z, uint32_t z_off,
-                                      uint64_t stride) {
+                                      uint64_t stride, const rt_alloc_site* site) {
     uint64_t       count = 0;
     const uint8_t* base  = nullptr; // dynamic-array element base (linear)
     const rt_queue* q    = nullptr; // queue handle (ring indexing)
@@ -1578,7 +1627,7 @@ extern "C" void rt_container_format_p(rt_string* out, const void* handle, int32_
         render_arg(s, a, spec);
     }
     s += '}';
-    rt_string_assign_bytes(out, s.data(), static_cast<uint64_t>(s.size()));
+    rt_string_assign_bytes(out, s.data(), static_cast<uint64_t>(s.size()), site);
 }
 
 // Logical equality (`==`) of two queues / dynamic arrays (LRM 11.2.2, 11.4.5).
@@ -1801,7 +1850,7 @@ extern "C" void* rt_assoc_get_ptr(rt_assoc* h, const uint8_t* kptr, uint32_t kle
 }
 
 extern "C" void* rt_assoc_put_ptr(rt_assoc* h, const rt_elem_ops* ops, const uint8_t* kptr,
-                                  uint32_t klen) {
+                                  uint32_t klen, const rt_alloc_site* /*site*/) {
     AssocMap* m = assoc_impl(h);
     if (m == nullptr) {
         m       = new AssocMap();
@@ -1912,7 +1961,7 @@ extern "C" int rt_assoc_prev(rt_assoc* h, const uint8_t* cur_ptr, uint32_t cur_l
     return 1;
 }
 
-extern "C" void rt_assoc_assign(rt_assoc* dst, const rt_assoc* src, const rt_elem_ops* ops) {
+extern "C" void rt_assoc_assign(rt_assoc* dst, const rt_assoc* src, const rt_elem_ops* ops, const rt_alloc_site* site) {
     if (dst == src) {
         return;
     }
@@ -1930,7 +1979,7 @@ extern "C" void rt_assoc_assign(rt_assoc* dst, const rt_assoc* src, const rt_ele
         slot.resize(static_cast<size_t>(ops->stride));
         if (managed) {
             rt_elem_init(ops, slot.data());
-            rt_elem_copy(ops, slot.data(), kv.second.data());
+            rt_elem_copy(ops, slot.data(), kv.second.data(), site);
         } else {
             std::memcpy(slot.data(), kv.second.data(), static_cast<size_t>(ops->stride));
         }
@@ -2393,13 +2442,14 @@ extern "C" void rt_sformat(uint8_t* mm, uint8_t* z, uint32_t width, const char* 
                         static_cast<uint32_t>(out.size()), (flags & 1u) != 0);
 }
 
-extern "C" void rt_sformat_str(rt_string* dst, const char* fmt, uint32_t argc, const rt_arg* argv) {
+extern "C" void rt_sformat_str(rt_string* dst, const char* fmt, uint32_t argc, const rt_arg* argv,
+                               const rt_alloc_site* site) {
     std::string out;
     render(out, fmt, argc, argv);
-    rt_string_assign_bytes(dst, out.data(), out.size());
+    rt_string_assign_bytes(dst, out.data(), out.size(), site);
 }
 
-extern "C" int32_t rt_fgets_str(rt_string* dst, int32_t fd) {
+extern "C" int32_t rt_fgets_str(rt_string* dst, int32_t fd, const rt_alloc_site* site) {
     io_ensure_init();
     std::FILE* f = fd_stream(fd);
     if (f == nullptr) {
@@ -2421,7 +2471,7 @@ extern "C" int32_t rt_fgets_str(rt_string* dst, int32_t fd) {
     if (line.empty()) {
         return 0;
     }
-    rt_string_assign_bytes(dst, line.data(), line.size());
+    rt_string_assign_bytes(dst, line.data(), line.size(), site);
     return static_cast<int32_t>(line.size());
 }
 
@@ -2447,7 +2497,7 @@ extern "C" int32_t rt_ferror(int32_t fd, uint8_t* mm, uint8_t* z, uint32_t width
     return code;
 }
 
-extern "C" int32_t rt_ferror_str(int32_t fd, rt_string* dst) {
+extern "C" int32_t rt_ferror_str(int32_t fd, rt_string* dst, const rt_alloc_site* site) {
     io_ensure_init();
     std::FILE*  f    = fd_stream(fd);
     int         code = 0;
@@ -2459,7 +2509,7 @@ extern "C" int32_t rt_ferror_str(int32_t fd, rt_string* dst) {
         code = errno;
         msg  = std::strerror(errno);
     }
-    rt_string_assign_bytes(dst, msg, std::strlen(msg));
+    rt_string_assign_bytes(dst, msg, std::strlen(msg), site);
     return code;
 }
 
@@ -2993,6 +3043,63 @@ fmt::text_style styled(fmt::text_style s) {
     return diag_color() ? s : fmt::text_style{};
 }
 
+// One run on a diagnostic's marker row: `width` copies of `ch` starting under
+// 1-based source column `column`. A mark at column 0 (nothing to point at) is
+// dropped by print_snippet.
+struct SnippetMark {
+    int32_t column;
+    size_t  width;
+    char    ch;
+};
+
+// The source line a marker row will be measured against. A tab is one column to
+// slang, so it must occupy one column here too or the caret drifts. Rendering it
+// as a single space keeps the arithmetic exact at the cost of the source's own
+// indentation width.
+std::string snippet_text(const char* src) {
+    std::string text = src;
+    std::replace(text.begin(), text.end(), '\t', ' ');
+    return text;
+}
+
+// The "<n> | <source>" row and, under it, the marker row carrying `marks`. The
+// row is built as one padded string so two marks cannot fight over spacing;
+// later marks overwrite earlier ones where they overlap. The text row puts a
+// space after the bar, so source column N is offset N in the marker row.
+void print_snippet(const std::string& text, int32_t line_no,
+                   std::initializer_list<SnippetMark> marks, const fmt::text_style& loc,
+                   const fmt::text_style& caret) {
+    const std::string number = std::to_string(line_no);
+    const std::string gutter(number.size(), ' ');
+    fmt::print(stderr, loc, "{} |", number);
+    fmt::print(stderr, " {}", text);
+    fmt::print(stderr, "\n");
+    std::string row;
+    for (const SnippetMark& m : marks) {
+        if (m.column <= 0 || static_cast<size_t>(m.column) > text.size() + 1) {
+            continue;
+        }
+        const size_t at = static_cast<size_t>(m.column);
+        const size_t n  = std::min(m.width, text.size() + 1 - at);
+        if (row.size() < at + n) {
+            row.resize(at + n, ' ');
+        }
+        row.replace(at, n, n, m.ch);
+    }
+    if (row.empty()) {
+        return;
+    }
+    fmt::print(stderr, loc, "{} |", gutter);
+    fmt::print(stderr, caret, "{}", row);
+    fmt::print(stderr, "\n");
+}
+
+// Width of a recorded [column, end_column) source extent; 1 when the frontend
+// recorded no extent, which draws a bare caret.
+size_t mark_width(int32_t column, int32_t end_column) {
+    return end_column > column ? static_cast<size_t>(end_column - column) : 1;
+}
+
 } // namespace
 
 extern "C" void rt_bounds_report(const rt_bounds_site* site, int64_t index, int64_t extent,
@@ -3063,38 +3170,12 @@ extern "C" void rt_bounds_report(const rt_bounds_site* site, int64_t index, int6
     fmt::print(stderr, loc, "{}", site->where);
     fmt::print(stderr, "\n");
     if (site->line != nullptr && site->line[0] != '\0') {
-        // A tab is one column to slang, so it must occupy one column here too or
-        // the caret drifts. Rendering it as a single space keeps the arithmetic
-        // exact at the cost of the source's own indentation width.
-        std::string text = site->line;
-        std::replace(text.begin(), text.end(), '\t', ' ');
-        const std::string number = std::to_string(site->line_no);
-        const std::string gutter(number.size(), ' ');
-        fmt::print(stderr, loc, "{} |", number);
-        fmt::print(stderr, " {}", text);
-        fmt::print(stderr, "\n");
+        const std::string text = snippet_text(site->line);
         // The marker row: `^^^` under the index expression, `---` under the
-        // array it indexes when both landed on this line. Built as one padded
-        // string so the two cannot fight over spacing. The text row puts a space
-        // after the bar, so source column N is offset N in the row.
-        std::string marks;
-        const auto  place = [&](int32_t col, size_t n, char ch) {
-            if (col <= 0 || static_cast<size_t>(col) > text.size() + 1) {
-                return;
-            }
-            const size_t at = static_cast<size_t>(col);
-            n               = std::min(n, text.size() + 1 - static_cast<size_t>(col));
-            if (marks.size() < at + n) {
-                marks.resize(at + n, ' ');
-            }
-            marks.replace(at, n, n, ch);
-        };
-        // Width of a recorded [col, end) extent; 1 when nothing was recorded.
-        const auto width = [](int32_t col, int32_t end) -> size_t {
-            return end > col ? static_cast<size_t>(end - col) : 1;
-        };
+        // array it indexes when both landed on this line.
+        SnippetMark       acc{ 0, 0, '-' };
         if (site->acc_line_no == site->line_no) {
-            size_t n = width(site->acc_column, site->acc_end_column);
+            size_t n = mark_width(site->acc_column, site->acc_end_column);
             if (n == 1) {
                 // No extent recorded for the indexed expression. Fall back to
                 // its name, and only where the source really spells it at that
@@ -3108,14 +3189,13 @@ extern "C" void rt_bounds_report(const rt_bounds_site* site, int64_t index, int6
                     n = leaf.size();
                 }
             }
-            place(site->acc_column, n, '-');
+            acc = SnippetMark{ site->acc_column, n, '-' };
         }
-        place(site->column, width(site->column, site->end_column), '^');
-        if (!marks.empty()) {
-            fmt::print(stderr, loc, "{} |", gutter);
-            fmt::print(stderr, caret, "{}", marks);
-            fmt::print(stderr, "\n");
-        }
+        print_snippet(text, site->line_no,
+                      { acc,
+                        SnippetMark{ site->column, mark_width(site->column, site->end_column),
+                                     '^' } },
+                      loc, caret);
     }
     fmt::print(stderr, tag, "  note:");
     fmt::print(stderr, body, " {} '{}' at {}", write ? "write to" : "read of", site->name, when);
@@ -3126,6 +3206,209 @@ extern "C" void rt_bounds_report(const rt_bounds_site* site, int64_t index, int6
         fmt::print(stderr, "\n");
     }
     std::fflush(stderr);
+}
+
+// ---- Null class-handle dereference (LRM 8.4) ----
+
+extern "C" void rt_null_handle(const rt_null_site* site, uint64_t now) {
+    // Reached only from the guard the backend plants ahead of every class-handle
+    // dereference and every virtual dispatch. LRM 8.4 leaves the result of an
+    // access through a null handle indeterminate and permits an implementation
+    // error; the untrapped alternative is an inttoptr to address zero and a
+    // segfault carrying nothing that points back at the design. Laid out like the
+    // bounds report -- what went wrong, where, the offending line under a caret,
+    // then the notes -- except that this one is fatal.
+    io_ensure_init();
+    std::fflush(stdout);
+
+    const fmt::text_style label = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::red));
+    const fmt::text_style head  = styled(fmt::emphasis::bold);
+    const fmt::text_style loc   = styled(fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style tag   = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style body  = styled(fmt::emphasis::faint);
+    const fmt::text_style caret = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::red));
+
+    std::string when;
+    append_finish_time(when, now);
+    // Each styled run stops short of the newline: fmt closes a style after
+    // everything it formatted, and a reset that lands past the line break leaves
+    // the style live across it.
+    fmt::print(stderr, label, "fatal:");
+    fmt::print(stderr, head, " dereference of a null class handle");
+    fmt::print(stderr, "\n");
+    fmt::print(stderr, loc, "{}", site->where);
+    fmt::print(stderr, "\n");
+    if (site->line != nullptr && site->line[0] != '\0') {
+        const std::string text = snippet_text(site->line);
+        print_snippet(text, site->line_no,
+                      { SnippetMark{ site->column, mark_width(site->column, site->end_column),
+                                     '^' } },
+                      loc, caret);
+    }
+    fmt::print(stderr, tag, "  note:");
+    fmt::print(stderr, body, " the handle holds no object at {} -- it was never assigned one, or "
+                             "was assigned null",
+               when);
+    fmt::print(stderr, "\n");
+    fmt::print(stderr, tag, "  note:");
+    fmt::print(stderr, body, " construct the object with `new` before reaching a member "
+                             "through it (LRM 8.4)");
+    fmt::print(stderr, "\n");
+    std::fflush(stderr);
+
+    rt_vcd_close();
+    rt_finishing = 1;
+    // Same reasoning as rt_oscillation_abort: there is no defined state to hand
+    // back to the host mid-instant, and std::exit keeps the nonzero status that
+    // distinguishes this from a clean run.
+    std::exit(1);
+}
+
+// ---- Checked heap allocation ----
+
+namespace {
+
+// The wheel rt_sim_run is currently driving, so a cold diagnostic can report a
+// simulation time without every allocating entry point carrying one across the
+// ABI. Written once per run on the simulation thread and read only from a
+// failure path.
+const rt_wheel* g_diag_wheel = nullptr;
+
+// The noun a headline names the failing object by. Callers say "this <noun>"
+// rather than "a <noun>": one phrasing serves "queue" and "associative array"
+// alike, and it pairs with the caret already pointing at the statement.
+const char* site_noun(const rt_alloc_site* site) {
+    return site != nullptr && site->what != nullptr ? site->what : "value";
+}
+
+// Shared body of every heap-failure fatal: the compiler-diagnostic block
+// (headline, location, source line under a caret) plus the notes, then exit.
+// The caller composes the whole headline, so each failure leads with what is
+// wrong with the size rather than with the machinery that noticed.
+[[noreturn]] void alloc_fatal(const rt_alloc_site* site, uint64_t now, const std::string& headline) {
+    io_ensure_init();
+    std::fflush(stdout);
+
+    const fmt::text_style label = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::red));
+    const fmt::text_style head  = styled(fmt::emphasis::bold);
+    const fmt::text_style loc   = styled(fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style tag   = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style body  = styled(fmt::emphasis::faint);
+    const fmt::text_style caret = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::red));
+
+    const char* where = site != nullptr && site->where != nullptr ? site->where : "<unknown>";
+
+    std::string when;
+    append_finish_time(when, now);
+    // Each styled run stops short of the newline: fmt closes a style after
+    // everything it formatted, and a reset past the line break leaks the style.
+    fmt::print(stderr, label, "fatal:");
+    fmt::print(stderr, head, " {}", headline);
+    fmt::print(stderr, "\n");
+    fmt::print(stderr, loc, "{}", where);
+    fmt::print(stderr, "\n");
+    if (site != nullptr && site->line != nullptr && site->line[0] != '\0') {
+        const std::string text = snippet_text(site->line);
+        print_snippet(text, site->line_no,
+                      { SnippetMark{ site->column, mark_width(site->column, site->end_column),
+                                     '^' } },
+                      loc, caret);
+    }
+    fmt::print(stderr, tag, "  note:");
+    fmt::print(stderr, body, " at {}", when);
+    fmt::print(stderr, "\n");
+    std::fflush(stderr);
+
+    rt_vcd_close();
+    rt_finishing = 1;
+    // Same reasoning as rt_oscillation_abort: no defined state to hand back, and
+    // a nonzero status distinguishes this from a clean run.
+    std::exit(1);
+}
+
+// Render a byte count the way a person reads one: exact, plus a rounded binary
+// magnitude once it stops being legible on its own.
+std::string bytes_text(uint64_t n) {
+    static const char* const unit[] = { "bytes", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB" };
+    if (n < 1024) {
+        return fmt::format("{} bytes", n);
+    }
+    double      v = static_cast<double>(n);
+    std::size_t u = 0;
+    while (v >= 1024.0 && u + 1 < sizeof(unit) / sizeof(unit[0])) {
+        v /= 1024.0;
+        ++u;
+    }
+    return fmt::format("{} bytes ({:.1f} {})", n, v, unit[u]);
+}
+
+} // namespace
+
+extern "C" uint64_t rt_diag_now(void) {
+    return g_diag_wheel != nullptr ? rt_wheel_now(g_diag_wheel) : 0;
+}
+
+namespace {
+
+// The body behind both public entry points. `zeroed` picks calloc, whose large
+// requests come back as untouched zero pages; the diagnostics are identical
+// because the failure modes are.
+void* alloc_bytes(uint64_t size, const rt_alloc_site* site, uint64_t now, bool zeroed) {
+    if (size == 0) {
+        // Every caller treats a null buffer with a zero length as the empty
+        // container, and malloc(0) may hand back a pointer that must still be
+        // freed. Normalizing here keeps the "null means empty" invariant.
+        return nullptr;
+    }
+    // size_t is the only ceiling: a 32-bit host cannot address a >4 GiB buffer
+    // however much the design asks for, and saying so beats a truncating cast.
+    if (size > static_cast<uint64_t>(SIZE_MAX)) {
+        alloc_fatal(site, now,
+                    fmt::format("size for this {} exceeds what this machine can address: {}",
+                                site_noun(site), bytes_text(size)));
+    }
+    const size_t bytes = static_cast<size_t>(size);
+    void*        p     = zeroed ? std::calloc(bytes, 1) : std::malloc(bytes);
+    if (p == nullptr) {
+        alloc_fatal(site, now,
+                    fmt::format("out of memory for this {}: the system refused {}",
+                                site_noun(site), bytes_text(size)));
+    }
+    return p;
+}
+
+} // namespace
+
+extern "C" void* rt_alloc_checked(uint64_t size, const rt_alloc_site* site, uint64_t now) {
+    return alloc_bytes(size, site, now, /*zeroed=*/false);
+}
+
+extern "C" uint64_t rt_alloc_elems_size(uint64_t count, uint64_t stride, const rt_alloc_site* site,
+                                        uint64_t now) {
+    uint64_t size = 0;
+    if (__builtin_mul_overflow(count, stride, &size)) {
+        alloc_fatal(site, now,
+                    fmt::format("size for this {} overflows: {} elements of {} bytes exceeds the "
+                                "largest object this machine can address",
+                                site_noun(site), count, stride));
+    }
+    return size;
+}
+
+extern "C" void* rt_alloc_elems_checked(uint64_t count, uint64_t stride, const rt_alloc_site* site,
+                                        uint64_t now) {
+    return rt_alloc_checked(rt_alloc_elems_size(count, stride, site, now), site, now);
+}
+
+extern "C" void* rt_zalloc_elems_checked(uint64_t count, uint64_t stride,
+                                         const rt_alloc_site* site, uint64_t now) {
+    return alloc_bytes(rt_alloc_elems_size(count, stride, site, now), site, now,
+                       /*zeroed=*/true);
+}
+
+extern "C" void rt_alloc_negative(int64_t n, const rt_alloc_site* site, uint64_t now) {
+    alloc_fatal(site, now,
+                fmt::format("invalid negative size for this {}: {}", site_noun(site), n));
 }
 
 // ---- Deferred immediate assertion reports (LRM 16.4) ----
@@ -3228,8 +3511,12 @@ extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*)
     // the settled design state on BOTH exit paths. `drain` now returns normally
     // whether it ran out of work or a $finish stopped it, so there is one path.
     rt_finishing = 0; // a prior run in this process may have set it
+    // Publish the wheel so a cold diagnostic (an allocation failure) can report
+    // the simulation time without every allocating call carrying one.
+    g_diag_wheel = static_cast<const rt_wheel*>(wheel);
     drain(state, wheel);
     finals(state, wheel);
+    g_diag_wheel = nullptr;
     sim_teardown();
 }
 
@@ -3956,15 +4243,15 @@ extern "C" void rt_string_deinit(rt_string* s) {
     s->storage[31] = str_inline_cap;
 }
 
-extern "C" void rt_string_assign(rt_string* dst, const rt_string* src) {
+extern "C" void rt_string_assign(rt_string* dst, const rt_string* src, const rt_alloc_site* site) {
     if (dst == src) {
         return;
     }
-    str_assign(dst, str_data(src), str_len(src));
+    str_assign(dst, str_data(src), str_len(src), site);
 }
 
-extern "C" void rt_string_assign_bytes(rt_string* dst, const char* p, uint64_t n) {
-    str_assign(dst, p, n);
+extern "C" void rt_string_assign_bytes(rt_string* dst, const char* p, uint64_t n, const rt_alloc_site* site) {
+    str_assign(dst, p, n, site);
 }
 
 extern "C" uint64_t rt_string_len(const rt_string* s) {
@@ -3975,7 +4262,7 @@ extern "C" const char* rt_string_data(const rt_string* s) {
     return str_data(s);
 }
 
-extern "C" void rt_string_concat(rt_string* dst, const rt_string* const* parts, uint32_t n) {
+extern "C" void rt_string_concat(rt_string* dst, const rt_string* const* parts, uint32_t n, const rt_alloc_site* site) {
     // Aliasing exists only as identical handle pointers: distinct handles never
     // share a buffer (every assignment deep-copies). Scan for dst among the
     // parts; anything but a prefix occurrence falls back to a scratch build.
@@ -3995,7 +4282,7 @@ extern "C" void rt_string_concat(rt_string* dst, const rt_string* const* parts, 
         // stored length is only updated after the copies, so their str_len is
         // the pre-call value too.
         const uint64_t skip = dst_at == 0 ? str_len(dst) : 0;
-        str_reserve(dst, total);
+        str_reserve(dst, total, site);
         char*    out = str_data(dst);
         uint64_t off = skip;
         for (uint32_t k = dst_at == 0 ? 1 : 0; k < n; ++k) {
@@ -4008,24 +4295,28 @@ extern "C" void rt_string_concat(rt_string* dst, const rt_string* const* parts, 
     }
     // dst appears at a later position (s = {c, s}): its bytes sit mid-result,
     // so prefix writes would clobber them. Build in scratch.
-    StrScratch scratch(total);
+    StrScratch scratch(total, site);
     uint64_t   off = 0;
     for (uint32_t k = 0; k < n; ++k) {
         const uint64_t len = str_len(parts[k]);
         std::memcpy(scratch.buf + off, str_data(parts[k]), len);
         off += len;
     }
-    str_assign(dst, scratch.buf, total);
+    str_assign(dst, scratch.buf, total, site);
 }
 
-extern "C" void rt_string_repl(rt_string* dst, const rt_string* src, uint64_t count) {
-    const uint64_t len   = str_len(src);
-    const uint64_t total = len * count;
-    StrScratch     scratch(total);
+extern "C" void rt_string_repl(rt_string* dst, const rt_string* src, uint64_t count, const rt_alloc_site* site) {
+    const uint64_t len = str_len(src);
+    // `count` is a design-controlled replication factor ({N{s}}), so the byte
+    // total is the one product here that a program can push past 2^64. A wrapping
+    // one would size the scratch buffer from the wrapped value and then write
+    // `count` copies into it.
+    const uint64_t total = rt_alloc_elems_size(count, len, site, rt_diag_now());
+    StrScratch     scratch(total, site);
     for (uint64_t k = 0; k < count; ++k) {
         std::memcpy(scratch.buf + k * len, str_data(src), len);
     }
-    str_assign(dst, scratch.buf, total);
+    str_assign(dst, scratch.buf, total, site);
 }
 
 extern "C" int32_t rt_string_cmp(const rt_string* a, const rt_string* b) {
@@ -4055,28 +4346,30 @@ extern "C" int32_t rt_string_icmp(const rt_string* a, const rt_string* b) {
     return la < lb ? -1 : (la > lb ? 1 : 0);
 }
 
-extern "C" void rt_string_substr(rt_string* dst, const rt_string* src, int32_t i, int32_t j) {
+extern "C" void rt_string_substr(rt_string* dst, const rt_string* src, int32_t i, int32_t j,
+                                 const rt_alloc_site* site) {
     const uint64_t len = str_len(src);
     if (i < 0 || j < i || static_cast<uint64_t>(j) >= len) {
-        str_assign(dst, nullptr, 0);
+        str_assign(dst, nullptr, 0, site);
         return;
     }
-    str_assign(dst, str_data(src) + i, static_cast<uint64_t>(j) - static_cast<uint64_t>(i) + 1);
+    str_assign(dst, str_data(src) + i, static_cast<uint64_t>(j) - static_cast<uint64_t>(i) + 1, site);
 }
 
 extern "C" void rt_enum_name(rt_string* dst, const uint8_t* val, uint32_t vbytes, uint32_t count,
-                             const uint8_t* values, const char* const* names, const uint32_t* lens) {
+                             const uint8_t* values, const char* const* names, const uint32_t* lens,
+                             const rt_alloc_site* site) {
     for (uint32_t k = 0; k < count; ++k) {
         if (std::memcmp(val, values + static_cast<size_t>(k) * vbytes, vbytes) == 0) {
-            str_assign(dst, names[k], lens[k]);
+            str_assign(dst, names[k], lens[k], site);
             return;
         }
     }
-    str_assign(dst, nullptr, 0); // No member matched: empty string (LRM 6.19.2).
+    str_assign(dst, nullptr, 0, site); // No member matched: empty string (LRM 6.19.2).
 }
 
-extern "C" void rt_string_toupper(rt_string* dst, const rt_string* src) {
-    rt_string_assign(dst, src); // No-op when dst == src, then transform in place.
+extern "C" void rt_string_toupper(rt_string* dst, const rt_string* src, const rt_alloc_site* site) {
+    rt_string_assign(dst, src, site); // No-op when dst == src, then transform in place.
     char*          p = str_data(dst);
     const uint64_t n = str_len(dst);
     for (uint64_t k = 0; k < n; ++k) {
@@ -4084,8 +4377,8 @@ extern "C" void rt_string_toupper(rt_string* dst, const rt_string* src) {
     }
 }
 
-extern "C" void rt_string_tolower(rt_string* dst, const rt_string* src) {
-    rt_string_assign(dst, src);
+extern "C" void rt_string_tolower(rt_string* dst, const rt_string* src, const rt_alloc_site* site) {
+    rt_string_assign(dst, src, site);
     char*          p = str_data(dst);
     const uint64_t n = str_len(dst);
     for (uint64_t k = 0; k < n; ++k) {
@@ -4151,10 +4444,10 @@ int32_t str_atoi_base(const rt_string* s, uint32_t base) {
 // followed by the magnitude in any base, matching iverilog's convention for
 // hextoa/octtoa/bintoa — not a two's-complement bit-pattern
 // dump.
-void str_toa_base(rt_string* dst, int32_t i, int base) {
+void str_toa_base(rt_string* dst, int32_t i, int base, const rt_alloc_site* site) {
     char       buf[36]; // sign + up to 32 binary digits
     const auto res = std::to_chars(buf, buf + sizeof(buf), i, base);
-    str_assign(dst, buf, static_cast<uint64_t>(res.ptr - buf));
+    str_assign(dst, buf, static_cast<uint64_t>(res.ptr - buf), site);
 }
 
 } // namespace
@@ -4189,28 +4482,29 @@ extern "C" double rt_string_atoreal(const rt_string* s) {
     return v;
 }
 
-extern "C" void rt_string_itoa(rt_string* dst, int32_t i) {
-    str_toa_base(dst, i, 10);
+extern "C" void rt_string_itoa(rt_string* dst, int32_t i, const rt_alloc_site* site) {
+    str_toa_base(dst, i, 10, site);
 }
-extern "C" void rt_string_hextoa(rt_string* dst, int32_t i) {
-    str_toa_base(dst, i, 16);
+extern "C" void rt_string_hextoa(rt_string* dst, int32_t i, const rt_alloc_site* site) {
+    str_toa_base(dst, i, 16, site);
 }
-extern "C" void rt_string_octtoa(rt_string* dst, int32_t i) {
-    str_toa_base(dst, i, 8);
+extern "C" void rt_string_octtoa(rt_string* dst, int32_t i, const rt_alloc_site* site) {
+    str_toa_base(dst, i, 8, site);
 }
-extern "C" void rt_string_bintoa(rt_string* dst, int32_t i) {
-    str_toa_base(dst, i, 2);
+extern "C" void rt_string_bintoa(rt_string* dst, int32_t i, const rt_alloc_site* site) {
+    str_toa_base(dst, i, 2, site);
 }
 
-extern "C" void rt_string_realtoa(rt_string* dst, double r) {
+extern "C" void rt_string_realtoa(rt_string* dst, double r, const rt_alloc_site* site) {
     char       buf[32];
     const auto res = std::to_chars(buf, buf + sizeof(buf), r);
-    str_assign(dst, buf, static_cast<uint64_t>(res.ptr - buf));
+    str_assign(dst, buf, static_cast<uint64_t>(res.ptr - buf), site);
 }
 
-extern "C" void rt_string_from_packed(rt_string* dst, const uint8_t* val, uint32_t width_bits) {
+extern "C" void rt_string_from_packed(rt_string* dst, const uint8_t* val, uint32_t width_bits,
+                                      const rt_alloc_site* site) {
     const uint32_t nbytes = (width_bits + 7) / 8;
-    StrScratch     scratch(nbytes);
+    StrScratch     scratch(nbytes, site);
     uint64_t       out_len = 0;
     for (uint32_t k = nbytes; k-- > 0;) {
         uint8_t c = val[k];
@@ -4221,7 +4515,7 @@ extern "C" void rt_string_from_packed(rt_string* dst, const uint8_t* val, uint32
             scratch.buf[out_len++] = static_cast<char>(c);
         }
     }
-    str_assign(dst, scratch.buf, out_len);
+    str_assign(dst, scratch.buf, out_len, site);
 }
 
 extern "C" void rt_string_to_packed(const rt_string* s, uint8_t* out, uint32_t width_bits) {
@@ -4273,13 +4567,15 @@ extern "C" void rt_free(void* p) {
 
 // -- Value-change dump (VCD, LRM §21.7; design in docs/VCD.md) --
 //
-// Phase 0: a single-threaded, full-scan writer. rt_vcd_flush is the sole emitter;
-// at each settled instant it reads every dumped variable's planes, diffs against a
-// per-variable shadow, and writes the changes under one `#tick` marker. Storage is
-// allocated once at rt_vcd_start (the FILE gets a fixed setvbuf buffer); the steady
-// state performs no heap allocation. See docs/VCD.md for the phased plan (the
-// activity-driven dirty set, off-thread formatting, and alternate backends land
-// later behind the same producer/sink split).
+// The sim thread is the sole producer: at each settled instant rt_vcd_flush reads
+// the planes of the variables the dirty set marked, diffs them against a
+// per-variable shadow, and appends backend-neutral records to a buffer. A writer
+// thread formats whole buffers into VCD text and owns the file. Storage (var
+// table, shadows, record buffers, the 1 MiB output buffer) is allocated once at
+// rt_vcd_start; the steady state performs no heap allocation. docs/VCD.md is the
+// design of record; what is still open there (multithreaded formatting, io_uring,
+// crash-handler durability, FST / viewer sinks) all sits behind this same
+// producer/record/sink split.
 
 namespace {
 
@@ -4301,6 +4597,9 @@ struct VcdVar {
     uint32_t       z_bytes     = 0;   // significant bytes of the z field (0 for never-z / narrow)
     bool           four_state  = false;
     bool           narrow      = false;   // 2-state `{ iW }` slot: mm is a bare iW value word
+    // real / shortreal: the value word is an IEEE-754 bit pattern, dumped as
+    // `r<decimal>` rather than as bits (LRM §21.7.2.1 vector_value_change).
+    bool           is_real     = false;
     bool           seen        = false;   // shadow valid (a value has been dumped)
     // Shadow of the last dumped *raw* slot: mm_bytes of the mm field, then z_bytes
     // of the z field. The diff is a memcmp of these against the live slot; the
@@ -4333,11 +4632,13 @@ struct VcdEngine {
     std::vector<uint8_t>  recbuf;    // producer -> sink record byte stream for pending instants
     std::vector<uint64_t> scratch;   // scan buffer: 3*max_nwords words (must | may | z)
     // Activity-driven dirty set: `epoch[i]` is set by rt_vcd_touch when var i is
-    // written this instant. `always` marks array elements (scanned every instant,
-    // not touched). Both are dense byte arrays parallel to `vars`, so the flush's
-    // per-instant index scan touches only these two, not the fat VcdVar struct.
+    // written this instant, including per-element for an unpacked array. A dense
+    // byte array parallel to `vars`, so the flush's per-instant index scan reads
+    // one byte per variable and never the fat VcdVar struct.
     std::vector<uint8_t> epoch;
-    std::vector<uint8_t> always;
+    // Bytes already handed to the FILE. With the pending iobuf they are the file's
+    // size, which the writer tests against the $dumplimit cap (vcd_limit_reached).
+    uint64_t written = 0;
     uint32_t max_nwords = 1;    // widest variable, in words (sizes scratch / buffers)
     uint32_t next_id    = 0;    // next VCD identifier index (assigned per registration)
     bool started        = false;   // header finished ($enddefinitions written)
@@ -4358,6 +4659,7 @@ VcdEngine g_vcd;
 void vcd_flush_out() {
     if (g_vcd.out_len != 0) {
         std::fwrite(g_vcd.iobuf, 1, g_vcd.out_len, g_vcd.file);
+        g_vcd.written += g_vcd.out_len;
         g_vcd.out_len = 0;
     }
 }
@@ -4374,6 +4676,7 @@ inline void vcd_puts(std::string_view s) {
         vcd_flush_out();
         if (s.size() > VcdEngine::iobuf_size) {   // a single string larger than the buffer
             std::fwrite(s.data(), 1, s.size(), g_vcd.file);
+            g_vcd.written += s.size();
             return;
         }
     }
@@ -4516,11 +4819,36 @@ void vcd_read_planes(const VcdVar& v, uint64_t* out) {
     }
 }
 
+// Emit a real's value change: `r<decimal> <id>` (LRM §21.7.2.1). The slot holds
+// the IEEE-754 bit pattern in its value word -- 64 bits for `real`, 32 for
+// `shortreal`, which widens to double so the file carries one representation.
+// The decimal is the shortest round-tripping form (std::to_chars), so a reader's
+// strtod recovers the exact bits; iverilog's %.16g can lose the last ulp.
+// A real has no x/z, so the only way `may` can differ from `must` is the all-x
+// $dumpoff checkpoint (rt_vcd_flush), which prints as NaN -- iverilog's spelling,
+// and the one value no real can otherwise round-trip to.
+void vcd_emit_real(const VcdVar& v, const uint64_t* must, const uint64_t* may) {
+    char   buf[40];
+    size_t len = 0;
+    if (must[0] != may[0]) {
+        std::memcpy(buf, "NaN", 3);
+        len = 3;
+    } else {
+        const double d = v.width == 32
+                           ? static_cast<double>(std::bit_cast<float>(static_cast<uint32_t>(must[0])))
+                           : std::bit_cast<double>(must[0]);
+        len = static_cast<size_t>(std::to_chars(buf, buf + sizeof(buf), d).ptr - buf);
+    }
+    vcd_put('r');
+    vcd_puts(std::string_view(buf, len));
+    vcd_puts(v.suffix);
+}
+
 // Emit one variable's value-change line for the given planes (each `v.nwords`
 // little-endian words). Scalars print the value char then the id; vectors print
 // `b<bits> <id>` with the LRM §21.7.2.1 asymmetric leading-bit compression
 // (leftmost printed digit sets the reader's left-extension: 0->0, x->x, z->z, but
-// 1->0, so a 1-MSB cannot be compressed).
+// 1->0, so a 1-MSB cannot be compressed). A real prints `r<decimal> <id>`.
 void vcd_emit(const VcdVar& v, const uint64_t* must, const uint64_t* may, const uint64_t* z) {
     const auto bitc = [&](uint32_t i) -> char {
         const uint64_t m = 1ull << (i & 63);
@@ -4533,6 +4861,10 @@ void vcd_emit(const VcdVar& v, const uint64_t* must, const uint64_t* may, const 
         }
         return (must[w] & m) != 0 ? '1' : 'x';
     };
+    if (v.is_real) {
+        vcd_emit_real(v, must, may);
+        return;
+    }
     // One capacity check for the whole line: 'b' + up to width digits + suffix. Then
     // write through a local pointer, no per-character bounds check.
     const size_t need = static_cast<size_t>(v.width) + v.suffix.size() + 2;
@@ -4645,6 +4977,33 @@ bool vcd_scan_var(uint32_t i, bool force) {
 // Writer-thread scratch for the aligned plane copy (only the writer touches it).
 std::vector<uint64_t> vcd_writer_scratch;
 
+// -- $dumplimit (LRM §21.7.1.5) --
+//
+// The cap and the "cap reached" edge are the only VCD state both threads see: the
+// sim thread sets the cap at the $dumplimit call and reads the edge at the next
+// flush; the writer, which is the only thread that knows how many bytes the text
+// actually takes, tests the cap and publishes the edge. Both are reset at close.
+std::atomic<uint64_t> vcd_limit{ 0 };
+std::atomic<bool>     vcd_limit_hit{ false };
+
+// Writer-side test, run at instant boundaries only, so the dump never ends
+// mid-instant: the file keeps the last whole instant that fit, then the comment
+// the LRM asks for. Everything after it is dropped. The console notice goes out
+// here, the one place the edge is taken -- a small dump reaches its cap only when
+// the writer drains at close, too late for the sim thread to report it.
+bool vcd_limit_reached() {
+    const uint64_t cap = vcd_limit.load(std::memory_order_relaxed);
+    if (cap == 0 || g_vcd.written + g_vcd.out_len < cap) {
+        return false;
+    }
+    vcd_puts("$comment Dump file limit (");
+    vcd_put_dec(cap);
+    vcd_puts(" bytes) reached. $end\n");
+    vcd_limit_hit.store(true, std::memory_order_release);
+    std::fprintf(stderr, "$dumplimit: dump file limit (%" PRIu64 " bytes) reached; dumping stopped\n", cap);
+    return true;
+}
+
 // Format one record byte buffer to the output file. Reads only the record bytes
 // and the read-only var table (no diff / shadow state), so it runs on the writer
 // thread while the sim thread fills the next buffer.
@@ -4653,6 +5012,9 @@ void vcd_write_records(const std::vector<uint8_t>& buf) {
     while (p < buf.size()) {
         const uint8_t tag = buf[p++];
         if (tag == 1) {
+            if (vcd_limit_hit.load(std::memory_order_relaxed) || vcd_limit_reached()) {
+                return;   // capped: this instant and everything after it is dropped
+            }
             uint64_t tick = 0;
             std::memcpy(&tick, &buf[p], sizeof(tick));
             p += sizeof(tick);
@@ -4742,6 +5104,22 @@ void vcd_handoff() {
     vcd_cv_ready.notify_one();
 }
 
+// Sim-thread side of the $dumplimit cap: has the writer reported the file full?
+// It switches dumping off for the rest of the run -- a later $dumpon / $dumpall /
+// $dumpvars does not restart it, since the file already carries its cutoff
+// comment -- and drops the records still queued behind the cutoff.
+bool vcd_capped() {
+    if (!vcd_limit_hit.load(std::memory_order_acquire)) {
+        return false;
+    }
+    g_vcd.active      = false;
+    rt_vcd_active     = 0;
+    g_vcd.pending_off = false;
+    g_vcd.force_all   = false;
+    g_vcd.recbuf.clear();
+    return true;
+}
+
 } // namespace
 
 extern "C" void rt_vcd_open(const char* path_buf, uint32_t path_len, uint32_t forward) {
@@ -4790,13 +5168,11 @@ extern "C" void rt_vcd_upscope(void) {
 }
 
 // Write one $var line and add the variable to the scan table. Shared by the
-// scalar (rt_vcd_var) and per-element array (rt_vcd_array) registration.
-// `always_scan` marks an array element: its writes are not instrumented with
-// rt_vcd_touch, so the flush scans it every instant instead of relying on the
-// dirty set.
-static void vcd_register(std::string_view ref, uint32_t width, uint32_t flags, const uint8_t* mm, const uint8_t* z,
-                         bool always_scan) {
-    g_vcd.always.push_back(static_cast<uint8_t>(always_scan ? 1 : 0));
+// scalar (rt_vcd_var) and per-element array (rt_vcd_array) registration; every
+// variable it adds is instrumented with rt_vcd_touch at its write sites, so the
+// flush needs no per-variable scan policy.
+static void vcd_register(std::string_view ref, uint32_t width, uint32_t flags, const uint8_t* mm,
+                         const uint8_t* z) {
     VcdVar v;
     v.mm         = mm;
     v.z          = z;
@@ -4804,6 +5180,7 @@ static void vcd_register(std::string_view ref, uint32_t width, uint32_t flags, c
     v.nwords     = vcd_nwords(width);
     v.four_state = (flags & RT_VCD_FLAG_FOUR_STATE) != 0;
     v.narrow     = (flags & RT_VCD_FLAG_NARROW) != 0;
+    v.is_real    = (flags & RT_VCD_FLAG_REAL) != 0;
     v.idcode     = vcd_idcode(g_vcd.next_id++);
     v.mm_bytes   = v.narrow ? (width + 7) / 8 : (2 * width + 7) / 8;
     v.z_bytes    = z != nullptr ? (width + 7) / 8 : 0;
@@ -4812,11 +5189,13 @@ static void vcd_register(std::string_view ref, uint32_t width, uint32_t flags, c
     if (v.nwords > g_vcd.max_nwords) {
         g_vcd.max_nwords = v.nwords;
     }
-    const char* vtype = (flags & RT_VCD_FLAG_NET) != 0 ? "wire" : "reg";
+    const char* vtype = v.is_real                          ? "real"
+                        : (flags & RT_VCD_FLAG_NET) != 0   ? "wire"
+                                                           : "reg";
     vcd_puts("$var ");
     vcd_puts(vtype);
     vcd_put(' ');
-    vcd_put_dec(width);
+    vcd_put_dec(v.is_real ? 64 : width);
     vcd_put(' ');
     vcd_puts(v.idcode);
     vcd_put(' ');
@@ -4835,7 +5214,7 @@ extern "C" void rt_vcd_var(const char* name, uint32_t name_len, uint32_t width, 
     if (g_vcd.file == nullptr || g_vcd.started) {
         return;
     }
-    vcd_register(std::string_view(name, name_len), width, flags, mm, z, false);
+    vcd_register(std::string_view(name, name_len), width, flags, mm, z);
 }
 
 extern "C" void rt_vcd_touch(uint32_t idx) {
@@ -4873,9 +5252,7 @@ extern "C" void rt_vcd_array(const char* name, uint32_t name_len, uint32_t count
         const std::string ref  = std::string(leaf) + "[" + std::to_string(addr) + "]";
         const uint8_t*    mm   = mm_base + static_cast<size_t>(k) * stride;
         const uint8_t*    z    = z_base != nullptr ? z_base + static_cast<size_t>(k) * stride : nullptr;
-        // Array elements are touched on write (not always-scanned), so register
-        // them like scalars; the backend instruments blocking and NBA array writes.
-        vcd_register(ref, width, flags, mm, z, false);
+        vcd_register(ref, width, flags, mm, z);
     }
 }
 
@@ -4914,13 +5291,16 @@ extern "C" void rt_vcd_start(void) {
         vcd_thread    = std::thread(vcd_writer_loop);
         g_vcd.started = true;
     }
+    if (vcd_capped()) {
+        return;   // the cap was already reached: $dumpvars does not restart the dump
+    }
     g_vcd.active    = true;
     rt_vcd_active   = 1;
     g_vcd.force_all = true;   // the first flush emits every variable's initial value
 }
 
 extern "C" void rt_vcd_flush(uint64_t tick) {
-    if (g_vcd.file == nullptr) {
+    if (g_vcd.file == nullptr || vcd_capped()) {
         return;
     }
     uint64_t* const scan  = g_vcd.scratch.data();
@@ -4953,9 +5333,9 @@ extern "C" void rt_vcd_flush(uint64_t tick) {
     }
     // Produce a time marker followed by the changed variables; drop the marker if
     // nothing changed (no-change instants emit nothing). Scan in index order,
-    // reading + diffing only variables the dirty set marked (or always-scanned
-    // array elements). No per-instant sort: index order is byte-identical to a full
-    // scan for free, and the epoch check skips the expensive read/diff for the rest.
+    // reading + diffing only the variables the dirty set marked. No per-instant
+    // sort: index order is byte-identical to a full scan for free, and the epoch
+    // check skips the expensive read/diff for the rest.
     const size_t mark = g_vcd.recbuf.size();
     vcd_rec_time(tick);
     bool any = false;
@@ -4965,14 +5345,12 @@ extern "C" void rt_vcd_flush(uint64_t tick) {
             any |= vcd_scan_var(i, true);
         }
     } else {
-        // Hot loop over two dense byte arrays only (no fat-struct access): scan a
-        // var iff it was touched this instant or is an always-scan array element.
-        const uint8_t* ep = g_vcd.epoch.data();
-        const uint8_t* al = g_vcd.always.data();
+        // Hot loop over one dense byte array (no fat-struct access): scan a var
+        // iff it was written this instant.
+        uint8_t* ep = g_vcd.epoch.data();
         for (uint32_t i = 0; i < nvars; ++i) {
-            const uint8_t s = ep[i];
-            g_vcd.epoch[i]  = 0;
-            if ((s | al[i]) != 0) {
+            if (ep[i] != 0) {
+                ep[i] = 0;
                 any |= vcd_scan_var(i, false);
             }
         }
@@ -4996,7 +5374,7 @@ extern "C" void rt_vcd_off(void) {
 }
 
 extern "C" void rt_vcd_on(void) {
-    if (g_vcd.started) {
+    if (g_vcd.started && !vcd_capped()) {
         g_vcd.active    = true;
         rt_vcd_active   = 1;
         g_vcd.force_all = true;
@@ -5007,6 +5385,13 @@ extern "C" void rt_vcd_all(void) {
     if (g_vcd.active) {
         g_vcd.force_all = true;
     }
+}
+
+extern "C" void rt_vcd_limit(uint64_t bytes) {
+    // Legal before or after $dumpvars; the writer picks the new cap up at its next
+    // instant boundary. A cap already passed is honoured there, not here, so the
+    // cutoff comment is always written by the thread that owns the file.
+    vcd_limit.store(bytes, std::memory_order_relaxed);
 }
 
 extern "C" void rt_vcd_dumpflush(void) {
@@ -5040,6 +5425,10 @@ static void vcd_shutdown_writer() {
     vcd_pool.clear();
     vcd_inflight = 0;
     vcd_stop     = false;
+    // The cap outlives the engine struct (both threads read it), so it resets here
+    // with the rest of the cross-thread state.
+    vcd_limit.store(0, std::memory_order_relaxed);
+    vcd_limit_hit.store(false, std::memory_order_relaxed);
 }
 
 extern "C" void rt_vcd_close(void) {
@@ -5082,6 +5471,6 @@ void rt_dpi_unpack_logicvec(const uint32_t* in, uint32_t nchunks, uint32_t* must
     }
 }
 
-void rt_dpi_str_out(rt_string* dst, const char* p) {
-    rt_string_assign_bytes(dst, p, p != nullptr ? std::strlen(p) : 0);
+void rt_dpi_str_out(rt_string* dst, const char* p, const rt_alloc_site* site) {
+    rt_string_assign_bytes(dst, p, p != nullptr ? std::strlen(p) : 0, site);
 }

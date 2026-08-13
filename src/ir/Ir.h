@@ -1603,11 +1603,14 @@ struct Inst {
         // $dumpfile("f.vcd"): set the output path (payload: unary, the filename
         // value). Lowers to an rt_vcd_open call.
         DumpFile,
-        // $dumpvars: begin dumping (payload: none). Phase 0 supports only the
-        // whole-design form ($dumpvars / $dumpvars(0)); a scope-subset selector is
+        // $dumpvars: begin dumping (payload: none). Only the whole-design form
+        // ($dumpvars / $dumpvars(0)) is supported; a scope-subset selector is
         // rejected at the frontend. The backend enumerates every dumpable signal,
         // emits the descriptor table, and lowers this to an rt_vcd_start call.
         DumpVars,
+        // $dumplimit(n): stop dumping once the file reaches `n` bytes (payload:
+        // unary, the byte count). Lowers to an rt_vcd_limit call.
+        DumpLimit,
         // $dumpoff / $dumpon / $dumpall / $dumpflush (payload: none). Suspend (with
         // an all-x checkpoint) / resume / force-dump-now / flush-to-disk. Each
         // lowers to the matching rt_vcd_* control call.
@@ -1836,6 +1839,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Rewind:
         case T::Fflush:
         case T::DumpFile:
+        case T::DumpLimit:
         case T::StrLen:
         case T::StrUpper:
         case T::StrLower:

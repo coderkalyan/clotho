@@ -476,6 +476,35 @@ endmodule
     CHECK(has_tag(monitor_process(m), ir::Inst::Tag::ReactivePend));
 }
 
+TEST_CASE("a restrict is lowered in full and then says nothing") {
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, a, b;
+  // Unlabelled: slang's module-item parser accepts a label only ahead of
+  // assert / assume / cover, so `rp: restrict ...` is a parse error there.
+  restrict property (@(posedge clk) a |=> b);
+endmodule
+)", r);
+    CHECK(r.ok);
+
+    // Lowered in full: `restrict` constrains a FORMAL tool's input space and the
+    // LRM gives it no simulation verdict, but that is a reason to emit no report,
+    // not a reason to drop the property. The monitor exists, so the temporal
+    // expression was really bound and anything libsva cannot handle inside one is
+    // still refused rather than waved through.
+    REQUIRE(m.monitors.size() == 1);
+    CHECK(m.monitors[0].kind == ir::AssertionKind::Restrict);
+    CHECK(m.monitors[0].has_trigger);
+
+    // And then silent: no verdict pended into Reactive, no report inline, and no
+    // tally -- the three things the other kinds do.
+    CHECK_FALSE(has_tag(monitor_process(m), ir::Inst::Tag::ReactivePend));
+    CHECK_FALSE(has_tag(monitor_process(m), ir::Inst::Tag::Severity));
+    CHECK(find_signal(m, "sva.0.cov") == nullptr);
+    CHECK(activation_count(m, ir::Activation::Final) == 0);
+}
+
 // -- Loud refusals ----------------------------------------------------------
 //
 // Every shape libsva cannot lower, and every shape clotho has not wired up, must
@@ -850,6 +879,48 @@ endmodule
 )", "function call in a concurrent assertion expression");
 }
 
+TEST_CASE("a sequence method is refused by name, not as a stray function call") {
+    // `.triggered` and `.matched` are calls only syntactically. Both report on the
+    // attempts of the NAMED SEQUENCE they are called on, which would need that
+    // sequence stepped as an automaton of its own -- nothing to do with the
+    // sampling rule the generic call refusal is about. A reader told "a function
+    // call ... would not be sampled" goes looking for the wrong thing.
+    constexpr std::string_view triggered = R"(
+module t;
+  bit clk, a, b, c;
+  sequence sab;
+    a ##1 b;
+  endsequence
+  ap: assert property (@(posedge clk) sab.triggered |=> c);
+endmodule
+)";
+    refuses(triggered, "`.triggered` on a named sequence");
+
+    // `.matched` is the same method across a clock boundary; slang rejects it
+    // outside an assertion expression, so this is the only place it can appear.
+    refuses(R"(
+module t;
+  bit clk, a, b, c;
+  sequence sab;
+    a ##1 b;
+  endsequence
+  ap: assert property (@(posedge clk) sab.matched |=> c);
+endmodule
+)", "`.matched` on a named sequence");
+
+    // Outside an assertion expression the same call reaches the system-function
+    // tail instead, which would have named no feature at all.
+    refuses(R"(
+module t;
+  bit clk, a, b, hit;
+  sequence sab;
+    a ##1 b;
+  endsequence
+  always @(posedge clk) hit <= sab.triggered;
+endmodule
+)", "`.triggered` on a named sequence");
+}
+
 // -- Inferred clocking (LRM 16.14.6) ----------------------------------------
 //
 // A property with no clocking event of its own takes the one from the procedure
@@ -1191,17 +1262,39 @@ endmodule
 )", "recursive property");
 }
 
-TEST_CASE("a disable iff inside a named property is refused, not silently dropped") {
-    // Only a `disable iff` at the top of the assertion is peeled into the
-    // request. LRM 16.12 also allows one at the top of a property declaration,
-    // where it would have to be hoisted back out through the instantiation.
+TEST_CASE("two disable iff clauses in one assertion are refused") {
+    // LRM 16.12: "Nesting of disable iff clauses, explicitly or through property
+    // instantiations, is not allowed". So there is no precedence to define between
+    // a clause on the assertion and one in the property it instantiates, and
+    // clotho defines none -- it refuses the pair rather than picking a winner,
+    // because either choice would be a reset semantics clotho invented.
+    //
+    // slang gets here first (diag::NestedDisableIff), which is why the needle is
+    // the wording both share. clotho keeps its own guard behind that, because
+    // which node became the reset is clotho's invariant and not slang's to
+    // maintain.
     refuses(R"(
 module t;
-  bit clk, rst, a, b;
+  bit clk, rst, halt, a, b;
   property p;
     disable iff (rst) a |=> b;
   endproperty
-  ap: assert property (@(posedge clk) p);
+  ap: assert property (@(posedge clk) disable iff (halt) p);
+endmodule
+)", "disable iff");
+
+    // The other half of the same rule (16.12.1): an instance used as an operand of
+    // a property-building operator may not carry a clause. The reset would belong
+    // to that operand alone, so hoisting it would silently widen it to the whole
+    // assertion -- body_disable therefore does not descend here, and the clause
+    // reaches sva::lower's DisableIff arm with nothing hoisted to match it.
+    refuses(R"(
+module t;
+  bit clk, rst, a, b, c;
+  property p;
+    disable iff (rst) a |=> b;
+  endproperty
+  ap: assert property (@(posedge clk) p and c);
 endmodule
 )", "disable iff");
 }
@@ -1777,7 +1870,7 @@ std::string sva_run_capture(std::string_view source) {
     return out;
 }
 
-std::string report_times(std::string_view source) {
+std::string report_times(std::string_view source, std::string_view marker = "assertion failed") {
     const std::string out = sva_run_capture(source);
     std::string       times;
     std::string       tick;
@@ -1793,7 +1886,7 @@ std::string report_times(std::string_view source) {
             if (close != std::string_view::npos) {
                 tick = std::string(line.substr(1, close - 1));
             }
-        } else if (line.find("assertion failed") != std::string_view::npos) {
+        } else if (line.find(marker) != std::string_view::npos) {
             times += times.empty() ? "" : " ";
             times += tick;
         }
@@ -2176,16 +2269,85 @@ endmodule
 )") == "25 35");
 }
 
-// -- Sampled value function refusals ----------------------------------------
-
-TEST_CASE("a gating expression on $past is refused") {
-    refuses(R"(
+TEST_CASE("a gating expression on $past skips the ticks it does not hold on") {
+    // LRM 16.9.3 reads $past(v, n, g) at "the kth strictly prior time step in
+    // which the event ev iff g occurred", so the gate decides which ticks the
+    // history counts rather than which value it hands back. The gate is sampled
+    // like any other assertion boolean; only the `disable iff` condition is not.
+    //
+    // Samples are t5: v=0 g=1, t15: v=1 g=1, t25: v=2 g=1, t35: v=3 g=0,
+    // t45: v=2 g=1. The gate is low for the t=35 tick alone, so the ring still
+    // holds the t=25 sample of 2 when t=45 reads it.
+    //
+    // `$past != v` therefore fails at t=45 (2 against 2), on top of the first
+    // tick, where the seed of 0 meets a sample of 0. Drop the gate on the floor
+    // and the ring holds the t=35 sample of 3 instead, which passes -- so the
+    // t=45 report is exactly the gate being honoured.
+    CHECK(report_times(R"(
 module t;
-  bit clk, a, g, b;
-  ap: assert property (@(posedge clk) $past(a, 1, g) |=> b);
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit [3:0] v = 0;
+  bit       g = 1;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) $past(v, 1, g) != v);
+  initial begin
+    @(posedge clk); v <= 1;
+    @(posedge clk); v <= 2;
+    @(posedge clk); v <= 3; g <= 0;
+    @(posedge clk); v <= 2; g <= 1;
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
 endmodule
-)", "gating expression on $past");
+)") == "5 45");
+
+    // The ungated twin on the identical trace, which is what makes the line above
+    // a measurement rather than an assertion about itself.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit [3:0] v = 0;
+  bit       g = 1;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) $past(v) != v);
+  initial begin
+    @(posedge clk); v <= 1;
+    @(posedge clk); v <= 2;
+    @(posedge clk); v <= 3; g <= 0;
+    @(posedge clk); v <= 2; g <= 1;
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)") == "5");
 }
+
+TEST_CASE("a gated $past gets a ring of its own, at its own depth") {
+    // Rings are keyed by (variable, gate) and not by the variable alone: the two
+    // advance on different tick sets, so one ring could answer at most one of
+    // them. Depth is still the largest n asked of EACH ring -- two entries gated,
+    // one ungated -- so a gate costs a second ring and never a deeper one.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, g;
+  bit [3:0] v;
+  ap: assert property (@(posedge clk) $past(v, 2, g) != v && $past(v) != v);
+endmodule
+)", r);
+
+    CHECK(ring_count(m, "v") == 3);
+
+    size_t gated = 0;
+    for (const ir::SignalInfo& s : m.signals()) {
+        gated += s.name.find(".past.v.gate") != std::string::npos ? 1 : 0;
+    }
+    CHECK(gated == 2);
+}
+
+// -- Sampled value function refusals ----------------------------------------
 
 TEST_CASE("a non-constant tick count on $past is refused") {
     // The ring is sized at compile time, so the count has to be constant. slang
@@ -2260,6 +2422,91 @@ module t;
   ap: assert property (@(posedge clk) disable iff ($rose(rst)) a |=> b);
 endmodule
 )", "disable iff");
+}
+
+// -- A disable iff declared in a named property (LRM 16.12) ------------------
+//
+// The clause sits at the top of a property_spec, and a property declaration's
+// body IS one, so `property p; disable iff (rst) ...; endproperty` carries a
+// reset that belongs to every assertion instantiating p. lower_concurrent_assertion
+// lifts it (body_disable) and leaves the node standing for sva::lower to step
+// over. These run the monitor, because the observable is whether the reset
+// actually suppresses -- the structural half is the reset-root test at the top of
+// this file, and the nesting refusals are with the other refusals above.
+
+TEST_CASE("a disable iff in a named property suppresses the assertion") {
+    // a is sampled high at t=15 alone, so `a |=> b` opens one attempt whose
+    // obligation is checked at t=25 against a b that never rises. rst is driven
+    // with a nonblocking assignment at t=25, which commits in NBA and so is
+    // live-high when the monitor runs in Observed at that same tick -- LRM 16.15
+    // reads the disable condition live rather than sampled.
+    //
+    // The control first: the identical trace with no clause at all, so the silence
+    // below is the reset working and not the trace failing to fail.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, rst = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  property p;
+    a |=> b;
+  endproperty
+  ap: assert property (@(posedge clk) p);
+  initial begin
+    @(posedge clk); a <= 1;
+    @(posedge clk); a <= 0;
+    @(posedge clk); rst <= 1;
+    @(posedge clk); rst <= 0;
+    @(posedge clk); $finish;
+  end
+endmodule
+)") == "25");
+
+    // Same trace, same property, plus the clause the declaration now carries.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, rst = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  property p;
+    disable iff (rst) a |=> b;
+  endproperty
+  ap: assert property (@(posedge clk) p);
+  initial begin
+    @(posedge clk); a <= 1;
+    @(posedge clk); a <= 0;
+    @(posedge clk); rst <= 1;
+    @(posedge clk); rst <= 0;
+    @(posedge clk); $finish;
+  end
+endmodule
+)").empty());
+
+    // And with the clock inside the declaration as well. LRM 16.12's property_spec
+    // puts the clocking event ABOVE the clause, so this is the shape with a
+    // Clocking wrapper between the instantiated body and the reset -- the one step
+    // body_disable takes that body_clock does not need.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, rst = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  property p;
+    @(posedge clk) disable iff (rst) a |=> b;
+  endproperty
+  ap: assert property (p);
+  initial begin
+    @(posedge clk); a <= 1;
+    @(posedge clk); a <= 0;
+    @(posedge clk); rst <= 1;
+    @(posedge clk); rst <= 0;
+    @(posedge clk); $finish;
+  end
+endmodule
+)").empty());
 }
 
 // -- The bounded property operators (LRM 16.12) ------------------------------
@@ -3049,6 +3296,99 @@ endmodule
     CHECK(out.find("[45] CI-HIT") != std::string::npos);
 }
 
+TEST_CASE("a cover sequence counts every match where a cover property counts attempts") {
+    // The design of the case above, verbatim, with `cover property` replaced by
+    // `cover sequence`. That is the whole difference the LRM draws (16.12.6): a
+    // cover property reports how many ATTEMPTS succeeded, a cover sequence how
+    // many times the sequence MATCHED, and an attempt can match more than once.
+    //
+    // Here the antecedent matches at tick2 and tick3, so the two obligations pass
+    // at tick3 (35) and tick4 (45). Grouped into one attempt that is a single
+    // cover-property hit at 45; counted per match it is two.
+    const std::string out = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, ok = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  cs: cover sequence (@(posedge clk) (a ##[1:2] b) |=> ok) $display("[%0t] CS-HIT", $time);
+  initial begin
+    @(posedge clk);            // tick0
+    a <= 1;
+    @(posedge clk);            // tick1
+    a <= 0; b <= 1; ok <= 1;
+    @(posedge clk);            // tick2: the ##1 match ends
+    @(posedge clk);            // tick3: the ##2 match ends; obligation 1 passes
+    b <= 0;
+    @(posedge clk);            // tick4: obligation 2 passes
+    ok <= 0;
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)");
+    CHECK(count_of(out, "CS-HIT") == 2);
+    CHECK(out.find("[35] CS-HIT") != std::string::npos);
+    CHECK(out.find("[45] CS-HIT") != std::string::npos);
+}
+
+TEST_CASE("a restrict whose property fails reports nothing at all") {
+    // The behavioural half of the structural check above, over the trace of "two
+    // attempts of one assertion each keep their own verdict" below: two attempts
+    // match `a ##1 b` and both consequents are low, so an assert reports at 35 and
+    // 45. An empty report set only means something next to a non-empty one, so the
+    // same trace is run both ways.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, ok = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) (a ##1 b) |=> ok);
+  initial begin
+    @(posedge clk);            // tick0
+    a <= 1;
+    @(posedge clk);            // tick1: attempt A starts
+    b <= 1;
+    @(posedge clk);            // tick2: attempt B starts; A matches
+    a <= 0;
+    @(posedge clk);            // tick3: B matches; A's obligation FAILS
+    b <= 0;
+    @(posedge clk);            // tick4: B's obligation FAILS
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)") == "35 45");
+
+    // Same property, same trace, `restrict`: both attempts still fail, and the
+    // directive still says nothing. LRM 16.12 gives restrict no simulation
+    // verdict -- it constrains what a formal tool may drive, and slang enforces
+    // the silence by rejecting an action block on one.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, ok = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  restrict property (@(posedge clk) (a ##1 b) |=> ok);
+  initial begin
+    @(posedge clk);            // tick0
+    a <= 1;
+    @(posedge clk);            // tick1: attempt A starts
+    b <= 1;
+    @(posedge clk);            // tick2: attempt B starts; A matches
+    a <= 0;
+    @(posedge clk);            // tick3: B matches; A's obligation FAILS
+    b <= 0;
+    @(posedge clk);            // tick4: B's obligation FAILS
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)").empty());
+}
+
 TEST_CASE("a cover does not count an attempt one of whose obligations failed") {
     // The same cover with the second consequent low. The attempt does not pass, so
     // it is not covered at all -- the earlier obligation's match is not a hit of
@@ -3110,4 +3450,333 @@ module t;
   end
 endmodule
 )") == "35 45");
+}
+
+// -- Assertion control (LRM 20.12) -------------------------------------------
+//
+// One trace serves the first four cases, so that what changes between them is
+// only the control task. `a` is high and `b` low for the whole run, so `a |=> b`
+// starts an attempt at every tick and every one of them fails one tick later:
+// ticks at 5, 15, ..., 75, and an unmodified run reports at 15 through 75.
+//
+// The control tasks fire at 22 and 52, BETWEEN ticks, which is the interesting
+// placement: at 22 the attempt whose antecedent matched at 15 is already in
+// flight and owes a verdict at 25, and that verdict is exactly what separates
+// `off` from `kill`.
+constexpr std::string_view control_trace = R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 1;
+  bit b = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) a |=> b);
+  initial begin
+    #22 CONTROL_OFF;
+    #30 CONTROL_ON;
+  end
+  initial #78 $finish;
+endmodule
+)";
+
+// Substitute one placeholder in a fixture. The control cases differ only in the
+// task they run, so the trace itself is written once and the case supplies the
+// line -- what a reader has to compare between two expectations is then exactly
+// the difference between two control tasks.
+std::string substituted(std::string_view source, std::string_view token, std::string_view with) {
+    std::string out(source);
+    out.replace(out.find(token), token.size(), with);
+    return out;
+}
+
+std::string control_run(std::string_view stop, std::string_view start) {
+    return report_times(substituted(substituted(control_trace, "CONTROL_OFF", stop), "CONTROL_ON", start));
+}
+
+TEST_CASE("assertion control leaves an uncontrolled design alone") {
+    // The baseline the three cases below are read against. It also pins the
+    // shape of the trace: one report per tick from 15, so any hole in a later
+    // case is a suppression and not an artefact of the stimulus.
+    CHECK(control_run("$display(\"[control]\")", "$display(\"[control]\")") ==
+          "15 25 35 45 55 65 75");
+}
+
+TEST_CASE("$assertoff stops attempts starting and lets a pending one finish") {
+    // THE case for what `off` means (LRM 20.12): "No new attempts will be
+    // started. Attempts that are already executing ... are not affected."
+    //
+    // 25 survives and 35 does not, and the pair is the whole semantics. The
+    // attempt reporting at 25 was seeded by an antecedent that matched at 15,
+    // before the task ran -- it is in flight, so it runs to its verdict. The one
+    // that would have reported at 35 needed a fresh antecedent match at 25, and
+    // that is a new attempt, which is what the enable gates.
+    //
+    // Gate the advance or the verdict instead of the seed and 25 disappears with
+    // the rest. Gate nothing and the run is the baseline. Resuming at 52 puts the
+    // first new antecedent match at 55 and so the first new report at 65: an
+    // implication costs a tick between the two, and reading `15 25 55 ...` here
+    // would mean the seed was let through a tick early.
+    CHECK(control_run("$assertoff", "$asserton") == "15 25 65 75");
+}
+
+TEST_CASE("$assertkill also abandons the attempt $assertoff would have finished") {
+    // Same trace, same instants, one word different -- and 25 is gone. That is
+    // the only difference `kill` is allowed to make over `off`, so a change here
+    // that also moved 65 or 75 would mean the kill outlived its cycle rather than
+    // being the one-cycle reset it is built as.
+    CHECK(control_run("$assertkill", "$asserton") == "15 65 75");
+}
+
+TEST_CASE("$assertfailoff hides the report while the automaton keeps running") {
+    // The filters are not the enable. `55` is the proof: its attempt's antecedent
+    // matched at 45, while reporting was off, and the attempt still ran to a
+    // verdict that lands once reporting is back. Under `$assertoff` the same
+    // instants give `15 25 65 75` -- no 55, because no attempt started at 45 to
+    // report at 55, and an extra 25, because the filter suppresses a verdict the
+    // enable never stops.
+    //
+    // So the two mechanisms differ in both directions on one trace, which is what
+    // makes this case able to fail if they were ever wired to the same bit.
+    CHECK(control_run("$assertfailoff", "$assertfailon") == "15 55 65 75");
+}
+
+TEST_CASE("a bare sequence takes the same control as an implication") {
+    // The other seed path. With an antecedent the enable gates the trigger's
+    // first states and the seed is left alone -- an in-flight attempt reaching
+    // its obligation must not be stopped. With no antecedent there is no trigger
+    // to gate and the seed IS the start, so it takes the gate instead. Two
+    // different lines of emit_monitor, and this pins the second to the same
+    // observable behaviour as the first.
+    //
+    // `a ##1 b` with a high and b low starts an attempt every tick and fails it
+    // the next, so the report sets are the ones the implication cases produce,
+    // instant for instant.
+    const auto bare = [](std::string_view stop, std::string_view start) {
+        return report_times(substituted(substituted(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 1, b = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) a ##1 b);
+  initial begin
+    #22 CONTROL_OFF;
+    #30 CONTROL_ON;
+  end
+  initial #78 $finish;
+endmodule
+)",
+                                                    "CONTROL_OFF",
+                                                    stop),
+                                       "CONTROL_ON",
+                                       start));
+    };
+
+    CHECK(bare("$display(\"[control]\")", "$display(\"[control]\")") == "15 25 35 45 55 65 75");
+    CHECK(bare("$assertoff", "$asserton") == "15 25 65 75");
+    CHECK(bare("$assertkill", "$asserton") == "15 65 75");
+    CHECK(bare("$assertfailoff", "$assertfailon") == "15 55 65 75");
+}
+
+// Three assertions, one per level: `tp` in the top, `mp` in u1, `lp` in u1.u2.
+// All three fail at every tick from 15, so a report set counts how many are
+// still enabled -- "35" means one survived that tick and "35 35" means two.
+constexpr std::string_view control_hier = R"(
+module leaf(input bit clk, input bit a, input bit b);
+  lp: assert property (@(posedge clk) a |=> b);
+endmodule
+module mid(input bit clk, input bit a, input bit b);
+  mp: assert property (@(posedge clk) a |=> b);
+  leaf u2(.clk(clk), .a(a), .b(b));
+endmodule
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 1, b = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  mid u1(.clk(clk), .a(a), .b(b));
+  tp: assert property (@(posedge clk) a |=> b);
+  initial #22 CONTROL;
+  initial #48 $finish;
+endmodule
+)";
+
+std::string control_hier_run(std::string_view control) {
+    return report_times(substituted(control_hier, "CONTROL", control));
+}
+
+TEST_CASE("an assertion control task addresses the scope it names") {
+    // Ticks 15 and 25 are three reports each either way: 15 is before the task
+    // runs, and 25 belongs to attempts already in flight at 22. What the target
+    // decides is 35 and 45.
+    //
+    // Every assertion, named by leaving the list off entirely.
+    CHECK(control_hier_run("$assertoff") == "15 15 15 25 25 25");
+    // u1 and everything under it: `mp` and `lp` stop, `tp` in the top does not.
+    CHECK(control_hier_run("$assertoff(0, u1)") == "15 15 15 25 25 25 35 45");
+    // One assertion by name. A label makes a scope slang resolves the
+    // hierarchical name to, which is what LRM 20.12's list_of_scopes_or_assertions
+    // means by naming an assertion.
+    CHECK(control_hier_run("$assertoff(0, u1.u2.lp)") == "15 15 15 25 25 25 35 35 45 45");
+}
+
+TEST_CASE("an assertion control task's levels bounds how far down it reaches") {
+    // 1 is the named scope alone (the $dumpvars rule 20.12 defers to), so `mp`
+    // stops and `lp` one level below it does not: two reports left per tick.
+    CHECK(control_hier_run("$assertoff(1, u1)") == "15 15 15 25 25 25 35 35 45 45");
+    // 2 reaches u1.u2 as well, and 0 means every level below -- the same set
+    // here, which is what makes the pair a check on the counting rather than on
+    // one arithmetic accident.
+    CHECK(control_hier_run("$assertoff(2, u1)") == "15 15 15 25 25 25 35 45");
+    CHECK(control_hier_run("$assertoff(0, u1)") == "15 15 15 25 25 25 35 45");
+}
+
+// A cover and an assert side by side, each with an action block that prints its
+// own marker, so a directive_type filter is visible as one running while the
+// other does not. The cover is a bare sequence: an implication would cover
+// vacuously and slang warns about exactly that.
+constexpr std::string_view control_actions = R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 1, b = 1;
+  always @(posedge clk) $display("[%0t]", $time);
+  cp: cover property (@(posedge clk) a ##1 b) $display("cover hit");
+  ap: assert property (@(posedge clk) a |=> b) $display("assert pass");
+  initial begin CONTROL end
+  initial #38 $finish;
+endmodule
+)";
+
+std::string control_action_run(std::string_view control, std::string_view marker) {
+    return report_times(substituted(control_actions, "CONTROL", control), marker);
+}
+
+TEST_CASE("$assertcontrol's directive_type picks which directives it controls") {
+    // Both actions run at 15, 25 and 35 with nothing controlling them.
+    CHECK(control_action_run("", "cover hit") == "15 25 35");
+    CHECK(control_action_run("", "assert pass") == "15 25 35");
+    // PassOff over concurrent ASSERT directives only (LRM Table 20-7 bit 1): the
+    // assert's pass action stops and the cover's match action does not.
+    CHECK(control_action_run("#12 $assertcontrol(7, 1, 1);", "assert pass") == "");
+    CHECK(control_action_run("#12 $assertcontrol(7, 1, 1);", "cover hit") == "15 25 35");
+    // Bit 2 is COVER, and selects the other one.
+    CHECK(control_action_run("#12 $assertcontrol(7, 1, 2);", "assert pass") == "15 25 35");
+    CHECK(control_action_run("#12 $assertcontrol(7, 1, 2);", "cover hit") == "");
+}
+
+TEST_CASE("$assertcontrol LOCK holds a control state against a later task") {
+    // Locked at 7, so the PassOff at 12 writes nothing and both actions keep
+    // running. Without the lock the same PassOff silences both, which is the
+    // second line -- so this fails if the lock select were dropped from the
+    // control writes rather than merely reordered.
+    CHECK(control_action_run("#7 $assertcontrol(1); #12 $assertpassoff;", "cover hit") == "15 25 35");
+    CHECK(control_action_run("#7 $assertcontrol(1); #12 $assertpassoff;", "assert pass") == "15 25 35");
+    CHECK(control_action_run("#12 $assertpassoff;", "cover hit") == "");
+    // UNLOCK is not itself blocked by the lock it lifts, or a lock would be
+    // permanent. The PassOff lands at 19, after the hit at 15 and before the
+    // ones at 25 and 35, so those two are the ones it takes.
+    CHECK(control_action_run("#7 $assertcontrol(1); #10 $assertcontrol(2); #2 $assertpassoff;", "cover hit") == "15");
+}
+
+TEST_CASE("a non-constant assertion control argument is refused") {
+    // The control code decides which bits are emitted into which assertions, so
+    // it is not a value a running process can supply -- and the message says so
+    // rather than reporting the task as unsupported, which would be wrong.
+    refuses(R"(
+module t;
+  bit clk = 0;
+  int c;
+  bit a = 1, b = 0;
+  ap: assert property (@(posedge clk) a |=> b);
+  initial begin
+    c = 3;
+    $assertcontrol(c);
+  end
+endmodule
+)",
+            "control_type argument of an assertion control task must be a constant");
+
+    // The same for `levels`, which decides how much of the hierarchy is written.
+    refuses(R"(
+module t;
+  bit clk = 0;
+  int n;
+  bit a = 1, b = 0;
+  ap: assert property (@(posedge clk) a |=> b);
+  initial begin
+    n = 1;
+    $assertoff(n);
+  end
+endmodule
+)",
+            "levels argument of an assertion control task must be a constant");
+
+    // A code outside LRM Table 20-5 is a design error rather than a gap, and is
+    // named as one.
+    refuses(R"(
+module t;
+  bit clk = 0;
+  bit a = 1, b = 0;
+  ap: assert property (@(posedge clk) a |=> b);
+  initial $assertcontrol(99);
+endmodule
+)",
+            "control_type 99 is not one of LRM Table 20-5's codes");
+}
+
+TEST_CASE("assertion control over an immediate assertion is refused, not ignored") {
+    // The default assertion_type covers immediate assertions, which lower inline
+    // with no state to gate. Leaving them running under `$assertoff` would be a
+    // silent divergence, so the task refuses and says how to narrow it.
+    refuses(R"(
+module t;
+  bit clk = 0;
+  bit a = 1, b = 0;
+  ap: assert property (@(posedge clk) a |=> b);
+  always @(posedge clk) assert (a);
+  initial #12 $assertoff;
+endmodule
+)",
+            "over immediate assertions is not supported");
+}
+
+TEST_CASE("a design with no control task carries no control state") {
+    // The whole mechanism is allocated only for a design that calls a control
+    // task, so an ordinary assertion's emitted state is exactly what it was.
+    LowerResult       out;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk;
+  bit a, b;
+  ap: assert property (@(posedge clk) a |=> b);
+endmodule
+)",
+                                            out);
+    CHECK(out.ok);
+    for (const ir::SignalInfo& s : m.signals()) {
+        CHECK(s.name.find("sva.ctl") == std::string::npos);
+    }
+
+    // And a design that does call one carries exactly the five bits, once.
+    LowerResult       ctl;
+    const ir::Module& cm = lower_for_monitor(R"(
+module t;
+  bit clk;
+  bit a, b;
+  ap: assert property (@(posedge clk) a |=> b);
+  initial $assertoff;
+endmodule
+)",
+                                             ctl);
+    CHECK(ctl.ok);
+    CHECK(find_signal(cm, "sva.ctl0.off") != nullptr);
+    CHECK(find_signal(cm, "sva.ctl0.kill") != nullptr);
+    CHECK(find_signal(cm, "sva.ctl0.poff") != nullptr);
+    CHECK(find_signal(cm, "sva.ctl0.foff") != nullptr);
+    CHECK(find_signal(cm, "sva.ctl0.lock") != nullptr);
+    CHECK(find_signal(cm, "sva.ctl1.off") == nullptr);
+    // The monitor's own state is untouched by any of it.
+    CHECK(state_width(cm, "sva.0.pend0") == 1);
+    CHECK(state_width(cm, "sva.0.clk") == 1);
 }

@@ -767,6 +767,10 @@ Index Builder::dump_vars(SourceLoc loc) {
     return emit({ Inst::Tag::DumpVars, pay(&Inst::Payload::none, 0u) }, loc);
 }
 
+Index Builder::dump_limit(Index bytes, SourceLoc loc) {
+    return emit({ Inst::Tag::DumpLimit, pay(&Inst::Payload::unary, bytes) }, loc);
+}
+
 Index Builder::dump_control(Inst::Tag tag, SourceLoc loc) {
     return emit({ tag, pay(&Inst::Payload::none, 0u) }, loc);
 }

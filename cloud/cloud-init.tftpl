@@ -1,0 +1,12 @@
+#cloud-config
+# Runs at first boot. Box-setup only (deps + quiet hardware); no secrets. The
+# self-delete watchdog is armed later over SSH by run.sh, once the server id is
+# known. box_setup_b64 is the base64 of cloud/box-setup.sh (single source).
+write_files:
+  - path: /opt/clotho/box-setup.sh
+    permissions: "0755"
+    encoding: b64
+    content: ${box_setup_b64}
+runcmd:
+  - [ bash, /opt/clotho/box-setup.sh ]
+  - [ touch, /opt/clotho/.box-setup-done ]

@@ -86,6 +86,36 @@ std::string SourceContext::render_file_line(ir::SourceLoc loc) const {
     return pos.file + ":" + std::to_string(pos.line);
 }
 
+std::string SourceContext::full_path(ir::SourceLoc loc) const {
+    if (sm_ == nullptr || loc == ir::SourceLoc{ 0 }) {
+        return {};
+    }
+
+    const slang::SourceLocation sl = to_slang_location(loc);
+    if (!sl.valid() || !sm_->isFileLoc(sl)) {
+        return {};
+    }
+
+    return sm_->getFullPath(sl.buffer()).string();
+}
+
+std::optional<uint32_t> SourceContext::offset(ir::SourceLoc loc) const {
+    if (sm_ == nullptr || loc == ir::SourceLoc{ 0 }) {
+        return std::nullopt;
+    }
+
+    const slang::SourceLocation sl = to_slang_location(loc);
+    if (!sl.valid() || !sm_->isFileLoc(sl)) {
+        return std::nullopt;
+    }
+
+    return static_cast<uint32_t>(sl.offset());
+}
+
+const slang::ast::Compilation* SourceContext::compilation() const {
+    return comp_.get();
+}
+
 std::string SourceContext::line_text(ir::SourceLoc loc) const {
     if (sm_ == nullptr || loc == ir::SourceLoc{ 0 }) {
         return {};

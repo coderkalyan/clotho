@@ -55,7 +55,12 @@ struct Request {
     // The bound property expression, with a clocking wrapper at its top and the
     // disable-iff wrapper already peeled off by the caller.
     const slang::ast::AssertionExpr* property = nullptr;
-    // The disable-iff condition, or null when the assertion never disables.
+    // The disable-iff condition, or null when the assertion never disables. Like
+    // `clock` it may have been hoisted out of a named property's declaration --
+    // LRM 16.12 puts the clause at the top of a property_spec, and a declaration
+    // body is one -- in which case the DisableIff node stays where the user wrote
+    // it and the walk has to be told which one it may step over. Every other one
+    // is a nesting refusal.
     const slang::ast::Expression* disable = nullptr;
     // The assertion's clocking event. A clock written inside a named sequence or
     // property stays in the tree (LRM 16.13.1 lets it flow out to the whole

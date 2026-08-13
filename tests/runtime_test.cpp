@@ -178,6 +178,17 @@ std::string str_bytes(const rt_string& s) {
     return out;
 }
 
+// The allocation site every string call below reports against. A test drives the
+// runtime directly, with no JIT'd design to bake a real source location into a
+// constant global, so this stands in for one: it is only ever read on the fatal
+// path, which no test here reaches.
+constexpr rt_alloc_site kSite{ .where      = "<runtime test>",
+                               .line       = "",
+                               .what       = "string",
+                               .line_no    = 0,
+                               .column     = 0,
+                               .end_column = 0 };
+
 // A guard pairing init with deinit so tests can't leak on CHECK failures.
 struct Str {
     rt_string s;
@@ -186,7 +197,7 @@ struct Str {
     }
     explicit Str(std::string_view v) {
         rt_string_init(&s);
-        rt_string_assign_bytes(&s, v.data(), v.size());
+        rt_string_assign_bytes(&s, v.data(), v.size(), &kSite);
     }
     ~Str() {
         rt_string_deinit(&s);
@@ -231,7 +242,7 @@ TEST_CASE("rt_string round-trips byte sequences across the inline/heap boundary"
         for (size_t k = 0; k < n; ++k) {
             v += static_cast<char>('a' + k % 26);
         }
-        rt_string_assign_bytes(&s.s, v.data(), v.size());
+        rt_string_assign_bytes(&s.s, v.data(), v.size(), &kSite);
         CHECK(rt_string_len(&s.s) == n);
         CHECK(str_bytes(s.s) == v);
     }
@@ -240,14 +251,14 @@ TEST_CASE("rt_string round-trips byte sequences across the inline/heap boundary"
 TEST_CASE("rt_string_assign deep-copies and tolerates self-assignment") {
     Str a{ "hello world, this string is long enough to live on the heap" };
     Str b;
-    rt_string_assign(&b.s, &a.s);
+    rt_string_assign(&b.s, &a.s, &kSite);
     CHECK(str_bytes(b.s) == str_bytes(a.s));
 
     // Deep copy: mutating the source must not affect the copy.
     rt_string_putc(&a.s, 0, 'H');
     CHECK(str_bytes(b.s)[0] == 'h');
 
-    rt_string_assign(&a.s, &a.s);
+    rt_string_assign(&a.s, &a.s, &kSite);
     CHECK(str_bytes(a.s)[0] == 'H');
 }
 
@@ -287,15 +298,15 @@ TEST_CASE("rt_string_cmp and icmp order in strcmp fashion") {
 TEST_CASE("rt_string_substr yields the inclusive range or empty on invalid bounds") {
     Str s{ "hello" };
     Str d;
-    rt_string_substr(&d.s, &s.s, 1, 3);
+    rt_string_substr(&d.s, &s.s, 1, 3, &kSite);
     CHECK(str_bytes(d.s) == "ell");
-    rt_string_substr(&d.s, &s.s, 0, 4);
+    rt_string_substr(&d.s, &s.s, 0, 4, &kSite);
     CHECK(str_bytes(d.s) == "hello");
-    rt_string_substr(&d.s, &s.s, -1, 2); // i < 0
+    rt_string_substr(&d.s, &s.s, -1, 2, &kSite); // i < 0
     CHECK(rt_string_len(&d.s) == 0);
-    rt_string_substr(&d.s, &s.s, 3, 2); // j < i
+    rt_string_substr(&d.s, &s.s, 3, 2, &kSite); // j < i
     CHECK(rt_string_len(&d.s) == 0);
-    rt_string_substr(&d.s, &s.s, 0, 5); // j >= len
+    rt_string_substr(&d.s, &s.s, 0, 5, &kSite); // j >= len
     CHECK(rt_string_len(&d.s) == 0);
 }
 
@@ -306,27 +317,27 @@ TEST_CASE("rt_string_concat handles aliasing and empty parts; repl handles count
 
     const rt_string* parts1[] = { &a.s, &empty.s, &b.s };
     Str              d;
-    rt_string_concat(&d.s, parts1, 3);
+    rt_string_concat(&d.s, parts1, 3, &kSite);
     CHECK(str_bytes(d.s) == "foobar");
 
     // dst aliases a part: a = {a, b}.
     const rt_string* parts2[] = { &a.s, &b.s };
-    rt_string_concat(&a.s, parts2, 2);
+    rt_string_concat(&a.s, parts2, 2, &kSite);
     CHECK(str_bytes(a.s) == "foobar");
 
     Str r;
-    rt_string_repl(&r.s, &b.s, 3);
+    rt_string_repl(&r.s, &b.s, 3, &kSite);
     CHECK(str_bytes(r.s) == "barbarbar");
-    rt_string_repl(&r.s, &b.s, 0);
+    rt_string_repl(&r.s, &b.s, 0, &kSite);
     CHECK(rt_string_len(&r.s) == 0);
 }
 
 TEST_CASE("rt_string_toupper and tolower transform ASCII letters, aliasing allowed") {
     Str s{ "Hello, World 123!" };
     Str d;
-    rt_string_toupper(&d.s, &s.s);
+    rt_string_toupper(&d.s, &s.s, &kSite);
     CHECK(str_bytes(d.s) == "HELLO, WORLD 123!");
-    rt_string_tolower(&d.s, &d.s);
+    rt_string_tolower(&d.s, &d.s, &kSite);
     CHECK(str_bytes(d.s) == "hello, world 123!");
 }
 
@@ -334,22 +345,22 @@ TEST_CASE("rt_string_from_packed drops zero bytes and masks the partial top byte
     // LRM §6.16 example: string'(12'ha41) — bytes MSB-first are 0x0a, 0x41.
     Str           d;
     const uint8_t v12[2] = { 0x41, 0x0a }; // little-endian val plane
-    rt_string_from_packed(&d.s, v12, 12);
+    rt_string_from_packed(&d.s, v12, 12, &kSite);
     CHECK(str_bytes(d.s) == "\x0a\x41");
 
     // A zero byte inside the value is dropped.
     const uint8_t v24[4] = { 0x42, 0x00, 0x41, 0x00 }; // 24'h410042, plane_bytes(24)=4
-    rt_string_from_packed(&d.s, v24, 24);
+    rt_string_from_packed(&d.s, v24, 24, &kSite);
     CHECK(str_bytes(d.s) == "AB");
 
     const uint8_t zero[1] = { 0x00 };
-    rt_string_from_packed(&d.s, zero, 8);
+    rt_string_from_packed(&d.s, zero, 8, &kSite);
     CHECK(rt_string_len(&d.s) == 0);
 
     // Top-byte masking: bits above width read as 0. 12-bit value whose buffer
     // byte 1 carries junk above bit 3.
     const uint8_t vjunk[2] = { 0x41, 0xf0 };
-    rt_string_from_packed(&d.s, vjunk, 12);
+    rt_string_from_packed(&d.s, vjunk, 12, &kSite);
     CHECK(str_bytes(d.s) == "A");
 }
 
@@ -436,29 +447,29 @@ TEST_CASE("rt_string_atoreal accepts leading whitespace and '+', unlike atoi") {
 
 TEST_CASE("rt_string itoa family formats sign + magnitude, not two's-complement") {
     Str d;
-    rt_string_itoa(&d.s, 123);
+    rt_string_itoa(&d.s, 123, &kSite);
     CHECK(str_bytes(d.s) == "123");
-    rt_string_itoa(&d.s, -123);
+    rt_string_itoa(&d.s, -123, &kSite);
     CHECK(str_bytes(d.s) == "-123");
 
-    rt_string_hextoa(&d.s, 255);
+    rt_string_hextoa(&d.s, 255, &kSite);
     CHECK(str_bytes(d.s) == "ff");
-    rt_string_hextoa(&d.s, -256); // sign + magnitude, matching iverilog
+    rt_string_hextoa(&d.s, -256, &kSite); // sign + magnitude, matching iverilog
     CHECK(str_bytes(d.s) == "-100");
 
-    rt_string_octtoa(&d.s, 8);
+    rt_string_octtoa(&d.s, 8, &kSite);
     CHECK(str_bytes(d.s) == "10");
-    rt_string_bintoa(&d.s, 5);
+    rt_string_bintoa(&d.s, 5, &kSite);
     CHECK(str_bytes(d.s) == "101");
 }
 
 TEST_CASE("rt_string_realtoa formats at full round-trip precision") {
     Str d;
-    rt_string_realtoa(&d.s, 3.14);
+    rt_string_realtoa(&d.s, 3.14, &kSite);
     CHECK(str_bytes(d.s) == "3.14");
-    rt_string_realtoa(&d.s, 100.0);
+    rt_string_realtoa(&d.s, 100.0, &kSite);
     CHECK(str_bytes(d.s) == "100"); // no trailing ".0"
-    rt_string_realtoa(&d.s, 123456789.123);
+    rt_string_realtoa(&d.s, 123456789.123, &kSite);
     CHECK(str_bytes(d.s) == "123456789.123"); // full precision, unlike iverilog's %g
 }
 

@@ -439,6 +439,8 @@ const char* tag_name(Inst::Tag tag) {
             return "dump_file";
         case T::DumpVars:
             return "dump_vars";
+        case T::DumpLimit:
+            return "dump_limit";
         case T::DumpOff:
             return "dump_off";
         case T::DumpOn:

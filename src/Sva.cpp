@@ -14,6 +14,8 @@
 
 #include <ankerl/unordered_dense.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 
@@ -27,22 +29,56 @@ using slang::ast::BinaryAssertionOperator;
 using slang::ast::Expression;
 using slang::ast::ExpressionKind;
 
+// The libsva header this file was compiled against, checked against the archive
+// actually linked. libsva used to enforce the pairing with size constants for
+// its objects, which could only ever be checked from one side: a header from a
+// different build passed compilation and then overran memory at run time. The
+// objects are opaque now and a version replaces the sizes, because a version can
+// be compared from both sides.
+//
+// Deliberately not a global constructor. A build mismatch is worth catching the
+// first time clotho actually lowers an assertion -- in a run that was going to
+// touch libsva anyway -- rather than at load time in every invocation that never
+// sees one. The function-local static makes that one relaxed load afterwards.
+//
+// Not an assert() either: NDEBUG is set in Release, and a release build silently
+// reading tables through a mismatched ABI is exactly the failure being removed.
+void check_libsva_abi() {
+    static const bool ok = [] {
+        const uint32_t linked = sva_abi_version();
+        if (linked != SVA_ABI_VERSION) {
+            std::fprintf(stderr,
+                         "clotho: libsva ABI mismatch -- compiled against version %u, "
+                         "linked against version %u. The header and the static library "
+                         "are from different builds of libsva; rebuild it.\n",
+                         static_cast<unsigned>(SVA_ABI_VERSION),
+                         static_cast<unsigned>(linked));
+            std::abort();
+        }
+        return true;
+    }();
+    (void)ok;
+}
+
 // libsva reports failures against a node; the front-end reports against source.
 // This maps one to the other by remembering, per libsva node, the AssertionExpr
 // that produced it.
 class Lowering {
 public:
-    Lowering(Result& out, const slang::ast::TimingControl* clock) : out_(out), clock_(clock) {
-        sva_ir_init(&ir_);
+    Lowering(Result& out, const slang::ast::TimingControl* clock, const Expression* disable)
+        : out_(out), clock_(clock), disable_(disable) {
+        ir_ = sva_ir_create();
     }
     ~Lowering() {
-        sva_ir_deinit(&ir_);
+        sva_ir_destroy(ir_);
     }
     Lowering(const Lowering&) = delete;
     Lowering& operator=(const Lowering&) = delete;
 
+    // Null when the IR could not be allocated. lower() checks that once, before
+    // any builder runs, so no caller below here has to.
     sva_ir* ir() {
-        return &ir_;
+        return ir_;
     }
 
     // Record a failure once; the first one wins so the innermost cause survives.
@@ -85,8 +121,8 @@ public:
                 // negated operands, and vice versa.
                 sva_node node = 0;
                 const bool want_and = is_and != negated;
-                const sva_status status = want_and ? sva_bool_and(&ir_, *lhs, *rhs, &node)
-                                                   : sva_bool_or(&ir_, *lhs, *rhs, &node);
+                const sva_status status = want_and ? sva_bool_and(ir_, *lhs, *rhs, &node)
+                                                   : sva_bool_or(ir_, *lhs, *rhs, &node);
                 if (status != SVA_OK) {
                     return reject("out of memory building an assertion guard", blame);
                 }
@@ -126,7 +162,7 @@ public:
                     return std::nullopt;
                 }
                 sva_node node = 0;
-                if (sva_seq_boolean(&ir_, *guard, &node) != SVA_OK) {
+                if (sva_seq_boolean(ir_, *guard, &node) != SVA_OK) {
                     return reject("out of memory building an assertion sequence", &expr);
                 }
                 if (simple.repetition) {
@@ -215,7 +251,7 @@ public:
                     return std::nullopt;
                 }
                 sva_node node = 0;
-                if (build(&ir_, *lhs, *rhs, &node) != SVA_OK) {
+                if (build(ir_, *lhs, *rhs, &node) != SVA_OK) {
                     return reject("out of memory building an assertion sequence", &expr);
                 }
                 return node;
@@ -242,7 +278,7 @@ public:
                 // its operand's -- so SVA_ERROR_STATE_LIMIT is a reachable,
                 // user-visible outcome and gets the sentence sva_lower uses for
                 // it rather than a misleading complaint about memory.
-                const sva_status status = sva_seq_first_match(&ir_, *seq, &node);
+                const sva_status status = sva_seq_first_match(ir_, *seq, &node);
                 if (status == SVA_ERROR_STATE_LIMIT) {
                     return reject("`first_match` needs more automaton states than the "
                                   "limit allows, because it determinises its operand",
@@ -294,7 +330,7 @@ public:
             return std::nullopt;
         }
         sva_node node = 0;
-        if (sva_seq_throughout(&ir_, *guard, *seq, &node) != SVA_OK) {
+        if (sva_seq_throughout(ir_, *guard, *seq, &node) != SVA_OK) {
             return reject("out of memory building an assertion sequence", &blame);
         }
         return node;
@@ -331,7 +367,7 @@ public:
                 acc = head;
             }
             sva_node node = 0;
-            if (sva_seq_delay(&ir_, *acc, lo, hi, *next, &node) != SVA_OK) {
+            if (sva_seq_delay(ir_, *acc, lo, hi, *next, &node) != SVA_OK) {
                 return reject("out of memory building an assertion delay", &blame);
             }
             acc = node;
@@ -387,7 +423,7 @@ public:
                           &blame);
         }
         sva_node node = 0;
-        if (sva_seq_repeat(&ir_, kind, operand, lo, hi, &node) != SVA_OK) {
+        if (sva_seq_repeat(ir_, kind, operand, lo, hi, &node) != SVA_OK) {
             return reject("out of memory building an assertion repetition", &blame);
         }
         return node;
@@ -481,6 +517,25 @@ public:
         return clock_ != nullptr && wrapper.clocking.isEquivalentTo(*clock_);
     }
 
+    // Whether this `disable iff` is the one that became the assertion's reset.
+    // Same hoist as the clock above: LRM 16.12 allows the clause at the top of a
+    // property declaration as well as at the top of the assertion, the caller
+    // lifted whichever one is there into Request::disable, and stepping over that
+    // node here is exactly what the lift means.
+    //
+    // Identity and not equivalence, which is where this parts company with
+    // is_assertion_clock. A clock is written once and may be instantiated many
+    // times, so two structurally equal events are one clock; 16.12 instead says
+    // "Nesting of disable iff clauses, explicitly or through property
+    // instantiations, is not allowed", so a second clause is a second reset
+    // however it is spelled and must not be absorbed by matching the first one's
+    // text. slang hands back one bound body per instantiation with the actuals
+    // already substituted, so the condition the caller passed back IS the object
+    // reached here -- pointer equality is exact rather than approximate.
+    bool is_assertion_disable(const slang::ast::DisableIffAssertionExpr& wrapper) const {
+        return disable_ != nullptr && &wrapper.condition == disable_;
+    }
+
     // -- Property layer ------------------------------------------------------
 
     std::optional<sva_node> property(const AssertionExpr& expr,
@@ -522,15 +577,25 @@ public:
                 }
                 return property(wrapper.expr, strength);
             }
-            case AssertionExprKind::DisableIff:
-                // Only a `disable iff` at the top of the assertion is peeled, by
-                // lower_concurrent_assertion, which is the only place that can
-                // put one in the sva::Request. LRM 16.12 also allows it at the
-                // top of a `property` declaration, where reaching the request
-                // means hoisting it back out through the instantiation.
-                // TODO: `disable iff` inside a named property declaration.
-                return reject("a `disable iff` inside a named property is not supported yet",
-                              &expr);
+            case AssertionExprKind::DisableIff: {
+                // `property p; disable iff (rst) a |=> b; endproperty`, hoisted by
+                // lower_concurrent_assertion. Stepped over at THIS layer for the
+                // same reason the clocking wrapper above is: the property under it
+                // is a property, and the sequence tail could not lower one.
+                const auto& wrapper = expr.as<slang::ast::DisableIffAssertionExpr>();
+                if (!is_assertion_disable(wrapper)) {
+                    // Either a second clause, or one somewhere the caller does not
+                    // hoist from -- under `and`, `until`, an abort. Both are LRM
+                    // 16.12 violations that slang diagnoses first
+                    // (diag::NestedDisableIff); this stays behind it because
+                    // absorbing one would reset an operand the user scoped it to,
+                    // or the whole assertion the user did not.
+                    return reject("only one `disable iff` is allowed, at the top of the "
+                                  "assertion or of the named property it instantiates",
+                                  &expr);
+                }
+                return property(wrapper.expr, strength);
+            }
             case AssertionExprKind::Binary: {
                 const auto& binary = expr.as<slang::ast::BinaryAssertionExpr>();
                 switch (binary.op) {
@@ -601,7 +666,7 @@ public:
             return std::nullopt;
         }
         sva_node node = 0;
-        if (sva_prop_sequence(&ir_, strength, *seq, &node) != SVA_OK) {
+        if (sva_prop_sequence(ir_, strength, *seq, &node) != SVA_OK) {
             return reject("out of memory building an assertion property", &expr);
         }
         return node;
@@ -820,7 +885,7 @@ public:
         const sva_implication kind =
             binary.op == BinaryAssertionOperator::OverlappedImplication ? SVA_OVERLAPPING
                                                                        : SVA_NONOVERLAPPING;
-        if (sva_prop_implies(&ir_, kind, *antecedent, *consequent, &node) != SVA_OK) {
+        if (sva_prop_implies(ir_, kind, *antecedent, *consequent, &node) != SVA_OK) {
             return reject("out of memory building an assertion property", &blame);
         }
         return node;
@@ -888,7 +953,7 @@ public:
         }
         sva_node node = 0;
         const sva_shift kind = conjunctive ? SVA_SHIFT_EVERY : SVA_SHIFT_SOME;
-        if (sva_prop_shift(&ir_, kind, lo, hi, *operand, &node) != SVA_OK) {
+        if (sva_prop_shift(ir_, kind, lo, hi, *operand, &node) != SVA_OK) {
             return reject("out of memory building an assertion property", &blame);
         }
         return node;
@@ -936,7 +1001,7 @@ public:
         const sva_implication kind =
             binary.op == BinaryAssertionOperator::OverlappedFollowedBy ? SVA_OVERLAPPING
                                                                        : SVA_NONOVERLAPPING;
-        if (sva_prop_followed_by(&ir_, kind, *antecedent, *consequent, &node) != SVA_OK) {
+        if (sva_prop_followed_by(ir_, kind, *antecedent, *consequent, &node) != SVA_OK) {
             return reject("out of memory building an assertion property", &blame);
         }
         return node;
@@ -976,7 +1041,7 @@ public:
         sva_node node = 0;
         const sva_junction kind =
             binary.op == BinaryAssertionOperator::And ? SVA_CONJUNCTION : SVA_DISJUNCTION;
-        if (sva_prop_junction(&ir_, kind, *lhs, *rhs, &node) != SVA_OK) {
+        if (sva_prop_junction(ir_, kind, *lhs, *rhs, &node) != SVA_OK) {
             return reject("out of memory building an assertion property", &blame);
         }
         return node;
@@ -1012,7 +1077,7 @@ public:
             return std::nullopt;
         }
         sva_node out = 0;
-        if (sva_prop_abort(&ir_, kind, *cond, *operand, &out) != SVA_OK) {
+        if (sva_prop_abort(ir_, kind, *cond, *operand, &out) != SVA_OK) {
             return reject("out of memory building an assertion property", &blame);
         }
         return out;
@@ -1033,7 +1098,7 @@ public:
     // on its left.
     std::optional<sva_node> guard_sequence(sva_node guard, const AssertionExpr& blame) {
         sva_node node = 0;
-        if (sva_seq_boolean(&ir_, guard, &node) != SVA_OK) {
+        if (sva_seq_boolean(ir_, guard, &node) != SVA_OK) {
             return reject("out of memory building an assertion sequence", &blame);
         }
         return node;
@@ -1059,7 +1124,7 @@ public:
                           &arm);
         }
         sva_node node = 0;
-        if (sva_prop_followed_by(&ir_, SVA_OVERLAPPING, *antecedent, *consequent, &node) !=
+        if (sva_prop_followed_by(ir_, SVA_OVERLAPPING, *antecedent, *consequent, &node) !=
             SVA_OK) {
             return reject("out of memory building an assertion property", &blame);
         }
@@ -1081,11 +1146,11 @@ public:
             return std::nullopt;
         }
         sva_node arm = 0;
-        if (sva_prop_sequence(&ir_, strength, *body, &arm) != SVA_OK) {
+        if (sva_prop_sequence(ir_, strength, *body, &arm) != SVA_OK) {
             return reject("out of memory building an assertion property", &blame);
         }
         sva_node node = 0;
-        if (sva_prop_followed_by(&ir_, SVA_OVERLAPPING, *antecedent, arm, &node) != SVA_OK) {
+        if (sva_prop_followed_by(ir_, SVA_OVERLAPPING, *antecedent, arm, &node) != SVA_OK) {
             return reject("out of memory building an assertion property", &blame);
         }
         return node;
@@ -1093,7 +1158,7 @@ public:
 
     std::optional<sva_node> disjoin(sva_node lhs, sva_node rhs, const AssertionExpr& blame) {
         sva_node node = 0;
-        if (sva_prop_junction(&ir_, SVA_DISJUNCTION, lhs, rhs, &node) != SVA_OK) {
+        if (sva_prop_junction(ir_, SVA_DISJUNCTION, lhs, rhs, &node) != SVA_OK) {
             return reject("out of memory building an assertion property", &blame);
         }
         return node;
@@ -1156,8 +1221,8 @@ public:
                 }
                 sva_node any = 0;
                 sva_node none = 0;
-                if (sva_bool_or(&ir_, *matches, *hit, &any) != SVA_OK ||
-                    sva_bool_and(&ir_, *misses, *miss, &none) != SVA_OK) {
+                if (sva_bool_or(ir_, *matches, *hit, &any) != SVA_OK ||
+                    sva_bool_and(ir_, *misses, *miss, &none) != SVA_OK) {
                     return reject("out of memory building an assertion guard", &blame);
                 }
                 matches = any;
@@ -1172,7 +1237,7 @@ public:
             // The first-match guard: this item's labels, and no earlier item's.
             sva_node guard = *matches;
             if (earlier) {
-                if (sva_bool_and(&ir_, *earlier, *matches, &guard) != SVA_OK) {
+                if (sva_bool_and(ir_, *earlier, *matches, &guard) != SVA_OK) {
                     return reject("out of memory building an assertion guard", &blame);
                 }
             }
@@ -1194,7 +1259,7 @@ public:
                 earlier = misses;
             } else {
                 sva_node none = 0;
-                if (sva_bool_and(&ir_, *earlier, *misses, &none) != SVA_OK) {
+                if (sva_bool_and(ir_, *earlier, *misses, &none) != SVA_OK) {
                     return reject("out of memory building an assertion guard", &blame);
                 }
                 earlier = none;
@@ -1252,7 +1317,7 @@ public:
             out_.atoms.push_back(Atom{ &expr, match, negated });
         }
         sva_node node = 0;
-        if (sva_bool_atom(&ir_, slot.first->second, &node) != SVA_OK) {
+        if (sva_bool_atom(ir_, slot.first->second, &node) != SVA_OK) {
             return reject("out of memory building an assertion atom", blame);
         }
         return node;
@@ -1261,20 +1326,25 @@ public:
     std::optional<sva_node> one_cycle_true(const AssertionExpr& blame) {
         sva_node always = 0;
         sva_node node = 0;
-        if (sva_bool_const(&ir_, true, &always) != SVA_OK ||
-            sva_seq_boolean(&ir_, always, &node) != SVA_OK) {
+        if (sva_bool_const(ir_, true, &always) != SVA_OK ||
+            sva_seq_boolean(ir_, always, &node) != SVA_OK) {
             return reject("out of memory building an assertion sequence", &blame);
         }
         return node;
     }
 
 private:
-    sva_ir ir_{};
+    // Owned. libsva allocates it; the destructor hands it back, and that is
+    // null-tolerant, so a failed create needs no special case here.
+    sva_ir* ir_ = nullptr;
     Result& out_;
     // The assertion's clocking event, so a nested one written where the user
     // wrote it can be told from a second clock. Never null in practice; the
     // caller has already refused an assertion with no clock at all.
     const slang::ast::TimingControl* clock_ = nullptr;
+    // The `disable iff` condition the caller hoisted, so the node it came from can
+    // be told from a second clause. Null when the assertion never disables.
+    const Expression* disable_ = nullptr;
     ankerl::unordered_dense::map<std::tuple<const void*, const void*, bool>, uint32_t> atoms_;
 };
 
@@ -1391,8 +1461,14 @@ bool available() {
 }
 
 Result lower(const Request& request) {
+    check_libsva_abi();
+
     Result out;
-    Lowering lowering(out, request.clock);
+    Lowering lowering(out, request.clock, request.disable);
+    if (lowering.ir() == nullptr) {
+        out.error = "out of memory building an assertion";
+        return out;
+    }
 
     const auto property = lowering.property(*request.property);
     if (!property) {
@@ -1428,7 +1504,7 @@ Result lower(const Request& request) {
         return out;
     }
 
-    sva_monitor monitor{};
+    sva_monitor* monitor = nullptr;
     sva_diagnostic reason{};
     const sva_status status =
         sva_lower(&monitor, lowering.ir(), index, nullptr, &reason);
@@ -1493,19 +1569,19 @@ Result lower(const Request& request) {
     }
 
     ir::AssertionMonitor& built = out.monitor;
-    built.kind = static_cast<ir::AssertionKind>(sva_monitor_kind(&monitor));
-    built.strength = sva_monitor_strength(&monitor) == SVA_STRONG ? ir::AssertionStrength::Strong
+    built.kind = static_cast<ir::AssertionKind>(sva_monitor_kind(monitor));
+    built.strength = sva_monitor_strength(monitor) == SVA_STRONG ? ir::AssertionStrength::Strong
                                                                  : ir::AssertionStrength::Weak;
-    built.depth = sva_monitor_depth(&monitor);
-    built.reset_root = sva_monitor_reset(&monitor);
-    built.overlap = sva_monitor_implication(&monitor) == SVA_OVERLAPPING;
-    built.has_trigger = sva_monitor_trigger(&monitor) != nullptr;
+    built.depth = sva_monitor_depth(monitor);
+    built.reset_root = sva_monitor_reset(monitor);
+    built.overlap = sva_monitor_implication(monitor) == SVA_OVERLAPPING;
+    built.has_trigger = sva_monitor_trigger(monitor) != nullptr;
 
-    const uint32_t guards = sva_monitor_guard_count(&monitor);
+    const uint32_t guards = sva_monitor_guard_count(monitor);
     built.cubes.resize(guards);
     for (uint32_t guard = 0; guard < guards; guard++) {
         uint32_t count = 0;
-        const sva_literal* literals = sva_monitor_guard(&monitor, guard, &count);
+        const sva_literal* literals = sva_monitor_guard(monitor, guard, &count);
         built.cubes[guard] = ir::AssertionCube{
             .start = static_cast<uint32_t>(built.literals.size()),
             .len = count,
@@ -1518,39 +1594,39 @@ Result lower(const Request& request) {
         }
     }
 
-    read_automaton(&monitor, sva_monitor_obligation(&monitor), built.obligation);
+    read_automaton(monitor, sva_monitor_obligation(monitor), built.obligation);
     if (built.has_trigger) {
-        read_automaton(&monitor, sva_monitor_trigger(&monitor), built.trigger);
+        read_automaton(monitor, sva_monitor_trigger(monitor), built.trigger);
     }
 
     // The scoped aborts. After the obligation, whose `words` sizes each mask.
-    const uint32_t aborts = sva_monitor_abort_count(&monitor);
+    const uint32_t aborts = sva_monitor_abort_count(monitor);
     built.aborts.reserve(aborts);
     for (uint32_t i = 0; i < aborts; i++) {
         // Never an SVA_ABORT_SYNC_* value here -- whether the condition is
         // sampled is reported separately, so the effect is just the verdict.
-        const bool accept = sva_monitor_abort_effect(&monitor, i) == SVA_ABORT_ACCEPT;
-        const uint64_t* mask = sva_monitor_abort_mask(&monitor, i);
+        const bool accept = sva_monitor_abort_effect(monitor, i) == SVA_ABORT_ACCEPT;
+        const uint64_t* mask = sva_monitor_abort_mask(monitor, i);
         built.aborts.push_back(ir::AssertionAbort{
-            .root = sva_monitor_abort_root(&monitor, i),
+            .root = sva_monitor_abort_root(monitor, i),
             .effect = accept ? ir::AssertionAbortEffect::Accept : ir::AssertionAbortEffect::Reject,
-            .sampled = sva_monitor_abort_sampled(&monitor, i),
-            .resolves_attempt = sva_monitor_abort_resolves_attempt(&monitor, i),
-            .covers_trigger = sva_monitor_abort_covers_trigger(&monitor, i),
+            .sampled = sva_monitor_abort_sampled(monitor, i),
+            .resolves_attempt = sva_monitor_abort_resolves_attempt(monitor, i),
+            .covers_trigger = sva_monitor_abort_covers_trigger(monitor, i),
             .mask = std::vector<uint64_t>(mask, mask + built.obligation.words),
         });
     }
 
     // Root expressions, in the monitor's order. The caller emits one 1-bit
     // evaluation per entry and packs the results into the valuation word.
-    const uint32_t roots = sva_monitor_root_count(&monitor);
-    const sva_node* root_nodes = sva_monitor_roots(&monitor);
+    const uint32_t roots = sva_monitor_root_count(monitor);
+    const sva_node* root_nodes = sva_monitor_roots(monitor);
     out.root_index.reserve(roots);
     for (uint32_t root = 0; root < roots; root++) {
         out.root_index.push_back(read_root(lowering.ir(), root_nodes[root], out));
     }
 
-    sva_monitor_deinit(&monitor);
+    sva_monitor_destroy(monitor);
     out.ok = true;
     return out;
 }

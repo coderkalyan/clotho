@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "ir/Ir.h"
@@ -70,10 +71,39 @@ public:
     // banners, where a column would be noise.
     [[nodiscard]] std::string render_file_line(ir::SourceLoc loc) const;
 
+    // Absolute path of the file a location came from, ignoring any `` `line ``
+    // directives. Empty when the location does not resolve to a file buffer.
+    //
+    // Deliberately not part of SourcePosition. `file` there is what a compiler
+    // PRINTS, and slang renders that relative to the process's working
+    // directory ("../../tmp/a.sv"), which is unusable to a consumer that does
+    // not share the cwd -- an editor being the obvious one, since it needs to
+    // turn the answer back into a file:// URI.
+    [[nodiscard]] std::string full_path(ir::SourceLoc loc) const;
+
     // The source line the location sits on, verbatim and without its newline;
     // empty when unresolvable. Paired with `SourcePosition::column` this is
     // enough to draw the snippet-and-caret block a compiler diagnostic shows.
     [[nodiscard]] std::string line_text(ir::SourceLoc loc) const;
+
+    // Byte offset of a location within its own buffer, for a consumer that has
+    // the buffer text and its own line index. Empty when the location does not
+    // resolve to a file buffer.
+    //
+    // The offset is raw: it ignores `` `line `` directives, which is right for
+    // anyone addressing the actual bytes and wrong for anyone printing a
+    // location, so this and `resolve` are not interchangeable.
+    [[nodiscard]] std::optional<uint32_t> offset(ir::SourceLoc loc) const;
+
+    // The elaborated compilation, when this context adopted one. Null otherwise
+    // -- a context built by `lower_driver` before elaboration has none, and a
+    // default-constructed one never will.
+    //
+    // Exposed for consumers that need the AST rather than just locations: a
+    // language server colours identifiers by walking symbols forward to their
+    // name tokens, which needs the same elaboration lowering already paid for
+    // rather than a second one.
+    [[nodiscard]] const slang::ast::Compilation* compilation() const;
 
     // True when nothing was ever adopted, so every resolve fails. A default
     // context is empty; this lets a consumer skip location work entirely.

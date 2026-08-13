@@ -408,6 +408,8 @@ public:
     // $dumpvars (whole-design form): begin dumping every dumpable signal. The
     // backend supplies the signal set; this node carries no operands.
     Index dump_vars(SourceLoc loc);
+    // $dumplimit: stop dumping once the file reaches `bytes` bytes.
+    Index dump_limit(Index bytes, SourceLoc loc);
     // $dumpoff / $dumpon / $dumpall / $dumpflush. `tag` selects the control; it
     // must be one of the Dump* control tags.
     Index dump_control(Inst::Tag tag, SourceLoc loc);

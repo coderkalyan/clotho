@@ -170,7 +170,7 @@ struct DesignUses {
     // deferred assertion inside a called function or task is rejected in the
     // frontend, so a process scan already covers every case.
     bool defer = false;
-    // Any $dumpfile / $dumpvars / $dump* control. Processes only.
+    // Any $dumpfile / $dumpvars / $dump* control, in processes or functions.
     bool vcd = false;
 };
 

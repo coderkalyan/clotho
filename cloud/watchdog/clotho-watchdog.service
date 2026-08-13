@@ -1,0 +1,6 @@
+[Unit]
+Description=clotho-bench cost watchdog (self-delete on idle / hard cap)
+
+[Service]
+Type=oneshot
+ExecStart=/opt/clotho/clotho-watchdog.sh

@@ -258,6 +258,7 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::ReadMem:
         case Inst::Tag::DumpFile:
         case Inst::Tag::DumpVars:
+        case Inst::Tag::DumpLimit:
         case Inst::Tag::DumpOff:
         case Inst::Tag::DumpOn:
         case Inst::Tag::DumpAll:
@@ -597,13 +598,12 @@ struct Structural {
                     break;
                 case Inst::Tag::DumpFile:
                 case Inst::Tag::DumpVars:
+                case Inst::Tag::DumpLimit:
                 case Inst::Tag::DumpOff:
                 case Inst::Tag::DumpOn:
                 case Inst::Tag::DumpAll:
                 case Inst::Tag::DumpFlush:
-                    if (for_process) {
-                        uses.vcd = true;
-                    }
+                    uses.vcd = true;
                     break;
                 default:
                     break;
@@ -1327,6 +1327,7 @@ struct ValueSweep {
                 case Inst::Tag::TestPlusArgs:
                 case Inst::Tag::DumpFile:
                 case Inst::Tag::DumpVars:
+                case Inst::Tag::DumpLimit:
                 case Inst::Tag::DumpOff:
                 case Inst::Tag::DumpOn:
                 case Inst::Tag::DumpAll:

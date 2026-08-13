@@ -212,6 +212,12 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_queue_assign_dynarr", &rt_queue_assign_dynarr);
     expose("rt_severity", &rt_severity);
     expose("rt_bounds_report", &rt_bounds_report);
+    expose("rt_null_handle", &rt_null_handle);
+    expose("rt_alloc_checked", &rt_alloc_checked);
+    expose("rt_alloc_elems_checked", &rt_alloc_elems_checked);
+    expose("rt_alloc_elems_size", &rt_alloc_elems_size);
+    expose("rt_alloc_negative", &rt_alloc_negative);
+    expose("rt_diag_now", &rt_diag_now);
     expose("rt_sim_run", &rt_sim_run);
     expose("rt_fflush", &rt_fflush);
     expose("rt_readmem", &rt_readmem);
@@ -252,6 +258,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_vcd_on", &rt_vcd_on);
     expose("rt_vcd_all", &rt_vcd_all);
     expose("rt_vcd_dumpflush", &rt_vcd_dumpflush);
+    expose("rt_vcd_limit", &rt_vcd_limit);
     expose("rt_vcd_close", &rt_vcd_close);
     expose("rt_alloc", &rt_alloc);
     expose("rt_free", &rt_free);

@@ -6,6 +6,7 @@
 
 #include "Lower.h"
 #include "PosixIo.h"
+#include "Subprocess.h"
 #include "ir/Jit.h"
 
 using namespace clotho;
@@ -785,4 +786,157 @@ TEST_CASE("forward typedef: an unresolved forward declaration is an error") {
         endmodule
     )");
     CHECK(d.find("forward typedef") != std::string::npos);
+}
+
+// LRM 8.4: "Accessing non-static members ... via a null object handle is
+// illegal. The result of an illegal access via a null object handle is
+// indeterminate, and implementations may issue an error." A class handle is raw
+// pointer bits, so the untrapped outcome is a load from address zero and a
+// segfault naming nothing; clotho guards every dereference instead and ends the
+// run with a located fatal. Out of process because the fatal exits.
+TEST_CASE("null handle dereference is a located fatal, not a segfault") {
+    constexpr std::string_view src = "module m;\n"
+                                     "    class Packet;\n"
+                                     "        int id;\n"
+                                     "    endclass\n"
+                                     "    Packet p;\n"
+                                     "    initial begin\n"
+                                     "        $display(\"before\");\n"
+                                     "        p.id = 1;\n"
+                                     "        $display(\"after\");\n"
+                                     "    end\n"
+                                     "endmodule\n";
+
+    const test::DesignRun run = test::run_design_captured(src);
+
+    // The store never happens, and nothing after it runs.
+    CHECK(run.out == "before\n");
+    CHECK(test::design_exit_code(run) != 0);
+    CHECK(run.err.find("fatal: dereference of a null class handle") != std::string::npos);
+    // The caret lands on the handle expression, not on the whole `p.id` member
+    // access: the report has to name what was null.
+    CHECK(run.err.find("source:8:9") != std::string::npos);
+    CHECK(run.err.find("8 |         p.id = 1;\n") != std::string::npos);
+    CHECK(run.err.find("  |         ^\n") != std::string::npos);
+}
+
+// A method called on a null handle passes null as `this`, so the guard fires at
+// the first property the body touches -- inside the callee, where the source
+// spells no handle at all. The report then points at the property reference.
+TEST_CASE("a method reached through a null handle traps at its property access") {
+    constexpr std::string_view src = "module m;\n"
+                                     "    class Counter;\n"
+                                     "        int n;\n"
+                                     "        function void bump();\n"
+                                     "            n = n + 1;\n"
+                                     "        endfunction\n"
+                                     "    endclass\n"
+                                     "    Counter c;\n"
+                                     "    initial begin\n"
+                                     "        c = null;\n"
+                                     "        c.bump();\n"
+                                     "        $display(\"after\");\n"
+                                     "    end\n"
+                                     "endmodule\n";
+
+    const test::DesignRun run = test::run_design_captured(src);
+
+    CHECK(run.out.empty());
+    CHECK(test::design_exit_code(run) != 0);
+    CHECK(run.err.find("fatal: dereference of a null class handle") != std::string::npos);
+    CHECK(run.err.find("5 |             n = n + 1;\n") != std::string::npos);
+}
+
+// The guard is a null test, not a "was it ever new'd" test: an explicit
+// `h = null` after a live object is just as fatal, and a handle that holds an
+// object stays untouched by the check.
+TEST_CASE("a handle nulled after use is fatal; a live one is not") {
+    constexpr std::string_view live = R"(
+        module m;
+            class C; int v; endclass
+            initial begin
+                C a, b;
+                a = new();
+                a.v = 4;
+                b = a;
+                b.v = b.v + 1;
+                $display("%0d", a.v);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(live) == "5\n");
+
+    constexpr std::string_view nulled = "module m;\n"
+                                        "    class C;\n"
+                                        "        int v;\n"
+                                        "    endclass\n"
+                                        "    initial begin\n"
+                                        "        C a;\n"
+                                        "        a = new();\n"
+                                        "        a.v = 4;\n"
+                                        "        $display(\"%0d\", a.v);\n"
+                                        "        a = null;\n"
+                                        "        a.v = 5;\n"
+                                        "    end\n"
+                                        "endmodule\n";
+
+    const test::DesignRun run = test::run_design_captured(nulled);
+    CHECK(run.out == "4\n");
+    CHECK(test::design_exit_code(run) != 0);
+    CHECK(run.err.find("11 |         a.v = 5;\n") != std::string::npos);
+}
+
+// LRM 8.4 puts a virtual method reached through a null handle in the same class
+// of illegal accesses as a property. The vtable load is the first thing that
+// would fault, so the receiver takes the guard before it — and the caret lands
+// on the call site, which is where the design named the null handle.
+TEST_CASE("virtual dispatch through a null handle is a located fatal") {
+    constexpr std::string_view src = "module m;\n"
+                                     "    class Base;\n"
+                                     "        virtual function int tag();\n"
+                                     "            return 1;\n"
+                                     "        endfunction\n"
+                                     "    endclass\n"
+                                     "    Base b;\n"
+                                     "    initial begin\n"
+                                     "        $display(\"before\");\n"
+                                     "        $display(\"%0d\", b.tag());\n"
+                                     "    end\n"
+                                     "endmodule\n";
+
+    const test::DesignRun run = test::run_design_captured(src);
+
+    CHECK(run.out == "before\n");
+    CHECK(test::design_exit_code(run) != 0);
+    CHECK(run.err.find("fatal: dereference of a null class handle") != std::string::npos);
+    CHECK(run.err.find("10 |         $display(\"%0d\", b.tag());\n") != std::string::npos);
+}
+
+// `semaphore` (LRM 15.3), `mailbox` (LRM 15.4), `process` (LRM 9.7) and
+// `std::weak_reference` (LRM 8.30) are classes slang synthesizes into the `std`
+// package with signatures but no bodies -- the simulator is expected to supply
+// the semantics. Clotho has no runtime for any of them, so each
+// must be refused in the frontend. Before this guard, lowering a `semaphore`
+// bound a bodyless method with no formals and died on an out-of-range formal
+// index; `mailbox` reached lower_type's catch-all and said only "unsupported
+// non-integral type".
+TEST_CASE("built-in std classes are refused in the frontend") {
+    // A declaration is enough: the type lowers before any method is reached.
+    CHECK(fails("module m; semaphore s; initial s = new(1); endmodule")
+            .find("the built-in 'semaphore' class is not supported") != std::string::npos);
+    CHECK(fails("module m; mailbox b; initial b = new(); endmodule")
+            .find("the built-in 'mailbox' class is not supported") != std::string::npos);
+    // A specialization and an explicit `std::` qualification are the same type.
+    CHECK(fails("module m; mailbox #(int) b; initial b = new(2); endmodule")
+            .find("the built-in 'mailbox' class is not supported") != std::string::npos);
+    CHECK(fails("module m; std::semaphore s; initial s = new(1); endmodule")
+            .find("the built-in 'semaphore' class is not supported") != std::string::npos);
+    CHECK(fails("module m; initial begin process p; p = process::self(); end endmodule")
+            .find("the built-in 'process' class is not supported") != std::string::npos);
+    // Reached indirectly: as a property of a user class, and as a formal.
+    CHECK(fails("module m; class H; semaphore lock; endclass H h; initial h = new; endmodule")
+            .find("the built-in 'semaphore' class is not supported") != std::string::npos);
+    CHECK(fails("module m; task automatic t(mailbox b); endtask"
+                " mailbox g; initial begin g = new(); t(g); end endmodule")
+            .find("the built-in 'mailbox' class is not supported") != std::string::npos);
 }
