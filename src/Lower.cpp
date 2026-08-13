@@ -11057,22 +11057,10 @@ private:
             lower_string_method(name, call, b);
             return;
         }
-        // A dynamic-array method as a statement (arr.delete(); arr.size() is
-        // legal-but-pointless): lower for effect, discard the value.
-        if (!name.empty() && name[0] != '$' && !call.arguments().empty() && is_dyn_array(*call.arguments()[0])) {
-            lower_dyn_array_method(name, call, b, loc(call));
-            return;
-        }
-        // A queue method as a statement (push/pop/insert/delete): lower for
-        // effect, discard any returned element.
-        if (!name.empty() && name[0] != '$' && !call.arguments().empty() && is_queue(*call.arguments()[0])) {
-            lower_queue_method(name, call, b, loc(call));
-            return;
-        }
-        // An associative-array method as a statement (delete; first/next/... are
-        // legal-but-pointless without their return): lower for effect.
-        if (!name.empty() && name[0] != '$' && !call.arguments().empty() && is_assoc(*call.arguments()[0])) {
-            lower_assoc_method(name, call, b, loc(call));
+        // A container method as a statement (arr.delete(), push/pop/insert, a
+        // manipulation method whose result is unused): lower for effect, discard
+        // the value.
+        if (lower_container_method(call, b, loc(call))) {
             return;
         }
         if (const char rx = display_radix(name, "$display")) {
@@ -11818,22 +11806,19 @@ private:
             return lower_string_method(name, call, b);
         }
 
-        // Dynamic-array built-in methods (arr.size(), LRM 7.5) arrive the same
-        // way, with the array as arguments()[0].
-        if (!name.empty() && name[0] != '$' && !call.arguments().empty() && is_dyn_array(*call.arguments()[0])) {
-            return lower_dyn_array_method(name, call, b, l);
+        // `item.index` inside a `with` clause reaches here as a builtin method on
+        // the iterator variable, whose type may itself be a container -- so it is
+        // resolved ahead of the container dispatch below.
+        if (!name.empty() && name[0] != '$' && !call.arguments().empty() && name == "index") {
+            if (const std::optional<ir::Index> v = lower_iterator_index(call, b, l)) {
+                return *v;
+            }
         }
 
-        // Queue built-in methods (q.size(), q.pop_front(), LRM 7.10.2) arrive the
-        // same way, with the queue as arguments()[0].
-        if (!name.empty() && name[0] != '$' && !call.arguments().empty() && is_queue(*call.arguments()[0])) {
-            return lower_queue_method(name, call, b, l);
-        }
-
-        // Associative-array built-in methods (a.num(), a.exists(k), a.first(k),
-        // LRM 7.9) arrive the same way, with the assoc as arguments()[0].
-        if (!name.empty() && name[0] != '$' && !call.arguments().empty() && is_assoc(*call.arguments()[0])) {
-            return lower_assoc_method(name, call, b, l);
+        // Dynamic-array (LRM 7.5), queue (7.10.2) and associative-array (7.9)
+        // built-in methods, plus the 7.12 manipulation methods on any of them.
+        if (const std::optional<ir::Index> v = lower_container_method(call, b, l)) {
+            return *v;
         }
 
         // Enum methods (LRM 6.19.2-6.19.5) arrive the same way, with an enum-typed
@@ -13690,8 +13675,10 @@ private:
             guard_shuffle();
             return b.dyn_array_shuffle(arr, aty, l);
         }
-        // TODO: sort/rsort `with` clause, 4-state / wide sort, and find/min/max/
-        // unique/sum reduction & locator methods (need iterator-clause lowering).
+        if (is_locator_method(name) || is_reduction_method(name)) {
+            return lower_array_iter_method(name, call, arr, b, l);
+        }
+        // TODO: sort/rsort `with` clause (LRM 7.12.2), and 4-state / wide sort.
         fail("dynamic array method '" + std::string(name) + "' is not supported");
     }
 
@@ -13721,6 +13708,312 @@ private:
         if (!ok) {
             fail("'" + std::string(name) + "' is only supported for a 2-state integral (width <= 64) or real element");
         }
+    }
+
+    // The LRM 7.12.1 array locator methods. All ten return a queue: of elements,
+    // or of `int` indices for the `_index` forms. `find*` require a `with` clause;
+    // min/max/unique take one optionally.
+    static bool is_locator_method(std::string_view name) {
+        return name == "find" || name == "find_index" || name == "find_first" || name == "find_first_index" ||
+               name == "find_last" || name == "find_last_index" || name == "min" || name == "max" ||
+               name == "unique" || name == "unique_index";
+    }
+
+    // The LRM 7.12.3 array reduction methods, which fold the array to one scalar.
+    static bool is_reduction_method(std::string_view name) {
+        return name == "sum" || name == "product" || name == "and" || name == "or" || name == "xor";
+    }
+
+    // The LRM 7.12.2 array ordering methods, which mutate the array in place.
+    static bool is_ordering_method(std::string_view name) {
+        return name == "reverse" || name == "sort" || name == "rsort" || name == "shuffle";
+    }
+
+    // A built-in method whose receiver is a container: a dynamic array (LRM 7.5), a
+    // queue (7.10.2), an associative array (7.9), or any of them carrying a 7.12
+    // manipulation method. The receiver arrives as arguments()[0] and the name
+    // carries no '$', like a string method. nullopt when the call is something
+    // else, so the rvalue, statement and lvalue paths can each fall through to
+    // their own next case.
+    std::optional<ir::Index> lower_container_method(const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
+        const std::string_view name = call.getSubroutineName();
+        if (name.empty() || name[0] == '$' || call.arguments().empty()) {
+            return std::nullopt;
+        }
+        const Expression& recv = *call.arguments()[0];
+        if (is_dyn_array(recv)) {
+            return lower_dyn_array_method(name, call, b, l);
+        }
+        if (is_queue(recv)) {
+            return lower_queue_method(name, call, b, l);
+        }
+        if (is_assoc(recv)) {
+            return lower_assoc_method(name, call, b, l);
+        }
+        // LRM 7.12 allows the manipulation methods on any unpacked array, and a
+        // fixed-size one reaches none of the dispatches above. Refused by name
+        // here, on the path every caller shares, so it does not surface as
+        // "system call used where a user subroutine was expected".
+        // TODO: array manipulation methods on a fixed-size unpacked array. Needs
+        // declared-range index mapping -- an `_index` result and the iterator index
+        // are declared indices, not 0-based offsets.
+        if (is_unpacked_array(recv) &&
+            (is_locator_method(name) || is_reduction_method(name) || is_ordering_method(name))) {
+            fail("array method '" + std::string(name) + "' on a fixed-size unpacked array is not supported");
+        }
+        return std::nullopt;
+    }
+
+    // An active `with` iterator clause (LRM 7.12 / 7.12.4): the element variable
+    // slang created for the clause, and the cell holding the index that the
+    // clause's `item.index` reads. A stack, so a nested clause resolves to the
+    // innermost binding, and so the inner dedup scan of unique() can retarget the
+    // index without disturbing the outer one.
+    struct IterBinding {
+        const slang::ast::ValueSymbol* var = nullptr;
+        TempCell                       index;
+    };
+    std::vector<IterBinding> iter_stack_;
+
+    // `item.index` inside a `with` clause (LRM 7.12.4): the current iteration's
+    // index. slang resolves the user's chosen index-method name to this builtin
+    // and hands over the iterator variable as the receiver, so the binding is
+    // found by symbol identity rather than by name.
+    std::optional<ir::Index> lower_iterator_index(const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
+        const auto& args = call.arguments();
+        if (args[0]->kind != ExpressionKind::NamedValue) {
+            return std::nullopt;
+        }
+        const slang::ast::Symbol& sym = args[0]->as<ValueExpressionBase>().symbol;
+        if (sym.kind != slang::ast::SymbolKind::Iterator) {
+            return std::nullopt;
+        }
+        if (args.size() > 1 && const_uint(*args[1]) != 1) {
+            // TODO: `item.index(d)` for d > 1 needs multidimensional array
+            // manipulation methods, which need multidimensional dynamic arrays.
+            fail("the iterator index method is only supported for dimension 1");
+        }
+        for (size_t k = iter_stack_.size(); k-- > 0;) {
+            if (iter_stack_[k].var == &sym) {
+                const ir::Index cur = b.unary(ir::Inst::Tag::Load, iter_stack_[k].index.lv(b, l), l);
+                return b.resize(cur, lower_type(*call.type), l);
+            }
+        }
+        fail("the iterator index method is only supported inside its own `with` clause");
+    }
+
+    // A locator (LRM 7.12.1) or reduction (7.12.3) method on a dynamic array or
+    // queue, together with the `with` iterator clause both families share.
+    //
+    // All fifteen lower to one IR loop over the container rather than to a runtime
+    // helper the way the ordering methods do. The clause is arbitrary lowered IR,
+    // so it has to be evaluated in the frontend anyway — and going through the
+    // ordinary expression path is what makes a 4-state, wide, real or string
+    // element work with no per-element-type comparator in the runtime. The
+    // receiver handle and the element count are read once on entry: resizing the
+    // container from inside the clause is undefined per 7.12, same as mutating the
+    // array a foreach walks.
+    //
+    // A locator fills a fresh queue temp and returns its handle; a reduction folds
+    // into an accumulator at the result type's width, so a `byte` sum wraps like
+    // the LRM's worked example (7.12.3) rather than widening.
+    ir::Index lower_array_iter_method(std::string_view      name,
+                                      const CallExpression& call,
+                                      ir::Index             arr,
+                                      ir::Builder&          b,
+                                      ir::SourceLoc         l) {
+        using T                          = ir::Inst::Tag;
+        const Expression& recv           = *call.arguments()[0];
+        const auto&       sci            = std::get<CallExpression::SystemCallInfo>(call.subroutine);
+        const auto [iter_expr, iter_var] = sci.getIteratorInfo();
+
+        const bool      queue = is_queue(recv);
+        const ir::Ref   aty   = lower_type(*recv.type);
+        const ir::Ref   i32   = make_int_type(32, false, true);
+        const ir::Ref   bit1  = make_int_type(1, false, false);
+        const ir::Index one1  = b.constant(module_.pool.put_int(bit1, 1), l);
+        const ir::Index zero1 = b.constant(module_.pool.put_int(bit1, 0), l);
+
+        // 0 .. size-1, with the count snapshotted like a foreach bound.
+        const TempCell  idx   = make_temp_cell(i32, "arrm_idx");
+        const TempCell  bound = make_temp_cell(i32, "arrm_bound");
+        const ir::Index size  = queue ? b.queue_size(arr, aty, l) : b.dyn_array_size(arr, aty, l);
+        b.binary(T::Store, bound.lv(b, l), b.resize(size, i32, l), l);
+        b.binary(T::Store, idx.lv(b, l), b.constant(module_.pool.put_int(i32, 0), l), l);
+
+        if (iter_var != nullptr) {
+            declare_storage(iter_var->as<slang::ast::VariableSymbol>(), /*force_frame*/ true);
+        }
+
+        // The key is the clause's value, or the element itself when the clause is
+        // omitted -- 7.12.1 defines the bare form as "as if a with(item) clause
+        // were specified". A find* predicate reduces the same clause to one bit.
+        const auto elem_at = [&](ir::Index k) { return b.unary(T::Load, b.elem_select(arr, k, aty, l), l); };
+        const auto bind    = [&](ir::Index k) {
+            if (iter_var != nullptr) {
+                b.binary(T::Store, value_lvalue(*iter_var, b, l), elem_at(k), l);
+            }
+        };
+        const auto key_of = [&](ir::Index k) {
+            return iter_expr != nullptr ? lower_expr(*iter_expr, b) : elem_at(k);
+        };
+
+        const slang::ast::Type& kty = iter_expr != nullptr ? *iter_expr->type : *recv.type->getArrayElementType();
+        const bool              key_real = kty.isFloating();
+        const bool              key_str  = kty.getCanonicalType().isString();
+        const bool              indexed  = name.ends_with("_index");
+        const bool              is_red   = is_reduction_method(name);
+        const bool              minmax   = name == "min" || name == "max";
+        const bool              uniq     = name == "unique" || name == "unique_index";
+        const ir::Ref           rty      = lower_type(*call.type);
+
+        ir::Index res{};
+        TempCell  acc;
+        if (is_red) {
+            // The fold's identity, so a one-element array reduces to that element:
+            // 0 for sum / or / xor, 1 for product, all ones for and. An EMPTY array
+            // does not yield the identity though -- see the return below.
+            acc                  = make_temp_cell(rty, "arrm_acc");
+            const ir::Index seed = b.constant(module_.pool.put_int(rty, name == "product" ? 1 : 0), l);
+            b.binary(T::Store, acc.lv(b, l), name == "and" ? b.unary(T::Bnot, seed, l) : seed, l);
+        } else {
+            res = make_arg_temp(rty, b, l);
+            b.queue_delete(res, res, /*has_idx=*/false, rty, l);
+        }
+
+        TempCell best, have, key_cell, dup, scan;
+        if (minmax) {
+            // `best` is only read once `have` is set, so it needs no initializer.
+            best = make_temp_cell(lower_type(kty), "arrm_best");
+            have = make_temp_cell(bit1, "arrm_have");
+            b.binary(T::Store, have.lv(b, l), zero1, l);
+        }
+        if (uniq) {
+            key_cell = make_temp_cell(lower_type(kty), "arrm_key");
+            dup      = make_temp_cell(bit1, "arrm_dup");
+            scan     = make_temp_cell(i32, "arrm_scan");
+        }
+
+        iter_stack_.push_back(IterBinding{ .var = iter_var, .index = idx });
+
+        b.open_region();
+        const ir::Index      cur   = b.unary(T::Load, idx.lv(b, l), l);
+        const ir::Index      lpred = b.binary(T::Lt, cur, b.unary(T::Load, bound.lv(b, l), l), l);
+        const ir::ExtraSlice cond  = b.close_region();
+
+        b.open_region();
+        const ir::Index k = b.unary(T::Load, idx.lv(b, l), l);
+        bind(k);
+        if (is_red) {
+            const T     op = name == "sum"  ? T::Add
+                             : name == "product" ? T::Mul
+                             : name == "and"     ? T::Band
+                             : name == "or"      ? T::Bor
+                                                 : T::Bxor;
+            const ir::Index v = key_of(k);
+            b.binary(T::Store,
+                     acc.lv(b, l),
+                     b.binary(op, b.unary(T::Load, acc.lv(b, l), l), b.resize(v, rty, l), l),
+                     l);
+        } else if (minmax) {
+            const ir::Index key    = key_of(k);
+            const T         ord    = name == "min" ? (key_real ? T::FLt : T::Lt) : (key_real ? T::FGt : T::Gt);
+            const ir::Index better = b.binary(ord, key, b.unary(T::Load, best.lv(b, l), l), l);
+            const ir::Index first  = b.unary(T::Lnot, b.unary(T::Load, have.lv(b, l), l), l);
+            // A tie keeps the earlier element: 7.12.1 returns just one of them, and
+            // an x-bearing 4-state compare is not a definite 1, so it loses too.
+            b.open_region();
+            b.binary(T::Store, have.lv(b, l), one1, l);
+            b.binary(T::Store, best.lv(b, l), key, l);
+            b.queue_delete(res, res, /*has_idx=*/false, rty, l);
+            b.queue_push(res, elem_at(k), /*front=*/false, rty, l);
+            const ir::ExtraSlice take_r = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice skip_r = b.close_region();
+            b.cond(b.binary(T::Lor, first, better, l), take_r, skip_r, l);
+        } else if (uniq) {
+            // An element is unique when no earlier element yields the same key, so
+            // the first of each duplicate group survives (7.12.1 leaves the
+            // returned order unrelated to the array's). The scan re-evaluates the
+            // clause instead of caching keys in a second heap queue: 7.12 already
+            // makes a clause with side effects unpredictable.
+            b.binary(T::Store, key_cell.lv(b, l), key_of(k), l);
+            b.binary(T::Store, dup.lv(b, l), zero1, l);
+            b.binary(T::Store, scan.lv(b, l), b.constant(module_.pool.put_int(i32, 0), l), l);
+
+            b.open_region();
+            const ir::Index      at    = b.unary(T::Load, scan.lv(b, l), l);
+            const ir::Index      spred = b.binary(T::Lt, at, b.unary(T::Load, idx.lv(b, l), l), l);
+            const ir::ExtraSlice scond = b.close_region();
+
+            b.open_region();
+            const ir::Index j        = b.unary(T::Load, scan.lv(b, l), l);
+            iter_stack_.back().index = scan;
+            bind(j);
+            const ir::Index other    = key_of(j);
+            iter_stack_.back().index = idx;
+            // Integral keys dedup bit-exactly (===), which is also how slang's own
+            // constant evaluation of unique() dedups; a real or string key has no
+            // x/z to distinguish.
+            const T         eq   = key_real ? T::FEq : (key_str ? T::Eq : T::CaseEq);
+            const ir::Index same = b.binary(eq, other, b.unary(T::Load, key_cell.lv(b, l), l), l);
+            b.open_region();
+            b.binary(T::Store, dup.lv(b, l), one1, l);
+            const ir::ExtraSlice mark_r = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice nomark_r = b.close_region();
+            b.cond(same, mark_r, nomark_r, l);
+            const ir::ExtraSlice sbody = b.close_region();
+
+            b.open_region();
+            const ir::Index next_scan =
+              b.binary(T::Add, b.unary(T::Load, scan.lv(b, l), l), b.constant(module_.pool.put_int(i32, 1), l), l);
+            b.binary(T::Store, scan.lv(b, l), next_scan, l);
+            const ir::ExtraSlice sstep = b.close_region();
+            b.loop(scond, spred, sbody, sstep, /*bottom_test*/ false, l);
+
+            b.open_region();
+            b.queue_push(res, indexed ? k : elem_at(k), /*front=*/false, rty, l);
+            const ir::ExtraSlice keep_r = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice drop_r = b.close_region();
+            b.cond(b.unary(T::Lnot, b.unary(T::Load, dup.lv(b, l), l), l), keep_r, drop_r, l);
+        } else {
+            // find / find_index / find_first* / find_last*: the clause is a
+            // predicate. find_last keeps only the newest match by clearing first;
+            // find_first stops the walk.
+            const ir::Index p = lower_predicate(*iter_expr, b);
+            b.open_region();
+            if (name.starts_with("find_last")) {
+                b.queue_delete(res, res, /*has_idx=*/false, rty, l);
+            }
+            b.queue_push(res, indexed ? k : elem_at(k), /*front=*/false, rty, l);
+            if (name.starts_with("find_first")) {
+                b.break_(l);
+            }
+            const ir::ExtraSlice hit_r = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice miss_r = b.close_region();
+            b.cond(p, hit_r, miss_r, l);
+        }
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        b.binary(T::Store,
+                 idx.lv(b, l),
+                 b.binary(T::Add, b.unary(T::Load, idx.lv(b, l), l), b.constant(module_.pool.put_int(i32, 1), l), l),
+                 l);
+        const ir::ExtraSlice step = b.close_region();
+
+        b.loop(cond, lpred, body, step, /*bottom_test*/ false, l);
+        iter_stack_.pop_back();
+
+        if (!is_red) {
+            return res;
+        }
+        const ir::Index n     = b.unary(T::Load, bound.lv(b, l), l);
+        const ir::Index empty = b.binary(T::Eq, n, b.constant(module_.pool.put_int(i32, 0), l), l);
+        return b.select(empty, b.constant(module_.pool.put_int(rty, 0), l), b.unary(T::Load, acc.lv(b, l), l), l);
     }
 
     // Element address for a variable-size array (dynamic array or queue) index
@@ -13926,8 +14219,10 @@ private:
             guard_shuffle();
             return b.queue_shuffle(q, qty, l);
         }
-        // TODO: sort/rsort `with` clause, 4-state / wide sort, and find/min/max/
-        // unique/sum reduction & locator methods (need iterator-clause lowering).
+        if (is_locator_method(name) || is_reduction_method(name)) {
+            return lower_array_iter_method(name, call, q, b, l);
+        }
+        // TODO: sort/rsort `with` clause (LRM 7.12.2), and 4-state / wide sort.
         fail("queue method '" + std::string(name) + "' is not supported");
     }
 
@@ -15592,7 +15887,14 @@ private:
                 // handle (allocated by the backend) is read by an assignment /
                 // .size() / element access / foreach. Others are not lvalues.
                 if (is_handle_expr(expr)) {
-                    const std::optional<ir::Index> v = lower_user_call(expr.as<CallExpression>(), b);
+                    const CallExpression& call = expr.as<CallExpression>();
+                    // A locator method (LRM 7.12.1) returns a queue, and its
+                    // handle is reached the same way -- but it is a system call,
+                    // which lower_user_call refuses.
+                    if (const std::optional<ir::Index> v = lower_container_method(call, b, l)) {
+                        return *v;
+                    }
+                    const std::optional<ir::Index> v = lower_user_call(call, b);
                     if (!v) {
                         fail("handle-returning call used as an lvalue produced no value");
                     }
