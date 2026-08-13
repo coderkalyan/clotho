@@ -187,6 +187,10 @@ const char* tag_name(Inst::Tag tag) {
             return "assoc_delete_key";
         case T::AssocDeleteAll:
             return "assoc_delete_all";
+        case T::AssocDefault:
+            return "assoc_default";
+        case T::AssocReset:
+            return "assoc_reset";
         case T::AssocCopy:
             return "assoc_copy";
         case T::AssocFirst:

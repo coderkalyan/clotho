@@ -359,6 +359,14 @@ Index Builder::assoc_delete(Index a, Index key, bool has_key, Ref assoc_type, So
     return emit({ Inst::Tag::AssocDeleteKey, Inst::Payload{ .op_extra = { a, extra } } }, loc);
 }
 
+Index Builder::assoc_default(Index a, Ref assoc_type, SourceLoc loc) {
+    return emit({ Inst::Tag::AssocDefault, Inst::Payload{ .op_type = { a, assoc_type } } }, loc);
+}
+
+Index Builder::assoc_reset(Index a, Ref assoc_type, SourceLoc loc) {
+    return emit({ Inst::Tag::AssocReset, Inst::Payload{ .op_type = { a, assoc_type } } }, loc);
+}
+
 Index Builder::assoc_copy(Index dst, Index src, Ref assoc_type, SourceLoc loc) {
     const ExtraIndex extra = add_extra(AssocArg{ src, assoc_type });
 

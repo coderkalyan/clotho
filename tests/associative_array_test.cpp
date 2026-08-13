@@ -431,3 +431,126 @@ TEST_CASE("assoc unpacked-struct deep-copy independence") {
     )";
     CHECK(run_capture(src) == "a2a=3 anum=2\nb2a=88 b3a=5 bnum=3\n");
 }
+
+// -- Associative array literals (LRM 7.9.11) --------------------------------
+
+TEST_CASE("assoc literal with a default (LRM 7.9.11)") {
+    constexpr std::string_view src = R"(
+        module m;
+            string  words [int]    = '{default: "hello"};
+            integer tab [string]   = '{"Peter":20, "Paul":22, "Mary":23, default:-1};
+            initial begin
+                $display("%s", words[1]);
+                words[1] = "world";
+                $display("%s %s num=%0d", words[0], words[1], words.num());
+                $display("%0d %0d %0d num=%0d", tab["Peter"], tab["Mary"], tab["Nobody"],
+                         tab.num());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "hello\n"
+                              "hello world num=1\n"
+                              "20 23 -1 num=3\n");
+}
+
+// A keyed literal with no default leaves absent keys at the Table 7-1 element
+// default, and the entries it wrote are ordinary entries (num, foreach, first).
+TEST_CASE("assoc literal without a default") {
+    constexpr std::string_view src = R"(
+        module m;
+            int    f[int]    = '{1:10, 2:20};
+            string k;
+            int    g[string] = '{"b":2, "a":1};
+            initial begin
+                $display("f1=%0d f3=%0d num=%0d", f[1], f[3], f.num());
+                if (g.first(k)) $display("first=%s", k);
+                foreach (g[key]) $display("%s=%0d", key, g[key]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "f1=10 f3=0 num=2\n"
+                              "first=a\n"
+                              "a=1\n"
+                              "b=2\n");
+}
+
+TEST_CASE("assoc literal default survives delete and does not seed entries") {
+    constexpr std::string_view src = R"(
+        module m;
+            int         a[int] = '{default: 7};
+            logic [7:0] d[int] = '{default: 8'hAA};
+            initial begin
+                a[1] = 1;
+                a.delete();
+                $display("miss=%0d num=%0d", a[9], a.num());
+                d[5][0] = 1'b0;
+                $display("d5=%h num=%0d", d[5], d.num());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "miss=7 num=0\n"
+                              "d5=xX num=1\n");
+}
+
+TEST_CASE("assoc literal default follows a whole-array copy") {
+    constexpr std::string_view src = R"(
+        module m;
+            int a[int] = '{default: 7};
+            int b[int];
+            int c[int];
+            initial begin
+                b = a;
+                $display("bmiss=%0d bexists=%0d", b[9], b.exists(9));
+                c[3] = 3;
+                a = c;
+                $display("amiss=%0d anum=%0d", a[9], a.num());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "bmiss=7 bexists=0\n"
+                              "amiss=0 anum=1\n");
+}
+
+// A literal is also an assignment RHS, and it replaces the whole array: the old
+// entries and the old default both go. Works on a procedural local and inside a
+// function, where the array is frame storage.
+TEST_CASE("assoc literal as an assignment and in a subroutine") {
+    constexpr std::string_view src = R"(
+        module m;
+            int g[int] = '{default: 1};
+            function automatic int pick(int k);
+                int t[int] = '{5:50, default:8};
+                return t[k];
+            endfunction
+            initial begin
+                g[7] = 70;
+                g = '{2:20, default:42};
+                $display("g2=%0d g7=%0d num=%0d", g[2], g[7], g.num());
+                g = '{3:30};
+                $display("g3=%0d gmiss=%0d num=%0d", g[3], g[9], g.num());
+                $display("fn=%0d %0d", pick(5), pick(6));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "g2=20 g7=42 num=1\n"
+                              "g3=30 gmiss=0 num=1\n"
+                              "fn=50 8\n");
+}
+
+// A wildcard-index array takes a default too (7.9.11 puts no restriction on the
+// index type; only the index LOCATOR methods exclude `[*]`), and a real value
+// element folds the same way.
+TEST_CASE("assoc literal over a wildcard index and a real element") {
+    constexpr std::string_view src = R"(
+        module m;
+            int  w[*]   = '{default: 5};
+            real r[int] = '{1:1.5, default:2.5};
+            initial begin
+                $display("w=%0d num=%0d", w[3], w.num());
+                $display("r1=%0.2f rmiss=%0.2f", r[1], r[9]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "w=5 num=0\n"
+                              "r1=1.50 rmiss=2.50\n");
+}

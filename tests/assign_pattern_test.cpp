@@ -454,3 +454,20 @@ TEST_CASE("assignment-pattern lvalue: element count mismatch is rejected") {
         endmodule
     )").empty());
 }
+
+// An associative-array literal (LRM 7.9.11) builds the array through the
+// container path; the shapes that path does not implement fail loudly instead of
+// being dropped, which is how the initializer used to be lost silently.
+TEST_CASE("associative array literal: unsupported shapes are rejected") {
+    // A nonblocking whole-array literal needs handle-aware NBA staging.
+    CHECK(reject("module m; int a[int]; initial a <= '{default:1}; endmodule")
+            .find("nonblocking assignment to an associative array") != std::string::npos);
+    // An aggregate value element needs a per-leaf store per entry.
+    CHECK(reject(R"(
+        module m;
+            typedef struct { int x; byte y; } p;
+            p a[int] = '{1:'{x:1, y:2}};
+            initial $display("%0d", a[1].x);
+        endmodule
+    )").find("aggregate value element") != std::string::npos);
+}

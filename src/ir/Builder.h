@@ -182,6 +182,11 @@ public:
     Index assoc_exists(Index a, Index key, Ref assoc_type, SourceLoc loc);
     // a.delete(key): remove one key if present. a.delete(): remove all.
     Index assoc_delete(Index a, Index key, bool has_key, Ref assoc_type, SourceLoc loc);
+    // The `'{default: v}` slot as an lvalue (LRM 7.9.11): a Store into it sets the
+    // value a read of an absent key yields.
+    Index assoc_default(Index a, Ref assoc_type, SourceLoc loc);
+    // Whole-array replacement: drop every entry and the pattern default.
+    Index assoc_reset(Index a, Ref assoc_type, SourceLoc loc);
     // dst = src: deep copy of another associative array (value semantics).
     Index assoc_copy(Index dst, Index src, Ref assoc_type, SourceLoc loc);
     // a.first(k)/last(k)/next(k)/prev(k) (LRM 7.9.3): ordered traversal. `key`

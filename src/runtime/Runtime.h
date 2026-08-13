@@ -980,16 +980,20 @@ typedef struct rt_assoc {
     void* impl;
 } rt_assoc;
 
-// a[key] read: pointer to the element slot for `key`, or null if absent (LRM
-// 7.8: a read of an absent key does NOT create it — the backend materializes the
+// a[key] read: pointer to the element slot for `key`; when the key is absent,
+// the pattern default slot if one was set (LRM 7.9.11), else null (LRM 7.8: a
+// read of an absent key does NOT create it — the backend materializes the
 // element default). The pointer is valid until the next mutation of `h`.
 void* rt_assoc_get_ptr(rt_assoc* h, const uint8_t* kptr, uint32_t klen);
 
-// a[key] write: pointer to the element slot for `key`, creating (and proto-
-// initializing) the entry if absent (LRM 7.8). Valid until the next mutation.
-// `site` locates the write for an allocation-failure report.
 void* rt_assoc_put_ptr(rt_assoc* h, const rt_elem_ops* ops, const uint8_t* kptr, uint32_t klen,
                        const rt_alloc_site* site);
+
+// Writable pointer to the array's pattern default slot (LRM 7.9.11's
+// `'{default: v}`), creating and proto-initializing it on first use. The default
+// is per-array state, not an entry: it is invisible to num/exists/first/next and
+// survives a.delete(). Valid until the next mutation of `h`.
+void* rt_assoc_default_ptr(rt_assoc* h, const rt_elem_ops* ops, const rt_alloc_site* site);
 
 // a.exists(key) -> 0/1 (LRM 7.9.1).
 int rt_assoc_exists(rt_assoc* h, const uint8_t* kptr, uint32_t klen);
@@ -997,9 +1001,13 @@ int rt_assoc_exists(rt_assoc* h, const uint8_t* kptr, uint32_t klen);
 // a.delete(key): remove one entry if present (LRM 7.9.2). Idempotent.
 void rt_assoc_delete_key(rt_assoc* h, const rt_elem_ops* ops, const uint8_t* kptr, uint32_t klen);
 
-// a.delete(): destroy every entry and reset `h` to the empty map. Idempotent;
-// also the teardown entry point.
+// a.delete(): destroy every entry, num -> 0. Keeps the pattern default, which
+// LRM 7.9.11 makes independent of the array's contents. Idempotent.
 void rt_assoc_delete_all(rt_assoc* h, const rt_elem_ops* ops);
+
+// Destroy every entry AND the pattern default, resetting `h` to the empty map.
+// Whole-array assignment (which replaces the default too) and teardown.
+void rt_assoc_reset(rt_assoc* h, const rt_elem_ops* ops);
 
 // a.num() / a.size(): entry count (LRM 7.9.5).
 uint64_t rt_assoc_num(rt_assoc* h);

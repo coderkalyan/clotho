@@ -1161,6 +1161,16 @@ struct Inst {
         AssocDeleteKey,
         // a.delete(): remove all entries, num -> 0 (payload: op_type).
         AssocDeleteAll,
+        // The `'{default: v}` slot (LRM 7.9.11) as an lvalue, so a Store of the
+        // pattern's default value reuses the ordinary element-store path
+        // (payload: op_type). A read of an absent key resolves to this slot
+        // instead of the Table 7-1 element default. Invisible to
+        // num/exists/first/next, and it outlives a.delete().
+        AssocDefault,
+        // Whole-array replacement: drop every entry AND the pattern default
+        // (payload: op_type). What a `'{...}` literal assigns onto, as opposed to
+        // a.delete(), which keeps the default.
+        AssocReset,
         // a = other: deep copy of another assoc's entries (value semantics;
         // payload: op_extra -> AssocArg, arg is the source handle lvalue).
         AssocCopy,
@@ -2025,6 +2035,8 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         // the interned Assoc type.
         case T::AssocNum:
         case T::AssocDeleteAll:
+        case T::AssocDefault:
+        case T::AssocReset:
             return K::OpType;
         case T::ClassNew:
             return K::Ref;

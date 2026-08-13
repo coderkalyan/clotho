@@ -296,6 +296,8 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_assoc_exists", &rt_assoc_exists);
     expose("rt_assoc_delete_key", &rt_assoc_delete_key);
     expose("rt_assoc_delete_all", &rt_assoc_delete_all);
+    expose("rt_assoc_default_ptr", &rt_assoc_default_ptr);
+    expose("rt_assoc_reset", &rt_assoc_reset);
     expose("rt_assoc_num", &rt_assoc_num);
     expose("rt_assoc_first", &rt_assoc_first);
     expose("rt_assoc_last", &rt_assoc_last);

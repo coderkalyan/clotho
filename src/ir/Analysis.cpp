@@ -204,6 +204,8 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::AssocExists:
         case Inst::Tag::AssocDeleteKey:
         case Inst::Tag::AssocDeleteAll:
+        case Inst::Tag::AssocDefault:
+        case Inst::Tag::AssocReset:
         case Inst::Tag::AssocCopy:
         case Inst::Tag::AssocFirst:
         case Inst::Tag::AssocLast:
@@ -873,6 +875,16 @@ struct ValueSweep {
                     val_x[raw]       = four ? 1 : 0;
                     break;
                 }
+                case Inst::Tag::AssocDefault: {
+                    // The pattern default slot is an element slot like any other,
+                    // so a 4-state value element may carry x/z.
+                    const Type& dt   = std::get<Type>(m.pool.get(p.op_type.type));
+                    const bool  four = m.pool.layout(dt.element).domain == Domain::Four;
+                    val_z[raw]       = four ? 1 : 0;
+                    val_x[raw]       = four ? 1 : 0;
+                    break;
+                }
+                case Inst::Tag::AssocReset:
                 case Inst::Tag::AssocNum:
                 case Inst::Tag::AssocExists:
                 case Inst::Tag::AssocDeleteKey:

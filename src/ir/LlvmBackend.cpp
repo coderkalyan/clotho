@@ -382,6 +382,10 @@ struct LValue {
     // handle instead of a plane. Both false for an integral / real value.
     bool assoc_val_string = false;
     bool assoc_val_handle = false;
+    // The array's `'{default: v}` slot rather than a keyed entry (LRM 7.9.11):
+    // resolved through rt_assoc_default_ptr, which always yields a live slot, so
+    // there is no key span and no found-check.
+    bool assoc_default = false;
 };
 
 // A scalar / string leaf of an aggregate signal reachable by a STATIC path
@@ -1355,7 +1359,9 @@ private:
     // Destroy a handle's elements and free its storage (reset to empty).
     void emit_handle_delete(llvm::Value* handle, Ref type) {
         if (is_assoc_type(type)) {
-            b_.CreateCall(assoc_delete_all_fn(), { handle, elem_ops_global(type) });
+            // Teardown / whole-value replacement drops the pattern default too;
+            // a.delete() keeps it and takes rt_assoc_delete_all instead.
+            b_.CreateCall(assoc_reset_fn(), { handle, elem_ops_global(type) });
             return;
         }
         b_.CreateCall(is_queue_type(type) ? queue_delete_all_fn() : dynarr_delete_fn(),
@@ -8114,6 +8120,14 @@ private:
     llvm::FunctionCallee assoc_delete_all_fn() {
         return rt_fn("rt_assoc_delete_all", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
+    // void* rt_assoc_default_ptr(rt_assoc*, const rt_elem_ops*, const rt_alloc_site*)
+    llvm::FunctionCallee assoc_default_ptr_fn() {
+        return rt_fn("rt_assoc_default_ptr", raw_ptr_ty(), { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
+    }
+    // void rt_assoc_reset(rt_assoc*, const rt_elem_ops*)
+    llvm::FunctionCallee assoc_reset_fn() {
+        return rt_fn("rt_assoc_reset", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
     // u64 rt_assoc_num(rt_assoc*)
     llvm::FunctionCallee assoc_num_fn() {
         return rt_fn("rt_assoc_num", b_.getInt64Ty(), { raw_ptr_ty() });
@@ -9025,6 +9039,9 @@ private:
                 // One entry of the associative array's value element type.
                 return from_ref(std::get<Type>(mod_.pool.get(
                   ir_->extra_data<AssocArg>(p.op_extra.extra).assoc_type)).element);
+            case Inst::Tag::AssocDefault:
+                // The `'{default: v}` slot carries the same value element type.
+                return from_ref(std::get<Type>(mod_.pool.get(p.op_type.type)).element);
             case Inst::Tag::AssocNum:
             case Inst::Tag::AssocExists:
             case Inst::Tag::AssocFirst:
@@ -9033,6 +9050,7 @@ private:
             case Inst::Tag::AssocPrev:
             case Inst::Tag::AssocDeleteKey:
             case Inst::Tag::AssocDeleteAll:
+            case Inst::Tag::AssocReset:
             case Inst::Tag::AssocCopy:
                 // num()/exists() and the traversal status are definite 2-state
                 // ints; delete/copy are statements whose type is never queried.
@@ -9742,6 +9760,33 @@ private:
                 set_lvalue(i, el);
                 return;
             }
+            case Inst::Tag::AssocDefault: {
+                // The `'{default: v}` slot (LRM 7.9.11): the same deferred assoc
+                // lvalue as a[key], minus the key -- assoc_elem_lvalue resolves it
+                // through rt_assoc_default_ptr, which always yields a live slot.
+                const auto&   pt = p.op_type;
+                const DynElem e  = dynarr_elem(pt.type);
+                LValue        el;
+                el.is_assoc         = true;
+                el.assoc_default    = true;
+                el.assoc_handle     = lv_handle_ptr(lvalue_of(pt.op));
+                el.assoc_ops        = elem_ops_global(pt.type);
+                el.assoc_val_string = e.is_string;
+                el.assoc_val_handle = e.is_handle;
+                if (e.is_agg) {
+                    el.is_agg  = true;
+                    el.root_ty = e.agg_ty;
+                    set_lvalue(i, el);
+                    return;
+                }
+                el.slot_ty     = e.slot_ty;
+                el.has_z       = e.has_z;
+                el.narrow      = e.narrow;
+                el.store_width = e.width;
+                el.width       = e.width;
+                set_lvalue(i, el);
+                return;
+            }
             case Inst::Tag::MemberSelect: {
                 const auto ms = ir_->extra_data<MemberSelect>(p.op_extra.extra);
                 set_lvalue(i, agg_member(lvalue_of(p.op_extra.op), ms.struct_type, ms.field_index));
@@ -10136,6 +10181,9 @@ private:
                 return;
             case Inst::Tag::AssocDeleteAll:
                 lower_assoc_delete_all(i);
+                return;
+            case Inst::Tag::AssocReset:
+                lower_assoc_reset(i);
                 return;
             case Inst::Tag::AssocCopy:
                 lower_assoc_copy(i);
@@ -11616,6 +11664,27 @@ private:
     // entry-creating allocation reports "<unknown>".
     LValue assoc_elem_lvalue(const LValue& lv, bool for_write) {
         const SourceText at{ .where = "<unknown>" };
+        // The resolved slot pointer. The pattern-default slot (LRM 7.9.11) always
+        // exists once asked for, so it needs neither the read/write split nor a
+        // found-check; a keyed entry resolves through put_ptr on a write (creates)
+        // and get_ptr on a read (null when absent and no default is set).
+        const auto slot_ptr = [&]() -> llvm::Value* {
+            if (lv.assoc_default) {
+                return b_.CreateCall(assoc_default_ptr_fn(),
+                                     { lv.assoc_handle, lv.assoc_ops,
+                                       alloc_site_global(at, "associative array") });
+            }
+            if (for_write) {
+                return b_.CreateCall(assoc_put_ptr_fn(),
+                                     { lv.assoc_handle, lv.assoc_ops, lv.assoc_key_ptr,
+                                       lv.assoc_key_len, alloc_site_global(at, "associative array") });
+            }
+            return b_.CreateCall(assoc_get_ptr_fn(),
+                                 { lv.assoc_handle, lv.assoc_key_ptr, lv.assoc_key_len });
+        };
+        // A found-check is only meaningful for a key read: everything else yields a
+        // live slot.
+        const bool checked = !lv.assoc_default && !for_write;
         // Aggregate value (unpacked struct / fixed array): the resolved slot is
         // the flat aggregate image. The is_agg lvalue (root_ty + agg_path + leaf
         // facts) was built by the MemberSelect / ElemSelect descent; only the base
@@ -11623,45 +11692,34 @@ private:
         // (ANDed with any array-bound gate from a runtime element index) drives
         // dyn_elem_load to the per-leaf element default (Table 7-1), no entry
         // created.
+        llvm::Value* slot    = slot_ptr();
+        llvm::Value* nonnull = checked
+                                 ? b_.CreateICmpNE(slot, llvm::Constant::getNullValue(raw_ptr_ty()))
+                                 : nullptr;
         if (lv.is_agg) {
-            LValue el     = lv;
-            el.is_assoc   = false;
-            el.is_signal  = false;
-            if (for_write) {
-                el.base = b_.CreateCall(assoc_put_ptr_fn(),
-                                        { lv.assoc_handle, lv.assoc_ops, lv.assoc_key_ptr,
-                                          lv.assoc_key_len,
-                                          alloc_site_global(at, "associative array") });
-                return el;
+            LValue el    = lv;
+            el.is_assoc  = false;
+            el.is_signal = false;
+            el.base      = slot;
+            if (nonnull != nullptr) {
+                el.dyn_inrange =
+                  lv.dyn_inrange != nullptr ? b_.CreateAnd(lv.dyn_inrange, nonnull) : nonnull;
             }
-            llvm::Value* found = b_.CreateCall(
-              assoc_get_ptr_fn(), { lv.assoc_handle, lv.assoc_key_ptr, lv.assoc_key_len });
-            llvm::Value* nonnull = b_.CreateICmpNE(found, llvm::Constant::getNullValue(raw_ptr_ty()));
-            el.base        = found;
-            el.dyn_inrange = lv.dyn_inrange != nullptr ? b_.CreateAnd(lv.dyn_inrange, nonnull) : nonnull;
             return el;
         }
         LValue el;
+        el.base = slot;
+        if (nonnull != nullptr) {
+            el.dyn_inrange = nonnull;
+        }
         // Managed value elements (string / nested container): the resolved slot
         // IS the handle. put_ptr proto-inits a fresh entry (owned-empty string /
         // null container), so a write never sees null; a read of an absent key
         // returns null, which the string sink redirect / handle default handles.
-        const bool managed = lv.assoc_val_string || lv.assoc_val_handle;
-        if (managed) {
+        if (lv.assoc_val_string || lv.assoc_val_handle) {
             el.is_string = lv.assoc_val_string;
             el.is_handle = lv.assoc_val_handle;
             el.slot_ty   = lv.slot_ty;
-            if (for_write) {
-                el.base = b_.CreateCall(assoc_put_ptr_fn(),
-                                        { lv.assoc_handle, lv.assoc_ops, lv.assoc_key_ptr,
-                                          lv.assoc_key_len,
-                                          alloc_site_global(at, "associative array") });
-                return el;
-            }
-            llvm::Value* found = b_.CreateCall(
-              assoc_get_ptr_fn(), { lv.assoc_handle, lv.assoc_key_ptr, lv.assoc_key_len });
-            el.base        = found;
-            el.dyn_inrange = b_.CreateICmpNE(found, llvm::Constant::getNullValue(raw_ptr_ty()));
             return el;
         }
         el.slot_ty     = lv.slot_ty;
@@ -11672,17 +11730,6 @@ private:
         el.store_width = lv.store_width;
         el.bit_off     = b_.getInt32(0);
         el.width       = lv.width;
-        if (for_write) {
-            el.base = b_.CreateCall(assoc_put_ptr_fn(),
-                                    { lv.assoc_handle, lv.assoc_ops, lv.assoc_key_ptr,
-                                      lv.assoc_key_len,
-                                      alloc_site_global(at, "associative array") });
-            return el;
-        }
-        llvm::Value* found = b_.CreateCall(
-          assoc_get_ptr_fn(), { lv.assoc_handle, lv.assoc_key_ptr, lv.assoc_key_len });
-        el.base        = found;
-        el.dyn_inrange = b_.CreateICmpNE(found, llvm::Constant::getNullValue(raw_ptr_ty()));
         return el;
     }
 
@@ -11709,7 +11756,16 @@ private:
                       { lv_handle_ptr(lvalue_of(p.op)), elem_ops_global(aa.assoc_type), kptr, klen });
     }
 
+    // a.delete() (LRM 7.9.2): drop every entry but keep the pattern default,
+    // which 7.9.11 makes independent of the array's contents.
     void lower_assoc_delete_all(Index i) {
+        const auto& p = ir_->payload(i).op_type;
+        b_.CreateCall(assoc_delete_all_fn(),
+                      { lv_handle_ptr(lvalue_of(p.op)), elem_ops_global(p.type) });
+    }
+
+    // Whole-array replacement by a `'{...}` literal: entries and default both go.
+    void lower_assoc_reset(Index i) {
         const auto& p = ir_->payload(i).op_type;
         emit_handle_delete(lv_handle_ptr(lvalue_of(p.op)), p.type);
     }

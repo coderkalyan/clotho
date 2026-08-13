@@ -1879,6 +1879,11 @@ struct AssocMap {
     ankerl::unordered_dense::map<std::string, std::vector<uint8_t>> entries;
     std::vector<const std::string*>                                sorted;
     bool                                                           sorted_valid = false;
+    // The `'{default: v}` value (LRM 7.9.11), returned by a read of an absent
+    // key. Per-array state rather than an entry, so it is invisible to
+    // num/exists/first/next and survives a.delete().
+    std::vector<uint8_t> default_slot;
+    bool                 has_default = false;
 
     void invalidate() { sorted_valid = false; }
 
@@ -1907,8 +1912,22 @@ void assoc_free(AssocMap* m, const rt_elem_ops* ops) {
         for (auto& kv : m->entries) {
             rt_elem_deinit(ops, kv.second.data());
         }
+        if (m->has_default) {
+            rt_elem_deinit(ops, m->default_slot.data());
+        }
     }
     delete m;
+}
+
+// Drop every entry but keep the map alive, so the pattern default survives.
+void assoc_clear_entries(AssocMap* m, const rt_elem_ops* ops) {
+    if (ops->kind != rt_elem_pod) {
+        for (auto& kv : m->entries) {
+            rt_elem_deinit(ops, kv.second.data());
+        }
+    }
+    m->entries.clear();
+    m->invalidate();
 }
 
 void assoc_set_span(const std::string* k, const uint8_t** out_ptr, uint32_t* out_len) {
@@ -1925,7 +1944,13 @@ extern "C" void* rt_assoc_get_ptr(rt_assoc* h, const uint8_t* kptr, uint32_t kle
     }
     const auto it = m->entries.find(
       std::string(reinterpret_cast<const char*>(kptr), static_cast<size_t>(klen)));
-    return it == m->entries.end() ? nullptr : it->second.data();
+    if (it != m->entries.end()) {
+        return it->second.data();
+    }
+    // Absent key: the pattern default when one was set (LRM 7.9.11 -- and no
+    // warning), else null so the backend materializes the Table 7-1 element
+    // default. Neither creates an entry.
+    return m->has_default ? m->default_slot.data() : nullptr;
 }
 
 extern "C" void* rt_assoc_put_ptr(rt_assoc* h, const rt_elem_ops* ops, const uint8_t* kptr,
@@ -1945,6 +1970,21 @@ extern "C" void* rt_assoc_put_ptr(rt_assoc* h, const rt_elem_ops* ops, const uin
     rt_elem_init(ops, slot.data());
     m->invalidate();
     return slot.data();
+}
+
+extern "C" void* rt_assoc_default_ptr(rt_assoc* h, const rt_elem_ops* ops,
+                                      const rt_alloc_site* /*site*/) {
+    AssocMap* m = assoc_impl(h);
+    if (m == nullptr) {
+        m       = new AssocMap();
+        h->impl = m;
+    }
+    if (!m->has_default) {
+        m->default_slot.resize(static_cast<size_t>(ops->stride));
+        rt_elem_init(ops, m->default_slot.data());
+        m->has_default = true;
+    }
+    return m->default_slot.data();
 }
 
 extern "C" int rt_assoc_exists(rt_assoc* h, const uint8_t* kptr, uint32_t klen) {
@@ -1977,6 +2017,21 @@ extern "C" void rt_assoc_delete_key(rt_assoc* h, const rt_elem_ops* ops, const u
 }
 
 extern "C" void rt_assoc_delete_all(rt_assoc* h, const rt_elem_ops* ops) {
+    AssocMap* m = assoc_impl(h);
+    if (m == nullptr) {
+        return;
+    }
+    if (m->has_default) {
+        // The pattern default outlives the entries (LRM 7.9.11 keeps it
+        // independent of the array's contents), so the map has to stay.
+        assoc_clear_entries(m, ops);
+        return;
+    }
+    assoc_free(m, ops);
+    h->impl = nullptr;
+}
+
+extern "C" void rt_assoc_reset(rt_assoc* h, const rt_elem_ops* ops) {
     assoc_free(assoc_impl(h), ops);
     h->impl = nullptr;
 }
@@ -2044,24 +2099,30 @@ extern "C" void rt_assoc_assign(rt_assoc* dst, const rt_assoc* src, const rt_ele
     if (dst == src) {
         return;
     }
-    rt_assoc_delete_all(dst, ops);
+    rt_assoc_reset(dst, ops);
     AssocMap* sm = assoc_impl(const_cast<rt_assoc*>(src));
-    if (sm == nullptr || sm->entries.empty()) {
+    if (sm == nullptr || (sm->entries.empty() && !sm->has_default)) {
         return;
     }
     auto* dm  = new AssocMap();
     dst->impl = dm;
     dm->entries.reserve(sm->entries.size());
     const bool managed = ops->kind != rt_elem_pod;
-    for (const auto& kv : sm->entries) {
-        auto& slot = dm->entries[kv.first];
+    const auto copy_in = [&](std::vector<uint8_t>& slot, const uint8_t* from) {
         slot.resize(static_cast<size_t>(ops->stride));
         if (managed) {
             rt_elem_init(ops, slot.data());
-            rt_elem_copy(ops, slot.data(), kv.second.data(), site);
+            rt_elem_copy(ops, slot.data(), from, site);
         } else {
-            std::memcpy(slot.data(), kv.second.data(), static_cast<size_t>(ops->stride));
+            std::memcpy(slot.data(), from, static_cast<size_t>(ops->stride));
         }
+    };
+    for (const auto& kv : sm->entries) {
+        copy_in(dm->entries[kv.first], kv.second.data());
+    }
+    if (sm->has_default) {
+        copy_in(dm->default_slot, sm->default_slot.data());
+        dm->has_default = true;
     }
 }
 

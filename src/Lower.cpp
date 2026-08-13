@@ -2250,17 +2250,19 @@ private:
         return false;
     }
 
-    // True if a type is a fixed-size unpacked array, dynamic array, or queue: the
-    // remaining unpacked container shapes (scalar-element, so not is_aggregate)
-    // whose declaration initializer must route through the same element-wise /
-    // handle-aware emit_agg_store path as a struct-bearing aggregate, rather than
-    // the plain scalar Store fallback (which mis-lowers a `'{...}` or bare `{...}`
-    // literal, or a copy from another handle variable, into a raw bit-blast over
-    // the container's handle/flat storage).
+    // True if a type is a fixed-size unpacked array, dynamic array, queue, or
+    // associative array: the remaining unpacked container shapes (scalar-element,
+    // so not is_aggregate) whose declaration initializer must route through the
+    // same element-wise / handle-aware emit_agg_store path as a struct-bearing
+    // aggregate, rather than the plain scalar Store fallback (which mis-lowers a
+    // `'{...}` or bare `{...}` literal, or a copy from another handle variable,
+    // into a raw bit-blast over the container's handle/flat storage).
     static bool is_unpacked_container(const slang::ast::Type& t) {
         const slang::ast::Type& ct = t.getCanonicalType();
         return ct.as_if<slang::ast::FixedSizeUnpackedArrayType>() != nullptr ||
-               ct.as_if<slang::ast::DynamicArrayType>() != nullptr || ct.as_if<slang::ast::QueueType>() != nullptr;
+               ct.as_if<slang::ast::DynamicArrayType>() != nullptr ||
+               ct.as_if<slang::ast::QueueType>() != nullptr ||
+               ct.as_if<slang::ast::AssociativeArrayType>() != nullptr;
     }
 
     // Store a whole unpacked struct: one blocking store per member (the aggregate
@@ -2431,6 +2433,13 @@ private:
         // pattern and only differs in the element-span accessor.
         const bool is_concat_literal =
           pat == nullptr && rhs.kind == ExpressionKind::Concatenation && rhs.type->isUnpackedArray();
+        if (t.kind == ir::Type::Kind::Assoc && pat != nullptr) {
+            // An associative-array literal is keyed, never positional, so it has no
+            // element list to walk (slang keeps the entries and the `default:` in
+            // the structured pattern's own setters).
+            emit_assoc_literal_init(lhs, type, rhs, tag, b, l);
+            return;
+        }
         if (pat != nullptr || is_concat_literal) {
             const auto     elems = pat != nullptr ? pat->elements() : rhs.as<ConcatenationExpression>().operands();
             const uint32_t reps =
@@ -2572,6 +2581,89 @@ private:
         for (uint32_t k = 0; k < count; ++k) {
             b.queue_push(lhs, lower_expr(*elems[k % n], b), /*front*/ false, type, l);
         }
+    }
+
+    // Build an associative array from a `'{...}` literal (LRM 7.9.11): an optional
+    // `default:` value that every absent key reads back, plus zero or more keyed
+    // entries. Whole-array assignment replaces, so the old entries AND the old
+    // default go first; the default is installed before the entries so an explicit
+    // key is never overwritten by it.
+    //
+    // slang keeps neither in `elements()`: the entries are `indexSetters`, already
+    // bound against the key and value types, and the default is `defaultSetter`,
+    // which it binds SELF-DETERMINED — so `'{default: "hello"}` over a `string`
+    // element arrives as a packed byte literal and has to be converted here. It
+    // also rejects a positional or replicated pattern over an associative array
+    // outright, so a keyed pattern is the only shape that arrives.
+    void emit_assoc_literal_init(ir::Index         lhs,
+                                 ir::Ref           type,
+                                 const Expression& rhs,
+                                 ir::Inst::Tag     tag,
+                                 ir::Builder&      b,
+                                 ir::SourceLoc     l) {
+        if (tag != ir::Inst::Tag::Store) {
+            // TODO: nonblocking '{...} literal into an associative array (needs the
+            // handle-aware NBA staging path, the same gap as the queue / dynamic
+            // array literal and the whole-assoc NBA guard).
+            fail("nonblocking assignment of a literal into an associative array is not supported");
+        }
+        if (rhs.kind != ExpressionKind::StructuredAssignmentPattern) {
+            // TODO: unreachable through slang today (it rejects a positional or
+            // replicated pattern over an associative array); guarded rather than
+            // silently dropped if that ever changes.
+            fail("only a keyed '{key:value} / '{default:value} literal is supported for an "
+                 "associative array");
+        }
+        const auto& sap = rhs.as<slang::ast::StructuredAssignmentPatternExpression>();
+        if (!sap.memberSetters.empty() || !sap.typeSetters.empty()) {
+            fail("member / type keys in an associative array literal are not supported");
+        }
+        const slang::ast::Type& elem = *rhs.type->getArrayElementType();
+        if (!elem.isIntegral() && !elem.isFloating() && !elem.getCanonicalType().isString()) {
+            // TODO: an aggregate value element needs the per-leaf emit_agg_store
+            // path for each entry, not one scalar Store.
+            fail("associative array literal with an aggregate value element is not supported");
+        }
+        b.assoc_reset(lhs, type, l);
+        if (sap.defaultSetter != nullptr) {
+            const ir::Index dv = lower_assoc_value(*sap.defaultSetter, elem, b, l);
+            b.binary(ir::Inst::Tag::Store, b.assoc_default(lhs, type, l), dv, l);
+        }
+        for (const auto& setter : sap.indexSetters) {
+            const ir::Index key = lower_expr(*setter.index, b);
+            const ir::Index val = lower_assoc_value(*setter.expr, elem, b, l);
+            b.binary(ir::Inst::Tag::Store, b.assoc_select(lhs, key, type, l), val, l);
+        }
+    }
+
+    // One value of an associative-array literal, converted to the value element
+    // type. A keyed value arrives already bound to it; the `default:` value does
+    // not (slang binds it self-determined), so this applies the assignment-context
+    // conversions LRM 6.16 / 10.9 would have: packed <-> string both ways, and the
+    // ordinary integral / real coercion otherwise.
+    ir::Index lower_assoc_value(const Expression&       e,
+                                const slang::ast::Type& elem,
+                                ir::Builder&            b,
+                                ir::SourceLoc           l) {
+        if (elem.getCanonicalType().isString()) {
+            if (is_string_expr(e)) {
+                return lower_expr(e, b);
+            }
+            if (e.kind == ExpressionKind::StringLiteral) {
+                return b.constant(string_value_ref(e.as<StringLiteral>().getValue()), l);
+            }
+            if (!e.type->isIntegral()) {
+                fail("unsupported associative array literal value for a string element");
+            }
+            return b.unary(ir::Inst::Tag::StrFromPacked, lower_expr(e, b), l);
+        }
+        if (is_string_expr(e)) {
+            if (!elem.isIntegral()) {
+                fail("unsupported string value in an associative array literal");
+            }
+            return b.str_to_packed(lower_expr(e, b), lower_type(elem), l);
+        }
+        return coerce(lower_expr(e, b), *e.type, lower_type(elem), b, l);
     }
 
     // Per-leaf copy of one aggregate lvalue into another (both of `type`),
@@ -14164,19 +14256,23 @@ private:
     }
 
     // Whole-associative-array assignment (LRM 7.9): `a = other` deep-copies the
-    // source map. Element writes (`a[k] = x`) are ordinary Stores over an
-    // AssocSelect and do not reach here. Only a plain assoc variable / assoc-
-    // returning call source is a handle copy; an assignment-pattern source is a
-    // documented follow-up.
+    // source map (the pattern default included — it is part of the value), and
+    // `a = '{...}` rebuilds it from a literal (7.9.11). Element writes (`a[k] = x`)
+    // are ordinary Stores over an AssocSelect and do not reach here.
     ir::Index lower_assoc_assign(const AssignmentExpression& a, ir::Builder& b) {
-        const ir::SourceLoc l          = loc(a);
-        const ir::Index     dst        = lower_lvalue(a.left(), b);
-        const ir::Ref       aty        = lower_type(*a.left().type);
-        const bool          src_is_var = is_assoc(a.right()) && (a.right().kind == ExpressionKind::NamedValue ||
-                                                                 a.right().kind == ExpressionKind::HierarchicalValue ||
-                                                                 a.right().kind == ExpressionKind::Call);
+        const ir::SourceLoc l   = loc(a);
+        const ir::Index     dst = lower_lvalue(a.left(), b);
+        const ir::Ref       aty = lower_type(*a.left().type);
+        if (as_assignment_pattern(a.right()) != nullptr) {
+            emit_assoc_literal_init(dst, aty, unwrap_conversion(a.right()), ir::Inst::Tag::Store, b, l);
+            return dst;
+        }
+        const bool src_is_var = is_assoc(a.right()) && (a.right().kind == ExpressionKind::NamedValue ||
+                                                        a.right().kind == ExpressionKind::HierarchicalValue ||
+                                                        a.right().kind == ExpressionKind::Call);
         if (!src_is_var) {
-            // TODO: associative-array init from an assignment pattern ('{...}).
+            // TODO: associative-array assignment from any other rvalue shape (there
+            // is none in LRM 7.9 beyond a variable, a call result and a literal).
             fail("associative array assignment from a non-variable value is not supported");
         }
         b.assoc_copy(dst, lower_lvalue(a.right(), b), aty, l);
@@ -16105,8 +16201,9 @@ private:
         // constants / parameters.
         if (const Expression* init = prop.getInitializer()) {
             if (is_aggregate(prop.getType()) || is_unpacked_container(prop.getType())) {
-                // TODO: aggregate static-property initializer (per-leaf PreInit store).
-                fail("aggregate static class property initializer is not supported");
+                // TODO: aggregate / container static-property initializer (per-leaf
+                // PreInit store, or the container literal build).
+                fail("aggregate or container static class property initializer is not supported");
             }
             if (!preinit_) {
                 preinit_.emplace(module_.pool);
