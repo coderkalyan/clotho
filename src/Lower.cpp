@@ -6082,6 +6082,9 @@ private:
             case StatementKind::PatternCase:
                 lower_pattern_case(stmt.as<slang::ast::PatternCaseStatement>(), b);
                 break;
+            case StatementKind::RandCase:
+                lower_randcase(stmt.as<slang::ast::RandCaseStatement>(), b);
+                break;
             case StatementKind::ForLoop:
                 lower_for(stmt.as<ForLoopStatement>(), b);
                 break;
@@ -10906,6 +10909,98 @@ private:
         const ir::ExtraSlice else_region = b.close_region();
 
         b.cond(pred, then_region, else_region, loc(*item.stmt));
+    }
+
+    // randcase (LRM 18.16): take one branch at random, weighted. Every weight is
+    // evaluated exactly once and the sum is formed with unsigned addition at the
+    // widest weight's precision -- 18.16 makes each summand unsigned, so a signed
+    // weight is reinterpreted rather than sign-extended, and a sum that does not
+    // fit that precision wraps. One $urandom_range draw in [0, sum-1] then picks
+    // the first branch whose cumulative weight passes it, so a zero-weight branch
+    // is never taken and an all-zero sum takes no branch at all (18.16 leaves the
+    // warning for that case optional; Clotho does not emit one).
+    void lower_randcase(const slang::ast::RandCaseStatement& rc, ir::Builder& b) {
+        const ir::SourceLoc l = loc(rc);
+        if (fn_ctx_ != nullptr) {
+            // TODO: randcase inside a function/task/fork child/action block needs
+            // the caller's RNG threaded through the call ABI (the $urandom gap).
+            fail("randcase inside a function/task is not supported yet (no per-process RNG "
+                 "in the call frame); use it directly in a process");
+        }
+        if (rc.items.empty()) {
+            return;
+        }
+
+        uint32_t width = 1;
+        for (const slang::ast::RandCaseStatement::Item& item : rc.items) {
+            width = std::max(width, item.expr->type->getBitWidth());
+        }
+        if (width > 32) {
+            // TODO: a wider sum needs the LRM's several-draw scheme, stitching
+            // multiple $urandom_range results into one number (LRM 18.16).
+            fail("randcase with a weight wider than 32 bits is not supported");
+        }
+
+        // The weight domain is 2-state: an x/z weight bit reads as 0, which is how
+        // $urandom_range already treats its own operands (18.16 does not define a
+        // 4-state weight).
+        const ir::Ref          wty = make_int_type(width, false, false);
+        std::vector<ir::Index> weights;
+        weights.reserve(rc.items.size());
+        for (const slang::ast::RandCaseStatement::Item& item : rc.items) {
+            weights.push_back(b.resize(lower_expr(*item.expr, b), wty, loc(*item.expr)));
+        }
+
+        ir::Index sum = weights[0];
+        for (size_t k = 1; k < weights.size(); k++) {
+            sum = b.binary(ir::Inst::Tag::Add, sum, weights[k], l);
+        }
+
+        // The draw is guarded, not clamped: with a zero sum there is no branch to
+        // take, and $urandom_range(-1, 0) would otherwise draw over the full range
+        // (and consume a value from the process stream).
+        const ir::Ref   u32  = make_int_type(32, false, false);
+        const ir::Index zero = b.constant(module_.pool.put_int(wty, 0), l);
+        b.open_region();
+        const ir::Index draw = b.urandom_range(
+          b.binary(ir::Inst::Tag::Sub, b.resize(sum, u32, l), b.constant(module_.pool.put_int(u32, 1), l), l),
+          b.constant(module_.pool.put_int(u32, 0), l),
+          l);
+        lower_randcase_arm(rc, 0, zero, draw, weights, u32, b);
+        const ir::ExtraSlice pick_region = b.close_region();
+        b.open_region();
+        const ir::ExtraSlice none_region = b.close_region();
+        b.cond(b.binary(ir::Inst::Tag::Ne, sum, zero, l), pick_region, none_region, l);
+    }
+
+    // One arm of the randcase chain: item k runs when the draw is below its
+    // cumulative weight and no earlier arm claimed it. The cumulative sums carry
+    // the same wrapping unsigned precision as the total and are widened to 32 bits
+    // only to meet the draw, which is below the total -- so the terminal else is
+    // unreachable for a nonzero total.
+    void lower_randcase_arm(const slang::ast::RandCaseStatement& rc,
+                            size_t                               k,
+                            ir::Index                            acc,
+                            ir::Index                            draw,
+                            const std::vector<ir::Index>&        weights,
+                            ir::Ref                              u32,
+                            ir::Builder&                         b) {
+        if (k == weights.size()) {
+            return;
+        }
+        const ir::SourceLoc l    = loc(*rc.items[k].stmt);
+        const ir::Index     next = b.binary(ir::Inst::Tag::Add, acc, weights[k], l);
+        const ir::Index     pred = b.binary(ir::Inst::Tag::Lt, draw, b.resize(next, u32, l), l);
+
+        b.open_region();
+        lower_stmt(*rc.items[k].stmt, b);
+        const ir::ExtraSlice then_region = b.close_region();
+
+        b.open_region();
+        lower_randcase_arm(rc, k + 1, next, draw, weights, u32, b);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        b.cond(pred, then_region, else_region, l);
     }
 
     // -- System tasks --
