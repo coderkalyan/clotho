@@ -169,6 +169,29 @@ TEST_CASE("bit-query results feed expressions") {
     CHECK(out == "all set\n16\n");
 }
 
+// -- $isunbounded -----------------------------------------------------------
+
+// $isunbounded (LRM 20.6.1): 1 when the operand is a parameter whose value is
+// the unbounded literal `$`, 0 otherwise. The argument is never evaluated, so
+// the call is always an elaboration constant.
+TEST_CASE("$isunbounded distinguishes an unbounded parameter") {
+    const std::string out =
+      run_capture(prog("parameter int UNB = $; parameter int LIM = 16; parameter real R = 3.5;",
+                       "$display(\"%0b %0b %0b\", $isunbounded(UNB), $isunbounded(LIM),"
+                       " $isunbounded(R));"));
+    CHECK(out == "1 0 0\n");
+}
+
+// The idiomatic use: the unbounded bound picks a branch during elaboration, so
+// the result reaches lowering already folded into the dependent parameters.
+TEST_CASE("$isunbounded folds in a constant context") {
+    const std::string out = run_capture(
+      prog("parameter int UNB = $; localparam bit U = $isunbounded(UNB);"
+           " localparam int LIMIT = U ? 0 : 8;",
+           "$display(\"%0b %0d\", U, LIMIT);"));
+    CHECK(out == "1 0\n");
+}
+
 // -- $typename --------------------------------------------------------------
 
 TEST_CASE("$typename formats the supported type kinds") {

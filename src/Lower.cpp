@@ -11982,6 +11982,24 @@ private:
             fail("array query function on a dynamically-sized operand is not supported");
         }
 
+        // $isunbounded (LRM 20.6.1): 1 if the operand is the unbounded literal
+        // `$` or a parameter whose value is `$`, else 0. slang leaves the
+        // argument unevaluated and answers from its type / the referenced
+        // ParameterSymbol's value, so the call always folds to a 1-bit constant.
+        // The sole non-integer result is a hierarchical operand, which slang
+        // refuses to constant-evaluate.
+        if (name == "$isunbounded") {
+            slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+            slang::ast::EvalContext    ectx(actx);
+            const slang::ConstantValue cv = call.eval(ectx);
+            if (cv.isInteger()) {
+                return b.constant(svint_to_ref(cv.integer(), lower_type(*call.type)), l);
+            }
+            // TODO: $isunbounded of a hierarchical reference (LRM 20.6.1). Needs a
+            // constant-evaluation context that resolves across instances.
+            fail("$isunbounded of a hierarchical reference is not supported");
+        }
+
         // TODO: $typename (LRM 20.6.1). slang folds it to a string, but its type
         // $typename (LRM 20.6.1): the operand's resolved type name as a string
         // constant. Clotho formats the type itself (format_typename) rather than
