@@ -944,13 +944,14 @@ void rt_container_format_p(rt_string* out, const void* handle, int32_t is_queue,
 // case of a tagged union, it shall print "tag:value" along with the currently
 // valid element") into `out`. `v` carries the whole flat {tag, gap, payload}
 // value's planes; `width` is its total width and `tag_bits` its high discriminant
-// bits. `names` / `name_lens` / `widths` are the per-member table in tag order,
-// where a width of 0 marks a `void` member, printed as its tag with no `:value`.
-// A tag that is x/z or names no member has no valid element to print, so the whole
-// flat value renders as one `'h<hex>` leaf instead.
+// bits. `names` / `name_lens` / `widths` / `signs` are the per-member table in tag
+// order, where a width of 0 marks a `void` member, printed as its tag with no
+// `:value`, and `signs` selects a signed decimal payload. A tag that is x/z or
+// names no member has no valid element to print, so the whole flat value renders
+// as one decimal leaf instead.
 void rt_tagged_format_p(rt_string* out, const rt_arg* v, uint32_t width, uint32_t tag_bits,
                         uint32_t count, const char* const* names, const uint32_t* name_lens,
-                        const uint32_t* widths, const rt_alloc_site* site);
+                        const uint32_t* widths, const uint32_t* signs, const rt_alloc_site* site);
 
 // Logical `==` of two queues / dynamic arrays (LRM 11.4.5): 0 unequal, 1 equal,
 // 2 ambiguous (1'bx). Params mirror rt_container_format_p; `!=` is the caller's
@@ -1109,12 +1110,13 @@ void rt_string_tolower(rt_string* dst, const rt_string* src, const rt_alloc_site
 // (`vbytes` = (width+7)/8) and `values` is the `count` member values packed
 // contiguously (`vbytes` each); `names` / `lens` are the parallel name table.
 // Byte-compared, so a base wider than 64 bits works. With `fmt_fallback` set, a
-// value matching no member instead renders as a `'h<hex>` leaf of `width` bits —
-// LRM §21.2.1.6's rule for `%p` of an enum, against §6.19.2's "" for `.name()`.
+// value matching no member instead renders as a decimal leaf of `width` bits,
+// signed when `is_signed` — LRM §21.2.1.6's rule for `%p` of an enum ("according
+// to the base type"), against §6.19.2's "" for `.name()`.
 // `site` locates the name() call for an allocation-failure report.
 void rt_enum_name(rt_string* dst, const uint8_t* val, uint32_t vbytes, uint32_t count, const uint8_t* values,
                   const char* const* names, const uint32_t* lens, uint32_t width, uint32_t fmt_fallback,
-                  const rt_alloc_site* site);
+                  uint32_t is_signed, const rt_alloc_site* site);
 
 // s[i] = c ($.putc()): a no-op when i is out of range or (c & 0xff) == 0 — a
 // string never contains a 0 byte (LRM §6.16.2).

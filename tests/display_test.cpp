@@ -423,8 +423,6 @@ TEST_CASE("display operands wider than 64 bits (LRM 21.2)") {
 }
 
 TEST_CASE("%p renders unpacked aggregates as assignment patterns (LRM 21.2.1.6)") {
-    // `'{...}` with hex `'h` leaves and struct member names — matches verilator
-    // (the only working oracle; iverilog rejects %p on aggregates).
     SUBCASE("fixed unpacked array") {
         CHECK(run_capture(R"(
             module m;
@@ -435,7 +433,7 @@ TEST_CASE("%p renders unpacked aggregates as assignment patterns (LRM 21.2.1.6)"
                     $display("%p", arr);
                 end
             endmodule
-        )") == "'{'h0, 'ha, 'h14, 'h1e}\n");
+        )") == "'{0, 10, 20, 30}\n");
     }
     SUBCASE("nested array of struct, and interleaved specs") {
         CHECK(run_capture(R"(
@@ -448,6 +446,31 @@ TEST_CASE("%p renders unpacked aggregates as assignment patterns (LRM 21.2.1.6)"
                     $display("x=%0d v=%p y=%0d", 7, sarr, 9);
                 end
             endmodule
-        )") == "x=7 v='{'{a:'h1, b:'h1}, '{a:'h2, b:'h2}} y=9\n");
+        )") == "x=7 v='{'{a:1, b:1}, '{a:2, b:2}} y=9\n");
+    }
+    SUBCASE("real, string, and string-literal leaves") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { real r; string s; int n; } s_t;
+                s_t v;
+                string t;
+                initial begin
+                    v = '{1.5, "hi", -3};
+                    t = "top";
+                    $display("%p %p %p %p", v, t, "lit", 1.0/3.0);
+                end
+            endmodule
+        )") == "'{r:1.5, s:\"hi\", n:-3} \"top\" \"lit\" 0.333333\n");
+    }
+    SUBCASE("a class handle operand is refused loudly") {
+        // 21.2.1.6 wants an implementation-defined handle form with `null` for a null
+        // handle; printing the raw handle word as a decimal would be silently wrong.
+        check_rejected(R"(
+            module m;
+                class C; int x; endclass
+                C c;
+                initial $display("%p", c);
+            endmodule
+        )", "handle is not supported");
     }
 }

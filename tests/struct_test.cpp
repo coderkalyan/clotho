@@ -562,13 +562,7 @@ TEST_CASE("tagged union with a non-integral member is rejected loudly (Phase 3 g
     CHECK(r.diagnostic_text().find("unpacked union member must be an integral type") != std::string::npos);
 }
 
-TEST_CASE("%p of a tagged union prints tag:value (LRM 21.2.1.6)") {
-    // LRM 21.2.1.6: "For unions, only the first declared elements shall be printed.
-    // In the case of a tagged union, it shall print "tag:value" along with the
-    // currently valid element." Which member that is only the run-time tag knows,
-    // so this is the one %p shape rendered in the runtime. A `void` member has no
-    // element, so its tag prints alone. The payload renders at the MEMBER's own
-    // width, not the union's payload region, so the gap bits never leak in.
+TEST_CASE("%p of a tagged union prints '{tag:value} (LRM 21.2.1.6)") {
     CHECK(run_capture(R"(
         module m;
             typedef union tagged packed { void Invalid; int Valid; } opt_t;
@@ -587,21 +581,33 @@ TEST_CASE("%p of a tagged union prints tag:value (LRM 21.2.1.6)") {
                 $display("%p", u);
             end
         endmodule
-    )") == "Valid:'h2a Invalid\nb:'hab\nw:'hdeadbeef\nnone\n");
+    )") == "'{Valid:42} '{Invalid}\n'{b:-85}\n'{w:-559038737}\n'{none}\n");
 }
 
 TEST_CASE("%p of a tagged union whose tag is x falls back to the flat value") {
     // An uninitialized tagged union has undefined tag bits (LRM 11.9), so no member
     // is valid and there is no `tag:value` to print. LRM 21.2.1.6 does not cover
-    // that, so the whole flat value renders as one integral leaf — showing the x
-    // digits rather than inventing a member name.
+    // that, so the whole flat value renders as one integral leaf — all-x under the
+    // decimal leaf rule, rather than inventing a member name.
     CHECK(run_capture(R"(
         module m;
             typedef union tagged packed { void Invalid; logic [15:0] Valid; } opt_t;
             opt_t a;
             initial $display("%p", a);
         endmodule
-    )") == "'hxxxxx\n");
+    )") == "'{x}\n");
+}
+
+TEST_CASE("%p of a tagged union is a legal assignment pattern (sv-tests 7.3.2)") {
+    CHECK(run_capture(R"SV(
+        module m;
+            union tagged { void invalid; bit [3:0] valid; } un;
+            initial begin
+                un = tagged valid (10);
+                $display(":assert: ('%p' == ''{valid:10}')", un);
+            end
+        endmodule
+    )SV") == ":assert: (''{valid:10}' == ''{valid:10}')\n");
 }
 
 TEST_CASE("%p of a nested tagged union / packed struct / enum (LRM 21.2.1.6)") {
@@ -629,25 +635,21 @@ TEST_CASE("%p of a nested tagged union / packed struct / enum (LRM 21.2.1.6)") {
                 $display("%p", arr);
             end
         endmodule
-    )") == "'{o:Valid:'h7, c:GREEN, p:'{hi:'h11, lo:'h22}, n:'h5}\n"
-           "'{Valid:'h1, Invalid}\n");
+    )") == "'{o:'{Valid:7}, c:GREEN, p:'{hi:17, lo:34}, n:5}\n"
+           "'{'{Valid:1}, '{Invalid}}\n");
 }
 
 TEST_CASE("%p of a packed struct, a plain union, and an enum (LRM 21.2.1.6)") {
-    // Three more `shall` clauses that the aggregate-ABI dispatch used to miss, all
-    // rendering as a bare decimal before: "A packed structure data type shall print
-    // its value as an assignment pattern with named elements", "For unions, only the
-    // first declared elements shall be printed", and "An enumerated data type shall
-    // print its value as an enumeration name if the value is valid for that type.
-    // Otherwise the value shall print according to the base type".
     CHECK(run_capture(R"(
         module m;
             typedef struct packed { byte a; byte b; } ps_t;
             typedef union packed { byte a; byte b; } pu_t;
             typedef enum logic [1:0] { RED, GREEN, BLUE } c_t;
+            typedef enum byte { LOW = 8'sh01 } sb_t;
             ps_t s;
             pu_t u;
             c_t  c;
+            sb_t sb;
             initial begin
                 s = '{8'hAB, 8'h2A};
                 u.a = 8'hAB;
@@ -656,9 +658,11 @@ TEST_CASE("%p of a packed struct, a plain union, and an enum (LRM 21.2.1.6)") {
                 $display("%p", c);
                 c = c_t'(2'd3);
                 $display("%p", c);
+                sb = sb_t'(8'hF7);
+                $display("%p", sb);
             end
         endmodule
-    )") == "'{a:'hab, b:'h2a} '{a:'hab}\nGREEN\n'h3\n");
+    )") == "'{a:-85, b:42} '{a:-85}\nGREEN\n3\n-9\n");
 }
 
 TEST_CASE("an escaped %%p does not consume the %p splice") {
@@ -675,7 +679,7 @@ TEST_CASE("an escaped %%p does not consume the %p splice") {
                 $display("%%p [%p] and [%p] 100%%", a, c);
             end
         endmodule
-    )") == "%p ['{x:'h1}] and ['{x:'h2}] 100%\n");
+    )") == "%p ['{x:1}] and ['{x:2}] 100%\n");
 }
 
 TEST_CASE("unique / unique0 if accepts a pattern condition (LRM 12.4.2 + 12.6.2)") {
@@ -1435,7 +1439,7 @@ TEST_CASE("unpacked struct / aggregate task argument is guarded") {
 
 TEST_CASE("whole unpacked struct as a $display %p operand renders a pattern") {
     // %p expands the struct at lower time into `'{field:val, ...}` (LRM 21.2.1.6);
-    // integral leaves render in hex with a `'h` tag (matches verilator).
+    // integral leaves render as the clause's unformatted decimal.
     CHECK(run_capture(R"(
         module m;
             typedef struct { logic [7:0] a; int b; } s_t;
@@ -1445,7 +1449,7 @@ TEST_CASE("whole unpacked struct as a $display %p operand renders a pattern") {
                 $display("%p", x);
             end
         endmodule
-    )") == "'{a:'hab, b:'h2a}\n");
+    )") == "'{a:171, b:42}\n");
 }
 
 TEST_CASE("chained continuous copy of a struct wakes downstream readers") {

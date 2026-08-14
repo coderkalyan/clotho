@@ -1562,7 +1562,9 @@ extern "C" void rt_queue_append_range(rt_queue* dst, const rt_queue* src,
 // integral element slot is `must | (may << width)` (an i(2*width) word) plus an
 // optional z plane at `z_off`; a 2-state slot is the bare value word. Element
 // width is <= 64 (the frontend guards wider). Integral leaves reuse render_arg
-// under `'h%0h` (minimal hex) so the leaf format matches a fixed-array `%p`.
+// under `%0d` (minimal decimal, the element's signedness honoured) so the leaf
+// format matches a fixed-array `%p`: LRM 21.2.1.6 prints a singular element "as
+// [it] would unformatted", and 21.2.1.1 makes the unformatted default decimal.
 extern "C" void rt_container_format_p(rt_string* out, const void* handle, int32_t is_queue,
                                       int32_t kind, uint32_t width, uint32_t is_signed,
                                       uint32_t four_state, uint32_t has_z, uint32_t z_off,
@@ -1581,8 +1583,8 @@ extern "C" void rt_container_format_p(rt_string* out, const void* handle, int32_
 
     clotho::FormatSpec spec{};
     spec.ok        = true;
-    spec.conv      = 'h';
-    spec.has_width = true; // width 0 => minimal digits (the %0h form)
+    spec.conv      = 'd';
+    spec.has_width = true; // width 0 => minimal digits (the %0d form)
 
     std::string s = "'{";
     for (uint64_t i = 0; i < count; ++i) {
@@ -1622,7 +1624,6 @@ extern "C" void rt_container_format_p(rt_string* out, const void* handle, int32_
             std::memcpy(&must, slot, static_cast<size_t>((width + 7) / 8));
             must &= maskW;
         }
-        s += "'h";
         const rt_arg a{ width, is_signed != 0 ? 1u : 0u, &must, &xz, &z };
         render_arg(s, a, spec);
     }
@@ -1670,11 +1671,11 @@ void copy_low_bits(std::vector<uint64_t>& dst, const uint64_t* src, uint32_t w) 
 extern "C" void rt_tagged_format_p(rt_string* out, const rt_arg* v, uint32_t width,
                                    uint32_t tag_bits, uint32_t count, const char* const* names,
                                    const uint32_t* name_lens, const uint32_t* widths,
-                                   const rt_alloc_site* site) {
+                                   const uint32_t* signs, const rt_alloc_site* site) {
     clotho::FormatSpec spec{};
     spec.ok        = true;
-    spec.conv      = 'h';
-    spec.has_width = true; // width 0 => minimal digits (the %0h form)
+    spec.conv      = 'd';
+    spec.has_width = true; // width 0 => minimal digits (the %0d form)
 
     // A single-member tagged union reserves no tag bits, so its one member is
     // always the selected one.
@@ -1690,7 +1691,6 @@ extern "C" void rt_tagged_format_p(rt_string* out, const rt_arg* v, uint32_t wid
         copy_low_bits(mv, v->val, width);
         copy_low_bits(mx, v->xz, width);
         copy_low_bits(mz, v->z, width);
-        s += "'h";
         const rt_arg a{ width, 0, mv.data(), mx.data(), mz.data() };
         render_arg(s, a, spec);
     } else {
@@ -1701,8 +1701,8 @@ extern "C" void rt_tagged_format_p(rt_string* out, const rt_arg* v, uint32_t wid
             copy_low_bits(mv, v->val, mw);
             copy_low_bits(mx, v->xz, mw);
             copy_low_bits(mz, v->z, mw);
-            s += ":'h";
-            const rt_arg a{ mw, 0, mv.data(), mx.data(), mz.data() };
+            s += ':';
+            const rt_arg a{ mw, signs[tag] != 0 ? 1u : 0u, mv.data(), mx.data(), mz.data() };
             render_arg(s, a, spec);
         }
     }
@@ -4566,7 +4566,8 @@ extern "C" void rt_string_substr(rt_string* dst, const rt_string* src, int32_t i
 
 extern "C" void rt_enum_name(rt_string* dst, const uint8_t* val, uint32_t vbytes, uint32_t count,
                              const uint8_t* values, const char* const* names, const uint32_t* lens,
-                             uint32_t width, uint32_t fmt_fallback, const rt_alloc_site* site) {
+                             uint32_t width, uint32_t fmt_fallback, uint32_t is_signed,
+                             const rt_alloc_site* site) {
     for (uint32_t k = 0; k < count; ++k) {
         if (std::memcmp(val, values + static_cast<size_t>(k) * vbytes, vbytes) == 0) {
             str_assign(dst, names[k], lens[k], site);
@@ -4575,12 +4576,14 @@ extern "C" void rt_enum_name(rt_string* dst, const uint8_t* val, uint32_t vbytes
     }
     if (fmt_fallback != 0) {
         // LRM 21.2.1.6: "Otherwise the value shall print according to the base type
-        // of the enumeration" — under %p that is the ordinary integral leaf. Only the
-        // must plane reaches here, so an x/z-valued enum prints its must bits.
+        // of the enumeration" — under %p that is the ordinary integral leaf, i.e. the
+        // base type printed as it would be unformatted: decimal (21.2.1.1), signed
+        // when the base type is. Only the must plane reaches here, so an x/z-valued
+        // enum prints its must bits.
         clotho::FormatSpec spec{};
         spec.ok        = true;
-        spec.conv      = 'h';
-        spec.has_width = true; // width 0 => minimal digits (the %0h form)
+        spec.conv      = 'd';
+        spec.has_width = true; // width 0 => minimal digits (the %0d form)
 
         // render_arg reads all three planes, so the unknown planes are materialized
         // as zeros rather than left null.
@@ -4588,8 +4591,8 @@ extern "C" void rt_enum_name(rt_string* dst, const uint8_t* val, uint32_t vbytes
         std::vector<uint64_t> mv(words, 0);
         const std::vector<uint64_t> zero(words, 0);
         std::memcpy(mv.data(), val, std::min<size_t>(vbytes, words * sizeof(uint64_t)));
-        std::string  s = "'h";
-        const rt_arg a{ width, 0, mv.data(), zero.data(), zero.data() };
+        std::string  s;
+        const rt_arg a{ width, is_signed != 0 ? 1u : 0u, mv.data(), zero.data(), zero.data() };
         render_arg(s, a, spec);
         str_assign(dst, s.data(), static_cast<uint64_t>(s.size()), site);
         return;
