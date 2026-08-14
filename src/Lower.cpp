@@ -11162,6 +11162,13 @@ private:
             lower_var_initializer(vs);
             return;
         }
+        // An AUTOMATIC declaration is initialized on every entry to its block (LRM
+        // 6.21), which is exactly where this store lands: lower_var_decl runs at the
+        // declaration's own position in the statement list. With no initializer of its
+        // own that means the type's default (Table 6-7) -- without it the storage kept
+        // the previous entry's value, so a re-entered block behaved as if the variable
+        // were static.
+        const bool automatic = vs.lifetime == slang::ast::VariableLifetime::Automatic || force_frame;
         if (const Expression* init = vs.getInitializer()) {
             const ir::SourceLoc l = loc(*init);
             if (is_aggregate(vs.getType()) || is_unpacked_container(vs.getType())) {
@@ -11169,12 +11176,83 @@ private:
             } else {
                 b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
             }
-        } else if (aggregate_has_field_defaults(vs.getType())) {
-            // No initializer of its own, but the struct type declares field-level
-            // defaults (LRM 7.2 / 8.8); apply them per call for a frame local.
-            const ir::SourceLoc l = to_source_loc(vs.location);
+            return;
+        }
+        const ir::SourceLoc l = to_source_loc(vs.location);
+        // An event is not a value: its trigger state is separate static per-event
+        // state, and its 1-bit placeholder slot is never read (docs/design/
+        // named-events.md), so there is nothing to reset.
+        // TODO: LRM Table 6-7 wants a NEW event per entry, which needs the trigger
+        // stamp reset too.
+        if (automatic && !vs.getType().isEvent()) {
+            emit_default_init(value_lvalue(vs, b, l), lower_type(vs.getType()), b, l);
+        }
+        if (aggregate_has_field_defaults(vs.getType())) {
+            // The struct type declares field-level defaults (LRM 7.2 / 8.8), which
+            // override the type defaults just written.
             emit_var_field_defaults(vs, value_lvalue(vs, b, l), b, l);
         }
+    }
+
+    // Write a variable's TYPE default (LRM 6.8, Table 6-7): x for a 4-state integral
+    // leaf, 0 for a 2-state one, 0.0 for a real, `""` for a string, `null` for a
+    // handle, an EMPTY container, and per member / element for an aggregate.
+    //
+    // Only an automatic declaration with no initializer needs it (LRM 6.21): static
+    // storage already powers on at the default, once, in the backend's init_state.
+    void emit_default_init(ir::Index lv, ir::Ref ty, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Type t = std::get<ir::Type>(module_.pool.get(ty));
+        switch (t.kind) {
+            case ir::Type::Kind::Queue:
+                b.queue_delete(lv, lv, /*has_idx=*/false, ty, l);
+                return;
+            case ir::Type::Kind::DynArray:
+                b.dyn_array_delete(lv, ty, l);
+                return;
+            case ir::Type::Kind::Assoc:
+                b.assoc_delete(lv, lv, /*has_key=*/false, ty, l);
+                return;
+            case ir::Type::Kind::String:
+                b.binary(ir::Inst::Tag::Store, lv, b.constant(string_value_ref(""), l), l);
+                return;
+            case ir::Type::Kind::UnpackedArray: {
+                // Unrolled per element, in declared-address order, like every other
+                // fixed-array walk in the frontend.
+                const uint32_t n = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
+                for (uint32_t k = 0; k < n; ++k) {
+                    const int32_t coord =
+                      t.left <= t.right ? static_cast<int32_t>(t.left + k) : static_cast<int32_t>(t.left - k);
+                    const ir::Index idx =
+                      b.constant(module_.pool.put_int(make_int_type(32, false, true),
+                                                      static_cast<uint64_t>(static_cast<int64_t>(coord))),
+                                 l);
+                    emit_default_init(b.elem_select(lv, idx, ty, l), t.element, b, l);
+                }
+                return;
+            }
+            case ir::Type::Kind::Struct:
+                if (!t.is_packed) {
+                    const auto fields = module_.pool.struct_fields(t.fields_id);
+                    for (uint32_t i = 0; i < fields.size(); ++i) {
+                        emit_default_init(b.member_select(lv, i, ty, l), fields[i].type, b, l);
+                    }
+                    return;
+                }
+                break;
+            default:
+                break;
+        }
+        // A singular leaf: a packed value (a packed struct / union included), a real,
+        // or a handle word (a class handle / chandle powers on null == 0).
+        if (module_.pool.is_float(ty)) {
+            b.binary(ir::Inst::Tag::Store, lv, b.constant(module_.pool.put_real(ty, 0.0), l), l);
+            return;
+        }
+        const ir::Layout lay = module_.pool.layout(ty);
+        const uint32_t   w   = lay.width == 0 ? 1 : lay.width;
+        const ir::Ref dv = lay.domain == ir::Domain::Four ? svint_to_ref(slang::SVInt::createFillX(w, t.is_signed), ty)
+                                                          : module_.pool.put_int(ty, 0);
+        b.binary(ir::Inst::Tag::Store, lv, b.constant(dv, l), l);
     }
 
     // Apply a module-level (static) variable's declaration initializer (LRM 6.8)
@@ -19074,11 +19152,19 @@ private:
         return sig;
     }
 
-    // True if `vs` is a static-lifetime function local (persistent storage). A
-    // loop control variable is always treated as per-call (force_frame), since its
-    // value is reset by the loop initialization on every entry regardless.
+    // True if `vs` is a static-lifetime procedural local, i.e. one whose storage
+    // persists across entries to its block or call: a module Signal in a process, a
+    // persistent Signal in a subroutine. A loop control variable is always treated as
+    // per-call (force_frame), since the loop initialization resets it on every entry
+    // regardless, and LRM 6.21 makes a declared loop variable automatic anyway.
+    //
+    // The lifetime is what decides WHEN the declaration initializer runs, so this is
+    // not conditioned on being inside a subroutine: `static int n = 0;` in an
+    // `initial` block's loop body initializes once before time zero (LRM 6.21's
+    // worked example prints 1..9 for it, not 1 2 3 three times), exactly like the
+    // same declaration inside a function.
     bool is_static_local(const VariableSymbol& vs, bool force_frame) const {
-        return fn_ctx_ != nullptr && !force_frame && vs.lifetime == slang::ast::VariableLifetime::Static;
+        return !force_frame && vs.lifetime == slang::ast::VariableLifetime::Static;
     }
 
     // Ensure storage exists for a procedural local declaration / loop variable.
