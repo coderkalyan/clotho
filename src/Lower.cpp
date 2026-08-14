@@ -1773,20 +1773,23 @@ private:
         if (is_agg_abi_ref(er)) {
             return;
         }
-        // A nested queue / dynamic array element: the slot holds ITS handle, and the
-        // element descriptor chains through rt_elem_ops::inner, so the runtime
-        // deep-copies and frees the inner container per element. `q[i]` is a handle
-        // lvalue, so the inner container's own methods and element selects work on it
-        // unchanged.
+        // A nested container element (queue, dynamic array or associative array):
+        // the slot holds ITS handle, and the element descriptor chains through
+        // rt_elem_ops::inner — rt_elem_dynarr / rt_elem_queue / rt_elem_assoc — so
+        // the runtime deep-copies and frees the inner container per element. `q[i]`
+        // is a handle lvalue, so the inner container's own methods and element
+        // selects work on it unchanged.
         const ir::Type e = std::get<ir::Type>(module_.pool.get(er));
-        if (e.kind == ir::Type::Kind::Queue || e.kind == ir::Type::Kind::DynArray) {
+        if (e.kind == ir::Type::Kind::Queue || e.kind == ir::Type::Kind::DynArray ||
+            e.kind == ir::Type::Kind::Assoc) {
             return;
         }
-        // TODO: an associative-array element (needs a new rt_elem_assoc descriptor
-        // kind: the runtime has no case for it, so its lifecycle cannot be driven) and
-        // an event element (needs per-element trigger state, LRM 15.5).
-        fail(std::string(what) + " element type is not supported (only integral / real / string / "
-                                 "class-handle / unpacked struct or array / queue / dynamic-array elements)");
+        // An event has no value and its trigger state is a separate static
+        // timestamp, so there is no per-element storage to give it
+        // (docs/design/data-model.md §7). Every other kind is admitted above.
+        // TODO: event elements would need per-element trigger state (LRM 15.5),
+        // which is a scheduler change rather than a data-model one.
+        fail(std::string(what) + " element type is not supported (an event has no value to store)");
     }
 
     ir::Ref lower_type(const slang::ast::Type& type) {
@@ -1847,43 +1850,23 @@ private:
         }
         if (const auto* aa = ct.as_if<slang::ast::AssociativeArrayType>()) {
             // Associative array (LRM 7.8/7.9): a heap-backed rt_assoc handle
-            // (ankerl map + lazy sorted key index). The value element rides the
-            // rt_elem_ops descriptor; keys reach the runtime as normalized
-            // byte spans built in the backend (docs/design/dynamic-arrays.md
-            // §4a). Value element supports integral / real / string and a
-            // trivially-copyable (POD-leaf) unpacked struct / fixed array; the
-            // a[k] read/write routes a string handle through the OOB sink and an
-            // aggregate value through its per-leaf select path. Keys of every kind
-            // are supported.
+            // (ankerl map + lazy sorted key index). The value element rides the same
+            // rt_elem_ops descriptor a queue / dynamic-array element does, so it
+            // admits the same set (guard_container_element); keys reach the runtime
+            // as normalized order-preserving byte spans built in the backend
+            // (docs/design/dynamic-arrays.md §4a).
+            //
+            // What is special about an assoc value is only that `a[k]` is a DEFERRED
+            // place: the entry's slot address depends on whether the access reads
+            // (get_ptr, which must not create the entry — LRM 7.8.6) or writes
+            // (put_ptr, which must). Load / Store and the container-method surface
+            // each know their own direction, so every whole-value form works; the one
+            // shape that does not is a further ELEMENT SELECT through a
+            // container-valued entry (`a[k][i]`), which would have to defer twice.
+            // The backend names that case precisely.
             const slang::ast::Type& et = aa->elementType.getCanonicalType();
             const ir::Ref           er = lower_type(aa->elementType);
-            bool                    ok = et.isIntegral() || et.isFloating() || et.isString();
-            if (!ok && is_agg_abi_ref(er)) {
-                if (is_trivially_copyable(er)) {
-                    ok = true;
-                } else {
-                    // TODO: an associative array whose aggregate value element owns a
-                    // string or nested-container leaf. The kind-4 rt_elem_ops leaf
-                    // table it needs now exists (a queue / dynamic-array element uses
-                    // it), and the per-leaf copy path is already what a
-                    // non-trivially-copyable aggregate takes -- what is missing is
-                    // resolving the DEFERRED assoc base for a managed leaf: a leaf
-                    // string / handle access reaches agg_slot_ptr with is_assoc still
-                    // set, which loud-fails in the backend (get_ptr vs put_ptr is
-                    // direction-dependent, so the base cannot be resolved at select
-                    // time the way a queue element's can).
-                    fail("associative array value element that is an unpacked struct "
-                         "or array with a string or nested-container leaf is not "
-                         "supported");
-                }
-            }
-            if (!ok) {
-                // TODO: associative array with a nested variable-size (queue /
-                // dynamic / assoc) value element; class-handle values are excluded.
-                fail("associative array value element type is not supported (only "
-                     "integral / real / string / trivially-copyable unpacked struct "
-                     "or array elements)");
-            }
+            guard_container_element(et, er, "associative array value");
             ir::Type t;
             t.kind    = ir::Type::Kind::Assoc;
             t.element = er;
@@ -16848,6 +16831,21 @@ private:
     // last element, index size-1; size-1 == -1 selects the OOB default on an
     // empty queue).
     ir::Index var_elem_select(const ElementSelectExpression& es, ir::Index base, ir::Builder& b, ir::SourceLoc l) {
+        if (is_assoc_element_select(es.value()) && is_handle_expr(es.value())) {
+            // `a[k][i]`: the inner container is an associative-array ENTRY, whose
+            // slot address depends on the access direction (get_ptr must not create
+            // the entry, LRM 7.8.6; put_ptr must), and that direction belongs to the
+            // consumer of this select, not to the select itself.
+            //
+            // TODO: compose the deferral so an ElemSelect over a deferred AssocSelect
+            // stays deferred, carrying the pending index alongside the pending key.
+            // Whole-value assignment (`a[k] = q`, `q = a[k]`) and the container's own
+            // methods (`a[k].push_back(v)`, `a[k].size()`) all work today, each being
+            // unambiguously one direction.
+            fail("an element select through an associative-array element that is "
+                 "itself a queue or dynamic array is not supported (whole-value "
+                 "assignment and its own methods are)");
+        }
         const ir::Ref arr_ty = lower_type(*es.value().type);
         if (is_queue(es.value()) && es.selector().type->isUnbounded()) {
             const ir::Ref   i32  = make_int_type(32, false, true);

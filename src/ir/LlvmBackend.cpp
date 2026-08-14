@@ -1580,7 +1580,17 @@ private:
     // itself a container, or `q[i].inner` where the element is a struct with a
     // container member) redirects out of range to the sink, so the heap buffer is
     // never addressed past its live length.
-    llvm::Value* lv_handle_ptr(const LValue& lv) {
+    //
+    // `a[k]` where the assoc VALUE is a container is a deferred place, so it is
+    // resolved here, and the direction decides which way: a mutating method
+    // (`a[k].push_back(x)`) must create the entry, because LRM 7.10's methods
+    // operate on a queue variable and there is no variable until the entry exists;
+    // a query (`a[k].size()`) must not (LRM 7.8.6 -- reading a nonexistent element
+    // creates nothing), and reads the empty-container default out of the sink.
+    llvm::Value* lv_handle_ptr(const LValue& lv, bool for_write = true) {
+        if (lv.is_assoc) {
+            return lv_handle_ptr(assoc_elem_lvalue(lv, for_write), for_write);
+        }
         llvm::Value* ptr = lv.is_agg ? agg_slot_ptr(lv) : lv.base;
         if (lv.dyn_inrange == nullptr || !lv.is_handle) {
             return ptr;
@@ -2041,17 +2051,16 @@ private:
             // scalar/string leaves reachable by a static (struct-field-only) path
             // are enumerated for nonblocking staging.
             //
-            // A `ref` actual of aggregate type takes the same mirror even when a
-            // plain array would be flat, because the callee's formal ALIASES this
-            // storage and its own layout is always the canonical mirror. Left flat,
-            // a 2-state array signal forced packed by the pointer ABI ({i2W, iW}
-            // elements) would be read by the callee as narrow ({iW}) elements, so
-            // every index past 0 would address the wrong bytes. `force_agg` says the
-            // same thing for a compiler-materialized by-value temp; ref_arg is the
-            // analysis-derived version for a user signal.
-            const bool canonical_agg =
-              (sigs[i].force_agg || facts_.ref_arg[i]) && is_agg_abi(sigs[i].type);
-            if (needs_agg_storage(sigs[i].type) || canonical_agg) {
+            // A `ref` actual of plain array type deliberately does NOT switch models:
+            // it keeps flat storage and only its ELEMENT SHAPE is canonicalized
+            // below. That is sufficient, because a flat `[N x slot]` over canonical
+            // element slots is byte-identical to the canonical mirror (row-major,
+            // same leaf slot type) — only the GEP shape differs, and both sides
+            // compute the same address. Switching models here instead would leave a
+            // ref-actual array and an ordinary one of the SAME type with different
+            // storage, which a whole-array copy between the two cannot express.
+            if (needs_agg_storage(sigs[i].type) ||
+                (sigs[i].force_agg && is_agg_abi(sigs[i].type))) {
                 slot.is_agg     = true;
                 slot.has_z      = false;
                 slot.storage_ty = agg_storage_ty(sigs[i].type);
@@ -10511,6 +10520,25 @@ private:
                 LValue         lv     = lvalue_of(p.op_extra.op);
                 const auto     es     = ir_->extra_data<ElemSelect>(p.op_extra.extra);
                 const Type&    at     = std::get<Type>(mod_.pool.get(es.array_type));
+                const bool inner_container =
+                  at.kind == Type::Kind::DynArray || at.kind == Type::Kind::Queue;
+                if (lv.is_assoc && inner_container) {
+                    // `a[k][i]` where the assoc value is itself a container. The
+                    // element address needs the entry's slot, but resolving it here
+                    // would have to pick get_ptr or put_ptr WITHOUT knowing whether
+                    // the consumer reads or writes -- and picking put_ptr would
+                    // create an entry on a read, which LRM 7.8.6 forbids.
+                    //
+                    // TODO: compose the deferral. An AssocSelect already defers to
+                    // its Load / Store; an ElemSelect on top of one has to defer
+                    // too, carrying the pending index alongside the pending key, so
+                    // the direction stays the consumer's to choose. Whole-value
+                    // assignment and the container methods on `a[k]` work today
+                    // because each is unambiguously one direction.
+                    throw BackendError{ "element select through an associative-array "
+                                        "element that is itself a container is not "
+                                        "supported" };
+                }
                 if (at.kind == Type::Kind::DynArray) {
                     // Dynamic array (LRM 7.5): the base lvalue addresses the
                     // { data, len } handle. Load the heap data pointer and length,
@@ -10746,11 +10774,12 @@ private:
                 // Managed value elements carry only the slot type (a string / a
                 // container handle); the plane facts below are meaningless for
                 // them and are lifted per-kind in assoc_elem_lvalue.
-                el.slot_ty       = e.slot_ty;
-                el.has_z         = e.has_z;
-                el.narrow        = e.narrow;
-                el.store_width   = e.width;
-                el.width         = e.width;
+                el.slot_ty     = e.slot_ty;
+                el.handle_type = e.elem_type;
+                el.has_z       = e.has_z;
+                el.narrow      = e.narrow;
+                el.store_width = e.width;
+                el.width       = e.width;
                 set_lvalue(i, el);
                 return;
             }
@@ -10776,6 +10805,7 @@ private:
                     return;
                 }
                 el.slot_ty     = e.slot_ty;
+                el.handle_type = e.elem_type;
                 el.has_z       = e.has_z;
                 el.narrow      = e.narrow;
                 el.store_width = e.width;
@@ -11581,7 +11611,7 @@ private:
                 const auto&        pt = p.op_type;
                 const ContainerFmt cf = container_fmt(pt.type);
                 b_.CreateCall(container_fmt_p_fn(),
-                              { str_of(i), lv_handle_ptr(lvalue_of(pt.op)), b_.getInt32(cf.is_queue),
+                              { str_of(i), lv_handle_ptr(lvalue_of(pt.op), /*for_write=*/false), b_.getInt32(cf.is_queue),
                                 b_.getInt32(cf.kind), b_.getInt32(cf.width), b_.getInt32(cf.is_signed),
                                 b_.getInt32(cf.four), b_.getInt32(cf.has_z), b_.getInt32(cf.z_off),
                                 b_.getInt64(cf.stride),
@@ -12418,12 +12448,13 @@ private:
         llvm::Value* n = cast(must_of(value_of(da.size)), 64, type_of(da.size).is_signed);
         b_.CreateCall(dynarr_new_copy_fn(),
                       { lv_handle_ptr(lvalue_of(p.op)), elem_ops_global(da.array_type), n,
-                        lv_handle_ptr(lvalue_of(da.src)),
+                        lv_handle_ptr(lvalue_of(da.src), /*for_write=*/false),
                         alloc_site_global(loc_text(i), "dynamic array") });
     }
 
     void lower_dyn_array_size(Index i) {
-        llvm::Value* handle = lv_handle_ptr(lvalue_of(ir_->payload(i).op_type.op));
+        llvm::Value* handle =
+          lv_handle_ptr(lvalue_of(ir_->payload(i).op_type.op), /*for_write=*/false);
         llvm::Value* len =
           b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 1));
         set_value(i, two_val(cast(len, 32, false)));
@@ -12433,7 +12464,7 @@ private:
         const auto& p  = ir_->payload(i).op_extra;
         const auto  da = ir_->extra_data<DynArrayArg>(p.extra);
         b_.CreateCall(dynarr_assign_fn(),
-                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(da.arg)),
+                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(da.arg), /*for_write=*/false),
                         elem_ops_global(da.array_type),
                         alloc_site_global(loc_text(i), "dynamic array") });
     }
@@ -12551,7 +12582,8 @@ private:
     // the value in; pop copies out). Handles resolve through lv_handle_ptr so a
     // struct-member / class-property queue works too.
     void lower_queue_size(Index i) {
-        llvm::Value* handle = lv_handle_ptr(lvalue_of(ir_->payload(i).op_type.op));
+        llvm::Value* handle =
+          lv_handle_ptr(lvalue_of(ir_->payload(i).op_type.op), /*for_write=*/false);
         llvm::Value* len =
           b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 2));
         set_value(i, two_val(cast(len, 32, false)));
@@ -12578,7 +12610,7 @@ private:
             // directly. The frontend guarantees an lvalue operand here
             // (lower_container_element_value), staging a '{...} pattern into a
             // canonical aggregate temp when needed.
-            llvm::Value* src = e.is_agg ? agg_slot_ptr(lvalue_of(qa.arg)) : lv_handle_ptr(lvalue_of(qa.arg));
+            llvm::Value* src = e.is_agg ? agg_slot_ptr(lvalue_of(qa.arg)) : lv_handle_ptr(lvalue_of(qa.arg), /*for_write=*/false);
             b_.CreateCall(queue_push_fn(front),
                           { lv_handle_ptr(lvalue_of(p.op)), ops, bound, src, alloc_site_global(loc_text(i), "queue") });
             return;
@@ -12675,7 +12707,7 @@ private:
             return;
         }
         if (e.is_agg || e.is_handle) {
-            llvm::Value* src = e.is_agg ? agg_slot_ptr(lvalue_of(qi.val)) : lv_handle_ptr(lvalue_of(qi.val));
+            llvm::Value* src = e.is_agg ? agg_slot_ptr(lvalue_of(qi.val)) : lv_handle_ptr(lvalue_of(qi.val), /*for_write=*/false);
             b_.CreateCall(queue_insert_fn(), { handle, ops, bound, idx, src, alloc_site_global(loc_text(i), "queue") });
             return;
         }
@@ -12704,7 +12736,7 @@ private:
         const auto& p  = ir_->payload(i).op_extra;
         const auto  qa = ir_->extra_data<QueueArg>(p.extra);
         b_.CreateCall(queue_assign_fn(),
-                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qa.arg)),
+                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qa.arg), /*for_write=*/false),
                         elem_ops_global(qa.queue_type), alloc_site_global(loc_text(i), "queue") });
     }
 
@@ -12714,7 +12746,7 @@ private:
         const auto& p  = ir_->payload(i).op_extra;
         const auto  qa = ir_->extra_data<QueueArg>(p.extra);
         b_.CreateCall(queue_assign_dynarr_fn(),
-                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qa.arg)),
+                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qa.arg), /*for_write=*/false),
                         elem_ops_global(qa.queue_type), alloc_site_global(loc_text(i), "queue") });
     }
 
@@ -12726,7 +12758,7 @@ private:
         llvm::Value* lo = cast(must_of(value_of(qs.lo)), 64, /*sign=*/true);
         llvm::Value* hi = cast(must_of(value_of(qs.hi)), 64, /*sign=*/true);
         b_.CreateCall(queue_append_range_fn(),
-                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qs.src)),
+                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qs.src), /*for_write=*/false),
                         elem_ops_global(qs.queue_type), bound, lo, hi,
                         alloc_site_global(loc_text(i), "queue") });
     }
@@ -13141,6 +13173,9 @@ private:
             el.is_string = lv.assoc_val_string;
             el.is_handle = lv.assoc_val_handle;
             el.slot_ty   = lv.slot_ty;
+            // The sink redirect lv_handle_ptr / lv_string_ptr apply when the key is
+            // absent needs the element's own type to pick the empty image.
+            el.handle_type = lv.handle_type;
             return el;
         }
         el.slot_ty     = lv.slot_ty;
@@ -13156,7 +13191,7 @@ private:
 
     void lower_assoc_num(Index i) {
         const auto&  p   = ir_->payload(i).op_type;
-        llvm::Value* n   = b_.CreateCall(assoc_num_fn(), { lv_handle_ptr(lvalue_of(p.op)) });
+        llvm::Value* n   = b_.CreateCall(assoc_num_fn(), { lv_handle_ptr(lvalue_of(p.op), /*for_write=*/false) });
         set_value(i, two_val(cast(n, 32, false)));
     }
 
@@ -13166,7 +13201,7 @@ private:
         const auto&  p    = ir_->payload(i).op_extra;
         const auto   aa   = ir_->extra_data<AssocArg>(p.extra);
         const auto   span = normalize_assoc_key_value(aa.arg, aa.assoc_type);
-        llvm::Value* r    = b_.CreateCall(assoc_exists_fn(), { lv_handle_ptr(lvalue_of(p.op)), span.ptr, span.len });
+        llvm::Value* r    = b_.CreateCall(assoc_exists_fn(), { lv_handle_ptr(lvalue_of(p.op), /*for_write=*/false), span.ptr, span.len });
         if (span.valid != nullptr) {
             r = b_.CreateSelect(span.valid, r, zero(32));
         }
@@ -13215,7 +13250,7 @@ private:
         const auto& p  = ir_->payload(i).op_extra;
         const auto  aa = ir_->extra_data<AssocArg>(p.extra);
         b_.CreateCall(assoc_assign_fn(),
-                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(aa.arg)),
+                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(aa.arg), /*for_write=*/false),
                         elem_ops_global(aa.assoc_type),
                         alloc_site_global(loc_text(i), "associative array") });
     }
@@ -13515,7 +13550,7 @@ private:
         // The staged rt_queue starts at record field 1 (an aligned {i64 x4}).
         llvm::Value* staged = b_.CreateStructGEP(rt, rec, 1);
         b_.CreateMemSet(staged, b_.getInt8(0), b_.getInt64(4 * 8), llvm::MaybeAlign{ 1 });
-        b_.CreateCall(queue_assign_fn(), { staged, lv_handle_ptr(lvalue_of(qa.arg)),
+        b_.CreateCall(queue_assign_fn(), { staged, lv_handle_ptr(lvalue_of(qa.arg), /*for_write=*/false),
                                            elem_ops_global(qa.queue_type),
                                            alloc_site_global(loc_text(i), "queue") });
     }
@@ -16891,7 +16926,8 @@ private:
             // (the value may be a frame local or a call result temp). Resolved
             // through lv_handle_ptr so returning a struct member, class property
             // or container element copies THAT handle, not its parent's root.
-            emit_handle_assign(fn_->getArg(fn_->arg_size() - 1), lv_handle_ptr(lvalue_of(value)),
+            emit_handle_assign(fn_->getArg(fn_->arg_size() - 1),
+                               lv_handle_ptr(lvalue_of(value), /*for_write=*/false),
                                cur_fn_->return_type);
             deinit_body_strings();
             b_.CreateRetVoid();
@@ -19364,8 +19400,8 @@ private:
     // all. The must / may accumulators live in allocas so the loop needs no PHI
     // plumbing; LLVM promotes them.
     Plane emit_container_eq_loop(const LValue& lhs, const LValue& rhs, Ref type, const DynElem& e) {
-        llvm::Value* ha      = lv_handle_ptr(lhs);
-        llvm::Value* hb      = lv_handle_ptr(rhs);
+        llvm::Value* ha      = lv_handle_ptr(lhs, /*for_write=*/false);
+        llvm::Value* hb      = lv_handle_ptr(rhs, /*for_write=*/false);
         const auto [la, ba]  = container_len_base(ha, type);
         const auto [lb, bb]  = container_len_base(hb, type);
         llvm::Value* size_eq = b_.CreateICmpEQ(la, lb);
@@ -19455,7 +19491,7 @@ private:
             const ContainerFmt cf = container_fmt(type);
             llvm::Value*       ts =
               b_.CreateCall(container_eq_fn(),
-                            { lv_handle_ptr(lhs), lv_handle_ptr(rhs), b_.getInt32(cf.is_queue),
+                            { lv_handle_ptr(lhs, /*for_write=*/false), lv_handle_ptr(rhs, /*for_write=*/false), b_.getInt32(cf.is_queue),
                               b_.getInt32(cf.kind), b_.getInt32(cf.width), b_.getInt32(cf.is_signed),
                               b_.getInt32(cf.four), b_.getInt32(cf.has_z), b_.getInt32(cf.z_off),
                               b_.getInt64(cf.stride) });

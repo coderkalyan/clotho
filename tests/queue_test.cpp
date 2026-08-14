@@ -1446,16 +1446,28 @@ TEST_CASE("a struct element with a queue member deep-copies that member") {
                               "oob 0 1\n");
 }
 
-TEST_CASE("an associative-array element is still refused") {
-    // The runtime element descriptor has no rt_elem_assoc kind, so its lifecycle
-    // cannot be driven at all.
-    expect_fail(R"(
+TEST_CASE("an associative-array element deep-copies per element") {
+    // rt_elem_assoc (kind 5) drives an assoc element's lifecycle exactly as
+    // rt_elem_queue drives a nested queue's: the slot holds its handle and the
+    // descriptor chains through `inner`, so a push deep-copies the map and a pop or
+    // a whole-queue teardown frees it. No oracle: iverilog cannot parse an
+    // associative-array declaration at all.
+    constexpr std::string_view src = R"(
         module m;
             int q[$][string];
-            initial $display("%0d", q.size());
+            int m0[string];
+            initial begin
+                m0["a"] = 1;
+                m0["b"] = 2;
+                q.push_back(m0);
+                m0["c"] = 3;
+                q.push_back(m0);
+                $display("n=%0d e0=%0d e1=%0d", q.size(), q[0].num(), q[1].num());
+                $display("a0=%0d c1=%0d", q[0]["a"], q[1]["c"]);
+            end
         endmodule
-    )",
-                "queue element type is not supported");
+    )";
+    CHECK(run_capture(src) == "n=2 e0=2 e1=3\na0=1 c1=3\n");
 }
 
 // -- Operations over a non-scalar element --------------------------------------
