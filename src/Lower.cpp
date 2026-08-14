@@ -1007,7 +1007,7 @@ public:
         // Before finalize_preinit, which closes the process the seeds go into.
         finalize_sva_history();
         finalize_preinit();
-        finalize_sva_sampling();
+        finalize_preponed();
         module_.add_top(std::move(top_scope_));
     }
 
@@ -6206,6 +6206,8 @@ private:
                     b.unary(ir::Inst::Tag::Delay, scaled_delay(amount, b), loc(stmt));
                 } else if (is_event_control(timed.timing)) {
                     lower_event_wait(timed.timing, b, loc(stmt));
+                } else if (timed.timing.kind == TimingControlKind::CycleDelay) {
+                    lower_cycle_delay(timed.timing.as<CycleDelayControl>(), b, loc(stmt));
                 } else {
                     fail("unsupported timing control inside a process body");
                 }
@@ -10551,15 +10553,15 @@ private:
         }
     }
 
-    // Emit the Preponed copy of every sampled variable as one synthesized process
-    // (LRM 4.4.2.1: the sample is taken before any body of the time step runs, and
-    // is equivalent to sampling the previous Postponed region). One process for the
-    // whole top, like the PreInit pass: the copies are independent whole-signal
-    // stores, so their order carries no meaning and one dispatch per step beats one
-    // per scope. A design with no concurrent assertion registers no shadow and so
-    // gets no process and no state at all.
-    void finalize_sva_sampling() {
-        if (sva_shadow_pairs_.empty()) {
+    // Emit the Preponed process (LRM 4.4.2.1: it runs before any body of the time
+    // step, and is equivalent to sampling the previous Postponed region): the copy
+    // of every sampled variable, and the clear of every per-step latch. One process
+    // for the whole top, like the PreInit pass -- the copies are independent
+    // whole-signal stores, so their order carries no meaning and one dispatch per
+    // step beats one per scope. A design with no concurrent assertion and no
+    // clocking block registers neither, and so gets no process and no state at all.
+    void finalize_preponed() {
+        if (sva_shadow_pairs_.empty() && preponed_clears_.empty()) {
             return;
         }
         ir::Builder b(module_.pool);
@@ -10567,8 +10569,16 @@ private:
             const ir::SourceLoc l = module_.signal(shadow).loc;
             b.binary(ir::Inst::Tag::Store, b.signal(shadow, l), b.unary(ir::Inst::Tag::Load, b.signal(live, l), l), l);
         }
+        // "Did this clocking block's event occur in the current time step" (LRM
+        // 14.11's `##0`, and the maturation window of a drive): set in Observed,
+        // and false again from the top of the next step, which is here.
+        for (const ir::Signal sig : preponed_clears_) {
+            const ir::SourceLoc l = module_.signal(sig).loc;
+            b.binary(ir::Inst::Tag::Store, b.signal(sig, l), zero_mask(1, b, l), l);
+        }
         module_.add_process(ir::Process{ .activation = ir::Activation::Preponed, .ir = b.finish() });
         sva_shadow_pairs_.clear();
+        preponed_clears_.clear();
     }
 
     // -- Clocking blocks (LRM 14) --
@@ -10806,9 +10816,11 @@ private:
             }
             st.vars.push_back(var);
         }
-        if (st.has_drives) {
-            st.fired = declare_temp(mask_type(1), "clocking_fired");
-        }
+        // Always allocated, not just for a block with drives: `##0` (LRM 14.11) asks
+        // whether this block's event has already occurred in the current time step,
+        // and that is the same latch.
+        st.fired = declare_temp(mask_type(1), "clocking_fired");
+        preponed_clears_.push_back(st.fired);
         clocking_.emplace(&cb, std::move(st));
     }
 
@@ -10839,15 +10851,15 @@ private:
                                     : b.binary(ir::Inst::Tag::Band, clk_was, bit_not(clk_now, b, l), l);
         b.binary(ir::Inst::Tag::Store, b.signal(st.clkprev, l), clk_now, l);
 
-        if (st.has_drives) {
-            // Sticky, and cleared by the Re-NBA body: a drive issued between two
-            // clocking events matures at the next one (LRM 14.16), and a second
-            // Observed pass of the same slot sees no edge and must not clear it.
-            b.binary(ir::Inst::Tag::Store,
-                     b.signal(st.fired, l),
-                     b.binary(ir::Inst::Tag::Bor, load_signal(st.fired, b, l), fired, l),
-                     l);
-        }
+        // "This block's clocking event occurred in the current time step": sticky
+        // across a second Observed pass of the same slot, which sees no edge, and
+        // cleared from the top of the next step by the Preponed process. It is what
+        // makes a drive mature at a clocking event rather than at every settled
+        // point (LRM 14.16), and what `##0` tests (LRM 14.11).
+        b.binary(ir::Inst::Tag::Store,
+                 b.signal(st.fired, l),
+                 b.binary(ir::Inst::Tag::Bor, load_signal(st.fired, b, l), fired, l),
+                 l);
 
         b.open_region();
         for (const ClockVarState& cv : st.vars) {
@@ -10930,7 +10942,6 @@ private:
             const ir::ExtraSlice skip_r = b.close_region(); // empty
             b.cond(pend, drive_r, skip_r, l);
         }
-        b.binary(ir::Inst::Tag::Store, b.signal(st.fired, l), zero_mask(1, b, l), l);
         const ir::ExtraSlice then_r = b.close_region();
         b.open_region();
         const ir::ExtraSlice else_r = b.close_region(); // empty
@@ -10941,6 +10952,85 @@ private:
                                          .span       = ir::SourceSpan{ l, l },
                                          .ir         = b.finish(),
                                          .scope      = cur_scope_id() });
+    }
+
+    // The `default clocking` in scope (LRM 14.12), which is what a cycle delay
+    // counts the events of (LRM 14.11). slang resolves 14.12's scope rule -- the
+    // containing instance or checker, never an instantiated one -- and has already
+    // reported a `##n` with no default clocking in scope (diag::NoDefaultClocking),
+    // so a null here would be a clotho bug rather than a source error.
+    const ClockingBlockState& default_clocking_state() {
+        const Symbol* cb = scope_->getCompilation().getDefaultClocking(*scope_);
+        if (cb == nullptr) {
+            fail("a cycle delay needs a `default clocking` in scope (LRM 14.11)");
+        }
+        return clocking_state(cb->as<ClockingBlockSymbol>());
+    }
+
+    // `##n` as a statement (LRM 14.11): "wait for the specified number of clocking
+    // block events" of the default clocking. The count is evaluated once, and
+    // because it is the block's EVENT that is waited on rather than the clock, a
+    // `##1` executed away from the edge delays a fraction of a cycle, exactly as
+    // 14.11 describes.
+    //
+    // `##0` is the special case: it suspends only if the clocking event has not
+    // already occurred in this time step, and falls through if it has. The count is
+    // tested at run time rather than folded, so a non-constant one behaves the same.
+    void lower_cycle_delay(const CycleDelayControl& cd, ir::Builder& b, ir::SourceLoc l) {
+        const ClockingBlockState& st = default_clocking_state();
+        if (cd.expr.type->isFloating()) {
+            fail("a cycle delay with a real count is not supported");
+        }
+        const std::vector<ir::WaitEdge> edges{ ir::WaitEdge{ st.event, static_cast<uint32_t>(ir::Edge::Any) } };
+        const ir::Ref                   ty      = lower_type(*cd.expr.type);
+        const TempCell                  bound   = make_temp_cell(ty, "cycle_bound");
+        const TempCell                  counter = make_temp_cell(ty, "cycle_count");
+        b.binary(ir::Inst::Tag::Store, bound.lv(b, l), b.resize(lower_expr(cd.expr, b), ty, l), l);
+        b.binary(ir::Inst::Tag::Store, counter.lv(b, l), b.constant(module_.pool.put_int(ty, 0), l), l);
+
+        const ir::Index n_is_zero = b.binary(ir::Inst::Tag::Eq,
+                                             b.unary(ir::Inst::Tag::Load, bound.lv(b, l), l),
+                                             b.constant(module_.pool.put_int(ty, 0), l),
+                                             l);
+
+        // ##0: synchronise to this cycle's event, or continue if it already happened.
+        b.open_region();
+        {
+            const ir::Index seen = load_signal(st.fired, b, l);
+            b.open_region();
+            b.wait(edges, l);
+            const ir::ExtraSlice wait_r = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice done_r = b.close_region(); // empty
+            b.cond(bit_not(seen, b, l), wait_r, done_r, l);
+        }
+        const ir::ExtraSlice zero_r = b.close_region();
+
+        // ##n, n > 0: wait for the event n times. Same shape as a `repeat (N) @e`
+        // intra-assignment control, and for the same reason.
+        b.open_region();
+        {
+            b.open_region();
+            const ir::Index      cur  = b.unary(ir::Inst::Tag::Load, counter.lv(b, l), l);
+            const ir::Index      lim  = b.unary(ir::Inst::Tag::Load, bound.lv(b, l), l);
+            const ir::Index      pred = b.binary(ir::Inst::Tag::Lt, cur, lim, l);
+            const ir::ExtraSlice cond = b.close_region();
+
+            b.open_region();
+            b.wait(edges, l);
+            const ir::ExtraSlice body = b.close_region();
+
+            b.open_region();
+            const ir::Index sc  = b.unary(ir::Inst::Tag::Load, counter.lv(b, l), l);
+            const ir::Index one = b.constant(module_.pool.put_int(ty, 1), l);
+            b.binary(ir::Inst::Tag::Store, counter.lv(b, l), b.binary(ir::Inst::Tag::Add, sc, one, l), l);
+            const ir::ExtraSlice step = b.close_region();
+
+            b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
+        }
+        const ir::ExtraSlice many_r = b.close_region();
+
+        b.cond(n_is_zero, zero_r, many_r, l);
     }
 
     // `cb.sig <= expr` (LRM 14.16): a synchronous drive. It does not block, and it
@@ -19247,6 +19337,10 @@ private:
     // Collect (storage, which must exist before any process reads it) and read in
     // Emit (the sample-and-trigger process, and `@(cb)`).
     ankerl::unordered_dense::map<const Symbol*, ClockingBlockState> clocking_;
+    // The one-bit per-step latches the Preponed process clears: a clocking block's
+    // "my event occurred in this time step" (LRM 14.11's `##0`, and the maturation
+    // window of a synchronous drive).
+    std::vector<ir::Signal> preponed_clears_;
     // Set while lowering one sampled assertion atom, so value_lvalue resolves
     // through sva_shadow_of. Scoped by SampledScope, never assigned bare.
     bool sva_sampled_ = false;

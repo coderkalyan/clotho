@@ -557,16 +557,93 @@ TEST_CASE("a sequence declared inside a clocking block is refused") {
                    "declared inside a clocking block is not supported");
 }
 
-// A cycle delay (LRM 14.11) waits for N clocking block events of the default
-// clocking. The clocking block it needs now elaborates, so this refusal has moved
-// from the member walk to the statement itself.
-TEST_CASE("a cycle delay statement is still refused") {
-    check_rejected(R"(
+// -- Cycle delays (LRM 14.11) -----------------------------------------------
+
+// `##n` waits for n clocking block events of the default clocking (LRM 14.11).
+// The clock has posedges at 5, 15, 25: one event to 5, two more to 25.
+TEST_CASE("a cycle delay waits for that many clocking events") {
+    CHECK(run_capture(R"(
         module t;
-          bit clk = 0, d = 0;
-          default clocking cb @(posedge clk); input d; endclocking
-          initial begin ##1; $finish; end
+          bit clk = 0;
+          default clocking cb @(posedge clk); endclocking
+          always #5 clk = ~clk;
+          initial begin
+            ##1 $display("[%0t] after ##1", $time);
+            ##2 $display("[%0t] after ##2", $time);
+            $finish;
+          end
         endmodule
-    )",
-                   "unsupported timing control inside a process body");
+    )") == "[5] after ##1\n[25] after ##2\n");
+}
+
+// LRM 14.11: "If a clocking block event has not yet occurred in the current time
+// step, a ##0 cycle delay shall suspend the calling process until the clocking
+// block event occurs." Entered at 3, resumed at the posedge at 5.
+TEST_CASE("a ##0 cycle delay synchronises to the current cycle's event") {
+    CHECK(run_capture(R"(
+        module t;
+          bit clk = 0;
+          default clocking cb @(posedge clk); endclocking
+          always #5 clk = ~clk;
+          initial #3 ##0 $display("[%0t] synchronised", $time);
+          initial #26 $finish;
+        endmodule
+    )") == "[5] synchronised\n");
+}
+
+// The other half of the same rule: "When a process executes a ##0 cycle delay and
+// the associated clocking block event has already occurred in the current time
+// step, the process shall continue execution without suspension." Woken by the
+// event at 5, the ##0 does not cost it a cycle -- a suspend would print 15.
+TEST_CASE("a ##0 cycle delay does not suspend once the event has occurred") {
+    CHECK(run_capture(R"(
+        module t;
+          bit clk = 0;
+          default clocking cb @(posedge clk); endclocking
+          always #5 clk = ~clk;
+          initial begin
+            @(cb);
+            ##0;
+            $display("[%0t] not suspended", $time);
+          end
+          initial #26 $finish;
+        endmodule
+    )") == "[5] not suspended\n");
+}
+
+// The idiom the two halves exist for: advance a cycle, drive, advance, drive. The
+// cycle delay lands the process at the clocking event and the drive then matures in
+// that same event's Re-NBA region.
+TEST_CASE("a cycle delay and a synchronous drive compose") {
+    CHECK(run_capture(R"(
+        module t;
+          bit clk = 0;
+          logic [3:0] d = 0;
+          default clocking cb @(posedge clk); output d; endclocking
+          always #5 clk = ~clk;
+          initial begin
+            ##1;
+            cb.d <= 4'h1;
+            ##1;
+            cb.d <= 4'h2;
+          end
+          always @(d) $display("[%0t] d=%h", $time, d);
+          initial #26 $finish;
+        endmodule
+    )") == "[5] d=1\n[15] d=2\n");
+}
+
+// LRM 14.11: "The cycle_delay can be any SystemVerilog expression that evaluates to
+// a non-negative integer value", evaluated once.
+TEST_CASE("a cycle delay count may be a run-time expression") {
+    CHECK(run_capture(R"(
+        module t;
+          bit clk = 0;
+          int unsigned n = 2;
+          default clocking cb @(posedge clk); endclocking
+          always #5 clk = ~clk;
+          initial ##(n) $display("[%0t] after ##n", $time);
+          initial #26 $finish;
+        endmodule
+    )") == "[15] after ##n\n");
 }
