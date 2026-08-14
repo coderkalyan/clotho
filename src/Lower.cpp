@@ -1212,7 +1212,10 @@ private:
                     if (pass == Pass::Collect) {
                         recover([&] { collect_clocking_block(m.as<ClockingBlockSymbol>()); });
                     } else if (emit) {
-                        recover([&] { lower_clocking_block(m.as<ClockingBlockSymbol>()); });
+                        recover([&] {
+                            lower_clocking_block(m.as<ClockingBlockSymbol>());
+                            lower_clocking_drives(m.as<ClockingBlockSymbol>());
+                        });
                     }
                     break;
                 // Known-inert members: elaboration artifacts and declarations
@@ -10608,12 +10611,22 @@ private:
     // expression lowering needs no clocking-specific code at all.
     struct ClockVarState {
         const ClockVarSymbol* sym = nullptr;
-        // The sampled value `cb.sig` reads.
+        // The sampled value `cb.sig` reads, for an `input` or `inout` clockvar.
+        // Zero for an `output`, which LRM 14.3 makes it illegal to read.
         ir::Signal sampled{ 0 };
         // Set for an explicit `#0` input skew, which samples the live signal in the
         // Observed region; cleared for `#1step` (the LRM 14.4 default), which
         // samples the Preponed shadow of the step before.
         bool zero_skew = false;
+        // A synchronous drive (LRM 14.16) of an `output` or `inout` clockvar
+        // executes without blocking and defers its drive to the clocking event, so
+        // the drive statement writes the value it evaluated into `drive_val` and
+        // raises `drive_pend`; the block's Re-NBA body consumes both. Zero for an
+        // `input`.
+        ir::Signal drive_val{ 0 };
+        ir::Signal drive_pend{ 0 };
+        // Whether this clockvar can be driven at all.
+        bool drives = false;
     };
 
     struct ClockingBlockState {
@@ -10627,8 +10640,17 @@ private:
         // One-slot history of the clocking signal, so the Observed body can detect
         // its own edge: it is resumed once per settled instant, never woken.
         ir::Signal clkprev{ 0 };
-        // Input clockvars in declaration order.
+        // Set by the Observed body when the clocking event fired in this time slot
+        // and cleared by the Re-NBA body, which is what makes a drive land in the
+        // Re-NBA region OF THAT slot (LRM 14.16) rather than in every slot. Sticky
+        // across a second Observed pass of the same slot, which sees no edge. Zero
+        // when the block has no drivable clockvar.
+        ir::Signal fired{ 0 };
+        // Clockvars in declaration order.
         std::vector<ClockVarState> vars;
+        // Whether any clockvar is drivable, i.e. whether the block needs `fired`
+        // and a Re-NBA process at all.
+        bool has_drives = false;
     };
 
     // The (clock, edge) a clocking block steps on. LRM 14.3 allows any event
@@ -10685,6 +10707,28 @@ private:
         fail("an input skew other than `#1step` or `#0` is not supported");
     }
 
+    // Whether this clockvar's effective output skew is the LRM 14.4 default of
+    // `#0`, which drives in the Re-NBA region of the clocking event's own time
+    // step. Anything else is refused.
+    void check_output_skew(const ClockingBlockSymbol& cb, const ClockVarSymbol& cv) {
+        const ClockingSkew skew = cv.outputSkew.hasValue() ? cv.outputSkew : cb.getDefaultOutputSkew();
+        if (!skew.hasValue()) {
+            return;
+        }
+        if (skew.edge != slang::ast::EdgeKind::None) {
+            // TODO: an edge-based output skew (`output negedge`, LRM 14.4), which
+            // drives on the named edge of the clocking signal instead.
+            fail("an edge-based clocking skew is not supported");
+        }
+        if (skew.delay->kind == TimingControlKind::Delay && const_uint(skew.delay->as<DelayControl>().expr) == 0) {
+            return;
+        }
+        // TODO: a nonzero output skew, which drives in the Re-NBA region of a FUTURE
+        // time step (LRM 14.16) and so needs a scheduled maturation rather than this
+        // block's own event.
+        fail("an output skew other than `#0` is not supported");
+    }
+
     // Collect: the block's own state, and storage for each input clockvar.
     // Registered here rather than in Emit for the reason collect_signals registers
     // ordinary variables there -- the InstanceScope tree is frozen after Collect,
@@ -10718,13 +10762,8 @@ private:
                 fail("a " + std::string(toString(m.kind)) + " declared inside a clocking block is not supported");
             }
             const ClockVarSymbol& cv = m.as<ClockVarSymbol>();
-            if (cv.direction != slang::ast::ArgumentDirection::In) {
-                // TODO: synchronous drives (LRM 14.16). An output clockvar drives its
-                // signal in the Re-NBA region of the clocking event's time step,
-                // which needs the deferred-record path plus a commit gated to that
-                // region -- neither is a sampling problem, so both land separately.
-                fail("a clocking block `output` / `inout` is not supported");
-            }
+            const bool is_input  = cv.direction != slang::ast::ArgumentDirection::Out;
+            const bool is_output = cv.direction != slang::ast::ArgumentDirection::In;
             const Expression* init = cv.getInitializer();
             if (init == nullptr ||
                 (init->kind != ExpressionKind::NamedValue && init->kind != ExpressionKind::HierarchicalValue)) {
@@ -10741,16 +10780,34 @@ private:
                 // so the type must have a flat plane value.
                 fail("a clocking item must have a packed value");
             }
-            ir::SignalInfo info;
-            info.name = prefix_ + base + "." + std::string(cv.name);
-            info.loc  = to_source_loc(cv.location);
-            info.type = type;
-            info.dir  = ir::SignalInfo::Direction::Internal;
-
-            const ir::Signal sampled = register_signal(std::move(info));
-            sigmap_[&cv]             = sampled;
-            st.vars.push_back(
-              ClockVarState{ .sym = &cv, .sampled = sampled, .zero_skew = zero_input_skew(cb, cv) });
+            ClockVarState var{ .sym = &cv };
+            if (is_input) {
+                // An `inout` is two clockvars sharing one name and one signal (LRM
+                // 14.3), and reading it yields the sample, never the driven value --
+                // which is why the two never share storage (LRM 14.16.1).
+                ir::SignalInfo info;
+                info.name    = prefix_ + base + "." + std::string(cv.name);
+                info.loc     = to_source_loc(cv.location);
+                info.type    = type;
+                info.dir     = ir::SignalInfo::Direction::Internal;
+                var.sampled  = register_signal(std::move(info));
+                var.zero_skew = zero_input_skew(cb, cv);
+                // Reads resolve through the ordinary signal path; an `output`-only
+                // clockvar is never read (slang rejects one with ClockVarOutputRead),
+                // so it deliberately gets no sigmap_ entry.
+                sigmap_[&cv] = var.sampled;
+            }
+            if (is_output) {
+                check_output_skew(cb, cv);
+                var.drives     = true;
+                var.drive_val  = declare_temp(type, "clocking_drv");
+                var.drive_pend = declare_temp(mask_type(1), "clocking_pend");
+                st.has_drives  = true;
+            }
+            st.vars.push_back(var);
+        }
+        if (st.has_drives) {
+            st.fired = declare_temp(mask_type(1), "clocking_fired");
         }
         clocking_.emplace(&cb, std::move(st));
     }
@@ -10782,8 +10839,21 @@ private:
                                     : b.binary(ir::Inst::Tag::Band, clk_was, bit_not(clk_now, b, l), l);
         b.binary(ir::Inst::Tag::Store, b.signal(st.clkprev, l), clk_now, l);
 
+        if (st.has_drives) {
+            // Sticky, and cleared by the Re-NBA body: a drive issued between two
+            // clocking events matures at the next one (LRM 14.16), and a second
+            // Observed pass of the same slot sees no edge and must not clear it.
+            b.binary(ir::Inst::Tag::Store,
+                     b.signal(st.fired, l),
+                     b.binary(ir::Inst::Tag::Bor, load_signal(st.fired, b, l), fired, l),
+                     l);
+        }
+
         b.open_region();
         for (const ClockVarState& cv : st.vars) {
+            if (cv.sampled == ir::Signal{ 0 }) {
+                continue; // output-only: nothing to sample
+            }
             const ir::Signal live = signal_of(cv.sym->getInitializer()->as<ValueExpressionBase>().symbol);
             // #1step reads the shadow of the step before; an explicit #0 reads the
             // live signal, here in Observed (LRM 14.4, 14.13).
@@ -10811,6 +10881,104 @@ private:
                                          .span        = ir::SourceSpan{ l, l },
                                          .ir          = b.finish(),
                                          .scope       = cur_scope_id() });
+    }
+
+    // Emit: the block's Re-NBA process, which performs the synchronous drives that
+    // matured at this time slot's clocking event (LRM 14.16).
+    //
+    // Why a process in that region rather than a deferred nonblocking record: LRM
+    // 14.16 puts the value change in "the Re-NBA region of the time step
+    // corresponding to the clocking event", and a drive may be issued by code that
+    // runs at that very event -- an Active-region process woken by the clocking
+    // block event, or a program's Reactive code -- so the maturation cannot be
+    // decided any earlier than this. Everything the drive needs was already
+    // evaluated at drive time (the RHS is sampled immediately, LRM 14.16), so the
+    // body is a per-clockvar `if (pending) drive`.
+    //
+    // Idempotent: it clears each pending flag and the block's `fired` flag, so a
+    // second trip through the region in one time slot (LRM 4.4.2.8's loop) drives
+    // nothing more. LRM 14.16.2 describes exactly that as the glitch case.
+    void lower_clocking_drives(const ClockingBlockSymbol& cb) {
+        const auto it = clocking_.find(&cb);
+        if (it == clocking_.end() || !it->second.has_drives) {
+            return;
+        }
+        const ClockingBlockState& st = it->second;
+        const ir::SourceLoc       l  = to_source_loc(cb.location);
+
+        ir::Builder     b(module_.pool);
+        const ir::Index fired = load_signal(st.fired, b, l);
+        b.open_region();
+        for (const ClockVarState& cv : st.vars) {
+            if (!cv.drives) {
+                continue;
+            }
+            const ir::Signal live = signal_of(cv.sym->getInitializer()->as<ValueExpressionBase>().symbol);
+            if (module_.signal(live).is_net) {
+                // TODO: a net-typed clocking block output (LRM 14.16). The block owns
+                // a `'z`-initialized (strong1, strong0) driver on the net, resolved
+                // against the net's other drivers, rather than writing it directly --
+                // which is a driver-registration question, not a scheduling one.
+                fail("a clocking block output on a net is not supported");
+            }
+            const ir::Index pend = load_signal(cv.drive_pend, b, l);
+            b.open_region();
+            b.binary(ir::Inst::Tag::Store, b.signal(live, l), load_signal(cv.drive_val, b, l), l);
+            b.binary(ir::Inst::Tag::Store, b.signal(cv.drive_pend, l), zero_mask(1, b, l), l);
+            const ir::ExtraSlice drive_r = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice skip_r = b.close_region(); // empty
+            b.cond(pend, drive_r, skip_r, l);
+        }
+        b.binary(ir::Inst::Tag::Store, b.signal(st.fired, l), zero_mask(1, b, l), l);
+        const ir::ExtraSlice then_r = b.close_region();
+        b.open_region();
+        const ir::ExtraSlice else_r = b.close_region(); // empty
+        b.cond(fired, then_r, else_r, l);
+
+        module_.add_process(ir::Process{ .activation = ir::Activation::ReNba,
+                                         .self_start = false,
+                                         .span       = ir::SourceSpan{ l, l },
+                                         .ir         = b.finish(),
+                                         .scope      = cur_scope_id() });
+    }
+
+    // `cb.sig <= expr` (LRM 14.16): a synchronous drive. It does not block, and it
+    // does not write the target now -- the RHS is evaluated immediately and the
+    // drive is performed at the clocking event, by the block's Re-NBA process. So
+    // this is two ordinary stores into that block's per-clockvar state, and a
+    // second drive in the same cycle simply overwrites them, which is LRM 14.16.2's
+    // "the last value is the only value driven".
+    void lower_clocking_drive(const ClockVarSymbol& cv, const AssignmentExpression& a, ir::Builder& b) {
+        const auto& cb = cv.getParentScope()->asSymbol().as<ClockingBlockSymbol>();
+        const ClockingBlockState& st = clocking_state(cb);
+        const ClockVarState*      var = nullptr;
+        for (const ClockVarState& c : st.vars) {
+            if (c.sym == &cv) {
+                var = &c;
+            }
+        }
+        if (var == nullptr || !var->drives) {
+            fail("a drive of a clocking block input is not legal SystemVerilog");
+        }
+        if (a.timingControl != nullptr) {
+            // TODO: `cb.sig <= ##n expr` (LRM 14.16), which postpones the drive by n
+            // cycles of this clockvar's clocking block. slang has already rejected
+            // every other intra-assignment delay form here (ClockVarBadTiming).
+            fail("a cycle delay on a synchronous drive is not supported");
+        }
+        if (a.left().kind != ExpressionKind::NamedValue && a.left().kind != ExpressionKind::HierarchicalValue) {
+            // TODO: a bit-select or slice of a clockvar as the drive target (LRM
+            // 14.16 allows both). The pending value is one whole-signal store, so a
+            // partial drive needs a per-bit pending mask.
+            fail("a synchronous drive of a bit-select or slice of a clockvar is not supported");
+        }
+        const ir::SourceLoc l = loc(a);
+        b.binary(ir::Inst::Tag::Store,
+                 b.signal(var->drive_val, l),
+                 b.resize(lower_expr(a.right(), b), module_.signal(var->drive_val).type, l),
+                 l);
+        b.binary(ir::Inst::Tag::Store, b.signal(var->drive_pend, l), true_const(b, l), l);
     }
 
     // The lowered state of a clocking block, for a reader outside it (`@(cb)`).
@@ -14688,6 +14856,15 @@ private:
         // write is gated in Phase 1; a select-write to a force target, or a
         // compound update, is guarded loud.
         if (const ValueSymbol* root = lvalue_root(a.left())) {
+            if (root->kind == SymbolKind::ClockVar) {
+                // A synchronous drive (LRM 14.16), which is neither an ordinary store
+                // nor an ordinary nonblocking one: the target is written by the
+                // clocking block, in the Re-NBA region of its clocking event. slang
+                // has already required the `<=` form (ClockVarSyncDrive) and rejected
+                // a write to an `input` clockvar.
+                lower_clocking_drive(root->as<ClockVarSymbol>(), a, b);
+                return ir::Index{};
+            }
             if (ForceInfo* fi = force_info_of(*root)) {
                 if (force_target_var(a.left()) == nullptr) {
                     fail("assignment to a bit/part/element-select of a force-target "

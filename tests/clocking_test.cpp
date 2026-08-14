@@ -273,32 +273,195 @@ TEST_CASE("a clocking item may rename the signal it samples") {
     )") == "[5] cb.sampled_raw=1\n[15] cb.sampled_raw=1\n");
 }
 
+// -- Synchronous drives (LRM 14.16) -----------------------------------------
+
+// The canonical testbench drive: wait for the clocking event, then drive. The
+// value is written in the Re-NBA region of THAT time slot (LRM 14.16), so it lands
+// at the same simulation time the drive executed -- one cycle late would be the
+// classic off-by-one.
+TEST_CASE("a synchronous drive lands in the Re-NBA region of its clocking event") {
+    CHECK(run_capture(R"(
+        module t;
+          bit clk = 0;
+          bit d = 0;
+          clocking cb @(posedge clk); output d; endclocking
+          always #5 clk = ~clk;
+          initial begin
+            @(cb); cb.d <= 1;
+            @(cb); cb.d <= 0;
+          end
+          always @(d) $display("[%0t] d=%b", $time, d);
+          initial #26 $finish;
+        endmodule
+    )") == "[5] d=1\n[15] d=0\n");
+}
+
+// LRM 14.16: a drive "shall execute without blocking" and performs its action at
+// the clocking event, so the target still holds the old value on the statement
+// after the drive -- and takes the new one later in the same time slot.
+TEST_CASE("a synchronous drive does not write its target immediately") {
+    CHECK(run_capture(R"(
+        module t;
+          bit clk = 0;
+          bit d = 0;
+          clocking cb @(posedge clk); output d; endclocking
+          always #5 clk = ~clk;
+          initial begin
+            @(cb);
+            cb.d <= 1;
+            $display("[%0t] after the drive d=%b", $time, d);
+          end
+          always @(d) $display("[%0t] d became %b", $time, d);
+          initial #16 $finish;
+        endmodule
+    )") == "[5] after the drive d=0\n[5] d became 1\n");
+}
+
+// LRM 14.16: a drive executed at a time NOT coincident with the clocking event
+// "shall perform their drive action as if they had executed at the time of the
+// next clocking event". Driven at 3, applied at the posedge at 5.
+TEST_CASE("a drive between two clocking events matures at the next one") {
+    CHECK(run_capture(R"(
+        module t;
+          bit clk = 0;
+          bit d = 0;
+          clocking cb @(posedge clk); output d; endclocking
+          always #5 clk = ~clk;
+          initial #3 cb.d <= 1;
+          always @(d) $display("[%0t] d=%b", $time, d);
+          initial #16 $finish;
+        endmodule
+    )") == "[5] d=1\n");
+}
+
+// LRM 14.16.2's own example: two drives of the same clockvar maturing in the same
+// Re-NBA region, where "the last value is the only value driven onto the output
+// signal". Only one change of `nib` is ever visible.
+TEST_CASE("the last of several drives in one cycle is the only one driven") {
+    CHECK(run_capture(R"(
+        module t;
+          bit clk = 0;
+          logic [3:0] nib = 0;
+          clocking cb @(posedge clk); output nib; endclocking
+          always #5 clk = ~clk;
+          initial begin
+            @(cb);
+            cb.nib <= 4'b0101;
+            cb.nib <= 4'b0011;
+          end
+          always @(nib) $display("[%0t] nib=%b", $time, nib);
+          initial #16 $finish;
+        endmodule
+    )") == "[5] nib=0011\n");
+}
+
+// LRM 14.16.1: "a drive does not change the clocking block input ... reading the
+// input always yields the last sampled value, and not the driven value". This is
+// the LRM's own `cb.a <= c; cb.b <= cb.a;` shape: `b` takes the value `a` had
+// before the change, so the two directions of an `inout` cannot share storage.
+TEST_CASE("a drive to an inout clockvar does not change its sampled input") {
+    CHECK(run_capture(R"(
+        module t;
+          bit clk = 0;
+          bit a = 0, b = 0;
+          clocking cb @(posedge clk); inout a; output b; endclocking
+          always #5 clk = ~clk;
+          initial begin
+            @(cb);
+            cb.a <= 1;
+            cb.b <= cb.a;
+          end
+          final $display("a=%b b=%b", a, b);
+          initial #16 $finish;
+        endmodule
+    )") == "a=1 b=0\n");
+}
+
+// The pairing LRM 24.3 and 14.16 are built for: a program drives the design
+// through a clocking block. The drive is issued in the Reactive region and applied
+// in the Re-NBA region of the same time slot, so the design sees it at the clock
+// edge the program was woken by.
+//
+// The second `@(t.cb)` keeps the program alive past the cycle it drove in: LRM
+// 24.6 ends the simulation when the last program initial completes, and clotho's
+// finish empties the queues of the wave it happens in, which would otherwise drop
+// the very Re-NBA pass under test.
+TEST_CASE("a program drives the design through a clocking block") {
+    CHECK(run_capture(R"(
+        module t;
+          bit clk = 0;
+          bit d = 0;
+          clocking cb @(posedge clk); output d; endclocking
+          always #5 clk = ~clk;
+          always @(d) $display("[%0t] d=%b", $time, d);
+          p pi();
+          initial #26 $finish;
+        endmodule
+
+        program p;
+          initial begin
+            @(t.cb);
+            t.cb.d <= 1;
+            @(t.cb);
+          end
+        endprogram
+    )") == "[5] d=1\n");
+}
+
 // -- What is refused, and loudly ---------------------------------------------
 
-// A synchronous drive (LRM 14.16) updates its signal in the Re-NBA region of the
-// clocking event's time step. Nothing here does that yet, and a clockvar given
-// ordinary variable semantics would drive nothing at all, so the declaration is
-// refused rather than silently accepted.
-TEST_CASE("a clocking block output is refused") {
+// A nonzero output skew drives "in the Re-NBA region of a future time step" (LRM
+// 14.16), which needs a scheduled maturation rather than this block's own event.
+TEST_CASE("a nonzero output skew is refused") {
     check_rejected(R"(
         module t;
           bit clk = 0, d = 0;
+          clocking cb @(posedge clk); output #2 d; endclocking
+          initial #1 $finish;
+        endmodule
+    )",
+                   "output skew other than `#0`");
+}
+
+// LRM 14.16: a net target needs a `'z`-initialized (strong1, strong0) driver of
+// its own, resolved against the net's other drivers.
+TEST_CASE("a clocking block output on a net is refused") {
+    check_rejected(R"(
+        module t;
+          bit clk = 0;
+          wire d;
           clocking cb @(posedge clk); output d; endclocking
           initial #1 $finish;
         endmodule
     )",
-                   "`output` / `inout` is not supported");
+                   "clocking block output on a net is not supported");
 }
 
-TEST_CASE("a clocking block inout is refused") {
+// LRM 14.16: `cb.sig <= ##n expr` postpones the drive by n cycles of the
+// clockvar's own clocking block.
+TEST_CASE("a cycle delay on a synchronous drive is refused") {
     check_rejected(R"(
         module t;
           bit clk = 0, d = 0;
-          clocking cb @(posedge clk); inout d; endclocking
-          initial #1 $finish;
+          default clocking cb @(posedge clk); output d; endclocking
+          initial begin @(cb); cb.d <= ##1 1'b1; end
         endmodule
     )",
-                   "`output` / `inout` is not supported");
+                   "cycle delay on a synchronous drive is not supported");
+}
+
+// LRM 14.16 allows a bit-select or slice as the drive target; the pending value
+// here is one whole-signal store, so a partial drive is refused.
+TEST_CASE("a synchronous drive of a bit-select is refused") {
+    check_rejected(R"(
+        module t;
+          bit clk = 0;
+          logic [3:0] nib = 0;
+          clocking cb @(posedge clk); output nib; endclocking
+          initial begin @(cb); cb.nib[0] <= 1'b1; end
+        endmodule
+    )",
+                   "bit-select or slice of a clockvar is not supported");
 }
 
 // LRM 14.14. Also the gate on `$global_clock` and on the `global clocking` half of

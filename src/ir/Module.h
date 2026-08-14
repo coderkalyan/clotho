@@ -124,6 +124,22 @@ enum class Activation : uint8_t {
     // events, so an Observed body can wake an Active process; the drain returns
     // to the active region when that happens (see emit_active_run).
     Observed,
+    // Runs in the Re-NBA region (LRM 4.4.2.8), after the Reactive and Re-Inactive
+    // queues of the time slot have settled and beside the update region that
+    // commits the nonblocking assignments reactive code made. Only
+    // compiler-synthesized, and today only for a clocking block's synchronous
+    // drives: LRM 14.16 puts a zero-skew drive "in the Re-NBA region of the time
+    // step corresponding to the clocking event", which is after every process that
+    // could issue one -- an Active-region process woken by the clocking block
+    // event, and a program's Reactive code alike.
+    //
+    // Emitted like Observed (emit_renba_run), so it is filtered out of the seed and
+    // subscribe loops and its wait_events are never consulted. Its stores are
+    // ordinary design writes: the reactive drain re-settles the active set when one
+    // wakes a process, which is what makes the driven value visible in the same
+    // time slot. A body must be idempotent, because LRM 4.4.2.8's loop can re-enter
+    // the region within one slot (LRM 14.16.2 names the resulting glitch).
+    ReNba,
     // Runs once at time zero, then completes (an `initial` block).
     Initial,
     // An `initial` procedure of a `program` block (LRM 24.3): a one-shot process

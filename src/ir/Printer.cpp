@@ -1052,6 +1052,9 @@ void print_module(const Module& m, std::ostream& os, const LocResolver& resolve)
             case Activation::Observed:
                 os << "observed";
                 break;
+            case Activation::ReNba:
+                os << "re_nba";
+                break;
             case Activation::Initial:
                 os << "initial";
                 break;

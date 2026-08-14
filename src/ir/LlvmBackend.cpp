@@ -697,7 +697,7 @@ public:
         // pass/fail code to schedule, a process in Observed that could schedule
         // some, or a program block, whose `initial` procedures run in Reactive
         // (LRM 24.3). Everything it costs sits behind this one flag.
-        design_uses_reactive_ = facts_.uses.reactive || has_observed() || has_program();
+        design_uses_reactive_ = facts_.uses.reactive || has_observed() || has_program() || has_renba();
         if (design_uses_reactive_) {
             // Before any body lowers: the classification decides which region a #0
             // inside reactive code parks in, and both queues have to exist ahead of
@@ -4090,6 +4090,40 @@ private:
         }
     }
 
+    // Whether any process runs in the Re-NBA region. A design with no clocking
+    // block pays nothing for the region existing, exactly like has_observed.
+    bool has_renba() const {
+        for (const Process& p : mod_.processes()) {
+            if (p.activation == Activation::ReNba) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Run every Re-NBA process once (LRM 4.4.2.8), at the point where the reactive
+    // region set has settled -- so after every process that could have issued a
+    // clocking block synchronous drive this time slot, which is what LRM 14.16
+    // requires of one.
+    //
+    // Emitted like emit_observed_run, and its stores are ordinary design writes for
+    // the same reason: a driven signal must wake its readers. The caller re-settles
+    // the active set afterwards.
+    void emit_renba_run(llvm::Value* state, llvm::Value* wheel,
+                        const std::vector<llvm::Function*>& procs) {
+        auto* ptr_ty    = llvm::PointerType::getUnqual(ctx_);
+        auto* proc_fnty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty }, false);
+        const auto all  = mod_.processes();
+        for (uint32_t g = 0; g < procs.size(); ++g) {
+            if (all[groups_[g].front()].activation != Activation::ReNba) {
+                continue;
+            }
+            llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
+            b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
+            b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
+        }
+    }
+
     // Whether `id` is reachable as reactive code (build_reactive_fns).
     bool is_reactive_fn(FunctionId id) const {
         const auto k = static_cast<uint32_t>(id);
@@ -4245,7 +4279,9 @@ private:
         }
         for (const Process& p : mod_.processes()) {
             if (p.activation == Activation::Observed) {
-                reject_unsupported_observed(p.ir);
+                reject_resume_once(p.ir, "Observed", "property evaluation, LRM 4.4.2.5");
+            } else if (p.activation == Activation::ReNba) {
+                reject_resume_once(p.ir, "Re-NBA", "clocking block drives, LRM 4.4.2.8");
             }
         }
     }
@@ -4306,34 +4342,37 @@ private:
         }
     }
 
-    // What an Observed process may not contain. It is run resume-once
-    // (emit_observed_run), and the NBA region has already committed by the time
-    // it executes.
-    void reject_unsupported_observed(const Ir& ir) {
+    // What a resume-once region process may not contain -- an Observed body
+    // (emit_observed_run) or a Re-NBA one (emit_renba_run). Both are run to
+    // completion by a single resume at a point where the NBA region has already
+    // committed, so neither may suspend, and neither is in the reactive region set
+    // that LRM 4.4.2.8 scopes the update region to.
+    void reject_resume_once(const Ir& ir, std::string_view region, std::string_view what) {
         for (uint32_t k = 0; k < ir.inst_count(); ++k) {
             switch (ir.tag(static_cast<Index>(k))) {
                 case Inst::Tag::Delay:
                 case Inst::Tag::Wait:
                 case Inst::Tag::Fork:
-                    // TODO: an Observed body that suspends needs the Observed region
-                    // to be a queue that can be re-entered, not a straight-line run.
-                    // Resuming it once would silently truncate the body.
-                    throw BackendError{ "a timing control in an Observed-region process (property "
-                                        "evaluation, LRM 4.4.2.5) is not supported" };
+                    // TODO: a body that suspends needs its region to be a queue that
+                    // can be re-entered, not a straight-line run. Resuming it once
+                    // would silently truncate the body.
+                    throw BackendError{ "a timing control in a " + std::string(region) + "-region process (" +
+                                        std::string(what) + ") is not supported" };
                 case Inst::Tag::StoreNb:
                 case Inst::Tag::StoreNbDelay:
                 case Inst::Tag::StoreNbEvent:
                 case Inst::Tag::StoreInertialDelay:
                 case Inst::Tag::EventTriggerNb:
                 case Inst::Tag::EventTriggerNbDelayed:
-                    // TODO: Re-NBA exists now and, running after Observed, would in
-                    // fact catch this. It is still refused because LRM 4.4.2.8
-                    // scopes that update region to nonblocking assignments made
-                    // from the REACTIVE region set, and an Observed process is not
-                    // in it; committing one there would be clotho inventing a
-                    // schedule the LRM does not give. Refused rather than guessed.
-                    throw BackendError{ "a nonblocking assignment in an Observed-region process "
-                                        "(property evaluation, LRM 4.4.2.5) is not supported" };
+                    // LRM 4.4.2.8 scopes the update region to nonblocking assignments
+                    // made from the REACTIVE region set, and neither of these
+                    // processes is in it; committing one there would be clotho
+                    // inventing a schedule the LRM does not give. A clocking block
+                    // drive is not one of these: LRM 14.16 puts the value change
+                    // itself in Re-NBA, which is where that body already runs, so it
+                    // stores directly.
+                    throw BackendError{ "a nonblocking assignment in a " + std::string(region) +
+                                        "-region process (" + std::string(what) + ") is not supported" };
                 default:
                     break;
             }
@@ -7310,6 +7349,9 @@ private:
             if (p.activation == Activation::Observed) {
                 continue; // run explicitly at each settled point (emit_observed_run)
             }
+            if (p.activation == Activation::ReNba) {
+                continue; // run explicitly in the Re-NBA region (emit_renba_run)
+            }
             if (p.activation == Activation::Final) {
                 continue; // deferred to emit_finals_run at end of simulation
             }
@@ -7587,7 +7629,7 @@ private:
             // Re-NBA (LRM 4.4.2.8), the reactive region set's dual of the NBA
             // region. Gated on has_nba exactly as nba.check/nba.commit are: a
             // design that stages no nonblocking updates emits none of it.
-            auto* rncheck   = has_nba ? llvm::BasicBlock::Create(ctx_, "re_nba.check", fn) : rdone;
+            auto* rncheck   = (has_nba || has_renba()) ? llvm::BasicBlock::Create(ctx_, "re_nba.check", fn) : rdone;
             auto* rncommit  = has_nba ? llvm::BasicBlock::Create(ctx_, "re_nba.commit", fn) : nullptr;
             auto* ripromote = has_re_inactive
               ? llvm::BasicBlock::Create(ctx_, "re_inactive.promote", fn) : nullptr;
@@ -7696,7 +7738,7 @@ private:
                 b_.CreateBr(rcheck);
             }
 
-            if (has_nba) {
+            if (has_nba || has_renba()) {
                 // Re-NBA (LRM 4.4.2.8). Both reactive queues have settled here, so
                 // anything still staged was staged BY reactive code: the NBA region
                 // ran and drained long before the Observed region pended any of
@@ -7713,11 +7755,26 @@ private:
                 // the first, and can neither re-apply an active-region update nor
                 // drop a reactive one.
                 b_.SetInsertPoint(rncheck);
-                b_.CreateCondBr(emit_nba_any_staged(), rncommit, rdone);
+                // The region's processes first: a clocking block's synchronous
+                // drives (LRM 14.16) belong to this region, and every process that
+                // could have issued one -- Active code woken by the clocking block
+                // event, and a program's Reactive code -- has now run. Their stores
+                // are direct, so rdone's re-settle is what publishes them; the
+                // commit below is the separate business of the update region, and
+                // LRM 14.16.2 leaves the order between a drive and a same-slot
+                // nonblocking write to the same variable arbitrary.
+                if (has_renba()) {
+                    emit_renba_run(state, wheel, procs);
+                }
+                if (has_nba) {
+                    b_.CreateCondBr(emit_nba_any_staged(), rncommit, rdone);
 
-                b_.SetInsertPoint(rncommit);
-                emit_nba_commit(state, wheel);
-                b_.CreateBr(rcheck);
+                    b_.SetInsertPoint(rncommit);
+                    emit_nba_commit(state, wheel);
+                    b_.CreateBr(rcheck);
+                } else {
+                    b_.CreateBr(rdone);
+                }
             }
 
             b_.SetInsertPoint(rdone);
