@@ -1205,21 +1205,50 @@ endmodule
     CHECK(i.cubes.size() == e.cubes.size());
 }
 
-TEST_CASE("a default clocking block elaborates, but does not yet clock an assertion") {
-    // The other half of 16.14.6: with no candidate event in the procedure, the
-    // scope's `default clocking` supplies one (LRM 14.12) and slang hands it back
-    // through the same channel as a procedural inference. The clocking block itself
-    // now elaborates (LRM 14, tests/clocking_test.cpp), so what is left is the
-    // resolution step: the inference verdict names the block's event, and clotho
-    // has no instance-local TimingControl to match it against the events this
-    // procedure waits on -- none, here. Refused rather than clocked on a guess.
-    refuses(R"(
+TEST_CASE("a default clocking supplies the clock of an unclocked assertion") {
+    // The last rule of the precedence chain (LRM 16.16: explicit > contextually
+    // inferred > default clocking). With no explicit clock and no candidate event in
+    // the procedure, LRM 16.14.6 sends the clock to the scope's `default clocking`,
+    // and 16.16(a) says it is "treated as though the default clocking event had been
+    // written explicitly as the leading clocking event" -- so the monitor must be
+    // indistinguishable from the explicitly clocked one, not merely present.
+    LowerResult       def_r;
+    const ir::Module& def = lower_for_monitor(R"(
 module t;
   bit clk, a, b;
   default clocking cb @(posedge clk); endclocking
-  initial assert property (a |=> b);
+  ap: assert property (a |=> b);
 endmodule
-)", "the clocking event inferred for this assertion is not one the enclosing procedure waits on");
+)", def_r);
+    LowerResult       explicit_r;
+    const ir::Module& expl = lower_for_monitor(implication, explicit_r);
+    REQUIRE_MESSAGE(def_r.ok, def_r.diagnostic_text());
+    REQUIRE(explicit_r.ok);
+    REQUIRE(def.monitors.size() == 1);
+    REQUIRE(expl.monitors.size() == 1);
+
+    const ir::AssertionMonitor& d = def.monitors[0];
+    const ir::AssertionMonitor& e = expl.monitors[0];
+    CHECK(def.signal(d.clock).name == expl.signal(e.clock).name);
+    CHECK(d.edge == e.edge);
+    CHECK(d.kind == e.kind);
+    CHECK(d.depth == e.depth);
+    CHECK(d.obligation.state_count == e.obligation.state_count);
+}
+
+TEST_CASE("a default clocking on the negedge clocks the assertion there") {
+    // The event is taken from the block, so its edge is too.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, a, b;
+  default clocking cb @(negedge clk); endclocking
+  ap: assert property (a |=> b);
+endmodule
+)", r);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(m.monitors.size() == 1);
+    CHECK(m.monitors[0].edge == ir::Edge::Negative);
 }
 
 // -- Named sequences, properties and lets (LRM 16.8, 16.12) -----------------

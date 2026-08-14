@@ -464,17 +464,49 @@ TEST_CASE("a synchronous drive of a bit-select is refused") {
                    "bit-select or slice of a clockvar is not supported");
 }
 
-// LRM 14.14. Also the gate on `$global_clock` and on the `global clocking` half of
-// multiclock assertions.
-TEST_CASE("global clocking is refused") {
-    check_rejected(R"(
+// -- Global clocking (LRM 14.14) and a block as an assertion clock ----------
+
+// `global clocking` declares the event `$global_clock` names (LRM 14.14). Waiting on
+// it is waiting on that block's clocking event, and using it as an assertion's
+// leading clock is the same substitution LRM 16.16(a) makes for a default clocking:
+// the assertion is clocked on the block's own posedge, so the antecedent matches at
+// 5 and the obligation fails at 15.
+TEST_CASE("global clocking supplies $global_clock as an event and an assertion clock") {
+    CHECK(run_capture(R"(
         module t;
           bit clk = 0;
+          bit a = 0, b = 0;
           global clocking gc @(posedge clk); endclocking
-          initial #1 $finish;
+          always #5 clk = ~clk;
+          always @($global_clock) $display("[%0t] tick", $time);
+          ap: assert property (@($global_clock) a |=> b) else $display("[%0t] FAIL", $time);
+          initial begin
+            a = 1;
+            #7 a = 0;
+            #14 $finish;
+          end
         endmodule
-    )",
-                   "`global clocking` is not supported");
+    )") == "[5] tick\n[15] tick\n[15] FAIL\n");
+}
+
+// LRM 16.14.6(c)(1) admits an event expression "consisting solely of a clocking
+// block identifier" as an assertion clock, and 14.15 makes `@(cb)` name the block's
+// event. Written explicitly here; the monitor ends up clocked on `posedge clk`.
+TEST_CASE("a clocking block names the clock of an assertion") {
+    CHECK(run_capture(R"(
+        module t;
+          bit clk = 0;
+          bit a = 0, b = 0;
+          clocking cb @(posedge clk); input a, b; endclocking
+          always #5 clk = ~clk;
+          ap: assert property (@(cb) a |=> b) else $display("[%0t] FAIL", $time);
+          initial begin
+            a = 1;
+            #7 a = 0;
+            #14 $finish;
+          end
+        endmodule
+    )") == "[15] FAIL\n");
 }
 
 // An input skew of `#N` samples the value the signal held N time units before the
@@ -555,6 +587,31 @@ TEST_CASE("a sequence declared inside a clocking block is refused") {
         endmodule
     )",
                    "declared inside a clocking block is not supported");
+}
+
+// -- Default clocking (LRM 14.12) -------------------------------------------
+
+// An unclocked concurrent assertion in a scope with a `default clocking` takes that
+// block's event as its leading clocking event (LRM 16.16(a) / 16.14.6). `a` is high
+// from time 0 and `b` never rises, so the antecedent matches at the posedge at 5
+// and the obligation fails one cycle later -- at 15, on the edge the block names.
+// The IR-level equivalence to an explicit `@(posedge clk)` is pinned in
+// tests/sva_test.cpp; this is the same thing at run time.
+TEST_CASE("a default clocking clocks an unclocked assertion") {
+    CHECK(run_capture(R"(
+        module t;
+          bit clk = 0;
+          bit a = 0, b = 0;
+          default clocking cb @(posedge clk); endclocking
+          always #5 clk = ~clk;
+          ap: assert property (a |=> b) else $display("[%0t] FAIL", $time);
+          initial begin
+            a = 1;
+            #7 a = 0;
+            #20 $finish;
+          end
+        endmodule
+    )") == "[15] FAIL\n");
 }
 
 // -- Cycle delays (LRM 14.11) -----------------------------------------------

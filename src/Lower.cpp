@@ -5905,6 +5905,11 @@ private:
                 return clocking_state(sym.as<ClockingBlockSymbol>()).event;
             }
         }
+        if (const ClockingBlockSymbol* gc = global_clock_call(e)) {
+            // `@($global_clock)` (LRM 14.14): the global clocking event, which is the
+            // event of the block that declares it -- the same wait as `@(cb)` on it.
+            return clocking_state(*gc).event;
+        }
         if (e.kind == ExpressionKind::NamedValue || e.kind == ExpressionKind::HierarchicalValue) {
             // Waiting on a hierarchical signal (`@(posedge top.dut.clk)`, LRM 23.6)
             // subscribes to the target instance's signal directly. A clockvar
@@ -7379,26 +7384,53 @@ private:
                 inference_untranslated = clocking == nullptr;
             }
         }
-        if (clocking == nullptr && inference_untranslated) {
-            // slang inferred a clock that is not one of the events this procedure
-            // waits on: a `default clocking` block, a `$inferred_clock` expansion,
-            // or an event control buried in the body rather than leading it. Each
-            // needs its own resolution path, and picking the procedure's event
-            // control anyway would silently clock the assertion on the wrong edge.
-            // TODO: default/global clocking (LRM 14.12) as an inferred assertion
-            // clock; it is blocked behind clocking-block support generally.
-            fail("the clocking event inferred for this assertion is not one the "
-                 "enclosing procedure waits on");
-        }
         if (clocking == nullptr) {
-            // Unreachable for a well-formed design: slang's own analysis rejects
-            // an assertion with neither an explicit nor an inferable clock
-            // (diag::AssertionNoClock), and lowering never runs on a design that
-            // errored. It still fails loudly rather than guessing, because the
-            // table is only as complete as the analysis pass that filled it.
-            fail("a concurrent assertion needs a clocking event, and none could be "
-                 "inferred from its context");
+            // Nothing explicit, nothing hoisted out of the body, and nothing the
+            // procedure's own event control could supply -- either because slang
+            // inferred an event this procedure does not wait on, or because it
+            // inferred none at all. LRM 16.14.6 answers both the same way: "if no
+            // clock can be inferred from the procedural context, then the clocks
+            // shall be inferred from the default clocking (14.12), as if the
+            // assertion were instantiated immediately before the procedure", which
+            // LRM 16.16(a) restates as the default clocking event being treated as
+            // though written as the leading clocking event. So it is not a guess: it
+            // is the last rule in the precedence chain (16.16: explicit > contextual
+            // > default).
+            //
+            // `getEvent()` is bound in the block's own scope, so it is already this
+            // instance's TimingControl -- no InferredClockMap round trip.
+            if (const Symbol* def = scope_->getCompilation().getDefaultClocking(*scope_)) {
+                const auto& cb = def->as<ClockingBlockSymbol>();
+                clocking       = &clocking_event(cb);
+                // Whatever else this assertion reads, it is now clocked by a block
+                // whose own state must exist: refuse rather than lower against a
+                // block Collect turned down.
+                (void)clocking_state(cb);
+            } else if (inference_untranslated) {
+                // A `$inferred_clock` expansion, or an event control buried in the
+                // body rather than leading it, with no default clocking to fall back
+                // on. Picking the procedure's event control anyway would silently
+                // clock the assertion on the wrong edge.
+                // TODO: `$inferred_clock` (LRM 16.14.7) as an assertion clock.
+                fail("the clocking event inferred for this assertion is not one the "
+                     "enclosing procedure waits on");
+            } else {
+                // Unreachable for a well-formed design: slang's own analysis rejects
+                // an assertion with neither an explicit nor an inferable clock
+                // (diag::AssertionNoClock), and lowering never runs on a design that
+                // errored. It still fails loudly rather than guessing, because the
+                // table is only as complete as the analysis pass that filled it.
+                fail("a concurrent assertion needs a clocking event, and none could be "
+                     "inferred from its context");
+            }
         }
+        // An event control that NAMES a clocking block -- `@(cb)`, or
+        // `@($global_clock)` -- stands for that block's own clocking event (LRM
+        // 14.15 / 14.14, and 16.14.6(c)(1) admits it as an inferable clock). The
+        // substitution is the one 16.16(a) already makes for a default clocking, so
+        // from here on such an assertion is indistinguishable from an explicitly
+        // clocked one.
+        clocking = &clocking_event_of(*clocking);
         if (clocking->kind != TimingControlKind::SignalEvent) {
             // TODO: multiclock assertions (LRM 16.13).
             fail("only a single-signal clocking event is supported");
@@ -10739,18 +10771,16 @@ private:
         fail("an output skew other than `#0` is not supported");
     }
 
-    // Collect: the block's own state, and storage for each input clockvar.
-    // Registered here rather than in Emit for the reason collect_signals registers
-    // ordinary variables there -- the InstanceScope tree is frozen after Collect,
-    // and a reader in another scope (`@(bus.cb)`, `bus.cb.sig`) resolves against
-    // storage that must already exist.
+    // Collect: the block's own state, and storage for each clockvar. Registered here
+    // rather than in Emit for the reason collect_signals registers ordinary
+    // variables there -- the InstanceScope tree is frozen after Collect, and a
+    // reader in another scope (`@(bus.cb)`, `bus.cb.sig`) resolves against storage
+    // that must already exist.
+    //
+    // A `global clocking` block (LRM 14.14) lowers exactly like any other: its
+    // grammar admits no clocking items, so it is an event and nothing else, and
+    // `$global_clock` names that event.
     void collect_clocking_block(const ClockingBlockSymbol& cb) {
-        if (cb.isGlobal) {
-            // TODO: `global clocking` and `$global_clock` (LRM 14.14). Needs the
-            // upward instance-scope resolution of 14.14, and beside another clock in
-            // an assertion it needs multiclock support.
-            fail("`global clocking` is not supported");
-        }
         // Checked in Collect so an unsupported clock is reported before any reader
         // resolves a clockvar of this block. The signal itself resolves in Emit,
         // once every scope has been collected.
@@ -11031,6 +11061,55 @@ private:
         const ir::ExtraSlice many_r = b.close_region();
 
         b.cond(n_is_zero, zero_r, many_r, l);
+    }
+
+    // The `global clocking` block `$global_clock` names, resolved from `scope_` (LRM
+    // 14.14: the enclosing instance scope, then upward through parent instance
+    // scopes). slang implements that walk and has already reported the absence of one
+    // (diag::NoGlobalClocking), so a null here would be a clotho bug.
+    const ClockingBlockSymbol& global_clocking() {
+        const Symbol* gc = scope_->getCompilation().getGlobalClockingAndNoteUse(*scope_);
+        if (gc == nullptr) {
+            fail("`$global_clock` needs a `global clocking` declaration (LRM 14.14)");
+        }
+        return gc->as<ClockingBlockSymbol>();
+    }
+
+    // The clocking block a `$global_clock` call names, or null for any other
+    // expression. slang binds `$global_clock` as an event-typed system call, so there
+    // is no symbol on it to follow -- the block comes from the scope instead.
+    const ClockingBlockSymbol* global_clock_call(const Expression& e) {
+        if (e.kind != ExpressionKind::Call) {
+            return nullptr;
+        }
+        const CallExpression& call = e.as<CallExpression>();
+        if (!call.isSystemCall() || call.getSubroutineName() != "$global_clock") {
+            return nullptr;
+        }
+        return &global_clocking();
+    }
+
+    // The event of the clocking block an event control NAMES, for the two forms that
+    // name one instead of writing a signal edge: `@(cb)` (LRM 14.15, and 16.14.6's
+    // inferable "event expression consisting solely of a clocking block identifier")
+    // and `@($global_clock)` (LRM 14.14). Both stand for the block's own clocking
+    // event, which is the same substitution LRM 16.16(a) makes for a default
+    // clocking. Any other control is returned unchanged.
+    const TimingControl& clocking_event_of(const TimingControl& tc) {
+        if (tc.kind != TimingControlKind::SignalEvent) {
+            return tc;
+        }
+        const Expression& e = tc.as<SignalEventControl>().expr;
+        if (e.kind == ExpressionKind::ArbitrarySymbol) {
+            const Symbol& sym = *e.as<ArbitrarySymbolExpression>().symbol;
+            if (sym.kind == SymbolKind::ClockingBlock) {
+                return clocking_event(sym.as<ClockingBlockSymbol>());
+            }
+        }
+        if (const ClockingBlockSymbol* gc = global_clock_call(e)) {
+            return clocking_event(*gc);
+        }
+        return tc;
     }
 
     // `cb.sig <= expr` (LRM 14.16): a synchronous drive. It does not block, and it
