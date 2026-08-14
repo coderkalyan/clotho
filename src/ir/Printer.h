@@ -20,6 +20,11 @@ void print(const Ir& ir, std::ostream& os);
 // Render the whole IR to a string.
 std::string toString(const Ir& ir);
 
+// Short mnemonic for an instruction tag (snake_case). Exposed so a test can pin an
+// emitted tag SEQUENCE without pinning the enum's ordinals, which move whenever a
+// tag is inserted rather than appended.
+const char* tag_name(Inst::Tag tag);
+
 // Render a module: its name, signal table (so the body's `s<n>` references are
 // decodable), then each process with a header and its lowered body. When
 // `resolve` is set, signal, process and function headers carry their source

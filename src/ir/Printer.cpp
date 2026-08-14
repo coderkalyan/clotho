@@ -91,7 +91,10 @@ void render_type(const InternPool& pool, Ref type, std::ostream& os) {
     }
 }
 
-// Short mnemonic for an instruction tag (snake_case, femtoc-style).
+} // namespace
+
+// Short mnemonic for an instruction tag (snake_case, femtoc-style). Declared in
+// Printer.h so a test can pin an emitted tag sequence by name.
 const char* tag_name(Inst::Tag tag) {
     using T = Inst::Tag;
     switch (tag) {
@@ -409,6 +412,10 @@ const char* tag_name(Inst::Tag tag) {
             return "named_block";
         case T::Disable:
             return "disable";
+        case T::DisableRemote:
+            return "disable_remote";
+        case T::DeferFlush:
+            return "defer_flush";
         case T::Fflush:
             return "fflush";
         case T::System:
@@ -542,6 +549,8 @@ const char* tag_name(Inst::Tag tag) {
     return "?";
 }
 
+namespace {
+
 // Stateful walker: holds the IR and output stream and tracks indentation as it
 // descends through region bodies.
 class Printer {
@@ -625,7 +634,7 @@ private:
         // region blocks.
         if (tag == Inst::Tag::NamedBlock) {
             const BlockInfo bi = ir_.extra_data<BlockInfo>(p.extra);
-            os_ << "L" << bi.label << ") {\n";
+            os_ << "L" << bi.label << (bi.remote != 0 ? ", remote" : "") << ") {\n";
             render_region("body", bi.body, depth);
             indent(depth);
             os_ << "}\n";

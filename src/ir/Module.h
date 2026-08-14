@@ -600,6 +600,11 @@ public:
         return next_scope_id_++;
     }
 
+    // Number of `disable` target ids allocated (LRM 9.6.2). One id per targeted
+    // named block per elaborated instance, so this is the length of the backend's
+    // per-target occupant tables. Zero for a design with no `disable`.
+    uint32_t disable_targets = 0;
+
     // Append a signal; the returned Signal handle is its index in `signals`.
     Signal add_signal(SignalInfo info) {
         const auto index = static_cast<uint32_t>(signals_.size());

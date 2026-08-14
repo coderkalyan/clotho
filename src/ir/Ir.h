@@ -523,10 +523,21 @@ struct LoopInfo {
 struct BlockInfo {
     // Statements of the block.
     ExtraSlice body;
-    // Label the Disable insts targeting this block carry. Unique per lowering
-    // unit; a block nested in a loop is re-entered, never nested in itself.
+    // Id the Disable / DisableRemote insts targeting this block carry. Allocated
+    // per targeted block symbol, and slang gives every elaborated instance its
+    // own StatementBlockSymbol, so one id already names one block IN one instance
+    // -- there is no separate instance dimension to resolve.
     uint32_t label;
+    // Whether some `disable` names this block from outside it (a sibling block, or
+    // another process). Only such a block carries the occupant bookkeeping a
+    // remote abort needs; a purely lexical target stays a bare region plus a
+    // branch, as in V1.
+    uint32_t remote;
 };
+
+// A BlockInfo::remote / block-target id naming no target: the block is a purely
+// lexical `disable` target, so it carries no occupant bookkeeping.
+inline constexpr uint32_t kNoDisableTarget = UINT32_MAX;
 
 // Extra payload for one arm of a `switch`: the constant case-value keys that
 // select this arm, and the arm's statement body. `keys` is a run of u64 case
@@ -1468,13 +1479,23 @@ struct Inst {
         // unit (payload: extra -> BlockInfo). Lowers to its body followed by an
         // end block, which is where a Disable branches to.
         NamedBlock,
-        // `disable <named block>` (LRM 9.6.2): leave the enclosing NamedBlock
-        // carrying the same label, resuming at the statement after that block
-        // (payload: label). A terminator, exactly like Break, and it binds
-        // lexically -- the label names an enclosing block of this unit, never a
-        // block in another process, which is the remote form the frontend still
-        // refuses (docs/design/disable.md).
+        // `disable <named block>` (LRM 9.6.2), lexical form: leave the enclosing
+        // NamedBlock carrying the same id, resuming at the statement after that
+        // block (payload: label). A terminator, exactly like Break, and it binds
+        // lexically -- the id names an enclosing block of this unit.
         Disable,
+        // `disable <named block>` (LRM 9.6.2), remote form: mark the activation
+        // currently inside the target region as disabled and force-wake it
+        // (payload: label, here the target id rather than an enclosing label).
+        // NOT a terminator -- the disabling process carries on -- and a no-op when
+        // nothing is inside the region, which is LRM 9.6.2's "if the block is not
+        // currently executing, the disable has no effect".
+        DisableRemote,
+        // Drop this process's pending deferred-assertion reports (LRM 16.4.4):
+        // bump its generation counter, exactly as an activation start does
+        // (payload: none). Emitted immediately before a `disable` of the
+        // procedure's own outermost scope.
+        DeferFlush,
         // Time delay `#n`: suspend the process for `n` ticks (payload: unary, the
         // tick count). Lowers to a timer scheduled on the wheel plus a coroutine
         // suspend; the wheel resumes the process when the delay elapses.
@@ -2150,6 +2171,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::NamedBlock:
             return K::Extra;
         case T::Disable:
+        case T::DisableRemote:
             return K::Label;
         case T::Call:
             return K::Call;
@@ -2180,6 +2202,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::TimeFormat;
         case T::Break:
         case T::Continue:
+        case T::DeferFlush:
         case T::RetVoid:
         case T::DumpVars:
         case T::DumpOff:
