@@ -15715,6 +15715,55 @@ private:
         return b.binary(ir::Inst::Tag::Mul, w, mul, l);
     }
 
+    // Whether a nonblocking intra-assignment target's select chain resolves
+    // through storage the deferred record can address. The record reuses plain
+    // NBA's lvalue encoding, so the supported chain is exactly what that
+    // encoding covers: packed bit / part / sub-vector selects, fixed
+    // unpacked-array element selects, and packed or unpacked struct fields. A
+    // container element (string, queue, dynamic or associative array) is
+    // excluded because plain NBA cannot encode one either, so there is nothing
+    // to reuse.
+    static bool intra_nb_target_path(const Expression& e) {
+        switch (e.kind) {
+            case ExpressionKind::NamedValue:
+            case ExpressionKind::HierarchicalValue:
+                return true;
+            case ExpressionKind::ElementSelect: {
+                const Expression& base = e.as<ElementSelectExpression>().value();
+                if (!base.type->isIntegral() && !is_unpacked_array(base)) {
+                    return false;
+                }
+                return intra_nb_target_path(base);
+            }
+            case ExpressionKind::RangeSelect: {
+                // A part-select of a packed value. An unpacked-array slice names
+                // several elements, which one record cannot carry.
+                const Expression& base = e.as<RangeSelectExpression>().value();
+                return base.type->isIntegral() && intra_nb_target_path(base);
+            }
+            case ExpressionKind::MemberAccess: {
+                // A packed or unpacked struct field. A class property has no
+                // signal storage and is rejected ahead of the timing block.
+                const MemberAccessExpression& ma = e.as<MemberAccessExpression>();
+                return ma.member.as_if<FieldSymbol>() != nullptr && intra_nb_target_path(ma.value());
+            }
+            default:
+                return false;
+        }
+    }
+
+    // Whether `x <= #d y` / `x <= @e y` can lower to this target (LRM 9.4.5).
+    // One record carries one scalar value, so the target must name a single
+    // integral (a packed struct or union included) or real object; a whole
+    // unpacked array or struct would have to spread the sampled RHS across one
+    // record per leaf.
+    static bool intra_nb_target_supported(const Expression& e) {
+        if ((!e.type->isIntegral() && !e.type->isFloating()) || e.type->isUnpackedArray()) {
+            return false;
+        }
+        return intra_nb_target_path(e);
+    }
+
     // Reject the one nonblocking-assignment target a subroutine (task or function)
     // cannot stage: a frame local or formal argument (both live in localmap). These
     // have no module-signal storage, and nba_target in the backend only walks to a
@@ -15831,7 +15880,14 @@ private:
                 fail("compound assignment to an unpacked struct is not supported");
             }
             if (a.timingControl != nullptr) {
-                fail("intra-assignment timing control (#/@ on an assignment) is not supported");
+                // TODO: intra-assignment timing on a WHOLE unpacked aggregate. A
+                // field of one is supported (each leaf defers its own record); a
+                // whole-object target would have to sample the RHS once and spread
+                // it across one record per decomposed leaf, sharing the single
+                // delay. Selects, struct fields and array elements go through the
+                // nonblocking timing block below instead.
+                fail("intra-assignment timing on a whole unpacked struct or array target "
+                     "is not supported");
             }
             const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
             emit_struct_store(lower_lvalue(a.left(), b), lower_type(*a.left().type), a.right(), tag, b, l);
@@ -15850,18 +15906,19 @@ private:
             // scheduler infrastructure not present yet.
             if (a.isNonBlocking()) {
                 // Nonblocking form: sample now, do not block, commit after the
-                // timing via a detached scheduled store. Only a whole scalar target
-                // (integral or real) is lowered — the record is monomorphized per
-                // whole signal — so selects / concats / aggregates (needing the
-                // masked/array record path) fail loud, a documented follow-up
-                // (docs/design/intra-assignment-timing.md). A real rides its IEEE
-                // pattern through the same narrow record (intra_pack_mm).
-                const bool whole_scalar =
-                  (a.left().kind == ExpressionKind::NamedValue || a.left().kind == ExpressionKind::HierarchicalValue) &&
-                  (a.left().type->isIntegral() || a.left().type->isFloating()) && !a.left().type->isUnpackedArray();
-                if (!whole_scalar) {
+                // timing via a detached scheduled store. The supported target set
+                // mirrors what plain NBA can encode as an lvalue, since the
+                // deferred record reuses that encoding (a positioned value plus a
+                // write mask, and for an array element / aggregate leaf the live
+                // destination pointer resolved at statement-execution time):
+                // a whole integral or real scalar, a bit/part-select of one
+                // (constant or variable), an unpacked-array element, and a packed
+                // or unpacked struct field. A real rides its IEEE pattern through
+                // the same narrow record (intra_pack_mm).
+                if (!intra_nb_target_supported(a.left())) {
                     fail("nonblocking intra-assignment timing is only supported for a whole "
-                         "integral or real scalar target");
+                         "integral or real scalar, a bit/part-select of one, an "
+                         "unpacked-array element, or a struct field");
                 }
                 const TimingControl& tc = *a.timingControl;
                 if (tc.kind == TimingControlKind::Delay) {
